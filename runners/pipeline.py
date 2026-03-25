@@ -54,7 +54,7 @@ def process_one_file(
     elif settings_profile != "manual":
         raise ValueError(f"Unknown settings_profile: {settings_profile}")
 
-    graph = build_knn_graph(data.phi_init, k=graph_k)
+    graph = build_knn_graph(data.phi_init, k=graph_k, device=fit_options.device)
 
     if lambda_grid is None:
         lambda_grid = default_lambda_grid(data, mode=lambda_grid_mode)

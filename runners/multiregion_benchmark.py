@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import itertools as its
+import multiprocessing as mp
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +43,9 @@ class MassiveMultiregionBenchmarkConfig:
     lineage_zero_prob: float = 0.3
     flush_every: int = 50
     cleanup_temp: bool = True
+    prefetch_workers: int = 0
+    prefetch_buffer: int = 0
+    fit_workers: int = 1
 
     @property
     def expected_cases(self) -> int:
@@ -50,6 +56,132 @@ class MassiveMultiregionBenchmarkConfig:
             * len(self.n_samples_list)
             * int(self.reps)
         )
+
+
+@dataclass(frozen=True)
+class BenchmarkCaseSpec:
+    N_mean: int
+    simu_purity: float
+    amp_rate: float
+    n_samples: int
+    sim: int
+    child_seed: int
+
+
+def _effective_prefetch_workers(config: MassiveMultiregionBenchmarkConfig) -> int:
+    if config.prefetch_workers > 0:
+        return int(config.prefetch_workers)
+    return max(int(os.cpu_count() or 1), 1)
+
+
+def _effective_prefetch_buffer(config: MassiveMultiregionBenchmarkConfig) -> int:
+    if config.prefetch_buffer > 0:
+        return int(config.prefetch_buffer)
+    return max(2 * _effective_prefetch_workers(config), 1)
+
+
+def _iter_case_specs(config: MassiveMultiregionBenchmarkConfig) -> list[BenchmarkCaseSpec]:
+    rng_master = np.random.default_rng(config.seed)
+    specs: list[BenchmarkCaseSpec] = []
+    for N_mean, simu_purity, amp_rate, n_samples in its.product(
+        config.N_list,
+        config.purity_list,
+        config.amp_rate_list,
+        config.n_samples_list,
+    ):
+        for sim in range(config.reps):
+            specs.append(
+                BenchmarkCaseSpec(
+                    N_mean=int(N_mean),
+                    simu_purity=float(simu_purity),
+                    amp_rate=float(amp_rate),
+                    n_samples=int(n_samples),
+                    sim=int(sim),
+                    child_seed=int(rng_master.integers(0, 2**32 - 1)),
+                )
+            )
+    return specs
+
+
+def _prepare_case_artifacts(
+    spec: BenchmarkCaseSpec,
+    config: MassiveMultiregionBenchmarkConfig,
+    temp_sim_root: str | Path,
+    temp_tsv_root: str | Path,
+) -> tuple[Path | None, Path]:
+    child_rng = np.random.default_rng(spec.child_seed)
+    patient_dir = write_patient_simulation(
+        rng=child_rng,
+        out_dir=temp_sim_root,
+        N_mean=spec.N_mean,
+        simu_purity=spec.simu_purity,
+        amp_rate=spec.amp_rate,
+        n_samples=spec.n_samples,
+        sim=spec.sim,
+        K_min=config.K_min,
+        K_max=config.K_max,
+        lambda_mut=config.lambda_mut,
+        alpha_mut=config.alpha_mut,
+        alpha_split=config.alpha_split,
+        alpha_lambda=config.alpha_lambda,
+        tau_lineage_min=config.tau_lineage_min,
+        tau_lineage_max=config.tau_lineage_max,
+        purity_conc=config.purity_conc,
+        lineage_zero_prob=config.lineage_zero_prob,
+    )
+    out_tsv = convert_one_patient(patient_dir, Path(temp_tsv_root))
+    return out_tsv, patient_dir
+
+
+def _run_case_worker(
+    spec: BenchmarkCaseSpec,
+    config: MassiveMultiregionBenchmarkConfig,
+    fit_options: FitOptions,
+    lambda_grid: list[float] | None,
+    lambda_grid_mode: str,
+    graph_k: int,
+    bic_df_scale: float,
+    bic_cluster_penalty: float,
+    settings_profile: str,
+    use_warm_starts: bool,
+    write_patient_outputs: bool,
+    temp_sim_root: str | Path,
+    temp_tsv_root: str | Path,
+    outdir: str | Path,
+) -> dict[str, int | float | str | bool] | None:
+    out_tsv = None
+    patient_dir = None
+    try:
+        out_tsv, patient_dir = _prepare_case_artifacts(
+            spec=spec,
+            config=config,
+            temp_sim_root=temp_sim_root,
+            temp_tsv_root=temp_tsv_root,
+        )
+        if out_tsv is None:
+            return None
+
+        summary = process_one_file(
+            file_path=out_tsv,
+            outdir=outdir,
+            simulation_root=temp_sim_root,
+            lambda_grid=lambda_grid,
+            lambda_grid_mode=lambda_grid_mode,
+            graph_k=graph_k,
+            fit_options=fit_options,
+            bic_df_scale=bic_df_scale,
+            bic_cluster_penalty=bic_cluster_penalty,
+            settings_profile=settings_profile,
+            use_warm_starts=use_warm_starts,
+            write_outputs=write_patient_outputs,
+        )
+        return {**_parse_patient_id(out_tsv.stem), **summary}
+    finally:
+        if config.cleanup_temp:
+            if out_tsv is not None:
+                Path(out_tsv).unlink(missing_ok=True)
+            if patient_dir is not None:
+                shutil.rmtree(patient_dir, ignore_errors=True)
 
 
 def _aggregate_simple(patient_df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -93,82 +225,185 @@ def run_massive_multiregion_benchmark(
     if fit_options is None:
         fit_options = FitOptions(lambda_value=0.0, device="cuda")
 
-    rng_master = np.random.default_rng(config.seed)
     patient_rows: list[dict[str, int | float | str | bool]] = []
     total_cases = config.expected_cases
     start_time = perf_counter()
     case_index = 0
+    specs = _iter_case_specs(config)
 
-    for N_mean, simu_purity, amp_rate, n_samples in its.product(
-        config.N_list,
-        config.purity_list,
-        config.amp_rate_list,
-        config.n_samples_list,
-    ):
-        for sim in range(config.reps):
-            child_seed = int(rng_master.integers(0, 2**32 - 1))
-            child_rng = np.random.default_rng(child_seed)
-
-            patient_dir = write_patient_simulation(
-                rng=child_rng,
-                out_dir=temp_sim_root,
-                N_mean=N_mean,
-                simu_purity=simu_purity,
-                amp_rate=amp_rate,
-                n_samples=n_samples,
-                sim=sim,
-                K_min=config.K_min,
-                K_max=config.K_max,
-                lambda_mut=config.lambda_mut,
-                alpha_mut=config.alpha_mut,
-                alpha_split=config.alpha_split,
-                alpha_lambda=config.alpha_lambda,
-                tau_lineage_min=config.tau_lineage_min,
-                tau_lineage_max=config.tau_lineage_max,
-                purity_conc=config.purity_conc,
-                lineage_zero_prob=config.lineage_zero_prob,
-            )
-            out_tsv = convert_one_patient(patient_dir, temp_tsv_root)
-            if out_tsv is None:
-                if config.cleanup_temp:
-                    shutil.rmtree(patient_dir, ignore_errors=True)
-                continue
-
-            summary = process_one_file(
-                file_path=out_tsv,
-                outdir=outdir,
-                simulation_root=temp_sim_root,
-                lambda_grid=lambda_grid,
-                lambda_grid_mode=lambda_grid_mode,
-                graph_k=graph_k,
-                fit_options=fit_options,
-                bic_df_scale=bic_df_scale,
-                bic_cluster_penalty=bic_cluster_penalty,
-                settings_profile=settings_profile,
-                use_warm_starts=use_warm_starts,
-                write_outputs=write_patient_outputs,
-            )
-            patient_rows.append({**_parse_patient_id(out_tsv.stem), **summary})
-            case_index += 1
-
+    def _record_case(out_tsv: Path | None, patient_dir: Path) -> None:
+        nonlocal case_index
+        if out_tsv is None:
             if config.cleanup_temp:
-                out_tsv.unlink(missing_ok=True)
                 shutil.rmtree(patient_dir, ignore_errors=True)
+            return
 
-            if case_index % max(config.flush_every, 1) == 0 or case_index == total_cases:
-                patient_df = pd.DataFrame(patient_rows).sort_values(
-                    ["N_mean", "purity", "amp_rate", "n_samples", "rep"]
-                ).reset_index(drop=True)
-                patient_df.to_csv(outdir / "benchmark_patients.tsv", sep="\t", index=False)
-                elapsed = perf_counter() - start_time
-                rate = case_index / max(elapsed, 1e-9)
-                remaining = max(total_cases - case_index, 0)
-                eta_seconds = remaining / max(rate, 1e-9)
-                print(
-                    f"[multiregion-benchmark] {case_index}/{total_cases} cases "
-                    f"| elapsed={elapsed/60.0:.1f} min | rate={rate:.2f} cases/s "
-                    f"| eta={eta_seconds/60.0:.1f} min"
+        summary = process_one_file(
+            file_path=out_tsv,
+            outdir=outdir,
+            simulation_root=temp_sim_root,
+            lambda_grid=lambda_grid,
+            lambda_grid_mode=lambda_grid_mode,
+            graph_k=graph_k,
+            fit_options=fit_options,
+            bic_df_scale=bic_df_scale,
+            bic_cluster_penalty=bic_cluster_penalty,
+            settings_profile=settings_profile,
+            use_warm_starts=use_warm_starts,
+            write_outputs=write_patient_outputs,
+        )
+        patient_rows.append({**_parse_patient_id(out_tsv.stem), **summary})
+        case_index += 1
+
+        if config.cleanup_temp:
+            out_tsv.unlink(missing_ok=True)
+            shutil.rmtree(patient_dir, ignore_errors=True)
+
+        if case_index % max(config.flush_every, 1) == 0 or case_index == total_cases:
+            patient_df = pd.DataFrame(patient_rows).sort_values(
+                ["N_mean", "purity", "amp_rate", "n_samples", "rep"]
+            ).reset_index(drop=True)
+            patient_df.to_csv(outdir / "benchmark_patients.tsv", sep="\t", index=False)
+            elapsed = perf_counter() - start_time
+            rate = case_index / max(elapsed, 1e-9)
+            remaining = max(total_cases - case_index, 0)
+            eta_seconds = remaining / max(rate, 1e-9)
+            print(
+                f"[multiregion-benchmark] {case_index}/{total_cases} cases "
+                f"| elapsed={elapsed/60.0:.1f} min | rate={rate:.2f} cases/s "
+                f"| eta={eta_seconds/60.0:.1f} min"
+            )
+
+    if config.fit_workers > 1:
+        inflight_limit = max(int(config.fit_workers) * 4, 1)
+        spec_iter = iter(specs)
+        with cf.ProcessPoolExecutor(
+            max_workers=int(config.fit_workers),
+            mp_context=mp.get_context("spawn"),
+        ) as executor:
+            future_map: dict[cf.Future[dict[str, int | float | str | bool] | None], BenchmarkCaseSpec] = {}
+
+            while len(future_map) < inflight_limit:
+                try:
+                    spec = next(spec_iter)
+                except StopIteration:
+                    break
+                future = executor.submit(
+                    _run_case_worker,
+                    spec,
+                    config,
+                    fit_options,
+                    lambda_grid,
+                    lambda_grid_mode,
+                    graph_k,
+                    bic_df_scale,
+                    bic_cluster_penalty,
+                    settings_profile,
+                    use_warm_starts,
+                    write_patient_outputs,
+                    temp_sim_root,
+                    temp_tsv_root,
+                    outdir,
                 )
+                future_map[future] = spec
+
+            while future_map:
+                done, _ = cf.wait(future_map, return_when=cf.FIRST_COMPLETED)
+                for future in done:
+                    future_map.pop(future)
+                    row = future.result()
+                    if row is not None:
+                        patient_rows.append(row)
+                        case_index += 1
+                        if case_index % max(config.flush_every, 1) == 0 or case_index == total_cases:
+                            patient_df = pd.DataFrame(patient_rows).sort_values(
+                                ["N_mean", "purity", "amp_rate", "n_samples", "rep"]
+                            ).reset_index(drop=True)
+                            patient_df.to_csv(outdir / "benchmark_patients.tsv", sep="\t", index=False)
+                            elapsed = perf_counter() - start_time
+                            rate = case_index / max(elapsed, 1e-9)
+                            remaining = max(total_cases - case_index, 0)
+                            eta_seconds = remaining / max(rate, 1e-9)
+                            print(
+                                f"[multiregion-benchmark] {case_index}/{total_cases} cases "
+                                f"| elapsed={elapsed/60.0:.1f} min | rate={rate:.2f} cases/s "
+                                f"| eta={eta_seconds/60.0:.1f} min"
+                            )
+
+                    while len(future_map) < inflight_limit:
+                        try:
+                            spec = next(spec_iter)
+                        except StopIteration:
+                            break
+                        next_future = executor.submit(
+                            _run_case_worker,
+                            spec,
+                            config,
+                            fit_options,
+                            lambda_grid,
+                            lambda_grid_mode,
+                            graph_k,
+                            bic_df_scale,
+                            bic_cluster_penalty,
+                            settings_profile,
+                            use_warm_starts,
+                            write_patient_outputs,
+                            temp_sim_root,
+                            temp_tsv_root,
+                            outdir,
+                        )
+                        future_map[next_future] = spec
+    else:
+        prefetch_workers = _effective_prefetch_workers(config)
+        if prefetch_workers <= 1:
+            for spec in specs:
+                out_tsv, patient_dir = _prepare_case_artifacts(
+                    spec=spec,
+                    config=config,
+                    temp_sim_root=temp_sim_root,
+                    temp_tsv_root=temp_tsv_root,
+                )
+                _record_case(out_tsv=out_tsv, patient_dir=patient_dir)
+        else:
+            prefetch_buffer = _effective_prefetch_buffer(config)
+            spec_iter = iter(specs)
+            with cf.ProcessPoolExecutor(max_workers=prefetch_workers) as executor:
+                future_map: dict[cf.Future[tuple[Path | None, Path]], BenchmarkCaseSpec] = {}
+
+                while len(future_map) < prefetch_buffer:
+                    try:
+                        spec = next(spec_iter)
+                    except StopIteration:
+                        break
+                    future = executor.submit(
+                        _prepare_case_artifacts,
+                        spec,
+                        config,
+                        temp_sim_root,
+                        temp_tsv_root,
+                    )
+                    future_map[future] = spec
+
+                while future_map:
+                    done, _ = cf.wait(future_map, return_when=cf.FIRST_COMPLETED)
+                    for future in done:
+                        future_map.pop(future)
+                        out_tsv, patient_dir = future.result()
+                        _record_case(out_tsv=out_tsv, patient_dir=patient_dir)
+
+                        while len(future_map) < prefetch_buffer:
+                            try:
+                                spec = next(spec_iter)
+                            except StopIteration:
+                                break
+                            next_future = executor.submit(
+                                _prepare_case_artifacts,
+                                spec,
+                                config,
+                                temp_sim_root,
+                                temp_tsv_root,
+                            )
+                            future_map[next_future] = spec
 
     patient_df = pd.DataFrame(patient_rows).sort_values(["N_mean", "purity", "amp_rate", "n_samples", "rep"]).reset_index(drop=True)
     scenario_df, global_df = _aggregate_patient_results(patient_df)
@@ -215,6 +450,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lineage-zero-prob", type=float, default=0.3, help="Probability of zeroing a lineage in a sample.")
     parser.add_argument("--flush-every", type=int, default=50, help="Write partial benchmark summaries every N cases.")
     parser.add_argument("--keep-temp", action="store_true", help="Keep temporary simulation and TSV files.")
+    parser.add_argument("--fit-workers", type=int, default=1, help="Number of independent case workers to run in parallel; values above 1 parallelize full generate-convert-fit pipelines.")
+    parser.add_argument("--prefetch-workers", type=int, default=0, help="CPU worker count for background simulation and TSV conversion; 0 uses all available CPUs.")
+    parser.add_argument("--prefetch-buffer", type=int, default=0, help="Maximum number of prepared cases queued ahead of GPU fitting; 0 uses 2x workers.")
     parser.add_argument("--lambda-grid", default=None, help="Optional comma-separated lambda grid.")
     parser.add_argument(
         "--lambda-grid-mode",
@@ -282,6 +520,9 @@ def benchmark_config_from_args(args: argparse.Namespace) -> MassiveMultiregionBe
         lineage_zero_prob=args.lineage_zero_prob,
         flush_every=args.flush_every,
         cleanup_temp=not args.keep_temp,
+        fit_workers=args.fit_workers,
+        prefetch_workers=args.prefetch_workers,
+        prefetch_buffer=args.prefetch_buffer,
     )
 
 

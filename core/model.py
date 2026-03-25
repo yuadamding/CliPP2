@@ -12,14 +12,14 @@ from .graph import GraphData
 @dataclass
 class FitOptions:
     lambda_value: float
-    em_max_iter: int = 12
+    em_max_iter: int = 8
     em_tol: float = 1e-4
-    admm_max_iter: int = 30
+    admm_max_iter: int = 20
     admm_tol: float = 5e-3
     admm_rho: float = 2.0
     inner_steps: int = 2
     inner_lr: float = 5e-2
-    cg_max_iter: int = 50
+    cg_max_iter: int = 30
     cg_tol: float = 1e-4
     curvature_floor: float = 1e-4
     major_prior: float = 0.5
@@ -51,10 +51,65 @@ class FitResult:
     bic: float | None = None
 
 
+@dataclass
+class _TorchFitContext:
+    device: torch.device
+    alt_counts: torch.Tensor
+    total_counts: torch.Tensor
+    scaling: torch.Tensor
+    minor_cn: torch.Tensor
+    major_cn: torch.Tensor
+    minor_scale: torch.Tensor
+    major_scale: torch.Tensor
+    phi_upper: torch.Tensor
+    edge_src: torch.Tensor
+    edge_dst: torch.Tensor
+    edge_weight: torch.Tensor
+    degree: torch.Tensor
+    num_edges: int
+
+
 def _resolve_device(device: str) -> torch.device:
     if device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device)
+
+
+def _make_torch_context(data: PatientData, graph: GraphData, device: torch.device) -> _TorchFitContext:
+    alt_counts = torch.as_tensor(data.alt_counts, dtype=torch.float32, device=device)
+    total_counts = torch.as_tensor(data.total_counts, dtype=torch.float32, device=device)
+    scaling = torch.as_tensor(data.scaling, dtype=torch.float32, device=device)
+    minor_cn = torch.as_tensor(data.minor_cn, dtype=torch.float32, device=device)
+    major_cn = torch.as_tensor(data.major_cn, dtype=torch.float32, device=device)
+    minor_scale = scaling * minor_cn
+    major_scale = scaling * major_cn
+    phi_upper = torch.as_tensor(data.phi_upper, dtype=torch.float32, device=device)
+
+    edge_src = torch.as_tensor(graph.src, dtype=torch.long, device=device)
+    edge_dst = torch.as_tensor(graph.dst, dtype=torch.long, device=device)
+    edge_weight = torch.as_tensor(graph.weight, dtype=torch.float32, device=device).view(-1, 1)
+    degree = torch.zeros((data.num_mutations, 1), dtype=torch.float32, device=device)
+    if graph.num_edges > 0:
+        ones = torch.ones((graph.num_edges, 1), dtype=torch.float32, device=device)
+        degree.index_add_(0, edge_src, ones)
+        degree.index_add_(0, edge_dst, ones)
+
+    return _TorchFitContext(
+        device=device,
+        alt_counts=alt_counts,
+        total_counts=total_counts,
+        scaling=scaling,
+        minor_cn=minor_cn,
+        major_cn=major_cn,
+        minor_scale=minor_scale,
+        major_scale=major_scale,
+        phi_upper=phi_upper,
+        edge_src=edge_src,
+        edge_dst=edge_dst,
+        edge_weight=edge_weight,
+        degree=degree,
+        num_edges=int(graph.num_edges),
+    )
 
 
 def _torch_e_step(
@@ -237,112 +292,87 @@ def _cg_solve_graph_quadratic_torch(
 
 
 def _m_step_admm_torch(
-    data: PatientData,
-    graph: GraphData,
-    phi_start: np.ndarray,
-    minor_probability_np: np.ndarray,
-    major_probability_np: np.ndarray,
+    context: _TorchFitContext,
+    phi_start: torch.Tensor,
+    minor_probability: torch.Tensor,
+    major_probability: torch.Tensor,
     options: FitOptions,
-) -> tuple[np.ndarray, np.ndarray]:
-    device = _resolve_device(options.device)
+) -> tuple[torch.Tensor, torch.Tensor]:
     torch.set_float32_matmul_precision("high")
 
-    alt_counts = torch.as_tensor(data.alt_counts, dtype=torch.float32, device=device)
-    total_counts = torch.as_tensor(data.total_counts, dtype=torch.float32, device=device)
-    minor_scale = torch.as_tensor(data.scaling * data.minor_cn, dtype=torch.float32, device=device)
-    major_scale = torch.as_tensor(data.scaling * data.major_cn, dtype=torch.float32, device=device)
-    phi_upper = torch.as_tensor(data.phi_upper, dtype=torch.float32, device=device)
-    minor_probability = torch.as_tensor(minor_probability_np, dtype=torch.float32, device=device)
-    major_probability = torch.as_tensor(major_probability_np, dtype=torch.float32, device=device)
-    phi = torch.minimum(
-        torch.clamp(torch.as_tensor(phi_start, dtype=torch.float32, device=device), min=options.eps),
-        phi_upper,
-    )
+    phi = torch.minimum(torch.clamp(phi_start, min=options.eps), context.phi_upper)
 
-    edge_src = torch.as_tensor(graph.src, dtype=torch.long, device=device)
-    edge_dst = torch.as_tensor(graph.dst, dtype=torch.long, device=device)
-    edge_weight = torch.as_tensor(graph.weight, dtype=torch.float32, device=device).view(-1, 1)
-    degree = torch.zeros((data.num_mutations, 1), dtype=torch.float32, device=device)
-    if graph.num_edges > 0:
-        degree.index_add_(0, edge_src, torch.ones_like(edge_weight))
-        degree.index_add_(0, edge_dst, torch.ones_like(edge_weight))
-
-    if graph.num_edges > 0:
-        z = torch.zeros((graph.num_edges, data.num_samples), dtype=torch.float32, device=device)
+    if context.num_edges > 0:
+        z = torch.zeros((context.num_edges, context.alt_counts.shape[1]), dtype=torch.float32, device=context.device)
         u = torch.zeros_like(z)
     else:
-        z = torch.zeros((0, data.num_samples), dtype=torch.float32, device=device)
+        z = torch.zeros((0, context.alt_counts.shape[1]), dtype=torch.float32, device=context.device)
         u = torch.zeros_like(z)
 
     for admm_iter in range(options.admm_max_iter):
         for _ in range(max(options.inner_steps, 1)):
             grad, hess = _weighted_surrogate_grad_hessian_torch(
                 phi=phi,
-                alt_counts=alt_counts,
-                total_counts=total_counts,
-                minor_scale=minor_scale,
-                major_scale=major_scale,
+                alt_counts=context.alt_counts,
+                total_counts=context.total_counts,
+                minor_scale=context.minor_scale,
+                major_scale=context.major_scale,
                 minor_probability=minor_probability,
                 major_probability=major_probability,
                 eps=options.eps,
                 curvature_floor=options.curvature_floor,
             )
-            target = torch.minimum(torch.clamp(phi - grad / hess, min=options.eps), phi_upper)
-            if graph.num_edges == 0:
+            target = torch.minimum(torch.clamp(phi - grad / hess, min=options.eps), context.phi_upper)
+            if context.num_edges == 0:
                 phi = target
                 continue
 
             rhs_shift = _difference_transpose_torch(
                 values=z - u,
-                num_nodes=data.num_mutations,
-                src=edge_src,
-                dst=edge_dst,
+                num_nodes=context.alt_counts.shape[0],
+                src=context.edge_src,
+                dst=context.edge_dst,
             )
             phi = _cg_solve_graph_quadratic_torch(
                 initial=phi,
                 diagonal=hess,
                 target=target,
                 rhs_shift=rhs_shift,
-                degree=degree,
-                phi_upper=phi_upper,
+                degree=context.degree,
+                phi_upper=context.phi_upper,
                 rho=options.admm_rho,
-                src=edge_src,
-                dst=edge_dst,
+                src=context.edge_src,
+                dst=context.edge_dst,
                 cg_max_iter=options.cg_max_iter,
                 cg_tol=options.cg_tol,
                 eps=options.eps,
             )
 
-        if graph.num_edges == 0:
+        if context.num_edges == 0:
             break
 
-        with torch.no_grad():
-            diff = phi[edge_src] - phi[edge_dst]
-            v = diff + u
-            z_new = _group_soft_threshold_torch(
-                value=v,
-                threshold=(options.lambda_value * edge_weight) / max(options.admm_rho, options.eps),
-                eps=options.eps,
+        diff = phi[context.edge_src] - phi[context.edge_dst]
+        v = diff + u
+        z_new = _group_soft_threshold_torch(
+            value=v,
+            threshold=(options.lambda_value * context.edge_weight) / max(options.admm_rho, options.eps),
+            eps=options.eps,
+        )
+        primal_residual = torch.linalg.norm(diff - z_new).item()
+        dual_residual = (options.admm_rho * torch.linalg.norm(z_new - z)).item()
+        u = u + diff - z_new
+        z = z_new
+
+        if options.verbose:
+            print(
+                f"  ADMM iter {admm_iter + 1:02d} "
+                f"| primal={primal_residual:.4e} dual={dual_residual:.4e}"
             )
-            primal_residual = torch.linalg.norm(diff - z_new).item()
-            dual_residual = (options.admm_rho * torch.linalg.norm(z_new - z)).item()
-            u = u + diff - z_new
-            z = z_new
 
-            if options.verbose:
-                print(
-                    f"  ADMM iter {admm_iter + 1:02d} "
-                    f"| primal={primal_residual:.4e} dual={dual_residual:.4e}"
-                )
+        if primal_residual < options.admm_tol and dual_residual < options.admm_tol:
+            break
 
-            if primal_residual < options.admm_tol and dual_residual < options.admm_tol:
-                break
-
-    with torch.no_grad():
-        phi_final = phi.detach().cpu().numpy().astype(np.float32)
-        z_final = z.detach().cpu().numpy().astype(np.float32)
-
-    return phi_final, z_final
+    return phi, z
 
 
 def _connected_components(num_nodes: int, src: np.ndarray, dst: np.ndarray, fused_mask: np.ndarray) -> np.ndarray:
@@ -439,6 +469,7 @@ def fit_single_stage_em(
     phi_start: np.ndarray | None = None,
 ) -> FitResult:
     device = _resolve_device(options.device)
+    context = _make_torch_context(data=data, graph=graph, device=device)
 
     if phi_start is None:
         phi = data.phi_init.copy()
@@ -447,48 +478,45 @@ def fit_single_stage_em(
     phi = np.clip(phi, options.eps, data.phi_upper)
     history: list[float] = []
     converged = False
-    z = np.zeros((graph.num_edges, data.num_samples), dtype=np.float32)
-
-    alt_counts = torch.as_tensor(data.alt_counts, dtype=torch.float32, device=device)
-    total_counts = torch.as_tensor(data.total_counts, dtype=torch.float32, device=device)
-    scaling = torch.as_tensor(data.scaling, dtype=torch.float32, device=device)
-    minor_cn = torch.as_tensor(data.minor_cn, dtype=torch.float32, device=device)
-    major_cn = torch.as_tensor(data.major_cn, dtype=torch.float32, device=device)
+    phi_t = torch.as_tensor(phi, dtype=torch.float32, device=device)
+    z_t = torch.zeros((graph.num_edges, data.num_samples), dtype=torch.float32, device=device)
 
     previous_loglik = -np.inf
-    for iteration in range(options.em_max_iter):
-        phi_t = torch.as_tensor(phi, dtype=torch.float32, device=device)
-        minor_probability_t, major_probability_t, marginal_loglik = _torch_e_step(
-            phi=phi_t,
-            alt_counts=alt_counts,
-            total_counts=total_counts,
-            scaling=scaling,
-            minor_cn=minor_cn,
-            major_cn=major_cn,
-            major_prior=options.major_prior,
-            eps=options.eps,
-        )
-        history.append(marginal_loglik)
+    with torch.inference_mode():
+        for iteration in range(options.em_max_iter):
+            minor_probability_t, major_probability_t, marginal_loglik = _torch_e_step(
+                phi=phi_t,
+                alt_counts=context.alt_counts,
+                total_counts=context.total_counts,
+                scaling=context.scaling,
+                minor_cn=context.minor_cn,
+                major_cn=context.major_cn,
+                major_prior=options.major_prior,
+                eps=options.eps,
+            )
+            history.append(marginal_loglik)
 
-        if options.verbose:
-            print(
-                f"EM iter {iteration + 1:02d} | "
-                f"loglik={marginal_loglik:.3f} | lambda={options.lambda_value:.3f}"
+            if options.verbose:
+                print(
+                    f"EM iter {iteration + 1:02d} | "
+                    f"loglik={marginal_loglik:.3f} | lambda={options.lambda_value:.3f}"
+                )
+
+            if iteration > 0 and abs(marginal_loglik - previous_loglik) < options.em_tol * (1.0 + abs(previous_loglik)):
+                converged = True
+                break
+
+            previous_loglik = marginal_loglik
+            phi_t, z_t = _m_step_admm_torch(
+                context=context,
+                phi_start=phi_t,
+                minor_probability=minor_probability_t,
+                major_probability=major_probability_t,
+                options=options,
             )
 
-        if iteration > 0 and abs(marginal_loglik - previous_loglik) < options.em_tol * (1.0 + abs(previous_loglik)):
-            converged = True
-            break
-
-        previous_loglik = marginal_loglik
-        phi, z = _m_step_admm_torch(
-            data=data,
-            graph=graph,
-            phi_start=phi,
-            minor_probability_np=minor_probability_t.detach().cpu().numpy(),
-            major_probability_np=major_probability_t.detach().cpu().numpy(),
-            options=options,
-        )
+        phi = phi_t.detach().cpu().numpy().astype(np.float32)
+        z = z_t.detach().cpu().numpy().astype(np.float32)
 
     z_norm = np.linalg.norm(z, axis=1) if graph.num_edges > 0 else np.zeros(0, dtype=np.float32)
     cluster_labels, cluster_centers, phi_clustered = _cluster_profiles(
@@ -504,7 +532,18 @@ def fit_single_stage_em(
         merge_tol=options.center_merge_tol,
     )
 
-    _, major_probability, loglik = _numpy_e_step(phi_clustered, data, options)
+    phi_clustered_t = torch.as_tensor(phi_clustered, dtype=torch.float32, device=device)
+    _, major_probability_t, loglik = _torch_e_step(
+        phi=phi_clustered_t,
+        alt_counts=context.alt_counts,
+        total_counts=context.total_counts,
+        scaling=context.scaling,
+        minor_cn=context.minor_cn,
+        major_cn=context.major_cn,
+        major_prior=options.major_prior,
+        eps=options.eps,
+    )
+    major_probability = major_probability_t.detach().cpu().numpy()
     major_call = major_probability >= 0.5
     multiplicity_call = np.where(major_call, data.major_cn, data.minor_cn).astype(np.float32)
     penalty_value = _penalty_value(phi_clustered, graph, options.lambda_value)

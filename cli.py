@@ -62,8 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional comma-separated filter for benchmark depth settings, for example '50,300,1000'.",
     )
-    parser.add_argument("--em-max-iter", type=int, default=12, help="Maximum EM iterations.")
-    parser.add_argument("--admm-max-iter", type=int, default=30, help="Maximum ADMM iterations per M-step.")
+    parser.add_argument("--em-max-iter", type=int, default=8, help="Maximum EM iterations.")
+    parser.add_argument("--admm-max-iter", type=int, default=20, help="Maximum ADMM iterations per M-step.")
     parser.add_argument("--inner-steps", type=int, default=2, help="Quadratic-majorization updates per ADMM iteration.")
     parser.add_argument(
         "--inner-lr",
@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=5e-2,
         help="Deprecated compatibility knob; no longer used by the ADMM solver.",
     )
-    parser.add_argument("--cg-max-iter", type=int, default=50, help="Maximum conjugate-gradient iterations for each ADMM w-update.")
+    parser.add_argument("--cg-max-iter", type=int, default=30, help="Maximum conjugate-gradient iterations for each ADMM w-update.")
     parser.add_argument("--cg-tol", type=float, default=1e-4, help="Relative conjugate-gradient tolerance.")
     parser.add_argument("--curvature-floor", type=float, default=1e-4, help="Minimum diagonal curvature used in the quadratic surrogate.")
     parser.add_argument("--admm-rho", type=float, default=2.0, help="ADMM penalty parameter.")
