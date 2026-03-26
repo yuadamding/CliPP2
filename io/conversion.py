@@ -24,7 +24,7 @@ JEFFREYS_PSEUDO = 0.5
 @dataclass(frozen=True)
 class ConversionConfig:
     input_root: str | Path = "CliPP2Sim"
-    output_root: str | Path = "CliPP2Sim_PyClone"
+    output_root: str | Path = "CliPP2Sim_TSV"
 
 
 def map_cna_to_mutations(mut_coords: pd.DataFrame, cna: pd.DataFrame) -> pd.DataFrame:
@@ -175,7 +175,7 @@ def convert_one_patient(patient_path: Path, output_root: Path) -> Path | None:
 
 def convert_simulation_root(
     input_root: str | Path = "CliPP2Sim",
-    output_root: str | Path = "CliPP2Sim_PyClone",
+    output_root: str | Path = "CliPP2Sim_TSV",
 ) -> list[Path]:
     input_root = Path(input_root)
     output_root = Path(output_root)
@@ -198,7 +198,7 @@ def convert_simulation_root_from_config(config: ConversionConfig) -> list[Path]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Merge simulation folders into per-patient TSV files.")
     parser.add_argument("--input-root", default="CliPP2Sim", help="Root directory containing patient simulation folders.")
-    parser.add_argument("--output-root", default="CliPP2Sim_PyClone", help="Directory to write merged TSV files.")
+    parser.add_argument("--output-root", default="CliPP2Sim_TSV", help="Directory to write merged TSV files.")
     return parser
 
 

@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
             "and graph fused lasso."
         ),
     )
-    parser.add_argument("--input-dir", default="CliPP2Sim_PyClone", help="Directory with per-patient TSV files.")
+    parser.add_argument("--input-dir", default="CliPP2Sim_TSV", help="Directory with per-patient TSV files.")
     parser.add_argument("--input-file", default=None, help="Optional single patient TSV file.")
     parser.add_argument("--outdir", default="multi_region_clipp_results", help="Output directory.")
     parser.add_argument("--simulation-root", default="CliPP2Sim", help="Simulation root for ARI evaluation.")

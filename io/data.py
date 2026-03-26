@@ -39,6 +39,18 @@ class PatientData:
             return 1.0
         return float(np.median(positive_depth))
 
+    @property
+    def multiplicity_estimation_mask(self) -> np.ndarray:
+        distinct_candidates = ~np.isclose(self.major_cn, self.minor_cn)
+        positive_candidates = (self.major_cn > 0.0) & (self.minor_cn > 0.0)
+        non_diploid = (self.major_cn != 1.0) | (self.minor_cn != 1.0)
+        return self.has_cna & non_diploid & distinct_candidates & positive_candidates
+
+    @property
+    def fixed_multiplicity(self) -> np.ndarray:
+        # Outside CNA-ambiguous entries, keep multiplicity fixed at the available major-copy value.
+        return self.major_cn.astype(np.float32, copy=True)
+
 
 def _first_seen(values: pd.Series) -> list[str]:
     return list(pd.Index(values.astype(str)).drop_duplicates())

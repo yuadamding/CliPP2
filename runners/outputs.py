@@ -49,6 +49,7 @@ def cell_output_table(data: PatientData, fit: FitResult) -> pd.DataFrame:
             "phi": fit.phi_clustered.reshape(-1),
             "major_cn": data.major_cn.reshape(-1),
             "minor_cn": data.minor_cn.reshape(-1),
+            "multiplicity_estimated": fit.multiplicity_estimated_mask.reshape(-1).astype(int),
             "major_probability": fit.major_probability.reshape(-1),
             "major_call": fit.major_call.reshape(-1).astype(int),
             "multiplicity_call": fit.multiplicity_call.reshape(-1),

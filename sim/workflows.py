@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.description = "Generate simulation folders and convert them into per-patient TSV files."
     parser.add_argument(
         "--merged-out-dir",
-        default="CliPP2Sim_PyClone",
+        default="CliPP2Sim_TSV",
         help="Directory to write the merged per-patient TSV files.",
     )
     return parser

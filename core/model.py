@@ -39,6 +39,7 @@ class FitResult:
     major_probability: np.ndarray
     major_call: np.ndarray
     multiplicity_call: np.ndarray
+    multiplicity_estimated_mask: np.ndarray
     loglik: float
     penalized_objective: float
     lambda_value: float
@@ -77,6 +78,8 @@ class _TorchFitContext:
     edge_dst: torch.Tensor
     edge_weight: torch.Tensor
     degree: torch.Tensor
+    multiplicity_estimation_mask: torch.Tensor
+    fixed_major_probability: torch.Tensor
     num_edges: int
 
 
@@ -100,6 +103,16 @@ def _make_torch_context(data: PatientData, graph: GraphData, device: torch.devic
     edge_dst = torch.as_tensor(graph.dst, dtype=torch.long, device=device)
     edge_weight = torch.as_tensor(graph.weight, dtype=torch.float32, device=device).view(-1, 1)
     degree = torch.zeros((data.num_mutations, 1), dtype=torch.float32, device=device)
+    multiplicity_estimation_mask = torch.as_tensor(
+        data.multiplicity_estimation_mask,
+        dtype=torch.bool,
+        device=device,
+    )
+    fixed_major_probability = torch.where(
+        multiplicity_estimation_mask,
+        torch.zeros_like(alt_counts),
+        torch.ones_like(alt_counts),
+    )
     if graph.num_edges > 0:
         ones = torch.ones((graph.num_edges, 1), dtype=torch.float32, device=device)
         degree.index_add_(0, edge_src, ones)
@@ -119,6 +132,8 @@ def _make_torch_context(data: PatientData, graph: GraphData, device: torch.devic
         edge_dst=edge_dst,
         edge_weight=edge_weight,
         degree=degree,
+        multiplicity_estimation_mask=multiplicity_estimation_mask,
+        fixed_major_probability=fixed_major_probability,
         num_edges=int(graph.num_edges),
     )
 
@@ -139,6 +154,8 @@ def _torch_e_step(
     scaling: torch.Tensor,
     minor_cn: torch.Tensor,
     major_cn: torch.Tensor,
+    multiplicity_estimation_mask: torch.Tensor | None,
+    fixed_major_probability: torch.Tensor | None,
     major_prior: float,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
@@ -154,9 +171,18 @@ def _torch_e_step(
     stacked = torch.stack((ll_minor, ll_major), dim=-1)
     log_norm = torch.logsumexp(stacked, dim=-1, keepdim=True)
     responsibilities = torch.exp(stacked - log_norm)
-    major_probability = responsibilities[..., 1]
-    minor_probability = responsibilities[..., 0]
-    marginal_loglik = float(log_norm.sum().detach().cpu().item())
+    if multiplicity_estimation_mask is None or fixed_major_probability is None:
+        major_probability = responsibilities[..., 1]
+        minor_probability = responsibilities[..., 0]
+        marginal_terms = log_norm.squeeze(-1)
+    else:
+        estimate_mask = multiplicity_estimation_mask
+        fixed_major = fixed_major_probability
+        major_probability = torch.where(estimate_mask, responsibilities[..., 1], fixed_major)
+        minor_probability = 1.0 - major_probability
+        fixed_loglik = torch.where(fixed_major >= 0.5, ll_major, ll_minor)
+        marginal_terms = torch.where(estimate_mask, log_norm.squeeze(-1), fixed_loglik)
+    marginal_loglik = float(marginal_terms.sum().detach().cpu().item())
     return minor_probability, major_probability, marginal_loglik
 
 
@@ -167,6 +193,12 @@ def _numpy_e_step(phi: np.ndarray, data: PatientData, options: FitOptions) -> tu
     scaling_t = torch.as_tensor(data.scaling, dtype=torch.float32)
     minor_t = torch.as_tensor(data.minor_cn, dtype=torch.float32)
     major_t = torch.as_tensor(data.major_cn, dtype=torch.float32)
+    estimate_mask_t = torch.as_tensor(data.multiplicity_estimation_mask, dtype=torch.bool)
+    fixed_major_t = torch.where(
+        estimate_mask_t,
+        torch.zeros_like(alt_t),
+        torch.ones_like(alt_t),
+    )
     minor_prob, major_prob, marginal_loglik = _torch_e_step(
         phi=phi_t,
         alt_counts=alt_t,
@@ -174,6 +206,8 @@ def _numpy_e_step(phi: np.ndarray, data: PatientData, options: FitOptions) -> tu
         scaling=scaling_t,
         minor_cn=minor_t,
         major_cn=major_t,
+        multiplicity_estimation_mask=estimate_mask_t,
+        fixed_major_probability=fixed_major_t,
         major_prior=options.major_prior,
         eps=options.eps,
     )
@@ -531,6 +565,8 @@ def fit_single_stage_em_raw(
                 scaling=context.scaling,
                 minor_cn=context.minor_cn,
                 major_cn=context.major_cn,
+                multiplicity_estimation_mask=context.multiplicity_estimation_mask,
+                fixed_major_probability=context.fixed_major_probability,
                 major_prior=options.major_prior,
                 eps=options.eps,
             )
@@ -606,12 +642,18 @@ def finalize_raw_fit(
         scaling=context.scaling,
         minor_cn=context.minor_cn,
         major_cn=context.major_cn,
+        multiplicity_estimation_mask=context.multiplicity_estimation_mask,
+        fixed_major_probability=context.fixed_major_probability,
         major_prior=options.major_prior,
         eps=options.eps,
     )
     major_probability = major_probability_t.detach().cpu().numpy()
     major_call = major_probability >= 0.5
-    multiplicity_call = np.where(major_call, data.major_cn, data.minor_cn).astype(np.float32)
+    multiplicity_call = np.where(
+        data.multiplicity_estimation_mask,
+        np.where(major_call, data.major_cn, data.minor_cn),
+        data.fixed_multiplicity,
+    ).astype(np.float32)
     penalty_value = _penalty_value(phi_clustered, graph, options.lambda_value)
     penalized_objective = float(loglik - penalty_value)
 
@@ -623,6 +665,7 @@ def finalize_raw_fit(
         major_probability=major_probability.astype(np.float32),
         major_call=major_call.astype(bool),
         multiplicity_call=multiplicity_call.astype(np.float32),
+        multiplicity_estimated_mask=data.multiplicity_estimation_mask.astype(bool),
         loglik=float(loglik),
         penalized_objective=penalized_objective,
         lambda_value=float(options.lambda_value),

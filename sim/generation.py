@@ -7,7 +7,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.stats import bernoulli
 
 
 @dataclass(frozen=True)
@@ -279,6 +278,72 @@ def sample_mutations_per_clone(
     return cluster_id.astype(int), cluster_size.astype(int), int(N_mut)
 
 
+def _sample_cna_states(
+    rng: np.random.Generator,
+    no_mutations: int,
+    amp_rate: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    major_cn = np.ones(no_mutations, dtype=int)
+    minor_cn = np.ones(no_mutations, dtype=int)
+    multiplicity = np.ones(no_mutations, dtype=int)
+    multiplicity_source = np.full(no_mutations, "fixed", dtype=object)
+
+    if amp_rate <= 0.0 or no_mutations <= 0:
+        return major_cn, minor_cn, multiplicity, multiplicity_source
+
+    amp_mask = rng.random(no_mutations) < amp_rate
+    n_amp = int(amp_mask.sum())
+    if n_amp == 0:
+        return major_cn, minor_cn, multiplicity, multiplicity_source
+
+    major_amp = np.empty(n_amp, dtype=int)
+    minor_amp = np.empty(n_amp, dtype=int)
+    multiplicity_amp = np.empty(n_amp, dtype=int)
+    source_amp = np.empty(n_amp, dtype=object)
+
+    filled = 0
+    while filled < n_amp:
+        batch_size = max(2 * (n_amp - filled), 16)
+        allele_a = rng.integers(0, 5, size=batch_size)
+        allele_b = rng.integers(0, 5, size=batch_size)
+        cand_major = np.maximum(allele_a, allele_b)
+        cand_minor = np.minimum(allele_a, allele_b)
+
+        valid = ((cand_major + cand_minor) > 0) & ~((cand_major == 1) & (cand_minor == 1))
+        if not np.any(valid):
+            continue
+
+        valid_idx = np.flatnonzero(valid)
+        take = min(valid_idx.size, n_amp - filled)
+        idx = valid_idx[:take]
+
+        maj = cand_major[idx]
+        minr = cand_minor[idx]
+        ambiguous = (maj > minr) & (minr > 0)
+        choose_major = np.ones(take, dtype=bool)
+        if ambiguous.any():
+            choose_major[ambiguous] = rng.random(int(ambiguous.sum())) < 0.5
+
+        mult = np.where(choose_major, maj, minr)
+        src = np.full(take, "fixed", dtype=object)
+        src[minr == 0] = "major"
+        if ambiguous.any():
+            src[ambiguous] = np.where(choose_major[ambiguous], "major", "minor")
+
+        end = filled + take
+        major_amp[filled:end] = maj
+        minor_amp[filled:end] = minr
+        multiplicity_amp[filled:end] = mult
+        source_amp[filled:end] = src
+        filled = end
+
+    major_cn[amp_mask] = major_amp
+    minor_cn[amp_mask] = minor_amp
+    multiplicity[amp_mask] = multiplicity_amp
+    multiplicity_source[amp_mask] = source_amp
+    return major_cn, minor_cn, multiplicity, multiplicity_source
+
+
 def _write_patient_simulation(
     rng: np.random.Generator,
     out_dir: Path,
@@ -370,19 +435,12 @@ def _write_patient_simulation(
     ).to_csv(data_dir / "purity.txt", sep="\t", index=False)
 
     for j in range(n_samples):
-        minor_j = np.ones(no_mutations, dtype=int)
-        total_j = 2 * np.ones(no_mutations, dtype=int)
-        if amp_rate > 0.0:
-            tmp = bernoulli.rvs(amp_rate, size=no_mutations, random_state=rng).astype(bool)
-            n_amp = int(tmp.sum())
-            if n_amp > 0:
-                minor_amp = rng.integers(1, 5, size=n_amp)
-                ref_amp = rng.integers(0, 5, size=n_amp)
-                minor_j[tmp] = minor_amp
-                total_j[tmp] = minor_amp + ref_amp
-
-        major_cn_j = np.maximum(total_j - minor_j, minor_j)
-        minor_cn_j = np.minimum(total_j - minor_j, minor_j)
+        major_cn_j, minor_cn_j, multiplicity_j, multiplicity_source_j = _sample_cna_states(
+            rng=rng,
+            no_mutations=no_mutations,
+            amp_rate=amp_rate,
+        )
+        total_j = major_cn_j + minor_cn_j
         pd.DataFrame(
             {
                 "chromosome_index": np.ones(no_mutations, dtype=int),
@@ -391,14 +449,15 @@ def _write_patient_simulation(
                 "major_cn": major_cn_j,
                 "minor_cn": minor_cn_j,
                 "total_cn": total_j,
-                "multiplicity": minor_j,
+                "multiplicity": multiplicity_j,
+                "multiplicity_source": multiplicity_source_j,
             }
         ).to_csv(data_dir / f"sample{j}" / "cna.txt", sep="\t", index=False)
 
         mutation_ccf_sample_j = ccf_samples_clones[cluster_id, j]
         purity_j = sample_purities[j]
         n_j = rng.poisson(N_mean, size=no_mutations)
-        vaf_j = purity_j * mutation_ccf_sample_j * minor_j / (2 * (1 - purity_j) + purity_j * total_j)
+        vaf_j = purity_j * mutation_ccf_sample_j * multiplicity_j / (2 * (1 - purity_j) + purity_j * total_j)
         r_j = rng.binomial(n_j, vaf_j)
         ref_j = n_j - r_j
 
