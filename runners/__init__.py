@@ -1,3 +1,4 @@
+from .model_selection import ModelSelectionResult, select_model
 from .benchmark import run_simulation_benchmark
 from .multiregion_benchmark import MassiveMultiregionBenchmarkConfig, run_massive_multiregion_benchmark
 from .outputs import (
@@ -20,6 +21,7 @@ from .single_region_benchmark import run_single_region_cohort_benchmark
 
 __all__ = [
     "MassiveMultiregionBenchmarkConfig",
+    "ModelSelectionResult",
     "PatientRegime",
     "RecommendedSettings",
     "cell_output_table",
@@ -36,6 +38,7 @@ __all__ = [
     "run_massive_multiregion_benchmark",
     "run_simulation_benchmark",
     "run_single_region_cohort_benchmark",
+    "select_model",
     "summarize_patient_regime",
     "write_fit_outputs",
 ]

@@ -25,7 +25,7 @@ class FitOptions:
     major_prior: float = 0.5
     eps: float = 1e-6
     fused_tol: float = 1e-3
-    center_merge_tol: float = 1e-1
+    center_merge_tol: float = 8e-2
     device: str = "auto"
     verbose: bool = False
 
@@ -49,6 +49,17 @@ class FitResult:
     z_norm: np.ndarray
     history: list[float] = field(default_factory=list)
     bic: float | None = None
+
+
+@dataclass
+class RawFitResult:
+    phi: np.ndarray
+    z_norm: np.ndarray
+    lambda_value: float
+    iterations: int
+    converged: bool
+    device: str
+    history: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -110,6 +121,15 @@ def _make_torch_context(data: PatientData, graph: GraphData, device: torch.devic
         degree=degree,
         num_edges=int(graph.num_edges),
     )
+
+
+def make_fit_context(
+    data: PatientData,
+    graph: GraphData,
+    device: str | torch.device = "auto",
+) -> _TorchFitContext:
+    resolved_device = device if isinstance(device, torch.device) else _resolve_device(str(device))
+    return _make_torch_context(data=data, graph=graph, device=resolved_device)
 
 
 def _torch_e_step(
@@ -468,6 +488,26 @@ def fit_single_stage_em(
     options: FitOptions,
     phi_start: np.ndarray | None = None,
 ) -> FitResult:
+    raw_fit = fit_single_stage_em_raw(
+        data=data,
+        graph=graph,
+        options=options,
+        phi_start=phi_start,
+    )
+    return finalize_raw_fit(
+        data=data,
+        graph=graph,
+        raw_fit=raw_fit,
+        options=options,
+    )
+
+
+def fit_single_stage_em_raw(
+    data: PatientData,
+    graph: GraphData,
+    options: FitOptions,
+    phi_start: np.ndarray | None = None,
+) -> RawFitResult:
     device = _resolve_device(options.device)
     context = _make_torch_context(data=data, graph=graph, device=device)
 
@@ -519,6 +559,32 @@ def fit_single_stage_em(
         z = z_t.detach().cpu().numpy().astype(np.float32)
 
     z_norm = np.linalg.norm(z, axis=1) if graph.num_edges > 0 else np.zeros(0, dtype=np.float32)
+    return RawFitResult(
+        phi=phi.astype(np.float32),
+        z_norm=z_norm.astype(np.float32),
+        lambda_value=float(options.lambda_value),
+        iterations=len(history),
+        converged=converged,
+        device=str(device),
+        history=history,
+    )
+
+
+def finalize_raw_fit(
+    data: PatientData,
+    graph: GraphData,
+    raw_fit: RawFitResult,
+    options: FitOptions,
+    context: _TorchFitContext | None = None,
+) -> FitResult:
+    if context is None:
+        device = _resolve_device(options.device)
+        context = _make_torch_context(data=data, graph=graph, device=device)
+    else:
+        device = context.device
+
+    phi = raw_fit.phi.astype(np.float32, copy=True)
+    z_norm = raw_fit.z_norm.astype(np.float32, copy=True)
     cluster_labels, cluster_centers, phi_clustered = _cluster_profiles(
         phi=phi,
         graph=graph,
@@ -561,9 +627,9 @@ def fit_single_stage_em(
         penalized_objective=penalized_objective,
         lambda_value=float(options.lambda_value),
         n_clusters=int(cluster_centers.shape[0]),
-        iterations=len(history),
-        converged=converged,
-        device=str(device),
+        iterations=int(raw_fit.iterations),
+        converged=bool(raw_fit.converged),
+        device=str(raw_fit.device),
         z_norm=z_norm.astype(np.float32),
-        history=history,
+        history=list(raw_fit.history),
     )

@@ -16,7 +16,7 @@ import pandas as pd
 from ..core.model import FitOptions
 from ..io.conversion import convert_one_patient
 from ..sim.generation import parse_float_list, parse_int_list, write_patient_simulation
-from .benchmark import _aggregate_patient_results, _parse_patient_id
+from .benchmark import _add_cluster_count_metrics, _aggregate_patient_results, _parse_patient_id
 from .pipeline import process_one_file
 
 
@@ -145,6 +145,9 @@ def _run_case_worker(
     settings_profile: str,
     use_warm_starts: bool,
     write_patient_outputs: bool,
+    bo_max_evals: int,
+    bo_init_points: int,
+    bo_random_seed: int,
     temp_sim_root: str | Path,
     temp_tsv_root: str | Path,
     outdir: str | Path,
@@ -174,6 +177,9 @@ def _run_case_worker(
             settings_profile=settings_profile,
             use_warm_starts=use_warm_starts,
             write_outputs=write_patient_outputs,
+            bo_max_evals=bo_max_evals,
+            bo_init_points=bo_init_points,
+            bo_random_seed=bo_random_seed,
         )
         return {**_parse_patient_id(out_tsv.stem), **summary}
     finally:
@@ -185,12 +191,16 @@ def _run_case_worker(
 
 
 def _aggregate_simple(patient_df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    patient_df = _add_cluster_count_metrics(patient_df)
     return (
         patient_df.groupby(columns, dropna=False)
         .agg(
             n_patients=("patient_id", "size"),
             mean_true_K=("true_K", "mean"),
             mean_estimated_clusters=("n_clusters", "mean"),
+            mean_cluster_count_error=("cluster_count_error", "mean"),
+            mean_abs_cluster_count_error=("abs_cluster_count_error", "mean"),
+            exact_cluster_count_match_rate=("cluster_count_exact_match", "mean"),
             mean_ARI=("ARI", "mean"),
             median_ARI=("ARI", "median"),
             mean_cp_rmse=("cp_rmse", "mean"),
@@ -208,11 +218,14 @@ def run_massive_multiregion_benchmark(
     lambda_grid: list[float] | None = None,
     lambda_grid_mode: str = "dense_no_zero",
     graph_k: int = 8,
-    bic_df_scale: float = 10.0,
-    bic_cluster_penalty: float = 6.0,
+    bic_df_scale: float = 8.0,
+    bic_cluster_penalty: float = 4.0,
     settings_profile: str = "auto",
     use_warm_starts: bool = True,
     write_patient_outputs: bool = False,
+    bo_max_evals: int = 12,
+    bo_init_points: int = 5,
+    bo_random_seed: int = 0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     outdir = Path(config.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -251,6 +264,9 @@ def run_massive_multiregion_benchmark(
             settings_profile=settings_profile,
             use_warm_starts=use_warm_starts,
             write_outputs=write_patient_outputs,
+            bo_max_evals=bo_max_evals,
+            bo_init_points=bo_init_points,
+            bo_random_seed=bo_random_seed,
         )
         patient_rows.append({**_parse_patient_id(out_tsv.stem), **summary})
         case_index += 1
@@ -260,9 +276,12 @@ def run_massive_multiregion_benchmark(
             shutil.rmtree(patient_dir, ignore_errors=True)
 
         if case_index % max(config.flush_every, 1) == 0 or case_index == total_cases:
-            patient_df = pd.DataFrame(patient_rows).sort_values(
-                ["N_mean", "purity", "amp_rate", "n_samples", "rep"]
-            ).reset_index(drop=True)
+            patient_df = (
+                pd.DataFrame(patient_rows)
+                .sort_values(["N_mean", "purity", "amp_rate", "n_samples", "rep"])
+                .reset_index(drop=True)
+            )
+            patient_df = _add_cluster_count_metrics(patient_df)
             patient_df.to_csv(outdir / "benchmark_patients.tsv", sep="\t", index=False)
             elapsed = perf_counter() - start_time
             rate = case_index / max(elapsed, 1e-9)
@@ -301,6 +320,9 @@ def run_massive_multiregion_benchmark(
                     settings_profile,
                     use_warm_starts,
                     write_patient_outputs,
+                    bo_max_evals,
+                    bo_init_points,
+                    bo_random_seed,
                     temp_sim_root,
                     temp_tsv_root,
                     outdir,
@@ -316,9 +338,12 @@ def run_massive_multiregion_benchmark(
                         patient_rows.append(row)
                         case_index += 1
                         if case_index % max(config.flush_every, 1) == 0 or case_index == total_cases:
-                            patient_df = pd.DataFrame(patient_rows).sort_values(
-                                ["N_mean", "purity", "amp_rate", "n_samples", "rep"]
-                            ).reset_index(drop=True)
+                            patient_df = (
+                                pd.DataFrame(patient_rows)
+                                .sort_values(["N_mean", "purity", "amp_rate", "n_samples", "rep"])
+                                .reset_index(drop=True)
+                            )
+                            patient_df = _add_cluster_count_metrics(patient_df)
                             patient_df.to_csv(outdir / "benchmark_patients.tsv", sep="\t", index=False)
                             elapsed = perf_counter() - start_time
                             rate = case_index / max(elapsed, 1e-9)
@@ -348,6 +373,9 @@ def run_massive_multiregion_benchmark(
                             settings_profile,
                             use_warm_starts,
                             write_patient_outputs,
+                            bo_max_evals,
+                            bo_init_points,
+                            bo_random_seed,
                             temp_sim_root,
                             temp_tsv_root,
                             outdir,
@@ -405,7 +433,12 @@ def run_massive_multiregion_benchmark(
                             )
                             future_map[next_future] = spec
 
-    patient_df = pd.DataFrame(patient_rows).sort_values(["N_mean", "purity", "amp_rate", "n_samples", "rep"]).reset_index(drop=True)
+    patient_df = (
+        pd.DataFrame(patient_rows)
+        .sort_values(["N_mean", "purity", "amp_rate", "n_samples", "rep"])
+        .reset_index(drop=True)
+    )
+    patient_df = _add_cluster_count_metrics(patient_df)
     scenario_df, global_df = _aggregate_patient_results(patient_df)
     by_samples_df = _aggregate_simple(patient_df, ["n_samples"])
     by_depth_df = _aggregate_simple(patient_df, ["N_mean"])
@@ -473,15 +506,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--em-tol", type=float, default=1e-4, help="Relative EM stopping tolerance.")
     parser.add_argument("--admm-tol", type=float, default=5e-3, help="ADMM stopping tolerance.")
     parser.add_argument("--fused-tol", type=float, default=1e-3, help="Tolerance for calling an edge fused.")
-    parser.add_argument("--center-merge-tol", type=float, default=1e-1, help="Cluster-center merge threshold.")
-    parser.add_argument("--bic-df-scale", type=float, default=10.0, help="Extended BIC CP degrees-of-freedom scale.")
-    parser.add_argument("--bic-cluster-penalty", type=float, default=6.0, help="Extended BIC cluster-count penalty.")
+    parser.add_argument("--center-merge-tol", type=float, default=8e-2, help="Cluster-center merge threshold.")
+    parser.add_argument("--bic-df-scale", type=float, default=8.0, help="Extended BIC CP degrees-of-freedom scale.")
+    parser.add_argument("--bic-cluster-penalty", type=float, default=4.0, help="Extended BIC cluster-count penalty.")
     parser.add_argument(
         "--settings-profile",
-        choices=["manual", "auto"],
+        choices=["manual", "auto", "bayes", "legacy_auto"],
         default="auto",
-        help="Use fixed manual settings or the rule-based auto profile learned from simulation benchmarks.",
+        help="Model-selection strategy: manual fixed settings, bayes/auto Bayesian optimization, or legacy_auto for the old rule-based baseline.",
     )
+    parser.add_argument("--bo-max-evals", type=int, default=12, help="Maximum Bayesian optimization evaluations per patient when --settings-profile is bayes/auto.")
+    parser.add_argument("--bo-init-points", type=int, default=5, help="Number of initial design points before Gaussian-process-guided proposals.")
+    parser.add_argument("--bo-random-seed", type=int, default=0, help="Random seed used by the Bayesian optimizer.")
     parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability for major-copy multiplicity.")
     parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
     parser.add_argument("--write-patient-outputs", action="store_true", help="Write full per-patient result files.")
@@ -562,6 +598,9 @@ def main() -> None:
         settings_profile=args.settings_profile,
         use_warm_starts=not args.disable_warm_start,
         write_patient_outputs=args.write_patient_outputs,
+        bo_max_evals=args.bo_max_evals,
+        bo_init_points=args.bo_init_points,
+        bo_random_seed=args.bo_random_seed,
     )
     print(global_df.to_string(index=False))
     print(_aggregate_simple(patient_df, ["n_samples"]).to_string(index=False))

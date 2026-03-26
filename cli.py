@@ -81,27 +81,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--center-merge-tol",
         type=float,
-        default=1e-1,
+        default=8e-2,
         help="Global distance threshold for merging nearly identical fused CP profiles.",
     )
     parser.add_argument(
         "--bic-df-scale",
         type=float,
-        default=10.0,
+        default=8.0,
         help="Scale factor on the CP-profile degrees of freedom in the extended BIC selection score.",
     )
     parser.add_argument(
         "--bic-cluster-penalty",
         type=float,
-        default=6.0,
+        default=4.0,
         help="Additional cluster-count complexity penalty in the extended BIC selection score.",
     )
     parser.add_argument(
         "--settings-profile",
-        choices=["manual", "auto"],
+        choices=["manual", "auto", "bayes", "legacy_auto"],
         default="auto",
-        help="Use fixed manual settings or the rule-based auto profile learned from simulation benchmarks.",
+        help="Model-selection strategy: manual fixed settings, bayes/auto Bayesian optimization, or legacy_auto for the old rule-based baseline.",
     )
+    parser.add_argument("--bo-max-evals", type=int, default=12, help="Maximum Bayesian optimization evaluations per patient when --settings-profile is bayes/auto.")
+    parser.add_argument("--bo-init-points", type=int, default=5, help="Number of initial design points before Gaussian-process-guided proposals.")
+    parser.add_argument("--bo-random-seed", type=int, default=0, help="Random seed used by the Bayesian optimizer.")
     parser.add_argument(
         "--disable-warm-start",
         action="store_true",
@@ -159,6 +162,9 @@ def main() -> None:
             settings_profile=args.settings_profile,
             use_warm_starts=not args.disable_warm_start,
             write_patient_outputs=not args.skip_patient_outputs,
+            bo_max_evals=args.bo_max_evals,
+            bo_init_points=args.bo_init_points,
+            bo_random_seed=args.bo_random_seed,
         )
         print(global_df.to_string(index=False))
         print(scenario_df.head().to_string(index=False))
@@ -178,6 +184,9 @@ def main() -> None:
             settings_profile=args.settings_profile,
             use_warm_starts=not args.disable_warm_start,
             write_outputs=not args.skip_patient_outputs,
+            bo_max_evals=args.bo_max_evals,
+            bo_init_points=args.bo_init_points,
+            bo_random_seed=args.bo_random_seed,
         )
         print(summary)
         return
@@ -196,6 +205,9 @@ def main() -> None:
         settings_profile=args.settings_profile,
         use_warm_starts=not args.disable_warm_start,
         write_outputs=not args.skip_patient_outputs,
+        bo_max_evals=args.bo_max_evals,
+        bo_init_points=args.bo_init_points,
+        bo_random_seed=args.bo_random_seed,
     )
     print(summary_df.head().to_string(index=False))
 

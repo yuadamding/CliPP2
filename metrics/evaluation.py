@@ -86,12 +86,9 @@ def evaluate_fit_against_simulation(
             truth_phi[:, column] = truth_cp["ccf"].to_numpy(dtype=np.float32)
             truth_multiplicity[:, column] = cna["multiplicity"].to_numpy(dtype=np.float32)
 
-    mutation_has_complete_cna = np.all(data.has_cna, axis=1)
-    mutation_has_non_diploid_cna = np.any((data.major_cn != 1.0) | (data.minor_cn != 1.0), axis=1)
-    eval_mask = mutation_has_complete_cna & mutation_has_non_diploid_cna
-
+    eval_mask = np.ones(data.num_mutations, dtype=bool)
     n_eval_mutations = int(eval_mask.sum())
-    n_filtered_mutations = int(data.num_mutations - n_eval_mutations)
+    n_filtered_mutations = 0
     if n_eval_mutations == 0:
         return SimulationEvaluation(
             ari=float("nan"),
@@ -108,9 +105,15 @@ def evaluate_fit_against_simulation(
     if truth_multiplicity is None:
         multiplicity_accuracy = float("nan")
     else:
-        multiplicity_accuracy = float(
-            np.mean(np.isclose(fit.multiplicity_call[eval_mask], truth_multiplicity[eval_mask]))
+        cna_mask = np.all(data.has_cna, axis=1) & np.any(
+            (data.major_cn != 1.0) | (data.minor_cn != 1.0), axis=1
         )
+        if not cna_mask.any():
+            multiplicity_accuracy = float("nan")
+        else:
+            multiplicity_accuracy = float(
+                np.mean(np.isclose(fit.multiplicity_call[cna_mask], truth_multiplicity[cna_mask]))
+            )
 
     return SimulationEvaluation(
         ari=ari,

@@ -68,7 +68,19 @@ def _select_representative_files_with_filter(
     return selected
 
 
+def _add_cluster_count_metrics(patient_df: pd.DataFrame) -> pd.DataFrame:
+    enriched_df = patient_df.copy()
+    cluster_count_error = enriched_df["n_clusters"] - enriched_df["true_K"]
+    enriched_df["cluster_count_error"] = cluster_count_error
+    enriched_df["abs_cluster_count_error"] = cluster_count_error.abs()
+    enriched_df["cluster_count_exact_match"] = (
+        enriched_df["n_clusters"] == enriched_df["true_K"]
+    ).astype(float)
+    return enriched_df
+
+
 def _aggregate_patient_results(patient_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    patient_df = _add_cluster_count_metrics(patient_df)
     scenario_df = (
         patient_df.groupby(["N_mean", "purity", "amp_rate", "n_samples"], dropna=False)
         .agg(
@@ -76,6 +88,9 @@ def _aggregate_patient_results(patient_df: pd.DataFrame) -> tuple[pd.DataFrame, 
             mean_true_K=("true_K", "mean"),
             mean_selected_lambda=("selected_lambda", "mean"),
             mean_estimated_clusters=("n_clusters", "mean"),
+            mean_cluster_count_error=("cluster_count_error", "mean"),
+            mean_abs_cluster_count_error=("abs_cluster_count_error", "mean"),
+            exact_cluster_count_match_rate=("cluster_count_exact_match", "mean"),
             mean_ARI=("ARI", "mean"),
             median_ARI=("ARI", "median"),
             mean_cp_rmse=("cp_rmse", "mean"),
@@ -97,6 +112,9 @@ def _aggregate_patient_results(patient_df: pd.DataFrame) -> tuple[pd.DataFrame, 
                 "mean_cp_rmse": float(patient_df["cp_rmse"].mean()),
                 "mean_multiplicity_accuracy": float(patient_df["multiplicity_accuracy"].mean()),
                 "mean_estimated_clusters": float(patient_df["n_clusters"].mean()),
+                "mean_cluster_count_error": float(patient_df["cluster_count_error"].mean()),
+                "mean_abs_cluster_count_error": float(patient_df["abs_cluster_count_error"].mean()),
+                "exact_cluster_count_match_rate": float(patient_df["cluster_count_exact_match"].mean()),
                 "mean_eval_mutations": float(patient_df["n_eval_mutations"].mean()),
                 "mean_filtered_mutations": float(patient_df["n_filtered_mutations"].mean()),
                 "mean_elapsed_seconds": float(patient_df["elapsed_seconds"].mean()),
@@ -116,11 +134,14 @@ def run_simulation_benchmark(
     lambda_grid_mode: str = "dense_no_zero",
     graph_k: int = 8,
     fit_options: FitOptions | None = None,
-    bic_df_scale: float = 10.0,
-    bic_cluster_penalty: float = 6.0,
+    bic_df_scale: float = 8.0,
+    bic_cluster_penalty: float = 4.0,
     settings_profile: str = "auto",
     use_warm_starts: bool = True,
     write_patient_outputs: bool = True,
+    bo_max_evals: int = 12,
+    bo_init_points: int = 5,
+    bo_random_seed: int = 0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     input_dir = Path(input_dir)
     simulation_root = Path(simulation_root)
@@ -157,10 +178,18 @@ def run_simulation_benchmark(
                 settings_profile=settings_profile,
                 use_warm_starts=use_warm_starts,
                 write_outputs=write_patient_outputs,
+                bo_max_evals=bo_max_evals,
+                bo_init_points=bo_init_points,
+                bo_random_seed=bo_random_seed,
             )
             patient_rows.append({**_parse_patient_id(file_path.stem), **summary})
 
-    patient_df = pd.DataFrame(patient_rows).sort_values(["N_mean", "purity", "amp_rate", "n_samples", "rep"]).reset_index(drop=True)
+    patient_df = (
+        pd.DataFrame(patient_rows)
+        .sort_values(["N_mean", "purity", "amp_rate", "n_samples", "rep"])
+        .reset_index(drop=True)
+    )
+    patient_df = _add_cluster_count_metrics(patient_df)
     scenario_df, global_df = _aggregate_patient_results(patient_df)
 
     patient_df.to_csv(outdir / "benchmark_patients.tsv", sep="\t", index=False)
