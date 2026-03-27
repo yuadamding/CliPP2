@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import adjusted_rand_score
+from sklearn.metrics import adjusted_rand_score, f1_score
 
 from ..core.model import FitResult
 from ..io.data import PatientData
@@ -16,7 +16,10 @@ from ..io.data import PatientData
 class SimulationEvaluation:
     ari: float
     cp_rmse: float
-    multiplicity_accuracy: float
+    multiplicity_f1: float
+    estimated_clonal_fraction: float
+    true_clonal_fraction: float
+    clonal_fraction_error: float
     true_clusters: int
     estimated_clusters: int
     n_eval_mutations: int
@@ -53,6 +56,24 @@ def _load_single_region_truth(
             truth_multiplicity = cna["multiplicity"].to_numpy(dtype=np.float32).reshape(-1, 1)
 
     return truth_clusters, truth_phi, truth_multiplicity
+
+
+def _cluster_level_clonal_fraction(phi: np.ndarray, labels: np.ndarray) -> float:
+    if phi.size == 0 or labels.size == 0:
+        return float("nan")
+
+    unique_labels, relabeled = np.unique(labels.astype(np.int64), return_inverse=True)
+    if unique_labels.size == 0:
+        return float("nan")
+
+    centers = np.zeros((unique_labels.size, phi.shape[1]), dtype=np.float32)
+    for label in range(unique_labels.size):
+        centers[label] = phi[relabeled == label].mean(axis=0)
+
+    clonal_target = np.ones((phi.shape[1],), dtype=np.float32)
+    rms_distance = np.sqrt(np.mean((centers - clonal_target[None, :]) ** 2, axis=1))
+    clonal_label = int(np.argmin(rms_distance))
+    return float(np.mean(relabeled == clonal_label))
 
 
 def evaluate_fit_against_simulation(
@@ -93,7 +114,10 @@ def evaluate_fit_against_simulation(
         return SimulationEvaluation(
             ari=float("nan"),
             cp_rmse=float("nan"),
-            multiplicity_accuracy=float("nan"),
+            multiplicity_f1=float("nan"),
+            estimated_clonal_fraction=float("nan"),
+            true_clonal_fraction=float("nan"),
+            clonal_fraction_error=float("nan"),
             true_clusters=int(np.unique(truth_clusters).shape[0]),
             estimated_clusters=int(fit.n_clusters),
             n_eval_mutations=0,
@@ -102,23 +126,40 @@ def evaluate_fit_against_simulation(
 
     ari = float(adjusted_rand_score(truth_clusters[eval_mask], fit.cluster_labels[eval_mask]))
     cp_rmse = float(np.sqrt(np.mean((fit.phi_clustered[eval_mask] - truth_phi[eval_mask]) ** 2)))
+    estimated_clonal_fraction = _cluster_level_clonal_fraction(
+        fit.phi_clustered[eval_mask],
+        fit.cluster_labels[eval_mask],
+    )
+    true_clonal_fraction = _cluster_level_clonal_fraction(
+        truth_phi[eval_mask],
+        truth_clusters[eval_mask],
+    )
+    clonal_fraction_error = float(estimated_clonal_fraction - true_clonal_fraction)
     if truth_multiplicity is None:
-        multiplicity_accuracy = float("nan")
+        multiplicity_f1 = float("nan")
     else:
-        cna_mask = np.all(data.has_cna, axis=1) & np.any(
-            (data.major_cn != 1.0) | (data.minor_cn != 1.0), axis=1
-        )
-        if not cna_mask.any():
-            multiplicity_accuracy = float("nan")
+        cna_subject_mask = data.has_cna & ((data.major_cn != 1.0) | (data.minor_cn != 1.0))
+        if not cna_subject_mask.any():
+            multiplicity_f1 = float("nan")
         else:
-            multiplicity_accuracy = float(
-                np.mean(np.isclose(fit.multiplicity_call[cna_mask], truth_multiplicity[cna_mask]))
+            truth_major = np.isclose(truth_multiplicity[cna_subject_mask], data.major_cn[cna_subject_mask])
+            pred_major = np.isclose(fit.multiplicity_call[cna_subject_mask], data.major_cn[cna_subject_mask])
+            multiplicity_f1 = float(
+                f1_score(
+                    truth_major.astype(int).reshape(-1),
+                    pred_major.astype(int).reshape(-1),
+                    average="macro",
+                    zero_division=0,
+                )
             )
 
     return SimulationEvaluation(
         ari=ari,
         cp_rmse=cp_rmse,
-        multiplicity_accuracy=multiplicity_accuracy,
+        multiplicity_f1=multiplicity_f1,
+        estimated_clonal_fraction=estimated_clonal_fraction,
+        true_clonal_fraction=true_clonal_fraction,
+        clonal_fraction_error=clonal_fraction_error,
         true_clusters=int(np.unique(truth_clusters).shape[0]),
         estimated_clusters=int(fit.n_clusters),
         n_eval_mutations=n_eval_mutations,

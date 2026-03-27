@@ -64,8 +64,7 @@ def process_one_file(
     if best_evaluation is None and simulation_root is not None and (Path(simulation_root) / data.patient_id).exists():
         best_evaluation = evaluate_fit_against_simulation(fit=best_fit, data=data, simulation_root=simulation_root)
 
-    if write_outputs:
-        write_fit_outputs(outdir=outdir, data=data, fit=best_fit, search_df=search_df, evaluation=best_evaluation)
+    elapsed_seconds = float(perf_counter() - start_time)
 
     summary = {
         "patient_id": data.patient_id,
@@ -90,11 +89,30 @@ def process_one_file(
         "device": best_fit.device,
         "ARI": np.nan if best_evaluation is None else float(best_evaluation.ari),
         "cp_rmse": np.nan if best_evaluation is None else float(best_evaluation.cp_rmse),
-        "multiplicity_accuracy": np.nan if best_evaluation is None else float(best_evaluation.multiplicity_accuracy),
+        "multiplicity_f1": np.nan if best_evaluation is None else float(best_evaluation.multiplicity_f1),
+        "estimated_clonal_fraction": np.nan
+        if best_evaluation is None
+        else float(best_evaluation.estimated_clonal_fraction),
+        "true_clonal_fraction": np.nan
+        if best_evaluation is None
+        else float(best_evaluation.true_clonal_fraction),
+        "clonal_fraction_error": np.nan
+        if best_evaluation is None
+        else float(best_evaluation.clonal_fraction_error),
         "n_eval_mutations": np.nan if best_evaluation is None else int(best_evaluation.n_eval_mutations),
         "n_filtered_mutations": np.nan if best_evaluation is None else int(best_evaluation.n_filtered_mutations),
-        "elapsed_seconds": float(perf_counter() - start_time),
+        "elapsed_seconds": elapsed_seconds,
     }
+
+    if write_outputs:
+        write_fit_outputs(
+            outdir=outdir,
+            data=data,
+            fit=best_fit,
+            search_df=search_df,
+            evaluation=best_evaluation,
+            run_summary=summary,
+        )
     return summary
 
 

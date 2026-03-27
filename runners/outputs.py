@@ -63,7 +63,10 @@ def evaluation_to_frame(evaluation: SimulationEvaluation) -> pd.DataFrame:
             {
                 "ARI": evaluation.ari,
                 "cp_rmse": evaluation.cp_rmse,
-                "multiplicity_accuracy": evaluation.multiplicity_accuracy,
+                "multiplicity_f1": evaluation.multiplicity_f1,
+                "estimated_clonal_fraction": evaluation.estimated_clonal_fraction,
+                "true_clonal_fraction": evaluation.true_clonal_fraction,
+                "clonal_fraction_error": evaluation.clonal_fraction_error,
                 "true_clusters": evaluation.true_clusters,
                 "estimated_clusters": evaluation.estimated_clusters,
                 "n_eval_mutations": evaluation.n_eval_mutations,
@@ -79,6 +82,7 @@ def write_fit_outputs(
     fit: FitResult,
     search_df: pd.DataFrame,
     evaluation: SimulationEvaluation | None,
+    run_summary: dict[str, float | int | str | bool] | None = None,
 ) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     mutation_output_table(data, fit).to_csv(
@@ -104,6 +108,12 @@ def write_fit_outputs(
     if evaluation is not None:
         evaluation_to_frame(evaluation).to_csv(
             outdir / f"{data.patient_id}_simulation_eval.tsv",
+            sep="\t",
+            index=False,
+        )
+    if run_summary is not None:
+        pd.DataFrame([run_summary]).to_csv(
+            outdir / f"{data.patient_id}_run_summary.tsv",
             sep="\t",
             index=False,
         )

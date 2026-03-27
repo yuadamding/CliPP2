@@ -99,6 +99,8 @@ def _evaluate_candidate(
     if evaluate_candidate and simulation_root is not None and (simulation_root / data.patient_id).exists():
         evaluation = evaluate_fit_against_simulation(fit=best_fit, data=data, simulation_root=simulation_root)
 
+    largest_cluster_fraction, small_cluster_count, small_cluster_mass, raw_spread = _fit_cluster_metrics(best_fit, data)
+
     row: dict[str, float | int | str | bool] = {
         "patient_id": data.patient_id,
         "selection_method": selection_method,
@@ -117,10 +119,14 @@ def _evaluate_candidate(
         "converged": bool(best_fit.converged),
         "iterations": int(best_fit.iterations),
         "device": str(best_fit.device),
+        "largest_cluster_fraction": largest_cluster_fraction,
+        "small_cluster_count": int(small_cluster_count),
+        "small_cluster_mass": float(small_cluster_mass),
+        "raw_phi_spread": float(raw_spread),
         "acquisition_value": np.nan if acquisition_value is None else float(acquisition_value),
         "ARI": np.nan if evaluation is None else float(evaluation.ari),
         "cp_rmse": np.nan if evaluation is None else float(evaluation.cp_rmse),
-        "multiplicity_accuracy": np.nan if evaluation is None else float(evaluation.multiplicity_accuracy),
+        "multiplicity_f1": np.nan if evaluation is None else float(evaluation.multiplicity_f1),
         "n_eval_mutations": np.nan if evaluation is None else int(evaluation.n_eval_mutations),
         "n_filtered_mutations": np.nan if evaluation is None else int(evaluation.n_filtered_mutations),
     }
@@ -247,7 +253,7 @@ def _bo_bounds(
     if not lambda_seed:
         lambda_seed = default_lambda_grid(data, mode="dense_no_zero")
 
-    lambda_low = max(min(lambda_seed) * 0.5, 1e-6)
+    lambda_low = max(min(lambda_seed) * 0.2, 1e-6)
     lambda_high = max(lambda_seed) * 1.5
     if lambda_high <= lambda_low:
         lambda_high = lambda_low * 2.0
@@ -303,16 +309,86 @@ def _raw_candidate_key(lambda_value: float, graph_k: int) -> tuple[float, int]:
     return (round(float(lambda_value), 6), int(graph_k))
 
 
+def _small_cluster_threshold(data: PatientData) -> int:
+    adaptive = int(np.round(0.01 * float(data.num_mutations) / max(np.sqrt(float(max(data.num_samples, 1))), 1.0)))
+    return int(np.clip(max(adaptive, 2), 2, 25))
+
+
+def _fit_cluster_metrics(
+    fit: FitResult,
+    data: PatientData,
+) -> tuple[float, int, float, float]:
+    cluster_sizes = np.bincount(fit.cluster_labels, minlength=max(fit.n_clusters, 1)).astype(np.int64)
+    small_threshold = _small_cluster_threshold(data)
+    small_cluster_count = int(np.sum(cluster_sizes <= small_threshold))
+    small_cluster_mass = float(cluster_sizes[cluster_sizes <= small_threshold].sum() / max(data.num_mutations, 1))
+    largest_cluster_fraction = float(cluster_sizes.max() / max(data.num_mutations, 1))
+    raw_center = fit.phi.mean(axis=0, keepdims=True)
+    raw_spread = float(np.sqrt(np.mean((fit.phi - raw_center) ** 2)))
+    return largest_cluster_fraction, small_cluster_count, small_cluster_mass, raw_spread
+
+
+def _fit_has_tiny_clusters(fit: FitResult, data: PatientData) -> bool:
+    if fit.n_clusters <= 1:
+        return False
+    _, small_cluster_count, _, _ = _fit_cluster_metrics(fit, data)
+    return bool(small_cluster_count > 0)
+
+
+def _fit_is_collapsed(fit: FitResult, data: PatientData) -> bool:
+    largest_cluster_fraction, _, _, raw_spread = _fit_cluster_metrics(fit, data)
+    return bool(
+        largest_cluster_fraction >= 0.95
+        and raw_spread >= 0.08
+        and data.num_samples >= 3
+    )
+
+
+def _needs_local_refinement(fit: FitResult, data: PatientData) -> bool:
+    return bool(
+        data.num_samples <= 2
+        or fit.n_clusters <= 1
+        or _fit_has_tiny_clusters(fit, data)
+        or _fit_is_collapsed(fit, data)
+    )
+
+
+def _lambda_refine_grid(
+    lambda_value: float,
+    *,
+    lambda_bounds: tuple[float, float],
+    mode: str,
+) -> list[float]:
+    if mode == "low_samples":
+        ratios = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0]
+    elif mode == "collapsed":
+        ratios = [0.05, 0.1, 0.2, 0.4, 0.7, 1.0]
+    elif mode == "broad":
+        ratios = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5]
+    else:
+        ratios = [0.5, 0.75, 1.0, 1.25, 1.5]
+    candidates = []
+    for ratio in ratios:
+        value = float(np.clip(lambda_value * ratio, lambda_bounds[0], lambda_bounds[1]))
+        candidates.append(round(value, 6))
+    return sorted(set(candidates))
+
+
 def _center_search_grid(
     center_merge_tol: float,
     *,
     center_bounds: tuple[float, float],
+    include_stable_anchor: bool = False,
 ) -> list[float]:
     deltas = (-0.02, -0.01, 0.0, 0.01, 0.02)
     candidates = []
     for delta in deltas:
         value = float(np.clip(center_merge_tol + delta, center_bounds[0], center_bounds[1]))
         candidates.append(round(value, 5))
+    if include_stable_anchor:
+        for anchor in (0.06, 0.08, 0.10, 0.12):
+            value = float(np.clip(anchor, center_bounds[0], center_bounds[1]))
+            candidates.append(round(value, 5))
     return sorted(set(candidates))
 
 
@@ -393,9 +469,11 @@ def _bayesian_selection(
     lambda_mid = float(np.sqrt(lambda_bounds[0] * lambda_bounds[1]))
     initial_candidates: list[tuple[float, int, float]] = [
         (lambda_mid, int(np.clip(graph_k, graph_values[0], graph_values[-1])), center_mid),
+        (float(lambda_bounds[0]), int(np.clip(graph_k, graph_values[0], graph_values[-1])), center_mid),
         (float(lambda_seed[0]), int(np.clip(graph_k, graph_values[0], graph_values[-1])), center_mid),
         (float(lambda_seed[len(lambda_seed) // 2]), int(np.clip(graph_k, graph_values[0], graph_values[-1])), center_mid),
         (float(lambda_seed[-1]), int(np.clip(graph_k, graph_values[0], graph_values[-1])), center_mid),
+        (float(lambda_bounds[0]), 8 if 8 in graph_values else int(np.clip(graph_k, graph_values[0], graph_values[-1])), 0.08 if center_bounds[0] <= 0.08 <= center_bounds[1] else center_mid),
         (lambda_mid, int(graph_values[0]), center_bounds[0]),
         (lambda_mid, int(graph_values[-1]), center_bounds[1]),
     ]
@@ -559,6 +637,112 @@ def _bayesian_selection(
     )
     candidate_fits.append((refined_fit, refined_evaluation))
     search_rows.append(refined_row)
+
+    incumbent_index = int(np.argmin([fit.bic for fit, _ in candidate_fits]))
+    incumbent_fit, _ = candidate_fits[incumbent_index]
+    incumbent_row = search_rows[incumbent_index]
+    if _needs_local_refinement(incumbent_fit, data):
+        collapsed_fit = _fit_is_collapsed(incumbent_fit, data)
+        low_sample_fit = bool(data.num_samples <= 2)
+        if collapsed_fit:
+            lambda_mode = "collapsed"
+        elif low_sample_fit:
+            lambda_mode = "low_samples"
+        else:
+            lambda_mode = "broad"
+
+        lambda_candidates = _lambda_refine_grid(
+            float(incumbent_row["lambda"]),
+            lambda_bounds=lambda_bounds,
+            mode=lambda_mode,
+        )
+        if low_sample_fit:
+            graph_candidates = [
+                value
+                for value in sorted(
+                    set(
+                        [
+                            int(incumbent_row["graph_k"]),
+                            4,
+                            6,
+                            8,
+                            10,
+                        ]
+                        + [
+                            int(np.clip(int(incumbent_row["graph_k"]) + delta, graph_values[0], graph_values[-1]))
+                            for delta in (-2, -1, 1, 2)
+                        ]
+                    )
+                )
+                if graph_values[0] <= value <= graph_values[-1]
+            ]
+        elif collapsed_fit:
+            graph_candidates = [
+                value
+                for value in sorted(
+                    set(
+                        [
+                            int(incumbent_row["graph_k"]),
+                            4,
+                            6,
+                            8,
+                            10,
+                            12,
+                        ]
+                    )
+                )
+                if graph_values[0] <= value <= graph_values[-1]
+            ]
+        else:
+            graph_candidates = [int(incumbent_row["graph_k"])]
+
+        center_candidates = _center_search_grid(
+            float(incumbent_row["center_merge_tol"]),
+            center_bounds=center_bounds,
+            include_stable_anchor=bool(low_sample_fit or collapsed_fit),
+        )
+
+        for lambda_candidate in lambda_candidates:
+            for graph_candidate in graph_candidates:
+                if _candidate_key(lambda_candidate, graph_candidate, float(incumbent_row["center_merge_tol"])) in existing_keys:
+                    continue
+                existing_keys.add(_candidate_key(lambda_candidate, graph_candidate, float(incumbent_row["center_merge_tol"])))
+                graph = _graph_cache_get(
+                    graph_cache,
+                    data=data,
+                    graph_k=graph_candidate,
+                    device=fit_options.device,
+                )
+                context = _context_cache_get(
+                    context_cache,
+                    data=data,
+                    graph_k=graph_candidate,
+                    graph=graph,
+                    device=fit_options.device,
+                )
+                fit, evaluation, row = _evaluate_candidate(
+                    data=data,
+                    graph=graph,
+                    graph_k=graph_candidate,
+                    fit_options=fit_options,
+                    bic_df_scale=bic_df_scale,
+                    bic_cluster_penalty=bic_cluster_penalty,
+                    simulation_root=simulation_root,
+                    evaluate_candidate=evaluate_all_candidates,
+                    phi_start=phi_start_cache.get(graph_candidate),
+                    selection_method=selection_method,
+                    profile_name=profile_name,
+                    selection_step=len(search_rows),
+                    lambda_value=lambda_candidate,
+                    center_merge_tol=float(incumbent_row["center_merge_tol"]),
+                    center_candidates=center_candidates,
+                    raw_fit_cache=raw_fit_cache,
+                    context=context,
+                    acquisition_value=np.nan,
+                )
+                phi_start_cache[graph_candidate] = fit.phi.copy()
+                candidate_fits.append((fit, evaluation))
+                search_rows.append(row)
 
     best_index = int(np.argmin([fit.bic for fit, _ in candidate_fits]))
     best_fit, best_evaluation = candidate_fits[best_index]

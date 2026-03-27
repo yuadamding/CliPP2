@@ -516,6 +516,77 @@ def _merge_cluster_profiles(
     return merged_labels.astype(np.int64), merged_centers, merged_phi
 
 
+def _small_cluster_threshold(num_mutations: int, num_samples: int) -> int:
+    adaptive = int(np.round(0.01 * float(num_mutations) / max(np.sqrt(float(max(num_samples, 1))), 1.0)))
+    return int(np.clip(max(adaptive, 2), 2, 25))
+
+
+def _recompute_cluster_centers(
+    phi: np.ndarray,
+    cluster_labels: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    _, relabeled = np.unique(cluster_labels.astype(np.int64), return_inverse=True)
+    relabeled = relabeled.astype(np.int64)
+    num_clusters = int(relabeled.max()) + 1
+    centers = np.zeros((num_clusters, phi.shape[1]), dtype=np.float32)
+    for label in range(num_clusters):
+        centers[label] = phi[relabeled == label].mean(axis=0)
+    return relabeled, centers, centers[relabeled]
+
+
+def _cleanup_small_clusters(
+    phi: np.ndarray,
+    cluster_labels: np.ndarray,
+    cluster_centers: np.ndarray,
+    *,
+    num_samples: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if cluster_centers.shape[0] <= 1:
+        return cluster_labels, cluster_centers, cluster_centers[cluster_labels]
+
+    labels = cluster_labels.astype(np.int64, copy=True)
+    min_size = _small_cluster_threshold(phi.shape[0], num_samples=num_samples)
+
+    for _ in range(4):
+        cluster_sizes = np.bincount(labels, minlength=int(labels.max()) + 1)
+        small_labels = np.where(cluster_sizes <= min_size)[0]
+        if small_labels.size == 0 or cluster_sizes.size <= 1:
+            break
+
+        large_labels = np.where(cluster_sizes > min_size)[0]
+        if large_labels.size == 0:
+            break
+
+        centers = np.zeros((cluster_sizes.size, phi.shape[1]), dtype=np.float32)
+        for label in range(cluster_sizes.size):
+            centers[label] = phi[labels == label].mean(axis=0)
+
+        changed = False
+        for label in small_labels:
+            if cluster_sizes[label] == 0:
+                continue
+
+            candidate_labels = large_labels[large_labels != label]
+            if candidate_labels.size == 0:
+                candidate_labels = np.where(cluster_sizes > 0)[0]
+                candidate_labels = candidate_labels[candidate_labels != label]
+            if candidate_labels.size == 0:
+                continue
+
+            diffs = centers[candidate_labels] - centers[label]
+            rms_distances = np.sqrt(np.mean(diffs * diffs, axis=1))
+            target_label = int(candidate_labels[int(np.argmin(rms_distances))])
+            labels[labels == label] = target_label
+            changed = True
+
+        labels, centers, clustered_phi = _recompute_cluster_centers(phi, labels)
+        if not changed:
+            return labels, centers, clustered_phi
+
+    labels, centers, clustered_phi = _recompute_cluster_centers(phi, labels)
+    return labels, centers, clustered_phi
+
+
 def fit_single_stage_em(
     data: PatientData,
     graph: GraphData,
@@ -626,6 +697,18 @@ def finalize_raw_fit(
         graph=graph,
         z_norm=z_norm,
         fused_tol=options.fused_tol,
+    )
+    cluster_labels, cluster_centers, phi_clustered = _merge_cluster_profiles(
+        phi=phi,
+        cluster_labels=cluster_labels,
+        cluster_centers=cluster_centers,
+        merge_tol=options.center_merge_tol,
+    )
+    cluster_labels, cluster_centers, phi_clustered = _cleanup_small_clusters(
+        phi=phi,
+        cluster_labels=cluster_labels,
+        cluster_centers=cluster_centers,
+        num_samples=data.num_samples,
     )
     cluster_labels, cluster_centers, phi_clustered = _merge_cluster_profiles(
         phi=phi,
