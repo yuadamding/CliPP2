@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy.optimize import minimize_scalar
 import torch
 
 from ..io.data import PatientData
@@ -26,6 +27,7 @@ class FitOptions:
     eps: float = 1e-6
     fused_tol: float = 1e-3
     center_merge_tol: float = 8e-2
+    refit_cluster_centers: bool = False
     device: str = "auto"
     verbose: bool = False
 
@@ -50,6 +52,9 @@ class FitResult:
     z_norm: np.ndarray
     history: list[float] = field(default_factory=list)
     bic: float | None = None
+    classic_bic: float | None = None
+    extended_bic: float | None = None
+    selection_score_name: str | None = None
 
 
 @dataclass
@@ -587,6 +592,106 @@ def _cleanup_small_clusters(
     return labels, centers, clustered_phi
 
 
+def _cluster_sample_loglik(
+    theta: float,
+    *,
+    alt_counts: np.ndarray,
+    total_counts: np.ndarray,
+    scaling: np.ndarray,
+    minor_cn: np.ndarray,
+    major_cn: np.ndarray,
+    estimate_mask: np.ndarray,
+    fixed_multiplicity: np.ndarray,
+    major_prior: float,
+    eps: float,
+) -> float:
+    theta = float(theta)
+    total_loglik = 0.0
+
+    if estimate_mask.any():
+        p_minor = np.clip(scaling[estimate_mask] * minor_cn[estimate_mask] * theta, eps, 1.0 - eps)
+        p_major = np.clip(scaling[estimate_mask] * major_cn[estimate_mask] * theta, eps, 1.0 - eps)
+        alt = alt_counts[estimate_mask]
+        total = total_counts[estimate_mask]
+        ll_minor = alt * np.log(p_minor) + (total - alt) * np.log1p(-p_minor) + np.log(max(1.0 - major_prior, eps))
+        ll_major = alt * np.log(p_major) + (total - alt) * np.log1p(-p_major) + np.log(max(major_prior, eps))
+        total_loglik += float(np.logaddexp(ll_minor, ll_major).sum())
+
+    fixed_mask = ~estimate_mask
+    if fixed_mask.any():
+        p_fixed = np.clip(scaling[fixed_mask] * fixed_multiplicity[fixed_mask] * theta, eps, 1.0 - eps)
+        alt = alt_counts[fixed_mask]
+        total = total_counts[fixed_mask]
+        total_loglik += float((alt * np.log(p_fixed) + (total - alt) * np.log1p(-p_fixed)).sum())
+
+    return total_loglik
+
+
+def _refit_partition_cluster_centers(
+    data: PatientData,
+    cluster_labels: np.ndarray,
+    cluster_centers: np.ndarray,
+    options: FitOptions,
+) -> tuple[np.ndarray, np.ndarray]:
+    refit_centers = np.zeros_like(cluster_centers, dtype=np.float32)
+    estimate_mask = data.multiplicity_estimation_mask.astype(bool, copy=False)
+    fixed_multiplicity = data.fixed_multiplicity.astype(np.float32, copy=False)
+
+    for label in range(cluster_centers.shape[0]):
+        members = cluster_labels == label
+        if not np.any(members):
+            continue
+
+        for sample_idx in range(data.num_samples):
+            alt = data.alt_counts[members, sample_idx].astype(np.float64, copy=False)
+            total = data.total_counts[members, sample_idx].astype(np.float64, copy=False)
+            scaling = data.scaling[members, sample_idx].astype(np.float64, copy=False)
+            minor_cn = data.minor_cn[members, sample_idx].astype(np.float64, copy=False)
+            major_cn = data.major_cn[members, sample_idx].astype(np.float64, copy=False)
+            sample_estimate_mask = estimate_mask[members, sample_idx]
+            sample_fixed = fixed_multiplicity[members, sample_idx].astype(np.float64, copy=False)
+
+            lower = float(options.eps)
+            upper = float(np.clip(np.min(data.phi_upper[members, sample_idx]), lower, 1.0))
+            start = float(np.clip(cluster_centers[label, sample_idx], lower, upper))
+
+            if upper <= lower + 1e-8:
+                refit_centers[label, sample_idx] = lower
+                continue
+
+            def objective(theta: float) -> float:
+                return -_cluster_sample_loglik(
+                    theta,
+                    alt_counts=alt,
+                    total_counts=total,
+                    scaling=scaling,
+                    minor_cn=minor_cn,
+                    major_cn=major_cn,
+                    estimate_mask=sample_estimate_mask,
+                    fixed_multiplicity=sample_fixed,
+                    major_prior=options.major_prior,
+                    eps=options.eps,
+                )
+
+            candidate_thetas = np.array([lower, start, upper], dtype=np.float64)
+            candidate_values = np.array([objective(value) for value in candidate_thetas], dtype=np.float64)
+            best_theta = float(candidate_thetas[int(np.argmin(candidate_values))])
+
+            result = minimize_scalar(
+                objective,
+                bounds=(lower, upper),
+                method="bounded",
+                options={"xatol": 1e-4, "maxiter": 64},
+            )
+            if result.success and np.isfinite(result.fun):
+                best_theta = float(np.clip(result.x, lower, upper))
+
+            refit_centers[label, sample_idx] = best_theta
+
+    refit_phi = refit_centers[cluster_labels]
+    return refit_centers.astype(np.float32), refit_phi.astype(np.float32)
+
+
 def fit_single_stage_em(
     data: PatientData,
     graph: GraphData,
@@ -716,6 +821,13 @@ def finalize_raw_fit(
         cluster_centers=cluster_centers,
         merge_tol=options.center_merge_tol,
     )
+    if options.refit_cluster_centers:
+        cluster_centers, phi_clustered = _refit_partition_cluster_centers(
+            data=data,
+            cluster_labels=cluster_labels,
+            cluster_centers=cluster_centers,
+            options=options,
+        )
 
     phi_clustered_t = torch.as_tensor(phi_clustered, dtype=torch.float32, device=device)
     _, major_probability_t, loglik = _torch_e_step(
@@ -758,4 +870,5 @@ def finalize_raw_fit(
         device=str(raw_fit.device),
         z_norm=z_norm.astype(np.float32),
         history=list(raw_fit.history),
+        selection_score_name=None,
     )

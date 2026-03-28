@@ -21,13 +21,19 @@ class SimulationGridConfig:
     K_min: int = 2
     K_max: int = 10
     lambda_mut: int = 2000
+    lambda_mut_list: tuple[int, ...] | None = (300, 600, 1000, 2000, 4000)
     alpha_mut: float = 10.0
     alpha_split: float = 1.0
     alpha_lambda: float = 5.0
     tau_lineage_min: float = 1.0
     tau_lineage_max: float = 50.0
     purity_conc: float = 50.0
-    lineage_zero_prob: float = 0.3
+    lineage_zero_prob: float = 0.0
+    min_clone_ccf: float = 0.02
+    min_clone_ccf_l2_norm: float = 0.05
+    min_mutations_per_clone: int = 15
+    min_clone_ccf_distance: float = 0.10
+    max_rejection_tries: int = 1024
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -109,6 +115,27 @@ def _check_sample_ccf_against_tree(parent, children, ccf_samples_clones, tol=1e-
     return True
 
 
+def _min_pairwise_clone_distance(ccf_samples_clones: np.ndarray) -> float:
+    ccf = np.asarray(ccf_samples_clones, dtype=float)
+    if ccf.shape[0] <= 1:
+        return float("inf")
+    diff = ccf[:, None, :] - ccf[None, :, :]
+    dist = np.sqrt(np.sum(diff * diff, axis=2))
+    np.fill_diagonal(dist, np.inf)
+    return float(np.min(dist))
+
+
+def _min_clone_region_ccf(ccf_samples_clones: np.ndarray) -> float:
+    ccf = np.asarray(ccf_samples_clones, dtype=float)
+    return float(np.min(ccf))
+
+
+def _min_clone_l2_norm(ccf_samples_clones: np.ndarray) -> float:
+    ccf = np.asarray(ccf_samples_clones, dtype=float)
+    norms = np.linalg.norm(ccf, axis=1)
+    return float(np.min(norms))
+
+
 def simulate_clonal_tree_ccf(
     K,
     n_samples,
@@ -119,130 +146,137 @@ def simulate_clonal_tree_ccf(
     eps=1e-8,
     alpha_lambda=5.0,
     lineage_eps=1e-8,
+    min_clone_ccf=0.02,
+    min_clone_ccf_l2_norm=0.05,
+    min_clone_ccf_distance=0.10,
+    max_rejection_tries=1024,
 ):
     if isinstance(random_state, np.random.Generator):
         rng = random_state
     else:
         rng = np.random.default_rng(random_state)
 
-    while True:
-        parent = np.empty(K, dtype=int)
-        parent[0] = -1
-        for k in range(1, K):
-            parent[k] = rng.integers(0, k)
+    if lineage_zero_prob > eps and min_clone_ccf > 0.0:
+        raise ValueError(
+            "lineage_zero_prob must be 0 when enforcing a strictly positive minimum clone CCF in every region."
+        )
 
-        children = [[] for _ in range(K)]
-        for k, p in enumerate(parent):
-            if p >= 0:
-                children[p].append(k)
+    for _ in range(max(int(max_rejection_tries), 1)):
+        while True:
+            parent = np.empty(K, dtype=int)
+            parent[0] = -1
+            for k in range(1, K):
+                parent[k] = rng.integers(0, k)
 
-        leaves_all = [k for k in range(K) if len(children[k]) == 0]
-        is_pure_chain = (K > 1 and len(leaves_all) == 1 and all(len(ch) <= 1 for ch in children))
-        if not is_pure_chain or K <= 5:
-            break
+            children = [[] for _ in range(K)]
+            for k, p in enumerate(parent):
+                if p >= 0:
+                    children[p].append(k)
 
-    if is_pure_chain:
-        base_min = 0.2
-        if base_min * K > 1.0 + 1e-10:
-            raise ValueError(f"Cannot enforce λ_k >= 0.2 for pure chain with K={K}.")
-        if abs(base_min * K - 1.0) <= 1e-10:
-            lambda_k = np.full(K, base_min, dtype=float)
+            leaves_all = [k for k in range(K) if len(children[k]) == 0]
+            is_pure_chain = (K > 1 and len(leaves_all) == 1 and all(len(ch) <= 1 for ch in children))
+            if not is_pure_chain or K <= 5:
+                break
+
+        if is_pure_chain:
+            base_min = 0.2
+            if base_min * K > 1.0 + 1e-10:
+                raise ValueError(f"Cannot enforce λ_k >= 0.2 for pure chain with K={K}.")
+            if abs(base_min * K - 1.0) <= 1e-10:
+                lambda_k = np.full(K, base_min, dtype=float)
+            else:
+                leftover = 1.0 - base_min * K
+                lambda_k = base_min + leftover * rng.dirichlet(np.ones(K))
         else:
-            leftover = 1.0 - base_min * K
-            lambda_k = base_min + leftover * rng.dirichlet(np.ones(K))
-    else:
-        lambda_k = rng.dirichlet(alpha_lambda * np.ones(K))
+            lambda_k = rng.dirichlet(alpha_lambda * np.ones(K))
 
-    ccf_patient_clones = np.zeros(K, dtype=float)
-    for k in reversed(range(K)):
-        ccf_patient_clones[k] = lambda_k[k] + sum(ccf_patient_clones[c] for c in children[k])
+        ccf_patient_clones = np.zeros(K, dtype=float)
+        for k in reversed(range(K)):
+            ccf_patient_clones[k] = lambda_k[k] + sum(ccf_patient_clones[c] for c in children[k])
 
-    _check_patient_tree_and_ccf(parent, children, ccf_patient_clones, tol=1e-8)
+        _check_patient_tree_and_ccf(parent, children, ccf_patient_clones, tol=1e-8)
 
-    lineage_terminals = [k for k in range(K) if lambda_k[k] > lineage_eps]
-    if len(lineage_terminals) == 0:
-        lineage_terminals = [k for k in range(K) if len(children[k]) == 0]
+        lineage_terminals = [k for k in range(K) if lambda_k[k] > lineage_eps]
+        if len(lineage_terminals) == 0:
+            lineage_terminals = [k for k in range(K) if len(children[k]) == 0]
 
-    lineages = []
-    for terminal in lineage_terminals:
-        path = []
-        node = terminal
-        while node != -1:
-            path.append(node)
-            node = parent[node]
-        path.reverse()
-        lineages.append(path)
+        lineages = []
+        for terminal in lineage_terminals:
+            path = []
+            node = terminal
+            while node != -1:
+                path.append(node)
+                node = parent[node]
+            path.reverse()
+            lineages.append(path)
 
-    L = len(lineages)
-    A = np.zeros((K, L), dtype=float)
-    for ell_idx, path in enumerate(lineages):
-        for k in path:
-            A[k, ell_idx] = 1.0
+        L = len(lineages)
+        A = np.zeros((K, L), dtype=float)
+        for ell_idx, path in enumerate(lineages):
+            for k in path:
+                A[k, ell_idx] = 1.0
 
-    idx_term = np.array(lineage_terminals, dtype=int)
-    ccf_patient_lineages = lambda_k[idx_term].copy()
-    u_safe = np.maximum(ccf_patient_lineages.astype(float), eps)
-    u_safe = u_safe / u_safe.sum()
+        idx_term = np.array(lineage_terminals, dtype=int)
+        ccf_patient_lineages = lambda_k[idx_term].copy()
+        u_safe = np.maximum(ccf_patient_lineages.astype(float), eps)
+        u_safe = u_safe / u_safe.sum()
+        lineage_floor = max(float(min_clone_ccf), float(min_clone_ccf_l2_norm) / np.sqrt(float(n_samples)))
+        if lineage_floor * L >= 1.0 - eps:
+            raise ValueError(
+                f"Cannot enforce lineage floor {lineage_floor:.4f} with {L} lineages; floor * lineages must stay below 1."
+            )
+        leftover_mass = 1.0 - lineage_floor * L
 
-    tau_arr = np.asarray(tau, dtype=float)
-    if tau_arr.ndim == 0:
-        tau_vec = np.full(n_samples, float(tau_arr), dtype=float)
-    else:
-        if tau_arr.shape[0] != n_samples:
-            raise ValueError("If `tau` is array-like, its length must be n_samples.")
-        tau_vec = tau_arr
-
-    ccf_samples_lineages = np.zeros((L, n_samples), dtype=float)
-    for j in range(n_samples):
-        if lineage_zero_prob <= 0.0:
-            present_mask = np.ones(L, dtype=bool)
+        tau_arr = np.asarray(tau, dtype=float)
+        if tau_arr.ndim == 0:
+            tau_vec = np.full(n_samples, float(tau_arr), dtype=float)
         else:
-            present_mask = rng.random(L) > lineage_zero_prob
-            if not present_mask.any():
-                present_mask[int(np.argmax(u_safe))] = True
+            if tau_arr.shape[0] != n_samples:
+                raise ValueError("If `tau` is array-like, its length must be n_samples.")
+            tau_vec = tau_arr
 
-        present_idx = np.where(present_mask)[0]
-        lambda_present = ccf_patient_lineages[present_idx]
-        u_present = u_safe[present_idx]
+        ccf_samples_lineages = np.zeros((L, n_samples), dtype=float)
+        for j in range(n_samples):
+            if tau_vec[j] <= 0:
+                lambda_sample = u_safe.copy()
+            else:
+                alpha_present = tau_vec[j] * u_safe
+                lambda_sample = rng.dirichlet(alpha_present)
 
-        if tau_vec[j] <= 0:
-            v_present = lambda_present.copy()
-        else:
-            alpha_present = tau_vec[j] * u_present
-            w_present = rng.dirichlet(alpha_present)
-            v_present = w_present * lambda_present
+            ccf_samples_lineages[:, j] = lineage_floor + leftover_mass * lambda_sample
 
-        total_v = v_present.sum()
-        if total_v <= 0:
-            lambda_sample_present = lambda_present / lambda_present.sum()
-        else:
-            lambda_sample_present = v_present / total_v
+        ccf_samples_clones = A @ ccf_samples_lineages
+        _check_sample_ccf_against_tree(parent, children, ccf_samples_clones, tol=1e-8)
+        if _min_clone_region_ccf(ccf_samples_clones) < float(min_clone_ccf) - eps:
+            continue
+        if _min_clone_l2_norm(ccf_samples_clones) < float(min_clone_ccf_l2_norm) - eps:
+            continue
+        if _min_pairwise_clone_distance(ccf_samples_clones) < float(min_clone_ccf_distance) - eps:
+            continue
 
-        lambda_j = np.zeros(L, dtype=float)
-        lambda_j[present_idx] = lambda_sample_present
-        ccf_samples_lineages[:, j] = lambda_j
+        return {
+            "parent": parent,
+            "children": children,
+            "lineage_terminals": idx_term,
+            "lineages": lineages,
+            "A": A,
+            "ccf_patient_clones": ccf_patient_clones,
+            "lambda_k": lambda_k,
+            "ccf_patient_lineages": ccf_patient_lineages,
+            "ccf_samples_lineages": ccf_samples_lineages,
+            "ccf_samples_clones": ccf_samples_clones,
+        }
 
-    ccf_samples_clones = A @ ccf_samples_lineages
-    _check_sample_ccf_against_tree(parent, children, ccf_samples_clones, tol=1e-8)
-
-    return {
-        "parent": parent,
-        "children": children,
-        "lineage_terminals": idx_term,
-        "lineages": lineages,
-        "A": A,
-        "ccf_patient_clones": ccf_patient_clones,
-        "lambda_k": lambda_k,
-        "ccf_patient_lineages": ccf_patient_lineages,
-        "ccf_samples_lineages": ccf_samples_lineages,
-        "ccf_samples_clones": ccf_samples_clones,
-    }
+    raise RuntimeError(
+        "Failed to generate a clonal tree satisfying the region-level clone CCF and pairwise clone-separation constraints."
+    )
 
 
 def sample_mutations_per_clone(
     ccf_patient_clones,
     lambda_mut=800,
     alpha_mut=10.0,
+    min_mutations_per_clone=1,
     random_state=None,
 ):
     if isinstance(random_state, np.random.Generator):
@@ -253,9 +287,11 @@ def sample_mutations_per_clone(
     ccf = np.asarray(ccf_patient_clones, dtype=float)
     K = ccf.shape[0]
 
+    min_mutations_per_clone = max(int(min_mutations_per_clone), 1)
     N_mut = rng.poisson(lambda_mut)
-    if N_mut < K:
-        N_mut = K
+    min_total = K * min_mutations_per_clone
+    if N_mut < min_total:
+        N_mut = min_total
 
     base = np.maximum(ccf, 0.0)
     if base.sum() <= 0:
@@ -265,8 +301,8 @@ def sample_mutations_per_clone(
         p0 = base / base.sum()
 
     theta = rng.dirichlet(alpha_mut * p0)
-    base_counts = np.ones(K, dtype=int)
-    remaining = N_mut - K
+    base_counts = np.full(K, min_mutations_per_clone, dtype=int)
+    remaining = N_mut - min_total
     if remaining > 0:
         extra = rng.multinomial(remaining, theta)
         cluster_size = base_counts + extra
@@ -362,6 +398,11 @@ def _write_patient_simulation(
     tau_lineage_max: float,
     purity_conc: float,
     lineage_zero_prob: float,
+    min_clone_ccf: float,
+    min_clone_ccf_l2_norm: float,
+    min_mutations_per_clone: int,
+    min_clone_ccf_distance: float,
+    max_rejection_tries: int,
 ) -> Path:
     K = rng.integers(K_min, K_max + 1)
     tau_vec = rng.uniform(tau_lineage_min, tau_lineage_max, size=n_samples)
@@ -374,6 +415,10 @@ def _write_patient_simulation(
         lineage_zero_prob=lineage_zero_prob,
         random_state=rng,
         alpha_lambda=alpha_lambda,
+        min_clone_ccf=min_clone_ccf,
+        min_clone_ccf_l2_norm=min_clone_ccf_l2_norm,
+        min_clone_ccf_distance=min_clone_ccf_distance,
+        max_rejection_tries=max_rejection_tries,
     )
 
     ccf_patient_clones = sim_tree["ccf_patient_clones"]
@@ -388,10 +433,13 @@ def _write_patient_simulation(
         ccf_patient_clones=ccf_patient_clones,
         lambda_mut=lambda_mut,
         alpha_mut=alpha_mut,
+        min_mutations_per_clone=min_mutations_per_clone,
         random_state=rng,
     )
 
-    data_dir = out_dir / f"{N_mean}_{K}_{simu_purity}_{amp_rate}_S{n_samples}_M{no_mutations}_rep{sim}"
+    data_dir = out_dir / (
+        f"{N_mean}_{K}_{simu_purity}_{amp_rate}_S{n_samples}_Lm{int(lambda_mut)}_M{no_mutations}_rep{sim}"
+    )
     data_dir.mkdir(parents=True, exist_ok=True)
     for j in range(n_samples):
         (data_dir / f"sample{j}").mkdir(parents=True, exist_ok=True)
@@ -498,7 +546,12 @@ def write_patient_simulation(
     tau_lineage_min: float = 1.0,
     tau_lineage_max: float = 50.0,
     purity_conc: float = 50.0,
-    lineage_zero_prob: float = 0.3,
+    lineage_zero_prob: float = 0.0,
+    min_clone_ccf: float = 0.02,
+    min_clone_ccf_l2_norm: float = 0.05,
+    min_mutations_per_clone: int = 15,
+    min_clone_ccf_distance: float = 0.10,
+    max_rejection_tries: int = 1024,
 ) -> Path:
     return _write_patient_simulation(
         rng=rng,
@@ -518,6 +571,11 @@ def write_patient_simulation(
         tau_lineage_max=tau_lineage_max,
         purity_conc=purity_conc,
         lineage_zero_prob=lineage_zero_prob,
+        min_clone_ccf=min_clone_ccf,
+        min_clone_ccf_l2_norm=min_clone_ccf_l2_norm,
+        min_mutations_per_clone=min_mutations_per_clone,
+        min_clone_ccf_distance=min_clone_ccf_distance,
+        max_rejection_tries=max_rejection_tries,
     )
 
 
@@ -532,13 +590,19 @@ def run_simulation_grid(
     K_min: int = 2,
     K_max: int = 10,
     lambda_mut: int = 2000,
+    lambda_mut_list: list[int] | None = None,
     alpha_mut: float = 10.0,
     alpha_split: float = 1.0,
     alpha_lambda: float = 5.0,
     tau_lineage_min: float = 1.0,
     tau_lineage_max: float = 50.0,
     purity_conc: float = 50.0,
-    lineage_zero_prob: float = 0.3,
+    lineage_zero_prob: float = 0.0,
+    min_clone_ccf: float = 0.02,
+    min_clone_ccf_l2_norm: float = 0.05,
+    min_mutations_per_clone: int = 15,
+    min_clone_ccf_distance: float = 0.10,
+    max_rejection_tries: int = 1024,
 ) -> list[Path]:
     if purity_list is None:
         purity_list = list(SimulationGridConfig.purity_list)
@@ -548,13 +612,22 @@ def run_simulation_grid(
         N_list = list(SimulationGridConfig.N_list)
     if n_samples_list is None:
         n_samples_list = list(SimulationGridConfig.n_samples_list)
+    if lambda_mut_list is None:
+        config_default = SimulationGridConfig.lambda_mut_list
+        lambda_mut_list = list(config_default) if config_default is not None else [int(lambda_mut)]
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rng_master = np.random.default_rng(seed)
     written_dirs: list[Path] = []
 
-    for N_mean, simu_purity, amp_rate, n_samples in its.product(N_list, purity_list, amp_rate_list, n_samples_list):
+    for N_mean, simu_purity, amp_rate, n_samples, lambda_mut_value in its.product(
+        N_list,
+        purity_list,
+        amp_rate_list,
+        n_samples_list,
+        lambda_mut_list,
+    ):
         for sim in range(reps):
             child_seed = int(rng_master.integers(0, 2**32 - 1))
             child_rng = np.random.default_rng(child_seed)
@@ -569,7 +642,7 @@ def run_simulation_grid(
                     sim=sim,
                     K_min=K_min,
                     K_max=K_max,
-                    lambda_mut=lambda_mut,
+                    lambda_mut=int(lambda_mut_value),
                     alpha_mut=alpha_mut,
                     alpha_split=alpha_split,
                     alpha_lambda=alpha_lambda,
@@ -577,6 +650,11 @@ def run_simulation_grid(
                     tau_lineage_max=tau_lineage_max,
                     purity_conc=purity_conc,
                     lineage_zero_prob=lineage_zero_prob,
+                    min_clone_ccf=min_clone_ccf,
+                    min_clone_ccf_l2_norm=min_clone_ccf_l2_norm,
+                    min_mutations_per_clone=min_mutations_per_clone,
+                    min_clone_ccf_distance=min_clone_ccf_distance,
+                    max_rejection_tries=max_rejection_tries,
                 )
             )
 
@@ -595,6 +673,7 @@ def run_simulation_grid_from_config(config: SimulationGridConfig) -> list[Path]:
         K_min=config.K_min,
         K_max=config.K_max,
         lambda_mut=config.lambda_mut,
+        lambda_mut_list=list(config.lambda_mut_list) if config.lambda_mut_list is not None else None,
         alpha_mut=config.alpha_mut,
         alpha_split=config.alpha_split,
         alpha_lambda=config.alpha_lambda,
@@ -602,6 +681,11 @@ def run_simulation_grid_from_config(config: SimulationGridConfig) -> list[Path]:
         tau_lineage_max=config.tau_lineage_max,
         purity_conc=config.purity_conc,
         lineage_zero_prob=config.lineage_zero_prob,
+        min_clone_ccf=config.min_clone_ccf,
+        min_clone_ccf_l2_norm=config.min_clone_ccf_l2_norm,
+        min_mutations_per_clone=config.min_mutations_per_clone,
+        min_clone_ccf_distance=config.min_clone_ccf_distance,
+        max_rejection_tries=config.max_rejection_tries,
     )
 
 
@@ -616,13 +700,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=None, help="Optional master RNG seed.")
     parser.add_argument("--K-min", type=int, default=2, help="Minimum number of clones.")
     parser.add_argument("--K-max", type=int, default=10, help="Maximum number of clones.")
-    parser.add_argument("--lambda-mut", type=int, default=2000, help="Poisson mean for mutation count.")
+    parser.add_argument("--lambda-mut", type=int, default=2000, help="Legacy single Poisson mean for mutation count.")
+    parser.add_argument(
+        "--lambda-mut-list",
+        default="300,600,1000,2000,4000",
+        help="Comma-separated Poisson means for mutation counts; used by default to cover a wider mutation range.",
+    )
     parser.add_argument("--alpha-mut", type=float, default=10.0, help="Dirichlet concentration for mutation allocation.")
     parser.add_argument("--alpha-lambda", type=float, default=5.0, help="Dirichlet concentration for lineage residual masses.")
     parser.add_argument("--tau-lineage-min", type=float, default=1.0, help="Minimum lineage concentration per sample.")
     parser.add_argument("--tau-lineage-max", type=float, default=50.0, help="Maximum lineage concentration per sample.")
     parser.add_argument("--purity-conc", type=float, default=50.0, help="Beta concentration for sample purities.")
-    parser.add_argument("--lineage-zero-prob", type=float, default=0.3, help="Probability of zeroing a lineage in a sample.")
+    parser.add_argument("--lineage-zero-prob", type=float, default=0.0, help="Probability of zeroing a lineage in a sample. Default is 0.0 because clone CCF is now constrained to stay positive in every region.")
+    parser.add_argument("--min-clone-ccf", type=float, default=0.02, help="Minimum allowed clone CCF in every region.")
+    parser.add_argument("--min-clone-ccf-l2-norm", type=float, default=0.05, help="Minimum L2 norm of each clone's multiregion CCF vector.")
+    parser.add_argument("--min-mutations-per-clone", type=int, default=15, help="Minimum number of mutations assigned to each clone.")
+    parser.add_argument(
+        "--min-clone-ccf-distance",
+        type=float,
+        default=0.10,
+        help="Minimum L2 distance between any two clones' multiregion CCF profiles.",
+    )
+    parser.add_argument(
+        "--max-rejection-tries",
+        type=int,
+        default=1024,
+        help="Maximum rejection-sampling attempts when enforcing clone CCF constraints.",
+    )
     return parser
 
 
@@ -638,12 +742,18 @@ def simulation_config_from_args(args: argparse.Namespace) -> SimulationGridConfi
         K_min=args.K_min,
         K_max=args.K_max,
         lambda_mut=args.lambda_mut,
+        lambda_mut_list=tuple(parse_int_list(args.lambda_mut_list)) if args.lambda_mut_list else None,
         alpha_mut=args.alpha_mut,
         alpha_lambda=args.alpha_lambda,
         tau_lineage_min=args.tau_lineage_min,
         tau_lineage_max=args.tau_lineage_max,
         purity_conc=args.purity_conc,
         lineage_zero_prob=args.lineage_zero_prob,
+        min_clone_ccf=args.min_clone_ccf,
+        min_clone_ccf_l2_norm=args.min_clone_ccf_l2_norm,
+        min_mutations_per_clone=args.min_mutations_per_clone,
+        min_clone_ccf_distance=args.min_clone_ccf_distance,
+        max_rejection_tries=args.max_rejection_tries,
     )
 
 

@@ -102,6 +102,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Model-selection strategy: manual fixed settings, bayes/auto Bayesian optimization, or legacy_auto for the old rule-based baseline.",
     )
+    parser.add_argument(
+        "--selection-score",
+        choices=["ebic", "refit_ebic", "classic_bic", "classic_refit_bic"],
+        default="refit_ebic",
+        help="Candidate scoring objective: default refit-EBIC on partition-refit likelihood, current EBIC, naive classic BIC, or classic BIC after partition-wise center refit.",
+    )
     parser.add_argument("--bo-max-evals", type=int, default=12, help="Maximum Bayesian optimization evaluations per patient when --settings-profile is bayes/auto.")
     parser.add_argument("--bo-init-points", type=int, default=5, help="Number of initial design points before Gaussian-process-guided proposals.")
     parser.add_argument("--bo-random-seed", type=int, default=0, help="Random seed used by the Bayesian optimizer.")
@@ -160,6 +166,7 @@ def main() -> None:
             bic_df_scale=args.bic_df_scale,
             bic_cluster_penalty=args.bic_cluster_penalty,
             settings_profile=args.settings_profile,
+            selection_score=args.selection_score,
             use_warm_starts=not args.disable_warm_start,
             write_patient_outputs=not args.skip_patient_outputs,
             bo_max_evals=args.bo_max_evals,
@@ -182,6 +189,7 @@ def main() -> None:
             bic_df_scale=args.bic_df_scale,
             bic_cluster_penalty=args.bic_cluster_penalty,
             settings_profile=args.settings_profile,
+            selection_score=args.selection_score,
             use_warm_starts=not args.disable_warm_start,
             write_outputs=not args.skip_patient_outputs,
             bo_max_evals=args.bo_max_evals,
@@ -203,6 +211,7 @@ def main() -> None:
         bic_df_scale=args.bic_df_scale,
         bic_cluster_penalty=args.bic_cluster_penalty,
         settings_profile=args.settings_profile,
+        selection_score=args.selection_score,
         use_warm_starts=not args.disable_warm_start,
         write_outputs=not args.skip_patient_outputs,
         bo_max_evals=args.bo_max_evals,

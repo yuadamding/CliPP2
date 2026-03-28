@@ -37,7 +37,21 @@ def summarize_patient_regime(data: PatientData) -> PatientRegime:
     )
 
 
-def recommend_settings_from_regime(regime: PatientRegime) -> RecommendedSettings:
+def _refit_ebic_default_settings() -> RecommendedSettings:
+    return RecommendedSettings(
+        profile_name="refit_ebic_default",
+        graph_k=8,
+        lambda_grid_mode="dense_no_zero",
+        bic_df_scale=8.0,
+        bic_cluster_penalty=4.0,
+        center_merge_tol=0.08,
+    )
+
+
+def recommend_settings_from_regime(regime: PatientRegime, *, selection_score: str = "refit_ebic") -> RecommendedSettings:
+    if selection_score == "refit_ebic":
+        return _refit_ebic_default_settings()
+
     if regime.depth_scale <= 100.0:
         return RecommendedSettings(
             profile_name="strong_low_depth",
@@ -88,8 +102,8 @@ def recommend_settings_from_regime(regime: PatientRegime) -> RecommendedSettings
     )
 
 
-def recommend_settings_from_data(data: PatientData) -> RecommendedSettings:
-    return recommend_settings_from_regime(summarize_patient_regime(data))
+def recommend_settings_from_data(data: PatientData, *, selection_score: str = "refit_ebic") -> RecommendedSettings:
+    return recommend_settings_from_regime(summarize_patient_regime(data), selection_score=selection_score)
 
 
 __all__ = [
