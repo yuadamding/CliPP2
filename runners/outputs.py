@@ -10,17 +10,22 @@ from ..io.data import PatientData
 from ..metrics.evaluation import SimulationEvaluation
 
 
+def _display_region_label(label: str) -> str:
+    return str(label).replace("sample", "region")
+
+
 def mutation_output_table(data: PatientData, fit: FitResult) -> pd.DataFrame:
     cluster_sizes = np.bincount(fit.cluster_labels, minlength=fit.n_clusters)
     table = pd.DataFrame(
         {
+            "tumor_id": np.repeat(data.tumor_id, data.num_mutations),
             "mutation_id": data.mutation_ids,
             "cluster_label": fit.cluster_labels + 1,
             "cluster_size": cluster_sizes[fit.cluster_labels],
         }
     )
-    for column, sample_id in enumerate(data.sample_ids):
-        table[f"phi_{sample_id}"] = fit.phi_clustered[:, column]
+    for column, region_id in enumerate(data.region_ids):
+        table[f"phi_{_display_region_label(region_id)}"] = fit.phi_clustered[:, column]
     return table
 
 
@@ -28,28 +33,34 @@ def cluster_output_table(data: PatientData, fit: FitResult) -> pd.DataFrame:
     cluster_sizes = np.bincount(fit.cluster_labels, minlength=fit.n_clusters)
     table = pd.DataFrame(
         {
+            "tumor_id": np.repeat(data.tumor_id, fit.n_clusters),
             "cluster_label": np.arange(1, fit.n_clusters + 1, dtype=int),
             "cluster_size": cluster_sizes,
         }
     )
-    for column, sample_id in enumerate(data.sample_ids):
-        table[f"phi_{sample_id}"] = fit.cluster_centers[:, column]
+    for column, region_id in enumerate(data.region_ids):
+        table[f"phi_{_display_region_label(region_id)}"] = fit.cluster_centers[:, column]
     return table
 
 
 def cell_output_table(data: PatientData, fit: FitResult) -> pd.DataFrame:
-    mutation_ids = np.repeat(np.asarray(data.mutation_ids, dtype=object), data.num_samples)
-    sample_ids = np.tile(np.asarray(data.sample_ids, dtype=object), data.num_mutations)
-    cluster_labels = np.repeat(fit.cluster_labels + 1, data.num_samples)
+    mutation_ids = np.repeat(np.asarray(data.mutation_ids, dtype=object), data.num_regions)
+    region_ids = np.tile(
+        np.asarray([_display_region_label(region_id) for region_id in data.region_ids], dtype=object),
+        data.num_mutations,
+    )
+    cluster_labels = np.repeat(fit.cluster_labels + 1, data.num_regions)
     return pd.DataFrame(
         {
+            "tumor_id": np.repeat(np.asarray(data.tumor_id, dtype=object), mutation_ids.shape[0]),
             "mutation_id": mutation_ids,
-            "sample_id": sample_ids,
+            "region_id": region_ids,
             "cluster_label": cluster_labels,
             "phi": fit.phi_clustered.reshape(-1),
             "major_cn": data.major_cn.reshape(-1),
             "minor_cn": data.minor_cn.reshape(-1),
             "multiplicity_estimated": fit.multiplicity_estimated_mask.reshape(-1).astype(int),
+            "gamma_major": fit.gamma_major.reshape(-1),
             "major_probability": fit.major_probability.reshape(-1),
             "major_call": fit.major_call.reshape(-1).astype(int),
             "multiplicity_call": fit.multiplicity_call.reshape(-1),
@@ -86,34 +97,34 @@ def write_fit_outputs(
 ) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     mutation_output_table(data, fit).to_csv(
-        outdir / f"{data.patient_id}_mutation_clusters.tsv",
+        outdir / f"{data.tumor_id}_mutation_clusters.tsv",
         sep="\t",
         index=False,
     )
     cluster_output_table(data, fit).to_csv(
-        outdir / f"{data.patient_id}_cluster_centers.tsv",
+        outdir / f"{data.tumor_id}_cluster_centers.tsv",
         sep="\t",
         index=False,
     )
     cell_output_table(data, fit).to_csv(
-        outdir / f"{data.patient_id}_cell_multiplicity.tsv",
+        outdir / f"{data.tumor_id}_cell_multiplicity.tsv",
         sep="\t",
         index=False,
     )
     search_df.to_csv(
-        outdir / f"{data.patient_id}_lambda_search.tsv",
+        outdir / f"{data.tumor_id}_lambda_search.tsv",
         sep="\t",
         index=False,
     )
     if evaluation is not None:
         evaluation_to_frame(evaluation).to_csv(
-            outdir / f"{data.patient_id}_simulation_eval.tsv",
+            outdir / f"{data.tumor_id}_simulation_eval.tsv",
             sep="\t",
             index=False,
         )
     if run_summary is not None:
         pd.DataFrame([run_summary]).to_csv(
-            outdir / f"{data.patient_id}_run_summary.tsv",
+            outdir / f"{data.tumor_id}_run_summary.tsv",
             sep="\t",
             index=False,
         )

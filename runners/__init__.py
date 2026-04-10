@@ -14,19 +14,23 @@ from .outputs import (
     write_fit_outputs,
 )
 from .pipeline import process_one_file, run_directory
+from .plotting import plot_benchmark_outcomes
 from .selection import compute_classic_bic, compute_extended_bic, default_lambda_grid
 from .settings import (
     PatientRegime,
+    TumorRegime,
     RecommendedSettings,
     recommend_settings_from_data,
     recommend_settings_from_regime,
     summarize_patient_regime,
+    summarize_tumor_regime,
 )
 
 __all__ = [
     "MassiveMultiregionBenchmarkConfig",
     "ModelSelectionResult",
     "PatientRegime",
+    "TumorRegime",
     "RecommendedSettings",
     "cell_output_table",
     "cluster_output_table",
@@ -36,6 +40,7 @@ __all__ = [
     "evaluation_to_frame",
     "mutation_output_table",
     "process_one_file",
+    "plot_benchmark_outcomes",
     "recommend_settings_from_data",
     "recommend_settings_from_regime",
     "run_cohort_benchmark",
@@ -45,5 +50,6 @@ __all__ = [
     "run_single_region_cohort_benchmark",
     "select_model",
     "summarize_patient_regime",
+    "summarize_tumor_regime",
     "write_fit_outputs",
 ]

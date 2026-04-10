@@ -86,7 +86,7 @@ def convert_one_patient(patient_path: Path, output_root: Path) -> Path | None:
         snv_file = sample_dir / "snv.txt"
         cna_file = sample_dir / "cna.txt"
         purity_file = sample_dir / "purity.txt"
-        sample_label = f"{patient_id}_{sample_dir.name}"
+        region_label = f"{patient_id}_{sample_dir.name.replace('sample', 'region')}"
 
         if not (snv_file.exists() and cna_file.exists() and purity_file.exists()):
             continue
@@ -113,7 +113,8 @@ def convert_one_patient(patient_path: Path, output_root: Path) -> Path | None:
             inplace=True,
         )
 
-        mut_sample["sample_id"] = sample_label
+        mut_sample["region_id"] = region_label
+        mut_sample["sample_id"] = region_label
         mut_sample["normal_cn"] = 2
         mut_sample["purity"] = purity
 
@@ -123,6 +124,7 @@ def convert_one_patient(patient_path: Path, output_root: Path) -> Path | None:
                     SNV_CHROMOSOME_COL,
                     SNV_POSITION_COL,
                     "mutation_id",
+                    "region_id",
                     "sample_id",
                     "ref_counts",
                     "alt_counts",
@@ -150,12 +152,13 @@ def convert_one_patient(patient_path: Path, output_root: Path) -> Path | None:
     all_rows.loc[missing_cna, "major_cn"] = 1.0
     all_rows.loc[missing_cna, "minor_cn"] = 1.0
 
-    all_rows.sort_values(by=[SNV_CHROMOSOME_COL, SNV_POSITION_COL, "sample_id"], inplace=True)
+    all_rows.sort_values(by=[SNV_CHROMOSOME_COL, SNV_POSITION_COL, "region_id"], inplace=True)
     all_rows.reset_index(drop=True, inplace=True)
 
     output_df = all_rows[
         [
             "mutation_id",
+            "region_id",
             "sample_id",
             "ref_counts",
             "alt_counts",
@@ -171,6 +174,10 @@ def convert_one_patient(patient_path: Path, output_root: Path) -> Path | None:
     out_file = output_root / f"{patient_id}.tsv"
     output_df.to_csv(out_file, sep="\t", index=False)
     return out_file
+
+
+def convert_one_tumor(tumor_path: Path, output_root: Path) -> Path | None:
+    return convert_one_patient(tumor_path, output_root)
 
 
 def convert_simulation_root(
@@ -196,8 +203,8 @@ def convert_simulation_root_from_config(config: ConversionConfig) -> list[Path]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Merge simulation folders into per-patient TSV files.")
-    parser.add_argument("--input-root", default="CliPP2Sim", help="Root directory containing patient simulation folders.")
+    parser = argparse.ArgumentParser(description="Merge simulation folders into per-tumor TSV files.")
+    parser.add_argument("--input-root", default="CliPP2Sim", help="Root directory containing tumor simulation folders.")
     parser.add_argument("--output-root", default="CliPP2Sim_TSV", help="Directory to write merged TSV files.")
     return parser
 
@@ -210,7 +217,7 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     written = convert_simulation_root_from_config(conversion_config_from_args(args))
-    print(f"Converted {len(written)} patients into {args.output_root}")
+    print(f"Converted {len(written)} tumors into {args.output_root}")
 
 
 __all__ = [
@@ -218,6 +225,7 @@ __all__ = [
     "build_parser",
     "conversion_config_from_args",
     "convert_one_patient",
+    "convert_one_tumor",
     "convert_simulation_root",
     "convert_simulation_root_from_config",
     "main",

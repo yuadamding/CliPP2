@@ -24,15 +24,17 @@ DEFAULT_PATIENT_SORT_COLUMNS = ["N_mean", "purity", "amp_rate", "n_samples", "tr
 def _parse_patient_id(patient_id: str) -> dict[str, int | float | str]:
     match = PATIENT_PATTERN.fullmatch(patient_id)
     if match is None:
-        raise ValueError(f"Patient id does not match simulation pattern: {patient_id}")
+        raise ValueError(f"Tumor id does not match simulation pattern: {patient_id}")
 
     return {
         "patient_id": patient_id,
+        "tumor_id": patient_id,
         "N_mean": int(match.group("N_mean")),
         "true_K": int(match.group("true_K")),
         "purity": float(match.group("purity")),
         "amp_rate": float(match.group("amp_rate")),
         "n_samples": int(match.group("n_samples")),
+        "n_regions": int(match.group("n_samples")),
         "lambda_mut_setting": (
             int(match.group("lambda_mut_setting"))
             if match.group("lambda_mut_setting") is not None
@@ -46,15 +48,17 @@ def _parse_patient_id(patient_id: str) -> dict[str, int | float | str]:
 def parse_single_region_patient_id(patient_id: str) -> dict[str, int | float | str]:
     match = SINGLE_REGION_PATTERN.fullmatch(patient_id)
     if match is None:
-        raise ValueError(f"Patient id does not match single-region simulation pattern: {patient_id}")
+        raise ValueError(f"Tumor id does not match single-region simulation pattern: {patient_id}")
 
     return {
         "patient_id": patient_id,
+        "tumor_id": patient_id,
         "N_mean": int(match.group("N_mean")),
         "true_K": int(match.group("true_K")),
         "purity": float(match.group("purity")),
         "amp_rate": float(match.group("amp_rate")),
         "n_samples": 1,
+        "n_regions": 1,
         "lambda_mut_setting": np.nan,
         "rep": int(match.group("rep")),
     }
@@ -106,6 +110,40 @@ def _add_cluster_count_metrics(patient_df: pd.DataFrame) -> pd.DataFrame:
         enriched_df["n_clusters"] == enriched_df["true_K"]
     ).astype(float)
     return enriched_df
+
+
+def _with_tumor_region_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    aliased = df.copy()
+    if "patient_id" in aliased.columns and "tumor_id" not in aliased.columns:
+        aliased["tumor_id"] = aliased["patient_id"]
+    if "n_samples" in aliased.columns and "n_regions" not in aliased.columns:
+        aliased["n_regions"] = aliased["n_samples"]
+    if "n_patients" in aliased.columns and "n_tumors" not in aliased.columns:
+        aliased["n_tumors"] = aliased["n_patients"]
+    if "n_evaluable_patients" in aliased.columns and "n_evaluable_tumors" not in aliased.columns:
+        aliased["n_evaluable_tumors"] = aliased["n_evaluable_patients"]
+    return aliased
+
+
+def _display_tumor_region_df(df: pd.DataFrame) -> pd.DataFrame:
+    display = _with_tumor_region_aliases(df)
+    if "patient_id" in display.columns and "tumor_id" in display.columns:
+        display = display.drop(columns=["patient_id"])
+    elif "patient_id" in display.columns:
+        display = display.rename(columns={"patient_id": "tumor_id"})
+    if "n_samples" in display.columns and "n_regions" in display.columns:
+        display = display.drop(columns=["n_samples"])
+    elif "n_samples" in display.columns:
+        display = display.rename(columns={"n_samples": "n_regions"})
+    if "n_patients" in display.columns and "n_tumors" in display.columns:
+        display = display.drop(columns=["n_patients"])
+    elif "n_patients" in display.columns:
+        display = display.rename(columns={"n_patients": "n_tumors"})
+    if "n_evaluable_patients" in display.columns and "n_evaluable_tumors" in display.columns:
+        display = display.drop(columns=["n_evaluable_patients"])
+    elif "n_evaluable_patients" in display.columns:
+        display = display.rename(columns={"n_evaluable_patients": "n_evaluable_tumors"})
+    return display
 
 
 def _aggregate_patient_results(patient_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -166,12 +204,12 @@ def _aggregate_patient_results(patient_df: pd.DataFrame) -> tuple[pd.DataFrame, 
             }
         ]
     )
-    return scenario_df, global_df
+    return _with_tumor_region_aliases(scenario_df), _with_tumor_region_aliases(global_df)
 
 
 def _aggregate_simple(patient_df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     patient_df = _add_cluster_count_metrics(patient_df)
-    return (
+    aggregated = (
         patient_df.groupby(columns, dropna=False)
         .agg(
             n_patients=("patient_id", "size"),
@@ -200,6 +238,7 @@ def _aggregate_simple(patient_df: pd.DataFrame, columns: list[str]) -> pd.DataFr
         .reset_index()
         .sort_values(columns)
     )
+    return _with_tumor_region_aliases(aggregated)
 
 
 def materialize_patient_df(
@@ -216,7 +255,7 @@ def materialize_patient_df(
         patient_df = patient_df.sort_values(existing_sort_columns).reset_index(drop=True)
     else:
         patient_df = patient_df.reset_index(drop=True)
-    return _add_cluster_count_metrics(patient_df)
+    return _with_tumor_region_aliases(_add_cluster_count_metrics(patient_df))
 
 
 def write_patient_checkpoint(
@@ -231,6 +270,7 @@ def write_patient_checkpoint(
 ) -> pd.DataFrame:
     patient_df = materialize_patient_df(patient_rows, sort_columns=sort_columns)
     patient_df.to_csv(outdir / "benchmark_patients.tsv", sep="\t", index=False)
+    _display_tumor_region_df(patient_df).to_csv(outdir / "benchmark_tumors.tsv", sep="\t", index=False)
 
     elapsed = perf_counter() - start_time
     rate = case_index / max(elapsed, 1e-9)
@@ -253,8 +293,10 @@ def write_benchmark_tables(patient_df: pd.DataFrame, outdir: Path) -> tuple[pd.D
     by_amp_rate_df = _aggregate_simple(patient_df, ["amp_rate"])
 
     patient_df.to_csv(outdir / "benchmark_patients.tsv", sep="\t", index=False)
+    _display_tumor_region_df(patient_df).to_csv(outdir / "benchmark_tumors.tsv", sep="\t", index=False)
     scenario_df.to_csv(outdir / "benchmark_by_scenario.tsv", sep="\t", index=False)
     by_samples_df.to_csv(outdir / "benchmark_by_n_samples.tsv", sep="\t", index=False)
+    _display_tumor_region_df(by_samples_df).to_csv(outdir / "benchmark_by_n_regions.tsv", sep="\t", index=False)
     by_depth_df.to_csv(outdir / "benchmark_by_depth.tsv", sep="\t", index=False)
     by_true_k_df.to_csv(outdir / "benchmark_by_true_k.tsv", sep="\t", index=False)
     by_purity_df.to_csv(outdir / "benchmark_by_purity.tsv", sep="\t", index=False)
@@ -275,20 +317,10 @@ def _parse_lambda_grid(value: str | None) -> list[float] | None:
 def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
     return FitOptions(
         lambda_value=0.0,
-        em_max_iter=args.em_max_iter,
-        em_tol=args.em_tol,
-        admm_max_iter=args.admm_max_iter,
-        admm_tol=args.admm_tol,
-        admm_rho=args.admm_rho,
-        inner_steps=args.inner_steps,
-        inner_lr=args.inner_lr,
-        cg_max_iter=args.cg_max_iter,
-        cg_tol=args.cg_tol,
-        curvature_floor=args.curvature_floor,
+        outer_max_iter=args.outer_max_iter,
+        inner_max_iter=args.inner_max_iter,
+        tol=args.tol,
         major_prior=args.major_prior,
-        fused_tol=args.fused_tol,
-        center_merge_tol=args.center_merge_tol,
-        device=args.device,
         verbose=args.verbose,
     )
 

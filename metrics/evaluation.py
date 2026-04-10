@@ -26,10 +26,10 @@ class SimulationEvaluation:
     n_filtered_mutations: int
 
 
-def _sample_index_from_label(sample_id: str) -> int:
-    match = re.search(r"sample(\d+)$", sample_id)
+def _region_index_from_label(region_id: str) -> int:
+    match = re.search(r"(?:sample|region)(\d+)$", region_id)
     if match is None:
-        raise ValueError(f"Could not parse sample index from '{sample_id}'")
+        raise ValueError(f"Could not parse region index from '{region_id}'")
     return int(match.group(1))
 
 
@@ -41,7 +41,7 @@ def _load_single_region_truth(
     truth_cp = pd.read_csv(patient_dir / "truth_cp.txt", sep="\t")
     if truth_cp.shape[0] != data.num_mutations:
         raise ValueError(
-            f"Single-region truth CP count mismatch for {data.patient_id}: "
+            f"Single-region truth CP count mismatch for tumor {data.tumor_id}: "
             f"{truth_cp.shape[0]} != {data.num_mutations}"
         )
 
@@ -62,13 +62,15 @@ def _cluster_level_clonal_fraction(phi: np.ndarray, labels: np.ndarray) -> float
     if phi.size == 0 or labels.size == 0:
         return float("nan")
 
-    unique_labels, relabeled = np.unique(labels.astype(np.int64), return_inverse=True)
-    if unique_labels.size == 0:
+    _, relabeled = np.unique(labels.astype(np.int64), return_inverse=True)
+    if relabeled.size == 0:
         return float("nan")
 
-    centers = np.zeros((unique_labels.size, phi.shape[1]), dtype=np.float32)
-    for label in range(unique_labels.size):
-        centers[label] = phi[relabeled == label].mean(axis=0)
+    num_clusters = int(relabeled.max()) + 1
+    centers = np.zeros((num_clusters, phi.shape[1]), dtype=np.float32)
+    np.add.at(centers, relabeled, phi.astype(np.float32, copy=False))
+    counts = np.bincount(relabeled, minlength=num_clusters).astype(np.float32)
+    centers /= np.clip(counts[:, None], 1.0, None)
 
     clonal_target = np.ones((phi.shape[1],), dtype=np.float32)
     rms_distance = np.sqrt(np.mean((centers - clonal_target[None, :]) ** 2, axis=1))
@@ -83,7 +85,7 @@ def evaluate_fit_against_simulation(
 ) -> SimulationEvaluation:
     patient_dir = Path(simulation_root) / data.patient_id
     if not patient_dir.exists():
-        raise FileNotFoundError(f"Simulation directory not found for patient '{data.patient_id}': {patient_dir}")
+        raise FileNotFoundError(f"Simulation directory not found for tumor '{data.tumor_id}': {patient_dir}")
 
     if data.num_samples == 1 and (patient_dir / "truth_cp.txt").exists():
         truth_clusters, truth_phi, truth_multiplicity = _load_single_region_truth(patient_dir=patient_dir, data=data)
@@ -91,18 +93,18 @@ def evaluate_fit_against_simulation(
         truth_clusters = pd.read_csv(patient_dir / "truth.txt", sep="\t")["cluster_id"].to_numpy(dtype=int)
         if truth_clusters.shape[0] != data.num_mutations:
             raise ValueError(
-                f"Truth cluster count mismatch for {data.patient_id}: "
+                f"Truth cluster count mismatch for tumor {data.tumor_id}: "
                 f"{truth_clusters.shape[0]} != {data.num_mutations}"
             )
 
         truth_phi = np.zeros_like(fit.phi_clustered, dtype=np.float32)
         truth_multiplicity = np.zeros_like(fit.multiplicity_call, dtype=np.float32)
 
-        for column, sample_id in enumerate(data.sample_ids):
-            sample_index = _sample_index_from_label(sample_id)
-            sample_dir = patient_dir / f"sample{sample_index}"
-            truth_cp = pd.read_csv(sample_dir / "truth_cp.txt", sep="\t")
-            cna = pd.read_csv(sample_dir / "cna.txt", sep="\t")
+        for column, region_id in enumerate(data.region_ids):
+            region_index = _region_index_from_label(region_id)
+            region_dir = patient_dir / f"sample{region_index}"
+            truth_cp = pd.read_csv(region_dir / "truth_cp.txt", sep="\t")
+            cna = pd.read_csv(region_dir / "cna.txt", sep="\t")
 
             truth_phi[:, column] = truth_cp["ccf"].to_numpy(dtype=np.float32)
             truth_multiplicity[:, column] = cna["multiplicity"].to_numpy(dtype=np.float32)

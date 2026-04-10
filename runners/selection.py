@@ -5,19 +5,26 @@ import numpy as np
 from ..io.data import PatientData
 
 
-def default_lambda_grid(data: PatientData, mode: str = "dense_no_zero") -> list[float]:
-    sample_scale = float(np.sqrt(max(data.num_samples, 1)))
-    base = max(data.depth_scale, 1.0) * sample_scale
+def _default_lambda_ratios(mode: str) -> np.ndarray:
     if mode == "standard":
-        grid = base * np.array([0.0, 0.005, 0.015, 0.05, 0.15], dtype=float)
-    elif mode == "dense":
-        grid = base * np.array([0.0, 0.005, 0.01, 0.02, 0.04, 0.08, 0.16], dtype=float)
-    elif mode == "dense_no_zero":
-        grid = base * np.array([0.005, 0.01, 0.02, 0.04, 0.08, 0.16], dtype=float)
-    elif mode == "coarse_no_zero":
-        grid = base * np.array([0.005, 0.02, 0.08, 0.16], dtype=float)
-    else:
-        raise ValueError(f"Unknown lambda grid mode: {mode}")
+        return np.array([0.25, 0.5, 1.0, 2.0], dtype=float)
+    if mode == "dense":
+        return np.array([0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0], dtype=float)
+    if mode == "dense_no_zero":
+        return np.array([0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0], dtype=float)
+    if mode == "ultra_dense_no_zero":
+        return np.array([0.05, 0.1, 0.15, 0.25, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=float)
+    if mode == "coarse_no_zero":
+        return np.array([0.25, 1.0, 4.0], dtype=float)
+    raise ValueError(f"Unknown lambda grid mode: {mode}")
+
+
+def default_lambda_grid(
+    data: PatientData,
+    mode: str = "dense_no_zero",
+) -> list[float]:
+    del data
+    grid = _default_lambda_ratios(mode=mode)
     return [float(value) for value in np.unique(np.round(grid, 6))]
 
 

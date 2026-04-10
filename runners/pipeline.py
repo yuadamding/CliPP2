@@ -20,17 +20,13 @@ def process_one_file(
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
     lambda_grid_mode: str = "dense_no_zero",
-    graph_k: int = 8,
     fit_options: FitOptions | None = None,
     bic_df_scale: float = 8.0,
     bic_cluster_penalty: float = 4.0,
-    settings_profile: str = "auto",
+    settings_profile: str = "manual",
     selection_score: str = "refit_ebic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
-    bo_max_evals: int = 12,
-    bo_init_points: int = 5,
-    bo_random_seed: int = 0,
 ) -> dict[str, float | int | str | bool]:
     start_time = perf_counter()
     file_path = Path(file_path)
@@ -47,7 +43,6 @@ def process_one_file(
         simulation_root=Path(simulation_root) if simulation_root is not None else None,
         lambda_grid=lambda_grid,
         lambda_grid_mode=lambda_grid_mode,
-        graph_k=graph_k,
         fit_options=fit_options,
         bic_df_scale=bic_df_scale,
         bic_cluster_penalty=bic_cluster_penalty,
@@ -55,9 +50,6 @@ def process_one_file(
         selection_score=selection_score,
         use_warm_starts=use_warm_starts,
         evaluate_all_candidates=evaluate_all_candidates,
-        bo_max_evals=bo_max_evals,
-        bo_init_points=bo_init_points,
-        bo_random_seed=bo_random_seed,
     )
     best_fit = selection_result.best_fit
     best_evaluation = selection_result.best_evaluation
@@ -69,27 +61,25 @@ def process_one_file(
     elapsed_seconds = float(perf_counter() - start_time)
 
     summary = {
-        "patient_id": data.patient_id,
+        "tumor_id": data.tumor_id,
+        "estimator": "profiled_direct_partition",
         "selected_lambda": float(best_fit.lambda_value),
         "bic": float(best_fit.bic if best_fit.bic is not None else np.nan),
         "classic_bic": float(best_fit.classic_bic if best_fit.classic_bic is not None else np.nan),
         "extended_bic": float(best_fit.extended_bic if best_fit.extended_bic is not None else np.nan),
         "loglik": float(best_fit.loglik),
         "n_clusters": int(best_fit.n_clusters),
-        "graph_edges": int(selection_result.graph_edges),
         "settings_profile": selection_result.profile_name,
         "selection_method": selection_result.selection_method,
         "selection_score_name": str(best_fit.selection_score_name or selection_score),
-        "num_samples": int(patient_regime.num_samples),
+        "num_regions": int(patient_regime.num_samples),
         "num_mutations": int(patient_regime.num_mutations),
         "depth_scale": float(patient_regime.depth_scale),
         "mean_purity": float(patient_regime.mean_purity),
         "non_diploid_rate": float(patient_regime.non_diploid_rate),
-        "graph_k": int(selection_result.graph_k),
         "lambda_grid_mode": str(lambda_grid_mode if lambda_grid is None else "explicit"),
         "bic_df_scale": float(selection_result.bic_df_scale),
         "bic_cluster_penalty": float(selection_result.bic_cluster_penalty),
-        "center_merge_tol": float(selection_result.center_merge_tol),
         "converged": bool(best_fit.converged),
         "device": best_fit.device,
         "ARI": np.nan if best_evaluation is None else float(best_evaluation.ari),
@@ -127,18 +117,14 @@ def run_directory(
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
     lambda_grid_mode: str = "dense_no_zero",
-    graph_k: int = 8,
     fit_options: FitOptions | None = None,
     max_files: int | None = None,
     bic_df_scale: float = 8.0,
     bic_cluster_penalty: float = 4.0,
-    settings_profile: str = "auto",
+    settings_profile: str = "manual",
     selection_score: str = "refit_ebic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
-    bo_max_evals: int = 12,
-    bo_init_points: int = 5,
-    bo_random_seed: int = 0,
 ) -> pd.DataFrame:
     input_dir = Path(input_dir)
     files = sorted(input_dir.glob("*.tsv"))
@@ -157,7 +143,6 @@ def run_directory(
                 simulation_root=simulation_root,
                 lambda_grid=lambda_grid,
                 lambda_grid_mode=lambda_grid_mode,
-                graph_k=graph_k,
                 fit_options=fit_options,
                 bic_df_scale=bic_df_scale,
                 bic_cluster_penalty=bic_cluster_penalty,
@@ -165,13 +150,12 @@ def run_directory(
                 selection_score=selection_score,
                 use_warm_starts=use_warm_starts,
                 write_outputs=write_outputs,
-                bo_max_evals=bo_max_evals,
-                bo_init_points=bo_init_points,
-                bo_random_seed=bo_random_seed,
             )
         )
 
-    summary_df = pd.DataFrame(summaries).sort_values("patient_id").reset_index(drop=True)
+    summary_df = pd.DataFrame(summaries)
+    sort_column = "tumor_id" if "tumor_id" in summary_df.columns else "patient_id"
+    summary_df = summary_df.sort_values(sort_column).reset_index(drop=True)
     Path(outdir).mkdir(parents=True, exist_ok=True)
     summary_df.to_csv(Path(outdir) / "single_stage_summary.tsv", sep="\t", index=False)
     return summary_df

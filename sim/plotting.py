@@ -186,6 +186,7 @@ def _plot_patient_tree(ax, clone_ids: list[int], patient_ccf: np.ndarray, cluste
 def _plot_region_ccf_matrix(ax, fig: plt.Figure, clone_ids: list[int], sample_ccf: np.ndarray, cluster_sizes: np.ndarray, patient_ccf: np.ndarray, order: list[int]) -> None:
     mat = sample_ccf[order, :]
     im = ax.imshow(mat, aspect="auto", cmap="viridis", vmin=0.0, vmax=1.0)
+    ax.grid(False)
     n_rows, n_cols = mat.shape
     font_size = 10 if n_cols <= 5 else 9 if n_cols <= 10 else 7
     ax.set_title("Clone CCF Matrix By Region")

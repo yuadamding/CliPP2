@@ -94,23 +94,15 @@ def _effective_prefetch_buffer(config: MassiveMultiregionBenchmarkConfig) -> int
     return max(2 * _effective_prefetch_workers(config), 1)
 
 
-def _looks_like_cpu_device(device: object) -> bool:
-    if device is None:
-        return True
-    device_text = str(device).strip().lower()
-    return device_text in {"", "auto", "cpu"}
-
-
 def _effective_fit_workers(
     config: MassiveMultiregionBenchmarkConfig,
     fit_options: FitOptions | None,
 ) -> int:
     if int(config.fit_workers) > 0:
         return int(config.fit_workers)
+    del fit_options
     cpu_count = max(int(os.cpu_count() or 1), 1)
-    if fit_options is None or _looks_like_cpu_device(fit_options.device):
-        return max(cpu_count - 2, 1)
-    return 1
+    return max(cpu_count - 2, 1)
 
 
 def _configure_numeric_runtime(worker_threads: int) -> None:
@@ -205,16 +197,12 @@ def _run_case_worker(
     fit_options: FitOptions,
     lambda_grid: list[float] | None,
     lambda_grid_mode: str,
-    graph_k: int,
     bic_df_scale: float,
     bic_cluster_penalty: float,
     settings_profile: str,
     selection_score: str,
     use_warm_starts: bool,
     write_patient_outputs: bool,
-    bo_max_evals: int,
-    bo_init_points: int,
-    bo_random_seed: int,
     temp_sim_root: str | Path,
     temp_tsv_root: str | Path,
     outdir: str | Path,
@@ -238,7 +226,6 @@ def _run_case_worker(
             simulation_root=temp_sim_root,
             lambda_grid=lambda_grid,
             lambda_grid_mode=lambda_grid_mode,
-            graph_k=graph_k,
             fit_options=fit_options,
             bic_df_scale=bic_df_scale,
             bic_cluster_penalty=bic_cluster_penalty,
@@ -246,9 +233,6 @@ def _run_case_worker(
             selection_score=selection_score,
             use_warm_starts=use_warm_starts,
             write_outputs=write_patient_outputs,
-            bo_max_evals=bo_max_evals,
-            bo_init_points=bo_init_points,
-            bo_random_seed=bo_random_seed,
         )
         return {**_parse_patient_id(out_tsv.stem), **summary}
     finally:
@@ -264,16 +248,12 @@ def run_massive_multiregion_benchmark(
     fit_options: FitOptions | None = None,
     lambda_grid: list[float] | None = None,
     lambda_grid_mode: str = "dense_no_zero",
-    graph_k: int = 8,
     bic_df_scale: float = 8.0,
     bic_cluster_penalty: float = 4.0,
-    settings_profile: str = "auto",
+    settings_profile: str = "manual",
     selection_score: str = "refit_ebic",
     use_warm_starts: bool = True,
     write_patient_outputs: bool = False,
-    bo_max_evals: int = 12,
-    bo_init_points: int = 5,
-    bo_random_seed: int = 0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     outdir = Path(config.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -284,7 +264,7 @@ def run_massive_multiregion_benchmark(
     temp_tsv_root.mkdir(parents=True, exist_ok=True)
 
     if fit_options is None:
-        fit_options = FitOptions(lambda_value=0.0, device="auto")
+        fit_options = FitOptions(lambda_value=0.0)
     _configure_numeric_runtime(config.worker_threads)
 
     patient_rows: list[dict[str, int | float | str | bool]] = []
@@ -321,7 +301,6 @@ def run_massive_multiregion_benchmark(
             simulation_root=temp_sim_root,
             lambda_grid=lambda_grid,
             lambda_grid_mode=lambda_grid_mode,
-            graph_k=graph_k,
             fit_options=fit_options,
             bic_df_scale=bic_df_scale,
             bic_cluster_penalty=bic_cluster_penalty,
@@ -329,9 +308,6 @@ def run_massive_multiregion_benchmark(
             selection_score=selection_score,
             use_warm_starts=use_warm_starts,
             write_outputs=write_patient_outputs,
-            bo_max_evals=bo_max_evals,
-            bo_init_points=bo_init_points,
-            bo_random_seed=bo_random_seed,
         )
         patient_rows.append({**_parse_patient_id(out_tsv.stem), **summary})
         case_index += 1
@@ -366,16 +342,12 @@ def run_massive_multiregion_benchmark(
                     fit_options,
                     lambda_grid,
                     lambda_grid_mode,
-                    graph_k,
                     bic_df_scale,
                     bic_cluster_penalty,
                     settings_profile,
                     selection_score,
                     use_warm_starts,
                     write_patient_outputs,
-                    bo_max_evals,
-                    bo_init_points,
-                    bo_random_seed,
                     temp_sim_root,
                     temp_tsv_root,
                     outdir,
@@ -405,16 +377,12 @@ def run_massive_multiregion_benchmark(
                             fit_options,
                             lambda_grid,
                             lambda_grid_mode,
-                            graph_k,
                             bic_df_scale,
                             bic_cluster_penalty,
                             settings_profile,
                             selection_score,
                             use_warm_starts,
                             write_patient_outputs,
-                            bo_max_evals,
-                            bo_init_points,
-                            bo_random_seed,
                             temp_sim_root,
                             temp_tsv_root,
                             outdir,

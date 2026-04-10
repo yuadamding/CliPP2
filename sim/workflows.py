@@ -27,11 +27,11 @@ def generate_and_convert_simulation(config: SimulationPackageConfig) -> tuple[li
 
 def build_parser() -> argparse.ArgumentParser:
     parser = build_simulation_parser()
-    parser.description = "Generate simulation folders and convert them into per-patient TSV files."
+    parser.description = "Generate simulation folders and convert them into per-tumor TSV files."
     parser.add_argument(
         "--merged-out-dir",
         default="CliPP2Sim_TSV",
-        help="Directory to write the merged per-patient TSV files.",
+        help="Directory to write the merged per-tumor TSV files.",
     )
     return parser
 
