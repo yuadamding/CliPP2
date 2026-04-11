@@ -7,11 +7,11 @@ import numpy as np
 import pandas as pd
 
 from ..core.model import FitOptions
-from ..io.data import PatientData, load_patient_tsv
+from ..io.data import TumorData, load_tumor_tsv
 from ..metrics.evaluation import evaluate_fit_against_simulation
 from .model_selection import select_model
 from .outputs import write_fit_outputs
-from .settings import summarize_patient_regime
+from .settings import summarize_tumor_regime
 
 
 def process_one_file(
@@ -24,20 +24,20 @@ def process_one_file(
     bic_df_scale: float = 8.0,
     bic_cluster_penalty: float = 4.0,
     settings_profile: str = "manual",
-    selection_score: str = "refit_ebic",
+    selection_score: str = "ebic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
 ) -> dict[str, float | int | str | bool]:
     start_time = perf_counter()
     file_path = Path(file_path)
     outdir = Path(outdir)
-    data = load_patient_tsv(file_path)
+    data = load_tumor_tsv(file_path)
 
     if fit_options is None:
         fit_options = FitOptions(lambda_value=0.0)
 
-    patient_regime = summarize_patient_regime(data)
-    evaluate_all_candidates = write_outputs and simulation_root is not None and (Path(simulation_root) / data.patient_id).exists()
+    tumor_regime = summarize_tumor_regime(data)
+    evaluate_all_candidates = write_outputs and simulation_root is not None and (Path(simulation_root) / data.tumor_id).exists()
     selection_result = select_model(
         data=data,
         simulation_root=Path(simulation_root) if simulation_root is not None else None,
@@ -55,14 +55,14 @@ def process_one_file(
     best_evaluation = selection_result.best_evaluation
     search_df = selection_result.search_df
 
-    if best_evaluation is None and simulation_root is not None and (Path(simulation_root) / data.patient_id).exists():
+    if best_evaluation is None and simulation_root is not None and (Path(simulation_root) / data.tumor_id).exists():
         best_evaluation = evaluate_fit_against_simulation(fit=best_fit, data=data, simulation_root=simulation_root)
 
     elapsed_seconds = float(perf_counter() - start_time)
 
     summary = {
         "tumor_id": data.tumor_id,
-        "estimator": "profiled_direct_partition",
+        "estimator": "objective_faithful_pairwise_fusion",
         "selected_lambda": float(best_fit.lambda_value),
         "bic": float(best_fit.bic if best_fit.bic is not None else np.nan),
         "classic_bic": float(best_fit.classic_bic if best_fit.classic_bic is not None else np.nan),
@@ -72,16 +72,17 @@ def process_one_file(
         "settings_profile": selection_result.profile_name,
         "selection_method": selection_result.selection_method,
         "selection_score_name": str(best_fit.selection_score_name or selection_score),
-        "num_regions": int(patient_regime.num_samples),
-        "num_mutations": int(patient_regime.num_mutations),
-        "depth_scale": float(patient_regime.depth_scale),
-        "mean_purity": float(patient_regime.mean_purity),
-        "non_diploid_rate": float(patient_regime.non_diploid_rate),
+        "num_regions": int(tumor_regime.num_regions),
+        "num_mutations": int(tumor_regime.num_mutations),
+        "depth_scale": float(tumor_regime.depth_scale),
+        "mean_purity": float(tumor_regime.mean_purity),
+        "non_diploid_rate": float(tumor_regime.non_diploid_rate),
         "lambda_grid_mode": str(lambda_grid_mode if lambda_grid is None else "explicit"),
         "bic_df_scale": float(selection_result.bic_df_scale),
         "bic_cluster_penalty": float(selection_result.bic_cluster_penalty),
         "converged": bool(best_fit.converged),
         "device": best_fit.device,
+        "graph_name": str(best_fit.graph_name),
         "ARI": np.nan if best_evaluation is None else float(best_evaluation.ari),
         "cp_rmse": np.nan if best_evaluation is None else float(best_evaluation.cp_rmse),
         "multiplicity_f1": np.nan if best_evaluation is None else float(best_evaluation.multiplicity_f1),
@@ -122,7 +123,7 @@ def run_directory(
     bic_df_scale: float = 8.0,
     bic_cluster_penalty: float = 4.0,
     settings_profile: str = "manual",
-    selection_score: str = "refit_ebic",
+    selection_score: str = "ebic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
 ) -> pd.DataFrame:

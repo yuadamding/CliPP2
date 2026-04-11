@@ -1,4 +1,5 @@
-from .fusion_solver import (
+from .fusion import (
+    FusionFitArtifacts,
     PairwiseFusionGraph,
     TorchRuntime,
     build_complete_uniform_graph,
@@ -6,16 +7,14 @@ from .fusion_solver import (
     compute_pooled_observed_data_start,
     fit_observed_data_pairwise_fusion,
 )
-from .model import FitOptions, FitResult, fit_single_stage_em
 
 __all__ = [
-    "FitOptions",
-    "FitResult",
+    "FusionFitArtifacts",
     "PairwiseFusionGraph",
     "TorchRuntime",
     "build_complete_uniform_graph",
     "compute_exact_observed_data_pilot",
     "compute_pooled_observed_data_start",
     "fit_observed_data_pairwise_fusion",
-    "fit_single_stage_em",
 ]
+

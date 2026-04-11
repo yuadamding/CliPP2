@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="multi-region clipp",
         description=(
             "multi-region clipp: cellular prevalence clustering with exact observed-data "
-            "likelihood and profiled direct partition search."
+            "likelihood and objective-faithful pairwise fusion."
         ),
     )
     parser.add_argument("--input-dir", default="CliPP2Sim_TSV", help="Directory with per-tumor TSV files.")
@@ -59,9 +59,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional comma-separated filter for benchmark depth settings, for example '50,300,1000'.",
     )
-    parser.add_argument("--outer-max-iter", type=int, default=8, help="Maximum partition-search rounds.")
-    parser.add_argument("--inner-max-iter", type=int, default=30, help="Maximum 1D center-refit iterations.")
-    parser.add_argument("--tol", type=float, default=1e-4, help="Partition-search tolerance.")
+    parser.add_argument("--outer-max-iter", type=int, default=8, help="Maximum outer majorization iterations.")
+    parser.add_argument("--inner-max-iter", type=int, default=30, help="Maximum inner convex-solver iterations.")
+    parser.add_argument("--tol", type=float, default=1e-4, help="Optimization tolerance.")
     parser.add_argument(
         "--bic-df-scale",
         type=float,
@@ -78,13 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--settings-profile",
         choices=["manual", "auto"],
         default="manual",
-        help="Model-selection strategy. 'manual' uses the provided lambda path; 'auto' uses compact direct-partition defaults.",
+        help="Model-selection strategy. 'manual' uses the provided lambda path; 'auto' uses compact pairwise-fusion defaults.",
     )
     parser.add_argument(
         "--selection-score",
-        choices=["ebic", "refit_ebic", "classic_bic", "classic_refit_bic"],
-        default="refit_ebic",
-        help="Candidate scoring objective. The default is refit-EBIC on the partition-refit observed likelihood.",
+        choices=["ebic", "classic_bic", "refit_ebic", "classic_refit_bic"],
+        default="ebic",
+        help="Candidate scoring objective. Legacy refit-* names are accepted as aliases but normalize to the raw-objective BIC scores.",
     )
     parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
     parser.add_argument(
@@ -94,8 +94,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip per-tumor mutation/cluster/lambda files and only write benchmark summaries.",
     )
     parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability assigned to major-copy multiplicity.")
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Execution device for the Torch fusion backend.",
+    )
     parser.add_argument("--max-files", type=int, default=None, help="Optional cap on the number of files processed.")
-    parser.add_argument("--verbose", action="store_true", help="Print partition-search progress.")
+    parser.add_argument("--verbose", action="store_true", help="Print optimizer progress.")
     return parser
 
 
@@ -109,6 +115,7 @@ def main() -> None:
         inner_max_iter=args.inner_max_iter,
         tol=args.tol,
         major_prior=args.major_prior,
+        device=args.device,
         verbose=args.verbose,
     )
     lambda_grid = _parse_lambda_grid(args.lambda_grid)

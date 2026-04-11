@@ -8,10 +8,10 @@ import pandas as pd
 
 
 @dataclass
-class PatientData:
-    patient_id: str
+class TumorData:
+    tumor_id: str
     mutation_ids: list[str]
-    sample_ids: list[str]
+    region_ids: list[str]
     alt_counts: np.ndarray
     total_counts: np.ndarray
     purity: np.ndarray
@@ -29,20 +29,20 @@ class PatientData:
         return int(self.alt_counts.shape[0])
 
     @property
-    def num_samples(self) -> int:
+    def num_regions(self) -> int:
         return int(self.alt_counts.shape[1])
 
     @property
-    def tumor_id(self) -> str:
-        return self.patient_id
+    def num_samples(self) -> int:
+        return self.num_regions
 
     @property
-    def region_ids(self) -> list[str]:
-        return list(self.sample_ids)
+    def patient_id(self) -> str:
+        return self.tumor_id
 
     @property
-    def num_regions(self) -> int:
-        return self.num_samples
+    def sample_ids(self) -> list[str]:
+        return list(self.region_ids)
 
     @property
     def depth_scale(self) -> float:
@@ -63,8 +63,7 @@ class PatientData:
         # Outside CNA-ambiguous entries, keep multiplicity fixed at the available major-copy value.
         return self.major_cn.astype(np.float32, copy=True)
 
-
-TumorData = PatientData
+PatientData = TumorData
 
 
 def _first_seen(values: pd.Series) -> list[str]:
@@ -122,7 +121,7 @@ def compute_phi_init_from_counts(
     return phi_init.astype(np.float32), init_major_mask.astype(bool)
 
 
-def load_patient_tsv(file_path: str | Path, eps: float = 1e-6) -> PatientData:
+def load_tumor_tsv(file_path: str | Path, eps: float = 1e-6) -> TumorData:
     file_path = Path(file_path)
     df = pd.read_csv(file_path, sep="\t").copy()
 
@@ -159,21 +158,21 @@ def load_patient_tsv(file_path: str | Path, eps: float = 1e-6) -> PatientData:
     df["mutation_id"] = df["mutation_id"].astype(str)
     df["sample_id"] = df["sample_id"].astype(str)
     mutation_ids = _first_seen(df["mutation_id"])
-    sample_ids = _first_seen(df["sample_id"])
+    region_ids = _first_seen(df["sample_id"])
 
     mut_index = {mutation_id: idx for idx, mutation_id in enumerate(mutation_ids)}
-    sample_index = {sample_id: idx for idx, sample_id in enumerate(sample_ids)}
+    sample_index = {sample_id: idx for idx, sample_id in enumerate(region_ids)}
 
     num_mutations = len(mutation_ids)
-    num_samples = len(sample_ids)
+    num_regions = len(region_ids)
 
-    alt_counts = np.zeros((num_mutations, num_samples), dtype=np.float32)
-    total_counts = np.zeros((num_mutations, num_samples), dtype=np.float32)
-    purity = np.zeros((num_mutations, num_samples), dtype=np.float32)
-    major_cn = np.zeros((num_mutations, num_samples), dtype=np.float32)
-    minor_cn = np.zeros((num_mutations, num_samples), dtype=np.float32)
-    normal_cn = np.zeros((num_mutations, num_samples), dtype=np.float32)
-    has_cna = np.ones((num_mutations, num_samples), dtype=bool)
+    alt_counts = np.zeros((num_mutations, num_regions), dtype=np.float32)
+    total_counts = np.zeros((num_mutations, num_regions), dtype=np.float32)
+    purity = np.zeros((num_mutations, num_regions), dtype=np.float32)
+    major_cn = np.zeros((num_mutations, num_regions), dtype=np.float32)
+    minor_cn = np.zeros((num_mutations, num_regions), dtype=np.float32)
+    normal_cn = np.zeros((num_mutations, num_regions), dtype=np.float32)
+    has_cna = np.ones((num_mutations, num_regions), dtype=bool)
 
     for row in df.itertuples(index=False):
         i = mut_index[str(row.mutation_id)]
@@ -210,10 +209,10 @@ def load_patient_tsv(file_path: str | Path, eps: float = 1e-6) -> PatientData:
         eps=eps,
     )
 
-    return PatientData(
-        patient_id=file_path.stem,
+    return TumorData(
+        tumor_id=file_path.stem,
         mutation_ids=mutation_ids,
-        sample_ids=sample_ids,
+        region_ids=region_ids,
         alt_counts=alt_counts,
         total_counts=total_counts,
         purity=purity.astype(np.float32),
@@ -228,14 +227,14 @@ def load_patient_tsv(file_path: str | Path, eps: float = 1e-6) -> PatientData:
     )
 
 
-def load_tumor_tsv(file_path: str | Path, eps: float = 1e-6) -> TumorData:
-    return load_patient_tsv(file_path=file_path, eps=eps)
+def load_patient_tsv(file_path: str | Path, eps: float = 1e-6) -> PatientData:
+    return load_tumor_tsv(file_path=file_path, eps=eps)
 
 
 __all__ = [
-    "PatientData",
     "TumorData",
+    "PatientData",
     "compute_phi_init_from_counts",
-    "load_patient_tsv",
     "load_tumor_tsv",
+    "load_patient_tsv",
 ]

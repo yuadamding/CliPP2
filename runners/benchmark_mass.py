@@ -251,7 +251,7 @@ def run_massive_multiregion_benchmark(
     bic_df_scale: float = 8.0,
     bic_cluster_penalty: float = 4.0,
     settings_profile: str = "manual",
-    selection_score: str = "refit_ebic",
+    selection_score: str = "ebic",
     use_warm_starts: bool = True,
     write_patient_outputs: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:

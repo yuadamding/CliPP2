@@ -5,16 +5,16 @@ from .conversion import (
     convert_simulation_root,
     convert_simulation_root_from_config,
 )
-from .data import PatientData, TumorData, load_patient_tsv, load_tumor_tsv
+from .data import TumorData, PatientData, load_tumor_tsv, load_patient_tsv
 
 __all__ = [
     "ConversionConfig",
-    "PatientData",
     "TumorData",
+    "PatientData",
     "convert_one_patient",
     "convert_one_tumor",
     "convert_simulation_root",
     "convert_simulation_root_from_config",
-    "load_patient_tsv",
     "load_tumor_tsv",
+    "load_patient_tsv",
 ]

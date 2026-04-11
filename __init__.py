@@ -1,7 +1,7 @@
 """Core package for multi-region clipp.
 
 Layout:
-- `core`: direct partition search and fitting
+- `core`: observed-data pairwise fusion and fitting
 - `io`: TSV loading and simulation-to-TSV conversion
 - `metrics`: simulation-time evaluation helpers
 - `runners`: end-to-end fitting, benchmarking, and settings selection
@@ -9,22 +9,32 @@ Layout:
 """
 
 from ._version import __version__
-from .core import FitOptions, FitResult, fit_profiled_partition_search, fit_single_stage_em
+from .core import (
+    FitOptions,
+    FitResult,
+    PairwiseFusionGraph,
+    TorchRuntime,
+    build_complete_uniform_graph,
+    compute_exact_observed_data_pilot,
+    compute_pooled_observed_data_start,
+    fit_observed_data_pairwise_fusion,
+    fit_single_stage_em,
+)
 from .io import (
     ConversionConfig,
-    PatientData,
     TumorData,
+    PatientData,
     convert_one_tumor,
     convert_simulation_root,
-    load_patient_tsv,
     load_tumor_tsv,
+    load_patient_tsv,
 )
 from .metrics import evaluate_fit_against_simulation
 from .runners import (
     MassiveMultiregionBenchmarkConfig,
     ModelSelectionResult,
-    PatientRegime,
     TumorRegime,
+    PatientRegime,
     RecommendedSettings,
     process_one_file,
     recommend_settings_from_data,
@@ -46,22 +56,27 @@ __all__ = [
     "FitResult",
     "MassiveMultiregionBenchmarkConfig",
     "ModelSelectionResult",
+    "PairwiseFusionGraph",
+    "TorchRuntime",
+    "TumorData",
     "PatientRegime",
     "PatientData",
-    "TumorData",
     "TumorRegime",
     "RecommendedSettings",
     "SimulationGridConfig",
     "SimulationPackageConfig",
     "__version__",
+    "build_complete_uniform_graph",
+    "compute_exact_observed_data_pilot",
+    "compute_pooled_observed_data_start",
     "convert_one_tumor",
     "convert_simulation_root",
     "evaluate_fit_against_simulation",
-    "fit_profiled_partition_search",
+    "fit_observed_data_pairwise_fusion",
     "fit_single_stage_em",
     "generate_and_convert_simulation",
-    "load_patient_tsv",
     "load_tumor_tsv",
+    "load_patient_tsv",
     "process_one_file",
     "recommend_settings_from_data",
     "recommend_settings_from_regime",

@@ -7,7 +7,9 @@ import numpy as np
 import pandas as pd
 
 from ..core.model import FitOptions, FitResult, fit_single_stage_em
-from ..io.data import PatientData
+from ..core.fusion_solver import build_complete_uniform_graph, compute_exact_observed_data_pilot
+from ..core.fusion.torch_backend import resolve_runtime
+from ..io.data import TumorData
 from ..metrics.evaluation import SimulationEvaluation, evaluate_fit_against_simulation
 from .selection import compute_classic_bic, compute_extended_bic, default_lambda_grid
 from .settings import recommend_settings_from_data
@@ -24,11 +26,20 @@ class ModelSelectionResult:
     profile_name: str
 
 
+def _normalize_selection_score_name(selection_score: str) -> str:
+    normalized = str(selection_score).strip().lower()
+    if normalized in {"ebic", "refit_ebic"}:
+        return "ebic"
+    if normalized in {"classic_bic", "classic_refit_bic"}:
+        return "classic_bic"
+    raise ValueError(f"Unknown selection_score: {selection_score}")
+
+
 def _selection_score_value(
     *,
     loglik: float,
     num_clusters: int,
-    data: PatientData,
+    data: TumorData,
     bic_df_scale: float,
     bic_cluster_penalty: float,
     selection_score: str,
@@ -41,17 +52,17 @@ def _selection_score_value(
         bic_df_scale=bic_df_scale,
         bic_cluster_penalty=bic_cluster_penalty,
     )
-    normalized = str(selection_score).strip().lower()
-    if normalized in {"ebic", "refit_ebic"}:
+    normalized = _normalize_selection_score_name(selection_score)
+    if normalized == "ebic":
         return float(extended_bic), float(classic_bic), float(extended_bic)
-    if normalized in {"classic_bic", "classic_refit_bic"}:
+    if normalized == "classic_bic":
         return float(classic_bic), float(classic_bic), float(extended_bic)
-    raise ValueError(f"Unknown selection_score: {selection_score}")
+    raise ValueError(f"Unknown normalized selection_score: {selection_score}")
 
 
 def _evaluate_candidate(
     *,
-    data: PatientData,
+    data: TumorData,
     fit_options: FitOptions,
     bic_df_scale: float,
     bic_cluster_penalty: float,
@@ -64,6 +75,7 @@ def _evaluate_candidate(
     lambda_value: float,
     selection_score: str,
 ) -> tuple[FitResult, SimulationEvaluation | None, dict[str, float | int | str | bool]]:
+    canonical_score_name = _normalize_selection_score_name(selection_score)
     fit = fit_single_stage_em(
         data=data,
         options=replace(fit_options, lambda_value=float(lambda_value)),
@@ -80,14 +92,13 @@ def _evaluate_candidate(
     fit.bic = bic
     fit.classic_bic = classic_bic
     fit.extended_bic = extended_bic
-    fit.selection_score_name = selection_score
+    fit.selection_score_name = canonical_score_name
 
     evaluation = None
-    if evaluate_candidate and simulation_root is not None and (simulation_root / data.patient_id).exists():
+    if evaluate_candidate and simulation_root is not None and (simulation_root / data.tumor_id).exists():
         evaluation = evaluate_fit_against_simulation(fit=fit, data=data, simulation_root=simulation_root)
 
     row: dict[str, float | int | str | bool] = {
-        "patient_id": data.patient_id,
         "tumor_id": data.tumor_id,
         "selection_method": selection_method,
         "selection_profile": profile_name,
@@ -96,7 +107,7 @@ def _evaluate_candidate(
         "bic_df_scale": float(bic_df_scale),
         "bic_cluster_penalty": float(bic_cluster_penalty),
         "bic": float(bic),
-        "selection_score_name": str(selection_score),
+        "selection_score_name": str(canonical_score_name),
         "classic_bic": float(classic_bic),
         "extended_bic": float(extended_bic),
         "loglik": float(fit.loglik),
@@ -105,6 +116,7 @@ def _evaluate_candidate(
         "converged": bool(fit.converged),
         "iterations": int(fit.iterations),
         "device": str(fit.device),
+        "graph_name": str(fit.graph_name),
         "ARI": np.nan if evaluation is None else float(evaluation.ari),
         "cp_rmse": np.nan if evaluation is None else float(evaluation.cp_rmse),
         "multiplicity_f1": np.nan if evaluation is None else float(evaluation.multiplicity_f1),
@@ -118,7 +130,7 @@ def _evaluate_candidate(
 
 def _grid_search_selection(
     *,
-    data: PatientData,
+    data: TumorData,
     simulation_root: Path | None,
     lambda_grid: list[float] | None,
     lambda_grid_mode: str,
@@ -135,14 +147,24 @@ def _grid_search_selection(
         lambda_grid = default_lambda_grid(data, mode=lambda_grid_mode)
     lambda_grid = [float(value) for value in np.unique(np.sort(np.asarray(lambda_grid, dtype=float)))]
 
-    phi_start = data.phi_init.copy()
+    effective_graph = fit_options.graph if fit_options.graph is not None else build_complete_uniform_graph(data.num_mutations)
+    effective_fit_options = replace(fit_options, graph=effective_graph)
+    runtime = resolve_runtime(fit_options.device)
+    phi_start = compute_exact_observed_data_pilot(
+        data,
+        runtime=runtime,
+        major_prior=float(fit_options.major_prior),
+        eps=float(fit_options.eps),
+        tol=max(float(fit_options.tol), 1e-6),
+        max_iter=max(int(fit_options.inner_max_iter), 16),
+    )
     candidate_fits: list[tuple[FitResult, SimulationEvaluation | None]] = []
     search_rows: list[dict[str, float | int | str | bool]] = []
 
     for step, lambda_value in enumerate(lambda_grid):
         fit, evaluation, row = _evaluate_candidate(
             data=data,
-            fit_options=fit_options,
+            fit_options=effective_fit_options,
             bic_df_scale=bic_df_scale,
             bic_cluster_penalty=bic_cluster_penalty,
             simulation_root=simulation_root,
@@ -175,7 +197,7 @@ def _grid_search_selection(
 
 def select_model(
     *,
-    data: PatientData,
+    data: TumorData,
     simulation_root: Path | None,
     lambda_grid: list[float] | None,
     lambda_grid_mode: str,

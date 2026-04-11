@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from ..io.data import PatientData
-from .partition_search import fit_profiled_partition_search
+from ..io.data import TumorData
+from .fusion_solver import PairwiseFusionGraph, fit_observed_data_pairwise_fusion
 
 
 @dataclass
@@ -16,6 +16,8 @@ class FitOptions:
     tol: float = 1e-4
     major_prior: float = 0.5
     eps: float = 1e-6
+    graph: PairwiseFusionGraph | None = None
+    device: str = "auto"
     verbose: bool = False
 
 
@@ -37,6 +39,7 @@ class FitResult:
     iterations: int
     converged: bool
     device: str
+    graph_name: str
     history: list[float] = field(default_factory=list)
     bic: float | None = None
     classic_bic: float | None = None
@@ -45,11 +48,11 @@ class FitResult:
 
 
 def fit_single_stage_em(
-    data: PatientData,
+    data: TumorData,
     options: FitOptions,
     phi_start: np.ndarray | None = None,
 ) -> FitResult:
-    artifacts = fit_profiled_partition_search(
+    artifacts = fit_observed_data_pairwise_fusion(
         data=data,
         lambda_value=float(options.lambda_value),
         major_prior=float(options.major_prior),
@@ -58,6 +61,8 @@ def fit_single_stage_em(
         inner_max_iter=max(int(options.inner_max_iter), 16),
         tol=max(float(options.tol), 1e-6),
         phi_start=None if phi_start is None else np.asarray(phi_start, dtype=np.float32),
+        graph=options.graph,
+        device=str(options.device),
         verbose=bool(options.verbose),
     )
     return FitResult(
@@ -77,6 +82,7 @@ def fit_single_stage_em(
         iterations=int(artifacts.iterations),
         converged=bool(artifacts.converged),
         device=str(artifacts.device),
+        graph_name=str(artifacts.graph_name),
         history=list(artifacts.history),
     )
 

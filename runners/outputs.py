@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from ..core.model import FitResult
-from ..io.data import PatientData
+from ..io.data import TumorData
 from ..metrics.evaluation import SimulationEvaluation
 
 
@@ -14,7 +14,7 @@ def _display_region_label(label: str) -> str:
     return str(label).replace("sample", "region")
 
 
-def mutation_output_table(data: PatientData, fit: FitResult) -> pd.DataFrame:
+def mutation_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame:
     cluster_sizes = np.bincount(fit.cluster_labels, minlength=fit.n_clusters)
     table = pd.DataFrame(
         {
@@ -29,7 +29,7 @@ def mutation_output_table(data: PatientData, fit: FitResult) -> pd.DataFrame:
     return table
 
 
-def cluster_output_table(data: PatientData, fit: FitResult) -> pd.DataFrame:
+def cluster_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame:
     cluster_sizes = np.bincount(fit.cluster_labels, minlength=fit.n_clusters)
     table = pd.DataFrame(
         {
@@ -43,7 +43,7 @@ def cluster_output_table(data: PatientData, fit: FitResult) -> pd.DataFrame:
     return table
 
 
-def cell_output_table(data: PatientData, fit: FitResult) -> pd.DataFrame:
+def cell_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame:
     mutation_ids = np.repeat(np.asarray(data.mutation_ids, dtype=object), data.num_regions)
     region_ids = np.tile(
         np.asarray([_display_region_label(region_id) for region_id in data.region_ids], dtype=object),
@@ -89,7 +89,7 @@ def evaluation_to_frame(evaluation: SimulationEvaluation) -> pd.DataFrame:
 
 def write_fit_outputs(
     outdir: Path,
-    data: PatientData,
+    data: TumorData,
     fit: FitResult,
     search_df: pd.DataFrame,
     evaluation: SimulationEvaluation | None,

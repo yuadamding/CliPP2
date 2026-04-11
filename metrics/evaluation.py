@@ -9,7 +9,7 @@ import pandas as pd
 from sklearn.metrics import adjusted_rand_score, f1_score
 
 from ..core.model import FitResult
-from ..io.data import PatientData
+from ..io.data import TumorData
 
 
 @dataclass
@@ -34,11 +34,11 @@ def _region_index_from_label(region_id: str) -> int:
 
 
 def _load_single_region_truth(
-    patient_dir: Path,
-    data: PatientData,
+    tumor_dir: Path,
+    data: TumorData,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-    truth_clusters = pd.read_csv(patient_dir / "truth.txt", sep="\t")["cluster_id"].to_numpy(dtype=int)
-    truth_cp = pd.read_csv(patient_dir / "truth_cp.txt", sep="\t")
+    truth_clusters = pd.read_csv(tumor_dir / "truth.txt", sep="\t")["cluster_id"].to_numpy(dtype=int)
+    truth_cp = pd.read_csv(tumor_dir / "truth_cp.txt", sep="\t")
     if truth_cp.shape[0] != data.num_mutations:
         raise ValueError(
             f"Single-region truth CP count mismatch for tumor {data.tumor_id}: "
@@ -49,7 +49,7 @@ def _load_single_region_truth(
     truth_phi[:, 0] = truth_cp["ccf"].to_numpy(dtype=np.float32)
 
     truth_multiplicity = None
-    cna_path = patient_dir / "cna.txt"
+    cna_path = tumor_dir / "cna.txt"
     if cna_path.exists():
         cna = pd.read_csv(cna_path, sep="\t")
         if "multiplicity" in cna.columns and cna.shape[0] == data.num_mutations:
@@ -80,17 +80,17 @@ def _cluster_level_clonal_fraction(phi: np.ndarray, labels: np.ndarray) -> float
 
 def evaluate_fit_against_simulation(
     fit: FitResult,
-    data: PatientData,
+    data: TumorData,
     simulation_root: str | Path,
 ) -> SimulationEvaluation:
-    patient_dir = Path(simulation_root) / data.patient_id
-    if not patient_dir.exists():
-        raise FileNotFoundError(f"Simulation directory not found for tumor '{data.tumor_id}': {patient_dir}")
+    tumor_dir = Path(simulation_root) / data.tumor_id
+    if not tumor_dir.exists():
+        raise FileNotFoundError(f"Simulation directory not found for tumor '{data.tumor_id}': {tumor_dir}")
 
-    if data.num_samples == 1 and (patient_dir / "truth_cp.txt").exists():
-        truth_clusters, truth_phi, truth_multiplicity = _load_single_region_truth(patient_dir=patient_dir, data=data)
+    if data.num_samples == 1 and (tumor_dir / "truth_cp.txt").exists():
+        truth_clusters, truth_phi, truth_multiplicity = _load_single_region_truth(tumor_dir=tumor_dir, data=data)
     else:
-        truth_clusters = pd.read_csv(patient_dir / "truth.txt", sep="\t")["cluster_id"].to_numpy(dtype=int)
+        truth_clusters = pd.read_csv(tumor_dir / "truth.txt", sep="\t")["cluster_id"].to_numpy(dtype=int)
         if truth_clusters.shape[0] != data.num_mutations:
             raise ValueError(
                 f"Truth cluster count mismatch for tumor {data.tumor_id}: "
@@ -102,7 +102,7 @@ def evaluate_fit_against_simulation(
 
         for column, region_id in enumerate(data.region_ids):
             region_index = _region_index_from_label(region_id)
-            region_dir = patient_dir / f"sample{region_index}"
+            region_dir = tumor_dir / f"sample{region_index}"
             truth_cp = pd.read_csv(region_dir / "truth_cp.txt", sep="\t")
             cna = pd.read_csv(region_dir / "cna.txt", sep="\t")
 

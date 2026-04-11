@@ -19,6 +19,7 @@ SINGLE_REGION_PATTERN = re.compile(
 )
 
 DEFAULT_PATIENT_SORT_COLUMNS = ["N_mean", "purity", "amp_rate", "n_samples", "true_K", "rep"]
+DEFAULT_TUMOR_SORT_COLUMNS = DEFAULT_PATIENT_SORT_COLUMNS
 
 
 def _parse_patient_id(patient_id: str) -> dict[str, int | float | str]:
@@ -69,6 +70,14 @@ def parse_cohort_patient_id(patient_id: str) -> dict[str, int | float | str]:
         return _parse_patient_id(patient_id)
     except ValueError:
         return parse_single_region_patient_id(patient_id)
+
+
+def parse_single_region_tumor_id(tumor_id: str) -> dict[str, int | float | str]:
+    return parse_single_region_patient_id(tumor_id)
+
+
+def parse_cohort_tumor_id(tumor_id: str) -> dict[str, int | float | str]:
+    return parse_cohort_patient_id(tumor_id)
 
 
 def _select_representative_files_with_filter(
@@ -258,6 +267,14 @@ def materialize_patient_df(
     return _with_tumor_region_aliases(_add_cluster_count_metrics(patient_df))
 
 
+def materialize_tumor_df(
+    tumor_rows: list[dict[str, int | float | str | bool]],
+    *,
+    sort_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    return materialize_patient_df(tumor_rows, sort_columns=sort_columns)
+
+
 def write_patient_checkpoint(
     patient_rows: list[dict[str, int | float | str | bool]],
     *,
@@ -282,6 +299,27 @@ def write_patient_checkpoint(
         f"| eta={eta_seconds/60.0:.1f} min"
     )
     return patient_df
+
+
+def write_tumor_checkpoint(
+    tumor_rows: list[dict[str, int | float | str | bool]],
+    *,
+    outdir: Path,
+    start_time: float,
+    case_index: int,
+    total_cases: int,
+    label: str,
+    sort_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    return write_patient_checkpoint(
+        tumor_rows,
+        outdir=outdir,
+        start_time=start_time,
+        case_index=case_index,
+        total_cases=total_cases,
+        label=label,
+        sort_columns=sort_columns,
+    )
 
 
 def write_benchmark_tables(patient_df: pd.DataFrame, outdir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -321,12 +359,14 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         inner_max_iter=args.inner_max_iter,
         tol=args.tol,
         major_prior=args.major_prior,
+        device=args.device,
         verbose=args.verbose,
     )
 
 
 __all__ = [
     "DEFAULT_PATIENT_SORT_COLUMNS",
+    "DEFAULT_TUMOR_SORT_COLUMNS",
     "PATIENT_PATTERN",
     "SINGLE_REGION_PATTERN",
     "_add_cluster_count_metrics",
@@ -337,8 +377,12 @@ __all__ = [
     "_parse_patient_id",
     "_select_representative_files_with_filter",
     "materialize_patient_df",
+    "materialize_tumor_df",
     "parse_cohort_patient_id",
+    "parse_cohort_tumor_id",
     "parse_single_region_patient_id",
+    "parse_single_region_tumor_id",
     "write_benchmark_tables",
     "write_patient_checkpoint",
+    "write_tumor_checkpoint",
 ]
