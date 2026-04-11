@@ -223,6 +223,17 @@ def _fit_from_start(
         edge_v=edge_v_np,
         tol=summary_tol,
     )
+    phi_clustered_torch = torch.as_tensor(phi_clustered, dtype=runtime.dtype, device=runtime.device)
+    summary_fit_loss, _, _, _ = objective_value_torch(
+        torch_data,
+        phi_clustered_torch,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        edge_w=edge_w,
+        lambda_value=0.0,
+        major_prior=major_prior,
+        eps=eps,
+    )
 
     major_probability = np.where(
         data.multiplicity_estimation_mask,
@@ -247,6 +258,7 @@ def _fit_from_start(
         multiplicity_call=multiplicity_call.astype(np.float32, copy=False),
         multiplicity_estimated_mask=data.multiplicity_estimation_mask.astype(bool, copy=False),
         loglik=float(-fit_loss),
+        summary_loglik=float(-summary_fit_loss),
         penalized_objective=float(objective),
         lambda_value=float(lambda_value),
         n_clusters=int(cluster_centers.shape[0]),
@@ -322,4 +334,3 @@ def fit_observed_data_pairwise_fusion(
     if best_artifacts is None:
         raise RuntimeError("No valid start produced a fusion fit.")
     return best_artifacts
-

@@ -33,6 +33,7 @@ class FitResult:
     multiplicity_call: np.ndarray
     multiplicity_estimated_mask: np.ndarray
     loglik: float
+    summary_loglik: float
     penalized_objective: float
     lambda_value: float
     n_clusters: int
@@ -76,6 +77,7 @@ def fit_single_stage_em(
         multiplicity_call=artifacts.multiplicity_call.astype(np.float32, copy=False),
         multiplicity_estimated_mask=artifacts.multiplicity_estimated_mask.astype(bool, copy=False),
         loglik=float(artifacts.loglik),
+        summary_loglik=float(artifacts.summary_loglik),
         penalized_objective=float(artifacts.penalized_objective),
         lambda_value=float(artifacts.lambda_value),
         n_clusters=int(artifacts.n_clusters),

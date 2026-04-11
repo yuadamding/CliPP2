@@ -51,7 +51,15 @@ def recommend_settings_from_regime(
     *,
     selection_score: str = "ebic",
 ) -> RecommendedSettings:
-    del selection_score
+    normalized_score = str(selection_score).strip().lower()
+
+    if normalized_score == "oracle_ari":
+        return RecommendedSettings(
+            profile_name="pairwise_fusion_oracle_dense",
+            lambda_grid_mode="ultra_dense_no_zero",
+            bic_df_scale=8.0,
+            bic_cluster_penalty=4.0,
+        )
 
     if regime.num_regions <= 2 or regime.depth_scale <= 300.0 or regime.num_mutations <= 800:
         return RecommendedSettings(

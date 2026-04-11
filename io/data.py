@@ -70,6 +70,27 @@ def _first_seen(values: pd.Series) -> list[str]:
     return list(pd.Index(values.astype(str)).drop_duplicates())
 
 
+def _parse_bool_like(value: object, *, column_name: str) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        raise ValueError(f"Missing boolean value in column '{column_name}'.")
+    if isinstance(value, (int, np.integer)):
+        if int(value) in {0, 1}:
+            return bool(int(value))
+        raise ValueError(f"Invalid integer boolean value {value!r} in column '{column_name}'.")
+    if isinstance(value, (float, np.floating)):
+        if float(value) in {0.0, 1.0}:
+            return bool(int(value))
+        raise ValueError(f"Invalid float boolean value {value!r} in column '{column_name}'.")
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "t", "yes", "y", "1"}:
+        return True
+    if normalized in {"false", "f", "no", "n", "0"}:
+        return False
+    raise ValueError(f"Invalid boolean value {value!r} in column '{column_name}'.")
+
+
 def _safe_probability(scale: np.ndarray, multiplicity: np.ndarray, phi: np.ndarray, eps: float) -> np.ndarray:
     return np.clip(scale * multiplicity * phi, eps, 1.0 - eps)
 
@@ -157,8 +178,29 @@ def load_tumor_tsv(file_path: str | Path, eps: float = 1e-6) -> TumorData:
 
     df["mutation_id"] = df["mutation_id"].astype(str)
     df["sample_id"] = df["sample_id"].astype(str)
+    pair_df = df.loc[:, ["mutation_id", "sample_id"]].copy()
+    duplicate_mask = pair_df.duplicated(keep=False)
+    if bool(duplicate_mask.any()):
+        duplicate_pairs = pair_df.loc[duplicate_mask].drop_duplicates().head(5)
+        duplicate_examples = ", ".join(
+            f"({row.mutation_id}, {row.sample_id})" for row in duplicate_pairs.itertuples(index=False)
+        )
+        raise ValueError(
+            f"Duplicate mutation-region rows found in {file_path}. "
+            f"Examples: {duplicate_examples}"
+        )
+
     mutation_ids = _first_seen(df["mutation_id"])
     region_ids = _first_seen(df["sample_id"])
+    expected_pairs = {(mutation_id, region_id) for mutation_id in mutation_ids for region_id in region_ids}
+    observed_pairs = set(zip(df["mutation_id"], df["sample_id"]))
+    missing_pairs = expected_pairs.difference(observed_pairs)
+    if missing_pairs:
+        missing_examples = ", ".join(f"({mutation_id}, {region_id})" for mutation_id, region_id in list(sorted(missing_pairs))[:5])
+        raise ValueError(
+            f"Incomplete mutation-region matrix in {file_path}; missing {len(missing_pairs)} cell(s). "
+            f"Examples: {missing_examples}"
+        )
 
     mut_index = {mutation_id: idx for idx, mutation_id in enumerate(mutation_ids)}
     sample_index = {sample_id: idx for idx, sample_id in enumerate(region_ids)}
@@ -166,13 +208,14 @@ def load_tumor_tsv(file_path: str | Path, eps: float = 1e-6) -> TumorData:
     num_mutations = len(mutation_ids)
     num_regions = len(region_ids)
 
-    alt_counts = np.zeros((num_mutations, num_regions), dtype=np.float32)
-    total_counts = np.zeros((num_mutations, num_regions), dtype=np.float32)
-    purity = np.zeros((num_mutations, num_regions), dtype=np.float32)
-    major_cn = np.zeros((num_mutations, num_regions), dtype=np.float32)
-    minor_cn = np.zeros((num_mutations, num_regions), dtype=np.float32)
-    normal_cn = np.zeros((num_mutations, num_regions), dtype=np.float32)
-    has_cna = np.ones((num_mutations, num_regions), dtype=bool)
+    alt_counts = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
+    total_counts = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
+    purity = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
+    major_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
+    minor_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
+    normal_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
+    has_explicit_cna_mask = "has_cna" in df.columns or "cna_observed" in df.columns
+    has_cna = np.zeros((num_mutations, num_regions), dtype=bool) if has_explicit_cna_mask else np.ones((num_mutations, num_regions), dtype=bool)
 
     for row in df.itertuples(index=False):
         i = mut_index[str(row.mutation_id)]
@@ -186,9 +229,20 @@ def load_tumor_tsv(file_path: str | Path, eps: float = 1e-6) -> TumorData:
         minor_cn[i, j] = float(row.minor_cn)
         normal_cn[i, j] = float(row.normal_cn)
         if "has_cna" in df.columns:
-            has_cna[i, j] = bool(getattr(row, "has_cna"))
+            has_cna[i, j] = _parse_bool_like(getattr(row, "has_cna"), column_name="has_cna")
         elif "cna_observed" in df.columns:
-            has_cna[i, j] = bool(getattr(row, "cna_observed"))
+            has_cna[i, j] = _parse_bool_like(getattr(row, "cna_observed"), column_name="cna_observed")
+
+    for name, matrix in {
+        "alt_counts": alt_counts,
+        "total_counts": total_counts,
+        "purity": purity,
+        "major_cn": major_cn,
+        "minor_cn": minor_cn,
+        "normal_cn": normal_cn,
+    }.items():
+        if np.isnan(matrix).any():
+            raise ValueError(f"Incomplete numeric matrix '{name}' after loading {file_path}.")
 
     purity = np.clip(purity, eps, 1.0 - eps)
     total_cn = major_cn + minor_cn

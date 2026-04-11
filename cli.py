@@ -38,6 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--simulation-root", default="CliPP2Sim", help="Simulation root for ARI evaluation.")
     parser.add_argument("--lambda-grid", default=None, help="Comma-separated lambda grid or 'auto'.")
     parser.add_argument(
+        "--graph-file",
+        default=None,
+        help="Optional TSV defining a custom pairwise-fusion graph using either edge_u/edge_v or mutation_u/mutation_v columns, with optional edge_w.",
+    )
+    parser.add_argument(
         "--lambda-grid-mode",
         choices=["standard", "dense", "dense_no_zero", "coarse_no_zero", "ultra_dense_no_zero"],
         default="dense_no_zero",
@@ -82,9 +87,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--selection-score",
-        choices=["ebic", "classic_bic", "refit_ebic", "classic_refit_bic"],
+        choices=["ebic", "classic_bic", "refit_ebic", "classic_refit_bic", "oracle_ari"],
         default="ebic",
-        help="Candidate scoring objective. Legacy refit-* names are accepted as aliases but normalize to the raw-objective BIC scores.",
+        help="Candidate scoring objective. Legacy refit-* names are accepted as aliases; BIC-style scores are computed on the post-hoc summary partition/log-likelihood pair, while 'oracle_ari' requires simulation truth.",
     )
     parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
     parser.add_argument(
@@ -156,6 +161,7 @@ def main() -> None:
             selection_score=args.selection_score,
             use_warm_starts=not args.disable_warm_start,
             write_outputs=not args.skip_patient_outputs,
+            graph_file=Path(args.graph_file) if args.graph_file else None,
         )
         print(summary)
         return
@@ -174,6 +180,7 @@ def main() -> None:
         selection_score=args.selection_score,
         use_warm_starts=not args.disable_warm_start,
         write_outputs=not args.skip_patient_outputs,
+        graph_file=Path(args.graph_file) if args.graph_file else None,
     )
     print(summary_df.head().to_string(index=False))
 

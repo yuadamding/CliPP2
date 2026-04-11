@@ -6,6 +6,7 @@ from .benchmark import (
     run_simulation_benchmark,
     run_single_region_cohort_benchmark,
 )
+from .benchmark_cohort_ray import run_ray_cohort_benchmark
 from .outputs import (
     cell_output_table,
     cluster_output_table,
@@ -44,6 +45,7 @@ __all__ = [
     "recommend_settings_from_data",
     "recommend_settings_from_regime",
     "run_cohort_benchmark",
+    "run_ray_cohort_benchmark",
     "run_directory",
     "run_massive_multiregion_benchmark",
     "run_simulation_benchmark",

@@ -26,6 +26,7 @@ class FusionFitArtifacts:
     multiplicity_call: np.ndarray
     multiplicity_estimated_mask: np.ndarray
     loglik: float
+    summary_loglik: float
     penalized_objective: float
     lambda_value: float
     n_clusters: int
@@ -41,4 +42,3 @@ class TorchRuntime:
     device: torch.device
     device_name: str
     dtype: torch.dtype
-

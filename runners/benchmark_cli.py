@@ -28,9 +28,9 @@ def _add_shared_fit_args(
     )
     parser.add_argument(
         "--selection-score",
-        choices=["ebic", "classic_bic", "refit_ebic", "classic_refit_bic"],
+        choices=["ebic", "classic_bic", "refit_ebic", "classic_refit_bic", "oracle_ari"],
         default="ebic",
-        help="Candidate scoring objective. Legacy refit-* names are accepted as aliases.",
+        help="Candidate scoring objective. Legacy refit-* names are accepted as aliases; 'oracle_ari' requires simulation truth.",
     )
     parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability for major-copy multiplicity.")
     parser.add_argument(

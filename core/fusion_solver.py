@@ -6,6 +6,7 @@ from .fusion import (
     compute_exact_observed_data_pilot,
     compute_pooled_observed_data_start,
     fit_observed_data_pairwise_fusion,
+    load_pairwise_fusion_graph_tsv,
 )
 
 __all__ = [
@@ -16,5 +17,5 @@ __all__ = [
     "compute_exact_observed_data_pilot",
     "compute_pooled_observed_data_start",
     "fit_observed_data_pairwise_fusion",
+    "load_pairwise_fusion_graph_tsv",
 ]
-
