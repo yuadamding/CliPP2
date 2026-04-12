@@ -17,6 +17,9 @@ class FitOptions:
     major_prior: float = 0.5
     eps: float = 1e-6
     graph: PairwiseFusionGraph | None = None
+    adaptive_weight_gamma: float = 1.0
+    adaptive_weight_floor: float = 1e-6
+    adaptive_weight_baseline: float = 1.0
     device: str = "auto"
     verbose: bool = False
 
@@ -52,6 +55,13 @@ def fit_single_stage_em(
     data: TumorData,
     options: FitOptions,
     phi_start: np.ndarray | None = None,
+    exact_pilot: np.ndarray | None = None,
+    pooled_start: np.ndarray | None = None,
+    scalar_well_starts: list[np.ndarray] | None = None,
+    start_mode: str = "full",
+    runtime=None,
+    torch_data=None,
+    compute_summary: bool = True,
 ) -> FitResult:
     artifacts = fit_observed_data_pairwise_fusion(
         data=data,
@@ -63,7 +73,19 @@ def fit_single_stage_em(
         tol=max(float(options.tol), 1e-6),
         phi_start=None if phi_start is None else np.asarray(phi_start, dtype=np.float32),
         graph=options.graph,
+        adaptive_weight_gamma=float(options.adaptive_weight_gamma),
+        adaptive_weight_floor=float(options.adaptive_weight_floor),
+        adaptive_weight_baseline=float(options.adaptive_weight_baseline),
+        exact_pilot=None if exact_pilot is None else np.asarray(exact_pilot, dtype=np.float32),
+        pooled_start=None if pooled_start is None else np.asarray(pooled_start, dtype=np.float32),
+        scalar_well_starts=None
+        if scalar_well_starts is None
+        else [np.asarray(start, dtype=np.float32) for start in scalar_well_starts],
+        start_mode=str(start_mode),
         device=str(options.device),
+        runtime=runtime,
+        torch_data=torch_data,
+        compute_summary=bool(compute_summary),
         verbose=bool(options.verbose),
     )
     return FitResult(

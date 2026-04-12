@@ -21,14 +21,54 @@ from .benchmark_common import (
 )
 from .model_selection import (
     ORACLE_EXPANSION_FACTOR,
+    ORACLE_LIGHT_LOCAL_POINTS,
+    ORACLE_LIGHT_LOCAL_ROUNDS,
+    ORACLE_LIGHT_LOG10_SPAN_TOL,
+    ORACLE_LIGHT_POLISH_TOP_K,
     ORACLE_MAX_LAMBDA,
     ORACLE_MAX_SEARCH_ROUNDS,
     ORACLE_MIN_LAMBDA,
+    ORACLE_POLISH_TOP_K,
     ORACLE_REFINE_POINTS,
     ORACLE_REFINE_ROUNDS,
     ORACLE_ULTRA_DENSE_POINTS,
 )
 from .pipeline import process_one_file_bundle
+
+
+_RESUME_DERIVED_CANDIDATE_COLUMNS = {
+    "selected_lambda",
+    "selection_metric_value",
+    "selection_lambda_min",
+    "selection_lambda_max",
+    "selection_lambda_count",
+    "best_ari",
+    "ari_optimal_lambda_min",
+    "ari_optimal_lambda_max",
+    "ari_optimal_lambda_count",
+    "selection_boundary_unresolved",
+    "ari_boundary_unresolved",
+    "selection_used_convergence_fallback",
+    "oracle_search_rounds_completed",
+    "oracle_search_stop_reason_tumor",
+    "num_candidates",
+    "num_converged_candidates",
+    "tested_lambda_min",
+    "tested_lambda_max",
+    "tested_lambda_count",
+    "lambda_log10",
+    "selected_lambda_log10",
+    "abs_log10_distance_to_selected_lambda",
+    "best_ari_in_tumor",
+    "delta_to_best_ari",
+    "ari_rank_within_tumor",
+    "best_bic_in_tumor",
+    "delta_to_best_bic",
+    "bic_rank_within_tumor",
+    "best_cp_rmse_in_tumor",
+    "delta_to_best_cp_rmse",
+    "cp_rmse_rank_within_tumor",
+}
 
 
 def _configure_cpu_runtime() -> None:
@@ -65,6 +105,7 @@ def _process_one_file_remote(
     selection_score: str,
     use_warm_starts: bool,
     write_outputs: bool,
+    finalize_selected_fit: bool,
 ) -> dict[str, float | int | str | bool]:
     _configure_cpu_runtime()
     with warnings.catch_warnings():
@@ -86,6 +127,7 @@ def _process_one_file_remote(
             selection_score=selection_score,
             use_warm_starts=use_warm_starts,
             write_outputs=write_outputs,
+            finalize_selected_fit=finalize_selected_fit,
             graph_file=None if graph_file is None else Path(graph_file),
         )
         candidate_rows = search_df.to_dict(orient="records")
@@ -121,6 +163,20 @@ def _materialize_candidate_df(
     else:
         candidate_df = candidate_df.reset_index(drop=True)
     return candidate_df
+
+
+def _strip_resume_candidate_enrichment(candidate_df: pd.DataFrame) -> pd.DataFrame:
+    if candidate_df.empty:
+        return candidate_df
+    drop_cols = [
+        column
+        for column in candidate_df.columns
+        if column in _RESUME_DERIVED_CANDIDATE_COLUMNS
+        or column.endswith("_tumor")
+    ]
+    if not drop_cols:
+        return candidate_df
+    return candidate_df.drop(columns=drop_cols)
 
 
 def _aggregate_tuning_guidance(best_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -475,6 +531,44 @@ def _write_tuning_memory(
     summary_df.to_csv(outdir / "summary.tsv", sep="\t", index=False)
 
 
+def _write_initial_benchmark_artifacts(
+    *,
+    outdir: Path,
+    search_config: dict[str, object],
+    existing_patient_rows: list[dict[str, float | int | str | bool]],
+    existing_candidate_rows: list[dict[str, float | int | str | bool]],
+) -> None:
+    pd.DataFrame([search_config]).to_csv(outdir / "search_config.tsv", sep="\t", index=False)
+    if existing_patient_rows or existing_candidate_rows:
+        _write_tuning_memory(
+            outdir=outdir,
+            patient_rows=existing_patient_rows,
+            candidate_rows=existing_candidate_rows,
+            search_config=search_config,
+        )
+        return
+    pd.DataFrame(
+        [
+            {
+                "attempted_tumors": 0,
+                "evaluated_candidates": 0,
+                "mean_ARI": np.nan,
+                "median_ARI": np.nan,
+                "mean_cp_rmse": np.nan,
+                "mean_selected_lambda": np.nan,
+                "mean_selection_lambda_count": np.nan,
+                "mean_ari_optimal_lambda_count": np.nan,
+                "selection_boundary_unresolved_tumors": 0,
+                "ari_boundary_unresolved_tumors": 0,
+                "selection_convergence_fallback_tumors": 0,
+                "resolved_guidance_tumors": 0,
+                "mean_oracle_search_rounds_completed": np.nan,
+                "search_stop_reason_mode": "",
+            }
+        ]
+    ).to_csv(outdir / "summary.tsv", sep="\t", index=False)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m clipp2.runners.benchmark_cohort_ray",
@@ -529,11 +623,38 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(input_dir.glob("*.tsv"), key=lambda path: (path.stat().st_size, path.name))
+    def _file_sort_key(path: Path) -> tuple[int, int, str]:
+        try:
+            meta = parse_cohort_patient_id(path.stem)
+            return (int(meta.get("n_mutations", 10**9)), int(path.stat().st_size), path.name)
+        except Exception:
+            return (10**9, int(path.stat().st_size), path.name)
+
+    files = sorted(input_dir.glob("*.tsv"), key=_file_sort_key)
     if args.max_files is not None:
         files = files[: max(0, int(args.max_files))]
     if not files:
         raise RuntimeError(f"No TSV files found in {input_dir}")
+
+    existing_patient_path = outdir / "benchmark_patients.tsv"
+    existing_candidate_path = outdir / "per_candidate.tsv"
+    existing_patient_rows: list[dict[str, float | int | str | bool]] = []
+    existing_candidate_rows: list[dict[str, float | int | str | bool]] = []
+    completed_tumor_ids: set[str] = set()
+    if existing_patient_path.exists():
+        existing_patient_df = pd.read_csv(existing_patient_path, sep="\t")
+        if not existing_patient_df.empty:
+            existing_patient_rows = existing_patient_df.to_dict(orient="records")
+            if "tumor_id" in existing_patient_df.columns:
+                completed_tumor_ids = set(existing_patient_df["tumor_id"].astype(str).tolist())
+    if existing_candidate_path.exists():
+        existing_candidate_df = pd.read_csv(existing_candidate_path, sep="\t")
+        if not existing_candidate_df.empty:
+            existing_candidate_df = _strip_resume_candidate_enrichment(existing_candidate_df)
+            existing_candidate_rows = existing_candidate_df.to_dict(orient="records")
+
+    if completed_tumor_ids:
+        files = [path for path in files if path.stem not in completed_tumor_ids]
 
     fit_options = _fit_options_from_args(
         argparse.Namespace(
@@ -553,6 +674,9 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "major_prior": float(fit_options.major_prior),
         "eps": float(fit_options.eps),
         "graph": None,
+        "adaptive_weight_gamma": float(fit_options.adaptive_weight_gamma),
+        "adaptive_weight_floor": float(fit_options.adaptive_weight_floor),
+        "adaptive_weight_baseline": float(fit_options.adaptive_weight_baseline),
         "device": "cpu",
         "verbose": bool(fit_options.verbose),
     }
@@ -571,15 +695,37 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "tol": float(args.tol),
         "device": "cpu",
         "major_prior": float(args.major_prior),
+        "default_graph_policy": "complete_adaptive_from_exact_pilot",
+        "adaptive_weight_gamma": float(fit_options.adaptive_weight_gamma),
+        "adaptive_weight_floor": float(fit_options.adaptive_weight_floor),
+        "adaptive_weight_baseline": float(fit_options.adaptive_weight_baseline),
         "oracle_refine_rounds": int(ORACLE_REFINE_ROUNDS),
         "oracle_refine_points": int(ORACLE_REFINE_POINTS),
         "oracle_ultra_dense_points": int(ORACLE_ULTRA_DENSE_POINTS),
+        "oracle_polish_top_k": int(ORACLE_POLISH_TOP_K),
+        "oracle_light_local_rounds": int(ORACLE_LIGHT_LOCAL_ROUNDS),
+        "oracle_light_local_points": int(ORACLE_LIGHT_LOCAL_POINTS),
+        "oracle_light_log10_span_tol": float(ORACLE_LIGHT_LOG10_SPAN_TOL),
+        "oracle_light_polish_top_k": int(ORACLE_LIGHT_POLISH_TOP_K),
         "oracle_expansion_factor": float(ORACLE_EXPANSION_FACTOR),
         "oracle_max_search_rounds": int(ORACLE_MAX_SEARCH_ROUNDS),
         "oracle_min_lambda": float(ORACLE_MIN_LAMBDA),
         "oracle_max_lambda": float(ORACLE_MAX_LAMBDA),
+        "oracle_candidate_evaluation_mode": "ari_only_during_search_full_on_selected_summary",
+        "oracle_candidate_start_mode": "warm_only_for_light_search_full_when_selected_fit_is_finalized",
+        "oracle_candidate_compute_summary": "false_during_search_true_only_when_selected_fit_is_finalized",
+        "finalize_selected_fit": bool(args.write_tumor_outputs or str(args.selection_score).strip().lower() != "oracle_ari"),
         "boundary_hit_means_search_problem": True,
+        "resumed_from_existing": bool(existing_patient_rows or existing_candidate_rows),
+        "precompleted_tumors": int(len(completed_tumor_ids)),
     }
+
+    _write_initial_benchmark_artifacts(
+        outdir=outdir,
+        search_config=search_config,
+        existing_patient_rows=existing_patient_rows,
+        existing_candidate_rows=existing_candidate_rows,
+    )
 
     ray.init(
         num_cpus=max(int(args.workers), 1),
@@ -588,85 +734,88 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         log_to_driver=True,
     )
 
-    patient_rows: list[dict[str, float | int | str | bool]] = []
-    candidate_rows: list[dict[str, float | int | str | bool]] = []
-    total_files = len(files)
+    patient_rows: list[dict[str, float | int | str | bool]] = list(existing_patient_rows)
+    candidate_rows: list[dict[str, float | int | str | bool]] = list(existing_candidate_rows)
+    total_files = len(completed_tumor_ids) + len(files)
     start_time = perf_counter()
     in_flight: dict[ray.ObjectRef, Path] = {}
     file_iter = iter(files)
-    max_in_flight = max(int(args.workers) * 2, 1)
+    max_in_flight = max(int(args.workers), 1)
 
-    def submit_next() -> bool:
-        try:
-            file_path = next(file_iter)
-        except StopIteration:
-            return False
-        future = _process_one_file_remote.remote(
-            file_path=str(file_path),
-            outdir=str(outdir),
-            simulation_root=str(simulation_root),
-            lambda_grid=_parse_lambda_grid(args.lambda_grid),
-            lambda_grid_mode=str(args.lambda_grid_mode),
-            graph_file=None if args.graph_file is None else str(args.graph_file),
-            fit_options_kwargs=fit_options_kwargs,
-            bic_df_scale=float(args.bic_df_scale),
-            bic_cluster_penalty=float(args.bic_cluster_penalty),
-            settings_profile=str(args.settings_profile),
-            selection_score=str(args.selection_score),
-            use_warm_starts=not args.disable_warm_start,
-            write_outputs=bool(args.write_tumor_outputs),
-        )
-        in_flight[future] = file_path
-        return True
-
-    for _ in range(min(max_in_flight, total_files)):
-        if not submit_next():
-            break
-
-    completed = 0
-    while in_flight:
-        ready, _ = ray.wait(list(in_flight.keys()), num_returns=1)
-        future = ready[0]
-        file_path = in_flight.pop(future)
-        result = ray.get(future)
-        summary = result["summary"]
-        local_candidate_rows = result["candidate_rows"]
-        meta = parse_cohort_patient_id(file_path.stem)
-        patient_rows.append({**meta, **summary})
-        candidate_rows.extend({**meta, **row} for row in local_candidate_rows)
-        completed += 1
-
-        if completed % max(int(args.flush_every), 1) == 0 or completed == total_files:
-            patient_df = write_patient_checkpoint(
-                patient_rows,
-                outdir=outdir,
-                start_time=start_time,
-                case_index=completed,
-                total_cases=total_files,
-                label="ray-cohort-benchmark",
+    try:
+        def submit_next() -> bool:
+            try:
+                file_path = next(file_iter)
+            except StopIteration:
+                return False
+            future = _process_one_file_remote.remote(
+                file_path=str(file_path),
+                outdir=str(outdir),
+                simulation_root=str(simulation_root),
+                lambda_grid=_parse_lambda_grid(args.lambda_grid),
+                lambda_grid_mode=str(args.lambda_grid_mode),
+                graph_file=None if args.graph_file is None else str(args.graph_file),
+                fit_options_kwargs=fit_options_kwargs,
+                bic_df_scale=float(args.bic_df_scale),
+                bic_cluster_penalty=float(args.bic_cluster_penalty),
+                settings_profile=str(args.settings_profile),
+                selection_score=str(args.selection_score),
+                use_warm_starts=not args.disable_warm_start,
+                write_outputs=bool(args.write_tumor_outputs),
+                finalize_selected_fit=bool(args.write_tumor_outputs or str(args.selection_score).strip().lower() != "oracle_ari"),
             )
-            write_benchmark_tables(patient_df, outdir)
-            _write_tuning_memory(
-                outdir=outdir,
-                patient_rows=patient_rows,
-                candidate_rows=candidate_rows,
-                search_config=search_config,
-            )
+            in_flight[future] = file_path
+            return True
 
-        while len(in_flight) < max_in_flight:
+        for _ in range(min(max_in_flight, len(files))):
             if not submit_next():
                 break
 
-    patient_df = materialize_patient_df(patient_rows)
-    scenario_df, global_df = write_benchmark_tables(patient_df, outdir)
-    _write_tuning_memory(
-        outdir=outdir,
-        patient_rows=patient_rows,
-        candidate_rows=candidate_rows,
-        search_config=search_config,
-    )
-    ray.shutdown()
-    return patient_df, scenario_df, global_df
+        completed = len(completed_tumor_ids)
+        while in_flight:
+            ready, _ = ray.wait(list(in_flight.keys()), num_returns=1)
+            future = ready[0]
+            file_path = in_flight.pop(future)
+            result = ray.get(future)
+            summary = result["summary"]
+            local_candidate_rows = result["candidate_rows"]
+            meta = parse_cohort_patient_id(file_path.stem)
+            patient_rows.append({**meta, **summary})
+            candidate_rows.extend({**meta, **row} for row in local_candidate_rows)
+            completed += 1
+
+            if completed % max(int(args.flush_every), 1) == 0 or completed == total_files:
+                patient_df = write_patient_checkpoint(
+                    patient_rows,
+                    outdir=outdir,
+                    start_time=start_time,
+                    case_index=completed,
+                    total_cases=total_files,
+                    label="ray-cohort-benchmark",
+                )
+                write_benchmark_tables(patient_df, outdir)
+                _write_tuning_memory(
+                    outdir=outdir,
+                    patient_rows=patient_rows,
+                    candidate_rows=candidate_rows,
+                    search_config=search_config,
+                )
+
+            while len(in_flight) < max_in_flight:
+                if not submit_next():
+                    break
+
+        patient_df = materialize_patient_df(patient_rows)
+        scenario_df, global_df = write_benchmark_tables(patient_df, outdir)
+        _write_tuning_memory(
+            outdir=outdir,
+            patient_rows=patient_rows,
+            candidate_rows=candidate_rows,
+            search_config=search_config,
+        )
+        return patient_df, scenario_df, global_df
+    finally:
+        ray.shutdown()
 
 
 def main(argv: list[str] | None = None) -> None:

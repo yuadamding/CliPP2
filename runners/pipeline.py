@@ -30,6 +30,7 @@ def process_one_file_bundle(
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
+    finalize_selected_fit: bool | None = None,
 ) -> tuple[dict[str, float | int | str | bool], pd.DataFrame]:
     start_time = perf_counter()
     file_path = Path(file_path)
@@ -50,6 +51,8 @@ def process_one_file_bundle(
 
     tumor_regime = summarize_tumor_regime(data)
     simulation_available = simulation_root is not None and (Path(simulation_root) / data.tumor_id).exists()
+    if finalize_selected_fit is None:
+        finalize_selected_fit = bool(write_outputs or str(selection_score).strip().lower() != "oracle_ari")
     evaluate_all_candidates = simulation_available and (
         write_outputs or str(selection_score).strip().lower() == "oracle_ari"
     )
@@ -65,12 +68,13 @@ def process_one_file_bundle(
         selection_score=selection_score,
         use_warm_starts=use_warm_starts,
         evaluate_all_candidates=evaluate_all_candidates,
+        finalize_selected_fit=bool(finalize_selected_fit),
     )
     best_fit = selection_result.best_fit
     best_evaluation = selection_result.best_evaluation
     search_df = selection_result.search_df
 
-    if best_evaluation is None and simulation_available:
+    if best_evaluation is None and simulation_available and bool(finalize_selected_fit):
         best_evaluation = evaluate_fit_against_simulation(fit=best_fit, data=data, simulation_root=simulation_root)
 
     elapsed_seconds = float(perf_counter() - start_time)
@@ -88,7 +92,14 @@ def process_one_file_bundle(
         "settings_profile": selection_result.profile_name,
         "selection_method": selection_result.selection_method,
         "selection_score_name": str(best_fit.selection_score_name or selection_score),
-        "selection_loglik_kind": "summary_clustered" if str(best_fit.selection_score_name or selection_score) != "oracle_ari" else "oracle_ari_any_candidate",
+        "selection_loglik_kind": (
+            "summary_clustered"
+            if str(best_fit.selection_score_name or selection_score) != "oracle_ari"
+            else "oracle_ari_finalized_selected_fit"
+            if bool(finalize_selected_fit)
+            else "oracle_ari_candidate_fit"
+        ),
+        "finalize_selected_fit": bool(finalize_selected_fit),
         "selection_used_convergence_fallback": bool(selection_result.selection_used_convergence_fallback),
         "num_candidates": int(selection_result.num_candidates),
         "num_converged_candidates": int(selection_result.num_converged_candidates),
@@ -144,7 +155,13 @@ def process_one_file_bundle(
         "converged": bool(best_fit.converged),
         "device": best_fit.device,
         "graph_name": str(best_fit.graph_name),
-        "ARI": np.nan if best_evaluation is None else float(best_evaluation.ari),
+        "ARI": (
+            float(best_evaluation.ari)
+            if best_evaluation is not None
+            else float(selection_result.best_ari)
+            if selection_result.best_ari is not None
+            else np.nan
+        ),
         "cp_rmse": np.nan if best_evaluation is None else float(best_evaluation.cp_rmse),
         "multiplicity_f1": np.nan if best_evaluation is None else float(best_evaluation.multiplicity_f1),
         "estimated_clonal_fraction": np.nan
@@ -187,6 +204,7 @@ def process_one_file(
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
+    finalize_selected_fit: bool | None = None,
 ) -> dict[str, float | int | str | bool]:
     summary, _ = process_one_file_bundle(
         file_path=file_path,
@@ -202,6 +220,7 @@ def process_one_file(
         use_warm_starts=use_warm_starts,
         write_outputs=write_outputs,
         graph_file=graph_file,
+        finalize_selected_fit=finalize_selected_fit,
     )
     return summary
 
@@ -221,6 +240,7 @@ def run_directory(
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
+    finalize_selected_fit: bool | None = None,
 ) -> pd.DataFrame:
     input_dir = Path(input_dir)
     files = sorted(input_dir.glob("*.tsv"))
@@ -247,6 +267,7 @@ def run_directory(
                 use_warm_starts=use_warm_starts,
                 write_outputs=write_outputs,
                 graph_file=graph_file,
+                finalize_selected_fit=finalize_selected_fit,
             )
         )
 

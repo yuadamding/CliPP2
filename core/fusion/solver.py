@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 import torch
 
 from ...io.data import TumorData
-from .graph import coerce_graph
-from .starts import compute_exact_observed_data_pilot, compute_pooled_observed_data_start
+from .graph import resolve_pairwise_fusion_graph
+from .starts import (
+    compute_exact_observed_data_pilot,
+    compute_pooled_observed_data_start,
+    compute_scalar_well_start_bank,
+)
 from .torch_backend import (
-    cell_terms_torch,
+    em_surrogate_terms_torch,
     objective_value_torch,
     resolve_runtime,
+    solve_majorized_subproblem_alm_torch,
     solve_majorized_subproblem_pdhg_torch,
     to_torch_tumor_data,
 )
@@ -43,37 +50,63 @@ class _UnionFind:
             self.rank[root_left] += 1
 
 
-def _cluster_summary(
+def _graph_tensors(
+    graph: PairwiseFusionGraph,
+    runtime,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache_key = (str(runtime.device_name), str(runtime.dtype))
+    cached = graph.torch_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    tensors = (
+        torch.as_tensor(graph.edge_u, dtype=torch.long, device=runtime.device),
+        torch.as_tensor(graph.edge_v, dtype=torch.long, device=runtime.device),
+        torch.as_tensor(graph.edge_w, dtype=runtime.dtype, device=runtime.device),
+    )
+    graph.torch_cache[cache_key] = tensors
+    return tensors
+
+
+def _cluster_labels(
     phi: np.ndarray,
     *,
     edge_u: np.ndarray,
     edge_v: np.ndarray,
     tol: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> np.ndarray:
     num_mutations = int(phi.shape[0])
     if num_mutations == 0:
-        return (
-            np.zeros((0,), dtype=np.int64),
-            np.zeros((0, phi.shape[1]), dtype=np.float32),
-            np.zeros_like(phi, dtype=np.float32),
-        )
+        return np.zeros((0,), dtype=np.int64)
 
-    union_find = _UnionFind(num_mutations)
-    if edge_u.size > 0:
-        fused = np.linalg.norm(phi[edge_u] - phi[edge_v], axis=1) <= float(tol)
-        for left, right in zip(edge_u[fused], edge_v[fused]):
-            union_find.union(int(left), int(right))
+    if edge_u.size == 0:
+        return np.arange(num_mutations, dtype=np.int64)
 
-    roots = np.asarray([union_find.find(i) for i in range(num_mutations)], dtype=np.int64)
-    _, labels = np.unique(roots, return_inverse=True)
-    labels = labels.astype(np.int64, copy=False)
+    fused = np.linalg.norm(phi[edge_u] - phi[edge_v], axis=1) <= float(tol)
+    if not np.any(fused):
+        return np.arange(num_mutations, dtype=np.int64)
+
+    left = edge_u[fused].astype(np.int32, copy=False)
+    right = edge_v[fused].astype(np.int32, copy=False)
+    rows = np.concatenate([left, right])
+    cols = np.concatenate([right, left])
+    values = np.ones(rows.shape[0], dtype=np.int8)
+    graph = coo_matrix((values, (rows, cols)), shape=(num_mutations, num_mutations))
+    _, labels = connected_components(graph, directed=False, return_labels=True)
+    return labels.astype(np.int64, copy=False)
+
+
+def _cluster_summary_from_labels(
+    phi: np.ndarray,
+    labels: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     n_clusters = int(labels.max()) + 1 if labels.size else 0
     centers = np.zeros((n_clusters, phi.shape[1]), dtype=np.float64)
     counts = np.bincount(labels, minlength=n_clusters).astype(np.float64)
     np.add.at(centers, labels, phi)
     centers /= np.clip(counts[:, None], 1.0, None)
     phi_clustered = centers[labels]
-    return labels, centers.astype(np.float32, copy=False), phi_clustered.astype(np.float32, copy=False)
+    return centers.astype(np.float32, copy=False), phi_clustered.astype(np.float32, copy=False)
 
 
 def _deduplicate_starts(starts: list[np.ndarray]) -> list[np.ndarray]:
@@ -99,17 +132,20 @@ def _fit_from_start(
     inner_max_iter: int,
     tol: float,
     phi_start: np.ndarray,
+    compute_summary: bool,
     verbose: bool,
 ) -> FusionFitArtifacts:
     edge_u_np = graph.edge_u
     edge_v_np = graph.edge_v
-    edge_w_np = graph.edge_w
-    edge_u = torch.as_tensor(edge_u_np, dtype=torch.long, device=runtime.device)
-    edge_v = torch.as_tensor(edge_v_np, dtype=torch.long, device=runtime.device)
-    edge_w = torch.as_tensor(edge_w_np, dtype=runtime.dtype, device=runtime.device)
+    complete_edge_count = data.num_mutations * max(data.num_mutations - 1, 0) // 2
+    use_alm = (
+        edge_u_np.size == complete_edge_count
+        and int(graph.degree_bound) == max(int(data.num_mutations) - 1, 1)
+    )
+    edge_u, edge_v, edge_w = _graph_tensors(graph, runtime)
 
     lower = torch.full_like(torch_data.phi_upper, float(eps))
-    upper = torch_data.phi_upper
+    upper = torch.minimum(torch_data.phi_upper, torch.ones_like(torch_data.phi_upper))
     phi = torch.as_tensor(np.asarray(phi_start, dtype=np.float64), dtype=runtime.dtype, device=runtime.device)
     phi = torch.minimum(torch.maximum(phi, lower), upper)
 
@@ -134,8 +170,15 @@ def _fit_from_start(
         iterations = outer_iter + 1
         previous_phi = phi.clone()
         previous_objective = objective
-        terms = cell_terms_torch(torch_data, phi, major_prior=major_prior, eps=eps)
-        h_base = torch.clamp(terms.hess_upper, min=1e-6)
+        surrogate_terms = em_surrogate_terms_torch(
+            torch_data,
+            phi,
+            omega_major=gamma_major,
+            major_prior=major_prior,
+            eps=eps,
+        )
+        surrogate_fit_loss = float(torch.sum(surrogate_terms.loss).item())
+        h_base = torch.clamp(surrogate_terms.hess_upper, min=1e-6)
         scale = 1.0
         accepted = False
         candidate_phi = phi
@@ -147,25 +190,58 @@ def _fit_from_start(
 
         for _ in range(10):
             h = h_base * scale
-            U = phi - terms.grad / h
-            phi_trial, dual_trial, _, inner_ok, inner_residual = solve_majorized_subproblem_pdhg_torch(
-                runtime=runtime,
-                num_mutations=data.num_mutations,
-                U=U,
-                h=h,
-                lower=lower,
-                upper=upper,
-                lambda_value=lambda_value,
-                edge_u=edge_u,
-                edge_v=edge_v,
-                edge_w=edge_w,
-                tol=max(tol, 1e-6),
-                max_iter=max(inner_max_iter, 10),
-                phi_start=phi,
-                dual_start=dual,
-            )
+            U = phi - surrogate_terms.grad / h
+            if use_alm:
+                phi_trial, dual_trial, _, inner_ok, inner_residual = solve_majorized_subproblem_alm_torch(
+                    runtime=runtime,
+                    num_mutations=data.num_mutations,
+                    U=U,
+                    h=h,
+                    lower=lower,
+                    upper=upper,
+                    lambda_value=lambda_value,
+                    edge_u=edge_u,
+                    edge_v=edge_v,
+                    edge_w=edge_w,
+                    tol=max(tol, 1e-6),
+                    max_iter=max(inner_max_iter, 10),
+                    phi_start=phi,
+                    dual_start=dual,
+                )
+            else:
+                phi_trial, dual_trial, _, inner_ok, inner_residual = solve_majorized_subproblem_pdhg_torch(
+                    runtime=runtime,
+                    num_mutations=data.num_mutations,
+                    U=U,
+                    h=h,
+                    lower=lower,
+                    upper=upper,
+                    lambda_value=lambda_value,
+                    edge_u=edge_u,
+                    edge_v=edge_v,
+                    edge_w=edge_w,
+                    degree_bound=int(graph.degree_bound),
+                    tol=max(tol, 1e-6),
+                    max_iter=max(inner_max_iter, 10),
+                    phi_start=phi,
+                    dual_start=dual,
+                )
             delta = phi_trial - phi
-            majorizer_rhs = fit_loss + float(torch.sum(terms.grad * delta + 0.5 * h * torch.square(delta)).item())
+            majorizer_rhs = surrogate_fit_loss + float(
+                torch.sum(surrogate_terms.grad * delta + 0.5 * h * torch.square(delta)).item()
+            )
+            trial_surrogate_terms = em_surrogate_terms_torch(
+                torch_data,
+                phi_trial,
+                omega_major=gamma_major,
+                major_prior=major_prior,
+                eps=eps,
+            )
+            trial_surrogate_loss = float(torch.sum(trial_surrogate_terms.loss).item())
+            if trial_surrogate_loss > majorizer_rhs + 1e-8:
+                scale *= 2.0
+                continue
+
             trial_fit_loss, _, trial_objective, trial_gamma = objective_value_torch(
                 torch_data,
                 phi_trial,
@@ -176,7 +252,7 @@ def _fit_from_start(
                 major_prior=major_prior,
                 eps=eps,
             )
-            if trial_fit_loss <= majorizer_rhs + 1e-8:
+            if trial_objective <= previous_objective + 1e-8:
                 accepted = True
                 candidate_phi = phi_trial
                 candidate_dual = dual_trial
@@ -217,23 +293,31 @@ def _fit_from_start(
     phi_np = phi.detach().cpu().numpy().astype(np.float64, copy=False)
     gamma_np = gamma_major.detach().cpu().numpy().astype(np.float64, copy=False)
     summary_tol = max(10.0 * float(tol), 1e-4)
-    cluster_labels, cluster_centers, phi_clustered = _cluster_summary(
+    cluster_labels = _cluster_labels(
         phi_np,
         edge_u=edge_u_np,
         edge_v=edge_v_np,
         tol=summary_tol,
     )
-    phi_clustered_torch = torch.as_tensor(phi_clustered, dtype=runtime.dtype, device=runtime.device)
-    summary_fit_loss, _, _, _ = objective_value_torch(
-        torch_data,
-        phi_clustered_torch,
-        edge_u=edge_u,
-        edge_v=edge_v,
-        edge_w=edge_w,
-        lambda_value=0.0,
-        major_prior=major_prior,
-        eps=eps,
-    )
+    n_clusters = int(cluster_labels.max()) + 1 if cluster_labels.size else 0
+    if compute_summary:
+        cluster_centers, phi_clustered = _cluster_summary_from_labels(phi_np, cluster_labels)
+        phi_clustered_torch = torch.as_tensor(phi_clustered, dtype=runtime.dtype, device=runtime.device)
+        summary_fit_loss, _, _, _ = objective_value_torch(
+            torch_data,
+            phi_clustered_torch,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            edge_w=edge_w,
+            lambda_value=0.0,
+            major_prior=major_prior,
+            eps=eps,
+        )
+        summary_loglik = float(-summary_fit_loss)
+    else:
+        cluster_centers = np.zeros((n_clusters, phi_np.shape[1]), dtype=np.float32)
+        phi_clustered = phi_np.astype(np.float32, copy=False)
+        summary_loglik = float("nan")
 
     major_probability = np.where(
         data.multiplicity_estimation_mask,
@@ -258,10 +342,10 @@ def _fit_from_start(
         multiplicity_call=multiplicity_call.astype(np.float32, copy=False),
         multiplicity_estimated_mask=data.multiplicity_estimation_mask.astype(bool, copy=False),
         loglik=float(-fit_loss),
-        summary_loglik=float(-summary_fit_loss),
+        summary_loglik=summary_loglik,
         penalized_objective=float(objective),
         lambda_value=float(lambda_value),
-        n_clusters=int(cluster_centers.shape[0]),
+        n_clusters=n_clusters,
         iterations=int(iterations),
         converged=bool(converged),
         device=runtime.device_name,
@@ -281,43 +365,88 @@ def fit_observed_data_pairwise_fusion(
     tol: float,
     phi_start: np.ndarray | None = None,
     graph: PairwiseFusionGraph | None = None,
+    adaptive_weight_gamma: float = 1.0,
+    adaptive_weight_floor: float = 1e-6,
+    adaptive_weight_baseline: float = 1.0,
+    exact_pilot: np.ndarray | None = None,
+    pooled_start: np.ndarray | None = None,
+    scalar_well_starts: list[np.ndarray] | None = None,
+    start_mode: str = "full",
     device: str | None = "auto",
+    runtime=None,
+    torch_data=None,
+    compute_summary: bool = True,
     verbose: bool = False,
 ) -> FusionFitArtifacts:
-    runtime = resolve_runtime(device)
-    effective_graph = coerce_graph(data.num_mutations, graph)
-    torch_data = to_torch_tumor_data(data, runtime)
+    effective_runtime = resolve_runtime(device) if runtime is None else runtime
+    effective_torch_data = to_torch_tumor_data(data, effective_runtime) if torch_data is None else torch_data
 
-    exact_pilot = compute_exact_observed_data_pilot(
-        data,
-        runtime=runtime,
-        major_prior=major_prior,
-        eps=eps,
-        tol=max(tol, 1e-6),
-        max_iter=max(inner_max_iter, 16),
+    if exact_pilot is None:
+        exact_pilot = compute_exact_observed_data_pilot(
+            data,
+            runtime=effective_runtime,
+            major_prior=major_prior,
+            eps=eps,
+            tol=max(tol, 1e-6),
+            max_iter=max(inner_max_iter, 16),
+        )
+    effective_graph = resolve_pairwise_fusion_graph(
+        data.num_mutations,
+        graph=graph,
+        pilot_phi=exact_pilot,
+        gamma=float(adaptive_weight_gamma),
+        tau=max(float(adaptive_weight_floor), float(eps)),
+        baseline=float(adaptive_weight_baseline),
     )
-    pooled_start = compute_pooled_observed_data_start(
-        data,
-        runtime=runtime,
-        major_prior=major_prior,
-        eps=eps,
-        tol=max(tol, 1e-6),
-        max_iter=max(inner_max_iter, 16),
-        beta_hints=exact_pilot,
-    )
+    if pooled_start is None:
+        pooled_start = compute_pooled_observed_data_start(
+            data,
+            runtime=effective_runtime,
+            major_prior=major_prior,
+            eps=eps,
+            tol=max(tol, 1e-6),
+            max_iter=max(inner_max_iter, 16),
+            beta_hints=exact_pilot,
+        )
+    if scalar_well_starts is None:
+        scalar_well_starts = compute_scalar_well_start_bank(
+            data,
+            major_prior=major_prior,
+            eps=eps,
+            tol=max(tol, 1e-6),
+            max_iter=max(inner_max_iter, 16),
+            exact_pilot=exact_pilot,
+        )
+    else:
+        scalar_well_starts = [np.asarray(start, dtype=np.float64) for start in scalar_well_starts]
 
-    start_bank = []
+    normalized_start_mode = str(start_mode).strip().lower()
+    if normalized_start_mode not in {"full", "warm_plus_pilot", "warm_only"}:
+        raise ValueError(f"Unknown start_mode: {start_mode}")
+
+    start_bank: list[np.ndarray] = []
     if phi_start is not None:
         start_bank.append(np.asarray(phi_start, dtype=np.float64))
-    start_bank.extend([exact_pilot, pooled_start])
+    if normalized_start_mode == "full":
+        start_bank.extend(scalar_well_starts)
+        start_bank.append(pooled_start)
+    elif normalized_start_mode == "warm_plus_pilot":
+        if phi_start is None:
+            start_bank.extend(scalar_well_starts)
+            start_bank.append(pooled_start)
+        else:
+            start_bank.extend(scalar_well_starts)
+    elif phi_start is None:
+        start_bank.extend(scalar_well_starts)
+        start_bank.append(pooled_start)
     start_bank = _deduplicate_starts(start_bank)
 
     best_artifacts: FusionFitArtifacts | None = None
     for start in start_bank:
         artifacts = _fit_from_start(
             data,
-            torch_data=torch_data,
-            runtime=runtime,
+            torch_data=effective_torch_data,
+            runtime=effective_runtime,
             graph=effective_graph,
             lambda_value=lambda_value,
             major_prior=major_prior,
@@ -326,9 +455,19 @@ def fit_observed_data_pairwise_fusion(
             inner_max_iter=inner_max_iter,
             tol=tol,
             phi_start=start,
+            compute_summary=compute_summary,
             verbose=verbose,
         )
-        if best_artifacts is None or artifacts.penalized_objective < best_artifacts.penalized_objective - 1e-8:
+        if best_artifacts is None:
+            best_artifacts = artifacts
+            continue
+        if artifacts.converged and not best_artifacts.converged:
+            best_artifacts = artifacts
+            continue
+        if (
+            artifacts.converged == best_artifacts.converged
+            and artifacts.penalized_objective < best_artifacts.penalized_objective - 1e-8
+        ):
             best_artifacts = artifacts
 
     if best_artifacts is None:

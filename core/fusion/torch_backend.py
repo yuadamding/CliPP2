@@ -6,7 +6,6 @@ import numpy as np
 import torch
 
 from ...io.data import TumorData
-from .graph import edge_degree_bound
 from .types import PairwiseFusionGraph, TorchRuntime
 
 
@@ -28,6 +27,17 @@ class TorchCellTerms:
     grad: torch.Tensor
     hess_upper: torch.Tensor
     gamma_major: torch.Tensor
+
+
+def _binary_entropy_offset_torch(weight: torch.Tensor) -> torch.Tensor:
+    clipped = torch.clamp(weight, min=0.0, max=1.0)
+    positive = clipped > 0.0
+    one_minus = 1.0 - clipped
+    positive_complement = one_minus > 0.0
+    term = torch.zeros_like(clipped)
+    term = torch.where(positive, term + clipped * torch.log(clipped), term)
+    term = torch.where(positive_complement, term + one_minus * torch.log(one_minus), term)
+    return term
 
 
 def resolve_runtime(device: str | None) -> TorchRuntime:
@@ -178,6 +188,75 @@ def cell_terms_torch(
     )
 
 
+def em_surrogate_terms_torch(
+    data: TorchTumorData,
+    phi: torch.Tensor,
+    *,
+    omega_major: torch.Tensor,
+    major_prior: float,
+    eps: float,
+) -> TorchCellTerms:
+    phi = torch.clamp(phi, min=float(eps), max=1.0)
+    phi = torch.minimum(phi, data.phi_upper)
+    alt = data.alt
+    nonalt = data.nonalt
+    amb = data.ambiguous
+
+    loss = torch.zeros_like(phi)
+    grad = torch.zeros_like(phi)
+    hess_upper = torch.zeros_like(phi)
+    gamma_major = torch.ones_like(phi)
+
+    fixed = ~amb
+    if torch.any(fixed):
+        prob_fixed, slope_fixed = clip_probability_and_slope(phi[fixed], data.b_fixed[fixed], eps)
+        loss_fixed = -(alt[fixed] * torch.log(prob_fixed) + nonalt[fixed] * torch.log1p(-prob_fixed))
+        grad_fixed, curvature_fixed = state_log_kernel_grad_and_curvature(
+            alt=alt[fixed],
+            nonalt=nonalt[fixed],
+            prob=prob_fixed,
+            slope=slope_fixed,
+        )
+        loss[fixed] = loss_fixed
+        grad[fixed] = -grad_fixed
+        hess_upper[fixed] = curvature_fixed
+
+    if torch.any(amb):
+        omega = torch.clamp(omega_major[amb], min=0.0, max=1.0)
+        prob_minus, slope_minus = clip_probability_and_slope(phi[amb], data.b_minus[amb], eps)
+        prob_plus, slope_plus = clip_probability_and_slope(phi[amb], data.b_plus[amb], eps)
+        log_minor = alt[amb] * torch.log(prob_minus) + nonalt[amb] * torch.log1p(-prob_minus) + float(np.log(max(1.0 - major_prior, eps)))
+        log_major = alt[amb] * torch.log(prob_plus) + nonalt[amb] * torch.log1p(-prob_plus) + float(np.log(max(major_prior, eps)))
+        gamma_major[amb] = omega
+
+        grad_minus, curvature_minus = state_log_kernel_grad_and_curvature(
+            alt=alt[amb],
+            nonalt=nonalt[amb],
+            prob=prob_minus,
+            slope=slope_minus,
+        )
+        grad_plus, curvature_plus = state_log_kernel_grad_and_curvature(
+            alt=alt[amb],
+            nonalt=nonalt[amb],
+            prob=prob_plus,
+            slope=slope_plus,
+        )
+
+        loss_major = -log_major
+        loss_minor = -log_minor
+        entropy_offset = _binary_entropy_offset_torch(omega)
+        loss[amb] = (1.0 - omega) * loss_minor + omega * loss_major + entropy_offset
+        grad[amb] = -((1.0 - omega) * grad_minus + omega * grad_plus)
+        hess_upper[amb] = (1.0 - omega) * curvature_minus + omega * curvature_plus
+
+    return TorchCellTerms(
+        loss=loss,
+        grad=grad,
+        hess_upper=torch.clamp(hess_upper, min=1e-8),
+        gamma_major=gamma_major,
+    )
+
+
 def pairwise_penalty_torch(
     phi: torch.Tensor,
     *,
@@ -284,6 +363,7 @@ def solve_majorized_subproblem_pdhg_torch(
     edge_u: torch.Tensor,
     edge_v: torch.Tensor,
     edge_w: torch.Tensor,
+    degree_bound: int,
     tol: float,
     max_iter: int,
     phi_start: torch.Tensor,
@@ -302,7 +382,7 @@ def solve_majorized_subproblem_pdhg_torch(
     else:
         dual = torch.zeros((int(edge_u.numel()), int(phi.shape[1])), dtype=runtime.dtype, device=runtime.device)
     bar = phi.clone()
-    degree = edge_degree_bound(num_mutations, edge_u=edge_u.detach().cpu().numpy(), edge_v=edge_v.detach().cpu().numpy())
+    degree = max(int(degree_bound), 1)
     step = 0.99 / np.sqrt(2.0 * float(degree))
     radius = float(lambda_value) * edge_w
 
@@ -359,3 +439,136 @@ def solve_majorized_subproblem_pdhg_torch(
 
     return phi, dual, iterations, converged, float(last_residual)
 
+
+def _complete_graph_isotropic_box_qp_torch(
+    *,
+    U: torch.Tensor,
+    h: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    rho: float,
+    q: torch.Tensor,
+    max_iter: int,
+) -> torch.Tensor:
+    num_mutations = int(U.shape[0])
+    rho_t = torch.as_tensor(float(rho), dtype=U.dtype, device=U.device)
+    rhs = h * U + rho_t * q
+    denom = h + rho_t * float(num_mutations)
+
+    lo = torch.sum(lower, dim=0)
+    hi = torch.sum(upper, dim=0)
+    mid = 0.5 * (lo + hi)
+    for _ in range(max(int(max_iter), 16)):
+        mid = 0.5 * (lo + hi)
+        x_mid = torch.minimum(
+            torch.maximum((rhs + rho_t * mid.unsqueeze(0)) / denom, lower),
+            upper,
+        )
+        residual = torch.sum(x_mid, dim=0) - mid
+        move_right = residual > 0.0
+        lo = torch.where(move_right, mid, lo)
+        hi = torch.where(move_right, hi, mid)
+
+    return torch.minimum(
+        torch.maximum((rhs + rho_t * mid.unsqueeze(0)) / denom, lower),
+        upper,
+    )
+
+
+def solve_majorized_subproblem_alm_torch(
+    *,
+    runtime: TorchRuntime,
+    num_mutations: int,
+    U: torch.Tensor,
+    h: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    lambda_value: float,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    edge_w: torch.Tensor,
+    tol: float,
+    max_iter: int,
+    phi_start: torch.Tensor,
+    dual_start: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, int, bool, float]:
+    phi = torch.minimum(torch.maximum(phi_start.to(dtype=runtime.dtype, device=runtime.device), lower), upper)
+    if lambda_value <= 0.0 or edge_u.numel() == 0:
+        projected = torch.minimum(torch.maximum(U, lower), upper)
+        total_grad = h * (projected - U)
+        stat = stationarity_residual_torch(total_grad=total_grad, phi=projected, lower=lower, upper=upper, atol=tol)
+        residual = float((torch.linalg.norm(stat) / (1.0 + torch.linalg.norm(projected))).item())
+        return projected, torch.zeros((0, phi.shape[1]), dtype=runtime.dtype, device=runtime.device), 1, residual <= tol, residual
+
+    if dual_start is not None and tuple(dual_start.shape) == (int(edge_u.numel()), int(phi.shape[1])):
+        scaled_dual = dual_start.to(dtype=runtime.dtype, device=runtime.device)
+    else:
+        scaled_dual = torch.zeros((int(edge_u.numel()), int(phi.shape[1])), dtype=runtime.dtype, device=runtime.device)
+
+    rho = float(torch.clamp(torch.median(h), min=1e-3, max=1e3).item())
+    shrink_radius = (float(lambda_value) * edge_w) / rho
+
+    converged = False
+    iterations = 0
+    last_residual = np.inf
+    z = phi.index_select(0, edge_u) - phi.index_select(0, edge_v)
+
+    for inner_iter in range(max(int(max_iter), 10)):
+        iterations = inner_iter + 1
+        edge_diff = phi.index_select(0, edge_u) - phi.index_select(0, edge_v)
+        z_argument = edge_diff + scaled_dual
+        z_norm = torch.linalg.norm(z_argument, dim=1, keepdim=True)
+        shrink = torch.clamp(1.0 - shrink_radius[:, None] / z_norm.clamp_min(1e-12), min=0.0)
+        z_new = shrink * z_argument
+
+        rhs_edge = z_new - scaled_dual
+        q = torch.zeros_like(phi)
+        q.index_add_(0, edge_u, rhs_edge)
+        q.index_add_(0, edge_v, -rhs_edge)
+        phi_new = _complete_graph_isotropic_box_qp_torch(
+            U=U,
+            h=h,
+            lower=lower,
+            upper=upper,
+            rho=rho,
+            q=q,
+            max_iter=max(max_iter, 20),
+        )
+
+        edge_diff_new = phi_new.index_select(0, edge_u) - phi_new.index_select(0, edge_v)
+        primal_residual = edge_diff_new - z_new
+        scaled_dual_new = scaled_dual + primal_residual
+
+        primal_norm = float(
+            (torch.linalg.norm(primal_residual) / (1.0 + torch.linalg.norm(z_new))).item()
+        )
+        dual_residual_vec = torch.zeros_like(phi)
+        dual_residual_vec.index_add_(0, edge_u, z_new - z)
+        dual_residual_vec.index_add_(0, edge_v, -(z_new - z))
+        dual_norm = float(
+            (rho * torch.linalg.norm(dual_residual_vec) / (1.0 + torch.linalg.norm(phi_new))).item()
+        )
+        actual_dual = rho * scaled_dual_new
+        last_residual = inner_kkt_residual_torch(
+            phi=phi_new,
+            dual=actual_dual,
+            U=U,
+            h=h,
+            lower=lower,
+            upper=upper,
+            lambda_value=lambda_value,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            edge_w=edge_w,
+            atol=max(tol, 1e-8),
+        )
+
+        phi = phi_new
+        z = z_new
+        scaled_dual = scaled_dual_new
+
+        if primal_norm <= tol and dual_norm <= tol and last_residual <= 5.0 * tol:
+            converged = True
+            break
+
+    return phi, scaled_dual, iterations, converged, float(last_residual)

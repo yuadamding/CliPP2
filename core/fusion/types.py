@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -12,6 +12,12 @@ class PairwiseFusionGraph:
     edge_v: np.ndarray
     edge_w: np.ndarray
     name: str = "complete_uniform"
+    degree_bound: int = 1
+    torch_cache: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)

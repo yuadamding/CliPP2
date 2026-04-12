@@ -22,6 +22,14 @@ DEFAULT_PATIENT_SORT_COLUMNS = ["N_mean", "purity", "amp_rate", "n_samples", "tr
 DEFAULT_TUMOR_SORT_COLUMNS = DEFAULT_PATIENT_SORT_COLUMNS
 
 
+def _safe_nanmean_abs(values: pd.Series | np.ndarray) -> float:
+    array = np.asarray(values, dtype=float)
+    finite = np.isfinite(array)
+    if not np.any(finite):
+        return float("nan")
+    return float(np.mean(np.abs(array[finite])))
+
+
 def _parse_patient_id(patient_id: str) -> dict[str, int | float | str]:
     match = PATIENT_PATTERN.fullmatch(patient_id)
     if match is None:
@@ -178,7 +186,7 @@ def _aggregate_patient_results(patient_df: pd.DataFrame) -> tuple[pd.DataFrame, 
             mean_clonal_fraction_error=("clonal_fraction_error", "mean"),
             mean_abs_clonal_fraction_error=(
                 "clonal_fraction_error",
-                lambda s: float(np.nanmean(np.abs(s.to_numpy(dtype=float)))),
+                _safe_nanmean_abs,
             ),
             mean_eval_mutations=("n_eval_mutations", "mean"),
             mean_filtered_mutations=("n_filtered_mutations", "mean"),
@@ -200,9 +208,7 @@ def _aggregate_patient_results(patient_df: pd.DataFrame) -> tuple[pd.DataFrame, 
                 "mean_estimated_clonal_fraction": float(patient_df["estimated_clonal_fraction"].mean()),
                 "mean_true_clonal_fraction": float(patient_df["true_clonal_fraction"].mean()),
                 "mean_clonal_fraction_error": float(patient_df["clonal_fraction_error"].mean()),
-                "mean_abs_clonal_fraction_error": float(
-                    np.nanmean(np.abs(patient_df["clonal_fraction_error"].to_numpy(dtype=float)))
-                ),
+                "mean_abs_clonal_fraction_error": _safe_nanmean_abs(patient_df["clonal_fraction_error"]),
                 "mean_estimated_clusters": float(patient_df["n_clusters"].mean()),
                 "mean_cluster_count_error": float(patient_df["cluster_count_error"].mean()),
                 "mean_abs_cluster_count_error": float(patient_df["abs_cluster_count_error"].mean()),
@@ -238,7 +244,7 @@ def _aggregate_simple(patient_df: pd.DataFrame, columns: list[str]) -> pd.DataFr
             mean_clonal_fraction_error=("clonal_fraction_error", "mean"),
             mean_abs_clonal_fraction_error=(
                 "clonal_fraction_error",
-                lambda s: float(np.nanmean(np.abs(s.to_numpy(dtype=float)))),
+                _safe_nanmean_abs,
             ),
             mean_eval_mutations=("n_eval_mutations", "mean"),
             mean_filtered_mutations=("n_filtered_mutations", "mean"),
