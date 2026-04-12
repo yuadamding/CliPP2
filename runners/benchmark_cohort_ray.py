@@ -106,6 +106,7 @@ def _process_one_file_remote(
     use_warm_starts: bool,
     write_outputs: bool,
     finalize_selected_fit: bool,
+    missing_cna_policy: str,
 ) -> dict[str, float | int | str | bool]:
     _configure_cpu_runtime()
     with warnings.catch_warnings():
@@ -129,6 +130,7 @@ def _process_one_file_remote(
             write_outputs=write_outputs,
             finalize_selected_fit=finalize_selected_fit,
             graph_file=None if graph_file is None else Path(graph_file),
+            missing_cna_policy=str(missing_cna_policy),
         )
         candidate_rows = search_df.to_dict(orient="records")
         return {
@@ -599,6 +601,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--outer-max-iter", type=int, default=4, help="Maximum outer majorization iterations.")
     parser.add_argument("--inner-max-iter", type=int, default=30, help="Maximum inner solver iterations.")
     parser.add_argument("--tol", type=float, default=1e-4, help="Optimization tolerance.")
+    parser.add_argument("--summary-tol", type=float, default=None, help="Optional explicit summary clustering tolerance.")
     parser.add_argument("--bic-df-scale", type=float, default=8.0, help="Extended BIC CP degrees-of-freedom scale.")
     parser.add_argument("--bic-cluster-penalty", type=float, default=4.0, help="Extended BIC cluster-count penalty.")
     parser.add_argument("--settings-profile", choices=["manual", "auto"], default="auto", help="Model-selection strategy.")
@@ -609,6 +612,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Candidate scoring objective. BIC-style scores use the post-hoc summary partition/log-likelihood pair; 'oracle_ari' uses simulation truth to select the best lambda and stores the optimal-ARI lambda range.",
     )
     parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability for major-copy multiplicity.")
+    parser.add_argument("--dtype", choices=["auto", "float32", "float64"], default="auto", help="Torch runtime dtype.")
+    parser.add_argument(
+        "--missing-cna-policy",
+        choices=["error", "all_true"],
+        default="error",
+        help="Behavior when an input TSV omits both has_cna and cna_observed.",
+    )
     parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
     parser.add_argument("--write-tumor-outputs", action="store_true", help="Write full per-tumor result files.")
     parser.add_argument("--verbose", action="store_true", help="Print optimizer progress inside each worker.")
@@ -661,8 +671,10 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
             outer_max_iter=args.outer_max_iter,
             inner_max_iter=args.inner_max_iter,
             tol=args.tol,
+            summary_tol=args.summary_tol,
             major_prior=args.major_prior,
             device="cpu",
+            dtype=args.dtype,
             verbose=args.verbose,
         )
     )
@@ -678,6 +690,8 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "adaptive_weight_floor": float(fit_options.adaptive_weight_floor),
         "adaptive_weight_baseline": float(fit_options.adaptive_weight_baseline),
         "device": "cpu",
+        "dtype": str(fit_options.dtype),
+        "summary_tol": fit_options.summary_tol,
         "verbose": bool(fit_options.verbose),
     }
     search_config = {
@@ -685,6 +699,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "simulation_root": str(simulation_root),
         "outdir": str(outdir),
         "workers": int(args.workers),
+        "flush_every": int(args.flush_every),
         "selection_score": str(args.selection_score),
         "settings_profile": str(args.settings_profile),
         "lambda_grid_mode": str(args.lambda_grid_mode),
@@ -693,7 +708,10 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "outer_max_iter": int(args.outer_max_iter),
         "inner_max_iter": int(args.inner_max_iter),
         "tol": float(args.tol),
+        "summary_tol": np.nan if args.summary_tol is None else float(args.summary_tol),
         "device": "cpu",
+        "dtype": str(args.dtype),
+        "missing_cna_policy": str(args.missing_cna_policy),
         "major_prior": float(args.major_prior),
         "default_graph_policy": "complete_adaptive_from_exact_pilot",
         "adaptive_weight_gamma": float(fit_options.adaptive_weight_gamma),
@@ -711,6 +729,13 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "oracle_max_search_rounds": int(ORACLE_MAX_SEARCH_ROUNDS),
         "oracle_min_lambda": float(ORACLE_MIN_LAMBDA),
         "oracle_max_lambda": float(ORACLE_MAX_LAMBDA),
+        "oracle_search_style": (
+            "light_dynamic_zoom"
+            if str(args.selection_score).strip().lower() == "oracle_ari" and not bool(args.write_tumor_outputs)
+            else "heavy_dynamic_refinement"
+            if str(args.selection_score).strip().lower() == "oracle_ari"
+            else "non_oracle_grid"
+        ),
         "oracle_candidate_evaluation_mode": "ari_only_during_search_full_on_selected_summary",
         "oracle_candidate_start_mode": "warm_only_for_light_search_full_when_selected_fit_is_finalized",
         "oracle_candidate_compute_summary": "false_during_search_true_only_when_selected_fit_is_finalized",
@@ -763,6 +788,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
                 use_warm_starts=not args.disable_warm_start,
                 write_outputs=bool(args.write_tumor_outputs),
                 finalize_selected_fit=bool(args.write_tumor_outputs or str(args.selection_score).strip().lower() != "oracle_ari"),
+                missing_cna_policy=str(args.missing_cna_policy),
             )
             in_flight[future] = file_path
             return True

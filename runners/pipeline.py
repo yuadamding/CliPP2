@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import concurrent.futures as cf
+import multiprocessing as mp
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
@@ -31,11 +33,12 @@ def process_one_file_bundle(
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
     finalize_selected_fit: bool | None = None,
+    missing_cna_policy: str = "error",
 ) -> tuple[dict[str, float | int | str | bool], pd.DataFrame]:
     start_time = perf_counter()
     file_path = Path(file_path)
     outdir = Path(outdir)
-    data = load_tumor_tsv(file_path)
+    data = load_tumor_tsv(file_path, missing_cna_policy=missing_cna_policy)
 
     if fit_options is None:
         fit_options = FitOptions(lambda_value=0.0)
@@ -154,7 +157,9 @@ def process_one_file_bundle(
         "bic_cluster_penalty": float(selection_result.bic_cluster_penalty),
         "converged": bool(best_fit.converged),
         "device": best_fit.device,
+        "dtype": str(best_fit.dtype),
         "graph_name": str(best_fit.graph_name),
+        "summary_tol": float(best_fit.summary_tol),
         "ARI": (
             float(best_evaluation.ari)
             if best_evaluation is not None
@@ -205,6 +210,7 @@ def process_one_file(
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
     finalize_selected_fit: bool | None = None,
+    missing_cna_policy: str = "error",
 ) -> dict[str, float | int | str | bool]:
     summary, _ = process_one_file_bundle(
         file_path=file_path,
@@ -221,6 +227,7 @@ def process_one_file(
         write_outputs=write_outputs,
         graph_file=graph_file,
         finalize_selected_fit=finalize_selected_fit,
+        missing_cna_policy=missing_cna_policy,
     )
     return summary
 
@@ -241,6 +248,8 @@ def run_directory(
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
     finalize_selected_fit: bool | None = None,
+    missing_cna_policy: str = "error",
+    workers: int = 1,
 ) -> pd.DataFrame:
     input_dir = Path(input_dir)
     files = sorted(input_dir.glob("*.tsv"))
@@ -251,25 +260,59 @@ def run_directory(
         raise RuntimeError(f"No TSV files found in {input_dir}")
 
     summaries = []
-    for file_path in files:
-        summaries.append(
-            process_one_file(
-                file_path=file_path,
-                outdir=outdir,
-                simulation_root=simulation_root,
-                lambda_grid=lambda_grid,
-                lambda_grid_mode=lambda_grid_mode,
-                fit_options=fit_options,
-                bic_df_scale=bic_df_scale,
-                bic_cluster_penalty=bic_cluster_penalty,
-                settings_profile=settings_profile,
-                selection_score=selection_score,
-                use_warm_starts=use_warm_starts,
-                write_outputs=write_outputs,
-                graph_file=graph_file,
-                finalize_selected_fit=finalize_selected_fit,
+    worker_count = max(int(workers), 1)
+    if worker_count <= 1:
+        for file_path in files:
+            summaries.append(
+                process_one_file(
+                    file_path=file_path,
+                    outdir=outdir,
+                    simulation_root=simulation_root,
+                    lambda_grid=lambda_grid,
+                    lambda_grid_mode=lambda_grid_mode,
+                    fit_options=fit_options,
+                    bic_df_scale=bic_df_scale,
+                    bic_cluster_penalty=bic_cluster_penalty,
+                    settings_profile=settings_profile,
+                    selection_score=selection_score,
+                    use_warm_starts=use_warm_starts,
+                    write_outputs=write_outputs,
+                    graph_file=graph_file,
+                    finalize_selected_fit=finalize_selected_fit,
+                    missing_cna_policy=missing_cna_policy,
+                )
             )
-        )
+    else:
+        with cf.ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=mp.get_context("spawn"),
+        ) as executor:
+            future_map = {
+                executor.submit(
+                    process_one_file,
+                    file_path=file_path,
+                    outdir=outdir,
+                    simulation_root=simulation_root,
+                    lambda_grid=lambda_grid,
+                    lambda_grid_mode=lambda_grid_mode,
+                    fit_options=fit_options,
+                    bic_df_scale=bic_df_scale,
+                    bic_cluster_penalty=bic_cluster_penalty,
+                    settings_profile=settings_profile,
+                    selection_score=selection_score,
+                    use_warm_starts=use_warm_starts,
+                    write_outputs=write_outputs,
+                    graph_file=graph_file,
+                    finalize_selected_fit=finalize_selected_fit,
+                    missing_cna_policy=missing_cna_policy,
+                ): file_path
+                for file_path in files
+            }
+            ordered: dict[str, dict[str, float | int | str | bool]] = {}
+            for future in cf.as_completed(future_map):
+                file_path = future_map[future]
+                ordered[file_path.stem] = future.result()
+            summaries = [ordered[file_path.stem] for file_path in files]
 
     summary_df = pd.DataFrame(summaries)
     sort_column = "tumor_id" if "tumor_id" in summary_df.columns else "patient_id"

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
 import torch
 
 from ...io.data import TumorData
@@ -10,6 +8,7 @@ from .graph import resolve_pairwise_fusion_graph
 from .starts import (
     compute_exact_observed_data_pilot,
     compute_pooled_observed_data_start,
+    compute_scalar_cell_wells,
     compute_scalar_well_start_bank,
 )
 from .torch_backend import (
@@ -86,14 +85,22 @@ def _cluster_labels(
     if not np.any(fused):
         return np.arange(num_mutations, dtype=np.int64)
 
-    left = edge_u[fused].astype(np.int32, copy=False)
-    right = edge_v[fused].astype(np.int32, copy=False)
-    rows = np.concatenate([left, right])
-    cols = np.concatenate([right, left])
-    values = np.ones(rows.shape[0], dtype=np.int8)
-    graph = coo_matrix((values, (rows, cols)), shape=(num_mutations, num_mutations))
-    _, labels = connected_components(graph, directed=False, return_labels=True)
-    return labels.astype(np.int64, copy=False)
+    uf = _UnionFind(num_mutations)
+    for left, right in zip(edge_u[fused], edge_v[fused]):
+        uf.union(int(left), int(right))
+
+    labels = np.empty(num_mutations, dtype=np.int64)
+    root_to_label: dict[int, int] = {}
+    next_label = 0
+    for idx in range(num_mutations):
+        root = uf.find(idx)
+        label = root_to_label.get(root)
+        if label is None:
+            label = next_label
+            root_to_label[root] = label
+            next_label += 1
+        labels[idx] = int(label)
+    return labels
 
 
 def _cluster_summary_from_labels(
@@ -101,20 +108,23 @@ def _cluster_summary_from_labels(
     labels: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     n_clusters = int(labels.max()) + 1 if labels.size else 0
-    centers = np.zeros((n_clusters, phi.shape[1]), dtype=np.float64)
+    centers = np.zeros((n_clusters, phi.shape[1]), dtype=phi.dtype)
     counts = np.bincount(labels, minlength=n_clusters).astype(np.float64)
     np.add.at(centers, labels, phi)
     centers /= np.clip(counts[:, None], 1.0, None)
     phi_clustered = centers[labels]
-    return centers.astype(np.float32, copy=False), phi_clustered.astype(np.float32, copy=False)
+    return centers.astype(phi.dtype, copy=False), phi_clustered.astype(phi.dtype, copy=False)
 
 
 def _deduplicate_starts(starts: list[np.ndarray]) -> list[np.ndarray]:
     unique: list[np.ndarray] = []
+    seen: set[bytes] = set()
     for start in starts:
-        start_arr = np.asarray(start, dtype=np.float64)
-        if any(np.allclose(start_arr, existing, rtol=1e-7, atol=1e-8) for existing in unique):
+        start_arr = np.asarray(start)
+        signature = np.round(start_arr, decimals=8).astype(np.float32, copy=False).tobytes()
+        if signature in seen:
             continue
+        seen.add(signature)
         unique.append(start_arr)
     return unique
 
@@ -132,6 +142,7 @@ def _fit_from_start(
     inner_max_iter: int,
     tol: float,
     phi_start: np.ndarray,
+    summary_tol: float | None,
     compute_summary: bool,
     verbose: bool,
 ) -> FusionFitArtifacts:
@@ -146,7 +157,7 @@ def _fit_from_start(
 
     lower = torch.full_like(torch_data.phi_upper, float(eps))
     upper = torch.minimum(torch_data.phi_upper, torch.ones_like(torch_data.phi_upper))
-    phi = torch.as_tensor(np.asarray(phi_start, dtype=np.float64), dtype=runtime.dtype, device=runtime.device)
+    phi = torch.as_tensor(np.asarray(phi_start), dtype=runtime.dtype, device=runtime.device)
     phi = torch.minimum(torch.maximum(phi, lower), upper)
 
     dual = None
@@ -290,14 +301,18 @@ def _fit_from_start(
             converged = True
             break
 
-    phi_np = phi.detach().cpu().numpy().astype(np.float64, copy=False)
-    gamma_np = gamma_major.detach().cpu().numpy().astype(np.float64, copy=False)
-    summary_tol = max(10.0 * float(tol), 1e-4)
+    phi_np = phi.detach().cpu().numpy()
+    gamma_np = gamma_major.detach().cpu().numpy()
+    effective_summary_tol = (
+        max(10.0 * float(tol), 1e-4)
+        if summary_tol is None
+        else max(float(summary_tol), 1e-12)
+    )
     cluster_labels = _cluster_labels(
         phi_np,
         edge_u=edge_u_np,
         edge_v=edge_v_np,
-        tol=summary_tol,
+        tol=effective_summary_tol,
     )
     n_clusters = int(cluster_labels.max()) + 1 if cluster_labels.size else 0
     if compute_summary:
@@ -315,31 +330,31 @@ def _fit_from_start(
         )
         summary_loglik = float(-summary_fit_loss)
     else:
-        cluster_centers = np.zeros((n_clusters, phi_np.shape[1]), dtype=np.float32)
-        phi_clustered = phi_np.astype(np.float32, copy=False)
+        cluster_centers = np.zeros((n_clusters, phi_np.shape[1]), dtype=phi_np.dtype)
+        phi_clustered = phi_np.astype(phi_np.dtype, copy=False)
         summary_loglik = float("nan")
 
     major_probability = np.where(
         data.multiplicity_estimation_mask,
         gamma_np,
         1.0,
-    ).astype(np.float32, copy=False)
+    ).astype(phi_np.dtype, copy=False)
     major_call = major_probability >= 0.5
     multiplicity_call = np.where(
         data.multiplicity_estimation_mask,
         np.where(major_call, data.major_cn, data.minor_cn),
         data.fixed_multiplicity,
-    ).astype(np.float32, copy=False)
+    ).astype(phi_np.dtype, copy=False)
 
     return FusionFitArtifacts(
-        phi=phi_np.astype(np.float32, copy=False),
-        phi_clustered=phi_clustered.astype(np.float32, copy=False),
+        phi=phi_np.astype(phi_np.dtype, copy=False),
+        phi_clustered=phi_clustered.astype(phi_np.dtype, copy=False),
         cluster_labels=cluster_labels.astype(np.int64, copy=False),
-        cluster_centers=cluster_centers.astype(np.float32, copy=False),
-        gamma_major=major_probability.astype(np.float32, copy=False),
-        major_probability=major_probability.astype(np.float32, copy=False),
+        cluster_centers=cluster_centers.astype(phi_np.dtype, copy=False),
+        gamma_major=major_probability.astype(phi_np.dtype, copy=False),
+        major_probability=major_probability.astype(phi_np.dtype, copy=False),
         major_call=major_call.astype(bool, copy=False),
-        multiplicity_call=multiplicity_call.astype(np.float32, copy=False),
+        multiplicity_call=multiplicity_call.astype(phi_np.dtype, copy=False),
         multiplicity_estimated_mask=data.multiplicity_estimation_mask.astype(bool, copy=False),
         loglik=float(-fit_loss),
         summary_loglik=summary_loglik,
@@ -349,7 +364,9 @@ def _fit_from_start(
         iterations=int(iterations),
         converged=bool(converged),
         device=runtime.device_name,
+        dtype=str(runtime.dtype).replace("torch.", ""),
         graph_name=str(graph.name),
+        summary_tol=float(effective_summary_tol),
         history=[float(value) for value in history],
     )
 
@@ -373,23 +390,27 @@ def fit_observed_data_pairwise_fusion(
     scalar_well_starts: list[np.ndarray] | None = None,
     start_mode: str = "full",
     device: str | None = "auto",
+    dtype: str | None = "auto",
+    summary_tol: float | None = None,
     runtime=None,
     torch_data=None,
     compute_summary: bool = True,
     verbose: bool = False,
 ) -> FusionFitArtifacts:
-    effective_runtime = resolve_runtime(device) if runtime is None else runtime
+    effective_runtime = resolve_runtime(device, dtype=dtype) if runtime is None else runtime
     effective_torch_data = to_torch_tumor_data(data, effective_runtime) if torch_data is None else torch_data
 
     if exact_pilot is None:
-        exact_pilot = compute_exact_observed_data_pilot(
+        exact_pilot, secondary_wells, valid_secondary = compute_scalar_cell_wells(
             data,
-            runtime=effective_runtime,
             major_prior=major_prior,
             eps=eps,
             tol=max(tol, 1e-6),
             max_iter=max(inner_max_iter, 16),
         )
+    else:
+        secondary_wells = None
+        valid_secondary = None
     effective_graph = resolve_pairwise_fusion_graph(
         data.num_mutations,
         graph=graph,
@@ -416,9 +437,11 @@ def fit_observed_data_pairwise_fusion(
             tol=max(tol, 1e-6),
             max_iter=max(inner_max_iter, 16),
             exact_pilot=exact_pilot,
+            secondary_wells=secondary_wells,
+            valid_secondary=valid_secondary,
         )
     else:
-        scalar_well_starts = [np.asarray(start, dtype=np.float64) for start in scalar_well_starts]
+        scalar_well_starts = [np.asarray(start) for start in scalar_well_starts]
 
     normalized_start_mode = str(start_mode).strip().lower()
     if normalized_start_mode not in {"full", "warm_plus_pilot", "warm_only"}:
@@ -426,7 +449,7 @@ def fit_observed_data_pairwise_fusion(
 
     start_bank: list[np.ndarray] = []
     if phi_start is not None:
-        start_bank.append(np.asarray(phi_start, dtype=np.float64))
+        start_bank.append(np.asarray(phi_start))
     if normalized_start_mode == "full":
         start_bank.extend(scalar_well_starts)
         start_bank.append(pooled_start)
@@ -437,8 +460,7 @@ def fit_observed_data_pairwise_fusion(
         else:
             start_bank.extend(scalar_well_starts)
     elif phi_start is None:
-        start_bank.extend(scalar_well_starts)
-        start_bank.append(pooled_start)
+        start_bank.append(exact_pilot)
     start_bank = _deduplicate_starts(start_bank)
 
     best_artifacts: FusionFitArtifacts | None = None
@@ -455,6 +477,7 @@ def fit_observed_data_pairwise_fusion(
             inner_max_iter=inner_max_iter,
             tol=tol,
             phi_start=start,
+            summary_tol=summary_tol,
             compute_summary=compute_summary,
             verbose=verbose,
         )

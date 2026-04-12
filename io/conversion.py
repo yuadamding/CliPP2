@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -30,29 +31,42 @@ class ConversionConfig:
 def map_cna_to_mutations(mut_coords: pd.DataFrame, cna: pd.DataFrame) -> pd.DataFrame:
     mc = mut_coords.copy()
     mc[SNV_CHROMOSOME_COL] = mc[SNV_CHROMOSOME_COL].astype(str)
+    mc[SNV_POSITION_COL] = mc[SNV_POSITION_COL].astype(int)
+    mc["row_index"] = np.arange(mc.shape[0], dtype=np.int64)
 
     cna = cna.copy()
     cna[CNA_CHROMOSOME_COL] = cna[CNA_CHROMOSOME_COL].astype(str)
+    cna[CNA_START_COL] = cna[CNA_START_COL].astype(int)
+    cna[CNA_END_COL] = cna[CNA_END_COL].astype(int)
 
-    cross = mc.merge(
-        cna,
-        left_on=SNV_CHROMOSOME_COL,
-        right_on=CNA_CHROMOSOME_COL,
-        how="left",
-    )
-    in_segment = (
-        (cross[SNV_POSITION_COL] >= cross[CNA_START_COL]) &
-        (cross[SNV_POSITION_COL] <= cross[CNA_END_COL])
-    )
+    mapped = mc.copy()
+    mapped[CNA_MAJOR_COL] = np.nan
+    mapped[CNA_MINOR_COL] = np.nan
+    mapped["has_cna"] = 0
 
-    matches = cross.loc[
-        in_segment,
-        [SNV_CHROMOSOME_COL, SNV_POSITION_COL, CNA_MAJOR_COL, CNA_MINOR_COL],
-    ].drop_duplicates()
-    matches["has_cna"] = 1
+    for chromosome, mut_chr in mc.groupby(SNV_CHROMOSOME_COL, sort=False):
+        cna_chr = cna.loc[cna[CNA_CHROMOSOME_COL] == chromosome].copy()
+        if cna_chr.empty:
+            continue
 
-    mapped = mc.merge(matches, on=[SNV_CHROMOSOME_COL, SNV_POSITION_COL], how="left")
-    mapped["has_cna"] = mapped["has_cna"].fillna(0).astype(int)
+        mut_chr = mut_chr.sort_values(SNV_POSITION_COL).copy()
+        cna_chr = cna_chr.sort_values([CNA_START_COL, CNA_END_COL]).reset_index(drop=True)
+
+        seg_idx = 0
+        for row in mut_chr.itertuples(index=False):
+            position = int(getattr(row, SNV_POSITION_COL))
+            while seg_idx < cna_chr.shape[0] and int(cna_chr.iloc[seg_idx][CNA_END_COL]) < position:
+                seg_idx += 1
+            if seg_idx >= cna_chr.shape[0]:
+                break
+            current = cna_chr.iloc[seg_idx]
+            if int(current[CNA_START_COL]) <= position <= int(current[CNA_END_COL]):
+                mapped_idx = int(getattr(row, "row_index"))
+                mapped.at[mapped_idx, CNA_MAJOR_COL] = float(current[CNA_MAJOR_COL])
+                mapped.at[mapped_idx, CNA_MINOR_COL] = float(current[CNA_MINOR_COL])
+                mapped.at[mapped_idx, "has_cna"] = 1
+
+    mapped = mapped.drop(columns=["row_index"])
     return mapped
 
 

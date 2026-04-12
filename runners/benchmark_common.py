@@ -366,6 +366,8 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         tol=args.tol,
         major_prior=args.major_prior,
         device=args.device,
+        dtype=getattr(args, "dtype", "auto"),
+        summary_tol=getattr(args, "summary_tol", None),
         verbose=args.verbose,
     )
 

@@ -142,7 +142,12 @@ def compute_phi_init_from_counts(
     return phi_init.astype(np.float32), init_major_mask.astype(bool)
 
 
-def load_tumor_tsv(file_path: str | Path, eps: float = 1e-6) -> TumorData:
+def load_tumor_tsv(
+    file_path: str | Path,
+    eps: float = 1e-6,
+    *,
+    missing_cna_policy: str = "error",
+) -> TumorData:
     file_path = Path(file_path)
     df = pd.read_csv(file_path, sep="\t").copy()
 
@@ -215,7 +220,18 @@ def load_tumor_tsv(file_path: str | Path, eps: float = 1e-6) -> TumorData:
     minor_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
     normal_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
     has_explicit_cna_mask = "has_cna" in df.columns or "cna_observed" in df.columns
-    has_cna = np.zeros((num_mutations, num_regions), dtype=bool) if has_explicit_cna_mask else np.ones((num_mutations, num_regions), dtype=bool)
+    normalized_missing_cna_policy = str(missing_cna_policy).strip().lower()
+    if normalized_missing_cna_policy not in {"error", "all_true"}:
+        raise ValueError("missing_cna_policy must be one of {'error', 'all_true'}.")
+    if has_explicit_cna_mask:
+        has_cna = np.zeros((num_mutations, num_regions), dtype=bool)
+    else:
+        if normalized_missing_cna_policy == "error":
+            raise ValueError(
+                f"Missing CNA observability column in {file_path}; expected 'has_cna' or 'cna_observed'. "
+                "Pass missing_cna_policy='all_true' only if that behavior is intentional."
+            )
+        has_cna = np.ones((num_mutations, num_regions), dtype=bool)
 
     for row in df.itertuples(index=False):
         i = mut_index[str(row.mutation_id)]
@@ -281,8 +297,13 @@ def load_tumor_tsv(file_path: str | Path, eps: float = 1e-6) -> TumorData:
     )
 
 
-def load_patient_tsv(file_path: str | Path, eps: float = 1e-6) -> PatientData:
-    return load_tumor_tsv(file_path=file_path, eps=eps)
+def load_patient_tsv(
+    file_path: str | Path,
+    eps: float = 1e-6,
+    *,
+    missing_cna_policy: str = "error",
+) -> PatientData:
+    return load_tumor_tsv(file_path=file_path, eps=eps, missing_cna_policy=missing_cna_policy)
 
 
 __all__ = [

@@ -40,14 +40,22 @@ def _binary_entropy_offset_torch(weight: torch.Tensor) -> torch.Tensor:
     return term
 
 
-def resolve_runtime(device: str | None) -> TorchRuntime:
+def resolve_runtime(device: str | None, *, dtype: str | None = None) -> TorchRuntime:
     requested = "auto" if device is None else str(device).strip().lower()
     if requested == "auto":
         requested = "cuda" if torch.cuda.is_available() else "cpu"
     if requested.startswith("cuda") and not torch.cuda.is_available():
         requested = "cpu"
     runtime_device = torch.device(requested)
-    runtime_dtype = torch.float32 if runtime_device.type == "cuda" else torch.float64
+    requested_dtype = "auto" if dtype is None else str(dtype).strip().lower()
+    if requested_dtype == "auto":
+        runtime_dtype = torch.float32 if runtime_device.type == "cuda" else torch.float64
+    elif requested_dtype == "float32":
+        runtime_dtype = torch.float32
+    elif requested_dtype == "float64":
+        runtime_dtype = torch.float64
+    else:
+        raise ValueError(f"Unknown runtime dtype: {dtype}")
     device_name = runtime_device.type if runtime_device.index is None else f"{runtime_device.type}:{runtime_device.index}"
     return TorchRuntime(device=runtime_device, device_name=device_name, dtype=runtime_dtype)
 

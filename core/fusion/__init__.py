@@ -8,8 +8,8 @@ from .solver import fit_observed_data_pairwise_fusion
 from .starts import (
     compute_exact_observed_data_pilot,
     compute_pooled_observed_data_start,
+    compute_scalar_cell_wells,
     compute_scalar_well_start_bank,
-    compute_stationary_screen_box,
 )
 from .types import FusionFitArtifacts, PairwiseFusionGraph, TorchRuntime
 
@@ -23,7 +23,7 @@ __all__ = [
     "resolve_pairwise_fusion_graph",
     "compute_exact_observed_data_pilot",
     "compute_pooled_observed_data_start",
+    "compute_scalar_cell_wells",
     "compute_scalar_well_start_bank",
-    "compute_stationary_screen_box",
     "fit_observed_data_pairwise_fusion",
 ]

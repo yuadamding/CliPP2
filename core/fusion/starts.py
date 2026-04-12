@@ -790,6 +790,24 @@ def compute_exact_observed_data_pilot(
     tol: float,
     max_iter: int,
 ) -> np.ndarray:
+    primary, _, _ = compute_scalar_cell_wells(
+        data,
+        major_prior=major_prior,
+        eps=eps,
+        tol=tol,
+        max_iter=max_iter,
+    )
+    return np.clip(primary, eps, np.asarray(data.phi_upper, dtype=np.float64))
+
+
+def compute_scalar_cell_wells(
+    data: TumorData,
+    *,
+    major_prior: float,
+    eps: float,
+    tol: float,
+    max_iter: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     alt = np.asarray(data.alt_counts, dtype=np.float64).reshape(-1)
     total = np.asarray(data.total_counts, dtype=np.float64).reshape(-1)
     b_minus = (np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.minor_cn, dtype=np.float64)).reshape(-1)
@@ -800,6 +818,8 @@ def compute_exact_observed_data_pilot(
     upper = np.asarray(data.phi_upper, dtype=np.float64).reshape(-1)
     hint = np.clip(np.asarray(data.phi_init, dtype=np.float64).reshape(-1), lower, upper)
     refined = np.zeros_like(hint, dtype=np.float64)
+    secondary = np.full_like(hint, np.nan, dtype=np.float64)
+    valid_secondary = np.zeros_like(hint, dtype=bool)
 
     fixed_mask = ~ambiguous
     if np.any(fixed_mask):
@@ -817,7 +837,7 @@ def compute_exact_observed_data_pilot(
 
     amb_indices = np.flatnonzero(ambiguous)
     for idx in amb_indices:
-        refined[idx] = _exact_pilot_cell_beta(
+        primary, alternate = _cell_best_two_betas(
             alt=float(alt[idx]),
             total=float(total[idx]),
             b_minus=float(b_minus[idx]),
@@ -832,8 +852,17 @@ def compute_exact_observed_data_pilot(
             max_iter=max_iter,
             hint=float(hint[idx]),
         )
+        refined[idx] = float(primary)
+        if alternate is not None:
+            secondary[idx] = float(alternate)
+            valid_secondary[idx] = abs(float(alternate) - float(primary)) > max(float(tol) * 10.0, 1e-8)
 
-    return np.clip(refined.reshape(data.phi_init.shape), eps, np.asarray(data.phi_upper, dtype=np.float64))
+    shape = data.phi_init.shape
+    return (
+        np.clip(refined.reshape(shape), eps, np.asarray(data.phi_upper, dtype=np.float64)),
+        secondary.reshape(shape),
+        valid_secondary.reshape(shape),
+    )
 
 
 def compute_pooled_observed_data_start(
@@ -926,42 +955,21 @@ def compute_scalar_well_start_bank(
     tol: float,
     max_iter: int,
     exact_pilot: np.ndarray,
+    secondary_wells: np.ndarray | None = None,
+    valid_secondary: np.ndarray | None = None,
     max_sample_flips: int = 4,
 ) -> list[np.ndarray]:
     exact_pilot = np.asarray(exact_pilot, dtype=np.float64)
-    alt = np.asarray(data.alt_counts, dtype=np.float64)
-    total = np.asarray(data.total_counts, dtype=np.float64)
-    b_minus = np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.minor_cn, dtype=np.float64)
-    b_plus = np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.major_cn, dtype=np.float64)
-    b_fixed = np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.fixed_multiplicity, dtype=np.float64)
-    ambiguous = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
-    lower = np.full_like(exact_pilot, float(eps), dtype=np.float64)
-    upper = np.asarray(data.phi_upper, dtype=np.float64)
-
-    secondary = np.full_like(exact_pilot, np.nan, dtype=np.float64)
-    valid_secondary = np.zeros_like(ambiguous, dtype=bool)
-
-    ambiguous_coords = np.argwhere(ambiguous)
-    for mutation_idx, sample_idx in ambiguous_coords:
-        primary, alternate = _cell_best_two_betas(
-            alt=float(alt[mutation_idx, sample_idx]),
-            total=float(total[mutation_idx, sample_idx]),
-            b_minus=float(b_minus[mutation_idx, sample_idx]),
-            b_plus=float(b_plus[mutation_idx, sample_idx]),
-            b_fixed=float(b_fixed[mutation_idx, sample_idx]),
-            ambiguous=True,
-            lower=float(lower[mutation_idx, sample_idx]),
-            upper=float(upper[mutation_idx, sample_idx]),
+    if secondary_wells is None or valid_secondary is None:
+        _, secondary, valid_secondary = compute_scalar_cell_wells(
+            data,
             major_prior=major_prior,
             eps=eps,
             tol=tol,
             max_iter=max_iter,
-            hint=float(exact_pilot[mutation_idx, sample_idx]),
         )
-        if alternate is None:
-            continue
-        secondary[mutation_idx, sample_idx] = float(alternate)
-        valid_secondary[mutation_idx, sample_idx] = abs(float(alternate) - float(primary)) > max(float(tol) * 10.0, 1e-8)
+    secondary = np.asarray(secondary_wells if secondary_wells is not None else secondary, dtype=np.float64)
+    valid_secondary = np.asarray(valid_secondary, dtype=bool)
 
     starts: list[np.ndarray] = [exact_pilot.copy()]
     if not np.any(valid_secondary):
@@ -986,9 +994,12 @@ def compute_scalar_well_start_bank(
         starts.append(sample_start)
 
     unique: list[np.ndarray] = []
+    seen: set[bytes] = set()
     for start in starts:
-        if any(np.allclose(start, existing, rtol=1e-7, atol=1e-8) for existing in unique):
+        signature = np.round(np.asarray(start), decimals=8).astype(np.float32, copy=False).tobytes()
+        if signature in seen:
             continue
+        seen.add(signature)
         unique.append(start.astype(np.float64, copy=False))
     return unique
 

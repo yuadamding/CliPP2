@@ -19,6 +19,9 @@ class PairwiseFusionGraph:
         compare=False,
     )
 
+    def clear_torch_cache(self) -> None:
+        self.torch_cache.clear()
+
 
 @dataclass(frozen=True)
 class FusionFitArtifacts:
@@ -39,7 +42,9 @@ class FusionFitArtifacts:
     iterations: int
     converged: bool
     device: str
+    dtype: str
     graph_name: str
+    summary_tol: float
     history: list[float]
 
 

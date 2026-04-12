@@ -10,6 +10,7 @@ from ..core.model import FitOptions, FitResult, fit_single_stage_em
 from ..core.fusion_solver import (
     compute_exact_observed_data_pilot,
     compute_pooled_observed_data_start,
+    compute_scalar_cell_wells,
     compute_scalar_well_start_bank,
     resolve_pairwise_fusion_graph,
 )
@@ -645,7 +646,10 @@ def _oracle_search_behavior(
         ari_only_evaluation=oracle_ari,
         exploratory_start_mode="warm_only" if oracle_ari and use_warm_starts else "full",
         exploratory_compute_summary=not oracle_ari,
-        use_heavy_refinement=bool(oracle_ari and not explicit_lambda_grid),
+        # Heavy oracle refinement is too expensive for benchmark-style ARI search
+        # when we are not even finalizing a selected fit. In that case we still
+        # use a dynamic lambda search, but via the lighter boundary-expand/local-zoom path.
+        use_heavy_refinement=bool(oracle_ari and not explicit_lambda_grid and finalize_selected_fit),
         finalize_selected_fit=bool(oracle_ari and finalize_selected_fit),
     )
 
@@ -680,11 +684,10 @@ def _grid_search_selection(
     if oracle_behavior.use_heavy_refinement:
         lambda_grid = _densify_lambda_grid(lambda_grid)
 
-    runtime = resolve_runtime(fit_options.device)
+    runtime = resolve_runtime(fit_options.device, dtype=fit_options.dtype)
     torch_data = to_torch_tumor_data(data, runtime)
-    pilot_phi = compute_exact_observed_data_pilot(
+    pilot_phi, secondary_wells, valid_secondary = compute_scalar_cell_wells(
         data,
-        runtime=runtime,
         major_prior=float(fit_options.major_prior),
         eps=float(fit_options.eps),
         tol=max(float(fit_options.tol), 1e-6),
@@ -715,6 +718,8 @@ def _grid_search_selection(
         tol=max(float(fit_options.tol), 1e-6),
         max_iter=max(int(fit_options.inner_max_iter), 16),
         exact_pilot=pilot_phi,
+        secondary_wells=secondary_wells,
+        valid_secondary=valid_secondary,
     )
     simulation_truth: SimulationTruth | None = None
     if evaluate_all_candidates and simulation_root is not None and (simulation_root / data.tumor_id).exists():
@@ -1030,9 +1035,16 @@ def _grid_search_selection(
     num_candidates = int(search_df.shape[0])
     converged_mask = search_df["converged"].astype(bool).to_numpy(dtype=bool)
     num_converged_candidates = int(np.sum(converged_mask))
+    converged_oracle_df = pd.DataFrame(columns=search_df.columns)
     if normalized_score == "oracle_ari":
-        selection_df = _oracle_candidate_frame(search_df)
-        selection_used_convergence_fallback = False
+        oracle_df = _oracle_candidate_frame(search_df)
+        converged_oracle_df = _oracle_candidate_frame(search_df.loc[converged_mask].copy())
+        if not converged_oracle_df.empty:
+            selection_df = converged_oracle_df
+            selection_used_convergence_fallback = False
+        else:
+            selection_df = oracle_df
+            selection_used_convergence_fallback = bool(not oracle_df.empty)
     else:
         selection_df = search_df.loc[converged_mask].copy() if num_converged_candidates > 0 else search_df.copy()
         selection_used_convergence_fallback = bool(num_converged_candidates == 0 and num_candidates > 0)
@@ -1083,7 +1095,6 @@ def _grid_search_selection(
         selection_lambda_values,
         maximize=True,
     )
-    converged_oracle_df = _oracle_candidate_frame(search_df.loc[converged_mask].copy())
     best_converged_ari_min, best_converged_ari_max, best_converged_ari_count, best_converged_ari_value, _ = _optimal_lambda_range(
         converged_oracle_df["ARI"].to_numpy(dtype=float) if not converged_oracle_df.empty else np.asarray([], dtype=float),
         converged_oracle_df["lambda"].to_numpy(dtype=float) if not converged_oracle_df.empty else np.asarray([], dtype=float),
@@ -1166,6 +1177,7 @@ def _grid_search_selection(
                 simulation_truth=simulation_truth,
             )
     search_df = search_df.drop(columns=["_candidate_id"])
+    effective_graph.clear_torch_cache()
     return ModelSelectionResult(
         best_fit=best_fit,
         best_evaluation=best_evaluation,

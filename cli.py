@@ -68,6 +68,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inner-max-iter", type=int, default=30, help="Maximum inner convex-solver iterations.")
     parser.add_argument("--tol", type=float, default=1e-4, help="Optimization tolerance.")
     parser.add_argument(
+        "--summary-tol",
+        type=float,
+        default=None,
+        help="Optional explicit post-hoc fusion tolerance used for summary clustering and summary-based selection.",
+    )
+    parser.add_argument(
         "--bic-df-scale",
         type=float,
         default=8.0,
@@ -105,6 +111,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Execution device for the Torch fusion backend.",
     )
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "float32", "float64"],
+        default="auto",
+        help="Numeric dtype for Torch execution. 'auto' uses float64 on CPU and float32 on CUDA.",
+    )
+    parser.add_argument(
+        "--missing-cna-policy",
+        choices=["error", "all_true"],
+        default="error",
+        help="Behavior when neither has_cna nor cna_observed is present in an input TSV.",
+    )
+    parser.add_argument("--workers", type=int, default=1, help="Process-level parallelism for ordinary directory/cohort runs.")
     parser.add_argument("--max-files", type=int, default=None, help="Optional cap on the number of files processed.")
     parser.add_argument("--verbose", action="store_true", help="Print optimizer progress.")
     return parser
@@ -119,8 +138,10 @@ def main() -> None:
         outer_max_iter=args.outer_max_iter,
         inner_max_iter=args.inner_max_iter,
         tol=args.tol,
+        summary_tol=args.summary_tol,
         major_prior=args.major_prior,
         device=args.device,
+        dtype=args.dtype,
         verbose=args.verbose,
     )
     lambda_grid = _parse_lambda_grid(args.lambda_grid)
@@ -142,6 +163,8 @@ def main() -> None:
             selection_score=args.selection_score,
             use_warm_starts=not args.disable_warm_start,
             write_patient_outputs=not args.skip_patient_outputs,
+            workers=args.workers,
+            missing_cna_policy=args.missing_cna_policy,
         )
         print(global_df.to_string(index=False))
         print(scenario_df.head().to_string(index=False))
@@ -162,6 +185,7 @@ def main() -> None:
             use_warm_starts=not args.disable_warm_start,
             write_outputs=not args.skip_patient_outputs,
             graph_file=Path(args.graph_file) if args.graph_file else None,
+            missing_cna_policy=args.missing_cna_policy,
         )
         print(summary)
         return
@@ -181,6 +205,8 @@ def main() -> None:
         use_warm_starts=not args.disable_warm_start,
         write_outputs=not args.skip_patient_outputs,
         graph_file=Path(args.graph_file) if args.graph_file else None,
+        missing_cna_policy=args.missing_cna_policy,
+        workers=args.workers,
     )
     print(summary_df.head().to_string(index=False))
 
