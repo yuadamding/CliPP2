@@ -81,6 +81,13 @@ def process_one_file_bundle(
         best_evaluation = evaluate_fit_against_simulation(fit=best_fit, data=data, simulation_root=simulation_root)
 
     elapsed_seconds = float(perf_counter() - start_time)
+    reported_selected_ari = (
+        float(selection_result.selected_ari)
+        if selection_result.selected_ari is not None
+        else float(best_evaluation.ari)
+        if best_evaluation is not None
+        else None
+    )
 
     summary = {
         "tumor_id": data.tumor_id,
@@ -180,7 +187,7 @@ def process_one_file_bundle(
         "selection_hits_upper_boundary": bool(selection_result.selection_hits_upper_boundary),
         "selection_boundary_unresolved": bool(selection_result.selection_boundary_unresolved),
         "selection_optimum_resolved": bool(selection_result.selection_optimum_resolved),
-        "selected_ari": np.nan if selection_result.selected_ari is None else float(selection_result.selected_ari),
+        "selected_ari": np.nan if reported_selected_ari is None else float(reported_selected_ari),
         "best_ari": np.nan if selection_result.best_ari is None else float(selection_result.best_ari),
         "best_ari_all_evaluated": np.nan
         if getattr(selection_result, "best_ari_all_evaluated", None) is None
@@ -282,7 +289,7 @@ def process_one_file_bundle(
         "dtype": str(best_fit.dtype),
         "graph_name": str(best_fit.graph_name),
         "summary_tol": float(best_fit.summary_tol),
-        "ARI": np.nan if selection_result.selected_ari is None else float(selection_result.selected_ari),
+        "ARI": np.nan if reported_selected_ari is None else float(reported_selected_ari),
         "cp_rmse": np.nan if best_evaluation is None else float(best_evaluation.cp_rmse),
         "multiplicity_f1": np.nan if best_evaluation is None else float(best_evaluation.multiplicity_f1),
         "estimated_clonal_fraction": np.nan
