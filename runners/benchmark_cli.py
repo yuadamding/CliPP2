@@ -8,6 +8,7 @@ from ..sim.generation import parse_float_list, parse_int_list
 from .benchmark_common import _aggregate_simple, _fit_options_from_args, _parse_lambda_grid
 from .benchmark_cohort import run_single_region_cohort_benchmark
 from .benchmark_mass import MassiveMultiregionBenchmarkConfig, run_massive_multiregion_benchmark
+from .selection import LAMBDA_GRID_MODES
 
 
 def _add_shared_fit_args(
@@ -96,7 +97,7 @@ def build_single_region_benchmark_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-grid", default=None, help="Optional comma-separated lambda grid.")
     parser.add_argument(
         "--lambda-grid-mode",
-        choices=["standard", "dense", "dense_no_zero", "coarse_no_zero", "ultra_dense_no_zero"],
+        choices=list(LAMBDA_GRID_MODES),
         default="dense_no_zero",
         help="Automatic lambda grid template used when --lambda-grid is not provided.",
     )
@@ -145,7 +146,7 @@ def build_mass_multiregion_benchmark_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-grid", default=None, help="Optional comma-separated lambda grid.")
     parser.add_argument(
         "--lambda-grid-mode",
-        choices=["standard", "dense", "dense_no_zero", "coarse_no_zero", "ultra_dense_no_zero"],
+        choices=list(LAMBDA_GRID_MODES),
         default="dense_no_zero",
         help="Automatic lambda grid template used when --lambda-grid is not provided.",
     )
@@ -224,3 +225,7 @@ __all__ = [
     "main_mass_multiregion_benchmark",
     "main_single_region_benchmark",
 ]
+
+
+if __name__ == "__main__":
+    main()

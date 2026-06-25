@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from . import FitOptions, process_one_file, run_directory, run_simulation_benchmark
+from .runners.selection import LAMBDA_GRID_MODES
 
 
 def _parse_lambda_grid(value: str | None) -> list[float] | None:
@@ -44,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--lambda-grid-mode",
-        choices=["standard", "dense", "dense_no_zero", "coarse_no_zero", "ultra_dense_no_zero"],
+        choices=list(LAMBDA_GRID_MODES),
         default="dense_no_zero",
         help="Automatic lambda grid template used when --lambda-grid is not provided.",
     )
@@ -212,3 +213,7 @@ def main() -> None:
 
 
 __all__ = ["build_parser", "main"]
+
+
+if __name__ == "__main__":
+    main()

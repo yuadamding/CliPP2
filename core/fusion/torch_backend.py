@@ -317,6 +317,64 @@ def stationarity_residual_torch(
     return residual
 
 
+def graph_fusion_kkt_residual_from_grad_torch(
+    *,
+    phi: torch.Tensor,
+    grad_smooth: torch.Tensor,
+    dual_kkt: torch.Tensor | None,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    edge_w: torch.Tensor,
+    lambda_value: float,
+    atol: float,
+) -> dict[str, float]:
+    if dual_kkt is None or tuple(dual_kkt.shape) != (int(edge_u.numel()), int(phi.shape[1])):
+        dual = torch.zeros((int(edge_u.numel()), int(phi.shape[1])), dtype=phi.dtype, device=phi.device)
+    else:
+        dual = dual_kkt.to(dtype=phi.dtype, device=phi.device)
+
+    adj = torch.zeros_like(phi)
+    if edge_u.numel() > 0 and lambda_value > 0.0:
+        adj.index_add_(0, edge_u, dual)
+        adj.index_add_(0, edge_v, -dual)
+    total_grad = grad_smooth + adj
+    stat = stationarity_residual_torch(total_grad=total_grad, phi=phi, lower=lower, upper=upper, atol=atol)
+    stat_denom = 1.0 + torch.linalg.norm(grad_smooth) + torch.linalg.norm(adj)
+    stationarity_residual = float((torch.linalg.norm(stat) / stat_denom).item())
+
+    if edge_u.numel() == 0 or lambda_value <= 0.0:
+        edge_subgradient_residual = 0.0
+        dual_ball_residual = 0.0
+    else:
+        diff = phi.index_select(0, edge_u) - phi.index_select(0, edge_v)
+        diff_norm = torch.linalg.norm(diff, dim=1)
+        dual_norm = torch.linalg.norm(dual, dim=1)
+        radius = float(lambda_value) * edge_w
+        edge_resid = torch.zeros_like(diff_norm)
+        active = diff_norm > float(atol)
+        if torch.any(active):
+            target = radius[active, None] * diff[active] / diff_norm[active, None].clamp_min(float(atol))
+            edge_resid[active] = torch.linalg.norm(dual[active] - target, dim=1)
+
+        ball_resid = torch.clamp(dual_norm - radius, min=0.0)
+        if torch.any(~active):
+            edge_resid[~active] = ball_resid[~active]
+
+        denom = 1.0 + float(torch.max(radius).item()) if radius.numel() else 1.0
+        edge_subgradient_residual = float((torch.max(edge_resid) / denom).item()) if edge_resid.numel() else 0.0
+        dual_ball_residual = float((torch.max(ball_resid) / denom).item()) if ball_resid.numel() else 0.0
+
+    return {
+        "stationarity_residual": stationarity_residual,
+        "edge_subgradient_residual": edge_subgradient_residual,
+        "dual_ball_residual": dual_ball_residual,
+        "box_residual": stationarity_residual,
+        "kkt_residual": max(stationarity_residual, edge_subgradient_residual),
+    }
+
+
 def inner_kkt_residual_torch(
     *,
     phi: torch.Tensor,
@@ -331,32 +389,19 @@ def inner_kkt_residual_torch(
     edge_w: torch.Tensor,
     atol: float,
 ) -> float:
-    if edge_u.numel() == 0 or lambda_value <= 0.0:
-        total_grad = h * (phi - U)
-        stat = stationarity_residual_torch(total_grad=total_grad, phi=phi, lower=lower, upper=upper, atol=atol)
-        return float((torch.linalg.norm(stat) / (1.0 + torch.linalg.norm(phi))).item())
-
-    adj = torch.zeros_like(phi)
-    adj.index_add_(0, edge_u, dual)
-    adj.index_add_(0, edge_v, -dual)
-    total_grad = h * (phi - U) + adj
-    stat = stationarity_residual_torch(total_grad=total_grad, phi=phi, lower=lower, upper=upper, atol=atol)
-    stat_resid = float((torch.linalg.norm(stat) / (1.0 + torch.linalg.norm(phi))).item())
-
-    diff = phi.index_select(0, edge_u) - phi.index_select(0, edge_v)
-    diff_norm = torch.linalg.norm(diff, dim=1)
-    dual_norm = torch.linalg.norm(dual, dim=1)
-    radius = float(lambda_value) * edge_w
-    edge_resid = torch.zeros_like(diff_norm)
-    active = diff_norm > float(atol)
-    if torch.any(active):
-        target = radius[active, None] * diff[active] / diff_norm[active, None].clamp_min(float(atol))
-        edge_resid[active] = torch.linalg.norm(dual[active] - target, dim=1)
-    if torch.any(~active):
-        edge_resid[~active] = torch.clamp(dual_norm[~active] - radius[~active], min=0.0)
-    denom = 1.0 + float(torch.max(radius).item()) if radius.numel() else 1.0
-    edge_resid_value = float((torch.max(edge_resid) / denom).item()) if edge_resid.numel() else 0.0
-    return max(stat_resid, edge_resid_value)
+    diag = graph_fusion_kkt_residual_from_grad_torch(
+        phi=phi,
+        grad_smooth=h * (phi - U),
+        dual_kkt=dual,
+        lower=lower,
+        upper=upper,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        edge_w=edge_w,
+        lambda_value=lambda_value,
+        atol=atol,
+    )
+    return float(diag["kkt_residual"])
 
 
 def solve_majorized_subproblem_pdhg_torch(
@@ -376,14 +421,15 @@ def solve_majorized_subproblem_pdhg_torch(
     max_iter: int,
     phi_start: torch.Tensor,
     dual_start: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, int, bool, float]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
     phi = torch.minimum(torch.maximum(phi_start.to(dtype=runtime.dtype, device=runtime.device), lower), upper)
     if lambda_value <= 0.0 or edge_u.numel() == 0:
         projected = torch.minimum(torch.maximum(U, lower), upper)
         total_grad = h * (projected - U)
         stat = stationarity_residual_torch(total_grad=total_grad, phi=projected, lower=lower, upper=upper, atol=tol)
         residual = float((torch.linalg.norm(stat) / (1.0 + torch.linalg.norm(projected))).item())
-        return projected, torch.zeros((0, phi.shape[1]), dtype=runtime.dtype, device=runtime.device), 1, residual <= tol, residual
+        empty_dual = torch.zeros((0, phi.shape[1]), dtype=runtime.dtype, device=runtime.device)
+        return projected, empty_dual, empty_dual, 1, residual <= tol, residual
 
     if dual_start is not None and tuple(dual_start.shape) == (int(edge_u.numel()), int(phi.shape[1])):
         dual = dual_start.to(dtype=runtime.dtype, device=runtime.device)
@@ -445,7 +491,7 @@ def solve_majorized_subproblem_pdhg_torch(
             converged = True
             break
 
-    return phi, dual, iterations, converged, float(last_residual)
+    return phi, dual, dual, iterations, converged, float(last_residual)
 
 
 def _complete_graph_isotropic_box_qp_torch(
@@ -499,14 +545,15 @@ def solve_majorized_subproblem_alm_torch(
     max_iter: int,
     phi_start: torch.Tensor,
     dual_start: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, int, bool, float]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
     phi = torch.minimum(torch.maximum(phi_start.to(dtype=runtime.dtype, device=runtime.device), lower), upper)
     if lambda_value <= 0.0 or edge_u.numel() == 0:
         projected = torch.minimum(torch.maximum(U, lower), upper)
         total_grad = h * (projected - U)
         stat = stationarity_residual_torch(total_grad=total_grad, phi=projected, lower=lower, upper=upper, atol=tol)
         residual = float((torch.linalg.norm(stat) / (1.0 + torch.linalg.norm(projected))).item())
-        return projected, torch.zeros((0, phi.shape[1]), dtype=runtime.dtype, device=runtime.device), 1, residual <= tol, residual
+        empty_dual = torch.zeros((0, phi.shape[1]), dtype=runtime.dtype, device=runtime.device)
+        return projected, empty_dual, empty_dual, 1, residual <= tol, residual
 
     if dual_start is not None and tuple(dual_start.shape) == (int(edge_u.numel()), int(phi.shape[1])):
         scaled_dual = dual_start.to(dtype=runtime.dtype, device=runtime.device)
@@ -520,6 +567,7 @@ def solve_majorized_subproblem_alm_torch(
     iterations = 0
     last_residual = np.inf
     z = phi.index_select(0, edge_u) - phi.index_select(0, edge_v)
+    actual_dual = rho * scaled_dual
 
     for inner_iter in range(max(int(max_iter), 10)):
         iterations = inner_iter + 1
@@ -579,4 +627,4 @@ def solve_majorized_subproblem_alm_torch(
             converged = True
             break
 
-    return phi, scaled_dual, iterations, converged, float(last_residual)
+    return phi, scaled_dual, actual_dual, iterations, converged, float(last_residual)

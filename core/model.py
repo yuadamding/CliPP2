@@ -48,6 +48,41 @@ class FitResult:
     dtype: str
     graph_name: str
     summary_tol: float
+    inner_kkt_residual: float
+    accepted_inner_kkt_residual: float
+    last_attempted_inner_kkt_residual: float
+    best_attempted_inner_kkt_residual: float
+    last_attempted_objective_gap: float
+    best_attempted_objective_gap: float
+    last_attempted_surrogate_gap: float
+    best_attempted_surrogate_gap: float
+    last_attempted_inner_model_gap: float
+    best_attempted_inner_model_gap: float
+    last_attempted_em_envelope_gap: float
+    best_attempted_em_envelope_gap: float
+    outer_stationarity_residual: float
+    outer_edge_subgradient_residual: float
+    outer_dual_ball_residual: float
+    outer_box_residual: float
+    fixed_objective_kkt_residual: float
+    converged_inner: bool
+    converged_outer: bool
+    final_relative_objective_change: float
+    final_step_residual: float
+    accepted_outer_steps: int
+    accepted_full_steps: int
+    accepted_damped_steps: int
+    attempted_outer_steps: int
+    failed_majorization_checks: int
+    failed_inner_model_checks: int
+    failed_em_envelope_checks: int
+    failed_descent_checks: int
+    failed_nonfinite_checks: int
+    mm_consistency_violations: int
+    accepted_step_type: str
+    last_reject_reason: str
+    failure_reason: str
+    selection_eligible: bool
     history: list[float] = field(default_factory=list)
     bic: float | None = None
     classic_bic: float | None = None
@@ -115,6 +150,41 @@ def fit_single_stage_em(
         dtype=str(artifacts.dtype),
         graph_name=str(artifacts.graph_name),
         summary_tol=float(artifacts.summary_tol),
+        inner_kkt_residual=float(artifacts.inner_kkt_residual),
+        accepted_inner_kkt_residual=float(artifacts.accepted_inner_kkt_residual),
+        last_attempted_inner_kkt_residual=float(artifacts.last_attempted_inner_kkt_residual),
+        best_attempted_inner_kkt_residual=float(artifacts.best_attempted_inner_kkt_residual),
+        last_attempted_objective_gap=float(artifacts.last_attempted_objective_gap),
+        best_attempted_objective_gap=float(artifacts.best_attempted_objective_gap),
+        last_attempted_surrogate_gap=float(artifacts.last_attempted_surrogate_gap),
+        best_attempted_surrogate_gap=float(artifacts.best_attempted_surrogate_gap),
+        last_attempted_inner_model_gap=float(artifacts.last_attempted_inner_model_gap),
+        best_attempted_inner_model_gap=float(artifacts.best_attempted_inner_model_gap),
+        last_attempted_em_envelope_gap=float(artifacts.last_attempted_em_envelope_gap),
+        best_attempted_em_envelope_gap=float(artifacts.best_attempted_em_envelope_gap),
+        outer_stationarity_residual=float(artifacts.outer_stationarity_residual),
+        outer_edge_subgradient_residual=float(artifacts.outer_edge_subgradient_residual),
+        outer_dual_ball_residual=float(artifacts.outer_dual_ball_residual),
+        outer_box_residual=float(artifacts.outer_box_residual),
+        fixed_objective_kkt_residual=float(artifacts.fixed_objective_kkt_residual),
+        converged_inner=bool(artifacts.converged_inner),
+        converged_outer=bool(artifacts.converged_outer),
+        final_relative_objective_change=float(artifacts.final_relative_objective_change),
+        final_step_residual=float(artifacts.final_step_residual),
+        accepted_outer_steps=int(artifacts.accepted_outer_steps),
+        accepted_full_steps=int(artifacts.accepted_full_steps),
+        accepted_damped_steps=int(artifacts.accepted_damped_steps),
+        attempted_outer_steps=int(artifacts.attempted_outer_steps),
+        failed_majorization_checks=int(artifacts.failed_majorization_checks),
+        failed_inner_model_checks=int(artifacts.failed_inner_model_checks),
+        failed_em_envelope_checks=int(artifacts.failed_em_envelope_checks),
+        failed_descent_checks=int(artifacts.failed_descent_checks),
+        failed_nonfinite_checks=int(artifacts.failed_nonfinite_checks),
+        mm_consistency_violations=int(artifacts.mm_consistency_violations),
+        accepted_step_type=str(artifacts.accepted_step_type),
+        last_reject_reason=str(artifacts.last_reject_reason),
+        failure_reason=str(artifacts.failure_reason),
+        selection_eligible=bool(artifacts.selection_eligible),
         history=list(artifacts.history),
     )
 

@@ -1,8 +1,43 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from ..io.data import TumorData
+
+
+FIXED_LAMBDA_GRID_MODES = (
+    "standard",
+    "dense",
+    "dense_no_zero",
+    "coarse_no_zero",
+    "ultra_dense_no_zero",
+)
+CV_STABILITY_LAMBDA_GRID_MODES = (
+    "adaptive_cv",
+    "adaptive_cv_stability",
+    "adaptive_cv_stability_one_se",
+)
+ADAPTIVE_LAMBDA_GRID_MODES = ("adaptive_ebic_path",) + CV_STABILITY_LAMBDA_GRID_MODES
+LAMBDA_GRID_MODES = FIXED_LAMBDA_GRID_MODES + ADAPTIVE_LAMBDA_GRID_MODES
+
+
+@dataclass(frozen=True)
+class LambdaBracket:
+    lambda_min: float
+    lambda_eq: float
+    lambda_full: float
+    anchors: list[float]
+    diagnostics: dict[str, float]
+
+
+def is_adaptive_lambda_grid_mode(mode: str) -> bool:
+    return str(mode).strip().lower() in ADAPTIVE_LAMBDA_GRID_MODES
+
+
+def is_cv_stability_lambda_grid_mode(mode: str) -> bool:
+    return str(mode).strip().lower() in CV_STABILITY_LAMBDA_GRID_MODES
 
 
 def _default_lambda_ratios(mode: str) -> np.ndarray:
@@ -27,6 +62,8 @@ def default_lambda_grid(
     mode: str = "dense_no_zero",
 ) -> list[float]:
     del data
+    if is_adaptive_lambda_grid_mode(mode):
+        raise ValueError(f"{mode} requires data-adaptive lambda anchors, not a fixed default grid.")
     grid = _default_lambda_ratios(mode=mode)
     return [float(value) for value in np.unique(np.round(grid, 6))]
 
@@ -56,7 +93,14 @@ def compute_extended_bic(
 
 
 __all__ = [
+    "ADAPTIVE_LAMBDA_GRID_MODES",
+    "CV_STABILITY_LAMBDA_GRID_MODES",
+    "FIXED_LAMBDA_GRID_MODES",
+    "LAMBDA_GRID_MODES",
+    "LambdaBracket",
     "compute_classic_bic",
     "compute_extended_bic",
     "default_lambda_grid",
+    "is_adaptive_lambda_grid_mode",
+    "is_cv_stability_lambda_grid_mode",
 ]

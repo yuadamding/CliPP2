@@ -63,23 +63,23 @@ def recommend_settings_from_regime(
 
     if regime.num_regions <= 2 or regime.depth_scale <= 300.0 or regime.num_mutations <= 800:
         return RecommendedSettings(
-            profile_name="pairwise_fusion_ultra",
-            lambda_grid_mode="ultra_dense_no_zero",
+            profile_name="pairwise_fusion_adaptive_cv_stability",
+            lambda_grid_mode="adaptive_cv_stability",
             bic_df_scale=8.0,
             bic_cluster_penalty=4.0,
         )
 
     if regime.num_regions >= 10 or regime.num_mutations >= 2500:
         return RecommendedSettings(
-            profile_name="pairwise_fusion_dense",
-            lambda_grid_mode="dense_no_zero",
+            profile_name="pairwise_fusion_adaptive_cv_stability_large",
+            lambda_grid_mode="adaptive_cv_stability",
             bic_df_scale=8.0,
             bic_cluster_penalty=4.0,
         )
 
     return RecommendedSettings(
-        profile_name="pairwise_fusion_default",
-        lambda_grid_mode="dense_no_zero",
+        profile_name="pairwise_fusion_adaptive_cv_stability_default",
+        lambda_grid_mode="adaptive_cv_stability",
         bic_df_scale=8.0,
         bic_cluster_penalty=4.0,
     )

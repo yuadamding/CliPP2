@@ -35,6 +35,11 @@ from .io import (
 )
 from .metrics import evaluate_fit_against_simulation
 from .runners import (
+    ADAPTIVE_LAMBDA_GRID_MODES,
+    CV_STABILITY_LAMBDA_GRID_MODES,
+    FIXED_LAMBDA_GRID_MODES,
+    LAMBDA_GRID_MODES,
+    LambdaBracket,
     MassiveMultiregionBenchmarkConfig,
     ModelSelectionResult,
     TumorRegime,
@@ -58,6 +63,11 @@ __all__ = [
     "ConversionConfig",
     "FitOptions",
     "FitResult",
+    "ADAPTIVE_LAMBDA_GRID_MODES",
+    "CV_STABILITY_LAMBDA_GRID_MODES",
+    "FIXED_LAMBDA_GRID_MODES",
+    "LAMBDA_GRID_MODES",
+    "LambdaBracket",
     "MassiveMultiregionBenchmarkConfig",
     "ModelSelectionResult",
     "PairwiseFusionGraph",

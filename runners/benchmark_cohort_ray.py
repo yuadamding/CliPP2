@@ -34,14 +34,23 @@ from .model_selection import (
     ORACLE_ULTRA_DENSE_POINTS,
 )
 from .pipeline import process_one_file_bundle
+from .selection import LAMBDA_GRID_MODES, is_adaptive_lambda_grid_mode
 
 
 _RESUME_DERIVED_CANDIDATE_COLUMNS = {
     "selected_lambda",
+    "selected_lambda_representative",
+    "selected_lambda_left",
+    "selected_lambda_right",
+    "selected_lambda_interval_log10_width",
+    "selected_validation_loglik_mean",
+    "selected_validation_loglik_se",
+    "selected_instability",
     "selection_metric_value",
     "selection_lambda_min",
     "selection_lambda_max",
     "selection_lambda_count",
+    "selected_ari",
     "best_ari",
     "ari_optimal_lambda_min",
     "ari_optimal_lambda_max",
@@ -268,11 +277,10 @@ def _compute_top_candidates(candidate_df: pd.DataFrame, *, top_k: int = 5) -> pd
             ordered = group.sort_values(["bic", "lambda"], ascending=[True, True], na_position="last")
         return ordered.head(top_k)
 
-    return (
-        candidate_df.groupby("tumor_id", group_keys=False)
-        .apply(_top_group)
-        .reset_index(drop=True)
-    )
+    top_groups = [_top_group(group) for _, group in candidate_df.groupby("tumor_id", sort=False)]
+    if not top_groups:
+        return candidate_df.iloc[0:0].copy()
+    return pd.concat(top_groups, ignore_index=True)
 
 
 def _compute_near_best_candidates(candidate_df: pd.DataFrame, *, ari_tol: float = 0.01) -> pd.DataFrame:
@@ -309,6 +317,7 @@ def _enrich_candidate_landscape(candidate_df: pd.DataFrame, best_df: pd.DataFram
             "selection_lambda_min",
             "selection_lambda_max",
             "selection_lambda_count",
+            "selected_ari",
             "best_ari",
             "ari_optimal_lambda_min",
             "ari_optimal_lambda_max",
@@ -323,6 +332,9 @@ def _enrich_candidate_landscape(candidate_df: pd.DataFrame, best_df: pd.DataFram
             "tested_lambda_min",
             "tested_lambda_max",
             "tested_lambda_count",
+            "selected_validation_loglik_mean",
+            "selected_validation_loglik_se",
+            "selected_instability",
         ]
         if column in best_df.columns
     ]
@@ -594,7 +606,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--lambda-grid-mode",
-        choices=["standard", "dense", "dense_no_zero", "coarse_no_zero", "ultra_dense_no_zero"],
+        choices=list(LAMBDA_GRID_MODES),
         default="dense_no_zero",
         help="Automatic lambda grid template when --lambda-grid is not provided.",
     )
@@ -734,6 +746,8 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
             if str(args.selection_score).strip().lower() == "oracle_ari" and not bool(args.write_tumor_outputs)
             else "heavy_dynamic_refinement"
             if str(args.selection_score).strip().lower() == "oracle_ari"
+            else "adaptive_path_refinement"
+            if args.lambda_grid is None and is_adaptive_lambda_grid_mode(str(args.lambda_grid_mode))
             else "non_oracle_grid"
         ),
         "oracle_candidate_evaluation_mode": "ari_only_during_search_full_on_selected_summary",
@@ -858,3 +872,7 @@ __all__ = [
     "main",
     "run_ray_cohort_benchmark",
 ]
+
+
+if __name__ == "__main__":
+    main()

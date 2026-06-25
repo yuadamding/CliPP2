@@ -46,6 +46,41 @@ class FusionFitArtifacts:
     graph_name: str
     summary_tol: float
     history: list[float]
+    inner_kkt_residual: float
+    accepted_inner_kkt_residual: float
+    last_attempted_inner_kkt_residual: float
+    best_attempted_inner_kkt_residual: float
+    last_attempted_objective_gap: float
+    best_attempted_objective_gap: float
+    last_attempted_surrogate_gap: float
+    best_attempted_surrogate_gap: float
+    last_attempted_inner_model_gap: float
+    best_attempted_inner_model_gap: float
+    last_attempted_em_envelope_gap: float
+    best_attempted_em_envelope_gap: float
+    outer_stationarity_residual: float
+    outer_edge_subgradient_residual: float
+    outer_dual_ball_residual: float
+    outer_box_residual: float
+    fixed_objective_kkt_residual: float
+    converged_inner: bool
+    converged_outer: bool
+    final_relative_objective_change: float
+    final_step_residual: float
+    accepted_outer_steps: int
+    accepted_full_steps: int
+    accepted_damped_steps: int
+    attempted_outer_steps: int
+    failed_majorization_checks: int
+    failed_inner_model_checks: int
+    failed_em_envelope_checks: int
+    failed_descent_checks: int
+    failed_nonfinite_checks: int
+    mm_consistency_violations: int
+    accepted_step_type: str
+    last_reject_reason: str
+    failure_reason: str
+    selection_eligible: bool
 
 
 @dataclass(frozen=True)

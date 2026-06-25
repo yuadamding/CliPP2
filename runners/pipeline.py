@@ -95,6 +95,40 @@ def process_one_file_bundle(
         "settings_profile": selection_result.profile_name,
         "selection_method": selection_result.selection_method,
         "selection_score_name": str(best_fit.selection_score_name or selection_score),
+        "lambda_search_mode": str(selection_result.lambda_search_mode),
+        "selected_lambda_representative": float(selection_result.selected_lambda_representative)
+        if selection_result.selected_lambda_representative is not None
+        else np.nan,
+        "selected_lambda_left": np.nan
+        if selection_result.selected_lambda_left is None
+        else float(selection_result.selected_lambda_left),
+        "selected_lambda_right": np.nan
+        if selection_result.selected_lambda_right is None
+        else float(selection_result.selected_lambda_right),
+        "selected_lambda_interval_log10_width": np.nan
+        if selection_result.selected_lambda_interval_log10_width is None
+        else float(selection_result.selected_lambda_interval_log10_width),
+        "lambda_bracket_min": np.nan
+        if selection_result.lambda_bracket_min is None
+        else float(selection_result.lambda_bracket_min),
+        "lambda_bracket_eq": np.nan
+        if selection_result.lambda_bracket_eq is None
+        else float(selection_result.lambda_bracket_eq),
+        "lambda_bracket_full": np.nan
+        if selection_result.lambda_bracket_full is None
+        else float(selection_result.lambda_bracket_full),
+        "adaptive_refinement_rounds_completed": int(selection_result.adaptive_refinement_rounds_completed),
+        "selected_validation_loglik_mean": np.nan
+        if selection_result.selected_validation_loglik_mean is None
+        else float(selection_result.selected_validation_loglik_mean),
+        "selected_validation_loglik_se": np.nan
+        if selection_result.selected_validation_loglik_se is None
+        else float(selection_result.selected_validation_loglik_se),
+        "selected_instability": np.nan
+        if selection_result.selected_instability is None
+        else float(selection_result.selected_instability),
+        "cv_stability_replicates": int(selection_result.cv_stability_replicates),
+        "cv_stability_threshold": float(selection_result.cv_stability_threshold),
         "selection_loglik_kind": (
             "summary_clustered"
             if str(best_fit.selection_score_name or selection_score) != "oracle_ari"
@@ -120,6 +154,7 @@ def process_one_file_bundle(
         "selection_hits_upper_boundary": bool(selection_result.selection_hits_upper_boundary),
         "selection_boundary_unresolved": bool(selection_result.selection_boundary_unresolved),
         "selection_optimum_resolved": bool(selection_result.selection_optimum_resolved),
+        "selected_ari": np.nan if selection_result.selected_ari is None else float(selection_result.selected_ari),
         "best_ari": np.nan if selection_result.best_ari is None else float(selection_result.best_ari),
         "best_converged_ari": np.nan
         if selection_result.best_converged_ari is None
@@ -156,17 +191,46 @@ def process_one_file_bundle(
         "bic_df_scale": float(selection_result.bic_df_scale),
         "bic_cluster_penalty": float(selection_result.bic_cluster_penalty),
         "converged": bool(best_fit.converged),
+        "converged_inner": bool(best_fit.converged_inner),
+        "converged_outer": bool(best_fit.converged_outer),
+        "inner_kkt_residual": float(best_fit.inner_kkt_residual),
+        "accepted_inner_kkt_residual": float(best_fit.accepted_inner_kkt_residual),
+        "last_attempted_inner_kkt_residual": float(best_fit.last_attempted_inner_kkt_residual),
+        "best_attempted_inner_kkt_residual": float(best_fit.best_attempted_inner_kkt_residual),
+        "last_attempted_objective_gap": float(best_fit.last_attempted_objective_gap),
+        "best_attempted_objective_gap": float(best_fit.best_attempted_objective_gap),
+        "last_attempted_surrogate_gap": float(best_fit.last_attempted_surrogate_gap),
+        "best_attempted_surrogate_gap": float(best_fit.best_attempted_surrogate_gap),
+        "last_attempted_inner_model_gap": float(best_fit.last_attempted_inner_model_gap),
+        "best_attempted_inner_model_gap": float(best_fit.best_attempted_inner_model_gap),
+        "last_attempted_em_envelope_gap": float(best_fit.last_attempted_em_envelope_gap),
+        "best_attempted_em_envelope_gap": float(best_fit.best_attempted_em_envelope_gap),
+        "outer_stationarity_residual": float(best_fit.outer_stationarity_residual),
+        "outer_edge_subgradient_residual": float(best_fit.outer_edge_subgradient_residual),
+        "outer_dual_ball_residual": float(best_fit.outer_dual_ball_residual),
+        "outer_box_residual": float(best_fit.outer_box_residual),
+        "fixed_objective_kkt_residual": float(best_fit.fixed_objective_kkt_residual),
+        "final_relative_objective_change": float(best_fit.final_relative_objective_change),
+        "final_step_residual": float(best_fit.final_step_residual),
+        "accepted_outer_steps": int(best_fit.accepted_outer_steps),
+        "accepted_full_steps": int(best_fit.accepted_full_steps),
+        "accepted_damped_steps": int(best_fit.accepted_damped_steps),
+        "attempted_outer_steps": int(best_fit.attempted_outer_steps),
+        "failed_majorization_checks": int(best_fit.failed_majorization_checks),
+        "failed_inner_model_checks": int(best_fit.failed_inner_model_checks),
+        "failed_em_envelope_checks": int(best_fit.failed_em_envelope_checks),
+        "failed_descent_checks": int(best_fit.failed_descent_checks),
+        "failed_nonfinite_checks": int(best_fit.failed_nonfinite_checks),
+        "mm_consistency_violations": int(best_fit.mm_consistency_violations),
+        "accepted_step_type": str(best_fit.accepted_step_type),
+        "last_reject_reason": str(best_fit.last_reject_reason),
+        "failure_reason": str(best_fit.failure_reason),
+        "selection_eligible": bool(best_fit.selection_eligible),
         "device": best_fit.device,
         "dtype": str(best_fit.dtype),
         "graph_name": str(best_fit.graph_name),
         "summary_tol": float(best_fit.summary_tol),
-        "ARI": (
-            float(best_evaluation.ari)
-            if best_evaluation is not None
-            else float(selection_result.best_ari)
-            if selection_result.best_ari is not None
-            else np.nan
-        ),
+        "ARI": np.nan if selection_result.selected_ari is None else float(selection_result.selected_ari),
         "cp_rmse": np.nan if best_evaluation is None else float(best_evaluation.cp_rmse),
         "multiplicity_f1": np.nan if best_evaluation is None else float(best_evaluation.multiplicity_f1),
         "estimated_clonal_fraction": np.nan
