@@ -1100,6 +1100,80 @@ def _lambda_interval_midpoint(left_lambda: float, right_lambda: float) -> float 
     return float(midpoint)
 
 
+def _adaptive_transition_probe_records(
+    lambda_bracket: LambdaBracket | None,
+    evaluated_lambdas: list[float] | np.ndarray,
+    *,
+    max_new: int,
+) -> list[_AdaptiveIntervalProposal]:
+    if lambda_bracket is None or int(max_new) <= 0:
+        return []
+    lambda_eq = float(lambda_bracket.lambda_eq)
+    if not np.isfinite(lambda_eq) or lambda_eq <= 0.0:
+        return []
+
+    lambda_min = max(float(lambda_bracket.lambda_min), LAMBDA_SEARCH_MIN)
+    if not np.isfinite(lambda_min) or lambda_min <= 0.0:
+        lambda_min = LAMBDA_SEARCH_MIN
+    lambda_full = float(lambda_bracket.lambda_full)
+    if not np.isfinite(lambda_full) or lambda_full <= 0.0:
+        lambda_full = lambda_eq
+    transition_upper = min(max(lambda_full, 4.0 * lambda_eq), LAMBDA_SEARCH_MAX)
+    evaluated_keys = {_canonical_lambda(value) for value in _sorted_unique_lambdas(evaluated_lambdas)}
+
+    records: list[_AdaptiveIntervalProposal] = []
+    seen = set(evaluated_keys)
+
+    def _add_probe(left_lambda: float, right_lambda: float, reason: str, priority_order: int) -> None:
+        if len(records) >= int(max_new):
+            return
+        left = float(max(left_lambda, 0.0))
+        right = float(min(max(right_lambda, 0.0), LAMBDA_SEARCH_MAX))
+        midpoint = _lambda_interval_midpoint(left, right)
+        if midpoint is None:
+            return
+        key = _canonical_lambda(midpoint)
+        if key in seen:
+            return
+        seen.add(key)
+        log_width = _lambda_interval_log10_width(left, right)
+        records.append(
+            _AdaptiveIntervalProposal(
+                lambda_value=float(midpoint),
+                left_lambda=float(left),
+                right_lambda=float(right),
+                left_candidate_id=None,
+                right_candidate_id=None,
+                priority_key=(-1, float(priority_order), 0.0, -float(log_width), 0.0),
+                reason=str(reason),
+                log_width=float(log_width),
+                partition_changed=False,
+                nonagglomerative_or_numerically_inconsistent=False,
+            )
+        )
+
+    upper_right = min(2.0 * lambda_eq, transition_upper)
+    _add_probe(
+        lambda_eq,
+        upper_right,
+        "lambda_eq_upper_transition_probe",
+        0,
+    )
+    _add_probe(
+        max(0.5 * lambda_eq, lambda_min),
+        lambda_eq,
+        "lambda_eq_lower_transition_probe",
+        1,
+    )
+    _add_probe(
+        upper_right,
+        transition_upper,
+        "lambda_eq_high_transition_probe",
+        2,
+    )
+    return records
+
+
 def _adaptive_interval_proposal_records(
     search_df: pd.DataFrame,
     *,
@@ -1930,6 +2004,61 @@ def _grid_search_selection(
         start_mode="warm_only" if adaptive_lambda_mode and use_warm_starts else "full",
         compute_summary=True,
     )
+
+    if adaptive_lambda_mode and lambda_bracket is not None:
+        remaining_transition_budget = max(
+            ADAPTIVE_PATH_MAX_CANDIDATES - len(fit_by_lambda),
+            0,
+        )
+        transition_probe_records = _adaptive_transition_probe_records(
+            lambda_bracket,
+            list(fit_by_lambda.keys()),
+            max_new=min(
+                ADAPTIVE_PATH_TRANSITION_PROBE_MAX_CANDIDATES,
+                remaining_transition_budget,
+            ),
+        )
+        if transition_probe_records:
+            transition_phi_by_lambda: dict[float, np.ndarray] = {}
+            transition_starts_by_lambda: dict[float, list[np.ndarray]] = {}
+            transition_metadata_by_lambda: dict[float, dict[str, float | int | str | bool]] = {}
+            for proposal in transition_probe_records:
+                lambda_key = _canonical_lambda(proposal.lambda_value)
+                left_fit = fit_by_lambda.get(_canonical_lambda(proposal.left_lambda))
+                right_fit = fit_by_lambda.get(_canonical_lambda(proposal.right_lambda))
+                transition_starts = [start.copy() for start in scalar_well_starts]
+                if right_fit is not None:
+                    transition_starts.insert(0, right_fit.phi.copy())
+                if left_fit is not None:
+                    transition_phi_by_lambda[lambda_key] = left_fit.phi.copy()
+                    transition_starts.insert(0, left_fit.phi.copy())
+                elif right_fit is not None:
+                    transition_phi_by_lambda[lambda_key] = right_fit.phi.copy()
+                transition_starts_by_lambda[lambda_key] = transition_starts
+                transition_metadata_by_lambda[lambda_key] = {
+                    "adaptive_interval_left_lambda": float(proposal.left_lambda),
+                    "adaptive_interval_right_lambda": float(proposal.right_lambda),
+                    "adaptive_interval_log10_width": float(proposal.log_width),
+                    "adaptive_interval_priority_class": int(proposal.priority_key[0]),
+                    "adaptive_interval_reason": str(proposal.reason),
+                    "adaptive_interval_partition_changed": bool(proposal.partition_changed),
+                    "adaptive_interval_nonagglomerative_or_numerically_inconsistent": bool(
+                        proposal.nonagglomerative_or_numerically_inconsistent
+                    ),
+                    "adaptive_transition_probe": True,
+                }
+            _evaluate_lambda_sequence(
+                [float(proposal.lambda_value) for proposal in transition_probe_records],
+                search_round=0,
+                search_phase="adaptive_transition_probe",
+                candidate_fit_options=_kkt_polish_options(effective_fit_options),
+                ari_only_evaluation=False,
+                start_mode="full",
+                compute_summary=True,
+                phi_start_by_lambda=transition_phi_by_lambda,
+                scalar_well_starts_by_lambda=transition_starts_by_lambda,
+                lambda_metadata_by_lambda=transition_metadata_by_lambda,
+            )
 
     adaptive_search_rounds_completed = 0
     adaptive_search_stop_reason = "not_applicable"
