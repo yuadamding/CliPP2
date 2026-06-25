@@ -70,6 +70,14 @@ CV_STABILITY_MAX_PATH_ROUNDS = 1
 CV_STABILITY_REFINE_PER_ROUND = 2
 CV_STABILITY_MAX_EVALUATED_LAMBDAS = 8
 CV_STABILITY_MIN_VALID_REPLICATES = 2
+KKT_POLISH_REPAIR_MULTIPLIER = 20.0
+KKT_POLISH_REPAIR_FLOOR = 2e-3
+KKT_POLISH_SCORE_WINDOW_ABS = 10.0
+KKT_POLISH_SCORE_WINDOW_REL = 0.01
+KKT_POLISH_MAX_CANDIDATES = 8
+KKT_POLISH_OUTER_MAX_ITER = 100
+KKT_POLISH_INNER_MAX_ITER = 60
+KKT_POLISH_REPAIR_CEILING = 2e-2
 
 
 @dataclass(frozen=True)
@@ -115,6 +123,24 @@ class ModelSelectionResult:
     oracle_search_stop_reason: str
     num_candidates: int
     num_converged_candidates: int
+    num_candidates_all: int
+    num_candidates_certified: int
+    num_candidates_near_kkt: int
+    num_candidates_polished: int
+    num_polish_success: int
+    num_polish_failed: int
+    selected_kkt_residual: float | None
+    best_score_all_evaluated_lambda: float | None
+    best_score_all_evaluated_kkt_residual: float | None
+    best_score_all_evaluated_selection_eligible: bool
+    best_score_certified_lambda: float | None
+    best_score_certified_kkt_residual: float | None
+    best_ari_all_evaluated: float | None
+    best_ari_certified: float | None
+    best_ari_near_kkt: float | None
+    best_ari_after_polish: float | None
+    selection_optimizer_limited: bool
+    selection_optimizer_limited_reason: str
     selection_used_convergence_fallback: bool
     lambda_search_mode: str
     selected_lambda_representative: float | None
@@ -418,6 +444,8 @@ def _evaluate_cv_stability_for_path(
         "cv_stability_score": np.nan,
         "cv_one_se_eligible": False,
         "cv_stability_eligible": False,
+        "cv_polish_attempted_replicates": 0,
+        "cv_polish_success_replicates": 0,
     }
     for column, value in metric_columns.items():
         enriched[column] = value
@@ -469,6 +497,8 @@ def _evaluate_cv_stability_for_path(
         validation_logliks: list[float] = []
         replicate_labels: list[np.ndarray] = []
         invalid_replicates = 0
+        polish_attempted_replicates = 0
+        polish_success_replicates = 0
         previous_phi: np.ndarray | None = None
         for train_data, validation_data in replicate_data:
             phi_start = previous_phi.copy() if use_warm_starts and previous_phi is not None else full_fit.phi.copy()
@@ -482,8 +512,27 @@ def _evaluate_cv_stability_for_path(
                 compute_summary=True,
             )
             if not bool(train_fit.selection_eligible):
-                invalid_replicates += 1
-                continue
+                train_kkt = float(train_fit.fixed_objective_kkt_residual)
+                if np.isfinite(train_kkt) and train_kkt <= _kkt_polish_repair_tol(float(effective_fit_options.tol)):
+                    polish_attempted_replicates += 1
+                    polished_fit = fit_single_stage_em(
+                        data=train_data,
+                        options=replace(_kkt_polish_options(effective_fit_options), lambda_value=lambda_value),
+                        phi_start=train_fit.phi.copy(),
+                        start_mode="warm_only",
+                        runtime=None,
+                        torch_data=None,
+                        compute_summary=True,
+                    )
+                    if bool(polished_fit.selection_eligible):
+                        train_fit = polished_fit
+                        polish_success_replicates += 1
+                    else:
+                        invalid_replicates += 1
+                        continue
+                else:
+                    invalid_replicates += 1
+                    continue
             validation_logliks.append(
                 _validation_loglik_for_fit(
                     train_fit,
@@ -521,6 +570,8 @@ def _evaluate_cv_stability_for_path(
             "stability_threshold": float(stability_threshold),
             "cv_stability_score": float(mean - instability),
             "cv_stability_eligible": stable,
+            "cv_polish_attempted_replicates": int(polish_attempted_replicates),
+            "cv_polish_success_replicates": int(polish_success_replicates),
         }
 
     for candidate_id, metrics in cv_results.items():
@@ -762,16 +813,237 @@ def _adaptive_score_column(normalized_score: str) -> str:
     return "bic"
 
 
+def _score_maximized(normalized_score: str) -> bool:
+    return normalized_score == "oracle_ari"
+
+
+def _kkt_polish_repair_tol(tol: float) -> float:
+    return float(max(KKT_POLISH_REPAIR_MULTIPLIER * float(tol), KKT_POLISH_REPAIR_FLOOR))
+
+
+def _kkt_polish_options(base_options: FitOptions) -> FitOptions:
+    return replace(
+        base_options,
+        outer_max_iter=max(int(base_options.outer_max_iter) * 2, KKT_POLISH_OUTER_MAX_ITER),
+        inner_max_iter=max(int(base_options.inner_max_iter) * 2, KKT_POLISH_INNER_MAX_ITER),
+        tol=max(float(base_options.tol) * 0.5, 1e-6),
+    )
+
+
+def _score_window(best_score: float) -> float:
+    if not np.isfinite(best_score):
+        return float(KKT_POLISH_SCORE_WINDOW_ABS)
+    return float(max(KKT_POLISH_SCORE_WINDOW_ABS, KKT_POLISH_SCORE_WINDOW_REL * abs(float(best_score))))
+
+
+def _score_competitive_mask(
+    scores: np.ndarray,
+    *,
+    best_score: float,
+    normalized_score: str,
+) -> np.ndarray:
+    window = _score_window(best_score)
+    if _score_maximized(normalized_score):
+        return scores >= best_score - window
+    return scores <= best_score + window
+
+
+def _score_strictly_better(score: float, reference: float, *, normalized_score: str) -> bool:
+    if not np.isfinite(score) or not np.isfinite(reference):
+        return False
+    margin = 1e-8 * (1.0 + abs(float(reference)))
+    if _score_maximized(normalized_score):
+        return bool(float(score) > float(reference) + margin)
+    return bool(float(score) < float(reference) - margin)
+
+
 def _best_candidate_rows_by_lambda(search_df: pd.DataFrame) -> pd.DataFrame:
     if search_df.empty:
         return search_df.copy()
     ranked = search_df.copy()
     ranked["_lambda_key"] = np.round(ranked["lambda"].to_numpy(dtype=float), 12)
-    ranked = ranked.sort_values(
-        ["_lambda_key", "converged", "penalized_objective", "selection_step"],
-        ascending=[True, False, True, True],
-    )
+    sort_columns = ["_lambda_key"]
+    ascending = [True]
+    if "selection_eligible" in ranked.columns:
+        sort_columns.append("selection_eligible")
+        ascending.append(False)
+    sort_columns.extend(["converged", "penalized_objective", "selection_step"])
+    ascending.extend([False, True, True])
+    ranked = ranked.sort_values(sort_columns, ascending=ascending)
     return ranked.drop_duplicates("_lambda_key", keep="first").drop(columns=["_lambda_key"]).reset_index(drop=True)
+
+
+def _annotate_polish_candidates(
+    search_df: pd.DataFrame,
+    *,
+    normalized_score: str,
+    tol: float,
+    max_candidates: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if search_df.empty:
+        return search_df.copy(), search_df.iloc[0:0].copy()
+
+    enriched = search_df.copy()
+    n_rows = int(enriched.shape[0])
+    score_column = _adaptive_score_column(normalized_score)
+    if score_column in enriched.columns:
+        scores = enriched[score_column].to_numpy(dtype=float)
+    else:
+        scores = np.full(n_rows, np.nan, dtype=float)
+    objectives = (
+        enriched["penalized_objective"].to_numpy(dtype=float)
+        if "penalized_objective" in enriched.columns
+        else np.full(n_rows, np.nan, dtype=float)
+    )
+    mm_violations = (
+        enriched["mm_consistency_violations"].to_numpy(dtype=float)
+        if "mm_consistency_violations" in enriched.columns
+        else np.zeros(n_rows, dtype=float)
+    )
+    kkt_residuals = (
+        enriched["fixed_objective_kkt_residual"].to_numpy(dtype=float)
+        if "fixed_objective_kkt_residual" in enriched.columns
+        else np.full(n_rows, np.nan, dtype=float)
+    )
+    selection_eligible = (
+        enriched["selection_eligible"].astype(bool).to_numpy(dtype=bool)
+        if "selection_eligible" in enriched.columns
+        else enriched["converged"].astype(bool).to_numpy(dtype=bool)
+        if "converged" in enriched.columns
+        else np.zeros(n_rows, dtype=bool)
+    )
+    provisional = np.isfinite(objectives) & np.isfinite(scores) & (mm_violations <= 0.0)
+    failed = provisional & ~selection_eligible
+    certified = provisional & selection_eligible
+    repair_tol = _kkt_polish_repair_tol(tol)
+    near_kkt = failed & np.isfinite(kkt_residuals) & (kkt_residuals <= repair_tol)
+    repairable_kkt = failed & np.isfinite(kkt_residuals) & (kkt_residuals <= KKT_POLISH_REPAIR_CEILING)
+
+    score_competitive = np.zeros(n_rows, dtype=bool)
+    if np.any(provisional):
+        certified_scores = scores[certified & np.isfinite(scores)]
+        if certified_scores.size:
+            best_score = float(np.max(certified_scores) if _score_maximized(normalized_score) else np.min(certified_scores))
+        else:
+            provisional_scores = scores[provisional & np.isfinite(scores)]
+            best_score = (
+                float(np.max(provisional_scores))
+                if _score_maximized(normalized_score)
+                else float(np.min(provisional_scores))
+            )
+        score_competitive = repairable_kkt & _score_competitive_mask(
+            scores,
+            best_score=best_score,
+            normalized_score=normalized_score,
+        )
+
+    partition_diff = np.zeros(n_rows, dtype=bool)
+    if np.any(certified) and "partition_signature" in enriched.columns:
+        certified_df = enriched.loc[certified].copy()
+        certified_df["_score_for_sort"] = certified_df[score_column].astype(float) if score_column in certified_df.columns else np.nan
+        certified_df = certified_df.sort_values(
+            ["_score_for_sort", "lambda", "selection_step"],
+            ascending=[not _score_maximized(normalized_score), True, True],
+            na_position="last",
+        )
+        best_signature = str(certified_df.iloc[0].get("partition_signature", ""))
+        partition_values = enriched["partition_signature"].astype(str).to_numpy()
+        partition_diff = failed & (partition_values != best_signature)
+
+    boundary_neighbor = np.zeros(n_rows, dtype=bool)
+    if "_candidate_id" in enriched.columns and np.any(certified):
+        id_to_index = {
+            int(candidate_id): int(pos)
+            for pos, candidate_id in enumerate(enriched["_candidate_id"].astype(int).tolist())
+        }
+        path_df = _best_candidate_rows_by_lambda(enriched).sort_values("lambda").reset_index(drop=True)
+        for idx in range(path_df.shape[0]):
+            current = path_df.iloc[idx]
+            if not bool(current.get("selection_eligible", current.get("converged", False))):
+                continue
+            current_score = float(current.get(score_column, np.nan))
+            for neighbor_idx in (idx - 1, idx + 1):
+                if neighbor_idx < 0 or neighbor_idx >= path_df.shape[0]:
+                    continue
+                neighbor = path_df.iloc[neighbor_idx]
+                neighbor_id = int(neighbor.get("_candidate_id", -1))
+                source_pos = id_to_index.get(neighbor_id)
+                if source_pos is None or not failed[source_pos]:
+                    continue
+                neighbor_score = float(neighbor.get(score_column, np.nan))
+                better_or_close = False
+                if np.isfinite(current_score) and np.isfinite(neighbor_score):
+                    better_or_close = bool(
+                        _score_competitive_mask(
+                            np.asarray([neighbor_score], dtype=float),
+                            best_score=current_score,
+                            normalized_score=normalized_score,
+                        )[0]
+                    )
+                changed_partition = str(neighbor.get("partition_signature", "")) != str(current.get("partition_signature", ""))
+                if repairable_kkt[source_pos] and (better_or_close or changed_partition):
+                    boundary_neighbor[source_pos] = True
+
+    priority = (
+        4.0 * near_kkt.astype(float)
+        + 3.0 * score_competitive.astype(float)
+        + 2.0 * partition_diff.astype(float)
+        + 1.0 * boundary_neighbor.astype(float)
+    )
+    core_polish_trigger = near_kkt | score_competitive | boundary_neighbor
+    promising = failed & core_polish_trigger
+
+    enriched["provisional_score"] = np.where(provisional, scores, np.nan)
+    ranks = pd.Series(np.nan, index=enriched.index, dtype=float)
+    if np.any(provisional):
+        rank_values = enriched.loc[provisional, "provisional_score"].rank(
+            method="min",
+            ascending=not _score_maximized(normalized_score),
+        )
+        ranks.loc[rank_values.index] = rank_values
+    enriched["provisional_rank"] = ranks
+    enriched["near_kkt_for_polish"] = near_kkt
+    enriched["score_competitive_for_polish"] = score_competitive
+    enriched["path_boundary_for_polish"] = boundary_neighbor
+    enriched["partition_diff_for_polish"] = partition_diff
+    if "promising_for_polish" in enriched.columns:
+        previous_promising = enriched["promising_for_polish"].astype(bool).to_numpy(dtype=bool)
+    else:
+        previous_promising = np.zeros(n_rows, dtype=bool)
+    enriched["promising_for_polish"] = promising | previous_promising
+    enriched["polish_priority"] = priority
+
+    default_columns = {
+        "polish_attempted": False,
+        "polish_success": False,
+        "polish_outer_max_iter": 0,
+        "polish_inner_max_iter": 0,
+        "pre_polish_kkt_residual": np.nan,
+        "post_polish_kkt_residual": np.nan,
+        "post_polish_selection_eligible": False,
+        "optimizer_limited_candidate": False,
+    }
+    for column, default in default_columns.items():
+        if column not in enriched.columns:
+            enriched[column] = default
+    if "search_phase" in enriched.columns:
+        polish_phase = enriched["search_phase"].astype(str).eq("kkt_polish").to_numpy(dtype=bool)
+        enriched.loc[polish_phase, "polish_attempted"] = True
+        enriched.loc[polish_phase, "polish_success"] = selection_eligible[polish_phase]
+        enriched.loc[polish_phase, "post_polish_kkt_residual"] = kkt_residuals[polish_phase]
+        enriched.loc[polish_phase, "post_polish_selection_eligible"] = selection_eligible[polish_phase]
+
+    candidate_df = enriched.loc[promising].copy()
+    if candidate_df.empty or int(max_candidates) <= 0:
+        return enriched, candidate_df.iloc[0:0].copy()
+    candidate_df["_lambda_key"] = np.round(candidate_df["lambda"].to_numpy(dtype=float), 12)
+    candidate_df = candidate_df.sort_values(
+        ["polish_priority", "provisional_score", "fixed_objective_kkt_residual", "lambda", "selection_step"],
+        ascending=[False, not _score_maximized(normalized_score), True, True, True],
+        na_position="last",
+    )
+    candidate_df = candidate_df.drop_duplicates("_lambda_key", keep="first").head(int(max_candidates)).drop(columns=["_lambda_key"])
+    return enriched, candidate_df.reset_index(drop=True)
 
 
 def _adaptive_interval_proposals(
@@ -1546,6 +1818,7 @@ def _grid_search_selection(
         ari_only_evaluation: bool = False,
         start_mode: str = "full",
         compute_summary: bool = True,
+        phi_start_by_lambda: dict[float, np.ndarray] | None = None,
     ) -> None:
         nonlocal next_step
         ordered_lambdas = [
@@ -1558,7 +1831,10 @@ def _grid_search_selection(
 
         previous_phi: np.ndarray | None = None
         for lambda_value in ordered_lambdas:
-            if use_warm_starts:
+            lambda_key = _canonical_lambda(lambda_value)
+            if phi_start_by_lambda is not None and lambda_key in phi_start_by_lambda:
+                phi_start = phi_start_by_lambda[lambda_key].copy()
+            elif use_warm_starts:
                 phi_start = previous_phi.copy() if previous_phi is not None else _nearest_phi_start(lambda_value)
             else:
                 phi_start = pilot_phi.copy()
@@ -1599,7 +1875,6 @@ def _grid_search_selection(
                 row["lambda_full_residual"] = float(lambda_bracket.diagnostics.get("lambda_full_residual", np.nan))
             row["_candidate_id"] = int(len(result_entries))
             result_entries.append((fit, evaluation, row))
-            lambda_key = _canonical_lambda(lambda_value)
             incumbent = fit_by_lambda.get(lambda_key)
             if _prefer_fit_candidate(fit, incumbent):
                 fit_by_lambda[lambda_key] = fit
@@ -1880,6 +2155,93 @@ def _grid_search_selection(
                     oracle_search_stop_reason = "explicit_grid_local_polish_optimum"
 
     search_df = pd.DataFrame([row for _, _, row in result_entries]).sort_values(["lambda", "selection_step"]).reset_index(drop=True)
+    if normalized_score != "oracle_ari":
+        search_df, polish_candidate_df = _annotate_polish_candidates(
+            search_df,
+            normalized_score=normalized_score,
+            tol=float(effective_fit_options.tol),
+            max_candidates=KKT_POLISH_MAX_CANDIDATES,
+        )
+        if not polish_candidate_df.empty:
+            row_by_candidate_id = {
+                int(row["_candidate_id"]): row
+                for _, _, row in result_entries
+                if "_candidate_id" in row
+            }
+            fit_by_candidate_id = {
+                int(row["_candidate_id"]): fit
+                for fit, _, row in result_entries
+                if "_candidate_id" in row
+            }
+            polish_fit_options = _kkt_polish_options(effective_fit_options)
+            polish_source_by_lambda: dict[float, dict[str, float | int | str | bool]] = {}
+            polish_phi_by_lambda: dict[float, np.ndarray] = {}
+            for _, candidate_row in polish_candidate_df.iterrows():
+                candidate_id = int(candidate_row["_candidate_id"])
+                lambda_key = _canonical_lambda(float(candidate_row["lambda"]))
+                source_row = row_by_candidate_id.get(candidate_id)
+                source_fit = fit_by_candidate_id.get(candidate_id)
+                if source_row is None:
+                    continue
+                source_row["promising_for_polish"] = True
+                source_row["polish_attempted"] = True
+                source_row["polish_success"] = False
+                source_row["polish_outer_max_iter"] = int(polish_fit_options.outer_max_iter)
+                source_row["polish_inner_max_iter"] = int(polish_fit_options.inner_max_iter)
+                source_row["pre_polish_kkt_residual"] = float(candidate_row["fixed_objective_kkt_residual"])
+                source_row["post_polish_kkt_residual"] = np.nan
+                source_row["post_polish_selection_eligible"] = False
+                polish_source_by_lambda[lambda_key] = source_row
+                if source_fit is not None:
+                    polish_phi_by_lambda[lambda_key] = source_fit.phi.copy()
+
+            polish_lambdas = [float(value) for value in polish_candidate_df["lambda"].to_numpy(dtype=float)]
+            before_polish = len(result_entries)
+            _evaluate_lambda_sequence(
+                polish_lambdas,
+                search_round=adaptive_refinement_rounds_completed + oracle_search_rounds_completed + 1,
+                search_phase="kkt_polish",
+                allow_revisit=True,
+                candidate_fit_options=polish_fit_options,
+                ari_only_evaluation=False,
+                start_mode="warm_only" if use_warm_starts else "full",
+                compute_summary=True,
+                phi_start_by_lambda=polish_phi_by_lambda,
+            )
+            for _, _, polished_row in result_entries[before_polish:]:
+                lambda_key = _canonical_lambda(float(polished_row["lambda"]))
+                source_row = polish_source_by_lambda.get(lambda_key)
+                pre_kkt = (
+                    float(source_row.get("pre_polish_kkt_residual", np.nan))
+                    if source_row is not None
+                    else np.nan
+                )
+                post_kkt = float(polished_row["fixed_objective_kkt_residual"])
+                polish_success = bool(polished_row["selection_eligible"])
+                polished_row["promising_for_polish"] = True
+                polished_row["polish_attempted"] = True
+                polished_row["polish_success"] = polish_success
+                polished_row["polish_outer_max_iter"] = int(polish_fit_options.outer_max_iter)
+                polished_row["polish_inner_max_iter"] = int(polish_fit_options.inner_max_iter)
+                polished_row["pre_polish_kkt_residual"] = pre_kkt
+                polished_row["post_polish_kkt_residual"] = post_kkt
+                polished_row["post_polish_selection_eligible"] = polish_success
+                if source_row is not None:
+                    source_row["polish_success"] = polish_success
+                    source_row["post_polish_kkt_residual"] = post_kkt
+                    source_row["post_polish_selection_eligible"] = polish_success
+
+            search_df = (
+                pd.DataFrame([row for _, _, row in result_entries])
+                .sort_values(["lambda", "selection_step"])
+                .reset_index(drop=True)
+            )
+        search_df, _ = _annotate_polish_candidates(
+            search_df,
+            normalized_score=normalized_score,
+            tol=float(effective_fit_options.tol),
+            max_candidates=0,
+        )
     if cv_lambda_mode and normalized_score != "oracle_ari":
         search_df = _evaluate_cv_stability_for_path(
             data=data,
@@ -1917,6 +2279,7 @@ def _grid_search_selection(
         if num_selection_eligible_candidates == 0:
             raise RuntimeError(f"No KKT-certified candidates were eligible for model selection for tumor {data.tumor_id}.")
         selection_df = search_df.loc[candidate_selection_eligible_mask].copy()
+        converged_oracle_df = _oracle_candidate_frame(selection_df.copy())
         selection_used_convergence_fallback = False
 
     if selection_df.empty:
@@ -1994,6 +2357,129 @@ def _grid_search_selection(
         tied_df = selection_df.loc[selection_mask].sort_values(["bic", "lambda", "selection_step"])
         best_row = tied_df.iloc[0]
 
+    score_column = _adaptive_score_column(normalized_score)
+    all_scores = (
+        search_df[score_column].to_numpy(dtype=float)
+        if score_column in search_df.columns
+        else np.full(search_df.shape[0], np.nan, dtype=float)
+    )
+    all_objectives = (
+        search_df["penalized_objective"].to_numpy(dtype=float)
+        if "penalized_objective" in search_df.columns
+        else np.full(search_df.shape[0], np.nan, dtype=float)
+    )
+    all_mm_violations = (
+        search_df["mm_consistency_violations"].to_numpy(dtype=float)
+        if "mm_consistency_violations" in search_df.columns
+        else np.zeros(search_df.shape[0], dtype=float)
+    )
+    provisional_mask = np.isfinite(all_scores) & np.isfinite(all_objectives) & (all_mm_violations <= 0.0)
+    provisional_df = search_df.loc[provisional_mask].copy()
+    if provisional_df.empty:
+        best_score_all_row = None
+    else:
+        best_score_all_row = provisional_df.sort_values(
+            [score_column, "lambda", "selection_step"],
+            ascending=[not _score_maximized(normalized_score), True, True],
+            na_position="last",
+        ).iloc[0]
+    certified_score_df = search_df.loc[candidate_selection_eligible_mask & provisional_mask].copy()
+    if certified_score_df.empty:
+        best_score_certified_row = None
+    else:
+        best_score_certified_row = certified_score_df.sort_values(
+            [score_column, "lambda", "selection_step"],
+            ascending=[not _score_maximized(normalized_score), True, True],
+            na_position="last",
+        ).iloc[0]
+
+    num_candidates_all = int(search_df.shape[0])
+    num_candidates_certified = int(np.sum(candidate_selection_eligible_mask))
+    near_kkt_mask = (
+        search_df["near_kkt_for_polish"].astype(bool).to_numpy(dtype=bool)
+        if "near_kkt_for_polish" in search_df.columns
+        else np.zeros(search_df.shape[0], dtype=bool)
+    )
+    polish_phase_mask = (
+        search_df["search_phase"].astype(str).eq("kkt_polish").to_numpy(dtype=bool)
+        if "search_phase" in search_df.columns
+        else np.zeros(search_df.shape[0], dtype=bool)
+    )
+    polish_success_mask = polish_phase_mask & candidate_selection_eligible_mask
+    num_candidates_near_kkt = int(np.sum(near_kkt_mask))
+    num_candidates_polished = int(np.sum(polish_phase_mask))
+    num_polish_success = int(np.sum(polish_success_mask))
+    num_polish_failed = int(num_candidates_polished - num_polish_success)
+
+    selected_kkt_residual = (
+        float(best_row["fixed_objective_kkt_residual"])
+        if "fixed_objective_kkt_residual" in best_row and np.isfinite(float(best_row["fixed_objective_kkt_residual"]))
+        else None
+    )
+    selected_provisional_score = float(best_row.get(score_column, np.nan))
+    best_score_all_evaluated_lambda = None
+    best_score_all_evaluated_kkt_residual = None
+    best_score_all_evaluated_selection_eligible = False
+    if best_score_all_row is not None:
+        best_score_all_evaluated_lambda = float(best_score_all_row["lambda"])
+        best_score_all_evaluated_kkt_residual = (
+            float(best_score_all_row["fixed_objective_kkt_residual"])
+            if np.isfinite(float(best_score_all_row.get("fixed_objective_kkt_residual", np.nan)))
+            else None
+        )
+        best_score_all_evaluated_selection_eligible = bool(
+            best_score_all_row.get("selection_eligible", best_score_all_row.get("converged", False))
+        )
+    best_score_certified_lambda = None
+    best_score_certified_kkt_residual = None
+    if best_score_certified_row is not None:
+        best_score_certified_lambda = float(best_score_certified_row["lambda"])
+        best_score_certified_kkt_residual = (
+            float(best_score_certified_row["fixed_objective_kkt_residual"])
+            if np.isfinite(float(best_score_certified_row.get("fixed_objective_kkt_residual", np.nan)))
+            else None
+        )
+
+    selection_optimizer_limited = False
+    selection_optimizer_limited_reason = "none"
+    optimizer_limited_ids: set[int] = set()
+    if best_score_all_row is not None:
+        best_score_all_score = float(best_score_all_row.get(score_column, np.nan))
+        best_score_all_eligible = bool(best_score_all_row.get("selection_eligible", best_score_all_row.get("converged", False)))
+        same_lambda_polish_success = False
+        if "_candidate_id" in search_df.columns:
+            best_lambda_key = _canonical_lambda(float(best_score_all_row["lambda"]))
+            same_lambda_polish_success = bool(
+                np.any(
+                    polish_phase_mask
+                    & candidate_selection_eligible_mask
+                    & (np.round(search_df["lambda"].to_numpy(dtype=float), 12) == best_lambda_key)
+                )
+            )
+        if (
+            _score_strictly_better(best_score_all_score, selected_provisional_score, normalized_score=normalized_score)
+            and not best_score_all_eligible
+        ):
+            if same_lambda_polish_success:
+                selection_optimizer_limited_reason = "best_provisional_score_repaired_by_polish"
+            else:
+                selection_optimizer_limited = True
+                selection_optimizer_limited_reason = "best_provisional_score_failed_kkt_after_polish"
+
+    if "_candidate_id" in search_df.columns and np.isfinite(selected_provisional_score):
+        same_lambda_success_keys = {
+            _canonical_lambda(value)
+            for value in search_df.loc[polish_success_mask, "lambda"].to_numpy(dtype=float)
+        }
+        for _, candidate_row in search_df.loc[provisional_mask & ~candidate_selection_eligible_mask].iterrows():
+            candidate_score = float(candidate_row.get(score_column, np.nan))
+            candidate_lambda_key = _canonical_lambda(float(candidate_row["lambda"]))
+            if (
+                _score_strictly_better(candidate_score, selected_provisional_score, normalized_score=normalized_score)
+                and candidate_lambda_key not in same_lambda_success_keys
+            ):
+                optimizer_limited_ids.add(int(candidate_row["_candidate_id"]))
+
     best_ari_min, best_ari_max, best_ari_count, best_ari_value, ari_mask = _optimal_lambda_range(
         selection_df["ARI"].to_numpy(dtype=float),
         selection_lambda_values,
@@ -2002,6 +2488,38 @@ def _grid_search_selection(
     best_converged_ari_min, best_converged_ari_max, best_converged_ari_count, best_converged_ari_value, _ = _optimal_lambda_range(
         converged_oracle_df["ARI"].to_numpy(dtype=float) if not converged_oracle_df.empty else np.asarray([], dtype=float),
         converged_oracle_df["lambda"].to_numpy(dtype=float) if not converged_oracle_df.empty else np.asarray([], dtype=float),
+        maximize=True,
+    )
+    _, _, _, best_ari_all_evaluated, _ = _optimal_lambda_range(
+        search_df["ARI"].to_numpy(dtype=float) if "ARI" in search_df.columns else np.asarray([], dtype=float),
+        search_df["lambda"].to_numpy(dtype=float) if "lambda" in search_df.columns else np.asarray([], dtype=float),
+        maximize=True,
+    )
+    _, _, _, best_ari_certified, _ = _optimal_lambda_range(
+        search_df.loc[candidate_selection_eligible_mask, "ARI"].to_numpy(dtype=float)
+        if "ARI" in search_df.columns and np.any(candidate_selection_eligible_mask)
+        else np.asarray([], dtype=float),
+        search_df.loc[candidate_selection_eligible_mask, "lambda"].to_numpy(dtype=float)
+        if "lambda" in search_df.columns and np.any(candidate_selection_eligible_mask)
+        else np.asarray([], dtype=float),
+        maximize=True,
+    )
+    _, _, _, best_ari_near_kkt, _ = _optimal_lambda_range(
+        search_df.loc[near_kkt_mask, "ARI"].to_numpy(dtype=float)
+        if "ARI" in search_df.columns and np.any(near_kkt_mask)
+        else np.asarray([], dtype=float),
+        search_df.loc[near_kkt_mask, "lambda"].to_numpy(dtype=float)
+        if "lambda" in search_df.columns and np.any(near_kkt_mask)
+        else np.asarray([], dtype=float),
+        maximize=True,
+    )
+    _, _, _, best_ari_after_polish, _ = _optimal_lambda_range(
+        search_df.loc[polish_phase_mask, "ARI"].to_numpy(dtype=float)
+        if "ARI" in search_df.columns and np.any(polish_phase_mask)
+        else np.asarray([], dtype=float),
+        search_df.loc[polish_phase_mask, "lambda"].to_numpy(dtype=float)
+        if "lambda" in search_df.columns and np.any(polish_phase_mask)
+        else np.asarray([], dtype=float),
         maximize=True,
     )
     selection_lower_hit, selection_upper_hit = _lambda_boundary_flags(
@@ -2046,6 +2564,10 @@ def _grid_search_selection(
         final_oracle_search_stop_reason = oracle_search_stop_reason
     eligible_mask = candidate_selection_eligible_mask
     search_df["eligible_for_selection"] = eligible_mask
+    if "optimizer_limited_candidate" not in search_df.columns:
+        search_df["optimizer_limited_candidate"] = False
+    if optimizer_limited_ids and "_candidate_id" in search_df.columns:
+        search_df["optimizer_limited_candidate"] = search_df["_candidate_id"].astype(int).isin(optimizer_limited_ids)
     search_df["is_selection_optimal"] = search_df["_candidate_id"].astype(int).isin(selection_optimal_ids)
     search_df["is_ari_optimal"] = search_df["_candidate_id"].astype(int).isin(ari_optimal_ids)
     selected_candidate_id = int(best_row["_candidate_id"])
@@ -2154,6 +2676,24 @@ def _grid_search_selection(
         selected_instability=selected_instability,
         cv_stability_replicates=int(CV_STABILITY_REPLICATES if cv_lambda_mode else 0),
         cv_stability_threshold=float(CV_STABILITY_THRESHOLD),
+        num_candidates_all=num_candidates_all,
+        num_candidates_certified=num_candidates_certified,
+        num_candidates_near_kkt=num_candidates_near_kkt,
+        num_candidates_polished=num_candidates_polished,
+        num_polish_success=num_polish_success,
+        num_polish_failed=num_polish_failed,
+        selected_kkt_residual=selected_kkt_residual,
+        best_score_all_evaluated_lambda=best_score_all_evaluated_lambda,
+        best_score_all_evaluated_kkt_residual=best_score_all_evaluated_kkt_residual,
+        best_score_all_evaluated_selection_eligible=best_score_all_evaluated_selection_eligible,
+        best_score_certified_lambda=best_score_certified_lambda,
+        best_score_certified_kkt_residual=best_score_certified_kkt_residual,
+        best_ari_all_evaluated=best_ari_all_evaluated,
+        best_ari_certified=best_ari_certified,
+        best_ari_near_kkt=best_ari_near_kkt,
+        best_ari_after_polish=best_ari_after_polish,
+        selection_optimizer_limited=selection_optimizer_limited,
+        selection_optimizer_limited_reason=selection_optimizer_limited_reason,
     )
 
 

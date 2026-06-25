@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import socket
 from time import perf_counter
 import warnings
 
@@ -85,6 +86,24 @@ _RESUME_DERIVED_CANDIDATE_COLUMNS = {
     "oracle_search_stop_reason_tumor",
     "num_candidates",
     "num_converged_candidates",
+    "num_candidates_all",
+    "num_candidates_certified",
+    "num_candidates_near_kkt",
+    "num_candidates_polished",
+    "num_polish_success",
+    "num_polish_failed",
+    "selected_kkt_residual",
+    "best_score_all_evaluated_lambda",
+    "best_score_all_evaluated_kkt_residual",
+    "best_score_all_evaluated_selection_eligible",
+    "best_score_certified_lambda",
+    "best_score_certified_kkt_residual",
+    "best_ari_all_evaluated",
+    "best_ari_certified",
+    "best_ari_near_kkt",
+    "best_ari_after_polish",
+    "selection_optimizer_limited",
+    "selection_optimizer_limited_reason",
     "tested_lambda_min",
     "tested_lambda_max",
     "tested_lambda_count",
@@ -121,6 +140,42 @@ def _configure_cpu_runtime() -> None:
         pass
 
 
+def _ray_runtime_diagnostics(
+    *,
+    requested_device: str,
+    fit_options_kwargs: dict[str, object],
+) -> dict[str, float | int | str | bool]:
+    diagnostics: dict[str, float | int | str | bool] = {
+        "ray_worker_pid": int(os.getpid()),
+        "ray_worker_hostname": socket.gethostname(),
+        "requested_device": str(requested_device),
+        "fit_options_device": str(fit_options_kwargs.get("device", "")),
+        "fit_options_dtype": str(fit_options_kwargs.get("dtype", "")),
+        "CUDA_VISIBLE_DEVICES": str(os.environ.get("CUDA_VISIBLE_DEVICES", "")),
+        "torch_cuda_available": False,
+        "torch_cuda_device_count": 0,
+        "torch_cuda_current_device": -1,
+        "torch_cuda_device_name": "",
+        "torch_version": "",
+        "torch_cuda_version": "",
+    }
+    try:
+        import torch
+
+        diagnostics["torch_version"] = str(torch.__version__)
+        diagnostics["torch_cuda_version"] = str(getattr(torch.version, "cuda", "") or "")
+        cuda_available = bool(torch.cuda.is_available())
+        diagnostics["torch_cuda_available"] = cuda_available
+        diagnostics["torch_cuda_device_count"] = int(torch.cuda.device_count()) if cuda_available else 0
+        if cuda_available and int(diagnostics["torch_cuda_device_count"]) > 0:
+            current_device = int(torch.cuda.current_device())
+            diagnostics["torch_cuda_current_device"] = current_device
+            diagnostics["torch_cuda_device_name"] = str(torch.cuda.get_device_name(current_device))
+    except Exception as exc:
+        diagnostics["torch_cuda_error"] = str(exc)
+    return diagnostics
+
+
 @ray.remote(num_cpus=1)
 def _process_one_file_remote(
     *,
@@ -131,6 +186,7 @@ def _process_one_file_remote(
     lambda_grid_mode: str,
     graph_file: str | None,
     fit_options_kwargs: dict[str, object],
+    requested_device: str,
     bic_df_scale: float,
     bic_cluster_penalty: float,
     settings_profile: str,
@@ -141,6 +197,10 @@ def _process_one_file_remote(
     missing_cna_policy: str,
 ) -> dict[str, float | int | str | bool]:
     _configure_cpu_runtime()
+    runtime_diagnostics = _ray_runtime_diagnostics(
+        requested_device=requested_device,
+        fit_options_kwargs=fit_options_kwargs,
+    )
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -164,6 +224,7 @@ def _process_one_file_remote(
             graph_file=None if graph_file is None else Path(graph_file),
             missing_cna_policy=str(missing_cna_policy),
         )
+        summary.update(runtime_diagnostics)
         candidate_rows = search_df.to_dict(orient="records")
         return {
             "summary": summary,
@@ -352,6 +413,24 @@ def _enrich_candidate_landscape(candidate_df: pd.DataFrame, best_df: pd.DataFram
             "oracle_search_stop_reason",
             "num_candidates",
             "num_converged_candidates",
+            "num_candidates_all",
+            "num_candidates_certified",
+            "num_candidates_near_kkt",
+            "num_candidates_polished",
+            "num_polish_success",
+            "num_polish_failed",
+            "selected_kkt_residual",
+            "best_score_all_evaluated_lambda",
+            "best_score_all_evaluated_kkt_residual",
+            "best_score_all_evaluated_selection_eligible",
+            "best_score_certified_lambda",
+            "best_score_certified_kkt_residual",
+            "best_ari_all_evaluated",
+            "best_ari_certified",
+            "best_ari_near_kkt",
+            "best_ari_after_polish",
+            "selection_optimizer_limited",
+            "selection_optimizer_limited_reason",
             "tested_lambda_min",
             "tested_lambda_max",
             "tested_lambda_count",
@@ -841,6 +920,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
                 lambda_grid_mode=str(args.lambda_grid_mode),
                 graph_file=None if args.graph_file is None else str(args.graph_file),
                 fit_options_kwargs=fit_options_kwargs,
+                requested_device=str(args.device),
                 bic_df_scale=float(args.bic_df_scale),
                 bic_cluster_penalty=float(args.bic_cluster_penalty),
                 settings_profile=str(args.settings_profile),

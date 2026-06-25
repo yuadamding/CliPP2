@@ -140,6 +140,32 @@ def process_one_file_bundle(
         "selection_used_convergence_fallback": bool(selection_result.selection_used_convergence_fallback),
         "num_candidates": int(selection_result.num_candidates),
         "num_converged_candidates": int(selection_result.num_converged_candidates),
+        "num_candidates_all": int(getattr(selection_result, "num_candidates_all", selection_result.num_candidates)),
+        "num_candidates_certified": int(
+            getattr(selection_result, "num_candidates_certified", selection_result.num_converged_candidates)
+        ),
+        "num_candidates_near_kkt": int(getattr(selection_result, "num_candidates_near_kkt", 0)),
+        "num_candidates_polished": int(getattr(selection_result, "num_candidates_polished", 0)),
+        "num_polish_success": int(getattr(selection_result, "num_polish_success", 0)),
+        "num_polish_failed": int(getattr(selection_result, "num_polish_failed", 0)),
+        "selected_kkt_residual": np.nan
+        if getattr(selection_result, "selected_kkt_residual", None) is None
+        else float(selection_result.selected_kkt_residual),
+        "best_score_all_evaluated_lambda": np.nan
+        if getattr(selection_result, "best_score_all_evaluated_lambda", None) is None
+        else float(selection_result.best_score_all_evaluated_lambda),
+        "best_score_all_evaluated_kkt_residual": np.nan
+        if getattr(selection_result, "best_score_all_evaluated_kkt_residual", None) is None
+        else float(selection_result.best_score_all_evaluated_kkt_residual),
+        "best_score_all_evaluated_selection_eligible": bool(
+            getattr(selection_result, "best_score_all_evaluated_selection_eligible", False)
+        ),
+        "best_score_certified_lambda": np.nan
+        if getattr(selection_result, "best_score_certified_lambda", None) is None
+        else float(selection_result.best_score_certified_lambda),
+        "best_score_certified_kkt_residual": np.nan
+        if getattr(selection_result, "best_score_certified_kkt_residual", None) is None
+        else float(selection_result.best_score_certified_kkt_residual),
         "selection_metric_value": np.nan
         if selection_result.selection_metric_value is None
         else float(selection_result.selection_metric_value),
@@ -156,6 +182,22 @@ def process_one_file_bundle(
         "selection_optimum_resolved": bool(selection_result.selection_optimum_resolved),
         "selected_ari": np.nan if selection_result.selected_ari is None else float(selection_result.selected_ari),
         "best_ari": np.nan if selection_result.best_ari is None else float(selection_result.best_ari),
+        "best_ari_all_evaluated": np.nan
+        if getattr(selection_result, "best_ari_all_evaluated", None) is None
+        else float(selection_result.best_ari_all_evaluated),
+        "best_ari_certified": np.nan
+        if getattr(selection_result, "best_ari_certified", None) is None
+        else float(selection_result.best_ari_certified),
+        "best_ari_near_kkt": np.nan
+        if getattr(selection_result, "best_ari_near_kkt", None) is None
+        else float(selection_result.best_ari_near_kkt),
+        "best_ari_after_polish": np.nan
+        if getattr(selection_result, "best_ari_after_polish", None) is None
+        else float(selection_result.best_ari_after_polish),
+        "selection_optimizer_limited": bool(getattr(selection_result, "selection_optimizer_limited", False)),
+        "selection_optimizer_limited_reason": str(
+            getattr(selection_result, "selection_optimizer_limited_reason", "none")
+        ),
         "best_converged_ari": np.nan
         if selection_result.best_converged_ari is None
         else float(selection_result.best_converged_ari),
