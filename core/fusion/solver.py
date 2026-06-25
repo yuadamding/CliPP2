@@ -552,7 +552,7 @@ def _fit_from_start(
         edge_w=edge_w,
         lambda_value=lambda_value,
         atol=max(tol, 1e-8),
-        max_iter=64,
+        max_iter=96,
     )
     final_outer_diag = final_dual_audit["diag"]
     outer_kkt_certificate_status = str(final_dual_audit["status"])

@@ -66,12 +66,17 @@ def build_complete_adaptive_graph(
         )
 
     pairwise_norm = np.linalg.norm(pilot_phi[edge_u] - pilot_phi[edge_v], axis=1)
-    edge_w = float(baseline) / np.power(np.maximum(pairwise_norm, float(tau)), float(gamma))
+    raw_edge_w = 1.0 / np.power(np.maximum(pairwise_norm, float(tau)), float(gamma))
+    mean_raw_weight = float(np.mean(raw_edge_w)) if raw_edge_w.size else 1.0
+    if not np.isfinite(mean_raw_weight) or mean_raw_weight <= 0.0:
+        raise ValueError("Adaptive pairwise weights must have a positive finite mean.")
+    target_mean_weight = float(baseline) * _complete_graph_weight(num_mutations)
+    edge_w = raw_edge_w * (target_mean_weight / mean_raw_weight)
     return PairwiseFusionGraph(
         edge_u=edge_u,
         edge_v=edge_v,
         edge_w=edge_w.astype(np.float64, copy=False),
-        name=f"complete_adaptive_gamma{gamma:g}",
+        name=f"complete_adaptive_gamma{gamma:g}_mean_normalized",
         degree_bound=max(num_mutations - 1, 1),
     )
 

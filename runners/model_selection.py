@@ -10,6 +10,7 @@ import torch
 
 from ..core.model import FitOptions, FitResult, fit_single_stage_em
 from ..core.fusion_solver import (
+    PartitionRefitResult,
     cluster_labels_from_edges,
     compute_exact_observed_data_pilot,
     compute_pooled_observed_data_start,
@@ -49,21 +50,21 @@ from .settings import recommend_settings_from_data
 
 LAMBDA_SEARCH_MIN = 1e-6
 LAMBDA_SEARCH_MAX = 1e6
-ADAPTIVE_PATH_MAX_CANDIDATES = 8
-ADAPTIVE_PATH_MAX_ROUNDS = 1
-ADAPTIVE_PATH_REFINE_PER_ROUND = 1
+ADAPTIVE_PATH_MAX_CANDIDATES = 40
+ADAPTIVE_PATH_MAX_ROUNDS = 4
+ADAPTIVE_PATH_REFINE_PER_ROUND = 5
 ADAPTIVE_PATH_LOG10_WIDTH_TOL = 0.05
 ADAPTIVE_PATH_VALUE_CURVE_TOL = 1e-4
 ADAPTIVE_PATH_FULL_FUSION_MAX_ITER = 80
-ADAPTIVE_FIRST_PASS_OUTER_MAX_ITER = 20
-ADAPTIVE_FIRST_PASS_INNER_MAX_ITER = 30
+ADAPTIVE_FIRST_PASS_OUTER_MAX_ITER = 40
+ADAPTIVE_FIRST_PASS_INNER_MAX_ITER = 60
 KKT_POLISH_REPAIR_MULTIPLIER = 20.0
 KKT_POLISH_REPAIR_FLOOR = 2e-3
 KKT_POLISH_SCORE_WINDOW_ABS = 10.0
 KKT_POLISH_SCORE_WINDOW_REL = 0.01
 KKT_POLISH_MAX_CANDIDATES = 8
-KKT_POLISH_OUTER_MAX_ITER = 100
-KKT_POLISH_INNER_MAX_ITER = 60
+KKT_POLISH_OUTER_MAX_ITER = 140
+KKT_POLISH_INNER_MAX_ITER = 96
 KKT_POLISH_REPAIR_CEILING = 1e-1
 KKT_POLISH_RESCUE_MAX_CANDIDATES = 3
 
@@ -213,6 +214,20 @@ ModelSelectionResult = BICSelectionResult
 
 
 @dataclass(frozen=True)
+class _AdaptiveIntervalProposal:
+    lambda_value: float
+    left_lambda: float
+    right_lambda: float
+    left_candidate_id: int | None
+    right_candidate_id: int | None
+    priority_key: tuple[int, float, float, float, float]
+    reason: str
+    log_width: float
+    partition_changed: bool
+    nonagglomerative_or_numerically_inconsistent: bool
+
+
+@dataclass(frozen=True)
 class FullFusionKKTResult:
     residual: float
     iterations: int
@@ -263,6 +278,82 @@ def _is_bic_selection_eligible(
     )
 
 
+def _bic_selection_eligible_mask(search_df: pd.DataFrame) -> np.ndarray:
+    n_rows = int(search_df.shape[0])
+    if "bic_selection_eligible" in search_df.columns:
+        return search_df["bic_selection_eligible"].astype(bool).to_numpy(dtype=bool)
+    if "selection_eligible" in search_df.columns:
+        return search_df["selection_eligible"].astype(bool).to_numpy(dtype=bool)
+    if "converged" in search_df.columns:
+        return search_df["converged"].astype(bool).to_numpy(dtype=bool)
+    return np.zeros(n_rows, dtype=bool)
+
+
+def _row_bic_selection_eligible(row: pd.Series) -> bool:
+    return bool(row.get("bic_selection_eligible", row.get("selection_eligible", row.get("converged", False))))
+
+
+def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
+    if search_df.empty:
+        return search_df.copy()
+    enriched = search_df.copy()
+    n_rows = int(enriched.shape[0])
+    if "raw_kkt_eligible" in enriched.columns:
+        raw_kkt = enriched["raw_kkt_eligible"].astype(bool).to_numpy(dtype=bool)
+    elif "selection_eligible" in enriched.columns:
+        raw_kkt = enriched["selection_eligible"].astype(bool).to_numpy(dtype=bool)
+    elif "converged" in enriched.columns:
+        raw_kkt = enriched["converged"].astype(bool).to_numpy(dtype=bool)
+    else:
+        raw_kkt = np.zeros(n_rows, dtype=bool)
+    if "bic_refit_converged" in enriched.columns:
+        bic_refit = enriched["bic_refit_converged"].astype(bool).to_numpy(dtype=bool)
+    else:
+        bic_refit = np.ones(n_rows, dtype=bool)
+    if "classic_bic" in enriched.columns:
+        classic_bic = enriched["classic_bic"].to_numpy(dtype=float)
+    elif "bic" in enriched.columns:
+        classic_bic = enriched["bic"].to_numpy(dtype=float)
+    else:
+        classic_bic = np.full(n_rows, np.nan, dtype=float)
+    enriched["bic_selection_eligible"] = raw_kkt & bic_refit & np.isfinite(classic_bic)
+    return enriched
+
+
+def _annotate_bic_diagnostics(search_df: pd.DataFrame) -> pd.DataFrame:
+    if search_df.empty:
+        return search_df.copy()
+    enriched = _add_bic_selection_eligible(search_df)
+    if {"bic_df", "bic_n_eff"}.issubset(enriched.columns):
+        bic_df = enriched["bic_df"].to_numpy(dtype=float)
+        bic_n_eff = np.maximum(enriched["bic_n_eff"].to_numpy(dtype=float), 1.0)
+        enriched["bic_penalty"] = bic_df * np.log(bic_n_eff)
+    elif "bic_penalty" not in enriched.columns:
+        enriched["bic_penalty"] = np.nan
+
+    for column in ("delta_loglik_vs_one_cluster", "delta_bic_vs_one_cluster"):
+        if column not in enriched.columns:
+            enriched[column] = np.nan
+    if not {"n_clusters", "classic_bic", "bic_loglik"}.issubset(enriched.columns):
+        return enriched
+    n_clusters = enriched["n_clusters"].to_numpy(dtype=float)
+    one_cluster = enriched.loc[(n_clusters == 1.0) & np.isfinite(enriched["classic_bic"].to_numpy(dtype=float))].copy()
+    if one_cluster.empty:
+        return enriched
+    one_cluster["_bic_eligible_for_baseline"] = _bic_selection_eligible_mask(one_cluster)
+    baseline = one_cluster.sort_values(
+        ["_bic_eligible_for_baseline", "classic_bic", "lambda", "selection_step"],
+        ascending=[False, True, True, True],
+    ).iloc[0]
+    baseline_loglik = float(baseline.get("bic_loglik", np.nan))
+    baseline_bic = float(baseline.get("classic_bic", np.nan))
+    if np.isfinite(baseline_loglik):
+        enriched["delta_loglik_vs_one_cluster"] = enriched["bic_loglik"].to_numpy(dtype=float) - baseline_loglik
+    if np.isfinite(baseline_bic):
+        enriched["delta_bic_vs_one_cluster"] = enriched["classic_bic"].to_numpy(dtype=float) - baseline_bic
+    return enriched
+
+
 def _optimal_lambda_range(
     values: np.ndarray,
     lambdas: np.ndarray,
@@ -293,16 +384,16 @@ def _canonical_lambda(value: float) -> float:
 
 def _sorted_unique_lambdas(values: list[float] | np.ndarray) -> list[float]:
     array = np.asarray(list(values), dtype=float)
-    array = array[np.isfinite(array) & (array > 0.0)]
+    array = array[np.isfinite(array) & (array >= 0.0)]
     if array.size == 0:
         return []
     return [float(value) for value in np.unique(np.round(np.sort(array), 12))]
 
 
-def _partition_signature(labels: np.ndarray) -> str:
+def _canonical_partition_labels(labels: np.ndarray) -> np.ndarray:
     labels = np.asarray(labels, dtype=np.int64)
     if labels.size == 0:
-        return "empty"
+        return labels.copy()
     root_to_label: dict[int, int] = {}
     canonical = np.empty_like(labels)
     next_label = 0
@@ -314,8 +405,42 @@ def _partition_signature(labels: np.ndarray) -> str:
             root_to_label[key] = label
             next_label += 1
         canonical[idx] = label
-    digest = hashlib.blake2b(canonical.tobytes(), digest_size=12).hexdigest()
-    return f"{int(next_label)}:{digest}"
+    return canonical
+
+
+def _partition_blocks(labels: np.ndarray) -> tuple[tuple[int, ...], ...]:
+    canonical = _canonical_partition_labels(labels)
+    if canonical.size == 0:
+        return ()
+    blocks = [
+        tuple(int(idx) for idx in np.flatnonzero(canonical == int(label)).tolist())
+        for label in np.unique(canonical)
+    ]
+    return tuple(sorted(blocks))
+
+
+def _partition_signature(labels: np.ndarray) -> str:
+    blocks = _partition_blocks(labels)
+    if not blocks:
+        return "empty"
+    hasher = hashlib.blake2b(digest_size=12)
+    for block in blocks:
+        hasher.update(np.asarray([len(block)], dtype=np.int64).tobytes())
+        if block:
+            hasher.update(np.asarray(block, dtype=np.int64).tobytes())
+    return f"{len(blocks)}:{hasher.hexdigest()}"
+
+
+def _partition_is_coarsening(fine_labels: np.ndarray, coarse_labels: np.ndarray) -> bool:
+    fine = _canonical_partition_labels(fine_labels)
+    coarse = _canonical_partition_labels(coarse_labels)
+    if fine.shape != coarse.shape:
+        return False
+    for label in np.unique(fine):
+        coarse_values = np.unique(coarse[fine == int(label)])
+        if coarse_values.size > 1:
+            return False
+    return True
 
 
 def _cluster_sizes_text(labels: np.ndarray) -> str:
@@ -590,18 +715,27 @@ def _initial_adaptive_lambda_bracket(
         tol=tol,
     )
     lambda_full = max(float(lambda_full), float(lambda_eq), LAMBDA_SEARCH_MIN)
-    lambda_min = max(float(lambda_eq) / 4.0, LAMBDA_SEARCH_MIN)
-    lambda_anchor_max = min(max(float(lambda_full) * 4.0, float(lambda_eq)), LAMBDA_SEARCH_MAX)
+    lambda_min = max(float(lambda_eq) / 128.0, LAMBDA_SEARCH_MIN)
+    lambda_anchor_max = min(max(float(lambda_full), float(lambda_eq) * 4.0), LAMBDA_SEARCH_MAX)
     raw_anchors = [
-        lambda_min,
+        0.0,
+        lambda_eq / 128.0,
+        lambda_eq / 64.0,
+        lambda_eq / 32.0,
+        lambda_eq / 16.0,
+        lambda_eq / 8.0,
         lambda_eq / 4.0,
+        lambda_eq / 2.0,
         lambda_eq,
+        lambda_eq * 2.0,
+        lambda_eq * 4.0,
         lambda_full,
-        min(lambda_full * 2.0, LAMBDA_SEARCH_MAX),
-        min(lambda_full * 4.0, LAMBDA_SEARCH_MAX),
     ]
     anchors = _sorted_unique_lambdas(
-        [min(max(float(value), lambda_min), lambda_anchor_max) for value in raw_anchors]
+        [
+            0.0 if float(value) <= 0.0 else min(max(float(value), lambda_min), lambda_anchor_max)
+            for value in raw_anchors
+        ]
     )
     diagnostics = {
         "pilot_loss": float(pilot_loss),
@@ -683,15 +817,29 @@ def _score_strictly_better(score: float, reference: float, *, normalized_score: 
 def _best_candidate_rows_by_lambda(search_df: pd.DataFrame) -> pd.DataFrame:
     if search_df.empty:
         return search_df.copy()
-    ranked = search_df.copy()
+    ranked = _add_bic_selection_eligible(search_df)
     ranked["_lambda_key"] = np.round(ranked["lambda"].to_numpy(dtype=float), 12)
-    sort_columns = ["_lambda_key"]
-    ascending = [True]
-    if "selection_eligible" in ranked.columns:
-        sort_columns.append("selection_eligible")
-        ascending.append(False)
-    sort_columns.extend(["converged", "penalized_objective", "selection_step"])
-    ascending.extend([False, True, True])
+    defaults = {
+        "selection_eligible": False,
+        "bic_refit_converged": False,
+        "converged": False,
+        "classic_bic": np.inf,
+        "penalized_objective": np.inf,
+        "selection_step": np.arange(ranked.shape[0], dtype=int),
+    }
+    for column, default in defaults.items():
+        if column not in ranked.columns:
+            ranked[column] = default
+    sort_columns = [
+        "_lambda_key",
+        "bic_selection_eligible",
+        "selection_eligible",
+        "bic_refit_converged",
+        "classic_bic",
+        "penalized_objective",
+        "selection_step",
+    ]
+    ascending = [True, False, False, False, True, True, True]
     ranked = ranked.sort_values(sort_columns, ascending=ascending)
     return ranked.drop_duplicates("_lambda_key", keep="first").drop(columns=["_lambda_key"]).reset_index(drop=True)
 
@@ -706,7 +854,7 @@ def _annotate_polish_candidates(
     if search_df.empty:
         return search_df.copy(), search_df.iloc[0:0].copy()
 
-    enriched = search_df.copy()
+    enriched = _add_bic_selection_eligible(search_df)
     n_rows = int(enriched.shape[0])
     score_column = _adaptive_score_column(normalized_score)
     if score_column in enriched.columns:
@@ -728,13 +876,7 @@ def _annotate_polish_candidates(
         if "fixed_objective_kkt_residual" in enriched.columns
         else np.full(n_rows, np.nan, dtype=float)
     )
-    selection_eligible = (
-        enriched["selection_eligible"].astype(bool).to_numpy(dtype=bool)
-        if "selection_eligible" in enriched.columns
-        else enriched["converged"].astype(bool).to_numpy(dtype=bool)
-        if "converged" in enriched.columns
-        else np.zeros(n_rows, dtype=bool)
-    )
+    selection_eligible = _bic_selection_eligible_mask(enriched)
     provisional = np.isfinite(objectives) & np.isfinite(scores) & (mm_violations <= 0.0)
     failed = provisional & ~selection_eligible
     certified = provisional & selection_eligible
@@ -782,7 +924,7 @@ def _annotate_polish_candidates(
         path_df = _best_candidate_rows_by_lambda(enriched).sort_values("lambda").reset_index(drop=True)
         for idx in range(path_df.shape[0]):
             current = path_df.iloc[idx]
-            if not bool(current.get("selection_eligible", current.get("converged", False))):
+            if not _row_bic_selection_eligible(current):
                 continue
             current_score = float(current.get(score_column, np.nan))
             for neighbor_idx in (idx - 1, idx + 1):
@@ -872,31 +1014,86 @@ def _annotate_polish_candidates(
     return enriched, candidate_df.reset_index(drop=True)
 
 
-def _adaptive_interval_proposals(
+def _row_candidate_id(row: pd.Series) -> int | None:
+    if "_candidate_id" not in row:
+        return None
+    value = row.get("_candidate_id", np.nan)
+    if pd.isna(value):
+        return None
+    return int(value)
+
+
+def _row_cluster_count(row: pd.Series) -> int | None:
+    for column in ("n_clusters", "bic_n_clusters", "summary_n_clusters"):
+        if column not in row:
+            continue
+        value = row.get(column, np.nan)
+        if pd.isna(value):
+            continue
+        return int(value)
+    return None
+
+
+def _lambda_interval_log10_width(left_lambda: float, right_lambda: float) -> float:
+    left_lambda = float(left_lambda)
+    right_lambda = float(right_lambda)
+    if not np.isfinite(left_lambda) or not np.isfinite(right_lambda) or right_lambda <= left_lambda:
+        return 0.0
+    if left_lambda > 0.0:
+        return float(max(np.log10(right_lambda) - np.log10(left_lambda), 0.0))
+    if right_lambda <= LAMBDA_SEARCH_MIN * (1.0 + 1e-12):
+        return 0.0
+    return float(max(np.log10(right_lambda) - np.log10(LAMBDA_SEARCH_MIN), 0.0))
+
+
+def _lambda_interval_midpoint(left_lambda: float, right_lambda: float) -> float | None:
+    left_lambda = float(left_lambda)
+    right_lambda = float(right_lambda)
+    if not np.isfinite(left_lambda) or not np.isfinite(right_lambda) or right_lambda <= left_lambda:
+        return None
+    if left_lambda <= 0.0:
+        if right_lambda <= LAMBDA_SEARCH_MIN * (1.0 + 1e-12):
+            return None
+        midpoint = max(0.5 * right_lambda, LAMBDA_SEARCH_MIN)
+    else:
+        midpoint = float(np.sqrt(left_lambda * right_lambda))
+    if not (left_lambda < midpoint < right_lambda):
+        return None
+    return float(midpoint)
+
+
+def _adaptive_interval_proposal_records(
     search_df: pd.DataFrame,
     *,
     normalized_score: str,
     tol: float,
     max_new: int,
-) -> list[float]:
+    partition_labels_by_candidate_id: dict[int, np.ndarray] | None = None,
+) -> list[_AdaptiveIntervalProposal]:
     path_df = _best_candidate_rows_by_lambda(search_df).sort_values("lambda").reset_index(drop=True)
-    if path_df.shape[0] < 2:
+    if path_df.shape[0] < 2 or int(max_new) <= 0:
         return []
     score_column = _adaptive_score_column(normalized_score)
     finite_scores = path_df[score_column].to_numpy(dtype=float)
     finite_scores = finite_scores[np.isfinite(finite_scores)]
-    best_score = float(np.min(finite_scores) if finite_scores.size else np.nan)
-    intervals: list[tuple[float, float]] = []
+    if _score_maximized(normalized_score):
+        best_score = float(np.max(finite_scores) if finite_scores.size else np.nan)
+    else:
+        best_score = float(np.min(finite_scores) if finite_scores.size else np.nan)
+    intervals: list[_AdaptiveIntervalProposal] = []
     for idx in range(path_df.shape[0] - 1):
         left = path_df.iloc[idx]
         right = path_df.iloc[idx + 1]
         left_lambda = float(left["lambda"])
         right_lambda = float(right["lambda"])
-        if left_lambda <= 0.0 or right_lambda <= left_lambda:
+        if right_lambda <= left_lambda:
             continue
-        log_width = float(np.log10(right_lambda) - np.log10(left_lambda))
-        if log_width <= ADAPTIVE_PATH_LOG10_WIDTH_TOL:
+        log_width = _lambda_interval_log10_width(left_lambda, right_lambda)
+        midpoint = _lambda_interval_midpoint(left_lambda, right_lambda)
+        if midpoint is None:
             continue
+        left_candidate_id = _row_candidate_id(left)
+        right_candidate_id = _row_candidate_id(right)
         partition_changed = str(left.get("partition_signature", "")) != str(right.get("partition_signature", ""))
         p_left = float(left.get("profile_penalty", np.nan))
         p_right = float(right.get("profile_penalty", np.nan))
@@ -916,11 +1113,15 @@ def _adaptive_interval_proposals(
         if np.isfinite(best_score):
             left_score = float(left.get(score_column, np.nan))
             right_score = float(right.get(score_column, np.nan))
-            near_best = min(left_score, right_score) <= best_score + max(1.0, abs(best_score) * 1e-5)
+            score_window = max(1.0, abs(best_score) * 1e-5)
+            if _score_maximized(normalized_score):
+                near_best = max(left_score, right_score) >= best_score - score_window
+            else:
+                near_best = min(left_score, right_score) <= best_score + score_window
             score_focus = 1.0 if near_best else 0.0
         repair_tol = _kkt_polish_repair_tol(tol)
-        left_ok = bool(left.get("selection_eligible", False))
-        right_ok = bool(right.get("selection_eligible", False))
+        left_ok = _row_bic_selection_eligible(left)
+        right_ok = _row_bic_selection_eligible(right)
         left_kkt = float(left.get("fixed_objective_kkt_residual", np.inf))
         right_kkt = float(right.get("fixed_objective_kkt_residual", np.inf))
         kkt_risk = (
@@ -932,29 +1133,113 @@ def _adaptive_interval_proposals(
             )
             else 0.0
         )
-        priority = (
-            log_width
-            + (3.0 if partition_changed else 0.0)
-            + (3.0 if monotonicity_violation else 0.0)
-            + value_curve_score
-            + score_focus
-            + kkt_risk
+        left_k = _row_cluster_count(left)
+        right_k = _row_cluster_count(right)
+        cluster_jump = 0 if left_k is None or right_k is None else abs(int(right_k) - int(left_k))
+        k_increases = bool(left_k is not None and right_k is not None and int(right_k) > int(left_k))
+        nonnested_partition_change = False
+        if (
+            partition_labels_by_candidate_id is not None
+            and partition_changed
+            and left_ok
+            and right_ok
+            and left_candidate_id is not None
+            and right_candidate_id is not None
+            and left_candidate_id in partition_labels_by_candidate_id
+            and right_candidate_id in partition_labels_by_candidate_id
+        ):
+            nonnested_partition_change = not _partition_is_coarsening(
+                partition_labels_by_candidate_id[left_candidate_id],
+                partition_labels_by_candidate_id[right_candidate_id],
+            )
+        nonagglomerative_or_numerically_inconsistent = bool(
+            nonnested_partition_change or k_increases or monotonicity_violation
         )
-        if priority <= ADAPTIVE_PATH_LOG10_WIDTH_TOL:
+        failed_endpoint_near_best = bool(score_focus and (not left_ok or not right_ok))
+
+        if nonagglomerative_or_numerically_inconsistent or failed_endpoint_near_best:
+            priority_class = 0
+            if nonnested_partition_change:
+                reason = "nonnested_partition_change"
+            elif k_increases:
+                reason = "cluster_count_increases_with_lambda"
+            elif monotonicity_violation:
+                reason = "penalty_monotonicity_violation"
+            else:
+                reason = "failed_kkt_near_best_bic"
+        elif partition_changed:
+            priority_class = 1
+            reason = "partition_signature_change"
+        elif cluster_jump > 1:
+            priority_class = 2
+            reason = "cluster_count_jump"
+        elif score_focus and partition_changed:
+            priority_class = 3
+            reason = "selected_partition_boundary"
+        elif log_width > ADAPTIVE_PATH_LOG10_WIDTH_TOL:
+            priority_class = 4
+            reason = "wide_same_partition_interval"
+        elif value_curve_score > 0.0 or kkt_risk > 0.0:
+            priority_class = 5
+            reason = "soft_path_diagnostic"
+        else:
             continue
-        intervals.append((float(priority), float(np.sqrt(left_lambda * right_lambda))))
-    intervals.sort(key=lambda item: (-item[0], item[1]))
-    proposals: list[float] = []
+
+        priority_key = (
+            int(priority_class),
+            -float(score_focus),
+            -float(cluster_jump),
+            -float(log_width),
+            -float(value_curve_score + kkt_risk),
+        )
+        intervals.append(
+            _AdaptiveIntervalProposal(
+                lambda_value=float(midpoint),
+                left_lambda=float(left_lambda),
+                right_lambda=float(right_lambda),
+                left_candidate_id=left_candidate_id,
+                right_candidate_id=right_candidate_id,
+                priority_key=priority_key,
+                reason=str(reason),
+                log_width=float(log_width),
+                partition_changed=bool(partition_changed),
+                nonagglomerative_or_numerically_inconsistent=bool(
+                    nonagglomerative_or_numerically_inconsistent
+                ),
+            )
+        )
+    intervals.sort(key=lambda item: (*item.priority_key, item.lambda_value))
+    proposals: list[_AdaptiveIntervalProposal] = []
     seen: set[float] = set()
-    for _, value in intervals:
-        key = _canonical_lambda(value)
+    for proposal in intervals:
+        key = _canonical_lambda(proposal.lambda_value)
         if key in seen:
             continue
         seen.add(key)
-        proposals.append(float(value))
+        proposals.append(proposal)
         if len(proposals) >= max_new:
             break
     return proposals
+
+
+def _adaptive_interval_proposals(
+    search_df: pd.DataFrame,
+    *,
+    normalized_score: str,
+    tol: float,
+    max_new: int,
+    partition_labels_by_candidate_id: dict[int, np.ndarray] | None = None,
+) -> list[float]:
+    return [
+        float(proposal.lambda_value)
+        for proposal in _adaptive_interval_proposal_records(
+            search_df,
+            normalized_score=normalized_score,
+            tol=tol,
+            max_new=max_new,
+            partition_labels_by_candidate_id=partition_labels_by_candidate_id,
+        )
+    ]
 
 
 def _selected_lambda_signature_interval(
@@ -970,10 +1255,7 @@ def _selected_lambda_signature_interval(
     selected_row = selected.iloc[0]
     selected_lambda = float(selected_row["lambda"])
     signature = str(selected_row.get("partition_signature", ""))
-    if "selection_eligible" in search_df.columns:
-        eligible = search_df.loc[search_df["selection_eligible"].astype(bool)].copy()
-    else:
-        eligible = search_df.loc[search_df["converged"].astype(bool)].copy()
+    eligible = search_df.loc[_bic_selection_eligible_mask(search_df)].copy()
     if eligible.empty:
         eligible = search_df.copy()
     eligible = _best_candidate_rows_by_lambda(eligible).sort_values("lambda").reset_index(drop=True)
@@ -981,7 +1263,17 @@ def _selected_lambda_signature_interval(
     signatures = eligible["partition_signature"].astype(str).to_numpy() if "partition_signature" in eligible.columns else np.full(eligible.shape[0], signature)
     if lambdas.size == 0:
         return selected_lambda, selected_lambda, 0.0
-    idx = int(np.argmin(np.abs(np.log(lambdas) - np.log(selected_lambda))))
+    if selected_lambda > 0.0:
+        distances = np.where(
+            lambdas > 0.0,
+            np.abs(np.log(lambdas) - np.log(selected_lambda)),
+            np.inf,
+        )
+        if not np.any(np.isfinite(distances)):
+            distances = np.abs(lambdas - selected_lambda)
+    else:
+        distances = np.abs(lambdas - selected_lambda)
+    idx = int(np.argmin(distances))
     left_idx = idx
     while left_idx > 0 and signatures[left_idx - 1] == signature:
         left_idx -= 1
@@ -1044,6 +1336,7 @@ def _evaluate_candidate(
     selection_step: int,
     lambda_value: float,
     selection_score: str,
+    bic_refit_cache: dict[str, PartitionRefitResult] | None = None,
 ) -> tuple[FitResult, SimulationEvaluation | None, dict[str, float | int | str | bool]]:
     canonical_score_name = _normalize_selection_score_name(selection_score)
     effective_fit_options = fit_options if candidate_fit_options is None else candidate_fit_options
@@ -1069,15 +1362,23 @@ def _evaluate_candidate(
         edge_v=graph.edge_v,
         tol=bic_partition_tol,
     )
-    bic_refit = partition_constrained_observed_refit(
-        data,
-        bic_labels,
-        major_prior=float(effective_fit_options.major_prior),
-        eps=float(effective_fit_options.eps),
-        tol=max(float(effective_fit_options.tol), 1e-8),
-        max_iter=max(int(effective_fit_options.inner_max_iter), 32),
-        hint_phi=fit.phi,
-    )
+    partition_hash = _partition_signature(bic_labels)
+    bic_refit_cache_hit = False
+    if bic_refit_cache is not None and partition_hash in bic_refit_cache:
+        bic_refit = bic_refit_cache[partition_hash]
+        bic_refit_cache_hit = True
+    else:
+        bic_refit = partition_constrained_observed_refit(
+            data,
+            bic_labels,
+            major_prior=float(effective_fit_options.major_prior),
+            eps=float(effective_fit_options.eps),
+            tol=max(float(effective_fit_options.tol), 1e-8),
+            max_iter=max(int(effective_fit_options.inner_max_iter), 32),
+            hint_phi=fit.phi,
+        )
+        if bic_refit_cache is not None:
+            bic_refit_cache[partition_hash] = bic_refit
     bic_n_clusters = int(bic_refit.n_clusters)
     bic_loglik = float(bic_refit.loglik)
     bic, classic_bic, extended_bic = _selection_score_value(
@@ -1110,6 +1411,7 @@ def _evaluate_candidate(
     bic_df_value = float(bic_degrees_of_freedom(bic_n_clusters, data))
     bic_n_eff_value = float(effective_bic_cell_count(data))
     bic_depth_n_eff_value = float(effective_bic_depth_count(data))
+    bic_penalty_value = float(bic_df_value * np.log(max(bic_n_eff_value, 1.0)))
     edge_count = int(graph.edge_u.size)
     if edge_count:
         edge_weight_min = float(np.min(graph.edge_w))
@@ -1119,7 +1421,6 @@ def _evaluate_candidate(
         edge_weight_min = float("nan")
         edge_weight_max = float("nan")
         edge_weight_mean = float("nan")
-    partition_hash = _partition_signature(bic_labels)
     raw_kkt_eligible = bool(fit.selection_eligible)
     bic_selection_eligible = _is_bic_selection_eligible(
         raw_kkt_eligible=raw_kkt_eligible,
@@ -1181,8 +1482,11 @@ def _evaluate_candidate(
         "bic_loglik_source": str(bic_refit.loglik_source),
         "bic_df": float(bic_df_value),
         "bic_active_df": float(bic_refit.active_degrees_of_freedom),
+        "bic_penalty": float(bic_penalty_value),
         "bic_n_eff": float(bic_n_eff_value),
         "bic_depth_n_eff": float(bic_depth_n_eff_value),
+        "delta_loglik_vs_one_cluster": np.nan,
+        "delta_bic_vs_one_cluster": np.nan,
         "bic_partition_tol": float(bic_partition_tol),
         "bic_n_clusters": int(bic_n_clusters),
         "loglik": float(fit.loglik),
@@ -1193,6 +1497,7 @@ def _evaluate_candidate(
         "refit_fit_loss": float(bic_refit.fit_loss),
         "refit_converged": bool(bic_refit.converged),
         "bic_refit_converged": bool(bic_refit.converged),
+        "bic_refit_cache_hit": bool(bic_refit_cache_hit),
         "refit_boundary_count": int(bic_refit.boundary_count),
         "refit_active_df": int(bic_refit.active_degrees_of_freedom),
         "penalized_objective": float(fit.penalized_objective),
@@ -1315,13 +1620,21 @@ def _representative_optimal_row(
 
     if np.isclose(lambda_min, lambda_max, rtol=0.0, atol=1e-12):
         target_lambda = float(lambda_min)
+    elif lambda_min <= 0.0 or lambda_max <= 0.0:
+        target_lambda = 0.0
     else:
         target_lambda = float(np.sqrt(float(lambda_min) * float(lambda_max)))
 
     ranked_df = tied_df.copy()
-    ranked_df["_repr_log_distance"] = np.abs(
-        np.log(ranked_df["lambda"].to_numpy(dtype=float)) - np.log(target_lambda)
-    )
+    lambda_values = ranked_df["lambda"].to_numpy(dtype=float)
+    if target_lambda > 0.0:
+        ranked_df["_repr_log_distance"] = np.where(
+            lambda_values > 0.0,
+            np.abs(np.log(lambda_values) - np.log(target_lambda)),
+            np.inf,
+        )
+    else:
+        ranked_df["_repr_log_distance"] = np.abs(lambda_values - target_lambda)
     return ranked_df.sort_values(
         ["_repr_log_distance", "converged", "iterations", "lambda", "selection_step"],
         ascending=[True, False, False, True, True],
@@ -1445,14 +1758,28 @@ def _grid_search_selection(
         simulation_truth = load_simulation_truth(data, simulation_root)
     result_entries: list[tuple[FitResult, SimulationEvaluation | None, dict[str, float | int | str | bool]]] = []
     fit_by_lambda: dict[float, FitResult] = {}
+    partition_labels_by_candidate_id: dict[int, np.ndarray] = {}
+    bic_refit_cache: dict[str, PartitionRefitResult] = {}
     next_step = 0
 
     def _nearest_phi_start(target_lambda: float) -> np.ndarray:
         if not fit_by_lambda:
             return pilot_phi.copy()
+        target = float(target_lambda)
+
+        def _lambda_start_distance(value: float) -> float:
+            lambda_value = float(value)
+            if lambda_value > 0.0 and target > 0.0:
+                return float(abs(np.log(lambda_value) - np.log(target)))
+            if lambda_value <= 0.0 and target <= 0.0:
+                return 0.0
+            if target <= 0.0:
+                return float(abs(lambda_value - target))
+            return float("inf")
+
         nearest_lambda = min(
             fit_by_lambda,
-            key=lambda value: abs(np.log(value) - np.log(target_lambda)),
+            key=_lambda_start_distance,
         )
         return fit_by_lambda[nearest_lambda].phi.copy()
 
@@ -1467,6 +1794,8 @@ def _grid_search_selection(
         start_mode: str = "full",
         compute_summary: bool = True,
         phi_start_by_lambda: dict[float, np.ndarray] | None = None,
+        scalar_well_starts_by_lambda: dict[float, list[np.ndarray]] | None = None,
+        lambda_metadata_by_lambda: dict[float, dict[str, float | int | str | bool]] | None = None,
     ) -> None:
         nonlocal next_step
         ordered_lambdas = [
@@ -1486,6 +1815,9 @@ def _grid_search_selection(
                 phi_start = previous_phi.copy() if previous_phi is not None else _nearest_phi_start(lambda_value)
             else:
                 phi_start = pilot_phi.copy()
+            candidate_scalar_well_starts = scalar_well_starts
+            if scalar_well_starts_by_lambda is not None and lambda_key in scalar_well_starts_by_lambda:
+                candidate_scalar_well_starts = scalar_well_starts_by_lambda[lambda_key]
             fit, evaluation, row = _evaluate_candidate(
                 data=data,
                 fit_options=search_fit_options,
@@ -1499,7 +1831,7 @@ def _grid_search_selection(
                 phi_start=phi_start,
                 exact_pilot=pilot_phi,
                 pooled_start=pooled_start,
-                scalar_well_starts=scalar_well_starts,
+                scalar_well_starts=candidate_scalar_well_starts,
                 start_mode=start_mode,
                 runtime=runtime,
                 torch_data=torch_data,
@@ -1509,6 +1841,7 @@ def _grid_search_selection(
                 selection_step=next_step,
                 lambda_value=lambda_value,
                 selection_score=selection_score,
+                bic_refit_cache=bic_refit_cache,
             )
             row["search_round"] = int(search_round)
             row["search_phase"] = str(search_phase)
@@ -1523,8 +1856,16 @@ def _grid_search_selection(
                 for diagnostic_name, diagnostic_value in lambda_bracket.diagnostics.items():
                     if np.isscalar(diagnostic_value):
                         row[str(diagnostic_name)] = float(diagnostic_value)
-            row["_candidate_id"] = int(len(result_entries))
+            if lambda_metadata_by_lambda is not None and lambda_key in lambda_metadata_by_lambda:
+                row.update(lambda_metadata_by_lambda[lambda_key])
+            candidate_id = int(len(result_entries))
+            row["_candidate_id"] = candidate_id
             result_entries.append((fit, evaluation, row))
+            if fit.bic_partition_labels is not None:
+                partition_labels_by_candidate_id[candidate_id] = np.asarray(
+                    fit.bic_partition_labels,
+                    dtype=np.int64,
+                ).copy()
             incumbent = fit_by_lambda.get(lambda_key)
             if _prefer_fit_candidate(fit, incumbent):
                 fit_by_lambda[lambda_key] = fit
@@ -1553,7 +1894,7 @@ def _grid_search_selection(
                 adaptive_search_stop_reason = "adaptive_candidate_budget_reached"
                 break
             interim_df = pd.DataFrame([row for _, _, row in result_entries])
-            proposals = _adaptive_interval_proposals(
+            proposal_records = _adaptive_interval_proposal_records(
                 interim_df,
                 normalized_score=normalized_score,
                 tol=float(effective_fit_options.tol),
@@ -1561,22 +1902,66 @@ def _grid_search_selection(
                     adaptive_refine_per_round,
                     max(adaptive_max_candidates - len(fit_by_lambda), 0),
                 ),
+                partition_labels_by_candidate_id=partition_labels_by_candidate_id,
             )
-            proposals = [
-                value
-                for value in proposals
-                if _canonical_lambda(value) not in fit_by_lambda
+            proposal_records = [
+                proposal
+                for proposal in proposal_records
+                if _canonical_lambda(proposal.lambda_value) not in fit_by_lambda
             ]
+            proposals = [float(proposal.lambda_value) for proposal in proposal_records]
             if not proposals:
                 adaptive_search_stop_reason = "adaptive_path_resolved"
                 break
+            fit_by_candidate_id = {
+                int(row["_candidate_id"]): fit
+                for fit, _, row in result_entries
+                if "_candidate_id" in row
+            }
+            proposal_phi_by_lambda: dict[float, np.ndarray] = {}
+            proposal_scalar_starts_by_lambda: dict[float, list[np.ndarray]] = {}
+            proposal_metadata_by_lambda: dict[float, dict[str, float | int | str | bool]] = {}
+            for proposal in proposal_records:
+                lambda_key = _canonical_lambda(proposal.lambda_value)
+                left_fit = (
+                    fit_by_candidate_id.get(int(proposal.left_candidate_id))
+                    if proposal.left_candidate_id is not None
+                    else None
+                )
+                right_fit = (
+                    fit_by_candidate_id.get(int(proposal.right_candidate_id))
+                    if proposal.right_candidate_id is not None
+                    else None
+                )
+                if left_fit is not None:
+                    proposal_phi_by_lambda[lambda_key] = left_fit.phi.copy()
+                elif right_fit is not None:
+                    proposal_phi_by_lambda[lambda_key] = right_fit.phi.copy()
+                proposal_starts = [start.copy() for start in scalar_well_starts]
+                if right_fit is not None:
+                    proposal_starts.insert(0, right_fit.phi.copy())
+                proposal_scalar_starts_by_lambda[lambda_key] = proposal_starts
+                proposal_metadata_by_lambda[lambda_key] = {
+                    "adaptive_interval_left_lambda": float(proposal.left_lambda),
+                    "adaptive_interval_right_lambda": float(proposal.right_lambda),
+                    "adaptive_interval_log10_width": float(proposal.log_width),
+                    "adaptive_interval_priority_class": int(proposal.priority_key[0]),
+                    "adaptive_interval_reason": str(proposal.reason),
+                    "adaptive_interval_partition_changed": bool(proposal.partition_changed),
+                    "adaptive_interval_nonagglomerative_or_numerically_inconsistent": bool(
+                        proposal.nonagglomerative_or_numerically_inconsistent
+                    ),
+                }
             before = len(fit_by_lambda)
             _evaluate_lambda_sequence(
                 proposals,
                 search_round=adaptive_round,
                 search_phase=f"adaptive_refine_{adaptive_round}",
-                start_mode="warm_only" if use_warm_starts else "full",
+                start_mode="full",
                 compute_summary=True,
+                phi_start_by_lambda=proposal_phi_by_lambda,
+                scalar_well_starts_by_lambda=proposal_scalar_starts_by_lambda,
+                lambda_metadata_by_lambda=proposal_metadata_by_lambda,
             )
             if len(fit_by_lambda) == before:
                 adaptive_search_stop_reason = "adaptive_no_new_lambdas"
@@ -1652,7 +2037,7 @@ def _grid_search_selection(
                 )
                 post_kkt = float(polished_row["fixed_objective_kkt_residual"])
                 post_bic = float(polished_row.get(score_column, np.nan))
-                polish_success = bool(polished_row["selection_eligible"])
+                polish_success = bool(polished_row.get("bic_selection_eligible", polished_row["selection_eligible"]))
                 polished_row["promising_for_polish"] = True
                 polished_row["polish_attempted"] = True
                 polished_row["polish_success"] = polish_success
@@ -1681,8 +2066,7 @@ def _grid_search_selection(
             max_candidates=0,
         )
         has_certified_candidate = bool(
-            "selection_eligible" in search_df.columns
-            and search_df["selection_eligible"].astype(bool).to_numpy(dtype=bool).any()
+            np.any(_bic_selection_eligible_mask(search_df))
         )
         if not has_certified_candidate:
             score_column = _adaptive_score_column(normalized_score)
@@ -1770,7 +2154,7 @@ def _grid_search_selection(
                     )
                     post_kkt = float(polished_row["fixed_objective_kkt_residual"])
                     post_bic = float(polished_row.get(score_column, np.nan))
-                    polish_success = bool(polished_row["selection_eligible"])
+                    polish_success = bool(polished_row.get("bic_selection_eligible", polished_row["selection_eligible"]))
                     polished_row["promising_for_polish"] = True
                     polished_row["polish_attempted"] = True
                     polished_row["polish_success"] = polish_success
@@ -1798,8 +2182,7 @@ def _grid_search_selection(
                     max_candidates=0,
                 )
         has_certified_candidate = bool(
-            "selection_eligible" in search_df.columns
-            and search_df["selection_eligible"].astype(bool).to_numpy(dtype=bool).any()
+            np.any(_bic_selection_eligible_mask(search_df))
         )
         if not has_certified_candidate:
             score_column = _adaptive_score_column(normalized_score)
@@ -1867,13 +2250,10 @@ def _grid_search_selection(
                     tol=float(effective_fit_options.tol),
                     max_candidates=0,
                 )
+    search_df = _annotate_bic_diagnostics(search_df)
     num_candidates = int(search_df.shape[0])
     converged_mask = search_df["converged"].astype(bool).to_numpy(dtype=bool)
-    candidate_selection_eligible_mask = (
-        search_df["selection_eligible"].astype(bool).to_numpy(dtype=bool)
-        if "selection_eligible" in search_df.columns
-        else converged_mask
-    )
+    candidate_selection_eligible_mask = _bic_selection_eligible_mask(search_df)
     num_converged_candidates = int(np.sum(converged_mask))
     num_selection_eligible_candidates = int(np.sum(candidate_selection_eligible_mask))
     if num_selection_eligible_candidates == 0:
@@ -1975,7 +2355,7 @@ def _grid_search_selection(
             else None
         )
         best_score_all_evaluated_selection_eligible = bool(
-            best_score_all_row.get("selection_eligible", best_score_all_row.get("converged", False))
+            _row_bic_selection_eligible(best_score_all_row)
         )
     best_score_certified_lambda = None
     best_score_certified_kkt_residual = None
@@ -1992,7 +2372,7 @@ def _grid_search_selection(
     optimizer_limited_ids: set[int] = set()
     if best_score_all_row is not None:
         best_score_all_score = float(best_score_all_row.get(score_column, np.nan))
-        best_score_all_eligible = bool(best_score_all_row.get("selection_eligible", best_score_all_row.get("converged", False)))
+        best_score_all_eligible = bool(_row_bic_selection_eligible(best_score_all_row))
         same_lambda_polish_success = False
         if "_candidate_id" in search_df.columns:
             best_lambda_key = _canonical_lambda(float(best_score_all_row["lambda"]))

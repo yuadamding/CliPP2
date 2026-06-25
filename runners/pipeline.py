@@ -199,6 +199,9 @@ def process_one_file_bundle(
         "best_ari_certified": np.nan
         if getattr(simulation_diagnostics, "best_ari_certified", None) is None
         else float(simulation_diagnostics.best_ari_certified),
+        "best_ari_bic_eligible": np.nan
+        if getattr(simulation_diagnostics, "best_ari_certified", None) is None
+        else float(simulation_diagnostics.best_ari_certified),
         "best_ari_near_kkt": np.nan
         if getattr(simulation_diagnostics, "best_ari_near_kkt", None) is None
         else float(simulation_diagnostics.best_ari_near_kkt),

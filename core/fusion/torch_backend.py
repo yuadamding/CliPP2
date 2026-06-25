@@ -387,7 +387,7 @@ def refine_graph_fusion_dual_certificate_torch(
     edge_w: torch.Tensor,
     lambda_value: float,
     atol: float,
-    max_iter: int = 64,
+    max_iter: int = 96,
 ) -> dict[str, object]:
     before_diag = graph_fusion_kkt_residual_from_grad_torch(
         phi=phi,
