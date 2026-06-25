@@ -103,6 +103,102 @@ _RESUME_DERIVED_CANDIDATE_COLUMNS = {
     "delta_to_best_cp_rmse",
     "cp_rmse_rank_within_tumor",
 }
+_CURRENT_RESUME_PATIENT_COLUMNS = {
+    "tumor_id",
+    "selected_lambda",
+    "selection_score_name",
+    "lambda_search_mode",
+    "selected_ari",
+    "adaptive_search_rounds_completed",
+    "adaptive_search_stop_reason",
+    "num_candidates_all",
+    "num_candidates_certified",
+    "selected_kkt_residual",
+    "selection_optimizer_limited",
+    "selection_optimizer_limited_reason",
+}
+_STALE_RESUME_COLUMNS = {
+    "oracle_search_rounds_completed",
+    "oracle_search_stop_reason",
+    "cv_stability_replicates",
+    "selected_validation_loglik_mean",
+}
+
+
+def _format_column_set(columns: set[str]) -> str:
+    return ", ".join(sorted(columns))
+
+
+def _validate_resume_compatibility(
+    *,
+    existing_patient_df: pd.DataFrame,
+    existing_candidate_df: pd.DataFrame,
+    selection_score: str,
+    lambda_grid_mode: str,
+    outdir: Path,
+) -> None:
+    if existing_patient_df.empty and existing_candidate_df.empty:
+        return
+
+    patient_columns = set(existing_patient_df.columns.astype(str))
+    candidate_columns = set(existing_candidate_df.columns.astype(str))
+    stale_columns = (patient_columns | candidate_columns) & _STALE_RESUME_COLUMNS
+    if stale_columns:
+        raise RuntimeError(
+            "Existing benchmark outputs in "
+            f"{outdir} were produced by an older incompatible model-selection schema "
+            f"({_format_column_set(stale_columns)}). Use a clean output directory or archive/remove those files."
+        )
+
+    missing_patient_columns = _CURRENT_RESUME_PATIENT_COLUMNS - patient_columns
+    if not existing_patient_df.empty and missing_patient_columns:
+        raise RuntimeError(
+            "Existing benchmark_patients.tsv in "
+            f"{outdir} is missing current resume columns "
+            f"({_format_column_set(missing_patient_columns)}). Use a clean output directory or archive/remove it."
+        )
+
+    expected_score = str(selection_score).strip().lower()
+    if "selection_score_name" in existing_patient_df.columns:
+        observed_scores = {
+            value
+            for value in (
+                existing_patient_df["selection_score_name"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .unique()
+            )
+            if value
+        }
+        if observed_scores and observed_scores != {expected_score}:
+            raise RuntimeError(
+                "Existing benchmark_patients.tsv in "
+                f"{outdir} used selection_score_name={sorted(observed_scores)}, "
+                f"but this run requests {expected_score!r}. Use a clean output directory or archive/remove it."
+            )
+
+    expected_lambda_mode = str(lambda_grid_mode).strip().lower()
+    if "lambda_grid_mode" in existing_patient_df.columns:
+        observed_modes = {
+            value
+            for value in (
+                existing_patient_df["lambda_grid_mode"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .unique()
+            )
+            if value
+        }
+        if observed_modes and observed_modes != {expected_lambda_mode}:
+            raise RuntimeError(
+                "Existing benchmark_patients.tsv in "
+                f"{outdir} used lambda_grid_mode={sorted(observed_modes)}, "
+                f"but this run requests {expected_lambda_mode!r}. Use a clean output directory or archive/remove it."
+            )
 
 
 def _configure_cpu_runtime() -> None:
@@ -763,20 +859,32 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
 
     existing_patient_path = outdir / "benchmark_patients.tsv"
     existing_candidate_path = outdir / "per_candidate.tsv"
+    existing_patient_df = pd.DataFrame()
+    existing_candidate_df = pd.DataFrame()
     existing_patient_rows: list[dict[str, float | int | str | bool]] = []
     existing_candidate_rows: list[dict[str, float | int | str | bool]] = []
     completed_tumor_ids: set[str] = set()
     if existing_patient_path.exists():
         existing_patient_df = pd.read_csv(existing_patient_path, sep="\t")
         if not existing_patient_df.empty:
-            existing_patient_rows = existing_patient_df.to_dict(orient="records")
             if "tumor_id" in existing_patient_df.columns:
                 completed_tumor_ids = set(existing_patient_df["tumor_id"].astype(str).tolist())
     if existing_candidate_path.exists():
         existing_candidate_df = pd.read_csv(existing_candidate_path, sep="\t")
+    if not existing_patient_df.empty or not existing_candidate_df.empty:
+        _validate_resume_compatibility(
+            existing_patient_df=existing_patient_df,
+            existing_candidate_df=existing_candidate_df,
+            selection_score=str(args.selection_score),
+            lambda_grid_mode=str(args.lambda_grid_mode),
+            outdir=outdir,
+        )
+        if not existing_patient_df.empty:
+            existing_patient_rows = existing_patient_df.to_dict(orient="records")
         if not existing_candidate_df.empty:
-            existing_candidate_df = _strip_resume_candidate_enrichment(existing_candidate_df)
-            existing_candidate_rows = existing_candidate_df.to_dict(orient="records")
+            existing_candidate_rows = _strip_resume_candidate_enrichment(existing_candidate_df).to_dict(
+                orient="records"
+            )
 
     if completed_tumor_ids:
         files = [path for path in files if path.stem not in completed_tumor_ids]
