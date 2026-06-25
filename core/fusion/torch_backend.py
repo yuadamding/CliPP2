@@ -375,6 +375,141 @@ def graph_fusion_kkt_residual_from_grad_torch(
     }
 
 
+def refine_graph_fusion_dual_certificate_torch(
+    *,
+    phi: torch.Tensor,
+    grad_smooth: torch.Tensor,
+    dual_kkt: torch.Tensor | None,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    edge_w: torch.Tensor,
+    lambda_value: float,
+    atol: float,
+    max_iter: int = 64,
+) -> dict[str, object]:
+    before_diag = graph_fusion_kkt_residual_from_grad_torch(
+        phi=phi,
+        grad_smooth=grad_smooth,
+        dual_kkt=dual_kkt,
+        lower=lower,
+        upper=upper,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        edge_w=edge_w,
+        lambda_value=lambda_value,
+        atol=atol,
+    )
+    if edge_u.numel() == 0 or lambda_value <= 0.0:
+        dual = torch.zeros((int(edge_u.numel()), int(phi.shape[1])), dtype=phi.dtype, device=phi.device)
+        after_diag = graph_fusion_kkt_residual_from_grad_torch(
+            phi=phi,
+            grad_smooth=grad_smooth,
+            dual_kkt=dual,
+            lower=lower,
+            upper=upper,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            edge_w=edge_w,
+            lambda_value=lambda_value,
+            atol=atol,
+        )
+        return {
+            "dual": dual,
+            "diag": after_diag,
+            "status": "zero_penalty_no_dual_needed",
+            "dual_refined": False,
+            "fused_edges": 0,
+            "nonzero_edges": 0,
+            "stationarity_before": float(before_diag["stationarity_residual"]),
+            "stationarity_after": float(after_diag["stationarity_residual"]),
+        }
+
+    diff = phi.index_select(0, edge_u) - phi.index_select(0, edge_v)
+    diff_norm = torch.linalg.norm(diff, dim=1)
+    radius = float(lambda_value) * edge_w
+    active = diff_norm > float(atol)
+    fused = ~active
+    dual = torch.zeros((int(edge_u.numel()), int(phi.shape[1])), dtype=phi.dtype, device=phi.device)
+    if torch.any(active):
+        dual[active] = radius[active, None] * diff[active] / diff_norm[active, None].clamp_min(float(atol))
+    if torch.any(fused) and dual_kkt is not None and tuple(dual_kkt.shape) == tuple(dual.shape):
+        dual[fused] = dual_kkt.to(dtype=phi.dtype, device=phi.device)[fused]
+        fused_norm = torch.linalg.norm(dual[fused], dim=1)
+        fused_radius = radius[fused]
+        scale = torch.maximum(torch.ones_like(fused_norm), fused_norm / fused_radius.clamp_min(1e-12))
+        dual[fused] = dual[fused] / scale[:, None]
+
+    best_dual = dual.clone()
+    best_diag = graph_fusion_kkt_residual_from_grad_torch(
+        phi=phi,
+        grad_smooth=grad_smooth,
+        dual_kkt=dual,
+        lower=lower,
+        upper=upper,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        edge_w=edge_w,
+        lambda_value=lambda_value,
+        atol=atol,
+    )
+    best_residual = float(best_diag["kkt_residual"])
+    if torch.any(fused):
+        degree = torch.bincount(
+            torch.cat([edge_u, edge_v]),
+            minlength=int(phi.shape[0]),
+        ).max()
+        step = 0.25 / max(float(degree.item()), 1.0)
+        for _ in range(max(int(max_iter), 1)):
+            adj = torch.zeros_like(phi)
+            adj.index_add_(0, edge_u, dual)
+            adj.index_add_(0, edge_v, -dual)
+            total_grad = grad_smooth + adj
+            stat = stationarity_residual_torch(
+                total_grad=total_grad,
+                phi=phi,
+                lower=lower,
+                upper=upper,
+                atol=atol,
+            )
+            dual[fused] = dual[fused] - float(step) * (
+                stat.index_select(0, edge_u)[fused] - stat.index_select(0, edge_v)[fused]
+            )
+            fused_norm = torch.linalg.norm(dual[fused], dim=1)
+            fused_radius = radius[fused]
+            scale = torch.maximum(torch.ones_like(fused_norm), fused_norm / fused_radius.clamp_min(1e-12))
+            dual[fused] = dual[fused] / scale[:, None]
+            diag = graph_fusion_kkt_residual_from_grad_torch(
+                phi=phi,
+                grad_smooth=grad_smooth,
+                dual_kkt=dual,
+                lower=lower,
+                upper=upper,
+                edge_u=edge_u,
+                edge_v=edge_v,
+                edge_w=edge_w,
+                lambda_value=lambda_value,
+                atol=atol,
+            )
+            residual = float(diag["kkt_residual"])
+            if residual < best_residual:
+                best_residual = residual
+                best_diag = diag
+                best_dual = dual.clone()
+
+    return {
+        "dual": best_dual,
+        "diag": best_diag,
+        "status": "refined_fused_edge_dual" if torch.any(fused) else "analytic_nonfused_dual",
+        "dual_refined": bool(torch.any(fused)),
+        "fused_edges": int(torch.sum(fused).item()),
+        "nonzero_edges": int(torch.sum(active).item()),
+        "stationarity_before": float(before_diag["stationarity_residual"]),
+        "stationarity_after": float(best_diag["stationarity_residual"]),
+    }
+
+
 def inner_kkt_residual_torch(
     *,
     phi: torch.Tensor,

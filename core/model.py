@@ -65,6 +65,12 @@ class FitResult:
     outer_dual_ball_residual: float
     outer_box_residual: float
     fixed_objective_kkt_residual: float
+    outer_kkt_certificate_status: str
+    outer_kkt_dual_refined: bool
+    outer_kkt_fused_edges: int
+    outer_kkt_nonzero_edges: int
+    outer_stationarity_residual_before_dual_refine: float
+    outer_stationarity_residual_after_dual_refine: float
     converged_inner: bool
     converged_outer: bool
     final_relative_objective_change: float
@@ -167,6 +173,12 @@ def fit_single_stage_em(
         outer_dual_ball_residual=float(artifacts.outer_dual_ball_residual),
         outer_box_residual=float(artifacts.outer_box_residual),
         fixed_objective_kkt_residual=float(artifacts.fixed_objective_kkt_residual),
+        outer_kkt_certificate_status=str(artifacts.outer_kkt_certificate_status),
+        outer_kkt_dual_refined=bool(artifacts.outer_kkt_dual_refined),
+        outer_kkt_fused_edges=int(artifacts.outer_kkt_fused_edges),
+        outer_kkt_nonzero_edges=int(artifacts.outer_kkt_nonzero_edges),
+        outer_stationarity_residual_before_dual_refine=float(artifacts.outer_stationarity_residual_before_dual_refine),
+        outer_stationarity_residual_after_dual_refine=float(artifacts.outer_stationarity_residual_after_dual_refine),
         converged_inner=bool(artifacts.converged_inner),
         converged_outer=bool(artifacts.converged_outer),
         final_relative_objective_change=float(artifacts.final_relative_objective_change),

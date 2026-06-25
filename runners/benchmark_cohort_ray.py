@@ -37,6 +37,29 @@ from .pipeline import process_one_file_bundle
 from .selection import LAMBDA_GRID_MODES, is_adaptive_lambda_grid_mode
 
 
+def _resolve_effective_device(device: str | None) -> str:
+    requested = "auto" if device is None else str(device).strip().lower()
+    if requested == "cpu":
+        return "cpu"
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _cuda_device_count() -> int:
+    try:
+        import torch
+
+        return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
+
+
 _RESUME_DERIVED_CANDIDATE_COLUMNS = {
     "selected_lambda",
     "selected_lambda_representative",
@@ -597,7 +620,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--workers", type=int, default=24, help="Number of Ray workers.")
     parser.add_argument("--max-files", type=int, default=None, help="Optional cap on number of tumors.")
-    parser.add_argument("--flush-every", type=int, default=1, help="Write partial summaries every N finished tumors.")
+    parser.add_argument(
+        "--flush-every",
+        type=int,
+        default=0,
+        help="Write partial summaries every N finished tumors; 0 disables partial checkpoints.",
+    )
     parser.add_argument("--lambda-grid", default=None, help="Optional comma-separated lambda grid.")
     parser.add_argument(
         "--graph-file",
@@ -624,6 +652,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Candidate scoring objective. BIC-style scores use the post-hoc summary partition/log-likelihood pair; 'oracle_ari' uses simulation truth to select the best lambda and stores the optimal-ARI lambda range.",
     )
     parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability for major-copy multiplicity.")
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Execution device. 'auto' uses CUDA when available and otherwise falls back to CPU.",
+    )
     parser.add_argument("--dtype", choices=["auto", "float32", "float64"], default="auto", help="Torch runtime dtype.")
     parser.add_argument(
         "--missing-cna-policy",
@@ -678,6 +712,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
     if completed_tumor_ids:
         files = [path for path in files if path.stem not in completed_tumor_ids]
 
+    effective_device = _resolve_effective_device(args.device)
     fit_options = _fit_options_from_args(
         argparse.Namespace(
             outer_max_iter=args.outer_max_iter,
@@ -685,7 +720,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
             tol=args.tol,
             summary_tol=args.summary_tol,
             major_prior=args.major_prior,
-            device="cpu",
+            device=effective_device,
             dtype=args.dtype,
             verbose=args.verbose,
         )
@@ -701,7 +736,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "adaptive_weight_gamma": float(fit_options.adaptive_weight_gamma),
         "adaptive_weight_floor": float(fit_options.adaptive_weight_floor),
         "adaptive_weight_baseline": float(fit_options.adaptive_weight_baseline),
-        "device": "cpu",
+        "device": str(fit_options.device),
         "dtype": str(fit_options.dtype),
         "summary_tol": fit_options.summary_tol,
         "verbose": bool(fit_options.verbose),
@@ -721,7 +756,8 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "inner_max_iter": int(args.inner_max_iter),
         "tol": float(args.tol),
         "summary_tol": np.nan if args.summary_tol is None else float(args.summary_tol),
-        "device": "cpu",
+        "requested_device": str(args.device),
+        "device": str(fit_options.device),
         "dtype": str(args.dtype),
         "missing_cna_policy": str(args.missing_cna_policy),
         "major_prior": float(args.major_prior),
@@ -766,12 +802,16 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         existing_candidate_rows=existing_candidate_rows,
     )
 
-    ray.init(
-        num_cpus=max(int(args.workers), 1),
-        include_dashboard=False,
-        ignore_reinit_error=True,
-        log_to_driver=True,
-    )
+    ray_init_kwargs: dict[str, object] = {
+        "num_cpus": max(int(args.workers), 1),
+        "include_dashboard": False,
+        "ignore_reinit_error": True,
+        "log_to_driver": True,
+    }
+    cuda_count = _cuda_device_count() if effective_device == "cuda" else 0
+    if cuda_count > 0:
+        ray_init_kwargs["num_gpus"] = cuda_count
+    ray.init(**ray_init_kwargs)
 
     patient_rows: list[dict[str, float | int | str | bool]] = list(existing_patient_rows)
     candidate_rows: list[dict[str, float | int | str | bool]] = list(existing_candidate_rows)
@@ -780,6 +820,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
     in_flight: dict[ray.ObjectRef, Path] = {}
     file_iter = iter(files)
     max_in_flight = max(int(args.workers), 1)
+    num_gpus_per_task = 1.0 if effective_device == "cuda" and cuda_count > 0 else 0.0
 
     try:
         def submit_next() -> bool:
@@ -787,7 +828,12 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
                 file_path = next(file_iter)
             except StopIteration:
                 return False
-            future = _process_one_file_remote.remote(
+            remote_worker = (
+                _process_one_file_remote.options(num_gpus=num_gpus_per_task)
+                if num_gpus_per_task > 0.0
+                else _process_one_file_remote
+            )
+            future = remote_worker.remote(
                 file_path=str(file_path),
                 outdir=str(outdir),
                 simulation_root=str(simulation_root),
@@ -824,7 +870,8 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
             candidate_rows.extend({**meta, **row} for row in local_candidate_rows)
             completed += 1
 
-            if completed % max(int(args.flush_every), 1) == 0 or completed == total_files:
+            flush_every = int(args.flush_every)
+            if completed == total_files or (flush_every > 0 and completed % flush_every == 0):
                 patient_df = write_patient_checkpoint(
                     patient_rows,
                     outdir=outdir,

@@ -17,6 +17,7 @@ from .torch_backend import (
     graph_fusion_kkt_residual_from_grad_torch,
     objective_value_torch,
     pairwise_penalty_torch,
+    refine_graph_fusion_dual_certificate_torch,
     resolve_runtime,
     solve_majorized_subproblem_alm_torch,
     solve_majorized_subproblem_pdhg_torch,
@@ -211,6 +212,12 @@ def _fit_from_start(
         "box_residual": np.inf,
         "kkt_residual": np.inf,
     }
+    outer_kkt_certificate_status = "not_audited"
+    outer_kkt_dual_refined = False
+    outer_kkt_fused_edges = 0
+    outer_kkt_nonzero_edges = 0
+    outer_stationarity_residual_before_dual_refine = np.inf
+    outer_stationarity_residual_after_dual_refine = np.inf
     accepted_outer_steps = 0
     accepted_full_steps = 0
     accepted_damped_steps = 0
@@ -433,7 +440,7 @@ def _fit_from_start(
                     major_prior=major_prior,
                     eps=eps,
                 )
-                if np.isfinite(theta_objective) and theta_objective <= previous_objective - objective_tol:
+                if np.isfinite(theta_objective) and theta_objective <= previous_objective + objective_tol:
                     accepted = True
                     damped_accepted = True
                     accepted_outer_steps += 1
@@ -518,8 +525,48 @@ def _fit_from_start(
             converged = True
             break
 
+    final_terms = cell_terms_torch(torch_data, phi, major_prior=major_prior, eps=eps)
+    final_dual_audit = refine_graph_fusion_dual_certificate_torch(
+        phi=phi,
+        grad_smooth=final_terms.grad,
+        dual_kkt=dual_kkt,
+        lower=lower,
+        upper=upper,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        edge_w=edge_w,
+        lambda_value=lambda_value,
+        atol=max(tol, 1e-8),
+        max_iter=64,
+    )
+    final_outer_diag = final_dual_audit["diag"]
+    outer_kkt_certificate_status = str(final_dual_audit["status"])
+    outer_kkt_dual_refined = bool(final_dual_audit["dual_refined"])
+    outer_kkt_fused_edges = int(final_dual_audit["fused_edges"])
+    outer_kkt_nonzero_edges = int(final_dual_audit["nonzero_edges"])
+    outer_stationarity_residual_before_dual_refine = float(final_dual_audit["stationarity_before"])
+    outer_stationarity_residual_after_dual_refine = float(final_dual_audit["stationarity_after"])
+    converged_outer = bool(float(final_outer_diag["kkt_residual"]) <= 5.0 * tol)
+    valid_dual_certificate = outer_kkt_certificate_status in {
+        "zero_penalty_no_dual_needed",
+        "analytic_nonfused_dual",
+        "refined_fused_edge_dual",
+    }
+    selection_eligible = bool(
+        np.isfinite(float(objective))
+        and converged_outer
+        and valid_dual_certificate
+        and mm_consistency_violations == 0
+    )
+
     if converged:
         failure_reason = "converged"
+    elif selection_eligible and accepted_outer_steps == 0:
+        failure_reason = "start_already_stationary"
+    elif selection_eligible and accepted_damped_steps > 0 and accepted_full_steps == 0:
+        failure_reason = "fixed_objective_kkt_certified_after_damped_steps"
+    elif selection_eligible:
+        failure_reason = "fixed_objective_kkt_certified"
     elif mm_consistency_violations > 0:
         failure_reason = "mm_consistency_violation"
     elif accepted_outer_steps == 0:
@@ -546,7 +593,6 @@ def _fit_from_start(
         failure_reason = "inner_kkt_residual_above_tolerance"
     else:
         failure_reason = "outer_stopping_criteria_not_met"
-    selection_eligible = bool(converged and converged_outer and accepted_full_steps > 0)
 
     phi_np = phi.detach().cpu().numpy()
     gamma_np = gamma_major.detach().cpu().numpy()
@@ -632,6 +678,12 @@ def _fit_from_start(
         outer_dual_ball_residual=float(final_outer_diag["dual_ball_residual"]),
         outer_box_residual=float(final_outer_diag["box_residual"]),
         fixed_objective_kkt_residual=float(final_outer_diag["kkt_residual"]),
+        outer_kkt_certificate_status=str(outer_kkt_certificate_status),
+        outer_kkt_dual_refined=bool(outer_kkt_dual_refined),
+        outer_kkt_fused_edges=int(outer_kkt_fused_edges),
+        outer_kkt_nonzero_edges=int(outer_kkt_nonzero_edges),
+        outer_stationarity_residual_before_dual_refine=float(outer_stationarity_residual_before_dual_refine),
+        outer_stationarity_residual_after_dual_refine=float(outer_stationarity_residual_after_dual_refine),
         converged_inner=bool(converged_inner),
         converged_outer=bool(converged_outer),
         final_relative_objective_change=float(final_relative_objective_change),

@@ -210,6 +210,16 @@ def process_one_file_bundle(
         "outer_dual_ball_residual": float(best_fit.outer_dual_ball_residual),
         "outer_box_residual": float(best_fit.outer_box_residual),
         "fixed_objective_kkt_residual": float(best_fit.fixed_objective_kkt_residual),
+        "outer_kkt_certificate_status": str(best_fit.outer_kkt_certificate_status),
+        "outer_kkt_dual_refined": bool(best_fit.outer_kkt_dual_refined),
+        "outer_kkt_fused_edges": int(best_fit.outer_kkt_fused_edges),
+        "outer_kkt_nonzero_edges": int(best_fit.outer_kkt_nonzero_edges),
+        "outer_stationarity_residual_before_dual_refine": float(
+            best_fit.outer_stationarity_residual_before_dual_refine
+        ),
+        "outer_stationarity_residual_after_dual_refine": float(
+            best_fit.outer_stationarity_residual_after_dual_refine
+        ),
         "final_relative_objective_change": float(best_fit.final_relative_objective_change),
         "final_step_residual": float(best_fit.final_step_residual),
         "accepted_outer_steps": int(best_fit.accepted_outer_steps),

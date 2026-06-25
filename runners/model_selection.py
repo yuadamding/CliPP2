@@ -69,6 +69,7 @@ CV_STABILITY_MAX_PATH_CANDIDATES = 10
 CV_STABILITY_MAX_PATH_ROUNDS = 1
 CV_STABILITY_REFINE_PER_ROUND = 2
 CV_STABILITY_MAX_EVALUATED_LAMBDAS = 8
+CV_STABILITY_MIN_VALID_REPLICATES = 2
 
 
 @dataclass(frozen=True)
@@ -408,7 +409,8 @@ def _evaluate_cv_stability_for_path(
         "validation_loglik_mean": np.nan,
         "validation_loglik_se": np.nan,
         "validation_loglik_std": np.nan,
-        "validation_replicates": int(replicates),
+        "validation_replicates": 0,
+        "cv_invalid_replicates": 0,
         "instability": np.nan,
         "stability_pair_count": 0,
         "stability_pair_exact": False,
@@ -466,6 +468,7 @@ def _evaluate_cv_stability_for_path(
         lambda_value = float(full_fit.lambda_value)
         validation_logliks: list[float] = []
         replicate_labels: list[np.ndarray] = []
+        invalid_replicates = 0
         previous_phi: np.ndarray | None = None
         for train_data, validation_data in replicate_data:
             phi_start = previous_phi.copy() if use_warm_starts and previous_phi is not None else full_fit.phi.copy()
@@ -478,6 +481,9 @@ def _evaluate_cv_stability_for_path(
                 torch_data=None,
                 compute_summary=True,
             )
+            if not bool(train_fit.selection_eligible):
+                invalid_replicates += 1
+                continue
             validation_logliks.append(
                 _validation_loglik_for_fit(
                     train_fit,
@@ -492,7 +498,7 @@ def _evaluate_cv_stability_for_path(
 
         values = np.asarray(validation_logliks, dtype=float)
         finite_values = values[np.isfinite(values)]
-        if finite_values.size == 0:
+        if finite_values.size < min(int(CV_STABILITY_MIN_VALID_REPLICATES), max(int(replicates), 1)):
             continue
         mean = float(np.mean(finite_values))
         std = float(np.std(finite_values, ddof=1)) if finite_values.size > 1 else 0.0
@@ -508,6 +514,7 @@ def _evaluate_cv_stability_for_path(
             "validation_loglik_se": se,
             "validation_loglik_std": std,
             "validation_replicates": int(finite_values.size),
+            "cv_invalid_replicates": int(invalid_replicates + values.size - finite_values.size),
             "instability": float(instability),
             "stability_pair_count": int(pair_count),
             "stability_pair_exact": bool(exact_pairs),
@@ -522,9 +529,13 @@ def _evaluate_cv_stability_for_path(
             enriched.loc[row_mask, column] = value
 
     finite_cv = enriched["validation_loglik_mean"].to_numpy(dtype=float)
-    finite_mask = np.isfinite(finite_cv)
+    valid_replicates = enriched["validation_replicates"].to_numpy(dtype=int)
+    finite_mask = np.isfinite(finite_cv) & (valid_replicates >= int(CV_STABILITY_MIN_VALID_REPLICATES))
+    if "selection_eligible" in enriched.columns:
+        finite_mask &= enriched["selection_eligible"].astype(bool).to_numpy(dtype=bool)
     if np.any(finite_mask):
-        best_idx = int(np.nanargmax(finite_cv))
+        masked_cv = np.where(finite_mask, finite_cv, -np.inf)
+        best_idx = int(np.nanargmax(masked_cv))
         best_mean = float(enriched.iloc[best_idx]["validation_loglik_mean"])
         best_se = float(enriched.iloc[best_idx]["validation_loglik_se"])
         if not np.isfinite(best_se):
@@ -850,7 +861,10 @@ def _selected_lambda_signature_interval(
     selected_row = selected.iloc[0]
     selected_lambda = float(selected_row["lambda"])
     signature = str(selected_row.get("partition_signature", ""))
-    eligible = search_df.loc[search_df["converged"].astype(bool)].copy()
+    if "selection_eligible" in search_df.columns:
+        eligible = search_df.loc[search_df["selection_eligible"].astype(bool)].copy()
+    else:
+        eligible = search_df.loc[search_df["converged"].astype(bool)].copy()
     if eligible.empty:
         eligible = search_df.copy()
     eligible = _best_candidate_rows_by_lambda(eligible).sort_values("lambda").reset_index(drop=True)
@@ -1269,6 +1283,12 @@ def _evaluate_candidate(
         "outer_dual_ball_residual": float(fit.outer_dual_ball_residual),
         "outer_box_residual": float(fit.outer_box_residual),
         "fixed_objective_kkt_residual": float(fit.fixed_objective_kkt_residual),
+        "outer_kkt_certificate_status": str(fit.outer_kkt_certificate_status),
+        "outer_kkt_dual_refined": bool(fit.outer_kkt_dual_refined),
+        "outer_kkt_fused_edges": int(fit.outer_kkt_fused_edges),
+        "outer_kkt_nonzero_edges": int(fit.outer_kkt_nonzero_edges),
+        "outer_stationarity_residual_before_dual_refine": float(fit.outer_stationarity_residual_before_dual_refine),
+        "outer_stationarity_residual_after_dual_refine": float(fit.outer_stationarity_residual_after_dual_refine),
         "final_relative_objective_change": float(fit.final_relative_objective_change),
         "final_step_residual": float(fit.final_step_residual),
         "accepted_outer_steps": int(fit.accepted_outer_steps),
@@ -1368,9 +1388,19 @@ def _top_unique_oracle_lambdas(
 def _prefer_fit_candidate(candidate: FitResult, incumbent: FitResult | None) -> bool:
     if incumbent is None:
         return True
-    if candidate.converged and not incumbent.converged:
+    if candidate.selection_eligible and not incumbent.selection_eligible:
         return True
-    if candidate.converged != incumbent.converged:
+    if candidate.selection_eligible != incumbent.selection_eligible:
+        return False
+    if candidate.selection_eligible and incumbent.selection_eligible:
+        return bool(candidate.penalized_objective < incumbent.penalized_objective - 1e-8)
+    candidate_kkt = float(candidate.fixed_objective_kkt_residual)
+    incumbent_kkt = float(incumbent.fixed_objective_kkt_residual)
+    if np.isfinite(candidate_kkt) and np.isfinite(incumbent_kkt) and abs(candidate_kkt - incumbent_kkt) > 1e-8:
+        return bool(candidate_kkt < incumbent_kkt)
+    if np.isfinite(candidate_kkt) and not np.isfinite(incumbent_kkt):
+        return True
+    if not np.isfinite(candidate_kkt) and np.isfinite(incumbent_kkt):
         return False
     return bool(candidate.penalized_objective < incumbent.penalized_objective - 1e-8)
 
@@ -1879,12 +1909,15 @@ def _grid_search_selection(
             selection_df = converged_oracle_df
             selection_used_convergence_fallback = False
         else:
-            selection_df = oracle_df
-            selection_used_convergence_fallback = bool(not oracle_df.empty)
+            raise RuntimeError(
+                f"No KKT-certified oracle candidates were eligible for model selection for tumor {data.tumor_id}."
+            )
     else:
         num_selection_eligible_candidates = int(np.sum(candidate_selection_eligible_mask))
-        selection_df = search_df.loc[candidate_selection_eligible_mask].copy() if num_selection_eligible_candidates > 0 else search_df.copy()
-        selection_used_convergence_fallback = bool(num_selection_eligible_candidates == 0 and num_candidates > 0)
+        if num_selection_eligible_candidates == 0:
+            raise RuntimeError(f"No KKT-certified candidates were eligible for model selection for tumor {data.tumor_id}.")
+        selection_df = search_df.loc[candidate_selection_eligible_mask].copy()
+        selection_used_convergence_fallback = False
 
     if selection_df.empty:
         raise RuntimeError(f"No candidate fits were evaluated for tumor {data.tumor_id}.")
@@ -1893,7 +1926,13 @@ def _grid_search_selection(
 
     cv_selection_used = False
     if cv_lambda_mode and normalized_score != "oracle_ari":
-        cv_df = selection_df.loc[np.isfinite(selection_df["validation_loglik_mean"].to_numpy(dtype=float))].copy()
+        cv_mask = (
+            np.isfinite(selection_df["validation_loglik_mean"].to_numpy(dtype=float))
+            & (selection_df["validation_replicates"].to_numpy(dtype=int) >= int(CV_STABILITY_MIN_VALID_REPLICATES))
+        )
+        if cv_requires_stability:
+            cv_mask &= selection_df["cv_stability_eligible"].astype(bool).to_numpy(dtype=bool)
+        cv_df = selection_df.loc[cv_mask].copy()
         if not cv_df.empty:
             cv_values = cv_df["validation_loglik_mean"].to_numpy(dtype=float)
             best_cv_pos = int(np.nanargmax(cv_values))
@@ -1904,8 +1943,7 @@ def _grid_search_selection(
             one_se_df = cv_df.loc[cv_df["validation_loglik_mean"].to_numpy(dtype=float) >= best_cv_mean - best_cv_se - 1e-12].copy()
             if one_se_df.empty:
                 one_se_df = cv_df.iloc[[best_cv_pos]].copy()
-            stable_df = one_se_df.loc[one_se_df["cv_stability_eligible"].astype(bool)].copy()
-            candidate_df = stable_df if cv_requires_stability and not stable_df.empty else one_se_df
+            candidate_df = one_se_df
             best_row = candidate_df.sort_values(
                 ["lambda", "validation_loglik_mean", "instability", "selection_step"],
                 ascending=[False, False, True, True],
@@ -2006,10 +2044,7 @@ def _grid_search_selection(
             )
     else:
         final_oracle_search_stop_reason = oracle_search_stop_reason
-    if normalized_score == "oracle_ari":
-        eligible_mask = np.isfinite(search_df["ARI"].to_numpy(dtype=float))
-    else:
-        eligible_mask = candidate_selection_eligible_mask
+    eligible_mask = candidate_selection_eligible_mask
     search_df["eligible_for_selection"] = eligible_mask
     search_df["is_selection_optimal"] = search_df["_candidate_id"].astype(int).isin(selection_optimal_ids)
     search_df["is_ari_optimal"] = search_df["_candidate_id"].astype(int).isin(ari_optimal_ids)

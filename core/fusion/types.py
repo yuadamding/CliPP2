@@ -63,6 +63,12 @@ class FusionFitArtifacts:
     outer_dual_ball_residual: float
     outer_box_residual: float
     fixed_objective_kkt_residual: float
+    outer_kkt_certificate_status: str
+    outer_kkt_dual_refined: bool
+    outer_kkt_fused_edges: int
+    outer_kkt_nonzero_edges: int
+    outer_stationarity_residual_before_dual_refine: float
+    outer_stationarity_residual_after_dual_refine: float
     converged_inner: bool
     converged_outer: bool
     final_relative_objective_change: float
