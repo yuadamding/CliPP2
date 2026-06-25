@@ -59,8 +59,18 @@ class FusionFitArtifacts:
     last_attempted_em_envelope_gap: float
     best_attempted_em_envelope_gap: float
     outer_stationarity_residual: float
+    outer_projected_stationarity_residual: float
+    outer_projected_stationarity_norm: float
+    outer_stationarity_normalizer: float
+    outer_smooth_gradient_norm: float
+    outer_fusion_adjustment_norm: float
     outer_edge_subgradient_residual: float
     outer_dual_ball_residual: float
+    outer_box_primal_violation: float
+    outer_num_interior_coordinates: int
+    outer_num_lower_active_coordinates: int
+    outer_num_upper_active_coordinates: int
+    outer_num_frozen_coordinates: int
     outer_box_residual: float
     fixed_objective_kkt_residual: float
     outer_kkt_certificate_status: str

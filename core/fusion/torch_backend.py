@@ -373,8 +373,19 @@ def graph_fusion_kkt_residual_from_grad_torch(
         adj.index_add_(0, edge_v, -dual)
     total_grad = grad_smooth + adj
     stat = stationarity_residual_torch(total_grad=total_grad, phi=phi, lower=lower, upper=upper, atol=atol)
-    stat_denom = 1.0 + torch.linalg.norm(grad_smooth) + torch.linalg.norm(adj)
-    stationarity_residual = float((torch.linalg.norm(stat) / stat_denom).item())
+    smooth_gradient_norm = float(torch.linalg.norm(grad_smooth).item())
+    fusion_adjustment_norm = float(torch.linalg.norm(adj).item())
+    projected_stationarity_norm = float(torch.linalg.norm(stat).item())
+    stationarity_normalizer = float(1.0 + smooth_gradient_norm + fusion_adjustment_norm)
+    stationarity_residual = float(projected_stationarity_norm / max(stationarity_normalizer, 1e-300))
+    lower_active = phi <= lower + float(atol)
+    upper_active = phi >= upper - float(atol)
+    frozen = upper <= lower + float(atol)
+    interior = ~(lower_active | upper_active | frozen)
+    diagnostic_upper_active = upper_active & ~frozen
+    diagnostic_lower_active = lower_active & ~upper_active & ~frozen
+    box_violation = torch.maximum(torch.clamp(lower - phi, min=0.0), torch.clamp(phi - upper, min=0.0))
+    box_primal_violation = float(torch.max(box_violation).item()) if box_violation.numel() else 0.0
 
     if edge_u.numel() == 0 or lambda_value <= 0.0:
         edge_subgradient_residual = 0.0
@@ -400,8 +411,18 @@ def graph_fusion_kkt_residual_from_grad_torch(
 
     return {
         "stationarity_residual": stationarity_residual,
+        "projected_stationarity_residual": stationarity_residual,
+        "projected_stationarity_norm": projected_stationarity_norm,
+        "stationarity_normalizer": stationarity_normalizer,
+        "smooth_gradient_norm": smooth_gradient_norm,
+        "fusion_adjustment_norm": fusion_adjustment_norm,
         "edge_subgradient_residual": edge_subgradient_residual,
         "dual_ball_residual": dual_ball_residual,
+        "box_primal_violation": box_primal_violation,
+        "num_interior_coordinates": int(torch.sum(interior).item()),
+        "num_lower_active_coordinates": int(torch.sum(diagnostic_lower_active).item()),
+        "num_upper_active_coordinates": int(torch.sum(diagnostic_upper_active).item()),
+        "num_frozen_coordinates": int(torch.sum(frozen).item()),
         "box_residual": stationarity_residual,
         "kkt_residual": max(stationarity_residual, edge_subgradient_residual),
     }

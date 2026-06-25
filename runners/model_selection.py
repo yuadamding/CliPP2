@@ -53,6 +53,7 @@ LAMBDA_SEARCH_MAX = 1e6
 ADAPTIVE_PATH_MAX_CANDIDATES = 40
 ADAPTIVE_PATH_MAX_ROUNDS = 4
 ADAPTIVE_PATH_REFINE_PER_ROUND = 5
+ADAPTIVE_PATH_TRANSITION_PROBE_MAX_CANDIDATES = 3
 ADAPTIVE_PATH_LOG10_WIDTH_TOL = 0.05
 ADAPTIVE_PATH_VALUE_CURVE_TOL = 1e-4
 ADAPTIVE_PATH_FULL_FUSION_MAX_ITER = 80
@@ -876,13 +877,52 @@ def _annotate_polish_candidates(
         if "fixed_objective_kkt_residual" in enriched.columns
         else np.full(n_rows, np.nan, dtype=float)
     )
+    accepted_steps = (
+        enriched["accepted_outer_steps"].to_numpy(dtype=float)
+        if "accepted_outer_steps" in enriched.columns
+        else np.zeros(n_rows, dtype=float)
+    )
+    relative_changes = (
+        enriched["final_relative_objective_change"].to_numpy(dtype=float)
+        if "final_relative_objective_change" in enriched.columns
+        else np.zeros(n_rows, dtype=float)
+    )
+    step_residuals = (
+        enriched["final_step_residual"].to_numpy(dtype=float)
+        if "final_step_residual" in enriched.columns
+        else np.zeros(n_rows, dtype=float)
+    )
     selection_eligible = _bic_selection_eligible_mask(enriched)
-    provisional = np.isfinite(objectives) & np.isfinite(scores) & (mm_violations <= 0.0)
+    provisional = np.isfinite(objectives) & np.isfinite(scores) & np.isfinite(kkt_residuals) & (mm_violations <= 0.0)
     failed = provisional & ~selection_eligible
     certified = provisional & selection_eligible
     repair_tol = _kkt_polish_repair_tol(tol)
     near_kkt = failed & np.isfinite(kkt_residuals) & (kkt_residuals <= repair_tol)
-    repairable_kkt = failed & np.isfinite(kkt_residuals) & (kkt_residuals <= KKT_POLISH_REPAIR_CEILING)
+    repairable_kkt = failed & (kkt_residuals <= KKT_POLISH_REPAIR_CEILING)
+    moving = (
+        (accepted_steps > 0.0)
+        & (
+            (relative_changes > float(tol))
+            | (step_residuals > float(np.sqrt(max(float(tol), 1e-10))))
+        )
+    )
+    continuable = failed & moving
+
+    enriched["provisional_score"] = np.where(provisional, scores, np.nan)
+    ranks = pd.Series(np.nan, index=enriched.index, dtype=float)
+    if np.any(provisional):
+        rank_values = enriched.loc[provisional, "provisional_score"].rank(
+            method="min",
+            ascending=not _score_maximized(normalized_score),
+        )
+        ranks.loc[rank_values.index] = rank_values
+    rank_array = ranks.to_numpy(dtype=float)
+    rank_rescue = (
+        continuable
+        & np.isfinite(rank_array)
+        & (rank_array <= float(KKT_POLISH_RESCUE_MAX_CANDIDATES))
+    )
+    stalled_nonstationary = failed & ~moving & (kkt_residuals > repair_tol)
 
     score_competitive = np.zeros(n_rows, dtype=bool)
     if np.any(provisional):
@@ -896,7 +936,7 @@ def _annotate_polish_candidates(
                 if _score_maximized(normalized_score)
                 else float(np.min(provisional_scores))
             )
-        score_competitive = repairable_kkt & _score_competitive_mask(
+        score_competitive = continuable & _score_competitive_mask(
             scores,
             best_score=best_score,
             normalized_score=normalized_score,
@@ -946,29 +986,27 @@ def _annotate_polish_candidates(
                         )[0]
                     )
                 changed_partition = str(neighbor.get("partition_signature", "")) != str(current.get("partition_signature", ""))
-                if repairable_kkt[source_pos] and (better_or_close or changed_partition):
+                if continuable[source_pos] and (better_or_close or changed_partition):
                     boundary_neighbor[source_pos] = True
 
     priority = (
         4.0 * near_kkt.astype(float)
         + 3.0 * score_competitive.astype(float)
+        + 2.5 * rank_rescue.astype(float)
         + 2.0 * partition_diff.astype(float)
         + 1.0 * boundary_neighbor.astype(float)
     )
-    core_polish_trigger = near_kkt | score_competitive | boundary_neighbor
+    core_polish_trigger = near_kkt | score_competitive | rank_rescue | boundary_neighbor
     promising = failed & core_polish_trigger
 
-    enriched["provisional_score"] = np.where(provisional, scores, np.nan)
-    ranks = pd.Series(np.nan, index=enriched.index, dtype=float)
-    if np.any(provisional):
-        rank_values = enriched.loc[provisional, "provisional_score"].rank(
-            method="min",
-            ascending=not _score_maximized(normalized_score),
-        )
-        ranks.loc[rank_values.index] = rank_values
     enriched["provisional_rank"] = ranks
+    enriched["repairable_kkt_for_polish"] = repairable_kkt
+    enriched["moving_for_polish"] = moving
+    enriched["continuable_for_polish"] = continuable
     enriched["near_kkt_for_polish"] = near_kkt
     enriched["score_competitive_for_polish"] = score_competitive
+    enriched["rank_rescue_for_polish"] = rank_rescue
+    enriched["stalled_nonstationary_for_polish"] = stalled_nonstationary
     enriched["path_boundary_for_polish"] = boundary_neighbor
     enriched["partition_diff_for_polish"] = partition_diff
     if "promising_for_polish" in enriched.columns:
@@ -1264,10 +1302,10 @@ def _selected_lambda_signature_interval(
     if lambdas.size == 0:
         return selected_lambda, selected_lambda, 0.0
     if selected_lambda > 0.0:
-        distances = np.where(
-            lambdas > 0.0,
-            np.abs(np.log(lambdas) - np.log(selected_lambda)),
-            np.inf,
+        distances = np.full(lambdas.shape, np.inf, dtype=float)
+        positive_lambda_mask = lambdas > 0.0
+        distances[positive_lambda_mask] = np.abs(
+            np.log(lambdas[positive_lambda_mask]) - np.log(selected_lambda)
         )
         if not np.any(np.isfinite(distances)):
             distances = np.abs(lambdas - selected_lambda)
@@ -1528,8 +1566,18 @@ def _evaluate_candidate(
         "last_attempted_em_envelope_gap": float(fit.last_attempted_em_envelope_gap),
         "best_attempted_em_envelope_gap": float(fit.best_attempted_em_envelope_gap),
         "outer_stationarity_residual": float(fit.outer_stationarity_residual),
+        "outer_projected_stationarity_residual": float(fit.outer_projected_stationarity_residual),
+        "outer_projected_stationarity_norm": float(fit.outer_projected_stationarity_norm),
+        "outer_stationarity_normalizer": float(fit.outer_stationarity_normalizer),
+        "outer_smooth_gradient_norm": float(fit.outer_smooth_gradient_norm),
+        "outer_fusion_adjustment_norm": float(fit.outer_fusion_adjustment_norm),
         "outer_edge_subgradient_residual": float(fit.outer_edge_subgradient_residual),
         "outer_dual_ball_residual": float(fit.outer_dual_ball_residual),
+        "outer_box_primal_violation": float(fit.outer_box_primal_violation),
+        "outer_num_interior_coordinates": int(fit.outer_num_interior_coordinates),
+        "outer_num_lower_active_coordinates": int(fit.outer_num_lower_active_coordinates),
+        "outer_num_upper_active_coordinates": int(fit.outer_num_upper_active_coordinates),
+        "outer_num_frozen_coordinates": int(fit.outer_num_frozen_coordinates),
         "outer_box_residual": float(fit.outer_box_residual),
         "fixed_objective_kkt_residual": float(fit.fixed_objective_kkt_residual),
         "raw_kkt_residual": float(fit.fixed_objective_kkt_residual),
@@ -1628,11 +1676,12 @@ def _representative_optimal_row(
     ranked_df = tied_df.copy()
     lambda_values = ranked_df["lambda"].to_numpy(dtype=float)
     if target_lambda > 0.0:
-        ranked_df["_repr_log_distance"] = np.where(
-            lambda_values > 0.0,
-            np.abs(np.log(lambda_values) - np.log(target_lambda)),
-            np.inf,
+        distances = np.full(lambda_values.shape, np.inf, dtype=float)
+        positive_lambda_mask = lambda_values > 0.0
+        distances[positive_lambda_mask] = np.abs(
+            np.log(lambda_values[positive_lambda_mask]) - np.log(target_lambda)
         )
+        ranked_df["_repr_log_distance"] = distances
     else:
         ranked_df["_repr_log_distance"] = np.abs(lambda_values - target_lambda)
     return ranked_df.sort_values(

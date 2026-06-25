@@ -62,8 +62,18 @@ class FitResult:
     last_attempted_em_envelope_gap: float
     best_attempted_em_envelope_gap: float
     outer_stationarity_residual: float
+    outer_projected_stationarity_residual: float
+    outer_projected_stationarity_norm: float
+    outer_stationarity_normalizer: float
+    outer_smooth_gradient_norm: float
+    outer_fusion_adjustment_norm: float
     outer_edge_subgradient_residual: float
     outer_dual_ball_residual: float
+    outer_box_primal_violation: float
+    outer_num_interior_coordinates: int
+    outer_num_lower_active_coordinates: int
+    outer_num_upper_active_coordinates: int
+    outer_num_frozen_coordinates: int
     outer_box_residual: float
     fixed_objective_kkt_residual: float
     outer_kkt_certificate_status: str
@@ -183,8 +193,18 @@ def fit_single_stage_em(
         last_attempted_em_envelope_gap=float(artifacts.last_attempted_em_envelope_gap),
         best_attempted_em_envelope_gap=float(artifacts.best_attempted_em_envelope_gap),
         outer_stationarity_residual=float(artifacts.outer_stationarity_residual),
+        outer_projected_stationarity_residual=float(artifacts.outer_projected_stationarity_residual),
+        outer_projected_stationarity_norm=float(artifacts.outer_projected_stationarity_norm),
+        outer_stationarity_normalizer=float(artifacts.outer_stationarity_normalizer),
+        outer_smooth_gradient_norm=float(artifacts.outer_smooth_gradient_norm),
+        outer_fusion_adjustment_norm=float(artifacts.outer_fusion_adjustment_norm),
         outer_edge_subgradient_residual=float(artifacts.outer_edge_subgradient_residual),
         outer_dual_ball_residual=float(artifacts.outer_dual_ball_residual),
+        outer_box_primal_violation=float(artifacts.outer_box_primal_violation),
+        outer_num_interior_coordinates=int(artifacts.outer_num_interior_coordinates),
+        outer_num_lower_active_coordinates=int(artifacts.outer_num_lower_active_coordinates),
+        outer_num_upper_active_coordinates=int(artifacts.outer_num_upper_active_coordinates),
+        outer_num_frozen_coordinates=int(artifacts.outer_num_frozen_coordinates),
         outer_box_residual=float(artifacts.outer_box_residual),
         fixed_objective_kkt_residual=float(artifacts.fixed_objective_kkt_residual),
         outer_kkt_certificate_status=str(artifacts.outer_kkt_certificate_status),
