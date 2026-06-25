@@ -49,7 +49,7 @@ def summarize_patient_regime(data: TumorData) -> PatientRegime:
 def recommend_settings_from_regime(
     regime: TumorRegime,
     *,
-    selection_score: str = "ebic",
+    selection_score: str = "classic_bic",
 ) -> RecommendedSettings:
     normalized_score = str(selection_score).strip().lower()
 
@@ -57,38 +57,38 @@ def recommend_settings_from_regime(
         return RecommendedSettings(
             profile_name="pairwise_fusion_oracle_dense",
             lambda_grid_mode="ultra_dense_no_zero",
-            bic_df_scale=8.0,
-            bic_cluster_penalty=4.0,
+            bic_df_scale=1.0,
+            bic_cluster_penalty=0.0,
         )
 
     if regime.num_regions <= 2 or regime.depth_scale <= 300.0 or regime.num_mutations <= 800:
         return RecommendedSettings(
-            profile_name="pairwise_fusion_adaptive_cv_stability",
-            lambda_grid_mode="adaptive_cv_stability",
-            bic_df_scale=8.0,
-            bic_cluster_penalty=4.0,
+            profile_name="pairwise_fusion_adaptive_bic",
+            lambda_grid_mode="adaptive_bic",
+            bic_df_scale=1.0,
+            bic_cluster_penalty=0.0,
         )
 
     if regime.num_regions >= 10 or regime.num_mutations >= 2500:
         return RecommendedSettings(
-            profile_name="pairwise_fusion_adaptive_cv_stability_large",
-            lambda_grid_mode="adaptive_cv_stability",
-            bic_df_scale=8.0,
-            bic_cluster_penalty=4.0,
+            profile_name="pairwise_fusion_adaptive_bic_large",
+            lambda_grid_mode="adaptive_bic",
+            bic_df_scale=1.0,
+            bic_cluster_penalty=0.0,
         )
 
     return RecommendedSettings(
-        profile_name="pairwise_fusion_adaptive_cv_stability_default",
-        lambda_grid_mode="adaptive_cv_stability",
-        bic_df_scale=8.0,
-        bic_cluster_penalty=4.0,
+        profile_name="pairwise_fusion_adaptive_bic_default",
+        lambda_grid_mode="adaptive_bic",
+        bic_df_scale=1.0,
+        bic_cluster_penalty=0.0,
     )
 
 
 def recommend_settings_from_data(
     data: TumorData,
     *,
-    selection_score: str = "ebic",
+    selection_score: str = "classic_bic",
 ) -> RecommendedSettings:
     return recommend_settings_from_regime(
         summarize_tumor_regime(data),

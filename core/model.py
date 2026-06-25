@@ -20,9 +20,10 @@ class FitOptions:
     adaptive_weight_gamma: float = 1.0
     adaptive_weight_floor: float = 1e-6
     adaptive_weight_baseline: float = 1.0
-    device: str = "auto"
-    dtype: str = "auto"
-    summary_tol: float | None = None
+    device: str = "cuda"
+    dtype: str = "float64"
+    summary_tol: float | None = 1e-4
+    bic_partition_tol: float | None = 1e-4
     verbose: bool = False
 
 
@@ -93,6 +94,19 @@ class FitResult:
     bic: float | None = None
     classic_bic: float | None = None
     extended_bic: float | None = None
+    classic_bic_depth_n: float | None = None
+    bic_loglik: float | None = None
+    bic_loglik_source: str | None = None
+    bic_df: float | None = None
+    bic_active_df: float | None = None
+    bic_n_eff: float | None = None
+    bic_depth_n_eff: float | None = None
+    bic_partition_tol: float | None = None
+    bic_refit_boundary_count: int | None = None
+    bic_refit_converged: bool | None = None
+    bic_refit_phi: np.ndarray | None = None
+    bic_refit_cluster_centers: np.ndarray | None = None
+    bic_partition_labels: np.ndarray | None = None
     selection_score_name: str | None = None
 
 

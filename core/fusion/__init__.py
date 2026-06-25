@@ -4,7 +4,8 @@ from .graph import (
     load_pairwise_fusion_graph_tsv,
     resolve_pairwise_fusion_graph,
 )
-from .solver import fit_observed_data_pairwise_fusion
+from .solver import cluster_labels_from_edges, fit_observed_data_pairwise_fusion
+from .refit import PartitionRefitResult, partition_constrained_observed_refit
 from .starts import (
     compute_exact_observed_data_pilot,
     compute_pooled_observed_data_start,
@@ -16,10 +17,13 @@ from .types import FusionFitArtifacts, PairwiseFusionGraph, TorchRuntime
 __all__ = [
     "FusionFitArtifacts",
     "PairwiseFusionGraph",
+    "PartitionRefitResult",
     "TorchRuntime",
     "build_complete_adaptive_graph",
     "build_complete_uniform_graph",
+    "cluster_labels_from_edges",
     "load_pairwise_fusion_graph_tsv",
+    "partition_constrained_observed_refit",
     "resolve_pairwise_fusion_graph",
     "compute_exact_observed_data_pilot",
     "compute_pooled_observed_data_start",

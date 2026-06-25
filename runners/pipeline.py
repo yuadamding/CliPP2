@@ -23,12 +23,12 @@ def process_one_file_bundle(
     outdir: str | Path,
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
-    lambda_grid_mode: str = "dense_no_zero",
+    lambda_grid_mode: str = "adaptive_bic",
     fit_options: FitOptions | None = None,
-    bic_df_scale: float = 8.0,
-    bic_cluster_penalty: float = 4.0,
+    bic_df_scale: float = 1.0,
+    bic_cluster_penalty: float = 0.0,
     settings_profile: str = "manual",
-    selection_score: str = "ebic",
+    selection_score: str = "classic_bic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
@@ -88,6 +88,13 @@ def process_one_file_bundle(
         if best_evaluation is not None
         else None
     )
+    selected_ari_source = (
+        "candidate_selected_lambda"
+        if selection_result.selected_ari is not None
+        else "final_evaluation_selected_lambda"
+        if best_evaluation is not None
+        else "not_available"
+    )
 
     summary = {
         "tumor_id": data.tumor_id,
@@ -137,7 +144,7 @@ def process_one_file_bundle(
         "cv_stability_replicates": int(selection_result.cv_stability_replicates),
         "cv_stability_threshold": float(selection_result.cv_stability_threshold),
         "selection_loglik_kind": (
-            "summary_clustered"
+            "partition_constrained_observed_mle"
             if str(best_fit.selection_score_name or selection_score) != "oracle_ari"
             else "oracle_ari_finalized_selected_fit"
             if bool(finalize_selected_fit)
@@ -188,6 +195,9 @@ def process_one_file_bundle(
         "selection_boundary_unresolved": bool(selection_result.selection_boundary_unresolved),
         "selection_optimum_resolved": bool(selection_result.selection_optimum_resolved),
         "selected_ari": np.nan if reported_selected_ari is None else float(reported_selected_ari),
+        "selected_ari_source": selected_ari_source,
+        "selected_ari_lambda": np.nan if reported_selected_ari is None else float(best_fit.lambda_value),
+        "selected_ari_matches_selected_lambda": bool(reported_selected_ari is not None),
         "best_ari": np.nan if selection_result.best_ari is None else float(selection_result.best_ari),
         "best_ari_all_evaluated": np.nan
         if getattr(selection_result, "best_ari_all_evaluated", None) is None
@@ -239,6 +249,26 @@ def process_one_file_bundle(
         "lambda_grid_mode": str(lambda_grid_mode if lambda_grid is None else "explicit"),
         "bic_df_scale": float(selection_result.bic_df_scale),
         "bic_cluster_penalty": float(selection_result.bic_cluster_penalty),
+        "bic_loglik": np.nan if best_fit.bic_loglik is None else float(best_fit.bic_loglik),
+        "bic_loglik_source": str(best_fit.bic_loglik_source or ""),
+        "bic_df": np.nan if best_fit.bic_df is None else float(best_fit.bic_df),
+        "bic_active_df": np.nan if best_fit.bic_active_df is None else float(best_fit.bic_active_df),
+        "bic_n_eff": np.nan if best_fit.bic_n_eff is None else float(best_fit.bic_n_eff),
+        "bic_depth_n_eff": np.nan if best_fit.bic_depth_n_eff is None else float(best_fit.bic_depth_n_eff),
+        "classic_bic_depth_n": np.nan
+        if best_fit.classic_bic_depth_n is None
+        else float(best_fit.classic_bic_depth_n),
+        "bic_partition_tol": np.nan
+        if best_fit.bic_partition_tol is None
+        else float(best_fit.bic_partition_tol),
+        "bic_refit_boundary_count": -1
+        if best_fit.bic_refit_boundary_count is None
+        else int(best_fit.bic_refit_boundary_count),
+        "bic_refit_converged": bool(best_fit.bic_refit_converged)
+        if best_fit.bic_refit_converged is not None
+        else False,
+        "primary_phi_source": "raw_penalized_fit",
+        "bic_refit_phi_source": "secondary_partition_refit",
         "converged": bool(best_fit.converged),
         "converged_inner": bool(best_fit.converged_inner),
         "converged_outer": bool(best_fit.converged_outer),
@@ -323,12 +353,12 @@ def process_one_file(
     outdir: str | Path,
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
-    lambda_grid_mode: str = "dense_no_zero",
+    lambda_grid_mode: str = "adaptive_bic",
     fit_options: FitOptions | None = None,
-    bic_df_scale: float = 8.0,
-    bic_cluster_penalty: float = 4.0,
+    bic_df_scale: float = 1.0,
+    bic_cluster_penalty: float = 0.0,
     settings_profile: str = "manual",
-    selection_score: str = "ebic",
+    selection_score: str = "classic_bic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
@@ -360,13 +390,13 @@ def run_directory(
     outdir: str | Path,
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
-    lambda_grid_mode: str = "dense_no_zero",
+    lambda_grid_mode: str = "adaptive_bic",
     fit_options: FitOptions | None = None,
     max_files: int | None = None,
-    bic_df_scale: float = 8.0,
-    bic_cluster_penalty: float = 4.0,
+    bic_df_scale: float = 1.0,
+    bic_cluster_penalty: float = 0.0,
     settings_profile: str = "manual",
-    selection_score: str = "ebic",
+    selection_score: str = "classic_bic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     graph_file: str | Path | None = None,

@@ -207,25 +207,34 @@ def _process_one_file_remote(
             message="The number of unique classes is greater than 50% of the number of samples.*",
             category=UserWarning,
         )
-        summary, search_df = process_one_file_bundle(
-            file_path=Path(file_path),
-            outdir=Path(outdir),
-            simulation_root=Path(simulation_root),
-            lambda_grid=lambda_grid,
-            lambda_grid_mode=lambda_grid_mode,
-            fit_options=FitOptions(**fit_options_kwargs),
-            bic_df_scale=bic_df_scale,
-            bic_cluster_penalty=bic_cluster_penalty,
-            settings_profile=settings_profile,
-            selection_score=selection_score,
-            use_warm_starts=use_warm_starts,
-            write_outputs=write_outputs,
-            finalize_selected_fit=finalize_selected_fit,
-            graph_file=None if graph_file is None else Path(graph_file),
-            missing_cna_policy=str(missing_cna_policy),
-        )
+        try:
+            summary, search_df = process_one_file_bundle(
+                file_path=Path(file_path),
+                outdir=Path(outdir),
+                simulation_root=Path(simulation_root),
+                lambda_grid=lambda_grid,
+                lambda_grid_mode=lambda_grid_mode,
+                fit_options=FitOptions(**fit_options_kwargs),
+                bic_df_scale=bic_df_scale,
+                bic_cluster_penalty=bic_cluster_penalty,
+                settings_profile=settings_profile,
+                selection_score=selection_score,
+                use_warm_starts=use_warm_starts,
+                write_outputs=write_outputs,
+                finalize_selected_fit=finalize_selected_fit,
+                graph_file=None if graph_file is None else Path(graph_file),
+                missing_cna_policy=str(missing_cna_policy),
+            )
+            candidate_rows = search_df.to_dict(orient="records")
+        except Exception as exc:
+            summary = {
+                "tumor_id": Path(file_path).stem,
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            }
+            candidate_rows = []
         summary.update(runtime_diagnostics)
-        candidate_rows = search_df.to_dict(orient="records")
         return {
             "summary": summary,
             "candidate_rows": candidate_rows,
@@ -714,30 +723,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lambda-grid-mode",
         choices=list(LAMBDA_GRID_MODES),
-        default="dense_no_zero",
+        default="adaptive_bic",
         help="Automatic lambda grid template when --lambda-grid is not provided.",
     )
     parser.add_argument("--outer-max-iter", type=int, default=4, help="Maximum outer majorization iterations.")
     parser.add_argument("--inner-max-iter", type=int, default=30, help="Maximum inner solver iterations.")
     parser.add_argument("--tol", type=float, default=1e-4, help="Optimization tolerance.")
-    parser.add_argument("--summary-tol", type=float, default=None, help="Optional explicit summary clustering tolerance.")
-    parser.add_argument("--bic-df-scale", type=float, default=8.0, help="Extended BIC CP degrees-of-freedom scale.")
-    parser.add_argument("--bic-cluster-penalty", type=float, default=4.0, help="Extended BIC cluster-count penalty.")
+    parser.add_argument("--summary-tol", type=float, default=1e-4, help="Explicit display summary clustering tolerance.")
+    parser.add_argument("--bic-partition-tol", type=float, default=1e-4, help="Explicit partition tolerance used for BIC scoring.")
+    parser.add_argument("--bic-df-scale", type=float, default=1.0, help="Extended BIC CP degrees-of-freedom scale.")
+    parser.add_argument("--bic-cluster-penalty", type=float, default=0.0, help="Extended BIC cluster-count penalty.")
     parser.add_argument("--settings-profile", choices=["manual", "auto"], default="auto", help="Model-selection strategy.")
     parser.add_argument(
         "--selection-score",
-        choices=["ebic", "classic_bic", "refit_ebic", "classic_refit_bic", "oracle_ari"],
-        default="oracle_ari",
-        help="Candidate scoring objective. BIC-style scores use the post-hoc summary partition/log-likelihood pair; 'oracle_ari' uses simulation truth to select the best lambda and stores the optimal-ARI lambda range.",
+        choices=[
+            "classic_bic",
+            "partition_refit_bic",
+            "ebic",
+            "partition_refit_ebic",
+            "refit_ebic",
+            "classic_refit_bic",
+            "oracle_ari",
+        ],
+        default="classic_bic",
+        help="Candidate scoring objective. BIC-style scores use a partition-constrained observed-data refit; 'oracle_ari' uses simulation truth to select the best lambda.",
     )
     parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability for major-copy multiplicity.")
     parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
-        default="auto",
-        help="Execution device. 'auto' uses CUDA when available and otherwise falls back to CPU.",
+        default="cuda",
+        help="Execution device. CUDA is the default and falls back to CPU when unavailable.",
     )
-    parser.add_argument("--dtype", choices=["auto", "float32", "float64"], default="auto", help="Torch runtime dtype.")
+    parser.add_argument("--dtype", choices=["auto", "float32", "float64"], default="float64", help="Torch runtime dtype.")
     parser.add_argument(
         "--missing-cna-policy",
         choices=["error", "all_true"],
@@ -798,6 +816,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
             inner_max_iter=args.inner_max_iter,
             tol=args.tol,
             summary_tol=args.summary_tol,
+            bic_partition_tol=args.bic_partition_tol,
             major_prior=args.major_prior,
             device=effective_device,
             dtype=args.dtype,
@@ -818,6 +837,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "device": str(fit_options.device),
         "dtype": str(fit_options.dtype),
         "summary_tol": fit_options.summary_tol,
+        "bic_partition_tol": fit_options.bic_partition_tol,
         "verbose": bool(fit_options.verbose),
     }
     search_config = {
@@ -831,10 +851,13 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "lambda_grid_mode": str(args.lambda_grid_mode),
         "lambda_grid": "" if args.lambda_grid is None else str(args.lambda_grid),
         "graph_file": "" if args.graph_file is None else str(args.graph_file),
+        "bic_df_scale": float(args.bic_df_scale),
+        "bic_cluster_penalty": float(args.bic_cluster_penalty),
         "outer_max_iter": int(args.outer_max_iter),
         "inner_max_iter": int(args.inner_max_iter),
         "tol": float(args.tol),
         "summary_tol": np.nan if args.summary_tol is None else float(args.summary_tol),
+        "bic_partition_tol": np.nan if args.bic_partition_tol is None else float(args.bic_partition_tol),
         "requested_device": str(args.device),
         "device": str(fit_options.device),
         "dtype": str(args.dtype),

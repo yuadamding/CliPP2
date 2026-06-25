@@ -366,8 +366,9 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         tol=args.tol,
         major_prior=args.major_prior,
         device=args.device,
-        dtype=getattr(args, "dtype", "auto"),
-        summary_tol=getattr(args, "summary_tol", None),
+        dtype=getattr(args, "dtype", "float64"),
+        summary_tol=getattr(args, "summary_tol", 1e-4),
+        bic_partition_tol=getattr(args, "bic_partition_tol", 1e-4),
         verbose=args.verbose,
     )
 

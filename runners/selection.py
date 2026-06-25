@@ -19,7 +19,11 @@ CV_STABILITY_LAMBDA_GRID_MODES = (
     "adaptive_cv_stability",
     "adaptive_cv_stability_one_se",
 )
-ADAPTIVE_LAMBDA_GRID_MODES = ("adaptive_ebic_path",) + CV_STABILITY_LAMBDA_GRID_MODES
+BIC_ADAPTIVE_LAMBDA_GRID_MODES = (
+    "adaptive_bic",
+    "adaptive_ebic_path",
+)
+ADAPTIVE_LAMBDA_GRID_MODES = BIC_ADAPTIVE_LAMBDA_GRID_MODES + CV_STABILITY_LAMBDA_GRID_MODES
 LAMBDA_GRID_MODES = FIXED_LAMBDA_GRID_MODES + ADAPTIVE_LAMBDA_GRID_MODES
 
 
@@ -69,8 +73,27 @@ def default_lambda_grid(
 
 
 def compute_classic_bic(loglik: float, num_clusters: int, data: TumorData) -> float:
-    num_observations = max(data.num_mutations * data.num_samples, 1)
-    degrees_of_freedom = max(int(num_clusters), 1) * data.num_samples
+    num_observations = effective_bic_cell_count(data)
+    degrees_of_freedom = bic_degrees_of_freedom(num_clusters, data)
+    return float(-2.0 * loglik + degrees_of_freedom * np.log(num_observations))
+
+
+def effective_bic_cell_count(data: TumorData) -> int:
+    return max(int(np.sum(np.asarray(data.total_counts, dtype=np.float64) > 0.0)), 1)
+
+
+def effective_bic_depth_count(data: TumorData) -> float:
+    positive_depth = np.asarray(data.total_counts, dtype=np.float64)
+    return float(max(float(np.sum(positive_depth[positive_depth > 0.0])), 1.0))
+
+
+def bic_degrees_of_freedom(num_clusters: int, data: TumorData) -> int:
+    return max(int(num_clusters), 1) * int(data.num_samples)
+
+
+def compute_classic_bic_depth_n(loglik: float, num_clusters: int, data: TumorData) -> float:
+    num_observations = effective_bic_depth_count(data)
+    degrees_of_freedom = bic_degrees_of_freedom(num_clusters, data)
     return float(-2.0 * loglik + degrees_of_freedom * np.log(num_observations))
 
 
@@ -81,9 +104,9 @@ def compute_extended_bic(
     bic_df_scale: float,
     bic_cluster_penalty: float,
 ) -> float:
-    num_observations = max(data.num_mutations * data.num_samples, 1)
+    num_observations = effective_bic_cell_count(data)
     cluster_count = max(int(num_clusters), 1)
-    cp_degrees_of_freedom = cluster_count * data.num_samples
+    cp_degrees_of_freedom = bic_degrees_of_freedom(cluster_count, data)
     cluster_complexity = cluster_count
     return float(
         -2.0 * loglik
@@ -94,13 +117,18 @@ def compute_extended_bic(
 
 __all__ = [
     "ADAPTIVE_LAMBDA_GRID_MODES",
+    "BIC_ADAPTIVE_LAMBDA_GRID_MODES",
     "CV_STABILITY_LAMBDA_GRID_MODES",
     "FIXED_LAMBDA_GRID_MODES",
     "LAMBDA_GRID_MODES",
     "LambdaBracket",
+    "bic_degrees_of_freedom",
     "compute_classic_bic",
+    "compute_classic_bic_depth_n",
     "compute_extended_bic",
     "default_lambda_grid",
+    "effective_bic_cell_count",
+    "effective_bic_depth_count",
     "is_adaptive_lambda_grid_mode",
     "is_cv_stability_lambda_grid_mode",
 ]

@@ -28,6 +28,8 @@ def mutation_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame:
         region_label = _display_region_label(region_id)
         table[f"phi_{region_label}"] = fit.phi[:, column]
         table[f"summary_phi_{region_label}"] = fit.phi_clustered[:, column]
+        if fit.bic_refit_phi is not None:
+            table[f"bic_refit_phi_{region_label}"] = fit.bic_refit_phi[:, column]
     return table
 
 
@@ -42,6 +44,8 @@ def cluster_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame:
     )
     for column, region_id in enumerate(data.region_ids):
         table[f"phi_{_display_region_label(region_id)}"] = fit.cluster_centers[:, column]
+        if fit.bic_refit_cluster_centers is not None and fit.bic_refit_cluster_centers.shape[0] == fit.n_clusters:
+            table[f"bic_refit_phi_{_display_region_label(region_id)}"] = fit.bic_refit_cluster_centers[:, column]
     return table
 
 
@@ -60,6 +64,11 @@ def cell_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame:
             "cluster_label": cluster_labels,
             "phi": fit.phi.reshape(-1),
             "summary_phi": fit.phi_clustered.reshape(-1),
+            "bic_refit_phi": (
+                np.full_like(fit.phi, np.nan, dtype=np.float64)
+                if fit.bic_refit_phi is None
+                else fit.bic_refit_phi
+            ).reshape(-1),
             "major_cn": data.major_cn.reshape(-1),
             "minor_cn": data.minor_cn.reshape(-1),
             "multiplicity_estimated": fit.multiplicity_estimated_mask.reshape(-1).astype(int),

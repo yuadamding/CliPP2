@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lambda-grid-mode",
         choices=list(LAMBDA_GRID_MODES),
-        default="dense_no_zero",
+        default="adaptive_bic",
         help="Automatic lambda grid template used when --lambda-grid is not provided.",
     )
     parser.add_argument(
@@ -71,19 +71,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--summary-tol",
         type=float,
-        default=None,
-        help="Optional explicit post-hoc fusion tolerance used for summary clustering and summary-based selection.",
+        default=1e-4,
+        help="Explicit post-hoc fusion tolerance used for display summary clustering.",
+    )
+    parser.add_argument(
+        "--bic-partition-tol",
+        type=float,
+        default=1e-4,
+        help="Explicit fusion tolerance used to extract partitions for partition-refit BIC.",
     )
     parser.add_argument(
         "--bic-df-scale",
         type=float,
-        default=8.0,
+        default=1.0,
         help="Scale factor on the CP-profile degrees of freedom in the extended BIC selection score.",
     )
     parser.add_argument(
         "--bic-cluster-penalty",
         type=float,
-        default=4.0,
+        default=0.0,
         help="Additional cluster-count complexity penalty in the extended BIC selection score.",
     )
     parser.add_argument(
@@ -94,9 +100,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--selection-score",
-        choices=["ebic", "classic_bic", "refit_ebic", "classic_refit_bic", "oracle_ari"],
-        default="ebic",
-        help="Candidate scoring objective. Legacy refit-* names are accepted as aliases; BIC-style scores are computed on the post-hoc summary partition/log-likelihood pair, while 'oracle_ari' requires simulation truth.",
+        choices=[
+            "classic_bic",
+            "partition_refit_bic",
+            "ebic",
+            "partition_refit_ebic",
+            "refit_ebic",
+            "classic_refit_bic",
+            "oracle_ari",
+        ],
+        default="classic_bic",
+        help="Candidate scoring objective. BIC-style scores use a partition-constrained observed-data refit; 'oracle_ari' requires simulation truth.",
     )
     parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
     parser.add_argument(
@@ -109,14 +123,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
-        default="auto",
-        help="Execution device for the Torch fusion backend.",
+        default="cuda",
+        help="Execution device for the Torch fusion backend. CUDA is the default and falls back to CPU when unavailable.",
     )
     parser.add_argument(
         "--dtype",
         choices=["auto", "float32", "float64"],
-        default="auto",
-        help="Numeric dtype for Torch execution. 'auto' uses float64 on CPU and float32 on CUDA.",
+        default="float64",
+        help="Numeric dtype for Torch execution. Float64 is the default for BIC model selection.",
     )
     parser.add_argument(
         "--missing-cna-policy",
@@ -140,6 +154,7 @@ def main() -> None:
         inner_max_iter=args.inner_max_iter,
         tol=args.tol,
         summary_tol=args.summary_tol,
+        bic_partition_tol=args.bic_partition_tol,
         major_prior=args.major_prior,
         device=args.device,
         dtype=args.dtype,

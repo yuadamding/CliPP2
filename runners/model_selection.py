@@ -10,10 +10,12 @@ import torch
 
 from ..core.model import FitOptions, FitResult, fit_single_stage_em
 from ..core.fusion_solver import (
+    cluster_labels_from_edges,
     compute_exact_observed_data_pilot,
     compute_pooled_observed_data_start,
     compute_scalar_cell_wells,
     compute_scalar_well_start_bank,
+    partition_constrained_observed_refit,
     resolve_pairwise_fusion_graph,
 )
 from ..core.fusion.torch_backend import (
@@ -33,9 +35,13 @@ from ..metrics.evaluation import (
 )
 from .selection import (
     LambdaBracket,
+    bic_degrees_of_freedom,
     compute_classic_bic,
+    compute_classic_bic_depth_n,
     compute_extended_bic,
     default_lambda_grid,
+    effective_bic_cell_count,
+    effective_bic_depth_count,
     is_adaptive_lambda_grid_mode,
     is_cv_stability_lambda_grid_mode,
 )
@@ -54,12 +60,14 @@ ORACLE_LIGHT_LOCAL_ROUNDS = 2
 ORACLE_LIGHT_LOCAL_POINTS = 11
 ORACLE_LIGHT_LOG10_SPAN_TOL = 0.05
 ORACLE_LIGHT_POLISH_TOP_K = 3
-ADAPTIVE_PATH_MAX_CANDIDATES = 36
-ADAPTIVE_PATH_MAX_ROUNDS = 4
-ADAPTIVE_PATH_REFINE_PER_ROUND = 3
+ADAPTIVE_PATH_MAX_CANDIDATES = 8
+ADAPTIVE_PATH_MAX_ROUNDS = 1
+ADAPTIVE_PATH_REFINE_PER_ROUND = 1
 ADAPTIVE_PATH_LOG10_WIDTH_TOL = 0.05
 ADAPTIVE_PATH_VALUE_CURVE_TOL = 1e-4
 ADAPTIVE_PATH_FULL_FUSION_MAX_ITER = 80
+ADAPTIVE_FIRST_PASS_OUTER_MAX_ITER = 20
+ADAPTIVE_FIRST_PASS_INNER_MAX_ITER = 30
 CV_STABILITY_REPLICATES = 3
 CV_STABILITY_TRAIN_FRACTION = 0.8
 CV_STABILITY_THRESHOLD = 0.10
@@ -77,7 +85,8 @@ KKT_POLISH_SCORE_WINDOW_REL = 0.01
 KKT_POLISH_MAX_CANDIDATES = 8
 KKT_POLISH_OUTER_MAX_ITER = 100
 KKT_POLISH_INNER_MAX_ITER = 60
-KKT_POLISH_REPAIR_CEILING = 2e-2
+KKT_POLISH_REPAIR_CEILING = 1e-1
+KKT_POLISH_RESCUE_MAX_CANDIDATES = 3
 
 
 @dataclass(frozen=True)
@@ -160,10 +169,15 @@ class ModelSelectionResult:
 
 def _normalize_selection_score_name(selection_score: str) -> str:
     normalized = str(selection_score).strip().lower()
-    if normalized in {"ebic", "refit_ebic"}:
-        return "summary_ebic"
-    if normalized in {"classic_bic", "classic_refit_bic"}:
-        return "summary_classic_bic"
+    if normalized in {"ebic", "refit_ebic", "partition_refit_ebic", "summary_ebic"}:
+        return "partition_refit_ebic"
+    if normalized in {
+        "classic_bic",
+        "classic_refit_bic",
+        "partition_refit_bic",
+        "summary_classic_bic",
+    }:
+        return "partition_refit_bic"
     if normalized == "oracle_ari":
         return "oracle_ari"
     raise ValueError(f"Unknown selection_score: {selection_score}")
@@ -187,9 +201,9 @@ def _selection_score_value(
         bic_cluster_penalty=bic_cluster_penalty,
     )
     normalized = _normalize_selection_score_name(selection_score)
-    if normalized == "summary_ebic":
+    if normalized == "partition_refit_ebic":
         return float(extended_bic), float(classic_bic), float(extended_bic)
-    if normalized == "summary_classic_bic":
+    if normalized == "partition_refit_bic":
         return float(classic_bic), float(classic_bic), float(extended_bic)
     if normalized == "oracle_ari":
         return float(extended_bic), float(classic_bic), float(extended_bic)
@@ -259,6 +273,60 @@ def _partition_signature(labels: np.ndarray) -> str:
         canonical[idx] = label
     digest = hashlib.blake2b(canonical.tobytes(), digest_size=12).hexdigest()
     return f"{int(next_label)}:{digest}"
+
+
+def _cluster_sizes_text(labels: np.ndarray) -> str:
+    labels = np.asarray(labels, dtype=np.int64)
+    if labels.size == 0:
+        return ""
+    counts = np.bincount(labels, minlength=int(labels.max()) + 1)
+    return ",".join(str(int(value)) for value in counts.tolist())
+
+
+def _hash_array(hasher: "hashlib._Hash", array: np.ndarray) -> None:
+    contiguous = np.ascontiguousarray(array)
+    hasher.update(str(contiguous.dtype).encode("utf-8"))
+    hasher.update(np.asarray(contiguous.shape, dtype=np.int64).tobytes())
+    hasher.update(contiguous.tobytes())
+
+
+def _input_data_hash(data: TumorData) -> str:
+    hasher = hashlib.blake2b(digest_size=16)
+    for value in data.mutation_ids:
+        hasher.update(str(value).encode("utf-8"))
+        hasher.update(b"\0")
+    hasher.update(b"\1")
+    for value in data.region_ids:
+        hasher.update(str(value).encode("utf-8"))
+        hasher.update(b"\0")
+    for array in (
+        data.alt_counts,
+        data.total_counts,
+        data.purity,
+        data.major_cn,
+        data.minor_cn,
+        data.normal_cn,
+        data.has_cna.astype(np.int8, copy=False),
+        data.scaling,
+        data.phi_upper,
+    ):
+        _hash_array(hasher, np.asarray(array))
+    return hasher.hexdigest()
+
+
+def _edge_list_hash(edge_u: np.ndarray, edge_v: np.ndarray, edge_w: np.ndarray) -> str:
+    hasher = hashlib.blake2b(digest_size=16)
+    _hash_array(hasher, np.asarray(edge_u, dtype=np.int64))
+    _hash_array(hasher, np.asarray(edge_v, dtype=np.int64))
+    _hash_array(hasher, np.asarray(edge_w, dtype=np.float64))
+    return hasher.hexdigest()
+
+
+def _effective_bic_partition_tol(options: FitOptions) -> float:
+    value = options.bic_partition_tol
+    if value is None:
+        value = 1e-4
+    return float(max(float(value), 1e-12))
 
 
 def _profile_penalty_from_fit(fit: FitResult) -> tuple[float, float]:
@@ -780,18 +848,18 @@ def _initial_adaptive_lambda_bracket(
         tol=tol,
     )
     lambda_full = max(float(lambda_full), float(lambda_eq), ORACLE_MIN_LAMBDA)
-    lambda_min = max(min(float(lambda_eq) / 16.0, float(lambda_full) / 256.0), ORACLE_MIN_LAMBDA)
+    lambda_min = max(float(lambda_eq) / 4.0, ORACLE_MIN_LAMBDA)
+    lambda_anchor_max = min(max(float(lambda_full) * 4.0, float(lambda_eq)), ORACLE_MAX_LAMBDA)
     raw_anchors = [
         lambda_min,
-        lambda_eq / 16.0,
         lambda_eq / 4.0,
         lambda_eq,
-        min(lambda_eq * 4.0, lambda_full),
-        min(lambda_eq * 16.0, lambda_full),
         lambda_full,
+        min(lambda_full * 2.0, ORACLE_MAX_LAMBDA),
+        min(lambda_full * 4.0, ORACLE_MAX_LAMBDA),
     ]
     anchors = _sorted_unique_lambdas(
-        [min(max(float(value), lambda_min), lambda_full) for value in raw_anchors]
+        [min(max(float(value), lambda_min), lambda_anchor_max) for value in raw_anchors]
     )
     diagnostics = {
         "pilot_loss": float(pilot_loss),
@@ -810,7 +878,7 @@ def _initial_adaptive_lambda_bracket(
 
 
 def _adaptive_score_column(normalized_score: str) -> str:
-    if normalized_score == "summary_classic_bic":
+    if normalized_score == "partition_refit_bic":
         return "classic_bic"
     if normalized_score == "oracle_ari":
         return "ARI"
@@ -831,6 +899,14 @@ def _kkt_polish_options(base_options: FitOptions) -> FitOptions:
         outer_max_iter=max(int(base_options.outer_max_iter) * 2, KKT_POLISH_OUTER_MAX_ITER),
         inner_max_iter=max(int(base_options.inner_max_iter) * 2, KKT_POLISH_INNER_MAX_ITER),
         tol=max(float(base_options.tol) * 0.5, 1e-6),
+    )
+
+
+def _adaptive_first_pass_options(base_options: FitOptions) -> FitOptions:
+    return replace(
+        base_options,
+        outer_max_iter=min(int(base_options.outer_max_iter), ADAPTIVE_FIRST_PASS_OUTER_MAX_ITER),
+        inner_max_iter=min(int(base_options.inner_max_iter), ADAPTIVE_FIRST_PASS_INNER_MAX_ITER),
     )
 
 
@@ -1022,6 +1098,8 @@ def _annotate_polish_candidates(
         "polish_success": False,
         "polish_outer_max_iter": 0,
         "polish_inner_max_iter": 0,
+        "pre_polish_bic": np.nan,
+        "post_polish_bic": np.nan,
         "pre_polish_kkt_residual": np.nan,
         "post_polish_kkt_residual": np.nan,
         "post_polish_selection_eligible": False,
@@ -1031,9 +1109,10 @@ def _annotate_polish_candidates(
         if column not in enriched.columns:
             enriched[column] = default
     if "search_phase" in enriched.columns:
-        polish_phase = enriched["search_phase"].astype(str).eq("kkt_polish").to_numpy(dtype=bool)
+        polish_phase = enriched["search_phase"].astype(str).str.startswith("kkt_polish").to_numpy(dtype=bool)
         enriched.loc[polish_phase, "polish_attempted"] = True
         enriched.loc[polish_phase, "polish_success"] = selection_eligible[polish_phase]
+        enriched.loc[polish_phase, "post_polish_bic"] = scores[polish_phase]
         enriched.loc[polish_phase, "post_polish_kkt_residual"] = kkt_residuals[polish_phase]
         enriched.loc[polish_phase, "post_polish_selection_eligible"] = selection_eligible[polish_phase]
 
@@ -1464,24 +1543,73 @@ def _evaluate_candidate(
         torch_data=torch_data,
         compute_summary=compute_summary,
     )
+    bic_partition_tol = _effective_bic_partition_tol(effective_fit_options)
+    graph = effective_fit_options.graph
+    if graph is None:
+        raise RuntimeError("Model-selection candidates require a resolved pairwise-fusion graph.")
+    bic_labels = cluster_labels_from_edges(
+        fit.phi,
+        edge_u=graph.edge_u,
+        edge_v=graph.edge_v,
+        tol=bic_partition_tol,
+    )
+    bic_refit = partition_constrained_observed_refit(
+        data,
+        bic_labels,
+        major_prior=float(effective_fit_options.major_prior),
+        eps=float(effective_fit_options.eps),
+        tol=max(float(effective_fit_options.tol), 1e-8),
+        max_iter=max(int(effective_fit_options.inner_max_iter), 32),
+        hint_phi=fit.phi,
+    )
+    bic_n_clusters = int(bic_refit.n_clusters)
+    bic_loglik = float(bic_refit.loglik)
     if canonical_score_name == "oracle_ari":
         bic = float("nan")
         classic_bic = float("nan")
         extended_bic = float("nan")
+        classic_bic_depth_n = float("nan")
     else:
         bic, classic_bic, extended_bic = _selection_score_value(
-            loglik=fit.summary_loglik,
-            num_clusters=fit.n_clusters,
+            loglik=bic_loglik,
+            num_clusters=bic_n_clusters,
             data=data,
             bic_df_scale=bic_df_scale,
             bic_cluster_penalty=bic_cluster_penalty,
             selection_score=selection_score,
         )
+        classic_bic_depth_n = compute_classic_bic_depth_n(bic_loglik, bic_n_clusters, data)
     fit.bic = bic
     fit.classic_bic = classic_bic
     fit.extended_bic = extended_bic
+    fit.classic_bic_depth_n = classic_bic_depth_n
+    fit.bic_loglik = bic_loglik
+    fit.bic_loglik_source = bic_refit.loglik_source
+    fit.bic_df = float(bic_degrees_of_freedom(bic_n_clusters, data))
+    fit.bic_active_df = float(bic_refit.active_degrees_of_freedom)
+    fit.bic_n_eff = float(effective_bic_cell_count(data))
+    fit.bic_depth_n_eff = float(effective_bic_depth_count(data))
+    fit.bic_partition_tol = float(bic_partition_tol)
+    fit.bic_refit_boundary_count = int(bic_refit.boundary_count)
+    fit.bic_refit_converged = bool(bic_refit.converged)
+    fit.bic_refit_phi = bic_refit.phi.astype(fit.phi.dtype, copy=False)
+    fit.bic_refit_cluster_centers = bic_refit.cluster_centers.astype(fit.phi.dtype, copy=False)
+    fit.bic_partition_labels = bic_labels.astype(np.int64, copy=False)
     fit.selection_score_name = canonical_score_name
     penalty_value, profile_penalty_value = _profile_penalty_from_fit(fit)
+    bic_df_value = float(bic_degrees_of_freedom(bic_n_clusters, data))
+    bic_n_eff_value = float(effective_bic_cell_count(data))
+    bic_depth_n_eff_value = float(effective_bic_depth_count(data))
+    edge_count = int(graph.edge_u.size)
+    if edge_count:
+        edge_weight_min = float(np.min(graph.edge_w))
+        edge_weight_max = float(np.max(graph.edge_w))
+        edge_weight_mean = float(np.mean(graph.edge_w))
+    else:
+        edge_weight_min = float("nan")
+        edge_weight_max = float("nan")
+        edge_weight_mean = float("nan")
+    partition_hash = _partition_signature(bic_labels)
 
     evaluation = None
     ari_value = np.nan
@@ -1527,18 +1655,41 @@ def _evaluate_candidate(
         "bic_df_scale": float(bic_df_scale),
         "bic_cluster_penalty": float(bic_cluster_penalty),
         "bic": float(bic),
+        "bic_value": float(bic),
         "selection_score_name": str(canonical_score_name),
         "classic_bic": float(classic_bic),
         "extended_bic": float(extended_bic),
+        "classic_bic_cell_n": float(classic_bic),
+        "classic_bic_depth_n": float(classic_bic_depth_n),
+        "bic_loglik": float(bic_loglik),
+        "bic_loglik_source": str(bic_refit.loglik_source),
+        "bic_df": float(bic_df_value),
+        "bic_active_df": float(bic_refit.active_degrees_of_freedom),
+        "bic_n_eff": float(bic_n_eff_value),
+        "bic_depth_n_eff": float(bic_depth_n_eff_value),
+        "bic_partition_tol": float(bic_partition_tol),
+        "bic_n_clusters": int(bic_n_clusters),
         "loglik": float(fit.loglik),
+        "raw_loglik": float(fit.loglik),
         "fit_loss": float(-fit.loglik),
         "summary_loglik": float(fit.summary_loglik),
+        "refit_loglik": float(bic_loglik),
+        "refit_fit_loss": float(bic_refit.fit_loss),
+        "refit_converged": bool(bic_refit.converged),
+        "refit_boundary_count": int(bic_refit.boundary_count),
+        "refit_active_df": int(bic_refit.active_degrees_of_freedom),
         "penalized_objective": float(fit.penalized_objective),
+        "raw_objective": float(fit.penalized_objective),
         "penalty": float(penalty_value),
+        "raw_penalty": float(penalty_value),
         "profile_penalty": float(profile_penalty_value),
-        "n_clusters": int(fit.n_clusters),
-        "partition_signature": _partition_signature(fit.cluster_labels),
+        "summary_n_clusters": int(fit.n_clusters),
+        "n_clusters": int(bic_n_clusters),
+        "partition_signature": partition_hash,
+        "partition_hash": partition_hash,
+        "cluster_sizes": _cluster_sizes_text(bic_labels),
         "converged": bool(fit.converged),
+        "raw_fit_status": str(fit.failure_reason),
         "converged_inner": bool(fit.converged_inner),
         "converged_outer": bool(fit.converged_outer),
         "iterations": int(fit.iterations),
@@ -1559,6 +1710,7 @@ def _evaluate_candidate(
         "outer_dual_ball_residual": float(fit.outer_dual_ball_residual),
         "outer_box_residual": float(fit.outer_box_residual),
         "fixed_objective_kkt_residual": float(fit.fixed_objective_kkt_residual),
+        "raw_kkt_residual": float(fit.fixed_objective_kkt_residual),
         "outer_kkt_certificate_status": str(fit.outer_kkt_certificate_status),
         "outer_kkt_dual_refined": bool(fit.outer_kkt_dual_refined),
         "outer_kkt_fused_edges": int(fit.outer_kkt_fused_edges),
@@ -1581,8 +1733,24 @@ def _evaluate_candidate(
         "last_reject_reason": str(fit.last_reject_reason),
         "failure_reason": str(fit.failure_reason),
         "selection_eligible": bool(fit.selection_eligible),
+        "raw_kkt_eligible": bool(fit.selection_eligible),
+        "partition_tol": float(bic_partition_tol),
+        "primary_phi_source": "raw_penalized_fit",
+        "bic_refit_phi_source": "secondary_partition_refit",
         "device": str(fit.device),
+        "dtype": str(fit.dtype),
+        "eps": float(effective_fit_options.eps),
+        "major_prior": float(effective_fit_options.major_prior),
         "graph_name": str(fit.graph_name),
+        "num_edges": edge_count,
+        "edge_weight_min": edge_weight_min,
+        "edge_weight_max": edge_weight_max,
+        "edge_weight_mean": edge_weight_mean,
+        "adaptive_weight_gamma": float(effective_fit_options.adaptive_weight_gamma),
+        "adaptive_weight_floor": float(effective_fit_options.adaptive_weight_floor),
+        "adaptive_weight_baseline": float(effective_fit_options.adaptive_weight_baseline),
+        "edge_list_hash": _edge_list_hash(graph.edge_u, graph.edge_v, graph.edge_w),
+        "input_data_hash": _input_data_hash(data),
         "evaluation_mode": "ari_only" if ari_only_evaluation else "full",
         "fit_compute_summary": bool(compute_summary),
         "fit_start_mode": str(start_mode),
@@ -1755,6 +1923,11 @@ def _grid_search_selection(
         baseline=float(fit_options.adaptive_weight_baseline),
     )
     effective_fit_options = replace(fit_options, graph=effective_graph)
+    search_fit_options = (
+        _adaptive_first_pass_options(effective_fit_options)
+        if adaptive_lambda_mode and normalized_score != "oracle_ari"
+        else effective_fit_options
+    )
     pooled_start = compute_pooled_observed_data_start(
         data,
         runtime=runtime,
@@ -1844,7 +2017,7 @@ def _grid_search_selection(
                 phi_start = pilot_phi.copy()
             fit, evaluation, row = _evaluate_candidate(
                 data=data,
-                fit_options=effective_fit_options,
+                fit_options=search_fit_options,
                 candidate_fit_options=candidate_fit_options,
                 bic_df_scale=bic_df_scale,
                 bic_cluster_penalty=bic_cluster_penalty,
@@ -1891,7 +2064,11 @@ def _grid_search_selection(
         search_round=0,
         search_phase="base",
         ari_only_evaluation=oracle_behavior.ari_only_evaluation,
-        start_mode=oracle_behavior.exploratory_start_mode,
+        start_mode=(
+            "warm_only"
+            if adaptive_lambda_mode and normalized_score != "oracle_ari" and use_warm_starts
+            else oracle_behavior.exploratory_start_mode
+        ),
         compute_summary=oracle_behavior.exploratory_compute_summary,
     )
 
@@ -1929,7 +2106,7 @@ def _grid_search_selection(
                 proposals,
                 search_round=adaptive_round,
                 search_phase=f"adaptive_refine_{adaptive_round}",
-                start_mode="warm_plus_pilot" if use_warm_starts else "full",
+                start_mode="warm_only" if use_warm_starts else "full",
                 compute_summary=True,
             )
             if len(fit_by_lambda) == before:
@@ -2159,6 +2336,7 @@ def _grid_search_selection(
                     oracle_search_stop_reason = "explicit_grid_local_polish_optimum"
 
     search_df = pd.DataFrame([row for _, _, row in result_entries]).sort_values(["lambda", "selection_step"]).reset_index(drop=True)
+    score_column = _adaptive_score_column(normalized_score)
     if normalized_score != "oracle_ari":
         search_df, polish_candidate_df = _annotate_polish_candidates(
             search_df,
@@ -2192,6 +2370,8 @@ def _grid_search_selection(
                 source_row["polish_success"] = False
                 source_row["polish_outer_max_iter"] = int(polish_fit_options.outer_max_iter)
                 source_row["polish_inner_max_iter"] = int(polish_fit_options.inner_max_iter)
+                source_row["pre_polish_bic"] = float(candidate_row.get(score_column, np.nan))
+                source_row["post_polish_bic"] = np.nan
                 source_row["pre_polish_kkt_residual"] = float(candidate_row["fixed_objective_kkt_residual"])
                 source_row["post_polish_kkt_residual"] = np.nan
                 source_row["post_polish_selection_eligible"] = False
@@ -2221,17 +2401,21 @@ def _grid_search_selection(
                     else np.nan
                 )
                 post_kkt = float(polished_row["fixed_objective_kkt_residual"])
+                post_bic = float(polished_row.get(score_column, np.nan))
                 polish_success = bool(polished_row["selection_eligible"])
                 polished_row["promising_for_polish"] = True
                 polished_row["polish_attempted"] = True
                 polished_row["polish_success"] = polish_success
                 polished_row["polish_outer_max_iter"] = int(polish_fit_options.outer_max_iter)
                 polished_row["polish_inner_max_iter"] = int(polish_fit_options.inner_max_iter)
+                polished_row["pre_polish_bic"] = float(source_row.get("pre_polish_bic", np.nan)) if source_row is not None else np.nan
+                polished_row["post_polish_bic"] = post_bic
                 polished_row["pre_polish_kkt_residual"] = pre_kkt
                 polished_row["post_polish_kkt_residual"] = post_kkt
                 polished_row["post_polish_selection_eligible"] = polish_success
                 if source_row is not None:
                     source_row["polish_success"] = polish_success
+                    source_row["post_polish_bic"] = post_bic
                     source_row["post_polish_kkt_residual"] = post_kkt
                     source_row["post_polish_selection_eligible"] = polish_success
 
@@ -2246,12 +2430,129 @@ def _grid_search_selection(
             tol=float(effective_fit_options.tol),
             max_candidates=0,
         )
+        has_certified_candidate = bool(
+            "selection_eligible" in search_df.columns
+            and search_df["selection_eligible"].astype(bool).to_numpy(dtype=bool).any()
+        )
+        if not has_certified_candidate:
+            score_column = _adaptive_score_column(normalized_score)
+            if score_column in search_df.columns and "_candidate_id" in search_df.columns:
+                objectives = search_df["penalized_objective"].to_numpy(dtype=float)
+                scores = search_df[score_column].to_numpy(dtype=float)
+                mm_violations = (
+                    search_df["mm_consistency_violations"].to_numpy(dtype=float)
+                    if "mm_consistency_violations" in search_df.columns
+                    else np.zeros(search_df.shape[0], dtype=float)
+                )
+                rescue_pool = search_df.loc[np.isfinite(objectives) & np.isfinite(scores) & (mm_violations <= 0.0)].copy()
+            else:
+                rescue_pool = search_df.iloc[0:0].copy()
+            if not rescue_pool.empty:
+                score_rescue = rescue_pool.sort_values(
+                    [score_column, "lambda", "selection_step"],
+                    ascending=[not _score_maximized(normalized_score), True, True],
+                    na_position="last",
+                ).head(max(KKT_POLISH_RESCUE_MAX_CANDIDATES - 1, 1))
+                lambda_rescue = rescue_pool.sort_values(
+                    ["lambda", "fixed_objective_kkt_residual", "selection_step"],
+                    ascending=[False, True, True],
+                    na_position="last",
+                ).head(1)
+                rescue_candidate_df = (
+                    pd.concat([score_rescue, lambda_rescue], ignore_index=True)
+                    .drop_duplicates("_candidate_id", keep="first")
+                    .head(KKT_POLISH_RESCUE_MAX_CANDIDATES)
+                )
+                row_by_candidate_id = {
+                    int(row["_candidate_id"]): row
+                    for _, _, row in result_entries
+                    if "_candidate_id" in row
+                }
+                fit_by_candidate_id = {
+                    int(row["_candidate_id"]): fit
+                    for fit, _, row in result_entries
+                    if "_candidate_id" in row
+                }
+                rescue_fit_options = _kkt_polish_options(effective_fit_options)
+                rescue_source_by_lambda: dict[float, dict[str, float | int | str | bool]] = {}
+                rescue_phi_by_lambda: dict[float, np.ndarray] = {}
+                for _, candidate_row in rescue_candidate_df.iterrows():
+                    candidate_id = int(candidate_row["_candidate_id"])
+                    lambda_key = _canonical_lambda(float(candidate_row["lambda"]))
+                    source_row = row_by_candidate_id.get(candidate_id)
+                    source_fit = fit_by_candidate_id.get(candidate_id)
+                    if source_row is None:
+                        continue
+                    source_row["promising_for_polish"] = True
+                    source_row["polish_attempted"] = True
+                    source_row["polish_success"] = False
+                    source_row["polish_outer_max_iter"] = int(rescue_fit_options.outer_max_iter)
+                    source_row["polish_inner_max_iter"] = int(rescue_fit_options.inner_max_iter)
+                    source_row["pre_polish_bic"] = float(candidate_row.get(score_column, np.nan))
+                    source_row["post_polish_bic"] = np.nan
+                    source_row["pre_polish_kkt_residual"] = float(candidate_row["fixed_objective_kkt_residual"])
+                    source_row["post_polish_kkt_residual"] = np.nan
+                    source_row["post_polish_selection_eligible"] = False
+                    rescue_source_by_lambda[lambda_key] = source_row
+                    if source_fit is not None:
+                        rescue_phi_by_lambda[lambda_key] = source_fit.phi.copy()
+
+                rescue_lambdas = [float(value) for value in rescue_candidate_df["lambda"].to_numpy(dtype=float)]
+                before_rescue = len(result_entries)
+                _evaluate_lambda_sequence(
+                    rescue_lambdas,
+                    search_round=adaptive_refinement_rounds_completed + oracle_search_rounds_completed + 2,
+                    search_phase="kkt_polish_rescue",
+                    allow_revisit=True,
+                    candidate_fit_options=rescue_fit_options,
+                    ari_only_evaluation=False,
+                    start_mode="warm_only" if use_warm_starts else "full",
+                    compute_summary=True,
+                    phi_start_by_lambda=rescue_phi_by_lambda,
+                )
+                for _, _, polished_row in result_entries[before_rescue:]:
+                    lambda_key = _canonical_lambda(float(polished_row["lambda"]))
+                    source_row = rescue_source_by_lambda.get(lambda_key)
+                    pre_kkt = (
+                        float(source_row.get("pre_polish_kkt_residual", np.nan))
+                        if source_row is not None
+                        else np.nan
+                    )
+                    post_kkt = float(polished_row["fixed_objective_kkt_residual"])
+                    post_bic = float(polished_row.get(score_column, np.nan))
+                    polish_success = bool(polished_row["selection_eligible"])
+                    polished_row["promising_for_polish"] = True
+                    polished_row["polish_attempted"] = True
+                    polished_row["polish_success"] = polish_success
+                    polished_row["polish_outer_max_iter"] = int(rescue_fit_options.outer_max_iter)
+                    polished_row["polish_inner_max_iter"] = int(rescue_fit_options.inner_max_iter)
+                    polished_row["pre_polish_bic"] = float(source_row.get("pre_polish_bic", np.nan)) if source_row is not None else np.nan
+                    polished_row["post_polish_bic"] = post_bic
+                    polished_row["pre_polish_kkt_residual"] = pre_kkt
+                    polished_row["post_polish_kkt_residual"] = post_kkt
+                    polished_row["post_polish_selection_eligible"] = polish_success
+                    if source_row is not None:
+                        source_row["polish_success"] = polish_success
+                        source_row["post_polish_bic"] = post_bic
+                        source_row["post_polish_kkt_residual"] = post_kkt
+                        source_row["post_polish_selection_eligible"] = polish_success
+                search_df = (
+                    pd.DataFrame([row for _, _, row in result_entries])
+                    .sort_values(["lambda", "selection_step"])
+                    .reset_index(drop=True)
+                )
+                search_df, _ = _annotate_polish_candidates(
+                    search_df,
+                    normalized_score=normalized_score,
+                    tol=float(effective_fit_options.tol),
+                    max_candidates=0,
+                )
     if cv_lambda_mode and normalized_score != "oracle_ari":
         search_df = _evaluate_cv_stability_for_path(
             data=data,
             search_df=search_df,
             result_entries=result_entries,
-            effective_fit_options=effective_fit_options,
+            effective_fit_options=search_fit_options,
             runtime=runtime,
             use_warm_starts=use_warm_starts,
             replicates=CV_STABILITY_REPLICATES,
@@ -2344,7 +2645,7 @@ def _grid_search_selection(
             lambda_min=selection_min,
             lambda_max=selection_max,
         )
-    elif not cv_selection_used and normalized_score == "summary_classic_bic":
+    elif not cv_selection_used and normalized_score == "partition_refit_bic":
         selection_min, selection_max, selection_count, selection_metric_value, selection_mask = _optimal_lambda_range(
             selection_df["classic_bic"].to_numpy(dtype=float),
             selection_lambda_values,
@@ -2405,7 +2706,7 @@ def _grid_search_selection(
         else np.zeros(search_df.shape[0], dtype=bool)
     )
     polish_phase_mask = (
-        search_df["search_phase"].astype(str).eq("kkt_polish").to_numpy(dtype=bool)
+        search_df["search_phase"].astype(str).str.startswith("kkt_polish").to_numpy(dtype=bool)
         if "search_phase" in search_df.columns
         else np.zeros(search_df.shape[0], dtype=bool)
     )
@@ -2568,6 +2869,10 @@ def _grid_search_selection(
         final_oracle_search_stop_reason = oracle_search_stop_reason
     eligible_mask = candidate_selection_eligible_mask
     search_df["eligible_for_selection"] = eligible_mask
+    lambda_values_evaluated = ",".join(
+        f"{float(value):.12g}" for value in _sorted_unique_lambdas(search_df["lambda"].to_numpy(dtype=float))
+    )
+    search_df["lambda_values_evaluated"] = lambda_values_evaluated
     if "optimizer_limited_candidate" not in search_df.columns:
         search_df["optimizer_limited_candidate"] = False
     if optimizer_limited_ids and "_candidate_id" in search_df.columns:
@@ -2737,6 +3042,8 @@ def select_model(
         selection_method = "lambda_path_oracle_ari"
     elif is_cv_stability_lambda_grid_mode(effective_lambda_grid_mode):
         selection_method = "adaptive_cv_stability_one_se"
+    elif is_adaptive_lambda_grid_mode(effective_lambda_grid_mode):
+        selection_method = "adaptive_bic_path"
     else:
         selection_method = "lambda_path_grid"
 

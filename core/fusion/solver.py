@@ -107,6 +107,21 @@ def _cluster_labels(
     return labels
 
 
+def cluster_labels_from_edges(
+    phi: np.ndarray,
+    *,
+    edge_u: np.ndarray,
+    edge_v: np.ndarray,
+    tol: float,
+) -> np.ndarray:
+    return _cluster_labels(
+        np.asarray(phi),
+        edge_u=np.asarray(edge_u, dtype=np.int64),
+        edge_v=np.asarray(edge_v, dtype=np.int64),
+        tol=float(tol),
+    )
+
+
 def _cluster_summary_from_labels(
     phi: np.ndarray,
     labels: np.ndarray,
@@ -723,7 +738,7 @@ def fit_observed_data_pairwise_fusion(
     pooled_start: np.ndarray | None = None,
     scalar_well_starts: list[np.ndarray] | None = None,
     start_mode: str = "full",
-    device: str | None = "auto",
+    device: str | None = "cuda",
     dtype: str | None = "auto",
     summary_tol: float | None = None,
     runtime=None,

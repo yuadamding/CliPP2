@@ -19,8 +19,10 @@ def _add_shared_fit_args(
     parser.add_argument("--outer-max-iter", type=int, default=outer_max_iter, help="Maximum outer majorization iterations.")
     parser.add_argument("--inner-max-iter", type=int, default=30 if outer_max_iter >= 8 else 50, help="Maximum inner convex-solver iterations.")
     parser.add_argument("--tol", type=float, default=1e-4, help="Optimization tolerance.")
-    parser.add_argument("--bic-df-scale", type=float, default=8.0, help="Extended BIC CP degrees-of-freedom scale.")
-    parser.add_argument("--bic-cluster-penalty", type=float, default=4.0, help="Extended BIC cluster-count penalty.")
+    parser.add_argument("--summary-tol", type=float, default=1e-4, help="Explicit display summary clustering tolerance.")
+    parser.add_argument("--bic-partition-tol", type=float, default=1e-4, help="Explicit partition tolerance used for BIC scoring.")
+    parser.add_argument("--bic-df-scale", type=float, default=1.0, help="Extended BIC CP degrees-of-freedom scale.")
+    parser.add_argument("--bic-cluster-penalty", type=float, default=0.0, help="Extended BIC cluster-count penalty.")
     parser.add_argument(
         "--settings-profile",
         choices=["manual", "auto"],
@@ -29,17 +31,26 @@ def _add_shared_fit_args(
     )
     parser.add_argument(
         "--selection-score",
-        choices=["ebic", "classic_bic", "refit_ebic", "classic_refit_bic", "oracle_ari"],
-        default="ebic",
-        help="Candidate scoring objective. Legacy refit-* names are accepted as aliases; 'oracle_ari' requires simulation truth.",
+        choices=[
+            "classic_bic",
+            "partition_refit_bic",
+            "ebic",
+            "partition_refit_ebic",
+            "refit_ebic",
+            "classic_refit_bic",
+            "oracle_ari",
+        ],
+        default="classic_bic",
+        help="Candidate scoring objective. BIC-style scores use a partition-constrained observed-data refit; 'oracle_ari' requires simulation truth.",
     )
     parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability for major-copy multiplicity.")
     parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
-        default="auto",
-        help="Execution device for the Torch fusion backend.",
+        default="cuda",
+        help="Execution device for the Torch fusion backend. CUDA is the default and falls back to CPU when unavailable.",
     )
+    parser.add_argument("--dtype", choices=["auto", "float32", "float64"], default="float64", help="Torch runtime dtype.")
     parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
     parser.add_argument(
         "--write-patient-outputs",
@@ -98,7 +109,7 @@ def build_single_region_benchmark_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lambda-grid-mode",
         choices=list(LAMBDA_GRID_MODES),
-        default="dense_no_zero",
+        default="adaptive_bic",
         help="Automatic lambda grid template used when --lambda-grid is not provided.",
     )
     _add_shared_fit_args(parser, outer_max_iter=8)
@@ -147,7 +158,7 @@ def build_mass_multiregion_benchmark_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lambda-grid-mode",
         choices=list(LAMBDA_GRID_MODES),
-        default="dense_no_zero",
+        default="adaptive_bic",
         help="Automatic lambda grid template used when --lambda-grid is not provided.",
     )
     _add_shared_fit_args(parser, outer_max_iter=4)
