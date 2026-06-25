@@ -455,9 +455,13 @@ def _evaluate_cv_stability_for_path(
         for fit, _, row in result_entries
         if "_candidate_id" in row
     }
-    eligible_df = enriched.loc[
-        enriched.apply(lambda row: bool(row.get("selection_eligible", row.get("converged", False))), axis=1)
-    ].copy()
+    if "selection_eligible" in enriched.columns:
+        eligible_mask = enriched["selection_eligible"].astype(bool).to_numpy(dtype=bool)
+    elif "converged" in enriched.columns:
+        eligible_mask = enriched["converged"].astype(bool).to_numpy(dtype=bool)
+    else:
+        eligible_mask = np.zeros(enriched.shape[0], dtype=bool)
+    eligible_df = enriched.loc[eligible_mask].copy()
     if eligible_df.shape[0] > CV_STABILITY_MAX_EVALUATED_LAMBDAS:
         score_column = "classic_bic" if "classic_bic" in eligible_df.columns else "bic"
         top_k = max(CV_STABILITY_MAX_EVALUATED_LAMBDAS // 2, 1)
