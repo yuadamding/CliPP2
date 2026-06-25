@@ -8,7 +8,7 @@ from ..sim.generation import parse_float_list, parse_int_list
 from .benchmark_common import _aggregate_simple, _fit_options_from_args, _parse_lambda_grid
 from .benchmark_cohort import run_single_region_cohort_benchmark
 from .benchmark_mass import MassiveMultiregionBenchmarkConfig, run_massive_multiregion_benchmark
-from .selection import LAMBDA_GRID_MODES
+from .selection import PUBLIC_LAMBDA_GRID_MODES
 
 
 def _add_shared_fit_args(
@@ -31,17 +31,9 @@ def _add_shared_fit_args(
     )
     parser.add_argument(
         "--selection-score",
-        choices=[
-            "classic_bic",
-            "partition_refit_bic",
-            "ebic",
-            "partition_refit_ebic",
-            "refit_ebic",
-            "classic_refit_bic",
-            "oracle_ari",
-        ],
-        default="classic_bic",
-        help="Candidate scoring objective. BIC-style scores use a partition-constrained observed-data refit; 'oracle_ari' requires simulation truth.",
+        choices=["bic"],
+        default="bic",
+        help="Candidate scoring objective. BIC uses a partition-constrained observed-data refit.",
     )
     parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability for major-copy multiplicity.")
     parser.add_argument(
@@ -108,7 +100,7 @@ def build_single_region_benchmark_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-grid", default=None, help="Optional comma-separated lambda grid.")
     parser.add_argument(
         "--lambda-grid-mode",
-        choices=list(LAMBDA_GRID_MODES),
+        choices=list(PUBLIC_LAMBDA_GRID_MODES),
         default="adaptive_bic",
         help="Automatic lambda grid template used when --lambda-grid is not provided.",
     )
@@ -157,7 +149,7 @@ def build_mass_multiregion_benchmark_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda-grid", default=None, help="Optional comma-separated lambda grid.")
     parser.add_argument(
         "--lambda-grid-mode",
-        choices=list(LAMBDA_GRID_MODES),
+        choices=list(PUBLIC_LAMBDA_GRID_MODES),
         default="adaptive_bic",
         help="Automatic lambda grid template used when --lambda-grid is not provided.",
     )

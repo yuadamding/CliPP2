@@ -49,17 +49,11 @@ def summarize_patient_regime(data: TumorData) -> PatientRegime:
 def recommend_settings_from_regime(
     regime: TumorRegime,
     *,
-    selection_score: str = "classic_bic",
+    selection_score: str = "bic",
 ) -> RecommendedSettings:
     normalized_score = str(selection_score).strip().lower()
-
-    if normalized_score == "oracle_ari":
-        return RecommendedSettings(
-            profile_name="pairwise_fusion_oracle_dense",
-            lambda_grid_mode="ultra_dense_no_zero",
-            bic_df_scale=1.0,
-            bic_cluster_penalty=0.0,
-        )
+    if normalized_score != "bic":
+        raise ValueError(f"Unknown selection_score: {selection_score}")
 
     if regime.num_regions <= 2 or regime.depth_scale <= 300.0 or regime.num_mutations <= 800:
         return RecommendedSettings(
@@ -88,7 +82,7 @@ def recommend_settings_from_regime(
 def recommend_settings_from_data(
     data: TumorData,
     *,
-    selection_score: str = "classic_bic",
+    selection_score: str = "bic",
 ) -> RecommendedSettings:
     return recommend_settings_from_regime(
         summarize_tumor_regime(data),

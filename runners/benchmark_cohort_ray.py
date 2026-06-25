@@ -20,22 +20,8 @@ from .benchmark_common import (
     write_benchmark_tables,
     write_patient_checkpoint,
 )
-from .model_selection import (
-    ORACLE_EXPANSION_FACTOR,
-    ORACLE_LIGHT_LOCAL_POINTS,
-    ORACLE_LIGHT_LOCAL_ROUNDS,
-    ORACLE_LIGHT_LOG10_SPAN_TOL,
-    ORACLE_LIGHT_POLISH_TOP_K,
-    ORACLE_MAX_LAMBDA,
-    ORACLE_MAX_SEARCH_ROUNDS,
-    ORACLE_MIN_LAMBDA,
-    ORACLE_POLISH_TOP_K,
-    ORACLE_REFINE_POINTS,
-    ORACLE_REFINE_ROUNDS,
-    ORACLE_ULTRA_DENSE_POINTS,
-)
 from .pipeline import process_one_file_bundle
-from .selection import LAMBDA_GRID_MODES, is_adaptive_lambda_grid_mode
+from .selection import PUBLIC_LAMBDA_GRID_MODES, is_adaptive_lambda_grid_mode
 
 
 def _resolve_effective_device(device: str | None) -> str:
@@ -67,9 +53,6 @@ _RESUME_DERIVED_CANDIDATE_COLUMNS = {
     "selected_lambda_left",
     "selected_lambda_right",
     "selected_lambda_interval_log10_width",
-    "selected_validation_loglik_mean",
-    "selected_validation_loglik_se",
-    "selected_instability",
     "selection_metric_value",
     "selection_lambda_min",
     "selection_lambda_max",
@@ -82,8 +65,8 @@ _RESUME_DERIVED_CANDIDATE_COLUMNS = {
     "selection_boundary_unresolved",
     "ari_boundary_unresolved",
     "selection_used_convergence_fallback",
-    "oracle_search_rounds_completed",
-    "oracle_search_stop_reason_tumor",
+    "adaptive_search_rounds_completed",
+    "adaptive_search_stop_reason_tumor",
     "num_candidates",
     "num_converged_candidates",
     "num_candidates_all",
@@ -319,7 +302,7 @@ def _aggregate_tuning_guidance(best_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.
             median_best_ari=("best_ari", "median"),
             ari_boundary_unresolved_rate=("ari_boundary_unresolved", "mean"),
             convergence_fallback_rate=("selection_used_convergence_fallback", "mean"),
-            mean_oracle_search_rounds_completed=("oracle_search_rounds_completed", "mean"),
+            mean_adaptive_search_rounds_completed=("adaptive_search_rounds_completed", "mean"),
             mean_ari=("ARI", "mean"),
             median_ari=("ARI", "median"),
             mean_cp_rmse=("cp_rmse", "mean"),
@@ -343,7 +326,7 @@ def _aggregate_tuning_guidance(best_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.
             median_best_ari=("best_ari", "median"),
             ari_boundary_unresolved_rate=("ari_boundary_unresolved", "mean"),
             convergence_fallback_rate=("selection_used_convergence_fallback", "mean"),
-            mean_oracle_search_rounds_completed=("oracle_search_rounds_completed", "mean"),
+            mean_adaptive_search_rounds_completed=("adaptive_search_rounds_completed", "mean"),
             mean_ari=("ARI", "mean"),
             median_ari=("ARI", "median"),
             mean_cp_rmse=("cp_rmse", "mean"),
@@ -418,8 +401,8 @@ def _enrich_candidate_landscape(candidate_df: pd.DataFrame, best_df: pd.DataFram
             "selection_boundary_unresolved",
             "ari_boundary_unresolved",
             "selection_used_convergence_fallback",
-            "oracle_search_rounds_completed",
-            "oracle_search_stop_reason",
+            "adaptive_search_rounds_completed",
+            "adaptive_search_stop_reason",
             "num_candidates",
             "num_converged_candidates",
             "num_candidates_all",
@@ -443,9 +426,6 @@ def _enrich_candidate_landscape(candidate_df: pd.DataFrame, best_df: pd.DataFram
             "tested_lambda_min",
             "tested_lambda_max",
             "tested_lambda_count",
-            "selected_validation_loglik_mean",
-            "selected_validation_loglik_se",
-            "selected_instability",
         ]
         if column in best_df.columns
     ]
@@ -535,7 +515,7 @@ def _aggregate_guidance_simple(best_df: pd.DataFrame, columns: list[str]) -> pd.
             median_ari=("ARI", "median"),
             mean_cp_rmse=("cp_rmse", "mean"),
             mean_n_clusters=("n_clusters", "mean"),
-            mean_oracle_search_rounds_completed=("oracle_search_rounds_completed", "mean"),
+            mean_adaptive_search_rounds_completed=("adaptive_search_rounds_completed", "mean"),
         )
         .reset_index()
         .sort_values(existing_columns)
@@ -646,10 +626,10 @@ def _write_tuning_memory(
                 "ari_boundary_unresolved_tumors": int(best_df["ari_boundary_unresolved"].sum()) if "ari_boundary_unresolved" in best_df.columns and not best_df.empty else 0,
                 "selection_convergence_fallback_tumors": int(best_df["selection_used_convergence_fallback"].sum()) if "selection_used_convergence_fallback" in best_df.columns and not best_df.empty else 0,
                 "resolved_guidance_tumors": 0 if resolved_tumor_ids is None else int(len(resolved_tumor_ids)),
-                "mean_oracle_search_rounds_completed": float(best_df["oracle_search_rounds_completed"].mean()) if "oracle_search_rounds_completed" in best_df.columns and not best_df.empty else np.nan,
+                "mean_adaptive_search_rounds_completed": float(best_df["adaptive_search_rounds_completed"].mean()) if "adaptive_search_rounds_completed" in best_df.columns and not best_df.empty else np.nan,
                 "search_stop_reason_mode": ""
-                if "oracle_search_stop_reason" not in best_df.columns or best_df.empty
-                else str(best_df["oracle_search_stop_reason"].mode(dropna=True).iloc[0]) if not best_df["oracle_search_stop_reason"].mode(dropna=True).empty else "",
+                if "adaptive_search_stop_reason" not in best_df.columns or best_df.empty
+                else str(best_df["adaptive_search_stop_reason"].mode(dropna=True).iloc[0]) if not best_df["adaptive_search_stop_reason"].mode(dropna=True).empty else "",
             }
         ]
     )
@@ -687,7 +667,7 @@ def _write_initial_benchmark_artifacts(
                 "ari_boundary_unresolved_tumors": 0,
                 "selection_convergence_fallback_tumors": 0,
                 "resolved_guidance_tumors": 0,
-                "mean_oracle_search_rounds_completed": np.nan,
+                "mean_adaptive_search_rounds_completed": np.nan,
                 "search_stop_reason_mode": "",
             }
         ]
@@ -703,7 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--simulation-root", default="/storage/CliPP2/CliPP2Sim1K", help="Root directory with simulation truth folders.")
     parser.add_argument(
         "--outdir",
-        default="/storage/CliPP2/CliPP2Sim1K_benchmark_objective_faithful_oracle_ari_cpu_ray24",
+        default="/storage/CliPP2/CliPP2Sim1K_benchmark_bic_ray24",
         help="Output directory for benchmark tables.",
     )
     parser.add_argument("--workers", type=int, default=24, help="Number of Ray workers.")
@@ -722,7 +702,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--lambda-grid-mode",
-        choices=list(LAMBDA_GRID_MODES),
+        choices=list(PUBLIC_LAMBDA_GRID_MODES),
         default="adaptive_bic",
         help="Automatic lambda grid template when --lambda-grid is not provided.",
     )
@@ -736,17 +716,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--settings-profile", choices=["manual", "auto"], default="auto", help="Model-selection strategy.")
     parser.add_argument(
         "--selection-score",
-        choices=[
-            "classic_bic",
-            "partition_refit_bic",
-            "ebic",
-            "partition_refit_ebic",
-            "refit_ebic",
-            "classic_refit_bic",
-            "oracle_ari",
-        ],
-        default="classic_bic",
-        help="Candidate scoring objective. BIC-style scores use a partition-constrained observed-data refit; 'oracle_ari' uses simulation truth to select the best lambda.",
+        choices=["bic"],
+        default="bic",
+        help="Candidate scoring objective. BIC uses a partition-constrained observed-data refit.",
     )
     parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability for major-copy multiplicity.")
     parser.add_argument(
@@ -867,31 +839,12 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "adaptive_weight_gamma": float(fit_options.adaptive_weight_gamma),
         "adaptive_weight_floor": float(fit_options.adaptive_weight_floor),
         "adaptive_weight_baseline": float(fit_options.adaptive_weight_baseline),
-        "oracle_refine_rounds": int(ORACLE_REFINE_ROUNDS),
-        "oracle_refine_points": int(ORACLE_REFINE_POINTS),
-        "oracle_ultra_dense_points": int(ORACLE_ULTRA_DENSE_POINTS),
-        "oracle_polish_top_k": int(ORACLE_POLISH_TOP_K),
-        "oracle_light_local_rounds": int(ORACLE_LIGHT_LOCAL_ROUNDS),
-        "oracle_light_local_points": int(ORACLE_LIGHT_LOCAL_POINTS),
-        "oracle_light_log10_span_tol": float(ORACLE_LIGHT_LOG10_SPAN_TOL),
-        "oracle_light_polish_top_k": int(ORACLE_LIGHT_POLISH_TOP_K),
-        "oracle_expansion_factor": float(ORACLE_EXPANSION_FACTOR),
-        "oracle_max_search_rounds": int(ORACLE_MAX_SEARCH_ROUNDS),
-        "oracle_min_lambda": float(ORACLE_MIN_LAMBDA),
-        "oracle_max_lambda": float(ORACLE_MAX_LAMBDA),
-        "oracle_search_style": (
-            "light_dynamic_zoom"
-            if str(args.selection_score).strip().lower() == "oracle_ari" and not bool(args.write_tumor_outputs)
-            else "heavy_dynamic_refinement"
-            if str(args.selection_score).strip().lower() == "oracle_ari"
-            else "adaptive_path_refinement"
+        "lambda_search_style": (
+            "adaptive_bic_path_refinement"
             if args.lambda_grid is None and is_adaptive_lambda_grid_mode(str(args.lambda_grid_mode))
-            else "non_oracle_grid"
+            else "fixed_lambda_grid"
         ),
-        "oracle_candidate_evaluation_mode": "ari_only_during_search_full_on_selected_summary",
-        "oracle_candidate_start_mode": "warm_only_for_light_search_full_when_selected_fit_is_finalized",
-        "oracle_candidate_compute_summary": "false_during_search_true_only_when_selected_fit_is_finalized",
-        "finalize_selected_fit": bool(args.write_tumor_outputs or str(args.selection_score).strip().lower() != "oracle_ari"),
+        "finalize_selected_fit": True,
         "boundary_hit_means_search_problem": True,
         "resumed_from_existing": bool(existing_patient_rows or existing_candidate_rows),
         "precompleted_tumors": int(len(completed_tumor_ids)),
@@ -950,7 +903,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
                 selection_score=str(args.selection_score),
                 use_warm_starts=not args.disable_warm_start,
                 write_outputs=bool(args.write_tumor_outputs),
-                finalize_selected_fit=bool(args.write_tumor_outputs or str(args.selection_score).strip().lower() != "oracle_ari"),
+                finalize_selected_fit=True,
                 missing_cna_policy=str(args.missing_cna_policy),
             )
             in_flight[future] = file_path

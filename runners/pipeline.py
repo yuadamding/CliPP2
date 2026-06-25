@@ -28,7 +28,7 @@ def process_one_file_bundle(
     bic_df_scale: float = 1.0,
     bic_cluster_penalty: float = 0.0,
     settings_profile: str = "manual",
-    selection_score: str = "classic_bic",
+    selection_score: str = "bic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
@@ -55,10 +55,8 @@ def process_one_file_bundle(
     tumor_regime = summarize_tumor_regime(data)
     simulation_available = simulation_root is not None and (Path(simulation_root) / data.tumor_id).exists()
     if finalize_selected_fit is None:
-        finalize_selected_fit = bool(write_outputs or str(selection_score).strip().lower() != "oracle_ari")
-    evaluate_all_candidates = simulation_available and (
-        write_outputs or str(selection_score).strip().lower() == "oracle_ari"
-    )
+        finalize_selected_fit = True
+    evaluate_all_candidates = simulation_available and write_outputs
     selection_result = select_model(
         data=data,
         simulation_root=Path(simulation_root) if simulation_root is not None else None,
@@ -132,24 +130,7 @@ def process_one_file_bundle(
         if selection_result.lambda_bracket_full is None
         else float(selection_result.lambda_bracket_full),
         "adaptive_refinement_rounds_completed": int(selection_result.adaptive_refinement_rounds_completed),
-        "selected_validation_loglik_mean": np.nan
-        if selection_result.selected_validation_loglik_mean is None
-        else float(selection_result.selected_validation_loglik_mean),
-        "selected_validation_loglik_se": np.nan
-        if selection_result.selected_validation_loglik_se is None
-        else float(selection_result.selected_validation_loglik_se),
-        "selected_instability": np.nan
-        if selection_result.selected_instability is None
-        else float(selection_result.selected_instability),
-        "cv_stability_replicates": int(selection_result.cv_stability_replicates),
-        "cv_stability_threshold": float(selection_result.cv_stability_threshold),
-        "selection_loglik_kind": (
-            "partition_constrained_observed_mle"
-            if str(best_fit.selection_score_name or selection_score) != "oracle_ari"
-            else "oracle_ari_finalized_selected_fit"
-            if bool(finalize_selected_fit)
-            else "oracle_ari_candidate_fit"
-        ),
+        "selection_loglik_kind": "partition_constrained_observed_mle",
         "finalize_selected_fit": bool(finalize_selected_fit),
         "selection_used_convergence_fallback": bool(selection_result.selection_used_convergence_fallback),
         "num_candidates": int(selection_result.num_candidates),
@@ -236,8 +217,8 @@ def process_one_file_bundle(
         "ari_hits_upper_boundary": bool(selection_result.ari_hits_upper_boundary),
         "ari_boundary_unresolved": bool(selection_result.ari_boundary_unresolved),
         "ari_optimum_resolved": bool(selection_result.ari_optimum_resolved),
-        "oracle_search_rounds_completed": int(selection_result.oracle_search_rounds_completed),
-        "oracle_search_stop_reason": str(selection_result.oracle_search_stop_reason),
+        "adaptive_search_rounds_completed": int(selection_result.adaptive_search_rounds_completed),
+        "adaptive_search_stop_reason": str(selection_result.adaptive_search_stop_reason),
         "tested_lambda_min": float(search_df["lambda"].min()) if not search_df.empty else np.nan,
         "tested_lambda_max": float(search_df["lambda"].max()) if not search_df.empty else np.nan,
         "tested_lambda_count": int(search_df["lambda"].nunique()) if not search_df.empty else 0,
@@ -358,7 +339,7 @@ def process_one_file(
     bic_df_scale: float = 1.0,
     bic_cluster_penalty: float = 0.0,
     settings_profile: str = "manual",
-    selection_score: str = "classic_bic",
+    selection_score: str = "bic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
@@ -396,7 +377,7 @@ def run_directory(
     bic_df_scale: float = 1.0,
     bic_cluster_penalty: float = 0.0,
     settings_profile: str = "manual",
-    selection_score: str = "classic_bic",
+    selection_score: str = "bic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     graph_file: str | Path | None = None,

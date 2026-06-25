@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from . import FitOptions, process_one_file, run_directory, run_simulation_benchmark
-from .runners.selection import LAMBDA_GRID_MODES
+from .runners.selection import PUBLIC_LAMBDA_GRID_MODES
 
 
 def _parse_lambda_grid(value: str | None) -> list[float] | None:
@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--lambda-grid-mode",
-        choices=list(LAMBDA_GRID_MODES),
+        choices=list(PUBLIC_LAMBDA_GRID_MODES),
         default="adaptive_bic",
         help="Automatic lambda grid template used when --lambda-grid is not provided.",
     )
@@ -100,17 +100,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--selection-score",
-        choices=[
-            "classic_bic",
-            "partition_refit_bic",
-            "ebic",
-            "partition_refit_ebic",
-            "refit_ebic",
-            "classic_refit_bic",
-            "oracle_ari",
-        ],
-        default="classic_bic",
-        help="Candidate scoring objective. BIC-style scores use a partition-constrained observed-data refit; 'oracle_ari' requires simulation truth.",
+        choices=["bic"],
+        default="bic",
+        help="Candidate scoring objective. BIC uses a partition-constrained observed-data refit.",
     )
     parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
     parser.add_argument(

@@ -14,17 +14,12 @@ FIXED_LAMBDA_GRID_MODES = (
     "coarse_no_zero",
     "ultra_dense_no_zero",
 )
-CV_STABILITY_LAMBDA_GRID_MODES = (
-    "adaptive_cv",
-    "adaptive_cv_stability",
-    "adaptive_cv_stability_one_se",
-)
 BIC_ADAPTIVE_LAMBDA_GRID_MODES = (
     "adaptive_bic",
-    "adaptive_ebic_path",
 )
-ADAPTIVE_LAMBDA_GRID_MODES = BIC_ADAPTIVE_LAMBDA_GRID_MODES + CV_STABILITY_LAMBDA_GRID_MODES
+ADAPTIVE_LAMBDA_GRID_MODES = BIC_ADAPTIVE_LAMBDA_GRID_MODES
 LAMBDA_GRID_MODES = FIXED_LAMBDA_GRID_MODES + ADAPTIVE_LAMBDA_GRID_MODES
+PUBLIC_LAMBDA_GRID_MODES = LAMBDA_GRID_MODES
 
 
 @dataclass(frozen=True)
@@ -38,10 +33,6 @@ class LambdaBracket:
 
 def is_adaptive_lambda_grid_mode(mode: str) -> bool:
     return str(mode).strip().lower() in ADAPTIVE_LAMBDA_GRID_MODES
-
-
-def is_cv_stability_lambda_grid_mode(mode: str) -> bool:
-    return str(mode).strip().lower() in CV_STABILITY_LAMBDA_GRID_MODES
 
 
 def _default_lambda_ratios(mode: str) -> np.ndarray:
@@ -118,10 +109,10 @@ def compute_extended_bic(
 __all__ = [
     "ADAPTIVE_LAMBDA_GRID_MODES",
     "BIC_ADAPTIVE_LAMBDA_GRID_MODES",
-    "CV_STABILITY_LAMBDA_GRID_MODES",
     "FIXED_LAMBDA_GRID_MODES",
     "LAMBDA_GRID_MODES",
     "LambdaBracket",
+    "PUBLIC_LAMBDA_GRID_MODES",
     "bic_degrees_of_freedom",
     "compute_classic_bic",
     "compute_classic_bic_depth_n",
@@ -130,5 +121,4 @@ __all__ = [
     "effective_bic_cell_count",
     "effective_bic_depth_count",
     "is_adaptive_lambda_grid_mode",
-    "is_cv_stability_lambda_grid_mode",
 ]
