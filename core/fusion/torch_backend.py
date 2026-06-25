@@ -29,6 +29,38 @@ class TorchCellTerms:
     gamma_major: torch.Tensor
 
 
+DEFAULT_INNER_KKT_CHECK_EVERY = 8
+DEFAULT_BOX_PHI_ATOL = 1e-8
+DEFAULT_BOX_MAX_ITER = 32
+
+
+def _box_qp_sweeps_for_atol(
+    phi_atol: float = DEFAULT_BOX_PHI_ATOL,
+    *,
+    max_iter: int = DEFAULT_BOX_MAX_ITER,
+) -> int:
+    atol = float(phi_atol)
+    if not np.isfinite(atol) or atol <= 0.0:
+        atol = DEFAULT_BOX_PHI_ATOL
+    requested = int(np.ceil(np.log2(1.0 / min(max(atol, np.finfo(float).tiny), 1.0)))) + 1
+    return max(16, min(max(int(max_iter), 16), requested))
+
+
+def _inner_kkt_audit_due(
+    *,
+    iteration: int,
+    max_iter: int,
+    kkt_check_every: int,
+    cheap_converged: bool,
+) -> bool:
+    if bool(cheap_converged):
+        return True
+    if int(iteration) >= int(max_iter):
+        return True
+    check_every = max(int(kkt_check_every), 1)
+    return int(iteration) % check_every == 0
+
+
 def _binary_entropy_offset_torch(weight: torch.Tensor) -> torch.Tensor:
     clipped = torch.clamp(weight, min=0.0, max=1.0)
     positive = clipped > 0.0
@@ -556,6 +588,7 @@ def solve_majorized_subproblem_pdhg_torch(
     max_iter: int,
     phi_start: torch.Tensor,
     dual_start: torch.Tensor | None,
+    kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
     phi = torch.minimum(torch.maximum(phi_start.to(dtype=runtime.dtype, device=runtime.device), lower), upper)
     if lambda_value <= 0.0 or edge_u.numel() == 0:
@@ -578,7 +611,8 @@ def solve_majorized_subproblem_pdhg_torch(
     converged = False
     iterations = 0
     last_residual = np.inf
-    for inner_iter in range(max(int(max_iter), 10)):
+    actual_max_iter = max(int(max_iter), 10)
+    for inner_iter in range(actual_max_iter):
         iterations = inner_iter + 1
         edge_diff = bar.index_select(0, edge_u) - bar.index_select(0, edge_v)
         dual_trial = dual + step * edge_diff
@@ -609,22 +643,29 @@ def solve_majorized_subproblem_pdhg_torch(
         phi = phi_new
         dual = dual_new
 
-        last_residual = inner_kkt_residual_torch(
-            phi=phi,
-            dual=dual,
-            U=U,
-            h=h,
-            lower=lower,
-            upper=upper,
-            lambda_value=lambda_value,
-            edge_u=edge_u,
-            edge_v=edge_v,
-            edge_w=edge_w,
-            atol=max(tol, 1e-8),
-        )
-        if primal_delta <= tol and dual_delta <= tol and last_residual <= 5.0 * tol:
-            converged = True
-            break
+        cheap_converged = bool(primal_delta <= tol and dual_delta <= tol)
+        if _inner_kkt_audit_due(
+            iteration=iterations,
+            max_iter=actual_max_iter,
+            kkt_check_every=kkt_check_every,
+            cheap_converged=cheap_converged,
+        ):
+            last_residual = inner_kkt_residual_torch(
+                phi=phi,
+                dual=dual,
+                U=U,
+                h=h,
+                lower=lower,
+                upper=upper,
+                lambda_value=lambda_value,
+                edge_u=edge_u,
+                edge_v=edge_v,
+                edge_w=edge_w,
+                atol=max(tol, 1e-8),
+            )
+            if cheap_converged and last_residual <= 5.0 * tol:
+                converged = True
+                break
 
     return phi, dual, dual, iterations, converged, float(last_residual)
 
@@ -658,6 +699,7 @@ def _complete_graph_isotropic_box_qp_torch(
         lo = torch.where(move_right, mid, lo)
         hi = torch.where(move_right, hi, mid)
 
+    mid = 0.5 * (lo + hi)
     return torch.minimum(
         torch.maximum((rhs + rho_t * mid.unsqueeze(0)) / denom, lower),
         upper,
@@ -680,6 +722,9 @@ def solve_majorized_subproblem_alm_torch(
     max_iter: int,
     phi_start: torch.Tensor,
     dual_start: torch.Tensor | None,
+    kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
+    box_phi_atol: float = DEFAULT_BOX_PHI_ATOL,
+    box_max_iter: int = DEFAULT_BOX_MAX_ITER,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
     phi = torch.minimum(torch.maximum(phi_start.to(dtype=runtime.dtype, device=runtime.device), lower), upper)
     if lambda_value <= 0.0 or edge_u.numel() == 0:
@@ -703,8 +748,10 @@ def solve_majorized_subproblem_alm_torch(
     last_residual = np.inf
     z = phi.index_select(0, edge_u) - phi.index_select(0, edge_v)
     actual_dual = rho * scaled_dual
+    actual_max_iter = max(int(max_iter), 10)
+    box_iter = _box_qp_sweeps_for_atol(box_phi_atol, max_iter=box_max_iter)
 
-    for inner_iter in range(max(int(max_iter), 10)):
+    for inner_iter in range(actual_max_iter):
         iterations = inner_iter + 1
         edge_diff = phi.index_select(0, edge_u) - phi.index_select(0, edge_v)
         z_argument = edge_diff + scaled_dual
@@ -723,7 +770,7 @@ def solve_majorized_subproblem_alm_torch(
             upper=upper,
             rho=rho,
             q=q,
-            max_iter=max(max_iter, 20),
+            max_iter=box_iter,
         )
 
         edge_diff_new = phi_new.index_select(0, edge_u) - phi_new.index_select(0, edge_v)
@@ -740,26 +787,33 @@ def solve_majorized_subproblem_alm_torch(
             (rho * torch.linalg.norm(dual_residual_vec) / (1.0 + torch.linalg.norm(phi_new))).item()
         )
         actual_dual = rho * scaled_dual_new
-        last_residual = inner_kkt_residual_torch(
-            phi=phi_new,
-            dual=actual_dual,
-            U=U,
-            h=h,
-            lower=lower,
-            upper=upper,
-            lambda_value=lambda_value,
-            edge_u=edge_u,
-            edge_v=edge_v,
-            edge_w=edge_w,
-            atol=max(tol, 1e-8),
-        )
 
         phi = phi_new
         z = z_new
         scaled_dual = scaled_dual_new
 
-        if primal_norm <= tol and dual_norm <= tol and last_residual <= 5.0 * tol:
-            converged = True
-            break
+        cheap_converged = bool(primal_norm <= tol and dual_norm <= tol)
+        if _inner_kkt_audit_due(
+            iteration=iterations,
+            max_iter=actual_max_iter,
+            kkt_check_every=kkt_check_every,
+            cheap_converged=cheap_converged,
+        ):
+            last_residual = inner_kkt_residual_torch(
+                phi=phi,
+                dual=actual_dual,
+                U=U,
+                h=h,
+                lower=lower,
+                upper=upper,
+                lambda_value=lambda_value,
+                edge_u=edge_u,
+                edge_v=edge_v,
+                edge_w=edge_w,
+                atol=max(tol, 1e-8),
+            )
+            if cheap_converged and last_residual <= 5.0 * tol:
+                converged = True
+                break
 
     return phi, scaled_dual, actual_dual, iterations, converged, float(last_residual)

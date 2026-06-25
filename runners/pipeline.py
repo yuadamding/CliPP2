@@ -34,6 +34,7 @@ def process_one_file_bundle(
     graph_file: str | Path | None = None,
     finalize_selected_fit: bool | None = None,
     missing_cna_policy: str = "error",
+    evaluate_all_candidates: bool | None = None,
 ) -> tuple[dict[str, float | int | str | bool], pd.DataFrame]:
     start_time = perf_counter()
     file_path = Path(file_path)
@@ -56,7 +57,11 @@ def process_one_file_bundle(
     simulation_available = simulation_root is not None and (Path(simulation_root) / data.tumor_id).exists()
     if finalize_selected_fit is None:
         finalize_selected_fit = True
-    evaluate_all_candidates = simulation_available and write_outputs
+    evaluate_all_candidates_flag = (
+        simulation_available and write_outputs
+        if evaluate_all_candidates is None
+        else simulation_available and bool(evaluate_all_candidates)
+    )
     selection_result = select_model(
         data=data,
         simulation_root=Path(simulation_root) if simulation_root is not None else None,
@@ -68,7 +73,7 @@ def process_one_file_bundle(
         settings_profile=settings_profile,
         selection_score=selection_score,
         use_warm_starts=use_warm_starts,
-        evaluate_all_candidates=evaluate_all_candidates,
+        evaluate_all_candidates=evaluate_all_candidates_flag,
         finalize_selected_fit=bool(finalize_selected_fit),
     )
     best_fit = selection_result.best_fit
@@ -145,6 +150,7 @@ def process_one_file_bundle(
         "adaptive_refinement_rounds_completed": int(selection_result.adaptive_refinement_rounds_completed),
         "selection_loglik_kind": "partition_constrained_observed_mle",
         "finalize_selected_fit": bool(finalize_selected_fit),
+        "evaluate_all_candidates": bool(evaluate_all_candidates_flag),
         "selection_used_convergence_fallback": bool(selection_result.selection_used_convergence_fallback),
         "num_candidates": int(selection_result.num_candidates),
         "num_converged_candidates": int(selection_result.num_converged_candidates),
@@ -389,6 +395,7 @@ def process_one_file(
     graph_file: str | Path | None = None,
     finalize_selected_fit: bool | None = None,
     missing_cna_policy: str = "error",
+    evaluate_all_candidates: bool | None = None,
 ) -> dict[str, float | int | str | bool]:
     summary, _ = process_one_file_bundle(
         file_path=file_path,
@@ -405,6 +412,7 @@ def process_one_file(
         write_outputs=write_outputs,
         graph_file=graph_file,
         finalize_selected_fit=finalize_selected_fit,
+        evaluate_all_candidates=evaluate_all_candidates,
         missing_cna_policy=missing_cna_policy,
     )
     return summary
@@ -428,6 +436,7 @@ def run_directory(
     finalize_selected_fit: bool | None = None,
     missing_cna_policy: str = "error",
     workers: int = 1,
+    evaluate_all_candidates: bool | None = None,
 ) -> pd.DataFrame:
     input_dir = Path(input_dir)
     files = sorted(input_dir.glob("*.tsv"))
@@ -457,6 +466,7 @@ def run_directory(
                     write_outputs=write_outputs,
                     graph_file=graph_file,
                     finalize_selected_fit=finalize_selected_fit,
+                    evaluate_all_candidates=evaluate_all_candidates,
                     missing_cna_policy=missing_cna_policy,
                 )
             )
@@ -482,6 +492,7 @@ def run_directory(
                     write_outputs=write_outputs,
                     graph_file=graph_file,
                     finalize_selected_fit=finalize_selected_fit,
+                    evaluate_all_candidates=evaluate_all_candidates,
                     missing_cna_policy=missing_cna_policy,
                 ): file_path
                 for file_path in files

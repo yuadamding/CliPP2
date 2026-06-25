@@ -585,6 +585,7 @@ def _process_one_file_remote(
     selection_score: str,
     use_warm_starts: bool,
     write_outputs: bool,
+    evaluate_all_candidates: bool,
     finalize_selected_fit: bool,
     missing_cna_policy: str,
 ) -> dict[str, float | int | str | bool]:
@@ -613,6 +614,7 @@ def _process_one_file_remote(
                 selection_score=selection_score,
                 use_warm_starts=use_warm_starts,
                 write_outputs=write_outputs,
+                evaluate_all_candidates=bool(evaluate_all_candidates),
                 finalize_selected_fit=finalize_selected_fit,
                 graph_file=None if graph_file is None else Path(graph_file),
                 missing_cna_policy=str(missing_cna_policy),
@@ -1145,6 +1147,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
     parser.add_argument("--write-tumor-outputs", action="store_true", help="Write full per-tumor result files.")
+    parser.add_argument(
+        "--evaluate-all-candidates",
+        action="store_true",
+        help="Evaluate simulation metrics for every candidate even when tumor outputs are not written.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Print optimizer progress inside each worker.")
     return parser
 
@@ -1226,6 +1233,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "lambda_grid_mode": str(args.lambda_grid_mode),
         "lambda_grid": "" if args.lambda_grid is None else str(args.lambda_grid),
         "graph_file": "" if args.graph_file is None else str(args.graph_file),
+        "evaluate_all_candidates": bool(args.evaluate_all_candidates),
         "bic_partition_tol": np.nan
         if fit_options.bic_partition_tol is None
         else float(fit_options.bic_partition_tol),
@@ -1282,6 +1290,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "lambda_grid_mode": str(args.lambda_grid_mode),
         "lambda_grid": "" if args.lambda_grid is None else str(args.lambda_grid),
         "graph_file": "" if args.graph_file is None else str(args.graph_file),
+        "evaluate_all_candidates": bool(args.evaluate_all_candidates),
         "bic_df_scale": float(args.bic_df_scale),
         "bic_cluster_penalty": float(args.bic_cluster_penalty),
         "outer_max_iter": int(args.outer_max_iter),
@@ -1362,6 +1371,7 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
                 selection_score=str(args.selection_score),
                 use_warm_starts=not args.disable_warm_start,
                 write_outputs=bool(args.write_tumor_outputs),
+                evaluate_all_candidates=bool(args.evaluate_all_candidates),
                 finalize_selected_fit=True,
                 missing_cna_policy=str(args.missing_cna_policy),
             )
