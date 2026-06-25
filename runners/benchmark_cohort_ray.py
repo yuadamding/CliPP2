@@ -11,7 +11,13 @@ import numpy as np
 import pandas as pd
 import ray
 
+from ..core.fusion_solver import (
+    compute_scalar_cell_wells,
+    load_pairwise_fusion_graph_tsv,
+    resolve_pairwise_fusion_graph,
+)
 from ..core.model import FitOptions
+from ..io.data import load_tumor_tsv
 from .benchmark_common import (
     _fit_options_from_args,
     _parse_lambda_grid,
@@ -20,6 +26,7 @@ from .benchmark_common import (
     write_benchmark_tables,
     write_patient_checkpoint,
 )
+from .model_selection import _edge_list_hash, _input_data_hash
 from .pipeline import process_one_file_bundle
 from .selection import PUBLIC_LAMBDA_GRID_MODES, is_adaptive_lambda_grid_mode
 
@@ -109,6 +116,23 @@ _CURRENT_RESUME_PATIENT_COLUMNS = {
     "selection_score_name",
     "lambda_search_mode",
     "selected_ari",
+    "bic_df_scale",
+    "bic_cluster_penalty",
+    "input_data_hash",
+    "edge_list_hash",
+    "graph_name",
+    "adaptive_weight_gamma",
+    "adaptive_weight_floor",
+    "adaptive_weight_baseline",
+    "major_prior",
+    "eps",
+    "bic_partition_tol",
+    "dtype",
+    "tol",
+    "outer_max_iter",
+    "inner_max_iter",
+    "raw_kkt_eligible",
+    "bic_selection_eligible",
     "adaptive_search_rounds_completed",
     "adaptive_search_stop_reason",
     "num_candidates_all",
@@ -117,11 +141,51 @@ _CURRENT_RESUME_PATIENT_COLUMNS = {
     "selection_optimizer_limited",
     "selection_optimizer_limited_reason",
 }
+_CURRENT_RESUME_CANDIDATE_COLUMNS = {
+    "tumor_id",
+    "lambda",
+    "selection_score_name",
+    "bic_df_scale",
+    "bic_cluster_penalty",
+    "classic_bic",
+    "bic_loglik",
+    "bic_loglik_source",
+    "bic_df",
+    "bic_n_eff",
+    "bic_partition_tol",
+    "bic_refit_converged",
+    "selection_eligible",
+    "raw_kkt_eligible",
+    "bic_selection_eligible",
+    "fixed_objective_kkt_residual",
+    "outer_kkt_certificate_status",
+    "polish_attempted",
+    "polish_success",
+    "post_polish_selection_eligible",
+    "input_data_hash",
+    "edge_list_hash",
+    "graph_name",
+    "adaptive_weight_gamma",
+    "adaptive_weight_floor",
+    "adaptive_weight_baseline",
+    "major_prior",
+    "eps",
+    "dtype",
+    "tol",
+    "outer_max_iter",
+    "inner_max_iter",
+}
 _STALE_RESUME_COLUMNS = {
     "oracle_search_rounds_completed",
     "oracle_search_stop_reason",
     "cv_stability_replicates",
     "selected_validation_loglik_mean",
+}
+_SEARCH_CONFIG_ONLY_SETTINGS = {
+    "graph_file",
+    "lambda_grid",
+    "settings_profile",
+    "missing_cna_policy",
 }
 
 
@@ -129,20 +193,240 @@ def _format_column_set(columns: set[str]) -> str:
     return ", ".join(sorted(columns))
 
 
-def _validate_resume_compatibility(
+def _non_null_values(df: pd.DataFrame, column: str) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(dtype=object)
+    return df[column].dropna()
+
+
+def _validate_resume_column_matches(
+    *,
+    df: pd.DataFrame,
+    column: str,
+    expected: object,
+    outdir: Path,
+    table_name: str,
+) -> None:
+    values = _non_null_values(df, column)
+    if values.empty:
+        return
+    if isinstance(expected, (float, int, np.floating, np.integer)):
+        observed = pd.to_numeric(values, errors="coerce").to_numpy(dtype=float)
+        finite_observed = observed[np.isfinite(observed)]
+        if finite_observed.size == 0:
+            return
+        if not np.allclose(finite_observed, float(expected), rtol=1e-12, atol=1e-12):
+            raise RuntimeError(
+                f"Existing {table_name} in {outdir} has {column} values "
+                f"{sorted(set(float(value) for value in finite_observed))}, "
+                f"but this run requests {float(expected)!r}. Use a clean output directory or archive/remove it."
+            )
+        return
+
+    expected_text = str(expected).strip().lower()
+    observed_text = {
+        value
+        for value in values.astype(str).str.strip().str.lower().unique()
+        if value
+    }
+    if observed_text and observed_text != {expected_text}:
+        raise RuntimeError(
+            f"Existing {table_name} in {outdir} has {column} values {sorted(observed_text)}, "
+            f"but this run requests {expected_text!r}. Use a clean output directory or archive/remove it."
+        )
+
+
+def _validate_patient_candidate_consistency(
     *,
     existing_patient_df: pd.DataFrame,
     existing_candidate_df: pd.DataFrame,
-    selection_score: str,
-    lambda_grid_mode: str,
     outdir: Path,
 ) -> None:
-    if existing_patient_df.empty and existing_candidate_df.empty:
+    if existing_patient_df.empty or existing_candidate_df.empty:
+        return
+    for column in ["input_data_hash", "edge_list_hash", "graph_name"]:
+        if column not in existing_patient_df.columns or column not in existing_candidate_df.columns:
+            continue
+        patient_values = existing_patient_df[["tumor_id", column]].dropna()
+        candidate_values = existing_candidate_df[["tumor_id", column]].dropna()
+        if patient_values.empty or candidate_values.empty:
+            continue
+        merged = candidate_values.merge(patient_values, on="tumor_id", suffixes=("_candidate", "_patient"))
+        if merged.empty:
+            continue
+        mismatched = merged.loc[
+            merged[f"{column}_candidate"].astype(str) != merged[f"{column}_patient"].astype(str)
+        ]
+        if not mismatched.empty:
+            tumor_ids = sorted(mismatched["tumor_id"].astype(str).unique().tolist())[:5]
+            raise RuntimeError(
+                f"Existing benchmark outputs in {outdir} have inconsistent {column} values "
+                f"between patient and candidate rows for tumors {tumor_ids}. "
+                "Use a clean output directory or archive/remove those files."
+            )
+
+
+def _saved_resume_hashes_by_tumor(
+    *,
+    existing_patient_df: pd.DataFrame,
+    existing_candidate_df: pd.DataFrame,
+) -> dict[str, dict[str, str]]:
+    saved: dict[str, dict[str, str]] = {}
+    for table_name, df in (
+        ("benchmark_patients.tsv", existing_patient_df),
+        ("per_candidate.tsv", existing_candidate_df),
+    ):
+        required = {"tumor_id", "input_data_hash", "edge_list_hash", "graph_name"}
+        if df.empty or not required.issubset(df.columns):
+            continue
+        for tumor_id, tumor_df in df.loc[:, sorted(required)].dropna(subset=["tumor_id"]).groupby("tumor_id"):
+            tumor_key = str(tumor_id)
+            record = saved.setdefault(tumor_key, {})
+            for column in ["input_data_hash", "edge_list_hash", "graph_name"]:
+                values = {
+                    value
+                    for value in tumor_df[column].dropna().astype(str).str.strip().unique()
+                    if value
+                }
+                if len(values) > 1:
+                    raise RuntimeError(
+                        f"Existing {table_name} has inconsistent {column} values for tumor "
+                        f"{tumor_key!r}: {sorted(values)}. Use a clean output directory or archive/remove it."
+                    )
+                if not values:
+                    continue
+                value = next(iter(values))
+                previous = record.get(column)
+                if previous is not None and previous != value:
+                    raise RuntimeError(
+                        f"Existing benchmark outputs have inconsistent {column} values for tumor "
+                        f"{tumor_key!r}: {sorted({previous, value})}. Use a clean output directory or archive/remove it."
+                    )
+                record[column] = value
+    return saved
+
+
+def _current_resume_hashes_for_file(
+    *,
+    file_path: Path,
+    fit_options: FitOptions,
+    graph_file: Path | None,
+    missing_cna_policy: str,
+) -> tuple[str, dict[str, str]]:
+    data = load_tumor_tsv(
+        file_path,
+        eps=float(fit_options.eps),
+        missing_cna_policy=str(missing_cna_policy),
+    )
+    graph = None
+    pilot_phi = None
+    if graph_file is not None:
+        graph = load_pairwise_fusion_graph_tsv(
+            graph_file,
+            num_mutations=data.num_mutations,
+            mutation_ids=data.mutation_ids,
+        )
+    else:
+        pilot_phi, _, _ = compute_scalar_cell_wells(
+            data,
+            major_prior=float(fit_options.major_prior),
+            eps=float(fit_options.eps),
+            tol=max(float(fit_options.tol), 1e-6),
+            max_iter=max(int(fit_options.inner_max_iter), 16),
+        )
+    effective_graph = resolve_pairwise_fusion_graph(
+        data.num_mutations,
+        graph=graph,
+        pilot_phi=pilot_phi,
+        gamma=float(fit_options.adaptive_weight_gamma),
+        tau=max(float(fit_options.adaptive_weight_floor), float(fit_options.eps)),
+        baseline=float(fit_options.adaptive_weight_baseline),
+    )
+    return data.tumor_id, {
+        "input_data_hash": _input_data_hash(data),
+        "edge_list_hash": _edge_list_hash(
+            effective_graph.edge_u,
+            effective_graph.edge_v,
+            effective_graph.edge_w,
+        ),
+        "graph_name": str(effective_graph.name),
+    }
+
+
+def _validate_requested_resume_hashes(
+    *,
+    files: list[Path],
+    existing_patient_df: pd.DataFrame,
+    existing_candidate_df: pd.DataFrame,
+    fit_options: FitOptions,
+    graph_file: Path | None,
+    missing_cna_policy: str,
+    outdir: Path,
+) -> None:
+    saved_hashes = _saved_resume_hashes_by_tumor(
+        existing_patient_df=existing_patient_df,
+        existing_candidate_df=existing_candidate_df,
+    )
+    if not saved_hashes:
+        return
+    requested_by_tumor = {path.stem: path for path in files}
+    for tumor_id, expected_hashes in saved_hashes.items():
+        file_path = requested_by_tumor.get(tumor_id)
+        if file_path is None:
+            continue
+        _, current_hashes = _current_resume_hashes_for_file(
+            file_path=file_path,
+            fit_options=fit_options,
+            graph_file=graph_file,
+            missing_cna_policy=missing_cna_policy,
+        )
+        for column, expected in expected_hashes.items():
+            current = current_hashes.get(column, "")
+            if expected and current and expected != current:
+                raise RuntimeError(
+                    f"Existing benchmark outputs in {outdir} have {column}={expected!r} for "
+                    f"tumor {tumor_id!r}, but the current requested input resolves to {current!r}. "
+                    "Use a clean output directory or archive/remove those files."
+                )
+
+
+def _validate_search_config_compatibility(
+    *,
+    existing_search_config_df: pd.DataFrame,
+    expected_settings: dict[str, object],
+    outdir: Path,
+) -> None:
+    if existing_search_config_df.empty:
+        return
+    for column, expected in expected_settings.items():
+        _validate_resume_column_matches(
+            df=existing_search_config_df,
+            column=column,
+            expected=expected,
+            outdir=outdir,
+            table_name="search_config.tsv",
+        )
+
+
+def _validate_bic_resume_compatibility(
+    *,
+    existing_patient_df: pd.DataFrame,
+    existing_candidate_df: pd.DataFrame,
+    existing_search_config_df: pd.DataFrame | None = None,
+    selection_score: str,
+    lambda_grid_mode: str,
+    expected_settings: dict[str, object] | None = None,
+    outdir: Path,
+) -> None:
+    if existing_search_config_df is None:
+        existing_search_config_df = pd.DataFrame()
+    if existing_patient_df.empty and existing_candidate_df.empty and existing_search_config_df.empty:
         return
 
     patient_columns = set(existing_patient_df.columns.astype(str))
     candidate_columns = set(existing_candidate_df.columns.astype(str))
-    stale_columns = (patient_columns | candidate_columns) & _STALE_RESUME_COLUMNS
+    search_config_columns = set(existing_search_config_df.columns.astype(str))
+    stale_columns = (patient_columns | candidate_columns | search_config_columns) & _STALE_RESUME_COLUMNS
     if stale_columns:
         raise RuntimeError(
             "Existing benchmark outputs in "
@@ -158,47 +442,76 @@ def _validate_resume_compatibility(
             f"({_format_column_set(missing_patient_columns)}). Use a clean output directory or archive/remove it."
         )
 
-    expected_score = str(selection_score).strip().lower()
-    if "selection_score_name" in existing_patient_df.columns:
-        observed_scores = {
-            value
-            for value in (
-                existing_patient_df["selection_score_name"]
-                .dropna()
-                .astype(str)
-                .str.strip()
-                .str.lower()
-                .unique()
+    missing_candidate_columns = _CURRENT_RESUME_CANDIDATE_COLUMNS - candidate_columns
+    if not existing_candidate_df.empty and missing_candidate_columns:
+        raise RuntimeError(
+            "Existing per_candidate.tsv in "
+            f"{outdir} is missing current resume columns "
+            f"({_format_column_set(missing_candidate_columns)}). Use a clean output directory or archive/remove it."
+        )
+
+    expected_settings = dict(expected_settings or {})
+    expected_settings.setdefault("selection_score_name", str(selection_score).strip().lower())
+    expected_settings.setdefault("lambda_grid_mode", str(lambda_grid_mode).strip().lower())
+    search_config_expected_settings = dict(expected_settings)
+    search_config_expected_settings["selection_score"] = search_config_expected_settings.pop(
+        "selection_score_name"
+    )
+    for column, expected in expected_settings.items():
+        if column in _SEARCH_CONFIG_ONLY_SETTINGS:
+            continue
+        if column == "lambda_grid_mode":
+            _validate_resume_column_matches(
+                df=existing_patient_df,
+                column=column,
+                expected=expected,
+                outdir=outdir,
+                table_name="benchmark_patients.tsv",
             )
-            if value
-        }
-        if observed_scores and observed_scores != {expected_score}:
-            raise RuntimeError(
-                "Existing benchmark_patients.tsv in "
-                f"{outdir} used selection_score_name={sorted(observed_scores)}, "
-                f"but this run requests {expected_score!r}. Use a clean output directory or archive/remove it."
+            continue
+        for table_name, df in (
+            ("benchmark_patients.tsv", existing_patient_df),
+            ("per_candidate.tsv", existing_candidate_df),
+        ):
+            _validate_resume_column_matches(
+                df=df,
+                column=column,
+                expected=expected,
+                outdir=outdir,
+                table_name=table_name,
             )
 
-    expected_lambda_mode = str(lambda_grid_mode).strip().lower()
-    if "lambda_grid_mode" in existing_patient_df.columns:
-        observed_modes = {
-            value
-            for value in (
-                existing_patient_df["lambda_grid_mode"]
-                .dropna()
-                .astype(str)
-                .str.strip()
-                .str.lower()
-                .unique()
-            )
-            if value
-        }
-        if observed_modes and observed_modes != {expected_lambda_mode}:
-            raise RuntimeError(
-                "Existing benchmark_patients.tsv in "
-                f"{outdir} used lambda_grid_mode={sorted(observed_modes)}, "
-                f"but this run requests {expected_lambda_mode!r}. Use a clean output directory or archive/remove it."
-            )
+    _validate_search_config_compatibility(
+        existing_search_config_df=existing_search_config_df,
+        expected_settings=search_config_expected_settings,
+        outdir=outdir,
+    )
+    _validate_patient_candidate_consistency(
+        existing_patient_df=existing_patient_df,
+        existing_candidate_df=existing_candidate_df,
+        outdir=outdir,
+    )
+
+
+def _validate_resume_compatibility(
+    *,
+    existing_patient_df: pd.DataFrame,
+    existing_candidate_df: pd.DataFrame,
+    existing_search_config_df: pd.DataFrame | None = None,
+    selection_score: str,
+    lambda_grid_mode: str,
+    expected_settings: dict[str, object] | None = None,
+    outdir: Path,
+) -> None:
+    _validate_bic_resume_compatibility(
+        existing_patient_df=existing_patient_df,
+        existing_candidate_df=existing_candidate_df,
+        existing_search_config_df=existing_search_config_df,
+        selection_score=selection_score,
+        lambda_grid_mode=lambda_grid_mode,
+        expected_settings=expected_settings,
+        outdir=outdir,
+    )
 
 
 def _configure_cpu_runtime() -> None:
@@ -859,8 +1172,10 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
 
     existing_patient_path = outdir / "benchmark_patients.tsv"
     existing_candidate_path = outdir / "per_candidate.tsv"
+    existing_search_config_path = outdir / "search_config.tsv"
     existing_patient_df = pd.DataFrame()
     existing_candidate_df = pd.DataFrame()
+    existing_search_config_df = pd.DataFrame()
     existing_patient_rows: list[dict[str, float | int | str | bool]] = []
     existing_candidate_rows: list[dict[str, float | int | str | bool]] = []
     completed_tumor_ids: set[str] = set()
@@ -871,23 +1186,8 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
                 completed_tumor_ids = set(existing_patient_df["tumor_id"].astype(str).tolist())
     if existing_candidate_path.exists():
         existing_candidate_df = pd.read_csv(existing_candidate_path, sep="\t")
-    if not existing_patient_df.empty or not existing_candidate_df.empty:
-        _validate_resume_compatibility(
-            existing_patient_df=existing_patient_df,
-            existing_candidate_df=existing_candidate_df,
-            selection_score=str(args.selection_score),
-            lambda_grid_mode=str(args.lambda_grid_mode),
-            outdir=outdir,
-        )
-        if not existing_patient_df.empty:
-            existing_patient_rows = existing_patient_df.to_dict(orient="records")
-        if not existing_candidate_df.empty:
-            existing_candidate_rows = _strip_resume_candidate_enrichment(existing_candidate_df).to_dict(
-                orient="records"
-            )
-
-    if completed_tumor_ids:
-        files = [path for path in files if path.stem not in completed_tumor_ids]
+    if existing_search_config_path.exists():
+        existing_search_config_df = pd.read_csv(existing_search_config_path, sep="\t")
 
     effective_device = _resolve_effective_device(args.device)
     fit_options = _fit_options_from_args(
@@ -920,6 +1220,57 @@ def run_ray_cohort_benchmark(args: argparse.Namespace) -> tuple[pd.DataFrame, pd
         "bic_partition_tol": fit_options.bic_partition_tol,
         "verbose": bool(fit_options.verbose),
     }
+    expected_resume_settings = {
+        "selection_score_name": str(args.selection_score),
+        "settings_profile": str(args.settings_profile),
+        "lambda_grid_mode": str(args.lambda_grid_mode),
+        "lambda_grid": "" if args.lambda_grid is None else str(args.lambda_grid),
+        "graph_file": "" if args.graph_file is None else str(args.graph_file),
+        "bic_partition_tol": np.nan
+        if fit_options.bic_partition_tol is None
+        else float(fit_options.bic_partition_tol),
+        "bic_df_scale": float(args.bic_df_scale),
+        "bic_cluster_penalty": float(args.bic_cluster_penalty),
+        "dtype": str(fit_options.dtype),
+        "missing_cna_policy": str(args.missing_cna_policy),
+        "major_prior": float(fit_options.major_prior),
+        "eps": float(fit_options.eps),
+        "tol": float(fit_options.tol),
+        "outer_max_iter": int(fit_options.outer_max_iter),
+        "inner_max_iter": int(fit_options.inner_max_iter),
+        "adaptive_weight_gamma": float(fit_options.adaptive_weight_gamma),
+        "adaptive_weight_floor": float(fit_options.adaptive_weight_floor),
+        "adaptive_weight_baseline": float(fit_options.adaptive_weight_baseline),
+    }
+    if not existing_patient_df.empty or not existing_candidate_df.empty or not existing_search_config_df.empty:
+        _validate_bic_resume_compatibility(
+            existing_patient_df=existing_patient_df,
+            existing_candidate_df=existing_candidate_df,
+            existing_search_config_df=existing_search_config_df,
+            selection_score=str(args.selection_score),
+            lambda_grid_mode=str(args.lambda_grid_mode),
+            expected_settings=expected_resume_settings,
+            outdir=outdir,
+        )
+        _validate_requested_resume_hashes(
+            files=files,
+            existing_patient_df=existing_patient_df,
+            existing_candidate_df=existing_candidate_df,
+            fit_options=fit_options,
+            graph_file=None if args.graph_file is None else Path(args.graph_file),
+            missing_cna_policy=str(args.missing_cna_policy),
+            outdir=outdir,
+        )
+        if not existing_patient_df.empty:
+            existing_patient_rows = existing_patient_df.to_dict(orient="records")
+        if not existing_candidate_df.empty:
+            existing_candidate_rows = _strip_resume_candidate_enrichment(existing_candidate_df).to_dict(
+                orient="records"
+            )
+
+    if completed_tumor_ids:
+        files = [path for path in files if path.stem not in completed_tumor_ids]
+
     search_config = {
         "input_dir": str(input_dir),
         "simulation_root": str(simulation_root),

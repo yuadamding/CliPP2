@@ -72,23 +72,36 @@ def process_one_file_bundle(
         finalize_selected_fit=bool(finalize_selected_fit),
     )
     best_fit = selection_result.best_fit
-    best_evaluation = selection_result.best_evaluation
+    simulation_diagnostics = getattr(selection_result, "simulation", selection_result)
+    best_evaluation = getattr(
+        simulation_diagnostics,
+        "selected_evaluation",
+        getattr(selection_result, "best_evaluation", None),
+    )
     search_df = selection_result.search_df
+    selected_search_row: dict[str, object] = {}
+    if not search_df.empty and "is_selected_best_row" in search_df.columns:
+        selected_mask = search_df["is_selected_best_row"].astype(bool).to_numpy(dtype=bool)
+        if np.any(selected_mask):
+            selected_search_row = search_df.loc[selected_mask].iloc[0].to_dict()
+
+    def _selected_value(name: str, default: object = np.nan) -> object:
+        return selected_search_row.get(name, default)
 
     if best_evaluation is None and simulation_available and bool(finalize_selected_fit):
         best_evaluation = evaluate_fit_against_simulation(fit=best_fit, data=data, simulation_root=simulation_root)
 
     elapsed_seconds = float(perf_counter() - start_time)
     reported_selected_ari = (
-        float(selection_result.selected_ari)
-        if selection_result.selected_ari is not None
+        float(simulation_diagnostics.selected_ari)
+        if simulation_diagnostics.selected_ari is not None
         else float(best_evaluation.ari)
         if best_evaluation is not None
         else None
     )
     selected_ari_source = (
         "candidate_selected_lambda"
-        if selection_result.selected_ari is not None
+        if simulation_diagnostics.selected_ari is not None
         else "final_evaluation_selected_lambda"
         if best_evaluation is not None
         else "not_available"
@@ -179,44 +192,44 @@ def process_one_file_bundle(
         "selected_ari_source": selected_ari_source,
         "selected_ari_lambda": np.nan if reported_selected_ari is None else float(best_fit.lambda_value),
         "selected_ari_matches_selected_lambda": bool(reported_selected_ari is not None),
-        "best_ari": np.nan if selection_result.best_ari is None else float(selection_result.best_ari),
+        "best_ari": np.nan if simulation_diagnostics.best_ari is None else float(simulation_diagnostics.best_ari),
         "best_ari_all_evaluated": np.nan
-        if getattr(selection_result, "best_ari_all_evaluated", None) is None
-        else float(selection_result.best_ari_all_evaluated),
+        if getattr(simulation_diagnostics, "best_ari_all_evaluated", None) is None
+        else float(simulation_diagnostics.best_ari_all_evaluated),
         "best_ari_certified": np.nan
-        if getattr(selection_result, "best_ari_certified", None) is None
-        else float(selection_result.best_ari_certified),
+        if getattr(simulation_diagnostics, "best_ari_certified", None) is None
+        else float(simulation_diagnostics.best_ari_certified),
         "best_ari_near_kkt": np.nan
-        if getattr(selection_result, "best_ari_near_kkt", None) is None
-        else float(selection_result.best_ari_near_kkt),
+        if getattr(simulation_diagnostics, "best_ari_near_kkt", None) is None
+        else float(simulation_diagnostics.best_ari_near_kkt),
         "best_ari_after_polish": np.nan
-        if getattr(selection_result, "best_ari_after_polish", None) is None
-        else float(selection_result.best_ari_after_polish),
+        if getattr(simulation_diagnostics, "best_ari_after_polish", None) is None
+        else float(simulation_diagnostics.best_ari_after_polish),
         "selection_optimizer_limited": bool(getattr(selection_result, "selection_optimizer_limited", False)),
         "selection_optimizer_limited_reason": str(
             getattr(selection_result, "selection_optimizer_limited_reason", "none")
         ),
         "best_converged_ari": np.nan
-        if selection_result.best_converged_ari is None
-        else float(selection_result.best_converged_ari),
+        if simulation_diagnostics.best_converged_ari is None
+        else float(simulation_diagnostics.best_converged_ari),
         "best_converged_lambda_min": np.nan
-        if selection_result.best_converged_lambda_min is None
-        else float(selection_result.best_converged_lambda_min),
+        if simulation_diagnostics.best_converged_lambda_min is None
+        else float(simulation_diagnostics.best_converged_lambda_min),
         "best_converged_lambda_max": np.nan
-        if selection_result.best_converged_lambda_max is None
-        else float(selection_result.best_converged_lambda_max),
-        "best_converged_lambda_count": int(selection_result.best_converged_lambda_count),
+        if simulation_diagnostics.best_converged_lambda_max is None
+        else float(simulation_diagnostics.best_converged_lambda_max),
+        "best_converged_lambda_count": int(simulation_diagnostics.best_converged_lambda_count),
         "ari_optimal_lambda_min": np.nan
-        if selection_result.ari_optimal_lambda_min is None
-        else float(selection_result.ari_optimal_lambda_min),
+        if simulation_diagnostics.ari_optimal_lambda_min is None
+        else float(simulation_diagnostics.ari_optimal_lambda_min),
         "ari_optimal_lambda_max": np.nan
-        if selection_result.ari_optimal_lambda_max is None
-        else float(selection_result.ari_optimal_lambda_max),
-        "ari_optimal_lambda_count": int(selection_result.ari_optimal_lambda_count),
-        "ari_hits_lower_boundary": bool(selection_result.ari_hits_lower_boundary),
-        "ari_hits_upper_boundary": bool(selection_result.ari_hits_upper_boundary),
-        "ari_boundary_unresolved": bool(selection_result.ari_boundary_unresolved),
-        "ari_optimum_resolved": bool(selection_result.ari_optimum_resolved),
+        if simulation_diagnostics.ari_optimal_lambda_max is None
+        else float(simulation_diagnostics.ari_optimal_lambda_max),
+        "ari_optimal_lambda_count": int(simulation_diagnostics.ari_optimal_lambda_count),
+        "ari_hits_lower_boundary": bool(simulation_diagnostics.ari_hits_lower_boundary),
+        "ari_hits_upper_boundary": bool(simulation_diagnostics.ari_hits_upper_boundary),
+        "ari_boundary_unresolved": bool(simulation_diagnostics.ari_boundary_unresolved),
+        "ari_optimum_resolved": bool(simulation_diagnostics.ari_optimum_resolved),
         "adaptive_search_rounds_completed": int(selection_result.adaptive_search_rounds_completed),
         "adaptive_search_stop_reason": str(selection_result.adaptive_search_stop_reason),
         "tested_lambda_min": float(search_df["lambda"].min()) if not search_df.empty else np.nan,
@@ -228,6 +241,22 @@ def process_one_file_bundle(
         "mean_purity": float(tumor_regime.mean_purity),
         "non_diploid_rate": float(tumor_regime.non_diploid_rate),
         "lambda_grid_mode": str(lambda_grid_mode if lambda_grid is None else "explicit"),
+        "input_data_hash": str(_selected_value("input_data_hash", "")),
+        "edge_list_hash": str(_selected_value("edge_list_hash", "")),
+        "eps": float(_selected_value("eps", fit_options.eps)),
+        "major_prior": float(_selected_value("major_prior", fit_options.major_prior)),
+        "adaptive_weight_gamma": float(
+            _selected_value("adaptive_weight_gamma", fit_options.adaptive_weight_gamma)
+        ),
+        "adaptive_weight_floor": float(
+            _selected_value("adaptive_weight_floor", fit_options.adaptive_weight_floor)
+        ),
+        "adaptive_weight_baseline": float(
+            _selected_value("adaptive_weight_baseline", fit_options.adaptive_weight_baseline)
+        ),
+        "tol": float(_selected_value("tol", fit_options.tol)),
+        "outer_max_iter": int(_selected_value("outer_max_iter", fit_options.outer_max_iter)),
+        "inner_max_iter": int(_selected_value("inner_max_iter", fit_options.inner_max_iter)),
         "bic_df_scale": float(selection_result.bic_df_scale),
         "bic_cluster_penalty": float(selection_result.bic_cluster_penalty),
         "bic_loglik": np.nan if best_fit.bic_loglik is None else float(best_fit.bic_loglik),
@@ -295,7 +324,19 @@ def process_one_file_bundle(
         "accepted_step_type": str(best_fit.accepted_step_type),
         "last_reject_reason": str(best_fit.last_reject_reason),
         "failure_reason": str(best_fit.failure_reason),
-        "selection_eligible": bool(best_fit.selection_eligible),
+        "raw_kkt_eligible": bool(_selected_value("raw_kkt_eligible", best_fit.selection_eligible)),
+        "bic_selection_eligible": bool(
+            _selected_value(
+                "bic_selection_eligible",
+                bool(
+                    best_fit.selection_eligible
+                    and bool(best_fit.bic_refit_converged)
+                    and best_fit.classic_bic is not None
+                    and np.isfinite(float(best_fit.classic_bic))
+                ),
+            )
+        ),
+        "selection_eligible": bool(_selected_value("selection_eligible", best_fit.selection_eligible)),
         "device": best_fit.device,
         "dtype": str(best_fit.dtype),
         "graph_name": str(best_fit.graph_name),

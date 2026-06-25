@@ -13,13 +13,14 @@ FIXED_LAMBDA_GRID_MODES = (
     "dense_no_zero",
     "coarse_no_zero",
     "ultra_dense_no_zero",
+    "fixed_grid",
 )
 BIC_ADAPTIVE_LAMBDA_GRID_MODES = (
     "adaptive_bic",
 )
 ADAPTIVE_LAMBDA_GRID_MODES = BIC_ADAPTIVE_LAMBDA_GRID_MODES
 LAMBDA_GRID_MODES = FIXED_LAMBDA_GRID_MODES + ADAPTIVE_LAMBDA_GRID_MODES
-PUBLIC_LAMBDA_GRID_MODES = LAMBDA_GRID_MODES
+PUBLIC_LAMBDA_GRID_MODES = ("adaptive_bic", "fixed_grid")
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,8 @@ def is_adaptive_lambda_grid_mode(mode: str) -> bool:
 def _default_lambda_ratios(mode: str) -> np.ndarray:
     if mode == "standard":
         return np.array([0.5, 2.0, 8.0, 32.0, 128.0], dtype=float)
+    if mode == "fixed_grid":
+        mode = "dense_no_zero"
     if mode == "dense":
         return np.array([0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0], dtype=float)
     if mode == "dense_no_zero":
@@ -54,7 +57,7 @@ def _default_lambda_ratios(mode: str) -> np.ndarray:
 
 def default_lambda_grid(
     data: TumorData,
-    mode: str = "dense_no_zero",
+    mode: str = "fixed_grid",
 ) -> list[float]:
     del data
     if is_adaptive_lambda_grid_mode(mode):

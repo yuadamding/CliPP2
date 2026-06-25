@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -69,9 +69,30 @@ KKT_POLISH_RESCUE_MAX_CANDIDATES = 3
 
 
 @dataclass
-class ModelSelectionResult:
+class SimulationDiagnostics:
+    selected_evaluation: SimulationEvaluation | None = None
+    selected_ari: float | None = None
+    best_ari: float | None = None
+    ari_optimal_lambda_min: float | None = None
+    ari_optimal_lambda_max: float | None = None
+    ari_optimal_lambda_count: int = 0
+    best_converged_ari: float | None = None
+    best_converged_lambda_min: float | None = None
+    best_converged_lambda_max: float | None = None
+    best_converged_lambda_count: int = 0
+    ari_hits_lower_boundary: bool = False
+    ari_hits_upper_boundary: bool = False
+    ari_boundary_unresolved: bool = False
+    ari_optimum_resolved: bool = True
+    best_ari_all_evaluated: float | None = None
+    best_ari_certified: float | None = None
+    best_ari_near_kkt: float | None = None
+    best_ari_after_polish: float | None = None
+
+
+@dataclass
+class BICSelectionResult:
     best_fit: FitResult
-    best_evaluation: SimulationEvaluation | None
     search_df: pd.DataFrame
     bic_df_scale: float
     bic_cluster_penalty: float
@@ -81,23 +102,10 @@ class ModelSelectionResult:
     selection_lambda_min: float | None
     selection_lambda_max: float | None
     selection_lambda_count: int
-    selected_ari: float | None
-    best_ari: float | None
-    ari_optimal_lambda_min: float | None
-    ari_optimal_lambda_max: float | None
-    ari_optimal_lambda_count: int
-    best_converged_ari: float | None
-    best_converged_lambda_min: float | None
-    best_converged_lambda_max: float | None
-    best_converged_lambda_count: int
     selection_hits_lower_boundary: bool
     selection_hits_upper_boundary: bool
     selection_boundary_unresolved: bool
     selection_optimum_resolved: bool
-    ari_hits_lower_boundary: bool
-    ari_hits_upper_boundary: bool
-    ari_boundary_unresolved: bool
-    ari_optimum_resolved: bool
     adaptive_search_rounds_completed: int
     adaptive_search_stop_reason: str
     num_candidates: int
@@ -114,10 +122,6 @@ class ModelSelectionResult:
     best_score_all_evaluated_selection_eligible: bool
     best_score_certified_lambda: float | None
     best_score_certified_kkt_residual: float | None
-    best_ari_all_evaluated: float | None
-    best_ari_certified: float | None
-    best_ari_near_kkt: float | None
-    best_ari_after_polish: float | None
     selection_optimizer_limited: bool
     selection_optimizer_limited_reason: str
     selection_used_convergence_fallback: bool
@@ -130,6 +134,82 @@ class ModelSelectionResult:
     lambda_bracket_eq: float | None
     lambda_bracket_full: float | None
     adaptive_refinement_rounds_completed: int
+    simulation: SimulationDiagnostics = field(default_factory=SimulationDiagnostics)
+
+    @property
+    def best_evaluation(self) -> SimulationEvaluation | None:
+        return self.simulation.selected_evaluation
+
+    @property
+    def selected_ari(self) -> float | None:
+        return self.simulation.selected_ari
+
+    @property
+    def best_ari(self) -> float | None:
+        return self.simulation.best_ari
+
+    @property
+    def ari_optimal_lambda_min(self) -> float | None:
+        return self.simulation.ari_optimal_lambda_min
+
+    @property
+    def ari_optimal_lambda_max(self) -> float | None:
+        return self.simulation.ari_optimal_lambda_max
+
+    @property
+    def ari_optimal_lambda_count(self) -> int:
+        return self.simulation.ari_optimal_lambda_count
+
+    @property
+    def best_converged_ari(self) -> float | None:
+        return self.simulation.best_converged_ari
+
+    @property
+    def best_converged_lambda_min(self) -> float | None:
+        return self.simulation.best_converged_lambda_min
+
+    @property
+    def best_converged_lambda_max(self) -> float | None:
+        return self.simulation.best_converged_lambda_max
+
+    @property
+    def best_converged_lambda_count(self) -> int:
+        return self.simulation.best_converged_lambda_count
+
+    @property
+    def ari_hits_lower_boundary(self) -> bool:
+        return self.simulation.ari_hits_lower_boundary
+
+    @property
+    def ari_hits_upper_boundary(self) -> bool:
+        return self.simulation.ari_hits_upper_boundary
+
+    @property
+    def ari_boundary_unresolved(self) -> bool:
+        return self.simulation.ari_boundary_unresolved
+
+    @property
+    def ari_optimum_resolved(self) -> bool:
+        return self.simulation.ari_optimum_resolved
+
+    @property
+    def best_ari_all_evaluated(self) -> float | None:
+        return self.simulation.best_ari_all_evaluated
+
+    @property
+    def best_ari_certified(self) -> float | None:
+        return self.simulation.best_ari_certified
+
+    @property
+    def best_ari_near_kkt(self) -> float | None:
+        return self.simulation.best_ari_near_kkt
+
+    @property
+    def best_ari_after_polish(self) -> float | None:
+        return self.simulation.best_ari_after_polish
+
+
+ModelSelectionResult = BICSelectionResult
 
 
 @dataclass(frozen=True)
@@ -168,6 +248,19 @@ def _selection_score_value(
     if normalized == "bic":
         return float(classic_bic), float(classic_bic), float(extended_bic)
     raise ValueError(f"Unknown normalized selection_score: {selection_score}")
+
+
+def _is_bic_selection_eligible(
+    *,
+    raw_kkt_eligible: bool,
+    bic_refit_converged: bool,
+    classic_bic: float,
+) -> bool:
+    return bool(
+        bool(raw_kkt_eligible)
+        and bool(bic_refit_converged)
+        and np.isfinite(float(classic_bic))
+    )
 
 
 def _optimal_lambda_range(
@@ -555,8 +648,8 @@ def _kkt_polish_options(base_options: FitOptions) -> FitOptions:
 def _adaptive_first_pass_options(base_options: FitOptions) -> FitOptions:
     return replace(
         base_options,
-        outer_max_iter=min(int(base_options.outer_max_iter), ADAPTIVE_FIRST_PASS_OUTER_MAX_ITER),
-        inner_max_iter=min(int(base_options.inner_max_iter), ADAPTIVE_FIRST_PASS_INNER_MAX_ITER),
+        outer_max_iter=max(int(base_options.outer_max_iter), ADAPTIVE_FIRST_PASS_OUTER_MAX_ITER),
+        inner_max_iter=max(int(base_options.inner_max_iter), ADAPTIVE_FIRST_PASS_INNER_MAX_ITER),
     )
 
 
@@ -783,6 +876,7 @@ def _adaptive_interval_proposals(
     search_df: pd.DataFrame,
     *,
     normalized_score: str,
+    tol: float,
     max_new: int,
 ) -> list[float]:
     path_df = _best_candidate_rows_by_lambda(search_df).sort_values("lambda").reset_index(drop=True)
@@ -824,7 +918,20 @@ def _adaptive_interval_proposals(
             right_score = float(right.get(score_column, np.nan))
             near_best = min(left_score, right_score) <= best_score + max(1.0, abs(best_score) * 1e-5)
             score_focus = 1.0 if near_best else 0.0
-        kkt_risk = 1.0 if (not bool(left["converged"]) or not bool(right["converged"])) else 0.0
+        repair_tol = _kkt_polish_repair_tol(tol)
+        left_ok = bool(left.get("selection_eligible", False))
+        right_ok = bool(right.get("selection_eligible", False))
+        left_kkt = float(left.get("fixed_objective_kkt_residual", np.inf))
+        right_kkt = float(right.get("fixed_objective_kkt_residual", np.inf))
+        kkt_risk = (
+            1.0
+            if (
+                not left_ok
+                or not right_ok
+                or min(left_kkt, right_kkt) <= repair_tol
+            )
+            else 0.0
+        )
         priority = (
             log_width
             + (3.0 if partition_changed else 0.0)
@@ -1013,6 +1120,12 @@ def _evaluate_candidate(
         edge_weight_max = float("nan")
         edge_weight_mean = float("nan")
     partition_hash = _partition_signature(bic_labels)
+    raw_kkt_eligible = bool(fit.selection_eligible)
+    bic_selection_eligible = _is_bic_selection_eligible(
+        raw_kkt_eligible=raw_kkt_eligible,
+        bic_refit_converged=bool(bic_refit.converged),
+        classic_bic=float(classic_bic),
+    )
 
     evaluation = None
     ari_value = np.nan
@@ -1079,6 +1192,7 @@ def _evaluate_candidate(
         "refit_loglik": float(bic_loglik),
         "refit_fit_loss": float(bic_refit.fit_loss),
         "refit_converged": bool(bic_refit.converged),
+        "bic_refit_converged": bool(bic_refit.converged),
         "refit_boundary_count": int(bic_refit.boundary_count),
         "refit_active_df": int(bic_refit.active_degrees_of_freedom),
         "penalized_objective": float(fit.penalized_objective),
@@ -1135,13 +1249,20 @@ def _evaluate_candidate(
         "accepted_step_type": str(fit.accepted_step_type),
         "last_reject_reason": str(fit.last_reject_reason),
         "failure_reason": str(fit.failure_reason),
-        "selection_eligible": bool(fit.selection_eligible),
-        "raw_kkt_eligible": bool(fit.selection_eligible),
+        "selection_eligible": bic_selection_eligible,
+        "raw_kkt_eligible": raw_kkt_eligible,
+        "bic_selection_eligible": bic_selection_eligible,
         "partition_tol": float(bic_partition_tol),
         "primary_phi_source": "raw_penalized_fit",
         "bic_refit_phi_source": "secondary_partition_refit",
         "device": str(fit.device),
         "dtype": str(fit.dtype),
+        "tol": float(effective_fit_options.tol),
+        "outer_max_iter": int(effective_fit_options.outer_max_iter),
+        "inner_max_iter": int(effective_fit_options.inner_max_iter),
+        "summary_tol": float(effective_fit_options.summary_tol)
+        if effective_fit_options.summary_tol is not None
+        else np.nan,
         "eps": float(effective_fit_options.eps),
         "major_prior": float(effective_fit_options.major_prior),
         "graph_name": str(fit.graph_name),
@@ -1242,7 +1363,7 @@ def _grid_search_selection(
     selection_method: str,
     selection_score: str,
     finalize_selected_fit: bool,
-) -> ModelSelectionResult:
+) -> BICSelectionResult:
     explicit_lambda_grid = lambda_grid is not None
     normalized_lambda_grid_mode = str(lambda_grid_mode).strip().lower()
     if normalized_lambda_grid_mode not in LAMBDA_GRID_MODES:
@@ -1435,6 +1556,7 @@ def _grid_search_selection(
             proposals = _adaptive_interval_proposals(
                 interim_df,
                 normalized_score=normalized_score,
+                tol=float(effective_fit_options.tol),
                 max_new=min(
                     adaptive_refine_per_round,
                     max(adaptive_max_candidates - len(fit_by_lambda), 0),
@@ -1664,6 +1786,76 @@ def _grid_search_selection(
                         source_row["post_polish_bic"] = post_bic
                         source_row["post_polish_kkt_residual"] = post_kkt
                         source_row["post_polish_selection_eligible"] = polish_success
+                search_df = (
+                    pd.DataFrame([row for _, _, row in result_entries])
+                    .sort_values(["lambda", "selection_step"])
+                    .reset_index(drop=True)
+                )
+                search_df, _ = _annotate_polish_candidates(
+                    search_df,
+                    normalized_score=normalized_score,
+                    tol=float(effective_fit_options.tol),
+                    max_candidates=0,
+                )
+        has_certified_candidate = bool(
+            "selection_eligible" in search_df.columns
+            and search_df["selection_eligible"].astype(bool).to_numpy(dtype=bool).any()
+        )
+        if not has_certified_candidate:
+            score_column = _adaptive_score_column(normalized_score)
+            if score_column in search_df.columns and "_candidate_id" in search_df.columns:
+                objectives = search_df["penalized_objective"].to_numpy(dtype=float)
+                scores = search_df[score_column].to_numpy(dtype=float)
+                mm_violations = (
+                    search_df["mm_consistency_violations"].to_numpy(dtype=float)
+                    if "mm_consistency_violations" in search_df.columns
+                    else np.zeros(search_df.shape[0], dtype=float)
+                )
+                full_start_pool = search_df.loc[
+                    np.isfinite(objectives) & np.isfinite(scores) & (mm_violations <= 0.0)
+                ].copy()
+            else:
+                full_start_pool = search_df.iloc[0:0].copy()
+            if not full_start_pool.empty:
+                score_rescue = full_start_pool.sort_values(
+                    [score_column, "lambda", "selection_step"],
+                    ascending=[not _score_maximized(normalized_score), True, True],
+                    na_position="last",
+                ).head(max(KKT_POLISH_RESCUE_MAX_CANDIDATES - 1, 1))
+                lambda_rescue = full_start_pool.sort_values(
+                    ["lambda", "fixed_objective_kkt_residual", "selection_step"],
+                    ascending=[False, True, True],
+                    na_position="last",
+                ).head(1)
+                full_start_rescue_df = (
+                    pd.concat([score_rescue, lambda_rescue], ignore_index=True)
+                    .drop_duplicates("_candidate_id", keep="first")
+                    .head(KKT_POLISH_RESCUE_MAX_CANDIDATES)
+                )
+                fit_by_candidate_id = {
+                    int(row["_candidate_id"]): fit
+                    for fit, _, row in result_entries
+                    if "_candidate_id" in row
+                }
+                full_start_phi_by_lambda: dict[float, np.ndarray] = {}
+                for _, candidate_row in full_start_rescue_df.iterrows():
+                    candidate_id = int(candidate_row["_candidate_id"])
+                    source_fit = fit_by_candidate_id.get(candidate_id)
+                    if source_fit is not None:
+                        full_start_phi_by_lambda[_canonical_lambda(float(candidate_row["lambda"]))] = source_fit.phi.copy()
+
+                full_start_lambdas = [float(value) for value in full_start_rescue_df["lambda"].to_numpy(dtype=float)]
+                _evaluate_lambda_sequence(
+                    full_start_lambdas,
+                    search_round=adaptive_refinement_rounds_completed + 3,
+                    search_phase="kkt_polish_full_start_rescue",
+                    allow_revisit=True,
+                    candidate_fit_options=_kkt_polish_options(effective_fit_options),
+                    ari_only_evaluation=False,
+                    start_mode="full",
+                    compute_summary=True,
+                    phi_start_by_lambda=full_start_phi_by_lambda,
+                )
                 search_df = (
                     pd.DataFrame([row for _, _, row in result_entries])
                     .sort_values(["lambda", "selection_step"])
@@ -1931,18 +2123,8 @@ def _grid_search_selection(
     selected_ari = float(best_evaluation.ari) if best_evaluation is not None else selected_candidate_ari
     search_df = search_df.drop(columns=["_candidate_id"])
     effective_graph.clear_torch_cache()
-    return ModelSelectionResult(
-        best_fit=best_fit,
-        best_evaluation=best_evaluation,
-        search_df=search_df,
-        bic_df_scale=float(bic_df_scale),
-        bic_cluster_penalty=float(bic_cluster_penalty),
-        selection_method=selection_method,
-        profile_name=profile_name,
-        selection_metric_value=selection_metric_value,
-        selection_lambda_min=selection_min,
-        selection_lambda_max=selection_max,
-        selection_lambda_count=selection_count,
+    simulation_diagnostics = SimulationDiagnostics(
+        selected_evaluation=best_evaluation,
         selected_ari=selected_ari,
         best_ari=best_ari_value,
         ari_optimal_lambda_min=best_ari_min,
@@ -1952,14 +2134,30 @@ def _grid_search_selection(
         best_converged_lambda_min=best_converged_ari_min,
         best_converged_lambda_max=best_converged_ari_max,
         best_converged_lambda_count=best_converged_ari_count,
-        selection_hits_lower_boundary=selection_lower_hit,
-        selection_hits_upper_boundary=selection_upper_hit,
-        selection_boundary_unresolved=selection_boundary_unresolved,
-        selection_optimum_resolved=not selection_boundary_unresolved,
         ari_hits_lower_boundary=ari_lower_hit,
         ari_hits_upper_boundary=ari_upper_hit,
         ari_boundary_unresolved=ari_boundary_unresolved,
         ari_optimum_resolved=not ari_boundary_unresolved,
+        best_ari_all_evaluated=best_ari_all_evaluated,
+        best_ari_certified=best_ari_certified,
+        best_ari_near_kkt=best_ari_near_kkt,
+        best_ari_after_polish=best_ari_after_polish,
+    )
+    return BICSelectionResult(
+        best_fit=best_fit,
+        search_df=search_df,
+        bic_df_scale=float(bic_df_scale),
+        bic_cluster_penalty=float(bic_cluster_penalty),
+        selection_method=selection_method,
+        profile_name=profile_name,
+        selection_metric_value=selection_metric_value,
+        selection_lambda_min=selection_min,
+        selection_lambda_max=selection_max,
+        selection_lambda_count=selection_count,
+        selection_hits_lower_boundary=selection_lower_hit,
+        selection_hits_upper_boundary=selection_upper_hit,
+        selection_boundary_unresolved=selection_boundary_unresolved,
+        selection_optimum_resolved=not selection_boundary_unresolved,
         adaptive_search_rounds_completed=adaptive_search_rounds_completed,
         adaptive_search_stop_reason=str(final_adaptive_search_stop_reason),
         num_candidates=num_candidates,
@@ -1986,12 +2184,9 @@ def _grid_search_selection(
         best_score_all_evaluated_selection_eligible=best_score_all_evaluated_selection_eligible,
         best_score_certified_lambda=best_score_certified_lambda,
         best_score_certified_kkt_residual=best_score_certified_kkt_residual,
-        best_ari_all_evaluated=best_ari_all_evaluated,
-        best_ari_certified=best_ari_certified,
-        best_ari_near_kkt=best_ari_near_kkt,
-        best_ari_after_polish=best_ari_after_polish,
         selection_optimizer_limited=selection_optimizer_limited,
         selection_optimizer_limited_reason=selection_optimizer_limited_reason,
+        simulation=simulation_diagnostics,
     )
 
 
@@ -2009,7 +2204,7 @@ def select_model(
     use_warm_starts: bool,
     evaluate_all_candidates: bool,
     finalize_selected_fit: bool = True,
-) -> ModelSelectionResult:
+) -> BICSelectionResult:
     normalized_profile = settings_profile.strip().lower()
     if normalized_profile not in {"manual", "auto"}:
         raise ValueError(f"Unknown settings_profile: {settings_profile}")
@@ -2054,6 +2249,8 @@ def select_model(
 
 
 __all__ = [
+    "BICSelectionResult",
     "ModelSelectionResult",
+    "SimulationDiagnostics",
     "select_model",
 ]

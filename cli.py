@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-from . import FitOptions, process_one_file, run_directory, run_simulation_benchmark
+from . import FitOptions, process_one_file, run_directory
 from .runners.selection import PUBLIC_LAMBDA_GRID_MODES
 
 
@@ -25,18 +26,7 @@ def _parse_int_grid(value: str | None) -> list[int] | None:
     return [int(piece) for piece in cleaned.split(",") if piece.strip()]
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="multi-region clipp",
-        description=(
-            "multi-region clipp: cellular prevalence clustering with exact observed-data "
-            "likelihood and objective-faithful pairwise fusion."
-        ),
-    )
-    parser.add_argument("--input-dir", default="CliPP2Sim_TSV", help="Directory with per-tumor TSV files.")
-    parser.add_argument("--input-file", default=None, help="Optional single tumor TSV file.")
-    parser.add_argument("--outdir", default="multi_region_clipp_results", help="Output directory.")
-    parser.add_argument("--simulation-root", default="CliPP2Sim", help="Simulation root for ARI evaluation.")
+def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lambda-grid", default=None, help="Comma-separated lambda grid or 'auto'.")
     parser.add_argument(
         "--graph-file",
@@ -48,22 +38,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(PUBLIC_LAMBDA_GRID_MODES),
         default="adaptive_bic",
         help="Automatic lambda grid template used when --lambda-grid is not provided.",
-    )
-    parser.add_argument(
-        "--benchmark-simulation",
-        action="store_true",
-        help="Run a stratified simulation benchmark instead of processing all input files directly.",
-    )
-    parser.add_argument(
-        "--reps-per-scenario",
-        type=int,
-        default=1,
-        help="Number of representative tumors to benchmark for each simulation scenario.",
-    )
-    parser.add_argument(
-        "--n-mean-values",
-        default=None,
-        help="Optional comma-separated filter for benchmark depth settings, for example '50,300,1000'.",
     )
     parser.add_argument("--outer-max-iter", type=int, default=8, help="Maximum outer majorization iterations.")
     parser.add_argument("--inner-max-iter", type=int, default=30, help="Maximum inner convex-solver iterations.")
@@ -84,13 +58,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--bic-df-scale",
         type=float,
         default=1.0,
-        help="Scale factor on the CP-profile degrees of freedom in the extended BIC selection score.",
+        help="Scale factor on the CP-profile degrees of freedom in the extended BIC diagnostic.",
     )
     parser.add_argument(
         "--bic-cluster-penalty",
         type=float,
         default=0.0,
-        help="Additional cluster-count complexity penalty in the extended BIC selection score.",
+        help="Additional cluster-count complexity penalty in the extended BIC diagnostic.",
     )
     parser.add_argument(
         "--settings-profile",
@@ -105,12 +79,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Candidate scoring objective. BIC uses a partition-constrained observed-data refit.",
     )
     parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
-    parser.add_argument(
-        "--skip-patient-outputs",
-        "--skip-tumor-outputs",
-        action="store_true",
-        help="Skip per-tumor mutation/cluster/lambda files and only write benchmark summaries.",
-    )
     parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability assigned to major-copy multiplicity.")
     parser.add_argument(
         "--device",
@@ -130,17 +98,69 @@ def build_parser() -> argparse.ArgumentParser:
         default="error",
         help="Behavior when neither has_cna nor cna_observed is present in an input TSV.",
     )
-    parser.add_argument("--workers", type=int, default=1, help="Process-level parallelism for ordinary directory/cohort runs.")
-    parser.add_argument("--max-files", type=int, default=None, help="Optional cap on the number of files processed.")
     parser.add_argument("--verbose", action="store_true", help="Print optimizer progress.")
+
+
+def _add_fit_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--input-dir", default="CliPP2Sim_TSV", help="Directory with per-tumor TSV files.")
+    parser.add_argument("--input-file", default=None, help="Optional single tumor TSV file.")
+    parser.add_argument("--outdir", default="multi_region_clipp_results", help="Output directory.")
+    parser.add_argument("--simulation-root", default=None, help=argparse.SUPPRESS)
+    _add_common_selection_args(parser)
+    parser.add_argument(
+        "--skip-outputs",
+        "--skip-patient-outputs",
+        "--skip-tumor-outputs",
+        action="store_true",
+        help="Skip per-tumor mutation/cluster/lambda files.",
+    )
+    parser.add_argument("--workers", type=int, default=1, help="Process-level parallelism for directory runs.")
+    parser.add_argument("--max-files", type=int, default=None, help="Optional cap on the number of files processed.")
+
+
+def _add_benchmark_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--input-dir", default="CliPP2Sim_TSV", help="Directory with per-tumor TSV files.")
+    parser.add_argument("--outdir", default="multi_region_clipp_results", help="Output directory.")
+    parser.add_argument("--simulation-root", default="CliPP2Sim", help="Simulation root for benchmark diagnostics.")
+    _add_common_selection_args(parser)
+    parser.add_argument(
+        "--reps-per-scenario",
+        type=int,
+        default=1,
+        help="Number of representative tumors to benchmark for each simulation scenario.",
+    )
+    parser.add_argument(
+        "--n-mean-values",
+        default=None,
+        help="Optional comma-separated filter for benchmark depth settings, for example '50,300,1000'.",
+    )
+    parser.add_argument(
+        "--skip-outputs",
+        "--skip-patient-outputs",
+        "--skip-tumor-outputs",
+        action="store_true",
+        help="Skip per-tumor mutation/cluster/lambda files and only write benchmark summaries.",
+    )
+    parser.add_argument("--workers", type=int, default=1, help="Process-level parallelism for benchmark runs.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="clipp2",
+        description=(
+            "CliPP2 BIC model selection for objective-faithful observed-data pairwise fusion."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    fit_parser = subparsers.add_parser("fit", help="Fit TSV files with certified BIC model selection.")
+    _add_fit_args(fit_parser)
+    benchmark_parser = subparsers.add_parser("benchmark", help="Run simulation benchmark diagnostics.")
+    _add_benchmark_args(benchmark_parser)
     return parser
 
 
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-
-    fit_options = FitOptions(
+def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
+    return FitOptions(
         lambda_value=0.0,
         outer_max_iter=args.outer_max_iter,
         inner_max_iter=args.inner_max_iter,
@@ -152,37 +172,54 @@ def main() -> None:
         dtype=args.dtype,
         verbose=args.verbose,
     )
+
+
+def _legacy_command_argv(argv: list[str]) -> list[str]:
+    if argv and argv[0] in {"fit", "benchmark", "-h", "--help"}:
+        return argv
+    if "--benchmark-simulation" in argv:
+        return ["benchmark", *[arg for arg in argv if arg != "--benchmark-simulation"]]
+    return ["fit", *argv]
+
+
+def _run_benchmark(args: argparse.Namespace) -> None:
+    from .runners.benchmark import run_simulation_benchmark
+
+    fit_options = _fit_options_from_args(args)
     lambda_grid = _parse_lambda_grid(args.lambda_grid)
     n_mean_values = _parse_int_grid(args.n_mean_values)
+    _, scenario_df, global_df = run_simulation_benchmark(
+        input_dir=Path(args.input_dir),
+        simulation_root=Path(args.simulation_root),
+        outdir=Path(args.outdir),
+        reps_per_scenario=args.reps_per_scenario,
+        n_mean_values=n_mean_values,
+        lambda_grid=lambda_grid,
+        lambda_grid_mode=args.lambda_grid_mode,
+        fit_options=fit_options,
+        bic_df_scale=args.bic_df_scale,
+        bic_cluster_penalty=args.bic_cluster_penalty,
+        settings_profile=args.settings_profile,
+        selection_score=args.selection_score,
+        use_warm_starts=not args.disable_warm_start,
+        write_patient_outputs=not args.skip_outputs,
+        workers=args.workers,
+        missing_cna_policy=args.missing_cna_policy,
+    )
+    print(global_df.to_string(index=False))
+    print(scenario_df.head().to_string(index=False))
 
-    if args.benchmark_simulation:
-        patient_df, scenario_df, global_df = run_simulation_benchmark(
-            input_dir=Path(args.input_dir),
-            simulation_root=Path(args.simulation_root),
-            outdir=Path(args.outdir),
-            reps_per_scenario=args.reps_per_scenario,
-            n_mean_values=n_mean_values,
-            lambda_grid=lambda_grid,
-            lambda_grid_mode=args.lambda_grid_mode,
-            fit_options=fit_options,
-            bic_df_scale=args.bic_df_scale,
-            bic_cluster_penalty=args.bic_cluster_penalty,
-            settings_profile=args.settings_profile,
-            selection_score=args.selection_score,
-            use_warm_starts=not args.disable_warm_start,
-            write_patient_outputs=not args.skip_patient_outputs,
-            workers=args.workers,
-            missing_cna_policy=args.missing_cna_policy,
-        )
-        print(global_df.to_string(index=False))
-        print(scenario_df.head().to_string(index=False))
-        return
+
+def _run_fit(args: argparse.Namespace) -> None:
+    fit_options = _fit_options_from_args(args)
+    lambda_grid = _parse_lambda_grid(args.lambda_grid)
+    simulation_root = Path(args.simulation_root) if args.simulation_root else None
 
     if args.input_file:
         summary = process_one_file(
             file_path=Path(args.input_file),
             outdir=Path(args.outdir),
-            simulation_root=Path(args.simulation_root) if args.simulation_root else None,
+            simulation_root=simulation_root,
             lambda_grid=lambda_grid,
             lambda_grid_mode=args.lambda_grid_mode,
             fit_options=fit_options,
@@ -191,7 +228,7 @@ def main() -> None:
             settings_profile=args.settings_profile,
             selection_score=args.selection_score,
             use_warm_starts=not args.disable_warm_start,
-            write_outputs=not args.skip_patient_outputs,
+            write_outputs=not args.skip_outputs,
             graph_file=Path(args.graph_file) if args.graph_file else None,
             missing_cna_policy=args.missing_cna_policy,
         )
@@ -201,7 +238,7 @@ def main() -> None:
     summary_df = run_directory(
         input_dir=Path(args.input_dir),
         outdir=Path(args.outdir),
-        simulation_root=Path(args.simulation_root) if args.simulation_root else None,
+        simulation_root=simulation_root,
         lambda_grid=lambda_grid,
         lambda_grid_mode=args.lambda_grid_mode,
         fit_options=fit_options,
@@ -211,12 +248,21 @@ def main() -> None:
         settings_profile=args.settings_profile,
         selection_score=args.selection_score,
         use_warm_starts=not args.disable_warm_start,
-        write_outputs=not args.skip_patient_outputs,
+        write_outputs=not args.skip_outputs,
         graph_file=Path(args.graph_file) if args.graph_file else None,
         missing_cna_policy=args.missing_cna_policy,
         workers=args.workers,
     )
     print(summary_df.head().to_string(index=False))
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(_legacy_command_argv(list(sys.argv[1:] if argv is None else argv)))
+    if args.command == "benchmark":
+        _run_benchmark(args)
+        return
+    _run_fit(args)
 
 
 __all__ = ["build_parser", "main"]
