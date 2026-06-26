@@ -23,8 +23,10 @@ from .refit import PartitionRefitResult, partition_constrained_observed_refit
 from .starts import (
     compute_exact_observed_data_pilot,
     compute_pooled_observed_data_start,
+    compute_pooled_observed_data_start_torch,
     compute_scalar_cell_wells,
     compute_scalar_well_start_bank,
+    compute_scalar_well_start_bank_torch,
 )
 from .types import (
     FusionFitArtifacts,
@@ -68,8 +70,10 @@ __all__ = [
     "tensorize_graph",
     "compute_exact_observed_data_pilot",
     "compute_pooled_observed_data_start",
+    "compute_pooled_observed_data_start_torch",
     "compute_scalar_cell_wells",
     "compute_scalar_well_start_bank",
+    "compute_scalar_well_start_bank_torch",
     "fit_observed_data_pairwise_fusion",
     "prepare_torch_problem",
     "torch_data_from_context",

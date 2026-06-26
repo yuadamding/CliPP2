@@ -11,9 +11,9 @@ from .graph_ops import (
     tensorize_graph,
 )
 from .starts import (
-    compute_pooled_observed_data_start,
+    compute_pooled_observed_data_start_torch,
     compute_scalar_cell_wells,
-    compute_scalar_well_start_bank,
+    compute_scalar_well_start_bank_torch,
 )
 from .torch_backend import (
     TorchTumorData,
@@ -134,7 +134,7 @@ def _deduplicate_starts(starts: list[np.ndarray | torch.Tensor]) -> list[np.ndar
         if signature in seen:
             continue
         seen.add(signature)
-        unique.append(start_arr)
+        unique.append(start)
     return unique
 
 
@@ -285,26 +285,22 @@ def prepare_torch_problem(
         tensor_graph = tensorize_graph(effective_graph, effective_runtime, num_nodes=data.num_mutations)
 
     if pooled_start is None:
-        pooled_start_np = compute_pooled_observed_data_start(
-            data,
-            runtime=effective_runtime,
+        pooled_start_tensor = compute_pooled_observed_data_start_torch(
+            effective_torch_data,
             major_prior=float(major_prior),
             eps=float(eps),
             tol=tol,
             max_iter=max(int(inner_max_iter), 16),
-            beta_hints=exact_pilot_np,
+            beta_hints=exact_pilot_tensor,
         )
     else:
-        pooled_start_np = pooled_start
+        pooled_start_tensor = _tensor_from_start(pooled_start, effective_runtime)
 
     if scalar_well_starts is None:
-        scalar_well_starts_seq = compute_scalar_well_start_bank(
-            data,
-            major_prior=float(major_prior),
+        scalar_well_starts_seq = compute_scalar_well_start_bank_torch(
+            effective_torch_data,
             eps=float(eps),
-            tol=tol,
-            max_iter=max(int(inner_max_iter), 16),
-            exact_pilot=exact_pilot_np,
+            exact_pilot=exact_pilot_tensor,
             secondary_wells=secondary_wells,
             valid_secondary=valid_secondary,
         )
@@ -323,7 +319,7 @@ def prepare_torch_problem(
         graph=tensor_graph,
         graph_spec=effective_graph,
         exact_pilot=exact_pilot_tensor,
-        pooled_start=_tensor_from_start(pooled_start_np, effective_runtime),
+        pooled_start=pooled_start_tensor,
         scalar_well_starts=tuple(
             _tensor_from_start(start, effective_runtime)
             for start in scalar_well_starts_seq

@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from ...io.data import TumorData
-from .torch_backend import TorchRuntime, cell_loss_grid_torch
+from .torch_backend import TorchRuntime, TorchTumorData, cell_loss_grid_torch
 
 
 _ROOT_SCAN_POINTS = 65
@@ -595,6 +595,70 @@ def _batched_log_grid(
     return torch.exp(torch.log(lower_t).unsqueeze(-1) + (torch.log(upper_t) - torch.log(lower_t)).unsqueeze(-1) * t)
 
 
+def _pooled_sample_loss_grid_torch(
+    torch_data: TorchTumorData,
+    beta_by_sample: torch.Tensor,
+    *,
+    major_prior: float,
+    eps: float,
+) -> torch.Tensor:
+    if beta_by_sample.ndim == 1:
+        beta_grid = beta_by_sample[:, None]
+        squeeze = True
+    else:
+        beta_grid = beta_by_sample
+        squeeze = False
+    num_mutations = int(torch_data.alt.shape[0])
+    beta = beta_grid.unsqueeze(0).expand(num_mutations, -1, -1)
+    losses = cell_loss_grid_torch(
+        beta,
+        alt=torch_data.alt.unsqueeze(-1),
+        total=torch_data.total.unsqueeze(-1),
+        b_minus=torch_data.b_minus.unsqueeze(-1),
+        b_plus=torch_data.b_plus.unsqueeze(-1),
+        b_fixed=torch_data.b_fixed.unsqueeze(-1),
+        ambiguous=torch_data.ambiguous.unsqueeze(-1),
+        major_prior=major_prior,
+        eps=eps,
+    )
+    sample_losses = torch.sum(losses, dim=0)
+    return sample_losses.squeeze(-1) if squeeze else sample_losses
+
+
+def _golden_section_minimize_samples_torch(
+    objective,
+    *,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    tol: float,
+    max_iter: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    ratio = 0.5 * (np.sqrt(5.0) - 1.0)
+    ratio_t = torch.as_tensor(ratio, dtype=left.dtype, device=left.device)
+    left_current = left
+    right_current = right
+
+    for _ in range(max(int(max_iter), 8)):
+        width = right_current - left_current
+        x1 = right_current - ratio_t * width
+        x2 = left_current + ratio_t * width
+        f1 = objective(x1)
+        f2 = objective(x2)
+        active = torch.abs(width) > float(tol) * (1.0 + torch.abs(left_current) + torch.abs(right_current))
+        shrink_right = active & (f1 <= f2)
+        shrink_left = active & ~shrink_right
+        left_current = torch.where(shrink_left, x1, left_current)
+        right_current = torch.where(shrink_right, x2, right_current)
+
+    width = right_current - left_current
+    x1 = right_current - ratio_t * width
+    x2 = left_current + ratio_t * width
+    f1 = objective(x1)
+    f2 = objective(x2)
+    use_x1 = f1 <= f2
+    return torch.where(use_x1, x1, x2), torch.where(use_x1, f1, f2)
+
+
 def _cell_breakpoints(
     *,
     lower: float,
@@ -865,6 +929,74 @@ def compute_scalar_cell_wells(
     )
 
 
+def compute_pooled_observed_data_start_torch(
+    torch_data: TorchTumorData,
+    *,
+    major_prior: float,
+    eps: float,
+    tol: float,
+    max_iter: int,
+    beta_hints: torch.Tensor | np.ndarray | None = None,
+) -> torch.Tensor:
+    dtype = torch_data.alt.dtype
+    device = torch_data.alt.device
+    num_mutations = int(torch_data.alt.shape[0])
+    num_samples = int(torch_data.alt.shape[1])
+    lower = torch.full((num_samples,), float(eps), dtype=dtype, device=device)
+    upper = torch.min(torch_data.phi_upper, dim=0).values
+
+    if beta_hints is None:
+        local_left = lower
+        local_right = upper
+    else:
+        hints = torch.as_tensor(beta_hints, dtype=dtype, device=device)
+        hints = torch.minimum(torch.maximum(hints, torch_data.phi_upper.new_full((), float(eps))), torch_data.phi_upper)
+        hint = torch.median(hints, dim=0).values
+        local_left = torch.maximum(lower, hint / 3.0)
+        local_right = torch.minimum(upper, hint * 3.0)
+        invalid_local = local_right <= local_left + 1e-12
+        local_left = torch.where(invalid_local, lower, local_left)
+        local_right = torch.where(invalid_local, upper, local_right)
+
+    t = torch.linspace(0.0, 1.0, steps=25, dtype=dtype, device=device)
+    grid = torch.exp(
+        torch.log(local_left).unsqueeze(-1)
+        + (torch.log(local_right) - torch.log(local_left)).unsqueeze(-1) * t
+    )
+    losses = _pooled_sample_loss_grid_torch(
+        torch_data,
+        grid,
+        major_prior=major_prior,
+        eps=eps,
+    )
+    best_index = torch.argmin(losses, dim=1)
+    best_beta = torch.gather(grid, 1, best_index[:, None]).squeeze(1)
+    best_value = torch.gather(losses, 1, best_index[:, None]).squeeze(1)
+    left_index = torch.clamp(best_index - 1, min=0)
+    right_index = torch.clamp(best_index + 1, max=grid.shape[1] - 1)
+    left = torch.gather(grid, 1, left_index[:, None]).squeeze(1)
+    right = torch.gather(grid, 1, right_index[:, None]).squeeze(1)
+    left = torch.where(best_index == 0, lower, left)
+    right = torch.where(best_index == grid.shape[1] - 1, upper, right)
+
+    objective = lambda values: _pooled_sample_loss_grid_torch(
+        torch_data,
+        values,
+        major_prior=major_prior,
+        eps=eps,
+    )
+    refined_beta, refined_value = _golden_section_minimize_samples_torch(
+        objective,
+        left=left,
+        right=right,
+        tol=float(tol),
+        max_iter=max_iter,
+    )
+    pooled = torch.where(refined_value <= best_value, refined_beta, best_beta)
+    tiled = pooled.unsqueeze(0).expand(num_mutations, -1)
+    return torch.minimum(torch.maximum(tiled, torch_data.phi_upper.new_full((), float(eps))), torch_data.phi_upper)
+
+
 def compute_pooled_observed_data_start(
     data: TumorData,
     *,
@@ -1002,6 +1134,68 @@ def compute_scalar_well_start_bank(
         seen.add(signature)
         unique.append(start.astype(np.float64, copy=False))
     return unique
+
+
+def _deduplicate_tensor_starts(starts: list[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+    unique: list[torch.Tensor] = []
+    seen: set[bytes] = set()
+    for start in starts:
+        signature = np.round(start.detach().cpu().numpy(), decimals=8).astype(np.float32, copy=False).tobytes()
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique.append(start)
+    return tuple(unique)
+
+
+def compute_scalar_well_start_bank_torch(
+    torch_data: TorchTumorData,
+    *,
+    eps: float,
+    exact_pilot: torch.Tensor,
+    secondary_wells: torch.Tensor | np.ndarray | None = None,
+    valid_secondary: torch.Tensor | np.ndarray | None = None,
+    max_sample_flips: int = 4,
+) -> tuple[torch.Tensor, ...]:
+    dtype = torch_data.alt.dtype
+    device = torch_data.alt.device
+    lower = torch.full_like(torch_data.phi_upper, float(eps))
+    pilot = exact_pilot.to(dtype=dtype, device=device)
+    pilot = torch.minimum(torch.maximum(pilot, lower), torch_data.phi_upper)
+
+    starts: list[torch.Tensor] = [pilot]
+    if secondary_wells is None or valid_secondary is None:
+        return tuple(starts)
+
+    secondary = torch.as_tensor(secondary_wells, dtype=dtype, device=device)
+    valid = torch.as_tensor(valid_secondary, dtype=torch.bool, device=device)
+    valid = valid & torch.isfinite(secondary)
+    if not bool(torch.any(valid).item()):
+        return tuple(starts)
+
+    global_alternate = torch.where(valid, secondary, pilot)
+    starts.append(torch.minimum(torch.maximum(global_alternate, lower), torch_data.phi_upper))
+
+    sample_delta = torch.where(valid, torch.abs(secondary - pilot), torch.zeros_like(pilot))
+    sample_scores = torch.sum(sample_delta, dim=0).detach().cpu().numpy()
+    sample_order = [
+        (float(score), int(sample_idx))
+        for sample_idx, score in enumerate(sample_scores)
+        if float(score) > 0.0
+    ]
+    sample_order.sort(reverse=True)
+
+    for _, sample_idx in sample_order[: max(0, int(max_sample_flips))]:
+        sample_start = pilot.clone()
+        mask = valid[:, sample_idx]
+        sample_start[:, sample_idx] = torch.where(
+            mask,
+            secondary[:, sample_idx],
+            sample_start[:, sample_idx],
+        )
+        starts.append(torch.minimum(torch.maximum(sample_start, lower), torch_data.phi_upper))
+
+    return _deduplicate_tensor_starts(starts)
 
 
 def compute_stationary_screen_box(
