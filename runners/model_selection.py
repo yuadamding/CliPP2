@@ -26,6 +26,7 @@ from ..core.fusion.torch_backend import (
     stationarity_residual_torch,
     to_torch_tumor_data,
 )
+from ..core.fusion.graph_ops import graph_adjoint_edges, graph_forward_edges, project_dual_ball, tensorize_graph
 from ..io.data import TumorData
 from ..metrics.evaluation import (
     SimulationEvaluation,
@@ -550,9 +551,7 @@ def _full_fusion_box_residual_with_dual_balls(
     last_residual = float("inf")
     max_iterations = max(int(max_iter), 1)
     for iteration in range(max_iterations):
-        adj = torch.zeros_like(phi)
-        adj.index_add_(0, edge_u, dual)
-        adj.index_add_(0, edge_v, -dual)
+        adj = graph_adjoint_edges(dual, edge_u=edge_u, edge_v=edge_v, num_nodes=int(phi.shape[0]))
         total_grad = grad_smooth + adj
         stat = stationarity_residual_torch(
             total_grad=total_grad,
@@ -570,10 +569,8 @@ def _full_fusion_box_residual_with_dual_balls(
             converged = True
             break
         previous_residual = last_residual
-        dual = dual - float(step) * (stat.index_select(0, edge_u) - stat.index_select(0, edge_v))
-        dual_norm = torch.linalg.norm(dual, dim=1)
-        scale = torch.maximum(torch.ones_like(dual_norm), dual_norm / radius.clamp_min(1e-12))
-        dual = dual / scale[:, None]
+        dual = dual - float(step) * graph_forward_edges(stat, edge_u=edge_u, edge_v=edge_v)
+        dual = project_dual_ball(dual, radius)
     info = FullFusionKKTResult(
         residual=float(last_residual),
         iterations=iterations,
@@ -613,7 +610,7 @@ def _estimate_lambda_full_light(
         edge_v=edge_v,
         edge_w=edge_w,
         lambda_value=high,
-        atol=max(float(tol), 1e-8),
+        atol=float(tol),
         max_iter=ADAPTIVE_PATH_FULL_FUSION_MAX_ITER,
         return_info=True,
     )
@@ -631,7 +628,7 @@ def _estimate_lambda_full_light(
             edge_v=edge_v,
             edge_w=edge_w,
             lambda_value=high,
-            atol=max(float(tol), 1e-8),
+            atol=float(tol),
             max_iter=ADAPTIVE_PATH_FULL_FUSION_MAX_ITER,
             return_info=True,
         )
@@ -649,7 +646,7 @@ def _estimate_lambda_full_light(
                 edge_v=edge_v,
                 edge_w=edge_w,
                 lambda_value=mid,
-                atol=max(float(tol), 1e-8),
+                atol=float(tol),
                 max_iter=ADAPTIVE_PATH_FULL_FUSION_MAX_ITER,
                 return_info=True,
             )
@@ -776,7 +773,7 @@ def _kkt_polish_options(base_options: FitOptions) -> FitOptions:
         base_options,
         outer_max_iter=max(int(base_options.outer_max_iter) * 2, KKT_POLISH_OUTER_MAX_ITER),
         inner_max_iter=max(int(base_options.inner_max_iter) * 2, KKT_POLISH_INNER_MAX_ITER),
-        tol=max(float(base_options.tol) * 0.5, 1e-6),
+        tol=float(base_options.tol) * 0.5,
     )
 
 
@@ -903,7 +900,7 @@ def _annotate_polish_candidates(
         (accepted_steps > 0.0)
         & (
             (relative_changes > float(tol))
-            | (step_residuals > float(np.sqrt(max(float(tol), 1e-10))))
+            | (step_residuals > float(np.sqrt(float(tol))))
         )
     )
     continuable = failed & moving
@@ -1485,7 +1482,7 @@ def _evaluate_candidate(
             bic_labels,
             major_prior=float(effective_fit_options.major_prior),
             eps=float(effective_fit_options.eps),
-            tol=max(float(effective_fit_options.tol), 1e-8),
+            tol=float(effective_fit_options.tol),
             max_iter=max(int(effective_fit_options.inner_max_iter), 32),
             hint_phi=fit.phi,
         )
@@ -1818,7 +1815,7 @@ def _grid_search_selection(
         data,
         major_prior=float(fit_options.major_prior),
         eps=float(fit_options.eps),
-        tol=max(float(fit_options.tol), 1e-6),
+        tol=float(fit_options.tol),
         max_iter=max(int(fit_options.inner_max_iter), 16),
     )
     effective_graph = resolve_pairwise_fusion_graph(
@@ -1829,6 +1826,7 @@ def _grid_search_selection(
         tau=max(float(fit_options.adaptive_weight_floor), float(fit_options.eps)),
         baseline=float(fit_options.adaptive_weight_baseline),
     )
+    effective_tensor_graph = tensorize_graph(effective_graph, runtime, num_nodes=data.num_mutations)
     effective_fit_options = replace(fit_options, graph=effective_graph)
     search_fit_options = (
         _adaptive_first_pass_options(effective_fit_options)
@@ -1840,7 +1838,7 @@ def _grid_search_selection(
         runtime=runtime,
         major_prior=float(fit_options.major_prior),
         eps=float(fit_options.eps),
-        tol=max(float(fit_options.tol), 1e-6),
+        tol=float(fit_options.tol),
         max_iter=max(int(fit_options.inner_max_iter), 16),
         beta_hints=pilot_phi,
     )
@@ -1848,32 +1846,24 @@ def _grid_search_selection(
         data,
         major_prior=float(fit_options.major_prior),
         eps=float(fit_options.eps),
-        tol=max(float(fit_options.tol), 1e-6),
+        tol=float(fit_options.tol),
         max_iter=max(int(fit_options.inner_max_iter), 16),
         exact_pilot=pilot_phi,
         secondary_wells=secondary_wells,
         valid_secondary=valid_secondary,
     )
     if adaptive_lambda_mode:
-        edge_u_for_bracket, edge_v_for_bracket, edge_w_for_bracket = effective_graph.torch_cache.get(
-            (str(runtime.device_name), str(runtime.dtype)),
-            (None, None, None),
-        )
-        if edge_u_for_bracket is None or edge_v_for_bracket is None or edge_w_for_bracket is None:
-            from ..core.fusion.solver import _graph_tensors
-
-            edge_u_for_bracket, edge_v_for_bracket, edge_w_for_bracket = _graph_tensors(effective_graph, runtime)
         lambda_bracket = _initial_adaptive_lambda_bracket(
             torch_data=torch_data,
             runtime=runtime,
             exact_pilot=pilot_phi,
             pooled_start=pooled_start,
-            edge_u=edge_u_for_bracket,
-            edge_v=edge_v_for_bracket,
-            edge_w=edge_w_for_bracket,
+            edge_u=effective_tensor_graph.edge_u,
+            edge_v=effective_tensor_graph.edge_v,
+            edge_w=effective_tensor_graph.weight,
             major_prior=float(fit_options.major_prior),
             eps=float(fit_options.eps),
-            tol=max(float(fit_options.tol), 1e-6),
+            tol=float(fit_options.tol),
         )
         lambda_grid = list(lambda_bracket.anchors)
     simulation_truth: SimulationTruth | None = None
@@ -2680,7 +2670,6 @@ def _grid_search_selection(
     selected_candidate_ari = float(best_row["ARI"]) if np.isfinite(float(best_row["ARI"])) else None
     selected_ari = float(best_evaluation.ari) if best_evaluation is not None else selected_candidate_ari
     search_df = search_df.drop(columns=["_candidate_id"])
-    effective_graph.clear_torch_cache()
     simulation_diagnostics = SimulationDiagnostics(
         selected_evaluation=best_evaluation,
         selected_ari=selected_ari,

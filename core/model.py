@@ -139,7 +139,7 @@ def fit_single_stage_em(
         eps=float(options.eps),
         outer_max_iter=max(int(options.outer_max_iter), 1),
         inner_max_iter=max(int(options.inner_max_iter), 16),
-        tol=max(float(options.tol), 1e-6),
+        tol=float(options.tol),
         phi_start=None if phi_start is None else np.asarray(phi_start),
         graph=options.graph,
         adaptive_weight_gamma=float(options.adaptive_weight_gamma),

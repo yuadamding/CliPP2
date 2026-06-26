@@ -331,7 +331,7 @@ def _current_resume_hashes_for_file(
             data,
             major_prior=float(fit_options.major_prior),
             eps=float(fit_options.eps),
-            tol=max(float(fit_options.tol), 1e-6),
+            tol=float(fit_options.tol),
             max_iter=max(int(fit_options.inner_max_iter), 16),
         )
     effective_graph = resolve_pairwise_fusion_graph(

@@ -5,6 +5,7 @@ import torch
 
 from ...io.data import TumorData
 from .graph import resolve_pairwise_fusion_graph
+from .graph_ops import tensorize_graph
 from .starts import (
     compute_exact_observed_data_pilot,
     compute_pooled_observed_data_start,
@@ -23,7 +24,7 @@ from .torch_backend import (
     solve_majorized_subproblem_pdhg_torch,
     to_torch_tumor_data,
 )
-from .types import FusionFitArtifacts, PairwiseFusionGraph
+from .types import FusionFitArtifacts, PairwiseFusionGraph, TensorFusionGraph
 
 
 class _UnionFind:
@@ -56,19 +57,15 @@ class _UnionFind:
 def _graph_tensors(
     graph: PairwiseFusionGraph,
     runtime,
+    *,
+    num_nodes: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    cache_key = (str(runtime.device_name), str(runtime.dtype))
-    cached = graph.torch_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    tensors = (
-        torch.as_tensor(graph.edge_u, dtype=torch.long, device=runtime.device),
-        torch.as_tensor(graph.edge_v, dtype=torch.long, device=runtime.device),
-        torch.as_tensor(graph.edge_w, dtype=runtime.dtype, device=runtime.device),
+    tensor_graph = tensorize_graph(
+        graph,
+        runtime,
+        num_nodes=int(num_nodes) if num_nodes is not None else int(max(graph.edge_u.max(initial=-1), graph.edge_v.max(initial=-1)) + 1),
     )
-    graph.torch_cache[cache_key] = tensors
-    return tensors
+    return tensor_graph.edge_u, tensor_graph.edge_v, tensor_graph.weight
 
 
 def _cluster_labels(
@@ -177,12 +174,20 @@ def _update_minimum(current: float, candidate: float) -> float:
     return float(min(current, candidate))
 
 
+def _validate_solver_tolerance(tol: float) -> float:
+    value = float(tol)
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError("Solver tolerance must be a positive finite value.")
+    return value
+
+
 def _fit_from_start(
     data: TumorData,
     *,
     torch_data,
     runtime,
     graph: PairwiseFusionGraph,
+    tensor_graph: TensorFusionGraph,
     lambda_value: float,
     major_prior: float,
     eps: float,
@@ -194,14 +199,11 @@ def _fit_from_start(
     compute_summary: bool,
     verbose: bool,
 ) -> FusionFitArtifacts:
+    tol = _validate_solver_tolerance(tol)
     edge_u_np = graph.edge_u
     edge_v_np = graph.edge_v
-    complete_edge_count = data.num_mutations * max(data.num_mutations - 1, 0) // 2
-    use_alm = (
-        edge_u_np.size == complete_edge_count
-        and int(graph.degree_bound) == max(int(data.num_mutations) - 1, 1)
-    )
-    edge_u, edge_v, edge_w = _graph_tensors(graph, runtime)
+    use_alm = bool(tensor_graph.is_complete and int(graph.degree_bound) == max(int(data.num_mutations) - 1, 1))
+    edge_u, edge_v, edge_w = tensor_graph.edge_u, tensor_graph.edge_v, tensor_graph.weight
 
     lower = torch.full_like(torch_data.phi_upper, float(eps))
     upper = torch.minimum(torch_data.phi_upper, torch.ones_like(torch_data.phi_upper))
@@ -328,7 +330,7 @@ def _fit_from_start(
                     edge_u=edge_u,
                     edge_v=edge_v,
                     edge_w=edge_w,
-                    tol=max(tol, 1e-6),
+                    tol=tol,
                     max_iter=max(inner_max_iter, 10),
                     phi_start=phi,
                     dual_start=dual,
@@ -346,7 +348,7 @@ def _fit_from_start(
                     edge_v=edge_v,
                     edge_w=edge_w,
                     degree_bound=int(graph.degree_bound),
-                    tol=max(tol, 1e-6),
+                    tol=tol,
                     max_iter=max(inner_max_iter, 10),
                     phi_start=phi,
                     dual_start=dual,
@@ -529,7 +531,7 @@ def _fit_from_start(
             edge_v=edge_v,
             edge_w=edge_w,
             lambda_value=lambda_value,
-            atol=max(tol, 1e-8),
+            atol=tol,
         )
         outer_converged = bool(outer_diag["kkt_residual"] <= 5.0 * tol)
         final_relative_objective_change = float(rel_change)
@@ -543,7 +545,7 @@ def _fit_from_start(
         converged_outer = bool(outer_converged)
         if (
             rel_change <= tol
-            and step_residual <= np.sqrt(max(tol, 1e-10))
+            and step_residual <= np.sqrt(tol)
             and current_inner_converged
             and outer_converged
         ):
@@ -561,7 +563,7 @@ def _fit_from_start(
         edge_v=edge_v,
         edge_w=edge_w,
         lambda_value=lambda_value,
-        atol=max(tol, 1e-8),
+        atol=tol,
         max_iter=96,
     )
     final_outer_diag = final_dual_audit["diag"]
@@ -766,6 +768,7 @@ def fit_observed_data_pairwise_fusion(
     compute_summary: bool = True,
     verbose: bool = False,
 ) -> FusionFitArtifacts:
+    tol = _validate_solver_tolerance(tol)
     effective_runtime = resolve_runtime(device, dtype=dtype) if runtime is None else runtime
     effective_torch_data = to_torch_tumor_data(data, effective_runtime) if torch_data is None else torch_data
 
@@ -774,7 +777,7 @@ def fit_observed_data_pairwise_fusion(
             data,
             major_prior=major_prior,
             eps=eps,
-            tol=max(tol, 1e-6),
+            tol=tol,
             max_iter=max(inner_max_iter, 16),
         )
     else:
@@ -788,13 +791,14 @@ def fit_observed_data_pairwise_fusion(
         tau=max(float(adaptive_weight_floor), float(eps)),
         baseline=float(adaptive_weight_baseline),
     )
+    effective_tensor_graph = tensorize_graph(effective_graph, effective_runtime, num_nodes=data.num_mutations)
     if pooled_start is None:
         pooled_start = compute_pooled_observed_data_start(
             data,
             runtime=effective_runtime,
             major_prior=major_prior,
             eps=eps,
-            tol=max(tol, 1e-6),
+            tol=tol,
             max_iter=max(inner_max_iter, 16),
             beta_hints=exact_pilot,
         )
@@ -803,7 +807,7 @@ def fit_observed_data_pairwise_fusion(
             data,
             major_prior=major_prior,
             eps=eps,
-            tol=max(tol, 1e-6),
+            tol=tol,
             max_iter=max(inner_max_iter, 16),
             exact_pilot=exact_pilot,
             secondary_wells=secondary_wells,
@@ -839,6 +843,7 @@ def fit_observed_data_pairwise_fusion(
             torch_data=effective_torch_data,
             runtime=effective_runtime,
             graph=effective_graph,
+            tensor_graph=effective_tensor_graph,
             lambda_value=lambda_value,
             major_prior=major_prior,
             eps=eps,

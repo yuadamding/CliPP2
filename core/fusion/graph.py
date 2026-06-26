@@ -8,17 +8,9 @@ import pandas as pd
 from .types import PairwiseFusionGraph
 
 
-_EDGE_CACHE: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-
-
 def _complete_graph_edges(num_mutations: int) -> tuple[np.ndarray, np.ndarray]:
-    cached = _EDGE_CACHE.get(int(num_mutations))
-    if cached is not None:
-        return cached
     edges = np.triu_indices(int(num_mutations), k=1)
-    cached = (edges[0].astype(np.int32), edges[1].astype(np.int32))
-    _EDGE_CACHE[int(num_mutations)] = cached
-    return cached
+    return edges[0].astype(np.int32), edges[1].astype(np.int32)
 
 
 def _complete_graph_weight(num_mutations: int) -> float:
@@ -127,7 +119,19 @@ def coerce_graph(num_mutations: int, graph: PairwiseFusionGraph | None) -> Pairw
     if not np.all(np.isfinite(edge_w)):
         raise ValueError("PairwiseFusionGraph weights must be finite.")
     if np.any(edge_w < 0.0):
-        raise ValueError("PairwiseFusionGraph weights must be nonnegative.")
+        raise ValueError("PairwiseFusionGraph weights must be nonnegative; omit zero-weight edges explicitly.")
+    positive_weight = edge_w > 0.0
+    edge_u = edge_u[positive_weight]
+    edge_v = edge_v[positive_weight]
+    edge_w = edge_w[positive_weight]
+    if edge_u.size == 0:
+        return PairwiseFusionGraph(
+            edge_u=edge_u,
+            edge_v=edge_v,
+            edge_w=edge_w,
+            name=str(graph.name),
+            degree_bound=1,
+        )
 
     left = np.minimum(edge_u, edge_v)
     right = np.maximum(edge_u, edge_v)

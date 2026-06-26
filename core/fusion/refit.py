@@ -213,6 +213,9 @@ def partition_constrained_observed_refit(
     max_iter: int,
     hint_phi: np.ndarray | None = None,
 ) -> PartitionRefitResult:
+    tol = float(tol)
+    if not np.isfinite(tol) or tol <= 0.0:
+        raise ValueError("Partition refit tolerance must be a positive finite value.")
     labels = _canonical_labels(np.asarray(labels, dtype=np.int64))
     n_clusters = int(labels.max()) + 1 if labels.size else 0
     n_samples = int(data.num_samples)
@@ -257,7 +260,7 @@ def partition_constrained_observed_refit(
                 upper=upper,
                 major_prior=float(major_prior),
                 eps=float(eps),
-                tol=max(float(tol), 1e-8),
+                tol=tol,
                 max_iter=max(int(max_iter), 32),
                 hint=hint,
             )

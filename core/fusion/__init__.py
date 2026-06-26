@@ -4,6 +4,7 @@ from .graph import (
     load_pairwise_fusion_graph_tsv,
     resolve_pairwise_fusion_graph,
 )
+from .graph_ops import graph_adjoint, graph_forward, project_dual_ball, tensorize_graph
 from .solver import cluster_labels_from_edges, fit_observed_data_pairwise_fusion
 from .refit import PartitionRefitResult, partition_constrained_observed_refit
 from .starts import (
@@ -12,19 +13,43 @@ from .starts import (
     compute_scalar_cell_wells,
     compute_scalar_well_start_bank,
 )
-from .types import FusionFitArtifacts, PairwiseFusionGraph, TorchRuntime
+from .types import (
+    FusionFitArtifacts,
+    InnerDiagnostics,
+    ObjectiveTerms,
+    OuterDiagnostics,
+    PairwiseFusionGraph,
+    SolverContext,
+    SolverState,
+    TensorFusionGraph,
+    TensorProblem,
+    TorchFitResult,
+    TorchRuntime,
+)
 
 __all__ = [
     "FusionFitArtifacts",
+    "InnerDiagnostics",
+    "ObjectiveTerms",
+    "OuterDiagnostics",
     "PairwiseFusionGraph",
     "PartitionRefitResult",
+    "SolverContext",
+    "SolverState",
+    "TensorFusionGraph",
+    "TensorProblem",
+    "TorchFitResult",
     "TorchRuntime",
     "build_complete_adaptive_graph",
     "build_complete_uniform_graph",
     "cluster_labels_from_edges",
+    "graph_adjoint",
+    "graph_forward",
     "load_pairwise_fusion_graph_tsv",
     "partition_constrained_observed_refit",
+    "project_dual_ball",
     "resolve_pairwise_fusion_graph",
+    "tensorize_graph",
     "compute_exact_observed_data_pilot",
     "compute_pooled_observed_data_start",
     "compute_scalar_cell_wells",

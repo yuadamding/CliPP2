@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -13,14 +13,11 @@ class PairwiseFusionGraph:
     edge_w: np.ndarray
     name: str = "complete_uniform"
     degree_bound: int = 1
-    torch_cache: dict[tuple[str, str], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = field(
-        default_factory=dict,
-        repr=False,
-        compare=False,
-    )
 
     def clear_torch_cache(self) -> None:
-        self.torch_cache.clear()
+        # Backward-compatible no-op. Device tensors are owned by SolverContext
+        # or per-run TensorFusionGraph objects, not cached on this host graph.
+        return None
 
 
 @dataclass(frozen=True)
@@ -104,3 +101,100 @@ class TorchRuntime:
     device: torch.device
     device_name: str
     dtype: torch.dtype
+
+
+@dataclass(frozen=True, slots=True)
+class TensorProblem:
+    alt: torch.Tensor
+    total: torch.Tensor
+    nonalt: torch.Tensor
+    phi_upper: torch.Tensor
+    ambiguous: torch.Tensor
+    b_minus: torch.Tensor
+    b_plus: torch.Tensor
+    b_fixed: torch.Tensor
+    eps: float
+    major_prior: float
+    log_prior_minor: torch.Tensor
+    log_prior_major: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class TensorFusionGraph:
+    edge_index: torch.Tensor
+    weight: torch.Tensor
+    degree: torch.Tensor
+    num_nodes: int
+    is_complete: bool
+    is_uniform: bool
+    name: str
+
+    @property
+    def edge_u(self) -> torch.Tensor:
+        return self.edge_index[0]
+
+    @property
+    def edge_v(self) -> torch.Tensor:
+        return self.edge_index[1]
+
+
+@dataclass(frozen=True, slots=True)
+class SolverContext:
+    problem: TensorProblem
+    graph: TensorFusionGraph
+    exact_pilot: torch.Tensor
+    pooled_start: torch.Tensor
+    scalar_well_starts: tuple[torch.Tensor, ...]
+    lower: torch.Tensor
+    upper: torch.Tensor
+    runtime: TorchRuntime
+
+
+@dataclass(slots=True)
+class SolverState:
+    phi: torch.Tensor
+    dual: torch.Tensor | None
+    split: torch.Tensor | None
+    curvature: torch.Tensor | None
+    previous_lambda: float
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectiveTerms:
+    fit: torch.Tensor
+    penalty: torch.Tensor
+    total: torch.Tensor
+    gamma_major: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class InnerDiagnostics:
+    iterations: int
+    kkt_residual: float
+    primal_delta: float
+    dual_delta: float
+    converged: bool
+
+
+@dataclass(frozen=True, slots=True)
+class OuterDiagnostics:
+    iterations: int
+    objective_history: tuple[float, ...]
+    stationarity_residual: float
+    majorization_failures: int
+    accepted_full_steps: int
+    accepted_damped_steps: int
+    converged: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TorchFitResult:
+    phi_raw: torch.Tensor
+    gamma_major: torch.Tensor
+    dual: torch.Tensor | None
+    fit_loss: torch.Tensor
+    fusion_penalty: torch.Tensor
+    objective: torch.Tensor
+    inner: InnerDiagnostics
+    outer: OuterDiagnostics
+    graph_name: str
