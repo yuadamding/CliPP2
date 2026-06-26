@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from ...io.data import TumorData
-from .graph_ops import graph_adjoint_edges, graph_forward_edges, project_dual_ball
+from .graph_ops import PDHG_PRECONDITIONER_ETA, graph_adjoint_edges, graph_forward_edges, project_dual_ball
 from .types import ObjectiveTerms, TorchRuntime
 
 
@@ -683,6 +683,7 @@ def solve_majorized_subproblem_pdhg_torch(
     max_iter: int,
     phi_start: torch.Tensor,
     dual_start: torch.Tensor | None,
+    tau_node: torch.Tensor | None = None,
     kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
     lambda_value = validate_lambda_value(lambda_value)
@@ -701,13 +702,20 @@ def solve_majorized_subproblem_pdhg_torch(
         dual = torch.zeros((int(edge_u.numel()), int(phi.shape[1])), dtype=runtime.dtype, device=runtime.device)
     bar = phi.clone()
     del degree_bound
-    eta = 0.99
-    node_degree = torch.bincount(
-        torch.cat([edge_u, edge_v]),
-        minlength=int(num_mutations),
-    ).to(dtype=runtime.dtype, device=runtime.device)
-    tau_node = (eta / node_degree.clamp_min(1.0))[:, None]
-    sigma_edge = eta / 2.0
+    if tau_node is None:
+        node_degree = torch.bincount(
+            torch.cat([edge_u, edge_v]),
+            minlength=int(num_mutations),
+        ).to(dtype=runtime.dtype, device=runtime.device)
+        tau_node_t = (PDHG_PRECONDITIONER_ETA / node_degree.clamp_min(1.0))[:, None]
+    else:
+        tau_node_t = tau_node.to(dtype=runtime.dtype, device=runtime.device)
+        if tau_node_t.ndim == 1:
+            tau_node_t = tau_node_t[:, None]
+        expected_shape = (int(num_mutations), 1)
+        if tuple(tau_node_t.shape) != expected_shape:
+            raise ValueError(f"tau_node must have shape {expected_shape}.")
+    sigma_edge = PDHG_PRECONDITIONER_ETA / 2.0
     radius = float(lambda_value) * edge_w
 
     converged = False
@@ -726,8 +734,8 @@ def solve_majorized_subproblem_pdhg_torch(
             edge_v=edge_v,
             num_nodes=int(phi.shape[0]),
         )
-        primal_base = phi - tau_node * adj
-        phi_new = (primal_base + tau_node * h * U) / (1.0 + tau_node * h)
+        primal_base = phi - tau_node_t * adj
+        phi_new = (primal_base + tau_node_t * h * U) / (1.0 + tau_node_t * h)
         phi_new = torch.minimum(torch.maximum(phi_new, lower), upper)
         bar = phi_new + (phi_new - phi)
 

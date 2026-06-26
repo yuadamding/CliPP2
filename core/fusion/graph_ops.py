@@ -5,6 +5,8 @@ import torch
 
 from .types import PairwiseFusionGraph, TensorFusionGraph, TorchRuntime
 
+PDHG_PRECONDITIONER_ETA = 0.99
+
 
 def _complete_graph_weight(num_nodes: int) -> float:
     return 1.0 / float(max(int(num_nodes) - 1, 1))
@@ -24,6 +26,7 @@ def _tensor_graph_from_edges(
         one = torch.ones_like(weight)
         degree.index_add_(0, edge_index[0], one)
         degree.index_add_(0, edge_index[1], one)
+    pdhg_tau_node = (PDHG_PRECONDITIONER_ETA / degree.clamp_min(1.0))[:, None]
     complete_edge_count = int(num_nodes) * max(int(num_nodes) - 1, 0) // 2
     is_complete = bool(edge_u.numel() == complete_edge_count)
     is_uniform = bool(weight.numel() == 0 or torch.allclose(weight, weight[:1].expand_as(weight)))
@@ -31,6 +34,7 @@ def _tensor_graph_from_edges(
         edge_index=edge_index,
         weight=weight,
         degree=degree,
+        pdhg_tau_node=pdhg_tau_node,
         num_nodes=int(num_nodes),
         is_complete=is_complete,
         is_uniform=is_uniform,

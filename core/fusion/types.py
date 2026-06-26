@@ -126,6 +126,7 @@ class TensorFusionGraph:
     edge_index: torch.Tensor
     weight: torch.Tensor
     degree: torch.Tensor
+    pdhg_tau_node: torch.Tensor
     num_nodes: int
     is_complete: bool
     is_uniform: bool

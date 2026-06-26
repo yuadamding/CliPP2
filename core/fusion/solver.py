@@ -637,6 +637,7 @@ def _fit_from_start(
                     max_iter=max(inner_max_iter, 10),
                     phi_start=phi,
                     dual_start=dual,
+                    tau_node=tensor_graph.pdhg_tau_node,
                 )
             attempted_outer_steps += 1
             last_attempted_inner_kkt_residual = float(inner_residual)
