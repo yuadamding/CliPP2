@@ -7,12 +7,12 @@ from ...io.data import TumorData
 from .graph import resolve_pairwise_fusion_graph
 from .graph_ops import tensorize_graph
 from .starts import (
-    compute_exact_observed_data_pilot,
     compute_pooled_observed_data_start,
     compute_scalar_cell_wells,
     compute_scalar_well_start_bank,
 )
 from .torch_backend import (
+    TorchTumorData,
     cell_terms_torch,
     em_surrogate_terms_torch,
     graph_fusion_kkt_residual_from_grad_torch,
@@ -24,7 +24,7 @@ from .torch_backend import (
     solve_majorized_subproblem_pdhg_torch,
     to_torch_tumor_data,
 )
-from .types import FusionFitArtifacts, PairwiseFusionGraph, TensorFusionGraph
+from .types import FusionFitArtifacts, PairwiseFusionGraph, SolverContext, TensorFusionGraph, TensorProblem
 
 
 class _UnionFind:
@@ -52,20 +52,6 @@ class _UnionFind:
         else:
             self.parent[root_right] = root_left
             self.rank[root_left] += 1
-
-
-def _graph_tensors(
-    graph: PairwiseFusionGraph,
-    runtime,
-    *,
-    num_nodes: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    tensor_graph = tensorize_graph(
-        graph,
-        runtime,
-        num_nodes=int(num_nodes) if num_nodes is not None else int(max(graph.edge_u.max(initial=-1), graph.edge_v.max(initial=-1)) + 1),
-    )
-    return tensor_graph.edge_u, tensor_graph.edge_v, tensor_graph.weight
 
 
 def _cluster_labels(
@@ -132,11 +118,14 @@ def _cluster_summary_from_labels(
     return centers.astype(phi.dtype, copy=False), phi_clustered.astype(phi.dtype, copy=False)
 
 
-def _deduplicate_starts(starts: list[np.ndarray]) -> list[np.ndarray]:
-    unique: list[np.ndarray] = []
+def _deduplicate_starts(starts: list[np.ndarray | torch.Tensor]) -> list[np.ndarray | torch.Tensor]:
+    unique: list[np.ndarray | torch.Tensor] = []
     seen: set[bytes] = set()
     for start in starts:
-        start_arr = np.asarray(start)
+        if torch.is_tensor(start):
+            start_arr = start.detach().cpu().numpy()
+        else:
+            start_arr = np.asarray(start)
         signature = np.round(start_arr, decimals=8).astype(np.float32, copy=False).tobytes()
         if signature in seen:
             continue
@@ -181,6 +170,155 @@ def _validate_solver_tolerance(tol: float) -> float:
     return value
 
 
+def _tensor_from_start(
+    start: np.ndarray | torch.Tensor,
+    runtime,
+) -> torch.Tensor:
+    if torch.is_tensor(start):
+        return start.to(dtype=runtime.dtype, device=runtime.device)
+    return torch.as_tensor(np.asarray(start), dtype=runtime.dtype, device=runtime.device)
+
+
+def _tensor_problem_from_torch_data(
+    torch_data: TorchTumorData,
+    *,
+    major_prior: float,
+    eps: float,
+) -> TensorProblem:
+    prior = float(major_prior)
+    if not np.isfinite(prior) or not (0.0 < prior < 1.0):
+        raise ValueError("major_prior must lie strictly in (0, 1).")
+    prior_tensor = torch.as_tensor(prior, dtype=torch_data.alt.dtype, device=torch_data.alt.device)
+    return TensorProblem(
+        alt=torch_data.alt,
+        total=torch_data.total,
+        nonalt=torch_data.nonalt,
+        phi_upper=torch_data.phi_upper,
+        ambiguous=torch_data.ambiguous,
+        b_minus=torch_data.b_minus,
+        b_plus=torch_data.b_plus,
+        b_fixed=torch_data.b_fixed,
+        eps=float(eps),
+        major_prior=prior,
+        log_prior_minor=torch.log1p(-prior_tensor),
+        log_prior_major=torch.log(prior_tensor),
+    )
+
+
+def torch_data_from_context(context: SolverContext) -> TorchTumorData:
+    problem = context.problem
+    return TorchTumorData(
+        alt=problem.alt,
+        total=problem.total,
+        nonalt=problem.nonalt,
+        phi_upper=problem.phi_upper,
+        ambiguous=problem.ambiguous,
+        b_minus=problem.b_minus,
+        b_plus=problem.b_plus,
+        b_fixed=problem.b_fixed,
+    )
+
+
+def prepare_torch_problem(
+    data: TumorData,
+    *,
+    major_prior: float,
+    eps: float,
+    tol: float,
+    inner_max_iter: int,
+    graph: PairwiseFusionGraph | None = None,
+    adaptive_weight_gamma: float = 1.0,
+    adaptive_weight_floor: float = 1e-6,
+    adaptive_weight_baseline: float = 1.0,
+    exact_pilot: np.ndarray | torch.Tensor | None = None,
+    pooled_start: np.ndarray | torch.Tensor | None = None,
+    scalar_well_starts: list[np.ndarray | torch.Tensor] | tuple[np.ndarray | torch.Tensor, ...] | None = None,
+    device: str | None = "cuda",
+    dtype: str | None = "auto",
+    runtime=None,
+    torch_data: TorchTumorData | None = None,
+) -> SolverContext:
+    tol = _validate_solver_tolerance(tol)
+    effective_runtime = resolve_runtime(device, dtype=dtype) if runtime is None else runtime
+    effective_torch_data = to_torch_tumor_data(data, effective_runtime) if torch_data is None else torch_data
+
+    if exact_pilot is None:
+        exact_pilot_np, secondary_wells, valid_secondary = compute_scalar_cell_wells(
+            data,
+            major_prior=float(major_prior),
+            eps=float(eps),
+            tol=tol,
+            max_iter=max(int(inner_max_iter), 16),
+        )
+    else:
+        exact_pilot_np = (
+            exact_pilot.detach().cpu().numpy()
+            if torch.is_tensor(exact_pilot)
+            else np.asarray(exact_pilot)
+        )
+        secondary_wells = None
+        valid_secondary = None
+
+    effective_graph = resolve_pairwise_fusion_graph(
+        data.num_mutations,
+        graph=graph,
+        pilot_phi=exact_pilot_np,
+        gamma=float(adaptive_weight_gamma),
+        tau=max(float(adaptive_weight_floor), float(eps)),
+        baseline=float(adaptive_weight_baseline),
+    )
+    tensor_graph = tensorize_graph(effective_graph, effective_runtime, num_nodes=data.num_mutations)
+
+    if pooled_start is None:
+        pooled_start_np = compute_pooled_observed_data_start(
+            data,
+            runtime=effective_runtime,
+            major_prior=float(major_prior),
+            eps=float(eps),
+            tol=tol,
+            max_iter=max(int(inner_max_iter), 16),
+            beta_hints=exact_pilot_np,
+        )
+    else:
+        pooled_start_np = pooled_start
+
+    if scalar_well_starts is None:
+        scalar_well_starts_seq = compute_scalar_well_start_bank(
+            data,
+            major_prior=float(major_prior),
+            eps=float(eps),
+            tol=tol,
+            max_iter=max(int(inner_max_iter), 16),
+            exact_pilot=exact_pilot_np,
+            secondary_wells=secondary_wells,
+            valid_secondary=valid_secondary,
+        )
+    else:
+        scalar_well_starts_seq = list(scalar_well_starts)
+
+    lower = torch.full_like(effective_torch_data.phi_upper, float(eps))
+    upper = torch.minimum(effective_torch_data.phi_upper, torch.ones_like(effective_torch_data.phi_upper))
+    problem = _tensor_problem_from_torch_data(
+        effective_torch_data,
+        major_prior=float(major_prior),
+        eps=float(eps),
+    )
+    return SolverContext(
+        problem=problem,
+        graph=tensor_graph,
+        graph_spec=effective_graph,
+        exact_pilot=_tensor_from_start(exact_pilot_np, effective_runtime),
+        pooled_start=_tensor_from_start(pooled_start_np, effective_runtime),
+        scalar_well_starts=tuple(
+            _tensor_from_start(start, effective_runtime)
+            for start in scalar_well_starts_seq
+        ),
+        lower=lower,
+        upper=upper,
+        runtime=effective_runtime,
+    )
+
+
 def _fit_from_start(
     data: TumorData,
     *,
@@ -194,7 +332,9 @@ def _fit_from_start(
     outer_max_iter: int,
     inner_max_iter: int,
     tol: float,
-    phi_start: np.ndarray,
+    phi_start: np.ndarray | torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
     summary_tol: float | None,
     compute_summary: bool,
     verbose: bool,
@@ -205,9 +345,7 @@ def _fit_from_start(
     use_alm = bool(tensor_graph.is_complete and int(graph.degree_bound) == max(int(data.num_mutations) - 1, 1))
     edge_u, edge_v, edge_w = tensor_graph.edge_u, tensor_graph.edge_v, tensor_graph.weight
 
-    lower = torch.full_like(torch_data.phi_upper, float(eps))
-    upper = torch.minimum(torch_data.phi_upper, torch.ones_like(torch_data.phi_upper))
-    phi = torch.as_tensor(np.asarray(phi_start), dtype=runtime.dtype, device=runtime.device)
+    phi = _tensor_from_start(phi_start, runtime)
     phi = torch.minimum(torch.maximum(phi, lower), upper)
 
     dual = None
@@ -765,75 +903,59 @@ def fit_observed_data_pairwise_fusion(
     summary_tol: float | None = None,
     runtime=None,
     torch_data=None,
+    solver_context: SolverContext | None = None,
     compute_summary: bool = True,
     verbose: bool = False,
 ) -> FusionFitArtifacts:
     tol = _validate_solver_tolerance(tol)
-    effective_runtime = resolve_runtime(device, dtype=dtype) if runtime is None else runtime
-    effective_torch_data = to_torch_tumor_data(data, effective_runtime) if torch_data is None else torch_data
-
-    if exact_pilot is None:
-        exact_pilot, secondary_wells, valid_secondary = compute_scalar_cell_wells(
+    if solver_context is None:
+        solver_context = prepare_torch_problem(
             data,
-            major_prior=major_prior,
-            eps=eps,
+            major_prior=float(major_prior),
+            eps=float(eps),
             tol=tol,
-            max_iter=max(inner_max_iter, 16),
-        )
-    else:
-        secondary_wells = None
-        valid_secondary = None
-    effective_graph = resolve_pairwise_fusion_graph(
-        data.num_mutations,
-        graph=graph,
-        pilot_phi=exact_pilot,
-        gamma=float(adaptive_weight_gamma),
-        tau=max(float(adaptive_weight_floor), float(eps)),
-        baseline=float(adaptive_weight_baseline),
-    )
-    effective_tensor_graph = tensorize_graph(effective_graph, effective_runtime, num_nodes=data.num_mutations)
-    if pooled_start is None:
-        pooled_start = compute_pooled_observed_data_start(
-            data,
-            runtime=effective_runtime,
-            major_prior=major_prior,
-            eps=eps,
-            tol=tol,
-            max_iter=max(inner_max_iter, 16),
-            beta_hints=exact_pilot,
-        )
-    if scalar_well_starts is None:
-        scalar_well_starts = compute_scalar_well_start_bank(
-            data,
-            major_prior=major_prior,
-            eps=eps,
-            tol=tol,
-            max_iter=max(inner_max_iter, 16),
+            inner_max_iter=int(inner_max_iter),
+            graph=graph,
+            adaptive_weight_gamma=float(adaptive_weight_gamma),
+            adaptive_weight_floor=float(adaptive_weight_floor),
+            adaptive_weight_baseline=float(adaptive_weight_baseline),
             exact_pilot=exact_pilot,
-            secondary_wells=secondary_wells,
-            valid_secondary=valid_secondary,
+            pooled_start=pooled_start,
+            scalar_well_starts=scalar_well_starts,
+            device=device,
+            dtype=dtype,
+            runtime=runtime,
+            torch_data=torch_data,
         )
-    else:
-        scalar_well_starts = [np.asarray(start) for start in scalar_well_starts]
+    elif (
+        abs(float(solver_context.problem.major_prior) - float(major_prior)) > 0.0
+        or abs(float(solver_context.problem.eps) - float(eps)) > 0.0
+    ):
+        raise ValueError("SolverContext major_prior/eps do not match the requested fit options.")
+
+    effective_runtime = solver_context.runtime
+    effective_torch_data = torch_data_from_context(solver_context)
+    effective_graph = solver_context.graph_spec
+    effective_tensor_graph = solver_context.graph
 
     normalized_start_mode = str(start_mode).strip().lower()
     if normalized_start_mode not in {"full", "warm_plus_pilot", "warm_only"}:
         raise ValueError(f"Unknown start_mode: {start_mode}")
 
-    start_bank: list[np.ndarray] = []
+    start_bank: list[np.ndarray | torch.Tensor] = []
     if phi_start is not None:
-        start_bank.append(np.asarray(phi_start))
+        start_bank.append(phi_start)
     if normalized_start_mode == "full":
-        start_bank.extend(scalar_well_starts)
-        start_bank.append(pooled_start)
+        start_bank.extend(solver_context.scalar_well_starts)
+        start_bank.append(solver_context.pooled_start)
     elif normalized_start_mode == "warm_plus_pilot":
         if phi_start is None:
-            start_bank.extend(scalar_well_starts)
-            start_bank.append(pooled_start)
+            start_bank.extend(solver_context.scalar_well_starts)
+            start_bank.append(solver_context.pooled_start)
         else:
-            start_bank.extend(scalar_well_starts)
+            start_bank.extend(solver_context.scalar_well_starts)
     elif phi_start is None:
-        start_bank.append(exact_pilot)
+        start_bank.append(solver_context.exact_pilot)
     start_bank = _deduplicate_starts(start_bank)
 
     best_artifacts: FusionFitArtifacts | None = None
@@ -851,6 +973,8 @@ def fit_observed_data_pairwise_fusion(
             inner_max_iter=inner_max_iter,
             tol=tol,
             phi_start=start,
+            lower=solver_context.lower,
+            upper=solver_context.upper,
             summary_tol=summary_tol,
             compute_summary=compute_summary,
             verbose=verbose,

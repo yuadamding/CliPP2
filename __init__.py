@@ -7,6 +7,7 @@ from .core import (
     PairwiseFusionGraph,
     fit_observed_data_pairwise_fusion,
     fit_single_stage_em,
+    prepare_torch_problem,
     resolve_pairwise_fusion_graph,
 )
 from .io.data import PatientData, TumorData, load_patient_tsv, load_tumor_tsv
@@ -45,6 +46,7 @@ __all__ = [
     "load_tumor_tsv",
     "process_one_file",
     "recommend_settings_from_data",
+    "prepare_torch_problem",
     "resolve_pairwise_fusion_graph",
     "run_directory",
     "select_model",

@@ -142,6 +142,7 @@ class TensorFusionGraph:
 class SolverContext:
     problem: TensorProblem
     graph: TensorFusionGraph
+    graph_spec: PairwiseFusionGraph
     exact_pilot: torch.Tensor
     pooled_start: torch.Tensor
     scalar_well_starts: tuple[torch.Tensor, ...]

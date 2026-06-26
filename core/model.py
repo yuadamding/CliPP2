@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..io.data import TumorData
-from .fusion_solver import PairwiseFusionGraph, fit_observed_data_pairwise_fusion
+from .fusion_solver import PairwiseFusionGraph, SolverContext, fit_observed_data_pairwise_fusion
 
 
 @dataclass
@@ -130,6 +130,7 @@ def fit_single_stage_em(
     start_mode: str = "full",
     runtime=None,
     torch_data=None,
+    solver_context: SolverContext | None = None,
     compute_summary: bool = True,
 ) -> FitResult:
     artifacts = fit_observed_data_pairwise_fusion(
@@ -140,22 +141,21 @@ def fit_single_stage_em(
         outer_max_iter=max(int(options.outer_max_iter), 1),
         inner_max_iter=max(int(options.inner_max_iter), 16),
         tol=float(options.tol),
-        phi_start=None if phi_start is None else np.asarray(phi_start),
+        phi_start=phi_start,
         graph=options.graph,
         adaptive_weight_gamma=float(options.adaptive_weight_gamma),
         adaptive_weight_floor=float(options.adaptive_weight_floor),
         adaptive_weight_baseline=float(options.adaptive_weight_baseline),
-        exact_pilot=None if exact_pilot is None else np.asarray(exact_pilot),
-        pooled_start=None if pooled_start is None else np.asarray(pooled_start),
-        scalar_well_starts=None
-        if scalar_well_starts is None
-        else [np.asarray(start) for start in scalar_well_starts],
+        exact_pilot=exact_pilot,
+        pooled_start=pooled_start,
+        scalar_well_starts=scalar_well_starts,
         start_mode=str(start_mode),
         device=str(options.device),
         dtype=str(options.dtype),
         summary_tol=options.summary_tol,
         runtime=runtime,
         torch_data=torch_data,
+        solver_context=solver_context,
         compute_summary=bool(compute_summary),
         verbose=bool(options.verbose),
     )

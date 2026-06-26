@@ -16,7 +16,9 @@ from .fusion_solver import (
     compute_scalar_cell_wells,
     compute_scalar_well_start_bank,
     fit_observed_data_pairwise_fusion,
+    prepare_torch_problem,
     resolve_pairwise_fusion_graph,
+    torch_data_from_context,
 )
 from .model import FitOptions, FitResult, fit_single_stage_em
 
@@ -40,6 +42,8 @@ __all__ = [
     "compute_scalar_cell_wells",
     "compute_scalar_well_start_bank",
     "fit_observed_data_pairwise_fusion",
+    "prepare_torch_problem",
     "resolve_pairwise_fusion_graph",
+    "torch_data_from_context",
     "fit_single_stage_em",
 ]

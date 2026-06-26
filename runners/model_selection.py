@@ -12,21 +12,16 @@ from ..core.model import FitOptions, FitResult, fit_single_stage_em
 from ..core.fusion_solver import (
     PartitionRefitResult,
     cluster_labels_from_edges,
-    compute_exact_observed_data_pilot,
-    compute_pooled_observed_data_start,
-    compute_scalar_cell_wells,
-    compute_scalar_well_start_bank,
     partition_constrained_observed_refit,
-    resolve_pairwise_fusion_graph,
+    prepare_torch_problem,
+    torch_data_from_context,
 )
 from ..core.fusion.torch_backend import (
     cell_terms_torch,
     objective_value_torch,
-    resolve_runtime,
     stationarity_residual_torch,
-    to_torch_tumor_data,
 )
-from ..core.fusion.graph_ops import graph_adjoint_edges, graph_forward_edges, project_dual_ball, tensorize_graph
+from ..core.fusion.graph_ops import graph_adjoint_edges, graph_forward_edges, project_dual_ball
 from ..io.data import TumorData
 from ..metrics.evaluation import (
     SimulationEvaluation,
@@ -1439,6 +1434,7 @@ def _evaluate_candidate(
     start_mode: str,
     runtime,
     torch_data,
+    solver_context,
     compute_summary: bool,
     selection_method: str,
     profile_name: str,
@@ -1459,6 +1455,7 @@ def _evaluate_candidate(
         start_mode=start_mode,
         runtime=runtime,
         torch_data=torch_data,
+        solver_context=solver_context,
         compute_summary=compute_summary,
     )
     bic_partition_tol = _effective_bic_partition_tol(effective_fit_options)
@@ -1809,48 +1806,34 @@ def _grid_search_selection(
         lambda_grid = default_lambda_grid(data, mode=lambda_grid_mode)
     lambda_grid = [] if lambda_grid is None else _sorted_unique_lambdas(lambda_grid)
 
-    runtime = resolve_runtime(fit_options.device, dtype=fit_options.dtype)
-    torch_data = to_torch_tumor_data(data, runtime)
-    pilot_phi, secondary_wells, valid_secondary = compute_scalar_cell_wells(
+    solver_context = prepare_torch_problem(
         data,
         major_prior=float(fit_options.major_prior),
         eps=float(fit_options.eps),
         tol=float(fit_options.tol),
-        max_iter=max(int(fit_options.inner_max_iter), 16),
-    )
-    effective_graph = resolve_pairwise_fusion_graph(
-        data.num_mutations,
         graph=fit_options.graph,
-        pilot_phi=pilot_phi,
-        gamma=float(fit_options.adaptive_weight_gamma),
-        tau=max(float(fit_options.adaptive_weight_floor), float(fit_options.eps)),
-        baseline=float(fit_options.adaptive_weight_baseline),
+        inner_max_iter=max(int(fit_options.inner_max_iter), 16),
+        adaptive_weight_gamma=float(fit_options.adaptive_weight_gamma),
+        adaptive_weight_floor=float(fit_options.adaptive_weight_floor),
+        adaptive_weight_baseline=float(fit_options.adaptive_weight_baseline),
+        device=fit_options.device,
+        dtype=fit_options.dtype,
     )
-    effective_tensor_graph = tensorize_graph(effective_graph, runtime, num_nodes=data.num_mutations)
+    runtime = solver_context.runtime
+    torch_data = torch_data_from_context(solver_context)
+    pilot_phi = solver_context.exact_pilot.detach().cpu().numpy()
+    pooled_start = solver_context.pooled_start.detach().cpu().numpy()
+    scalar_well_starts = [
+        start.detach().cpu().numpy()
+        for start in solver_context.scalar_well_starts
+    ]
+    effective_graph = solver_context.graph_spec
+    effective_tensor_graph = solver_context.graph
     effective_fit_options = replace(fit_options, graph=effective_graph)
     search_fit_options = (
         _adaptive_first_pass_options(effective_fit_options)
         if adaptive_lambda_mode
         else effective_fit_options
-    )
-    pooled_start = compute_pooled_observed_data_start(
-        data,
-        runtime=runtime,
-        major_prior=float(fit_options.major_prior),
-        eps=float(fit_options.eps),
-        tol=float(fit_options.tol),
-        max_iter=max(int(fit_options.inner_max_iter), 16),
-        beta_hints=pilot_phi,
-    )
-    scalar_well_starts = compute_scalar_well_start_bank(
-        data,
-        major_prior=float(fit_options.major_prior),
-        eps=float(fit_options.eps),
-        tol=float(fit_options.tol),
-        max_iter=max(int(fit_options.inner_max_iter), 16),
-        exact_pilot=pilot_phi,
-        secondary_wells=secondary_wells,
-        valid_secondary=valid_secondary,
     )
     if adaptive_lambda_mode:
         lambda_bracket = _initial_adaptive_lambda_bracket(
@@ -1948,6 +1931,7 @@ def _grid_search_selection(
                 start_mode=start_mode,
                 runtime=runtime,
                 torch_data=torch_data,
+                solver_context=solver_context,
                 compute_summary=compute_summary,
                 selection_method=selection_method,
                 profile_name=profile_name,

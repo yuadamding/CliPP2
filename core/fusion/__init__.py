@@ -5,7 +5,12 @@ from .graph import (
     resolve_pairwise_fusion_graph,
 )
 from .graph_ops import graph_adjoint, graph_forward, project_dual_ball, tensorize_graph
-from .solver import cluster_labels_from_edges, fit_observed_data_pairwise_fusion
+from .solver import (
+    cluster_labels_from_edges,
+    fit_observed_data_pairwise_fusion,
+    prepare_torch_problem,
+    torch_data_from_context,
+)
 from .refit import PartitionRefitResult, partition_constrained_observed_refit
 from .starts import (
     compute_exact_observed_data_pilot,
@@ -55,4 +60,6 @@ __all__ = [
     "compute_scalar_cell_wells",
     "compute_scalar_well_start_bank",
     "fit_observed_data_pairwise_fusion",
+    "prepare_torch_problem",
+    "torch_data_from_context",
 ]
