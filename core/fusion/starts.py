@@ -554,6 +554,259 @@ def _cell_loss_grid_numpy(
     return -np.logaddexp(log_minor, log_major)
 
 
+def _ambiguous_cell_loss_matrix_numpy(
+    beta_values: np.ndarray,
+    *,
+    alt: np.ndarray,
+    total: np.ndarray,
+    b_minus: np.ndarray,
+    b_plus: np.ndarray,
+    major_prior: float,
+    eps: float,
+) -> np.ndarray:
+    beta = np.asarray(beta_values, dtype=np.float64)
+    alt_col = np.asarray(alt, dtype=np.float64)[:, None]
+    total_col = np.asarray(total, dtype=np.float64)[:, None]
+    nonalt_col = total_col - alt_col
+    b_minus_col = np.asarray(b_minus, dtype=np.float64)[:, None]
+    b_plus_col = np.asarray(b_plus, dtype=np.float64)[:, None]
+    prob_minus = np.clip(beta * b_minus_col, eps, 1.0 - eps)
+    prob_plus = np.clip(beta * b_plus_col, eps, 1.0 - eps)
+    log_minor = (
+        alt_col * np.log(prob_minus)
+        + nonalt_col * np.log1p(-prob_minus)
+        + float(np.log(max(1.0 - major_prior, eps)))
+    )
+    log_major = (
+        alt_col * np.log(prob_plus)
+        + nonalt_col * np.log1p(-prob_plus)
+        + float(np.log(max(major_prior, eps)))
+    )
+    return -np.logaddexp(log_minor, log_major)
+
+
+def _select_lexicographic_rows(
+    beta: np.ndarray,
+    loss: np.ndarray,
+    valid: np.ndarray,
+    tie_value: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    num_rows, num_cols = beta.shape
+    best_beta = np.full((num_rows,), np.nan, dtype=np.float64)
+    best_loss = np.full((num_rows,), np.inf, dtype=np.float64)
+    best_tie = np.full((num_rows,), np.inf, dtype=np.float64)
+    for col_idx in range(num_cols):
+        candidate_loss = loss[:, col_idx]
+        candidate_tie = tie_value[:, col_idx]
+        better = valid[:, col_idx] & (
+            (candidate_loss < best_loss)
+            | ((candidate_loss == best_loss) & (candidate_tie < best_tie))
+        )
+        best_beta[better] = beta[better, col_idx]
+        best_loss[better] = candidate_loss[better]
+        best_tie[better] = candidate_tie[better]
+    return best_beta, best_loss
+
+
+def _select_secondary_lexicographic_rows(
+    beta: np.ndarray,
+    loss: np.ndarray,
+    valid: np.ndarray,
+    tie_value: np.ndarray,
+    *,
+    primary: np.ndarray,
+    beta_tol: np.ndarray,
+) -> np.ndarray:
+    num_rows, num_cols = beta.shape
+    secondary = np.full((num_rows,), np.nan, dtype=np.float64)
+    best_loss = np.full((num_rows,), np.inf, dtype=np.float64)
+    best_tie = np.full((num_rows,), np.inf, dtype=np.float64)
+    for col_idx in range(num_cols):
+        candidate_loss = loss[:, col_idx]
+        candidate_tie = tie_value[:, col_idx]
+        far_from_primary = np.abs(beta[:, col_idx] - primary) > beta_tol
+        better = valid[:, col_idx] & far_from_primary & (
+            (candidate_loss < best_loss)
+            | ((candidate_loss == best_loss) & (candidate_tie < best_tie))
+        )
+        secondary[better] = beta[better, col_idx]
+        best_loss[better] = candidate_loss[better]
+        best_tie[better] = candidate_tie[better]
+    return secondary
+
+
+def _ambiguous_best_two_from_candidate_grid_numpy(
+    candidate_grid: np.ndarray,
+    *,
+    alt: np.ndarray,
+    total: np.ndarray,
+    b_minus: np.ndarray,
+    b_plus: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    hint: np.ndarray,
+    major_prior: float,
+    eps: float,
+    tol: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    candidates = np.round(np.asarray(candidate_grid, dtype=np.float64), 12)
+    lower = np.asarray(lower, dtype=np.float64)
+    upper = np.asarray(upper, dtype=np.float64)
+    hint = np.asarray(hint, dtype=np.float64)
+    valid = (
+        np.isfinite(candidates)
+        & (candidates >= lower[:, None] - 1e-12)
+        & (candidates <= upper[:, None] + 1e-12)
+    )
+    candidates = np.clip(candidates, lower[:, None], upper[:, None])
+    sorted_beta = np.sort(np.where(valid, candidates, np.inf), axis=1, kind="stable")
+    sorted_valid = np.isfinite(sorted_beta)
+    previous_beta = np.concatenate(
+        [np.full((sorted_beta.shape[0], 1), np.nan, dtype=np.float64), sorted_beta[:, :-1]],
+        axis=1,
+    )
+    unique = sorted_valid & (
+        (np.arange(sorted_beta.shape[1])[None, :] == 0)
+        | (sorted_beta != previous_beta)
+    )
+    beta = np.sort(np.where(unique, sorted_beta, np.inf), axis=1, kind="stable")
+    valid = np.isfinite(beta)
+    empty_rows = ~np.any(valid, axis=1)
+    if np.any(empty_rows):
+        beta[empty_rows, 0] = np.clip(hint[empty_rows], lower[empty_rows], upper[empty_rows])
+        valid[empty_rows, 0] = True
+
+    loss = _ambiguous_cell_loss_matrix_numpy(
+        beta,
+        alt=alt,
+        total=total,
+        b_minus=b_minus,
+        b_plus=b_plus,
+        major_prior=major_prior,
+        eps=eps,
+    )
+    loss = np.where(valid, loss, np.inf)
+    loss_tol = max(float(tol) * 10.0, 1e-10)
+
+    previous_valid = np.concatenate(
+        [np.zeros((valid.shape[0], 1), dtype=bool), valid[:, :-1]],
+        axis=1,
+    )
+    previous_loss = np.concatenate(
+        [np.full((loss.shape[0], 1), np.inf, dtype=np.float64), loss[:, :-1]],
+        axis=1,
+    )
+    loss_delta = np.full_like(loss, np.inf)
+    adjacent_valid = valid & previous_valid
+    loss_delta[adjacent_valid] = np.abs(loss[adjacent_valid] - previous_loss[adjacent_valid])
+    block_start = valid & (~previous_valid | (loss_delta > loss_tol))
+    block_id = np.cumsum(block_start, axis=1) - 1
+    block_id = np.where(valid, block_id, -1)
+
+    num_rows, num_cols = beta.shape
+    row_index = np.arange(num_rows, dtype=np.int64)
+    block_loss = np.full((num_rows, num_cols), np.inf, dtype=np.float64)
+    for col_idx in range(num_cols):
+        rows = valid[:, col_idx]
+        if np.any(rows):
+            np.minimum.at(block_loss, (row_index[rows], block_id[rows, col_idx]), loss[rows, col_idx])
+
+    left_block_loss = np.concatenate(
+        [np.full((num_rows, 1), np.inf, dtype=np.float64), block_loss[:, :-1]],
+        axis=1,
+    )
+    right_block_loss = np.concatenate(
+        [block_loss[:, 1:], np.full((num_rows, 1), np.inf, dtype=np.float64)],
+        axis=1,
+    )
+    local_block = (
+        np.isfinite(block_loss)
+        & (block_loss <= left_block_loss + loss_tol)
+        & (block_loss <= right_block_loss + loss_tol)
+    )
+
+    distance_to_hint = np.where(valid, np.abs(beta - hint[:, None]), np.inf)
+    representative_distance = np.full((num_rows, num_cols), np.inf, dtype=np.float64)
+    for col_idx in range(num_cols):
+        rows = valid[:, col_idx]
+        if np.any(rows):
+            np.minimum.at(
+                representative_distance,
+                (row_index[rows], block_id[rows, col_idx]),
+                distance_to_hint[rows, col_idx],
+            )
+
+    representative_beta = np.full((num_rows, num_cols), np.nan, dtype=np.float64)
+    for col_idx in range(num_cols):
+        rows = (
+            valid[:, col_idx]
+            & np.isfinite(distance_to_hint[:, col_idx])
+            & np.isnan(representative_beta[row_index, np.maximum(block_id[:, col_idx], 0)])
+        )
+        if not np.any(rows):
+            continue
+        row_ids = row_index[rows]
+        block_ids = block_id[rows, col_idx]
+        is_representative = distance_to_hint[rows, col_idx] == representative_distance[row_ids, block_ids]
+        if np.any(is_representative):
+            selected_rows = row_ids[is_representative]
+            selected_blocks = block_ids[is_representative]
+            representative_beta[selected_rows, selected_blocks] = beta[rows, col_idx][is_representative]
+
+    local_beta = representative_beta
+    local_loss = np.where(local_block, block_loss, np.inf)
+    local_valid = np.isfinite(local_loss) & np.isfinite(local_beta)
+    local_tie = np.where(local_valid, np.abs(local_beta - hint[:, None]), np.inf)
+    has_local = np.any(local_valid, axis=1)
+
+    primary = np.full((num_rows,), np.nan, dtype=np.float64)
+    primary_loss = np.full((num_rows,), np.inf, dtype=np.float64)
+    if np.any(has_local):
+        selected_primary, selected_loss = _select_lexicographic_rows(
+            local_beta[has_local],
+            local_loss[has_local],
+            local_valid[has_local],
+            local_tie[has_local],
+        )
+        primary[has_local] = selected_primary
+        primary_loss[has_local] = selected_loss
+
+    fallback_rows = ~has_local
+    if np.any(fallback_rows):
+        selected_primary, selected_loss = _select_lexicographic_rows(
+            beta[fallback_rows],
+            loss[fallback_rows],
+            valid[fallback_rows],
+            beta[fallback_rows],
+        )
+        primary[fallback_rows] = selected_primary
+        primary_loss[fallback_rows] = selected_loss
+
+    secondary_beta_tol = np.maximum(loss_tol, 1e-8 * np.maximum(1.0, np.abs(primary)))
+    secondary = np.full((num_rows,), np.nan, dtype=np.float64)
+    if np.any(has_local):
+        secondary[has_local] = _select_secondary_lexicographic_rows(
+            local_beta[has_local],
+            local_loss[has_local],
+            local_valid[has_local],
+            local_tie[has_local],
+            primary=primary[has_local],
+            beta_tol=secondary_beta_tol[has_local],
+        )
+    if np.any(fallback_rows):
+        secondary[fallback_rows] = _select_secondary_lexicographic_rows(
+            beta[fallback_rows],
+            loss[fallback_rows],
+            valid[fallback_rows],
+            beta[fallback_rows],
+            primary=primary[fallback_rows],
+            beta_tol=secondary_beta_tol[fallback_rows],
+        )
+
+    valid_secondary = np.isfinite(secondary) & (np.abs(secondary - primary) > max(float(tol) * 10.0, 1e-8))
+    return primary, secondary, valid_secondary
+
+
 def _sample_loss_grid_numpy(
     beta_values: np.ndarray,
     *,
@@ -1184,7 +1437,6 @@ def compute_scalar_cell_wells_torch(
         total = torch_data.total.reshape(-1)[flat_mask]
         b_minus = torch_data.b_minus.reshape(-1)[flat_mask]
         b_plus = torch_data.b_plus.reshape(-1)[flat_mask]
-        b_fixed = torch_data.b_fixed.reshape(-1)[flat_mask]
         lower_flat = lower.reshape(-1)[flat_mask]
         upper_flat = upper.reshape(-1)[flat_mask]
         hint_flat = hint.reshape(-1)[flat_mask]
@@ -1206,35 +1458,22 @@ def compute_scalar_cell_wells_torch(
         total_np = total.detach().cpu().numpy()
         b_minus_np = b_minus.detach().cpu().numpy()
         b_plus_np = b_plus.detach().cpu().numpy()
-        b_fixed_np = b_fixed.detach().cpu().numpy()
         lower_np = lower_flat.detach().cpu().numpy()
         upper_np = upper_flat.detach().cpu().numpy()
         hint_np = hint_flat.detach().cpu().numpy()
-        primary_np = np.empty((int(alt_np.size),), dtype=np.float64)
-        secondary_np = np.full((int(alt_np.size),), np.nan, dtype=np.float64)
-        valid_np = np.zeros((int(alt_np.size),), dtype=bool)
-
-        beta_tol = max(float(tol) * 10.0, 1e-8)
-        for row_idx in range(int(alt_np.size)):
-            primary, alternate = _cell_best_two_from_candidates(
-                candidate_grid[row_idx],
-                alt=float(alt_np[row_idx]),
-                total=float(total_np[row_idx]),
-                b_minus=float(b_minus_np[row_idx]),
-                b_plus=float(b_plus_np[row_idx]),
-                b_fixed=float(b_fixed_np[row_idx]),
-                ambiguous=True,
-                lower=float(lower_np[row_idx]),
-                upper=float(upper_np[row_idx]),
-                major_prior=major_prior,
-                eps=eps,
-                tol=tol,
-                hint=float(hint_np[row_idx]),
-            )
-            primary_np[row_idx] = float(primary)
-            if alternate is not None:
-                secondary_np[row_idx] = float(alternate)
-                valid_np[row_idx] = abs(float(alternate) - float(primary)) > beta_tol
+        primary_np, secondary_np, valid_np = _ambiguous_best_two_from_candidate_grid_numpy(
+            candidate_grid,
+            alt=alt_np,
+            total=total_np,
+            b_minus=b_minus_np,
+            b_plus=b_plus_np,
+            lower=lower_np,
+            upper=upper_np,
+            hint=hint_np,
+            major_prior=major_prior,
+            eps=eps,
+            tol=tol,
+        )
 
         refined_flat = refined.reshape(-1)
         secondary_flat = secondary.reshape(-1)
