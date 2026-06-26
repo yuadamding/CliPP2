@@ -233,6 +233,16 @@ class FullFusionKKTResult:
     lambda_value: float
 
 
+@dataclass(frozen=True)
+class CandidateStaticMetadata:
+    edge_count: int
+    edge_weight_min: float
+    edge_weight_max: float
+    edge_weight_mean: float
+    edge_list_hash: str
+    input_data_hash: str
+
+
 def _normalize_selection_score_name(selection_score: str) -> str:
     normalized = str(selection_score).strip().lower()
     if normalized == "bic":
@@ -486,6 +496,26 @@ def _edge_list_hash(edge_u: np.ndarray, edge_v: np.ndarray, edge_w: np.ndarray) 
     _hash_array(hasher, np.asarray(edge_v, dtype=np.int64))
     _hash_array(hasher, np.asarray(edge_w, dtype=np.float64))
     return hasher.hexdigest()
+
+
+def _candidate_static_metadata(data: TumorData, graph) -> CandidateStaticMetadata:
+    edge_count = int(graph.edge_u.size)
+    if edge_count:
+        edge_weight_min = float(np.min(graph.edge_w))
+        edge_weight_max = float(np.max(graph.edge_w))
+        edge_weight_mean = float(np.mean(graph.edge_w))
+    else:
+        edge_weight_min = float("nan")
+        edge_weight_max = float("nan")
+        edge_weight_mean = float("nan")
+    return CandidateStaticMetadata(
+        edge_count=edge_count,
+        edge_weight_min=edge_weight_min,
+        edge_weight_max=edge_weight_max,
+        edge_weight_mean=edge_weight_mean,
+        edge_list_hash=_edge_list_hash(graph.edge_u, graph.edge_v, graph.edge_w),
+        input_data_hash=_input_data_hash(data),
+    )
 
 
 def _effective_bic_partition_tol(options: FitOptions) -> float:
@@ -1455,6 +1485,7 @@ def _evaluate_candidate(
     lambda_value: float,
     selection_score: str,
     bic_refit_cache: dict[str, PartitionRefitResult] | None = None,
+    static_metadata: CandidateStaticMetadata | None = None,
 ) -> tuple[FitResult, SimulationEvaluation | None, dict[str, float | int | str | bool]]:
     canonical_score_name = _normalize_selection_score_name(selection_score)
     effective_fit_options = fit_options if candidate_fit_options is None else candidate_fit_options
@@ -1476,6 +1507,11 @@ def _evaluate_candidate(
     graph = effective_fit_options.graph
     if graph is None:
         raise RuntimeError("Model-selection candidates require a resolved pairwise-fusion graph.")
+    candidate_static = (
+        static_metadata
+        if static_metadata is not None
+        else _candidate_static_metadata(data, graph)
+    )
     bic_labels = cluster_labels_from_edges(
         fit.phi,
         edge_u=graph.edge_u,
@@ -1532,15 +1568,6 @@ def _evaluate_candidate(
     bic_n_eff_value = float(effective_bic_cell_count(data))
     bic_depth_n_eff_value = float(effective_bic_depth_count(data))
     bic_penalty_value = float(bic_df_value * np.log(max(bic_n_eff_value, 1.0)))
-    edge_count = int(graph.edge_u.size)
-    if edge_count:
-        edge_weight_min = float(np.min(graph.edge_w))
-        edge_weight_max = float(np.max(graph.edge_w))
-        edge_weight_mean = float(np.mean(graph.edge_w))
-    else:
-        edge_weight_min = float("nan")
-        edge_weight_max = float("nan")
-        edge_weight_mean = float("nan")
     raw_kkt_eligible = bool(fit.selection_eligible)
     bic_selection_eligible = _is_bic_selection_eligible(
         raw_kkt_eligible=raw_kkt_eligible,
@@ -1701,15 +1728,15 @@ def _evaluate_candidate(
         "eps": float(effective_fit_options.eps),
         "major_prior": float(effective_fit_options.major_prior),
         "graph_name": str(fit.graph_name),
-        "num_edges": edge_count,
-        "edge_weight_min": edge_weight_min,
-        "edge_weight_max": edge_weight_max,
-        "edge_weight_mean": edge_weight_mean,
+        "num_edges": int(candidate_static.edge_count),
+        "edge_weight_min": float(candidate_static.edge_weight_min),
+        "edge_weight_max": float(candidate_static.edge_weight_max),
+        "edge_weight_mean": float(candidate_static.edge_weight_mean),
         "adaptive_weight_gamma": float(effective_fit_options.adaptive_weight_gamma),
         "adaptive_weight_floor": float(effective_fit_options.adaptive_weight_floor),
         "adaptive_weight_baseline": float(effective_fit_options.adaptive_weight_baseline),
-        "edge_list_hash": _edge_list_hash(graph.edge_u, graph.edge_v, graph.edge_w),
-        "input_data_hash": _input_data_hash(data),
+        "edge_list_hash": str(candidate_static.edge_list_hash),
+        "input_data_hash": str(candidate_static.input_data_hash),
         "evaluation_mode": "ari_only" if ari_only_evaluation else "full",
         "fit_compute_summary": bool(compute_summary),
         "fit_start_mode": str(start_mode),
@@ -1845,6 +1872,7 @@ def _grid_search_selection(
     effective_graph = solver_context.graph_spec
     effective_tensor_graph = solver_context.graph
     effective_fit_options = replace(fit_options, graph=effective_graph)
+    static_metadata = _candidate_static_metadata(data, effective_graph)
     search_fit_options = (
         _adaptive_first_pass_options(effective_fit_options)
         if adaptive_lambda_mode
@@ -1989,6 +2017,7 @@ def _grid_search_selection(
                 lambda_value=lambda_value,
                 selection_score=selection_score,
                 bic_refit_cache=bic_refit_cache,
+                static_metadata=static_metadata,
             )
             row["search_round"] = int(search_round)
             row["search_phase"] = str(search_phase)
