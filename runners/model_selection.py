@@ -390,6 +390,18 @@ def _canonical_lambda(value: float) -> float:
     return float(np.round(float(value), 12))
 
 
+def _lambda_warm_start_distance(*, source_lambda: float, target_lambda: float) -> float:
+    source = float(source_lambda)
+    target = float(target_lambda)
+    if source > 0.0 and target > 0.0:
+        return float(abs(np.log(source) - np.log(target)))
+    if source <= 0.0 and target <= 0.0:
+        return 0.0
+    if target <= 0.0:
+        return float(abs(source - target))
+    return float("inf")
+
+
 def _sorted_unique_lambdas(values: list[float] | np.ndarray) -> list[float]:
     array = np.asarray(list(values), dtype=float)
     array = array[np.isfinite(array) & (array >= 0.0)]
@@ -1906,42 +1918,24 @@ def _grid_search_selection(
     def _nearest_phi_start(target_lambda: float) -> np.ndarray:
         if not fit_by_lambda:
             return pilot_phi.copy()
-        target = float(target_lambda)
-
-        def _lambda_start_distance(value: float) -> float:
-            lambda_value = float(value)
-            if lambda_value > 0.0 and target > 0.0:
-                return float(abs(np.log(lambda_value) - np.log(target)))
-            if lambda_value <= 0.0 and target <= 0.0:
-                return 0.0
-            if target <= 0.0:
-                return float(abs(lambda_value - target))
-            return float("inf")
-
         nearest_lambda = min(
             fit_by_lambda,
-            key=_lambda_start_distance,
+            key=lambda value: _lambda_warm_start_distance(
+                source_lambda=float(value),
+                target_lambda=float(target_lambda),
+            ),
         )
         return fit_by_lambda[nearest_lambda].phi.copy()
 
     def _nearest_solver_state(target_lambda: float) -> SolverState | None:
         if not solver_state_by_lambda:
             return None
-        target = float(target_lambda)
-
-        def _lambda_start_distance(value: float) -> float:
-            lambda_value = float(value)
-            if lambda_value > 0.0 and target > 0.0:
-                return float(abs(np.log(lambda_value) - np.log(target)))
-            if lambda_value <= 0.0 and target <= 0.0:
-                return 0.0
-            if target <= 0.0:
-                return float(abs(lambda_value - target))
-            return float("inf")
-
         nearest_lambda = min(
             solver_state_by_lambda,
-            key=_lambda_start_distance,
+            key=lambda value: _lambda_warm_start_distance(
+                source_lambda=float(value),
+                target_lambda=float(target_lambda),
+            ),
         )
         return solver_state_by_lambda.get(nearest_lambda)
 
