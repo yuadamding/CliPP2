@@ -10,7 +10,9 @@ from .fusion_solver import (
     TorchFitResult,
     TorchRuntime,
     build_complete_adaptive_graph,
+    build_complete_adaptive_tensor_graph,
     build_complete_uniform_graph,
+    build_complete_uniform_tensor_graph,
     compute_exact_observed_data_pilot,
     compute_pooled_observed_data_start,
     compute_scalar_cell_wells,
@@ -18,6 +20,7 @@ from .fusion_solver import (
     fit_observed_data_pairwise_fusion,
     prepare_torch_problem,
     resolve_pairwise_fusion_graph,
+    tensor_graph_to_pairwise_graph,
     torch_data_from_context,
 )
 from .model import FitOptions, FitResult, fit_single_stage_em
@@ -36,7 +39,9 @@ __all__ = [
     "TorchFitResult",
     "TorchRuntime",
     "build_complete_adaptive_graph",
+    "build_complete_adaptive_tensor_graph",
     "build_complete_uniform_graph",
+    "build_complete_uniform_tensor_graph",
     "compute_exact_observed_data_pilot",
     "compute_pooled_observed_data_start",
     "compute_scalar_cell_wells",
@@ -44,6 +49,7 @@ __all__ = [
     "fit_observed_data_pairwise_fusion",
     "prepare_torch_problem",
     "resolve_pairwise_fusion_graph",
+    "tensor_graph_to_pairwise_graph",
     "torch_data_from_context",
     "fit_single_stage_em",
 ]

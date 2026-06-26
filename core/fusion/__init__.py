@@ -4,7 +4,15 @@ from .graph import (
     load_pairwise_fusion_graph_tsv,
     resolve_pairwise_fusion_graph,
 )
-from .graph_ops import graph_adjoint, graph_forward, project_dual_ball, tensorize_graph
+from .graph_ops import (
+    build_complete_adaptive_tensor_graph,
+    build_complete_uniform_tensor_graph,
+    graph_adjoint,
+    graph_forward,
+    project_dual_ball,
+    tensor_graph_to_pairwise_graph,
+    tensorize_graph,
+)
 from .solver import (
     cluster_labels_from_edges,
     fit_observed_data_pairwise_fusion,
@@ -46,7 +54,9 @@ __all__ = [
     "TorchFitResult",
     "TorchRuntime",
     "build_complete_adaptive_graph",
+    "build_complete_adaptive_tensor_graph",
     "build_complete_uniform_graph",
+    "build_complete_uniform_tensor_graph",
     "cluster_labels_from_edges",
     "graph_adjoint",
     "graph_forward",
@@ -54,6 +64,7 @@ __all__ = [
     "partition_constrained_observed_refit",
     "project_dual_ball",
     "resolve_pairwise_fusion_graph",
+    "tensor_graph_to_pairwise_graph",
     "tensorize_graph",
     "compute_exact_observed_data_pilot",
     "compute_pooled_observed_data_start",

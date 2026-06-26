@@ -5,7 +5,11 @@ import torch
 
 from ...io.data import TumorData
 from .graph import resolve_pairwise_fusion_graph
-from .graph_ops import tensorize_graph
+from .graph_ops import (
+    build_complete_adaptive_tensor_graph,
+    tensor_graph_to_pairwise_graph,
+    tensorize_graph,
+)
 from .starts import (
     compute_pooled_observed_data_start,
     compute_scalar_cell_wells,
@@ -259,15 +263,26 @@ def prepare_torch_problem(
         secondary_wells = None
         valid_secondary = None
 
-    effective_graph = resolve_pairwise_fusion_graph(
-        data.num_mutations,
-        graph=graph,
-        pilot_phi=exact_pilot_np,
-        gamma=float(adaptive_weight_gamma),
-        tau=max(float(adaptive_weight_floor), float(eps)),
-        baseline=float(adaptive_weight_baseline),
-    )
-    tensor_graph = tensorize_graph(effective_graph, effective_runtime, num_nodes=data.num_mutations)
+    exact_pilot_tensor = _tensor_from_start(exact_pilot_np, effective_runtime)
+    if graph is None:
+        tensor_graph = build_complete_adaptive_tensor_graph(
+            exact_pilot_tensor,
+            effective_runtime,
+            gamma=float(adaptive_weight_gamma),
+            tau=max(float(adaptive_weight_floor), float(eps)),
+            baseline=float(adaptive_weight_baseline),
+        )
+        effective_graph = tensor_graph_to_pairwise_graph(tensor_graph)
+    else:
+        effective_graph = resolve_pairwise_fusion_graph(
+            data.num_mutations,
+            graph=graph,
+            pilot_phi=None,
+            gamma=float(adaptive_weight_gamma),
+            tau=max(float(adaptive_weight_floor), float(eps)),
+            baseline=float(adaptive_weight_baseline),
+        )
+        tensor_graph = tensorize_graph(effective_graph, effective_runtime, num_nodes=data.num_mutations)
 
     if pooled_start is None:
         pooled_start_np = compute_pooled_observed_data_start(
@@ -307,7 +322,7 @@ def prepare_torch_problem(
         problem=problem,
         graph=tensor_graph,
         graph_spec=effective_graph,
-        exact_pilot=_tensor_from_start(exact_pilot_np, effective_runtime),
+        exact_pilot=exact_pilot_tensor,
         pooled_start=_tensor_from_start(pooled_start_np, effective_runtime),
         scalar_well_starts=tuple(
             _tensor_from_start(start, effective_runtime)
