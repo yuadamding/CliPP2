@@ -2026,7 +2026,7 @@ def _grid_search_selection(
                 lambda_key = _canonical_lambda(proposal.lambda_value)
                 left_fit = fit_by_lambda.get(_canonical_lambda(proposal.left_lambda))
                 right_fit = fit_by_lambda.get(_canonical_lambda(proposal.right_lambda))
-                transition_starts = [start.copy() for start in scalar_well_starts]
+                transition_starts = [pilot_phi.copy()]
                 if right_fit is not None:
                     transition_starts.insert(0, right_fit.phi.copy())
                 if left_fit is not None:
@@ -2051,7 +2051,7 @@ def _grid_search_selection(
                 [float(proposal.lambda_value) for proposal in transition_probe_records],
                 search_round=0,
                 search_phase="adaptive_transition_probe",
-                candidate_fit_options=_kkt_polish_options(effective_fit_options),
+                candidate_fit_options=_adaptive_first_pass_options(effective_fit_options),
                 ari_only_evaluation=False,
                 start_mode="full",
                 compute_summary=True,
