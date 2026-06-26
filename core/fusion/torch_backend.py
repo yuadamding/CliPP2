@@ -262,7 +262,6 @@ def cell_terms_torch(
     if data.count_observed is not None:
         loss = torch.where(data.count_observed, loss, torch.zeros_like(loss))
         grad = torch.where(data.count_observed, grad, torch.zeros_like(grad))
-        hess_upper = torch.where(data.count_observed, hess_upper, torch.zeros_like(hess_upper))
 
     hess_upper = torch.clamp(hess_upper, min=1e-8)
     if data.count_observed is not None:
@@ -334,7 +333,6 @@ def em_surrogate_terms_torch(
     if data.count_observed is not None:
         loss = torch.where(data.count_observed, loss, torch.zeros_like(loss))
         grad = torch.where(data.count_observed, grad, torch.zeros_like(grad))
-        hess_upper = torch.where(data.count_observed, hess_upper, torch.zeros_like(hess_upper))
 
     hess_upper = torch.clamp(hess_upper, min=1e-8)
     if data.count_observed is not None:

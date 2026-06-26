@@ -25,6 +25,7 @@ class FitOptions:
     dtype: str = "float64"
     summary_tol: float | None = 1e-4
     bic_partition_tol: float | None = 1e-4
+    objective_shape: str = "unimodal"
     verbose: bool = False
 
 
@@ -105,7 +106,8 @@ class FitResult:
     failure_reason: str
     selection_eligible: bool
     stationarity_certified: bool = False       # True if KKT residual is below tolerance
-    global_optimality_certified: bool = False  # Always False: MM finds stationary points only
+    global_optimality_certified: bool = False
+    global_optimality_basis: str = "none"
     number_of_starts: int = 1
     number_of_finite_starts: int = 1
     best_start_objective: float = float("nan")
@@ -178,6 +180,7 @@ def fit_single_stage_em(
         device=str(options.device),
         dtype=str(options.dtype),
         summary_tol=options.summary_tol,
+        objective_shape=str(options.objective_shape),
         runtime=runtime,
         torch_data=torch_data,
         solver_context=solver_context,
@@ -266,6 +269,7 @@ def fit_single_stage_em(
         global_optimality_certified=bool(
             getattr(artifacts, "global_optimality_certified", False)
         ),
+        global_optimality_basis=str(getattr(artifacts, "global_optimality_basis", "none")),
         number_of_starts=int(getattr(artifacts, "number_of_starts", 1)),
         number_of_finite_starts=int(getattr(artifacts, "number_of_finite_starts", 1)),
         best_start_objective=float(

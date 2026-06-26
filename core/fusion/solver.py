@@ -24,7 +24,6 @@ from .torch_backend import (
     cell_terms_torch,
     em_surrogate_terms_torch,
     graph_fusion_kkt_residual_from_grad_torch,
-    objective_terms_torch,
     pairwise_penalty_torch,
     refine_graph_fusion_dual_certificate_torch,
     resolve_runtime,
@@ -210,6 +209,33 @@ def _inner_model_value_torch(
     return quad + penalty
 
 
+def _objective_value_from_cell_terms_torch(
+    cell_terms,
+    phi: torch.Tensor,
+    *,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    edge_w: torch.Tensor,
+    lambda_value: float,
+) -> tuple[float, float, float, torch.Tensor]:
+    fit_loss_tensor = torch.sum(cell_terms.loss)
+    penalty_tensor = pairwise_penalty_torch(
+        phi,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        edge_w=edge_w,
+        lambda_value=lambda_value,
+    )
+    objective_tensor = fit_loss_tensor + penalty_tensor
+    fit_loss, penalty, objective = (
+        float(value)
+        for value in torch.stack(
+            [fit_loss_tensor.detach(), penalty_tensor.detach(), objective_tensor.detach()]
+        ).cpu()
+    )
+    return fit_loss, penalty, objective, cell_terms.gamma_major
+
+
 def _objective_value_once_torch(
     torch_data: TorchTumorData,
     phi: torch.Tensor,
@@ -221,21 +247,20 @@ def _objective_value_once_torch(
     major_prior: float,
     eps: float,
 ) -> tuple[float, float, float, torch.Tensor]:
-    terms = objective_terms_torch(
+    terms = cell_terms_torch(
         torch_data,
+        phi,
+        major_prior=major_prior,
+        eps=eps,
+    )
+    return _objective_value_from_cell_terms_torch(
+        terms,
         phi,
         edge_u=edge_u,
         edge_v=edge_v,
         edge_w=edge_w,
         lambda_value=lambda_value,
-        major_prior=major_prior,
-        eps=eps,
     )
-    fit_loss, penalty, objective = (
-        float(value)
-        for value in torch.stack([terms.fit.detach(), terms.penalty.detach(), terms.total.detach()]).cpu()
-    )
-    return fit_loss, penalty, objective, terms.gamma_major
 
 
 def _update_minimum(current: float, candidate: float) -> float:
@@ -246,11 +271,55 @@ def _update_minimum(current: float, candidate: float) -> float:
     return float(min(current, candidate))
 
 
+_MISSING_SURROGATE_CURVATURE = 1e-6
+_OUTER_KKT_CHECK_EVERY = 4
+_UNIMODAL_GLOBAL_OPTIMALITY_BASIS = "assumed_unimodal_objective_plus_kkt"
+
+
+def _safe_surrogate_curvature_and_gradient(
+    surrogate_terms,
+    count_observed: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    h_base = torch.clamp(surrogate_terms.hess_upper, min=_MISSING_SURROGATE_CURVATURE)
+    surrogate_grad = surrogate_terms.grad
+    if count_observed is None:
+        return h_base, surrogate_grad
+
+    observed = count_observed
+    h_base = torch.where(
+        observed,
+        h_base,
+        torch.full_like(h_base, _MISSING_SURROGATE_CURVATURE),
+    )
+    surrogate_grad = torch.where(observed, surrogate_grad, torch.zeros_like(surrogate_grad))
+    return h_base, surrogate_grad
+
+
+def _safe_majorized_center(
+    phi: torch.Tensor,
+    *,
+    surrogate_grad: torch.Tensor,
+    h: torch.Tensor,
+    count_observed: torch.Tensor | None,
+) -> torch.Tensor:
+    U_raw = phi - surrogate_grad / h
+    if count_observed is None:
+        return U_raw
+    return torch.where(count_observed, U_raw, phi)
+
+
 def _validate_solver_tolerance(tol: float) -> float:
     value = float(tol)
     if not np.isfinite(value) or value <= 0.0:
         raise ValueError("Solver tolerance must be a positive finite value.")
     return value
+
+
+def _normalize_objective_shape(objective_shape: str) -> str:
+    normalized = str(objective_shape).strip().lower()
+    if normalized not in {"unimodal", "generic_nonconvex"}:
+        raise ValueError("objective_shape must be 'unimodal' or 'generic_nonconvex'.")
+    return normalized
 
 
 def _data_fingerprint(data: TumorData) -> str:
@@ -292,6 +361,12 @@ def _data_fingerprint(data: TumorData) -> str:
         "init_major_mask",
     ):
         update_array(name, getattr(data, name))
+    count_observed = getattr(data, "count_observed", None)
+    if count_observed is None:
+        count_observed_array = np.ones_like(np.asarray(data.alt_counts), dtype=bool)
+    else:
+        count_observed_array = np.asarray(count_observed, dtype=bool)
+    update_array("count_observed", count_observed_array)
     return digest.hexdigest()
 
 
@@ -347,6 +422,7 @@ def _tensor_problem_from_torch_data(
         major_prior=prior,
         log_prior_minor=torch.log1p(-prior_tensor),
         log_prior_major=torch.log(prior_tensor),
+        count_observed=torch_data.count_observed,
     )
 
 
@@ -361,6 +437,7 @@ def torch_data_from_context(context: SolverContext) -> TorchTumorData:
         b_minus=problem.b_minus,
         b_plus=problem.b_plus,
         b_fixed=problem.b_fixed,
+        count_observed=problem.count_observed,
     )
 
 
@@ -382,8 +459,11 @@ def prepare_torch_problem(
     dtype: str | None = "auto",
     runtime=None,
     torch_data: TorchTumorData | None = None,
+    objective_shape: str = "unimodal",
 ) -> SolverContext:
     tol = _validate_solver_tolerance(tol)
+    objective_shape = _normalize_objective_shape(objective_shape)
+    use_unimodal_objective = objective_shape == "unimodal"
     data_fingerprint = _data_fingerprint(data)
     effective_runtime = resolve_runtime(device, dtype=dtype) if runtime is None else runtime
     effective_torch_data = to_torch_tumor_data(data, effective_runtime) if torch_data is None else torch_data
@@ -399,7 +479,7 @@ def prepare_torch_problem(
         )
     else:
         exact_pilot_tensor = _tensor_from_start(exact_pilot, effective_runtime)
-        if scalar_well_starts is None:
+        if scalar_well_starts is None and not use_unimodal_objective:
             _, secondary_wells, valid_secondary = compute_scalar_cell_wells_torch(
                 effective_torch_data,
                 phi_init=data.phi_init,
@@ -432,7 +512,9 @@ def prepare_torch_problem(
         )
         tensor_graph = tensorize_graph(effective_graph, effective_runtime, num_nodes=data.num_mutations)
 
-    if pooled_start is None:
+    if use_unimodal_objective and pooled_start is None:
+        pooled_start_tensor = exact_pilot_tensor
+    elif pooled_start is None:
         pooled_start_tensor = compute_pooled_observed_data_start_torch(
             effective_torch_data,
             major_prior=float(major_prior),
@@ -444,7 +526,9 @@ def prepare_torch_problem(
     else:
         pooled_start_tensor = _tensor_from_start(pooled_start, effective_runtime)
 
-    if scalar_well_starts is None:
+    if use_unimodal_objective and scalar_well_starts is None:
+        scalar_well_starts_seq = ()
+    elif scalar_well_starts is None:
         scalar_well_starts_seq = compute_scalar_well_start_bank_torch(
             effective_torch_data,
             eps=float(eps),
@@ -498,9 +582,12 @@ def _fit_from_start(
     upper: torch.Tensor,
     summary_tol: float | None,
     compute_summary: bool,
+    objective_shape: str,
     verbose: bool,
 ) -> FusionFitArtifacts:
     tol = _validate_solver_tolerance(tol)
+    objective_shape = _normalize_objective_shape(objective_shape)
+    use_unimodal_objective = objective_shape == "unimodal"
     edge_u_np = graph.edge_u
     edge_v_np = graph.edge_v
     use_alm = bool(tensor_graph.is_complete and int(graph.degree_bound) == max(int(data.num_mutations) - 1, 1))
@@ -584,15 +671,14 @@ def _fit_from_start(
     last_reject_reason = "not_attempted"
     failure_reason = "not_converged"
 
-    fit_loss, penalty, objective, gamma_major = _objective_value_once_torch(
-        torch_data,
+    current_cell_terms = cell_terms_torch(torch_data, phi, major_prior=major_prior, eps=eps)
+    fit_loss, penalty, objective, gamma_major = _objective_value_from_cell_terms_torch(
+        current_cell_terms,
         phi,
         edge_u=edge_u,
         edge_v=edge_v,
         edge_w=edge_w,
         lambda_value=lambda_value,
-        major_prior=major_prior,
-        eps=eps,
     )
     history.append(float(objective))
 
@@ -600,17 +686,22 @@ def _fit_from_start(
         iterations = outer_iter + 1
         previous_phi = phi.clone()
         previous_objective = objective
-        surrogate_terms = em_surrogate_terms_torch(
-            torch_data,
-            phi,
-            omega_major=gamma_major,
-            major_prior=major_prior,
-            eps=eps,
+        if use_unimodal_objective:
+            surrogate_terms = current_cell_terms
+            surrogate_fit_loss = float(fit_loss)
+        else:
+            surrogate_terms = em_surrogate_terms_torch(
+                torch_data,
+                phi,
+                omega_major=gamma_major,
+                major_prior=major_prior,
+                eps=eps,
+            )
+            surrogate_fit_loss = float(torch.sum(surrogate_terms.loss).item())
+        h_base, surrogate_grad = _safe_surrogate_curvature_and_gradient(
+            surrogate_terms,
+            torch_data.count_observed,
         )
-        surrogate_fit_loss = float(torch.sum(surrogate_terms.loss).item())
-        h_base = torch.clamp(surrogate_terms.hess_upper, min=1e-6)
-        if torch_data.count_observed is not None:
-            h_base = torch.where(torch_data.count_observed, h_base, torch.zeros_like(h_base))
         scale = 1.0
         accepted = False
         candidate_phi = phi
@@ -620,22 +711,32 @@ def _fit_from_start(
         candidate_objective = objective
         candidate_fit_loss = fit_loss
         candidate_gamma = gamma_major
+        candidate_cell_terms = current_cell_terms
         candidate_inner_residual = np.nan
         candidate_step_type = "none"
         inner_converged = False
 
-        for _ in range(10):
+        curvature_attempts = 1 if use_unimodal_objective else 10
+        for _ in range(curvature_attempts):
             h = h_base * scale
-            U = phi - surrogate_terms.grad / h
-            q_current = _inner_model_value_torch(
+            U = _safe_majorized_center(
                 phi,
-                U=U,
+                surrogate_grad=surrogate_grad,
                 h=h,
-                edge_u=edge_u,
-                edge_v=edge_v,
-                edge_w=edge_w,
-                lambda_value=lambda_value,
+                count_observed=torch_data.count_observed,
             )
+            if use_unimodal_objective:
+                q_current = None
+            else:
+                q_current = _inner_model_value_torch(
+                    phi,
+                    U=U,
+                    h=h,
+                    edge_u=edge_u,
+                    edge_v=edge_v,
+                    edge_w=edge_w,
+                    lambda_value=lambda_value,
+                )
             if use_alm:
                 phi_trial, dual_trial, dual_kkt_trial, _, inner_ok, inner_residual = solve_majorized_subproblem_alm_torch(
                     runtime=runtime,
@@ -680,39 +781,43 @@ def _fit_from_start(
                 float(inner_residual),
             )
             delta = phi_trial - phi
-            quadratic_gap = float(torch.sum(surrogate_terms.grad * delta + 0.5 * h * torch.square(delta)).item())
-            majorizer_rhs = surrogate_fit_loss + quadratic_gap
-            q_trial = _inner_model_value_torch(
-                phi_trial,
-                U=U,
-                h=h,
-                edge_u=edge_u,
-                edge_v=edge_v,
-                edge_w=edge_w,
-                lambda_value=lambda_value,
-            )
-            inner_model_gap = float((q_trial - q_current).item())
-            trial_surrogate_terms = em_surrogate_terms_torch(
-                torch_data,
-                phi_trial,
-                omega_major=gamma_major,
-                major_prior=major_prior,
-                eps=eps,
-            )
-            trial_surrogate_loss = float(torch.sum(trial_surrogate_terms.loss).item())
-            surrogate_gap = float(trial_surrogate_loss - majorizer_rhs)
-            trial_fit_loss, _, trial_objective, trial_gamma = _objective_value_once_torch(
-                torch_data,
+            trial_cell_terms = cell_terms_torch(torch_data, phi_trial, major_prior=major_prior, eps=eps)
+            trial_fit_loss, _, trial_objective, trial_gamma = _objective_value_from_cell_terms_torch(
+                trial_cell_terms,
                 phi_trial,
                 edge_u=edge_u,
                 edge_v=edge_v,
                 edge_w=edge_w,
                 lambda_value=lambda_value,
-                major_prior=major_prior,
-                eps=eps,
             )
             objective_gap = float(trial_objective - previous_objective)
-            em_envelope_gap = float((trial_fit_loss - fit_loss) - (trial_surrogate_loss - surrogate_fit_loss))
+            if use_unimodal_objective:
+                inner_model_gap = 0.0
+                surrogate_gap = 0.0
+                em_envelope_gap = 0.0
+            else:
+                quadratic_gap = float(torch.sum(surrogate_terms.grad * delta + 0.5 * h * torch.square(delta)).item())
+                majorizer_rhs = surrogate_fit_loss + quadratic_gap
+                q_trial = _inner_model_value_torch(
+                    phi_trial,
+                    U=U,
+                    h=h,
+                    edge_u=edge_u,
+                    edge_v=edge_v,
+                    edge_w=edge_w,
+                    lambda_value=lambda_value,
+                )
+                inner_model_gap = float((q_trial - q_current).item())
+                trial_surrogate_terms = em_surrogate_terms_torch(
+                    torch_data,
+                    phi_trial,
+                    omega_major=gamma_major,
+                    major_prior=major_prior,
+                    eps=eps,
+                )
+                trial_surrogate_loss = float(torch.sum(trial_surrogate_terms.loss).item())
+                surrogate_gap = float(trial_surrogate_loss - majorizer_rhs)
+                em_envelope_gap = float((trial_fit_loss - fit_loss) - (trial_surrogate_loss - surrogate_fit_loss))
             last_attempted_objective_gap = objective_gap
             best_attempted_objective_gap = _update_minimum(float(best_attempted_objective_gap), objective_gap)
             last_attempted_surrogate_gap = surrogate_gap
@@ -727,12 +832,12 @@ def _fit_from_start(
                     inner_model_gap,
                     surrogate_gap,
                     em_envelope_gap,
-                    objective_gap,
-                    trial_fit_loss,
-                    trial_objective,
-                ]
+                objective_gap,
+                trial_fit_loss,
+                trial_objective,
+            ]
             )
-            inner_model_tol = 1e-8 * (1.0 + abs(float(q_current.item())))
+            inner_model_tol = 0.0 if use_unimodal_objective else 1e-8 * (1.0 + abs(float(q_current.item())))
             majorization_tol = 1e-8 * (1.0 + abs(surrogate_fit_loss))
             envelope_tol = 1e-8 * (1.0 + abs(fit_loss))
             objective_tol = 1e-8 * (1.0 + abs(previous_objective))
@@ -741,17 +846,17 @@ def _fit_from_start(
                 last_reject_reason = "rejected_nonfinite_objective"
                 scale *= 2.0
                 continue
-            if inner_model_gap > inner_model_tol:
+            if not use_unimodal_objective and inner_model_gap > inner_model_tol:
                 failed_inner_model_checks += 1
                 last_reject_reason = "rejected_inner_model_not_decreased"
                 scale *= 2.0
                 continue
-            if surrogate_gap > majorization_tol:
+            if not use_unimodal_objective and surrogate_gap > majorization_tol:
                 failed_majorization_checks += 1
                 last_reject_reason = "rejected_majorization_failed"
                 scale *= 2.0
                 continue
-            if em_envelope_gap > envelope_tol:
+            if not use_unimodal_objective and em_envelope_gap > envelope_tol:
                 failed_em_envelope_checks += 1
                 last_reject_reason = "rejected_em_envelope_failed"
                 scale *= 2.0
@@ -767,26 +872,33 @@ def _fit_from_start(
                 candidate_objective = trial_objective
                 candidate_fit_loss = trial_fit_loss
                 candidate_gamma = trial_gamma
+                candidate_cell_terms = trial_cell_terms
                 candidate_inner_residual = float(inner_residual)
                 candidate_step_type = "full_inner_step"
                 accepted_step_type = candidate_step_type
                 inner_converged = inner_ok and inner_residual <= 5.0 * tol
                 break
-            if inner_ok and inner_model_gap <= inner_model_tol and surrogate_gap <= majorization_tol and em_envelope_gap <= envelope_tol and objective_gap > max(1e-5, objective_tol):
+            if (
+                not use_unimodal_objective
+                and inner_ok
+                and inner_model_gap <= inner_model_tol
+                and surrogate_gap <= majorization_tol
+                and em_envelope_gap <= envelope_tol
+                and objective_gap > max(1e-5, objective_tol)
+            ):
                 mm_consistency_violations += 1
             theta = 0.5
             damped_accepted = False
             for _line_search_iter in range(12):
                 phi_theta = phi + theta * delta
-                theta_fit_loss, _, theta_objective, theta_gamma = _objective_value_once_torch(
-                    torch_data,
+                theta_cell_terms = cell_terms_torch(torch_data, phi_theta, major_prior=major_prior, eps=eps)
+                theta_fit_loss, _, theta_objective, theta_gamma = _objective_value_from_cell_terms_torch(
+                    theta_cell_terms,
                     phi_theta,
                     edge_u=edge_u,
                     edge_v=edge_v,
                     edge_w=edge_w,
                     lambda_value=lambda_value,
-                    major_prior=major_prior,
-                    eps=eps,
                 )
                 if np.isfinite(theta_objective) and theta_objective <= previous_objective + objective_tol:
                     accepted = True
@@ -800,6 +912,7 @@ def _fit_from_start(
                     candidate_objective = theta_objective
                     candidate_fit_loss = theta_fit_loss
                     candidate_gamma = theta_gamma
+                    candidate_cell_terms = theta_cell_terms
                     candidate_inner_residual = np.nan
                     candidate_step_type = "damped_mm_direction"
                     accepted_step_type = candidate_step_type
@@ -820,6 +933,7 @@ def _fit_from_start(
             candidate_objective = objective
             candidate_fit_loss = fit_loss
             candidate_gamma = gamma_major
+            candidate_cell_terms = current_cell_terms
             candidate_step_type = "none"
 
         phi = candidate_phi
@@ -829,6 +943,7 @@ def _fit_from_start(
         objective = candidate_objective
         fit_loss = candidate_fit_loss
         gamma_major = candidate_gamma
+        current_cell_terms = candidate_cell_terms
         penalty = objective - fit_loss
         history.append(float(objective))
 
@@ -840,31 +955,49 @@ def _fit_from_start(
 
         rel_change = abs(previous_objective - objective) / (1.0 + abs(previous_objective))
         step_residual = float((torch.linalg.norm(phi - previous_phi) / (1.0 + torch.linalg.norm(previous_phi))).item())
-        outer_terms = cell_terms_torch(torch_data, phi, major_prior=major_prior, eps=eps)
-        if dual_kkt is None:
-            dual_for_audit = torch.zeros((int(edge_u.numel()), int(phi.shape[1])), dtype=runtime.dtype, device=runtime.device)
-        else:
-            dual_for_audit = dual_kkt
-        outer_diag = graph_fusion_kkt_residual_from_grad_torch(
-            phi=phi,
-            grad_smooth=outer_terms.grad,
-            dual_kkt=dual_for_audit,
-            lower=lower,
-            upper=upper,
-            edge_u=edge_u,
-            edge_v=edge_v,
-            edge_w=edge_w,
-            lambda_value=lambda_value,
-            atol=tol,
+        cheap_outer_converged = bool(
+            rel_change <= 10.0 * tol
+            and step_residual <= max(1e-8, np.sqrt(tol))
         )
-        outer_converged = bool(outer_diag["kkt_residual"] <= 5.0 * tol)
+        do_outer_kkt_audit = bool(
+            cheap_outer_converged
+            or iterations >= max(int(outer_max_iter), 1)
+            or iterations % _OUTER_KKT_CHECK_EVERY == 0
+            or not np.isfinite(objective)
+        )
+        outer_diag = final_outer_diag
+        outer_converged = False
+        if do_outer_kkt_audit:
+            outer_terms = current_cell_terms
+            if dual_kkt is None:
+                dual_for_audit = torch.zeros(
+                    (int(edge_u.numel()), int(phi.shape[1])),
+                    dtype=runtime.dtype,
+                    device=runtime.device,
+                )
+            else:
+                dual_for_audit = dual_kkt
+            outer_diag = graph_fusion_kkt_residual_from_grad_torch(
+                phi=phi,
+                grad_smooth=outer_terms.grad,
+                dual_kkt=dual_for_audit,
+                lower=lower,
+                upper=upper,
+                edge_u=edge_u,
+                edge_v=edge_v,
+                edge_w=edge_w,
+                lambda_value=lambda_value,
+                atol=tol,
+            )
+            outer_converged = bool(outer_diag["kkt_residual"] <= 5.0 * tol)
         final_relative_objective_change = float(rel_change)
         final_step_residual = float(step_residual)
         if accepted:
             current_inner_converged = bool(inner_converged)
             current_inner_kkt_residual = float(candidate_inner_residual)
         final_inner_kkt_residual = float(current_inner_kkt_residual)
-        final_outer_diag = outer_diag
+        if do_outer_kkt_audit:
+            final_outer_diag = outer_diag
         converged_inner = bool(current_inner_converged)
         converged_outer = bool(outer_converged)
         if (
@@ -876,7 +1009,7 @@ def _fit_from_start(
             converged = True
             break
 
-    final_terms = cell_terms_torch(torch_data, phi, major_prior=major_prior, eps=eps)
+    final_terms = current_cell_terms
     final_dual_audit = refine_graph_fusion_dual_certificate_torch(
         phi=phi,
         grad_smooth=final_terms.grad,
@@ -911,7 +1044,14 @@ def _fit_from_start(
         and mm_consistency_violations == 0
     )
     stationarity_certified = bool(selection_eligible)
-    global_optimality_certified = False
+    global_optimality_certified = bool(selection_eligible and use_unimodal_objective)
+    global_optimality_basis = (
+        _UNIMODAL_GLOBAL_OPTIMALITY_BASIS
+        if global_optimality_certified
+        else "not_certified"
+    )
+    if use_unimodal_objective and global_optimality_certified:
+        converged = True
 
     if converged:
         failure_reason = "converged"
@@ -1110,6 +1250,7 @@ def _fit_from_start(
         selection_eligible=bool(selection_eligible),
         stationarity_certified=bool(stationarity_certified),
         global_optimality_certified=bool(global_optimality_certified),
+        global_optimality_basis=str(global_optimality_basis),
         number_of_starts=1,
         number_of_finite_starts=int(np.isfinite(float(objective))),
         best_start_objective=float(objective),
@@ -1184,10 +1325,12 @@ def fit_observed_data_pairwise_fusion(
     solver_context: SolverContext | None = None,
     solver_state: SolverState | None = None,
     compute_summary: bool = True,
+    objective_shape: str = "unimodal",
     verbose: bool = False,
 ) -> FusionFitArtifacts:
     tol = _validate_solver_tolerance(tol)
     lambda_value = validate_lambda_value(lambda_value)
+    objective_shape = _normalize_objective_shape(objective_shape)
     expected_data_fingerprint = _data_fingerprint(data)
     if solver_context is None:
         solver_context = prepare_torch_problem(
@@ -1207,6 +1350,7 @@ def fit_observed_data_pairwise_fusion(
             dtype=dtype,
             runtime=runtime,
             torch_data=torch_data,
+            objective_shape=objective_shape,
         )
     else:
         if getattr(solver_context, "data_fingerprint", None) != expected_data_fingerprint:
@@ -1233,20 +1377,26 @@ def fit_observed_data_pairwise_fusion(
     if normalized_start_mode not in {"full", "warm_plus_pilot", "warm_only"}:
         raise ValueError(f"Unknown start_mode: {start_mode}")
 
-    start_bank: list[np.ndarray | torch.Tensor] = []
-    if phi_start is not None:
-        start_bank.append(phi_start)
-    if normalized_start_mode == "full":
-        start_bank.extend(effective_scalar_well_starts)
-        start_bank.append(effective_pooled_start)
-    elif normalized_start_mode == "warm_plus_pilot":
-        if phi_start is None:
+    if objective_shape == "unimodal":
+        if phi_start is not None:
+            start_bank = [phi_start]
+        else:
+            start_bank = [effective_exact_pilot]
+    else:
+        start_bank: list[np.ndarray | torch.Tensor] = []
+        if phi_start is not None:
+            start_bank.append(phi_start)
+        if normalized_start_mode == "full":
             start_bank.extend(effective_scalar_well_starts)
             start_bank.append(effective_pooled_start)
-        else:
-            start_bank.extend(effective_scalar_well_starts)
-    elif phi_start is None:
-        start_bank.append(effective_exact_pilot)
+        elif normalized_start_mode == "warm_plus_pilot":
+            if phi_start is None:
+                start_bank.extend(effective_scalar_well_starts)
+                start_bank.append(effective_pooled_start)
+            else:
+                start_bank.extend(effective_scalar_well_starts)
+        elif phi_start is None:
+            start_bank.append(effective_exact_pilot)
     start_bank = _deduplicate_starts(start_bank, runtime=effective_runtime)
 
     best_artifacts: FusionFitArtifacts | None = None
@@ -1277,6 +1427,7 @@ def fit_observed_data_pairwise_fusion(
             upper=solver_context.upper,
             summary_tol=summary_tol,
             compute_summary=compute_summary,
+            objective_shape=objective_shape,
             verbose=verbose,
         )
         start_artifacts.append(artifacts)

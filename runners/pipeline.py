@@ -342,6 +342,7 @@ def process_one_file_bundle(
         "converged": bool(best_fit.converged),
         "stationarity_certified": bool(best_fit.stationarity_certified),
         "global_optimality_certified": bool(best_fit.global_optimality_certified),
+        "global_optimality_basis": str(best_fit.global_optimality_basis),
         "number_of_starts": int(best_fit.number_of_starts),
         "number_of_finite_starts": int(best_fit.number_of_finite_starts),
         "best_start_objective": float(best_fit.best_start_objective),

@@ -58,6 +58,7 @@ ADAPTIVE_PATH_VALUE_CURVE_TOL = 1e-4
 ADAPTIVE_PATH_FULL_FUSION_MAX_ITER = 80
 ADAPTIVE_FIRST_PASS_OUTER_MAX_ITER = 40
 ADAPTIVE_FIRST_PASS_INNER_MAX_ITER = 60
+ENABLE_KKT_POLISH = False
 KKT_POLISH_REPAIR_MULTIPLIER = 20.0
 KKT_POLISH_REPAIR_FLOOR = 2e-3
 KKT_POLISH_SCORE_WINDOW_ABS = 10.0
@@ -1798,6 +1799,7 @@ def _evaluate_candidate(
         "raw_fit_status": str(fit.failure_reason),
         "stationarity_certified": bool(fit.stationarity_certified),
         "global_optimality_certified": bool(fit.global_optimality_certified),
+        "global_optimality_basis": str(fit.global_optimality_basis),
         "number_of_starts": int(fit.number_of_starts),
         "number_of_finite_starts": int(fit.number_of_finite_starts),
         "best_start_objective": float(fit.best_start_objective),
@@ -2347,13 +2349,14 @@ def _grid_search_selection(
     search_df = pd.DataFrame([row for _, _, row in result_entries]).sort_values(["lambda", "selection_step"]).reset_index(drop=True)
     score_column = _adaptive_score_column(normalized_score)
     if normalized_score == "bic":
+        kkt_polish_enabled = bool(ENABLE_KKT_POLISH)
         search_df, polish_candidate_df = _annotate_polish_candidates(
             search_df,
             normalized_score=normalized_score,
             tol=float(effective_fit_options.tol),
-            max_candidates=KKT_POLISH_MAX_CANDIDATES,
+            max_candidates=KKT_POLISH_MAX_CANDIDATES if kkt_polish_enabled else 0,
         )
-        if not polish_candidate_df.empty:
+        if kkt_polish_enabled and not polish_candidate_df.empty:
             row_by_candidate_id = {
                 int(row["_candidate_id"]): row
                 for _, _, row in result_entries
@@ -2442,7 +2445,7 @@ def _grid_search_selection(
         has_certified_candidate = bool(
             np.any(_bic_selection_eligible_mask(search_df))
         )
-        if not has_certified_candidate:
+        if kkt_polish_enabled and not has_certified_candidate:
             score_column = _adaptive_score_column(normalized_score)
             if score_column in search_df.columns and "_candidate_id" in search_df.columns:
                 objectives = search_df["penalized_objective"].to_numpy(dtype=float)
@@ -2558,7 +2561,7 @@ def _grid_search_selection(
         has_certified_candidate = bool(
             np.any(_bic_selection_eligible_mask(search_df))
         )
-        if not has_certified_candidate:
+        if kkt_polish_enabled and not has_certified_candidate:
             score_column = _adaptive_score_column(normalized_score)
             if score_column in search_df.columns and "_candidate_id" in search_df.columns:
                 objectives = search_df["penalized_objective"].to_numpy(dtype=float)
@@ -2767,7 +2770,11 @@ def _grid_search_selection(
                 selection_optimizer_limited_reason = "best_provisional_score_repaired_by_polish"
             else:
                 selection_optimizer_limited = True
-                selection_optimizer_limited_reason = "best_provisional_score_failed_kkt_after_polish"
+                selection_optimizer_limited_reason = (
+                    "best_provisional_score_failed_kkt_after_polish"
+                    if ENABLE_KKT_POLISH
+                    else "best_provisional_score_failed_kkt"
+                )
 
     if "_candidate_id" in search_df.columns and np.isfinite(selected_provisional_score):
         same_lambda_success_keys = {

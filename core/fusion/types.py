@@ -99,6 +99,7 @@ class FusionFitArtifacts:
     selection_eligible: bool
     stationarity_certified: bool
     global_optimality_certified: bool
+    global_optimality_basis: str
     number_of_starts: int
     number_of_finite_starts: int
     best_start_objective: float
@@ -130,6 +131,7 @@ class TensorProblem:
     major_prior: float
     log_prior_minor: torch.Tensor
     log_prior_major: torch.Tensor
+    count_observed: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
