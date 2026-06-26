@@ -94,7 +94,7 @@ def resolve_runtime(device: str | None, *, dtype: str | None = None) -> TorchRun
     runtime_device = torch.device(requested)
     requested_dtype = "auto" if dtype is None else str(dtype).strip().lower()
     if requested_dtype == "auto":
-        runtime_dtype = torch.float32 if runtime_device.type == "cuda" else torch.float64
+        runtime_dtype = torch.float64
     elif requested_dtype == "float32":
         runtime_dtype = torch.float32
     elif requested_dtype == "float64":
