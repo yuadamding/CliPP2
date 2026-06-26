@@ -1,15 +1,122 @@
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 
 from .types import PairwiseFusionGraph, TensorFusionGraph, TorchRuntime
 
 PDHG_PRECONDITIONER_ETA = 0.99
+COMPLETE_GRAPH_MEMORY_SAFETY_FRACTION = 0.80
+COMPLETE_GRAPH_MEMORY_LIMIT_ENV = "CLIPP2_MAX_COMPLETE_GRAPH_BYTES"
 
 
 def _complete_graph_weight(num_nodes: int) -> float:
     return 1.0 / float(max(int(num_nodes) - 1, 1))
+
+
+def _dtype_nbytes(dtype: torch.dtype) -> int:
+    return int(torch.empty((), dtype=dtype).element_size())
+
+
+def estimate_complete_tensor_graph_bytes(
+    num_nodes: int,
+    *,
+    num_samples: int,
+    dtype: torch.dtype,
+    adaptive: bool,
+) -> int:
+    node_count = max(int(num_nodes), 0)
+    sample_count = max(int(num_samples), 1)
+    edge_count = node_count * max(node_count - 1, 0) // 2
+    value_bytes = _dtype_nbytes(dtype)
+    index_bytes = _dtype_nbytes(torch.long)
+    persistent_bytes = (
+        2 * edge_count * index_bytes
+        + edge_count * value_bytes
+        + 2 * node_count * value_bytes
+    )
+    if not adaptive:
+        return int(persistent_bytes)
+    adaptive_peak_bytes = edge_count * sample_count * value_bytes + 3 * edge_count * value_bytes
+    return int(persistent_bytes + adaptive_peak_bytes)
+
+
+def _parse_memory_limit_bytes(value: str | None) -> int | None:
+    if value is None or not str(value).strip():
+        return None
+    limit = int(float(str(value).strip()))
+    if limit <= 0:
+        raise ValueError(f"{COMPLETE_GRAPH_MEMORY_LIMIT_ENV} must be positive when set.")
+    return limit
+
+
+def _cuda_memory_limit_bytes(runtime: TorchRuntime) -> int | None:
+    if runtime.device.type != "cuda":
+        return None
+    try:
+        free_bytes, _ = torch.cuda.mem_get_info(runtime.device)
+    except Exception:
+        return None
+    return int(COMPLETE_GRAPH_MEMORY_SAFETY_FRACTION * int(free_bytes))
+
+
+def _cpu_memory_limit_bytes(runtime: TorchRuntime) -> int | None:
+    if runtime.device.type != "cpu":
+        return None
+    try:
+        page_count = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, OSError, ValueError):
+        return None
+    if int(page_count) <= 0 or int(page_size) <= 0:
+        return None
+    return int(COMPLETE_GRAPH_MEMORY_SAFETY_FRACTION * int(page_count) * int(page_size))
+
+
+def _complete_graph_memory_limit_bytes(
+    runtime: TorchRuntime,
+    *,
+    memory_limit_bytes: int | None,
+) -> int | None:
+    if memory_limit_bytes is not None:
+        return int(memory_limit_bytes)
+    env_limit = _parse_memory_limit_bytes(os.environ.get(COMPLETE_GRAPH_MEMORY_LIMIT_ENV))
+    if env_limit is not None:
+        return env_limit
+    cuda_limit = _cuda_memory_limit_bytes(runtime)
+    if cuda_limit is not None:
+        return cuda_limit
+    return _cpu_memory_limit_bytes(runtime)
+
+
+def _check_complete_tensor_graph_memory(
+    *,
+    num_nodes: int,
+    num_samples: int,
+    runtime: TorchRuntime,
+    adaptive: bool,
+    memory_limit_bytes: int | None,
+) -> None:
+    estimate = estimate_complete_tensor_graph_bytes(
+        num_nodes,
+        num_samples=num_samples,
+        dtype=runtime.dtype,
+        adaptive=adaptive,
+    )
+    limit = _complete_graph_memory_limit_bytes(runtime, memory_limit_bytes=memory_limit_bytes)
+    if limit is None or estimate <= limit:
+        return
+    graph_kind = "adaptive" if adaptive else "uniform"
+    edge_count = int(num_nodes) * max(int(num_nodes) - 1, 0) // 2
+    raise MemoryError(
+        f"Estimated complete {graph_kind} tensor graph allocation for "
+        f"{int(num_nodes)} nodes ({edge_count} edges) is {estimate} bytes, "
+        f"exceeding the configured limit of {int(limit)} bytes. "
+        "Use a smaller graph, provide a sparse graph, or raise "
+        f"{COMPLETE_GRAPH_MEMORY_LIMIT_ENV}."
+    )
 
 
 def _tensor_graph_from_edges(
@@ -63,7 +170,16 @@ def tensorize_graph(
 def build_complete_uniform_tensor_graph(
     num_nodes: int,
     runtime: TorchRuntime,
+    *,
+    memory_limit_bytes: int | None = None,
 ) -> TensorFusionGraph:
+    _check_complete_tensor_graph_memory(
+        num_nodes=int(num_nodes),
+        num_samples=1,
+        runtime=runtime,
+        adaptive=False,
+        memory_limit_bytes=memory_limit_bytes,
+    )
     edge_index = torch.triu_indices(
         int(num_nodes),
         int(num_nodes),
@@ -93,6 +209,7 @@ def build_complete_adaptive_tensor_graph(
     gamma: float = 1.0,
     tau: float = 1e-6,
     baseline: float = 1.0,
+    memory_limit_bytes: int | None = None,
 ) -> TensorFusionGraph:
     if pilot_phi.ndim != 2:
         raise ValueError("pilot_phi must be a two-dimensional mutation-by-region matrix.")
@@ -105,6 +222,13 @@ def build_complete_adaptive_tensor_graph(
 
     pilot = pilot_phi.to(dtype=runtime.dtype, device=runtime.device)
     num_nodes = int(pilot.shape[0])
+    _check_complete_tensor_graph_memory(
+        num_nodes=num_nodes,
+        num_samples=int(pilot.shape[1]),
+        runtime=runtime,
+        adaptive=True,
+        memory_limit_bytes=memory_limit_bytes,
+    )
     edge_index = torch.triu_indices(
         num_nodes,
         num_nodes,
