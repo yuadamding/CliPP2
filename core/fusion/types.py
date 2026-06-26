@@ -149,6 +149,7 @@ class SolverContext:
     lower: torch.Tensor
     upper: torch.Tensor
     runtime: TorchRuntime
+    data_fingerprint: str
 
 
 @dataclass(slots=True)

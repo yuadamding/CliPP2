@@ -35,6 +35,15 @@ DEFAULT_BOX_PHI_ATOL = 1e-8
 DEFAULT_BOX_MAX_ITER = 32
 
 
+def validate_lambda_value(lambda_value: float) -> float:
+    value = float(lambda_value)
+    if not np.isfinite(value):
+        raise ValueError("lambda_value must be finite.")
+    if value < 0.0:
+        raise ValueError("lambda_value must be nonnegative.")
+    return value
+
+
 def _box_qp_sweeps_for_atol(
     phi_atol: float = DEFAULT_BOX_PHI_ATOL,
     *,
@@ -318,6 +327,7 @@ def pairwise_penalty_torch(
     edge_w: torch.Tensor,
     lambda_value: float,
 ) -> torch.Tensor:
+    lambda_value = validate_lambda_value(lambda_value)
     if lambda_value <= 0.0 or edge_u.numel() == 0:
         return torch.zeros((), dtype=phi.dtype, device=phi.device)
     diffs = graph_forward_edges(phi, edge_u=edge_u, edge_v=edge_v)
@@ -409,6 +419,7 @@ def graph_fusion_kkt_residual_from_grad_torch(
     lambda_value: float,
     atol: float,
 ) -> dict[str, float]:
+    lambda_value = validate_lambda_value(lambda_value)
     if dual_kkt is None or tuple(dual_kkt.shape) != (int(edge_u.numel()), int(phi.shape[1])):
         dual = torch.zeros((int(edge_u.numel()), int(phi.shape[1])), dtype=phi.dtype, device=phi.device)
     else:
@@ -437,6 +448,11 @@ def graph_fusion_kkt_residual_from_grad_torch(
     diagnostic_lower_active = lower_active & ~upper_active & ~frozen
     box_violation = torch.maximum(torch.clamp(lower - phi, min=0.0), torch.clamp(phi - upper, min=0.0))
     box_primal_violation = float(torch.max(box_violation).item()) if box_violation.numel() else 0.0
+    box_scale = 1.0 + max(
+        float(torch.max(torch.abs(lower)).item()) if lower.numel() else 0.0,
+        float(torch.max(torch.abs(upper)).item()) if upper.numel() else 0.0,
+    )
+    box_residual = box_primal_violation / max(box_scale, 1e-300)
 
     if edge_u.numel() == 0 or lambda_value <= 0.0:
         edge_subgradient_residual = 0.0
@@ -474,8 +490,13 @@ def graph_fusion_kkt_residual_from_grad_torch(
         "num_lower_active_coordinates": int(torch.sum(diagnostic_lower_active).item()),
         "num_upper_active_coordinates": int(torch.sum(diagnostic_upper_active).item()),
         "num_frozen_coordinates": int(torch.sum(frozen).item()),
-        "box_residual": stationarity_residual,
-        "kkt_residual": max(stationarity_residual, edge_subgradient_residual),
+        "box_residual": float(box_residual),
+        "kkt_residual": max(
+            stationarity_residual,
+            edge_subgradient_residual,
+            dual_ball_residual,
+            float(box_residual),
+        ),
     }
 
 
@@ -493,6 +514,7 @@ def refine_graph_fusion_dual_certificate_torch(
     atol: float,
     max_iter: int = 96,
 ) -> dict[str, object]:
+    lambda_value = validate_lambda_value(lambda_value)
     before_diag = graph_fusion_kkt_residual_from_grad_torch(
         phi=phi,
         grad_smooth=grad_smooth,
@@ -628,6 +650,7 @@ def inner_kkt_residual_torch(
     edge_w: torch.Tensor,
     atol: float,
 ) -> float:
+    lambda_value = validate_lambda_value(lambda_value)
     diag = graph_fusion_kkt_residual_from_grad_torch(
         phi=phi,
         grad_smooth=h * (phi - U),
@@ -662,6 +685,7 @@ def solve_majorized_subproblem_pdhg_torch(
     dual_start: torch.Tensor | None,
     kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
+    lambda_value = validate_lambda_value(lambda_value)
     phi = torch.minimum(torch.maximum(phi_start.to(dtype=runtime.dtype, device=runtime.device), lower), upper)
     if lambda_value <= 0.0 or edge_u.numel() == 0:
         projected = torch.minimum(torch.maximum(U, lower), upper)
@@ -797,6 +821,7 @@ def solve_majorized_subproblem_alm_torch(
     box_phi_atol: float = DEFAULT_BOX_PHI_ATOL,
     box_max_iter: int = DEFAULT_BOX_MAX_ITER,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
+    lambda_value = validate_lambda_value(lambda_value)
     phi = torch.minimum(torch.maximum(phi_start.to(dtype=runtime.dtype, device=runtime.device), lower), upper)
     if lambda_value <= 0.0 or edge_u.numel() == 0:
         projected = torch.minimum(torch.maximum(U, lower), upper)

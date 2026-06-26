@@ -74,6 +74,13 @@ def _scaled_sum(sign_left: float, logabs_left: float, sign_right: float, logabs_
     return float(sign_left * np.exp(float(logabs_left) - anchor) + sign_right * np.exp(float(logabs_right) - anchor))
 
 
+def _major_prior_logs_numpy(major_prior: float) -> tuple[float, float]:
+    prior = float(major_prior)
+    if not np.isfinite(prior) or not (0.0 < prior < 1.0):
+        raise ValueError("major_prior must lie strictly in (0, 1).")
+    return float(np.log1p(-prior)), float(np.log(prior))
+
+
 def _ambiguous_middle_stationarity(
     beta: float,
     *,
@@ -98,15 +105,16 @@ def _ambiguous_middle_stationarity(
     sign_plus = float(np.sign(delta_plus))
     if sign_minus == 0.0 and sign_plus == 0.0:
         return 0.0
+    log_prior_minor, log_prior_major = _major_prior_logs_numpy(major_prior)
 
     logabs_minus = (
-        np.log(max(1.0 - float(major_prior), tiny))
+        log_prior_minor
         + alt * np.log(max(float(b_minus), tiny))
         + (nonalt - 1.0) * np.log(base_minus)
         + (np.log(max(abs(delta_minus), tiny)) if sign_minus != 0.0 else -np.inf)
     )
     logabs_plus = (
-        np.log(max(float(major_prior), tiny))
+        log_prior_major
         + alt * np.log(max(float(b_plus), tiny))
         + (nonalt - 1.0) * np.log(base_plus)
         + (np.log(max(abs(delta_plus), tiny)) if sign_plus != 0.0 else -np.inf)
@@ -547,10 +555,11 @@ def _cell_loss_grid_numpy(
         prob = np.clip(beta * float(b_fixed), eps, 1.0 - eps)
         return -(alt * np.log(prob) + nonalt * np.log1p(-prob))
 
+    log_prior_minor, log_prior_major = _major_prior_logs_numpy(major_prior)
     prob_minus = np.clip(beta * float(b_minus), eps, 1.0 - eps)
     prob_plus = np.clip(beta * float(b_plus), eps, 1.0 - eps)
-    log_minor = alt * np.log(prob_minus) + nonalt * np.log1p(-prob_minus) + float(np.log(max(1.0 - major_prior, eps)))
-    log_major = alt * np.log(prob_plus) + nonalt * np.log1p(-prob_plus) + float(np.log(max(major_prior, eps)))
+    log_minor = alt * np.log(prob_minus) + nonalt * np.log1p(-prob_minus) + log_prior_minor
+    log_major = alt * np.log(prob_plus) + nonalt * np.log1p(-prob_plus) + log_prior_major
     return -np.logaddexp(log_minor, log_major)
 
 
@@ -570,17 +579,18 @@ def _ambiguous_cell_loss_matrix_numpy(
     nonalt_col = total_col - alt_col
     b_minus_col = np.asarray(b_minus, dtype=np.float64)[:, None]
     b_plus_col = np.asarray(b_plus, dtype=np.float64)[:, None]
+    log_prior_minor, log_prior_major = _major_prior_logs_numpy(major_prior)
     prob_minus = np.clip(beta * b_minus_col, eps, 1.0 - eps)
     prob_plus = np.clip(beta * b_plus_col, eps, 1.0 - eps)
     log_minor = (
         alt_col * np.log(prob_minus)
         + nonalt_col * np.log1p(-prob_minus)
-        + float(np.log(max(1.0 - major_prior, eps)))
+        + log_prior_minor
     )
     log_major = (
         alt_col * np.log(prob_plus)
         + nonalt_col * np.log1p(-prob_plus)
-        + float(np.log(max(major_prior, eps)))
+        + log_prior_major
     )
     return -np.logaddexp(log_minor, log_major)
 
@@ -870,8 +880,9 @@ def _cell_grad_numpy(
     grad_minus = slope_minus * (alt / prob_minus - nonalt / (1.0 - prob_minus))
     grad_plus = slope_plus * (alt / prob_plus - nonalt / (1.0 - prob_plus))
 
-    log_minor = alt * np.log(prob_minus) + nonalt * np.log1p(-prob_minus) + float(np.log(max(1.0 - major_prior, eps)))
-    log_major = alt * np.log(prob_plus) + nonalt * np.log1p(-prob_plus) + float(np.log(max(major_prior, eps)))
+    log_prior_minor, log_prior_major = _major_prior_logs_numpy(major_prior)
+    log_minor = alt * np.log(prob_minus) + nonalt * np.log1p(-prob_minus) + log_prior_minor
+    log_major = alt * np.log(prob_plus) + nonalt * np.log1p(-prob_plus) + log_prior_major
     gamma = np.exp(log_major - np.logaddexp(log_minor, log_major))
     return -((1.0 - gamma) * grad_minus + gamma * grad_plus)
 
@@ -1686,24 +1697,20 @@ def compute_scalar_well_start_bank(
         starts.append(sample_start)
 
     unique: list[np.ndarray] = []
-    seen: set[bytes] = set()
     for start in starts:
-        signature = np.round(np.asarray(start), decimals=8).astype(np.float32, copy=False).tobytes()
-        if signature in seen:
+        start_array = np.asarray(start, dtype=np.float64)
+        if any(np.allclose(start_array, retained, rtol=0.0, atol=1e-8) for retained in unique):
             continue
-        seen.add(signature)
-        unique.append(start.astype(np.float64, copy=False))
+        unique.append(start_array.astype(np.float64, copy=False))
     return unique
 
 
 def _deduplicate_tensor_starts(starts: list[torch.Tensor]) -> tuple[torch.Tensor, ...]:
     unique: list[torch.Tensor] = []
-    seen: set[bytes] = set()
     for start in starts:
-        signature = np.round(start.detach().cpu().numpy(), decimals=8).astype(np.float32, copy=False).tobytes()
-        if signature in seen:
+        candidate = start.detach()
+        if any(torch.allclose(candidate, retained, rtol=0.0, atol=1e-8) for retained in unique):
             continue
-        seen.add(signature)
         unique.append(start)
     return tuple(unique)
 

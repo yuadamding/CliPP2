@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 import torch
 
@@ -27,6 +29,7 @@ from .torch_backend import (
     solve_majorized_subproblem_alm_torch,
     solve_majorized_subproblem_pdhg_torch,
     to_torch_tumor_data,
+    validate_lambda_value,
 )
 from .types import FusionFitArtifacts, PairwiseFusionGraph, SolverContext, TensorFusionGraph, TensorProblem
 
@@ -122,18 +125,23 @@ def _cluster_summary_from_labels(
     return centers.astype(phi.dtype, copy=False), phi_clustered.astype(phi.dtype, copy=False)
 
 
-def _deduplicate_starts(starts: list[np.ndarray | torch.Tensor]) -> list[np.ndarray | torch.Tensor]:
+def _deduplicate_starts(
+    starts: list[np.ndarray | torch.Tensor],
+    *,
+    runtime,
+    atol: float = 1e-8,
+) -> list[np.ndarray | torch.Tensor]:
     unique: list[np.ndarray | torch.Tensor] = []
-    seen: set[bytes] = set()
+    unique_tensors: list[torch.Tensor] = []
     for start in starts:
-        if torch.is_tensor(start):
-            start_arr = start.detach().cpu().numpy()
-        else:
-            start_arr = np.asarray(start)
-        signature = np.round(start_arr, decimals=8).astype(np.float32, copy=False).tobytes()
-        if signature in seen:
+        start_tensor = _tensor_from_start(start, runtime).detach()
+        duplicate = any(
+            torch.allclose(start_tensor, retained, rtol=0.0, atol=float(atol))
+            for retained in unique_tensors
+        )
+        if duplicate:
             continue
-        seen.add(signature)
+        unique_tensors.append(start_tensor)
         unique.append(start)
     return unique
 
@@ -172,6 +180,48 @@ def _validate_solver_tolerance(tol: float) -> float:
     if not np.isfinite(value) or value <= 0.0:
         raise ValueError("Solver tolerance must be a positive finite value.")
     return value
+
+
+def _data_fingerprint(data: TumorData) -> str:
+    digest = hashlib.sha256()
+
+    def update_text(value: str) -> None:
+        encoded = str(value).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+
+    def update_text_sequence(values: list[str]) -> None:
+        digest.update(len(values).to_bytes(8, "little"))
+        for value in values:
+            update_text(value)
+
+    def update_array(name: str, values: np.ndarray) -> None:
+        update_text(name)
+        array = np.ascontiguousarray(np.asarray(values))
+        update_text(str(array.dtype))
+        digest.update(len(array.shape).to_bytes(8, "little"))
+        for dimension in array.shape:
+            digest.update(int(dimension).to_bytes(8, "little", signed=True))
+        digest.update(array.tobytes())
+
+    update_text(data.tumor_id)
+    update_text_sequence(list(data.mutation_ids))
+    update_text_sequence(list(data.region_ids))
+    for name in (
+        "alt_counts",
+        "total_counts",
+        "purity",
+        "major_cn",
+        "minor_cn",
+        "normal_cn",
+        "has_cna",
+        "scaling",
+        "phi_upper",
+        "phi_init",
+        "init_major_mask",
+    ):
+        update_array(name, getattr(data, name))
+    return digest.hexdigest()
 
 
 def _tensor_from_start(
@@ -243,6 +293,7 @@ def prepare_torch_problem(
     torch_data: TorchTumorData | None = None,
 ) -> SolverContext:
     tol = _validate_solver_tolerance(tol)
+    data_fingerprint = _data_fingerprint(data)
     effective_runtime = resolve_runtime(device, dtype=dtype) if runtime is None else runtime
     effective_torch_data = to_torch_tumor_data(data, effective_runtime) if torch_data is None else torch_data
 
@@ -333,6 +384,7 @@ def prepare_torch_problem(
         lower=lower,
         upper=upper,
         runtime=effective_runtime,
+        data_fingerprint=data_fingerprint,
     )
 
 
@@ -925,6 +977,8 @@ def fit_observed_data_pairwise_fusion(
     verbose: bool = False,
 ) -> FusionFitArtifacts:
     tol = _validate_solver_tolerance(tol)
+    lambda_value = validate_lambda_value(lambda_value)
+    expected_data_fingerprint = _data_fingerprint(data)
     if solver_context is None:
         solver_context = prepare_torch_problem(
             data,
@@ -944,11 +998,14 @@ def fit_observed_data_pairwise_fusion(
             runtime=runtime,
             torch_data=torch_data,
         )
-    elif (
-        abs(float(solver_context.problem.major_prior) - float(major_prior)) > 0.0
-        or abs(float(solver_context.problem.eps) - float(eps)) > 0.0
-    ):
-        raise ValueError("SolverContext major_prior/eps do not match the requested fit options.")
+    else:
+        if getattr(solver_context, "data_fingerprint", None) != expected_data_fingerprint:
+            raise ValueError("SolverContext data fingerprint does not match the requested TumorData.")
+        if (
+            abs(float(solver_context.problem.major_prior) - float(major_prior)) > 0.0
+            or abs(float(solver_context.problem.eps) - float(eps)) > 0.0
+        ):
+            raise ValueError("SolverContext major_prior/eps do not match the requested fit options.")
 
     effective_runtime = solver_context.runtime
     effective_torch_data = torch_data_from_context(solver_context)
@@ -973,7 +1030,7 @@ def fit_observed_data_pairwise_fusion(
             start_bank.extend(solver_context.scalar_well_starts)
     elif phi_start is None:
         start_bank.append(solver_context.exact_pilot)
-    start_bank = _deduplicate_starts(start_bank)
+    start_bank = _deduplicate_starts(start_bank, runtime=effective_runtime)
 
     best_artifacts: FusionFitArtifacts | None = None
     for start in start_bank:
