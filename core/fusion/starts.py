@@ -645,6 +645,208 @@ def _select_secondary_lexicographic_rows(
     return secondary
 
 
+def _scatter_min_by_row_block(
+    values: torch.Tensor,
+    *,
+    valid: torch.Tensor,
+    block_id: torch.Tensor,
+) -> torch.Tensor:
+    num_rows, num_cols = values.shape
+    row_index = torch.arange(num_rows, dtype=torch.long, device=values.device)[:, None]
+    safe_block = torch.clamp(block_id, min=0)
+    flat_index = (row_index * num_cols + safe_block).reshape(-1)
+    flat_valid = valid.reshape(-1)
+    output = torch.full((num_rows * num_cols,), float("inf"), dtype=values.dtype, device=values.device)
+    if flat_valid.numel() == 0:
+        return output.reshape(num_rows, num_cols)
+    output.scatter_reduce_(
+        0,
+        flat_index[flat_valid],
+        values.reshape(-1)[flat_valid],
+        reduce="amin",
+        include_self=True,
+    )
+    return output.reshape(num_rows, num_cols)
+
+
+def _select_lexicographic_rows_torch(
+    beta: torch.Tensor,
+    loss: torch.Tensor,
+    valid: torch.Tensor,
+    tie_value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    inf = torch.full_like(loss, float("inf"))
+    masked_loss = torch.where(valid, loss, inf)
+    best_loss = torch.min(masked_loss, dim=1).values
+    near_best = valid & (loss == best_loss[:, None])
+    best_tie = torch.min(torch.where(near_best, tie_value, inf), dim=1).values
+    near_best_tie = near_best & (tie_value == best_tie[:, None])
+    best_index = torch.argmax(near_best_tie.to(torch.long), dim=1)
+    best_beta = torch.gather(beta, 1, best_index[:, None]).squeeze(1)
+    best_beta = torch.where(torch.isfinite(best_loss), best_beta, torch.full_like(best_beta, float("nan")))
+    return best_beta, best_loss
+
+
+def _select_secondary_lexicographic_rows_torch(
+    beta: torch.Tensor,
+    loss: torch.Tensor,
+    valid: torch.Tensor,
+    tie_value: torch.Tensor,
+    *,
+    primary: torch.Tensor,
+    beta_tol: torch.Tensor,
+) -> torch.Tensor:
+    inf = torch.full_like(loss, float("inf"))
+    far_from_primary = torch.abs(beta - primary[:, None]) > beta_tol[:, None]
+    eligible = valid & far_from_primary
+    masked_loss = torch.where(eligible, loss, inf)
+    best_loss = torch.min(masked_loss, dim=1).values
+    near_best = eligible & (loss == best_loss[:, None])
+    best_tie = torch.min(torch.where(near_best, tie_value, inf), dim=1).values
+    near_best_tie = near_best & (tie_value == best_tie[:, None])
+    best_index = torch.argmax(near_best_tie.to(torch.long), dim=1)
+    secondary = torch.gather(beta, 1, best_index[:, None]).squeeze(1)
+    return torch.where(torch.isfinite(best_loss), secondary, torch.full_like(secondary, float("nan")))
+
+
+def _ambiguous_best_two_from_candidate_grid_torch(
+    candidate_grid: torch.Tensor,
+    *,
+    alt: torch.Tensor,
+    total: torch.Tensor,
+    b_minus: torch.Tensor,
+    b_plus: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    hint: torch.Tensor,
+    major_prior: float,
+    eps: float,
+    tol: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    candidates = torch.round(candidate_grid.to(dtype=alt.dtype, device=alt.device), decimals=12)
+    lower = lower.to(dtype=alt.dtype, device=alt.device)
+    upper = upper.to(dtype=alt.dtype, device=alt.device)
+    hint = hint.to(dtype=alt.dtype, device=alt.device)
+    valid = torch.isfinite(candidates) & (candidates >= lower[:, None] - 1e-12) & (candidates <= upper[:, None] + 1e-12)
+    candidates = torch.minimum(torch.maximum(candidates, lower[:, None]), upper[:, None])
+
+    sorted_beta = torch.sort(torch.where(valid, candidates, torch.full_like(candidates, float("inf"))), dim=1).values
+    sorted_valid = torch.isfinite(sorted_beta)
+    previous_beta = torch.cat(
+        [torch.full((sorted_beta.shape[0], 1), float("nan"), dtype=sorted_beta.dtype, device=sorted_beta.device), sorted_beta[:, :-1]],
+        dim=1,
+    )
+    column_index = torch.arange(sorted_beta.shape[1], dtype=torch.long, device=sorted_beta.device)[None, :]
+    unique = sorted_valid & ((column_index == 0) | (sorted_beta != previous_beta))
+    beta = torch.sort(torch.where(unique, sorted_beta, torch.full_like(sorted_beta, float("inf"))), dim=1).values
+    valid = torch.isfinite(beta)
+    empty_rows = ~torch.any(valid, dim=1)
+    if beta.shape[1] > 0:
+        fallback = torch.minimum(torch.maximum(hint, lower), upper)
+        beta[:, 0] = torch.where(empty_rows, fallback, beta[:, 0])
+        valid[:, 0] = valid[:, 0] | empty_rows
+
+    loss = cell_loss_grid_torch(
+        beta,
+        alt=alt[:, None],
+        total=total[:, None],
+        b_minus=b_minus[:, None],
+        b_plus=b_plus[:, None],
+        b_fixed=b_plus[:, None],
+        ambiguous=torch.ones_like(beta, dtype=torch.bool),
+        major_prior=major_prior,
+        eps=eps,
+    )
+    loss = torch.where(valid, loss, torch.full_like(loss, float("inf")))
+    loss_tol = max(float(tol) * 10.0, 1e-10)
+
+    previous_valid = torch.cat(
+        [torch.zeros((valid.shape[0], 1), dtype=torch.bool, device=valid.device), valid[:, :-1]],
+        dim=1,
+    )
+    previous_loss = torch.cat(
+        [torch.full((loss.shape[0], 1), float("inf"), dtype=loss.dtype, device=loss.device), loss[:, :-1]],
+        dim=1,
+    )
+    loss_delta = torch.where(valid & previous_valid, torch.abs(loss - previous_loss), torch.full_like(loss, float("inf")))
+    block_start = valid & (~previous_valid | (loss_delta > loss_tol))
+    block_id = torch.cumsum(block_start.to(torch.long), dim=1) - 1
+    block_id = torch.where(valid, block_id, torch.full_like(block_id, -1))
+
+    block_loss = _scatter_min_by_row_block(loss, valid=valid, block_id=block_id)
+    left_block_loss = torch.cat(
+        [torch.full((block_loss.shape[0], 1), float("inf"), dtype=block_loss.dtype, device=block_loss.device), block_loss[:, :-1]],
+        dim=1,
+    )
+    right_block_loss = torch.cat(
+        [block_loss[:, 1:], torch.full((block_loss.shape[0], 1), float("inf"), dtype=block_loss.dtype, device=block_loss.device)],
+        dim=1,
+    )
+    local_block = (
+        torch.isfinite(block_loss)
+        & (block_loss <= left_block_loss + loss_tol)
+        & (block_loss <= right_block_loss + loss_tol)
+    )
+
+    distance_to_hint = torch.where(valid, torch.abs(beta - hint[:, None]), torch.full_like(beta, float("inf")))
+    representative_distance = _scatter_min_by_row_block(distance_to_hint, valid=valid, block_id=block_id)
+    safe_block = torch.clamp(block_id, min=0)
+    distance_at_block = torch.gather(representative_distance, 1, safe_block)
+    representative_candidate = valid & torch.isfinite(distance_to_hint) & (distance_to_hint == distance_at_block)
+
+    num_rows, num_cols = beta.shape
+    row_index = torch.arange(num_rows, dtype=torch.long, device=beta.device)[:, None]
+    flat_index = (row_index * num_cols + safe_block).reshape(-1)
+    col_index = torch.arange(num_cols, dtype=torch.long, device=beta.device)[None, :].expand(num_rows, -1)
+    selected_col = torch.full((num_rows * num_cols,), num_cols, dtype=torch.long, device=beta.device)
+    flat_candidate = representative_candidate.reshape(-1)
+    selected_col.scatter_reduce_(
+        0,
+        flat_index[flat_candidate],
+        col_index.reshape(-1)[flat_candidate],
+        reduce="amin",
+        include_self=True,
+    )
+    selected_col = selected_col.reshape(num_rows, num_cols)
+    gathered_beta = torch.gather(beta, 1, torch.clamp(selected_col, max=max(num_cols - 1, 0)))
+    local_beta = torch.where(selected_col < num_cols, gathered_beta, torch.full_like(beta, float("nan")))
+
+    local_loss = torch.where(local_block, block_loss, torch.full_like(block_loss, float("inf")))
+    local_valid = torch.isfinite(local_loss) & torch.isfinite(local_beta)
+    local_tie = torch.where(local_valid, torch.abs(local_beta - hint[:, None]), torch.full_like(local_loss, float("inf")))
+    has_local = torch.any(local_valid, dim=1)
+
+    local_primary, local_primary_loss = _select_lexicographic_rows_torch(local_beta, local_loss, local_valid, local_tie)
+    fallback_primary, fallback_loss = _select_lexicographic_rows_torch(beta, loss, valid, beta)
+    primary = torch.where(has_local, local_primary, fallback_primary)
+    primary_loss = torch.where(has_local, local_primary_loss, fallback_loss)
+    del primary_loss
+
+    secondary_beta_tol = torch.maximum(
+        torch.full_like(primary, loss_tol),
+        1e-8 * torch.maximum(torch.ones_like(primary), torch.abs(primary)),
+    )
+    local_secondary = _select_secondary_lexicographic_rows_torch(
+        local_beta,
+        local_loss,
+        local_valid,
+        local_tie,
+        primary=primary,
+        beta_tol=secondary_beta_tol,
+    )
+    fallback_secondary = _select_secondary_lexicographic_rows_torch(
+        beta,
+        loss,
+        valid,
+        beta,
+        primary=primary,
+        beta_tol=secondary_beta_tol,
+    )
+    secondary = torch.where(has_local, local_secondary, fallback_secondary)
+    valid_secondary = torch.isfinite(secondary) & (torch.abs(secondary - primary) > max(float(tol) * 10.0, 1e-8))
+    return primary, secondary, valid_secondary
+
+
 def _ambiguous_best_two_from_candidate_grid_numpy(
     candidate_grid: np.ndarray,
     *,
@@ -1463,24 +1665,17 @@ def compute_scalar_cell_wells_torch(
             eps=eps,
             tol=tol,
             max_iter=max_iter,
-        ).detach().cpu().numpy()
+        )
 
-        alt_np = alt.detach().cpu().numpy()
-        total_np = total.detach().cpu().numpy()
-        b_minus_np = b_minus.detach().cpu().numpy()
-        b_plus_np = b_plus.detach().cpu().numpy()
-        lower_np = lower_flat.detach().cpu().numpy()
-        upper_np = upper_flat.detach().cpu().numpy()
-        hint_np = hint_flat.detach().cpu().numpy()
-        primary_np, secondary_np, valid_np = _ambiguous_best_two_from_candidate_grid_numpy(
+        primary, alternate, valid_alternate = _ambiguous_best_two_from_candidate_grid_torch(
             candidate_grid,
-            alt=alt_np,
-            total=total_np,
-            b_minus=b_minus_np,
-            b_plus=b_plus_np,
-            lower=lower_np,
-            upper=upper_np,
-            hint=hint_np,
+            alt=alt,
+            total=total,
+            b_minus=b_minus,
+            b_plus=b_plus,
+            lower=lower_flat,
+            upper=upper_flat,
+            hint=hint_flat,
             major_prior=major_prior,
             eps=eps,
             tol=tol,
@@ -1489,9 +1684,9 @@ def compute_scalar_cell_wells_torch(
         refined_flat = refined.reshape(-1)
         secondary_flat = secondary.reshape(-1)
         valid_secondary_flat = valid_secondary.reshape(-1)
-        refined_flat[flat_mask] = torch.as_tensor(primary_np, dtype=dtype, device=device)
-        secondary_flat[flat_mask] = torch.as_tensor(secondary_np, dtype=dtype, device=device)
-        valid_secondary_flat[flat_mask] = torch.as_tensor(valid_np, dtype=torch.bool, device=device)
+        refined_flat[flat_mask] = primary
+        secondary_flat[flat_mask] = alternate
+        valid_secondary_flat[flat_mask] = valid_alternate
 
     return (
         torch.minimum(torch.maximum(refined, lower), upper),
