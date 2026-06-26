@@ -42,7 +42,12 @@ def _add_shared_fit_args(
         default="cuda",
         help="Execution device for the Torch fusion backend. CUDA is the default and falls back to CPU when unavailable.",
     )
-    parser.add_argument("--dtype", choices=["auto", "float32", "float64"], default="float64", help="Torch runtime dtype.")
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "float16", "float32", "float64"],
+        default="float64",
+        help="Torch runtime dtype. Float16 requires CUDA.",
+    )
     parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
     parser.add_argument(
         "--write-patient-outputs",

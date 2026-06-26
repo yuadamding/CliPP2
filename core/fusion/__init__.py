@@ -14,6 +14,7 @@ from .graph_ops import (
     tensorize_graph,
 )
 from .solver import (
+    cluster_diameters_from_edges,
     cluster_labels_from_edges,
     fit_observed_data_pairwise_fusion,
     fit_torch,
@@ -61,6 +62,7 @@ __all__ = [
     "build_complete_adaptive_tensor_graph",
     "build_complete_uniform_graph",
     "build_complete_uniform_tensor_graph",
+    "cluster_diameters_from_edges",
     "cluster_labels_from_edges",
     "graph_adjoint",
     "graph_forward",

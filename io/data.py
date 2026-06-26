@@ -12,17 +12,18 @@ class TumorData:
     tumor_id: str
     mutation_ids: list[str]
     region_ids: list[str]
-    alt_counts: np.ndarray
-    total_counts: np.ndarray
-    purity: np.ndarray
-    major_cn: np.ndarray
-    minor_cn: np.ndarray
-    normal_cn: np.ndarray
-    has_cna: np.ndarray
-    scaling: np.ndarray
-    phi_upper: np.ndarray
-    phi_init: np.ndarray
-    init_major_mask: np.ndarray
+    alt_counts: np.ndarray      # float64 (M, S)
+    total_counts: np.ndarray    # float64 (M, S)
+    purity: np.ndarray          # float64 (M, S)
+    major_cn: np.ndarray        # float64 (M, S)
+    minor_cn: np.ndarray        # float64 (M, S)
+    normal_cn: np.ndarray       # float64 (M, S)
+    has_cna: np.ndarray         # bool (M, S)
+    scaling: np.ndarray         # float64 (M, S)
+    phi_upper: np.ndarray       # float64 (M, S)
+    phi_init: np.ndarray        # float64 (M, S)
+    init_major_mask: np.ndarray # bool (M, S)
+    count_observed: np.ndarray | None = None  # bool (M, S) — True if counts observed; None means all observed
 
     @property
     def num_mutations(self) -> int:
@@ -61,7 +62,7 @@ class TumorData:
     @property
     def fixed_multiplicity(self) -> np.ndarray:
         # Outside CNA-ambiguous entries, keep multiplicity fixed at the available major-copy value.
-        return self.major_cn.astype(np.float32, copy=True)
+        return self.major_cn.astype(np.float64, copy=True)
 
 PatientData = TumorData
 
@@ -105,12 +106,12 @@ def compute_phi_init_from_counts(
     phi_upper: np.ndarray,
     eps: float = 1e-6,
 ) -> tuple[np.ndarray, np.ndarray]:
-    alt_counts = np.asarray(alt_counts, dtype=np.float32)
-    total_counts = np.asarray(total_counts, dtype=np.float32)
-    scaling = np.asarray(scaling, dtype=np.float32)
-    major_cn = np.asarray(major_cn, dtype=np.float32)
-    minor_cn = np.asarray(minor_cn, dtype=np.float32)
-    phi_upper = np.asarray(phi_upper, dtype=np.float32)
+    alt_counts = np.asarray(alt_counts, dtype=np.float64)
+    total_counts = np.asarray(total_counts, dtype=np.float64)
+    scaling = np.asarray(scaling, dtype=np.float64)
+    major_cn = np.asarray(major_cn, dtype=np.float64)
+    minor_cn = np.asarray(minor_cn, dtype=np.float64)
+    phi_upper = np.asarray(phi_upper, dtype=np.float64)
 
     smoothed_vaf = (alt_counts + 0.5) / (total_counts + 1.0)
 
@@ -137,9 +138,56 @@ def compute_phi_init_from_counts(
     loglik_minor = alt_counts * np.log(p_minor) + (total_counts - alt_counts) * np.log1p(-p_minor)
 
     init_major_mask = loglik_major >= loglik_minor
-    phi_init = np.where(init_major_mask, phi_major, phi_minor).astype(np.float32)
+    phi_init = np.where(init_major_mask, phi_major, phi_minor)
     phi_init = np.clip(phi_init, eps, phi_upper)
-    return phi_init.astype(np.float32), init_major_mask.astype(bool)
+    return phi_init.astype(np.float64), init_major_mask.astype(bool)
+
+
+def _validate_inputs_strict(
+    *,
+    file_path: Path,
+    alt_counts: np.ndarray,
+    total_counts: np.ndarray,
+    purity: np.ndarray,
+    major_cn: np.ndarray,
+    minor_cn: np.ndarray,
+    normal_cn: np.ndarray,
+) -> None:
+    errors: list[str] = []
+    for name, matrix in [
+        ("alt_counts", alt_counts), ("total_counts", total_counts),
+        ("purity", purity), ("major_cn", major_cn),
+        ("minor_cn", minor_cn), ("normal_cn", normal_cn),
+    ]:
+        if not np.all(np.isfinite(matrix)):
+            errors.append(f"Non-finite values in '{name}'.")
+    if errors:
+        raise ValueError(f"Invalid input data in {file_path}: {'; '.join(errors)}")
+
+    if np.any(alt_counts < 0.0):
+        errors.append("Negative alt_counts found.")
+    if np.any(total_counts < 0.0):
+        errors.append("Negative total_counts found.")
+    if np.any(alt_counts > total_counts + 0.5):
+        errors.append("alt_counts > total_counts found.")
+    if np.any(np.abs(alt_counts - np.round(alt_counts)) > 1e-6):
+        errors.append("Non-integer alt_counts found.")
+    if np.any(np.abs(total_counts - np.round(total_counts)) > 1e-6):
+        errors.append("Non-integer total_counts found.")
+    if np.any(purity <= 0.0):
+        errors.append("Purity must be strictly positive (purity <= 0 found).")
+    if np.any(purity > 1.0 + 1e-9):
+        errors.append("Purity > 1 found.")
+    if np.any(major_cn < 0.0):
+        errors.append("Negative major_cn found.")
+    if np.any(minor_cn < 0.0):
+        errors.append("Negative minor_cn found.")
+    if np.any(major_cn < minor_cn - 1e-9):
+        errors.append("major_cn < minor_cn found (major must be >= minor).")
+    if np.any(normal_cn <= 0.0):
+        errors.append("Nonpositive normal_cn found.")
+    if errors:
+        raise ValueError(f"Invalid input data in {file_path}: {'; '.join(errors)}")
 
 
 def load_tumor_tsv(
@@ -147,6 +195,7 @@ def load_tumor_tsv(
     eps: float = 1e-6,
     *,
     missing_cna_policy: str = "error",
+    validation_mode: str = "strict",
 ) -> TumorData:
     file_path = Path(file_path)
     df = pd.read_csv(file_path, sep="\t").copy()
@@ -181,6 +230,10 @@ def load_tumor_tsv(
     if "normal_cn" not in df.columns:
         df["normal_cn"] = 2.0
 
+    normalized_validation_mode = str(validation_mode).strip().lower()
+    if normalized_validation_mode not in {"strict", "lenient"}:
+        raise ValueError("validation_mode must be 'strict' or 'lenient'.")
+
     df["mutation_id"] = df["mutation_id"].astype(str)
     df["sample_id"] = df["sample_id"].astype(str)
     pair_df = df.loc[:, ["mutation_id", "sample_id"]].copy()
@@ -197,34 +250,62 @@ def load_tumor_tsv(
 
     mutation_ids = _first_seen(df["mutation_id"])
     region_ids = _first_seen(df["sample_id"])
-    expected_pairs = {(mutation_id, region_id) for mutation_id in mutation_ids for region_id in region_ids}
-    observed_pairs = set(zip(df["mutation_id"], df["sample_id"]))
-    missing_pairs = expected_pairs.difference(observed_pairs)
-    if missing_pairs:
-        missing_examples = ", ".join(f"({mutation_id}, {region_id})" for mutation_id, region_id in list(sorted(missing_pairs))[:5])
-        raise ValueError(
-            f"Incomplete mutation-region matrix in {file_path}; missing {len(missing_pairs)} cell(s). "
-            f"Examples: {missing_examples}"
-        )
 
-    mut_index = {mutation_id: idx for idx, mutation_id in enumerate(mutation_ids)}
-    sample_index = {sample_id: idx for idx, sample_id in enumerate(region_ids)}
-
+    # Completeness check: number of rows must equal M * S after dedup
     num_mutations = len(mutation_ids)
     num_regions = len(region_ids)
+    if len(df) != num_mutations * num_regions:
+        mutation_codes_check = pd.Categorical(df["mutation_id"], categories=mutation_ids).codes
+        sample_codes_check = pd.Categorical(df["sample_id"], categories=region_ids).codes
+        observed_set = set(zip(mutation_codes_check.tolist(), sample_codes_check.tolist()))
+        expected_set = {(i, j) for i in range(num_mutations) for j in range(num_regions)}
+        missing_pairs_coded = sorted(expected_set.difference(observed_set))[:5]
+        missing_examples = ", ".join(
+            f"({mutation_ids[i]}, {region_ids[j]})" for i, j in missing_pairs_coded
+        )
+        raise ValueError(
+            f"Incomplete mutation-region matrix in {file_path}; "
+            f"expected {num_mutations * num_regions} rows, got {len(df)}. "
+            f"Missing examples: {missing_examples}"
+        )
 
-    alt_counts = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
-    total_counts = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
-    purity = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
-    major_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
-    minor_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
-    normal_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float32)
+    # Vectorized fill using categorical integer codes
+    mutation_codes = pd.Categorical(df["mutation_id"], categories=mutation_ids).codes.copy()
+    sample_codes = pd.Categorical(df["sample_id"], categories=region_ids).codes.copy()
+
+    alt_vals = df["alt_counts"].to_numpy(dtype=np.float64)
+    ref_vals = df["ref_counts"].to_numpy(dtype=np.float64)
+    purity_vals = df[purity_col].to_numpy(dtype=np.float64)
+    major_vals = df["major_cn"].to_numpy(dtype=np.float64)
+    minor_vals = df["minor_cn"].to_numpy(dtype=np.float64)
+    normal_vals = df["normal_cn"].to_numpy(dtype=np.float64)
+
+    alt_counts = np.full((num_mutations, num_regions), np.nan, dtype=np.float64)
+    total_counts = np.full((num_mutations, num_regions), np.nan, dtype=np.float64)
+    purity = np.full((num_mutations, num_regions), np.nan, dtype=np.float64)
+    major_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float64)
+    minor_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float64)
+    normal_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float64)
+
+    alt_counts[mutation_codes, sample_codes] = alt_vals
+    total_counts[mutation_codes, sample_codes] = alt_vals + ref_vals
+    purity[mutation_codes, sample_codes] = purity_vals
+    major_cn[mutation_codes, sample_codes] = major_vals
+    minor_cn[mutation_codes, sample_codes] = minor_vals
+    normal_cn[mutation_codes, sample_codes] = normal_vals
+
     has_explicit_cna_mask = "has_cna" in df.columns or "cna_observed" in df.columns
     normalized_missing_cna_policy = str(missing_cna_policy).strip().lower()
     if normalized_missing_cna_policy not in {"error", "all_true"}:
         raise ValueError("missing_cna_policy must be one of {'error', 'all_true'}.")
     if has_explicit_cna_mask:
         has_cna = np.zeros((num_mutations, num_regions), dtype=bool)
+        cna_col = "has_cna" if "has_cna" in df.columns else "cna_observed"
+        has_cna_vals = np.array(
+            [_parse_bool_like(v, column_name=cna_col) for v in df[cna_col]],
+            dtype=bool,
+        )
+        has_cna[mutation_codes, sample_codes] = has_cna_vals
     else:
         if normalized_missing_cna_policy == "error":
             raise ValueError(
@@ -233,21 +314,16 @@ def load_tumor_tsv(
             )
         has_cna = np.ones((num_mutations, num_regions), dtype=bool)
 
-    for row in df.itertuples(index=False):
-        i = mut_index[str(row.mutation_id)]
-        j = sample_index[str(row.sample_id)]
-        alt = float(row.alt_counts)
-        ref = float(row.ref_counts)
-        alt_counts[i, j] = alt
-        total_counts[i, j] = alt + ref
-        purity[i, j] = float(getattr(row, purity_col))
-        major_cn[i, j] = float(row.major_cn)
-        minor_cn[i, j] = float(row.minor_cn)
-        normal_cn[i, j] = float(row.normal_cn)
-        if "has_cna" in df.columns:
-            has_cna[i, j] = _parse_bool_like(getattr(row, "has_cna"), column_name="has_cna")
-        elif "cna_observed" in df.columns:
-            has_cna[i, j] = _parse_bool_like(getattr(row, "cna_observed"), column_name="cna_observed")
+    # count_observed mask
+    if "count_observed" in df.columns:
+        count_obs_vals = np.array(
+            [_parse_bool_like(v, column_name="count_observed") for v in df["count_observed"]],
+            dtype=bool,
+        )
+        count_observed = np.zeros((num_mutations, num_regions), dtype=bool)
+        count_observed[mutation_codes, sample_codes] = count_obs_vals
+    else:
+        count_observed = np.ones((num_mutations, num_regions), dtype=bool)
 
     for name, matrix in {
         "alt_counts": alt_counts,
@@ -257,17 +333,33 @@ def load_tumor_tsv(
         "minor_cn": minor_cn,
         "normal_cn": normal_cn,
     }.items():
-        if np.isnan(matrix).any():
-            raise ValueError(f"Incomplete numeric matrix '{name}' after loading {file_path}.")
+        if not np.all(np.isfinite(matrix)):
+            raise ValueError(f"Non-finite values in matrix '{name}' after loading {file_path}.")
 
-    purity = np.clip(purity, eps, 1.0 - eps)
+    if normalized_validation_mode == "strict":
+        _validate_inputs_strict(
+            file_path=file_path,
+            alt_counts=alt_counts,
+            total_counts=total_counts,
+            purity=purity,
+            major_cn=major_cn,
+            minor_cn=minor_cn,
+            normal_cn=normal_cn,
+        )
+
     total_cn = major_cn + minor_cn
     denom = purity * total_cn + (1.0 - purity) * normal_cn
-    scaling = purity / np.clip(denom, eps, None)
+    bad_denom = ~(denom > 0.0)
+    if bad_denom.any():
+        raise ValueError(
+            f"Non-positive copy-number denominator found in {file_path}. "
+            "This can occur when purity=1 and total_cn=0 simultaneously."
+        )
+    scaling = purity / denom
 
     max_prob_scale = np.maximum(scaling * major_cn, scaling * minor_cn)
-    phi_upper = np.minimum(1.0, (1.0 - eps) / np.clip(max_prob_scale, eps, None)).astype(np.float32)
-    phi_upper = np.clip(phi_upper, eps, 1.0).astype(np.float32)
+    phi_upper = np.minimum(1.0, (1.0 - eps) / np.clip(max_prob_scale, eps, None))
+    phi_upper = np.clip(phi_upper, eps, 1.0)
 
     phi_init, init_major_mask = compute_phi_init_from_counts(
         alt_counts=alt_counts,
@@ -283,17 +375,18 @@ def load_tumor_tsv(
         tumor_id=file_path.stem,
         mutation_ids=mutation_ids,
         region_ids=region_ids,
-        alt_counts=alt_counts,
-        total_counts=total_counts,
-        purity=purity.astype(np.float32),
-        major_cn=major_cn.astype(np.float32),
-        minor_cn=minor_cn.astype(np.float32),
-        normal_cn=normal_cn.astype(np.float32),
-        has_cna=has_cna.astype(bool),
-        scaling=scaling.astype(np.float32),
-        phi_upper=phi_upper.astype(np.float32),
-        phi_init=phi_init.astype(np.float32),
-        init_major_mask=init_major_mask.astype(bool),
+        alt_counts=alt_counts.astype(np.float64, copy=False),
+        total_counts=total_counts.astype(np.float64, copy=False),
+        purity=purity.astype(np.float64, copy=False),
+        major_cn=major_cn.astype(np.float64, copy=False),
+        minor_cn=minor_cn.astype(np.float64, copy=False),
+        normal_cn=normal_cn.astype(np.float64, copy=False),
+        has_cna=has_cna.astype(bool, copy=False),
+        scaling=scaling.astype(np.float64, copy=False),
+        phi_upper=phi_upper.astype(np.float64, copy=False),
+        phi_init=phi_init.astype(np.float64, copy=False),
+        init_major_mask=init_major_mask.astype(bool, copy=False),
+        count_observed=count_observed.astype(bool, copy=False),
     )
 
 

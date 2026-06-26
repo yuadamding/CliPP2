@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 
 import numpy as np
@@ -121,6 +122,37 @@ def cluster_labels_from_edges(
         edge_v=np.asarray(edge_v, dtype=np.int64),
         tol=float(tol),
     )
+
+
+def cluster_diameters_from_edges(
+    phi: np.ndarray,
+    labels: np.ndarray,
+    *,
+    edge_u: np.ndarray,
+    edge_v: np.ndarray,
+) -> tuple[np.ndarray, bool]:
+    phi = np.asarray(phi)
+    labels = np.asarray(labels, dtype=np.int64)
+    edge_u = np.asarray(edge_u, dtype=np.int64)
+    edge_v = np.asarray(edge_v, dtype=np.int64)
+    n_clusters = int(labels.max()) + 1 if labels.size else 0
+    diameters = np.zeros(n_clusters, dtype=np.float64)
+    if labels.size == 0:
+        return diameters, False
+    n_rows = int(labels.shape[0])
+    expected_complete_edges = n_rows * (n_rows - 1) // 2
+    cluster_sizes = np.bincount(labels, minlength=n_clusters)
+    exact = bool(edge_u.size == expected_complete_edges or np.all(cluster_sizes <= 1))
+    if edge_u.size == 0 or edge_v.size == 0:
+        return diameters, exact
+    same_cluster = labels[edge_u] == labels[edge_v]
+    if not np.any(same_cluster):
+        return diameters, exact
+    same_u = edge_u[same_cluster]
+    same_v = edge_v[same_cluster]
+    distances = np.linalg.norm(phi[same_u] - phi[same_v], axis=1)
+    np.maximum.at(diameters, labels[same_u], distances.astype(np.float64, copy=False))
+    return diameters, exact
 
 
 def _cluster_summary_from_labels(
@@ -577,6 +609,8 @@ def _fit_from_start(
         )
         surrogate_fit_loss = float(torch.sum(surrogate_terms.loss).item())
         h_base = torch.clamp(surrogate_terms.hess_upper, min=1e-6)
+        if torch_data.count_observed is not None:
+            h_base = torch.where(torch_data.count_observed, h_base, torch.zeros_like(h_base))
         scale = 1.0
         accepted = False
         candidate_phi = phi
@@ -876,6 +910,8 @@ def _fit_from_start(
         and valid_dual_certificate
         and mm_consistency_violations == 0
     )
+    stationarity_certified = bool(selection_eligible)
+    global_optimality_certified = False
 
     if converged:
         failure_reason = "converged"
@@ -926,6 +962,13 @@ def _fit_from_start(
         tol=effective_summary_tol,
     )
     n_clusters = int(cluster_labels.max()) + 1 if cluster_labels.size else 0
+    cluster_diameters, cluster_diameter_exact = cluster_diameters_from_edges(
+        phi_np,
+        cluster_labels,
+        edge_u=edge_u_np,
+        edge_v=edge_v_np,
+    )
+    max_cluster_diameter = float(np.max(cluster_diameters)) if cluster_diameters.size else 0.0
     if compute_summary:
         cluster_centers, phi_clustered = _cluster_summary_from_labels(phi_np, cluster_labels)
         phi_clustered_torch = torch.as_tensor(phi_clustered, dtype=runtime.dtype, device=runtime.device)
@@ -994,6 +1037,9 @@ def _fit_from_start(
         phi_clustered=phi_clustered.astype(phi_np.dtype, copy=False),
         cluster_labels=cluster_labels.astype(np.int64, copy=False),
         cluster_centers=cluster_centers.astype(phi_np.dtype, copy=False),
+        cluster_diameters=cluster_diameters.astype(np.float64, copy=False),
+        max_cluster_diameter=float(max_cluster_diameter),
+        cluster_diameter_exact=bool(cluster_diameter_exact),
         gamma_major=major_probability.astype(phi_np.dtype, copy=False),
         major_probability=major_probability.astype(phi_np.dtype, copy=False),
         major_call=major_call.astype(bool, copy=False),
@@ -1062,6 +1108,14 @@ def _fit_from_start(
         last_reject_reason=str(last_reject_reason),
         failure_reason=str(failure_reason),
         selection_eligible=bool(selection_eligible),
+        stationarity_certified=bool(stationarity_certified),
+        global_optimality_certified=bool(global_optimality_certified),
+        number_of_starts=1,
+        number_of_finite_starts=int(np.isfinite(float(objective))),
+        best_start_objective=float(objective),
+        second_best_start_objective=float("nan"),
+        objective_spread_across_starts=0.0,
+        selected_start_objective_rank=1,
         solver_state=solver_state_out,
         torch_result=torch_result,
     )
@@ -1196,6 +1250,7 @@ def fit_observed_data_pairwise_fusion(
     start_bank = _deduplicate_starts(start_bank, runtime=effective_runtime)
 
     best_artifacts: FusionFitArtifacts | None = None
+    start_artifacts: list[FusionFitArtifacts] = []
     for start in start_bank:
         artifacts = _fit_from_start(
             data,
@@ -1224,6 +1279,7 @@ def fit_observed_data_pairwise_fusion(
             compute_summary=compute_summary,
             verbose=verbose,
         )
+        start_artifacts.append(artifacts)
         if best_artifacts is None:
             best_artifacts = artifacts
             continue
@@ -1238,4 +1294,26 @@ def fit_observed_data_pairwise_fusion(
 
     if best_artifacts is None:
         raise RuntimeError("No valid start produced a fusion fit.")
-    return best_artifacts
+    objectives = np.asarray([float(item.penalized_objective) for item in start_artifacts], dtype=np.float64)
+    finite_objectives = objectives[np.isfinite(objectives)]
+    if finite_objectives.size:
+        sorted_objectives = np.sort(finite_objectives)
+        best_start_objective = float(sorted_objectives[0])
+        second_best_start_objective = float(sorted_objectives[1]) if sorted_objectives.size >= 2 else float("nan")
+        objective_spread = float(sorted_objectives[-1] - sorted_objectives[0])
+        selected_objective = float(best_artifacts.penalized_objective)
+        selected_rank = int(1 + np.sum(finite_objectives < selected_objective - 1e-8))
+    else:
+        best_start_objective = float("nan")
+        second_best_start_objective = float("nan")
+        objective_spread = float("nan")
+        selected_rank = 0
+    return replace(
+        best_artifacts,
+        number_of_starts=int(len(start_artifacts)),
+        number_of_finite_starts=int(finite_objectives.size),
+        best_start_objective=float(best_start_objective),
+        second_best_start_objective=float(second_best_start_objective),
+        objective_spread_across_starts=float(objective_spread),
+        selected_start_objective_rank=int(selected_rank),
+    )

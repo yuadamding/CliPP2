@@ -26,6 +26,9 @@ class FusionFitArtifacts:
     phi_clustered: np.ndarray
     cluster_labels: np.ndarray
     cluster_centers: np.ndarray
+    cluster_diameters: np.ndarray
+    max_cluster_diameter: float
+    cluster_diameter_exact: bool
     gamma_major: np.ndarray
     major_probability: np.ndarray
     major_call: np.ndarray
@@ -94,6 +97,14 @@ class FusionFitArtifacts:
     last_reject_reason: str
     failure_reason: str
     selection_eligible: bool
+    stationarity_certified: bool
+    global_optimality_certified: bool
+    number_of_starts: int
+    number_of_finite_starts: int
+    best_start_objective: float
+    second_best_start_objective: float
+    objective_spread_across_starts: float
+    selected_start_objective_rank: int
     solver_state: SolverState | None = None
     torch_result: TorchFitResult | None = None
 

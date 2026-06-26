@@ -26,6 +26,10 @@ def _dtype_nbytes(dtype: torch.dtype) -> int:
     return int(torch.empty((), dtype=dtype).element_size())
 
 
+def _adaptive_weight_work_dtype(dtype: torch.dtype) -> torch.dtype:
+    return torch.float32 if dtype == torch.float16 else dtype
+
+
 def _adaptive_weight_chunk_size(*, num_samples: int, dtype: torch.dtype) -> int:
     sample_count = max(int(num_samples), 1)
     bytes_per_edge = max(sample_count * _dtype_nbytes(dtype), 1)
@@ -51,8 +55,10 @@ def estimate_complete_tensor_graph_bytes(
     )
     if not adaptive:
         return int(persistent_bytes)
-    chunk_edges = min(edge_count, _adaptive_weight_chunk_size(num_samples=sample_count, dtype=dtype))
-    adaptive_peak_bytes = chunk_edges * sample_count * value_bytes + 3 * chunk_edges * value_bytes
+    work_dtype = _adaptive_weight_work_dtype(dtype)
+    work_value_bytes = _dtype_nbytes(work_dtype)
+    chunk_edges = min(edge_count, _adaptive_weight_chunk_size(num_samples=sample_count, dtype=work_dtype))
+    adaptive_peak_bytes = chunk_edges * sample_count * work_value_bytes + 3 * chunk_edges * work_value_bytes
     return int(persistent_bytes + adaptive_peak_bytes)
 
 
@@ -283,7 +289,8 @@ def build_complete_adaptive_tensor_graph(
     if baseline <= 0.0 or not np.isfinite(baseline):
         raise ValueError("Adaptive pairwise weight baseline must be finite and positive.")
 
-    pilot = pilot_phi.to(dtype=runtime.dtype, device=runtime.device)
+    weight_work_dtype = _adaptive_weight_work_dtype(runtime.dtype)
+    pilot = pilot_phi.to(dtype=weight_work_dtype, device=runtime.device)
     num_nodes = int(pilot.shape[0])
     _check_complete_tensor_graph_memory(
         num_nodes=num_nodes,
@@ -321,7 +328,7 @@ def build_complete_adaptive_tensor_graph(
     if not bool(torch.isfinite(mean_raw_weight).item()) or float(mean_raw_weight.item()) <= 0.0:
         raise ValueError("Adaptive pairwise weights must have a positive finite mean.")
     target_mean_weight = float(baseline) * _complete_graph_weight(num_nodes)
-    weight = raw_weight.mul_(target_mean_weight / mean_raw_weight)
+    weight = raw_weight.mul_(target_mean_weight / mean_raw_weight).to(dtype=runtime.dtype)
     return _tensor_graph_from_edges(
         edge_u=edge_index[0],
         edge_v=edge_index[1],

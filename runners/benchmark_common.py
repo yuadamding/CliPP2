@@ -20,6 +20,31 @@ SINGLE_REGION_PATTERN = re.compile(
 
 DEFAULT_PATIENT_SORT_COLUMNS = ["N_mean", "purity", "amp_rate", "n_samples", "true_K", "rep"]
 DEFAULT_TUMOR_SORT_COLUMNS = DEFAULT_PATIENT_SORT_COLUMNS
+_PATIENT_NUMERIC_METRIC_DEFAULT_COLUMNS = {
+    "ARI",
+    "adaptive_search_rounds_completed",
+    "ari_optimal_lambda_count",
+    "best_ari",
+    "clonal_fraction_error",
+    "cp_rmse",
+    "elapsed_seconds",
+    "estimated_clonal_fraction",
+    "multiplicity_f1",
+    "n_clusters",
+    "n_eval_mutations",
+    "n_filtered_mutations",
+    "selected_lambda",
+    "selection_lambda_count",
+    "selection_lambda_max",
+    "selection_lambda_min",
+    "true_K",
+    "true_clonal_fraction",
+}
+_PATIENT_BOOL_METRIC_DEFAULT_COLUMNS = {
+    "ari_boundary_unresolved": True,
+    "selection_boundary_unresolved": True,
+    "selection_used_convergence_fallback": False,
+}
 
 
 def _safe_nanmean_abs(values: pd.Series | np.ndarray) -> float:
@@ -120,12 +145,26 @@ def _select_representative_files_with_filter(
 
 def _add_cluster_count_metrics(patient_df: pd.DataFrame) -> pd.DataFrame:
     enriched_df = patient_df.copy()
-    cluster_count_error = enriched_df["n_clusters"] - enriched_df["true_K"]
+    if "patient_id" not in enriched_df.columns and "tumor_id" in enriched_df.columns:
+        enriched_df["patient_id"] = enriched_df["tumor_id"]
+    for column in _PATIENT_NUMERIC_METRIC_DEFAULT_COLUMNS:
+        if column not in enriched_df.columns:
+            enriched_df[column] = np.nan
+    for column, default in _PATIENT_BOOL_METRIC_DEFAULT_COLUMNS.items():
+        if column not in enriched_df.columns:
+            enriched_df[column] = bool(default)
+
+    n_clusters = pd.to_numeric(enriched_df["n_clusters"], errors="coerce")
+    true_k = pd.to_numeric(enriched_df["true_K"], errors="coerce")
+    cluster_count_error = n_clusters - true_k
     enriched_df["cluster_count_error"] = cluster_count_error
     enriched_df["abs_cluster_count_error"] = cluster_count_error.abs()
-    enriched_df["cluster_count_exact_match"] = (
-        enriched_df["n_clusters"] == enriched_df["true_K"]
-    ).astype(float)
+    exact_known = n_clusters.notna() & true_k.notna()
+    enriched_df["cluster_count_exact_match"] = np.where(
+        exact_known,
+        (n_clusters == true_k).astype(float),
+        np.nan,
+    )
     return enriched_df
 
 

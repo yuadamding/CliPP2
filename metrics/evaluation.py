@@ -13,6 +13,7 @@ from ..io.data import TumorData
 
 @dataclass
 class SimulationEvaluation:
+    # Legacy cp_rmse is the partition-summary RMSE; explicit fields below separate sources.
     ari: float
     cp_rmse: float
     multiplicity_f1: float
@@ -23,6 +24,11 @@ class SimulationEvaluation:
     estimated_clusters: int
     n_eval_mutations: int
     n_filtered_mutations: int
+    raw_cp_rmse: float | None = None
+    summary_cp_rmse: float | None = None
+    # BIC partition-refit metrics (None when refit was not performed)
+    bic_refit_ari: float | None = None
+    bic_refit_cp_rmse: float | None = None
 
 
 @dataclass(frozen=True)
@@ -109,20 +115,88 @@ def _region_index_from_label(region_id: str) -> int:
     return int(match.group(1))
 
 
+def _reindex_by_mutation_id(
+    values: np.ndarray,
+    truth_ids: list[str] | None,
+    data_ids: list[str],
+    column_name: str,
+    tumor_id: str,
+) -> np.ndarray:
+    """Reorder truth rows to match data_ids ordering.
+
+    If truth_ids is None (truth file has no mutation_id column) the array is
+    returned after a shape check using positional alignment.  When mutation IDs
+    are present in the truth file, rows are reordered so alignment is ID-based,
+    preventing silent misalignment when truth and data use different orderings.
+    """
+    if truth_ids is None:
+        if values.shape[0] != len(data_ids):
+            raise ValueError(
+                f"Positional-alignment shape mismatch for '{column_name}' "
+                f"in tumor '{tumor_id}': "
+                f"{values.shape[0]} truth rows vs {len(data_ids)} mutations."
+            )
+        return values
+
+    if len(truth_ids) != len(set(truth_ids)):
+        raise ValueError(
+            f"Duplicate mutation_id values found in truth '{column_name}' "
+            f"for tumor '{tumor_id}'."
+        )
+    if values.shape[0] != len(truth_ids):
+        raise ValueError(
+            f"ID-alignment shape mismatch for '{column_name}' in tumor '{tumor_id}': "
+            f"{values.shape[0]} truth rows vs {len(truth_ids)} mutation IDs."
+        )
+    if len(data_ids) != len(set(data_ids)):
+        raise ValueError(
+            f"Duplicate mutation_id values found in loaded data for tumor '{tumor_id}'."
+        )
+    data_id_set = set(data_ids)
+    truth_id_to_index = {tid: i for i, tid in enumerate(truth_ids)}
+    missing = [mid for mid in data_ids if mid not in truth_id_to_index]
+    extra = [mid for mid in truth_ids if mid not in data_id_set]
+    if missing:
+        raise ValueError(
+            f"Mutations in data not found in truth '{column_name}' "
+            f"for tumor '{tumor_id}': {missing[:5]!r}"
+        )
+    if extra:
+        raise ValueError(
+            f"Mutations in truth '{column_name}' not found in data "
+            f"for tumor '{tumor_id}': {extra[:5]!r}"
+        )
+    indices = np.array([truth_id_to_index[mid] for mid in data_ids], dtype=np.intp)
+    return values[indices]
+
+
 def _load_single_region_truth(
     tumor_dir: Path,
     data: TumorData,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
-    truth_clusters = pd.read_csv(tumor_dir / "truth.txt", sep="\t")["cluster_id"].to_numpy(dtype=int)
-    truth_cp = pd.read_csv(tumor_dir / "truth_cp.txt", sep="\t")
-    if truth_cp.shape[0] != data.num_mutations:
-        raise ValueError(
-            f"Single-region truth CP count mismatch for tumor {data.tumor_id}: "
-            f"{truth_cp.shape[0]} != {data.num_mutations}"
-        )
+    truth_df = pd.read_csv(tumor_dir / "truth.txt", sep="\t")
+    truth_ids: list[str] | None = (
+        truth_df["mutation_id"].astype(str).tolist()
+        if "mutation_id" in truth_df.columns
+        else None
+    )
+    raw_clusters = truth_df["cluster_id"].to_numpy(dtype=int)
+    truth_clusters = _reindex_by_mutation_id(
+        raw_clusters, truth_ids, data.mutation_ids, "truth.txt/cluster_id", data.tumor_id
+    )
 
+    truth_cp = pd.read_csv(tumor_dir / "truth_cp.txt", sep="\t")
+    cp_ids: list[str] | None = (
+        truth_cp["mutation_id"].astype(str).tolist()
+        if "mutation_id" in truth_cp.columns
+        else None
+    )
+    raw_phi = truth_cp["ccf"].to_numpy(dtype=np.float32)
+    aligned_phi = _reindex_by_mutation_id(
+        raw_phi, cp_ids, data.mutation_ids, "truth_cp.txt/ccf", data.tumor_id
+    )
     truth_phi = np.zeros((data.num_mutations, 1), dtype=np.float32)
-    truth_phi[:, 0] = truth_cp["ccf"].to_numpy(dtype=np.float32)
+    truth_phi[:, 0] = aligned_phi
 
     truth_multiplicity = None
     cna_path = tumor_dir / "cna.txt"
@@ -170,12 +244,16 @@ def load_simulation_truth(
             truth_multiplicity=truth_multiplicity,
         )
 
-    truth_clusters = pd.read_csv(tumor_dir / "truth.txt", sep="\t")["cluster_id"].to_numpy(dtype=int)
-    if truth_clusters.shape[0] != data.num_mutations:
-        raise ValueError(
-            f"Truth cluster count mismatch for tumor {data.tumor_id}: "
-            f"{truth_clusters.shape[0]} != {data.num_mutations}"
-        )
+    truth_df = pd.read_csv(tumor_dir / "truth.txt", sep="\t")
+    truth_ids: list[str] | None = (
+        truth_df["mutation_id"].astype(str).tolist()
+        if "mutation_id" in truth_df.columns
+        else None
+    )
+    raw_clusters = truth_df["cluster_id"].to_numpy(dtype=int)
+    truth_clusters = _reindex_by_mutation_id(
+        raw_clusters, truth_ids, data.mutation_ids, "truth.txt/cluster_id", data.tumor_id
+    )
 
     truth_phi = np.zeros((data.num_mutations, data.num_samples), dtype=np.float32)
     truth_multiplicity = np.zeros((data.num_mutations, data.num_samples), dtype=np.float32)
@@ -186,8 +264,33 @@ def load_simulation_truth(
         truth_cp = pd.read_csv(region_dir / "truth_cp.txt", sep="\t")
         cna = pd.read_csv(region_dir / "cna.txt", sep="\t")
 
-        truth_phi[:, column] = truth_cp["ccf"].to_numpy(dtype=np.float32)
-        truth_multiplicity[:, column] = cna["multiplicity"].to_numpy(dtype=np.float32)
+        cp_ids: list[str] | None = (
+            truth_cp["mutation_id"].astype(str).tolist()
+            if "mutation_id" in truth_cp.columns
+            else None
+        )
+        aligned_ccf = _reindex_by_mutation_id(
+            truth_cp["ccf"].to_numpy(dtype=np.float32),
+            cp_ids,
+            data.mutation_ids,
+            f"sample{region_index}/truth_cp.txt/ccf",
+            data.tumor_id,
+        )
+        truth_phi[:, column] = aligned_ccf
+
+        cna_ids: list[str] | None = (
+            cna["mutation_id"].astype(str).tolist()
+            if "mutation_id" in cna.columns
+            else None
+        )
+        aligned_mult = _reindex_by_mutation_id(
+            cna["multiplicity"].to_numpy(dtype=np.float32),
+            cna_ids,
+            data.mutation_ids,
+            f"sample{region_index}/cna.txt/multiplicity",
+            data.tumor_id,
+        )
+        truth_multiplicity[:, column] = aligned_mult
 
     return SimulationTruth(
         truth_clusters=truth_clusters,
@@ -226,10 +329,14 @@ def evaluate_fit_against_simulation(
             estimated_clusters=int(fit.n_clusters),
             n_eval_mutations=0,
             n_filtered_mutations=int(data.num_mutations),
+            raw_cp_rmse=float("nan"),
+            summary_cp_rmse=float("nan"),
         )
 
     ari = _adjusted_rand_index(truth_clusters[eval_mask], fit.cluster_labels[eval_mask])
-    cp_rmse = float(np.sqrt(np.mean((fit.phi_clustered[eval_mask] - truth_phi[eval_mask]) ** 2)))
+    raw_cp_rmse = float(np.sqrt(np.mean((fit.phi[eval_mask] - truth_phi[eval_mask]) ** 2)))
+    summary_cp_rmse = float(np.sqrt(np.mean((fit.phi_clustered[eval_mask] - truth_phi[eval_mask]) ** 2)))
+    cp_rmse = summary_cp_rmse
     estimated_clonal_fraction = _cluster_level_clonal_fraction(
         fit.phi_clustered[eval_mask],
         fit.cluster_labels[eval_mask],
@@ -253,6 +360,23 @@ def evaluate_fit_against_simulation(
                 pred_major.astype(int).reshape(-1),
             )
 
+    bic_refit_ari: float | None = None
+    bic_refit_cp_rmse: float | None = None
+    refit_phi = getattr(fit, "bic_refit_phi", None)
+    refit_labels = getattr(fit, "bic_partition_labels", None)
+    if (
+        refit_phi is not None
+        and refit_labels is not None
+        and refit_phi.shape == fit.phi_clustered.shape
+        and refit_labels.shape == fit.cluster_labels.shape
+    ):
+        bic_refit_ari = _adjusted_rand_index(
+            truth_clusters[eval_mask], refit_labels[eval_mask]
+        )
+        bic_refit_cp_rmse = float(
+            np.sqrt(np.mean((refit_phi[eval_mask] - truth_phi[eval_mask]) ** 2))
+        )
+
     return SimulationEvaluation(
         ari=ari,
         cp_rmse=cp_rmse,
@@ -264,6 +388,10 @@ def evaluate_fit_against_simulation(
         estimated_clusters=int(fit.n_clusters),
         n_eval_mutations=n_eval_mutations,
         n_filtered_mutations=n_filtered_mutations,
+        raw_cp_rmse=raw_cp_rmse,
+        summary_cp_rmse=summary_cp_rmse,
+        bic_refit_ari=bic_refit_ari,
+        bic_refit_cp_rmse=bic_refit_cp_rmse,
     )
 
 

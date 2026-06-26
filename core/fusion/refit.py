@@ -17,8 +17,32 @@ class PartitionRefitResult:
     n_clusters: int
     boundary_count: int
     active_degrees_of_freedom: int
-    converged: bool
+    finite_candidate_found: bool  # True only if a finite loss was obtained; does NOT certify global MLE
+    refit_coordinate_count: int
+    refit_finite_coordinate_count: int
+    refit_total_grid_points: int
+    refit_max_grid_spacing: float
+    refit_total_candidate_basins: int
+    refit_total_refined_candidates: int
+    refit_min_best_second_loss_gap: float
     loglik_source: str = "partition_constrained_observed_mle"
+
+    @property
+    def converged(self) -> bool:
+        # Backward-compatible alias; use finite_candidate_found for new code.
+        return self.finite_candidate_found
+
+
+@dataclass(frozen=True)
+class _RefitCoordinateResult:
+    beta: float
+    loss: float
+    finite_candidate_found: bool
+    grid_points: int
+    max_grid_spacing: float
+    candidate_basins: int
+    refined_candidates: int
+    best_second_loss_gap: float
 
 
 def _canonical_labels(labels: np.ndarray) -> np.ndarray:
@@ -120,7 +144,7 @@ def _refit_cluster_sample(
     tol: float,
     max_iter: int,
     hint: float | None,
-) -> tuple[float, float, bool]:
+) -> _RefitCoordinateResult:
     lower = float(lower)
     upper = float(upper)
     if upper <= lower + 1e-12:
@@ -137,7 +161,16 @@ def _refit_cluster_sample(
                 eps=eps,
             )[0]
         )
-        return lower, loss, np.isfinite(loss)
+        return _RefitCoordinateResult(
+            beta=lower,
+            loss=loss,
+            finite_candidate_found=bool(np.isfinite(loss)),
+            grid_points=1,
+            max_grid_spacing=0.0,
+            candidate_basins=1 if np.isfinite(loss) else 0,
+            refined_candidates=0,
+            best_second_loss_gap=float("inf"),
+        )
 
     objective = lambda values: _objective_grid(
         values,
@@ -162,11 +195,22 @@ def _refit_cluster_sample(
     )
     losses = objective(grid)
     finite = np.isfinite(losses)
+    max_grid_spacing = float(np.max(np.diff(grid))) if grid.size > 1 else 0.0
     if not np.any(finite):
-        return lower, float("inf"), False
+        return _RefitCoordinateResult(
+            beta=lower,
+            loss=float("inf"),
+            finite_candidate_found=False,
+            grid_points=int(grid.size),
+            max_grid_spacing=float(max_grid_spacing),
+            candidate_basins=0,
+            refined_candidates=0,
+            best_second_loss_gap=float("inf"),
+        )
 
     best_loss = float(np.min(losses[finite]))
     best_beta = float(grid[np.where(finite)[0][int(np.argmin(losses[finite]))]])
+    candidate_losses: list[float] = []
 
     local_indices: set[int] = set()
     for idx in np.where(finite)[0].tolist():
@@ -177,7 +221,11 @@ def _refit_cluster_sample(
     if not local_indices:
         local_indices.add(int(np.nanargmin(losses)))
 
-    for idx in sorted(local_indices, key=lambda value: float(losses[value]))[:16]:
+    refined_candidates = 0
+    selected_indices = sorted(local_indices, key=lambda value: float(losses[value]))[:16]
+    for idx in selected_indices:
+        if np.isfinite(losses[idx]):
+            candidate_losses.append(float(losses[idx]))
         left = float(grid[max(idx - 1, 0)])
         right = float(grid[min(idx + 1, grid.size - 1)])
         if right <= left + 1e-12:
@@ -189,6 +237,9 @@ def _refit_cluster_sample(
             tol=float(tol),
             max_iter=max(int(max_iter), 32),
         )
+        refined_candidates += 1
+        if np.isfinite(refined_loss):
+            candidate_losses.append(float(refined_loss))
         if np.isfinite(refined_loss) and refined_loss < best_loss:
             best_beta = float(refined_beta)
             best_loss = float(refined_loss)
@@ -196,11 +247,35 @@ def _refit_cluster_sample(
     if hint is not None and np.isfinite(float(hint)):
         hint_beta = float(np.clip(float(hint), lower, upper))
         hint_loss = float(objective(np.asarray([hint_beta], dtype=np.float64))[0])
+        if np.isfinite(hint_loss):
+            candidate_losses.append(float(hint_loss))
         if np.isfinite(hint_loss) and hint_loss < best_loss:
             best_beta = hint_beta
             best_loss = hint_loss
 
-    return float(np.clip(best_beta, lower, upper)), float(best_loss), bool(np.isfinite(best_loss))
+    finite_candidate_losses = np.asarray(
+        [value for value in candidate_losses if np.isfinite(value)],
+        dtype=np.float64,
+    )
+    if finite_candidate_losses.size >= 2:
+        unique_losses = np.unique(np.round(finite_candidate_losses, 12))
+        if unique_losses.size >= 2:
+            best_second_loss_gap = float(unique_losses[1] - unique_losses[0])
+        else:
+            best_second_loss_gap = 0.0
+    else:
+        best_second_loss_gap = float("inf")
+
+    return _RefitCoordinateResult(
+        beta=float(np.clip(best_beta, lower, upper)),
+        loss=float(best_loss),
+        finite_candidate_found=bool(np.isfinite(best_loss)),
+        grid_points=int(grid.size),
+        max_grid_spacing=float(max_grid_spacing),
+        candidate_basins=int(len(local_indices)),
+        refined_candidates=int(refined_candidates),
+        best_second_loss_gap=float(best_second_loss_gap),
+    )
 
 
 def partition_constrained_observed_refit(
@@ -236,6 +311,13 @@ def partition_constrained_observed_refit(
     active_df = 0
     converged = True
     boundary_tol = max(float(tol) * 10.0, 1e-8)
+    refit_coordinate_count = 0
+    refit_finite_coordinate_count = 0
+    refit_total_grid_points = 0
+    refit_max_grid_spacing = 0.0
+    refit_total_candidate_basins = 0
+    refit_total_refined_candidates = 0
+    refit_min_best_second_loss_gap = float("inf")
 
     for cluster_idx in range(n_clusters):
         member_mask = labels == int(cluster_idx)
@@ -249,7 +331,7 @@ def partition_constrained_observed_refit(
             hint = None
             if hint_matrix is not None:
                 hint = float(np.median(hint_matrix[member_mask, sample_idx]))
-            beta, loss, ok = _refit_cluster_sample(
+            coordinate = _refit_cluster_sample(
                 alt=alt[member_mask, sample_idx],
                 total=total[member_mask, sample_idx],
                 b_minus=b_minus[member_mask, sample_idx],
@@ -264,9 +346,21 @@ def partition_constrained_observed_refit(
                 max_iter=max(int(max_iter), 32),
                 hint=hint,
             )
+            beta = float(coordinate.beta)
+            loss = float(coordinate.loss)
             centers[cluster_idx, sample_idx] = float(beta)
             total_loss += float(loss)
-            converged = bool(converged and ok)
+            converged = bool(converged and coordinate.finite_candidate_found)
+            refit_coordinate_count += 1
+            refit_finite_coordinate_count += int(coordinate.finite_candidate_found)
+            refit_total_grid_points += int(coordinate.grid_points)
+            refit_max_grid_spacing = max(refit_max_grid_spacing, float(coordinate.max_grid_spacing))
+            refit_total_candidate_basins += int(coordinate.candidate_basins)
+            refit_total_refined_candidates += int(coordinate.refined_candidates)
+            refit_min_best_second_loss_gap = min(
+                refit_min_best_second_loss_gap,
+                float(coordinate.best_second_loss_gap),
+            )
             at_boundary = bool(beta <= lower + boundary_tol or beta >= upper - boundary_tol)
             boundary_count += int(at_boundary)
             active_df += int(not at_boundary)
@@ -281,7 +375,14 @@ def partition_constrained_observed_refit(
         n_clusters=int(n_clusters),
         boundary_count=int(boundary_count),
         active_degrees_of_freedom=int(active_df),
-        converged=bool(converged and np.isfinite(total_loss)),
+        finite_candidate_found=bool(converged and np.isfinite(total_loss)),
+        refit_coordinate_count=int(refit_coordinate_count),
+        refit_finite_coordinate_count=int(refit_finite_coordinate_count),
+        refit_total_grid_points=int(refit_total_grid_points),
+        refit_max_grid_spacing=float(refit_max_grid_spacing),
+        refit_total_candidate_basins=int(refit_total_candidate_basins),
+        refit_total_refined_candidates=int(refit_total_refined_candidates),
+        refit_min_best_second_loss_gap=float(refit_min_best_second_loss_gap),
     )
 
 

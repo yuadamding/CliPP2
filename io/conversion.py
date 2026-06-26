@@ -158,11 +158,15 @@ def convert_one_patient(patient_path: Path, output_root: Path) -> Path | None:
     for col in ["ref_counts", "alt_counts", "major_cn", "minor_cn", "has_cna"]:
         all_rows[col] = all_rows[col].astype(float)
 
+    # Track which cells have observed SNV counts before filling
     missing_counts = all_rows["ref_counts"].isna() | all_rows["alt_counts"].isna()
-    all_rows.loc[missing_counts, "ref_counts"] = JEFFREYS_PSEUDO
-    all_rows.loc[missing_counts, "alt_counts"] = JEFFREYS_PSEUDO
+    all_rows["count_observed"] = (~missing_counts).astype(int)
+    # Fill missing counts with 0 — these entries will be masked by count_observed=0
+    all_rows.loc[missing_counts, "ref_counts"] = 0.0
+    all_rows.loc[missing_counts, "alt_counts"] = 0.0
 
     missing_cna = all_rows["major_cn"].isna() | all_rows["minor_cn"].isna()
+    # has_cna=0 already marks these as unobserved CNA; fill with diploid placeholders
     all_rows.loc[missing_cna, "major_cn"] = 1.0
     all_rows.loc[missing_cna, "minor_cn"] = 1.0
 
@@ -180,6 +184,7 @@ def convert_one_patient(patient_path: Path, output_root: Path) -> Path | None:
             "major_cn",
             "minor_cn",
             "has_cna",
+            "count_observed",
             "purity",
         ]
     ].copy()

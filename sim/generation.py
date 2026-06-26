@@ -49,29 +49,37 @@ def _check_patient_tree_and_ccf(parent, children, ccf_patient_clones, tol=1e-8):
     ccf = np.asarray(ccf_patient_clones, dtype=float)
     K = parent.shape[0]
 
-    assert K >= 1, "Tree must have at least one node."
-    assert parent[0] == -1, "Root must have parent -1."
+    if K < 1:
+        raise ValueError("Tree must have at least one node.")
+    if parent[0] != -1:
+        raise ValueError("Root must have parent -1.")
     for k in range(1, K):
         p = parent[k]
-        assert 0 <= p < K, f"Invalid parent[{k}]={p}; must be in [0,{K-1}]."
+        if not (0 <= p < K):
+            raise ValueError(f"Invalid parent[{k}]={p}; must be in [0,{K-1}].")
 
-    assert np.all(ccf >= -tol), "Some ccf_patient_clones < 0."
-    assert np.all(ccf <= 1.0 + tol), "Some ccf_patient_clones > 1."
-    assert abs(ccf[0] - 1.0) <= tol, f"Root CCF must be ~1, got {ccf[0]}."
+    if not np.all(ccf >= -tol):
+        raise ValueError("Some ccf_patient_clones < 0.")
+    if not np.all(ccf <= 1.0 + tol):
+        raise ValueError("Some ccf_patient_clones > 1.")
+    if abs(ccf[0] - 1.0) > tol:
+        raise ValueError(f"Root CCF must be ~1, got {ccf[0]}.")
 
     for k in range(1, K):
         p = parent[k]
-        assert ccf[k] <= ccf[p] + tol, (
-            f"Descendant clone {k} has ccf {ccf[k]:.4g} > parent {p} ccf {ccf[p]:.4g}."
-        )
+        if ccf[k] > ccf[p] + tol:
+            raise ValueError(
+                f"Descendant clone {k} has ccf {ccf[k]:.4g} > parent {p} ccf {ccf[p]:.4g}."
+            )
 
     for k in range(K):
         ch = children[k]
         if ch:
             s_children = float(sum(ccf[c] for c in ch))
-            assert s_children <= ccf[k] + tol, (
-                f"Mass mismatch at node {k}: ccf={ccf[k]:.6g}, sum(children)={s_children:.6g}."
-            )
+            if s_children > ccf[k] + tol:
+                raise ValueError(
+                    f"Mass mismatch at node {k}: ccf={ccf[k]:.6g}, sum(children)={s_children:.6g}."
+                )
 
     for k in range(K):
         stack = [k]
@@ -83,9 +91,10 @@ def _check_patient_tree_and_ccf(parent, children, ccf_patient_clones, tol=1e-8):
             else:
                 stack.extend(children[node])
         s_leaves = float(sum(ccf[leaf] for leaf in desc_leaves))
-        assert s_leaves <= ccf[k] + tol, (
-            f"Descendant-leaf mismatch at node {k}: ccf={ccf[k]:.6g}, sum(desc_leaves)={s_leaves:.6g}."
-        )
+        if s_leaves > ccf[k] + tol:
+            raise ValueError(
+                f"Descendant-leaf mismatch at node {k}: ccf={ccf[k]:.6g}, sum(desc_leaves)={s_leaves:.6g}."
+            )
 
     return True
 
@@ -95,23 +104,28 @@ def _check_sample_ccf_against_tree(parent, children, ccf_samples_clones, tol=1e-
     C = np.asarray(ccf_samples_clones, dtype=float)
     K, M = C.shape
 
-    assert np.allclose(C[0, :], 1.0, atol=tol), "Root CCF must be ~1 in all samples."
-    assert np.all(C >= -tol), "Some sample CCFs < 0."
-    assert np.all(C <= 1.0 + tol), "Some sample CCFs > 1."
+    if not np.allclose(C[0, :], 1.0, atol=tol):
+        raise ValueError("Root CCF must be ~1 in all samples.")
+    if not np.all(C >= -tol):
+        raise ValueError("Some sample CCFs < 0.")
+    if not np.all(C <= 1.0 + tol):
+        raise ValueError("Some sample CCFs > 1.")
 
     for j in range(M):
         for k in range(1, K):
             p = parent[k]
-            assert C[k, j] <= C[p, j] + tol, (
-                f"Sample {j}: clone {k} has CCF {C[k, j]:.4g} > parent {p} CCF {C[p, j]:.4g}."
-            )
+            if C[k, j] > C[p, j] + tol:
+                raise ValueError(
+                    f"Sample {j}: clone {k} has CCF {C[k, j]:.4g} > parent {p} CCF {C[p, j]:.4g}."
+                )
         for k in range(K):
             ch = children[k]
             if ch:
                 s_children = float(sum(C[c, j] for c in ch))
-                assert s_children <= C[k, j] + tol, (
-                    f"Sample {j}, node {k}: CCF={C[k, j]:.6g}, sum(children)={s_children:.6g}."
-                )
+                if s_children > C[k, j] + tol:
+                    raise ValueError(
+                        f"Sample {j}, node {k}: CCF={C[k, j]:.6g}, sum(children)={s_children:.6g}."
+                    )
     return True
 
 

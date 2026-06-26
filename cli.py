@@ -89,9 +89,9 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--dtype",
-        choices=["auto", "float32", "float64"],
+        choices=["auto", "float16", "float32", "float64"],
         default="float64",
-        help="Numeric dtype for Torch execution. Float64 is the default for BIC model selection.",
+        help="Numeric dtype for Torch execution. Float64 is the default for BIC model selection; float16 requires CUDA.",
     )
     parser.add_argument(
         "--missing-cna-policy",

@@ -16,12 +16,15 @@ def _display_region_label(label: str) -> str:
 
 def mutation_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame:
     cluster_sizes = np.bincount(fit.cluster_labels, minlength=fit.n_clusters)
+    cluster_diameters = np.asarray(fit.cluster_diameters, dtype=np.float64)
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, data.num_mutations),
             "mutation_id": data.mutation_ids,
             "cluster_label": fit.cluster_labels + 1,
             "cluster_size": cluster_sizes[fit.cluster_labels],
+            "cluster_diameter": cluster_diameters[fit.cluster_labels],
+            "cluster_diameter_exact": np.repeat(bool(fit.cluster_diameter_exact), data.num_mutations),
         }
     )
     for column, region_id in enumerate(data.region_ids):
@@ -35,11 +38,14 @@ def mutation_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame:
 
 def cluster_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame:
     cluster_sizes = np.bincount(fit.cluster_labels, minlength=fit.n_clusters)
+    cluster_diameters = np.asarray(fit.cluster_diameters, dtype=np.float64)
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, fit.n_clusters),
             "cluster_label": np.arange(1, fit.n_clusters + 1, dtype=int),
             "cluster_size": cluster_sizes,
+            "cluster_diameter": cluster_diameters,
+            "cluster_diameter_exact": np.repeat(bool(fit.cluster_diameter_exact), fit.n_clusters),
         }
     )
     for column, region_id in enumerate(data.region_ids):
@@ -85,6 +91,9 @@ def evaluation_to_frame(evaluation: SimulationEvaluation) -> pd.DataFrame:
             {
                 "ARI": evaluation.ari,
                 "cp_rmse": evaluation.cp_rmse,
+                "raw_cp_rmse": evaluation.raw_cp_rmse,
+                "summary_cp_rmse": evaluation.summary_cp_rmse,
+                "bic_refit_cp_rmse": evaluation.bic_refit_cp_rmse,
                 "multiplicity_f1": evaluation.multiplicity_f1,
                 "estimated_clonal_fraction": evaluation.estimated_clonal_fraction,
                 "true_clonal_fraction": evaluation.true_clonal_fraction,

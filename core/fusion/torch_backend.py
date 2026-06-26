@@ -20,6 +20,7 @@ class TorchTumorData:
     b_minus: torch.Tensor
     b_plus: torch.Tensor
     b_fixed: torch.Tensor
+    count_observed: torch.Tensor | None = None  # bool (M, S); None means all observed
 
 
 @dataclass(frozen=True)
@@ -95,12 +96,16 @@ def resolve_runtime(device: str | None, *, dtype: str | None = None) -> TorchRun
     requested_dtype = "auto" if dtype is None else str(dtype).strip().lower()
     if requested_dtype == "auto":
         runtime_dtype = torch.float64
+    elif requested_dtype == "float16":
+        runtime_dtype = torch.float16
     elif requested_dtype == "float32":
         runtime_dtype = torch.float32
     elif requested_dtype == "float64":
         runtime_dtype = torch.float64
     else:
         raise ValueError(f"Unknown runtime dtype: {dtype}")
+    if runtime_dtype == torch.float16 and runtime_device.type != "cuda":
+        raise RuntimeError("Float16 runtime dtype is only supported on CUDA.")
     device_name = runtime_device.type if runtime_device.index is None else f"{runtime_device.type}:{runtime_device.index}"
     return TorchRuntime(device=runtime_device, device_name=device_name, dtype=runtime_dtype)
 
@@ -109,6 +114,12 @@ def to_torch_tumor_data(data: TumorData, runtime: TorchRuntime) -> TorchTumorDat
     dtype = runtime.dtype
     device = runtime.device
     scaling = np.asarray(data.scaling, dtype=np.float64)
+    count_obs_np = getattr(data, "count_observed", None)
+    count_obs_tensor = (
+        torch.as_tensor(count_obs_np, dtype=torch.bool, device=device)
+        if count_obs_np is not None
+        else None
+    )
     return TorchTumorData(
         alt=torch.as_tensor(data.alt_counts, dtype=dtype, device=device),
         total=torch.as_tensor(data.total_counts, dtype=dtype, device=device),
@@ -122,6 +133,7 @@ def to_torch_tumor_data(data: TumorData, runtime: TorchRuntime) -> TorchTumorDat
             dtype=dtype,
             device=device,
         ),
+        count_observed=count_obs_tensor,
     )
 
 
@@ -247,10 +259,18 @@ def cell_terms_torch(
     hess_upper = torch.where(amb, amb_curvature, curvature_fixed)
     gamma_major = torch.where(amb, gamma, torch.ones_like(gamma))
 
+    if data.count_observed is not None:
+        loss = torch.where(data.count_observed, loss, torch.zeros_like(loss))
+        grad = torch.where(data.count_observed, grad, torch.zeros_like(grad))
+        hess_upper = torch.where(data.count_observed, hess_upper, torch.zeros_like(hess_upper))
+
+    hess_upper = torch.clamp(hess_upper, min=1e-8)
+    if data.count_observed is not None:
+        hess_upper = torch.where(data.count_observed, hess_upper, torch.zeros_like(hess_upper))
     return TorchCellTerms(
         loss=loss,
         grad=grad,
-        hess_upper=torch.clamp(hess_upper, min=1e-8),
+        hess_upper=hess_upper,
         gamma_major=gamma_major,
     )
 
@@ -311,10 +331,18 @@ def em_surrogate_terms_torch(
     hess_upper = torch.where(amb, amb_curvature, curvature_fixed)
     gamma_major = torch.where(amb, omega, torch.ones_like(omega))
 
+    if data.count_observed is not None:
+        loss = torch.where(data.count_observed, loss, torch.zeros_like(loss))
+        grad = torch.where(data.count_observed, grad, torch.zeros_like(grad))
+        hess_upper = torch.where(data.count_observed, hess_upper, torch.zeros_like(hess_upper))
+
+    hess_upper = torch.clamp(hess_upper, min=1e-8)
+    if data.count_observed is not None:
+        hess_upper = torch.where(data.count_observed, hess_upper, torch.zeros_like(hess_upper))
     return TorchCellTerms(
         loss=loss,
         grad=grad,
-        hess_upper=torch.clamp(hess_upper, min=1e-8),
+        hess_upper=hess_upper,
         gamma_major=gamma_major,
     )
 
@@ -394,16 +422,9 @@ def stationarity_residual_torch(
     upper: torch.Tensor,
     atol: float,
 ) -> torch.Tensor:
-    lower_active = phi <= lower + float(atol)
-    upper_active = phi >= upper - float(atol)
-    frozen = upper <= lower + float(atol)
-    interior = ~(lower_active | upper_active | frozen)
-    residual = torch.zeros_like(total_grad)
-    residual[interior] = total_grad[interior]
-    residual[lower_active] = torch.minimum(total_grad[lower_active], torch.zeros_like(total_grad[lower_active]))
-    residual[upper_active] = torch.maximum(total_grad[upper_active], torch.zeros_like(total_grad[upper_active]))
-    residual[frozen] = 0.0
-    return residual
+    del atol
+    projected = torch.minimum(torch.maximum(phi - total_grad, lower), upper)
+    return phi - projected
 
 
 def graph_fusion_kkt_residual_from_grad_torch(
@@ -459,18 +480,26 @@ def graph_fusion_kkt_residual_from_grad_torch(
         dual_ball_residual = 0.0
     else:
         diff = graph_forward_edges(phi, edge_u=edge_u, edge_v=edge_v)
-        diff_norm = torch.linalg.norm(diff, dim=1)
         dual_norm = torch.linalg.norm(dual, dim=1)
         radius = float(lambda_value) * edge_w
-        edge_resid = torch.zeros_like(diff_norm)
-        active = diff_norm > float(atol)
-        if torch.any(active):
-            target = radius[active, None] * diff[active] / diff_norm[active, None].clamp_min(float(atol))
-            edge_resid[active] = torch.linalg.norm(dual[active] - target, dim=1)
+
+        # Proximal fixed-point residual: R_e = d_e - prox_{r_e*|.|_2}(d_e + y_e)
+        # Stable form avoids cancellation and gives exact zeros for exact KKT:
+        #   |v| >= r: R_e = -y_e + r_e * v / |v|    (d-v+r*v/|v| = -y+r*v/|v|)
+        #   |v| <  r: R_e = d_e                       (prox maps v to 0)
+        # This is zero iff y_e ∈ r_e * ∂|d_e|_2, for any d_e including near-zero.
+        prox_input = diff + dual  # v = d + y, shape (E, S)
+        prox_input_norm = torch.linalg.norm(prox_input, dim=1)  # (E,)
+        big = prox_input_norm >= radius  # |v| >= r → active prox case
+        edge_resid = torch.zeros_like(prox_input_norm)
+        if big.any():
+            safe_norm = prox_input_norm[big].clamp_min(1e-300)
+            r = -dual[big] + radius[big, None] * prox_input[big] / safe_norm[:, None]
+            edge_resid[big] = torch.linalg.norm(r, dim=1)
+        if (~big).any():
+            edge_resid[~big] = torch.linalg.norm(diff[~big], dim=1)
 
         ball_resid = torch.clamp(dual_norm - radius, min=0.0)
-        if torch.any(~active):
-            edge_resid[~active] = ball_resid[~active]
 
         denom = 1.0 + float(torch.max(radius).item()) if radius.numel() else 1.0
         edge_subgradient_residual = float((torch.max(edge_resid) / denom).item()) if edge_resid.numel() else 0.0

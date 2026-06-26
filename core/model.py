@@ -34,6 +34,9 @@ class FitResult:
     phi_clustered: np.ndarray
     cluster_labels: np.ndarray
     cluster_centers: np.ndarray
+    cluster_diameters: np.ndarray
+    max_cluster_diameter: float
+    cluster_diameter_exact: bool
     gamma_major: np.ndarray
     major_probability: np.ndarray
     major_call: np.ndarray
@@ -101,11 +104,21 @@ class FitResult:
     last_reject_reason: str
     failure_reason: str
     selection_eligible: bool
+    stationarity_certified: bool = False       # True if KKT residual is below tolerance
+    global_optimality_certified: bool = False  # Always False: MM finds stationary points only
+    number_of_starts: int = 1
+    number_of_finite_starts: int = 1
+    best_start_objective: float = float("nan")
+    second_best_start_objective: float = float("nan")
+    objective_spread_across_starts: float = float("nan")
+    selected_start_objective_rank: int = 1
     history: list[float] = field(default_factory=list)
     bic: float | None = None
     classic_bic: float | None = None
     extended_bic: float | None = None
     classic_bic_depth_n: float | None = None
+    classic_bic_active_df: float | None = None
+    classic_bic_active_df_depth_n: float | None = None
     bic_loglik: float | None = None
     bic_loglik_source: str | None = None
     bic_df: float | None = None
@@ -114,6 +127,15 @@ class FitResult:
     bic_depth_n_eff: float | None = None
     bic_partition_tol: float | None = None
     bic_refit_boundary_count: int | None = None
+    bic_refit_finite_candidate_found: bool | None = None
+    bic_refit_global_optimum_certified: bool | None = None
+    bic_refit_coordinate_count: int | None = None
+    bic_refit_finite_coordinate_count: int | None = None
+    bic_refit_total_grid_points: int | None = None
+    bic_refit_max_grid_spacing: float | None = None
+    bic_refit_total_candidate_basins: int | None = None
+    bic_refit_total_refined_candidates: int | None = None
+    bic_refit_min_best_second_loss_gap: float | None = None
     bic_refit_converged: bool | None = None
     bic_refit_phi: np.ndarray | None = None
     bic_refit_cluster_centers: np.ndarray | None = None
@@ -168,6 +190,9 @@ def fit_single_stage_em(
         phi_clustered=artifacts.phi_clustered,
         cluster_labels=artifacts.cluster_labels.astype(np.int64, copy=False),
         cluster_centers=artifacts.cluster_centers,
+        cluster_diameters=artifacts.cluster_diameters.astype(np.float64, copy=False),
+        max_cluster_diameter=float(artifacts.max_cluster_diameter),
+        cluster_diameter_exact=bool(artifacts.cluster_diameter_exact),
         gamma_major=artifacts.gamma_major,
         major_probability=artifacts.major_probability,
         major_call=artifacts.major_call.astype(bool, copy=False),
@@ -235,6 +260,24 @@ def fit_single_stage_em(
         last_reject_reason=str(artifacts.last_reject_reason),
         failure_reason=str(artifacts.failure_reason),
         selection_eligible=bool(artifacts.selection_eligible),
+        stationarity_certified=bool(
+            getattr(artifacts, "stationarity_certified", artifacts.selection_eligible)
+        ),
+        global_optimality_certified=bool(
+            getattr(artifacts, "global_optimality_certified", False)
+        ),
+        number_of_starts=int(getattr(artifacts, "number_of_starts", 1)),
+        number_of_finite_starts=int(getattr(artifacts, "number_of_finite_starts", 1)),
+        best_start_objective=float(
+            getattr(artifacts, "best_start_objective", artifacts.penalized_objective)
+        ),
+        second_best_start_objective=float(
+            getattr(artifacts, "second_best_start_objective", float("nan"))
+        ),
+        objective_spread_across_starts=float(
+            getattr(artifacts, "objective_spread_across_starts", float("nan"))
+        ),
+        selected_start_objective_rank=int(getattr(artifacts, "selected_start_objective_rank", 1)),
         history=list(artifacts.history),
         solver_state=artifacts.solver_state,
     )

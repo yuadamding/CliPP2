@@ -12,6 +12,7 @@ from ..core.model import FitOptions, FitResult, fit_single_stage_em
 from ..core.fusion_solver import (
     PartitionRefitResult,
     SolverState,
+    cluster_diameters_from_edges,
     cluster_labels_from_edges,
     partition_constrained_observed_refit,
     prepare_torch_problem,
@@ -35,6 +36,7 @@ from .selection import (
     LAMBDA_GRID_MODES,
     LambdaBracket,
     bic_degrees_of_freedom,
+    compute_bic_with_df,
     compute_classic_bic,
     compute_classic_bic_depth_n,
     compute_extended_bic,
@@ -242,6 +244,7 @@ class CandidateStaticMetadata:
     edge_weight_max: float
     edge_weight_mean: float
     edge_list_hash: str
+    pilot_matrix_hash: str
     input_data_hash: str
 
 
@@ -278,12 +281,18 @@ def _selection_score_value(
 def _is_bic_selection_eligible(
     *,
     raw_kkt_eligible: bool,
-    bic_refit_converged: bool,
     classic_bic: float,
+    bic_refit_finite_candidate_found: bool | None = None,
+    bic_refit_converged: bool | None = None,
 ) -> bool:
+    refit_finite = (
+        bool(bic_refit_finite_candidate_found)
+        if bic_refit_finite_candidate_found is not None
+        else bool(bic_refit_converged)
+    )
     return bool(
         bool(raw_kkt_eligible)
-        and bool(bic_refit_converged)
+        and refit_finite
         and np.isfinite(float(classic_bic))
     )
 
@@ -292,6 +301,17 @@ def _bic_selection_eligible_mask(search_df: pd.DataFrame) -> np.ndarray:
     n_rows = int(search_df.shape[0])
     if "bic_selection_eligible" in search_df.columns:
         return search_df["bic_selection_eligible"].astype(bool).to_numpy(dtype=bool)
+    if any(
+        column in search_df.columns
+        for column in (
+            "raw_kkt_eligible",
+            "bic_refit_finite_candidate_found",
+            "bic_refit_converged",
+            "classic_bic",
+            "bic",
+        )
+    ):
+        return _add_bic_selection_eligible(search_df)["bic_selection_eligible"].astype(bool).to_numpy(dtype=bool)
     if "selection_eligible" in search_df.columns:
         return search_df["selection_eligible"].astype(bool).to_numpy(dtype=bool)
     if "converged" in search_df.columns:
@@ -316,10 +336,13 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
         raw_kkt = enriched["converged"].astype(bool).to_numpy(dtype=bool)
     else:
         raw_kkt = np.zeros(n_rows, dtype=bool)
-    if "bic_refit_converged" in enriched.columns:
+    if "bic_refit_finite_candidate_found" in enriched.columns:
+        bic_refit = enriched["bic_refit_finite_candidate_found"].astype(bool).to_numpy(dtype=bool)
+    elif "bic_refit_converged" in enriched.columns:
         bic_refit = enriched["bic_refit_converged"].astype(bool).to_numpy(dtype=bool)
     else:
-        bic_refit = np.ones(n_rows, dtype=bool)
+        # Absent certificate means unknown, treated as False (not True)
+        bic_refit = np.zeros(n_rows, dtype=bool)
     if "classic_bic" in enriched.columns:
         classic_bic = enriched["classic_bic"].to_numpy(dtype=float)
     elif "bic" in enriched.columns:
@@ -473,6 +496,11 @@ def _cluster_sizes_text(labels: np.ndarray) -> str:
     return ",".join(str(int(value)) for value in counts.tolist())
 
 
+def _max_cluster_diameter(diameters: np.ndarray) -> float:
+    values = np.asarray(diameters, dtype=np.float64)
+    return float(np.max(values)) if values.size else 0.0
+
+
 def _hash_array(hasher: "hashlib._Hash", array: np.ndarray) -> None:
     contiguous = np.ascontiguousarray(array)
     hasher.update(str(contiguous.dtype).encode("utf-8"))
@@ -512,7 +540,19 @@ def _edge_list_hash(edge_u: np.ndarray, edge_v: np.ndarray, edge_w: np.ndarray) 
     return hasher.hexdigest()
 
 
-def _candidate_static_metadata(data: TumorData, graph) -> CandidateStaticMetadata:
+def _pilot_matrix_hash(pilot_phi: StartArray | None) -> str:
+    if pilot_phi is None:
+        return ""
+    if torch.is_tensor(pilot_phi):
+        array = pilot_phi.detach().cpu().numpy()
+    else:
+        array = np.asarray(pilot_phi)
+    hasher = hashlib.blake2b(digest_size=16)
+    _hash_array(hasher, np.asarray(array, dtype=np.float64))
+    return hasher.hexdigest()
+
+
+def _candidate_static_metadata(data: TumorData, graph, pilot_phi: StartArray | None = None) -> CandidateStaticMetadata:
     edge_count = int(graph.edge_u.size)
     if edge_count:
         edge_weight_min = float(np.min(graph.edge_w))
@@ -528,6 +568,7 @@ def _candidate_static_metadata(data: TumorData, graph) -> CandidateStaticMetadat
         edge_weight_max=edge_weight_max,
         edge_weight_mean=edge_weight_mean,
         edge_list_hash=_edge_list_hash(graph.edge_u, graph.edge_v, graph.edge_w),
+        pilot_matrix_hash=_pilot_matrix_hash(pilot_phi),
         input_data_hash=_input_data_hash(data),
     )
 
@@ -885,9 +926,14 @@ def _best_candidate_rows_by_lambda(search_df: pd.DataFrame) -> pd.DataFrame:
     if search_df.empty:
         return search_df.copy()
     ranked = _add_bic_selection_eligible(search_df)
+    if "bic_refit_finite_candidate_found" not in ranked.columns and "bic_refit_converged" in ranked.columns:
+        ranked["bic_refit_finite_candidate_found"] = ranked["bic_refit_converged"].astype(bool)
+    if "bic_refit_converged" not in ranked.columns and "bic_refit_finite_candidate_found" in ranked.columns:
+        ranked["bic_refit_converged"] = ranked["bic_refit_finite_candidate_found"].astype(bool)
     ranked["_lambda_key"] = np.round(ranked["lambda"].to_numpy(dtype=float), 12)
     defaults = {
         "selection_eligible": False,
+        "bic_refit_finite_candidate_found": False,
         "bic_refit_converged": False,
         "converged": False,
         "classic_bic": np.inf,
@@ -901,12 +947,13 @@ def _best_candidate_rows_by_lambda(search_df: pd.DataFrame) -> pd.DataFrame:
         "_lambda_key",
         "bic_selection_eligible",
         "selection_eligible",
+        "bic_refit_finite_candidate_found",
         "bic_refit_converged",
         "classic_bic",
         "penalized_objective",
         "selection_step",
     ]
-    ascending = [True, False, False, False, True, True, True]
+    ascending = [True, False, False, False, False, True, True, True]
     ranked = ranked.sort_values(sort_columns, ascending=ascending)
     return ranked.drop_duplicates("_lambda_key", keep="first").drop(columns=["_lambda_key"]).reset_index(drop=True)
 
@@ -1550,6 +1597,13 @@ def _evaluate_candidate(
         edge_v=graph.edge_v,
         tol=bic_partition_tol,
     )
+    bic_partition_diameters, bic_partition_diameter_exact = cluster_diameters_from_edges(
+        fit.phi,
+        bic_labels,
+        edge_u=graph.edge_u,
+        edge_v=graph.edge_v,
+    )
+    bic_partition_max_diameter = _max_cluster_diameter(bic_partition_diameters)
     partition_hash = _partition_signature(bic_labels)
     bic_refit_cache_hit = False
     if bic_refit_cache is not None and partition_hash in bic_refit_cache:
@@ -1578,38 +1632,62 @@ def _evaluate_candidate(
         selection_score=selection_score,
     )
     classic_bic_depth_n = compute_classic_bic_depth_n(bic_loglik, bic_n_clusters, data)
+    bic_df_value = float(bic_degrees_of_freedom(bic_n_clusters, data))
+    bic_active_df_value = float(bic_refit.active_degrees_of_freedom)
+    bic_n_eff_value = float(effective_bic_cell_count(data))
+    bic_depth_n_eff_value = float(effective_bic_depth_count(data))
+    classic_bic_active_df = compute_bic_with_df(bic_loglik, bic_active_df_value, bic_n_eff_value)
+    classic_bic_active_df_depth_n = compute_bic_with_df(
+        bic_loglik,
+        bic_active_df_value,
+        bic_depth_n_eff_value,
+    )
     fit.bic = bic
     fit.classic_bic = classic_bic
     fit.extended_bic = extended_bic
     fit.classic_bic_depth_n = classic_bic_depth_n
+    fit.classic_bic_active_df = classic_bic_active_df
+    fit.classic_bic_active_df_depth_n = classic_bic_active_df_depth_n
     fit.bic_loglik = bic_loglik
     fit.bic_loglik_source = bic_refit.loglik_source
-    fit.bic_df = float(bic_degrees_of_freedom(bic_n_clusters, data))
-    fit.bic_active_df = float(bic_refit.active_degrees_of_freedom)
-    fit.bic_n_eff = float(effective_bic_cell_count(data))
-    fit.bic_depth_n_eff = float(effective_bic_depth_count(data))
+    fit.bic_df = float(bic_df_value)
+    fit.bic_active_df = float(bic_active_df_value)
+    fit.bic_n_eff = float(bic_n_eff_value)
+    fit.bic_depth_n_eff = float(bic_depth_n_eff_value)
     fit.bic_partition_tol = float(bic_partition_tol)
     fit.bic_refit_boundary_count = int(bic_refit.boundary_count)
-    fit.bic_refit_converged = bool(bic_refit.converged)
+    bic_refit_finite_candidate_found = bool(bic_refit.finite_candidate_found)
+    bic_refit_global_optimum_certified = False
+    fit.bic_refit_finite_candidate_found = bic_refit_finite_candidate_found
+    fit.bic_refit_global_optimum_certified = bic_refit_global_optimum_certified
+    fit.bic_refit_coordinate_count = int(bic_refit.refit_coordinate_count)
+    fit.bic_refit_finite_coordinate_count = int(bic_refit.refit_finite_coordinate_count)
+    fit.bic_refit_total_grid_points = int(bic_refit.refit_total_grid_points)
+    fit.bic_refit_max_grid_spacing = float(bic_refit.refit_max_grid_spacing)
+    fit.bic_refit_total_candidate_basins = int(bic_refit.refit_total_candidate_basins)
+    fit.bic_refit_total_refined_candidates = int(bic_refit.refit_total_refined_candidates)
+    fit.bic_refit_min_best_second_loss_gap = float(bic_refit.refit_min_best_second_loss_gap)
+    fit.bic_refit_converged = bic_refit_finite_candidate_found
     fit.bic_refit_phi = bic_refit.phi.astype(fit.phi.dtype, copy=False)
     fit.bic_refit_cluster_centers = bic_refit.cluster_centers.astype(fit.phi.dtype, copy=False)
     fit.bic_partition_labels = bic_labels.astype(np.int64, copy=False)
     fit.selection_score_name = canonical_score_name
     penalty_value, profile_penalty_value = _profile_penalty_from_fit(fit)
-    bic_df_value = float(bic_degrees_of_freedom(bic_n_clusters, data))
-    bic_n_eff_value = float(effective_bic_cell_count(data))
-    bic_depth_n_eff_value = float(effective_bic_depth_count(data))
     bic_penalty_value = float(bic_df_value * np.log(max(bic_n_eff_value, 1.0)))
+    bic_active_penalty_value = float(bic_active_df_value * np.log(max(bic_n_eff_value, 1.0)))
     raw_kkt_eligible = bool(fit.selection_eligible)
     bic_selection_eligible = _is_bic_selection_eligible(
         raw_kkt_eligible=raw_kkt_eligible,
-        bic_refit_converged=bool(bic_refit.converged),
         classic_bic=float(classic_bic),
+        bic_refit_finite_candidate_found=bic_refit_finite_candidate_found,
     )
 
     evaluation = None
     ari_value = np.nan
     cp_rmse_value = np.nan
+    raw_cp_rmse_value = np.nan
+    summary_cp_rmse_value = np.nan
+    bic_refit_cp_rmse_value = np.nan
     multiplicity_f1_value = np.nan
     estimated_clonal_fraction_value = np.nan
     true_clonal_fraction_value = np.nan
@@ -1633,6 +1711,15 @@ def _evaluate_candidate(
             )
             ari_value = float(evaluation.ari)
             cp_rmse_value = float(evaluation.cp_rmse)
+            raw_cp_rmse_value = float(
+                evaluation.raw_cp_rmse if evaluation.raw_cp_rmse is not None else np.nan
+            )
+            summary_cp_rmse_value = float(
+                evaluation.summary_cp_rmse if evaluation.summary_cp_rmse is not None else evaluation.cp_rmse
+            )
+            bic_refit_cp_rmse_value = float(
+                evaluation.bic_refit_cp_rmse if evaluation.bic_refit_cp_rmse is not None else np.nan
+            )
             multiplicity_f1_value = float(evaluation.multiplicity_f1)
             estimated_clonal_fraction_value = float(evaluation.estimated_clonal_fraction)
             true_clonal_fraction_value = float(evaluation.true_clonal_fraction)
@@ -1657,25 +1744,41 @@ def _evaluate_candidate(
         "extended_bic": float(extended_bic),
         "classic_bic_cell_n": float(classic_bic),
         "classic_bic_depth_n": float(classic_bic_depth_n),
+        "classic_bic_active_df": float(classic_bic_active_df),
+        "classic_bic_active_df_depth_n": float(classic_bic_active_df_depth_n),
         "bic_loglik": float(bic_loglik),
         "bic_loglik_source": str(bic_refit.loglik_source),
         "bic_df": float(bic_df_value),
-        "bic_active_df": float(bic_refit.active_degrees_of_freedom),
+        "bic_active_df": float(bic_active_df_value),
         "bic_penalty": float(bic_penalty_value),
+        "bic_active_penalty": float(bic_active_penalty_value),
         "bic_n_eff": float(bic_n_eff_value),
         "bic_depth_n_eff": float(bic_depth_n_eff_value),
         "delta_loglik_vs_one_cluster": np.nan,
         "delta_bic_vs_one_cluster": np.nan,
         "bic_partition_tol": float(bic_partition_tol),
         "bic_n_clusters": int(bic_n_clusters),
+        "bic_partition_max_diameter": float(bic_partition_max_diameter),
+        "bic_partition_diameter_exact": bool(bic_partition_diameter_exact),
         "loglik": float(fit.loglik),
         "raw_loglik": float(fit.loglik),
         "fit_loss": float(-fit.loglik),
         "summary_loglik": float(fit.summary_loglik),
         "refit_loglik": float(bic_loglik),
         "refit_fit_loss": float(bic_refit.fit_loss),
-        "refit_converged": bool(bic_refit.converged),
-        "bic_refit_converged": bool(bic_refit.converged),
+        "refit_finite_candidate_found": bool(bic_refit_finite_candidate_found),
+        "bic_refit_finite_candidate_found": bool(bic_refit_finite_candidate_found),
+        "refit_global_optimum_certified": bool(bic_refit_global_optimum_certified),
+        "bic_refit_global_optimum_certified": bool(bic_refit_global_optimum_certified),
+        "bic_refit_coordinate_count": int(bic_refit.refit_coordinate_count),
+        "bic_refit_finite_coordinate_count": int(bic_refit.refit_finite_coordinate_count),
+        "bic_refit_total_grid_points": int(bic_refit.refit_total_grid_points),
+        "bic_refit_max_grid_spacing": float(bic_refit.refit_max_grid_spacing),
+        "bic_refit_total_candidate_basins": int(bic_refit.refit_total_candidate_basins),
+        "bic_refit_total_refined_candidates": int(bic_refit.refit_total_refined_candidates),
+        "bic_refit_min_best_second_loss_gap": float(bic_refit.refit_min_best_second_loss_gap),
+        "refit_converged": bool(bic_refit_finite_candidate_found),
+        "bic_refit_converged": bool(bic_refit_finite_candidate_found),
         "bic_refit_cache_hit": bool(bic_refit_cache_hit),
         "refit_boundary_count": int(bic_refit.boundary_count),
         "refit_active_df": int(bic_refit.active_degrees_of_freedom),
@@ -1685,12 +1788,22 @@ def _evaluate_candidate(
         "raw_penalty": float(penalty_value),
         "profile_penalty": float(profile_penalty_value),
         "summary_n_clusters": int(fit.n_clusters),
+        "summary_cluster_max_diameter": float(fit.max_cluster_diameter),
+        "summary_cluster_diameter_exact": bool(fit.cluster_diameter_exact),
         "n_clusters": int(bic_n_clusters),
         "partition_signature": partition_hash,
         "partition_hash": partition_hash,
         "cluster_sizes": _cluster_sizes_text(bic_labels),
         "converged": bool(fit.converged),
         "raw_fit_status": str(fit.failure_reason),
+        "stationarity_certified": bool(fit.stationarity_certified),
+        "global_optimality_certified": bool(fit.global_optimality_certified),
+        "number_of_starts": int(fit.number_of_starts),
+        "number_of_finite_starts": int(fit.number_of_finite_starts),
+        "best_start_objective": float(fit.best_start_objective),
+        "second_best_start_objective": float(fit.second_best_start_objective),
+        "objective_spread_across_starts": float(fit.objective_spread_across_starts),
+        "selected_start_objective_rank": int(fit.selected_start_objective_rank),
         "converged_inner": bool(fit.converged_inner),
         "converged_outer": bool(fit.converged_outer),
         "iterations": int(fit.iterations),
@@ -1768,6 +1881,7 @@ def _evaluate_candidate(
         "adaptive_weight_floor": float(effective_fit_options.adaptive_weight_floor),
         "adaptive_weight_baseline": float(effective_fit_options.adaptive_weight_baseline),
         "edge_list_hash": str(candidate_static.edge_list_hash),
+        "pilot_matrix_hash": str(candidate_static.pilot_matrix_hash),
         "input_data_hash": str(candidate_static.input_data_hash),
         "evaluation_mode": "ari_only" if ari_only_evaluation else "full",
         "fit_compute_summary": bool(compute_summary),
@@ -1775,6 +1889,9 @@ def _evaluate_candidate(
         "solver_state_warm_start": bool(solver_state is not None),
         "ARI": ari_value,
         "cp_rmse": cp_rmse_value,
+        "raw_cp_rmse": raw_cp_rmse_value,
+        "summary_cp_rmse": summary_cp_rmse_value,
+        "bic_refit_cp_rmse": bic_refit_cp_rmse_value,
         "multiplicity_f1": multiplicity_f1_value,
         "estimated_clonal_fraction": estimated_clonal_fraction_value,
         "true_clonal_fraction": true_clonal_fraction_value,
@@ -1901,7 +2018,7 @@ def _grid_search_selection(
     effective_graph = solver_context.graph_spec
     effective_tensor_graph = solver_context.graph
     effective_fit_options = replace(fit_options, graph=effective_graph)
-    static_metadata = _candidate_static_metadata(data, effective_graph)
+    static_metadata = _candidate_static_metadata(data, effective_graph, pilot_phi=pilot_phi)
     search_fit_options = (
         _adaptive_first_pass_options(effective_fit_options)
         if adaptive_lambda_mode

@@ -9,6 +9,7 @@ from time import perf_counter
 import numpy as np
 import pandas as pd
 
+from .._version import __version__ as _SOFTWARE_VERSION
 from ..core.model import FitOptions
 from ..core.fusion_solver import load_pairwise_fusion_graph_tsv
 from ..io.data import TumorData, load_tumor_tsv
@@ -16,6 +17,14 @@ from ..metrics.evaluation import evaluate_fit_against_simulation
 from .model_selection import select_model
 from .outputs import write_fit_outputs
 from .settings import summarize_tumor_regime
+
+
+def _cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
 
 
 def process_one_file_bundle(
@@ -111,6 +120,14 @@ def process_one_file_bundle(
         if best_evaluation is not None
         else "not_available"
     )
+    best_bic_refit_finite = (
+        bool(best_fit.bic_refit_finite_candidate_found)
+        if getattr(best_fit, "bic_refit_finite_candidate_found", None) is not None
+        else bool(best_fit.bic_refit_converged)
+        if best_fit.bic_refit_converged is not None
+        else False
+    )
+    best_bic_refit_global = bool(getattr(best_fit, "bic_refit_global_optimum_certified", False))
 
     summary = {
         "tumor_id": data.tumor_id,
@@ -206,8 +223,8 @@ def process_one_file_bundle(
         if getattr(simulation_diagnostics, "best_ari_certified", None) is None
         else float(simulation_diagnostics.best_ari_certified),
         "best_ari_bic_eligible": np.nan
-        if getattr(simulation_diagnostics, "best_ari_certified", None) is None
-        else float(simulation_diagnostics.best_ari_certified),
+        if getattr(simulation_diagnostics, "best_ari_bic_eligible", None) is None
+        else float(simulation_diagnostics.best_ari_bic_eligible),
         "best_ari_near_kkt": np.nan
         if getattr(simulation_diagnostics, "best_ari_near_kkt", None) is None
         else float(simulation_diagnostics.best_ari_near_kkt),
@@ -252,6 +269,7 @@ def process_one_file_bundle(
         "lambda_grid_mode": str(lambda_grid_mode if lambda_grid is None else "explicit"),
         "input_data_hash": str(_selected_value("input_data_hash", "")),
         "edge_list_hash": str(_selected_value("edge_list_hash", "")),
+        "pilot_matrix_hash": str(_selected_value("pilot_matrix_hash", "")),
         "eps": float(_selected_value("eps", fit_options.eps)),
         "major_prior": float(_selected_value("major_prior", fit_options.major_prior)),
         "adaptive_weight_gamma": float(
@@ -277,18 +295,59 @@ def process_one_file_bundle(
         "classic_bic_depth_n": np.nan
         if best_fit.classic_bic_depth_n is None
         else float(best_fit.classic_bic_depth_n),
+        "classic_bic_active_df": np.nan
+        if best_fit.classic_bic_active_df is None
+        else float(best_fit.classic_bic_active_df),
+        "classic_bic_active_df_depth_n": np.nan
+        if best_fit.classic_bic_active_df_depth_n is None
+        else float(best_fit.classic_bic_active_df_depth_n),
         "bic_partition_tol": np.nan
         if best_fit.bic_partition_tol is None
         else float(best_fit.bic_partition_tol),
+        "summary_cluster_max_diameter": float(best_fit.max_cluster_diameter),
+        "summary_cluster_diameter_exact": bool(best_fit.cluster_diameter_exact),
+        "bic_partition_max_diameter": float(_selected_value("bic_partition_max_diameter", np.nan)),
+        "bic_partition_diameter_exact": bool(_selected_value("bic_partition_diameter_exact", False)),
         "bic_refit_boundary_count": -1
         if best_fit.bic_refit_boundary_count is None
         else int(best_fit.bic_refit_boundary_count),
+        "bic_refit_finite_candidate_found": bool(best_bic_refit_finite),
+        "bic_refit_global_optimum_certified": bool(best_bic_refit_global),
+        "bic_refit_coordinate_count": -1
+        if best_fit.bic_refit_coordinate_count is None
+        else int(best_fit.bic_refit_coordinate_count),
+        "bic_refit_finite_coordinate_count": -1
+        if best_fit.bic_refit_finite_coordinate_count is None
+        else int(best_fit.bic_refit_finite_coordinate_count),
+        "bic_refit_total_grid_points": -1
+        if best_fit.bic_refit_total_grid_points is None
+        else int(best_fit.bic_refit_total_grid_points),
+        "bic_refit_max_grid_spacing": np.nan
+        if best_fit.bic_refit_max_grid_spacing is None
+        else float(best_fit.bic_refit_max_grid_spacing),
+        "bic_refit_total_candidate_basins": -1
+        if best_fit.bic_refit_total_candidate_basins is None
+        else int(best_fit.bic_refit_total_candidate_basins),
+        "bic_refit_total_refined_candidates": -1
+        if best_fit.bic_refit_total_refined_candidates is None
+        else int(best_fit.bic_refit_total_refined_candidates),
+        "bic_refit_min_best_second_loss_gap": np.nan
+        if best_fit.bic_refit_min_best_second_loss_gap is None
+        else float(best_fit.bic_refit_min_best_second_loss_gap),
         "bic_refit_converged": bool(best_fit.bic_refit_converged)
         if best_fit.bic_refit_converged is not None
         else False,
         "primary_phi_source": "raw_penalized_fit",
         "bic_refit_phi_source": "secondary_partition_refit",
         "converged": bool(best_fit.converged),
+        "stationarity_certified": bool(best_fit.stationarity_certified),
+        "global_optimality_certified": bool(best_fit.global_optimality_certified),
+        "number_of_starts": int(best_fit.number_of_starts),
+        "number_of_finite_starts": int(best_fit.number_of_finite_starts),
+        "best_start_objective": float(best_fit.best_start_objective),
+        "second_best_start_objective": float(best_fit.second_best_start_objective),
+        "objective_spread_across_starts": float(best_fit.objective_spread_across_starts),
+        "selected_start_objective_rank": int(best_fit.selected_start_objective_rank),
         "converged_inner": bool(best_fit.converged_inner),
         "converged_outer": bool(best_fit.converged_outer),
         "inner_kkt_residual": float(best_fit.inner_kkt_residual),
@@ -349,7 +408,7 @@ def process_one_file_bundle(
                 "bic_selection_eligible",
                 bool(
                     best_fit.selection_eligible
-                    and bool(best_fit.bic_refit_converged)
+                    and bool(best_bic_refit_finite)
                     and best_fit.classic_bic is not None
                     and np.isfinite(float(best_fit.classic_bic))
                 ),
@@ -362,6 +421,12 @@ def process_one_file_bundle(
         "summary_tol": float(best_fit.summary_tol),
         "ARI": np.nan if reported_selected_ari is None else float(reported_selected_ari),
         "cp_rmse": np.nan if best_evaluation is None else float(best_evaluation.cp_rmse),
+        "raw_cp_rmse": np.nan
+        if best_evaluation is None
+        else float(getattr(best_evaluation, "raw_cp_rmse", np.nan)),
+        "summary_cp_rmse": np.nan
+        if best_evaluation is None
+        else float(getattr(best_evaluation, "summary_cp_rmse", best_evaluation.cp_rmse)),
         "multiplicity_f1": np.nan if best_evaluation is None else float(best_evaluation.multiplicity_f1),
         "estimated_clonal_fraction": np.nan
         if best_evaluation is None
@@ -374,7 +439,14 @@ def process_one_file_bundle(
         else float(best_evaluation.clonal_fraction_error),
         "n_eval_mutations": np.nan if best_evaluation is None else int(best_evaluation.n_eval_mutations),
         "n_filtered_mutations": np.nan if best_evaluation is None else int(best_evaluation.n_filtered_mutations),
+        "bic_refit_ari": np.nan
+        if (best_evaluation is None or getattr(best_evaluation, "bic_refit_ari", None) is None)
+        else float(best_evaluation.bic_refit_ari),
+        "bic_refit_cp_rmse": np.nan
+        if (best_evaluation is None or getattr(best_evaluation, "bic_refit_cp_rmse", None) is None)
+        else float(best_evaluation.bic_refit_cp_rmse),
         "elapsed_seconds": elapsed_seconds,
+        "software_version": _SOFTWARE_VERSION,
     }
 
     if write_outputs:
@@ -481,6 +553,21 @@ def run_directory(
                 )
             )
     else:
+        # Guard against multi-process CUDA: each spawned process would independently
+        # initialize the same device, risking OOM or allocator contention.
+        effective_device = getattr(fit_options, "device", "auto") if fit_options is not None else "auto"
+        if str(effective_device).strip().lower() not in {"cpu", "auto"} or (
+            str(effective_device).strip().lower() == "auto"
+            and _cuda_available()
+        ):
+            import warnings
+            warnings.warn(
+                f"workers={worker_count} with device={effective_device!r}: multiple processes may "
+                "each initialize the same CUDA device, causing OOM or contention. "
+                "Use workers=1 for CUDA mode, or set device='cpu'.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         with cf.ProcessPoolExecutor(
             max_workers=worker_count,
             mp_context=mp.get_context("spawn"),
@@ -510,7 +597,12 @@ def run_directory(
             ordered: dict[str, dict[str, float | int | str | bool]] = {}
             for future in cf.as_completed(future_map):
                 file_path = future_map[future]
-                ordered[file_path.stem] = future.result()
+                try:
+                    ordered[file_path.stem] = future.result()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Worker failed on {file_path}: {exc}"
+                    ) from exc
             summaries = [ordered[file_path.stem] for file_path in files]
 
     summary_df = pd.DataFrame(summaries)

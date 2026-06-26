@@ -27,7 +27,7 @@ from .benchmark_common import (
     write_benchmark_tables,
     write_patient_checkpoint,
 )
-from .model_selection import _edge_list_hash, _input_data_hash
+from .model_selection import _edge_list_hash, _input_data_hash, _pilot_matrix_hash
 from .pipeline import process_one_file_bundle
 from .selection import PUBLIC_LAMBDA_GRID_MODES, is_adaptive_lambda_grid_mode
 
@@ -107,6 +107,7 @@ _CURRENT_RESUME_PATIENT_COLUMNS = {
     "bic_cluster_penalty",
     "input_data_hash",
     "edge_list_hash",
+    "pilot_matrix_hash",
     "graph_name",
     "adaptive_weight_gamma",
     "adaptive_weight_floor",
@@ -151,6 +152,7 @@ _CURRENT_RESUME_CANDIDATE_COLUMNS = {
     "post_polish_selection_eligible",
     "input_data_hash",
     "edge_list_hash",
+    "pilot_matrix_hash",
     "graph_name",
     "adaptive_weight_gamma",
     "adaptive_weight_floor",
@@ -231,7 +233,7 @@ def _validate_patient_candidate_consistency(
 ) -> None:
     if existing_patient_df.empty or existing_candidate_df.empty:
         return
-    for column in ["input_data_hash", "edge_list_hash", "graph_name"]:
+    for column in ["input_data_hash", "edge_list_hash", "pilot_matrix_hash", "graph_name"]:
         if column not in existing_patient_df.columns or column not in existing_candidate_df.columns:
             continue
         patient_values = existing_patient_df[["tumor_id", column]].dropna()
@@ -266,10 +268,15 @@ def _saved_resume_hashes_by_tumor(
         required = {"tumor_id", "input_data_hash", "edge_list_hash", "graph_name"}
         if df.empty or not required.issubset(df.columns):
             continue
-        for tumor_id, tumor_df in df.loc[:, sorted(required)].dropna(subset=["tumor_id"]).groupby("tumor_id"):
+        hash_columns = [
+            column
+            for column in ["input_data_hash", "edge_list_hash", "pilot_matrix_hash", "graph_name"]
+            if column in df.columns
+        ]
+        for tumor_id, tumor_df in df.loc[:, ["tumor_id", *hash_columns]].dropna(subset=["tumor_id"]).groupby("tumor_id"):
             tumor_key = str(tumor_id)
             record = saved.setdefault(tumor_key, {})
-            for column in ["input_data_hash", "edge_list_hash", "graph_name"]:
+            for column in hash_columns:
                 values = {
                     value
                     for value in tumor_df[column].dropna().astype(str).str.strip().unique()
@@ -306,20 +313,18 @@ def _current_resume_hashes_for_file(
         missing_cna_policy=str(missing_cna_policy),
     )
     graph = None
-    pilot_phi = None
+    pilot_phi, _, _ = compute_scalar_cell_wells(
+        data,
+        major_prior=float(fit_options.major_prior),
+        eps=float(fit_options.eps),
+        tol=float(fit_options.tol),
+        max_iter=max(int(fit_options.inner_max_iter), 16),
+    )
     if graph_file is not None:
         graph = load_pairwise_fusion_graph_tsv(
             graph_file,
             num_mutations=data.num_mutations,
             mutation_ids=data.mutation_ids,
-        )
-    else:
-        pilot_phi, _, _ = compute_scalar_cell_wells(
-            data,
-            major_prior=float(fit_options.major_prior),
-            eps=float(fit_options.eps),
-            tol=float(fit_options.tol),
-            max_iter=max(int(fit_options.inner_max_iter), 16),
         )
     effective_graph = resolve_pairwise_fusion_graph(
         data.num_mutations,
@@ -336,6 +341,7 @@ def _current_resume_hashes_for_file(
             effective_graph.edge_v,
             effective_graph.edge_w,
         ),
+        "pilot_matrix_hash": _pilot_matrix_hash(pilot_phi),
         "graph_name": str(effective_graph.name),
     }
 
@@ -860,25 +866,31 @@ def _compute_search_diagnostics(best_df: pd.DataFrame) -> pd.DataFrame:
     if best_df.empty:
         return best_df
     diagnostics = best_df.copy()
+
+    def _numeric_column(name: str) -> pd.Series:
+        if name not in diagnostics.columns:
+            return pd.Series(np.nan, index=diagnostics.index, dtype=float)
+        return pd.to_numeric(diagnostics[name], errors="coerce")
+
     diagnostics["tested_log10_lambda_span"] = [
         _safe_log10_span(lower, upper)
         for lower, upper in zip(
-            diagnostics.get("tested_lambda_min", pd.Series(dtype=float)).to_numpy(dtype=float, copy=False),
-            diagnostics.get("tested_lambda_max", pd.Series(dtype=float)).to_numpy(dtype=float, copy=False),
+            _numeric_column("tested_lambda_min").to_numpy(dtype=float, copy=False),
+            _numeric_column("tested_lambda_max").to_numpy(dtype=float, copy=False),
         )
     ]
     diagnostics["selection_log10_lambda_span"] = [
         _safe_log10_span(lower, upper)
         for lower, upper in zip(
-            diagnostics.get("selection_lambda_min", pd.Series(dtype=float)).to_numpy(dtype=float, copy=False),
-            diagnostics.get("selection_lambda_max", pd.Series(dtype=float)).to_numpy(dtype=float, copy=False),
+            _numeric_column("selection_lambda_min").to_numpy(dtype=float, copy=False),
+            _numeric_column("selection_lambda_max").to_numpy(dtype=float, copy=False),
         )
     ]
     diagnostics["ari_log10_lambda_span"] = [
         _safe_log10_span(lower, upper)
         for lower, upper in zip(
-            diagnostics.get("ari_optimal_lambda_min", pd.Series(dtype=float)).to_numpy(dtype=float, copy=False),
-            diagnostics.get("ari_optimal_lambda_max", pd.Series(dtype=float)).to_numpy(dtype=float, copy=False),
+            _numeric_column("ari_optimal_lambda_min").to_numpy(dtype=float, copy=False),
+            _numeric_column("ari_optimal_lambda_max").to_numpy(dtype=float, copy=False),
         )
     ]
     return diagnostics
@@ -1125,7 +1137,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="cuda",
         help="Execution device. CUDA is the default and falls back to CPU when unavailable.",
     )
-    parser.add_argument("--dtype", choices=["auto", "float32", "float64"], default="float64", help="Torch runtime dtype.")
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "float16", "float32", "float64"],
+        default="float64",
+        help="Torch runtime dtype. Float16 requires CUDA.",
+    )
     parser.add_argument(
         "--missing-cna-policy",
         choices=["error", "all_true"],
