@@ -514,6 +514,7 @@ def _full_fusion_box_residual_with_dual_balls(
     lambda_value: float,
     atol: float,
     max_iter: int,
+    degree_bound: int | None = None,
     return_info: bool = False,
 ) -> float | tuple[float, FullFusionKKTResult]:
     lambda_float = float(lambda_value)
@@ -538,11 +539,15 @@ def _full_fusion_box_residual_with_dual_balls(
 
     dual = torch.zeros((int(edge_u.numel()), int(phi.shape[1])), dtype=phi.dtype, device=phi.device)
     radius = lambda_float * edge_w
-    degree = torch.bincount(
-        torch.cat([edge_u, edge_v]),
-        minlength=int(phi.shape[0]),
-    ).max()
-    step = 0.25 / max(float(degree.item()), 1.0)
+    if degree_bound is None:
+        degree = torch.bincount(
+            torch.cat([edge_u, edge_v]),
+            minlength=int(phi.shape[0]),
+        ).max()
+        effective_degree_bound = float(degree.item())
+    else:
+        effective_degree_bound = float(degree_bound)
+    step = 0.25 / max(effective_degree_bound, 1.0)
     previous_residual = float("inf")
     last_residual = float("inf")
     max_iterations = max(int(max_iter), 1)
@@ -588,6 +593,7 @@ def _estimate_lambda_full_light(
     major_prior: float,
     eps: float,
     tol: float,
+    degree_bound: int | None = None,
 ) -> tuple[float, float, FullFusionKKTResult]:
     phi = torch.as_tensor(np.asarray(pooled_start), dtype=runtime.dtype, device=runtime.device)
     lower = torch.full_like(torch_data.phi_upper, float(eps))
@@ -608,6 +614,7 @@ def _estimate_lambda_full_light(
         lambda_value=high,
         atol=float(tol),
         max_iter=ADAPTIVE_PATH_FULL_FUSION_MAX_ITER,
+        degree_bound=degree_bound,
         return_info=True,
     )
     for _ in range(16):
@@ -626,6 +633,7 @@ def _estimate_lambda_full_light(
             lambda_value=high,
             atol=float(tol),
             max_iter=ADAPTIVE_PATH_FULL_FUSION_MAX_ITER,
+            degree_bound=degree_bound,
             return_info=True,
         )
     if residual <= stat_tol:
@@ -644,6 +652,7 @@ def _estimate_lambda_full_light(
                 lambda_value=mid,
                 atol=float(tol),
                 max_iter=ADAPTIVE_PATH_FULL_FUSION_MAX_ITER,
+                degree_bound=degree_bound,
                 return_info=True,
             )
             if mid_residual <= stat_tol:
@@ -668,6 +677,7 @@ def _initial_adaptive_lambda_bracket(
     major_prior: float,
     eps: float,
     tol: float,
+    degree_bound: int | None = None,
 ) -> LambdaBracket:
     pilot = torch.as_tensor(np.asarray(exact_pilot), dtype=runtime.dtype, device=runtime.device)
     pooled = torch.as_tensor(np.asarray(pooled_start), dtype=runtime.dtype, device=runtime.device)
@@ -707,6 +717,7 @@ def _initial_adaptive_lambda_bracket(
         major_prior=major_prior,
         eps=eps,
         tol=tol,
+        degree_bound=degree_bound,
     )
     lambda_full = max(float(lambda_full), float(lambda_eq), LAMBDA_SEARCH_MIN)
     lambda_min = max(float(lambda_eq) / 128.0, LAMBDA_SEARCH_MIN)
@@ -1851,6 +1862,7 @@ def _grid_search_selection(
             major_prior=float(fit_options.major_prior),
             eps=float(fit_options.eps),
             tol=float(fit_options.tol),
+            degree_bound=int(effective_graph.degree_bound),
         )
         lambda_grid = list(lambda_bracket.anchors)
     simulation_truth: SimulationTruth | None = None
