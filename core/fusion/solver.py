@@ -1113,14 +1113,14 @@ def fit_observed_data_pairwise_fusion(
     outer_max_iter: int,
     inner_max_iter: int,
     tol: float,
-    phi_start: np.ndarray | None = None,
+    phi_start: np.ndarray | torch.Tensor | None = None,
     graph: PairwiseFusionGraph | None = None,
     adaptive_weight_gamma: float = 1.0,
     adaptive_weight_floor: float = 1e-6,
     adaptive_weight_baseline: float = 1.0,
-    exact_pilot: np.ndarray | None = None,
-    pooled_start: np.ndarray | None = None,
-    scalar_well_starts: list[np.ndarray] | None = None,
+    exact_pilot: np.ndarray | torch.Tensor | None = None,
+    pooled_start: np.ndarray | torch.Tensor | None = None,
+    scalar_well_starts: list[np.ndarray | torch.Tensor] | tuple[np.ndarray | torch.Tensor, ...] | None = None,
     start_mode: str = "full",
     device: str | None = "cuda",
     dtype: str | None = "auto",
@@ -1167,6 +1167,13 @@ def fit_observed_data_pairwise_fusion(
     effective_torch_data = torch_data_from_context(solver_context)
     effective_graph = solver_context.graph_spec
     effective_tensor_graph = solver_context.graph
+    effective_exact_pilot = solver_context.exact_pilot if exact_pilot is None else exact_pilot
+    effective_pooled_start = solver_context.pooled_start if pooled_start is None else pooled_start
+    effective_scalar_well_starts = (
+        solver_context.scalar_well_starts
+        if scalar_well_starts is None
+        else tuple(scalar_well_starts)
+    )
 
     normalized_start_mode = str(start_mode).strip().lower()
     if normalized_start_mode not in {"full", "warm_plus_pilot", "warm_only"}:
@@ -1176,16 +1183,16 @@ def fit_observed_data_pairwise_fusion(
     if phi_start is not None:
         start_bank.append(phi_start)
     if normalized_start_mode == "full":
-        start_bank.extend(solver_context.scalar_well_starts)
-        start_bank.append(solver_context.pooled_start)
+        start_bank.extend(effective_scalar_well_starts)
+        start_bank.append(effective_pooled_start)
     elif normalized_start_mode == "warm_plus_pilot":
         if phi_start is None:
-            start_bank.extend(solver_context.scalar_well_starts)
-            start_bank.append(solver_context.pooled_start)
+            start_bank.extend(effective_scalar_well_starts)
+            start_bank.append(effective_pooled_start)
         else:
-            start_bank.extend(solver_context.scalar_well_starts)
+            start_bank.extend(effective_scalar_well_starts)
     elif phi_start is None:
-        start_bank.append(solver_context.exact_pilot)
+        start_bank.append(effective_exact_pilot)
     start_bank = _deduplicate_starts(start_bank, runtime=effective_runtime)
 
     best_artifacts: FusionFitArtifacts | None = None

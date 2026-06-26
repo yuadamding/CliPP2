@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
+import torch
 
 from ..io.data import TumorData
 from .fusion_solver import PairwiseFusionGraph, SolverContext, SolverState, fit_observed_data_pairwise_fusion
@@ -124,10 +125,10 @@ class FitResult:
 def fit_single_stage_em(
     data: TumorData,
     options: FitOptions,
-    phi_start: np.ndarray | None = None,
-    exact_pilot: np.ndarray | None = None,
-    pooled_start: np.ndarray | None = None,
-    scalar_well_starts: list[np.ndarray] | None = None,
+    phi_start: np.ndarray | torch.Tensor | None = None,
+    exact_pilot: np.ndarray | torch.Tensor | None = None,
+    pooled_start: np.ndarray | torch.Tensor | None = None,
+    scalar_well_starts: list[np.ndarray | torch.Tensor] | None = None,
     start_mode: str = "full",
     runtime=None,
     torch_data=None,
