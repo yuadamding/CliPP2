@@ -817,6 +817,7 @@ def solve_majorized_subproblem_alm_torch(
     max_iter: int,
     phi_start: torch.Tensor,
     dual_start: torch.Tensor | None,
+    dual_start_is_actual: bool = False,
     kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
     box_phi_atol: float = DEFAULT_BOX_PHI_ATOL,
     box_max_iter: int = DEFAULT_BOX_MAX_ITER,
@@ -831,13 +832,19 @@ def solve_majorized_subproblem_alm_torch(
         empty_dual = torch.zeros((0, phi.shape[1]), dtype=runtime.dtype, device=runtime.device)
         return projected, empty_dual, empty_dual, 1, residual <= tol, residual
 
+    rho = float(torch.clamp(torch.median(h), min=1e-3, max=1e3).item())
+    radius = float(lambda_value) * edge_w
     if dual_start is not None and tuple(dual_start.shape) == (int(edge_u.numel()), int(phi.shape[1])):
-        scaled_dual = dual_start.to(dtype=runtime.dtype, device=runtime.device)
+        initial_dual = dual_start.to(dtype=runtime.dtype, device=runtime.device)
+        if bool(dual_start_is_actual):
+            initial_dual = project_dual_ball(initial_dual, radius)
+            scaled_dual = initial_dual / rho
+        else:
+            scaled_dual = initial_dual
     else:
         scaled_dual = torch.zeros((int(edge_u.numel()), int(phi.shape[1])), dtype=runtime.dtype, device=runtime.device)
 
-    rho = float(torch.clamp(torch.median(h), min=1e-3, max=1e3).item())
-    shrink_radius = (float(lambda_value) * edge_w) / rho
+    shrink_radius = radius / rho
 
     converged = False
     iterations = 0

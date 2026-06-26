@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ..io.data import TumorData
-from .fusion_solver import PairwiseFusionGraph, SolverContext, fit_observed_data_pairwise_fusion
+from .fusion_solver import PairwiseFusionGraph, SolverContext, SolverState, fit_observed_data_pairwise_fusion
 
 
 @dataclass
@@ -118,6 +118,7 @@ class FitResult:
     bic_refit_cluster_centers: np.ndarray | None = None
     bic_partition_labels: np.ndarray | None = None
     selection_score_name: str | None = None
+    solver_state: SolverState | None = None
 
 
 def fit_single_stage_em(
@@ -131,6 +132,7 @@ def fit_single_stage_em(
     runtime=None,
     torch_data=None,
     solver_context: SolverContext | None = None,
+    solver_state: SolverState | None = None,
     compute_summary: bool = True,
 ) -> FitResult:
     artifacts = fit_observed_data_pairwise_fusion(
@@ -156,6 +158,7 @@ def fit_single_stage_em(
         runtime=runtime,
         torch_data=torch_data,
         solver_context=solver_context,
+        solver_state=solver_state,
         compute_summary=bool(compute_summary),
         verbose=bool(options.verbose),
     )
@@ -232,6 +235,7 @@ def fit_single_stage_em(
         failure_reason=str(artifacts.failure_reason),
         selection_eligible=bool(artifacts.selection_eligible),
         history=list(artifacts.history),
+        solver_state=artifacts.solver_state,
     )
 
 

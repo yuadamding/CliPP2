@@ -7,6 +7,7 @@ from .core import (
     PairwiseFusionGraph,
     fit_observed_data_pairwise_fusion,
     fit_single_stage_em,
+    fit_torch,
     prepare_torch_problem,
     resolve_pairwise_fusion_graph,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "default_lambda_grid",
     "fit_observed_data_pairwise_fusion",
     "fit_single_stage_em",
+    "fit_torch",
     "load_patient_tsv",
     "load_tumor_tsv",
     "process_one_file",

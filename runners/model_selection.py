@@ -11,6 +11,7 @@ import torch
 from ..core.model import FitOptions, FitResult, fit_single_stage_em
 from ..core.fusion_solver import (
     PartitionRefitResult,
+    SolverState,
     cluster_labels_from_edges,
     partition_constrained_observed_refit,
     prepare_torch_problem,
@@ -1435,6 +1436,7 @@ def _evaluate_candidate(
     runtime,
     torch_data,
     solver_context,
+    solver_state: SolverState | None,
     compute_summary: bool,
     selection_method: str,
     profile_name: str,
@@ -1456,6 +1458,7 @@ def _evaluate_candidate(
         runtime=runtime,
         torch_data=torch_data,
         solver_context=solver_context,
+        solver_state=solver_state,
         compute_summary=compute_summary,
     )
     bic_partition_tol = _effective_bic_partition_tol(effective_fit_options)
@@ -1699,6 +1702,7 @@ def _evaluate_candidate(
         "evaluation_mode": "ari_only" if ari_only_evaluation else "full",
         "fit_compute_summary": bool(compute_summary),
         "fit_start_mode": str(start_mode),
+        "solver_state_warm_start": bool(solver_state is not None),
         "ARI": ari_value,
         "cp_rmse": cp_rmse_value,
         "multiplicity_f1": multiplicity_f1_value,
@@ -1854,6 +1858,7 @@ def _grid_search_selection(
         simulation_truth = load_simulation_truth(data, simulation_root)
     result_entries: list[tuple[FitResult, SimulationEvaluation | None, dict[str, float | int | str | bool]]] = []
     fit_by_lambda: dict[float, FitResult] = {}
+    solver_state_by_lambda: dict[float, SolverState] = {}
     partition_labels_by_candidate_id: dict[int, np.ndarray] = {}
     bic_refit_cache: dict[str, PartitionRefitResult] = {}
     next_step = 0
@@ -1879,6 +1884,27 @@ def _grid_search_selection(
         )
         return fit_by_lambda[nearest_lambda].phi.copy()
 
+    def _nearest_solver_state(target_lambda: float) -> SolverState | None:
+        if not solver_state_by_lambda:
+            return None
+        target = float(target_lambda)
+
+        def _lambda_start_distance(value: float) -> float:
+            lambda_value = float(value)
+            if lambda_value > 0.0 and target > 0.0:
+                return float(abs(np.log(lambda_value) - np.log(target)))
+            if lambda_value <= 0.0 and target <= 0.0:
+                return 0.0
+            if target <= 0.0:
+                return float(abs(lambda_value - target))
+            return float("inf")
+
+        nearest_lambda = min(
+            solver_state_by_lambda,
+            key=_lambda_start_distance,
+        )
+        return solver_state_by_lambda.get(nearest_lambda)
+
     def _evaluate_lambda_sequence(
         lambda_values_to_run: list[float],
         *,
@@ -1890,6 +1916,7 @@ def _grid_search_selection(
         start_mode: str = "full",
         compute_summary: bool = True,
         phi_start_by_lambda: dict[float, np.ndarray] | None = None,
+        solver_state_start_by_lambda: dict[float, SolverState] | None = None,
         scalar_well_starts_by_lambda: dict[float, list[np.ndarray]] | None = None,
         lambda_metadata_by_lambda: dict[float, dict[str, float | int | str | bool]] | None = None,
     ) -> None:
@@ -1903,12 +1930,22 @@ def _grid_search_selection(
             return
 
         previous_phi: np.ndarray | None = None
+        previous_solver_state: SolverState | None = None
         for lambda_value in ordered_lambdas:
             lambda_key = _canonical_lambda(lambda_value)
+            solver_state_start: SolverState | None = None
             if phi_start_by_lambda is not None and lambda_key in phi_start_by_lambda:
                 phi_start = phi_start_by_lambda[lambda_key].copy()
+                if solver_state_start_by_lambda is not None:
+                    solver_state_start = solver_state_start_by_lambda.get(lambda_key)
+                if solver_state_start is None:
+                    solver_state_start = solver_state_by_lambda.get(lambda_key)
             elif use_warm_starts:
-                phi_start = previous_phi.copy() if previous_phi is not None else _nearest_phi_start(lambda_value)
+                solver_state_start = previous_solver_state if previous_solver_state is not None else _nearest_solver_state(lambda_value)
+                if solver_state_start is not None:
+                    phi_start = solver_state_start.phi.detach().cpu().numpy().copy()
+                else:
+                    phi_start = previous_phi.copy() if previous_phi is not None else _nearest_phi_start(lambda_value)
             else:
                 phi_start = pilot_phi.copy()
             candidate_scalar_well_starts = scalar_well_starts
@@ -1932,6 +1969,7 @@ def _grid_search_selection(
                 runtime=runtime,
                 torch_data=torch_data,
                 solver_context=solver_context,
+                solver_state=solver_state_start if use_warm_starts else None,
                 compute_summary=compute_summary,
                 selection_method=selection_method,
                 profile_name=profile_name,
@@ -1966,9 +2004,12 @@ def _grid_search_selection(
             incumbent = fit_by_lambda.get(lambda_key)
             if _prefer_fit_candidate(fit, incumbent):
                 fit_by_lambda[lambda_key] = fit
+                if fit.solver_state is not None:
+                    solver_state_by_lambda[lambda_key] = fit.solver_state
             next_step += 1
             if use_warm_starts:
                 previous_phi = fit.phi.copy()
+                previous_solver_state = fit.solver_state
 
     _evaluate_lambda_sequence(
         lambda_grid,
@@ -1994,6 +2035,7 @@ def _grid_search_selection(
         )
         if transition_probe_records:
             transition_phi_by_lambda: dict[float, np.ndarray] = {}
+            transition_state_by_lambda: dict[float, SolverState] = {}
             transition_starts_by_lambda: dict[float, list[np.ndarray]] = {}
             transition_metadata_by_lambda: dict[float, dict[str, float | int | str | bool]] = {}
             for proposal in transition_probe_records:
@@ -2005,9 +2047,13 @@ def _grid_search_selection(
                     transition_starts.insert(0, right_fit.phi.copy())
                 if left_fit is not None:
                     transition_phi_by_lambda[lambda_key] = left_fit.phi.copy()
+                    if left_fit.solver_state is not None:
+                        transition_state_by_lambda[lambda_key] = left_fit.solver_state
                     transition_starts.insert(0, left_fit.phi.copy())
                 elif right_fit is not None:
                     transition_phi_by_lambda[lambda_key] = right_fit.phi.copy()
+                    if right_fit.solver_state is not None:
+                        transition_state_by_lambda[lambda_key] = right_fit.solver_state
                 transition_starts_by_lambda[lambda_key] = transition_starts
                 transition_metadata_by_lambda[lambda_key] = {
                     "adaptive_interval_left_lambda": float(proposal.left_lambda),
@@ -2030,6 +2076,7 @@ def _grid_search_selection(
                 start_mode="full",
                 compute_summary=True,
                 phi_start_by_lambda=transition_phi_by_lambda,
+                solver_state_start_by_lambda=transition_state_by_lambda,
                 scalar_well_starts_by_lambda=transition_starts_by_lambda,
                 lambda_metadata_by_lambda=transition_metadata_by_lambda,
             )
@@ -2071,6 +2118,7 @@ def _grid_search_selection(
                 if "_candidate_id" in row
             }
             proposal_phi_by_lambda: dict[float, np.ndarray] = {}
+            proposal_state_by_lambda: dict[float, SolverState] = {}
             proposal_scalar_starts_by_lambda: dict[float, list[np.ndarray]] = {}
             proposal_metadata_by_lambda: dict[float, dict[str, float | int | str | bool]] = {}
             for proposal in proposal_records:
@@ -2087,8 +2135,12 @@ def _grid_search_selection(
                 )
                 if left_fit is not None:
                     proposal_phi_by_lambda[lambda_key] = left_fit.phi.copy()
+                    if left_fit.solver_state is not None:
+                        proposal_state_by_lambda[lambda_key] = left_fit.solver_state
                 elif right_fit is not None:
                     proposal_phi_by_lambda[lambda_key] = right_fit.phi.copy()
+                    if right_fit.solver_state is not None:
+                        proposal_state_by_lambda[lambda_key] = right_fit.solver_state
                 proposal_starts = [start.copy() for start in scalar_well_starts]
                 if right_fit is not None:
                     proposal_starts.insert(0, right_fit.phi.copy())
@@ -2112,6 +2164,7 @@ def _grid_search_selection(
                 start_mode="full",
                 compute_summary=True,
                 phi_start_by_lambda=proposal_phi_by_lambda,
+                solver_state_start_by_lambda=proposal_state_by_lambda,
                 scalar_well_starts_by_lambda=proposal_scalar_starts_by_lambda,
                 lambda_metadata_by_lambda=proposal_metadata_by_lambda,
             )

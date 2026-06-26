@@ -94,6 +94,8 @@ class FusionFitArtifacts:
     last_reject_reason: str
     failure_reason: str
     selection_eligible: bool
+    solver_state: SolverState | None = None
+    torch_result: TorchFitResult | None = None
 
 
 @dataclass(frozen=True)

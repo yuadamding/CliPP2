@@ -16,6 +16,7 @@ from .graph_ops import (
 from .solver import (
     cluster_labels_from_edges,
     fit_observed_data_pairwise_fusion,
+    fit_torch,
     prepare_torch_problem,
     torch_data_from_context,
 )
@@ -77,6 +78,7 @@ __all__ = [
     "compute_scalar_well_start_bank",
     "compute_scalar_well_start_bank_torch",
     "fit_observed_data_pairwise_fusion",
+    "fit_torch",
     "prepare_torch_problem",
     "torch_data_from_context",
 ]

@@ -9,6 +9,7 @@ from ...io.data import TumorData
 from .graph import resolve_pairwise_fusion_graph
 from .graph_ops import (
     build_complete_adaptive_tensor_graph,
+    project_dual_ball,
     tensor_graph_to_pairwise_graph,
     tensorize_graph,
 )
@@ -22,7 +23,7 @@ from .torch_backend import (
     cell_terms_torch,
     em_surrogate_terms_torch,
     graph_fusion_kkt_residual_from_grad_torch,
-    objective_value_torch,
+    objective_terms_torch,
     pairwise_penalty_torch,
     refine_graph_fusion_dual_certificate_torch,
     resolve_runtime,
@@ -31,7 +32,17 @@ from .torch_backend import (
     to_torch_tumor_data,
     validate_lambda_value,
 )
-from .types import FusionFitArtifacts, PairwiseFusionGraph, SolverContext, TensorFusionGraph, TensorProblem
+from .types import (
+    FusionFitArtifacts,
+    InnerDiagnostics,
+    OuterDiagnostics,
+    PairwiseFusionGraph,
+    SolverContext,
+    SolverState,
+    TensorFusionGraph,
+    TensorProblem,
+    TorchFitResult,
+)
 
 
 class _UnionFind:
@@ -167,6 +178,34 @@ def _inner_model_value_torch(
     return quad + penalty
 
 
+def _objective_value_once_torch(
+    torch_data: TorchTumorData,
+    phi: torch.Tensor,
+    *,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    edge_w: torch.Tensor,
+    lambda_value: float,
+    major_prior: float,
+    eps: float,
+) -> tuple[float, float, float, torch.Tensor]:
+    terms = objective_terms_torch(
+        torch_data,
+        phi,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        edge_w=edge_w,
+        lambda_value=lambda_value,
+        major_prior=major_prior,
+        eps=eps,
+    )
+    fit_loss, penalty, objective = (
+        float(value)
+        for value in torch.stack([terms.fit.detach(), terms.penalty.detach(), terms.total.detach()]).cpu()
+    )
+    return fit_loss, penalty, objective, terms.gamma_major
+
+
 def _update_minimum(current: float, candidate: float) -> float:
     if not np.isfinite(candidate):
         return float(current)
@@ -231,6 +270,26 @@ def _tensor_from_start(
     if torch.is_tensor(start):
         return start.to(dtype=runtime.dtype, device=runtime.device)
     return torch.as_tensor(np.asarray(start), dtype=runtime.dtype, device=runtime.device)
+
+
+def _project_state_dual(
+    state: SolverState | None,
+    *,
+    runtime,
+    edge_w: torch.Tensor,
+    lambda_value: float,
+    num_edges: int,
+    num_samples: int,
+) -> torch.Tensor | None:
+    if state is None or state.dual is None:
+        return None
+    if tuple(state.dual.shape) != (int(num_edges), int(num_samples)):
+        return None
+    dual = state.dual.to(dtype=runtime.dtype, device=runtime.device)
+    if int(num_edges) == 0:
+        return torch.zeros((0, int(num_samples)), dtype=runtime.dtype, device=runtime.device)
+    radius = float(lambda_value) * edge_w.to(dtype=runtime.dtype, device=runtime.device)
+    return project_dual_ball(dual, radius)
 
 
 def _tensor_problem_from_torch_data(
@@ -402,6 +461,7 @@ def _fit_from_start(
     inner_max_iter: int,
     tol: float,
     phi_start: np.ndarray | torch.Tensor,
+    solver_state: SolverState | None,
     lower: torch.Tensor,
     upper: torch.Tensor,
     summary_tol: float | None,
@@ -414,11 +474,27 @@ def _fit_from_start(
     use_alm = bool(tensor_graph.is_complete and int(graph.degree_bound) == max(int(data.num_mutations) - 1, 1))
     edge_u, edge_v, edge_w = tensor_graph.edge_u, tensor_graph.edge_v, tensor_graph.weight
 
-    phi = _tensor_from_start(phi_start, runtime)
+    if (
+        solver_state is not None
+        and solver_state.phi is not None
+        and tuple(solver_state.phi.shape) == tuple(torch_data.phi_upper.shape)
+    ):
+        phi = solver_state.phi.to(dtype=runtime.dtype, device=runtime.device)
+    else:
+        phi = _tensor_from_start(phi_start, runtime)
     phi = torch.minimum(torch.maximum(phi, lower), upper)
 
-    dual = None
-    dual_kkt = None
+    state_dual = _project_state_dual(
+        solver_state,
+        runtime=runtime,
+        edge_w=edge_w,
+        lambda_value=lambda_value,
+        num_edges=int(edge_u.numel()),
+        num_samples=int(phi.shape[1]),
+    )
+    dual = state_dual
+    dual_kkt = state_dual
+    dual_start_is_actual = bool(use_alm and state_dual is not None)
     history: list[float] = []
     converged = False
     converged_inner = False
@@ -476,7 +552,7 @@ def _fit_from_start(
     last_reject_reason = "not_attempted"
     failure_reason = "not_converged"
 
-    fit_loss, penalty, objective, gamma_major = objective_value_torch(
+    fit_loss, penalty, objective, gamma_major = _objective_value_once_torch(
         torch_data,
         phi,
         edge_u=edge_u,
@@ -506,6 +582,7 @@ def _fit_from_start(
         candidate_phi = phi
         candidate_dual = dual
         candidate_dual_kkt = dual_kkt
+        candidate_dual_start_is_actual = dual_start_is_actual
         candidate_objective = objective
         candidate_fit_loss = fit_loss
         candidate_gamma = gamma_major
@@ -541,6 +618,7 @@ def _fit_from_start(
                     max_iter=max(inner_max_iter, 10),
                     phi_start=phi,
                     dual_start=dual,
+                    dual_start_is_actual=dual_start_is_actual,
                 )
             else:
                 phi_trial, dual_trial, dual_kkt_trial, _, inner_ok, inner_residual = solve_majorized_subproblem_pdhg_torch(
@@ -588,7 +666,7 @@ def _fit_from_start(
             )
             trial_surrogate_loss = float(torch.sum(trial_surrogate_terms.loss).item())
             surrogate_gap = float(trial_surrogate_loss - majorizer_rhs)
-            trial_fit_loss, _, trial_objective, trial_gamma = objective_value_torch(
+            trial_fit_loss, _, trial_objective, trial_gamma = _objective_value_once_torch(
                 torch_data,
                 phi_trial,
                 edge_u=edge_u,
@@ -650,6 +728,7 @@ def _fit_from_start(
                 candidate_phi = phi_trial
                 candidate_dual = dual_trial
                 candidate_dual_kkt = dual_kkt_trial
+                candidate_dual_start_is_actual = False
                 candidate_objective = trial_objective
                 candidate_fit_loss = trial_fit_loss
                 candidate_gamma = trial_gamma
@@ -664,7 +743,7 @@ def _fit_from_start(
             damped_accepted = False
             for _line_search_iter in range(12):
                 phi_theta = phi + theta * delta
-                theta_fit_loss, _, theta_objective, theta_gamma = objective_value_torch(
+                theta_fit_loss, _, theta_objective, theta_gamma = _objective_value_once_torch(
                     torch_data,
                     phi_theta,
                     edge_u=edge_u,
@@ -682,6 +761,7 @@ def _fit_from_start(
                     candidate_phi = phi_theta
                     candidate_dual = dual_trial
                     candidate_dual_kkt = None
+                    candidate_dual_start_is_actual = False
                     candidate_objective = theta_objective
                     candidate_fit_loss = theta_fit_loss
                     candidate_gamma = theta_gamma
@@ -701,6 +781,7 @@ def _fit_from_start(
             candidate_phi = phi
             candidate_dual = dual
             candidate_dual_kkt = dual_kkt
+            candidate_dual_start_is_actual = dual_start_is_actual
             candidate_objective = objective
             candidate_fit_loss = fit_loss
             candidate_gamma = gamma_major
@@ -709,6 +790,7 @@ def _fit_from_start(
         phi = candidate_phi
         dual = candidate_dual
         dual_kkt = candidate_dual_kkt
+        dual_start_is_actual = candidate_dual_start_is_actual
         objective = candidate_objective
         fit_loss = candidate_fit_loss
         gamma_major = candidate_gamma
@@ -774,6 +856,7 @@ def _fit_from_start(
         max_iter=96,
     )
     final_outer_diag = final_dual_audit["diag"]
+    final_dual = final_dual_audit["dual"]
     outer_kkt_certificate_status = str(final_dual_audit["status"])
     outer_kkt_dual_refined = bool(final_dual_audit["dual_refined"])
     outer_kkt_fused_edges = int(final_dual_audit["fused_edges"])
@@ -845,7 +928,7 @@ def _fit_from_start(
     if compute_summary:
         cluster_centers, phi_clustered = _cluster_summary_from_labels(phi_np, cluster_labels)
         phi_clustered_torch = torch.as_tensor(phi_clustered, dtype=runtime.dtype, device=runtime.device)
-        summary_fit_loss, _, _, _ = objective_value_torch(
+        summary_fit_loss, _, _, _ = _objective_value_once_torch(
             torch_data,
             phi_clustered_torch,
             edge_u=edge_u,
@@ -872,6 +955,38 @@ def _fit_from_start(
         np.where(major_call, data.major_cn, data.minor_cn),
         data.fixed_multiplicity,
     ).astype(phi_np.dtype, copy=False)
+    solver_state_out = SolverState(
+        phi=phi.detach(),
+        dual=final_dual.detach() if torch.is_tensor(final_dual) else None,
+        split=dual.detach() if torch.is_tensor(dual) else None,
+        curvature=None,
+        previous_lambda=float(lambda_value),
+    )
+    torch_result = TorchFitResult(
+        phi_raw=phi.detach(),
+        gamma_major=final_terms.gamma_major.detach(),
+        dual=solver_state_out.dual,
+        fit_loss=torch.as_tensor(float(fit_loss), dtype=runtime.dtype, device=runtime.device),
+        fusion_penalty=torch.as_tensor(float(objective - fit_loss), dtype=runtime.dtype, device=runtime.device),
+        objective=torch.as_tensor(float(objective), dtype=runtime.dtype, device=runtime.device),
+        inner=InnerDiagnostics(
+            iterations=int(iterations),
+            kkt_residual=float(final_inner_kkt_residual),
+            primal_delta=float(final_step_residual),
+            dual_delta=float("nan"),
+            converged=bool(converged_inner),
+        ),
+        outer=OuterDiagnostics(
+            iterations=int(iterations),
+            objective_history=tuple(float(value) for value in history),
+            stationarity_residual=float(final_outer_diag["stationarity_residual"]),
+            majorization_failures=int(failed_majorization_checks),
+            accepted_full_steps=int(accepted_full_steps),
+            accepted_damped_steps=int(accepted_damped_steps),
+            converged=bool(converged_outer),
+        ),
+        graph_name=str(graph.name),
+    )
 
     return FusionFitArtifacts(
         phi=phi_np.astype(phi_np.dtype, copy=False),
@@ -946,7 +1061,46 @@ def _fit_from_start(
         last_reject_reason=str(last_reject_reason),
         failure_reason=str(failure_reason),
         selection_eligible=bool(selection_eligible),
+        solver_state=solver_state_out,
+        torch_result=torch_result,
     )
+
+
+def fit_torch(
+    data: TumorData,
+    *,
+    context: SolverContext,
+    lambda_value: float,
+    state: SolverState | None = None,
+    outer_max_iter: int = 8,
+    inner_max_iter: int = 30,
+    tol: float = 1e-4,
+    summary_tol: float | None = None,
+    start_mode: str = "warm_only",
+    verbose: bool = False,
+) -> tuple[TorchFitResult, SolverState]:
+    start = state.phi if state is not None else context.exact_pilot
+    artifacts = fit_observed_data_pairwise_fusion(
+        data,
+        lambda_value=float(lambda_value),
+        major_prior=float(context.problem.major_prior),
+        eps=float(context.problem.eps),
+        outer_max_iter=int(outer_max_iter),
+        inner_max_iter=int(inner_max_iter),
+        tol=float(tol),
+        phi_start=start,
+        start_mode=start_mode,
+        device=context.runtime.device_name,
+        dtype=str(context.runtime.dtype).replace("torch.", ""),
+        summary_tol=summary_tol,
+        solver_context=context,
+        solver_state=state,
+        compute_summary=False,
+        verbose=bool(verbose),
+    )
+    if artifacts.torch_result is None or artifacts.solver_state is None:
+        raise RuntimeError("Torch fit did not produce a tensor result and solver state.")
+    return artifacts.torch_result, artifacts.solver_state
 
 
 def fit_observed_data_pairwise_fusion(
@@ -973,6 +1127,7 @@ def fit_observed_data_pairwise_fusion(
     runtime=None,
     torch_data=None,
     solver_context: SolverContext | None = None,
+    solver_state: SolverState | None = None,
     compute_summary: bool = True,
     verbose: bool = False,
 ) -> FusionFitArtifacts:
@@ -1047,6 +1202,14 @@ def fit_observed_data_pairwise_fusion(
             inner_max_iter=inner_max_iter,
             tol=tol,
             phi_start=start,
+            solver_state=(
+                solver_state
+                if (
+                    solver_state is not None
+                    and start is start_bank[0]
+                )
+                else None
+            ),
             lower=solver_context.lower,
             upper=solver_context.upper,
             summary_tol=summary_tol,
