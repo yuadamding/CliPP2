@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from . import FitOptions, process_one_file, run_directory
+from .runners.benchmark_common import _resolve_effective_device
 from .runners.selection import PUBLIC_LAMBDA_GRID_MODES
 
 
@@ -168,7 +169,7 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         summary_tol=args.summary_tol,
         bic_partition_tol=args.bic_partition_tol,
         major_prior=args.major_prior,
-        device=args.device,
+        device=_resolve_effective_device(args.device),
         dtype=args.dtype,
         verbose=args.verbose,
     )

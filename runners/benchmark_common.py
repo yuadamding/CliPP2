@@ -358,6 +358,20 @@ def _parse_lambda_grid(value: str | None) -> list[float] | None:
     return [float(piece) for piece in cleaned.split(",") if piece.strip()]
 
 
+def _resolve_effective_device(device: str | None) -> str:
+    requested = "auto" if device is None else str(device).strip().lower()
+    if requested == "cpu":
+        return "cpu"
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
     return FitOptions(
         lambda_value=0.0,
@@ -365,7 +379,7 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         inner_max_iter=args.inner_max_iter,
         tol=args.tol,
         major_prior=args.major_prior,
-        device=args.device,
+        device=_resolve_effective_device(args.device),
         dtype=getattr(args, "dtype", "float64"),
         summary_tol=getattr(args, "summary_tol", 1e-4),
         bic_partition_tol=getattr(args, "bic_partition_tol", 1e-4),
@@ -384,6 +398,7 @@ __all__ = [
     "_fit_options_from_args",
     "_parse_lambda_grid",
     "_parse_patient_id",
+    "_resolve_effective_device",
     "_select_representative_files_with_filter",
     "materialize_patient_df",
     "materialize_tumor_df",

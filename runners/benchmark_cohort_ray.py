@@ -21,6 +21,7 @@ from ..io.data import load_tumor_tsv
 from .benchmark_common import (
     _fit_options_from_args,
     _parse_lambda_grid,
+    _resolve_effective_device,
     materialize_patient_df,
     parse_cohort_patient_id,
     write_benchmark_tables,
@@ -29,20 +30,6 @@ from .benchmark_common import (
 from .model_selection import _edge_list_hash, _input_data_hash
 from .pipeline import process_one_file_bundle
 from .selection import PUBLIC_LAMBDA_GRID_MODES, is_adaptive_lambda_grid_mode
-
-
-def _resolve_effective_device(device: str | None) -> str:
-    requested = "auto" if device is None else str(device).strip().lower()
-    if requested == "cpu":
-        return "cpu"
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            return "cuda"
-    except Exception:
-        pass
-    return "cpu"
 
 
 def _cuda_device_count() -> int:
