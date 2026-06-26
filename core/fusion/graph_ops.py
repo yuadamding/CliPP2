@@ -16,6 +16,11 @@ def _complete_graph_weight(num_nodes: int) -> float:
     return 1.0 / float(max(int(num_nodes) - 1, 1))
 
 
+def _complete_graph_edge_count(num_nodes: int) -> int:
+    node_count = max(int(num_nodes), 0)
+    return node_count * max(node_count - 1, 0) // 2
+
+
 def _dtype_nbytes(dtype: torch.dtype) -> int:
     return int(torch.empty((), dtype=dtype).element_size())
 
@@ -29,7 +34,7 @@ def estimate_complete_tensor_graph_bytes(
 ) -> int:
     node_count = max(int(num_nodes), 0)
     sample_count = max(int(num_samples), 1)
-    edge_count = node_count * max(node_count - 1, 0) // 2
+    edge_count = _complete_graph_edge_count(node_count)
     value_bytes = _dtype_nbytes(dtype)
     index_bytes = _dtype_nbytes(torch.long)
     persistent_bytes = (
@@ -109,7 +114,7 @@ def _check_complete_tensor_graph_memory(
     if limit is None or estimate <= limit:
         return
     graph_kind = "adaptive" if adaptive else "uniform"
-    edge_count = int(num_nodes) * max(int(num_nodes) - 1, 0) // 2
+    edge_count = _complete_graph_edge_count(num_nodes)
     raise MemoryError(
         f"Estimated complete {graph_kind} tensor graph allocation for "
         f"{int(num_nodes)} nodes ({edge_count} edges) is {estimate} bytes, "
@@ -119,6 +124,22 @@ def _check_complete_tensor_graph_memory(
     )
 
 
+def _is_canonical_complete_edge_index(edge_index: torch.Tensor, *, num_nodes: int) -> bool:
+    edge_count = _complete_graph_edge_count(num_nodes)
+    if int(edge_index.shape[0]) != 2 or int(edge_index.shape[1]) != edge_count:
+        return False
+    if edge_count == 0:
+        return True
+    expected = torch.triu_indices(
+        int(num_nodes),
+        int(num_nodes),
+        offset=1,
+        dtype=edge_index.dtype,
+        device=edge_index.device,
+    )
+    return bool(torch.equal(edge_index, expected))
+
+
 def _tensor_graph_from_edges(
     *,
     edge_u: torch.Tensor,
@@ -126,6 +147,7 @@ def _tensor_graph_from_edges(
     weight: torch.Tensor,
     num_nodes: int,
     name: str,
+    known_complete: bool | None = None,
 ) -> TensorFusionGraph:
     edge_index = torch.stack([edge_u.to(dtype=torch.long), edge_v.to(dtype=torch.long)], dim=0)
     degree = torch.zeros((int(num_nodes),), dtype=weight.dtype, device=weight.device)
@@ -134,8 +156,11 @@ def _tensor_graph_from_edges(
         degree.index_add_(0, edge_index[0], one)
         degree.index_add_(0, edge_index[1], one)
     pdhg_tau_node = (PDHG_PRECONDITIONER_ETA / degree.clamp_min(1.0))[:, None]
-    complete_edge_count = int(num_nodes) * max(int(num_nodes) - 1, 0) // 2
-    is_complete = bool(edge_u.numel() == complete_edge_count)
+    is_complete = (
+        _is_canonical_complete_edge_index(edge_index, num_nodes=int(num_nodes))
+        if known_complete is None
+        else bool(known_complete)
+    )
     is_uniform = bool(weight.numel() == 0 or torch.allclose(weight, weight[:1].expand_as(weight)))
     return TensorFusionGraph(
         edge_index=edge_index,
@@ -199,6 +224,7 @@ def build_complete_uniform_tensor_graph(
         weight=weight,
         num_nodes=int(num_nodes),
         name="complete_uniform",
+        known_complete=True,
     )
 
 
@@ -244,6 +270,7 @@ def build_complete_adaptive_tensor_graph(
             weight=weight,
             num_nodes=num_nodes,
             name=f"complete_adaptive_gamma{gamma:g}",
+            known_complete=True,
         )
 
     diff = graph_forward_edges(pilot, edge_u=edge_index[0], edge_v=edge_index[1])
@@ -260,6 +287,7 @@ def build_complete_adaptive_tensor_graph(
         weight=weight,
         num_nodes=num_nodes,
         name=f"complete_adaptive_gamma{gamma:g}_mean_normalized",
+        known_complete=True,
     )
 
 
