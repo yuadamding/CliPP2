@@ -12,7 +12,7 @@ from .graph_ops import (
 )
 from .starts import (
     compute_pooled_observed_data_start_torch,
-    compute_scalar_cell_wells,
+    compute_scalar_cell_wells_torch,
     compute_scalar_well_start_bank_torch,
 )
 from .torch_backend import (
@@ -247,23 +247,29 @@ def prepare_torch_problem(
     effective_torch_data = to_torch_tumor_data(data, effective_runtime) if torch_data is None else torch_data
 
     if exact_pilot is None:
-        exact_pilot_np, secondary_wells, valid_secondary = compute_scalar_cell_wells(
-            data,
+        exact_pilot_tensor, secondary_wells, valid_secondary = compute_scalar_cell_wells_torch(
+            effective_torch_data,
+            phi_init=data.phi_init,
             major_prior=float(major_prior),
             eps=float(eps),
             tol=tol,
             max_iter=max(int(inner_max_iter), 16),
         )
     else:
-        exact_pilot_np = (
-            exact_pilot.detach().cpu().numpy()
-            if torch.is_tensor(exact_pilot)
-            else np.asarray(exact_pilot)
-        )
-        secondary_wells = None
-        valid_secondary = None
+        exact_pilot_tensor = _tensor_from_start(exact_pilot, effective_runtime)
+        if scalar_well_starts is None:
+            _, secondary_wells, valid_secondary = compute_scalar_cell_wells_torch(
+                effective_torch_data,
+                phi_init=data.phi_init,
+                major_prior=float(major_prior),
+                eps=float(eps),
+                tol=tol,
+                max_iter=max(int(inner_max_iter), 16),
+            )
+        else:
+            secondary_wells = None
+            valid_secondary = None
 
-    exact_pilot_tensor = _tensor_from_start(exact_pilot_np, effective_runtime)
     if graph is None:
         tensor_graph = build_complete_adaptive_tensor_graph(
             exact_pilot_tensor,

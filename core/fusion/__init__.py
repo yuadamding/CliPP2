@@ -25,6 +25,7 @@ from .starts import (
     compute_pooled_observed_data_start,
     compute_pooled_observed_data_start_torch,
     compute_scalar_cell_wells,
+    compute_scalar_cell_wells_torch,
     compute_scalar_well_start_bank,
     compute_scalar_well_start_bank_torch,
 )
@@ -72,6 +73,7 @@ __all__ = [
     "compute_pooled_observed_data_start",
     "compute_pooled_observed_data_start_torch",
     "compute_scalar_cell_wells",
+    "compute_scalar_cell_wells_torch",
     "compute_scalar_well_start_bank",
     "compute_scalar_well_start_bank_torch",
     "fit_observed_data_pairwise_fusion",

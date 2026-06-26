@@ -428,7 +428,22 @@ def _cell_best_two_betas(
     max_iter: int,
     hint: float | None,
 ) -> tuple[float, float | None]:
-    candidate_array = _cell_candidate_betas(
+    return _cell_best_two_from_candidates(
+        _cell_candidate_betas(
+            alt=alt,
+            total=total,
+            b_minus=b_minus,
+            b_plus=b_plus,
+            b_fixed=b_fixed,
+            ambiguous=ambiguous,
+            lower=lower,
+            upper=upper,
+            major_prior=major_prior,
+            eps=eps,
+            tol=tol,
+            max_iter=max_iter,
+            hint=hint,
+        ),
         alt=alt,
         total=total,
         b_minus=b_minus,
@@ -440,9 +455,35 @@ def _cell_best_two_betas(
         major_prior=major_prior,
         eps=eps,
         tol=tol,
-        max_iter=max_iter,
         hint=hint,
     )
+
+
+def _cell_best_two_from_candidates(
+    candidate_array: np.ndarray,
+    *,
+    alt: float,
+    total: float,
+    b_minus: float,
+    b_plus: float,
+    b_fixed: float,
+    ambiguous: bool,
+    lower: float,
+    upper: float,
+    major_prior: float,
+    eps: float,
+    tol: float,
+    hint: float | None,
+) -> tuple[float, float | None]:
+    candidate_array = np.asarray(candidate_array, dtype=np.float64)
+    candidate_array = candidate_array[np.isfinite(candidate_array)]
+    candidate_array = np.unique(np.round(candidate_array, 12))
+    candidate_array = candidate_array[(candidate_array >= float(lower) - 1e-12) & (candidate_array <= float(upper) + 1e-12)]
+    candidate_array = np.clip(candidate_array, float(lower), float(upper))
+    if candidate_array.size == 0:
+        fallback = float(lower) if hint is None else _project_to_interval(float(hint), float(lower), float(upper))
+        candidate_array = np.asarray([fallback], dtype=np.float64)
+
     losses = _cell_loss_grid_numpy(
         candidate_array,
         alt=float(alt),
@@ -657,6 +698,181 @@ def _golden_section_minimize_samples_torch(
     f2 = objective(x2)
     use_x1 = f1 <= f2
     return torch.where(use_x1, x1, x2), torch.where(use_x1, f1, f2)
+
+
+def _ambiguous_middle_stationarity_torch(
+    beta: torch.Tensor,
+    *,
+    alt: torch.Tensor,
+    total: torch.Tensor,
+    b_low: torch.Tensor,
+    b_high: torch.Tensor,
+    major_prior: float,
+) -> torch.Tensor:
+    while alt.ndim < beta.ndim:
+        alt = alt.unsqueeze(-1)
+        total = total.unsqueeze(-1)
+        b_low = b_low.unsqueeze(-1)
+        b_high = b_high.unsqueeze(-1)
+
+    tiny = torch.finfo(beta.dtype).tiny
+    nonalt = total - alt
+    base_low = torch.clamp(1.0 - b_low * beta, min=tiny)
+    base_high = torch.clamp(1.0 - b_high * beta, min=tiny)
+    delta_low = alt - total * b_low * beta
+    delta_high = alt - total * b_high * beta
+
+    sign_low = torch.sign(delta_low)
+    sign_high = torch.sign(delta_high)
+    log_prior_low = torch.log1p(beta.new_tensor(-float(major_prior)))
+    log_prior_high = torch.log(beta.new_tensor(float(major_prior)))
+    neg_inf = torch.full_like(beta, float("-inf"))
+
+    logabs_low = (
+        log_prior_low
+        + alt * torch.log(torch.clamp(b_low, min=tiny))
+        + (nonalt - 1.0) * torch.log(base_low)
+        + torch.where(sign_low != 0.0, torch.log(torch.clamp(torch.abs(delta_low), min=tiny)), neg_inf)
+    )
+    logabs_high = (
+        log_prior_high
+        + alt * torch.log(torch.clamp(b_high, min=tiny))
+        + (nonalt - 1.0) * torch.log(base_high)
+        + torch.where(sign_high != 0.0, torch.log(torch.clamp(torch.abs(delta_high), min=tiny)), neg_inf)
+    )
+    anchor = torch.maximum(logabs_low, logabs_high)
+    finite_anchor = torch.isfinite(anchor)
+    safe_anchor = torch.where(finite_anchor, anchor, torch.zeros_like(anchor))
+    low_term = sign_low * torch.exp(logabs_low - safe_anchor)
+    high_term = sign_high * torch.exp(logabs_high - safe_anchor)
+    low_term = torch.where((sign_low != 0.0) & finite_anchor, low_term, torch.zeros_like(low_term))
+    high_term = torch.where((sign_high != 0.0) & finite_anchor, high_term, torch.zeros_like(high_term))
+    return low_term + high_term
+
+
+def _ambiguous_candidate_grid_torch(
+    *,
+    alt: torch.Tensor,
+    total: torch.Tensor,
+    b_minus: torch.Tensor,
+    b_plus: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    hint: torch.Tensor,
+    major_prior: float,
+    eps: float,
+    tol: float,
+    max_iter: int,
+) -> torch.Tensor:
+    b_low = torch.minimum(b_minus, b_plus)
+    b_high = torch.maximum(b_minus, b_plus)
+    valid = (upper > lower + 1e-12) & (total > 0.0) & (b_low > 0.0) & (b_high > 0.0)
+    fallback = torch.where(upper <= lower + 1e-12, lower, hint)
+    nan = torch.full_like(lower, float("nan"))
+
+    def column(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return torch.where(mask, values, nan)
+
+    columns = [
+        torch.where(valid, lower, fallback),
+        column(upper, valid),
+        column(hint, valid),
+    ]
+
+    r1 = float(eps) / b_high
+    r2 = float(eps) / b_low
+    r3 = (1.0 - float(eps)) / b_high
+    r4 = (1.0 - float(eps)) / b_low
+    for kink in (r1, r2, r3, r4):
+        columns.append(column(kink, valid & (kink >= lower) & (kink <= upper)))
+
+    beta_high = alt / (total * b_high)
+    region2_left = torch.maximum(lower, r1)
+    region2_right = torch.minimum(upper, r2)
+    columns.append(column(beta_high, valid & (region2_left < beta_high) & (beta_high < region2_right)))
+
+    beta_low = alt / (total * b_low)
+    region4_left = torch.maximum(lower, r3)
+    region4_right = torch.minimum(upper, r4)
+    columns.append(column(beta_low, valid & (region4_left < beta_low) & (beta_low < region4_right)))
+
+    middle_left = torch.maximum(lower, r2)
+    middle_right = torch.minimum(upper, r3)
+    middle_mask = valid & (middle_right > middle_left + 1e-12)
+    num_cells = int(alt.numel())
+    zero_roots = torch.full((num_cells, _ROOT_SCAN_POINTS), float("nan"), dtype=alt.dtype, device=alt.device)
+    interval_roots = torch.full((num_cells, _ROOT_SCAN_POINTS - 1), float("nan"), dtype=alt.dtype, device=alt.device)
+
+    if bool(torch.any(middle_mask).item()):
+        left_probe = torch.nextafter(middle_left, middle_right)
+        right_probe = torch.nextafter(middle_right, middle_left)
+        t = torch.linspace(0.0, 1.0, steps=_ROOT_SCAN_POINTS, dtype=alt.dtype, device=alt.device)
+        probe = left_probe[:, None] + (right_probe - left_probe)[:, None] * t
+        probe = torch.where(middle_mask[:, None], probe, torch.full_like(probe, float("nan")))
+        values = _ambiguous_middle_stationarity_torch(
+            probe,
+            alt=alt,
+            total=total,
+            b_low=b_low,
+            b_high=b_high,
+            major_prior=major_prior,
+        )
+
+        zero_mask = torch.isfinite(values) & (torch.abs(values) <= 1e-10)
+        zero_roots = torch.where(zero_mask, probe, zero_roots)
+
+        left_values = values[:, :-1]
+        right_values = values[:, 1:]
+        interval_mask = (
+            torch.isfinite(left_values)
+            & torch.isfinite(right_values)
+            & (left_values != 0.0)
+            & (right_values != 0.0)
+            & (left_values * right_values <= 0.0)
+        )
+        flat_interval_indices = torch.nonzero(interval_mask.reshape(-1), as_tuple=False).flatten()
+        if int(flat_interval_indices.numel()) > 0:
+            flat_left = probe[:, :-1].reshape(-1)
+            flat_right = probe[:, 1:].reshape(-1)
+            left_current = flat_left[flat_interval_indices]
+            right_current = flat_right[flat_interval_indices]
+            f_left = left_values.reshape(-1)[flat_interval_indices]
+            cell_ids = torch.arange(num_cells, dtype=torch.long, device=alt.device).repeat_interleave(_ROOT_SCAN_POINTS - 1)
+            cell_ids = cell_ids[flat_interval_indices]
+
+            roots = 0.5 * (left_current + right_current)
+            active = torch.ones_like(roots, dtype=torch.bool)
+            invalid = torch.zeros_like(roots, dtype=torch.bool)
+            for _ in range(max(int(max_iter), 32)):
+                midpoint = 0.5 * (left_current + right_current)
+                f_mid = _ambiguous_middle_stationarity_torch(
+                    midpoint,
+                    alt=alt[cell_ids],
+                    total=total[cell_ids],
+                    b_low=b_low[cell_ids],
+                    b_high=b_high[cell_ids],
+                    major_prior=major_prior,
+                )
+                finite_mid = torch.isfinite(f_mid)
+                invalid = invalid | (active & ~finite_mid)
+                converged = active & finite_mid & (
+                    (torch.abs(f_mid) <= 1e-12)
+                    | (torch.abs(right_current - left_current) <= float(tol) * (1.0 + torch.abs(midpoint)))
+                )
+                roots = torch.where(converged, midpoint, roots)
+                active = active & finite_mid & ~converged
+                keep_left_interval = active & (f_left * f_mid <= 0.0)
+                move_left = active & ~keep_left_interval
+                right_current = torch.where(keep_left_interval, midpoint, right_current)
+                left_current = torch.where(move_left, midpoint, left_current)
+                f_left = torch.where(move_left, f_mid, f_left)
+
+            roots = torch.where(active & ~invalid, 0.5 * (left_current + right_current), roots)
+            roots = torch.where(invalid, torch.full_like(roots, float("nan")), roots)
+            interval_roots.reshape(-1)[flat_interval_indices] = roots
+
+    columns.extend([zero_roots, interval_roots])
+    return torch.cat([col[:, None] if col.ndim == 1 else col for col in columns], dim=1)
 
 
 def _cell_breakpoints(
@@ -926,6 +1142,111 @@ def compute_scalar_cell_wells(
         np.clip(refined.reshape(shape), eps, np.asarray(data.phi_upper, dtype=np.float64)),
         secondary.reshape(shape),
         valid_secondary.reshape(shape),
+    )
+
+
+def compute_scalar_cell_wells_torch(
+    torch_data: TorchTumorData,
+    *,
+    phi_init: torch.Tensor | np.ndarray,
+    major_prior: float,
+    eps: float,
+    tol: float,
+    max_iter: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dtype = torch_data.alt.dtype
+    device = torch_data.alt.device
+    shape = tuple(torch_data.alt.shape)
+    lower = torch.full_like(torch_data.phi_upper, float(eps))
+    upper = torch_data.phi_upper
+    hint = torch.as_tensor(phi_init, dtype=dtype, device=device).reshape(shape)
+    hint = torch.minimum(torch.maximum(hint, lower), upper)
+
+    refined = torch.zeros_like(hint)
+    secondary = torch.full_like(hint, float("nan"))
+    valid_secondary = torch.zeros(shape, dtype=torch.bool, device=device)
+
+    fixed_mask = ~torch_data.ambiguous
+    if bool(torch.any(fixed_mask).item()):
+        fixed_valid = fixed_mask & (torch_data.total > 0.0) & (torch_data.b_fixed > 0.0)
+        fixed_solution = torch.where(fixed_mask, hint, refined)
+        if bool(torch.any(fixed_valid).item()):
+            p_hat = torch.clamp(torch_data.alt / torch.clamp(torch_data.total, min=torch.finfo(dtype).tiny), min=float(eps), max=1.0 - float(eps))
+            beta_hat = p_hat / torch.clamp(torch_data.b_fixed, min=float(eps))
+            fixed_solution = torch.where(fixed_valid, beta_hat, fixed_solution)
+        fixed_solution = torch.minimum(torch.maximum(fixed_solution, lower), upper)
+        refined = torch.where(fixed_mask, fixed_solution, refined)
+
+    ambiguous_mask = torch_data.ambiguous
+    if bool(torch.any(ambiguous_mask).item()):
+        flat_mask = ambiguous_mask.reshape(-1)
+        alt = torch_data.alt.reshape(-1)[flat_mask]
+        total = torch_data.total.reshape(-1)[flat_mask]
+        b_minus = torch_data.b_minus.reshape(-1)[flat_mask]
+        b_plus = torch_data.b_plus.reshape(-1)[flat_mask]
+        b_fixed = torch_data.b_fixed.reshape(-1)[flat_mask]
+        lower_flat = lower.reshape(-1)[flat_mask]
+        upper_flat = upper.reshape(-1)[flat_mask]
+        hint_flat = hint.reshape(-1)[flat_mask]
+        candidate_grid = _ambiguous_candidate_grid_torch(
+            alt=alt,
+            total=total,
+            b_minus=b_minus,
+            b_plus=b_plus,
+            lower=lower_flat,
+            upper=upper_flat,
+            hint=hint_flat,
+            major_prior=major_prior,
+            eps=eps,
+            tol=tol,
+            max_iter=max_iter,
+        ).detach().cpu().numpy()
+
+        alt_np = alt.detach().cpu().numpy()
+        total_np = total.detach().cpu().numpy()
+        b_minus_np = b_minus.detach().cpu().numpy()
+        b_plus_np = b_plus.detach().cpu().numpy()
+        b_fixed_np = b_fixed.detach().cpu().numpy()
+        lower_np = lower_flat.detach().cpu().numpy()
+        upper_np = upper_flat.detach().cpu().numpy()
+        hint_np = hint_flat.detach().cpu().numpy()
+        primary_np = np.empty((int(alt_np.size),), dtype=np.float64)
+        secondary_np = np.full((int(alt_np.size),), np.nan, dtype=np.float64)
+        valid_np = np.zeros((int(alt_np.size),), dtype=bool)
+
+        beta_tol = max(float(tol) * 10.0, 1e-8)
+        for row_idx in range(int(alt_np.size)):
+            primary, alternate = _cell_best_two_from_candidates(
+                candidate_grid[row_idx],
+                alt=float(alt_np[row_idx]),
+                total=float(total_np[row_idx]),
+                b_minus=float(b_minus_np[row_idx]),
+                b_plus=float(b_plus_np[row_idx]),
+                b_fixed=float(b_fixed_np[row_idx]),
+                ambiguous=True,
+                lower=float(lower_np[row_idx]),
+                upper=float(upper_np[row_idx]),
+                major_prior=major_prior,
+                eps=eps,
+                tol=tol,
+                hint=float(hint_np[row_idx]),
+            )
+            primary_np[row_idx] = float(primary)
+            if alternate is not None:
+                secondary_np[row_idx] = float(alternate)
+                valid_np[row_idx] = abs(float(alternate) - float(primary)) > beta_tol
+
+        refined_flat = refined.reshape(-1)
+        secondary_flat = secondary.reshape(-1)
+        valid_secondary_flat = valid_secondary.reshape(-1)
+        refined_flat[flat_mask] = torch.as_tensor(primary_np, dtype=dtype, device=device)
+        secondary_flat[flat_mask] = torch.as_tensor(secondary_np, dtype=dtype, device=device)
+        valid_secondary_flat[flat_mask] = torch.as_tensor(valid_np, dtype=torch.bool, device=device)
+
+    return (
+        torch.minimum(torch.maximum(refined, lower), upper),
+        secondary,
+        valid_secondary,
     )
 
 
