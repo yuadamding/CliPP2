@@ -10,6 +10,7 @@ from .types import PairwiseFusionGraph, TensorFusionGraph, TorchRuntime
 PDHG_PRECONDITIONER_ETA = 0.99
 COMPLETE_GRAPH_MEMORY_SAFETY_FRACTION = 0.80
 COMPLETE_GRAPH_MEMORY_LIMIT_ENV = "CLIPP2_MAX_COMPLETE_GRAPH_BYTES"
+COMPLETE_ADAPTIVE_WEIGHT_CHUNK_BYTES = 64 * 1024 * 1024
 
 
 def _complete_graph_weight(num_nodes: int) -> float:
@@ -23,6 +24,12 @@ def _complete_graph_edge_count(num_nodes: int) -> int:
 
 def _dtype_nbytes(dtype: torch.dtype) -> int:
     return int(torch.empty((), dtype=dtype).element_size())
+
+
+def _adaptive_weight_chunk_size(*, num_samples: int, dtype: torch.dtype) -> int:
+    sample_count = max(int(num_samples), 1)
+    bytes_per_edge = max(sample_count * _dtype_nbytes(dtype), 1)
+    return max(1, int(COMPLETE_ADAPTIVE_WEIGHT_CHUNK_BYTES // bytes_per_edge))
 
 
 def estimate_complete_tensor_graph_bytes(
@@ -44,7 +51,8 @@ def estimate_complete_tensor_graph_bytes(
     )
     if not adaptive:
         return int(persistent_bytes)
-    adaptive_peak_bytes = edge_count * sample_count * value_bytes + 3 * edge_count * value_bytes
+    chunk_edges = min(edge_count, _adaptive_weight_chunk_size(num_samples=sample_count, dtype=dtype))
+    adaptive_peak_bytes = chunk_edges * sample_count * value_bytes + 3 * chunk_edges * value_bytes
     return int(persistent_bytes + adaptive_peak_bytes)
 
 
@@ -138,6 +146,35 @@ def _is_canonical_complete_edge_index(edge_index: torch.Tensor, *, num_nodes: in
         device=edge_index.device,
     )
     return bool(torch.equal(edge_index, expected))
+
+
+def _complete_adaptive_raw_weights(
+    pilot: torch.Tensor,
+    *,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    gamma: float,
+    tau: float,
+) -> torch.Tensor:
+    num_edges = int(edge_u.numel())
+    raw_weight = torch.empty((num_edges,), dtype=pilot.dtype, device=pilot.device)
+    chunk_size = max(
+        1,
+        min(
+            num_edges,
+            _adaptive_weight_chunk_size(num_samples=int(pilot.shape[1]), dtype=pilot.dtype),
+        ),
+    )
+    for start in range(0, num_edges, chunk_size):
+        stop = min(start + chunk_size, num_edges)
+        diff = graph_forward_edges(
+            pilot,
+            edge_u=edge_u[start:stop],
+            edge_v=edge_v[start:stop],
+        )
+        distance = torch.linalg.vector_norm(diff, dim=1)
+        raw_weight[start:stop] = distance.clamp_min(float(tau)).pow(-float(gamma))
+    return raw_weight
 
 
 def _tensor_graph_from_edges(
@@ -273,14 +310,18 @@ def build_complete_adaptive_tensor_graph(
             known_complete=True,
         )
 
-    diff = graph_forward_edges(pilot, edge_u=edge_index[0], edge_v=edge_index[1])
-    distance = torch.linalg.vector_norm(diff, dim=1)
-    raw_weight = distance.clamp_min(float(tau)).pow(-float(gamma))
+    raw_weight = _complete_adaptive_raw_weights(
+        pilot,
+        edge_u=edge_index[0],
+        edge_v=edge_index[1],
+        gamma=float(gamma),
+        tau=float(tau),
+    )
     mean_raw_weight = torch.mean(raw_weight)
     if not bool(torch.isfinite(mean_raw_weight).item()) or float(mean_raw_weight.item()) <= 0.0:
         raise ValueError("Adaptive pairwise weights must have a positive finite mean.")
     target_mean_weight = float(baseline) * _complete_graph_weight(num_nodes)
-    weight = raw_weight * (target_mean_weight / mean_raw_weight)
+    weight = raw_weight.mul_(target_mean_weight / mean_raw_weight)
     return _tensor_graph_from_edges(
         edge_u=edge_index[0],
         edge_v=edge_index[1],
