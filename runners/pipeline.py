@@ -10,8 +10,8 @@ import numpy as np
 import pandas as pd
 
 from .._version import __version__ as _SOFTWARE_VERSION
+from ..core.fusion.graph import load_pairwise_fusion_graph_tsv
 from ..core.model import FitOptions
-from ..core.fusion_solver import load_pairwise_fusion_graph_tsv
 from ..io.data import TumorData, load_tumor_tsv
 from ..metrics.evaluation import evaluate_fit_against_simulation
 from .model_selection import select_model
@@ -36,7 +36,6 @@ def process_one_file_bundle(
     fit_options: FitOptions | None = None,
     bic_df_scale: float = 1.0,
     bic_cluster_penalty: float = 0.0,
-    settings_profile: str = "manual",
     selection_score: str = "bic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
@@ -79,13 +78,13 @@ def process_one_file_bundle(
         fit_options=fit_options,
         bic_df_scale=bic_df_scale,
         bic_cluster_penalty=bic_cluster_penalty,
-        settings_profile=settings_profile,
         selection_score=selection_score,
         use_warm_starts=use_warm_starts,
         evaluate_all_candidates=evaluate_all_candidates_flag,
         finalize_selected_fit=bool(finalize_selected_fit),
     )
     best_fit = selection_result.best_fit
+    selection_artifact = getattr(selection_result, "selected_artifact", None)
     simulation_diagnostics = getattr(selection_result, "simulation", selection_result)
     best_evaluation = getattr(
         simulation_diagnostics,
@@ -101,6 +100,23 @@ def process_one_file_bundle(
 
     def _selected_value(name: str, default: object = np.nan) -> object:
         return selected_search_row.get(name, default)
+
+    def _artifact_value(name: str, default: object = None) -> object:
+        if selection_artifact is not None and hasattr(selection_artifact, name):
+            return getattr(selection_artifact, name)
+        return getattr(best_fit, name, default)
+
+    def _artifact_float(name: str, default: float = np.nan) -> float:
+        value = _artifact_value(name, None)
+        return float(default) if value is None else float(value)
+
+    def _artifact_int(name: str, default: int = -1) -> int:
+        value = _artifact_value(name, None)
+        return int(default) if value is None else int(value)
+
+    def _artifact_bool(name: str, default: bool = False) -> bool:
+        value = _artifact_value(name, None)
+        return bool(default) if value is None else bool(value)
 
     def _selected_bool(name: str, default: bool = False) -> bool:
         value = _selected_value(name, default)
@@ -154,7 +170,13 @@ def process_one_file_bundle(
         return int(value)
 
     if best_evaluation is None and simulation_available and bool(finalize_selected_fit):
-        best_evaluation = evaluate_fit_against_simulation(fit=best_fit, data=data, simulation_root=simulation_root)
+        best_evaluation = evaluate_fit_against_simulation(
+            fit=best_fit,
+            data=data,
+            simulation_root=simulation_root,
+            bic_refit_phi=_artifact_value("bic_refit_phi"),
+            bic_partition_labels=_artifact_value("bic_partition_labels"),
+        )
 
     elapsed_seconds = float(perf_counter() - start_time)
     reported_selected_ari = (
@@ -172,14 +194,15 @@ def process_one_file_bundle(
         if best_evaluation is not None
         else "not_available"
     )
+    best_classic_bic = _artifact_value("classic_bic")
     best_bic_refit_finite = (
-        bool(best_fit.bic_refit_finite_candidate_found)
-        if getattr(best_fit, "bic_refit_finite_candidate_found", None) is not None
-        else bool(best_fit.bic_refit_converged)
-        if best_fit.bic_refit_converged is not None
+        bool(_artifact_value("bic_refit_finite_candidate_found"))
+        if _artifact_value("bic_refit_finite_candidate_found") is not None
+        else bool(_artifact_value("bic_refit_converged"))
+        if _artifact_value("bic_refit_converged") is not None
         else False
     )
-    best_bic_refit_global = bool(getattr(best_fit, "bic_refit_global_optimum_certified", False))
+    best_bic_refit_global = bool(_artifact_value("bic_refit_global_optimum_certified", False))
 
     summary = {
         "tumor_id": data.tumor_id,
@@ -191,13 +214,13 @@ def process_one_file_bundle(
         "selected_partition_candidate_requested_K": _selected_int("partition_candidate_requested_K", -1),
         "loglik": float(best_fit.loglik),
         "summary_loglik": float(best_fit.summary_loglik),
-        "bic": float(best_fit.bic if best_fit.bic is not None else np.nan),
-        "classic_bic": float(best_fit.classic_bic if best_fit.classic_bic is not None else np.nan),
-        "extended_bic": float(best_fit.extended_bic if best_fit.extended_bic is not None else np.nan),
+        "bic": _artifact_float("bic"),
+        "classic_bic": float(best_classic_bic if best_classic_bic is not None else np.nan),
+        "extended_bic": _artifact_float("extended_bic"),
         "n_clusters": int(best_fit.n_clusters),
-        "settings_profile": selection_result.profile_name,
+        "selection_profile": selection_result.profile_name,
         "selection_method": selection_result.selection_method,
-        "selection_score_name": str(best_fit.selection_score_name or selection_score),
+        "selection_score_name": str(_artifact_value("selection_score_name", None) or selection_score),
         "lambda_search_mode": str(selection_result.lambda_search_mode),
         "selected_lambda_representative": selected_lambda_representative,
         "selected_lambda_left": np.nan
@@ -229,10 +252,6 @@ def process_one_file_bundle(
         "num_candidates_certified": int(
             getattr(selection_result, "num_candidates_certified", selection_result.num_converged_candidates)
         ),
-        "num_candidates_near_kkt": int(getattr(selection_result, "num_candidates_near_kkt", 0)),
-        "num_candidates_polished": int(getattr(selection_result, "num_candidates_polished", 0)),
-        "num_polish_success": int(getattr(selection_result, "num_polish_success", 0)),
-        "num_polish_failed": int(getattr(selection_result, "num_polish_failed", 0)),
         "selected_kkt_residual": np.nan
         if getattr(selection_result, "selected_kkt_residual", None) is None
         else float(selection_result.selected_kkt_residual),
@@ -281,12 +300,6 @@ def process_one_file_bundle(
         "best_ari_bic_eligible": np.nan
         if getattr(simulation_diagnostics, "best_ari_bic_eligible", None) is None
         else float(simulation_diagnostics.best_ari_bic_eligible),
-        "best_ari_near_kkt": np.nan
-        if getattr(simulation_diagnostics, "best_ari_near_kkt", None) is None
-        else float(simulation_diagnostics.best_ari_near_kkt),
-        "best_ari_after_polish": np.nan
-        if getattr(simulation_diagnostics, "best_ari_after_polish", None) is None
-        else float(simulation_diagnostics.best_ari_after_polish),
         "selection_optimizer_limited": bool(getattr(selection_result, "selection_optimizer_limited", False)),
         "selection_optimizer_limited_reason": str(
             getattr(selection_result, "selection_optimizer_limited_reason", "none")
@@ -342,57 +355,31 @@ def process_one_file_bundle(
         "inner_max_iter": int(_selected_value("inner_max_iter", fit_options.inner_max_iter)),
         "bic_df_scale": float(selection_result.bic_df_scale),
         "bic_cluster_penalty": float(selection_result.bic_cluster_penalty),
-        "bic_loglik": np.nan if best_fit.bic_loglik is None else float(best_fit.bic_loglik),
-        "bic_loglik_source": str(best_fit.bic_loglik_source or ""),
-        "bic_df": np.nan if best_fit.bic_df is None else float(best_fit.bic_df),
-        "bic_active_df": np.nan if best_fit.bic_active_df is None else float(best_fit.bic_active_df),
-        "bic_n_eff": np.nan if best_fit.bic_n_eff is None else float(best_fit.bic_n_eff),
-        "bic_depth_n_eff": np.nan if best_fit.bic_depth_n_eff is None else float(best_fit.bic_depth_n_eff),
-        "classic_bic_depth_n": np.nan
-        if best_fit.classic_bic_depth_n is None
-        else float(best_fit.classic_bic_depth_n),
-        "classic_bic_active_df": np.nan
-        if best_fit.classic_bic_active_df is None
-        else float(best_fit.classic_bic_active_df),
-        "classic_bic_active_df_depth_n": np.nan
-        if best_fit.classic_bic_active_df_depth_n is None
-        else float(best_fit.classic_bic_active_df_depth_n),
-        "bic_partition_tol": np.nan
-        if best_fit.bic_partition_tol is None
-        else float(best_fit.bic_partition_tol),
+        "bic_loglik": _artifact_float("bic_loglik"),
+        "bic_loglik_source": str(_artifact_value("bic_loglik_source", "") or ""),
+        "bic_df": _artifact_float("bic_df"),
+        "bic_active_df": _artifact_float("bic_active_df"),
+        "bic_n_eff": _artifact_float("bic_n_eff"),
+        "bic_depth_n_eff": _artifact_float("bic_depth_n_eff"),
+        "classic_bic_depth_n": _artifact_float("classic_bic_depth_n"),
+        "classic_bic_active_df": _artifact_float("classic_bic_active_df"),
+        "classic_bic_active_df_depth_n": _artifact_float("classic_bic_active_df_depth_n"),
+        "bic_partition_tol": _artifact_float("bic_partition_tol"),
         "summary_cluster_max_diameter": float(best_fit.max_cluster_diameter),
         "summary_cluster_diameter_exact": bool(best_fit.cluster_diameter_exact),
         "bic_partition_max_diameter": float(_selected_value("bic_partition_max_diameter", np.nan)),
         "bic_partition_diameter_exact": bool(_selected_value("bic_partition_diameter_exact", False)),
-        "bic_refit_boundary_count": -1
-        if best_fit.bic_refit_boundary_count is None
-        else int(best_fit.bic_refit_boundary_count),
+        "bic_refit_boundary_count": _artifact_int("bic_refit_boundary_count"),
         "bic_refit_finite_candidate_found": bool(best_bic_refit_finite),
         "bic_refit_global_optimum_certified": bool(best_bic_refit_global),
-        "bic_refit_coordinate_count": -1
-        if best_fit.bic_refit_coordinate_count is None
-        else int(best_fit.bic_refit_coordinate_count),
-        "bic_refit_finite_coordinate_count": -1
-        if best_fit.bic_refit_finite_coordinate_count is None
-        else int(best_fit.bic_refit_finite_coordinate_count),
-        "bic_refit_total_grid_points": -1
-        if best_fit.bic_refit_total_grid_points is None
-        else int(best_fit.bic_refit_total_grid_points),
-        "bic_refit_max_grid_spacing": np.nan
-        if best_fit.bic_refit_max_grid_spacing is None
-        else float(best_fit.bic_refit_max_grid_spacing),
-        "bic_refit_total_candidate_basins": -1
-        if best_fit.bic_refit_total_candidate_basins is None
-        else int(best_fit.bic_refit_total_candidate_basins),
-        "bic_refit_total_refined_candidates": -1
-        if best_fit.bic_refit_total_refined_candidates is None
-        else int(best_fit.bic_refit_total_refined_candidates),
-        "bic_refit_min_best_second_loss_gap": np.nan
-        if best_fit.bic_refit_min_best_second_loss_gap is None
-        else float(best_fit.bic_refit_min_best_second_loss_gap),
-        "bic_refit_converged": bool(best_fit.bic_refit_converged)
-        if best_fit.bic_refit_converged is not None
-        else False,
+        "bic_refit_coordinate_count": _artifact_int("bic_refit_coordinate_count"),
+        "bic_refit_finite_coordinate_count": _artifact_int("bic_refit_finite_coordinate_count"),
+        "bic_refit_total_grid_points": _artifact_int("bic_refit_total_grid_points"),
+        "bic_refit_max_grid_spacing": _artifact_float("bic_refit_max_grid_spacing"),
+        "bic_refit_total_candidate_basins": _artifact_int("bic_refit_total_candidate_basins"),
+        "bic_refit_total_refined_candidates": _artifact_int("bic_refit_total_refined_candidates"),
+        "bic_refit_min_best_second_loss_gap": _artifact_float("bic_refit_min_best_second_loss_gap"),
+        "bic_refit_converged": _artifact_bool("bic_refit_converged"),
         "primary_phi_source": _selected_str("primary_phi_source", "raw_penalized_fit"),
         "bic_refit_phi_source": _selected_str("bic_refit_phi_source", "secondary_partition_refit"),
         "converged": bool(best_fit.converged),
@@ -466,8 +453,8 @@ def process_one_file_bundle(
                 bool(
                     best_fit.selection_eligible
                     and bool(best_bic_refit_finite)
-                    and best_fit.classic_bic is not None
-                    and np.isfinite(float(best_fit.classic_bic))
+                    and best_classic_bic is not None
+                    and np.isfinite(float(best_classic_bic))
                 ),
             )
         ),
@@ -514,6 +501,8 @@ def process_one_file_bundle(
             search_df=search_df,
             evaluation=best_evaluation,
             run_summary=summary,
+            bic_refit_phi=_artifact_value("bic_refit_phi"),
+            bic_refit_cluster_centers=_artifact_value("bic_refit_cluster_centers"),
         )
     return summary, search_df
 
@@ -527,7 +516,6 @@ def process_one_file(
     fit_options: FitOptions | None = None,
     bic_df_scale: float = 1.0,
     bic_cluster_penalty: float = 0.0,
-    settings_profile: str = "manual",
     selection_score: str = "bic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
@@ -545,7 +533,6 @@ def process_one_file(
         fit_options=fit_options,
         bic_df_scale=bic_df_scale,
         bic_cluster_penalty=bic_cluster_penalty,
-        settings_profile=settings_profile,
         selection_score=selection_score,
         use_warm_starts=use_warm_starts,
         write_outputs=write_outputs,
@@ -567,7 +554,6 @@ def run_directory(
     max_files: int | None = None,
     bic_df_scale: float = 1.0,
     bic_cluster_penalty: float = 0.0,
-    settings_profile: str = "manual",
     selection_score: str = "bic",
     use_warm_starts: bool = True,
     write_outputs: bool = True,
@@ -599,7 +585,6 @@ def run_directory(
                     fit_options=fit_options,
                     bic_df_scale=bic_df_scale,
                     bic_cluster_penalty=bic_cluster_penalty,
-                    settings_profile=settings_profile,
                     selection_score=selection_score,
                     use_warm_starts=use_warm_starts,
                     write_outputs=write_outputs,
@@ -640,7 +625,6 @@ def run_directory(
                     fit_options=fit_options,
                     bic_df_scale=bic_df_scale,
                     bic_cluster_penalty=bic_cluster_penalty,
-                    settings_profile=settings_profile,
                     selection_score=selection_score,
                     use_warm_starts=use_warm_starts,
                     write_outputs=write_outputs,

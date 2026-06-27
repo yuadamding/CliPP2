@@ -7,20 +7,8 @@ import numpy as np
 from ..io.data import TumorData
 
 
-FIXED_LAMBDA_GRID_MODES = (
-    "standard",
-    "dense",
-    "dense_no_zero",
-    "coarse_no_zero",
-    "ultra_dense_no_zero",
-    "fixed_grid",
-)
-BIC_ADAPTIVE_LAMBDA_GRID_MODES = (
-    "adaptive_bic",
-)
-ADAPTIVE_LAMBDA_GRID_MODES = BIC_ADAPTIVE_LAMBDA_GRID_MODES
-LAMBDA_GRID_MODES = FIXED_LAMBDA_GRID_MODES + ADAPTIVE_LAMBDA_GRID_MODES
-PUBLIC_LAMBDA_GRID_MODES = ("adaptive_bic", "fixed_grid")
+ADAPTIVE_LAMBDA_GRID_MODES = ("adaptive_bic",)
+LAMBDA_GRID_MODES = ADAPTIVE_LAMBDA_GRID_MODES
 
 
 @dataclass(frozen=True)
@@ -34,36 +22,6 @@ class LambdaBracket:
 
 def is_adaptive_lambda_grid_mode(mode: str) -> bool:
     return str(mode).strip().lower() in ADAPTIVE_LAMBDA_GRID_MODES
-
-
-def _default_lambda_ratios(mode: str) -> np.ndarray:
-    if mode == "standard":
-        return np.array([0.5, 2.0, 8.0, 32.0, 128.0], dtype=float)
-    if mode == "fixed_grid":
-        mode = "dense_no_zero"
-    if mode == "dense":
-        return np.array([0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0], dtype=float)
-    if mode == "dense_no_zero":
-        return np.array([0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0], dtype=float)
-    if mode == "ultra_dense_no_zero":
-        return np.array(
-            [0.1, 0.15, 0.25, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0, 96.0, 128.0, 192.0, 256.0, 384.0, 512.0, 768.0, 1024.0],
-            dtype=float,
-        )
-    if mode == "coarse_no_zero":
-        return np.array([1.0, 8.0, 64.0, 512.0], dtype=float)
-    raise ValueError(f"Unknown lambda grid mode: {mode}")
-
-
-def default_lambda_grid(
-    data: TumorData,
-    mode: str = "fixed_grid",
-) -> list[float]:
-    del data
-    if is_adaptive_lambda_grid_mode(mode):
-        raise ValueError(f"{mode} requires data-adaptive lambda anchors, not a fixed default grid.")
-    grid = _default_lambda_ratios(mode=mode)
-    return [float(value) for value in np.unique(np.round(grid, 6))]
 
 
 def compute_classic_bic(loglik: float, num_clusters: int, data: TumorData) -> float:
@@ -131,18 +89,14 @@ def compute_extended_bic(
 
 __all__ = [
     "ADAPTIVE_LAMBDA_GRID_MODES",
-    "BIC_ADAPTIVE_LAMBDA_GRID_MODES",
-    "FIXED_LAMBDA_GRID_MODES",
     "LAMBDA_GRID_MODES",
     "LambdaBracket",
-    "PUBLIC_LAMBDA_GRID_MODES",
     "bic_degrees_of_freedom",
     "bic_degrees_of_freedom_nominal",
     "compute_bic_with_df",
     "compute_classic_bic",
     "compute_classic_bic_depth_n",
     "compute_extended_bic",
-    "default_lambda_grid",
     "effective_bic_cell_count",
     "effective_bic_depth_count",
     "is_adaptive_lambda_grid_mode",

@@ -6,7 +6,8 @@ import numpy as np
 import torch
 
 from ..io.data import TumorData
-from .fusion_solver import PairwiseFusionGraph, SolverContext, SolverState, fit_observed_data_pairwise_fusion
+from .fusion.solver import fit_observed_data_pairwise_fusion
+from .fusion.types import PairwiseFusionGraph, SolverContext, SolverState
 
 
 @dataclass
@@ -27,6 +28,72 @@ class FitOptions:
     bic_partition_tol: float | None = 1e-4
     objective_shape: str = "unimodal"
     verbose: bool = False
+
+
+@dataclass(frozen=True)
+class Problem:
+    data: TumorData
+    graph: PairwiseFusionGraph
+    lambda_value: float
+    major_prior: float = 0.5
+    eps: float = 1e-6
+
+
+@dataclass(frozen=True)
+class SolverOptions:
+    outer_max_iter: int = 8
+    inner_max_iter: int = 30
+    tol: float = 1e-4
+    device: str = "cuda"
+    dtype: str = "float64"
+    compute_summary: bool = False
+    summary_tol: float | None = 1e-4
+    bic_partition_tol: float | None = 1e-4
+    verbose: bool = False
+
+    def to_fit_options(self, problem: Problem) -> FitOptions:
+        return FitOptions(
+            lambda_value=float(problem.lambda_value),
+            outer_max_iter=int(self.outer_max_iter),
+            inner_max_iter=int(self.inner_max_iter),
+            tol=float(self.tol),
+            major_prior=float(problem.major_prior),
+            eps=float(problem.eps),
+            graph=problem.graph,
+            device=str(self.device),
+            dtype=str(self.dtype),
+            summary_tol=self.summary_tol,
+            bic_partition_tol=self.bic_partition_tol,
+            verbose=bool(self.verbose),
+        )
+
+
+@dataclass(frozen=True)
+class Estimate:
+    phi: np.ndarray
+    objective: float
+    loglik: float
+    lambda_value: float
+    graph_name: str
+
+
+@dataclass(frozen=True)
+class Diagnostics:
+    converged: bool
+    outer_iterations: int
+    inner_iterations: int
+    objective_history: tuple[float, ...]
+    fixed_objective_kkt_residual: float | None = None
+    inner_kkt_residual: float | None = None
+    failure_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class Summary:
+    cluster_labels: np.ndarray | None = None
+    cluster_centers: np.ndarray | None = None
+    major_probability: np.ndarray | None = None
+    multiplicity_call: np.ndarray | None = None
 
 
 @dataclass
@@ -54,6 +121,7 @@ class FitResult:
     dtype: str
     graph_name: str
     summary_tol: float
+    summary_available: bool
     inner_kkt_residual: float
     accepted_inner_kkt_residual: float
     last_attempted_inner_kkt_residual: float
@@ -115,38 +183,45 @@ class FitResult:
     objective_spread_across_starts: float = float("nan")
     selected_start_objective_rank: int = 1
     history: list[float] = field(default_factory=list)
-    bic: float | None = None
-    classic_bic: float | None = None
-    extended_bic: float | None = None
-    classic_bic_depth_n: float | None = None
-    classic_bic_active_df: float | None = None
-    classic_bic_active_df_depth_n: float | None = None
-    bic_loglik: float | None = None
-    bic_loglik_source: str | None = None
-    bic_df: float | None = None
-    bic_active_df: float | None = None
-    bic_n_eff: float | None = None
-    bic_depth_n_eff: float | None = None
-    bic_partition_tol: float | None = None
-    bic_refit_boundary_count: int | None = None
-    bic_refit_finite_candidate_found: bool | None = None
-    bic_refit_global_optimum_certified: bool | None = None
-    bic_refit_coordinate_count: int | None = None
-    bic_refit_finite_coordinate_count: int | None = None
-    bic_refit_total_grid_points: int | None = None
-    bic_refit_max_grid_spacing: float | None = None
-    bic_refit_total_candidate_basins: int | None = None
-    bic_refit_total_refined_candidates: int | None = None
-    bic_refit_min_best_second_loss_gap: float | None = None
-    bic_refit_converged: bool | None = None
-    bic_refit_phi: np.ndarray | None = None
-    bic_refit_cluster_centers: np.ndarray | None = None
-    bic_partition_labels: np.ndarray | None = None
-    selection_score_name: str | None = None
     solver_state: SolverState | None = None
 
+    @property
+    def estimate(self) -> Estimate:
+        return Estimate(
+            phi=self.phi,
+            objective=float(self.penalized_objective),
+            loglik=float(self.loglik),
+            lambda_value=float(self.lambda_value),
+            graph_name=str(self.graph_name),
+        )
 
-def fit_single_stage_em(
+    @property
+    def diagnostics(self) -> Diagnostics:
+        return Diagnostics(
+            converged=bool(self.converged),
+            outer_iterations=int(self.iterations),
+            inner_iterations=int(self.accepted_outer_steps),
+            objective_history=tuple(float(value) for value in self.history),
+            fixed_objective_kkt_residual=float(self.fixed_objective_kkt_residual),
+            inner_kkt_residual=float(self.inner_kkt_residual),
+            failure_reason=str(self.failure_reason or ""),
+        )
+
+    @property
+    def summary(self) -> Summary | None:
+        if not self.summary_available:
+            return None
+        if self.cluster_labels is None and self.cluster_centers is None:
+            return None
+        return Summary(
+            cluster_labels=self.cluster_labels,
+            cluster_centers=self.cluster_centers,
+            major_probability=self.major_probability,
+            multiplicity_call=self.multiplicity_call,
+        )
+
+
+def fit_fixed_objective(
     data: TumorData,
     options: FitOptions,
     phi_start: np.ndarray | torch.Tensor | None = None,
@@ -212,6 +287,7 @@ def fit_single_stage_em(
         dtype=str(artifacts.dtype),
         graph_name=str(artifacts.graph_name),
         summary_tol=float(artifacts.summary_tol),
+        summary_available=bool(compute_summary),
         inner_kkt_residual=float(artifacts.inner_kkt_residual),
         accepted_inner_kkt_residual=float(artifacts.accepted_inner_kkt_residual),
         last_attempted_inner_kkt_residual=float(artifacts.last_attempted_inner_kkt_residual),
@@ -287,8 +363,23 @@ def fit_single_stage_em(
     )
 
 
+def fit(problem: Problem, options: SolverOptions | None = None) -> FitResult:
+    solver_options = SolverOptions() if options is None else options
+    return fit_fixed_objective(
+        problem.data,
+        solver_options.to_fit_options(problem),
+        compute_summary=bool(solver_options.compute_summary),
+    )
+
+
 __all__ = [
+    "Diagnostics",
+    "Estimate",
     "FitOptions",
     "FitResult",
-    "fit_single_stage_em",
+    "Problem",
+    "SolverOptions",
+    "Summary",
+    "fit",
+    "fit_fixed_objective",
 ]

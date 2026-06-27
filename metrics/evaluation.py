@@ -304,6 +304,8 @@ def evaluate_fit_against_simulation(
     data: TumorData,
     simulation_root: str | Path | None = None,
     simulation_truth: SimulationTruth | None = None,
+    bic_refit_phi: np.ndarray | None = None,
+    bic_partition_labels: np.ndarray | None = None,
 ) -> SimulationEvaluation:
     if simulation_truth is None:
         if simulation_root is None:
@@ -362,8 +364,12 @@ def evaluate_fit_against_simulation(
 
     bic_refit_ari: float | None = None
     bic_refit_cp_rmse: float | None = None
-    refit_phi = getattr(fit, "bic_refit_phi", None)
-    refit_labels = getattr(fit, "bic_partition_labels", None)
+    refit_phi = bic_refit_phi if bic_refit_phi is not None else getattr(fit, "bic_refit_phi", None)
+    refit_labels = (
+        bic_partition_labels
+        if bic_partition_labels is not None
+        else getattr(fit, "bic_partition_labels", None)
+    )
     if (
         refit_phi is not None
         and refit_labels is not None

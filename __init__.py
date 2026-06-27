@@ -1,56 +1,21 @@
-"""CliPP2: certified BIC selection for observed-data pairwise fusion."""
+"""CliPP2: observed-data pairwise fusion for multi-region subclonal reconstruction."""
+
+from __future__ import annotations
 
 from ._version import __version__
-from .core import (
-    FitOptions,
-    FitResult,
-    PairwiseFusionGraph,
-    fit_observed_data_pairwise_fusion,
-    fit_single_stage_em,
-    fit_torch,
-    prepare_torch_problem,
-    resolve_pairwise_fusion_graph,
-)
+from .core.model import FitResult, Problem, SolverOptions, fit
+from .core.fusion.types import PairwiseFusionGraph
 from .io.data import PatientData, TumorData, load_patient_tsv, load_tumor_tsv
-from .runners import (
-    BICSelectionResult,
-    LambdaBracket,
-    ModelSelectionResult,
-    RecommendedSettings,
-    SimulationDiagnostics,
-    TumorRegime,
-    default_lambda_grid,
-    process_one_file,
-    recommend_settings_from_data,
-    run_directory,
-    select_model,
-    summarize_tumor_regime,
-)
 
 __all__ = [
-    "BICSelectionResult",
-    "FitOptions",
     "FitResult",
-    "LambdaBracket",
-    "ModelSelectionResult",
     "PairwiseFusionGraph",
     "PatientData",
-    "RecommendedSettings",
-    "SimulationDiagnostics",
+    "Problem",
+    "SolverOptions",
     "TumorData",
-    "TumorRegime",
     "__version__",
-    "default_lambda_grid",
-    "fit_observed_data_pairwise_fusion",
-    "fit_single_stage_em",
-    "fit_torch",
+    "fit",
     "load_patient_tsv",
     "load_tumor_tsv",
-    "process_one_file",
-    "recommend_settings_from_data",
-    "prepare_torch_problem",
-    "resolve_pairwise_fusion_graph",
-    "run_directory",
-    "select_model",
-    "summarize_tumor_regime",
 ]

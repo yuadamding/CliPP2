@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
-from . import FitOptions, process_one_file, run_directory
-from .runners.benchmark_common import _resolve_effective_device
-from .runners.selection import PUBLIC_LAMBDA_GRID_MODES
+from .core.model import FitOptions
+from .runners.pipeline import process_one_file, run_directory
+
+
+def _resolve_effective_device(device: str | None) -> str:
+    requested = "auto" if device is None else str(device).strip().lower()
+    if requested in {"cpu", "cuda"}:
+        return requested
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
 
 
 def _parse_lambda_grid(value: str | None) -> list[float] | None:
@@ -18,15 +30,6 @@ def _parse_lambda_grid(value: str | None) -> list[float] | None:
     return [float(piece) for piece in cleaned.split(",") if piece.strip()]
 
 
-def _parse_int_grid(value: str | None) -> list[int] | None:
-    if value is None:
-        return None
-    cleaned = value.strip()
-    if not cleaned:
-        return None
-    return [int(piece) for piece in cleaned.split(",") if piece.strip()]
-
-
 def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lambda-grid", default=None, help="Comma-separated lambda grid or 'auto'.")
     parser.add_argument(
@@ -35,13 +38,17 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         help="Optional TSV defining a custom pairwise-fusion graph using either edge_u/edge_v or mutation_u/mutation_v columns, with optional edge_w.",
     )
     parser.add_argument(
-        "--lambda-grid-mode",
-        choices=list(PUBLIC_LAMBDA_GRID_MODES),
-        default="adaptive_bic",
-        help="Automatic lambda grid template used when --lambda-grid is not provided.",
+        "--outer-max-iter",
+        type=int,
+        default=8,
+        help="Maximum outer majorization iterations.",
     )
-    parser.add_argument("--outer-max-iter", type=int, default=8, help="Maximum outer majorization iterations.")
-    parser.add_argument("--inner-max-iter", type=int, default=30, help="Maximum inner convex-solver iterations.")
+    parser.add_argument(
+        "--inner-max-iter",
+        type=int,
+        default=30,
+        help="Maximum inner convex-solver iterations.",
+    )
     parser.add_argument("--tol", type=float, default=1e-4, help="Optimization tolerance.")
     parser.add_argument(
         "--summary-tol",
@@ -55,37 +62,13 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         default=1e-4,
         help="Explicit fusion tolerance used to extract partitions for partition-refit BIC.",
     )
-    parser.add_argument(
-        "--bic-df-scale",
-        type=float,
-        default=1.0,
-        help="Scale factor on the CP-profile degrees of freedom in the extended BIC diagnostic.",
-    )
-    parser.add_argument(
-        "--bic-cluster-penalty",
-        type=float,
-        default=0.0,
-        help="Additional cluster-count complexity penalty in the extended BIC diagnostic.",
-    )
-    parser.add_argument(
-        "--settings-profile",
-        choices=["manual", "auto"],
-        default="manual",
-        help="Model-selection strategy. 'manual' uses the provided lambda path; 'auto' uses compact pairwise-fusion defaults.",
-    )
-    parser.add_argument(
-        "--selection-score",
-        choices=["bic"],
-        default="bic",
-        help="Candidate scoring objective. BIC uses a partition-constrained observed-data refit.",
-    )
     parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
     parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability assigned to major-copy multiplicity.")
     parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
         default="cuda",
-        help="Execution device for the Torch fusion backend. CUDA is the default and falls back to CPU when unavailable.",
+        help="Execution device for the Torch fusion backend. CUDA is the default; use 'auto' for CPU fallback.",
     )
     parser.add_argument(
         "--dtype",
@@ -106,7 +89,6 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input-dir", default="CliPP2Sim_TSV", help="Directory with per-tumor TSV files.")
     parser.add_argument("--input-file", default=None, help="Optional single tumor TSV file.")
     parser.add_argument("--outdir", default="multi_region_clipp_results", help="Output directory.")
-    parser.add_argument("--simulation-root", default=None, help=argparse.SUPPRESS)
     _add_common_selection_args(parser)
     parser.add_argument(
         "--skip-outputs",
@@ -119,32 +101,6 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-files", type=int, default=None, help="Optional cap on the number of files processed.")
 
 
-def _add_benchmark_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--input-dir", default="CliPP2Sim_TSV", help="Directory with per-tumor TSV files.")
-    parser.add_argument("--outdir", default="multi_region_clipp_results", help="Output directory.")
-    parser.add_argument("--simulation-root", default="CliPP2Sim", help="Simulation root for benchmark diagnostics.")
-    _add_common_selection_args(parser)
-    parser.add_argument(
-        "--reps-per-scenario",
-        type=int,
-        default=1,
-        help="Number of representative tumors to benchmark for each simulation scenario.",
-    )
-    parser.add_argument(
-        "--n-mean-values",
-        default=None,
-        help="Optional comma-separated filter for benchmark depth settings, for example '50,300,1000'.",
-    )
-    parser.add_argument(
-        "--skip-outputs",
-        "--skip-patient-outputs",
-        "--skip-tumor-outputs",
-        action="store_true",
-        help="Skip per-tumor mutation/cluster/lambda files and only write benchmark summaries.",
-    )
-    parser.add_argument("--workers", type=int, default=1, help="Process-level parallelism for benchmark runs.")
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipp2",
@@ -152,11 +108,9 @@ def build_parser() -> argparse.ArgumentParser:
             "CliPP2 BIC model selection for objective-faithful observed-data pairwise fusion."
         ),
     )
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_subparsers(dest="command", required=True)
     fit_parser = subparsers.add_parser("fit", help="Fit TSV files with certified BIC model selection.")
     _add_fit_args(fit_parser)
-    benchmark_parser = subparsers.add_parser("benchmark", help="Run simulation benchmark diagnostics.")
-    _add_benchmark_args(benchmark_parser)
     return parser
 
 
@@ -175,59 +129,21 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
     )
 
 
-def _legacy_command_argv(argv: list[str]) -> list[str]:
-    if argv and argv[0] in {"fit", "benchmark", "-h", "--help"}:
-        return argv
-    if "--benchmark-simulation" in argv:
-        return ["benchmark", *[arg for arg in argv if arg != "--benchmark-simulation"]]
-    return ["fit", *argv]
-
-
-def _run_benchmark(args: argparse.Namespace) -> None:
-    from .runners.benchmark import run_simulation_benchmark
-
-    fit_options = _fit_options_from_args(args)
-    lambda_grid = _parse_lambda_grid(args.lambda_grid)
-    n_mean_values = _parse_int_grid(args.n_mean_values)
-    _, scenario_df, global_df = run_simulation_benchmark(
-        input_dir=Path(args.input_dir),
-        simulation_root=Path(args.simulation_root),
-        outdir=Path(args.outdir),
-        reps_per_scenario=args.reps_per_scenario,
-        n_mean_values=n_mean_values,
-        lambda_grid=lambda_grid,
-        lambda_grid_mode=args.lambda_grid_mode,
-        fit_options=fit_options,
-        bic_df_scale=args.bic_df_scale,
-        bic_cluster_penalty=args.bic_cluster_penalty,
-        settings_profile=args.settings_profile,
-        selection_score=args.selection_score,
-        use_warm_starts=not args.disable_warm_start,
-        write_patient_outputs=not args.skip_outputs,
-        workers=args.workers,
-        missing_cna_policy=args.missing_cna_policy,
-    )
-    print(global_df.to_string(index=False))
-    print(scenario_df.head().to_string(index=False))
-
-
 def _run_fit(args: argparse.Namespace) -> None:
     fit_options = _fit_options_from_args(args)
     lambda_grid = _parse_lambda_grid(args.lambda_grid)
-    simulation_root = Path(args.simulation_root) if args.simulation_root else None
 
     if args.input_file:
         summary = process_one_file(
             file_path=Path(args.input_file),
             outdir=Path(args.outdir),
-            simulation_root=simulation_root,
+            simulation_root=None,
             lambda_grid=lambda_grid,
-            lambda_grid_mode=args.lambda_grid_mode,
+            lambda_grid_mode="adaptive_bic",
             fit_options=fit_options,
-            bic_df_scale=args.bic_df_scale,
-            bic_cluster_penalty=args.bic_cluster_penalty,
-            settings_profile=args.settings_profile,
-            selection_score=args.selection_score,
+            bic_df_scale=1.0,
+            bic_cluster_penalty=0.0,
+            selection_score="bic",
             use_warm_starts=not args.disable_warm_start,
             write_outputs=not args.skip_outputs,
             graph_file=Path(args.graph_file) if args.graph_file else None,
@@ -239,15 +155,14 @@ def _run_fit(args: argparse.Namespace) -> None:
     summary_df = run_directory(
         input_dir=Path(args.input_dir),
         outdir=Path(args.outdir),
-        simulation_root=simulation_root,
+        simulation_root=None,
         lambda_grid=lambda_grid,
-        lambda_grid_mode=args.lambda_grid_mode,
+        lambda_grid_mode="adaptive_bic",
         fit_options=fit_options,
         max_files=args.max_files,
-        bic_df_scale=args.bic_df_scale,
-        bic_cluster_penalty=args.bic_cluster_penalty,
-        settings_profile=args.settings_profile,
-        selection_score=args.selection_score,
+        bic_df_scale=1.0,
+        bic_cluster_penalty=0.0,
+        selection_score="bic",
         use_warm_starts=not args.disable_warm_start,
         write_outputs=not args.skip_outputs,
         graph_file=Path(args.graph_file) if args.graph_file else None,
@@ -259,10 +174,7 @@ def _run_fit(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args(_legacy_command_argv(list(sys.argv[1:] if argv is None else argv)))
-    if args.command == "benchmark":
-        _run_benchmark(args)
-        return
+    args = parser.parse_args(argv)
     _run_fit(args)
 
 
