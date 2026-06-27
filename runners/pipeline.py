@@ -179,6 +179,29 @@ def process_one_file_bundle(
         )
 
     elapsed_seconds = float(perf_counter() - start_time)
+    def _timing_sum(column: str, mask: pd.Series | None = None) -> float:
+        if search_df.empty or column not in search_df.columns:
+            return float(np.nan)
+        values = search_df[column] if mask is None else search_df.loc[mask, column]
+        numeric = pd.to_numeric(values, errors="coerce")
+        return float(numeric.sum(skipna=True))
+
+    def _timing_max(column: str) -> float:
+        if search_df.empty or column not in search_df.columns:
+            return float(np.nan)
+        numeric = pd.to_numeric(search_df[column], errors="coerce")
+        return float(numeric.max(skipna=True)) if numeric.notna().any() else float(np.nan)
+
+    raw_candidate_mask = (
+        search_df["candidate_pool_source"].astype(str).eq("raw_fused_lambda_path")
+        if "candidate_pool_source" in search_df.columns
+        else pd.Series(False, index=search_df.index)
+    )
+    partition_candidate_mask = (
+        search_df["candidate_pool_source"].astype(str).eq("likelihood_partition")
+        if "candidate_pool_source" in search_df.columns
+        else pd.Series(False, index=search_df.index)
+    )
     reported_selected_ari = (
         float(simulation_diagnostics.selected_ari)
         if simulation_diagnostics.selected_ari is not None
@@ -242,6 +265,35 @@ def process_one_file_bundle(
         if selection_result.lambda_bracket_full is None
         else float(selection_result.lambda_bracket_full),
         "adaptive_refinement_rounds_completed": int(selection_result.adaptive_refinement_rounds_completed),
+        "adaptive_candidate_budget": _selected_int("adaptive_candidate_budget", -1),
+        "adaptive_initial_anchor_count": _selected_int("adaptive_initial_anchor_count", -1),
+        "adaptive_transition_probe_max_candidates": _selected_int(
+            "adaptive_transition_probe_max_candidates",
+            -1,
+        ),
+        "likelihood_partition_pool_enabled": _selected_bool("likelihood_partition_pool_enabled", False),
+        "selection_elapsed_seconds": _timing_max("selection_elapsed_seconds"),
+        "selection_prepare_elapsed_seconds": _timing_max("selection_prepare_elapsed_seconds"),
+        "raw_candidate_elapsed_seconds": _timing_sum("candidate_elapsed_seconds", raw_candidate_mask),
+        "raw_fit_elapsed_seconds": _timing_sum("raw_fit_elapsed_seconds", raw_candidate_mask),
+        "raw_bic_refit_elapsed_seconds": _timing_sum("bic_refit_elapsed_seconds", raw_candidate_mask),
+        "raw_candidate_evaluation_elapsed_seconds": _timing_sum(
+            "candidate_evaluation_elapsed_seconds",
+            raw_candidate_mask,
+        ),
+        "partition_candidate_elapsed_seconds": _timing_sum(
+            "candidate_elapsed_seconds",
+            partition_candidate_mask,
+        ),
+        "partition_generation_elapsed_seconds": _timing_max("partition_generation_elapsed_seconds"),
+        "partition_curvature_elapsed_seconds": _timing_max("partition_curvature_elapsed_seconds"),
+        "partition_ward_elapsed_seconds": _timing_max("partition_ward_elapsed_seconds"),
+        "partition_initial_generation_elapsed_seconds": _timing_max(
+            "partition_initial_generation_elapsed_seconds"
+        ),
+        "partition_refine_generation_elapsed_seconds": _timing_max(
+            "partition_refine_generation_elapsed_seconds"
+        ),
         "selection_loglik_kind": "partition_constrained_observed_mle",
         "finalize_selected_fit": bool(finalize_selected_fit),
         "evaluate_all_candidates": bool(evaluate_all_candidates_flag),
