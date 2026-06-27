@@ -15,7 +15,6 @@ from ..io.data import TumorData
 from ..metrics.evaluation import (
     SimulationEvaluation,
     SimulationTruth,
-    evaluate_ari_against_simulation,
     evaluate_fit_against_simulation,
 )
 from .config import LIKELIHOOD_PARTITION_SENTINEL_LAMBDA
@@ -35,11 +34,11 @@ from .scoring import (
     _selection_score_value,
 )
 from .types import CandidateStaticMetadata, SelectionArtifact, StartArray
-from ..runners.selection import (
+from ..core.bic import (
     bic_degrees_of_freedom,
     compute_bic_with_df,
     compute_classic_bic_depth_n,
-    effective_bic_cell_count,
+    effective_bic_mutation_region_count,
     effective_bic_depth_count,
 )
 
@@ -53,7 +52,6 @@ def _evaluate_candidate(
     simulation_root: Path | None,
     simulation_truth: SimulationTruth | None,
     evaluate_candidate: bool,
-    ari_only_evaluation: bool,
     phi_start: StartArray | None,
     exact_pilot: StartArray | None,
     pooled_start: StartArray | None,
@@ -95,11 +93,10 @@ def _evaluate_candidate(
     graph = effective_fit_options.graph
     if graph is None:
         raise RuntimeError("Model-selection candidates require a resolved pairwise-fusion graph.")
-    candidate_static = (
-        static_metadata
-        if static_metadata is not None
-        else _candidate_static_metadata(data, graph)
-    )
+    # Callers always supply static_metadata; the old `else` fallback referenced a
+    # name that isn't imported here (a latent NameError), so assert instead.
+    assert static_metadata is not None, "static_metadata must be provided by the caller"
+    candidate_static = static_metadata
     bic_labels = cluster_labels_from_edges(
         fit.phi,
         edge_u=graph.edge_u,
@@ -146,7 +143,7 @@ def _evaluate_candidate(
     classic_bic_depth_n = compute_classic_bic_depth_n(bic_loglik, bic_n_clusters, data)
     bic_df_value = float(bic_degrees_of_freedom(bic_n_clusters, data))
     bic_active_df_value = float(bic_refit.active_degrees_of_freedom)
-    bic_n_eff_value = float(effective_bic_cell_count(data))
+    bic_n_eff_value = float(effective_bic_mutation_region_count(data))
     bic_depth_n_eff_value = float(effective_bic_depth_count(data))
     classic_bic_active_df = compute_bic_with_df(bic_loglik, bic_active_df_value, bic_n_eff_value)
     classic_bic_active_df_depth_n = compute_bic_with_df(
@@ -213,39 +210,32 @@ def _evaluate_candidate(
     evaluation_elapsed_seconds = 0.0
     if evaluate_candidate and simulation_truth is not None:
         evaluation_start_time = perf_counter()
-        if ari_only_evaluation:
-            ari_value = evaluate_ari_against_simulation(
-                fit=fit,
-                data=data,
-                simulation_truth=simulation_truth,
-            )
-        else:
-            evaluation = evaluate_fit_against_simulation(
-                fit=fit,
-                data=data,
-                simulation_truth=simulation_truth,
-                bic_refit_phi=artifact.bic_refit_phi,
-                bic_partition_labels=artifact.bic_partition_labels,
-            )
-            ari_value = float(evaluation.ari)
-            cp_rmse_value = float(evaluation.cp_rmse)
-            raw_cp_rmse_value = float(
-                evaluation.raw_cp_rmse if evaluation.raw_cp_rmse is not None else np.nan
-            )
-            summary_cp_rmse_value = float(
-                evaluation.summary_cp_rmse if evaluation.summary_cp_rmse is not None else evaluation.cp_rmse
-            )
-            bic_refit_cp_rmse_value = float(
-                evaluation.bic_refit_cp_rmse if evaluation.bic_refit_cp_rmse is not None else np.nan
-            )
-            multiplicity_f1_value = float(evaluation.multiplicity_f1)
-            estimated_clonal_fraction_value = float(evaluation.estimated_clonal_fraction)
-            true_clonal_fraction_value = float(evaluation.true_clonal_fraction)
-            clonal_fraction_error_value = float(evaluation.clonal_fraction_error)
-            estimated_clusters_value = int(evaluation.estimated_clusters)
-            true_clusters_value = int(evaluation.true_clusters)
-            n_eval_mutations_value = int(evaluation.n_eval_mutations)
-            n_filtered_mutations_value = int(evaluation.n_filtered_mutations)
+        evaluation = evaluate_fit_against_simulation(
+            fit=fit,
+            data=data,
+            simulation_truth=simulation_truth,
+            bic_refit_phi=artifact.bic_refit_phi,
+            bic_partition_labels=artifact.bic_partition_labels,
+        )
+        ari_value = float(evaluation.ari)
+        cp_rmse_value = float(evaluation.cp_rmse)
+        raw_cp_rmse_value = float(
+            evaluation.raw_cp_rmse if evaluation.raw_cp_rmse is not None else np.nan
+        )
+        summary_cp_rmse_value = float(
+            evaluation.summary_cp_rmse if evaluation.summary_cp_rmse is not None else evaluation.cp_rmse
+        )
+        bic_refit_cp_rmse_value = float(
+            evaluation.bic_refit_cp_rmse if evaluation.bic_refit_cp_rmse is not None else np.nan
+        )
+        multiplicity_f1_value = float(evaluation.multiplicity_f1)
+        estimated_clonal_fraction_value = float(evaluation.estimated_clonal_fraction)
+        true_clonal_fraction_value = float(evaluation.true_clonal_fraction)
+        clonal_fraction_error_value = float(evaluation.clonal_fraction_error)
+        estimated_clusters_value = int(evaluation.estimated_clusters)
+        true_clusters_value = int(evaluation.true_clusters)
+        n_eval_mutations_value = int(evaluation.n_eval_mutations)
+        n_filtered_mutations_value = int(evaluation.n_filtered_mutations)
         evaluation_elapsed_seconds = float(perf_counter() - evaluation_start_time)
 
     candidate_elapsed_seconds = float(perf_counter() - candidate_start_time)
@@ -265,7 +255,7 @@ def _evaluate_candidate(
         "selection_score_name": str(canonical_score_name),
         "classic_bic": float(classic_bic),
         "extended_bic": float(extended_bic),
-        "classic_bic_cell_n": float(classic_bic),
+        "classic_bic_mutation_region_n": float(classic_bic),
         "classic_bic_depth_n": float(classic_bic_depth_n),
         "classic_bic_active_df": float(classic_bic_active_df),
         "classic_bic_active_df_depth_n": float(classic_bic_active_df_depth_n),
@@ -411,7 +401,7 @@ def _evaluate_candidate(
         "edge_list_hash": str(candidate_static.edge_list_hash),
         "pilot_matrix_hash": str(candidate_static.pilot_matrix_hash),
         "input_data_hash": str(candidate_static.input_data_hash),
-        "evaluation_mode": "ari_only" if ari_only_evaluation else "full",
+        "evaluation_mode": "full",
         "fit_compute_summary": bool(compute_summary),
         "fit_start_mode": str(start_mode),
         "solver_state_warm_start": bool(solver_state is not None),
@@ -432,7 +422,6 @@ def _evaluate_candidate(
     return fit, evaluation, row, artifact
 
 
-
 def _evaluate_partition_candidate(
     *,
     data: TumorData,
@@ -443,7 +432,6 @@ def _evaluate_partition_candidate(
     bic_cluster_penalty: float,
     simulation_truth: SimulationTruth | None,
     evaluate_candidate: bool,
-    ari_only_evaluation: bool,
     selection_method: str,
     profile_name: str,
     selection_step: int,
@@ -477,7 +465,7 @@ def _evaluate_partition_candidate(
     classic_bic_depth_n = compute_classic_bic_depth_n(loglik, num_clusters, data)
     bic_df_value = float(bic_degrees_of_freedom(num_clusters, data))
     active_df_value = float(candidate.active_df) if candidate.active_df is not None else bic_df_value
-    bic_n_eff_value = float(effective_bic_cell_count(data))
+    bic_n_eff_value = float(effective_bic_mutation_region_count(data))
     bic_depth_n_eff_value = float(effective_bic_depth_count(data))
     classic_bic_active_df = compute_bic_with_df(loglik, active_df_value, bic_n_eff_value)
     classic_bic_active_df_depth_n = compute_bic_with_df(
@@ -507,7 +495,7 @@ def _evaluate_partition_candidate(
     bic_partition_tol = _effective_bic_partition_tol(fit_options)
     boundary_count = int(candidate.diagnostics.get("refit_boundary_count", -1.0))
     refit_coordinate_count = int(
-        candidate.diagnostics.get("refit_coordinate_count", num_clusters * int(data.num_samples))
+        candidate.diagnostics.get("refit_coordinate_count", num_clusters * int(data.num_regions))
     )
     refit_finite_coordinate_count = int(
         candidate.diagnostics.get(
@@ -661,39 +649,32 @@ def _evaluate_partition_candidate(
     evaluation_elapsed_seconds = 0.0
     if evaluate_candidate and simulation_truth is not None:
         evaluation_start_time = perf_counter()
-        if ari_only_evaluation:
-            ari_value = evaluate_ari_against_simulation(
-                fit=fit,
-                data=data,
-                simulation_truth=simulation_truth,
-            )
-        else:
-            evaluation = evaluate_fit_against_simulation(
-                fit=fit,
-                data=data,
-                simulation_truth=simulation_truth,
-                bic_refit_phi=artifact.bic_refit_phi,
-                bic_partition_labels=artifact.bic_partition_labels,
-            )
-            ari_value = float(evaluation.ari)
-            cp_rmse_value = float(evaluation.cp_rmse)
-            raw_cp_rmse_value = float(
-                evaluation.raw_cp_rmse if evaluation.raw_cp_rmse is not None else np.nan
-            )
-            summary_cp_rmse_value = float(
-                evaluation.summary_cp_rmse if evaluation.summary_cp_rmse is not None else evaluation.cp_rmse
-            )
-            bic_refit_cp_rmse_value = float(
-                evaluation.bic_refit_cp_rmse if evaluation.bic_refit_cp_rmse is not None else np.nan
-            )
-            multiplicity_f1_value = float(evaluation.multiplicity_f1)
-            estimated_clonal_fraction_value = float(evaluation.estimated_clonal_fraction)
-            true_clonal_fraction_value = float(evaluation.true_clonal_fraction)
-            clonal_fraction_error_value = float(evaluation.clonal_fraction_error)
-            estimated_clusters_value = int(evaluation.estimated_clusters)
-            true_clusters_value = int(evaluation.true_clusters)
-            n_eval_mutations_value = int(evaluation.n_eval_mutations)
-            n_filtered_mutations_value = int(evaluation.n_filtered_mutations)
+        evaluation = evaluate_fit_against_simulation(
+            fit=fit,
+            data=data,
+            simulation_truth=simulation_truth,
+            bic_refit_phi=artifact.bic_refit_phi,
+            bic_partition_labels=artifact.bic_partition_labels,
+        )
+        ari_value = float(evaluation.ari)
+        cp_rmse_value = float(evaluation.cp_rmse)
+        raw_cp_rmse_value = float(
+            evaluation.raw_cp_rmse if evaluation.raw_cp_rmse is not None else np.nan
+        )
+        summary_cp_rmse_value = float(
+            evaluation.summary_cp_rmse if evaluation.summary_cp_rmse is not None else evaluation.cp_rmse
+        )
+        bic_refit_cp_rmse_value = float(
+            evaluation.bic_refit_cp_rmse if evaluation.bic_refit_cp_rmse is not None else np.nan
+        )
+        multiplicity_f1_value = float(evaluation.multiplicity_f1)
+        estimated_clonal_fraction_value = float(evaluation.estimated_clonal_fraction)
+        true_clonal_fraction_value = float(evaluation.true_clonal_fraction)
+        clonal_fraction_error_value = float(evaluation.clonal_fraction_error)
+        estimated_clusters_value = int(evaluation.estimated_clusters)
+        true_clusters_value = int(evaluation.true_clusters)
+        n_eval_mutations_value = int(evaluation.n_eval_mutations)
+        n_filtered_mutations_value = int(evaluation.n_filtered_mutations)
         evaluation_elapsed_seconds = float(perf_counter() - evaluation_start_time)
 
     candidate_elapsed_seconds = float(perf_counter() - candidate_start_time)
@@ -721,7 +702,7 @@ def _evaluate_partition_candidate(
         "selection_score_name": str(canonical_score_name),
         "classic_bic": float(classic_bic),
         "extended_bic": float(extended_bic),
-        "classic_bic_cell_n": float(classic_bic),
+        "classic_bic_mutation_region_n": float(classic_bic),
         "classic_bic_depth_n": float(classic_bic_depth_n),
         "classic_bic_active_df": float(classic_bic_active_df),
         "classic_bic_active_df_depth_n": float(classic_bic_active_df_depth_n),
@@ -865,7 +846,7 @@ def _evaluate_partition_candidate(
         "edge_list_hash": str(static_metadata.edge_list_hash),
         "pilot_matrix_hash": str(static_metadata.pilot_matrix_hash),
         "input_data_hash": str(static_metadata.input_data_hash),
-        "evaluation_mode": "ari_only" if ari_only_evaluation else "full",
+        "evaluation_mode": "full",
         "fit_compute_summary": True,
         "fit_start_mode": "likelihood_partition",
         "solver_state_warm_start": False,
@@ -884,5 +865,3 @@ def _evaluate_partition_candidate(
         "n_filtered_mutations": n_filtered_mutations_value,
     }
     return fit, evaluation, row, artifact
-
-

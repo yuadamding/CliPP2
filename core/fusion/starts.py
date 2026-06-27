@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from ...io.data import TumorData
-from .torch_backend import TorchRuntime, TorchTumorData, cell_loss_grid_torch
+from .torch_backend import TorchRuntime, TorchTumorData, mutation_region_loss_grid_torch
 
 
 _ROOT_SCAN_POINTS = 65
@@ -227,7 +227,7 @@ def _middle_regime_roots(
     return [float(value) for value in np.unique(np.round(np.asarray(roots, dtype=np.float64), 12))]
 
 
-def _cell_candidate_betas(
+def _mutation_region_candidate_betas(
     *,
     alt: float,
     total: float,
@@ -311,58 +311,6 @@ def _cell_candidate_betas(
     return candidate_array
 
 
-def _exact_pilot_cell_beta(
-    *,
-    alt: float,
-    total: float,
-    b_minus: float,
-    b_plus: float,
-    b_fixed: float,
-    ambiguous: bool,
-    lower: float,
-    upper: float,
-    major_prior: float,
-    eps: float,
-    tol: float,
-    max_iter: int,
-    hint: float | None,
-) -> float:
-    candidate_array = _cell_candidate_betas(
-        alt=alt,
-        total=total,
-        b_minus=b_minus,
-        b_plus=b_plus,
-        b_fixed=b_fixed,
-        ambiguous=ambiguous,
-        lower=lower,
-        upper=upper,
-        major_prior=major_prior,
-        eps=eps,
-        tol=tol,
-        max_iter=max_iter,
-        hint=hint,
-    )
-    losses = _cell_loss_grid_numpy(
-        candidate_array,
-        alt=float(alt),
-        total=float(total),
-        b_minus=float(b_minus),
-        b_plus=float(b_plus),
-        b_fixed=float(b_fixed),
-        ambiguous=bool(ambiguous),
-        major_prior=major_prior,
-        eps=eps,
-    )
-    best_loss = float(np.min(losses))
-    best_mask = losses <= best_loss + 1e-12
-    best_candidates = candidate_array[best_mask]
-    if best_candidates.size == 1 or hint is None or not np.isfinite(hint):
-        return float(best_candidates[0])
-    hint_projected = _project_to_interval(hint, lower, upper)
-    best_idx = int(np.argmin(np.abs(best_candidates - hint_projected)))
-    return float(best_candidates[best_idx])
-
-
 def _local_minimum_representatives(
     candidate_array: np.ndarray,
     losses: np.ndarray,
@@ -420,7 +368,7 @@ def _local_minimum_representatives(
     )
 
 
-def _cell_best_two_betas(
+def _mutation_region_best_two_betas(
     *,
     alt: float,
     total: float,
@@ -436,8 +384,8 @@ def _cell_best_two_betas(
     max_iter: int,
     hint: float | None,
 ) -> tuple[float, float | None]:
-    return _cell_best_two_from_candidates(
-        _cell_candidate_betas(
+    return _mutation_region_best_two_from_candidates(
+        _mutation_region_candidate_betas(
             alt=alt,
             total=total,
             b_minus=b_minus,
@@ -467,7 +415,7 @@ def _cell_best_two_betas(
     )
 
 
-def _cell_best_two_from_candidates(
+def _mutation_region_best_two_from_candidates(
     candidate_array: np.ndarray,
     *,
     alt: float,
@@ -492,7 +440,7 @@ def _cell_best_two_from_candidates(
         fallback = float(lower) if hint is None else _project_to_interval(float(hint), float(lower), float(upper))
         candidate_array = np.asarray([fallback], dtype=np.float64)
 
-    losses = _cell_loss_grid_numpy(
+    losses = _mutation_region_loss_grid_numpy(
         candidate_array,
         alt=float(alt),
         total=float(total),
@@ -535,7 +483,7 @@ def _cell_best_two_from_candidates(
     return primary, secondary
 
 
-def _cell_loss_grid_numpy(
+def _mutation_region_loss_grid_numpy(
     beta_values: np.ndarray,
     *,
     alt: float,
@@ -563,7 +511,7 @@ def _cell_loss_grid_numpy(
     return -np.logaddexp(log_minor, log_major)
 
 
-def _ambiguous_cell_loss_matrix_numpy(
+def _ambiguous_mutation_region_loss_matrix_numpy(
     beta_values: np.ndarray,
     *,
     alt: np.ndarray,
@@ -746,7 +694,7 @@ def _ambiguous_best_two_from_candidate_grid_torch(
         beta[:, 0] = torch.where(empty_rows, fallback, beta[:, 0])
         valid[:, 0] = valid[:, 0] | empty_rows
 
-    loss = cell_loss_grid_torch(
+    loss = mutation_region_loss_grid_torch(
         beta,
         alt=alt[:, None],
         total=total[:, None],
@@ -888,7 +836,7 @@ def _ambiguous_best_two_from_candidate_grid_numpy(
         beta[empty_rows, 0] = np.clip(hint[empty_rows], lower[empty_rows], upper[empty_rows])
         valid[empty_rows, 0] = True
 
-    loss = _ambiguous_cell_loss_matrix_numpy(
+    loss = _ambiguous_mutation_region_loss_matrix_numpy(
         beta,
         alt=alt,
         total=total,
@@ -1034,7 +982,7 @@ def _sample_loss_grid_numpy(
     beta = np.asarray(beta_values, dtype=np.float64)
     losses = np.zeros(beta.shape, dtype=np.float64)
     for idx in range(int(alt.shape[0])):
-        losses += _cell_loss_grid_numpy(
+        losses += _mutation_region_loss_grid_numpy(
             beta,
             alt=float(alt[idx]),
             total=float(total[idx]),
@@ -1048,7 +996,7 @@ def _sample_loss_grid_numpy(
     return losses
 
 
-def _cell_grad_numpy(
+def _mutation_region_grad_numpy(
     beta_values: np.ndarray,
     *,
     alt: float,
@@ -1117,7 +1065,7 @@ def _pooled_sample_loss_grid_torch(
         squeeze = False
     num_mutations = int(torch_data.alt.shape[0])
     beta = beta_grid.unsqueeze(0).expand(num_mutations, -1, -1)
-    losses = cell_loss_grid_torch(
+    losses = mutation_region_loss_grid_torch(
         beta,
         alt=torch_data.alt.unsqueeze(-1),
         total=torch_data.total.unsqueeze(-1),
@@ -1265,9 +1213,9 @@ def _ambiguous_candidate_grid_torch(
     middle_left = torch.maximum(lower, r2)
     middle_right = torch.minimum(upper, r3)
     middle_mask = valid & (middle_right > middle_left + 1e-12)
-    num_cells = int(alt.numel())
-    zero_roots = torch.full((num_cells, _ROOT_SCAN_POINTS), float("nan"), dtype=alt.dtype, device=alt.device)
-    interval_roots = torch.full((num_cells, _ROOT_SCAN_POINTS - 1), float("nan"), dtype=alt.dtype, device=alt.device)
+    num_mutation_regions = int(alt.numel())
+    zero_roots = torch.full((num_mutation_regions, _ROOT_SCAN_POINTS), float("nan"), dtype=alt.dtype, device=alt.device)
+    interval_roots = torch.full((num_mutation_regions, _ROOT_SCAN_POINTS - 1), float("nan"), dtype=alt.dtype, device=alt.device)
 
     if bool(torch.any(middle_mask).item()):
         left_probe = torch.nextafter(middle_left, middle_right)
@@ -1303,8 +1251,8 @@ def _ambiguous_candidate_grid_torch(
             left_current = flat_left[flat_interval_indices]
             right_current = flat_right[flat_interval_indices]
             f_left = left_values.reshape(-1)[flat_interval_indices]
-            cell_ids = torch.arange(num_cells, dtype=torch.long, device=alt.device).repeat_interleave(_ROOT_SCAN_POINTS - 1)
-            cell_ids = cell_ids[flat_interval_indices]
+            mutation_region_ids = torch.arange(num_mutation_regions, dtype=torch.long, device=alt.device).repeat_interleave(_ROOT_SCAN_POINTS - 1)
+            mutation_region_ids = mutation_region_ids[flat_interval_indices]
 
             roots = 0.5 * (left_current + right_current)
             active = torch.ones_like(roots, dtype=torch.bool)
@@ -1313,10 +1261,10 @@ def _ambiguous_candidate_grid_torch(
                 midpoint = 0.5 * (left_current + right_current)
                 f_mid = _ambiguous_middle_stationarity_torch(
                     midpoint,
-                    alt=alt[cell_ids],
-                    total=total[cell_ids],
-                    b_low=b_low[cell_ids],
-                    b_high=b_high[cell_ids],
+                    alt=alt[mutation_region_ids],
+                    total=total[mutation_region_ids],
+                    b_low=b_low[mutation_region_ids],
+                    b_high=b_high[mutation_region_ids],
                     major_prior=major_prior,
                 )
                 finite_mid = torch.isfinite(f_mid)
@@ -1341,7 +1289,7 @@ def _ambiguous_candidate_grid_torch(
     return torch.cat([col[:, None] if col.ndim == 1 else col for col in columns], dim=1)
 
 
-def _cell_breakpoints(
+def _mutation_region_breakpoints(
     *,
     lower: float,
     upper: float,
@@ -1425,128 +1373,7 @@ def _scan_roots(
     return [float(value) for value in np.unique(np.round(np.asarray(roots, dtype=np.float64), 12))]
 
 
-def _screen_hull_from_gradient_strip(
-    *,
-    alt: float,
-    total: float,
-    b_minus: float,
-    b_plus: float,
-    b_fixed: float,
-    ambiguous: bool,
-    lower: float,
-    upper: float,
-    major_prior: float,
-    eps: float,
-    threshold: float,
-    tol: float,
-    max_iter: int,
-) -> tuple[float, float]:
-    lower = float(lower)
-    upper = float(upper)
-    threshold = float(threshold)
-    if upper <= lower + 1e-12 or threshold < 0.0:
-        return lower, upper
-
-    breakpoints = _cell_breakpoints(
-        lower=lower,
-        upper=upper,
-        b_minus=b_minus,
-        b_plus=b_plus,
-        b_fixed=b_fixed,
-        ambiguous=ambiguous,
-        eps=eps,
-    )
-    if breakpoints.size < 2:
-        return lower, upper
-
-    def grad_fn(values: np.ndarray) -> np.ndarray:
-        return _cell_grad_numpy(
-            values,
-            alt=alt,
-            total=total,
-            b_minus=b_minus,
-            b_plus=b_plus,
-            b_fixed=b_fixed,
-            ambiguous=ambiguous,
-            major_prior=major_prior,
-            eps=eps,
-        )
-
-    all_points = list(breakpoints.tolist())
-    for left_point, right_point in zip(breakpoints[:-1], breakpoints[1:]):
-        if right_point <= left_point + 1e-12:
-            continue
-        all_points.extend(
-            _scan_roots(
-                lambda beta: float(grad_fn(np.asarray([beta], dtype=np.float64))[0] - threshold),
-                left=float(left_point),
-                right=float(right_point),
-                tol=tol,
-                max_iter=max_iter,
-            )
-        )
-        all_points.extend(
-            _scan_roots(
-                lambda beta: float(grad_fn(np.asarray([beta], dtype=np.float64))[0] + threshold),
-                left=float(left_point),
-                right=float(right_point),
-                tol=tol,
-                max_iter=max_iter,
-            )
-        )
-
-    partition = np.unique(np.round(np.asarray(all_points, dtype=np.float64), 12))
-    partition = partition[(partition >= lower - 1e-12) & (partition <= upper + 1e-12)]
-    partition = np.clip(partition, lower, upper)
-    if partition.size == 0:
-        return lower, upper
-
-    admissible_left = float("inf")
-    admissible_right = float("-inf")
-    point_values = grad_fn(partition)
-    point_mask = np.isfinite(point_values) & (np.abs(point_values) <= threshold + 1e-10)
-    if np.any(point_mask):
-        admissible_left = min(admissible_left, float(np.min(partition[point_mask])))
-        admissible_right = max(admissible_right, float(np.max(partition[point_mask])))
-
-    for left_point, right_point in zip(partition[:-1], partition[1:]):
-        if right_point <= left_point + 1e-12:
-            continue
-        probe_left = np.nextafter(left_point, right_point)
-        probe_right = np.nextafter(right_point, left_point)
-        if not np.isfinite(probe_left) or not np.isfinite(probe_right) or probe_right <= probe_left:
-            continue
-        midpoint = 0.5 * (probe_left + probe_right)
-        grad_mid = float(grad_fn(np.asarray([midpoint], dtype=np.float64))[0])
-        if np.isfinite(grad_mid) and abs(grad_mid) <= threshold + 1e-10:
-            admissible_left = min(admissible_left, float(left_point))
-            admissible_right = max(admissible_right, float(right_point))
-
-    if not np.isfinite(admissible_left) or not np.isfinite(admissible_right) or admissible_right < admissible_left:
-        return lower, upper
-    return max(lower, admissible_left), min(upper, admissible_right)
-
-
-def compute_exact_observed_data_pilot(
-    data: TumorData,
-    *,
-    runtime: TorchRuntime,
-    major_prior: float,
-    eps: float,
-    tol: float,
-    max_iter: int,
-) -> np.ndarray:
-    primary, _, _ = compute_scalar_cell_wells(
-        data,
-        major_prior=major_prior,
-        eps=eps,
-        tol=tol,
-        max_iter=max_iter,
-    )
-    return np.clip(primary, eps, np.asarray(data.phi_upper, dtype=np.float64))
-
-
-def compute_scalar_cell_wells(
+def compute_scalar_mutation_region_wells(
     data: TumorData,
     *,
     major_prior: float,
@@ -1583,7 +1410,7 @@ def compute_scalar_cell_wells(
 
     amb_indices = np.flatnonzero(ambiguous)
     for idx in amb_indices:
-        primary, alternate = _cell_best_two_betas(
+        primary, alternate = _mutation_region_best_two_betas(
             alt=float(alt[idx]),
             total=float(total[idx]),
             b_minus=float(b_minus[idx]),
@@ -1611,7 +1438,7 @@ def compute_scalar_cell_wells(
     )
 
 
-def compute_scalar_cell_wells_torch(
+def compute_scalar_mutation_region_wells_torch(
     torch_data: TorchTumorData,
     *,
     phi_init: torch.Tensor | np.ndarray,
@@ -1707,8 +1534,8 @@ def compute_pooled_observed_data_start_torch(
     dtype = torch_data.alt.dtype
     device = torch_data.alt.device
     num_mutations = int(torch_data.alt.shape[0])
-    num_samples = int(torch_data.alt.shape[1])
-    lower = torch.full((num_samples,), float(eps), dtype=dtype, device=device)
+    num_regions = int(torch_data.alt.shape[1])
+    lower = torch.full((num_regions,), float(eps), dtype=dtype, device=device)
     upper = torch.min(torch_data.phi_upper, dim=0).values
 
     if beta_hints is None:
@@ -1783,14 +1610,14 @@ def compute_pooled_observed_data_start(
     b_plus_t = torch.as_tensor(b_plus, dtype=runtime.dtype, device=runtime.device)
     b_fixed_t = torch.as_tensor(b_fixed, dtype=runtime.dtype, device=runtime.device)
     ambiguous_t = torch.as_tensor(ambiguous, dtype=torch.bool, device=runtime.device)
-    pooled = np.zeros((data.num_samples,), dtype=np.float64)
+    pooled = np.zeros((data.num_regions,), dtype=np.float64)
 
-    for sample_idx in range(data.num_samples):
+    for region_idx in range(data.num_regions):
         lower = float(eps)
-        upper = float(np.min(np.asarray(data.phi_upper[:, sample_idx], dtype=np.float64)))
+        upper = float(np.min(np.asarray(data.phi_upper[:, region_idx], dtype=np.float64)))
         hint = None
         if beta_hints is not None:
-            hint = float(np.median(np.asarray(beta_hints[:, sample_idx], dtype=np.float64)))
+            hint = float(np.median(np.asarray(beta_hints[:, region_idx], dtype=np.float64)))
         local_left = max(lower, lower if hint is None else hint / 3.0)
         local_right = min(upper, upper if hint is None else hint * 3.0)
         if local_right <= local_left + 1e-12:
@@ -1802,14 +1629,14 @@ def compute_pooled_observed_data_start(
             num_points=25,
             runtime=runtime,
         )[0]
-        losses = cell_loss_grid_torch(
+        losses = mutation_region_loss_grid_torch(
             grid.unsqueeze(0).expand(data.num_mutations, -1),
-            alt=alt_t[:, sample_idx : sample_idx + 1],
-            total=total_t[:, sample_idx : sample_idx + 1],
-            b_minus=b_minus_t[:, sample_idx : sample_idx + 1],
-            b_plus=b_plus_t[:, sample_idx : sample_idx + 1],
-            b_fixed=b_fixed_t[:, sample_idx : sample_idx + 1],
-            ambiguous=ambiguous_t[:, sample_idx : sample_idx + 1],
+            alt=alt_t[:, region_idx : region_idx + 1],
+            total=total_t[:, region_idx : region_idx + 1],
+            b_minus=b_minus_t[:, region_idx : region_idx + 1],
+            b_plus=b_plus_t[:, region_idx : region_idx + 1],
+            b_fixed=b_fixed_t[:, region_idx : region_idx + 1],
+            ambiguous=ambiguous_t[:, region_idx : region_idx + 1],
             major_prior=major_prior,
             eps=eps,
         )
@@ -1822,12 +1649,12 @@ def compute_pooled_observed_data_start(
 
         objective = lambda values: _sample_loss_grid_numpy(
             values,
-            alt=np.asarray(data.alt_counts[:, sample_idx], dtype=np.float64),
-            total=np.asarray(data.total_counts[:, sample_idx], dtype=np.float64),
-            b_minus=b_minus[:, sample_idx],
-            b_plus=b_plus[:, sample_idx],
-            b_fixed=b_fixed[:, sample_idx],
-            ambiguous=ambiguous[:, sample_idx],
+            alt=np.asarray(data.alt_counts[:, region_idx], dtype=np.float64),
+            total=np.asarray(data.total_counts[:, region_idx], dtype=np.float64),
+            b_minus=b_minus[:, region_idx],
+            b_plus=b_plus[:, region_idx],
+            b_fixed=b_fixed[:, region_idx],
+            ambiguous=ambiguous[:, region_idx],
             major_prior=major_prior,
             eps=eps,
         )
@@ -1839,7 +1666,7 @@ def compute_pooled_observed_data_start(
             max_iter=max_iter,
         )
         best_value = float(objective(np.asarray([best_beta], dtype=np.float64))[0])
-        pooled[sample_idx] = refined_beta if refined_value <= best_value else best_beta
+        pooled[region_idx] = refined_beta if refined_value <= best_value else best_beta
 
     tiled = np.tile(pooled[None, :], (data.num_mutations, 1))
     return np.clip(tiled, eps, np.asarray(data.phi_upper, dtype=np.float64))
@@ -1855,11 +1682,11 @@ def compute_scalar_well_start_bank(
     exact_pilot: np.ndarray,
     secondary_wells: np.ndarray | None = None,
     valid_secondary: np.ndarray | None = None,
-    max_sample_flips: int = 4,
+    max_region_flips: int = 4,
 ) -> list[np.ndarray]:
     exact_pilot = np.asarray(exact_pilot, dtype=np.float64)
     if secondary_wells is None or valid_secondary is None:
-        _, secondary, valid_secondary = compute_scalar_cell_wells(
+        _, secondary, valid_secondary = compute_scalar_mutation_region_wells(
             data,
             major_prior=major_prior,
             eps=eps,
@@ -1877,19 +1704,19 @@ def compute_scalar_well_start_bank(
     global_alternate[valid_secondary] = secondary[valid_secondary]
     starts.append(global_alternate)
 
-    sample_delta = np.where(valid_secondary, np.abs(secondary - exact_pilot), 0.0)
-    sample_scores = [
-        (float(score), int(sample_idx))
-        for sample_idx, score in enumerate(np.sum(sample_delta, axis=0))
+    region_delta = np.where(valid_secondary, np.abs(secondary - exact_pilot), 0.0)
+    region_scores = [
+        (float(score), int(region_idx))
+        for region_idx, score in enumerate(np.sum(region_delta, axis=0))
         if score > 0.0
     ]
-    sample_scores.sort(reverse=True)
+    region_scores.sort(reverse=True)
 
-    for _, sample_idx in sample_scores[: max(0, int(max_sample_flips))]:
-        sample_start = exact_pilot.copy()
-        mask = valid_secondary[:, sample_idx]
-        sample_start[mask, sample_idx] = secondary[mask, sample_idx]
-        starts.append(sample_start)
+    for _, region_idx in region_scores[: max(0, int(max_region_flips))]:
+        region_start = exact_pilot.copy()
+        mask = valid_secondary[:, region_idx]
+        region_start[mask, region_idx] = secondary[mask, region_idx]
+        starts.append(region_start)
 
     unique: list[np.ndarray] = []
     for start in starts:
@@ -1917,7 +1744,7 @@ def compute_scalar_well_start_bank_torch(
     exact_pilot: torch.Tensor,
     secondary_wells: torch.Tensor | np.ndarray | None = None,
     valid_secondary: torch.Tensor | np.ndarray | None = None,
-    max_sample_flips: int = 4,
+    max_region_flips: int = 4,
 ) -> tuple[torch.Tensor, ...]:
     dtype = torch_data.alt.dtype
     device = torch_data.alt.device
@@ -1938,79 +1765,23 @@ def compute_scalar_well_start_bank_torch(
     global_alternate = torch.where(valid, secondary, pilot)
     starts.append(torch.minimum(torch.maximum(global_alternate, lower), torch_data.phi_upper))
 
-    sample_delta = torch.where(valid, torch.abs(secondary - pilot), torch.zeros_like(pilot))
-    sample_scores = torch.sum(sample_delta, dim=0).detach().cpu().numpy()
-    sample_order = [
-        (float(score), int(sample_idx))
-        for sample_idx, score in enumerate(sample_scores)
+    region_delta = torch.where(valid, torch.abs(secondary - pilot), torch.zeros_like(pilot))
+    region_scores = torch.sum(region_delta, dim=0).detach().cpu().numpy()
+    region_order = [
+        (float(score), int(region_idx))
+        for region_idx, score in enumerate(region_scores)
         if float(score) > 0.0
     ]
-    sample_order.sort(reverse=True)
+    region_order.sort(reverse=True)
 
-    for _, sample_idx in sample_order[: max(0, int(max_sample_flips))]:
-        sample_start = pilot.clone()
-        mask = valid[:, sample_idx]
-        sample_start[:, sample_idx] = torch.where(
+    for _, region_idx in region_order[: max(0, int(max_region_flips))]:
+        region_start = pilot.clone()
+        mask = valid[:, region_idx]
+        region_start[:, region_idx] = torch.where(
             mask,
-            secondary[:, sample_idx],
-            sample_start[:, sample_idx],
+            secondary[:, region_idx],
+            region_start[:, region_idx],
         )
-        starts.append(torch.minimum(torch.maximum(sample_start, lower), torch_data.phi_upper))
+        starts.append(torch.minimum(torch.maximum(region_start, lower), torch_data.phi_upper))
 
     return _deduplicate_tensor_starts(starts)
-
-
-def compute_stationary_screen_box(
-    data: TumorData,
-    *,
-    edge_u: np.ndarray,
-    edge_v: np.ndarray,
-    edge_w: np.ndarray,
-    lambda_value: float,
-    major_prior: float,
-    eps: float,
-    tol: float,
-    max_iter: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    lower = np.full_like(np.asarray(data.phi_upper, dtype=np.float64), float(eps), dtype=np.float64)
-    upper = np.asarray(data.phi_upper, dtype=np.float64).copy()
-    if float(lambda_value) <= 0.0 or edge_u.size == 0:
-        return lower, upper
-
-    row_weight_sum = np.zeros((data.num_mutations,), dtype=np.float64)
-    np.add.at(row_weight_sum, np.asarray(edge_u, dtype=np.int64), np.asarray(edge_w, dtype=np.float64))
-    np.add.at(row_weight_sum, np.asarray(edge_v, dtype=np.int64), np.asarray(edge_w, dtype=np.float64))
-
-    alt = np.asarray(data.alt_counts, dtype=np.float64)
-    total = np.asarray(data.total_counts, dtype=np.float64)
-    b_minus = np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.minor_cn, dtype=np.float64)
-    b_plus = np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.major_cn, dtype=np.float64)
-    b_fixed = np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.fixed_multiplicity, dtype=np.float64)
-    ambiguous = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
-
-    screen_lower = lower.copy()
-    screen_upper = upper.copy()
-    for mutation_idx in range(data.num_mutations):
-        threshold = float(lambda_value) * float(row_weight_sum[mutation_idx])
-        if threshold <= 0.0:
-            continue
-        for sample_idx in range(data.num_samples):
-            cell_lower, cell_upper = _screen_hull_from_gradient_strip(
-                alt=float(alt[mutation_idx, sample_idx]),
-                total=float(total[mutation_idx, sample_idx]),
-                b_minus=float(b_minus[mutation_idx, sample_idx]),
-                b_plus=float(b_plus[mutation_idx, sample_idx]),
-                b_fixed=float(b_fixed[mutation_idx, sample_idx]),
-                ambiguous=bool(ambiguous[mutation_idx, sample_idx]),
-                lower=float(lower[mutation_idx, sample_idx]),
-                upper=float(upper[mutation_idx, sample_idx]),
-                major_prior=major_prior,
-                eps=eps,
-                threshold=threshold,
-                tol=tol,
-                max_iter=max_iter,
-            )
-            if cell_upper >= cell_lower:
-                screen_lower[mutation_idx, sample_idx] = float(cell_lower)
-                screen_upper[mutation_idx, sample_idx] = float(cell_upper)
-    return screen_lower, screen_upper

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ...io.data import TumorData
-from .starts import _cell_breakpoints, _golden_section_minimize, _sample_loss_grid_numpy
+from .starts import _mutation_region_breakpoints, _golden_section_minimize, _sample_loss_grid_numpy
 
 
 @dataclass(frozen=True)
@@ -88,7 +88,7 @@ def _objective_grid(
     )
 
 
-def _cluster_sample_candidate_grid(
+def _cluster_region_candidate_grid(
     *,
     lower: float,
     upper: float,
@@ -111,7 +111,7 @@ def _cluster_sample_candidate_grid(
 
     for idx in range(int(b_minus.shape[0])):
         points.extend(
-            _cell_breakpoints(
+            _mutation_region_breakpoints(
                 lower=float(lower),
                 upper=float(upper),
                 b_minus=float(b_minus[idx]),
@@ -129,7 +129,7 @@ def _cluster_sample_candidate_grid(
     return np.clip(grid, float(lower), float(upper))
 
 
-def _refit_cluster_sample(
+def _refit_cluster_region(
     *,
     alt: np.ndarray,
     total: np.ndarray,
@@ -183,7 +183,7 @@ def _refit_cluster_sample(
         major_prior=major_prior,
         eps=eps,
     )
-    grid = _cluster_sample_candidate_grid(
+    grid = _cluster_region_candidate_grid(
         lower=lower,
         upper=upper,
         b_minus=b_minus,
@@ -293,9 +293,9 @@ def partition_constrained_observed_refit(
         raise ValueError("Partition refit tolerance must be a positive finite value.")
     labels = _canonical_labels(np.asarray(labels, dtype=np.int64))
     n_clusters = int(labels.max()) + 1 if labels.size else 0
-    n_samples = int(data.num_samples)
-    centers = np.zeros((n_clusters, n_samples), dtype=np.float64)
-    phi = np.zeros((int(data.num_mutations), n_samples), dtype=np.float64)
+    n_regions = int(data.num_regions)
+    centers = np.zeros((n_clusters, n_regions), dtype=np.float64)
+    phi = np.zeros((int(data.num_mutations), n_regions), dtype=np.float64)
 
     alt = np.asarray(data.alt_counts, dtype=np.float64)
     total = np.asarray(data.total_counts, dtype=np.float64)
@@ -305,6 +305,12 @@ def partition_constrained_observed_refit(
     ambiguous = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
     upper_matrix = np.asarray(data.phi_upper, dtype=np.float64)
     hint_matrix = None if hint_phi is None else np.asarray(hint_phi, dtype=np.float64)
+    # Only observed mutation_regions contribute to the likelihood, exactly as the torch fit
+    # objective masks them (torch_backend.mutation_region_terms_torch). The BIC denominator
+    # (effective_bic_mutation_region_count) also excludes them, so the refit loglik numerator
+    # must too — otherwise BIC scores a model that was never fit.
+    count_observed = getattr(data, "count_observed", None)
+    observed_matrix = None if count_observed is None else np.asarray(count_observed, dtype=bool)
 
     total_loss = 0.0
     boundary_count = 0
@@ -323,21 +329,37 @@ def partition_constrained_observed_refit(
         member_mask = labels == int(cluster_idx)
         if not np.any(member_mask):
             continue
-        for sample_idx in range(n_samples):
+        member_rows = np.where(member_mask)[0]
+        for region_idx in range(n_regions):
             lower = float(eps)
-            upper = float(np.min(upper_matrix[member_mask, sample_idx]))
+            # Feasibility box uses every member mutation_region; the likelihood uses only the
+            # observed ones, so the collapsed center stays representable for all.
+            upper = float(np.min(upper_matrix[member_rows, region_idx]))
             if not np.isfinite(upper) or upper < lower:
                 upper = lower
+            if observed_matrix is None:
+                obs_rows = member_rows
+            else:
+                obs_rows = member_rows[observed_matrix[member_rows, region_idx]]
+            if obs_rows.size == 0:
+                # No observed mutation_region constrains this cluster/sample: zero likelihood
+                # contribution (as in the fit), so the center is arbitrary in-box.
+                # Match the torch refit's midpoint choice for a consistent phi.
+                beta = float(0.5 * (lower + upper))
+                centers[cluster_idx, region_idx] = beta
+                refit_coordinate_count += 1
+                refit_finite_coordinate_count += 1
+                continue
             hint = None
             if hint_matrix is not None:
-                hint = float(np.median(hint_matrix[member_mask, sample_idx]))
-            coordinate = _refit_cluster_sample(
-                alt=alt[member_mask, sample_idx],
-                total=total[member_mask, sample_idx],
-                b_minus=b_minus[member_mask, sample_idx],
-                b_plus=b_plus[member_mask, sample_idx],
-                b_fixed=b_fixed[member_mask, sample_idx],
-                ambiguous=ambiguous[member_mask, sample_idx],
+                hint = float(np.median(hint_matrix[obs_rows, region_idx]))
+            coordinate = _refit_cluster_region(
+                alt=alt[obs_rows, region_idx],
+                total=total[obs_rows, region_idx],
+                b_minus=b_minus[obs_rows, region_idx],
+                b_plus=b_plus[obs_rows, region_idx],
+                b_fixed=b_fixed[obs_rows, region_idx],
+                ambiguous=ambiguous[obs_rows, region_idx],
                 lower=lower,
                 upper=upper,
                 major_prior=float(major_prior),
@@ -348,7 +370,7 @@ def partition_constrained_observed_refit(
             )
             beta = float(coordinate.beta)
             loss = float(coordinate.loss)
-            centers[cluster_idx, sample_idx] = float(beta)
+            centers[cluster_idx, region_idx] = float(beta)
             total_loss += float(loss)
             converged = bool(converged and coordinate.finite_candidate_found)
             refit_coordinate_count += 1

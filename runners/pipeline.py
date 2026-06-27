@@ -12,7 +12,7 @@ import pandas as pd
 from .._version import __version__ as _SOFTWARE_VERSION
 from ..core.fusion.graph import load_pairwise_fusion_graph_tsv
 from ..core.model import FitOptions
-from ..io.data import TumorData, load_tumor_tsv
+from ..io.data import load_tumor_tsv
 from ..metrics.evaluation import evaluate_fit_against_simulation
 from .model_selection import select_model
 from .outputs import write_fit_outputs
@@ -699,7 +699,7 @@ def run_directory(
             summaries = [ordered[file_path.stem] for file_path in files]
 
     summary_df = pd.DataFrame(summaries)
-    sort_column = "tumor_id" if "tumor_id" in summary_df.columns else "patient_id"
+    sort_column = "tumor_id"
     summary_df = summary_df.sort_values(sort_column).reset_index(drop=True)
     Path(outdir).mkdir(parents=True, exist_ok=True)
     summary_df.to_csv(Path(outdir) / "single_stage_summary.tsv", sep="\t", index=False)

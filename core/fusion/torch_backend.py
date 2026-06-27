@@ -24,7 +24,7 @@ class TorchTumorData:
 
 
 @dataclass(frozen=True)
-class TorchCellTerms:
+class TorchMutationRegionTerms:
     loss: torch.Tensor
     grad: torch.Tensor
     hess_upper: torch.Tensor
@@ -34,6 +34,46 @@ class TorchCellTerms:
 DEFAULT_INNER_KKT_CHECK_EVERY = 8
 DEFAULT_BOX_PHI_ATOL = 1e-8
 DEFAULT_BOX_MAX_ITER = 32
+
+# Single source of truth for the device/dtype defaults so they are not restated as
+# literals across FitOptions/SolverOptions/solver signatures. NOTE: a programmatic
+# caller on a CPU-only host must pass device="auto" (or "cpu"); the default stays
+# "cuda" to preserve historical behavior and the multiprocessing guard in
+# runners/pipeline.py. Flipping the library default to "auto" is a deliberate
+# product change, not done here.
+DEFAULT_DEVICE = "cuda"
+DEFAULT_DTYPE = "float64"
+
+_DTYPE_TO_NAME = {
+    torch.float16: "float16",
+    torch.float32: "float32",
+    torch.float64: "float64",
+}
+
+
+def dtype_name(dtype: torch.dtype) -> str:
+    """Inverse of resolve_runtime's dtype parsing (e.g. torch.float64 -> 'float64').
+
+    Replaces the fragile ``str(dtype).replace('torch.', '')`` round-trip and raises
+    on an unsupported dtype instead of silently emitting a bad string.
+    """
+    try:
+        return _DTYPE_TO_NAME[dtype]
+    except KeyError:
+        raise ValueError(f"Unsupported runtime dtype: {dtype!r}")
+
+
+def as_runtime_tensor(start, runtime: "TorchRuntime") -> torch.Tensor:
+    """Move/convert an array-like onto the runtime device & dtype.
+
+    The single conversion idiom shared by the solver, adaptive, and partition
+    layers (previously duplicated as _tensor_from_start / _runtime_start_tensor /
+    _as_torch). An existing tensor is cast in place; a numpy/array-like is wrapped
+    with ``torch.as_tensor`` (never ``from_numpy`` / ``torch.tensor(tensor)``).
+    """
+    if torch.is_tensor(start):
+        return start.to(dtype=runtime.dtype, device=runtime.device)
+    return torch.as_tensor(np.asarray(start), dtype=runtime.dtype, device=runtime.device)
 
 
 def validate_lambda_value(lambda_value: float) -> float:
@@ -84,6 +124,15 @@ def _binary_entropy_offset_torch(weight: torch.Tensor) -> torch.Tensor:
 
 
 def resolve_runtime(device: str | None, *, dtype: str | None = None) -> TorchRuntime:
+    """Resolve a device/dtype string pair into a TorchRuntime (the single place
+    that maps strings to torch.device/torch.dtype).
+
+    Determinism note: CUDA fits are not bit-reproducible run-to-run (e.g. the
+    float index_add_ in graph_ops.graph_adjoint_edges is nondeterministic on GPU),
+    and CPU vs GPU labels can differ near lambda-path decision boundaries. For
+    reproducible GPU runs, enable torch.use_deterministic_algorithms(True) and set
+    CUBLAS_WORKSPACE_CONFIG before fitting.
+    """
     requested = "auto" if device is None else str(device).strip().lower()
     if requested == "auto":
         requested = "cuda" if torch.cuda.is_available() else "cpu"
@@ -177,7 +226,7 @@ def state_log_kernel_grad_and_curvature(
     return grad, curvature
 
 
-def cell_loss_grid_torch(
+def mutation_region_loss_grid_torch(
     beta_grid: torch.Tensor,
     *,
     alt: torch.Tensor,
@@ -207,13 +256,13 @@ def cell_loss_grid_torch(
     return torch.where(_as_loss_shape(ambiguous, beta), amb_loss, fixed_loss)
 
 
-def cell_terms_torch(
+def mutation_region_terms_torch(
     data: TorchTumorData,
     phi: torch.Tensor,
     *,
     major_prior: float,
     eps: float,
-) -> TorchCellTerms:
+) -> TorchMutationRegionTerms:
     alt = data.alt
     nonalt = data.nonalt
     amb = data.ambiguous
@@ -266,7 +315,7 @@ def cell_terms_torch(
     hess_upper = torch.clamp(hess_upper, min=1e-8)
     if data.count_observed is not None:
         hess_upper = torch.where(data.count_observed, hess_upper, torch.zeros_like(hess_upper))
-    return TorchCellTerms(
+    return TorchMutationRegionTerms(
         loss=loss,
         grad=grad,
         hess_upper=hess_upper,
@@ -281,7 +330,7 @@ def em_surrogate_terms_torch(
     omega_major: torch.Tensor,
     major_prior: float,
     eps: float,
-) -> TorchCellTerms:
+) -> TorchMutationRegionTerms:
     alt = data.alt
     nonalt = data.nonalt
     amb = data.ambiguous
@@ -337,7 +386,7 @@ def em_surrogate_terms_torch(
     hess_upper = torch.clamp(hess_upper, min=1e-8)
     if data.count_observed is not None:
         hess_upper = torch.where(data.count_observed, hess_upper, torch.zeros_like(hess_upper))
-    return TorchCellTerms(
+    return TorchMutationRegionTerms(
         loss=loss,
         grad=grad,
         hess_upper=hess_upper,
@@ -371,7 +420,7 @@ def objective_terms_torch(
     major_prior: float,
     eps: float,
 ) -> ObjectiveTerms:
-    terms = cell_terms_torch(data, phi, major_prior=major_prior, eps=eps)
+    terms = mutation_region_terms_torch(data, phi, major_prior=major_prior, eps=eps)
     fit_loss = torch.sum(terms.loss)
     penalty = pairwise_penalty_torch(
         phi,
@@ -589,7 +638,6 @@ def refine_graph_fusion_dual_certificate_torch(
         dual[active] = radius[active, None] * diff[active] / diff_norm[active, None].clamp_min(float(atol))
     if torch.any(fused) and dual_kkt is not None and tuple(dual_kkt.shape) == tuple(dual.shape):
         dual[fused] = dual_kkt.to(dtype=phi.dtype, device=phi.device)[fused]
-        fused_norm = torch.linalg.norm(dual[fused], dim=1)
         fused_radius = radius[fused]
         dual[fused] = project_dual_ball(dual[fused], fused_radius)
 

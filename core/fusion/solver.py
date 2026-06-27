@@ -16,12 +16,14 @@ from .graph_ops import (
 )
 from .starts import (
     compute_pooled_observed_data_start_torch,
-    compute_scalar_cell_wells_torch,
+    compute_scalar_mutation_region_wells_torch,
     compute_scalar_well_start_bank_torch,
 )
 from .torch_backend import (
     TorchTumorData,
-    cell_terms_torch,
+    as_runtime_tensor,
+    mutation_region_terms_torch,
+    dtype_name,
     em_surrogate_terms_torch,
     graph_fusion_kkt_residual_from_grad_torch,
     pairwise_penalty_torch,
@@ -209,8 +211,8 @@ def _inner_model_value_torch(
     return quad + penalty
 
 
-def _objective_value_from_cell_terms_torch(
-    cell_terms,
+def _objective_value_from_mutation_region_terms_torch(
+    mutation_region_terms,
     phi: torch.Tensor,
     *,
     edge_u: torch.Tensor,
@@ -218,7 +220,7 @@ def _objective_value_from_cell_terms_torch(
     edge_w: torch.Tensor,
     lambda_value: float,
 ) -> tuple[float, float, float, torch.Tensor]:
-    fit_loss_tensor = torch.sum(cell_terms.loss)
+    fit_loss_tensor = torch.sum(mutation_region_terms.loss)
     penalty_tensor = pairwise_penalty_torch(
         phi,
         edge_u=edge_u,
@@ -233,7 +235,7 @@ def _objective_value_from_cell_terms_torch(
             [fit_loss_tensor.detach(), penalty_tensor.detach(), objective_tensor.detach()]
         ).cpu()
     )
-    return fit_loss, penalty, objective, cell_terms.gamma_major
+    return fit_loss, penalty, objective, mutation_region_terms.gamma_major
 
 
 def _objective_value_once_torch(
@@ -247,13 +249,13 @@ def _objective_value_once_torch(
     major_prior: float,
     eps: float,
 ) -> tuple[float, float, float, torch.Tensor]:
-    terms = cell_terms_torch(
+    terms = mutation_region_terms_torch(
         torch_data,
         phi,
         major_prior=major_prior,
         eps=eps,
     )
-    return _objective_value_from_cell_terms_torch(
+    return _objective_value_from_mutation_region_terms_torch(
         terms,
         phi,
         edge_u=edge_u,
@@ -374,9 +376,7 @@ def _tensor_from_start(
     start: np.ndarray | torch.Tensor,
     runtime,
 ) -> torch.Tensor:
-    if torch.is_tensor(start):
-        return start.to(dtype=runtime.dtype, device=runtime.device)
-    return torch.as_tensor(np.asarray(start), dtype=runtime.dtype, device=runtime.device)
+    return as_runtime_tensor(start, runtime)
 
 
 def _project_state_dual(
@@ -386,15 +386,15 @@ def _project_state_dual(
     edge_w: torch.Tensor,
     lambda_value: float,
     num_edges: int,
-    num_samples: int,
+    num_regions: int,
 ) -> torch.Tensor | None:
     if state is None or state.dual is None:
         return None
-    if tuple(state.dual.shape) != (int(num_edges), int(num_samples)):
+    if tuple(state.dual.shape) != (int(num_edges), int(num_regions)):
         return None
     dual = state.dual.to(dtype=runtime.dtype, device=runtime.device)
     if int(num_edges) == 0:
-        return torch.zeros((0, int(num_samples)), dtype=runtime.dtype, device=runtime.device)
+        return torch.zeros((0, int(num_regions)), dtype=runtime.dtype, device=runtime.device)
     radius = float(lambda_value) * edge_w.to(dtype=runtime.dtype, device=runtime.device)
     return project_dual_ball(dual, radius)
 
@@ -469,7 +469,7 @@ def prepare_torch_problem(
     effective_torch_data = to_torch_tumor_data(data, effective_runtime) if torch_data is None else torch_data
 
     if exact_pilot is None:
-        exact_pilot_tensor, secondary_wells, valid_secondary = compute_scalar_cell_wells_torch(
+        exact_pilot_tensor, secondary_wells, valid_secondary = compute_scalar_mutation_region_wells_torch(
             effective_torch_data,
             phi_init=data.phi_init,
             major_prior=float(major_prior),
@@ -480,7 +480,7 @@ def prepare_torch_problem(
     else:
         exact_pilot_tensor = _tensor_from_start(exact_pilot, effective_runtime)
         if scalar_well_starts is None and not use_unimodal_objective:
-            _, secondary_wells, valid_secondary = compute_scalar_cell_wells_torch(
+            _, secondary_wells, valid_secondary = compute_scalar_mutation_region_wells_torch(
                 effective_torch_data,
                 phi_init=data.phi_init,
                 major_prior=float(major_prior),
@@ -563,6 +563,168 @@ def prepare_torch_problem(
     )
 
 
+def _initial_outer_diag() -> dict[str, float | int]:
+    """Default outer-KKT diagnostics (all residuals +inf, all counts 0) used until
+    the first audit fills them in."""
+    return {
+        "stationarity_residual": np.inf,
+        "projected_stationarity_residual": np.inf,
+        "projected_stationarity_norm": np.inf,
+        "stationarity_normalizer": np.inf,
+        "smooth_gradient_norm": np.inf,
+        "fusion_adjustment_norm": np.inf,
+        "edge_subgradient_residual": np.inf,
+        "dual_ball_residual": np.inf,
+        "box_primal_violation": np.inf,
+        "num_interior_coordinates": 0,
+        "num_lower_active_coordinates": 0,
+        "num_upper_active_coordinates": 0,
+        "num_frozen_coordinates": 0,
+        "box_residual": np.inf,
+        "kkt_residual": np.inf,
+    }
+
+
+def _multiplicity_calls(
+    data: TumorData,
+    gamma_np: np.ndarray,
+    dtype: np.dtype,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Resolve per-mutation_region major-copy probability, the boolean major call, and the
+    chosen multiplicity, holding non-ambiguous mutation_regions at their fixed value."""
+    major_probability = np.where(
+        data.multiplicity_estimation_mask,
+        gamma_np,
+        1.0,
+    ).astype(dtype, copy=False)
+    major_call = major_probability >= 0.5
+    multiplicity_call = np.where(
+        data.multiplicity_estimation_mask,
+        np.where(major_call, data.major_cn, data.minor_cn),
+        data.fixed_multiplicity,
+    ).astype(dtype, copy=False)
+    return major_probability, major_call, multiplicity_call
+
+
+def _classify_failure_reason(
+    *,
+    converged: bool,
+    selection_eligible: bool,
+    accepted_outer_steps: int,
+    accepted_damped_steps: int,
+    accepted_full_steps: int,
+    mm_consistency_violations: int,
+    objective: float,
+    fit_loss: float,
+    kkt_residual: float,
+    tol: float,
+    failed_nonfinite_checks: int,
+    attempted_outer_steps: int,
+    failed_inner_model_checks: int,
+    failed_majorization_checks: int,
+    failed_em_envelope_checks: int,
+    failed_descent_checks: int,
+    converged_outer: bool,
+    converged_inner: bool,
+) -> str:
+    """Map the terminal solver state to a human-readable failure/convergence label."""
+    if converged:
+        return "converged"
+    if selection_eligible and accepted_outer_steps == 0:
+        return "start_already_stationary"
+    if selection_eligible and accepted_damped_steps > 0 and accepted_full_steps == 0:
+        return "fixed_objective_kkt_certified_after_damped_steps"
+    if selection_eligible:
+        return "fixed_objective_kkt_certified"
+    if mm_consistency_violations > 0:
+        return "mm_consistency_violation"
+    if accepted_outer_steps == 0:
+        final_penalty = float(objective - fit_loss)
+        if final_penalty <= 1e-8 and kkt_residual > 5.0 * tol:
+            return "pooled_start_not_stationary_no_descent_step_found"
+        if failed_nonfinite_checks > 0 and failed_nonfinite_checks >= attempted_outer_steps:
+            return "all_trials_nonfinite"
+        if failed_inner_model_checks > 0 and failed_inner_model_checks >= max(attempted_outer_steps - failed_nonfinite_checks, 1):
+            return "all_trials_failed_inner_model_decrease"
+        if failed_majorization_checks > 0 and failed_descent_checks == 0 and failed_em_envelope_checks == 0:
+            return "all_trials_failed_majorization"
+        if failed_em_envelope_checks > 0 and failed_descent_checks == 0:
+            return "all_trials_failed_em_envelope"
+        if failed_descent_checks > 0:
+            return "all_trials_failed_exact_descent"
+        return "no_accepted_outer_step"
+    if accepted_damped_steps > 0 and accepted_full_steps == 0:
+        return "only_damped_steps_accepted"
+    if not converged_outer:
+        return "outer_stationarity_residual_above_tolerance"
+    if not converged_inner:
+        return "inner_kkt_residual_above_tolerance"
+    return "outer_stopping_criteria_not_met"
+
+
+def _solve_inner_subproblem(
+    *,
+    use_alm: bool,
+    runtime,
+    num_mutations: int,
+    U: torch.Tensor,
+    h: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    lambda_value: float,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    edge_w: torch.Tensor,
+    degree_bound: int,
+    tol: float,
+    inner_max_iter: int,
+    phi: torch.Tensor,
+    dual,
+    dual_start_is_actual: bool,
+    pdhg_tau_node,
+):
+    """Dispatch the majorized inner subproblem to the ALM (complete-graph) or PDHG
+    solver. Returns (phi_trial, dual_trial, dual_kkt_trial, inner_ok, inner_residual)."""
+    if use_alm:
+        phi_trial, dual_trial, dual_kkt_trial, _, inner_ok, inner_residual = solve_majorized_subproblem_alm_torch(
+            runtime=runtime,
+            num_mutations=num_mutations,
+            U=U,
+            h=h,
+            lower=lower,
+            upper=upper,
+            lambda_value=lambda_value,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            edge_w=edge_w,
+            tol=tol,
+            max_iter=max(inner_max_iter, 10),
+            phi_start=phi,
+            dual_start=dual,
+            dual_start_is_actual=dual_start_is_actual,
+        )
+    else:
+        phi_trial, dual_trial, dual_kkt_trial, _, inner_ok, inner_residual = solve_majorized_subproblem_pdhg_torch(
+            runtime=runtime,
+            num_mutations=num_mutations,
+            U=U,
+            h=h,
+            lower=lower,
+            upper=upper,
+            lambda_value=lambda_value,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            edge_w=edge_w,
+            degree_bound=degree_bound,
+            tol=tol,
+            max_iter=max(inner_max_iter, 10),
+            phi_start=phi,
+            dual_start=dual,
+            tau_node=pdhg_tau_node,
+        )
+    return phi_trial, dual_trial, dual_kkt_trial, inner_ok, inner_residual
+
+
 def _fit_from_start(
     data: TumorData,
     *,
@@ -609,7 +771,7 @@ def _fit_from_start(
         edge_w=edge_w,
         lambda_value=lambda_value,
         num_edges=int(edge_u.numel()),
-        num_samples=int(phi.shape[1]),
+        num_regions=int(phi.shape[1]),
     )
     dual = state_dual
     dual_kkt = state_dual
@@ -624,23 +786,7 @@ def _fit_from_start(
     final_relative_objective_change = np.inf
     final_step_residual = np.inf
     final_inner_kkt_residual = np.nan
-    final_outer_diag = {
-        "stationarity_residual": np.inf,
-        "projected_stationarity_residual": np.inf,
-        "projected_stationarity_norm": np.inf,
-        "stationarity_normalizer": np.inf,
-        "smooth_gradient_norm": np.inf,
-        "fusion_adjustment_norm": np.inf,
-        "edge_subgradient_residual": np.inf,
-        "dual_ball_residual": np.inf,
-        "box_primal_violation": np.inf,
-        "num_interior_coordinates": 0,
-        "num_lower_active_coordinates": 0,
-        "num_upper_active_coordinates": 0,
-        "num_frozen_coordinates": 0,
-        "box_residual": np.inf,
-        "kkt_residual": np.inf,
-    }
+    final_outer_diag = _initial_outer_diag()
     outer_kkt_certificate_status = "not_audited"
     outer_kkt_dual_refined = False
     outer_kkt_fused_edges = 0
@@ -669,11 +815,10 @@ def _fit_from_start(
     best_attempted_em_envelope_gap = np.nan
     accepted_step_type = "none"
     last_reject_reason = "not_attempted"
-    failure_reason = "not_converged"
 
-    current_cell_terms = cell_terms_torch(torch_data, phi, major_prior=major_prior, eps=eps)
-    fit_loss, penalty, objective, gamma_major = _objective_value_from_cell_terms_torch(
-        current_cell_terms,
+    current_mutation_region_terms = mutation_region_terms_torch(torch_data, phi, major_prior=major_prior, eps=eps)
+    fit_loss, penalty, objective, gamma_major = _objective_value_from_mutation_region_terms_torch(
+        current_mutation_region_terms,
         phi,
         edge_u=edge_u,
         edge_v=edge_v,
@@ -687,7 +832,7 @@ def _fit_from_start(
         previous_phi = phi.clone()
         previous_objective = objective
         if use_unimodal_objective:
-            surrogate_terms = current_cell_terms
+            surrogate_terms = current_mutation_region_terms
             surrogate_fit_loss = float(fit_loss)
         else:
             surrogate_terms = em_surrogate_terms_torch(
@@ -711,7 +856,7 @@ def _fit_from_start(
         candidate_objective = objective
         candidate_fit_loss = fit_loss
         candidate_gamma = gamma_major
-        candidate_cell_terms = current_cell_terms
+        candidate_mutation_region_terms = current_mutation_region_terms
         candidate_inner_residual = np.nan
         candidate_step_type = "none"
         inner_converged = False
@@ -737,43 +882,26 @@ def _fit_from_start(
                     edge_w=edge_w,
                     lambda_value=lambda_value,
                 )
-            if use_alm:
-                phi_trial, dual_trial, dual_kkt_trial, _, inner_ok, inner_residual = solve_majorized_subproblem_alm_torch(
-                    runtime=runtime,
-                    num_mutations=data.num_mutations,
-                    U=U,
-                    h=h,
-                    lower=lower,
-                    upper=upper,
-                    lambda_value=lambda_value,
-                    edge_u=edge_u,
-                    edge_v=edge_v,
-                    edge_w=edge_w,
-                    tol=tol,
-                    max_iter=max(inner_max_iter, 10),
-                    phi_start=phi,
-                    dual_start=dual,
-                    dual_start_is_actual=dual_start_is_actual,
-                )
-            else:
-                phi_trial, dual_trial, dual_kkt_trial, _, inner_ok, inner_residual = solve_majorized_subproblem_pdhg_torch(
-                    runtime=runtime,
-                    num_mutations=data.num_mutations,
-                    U=U,
-                    h=h,
-                    lower=lower,
-                    upper=upper,
-                    lambda_value=lambda_value,
-                    edge_u=edge_u,
-                    edge_v=edge_v,
-                    edge_w=edge_w,
-                    degree_bound=int(graph.degree_bound),
-                    tol=tol,
-                    max_iter=max(inner_max_iter, 10),
-                    phi_start=phi,
-                    dual_start=dual,
-                    tau_node=tensor_graph.pdhg_tau_node,
-                )
+            phi_trial, dual_trial, dual_kkt_trial, inner_ok, inner_residual = _solve_inner_subproblem(
+                use_alm=use_alm,
+                runtime=runtime,
+                num_mutations=data.num_mutations,
+                U=U,
+                h=h,
+                lower=lower,
+                upper=upper,
+                lambda_value=lambda_value,
+                edge_u=edge_u,
+                edge_v=edge_v,
+                edge_w=edge_w,
+                degree_bound=int(graph.degree_bound),
+                tol=tol,
+                inner_max_iter=inner_max_iter,
+                phi=phi,
+                dual=dual,
+                dual_start_is_actual=dual_start_is_actual,
+                pdhg_tau_node=tensor_graph.pdhg_tau_node,
+            )
             attempted_outer_steps += 1
             last_attempted_inner_kkt_residual = float(inner_residual)
             best_attempted_inner_kkt_residual = _update_minimum(
@@ -781,9 +909,9 @@ def _fit_from_start(
                 float(inner_residual),
             )
             delta = phi_trial - phi
-            trial_cell_terms = cell_terms_torch(torch_data, phi_trial, major_prior=major_prior, eps=eps)
-            trial_fit_loss, _, trial_objective, trial_gamma = _objective_value_from_cell_terms_torch(
-                trial_cell_terms,
+            trial_mutation_region_terms = mutation_region_terms_torch(torch_data, phi_trial, major_prior=major_prior, eps=eps)
+            trial_fit_loss, _, trial_objective, trial_gamma = _objective_value_from_mutation_region_terms_torch(
+                trial_mutation_region_terms,
                 phi_trial,
                 edge_u=edge_u,
                 edge_v=edge_v,
@@ -872,7 +1000,7 @@ def _fit_from_start(
                 candidate_objective = trial_objective
                 candidate_fit_loss = trial_fit_loss
                 candidate_gamma = trial_gamma
-                candidate_cell_terms = trial_cell_terms
+                candidate_mutation_region_terms = trial_mutation_region_terms
                 candidate_inner_residual = float(inner_residual)
                 candidate_step_type = "full_inner_step"
                 accepted_step_type = candidate_step_type
@@ -891,9 +1019,9 @@ def _fit_from_start(
             damped_accepted = False
             for _line_search_iter in range(12):
                 phi_theta = phi + theta * delta
-                theta_cell_terms = cell_terms_torch(torch_data, phi_theta, major_prior=major_prior, eps=eps)
-                theta_fit_loss, _, theta_objective, theta_gamma = _objective_value_from_cell_terms_torch(
-                    theta_cell_terms,
+                theta_mutation_region_terms = mutation_region_terms_torch(torch_data, phi_theta, major_prior=major_prior, eps=eps)
+                theta_fit_loss, _, theta_objective, theta_gamma = _objective_value_from_mutation_region_terms_torch(
+                    theta_mutation_region_terms,
                     phi_theta,
                     edge_u=edge_u,
                     edge_v=edge_v,
@@ -912,7 +1040,7 @@ def _fit_from_start(
                     candidate_objective = theta_objective
                     candidate_fit_loss = theta_fit_loss
                     candidate_gamma = theta_gamma
-                    candidate_cell_terms = theta_cell_terms
+                    candidate_mutation_region_terms = theta_mutation_region_terms
                     candidate_inner_residual = np.nan
                     candidate_step_type = "damped_mm_direction"
                     accepted_step_type = candidate_step_type
@@ -933,7 +1061,7 @@ def _fit_from_start(
             candidate_objective = objective
             candidate_fit_loss = fit_loss
             candidate_gamma = gamma_major
-            candidate_cell_terms = current_cell_terms
+            candidate_mutation_region_terms = current_mutation_region_terms
             candidate_step_type = "none"
 
         phi = candidate_phi
@@ -943,7 +1071,7 @@ def _fit_from_start(
         objective = candidate_objective
         fit_loss = candidate_fit_loss
         gamma_major = candidate_gamma
-        current_cell_terms = candidate_cell_terms
+        current_mutation_region_terms = candidate_mutation_region_terms
         penalty = objective - fit_loss
         history.append(float(objective))
 
@@ -968,7 +1096,7 @@ def _fit_from_start(
         outer_diag = final_outer_diag
         outer_converged = False
         if do_outer_kkt_audit:
-            outer_terms = current_cell_terms
+            outer_terms = current_mutation_region_terms
             if dual_kkt is None:
                 dual_for_audit = torch.zeros(
                     (int(edge_u.numel()), int(phi.shape[1])),
@@ -1009,7 +1137,7 @@ def _fit_from_start(
             converged = True
             break
 
-    final_terms = current_cell_terms
+    final_terms = current_mutation_region_terms
     final_dual_audit = refine_graph_fusion_dual_certificate_torch(
         phi=phi,
         grad_smooth=final_terms.grad,
@@ -1053,40 +1181,26 @@ def _fit_from_start(
     if use_unimodal_objective and global_optimality_certified:
         converged = True
 
-    if converged:
-        failure_reason = "converged"
-    elif selection_eligible and accepted_outer_steps == 0:
-        failure_reason = "start_already_stationary"
-    elif selection_eligible and accepted_damped_steps > 0 and accepted_full_steps == 0:
-        failure_reason = "fixed_objective_kkt_certified_after_damped_steps"
-    elif selection_eligible:
-        failure_reason = "fixed_objective_kkt_certified"
-    elif mm_consistency_violations > 0:
-        failure_reason = "mm_consistency_violation"
-    elif accepted_outer_steps == 0:
-        final_penalty = float(objective - fit_loss)
-        if final_penalty <= 1e-8 and final_outer_diag["kkt_residual"] > 5.0 * tol:
-            failure_reason = "pooled_start_not_stationary_no_descent_step_found"
-        elif failed_nonfinite_checks > 0 and failed_nonfinite_checks >= attempted_outer_steps:
-            failure_reason = "all_trials_nonfinite"
-        elif failed_inner_model_checks > 0 and failed_inner_model_checks >= max(attempted_outer_steps - failed_nonfinite_checks, 1):
-            failure_reason = "all_trials_failed_inner_model_decrease"
-        elif failed_majorization_checks > 0 and failed_descent_checks == 0 and failed_em_envelope_checks == 0:
-            failure_reason = "all_trials_failed_majorization"
-        elif failed_em_envelope_checks > 0 and failed_descent_checks == 0:
-            failure_reason = "all_trials_failed_em_envelope"
-        elif failed_descent_checks > 0:
-            failure_reason = "all_trials_failed_exact_descent"
-        else:
-            failure_reason = "no_accepted_outer_step"
-    elif accepted_damped_steps > 0 and accepted_full_steps == 0:
-        failure_reason = "only_damped_steps_accepted"
-    elif not converged_outer:
-        failure_reason = "outer_stationarity_residual_above_tolerance"
-    elif not converged_inner:
-        failure_reason = "inner_kkt_residual_above_tolerance"
-    else:
-        failure_reason = "outer_stopping_criteria_not_met"
+    failure_reason = _classify_failure_reason(
+        converged=converged,
+        selection_eligible=selection_eligible,
+        accepted_outer_steps=accepted_outer_steps,
+        accepted_damped_steps=accepted_damped_steps,
+        accepted_full_steps=accepted_full_steps,
+        mm_consistency_violations=mm_consistency_violations,
+        objective=float(objective),
+        fit_loss=float(fit_loss),
+        kkt_residual=float(final_outer_diag["kkt_residual"]),
+        tol=tol,
+        failed_nonfinite_checks=failed_nonfinite_checks,
+        attempted_outer_steps=attempted_outer_steps,
+        failed_inner_model_checks=failed_inner_model_checks,
+        failed_majorization_checks=failed_majorization_checks,
+        failed_em_envelope_checks=failed_em_envelope_checks,
+        failed_descent_checks=failed_descent_checks,
+        converged_outer=converged_outer,
+        converged_inner=converged_inner,
+    )
 
     phi_np = phi.detach().cpu().numpy()
     gamma_np = gamma_major.detach().cpu().numpy()
@@ -1128,17 +1242,9 @@ def _fit_from_start(
         phi_clustered = phi_np.astype(phi_np.dtype, copy=False)
         summary_loglik = float("nan")
 
-    major_probability = np.where(
-        data.multiplicity_estimation_mask,
-        gamma_np,
-        1.0,
-    ).astype(phi_np.dtype, copy=False)
-    major_call = major_probability >= 0.5
-    multiplicity_call = np.where(
-        data.multiplicity_estimation_mask,
-        np.where(major_call, data.major_cn, data.minor_cn),
-        data.fixed_multiplicity,
-    ).astype(phi_np.dtype, copy=False)
+    major_probability, major_call, multiplicity_call = _multiplicity_calls(
+        data, gamma_np, phi_np.dtype
+    )
     solver_state_out = SolverState(
         phi=phi.detach(),
         dual=final_dual.detach() if torch.is_tensor(final_dual) else None,
@@ -1193,7 +1299,7 @@ def _fit_from_start(
         iterations=int(iterations),
         converged=bool(converged),
         device=runtime.device_name,
-        dtype=str(runtime.dtype).replace("torch.", ""),
+        dtype=dtype_name(runtime.dtype),
         graph_name=str(graph.name),
         summary_tol=float(effective_summary_tol),
         history=[float(value) for value in history],
@@ -1287,7 +1393,7 @@ def fit_torch(
         phi_start=start,
         start_mode=start_mode,
         device=context.runtime.device_name,
-        dtype=str(context.runtime.dtype).replace("torch.", ""),
+        dtype=dtype_name(context.runtime.dtype),
         summary_tol=summary_tol,
         solver_context=context,
         solver_state=state,

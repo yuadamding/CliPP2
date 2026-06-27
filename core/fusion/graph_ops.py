@@ -30,21 +30,21 @@ def _adaptive_weight_work_dtype(dtype: torch.dtype) -> torch.dtype:
     return torch.float32 if dtype == torch.float16 else dtype
 
 
-def _adaptive_weight_chunk_size(*, num_samples: int, dtype: torch.dtype) -> int:
-    sample_count = max(int(num_samples), 1)
-    bytes_per_edge = max(sample_count * _dtype_nbytes(dtype), 1)
+def _adaptive_weight_chunk_size(*, num_regions: int, dtype: torch.dtype) -> int:
+    region_count = max(int(num_regions), 1)
+    bytes_per_edge = max(region_count * _dtype_nbytes(dtype), 1)
     return max(1, int(COMPLETE_ADAPTIVE_WEIGHT_CHUNK_BYTES // bytes_per_edge))
 
 
 def estimate_complete_tensor_graph_bytes(
     num_nodes: int,
     *,
-    num_samples: int,
+    num_regions: int,
     dtype: torch.dtype,
     adaptive: bool,
 ) -> int:
     node_count = max(int(num_nodes), 0)
-    sample_count = max(int(num_samples), 1)
+    region_count = max(int(num_regions), 1)
     edge_count = _complete_graph_edge_count(node_count)
     value_bytes = _dtype_nbytes(dtype)
     index_bytes = _dtype_nbytes(torch.long)
@@ -57,8 +57,8 @@ def estimate_complete_tensor_graph_bytes(
         return int(persistent_bytes)
     work_dtype = _adaptive_weight_work_dtype(dtype)
     work_value_bytes = _dtype_nbytes(work_dtype)
-    chunk_edges = min(edge_count, _adaptive_weight_chunk_size(num_samples=sample_count, dtype=work_dtype))
-    adaptive_peak_bytes = chunk_edges * sample_count * work_value_bytes + 3 * chunk_edges * work_value_bytes
+    chunk_edges = min(edge_count, _adaptive_weight_chunk_size(num_regions=region_count, dtype=work_dtype))
+    adaptive_peak_bytes = chunk_edges * region_count * work_value_bytes + 3 * chunk_edges * work_value_bytes
     return int(persistent_bytes + adaptive_peak_bytes)
 
 
@@ -113,14 +113,14 @@ def _complete_graph_memory_limit_bytes(
 def _check_complete_tensor_graph_memory(
     *,
     num_nodes: int,
-    num_samples: int,
+    num_regions: int,
     runtime: TorchRuntime,
     adaptive: bool,
     memory_limit_bytes: int | None,
 ) -> None:
     estimate = estimate_complete_tensor_graph_bytes(
         num_nodes,
-        num_samples=num_samples,
+        num_regions=num_regions,
         dtype=runtime.dtype,
         adaptive=adaptive,
     )
@@ -168,7 +168,7 @@ def _complete_adaptive_raw_weights(
         1,
         min(
             num_edges,
-            _adaptive_weight_chunk_size(num_samples=int(pilot.shape[1]), dtype=pilot.dtype),
+            _adaptive_weight_chunk_size(num_regions=int(pilot.shape[1]), dtype=pilot.dtype),
         ),
     )
     for start in range(0, num_edges, chunk_size):
@@ -243,7 +243,7 @@ def build_complete_uniform_tensor_graph(
 ) -> TensorFusionGraph:
     _check_complete_tensor_graph_memory(
         num_nodes=int(num_nodes),
-        num_samples=1,
+        num_regions=1,
         runtime=runtime,
         adaptive=False,
         memory_limit_bytes=memory_limit_bytes,
@@ -294,7 +294,7 @@ def build_complete_adaptive_tensor_graph(
     num_nodes = int(pilot.shape[0])
     _check_complete_tensor_graph_memory(
         num_nodes=num_nodes,
-        num_samples=int(pilot.shape[1]),
+        num_regions=int(pilot.shape[1]),
         runtime=runtime,
         adaptive=True,
         memory_limit_bytes=memory_limit_bytes,

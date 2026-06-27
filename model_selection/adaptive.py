@@ -9,7 +9,8 @@ import torch
 from ..core.model import FitOptions
 from ..core.fusion.graph_ops import graph_adjoint_edges, graph_forward_edges, project_dual_ball
 from ..core.fusion.torch_backend import (
-    cell_terms_torch,
+    as_runtime_tensor,
+    mutation_region_terms_torch,
     objective_value_torch,
     stationarity_residual_torch,
 )
@@ -31,12 +32,10 @@ from .scoring import (
     _sorted_unique_lambdas,
 )
 from .types import FullFusionKKTResult, StartArray, _AdaptiveIntervalProposal
-from ..runners.selection import LambdaBracket
+from ..core.bic import LambdaBracket
 
 def _runtime_start_tensor(start: StartArray, runtime) -> torch.Tensor:
-    if torch.is_tensor(start):
-        return start.to(dtype=runtime.dtype, device=runtime.device)
-    return torch.as_tensor(np.asarray(start), dtype=runtime.dtype, device=runtime.device)
+    return as_runtime_tensor(start, runtime)
 
 
 def _full_fusion_box_residual_with_dual_balls(
@@ -136,7 +135,7 @@ def _estimate_lambda_full_light(
     lower = torch.full_like(torch_data.phi_upper, float(eps))
     upper = torch.minimum(torch_data.phi_upper, torch.ones_like(torch_data.phi_upper))
     phi = torch.minimum(torch.maximum(phi, lower), upper)
-    terms = cell_terms_torch(torch_data, phi, major_prior=major_prior, eps=eps)
+    terms = mutation_region_terms_torch(torch_data, phi, major_prior=major_prior, eps=eps)
     stat_tol = max(5.0 * float(tol), 1e-5)
     low = 0.0
     high = max(float(lambda_eq), LAMBDA_SEARCH_MIN)

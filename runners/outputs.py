@@ -63,7 +63,7 @@ def cluster_output_table(
     return table
 
 
-def cell_output_table(
+def mutation_region_output_table(
     data: TumorData,
     fit: FitResult,
     bic_refit_phi: np.ndarray | None = None,
@@ -140,8 +140,8 @@ def write_fit_outputs(
         sep="\t",
         index=False,
     )
-    cell_output_table(data, fit, bic_refit_phi=bic_refit_phi).to_csv(
-        outdir / f"{data.tumor_id}_cell_multiplicity.tsv",
+    mutation_region_output_table(data, fit, bic_refit_phi=bic_refit_phi).to_csv(
+        outdir / f"{data.tumor_id}_mutation_region_multiplicity.tsv",
         sep="\t",
         index=False,
     )
@@ -165,7 +165,7 @@ def write_fit_outputs(
 
 
 __all__ = [
-    "cell_output_table",
+    "mutation_region_output_table",
     "cluster_output_table",
     "evaluation_to_frame",
     "mutation_output_table",

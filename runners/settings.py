@@ -15,10 +15,6 @@ class TumorRegime:
     mean_purity: float
     non_diploid_rate: float
 
-    @property
-    def num_samples(self) -> int:
-        return self.num_regions
-
 
 def summarize_tumor_regime(data: TumorData) -> TumorRegime:
     non_diploid_mask = data.has_cna & ((data.major_cn != 1.0) | (data.minor_cn != 1.0))

@@ -5,7 +5,7 @@ import pandas as pd
 
 from ..core.model import FitOptions, FitResult
 from ..io.data import TumorData
-from ..runners.selection import (
+from ..core.bic import (
     compute_classic_bic,
     compute_extended_bic,
 )

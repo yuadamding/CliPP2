@@ -49,8 +49,8 @@ def _adjusted_rand_index(labels_true: np.ndarray, labels_pred: np.ndarray) -> fl
     if labels_true.shape != labels_pred.shape:
         raise ValueError("labels_true and labels_pred must have the same shape.")
 
-    n_samples = int(labels_true.size)
-    if n_samples < 2:
+    n_regions = int(labels_true.size)
+    if n_regions < 2:
         return 1.0
 
     _, true_inverse = np.unique(labels_true, return_inverse=True)
@@ -65,7 +65,7 @@ def _adjusted_rand_index(labels_true: np.ndarray, labels_pred: np.ndarray) -> fl
     pred_counts = np.bincount(pred_inverse, minlength=n_pred)
     sum_comb_true = float(np.sum(_comb2(true_counts)))
     sum_comb_pred = float(np.sum(_comb2(pred_counts)))
-    total_comb = float(n_samples * (n_samples - 1) * 0.5)
+    total_comb = float(n_regions * (n_regions - 1) * 0.5)
     if total_comb <= 0.0:
         return 1.0
 
@@ -236,7 +236,7 @@ def load_simulation_truth(
     if not tumor_dir.exists():
         raise FileNotFoundError(f"Simulation directory not found for tumor '{data.tumor_id}': {tumor_dir}")
 
-    if data.num_samples == 1 and (tumor_dir / "truth_cp.txt").exists():
+    if data.num_regions == 1 and (tumor_dir / "truth_cp.txt").exists():
         truth_clusters, truth_phi, truth_multiplicity = _load_single_region_truth(tumor_dir=tumor_dir, data=data)
         return SimulationTruth(
             truth_clusters=truth_clusters,
@@ -255,8 +255,8 @@ def load_simulation_truth(
         raw_clusters, truth_ids, data.mutation_ids, "truth.txt/cluster_id", data.tumor_id
     )
 
-    truth_phi = np.zeros((data.num_mutations, data.num_samples), dtype=np.float32)
-    truth_multiplicity = np.zeros((data.num_mutations, data.num_samples), dtype=np.float32)
+    truth_phi = np.zeros((data.num_mutations, data.num_regions), dtype=np.float32)
+    truth_multiplicity = np.zeros((data.num_mutations, data.num_regions), dtype=np.float32)
 
     for column, region_id in enumerate(data.region_ids):
         region_index = _region_index_from_label(region_id)
@@ -398,21 +398,4 @@ def evaluate_fit_against_simulation(
         summary_cp_rmse=summary_cp_rmse,
         bic_refit_ari=bic_refit_ari,
         bic_refit_cp_rmse=bic_refit_cp_rmse,
-    )
-
-
-def evaluate_ari_against_simulation(
-    fit: FitResult,
-    data: TumorData,
-    simulation_root: str | Path | None = None,
-    simulation_truth: SimulationTruth | None = None,
-) -> float:
-    if simulation_truth is None:
-        if simulation_root is None:
-            raise ValueError("Either simulation_root or simulation_truth must be provided.")
-        simulation_truth = load_simulation_truth(data, simulation_root)
-
-    return _adjusted_rand_index(
-        simulation_truth.truth_clusters.astype(int, copy=False),
-        fit.cluster_labels.astype(int, copy=False),
     )

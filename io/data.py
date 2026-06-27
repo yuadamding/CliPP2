@@ -34,18 +34,6 @@ class TumorData:
         return int(self.alt_counts.shape[1])
 
     @property
-    def num_samples(self) -> int:
-        return self.num_regions
-
-    @property
-    def patient_id(self) -> str:
-        return self.tumor_id
-
-    @property
-    def sample_ids(self) -> list[str]:
-        return list(self.region_ids)
-
-    @property
     def depth_scale(self) -> float:
         positive_depth = self.total_counts[self.total_counts > 0]
         if positive_depth.size == 0:
@@ -63,8 +51,6 @@ class TumorData:
     def fixed_multiplicity(self) -> np.ndarray:
         # Outside CNA-ambiguous entries, keep multiplicity fixed at the available major-copy value.
         return self.major_cn.astype(np.float64, copy=True)
-
-PatientData = TumorData
 
 
 def _first_seen(values: pd.Series) -> list[str]:
@@ -256,8 +242,8 @@ def load_tumor_tsv(
     num_regions = len(region_ids)
     if len(df) != num_mutations * num_regions:
         mutation_codes_check = pd.Categorical(df["mutation_id"], categories=mutation_ids).codes
-        sample_codes_check = pd.Categorical(df["sample_id"], categories=region_ids).codes
-        observed_set = set(zip(mutation_codes_check.tolist(), sample_codes_check.tolist()))
+        region_codes_check = pd.Categorical(df["sample_id"], categories=region_ids).codes
+        observed_set = set(zip(mutation_codes_check.tolist(), region_codes_check.tolist()))
         expected_set = {(i, j) for i in range(num_mutations) for j in range(num_regions)}
         missing_pairs_coded = sorted(expected_set.difference(observed_set))[:5]
         missing_examples = ", ".join(
@@ -271,7 +257,7 @@ def load_tumor_tsv(
 
     # Vectorized fill using categorical integer codes
     mutation_codes = pd.Categorical(df["mutation_id"], categories=mutation_ids).codes.copy()
-    sample_codes = pd.Categorical(df["sample_id"], categories=region_ids).codes.copy()
+    region_codes = pd.Categorical(df["sample_id"], categories=region_ids).codes.copy()
 
     alt_vals = df["alt_counts"].to_numpy(dtype=np.float64)
     ref_vals = df["ref_counts"].to_numpy(dtype=np.float64)
@@ -287,12 +273,12 @@ def load_tumor_tsv(
     minor_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float64)
     normal_cn = np.full((num_mutations, num_regions), np.nan, dtype=np.float64)
 
-    alt_counts[mutation_codes, sample_codes] = alt_vals
-    total_counts[mutation_codes, sample_codes] = alt_vals + ref_vals
-    purity[mutation_codes, sample_codes] = purity_vals
-    major_cn[mutation_codes, sample_codes] = major_vals
-    minor_cn[mutation_codes, sample_codes] = minor_vals
-    normal_cn[mutation_codes, sample_codes] = normal_vals
+    alt_counts[mutation_codes, region_codes] = alt_vals
+    total_counts[mutation_codes, region_codes] = alt_vals + ref_vals
+    purity[mutation_codes, region_codes] = purity_vals
+    major_cn[mutation_codes, region_codes] = major_vals
+    minor_cn[mutation_codes, region_codes] = minor_vals
+    normal_cn[mutation_codes, region_codes] = normal_vals
 
     has_explicit_cna_mask = "has_cna" in df.columns or "cna_observed" in df.columns
     normalized_missing_cna_policy = str(missing_cna_policy).strip().lower()
@@ -305,7 +291,7 @@ def load_tumor_tsv(
             [_parse_bool_like(v, column_name=cna_col) for v in df[cna_col]],
             dtype=bool,
         )
-        has_cna[mutation_codes, sample_codes] = has_cna_vals
+        has_cna[mutation_codes, region_codes] = has_cna_vals
     else:
         if normalized_missing_cna_policy == "error":
             raise ValueError(
@@ -321,7 +307,7 @@ def load_tumor_tsv(
             dtype=bool,
         )
         count_observed = np.zeros((num_mutations, num_regions), dtype=bool)
-        count_observed[mutation_codes, sample_codes] = count_obs_vals
+        count_observed[mutation_codes, region_codes] = count_obs_vals
     else:
         count_observed = np.ones((num_mutations, num_regions), dtype=bool)
 
@@ -390,19 +376,8 @@ def load_tumor_tsv(
     )
 
 
-def load_patient_tsv(
-    file_path: str | Path,
-    eps: float = 1e-6,
-    *,
-    missing_cna_policy: str = "error",
-) -> PatientData:
-    return load_tumor_tsv(file_path=file_path, eps=eps, missing_cna_policy=missing_cna_policy)
-
-
 __all__ = [
     "TumorData",
-    "PatientData",
     "compute_phi_init_from_counts",
     "load_tumor_tsv",
-    "load_patient_tsv",
 ]

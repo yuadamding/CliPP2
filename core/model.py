@@ -7,6 +7,7 @@ import torch
 
 from ..io.data import TumorData
 from .fusion.solver import fit_observed_data_pairwise_fusion
+from .fusion.torch_backend import DEFAULT_DEVICE, DEFAULT_DTYPE
 from .fusion.types import PairwiseFusionGraph, SolverContext, SolverState
 
 
@@ -22,8 +23,8 @@ class FitOptions:
     adaptive_weight_gamma: float = 1.0
     adaptive_weight_floor: float = 1e-6
     adaptive_weight_baseline: float = 1.0
-    device: str = "cuda"
-    dtype: str = "float64"
+    device: str = DEFAULT_DEVICE
+    dtype: str = DEFAULT_DTYPE
     summary_tol: float | None = 1e-4
     bic_partition_tol: float | None = 1e-4
     objective_shape: str = "unimodal"
@@ -44,8 +45,8 @@ class SolverOptions:
     outer_max_iter: int = 8
     inner_max_iter: int = 30
     tol: float = 1e-4
-    device: str = "cuda"
-    dtype: str = "float64"
+    device: str = DEFAULT_DEVICE
+    dtype: str = DEFAULT_DTYPE
     compute_summary: bool = False
     summary_tol: float | None = 1e-4
     bic_partition_tol: float | None = 1e-4

@@ -27,7 +27,7 @@ from ..metrics.evaluation import (
     SimulationTruth,
     load_simulation_truth,
 )
-from .selection import (
+from ..core.bic import (
     LAMBDA_GRID_MODES,
     LambdaBracket,
     is_adaptive_lambda_grid_mode,
@@ -107,9 +107,6 @@ from ..model_selection.types import (
 )
 
 
-
-
-
 def _hash_array(hasher: "hashlib._Hash", array: np.ndarray) -> None:
     contiguous = np.ascontiguousarray(array)
     hasher.update(str(contiguous.dtype).encode("utf-8"))
@@ -182,7 +179,6 @@ def _candidate_static_metadata(data: TumorData, graph, pilot_phi: StartArray | N
     )
 
 
-
 def _clone_start(start: StartArray) -> StartArray:
     if torch.is_tensor(start):
         return start.detach().clone()
@@ -195,581 +191,42 @@ def _fit_phi_start(fit: FitResult) -> StartArray:
     return fit.phi
 
 
+def _resolve_adaptive_path_config(use_partition_pool: bool) -> tuple[int, int, int, int]:
+    """Adaptive lambda-path budgets as
+    (max_candidates, max_rounds, refine_per_round, transition_probe_max_candidates),
+    switching between the partition-pool and default budgets on one condition."""
+    if use_partition_pool:
+        return (
+            ADAPTIVE_PATH_PARTITION_POOL_MAX_CANDIDATES,
+            ADAPTIVE_PATH_PARTITION_POOL_MAX_ROUNDS,
+            ADAPTIVE_PATH_PARTITION_POOL_REFINE_PER_ROUND,
+            ADAPTIVE_PATH_PARTITION_POOL_TRANSITION_PROBE_MAX_CANDIDATES,
+        )
+    return (
+        ADAPTIVE_PATH_MAX_CANDIDATES,
+        ADAPTIVE_PATH_MAX_ROUNDS,
+        ADAPTIVE_PATH_REFINE_PER_ROUND,
+        ADAPTIVE_PATH_TRANSITION_PROBE_MAX_CANDIDATES,
+    )
 
 
-def _grid_search_selection(
+def _assemble_selection_result(
     *,
-    data: TumorData,
-    simulation_root: Path | None,
-    lambda_grid: list[float] | None,
-    lambda_grid_mode: str,
-    fit_options: FitOptions,
-    bic_df_scale: float,
-    bic_cluster_penalty: float,
-    use_warm_starts: bool,
-    evaluate_all_candidates: bool,
-    profile_name: str,
-    selection_method: str,
-    selection_score: str,
-    finalize_selected_fit: bool,
+    search_df,
+    data,
+    normalized_score,
+    result_entries,
+    bic_df_scale,
+    bic_cluster_penalty,
+    selection_method,
+    profile_name,
+    lambda_search_mode,
+    lambda_bracket,
+    adaptive_search_stop_reason,
+    adaptive_search_rounds_completed,
+    adaptive_refinement_rounds_completed,
+    selection_start_time,
 ) -> BICSelectionResult:
-    selection_start_time = perf_counter()
-    explicit_lambda_grid = lambda_grid is not None
-    normalized_lambda_grid_mode = str(lambda_grid_mode).strip().lower()
-    if normalized_lambda_grid_mode not in LAMBDA_GRID_MODES:
-        raise ValueError(f"Unknown lambda_grid_mode: {lambda_grid_mode}")
-    adaptive_lambda_mode = bool(lambda_grid is None and is_adaptive_lambda_grid_mode(normalized_lambda_grid_mode))
-    normalized_score = _normalize_selection_score_name(selection_score)
-    lambda_search_mode = "explicit_grid" if explicit_lambda_grid else normalized_lambda_grid_mode
-    lambda_bracket: LambdaBracket | None = None
-    if lambda_grid is None and not adaptive_lambda_mode:
-        raise ValueError("Default model selection uses lambda_grid_mode='adaptive_bic'.")
-    lambda_grid = [] if lambda_grid is None else _sorted_unique_lambdas(lambda_grid)
-    likelihood_partition_pool_enabled = bool(ENABLE_LIKELIHOOD_PARTITION_CANDIDATES)
-
-    prepare_start_time = perf_counter()
-    solver_context = prepare_torch_problem(
-        data,
-        major_prior=float(fit_options.major_prior),
-        eps=float(fit_options.eps),
-        tol=float(fit_options.tol),
-        graph=fit_options.graph,
-        inner_max_iter=max(int(fit_options.inner_max_iter), 16),
-        adaptive_weight_gamma=float(fit_options.adaptive_weight_gamma),
-        adaptive_weight_floor=float(fit_options.adaptive_weight_floor),
-        adaptive_weight_baseline=float(fit_options.adaptive_weight_baseline),
-        device=fit_options.device,
-        dtype=fit_options.dtype,
-    )
-    prepare_elapsed_seconds = float(perf_counter() - prepare_start_time)
-    runtime = solver_context.runtime
-    torch_data = torch_data_from_context(solver_context)
-    pilot_phi: StartArray = solver_context.exact_pilot
-    pooled_start: StartArray = solver_context.pooled_start
-    scalar_well_starts: list[StartArray] = list(solver_context.scalar_well_starts)
-    effective_graph = solver_context.graph_spec
-    effective_tensor_graph = solver_context.graph
-    effective_fit_options = replace(fit_options, graph=effective_graph)
-    static_metadata = _candidate_static_metadata(data, effective_graph, pilot_phi=pilot_phi)
-    search_fit_options = (
-        _adaptive_first_pass_options(effective_fit_options)
-        if adaptive_lambda_mode
-        else effective_fit_options
-    )
-    if adaptive_lambda_mode:
-        lambda_bracket = _initial_adaptive_lambda_bracket(
-            torch_data=torch_data,
-            runtime=runtime,
-            exact_pilot=pilot_phi,
-            pooled_start=pooled_start,
-            edge_u=effective_tensor_graph.edge_u,
-            edge_v=effective_tensor_graph.edge_v,
-            edge_w=effective_tensor_graph.weight,
-            major_prior=float(fit_options.major_prior),
-            eps=float(fit_options.eps),
-            tol=float(fit_options.tol),
-            degree_bound=int(effective_graph.degree_bound),
-            sparse_anchors=bool(likelihood_partition_pool_enabled),
-        )
-        lambda_grid = list(lambda_bracket.anchors)
-    simulation_truth: SimulationTruth | None = None
-    if evaluate_all_candidates and simulation_root is not None and (simulation_root / data.tumor_id).exists():
-        simulation_truth = load_simulation_truth(data, simulation_root)
-    result_entries: list[
-        tuple[FitResult, SimulationEvaluation | None, dict[str, float | int | str | bool], SelectionArtifact]
-    ] = []
-    fit_by_lambda: dict[float, FitResult] = {}
-    solver_state_by_lambda: dict[float, SolverState] = {}
-    partition_labels_by_candidate_id: dict[int, np.ndarray] = {}
-    bic_refit_cache: dict[str, PartitionRefitResult] = {}
-    next_step = 0
-    adaptive_max_candidates = (
-        ADAPTIVE_PATH_PARTITION_POOL_MAX_CANDIDATES
-        if adaptive_lambda_mode and likelihood_partition_pool_enabled
-        else ADAPTIVE_PATH_MAX_CANDIDATES
-    )
-    adaptive_max_rounds = (
-        ADAPTIVE_PATH_PARTITION_POOL_MAX_ROUNDS
-        if adaptive_lambda_mode and likelihood_partition_pool_enabled
-        else ADAPTIVE_PATH_MAX_ROUNDS
-    )
-    adaptive_refine_per_round = (
-        ADAPTIVE_PATH_PARTITION_POOL_REFINE_PER_ROUND
-        if adaptive_lambda_mode and likelihood_partition_pool_enabled
-        else ADAPTIVE_PATH_REFINE_PER_ROUND
-    )
-    adaptive_transition_probe_max_candidates = (
-        ADAPTIVE_PATH_PARTITION_POOL_TRANSITION_PROBE_MAX_CANDIDATES
-        if adaptive_lambda_mode and likelihood_partition_pool_enabled
-        else ADAPTIVE_PATH_TRANSITION_PROBE_MAX_CANDIDATES
-    )
-    adaptive_initial_anchor_count = int(len(lambda_grid))
-
-    def _nearest_phi_start(target_lambda: float) -> StartArray:
-        if not fit_by_lambda:
-            return _clone_start(pilot_phi)
-        nearest_lambda = min(
-            fit_by_lambda,
-            key=lambda value: _lambda_warm_start_distance(
-                source_lambda=float(value),
-                target_lambda=float(target_lambda),
-            ),
-        )
-        return _clone_start(_fit_phi_start(fit_by_lambda[nearest_lambda]))
-
-    def _nearest_solver_state(target_lambda: float) -> SolverState | None:
-        if not solver_state_by_lambda:
-            return None
-        nearest_lambda = min(
-            solver_state_by_lambda,
-            key=lambda value: _lambda_warm_start_distance(
-                source_lambda=float(value),
-                target_lambda=float(target_lambda),
-            ),
-        )
-        return solver_state_by_lambda.get(nearest_lambda)
-
-    def _evaluate_lambda_sequence(
-        lambda_values_to_run: list[float],
-        *,
-        search_round: int,
-        search_phase: str,
-        allow_revisit: bool = False,
-        candidate_fit_options: FitOptions | None = None,
-        ari_only_evaluation: bool = False,
-        start_mode: str = "full",
-        compute_summary: bool = True,
-        phi_start_by_lambda: dict[float, StartArray] | None = None,
-        solver_state_start_by_lambda: dict[float, SolverState] | None = None,
-        scalar_well_starts_by_lambda: dict[float, list[StartArray]] | None = None,
-        lambda_metadata_by_lambda: dict[float, dict[str, float | int | str | bool]] | None = None,
-    ) -> None:
-        nonlocal next_step
-        ordered_lambdas = [
-            value
-            for value in _sorted_unique_lambdas(lambda_values_to_run)
-            if allow_revisit or _canonical_lambda(value) not in fit_by_lambda
-        ]
-        if not ordered_lambdas:
-            return
-
-        previous_phi: StartArray | None = None
-        previous_solver_state: SolverState | None = None
-        for lambda_value in ordered_lambdas:
-            lambda_key = _canonical_lambda(lambda_value)
-            solver_state_start: SolverState | None = None
-            if phi_start_by_lambda is not None and lambda_key in phi_start_by_lambda:
-                phi_start = _clone_start(phi_start_by_lambda[lambda_key])
-                if solver_state_start_by_lambda is not None:
-                    solver_state_start = solver_state_start_by_lambda.get(lambda_key)
-                if solver_state_start is None:
-                    solver_state_start = solver_state_by_lambda.get(lambda_key)
-            elif use_warm_starts:
-                solver_state_start = previous_solver_state if previous_solver_state is not None else _nearest_solver_state(lambda_value)
-                if solver_state_start is not None:
-                    phi_start = _clone_start(solver_state_start.phi)
-                else:
-                    phi_start = _clone_start(previous_phi) if previous_phi is not None else _nearest_phi_start(lambda_value)
-            else:
-                phi_start = _clone_start(pilot_phi)
-            candidate_scalar_well_starts = scalar_well_starts
-            if scalar_well_starts_by_lambda is not None and lambda_key in scalar_well_starts_by_lambda:
-                candidate_scalar_well_starts = scalar_well_starts_by_lambda[lambda_key]
-            fit, evaluation, row, artifact = _evaluate_candidate(
-                data=data,
-                fit_options=search_fit_options,
-                candidate_fit_options=candidate_fit_options,
-                bic_df_scale=bic_df_scale,
-                bic_cluster_penalty=bic_cluster_penalty,
-                simulation_root=simulation_root,
-                simulation_truth=simulation_truth,
-                evaluate_candidate=evaluate_all_candidates,
-                ari_only_evaluation=ari_only_evaluation,
-                phi_start=phi_start,
-                exact_pilot=pilot_phi,
-                pooled_start=pooled_start,
-                scalar_well_starts=candidate_scalar_well_starts,
-                start_mode=start_mode,
-                runtime=runtime,
-                torch_data=torch_data,
-                solver_context=solver_context,
-                solver_state=solver_state_start if use_warm_starts else None,
-                compute_summary=compute_summary,
-                selection_method=selection_method,
-                profile_name=profile_name,
-                selection_step=next_step,
-                lambda_value=lambda_value,
-                selection_score=selection_score,
-                bic_refit_cache=bic_refit_cache,
-                static_metadata=static_metadata,
-            )
-            row["search_round"] = int(search_round)
-            row["search_phase"] = str(search_phase)
-            row["lambda_source"] = str(search_phase)
-            row["lambda_search_mode"] = str(lambda_search_mode)
-            row["selection_prepare_elapsed_seconds"] = float(prepare_elapsed_seconds)
-            row["adaptive_candidate_budget"] = int(adaptive_max_candidates)
-            row["adaptive_max_rounds"] = int(adaptive_max_rounds)
-            row["adaptive_refine_per_round"] = int(adaptive_refine_per_round)
-            row["adaptive_transition_probe_max_candidates"] = int(adaptive_transition_probe_max_candidates)
-            row["adaptive_initial_anchor_count"] = int(adaptive_initial_anchor_count)
-            row["likelihood_partition_pool_enabled"] = bool(likelihood_partition_pool_enabled)
-            row["lambda_bracket_min"] = np.nan if lambda_bracket is None else float(lambda_bracket.lambda_min)
-            row["lambda_bracket_eq"] = np.nan if lambda_bracket is None else float(lambda_bracket.lambda_eq)
-            row["lambda_bracket_full"] = np.nan if lambda_bracket is None else float(lambda_bracket.lambda_full)
-            if lambda_bracket is None:
-                row["lambda_full_residual"] = np.nan
-            else:
-                for diagnostic_name, diagnostic_value in lambda_bracket.diagnostics.items():
-                    if np.isscalar(diagnostic_value):
-                        row[str(diagnostic_name)] = float(diagnostic_value)
-            if lambda_metadata_by_lambda is not None and lambda_key in lambda_metadata_by_lambda:
-                row.update(lambda_metadata_by_lambda[lambda_key])
-            candidate_id = int(len(result_entries))
-            row["_candidate_id"] = candidate_id
-            result_entries.append((fit, evaluation, row, artifact))
-            if artifact.bic_partition_labels is not None:
-                partition_labels_by_candidate_id[candidate_id] = np.asarray(
-                    artifact.bic_partition_labels,
-                    dtype=np.int64,
-                ).copy()
-            incumbent = fit_by_lambda.get(lambda_key)
-            if _prefer_fit_candidate(fit, incumbent):
-                fit_by_lambda[lambda_key] = fit
-                if fit.solver_state is not None:
-                    solver_state_by_lambda[lambda_key] = fit.solver_state
-            next_step += 1
-            if use_warm_starts:
-                previous_phi = _clone_start(_fit_phi_start(fit))
-                previous_solver_state = fit.solver_state
-
-    _evaluate_lambda_sequence(
-        lambda_grid,
-        search_round=0,
-        search_phase="base",
-        ari_only_evaluation=False,
-        start_mode="warm_only" if adaptive_lambda_mode and use_warm_starts else "full",
-        compute_summary=True,
-    )
-
-    if adaptive_lambda_mode and lambda_bracket is not None:
-        remaining_transition_budget = max(
-            int(adaptive_max_candidates) - len(fit_by_lambda),
-            0,
-        )
-        transition_probe_records = _adaptive_transition_probe_records(
-            lambda_bracket,
-            list(fit_by_lambda.keys()),
-            max_new=min(
-                int(adaptive_transition_probe_max_candidates),
-                remaining_transition_budget,
-            ),
-        )
-        if transition_probe_records:
-            transition_phi_by_lambda: dict[float, StartArray] = {}
-            transition_state_by_lambda: dict[float, SolverState] = {}
-            transition_starts_by_lambda: dict[float, list[StartArray]] = {}
-            transition_metadata_by_lambda: dict[float, dict[str, float | int | str | bool]] = {}
-            for proposal in transition_probe_records:
-                lambda_key = _canonical_lambda(proposal.lambda_value)
-                left_fit = fit_by_lambda.get(_canonical_lambda(proposal.left_lambda))
-                right_fit = fit_by_lambda.get(_canonical_lambda(proposal.right_lambda))
-                transition_starts = [_clone_start(pilot_phi)]
-                if right_fit is not None:
-                    transition_starts.insert(0, _clone_start(_fit_phi_start(right_fit)))
-                if left_fit is not None:
-                    transition_phi_by_lambda[lambda_key] = _clone_start(_fit_phi_start(left_fit))
-                    if left_fit.solver_state is not None:
-                        transition_state_by_lambda[lambda_key] = left_fit.solver_state
-                    transition_starts.insert(0, _clone_start(_fit_phi_start(left_fit)))
-                elif right_fit is not None:
-                    transition_phi_by_lambda[lambda_key] = _clone_start(_fit_phi_start(right_fit))
-                    if right_fit.solver_state is not None:
-                        transition_state_by_lambda[lambda_key] = right_fit.solver_state
-                transition_starts_by_lambda[lambda_key] = transition_starts
-                transition_metadata_by_lambda[lambda_key] = {
-                    "adaptive_interval_left_lambda": float(proposal.left_lambda),
-                    "adaptive_interval_right_lambda": float(proposal.right_lambda),
-                    "adaptive_interval_log10_width": float(proposal.log_width),
-                    "adaptive_interval_priority_class": int(proposal.priority_key[0]),
-                    "adaptive_interval_reason": str(proposal.reason),
-                    "adaptive_interval_partition_changed": bool(proposal.partition_changed),
-                    "adaptive_interval_nonagglomerative_or_numerically_inconsistent": bool(
-                        proposal.nonagglomerative_or_numerically_inconsistent
-                    ),
-                    "adaptive_transition_probe": True,
-                }
-            _evaluate_lambda_sequence(
-                [float(proposal.lambda_value) for proposal in transition_probe_records],
-                search_round=0,
-                search_phase="adaptive_transition_probe",
-                candidate_fit_options=_adaptive_first_pass_options(effective_fit_options),
-                ari_only_evaluation=False,
-                start_mode="full",
-                compute_summary=True,
-                phi_start_by_lambda=transition_phi_by_lambda,
-                solver_state_start_by_lambda=transition_state_by_lambda,
-                scalar_well_starts_by_lambda=transition_starts_by_lambda,
-                lambda_metadata_by_lambda=transition_metadata_by_lambda,
-            )
-
-    adaptive_search_rounds_completed = 0
-    adaptive_search_stop_reason = "not_applicable"
-    adaptive_refinement_rounds_completed = 0
-    if adaptive_lambda_mode:
-        for adaptive_round in range(1, adaptive_max_rounds + 1):
-            if len(fit_by_lambda) >= adaptive_max_candidates:
-                adaptive_search_stop_reason = "adaptive_candidate_budget_reached"
-                break
-            interim_df = pd.DataFrame([row for _, _, row, _ in result_entries])
-            proposal_records = _adaptive_interval_proposal_records(
-                interim_df,
-                normalized_score=normalized_score,
-                tol=float(effective_fit_options.tol),
-                max_new=min(
-                    adaptive_refine_per_round,
-                    max(adaptive_max_candidates - len(fit_by_lambda), 0),
-                ),
-                partition_labels_by_candidate_id=partition_labels_by_candidate_id,
-            )
-            proposal_records = [
-                proposal
-                for proposal in proposal_records
-                if _canonical_lambda(proposal.lambda_value) not in fit_by_lambda
-            ]
-            proposals = [float(proposal.lambda_value) for proposal in proposal_records]
-            if not proposals:
-                adaptive_search_stop_reason = "adaptive_path_resolved"
-                break
-            fit_by_candidate_id = {
-                int(row["_candidate_id"]): fit
-                for fit, _, row, _ in result_entries
-                if "_candidate_id" in row
-            }
-            proposal_phi_by_lambda: dict[float, StartArray] = {}
-            proposal_state_by_lambda: dict[float, SolverState] = {}
-            proposal_scalar_starts_by_lambda: dict[float, list[StartArray]] = {}
-            proposal_metadata_by_lambda: dict[float, dict[str, float | int | str | bool]] = {}
-            for proposal in proposal_records:
-                lambda_key = _canonical_lambda(proposal.lambda_value)
-                left_fit = (
-                    fit_by_candidate_id.get(int(proposal.left_candidate_id))
-                    if proposal.left_candidate_id is not None
-                    else None
-                )
-                right_fit = (
-                    fit_by_candidate_id.get(int(proposal.right_candidate_id))
-                    if proposal.right_candidate_id is not None
-                    else None
-                )
-                if left_fit is not None:
-                    proposal_phi_by_lambda[lambda_key] = _clone_start(_fit_phi_start(left_fit))
-                    if left_fit.solver_state is not None:
-                        proposal_state_by_lambda[lambda_key] = left_fit.solver_state
-                elif right_fit is not None:
-                    proposal_phi_by_lambda[lambda_key] = _clone_start(_fit_phi_start(right_fit))
-                    if right_fit.solver_state is not None:
-                        proposal_state_by_lambda[lambda_key] = right_fit.solver_state
-                proposal_starts = [_clone_start(start) for start in scalar_well_starts]
-                if right_fit is not None:
-                    proposal_starts.insert(0, _clone_start(_fit_phi_start(right_fit)))
-                proposal_scalar_starts_by_lambda[lambda_key] = proposal_starts
-                proposal_metadata_by_lambda[lambda_key] = {
-                    "adaptive_interval_left_lambda": float(proposal.left_lambda),
-                    "adaptive_interval_right_lambda": float(proposal.right_lambda),
-                    "adaptive_interval_log10_width": float(proposal.log_width),
-                    "adaptive_interval_priority_class": int(proposal.priority_key[0]),
-                    "adaptive_interval_reason": str(proposal.reason),
-                    "adaptive_interval_partition_changed": bool(proposal.partition_changed),
-                    "adaptive_interval_nonagglomerative_or_numerically_inconsistent": bool(
-                        proposal.nonagglomerative_or_numerically_inconsistent
-                    ),
-                }
-            before = len(fit_by_lambda)
-            _evaluate_lambda_sequence(
-                proposals,
-                search_round=adaptive_round,
-                search_phase=f"adaptive_refine_{adaptive_round}",
-                start_mode="full",
-                compute_summary=True,
-                phi_start_by_lambda=proposal_phi_by_lambda,
-                solver_state_start_by_lambda=proposal_state_by_lambda,
-                scalar_well_starts_by_lambda=proposal_scalar_starts_by_lambda,
-                lambda_metadata_by_lambda=proposal_metadata_by_lambda,
-            )
-            if len(fit_by_lambda) == before:
-                adaptive_search_stop_reason = "adaptive_no_new_lambdas"
-                break
-            adaptive_refinement_rounds_completed = adaptive_round
-        else:
-            adaptive_search_stop_reason = "adaptive_max_rounds_reached"
-    adaptive_search_rounds_completed = int(adaptive_refinement_rounds_completed)
-    search_df = (
-        pd.DataFrame([row for _, _, row, _ in result_entries])
-        .sort_values(["lambda", "selection_step"])
-        .reset_index(drop=True)
-    )
-    partition_generation_elapsed_seconds = 0.0
-    partition_curvature_elapsed_seconds = 0.0
-    partition_ward_elapsed_seconds = 0.0
-    partition_refine_ward_elapsed_seconds = 0.0
-    partition_initial_generation_elapsed_seconds = 0.0
-    partition_refine_generation_elapsed_seconds = 0.0
-    partition_candidate_count = 0
-    if likelihood_partition_pool_enabled:
-        partition_generation_start_time = perf_counter()
-        partition_k_grid = _likelihood_partition_k_grid(int(data.num_mutations))
-        partition_curvature_start_time = perf_counter()
-        partition_curvature = observed_curvature_at_pilot_torch(
-            data,
-            pilot_phi,
-            major_prior=float(effective_fit_options.major_prior),
-            eps=float(effective_fit_options.eps),
-            torch_data=torch_data,
-            device=runtime.device,
-            dtype=runtime.dtype,
-        )
-        partition_curvature_elapsed_seconds = float(perf_counter() - partition_curvature_start_time)
-        partition_ward_start_time = perf_counter()
-        partition_label_sets = hessian_weighted_ward_label_sets_torch(
-            pilot_phi,
-            partition_curvature,
-            K_grid=partition_k_grid,
-            device=runtime.device,
-            dtype=runtime.dtype,
-        )
-        partition_ward_elapsed_seconds = float(perf_counter() - partition_ward_start_time)
-        partition_initial_start_time = perf_counter()
-        partition_candidates = generate_likelihood_partition_starts(
-            data,
-            exact_pilot=pilot_phi,
-            major_prior=float(effective_fit_options.major_prior),
-            eps=float(effective_fit_options.eps),
-            K_grid=partition_k_grid,
-            max_candidates_per_K=int(LIKELIHOOD_PARTITION_MAX_CANDIDATES_PER_K),
-            cem_max_iter=int(LIKELIHOOD_PARTITION_CEM_MAX_ITER),
-            refit_max_iter=int(LIKELIHOOD_PARTITION_REFIT_MAX_ITER),
-            tol=float(effective_fit_options.tol),
-            curvature=partition_curvature,
-            label_sets=partition_label_sets,
-            torch_data=torch_data,
-            device=runtime.device,
-            dtype=runtime.dtype,
-            use_torch=True,
-        )
-        partition_initial_generation_elapsed_seconds = float(perf_counter() - partition_initial_start_time)
-        partition_refine_k_grid, partition_refinement_reason = _likelihood_partition_refinement_k_grid(
-            partition_candidates,
-            partition_k_grid,
-            num_mutations=int(data.num_mutations),
-        )
-        if partition_refine_k_grid:
-            partition_refine_ward_start_time = perf_counter()
-            partition_refine_label_sets = hessian_weighted_ward_label_sets_torch(
-                pilot_phi,
-                partition_curvature,
-                K_grid=partition_refine_k_grid,
-                device=runtime.device,
-                dtype=runtime.dtype,
-            )
-            partition_refine_ward_elapsed_seconds = float(perf_counter() - partition_refine_ward_start_time)
-            partition_refine_start_time = perf_counter()
-            partition_refine_candidates = generate_likelihood_partition_starts(
-                data,
-                exact_pilot=pilot_phi,
-                major_prior=float(effective_fit_options.major_prior),
-                eps=float(effective_fit_options.eps),
-                K_grid=partition_refine_k_grid,
-                max_candidates_per_K=int(LIKELIHOOD_PARTITION_MAX_CANDIDATES_PER_K),
-                cem_max_iter=int(LIKELIHOOD_PARTITION_CEM_MAX_ITER),
-                refit_max_iter=int(LIKELIHOOD_PARTITION_REFIT_MAX_ITER),
-                tol=float(effective_fit_options.tol),
-                curvature=partition_curvature,
-                label_sets=partition_refine_label_sets,
-                torch_data=torch_data,
-                device=runtime.device,
-                dtype=runtime.dtype,
-                use_torch=True,
-            )
-            partition_refine_generation_elapsed_seconds = float(perf_counter() - partition_refine_start_time)
-            partition_candidates = _deduplicate_partition_candidates(
-                partition_candidates + partition_refine_candidates
-            )
-        partition_combined_k_grid = sorted(set(partition_k_grid) | set(partition_refine_k_grid))
-        partition_refine_k_set = set(partition_refine_k_grid)
-        partition_generation_elapsed_seconds = float(perf_counter() - partition_generation_start_time)
-        partition_candidate_count = int(len(partition_candidates))
-        for partition_rank, partition_candidate in enumerate(partition_candidates, start=1):
-            fit, evaluation, row, artifact = _evaluate_partition_candidate(
-                data=data,
-                fit_options=effective_fit_options,
-                candidate=partition_candidate,
-                candidate_rank=partition_rank,
-                bic_df_scale=bic_df_scale,
-                bic_cluster_penalty=bic_cluster_penalty,
-                simulation_truth=simulation_truth,
-                evaluate_candidate=evaluate_all_candidates,
-                ari_only_evaluation=False,
-                selection_method=selection_method,
-                profile_name=profile_name,
-                selection_step=next_step,
-                selection_score=selection_score,
-                static_metadata=static_metadata,
-            )
-            row["search_round"] = -1
-            row["search_phase"] = "likelihood_partition"
-            row["lambda_source"] = "likelihood_partition"
-            row["lambda_search_mode"] = str(lambda_search_mode)
-            row["selection_prepare_elapsed_seconds"] = float(prepare_elapsed_seconds)
-            row["adaptive_candidate_budget"] = int(adaptive_max_candidates)
-            row["adaptive_max_rounds"] = int(adaptive_max_rounds)
-            row["adaptive_refine_per_round"] = int(adaptive_refine_per_round)
-            row["adaptive_transition_probe_max_candidates"] = int(adaptive_transition_probe_max_candidates)
-            row["adaptive_initial_anchor_count"] = int(adaptive_initial_anchor_count)
-            row["likelihood_partition_pool_enabled"] = bool(likelihood_partition_pool_enabled)
-            row["partition_generation_elapsed_seconds"] = float(partition_generation_elapsed_seconds)
-            row["partition_curvature_elapsed_seconds"] = float(partition_curvature_elapsed_seconds)
-            row["partition_ward_elapsed_seconds"] = float(partition_ward_elapsed_seconds)
-            row["partition_refine_ward_elapsed_seconds"] = float(partition_refine_ward_elapsed_seconds)
-            row["partition_initial_generation_elapsed_seconds"] = float(
-                partition_initial_generation_elapsed_seconds
-            )
-            row["partition_refine_generation_elapsed_seconds"] = float(
-                partition_refine_generation_elapsed_seconds
-            )
-            row["partition_candidate_count"] = int(partition_candidate_count)
-            requested_k = _partition_candidate_requested_k(partition_candidate)
-            row["partition_candidate_generation_pass"] = (
-                "local_refine" if int(requested_k) in partition_refine_k_set else "sparse_anchor"
-            )
-            row["partition_candidate_refinement_reason"] = str(partition_refinement_reason)
-            row["partition_candidate_k_grid_size"] = int(len(partition_combined_k_grid))
-            row["partition_candidate_sparse_k_grid"] = ",".join(str(int(k)) for k in partition_k_grid)
-            row["partition_candidate_refine_k_grid"] = ",".join(str(int(k)) for k in partition_refine_k_grid)
-            row["partition_candidate_k_grid"] = ",".join(str(int(k)) for k in partition_combined_k_grid)
-            row["lambda_bracket_min"] = np.nan if lambda_bracket is None else float(lambda_bracket.lambda_min)
-            row["lambda_bracket_eq"] = np.nan if lambda_bracket is None else float(lambda_bracket.lambda_eq)
-            row["lambda_bracket_full"] = np.nan if lambda_bracket is None else float(lambda_bracket.lambda_full)
-            if lambda_bracket is None:
-                row["lambda_full_residual"] = np.nan
-            else:
-                for diagnostic_name, diagnostic_value in lambda_bracket.diagnostics.items():
-                    if np.isscalar(diagnostic_value):
-                        row[str(diagnostic_name)] = float(diagnostic_value)
-            candidate_id = int(len(result_entries))
-            row["_candidate_id"] = candidate_id
-            result_entries.append((fit, evaluation, row, artifact))
-            if artifact.bic_partition_labels is not None:
-                partition_labels_by_candidate_id[candidate_id] = np.asarray(
-                    artifact.bic_partition_labels,
-                    dtype=np.int64,
-                ).copy()
-            next_step += 1
-        search_df = (
-            pd.DataFrame([row for _, _, row, _ in result_entries])
-            .sort_values(["lambda", "selection_step"])
-            .reset_index(drop=True)
-        )
     search_df = _annotate_bic_diagnostics(search_df)
     num_candidates = int(search_df.shape[0])
     converged_mask = search_df["converged"].astype(bool).to_numpy(dtype=bool)
@@ -1070,6 +527,578 @@ def _grid_search_selection(
         selection_optimizer_limited=selection_optimizer_limited,
         selection_optimizer_limited_reason=selection_optimizer_limited_reason,
         simulation=simulation_diagnostics,
+    )
+
+
+def _grid_search_selection(
+    *,
+    data: TumorData,
+    simulation_root: Path | None,
+    lambda_grid: list[float] | None,
+    lambda_grid_mode: str,
+    fit_options: FitOptions,
+    bic_df_scale: float,
+    bic_cluster_penalty: float,
+    use_warm_starts: bool,
+    evaluate_all_candidates: bool,
+    profile_name: str,
+    selection_method: str,
+    selection_score: str,
+    finalize_selected_fit: bool,
+) -> BICSelectionResult:
+    selection_start_time = perf_counter()
+    explicit_lambda_grid = lambda_grid is not None
+    normalized_lambda_grid_mode = str(lambda_grid_mode).strip().lower()
+    if normalized_lambda_grid_mode not in LAMBDA_GRID_MODES:
+        raise ValueError(f"Unknown lambda_grid_mode: {lambda_grid_mode}")
+    adaptive_lambda_mode = bool(lambda_grid is None and is_adaptive_lambda_grid_mode(normalized_lambda_grid_mode))
+    normalized_score = _normalize_selection_score_name(selection_score)
+    lambda_search_mode = "explicit_grid" if explicit_lambda_grid else normalized_lambda_grid_mode
+    lambda_bracket: LambdaBracket | None = None
+    if lambda_grid is None and not adaptive_lambda_mode:
+        raise ValueError("Default model selection uses lambda_grid_mode='adaptive_bic'.")
+    lambda_grid = [] if lambda_grid is None else _sorted_unique_lambdas(lambda_grid)
+    likelihood_partition_pool_enabled = bool(ENABLE_LIKELIHOOD_PARTITION_CANDIDATES)
+
+    prepare_start_time = perf_counter()
+    solver_context = prepare_torch_problem(
+        data,
+        major_prior=float(fit_options.major_prior),
+        eps=float(fit_options.eps),
+        tol=float(fit_options.tol),
+        graph=fit_options.graph,
+        inner_max_iter=max(int(fit_options.inner_max_iter), 16),
+        adaptive_weight_gamma=float(fit_options.adaptive_weight_gamma),
+        adaptive_weight_floor=float(fit_options.adaptive_weight_floor),
+        adaptive_weight_baseline=float(fit_options.adaptive_weight_baseline),
+        device=fit_options.device,
+        dtype=fit_options.dtype,
+    )
+    prepare_elapsed_seconds = float(perf_counter() - prepare_start_time)
+    runtime = solver_context.runtime
+    torch_data = torch_data_from_context(solver_context)
+    pilot_phi: StartArray = solver_context.exact_pilot
+    pooled_start: StartArray = solver_context.pooled_start
+    scalar_well_starts: list[StartArray] = list(solver_context.scalar_well_starts)
+    effective_graph = solver_context.graph_spec
+    effective_tensor_graph = solver_context.graph
+    effective_fit_options = replace(fit_options, graph=effective_graph)
+    static_metadata = _candidate_static_metadata(data, effective_graph, pilot_phi=pilot_phi)
+    search_fit_options = (
+        _adaptive_first_pass_options(effective_fit_options)
+        if adaptive_lambda_mode
+        else effective_fit_options
+    )
+    if adaptive_lambda_mode:
+        lambda_bracket = _initial_adaptive_lambda_bracket(
+            torch_data=torch_data,
+            runtime=runtime,
+            exact_pilot=pilot_phi,
+            pooled_start=pooled_start,
+            edge_u=effective_tensor_graph.edge_u,
+            edge_v=effective_tensor_graph.edge_v,
+            edge_w=effective_tensor_graph.weight,
+            major_prior=float(fit_options.major_prior),
+            eps=float(fit_options.eps),
+            tol=float(fit_options.tol),
+            degree_bound=int(effective_graph.degree_bound),
+            sparse_anchors=bool(likelihood_partition_pool_enabled),
+        )
+        lambda_grid = list(lambda_bracket.anchors)
+    simulation_truth: SimulationTruth | None = None
+    if evaluate_all_candidates and simulation_root is not None and (simulation_root / data.tumor_id).exists():
+        simulation_truth = load_simulation_truth(data, simulation_root)
+    result_entries: list[
+        tuple[FitResult, SimulationEvaluation | None, dict[str, float | int | str | bool], SelectionArtifact]
+    ] = []
+    fit_by_lambda: dict[float, FitResult] = {}
+    solver_state_by_lambda: dict[float, SolverState] = {}
+    partition_labels_by_candidate_id: dict[int, np.ndarray] = {}
+    bic_refit_cache: dict[str, PartitionRefitResult] = {}
+    next_step = 0
+    (
+        adaptive_max_candidates,
+        adaptive_max_rounds,
+        adaptive_refine_per_round,
+        adaptive_transition_probe_max_candidates,
+    ) = _resolve_adaptive_path_config(adaptive_lambda_mode and likelihood_partition_pool_enabled)
+    adaptive_initial_anchor_count = int(len(lambda_grid))
+
+    def _nearest_phi_start(target_lambda: float) -> StartArray:
+        if not fit_by_lambda:
+            return _clone_start(pilot_phi)
+        nearest_lambda = min(
+            fit_by_lambda,
+            key=lambda value: _lambda_warm_start_distance(
+                source_lambda=float(value),
+                target_lambda=float(target_lambda),
+            ),
+        )
+        return _clone_start(_fit_phi_start(fit_by_lambda[nearest_lambda]))
+
+    def _nearest_solver_state(target_lambda: float) -> SolverState | None:
+        if not solver_state_by_lambda:
+            return None
+        nearest_lambda = min(
+            solver_state_by_lambda,
+            key=lambda value: _lambda_warm_start_distance(
+                source_lambda=float(value),
+                target_lambda=float(target_lambda),
+            ),
+        )
+        return solver_state_by_lambda.get(nearest_lambda)
+
+    def _evaluate_lambda_sequence(
+        lambda_values_to_run: list[float],
+        *,
+        search_round: int,
+        search_phase: str,
+        allow_revisit: bool = False,
+        candidate_fit_options: FitOptions | None = None,
+        start_mode: str = "full",
+        compute_summary: bool = True,
+        phi_start_by_lambda: dict[float, StartArray] | None = None,
+        solver_state_start_by_lambda: dict[float, SolverState] | None = None,
+        scalar_well_starts_by_lambda: dict[float, list[StartArray]] | None = None,
+        lambda_metadata_by_lambda: dict[float, dict[str, float | int | str | bool]] | None = None,
+    ) -> None:
+        nonlocal next_step
+        ordered_lambdas = [
+            value
+            for value in _sorted_unique_lambdas(lambda_values_to_run)
+            if allow_revisit or _canonical_lambda(value) not in fit_by_lambda
+        ]
+        if not ordered_lambdas:
+            return
+
+        previous_phi: StartArray | None = None
+        previous_solver_state: SolverState | None = None
+        for lambda_value in ordered_lambdas:
+            lambda_key = _canonical_lambda(lambda_value)
+            solver_state_start: SolverState | None = None
+            if phi_start_by_lambda is not None and lambda_key in phi_start_by_lambda:
+                phi_start = _clone_start(phi_start_by_lambda[lambda_key])
+                if solver_state_start_by_lambda is not None:
+                    solver_state_start = solver_state_start_by_lambda.get(lambda_key)
+                if solver_state_start is None:
+                    solver_state_start = solver_state_by_lambda.get(lambda_key)
+            elif use_warm_starts:
+                solver_state_start = previous_solver_state if previous_solver_state is not None else _nearest_solver_state(lambda_value)
+                if solver_state_start is not None:
+                    phi_start = _clone_start(solver_state_start.phi)
+                else:
+                    phi_start = _clone_start(previous_phi) if previous_phi is not None else _nearest_phi_start(lambda_value)
+            else:
+                phi_start = _clone_start(pilot_phi)
+            candidate_scalar_well_starts = scalar_well_starts
+            if scalar_well_starts_by_lambda is not None and lambda_key in scalar_well_starts_by_lambda:
+                candidate_scalar_well_starts = scalar_well_starts_by_lambda[lambda_key]
+            fit, evaluation, row, artifact = _evaluate_candidate(
+                data=data,
+                fit_options=search_fit_options,
+                candidate_fit_options=candidate_fit_options,
+                bic_df_scale=bic_df_scale,
+                bic_cluster_penalty=bic_cluster_penalty,
+                simulation_root=simulation_root,
+                simulation_truth=simulation_truth,
+                evaluate_candidate=evaluate_all_candidates,
+                phi_start=phi_start,
+                exact_pilot=pilot_phi,
+                pooled_start=pooled_start,
+                scalar_well_starts=candidate_scalar_well_starts,
+                start_mode=start_mode,
+                runtime=runtime,
+                torch_data=torch_data,
+                solver_context=solver_context,
+                solver_state=solver_state_start if use_warm_starts else None,
+                compute_summary=compute_summary,
+                selection_method=selection_method,
+                profile_name=profile_name,
+                selection_step=next_step,
+                lambda_value=lambda_value,
+                selection_score=selection_score,
+                bic_refit_cache=bic_refit_cache,
+                static_metadata=static_metadata,
+            )
+            row["search_round"] = int(search_round)
+            row["search_phase"] = str(search_phase)
+            row["lambda_source"] = str(search_phase)
+            row["lambda_search_mode"] = str(lambda_search_mode)
+            row["selection_prepare_elapsed_seconds"] = float(prepare_elapsed_seconds)
+            row["adaptive_candidate_budget"] = int(adaptive_max_candidates)
+            row["adaptive_max_rounds"] = int(adaptive_max_rounds)
+            row["adaptive_refine_per_round"] = int(adaptive_refine_per_round)
+            row["adaptive_transition_probe_max_candidates"] = int(adaptive_transition_probe_max_candidates)
+            row["adaptive_initial_anchor_count"] = int(adaptive_initial_anchor_count)
+            row["likelihood_partition_pool_enabled"] = bool(likelihood_partition_pool_enabled)
+            row["lambda_bracket_min"] = np.nan if lambda_bracket is None else float(lambda_bracket.lambda_min)
+            row["lambda_bracket_eq"] = np.nan if lambda_bracket is None else float(lambda_bracket.lambda_eq)
+            row["lambda_bracket_full"] = np.nan if lambda_bracket is None else float(lambda_bracket.lambda_full)
+            if lambda_bracket is None:
+                row["lambda_full_residual"] = np.nan
+            else:
+                for diagnostic_name, diagnostic_value in lambda_bracket.diagnostics.items():
+                    if np.isscalar(diagnostic_value):
+                        row[str(diagnostic_name)] = float(diagnostic_value)
+            if lambda_metadata_by_lambda is not None and lambda_key in lambda_metadata_by_lambda:
+                row.update(lambda_metadata_by_lambda[lambda_key])
+            candidate_id = int(len(result_entries))
+            row["_candidate_id"] = candidate_id
+            result_entries.append((fit, evaluation, row, artifact))
+            if artifact.bic_partition_labels is not None:
+                partition_labels_by_candidate_id[candidate_id] = np.asarray(
+                    artifact.bic_partition_labels,
+                    dtype=np.int64,
+                ).copy()
+            incumbent = fit_by_lambda.get(lambda_key)
+            if _prefer_fit_candidate(fit, incumbent):
+                fit_by_lambda[lambda_key] = fit
+                if fit.solver_state is not None:
+                    solver_state_by_lambda[lambda_key] = fit.solver_state
+            next_step += 1
+            if use_warm_starts:
+                previous_phi = _clone_start(_fit_phi_start(fit))
+                previous_solver_state = fit.solver_state
+
+    _evaluate_lambda_sequence(
+        lambda_grid,
+        search_round=0,
+        search_phase="base",
+        start_mode="warm_only" if adaptive_lambda_mode and use_warm_starts else "full",
+        compute_summary=True,
+    )
+
+    if adaptive_lambda_mode and lambda_bracket is not None:
+        remaining_transition_budget = max(
+            int(adaptive_max_candidates) - len(fit_by_lambda),
+            0,
+        )
+        transition_probe_records = _adaptive_transition_probe_records(
+            lambda_bracket,
+            list(fit_by_lambda.keys()),
+            max_new=min(
+                int(adaptive_transition_probe_max_candidates),
+                remaining_transition_budget,
+            ),
+        )
+        if transition_probe_records:
+            transition_phi_by_lambda: dict[float, StartArray] = {}
+            transition_state_by_lambda: dict[float, SolverState] = {}
+            transition_starts_by_lambda: dict[float, list[StartArray]] = {}
+            transition_metadata_by_lambda: dict[float, dict[str, float | int | str | bool]] = {}
+            for proposal in transition_probe_records:
+                lambda_key = _canonical_lambda(proposal.lambda_value)
+                left_fit = fit_by_lambda.get(_canonical_lambda(proposal.left_lambda))
+                right_fit = fit_by_lambda.get(_canonical_lambda(proposal.right_lambda))
+                transition_starts = [_clone_start(pilot_phi)]
+                if right_fit is not None:
+                    transition_starts.insert(0, _clone_start(_fit_phi_start(right_fit)))
+                if left_fit is not None:
+                    transition_phi_by_lambda[lambda_key] = _clone_start(_fit_phi_start(left_fit))
+                    if left_fit.solver_state is not None:
+                        transition_state_by_lambda[lambda_key] = left_fit.solver_state
+                    transition_starts.insert(0, _clone_start(_fit_phi_start(left_fit)))
+                elif right_fit is not None:
+                    transition_phi_by_lambda[lambda_key] = _clone_start(_fit_phi_start(right_fit))
+                    if right_fit.solver_state is not None:
+                        transition_state_by_lambda[lambda_key] = right_fit.solver_state
+                transition_starts_by_lambda[lambda_key] = transition_starts
+                transition_metadata_by_lambda[lambda_key] = {
+                    "adaptive_interval_left_lambda": float(proposal.left_lambda),
+                    "adaptive_interval_right_lambda": float(proposal.right_lambda),
+                    "adaptive_interval_log10_width": float(proposal.log_width),
+                    "adaptive_interval_priority_class": int(proposal.priority_key[0]),
+                    "adaptive_interval_reason": str(proposal.reason),
+                    "adaptive_interval_partition_changed": bool(proposal.partition_changed),
+                    "adaptive_interval_nonagglomerative_or_numerically_inconsistent": bool(
+                        proposal.nonagglomerative_or_numerically_inconsistent
+                    ),
+                    "adaptive_transition_probe": True,
+                }
+            _evaluate_lambda_sequence(
+                [float(proposal.lambda_value) for proposal in transition_probe_records],
+                search_round=0,
+                search_phase="adaptive_transition_probe",
+                candidate_fit_options=_adaptive_first_pass_options(effective_fit_options),
+                start_mode="full",
+                compute_summary=True,
+                phi_start_by_lambda=transition_phi_by_lambda,
+                solver_state_start_by_lambda=transition_state_by_lambda,
+                scalar_well_starts_by_lambda=transition_starts_by_lambda,
+                lambda_metadata_by_lambda=transition_metadata_by_lambda,
+            )
+
+    adaptive_search_rounds_completed = 0
+    adaptive_search_stop_reason = "not_applicable"
+    adaptive_refinement_rounds_completed = 0
+    if adaptive_lambda_mode:
+        for adaptive_round in range(1, adaptive_max_rounds + 1):
+            if len(fit_by_lambda) >= adaptive_max_candidates:
+                adaptive_search_stop_reason = "adaptive_candidate_budget_reached"
+                break
+            interim_df = pd.DataFrame([row for _, _, row, _ in result_entries])
+            proposal_records = _adaptive_interval_proposal_records(
+                interim_df,
+                normalized_score=normalized_score,
+                tol=float(effective_fit_options.tol),
+                max_new=min(
+                    adaptive_refine_per_round,
+                    max(adaptive_max_candidates - len(fit_by_lambda), 0),
+                ),
+                partition_labels_by_candidate_id=partition_labels_by_candidate_id,
+            )
+            proposal_records = [
+                proposal
+                for proposal in proposal_records
+                if _canonical_lambda(proposal.lambda_value) not in fit_by_lambda
+            ]
+            proposals = [float(proposal.lambda_value) for proposal in proposal_records]
+            if not proposals:
+                adaptive_search_stop_reason = "adaptive_path_resolved"
+                break
+            fit_by_candidate_id = {
+                int(row["_candidate_id"]): fit
+                for fit, _, row, _ in result_entries
+                if "_candidate_id" in row
+            }
+            proposal_phi_by_lambda: dict[float, StartArray] = {}
+            proposal_state_by_lambda: dict[float, SolverState] = {}
+            proposal_scalar_starts_by_lambda: dict[float, list[StartArray]] = {}
+            proposal_metadata_by_lambda: dict[float, dict[str, float | int | str | bool]] = {}
+            for proposal in proposal_records:
+                lambda_key = _canonical_lambda(proposal.lambda_value)
+                left_fit = (
+                    fit_by_candidate_id.get(int(proposal.left_candidate_id))
+                    if proposal.left_candidate_id is not None
+                    else None
+                )
+                right_fit = (
+                    fit_by_candidate_id.get(int(proposal.right_candidate_id))
+                    if proposal.right_candidate_id is not None
+                    else None
+                )
+                if left_fit is not None:
+                    proposal_phi_by_lambda[lambda_key] = _clone_start(_fit_phi_start(left_fit))
+                    if left_fit.solver_state is not None:
+                        proposal_state_by_lambda[lambda_key] = left_fit.solver_state
+                elif right_fit is not None:
+                    proposal_phi_by_lambda[lambda_key] = _clone_start(_fit_phi_start(right_fit))
+                    if right_fit.solver_state is not None:
+                        proposal_state_by_lambda[lambda_key] = right_fit.solver_state
+                proposal_starts = [_clone_start(start) for start in scalar_well_starts]
+                if right_fit is not None:
+                    proposal_starts.insert(0, _clone_start(_fit_phi_start(right_fit)))
+                proposal_scalar_starts_by_lambda[lambda_key] = proposal_starts
+                proposal_metadata_by_lambda[lambda_key] = {
+                    "adaptive_interval_left_lambda": float(proposal.left_lambda),
+                    "adaptive_interval_right_lambda": float(proposal.right_lambda),
+                    "adaptive_interval_log10_width": float(proposal.log_width),
+                    "adaptive_interval_priority_class": int(proposal.priority_key[0]),
+                    "adaptive_interval_reason": str(proposal.reason),
+                    "adaptive_interval_partition_changed": bool(proposal.partition_changed),
+                    "adaptive_interval_nonagglomerative_or_numerically_inconsistent": bool(
+                        proposal.nonagglomerative_or_numerically_inconsistent
+                    ),
+                }
+            before = len(fit_by_lambda)
+            _evaluate_lambda_sequence(
+                proposals,
+                search_round=adaptive_round,
+                search_phase=f"adaptive_refine_{adaptive_round}",
+                start_mode="full",
+                compute_summary=True,
+                phi_start_by_lambda=proposal_phi_by_lambda,
+                solver_state_start_by_lambda=proposal_state_by_lambda,
+                scalar_well_starts_by_lambda=proposal_scalar_starts_by_lambda,
+                lambda_metadata_by_lambda=proposal_metadata_by_lambda,
+            )
+            if len(fit_by_lambda) == before:
+                adaptive_search_stop_reason = "adaptive_no_new_lambdas"
+                break
+            adaptive_refinement_rounds_completed = adaptive_round
+        else:
+            adaptive_search_stop_reason = "adaptive_max_rounds_reached"
+    adaptive_search_rounds_completed = int(adaptive_refinement_rounds_completed)
+    search_df = (
+        pd.DataFrame([row for _, _, row, _ in result_entries])
+        .sort_values(["lambda", "selection_step"])
+        .reset_index(drop=True)
+    )
+    partition_generation_elapsed_seconds = 0.0
+    partition_curvature_elapsed_seconds = 0.0
+    partition_ward_elapsed_seconds = 0.0
+    partition_refine_ward_elapsed_seconds = 0.0
+    partition_initial_generation_elapsed_seconds = 0.0
+    partition_refine_generation_elapsed_seconds = 0.0
+    partition_candidate_count = 0
+    if likelihood_partition_pool_enabled:
+        partition_generation_start_time = perf_counter()
+        partition_k_grid = _likelihood_partition_k_grid(int(data.num_mutations))
+        partition_curvature_start_time = perf_counter()
+        partition_curvature = observed_curvature_at_pilot_torch(
+            data,
+            pilot_phi,
+            major_prior=float(effective_fit_options.major_prior),
+            eps=float(effective_fit_options.eps),
+            torch_data=torch_data,
+            device=runtime.device,
+            dtype=runtime.dtype,
+        )
+        partition_curvature_elapsed_seconds = float(perf_counter() - partition_curvature_start_time)
+        partition_ward_start_time = perf_counter()
+        partition_label_sets = hessian_weighted_ward_label_sets_torch(
+            pilot_phi,
+            partition_curvature,
+            K_grid=partition_k_grid,
+            device=runtime.device,
+            dtype=runtime.dtype,
+        )
+        partition_ward_elapsed_seconds = float(perf_counter() - partition_ward_start_time)
+        partition_initial_start_time = perf_counter()
+        partition_candidates = generate_likelihood_partition_starts(
+            data,
+            exact_pilot=pilot_phi,
+            major_prior=float(effective_fit_options.major_prior),
+            eps=float(effective_fit_options.eps),
+            K_grid=partition_k_grid,
+            max_candidates_per_K=int(LIKELIHOOD_PARTITION_MAX_CANDIDATES_PER_K),
+            cem_max_iter=int(LIKELIHOOD_PARTITION_CEM_MAX_ITER),
+            refit_max_iter=int(LIKELIHOOD_PARTITION_REFIT_MAX_ITER),
+            tol=float(effective_fit_options.tol),
+            curvature=partition_curvature,
+            label_sets=partition_label_sets,
+            torch_data=torch_data,
+            device=runtime.device,
+            dtype=runtime.dtype,
+            use_torch=True,
+        )
+        partition_initial_generation_elapsed_seconds = float(perf_counter() - partition_initial_start_time)
+        partition_refine_k_grid, partition_refinement_reason = _likelihood_partition_refinement_k_grid(
+            partition_candidates,
+            partition_k_grid,
+            num_mutations=int(data.num_mutations),
+        )
+        if partition_refine_k_grid:
+            partition_refine_ward_start_time = perf_counter()
+            partition_refine_label_sets = hessian_weighted_ward_label_sets_torch(
+                pilot_phi,
+                partition_curvature,
+                K_grid=partition_refine_k_grid,
+                device=runtime.device,
+                dtype=runtime.dtype,
+            )
+            partition_refine_ward_elapsed_seconds = float(perf_counter() - partition_refine_ward_start_time)
+            partition_refine_start_time = perf_counter()
+            partition_refine_candidates = generate_likelihood_partition_starts(
+                data,
+                exact_pilot=pilot_phi,
+                major_prior=float(effective_fit_options.major_prior),
+                eps=float(effective_fit_options.eps),
+                K_grid=partition_refine_k_grid,
+                max_candidates_per_K=int(LIKELIHOOD_PARTITION_MAX_CANDIDATES_PER_K),
+                cem_max_iter=int(LIKELIHOOD_PARTITION_CEM_MAX_ITER),
+                refit_max_iter=int(LIKELIHOOD_PARTITION_REFIT_MAX_ITER),
+                tol=float(effective_fit_options.tol),
+                curvature=partition_curvature,
+                label_sets=partition_refine_label_sets,
+                torch_data=torch_data,
+                device=runtime.device,
+                dtype=runtime.dtype,
+                use_torch=True,
+            )
+            partition_refine_generation_elapsed_seconds = float(perf_counter() - partition_refine_start_time)
+            partition_candidates = _deduplicate_partition_candidates(
+                partition_candidates + partition_refine_candidates
+            )
+        partition_combined_k_grid = sorted(set(partition_k_grid) | set(partition_refine_k_grid))
+        partition_refine_k_set = set(partition_refine_k_grid)
+        partition_generation_elapsed_seconds = float(perf_counter() - partition_generation_start_time)
+        partition_candidate_count = int(len(partition_candidates))
+        for partition_rank, partition_candidate in enumerate(partition_candidates, start=1):
+            fit, evaluation, row, artifact = _evaluate_partition_candidate(
+                data=data,
+                fit_options=effective_fit_options,
+                candidate=partition_candidate,
+                candidate_rank=partition_rank,
+                bic_df_scale=bic_df_scale,
+                bic_cluster_penalty=bic_cluster_penalty,
+                simulation_truth=simulation_truth,
+                evaluate_candidate=evaluate_all_candidates,
+                selection_method=selection_method,
+                profile_name=profile_name,
+                selection_step=next_step,
+                selection_score=selection_score,
+                static_metadata=static_metadata,
+            )
+            row["search_round"] = -1
+            row["search_phase"] = "likelihood_partition"
+            row["lambda_source"] = "likelihood_partition"
+            row["lambda_search_mode"] = str(lambda_search_mode)
+            row["selection_prepare_elapsed_seconds"] = float(prepare_elapsed_seconds)
+            row["adaptive_candidate_budget"] = int(adaptive_max_candidates)
+            row["adaptive_max_rounds"] = int(adaptive_max_rounds)
+            row["adaptive_refine_per_round"] = int(adaptive_refine_per_round)
+            row["adaptive_transition_probe_max_candidates"] = int(adaptive_transition_probe_max_candidates)
+            row["adaptive_initial_anchor_count"] = int(adaptive_initial_anchor_count)
+            row["likelihood_partition_pool_enabled"] = bool(likelihood_partition_pool_enabled)
+            row["partition_generation_elapsed_seconds"] = float(partition_generation_elapsed_seconds)
+            row["partition_curvature_elapsed_seconds"] = float(partition_curvature_elapsed_seconds)
+            row["partition_ward_elapsed_seconds"] = float(partition_ward_elapsed_seconds)
+            row["partition_refine_ward_elapsed_seconds"] = float(partition_refine_ward_elapsed_seconds)
+            row["partition_initial_generation_elapsed_seconds"] = float(
+                partition_initial_generation_elapsed_seconds
+            )
+            row["partition_refine_generation_elapsed_seconds"] = float(
+                partition_refine_generation_elapsed_seconds
+            )
+            row["partition_candidate_count"] = int(partition_candidate_count)
+            requested_k = _partition_candidate_requested_k(partition_candidate)
+            row["partition_candidate_generation_pass"] = (
+                "local_refine" if int(requested_k) in partition_refine_k_set else "sparse_anchor"
+            )
+            row["partition_candidate_refinement_reason"] = str(partition_refinement_reason)
+            row["partition_candidate_k_grid_size"] = int(len(partition_combined_k_grid))
+            row["partition_candidate_sparse_k_grid"] = ",".join(str(int(k)) for k in partition_k_grid)
+            row["partition_candidate_refine_k_grid"] = ",".join(str(int(k)) for k in partition_refine_k_grid)
+            row["partition_candidate_k_grid"] = ",".join(str(int(k)) for k in partition_combined_k_grid)
+            row["lambda_bracket_min"] = np.nan if lambda_bracket is None else float(lambda_bracket.lambda_min)
+            row["lambda_bracket_eq"] = np.nan if lambda_bracket is None else float(lambda_bracket.lambda_eq)
+            row["lambda_bracket_full"] = np.nan if lambda_bracket is None else float(lambda_bracket.lambda_full)
+            if lambda_bracket is None:
+                row["lambda_full_residual"] = np.nan
+            else:
+                for diagnostic_name, diagnostic_value in lambda_bracket.diagnostics.items():
+                    if np.isscalar(diagnostic_value):
+                        row[str(diagnostic_name)] = float(diagnostic_value)
+            candidate_id = int(len(result_entries))
+            row["_candidate_id"] = candidate_id
+            result_entries.append((fit, evaluation, row, artifact))
+            if artifact.bic_partition_labels is not None:
+                partition_labels_by_candidate_id[candidate_id] = np.asarray(
+                    artifact.bic_partition_labels,
+                    dtype=np.int64,
+                ).copy()
+            next_step += 1
+        search_df = (
+            pd.DataFrame([row for _, _, row, _ in result_entries])
+            .sort_values(["lambda", "selection_step"])
+            .reset_index(drop=True)
+        )
+    return _assemble_selection_result(
+        search_df=search_df,
+        data=data,
+        normalized_score=normalized_score,
+        result_entries=result_entries,
+        bic_df_scale=bic_df_scale,
+        bic_cluster_penalty=bic_cluster_penalty,
+        selection_method=selection_method,
+        profile_name=profile_name,
+        lambda_search_mode=lambda_search_mode,
+        lambda_bracket=lambda_bracket,
+        adaptive_search_stop_reason=adaptive_search_stop_reason,
+        adaptive_search_rounds_completed=adaptive_search_rounds_completed,
+        adaptive_refinement_rounds_completed=adaptive_refinement_rounds_completed,
+        selection_start_time=selection_start_time,
     )
 
 

@@ -8,9 +8,16 @@ import numpy as np
 import torch
 
 from ...io.data import TumorData
+from ..bic import bic_degrees_of_freedom, compute_bic_with_df, effective_bic_mutation_region_count
 from .refit import PartitionRefitResult, _canonical_labels, partition_constrained_observed_refit
-from .starts import _cell_loss_grid_numpy
-from .torch_backend import TorchTumorData, cell_loss_grid_torch, resolve_runtime, to_torch_tumor_data
+from .starts import _mutation_region_loss_grid_numpy
+from .torch_backend import (
+    TorchTumorData,
+    as_runtime_tensor,
+    mutation_region_loss_grid_torch,
+    resolve_runtime,
+    to_torch_tumor_data,
+)
 from .types import TorchRuntime
 
 
@@ -29,18 +36,14 @@ class PartitionCandidate:
     diagnostics: dict[str, float] = field(default_factory=dict)
 
 
-def effective_bic_cell_count(data: TumorData) -> int:
-    positive_depth = np.asarray(data.total_counts, dtype=np.float64) > 0.0
-    count_observed = getattr(data, "count_observed", None)
-    if count_observed is not None:
-        positive_depth = positive_depth & np.asarray(count_observed, dtype=bool)
-    return max(int(np.sum(positive_depth)), 1)
-
-
 def compute_partition_bic(*, fit_loss: float, num_clusters: int, data: TumorData) -> float:
-    n_eff = effective_bic_cell_count(data)
-    df = max(int(num_clusters), 1) * int(data.num_samples)
-    return float(2.0 * float(fit_loss) + float(df) * np.log(float(n_eff)))
+    # fit_loss is the negative log-likelihood (loglik = -fit_loss); delegate to the
+    # single BIC definition in core.bic so the formula/observed-mutation_region count never drift.
+    return compute_bic_with_df(
+        -float(fit_loss),
+        bic_degrees_of_freedom(num_clusters, data),
+        effective_bic_mutation_region_count(data),
+    )
 
 
 def _as_numpy(array: np.ndarray | object) -> np.ndarray:
@@ -116,9 +119,7 @@ def _resolve_partition_runtime(
 
 
 def _as_torch(array: np.ndarray | torch.Tensor | object, *, runtime: TorchRuntime) -> torch.Tensor:
-    if torch.is_tensor(array):
-        return array.to(dtype=runtime.dtype, device=runtime.device)
-    return torch.as_tensor(np.asarray(array, dtype=np.float64), dtype=runtime.dtype, device=runtime.device)
+    return as_runtime_tensor(array, runtime)
 
 
 def _data_arrays(data: TumorData) -> dict[str, np.ndarray]:
@@ -133,7 +134,7 @@ def _data_arrays(data: TumorData) -> dict[str, np.ndarray]:
     }
 
 
-def _cell_loss_vector_numpy(
+def _mutation_region_loss_vector_numpy(
     beta: float,
     *,
     alt: np.ndarray,
@@ -149,7 +150,7 @@ def _cell_loss_vector_numpy(
     out = np.empty_like(beta_values, dtype=np.float64)
     for idx in np.ndindex(beta_values.shape):
         out[idx] = float(
-            _cell_loss_grid_numpy(
+            _mutation_region_loss_grid_numpy(
                 np.asarray([beta_values[idx]], dtype=np.float64),
                 alt=float(alt[idx]),
                 total=float(total[idx]),
@@ -164,7 +165,7 @@ def _cell_loss_vector_numpy(
     return out
 
 
-def _single_cell_loss(
+def _single_mutation_region_loss(
     beta: float,
     *,
     alt: float,
@@ -177,7 +178,7 @@ def _single_cell_loss(
     eps: float,
 ) -> float:
     return float(
-        _cell_loss_grid_numpy(
+        _mutation_region_loss_grid_numpy(
             np.asarray([float(beta)], dtype=np.float64),
             alt=float(alt),
             total=float(total),
@@ -191,14 +192,14 @@ def _single_cell_loss(
     )
 
 
-def _cell_loss_matrix_torch(
+def _mutation_region_loss_matrix_torch(
     torch_data: TorchTumorData,
     beta: torch.Tensor,
     *,
     major_prior: float,
     eps: float,
 ) -> torch.Tensor:
-    return cell_loss_grid_torch(
+    return mutation_region_loss_grid_torch(
         beta,
         alt=torch_data.alt,
         total=torch_data.total,
@@ -250,9 +251,9 @@ def observed_curvature_at_pilot_torch(
     h_right = right - x0
     valid = (h_left > 1e-12) & (h_right > 1e-12)
 
-    f_left = _cell_loss_matrix_torch(torch_data, left, major_prior=major_prior, eps=eps)
-    f0 = _cell_loss_matrix_torch(torch_data, x0, major_prior=major_prior, eps=eps)
-    f_right = _cell_loss_matrix_torch(torch_data, right, major_prior=major_prior, eps=eps)
+    f_left = _mutation_region_loss_matrix_torch(torch_data, left, major_prior=major_prior, eps=eps)
+    f0 = _mutation_region_loss_matrix_torch(torch_data, x0, major_prior=major_prior, eps=eps)
+    f_right = _mutation_region_loss_matrix_torch(torch_data, right, major_prior=major_prior, eps=eps)
     denom = h_left * h_right * (h_left + h_right)
     curvature = 2.0 * (h_left * f_right - (h_left + h_right) * f0 + h_right * f_left) / denom
     floor = torch.full_like(curvature, float(curvature_floor))
@@ -284,46 +285,46 @@ def observed_curvature_at_pilot(
     h = np.full(phi0.shape, float(curvature_floor), dtype=np.float64)
 
     for mutation_idx in range(phi0.shape[0]):
-        for sample_idx in range(phi0.shape[1]):
-            x0 = float(np.clip(phi0[mutation_idx, sample_idx], lower, upper[mutation_idx, sample_idx]))
-            width = max(float(upper[mutation_idx, sample_idx]) - lower, 0.0)
+        for region_idx in range(phi0.shape[1]):
+            x0 = float(np.clip(phi0[mutation_idx, region_idx], lower, upper[mutation_idx, region_idx]))
+            width = max(float(upper[mutation_idx, region_idx]) - lower, 0.0)
             step = max(float(min_step), float(step_fraction) * max(width, abs(x0), 1.0))
             left = max(lower, x0 - step)
-            right = min(float(upper[mutation_idx, sample_idx]), x0 + step)
+            right = min(float(upper[mutation_idx, region_idx]), x0 + step)
             h_left = x0 - left
             h_right = right - x0
             if h_left <= 1e-12 or h_right <= 1e-12:
                 continue
-            f_left = _single_cell_loss(
+            f_left = _single_mutation_region_loss(
                 left,
-                alt=arrays["alt"][mutation_idx, sample_idx],
-                total=arrays["total"][mutation_idx, sample_idx],
-                b_minus=arrays["b_minus"][mutation_idx, sample_idx],
-                b_plus=arrays["b_plus"][mutation_idx, sample_idx],
-                b_fixed=arrays["b_fixed"][mutation_idx, sample_idx],
-                ambiguous=arrays["ambiguous"][mutation_idx, sample_idx],
+                alt=arrays["alt"][mutation_idx, region_idx],
+                total=arrays["total"][mutation_idx, region_idx],
+                b_minus=arrays["b_minus"][mutation_idx, region_idx],
+                b_plus=arrays["b_plus"][mutation_idx, region_idx],
+                b_fixed=arrays["b_fixed"][mutation_idx, region_idx],
+                ambiguous=arrays["ambiguous"][mutation_idx, region_idx],
                 major_prior=major_prior,
                 eps=eps,
             )
-            f0 = _single_cell_loss(
+            f0 = _single_mutation_region_loss(
                 x0,
-                alt=arrays["alt"][mutation_idx, sample_idx],
-                total=arrays["total"][mutation_idx, sample_idx],
-                b_minus=arrays["b_minus"][mutation_idx, sample_idx],
-                b_plus=arrays["b_plus"][mutation_idx, sample_idx],
-                b_fixed=arrays["b_fixed"][mutation_idx, sample_idx],
-                ambiguous=arrays["ambiguous"][mutation_idx, sample_idx],
+                alt=arrays["alt"][mutation_idx, region_idx],
+                total=arrays["total"][mutation_idx, region_idx],
+                b_minus=arrays["b_minus"][mutation_idx, region_idx],
+                b_plus=arrays["b_plus"][mutation_idx, region_idx],
+                b_fixed=arrays["b_fixed"][mutation_idx, region_idx],
+                ambiguous=arrays["ambiguous"][mutation_idx, region_idx],
                 major_prior=major_prior,
                 eps=eps,
             )
-            f_right = _single_cell_loss(
+            f_right = _single_mutation_region_loss(
                 right,
-                alt=arrays["alt"][mutation_idx, sample_idx],
-                total=arrays["total"][mutation_idx, sample_idx],
-                b_minus=arrays["b_minus"][mutation_idx, sample_idx],
-                b_plus=arrays["b_plus"][mutation_idx, sample_idx],
-                b_fixed=arrays["b_fixed"][mutation_idx, sample_idx],
-                ambiguous=arrays["ambiguous"][mutation_idx, sample_idx],
+                alt=arrays["alt"][mutation_idx, region_idx],
+                total=arrays["total"][mutation_idx, region_idx],
+                b_minus=arrays["b_minus"][mutation_idx, region_idx],
+                b_plus=arrays["b_plus"][mutation_idx, region_idx],
+                b_fixed=arrays["b_fixed"][mutation_idx, region_idx],
+                ambiguous=arrays["ambiguous"][mutation_idx, region_idx],
                 major_prior=major_prior,
                 eps=eps,
             )
@@ -333,7 +334,7 @@ def observed_curvature_at_pilot(
                 / (h_left * h_right * (h_left + h_right))
             )
             if np.isfinite(curvature):
-                h[mutation_idx, sample_idx] = max(float(curvature), float(curvature_floor))
+                h[mutation_idx, region_idx] = max(float(curvature), float(curvature_floor))
 
     finite = h[np.isfinite(h)]
     if finite.size and 0.0 < float(curvature_cap_quantile) < 1.0:
@@ -473,9 +474,9 @@ def hessian_weighted_ward_label_sets_torch(
     if not requested:
         return {}
 
-    num_samples = int(phi0.shape[1])
+    num_regions = int(phi0.shape[1])
     max_nodes = max(2 * num_mutations - 1, 1)
-    H = torch.zeros((max_nodes, num_samples), dtype=runtime.dtype, device=runtime.device)
+    H = torch.zeros((max_nodes, num_regions), dtype=runtime.dtype, device=runtime.device)
     mu = torch.zeros_like(H)
     H[:num_mutations] = h
     mu[:num_mutations] = phi0
@@ -569,20 +570,20 @@ def _loss_to_centers(
     infeasible = np.zeros((num_mutations, num_clusters), dtype=bool)
 
     for cluster_idx in range(num_clusters):
-        for sample_idx in range(int(data.num_samples)):
-            beta = float(centers[cluster_idx, sample_idx])
-            cost[:, cluster_idx] += _cell_loss_vector_numpy(
+        for region_idx in range(int(data.num_regions)):
+            beta = float(centers[cluster_idx, region_idx])
+            cost[:, cluster_idx] += _mutation_region_loss_vector_numpy(
                 beta,
-                alt=arrays["alt"][:, sample_idx],
-                total=arrays["total"][:, sample_idx],
-                b_minus=arrays["b_minus"][:, sample_idx],
-                b_plus=arrays["b_plus"][:, sample_idx],
-                b_fixed=arrays["b_fixed"][:, sample_idx],
-                ambiguous=arrays["ambiguous"][:, sample_idx],
+                alt=arrays["alt"][:, region_idx],
+                total=arrays["total"][:, region_idx],
+                b_minus=arrays["b_minus"][:, region_idx],
+                b_plus=arrays["b_plus"][:, region_idx],
+                b_fixed=arrays["b_fixed"][:, region_idx],
+                ambiguous=arrays["ambiguous"][:, region_idx],
                 major_prior=major_prior,
                 eps=eps,
             )
-            infeasible[:, cluster_idx] |= beta > arrays["upper"][:, sample_idx] + max(float(eps), 1e-8)
+            infeasible[:, cluster_idx] |= beta > arrays["upper"][:, region_idx] + max(float(eps), 1e-8)
 
     cost[infeasible] = float(infeasible_penalty)
     return cost
@@ -609,7 +610,7 @@ def _loss_to_centers_torch(
     )
     centers_t = _as_torch(centers, runtime=runtime)
     beta = centers_t.unsqueeze(0)
-    loss = cell_loss_grid_torch(
+    loss = mutation_region_loss_grid_torch(
         beta,
         alt=torch_data.alt.unsqueeze(1),
         total=torch_data.total.unsqueeze(1),
@@ -727,10 +728,10 @@ def partition_constrained_observed_refit_torch(
     )
     labels_np = _canonical_labels(np.asarray(labels, dtype=np.int64))
     n_clusters = int(labels_np.max()) + 1 if labels_np.size else 0
-    n_samples = int(data.num_samples)
+    n_regions = int(data.num_regions)
     if n_clusters <= 0:
-        empty_centers = np.zeros((0, n_samples), dtype=np.float64)
-        empty_phi = np.zeros((int(data.num_mutations), n_samples), dtype=np.float64)
+        empty_centers = np.zeros((0, n_regions), dtype=np.float64)
+        empty_phi = np.zeros((int(data.num_mutations), n_regions), dtype=np.float64)
         return PartitionRefitResult(
             phi=empty_phi,
             cluster_centers=empty_centers,
@@ -752,7 +753,7 @@ def partition_constrained_observed_refit_torch(
 
     labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=runtime.device)
     membership = torch.nn.functional.one_hot(labels_t, num_classes=n_clusters).to(dtype=runtime.dtype)
-    lower = torch.full((n_clusters, n_samples), float(eps), dtype=runtime.dtype, device=runtime.device)
+    lower = torch.full((n_clusters, n_regions), float(eps), dtype=runtime.dtype, device=runtime.device)
     upper = torch.empty_like(lower)
     for cluster_idx in range(n_clusters):
         member_mask = labels_t == int(cluster_idx)
@@ -765,7 +766,7 @@ def partition_constrained_observed_refit_torch(
 
     def objective(beta_ks: torch.Tensor) -> torch.Tensor:
         beta = beta_ks.unsqueeze(0)
-        loss = cell_loss_grid_torch(
+        loss = mutation_region_loss_grid_torch(
             beta,
             alt=torch_data.alt.unsqueeze(1),
             total=torch_data.total.unsqueeze(1),
@@ -776,6 +777,15 @@ def partition_constrained_observed_refit_torch(
             major_prior=float(major_prior),
             eps=float(eps),
         )
+        # Mask unobserved mutation_regions out of the likelihood, matching the fit objective
+        # (torch_backend.mutation_region_terms_torch) and the numpy refit; torch.where avoids
+        # inf*0 = nan when an infeasible beta makes the loss non-finite.
+        if torch_data.count_observed is not None:
+            loss = torch.where(
+                torch_data.count_observed.unsqueeze(1),
+                loss,
+                torch.zeros_like(loss),
+            )
         return torch.sum(loss * membership.unsqueeze(2), dim=0)
 
     left = lower.clone()
@@ -797,7 +807,7 @@ def partition_constrained_observed_refit_torch(
     candidates = [midpoint, left, right, lower, upper]
     if hint_phi is not None:
         hint_t = _as_torch(hint_phi, runtime=runtime)
-        hint_centers = torch.empty((n_clusters, n_samples), dtype=runtime.dtype, device=runtime.device)
+        hint_centers = torch.empty((n_clusters, n_regions), dtype=runtime.dtype, device=runtime.device)
         for cluster_idx in range(n_clusters):
             member_mask = labels_t == int(cluster_idx)
             if bool(torch.any(member_mask).item()):
@@ -825,7 +835,7 @@ def partition_constrained_observed_refit_torch(
     phi = centers[labels_t]
     phi = torch.minimum(torch.maximum(phi, torch.full_like(phi, float(eps))), torch_data.phi_upper)
     finite_candidate_found = bool(torch.isfinite(total_loss).item())
-    refit_coordinate_count = int(n_clusters * n_samples)
+    refit_coordinate_count = int(n_clusters * n_regions)
     finite_coordinate_count = int(torch.sum(torch.isfinite(best_loss)).detach().cpu().item())
     return PartitionRefitResult(
         phi=phi.detach().cpu().numpy().astype(np.float64, copy=False),
@@ -991,7 +1001,7 @@ def generate_likelihood_partition_starts(
         }
     candidates: list[PartitionCandidate] = []
     seen: set[bytes] = set()
-    n_eff = effective_bic_cell_count(data)
+    n_eff = effective_bic_mutation_region_count(data)
 
     for requested_k in sorted(label_sets):
         labels0 = _canonical_labels(label_sets[int(requested_k)])
@@ -1096,28 +1106,3 @@ def generate_likelihood_partition_starts(
         values = sorted(values, key=lambda item: (float(item.bic), float(item.fit_loss), str(item.source)))
         kept.extend(values[: max(int(max_candidates_per_K), 1)])
     return sorted(kept, key=lambda item: (float(item.bic), int(item.K), str(item.source)))
-
-
-def summarize_best_bic_by_K(candidates: Sequence[PartitionCandidate]) -> list[dict[str, object]]:
-    by_k: dict[int, PartitionCandidate] = {}
-    counts: dict[int, int] = {}
-    for candidate in candidates:
-        counts[int(candidate.K)] = counts.get(int(candidate.K), 0) + 1
-        current = by_k.get(int(candidate.K))
-        if current is None or float(candidate.bic) < float(current.bic):
-            by_k[int(candidate.K)] = candidate
-    rows: list[dict[str, object]] = []
-    for candidate_k in sorted(by_k):
-        candidate = by_k[candidate_k]
-        rows.append(
-            {
-                "K": int(candidate_k),
-                "candidate_count": int(counts[candidate_k]),
-                "best_source": str(candidate.source),
-                "best_fit_loss": float(candidate.fit_loss),
-                "best_bic": float(candidate.bic),
-                "best_active_df": -1 if candidate.active_df is None else int(candidate.active_df),
-                "n_eff": -1 if candidate.n_eff is None else int(candidate.n_eff),
-            }
-        )
-    return rows

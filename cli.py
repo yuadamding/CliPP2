@@ -92,7 +92,6 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     _add_common_selection_args(parser)
     parser.add_argument(
         "--skip-outputs",
-        "--skip-patient-outputs",
         "--skip-tumor-outputs",
         action="store_true",
         help="Skip per-tumor mutation/cluster/lambda files.",
