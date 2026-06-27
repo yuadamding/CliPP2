@@ -16,8 +16,8 @@ from ..core.fusion_solver import (
     cluster_diameters_from_edges,
     cluster_labels_from_edges,
     generate_likelihood_partition_starts,
-    hessian_weighted_ward_label_sets,
-    observed_curvature_at_pilot,
+    hessian_weighted_ward_label_sets_torch,
+    observed_curvature_at_pilot_torch,
     partition_constrained_observed_refit,
     prepare_torch_problem,
     torch_data_from_context,
@@ -2218,6 +2218,18 @@ def _evaluate_partition_candidate(
     refit_coordinate_count = int(
         candidate.diagnostics.get("refit_coordinate_count", num_clusters * int(data.num_samples))
     )
+    refit_finite_coordinate_count = int(
+        candidate.diagnostics.get(
+            "refit_finite_coordinate_count",
+            refit_coordinate_count if candidate.finite_candidate_found else 0,
+        )
+    )
+    refit_total_grid_points = int(candidate.diagnostics.get("refit_total_grid_points", -1.0))
+    refit_max_grid_spacing = float(candidate.diagnostics.get("refit_max_grid_spacing", np.nan))
+    refit_total_candidate_basins = int(candidate.diagnostics.get("refit_total_candidate_basins", -1.0))
+    refit_total_refined_candidates = int(candidate.diagnostics.get("refit_total_refined_candidates", -1.0))
+    refit_min_best_second_loss_gap = float(candidate.diagnostics.get("refit_min_best_second_loss_gap", np.nan))
+    partition_generation_cuda = bool(candidate.diagnostics.get("partition_generation_cuda", 0.0))
     finite_candidate_found = bool(candidate.finite_candidate_found and np.isfinite(float(classic_bic)))
     bic_selection_eligible = bool(finite_candidate_found and np.isfinite(float(classic_bic)))
     partition_hash = _partition_signature(labels)
@@ -2324,12 +2336,12 @@ def _evaluate_partition_candidate(
         bic_refit_finite_candidate_found=finite_candidate_found,
         bic_refit_global_optimum_certified=False,
         bic_refit_coordinate_count=int(refit_coordinate_count),
-        bic_refit_finite_coordinate_count=int(refit_coordinate_count) if finite_candidate_found else 0,
-        bic_refit_total_grid_points=-1,
-        bic_refit_max_grid_spacing=float("nan"),
-        bic_refit_total_candidate_basins=-1,
-        bic_refit_total_refined_candidates=-1,
-        bic_refit_min_best_second_loss_gap=float("nan"),
+        bic_refit_finite_coordinate_count=int(refit_finite_coordinate_count),
+        bic_refit_total_grid_points=int(refit_total_grid_points),
+        bic_refit_max_grid_spacing=float(refit_max_grid_spacing),
+        bic_refit_total_candidate_basins=int(refit_total_candidate_basins),
+        bic_refit_total_refined_candidates=int(refit_total_refined_candidates),
+        bic_refit_min_best_second_loss_gap=float(refit_min_best_second_loss_gap),
         bic_refit_converged=finite_candidate_found,
         bic_refit_phi=phi_clustered,
         bic_refit_cluster_centers=centers,
@@ -2400,6 +2412,7 @@ def _evaluate_partition_candidate(
         "partition_candidate_K": int(num_clusters),
         "partition_candidate_fit_loss": float(fit_loss),
         "partition_candidate_bic": float(classic_bic),
+        "partition_generation_cuda": bool(partition_generation_cuda),
         "bic_df_scale": float(bic_df_scale),
         "bic_cluster_penalty": float(bic_cluster_penalty),
         "bic": float(bic),
@@ -2436,12 +2449,12 @@ def _evaluate_partition_candidate(
         "refit_global_optimum_certified": False,
         "bic_refit_global_optimum_certified": False,
         "bic_refit_coordinate_count": int(refit_coordinate_count),
-        "bic_refit_finite_coordinate_count": int(refit_coordinate_count) if finite_candidate_found else 0,
-        "bic_refit_total_grid_points": -1,
-        "bic_refit_max_grid_spacing": np.nan,
-        "bic_refit_total_candidate_basins": -1,
-        "bic_refit_total_refined_candidates": -1,
-        "bic_refit_min_best_second_loss_gap": np.nan,
+        "bic_refit_finite_coordinate_count": int(refit_finite_coordinate_count),
+        "bic_refit_total_grid_points": int(refit_total_grid_points),
+        "bic_refit_max_grid_spacing": float(refit_max_grid_spacing),
+        "bic_refit_total_candidate_basins": int(refit_total_candidate_basins),
+        "bic_refit_total_refined_candidates": int(refit_total_refined_candidates),
+        "bic_refit_min_best_second_loss_gap": float(refit_min_best_second_loss_gap),
         "refit_converged": bool(finite_candidate_found),
         "bic_refit_converged": bool(finite_candidate_found),
         "bic_refit_cache_hit": False,
@@ -3297,16 +3310,21 @@ def _grid_search_selection(
         and int(data.num_mutations) <= int(LIKELIHOOD_PARTITION_MAX_MUTATIONS)
     ):
         partition_k_grid = _likelihood_partition_k_grid(int(data.num_mutations))
-        partition_curvature = observed_curvature_at_pilot(
+        partition_curvature = observed_curvature_at_pilot_torch(
             data,
             pilot_phi,
             major_prior=float(effective_fit_options.major_prior),
             eps=float(effective_fit_options.eps),
+            torch_data=torch_data,
+            device=runtime.device,
+            dtype=runtime.dtype,
         )
-        partition_label_sets = hessian_weighted_ward_label_sets(
+        partition_label_sets = hessian_weighted_ward_label_sets_torch(
             pilot_phi,
             partition_curvature,
             K_grid=partition_k_grid,
+            device=runtime.device,
+            dtype=runtime.dtype,
         )
         partition_candidates = generate_likelihood_partition_starts(
             data,
@@ -3320,6 +3338,10 @@ def _grid_search_selection(
             tol=float(effective_fit_options.tol),
             curvature=partition_curvature,
             label_sets=partition_label_sets,
+            torch_data=torch_data,
+            device=runtime.device,
+            dtype=runtime.dtype,
+            use_torch=True,
         )
         partition_refine_k_grid, partition_refinement_reason = _likelihood_partition_refinement_k_grid(
             partition_candidates,
@@ -3327,10 +3349,12 @@ def _grid_search_selection(
             num_mutations=int(data.num_mutations),
         )
         if partition_refine_k_grid:
-            partition_refine_label_sets = hessian_weighted_ward_label_sets(
+            partition_refine_label_sets = hessian_weighted_ward_label_sets_torch(
                 pilot_phi,
                 partition_curvature,
                 K_grid=partition_refine_k_grid,
+                device=runtime.device,
+                dtype=runtime.dtype,
             )
             partition_refine_candidates = generate_likelihood_partition_starts(
                 data,
@@ -3344,6 +3368,10 @@ def _grid_search_selection(
                 tol=float(effective_fit_options.tol),
                 curvature=partition_curvature,
                 label_sets=partition_refine_label_sets,
+                torch_data=torch_data,
+                device=runtime.device,
+                dtype=runtime.dtype,
+                use_torch=True,
             )
             partition_candidates = _deduplicate_partition_candidates(
                 partition_candidates + partition_refine_candidates
