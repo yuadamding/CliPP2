@@ -102,6 +102,57 @@ def process_one_file_bundle(
     def _selected_value(name: str, default: object = np.nan) -> object:
         return selected_search_row.get(name, default)
 
+    def _selected_bool(name: str, default: bool = False) -> bool:
+        value = _selected_value(name, default)
+        if value is None:
+            return bool(default)
+        try:
+            if pd.isna(value):
+                return bool(default)
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"0", "false", "f", "no", "n", ""}:
+                return False
+            if normalized in {"1", "true", "t", "yes", "y"}:
+                return True
+        return bool(value)
+
+    selected_lambda_applicable = _selected_bool("lambda_applicable", True)
+    selected_lambda_value = float(best_fit.lambda_value) if selected_lambda_applicable else np.nan
+    selected_lambda_representative = (
+        np.nan
+        if not selected_lambda_applicable or selection_result.selected_lambda_representative is None
+        else float(selection_result.selected_lambda_representative)
+    )
+    if not search_df.empty:
+        if "lambda_applicable" in search_df.columns:
+            lambda_applicable_mask = search_df["lambda_applicable"].fillna(True).astype(bool).to_numpy(dtype=bool)
+        else:
+            lambda_applicable_mask = np.ones(search_df.shape[0], dtype=bool)
+        tested_lambda_values = search_df.loc[lambda_applicable_mask, "lambda"].to_numpy(dtype=float)
+        tested_lambda_values = tested_lambda_values[
+            np.isfinite(tested_lambda_values) & (tested_lambda_values >= 0.0)
+        ]
+    else:
+        tested_lambda_values = np.asarray([], dtype=float)
+    tested_lambda_min = float(np.min(tested_lambda_values)) if tested_lambda_values.size else np.nan
+    tested_lambda_max = float(np.max(tested_lambda_values)) if tested_lambda_values.size else np.nan
+    tested_lambda_count = int(np.unique(np.round(tested_lambda_values, 12)).size)
+
+    def _selected_str(name: str, default: str = "") -> str:
+        value = _selected_value(name, default)
+        if pd.isna(value):
+            return str(default)
+        return str(value)
+
+    def _selected_int(name: str, default: int = -1) -> int:
+        value = _selected_value(name, default)
+        if pd.isna(value):
+            return int(default)
+        return int(value)
+
     if best_evaluation is None and simulation_available and bool(finalize_selected_fit):
         best_evaluation = evaluate_fit_against_simulation(fit=best_fit, data=data, simulation_root=simulation_root)
 
@@ -113,10 +164,11 @@ def process_one_file_bundle(
         if best_evaluation is not None
         else None
     )
+    selected_model_token = "selected_lambda" if selected_lambda_applicable else "selected_model"
     selected_ari_source = (
-        "candidate_selected_lambda"
+        f"candidate_{selected_model_token}"
         if simulation_diagnostics.selected_ari is not None
-        else "final_evaluation_selected_lambda"
+        else f"final_evaluation_{selected_model_token}"
         if best_evaluation is not None
         else "not_available"
     )
@@ -132,7 +184,11 @@ def process_one_file_bundle(
     summary = {
         "tumor_id": data.tumor_id,
         "estimator": "objective_faithful_pairwise_fusion",
-        "selected_lambda": float(best_fit.lambda_value),
+        "selected_lambda": selected_lambda_value,
+        "selected_lambda_applicable": bool(selected_lambda_applicable),
+        "selected_candidate_pool_source": _selected_str("candidate_pool_source", "raw_fused_lambda_path"),
+        "selected_partition_candidate_source": _selected_str("partition_candidate_source", ""),
+        "selected_partition_candidate_requested_K": _selected_int("partition_candidate_requested_K", -1),
         "loglik": float(best_fit.loglik),
         "summary_loglik": float(best_fit.summary_loglik),
         "bic": float(best_fit.bic if best_fit.bic is not None else np.nan),
@@ -143,9 +199,7 @@ def process_one_file_bundle(
         "selection_method": selection_result.selection_method,
         "selection_score_name": str(best_fit.selection_score_name or selection_score),
         "lambda_search_mode": str(selection_result.lambda_search_mode),
-        "selected_lambda_representative": float(selection_result.selected_lambda_representative)
-        if selection_result.selected_lambda_representative is not None
-        else np.nan,
+        "selected_lambda_representative": selected_lambda_representative,
         "selected_lambda_left": np.nan
         if selection_result.selected_lambda_left is None
         else float(selection_result.selected_lambda_left),
@@ -213,8 +267,10 @@ def process_one_file_bundle(
         "selection_optimum_resolved": bool(selection_result.selection_optimum_resolved),
         "selected_ari": np.nan if reported_selected_ari is None else float(reported_selected_ari),
         "selected_ari_source": selected_ari_source,
-        "selected_ari_lambda": np.nan if reported_selected_ari is None else float(best_fit.lambda_value),
-        "selected_ari_matches_selected_lambda": bool(reported_selected_ari is not None),
+        "selected_ari_lambda": np.nan if reported_selected_ari is None else selected_lambda_value,
+        "selected_ari_matches_selected_lambda": bool(
+            reported_selected_ari is not None and selected_lambda_applicable
+        ),
         "best_ari": np.nan if simulation_diagnostics.best_ari is None else float(simulation_diagnostics.best_ari),
         "best_ari_all_evaluated": np.nan
         if getattr(simulation_diagnostics, "best_ari_all_evaluated", None) is None
@@ -258,9 +314,9 @@ def process_one_file_bundle(
         "ari_optimum_resolved": bool(simulation_diagnostics.ari_optimum_resolved),
         "adaptive_search_rounds_completed": int(selection_result.adaptive_search_rounds_completed),
         "adaptive_search_stop_reason": str(selection_result.adaptive_search_stop_reason),
-        "tested_lambda_min": float(search_df["lambda"].min()) if not search_df.empty else np.nan,
-        "tested_lambda_max": float(search_df["lambda"].max()) if not search_df.empty else np.nan,
-        "tested_lambda_count": int(search_df["lambda"].nunique()) if not search_df.empty else 0,
+        "tested_lambda_min": tested_lambda_min,
+        "tested_lambda_max": tested_lambda_max,
+        "tested_lambda_count": tested_lambda_count,
         "num_regions": int(tumor_regime.num_regions),
         "num_mutations": int(tumor_regime.num_mutations),
         "depth_scale": float(tumor_regime.depth_scale),
@@ -337,8 +393,8 @@ def process_one_file_bundle(
         "bic_refit_converged": bool(best_fit.bic_refit_converged)
         if best_fit.bic_refit_converged is not None
         else False,
-        "primary_phi_source": "raw_penalized_fit",
-        "bic_refit_phi_source": "secondary_partition_refit",
+        "primary_phi_source": _selected_str("primary_phi_source", "raw_penalized_fit"),
+        "bic_refit_phi_source": _selected_str("bic_refit_phi_source", "secondary_partition_refit"),
         "converged": bool(best_fit.converged),
         "stationarity_certified": bool(best_fit.stationarity_certified),
         "global_optimality_certified": bool(best_fit.global_optimality_certified),
