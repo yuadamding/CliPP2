@@ -14,6 +14,7 @@ from ..core.fusion.graph import load_pairwise_fusion_graph_tsv
 from ..core.model import FitOptions
 from ..io.data import load_tumor_tsv
 from ..metrics.evaluation import evaluate_fit_against_simulation
+from ..model_selection.config import DEFAULT_SELECTION_SCORE
 from .model_selection import select_model
 from .outputs import write_fit_outputs
 from .settings import summarize_tumor_regime
@@ -32,11 +33,11 @@ def process_one_file_bundle(
     outdir: str | Path,
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
-    lambda_grid_mode: str = "adaptive_bic",
+    lambda_grid_mode: str = "partition_guided_admm",
     fit_options: FitOptions | None = None,
     bic_df_scale: float = 1.0,
     bic_cluster_penalty: float = 0.0,
-    selection_score: str = "bic",
+    selection_score: str = DEFAULT_SELECTION_SCORE,
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
@@ -240,11 +241,63 @@ def process_one_file_bundle(
         "bic": _artifact_float("bic"),
         "classic_bic": float(best_classic_bic if best_classic_bic is not None else np.nan),
         "extended_bic": _artifact_float("extended_bic"),
+        "partition_icl": _artifact_float("partition_icl"),
+        "partition_log_evidence": _artifact_float("partition_log_evidence"),
+        "partition_code_deviance": _artifact_float("partition_code_deviance"),
+        "partition_dirichlet_alpha": _artifact_float("partition_dirichlet_alpha"),
         "n_clusters": int(best_fit.n_clusters),
         "selection_profile": selection_result.profile_name,
         "selection_method": selection_result.selection_method,
         "selection_score_name": str(_artifact_value("selection_score_name", None) or selection_score),
         "lambda_search_mode": str(selection_result.lambda_search_mode),
+        "lambda_path_prespecified": _selected_bool("lambda_path_prespecified", lambda_grid is not None),
+        "lambda_source": _selected_str("lambda_source", ""),
+        "lambda_proposal_reason": _selected_str("lambda_proposal_reason", ""),
+        "initialization_mode": _selected_str("initialization_mode", ""),
+        "initializer_selection_score": _selected_str("initializer_selection_score", ""),
+        "initializer_score_value": float(_selected_value("initializer_score_value", np.nan)),
+        "initializer_K": _selected_int("initializer_K", -1),
+        "initializer_requested_K": _selected_int("initializer_requested_K", -1),
+        "initializer_source": _selected_str("initializer_source", ""),
+        "initializer_partition_signature": _selected_str(
+            "initializer_partition_signature", ""
+        ),
+        "initializer_matrix_hash": _selected_str("initializer_matrix_hash", ""),
+        "fusion_graph_source": _selected_str("fusion_graph_source", ""),
+        "fusion_graph_pilot_matrix_hash": _selected_str(
+            "fusion_graph_pilot_matrix_hash", ""
+        ),
+        "scalar_likelihood_pilot_matrix_hash": _selected_str(
+            "scalar_likelihood_pilot_matrix_hash", ""
+        ),
+        "fusion_graph_likelihood_noise_tau": float(
+            _selected_value("fusion_graph_likelihood_noise_tau", np.nan)
+        ),
+        "fusion_graph_likelihood_noise_divisor": float(
+            _selected_value("fusion_graph_likelihood_noise_divisor", np.nan)
+        ),
+        "fusion_graph_likelihood_noise_degree_exponent": float(
+            _selected_value(
+                "fusion_graph_likelihood_noise_degree_exponent", np.nan
+            )
+        ),
+        "initializer_pool_size": _selected_int("initializer_pool_size", -1),
+        "initializer_lambda": float(_selected_value("initializer_lambda", np.nan)),
+        "initializer_kkt_residual": float(
+            _selected_value("initializer_kkt_residual", np.nan)
+        ),
+        "initializer_max_dual_ball_ratio": float(
+            _selected_value("initializer_max_dual_ball_ratio", np.nan)
+        ),
+        "initializer_capacity_iterations": _selected_int(
+            "initializer_capacity_iterations", -1
+        ),
+        "initializer_capacity_converged": _selected_bool(
+            "initializer_capacity_converged", False
+        ),
+        "initializer_capacity_status": _selected_str(
+            "initializer_capacity_status", ""
+        ),
         "selected_lambda_representative": selected_lambda_representative,
         "selected_lambda_left": np.nan
         if selection_result.selected_lambda_left is None
@@ -446,6 +499,9 @@ def process_one_file_bundle(
         "selected_start_objective_rank": int(best_fit.selected_start_objective_rank),
         "converged_inner": bool(best_fit.converged_inner),
         "converged_outer": bool(best_fit.converged_outer),
+        "inner_solver": str(best_fit.inner_solver),
+        "inner_iterations": int(best_fit.inner_iterations),
+        "admm_iterations": int(best_fit.admm_iterations),
         "inner_kkt_residual": float(best_fit.inner_kkt_residual),
         "accepted_inner_kkt_residual": float(best_fit.accepted_inner_kkt_residual),
         "last_attempted_inner_kkt_residual": float(best_fit.last_attempted_inner_kkt_residual),
@@ -524,6 +580,17 @@ def process_one_file_bundle(
         if best_evaluation is None
         else float(getattr(best_evaluation, "summary_cp_rmse", best_evaluation.cp_rmse)),
         "multiplicity_f1": np.nan if best_evaluation is None else float(best_evaluation.multiplicity_f1),
+        "multiplicity_asymmetric_f1": np.nan
+        if best_evaluation is None
+        else float(
+            best_evaluation.multiplicity_f1
+            if getattr(best_evaluation, "multiplicity_asymmetric_f1", None) is None
+            else best_evaluation.multiplicity_asymmetric_f1
+        ),
+        "multiplicity_estimable_f1": np.nan
+        if best_evaluation is None
+        or getattr(best_evaluation, "multiplicity_estimable_f1", None) is None
+        else float(best_evaluation.multiplicity_estimable_f1),
         "estimated_clonal_fraction": np.nan
         if best_evaluation is None
         else float(best_evaluation.estimated_clonal_fraction),
@@ -564,11 +631,11 @@ def process_one_file(
     outdir: str | Path,
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
-    lambda_grid_mode: str = "adaptive_bic",
+    lambda_grid_mode: str = "partition_guided_admm",
     fit_options: FitOptions | None = None,
     bic_df_scale: float = 1.0,
     bic_cluster_penalty: float = 0.0,
-    selection_score: str = "bic",
+    selection_score: str = DEFAULT_SELECTION_SCORE,
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
@@ -601,12 +668,12 @@ def run_directory(
     outdir: str | Path,
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
-    lambda_grid_mode: str = "adaptive_bic",
+    lambda_grid_mode: str = "partition_guided_admm",
     fit_options: FitOptions | None = None,
     max_files: int | None = None,
     bic_df_scale: float = 1.0,
     bic_cluster_penalty: float = 0.0,
-    selection_score: str = "bic",
+    selection_score: str = DEFAULT_SELECTION_SCORE,
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     graph_file: str | Path | None = None,

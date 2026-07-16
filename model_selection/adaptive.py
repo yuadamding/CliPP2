@@ -313,7 +313,11 @@ def _initial_adaptive_lambda_bracket(
 def _adaptive_score_column(normalized_score: str) -> str:
     if normalized_score == "bic":
         return "classic_bic"
-    return "bic"
+    if normalized_score == "extended_bic":
+        return "extended_bic"
+    if normalized_score == "partition_icl":
+        return "partition_icl"
+    raise ValueError(f"Unknown normalized selection score: {normalized_score}")
 
 
 def _score_maximized(normalized_score: str) -> bool:
@@ -338,7 +342,11 @@ def _score_strictly_better(score: float, reference: float, *, normalized_score: 
     return bool(float(score) < float(reference) - margin)
 
 
-def _best_candidate_rows_by_lambda(search_df: pd.DataFrame) -> pd.DataFrame:
+def _best_candidate_rows_by_lambda(
+    search_df: pd.DataFrame,
+    *,
+    normalized_score: str = "bic",
+) -> pd.DataFrame:
     if search_df.empty:
         return search_df.copy()
     ranked = _add_bic_selection_eligible(search_df)
@@ -347,12 +355,13 @@ def _best_candidate_rows_by_lambda(search_df: pd.DataFrame) -> pd.DataFrame:
     if "bic_refit_converged" not in ranked.columns and "bic_refit_finite_candidate_found" in ranked.columns:
         ranked["bic_refit_converged"] = ranked["bic_refit_finite_candidate_found"].astype(bool)
     ranked["_lambda_key"] = np.round(ranked["lambda"].to_numpy(dtype=float), 12)
+    score_column = _adaptive_score_column(normalized_score)
     defaults = {
         "selection_eligible": False,
         "bic_refit_finite_candidate_found": False,
         "bic_refit_converged": False,
         "converged": False,
-        "classic_bic": np.inf,
+        score_column: np.inf,
         "penalized_objective": np.inf,
         "selection_step": np.arange(ranked.shape[0], dtype=int),
     }
@@ -365,7 +374,7 @@ def _best_candidate_rows_by_lambda(search_df: pd.DataFrame) -> pd.DataFrame:
         "selection_eligible",
         "bic_refit_finite_candidate_found",
         "bic_refit_converged",
-        "classic_bic",
+        score_column,
         "penalized_objective",
         "selection_step",
     ]
@@ -504,7 +513,10 @@ def _adaptive_interval_proposal_records(
     max_new: int,
     partition_labels_by_candidate_id: dict[int, np.ndarray] | None = None,
 ) -> list[_AdaptiveIntervalProposal]:
-    path_df = _best_candidate_rows_by_lambda(search_df).sort_values("lambda").reset_index(drop=True)
+    path_df = _best_candidate_rows_by_lambda(
+        search_df,
+        normalized_score=normalized_score,
+    ).sort_values("lambda").reset_index(drop=True)
     if path_df.shape[0] < 2 or int(max_new) <= 0:
         return []
     score_column = _adaptive_score_column(normalized_score)
@@ -600,7 +612,7 @@ def _adaptive_interval_proposal_records(
             elif monotonicity_violation:
                 reason = "penalty_monotonicity_violation"
             else:
-                reason = "failed_kkt_near_best_bic"
+                reason = "failed_kkt_near_best_score"
         elif partition_changed:
             priority_class = 1
             reason = "partition_signature_change"
@@ -680,6 +692,7 @@ def _selected_lambda_signature_interval(
     search_df: pd.DataFrame,
     *,
     selected_candidate_id: int,
+    normalized_score: str = "bic",
 ) -> tuple[float | None, float | None, float | None]:
     if search_df.empty or "_candidate_id" not in search_df.columns:
         return None, None, None
@@ -694,7 +707,10 @@ def _selected_lambda_signature_interval(
     eligible = search_df.loc[_bic_selection_eligible_mask(search_df)].copy()
     if eligible.empty:
         eligible = search_df.copy()
-    eligible = _best_candidate_rows_by_lambda(eligible).sort_values("lambda").reset_index(drop=True)
+    eligible = _best_candidate_rows_by_lambda(
+        eligible,
+        normalized_score=normalized_score,
+    ).sort_values("lambda").reset_index(drop=True)
     lambdas = eligible["lambda"].to_numpy(dtype=float)
     signatures = eligible["partition_signature"].astype(str).to_numpy() if "partition_signature" in eligible.columns else np.full(eligible.shape[0], signature)
     if lambdas.size == 0:
@@ -746,4 +762,3 @@ def _lambda_boundary_unresolved(
     if not sorted_lambdas:
         return False
     return bool(lower_hit or upper_hit)
-

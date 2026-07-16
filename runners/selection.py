@@ -12,6 +12,7 @@ from __future__ import annotations
 from ..core.bic import (
     ADAPTIVE_LAMBDA_GRID_MODES,
     LAMBDA_GRID_MODES,
+    PARTITION_GUIDED_LAMBDA_GRID_MODES,
     LambdaBracket,
     bic_degrees_of_freedom,
     compute_bic_with_df,
@@ -21,11 +22,13 @@ from ..core.bic import (
     effective_bic_mutation_region_count,
     effective_bic_depth_count,
     is_adaptive_lambda_grid_mode,
+    is_partition_guided_lambda_grid_mode,
 )
 
 __all__ = [
     "ADAPTIVE_LAMBDA_GRID_MODES",
     "LAMBDA_GRID_MODES",
+    "PARTITION_GUIDED_LAMBDA_GRID_MODES",
     "LambdaBracket",
     "bic_degrees_of_freedom",
     "compute_bic_with_df",
@@ -35,4 +38,5 @@ __all__ = [
     "effective_bic_mutation_region_count",
     "effective_bic_depth_count",
     "is_adaptive_lambda_grid_mode",
+    "is_partition_guided_lambda_grid_mode",
 ]

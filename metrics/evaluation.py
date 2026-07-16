@@ -29,6 +29,10 @@ class SimulationEvaluation:
     # BIC partition-refit metrics (None when refit was not performed)
     bic_refit_ari: float | None = None
     bic_refit_cp_rmse: float | None = None
+    # multiplicity_f1 remains the compatibility name for the requested
+    # asymmetric-copy metric. The explicit fields make both masks inspectable.
+    multiplicity_asymmetric_f1: float | None = None
+    multiplicity_estimable_f1: float | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,30 @@ def _macro_binary_f1(y_true: np.ndarray, y_pred: np.ndarray) -> float:
         return 2.0 * precision * recall / (precision + recall)
 
     return float(0.5 * (_f1(tp0, fp0, fn0) + _f1(tp1, fp1, fn1)))
+
+
+def _multiplicity_f1_for_mask(
+    *,
+    truth_multiplicity: np.ndarray,
+    predicted_multiplicity: np.ndarray,
+    major_cn: np.ndarray,
+    mask: np.ndarray,
+) -> float:
+    subject_mask = np.asarray(mask, dtype=bool)
+    if not subject_mask.any():
+        return float("nan")
+    truth_major = np.isclose(
+        truth_multiplicity[subject_mask],
+        major_cn[subject_mask],
+    )
+    pred_major = np.isclose(
+        predicted_multiplicity[subject_mask],
+        major_cn[subject_mask],
+    )
+    return _macro_binary_f1(
+        truth_major.astype(int).reshape(-1),
+        pred_major.astype(int).reshape(-1),
+    )
 
 
 def _region_index_from_label(region_id: str) -> int:
@@ -333,6 +361,8 @@ def evaluate_fit_against_simulation(
             n_filtered_mutations=int(data.num_mutations),
             raw_cp_rmse=float("nan"),
             summary_cp_rmse=float("nan"),
+            multiplicity_asymmetric_f1=float("nan"),
+            multiplicity_estimable_f1=float("nan"),
         )
 
     ari = _adjusted_rand_index(truth_clusters[eval_mask], fit.cluster_labels[eval_mask])
@@ -350,17 +380,26 @@ def evaluate_fit_against_simulation(
     clonal_fraction_error = float(estimated_clonal_fraction - true_clonal_fraction)
     if truth_multiplicity is None:
         multiplicity_f1 = float("nan")
+        multiplicity_asymmetric_f1 = float("nan")
+        multiplicity_estimable_f1 = float("nan")
     else:
-        cna_subject_mask = data.has_cna & ((data.major_cn != 1.0) | (data.minor_cn != 1.0))
-        if not cna_subject_mask.any():
-            multiplicity_f1 = float("nan")
-        else:
-            truth_major = np.isclose(truth_multiplicity[cna_subject_mask], data.major_cn[cna_subject_mask])
-            pred_major = np.isclose(fit.multiplicity_call[cna_subject_mask], data.major_cn[cna_subject_mask])
-            multiplicity_f1 = _macro_binary_f1(
-                truth_major.astype(int).reshape(-1),
-                pred_major.astype(int).reshape(-1),
-            )
+        # The requested primary metric is defined exactly on asymmetric copy
+        # states. Symmetric states have no identifiable major-versus-minor
+        # binary label and therefore do not enter this score.
+        asymmetric_mask = np.asarray(data.major_cn) != np.asarray(data.minor_cn)
+        multiplicity_asymmetric_f1 = _multiplicity_f1_for_mask(
+            truth_multiplicity=truth_multiplicity,
+            predicted_multiplicity=fit.multiplicity_call,
+            major_cn=data.major_cn,
+            mask=asymmetric_mask,
+        )
+        multiplicity_estimable_f1 = _multiplicity_f1_for_mask(
+            truth_multiplicity=truth_multiplicity,
+            predicted_multiplicity=fit.multiplicity_call,
+            major_cn=data.major_cn,
+            mask=data.multiplicity_estimation_mask,
+        )
+        multiplicity_f1 = multiplicity_asymmetric_f1
 
     bic_refit_ari: float | None = None
     bic_refit_cp_rmse: float | None = None
@@ -398,4 +437,6 @@ def evaluate_fit_against_simulation(
         summary_cp_rmse=summary_cp_rmse,
         bic_refit_ari=bic_refit_ari,
         bic_refit_cp_rmse=bic_refit_cp_rmse,
+        multiplicity_asymmetric_f1=multiplicity_asymmetric_f1,
+        multiplicity_estimable_f1=multiplicity_estimable_f1,
     )

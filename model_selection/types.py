@@ -37,6 +37,10 @@ class SelectionArtifact:
     bic: float | None = None
     classic_bic: float | None = None
     extended_bic: float | None = None
+    partition_icl: float | None = None
+    partition_log_evidence: float | None = None
+    partition_code_deviance: float | None = None
+    partition_dirichlet_alpha: float | None = None
     classic_bic_depth_n: float | None = None
     classic_bic_active_df: float | None = None
     classic_bic_active_df_depth_n: float | None = None
@@ -206,5 +210,4 @@ class CandidateStaticMetadata:
     edge_list_hash: str
     pilot_matrix_hash: str
     input_data_hash: str
-
 

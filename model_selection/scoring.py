@@ -8,13 +8,18 @@ from ..io.data import TumorData
 from ..core.bic import (
     compute_classic_bic,
     compute_extended_bic,
+    compute_partition_icl,
 )
+from .config import PARTITION_ICL_DIRICHLET_ALPHA, SELECTION_SCORE_NAMES
 
 def _normalize_selection_score_name(selection_score: str) -> str:
     normalized = str(selection_score).strip().lower()
-    if normalized == "bic":
-        return "bic"
-    raise ValueError(f"Unknown selection_score: {selection_score}")
+    if normalized == "ebic":
+        normalized = "extended_bic"
+    if normalized in SELECTION_SCORE_NAMES:
+        return normalized
+    allowed = ", ".join(SELECTION_SCORE_NAMES)
+    raise ValueError(f"Unknown selection_score: {selection_score}. Expected one of: {allowed}.")
 
 
 def _selection_score_value(
@@ -25,7 +30,9 @@ def _selection_score_value(
     bic_df_scale: float,
     bic_cluster_penalty: float,
     selection_score: str,
-) -> tuple[float, float, float]:
+    cluster_sizes: np.ndarray | None = None,
+    partition_icl_alpha: float = PARTITION_ICL_DIRICHLET_ALPHA,
+) -> tuple[float, float, float, float]:
     classic_bic = compute_classic_bic(loglik, num_clusters, data)
     extended_bic = compute_extended_bic(
         loglik,
@@ -34,16 +41,40 @@ def _selection_score_value(
         bic_df_scale=bic_df_scale,
         bic_cluster_penalty=bic_cluster_penalty,
     )
+    partition_icl = (
+        float("nan")
+        if cluster_sizes is None
+        else compute_partition_icl(
+            loglik,
+            cluster_sizes,
+            data,
+            alpha=float(partition_icl_alpha),
+        )
+    )
     normalized = _normalize_selection_score_name(selection_score)
     if normalized == "bic":
-        return float(classic_bic), float(classic_bic), float(extended_bic)
-    raise ValueError(f"Unknown normalized selection_score: {selection_score}")
+        selected_score = classic_bic
+    elif normalized == "extended_bic":
+        selected_score = extended_bic
+    elif normalized == "partition_icl":
+        if not np.isfinite(partition_icl):
+            raise ValueError("partition_icl selection requires candidate cluster sizes or labels.")
+        selected_score = partition_icl
+    else:
+        raise ValueError(f"Unknown normalized selection_score: {selection_score}")
+    return (
+        float(selected_score),
+        float(classic_bic),
+        float(extended_bic),
+        float(partition_icl),
+    )
 
 
 def _is_bic_selection_eligible(
     *,
     raw_kkt_eligible: bool,
     classic_bic: float,
+    selection_score_value: float | None = None,
     bic_refit_finite_candidate_found: bool | None = None,
     bic_refit_converged: bool | None = None,
 ) -> bool:
@@ -52,10 +83,16 @@ def _is_bic_selection_eligible(
         if bic_refit_finite_candidate_found is not None
         else bool(bic_refit_converged)
     )
+    selected_score_finite = (
+        np.isfinite(float(classic_bic))
+        if selection_score_value is None
+        else np.isfinite(float(selection_score_value))
+    )
     return bool(
         bool(raw_kkt_eligible)
         and refit_finite
         and np.isfinite(float(classic_bic))
+        and selected_score_finite
     )
 
 
@@ -79,6 +116,42 @@ def _bic_selection_eligible_mask(search_df: pd.DataFrame) -> np.ndarray:
     if "converged" in search_df.columns:
         return search_df["converged"].astype(bool).to_numpy(dtype=bool)
     return np.zeros(n_rows, dtype=bool)
+
+
+def _positive_admm_fusion_selection_mask(search_df: pd.DataFrame) -> np.ndarray:
+    """Strict final-candidate contract for partition-guided fusion.
+
+    A proposal/refit is never a final estimator in this mode.  The selected
+    row must come from the raw positive-penalty complete-graph ADMM solve and
+    retain the usual KKT/refit score certificates.
+    """
+
+    eligible = _bic_selection_eligible_mask(search_df)
+    if search_df.empty:
+        return eligible
+    if "candidate_pool_source" not in search_df.columns:
+        return np.zeros(search_df.shape[0], dtype=bool)
+    source_ok = (
+        search_df["candidate_pool_source"]
+        .astype(str)
+        .eq("raw_fused_lambda_path")
+        .to_numpy(dtype=bool)
+    )
+    if "lambda" not in search_df.columns:
+        return np.zeros(search_df.shape[0], dtype=bool)
+    lambdas = search_df["lambda"].to_numpy(dtype=float)
+    lambda_ok = np.isfinite(lambdas) & (lambdas > 0.0)
+    if "inner_solver" not in search_df.columns or "admm_iterations" not in search_df.columns:
+        return np.zeros(search_df.shape[0], dtype=bool)
+    solver_ok = (
+        search_df["inner_solver"]
+        .astype(str)
+        .eq("admm_complete_graph")
+        .to_numpy(dtype=bool)
+    )
+    admm_iterations = pd.to_numeric(search_df["admm_iterations"], errors="coerce").to_numpy(dtype=float)
+    iterations_ok = np.isfinite(admm_iterations) & (admm_iterations > 0.0)
+    return eligible & source_ok & lambda_ok & solver_ok & iterations_ok
 
 
 def _row_bic_selection_eligible(row: pd.Series) -> bool:
@@ -166,7 +239,16 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
         classic_bic = enriched["bic"].to_numpy(dtype=float)
     else:
         classic_bic = np.full(n_rows, np.nan, dtype=float)
-    enriched["bic_selection_eligible"] = (raw_kkt | partition_candidate) & bic_refit & np.isfinite(classic_bic)
+    if "bic" in enriched.columns:
+        selected_score = enriched["bic"].to_numpy(dtype=float)
+    else:
+        selected_score = classic_bic
+    enriched["bic_selection_eligible"] = (
+        (raw_kkt | partition_candidate)
+        & bic_refit
+        & np.isfinite(classic_bic)
+        & np.isfinite(selected_score)
+    )
     return enriched
 
 

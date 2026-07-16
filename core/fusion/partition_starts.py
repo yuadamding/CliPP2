@@ -8,8 +8,18 @@ import numpy as np
 import torch
 
 from ...io.data import TumorData
-from ..bic import bic_degrees_of_freedom, compute_bic_with_df, effective_bic_mutation_region_count
-from .refit import PartitionRefitResult, _canonical_labels, partition_constrained_observed_refit
+from ..bic import (
+    bic_degrees_of_freedom,
+    cluster_sizes_from_labels,
+    compute_bic_with_df,
+    compute_partition_icl,
+    effective_bic_mutation_region_count,
+)
+from .refit import (
+    PartitionRefitResult,
+    _canonical_labels,
+    partition_constrained_observed_refit,
+)
 from .starts import _mutation_region_loss_grid_numpy
 from .torch_backend import (
     TorchTumorData,
@@ -19,6 +29,12 @@ from .torch_backend import (
     to_torch_tumor_data,
 )
 from .types import TorchRuntime
+
+
+# Bound each temporary used to initialize the dense Ward cost matrix.  The
+# unchunked broadcast has shape (M, M, S), so its memory grows by several
+# copies of M^2*S even though the persistent Ward state is only O(M^2).
+_WARD_INITIAL_PAIRWISE_WORK_ELEMENTS = 4_000_000
 
 
 @dataclass(frozen=True)
@@ -36,7 +52,9 @@ class PartitionCandidate:
     diagnostics: dict[str, float] = field(default_factory=dict)
 
 
-def compute_partition_bic(*, fit_loss: float, num_clusters: int, data: TumorData) -> float:
+def compute_partition_bic(
+    *, fit_loss: float, num_clusters: int, data: TumorData
+) -> float:
     # fit_loss is the negative log-likelihood (loglik = -fit_loss); delegate to the
     # single BIC definition in core.bic so the formula/observed-mutation_region count never drift.
     return compute_bic_with_df(
@@ -61,7 +79,9 @@ def _partition_work_dtype(dtype: torch.dtype) -> torch.dtype:
     return torch.float32 if dtype == torch.float16 else dtype
 
 
-def _copy_torch_tumor_data(data: TorchTumorData, *, dtype: torch.dtype, device: torch.device) -> TorchTumorData:
+def _copy_torch_tumor_data(
+    data: TorchTumorData, *, dtype: torch.dtype, device: torch.device
+) -> TorchTumorData:
     return TorchTumorData(
         alt=data.alt.to(dtype=dtype, device=device),
         total=data.total.to(dtype=dtype, device=device),
@@ -71,7 +91,9 @@ def _copy_torch_tumor_data(data: TorchTumorData, *, dtype: torch.dtype, device: 
         b_minus=data.b_minus.to(dtype=dtype, device=device),
         b_plus=data.b_plus.to(dtype=dtype, device=device),
         b_fixed=data.b_fixed.to(dtype=dtype, device=device),
-        count_observed=None if data.count_observed is None else data.count_observed.to(device=device),
+        count_observed=None
+        if data.count_observed is None
+        else data.count_observed.to(device=device),
     )
 
 
@@ -84,11 +106,17 @@ def _resolve_partition_runtime(
     dtype: str | torch.dtype | None = None,
 ) -> tuple[TorchRuntime, TorchTumorData]:
     if torch_data is not None:
-        runtime_device = torch.device(device) if device is not None else torch_data.alt.device
-        runtime_dtype = torch_data.alt.dtype if dtype is None or isinstance(dtype, torch.dtype) else resolve_runtime(
-            str(runtime_device),
-            dtype=str(dtype),
-        ).dtype
+        runtime_device = (
+            torch.device(device) if device is not None else torch_data.alt.device
+        )
+        runtime_dtype = (
+            torch_data.alt.dtype
+            if dtype is None or isinstance(dtype, torch.dtype)
+            else resolve_runtime(
+                str(runtime_device),
+                dtype=str(dtype),
+            ).dtype
+        )
         if isinstance(dtype, torch.dtype):
             runtime_dtype = dtype
         runtime_dtype = _partition_work_dtype(runtime_dtype)
@@ -97,13 +125,19 @@ def _resolve_partition_runtime(
             device_name=_torch_device_name(runtime_device),
             dtype=runtime_dtype,
         )
-        return runtime, _copy_torch_tumor_data(torch_data, dtype=runtime.dtype, device=runtime.device)
+        return runtime, _copy_torch_tumor_data(
+            torch_data, dtype=runtime.dtype, device=runtime.device
+        )
 
     if torch.is_tensor(exact_pilot):
-        runtime_device = torch.device(device) if device is not None else exact_pilot.device
+        runtime_device = (
+            torch.device(device) if device is not None else exact_pilot.device
+        )
         runtime_dtype = exact_pilot.dtype if dtype is None else dtype
         if not isinstance(runtime_dtype, torch.dtype):
-            runtime_dtype = resolve_runtime(str(runtime_device), dtype=str(runtime_dtype)).dtype
+            runtime_dtype = resolve_runtime(
+                str(runtime_device), dtype=str(runtime_dtype)
+            ).dtype
         runtime_dtype = _partition_work_dtype(runtime_dtype)
         runtime = TorchRuntime(
             device=runtime_device,
@@ -111,14 +145,25 @@ def _resolve_partition_runtime(
             dtype=runtime_dtype,
         )
     else:
-        requested_device = "cuda" if device is None and torch.cuda.is_available() else device
-        runtime = resolve_runtime(None if requested_device is None else str(requested_device), dtype=None if dtype is None else str(dtype))
+        requested_device = (
+            "cuda" if device is None and torch.cuda.is_available() else device
+        )
+        runtime = resolve_runtime(
+            None if requested_device is None else str(requested_device),
+            dtype=None if dtype is None else str(dtype),
+        )
         if runtime.dtype == torch.float16:
-            runtime = TorchRuntime(device=runtime.device, device_name=runtime.device_name, dtype=torch.float32)
+            runtime = TorchRuntime(
+                device=runtime.device,
+                device_name=runtime.device_name,
+                dtype=torch.float32,
+            )
     return runtime, to_torch_tumor_data(data, runtime)
 
 
-def _as_torch(array: np.ndarray | torch.Tensor | object, *, runtime: TorchRuntime) -> torch.Tensor:
+def _as_torch(
+    array: np.ndarray | torch.Tensor | object, *, runtime: TorchRuntime
+) -> torch.Tensor:
     return as_runtime_tensor(array, runtime)
 
 
@@ -126,9 +171,12 @@ def _data_arrays(data: TumorData) -> dict[str, np.ndarray]:
     return {
         "alt": np.asarray(data.alt_counts, dtype=np.float64),
         "total": np.asarray(data.total_counts, dtype=np.float64),
-        "b_minus": np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.minor_cn, dtype=np.float64),
-        "b_plus": np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.major_cn, dtype=np.float64),
-        "b_fixed": np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.fixed_multiplicity, dtype=np.float64),
+        "b_minus": np.asarray(data.scaling, dtype=np.float64)
+        * np.asarray(data.minor_cn, dtype=np.float64),
+        "b_plus": np.asarray(data.scaling, dtype=np.float64)
+        * np.asarray(data.major_cn, dtype=np.float64),
+        "b_fixed": np.asarray(data.scaling, dtype=np.float64)
+        * np.asarray(data.fixed_multiplicity, dtype=np.float64),
         "ambiguous": np.asarray(data.multiplicity_estimation_mask, dtype=bool),
         "upper": np.asarray(data.phi_upper, dtype=np.float64),
     }
@@ -251,18 +299,30 @@ def observed_curvature_at_pilot_torch(
     h_right = right - x0
     valid = (h_left > 1e-12) & (h_right > 1e-12)
 
-    f_left = _mutation_region_loss_matrix_torch(torch_data, left, major_prior=major_prior, eps=eps)
-    f0 = _mutation_region_loss_matrix_torch(torch_data, x0, major_prior=major_prior, eps=eps)
-    f_right = _mutation_region_loss_matrix_torch(torch_data, right, major_prior=major_prior, eps=eps)
+    f_left = _mutation_region_loss_matrix_torch(
+        torch_data, left, major_prior=major_prior, eps=eps
+    )
+    f0 = _mutation_region_loss_matrix_torch(
+        torch_data, x0, major_prior=major_prior, eps=eps
+    )
+    f_right = _mutation_region_loss_matrix_torch(
+        torch_data, right, major_prior=major_prior, eps=eps
+    )
     denom = h_left * h_right * (h_left + h_right)
-    curvature = 2.0 * (h_left * f_right - (h_left + h_right) * f0 + h_right * f_left) / denom
+    curvature = (
+        2.0 * (h_left * f_right - (h_left + h_right) * f0 + h_right * f_left) / denom
+    )
     floor = torch.full_like(curvature, float(curvature_floor))
-    curvature = torch.where(valid & torch.isfinite(curvature), torch.maximum(curvature, floor), floor)
+    curvature = torch.where(
+        valid & torch.isfinite(curvature), torch.maximum(curvature, floor), floor
+    )
 
     finite = curvature[torch.isfinite(curvature)]
     if finite.numel() and 0.0 < float(curvature_cap_quantile) < 1.0:
         cap = torch.quantile(finite, float(curvature_cap_quantile))
-        if bool(torch.isfinite(cap).item()) and float(cap.item()) > float(curvature_floor):
+        if bool(torch.isfinite(cap).item()) and float(cap.item()) > float(
+            curvature_floor
+        ):
             curvature = torch.minimum(curvature, cap)
     return torch.maximum(curvature, floor)
 
@@ -286,7 +346,13 @@ def observed_curvature_at_pilot(
 
     for mutation_idx in range(phi0.shape[0]):
         for region_idx in range(phi0.shape[1]):
-            x0 = float(np.clip(phi0[mutation_idx, region_idx], lower, upper[mutation_idx, region_idx]))
+            x0 = float(
+                np.clip(
+                    phi0[mutation_idx, region_idx],
+                    lower,
+                    upper[mutation_idx, region_idx],
+                )
+            )
             width = max(float(upper[mutation_idx, region_idx]) - lower, 0.0)
             step = max(float(min_step), float(step_fraction) * max(width, abs(x0), 1.0))
             left = max(lower, x0 - step)
@@ -334,7 +400,9 @@ def observed_curvature_at_pilot(
                 / (h_left * h_right * (h_left + h_right))
             )
             if np.isfinite(curvature):
-                h[mutation_idx, region_idx] = max(float(curvature), float(curvature_floor))
+                h[mutation_idx, region_idx] = max(
+                    float(curvature), float(curvature_floor)
+                )
 
     finite = h[np.isfinite(h)]
     if finite.size and 0.0 < float(curvature_cap_quantile) < 1.0:
@@ -344,7 +412,9 @@ def observed_curvature_at_pilot(
     return np.maximum(h, float(curvature_floor))
 
 
-def _ward_merge_cost(H_a: np.ndarray, mu_a: np.ndarray, H_b: np.ndarray, mu_b: np.ndarray) -> float:
+def _ward_merge_cost(
+    H_a: np.ndarray, mu_a: np.ndarray, H_b: np.ndarray, mu_b: np.ndarray
+) -> float:
     denom = H_a + H_b
     weight = np.divide(H_a * H_b, denom, out=np.zeros_like(denom), where=denom > 0.0)
     value = 0.5 * float(np.sum(weight * np.square(mu_a - mu_b)))
@@ -368,7 +438,9 @@ def hessian_weighted_ward_label_sets(
 
     H: dict[int, np.ndarray] = {idx: h[idx].copy() for idx in range(num_mutations)}
     mu: dict[int, np.ndarray] = {idx: phi0[idx].copy() for idx in range(num_mutations)}
-    members: dict[int, np.ndarray] = {idx: np.asarray([idx], dtype=np.int64) for idx in range(num_mutations)}
+    members: dict[int, np.ndarray] = {
+        idx: np.asarray([idx], dtype=np.int64) for idx in range(num_mutations)
+    }
     active: set[int] = set(range(num_mutations))
     version: dict[int, int] = {idx: 0 for idx in range(num_mutations)}
     heap: list[tuple[float, int, int, int, int]] = []
@@ -400,7 +472,9 @@ def hessian_weighted_ward_label_sets(
             ):
                 break
         else:
-            raise RuntimeError("Hessian-weighted Ward heap exhausted before all clusters were merged.")
+            raise RuntimeError(
+                "Hessian-weighted Ward heap exhausted before all clusters were merged."
+            )
 
         new_id = next_cluster_id
         next_cluster_id += 1
@@ -442,6 +516,7 @@ def hessian_weighted_ward_label_sets_torch(
     K_grid: Sequence[int],
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
+    initial_pairwise_work_elements: int = _WARD_INITIAL_PAIRWISE_WORK_ELEMENTS,
 ) -> dict[int, np.ndarray]:
     if torch.is_tensor(exact_pilot):
         pilot_device = exact_pilot.device
@@ -450,7 +525,9 @@ def hessian_weighted_ward_label_sets_torch(
         pilot_device = curvature.device
         pilot_dtype = curvature.dtype
     else:
-        pilot_device = torch.device("cuda" if device is None and torch.cuda.is_available() else "cpu")
+        pilot_device = torch.device(
+            "cuda" if device is None and torch.cuda.is_available() else "cpu"
+        )
         pilot_dtype = torch.float64
     runtime_device = torch.device(device) if device is not None else pilot_device
     if dtype is None:
@@ -475,26 +552,67 @@ def hessian_weighted_ward_label_sets_torch(
         return {}
 
     num_regions = int(phi0.shape[1])
+    if int(initial_pairwise_work_elements) < 1:
+        raise ValueError("initial_pairwise_work_elements must be positive.")
     max_nodes = max(2 * num_mutations - 1, 1)
-    H = torch.zeros((max_nodes, num_regions), dtype=runtime.dtype, device=runtime.device)
+    H = torch.zeros(
+        (max_nodes, num_regions), dtype=runtime.dtype, device=runtime.device
+    )
     mu = torch.zeros_like(H)
     H[:num_mutations] = h
     mu[:num_mutations] = phi0
     active = torch.zeros((max_nodes,), dtype=torch.bool, device=runtime.device)
     active[:num_mutations] = True
-    mutation_cluster = torch.arange(num_mutations, dtype=torch.long, device=runtime.device)
+    mutation_cluster = torch.arange(
+        num_mutations, dtype=torch.long, device=runtime.device
+    )
 
-    denom = H[:num_mutations, None, :] + H[None, :num_mutations, :]
-    weight = torch.where(denom > 0.0, H[:num_mutations, None, :] * H[None, :num_mutations, :] / denom.clamp_min(torch.finfo(runtime.dtype).tiny), torch.zeros_like(denom))
-    diff = mu[:num_mutations, None, :] - mu[None, :num_mutations, :]
-    initial_cost = 0.5 * torch.sum(weight * torch.square(diff), dim=2)
     finite_large = torch.finfo(runtime.dtype).max / 16.0
-    cost_matrix = torch.full((max_nodes, max_nodes), finite_large, dtype=runtime.dtype, device=runtime.device)
-    upper_mask = torch.triu(torch.ones((num_mutations, num_mutations), dtype=torch.bool, device=runtime.device), diagonal=1)
-    cost_matrix[:num_mutations, :num_mutations] = torch.where(upper_mask, initial_cost, torch.full_like(initial_cost, finite_large))
+    cost_matrix = torch.full(
+        (max_nodes, max_nodes), finite_large, dtype=runtime.dtype, device=runtime.device
+    )
+    # Compute the exact singleton Ward costs in row blocks.  This retains the
+    # same dense cost matrix and merge order while avoiding simultaneous
+    # (M, M, S) denominator, weight, difference, and product tensors.  It is
+    # particularly important for multi-region cohorts with thousands of
+    # mutations, where the former initializer could exhaust a 10-GiB GPU
+    # before the ADMM fit started.
+    pair_region_elements_per_row = max(num_mutations * num_regions, 1)
+    initial_row_chunk = max(
+        1,
+        min(
+            num_mutations,
+            int(initial_pairwise_work_elements) // pair_region_elements_per_row,
+        ),
+    )
+    all_columns = torch.arange(num_mutations, dtype=torch.long, device=runtime.device)
+    H_initial = H[:num_mutations]
+    mu_initial = mu[:num_mutations]
+    tiny = torch.finfo(runtime.dtype).tiny
+    for row_start in range(0, num_mutations, initial_row_chunk):
+        row_stop = min(row_start + initial_row_chunk, num_mutations)
+        H_left = H_initial[row_start:row_stop].unsqueeze(1)
+        denom = H_left + H_initial.unsqueeze(0)
+        weight = H_left * H_initial.unsqueeze(0)
+        weight.div_(denom.clamp_min(tiny))
+        weight.masked_fill_(denom <= 0.0, 0.0)
+        diff = mu_initial[row_start:row_stop].unsqueeze(1) - mu_initial.unsqueeze(0)
+        diff.square_().mul_(weight)
+        initial_cost = 0.5 * torch.sum(diff, dim=2)
+        row_ids = torch.arange(
+            row_start, row_stop, dtype=torch.long, device=runtime.device
+        )
+        upper_mask = all_columns.unsqueeze(0) > row_ids.unsqueeze(1)
+        cost_matrix[row_start:row_stop, :num_mutations] = torch.where(
+            upper_mask,
+            initial_cost,
+            finite_large,
+        )
 
     def current_labels() -> np.ndarray:
-        return _canonical_labels(mutation_cluster.detach().cpu().numpy().astype(np.int64, copy=False))
+        return _canonical_labels(
+            mutation_cluster.detach().cpu().numpy().astype(np.int64, copy=False)
+        )
 
     out: dict[int, np.ndarray] = {}
     active_count = num_mutations
@@ -506,7 +624,9 @@ def hessian_weighted_ward_label_sets_torch(
         flat_index = int(torch.argmin(cost_matrix).item())
         min_cost = float(cost_matrix.reshape(-1)[flat_index].item())
         if not np.isfinite(min_cost) or min_cost >= finite_large * 0.5:
-            raise RuntimeError("Hessian-weighted Ward dense CUDA cost matrix exhausted before all clusters were merged.")
+            raise RuntimeError(
+                "Hessian-weighted Ward dense CUDA cost matrix exhausted before all clusters were merged."
+            )
         left = int(flat_index // max_nodes)
         right = int(flat_index % max_nodes)
         new_id = next_cluster_id
@@ -516,7 +636,8 @@ def hessian_weighted_ward_label_sets_torch(
         H[new_id] = H_new
         mu[new_id] = torch.where(
             H_new > 0.0,
-            (H[left] * mu[left] + H[right] * mu[right]) / H_new.clamp_min(torch.finfo(runtime.dtype).tiny),
+            (H[left] * mu[left] + H[right] * mu[right])
+            / H_new.clamp_min(torch.finfo(runtime.dtype).tiny),
             0.5 * (mu[left] + mu[right]),
         )
         mutation_cluster = torch.where(
@@ -541,7 +662,9 @@ def hessian_weighted_ward_label_sets_torch(
             denom_vec = H[new_id].unsqueeze(0) + H[other]
             weight_vec = torch.where(
                 denom_vec > 0.0,
-                H[new_id].unsqueeze(0) * H[other] / denom_vec.clamp_min(torch.finfo(runtime.dtype).tiny),
+                H[new_id].unsqueeze(0)
+                * H[other]
+                / denom_vec.clamp_min(torch.finfo(runtime.dtype).tiny),
                 torch.zeros_like(denom_vec),
             )
             diff_vec = mu[new_id].unsqueeze(0) - mu[other]
@@ -572,7 +695,7 @@ def _loss_to_centers(
     for cluster_idx in range(num_clusters):
         for region_idx in range(int(data.num_regions)):
             beta = float(centers[cluster_idx, region_idx])
-            cost[:, cluster_idx] += _mutation_region_loss_vector_numpy(
+            region_loss = _mutation_region_loss_vector_numpy(
                 beta,
                 alt=arrays["alt"][:, region_idx],
                 total=arrays["total"][:, region_idx],
@@ -583,7 +706,16 @@ def _loss_to_centers(
                 major_prior=major_prior,
                 eps=eps,
             )
-            infeasible[:, cluster_idx] |= beta > arrays["upper"][:, region_idx] + max(float(eps), 1e-8)
+            if data.count_observed is not None:
+                region_loss = np.where(
+                    np.asarray(data.count_observed, dtype=bool)[:, region_idx],
+                    region_loss,
+                    0.0,
+                )
+            cost[:, cluster_idx] += region_loss
+            infeasible[:, cluster_idx] |= beta > arrays["upper"][:, region_idx] + max(
+                float(eps), 1e-8
+            )
 
     cost[infeasible] = float(infeasible_penalty)
     return cost
@@ -621,9 +753,19 @@ def _loss_to_centers_torch(
         major_prior=float(major_prior),
         eps=float(eps),
     )
+    if torch_data.count_observed is not None:
+        loss = torch.where(
+            torch_data.count_observed.unsqueeze(1),
+            loss,
+            torch.zeros_like(loss),
+        )
     cost = torch.sum(loss, dim=2)
-    infeasible = torch.any(beta > torch_data.phi_upper.unsqueeze(1) + max(float(eps), 1e-8), dim=2)
-    safe_penalty = min(float(infeasible_penalty), float(torch.finfo(cost.dtype).max) / 16.0)
+    infeasible = torch.any(
+        beta > torch_data.phi_upper.unsqueeze(1) + max(float(eps), 1e-8), dim=2
+    )
+    safe_penalty = min(
+        float(infeasible_penalty), float(torch.finfo(cost.dtype).max) / 16.0
+    )
     return torch.where(
         infeasible,
         torch.full_like(cost, float(safe_penalty)),
@@ -659,6 +801,73 @@ def _repair_empty_clusters(labels: np.ndarray, cost: np.ndarray) -> np.ndarray:
     return labels
 
 
+def _classification_log_cluster_weights(
+    labels: np.ndarray,
+    *,
+    num_clusters: int,
+    alpha: float,
+) -> np.ndarray:
+    """Return smoothed log cluster proportions for classification-EM.
+
+    The read-count likelihood used by the partition refit is conditional on the
+    mutation labels.  Adding ``log(pi_k)`` to the classification likelihood makes
+    the reassignment step account for the probability of those labels instead of
+    treating every requested component as equally likely regardless of support.
+    """
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    num_clusters = int(num_clusters)
+    alpha = float(alpha)
+    if num_clusters <= 0:
+        raise ValueError("num_clusters must be positive.")
+    if not np.isfinite(alpha) or alpha <= 0.0:
+        raise ValueError("classification_weight_alpha must be positive and finite.")
+    if labels.size == 0:
+        raise ValueError("classification cluster weights require at least one label.")
+    if np.any(labels < 0) or np.any(labels >= num_clusters):
+        raise ValueError("labels must be in [0, num_clusters).")
+
+    counts = np.bincount(labels, minlength=num_clusters).astype(np.float64, copy=False)
+    probabilities = (counts + alpha) / (
+        float(labels.size) + alpha * float(num_clusters)
+    )
+    return np.log(probabilities)
+
+
+def _classification_assignment_cost(
+    count_cost: np.ndarray,
+    labels: np.ndarray,
+    *,
+    alpha: float,
+) -> np.ndarray:
+    """Add the negative log cluster-proportion term to mutation/cluster costs."""
+    count_cost = np.asarray(count_cost)
+    if count_cost.ndim != 2 or count_cost.shape[1] <= 0:
+        raise ValueError("count_cost must be a non-empty mutation-by-cluster matrix.")
+    if np.asarray(labels).reshape(-1).size != int(count_cost.shape[0]):
+        raise ValueError("labels must contain one entry per mutation cost row.")
+    log_weights = _classification_log_cluster_weights(
+        labels,
+        num_clusters=int(count_cost.shape[1]),
+        alpha=float(alpha),
+    )
+    return count_cost - log_weights[None, :]
+
+
+def _classification_refit_score(
+    data: TumorData,
+    labels: np.ndarray,
+    refit: PartitionRefitResult,
+    *,
+    alpha: float,
+) -> float:
+    return compute_partition_icl(
+        float(refit.loglik),
+        cluster_sizes_from_labels(labels),
+        data,
+        alpha=float(alpha),
+    )
+
+
 def refine_partition_likelihood(
     data: TumorData,
     labels: np.ndarray,
@@ -669,9 +878,14 @@ def refine_partition_likelihood(
     max_iter: int = 12,
     refit_max_iter: int = 32,
     hint_phi: np.ndarray | None = None,
+    classification_weight_alpha: float | None = None,
+    allow_component_death: bool = False,
 ) -> tuple[np.ndarray, PartitionRefitResult]:
     labels = _canonical_labels(np.asarray(labels, dtype=np.int64))
     refit: PartitionRefitResult | None = None
+    best_labels: np.ndarray | None = None
+    best_refit: PartitionRefitResult | None = None
+    best_score = float("inf")
     for _ in range(max(int(max_iter), 0)):
         refit = partition_constrained_observed_refit(
             data,
@@ -682,9 +896,35 @@ def refine_partition_likelihood(
             max_iter=max(int(refit_max_iter), 32),
             hint_phi=hint_phi,
         )
-        cost = _loss_to_centers(data, refit.cluster_centers, major_prior=float(major_prior), eps=float(eps))
-        labels_next = np.argmin(cost, axis=1).astype(np.int64, copy=False)
-        labels_next = _repair_empty_clusters(labels_next, cost)
+        if classification_weight_alpha is not None:
+            current_score = _classification_refit_score(
+                data,
+                labels,
+                refit,
+                alpha=float(classification_weight_alpha),
+            )
+            if current_score < best_score:
+                best_score = float(current_score)
+                best_labels = labels.copy()
+                best_refit = refit
+        count_cost = _loss_to_centers(
+            data,
+            refit.cluster_centers,
+            major_prior=float(major_prior),
+            eps=float(eps),
+        )
+        assignment_cost = (
+            count_cost
+            if classification_weight_alpha is None
+            else _classification_assignment_cost(
+                count_cost,
+                labels,
+                alpha=float(classification_weight_alpha),
+            )
+        )
+        labels_next = np.argmin(assignment_cost, axis=1).astype(np.int64, copy=False)
+        if not bool(allow_component_death):
+            labels_next = _repair_empty_clusters(labels_next, assignment_cost)
         labels_next = _canonical_labels(labels_next)
         if np.array_equal(labels_next, labels):
             labels = labels_next
@@ -699,6 +939,18 @@ def refine_partition_likelihood(
         max_iter=max(int(refit_max_iter), 32),
         hint_phi=hint_phi,
     )
+    if classification_weight_alpha is not None:
+        final_score = _classification_refit_score(
+            data,
+            labels,
+            refit,
+            alpha=float(classification_weight_alpha),
+        )
+        if final_score < best_score:
+            best_labels = labels.copy()
+            best_refit = refit
+        if best_labels is not None and best_refit is not None:
+            return _canonical_labels(best_labels), best_refit
     return _canonical_labels(labels), refit
 
 
@@ -752,13 +1004,19 @@ def partition_constrained_observed_refit_torch(
         )
 
     labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=runtime.device)
-    membership = torch.nn.functional.one_hot(labels_t, num_classes=n_clusters).to(dtype=runtime.dtype)
-    lower = torch.full((n_clusters, n_regions), float(eps), dtype=runtime.dtype, device=runtime.device)
+    membership = torch.nn.functional.one_hot(labels_t, num_classes=n_clusters).to(
+        dtype=runtime.dtype
+    )
+    lower = torch.full(
+        (n_clusters, n_regions), float(eps), dtype=runtime.dtype, device=runtime.device
+    )
     upper = torch.empty_like(lower)
     for cluster_idx in range(n_clusters):
         member_mask = labels_t == int(cluster_idx)
         if bool(torch.any(member_mask).item()):
-            upper[cluster_idx] = torch.min(torch_data.phi_upper[member_mask], dim=0).values
+            upper[cluster_idx] = torch.min(
+                torch_data.phi_upper[member_mask], dim=0
+            ).values
         else:
             upper[cluster_idx] = lower[cluster_idx]
     upper = torch.where(torch.isfinite(upper) & (upper >= lower), upper, lower)
@@ -793,7 +1051,12 @@ def partition_constrained_observed_refit_torch(
     ratio = 0.5 * (np.sqrt(5.0) - 1.0)
     n_iter = max(int(max_iter), 32)
     for _ in range(n_iter):
-        if bool(torch.all(torch.abs(right - left) <= tol * (1.0 + torch.abs(left) + torch.abs(right))).item()):
+        if bool(
+            torch.all(
+                torch.abs(right - left)
+                <= tol * (1.0 + torch.abs(left) + torch.abs(right))
+            ).item()
+        ):
             break
         x1 = right - float(ratio) * (right - left)
         x2 = left + float(ratio) * (right - left)
@@ -807,16 +1070,22 @@ def partition_constrained_observed_refit_torch(
     candidates = [midpoint, left, right, lower, upper]
     if hint_phi is not None:
         hint_t = _as_torch(hint_phi, runtime=runtime)
-        hint_centers = torch.empty((n_clusters, n_regions), dtype=runtime.dtype, device=runtime.device)
+        hint_centers = torch.empty(
+            (n_clusters, n_regions), dtype=runtime.dtype, device=runtime.device
+        )
         for cluster_idx in range(n_clusters):
             member_mask = labels_t == int(cluster_idx)
             if bool(torch.any(member_mask).item()):
-                hint_centers[cluster_idx] = torch.median(hint_t[member_mask], dim=0).values
+                hint_centers[cluster_idx] = torch.median(
+                    hint_t[member_mask], dim=0
+                ).values
             else:
                 hint_centers[cluster_idx] = lower[cluster_idx]
         candidates.append(torch.minimum(torch.maximum(hint_centers, lower), upper))
     candidate_values = torch.stack(candidates, dim=0)
-    candidate_losses = torch.stack([objective(candidate) for candidate in candidates], dim=0)
+    candidate_losses = torch.stack(
+        [objective(candidate) for candidate in candidates], dim=0
+    )
     best_idx = torch.argmin(candidate_losses, dim=0, keepdim=True)
     centers = torch.gather(candidate_values, 0, best_idx).squeeze(0)
     best_loss = torch.gather(candidate_losses, 0, best_idx).squeeze(0)
@@ -833,10 +1102,14 @@ def partition_constrained_observed_refit_torch(
     boundary_count = int(torch.sum(at_boundary).detach().cpu().item())
     active_df = int(centers.numel() - boundary_count)
     phi = centers[labels_t]
-    phi = torch.minimum(torch.maximum(phi, torch.full_like(phi, float(eps))), torch_data.phi_upper)
+    phi = torch.minimum(
+        torch.maximum(phi, torch.full_like(phi, float(eps))), torch_data.phi_upper
+    )
     finite_candidate_found = bool(torch.isfinite(total_loss).item())
     refit_coordinate_count = int(n_clusters * n_regions)
-    finite_coordinate_count = int(torch.sum(torch.isfinite(best_loss)).detach().cpu().item())
+    finite_coordinate_count = int(
+        torch.sum(torch.isfinite(best_loss)).detach().cpu().item()
+    )
     return PartitionRefitResult(
         phi=phi.detach().cpu().numpy().astype(np.float64, copy=False),
         cluster_centers=centers.detach().cpu().numpy().astype(np.float64, copy=False),
@@ -848,8 +1121,12 @@ def partition_constrained_observed_refit_torch(
         finite_candidate_found=finite_candidate_found,
         refit_coordinate_count=refit_coordinate_count,
         refit_finite_coordinate_count=finite_coordinate_count,
-        refit_total_grid_points=int(refit_coordinate_count * (2 * n_iter + len(candidates))),
-        refit_max_grid_spacing=float(torch.max(initial_width).detach().cpu().item()) if initial_width.numel() else 0.0,
+        refit_total_grid_points=int(
+            refit_coordinate_count * (2 * n_iter + len(candidates))
+        ),
+        refit_max_grid_spacing=float(torch.max(initial_width).detach().cpu().item())
+        if initial_width.numel()
+        else 0.0,
         refit_total_candidate_basins=refit_coordinate_count,
         refit_total_refined_candidates=refit_coordinate_count,
         refit_min_best_second_loss_gap=float(best_second_loss_gap),
@@ -871,6 +1148,8 @@ def refine_partition_likelihood_torch(
     torch_data: TorchTumorData | None = None,
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
+    classification_weight_alpha: float | None = None,
+    allow_component_death: bool = False,
 ) -> tuple[np.ndarray, PartitionRefitResult]:
     runtime, torch_data = _resolve_partition_runtime(
         data=data,
@@ -881,6 +1160,9 @@ def refine_partition_likelihood_torch(
     )
     labels = _canonical_labels(np.asarray(labels, dtype=np.int64))
     refit: PartitionRefitResult | None = None
+    best_labels: np.ndarray | None = None
+    best_refit: PartitionRefitResult | None = None
+    best_score = float("inf")
     for _ in range(max(int(max_iter), 0)):
         refit = partition_constrained_observed_refit_torch(
             data,
@@ -894,6 +1176,17 @@ def refine_partition_likelihood_torch(
             device=runtime.device,
             dtype=runtime.dtype,
         )
+        if classification_weight_alpha is not None:
+            current_score = _classification_refit_score(
+                data,
+                labels,
+                refit,
+                alpha=float(classification_weight_alpha),
+            )
+            if current_score < best_score:
+                best_score = float(current_score)
+                best_labels = labels.copy()
+                best_refit = refit
         cost_t = _loss_to_centers_torch(
             data,
             refit.cluster_centers,
@@ -903,8 +1196,31 @@ def refine_partition_likelihood_torch(
             device=runtime.device,
             dtype=runtime.dtype,
         )
-        labels_next = torch.argmin(cost_t, dim=1).detach().cpu().numpy().astype(np.int64, copy=False)
-        labels_next = _repair_empty_clusters(labels_next, cost_t.detach().cpu().numpy())
+        if classification_weight_alpha is None:
+            assignment_cost_t = cost_t
+        else:
+            log_weights = _classification_log_cluster_weights(
+                labels,
+                num_clusters=int(cost_t.shape[1]),
+                alpha=float(classification_weight_alpha),
+            )
+            assignment_cost_t = cost_t - torch.as_tensor(
+                log_weights,
+                dtype=cost_t.dtype,
+                device=cost_t.device,
+            ).unsqueeze(0)
+        labels_next = (
+            torch.argmin(assignment_cost_t, dim=1)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.int64, copy=False)
+        )
+        if not bool(allow_component_death):
+            labels_next = _repair_empty_clusters(
+                labels_next,
+                assignment_cost_t.detach().cpu().numpy(),
+            )
         labels_next = _canonical_labels(labels_next)
         if np.array_equal(labels_next, labels):
             labels = labels_next
@@ -922,6 +1238,18 @@ def refine_partition_likelihood_torch(
         device=runtime.device,
         dtype=runtime.dtype,
     )
+    if classification_weight_alpha is not None:
+        final_score = _classification_refit_score(
+            data,
+            labels,
+            refit,
+            alpha=float(classification_weight_alpha),
+        )
+        if final_score < best_score:
+            best_labels = labels.copy()
+            best_refit = refit
+        if best_labels is not None and best_refit is not None:
+            return _canonical_labels(best_labels), best_refit
     return _canonical_labels(labels), refit
 
 
@@ -947,6 +1275,8 @@ def generate_likelihood_partition_starts(
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
     use_torch: bool = True,
+    classification_weight_alpha: float | None = None,
+    allow_component_death: bool = False,
 ) -> list[PartitionCandidate]:
     use_torch_runtime = bool(use_torch)
     runtime: TorchRuntime | None = None
@@ -962,11 +1292,19 @@ def generate_likelihood_partition_starts(
             )
         except RuntimeError:
             use_torch_runtime = False
-    phi0 = _as_torch(exact_pilot, runtime=runtime).detach().cpu().numpy() if use_torch_runtime and runtime is not None else _as_numpy(exact_pilot)
+    phi0 = (
+        _as_torch(exact_pilot, runtime=runtime).detach().cpu().numpy()
+        if use_torch_runtime and runtime is not None
+        else _as_numpy(exact_pilot)
+    )
     requested_grid = {int(k) for k in K_grid if 1 <= int(k) <= int(data.num_mutations)}
     if label_sets is None:
         if curvature is None:
-            if use_torch_runtime and runtime is not None and partition_torch_data is not None:
+            if (
+                use_torch_runtime
+                and runtime is not None
+                and partition_torch_data is not None
+            ):
                 curvature = observed_curvature_at_pilot_torch(
                     data,
                     exact_pilot,
@@ -992,7 +1330,9 @@ def generate_likelihood_partition_starts(
                 dtype=runtime.dtype,
             )
         else:
-            label_sets = hessian_weighted_ward_label_sets(phi0, _as_numpy(curvature), K_grid=K_grid)
+            label_sets = hessian_weighted_ward_label_sets(
+                phi0, _as_numpy(curvature), K_grid=K_grid
+            )
     else:
         label_sets = {
             int(k): _canonical_labels(np.asarray(labels, dtype=np.int64))
@@ -1010,7 +1350,11 @@ def generate_likelihood_partition_starts(
             (f"hessian_ward_cem_K{int(requested_k)}", labels0),
         ):
             if source.startswith("hessian_ward_cem"):
-                if use_torch_runtime and runtime is not None and partition_torch_data is not None:
+                if (
+                    use_torch_runtime
+                    and runtime is not None
+                    and partition_torch_data is not None
+                ):
                     labels_used, refit = refine_partition_likelihood_torch(
                         data,
                         labels,
@@ -1023,6 +1367,8 @@ def generate_likelihood_partition_starts(
                         torch_data=partition_torch_data,
                         device=runtime.device,
                         dtype=runtime.dtype,
+                        classification_weight_alpha=classification_weight_alpha,
+                        allow_component_death=bool(allow_component_death),
                     )
                 else:
                     labels_used, refit = refine_partition_likelihood(
@@ -1034,9 +1380,15 @@ def generate_likelihood_partition_starts(
                         max_iter=int(cem_max_iter),
                         refit_max_iter=int(refit_max_iter),
                         hint_phi=phi0,
+                        classification_weight_alpha=classification_weight_alpha,
+                        allow_component_death=bool(allow_component_death),
                     )
             else:
-                if use_torch_runtime and runtime is not None and partition_torch_data is not None:
+                if (
+                    use_torch_runtime
+                    and runtime is not None
+                    and partition_torch_data is not None
+                ):
                     refit = partition_constrained_observed_refit_torch(
                         data,
                         labels,
@@ -1066,7 +1418,21 @@ def generate_likelihood_partition_starts(
                 continue
             seen.add(key)
             candidate_k = int(refit.n_clusters)
-            bic = compute_partition_bic(fit_loss=float(refit.fit_loss), num_clusters=candidate_k, data=data)
+            classic_bic = compute_partition_bic(
+                fit_loss=float(refit.fit_loss),
+                num_clusters=candidate_k,
+                data=data,
+            )
+            bic = (
+                classic_bic
+                if classification_weight_alpha is None
+                else compute_partition_icl(
+                    -float(refit.fit_loss),
+                    cluster_sizes_from_labels(labels_used),
+                    data,
+                    alpha=float(classification_weight_alpha),
+                )
+            )
             candidates.append(
                 PartitionCandidate(
                     labels=_canonical_labels(labels_used),
@@ -1081,14 +1447,23 @@ def generate_likelihood_partition_starts(
                     finite_candidate_found=bool(refit.finite_candidate_found),
                     diagnostics={
                         "requested_K": float(requested_k),
+                        "partition_generation_classic_bic": float(classic_bic),
                         "refit_boundary_count": float(refit.boundary_count),
                         "refit_coordinate_count": float(refit.refit_coordinate_count),
-                        "refit_finite_coordinate_count": float(refit.refit_finite_coordinate_count),
+                        "refit_finite_coordinate_count": float(
+                            refit.refit_finite_coordinate_count
+                        ),
                         "refit_total_grid_points": float(refit.refit_total_grid_points),
                         "refit_max_grid_spacing": float(refit.refit_max_grid_spacing),
-                        "refit_total_candidate_basins": float(refit.refit_total_candidate_basins),
-                        "refit_total_refined_candidates": float(refit.refit_total_refined_candidates),
-                        "refit_min_best_second_loss_gap": float(refit.refit_min_best_second_loss_gap),
+                        "refit_total_candidate_basins": float(
+                            refit.refit_total_candidate_basins
+                        ),
+                        "refit_total_refined_candidates": float(
+                            refit.refit_total_refined_candidates
+                        ),
+                        "refit_min_best_second_loss_gap": float(
+                            refit.refit_min_best_second_loss_gap
+                        ),
                         "partition_generation_cuda": float(
                             use_torch_runtime
                             and runtime is not None
@@ -1103,6 +1478,11 @@ def generate_likelihood_partition_starts(
         by_k.setdefault(int(candidate.K), []).append(candidate)
     kept: list[PartitionCandidate] = []
     for candidate_k, values in by_k.items():
-        values = sorted(values, key=lambda item: (float(item.bic), float(item.fit_loss), str(item.source)))
+        values = sorted(
+            values,
+            key=lambda item: (float(item.bic), float(item.fit_loss), str(item.source)),
+        )
         kept.extend(values[: max(int(max_candidates_per_K), 1)])
-    return sorted(kept, key=lambda item: (float(item.bic), int(item.K), str(item.source)))
+    return sorted(
+        kept, key=lambda item: (float(item.bic), int(item.K), str(item.source))
+    )

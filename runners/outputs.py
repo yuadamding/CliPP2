@@ -107,6 +107,8 @@ def evaluation_to_frame(evaluation: SimulationEvaluation) -> pd.DataFrame:
                 "summary_cp_rmse": evaluation.summary_cp_rmse,
                 "bic_refit_cp_rmse": evaluation.bic_refit_cp_rmse,
                 "multiplicity_f1": evaluation.multiplicity_f1,
+                "multiplicity_asymmetric_f1": evaluation.multiplicity_asymmetric_f1,
+                "multiplicity_estimable_f1": evaluation.multiplicity_estimable_f1,
                 "estimated_clonal_fraction": evaluation.estimated_clonal_fraction,
                 "true_clonal_fraction": evaluation.true_clonal_fraction,
                 "clonal_fraction_error": evaluation.clonal_fraction_error,

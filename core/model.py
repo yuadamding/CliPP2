@@ -87,6 +87,8 @@ class Diagnostics:
     fixed_objective_kkt_residual: float | None = None
     inner_kkt_residual: float | None = None
     failure_reason: str | None = None
+    admm_iterations: int = 0
+    inner_solver: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,12 @@ class FitResult:
     selected_start_objective_rank: int = 1
     history: list[float] = field(default_factory=list)
     solver_state: SolverState | None = None
+    # ``iterations`` is retained as the outer-MM count for compatibility.
+    # These fields report the actual accumulated inner-solver work and its
+    # implementation identity.
+    inner_iterations: int = 0
+    admm_iterations: int = 0
+    inner_solver: str = "unknown"
 
     @property
     def estimate(self) -> Estimate:
@@ -201,11 +209,13 @@ class FitResult:
         return Diagnostics(
             converged=bool(self.converged),
             outer_iterations=int(self.iterations),
-            inner_iterations=int(self.accepted_outer_steps),
+            inner_iterations=int(self.inner_iterations),
             objective_history=tuple(float(value) for value in self.history),
             fixed_objective_kkt_residual=float(self.fixed_objective_kkt_residual),
             inner_kkt_residual=float(self.inner_kkt_residual),
             failure_reason=str(self.failure_reason or ""),
+            admm_iterations=int(self.admm_iterations),
+            inner_solver=str(self.inner_solver),
         )
 
     @property
@@ -361,6 +371,9 @@ def fit_fixed_objective(
         selected_start_objective_rank=int(getattr(artifacts, "selected_start_objective_rank", 1)),
         history=list(artifacts.history),
         solver_state=artifacts.solver_state,
+        inner_iterations=int(getattr(artifacts, "inner_iterations", 0)),
+        admm_iterations=int(getattr(artifacts, "admm_iterations", 0)),
+        inner_solver=str(getattr(artifacts, "inner_solver", "unknown")),
     )
 
 

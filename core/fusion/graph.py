@@ -73,6 +73,99 @@ def build_complete_adaptive_graph(
     )
 
 
+def likelihood_noise_distance_floor(
+    curvature: np.ndarray,
+    *,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    minimum: float = 1e-6,
+) -> float:
+    """Estimate a pilot-distance floor from local likelihood information.
+
+    ``1 / curvature`` is the local variance approximation for each mutation-
+    region CCF.  It is capped by the squared feasible box width, accumulated
+    across regions, and multiplied by ``sqrt(2)`` to represent the noise of a
+    difference between two independently estimated mutation vectors.  The
+    median mutation scale is robust to a minority of flat/boundary likelihoods.
+
+    This quantity depends only on the observed likelihood and feasible domain;
+    it does not use a clustering guide or a lambda path.
+    """
+
+    h = np.asarray(curvature, dtype=np.float64)
+    lo = np.asarray(lower, dtype=np.float64)
+    hi = np.asarray(upper, dtype=np.float64)
+    if h.ndim != 2 or lo.shape != h.shape or hi.shape != h.shape:
+        raise ValueError("curvature, lower, and upper must have the same 2D shape.")
+    if not np.isfinite(float(minimum)) or float(minimum) <= 0.0:
+        raise ValueError("minimum likelihood-noise floor must be finite and positive.")
+    if np.any(~np.isfinite(h)) or np.any(h <= 0.0):
+        raise ValueError("curvature must contain only finite positive values.")
+    if np.any(~np.isfinite(lo)) or np.any(~np.isfinite(hi)) or np.any(hi < lo):
+        raise ValueError("likelihood-noise bounds must be finite with upper >= lower.")
+
+    width_sq = np.square(hi - lo)
+    local_variance = np.minimum(1.0 / h, width_sq)
+    mutation_scale = np.sqrt(2.0 * np.sum(local_variance, axis=1))
+    finite_positive = mutation_scale[
+        np.isfinite(mutation_scale) & (mutation_scale > 0.0)
+    ]
+    if finite_positive.size == 0:
+        return float(minimum)
+    return float(max(float(np.median(finite_positive)), float(minimum)))
+
+
+def build_likelihood_noise_regularized_adaptive_graph(
+    pilot_phi: np.ndarray,
+    curvature: np.ndarray,
+    *,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    gamma: float = 1.0,
+    minimum_tau: float = 1e-6,
+    baseline: float = 1.0,
+    noise_divisor: float = 1.0,
+) -> tuple[PairwiseFusionGraph, float]:
+    """Build adaptive complete-graph weights with a likelihood-noise floor.
+
+    ``noise_divisor`` distributes a node-level uncertainty scale across the
+    incident pairwise terms. Guided complete-graph mode uses its degree
+    ``M - 1``; the resulting floor remains positive and data-derived while
+    avoiding the near-infinite contrast caused by a fixed ``1e-6`` floor.
+    """
+
+    if not np.isfinite(float(noise_divisor)) or float(noise_divisor) <= 0.0:
+        raise ValueError("noise_divisor must be finite and positive.")
+
+    node_noise_scale = likelihood_noise_distance_floor(
+        curvature,
+        lower=lower,
+        upper=upper,
+        minimum=float(minimum_tau),
+    )
+    tau = max(
+        float(node_noise_scale) / float(noise_divisor),
+        float(minimum_tau),
+    )
+    graph = build_complete_adaptive_graph(
+        pilot_phi,
+        gamma=float(gamma),
+        tau=float(tau),
+        baseline=float(baseline),
+    )
+    graph = PairwiseFusionGraph(
+        edge_u=graph.edge_u,
+        edge_v=graph.edge_v,
+        edge_w=graph.edge_w,
+        name=(
+            f"complete_adaptive_likelihood_noise_gamma{float(gamma):g}_"
+            f"tau{float(tau):.6g}_div{float(noise_divisor):.6g}_mean_normalized"
+        ),
+        degree_bound=graph.degree_bound,
+    )
+    return graph, float(tau)
+
+
 def resolve_pairwise_fusion_graph(
     num_mutations: int,
     *,

@@ -5,6 +5,7 @@ import hashlib
 import numpy as np
 
 from ..io.data import TumorData
+from ..core.fusion.multiplicity import infer_multiplicity_posterior_numpy
 from ..core.fusion.partition_starts import PartitionCandidate
 from .config import (
     LIKELIHOOD_PARTITION_K_ANCHORS,
@@ -209,21 +210,19 @@ def _centers_from_partition_labels(phi: np.ndarray, labels: np.ndarray, num_clus
 def _multiplicity_summary_for_phi(
     data: TumorData,
     phi: np.ndarray,
+    *,
+    major_prior: float = 0.5,
+    eps: float = 1e-6,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    phi = np.asarray(phi, dtype=np.float64)
-    multiplicity_mask = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
-    major_probability = np.ones_like(phi, dtype=np.float64)
-    major_probability[multiplicity_mask] = 0.5
-    major_call = major_probability >= 0.5
-    multiplicity_call = np.where(
-        multiplicity_mask,
-        np.where(major_call, data.major_cn, data.minor_cn),
-        data.fixed_multiplicity,
-    ).astype(np.float64, copy=False)
-    return (
-        major_probability.astype(phi.dtype, copy=False),
-        major_call.astype(bool, copy=False),
-        multiplicity_call,
-        multiplicity_mask.astype(bool, copy=False),
+    posterior = infer_multiplicity_posterior_numpy(
+        data,
+        phi,
+        major_prior=float(major_prior),
+        eps=float(eps),
     )
-
+    return (
+        posterior.gamma_major,
+        posterior.major_call,
+        posterior.multiplicity_call,
+        posterior.estimation_mask,
+    )

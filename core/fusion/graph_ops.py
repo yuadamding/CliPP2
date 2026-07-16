@@ -57,8 +57,14 @@ def estimate_complete_tensor_graph_bytes(
         return int(persistent_bytes)
     work_dtype = _adaptive_weight_work_dtype(dtype)
     work_value_bytes = _dtype_nbytes(work_dtype)
-    chunk_edges = min(edge_count, _adaptive_weight_chunk_size(num_regions=region_count, dtype=work_dtype))
-    adaptive_peak_bytes = chunk_edges * region_count * work_value_bytes + 3 * chunk_edges * work_value_bytes
+    chunk_edges = min(
+        edge_count,
+        _adaptive_weight_chunk_size(num_regions=region_count, dtype=work_dtype),
+    )
+    adaptive_peak_bytes = (
+        chunk_edges * region_count * work_value_bytes
+        + 3 * chunk_edges * work_value_bytes
+    )
     return int(persistent_bytes + adaptive_peak_bytes)
 
 
@@ -67,7 +73,9 @@ def _parse_memory_limit_bytes(value: str | None) -> int | None:
         return None
     limit = int(float(str(value).strip()))
     if limit <= 0:
-        raise ValueError(f"{COMPLETE_GRAPH_MEMORY_LIMIT_ENV} must be positive when set.")
+        raise ValueError(
+            f"{COMPLETE_GRAPH_MEMORY_LIMIT_ENV} must be positive when set."
+        )
     return limit
 
 
@@ -101,7 +109,9 @@ def _complete_graph_memory_limit_bytes(
 ) -> int | None:
     if memory_limit_bytes is not None:
         return int(memory_limit_bytes)
-    env_limit = _parse_memory_limit_bytes(os.environ.get(COMPLETE_GRAPH_MEMORY_LIMIT_ENV))
+    env_limit = _parse_memory_limit_bytes(
+        os.environ.get(COMPLETE_GRAPH_MEMORY_LIMIT_ENV)
+    )
     if env_limit is not None:
         return env_limit
     cuda_limit = _cuda_memory_limit_bytes(runtime)
@@ -124,7 +134,9 @@ def _check_complete_tensor_graph_memory(
         dtype=runtime.dtype,
         adaptive=adaptive,
     )
-    limit = _complete_graph_memory_limit_bytes(runtime, memory_limit_bytes=memory_limit_bytes)
+    limit = _complete_graph_memory_limit_bytes(
+        runtime, memory_limit_bytes=memory_limit_bytes
+    )
     if limit is None or estimate <= limit:
         return
     graph_kind = "adaptive" if adaptive else "uniform"
@@ -138,7 +150,9 @@ def _check_complete_tensor_graph_memory(
     )
 
 
-def _is_canonical_complete_edge_index(edge_index: torch.Tensor, *, num_nodes: int) -> bool:
+def _is_canonical_complete_edge_index(
+    edge_index: torch.Tensor, *, num_nodes: int
+) -> bool:
     edge_count = _complete_graph_edge_count(num_nodes)
     if int(edge_index.shape[0]) != 2 or int(edge_index.shape[1]) != edge_count:
         return False
@@ -168,7 +182,9 @@ def _complete_adaptive_raw_weights(
         1,
         min(
             num_edges,
-            _adaptive_weight_chunk_size(num_regions=int(pilot.shape[1]), dtype=pilot.dtype),
+            _adaptive_weight_chunk_size(
+                num_regions=int(pilot.shape[1]), dtype=pilot.dtype
+            ),
         ),
     )
     for start in range(0, num_edges, chunk_size):
@@ -192,7 +208,9 @@ def _tensor_graph_from_edges(
     name: str,
     known_complete: bool | None = None,
 ) -> TensorFusionGraph:
-    edge_index = torch.stack([edge_u.to(dtype=torch.long), edge_v.to(dtype=torch.long)], dim=0)
+    edge_index = torch.stack(
+        [edge_u.to(dtype=torch.long), edge_v.to(dtype=torch.long)], dim=0
+    )
     degree = torch.zeros((int(num_nodes),), dtype=weight.dtype, device=weight.device)
     if edge_u.numel():
         one = torch.ones_like(weight)
@@ -204,7 +222,9 @@ def _tensor_graph_from_edges(
         if known_complete is None
         else bool(known_complete)
     )
-    is_uniform = bool(weight.numel() == 0 or torch.allclose(weight, weight[:1].expand_as(weight)))
+    is_uniform = bool(
+        weight.numel() == 0 or torch.allclose(weight, weight[:1].expand_as(weight))
+    )
     return TensorFusionGraph(
         edge_index=edge_index,
         weight=weight,
@@ -281,13 +301,17 @@ def build_complete_adaptive_tensor_graph(
     memory_limit_bytes: int | None = None,
 ) -> TensorFusionGraph:
     if pilot_phi.ndim != 2:
-        raise ValueError("pilot_phi must be a two-dimensional mutation-by-region matrix.")
+        raise ValueError(
+            "pilot_phi must be a two-dimensional mutation-by-region matrix."
+        )
     if gamma <= 0.0:
         raise ValueError("Adaptive pairwise weight exponent gamma must be positive.")
     if tau <= 0.0:
         raise ValueError("Adaptive pairwise weight floor tau must be positive.")
     if baseline <= 0.0 or not np.isfinite(baseline):
-        raise ValueError("Adaptive pairwise weight baseline must be finite and positive.")
+        raise ValueError(
+            "Adaptive pairwise weight baseline must be finite and positive."
+        )
 
     weight_work_dtype = _adaptive_weight_work_dtype(runtime.dtype)
     pilot = pilot_phi.to(dtype=weight_work_dtype, device=runtime.device)
@@ -325,10 +349,15 @@ def build_complete_adaptive_tensor_graph(
         tau=float(tau),
     )
     mean_raw_weight = torch.mean(raw_weight)
-    if not bool(torch.isfinite(mean_raw_weight).item()) or float(mean_raw_weight.item()) <= 0.0:
+    if (
+        not bool(torch.isfinite(mean_raw_weight).item())
+        or float(mean_raw_weight.item()) <= 0.0
+    ):
         raise ValueError("Adaptive pairwise weights must have a positive finite mean.")
     target_mean_weight = float(baseline) * _complete_graph_weight(num_nodes)
-    weight = raw_weight.mul_(target_mean_weight / mean_raw_weight).to(dtype=runtime.dtype)
+    weight = raw_weight.mul_(target_mean_weight / mean_raw_weight).to(
+        dtype=runtime.dtype
+    )
     return _tensor_graph_from_edges(
         edge_u=edge_index[0],
         edge_v=edge_index[1],
@@ -343,7 +372,11 @@ def tensor_graph_to_pairwise_graph(graph: TensorFusionGraph) -> PairwiseFusionGr
     edge_u = graph.edge_u.detach().cpu().numpy().astype(np.int32, copy=False)
     edge_v = graph.edge_v.detach().cpu().numpy().astype(np.int32, copy=False)
     edge_w = graph.weight.detach().cpu().numpy().astype(np.float64, copy=False)
-    degree_bound = int(torch.max(graph.degree).detach().cpu().item()) if graph.degree.numel() else 1
+    degree_bound = (
+        int(torch.max(graph.degree).detach().cpu().item())
+        if graph.degree.numel()
+        else 1
+    )
     return PairwiseFusionGraph(
         edge_u=edge_u,
         edge_v=edge_v,
@@ -385,7 +418,9 @@ def graph_adjoint_edges(
     result = dual.new_zeros((int(num_nodes), int(dual.shape[1])))
     if edge_u.numel():
         result.index_add_(0, edge_u, dual)
-        result.index_add_(0, edge_v, -dual)
+        # ``alpha=-1`` avoids allocating a complete negated edge tensor.  This
+        # matters for complete graphs, where E=M(M-1)/2 can be several million.
+        result.index_add_(0, edge_v, dual, alpha=-1.0)
     return result
 
 

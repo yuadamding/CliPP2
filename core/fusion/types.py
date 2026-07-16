@@ -108,6 +108,12 @@ class FusionFitArtifacts:
     selected_start_objective_rank: int
     solver_state: SolverState | None = None
     torch_result: TorchFitResult | None = None
+    # Backward-compatible solver provenance. ``iterations`` above remains the
+    # number of outer MM iterations; this is the accumulated work performed by
+    # the inner convex solver for the selected start.
+    inner_iterations: int = 0
+    admm_iterations: int = 0
+    inner_solver: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -216,3 +222,5 @@ class TorchFitResult:
     inner: InnerDiagnostics
     outer: OuterDiagnostics
     graph_name: str
+    admm_iterations: int = 0
+    inner_solver: str = "unknown"

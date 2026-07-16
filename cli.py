@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .core.bic import LAMBDA_GRID_MODES
 from .core.model import FitOptions
+from .model_selection.config import DEFAULT_SELECTION_SCORE, SELECTION_SCORE_NAMES
 from .runners.pipeline import process_one_file, run_directory
 
 
@@ -31,7 +33,24 @@ def _parse_lambda_grid(value: str | None) -> list[float] | None:
 
 
 def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--lambda-grid", default=None, help="Comma-separated lambda grid or 'auto'.")
+    parser.add_argument(
+        "--lambda-grid",
+        default=None,
+        help=(
+            "Comma-separated legacy lambda grid or 'auto'. Prespecified values "
+            "require --lambda-grid-mode adaptive_bic."
+        ),
+    )
+    parser.add_argument(
+        "--lambda-grid-mode",
+        choices=list(LAMBDA_GRID_MODES),
+        default="partition_guided_admm",
+        help=(
+            "Automatic lambda strategy. partition_guided_admm discovers lambda "
+            "online from the likelihood-partition initializer and ADMM fits and "
+            "rejects an explicit --lambda-grid."
+        ),
+    )
     parser.add_argument(
         "--graph-file",
         default=None,
@@ -65,6 +84,27 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
     parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability assigned to major-copy multiplicity.")
     parser.add_argument(
+        "--selection-score",
+        choices=list(SELECTION_SCORE_NAMES),
+        default=DEFAULT_SELECTION_SCORE,
+        help=(
+            "Model-selection criterion. partition_icl is assignment-aware and "
+            "recommended; bic retains the legacy center-only criterion."
+        ),
+    )
+    parser.add_argument(
+        "--bic-df-scale",
+        type=float,
+        default=1.0,
+        help="Continuous-parameter scale used by extended_bic.",
+    )
+    parser.add_argument(
+        "--bic-cluster-penalty",
+        type=float,
+        default=0.0,
+        help="Additional K*log(M) coefficient used by extended_bic.",
+    )
+    parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
         default="cuda",
@@ -89,6 +129,11 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input-dir", default="CliPP2Sim_TSV", help="Directory with per-tumor TSV files.")
     parser.add_argument("--input-file", default=None, help="Optional single tumor TSV file.")
     parser.add_argument("--outdir", default="multi_region_clipp_results", help="Output directory.")
+    parser.add_argument(
+        "--simulation-root",
+        default=None,
+        help="Optional simulation truth root used only to report benchmark metrics.",
+    )
     _add_common_selection_args(parser)
     parser.add_argument(
         "--skip-outputs",
@@ -136,13 +181,13 @@ def _run_fit(args: argparse.Namespace) -> None:
         summary = process_one_file(
             file_path=Path(args.input_file),
             outdir=Path(args.outdir),
-            simulation_root=None,
+            simulation_root=Path(args.simulation_root) if args.simulation_root else None,
             lambda_grid=lambda_grid,
-            lambda_grid_mode="adaptive_bic",
+            lambda_grid_mode=args.lambda_grid_mode,
             fit_options=fit_options,
-            bic_df_scale=1.0,
-            bic_cluster_penalty=0.0,
-            selection_score="bic",
+            bic_df_scale=args.bic_df_scale,
+            bic_cluster_penalty=args.bic_cluster_penalty,
+            selection_score=args.selection_score,
             use_warm_starts=not args.disable_warm_start,
             write_outputs=not args.skip_outputs,
             graph_file=Path(args.graph_file) if args.graph_file else None,
@@ -154,14 +199,14 @@ def _run_fit(args: argparse.Namespace) -> None:
     summary_df = run_directory(
         input_dir=Path(args.input_dir),
         outdir=Path(args.outdir),
-        simulation_root=None,
+        simulation_root=Path(args.simulation_root) if args.simulation_root else None,
         lambda_grid=lambda_grid,
-        lambda_grid_mode="adaptive_bic",
+        lambda_grid_mode=args.lambda_grid_mode,
         fit_options=fit_options,
         max_files=args.max_files,
-        bic_df_scale=1.0,
-        bic_cluster_penalty=0.0,
-        selection_score="bic",
+        bic_df_scale=args.bic_df_scale,
+        bic_cluster_penalty=args.bic_cluster_penalty,
+        selection_score=args.selection_score,
         use_warm_starts=not args.disable_warm_start,
         write_outputs=not args.skip_outputs,
         graph_file=Path(args.graph_file) if args.graph_file else None,

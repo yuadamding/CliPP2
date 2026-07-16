@@ -1572,12 +1572,13 @@ def compute_pooled_observed_data_start_torch(
     left = torch.where(best_index == 0, lower, left)
     right = torch.where(best_index == grid.shape[1] - 1, upper, right)
 
-    objective = lambda values: _pooled_sample_loss_grid_torch(
-        torch_data,
-        values,
-        major_prior=major_prior,
-        eps=eps,
-    )
+    def objective(values):
+        return _pooled_sample_loss_grid_torch(
+            torch_data,
+            values,
+            major_prior=major_prior,
+            eps=eps,
+        )
     refined_beta, refined_value = _golden_section_minimize_samples_torch(
         objective,
         left=left,
@@ -1647,17 +1648,18 @@ def compute_pooled_observed_data_start(
         left = float(lower if best_index == 0 else grid_np[best_index - 1])
         right = float(upper if best_index == grid_np.shape[0] - 1 else grid_np[best_index + 1])
 
-        objective = lambda values: _sample_loss_grid_numpy(
-            values,
-            alt=np.asarray(data.alt_counts[:, region_idx], dtype=np.float64),
-            total=np.asarray(data.total_counts[:, region_idx], dtype=np.float64),
-            b_minus=b_minus[:, region_idx],
-            b_plus=b_plus[:, region_idx],
-            b_fixed=b_fixed[:, region_idx],
-            ambiguous=ambiguous[:, region_idx],
-            major_prior=major_prior,
-            eps=eps,
-        )
+        def objective(values):
+            return _sample_loss_grid_numpy(
+                values,
+                alt=np.asarray(data.alt_counts[:, region_idx], dtype=np.float64),
+                total=np.asarray(data.total_counts[:, region_idx], dtype=np.float64),
+                b_minus=b_minus[:, region_idx],
+                b_plus=b_plus[:, region_idx],
+                b_fixed=b_fixed[:, region_idx],
+                ambiguous=ambiguous[:, region_idx],
+                major_prior=major_prior,
+                eps=eps,
+            )
         refined_beta, refined_value = _golden_section_minimize(
             objective,
             left=left,

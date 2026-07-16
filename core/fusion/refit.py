@@ -172,17 +172,18 @@ def _refit_cluster_region(
             best_second_loss_gap=float("inf"),
         )
 
-    objective = lambda values: _objective_grid(
-        values,
-        alt=alt,
-        total=total,
-        b_minus=b_minus,
-        b_plus=b_plus,
-        b_fixed=b_fixed,
-        ambiguous=ambiguous,
-        major_prior=major_prior,
-        eps=eps,
-    )
+    def objective(values):
+        return _objective_grid(
+            values,
+            alt=alt,
+            total=total,
+            b_minus=b_minus,
+            b_plus=b_plus,
+            b_fixed=b_fixed,
+            ambiguous=ambiguous,
+            major_prior=major_prior,
+            eps=eps,
+        )
     grid = _cluster_region_candidate_grid(
         lower=lower,
         upper=upper,
