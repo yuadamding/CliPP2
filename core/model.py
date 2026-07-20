@@ -255,6 +255,11 @@ class FitResult:
     workset_expansions: int = 0
     streamed_edge_passes: int = 0
     dense_iterations: int = 0
+    certificate_iterations: int = 0
+    activity_passes: int = 0
+    analytic_adjoint_passes: int = 0
+    column_scan_passes: int = 0
+    full_certificate_audit_passes: int = 0
     fallback_reason: str = ""
     exactness_provenance_version: int = 0
     estimator_role: str = "raw_fused_lambda_path"
@@ -513,6 +518,21 @@ def fit_fixed_objective(
         ),
         dense_iterations=int(
             provenance.dense_iterations if provenance is not None else 0
+        ),
+        certificate_iterations=int(
+            provenance.certificate_iterations if provenance is not None else 0
+        ),
+        activity_passes=int(
+            provenance.activity_passes if provenance is not None else 0
+        ),
+        analytic_adjoint_passes=int(
+            provenance.analytic_adjoint_passes if provenance is not None else 0
+        ),
+        column_scan_passes=int(
+            provenance.column_scan_passes if provenance is not None else 0
+        ),
+        full_certificate_audit_passes=int(
+            provenance.full_certificate_audit_passes if provenance is not None else 0
         ),
         fallback_reason=str(
             provenance.fallback_reason if provenance is not None else ""

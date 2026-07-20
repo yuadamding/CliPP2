@@ -319,6 +319,7 @@ def _offload_solver_state_to_cpu(state: SolverState | None) -> SolverState | Non
         previous_lambda=float(state.previous_lambda),
         warm_state=warm_state,
         certificate=certificate,
+        quotient_failure=state.quotient_failure,
     )
 
 

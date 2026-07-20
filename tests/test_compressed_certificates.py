@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from unittest.mock import patch
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -17,6 +18,7 @@ from CliPP2.core.fusion.types import (
     CertificateOptions,
     CompressedEdgeCertificate,
     TensorFusionGraph,
+    WorksetMemoryOptions,
 )
 
 
@@ -268,6 +270,18 @@ def test_internal_workset_expands_and_certifies_full_graph() -> None:
     assert result.certificate.gradient_scope == "observed_objective"
     assert 2 in result.certificate.internal_edge_ids.tolist()
     assert result.work_counters.workset_expansions >= 1
+    assert result.work_counters.activity_passes > 0
+    assert result.work_counters.analytic_adjoint_passes > 0
+    assert result.work_counters.column_scan_passes > 0
+    assert result.work_counters.full_certificate_audit_passes > 0
+    assert result.work_counters.streamed_edge_passes == sum(
+        (
+            result.work_counters.activity_passes,
+            result.work_counters.analytic_adjoint_passes,
+            result.work_counters.column_scan_passes,
+            result.work_counters.full_certificate_audit_passes,
+        )
+    )
     assert result.fused_edges == 3
     assert result.nonzero_edges == 0
 
@@ -287,30 +301,45 @@ def test_unconverged_workset_refinement_fails_closed_after_three_attempts() -> N
         gradient_scope="mm_surrogate",
     )
 
-    result = refine_graph_fusion_certificate(
-        certificate=initial,
-        phi=phi,
-        grad_smooth=torch.arange(8, dtype=dtype).sub(3.5)[:, None],
-        gradient_scope="observed_objective",
-        graph=graph,
-        graph_hash="bounded-unconverged-workset",
-        lower=torch.zeros_like(phi),
-        upper=torch.ones_like(phi),
-        lambda_value=100.0,
-        atol=1e-12,
-        options=CertificateOptions(
-            max_iter=1,
-            max_expansions=10,
-            add_batch=1,
-            mapping_tolerance=1e-30,
-            column_tolerance=1e-30,
+    with patch(
+        "CliPP2.core.fusion.certificates._scan_omitted_internal_edges",
+        side_effect=AssertionError(
+            "Omitted columns must not be scanned before the mapping gate passes."
         ),
-    )
+    ) as omitted_scan:
+        result = refine_graph_fusion_certificate(
+            certificate=initial,
+            phi=phi,
+            grad_smooth=torch.arange(8, dtype=dtype).sub(3.5)[:, None],
+            gradient_scope="observed_objective",
+            graph=graph,
+            graph_hash="bounded-unconverged-workset",
+            lower=torch.zeros_like(phi),
+            upper=torch.ones_like(phi),
+            lambda_value=100.0,
+            atol=1e-12,
+            options=CertificateOptions(
+                max_iter=1,
+                max_expansions=10,
+                add_batch=1,
+                mapping_tolerance=1e-30,
+                column_tolerance=1e-30,
+            ),
+        )
 
+    omitted_scan.assert_not_called()
     assert result.status == "workset_incomplete"
     assert result.diagnostics.kkt_residual > 5e-12
     assert result.work_counters.workset_iterations == 3
     assert result.work_counters.workset_expansions == 0
+    assert result.work_counters.activity_passes > 0
+    assert result.work_counters.analytic_adjoint_passes > 0
+    assert result.work_counters.column_scan_passes == 0
+    assert result.work_counters.full_certificate_audit_passes == 0
+    assert result.work_counters.streamed_edge_passes == (
+        result.work_counters.activity_passes
+        + result.work_counters.analytic_adjoint_passes
+    )
 
 
 def test_mm_certificate_is_not_reused_as_observed_objective_authority() -> None:
@@ -348,6 +377,15 @@ def test_mm_certificate_is_not_reused_as_observed_objective_authority() -> None:
     assert mm_result.status == "certified"
     assert isinstance(mm_result.certificate, CompressedEdgeCertificate)
     assert mm_result.certificate.gradient_scope == "mm_surrogate"
+    assert mm_result.work_counters.activity_passes > 0
+    assert mm_result.work_counters.analytic_adjoint_passes > 0
+    assert mm_result.work_counters.column_scan_passes == 0
+    assert mm_result.work_counters.full_certificate_audit_passes > 0
+    assert mm_result.work_counters.streamed_edge_passes == (
+        mm_result.work_counters.activity_passes
+        + mm_result.work_counters.analytic_adjoint_passes
+        + mm_result.work_counters.full_certificate_audit_passes
+    )
 
     observed_result = refine_graph_fusion_certificate(
         certificate=mm_result.certificate,
@@ -411,3 +449,71 @@ def test_periodic_and_final_style_refinement_never_allocates_dense_edge_dual() -
     assert isinstance(result.certificate, CompressedEdgeCertificate)
     assert tuple(result.certificate.internal_dual.shape) == (0, 2)
     assert audit.operations == []
+
+
+def test_compressed_resource_limits_report_activity_passes() -> None:
+    dtype = torch.float64
+    graph = _complete_graph(4, dtype=dtype)
+    labels = torch.zeros(4, dtype=torch.long)
+    centers = torch.tensor([[0.5]], dtype=dtype)
+    phi = centers.index_select(0, labels)
+    options = CertificateOptions(memory=WorksetMemoryOptions(max_workset_bytes=1))
+
+    for support_ids in (
+        torch.empty(0, dtype=torch.long),
+        torch.tensor([0], dtype=torch.long),
+    ):
+        certificate = CompressedEdgeCertificate(
+            labels=labels,
+            centers=centers,
+            internal_edge_ids=support_ids,
+            internal_dual=torch.zeros((int(support_ids.numel()), 1), dtype=dtype),
+            graph_hash="resource-counter",
+            gradient_scope="observed_objective",
+        )
+        result = refine_graph_fusion_certificate(
+            certificate=certificate,
+            phi=phi,
+            grad_smooth=torch.zeros_like(phi),
+            gradient_scope="observed_objective",
+            graph=graph,
+            graph_hash="resource-counter",
+            lower=torch.zeros_like(phi),
+            upper=torch.ones_like(phi),
+            lambda_value=1.0,
+            atol=1e-8,
+            options=options,
+        )
+
+        assert result.status == "resource_limit"
+        assert result.work_counters.activity_passes > 0
+        assert (
+            result.work_counters.streamed_edge_passes
+            == result.work_counters.activity_passes
+        )
+        assert result.work_counters.analytic_adjoint_passes == 0
+        assert result.work_counters.column_scan_passes == 0
+        assert result.work_counters.full_certificate_audit_passes == 0
+
+
+def test_dense_refinement_reports_certificate_iterations() -> None:
+    dtype = torch.float64
+    graph = _complete_graph(2, dtype=dtype)
+    phi = torch.full((2, 1), 0.5, dtype=dtype)
+
+    result = refine_graph_fusion_certificate(
+        certificate=None,
+        phi=phi,
+        grad_smooth=torch.tensor([[0.2], [-0.2]], dtype=dtype),
+        gradient_scope="observed_objective",
+        graph=graph,
+        graph_hash="dense-counter",
+        lower=torch.zeros_like(phi),
+        upper=torch.ones_like(phi),
+        lambda_value=1.0,
+        atol=1e-8,
+        max_iter=200,
+    )
+
+    assert result.status == "refined_fused_edge_dual"
+    assert 0 < result.work_counters.certificate_iterations < 200

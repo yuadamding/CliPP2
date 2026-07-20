@@ -382,6 +382,11 @@ def solve_majorized_subproblem_quotient_workset_torch(
     workset_iterations = 0
     workset_expansions = 0
     streamed_edge_passes = 0
+    certificate_iterations = 0
+    activity_passes = 0
+    analytic_adjoint_passes = 0
+    column_scan_passes = 0
+    full_certificate_audit_passes = 0
 
     def attempted_work() -> BackendWorkCounters:
         return BackendWorkCounters(
@@ -389,6 +394,11 @@ def solve_majorized_subproblem_quotient_workset_torch(
             workset_iterations=int(workset_iterations),
             workset_expansions=int(workset_expansions),
             streamed_edge_passes=int(streamed_edge_passes),
+            certificate_iterations=int(certificate_iterations),
+            activity_passes=int(activity_passes),
+            analytic_adjoint_passes=int(analytic_adjoint_passes),
+            column_scan_passes=int(column_scan_passes),
+            full_certificate_audit_passes=int(full_certificate_audit_passes),
         )
 
     phi_initial = phi_start.to(device=runtime.device, dtype=runtime.dtype)
@@ -405,45 +415,59 @@ def solve_majorized_subproblem_quotient_workset_torch(
         return float((quadratic + penalty).item())
 
     initial_objective = exact_inner_objective(phi_initial)
+    best_candidate = phi_initial
+    best_objective = initial_objective
+    best_labels: torch.Tensor | None = None
+    best_warm: QuotientWorksetWarmState | None = None
+    best_certificate: CompressedEdgeCertificate | None = None
+
+    def remember_candidate(
+        candidate: torch.Tensor,
+        *,
+        objective: float | None = None,
+        labels_hint: torch.Tensor | None = None,
+        warm_hint: QuotientWorksetWarmState | None = None,
+        certificate_hint: CompressedEdgeCertificate | None = None,
+    ) -> None:
+        nonlocal best_candidate, best_objective, best_labels, best_warm
+        nonlocal best_certificate
+        if (
+            not bool(torch.isfinite(candidate).all().item())
+            or bool(torch.any(candidate < lower).item())
+            or bool(torch.any(candidate > upper).item())
+        ):
+            return
+        objective = exact_inner_objective(candidate) if objective is None else objective
+        if not math.isfinite(objective) or objective > best_objective:
+            return
+        if objective < best_objective or warm_hint is not None:
+            best_candidate = candidate
+            best_objective = objective
+            best_labels = labels_hint
+            best_warm = warm_hint
+            best_certificate = certificate_hint
 
     def unsuccessful(
         status: str,
         reason: str,
         *,
-        candidate: torch.Tensor | None = None,
         labels_hint: torch.Tensor | None = None,
-        warm_hint: QuotientWorksetWarmState | None = None,
-        certificate_hint: CompressedEdgeCertificate | None = None,
     ) -> QuotientAttemptResult:
-        candidate = phi_initial if candidate is None else candidate
-        objective = exact_inner_objective(candidate)
-        comparison_tolerance = (
-            64.0
-            * float(torch.finfo(candidate.dtype).eps)
-            * (1.0 + abs(initial_objective))
-        )
-        if (
-            not bool(torch.isfinite(candidate).all().item())
-            or bool(torch.any(candidate < lower).item())
-            or bool(torch.any(candidate > upper).item())
-            or objective > initial_objective + comparison_tolerance
-        ):
-            candidate = phi_initial
-            objective = initial_objective
-            warm_hint = None
-            certificate_hint = None
-        warm = warm_hint or PrimalOnlyWarmState(
-            phi=candidate,
-            structure_hint=labels_hint,
-            certificate_hint=certificate_hint,
+        nonlocal best_labels
+        if best_labels is None and labels_hint is not None:
+            best_labels = labels_hint
+        warm = best_warm or PrimalOnlyWarmState(
+            phi=best_candidate,
+            structure_hint=best_labels,
+            certificate_hint=best_certificate,
             structure_hint_is_heuristic=True,
         )
         return QuotientAttemptResult(
             status=status,
-            phi_candidate=candidate,
+            phi_candidate=best_candidate,
             warm_state=warm,
-            certificate_hint=certificate_hint,
-            exact_inner_objective=float(objective),
+            certificate_hint=best_certificate,
+            exact_inner_objective=float(best_objective),
             work_counters=attempted_work(),
             reason=reason,
         )
@@ -527,11 +551,13 @@ def solve_majorized_subproblem_quotient_workset_torch(
                 lambda_value=lambda_value,
                 atol=tol,
             )
-            streamed_edge_passes += _compressed_audit_edge_passes(
+            audit_passes = _compressed_audit_edge_passes(
                 num_edges=int(graph.edge_u.numel()),
                 num_regions=int(phi_warm.shape[1]),
                 dtype=phi_warm.dtype,
             )
+            streamed_edge_passes += audit_passes
+            full_certificate_audit_passes += audit_passes
             if inherited_kkt.kkt_residual <= 5.0 * float(tol):
                 counters = attempted_work()
                 inherited_warm = QuotientWorksetWarmState(
@@ -691,6 +717,20 @@ def solve_majorized_subproblem_quotient_workset_torch(
             graph_hash=graph_hash,
             previous_lambda=float(lambda_value),
         )
+        candidate_objective = float(
+            quotient_inner_objective(
+                centers=centers,
+                problem=quotient,
+                lambda_value=lambda_value,
+            ).item()
+        )
+        remember_candidate(
+            phi,
+            objective=candidate_objective,
+            labels_hint=labels,
+            warm_hint=candidate_warm,
+            certificate_hint=candidate_certificate,
+        )
         quotient_loose_tolerance = max(
             25.0 * float(tol),
             64.0 * float(torch.finfo(runtime.dtype).eps),
@@ -707,10 +747,6 @@ def solve_majorized_subproblem_quotient_workset_torch(
             return unsuccessful(
                 "quotient_unconverged",
                 "quotient_loose_convergence_criterion_not_met",
-                candidate=phi,
-                labels_hint=labels,
-                warm_hint=candidate_warm,
-                certificate_hint=candidate_certificate,
             )
         merged_labels = _coalesced_labels(
             labels=labels,
@@ -740,6 +776,33 @@ def solve_majorized_subproblem_quotient_workset_torch(
         workset_iterations += int(work.workset_iterations)
         workset_expansions += int(work.workset_expansions)
         streamed_edge_passes += int(work.streamed_edge_passes)
+        certificate_iterations += int(work.certificate_iterations)
+        activity_passes += int(work.activity_passes)
+        analytic_adjoint_passes += int(work.analytic_adjoint_passes)
+        column_scan_passes += int(work.column_scan_passes)
+        full_certificate_audit_passes += int(work.full_certificate_audit_passes)
+        certificate_hint = (
+            refinement.certificate
+            if isinstance(refinement.certificate, CompressedEdgeCertificate)
+            else candidate_certificate
+        )
+        warm_hint = QuotientWorksetWarmState(
+            phi=phi,
+            labels=labels,
+            centers=centers,
+            quotient_dual=quotient_dual,
+            internal_edge_ids=certificate_hint.internal_edge_ids,
+            internal_dual=certificate_hint.internal_dual,
+            graph_hash=graph_hash,
+            previous_lambda=float(lambda_value),
+        )
+        remember_candidate(
+            phi,
+            objective=candidate_objective,
+            labels_hint=labels,
+            warm_hint=warm_hint,
+            certificate_hint=certificate_hint,
+        )
         if refinement.status == "not_certified" and allow_heuristic_split:
             split_labels = heuristic_residual_split(
                 labels=labels,
@@ -753,21 +816,6 @@ def solve_majorized_subproblem_quotient_workset_torch(
         if refinement.status != "certified" or not isinstance(
             refinement.certificate, CompressedEdgeCertificate
         ):
-            certificate_hint = (
-                refinement.certificate
-                if isinstance(refinement.certificate, CompressedEdgeCertificate)
-                else candidate_certificate
-            )
-            warm_hint = QuotientWorksetWarmState(
-                phi=phi,
-                labels=labels,
-                centers=centers,
-                quotient_dual=quotient_dual,
-                internal_edge_ids=certificate_hint.internal_edge_ids,
-                internal_dual=certificate_hint.internal_dual,
-                graph_hash=graph_hash,
-                previous_lambda=float(lambda_value),
-            )
             status = (
                 refinement.status
                 if refinement.status in {"workset_incomplete", "resource_limit"}
@@ -776,10 +824,6 @@ def solve_majorized_subproblem_quotient_workset_torch(
             return unsuccessful(
                 status,
                 f"workset_refinement_{refinement.status}",
-                candidate=phi,
-                labels_hint=labels,
-                warm_hint=warm_hint,
-                certificate_hint=certificate_hint,
             )
         certificate = refinement.certificate
         counters = attempted_work()
@@ -818,5 +862,4 @@ def solve_majorized_subproblem_quotient_workset_torch(
     return unsuccessful(
         "not_certified",
         "quotient_structural_round_limit",
-        labels_hint=labels,
     )

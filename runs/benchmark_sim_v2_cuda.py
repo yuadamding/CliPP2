@@ -63,6 +63,13 @@ BACKEND_COLUMNS = (
     "dense_iterations",
     "fallback_reason",
 )
+OPTIONAL_WORK_COLUMNS = (
+    "certificate_iterations",
+    "activity_passes",
+    "analytic_adjoint_passes",
+    "column_scan_passes",
+    "full_certificate_audit_passes",
+)
 CORRECTNESS_TIMING_COLUMNS = (
     "partition_signature",
     "partition_hash",
@@ -450,6 +457,14 @@ def _python_source_manifest(package_root: Path) -> dict[str, Any]:
     }
 
 
+def _harness_metadata() -> dict[str, str]:
+    path = Path(__file__).resolve(strict=True)
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
 def _source_metadata(
     *, package_parent: Path, source_label: str, package: Any
 ) -> dict[str, Any]:
@@ -747,6 +762,20 @@ def _device_type(value: Any) -> str | None:
     return normalized.split(":", 1)[0]
 
 
+def _canonical_device(value: Any, *, bare_cuda_index: int | None = None) -> str | None:
+    if _blank(value):
+        return None
+    normalized = str(value).strip().lower()
+    if normalized == "cuda":
+        return "cuda" if bare_cuda_index is None else f"cuda:{int(bare_cuda_index)}"
+    if normalized.startswith("cuda:"):
+        try:
+            return f"cuda:{int(normalized.split(':', 1)[1])}"
+        except ValueError:
+            return normalized
+    return normalized
+
+
 def _actual_backend(record: Mapping[str, Any]) -> Any:
     for column in ("inner_backend", "inner_solver"):
         value = record.get(column)
@@ -779,6 +808,7 @@ def _backend_observations(
             *SEARCH_ID_COLUMNS,
             *CORRECTNESS_TIMING_COLUMNS,
             *BACKEND_COLUMNS,
+            *OPTIONAL_WORK_COLUMNS,
         ):
             observation[column] = _json_safe(record.get(column))
         actual = _actual_backend(record)
@@ -788,6 +818,12 @@ def _backend_observations(
         observation["missing_backend_columns"] = [
             column for column in BACKEND_COLUMNS if column not in record
         ]
+        observation["missing_optional_work_columns"] = [
+            column for column in OPTIONAL_WORK_COLUMNS if column not in record
+        ]
+        observation["work_counter_scope"] = _json_safe(
+            record.get("work_counter_scope", "selected_start_only")
+        )
         observations.append(observation)
     return observations
 
@@ -799,16 +835,34 @@ def _audit_backend_observations(
     expected_device_type: str = "cuda",
 ) -> dict[str, Any]:
     requested = _normalize_backend(requested_backend)
-    expected_device = _device_type(expected_device_type)
-    if expected_device is None:
+    expected_device = _canonical_device(expected_device_type)
+    expected_device_kind = _device_type(expected_device)
+    if expected_device_kind is None:
         raise ValueError("expected_device_type must not be blank")
     applicable = [row for row in observations if bool(row.get("backend_applicable"))]
+    missing_optional_rows = [
+        {
+            "search_row_index": row.get("search_row_index"),
+            "columns": list(row.get("missing_optional_work_columns", [])),
+        }
+        for row in applicable
+        if row.get("missing_optional_work_columns")
+    ]
+    work_accounting = {
+        "columns": list(OPTIONAL_WORK_COLUMNS),
+        "scope": "selected_start_only",
+        "complete_rows": len(applicable) - len(missing_optional_rows),
+        "missing_rows": missing_optional_rows,
+        "passed": not missing_optional_rows,
+    }
     violations: list[dict[str, Any]] = []
     if requested == "auto":
         return {
             "requested_backend": requested,
-            "expected_device_type": expected_device,
+            "expected_device_type": expected_device_kind,
+            "expected_device": expected_device,
             "applicable_rows": len(applicable),
+            "work_accounting": work_accounting,
             "passed": None,
             "violations": [],
         }
@@ -834,12 +888,30 @@ def _audit_backend_observations(
                 }
             )
         recorded_device = row.get("device")
-        actual_device = _device_type(recorded_device)
-        if actual_device != expected_device:
+        expected_cuda_index = (
+            int(expected_device.split(":", 1)[1])
+            if expected_device.startswith("cuda:")
+            else None
+        )
+        actual_device = _canonical_device(
+            recorded_device,
+            bare_cuda_index=expected_cuda_index,
+        )
+        actual_device_kind = _device_type(actual_device)
+        device_matches = (
+            actual_device_kind == expected_device_kind
+            if ":" not in expected_device
+            else actual_device == expected_device
+        )
+        if not device_matches:
             violations.append(
                 {
                     "search_row_index": row_index,
-                    "kind": "actual_device_type",
+                    "kind": (
+                        "actual_device_type"
+                        if actual_device_kind != expected_device_kind
+                        else "actual_device"
+                    ),
                     "expected": expected_device,
                     "actual": actual_device,
                     "recorded_device": recorded_device,
@@ -865,8 +937,10 @@ def _audit_backend_observations(
             )
     return {
         "requested_backend": requested,
-        "expected_device_type": expected_device,
+        "expected_device_type": expected_device_kind,
+        "expected_device": expected_device,
         "applicable_rows": len(applicable),
+        "work_accounting": work_accounting,
         "passed": not violations,
         "violations": violations,
     }
@@ -1034,7 +1108,13 @@ def _run_case(
             "backend_audit": _audit_backend_observations(
                 observations,
                 requested_backend=args.backend,
-                expected_device_type=_device_type(args.device) or "cuda",
+                expected_device_type=(
+                    _canonical_device(
+                        args.device,
+                        bare_cuda_index=int(torch.cuda.current_device()),
+                    )
+                    or "cuda"
+                ),
             ),
         }
     )
@@ -1191,6 +1271,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             source_label=str(args.source_label),
             package=modules["package"],
         ),
+        "harness": _harness_metadata(),
         "environment": environment,
         "warmup": warmup,
         "configuration": {

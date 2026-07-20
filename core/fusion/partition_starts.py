@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import heapq
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import torch
@@ -869,6 +869,24 @@ def _classification_refit_score(
     )
 
 
+def _validated_refinement_labels(
+    data: TumorData,
+    labels: np.ndarray,
+) -> np.ndarray:
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if labels.size != int(data.num_mutations):
+        raise ValueError(
+            "labels must contain one entry per tumor mutation "
+            f"({int(data.num_mutations)})."
+        )
+    return _canonical_labels(labels)
+
+
+def _validate_classification_weight_alpha(alpha: float | None) -> None:
+    if alpha is not None and (not np.isfinite(float(alpha)) or float(alpha) <= 0.0):
+        raise ValueError("classification_weight_alpha must be positive and finite.")
+
+
 def refine_partition_likelihood(
     data: TumorData,
     labels: np.ndarray,
@@ -881,22 +899,35 @@ def refine_partition_likelihood(
     hint_phi: np.ndarray | None = None,
     classification_weight_alpha: float | None = None,
     allow_component_death: bool = False,
+    _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
 ) -> tuple[np.ndarray, PartitionRefitResult]:
-    labels = _canonical_labels(np.asarray(labels, dtype=np.int64))
-    refit: PartitionRefitResult | None = None
-    best_labels: np.ndarray | None = None
-    best_refit: PartitionRefitResult | None = None
-    best_score = float("inf")
-    for _ in range(max(int(max_iter), 0)):
-        refit = partition_constrained_observed_refit(
+    labels = _validated_refinement_labels(data, labels)
+    _validate_classification_weight_alpha(classification_weight_alpha)
+
+    def refit_labels(current_labels: np.ndarray) -> PartitionRefitResult:
+        if _refit_labels is not None:
+            return _refit_labels(current_labels)
+        result = partition_constrained_observed_refit(
             data,
-            labels,
+            current_labels,
             major_prior=float(major_prior),
             eps=float(eps),
             tol=float(tol),
             max_iter=max(int(refit_max_iter), 32),
             hint_phi=hint_phi,
         )
+        return result
+
+    refit: PartitionRefitResult | None = None
+    refit_key: bytes | None = None
+    best_labels: np.ndarray | None = None
+    best_refit: PartitionRefitResult | None = None
+    best_score = float("inf")
+    for _ in range(max(int(max_iter), 0)):
+        labels_key = _label_key(labels)
+        if refit is None or refit_key != labels_key:
+            refit = refit_labels(labels)
+            refit_key = labels_key
         if classification_weight_alpha is not None:
             current_score = _classification_refit_score(
                 data,
@@ -927,29 +958,24 @@ def refine_partition_likelihood(
         if not bool(allow_component_death):
             labels_next = _repair_empty_clusters(labels_next, assignment_cost)
         labels_next = _canonical_labels(labels_next)
-        if np.array_equal(labels_next, labels):
+        if _label_key(labels_next) == labels_key:
             labels = labels_next
             break
         labels = labels_next
-    refit = partition_constrained_observed_refit(
-        data,
-        labels,
-        major_prior=float(major_prior),
-        eps=float(eps),
-        tol=float(tol),
-        max_iter=max(int(refit_max_iter), 32),
-        hint_phi=hint_phi,
-    )
+    labels_key = _label_key(labels)
+    if refit is None or refit_key != labels_key:
+        refit = refit_labels(labels)
+        if classification_weight_alpha is not None:
+            final_score = _classification_refit_score(
+                data,
+                labels,
+                refit,
+                alpha=float(classification_weight_alpha),
+            )
+            if final_score < best_score:
+                best_labels = labels.copy()
+                best_refit = refit
     if classification_weight_alpha is not None:
-        final_score = _classification_refit_score(
-            data,
-            labels,
-            refit,
-            alpha=float(classification_weight_alpha),
-        )
-        if final_score < best_score:
-            best_labels = labels.copy()
-            best_refit = refit
         if best_labels is not None and best_refit is not None:
             return _canonical_labels(best_labels), best_refit
     return _canonical_labels(labels), refit
@@ -979,7 +1005,7 @@ def partition_constrained_observed_refit_torch(
         device=device,
         dtype=dtype,
     )
-    labels_np = _canonical_labels(np.asarray(labels, dtype=np.int64))
+    labels_np = _validated_refinement_labels(data, labels)
     n_clusters = int(labels_np.max()) + 1 if labels_np.size else 0
     n_regions = int(data.num_regions)
     if n_clusters <= 0:
@@ -1012,14 +1038,10 @@ def partition_constrained_observed_refit_torch(
         (n_clusters, n_regions), float(eps), dtype=runtime.dtype, device=runtime.device
     )
     upper = torch.empty_like(lower)
+    # Canonical labels are contiguous, so every cluster index is present.
     for cluster_idx in range(n_clusters):
         member_mask = labels_t == int(cluster_idx)
-        if bool(torch.any(member_mask).item()):
-            upper[cluster_idx] = torch.min(
-                torch_data.phi_upper[member_mask], dim=0
-            ).values
-        else:
-            upper[cluster_idx] = lower[cluster_idx]
+        upper[cluster_idx] = torch.min(torch_data.phi_upper[member_mask], dim=0).values
     upper = torch.where(torch.isfinite(upper) & (upper >= lower), upper, lower)
     initial_width = torch.clamp(upper - lower, min=0.0)
 
@@ -1076,12 +1098,7 @@ def partition_constrained_observed_refit_torch(
         )
         for cluster_idx in range(n_clusters):
             member_mask = labels_t == int(cluster_idx)
-            if bool(torch.any(member_mask).item()):
-                hint_centers[cluster_idx] = torch.median(
-                    hint_t[member_mask], dim=0
-                ).values
-            else:
-                hint_centers[cluster_idx] = lower[cluster_idx]
+            hint_centers[cluster_idx] = torch.median(hint_t[member_mask], dim=0).values
         candidates.append(torch.minimum(torch.maximum(hint_centers, lower), upper))
     candidate_values = torch.stack(candidates, dim=0)
     candidate_losses = torch.stack(
@@ -1151,6 +1168,7 @@ def refine_partition_likelihood_torch(
     dtype: str | torch.dtype | None = None,
     classification_weight_alpha: float | None = None,
     allow_component_death: bool = False,
+    _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
 ) -> tuple[np.ndarray, PartitionRefitResult]:
     runtime, torch_data = _resolve_partition_runtime(
         data=data,
@@ -1159,15 +1177,15 @@ def refine_partition_likelihood_torch(
         device=device,
         dtype=dtype,
     )
-    labels = _canonical_labels(np.asarray(labels, dtype=np.int64))
-    refit: PartitionRefitResult | None = None
-    best_labels: np.ndarray | None = None
-    best_refit: PartitionRefitResult | None = None
-    best_score = float("inf")
-    for _ in range(max(int(max_iter), 0)):
-        refit = partition_constrained_observed_refit_torch(
+    labels = _validated_refinement_labels(data, labels)
+    _validate_classification_weight_alpha(classification_weight_alpha)
+
+    def refit_labels(current_labels: np.ndarray) -> PartitionRefitResult:
+        if _refit_labels is not None:
+            return _refit_labels(current_labels)
+        result = partition_constrained_observed_refit_torch(
             data,
-            labels,
+            current_labels,
             major_prior=float(major_prior),
             eps=float(eps),
             tol=float(tol),
@@ -1177,6 +1195,18 @@ def refine_partition_likelihood_torch(
             device=runtime.device,
             dtype=runtime.dtype,
         )
+        return result
+
+    refit: PartitionRefitResult | None = None
+    refit_key: bytes | None = None
+    best_labels: np.ndarray | None = None
+    best_refit: PartitionRefitResult | None = None
+    best_score = float("inf")
+    for _ in range(max(int(max_iter), 0)):
+        labels_key = _label_key(labels)
+        if refit is None or refit_key != labels_key:
+            refit = refit_labels(labels)
+            refit_key = labels_key
         if classification_weight_alpha is not None:
             current_score = _classification_refit_score(
                 data,
@@ -1223,32 +1253,24 @@ def refine_partition_likelihood_torch(
                 assignment_cost_t.detach().cpu().numpy(),
             )
         labels_next = _canonical_labels(labels_next)
-        if np.array_equal(labels_next, labels):
+        if _label_key(labels_next) == labels_key:
             labels = labels_next
             break
         labels = labels_next
-    refit = partition_constrained_observed_refit_torch(
-        data,
-        labels,
-        major_prior=float(major_prior),
-        eps=float(eps),
-        tol=float(tol),
-        max_iter=max(int(refit_max_iter), 32),
-        hint_phi=hint_phi,
-        torch_data=torch_data,
-        device=runtime.device,
-        dtype=runtime.dtype,
-    )
+    labels_key = _label_key(labels)
+    if refit is None or refit_key != labels_key:
+        refit = refit_labels(labels)
+        if classification_weight_alpha is not None:
+            final_score = _classification_refit_score(
+                data,
+                labels,
+                refit,
+                alpha=float(classification_weight_alpha),
+            )
+            if final_score < best_score:
+                best_labels = labels.copy()
+                best_refit = refit
     if classification_weight_alpha is not None:
-        final_score = _classification_refit_score(
-            data,
-            labels,
-            refit,
-            alpha=float(classification_weight_alpha),
-        )
-        if final_score < best_score:
-            best_labels = labels.copy()
-            best_refit = refit
         if best_labels is not None and best_refit is not None:
             return _canonical_labels(best_labels), best_refit
     return _canonical_labels(labels), refit
@@ -1279,6 +1301,7 @@ def generate_likelihood_partition_starts(
     classification_weight_alpha: float | None = None,
     allow_component_death: bool = False,
 ) -> list[PartitionCandidate]:
+    _validate_classification_weight_alpha(classification_weight_alpha)
     use_torch_runtime = bool(use_torch)
     runtime: TorchRuntime | None = None
     partition_torch_data: TorchTumorData | None = None
@@ -1339,6 +1362,45 @@ def generate_likelihood_partition_starts(
         }
     candidates: list[PartitionCandidate] = []
     seen: set[bytes] = set()
+    # This cache never escapes one generation call, so labels fully identify a
+    # refit under the shared data, tolerance, hint, runtime, and backend.
+    refit_cache: dict[bytes, PartitionRefitResult] = {}
+
+    def cached_refit(labels: np.ndarray) -> PartitionRefitResult:
+        labels_key = _label_key(labels)
+        cached = refit_cache.get(labels_key)
+        if cached is not None:
+            return cached
+        if (
+            use_torch_runtime
+            and runtime is not None
+            and partition_torch_data is not None
+        ):
+            result = partition_constrained_observed_refit_torch(
+                data,
+                labels,
+                major_prior=float(major_prior),
+                eps=float(eps),
+                tol=float(tol),
+                max_iter=max(int(refit_max_iter), 32),
+                hint_phi=exact_pilot,
+                torch_data=partition_torch_data,
+                device=runtime.device,
+                dtype=runtime.dtype,
+            )
+        else:
+            result = partition_constrained_observed_refit(
+                data,
+                labels,
+                major_prior=float(major_prior),
+                eps=float(eps),
+                tol=float(tol),
+                max_iter=max(int(refit_max_iter), 32),
+                hint_phi=phi0,
+            )
+        refit_cache[labels_key] = result
+        return result
+
     n_eff = effective_bic_mutation_region_count(data)
 
     for requested_k in sorted(label_sets):
@@ -1367,6 +1429,7 @@ def generate_likelihood_partition_starts(
                         dtype=runtime.dtype,
                         classification_weight_alpha=classification_weight_alpha,
                         allow_component_death=bool(allow_component_death),
+                        _refit_labels=cached_refit,
                     )
                 else:
                     labels_used, refit = refine_partition_likelihood(
@@ -1380,35 +1443,10 @@ def generate_likelihood_partition_starts(
                         hint_phi=phi0,
                         classification_weight_alpha=classification_weight_alpha,
                         allow_component_death=bool(allow_component_death),
+                        _refit_labels=cached_refit,
                     )
             else:
-                if (
-                    use_torch_runtime
-                    and runtime is not None
-                    and partition_torch_data is not None
-                ):
-                    refit = partition_constrained_observed_refit_torch(
-                        data,
-                        labels,
-                        major_prior=float(major_prior),
-                        eps=float(eps),
-                        tol=float(tol),
-                        max_iter=max(int(refit_max_iter), 32),
-                        hint_phi=exact_pilot,
-                        torch_data=partition_torch_data,
-                        device=runtime.device,
-                        dtype=runtime.dtype,
-                    )
-                else:
-                    refit = partition_constrained_observed_refit(
-                        data,
-                        labels,
-                        major_prior=float(major_prior),
-                        eps=float(eps),
-                        tol=float(tol),
-                        max_iter=max(int(refit_max_iter), 32),
-                        hint_phi=phi0,
-                    )
+                refit = cached_refit(labels)
                 labels_used = labels
 
             key = _label_key(labels_used)

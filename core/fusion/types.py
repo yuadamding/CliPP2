@@ -193,12 +193,24 @@ BackendWarmState: TypeAlias = (
 
 
 @dataclass(frozen=True, slots=True)
+class QuotientFailureProvenance:
+    lambda_value: float
+    graph_hash: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class BackendWorkCounters:
     quotient_iterations: int = 0
     workset_iterations: int = 0
     workset_expansions: int = 0
     streamed_edge_passes: int = 0
     dense_iterations: int = 0
+    certificate_iterations: int = 0
+    activity_passes: int = 0
+    analytic_adjoint_passes: int = 0
+    column_scan_passes: int = 0
+    full_certificate_audit_passes: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +276,11 @@ class ExactFusionProvenance:
     workset_expansions: int = 0
     streamed_edge_passes: int = 0
     dense_iterations: int = 0
+    certificate_iterations: int = 0
+    activity_passes: int = 0
+    analytic_adjoint_passes: int = 0
+    column_scan_passes: int = 0
+    full_certificate_audit_passes: int = 0
     fallback_reason: str = ""
 
 
@@ -447,6 +464,7 @@ class SolverState:
     previous_lambda: float
     warm_state: BackendWarmState | None = None
     certificate: GraphFusionCertificate | None = None
+    quotient_failure: QuotientFailureProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)

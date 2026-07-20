@@ -17,7 +17,11 @@ from CliPP2.core.fusion.starts import (
     compute_scalar_well_start_bank,
     compute_scalar_well_start_bank_torch,
 )
-from CliPP2.core.fusion.torch_backend import resolve_runtime, to_torch_tumor_data
+from CliPP2.core.fusion.torch_backend import (
+    refine_graph_fusion_dual_certificate_torch,
+    resolve_runtime,
+    to_torch_tumor_data,
+)
 from CliPP2.core.fusion.types import (
     CompressedEdgeCertificate,
     PrimalOnlyWarmState,
@@ -66,6 +70,63 @@ def _toy_tumor_data(*, tumor_id: str = "toy", alt_shift: float = 0.0) -> TumorDa
         phi_init=np.full_like(alt_counts, 0.5, dtype=np.float32),
         init_major_mask=np.ones_like(alt_counts, dtype=bool),
     )
+
+
+@pytest.mark.parametrize("edge_work_bytes", [None, 1])
+def test_fixed_primal_certificate_stops_on_a_deterministic_plateau(
+    edge_work_bytes: int | None,
+) -> None:
+    phi = torch.full((2, 1), -1.0, dtype=torch.float64)
+    audit = refine_graph_fusion_dual_certificate_torch(
+        phi=phi,
+        grad_smooth=torch.zeros_like(phi),
+        dual_kkt=None,
+        lower=torch.zeros_like(phi),
+        upper=torch.ones_like(phi),
+        edge_u=torch.tensor([0]),
+        edge_v=torch.tensor([1]),
+        edge_w=torch.ones(1, dtype=phi.dtype),
+        lambda_value=1.0,
+        atol=1e-8,
+        max_iter=100,
+        edge_work_bytes=edge_work_bytes,
+    )
+
+    assert audit["diag"]["kkt_residual"] > 5e-8
+    assert audit["refinement_iterations"] == 8
+
+
+@pytest.mark.parametrize("edge_work_bytes", [None, 1])
+def test_fixed_primal_certificate_does_not_confuse_dual_motion_with_a_plateau(
+    edge_work_bytes: int | None,
+) -> None:
+    phi = torch.tensor([[1.0], [1.0], [0.5]], dtype=torch.float64)
+    audit = refine_graph_fusion_dual_certificate_torch(
+        phi=phi,
+        grad_smooth=torch.tensor(
+            [[0.2365472727217759], [-2.00356390703028], [0.9668085873661573]],
+            dtype=phi.dtype,
+        ),
+        dual_kkt=torch.tensor(
+            [[1.4403661842651112], [0.7074348754654124], [-1.0394116546875747]],
+            dtype=phi.dtype,
+        ),
+        lower=torch.zeros_like(phi),
+        upper=torch.ones_like(phi),
+        edge_u=torch.tensor([0, 0, 1]),
+        edge_v=torch.tensor([1, 2, 2]),
+        edge_w=torch.tensor(
+            [1.0748447666506027, 0.5279092788672166, 0.7756403820370112],
+            dtype=phi.dtype,
+        ),
+        lambda_value=1.3400690303898812,
+        atol=0.025,
+        max_iter=64,
+        edge_work_bytes=edge_work_bytes,
+    )
+
+    assert audit["diag"]["kkt_residual"] <= 5 * 0.025
+    assert audit["refinement_iterations"] == 17
 
 
 def test_damped_state_transition_invalidates_trial_certificate_and_dual() -> None:

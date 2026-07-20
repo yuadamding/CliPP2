@@ -382,6 +382,106 @@ def test_prepared_context_resource_policy_carries_cpu_fallback(monkeypatch) -> N
     assert context.resource_fallback == "dense_cpu"
 
 
+def test_invalid_device_never_triggers_cpu_fallback() -> None:
+    data = _toy_data()
+
+    with pytest.raises(ValueError, match="Unknown runtime device"):
+        solver_module.prepare_torch_problem_with_resource_policy(
+            data,
+            dense_fallback_policy="cpu_allowed",
+            device="not-a-device",
+            dtype="float64",
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-5,
+            inner_max_iter=32,
+        )
+    with pytest.raises(ValueError, match="Unknown runtime device"):
+        solver_module.fit_observed_data_pairwise_fusion(
+            data,
+            lambda_value=0.2,
+            major_prior=0.5,
+            eps=1e-6,
+            outer_max_iter=1,
+            inner_max_iter=16,
+            tol=1e-5,
+            device="not-a-device",
+            dtype="float64",
+            dense_fallback_policy="cpu_allowed",
+            compute_summary=False,
+        )
+
+
+def test_unavailable_cuda_uses_only_the_explicit_cpu_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _toy_data()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    context = solver_module.prepare_torch_problem_with_resource_policy(
+        data,
+        dense_fallback_policy="cpu_allowed",
+        device="cuda",
+        dtype="float64",
+        major_prior=0.5,
+        eps=1e-6,
+        tol=1e-5,
+        inner_max_iter=32,
+    )
+    artifacts = solver_module.fit_observed_data_pairwise_fusion(
+        data,
+        lambda_value=0.2,
+        major_prior=0.5,
+        eps=1e-6,
+        outer_max_iter=1,
+        inner_max_iter=16,
+        tol=1e-5,
+        device="cuda",
+        dtype="float64",
+        dense_fallback_policy="cpu_allowed",
+        compute_summary=False,
+    )
+
+    assert context.runtime.device == torch.device("cpu")
+    assert context.resource_fallback == "dense_cpu"
+    assert artifacts.device == "cpu"
+    assert artifacts.inner_solver == "admm_complete_graph_cpu_fallback"
+
+
+def test_out_of_range_cuda_index_never_triggers_cpu_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _toy_data()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+    with pytest.raises(ValueError, match="CUDA device index is unavailable: 7"):
+        solver_module.prepare_torch_problem_with_resource_policy(
+            data,
+            dense_fallback_policy="cpu_allowed",
+            device="cuda:7",
+            dtype="float64",
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-5,
+            inner_max_iter=32,
+        )
+    with pytest.raises(ValueError, match="CUDA device index is unavailable: 7"):
+        solver_module.fit_observed_data_pairwise_fusion(
+            data,
+            lambda_value=0.2,
+            major_prior=0.5,
+            eps=1e-6,
+            outer_max_iter=1,
+            inner_max_iter=16,
+            tol=1e-5,
+            device="cuda:7",
+            dtype="float64",
+            dense_fallback_policy="cpu_allowed",
+            compute_summary=False,
+        )
+
+
 def test_likelihood_only_context_defers_complete_graph_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

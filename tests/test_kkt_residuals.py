@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+
 import pytest
 import torch
 
@@ -283,6 +285,7 @@ def test_fused_edge_dual_refinement_finds_nonzero_certificate() -> None:
     assert audit["fused_edges"] == 1
     assert audit["diag"]["kkt_residual"] < 1e-6
     assert audit["stationarity_after"] < audit["stationarity_before"]
+    assert 0 < audit["refinement_iterations"] < 200
 
 
 def test_fused_edge_rejects_dual_outside_ball() -> None:
@@ -466,13 +469,17 @@ def test_box_qp_sweeps_are_accuracy_driven_not_alm_budget() -> None:
     assert _box_qp_sweeps_for_atol(1e-12, max_iter=32) == 32
 
 
-def test_zero_penalty_alm_shortcut_reports_no_admm_iterations() -> None:
+@pytest.mark.parametrize("edge_work_bytes", [None, 8])
+def test_zero_penalty_alm_shortcut_clears_diagnostics(
+    edge_work_bytes: int | None,
+) -> None:
     runtime = resolve_runtime("cpu", dtype="float64")
     U = torch.tensor([[0.0], [1.0]], dtype=runtime.dtype, device=runtime.device)
     h = torch.full_like(U, 4.0)
     lower = torch.full_like(U, -10.0)
     upper = torch.full_like(U, 10.0)
 
+    diagnostics: dict[str, float | int] = {"kkt_residual": 99.0, "stale": 1.0}
     _, _, _, iterations, converged, residual = solve_majorized_subproblem_alm_torch(
         runtime=runtime,
         num_mutations=2,
@@ -488,14 +495,85 @@ def test_zero_penalty_alm_shortcut_reports_no_admm_iterations() -> None:
         max_iter=16,
         phi_start=U,
         dual_start=None,
+        edge_work_bytes=edge_work_bytes,
+        diagnostics_out=diagnostics,
     )
 
     assert iterations == 0
     assert converged
     assert residual == 0.0
+    assert diagnostics["kkt_residual"] == 0.0
+    assert diagnostics["inner_kkt_audits"] == 0
+    assert diagnostics["inner_stationarity_checks"] == 0
+    assert "stale" not in diagnostics
 
 
-def test_alm_uses_periodic_kkt_audits_and_decoupled_box_budget(monkeypatch) -> None:
+def test_complete_graph_cached_kkt_matches_generic_audit() -> None:
+    torch.manual_seed(3)
+    dtype = torch.float64
+    num_mutations = 4
+    phi = torch.rand((num_mutations, 2), dtype=dtype)
+    U = torch.rand_like(phi)
+    h = 0.5 + torch.rand_like(phi)
+    lower = torch.zeros_like(phi)
+    upper = torch.ones_like(phi)
+    edges = torch.triu_indices(num_mutations, num_mutations, offset=1)
+    edge_w = 0.5 + torch.rand(edges.shape[1], dtype=dtype)
+    dual = torch.randn((edges.shape[1], phi.shape[1]), dtype=dtype)
+    adj = graph_adjoint_edges(
+        dual,
+        edge_u=edges[0],
+        edge_v=edges[1],
+        num_nodes=num_mutations,
+    )
+    cached: dict[str, float | int] = {}
+    grad_smooth, _ = torch_backend._complete_graph_admm_stationarity_components_torch(
+        phi=phi,
+        U=U,
+        h=h,
+        lower=lower,
+        upper=upper,
+        adj=adj,
+        atol=1e-8,
+    )
+    edge_max, ball_max, radius_max = torch_backend._edge_kkt_maxima_from_diff_torch(
+        diff=graph_forward_edges(phi, edge_u=edges[0], edge_v=edges[1]),
+        dual=dual,
+        radius=0.7 * edge_w,
+    )
+    torch_backend._complete_graph_admm_kkt_residual_from_maxima_torch(
+        phi=phi,
+        grad_smooth=grad_smooth,
+        adj=adj,
+        lower=lower,
+        upper=upper,
+        max_edge_residual=edge_max,
+        max_ball_residual=ball_max,
+        max_radius=radius_max,
+        atol=1e-8,
+        diagnostics_out=cached,
+    )
+    generic = graph_fusion_kkt_residual_from_grad_torch(
+        phi=phi,
+        grad_smooth=h * (phi - U),
+        dual_kkt=dual,
+        lower=lower,
+        upper=upper,
+        edge_u=edges[0],
+        edge_v=edges[1],
+        edge_w=edge_w,
+        lambda_value=0.7,
+        atol=1e-8,
+    )
+
+    assert cached.keys() == generic.keys()
+    for key, expected in generic.items():
+        assert cached[key] == pytest.approx(expected, rel=1e-13, abs=1e-14)
+
+
+def test_alm_reuses_state_for_periodic_kkt_audits_and_decouples_box_budget(
+    monkeypatch,
+) -> None:
     runtime = resolve_runtime("cpu", dtype="float64")
     dtype = runtime.dtype
     device = runtime.device
@@ -522,7 +600,12 @@ def test_alm_uses_periodic_kkt_audits_and_decoupled_box_budget(monkeypatch) -> N
     monkeypatch.setattr(
         torch_backend, "_complete_graph_isotropic_box_qp_torch", counting_box_qp
     )
-    monkeypatch.setattr(torch_backend, "inner_kkt_residual_torch", counting_kkt)
+    monkeypatch.setattr(
+        torch_backend,
+        "_complete_graph_admm_kkt_residual_from_maxima_torch",
+        counting_kkt,
+    )
+    diagnostics: dict[str, float | int] = {}
 
     _, _, _, iterations, converged, residual = (
         torch_backend.solve_majorized_subproblem_alm_torch(
@@ -542,15 +625,132 @@ def test_alm_uses_periodic_kkt_audits_and_decoupled_box_budget(monkeypatch) -> N
             dual_start=None,
             kkt_check_every=4,
             box_phi_atol=1e-6,
+            diagnostics_out=diagnostics,
         )
     )
 
     assert not converged
     assert residual == 1.0
     assert iterations == 12
-    assert audit_calls == 3
+    assert audit_calls == 1
+    assert diagnostics["inner_kkt_audits"] == 1
+    assert diagnostics["inner_stationarity_checks"] == 3
     assert len(box_iters) == 12
     assert set(box_iters) == {21}
+
+
+def _seed17_admm_problem(*, edge_work_bytes: int | None) -> dict[str, object]:
+    random.seed(17)
+    torch.manual_seed(17)
+    num_mutations = random.randint(3, 15)
+    num_regions = random.randint(1, 4)
+    assert (num_mutations, num_regions) == (11, 4)
+
+    runtime = resolve_runtime("cpu", dtype="float64")
+    edges = torch.triu_indices(num_mutations, num_mutations, offset=1)
+    U = torch.rand((num_mutations, num_regions), dtype=runtime.dtype)
+    h = 0.001 + 1000.0 * torch.rand_like(U)
+    edge_w = 0.001 + 5.0 * torch.rand(edges.shape[1], dtype=runtime.dtype)
+    lambda_value = 10.0 ** random.uniform(-3.0, 2.0)
+    tol = 10.0 ** random.uniform(-7.0, -3.0)
+    assert random.choice([16, 24, 30, 40, 80]) == 30
+
+    return {
+        "runtime": runtime,
+        "num_mutations": num_mutations,
+        "U": U,
+        "h": h,
+        "lower": torch.zeros_like(U),
+        "upper": torch.ones_like(U),
+        "lambda_value": lambda_value,
+        "edge_u": edges[0],
+        "edge_v": edges[1],
+        "edge_w": edge_w,
+        "tol": tol,
+        "phi_start": U,
+        "dual_start": None,
+        "spectral_rho": True,
+        "kkt_check_every": 8,
+        "edge_work_bytes": edge_work_bytes,
+    }
+
+
+@pytest.mark.parametrize(
+    "edge_work_bytes",
+    [None, 8],
+    ids=["dense", "one-edge-streaming"],
+)
+def test_periodic_exact_audit_retains_a_certified_within_budget_iterate(
+    edge_work_bytes: int | None,
+) -> None:
+    problem = _seed17_admm_problem(edge_work_bytes=edge_work_bytes)
+
+    certified = solve_majorized_subproblem_alm_torch(**problem, max_iter=24)
+    extended = solve_majorized_subproblem_alm_torch(**problem, max_iter=30)
+
+    assert certified[3] == 24
+    assert certified[4]
+    assert certified[5] == pytest.approx(4.5830886190865793e-4, rel=1e-10)
+    assert extended[3] == 24
+    assert extended[4]
+    assert extended[5] == pytest.approx(certified[5], rel=1e-12)
+
+
+def test_float32_stationarity_gate_cannot_false_certify_streaming_admm() -> None:
+    random.seed(23)
+    torch.manual_seed(23)
+    runtime = resolve_runtime("cpu", dtype="float32")
+    num_mutations = random.randint(2, 20)
+    num_regions = random.randint(1, 5)
+    edges = torch.triu_indices(num_mutations, num_mutations, offset=1)
+    U = torch.rand((num_mutations, num_regions), dtype=runtime.dtype)
+    h = 10.0 ** random.uniform(2, 8) * (0.001 + torch.rand_like(U))
+    lower = torch.zeros_like(U)
+    upper = torch.ones_like(U)
+    edge_w = 0.001 + 5.0 * torch.rand(edges.shape[1], dtype=runtime.dtype)
+    lambda_value = 10.0 ** random.uniform(-7, 0)
+    tol = 10.0 ** random.uniform(-7, -2)
+    max_iter = random.choice([10, 16, 20, 24, 30, 40])
+    kkt_check_every = random.choice([1, 2, 4, 8, 10])
+
+    result = solve_majorized_subproblem_alm_torch(
+        runtime=runtime,
+        num_mutations=num_mutations,
+        U=U,
+        h=h,
+        lower=lower,
+        upper=upper,
+        lambda_value=lambda_value,
+        edge_u=edges[0],
+        edge_v=edges[1],
+        edge_w=edge_w,
+        tol=tol,
+        max_iter=max_iter,
+        phi_start=U,
+        dual_start=None,
+        spectral_rho=True,
+        kkt_check_every=kkt_check_every,
+        edge_work_bytes=1,
+    )
+    exact = inner_kkt_residual_torch(
+        phi=result[0],
+        dual=result[2],
+        U=U,
+        h=h,
+        lower=lower,
+        upper=upper,
+        lambda_value=lambda_value,
+        edge_u=edges[0],
+        edge_v=edges[1],
+        edge_w=edge_w,
+        atol=tol,
+        edge_work_bytes=1,
+    )
+    kkt_stop_tol = tol + 0.25 * min(1e-8, tol)
+
+    assert (num_mutations, num_regions, max_iter, kkt_check_every) == (11, 1, 20, 2)
+    assert result[5] == pytest.approx(exact, rel=1e-6, abs=1e-10)
+    assert not result[4] or exact <= kkt_stop_tol
 
 
 def test_pdhg_uses_precomputed_tau_node_without_rebuilding_degree(monkeypatch) -> None:

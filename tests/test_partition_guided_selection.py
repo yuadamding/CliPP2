@@ -12,6 +12,7 @@ from CliPP2.core.model import FitOptions
 from CliPP2.core.fusion.types import (
     DenseEdgeCertificate,
     DenseWarmState,
+    QuotientFailureProvenance,
     SolverState,
     TorchRuntime,
 )
@@ -223,6 +224,11 @@ def test_persistent_solver_state_offload_preserves_values_and_shared_storage() -
             graph_hash="shared-storage-test",
             gradient_scope="observed_objective",
         ),
+        quotient_failure=QuotientFailureProvenance(
+            lambda_value=3.5,
+            graph_hash="shared-storage-test",
+            reason="test-failure",
+        ),
     )
 
     observed = runner._offload_solver_state_to_cpu(state)
@@ -233,6 +239,7 @@ def test_persistent_solver_state_offload_preserves_values_and_shared_storage() -
     assert not hasattr(observed, "curvature")
     assert not hasattr(observed, "split")
     assert observed.previous_lambda == pytest.approx(3.5)
+    assert observed.quotient_failure == state.quotient_failure
     assert isinstance(observed.warm_state, DenseWarmState)
     assert isinstance(observed.certificate, DenseEdgeCertificate)
     assert observed.phi is observed.warm_state.phi

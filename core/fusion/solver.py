@@ -44,6 +44,7 @@ from .starts import (
     compute_scalar_well_start_bank_torch,
 )
 from .torch_backend import (
+    CudaUnavailableError,
     TorchTumorData,
     as_runtime_tensor,
     mutation_region_terms_torch,
@@ -74,6 +75,7 @@ from .types import (
     OuterDiagnostics,
     PairwiseFusionGraph,
     PrimalOnlyWarmState,
+    QuotientFailureProvenance,
     QuotientWorksetWarmState,
     SolverContext,
     SolverState,
@@ -318,6 +320,7 @@ def _update_minimum(current: float, candidate: float) -> float:
 
 _MISSING_SURROGATE_CURVATURE = 1e-6
 _OUTER_KKT_CHECK_EVERY = 4
+_PERIODIC_CERTIFICATE_MAX_ITER = 96
 _FULL_STEP_MAX_CURVATURE_ATTEMPTS = 24
 _UNIMODAL_GLOBAL_OPTIMALITY_BASIS = "assumed_unimodal_objective_plus_kkt"
 
@@ -898,7 +901,7 @@ def prepare_torch_problem_with_resource_policy(
             if supplied_runtime is None
             else supplied_runtime
         )
-    except RuntimeError:
+    except CudaUnavailableError:
         if normalized_policy != "cpu_allowed":
             raise
         try:
@@ -1307,6 +1310,13 @@ def _solve_inner_subproblem(
             workset_expansions=int(quotient_attempt_work.workset_expansions),
             streamed_edge_passes=int(quotient_attempt_work.streamed_edge_passes),
             dense_iterations=dense_iterations,
+            certificate_iterations=int(quotient_attempt_work.certificate_iterations),
+            activity_passes=int(quotient_attempt_work.activity_passes),
+            analytic_adjoint_passes=int(quotient_attempt_work.analytic_adjoint_passes),
+            column_scan_passes=int(quotient_attempt_work.column_scan_passes),
+            full_certificate_audit_passes=int(
+                quotient_attempt_work.full_certificate_audit_passes
+            ),
         ),
         fallback_reason=quotient_fallback_reason,
     )
@@ -1396,10 +1406,13 @@ def _fit_from_start(
     else:
         dense_inner_solver = "pdhg"
     inner_solver = dense_inner_solver
+    prior_failure = solver_state.quotient_failure if solver_state is not None else None
     prior_quotient_failure = bool(
         requested_inner_backend == "quotient_workset"
-        and solver_state is not None
-        and isinstance(solver_state.warm_state, DenseWarmState)
+        and lambda_value > 0.0
+        and prior_failure is not None
+        and prior_failure.graph_hash == str(graph_hash)
+        and prior_failure.lambda_value == float(lambda_value)
     )
     use_compressed_certificates = bool(
         requested_inner_backend == "quotient_workset"
@@ -1479,11 +1492,17 @@ def _fit_from_start(
     workset_expansions = 0
     streamed_edge_passes = 0
     dense_iterations = 0
+    certificate_iterations = 0
+    activity_passes = 0
+    analytic_adjoint_passes = 0
+    column_scan_passes = 0
+    full_certificate_audit_passes = 0
     fallback_reason = (
         "dense_current_device_after_prior_quotient_failure"
         if prior_quotient_failure
         else ""
     )
+    quotient_failure = prior_failure if prior_quotient_failure else None
     active_inner_backend = (
         "dense" if prior_quotient_failure else requested_inner_backend
     )
@@ -1649,6 +1668,7 @@ def _fit_from_start(
             attempted_inner_iterations = 0
             inner_batch_limit = 8 if require_full_step_backtracking else 1
             for _inner_batch in range(inner_batch_limit):
+                attempted_quotient = active_inner_backend == "quotient_workset"
                 inner_result = _solve_inner_subproblem(
                     use_alm=use_alm,
                     runtime=runtime,
@@ -1687,10 +1707,31 @@ def _fit_from_start(
                     inner_result.work_counters.streamed_edge_passes
                 )
                 dense_iterations += int(inner_result.work_counters.dense_iterations)
+                certificate_iterations += int(
+                    inner_result.work_counters.certificate_iterations
+                )
+                activity_passes += int(inner_result.work_counters.activity_passes)
+                analytic_adjoint_passes += int(
+                    inner_result.work_counters.analytic_adjoint_passes
+                )
+                column_scan_passes += int(inner_result.work_counters.column_scan_passes)
+                full_certificate_audit_passes += int(
+                    inner_result.work_counters.full_certificate_audit_passes
+                )
                 fallback_reason = _combine_fallback_reasons(
                     fallback_reason,
                     inner_result.fallback_reason,
                 )
+                if (
+                    attempted_quotient
+                    and lambda_value > 0.0
+                    and inner_result.fallback_reason
+                ):
+                    quotient_failure = QuotientFailureProvenance(
+                        lambda_value=float(lambda_value),
+                        graph_hash=str(graph_hash),
+                        reason=str(inner_result.fallback_reason),
+                    )
                 if inner_result.fallback_reason:
                     active_inner_backend = "dense"
                 phi_trial = inner_result.phi
@@ -2132,9 +2173,18 @@ def _fit_from_start(
                     upper=upper,
                     lambda_value=lambda_value,
                     atol=tol,
-                    max_iter=int(certificate_options.max_iter),
+                    max_iter=min(
+                        int(certificate_options.max_iter),
+                        _PERIODIC_CERTIFICATE_MAX_ITER,
+                    ),
                     options=(
-                        certificate_options
+                        replace(
+                            certificate_options,
+                            max_iter=min(
+                                int(certificate_options.max_iter),
+                                _PERIODIC_CERTIFICATE_MAX_ITER,
+                            ),
+                        )
                         if isinstance(observed_start, CompressedEdgeCertificate)
                         else None
                     ),
@@ -2147,6 +2197,21 @@ def _fit_from_start(
                 )
                 streamed_edge_passes += int(
                     observed_refinement.work_counters.streamed_edge_passes
+                )
+                certificate_iterations += int(
+                    observed_refinement.work_counters.certificate_iterations
+                )
+                activity_passes += int(
+                    observed_refinement.work_counters.activity_passes
+                )
+                analytic_adjoint_passes += int(
+                    observed_refinement.work_counters.analytic_adjoint_passes
+                )
+                column_scan_passes += int(
+                    observed_refinement.work_counters.column_scan_passes
+                )
+                full_certificate_audit_passes += int(
+                    observed_refinement.work_counters.full_certificate_audit_passes
                 )
                 certificate = observed_refinement.certificate
                 outer_diag = observed_refinement.diagnostics.as_dict()
@@ -2226,6 +2291,19 @@ def _fit_from_start(
     streamed_edge_passes += int(
         final_certificate_refinement.work_counters.streamed_edge_passes
     )
+    certificate_iterations += int(
+        final_certificate_refinement.work_counters.certificate_iterations
+    )
+    activity_passes += int(final_certificate_refinement.work_counters.activity_passes)
+    analytic_adjoint_passes += int(
+        final_certificate_refinement.work_counters.analytic_adjoint_passes
+    )
+    column_scan_passes += int(
+        final_certificate_refinement.work_counters.column_scan_passes
+    )
+    full_certificate_audit_passes += int(
+        final_certificate_refinement.work_counters.full_certificate_audit_passes
+    )
     certificate = final_certificate_refinement.certificate
     final_outer_diag = final_certificate_refinement.diagnostics.as_dict()
     final_dual = getattr(certificate, "dual", None)
@@ -2281,6 +2359,11 @@ def _fit_from_start(
         workset_expansions=int(workset_expansions),
         streamed_edge_passes=int(streamed_edge_passes),
         dense_iterations=int(dense_iterations),
+        certificate_iterations=int(certificate_iterations),
+        activity_passes=int(activity_passes),
+        analytic_adjoint_passes=int(analytic_adjoint_passes),
+        column_scan_passes=int(column_scan_passes),
+        full_certificate_audit_passes=int(full_certificate_audit_passes),
         fallback_reason=str(fallback_reason),
     )
     stationarity_certified = bool(selection_eligible)
@@ -2394,6 +2477,9 @@ def _fit_from_start(
         previous_lambda=float(lambda_value),
         warm_state=terminal_warm_state,
         certificate=certificate,
+        quotient_failure=(
+            quotient_failure if requested_inner_backend == "quotient_workset" else None
+        ),
     )
     torch_result = TorchFitResult(
         phi_raw=phi.detach(),
@@ -2643,7 +2729,7 @@ def fit_observed_data_pairwise_fusion(
             requested_runtime = (
                 resolve_runtime(device, dtype=dtype) if runtime is None else runtime
             )
-        except RuntimeError:
+        except CudaUnavailableError:
             if normalized_fallback_policy != "cpu_allowed":
                 raise
             try:
@@ -2836,6 +2922,7 @@ def fit_observed_data_pairwise_fusion(
         *,
         reason: str,
         backend_name: str | None = None,
+        quotient_failure_reason: str | None = None,
     ) -> FusionFitArtifacts:
         fallback_backend = (
             str(backend_name) if backend_name is not None else artifacts.inner_solver
@@ -2861,9 +2948,20 @@ def fit_observed_data_pairwise_fusion(
             if artifacts.torch_result is not None
             else None
         )
+        fallback_solver_state = artifacts.solver_state
+        if quotient_failure_reason is not None and fallback_solver_state is not None:
+            fallback_solver_state = replace(
+                fallback_solver_state,
+                quotient_failure=QuotientFailureProvenance(
+                    lambda_value=float(lambda_value),
+                    graph_hash=str(solver_context.graph_hash),
+                    reason=str(quotient_failure_reason),
+                ),
+            )
         return replace(
             artifacts,
             inner_solver=fallback_backend,
+            solver_state=fallback_solver_state,
             exactness_provenance=fallback_provenance,
             torch_result=fallback_torch_result,
         )
@@ -2906,6 +3004,26 @@ def fit_observed_data_pairwise_fusion(
                 int(current_provenance.dense_iterations)
                 + int(attempted_provenance.dense_iterations)
             ),
+            certificate_iterations=(
+                int(current_provenance.certificate_iterations)
+                + int(attempted_provenance.certificate_iterations)
+            ),
+            activity_passes=(
+                int(current_provenance.activity_passes)
+                + int(attempted_provenance.activity_passes)
+            ),
+            analytic_adjoint_passes=(
+                int(current_provenance.analytic_adjoint_passes)
+                + int(attempted_provenance.analytic_adjoint_passes)
+            ),
+            column_scan_passes=(
+                int(current_provenance.column_scan_passes)
+                + int(attempted_provenance.column_scan_passes)
+            ),
+            full_certificate_audit_passes=(
+                int(current_provenance.full_certificate_audit_passes)
+                + int(attempted_provenance.full_certificate_audit_passes)
+            ),
             fallback_reason=_combine_fallback_reasons(
                 attempted_provenance.fallback_reason,
                 current_provenance.fallback_reason,
@@ -2945,12 +3063,16 @@ def fit_observed_data_pairwise_fusion(
         )
         cpu_seed = state_for_start.phi if state_for_start is not None else start
         attempted_artifacts: FusionFitArtifacts | None = None
+        quotient_terminal_failure_reason: str | None = None
+        backend_for_start = (
+            "dense" if context_prepared_by_cpu_fallback else inner_backend
+        )
         try:
             artifacts = run_start(
                 context=solver_context,
                 start=start,
                 state=state_for_start,
-                backend="dense" if context_prepared_by_cpu_fallback else inner_backend,
+                backend=backend_for_start,
                 fallback_policy=(
                     "device_only"
                     if context_prepared_by_cpu_fallback
@@ -2975,6 +3097,10 @@ def fit_observed_data_pairwise_fusion(
             )
             if compressed_terminal_not_certified:
                 attempted_artifacts = artifacts
+                if normalize_inner_backend(backend_for_start) == "quotient_workset":
+                    quotient_terminal_failure_reason = (
+                        "dense_current_device_after_compressed_not_certified"
+                    )
                 cpu_seed = (
                     artifacts.torch_result.phi_raw
                     if artifacts.torch_result is not None
@@ -2997,6 +3123,7 @@ def fit_observed_data_pairwise_fusion(
                 artifacts = mark_fallback(
                     artifacts,
                     reason="dense_current_device_after_compressed_not_certified",
+                    quotient_failure_reason=quotient_terminal_failure_reason,
                 )
             if context_prepared_by_cpu_fallback:
                 artifacts = mark_fallback(
@@ -3087,6 +3214,7 @@ def fit_observed_data_pairwise_fusion(
                 artifacts,
                 reason="dense_cpu_after_solver_resource_limit",
                 backend_name="admm_complete_graph_cpu_fallback",
+                quotient_failure_reason=quotient_terminal_failure_reason,
             )
         start_artifacts.append(artifacts)
         if best_artifacts is None:

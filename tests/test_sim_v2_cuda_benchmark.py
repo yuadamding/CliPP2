@@ -80,6 +80,11 @@ def _quotient_record(**updates: object) -> dict[str, object]:
         "workset_expansions": 2,
         "streamed_edge_passes": 3,
         "dense_iterations": 0,
+        "certificate_iterations": 5,
+        "activity_passes": 7,
+        "analytic_adjoint_passes": 11,
+        "column_scan_passes": 13,
+        "full_certificate_audit_passes": 17,
         "fallback_reason": "",
     }
     record.update(updates)
@@ -103,13 +108,28 @@ def test_backend_observations_capture_each_counter_and_pass_strict_audit() -> No
     assert observations[0]["workset_iterations"] == 8
     assert observations[0]["workset_expansions"] == 2
     assert observations[0]["dense_iterations"] == 0
+    assert observations[0]["certificate_iterations"] == 5
+    assert observations[0]["activity_passes"] == 7
+    assert observations[0]["analytic_adjoint_passes"] == 11
+    assert observations[0]["column_scan_passes"] == 13
+    assert observations[0]["full_certificate_audit_passes"] == 17
     assert observations[0]["fallback_reason"] == ""
     assert observations[0]["partition_signature"] is None
     assert observations[0]["missing_backend_columns"] == []
+    assert observations[0]["missing_optional_work_columns"] == []
+    assert observations[0]["work_counter_scope"] == "selected_start_only"
     assert audit == {
         "requested_backend": "quotient_workset",
         "expected_device_type": "cuda",
+        "expected_device": "cuda",
         "applicable_rows": 2,
+        "work_accounting": {
+            "columns": list(benchmark.OPTIONAL_WORK_COLUMNS),
+            "scope": "selected_start_only",
+            "complete_rows": 2,
+            "missing_rows": [],
+            "passed": True,
+        },
         "passed": True,
         "violations": [],
     }
@@ -147,6 +167,7 @@ def test_backend_observation_preserves_correctness_and_timing_evidence() -> None
 
     assert {column: observation[column] for column in evidence} == evidence
     assert observation["missing_backend_columns"] == []
+    assert observation["missing_optional_work_columns"] == []
     assert (
         benchmark._audit_backend_observations(
             [observation], requested_backend="quotient_workset"
@@ -196,10 +217,67 @@ def test_strict_audit_rejects_non_cuda_or_missing_device(
 
     assert audit["passed"] is False
     assert audit["expected_device_type"] == "cuda"
+    assert audit["expected_device"] == "cuda:0"
     assert [violation["kind"] for violation in audit["violations"]] == [
         "actual_device_type"
     ]
     assert audit["violations"][0]["recorded_device"] == recorded_device
+
+
+def test_strict_audit_rejects_the_wrong_cuda_index() -> None:
+    observations = benchmark._backend_observations(
+        [_quotient_record(device="cuda:1")],
+        requested_backend="quotient_workset",
+    )
+
+    audit = benchmark._audit_backend_observations(
+        observations,
+        requested_backend="quotient_workset",
+        expected_device_type="cuda:0",
+    )
+
+    assert audit["passed"] is False
+    assert audit["violations"] == [
+        {
+            "search_row_index": 0,
+            "kind": "actual_device",
+            "expected": "cuda:0",
+            "actual": "cuda:1",
+            "recorded_device": "cuda:1",
+        }
+    ]
+
+
+def test_archived_rows_expose_missing_optional_work_accounting() -> None:
+    record = _quotient_record()
+    for column in benchmark.OPTIONAL_WORK_COLUMNS:
+        record.pop(column)
+    observations = benchmark._backend_observations(
+        [record], requested_backend="quotient_workset"
+    )
+
+    audit = benchmark._audit_backend_observations(
+        observations,
+        requested_backend="quotient_workset",
+        expected_device_type="cuda:0",
+    )
+
+    assert audit["passed"] is True
+    assert observations[0]["missing_optional_work_columns"] == list(
+        benchmark.OPTIONAL_WORK_COLUMNS
+    )
+    assert audit["work_accounting"] == {
+        "columns": list(benchmark.OPTIONAL_WORK_COLUMNS),
+        "scope": "selected_start_only",
+        "complete_rows": 0,
+        "missing_rows": [
+            {
+                "search_row_index": 0,
+                "columns": list(benchmark.OPTIONAL_WORK_COLUMNS),
+            }
+        ],
+        "passed": False,
+    }
 
 
 def test_lambda_budget_counts_unique_values_not_retries() -> None:
@@ -313,6 +391,14 @@ def test_python_source_manifest_hashes_relative_paths_and_bytes_only(
     assert (
         benchmark._python_source_manifest(package_root)["sha256"] != manifest["sha256"]
     )
+
+
+def test_harness_metadata_hashes_the_executed_script() -> None:
+    metadata = benchmark._harness_metadata()
+    path = Path(metadata["path"])
+
+    assert path.samefile(Path(benchmark.__file__))
+    assert metadata["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _complete_case(case_path: Path, *, selection_step: int = 0) -> dict[str, object]:

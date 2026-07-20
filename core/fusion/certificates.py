@@ -500,7 +500,10 @@ def _refine_compressed_certificate(
             nonzero_edges=nonzero_edges,
             stationarity_before=diag.stationarity_residual,
             stationarity_after=diag.stationarity_residual,
-            work_counters=BackendWorkCounters(streamed_edge_passes=activity_passes),
+            work_counters=BackendWorkCounters(
+                streamed_edge_passes=activity_passes,
+                activity_passes=activity_passes,
+            ),
         )
     labels, centers, inherited_ids, inherited_dual = _validated_compressed_tensors(
         certificate,
@@ -543,7 +546,8 @@ def _refine_compressed_certificate(
             stationarity_before=diag.stationarity_residual,
             stationarity_after=diag.stationarity_residual,
             work_counters=BackendWorkCounters(
-                streamed_edge_passes=tree_passes + activity_passes
+                streamed_edge_passes=tree_passes + activity_passes,
+                activity_passes=activity_passes,
             ),
         )
     support_ids, dual = _merge_internal_support(
@@ -568,6 +572,8 @@ def _refine_compressed_certificate(
     base_grad = grad_smooth + between_adj
     total_iterations = 0
     edge_passes = tree_passes + between_passes + activity_passes
+    column_scan_passes = 0
+    full_certificate_audit_passes = 0
     column_residual = float("inf")
     node_residual = float("inf")
     # A nonempty inherited support may already be authoritative, so give it one
@@ -593,11 +599,13 @@ def _refine_compressed_certificate(
             lambda_value=lambda_value,
             atol=atol,
         )
-        edge_passes += _compressed_audit_edge_passes(
+        audit_passes = _compressed_audit_edge_passes(
             num_edges=int(graph.edge_u.numel()),
             num_regions=int(phi.shape[1]),
             dtype=phi.dtype,
         )
+        edge_passes += audit_passes
+        full_certificate_audit_passes += audit_passes
     if has_inherited_fast_path and before.kkt_residual <= 5.0 * float(atol):
         # The inherited compressed state has already passed a full
         # original-graph audit.  Re-optimizing its workset cannot strengthen
@@ -620,7 +628,13 @@ def _refine_compressed_certificate(
             nonzero_edges=nonzero_edges,
             stationarity_before=before.stationarity_residual,
             stationarity_after=before.stationarity_residual,
-            work_counters=BackendWorkCounters(streamed_edge_passes=edge_passes),
+            work_counters=BackendWorkCounters(
+                streamed_edge_passes=edge_passes,
+                activity_passes=activity_passes,
+                analytic_adjoint_passes=between_passes,
+                column_scan_passes=column_scan_passes,
+                full_certificate_audit_passes=full_certificate_audit_passes,
+            ),
             node_residual=before.stationarity_residual,
             column_residual=before.edge_subgradient_residual,
         )
@@ -644,26 +658,6 @@ def _refine_compressed_certificate(
             )
         )
         total_iterations += iterations
-        work_adj = torch.zeros_like(phi)
-        if support_ids.numel():
-            work_u = graph.edge_u.index_select(0, support_ids)
-            work_v = graph.edge_v.index_select(0, support_ids)
-            work_adj.index_add_(0, work_u, dual)
-            work_adj.index_add_(0, work_v, dual, alpha=-1.0)
-        scale = (
-            1.0
-            + float(torch.linalg.norm(grad_smooth).item())
-            + float(torch.linalg.norm(between_adj + work_adj).item())
-        )
-        column_residual, proposed_ids, scan_passes = _scan_omitted_internal_edges(
-            residual=residual,
-            labels=labels,
-            support_ids=support_ids,
-            graph=graph,
-            scale=scale,
-            add_batch=int(options.add_batch),
-        )
-        edge_passes += scan_passes
         current = CompressedEdgeCertificate(
             labels=labels,
             centers=centers,
@@ -686,6 +680,27 @@ def _refine_compressed_certificate(
             continue
         unconverged_worksets = 0
 
+        work_adj = torch.zeros_like(phi)
+        if support_ids.numel():
+            work_u = graph.edge_u.index_select(0, support_ids)
+            work_v = graph.edge_v.index_select(0, support_ids)
+            work_adj.index_add_(0, work_u, dual)
+            work_adj.index_add_(0, work_v, dual, alpha=-1.0)
+        scale = (
+            1.0
+            + float(torch.linalg.norm(grad_smooth).item())
+            + float(torch.linalg.norm(between_adj + work_adj).item())
+        )
+        column_residual, proposed_ids, scan_passes = _scan_omitted_internal_edges(
+            residual=residual,
+            labels=labels,
+            support_ids=support_ids,
+            graph=graph,
+            scale=scale,
+            add_batch=int(options.add_batch),
+        )
+        edge_passes += scan_passes
+        column_scan_passes += scan_passes
         column_ready = column_residual <= float(options.column_tolerance)
         should_expand = not column_ready
         if column_ready:
@@ -700,11 +715,13 @@ def _refine_compressed_certificate(
                 lambda_value=lambda_value,
                 atol=atol,
             )
-            edge_passes += _compressed_audit_edge_passes(
+            audit_passes = _compressed_audit_edge_passes(
                 num_edges=int(graph.edge_u.numel()),
                 num_regions=int(phi.shape[1]),
                 dtype=phi.dtype,
             )
+            edge_passes += audit_passes
+            full_certificate_audit_passes += audit_passes
             if final_diag.kkt_residual <= 5.0 * float(atol):
                 status = "certified"
                 certificate = current
@@ -757,6 +774,10 @@ def _refine_compressed_certificate(
             workset_iterations=total_iterations,
             workset_expansions=expansions,
             streamed_edge_passes=edge_passes,
+            activity_passes=activity_passes,
+            analytic_adjoint_passes=between_passes,
+            column_scan_passes=column_scan_passes,
+            full_certificate_audit_passes=full_certificate_audit_passes,
         ),
         node_residual=node_residual,
         column_residual=column_residual,
@@ -1118,4 +1139,7 @@ def refine_graph_fusion_certificate(
         nonzero_edges=int(dense["nonzero_edges"]),
         stationarity_before=float(dense["stationarity_before"]),
         stationarity_after=float(dense["stationarity_after"]),
+        work_counters=BackendWorkCounters(
+            certificate_iterations=int(dense["refinement_iterations"])
+        ),
     )

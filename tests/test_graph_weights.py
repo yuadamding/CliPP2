@@ -27,7 +27,7 @@ from CliPP2.core.fusion.graph_ops import (
     tensor_graph_to_pairwise_graph,
     tensorize_graph,
 )
-from CliPP2.core.fusion.torch_backend import resolve_runtime
+from CliPP2.core.fusion.torch_backend import CudaUnavailableError, resolve_runtime
 from CliPP2.core.fusion.types import PairwiseFusionGraph
 
 
@@ -352,7 +352,7 @@ def test_explicit_cuda_request_does_not_silently_fallback(
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
-    with pytest.raises(RuntimeError, match="CUDA is not available"):
+    with pytest.raises(CudaUnavailableError, match="CUDA is not available"):
         resolve_runtime("cuda", dtype="float64")
 
     assert resolve_runtime("auto", dtype="float64").device.type == "cpu"
@@ -364,9 +364,12 @@ def test_auto_dtype_is_float64_on_cpu_and_cuda(monkeypatch: pytest.MonkeyPatch) 
     assert resolve_runtime("auto", dtype="auto").dtype == torch.float64
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
     runtime = resolve_runtime("cuda", dtype="auto")
 
-    assert runtime.device.type == "cuda"
+    assert runtime.device == torch.device("cuda:2")
+    assert runtime.device_name == "cuda:2"
     assert runtime.dtype == torch.float64
 
 
@@ -376,10 +379,25 @@ def test_float16_dtype_is_cuda_only(monkeypatch: pytest.MonkeyPatch) -> None:
         resolve_runtime("cpu", dtype="float16")
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     runtime = resolve_runtime("cuda", dtype="float16")
 
     assert runtime.device.type == "cuda"
     assert runtime.dtype == torch.float16
+
+
+def test_runtime_rejects_malformed_or_unavailable_device_indices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    with pytest.raises(ValueError, match="Unknown runtime device"):
+        resolve_runtime("not-a-device", dtype="float64")
+    with pytest.raises(ValueError, match="CUDA device index is unavailable"):
+        resolve_runtime("cuda:2", dtype="float64")
 
 
 @pytest.mark.skipif(

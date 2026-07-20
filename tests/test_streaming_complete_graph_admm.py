@@ -209,13 +209,13 @@ def test_streamed_final_certificate_retains_certified_incoming_dual() -> None:
     assert audit["fused_edges"] == 1
     assert audit["nonzero_edges"] == 0
     assert audit["dual"] is incoming
+    assert audit["refinement_iterations"] == 0
 
 
-def test_streamed_final_certificate_refines_a_suboptimal_certified_input() -> None:
+def test_final_certificate_immediately_retains_eligible_incoming_dual() -> None:
     # This seed supplies an incoming multiplier inside the downstream 5*atol
-    # eligibility gate, while analytic fused-edge refinement produces a
-    # materially stronger certificate. Streaming must not return early merely
-    # because the incoming state clears that gate.
+    # eligibility gate. Fixed-primal reconstruction must not spend its full
+    # refinement budget improving a certificate that is already accepted.
     torch.manual_seed(0)
     num_mutations, num_regions = 5, 2
     edge_index = torch.triu_indices(num_mutations, num_mutations, offset=1)
@@ -251,20 +251,11 @@ def test_streamed_final_certificate_refines_a_suboptimal_certified_input() -> No
     )
 
     assert incoming_diag["kkt_residual"] <= 5.0 * atol
-    assert dense["diag"]["kkt_residual"] < incoming_diag["kkt_residual"]
-    assert dense["status"] == streamed["status"] == "refined_fused_edge_dual"
-    for key, dense_value in dense["diag"].items():
-        assert streamed["diag"][key] == pytest.approx(
-            dense_value,
-            rel=1e-14,
-            abs=1e-14,
-        )
-    torch.testing.assert_close(
-        streamed["dual"],
-        dense["dual"],
-        rtol=1e-14,
-        atol=1e-14,
-    )
+    assert dense["status"] == streamed["status"] == "input_dual_retained"
+    assert dense["diag"]["kkt_residual"] == incoming_diag["kkt_residual"]
+    assert streamed["diag"]["kkt_residual"] == incoming_diag["kkt_residual"]
+    assert dense["dual"] is streamed["dual"] is incoming
+    assert dense["refinement_iterations"] == streamed["refinement_iterations"] == 0
 
 
 def test_spectral_rho_adaptation_is_objective_scale_equivariant() -> None:

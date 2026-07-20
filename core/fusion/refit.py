@@ -318,7 +318,13 @@ def partition_constrained_observed_refit(
     tol = float(tol)
     if not np.isfinite(tol) or tol <= 0.0:
         raise ValueError("Partition refit tolerance must be a positive finite value.")
-    labels = _canonical_labels(np.asarray(labels, dtype=np.int64))
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if labels.size != int(data.num_mutations):
+        raise ValueError(
+            "labels must contain one entry per tumor mutation "
+            f"({int(data.num_mutations)})."
+        )
+    labels = _canonical_labels(labels)
     n_clusters = int(labels.max()) + 1 if labels.size else 0
     n_regions = int(data.num_regions)
     centers = np.zeros((n_clusters, n_regions), dtype=np.float64)

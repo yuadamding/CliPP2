@@ -342,3 +342,171 @@ def test_generator_records_realized_k_and_realized_partition_icl() -> None:
 
     ward = next(candidate for candidate in candidates if "cem" not in candidate.source)
     assert cem.bic <= ward.bic
+
+
+@pytest.mark.parametrize("use_torch", [False, True])
+def test_generator_reuses_stable_ward_refit(
+    monkeypatch: pytest.MonkeyPatch,
+    use_torch: bool,
+) -> None:
+    data = _identical_mutation_tumor()
+    function_name = (
+        "partition_constrained_observed_refit_torch"
+        if use_torch
+        else "partition_constrained_observed_refit"
+    )
+    original = getattr(partition_starts_module, function_name)
+    calls = 0
+
+    def counting_refit(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(partition_starts_module, function_name, counting_refit)
+    candidates = generate_likelihood_partition_starts(
+        data,
+        exact_pilot=data.phi_init,
+        major_prior=0.5,
+        eps=1e-6,
+        K_grid=[1],
+        cem_max_iter=3,
+        refit_max_iter=32,
+        tol=1e-6,
+        label_sets={1: np.zeros(3, dtype=np.int64)},
+        use_torch=use_torch,
+        device="cpu",
+        dtype="float64",
+    )
+
+    assert calls == 1
+    assert len(candidates) == 1
+    assert candidates[0].K == 1
+
+
+def test_refinement_refits_labels_changed_on_last_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _identical_mutation_tumor()
+    original = partition_starts_module.partition_constrained_observed_refit
+    calls = 0
+
+    def counting_refit(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        partition_starts_module,
+        "partition_constrained_observed_refit",
+        counting_refit,
+    )
+    labels, refit = refine_partition_likelihood(
+        data,
+        np.asarray([0, 0, 1], dtype=np.int64),
+        major_prior=0.5,
+        eps=1e-6,
+        tol=1e-6,
+        max_iter=1,
+        refit_max_iter=32,
+        classification_weight_alpha=1.0,
+        allow_component_death=True,
+    )
+
+    assert calls == 2
+    assert np.unique(labels).size == 1
+    assert refit.n_clusters == 1
+
+
+@pytest.mark.parametrize("use_torch", [False, True])
+def test_zero_iteration_refinement_performs_one_validated_refit(
+    monkeypatch: pytest.MonkeyPatch,
+    use_torch: bool,
+) -> None:
+    data = _identical_mutation_tumor()
+    labels = np.zeros(3, dtype=np.int64)
+    function_name = (
+        "partition_constrained_observed_refit_torch"
+        if use_torch
+        else "partition_constrained_observed_refit"
+    )
+    original = getattr(partition_starts_module, function_name)
+    calls = 0
+
+    def counting_refit(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(partition_starts_module, function_name, counting_refit)
+    refine = (
+        refine_partition_likelihood_torch if use_torch else refine_partition_likelihood
+    )
+    runtime_kwargs = {"device": "cpu", "dtype": "float64"} if use_torch else {}
+    observed_labels, observed = refine(
+        data,
+        labels,
+        major_prior=0.5,
+        eps=1e-6,
+        tol=1e-6,
+        max_iter=0,
+        **runtime_kwargs,
+    )
+    assert calls == 1
+    assert np.array_equal(observed_labels, labels)
+    assert observed.n_clusters == 1
+
+
+@pytest.mark.parametrize("use_torch", [False, True])
+def test_refinement_validates_labels_and_classification_weight_before_zero_iterations(
+    use_torch: bool,
+) -> None:
+    data = _identical_mutation_tumor()
+    refine = (
+        refine_partition_likelihood_torch if use_torch else refine_partition_likelihood
+    )
+    runtime_kwargs = {"device": "cpu", "dtype": "float64"} if use_torch else {}
+
+    with pytest.raises(ValueError, match="one entry per tumor mutation"):
+        refine(
+            data,
+            np.zeros(2, dtype=np.int64),
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-6,
+            max_iter=0,
+            **runtime_kwargs,
+        )
+    with pytest.raises(ValueError, match="positive and finite"):
+        refine(
+            data,
+            np.zeros(3, dtype=np.int64),
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-6,
+            max_iter=0,
+            classification_weight_alpha=0.0,
+            **runtime_kwargs,
+        )
+
+
+@pytest.mark.parametrize("use_torch", [False, True])
+def test_partition_refit_rejects_wrong_label_count(use_torch: bool) -> None:
+    data = _identical_mutation_tumor()
+    refit = (
+        partition_starts_module.partition_constrained_observed_refit_torch
+        if use_torch
+        else partition_starts_module.partition_constrained_observed_refit
+    )
+    runtime_kwargs = {"device": "cpu", "dtype": "float64"} if use_torch else {}
+
+    with pytest.raises(ValueError, match="one entry per tumor mutation"):
+        refit(
+            data,
+            np.zeros(2, dtype=np.int64),
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-6,
+            max_iter=32,
+            **runtime_kwargs,
+        )

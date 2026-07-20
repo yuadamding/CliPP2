@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
 import CliPP2.core.fusion.quotient_workset as quotient_module
+import CliPP2.core.fusion.solver as solver_module
 from CliPP2.core.fusion.solver import prepare_torch_problem
 from CliPP2.core.fusion.quotient_workset import (
     QuotientCacheResourceError,
@@ -18,7 +20,9 @@ from CliPP2.core.fusion.quotient_workset import (
     solve_majorized_subproblem_quotient_workset_torch,
 )
 from CliPP2.core.fusion.types import (
+    BackendWorkCounters,
     CertificateOptions,
+    CompressedEdgeCertificate,
     ExactSolverResourceLimit,
     QuotientWorksetWarmState,
     TensorFusionGraph,
@@ -44,6 +48,27 @@ def _complete_graph(num_nodes: int, *, dtype: torch.dtype) -> TensorFusionGraph:
         is_complete=True,
         is_uniform=False,
         name="complete_test",
+    )
+
+
+def _toy_data(tumor_id: str) -> TumorData:
+    alt = np.array([[3.0], [3.0], [7.0]], dtype=np.float64)
+    total = np.array([[10.0], [10.0], [12.0]], dtype=np.float64)
+    return TumorData(
+        tumor_id=tumor_id,
+        mutation_ids=["m0", "m1", "m2"],
+        region_ids=["r0"],
+        alt_counts=alt,
+        total_counts=total,
+        purity=np.ones_like(alt),
+        major_cn=np.ones_like(alt),
+        minor_cn=np.ones_like(alt),
+        normal_cn=np.full_like(alt, 2.0),
+        has_cna=np.zeros_like(alt, dtype=bool),
+        scaling=np.full_like(alt, 0.5),
+        phi_upper=np.ones_like(alt),
+        phi_init=np.full_like(alt, 0.5),
+        init_major_mask=np.ones_like(alt, dtype=bool),
     )
 
 
@@ -279,25 +304,79 @@ def test_unconverged_quotient_returns_no_worse_seed_without_workset(
     )
 
 
-def test_opt_in_quotient_backend_returns_observed_full_graph_certificate() -> None:
-    alt = np.array([[3.0], [3.0], [7.0]], dtype=np.float64)
-    total = np.array([[10.0], [10.0], [12.0]], dtype=np.float64)
-    data = TumorData(
-        tumor_id="quotient-toy",
-        mutation_ids=["m0", "m1", "m2"],
-        region_ids=["r0"],
-        alt_counts=alt,
-        total_counts=total,
-        purity=np.ones_like(alt),
-        major_cn=np.ones_like(alt),
-        minor_cn=np.ones_like(alt),
-        normal_cn=np.full_like(alt, 2.0),
-        has_cna=np.zeros_like(alt, dtype=bool),
-        scaling=np.full_like(alt, 0.5),
-        phi_upper=np.ones_like(alt),
-        phi_init=np.full_like(alt, 0.5),
-        init_major_mask=np.ones_like(alt, dtype=bool),
+@pytest.mark.parametrize(
+    ("route", "phi_values", "u_values", "expected_values"),
+    [
+        ("coalescence", [0.2, 0.2, 0.8, 0.8], [0.5] * 4, [0.5] * 4),
+        (
+            "heuristic_split",
+            [0.1, 0.1, 0.9, 0.9],
+            [0.2, 0.4, 0.6, 0.8],
+            [0.3, 0.3, 0.7, 0.7],
+        ),
+    ],
+)
+def test_structural_round_limit_preserves_best_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    route: str,
+    phi_values: list[float],
+    u_values: list[float],
+    expected_values: list[float],
+) -> None:
+    dtype = torch.float64
+    graph = _complete_graph(4, dtype=dtype)
+    phi_start = torch.tensor(phi_values, dtype=dtype)[:, None]
+    U = torch.tensor(u_values, dtype=dtype)[:, None]
+    expected = torch.tensor(expected_values, dtype=dtype)[:, None]
+
+    def quotient_solution(**kwargs):
+        centers = kwargs["U"].clone()
+        dual = torch.zeros((int(kwargs["edge_u"].numel()), 1), dtype=dtype)
+        return centers, dual, dual, 2, True, 0.0
+
+    monkeypatch.setattr(
+        quotient_module,
+        "solve_majorized_subproblem_alm_torch",
+        quotient_solution,
     )
+    monkeypatch.setattr(
+        quotient_module,
+        "refine_graph_fusion_certificate",
+        lambda **kwargs: SimpleNamespace(
+            certificate=kwargs["certificate"],
+            status="not_certified",
+            work_counters=BackendWorkCounters(),
+        ),
+    )
+    attempt = solve_majorized_subproblem_quotient_workset_torch(
+        runtime=TorchRuntime(
+            device=torch.device("cpu"), device_name="cpu", dtype=dtype
+        ),
+        U=U,
+        h=torch.ones_like(U),
+        lower=torch.zeros_like(U),
+        upper=torch.ones_like(U),
+        lambda_value=1e-4,
+        graph=graph,
+        graph_hash=f"{route}-limit",
+        tol=1e-8,
+        max_iter=20,
+        phi_start=phi_start,
+        warm_state=None,
+        certificate_options=CertificateOptions(),
+        partition_tolerance=1e-8,
+        max_structural_rounds=1,
+    )
+
+    assert attempt.reason == "quotient_structural_round_limit"
+    torch.testing.assert_close(attempt.phi_candidate, expected)
+    assert isinstance(attempt.warm_state, QuotientWorksetWarmState)
+    torch.testing.assert_close(attempt.warm_state.phi, expected)
+    assert attempt.certificate_hint is not None
+
+
+def test_opt_in_quotient_backend_returns_observed_full_graph_certificate() -> None:
+    data = _toy_data("quotient-toy")
 
     fit = fit_fixed_objective(
         data,
@@ -324,6 +403,10 @@ def test_opt_in_quotient_backend_returns_observed_full_graph_certificate() -> No
     assert fit.workset_iterations == 1
     assert fit.workset_expansions == 0
     assert fit.streamed_edge_passes > 0
+    assert fit.activity_passes > 0
+    assert fit.analytic_adjoint_passes > 0
+    assert fit.column_scan_passes > 0
+    assert fit.full_certificate_audit_passes > 0
     assert fit.dense_iterations == 0
     assert fit.fallback_reason == ""
     assert fit.solver_state is not None
@@ -358,27 +441,90 @@ def test_opt_in_quotient_backend_returns_observed_full_graph_certificate() -> No
     assert dense.selection_eligible
 
 
+def test_terminal_compressed_fallback_records_same_lambda_breaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _toy_data("terminal-quotient-breaker")
+    options = FitOptions(
+        lambda_value=1.0,
+        outer_max_iter=4,
+        inner_max_iter=80,
+        tol=1e-5,
+        device="cpu",
+        dtype="float64",
+        inner_backend="quotient_workset",
+        certificate_max_iter=1000,
+        workset_max_expansions=8,
+    )
+    context = prepare_torch_problem(
+        data,
+        major_prior=options.major_prior,
+        eps=options.eps,
+        tol=options.tol,
+        inner_max_iter=options.inner_max_iter,
+        device=options.device,
+        dtype=options.dtype,
+    )
+    refine = solver_module.refine_graph_fusion_certificate
+    compressed_observed_calls = 0
+
+    def force_terminal_fallback(**kwargs):
+        nonlocal compressed_observed_calls
+        result = refine(**kwargs)
+        if isinstance(kwargs["certificate"], CompressedEdgeCertificate) and (
+            kwargs["gradient_scope"] == "observed_objective"
+        ):
+            compressed_observed_calls += 1
+            return replace(result, status="not_certified")
+        return result
+
+    monkeypatch.setattr(
+        solver_module,
+        "refine_graph_fusion_certificate",
+        force_terminal_fallback,
+    )
+    fallback = fit_fixed_objective(
+        data,
+        options,
+        phi_start=context.exact_pilot,
+        solver_context=context,
+        start_mode="warm_only",
+        compute_summary=False,
+    )
+
+    assert compressed_observed_calls > 0
+    assert fallback.quotient_iterations > 0
+    assert "dense_current_device_after_compressed_not_certified" in (
+        fallback.fallback_reason
+    )
+    assert fallback.solver_state is not None
+    failure = fallback.solver_state.quotient_failure
+    assert failure is not None
+    assert failure.lambda_value == options.lambda_value
+    assert failure.graph_hash == context.graph_hash
+    calls_before_continuation = compressed_observed_calls
+
+    continued = fit_fixed_objective(
+        data,
+        options,
+        solver_context=context,
+        solver_state=fallback.solver_state,
+        start_mode="warm_only",
+        compute_summary=False,
+    )
+
+    assert continued.quotient_iterations == 0
+    assert "dense_current_device_after_prior_quotient_failure" in (
+        continued.fallback_reason
+    )
+    assert compressed_observed_calls == calls_before_continuation
+
+
 def test_resource_limit_is_explicit_when_workset_and_dense_fallback_do_not_fit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    alt = np.array([[3.0], [3.0], [7.0]], dtype=np.float64)
-    total = np.array([[10.0], [10.0], [12.0]], dtype=np.float64)
-    data = TumorData(
-        tumor_id="quotient-resource-limit",
-        mutation_ids=["m0", "m1", "m2"],
-        region_ids=["r0"],
-        alt_counts=alt,
-        total_counts=total,
-        purity=np.ones_like(alt),
-        major_cn=np.ones_like(alt),
-        minor_cn=np.ones_like(alt),
-        normal_cn=np.full_like(alt, 2.0),
-        has_cna=np.zeros_like(alt, dtype=bool),
-        scaling=np.full_like(alt, 0.5),
-        phi_upper=np.ones_like(alt),
-        phi_init=np.full_like(alt, 0.5),
-        init_major_mask=np.ones_like(alt, dtype=bool),
-    )
+    data = _toy_data("quotient-resource-limit")
+    alt = data.alt_counts
     options = FitOptions(
         lambda_value=1.0,
         outer_max_iter=1,
@@ -426,6 +572,9 @@ def test_resource_limit_is_explicit_when_workset_and_dense_fallback_do_not_fit(
     assert dense_fallback.admm_iterations == dense_fallback.dense_iterations
     assert dense_fallback.inner_iterations > dense_fallback.admm_iterations
     assert "dense_current_device_after_resource_limit" in dense_fallback.fallback_reason
+    assert dense_fallback.solver_state is not None
+    assert dense_fallback.solver_state.quotient_failure is not None
+    assert dense_fallback.solver_state.quotient_failure.lambda_value == 1.0
 
     continued = fit_fixed_objective(
         data,
@@ -439,6 +588,63 @@ def test_resource_limit_is_explicit_when_workset_and_dense_fallback_do_not_fit(
     assert (
         "dense_current_device_after_prior_quotient_failure" in continued.fallback_reason
     )
+    different_lambda = fit_fixed_objective(
+        data,
+        replace(options, lambda_value=2.0),
+        solver_context=context,
+        solver_state=dense_fallback.solver_state,
+        start_mode="warm_only",
+        compute_summary=False,
+    )
+    assert (
+        "dense_current_device_after_resource_limit" in different_lambda.fallback_reason
+    )
+    assert "prior_quotient_failure" not in different_lambda.fallback_reason
+    assert different_lambda.solver_state is not None
+    assert different_lambda.solver_state.quotient_failure is not None
+    assert different_lambda.solver_state.quotient_failure.lambda_value == 2.0
+
+    zero_lambda = fit_fixed_objective(
+        data,
+        replace(options, lambda_value=0.0),
+        phi_start=fallback_start,
+        solver_context=context,
+        start_mode="warm_only",
+        compute_summary=False,
+    )
+    assert zero_lambda.solver_state is not None
+    assert zero_lambda.solver_state.quotient_failure is None
+    from_zero = fit_fixed_objective(
+        data,
+        options,
+        solver_context=context,
+        solver_state=zero_lambda.solver_state,
+        start_mode="warm_only",
+        compute_summary=False,
+    )
+    assert "dense_current_device_after_resource_limit" in from_zero.fallback_reason
+    assert "prior_quotient_failure" not in from_zero.fallback_reason
+
+    ordinary_dense = fit_fixed_objective(
+        data,
+        replace(options, inner_backend="dense"),
+        phi_start=fallback_start,
+        solver_context=context,
+        start_mode="warm_only",
+        compute_summary=False,
+    )
+    assert ordinary_dense.solver_state is not None
+    assert ordinary_dense.solver_state.quotient_failure is None
+    from_dense = fit_fixed_objective(
+        data,
+        options,
+        solver_context=context,
+        solver_state=ordinary_dense.solver_state,
+        start_mode="warm_only",
+        compute_summary=False,
+    )
+    assert "dense_current_device_after_resource_limit" in from_dense.fallback_reason
+    assert "prior_quotient_failure" not in from_dense.fallback_reason
 
     monkeypatch.setenv("CLIPP2_MAX_COMPLETE_GRAPH_BYTES", "1")
 
