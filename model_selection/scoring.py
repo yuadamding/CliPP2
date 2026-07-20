@@ -12,6 +12,7 @@ from ..core.bic import (
 )
 from .config import PARTITION_ICL_DIRICHLET_ALPHA, SELECTION_SCORE_NAMES
 
+
 def _normalize_selection_score_name(selection_score: str) -> str:
     normalized = str(selection_score).strip().lower()
     if normalized == "ebic":
@@ -19,7 +20,9 @@ def _normalize_selection_score_name(selection_score: str) -> str:
     if normalized in SELECTION_SCORE_NAMES:
         return normalized
     allowed = ", ".join(SELECTION_SCORE_NAMES)
-    raise ValueError(f"Unknown selection_score: {selection_score}. Expected one of: {allowed}.")
+    raise ValueError(
+        f"Unknown selection_score: {selection_score}. Expected one of: {allowed}."
+    )
 
 
 def _selection_score_value(
@@ -58,7 +61,9 @@ def _selection_score_value(
         selected_score = extended_bic
     elif normalized == "partition_icl":
         if not np.isfinite(partition_icl):
-            raise ValueError("partition_icl selection requires candidate cluster sizes or labels.")
+            raise ValueError(
+                "partition_icl selection requires candidate cluster sizes or labels."
+            )
         selected_score = partition_icl
     else:
         raise ValueError(f"Unknown normalized selection_score: {selection_score}")
@@ -110,7 +115,11 @@ def _bic_selection_eligible_mask(search_df: pd.DataFrame) -> np.ndarray:
             "bic",
         )
     ):
-        return _add_bic_selection_eligible(search_df)["bic_selection_eligible"].astype(bool).to_numpy(dtype=bool)
+        return (
+            _add_bic_selection_eligible(search_df)["bic_selection_eligible"]
+            .astype(bool)
+            .to_numpy(dtype=bool)
+        )
     if "selection_eligible" in search_df.columns:
         return search_df["selection_eligible"].astype(bool).to_numpy(dtype=bool)
     if "converged" in search_df.columns:
@@ -118,19 +127,156 @@ def _bic_selection_eligible_mask(search_df: pd.DataFrame) -> np.ndarray:
     return np.zeros(n_rows, dtype=bool)
 
 
-def _positive_admm_fusion_selection_mask(search_df: pd.DataFrame) -> np.ndarray:
-    """Strict final-candidate contract for partition-guided fusion.
+def _false_mask(search_df: pd.DataFrame) -> np.ndarray:
+    return np.zeros(search_df.shape[0], dtype=bool)
 
-    A proposal/refit is never a final estimator in this mode.  The selected
-    row must come from the raw positive-penalty complete-graph ADMM solve and
-    retain the usual KKT/refit score certificates.
+
+def _required_bool_mask(search_df: pd.DataFrame, column: str) -> np.ndarray:
+    if column not in search_df.columns:
+        return _false_mask(search_df)
+    return (
+        search_df[column]
+        .map(lambda value: _bool_with_default(value, default=False))
+        .to_numpy(dtype=bool)
+    )
+
+
+def _required_text_mask(
+    search_df: pd.DataFrame,
+    column: str,
+    expected: str | None = None,
+) -> np.ndarray:
+    if column not in search_df.columns:
+        return _false_mask(search_df)
+
+    def is_valid(value: object) -> bool:
+        try:
+            if pd.isna(value):
+                return False
+        except (TypeError, ValueError):
+            return False
+        normalized = str(value).strip()
+        if not normalized:
+            return False
+        return expected is None or normalized == expected
+
+    return search_df[column].map(is_valid).to_numpy(dtype=bool)
+
+
+def _required_text_membership_mask(
+    search_df: pd.DataFrame,
+    column: str,
+    accepted: frozenset[str],
+) -> np.ndarray:
+    if column not in search_df.columns:
+        return _false_mask(search_df)
+    return (
+        search_df[column]
+        .map(lambda value: str(value).strip() in accepted)
+        .to_numpy(dtype=bool)
+    )
+
+
+def _exact_fusion_certificate_mask(search_df: pd.DataFrame) -> np.ndarray:
+    """Return rows carrying an accepted full fixed-objective certificate.
+
+    Versioned provenance is authoritative and deliberately independent of the
+    inner backend. Rows written before provenance schema v1 retain the previous
+    dense-ADMM rule. A present but invalid/unsupported schema value fails closed
+    rather than falling back to solver identity.
     """
+
+    if search_df.empty:
+        return _false_mask(search_df)
+
+    raw_kkt_ok = _required_bool_mask(search_df, "raw_kkt_eligible")
+    if "exactness_provenance_version" in search_df.columns:
+        schema_values = search_df["exactness_provenance_version"]
+        schema_present = schema_values.notna().to_numpy(dtype=bool)
+        schema_version = pd.to_numeric(schema_values, errors="coerce").to_numpy(
+            dtype=float
+        )
+    else:
+        schema_present = _false_mask(search_df)
+        schema_version = np.full(search_df.shape[0], np.nan, dtype=float)
+
+    explicit = (
+        schema_present
+        & np.isfinite(schema_version)
+        & (schema_version == 1.0)
+        & raw_kkt_ok
+        & _required_text_mask(search_df, "estimator_role", "raw_fused_lambda_path")
+        & _required_bool_mask(search_df, "objective_faithful")
+        & _required_text_mask(search_df, "objective_spec_hash")
+        & _required_text_mask(search_df, "original_graph_hash")
+        & _required_text_mask(search_df, "certificate_problem_hash")
+        & _required_text_mask(search_df, "certificate_scope", "full_original_graph")
+        & _required_text_mask(
+            search_df, "certificate_gradient_scope", "observed_objective"
+        )
+        & _required_bool_mask(search_df, "full_kkt_certified")
+        & _required_text_membership_mask(
+            search_df,
+            "full_kkt_certificate_status",
+            frozenset(
+                {
+                    "certified",
+                    "input_dual_retained",
+                    "analytic_nonfused_dual",
+                    "refined_fused_edge_dual",
+                    "zero_penalty_no_dual_needed",
+                }
+            ),
+        )
+    )
+
+    if "fixed_objective_kkt_residual" in search_df.columns:
+        residual = pd.to_numeric(
+            search_df["fixed_objective_kkt_residual"], errors="coerce"
+        ).to_numpy(dtype=float)
+    else:
+        residual = np.full(search_df.shape[0], np.nan, dtype=float)
+    if "full_kkt_tolerance" in search_df.columns:
+        tolerance = pd.to_numeric(
+            search_df["full_kkt_tolerance"], errors="coerce"
+        ).to_numpy(dtype=float)
+    else:
+        tolerance = np.full(search_df.shape[0], np.nan, dtype=float)
+    explicit &= (
+        np.isfinite(residual)
+        & np.isfinite(tolerance)
+        & (tolerance > 0.0)
+        & (residual <= tolerance)
+    )
+
+    legacy = ~schema_present & raw_kkt_ok
+    if (
+        "inner_solver" not in search_df.columns
+        or "admm_iterations" not in search_df.columns
+    ):
+        legacy &= False
+    else:
+        solver_ok = (
+            search_df["inner_solver"]
+            .astype(str)
+            .eq("admm_complete_graph")
+            .to_numpy(dtype=bool)
+        )
+        admm_iterations = pd.to_numeric(
+            search_df["admm_iterations"], errors="coerce"
+        ).to_numpy(dtype=float)
+        legacy &= solver_ok & np.isfinite(admm_iterations) & (admm_iterations > 0.0)
+    return explicit | legacy
+
+
+def _positive_exact_fusion_selection_mask(search_df: pd.DataFrame) -> np.ndarray:
+    """Strict backend-neutral contract for a final positive-fusion estimator."""
 
     eligible = _bic_selection_eligible_mask(search_df)
     if search_df.empty:
         return eligible
     if "candidate_pool_source" not in search_df.columns:
-        return np.zeros(search_df.shape[0], dtype=bool)
+        return _false_mask(search_df)
     source_ok = (
         search_df["candidate_pool_source"]
         .astype(str)
@@ -138,24 +284,25 @@ def _positive_admm_fusion_selection_mask(search_df: pd.DataFrame) -> np.ndarray:
         .to_numpy(dtype=bool)
     )
     if "lambda" not in search_df.columns:
-        return np.zeros(search_df.shape[0], dtype=bool)
-    lambdas = search_df["lambda"].to_numpy(dtype=float)
+        return _false_mask(search_df)
+    lambdas = pd.to_numeric(search_df["lambda"], errors="coerce").to_numpy(dtype=float)
     lambda_ok = np.isfinite(lambdas) & (lambdas > 0.0)
-    if "inner_solver" not in search_df.columns or "admm_iterations" not in search_df.columns:
-        return np.zeros(search_df.shape[0], dtype=bool)
-    solver_ok = (
-        search_df["inner_solver"]
-        .astype(str)
-        .eq("admm_complete_graph")
-        .to_numpy(dtype=bool)
-    )
-    admm_iterations = pd.to_numeric(search_df["admm_iterations"], errors="coerce").to_numpy(dtype=float)
-    iterations_ok = np.isfinite(admm_iterations) & (admm_iterations > 0.0)
-    return eligible & source_ok & lambda_ok & solver_ok & iterations_ok
+    return eligible & source_ok & lambda_ok & _exact_fusion_certificate_mask(search_df)
+
+
+def _positive_admm_fusion_selection_mask(search_df: pd.DataFrame) -> np.ndarray:
+    """Deprecated compatibility alias for the backend-neutral exact mask."""
+
+    return _positive_exact_fusion_selection_mask(search_df)
 
 
 def _row_bic_selection_eligible(row: pd.Series) -> bool:
-    return bool(row.get("bic_selection_eligible", row.get("selection_eligible", row.get("converged", False))))
+    return bool(
+        row.get(
+            "bic_selection_eligible",
+            row.get("selection_eligible", row.get("converged", False)),
+        )
+    )
 
 
 def _bool_with_default(value: object, default: bool = True) -> bool:
@@ -195,7 +342,11 @@ def _lambda_applicable_mask(frame: pd.DataFrame) -> np.ndarray:
     if frame.empty:
         return np.zeros(0, dtype=bool)
     if "lambda_applicable" in frame.columns:
-        mask = frame["lambda_applicable"].map(_bool_with_default).to_numpy(dtype=bool, copy=True)
+        mask = (
+            frame["lambda_applicable"]
+            .map(_bool_with_default)
+            .to_numpy(dtype=bool, copy=True)
+        )
     else:
         mask = np.ones(frame.shape[0], dtype=bool)
     if "lambda" in frame.columns:
@@ -219,15 +370,24 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
         raw_kkt = np.zeros(n_rows, dtype=bool)
     if "candidate_pool_source" in enriched.columns:
         candidate_source = enriched["candidate_pool_source"].astype(str)
-        partition_candidate = candidate_source.eq("likelihood_partition").to_numpy(dtype=bool)
+        partition_candidate = candidate_source.eq("likelihood_partition").to_numpy(
+            dtype=bool
+        )
     elif "search_phase" in enriched.columns:
         partition_candidate = (
-            enriched["search_phase"].astype(str).eq("likelihood_partition").to_numpy(dtype=bool)
+            enriched["search_phase"]
+            .astype(str)
+            .eq("likelihood_partition")
+            .to_numpy(dtype=bool)
         )
     else:
         partition_candidate = np.zeros(n_rows, dtype=bool)
     if "bic_refit_finite_candidate_found" in enriched.columns:
-        bic_refit = enriched["bic_refit_finite_candidate_found"].astype(bool).to_numpy(dtype=bool)
+        bic_refit = (
+            enriched["bic_refit_finite_candidate_found"]
+            .astype(bool)
+            .to_numpy(dtype=bool)
+        )
     elif "bic_refit_converged" in enriched.columns:
         bic_refit = enriched["bic_refit_converged"].astype(bool).to_numpy(dtype=bool)
     else:
@@ -269,10 +429,14 @@ def _annotate_bic_diagnostics(search_df: pd.DataFrame) -> pd.DataFrame:
     if not {"n_clusters", "classic_bic", "bic_loglik"}.issubset(enriched.columns):
         return enriched
     n_clusters = enriched["n_clusters"].to_numpy(dtype=float)
-    one_cluster = enriched.loc[(n_clusters == 1.0) & np.isfinite(enriched["classic_bic"].to_numpy(dtype=float))].copy()
+    one_cluster = enriched.loc[
+        (n_clusters == 1.0) & np.isfinite(enriched["classic_bic"].to_numpy(dtype=float))
+    ].copy()
     if one_cluster.empty:
         return enriched
-    one_cluster["_bic_eligible_for_baseline"] = _bic_selection_eligible_mask(one_cluster)
+    one_cluster["_bic_eligible_for_baseline"] = _bic_selection_eligible_mask(
+        one_cluster
+    )
     baseline = one_cluster.sort_values(
         ["_bic_eligible_for_baseline", "classic_bic", "lambda", "selection_step"],
         ascending=[False, True, True, True],
@@ -280,9 +444,13 @@ def _annotate_bic_diagnostics(search_df: pd.DataFrame) -> pd.DataFrame:
     baseline_loglik = float(baseline.get("bic_loglik", np.nan))
     baseline_bic = float(baseline.get("classic_bic", np.nan))
     if np.isfinite(baseline_loglik):
-        enriched["delta_loglik_vs_one_cluster"] = enriched["bic_loglik"].to_numpy(dtype=float) - baseline_loglik
+        enriched["delta_loglik_vs_one_cluster"] = (
+            enriched["bic_loglik"].to_numpy(dtype=float) - baseline_loglik
+        )
     if np.isfinite(baseline_bic):
-        enriched["delta_bic_vs_one_cluster"] = enriched["classic_bic"].to_numpy(dtype=float) - baseline_bic
+        enriched["delta_bic_vs_one_cluster"] = (
+            enriched["classic_bic"].to_numpy(dtype=float) - baseline_bic
+        )
     return enriched
 
 
@@ -300,7 +468,9 @@ def _optimal_lambda_range(
     finite_values = values[finite_mask]
     best_value = float(np.max(finite_values) if maximize else np.min(finite_values))
     optimal_mask = finite_mask & np.isclose(values, best_value, rtol=0.0, atol=1e-12)
-    lambda_values = np.unique(np.round(lambdas[optimal_mask].astype(float, copy=False), 12))
+    lambda_values = np.unique(
+        np.round(lambdas[optimal_mask].astype(float, copy=False), 12)
+    )
     return (
         float(np.min(lambda_values)),
         float(np.max(lambda_values)),
@@ -322,8 +492,14 @@ def _lambda_range_for_optimal_rows(
     combined_mask = np.asarray(optimal_mask, dtype=bool) & lambda_mask
     if not np.any(combined_mask):
         return None, None, 0
-    lambda_values = np.unique(np.round(frame.loc[combined_mask, "lambda"].to_numpy(dtype=float), 12))
-    return float(np.min(lambda_values)), float(np.max(lambda_values)), int(lambda_values.size)
+    lambda_values = np.unique(
+        np.round(frame.loc[combined_mask, "lambda"].to_numpy(dtype=float), 12)
+    )
+    return (
+        float(np.min(lambda_values)),
+        float(np.max(lambda_values)),
+        int(lambda_values.size),
+    )
 
 
 def _canonical_lambda(value: float) -> float:
@@ -348,7 +524,6 @@ def _sorted_unique_lambdas(values: list[float] | np.ndarray) -> list[float]:
     if array.size == 0:
         return []
     return [float(value) for value in np.unique(np.round(np.sort(array), 12))]
-
 
 
 def _ari_candidate_frame(search_df: pd.DataFrame) -> pd.DataFrame:
@@ -404,18 +579,22 @@ def _prefer_fit_candidate(candidate: FitResult, incumbent: FitResult | None) -> 
     if candidate.selection_eligible != incumbent.selection_eligible:
         return False
     if candidate.selection_eligible and incumbent.selection_eligible:
-        return bool(candidate.penalized_objective < incumbent.penalized_objective - 1e-8)
+        return bool(
+            candidate.penalized_objective < incumbent.penalized_objective - 1e-8
+        )
     candidate_kkt = float(candidate.fixed_objective_kkt_residual)
     incumbent_kkt = float(incumbent.fixed_objective_kkt_residual)
-    if np.isfinite(candidate_kkt) and np.isfinite(incumbent_kkt) and abs(candidate_kkt - incumbent_kkt) > 1e-8:
+    if (
+        np.isfinite(candidate_kkt)
+        and np.isfinite(incumbent_kkt)
+        and abs(candidate_kkt - incumbent_kkt) > 1e-8
+    ):
         return bool(candidate_kkt < incumbent_kkt)
     if np.isfinite(candidate_kkt) and not np.isfinite(incumbent_kkt):
         return True
     if not np.isfinite(candidate_kkt) and np.isfinite(incumbent_kkt):
         return False
     return bool(candidate.penalized_objective < incumbent.penalized_objective - 1e-8)
-
-
 
 
 def _effective_bic_partition_tol(options: FitOptions) -> float:

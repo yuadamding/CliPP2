@@ -595,6 +595,38 @@ def objective_value_torch(
     )
 
 
+def project_stationarity_cone_torch(
+    total_grad: torch.Tensor,
+    *,
+    phi: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+) -> torch.Tensor:
+    """Project a total gradient onto the box KKT stationarity cone.
+
+    Boundary membership is intentionally exact.  A coordinate merely near a
+    bound is still interior and therefore has the singleton stationarity cone
+    ``{0}``.  Frozen coordinates have the full real line as their cone.
+    """
+
+    frozen = lower == upper
+    lower_only = (phi == lower) & ~frozen
+    upper_only = (phi == upper) & ~frozen
+
+    projected = torch.zeros_like(total_grad)
+    projected = torch.where(
+        lower_only,
+        torch.clamp(total_grad, min=0.0),
+        projected,
+    )
+    projected = torch.where(
+        upper_only,
+        torch.clamp(total_grad, max=0.0),
+        projected,
+    )
+    return torch.where(frozen, total_grad, projected)
+
+
 def stationarity_residual_torch(
     *,
     total_grad: torch.Tensor,
@@ -1186,6 +1218,7 @@ def inner_kkt_residual_torch(
     atol: float,
     dual_scale: float = 1.0,
     edge_work_bytes: int | None = None,
+    diagnostics_out: dict[str, float | int] | None = None,
 ) -> float:
     lambda_value = validate_lambda_value(lambda_value)
     diag = graph_fusion_kkt_residual_from_grad_torch(
@@ -1202,6 +1235,9 @@ def inner_kkt_residual_torch(
         dual_scale=dual_scale,
         edge_work_bytes=edge_work_bytes,
     )
+    if diagnostics_out is not None:
+        diagnostics_out.clear()
+        diagnostics_out.update(diag)
     return float(diag["kkt_residual"])
 
 
@@ -1394,6 +1430,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
     kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
     box_phi_atol: float = DEFAULT_BOX_PHI_ATOL,
     box_max_iter: int = DEFAULT_BOX_MAX_ITER,
+    diagnostics_out: dict[str, float | int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
     lambda_value = validate_lambda_value(lambda_value)
     phi = torch.minimum(
@@ -1546,6 +1583,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
                 edge_v=edge_v,
                 edge_w=edge_w,
                 atol=tol,
+                diagnostics_out=diagnostics_out,
             )
             # The audited residual is the full box-QP KKT certificate
             # (stationarity, edge subgradient, dual ball, and box feasibility).
@@ -1585,6 +1623,7 @@ def _solve_majorized_subproblem_alm_streaming_torch(
     box_phi_atol: float = DEFAULT_BOX_PHI_ATOL,
     box_max_iter: int = DEFAULT_BOX_MAX_ITER,
     edge_work_bytes: int | None = None,
+    diagnostics_out: dict[str, float | int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
     """Exact complete-graph ADMM with bounded edgewise working storage."""
     lambda_value = validate_lambda_value(lambda_value)
@@ -1795,6 +1834,7 @@ def _solve_majorized_subproblem_alm_streaming_torch(
                 atol=tol,
                 dual_scale=rho,
                 edge_work_bytes=edge_work_bytes,
+                diagnostics_out=diagnostics_out,
             )
             kkt_stop_tol = float(tol) + 0.25 * min(
                 float(box_phi_atol),
@@ -1841,6 +1881,7 @@ def solve_majorized_subproblem_alm_torch(
     box_phi_atol: float = DEFAULT_BOX_PHI_ATOL,
     box_max_iter: int = DEFAULT_BOX_MAX_ITER,
     edge_work_bytes: int | None = None,
+    diagnostics_out: dict[str, float | int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
     """Solve the complete-graph group-fusion subproblem by scaled-dual ADMM.
 
@@ -1887,6 +1928,7 @@ def solve_majorized_subproblem_alm_torch(
         kkt_check_every=kkt_check_every,
         box_phi_atol=box_phi_atol,
         box_max_iter=box_max_iter,
+        diagnostics_out=diagnostics_out,
     )
     if not use_streaming:
         return _solve_majorized_subproblem_alm_dense_torch(**common)

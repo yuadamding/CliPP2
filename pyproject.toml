@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clipp2"
+version = "0.0.1"
+description = "Objective-faithful multi-region cellular prevalence clustering."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.21",
+    "pandas>=1.5",
+    "scipy>=1.9",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "ruff>=0.12",
+]
+
+[project.scripts]
+clipp2 = "CliPP2.cli:main"
+
+[tool.setuptools]
+packages = [
+    "CliPP2",
+    "CliPP2.core",
+    "CliPP2.core.fusion",
+    "CliPP2.io",
+    "CliPP2.metrics",
+    "CliPP2.model_selection",
+    "CliPP2.runners",
+]
+package-dir = { CliPP2 = "." }
+include-package-data = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

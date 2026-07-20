@@ -3,7 +3,7 @@
 This module deliberately contains no lambda grid and no list of lambda
 multipliers.  The caller supplies one data-derived positive lambda (guided
 mode uses the initializer's blockwise KKT capacity). Thereafter exactly one
-lambda is proposed at a time from certified ADMM observations:
+lambda is proposed at a time from certified exact-fusion observations:
 
 * move toward the guide cluster count using the observed count discrepancy or
   a secant estimate on ``log(K)`` versus ``log(lambda)``;
@@ -11,9 +11,9 @@ lambda is proposed at a time from certified ADMM observations:
 * bracket the best observed ICL basin on both sides and geometrically resolve
   its two partition boundaries.
 
-The controller is intentionally solver-agnostic.  The caller owns ADMM warm
+The controller is intentionally solver-agnostic. The caller owns solver warm
 starts and passes the resulting diagnostics back via
-``OnlineLambdaObservation``.  An uncertified ADMM result is first retried at
+``OnlineLambdaObservation``. An uncertified exact-fusion result is first retried at
 the same lambda.  If any online-proposed lambda exhausts those ordinary
 retries, the controller permits one monotone full-step solver recovery at that
 same value.  This changes solver effort, not the lambda path; a recovered point
@@ -61,7 +61,9 @@ def objective_balance_lambda(
         raise ValueError("Require 0 < lambda_min < lambda_max.")
 
     penalty_reduction = float(pilot_penalty_unit - guide_penalty_unit)
-    penalty_scale = 1.0 + abs(float(pilot_penalty_unit)) + abs(float(guide_penalty_unit))
+    penalty_scale = (
+        1.0 + abs(float(pilot_penalty_unit)) + abs(float(guide_penalty_unit))
+    )
     numerical_tol = np.finfo(np.float64).eps * penalty_scale
     if penalty_reduction <= numerical_tol:
         raise ValueError(
@@ -73,7 +75,9 @@ def objective_balance_lambda(
         return float(lambda_min)
     crossing = excess_guide_loss / penalty_reduction
     if not isfinite(crossing) or crossing <= 0.0:
-        raise ValueError("The pilot/guide objective crossing is not a finite positive value.")
+        raise ValueError(
+            "The pilot/guide objective crossing is not a finite positive value."
+        )
     return float(min(max(crossing, float(lambda_min)), float(lambda_max)))
 
 
@@ -110,7 +114,10 @@ class OnlineLambdaConfig:
             or float(self.transition_log10_width_tolerance) <= 0.0
         ):
             raise ValueError("transition_log10_width_tolerance must be positive.")
-        if not isfinite(float(self.score_relative_tolerance)) or float(self.score_relative_tolerance) < 0.0:
+        if (
+            not isfinite(float(self.score_relative_tolerance))
+            or float(self.score_relative_tolerance) < 0.0
+        ):
             raise ValueError("score_relative_tolerance must be finite and nonnegative.")
         if int(self.max_unique_lambdas) < 1:
             raise ValueError("max_unique_lambdas must be positive.")
@@ -127,8 +134,15 @@ class OnlineLambdaObservation:
     partition_signature: str
     partition_icl: float
     kkt_residual: float
-    raw_kkt_eligible: bool
-    admm_iterations: int
+    # Deprecated dense-ADMM provenance retained for callers predating the
+    # backend-neutral certificate contract. It is consulted only when
+    # ``exact_candidate_eligible`` is None.
+    raw_kkt_eligible: bool = False
+    admm_iterations: int = 0
+    exact_candidate_eligible: bool | None = None
+    certificate_status: str = "unknown"
+    backend_name: str = "unknown"
+    solver_iterations: int = 0
 
 
 @dataclass(frozen=True)
@@ -167,7 +181,7 @@ def _geometric_midpoint(left: float, right: float) -> float | None:
 class OnlineLambdaController:
     """State machine for a truly online, guide-directed lambda search.
 
-    Call ``propose()`` once, run ADMM at the returned lambda, then call
+    Call ``propose()`` once, run the fusion solver at the returned lambda, then call
     ``observe()``.  Repeat until ``propose()`` returns ``None``.  Calling
     ``propose()`` twice without an intervening observation is an error.
     ``initial_reason`` is provenance only: callers using a guide-derived KKT
@@ -219,7 +233,9 @@ class OnlineLambdaController:
 
     @property
     def observations(self) -> tuple[OnlineLambdaObservation, ...]:
-        return tuple(sorted(self._certified.values(), key=lambda item: item.lambda_value))
+        return tuple(
+            sorted(self._certified.values(), key=lambda item: item.lambda_value)
+        )
 
     @property
     def proposal_history(self) -> tuple[OnlineLambdaProposal, ...]:
@@ -227,12 +243,22 @@ class OnlineLambdaController:
 
     @property
     def best_observation(self) -> OnlineLambdaObservation | None:
-        finite = [item for item in self._certified.values() if isfinite(float(item.partition_icl))]
+        finite = [
+            item
+            for item in self._certified.values()
+            if isfinite(float(item.partition_icl))
+        ]
         if not finite:
             return None
         best_score = min(float(item.partition_icl) for item in finite)
-        score_tol = float(self.config.score_relative_tolerance) * (1.0 + abs(best_score))
-        tied = [item for item in finite if float(item.partition_icl) <= best_score + score_tol]
+        score_tol = float(self.config.score_relative_tolerance) * (
+            1.0 + abs(best_score)
+        )
+        tied = [
+            item
+            for item in finite
+            if float(item.partition_icl) <= best_score + score_tol
+        ]
         return min(
             tied,
             key=lambda item: (
@@ -242,10 +268,17 @@ class OnlineLambdaController:
             ),
         )
 
-    def _is_admm_certified(self, observation: OnlineLambdaObservation) -> bool:
+    def _is_exact_fusion_certified(self, observation: OnlineLambdaObservation) -> bool:
+        if observation.exact_candidate_eligible is None:
+            # Compatibility for callers and persisted observations written
+            # before explicit exactness provenance was introduced.
+            certificate_ok = bool(
+                observation.raw_kkt_eligible and int(observation.admm_iterations) > 0
+            )
+        else:
+            certificate_ok = bool(observation.exact_candidate_eligible)
         return bool(
-            observation.raw_kkt_eligible
-            and int(observation.admm_iterations) > 0
+            certificate_ok
             and isfinite(float(observation.kkt_residual))
             and float(observation.kkt_residual) <= float(self.config.kkt_tolerance)
         )
@@ -259,21 +292,27 @@ class OnlineLambdaController:
         return proposal
 
     def observe(self, observation: OnlineLambdaObservation) -> None:
-        """Consume the ADMM result for the outstanding proposal."""
+        """Consume the exact-fusion result for the outstanding proposal."""
 
         if self._pending is None:
             raise RuntimeError("observe() requires an outstanding lambda proposal.")
-        if _lambda_key(observation.lambda_value) != _lambda_key(self._pending.lambda_value):
-            raise ValueError("The observation lambda does not match the outstanding proposal.")
+        if _lambda_key(observation.lambda_value) != _lambda_key(
+            self._pending.lambda_value
+        ):
+            raise ValueError(
+                "The observation lambda does not match the outstanding proposal."
+            )
         if not 1 <= int(observation.n_clusters) <= int(self.config.num_mutations):
             raise ValueError("Observed n_clusters must lie in [1, num_mutations].")
         key = _lambda_key(observation.lambda_value)
         self._attempt_count[key] = int(self._attempt_count.get(key, 0) + 1)
         self._last_observation = observation
         self._pending = None
-        if self._is_admm_certified(observation):
+        if self._is_exact_fusion_certified(observation):
             incumbent = self._certified.get(key)
-            if incumbent is None or float(observation.kkt_residual) < float(incumbent.kkt_residual):
+            if incumbent is None or float(observation.kkt_residual) < float(
+                incumbent.kkt_residual
+            ):
                 self._certified[key] = observation
             self._retry_key = None
         else:
@@ -283,7 +322,9 @@ class OnlineLambdaController:
         """Return exactly one next lambda, or ``None`` after a terminal state."""
 
         if self._pending is not None:
-            raise RuntimeError("The outstanding proposal must be observed before proposing again.")
+            raise RuntimeError(
+                "The outstanding proposal must be observed before proposing again."
+            )
         if self.stopped:
             return None
 
@@ -329,11 +370,11 @@ class OnlineLambdaController:
                 return OnlineLambdaProposal(
                     lambda_value=float(failed.lambda_value),
                     phase="solver_recovery",
-                    reason="monotone_full_step_admm_recovery",
+                    reason="monotone_full_step_solver_recovery",
                     warm_start_lambda=None,
                     retry_number=attempts,
                 )
-            self._stop_reason = "online_lambda_uncertified_admm_result"
+            self._stop_reason = "online_lambda_uncertified_exact_fusion_result"
             return None
         failed = self._last_observation
         if failed is None:
@@ -343,11 +384,17 @@ class OnlineLambdaController:
         return OnlineLambdaProposal(
             lambda_value=float(failed.lambda_value),
             phase="retry_same_lambda",
-            reason="admm_kkt_not_certified",
+            reason="exact_fusion_kkt_not_certified",
             warm_start_lambda=float(failed.lambda_value),
-            alternate_start_lambda=None if previous is None else previous.alternate_start_lambda,
-            bracket_left_lambda=None if previous is None else previous.bracket_left_lambda,
-            bracket_right_lambda=None if previous is None else previous.bracket_right_lambda,
+            alternate_start_lambda=None
+            if previous is None
+            else previous.alternate_start_lambda,
+            bracket_left_lambda=None
+            if previous is None
+            else previous.bracket_left_lambda,
+            bracket_right_lambda=None
+            if previous is None
+            else previous.bracket_right_lambda,
             retry_number=attempts,
         )
 
@@ -380,9 +427,13 @@ class OnlineLambdaController:
                         reason="guide_cluster_count_bracketed_but_skipped",
                     )
             elif all(int(item.n_clusters) > guide_k for item in points):
-                return self._outward_proposal(points, direction=1, reason="observed_k_above_guide_k")
+                return self._outward_proposal(
+                    points, direction=1, reason="observed_k_above_guide_k"
+                )
             elif all(int(item.n_clusters) < guide_k for item in points):
-                return self._outward_proposal(points, direction=-1, reason="observed_k_below_guide_k")
+                return self._outward_proposal(
+                    points, direction=-1, reason="observed_k_below_guide_k"
+                )
 
         return self._score_basin_proposal(points)
 
@@ -517,12 +568,16 @@ class OnlineLambdaController:
             previous_log_step = abs(x_frontier - x_neighbor)
             delta_x = x_frontier - x_neighbor
             delta_log_k = log(float(k_frontier)) - log(float(neighbor.n_clusters))
-            if abs(delta_x) > np.finfo(np.float64).eps and abs(delta_log_k) > np.finfo(np.float64).eps:
+            if (
+                abs(delta_x) > np.finfo(np.float64).eps
+                and abs(delta_log_k) > np.finfo(np.float64).eps
+            ):
                 slope = delta_log_k / delta_x
                 if slope < 0.0:
-                    secant_x = x_frontier + (
-                        log(float(guide_k)) - log(float(k_frontier))
-                    ) / slope
+                    secant_x = (
+                        x_frontier
+                        + (log(float(guide_k)) - log(float(k_frontier))) / slope
+                    )
                     if direction * (secant_x - x_frontier) > 0.0:
                         proposed_x = x_frontier + direction * max(
                             abs(secant_x - x_frontier),
@@ -549,9 +604,13 @@ class OnlineLambdaController:
         upper_x = log(float(self.config.lambda_max))
         bounded_x = min(max(proposed_x, lower_x), upper_x)
         candidate = exp(bounded_x)
-        if direction > 0 and candidate <= float(frontier.lambda_value) * (1.0 + 8.0 * np.finfo(float).eps):
+        if direction > 0 and candidate <= float(frontier.lambda_value) * (
+            1.0 + 8.0 * np.finfo(float).eps
+        ):
             return None
-        if direction < 0 and candidate >= float(frontier.lambda_value) * (1.0 - 8.0 * np.finfo(float).eps):
+        if direction < 0 and candidate >= float(frontier.lambda_value) * (
+            1.0 - 8.0 * np.finfo(float).eps
+        ):
             return None
         return float(candidate)
 
@@ -569,7 +628,10 @@ class OnlineLambdaController:
             if _lambda_key(item.lambda_value) == _lambda_key(best.lambda_value)
         )
         run_left = best_index
-        while run_left > 0 and points[run_left - 1].partition_signature == best.partition_signature:
+        while (
+            run_left > 0
+            and points[run_left - 1].partition_signature == best.partition_signature
+        ):
             run_left -= 1
         run_right = best_index
         while (
@@ -589,8 +651,12 @@ class OnlineLambdaController:
         missing_right = right_guard is None and not right_terminal
         if missing_left or missing_right:
             if missing_left and missing_right:
-                lower_span = max(log(self.initial_lambda) - log(points[0].lambda_value), 0.0)
-                upper_span = max(log(points[-1].lambda_value) - log(self.initial_lambda), 0.0)
+                lower_span = max(
+                    log(self.initial_lambda) - log(points[0].lambda_value), 0.0
+                )
+                upper_span = max(
+                    log(points[-1].lambda_value) - log(self.initial_lambda), 0.0
+                )
                 if lower_span < upper_span:
                     direction = -1
                 elif upper_span < lower_span:
@@ -612,14 +678,20 @@ class OnlineLambdaController:
             )
 
         boundary_intervals: list[
-            tuple[OnlineLambdaObservation, OnlineLambdaObservation, OnlineLambdaObservation]
+            tuple[
+                OnlineLambdaObservation,
+                OnlineLambdaObservation,
+                OnlineLambdaObservation,
+            ]
         ] = []
         if left_guard is not None:
             boundary_intervals.append((left_guard, points[run_left], left_guard))
         if right_guard is not None:
             boundary_intervals.append((points[run_right], right_guard, right_guard))
         unresolved = [
-            item for item in boundary_intervals if not self._interval_resolved(item[0], item[1])
+            item
+            for item in boundary_intervals
+            if not self._interval_resolved(item[0], item[1])
         ]
         if unresolved:
             left, right, guard = max(
@@ -636,7 +708,10 @@ class OnlineLambdaController:
                 reason="resolve_best_partition_signature_boundary",
             )
 
-        if any(not isfinite(float(guard.partition_icl)) for _, _, guard in boundary_intervals):
+        if any(
+            not isfinite(float(guard.partition_icl))
+            for _, _, guard in boundary_intervals
+        ):
             self._stop_reason = "online_lambda_nonfinite_icl_guard"
             return None
         self._stop_reason = "online_lambda_score_basin_resolved"

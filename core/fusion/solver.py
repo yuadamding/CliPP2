@@ -7,12 +7,21 @@ import numpy as np
 import torch
 
 from ...io.data import TumorData
+from .certificates import (
+    audit_graph_fusion_certificate,
+    refine_graph_fusion_certificate,
+)
 from .graph import resolve_pairwise_fusion_graph
 from .graph_ops import (
     build_complete_adaptive_tensor_graph,
+    dense_complete_solver_memory_preflight,
     project_dual_ball,
     tensor_graph_to_pairwise_graph,
     tensorize_graph,
+)
+from .quotient_workset import (
+    compressed_certificate_for_primal,
+    solve_majorized_subproblem_quotient_workset_torch,
 )
 from .starts import (
     compute_pooled_observed_data_start_torch,
@@ -27,7 +36,6 @@ from .torch_backend import (
     em_surrogate_terms_torch,
     graph_fusion_kkt_residual_from_grad_torch,
     pairwise_penalty_torch,
-    refine_graph_fusion_dual_certificate_torch,
     resolve_runtime,
     solve_majorized_subproblem_alm_torch,
     solve_majorized_subproblem_pdhg_torch,
@@ -35,15 +43,27 @@ from .torch_backend import (
     validate_lambda_value,
 )
 from .types import (
+    BackendWorkCounters,
+    CertificateOptions,
+    CompressedEdgeCertificate,
+    DenseEdgeCertificate,
+    DenseWarmState,
+    ExactSolverResourceLimit,
+    ExactFusionProvenance,
     FusionFitArtifacts,
     InnerDiagnostics,
+    InnerSolveResult,
+    KKTDiagnostics,
     OuterDiagnostics,
     PairwiseFusionGraph,
+    PrimalOnlyWarmState,
+    QuotientWorksetWarmState,
     SolverContext,
     SolverState,
     TensorFusionGraph,
     TensorProblem,
     TorchFitResult,
+    WorksetMemoryOptions,
 )
 
 
@@ -326,6 +346,22 @@ def _validate_solver_tolerance(tol: float) -> float:
     return value
 
 
+def _normalize_inner_backend(inner_backend: str) -> str:
+    normalized = str(inner_backend).strip().lower().replace("-", "_")
+    if normalized not in {"auto", "dense", "quotient_workset"}:
+        raise ValueError("inner_backend must be one of: auto, dense, quotient_workset.")
+    return normalized
+
+
+def _combine_fallback_reasons(*reasons: str) -> str:
+    unique: list[str] = []
+    for reason in reasons:
+        normalized = str(reason).strip()
+        if normalized and normalized not in unique:
+            unique.append(normalized)
+    return ";".join(unique)
+
+
 def _normalize_objective_shape(objective_shape: str) -> str:
     normalized = str(objective_shape).strip().lower()
     if normalized not in {
@@ -388,11 +424,133 @@ def _data_fingerprint(data: TumorData) -> str:
     return digest.hexdigest()
 
 
+def _graph_fingerprint(graph: PairwiseFusionGraph) -> str:
+    """Return an order-sensitive identity for the original weighted graph."""
+
+    digest = hashlib.sha256()
+    for name, values in (
+        ("edge_u", graph.edge_u),
+        ("edge_v", graph.edge_v),
+        ("edge_w", graph.edge_w),
+    ):
+        encoded_name = name.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(8, "little"))
+        digest.update(encoded_name)
+        array = np.ascontiguousarray(np.asarray(values))
+        encoded_dtype = str(array.dtype).encode("utf-8")
+        digest.update(len(encoded_dtype).to_bytes(8, "little"))
+        digest.update(encoded_dtype)
+        digest.update(len(array.shape).to_bytes(8, "little"))
+        for dimension in array.shape:
+            digest.update(int(dimension).to_bytes(8, "little", signed=True))
+        digest.update(array.tobytes())
+    digest.update(str(graph.name).encode("utf-8"))
+    digest.update(int(graph.degree_bound).to_bytes(8, "little", signed=True))
+    return digest.hexdigest()
+
+
+def _objective_spec_fingerprint(
+    *,
+    data_fingerprint: str,
+    graph_hash: str,
+    major_prior: float,
+    eps: float,
+) -> str:
+    digest = hashlib.sha256()
+    for value in (
+        "clipp2_observed_objective_v1",
+        data_fingerprint,
+        graph_hash,
+        float(major_prior).hex(),
+        float(eps).hex(),
+    ):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _certificate_problem_fingerprint(
+    *, objective_spec_hash: str, lambda_value: float
+) -> str:
+    digest = hashlib.sha256()
+    for value in (objective_spec_hash, float(lambda_value).hex()):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
 def _tensor_from_start(
     start: np.ndarray | torch.Tensor,
     runtime,
 ) -> torch.Tensor:
     return as_runtime_tensor(start, runtime)
+
+
+def _validate_prebuilt_tensor_graph(
+    graph: PairwiseFusionGraph,
+    tensor_graph: TensorFusionGraph,
+    *,
+    runtime,
+    num_nodes: int,
+) -> None:
+    """Validate cheap invariants for an already paired host/device graph."""
+
+    if int(tensor_graph.num_nodes) != int(num_nodes):
+        raise ValueError("prebuilt_tensor_graph has the wrong number of nodes.")
+    if str(tensor_graph.name) != str(graph.name):
+        raise ValueError("prebuilt_tensor_graph name does not match graph.")
+    if tensor_graph.edge_index.ndim != 2 or int(tensor_graph.edge_index.shape[0]) != 2:
+        raise ValueError("prebuilt_tensor_graph edge_index must have shape (2, E).")
+    edge_count = int(tensor_graph.edge_index.shape[1])
+    if edge_count != int(np.asarray(graph.edge_u).size):
+        raise ValueError("prebuilt_tensor_graph edge count does not match graph.")
+    if tensor_graph.weight.ndim != 1 or int(tensor_graph.weight.numel()) != edge_count:
+        raise ValueError("prebuilt_tensor_graph weights must have shape (E,).")
+    if tensor_graph.edge_index.dtype != torch.long:
+        raise ValueError("prebuilt_tensor_graph edge indices must use torch.long.")
+    if tensor_graph.weight.dtype != runtime.dtype:
+        raise ValueError(
+            "prebuilt_tensor_graph weights do not match the runtime dtype."
+        )
+    if tuple(tensor_graph.degree.shape) != (int(num_nodes),):
+        raise ValueError("prebuilt_tensor_graph degree has the wrong shape.")
+    if tuple(tensor_graph.pdhg_tau_node.shape) != (int(num_nodes), 1):
+        raise ValueError(
+            "prebuilt_tensor_graph PDHG preconditioner has the wrong shape."
+        )
+    for value in (
+        tensor_graph.edge_index,
+        tensor_graph.weight,
+        tensor_graph.degree,
+        tensor_graph.pdhg_tau_node,
+    ):
+        if value.device.type != runtime.device.type or (
+            runtime.device.index is not None
+            and value.device.index != runtime.device.index
+        ):
+            raise ValueError("prebuilt_tensor_graph is not on the runtime device.")
+    # The host graph is the authority for objective/certificate hashes.  Exact
+    # equality prevents an unrelated device graph with the same name and edge
+    # count from being run under false provenance.  This is a D2H validation,
+    # not an H2D re-upload; guided construction already materializes this host
+    # spec for stable outputs.
+    tensor_edge_u = (
+        tensor_graph.edge_u.detach().cpu().numpy().astype(np.int64, copy=False)
+    )
+    tensor_edge_v = (
+        tensor_graph.edge_v.detach().cpu().numpy().astype(np.int64, copy=False)
+    )
+    tensor_weight = (
+        tensor_graph.weight.detach().cpu().numpy().astype(np.float64, copy=False)
+    )
+    if not np.array_equal(tensor_edge_u, np.asarray(graph.edge_u, dtype=np.int64)):
+        raise ValueError("prebuilt_tensor_graph edge_u does not match graph.")
+    if not np.array_equal(tensor_edge_v, np.asarray(graph.edge_v, dtype=np.int64)):
+        raise ValueError("prebuilt_tensor_graph edge_v does not match graph.")
+    if not np.array_equal(tensor_weight, np.asarray(graph.edge_w, dtype=np.float64)):
+        raise ValueError("prebuilt_tensor_graph weights do not match graph.")
 
 
 def _project_state_dual(
@@ -415,6 +573,31 @@ def _project_state_dual(
         )
     radius = float(lambda_value) * edge_w.to(dtype=runtime.dtype, device=runtime.device)
     return project_dual_ball(dual, radius)
+
+
+def _invalidate_damped_trial_state(
+    *,
+    phi: torch.Tensor,
+    trial_warm_state: DenseWarmState | QuotientWorksetWarmState | PrimalOnlyWarmState,
+) -> tuple[None, None, None, PrimalOnlyWarmState, bool]:
+    """Create the only state that may be promoted for a damped MM endpoint."""
+
+    structure_hint = (
+        trial_warm_state.labels
+        if isinstance(trial_warm_state, QuotientWorksetWarmState)
+        else None
+    )
+    return (
+        None,
+        None,
+        None,
+        PrimalOnlyWarmState(
+            phi=phi,
+            structure_hint=structure_hint,
+            structure_hint_is_heuristic=True,
+        ),
+        False,
+    )
 
 
 def _tensor_problem_from_torch_data(
@@ -469,6 +652,7 @@ def prepare_torch_problem(
     tol: float,
     inner_max_iter: int,
     graph: PairwiseFusionGraph | None = None,
+    prebuilt_tensor_graph: TensorFusionGraph | None = None,
     adaptive_weight_gamma: float = 1.0,
     adaptive_weight_floor: float = 1e-6,
     adaptive_weight_baseline: float = 1.0,
@@ -482,6 +666,7 @@ def prepare_torch_problem(
     runtime=None,
     torch_data: TorchTumorData | None = None,
     objective_shape: str = "unimodal",
+    defer_graph: bool = False,
 ) -> SolverContext:
     tol = _validate_solver_tolerance(tol)
     objective_shape = _normalize_objective_shape(objective_shape)
@@ -524,7 +709,45 @@ def prepare_torch_problem(
             secondary_wells = None
             valid_secondary = None
 
-    if graph is None:
+    if defer_graph:
+        if graph is not None or prebuilt_tensor_graph is not None:
+            raise ValueError(
+                "defer_graph=True does not accept a resolved or prebuilt graph."
+            )
+        # Guided selection needs the likelihood pilot, bounds, and Torch data
+        # before its observed-curvature graph is known.  Do not build and copy
+        # an O(M^2) adaptive graph that would be discarded immediately.
+        effective_graph = PairwiseFusionGraph(
+            edge_u=np.zeros((0,), dtype=np.int32),
+            edge_v=np.zeros((0,), dtype=np.int32),
+            edge_w=np.zeros((0,), dtype=np.float64),
+            name="deferred_likelihood_pilot",
+            degree_bound=1,
+        )
+        tensor_graph = tensorize_graph(
+            effective_graph,
+            effective_runtime,
+            num_nodes=data.num_mutations,
+        )
+    elif prebuilt_tensor_graph is not None:
+        if graph is None:
+            raise ValueError("prebuilt_tensor_graph requires its host graph spec.")
+        effective_graph = resolve_pairwise_fusion_graph(
+            data.num_mutations,
+            graph=graph,
+            pilot_phi=None,
+            gamma=float(adaptive_weight_gamma),
+            tau=max(float(adaptive_weight_floor), float(eps)),
+            baseline=float(adaptive_weight_baseline),
+        )
+        _validate_prebuilt_tensor_graph(
+            effective_graph,
+            prebuilt_tensor_graph,
+            runtime=effective_runtime,
+            num_nodes=data.num_mutations,
+        )
+        tensor_graph = prebuilt_tensor_graph
+    elif graph is None:
         tensor_graph = build_complete_adaptive_tensor_graph(
             exact_pilot_tensor,
             effective_runtime,
@@ -582,6 +805,13 @@ def prepare_torch_problem(
         major_prior=float(major_prior),
         eps=float(eps),
     )
+    graph_hash = _graph_fingerprint(effective_graph)
+    objective_spec_hash = _objective_spec_fingerprint(
+        data_fingerprint=data_fingerprint,
+        graph_hash=graph_hash,
+        major_prior=float(major_prior),
+        eps=float(eps),
+    )
     return SolverContext(
         problem=problem,
         graph=tensor_graph,
@@ -596,7 +826,134 @@ def prepare_torch_problem(
         upper=upper,
         runtime=effective_runtime,
         data_fingerprint=data_fingerprint,
+        graph_hash=graph_hash,
+        objective_spec_hash=objective_spec_hash,
     )
+
+
+def prepare_torch_problem_with_resource_policy(
+    data: TumorData,
+    *,
+    dense_fallback_policy: str,
+    inherited_resource_fallback: str | None = None,
+    **prepare_kwargs,
+) -> SolverContext:
+    """Prepare a context with typed allocation failure and optional CPU retry.
+
+    Model-selection code prepares graphs before it enters the fit API, so its
+    allocations need the same exact fallback contract as a direct fit.
+    """
+
+    normalized_policy = str(dense_fallback_policy).strip().lower().replace("-", "_")
+    if normalized_policy not in {"auto", "device_only", "cpu_allowed", "error"}:
+        raise ValueError(
+            "dense_fallback_policy must be auto, device_only, cpu_allowed, or error."
+        )
+    kwargs = dict(prepare_kwargs)
+    supplied_prebuilt_tensor_graph = kwargs.pop("prebuilt_tensor_graph", None)
+    supplied_runtime = kwargs.pop("runtime", None)
+    supplied_torch_data = kwargs.pop("torch_data", None)
+    requested_device = kwargs.pop("device", "cuda")
+    requested_dtype = kwargs.pop("dtype", "float64")
+    resolved_by_cpu_fallback = False
+    try:
+        requested_runtime = (
+            resolve_runtime(requested_device, dtype=requested_dtype)
+            if supplied_runtime is None
+            else supplied_runtime
+        )
+    except RuntimeError:
+        if normalized_policy != "cpu_allowed":
+            raise
+        try:
+            requested_runtime = resolve_runtime("cpu", dtype=requested_dtype)
+        except RuntimeError as cpu_runtime_error:
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: the requested runtime is unavailable "
+                "and dense CPU fallback does not support the requested dtype."
+            ) from cpu_runtime_error
+        resolved_by_cpu_fallback = True
+
+    def prepare_on_runtime(*, retain_torch_data: bool) -> SolverContext:
+        reusable_tensor_graph = supplied_prebuilt_tensor_graph
+        if reusable_tensor_graph is not None and (
+            reusable_tensor_graph.weight.device.type != requested_runtime.device.type
+            or (
+                requested_runtime.device.index is not None
+                and reusable_tensor_graph.weight.device.index
+                != requested_runtime.device.index
+            )
+            or reusable_tensor_graph.weight.dtype != requested_runtime.dtype
+        ):
+            # A resource-policy runtime change invalidates only the device copy;
+            # the paired host graph remains available for exact tensorization.
+            reusable_tensor_graph = None
+        context = prepare_torch_problem(
+            data,
+            device=requested_runtime.device_name,
+            dtype=dtype_name(requested_runtime.dtype),
+            runtime=requested_runtime,
+            torch_data=supplied_torch_data if retain_torch_data else None,
+            prebuilt_tensor_graph=reusable_tensor_graph,
+            **kwargs,
+        )
+        fallback = (
+            "dense_cpu" if resolved_by_cpu_fallback else inherited_resource_fallback
+        )
+        return replace(context, resource_fallback=fallback)
+
+    if resolved_by_cpu_fallback:
+        cpu_fits, cpu_bytes, cpu_limit = dense_complete_solver_memory_preflight(
+            num_nodes=int(data.num_mutations),
+            num_regions=int(data.num_regions),
+            runtime=requested_runtime,
+        )
+        if not cpu_fits:
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: dense CPU fallback needs "
+                f"approximately {cpu_bytes} bytes (available host limit: "
+                f"{cpu_limit})."
+            )
+    try:
+        return prepare_on_runtime(retain_torch_data=not resolved_by_cpu_fallback)
+    except (MemoryError, torch.OutOfMemoryError) as exc:
+        cpu_fallback_allowed = bool(
+            normalized_policy == "cpu_allowed"
+            and requested_runtime.device.type != "cpu"
+        )
+        if not cpu_fallback_allowed:
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: exact problem or graph construction "
+                f"exhausted memory on {requested_runtime.device_name}."
+            ) from exc
+        try:
+            requested_runtime = resolve_runtime(
+                "cpu", dtype=dtype_name(requested_runtime.dtype)
+            )
+        except RuntimeError as cpu_runtime_error:
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: dense CPU fallback does not support "
+                f"dtype {dtype_name(requested_runtime.dtype)}."
+            ) from cpu_runtime_error
+        cpu_fits, cpu_bytes, cpu_limit = dense_complete_solver_memory_preflight(
+            num_nodes=int(data.num_mutations),
+            num_regions=int(data.num_regions),
+            runtime=requested_runtime,
+        )
+        if not cpu_fits:
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: dense CPU fallback needs "
+                f"approximately {cpu_bytes} bytes (available host limit: "
+                f"{cpu_limit})."
+            ) from exc
+        resolved_by_cpu_fallback = True
+        try:
+            return prepare_on_runtime(retain_torch_data=False)
+        except (MemoryError, torch.OutOfMemoryError) as cpu_exc:
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: exact problem or graph construction "
+                "exhausted host memory during dense CPU fallback."
+            ) from cpu_exc
 
 
 def _initial_outer_diag() -> dict[str, float | int]:
@@ -728,11 +1085,74 @@ def _solve_inner_subproblem(
     dual_start_is_actual: bool,
     spectral_rho: bool,
     pdhg_tau_node,
-):
+    backend_name: str,
+    graph_hash: str,
+    backend_mode: str,
+    tensor_graph: TensorFusionGraph,
+    warm_state,
+    certificate_options: CertificateOptions,
+    partition_tolerance: float,
+    dense_fallback_policy: str,
+) -> InnerSolveResult:
     """Dispatch the majorized inner subproblem to the ALM (complete-graph) or PDHG
-    solver. Returns ``(phi_trial, dual_trial, dual_kkt_trial, iterations,
-    inner_ok, inner_residual)``. The iteration count comes directly from the
-    selected backend and is zero for its closed-form zero-penalty shortcut."""
+    solver and wrap its legacy tuple in a representation-aware result."""
+    if use_alm and backend_mode == "dense":
+        dense_fits, dense_bytes, dense_limit = dense_complete_solver_memory_preflight(
+            num_nodes=num_mutations,
+            num_regions=int(U.shape[1]),
+            runtime=runtime,
+        )
+        if not dense_fits:
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: dense complete-graph solve needs "
+                f"approximately {dense_bytes} bytes (available policy limit: "
+                f"{dense_limit})."
+            )
+    if use_alm and backend_mode in {"auto", "quotient_workset"}:
+        quotient_result, quotient_attempt_work = (
+            solve_majorized_subproblem_quotient_workset_torch(
+                runtime=runtime,
+                U=U,
+                h=h,
+                lower=lower,
+                upper=upper,
+                lambda_value=lambda_value,
+                graph=tensor_graph,
+                graph_hash=graph_hash,
+                tol=tol,
+                max_iter=max(inner_max_iter, 10),
+                phi_start=phi,
+                warm_state=(
+                    warm_state
+                    if isinstance(
+                        warm_state, (QuotientWorksetWarmState, PrimalOnlyWarmState)
+                    )
+                    else None
+                ),
+                certificate_options=certificate_options,
+                partition_tolerance=partition_tolerance,
+            )
+        )
+        if quotient_result is not None:
+            return quotient_result
+        if dense_fallback_policy == "error":
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: quotient/workset could not certify "
+                "this inner problem and dense fallback is disabled by policy."
+            )
+        dense_fits, dense_bytes, dense_limit = dense_complete_solver_memory_preflight(
+            num_nodes=num_mutations,
+            num_regions=int(U.shape[1]),
+            runtime=runtime,
+        )
+        if not dense_fits:
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: quotient/workset was not certified "
+                f"and dense fallback needs approximately {dense_bytes} bytes "
+                f"(available policy limit: {dense_limit})."
+            )
+
+    surrogate_diag_values: dict[str, float | int] = {}
     if use_alm:
         (
             phi_trial,
@@ -758,6 +1178,7 @@ def _solve_inner_subproblem(
             dual_start=dual,
             dual_start_is_actual=dual_start_is_actual,
             spectral_rho=bool(spectral_rho),
+            diagnostics_out=surrogate_diag_values,
         )
     else:
         (
@@ -791,13 +1212,71 @@ def _solve_inner_subproblem(
         # edge-by-region tensor does not remain live through outer scoring and
         # certificate refinement.
         dual_trial = dual_kkt_trial
-    return (
-        phi_trial,
-        dual_trial,
-        dual_kkt_trial,
-        int(inner_iterations),
-        inner_ok,
-        inner_residual,
+    if surrogate_diag_values:
+        surrogate_diag = surrogate_diag_values
+    else:
+        surrogate_diag = graph_fusion_kkt_residual_from_grad_torch(
+            phi=phi_trial,
+            grad_smooth=h * (phi_trial - U),
+            dual_kkt=dual_kkt_trial,
+            lower=lower,
+            upper=upper,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            edge_w=edge_w,
+            lambda_value=lambda_value,
+            atol=tol,
+        )
+    certificate = (
+        DenseEdgeCertificate(
+            dual=dual_kkt_trial,
+            graph_hash=str(graph_hash),
+            gradient_scope="mm_surrogate",
+        )
+        if torch.is_tensor(dual_kkt_trial)
+        else None
+    )
+    quotient_attempt_work = (
+        quotient_attempt_work
+        if use_alm and backend_mode in {"auto", "quotient_workset"}
+        else BackendWorkCounters()
+    )
+    dense_iterations = int(inner_iterations) if use_alm else 0
+    total_inner_iterations = (
+        int(inner_iterations)
+        + int(quotient_attempt_work.quotient_iterations)
+        + int(quotient_attempt_work.workset_iterations)
+    )
+    return InnerSolveResult(
+        phi=phi_trial,
+        backend_name=str(backend_name),
+        warm_state=DenseWarmState(
+            phi=phi_trial,
+            dual=dual_trial if torch.is_tensor(dual_trial) else None,
+            previous_lambda=float(lambda_value),
+            graph_hash=str(graph_hash),
+        ),
+        surrogate_certificate=certificate,
+        surrogate_kkt=KKTDiagnostics.from_mapping(surrogate_diag),
+        converged=bool(inner_ok),
+        inner_iterations=total_inner_iterations,
+        backend_iterations=total_inner_iterations,
+        work_counters=BackendWorkCounters(
+            quotient_iterations=int(quotient_attempt_work.quotient_iterations),
+            workset_iterations=int(quotient_attempt_work.workset_iterations),
+            workset_expansions=int(quotient_attempt_work.workset_expansions),
+            streamed_edge_passes=int(quotient_attempt_work.streamed_edge_passes),
+            dense_iterations=dense_iterations,
+        ),
+        fallback_reason=(
+            "dense_current_device_after_quotient_attempt"
+            if (
+                use_alm
+                and backend_mode in {"auto", "quotient_workset"}
+                and lambda_value > 0.0
+            )
+            else ""
+        ),
     )
 
 
@@ -808,6 +1287,8 @@ def _fit_from_start(
     runtime,
     graph: PairwiseFusionGraph,
     tensor_graph: TensorFusionGraph,
+    graph_hash: str,
+    objective_spec_hash: str,
     lambda_value: float,
     major_prior: float,
     eps: float,
@@ -821,10 +1302,52 @@ def _fit_from_start(
     summary_tol: float | None,
     compute_summary: bool,
     objective_shape: str,
+    inner_backend: str,
+    workset_max_bytes: int,
+    compressed_cache_max_bytes: int,
+    dense_fallback_policy: str,
+    workset_add_batch: int,
+    workset_max_expansions: int,
+    certificate_max_iter: int,
+    certificate_refinement_rounds: int,
+    certificate_column_tol_scale: float,
+    allow_heuristic_structure_splits: bool,
     verbose: bool,
 ) -> FusionFitArtifacts:
     tol = _validate_solver_tolerance(tol)
     objective_shape = _normalize_objective_shape(objective_shape)
+    requested_inner_backend = _normalize_inner_backend(inner_backend)
+    normalized_fallback_policy = (
+        str(dense_fallback_policy).strip().lower().replace("-", "_")
+    )
+    if normalized_fallback_policy not in {
+        "auto",
+        "device_only",
+        "cpu_allowed",
+        "error",
+    }:
+        raise ValueError(
+            "dense_fallback_policy must be auto, device_only, cpu_allowed, or error."
+        )
+    certificate_options = CertificateOptions(
+        max_iter=max(int(certificate_max_iter), 1),
+        refinement_rounds=max(int(certificate_refinement_rounds), 0),
+        max_expansions=max(int(workset_max_expansions), 1),
+        add_batch=max(int(workset_add_batch), 1),
+        mapping_tolerance=max(0.1 * float(tol), float(torch.finfo(runtime.dtype).eps)),
+        column_tolerance=max(
+            float(certificate_column_tol_scale) * float(tol),
+            float(torch.finfo(runtime.dtype).eps),
+        ),
+        memory=WorksetMemoryOptions(
+            max_workset_bytes=int(workset_max_bytes),
+            max_compressed_cache_bytes=int(compressed_cache_max_bytes),
+            dense_fallback_policy=normalized_fallback_policy,
+            allow_heuristic_split_before_dense_fallback=bool(
+                allow_heuristic_structure_splits
+            ),
+        ),
+    )
     use_unimodal_objective = objective_shape.startswith("unimodal")
     require_full_step_backtracking = (
         objective_shape == "unimodal_full_step_backtracking"
@@ -835,19 +1358,29 @@ def _fit_from_start(
         tensor_graph.is_complete
         and int(graph.degree_bound) == max(int(data.num_mutations) - 1, 1)
     )
+    if requested_inner_backend == "quotient_workset" and not use_alm:
+        raise ValueError(
+            "inner_backend='quotient_workset' requires the complete original graph."
+        )
     edge_u, edge_v, edge_w = (
         tensor_graph.edge_u,
         tensor_graph.edge_v,
         tensor_graph.weight,
     )
     if lambda_value <= 0.0 or int(edge_u.numel()) == 0:
-        inner_solver = "closed_form_projection"
+        dense_inner_solver = "closed_form_projection"
     elif use_alm:
         # The complete-graph ALM backend is the scaled-dual ADMM algorithm:
         # group shrinkage, constrained phi update, then dual ascent.
-        inner_solver = "admm_complete_graph"
+        dense_inner_solver = "admm_complete_graph"
     else:
-        inner_solver = "pdhg"
+        dense_inner_solver = "pdhg"
+    inner_solver = dense_inner_solver
+    use_compressed_certificates = bool(
+        requested_inner_backend in {"auto", "quotient_workset"}
+        and tensor_graph.is_complete
+        and lambda_value > 0.0
+    )
 
     if (
         solver_state is not None
@@ -859,16 +1392,55 @@ def _fit_from_start(
         phi = _tensor_from_start(phi_start, runtime)
     phi = torch.minimum(torch.maximum(phi, lower), upper)
 
-    state_dual = _project_state_dual(
-        solver_state,
-        runtime=runtime,
-        edge_w=edge_w,
-        lambda_value=lambda_value,
-        num_edges=int(edge_u.numel()),
-        num_regions=int(phi.shape[1]),
+    state_dual = (
+        None
+        if use_compressed_certificates
+        else _project_state_dual(
+            solver_state,
+            runtime=runtime,
+            edge_w=edge_w,
+            lambda_value=lambda_value,
+            num_edges=int(edge_u.numel()),
+            num_regions=int(phi.shape[1]),
+        )
     )
     dual = state_dual
     dual_kkt = state_dual
+    warm_state = (
+        solver_state.warm_state
+        if solver_state is not None and solver_state.warm_state is not None
+        else DenseWarmState(
+            phi=phi,
+            dual=state_dual,
+            previous_lambda=float(lambda_value),
+            graph_hash=str(graph_hash),
+        )
+    )
+    certificate = (
+        solver_state.certificate
+        if (
+            solver_state is not None
+            and solver_state.certificate is not None
+            and getattr(solver_state.certificate, "graph_hash", None) == graph_hash
+        )
+        else (
+            DenseEdgeCertificate(
+                dual=state_dual,
+                graph_hash=graph_hash,
+                gradient_scope="observed_objective",
+            )
+            if torch.is_tensor(state_dual)
+            else None
+        )
+    )
+    if use_compressed_certificates and not isinstance(
+        certificate, CompressedEdgeCertificate
+    ):
+        certificate = compressed_certificate_for_primal(
+            phi,
+            graph_hash=graph_hash,
+            gradient_scope="observed_objective",
+        )
     dual_start_is_actual = bool(use_alm and state_dual is not None)
     history: list[float] = []
     converged = False
@@ -876,6 +1448,12 @@ def _fit_from_start(
     converged_outer = False
     iterations = 0
     inner_iterations = 0
+    quotient_iterations = 0
+    workset_iterations = 0
+    workset_expansions = 0
+    streamed_edge_passes = 0
+    dense_iterations = 0
+    fallback_reason = ""
     current_inner_converged = False
     current_inner_kkt_residual = np.nan
     final_relative_objective_change = np.inf
@@ -948,25 +1526,24 @@ def _fit_from_start(
             torch_data.count_observed,
         )
         if require_full_step_backtracking:
-            forcing_dual = dual_kkt
-            if forcing_dual is None:
-                forcing_dual = torch.zeros(
-                    (int(edge_u.numel()), int(phi.shape[1])),
-                    dtype=runtime.dtype,
-                    device=runtime.device,
+            forcing_certificate = certificate
+            if use_compressed_certificates and forcing_certificate is None:
+                forcing_certificate = compressed_certificate_for_primal(
+                    phi,
+                    graph_hash=graph_hash,
+                    gradient_scope="observed_objective",
                 )
-            forcing_diag = graph_fusion_kkt_residual_from_grad_torch(
+            forcing_diag = audit_graph_fusion_certificate(
+                certificate=forcing_certificate,
                 phi=phi,
                 grad_smooth=current_mutation_region_terms.grad,
-                dual_kkt=forcing_dual,
+                graph=tensor_graph,
+                graph_hash=graph_hash,
                 lower=lower,
                 upper=upper,
-                edge_u=edge_u,
-                edge_v=edge_v,
-                edge_w=edge_w,
                 lambda_value=lambda_value,
                 atol=tol,
-            )
+            ).as_dict()
             inner_progress_tolerance = max(
                 5.0 * tol,
                 min(
@@ -982,6 +1559,9 @@ def _fit_from_start(
         candidate_phi = phi
         candidate_dual = dual
         candidate_dual_kkt = dual_kkt
+        candidate_certificate = certificate
+        candidate_warm_state = warm_state
+        candidate_backend_name = inner_solver
         candidate_dual_start_is_actual = dual_start_is_actual
         candidate_objective = objective
         candidate_fit_loss = fit_loss
@@ -1032,17 +1612,11 @@ def _fit_from_start(
             inner_phi_start = phi
             inner_dual_start = dual
             inner_dual_start_is_actual = dual_start_is_actual
+            inner_warm_start = warm_state
             attempted_inner_iterations = 0
             inner_batch_limit = 8 if require_full_step_backtracking else 1
             for _inner_batch in range(inner_batch_limit):
-                (
-                    phi_trial,
-                    dual_trial,
-                    dual_kkt_trial,
-                    batch_inner_iterations,
-                    inner_ok,
-                    inner_residual,
-                ) = _solve_inner_subproblem(
+                inner_result = _solve_inner_subproblem(
                     use_alm=use_alm,
                     runtime=runtime,
                     num_mutations=data.num_mutations,
@@ -1062,7 +1636,36 @@ def _fit_from_start(
                     dual_start_is_actual=inner_dual_start_is_actual,
                     spectral_rho=bool(require_full_step_backtracking),
                     pdhg_tau_node=tensor_graph.pdhg_tau_node,
+                    backend_name=dense_inner_solver,
+                    graph_hash=graph_hash,
+                    backend_mode=requested_inner_backend,
+                    tensor_graph=tensor_graph,
+                    warm_state=inner_warm_start,
+                    certificate_options=certificate_options,
+                    partition_tolerance=max(float(tol), 1e-12),
+                    dense_fallback_policy=normalized_fallback_policy,
                 )
+                quotient_iterations += int(
+                    inner_result.work_counters.quotient_iterations
+                )
+                workset_iterations += int(inner_result.work_counters.workset_iterations)
+                workset_expansions += int(inner_result.work_counters.workset_expansions)
+                streamed_edge_passes += int(
+                    inner_result.work_counters.streamed_edge_passes
+                )
+                dense_iterations += int(inner_result.work_counters.dense_iterations)
+                fallback_reason = _combine_fallback_reasons(
+                    fallback_reason,
+                    inner_result.fallback_reason,
+                )
+                phi_trial = inner_result.phi
+                dense_warm_state = inner_result.warm_state
+                dual_trial = getattr(dense_warm_state, "dual", None)
+                surrogate_certificate = inner_result.surrogate_certificate
+                dual_kkt_trial = getattr(surrogate_certificate, "dual", None)
+                batch_inner_iterations = int(inner_result.inner_iterations)
+                inner_ok = bool(inner_result.converged)
+                inner_residual = float(inner_result.surrogate_kkt.kkt_residual)
                 attempted_inner_iterations += int(batch_inner_iterations)
                 batch_inner_certified = bool(inner_ok)
                 if require_full_step_backtracking:
@@ -1091,6 +1694,7 @@ def _fit_from_start(
                 inner_phi_start = phi_trial
                 inner_dual_start = dual_kkt_trial if use_alm else dual_trial
                 inner_dual_start_is_actual = bool(use_alm)
+                inner_warm_start = inner_result.warm_state
             inner_iterations += int(attempted_inner_iterations)
             attempted_outer_steps += 1
             last_attempted_inner_kkt_residual = float(inner_residual)
@@ -1258,6 +1862,9 @@ def _fit_from_start(
                 # across outer MM subproblems because curvature changes rho.
                 candidate_dual = dual_kkt_trial if use_alm else dual_trial
                 candidate_dual_kkt = dual_kkt_trial
+                candidate_certificate = surrogate_certificate
+                candidate_warm_state = inner_result.warm_state
+                candidate_backend_name = inner_result.backend_name
                 candidate_dual_start_is_actual = bool(use_alm)
                 candidate_objective = trial_objective
                 candidate_fit_loss = trial_fit_loss
@@ -1373,9 +1980,17 @@ def _fit_from_start(
                     accepted_outer_steps += 1
                     accepted_damped_steps += 1
                     candidate_phi = phi_theta
-                    candidate_dual = dual_kkt_trial if use_alm else dual_trial
-                    candidate_dual_kkt = None
-                    candidate_dual_start_is_actual = bool(use_alm)
+                    (
+                        candidate_dual,
+                        candidate_dual_kkt,
+                        candidate_certificate,
+                        candidate_warm_state,
+                        candidate_dual_start_is_actual,
+                    ) = _invalidate_damped_trial_state(
+                        phi=phi_theta,
+                        trial_warm_state=inner_result.warm_state,
+                    )
+                    candidate_backend_name = inner_result.backend_name
                     candidate_objective = theta_objective
                     candidate_fit_loss = theta_fit_loss
                     candidate_gamma = theta_gamma
@@ -1396,6 +2011,9 @@ def _fit_from_start(
             candidate_phi = phi
             candidate_dual = dual
             candidate_dual_kkt = dual_kkt
+            candidate_certificate = certificate
+            candidate_warm_state = warm_state
+            candidate_backend_name = inner_solver
             candidate_dual_start_is_actual = dual_start_is_actual
             candidate_objective = objective
             candidate_fit_loss = fit_loss
@@ -1406,6 +2024,9 @@ def _fit_from_start(
         phi = candidate_phi
         dual = candidate_dual
         dual_kkt = candidate_dual_kkt
+        certificate = candidate_certificate
+        warm_state = candidate_warm_state
+        inner_solver = candidate_backend_name
         dual_start_is_actual = candidate_dual_start_is_actual
         objective = candidate_objective
         fit_loss = candidate_fit_loss
@@ -1442,26 +2063,52 @@ def _fit_from_start(
         outer_converged = False
         if do_outer_kkt_audit:
             outer_terms = current_mutation_region_terms
-            if dual_kkt is None:
-                dual_for_audit = torch.zeros(
-                    (int(edge_u.numel()), int(phi.shape[1])),
-                    dtype=runtime.dtype,
-                    device=runtime.device,
+            if inner_solver == "quotient_workset_complete_graph" or isinstance(
+                certificate, CompressedEdgeCertificate
+            ):
+                observed_start = certificate
+                if not isinstance(observed_start, CompressedEdgeCertificate):
+                    observed_start = compressed_certificate_for_primal(
+                        phi,
+                        graph_hash=graph_hash,
+                        gradient_scope="observed_objective",
+                    )
+                observed_refinement = refine_graph_fusion_certificate(
+                    certificate=observed_start,
+                    phi=phi,
+                    grad_smooth=outer_terms.grad,
+                    gradient_scope="observed_objective",
+                    graph=tensor_graph,
+                    graph_hash=graph_hash,
+                    lower=lower,
+                    upper=upper,
+                    lambda_value=lambda_value,
+                    atol=tol,
+                    options=certificate_options,
                 )
+                workset_iterations += int(
+                    observed_refinement.work_counters.workset_iterations
+                )
+                workset_expansions += int(
+                    observed_refinement.work_counters.workset_expansions
+                )
+                streamed_edge_passes += int(
+                    observed_refinement.work_counters.streamed_edge_passes
+                )
+                certificate = observed_refinement.certificate
+                outer_diag = observed_refinement.diagnostics.as_dict()
             else:
-                dual_for_audit = dual_kkt
-            outer_diag = graph_fusion_kkt_residual_from_grad_torch(
-                phi=phi,
-                grad_smooth=outer_terms.grad,
-                dual_kkt=dual_for_audit,
-                lower=lower,
-                upper=upper,
-                edge_u=edge_u,
-                edge_v=edge_v,
-                edge_w=edge_w,
-                lambda_value=lambda_value,
-                atol=tol,
-            )
+                outer_diag = audit_graph_fusion_certificate(
+                    certificate=certificate,
+                    phi=phi,
+                    grad_smooth=outer_terms.grad,
+                    graph=tensor_graph,
+                    graph_hash=graph_hash,
+                    lower=lower,
+                    upper=upper,
+                    lambda_value=lambda_value,
+                    atol=tol,
+                ).as_dict()
             outer_converged = bool(outer_diag["kkt_residual"] <= 5.0 * tol)
         final_relative_objective_change = float(rel_change)
         final_step_residual = float(step_residual)
@@ -1483,30 +2130,53 @@ def _fit_from_start(
             break
 
     final_terms = current_mutation_region_terms
-    final_dual_audit = refine_graph_fusion_dual_certificate_torch(
+    if inner_solver == "quotient_workset_complete_graph" and not isinstance(
+        certificate, CompressedEdgeCertificate
+    ):
+        certificate = compressed_certificate_for_primal(
+            phi,
+            graph_hash=graph_hash,
+            gradient_scope="observed_objective",
+        )
+    final_certificate_refinement = refine_graph_fusion_certificate(
+        certificate=certificate,
         phi=phi,
         grad_smooth=final_terms.grad,
-        dual_kkt=dual_kkt,
+        gradient_scope="observed_objective",
+        graph=tensor_graph,
+        graph_hash=graph_hash,
         lower=lower,
         upper=upper,
-        edge_u=edge_u,
-        edge_v=edge_v,
-        edge_w=edge_w,
         lambda_value=lambda_value,
         atol=tol,
         max_iter=96,
+        options=(
+            certificate_options
+            if isinstance(certificate, CompressedEdgeCertificate)
+            else None
+        ),
     )
-    final_outer_diag = final_dual_audit["diag"]
-    final_dual = final_dual_audit["dual"]
-    outer_kkt_certificate_status = str(final_dual_audit["status"])
-    outer_kkt_dual_refined = bool(final_dual_audit["dual_refined"])
-    outer_kkt_fused_edges = int(final_dual_audit["fused_edges"])
-    outer_kkt_nonzero_edges = int(final_dual_audit["nonzero_edges"])
+    workset_iterations += int(
+        final_certificate_refinement.work_counters.workset_iterations
+    )
+    workset_expansions += int(
+        final_certificate_refinement.work_counters.workset_expansions
+    )
+    streamed_edge_passes += int(
+        final_certificate_refinement.work_counters.streamed_edge_passes
+    )
+    certificate = final_certificate_refinement.certificate
+    final_outer_diag = final_certificate_refinement.diagnostics.as_dict()
+    final_dual = getattr(certificate, "dual", None)
+    outer_kkt_certificate_status = str(final_certificate_refinement.status)
+    outer_kkt_dual_refined = bool(final_certificate_refinement.dual_refined)
+    outer_kkt_fused_edges = int(final_certificate_refinement.fused_edges)
+    outer_kkt_nonzero_edges = int(final_certificate_refinement.nonzero_edges)
     outer_stationarity_residual_before_dual_refine = float(
-        final_dual_audit["stationarity_before"]
+        final_certificate_refinement.stationarity_before
     )
     outer_stationarity_residual_after_dual_refine = float(
-        final_dual_audit["stationarity_after"]
+        final_certificate_refinement.stationarity_after
     )
     converged_outer = bool(float(final_outer_diag["kkt_residual"]) <= 5.0 * tol)
     valid_dual_certificate = outer_kkt_certificate_status in {
@@ -1514,12 +2184,43 @@ def _fit_from_start(
         "analytic_nonfused_dual",
         "refined_fused_edge_dual",
         "input_dual_retained",
+        "certified",
     }
     selection_eligible = bool(
         np.isfinite(float(objective))
         and converged_outer
         and valid_dual_certificate
         and mm_consistency_violations == 0
+    )
+    full_kkt_certified = bool(
+        np.isfinite(float(final_outer_diag["kkt_residual"]))
+        and converged_outer
+        and valid_dual_certificate
+    )
+    exactness_provenance = ExactFusionProvenance(
+        schema_version=1,
+        estimator_role="raw_fused_lambda_path",
+        objective_faithful=True,
+        objective_spec_hash=str(objective_spec_hash),
+        original_graph_hash=str(graph_hash),
+        certificate_problem_hash=_certificate_problem_fingerprint(
+            objective_spec_hash=objective_spec_hash,
+            lambda_value=lambda_value,
+        ),
+        certificate_scope="full_original_graph",
+        gradient_scope="observed_objective",
+        full_kkt_certified=full_kkt_certified,
+        status=str(outer_kkt_certificate_status),
+        residual=float(final_outer_diag["kkt_residual"]),
+        tolerance=5.0 * float(tol),
+        backend_name=str(inner_solver),
+        backend_iterations=int(inner_iterations),
+        quotient_iterations=int(quotient_iterations),
+        workset_iterations=int(workset_iterations),
+        workset_expansions=int(workset_expansions),
+        streamed_edge_passes=int(streamed_edge_passes),
+        dense_iterations=int(dense_iterations),
+        fallback_reason=str(fallback_reason),
     )
     stationarity_certified = bool(selection_eligible)
     global_optimality_certified = bool(selection_eligible and use_unimodal_objective)
@@ -1601,6 +2302,31 @@ def _fit_from_start(
     major_probability, major_call, multiplicity_call = _multiplicity_calls(
         data, gamma_np, phi_np.dtype
     )
+    if isinstance(certificate, CompressedEdgeCertificate):
+        quotient_dual = (
+            warm_state.quotient_dual
+            if isinstance(warm_state, QuotientWorksetWarmState)
+            else None
+        )
+        terminal_warm_state = QuotientWorksetWarmState(
+            phi=phi.detach(),
+            labels=certificate.labels.detach(),
+            centers=certificate.centers.detach(),
+            quotient_dual=(
+                quotient_dual.detach() if torch.is_tensor(quotient_dual) else None
+            ),
+            internal_edge_ids=certificate.internal_edge_ids.detach(),
+            internal_dual=certificate.internal_dual.detach(),
+            graph_hash=str(graph_hash),
+            previous_lambda=float(lambda_value),
+        )
+    else:
+        terminal_warm_state = DenseWarmState(
+            phi=phi.detach(),
+            dual=final_dual.detach() if torch.is_tensor(final_dual) else None,
+            previous_lambda=float(lambda_value),
+            graph_hash=str(graph_hash),
+        )
     solver_state_out = SolverState(
         phi=phi.detach(),
         dual=final_dual.detach() if torch.is_tensor(final_dual) else None,
@@ -1610,6 +2336,8 @@ def _fit_from_start(
         split=None,
         curvature=None,
         previous_lambda=float(lambda_value),
+        warm_state=terminal_warm_state,
+        certificate=certificate,
     )
     torch_result = TorchFitResult(
         phi_raw=phi.detach(),
@@ -1642,9 +2370,11 @@ def _fit_from_start(
         ),
         graph_name=str(graph.name),
         admm_iterations=(
-            int(inner_iterations) if inner_solver == "admm_complete_graph" else 0
+            int(dense_iterations) if inner_solver == "admm_complete_graph" else 0
         ),
         inner_solver=str(inner_solver),
+        certificate=certificate,
+        exactness_provenance=exactness_provenance,
     )
 
     return FusionFitArtifacts(
@@ -1756,9 +2486,11 @@ def _fit_from_start(
         torch_result=torch_result,
         inner_iterations=int(inner_iterations),
         admm_iterations=(
-            int(inner_iterations) if inner_solver == "admm_complete_graph" else 0
+            int(dense_iterations) if inner_solver == "admm_complete_graph" else 0
         ),
         inner_solver=str(inner_solver),
+        certificate=certificate,
+        exactness_provenance=exactness_provenance,
     )
 
 
@@ -1830,32 +2562,132 @@ def fit_observed_data_pairwise_fusion(
     solver_state: SolverState | None = None,
     compute_summary: bool = True,
     objective_shape: str = "unimodal",
+    inner_backend: str = "dense",
+    workset_max_bytes: int = 256 * 1024 * 1024,
+    compressed_cache_max_bytes: int = 256 * 1024 * 1024,
+    dense_fallback_policy: str = "auto",
+    workset_add_batch: int = 64,
+    workset_max_expansions: int = 16,
+    certificate_max_iter: int = 512,
+    certificate_refinement_rounds: int = 2,
+    certificate_column_tol_scale: float = 1.0,
+    allow_heuristic_structure_splits: bool = True,
     verbose: bool = False,
 ) -> FusionFitArtifacts:
     tol = _validate_solver_tolerance(tol)
     lambda_value = validate_lambda_value(lambda_value)
     objective_shape = _normalize_objective_shape(objective_shape)
-    expected_data_fingerprint = _data_fingerprint(data)
-    if solver_context is None:
-        solver_context = prepare_torch_problem(
-            data,
-            major_prior=float(major_prior),
-            eps=float(eps),
-            tol=tol,
-            inner_max_iter=int(inner_max_iter),
-            graph=graph,
-            adaptive_weight_gamma=float(adaptive_weight_gamma),
-            adaptive_weight_floor=float(adaptive_weight_floor),
-            adaptive_weight_baseline=float(adaptive_weight_baseline),
-            exact_pilot=exact_pilot,
-            pooled_start=pooled_start,
-            scalar_well_starts=scalar_well_starts,
-            device=device,
-            dtype=dtype,
-            runtime=runtime,
-            torch_data=torch_data,
-            objective_shape=objective_shape,
+    normalized_fallback_policy = (
+        str(dense_fallback_policy).strip().lower().replace("-", "_")
+    )
+    if normalized_fallback_policy not in {
+        "auto",
+        "device_only",
+        "cpu_allowed",
+        "error",
+    }:
+        raise ValueError(
+            "dense_fallback_policy must be auto, device_only, cpu_allowed, or error."
         )
+    expected_data_fingerprint = _data_fingerprint(data)
+    context_prepared_by_cpu_fallback = bool(
+        solver_context is not None
+        and getattr(solver_context, "resource_fallback", None) == "dense_cpu"
+    )
+    if solver_context is None:
+        try:
+            requested_runtime = (
+                resolve_runtime(device, dtype=dtype) if runtime is None else runtime
+            )
+        except RuntimeError:
+            if normalized_fallback_policy != "cpu_allowed":
+                raise
+            try:
+                requested_runtime = resolve_runtime("cpu", dtype=dtype)
+            except RuntimeError as cpu_runtime_error:
+                raise ExactSolverResourceLimit(
+                    "exact_solver_resource_limit: the requested runtime is "
+                    "unavailable and dense CPU fallback does not support the "
+                    f"requested dtype {dtype!r}."
+                ) from cpu_runtime_error
+            context_prepared_by_cpu_fallback = True
+
+        def prepare_context(*, use_supplied_torch_data: bool) -> SolverContext:
+            return prepare_torch_problem(
+                data,
+                major_prior=float(major_prior),
+                eps=float(eps),
+                tol=tol,
+                inner_max_iter=int(inner_max_iter),
+                graph=graph,
+                adaptive_weight_gamma=float(adaptive_weight_gamma),
+                adaptive_weight_floor=float(adaptive_weight_floor),
+                adaptive_weight_baseline=float(adaptive_weight_baseline),
+                exact_pilot=exact_pilot,
+                pooled_start=pooled_start,
+                scalar_well_starts=scalar_well_starts,
+                device=requested_runtime.device_name,
+                dtype=dtype_name(requested_runtime.dtype),
+                runtime=requested_runtime,
+                torch_data=torch_data if use_supplied_torch_data else None,
+                objective_shape=objective_shape,
+            )
+
+        if context_prepared_by_cpu_fallback:
+            cpu_fits, cpu_bytes, cpu_limit = dense_complete_solver_memory_preflight(
+                num_nodes=int(data.num_mutations),
+                num_regions=int(data.num_regions),
+                runtime=requested_runtime,
+            )
+            if not cpu_fits:
+                raise ExactSolverResourceLimit(
+                    "exact_solver_resource_limit: dense CPU fallback needs "
+                    f"approximately {cpu_bytes} bytes (available host limit: "
+                    f"{cpu_limit})."
+                )
+
+        try:
+            solver_context = prepare_context(
+                use_supplied_torch_data=not context_prepared_by_cpu_fallback
+            )
+        except (MemoryError, torch.OutOfMemoryError) as exc:
+            cpu_fallback_allowed = bool(
+                normalized_fallback_policy == "cpu_allowed"
+                and requested_runtime.device.type != "cpu"
+            )
+            if not cpu_fallback_allowed:
+                raise ExactSolverResourceLimit(
+                    "exact_solver_resource_limit: exact problem or graph "
+                    f"construction exhausted memory on {requested_runtime.device_name}."
+                ) from exc
+            try:
+                requested_runtime = resolve_runtime(
+                    "cpu", dtype=dtype_name(requested_runtime.dtype)
+                )
+            except RuntimeError as cpu_runtime_error:
+                raise ExactSolverResourceLimit(
+                    "exact_solver_resource_limit: dense CPU fallback does not "
+                    f"support dtype {dtype_name(requested_runtime.dtype)}."
+                ) from cpu_runtime_error
+            cpu_fits, cpu_bytes, cpu_limit = dense_complete_solver_memory_preflight(
+                num_nodes=int(data.num_mutations),
+                num_regions=int(data.num_regions),
+                runtime=requested_runtime,
+            )
+            if not cpu_fits:
+                raise ExactSolverResourceLimit(
+                    "exact_solver_resource_limit: dense CPU fallback needs "
+                    f"approximately {cpu_bytes} bytes (available host limit: "
+                    f"{cpu_limit})."
+                ) from exc
+            context_prepared_by_cpu_fallback = True
+            try:
+                solver_context = prepare_context(use_supplied_torch_data=False)
+            except (MemoryError, torch.OutOfMemoryError) as cpu_exc:
+                raise ExactSolverResourceLimit(
+                    "exact_solver_resource_limit: exact problem or graph "
+                    "construction exhausted host memory during dense CPU fallback."
+                ) from cpu_exc
     else:
         if (
             getattr(solver_context, "data_fingerprint", None)
@@ -1873,9 +2705,7 @@ def fit_observed_data_pairwise_fusion(
             )
 
     effective_runtime = solver_context.runtime
-    effective_torch_data = torch_data_from_context(solver_context)
     effective_graph = solver_context.graph_spec
-    effective_tensor_graph = solver_context.graph
     effective_exact_pilot = (
         solver_context.exact_pilot if exact_pilot is None else exact_pilot
     )
@@ -1914,15 +2744,22 @@ def fit_observed_data_pairwise_fusion(
             start_bank.append(effective_exact_pilot)
     start_bank = _deduplicate_starts(start_bank, runtime=effective_runtime)
 
-    best_artifacts: FusionFitArtifacts | None = None
-    start_artifacts: list[FusionFitArtifacts] = []
-    for start in start_bank:
-        artifacts = _fit_from_start(
+    def run_start(
+        *,
+        context: SolverContext,
+        start: np.ndarray | torch.Tensor,
+        state: SolverState | None,
+        backend: str,
+        fallback_policy: str,
+    ) -> FusionFitArtifacts:
+        return _fit_from_start(
             data,
-            torch_data=effective_torch_data,
-            runtime=effective_runtime,
-            graph=effective_graph,
-            tensor_graph=effective_tensor_graph,
+            torch_data=torch_data_from_context(context),
+            runtime=context.runtime,
+            graph=context.graph_spec,
+            tensor_graph=context.graph,
+            graph_hash=str(context.graph_hash),
+            objective_spec_hash=str(context.objective_spec_hash),
             lambda_value=lambda_value,
             major_prior=major_prior,
             eps=eps,
@@ -1930,18 +2767,282 @@ def fit_observed_data_pairwise_fusion(
             inner_max_iter=inner_max_iter,
             tol=tol,
             phi_start=start,
-            solver_state=(
-                solver_state
-                if (solver_state is not None and start is start_bank[0])
-                else None
-            ),
-            lower=solver_context.lower,
-            upper=solver_context.upper,
+            solver_state=state,
+            lower=context.lower,
+            upper=context.upper,
             summary_tol=summary_tol,
             compute_summary=compute_summary,
             objective_shape=objective_shape,
+            inner_backend=backend,
+            workset_max_bytes=workset_max_bytes,
+            compressed_cache_max_bytes=compressed_cache_max_bytes,
+            dense_fallback_policy=fallback_policy,
+            workset_add_batch=workset_add_batch,
+            workset_max_expansions=workset_max_expansions,
+            certificate_max_iter=certificate_max_iter,
+            certificate_refinement_rounds=certificate_refinement_rounds,
+            certificate_column_tol_scale=certificate_column_tol_scale,
+            allow_heuristic_structure_splits=allow_heuristic_structure_splits,
             verbose=verbose,
         )
+
+    def mark_fallback(
+        artifacts: FusionFitArtifacts,
+        *,
+        reason: str,
+        backend_name: str | None = None,
+    ) -> FusionFitArtifacts:
+        fallback_backend = (
+            str(backend_name) if backend_name is not None else artifacts.inner_solver
+        )
+        fallback_provenance = (
+            replace(
+                artifacts.exactness_provenance,
+                backend_name=fallback_backend,
+                fallback_reason=_combine_fallback_reasons(
+                    artifacts.exactness_provenance.fallback_reason,
+                    reason,
+                ),
+            )
+            if artifacts.exactness_provenance is not None
+            else None
+        )
+        fallback_torch_result = (
+            replace(
+                artifacts.torch_result,
+                inner_solver=fallback_backend,
+                exactness_provenance=fallback_provenance,
+            )
+            if artifacts.torch_result is not None
+            else None
+        )
+        return replace(
+            artifacts,
+            inner_solver=fallback_backend,
+            exactness_provenance=fallback_provenance,
+            torch_result=fallback_torch_result,
+        )
+
+    def merge_attempted_work(
+        artifacts: FusionFitArtifacts,
+        attempted: FusionFitArtifacts | None,
+    ) -> FusionFitArtifacts:
+        """Preserve diagnostic work from a completed attempt before retrying."""
+
+        if attempted is None:
+            return artifacts
+        current_provenance = artifacts.exactness_provenance
+        attempted_provenance = attempted.exactness_provenance
+        if current_provenance is None or attempted_provenance is None:
+            return artifacts
+        merged_provenance = replace(
+            current_provenance,
+            backend_iterations=(
+                int(current_provenance.backend_iterations)
+                + int(attempted_provenance.backend_iterations)
+            ),
+            quotient_iterations=(
+                int(current_provenance.quotient_iterations)
+                + int(attempted_provenance.quotient_iterations)
+            ),
+            workset_iterations=(
+                int(current_provenance.workset_iterations)
+                + int(attempted_provenance.workset_iterations)
+            ),
+            workset_expansions=(
+                int(current_provenance.workset_expansions)
+                + int(attempted_provenance.workset_expansions)
+            ),
+            streamed_edge_passes=(
+                int(current_provenance.streamed_edge_passes)
+                + int(attempted_provenance.streamed_edge_passes)
+            ),
+            dense_iterations=(
+                int(current_provenance.dense_iterations)
+                + int(attempted_provenance.dense_iterations)
+            ),
+            fallback_reason=_combine_fallback_reasons(
+                attempted_provenance.fallback_reason,
+                current_provenance.fallback_reason,
+            ),
+        )
+        merged_inner_iterations = int(artifacts.inner_iterations) + int(
+            attempted.inner_iterations
+        )
+        merged_torch_result = artifacts.torch_result
+        if merged_torch_result is not None:
+            merged_torch_result = replace(
+                merged_torch_result,
+                inner=replace(
+                    merged_torch_result.inner,
+                    iterations=(
+                        int(merged_torch_result.inner.iterations)
+                        + int(attempted.inner_iterations)
+                    ),
+                ),
+                exactness_provenance=merged_provenance,
+            )
+        return replace(
+            artifacts,
+            inner_iterations=merged_inner_iterations,
+            exactness_provenance=merged_provenance,
+            torch_result=merged_torch_result,
+        )
+
+    cpu_fallback_context: SolverContext | None = None
+    best_artifacts: FusionFitArtifacts | None = None
+    start_artifacts: list[FusionFitArtifacts] = []
+    for start in start_bank:
+        state_for_start = (
+            solver_state
+            if (solver_state is not None and start is start_bank[0])
+            else None
+        )
+        cpu_seed = state_for_start.phi if state_for_start is not None else start
+        attempted_artifacts: FusionFitArtifacts | None = None
+        try:
+            artifacts = run_start(
+                context=solver_context,
+                start=start,
+                state=state_for_start,
+                backend="dense" if context_prepared_by_cpu_fallback else inner_backend,
+                fallback_policy=(
+                    "device_only"
+                    if context_prepared_by_cpu_fallback
+                    else dense_fallback_policy
+                ),
+            )
+            provenance = artifacts.exactness_provenance
+            compressed_terminal_not_certified = bool(
+                isinstance(artifacts.certificate, CompressedEdgeCertificate)
+                and (
+                    provenance is None
+                    or not bool(provenance.full_kkt_certified)
+                    or str(provenance.status)
+                    not in {
+                        "certified",
+                        "input_dual_retained",
+                        "analytic_nonfused_dual",
+                        "refined_fused_edge_dual",
+                        "zero_penalty_no_dual_needed",
+                    }
+                )
+            )
+            if compressed_terminal_not_certified:
+                attempted_artifacts = artifacts
+                cpu_seed = (
+                    artifacts.torch_result.phi_raw
+                    if artifacts.torch_result is not None
+                    else artifacts.phi
+                )
+                if normalized_fallback_policy == "error":
+                    raise ExactSolverResourceLimit(
+                        "exact_solver_resource_limit: quotient/workset did not "
+                        "produce an accepted terminal observed-objective "
+                        "certificate and dense fallback is disabled by policy."
+                    )
+                artifacts = run_start(
+                    context=solver_context,
+                    start=cpu_seed,
+                    state=None,
+                    backend="dense",
+                    fallback_policy="device_only",
+                )
+                artifacts = merge_attempted_work(artifacts, attempted_artifacts)
+                artifacts = mark_fallback(
+                    artifacts,
+                    reason="dense_current_device_after_compressed_not_certified",
+                )
+            if context_prepared_by_cpu_fallback:
+                artifacts = mark_fallback(
+                    artifacts,
+                    reason="dense_cpu_after_context_resource_limit",
+                    backend_name="admm_complete_graph_cpu_fallback",
+                )
+        except (MemoryError, torch.OutOfMemoryError) as exc:
+            resource_exc = (
+                exc
+                if isinstance(exc, ExactSolverResourceLimit)
+                else ExactSolverResourceLimit(
+                    "exact_solver_resource_limit: exact solver allocation "
+                    f"exhausted memory on {effective_runtime.device_name}."
+                )
+            )
+            cpu_fallback_allowed = bool(
+                normalized_fallback_policy == "cpu_allowed"
+                and effective_runtime.device.type != "cpu"
+            )
+            if not cpu_fallback_allowed:
+                if resource_exc is exc:
+                    raise
+                raise resource_exc from exc
+            try:
+                cpu_runtime = resolve_runtime(
+                    "cpu", dtype=dtype_name(effective_runtime.dtype)
+                )
+            except RuntimeError as cpu_runtime_error:
+                raise ExactSolverResourceLimit(
+                    "exact_solver_resource_limit: dense CPU fallback does not "
+                    f"support dtype {dtype_name(effective_runtime.dtype)}."
+                ) from cpu_runtime_error
+            cpu_fits, cpu_bytes, cpu_limit = dense_complete_solver_memory_preflight(
+                num_nodes=int(data.num_mutations),
+                num_regions=int(data.num_regions),
+                runtime=cpu_runtime,
+            )
+            if not cpu_fits:
+                raise ExactSolverResourceLimit(
+                    "exact_solver_resource_limit: dense CPU fallback needs "
+                    f"approximately {cpu_bytes} bytes (available host limit: "
+                    f"{cpu_limit})."
+                ) from resource_exc
+            if torch.is_tensor(cpu_seed):
+                cpu_start = cpu_seed.detach().to(device="cpu")
+            else:
+                cpu_start = np.asarray(cpu_seed)
+            if cpu_fallback_context is None:
+                try:
+                    cpu_fallback_context = prepare_torch_problem(
+                        data,
+                        major_prior=float(major_prior),
+                        eps=float(eps),
+                        tol=float(tol),
+                        inner_max_iter=int(inner_max_iter),
+                        graph=effective_graph,
+                        exact_pilot=cpu_start,
+                        pooled_start=cpu_start,
+                        scalar_well_starts=(),
+                        device="cpu",
+                        dtype=dtype_name(effective_runtime.dtype),
+                        objective_shape=objective_shape,
+                    )
+                except (MemoryError, torch.OutOfMemoryError) as cpu_exc:
+                    raise ExactSolverResourceLimit(
+                        "exact_solver_resource_limit: exact problem or graph "
+                        "construction exhausted host memory during dense CPU "
+                        "fallback."
+                    ) from cpu_exc
+            try:
+                artifacts = run_start(
+                    context=cpu_fallback_context,
+                    start=cpu_start,
+                    state=None,
+                    backend="dense",
+                    fallback_policy="device_only",
+                )
+            except (MemoryError, torch.OutOfMemoryError) as cpu_exc:
+                if isinstance(cpu_exc, ExactSolverResourceLimit):
+                    raise
+                raise ExactSolverResourceLimit(
+                    "exact_solver_resource_limit: dense CPU fallback exhausted "
+                    "host memory during the exact solve."
+                ) from cpu_exc
+            artifacts = merge_attempted_work(artifacts, attempted_artifacts)
+            artifacts = mark_fallback(
+                artifacts,
+                reason="dense_cpu_after_solver_resource_limit",
+                backend_name="admm_complete_graph_cpu_fallback",
+            )
         start_artifacts.append(artifacts)
         if best_artifacts is None:
             best_artifacts = artifacts

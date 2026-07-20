@@ -1,9 +1,254 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal, Mapping, TypeAlias
 
 import numpy as np
 import torch
+
+
+SmoothGradientScope: TypeAlias = Literal[
+    "mm_surrogate",
+    "observed_objective",
+]
+InnerBackend: TypeAlias = Literal["auto", "dense", "quotient_workset"]
+CertificateScope: TypeAlias = Literal["full_original_graph"]
+CertificateStatus: TypeAlias = Literal[
+    "certified",
+    "workset_incomplete",
+    "not_certified",
+    "resource_limit",
+    "dense_fallback",
+]
+DenseFallbackPolicy: TypeAlias = Literal[
+    "auto",
+    "device_only",
+    "cpu_allowed",
+    "error",
+]
+
+
+class ExactSolverResourceLimit(MemoryError):
+    """No configured exact backend can fit or fallback under its resource policy."""
+
+
+@dataclass(frozen=True, slots=True)
+class WorksetMemoryOptions:
+    max_workset_bytes: int = 256 * 1024 * 1024
+    max_compressed_cache_bytes: int = 256 * 1024 * 1024
+    dense_fallback_policy: DenseFallbackPolicy = "auto"
+    allow_heuristic_split_before_dense_fallback: bool = True
+
+    def __post_init__(self) -> None:
+        if int(self.max_workset_bytes) <= 0:
+            raise ValueError("max_workset_bytes must be positive.")
+        if int(self.max_compressed_cache_bytes) <= 0:
+            raise ValueError("max_compressed_cache_bytes must be positive.")
+
+
+@dataclass(frozen=True, slots=True)
+class CertificateOptions:
+    max_iter: int = 512
+    refinement_rounds: int = 2
+    max_expansions: int = 16
+    add_batch: int = 64
+    mapping_tolerance: float = 1e-6
+    column_tolerance: float = 1e-6
+    memory: WorksetMemoryOptions = WorksetMemoryOptions()
+
+    def __post_init__(self) -> None:
+        if int(self.max_iter) <= 0:
+            raise ValueError("certificate max_iter must be positive.")
+        if int(self.refinement_rounds) < 0:
+            raise ValueError("certificate refinement_rounds must be nonnegative.")
+        if int(self.max_expansions) <= 0:
+            raise ValueError("certificate max_expansions must be positive.")
+        if int(self.add_batch) <= 0:
+            raise ValueError("certificate add_batch must be positive.")
+        if float(self.mapping_tolerance) <= 0.0:
+            raise ValueError("certificate mapping_tolerance must be positive.")
+        if float(self.column_tolerance) <= 0.0:
+            raise ValueError("certificate column_tolerance must be positive.")
+
+
+@dataclass(frozen=True, slots=True)
+class KKTDiagnostics:
+    """Backend-neutral normalized graph-fusion KKT diagnostics."""
+
+    stationarity_residual: float
+    projected_stationarity_residual: float
+    projected_stationarity_norm: float
+    stationarity_normalizer: float
+    smooth_gradient_norm: float
+    fusion_adjustment_norm: float
+    edge_subgradient_residual: float
+    dual_ball_residual: float
+    box_primal_violation: float
+    num_interior_coordinates: int
+    num_lower_active_coordinates: int
+    num_upper_active_coordinates: int
+    num_frozen_coordinates: int
+    box_residual: float
+    kkt_residual: float
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, float | int]) -> "KKTDiagnostics":
+        return cls(
+            stationarity_residual=float(values["stationarity_residual"]),
+            projected_stationarity_residual=float(
+                values["projected_stationarity_residual"]
+            ),
+            projected_stationarity_norm=float(values["projected_stationarity_norm"]),
+            stationarity_normalizer=float(values["stationarity_normalizer"]),
+            smooth_gradient_norm=float(values["smooth_gradient_norm"]),
+            fusion_adjustment_norm=float(values["fusion_adjustment_norm"]),
+            edge_subgradient_residual=float(values["edge_subgradient_residual"]),
+            dual_ball_residual=float(values["dual_ball_residual"]),
+            box_primal_violation=float(values["box_primal_violation"]),
+            num_interior_coordinates=int(values["num_interior_coordinates"]),
+            num_lower_active_coordinates=int(values["num_lower_active_coordinates"]),
+            num_upper_active_coordinates=int(values["num_upper_active_coordinates"]),
+            num_frozen_coordinates=int(values["num_frozen_coordinates"]),
+            box_residual=float(values["box_residual"]),
+            kkt_residual=float(values["kkt_residual"]),
+        )
+
+    def as_dict(self) -> dict[str, float | int]:
+        return {
+            "stationarity_residual": self.stationarity_residual,
+            "projected_stationarity_residual": self.projected_stationarity_residual,
+            "projected_stationarity_norm": self.projected_stationarity_norm,
+            "stationarity_normalizer": self.stationarity_normalizer,
+            "smooth_gradient_norm": self.smooth_gradient_norm,
+            "fusion_adjustment_norm": self.fusion_adjustment_norm,
+            "edge_subgradient_residual": self.edge_subgradient_residual,
+            "dual_ball_residual": self.dual_ball_residual,
+            "box_primal_violation": self.box_primal_violation,
+            "num_interior_coordinates": self.num_interior_coordinates,
+            "num_lower_active_coordinates": self.num_lower_active_coordinates,
+            "num_upper_active_coordinates": self.num_upper_active_coordinates,
+            "num_frozen_coordinates": self.num_frozen_coordinates,
+            "box_residual": self.box_residual,
+            "kkt_residual": self.kkt_residual,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DenseEdgeCertificate:
+    dual: torch.Tensor
+    graph_hash: str
+    gradient_scope: SmoothGradientScope
+    certificate_scope: CertificateScope = "full_original_graph"
+
+
+@dataclass(frozen=True, slots=True)
+class CompressedEdgeCertificate:
+    labels: torch.Tensor
+    centers: torch.Tensor
+    internal_edge_ids: torch.Tensor
+    internal_dual: torch.Tensor
+    graph_hash: str
+    gradient_scope: SmoothGradientScope
+    nonfused_dual_mode: Literal["analytic_streamed"] = "analytic_streamed"
+    certificate_scope: CertificateScope = "full_original_graph"
+
+
+@dataclass(frozen=True, slots=True)
+class ImplicitGuidedCertificate:
+    labels: torch.Tensor
+    centers: torch.Tensor
+    within_flow_demand: torch.Tensor
+    lambda_value: float
+    graph_hash: str
+
+
+GraphFusionCertificate: TypeAlias = DenseEdgeCertificate | CompressedEdgeCertificate
+
+
+@dataclass(frozen=True, slots=True)
+class DenseWarmState:
+    phi: torch.Tensor
+    dual: torch.Tensor | None
+    previous_lambda: float
+    graph_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class QuotientWorksetWarmState:
+    phi: torch.Tensor
+    labels: torch.Tensor
+    centers: torch.Tensor
+    quotient_dual: torch.Tensor | None
+    internal_edge_ids: torch.Tensor
+    internal_dual: torch.Tensor
+    graph_hash: str
+    previous_lambda: float
+
+
+@dataclass(frozen=True, slots=True)
+class PrimalOnlyWarmState:
+    phi: torch.Tensor
+    structure_hint: torch.Tensor | None = None
+    structure_hint_is_heuristic: bool = True
+
+
+BackendWarmState: TypeAlias = (
+    DenseWarmState | QuotientWorksetWarmState | PrimalOnlyWarmState
+)
+
+
+@dataclass(frozen=True, slots=True)
+class BackendWorkCounters:
+    quotient_iterations: int = 0
+    workset_iterations: int = 0
+    workset_expansions: int = 0
+    streamed_edge_passes: int = 0
+    dense_iterations: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class InnerSolveResult:
+    phi: torch.Tensor
+    backend_name: str
+    warm_state: BackendWarmState
+    surrogate_certificate: GraphFusionCertificate | None
+    surrogate_kkt: KKTDiagnostics
+    converged: bool
+    inner_iterations: int
+    backend_iterations: int
+    work_counters: BackendWorkCounters
+    fallback_reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ExactFusionProvenance:
+    """Evidence used to decide fixed-objective candidate eligibility.
+
+    Solver identity and iteration counts are deliberately diagnostic.  Exact
+    eligibility is carried only by the objective/graph scopes and the normalized
+    terminal KKT certificate.
+    """
+
+    schema_version: int = 1
+    estimator_role: str = "raw_fused_lambda_path"
+    objective_faithful: bool = True
+    objective_spec_hash: str = ""
+    original_graph_hash: str = ""
+    certificate_problem_hash: str = ""
+    certificate_scope: str = "full_original_graph"
+    gradient_scope: str = "observed_objective"
+    full_kkt_certified: bool = False
+    status: str = "not_audited"
+    residual: float = float("inf")
+    tolerance: float = 0.0
+    backend_name: str = "unknown"
+    backend_iterations: int = 0
+    quotient_iterations: int = 0
+    workset_iterations: int = 0
+    workset_expansions: int = 0
+    streamed_edge_passes: int = 0
+    dense_iterations: int = 0
+    fallback_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -114,6 +359,8 @@ class FusionFitArtifacts:
     inner_iterations: int = 0
     admm_iterations: int = 0
     inner_solver: str = "unknown"
+    certificate: GraphFusionCertificate | None = None
+    exactness_provenance: ExactFusionProvenance | None = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +419,9 @@ class SolverContext:
     upper: torch.Tensor
     runtime: TorchRuntime
     data_fingerprint: str
+    graph_hash: str = ""
+    objective_spec_hash: str = ""
+    resource_fallback: str | None = None
 
 
 @dataclass(slots=True)
@@ -181,6 +431,8 @@ class SolverState:
     split: torch.Tensor | None
     curvature: torch.Tensor | None
     previous_lambda: float
+    warm_state: BackendWarmState | None = None
+    certificate: GraphFusionCertificate | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,3 +476,5 @@ class TorchFitResult:
     graph_name: str
     admm_iterations: int = 0
     inner_solver: str = "unknown"
+    certificate: GraphFusionCertificate | None = None
+    exactness_provenance: ExactFusionProvenance | None = None

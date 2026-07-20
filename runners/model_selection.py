@@ -11,6 +11,10 @@ import torch
 
 from ..core.model import FitOptions, FitResult
 from ..core.fusion.graph import build_likelihood_noise_regularized_adaptive_graph
+from ..core.fusion.graph_ops import (
+    build_likelihood_noise_regularized_adaptive_tensor_graph,
+    tensor_graph_to_pairwise_graph,
+)
 from ..core.fusion.partition_starts import (
     PartitionCandidate,
     generate_likelihood_partition_starts,
@@ -19,10 +23,20 @@ from ..core.fusion.partition_starts import (
 )
 from ..core.fusion.refit import PartitionRefitResult
 from ..core.fusion.solver import (
-    prepare_torch_problem,
+    prepare_torch_problem_with_resource_policy,
     torch_data_from_context,
 )
-from ..core.fusion.types import SolverState
+from ..core.fusion.torch_backend import dtype_name
+from ..core.fusion.types import (
+    CompressedEdgeCertificate,
+    DenseEdgeCertificate,
+    DenseWarmState,
+    ExactSolverResourceLimit,
+    PrimalOnlyWarmState,
+    QuotientWorksetWarmState,
+    SolverContext,
+    SolverState,
+)
 from ..io.data import TumorData
 from ..metrics.evaluation import (
     SimulationEvaluation,
@@ -76,7 +90,10 @@ from ..model_selection.config import (
     PARTITION_GUIDED_ADMM_MAX_SOLVER_RETRIES_PER_LAMBDA,
     PARTITION_GUIDED_ADMM_MAX_UNIQUE_LAMBDAS,
 )
-from ..model_selection.guided_fusion import build_guided_fusion_initialization
+from ..model_selection.guided_fusion import (
+    GuidedFusionInitialization,
+    build_guided_fusion_initialization,
+)
 from ..model_selection.online_lambda import (
     OnlineLambdaConfig,
     OnlineLambdaController,
@@ -98,13 +115,14 @@ from ..model_selection.scoring import (
     _ari_candidate_frame,
     _bic_selection_eligible_mask,
     _canonical_lambda,
+    _exact_fusion_certificate_mask,
     _is_bic_selection_eligible as _is_bic_selection_eligible,
     _lambda_applicable_mask,
     _lambda_range_for_optimal_rows,
     _lambda_warm_start_distance,
     _normalize_selection_score_name,
     _optimal_lambda_range,
-    _positive_admm_fusion_selection_mask,
+    _positive_exact_fusion_selection_mask,
     _prefer_fit_candidate,
     _row_bic_selection_eligible,
     _row_lambda_applicable,
@@ -217,12 +235,75 @@ def _offload_solver_state_to_cpu(state: SolverState | None) -> SolverState | Non
     if state is None:
         return None
 
-    tensors = (state.phi, state.dual, state.split, state.curvature)
-    if all(tensor is None or tensor.device.type == "cpu" for tensor in tensors):
-        return state
+    cpu_tensors: dict[
+        tuple[
+            torch.device,
+            torch.dtype,
+            torch.layout,
+            int,
+            int,
+            tuple[int, ...],
+            tuple[int, ...],
+        ],
+        torch.Tensor,
+    ] = {}
 
     def to_cpu(tensor: torch.Tensor | None) -> torch.Tensor | None:
-        return None if tensor is None else tensor.detach().to(device="cpu")
+        if tensor is None:
+            return None
+        detached = tensor.detach()
+        if detached.numel() == 0:
+            return detached.to(device="cpu")
+        alias_key = (
+            detached.device,
+            detached.dtype,
+            detached.layout,
+            int(detached.untyped_storage().data_ptr()),
+            int(detached.storage_offset()),
+            tuple(int(value) for value in detached.shape),
+            tuple(int(value) for value in detached.stride()),
+        )
+        cached = cpu_tensors.get(alias_key)
+        if cached is None:
+            cached = detached.to(device="cpu")
+            cpu_tensors[alias_key] = cached
+        return cached
+
+    warm_state = state.warm_state
+    if isinstance(warm_state, DenseWarmState):
+        warm_state = replace(
+            warm_state,
+            phi=to_cpu(warm_state.phi),
+            dual=to_cpu(warm_state.dual),
+        )
+    elif isinstance(warm_state, QuotientWorksetWarmState):
+        warm_state = replace(
+            warm_state,
+            phi=to_cpu(warm_state.phi),
+            labels=to_cpu(warm_state.labels),
+            centers=to_cpu(warm_state.centers),
+            quotient_dual=to_cpu(warm_state.quotient_dual),
+            internal_edge_ids=to_cpu(warm_state.internal_edge_ids),
+            internal_dual=to_cpu(warm_state.internal_dual),
+        )
+    elif isinstance(warm_state, PrimalOnlyWarmState):
+        warm_state = replace(
+            warm_state,
+            phi=to_cpu(warm_state.phi),
+            structure_hint=to_cpu(warm_state.structure_hint),
+        )
+
+    certificate = state.certificate
+    if isinstance(certificate, DenseEdgeCertificate):
+        certificate = replace(certificate, dual=to_cpu(certificate.dual))
+    elif isinstance(certificate, CompressedEdgeCertificate):
+        certificate = replace(
+            certificate,
+            labels=to_cpu(certificate.labels),
+            centers=to_cpu(certificate.centers),
+            internal_edge_ids=to_cpu(certificate.internal_edge_ids),
+            internal_dual=to_cpu(certificate.internal_dual),
+        )
 
     return SolverState(
         phi=to_cpu(state.phi),
@@ -230,7 +311,117 @@ def _offload_solver_state_to_cpu(state: SolverState | None) -> SolverState | Non
         split=to_cpu(state.split),
         curvature=to_cpu(state.curvature),
         previous_lambda=float(state.previous_lambda),
+        warm_state=warm_state,
+        certificate=certificate,
     )
+
+
+def _build_guided_initialization_with_resource_policy(
+    *,
+    data: TumorData,
+    guide_phi: StartArray,
+    guide_labels: np.ndarray | torch.Tensor,
+    solver_context: SolverContext,
+    fit_options: FitOptions,
+) -> tuple[GuidedFusionInitialization, SolverContext, StartArray]:
+    """Build guided state with typed allocation failure and optional CPU retry."""
+
+    fallback_policy = (
+        str(fit_options.dense_fallback_policy).strip().lower().replace("-", "_")
+    )
+    if fallback_policy not in {"auto", "device_only", "cpu_allowed", "error"}:
+        raise ValueError(
+            "dense_fallback_policy must be auto, device_only, cpu_allowed, or error."
+        )
+
+    def build(
+        *,
+        context: SolverContext,
+        phi: StartArray,
+        labels: np.ndarray | torch.Tensor,
+    ) -> GuidedFusionInitialization:
+        requested_backend = (
+            str(fit_options.inner_backend).strip().lower().replace("-", "_")
+        )
+        # The dense solver needs the guide's actual edge dual to preserve the
+        # historical one-candidate warm-start path.  A compressed guide is the
+        # right representation for quotient/workset, but feeding it to dense
+        # discards that high-quality dual and can turn one certified fit into a
+        # long recovery/search sequence.
+        materialize_dense_dual = bool(
+            fit_options.materialize_full_dual or requested_backend == "dense"
+        )
+        return build_guided_fusion_initialization(
+            phi,
+            labels,
+            solver_context=context,
+            partition_tolerance=max(float(fit_options.tol), 1e-8),
+            kkt_atol=float(fit_options.tol),
+            materialize_dense_dual=materialize_dense_dual,
+        )
+
+    try:
+        return (
+            build(context=solver_context, phi=guide_phi, labels=guide_labels),
+            solver_context,
+            guide_phi,
+        )
+    except (MemoryError, torch.OutOfMemoryError) as exc:
+        cpu_fallback_allowed = bool(
+            fallback_policy == "cpu_allowed"
+            and solver_context.runtime.device.type != "cpu"
+        )
+        if not cpu_fallback_allowed:
+            if isinstance(exc, ExactSolverResourceLimit):
+                raise
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: guided initialization exhausted "
+                f"memory on {solver_context.runtime.device_name}."
+            ) from exc
+
+        try:
+            cpu_guide_phi: StartArray = (
+                guide_phi.detach().to(device="cpu")
+                if torch.is_tensor(guide_phi)
+                else np.asarray(guide_phi)
+            )
+            cpu_guide_labels = (
+                guide_labels.detach().to(device="cpu")
+                if torch.is_tensor(guide_labels)
+                else np.asarray(guide_labels)
+            )
+            cpu_context = prepare_torch_problem_with_resource_policy(
+                data,
+                dense_fallback_policy="device_only",
+                inherited_resource_fallback="dense_cpu",
+                major_prior=float(solver_context.problem.major_prior),
+                eps=float(solver_context.problem.eps),
+                tol=float(fit_options.tol),
+                graph=solver_context.graph_spec,
+                inner_max_iter=max(int(fit_options.inner_max_iter), 16),
+                adaptive_weight_gamma=float(fit_options.adaptive_weight_gamma),
+                adaptive_weight_floor=float(fit_options.adaptive_weight_floor),
+                adaptive_weight_baseline=float(fit_options.adaptive_weight_baseline),
+                exact_pilot=cpu_guide_phi,
+                pooled_start=cpu_guide_phi,
+                scalar_well_starts=(),
+                device="cpu",
+                dtype=dtype_name(solver_context.runtime.dtype),
+                objective_shape=str(fit_options.objective_shape),
+            )
+            guided = build(
+                context=cpu_context,
+                phi=cpu_guide_phi,
+                labels=cpu_guide_labels,
+            )
+        except (MemoryError, torch.OutOfMemoryError) as cpu_exc:
+            if isinstance(cpu_exc, ExactSolverResourceLimit):
+                raise cpu_exc from exc
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: guided initialization exhausted "
+                "host memory during dense CPU fallback."
+            ) from cpu_exc
+        return guided, cpu_context, cpu_guide_phi
 
 
 def _fit_phi_start(fit: FitResult) -> StartArray:
@@ -315,17 +506,17 @@ def _assemble_selection_result(
     adaptive_search_rounds_completed,
     adaptive_refinement_rounds_completed,
     selection_start_time,
-    strict_positive_admm: bool = False,
+    strict_positive_exact_fusion: bool = False,
 ) -> BICSelectionResult:
     search_df = _annotate_bic_diagnostics(search_df)
     num_candidates = int(search_df.shape[0])
     converged_mask = search_df["converged"].astype(bool).to_numpy(dtype=bool)
     candidate_selection_eligible_mask = (
-        _positive_admm_fusion_selection_mask(search_df)
-        if strict_positive_admm
+        _positive_exact_fusion_selection_mask(search_df)
+        if strict_positive_exact_fusion
         else _bic_selection_eligible_mask(search_df)
     )
-    if strict_positive_admm:
+    if strict_positive_exact_fusion:
         search_df["bic_selection_eligible"] = candidate_selection_eligible_mask
     num_converged_candidates = int(np.sum(converged_mask))
     num_selection_eligible_candidates = int(np.sum(candidate_selection_eligible_mask))
@@ -730,12 +921,13 @@ def _partition_guided_admm_selection(
         )
 
     prepare_start_time = perf_counter()
-    pilot_context = prepare_torch_problem(
+    pilot_context = prepare_torch_problem_with_resource_policy(
         data,
+        dense_fallback_policy=str(fit_options.dense_fallback_policy),
         major_prior=float(fit_options.major_prior),
         eps=float(fit_options.eps),
         tol=float(fit_options.tol),
-        graph=fit_options.graph,
+        defer_graph=True,
         inner_max_iter=max(int(fit_options.inner_max_iter), 16),
         adaptive_weight_gamma=float(fit_options.adaptive_weight_gamma),
         adaptive_weight_floor=float(fit_options.adaptive_weight_floor),
@@ -778,11 +970,11 @@ def _partition_guided_admm_selection(
             f"No finite partition-ICL initializer was available for tumor {data.tumor_id}."
         )
 
-    guide_phi = torch.as_tensor(
-        guide.phi_start,
-        dtype=pilot_runtime.dtype,
-        device=pilot_runtime.device,
-    )
+    # Keep the partition guide host-backed for exact CPU behavior and fallback.
+    # CUDA graph construction uploads this small M x S matrix once; the O(M^2)
+    # graph itself stays device-backed and is reused by context preparation.
+    guide_phi: StartArray = np.asarray(guide.phi_start)
+    prebuilt_tensor_graph = None
     if fit_options.graph is None:
         complete_graph_degree = float(max(int(data.num_mutations) - 1, 1))
         likelihood_noise_degree_exponent = float(
@@ -791,31 +983,79 @@ def _partition_guided_admm_selection(
         likelihood_noise_divisor = float(
             complete_graph_degree**likelihood_noise_degree_exponent
         )
-        selection_graph, likelihood_noise_tau = (
-            build_likelihood_noise_regularized_adaptive_graph(
-                guide_phi.detach().cpu().numpy(),
-                guide_curvature.detach().cpu().numpy(),
-                lower=pilot_context.lower.detach().cpu().numpy(),
-                upper=pilot_context.upper.detach().cpu().numpy(),
-                gamma=float(fit_options.adaptive_weight_gamma),
-                minimum_tau=max(
-                    float(fit_options.adaptive_weight_floor), float(fit_options.eps)
-                ),
-                baseline=float(fit_options.adaptive_weight_baseline),
-                noise_divisor=likelihood_noise_divisor,
+        if pilot_runtime.device.type == "cuda":
+            try:
+                prebuilt_tensor_graph, likelihood_noise_tau = (
+                    build_likelihood_noise_regularized_adaptive_tensor_graph(
+                        torch.as_tensor(
+                            guide_phi,
+                            dtype=pilot_runtime.dtype,
+                            device=pilot_runtime.device,
+                        ),
+                        guide_curvature,
+                        pilot_runtime,
+                        lower=pilot_context.lower,
+                        upper=pilot_context.upper,
+                        gamma=float(fit_options.adaptive_weight_gamma),
+                        minimum_tau=max(
+                            float(fit_options.adaptive_weight_floor),
+                            float(fit_options.eps),
+                        ),
+                        baseline=float(fit_options.adaptive_weight_baseline),
+                        noise_divisor=likelihood_noise_divisor,
+                    )
+                )
+                selection_graph = tensor_graph_to_pairwise_graph(prebuilt_tensor_graph)
+            except (MemoryError, torch.OutOfMemoryError):
+                # The final graph may fit even if device-side adaptive
+                # temporaries do not. Preserve host construction; context
+                # preparation then applies the configured exact fallback
+                # policy while tensorizing this host spec.
+                prebuilt_tensor_graph = None
+                selection_graph, likelihood_noise_tau = (
+                    build_likelihood_noise_regularized_adaptive_graph(
+                        np.asarray(guide_phi),
+                        guide_curvature.detach().cpu().numpy(),
+                        lower=pilot_context.lower.detach().cpu().numpy(),
+                        upper=pilot_context.upper.detach().cpu().numpy(),
+                        gamma=float(fit_options.adaptive_weight_gamma),
+                        minimum_tau=max(
+                            float(fit_options.adaptive_weight_floor),
+                            float(fit_options.eps),
+                        ),
+                        baseline=float(fit_options.adaptive_weight_baseline),
+                        noise_divisor=likelihood_noise_divisor,
+                    )
+                )
+        else:
+            selection_graph, likelihood_noise_tau = (
+                build_likelihood_noise_regularized_adaptive_graph(
+                    np.asarray(guide_phi),
+                    guide_curvature.detach().cpu().numpy(),
+                    lower=pilot_context.lower.detach().cpu().numpy(),
+                    upper=pilot_context.upper.detach().cpu().numpy(),
+                    gamma=float(fit_options.adaptive_weight_gamma),
+                    minimum_tau=max(
+                        float(fit_options.adaptive_weight_floor),
+                        float(fit_options.eps),
+                    ),
+                    baseline=float(fit_options.adaptive_weight_baseline),
+                    noise_divisor=likelihood_noise_divisor,
+                )
             )
-        )
         graph_source = "partition_guide_likelihood_noise_degree_regularized"
         graph_pilot_phi: StartArray = guide_phi
     else:
-        selection_graph = pilot_context.graph_spec
+        selection_graph = fit_options.graph
         likelihood_noise_tau = float("nan")
         likelihood_noise_divisor = float("nan")
         likelihood_noise_degree_exponent = float("nan")
         graph_source = "user_supplied"
         graph_pilot_phi = pilot_phi
-    solver_context = prepare_torch_problem(
+    solver_context = prepare_torch_problem_with_resource_policy(
         data,
+        dense_fallback_policy=str(fit_options.dense_fallback_policy),
+        inherited_resource_fallback=pilot_context.resource_fallback,
         major_prior=float(fit_options.major_prior),
         eps=float(fit_options.eps),
         tol=float(fit_options.tol),
@@ -825,6 +1065,7 @@ def _partition_guided_admm_selection(
         # effectively immutable while retaining the current estimator as the
         # requested initializer.
         graph=selection_graph,
+        prebuilt_tensor_graph=prebuilt_tensor_graph,
         inner_max_iter=max(int(fit_options.inner_max_iter), 16),
         adaptive_weight_gamma=float(fit_options.adaptive_weight_gamma),
         adaptive_weight_floor=float(fit_options.adaptive_weight_floor),
@@ -838,8 +1079,6 @@ def _partition_guided_admm_selection(
         torch_data=pilot_torch_data,
         objective_shape=str(fit_options.objective_shape),
     )
-    runtime = solver_context.runtime
-    torch_data = torch_data_from_context(solver_context)
     effective_graph = solver_context.graph_spec
     effective_tensor_graph = solver_context.graph
     if not bool(effective_tensor_graph.is_complete) or int(
@@ -850,13 +1089,26 @@ def _partition_guided_admm_selection(
             "inner solver is ADMM."
         )
     effective_fit_options = replace(fit_options, graph=effective_graph)
-    guided_initialization = build_guided_fusion_initialization(
-        guide_phi,
-        guide.labels,
-        solver_context=solver_context,
-        partition_tolerance=max(float(fit_options.tol), 1e-8),
-        kkt_atol=float(fit_options.tol),
+    guided_initialization, solver_context, guide_phi = (
+        _build_guided_initialization_with_resource_policy(
+            data=data,
+            guide_phi=guide_phi,
+            guide_labels=np.asarray(guide.labels, dtype=np.int64),
+            solver_context=solver_context,
+            fit_options=effective_fit_options,
+        )
     )
+    runtime = solver_context.runtime
+    torch_data = torch_data_from_context(solver_context)
+    effective_graph = solver_context.graph_spec
+    effective_tensor_graph = solver_context.graph
+    effective_fit_options = replace(fit_options, graph=effective_graph)
+    if not bool(effective_tensor_graph.is_complete) or int(
+        effective_graph.degree_bound
+    ) != int(data.num_mutations - 1):
+        raise ValueError(
+            "partition_guided_admm CPU fallback changed the complete fusion graph."
+        )
     guided_initialization = replace(
         guided_initialization,
         solver_state=_offload_solver_state_to_cpu(guided_initialization.solver_state),
@@ -1147,10 +1399,8 @@ def _partition_guided_admm_selection(
         if _prefer_fit_candidate(fit, incumbent):
             fit_by_lambda[lambda_key] = fit
 
-        strict_raw_eligible = bool(
-            row.get("raw_kkt_eligible", False)
-            and fit.inner_solver == "admm_complete_graph"
-            and int(fit.admm_iterations) > 0
+        exact_raw_eligible = bool(
+            _exact_fusion_certificate_mask(pd.DataFrame([row]))[0]
             and bool(effective_tensor_graph.is_complete)
         )
         controller.observe(
@@ -1160,7 +1410,19 @@ def _partition_guided_admm_selection(
                 partition_signature=str(row["partition_signature"]),
                 partition_icl=float(row["partition_icl"]),
                 kkt_residual=float(row["fixed_objective_kkt_residual"]),
-                raw_kkt_eligible=bool(strict_raw_eligible),
+                exact_candidate_eligible=bool(exact_raw_eligible),
+                certificate_status=str(
+                    row.get(
+                        "full_kkt_certificate_status",
+                        fit.outer_kkt_certificate_status,
+                    )
+                ),
+                backend_name=str(row.get("inner_backend", fit.inner_solver)),
+                solver_iterations=int(
+                    row.get("backend_iterations", fit.inner_iterations)
+                ),
+                # Compatibility diagnostics for pre-provenance consumers.
+                raw_kkt_eligible=bool(row.get("raw_kkt_eligible", False)),
                 admm_iterations=int(fit.admm_iterations),
             )
         )
@@ -1193,7 +1455,7 @@ def _partition_guided_admm_selection(
         adaptive_search_rounds_completed=int(len(controller.proposal_history)),
         adaptive_refinement_rounds_completed=int(refinement_rounds),
         selection_start_time=selection_start_time,
-        strict_positive_admm=True,
+        strict_positive_exact_fusion=True,
     )
     return selection_result
 
@@ -1261,8 +1523,9 @@ def _grid_search_selection(
     likelihood_partition_pool_enabled = bool(ENABLE_LIKELIHOOD_PARTITION_CANDIDATES)
 
     prepare_start_time = perf_counter()
-    solver_context = prepare_torch_problem(
+    solver_context = prepare_torch_problem_with_resource_policy(
         data,
+        dense_fallback_policy=str(fit_options.dense_fallback_policy),
         major_prior=float(fit_options.major_prior),
         eps=float(fit_options.eps),
         tol=float(fit_options.tol),

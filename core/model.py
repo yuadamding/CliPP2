@@ -8,7 +8,12 @@ import torch
 from ..io.data import TumorData
 from .fusion.solver import fit_observed_data_pairwise_fusion
 from .fusion.torch_backend import DEFAULT_DEVICE, DEFAULT_DTYPE
-from .fusion.types import PairwiseFusionGraph, SolverContext, SolverState
+from .fusion.types import (
+    ExactFusionProvenance,
+    PairwiseFusionGraph,
+    SolverContext,
+    SolverState,
+)
 
 
 @dataclass
@@ -28,6 +33,17 @@ class FitOptions:
     summary_tol: float | None = 1e-4
     bic_partition_tol: float | None = 1e-4
     objective_shape: str = "unimodal"
+    inner_backend: str = "dense"
+    workset_max_bytes: int = 256 * 1024 * 1024
+    compressed_cache_max_bytes: int = 256 * 1024 * 1024
+    dense_fallback_policy: str = "auto"
+    workset_add_batch: int = 64
+    workset_max_expansions: int = 16
+    certificate_max_iter: int = 512
+    certificate_refinement_rounds: int = 2
+    certificate_column_tol_scale: float = 1.0
+    allow_heuristic_structure_splits: bool = True
+    materialize_full_dual: bool = False
     verbose: bool = False
 
 
@@ -50,6 +66,17 @@ class SolverOptions:
     compute_summary: bool = False
     summary_tol: float | None = 1e-4
     bic_partition_tol: float | None = 1e-4
+    inner_backend: str = "dense"
+    workset_max_bytes: int = 256 * 1024 * 1024
+    compressed_cache_max_bytes: int = 256 * 1024 * 1024
+    dense_fallback_policy: str = "auto"
+    workset_add_batch: int = 64
+    workset_max_expansions: int = 16
+    certificate_max_iter: int = 512
+    certificate_refinement_rounds: int = 2
+    certificate_column_tol_scale: float = 1.0
+    allow_heuristic_structure_splits: bool = True
+    materialize_full_dual: bool = False
     verbose: bool = False
 
     def to_fit_options(self, problem: Problem) -> FitOptions:
@@ -65,6 +92,19 @@ class SolverOptions:
             dtype=str(self.dtype),
             summary_tol=self.summary_tol,
             bic_partition_tol=self.bic_partition_tol,
+            inner_backend=str(self.inner_backend),
+            workset_max_bytes=int(self.workset_max_bytes),
+            compressed_cache_max_bytes=int(self.compressed_cache_max_bytes),
+            dense_fallback_policy=str(self.dense_fallback_policy),
+            workset_add_batch=int(self.workset_add_batch),
+            workset_max_expansions=int(self.workset_max_expansions),
+            certificate_max_iter=int(self.certificate_max_iter),
+            certificate_refinement_rounds=int(self.certificate_refinement_rounds),
+            certificate_column_tol_scale=float(self.certificate_column_tol_scale),
+            allow_heuristic_structure_splits=bool(
+                self.allow_heuristic_structure_splits
+            ),
+            materialize_full_dual=bool(self.materialize_full_dual),
             verbose=bool(self.verbose),
         )
 
@@ -89,6 +129,9 @@ class Diagnostics:
     failure_reason: str | None = None
     admm_iterations: int = 0
     inner_solver: str = "unknown"
+    full_kkt_certified: bool = False
+    certificate_scope: str = "unknown"
+    certificate_gradient_scope: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -176,7 +219,7 @@ class FitResult:
     last_reject_reason: str
     failure_reason: str
     selection_eligible: bool
-    stationarity_certified: bool = False       # True if KKT residual is below tolerance
+    stationarity_certified: bool = False  # True if KKT residual is below tolerance
     global_optimality_certified: bool = False
     global_optimality_basis: str = "none"
     number_of_starts: int = 1
@@ -193,6 +236,26 @@ class FitResult:
     inner_iterations: int = 0
     admm_iterations: int = 0
     inner_solver: str = "unknown"
+    inner_backend: str = "unknown"
+    backend_iterations: int = 0
+    quotient_iterations: int = 0
+    workset_iterations: int = 0
+    workset_expansions: int = 0
+    streamed_edge_passes: int = 0
+    dense_iterations: int = 0
+    fallback_reason: str = ""
+    exactness_provenance_version: int = 0
+    estimator_role: str = "raw_fused_lambda_path"
+    objective_faithful: bool = False
+    objective_spec_hash: str = ""
+    original_graph_hash: str = ""
+    certificate_problem_hash: str = ""
+    certificate_scope: str = "unknown"
+    certificate_gradient_scope: str = "unknown"
+    full_kkt_certified: bool = False
+    full_kkt_certificate_status: str = "not_audited"
+    full_kkt_tolerance: float = 0.0
+    exactness_provenance: ExactFusionProvenance | None = None
 
     @property
     def estimate(self) -> Estimate:
@@ -216,6 +279,9 @@ class FitResult:
             failure_reason=str(self.failure_reason or ""),
             admm_iterations=int(self.admm_iterations),
             inner_solver=str(self.inner_solver),
+            full_kkt_certified=bool(self.full_kkt_certified),
+            certificate_scope=str(self.certificate_scope),
+            certificate_gradient_scope=str(self.certificate_gradient_scope),
         )
 
     @property
@@ -267,6 +333,16 @@ def fit_fixed_objective(
         dtype=str(options.dtype),
         summary_tol=options.summary_tol,
         objective_shape=str(options.objective_shape),
+        inner_backend=str(options.inner_backend),
+        workset_max_bytes=int(options.workset_max_bytes),
+        compressed_cache_max_bytes=int(options.compressed_cache_max_bytes),
+        dense_fallback_policy=str(options.dense_fallback_policy),
+        workset_add_batch=int(options.workset_add_batch),
+        workset_max_expansions=int(options.workset_max_expansions),
+        certificate_max_iter=int(options.certificate_max_iter),
+        certificate_refinement_rounds=int(options.certificate_refinement_rounds),
+        certificate_column_tol_scale=float(options.certificate_column_tol_scale),
+        allow_heuristic_structure_splits=bool(options.allow_heuristic_structure_splits),
         runtime=runtime,
         torch_data=torch_data,
         solver_context=solver_context,
@@ -274,6 +350,7 @@ def fit_fixed_objective(
         compute_summary=bool(compute_summary),
         verbose=bool(options.verbose),
     )
+    provenance = artifacts.exactness_provenance
     return FitResult(
         phi=artifacts.phi,
         phi_clustered=artifacts.phi_clustered,
@@ -286,7 +363,9 @@ def fit_fixed_objective(
         major_probability=artifacts.major_probability,
         major_call=artifacts.major_call.astype(bool, copy=False),
         multiplicity_call=artifacts.multiplicity_call,
-        multiplicity_estimated_mask=artifacts.multiplicity_estimated_mask.astype(bool, copy=False),
+        multiplicity_estimated_mask=artifacts.multiplicity_estimated_mask.astype(
+            bool, copy=False
+        ),
         loglik=float(artifacts.loglik),
         summary_loglik=float(artifacts.summary_loglik),
         penalized_objective=float(artifacts.penalized_objective),
@@ -301,8 +380,12 @@ def fit_fixed_objective(
         summary_available=bool(compute_summary),
         inner_kkt_residual=float(artifacts.inner_kkt_residual),
         accepted_inner_kkt_residual=float(artifacts.accepted_inner_kkt_residual),
-        last_attempted_inner_kkt_residual=float(artifacts.last_attempted_inner_kkt_residual),
-        best_attempted_inner_kkt_residual=float(artifacts.best_attempted_inner_kkt_residual),
+        last_attempted_inner_kkt_residual=float(
+            artifacts.last_attempted_inner_kkt_residual
+        ),
+        best_attempted_inner_kkt_residual=float(
+            artifacts.best_attempted_inner_kkt_residual
+        ),
         last_attempted_objective_gap=float(artifacts.last_attempted_objective_gap),
         best_attempted_objective_gap=float(artifacts.best_attempted_objective_gap),
         last_attempted_surrogate_gap=float(artifacts.last_attempted_surrogate_gap),
@@ -312,17 +395,27 @@ def fit_fixed_objective(
         last_attempted_em_envelope_gap=float(artifacts.last_attempted_em_envelope_gap),
         best_attempted_em_envelope_gap=float(artifacts.best_attempted_em_envelope_gap),
         outer_stationarity_residual=float(artifacts.outer_stationarity_residual),
-        outer_projected_stationarity_residual=float(artifacts.outer_projected_stationarity_residual),
-        outer_projected_stationarity_norm=float(artifacts.outer_projected_stationarity_norm),
+        outer_projected_stationarity_residual=float(
+            artifacts.outer_projected_stationarity_residual
+        ),
+        outer_projected_stationarity_norm=float(
+            artifacts.outer_projected_stationarity_norm
+        ),
         outer_stationarity_normalizer=float(artifacts.outer_stationarity_normalizer),
         outer_smooth_gradient_norm=float(artifacts.outer_smooth_gradient_norm),
         outer_fusion_adjustment_norm=float(artifacts.outer_fusion_adjustment_norm),
-        outer_edge_subgradient_residual=float(artifacts.outer_edge_subgradient_residual),
+        outer_edge_subgradient_residual=float(
+            artifacts.outer_edge_subgradient_residual
+        ),
         outer_dual_ball_residual=float(artifacts.outer_dual_ball_residual),
         outer_box_primal_violation=float(artifacts.outer_box_primal_violation),
         outer_num_interior_coordinates=int(artifacts.outer_num_interior_coordinates),
-        outer_num_lower_active_coordinates=int(artifacts.outer_num_lower_active_coordinates),
-        outer_num_upper_active_coordinates=int(artifacts.outer_num_upper_active_coordinates),
+        outer_num_lower_active_coordinates=int(
+            artifacts.outer_num_lower_active_coordinates
+        ),
+        outer_num_upper_active_coordinates=int(
+            artifacts.outer_num_upper_active_coordinates
+        ),
         outer_num_frozen_coordinates=int(artifacts.outer_num_frozen_coordinates),
         outer_box_residual=float(artifacts.outer_box_residual),
         fixed_objective_kkt_residual=float(artifacts.fixed_objective_kkt_residual),
@@ -330,11 +423,17 @@ def fit_fixed_objective(
         outer_kkt_dual_refined=bool(artifacts.outer_kkt_dual_refined),
         outer_kkt_fused_edges=int(artifacts.outer_kkt_fused_edges),
         outer_kkt_nonzero_edges=int(artifacts.outer_kkt_nonzero_edges),
-        outer_stationarity_residual_before_dual_refine=float(artifacts.outer_stationarity_residual_before_dual_refine),
-        outer_stationarity_residual_after_dual_refine=float(artifacts.outer_stationarity_residual_after_dual_refine),
+        outer_stationarity_residual_before_dual_refine=float(
+            artifacts.outer_stationarity_residual_before_dual_refine
+        ),
+        outer_stationarity_residual_after_dual_refine=float(
+            artifacts.outer_stationarity_residual_after_dual_refine
+        ),
         converged_inner=bool(artifacts.converged_inner),
         converged_outer=bool(artifacts.converged_outer),
-        final_relative_objective_change=float(artifacts.final_relative_objective_change),
+        final_relative_objective_change=float(
+            artifacts.final_relative_objective_change
+        ),
         final_step_residual=float(artifacts.final_step_residual),
         accepted_outer_steps=int(artifacts.accepted_outer_steps),
         accepted_full_steps=int(artifacts.accepted_full_steps),
@@ -356,7 +455,9 @@ def fit_fixed_objective(
         global_optimality_certified=bool(
             getattr(artifacts, "global_optimality_certified", False)
         ),
-        global_optimality_basis=str(getattr(artifacts, "global_optimality_basis", "none")),
+        global_optimality_basis=str(
+            getattr(artifacts, "global_optimality_basis", "none")
+        ),
         number_of_starts=int(getattr(artifacts, "number_of_starts", 1)),
         number_of_finite_starts=int(getattr(artifacts, "number_of_finite_starts", 1)),
         best_start_objective=float(
@@ -368,12 +469,78 @@ def fit_fixed_objective(
         objective_spread_across_starts=float(
             getattr(artifacts, "objective_spread_across_starts", float("nan"))
         ),
-        selected_start_objective_rank=int(getattr(artifacts, "selected_start_objective_rank", 1)),
+        selected_start_objective_rank=int(
+            getattr(artifacts, "selected_start_objective_rank", 1)
+        ),
         history=list(artifacts.history),
         solver_state=artifacts.solver_state,
         inner_iterations=int(getattr(artifacts, "inner_iterations", 0)),
         admm_iterations=int(getattr(artifacts, "admm_iterations", 0)),
         inner_solver=str(getattr(artifacts, "inner_solver", "unknown")),
+        inner_backend=str(
+            provenance.backend_name
+            if provenance is not None
+            else getattr(artifacts, "inner_solver", "unknown")
+        ),
+        backend_iterations=int(
+            provenance.backend_iterations
+            if provenance is not None
+            else getattr(artifacts, "inner_iterations", 0)
+        ),
+        quotient_iterations=int(
+            provenance.quotient_iterations if provenance is not None else 0
+        ),
+        workset_iterations=int(
+            provenance.workset_iterations if provenance is not None else 0
+        ),
+        workset_expansions=int(
+            provenance.workset_expansions if provenance is not None else 0
+        ),
+        streamed_edge_passes=int(
+            provenance.streamed_edge_passes if provenance is not None else 0
+        ),
+        dense_iterations=int(
+            provenance.dense_iterations if provenance is not None else 0
+        ),
+        fallback_reason=str(
+            provenance.fallback_reason if provenance is not None else ""
+        ),
+        exactness_provenance_version=int(
+            provenance.schema_version if provenance is not None else 0
+        ),
+        estimator_role=str(
+            provenance.estimator_role
+            if provenance is not None
+            else "raw_fused_lambda_path"
+        ),
+        objective_faithful=bool(
+            provenance.objective_faithful if provenance is not None else False
+        ),
+        objective_spec_hash=str(
+            provenance.objective_spec_hash if provenance is not None else ""
+        ),
+        original_graph_hash=str(
+            provenance.original_graph_hash if provenance is not None else ""
+        ),
+        certificate_problem_hash=str(
+            provenance.certificate_problem_hash if provenance is not None else ""
+        ),
+        certificate_scope=str(
+            provenance.certificate_scope if provenance is not None else "unknown"
+        ),
+        certificate_gradient_scope=str(
+            provenance.gradient_scope if provenance is not None else "unknown"
+        ),
+        full_kkt_certified=bool(
+            provenance.full_kkt_certified if provenance is not None else False
+        ),
+        full_kkt_certificate_status=str(
+            provenance.status if provenance is not None else "not_audited"
+        ),
+        full_kkt_tolerance=float(
+            provenance.tolerance if provenance is not None else 0.0
+        ),
+        exactness_provenance=provenance,
     )
 
 

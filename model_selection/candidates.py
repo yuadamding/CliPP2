@@ -7,7 +7,10 @@ from time import perf_counter
 import numpy as np
 
 from ..core.model import FitOptions, FitResult, fit_fixed_objective
-from ..core.fusion.partition_starts import PartitionCandidate
+from ..core.fusion.partition_starts import (
+    PartitionCandidate,
+    partition_constrained_observed_refit_torch,
+)
 from ..core.fusion.refit import (
     PartitionRefitResult,
     partition_constrained_observed_refit,
@@ -137,15 +140,37 @@ def _evaluate_candidate(
         bic_refit_elapsed_seconds = 0.0
     else:
         bic_refit_start_time = perf_counter()
-        bic_refit = partition_constrained_observed_refit(
-            data,
-            bic_labels,
-            major_prior=float(effective_fit_options.major_prior),
-            eps=float(effective_fit_options.eps),
-            tol=float(effective_fit_options.tol),
-            max_iter=max(int(effective_fit_options.inner_max_iter), 32),
-            hint_phi=fit.phi,
+        use_cuda_refit = bool(
+            getattr(runtime, "device", None) is not None
+            and runtime.device.type == "cuda"
+            and str(effective_fit_options.objective_shape)
+            .strip()
+            .lower()
+            .startswith("unimodal")
         )
+        if use_cuda_refit:
+            bic_refit = partition_constrained_observed_refit_torch(
+                data,
+                bic_labels,
+                major_prior=float(effective_fit_options.major_prior),
+                eps=float(effective_fit_options.eps),
+                tol=float(effective_fit_options.tol),
+                max_iter=max(int(effective_fit_options.inner_max_iter), 32),
+                hint_phi=fit.phi,
+                torch_data=torch_data,
+                device=runtime.device,
+                dtype=runtime.dtype,
+            )
+        else:
+            bic_refit = partition_constrained_observed_refit(
+                data,
+                bic_labels,
+                major_prior=float(effective_fit_options.major_prior),
+                eps=float(effective_fit_options.eps),
+                tol=float(effective_fit_options.tol),
+                max_iter=max(int(effective_fit_options.inner_max_iter), 32),
+                hint_phi=fit.phi,
+            )
         bic_refit_elapsed_seconds = float(perf_counter() - bic_refit_start_time)
         if bic_refit_cache is not None:
             bic_refit_cache[partition_hash] = bic_refit
@@ -388,6 +413,25 @@ def _evaluate_candidate(
         "inner_iterations": int(fit.inner_iterations),
         "admm_iterations": int(fit.admm_iterations),
         "inner_solver": str(fit.inner_solver),
+        "inner_backend": str(fit.inner_backend),
+        "backend_iterations": int(fit.backend_iterations),
+        "quotient_iterations": int(fit.quotient_iterations),
+        "workset_iterations": int(fit.workset_iterations),
+        "workset_expansions": int(fit.workset_expansions),
+        "streamed_edge_passes": int(fit.streamed_edge_passes),
+        "dense_iterations": int(fit.dense_iterations),
+        "fallback_reason": str(fit.fallback_reason),
+        "exactness_provenance_version": int(fit.exactness_provenance_version),
+        "estimator_role": str(fit.estimator_role),
+        "objective_faithful": bool(fit.objective_faithful),
+        "objective_spec_hash": str(fit.objective_spec_hash),
+        "original_graph_hash": str(fit.original_graph_hash),
+        "certificate_problem_hash": str(fit.certificate_problem_hash),
+        "certificate_scope": str(fit.certificate_scope),
+        "certificate_gradient_scope": str(fit.certificate_gradient_scope),
+        "full_kkt_certified": bool(fit.full_kkt_certified),
+        "full_kkt_certificate_status": str(fit.full_kkt_certificate_status),
+        "full_kkt_tolerance": float(fit.full_kkt_tolerance),
         "inner_kkt_residual": float(fit.inner_kkt_residual),
         "accepted_inner_kkt_residual": float(fit.accepted_inner_kkt_residual),
         "last_attempted_inner_kkt_residual": float(
@@ -918,6 +962,28 @@ def _evaluate_partition_candidate(
         "converged_inner": bool(finite_candidate_found),
         "converged_outer": bool(finite_candidate_found),
         "iterations": 0,
+        "inner_iterations": 0,
+        "admm_iterations": 0,
+        "inner_solver": "not_applicable_partition_candidate",
+        "inner_backend": "not_applicable_partition_candidate",
+        "backend_iterations": 0,
+        "quotient_iterations": 0,
+        "workset_iterations": 0,
+        "workset_expansions": 0,
+        "streamed_edge_passes": 0,
+        "dense_iterations": 0,
+        "fallback_reason": "",
+        "exactness_provenance_version": 1,
+        "estimator_role": "partition_refit_candidate",
+        "objective_faithful": False,
+        "objective_spec_hash": "",
+        "original_graph_hash": "",
+        "certificate_problem_hash": "",
+        "certificate_scope": "not_applicable",
+        "certificate_gradient_scope": "not_applicable",
+        "full_kkt_certified": False,
+        "full_kkt_certificate_status": "not_applicable_partition_candidate",
+        "full_kkt_tolerance": 0.0,
         "inner_kkt_residual": np.nan,
         "accepted_inner_kkt_residual": np.nan,
         "last_attempted_inner_kkt_residual": np.nan,

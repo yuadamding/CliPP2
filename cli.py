@@ -68,7 +68,9 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         default=30,
         help="Maximum inner convex-solver iterations.",
     )
-    parser.add_argument("--tol", type=float, default=1e-4, help="Optimization tolerance.")
+    parser.add_argument(
+        "--tol", type=float, default=1e-4, help="Optimization tolerance."
+    )
     parser.add_argument(
         "--summary-tol",
         type=float,
@@ -81,8 +83,17 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         default=1e-4,
         help="Explicit fusion tolerance used to extract partitions for partition-refit BIC.",
     )
-    parser.add_argument("--disable-warm-start", action="store_true", help="Disable lambda-path warm starts.")
-    parser.add_argument("--major-prior", type=float, default=0.5, help="Prior probability assigned to major-copy multiplicity.")
+    parser.add_argument(
+        "--disable-warm-start",
+        action="store_true",
+        help="Disable lambda-path warm starts.",
+    )
+    parser.add_argument(
+        "--major-prior",
+        type=float,
+        default=0.5,
+        help="Prior probability assigned to major-copy multiplicity.",
+    )
     parser.add_argument(
         "--selection-score",
         choices=list(SELECTION_SCORE_NAMES),
@@ -117,18 +128,64 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         help="Numeric dtype for Torch execution. Float64 is the default for BIC model selection; float16 requires CUDA.",
     )
     parser.add_argument(
+        "--inner-backend",
+        choices=["auto", "dense", "quotient-workset"],
+        default="dense",
+        help=(
+            "Inner fusion backend. Quotient-workset remains opt-in; auto may "
+            "fall back to the dense exact solver when compression is not useful."
+        ),
+    )
+    parser.add_argument("--workset-max-bytes", type=int, default=256 * 1024 * 1024)
+    parser.add_argument(
+        "--compressed-cache-max-bytes", type=int, default=256 * 1024 * 1024
+    )
+    parser.add_argument(
+        "--dense-fallback-policy",
+        choices=["auto", "device-only", "cpu-allowed", "error"],
+        default="auto",
+    )
+    parser.add_argument("--workset-add-batch", type=int, default=64)
+    parser.add_argument("--workset-max-expansions", type=int, default=16)
+    parser.add_argument("--certificate-max-iter", type=int, default=512)
+    parser.add_argument("--certificate-refinement-rounds", type=int, default=2)
+    parser.add_argument("--certificate-column-tol-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--allow-heuristic-structure-splits",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--materialize-full-dual",
+        action="store_true",
+        help=(
+            "Debugging option: materialize the guided E-by-S dual after a dense "
+            "memory preflight. The default keeps guided state compressed."
+        ),
+    )
+    parser.add_argument(
         "--missing-cna-policy",
         choices=["error", "all_true"],
         default="error",
         help="Behavior when neither has_cna nor cna_observed is present in an input TSV.",
     )
-    parser.add_argument("--verbose", action="store_true", help="Print optimizer progress.")
+    parser.add_argument(
+        "--verbose", action="store_true", help="Print optimizer progress."
+    )
 
 
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--input-dir", default="CliPP2Sim_TSV", help="Directory with per-tumor TSV files.")
-    parser.add_argument("--input-file", default=None, help="Optional single tumor TSV file.")
-    parser.add_argument("--outdir", default="multi_region_clipp_results", help="Output directory.")
+    parser.add_argument(
+        "--input-dir",
+        default="CliPP2Sim_TSV",
+        help="Directory with per-tumor TSV files.",
+    )
+    parser.add_argument(
+        "--input-file", default=None, help="Optional single tumor TSV file."
+    )
+    parser.add_argument(
+        "--outdir", default="multi_region_clipp_results", help="Output directory."
+    )
     parser.add_argument(
         "--simulation-root",
         default=None,
@@ -141,8 +198,18 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Skip per-tumor mutation/cluster/lambda files.",
     )
-    parser.add_argument("--workers", type=int, default=1, help="Process-level parallelism for directory runs.")
-    parser.add_argument("--max-files", type=int, default=None, help="Optional cap on the number of files processed.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Process-level parallelism for directory runs.",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="Optional cap on the number of files processed.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -153,7 +220,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    fit_parser = subparsers.add_parser("fit", help="Fit TSV files with certified BIC model selection.")
+    fit_parser = subparsers.add_parser(
+        "fit", help="Fit TSV files with certified BIC model selection."
+    )
     _add_fit_args(fit_parser)
     return parser
 
@@ -169,6 +238,17 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         major_prior=args.major_prior,
         device=_resolve_effective_device(args.device),
         dtype=args.dtype,
+        inner_backend=args.inner_backend,
+        workset_max_bytes=args.workset_max_bytes,
+        compressed_cache_max_bytes=args.compressed_cache_max_bytes,
+        dense_fallback_policy=args.dense_fallback_policy,
+        workset_add_batch=args.workset_add_batch,
+        workset_max_expansions=args.workset_max_expansions,
+        certificate_max_iter=args.certificate_max_iter,
+        certificate_refinement_rounds=args.certificate_refinement_rounds,
+        certificate_column_tol_scale=args.certificate_column_tol_scale,
+        allow_heuristic_structure_splits=args.allow_heuristic_structure_splits,
+        materialize_full_dual=args.materialize_full_dual,
         verbose=args.verbose,
     )
 
@@ -181,7 +261,9 @@ def _run_fit(args: argparse.Namespace) -> None:
         summary = process_one_file(
             file_path=Path(args.input_file),
             outdir=Path(args.outdir),
-            simulation_root=Path(args.simulation_root) if args.simulation_root else None,
+            simulation_root=Path(args.simulation_root)
+            if args.simulation_root
+            else None,
             lambda_grid=lambda_grid,
             lambda_grid_mode=args.lambda_grid_mode,
             fit_options=fit_options,
