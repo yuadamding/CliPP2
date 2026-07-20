@@ -343,11 +343,6 @@ def _adaptive_score_column(normalized_score: str) -> str:
     raise ValueError(f"Unknown normalized selection score: {normalized_score}")
 
 
-def _score_maximized(normalized_score: str) -> bool:
-    del normalized_score
-    return False
-
-
 def _adaptive_first_pass_options(base_options: FitOptions) -> FitOptions:
     return replace(
         base_options,
@@ -360,14 +355,10 @@ def _adaptive_first_pass_options(base_options: FitOptions) -> FitOptions:
     )
 
 
-def _score_strictly_better(
-    score: float, reference: float, *, normalized_score: str
-) -> bool:
+def _score_strictly_better(score: float, reference: float) -> bool:
     if not np.isfinite(score) or not np.isfinite(reference):
         return False
     margin = 1e-8 * (1.0 + abs(float(reference)))
-    if _score_maximized(normalized_score):
-        return bool(float(score) > float(reference) + margin)
     return bool(float(score) < float(reference) - margin)
 
 
@@ -581,10 +572,7 @@ def _adaptive_interval_proposal_records(
     score_column = _adaptive_score_column(normalized_score)
     finite_scores = path_df[score_column].to_numpy(dtype=float)
     finite_scores = finite_scores[np.isfinite(finite_scores)]
-    if _score_maximized(normalized_score):
-        best_score = float(np.max(finite_scores) if finite_scores.size else np.nan)
-    else:
-        best_score = float(np.min(finite_scores) if finite_scores.size else np.nan)
+    best_score = float(np.min(finite_scores) if finite_scores.size else np.nan)
     intervals: list[_AdaptiveIntervalProposal] = []
     for idx in range(path_df.shape[0] - 1):
         left = path_df.iloc[idx]
@@ -623,10 +611,7 @@ def _adaptive_interval_proposal_records(
             left_score = float(left.get(score_column, np.nan))
             right_score = float(right.get(score_column, np.nan))
             score_window = max(1.0, abs(best_score) * 1e-5)
-            if _score_maximized(normalized_score):
-                near_best = max(left_score, right_score) >= best_score - score_window
-            else:
-                near_best = min(left_score, right_score) <= best_score + score_window
+            near_best = min(left_score, right_score) <= best_score + score_window
             score_focus = 1.0 if near_best else 0.0
         near_kkt_tol = float(max(20.0 * float(tol), 2e-3))
         left_ok = _row_bic_selection_eligible(left)
@@ -726,26 +711,6 @@ def _adaptive_interval_proposal_records(
         if len(proposals) >= max_new:
             break
     return proposals
-
-
-def _adaptive_interval_proposals(
-    search_df: pd.DataFrame,
-    *,
-    normalized_score: str,
-    tol: float,
-    max_new: int,
-    partition_labels_by_candidate_id: dict[int, np.ndarray] | None = None,
-) -> list[float]:
-    return [
-        float(proposal.lambda_value)
-        for proposal in _adaptive_interval_proposal_records(
-            search_df,
-            normalized_score=normalized_score,
-            tol=tol,
-            max_new=max_new,
-            partition_labels_by_candidate_id=partition_labels_by_candidate_id,
-        )
-    ]
 
 
 def _selected_lambda_signature_interval(

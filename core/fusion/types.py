@@ -415,8 +415,6 @@ class TensorProblem:
     b_fixed: torch.Tensor
     eps: float
     major_prior: float
-    log_prior_minor: torch.Tensor
-    log_prior_major: torch.Tensor
     count_observed: torch.Tensor | None = None
 
 
@@ -428,7 +426,6 @@ class TensorFusionGraph:
     pdhg_tau_node: torch.Tensor
     num_nodes: int
     is_complete: bool
-    is_uniform: bool
     name: str
 
     @property

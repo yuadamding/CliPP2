@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from pathlib import Path
 from time import perf_counter
 
 import numpy as np
@@ -54,6 +53,82 @@ from ..core.bic import (
 )
 
 
+def _evaluate_simulation_metrics(
+    *,
+    data: TumorData,
+    fit: FitResult,
+    artifact: SelectionArtifact,
+    simulation_truth: SimulationTruth | None,
+    enabled: bool,
+) -> tuple[SimulationEvaluation | None, dict[str, float | int], float]:
+    metrics: dict[str, float | int] = {
+        "ARI": np.nan,
+        "cp_rmse": np.nan,
+        "raw_cp_rmse": np.nan,
+        "summary_cp_rmse": np.nan,
+        "bic_refit_cp_rmse": np.nan,
+        "multiplicity_f1": np.nan,
+        "multiplicity_asymmetric_f1": np.nan,
+        "multiplicity_estimable_f1": np.nan,
+        "estimated_clonal_fraction": np.nan,
+        "true_clonal_fraction": np.nan,
+        "clonal_fraction_error": np.nan,
+        "estimated_clusters": np.nan,
+        "true_clusters": np.nan,
+        "n_eval_mutations": np.nan,
+        "n_filtered_mutations": np.nan,
+    }
+    if not enabled or simulation_truth is None:
+        return None, metrics, 0.0
+
+    start_time = perf_counter()
+    evaluation = evaluate_fit_against_simulation(
+        fit=fit,
+        data=data,
+        simulation_truth=simulation_truth,
+        bic_refit_phi=artifact.bic_refit_phi,
+        bic_partition_labels=artifact.bic_partition_labels,
+    )
+    metrics.update(
+        {
+            "ARI": float(evaluation.ari),
+            "cp_rmse": float(evaluation.cp_rmse),
+            "raw_cp_rmse": float(
+                evaluation.raw_cp_rmse if evaluation.raw_cp_rmse is not None else np.nan
+            ),
+            "summary_cp_rmse": float(
+                evaluation.summary_cp_rmse
+                if evaluation.summary_cp_rmse is not None
+                else evaluation.cp_rmse
+            ),
+            "bic_refit_cp_rmse": float(
+                evaluation.bic_refit_cp_rmse
+                if evaluation.bic_refit_cp_rmse is not None
+                else np.nan
+            ),
+            "multiplicity_f1": float(evaluation.multiplicity_f1),
+            "multiplicity_asymmetric_f1": float(
+                evaluation.multiplicity_f1
+                if evaluation.multiplicity_asymmetric_f1 is None
+                else evaluation.multiplicity_asymmetric_f1
+            ),
+            "multiplicity_estimable_f1": float(
+                np.nan
+                if evaluation.multiplicity_estimable_f1 is None
+                else evaluation.multiplicity_estimable_f1
+            ),
+            "estimated_clonal_fraction": float(evaluation.estimated_clonal_fraction),
+            "true_clonal_fraction": float(evaluation.true_clonal_fraction),
+            "clonal_fraction_error": float(evaluation.clonal_fraction_error),
+            "estimated_clusters": int(evaluation.estimated_clusters),
+            "true_clusters": int(evaluation.true_clusters),
+            "n_eval_mutations": int(evaluation.n_eval_mutations),
+            "n_filtered_mutations": int(evaluation.n_filtered_mutations),
+        }
+    )
+    return evaluation, metrics, float(perf_counter() - start_time)
+
+
 def _evaluate_candidate(
     *,
     data: TumorData,
@@ -61,7 +136,6 @@ def _evaluate_candidate(
     candidate_fit_options: FitOptions | None,
     bic_df_scale: float,
     bic_cluster_penalty: float,
-    simulation_root: Path | None,
     simulation_truth: SimulationTruth | None,
     evaluate_candidate: bool,
     phi_start: StartArray | None,
@@ -79,8 +153,8 @@ def _evaluate_candidate(
     selection_step: int,
     lambda_value: float,
     selection_score: str,
+    static_metadata: CandidateStaticMetadata,
     bic_refit_cache: dict[str, PartitionRefitResult] | None = None,
-    static_metadata: CandidateStaticMetadata | None = None,
 ) -> tuple[
     FitResult,
     SimulationEvaluation | None,
@@ -114,10 +188,6 @@ def _evaluate_candidate(
         raise RuntimeError(
             "Model-selection candidates require a resolved pairwise-fusion graph."
         )
-    # Callers always supply static_metadata; the old `else` fallback referenced a
-    # name that isn't imported here (a latent NameError), so assert instead.
-    assert static_metadata is not None, "static_metadata must be provided by the caller"
-    candidate_static = static_metadata
     bic_labels = cluster_labels_from_edges(
         fit.phi,
         edge_u=graph.edge_u,
@@ -257,66 +327,15 @@ def _evaluate_candidate(
         bic_refit_finite_candidate_found=bic_refit_finite_candidate_found,
     )
 
-    evaluation = None
-    ari_value = np.nan
-    cp_rmse_value = np.nan
-    raw_cp_rmse_value = np.nan
-    summary_cp_rmse_value = np.nan
-    bic_refit_cp_rmse_value = np.nan
-    multiplicity_f1_value = np.nan
-    multiplicity_asymmetric_f1_value = np.nan
-    multiplicity_estimable_f1_value = np.nan
-    estimated_clonal_fraction_value = np.nan
-    true_clonal_fraction_value = np.nan
-    clonal_fraction_error_value = np.nan
-    estimated_clusters_value = np.nan
-    true_clusters_value = np.nan
-    n_eval_mutations_value = np.nan
-    n_filtered_mutations_value = np.nan
-    evaluation_elapsed_seconds = 0.0
-    if evaluate_candidate and simulation_truth is not None:
-        evaluation_start_time = perf_counter()
-        evaluation = evaluate_fit_against_simulation(
-            fit=fit,
+    evaluation, evaluation_metrics, evaluation_elapsed_seconds = (
+        _evaluate_simulation_metrics(
             data=data,
+            fit=fit,
+            artifact=artifact,
             simulation_truth=simulation_truth,
-            bic_refit_phi=artifact.bic_refit_phi,
-            bic_partition_labels=artifact.bic_partition_labels,
+            enabled=evaluate_candidate,
         )
-        ari_value = float(evaluation.ari)
-        cp_rmse_value = float(evaluation.cp_rmse)
-        raw_cp_rmse_value = float(
-            evaluation.raw_cp_rmse if evaluation.raw_cp_rmse is not None else np.nan
-        )
-        summary_cp_rmse_value = float(
-            evaluation.summary_cp_rmse
-            if evaluation.summary_cp_rmse is not None
-            else evaluation.cp_rmse
-        )
-        bic_refit_cp_rmse_value = float(
-            evaluation.bic_refit_cp_rmse
-            if evaluation.bic_refit_cp_rmse is not None
-            else np.nan
-        )
-        multiplicity_f1_value = float(evaluation.multiplicity_f1)
-        multiplicity_asymmetric_f1_value = float(
-            evaluation.multiplicity_f1
-            if evaluation.multiplicity_asymmetric_f1 is None
-            else evaluation.multiplicity_asymmetric_f1
-        )
-        multiplicity_estimable_f1_value = float(
-            np.nan
-            if evaluation.multiplicity_estimable_f1 is None
-            else evaluation.multiplicity_estimable_f1
-        )
-        estimated_clonal_fraction_value = float(evaluation.estimated_clonal_fraction)
-        true_clonal_fraction_value = float(evaluation.true_clonal_fraction)
-        clonal_fraction_error_value = float(evaluation.clonal_fraction_error)
-        estimated_clusters_value = int(evaluation.estimated_clusters)
-        true_clusters_value = int(evaluation.true_clusters)
-        n_eval_mutations_value = int(evaluation.n_eval_mutations)
-        n_filtered_mutations_value = int(evaluation.n_filtered_mutations)
-        evaluation_elapsed_seconds = float(perf_counter() - evaluation_start_time)
+    )
 
     candidate_elapsed_seconds = float(perf_counter() - candidate_start_time)
 
@@ -525,37 +544,23 @@ def _evaluate_candidate(
         "eps": float(effective_fit_options.eps),
         "major_prior": float(effective_fit_options.major_prior),
         "graph_name": str(fit.graph_name),
-        "num_edges": int(candidate_static.edge_count),
-        "edge_weight_min": float(candidate_static.edge_weight_min),
-        "edge_weight_max": float(candidate_static.edge_weight_max),
-        "edge_weight_mean": float(candidate_static.edge_weight_mean),
+        "num_edges": int(static_metadata.edge_count),
+        "edge_weight_min": float(static_metadata.edge_weight_min),
+        "edge_weight_max": float(static_metadata.edge_weight_max),
+        "edge_weight_mean": float(static_metadata.edge_weight_mean),
         "adaptive_weight_gamma": float(effective_fit_options.adaptive_weight_gamma),
         "adaptive_weight_floor": float(effective_fit_options.adaptive_weight_floor),
         "adaptive_weight_baseline": float(
             effective_fit_options.adaptive_weight_baseline
         ),
-        "edge_list_hash": str(candidate_static.edge_list_hash),
-        "pilot_matrix_hash": str(candidate_static.pilot_matrix_hash),
-        "input_data_hash": str(candidate_static.input_data_hash),
+        "edge_list_hash": str(static_metadata.edge_list_hash),
+        "pilot_matrix_hash": str(static_metadata.pilot_matrix_hash),
+        "input_data_hash": str(static_metadata.input_data_hash),
         "evaluation_mode": ("full" if evaluation is not None else "not_evaluated"),
         "fit_compute_summary": bool(compute_summary),
         "fit_start_mode": str(start_mode),
         "solver_state_warm_start": bool(solver_state is not None),
-        "ARI": ari_value,
-        "cp_rmse": cp_rmse_value,
-        "raw_cp_rmse": raw_cp_rmse_value,
-        "summary_cp_rmse": summary_cp_rmse_value,
-        "bic_refit_cp_rmse": bic_refit_cp_rmse_value,
-        "multiplicity_f1": multiplicity_f1_value,
-        "multiplicity_asymmetric_f1": multiplicity_asymmetric_f1_value,
-        "multiplicity_estimable_f1": multiplicity_estimable_f1_value,
-        "estimated_clonal_fraction": estimated_clonal_fraction_value,
-        "true_clonal_fraction": true_clonal_fraction_value,
-        "clonal_fraction_error": clonal_fraction_error_value,
-        "estimated_clusters": estimated_clusters_value,
-        "true_clusters": true_clusters_value,
-        "n_eval_mutations": n_eval_mutations_value,
-        "n_filtered_mutations": n_filtered_mutations_value,
+        **evaluation_metrics,
     }
     return fit, evaluation, row, artifact
 
@@ -812,66 +817,15 @@ def _evaluate_partition_candidate(
         selection_score_name=str(canonical_score_name),
     )
 
-    evaluation = None
-    ari_value = np.nan
-    cp_rmse_value = np.nan
-    raw_cp_rmse_value = np.nan
-    summary_cp_rmse_value = np.nan
-    bic_refit_cp_rmse_value = np.nan
-    multiplicity_f1_value = np.nan
-    multiplicity_asymmetric_f1_value = np.nan
-    multiplicity_estimable_f1_value = np.nan
-    estimated_clonal_fraction_value = np.nan
-    true_clonal_fraction_value = np.nan
-    clonal_fraction_error_value = np.nan
-    estimated_clusters_value = np.nan
-    true_clusters_value = np.nan
-    n_eval_mutations_value = np.nan
-    n_filtered_mutations_value = np.nan
-    evaluation_elapsed_seconds = 0.0
-    if evaluate_candidate and simulation_truth is not None:
-        evaluation_start_time = perf_counter()
-        evaluation = evaluate_fit_against_simulation(
-            fit=fit,
+    evaluation, evaluation_metrics, evaluation_elapsed_seconds = (
+        _evaluate_simulation_metrics(
             data=data,
+            fit=fit,
+            artifact=artifact,
             simulation_truth=simulation_truth,
-            bic_refit_phi=artifact.bic_refit_phi,
-            bic_partition_labels=artifact.bic_partition_labels,
+            enabled=evaluate_candidate,
         )
-        ari_value = float(evaluation.ari)
-        cp_rmse_value = float(evaluation.cp_rmse)
-        raw_cp_rmse_value = float(
-            evaluation.raw_cp_rmse if evaluation.raw_cp_rmse is not None else np.nan
-        )
-        summary_cp_rmse_value = float(
-            evaluation.summary_cp_rmse
-            if evaluation.summary_cp_rmse is not None
-            else evaluation.cp_rmse
-        )
-        bic_refit_cp_rmse_value = float(
-            evaluation.bic_refit_cp_rmse
-            if evaluation.bic_refit_cp_rmse is not None
-            else np.nan
-        )
-        multiplicity_f1_value = float(evaluation.multiplicity_f1)
-        multiplicity_asymmetric_f1_value = float(
-            evaluation.multiplicity_f1
-            if evaluation.multiplicity_asymmetric_f1 is None
-            else evaluation.multiplicity_asymmetric_f1
-        )
-        multiplicity_estimable_f1_value = float(
-            np.nan
-            if evaluation.multiplicity_estimable_f1 is None
-            else evaluation.multiplicity_estimable_f1
-        )
-        estimated_clonal_fraction_value = float(evaluation.estimated_clonal_fraction)
-        true_clonal_fraction_value = float(evaluation.true_clonal_fraction)
-        clonal_fraction_error_value = float(evaluation.clonal_fraction_error)
-        estimated_clusters_value = int(evaluation.estimated_clusters)
-        true_clusters_value = int(evaluation.true_clusters)
-        n_eval_mutations_value = int(evaluation.n_eval_mutations)
-        n_filtered_mutations_value = int(evaluation.n_filtered_mutations)
-        evaluation_elapsed_seconds = float(perf_counter() - evaluation_start_time)
+    )
 
     candidate_elapsed_seconds = float(perf_counter() - candidate_start_time)
 
@@ -1080,20 +1034,6 @@ def _evaluate_partition_candidate(
         "fit_compute_summary": True,
         "fit_start_mode": "likelihood_partition",
         "solver_state_warm_start": False,
-        "ARI": ari_value,
-        "cp_rmse": cp_rmse_value,
-        "raw_cp_rmse": raw_cp_rmse_value,
-        "summary_cp_rmse": summary_cp_rmse_value,
-        "bic_refit_cp_rmse": bic_refit_cp_rmse_value,
-        "multiplicity_f1": multiplicity_f1_value,
-        "multiplicity_asymmetric_f1": multiplicity_asymmetric_f1_value,
-        "multiplicity_estimable_f1": multiplicity_estimable_f1_value,
-        "estimated_clonal_fraction": estimated_clonal_fraction_value,
-        "true_clonal_fraction": true_clonal_fraction_value,
-        "clonal_fraction_error": clonal_fraction_error_value,
-        "estimated_clusters": estimated_clusters_value,
-        "true_clusters": true_clusters_value,
-        "n_eval_mutations": n_eval_mutations_value,
-        "n_filtered_mutations": n_filtered_mutations_value,
+        **evaluation_metrics,
     }
     return fit, evaluation, row, artifact

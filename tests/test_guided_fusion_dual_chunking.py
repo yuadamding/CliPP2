@@ -377,7 +377,6 @@ def test_compressed_guided_large_block_uses_balanced_tree_flow() -> None:
         edge_u=edge_index[0],
         edge_v=edge_index[1],
         edge_w=edge_w,
-        chunk_edges=17,
     )
 
     support_u = edge_index[0].index_select(0, edge_ids)
@@ -402,7 +401,6 @@ def test_compressed_guided_large_block_uses_balanced_tree_flow() -> None:
         edge_u=edge_index[0],
         edge_v=edge_index[1],
         edge_w=edge_w,
-        chunk_edges=17,
     )
     torch.testing.assert_close(projected_edge_ids, edge_ids, rtol=0.0, atol=0.0)
     projected_norm = torch.linalg.vector_norm(projected_dual, dim=1)

@@ -21,8 +21,6 @@ from ..core.fusion.graph_ops import (
 )
 from ..core.fusion.partition_starts import (
     PartitionCandidate,
-    generate_likelihood_partition_starts,
-    hessian_weighted_ward_label_sets_torch,
     observed_curvature_at_pilot_torch,
 )
 from ..core.fusion.refit import PartitionRefitResult
@@ -58,15 +56,11 @@ from ..core.bic import (
 from ..model_selection.adaptive import (
     _adaptive_first_pass_options,
     _adaptive_interval_proposal_records,
-    _adaptive_interval_proposals as _adaptive_interval_proposals,
     _adaptive_score_column,
     _adaptive_transition_probe_records,
-    _best_candidate_rows_by_lambda as _best_candidate_rows_by_lambda,
-    _full_fusion_box_residual_with_dual_balls as _full_fusion_box_residual_with_dual_balls,
     _initial_adaptive_lambda_bracket,
     _lambda_boundary_flags,
     _lambda_boundary_unresolved,
-    _score_maximized,
     _score_strictly_better,
     _selected_lambda_signature_interval,
 )
@@ -75,8 +69,6 @@ from ..model_selection.candidates import (
     _evaluate_partition_candidate,
 )
 from ..model_selection.config import (
-    ADAPTIVE_FIRST_PASS_INNER_MAX_ITER as ADAPTIVE_FIRST_PASS_INNER_MAX_ITER,
-    ADAPTIVE_FIRST_PASS_OUTER_MAX_ITER as ADAPTIVE_FIRST_PASS_OUTER_MAX_ITER,
     ADAPTIVE_PATH_MAX_CANDIDATES,
     ADAPTIVE_PATH_MAX_ROUNDS,
     ADAPTIVE_PATH_PARTITION_POOL_MAX_CANDIDATES,
@@ -86,10 +78,6 @@ from ..model_selection.config import (
     ADAPTIVE_PATH_REFINE_PER_ROUND,
     ADAPTIVE_PATH_TRANSITION_PROBE_MAX_CANDIDATES,
     ENABLE_LIKELIHOOD_PARTITION_CANDIDATES,
-    LIKELIHOOD_PARTITION_CEM_MAX_ITER,
-    LIKELIHOOD_PARTITION_MAX_CANDIDATES_PER_K,
-    LIKELIHOOD_PARTITION_REFIT_MAX_ITER,
-    PARTITION_ICL_DIRICHLET_ALPHA,
     PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT,
     PARTITION_GUIDED_ADMM_MAX_SOLVER_RETRIES_PER_LAMBDA,
     PARTITION_GUIDED_ADMM_MAX_UNIQUE_LAMBDAS,
@@ -103,24 +91,21 @@ from ..model_selection.online_lambda import (
     OnlineLambdaController,
     OnlineLambdaObservation,
 )
-from ..model_selection.partition_initializer import generate_partition_initializer_pool
+from ..model_selection.partition_initializer import (
+    PartitionInitializerPool,
+    generate_partition_initializer_pool,
+)
 from ..model_selection.partitions import (
     _best_partition_candidate,
-    _deduplicate_partition_candidates,
-    _likelihood_partition_k_grid,
-    _likelihood_partition_refinement_k_grid,
     _partition_candidate_requested_k,
-    _partition_is_coarsening as _partition_is_coarsening,
     _partition_signature,
 )
 from ..model_selection.scoring import (
-    _add_bic_selection_eligible as _add_bic_selection_eligible,
     _annotate_bic_diagnostics,
     _ari_candidate_frame,
     _bic_selection_eligible_mask,
     _canonical_lambda,
     _exact_fusion_certificate_mask,
-    _is_bic_selection_eligible as _is_bic_selection_eligible,
     _lambda_applicable_mask,
     _lambda_range_for_optimal_rows,
     _lambda_warm_start_distance,
@@ -562,6 +547,53 @@ def _resolve_adaptive_path_config(
     )
 
 
+def _lambda_bracket_metadata(bracket: LambdaBracket | None) -> dict[str, float]:
+    if bracket is None:
+        return {
+            "lambda_bracket_min": np.nan,
+            "lambda_bracket_eq": np.nan,
+            "lambda_bracket_full": np.nan,
+            "lambda_full_residual": np.nan,
+        }
+    metadata = {
+        "lambda_bracket_min": float(bracket.lambda_min),
+        "lambda_bracket_eq": float(bracket.lambda_eq),
+        "lambda_bracket_full": float(bracket.lambda_full),
+    }
+    metadata.update(
+        {
+            str(name): float(value)
+            for name, value in bracket.diagnostics.items()
+            if np.isscalar(value)
+        }
+    )
+    return metadata
+
+
+def _partition_pool_row_metadata(
+    pool: PartitionInitializerPool,
+) -> dict[str, float | int | str]:
+    return {
+        "partition_generation_elapsed_seconds": float(pool.generation_elapsed_seconds),
+        "partition_curvature_elapsed_seconds": float(pool.curvature_elapsed_seconds),
+        "partition_ward_elapsed_seconds": float(pool.ward_elapsed_seconds),
+        "partition_refine_ward_elapsed_seconds": float(
+            pool.refine_ward_elapsed_seconds
+        ),
+        "partition_initial_generation_elapsed_seconds": float(
+            pool.initial_generation_elapsed_seconds
+        ),
+        "partition_refine_generation_elapsed_seconds": float(
+            pool.refine_generation_elapsed_seconds
+        ),
+        "partition_candidate_count": int(len(pool.candidates)),
+        "partition_candidate_refinement_reason": str(pool.refinement_reason),
+        "partition_candidate_sparse_k_grid": ",".join(map(str, pool.sparse_k_grid)),
+        "partition_candidate_refine_k_grid": ",".join(map(str, pool.refine_k_grid)),
+        "partition_candidate_k_grid": ",".join(map(str, pool.combined_k_grid)),
+    }
+
+
 def _assemble_selection_result(
     *,
     search_df,
@@ -597,13 +629,8 @@ def _assemble_selection_result(
             f"No candidates were eligible for model selection for tumor {data.tumor_id}."
         )
     selection_df = search_df.loc[candidate_selection_eligible_mask].copy()
-    converged_ari_df = _ari_candidate_frame(selection_df.copy())
+    converged_ari_df = _ari_candidate_frame(selection_df)
     selection_used_convergence_fallback = False
-
-    if selection_df.empty:
-        raise RuntimeError(
-            f"No candidate fits were evaluated for tumor {data.tumor_id}."
-        )
 
     selection_lambda_values = selection_df["lambda"].to_numpy(dtype=float)
     score_column = _adaptive_score_column(normalized_score)
@@ -660,7 +687,7 @@ def _assemble_selection_result(
     else:
         best_score_all_row = provisional_df.sort_values(
             [score_column, "lambda", "selection_step"],
-            ascending=[not _score_maximized(normalized_score), True, True],
+            ascending=[True, True, True],
             na_position="last",
         ).iloc[0]
     certified_score_df = search_df.loc[
@@ -671,7 +698,7 @@ def _assemble_selection_result(
     else:
         best_score_certified_row = certified_score_df.sort_values(
             [score_column, "lambda", "selection_step"],
-            ascending=[not _score_maximized(normalized_score), True, True],
+            ascending=[True, True, True],
             na_position="last",
         ).iloc[0]
 
@@ -726,7 +753,6 @@ def _assemble_selection_result(
             _score_strictly_better(
                 best_score_all_score,
                 selected_provisional_score,
-                normalized_score=normalized_score,
             )
             and not best_score_all_eligible
         ):
@@ -741,7 +767,6 @@ def _assemble_selection_result(
             if _score_strictly_better(
                 candidate_score,
                 selected_provisional_score,
-                normalized_score=normalized_score,
             ):
                 optimizer_limited_ids.add(int(candidate_row["_candidate_id"]))
 
@@ -1200,7 +1225,7 @@ def _partition_guided_admm_selection(
                 and np.isfinite(float(row.get("fixed_objective_kkt_residual", np.nan)))
             ]
             if finite_failed_entries:
-                best_failed_fit, best_failed_row = min(
+                best_failed_fit, _ = min(
                     finite_failed_entries,
                     key=lambda item: float(item[1]["fixed_objective_kkt_residual"]),
                 )
@@ -1243,18 +1268,11 @@ def _partition_guided_admm_selection(
             solver_state_start = guided_initialization.solver_state
             lambda_start_source = "guided_kkt_fallback"
             lambda_start_value = float(guided_initialization.lambda_value)
-        if proposal.phase == "solver_recovery":
-            phi_start = _clone_start(
-                solver_state_start.phi
-                if solver_state_start is not None and solver_state_start.phi is not None
-                else guide_phi
-            )
-        else:
-            phi_start = _clone_start(
-                solver_state_start.phi
-                if solver_state_start is not None and solver_state_start.phi is not None
-                else guide_phi
-            )
+        phi_start = _clone_start(
+            solver_state_start.phi
+            if solver_state_start is not None and solver_state_start.phi is not None
+            else guide_phi
+        )
 
         candidate_fit_options = effective_fit_options
         if proposal.phase == "solver_recovery":
@@ -1284,7 +1302,6 @@ def _partition_guided_admm_selection(
             candidate_fit_options=candidate_fit_options,
             bic_df_scale=bic_df_scale,
             bic_cluster_penalty=bic_cluster_penalty,
-            simulation_root=simulation_root,
             simulation_truth=simulation_truth,
             evaluate_candidate=evaluate_all_candidates,
             phi_start=phi_start,
@@ -1380,37 +1397,7 @@ def _partition_guided_admm_selection(
                 "adaptive_transition_probe_max_candidates": 0,
                 "adaptive_initial_anchor_count": 0,
                 "likelihood_partition_pool_enabled": True,
-                "partition_generation_elapsed_seconds": float(
-                    initializer_pool.generation_elapsed_seconds
-                ),
-                "partition_curvature_elapsed_seconds": float(
-                    initializer_pool.curvature_elapsed_seconds
-                ),
-                "partition_ward_elapsed_seconds": float(
-                    initializer_pool.ward_elapsed_seconds
-                ),
-                "partition_refine_ward_elapsed_seconds": float(
-                    initializer_pool.refine_ward_elapsed_seconds
-                ),
-                "partition_initial_generation_elapsed_seconds": float(
-                    initializer_pool.initial_generation_elapsed_seconds
-                ),
-                "partition_refine_generation_elapsed_seconds": float(
-                    initializer_pool.refine_generation_elapsed_seconds
-                ),
-                "partition_candidate_count": int(len(initializer_pool.candidates)),
-                "partition_candidate_refinement_reason": str(
-                    initializer_pool.refinement_reason
-                ),
-                "partition_candidate_sparse_k_grid": ",".join(
-                    str(int(k)) for k in initializer_pool.sparse_k_grid
-                ),
-                "partition_candidate_refine_k_grid": ",".join(
-                    str(int(k)) for k in initializer_pool.refine_k_grid
-                ),
-                "partition_candidate_k_grid": ",".join(
-                    str(int(k)) for k in initializer_pool.combined_k_grid
-                ),
+                **_partition_pool_row_metadata(initializer_pool),
             }
         )
         candidate_id = int(len(result_entries))
@@ -1461,7 +1448,7 @@ def _partition_guided_admm_selection(
     refinement_rounds = sum(
         1 for proposal in controller.proposal_history if "refine" in str(proposal.phase)
     )
-    selection_result = _assemble_selection_result(
+    return _assemble_selection_result(
         search_df=search_df,
         data=data,
         normalized_score=normalized_score,
@@ -1478,7 +1465,6 @@ def _partition_guided_admm_selection(
         selection_start_time=selection_start_time,
         strict_positive_exact_fusion=True,
     )
-    return selection_result
 
 
 def _grid_search_selection(
@@ -1495,7 +1481,6 @@ def _grid_search_selection(
     profile_name: str,
     selection_method: str,
     selection_score: str,
-    finalize_selected_fit: bool,
 ) -> BICSelectionResult:
     selection_start_time = perf_counter()
     explicit_lambda_grid = lambda_grid is not None
@@ -1709,7 +1694,6 @@ def _grid_search_selection(
                 candidate_fit_options=candidate_fit_options,
                 bic_df_scale=bic_df_scale,
                 bic_cluster_penalty=bic_cluster_penalty,
-                simulation_root=simulation_root,
                 simulation_truth=simulation_truth,
                 evaluate_candidate=evaluate_all_candidates,
                 phi_start=phi_start,
@@ -1745,24 +1729,7 @@ def _grid_search_selection(
             row["likelihood_partition_pool_enabled"] = bool(
                 likelihood_partition_pool_enabled
             )
-            row["lambda_bracket_min"] = (
-                np.nan if lambda_bracket is None else float(lambda_bracket.lambda_min)
-            )
-            row["lambda_bracket_eq"] = (
-                np.nan if lambda_bracket is None else float(lambda_bracket.lambda_eq)
-            )
-            row["lambda_bracket_full"] = (
-                np.nan if lambda_bracket is None else float(lambda_bracket.lambda_full)
-            )
-            if lambda_bracket is None:
-                row["lambda_full_residual"] = np.nan
-            else:
-                for (
-                    diagnostic_name,
-                    diagnostic_value,
-                ) in lambda_bracket.diagnostics.items():
-                    if np.isscalar(diagnostic_value):
-                        row[str(diagnostic_name)] = float(diagnostic_value)
+            row.update(_lambda_bracket_metadata(lambda_bracket))
             if (
                 lambda_metadata_by_lambda is not None
                 and lambda_key in lambda_metadata_by_lambda
@@ -1968,138 +1935,20 @@ def _grid_search_selection(
         .sort_values(["lambda", "selection_step"])
         .reset_index(drop=True)
     )
-    partition_generation_elapsed_seconds = 0.0
-    partition_curvature_elapsed_seconds = 0.0
-    partition_ward_elapsed_seconds = 0.0
-    partition_refine_ward_elapsed_seconds = 0.0
-    partition_initial_generation_elapsed_seconds = 0.0
-    partition_refine_generation_elapsed_seconds = 0.0
-    partition_candidate_count = 0
     if likelihood_partition_pool_enabled:
-        partition_generation_start_time = perf_counter()
-        partition_k_grid = _likelihood_partition_k_grid(int(data.num_mutations))
-        partition_curvature_start_time = perf_counter()
-        partition_curvature = observed_curvature_at_pilot_torch(
-            data,
-            pilot_phi,
-            major_prior=float(effective_fit_options.major_prior),
-            eps=float(effective_fit_options.eps),
-            torch_data=torch_data,
-            device=runtime.device,
-            dtype=runtime.dtype,
-        )
-        partition_curvature_elapsed_seconds = float(
-            perf_counter() - partition_curvature_start_time
-        )
-        partition_ward_start_time = perf_counter()
-        partition_label_sets = hessian_weighted_ward_label_sets_torch(
-            pilot_phi,
-            partition_curvature,
-            K_grid=partition_k_grid,
-            device=runtime.device,
-            dtype=runtime.dtype,
-        )
-        partition_ward_elapsed_seconds = float(
-            perf_counter() - partition_ward_start_time
-        )
-        partition_initial_start_time = perf_counter()
-        partition_candidates = generate_likelihood_partition_starts(
-            data,
-            exact_pilot=pilot_phi,
-            major_prior=float(effective_fit_options.major_prior),
-            eps=float(effective_fit_options.eps),
-            K_grid=partition_k_grid,
-            max_candidates_per_K=int(LIKELIHOOD_PARTITION_MAX_CANDIDATES_PER_K),
-            cem_max_iter=int(LIKELIHOOD_PARTITION_CEM_MAX_ITER),
-            refit_max_iter=int(LIKELIHOOD_PARTITION_REFIT_MAX_ITER),
-            tol=float(effective_fit_options.tol),
-            curvature=partition_curvature,
-            label_sets=partition_label_sets,
-            torch_data=torch_data,
-            device=runtime.device,
-            dtype=runtime.dtype,
-            use_torch=True,
-            classification_weight_alpha=(
-                float(PARTITION_ICL_DIRICHLET_ALPHA)
-                if normalized_score == "partition_icl"
-                else None
-            ),
-            allow_component_death=bool(normalized_score == "partition_icl"),
-        )
-        partition_initial_generation_elapsed_seconds = float(
-            perf_counter() - partition_initial_start_time
-        )
-        partition_candidates = _rescore_partition_candidates(
-            partition_candidates,
+        initializer_pool = generate_partition_initializer_pool(
             data=data,
+            pilot_phi=pilot_phi,
+            fit_options=effective_fit_options,
             normalized_score=normalized_score,
-            bic_df_scale=bic_df_scale,
-            bic_cluster_penalty=bic_cluster_penalty,
+            runtime=runtime,
+            torch_data=torch_data,
+            rescore_candidates=_rescore_partition_candidates,
+            bic_df_scale=float(bic_df_scale),
+            bic_cluster_penalty=float(bic_cluster_penalty),
         )
-        partition_refine_k_grid, partition_refinement_reason = (
-            _likelihood_partition_refinement_k_grid(
-                partition_candidates,
-                partition_k_grid,
-                num_mutations=int(data.num_mutations),
-            )
-        )
-        if partition_refine_k_grid:
-            partition_refine_ward_start_time = perf_counter()
-            partition_refine_label_sets = hessian_weighted_ward_label_sets_torch(
-                pilot_phi,
-                partition_curvature,
-                K_grid=partition_refine_k_grid,
-                device=runtime.device,
-                dtype=runtime.dtype,
-            )
-            partition_refine_ward_elapsed_seconds = float(
-                perf_counter() - partition_refine_ward_start_time
-            )
-            partition_refine_start_time = perf_counter()
-            partition_refine_candidates = generate_likelihood_partition_starts(
-                data,
-                exact_pilot=pilot_phi,
-                major_prior=float(effective_fit_options.major_prior),
-                eps=float(effective_fit_options.eps),
-                K_grid=partition_refine_k_grid,
-                max_candidates_per_K=int(LIKELIHOOD_PARTITION_MAX_CANDIDATES_PER_K),
-                cem_max_iter=int(LIKELIHOOD_PARTITION_CEM_MAX_ITER),
-                refit_max_iter=int(LIKELIHOOD_PARTITION_REFIT_MAX_ITER),
-                tol=float(effective_fit_options.tol),
-                curvature=partition_curvature,
-                label_sets=partition_refine_label_sets,
-                torch_data=torch_data,
-                device=runtime.device,
-                dtype=runtime.dtype,
-                use_torch=True,
-                classification_weight_alpha=(
-                    float(PARTITION_ICL_DIRICHLET_ALPHA)
-                    if normalized_score == "partition_icl"
-                    else None
-                ),
-                allow_component_death=bool(normalized_score == "partition_icl"),
-            )
-            partition_refine_generation_elapsed_seconds = float(
-                perf_counter() - partition_refine_start_time
-            )
-            partition_refine_candidates = _rescore_partition_candidates(
-                partition_refine_candidates,
-                data=data,
-                normalized_score=normalized_score,
-                bic_df_scale=bic_df_scale,
-                bic_cluster_penalty=bic_cluster_penalty,
-            )
-            partition_candidates = _deduplicate_partition_candidates(
-                partition_candidates + partition_refine_candidates
-            )
-        partition_combined_k_grid = sorted(
-            set(partition_k_grid) | set(partition_refine_k_grid)
-        )
-        partition_refine_k_set = set(partition_refine_k_grid)
-        partition_generation_elapsed_seconds = float(
-            perf_counter() - partition_generation_start_time
-        )
-        partition_candidate_count = int(len(partition_candidates))
+        partition_candidates = list(initializer_pool.candidates)
+        partition_refine_k_set = set(initializer_pool.refine_k_grid)
         for partition_rank, partition_candidate in enumerate(
             partition_candidates, start=1
         ):
@@ -2134,62 +1983,17 @@ def _grid_search_selection(
             row["likelihood_partition_pool_enabled"] = bool(
                 likelihood_partition_pool_enabled
             )
-            row["partition_generation_elapsed_seconds"] = float(
-                partition_generation_elapsed_seconds
-            )
-            row["partition_curvature_elapsed_seconds"] = float(
-                partition_curvature_elapsed_seconds
-            )
-            row["partition_ward_elapsed_seconds"] = float(
-                partition_ward_elapsed_seconds
-            )
-            row["partition_refine_ward_elapsed_seconds"] = float(
-                partition_refine_ward_elapsed_seconds
-            )
-            row["partition_initial_generation_elapsed_seconds"] = float(
-                partition_initial_generation_elapsed_seconds
-            )
-            row["partition_refine_generation_elapsed_seconds"] = float(
-                partition_refine_generation_elapsed_seconds
-            )
-            row["partition_candidate_count"] = int(partition_candidate_count)
+            row.update(_partition_pool_row_metadata(initializer_pool))
             requested_k = _partition_candidate_requested_k(partition_candidate)
             row["partition_candidate_generation_pass"] = (
                 "local_refine"
                 if int(requested_k) in partition_refine_k_set
                 else "sparse_anchor"
             )
-            row["partition_candidate_refinement_reason"] = str(
-                partition_refinement_reason
+            row["partition_candidate_k_grid_size"] = int(
+                len(initializer_pool.combined_k_grid)
             )
-            row["partition_candidate_k_grid_size"] = int(len(partition_combined_k_grid))
-            row["partition_candidate_sparse_k_grid"] = ",".join(
-                str(int(k)) for k in partition_k_grid
-            )
-            row["partition_candidate_refine_k_grid"] = ",".join(
-                str(int(k)) for k in partition_refine_k_grid
-            )
-            row["partition_candidate_k_grid"] = ",".join(
-                str(int(k)) for k in partition_combined_k_grid
-            )
-            row["lambda_bracket_min"] = (
-                np.nan if lambda_bracket is None else float(lambda_bracket.lambda_min)
-            )
-            row["lambda_bracket_eq"] = (
-                np.nan if lambda_bracket is None else float(lambda_bracket.lambda_eq)
-            )
-            row["lambda_bracket_full"] = (
-                np.nan if lambda_bracket is None else float(lambda_bracket.lambda_full)
-            )
-            if lambda_bracket is None:
-                row["lambda_full_residual"] = np.nan
-            else:
-                for (
-                    diagnostic_name,
-                    diagnostic_value,
-                ) in lambda_bracket.diagnostics.items():
-                    if np.isscalar(diagnostic_value):
-                        row[str(diagnostic_name)] = float(diagnostic_value)
+            row.update(_lambda_bracket_metadata(lambda_bracket))
             candidate_id = int(len(result_entries))
             row["_candidate_id"] = candidate_id
             result_entries.append((fit, evaluation, row, artifact))
@@ -2290,7 +2094,6 @@ def select_model(
         profile_name=profile_name,
         selection_method=selection_method,
         selection_score=selection_score,
-        finalize_selected_fit=finalize_selected_fit,
     )
 
 

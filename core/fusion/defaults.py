@@ -15,7 +15,6 @@ DEFAULT_DENSE_FALLBACK_POLICY: Final[DenseFallbackPolicy] = "device_only"
 
 INNER_BACKENDS: Final = ("auto", "dense", "quotient_workset")
 DENSE_FALLBACK_POLICIES: Final = ("device_only", "cpu_allowed", "error")
-DENSE_FALLBACK_POLICY_INPUTS: Final = ("auto", *DENSE_FALLBACK_POLICIES)
 
 DEFAULT_WORKSET_MAX_BYTES: Final = 256 * 1024 * 1024
 DEFAULT_COMPRESSED_CACHE_MAX_BYTES: Final = 256 * 1024 * 1024

@@ -200,18 +200,6 @@ def _box_qp_sweeps_for_atol(
     return max(16, min(max(int(max_iter), 16), requested))
 
 
-def _inner_kkt_audit_due(
-    *,
-    iteration: int,
-    max_iter: int,
-    kkt_check_every: int,
-) -> bool:
-    if int(iteration) >= int(max_iter):
-        return True
-    check_every = max(int(kkt_check_every), 1)
-    return int(iteration) % check_every == 0
-
-
 def _binary_entropy_offset_torch(weight: torch.Tensor) -> torch.Tensor:
     clipped = torch.clamp(weight, min=0.0, max=1.0)
     positive = clipped > 0.0
@@ -219,10 +207,9 @@ def _binary_entropy_offset_torch(weight: torch.Tensor) -> torch.Tensor:
     positive_complement = one_minus > 0.0
     term = torch.zeros_like(clipped)
     term = torch.where(positive, term + clipped * torch.log(clipped), term)
-    term = torch.where(
+    return torch.where(
         positive_complement, term + one_minus * torch.log(one_minus), term
     )
-    return term
 
 
 def resolve_runtime(device: str | None, *, dtype: str | None = None) -> TorchRuntime:
@@ -1643,10 +1630,9 @@ def solve_majorized_subproblem_pdhg_torch(
         phi_new = torch.minimum(torch.maximum(phi_new, lower), upper)
         bar = phi_new + (phi_new - phi)
 
-        audit_due = _inner_kkt_audit_due(
-            iteration=iterations,
-            max_iter=actual_max_iter,
-            kkt_check_every=kkt_check_every,
+        audit_due = (
+            iterations >= actual_max_iter
+            or iterations % max(int(kkt_check_every), 1) == 0
         )
         if audit_due:
             primal_delta = float(
@@ -1720,6 +1706,53 @@ def _complete_graph_isotropic_box_qp_torch(
     )
 
 
+def _closed_form_box_fusion_result(
+    *,
+    runtime: TorchRuntime,
+    U: torch.Tensor,
+    h: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    tol: float,
+    diagnostics_out: dict[str, float | int] | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
+    projected = torch.minimum(torch.maximum(U, lower), upper)
+    diag = _graph_fusion_kkt_diagnostics_from_components_torch(
+        phi=projected,
+        grad_smooth=h * (projected - U),
+        adj=torch.zeros_like(projected),
+        lower=lower,
+        upper=upper,
+        atol=tol,
+        max_edge_residual=0.0,
+        max_ball_residual=0.0,
+        max_radius=0.0,
+    )
+    residual = float(diag["kkt_residual"])
+    empty_dual = torch.zeros(
+        (0, projected.shape[1]), dtype=runtime.dtype, device=runtime.device
+    )
+    if diagnostics_out is not None:
+        diagnostics_out.clear()
+        diagnostics_out.update(diag)
+        diagnostics_out.update(inner_kkt_audits=0, inner_stationarity_checks=0)
+    return projected, empty_dual, empty_dual, 0, residual <= tol, residual
+
+
+def _initial_complete_graph_rho(
+    h: torch.Tensor, *, num_mutations: int, spectral_rho: bool
+) -> float:
+    median_h = torch.median(h)
+    if spectral_rho:
+        # The nonzero spectrum of the complete-graph D.T @ D is M.
+        return float(
+            torch.clamp(
+                median_h / max(float(num_mutations), 1.0), min=1e-8, max=1e8
+            ).item()
+        )
+    return float(torch.clamp(median_h, min=1e-3, max=1e3).item())
+
+
 def _solve_majorized_subproblem_alm_dense_torch(
     *,
     runtime: TorchRuntime,
@@ -1749,47 +1782,18 @@ def _solve_majorized_subproblem_alm_dense_torch(
         upper,
     )
     if lambda_value <= 0.0 or edge_u.numel() == 0:
-        projected = torch.minimum(torch.maximum(U, lower), upper)
-        total_grad = h * (projected - U)
-        diag = _graph_fusion_kkt_diagnostics_from_components_torch(
-            phi=projected,
-            grad_smooth=total_grad,
-            adj=torch.zeros_like(projected),
+        return _closed_form_box_fusion_result(
+            runtime=runtime,
+            U=U,
+            h=h,
             lower=lower,
             upper=upper,
-            atol=tol,
-            max_edge_residual=0.0,
-            max_ball_residual=0.0,
-            max_radius=0.0,
+            tol=tol,
+            diagnostics_out=diagnostics_out,
         )
-        residual = float(diag["kkt_residual"])
-        empty_dual = torch.zeros(
-            (0, phi.shape[1]), dtype=runtime.dtype, device=runtime.device
-        )
-        if diagnostics_out is not None:
-            diagnostics_out.clear()
-            diagnostics_out.update(diag)
-            diagnostics_out["inner_kkt_audits"] = 0
-            diagnostics_out["inner_stationarity_checks"] = 0
-        # This branch is a closed-form box projection; no ADMM iteration ran.
-        return projected, empty_dual, empty_dual, 0, residual <= tol, residual
-
-    median_h = torch.median(h)
-    if spectral_rho:
-        # For the complete graph, the nonzero spectrum of D.T @ D is M.
-        # Balancing H against rho * D.T @ D therefore uses median(H) / M,
-        # rather than treating the incidence operator as norm one.  Wide
-        # numerical bounds guard only overflow/underflow; they do not define a
-        # lambda path or alter the penalized objective.
-        rho = float(
-            torch.clamp(
-                median_h / max(float(num_mutations), 1.0),
-                min=1e-8,
-                max=1e8,
-            ).item()
-        )
-    else:
-        rho = float(torch.clamp(median_h, min=1e-3, max=1e3).item())
+    rho = _initial_complete_graph_rho(
+        h, num_mutations=num_mutations, spectral_rho=spectral_rho
+    )
     radius = float(lambda_value) * edge_w
     if dual_start is not None and tuple(dual_start.shape) == (
         int(edge_u.numel()),
@@ -1990,31 +1994,15 @@ def _solve_majorized_subproblem_alm_streaming_torch(
         upper,
     )
     if lambda_value <= 0.0 or edge_u.numel() == 0:
-        projected = torch.minimum(torch.maximum(U, lower), upper)
-        total_grad = h * (projected - U)
-        diag = _graph_fusion_kkt_diagnostics_from_components_torch(
-            phi=projected,
-            grad_smooth=total_grad,
-            adj=torch.zeros_like(projected),
+        return _closed_form_box_fusion_result(
+            runtime=runtime,
+            U=U,
+            h=h,
             lower=lower,
             upper=upper,
-            atol=tol,
-            max_edge_residual=0.0,
-            max_ball_residual=0.0,
-            max_radius=0.0,
+            tol=tol,
+            diagnostics_out=diagnostics_out,
         )
-        residual = float(diag["kkt_residual"])
-        empty_dual = torch.zeros(
-            (0, phi.shape[1]),
-            dtype=runtime.dtype,
-            device=runtime.device,
-        )
-        if diagnostics_out is not None:
-            diagnostics_out.clear()
-            diagnostics_out.update(diag)
-            diagnostics_out["inner_kkt_audits"] = 0
-            diagnostics_out["inner_stationarity_checks"] = 0
-        return projected, empty_dual, empty_dual, 0, residual <= tol, residual
 
     num_edges = int(edge_u.numel())
     num_regions = int(phi.shape[1])
@@ -2024,17 +2012,9 @@ def _solve_majorized_subproblem_alm_streaming_torch(
         dtype=runtime.dtype,
         work_bytes=edge_work_bytes,
     )
-    median_h = torch.median(h)
-    if spectral_rho:
-        rho = float(
-            torch.clamp(
-                median_h / max(float(num_mutations), 1.0),
-                min=1e-8,
-                max=1e8,
-            ).item()
-        )
-    else:
-        rho = float(torch.clamp(median_h, min=1e-3, max=1e3).item())
+    rho = _initial_complete_graph_rho(
+        h, num_mutations=num_mutations, spectral_rho=spectral_rho
+    )
 
     expected_dual_shape = (num_edges, num_regions)
     scaled_dual = torch.empty(

@@ -286,12 +286,6 @@ def _positive_exact_fusion_selection_mask(search_df: pd.DataFrame) -> np.ndarray
     return eligible & source_ok & lambda_ok & _exact_fusion_certificate_mask(search_df)
 
 
-def _positive_admm_fusion_selection_mask(search_df: pd.DataFrame) -> np.ndarray:
-    """Deprecated compatibility alias for the backend-neutral exact mask."""
-
-    return _positive_exact_fusion_selection_mask(search_df)
-
-
 def _row_bic_selection_eligible(row: pd.Series) -> bool:
     value = row.get(
         "bic_selection_eligible",
@@ -535,44 +529,6 @@ def _ari_candidate_frame(search_df: pd.DataFrame) -> pd.DataFrame:
         return search_df.iloc[0:0].copy()
     ari_df = search_df.loc[np.isfinite(search_df["ARI"].to_numpy(dtype=float))].copy()
     return ari_df.sort_values(["lambda", "selection_step"]).reset_index(drop=True)
-
-
-def _representative_optimal_row(
-    tied_df: pd.DataFrame,
-    *,
-    lambda_min: float | None,
-    lambda_max: float | None,
-) -> pd.Series:
-    if tied_df.empty:
-        raise ValueError("tied_df must contain at least one optimal candidate row.")
-    if lambda_min is None or lambda_max is None:
-        return tied_df.sort_values(
-            ["converged", "iterations", "lambda", "selection_step"],
-            ascending=[False, False, True, True],
-        ).iloc[0]
-
-    if np.isclose(lambda_min, lambda_max, rtol=0.0, atol=1e-12):
-        target_lambda = float(lambda_min)
-    elif lambda_min <= 0.0 or lambda_max <= 0.0:
-        target_lambda = 0.0
-    else:
-        target_lambda = float(np.sqrt(float(lambda_min) * float(lambda_max)))
-
-    ranked_df = tied_df.copy()
-    lambda_values = ranked_df["lambda"].to_numpy(dtype=float)
-    if target_lambda > 0.0:
-        distances = np.full(lambda_values.shape, np.inf, dtype=float)
-        positive_lambda_mask = lambda_values > 0.0
-        distances[positive_lambda_mask] = np.abs(
-            np.log(lambda_values[positive_lambda_mask]) - np.log(target_lambda)
-        )
-        ranked_df["_repr_log_distance"] = distances
-    else:
-        ranked_df["_repr_log_distance"] = np.abs(lambda_values - target_lambda)
-    return ranked_df.sort_values(
-        ["_repr_log_distance", "converged", "iterations", "lambda", "selection_step"],
-        ascending=[True, False, False, True, True],
-    ).iloc[0]
 
 
 def _prefer_fit_candidate(candidate: FitResult, incumbent: FitResult | None) -> bool:

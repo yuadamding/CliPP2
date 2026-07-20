@@ -20,11 +20,6 @@ from ..metrics.evaluation import evaluate_fit_against_simulation
 from ..model_selection.config import DEFAULT_SELECTION_SCORE
 from .model_selection import select_model
 from .outputs import write_fit_outputs
-from .settings import summarize_tumor_regime
-
-
-def _cuda_available() -> bool:
-    return torch.cuda.is_available()
 
 
 def _exact_resource_limit_summary(
@@ -90,7 +85,6 @@ def process_one_file_bundle(
             ),
         )
 
-    tumor_regime = summarize_tumor_regime(data)
     simulation_available = (
         simulation_root is not None and (Path(simulation_root) / data.tumor_id).exists()
     )
@@ -551,11 +545,13 @@ def process_one_file_bundle(
         "tested_lambda_min": tested_lambda_min,
         "tested_lambda_max": tested_lambda_max,
         "tested_lambda_count": tested_lambda_count,
-        "num_regions": int(tumor_regime.num_regions),
-        "num_mutations": int(tumor_regime.num_mutations),
-        "depth_scale": float(tumor_regime.depth_scale),
-        "mean_purity": float(tumor_regime.mean_purity),
-        "non_diploid_rate": float(tumor_regime.non_diploid_rate),
+        "num_regions": int(data.num_regions),
+        "num_mutations": int(data.num_mutations),
+        "depth_scale": float(data.depth_scale),
+        "mean_purity": float(np.mean(data.purity)),
+        "non_diploid_rate": float(
+            np.mean(data.has_cna & ((data.major_cn != 1.0) | (data.minor_cn != 1.0)))
+        ),
         "lambda_grid_mode": str(
             lambda_grid_mode if lambda_grid is None else "explicit"
         ),
@@ -943,7 +939,8 @@ def run_directory(
             else DEFAULT_DEVICE
         )
         if str(effective_device).strip().lower() not in {"cpu", "auto"} or (
-            str(effective_device).strip().lower() == "auto" and _cuda_available()
+            str(effective_device).strip().lower() == "auto"
+            and torch.cuda.is_available()
         ):
             import warnings
 

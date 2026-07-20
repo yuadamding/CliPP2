@@ -47,7 +47,6 @@ class PartitionCandidate:
     fit_loss: float
     bic: float
     active_df: int | None = None
-    n_eff: int | None = None
     finite_candidate_found: bool = True
     diagnostics: dict[str, float] = field(default_factory=dict)
 
@@ -443,7 +442,7 @@ def hessian_weighted_ward_label_sets(
         idx: np.asarray([idx], dtype=np.int64) for idx in range(num_mutations)
     }
     active: set[int] = set(range(num_mutations))
-    version: dict[int, int] = {idx: 0 for idx in range(num_mutations)}
+    version: dict[int, int] = dict.fromkeys(range(num_mutations), 0)
     heap: list[tuple[float, int, int, int, int]] = []
 
     for left in range(num_mutations - 1):
@@ -907,7 +906,7 @@ def refine_partition_likelihood(
     def refit_labels(current_labels: np.ndarray) -> PartitionRefitResult:
         if _refit_labels is not None:
             return _refit_labels(current_labels)
-        result = partition_constrained_observed_refit(
+        return partition_constrained_observed_refit(
             data,
             current_labels,
             major_prior=float(major_prior),
@@ -916,7 +915,6 @@ def refine_partition_likelihood(
             max_iter=max(int(refit_max_iter), 32),
             hint_phi=hint_phi,
         )
-        return result
 
     refit: PartitionRefitResult | None = None
     refit_key: bytes | None = None
@@ -975,9 +973,12 @@ def refine_partition_likelihood(
             if final_score < best_score:
                 best_labels = labels.copy()
                 best_refit = refit
-    if classification_weight_alpha is not None:
-        if best_labels is not None and best_refit is not None:
-            return _canonical_labels(best_labels), best_refit
+    if (
+        classification_weight_alpha is not None
+        and best_labels is not None
+        and best_refit is not None
+    ):
+        return _canonical_labels(best_labels), best_refit
     return _canonical_labels(labels), refit
 
 
@@ -1183,7 +1184,7 @@ def refine_partition_likelihood_torch(
     def refit_labels(current_labels: np.ndarray) -> PartitionRefitResult:
         if _refit_labels is not None:
             return _refit_labels(current_labels)
-        result = partition_constrained_observed_refit_torch(
+        return partition_constrained_observed_refit_torch(
             data,
             current_labels,
             major_prior=float(major_prior),
@@ -1195,7 +1196,6 @@ def refine_partition_likelihood_torch(
             device=runtime.device,
             dtype=runtime.dtype,
         )
-        return result
 
     refit: PartitionRefitResult | None = None
     refit_key: bytes | None = None
@@ -1270,9 +1270,12 @@ def refine_partition_likelihood_torch(
             if final_score < best_score:
                 best_labels = labels.copy()
                 best_refit = refit
-    if classification_weight_alpha is not None:
-        if best_labels is not None and best_refit is not None:
-            return _canonical_labels(best_labels), best_refit
+    if (
+        classification_weight_alpha is not None
+        and best_labels is not None
+        and best_refit is not None
+    ):
+        return _canonical_labels(best_labels), best_refit
     return _canonical_labels(labels), refit
 
 
@@ -1401,8 +1404,6 @@ def generate_likelihood_partition_starts(
         refit_cache[labels_key] = result
         return result
 
-    n_eff = effective_bic_mutation_region_count(data)
-
     for requested_k in sorted(label_sets):
         labels0 = _canonical_labels(label_sets[int(requested_k)])
         for source, labels in (
@@ -1479,7 +1480,6 @@ def generate_likelihood_partition_starts(
                     fit_loss=float(refit.fit_loss),
                     bic=float(bic),
                     active_df=int(refit.active_degrees_of_freedom),
-                    n_eff=int(n_eff),
                     finite_candidate_found=bool(refit.finite_candidate_found),
                     diagnostics={
                         "requested_K": float(requested_k),

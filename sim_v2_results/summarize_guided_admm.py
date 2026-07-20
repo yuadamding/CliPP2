@@ -143,12 +143,6 @@ def _safe_mean(values: Iterable[float]) -> float:
     return float(np.mean(array)) if array.size else float("nan")
 
 
-def _safe_rmse(values: Iterable[float]) -> float:
-    array = np.asarray(list(values), dtype=float)
-    array = array[np.isfinite(array)]
-    return float(np.sqrt(np.mean(np.square(array)))) if array.size else float("nan")
-
-
 def _min_linf_separation(truth_phi: np.ndarray, labels: np.ndarray) -> float:
     unique = np.unique(labels)
     if unique.size < 2:
@@ -522,9 +516,8 @@ def _load_cases(
                 truth.truth_phi, truth.truth_clusters
             ),
         )
-    if not allow_incomplete:
-        if len(cases) != expected_tumors:
-            raise ValueError(f"Expected {expected_tumors} cases, loaded {len(cases)}")
+    if not allow_incomplete and len(cases) != expected_tumors:
+        raise ValueError(f"Expected {expected_tumors} cases, loaded {len(cases)}")
     return cases
 
 
@@ -1831,7 +1824,6 @@ def _build_report(
     run_label: str,
     per_tumor: pd.DataFrame,
     by_s: pd.DataFrame,
-    by_depth: pd.DataFrame,
     audit: pd.DataFrame,
     confusion: pd.DataFrame,
     correlations: pd.DataFrame,
@@ -2130,7 +2122,6 @@ def main() -> int:
         "true_k": _group_metrics(per_tumor, "true_k"),
     }
     by_s = grouped_metrics["S"]
-    by_depth = grouped_metrics["depth"]
     audit = _solver_audit(per_tumor)
     correlations = _correlations(per_tumor)
 
@@ -2198,7 +2189,6 @@ def main() -> int:
         run_label=args.run_label,
         per_tumor=per_tumor,
         by_s=by_s,
-        by_depth=by_depth,
         audit=audit,
         confusion=confusion,
         correlations=correlations,

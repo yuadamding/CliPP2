@@ -205,14 +205,6 @@ def coerce_graph(
         raise ValueError("PairwiseFusionGraph edge arrays must be one-dimensional.")
     if edge_u.shape != edge_v.shape or edge_u.shape != edge_w.shape:
         raise ValueError("PairwiseFusionGraph edge arrays must have identical shapes.")
-    if edge_u.size == 0:
-        return PairwiseFusionGraph(
-            edge_u=edge_u,
-            edge_v=edge_v,
-            edge_w=edge_w,
-            name=str(graph.name),
-            degree_bound=1,
-        )
     if (
         np.any(edge_u < 0)
         or np.any(edge_v < 0)

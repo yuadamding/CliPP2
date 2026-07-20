@@ -645,9 +645,6 @@ def _tensor_problem_from_torch_data(
     prior = float(major_prior)
     if not np.isfinite(prior) or not (0.0 < prior < 1.0):
         raise ValueError("major_prior must lie strictly in (0, 1).")
-    prior_tensor = torch.as_tensor(
-        prior, dtype=torch_data.alt.dtype, device=torch_data.alt.device
-    )
     return TensorProblem(
         alt=torch_data.alt,
         total=torch_data.total,
@@ -659,8 +656,6 @@ def _tensor_problem_from_torch_data(
         b_fixed=torch_data.b_fixed,
         eps=float(eps),
         major_prior=prior,
-        log_prior_minor=torch.log1p(-prior_tensor),
-        log_prior_major=torch.log(prior_tensor),
         count_observed=torch_data.count_observed,
     )
 
@@ -2720,104 +2715,27 @@ def fit_observed_data_pairwise_fusion(
     lambda_value = validate_lambda_value(lambda_value)
     objective_shape = _normalize_objective_shape(objective_shape)
     normalized_fallback_policy = normalize_dense_fallback_policy(dense_fallback_policy)
-    context_prepared_by_cpu_fallback = bool(
-        solver_context is not None
-        and getattr(solver_context, "resource_fallback", None) == "dense_cpu"
-    )
     if solver_context is None:
-        try:
-            requested_runtime = (
-                resolve_runtime(device, dtype=dtype) if runtime is None else runtime
-            )
-        except CudaUnavailableError:
-            if normalized_fallback_policy != "cpu_allowed":
-                raise
-            try:
-                requested_runtime = resolve_runtime("cpu", dtype=dtype)
-            except RuntimeError as cpu_runtime_error:
-                raise ExactSolverResourceLimit(
-                    "exact_solver_resource_limit: the requested runtime is "
-                    "unavailable and dense CPU fallback does not support the "
-                    f"requested dtype {dtype!r}."
-                ) from cpu_runtime_error
-            context_prepared_by_cpu_fallback = True
-
-        def prepare_context(*, use_supplied_torch_data: bool) -> SolverContext:
-            return prepare_torch_problem(
-                data,
-                major_prior=float(major_prior),
-                eps=float(eps),
-                tol=tol,
-                inner_max_iter=int(inner_max_iter),
-                graph=graph,
-                adaptive_weight_gamma=float(adaptive_weight_gamma),
-                adaptive_weight_floor=float(adaptive_weight_floor),
-                adaptive_weight_baseline=float(adaptive_weight_baseline),
-                exact_pilot=exact_pilot,
-                pooled_start=pooled_start,
-                scalar_well_starts=scalar_well_starts,
-                device=requested_runtime.device_name,
-                dtype=dtype_name(requested_runtime.dtype),
-                runtime=requested_runtime,
-                torch_data=torch_data if use_supplied_torch_data else None,
-                objective_shape=objective_shape,
-            )
-
-        if context_prepared_by_cpu_fallback:
-            cpu_fits, cpu_bytes, cpu_limit = dense_complete_solver_memory_preflight(
-                num_nodes=int(data.num_mutations),
-                num_regions=int(data.num_regions),
-                runtime=requested_runtime,
-            )
-            if not cpu_fits:
-                raise ExactSolverResourceLimit(
-                    "exact_solver_resource_limit: dense CPU fallback needs "
-                    f"approximately {cpu_bytes} bytes (available host limit: "
-                    f"{cpu_limit})."
-                )
-
-        try:
-            solver_context = prepare_context(
-                use_supplied_torch_data=not context_prepared_by_cpu_fallback
-            )
-        except (MemoryError, torch.OutOfMemoryError) as exc:
-            cpu_fallback_allowed = bool(
-                normalized_fallback_policy == "cpu_allowed"
-                and requested_runtime.device.type != "cpu"
-            )
-            if not cpu_fallback_allowed:
-                raise ExactSolverResourceLimit(
-                    "exact_solver_resource_limit: exact problem or graph "
-                    f"construction exhausted memory on {requested_runtime.device_name}."
-                ) from exc
-            try:
-                requested_runtime = resolve_runtime(
-                    "cpu", dtype=dtype_name(requested_runtime.dtype)
-                )
-            except RuntimeError as cpu_runtime_error:
-                raise ExactSolverResourceLimit(
-                    "exact_solver_resource_limit: dense CPU fallback does not "
-                    f"support dtype {dtype_name(requested_runtime.dtype)}."
-                ) from cpu_runtime_error
-            cpu_fits, cpu_bytes, cpu_limit = dense_complete_solver_memory_preflight(
-                num_nodes=int(data.num_mutations),
-                num_regions=int(data.num_regions),
-                runtime=requested_runtime,
-            )
-            if not cpu_fits:
-                raise ExactSolverResourceLimit(
-                    "exact_solver_resource_limit: dense CPU fallback needs "
-                    f"approximately {cpu_bytes} bytes (available host limit: "
-                    f"{cpu_limit})."
-                ) from exc
-            context_prepared_by_cpu_fallback = True
-            try:
-                solver_context = prepare_context(use_supplied_torch_data=False)
-            except (MemoryError, torch.OutOfMemoryError) as cpu_exc:
-                raise ExactSolverResourceLimit(
-                    "exact_solver_resource_limit: exact problem or graph "
-                    "construction exhausted host memory during dense CPU fallback."
-                ) from cpu_exc
+        solver_context = prepare_torch_problem_with_resource_policy(
+            data,
+            dense_fallback_policy=normalized_fallback_policy,
+            major_prior=float(major_prior),
+            eps=float(eps),
+            tol=tol,
+            inner_max_iter=int(inner_max_iter),
+            graph=graph,
+            adaptive_weight_gamma=float(adaptive_weight_gamma),
+            adaptive_weight_floor=float(adaptive_weight_floor),
+            adaptive_weight_baseline=float(adaptive_weight_baseline),
+            exact_pilot=exact_pilot,
+            pooled_start=pooled_start,
+            scalar_well_starts=scalar_well_starts,
+            device=device,
+            dtype=dtype,
+            runtime=runtime,
+            torch_data=torch_data,
+            objective_shape=objective_shape,
+        )
     else:
         expected_data_fingerprint = tumor_data_fingerprint(data)
         if (
@@ -2835,6 +2753,9 @@ def fit_observed_data_pairwise_fusion(
                 "SolverContext major_prior/eps do not match the requested fit options."
             )
 
+    context_prepared_by_cpu_fallback = bool(
+        solver_context.resource_fallback == "dense_cpu"
+    )
     effective_runtime = solver_context.runtime
     effective_graph = solver_context.graph_spec
     effective_exact_pilot = (
@@ -2854,10 +2775,7 @@ def fit_observed_data_pairwise_fusion(
         raise ValueError(f"Unknown start_mode: {start_mode}")
 
     if objective_shape.startswith("unimodal"):
-        if phi_start is not None:
-            start_bank = [phi_start]
-        else:
-            start_bank = [effective_exact_pilot]
+        start_bank = [phi_start] if phi_start is not None else [effective_exact_pilot]
     else:
         start_bank: list[np.ndarray | torch.Tensor] = []
         if phi_start is not None:

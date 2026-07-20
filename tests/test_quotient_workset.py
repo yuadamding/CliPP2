@@ -46,7 +46,6 @@ def _complete_graph(num_nodes: int, *, dtype: torch.dtype) -> TensorFusionGraph:
         pdhg_tau_node=0.49 / degree,
         num_nodes=num_nodes,
         is_complete=True,
-        is_uniform=False,
         name="complete_test",
     )
 

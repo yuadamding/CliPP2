@@ -823,15 +823,11 @@ def _ambiguous_best_two_from_candidate_grid_torch(
     )
     has_local = torch.any(local_valid, dim=1)
 
-    local_primary, local_primary_loss = _select_lexicographic_rows_torch(
+    local_primary, _ = _select_lexicographic_rows_torch(
         local_beta, local_loss, local_valid, local_tie
     )
-    fallback_primary, fallback_loss = _select_lexicographic_rows_torch(
-        beta, loss, valid, beta
-    )
+    fallback_primary, _ = _select_lexicographic_rows_torch(beta, loss, valid, beta)
     primary = torch.where(has_local, local_primary, fallback_primary)
-    primary_loss = torch.where(has_local, local_primary_loss, fallback_loss)
-    del primary_loss
 
     secondary_beta_tol = torch.maximum(
         torch.full_like(primary, loss_tol),

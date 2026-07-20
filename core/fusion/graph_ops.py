@@ -299,9 +299,6 @@ def _tensor_graph_from_edges(
         if known_complete is None
         else bool(known_complete)
     )
-    is_uniform = bool(
-        weight.numel() == 0 or torch.allclose(weight, weight[:1].expand_as(weight))
-    )
     return TensorFusionGraph(
         edge_index=edge_index,
         weight=weight,
@@ -309,7 +306,6 @@ def _tensor_graph_from_edges(
         pdhg_tau_node=pdhg_tau_node,
         num_nodes=int(num_nodes),
         is_complete=is_complete,
-        is_uniform=is_uniform,
         name=str(name),
     )
 

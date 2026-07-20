@@ -325,25 +325,13 @@ def _assemble_actual_dual(
             edge_v=edge_v,
             num_nodes=int(num_mutations),
         )
-        flow_demand = torch.zeros_like(adjusted_grad)
-        stationarity_target = torch.zeros_like(adjusted_grad)
-
-        num_clusters = int(torch.max(labels).item()) + 1
-        cluster_sizes = torch.bincount(labels, minlength=num_clusters)
-        for cluster in range(num_clusters):
-            members = torch.nonzero(labels == int(cluster), as_tuple=False).flatten()
-            block_target = _box_stationarity_targets(
-                adjusted_grad.index_select(0, members),
-                phi=phi.index_select(0, members),
-                lower=lower.index_select(0, members),
-                upper=upper.index_select(0, members),
-            )
-            stationarity_target.index_copy_(0, members, block_target)
-            flow_demand.index_copy_(
-                0,
-                members,
-                adjusted_grad.index_select(0, members) - block_target,
-            )
+        flow_demand, stationarity_target, cluster_sizes = _complete_block_flow_terms(
+            adjusted_grad,
+            phi=phi,
+            labels=labels,
+            lower=lower,
+            upper=upper,
+        )
 
         if bool(torch.any(same_block).item()):
             block_size = cluster_sizes.index_select(
@@ -397,25 +385,13 @@ def _assemble_actual_dual(
         stop = min(start + chunk_edges, num_edges)
         dual_adjoint.index_add_(0, edge_v[start:stop], -dual[start:stop])
     adjusted_grad = grad_smooth + dual_adjoint
-    flow_demand = torch.zeros_like(adjusted_grad)
-    stationarity_target = torch.zeros_like(adjusted_grad)
-
-    num_clusters = int(torch.max(labels).item()) + 1
-    cluster_sizes = torch.bincount(labels, minlength=num_clusters)
-    for cluster in range(num_clusters):
-        members = torch.nonzero(labels == int(cluster), as_tuple=False).flatten()
-        block_target = _box_stationarity_targets(
-            adjusted_grad.index_select(0, members),
-            phi=phi.index_select(0, members),
-            lower=lower.index_select(0, members),
-            upper=upper.index_select(0, members),
-        )
-        stationarity_target.index_copy_(0, members, block_target)
-        flow_demand.index_copy_(
-            0,
-            members,
-            adjusted_grad.index_select(0, members) - block_target,
-        )
+    flow_demand, stationarity_target, cluster_sizes = _complete_block_flow_terms(
+        adjusted_grad,
+        phi=phi,
+        labels=labels,
+        lower=lower,
+        upper=upper,
+    )
 
     for start in range(0, num_edges, chunk_edges):
         stop = min(start + chunk_edges, num_edges)
@@ -777,7 +753,6 @@ def _implicit_guided_tree_support(
     edge_u: torch.Tensor,
     edge_v: torch.Tensor,
     edge_w: torch.Tensor,
-    chunk_edges: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build bounded-degree tree flows for the implicit complete-block demand."""
 
@@ -1232,7 +1207,6 @@ def _build_compressed_guided_initialization(
         edge_u=edge_u,
         edge_v=edge_v,
         edge_w=edge_w,
-        chunk_edges=chunk_edges,
     )
     phi_state = phi.detach()
     labels_state = labels.detach()

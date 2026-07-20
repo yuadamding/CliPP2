@@ -14,25 +14,30 @@ from CliPP2.core.fusion.torch_backend import (
     to_torch_tumor_data,
 )
 from CliPP2.io.data import TumorData, compute_phi_init_from_counts
-from CliPP2.runners.model_selection import (
+from CliPP2.model_selection.adaptive import (
+    _best_candidate_rows_by_lambda,
+    _full_fusion_box_residual_with_dual_balls,
+)
+from CliPP2.model_selection.config import (
     ADAPTIVE_FIRST_PASS_INNER_MAX_ITER,
     ADAPTIVE_FIRST_PASS_OUTER_MAX_ITER,
+)
+from CliPP2.model_selection.partitions import _partition_is_coarsening
+from CliPP2.model_selection.scoring import (
+    _add_bic_selection_eligible,
+    _is_bic_selection_eligible,
+)
+from CliPP2.runners.model_selection import (
     ADAPTIVE_PATH_MAX_CANDIDATES,
     ADAPTIVE_PATH_MAX_ROUNDS,
     ADAPTIVE_PATH_REFINE_PER_ROUND,
     ADAPTIVE_PATH_TRANSITION_PROBE_MAX_CANDIDATES,
     BICSelectionResult,
     SimulationDiagnostics,
-    _add_bic_selection_eligible,
     _adaptive_first_pass_options,
-    _adaptive_interval_proposals,
     _adaptive_interval_proposal_records,
     _adaptive_transition_probe_records,
-    _best_candidate_rows_by_lambda,
-    _full_fusion_box_residual_with_dual_balls,
-    _is_bic_selection_eligible,
     _lambda_warm_start_distance,
-    _partition_is_coarsening,
     _partition_signature,
     _sorted_unique_lambdas,
     select_model,
@@ -679,12 +684,12 @@ def test_adaptive_interval_refines_zero_left_partition_change() -> None:
         ]
     )
 
-    proposals = _adaptive_interval_proposals(
-        search_df,
-        normalized_score="bic",
-        tol=1e-4,
-        max_new=1,
-    )
+    proposals = [
+        proposal.lambda_value
+        for proposal in _adaptive_interval_proposal_records(
+            search_df, normalized_score="bic", tol=1e-4, max_new=1
+        )
+    ]
 
     assert np.allclose(proposals, [0.5])
 
@@ -708,12 +713,12 @@ def test_adaptive_interval_refines_wide_same_partition_plateau() -> None:
         ]
     )
 
-    proposals = _adaptive_interval_proposals(
-        search_df,
-        normalized_score="bic",
-        tol=1e-4,
-        max_new=1,
-    )
+    proposals = [
+        proposal.lambda_value
+        for proposal in _adaptive_interval_proposal_records(
+            search_df, normalized_score="bic", tol=1e-4, max_new=1
+        )
+    ]
 
     assert np.allclose(proposals, [10.0])
 
@@ -804,12 +809,12 @@ def test_adaptive_interval_kkt_risk_uses_selection_eligible_not_converged() -> N
         ]
     )
 
-    proposals = _adaptive_interval_proposals(
-        search_df,
-        normalized_score="bic",
-        tol=1e-4,
-        max_new=1,
-    )
+    proposals = [
+        proposal.lambda_value
+        for proposal in _adaptive_interval_proposal_records(
+            search_df, normalized_score="bic", tol=1e-4, max_new=1
+        )
+    ]
 
     assert np.allclose(proposals, [np.sqrt(10.0 * 100.0)])
 

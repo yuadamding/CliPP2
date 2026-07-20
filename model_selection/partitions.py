@@ -7,6 +7,7 @@ import numpy as np
 from ..io.data import TumorData
 from ..core.fusion.multiplicity import infer_multiplicity_posterior_numpy
 from ..core.fusion.partition_starts import PartitionCandidate
+from ..core.fusion.refit import _canonical_labels as _canonical_partition_labels
 from .config import (
     LIKELIHOOD_PARTITION_K_ANCHORS,
     LIKELIHOOD_PARTITION_K_MAX,
@@ -70,7 +71,7 @@ def _likelihood_partition_refinement_k_grid(
         return [], "none"
 
     k_cap = min(int(LIKELIHOOD_PARTITION_K_MAX), int(num_mutations))
-    grid = sorted(set(int(k) for k in sparse_grid if 1 <= int(k) <= k_cap))
+    grid = sorted({int(k) for k in sparse_grid if 1 <= int(k) <= k_cap})
     if not grid:
         return [], "none"
 
@@ -134,24 +135,6 @@ def _deduplicate_partition_candidates(
             str(candidate.source),
         ),
     )
-
-
-def _canonical_partition_labels(labels: np.ndarray) -> np.ndarray:
-    labels = np.asarray(labels, dtype=np.int64)
-    if labels.size == 0:
-        return labels.copy()
-    root_to_label: dict[int, int] = {}
-    canonical = np.empty_like(labels)
-    next_label = 0
-    for idx, value in enumerate(labels):
-        key = int(value)
-        label = root_to_label.get(key)
-        if label is None:
-            label = next_label
-            root_to_label[key] = label
-            next_label += 1
-        canonical[idx] = label
-    return canonical
 
 
 def _partition_blocks(labels: np.ndarray) -> tuple[tuple[int, ...], ...]:
