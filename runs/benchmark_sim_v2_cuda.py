@@ -226,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dense-fallback-policy",
         type=_normalize_fallback_policy,
-        default="auto",
+        default="device_only",
     )
     parser.add_argument(
         "--workset-max-bytes", type=_positive_int, default=DEFAULT_WORKSET_MAX_BYTES

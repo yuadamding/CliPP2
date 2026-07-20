@@ -694,6 +694,11 @@ def build_run_config(
     source_sha256: str,
     environment_sha256: str,
 ) -> dict[str, object]:
+    from CliPP2.core.fusion.defaults import (
+        normalize_dense_fallback_policy,
+        normalize_inner_backend,
+    )
+
     return {
         "schema_version": SCHEMA_VERSION,
         "cohort_sha256": cohort_sha256,
@@ -701,6 +706,7 @@ def build_run_config(
         "environment_sha256": environment_sha256,
         "conda_environment": CONDA_ENVIRONMENT,
         "device": str(args.device),
+        "allow_cpu": bool(getattr(args, "allow_cpu", False)),
         "dtype": "float64",
         "lambda_grid": None,
         "lambda_grid_mode": "partition_guided_admm",
@@ -716,13 +722,12 @@ def build_run_config(
         "summary_tol": float(args.summary_tol),
         "bic_partition_tol": float(args.bic_partition_tol),
         "major_prior": float(args.major_prior),
-        "inner_backend": str(args.inner_backend).strip().lower().replace("-", "_"),
+        "inner_backend": normalize_inner_backend(args.inner_backend),
         "workset_max_bytes": int(args.workset_max_bytes),
         "compressed_cache_max_bytes": int(args.compressed_cache_max_bytes),
-        "dense_fallback_policy": str(args.dense_fallback_policy)
-        .strip()
-        .lower()
-        .replace("-", "_"),
+        "dense_fallback_policy": normalize_dense_fallback_policy(
+            args.dense_fallback_policy
+        ),
         "workset_add_batch": int(args.workset_add_batch),
         "workset_max_expansions": int(args.workset_max_expansions),
         "certificate_max_iter": int(args.certificate_max_iter),
@@ -741,6 +746,12 @@ def build_run_config(
 def _fit_options_from_config(config: Mapping[str, object]):
     """Recreate the immutable worker solver options, including exact backends."""
 
+    from CliPP2.core.fusion.defaults import (
+        DEFAULT_DENSE_FALLBACK_POLICY,
+        DEFAULT_INNER_BACKEND,
+        normalize_dense_fallback_policy,
+        normalize_inner_backend,
+    )
     from CliPP2.core.model import FitOptions
 
     return FitOptions(
@@ -753,14 +764,18 @@ def _fit_options_from_config(config: Mapping[str, object]):
         major_prior=float(config["major_prior"]),
         device=str(config["device"]),
         dtype=str(config["dtype"]),
-        inner_backend=str(config.get("inner_backend", "dense")),
+        inner_backend=normalize_inner_backend(
+            str(config.get("inner_backend", DEFAULT_INNER_BACKEND))
+        ),
         workset_max_bytes=int(
             config.get("workset_max_bytes", DEFAULT_WORKSET_MAX_BYTES)
         ),
         compressed_cache_max_bytes=int(
             config.get("compressed_cache_max_bytes", DEFAULT_COMPRESSED_CACHE_MAX_BYTES)
         ),
-        dense_fallback_policy=str(config.get("dense_fallback_policy", "auto")),
+        dense_fallback_policy=normalize_dense_fallback_policy(
+            str(config.get("dense_fallback_policy", DEFAULT_DENSE_FALLBACK_POLICY))
+        ),
         workset_add_batch=int(
             config.get("workset_add_batch", DEFAULT_WORKSET_ADD_BATCH)
         ),
@@ -1516,7 +1531,7 @@ def validate_case_artifacts(
     allowed_devices = {expected_device}
     if (
         expected_device == "cuda"
-        and str(config.get("dense_fallback_policy", "auto"))
+        and str(config.get("dense_fallback_policy", "device_only"))
         .strip()
         .lower()
         .replace("-", "_")
@@ -2201,7 +2216,15 @@ def worker_main(argv: Sequence[str]) -> int:
             f"Simulation truth changed after scheduler preflight: {tumor_id}"
         )
     device = str(config["device"])
-    _assert_backend_available(device, allow_cpu=device == "cpu")
+    allow_cpu = bool(config.get("allow_cpu", False))
+    if (
+        str(config.get("dense_fallback_policy", "device_only")) == "cpu_allowed"
+        and not allow_cpu
+    ):
+        raise RuntimeError(
+            "CPU fallback policy lacks explicit allow_cpu authorization."
+        )
+    _assert_backend_available(device, allow_cpu=allow_cpu)
     if config["lambda_grid"] is not None:
         raise RuntimeError("Sim1K worker refuses a prespecified lambda grid.")
     if config["lambda_grid_mode"] != "partition_guided_admm":
@@ -2262,7 +2285,10 @@ def _scheduler_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-cpu",
         action="store_true",
-        help="Permit an explicitly requested --device cpu run. CUDA never falls back automatically.",
+        help=(
+            "Authorize CPU execution, either through --device cpu or an explicit "
+            "--dense-fallback-policy cpu-allowed CUDA fallback."
+        ),
     )
     parser.add_argument("--outer-max-iter", type=int, default=8)
     parser.add_argument("--inner-max-iter", type=int, default=30)
@@ -2286,7 +2312,7 @@ def _scheduler_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dense-fallback-policy",
         choices=("auto", "device-only", "cpu-allowed", "error"),
-        default="auto",
+        default="device-only",
     )
     parser.add_argument(
         "--workset-add-batch", type=int, default=DEFAULT_WORKSET_ADD_BATCH
@@ -2336,10 +2362,18 @@ def _scheduler_parser() -> argparse.ArgumentParser:
 
 
 def _validate_scheduler_args(args: argparse.Namespace) -> None:
+    from CliPP2.core.fusion.defaults import normalize_dense_fallback_policy
+
+    fallback_policy = normalize_dense_fallback_policy(args.dense_fallback_policy)
     if args.device == "cpu" and not args.allow_cpu:
         raise ValueError("--device cpu requires --allow-cpu.")
-    if args.device == "cuda" and args.allow_cpu:
-        raise ValueError("--allow-cpu is only valid together with --device cpu.")
+    if fallback_policy == "cpu_allowed" and not args.allow_cpu:
+        raise ValueError("--dense-fallback-policy cpu-allowed requires --allow-cpu.")
+    if args.allow_cpu and args.device != "cpu" and fallback_policy != "cpu_allowed":
+        raise ValueError(
+            "With --device cuda, --allow-cpu requires "
+            "--dense-fallback-policy cpu-allowed."
+        )
     for name in (
         "outer_max_iter",
         "inner_max_iter",
@@ -2366,9 +2400,9 @@ def _validate_scheduler_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{name.replace('_', '-')} must be finite and positive.")
     if (
         not math.isfinite(float(args.major_prior))
-        or not 0.0 <= float(args.major_prior) <= 1.0
+        or not 0.0 < float(args.major_prior) < 1.0
     ):
-        raise ValueError("--major-prior must be finite and in [0, 1].")
+        raise ValueError("--major-prior must be finite and strictly between 0 and 1.")
     if not math.isfinite(float(args.bic_df_scale)) or float(args.bic_df_scale) <= 0.0:
         raise ValueError("--bic-df-scale must be finite and positive.")
     if (

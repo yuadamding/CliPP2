@@ -5,6 +5,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,19 +42,71 @@ def test_cli_help_is_default_fit_only() -> None:
     assert "--simulation-root" in fit.stdout
     assert "fixed_grid" not in fit.stdout
     assert "dense_no_zero" not in fit.stdout
+    normalized_help = " ".join(top.stdout.split())
+    normalized_fit_help = " ".join(fit.stdout.split())
+    assert "Production defaults use CUDA" in normalized_help
+    assert "device-only" in fit.stdout
+    assert "Dense already materializes" in normalized_fit_help
 
 
 def test_fit_cli_defaults_to_assignment_aware_selection() -> None:
-    from CliPP2.cli import build_parser
+    from CliPP2.cli import _fit_options_from_args, parse_args
 
-    args = build_parser().parse_args(["fit"])
+    args = parse_args(["fit", "--input-file", "tumor.tsv"])
+    options = _fit_options_from_args(args)
 
     assert args.selection_score == "partition_icl"
     assert args.lambda_grid_mode == "partition_guided_admm"
     assert args.simulation_root is None
+    assert args.outdir == "clipp2_results"
     assert args.bic_df_scale == 1.0
     assert args.bic_cluster_penalty == 0.0
     assert args.materialize_full_dual is False
+    assert (options.device, options.dtype) == ("cuda", "float64")
+    assert options.inner_backend == "dense"
+    assert options.dense_fallback_policy == "device_only"
+
+
+def test_fit_cli_requires_exactly_one_input_selector() -> None:
+    from CliPP2.cli import parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args(["fit"])
+    with pytest.raises(SystemExit):
+        parse_args(["fit", "--input-file", "tumor.tsv", "--input-dir", "tumors"])
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--selection-score", "bic"],
+        ["--selection-score", "extended_bic"],
+        ["--lambda-grid", "0.1,1.0"],
+    ],
+)
+def test_partition_guided_cli_rejects_incompatible_options(
+    arguments: list[str],
+) -> None:
+    from CliPP2.cli import parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args(["fit", "--input-file", "tumor.tsv", *arguments])
+
+
+def test_auto_device_request_is_passed_to_the_runtime() -> None:
+    from CliPP2.cli import _fit_options_from_args, parse_args
+
+    args = parse_args(["fit", "--input-file", "tumor.tsv", "--device", "auto"])
+
+    assert _fit_options_from_args(args).device == "auto"
+
+
+def test_auto_inner_backend_is_a_dense_compatibility_alias() -> None:
+    from CliPP2.cli import _fit_options_from_args, parse_args
+
+    args = parse_args(["fit", "--input-file", "tumor.tsv", "--inner-backend", "auto"])
+
+    assert _fit_options_from_args(args).inner_backend == "dense"
 
 
 def test_top_level_package_surface_is_compact() -> None:

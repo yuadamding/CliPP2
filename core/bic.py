@@ -71,8 +71,13 @@ def bic_degrees_of_freedom(num_clusters: int, data: TumorData) -> int:
     return max(int(num_clusters), 1) * int(data.num_regions)
 
 
-def compute_bic_with_df(loglik: float, degrees_of_freedom: float, num_observations: float) -> float:
-    return float(-2.0 * float(loglik) + float(degrees_of_freedom) * np.log(max(float(num_observations), 1.0)))
+def compute_bic_with_df(
+    loglik: float, degrees_of_freedom: float, num_observations: float
+) -> float:
+    return float(
+        -2.0 * float(loglik)
+        + float(degrees_of_freedom) * np.log(max(float(num_observations), 1.0))
+    )
 
 
 def compute_classic_bic(loglik: float, num_clusters: int, data: TumorData) -> float:
@@ -81,7 +86,9 @@ def compute_classic_bic(loglik: float, num_clusters: int, data: TumorData) -> fl
     return compute_bic_with_df(loglik, degrees_of_freedom, num_observations)
 
 
-def compute_classic_bic_depth_n(loglik: float, num_clusters: int, data: TumorData) -> float:
+def compute_classic_bic_depth_n(
+    loglik: float, num_clusters: int, data: TumorData
+) -> float:
     num_observations = effective_bic_depth_count(data)
     degrees_of_freedom = bic_degrees_of_freedom(num_clusters, data)
     return compute_bic_with_df(loglik, degrees_of_freedom, num_observations)
@@ -128,7 +135,9 @@ def _validated_cluster_sizes(cluster_sizes: np.ndarray) -> np.ndarray:
     try:
         values = np.asarray(raw, dtype=np.float64)
     except (TypeError, ValueError) as exc:
-        raise ValueError("cluster_sizes must contain finite positive integers.") from exc
+        raise ValueError(
+            "cluster_sizes must contain finite positive integers."
+        ) from exc
     if (
         not np.all(np.isfinite(values))
         or np.any(values <= 0.0)

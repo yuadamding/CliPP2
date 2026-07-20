@@ -210,4 +210,3 @@ class CandidateStaticMetadata:
     edge_list_hash: str
     pilot_matrix_hash: str
     input_data_hash: str
-

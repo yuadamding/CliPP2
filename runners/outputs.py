@@ -28,7 +28,9 @@ def mutation_output_table(
             "cluster_label": fit.cluster_labels + 1,
             "cluster_size": cluster_sizes[fit.cluster_labels],
             "cluster_diameter": cluster_diameters[fit.cluster_labels],
-            "cluster_diameter_exact": np.repeat(bool(fit.cluster_diameter_exact), data.num_mutations),
+            "cluster_diameter_exact": np.repeat(
+                bool(fit.cluster_diameter_exact), data.num_mutations
+            ),
         }
     )
     for column, region_id in enumerate(data.region_ids):
@@ -53,13 +55,22 @@ def cluster_output_table(
             "cluster_label": np.arange(1, fit.n_clusters + 1, dtype=int),
             "cluster_size": cluster_sizes,
             "cluster_diameter": cluster_diameters,
-            "cluster_diameter_exact": np.repeat(bool(fit.cluster_diameter_exact), fit.n_clusters),
+            "cluster_diameter_exact": np.repeat(
+                bool(fit.cluster_diameter_exact), fit.n_clusters
+            ),
         }
     )
     for column, region_id in enumerate(data.region_ids):
-        table[f"phi_{_display_region_label(region_id)}"] = fit.cluster_centers[:, column]
-        if bic_refit_cluster_centers is not None and bic_refit_cluster_centers.shape[0] == fit.n_clusters:
-            table[f"bic_refit_phi_{_display_region_label(region_id)}"] = bic_refit_cluster_centers[:, column]
+        table[f"phi_{_display_region_label(region_id)}"] = fit.cluster_centers[
+            :, column
+        ]
+        if (
+            bic_refit_cluster_centers is not None
+            and bic_refit_cluster_centers.shape[0] == fit.n_clusters
+        ):
+            table[f"bic_refit_phi_{_display_region_label(region_id)}"] = (
+                bic_refit_cluster_centers[:, column]
+            )
     return table
 
 
@@ -68,15 +79,22 @@ def mutation_region_output_table(
     fit: FitResult,
     bic_refit_phi: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    mutation_ids = np.repeat(np.asarray(data.mutation_ids, dtype=object), data.num_regions)
+    mutation_ids = np.repeat(
+        np.asarray(data.mutation_ids, dtype=object), data.num_regions
+    )
     region_ids = np.tile(
-        np.asarray([_display_region_label(region_id) for region_id in data.region_ids], dtype=object),
+        np.asarray(
+            [_display_region_label(region_id) for region_id in data.region_ids],
+            dtype=object,
+        ),
         data.num_mutations,
     )
     cluster_labels = np.repeat(fit.cluster_labels + 1, data.num_regions)
     return pd.DataFrame(
         {
-            "tumor_id": np.repeat(np.asarray(data.tumor_id, dtype=object), mutation_ids.shape[0]),
+            "tumor_id": np.repeat(
+                np.asarray(data.tumor_id, dtype=object), mutation_ids.shape[0]
+            ),
             "mutation_id": mutation_ids,
             "region_id": region_ids,
             "cluster_label": cluster_labels,
@@ -89,7 +107,9 @@ def mutation_region_output_table(
             ).reshape(-1),
             "major_cn": data.major_cn.reshape(-1),
             "minor_cn": data.minor_cn.reshape(-1),
-            "multiplicity_estimated": fit.multiplicity_estimated_mask.reshape(-1).astype(int),
+            "multiplicity_estimated": fit.multiplicity_estimated_mask.reshape(
+                -1
+            ).astype(int),
             "gamma_major": fit.gamma_major.reshape(-1),
             "major_call": fit.major_call.reshape(-1).astype(int),
             "multiplicity_call": fit.multiplicity_call.reshape(-1),
@@ -137,7 +157,9 @@ def write_fit_outputs(
         sep="\t",
         index=False,
     )
-    cluster_output_table(data, fit, bic_refit_cluster_centers=bic_refit_cluster_centers).to_csv(
+    cluster_output_table(
+        data, fit, bic_refit_cluster_centers=bic_refit_cluster_centers
+    ).to_csv(
         outdir / f"{data.tumor_id}_cluster_centers.tsv",
         sep="\t",
         index=False,

@@ -11,6 +11,7 @@ import pandas as pd
 import torch
 
 from .._version import __version__ as _SOFTWARE_VERSION
+from ..core.fusion.defaults import DEFAULT_DEVICE
 from ..core.fusion.graph import load_pairwise_fusion_graph_tsv
 from ..core.fusion.types import ExactSolverResourceLimit
 from ..core.model import FitOptions
@@ -23,12 +24,7 @@ from .settings import summarize_tumor_regime
 
 
 def _cuda_available() -> bool:
-    try:
-        import torch
-
-        return torch.cuda.is_available()
-    except Exception:
-        return False
+    return torch.cuda.is_available()
 
 
 def _exact_resource_limit_summary(
@@ -936,9 +932,9 @@ def run_directory(
         # Guard against multi-process CUDA: each spawned process would independently
         # initialize the same device, risking OOM or allocator contention.
         effective_device = (
-            getattr(fit_options, "device", "auto")
+            getattr(fit_options, "device", DEFAULT_DEVICE)
             if fit_options is not None
-            else "auto"
+            else DEFAULT_DEVICE
         )
         if str(effective_device).strip().lower() not in {"cpu", "auto"} or (
             str(effective_device).strip().lower() == "auto" and _cuda_available()

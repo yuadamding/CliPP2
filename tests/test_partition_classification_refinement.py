@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 
+import CliPP2.core.fusion.partition_starts as partition_starts_module
 from CliPP2.core.bic import cluster_sizes_from_labels, compute_partition_icl
 from CliPP2.core.fusion.partition_starts import (
     _classification_assignment_cost,
@@ -280,6 +281,32 @@ def test_torch_ward_rejects_an_empty_initial_work_budget() -> None:
             device="cpu",
             dtype="float64",
             initial_pairwise_work_elements=0,
+        )
+
+
+def test_partition_generator_does_not_hide_explicit_cuda_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _identical_mutation_tumor()
+
+    def fail_explicit_cuda(**kwargs):
+        assert kwargs["device"] == "cuda"
+        raise RuntimeError("explicit CUDA unavailable")
+
+    monkeypatch.setattr(
+        partition_starts_module,
+        "_resolve_partition_runtime",
+        fail_explicit_cuda,
+    )
+    with pytest.raises(RuntimeError, match="explicit CUDA unavailable"):
+        generate_likelihood_partition_starts(
+            data,
+            exact_pilot=data.phi_init,
+            major_prior=0.5,
+            eps=1e-6,
+            K_grid=[1],
+            device="cuda",
+            use_torch=True,
         )
 
 

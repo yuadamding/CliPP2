@@ -19,7 +19,9 @@ def _complete_graph_weight(num_mutations: int) -> float:
 
 def build_complete_uniform_graph(num_mutations: int) -> PairwiseFusionGraph:
     edge_u, edge_v = _complete_graph_edges(num_mutations)
-    edge_w = np.full(edge_u.shape[0], _complete_graph_weight(num_mutations), dtype=np.float64)
+    edge_w = np.full(
+        edge_u.shape[0], _complete_graph_weight(num_mutations), dtype=np.float64
+    )
     return PairwiseFusionGraph(
         edge_u=edge_u,
         edge_v=edge_v,
@@ -38,13 +40,17 @@ def build_complete_adaptive_graph(
 ) -> PairwiseFusionGraph:
     pilot_phi = np.asarray(pilot_phi, dtype=np.float64)
     if pilot_phi.ndim != 2:
-        raise ValueError("pilot_phi must be a two-dimensional mutation-by-region matrix.")
+        raise ValueError(
+            "pilot_phi must be a two-dimensional mutation-by-region matrix."
+        )
     if gamma <= 0.0:
         raise ValueError("Adaptive pairwise weight exponent gamma must be positive.")
     if tau <= 0.0:
         raise ValueError("Adaptive pairwise weight floor tau must be positive.")
     if baseline <= 0.0 or not np.isfinite(baseline):
-        raise ValueError("Adaptive pairwise weight baseline must be finite and positive.")
+        raise ValueError(
+            "Adaptive pairwise weight baseline must be finite and positive."
+        )
 
     num_mutations = int(pilot_phi.shape[0])
     edge_u, edge_v = _complete_graph_edges(num_mutations)
@@ -187,7 +193,9 @@ def resolve_pairwise_fusion_graph(
     return build_complete_uniform_graph(num_mutations)
 
 
-def coerce_graph(num_mutations: int, graph: PairwiseFusionGraph | None) -> PairwiseFusionGraph:
+def coerce_graph(
+    num_mutations: int, graph: PairwiseFusionGraph | None
+) -> PairwiseFusionGraph:
     if graph is None:
         return build_complete_uniform_graph(num_mutations)
     edge_u = np.asarray(graph.edge_u, dtype=np.int32)
@@ -205,14 +213,23 @@ def coerce_graph(num_mutations: int, graph: PairwiseFusionGraph | None) -> Pairw
             name=str(graph.name),
             degree_bound=1,
         )
-    if np.any(edge_u < 0) or np.any(edge_v < 0) or np.any(edge_u >= int(num_mutations)) or np.any(edge_v >= int(num_mutations)):
-        raise ValueError("PairwiseFusionGraph edge indices must lie in [0, num_mutations).")
+    if (
+        np.any(edge_u < 0)
+        or np.any(edge_v < 0)
+        or np.any(edge_u >= int(num_mutations))
+        or np.any(edge_v >= int(num_mutations))
+    ):
+        raise ValueError(
+            "PairwiseFusionGraph edge indices must lie in [0, num_mutations)."
+        )
     if np.any(edge_u == edge_v):
         raise ValueError("PairwiseFusionGraph may not contain self-loops.")
     if not np.all(np.isfinite(edge_w)):
         raise ValueError("PairwiseFusionGraph weights must be finite.")
     if np.any(edge_w < 0.0):
-        raise ValueError("PairwiseFusionGraph weights must be nonnegative; omit zero-weight edges explicitly.")
+        raise ValueError(
+            "PairwiseFusionGraph weights must be nonnegative; omit zero-weight edges explicitly."
+        )
     positive_weight = edge_w > 0.0
     edge_u = edge_u[positive_weight]
     edge_v = edge_v[positive_weight]
@@ -231,7 +248,9 @@ def coerce_graph(num_mutations: int, graph: PairwiseFusionGraph | None) -> Pairw
     canonical_edges = np.stack([left, right], axis=1)
     _, unique_index = np.unique(canonical_edges, axis=0, return_index=True)
     if unique_index.size != canonical_edges.shape[0]:
-        raise ValueError("PairwiseFusionGraph may not contain duplicate undirected edges.")
+        raise ValueError(
+            "PairwiseFusionGraph may not contain duplicate undirected edges."
+        )
 
     order = np.lexsort((right, left))
     return PairwiseFusionGraph(
@@ -239,11 +258,15 @@ def coerce_graph(num_mutations: int, graph: PairwiseFusionGraph | None) -> Pairw
         edge_v=right[order],
         edge_w=edge_w[order],
         name=str(graph.name),
-        degree_bound=edge_degree_bound(num_mutations, edge_u=left[order], edge_v=right[order]),
+        degree_bound=edge_degree_bound(
+            num_mutations, edge_u=left[order], edge_v=right[order]
+        ),
     )
 
 
-def edge_degree_bound(num_mutations: int, edge_u: np.ndarray, edge_v: np.ndarray) -> int:
+def edge_degree_bound(
+    num_mutations: int, edge_u: np.ndarray, edge_v: np.ndarray
+) -> int:
     if edge_u.size == 0:
         return 1
     degree = np.bincount(
@@ -269,21 +292,49 @@ def load_pairwise_fusion_graph_tsv(
         edge_u = df["edge_u"].to_numpy(dtype=np.int32, copy=True)
         edge_v = df["edge_v"].to_numpy(dtype=np.int32, copy=True)
     else:
-        left_col = "mutation_u" if "mutation_u" in df.columns else "mutation_id_u" if "mutation_id_u" in df.columns else None
-        right_col = "mutation_v" if "mutation_v" in df.columns else "mutation_id_v" if "mutation_id_v" in df.columns else None
+        left_col = (
+            "mutation_u"
+            if "mutation_u" in df.columns
+            else "mutation_id_u"
+            if "mutation_id_u" in df.columns
+            else None
+        )
+        right_col = (
+            "mutation_v"
+            if "mutation_v" in df.columns
+            else "mutation_id_v"
+            if "mutation_id_v" in df.columns
+            else None
+        )
         if left_col is None or right_col is None:
             raise ValueError(
                 f"Graph file {file_path} must contain either ('edge_u', 'edge_v') or "
                 f"('mutation_u'/'mutation_id_u', 'mutation_v'/'mutation_id_v')."
             )
         if mutation_ids is None:
-            raise ValueError(f"Graph file {file_path} uses mutation IDs, but no mutation_ids mapping was provided.")
-        mutation_index = {str(mutation_id): idx for idx, mutation_id in enumerate(mutation_ids)}
+            raise ValueError(
+                f"Graph file {file_path} uses mutation IDs, but no mutation_ids mapping was provided."
+            )
+        mutation_index = {
+            str(mutation_id): idx for idx, mutation_id in enumerate(mutation_ids)
+        }
         try:
-            edge_u = df[left_col].astype(str).map(mutation_index.__getitem__).to_numpy(dtype=np.int32, copy=True)
-            edge_v = df[right_col].astype(str).map(mutation_index.__getitem__).to_numpy(dtype=np.int32, copy=True)
+            edge_u = (
+                df[left_col]
+                .astype(str)
+                .map(mutation_index.__getitem__)
+                .to_numpy(dtype=np.int32, copy=True)
+            )
+            edge_v = (
+                df[right_col]
+                .astype(str)
+                .map(mutation_index.__getitem__)
+                .to_numpy(dtype=np.int32, copy=True)
+            )
         except KeyError as exc:
-            raise ValueError(f"Graph file {file_path} references unknown mutation ID {exc.args[0]!r}.") from exc
+            raise ValueError(
+                f"Graph file {file_path} references unknown mutation ID {exc.args[0]!r}."
+            ) from exc
 
     if "edge_w" in df.columns:
         edge_w = df["edge_w"].to_numpy(dtype=np.float64, copy=True)

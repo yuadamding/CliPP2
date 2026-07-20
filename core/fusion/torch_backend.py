@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from ...io.data import TumorData
+from ...io.data import TumorData, tumor_data_fingerprint
 from .graph_ops import (
     PDHG_PRECONDITIONER_ETA,
     graph_adjoint_edges,
@@ -26,6 +26,7 @@ class TorchTumorData:
     b_plus: torch.Tensor
     b_fixed: torch.Tensor
     count_observed: torch.Tensor | None = None  # bool (M, S); None means all observed
+    data_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -43,15 +44,6 @@ DEFAULT_BOX_MAX_ITER = 32
 # its two mathematical edge states, but all additional edge work is streamed
 # in chunks bounded by this value.
 DEFAULT_EDGE_WORK_BYTES = 64 * 1024 * 1024
-
-# Single source of truth for the device/dtype defaults so they are not restated as
-# literals across FitOptions/SolverOptions/solver signatures. NOTE: a programmatic
-# caller on a CPU-only host must pass device="auto" (or "cpu"); the default stays
-# "cuda" to preserve historical behavior and the multiprocessing guard in
-# runners/pipeline.py. Flipping the library default to "auto" is a deliberate
-# product change, not done here.
-DEFAULT_DEVICE = "cuda"
-DEFAULT_DTYPE = "float64"
 
 _DTYPE_TO_NAME = {
     torch.float16: "float16",
@@ -245,7 +237,59 @@ def to_torch_tumor_data(data: TumorData, runtime: TorchRuntime) -> TorchTumorDat
             device=device,
         ),
         count_observed=count_obs_tensor,
+        data_fingerprint=tumor_data_fingerprint(data),
     )
+
+
+def validate_torch_tumor_data(
+    tensor_data: TorchTumorData,
+    *,
+    data: TumorData,
+    runtime: TorchRuntime,
+    expected_fingerprint: str | None = None,
+) -> None:
+    """Reject stale or runtime-incompatible tensors before solver reuse."""
+
+    fingerprint = expected_fingerprint or tumor_data_fingerprint(data)
+    if tensor_data.data_fingerprint != fingerprint:
+        raise ValueError("TorchTumorData fingerprint does not match TumorData.")
+
+    expected_shape = (int(data.num_mutations), int(data.num_regions))
+
+    def validate_field(name: str, *, dtype: torch.dtype) -> None:
+        value = getattr(tensor_data, name)
+        if not torch.is_tensor(value) or tuple(value.shape) != expected_shape:
+            raise ValueError(f"TorchTumorData.{name} must have shape {expected_shape}.")
+        if value.dtype != dtype:
+            raise ValueError(f"TorchTumorData.{name} must use runtime dtype {dtype}.")
+        if value.device.type != runtime.device.type or (
+            runtime.device.index is not None
+            and value.device.index != runtime.device.index
+        ):
+            raise ValueError(
+                f"TorchTumorData.{name} must be on runtime device "
+                f"{runtime.device_name}."
+            )
+
+    for name in (
+        "alt",
+        "total",
+        "nonalt",
+        "phi_upper",
+        "b_minus",
+        "b_plus",
+        "b_fixed",
+    ):
+        validate_field(name, dtype=runtime.dtype)
+    validate_field("ambiguous", dtype=torch.bool)
+
+    expected_observation_mask = data.count_observed is not None
+    if (tensor_data.count_observed is not None) != expected_observation_mask:
+        raise ValueError(
+            "TorchTumorData.count_observed presence does not match TumorData."
+        )
+    if tensor_data.count_observed is not None:
+        validate_field("count_observed", dtype=torch.bool)
 
 
 def _as_loss_shape(mask: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

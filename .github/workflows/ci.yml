@@ -30,25 +30,7 @@ jobs:
         run: ruff check .
 
       - name: Check formatting
-        run: >-
-          ruff format --check
-          cli.py
-          core/fusion/certificates.py
-          core/fusion/graph_ops.py
-          core/fusion/quotient_workset.py
-          core/fusion/solver.py
-          core/fusion/torch_backend.py
-          core/fusion/types.py
-          core/model.py
-          model_selection/candidates.py
-          model_selection/guided_fusion.py
-          model_selection/online_lambda.py
-          model_selection/scoring.py
-          runners/model_selection.py
-          runners/pipeline.py
-          runs/run_clipp2sim1k_benchmark.py
-          sim_v2_results/summarize_guided_admm.py
-          tests
+        run: ruff format --check .
 
       - name: Run tracked regression suite
         run: pytest -q

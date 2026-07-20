@@ -94,6 +94,7 @@ def _cohort(tmp_path: Path) -> tuple[Path, Path]:
 def _args() -> argparse.Namespace:
     return argparse.Namespace(
         device="cuda",
+        allow_cpu=False,
         outer_max_iter=8,
         inner_max_iter=30,
         tol=1e-4,
@@ -103,7 +104,7 @@ def _args() -> argparse.Namespace:
         inner_backend="dense",
         workset_max_bytes=scheduler.DEFAULT_WORKSET_MAX_BYTES,
         compressed_cache_max_bytes=scheduler.DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
-        dense_fallback_policy="auto",
+        dense_fallback_policy="device_only",
         workset_add_batch=scheduler.DEFAULT_WORKSET_ADD_BATCH,
         workset_max_expansions=scheduler.DEFAULT_WORKSET_MAX_EXPANSIONS,
         certificate_max_iter=scheduler.DEFAULT_CERTIFICATE_MAX_ITER,
@@ -115,6 +116,7 @@ def _args() -> argparse.Namespace:
         bic_cluster_penalty=0.0,
         timeout_seconds=100.0,
         termination_grace_seconds=5.0,
+        max_cases=None,
     )
 
 
@@ -731,7 +733,8 @@ def test_run_config_pins_science_but_not_execution_timeout() -> None:
         config["compressed_cache_max_bytes"]
         == scheduler.DEFAULT_COMPRESSED_CACHE_MAX_BYTES
     )
-    assert config["dense_fallback_policy"] == "auto"
+    assert config["dense_fallback_policy"] == "device_only"
+    assert config["allow_cpu"] is False
     assert config["allow_heuristic_structure_splits"] is True
     assert config["materialize_full_dual"] is False
     assert config["environment_sha256"] == "e" * 64
@@ -753,6 +756,7 @@ def test_run_config_pins_science_but_not_execution_timeout() -> None:
     quotient_args = _args()
     quotient_args.inner_backend = "quotient-workset"
     quotient_args.dense_fallback_policy = "cpu-allowed"
+    quotient_args.allow_cpu = True
     quotient_args.workset_max_bytes = 12345
     quotient_args.materialize_full_dual = True
     quotient_config = scheduler.build_run_config(
@@ -763,11 +767,61 @@ def test_run_config_pins_science_but_not_execution_timeout() -> None:
     )
     assert quotient_config["inner_backend"] == "quotient_workset"
     assert quotient_config["dense_fallback_policy"] == "cpu_allowed"
+    assert quotient_config["allow_cpu"] is True
     options = scheduler._fit_options_from_config(quotient_config)
     assert options.inner_backend == "quotient_workset"
     assert options.dense_fallback_policy == "cpu_allowed"
     assert options.workset_max_bytes == 12345
     assert options.materialize_full_dual is True
+
+
+def test_legacy_auto_policy_aliases_normalize_to_clean_defaults() -> None:
+    args = _args()
+    args.inner_backend = "auto"
+    args.dense_fallback_policy = "auto"
+
+    config = scheduler.build_run_config(
+        args,
+        cohort_sha256="a" * 64,
+        source_sha256="b" * 64,
+        environment_sha256="e" * 64,
+    )
+
+    assert config["inner_backend"] == "dense"
+    assert config["dense_fallback_policy"] == "device_only"
+
+
+@pytest.mark.parametrize("major_prior", [0.0, 1.0, float("nan")])
+def test_scheduler_rejects_invalid_major_prior(major_prior: float) -> None:
+    args = _args()
+    args.major_prior = major_prior
+
+    with pytest.raises(ValueError, match="strictly between"):
+        scheduler._validate_scheduler_args(args)
+
+
+def test_scheduler_requires_explicit_cpu_fallback_authorization() -> None:
+    args = _args()
+    args.dense_fallback_policy = "cpu-allowed"
+    with pytest.raises(ValueError, match="requires --allow-cpu"):
+        scheduler._validate_scheduler_args(args)
+
+    args.allow_cpu = True
+    scheduler._validate_scheduler_args(args)
+
+    args.dense_fallback_policy = "device-only"
+    with pytest.raises(ValueError, match="requires.*cpu-allowed"):
+        scheduler._validate_scheduler_args(args)
+
+
+def test_scheduler_allows_explicit_cpu_device_only_with_permission() -> None:
+    args = _args()
+    args.device = "cpu"
+    with pytest.raises(ValueError, match="requires --allow-cpu"):
+        scheduler._validate_scheduler_args(args)
+
+    args.allow_cpu = True
+    scheduler._validate_scheduler_args(args)
 
 
 def test_max_cases_selects_next_pending_cases(tmp_path: Path) -> None:

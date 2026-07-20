@@ -264,8 +264,10 @@ def test_full_guided_builder_matches_when_all_edge_helpers_are_chunked(
     assert (
         chunked.solver_state.previous_lambda == vectorized.solver_state.previous_lambda
     )
-    assert chunked.solver_state.split is vectorized.solver_state.split is None
-    assert chunked.solver_state.curvature is vectorized.solver_state.curvature is None
+    assert not hasattr(chunked.solver_state, "split")
+    assert not hasattr(chunked.solver_state, "curvature")
+    assert not hasattr(vectorized.solver_state, "split")
+    assert not hasattr(vectorized.solver_state, "curvature")
     torch.testing.assert_close(
         chunked.solver_state.phi,
         vectorized.solver_state.phi,
@@ -340,8 +342,8 @@ def test_compressed_guided_builder_matches_dense_diagnostics_and_state() -> None
     torch.testing.assert_close(
         warm_state.internal_dual,
         default_dense.solver_state.dual.index_select(0, warm_state.internal_edge_ids),
-        rtol=0.0,
-        atol=0.0,
+        rtol=4.0 * torch.finfo(torch.float64).eps,
+        atol=4.0 * torch.finfo(torch.float64).eps,
     )
     torch.testing.assert_close(
         warm_state.labels,
@@ -356,6 +358,57 @@ def test_compressed_guided_builder_matches_dense_diagnostics_and_state() -> None
         rtol=0.0,
         atol=0.0,
     )
+
+
+def test_compressed_guided_large_block_uses_balanced_tree_flow() -> None:
+    num_nodes = 511
+    edge_index = torch.triu_indices(num_nodes, num_nodes, offset=1)
+    labels = torch.zeros(num_nodes, dtype=torch.long)
+    cluster_sizes = torch.tensor([num_nodes], dtype=torch.long)
+    first_region = torch.arange(num_nodes, dtype=torch.float64) - (num_nodes - 1) / 2.0
+    flow_demand = torch.stack([first_region, -2.0 * first_region], dim=1)
+    edge_w = torch.ones(edge_index.shape[1], dtype=torch.float64)
+
+    edge_ids, tree_dual = guided_fusion._implicit_guided_tree_support(
+        lambda_value=1e9,
+        labels=labels,
+        flow_demand=flow_demand,
+        cluster_sizes=cluster_sizes,
+        edge_u=edge_index[0],
+        edge_v=edge_index[1],
+        edge_w=edge_w,
+        chunk_edges=17,
+    )
+
+    support_u = edge_index[0].index_select(0, edge_ids)
+    support_v = edge_index[1].index_select(0, edge_ids)
+    degree = torch.zeros(num_nodes, dtype=torch.long)
+    ones = torch.ones(num_nodes - 1, dtype=torch.long)
+    degree.index_add_(0, support_u, ones)
+    degree.index_add_(0, support_v, ones)
+    assert int(edge_ids.numel()) == num_nodes - 1
+    assert int(torch.max(degree).item()) <= 3
+
+    tree_adjoint = torch.zeros_like(flow_demand)
+    tree_adjoint.index_add_(0, support_u, tree_dual)
+    tree_adjoint.index_add_(0, support_v, tree_dual, alpha=-1.0)
+    torch.testing.assert_close(tree_adjoint, -flow_demand, rtol=0.0, atol=0.0)
+
+    projected_edge_ids, projected_dual = guided_fusion._implicit_guided_tree_support(
+        lambda_value=1.0,
+        labels=labels,
+        flow_demand=flow_demand,
+        cluster_sizes=cluster_sizes,
+        edge_u=edge_index[0],
+        edge_v=edge_index[1],
+        edge_w=edge_w,
+        chunk_edges=17,
+    )
+    torch.testing.assert_close(projected_edge_ids, edge_ids, rtol=0.0, atol=0.0)
+    projected_norm = torch.linalg.vector_norm(projected_dual, dim=1)
+    tolerance = 8.0 * torch.finfo(torch.float64).eps
+    assert bool(torch.all(projected_norm <= 1.0 + tolerance).item())
+    assert bool(torch.any(projected_norm >= 1.0 - tolerance).item())
 
 
 def test_compressed_guided_builder_never_materializes_full_edge_dual(

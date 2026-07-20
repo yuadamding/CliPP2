@@ -100,8 +100,8 @@ def test_guided_initialization_uses_observed_within_block_dual_capacity() -> Non
         expected_lambda
     )
     assert result.solver_state.previous_lambda == result.lambda_value
-    assert result.solver_state.split is None
-    assert result.solver_state.curvature is None
+    assert not hasattr(result.solver_state, "split")
+    assert not hasattr(result.solver_state, "curvature")
     assert torch.equal(result.solver_state.phi[0], result.solver_state.phi[1])
     assert torch.allclose(result.solver_state.dual[within][0], expected_dual)
     assert result.diagnostics.max_dual_ball_ratio <= 1.0 + 1e-12

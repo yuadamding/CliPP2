@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,18 +13,20 @@ class TumorData:
     tumor_id: str
     mutation_ids: list[str]
     region_ids: list[str]
-    alt_counts: np.ndarray      # float64 (M, S)
-    total_counts: np.ndarray    # float64 (M, S)
-    purity: np.ndarray          # float64 (M, S)
-    major_cn: np.ndarray        # float64 (M, S)
-    minor_cn: np.ndarray        # float64 (M, S)
-    normal_cn: np.ndarray       # float64 (M, S)
-    has_cna: np.ndarray         # bool (M, S)
-    scaling: np.ndarray         # float64 (M, S)
-    phi_upper: np.ndarray       # float64 (M, S)
-    phi_init: np.ndarray        # float64 (M, S)
-    init_major_mask: np.ndarray # bool (M, S)
-    count_observed: np.ndarray | None = None  # bool (M, S) — True if counts observed; None means all observed
+    alt_counts: np.ndarray  # float64 (M, S)
+    total_counts: np.ndarray  # float64 (M, S)
+    purity: np.ndarray  # float64 (M, S)
+    major_cn: np.ndarray  # float64 (M, S)
+    minor_cn: np.ndarray  # float64 (M, S)
+    normal_cn: np.ndarray  # float64 (M, S)
+    has_cna: np.ndarray  # bool (M, S)
+    scaling: np.ndarray  # float64 (M, S)
+    phi_upper: np.ndarray  # float64 (M, S)
+    phi_init: np.ndarray  # float64 (M, S)
+    init_major_mask: np.ndarray  # bool (M, S)
+    count_observed: np.ndarray | None = (
+        None  # bool (M, S) — True if counts observed; None means all observed
+    )
 
     @property
     def num_mutations(self) -> int:
@@ -53,6 +56,57 @@ class TumorData:
         return self.major_cn.astype(np.float64, copy=True)
 
 
+def tumor_data_fingerprint(data: TumorData) -> str:
+    """Return a deterministic identity for every observed-objective input."""
+
+    digest = hashlib.sha256()
+
+    def update_text(value: str) -> None:
+        encoded = str(value).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+
+    def update_text_sequence(values: list[str]) -> None:
+        digest.update(len(values).to_bytes(8, "little"))
+        for value in values:
+            update_text(value)
+
+    def update_array(name: str, values: np.ndarray) -> None:
+        update_text(name)
+        array = np.ascontiguousarray(np.asarray(values))
+        update_text(str(array.dtype))
+        digest.update(len(array.shape).to_bytes(8, "little"))
+        for dimension in array.shape:
+            digest.update(int(dimension).to_bytes(8, "little", signed=True))
+        digest.update(array.tobytes())
+
+    update_text(data.tumor_id)
+    update_text_sequence(list(data.mutation_ids))
+    update_text_sequence(list(data.region_ids))
+    for name in (
+        "alt_counts",
+        "total_counts",
+        "purity",
+        "major_cn",
+        "minor_cn",
+        "normal_cn",
+        "has_cna",
+        "scaling",
+        "phi_upper",
+        "phi_init",
+        "init_major_mask",
+    ):
+        update_array(name, getattr(data, name))
+    count_observed = getattr(data, "count_observed", None)
+    update_array(
+        "count_observed",
+        np.ones_like(np.asarray(data.alt_counts), dtype=bool)
+        if count_observed is None
+        else np.asarray(count_observed, dtype=bool),
+    )
+    return digest.hexdigest()
+
+
 def _first_seen(values: pd.Series) -> list[str]:
     return list(pd.Index(values.astype(str)).drop_duplicates())
 
@@ -65,11 +119,15 @@ def _parse_bool_like(value: object, *, column_name: str) -> bool:
     if isinstance(value, (int, np.integer)):
         if int(value) in {0, 1}:
             return bool(int(value))
-        raise ValueError(f"Invalid integer boolean value {value!r} in column '{column_name}'.")
+        raise ValueError(
+            f"Invalid integer boolean value {value!r} in column '{column_name}'."
+        )
     if isinstance(value, (float, np.floating)):
         if float(value) in {0.0, 1.0}:
             return bool(int(value))
-        raise ValueError(f"Invalid float boolean value {value!r} in column '{column_name}'.")
+        raise ValueError(
+            f"Invalid float boolean value {value!r} in column '{column_name}'."
+        )
     normalized = str(value).strip().lower()
     if normalized in {"true", "t", "yes", "y", "1"}:
         return True
@@ -78,7 +136,9 @@ def _parse_bool_like(value: object, *, column_name: str) -> bool:
     raise ValueError(f"Invalid boolean value {value!r} in column '{column_name}'.")
 
 
-def _safe_probability(scale: np.ndarray, multiplicity: np.ndarray, phi: np.ndarray, eps: float) -> np.ndarray:
+def _safe_probability(
+    scale: np.ndarray, multiplicity: np.ndarray, phi: np.ndarray, eps: float
+) -> np.ndarray:
     return np.clip(scale * multiplicity * phi, eps, 1.0 - eps)
 
 
@@ -120,8 +180,12 @@ def compute_phi_init_from_counts(
     p_major = _safe_probability(scaling, major_cn, phi_major, eps)
     p_minor = _safe_probability(scaling, minor_cn, phi_minor, eps)
 
-    loglik_major = alt_counts * np.log(p_major) + (total_counts - alt_counts) * np.log1p(-p_major)
-    loglik_minor = alt_counts * np.log(p_minor) + (total_counts - alt_counts) * np.log1p(-p_minor)
+    loglik_major = alt_counts * np.log(p_major) + (
+        total_counts - alt_counts
+    ) * np.log1p(-p_major)
+    loglik_minor = alt_counts * np.log(p_minor) + (
+        total_counts - alt_counts
+    ) * np.log1p(-p_minor)
 
     init_major_mask = loglik_major >= loglik_minor
     phi_init = np.where(init_major_mask, phi_major, phi_minor)
@@ -141,9 +205,12 @@ def _validate_inputs_strict(
 ) -> None:
     errors: list[str] = []
     for name, matrix in [
-        ("alt_counts", alt_counts), ("total_counts", total_counts),
-        ("purity", purity), ("major_cn", major_cn),
-        ("minor_cn", minor_cn), ("normal_cn", normal_cn),
+        ("alt_counts", alt_counts),
+        ("total_counts", total_counts),
+        ("purity", purity),
+        ("major_cn", major_cn),
+        ("minor_cn", minor_cn),
+        ("normal_cn", normal_cn),
     ]:
         if not np.all(np.isfinite(matrix)):
             errors.append(f"Non-finite values in '{name}'.")
@@ -211,7 +278,9 @@ def load_tumor_tsv(
     elif "tumour_content" in df.columns:
         purity_col = "tumour_content"
     else:
-        raise ValueError(f"Missing purity column in {file_path}; expected 'purity' or 'tumour_content'.")
+        raise ValueError(
+            f"Missing purity column in {file_path}; expected 'purity' or 'tumour_content'."
+        )
 
     if "normal_cn" not in df.columns:
         df["normal_cn"] = 2.0
@@ -227,7 +296,8 @@ def load_tumor_tsv(
     if bool(duplicate_mask.any()):
         duplicate_pairs = pair_df.loc[duplicate_mask].drop_duplicates().head(5)
         duplicate_examples = ", ".join(
-            f"({row.mutation_id}, {row.sample_id})" for row in duplicate_pairs.itertuples(index=False)
+            f"({row.mutation_id}, {row.sample_id})"
+            for row in duplicate_pairs.itertuples(index=False)
         )
         raise ValueError(
             f"Duplicate mutation-region rows found in {file_path}. "
@@ -241,10 +311,18 @@ def load_tumor_tsv(
     num_mutations = len(mutation_ids)
     num_regions = len(region_ids)
     if len(df) != num_mutations * num_regions:
-        mutation_codes_check = pd.Categorical(df["mutation_id"], categories=mutation_ids).codes
-        region_codes_check = pd.Categorical(df["sample_id"], categories=region_ids).codes
-        observed_set = set(zip(mutation_codes_check.tolist(), region_codes_check.tolist()))
-        expected_set = {(i, j) for i in range(num_mutations) for j in range(num_regions)}
+        mutation_codes_check = pd.Categorical(
+            df["mutation_id"], categories=mutation_ids
+        ).codes
+        region_codes_check = pd.Categorical(
+            df["sample_id"], categories=region_ids
+        ).codes
+        observed_set = set(
+            zip(mutation_codes_check.tolist(), region_codes_check.tolist())
+        )
+        expected_set = {
+            (i, j) for i in range(num_mutations) for j in range(num_regions)
+        }
         missing_pairs_coded = sorted(expected_set.difference(observed_set))[:5]
         missing_examples = ", ".join(
             f"({mutation_ids[i]}, {region_ids[j]})" for i, j in missing_pairs_coded
@@ -256,7 +334,9 @@ def load_tumor_tsv(
         )
 
     # Vectorized fill using categorical integer codes
-    mutation_codes = pd.Categorical(df["mutation_id"], categories=mutation_ids).codes.copy()
+    mutation_codes = pd.Categorical(
+        df["mutation_id"], categories=mutation_ids
+    ).codes.copy()
     region_codes = pd.Categorical(df["sample_id"], categories=region_ids).codes.copy()
 
     alt_vals = df["alt_counts"].to_numpy(dtype=np.float64)
@@ -303,7 +383,10 @@ def load_tumor_tsv(
     # count_observed mask
     if "count_observed" in df.columns:
         count_obs_vals = np.array(
-            [_parse_bool_like(v, column_name="count_observed") for v in df["count_observed"]],
+            [
+                _parse_bool_like(v, column_name="count_observed")
+                for v in df["count_observed"]
+            ],
             dtype=bool,
         )
         count_observed = np.zeros((num_mutations, num_regions), dtype=bool)
@@ -320,7 +403,9 @@ def load_tumor_tsv(
         "normal_cn": normal_cn,
     }.items():
         if not np.all(np.isfinite(matrix)):
-            raise ValueError(f"Non-finite values in matrix '{name}' after loading {file_path}.")
+            raise ValueError(
+                f"Non-finite values in matrix '{name}' after loading {file_path}."
+            )
 
     if normalized_validation_mode == "strict":
         _validate_inputs_strict(
@@ -380,4 +465,5 @@ __all__ = [
     "TumorData",
     "compute_phi_init_from_counts",
     "load_tumor_tsv",
+    "tumor_data_fingerprint",
 ]

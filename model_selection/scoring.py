@@ -84,9 +84,9 @@ def _is_bic_selection_eligible(
     bic_refit_converged: bool | None = None,
 ) -> bool:
     refit_finite = (
-        bool(bic_refit_finite_candidate_found)
+        _bool_with_default(bic_refit_finite_candidate_found, default=False)
         if bic_refit_finite_candidate_found is not None
-        else bool(bic_refit_converged)
+        else _bool_with_default(bic_refit_converged, default=False)
     )
     selected_score_finite = (
         np.isfinite(float(classic_bic))
@@ -94,7 +94,7 @@ def _is_bic_selection_eligible(
         else np.isfinite(float(selection_score_value))
     )
     return bool(
-        bool(raw_kkt_eligible)
+        _bool_with_default(raw_kkt_eligible, default=False)
         and refit_finite
         and np.isfinite(float(classic_bic))
         and selected_score_finite
@@ -104,7 +104,7 @@ def _is_bic_selection_eligible(
 def _bic_selection_eligible_mask(search_df: pd.DataFrame) -> np.ndarray:
     n_rows = int(search_df.shape[0])
     if "bic_selection_eligible" in search_df.columns:
-        return search_df["bic_selection_eligible"].astype(bool).to_numpy(dtype=bool)
+        return _strict_bool_mask(search_df["bic_selection_eligible"])
     if any(
         column in search_df.columns
         for column in (
@@ -121,9 +121,9 @@ def _bic_selection_eligible_mask(search_df: pd.DataFrame) -> np.ndarray:
             .to_numpy(dtype=bool)
         )
     if "selection_eligible" in search_df.columns:
-        return search_df["selection_eligible"].astype(bool).to_numpy(dtype=bool)
+        return _strict_bool_mask(search_df["selection_eligible"])
     if "converged" in search_df.columns:
-        return search_df["converged"].astype(bool).to_numpy(dtype=bool)
+        return _strict_bool_mask(search_df["converged"])
     return np.zeros(n_rows, dtype=bool)
 
 
@@ -134,11 +134,7 @@ def _false_mask(search_df: pd.DataFrame) -> np.ndarray:
 def _required_bool_mask(search_df: pd.DataFrame, column: str) -> np.ndarray:
     if column not in search_df.columns:
         return _false_mask(search_df)
-    return (
-        search_df[column]
-        .map(lambda value: _bool_with_default(value, default=False))
-        .to_numpy(dtype=bool)
-    )
+    return _strict_bool_mask(search_df[column])
 
 
 def _required_text_mask(
@@ -297,15 +293,14 @@ def _positive_admm_fusion_selection_mask(search_df: pd.DataFrame) -> np.ndarray:
 
 
 def _row_bic_selection_eligible(row: pd.Series) -> bool:
-    return bool(
-        row.get(
-            "bic_selection_eligible",
-            row.get("selection_eligible", row.get("converged", False)),
-        )
+    value = row.get(
+        "bic_selection_eligible",
+        row.get("selection_eligible", row.get("converged", False)),
     )
+    return _bool_with_default(value, default=False)
 
 
-def _bool_with_default(value: object, default: bool = True) -> bool:
+def _bool_with_default(value: object, default: bool = False) -> bool:
     if value is None:
         return bool(default)
     try:
@@ -319,11 +314,28 @@ def _bool_with_default(value: object, default: bool = True) -> bool:
             return False
         if normalized in {"1", "true", "t", "yes", "y"}:
             return True
-    return bool(value)
+        return bool(default)
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer, float, np.floating)):
+        numeric = float(value)
+        if numeric == 0.0:
+            return False
+        if numeric == 1.0:
+            return True
+    return bool(default)
+
+
+def _strict_bool_mask(values: pd.Series) -> np.ndarray:
+    return values.map(lambda value: _bool_with_default(value, default=False)).to_numpy(
+        dtype=bool, copy=True
+    )
 
 
 def _row_lambda_applicable(row: pd.Series) -> bool:
-    return _bool_with_default(row.get("lambda_applicable", True), default=True)
+    if "lambda_applicable" not in row:
+        return True
+    return _bool_with_default(row["lambda_applicable"], default=False)
 
 
 def _row_lambda_if_applicable(row: pd.Series) -> float | None:
@@ -342,11 +354,7 @@ def _lambda_applicable_mask(frame: pd.DataFrame) -> np.ndarray:
     if frame.empty:
         return np.zeros(0, dtype=bool)
     if "lambda_applicable" in frame.columns:
-        mask = (
-            frame["lambda_applicable"]
-            .map(_bool_with_default)
-            .to_numpy(dtype=bool, copy=True)
-        )
+        mask = _strict_bool_mask(frame["lambda_applicable"])
     else:
         mask = np.ones(frame.shape[0], dtype=bool)
     if "lambda" in frame.columns:
@@ -361,11 +369,11 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
     enriched = search_df.copy()
     n_rows = int(enriched.shape[0])
     if "raw_kkt_eligible" in enriched.columns:
-        raw_kkt = enriched["raw_kkt_eligible"].astype(bool).to_numpy(dtype=bool)
+        raw_kkt = _strict_bool_mask(enriched["raw_kkt_eligible"])
     elif "selection_eligible" in enriched.columns:
-        raw_kkt = enriched["selection_eligible"].astype(bool).to_numpy(dtype=bool)
+        raw_kkt = _strict_bool_mask(enriched["selection_eligible"])
     elif "converged" in enriched.columns:
-        raw_kkt = enriched["converged"].astype(bool).to_numpy(dtype=bool)
+        raw_kkt = _strict_bool_mask(enriched["converged"])
     else:
         raw_kkt = np.zeros(n_rows, dtype=bool)
     if "candidate_pool_source" in enriched.columns:
@@ -383,13 +391,9 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
     else:
         partition_candidate = np.zeros(n_rows, dtype=bool)
     if "bic_refit_finite_candidate_found" in enriched.columns:
-        bic_refit = (
-            enriched["bic_refit_finite_candidate_found"]
-            .astype(bool)
-            .to_numpy(dtype=bool)
-        )
+        bic_refit = _strict_bool_mask(enriched["bic_refit_finite_candidate_found"])
     elif "bic_refit_converged" in enriched.columns:
-        bic_refit = enriched["bic_refit_converged"].astype(bool).to_numpy(dtype=bool)
+        bic_refit = _strict_bool_mask(enriched["bic_refit_converged"])
     else:
         # Absent certificate means unknown, treated as False (not True)
         bic_refit = np.zeros(n_rows, dtype=bool)

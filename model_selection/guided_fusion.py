@@ -779,53 +779,10 @@ def _implicit_guided_tree_support(
     edge_w: torch.Tensor,
     chunk_edges: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Retain one bounded star-tree subset of the implicit complete-block flow."""
+    """Build bounded-degree tree flows for the implicit complete-block demand."""
 
-    num_clusters = int(cluster_sizes.numel())
-    roots = torch.full(
-        (num_clusters,),
-        int(labels.numel()),
-        dtype=torch.long,
-        device=labels.device,
-    )
-    nodes = torch.arange(int(labels.numel()), device=labels.device)
-    roots.scatter_reduce_(0, labels, nodes, reduce="amin", include_self=True)
-    selected_ids: list[torch.Tensor] = []
-    selected_duals: list[torch.Tensor] = []
-    num_edges = int(edge_u.numel())
-    for edge_slice in _edge_stream_slices(num_edges, chunk_edges):
-        chunk_u = edge_u[edge_slice]
-        chunk_v = edge_v[edge_slice]
-        label_u = labels.index_select(0, chunk_u)
-        label_v = labels.index_select(0, chunk_v)
-        same = label_u == label_v
-        root = roots.index_select(0, label_u)
-        selected = same & ((chunk_u == root) | (chunk_v == root))
-        selected_index = torch.nonzero(selected, as_tuple=False).flatten()
-        if int(selected_index.numel()) == 0:
-            continue
-        support_u = chunk_u.index_select(0, selected_index)
-        support_v = chunk_v.index_select(0, selected_index)
-        block_size = cluster_sizes.index_select(
-            0, labels.index_select(0, support_u)
-        ).to(dtype=flow_demand.dtype)
-        support_dual = (
-            flow_demand.index_select(0, support_v)
-            - flow_demand.index_select(0, support_u)
-        ) / block_size[:, None]
-        radius = float(lambda_value) * edge_w[edge_slice].index_select(
-            0, selected_index
-        )
-        selected_ids.append(
-            torch.arange(
-                int(edge_slice.start),
-                int(edge_slice.stop),
-                dtype=torch.long,
-                device=labels.device,
-            ).index_select(0, selected_index)
-        )
-        selected_duals.append(project_dual_ball(support_dual, radius))
-    if not selected_ids:
+    num_nodes = int(labels.numel())
+    if num_nodes == 0:
         return (
             torch.empty(0, dtype=torch.long, device=labels.device),
             torch.empty(
@@ -834,7 +791,82 @@ def _implicit_guided_tree_support(
                 device=flow_demand.device,
             ),
         )
-    return torch.cat(selected_ids), torch.cat(selected_duals)
+
+    # Complete tensor graphs use canonical torch.triu_indices ordering. Within
+    # each label block, heap-ordering the ascending node IDs gives a
+    # deterministic balanced binary tree with maximum degree three.
+    nodes = torch.arange(num_nodes, dtype=torch.long, device=labels.device)
+    order = torch.argsort(labels, stable=True)
+    sorted_labels = labels.index_select(0, order)
+    block_starts = torch.cumsum(cluster_sizes, dim=0) - cluster_sizes
+    sorted_starts = block_starts.index_select(0, sorted_labels)
+    local_rank = nodes - sorted_starts
+    child_positions = nodes[local_rank > 0]
+    if int(child_positions.numel()) == 0:
+        return (
+            torch.empty(0, dtype=torch.long, device=labels.device),
+            torch.empty(
+                (0, int(flow_demand.shape[1])),
+                dtype=flow_demand.dtype,
+                device=flow_demand.device,
+            ),
+        )
+
+    child_rank = local_rank.index_select(0, child_positions)
+    parent_positions = (
+        sorted_starts.index_select(0, child_positions) + (child_rank - 1) // 2
+    )
+    child_nodes = order.index_select(0, child_positions)
+    parent_nodes = order.index_select(0, parent_positions)
+    support_u = torch.minimum(parent_nodes, child_nodes)
+    support_v = torch.maximum(parent_nodes, child_nodes)
+    tree_edge_ids = (
+        support_u * (2 * num_nodes - support_u - 1) // 2 + support_v - support_u - 1
+    )
+
+    # Fail locally if this internal helper is ever used with a noncanonical
+    # graph despite the public complete-graph precondition.
+    if not torch.equal(
+        edge_u.index_select(0, tree_edge_ids), support_u
+    ) or not torch.equal(edge_v.index_select(0, tree_edge_ids), support_v):
+        raise ValueError(
+            "Balanced guided-tree support requires canonical complete edges."
+        )
+
+    # Aggregate demands from leaves to roots one tree level at a time. For an
+    # edge from parent to child, its unprojected vector flow is the child's
+    # subtree demand; orient it to the canonical (min_node, max_node) edge.
+    subtree_demand = flow_demand.clone()
+    largest_block = int(torch.max(cluster_sizes).item())
+    max_depth = max(largest_block.bit_length() - 1, 0)
+    for depth in range(max_depth, 0, -1):
+        first_rank = (1 << depth) - 1
+        last_rank = (1 << (depth + 1)) - 2
+        at_depth = (child_rank >= first_rank) & (child_rank <= last_rank)
+        depth_positions = torch.nonzero(at_depth, as_tuple=False).flatten()
+        if int(depth_positions.numel()) == 0:
+            continue
+        depth_children = child_nodes.index_select(0, depth_positions)
+        depth_parents = parent_nodes.index_select(0, depth_positions)
+        subtree_demand.index_add_(
+            0,
+            depth_parents,
+            subtree_demand.index_select(0, depth_children),
+        )
+
+    support_dual = subtree_demand.index_select(0, child_nodes)
+    orientation = torch.where(
+        parent_nodes == support_u,
+        torch.ones_like(parent_nodes),
+        -torch.ones_like(parent_nodes),
+    ).to(dtype=flow_demand.dtype)
+    support_dual = support_dual * orientation[:, None]
+
+    permutation = torch.argsort(tree_edge_ids)
+    tree_edge_ids = tree_edge_ids.index_select(0, permutation)
+    support_dual = support_dual.index_select(0, permutation)
+    radius = float(lambda_value) * edge_w.index_select(0, tree_edge_ids)
+    return tree_edge_ids, project_dual_ball(support_dual, radius)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1218,8 +1250,6 @@ def _build_compressed_guided_initialization(
     state = SolverState(
         phi=phi_state,
         dual=None,
-        split=None,
-        curvature=None,
         previous_lambda=float(lambda_value),
         warm_state=warm_state,
         certificate=None,
@@ -1528,8 +1558,6 @@ def build_guided_fusion_initialization(
     state = SolverState(
         phi=phi.detach(),
         dual=dual.detach(),
-        split=None,
-        curvature=None,
         previous_lambda=float(lambda_value),
     )
     return GuidedFusionInitialization(

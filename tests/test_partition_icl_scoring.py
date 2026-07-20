@@ -25,7 +25,12 @@ from CliPP2.model_selection.config import (
 )
 from CliPP2.model_selection.partitions import _likelihood_partition_k_grid
 from CliPP2.model_selection.scoring import (
+    _add_bic_selection_eligible,
+    _bic_selection_eligible_mask,
+    _lambda_applicable_mask,
     _normalize_selection_score_name,
+    _row_bic_selection_eligible,
+    _row_lambda_applicable,
     _selection_score_value,
 )
 from CliPP2.runners.model_selection import select_model
@@ -110,6 +115,60 @@ def test_one_cluster_has_zero_assignment_code() -> None:
     ) == pytest.approx(0.0)
     assert compute_partition_icl(-10.0, sizes, data) == pytest.approx(
         compute_classic_bic(-10.0, 1, data)
+    )
+
+
+def test_selection_boolean_columns_parse_strictly_and_fail_closed() -> None:
+    values = [True, "true", 1, False, "false", 0, np.nan, "nan", "unknown", 2]
+    frame = pd.DataFrame({"bic_selection_eligible": values})
+
+    assert _bic_selection_eligible_mask(frame).tolist() == [
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+    ]
+    assert not _row_bic_selection_eligible(
+        pd.Series({"bic_selection_eligible": np.nan})
+    )
+    assert not _row_bic_selection_eligible(
+        pd.Series({"bic_selection_eligible": "false"})
+    )
+
+
+def test_derived_eligibility_and_lambda_applicability_fail_closed() -> None:
+    eligibility = pd.DataFrame(
+        {
+            "raw_kkt_eligible": ["true", "false", np.nan, "unknown"],
+            "bic_refit_finite_candidate_found": ["true"] * 4,
+            "classic_bic": [1.0] * 4,
+        }
+    )
+    applicability = pd.DataFrame(
+        {
+            "lambda_applicable": ["true", "false", np.nan, "unknown"],
+            "lambda": [1.0] * 4,
+        }
+    )
+
+    assert _add_bic_selection_eligible(eligibility)[
+        "bic_selection_eligible"
+    ].tolist() == [True, False, False, False]
+    assert _lambda_applicable_mask(applicability).tolist() == [
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert _row_lambda_applicable(pd.Series({"lambda": 1.0}))
+    assert not _row_lambda_applicable(
+        pd.Series({"lambda": 1.0, "lambda_applicable": np.nan})
     )
 
 

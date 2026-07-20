@@ -10,6 +10,10 @@ import pandas as pd
 import torch
 
 from ..core.model import FitOptions, FitResult
+from ..core.fusion.defaults import (
+    normalize_dense_fallback_policy,
+    normalize_inner_backend,
+)
 from ..core.fusion.graph import build_likelihood_noise_regularized_adaptive_graph
 from ..core.fusion.graph_ops import (
     build_likelihood_noise_regularized_adaptive_tensor_graph,
@@ -269,6 +273,19 @@ def _offload_solver_state_to_cpu(state: SolverState | None) -> SolverState | Non
             cpu_tensors[alias_key] = cached
         return cached
 
+    def certificate_to_cpu(certificate):
+        if isinstance(certificate, DenseEdgeCertificate):
+            return replace(certificate, dual=to_cpu(certificate.dual))
+        if isinstance(certificate, CompressedEdgeCertificate):
+            return replace(
+                certificate,
+                labels=to_cpu(certificate.labels),
+                centers=to_cpu(certificate.centers),
+                internal_edge_ids=to_cpu(certificate.internal_edge_ids),
+                internal_dual=to_cpu(certificate.internal_dual),
+            )
+        return certificate
+
     warm_state = state.warm_state
     if isinstance(warm_state, DenseWarmState):
         warm_state = replace(
@@ -291,25 +308,14 @@ def _offload_solver_state_to_cpu(state: SolverState | None) -> SolverState | Non
             warm_state,
             phi=to_cpu(warm_state.phi),
             structure_hint=to_cpu(warm_state.structure_hint),
+            certificate_hint=certificate_to_cpu(warm_state.certificate_hint),
         )
 
-    certificate = state.certificate
-    if isinstance(certificate, DenseEdgeCertificate):
-        certificate = replace(certificate, dual=to_cpu(certificate.dual))
-    elif isinstance(certificate, CompressedEdgeCertificate):
-        certificate = replace(
-            certificate,
-            labels=to_cpu(certificate.labels),
-            centers=to_cpu(certificate.centers),
-            internal_edge_ids=to_cpu(certificate.internal_edge_ids),
-            internal_dual=to_cpu(certificate.internal_dual),
-        )
+    certificate = certificate_to_cpu(state.certificate)
 
     return SolverState(
         phi=to_cpu(state.phi),
         dual=to_cpu(state.dual),
-        split=to_cpu(state.split),
-        curvature=to_cpu(state.curvature),
         previous_lambda=float(state.previous_lambda),
         warm_state=warm_state,
         certificate=certificate,
@@ -326,13 +332,7 @@ def _build_guided_initialization_with_resource_policy(
 ) -> tuple[GuidedFusionInitialization, SolverContext, StartArray]:
     """Build guided state with typed allocation failure and optional CPU retry."""
 
-    fallback_policy = (
-        str(fit_options.dense_fallback_policy).strip().lower().replace("-", "_")
-    )
-    if fallback_policy not in {"auto", "device_only", "cpu_allowed", "error"}:
-        raise ValueError(
-            "dense_fallback_policy must be auto, device_only, cpu_allowed, or error."
-        )
+    fallback_policy = normalize_dense_fallback_policy(fit_options.dense_fallback_policy)
 
     def build(
         *,
@@ -340,9 +340,7 @@ def _build_guided_initialization_with_resource_policy(
         phi: StartArray,
         labels: np.ndarray | torch.Tensor,
     ) -> GuidedFusionInitialization:
-        requested_backend = (
-            str(fit_options.inner_backend).strip().lower().replace("-", "_")
-        )
+        requested_backend = normalize_inner_backend(fit_options.inner_backend)
         # The dense solver needs the guide's actual edge dual to preserve the
         # historical one-candidate warm-start path.  A compressed guide is the
         # right representation for quotient/workset, but feeding it to dense
@@ -422,6 +420,79 @@ def _build_guided_initialization_with_resource_policy(
                 "host memory during dense CPU fallback."
             ) from cpu_exc
         return guided, cpu_context, cpu_guide_phi
+
+
+def _build_partition_guided_graph_with_resource_policy(
+    *,
+    guide_phi: StartArray,
+    guide_curvature: torch.Tensor,
+    solver_context: SolverContext,
+    fit_options: FitOptions,
+    noise_divisor: float,
+):
+    """Build the adaptive graph on CUDA, with an explicitly authorized host retry."""
+
+    graph_options = {
+        "gamma": float(fit_options.adaptive_weight_gamma),
+        "minimum_tau": max(
+            float(fit_options.adaptive_weight_floor), float(fit_options.eps)
+        ),
+        "baseline": float(fit_options.adaptive_weight_baseline),
+        "noise_divisor": float(noise_divisor),
+    }
+
+    def host_array(value):
+        return (
+            value.detach().cpu().numpy()
+            if torch.is_tensor(value)
+            else np.asarray(value)
+        )
+
+    def build_host_graph():
+        return build_likelihood_noise_regularized_adaptive_graph(
+            host_array(guide_phi),
+            host_array(guide_curvature),
+            lower=host_array(solver_context.lower),
+            upper=host_array(solver_context.upper),
+            **graph_options,
+        )
+
+    runtime = solver_context.runtime
+    if runtime.device.type != "cuda":
+        graph, tau = build_host_graph()
+        return graph, None, tau
+
+    try:
+        tensor_graph, tau = build_likelihood_noise_regularized_adaptive_tensor_graph(
+            torch.as_tensor(
+                guide_phi,
+                dtype=runtime.dtype,
+                device=runtime.device,
+            ),
+            guide_curvature,
+            runtime,
+            lower=solver_context.lower,
+            upper=solver_context.upper,
+            **graph_options,
+        )
+        return tensor_graph_to_pairwise_graph(tensor_graph), tensor_graph, tau
+    except (MemoryError, torch.OutOfMemoryError) as exc:
+        if (
+            normalize_dense_fallback_policy(fit_options.dense_fallback_policy)
+            != "cpu_allowed"
+        ):
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: partition-guided graph construction "
+                f"exhausted memory on {runtime.device_name}; host retry is disabled."
+            ) from exc
+        try:
+            graph, tau = build_host_graph()
+        except (MemoryError, torch.OutOfMemoryError) as host_exc:
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: partition-guided graph construction "
+                "exhausted host memory during the authorized CPU retry."
+            ) from host_exc
+        return graph, None, tau
 
 
 def _fit_phi_start(fit: FitResult) -> StartArray:
@@ -974,7 +1045,6 @@ def _partition_guided_admm_selection(
     # CUDA graph construction uploads this small M x S matrix once; the O(M^2)
     # graph itself stays device-backed and is reused by context preparation.
     guide_phi: StartArray = np.asarray(guide.phi_start)
-    prebuilt_tensor_graph = None
     if fit_options.graph is None:
         complete_graph_degree = float(max(int(data.num_mutations) - 1, 1))
         likelihood_noise_degree_exponent = float(
@@ -983,70 +1053,20 @@ def _partition_guided_admm_selection(
         likelihood_noise_divisor = float(
             complete_graph_degree**likelihood_noise_degree_exponent
         )
-        if pilot_runtime.device.type == "cuda":
-            try:
-                prebuilt_tensor_graph, likelihood_noise_tau = (
-                    build_likelihood_noise_regularized_adaptive_tensor_graph(
-                        torch.as_tensor(
-                            guide_phi,
-                            dtype=pilot_runtime.dtype,
-                            device=pilot_runtime.device,
-                        ),
-                        guide_curvature,
-                        pilot_runtime,
-                        lower=pilot_context.lower,
-                        upper=pilot_context.upper,
-                        gamma=float(fit_options.adaptive_weight_gamma),
-                        minimum_tau=max(
-                            float(fit_options.adaptive_weight_floor),
-                            float(fit_options.eps),
-                        ),
-                        baseline=float(fit_options.adaptive_weight_baseline),
-                        noise_divisor=likelihood_noise_divisor,
-                    )
-                )
-                selection_graph = tensor_graph_to_pairwise_graph(prebuilt_tensor_graph)
-            except (MemoryError, torch.OutOfMemoryError):
-                # The final graph may fit even if device-side adaptive
-                # temporaries do not. Preserve host construction; context
-                # preparation then applies the configured exact fallback
-                # policy while tensorizing this host spec.
-                prebuilt_tensor_graph = None
-                selection_graph, likelihood_noise_tau = (
-                    build_likelihood_noise_regularized_adaptive_graph(
-                        np.asarray(guide_phi),
-                        guide_curvature.detach().cpu().numpy(),
-                        lower=pilot_context.lower.detach().cpu().numpy(),
-                        upper=pilot_context.upper.detach().cpu().numpy(),
-                        gamma=float(fit_options.adaptive_weight_gamma),
-                        minimum_tau=max(
-                            float(fit_options.adaptive_weight_floor),
-                            float(fit_options.eps),
-                        ),
-                        baseline=float(fit_options.adaptive_weight_baseline),
-                        noise_divisor=likelihood_noise_divisor,
-                    )
-                )
-        else:
-            selection_graph, likelihood_noise_tau = (
-                build_likelihood_noise_regularized_adaptive_graph(
-                    np.asarray(guide_phi),
-                    guide_curvature.detach().cpu().numpy(),
-                    lower=pilot_context.lower.detach().cpu().numpy(),
-                    upper=pilot_context.upper.detach().cpu().numpy(),
-                    gamma=float(fit_options.adaptive_weight_gamma),
-                    minimum_tau=max(
-                        float(fit_options.adaptive_weight_floor),
-                        float(fit_options.eps),
-                    ),
-                    baseline=float(fit_options.adaptive_weight_baseline),
-                    noise_divisor=likelihood_noise_divisor,
-                )
+        selection_graph, prebuilt_tensor_graph, likelihood_noise_tau = (
+            _build_partition_guided_graph_with_resource_policy(
+                guide_phi=guide_phi,
+                guide_curvature=guide_curvature,
+                solver_context=pilot_context,
+                fit_options=fit_options,
+                noise_divisor=likelihood_noise_divisor,
             )
+        )
         graph_source = "partition_guide_likelihood_noise_degree_regularized"
         graph_pilot_phi: StartArray = guide_phi
     else:
         selection_graph = fit_options.graph
+        prebuilt_tensor_graph = None
         likelihood_noise_tau = float("nan")
         likelihood_noise_divisor = float("nan")
         likelihood_noise_degree_exponent = float("nan")
@@ -1517,7 +1537,7 @@ def _grid_search_selection(
     lambda_bracket: LambdaBracket | None = None
     if lambda_grid is None and not adaptive_lambda_mode:
         raise ValueError(
-            "Default model selection uses lambda_grid_mode='adaptive_bic'."
+            f"lambda_grid_mode={lambda_search_mode!r} requires an explicit lambda grid."
         )
     lambda_grid = [] if lambda_grid is None else _sorted_unique_lambdas(lambda_grid)
     likelihood_partition_pool_enabled = bool(ENABLE_LIKELIHOOD_PARTITION_CANDIDATES)
@@ -2096,6 +2116,7 @@ def _grid_search_selection(
                 selection_step=next_step,
                 selection_score=selection_score,
                 static_metadata=static_metadata,
+                runtime=runtime,
             )
             row["search_round"] = -1
             row["search_phase"] = "likelihood_partition"

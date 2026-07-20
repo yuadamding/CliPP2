@@ -16,7 +16,8 @@ from ..core.fusion.refit import (
     partition_constrained_observed_refit,
 )
 from ..core.fusion.solver import cluster_diameters_from_edges, cluster_labels_from_edges
-from ..core.fusion.types import SolverState
+from ..core.fusion.torch_backend import dtype_name
+from ..core.fusion.types import SolverState, TorchRuntime
 from ..io.data import TumorData
 from ..metrics.evaluation import (
     SimulationEvaluation,
@@ -568,6 +569,7 @@ def _evaluate_partition_candidate(
     selection_step: int,
     selection_score: str,
     static_metadata: CandidateStaticMetadata,
+    runtime: TorchRuntime,
 ) -> tuple[
     FitResult,
     SimulationEvaluation | None,
@@ -701,8 +703,8 @@ def _evaluate_partition_candidate(
         n_clusters=num_clusters,
         iterations=0,
         converged=finite_candidate_found,
-        device=str(fit_options.device),
-        dtype=str(fit_options.dtype),
+        device=str(runtime.device_name),
+        dtype=dtype_name(runtime.dtype),
         graph_name=str(graph.name),
         summary_tol=float(summary_tol),
         summary_available=True,

@@ -5,7 +5,11 @@ from dataclasses import dataclass
 import numpy as np
 
 from ...io.data import TumorData
-from .starts import _mutation_region_breakpoints, _golden_section_minimize, _sample_loss_grid_numpy
+from .starts import (
+    _mutation_region_breakpoints,
+    _golden_section_minimize,
+    _sample_loss_grid_numpy,
+)
 
 
 @dataclass(frozen=True)
@@ -17,7 +21,9 @@ class PartitionRefitResult:
     n_clusters: int
     boundary_count: int
     active_degrees_of_freedom: int
-    finite_candidate_found: bool  # True only if a finite loss was obtained; does NOT certify global MLE
+    finite_candidate_found: (
+        bool  # True only if a finite loss was obtained; does NOT certify global MLE
+    )
     refit_coordinate_count: int
     refit_finite_coordinate_count: int
     refit_total_grid_points: int
@@ -106,8 +112,14 @@ def _cluster_region_candidate_grid(
     if hint is not None and np.isfinite(float(hint)):
         points.append(float(np.clip(float(hint), lower, upper)))
 
-    points.extend(np.geomspace(max(float(lower), float(eps)), float(upper), num=97, dtype=np.float64).tolist())
-    points.extend(np.linspace(float(lower), float(upper), num=49, dtype=np.float64).tolist())
+    points.extend(
+        np.geomspace(
+            max(float(lower), float(eps)), float(upper), num=97, dtype=np.float64
+        ).tolist()
+    )
+    points.extend(
+        np.linspace(float(lower), float(upper), num=49, dtype=np.float64).tolist()
+    )
 
     for idx in range(int(b_minus.shape[0])):
         points.extend(
@@ -184,6 +196,7 @@ def _refit_cluster_region(
             major_prior=major_prior,
             eps=eps,
         )
+
     grid = _cluster_region_candidate_grid(
         lower=lower,
         upper=upper,
@@ -215,15 +228,28 @@ def _refit_cluster_region(
 
     local_indices: set[int] = set()
     for idx in np.where(finite)[0].tolist():
-        left_loss = float(losses[idx - 1]) if idx > 0 and np.isfinite(losses[idx - 1]) else float("inf")
-        right_loss = float(losses[idx + 1]) if idx + 1 < losses.size and np.isfinite(losses[idx + 1]) else float("inf")
-        if float(losses[idx]) <= left_loss + 1e-10 and float(losses[idx]) <= right_loss + 1e-10:
+        left_loss = (
+            float(losses[idx - 1])
+            if idx > 0 and np.isfinite(losses[idx - 1])
+            else float("inf")
+        )
+        right_loss = (
+            float(losses[idx + 1])
+            if idx + 1 < losses.size and np.isfinite(losses[idx + 1])
+            else float("inf")
+        )
+        if (
+            float(losses[idx]) <= left_loss + 1e-10
+            and float(losses[idx]) <= right_loss + 1e-10
+        ):
             local_indices.add(int(idx))
     if not local_indices:
         local_indices.add(int(np.nanargmin(losses)))
 
     refined_candidates = 0
-    selected_indices = sorted(local_indices, key=lambda value: float(losses[value]))[:16]
+    selected_indices = sorted(local_indices, key=lambda value: float(losses[value]))[
+        :16
+    ]
     for idx in selected_indices:
         if np.isfinite(losses[idx]):
             candidate_losses.append(float(losses[idx]))
@@ -300,9 +326,15 @@ def partition_constrained_observed_refit(
 
     alt = np.asarray(data.alt_counts, dtype=np.float64)
     total = np.asarray(data.total_counts, dtype=np.float64)
-    b_minus = np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.minor_cn, dtype=np.float64)
-    b_plus = np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.major_cn, dtype=np.float64)
-    b_fixed = np.asarray(data.scaling, dtype=np.float64) * np.asarray(data.fixed_multiplicity, dtype=np.float64)
+    b_minus = np.asarray(data.scaling, dtype=np.float64) * np.asarray(
+        data.minor_cn, dtype=np.float64
+    )
+    b_plus = np.asarray(data.scaling, dtype=np.float64) * np.asarray(
+        data.major_cn, dtype=np.float64
+    )
+    b_fixed = np.asarray(data.scaling, dtype=np.float64) * np.asarray(
+        data.fixed_multiplicity, dtype=np.float64
+    )
     ambiguous = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
     upper_matrix = np.asarray(data.phi_upper, dtype=np.float64)
     hint_matrix = None if hint_phi is None else np.asarray(hint_phi, dtype=np.float64)
@@ -311,7 +343,9 @@ def partition_constrained_observed_refit(
     # (effective_bic_mutation_region_count) also excludes them, so the refit loglik numerator
     # must too — otherwise BIC scores a model that was never fit.
     count_observed = getattr(data, "count_observed", None)
-    observed_matrix = None if count_observed is None else np.asarray(count_observed, dtype=bool)
+    observed_matrix = (
+        None if count_observed is None else np.asarray(count_observed, dtype=bool)
+    )
 
     total_loss = 0.0
     boundary_count = 0
@@ -377,14 +411,18 @@ def partition_constrained_observed_refit(
             refit_coordinate_count += 1
             refit_finite_coordinate_count += int(coordinate.finite_candidate_found)
             refit_total_grid_points += int(coordinate.grid_points)
-            refit_max_grid_spacing = max(refit_max_grid_spacing, float(coordinate.max_grid_spacing))
+            refit_max_grid_spacing = max(
+                refit_max_grid_spacing, float(coordinate.max_grid_spacing)
+            )
             refit_total_candidate_basins += int(coordinate.candidate_basins)
             refit_total_refined_candidates += int(coordinate.refined_candidates)
             refit_min_best_second_loss_gap = min(
                 refit_min_best_second_loss_gap,
                 float(coordinate.best_second_loss_gap),
             )
-            at_boundary = bool(beta <= lower + boundary_tol or beta >= upper - boundary_tol)
+            at_boundary = bool(
+                beta <= lower + boundary_tol or beta >= upper - boundary_tol
+            )
             boundary_count += int(at_boundary)
             active_df += int(not at_boundary)
 

@@ -94,6 +94,7 @@ def _copy_torch_tumor_data(
         count_observed=None
         if data.count_observed is None
         else data.count_observed.to(device=device),
+        data_fingerprint=data.data_fingerprint,
     )
 
 
@@ -1282,16 +1283,13 @@ def generate_likelihood_partition_starts(
     runtime: TorchRuntime | None = None
     partition_torch_data: TorchTumorData | None = None
     if use_torch_runtime:
-        try:
-            runtime, partition_torch_data = _resolve_partition_runtime(
-                data=data,
-                exact_pilot=exact_pilot,
-                torch_data=torch_data,
-                device=device,
-                dtype=dtype,
-            )
-        except RuntimeError:
-            use_torch_runtime = False
+        runtime, partition_torch_data = _resolve_partition_runtime(
+            data=data,
+            exact_pilot=exact_pilot,
+            torch_data=torch_data,
+            device=device,
+            dtype=dtype,
+        )
     phi0 = (
         _as_torch(exact_pilot, runtime=runtime).detach().cpu().numpy()
         if use_torch_runtime and runtime is not None

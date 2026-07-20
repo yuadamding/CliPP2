@@ -6,8 +6,20 @@ import numpy as np
 import torch
 
 from ..io.data import TumorData
+from .fusion.defaults import (
+    DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
+    DEFAULT_CERTIFICATE_MAX_ITER,
+    DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
+    DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
+    DEFAULT_DENSE_FALLBACK_POLICY,
+    DEFAULT_DEVICE,
+    DEFAULT_DTYPE,
+    DEFAULT_INNER_BACKEND,
+    DEFAULT_WORKSET_ADD_BATCH,
+    DEFAULT_WORKSET_MAX_BYTES,
+    DEFAULT_WORKSET_MAX_EXPANSIONS,
+)
 from .fusion.solver import fit_observed_data_pairwise_fusion
-from .fusion.torch_backend import DEFAULT_DEVICE, DEFAULT_DTYPE
 from .fusion.types import (
     ExactFusionProvenance,
     PairwiseFusionGraph,
@@ -33,15 +45,15 @@ class FitOptions:
     summary_tol: float | None = 1e-4
     bic_partition_tol: float | None = 1e-4
     objective_shape: str = "unimodal"
-    inner_backend: str = "dense"
-    workset_max_bytes: int = 256 * 1024 * 1024
-    compressed_cache_max_bytes: int = 256 * 1024 * 1024
-    dense_fallback_policy: str = "auto"
-    workset_add_batch: int = 64
-    workset_max_expansions: int = 16
-    certificate_max_iter: int = 512
-    certificate_refinement_rounds: int = 2
-    certificate_column_tol_scale: float = 1.0
+    inner_backend: str = DEFAULT_INNER_BACKEND
+    workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES
+    compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES
+    dense_fallback_policy: str = DEFAULT_DENSE_FALLBACK_POLICY
+    workset_add_batch: int = DEFAULT_WORKSET_ADD_BATCH
+    workset_max_expansions: int = DEFAULT_WORKSET_MAX_EXPANSIONS
+    certificate_max_iter: int = DEFAULT_CERTIFICATE_MAX_ITER
+    certificate_refinement_rounds: int = DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS
+    certificate_column_tol_scale: float = DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE
     allow_heuristic_structure_splits: bool = True
     materialize_full_dual: bool = False
     verbose: bool = False
@@ -66,15 +78,15 @@ class SolverOptions:
     compute_summary: bool = False
     summary_tol: float | None = 1e-4
     bic_partition_tol: float | None = 1e-4
-    inner_backend: str = "dense"
-    workset_max_bytes: int = 256 * 1024 * 1024
-    compressed_cache_max_bytes: int = 256 * 1024 * 1024
-    dense_fallback_policy: str = "auto"
-    workset_add_batch: int = 64
-    workset_max_expansions: int = 16
-    certificate_max_iter: int = 512
-    certificate_refinement_rounds: int = 2
-    certificate_column_tol_scale: float = 1.0
+    inner_backend: str = DEFAULT_INNER_BACKEND
+    workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES
+    compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES
+    dense_fallback_policy: str = DEFAULT_DENSE_FALLBACK_POLICY
+    workset_add_batch: int = DEFAULT_WORKSET_ADD_BATCH
+    workset_max_expansions: int = DEFAULT_WORKSET_MAX_EXPANSIONS
+    certificate_max_iter: int = DEFAULT_CERTIFICATE_MAX_ITER
+    certificate_refinement_rounds: int = DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS
+    certificate_column_tol_scale: float = DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE
     allow_heuristic_structure_splits: bool = True
     materialize_full_dual: bool = False
     verbose: bool = False

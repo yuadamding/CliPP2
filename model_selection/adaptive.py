@@ -7,7 +7,11 @@ import pandas as pd
 import torch
 
 from ..core.model import FitOptions
-from ..core.fusion.graph_ops import graph_adjoint_edges, graph_forward_edges, project_dual_ball
+from ..core.fusion.graph_ops import (
+    graph_adjoint_edges,
+    graph_forward_edges,
+    project_dual_ball,
+)
 from ..core.fusion.torch_backend import (
     as_runtime_tensor,
     mutation_region_terms_torch,
@@ -33,6 +37,7 @@ from .scoring import (
 )
 from .types import FullFusionKKTResult, StartArray, _AdaptiveIntervalProposal
 from ..core.bic import LambdaBracket
+
 
 def _runtime_start_tensor(start: StartArray, runtime) -> torch.Tensor:
     return as_runtime_tensor(start, runtime)
@@ -64,7 +69,9 @@ def _full_fusion_box_residual_with_dual_balls(
             upper=upper,
             atol=atol,
         )
-        residual = float((torch.linalg.norm(stat) / (1.0 + torch.linalg.norm(grad_smooth))).item())
+        residual = float(
+            (torch.linalg.norm(stat) / (1.0 + torch.linalg.norm(grad_smooth))).item()
+        )
         info = FullFusionKKTResult(
             residual=residual,
             iterations=0,
@@ -73,7 +80,9 @@ def _full_fusion_box_residual_with_dual_balls(
         )
         return (residual, info) if return_info else residual
 
-    dual = torch.zeros((int(edge_u.numel()), int(phi.shape[1])), dtype=phi.dtype, device=phi.device)
+    dual = torch.zeros(
+        (int(edge_u.numel()), int(phi.shape[1])), dtype=phi.dtype, device=phi.device
+    )
     radius = lambda_float * edge_w
     if degree_bound is None:
         degree = torch.bincount(
@@ -88,7 +97,9 @@ def _full_fusion_box_residual_with_dual_balls(
     last_residual = float("inf")
     max_iterations = max(int(max_iter), 1)
     for iteration in range(max_iterations):
-        adj = graph_adjoint_edges(dual, edge_u=edge_u, edge_v=edge_v, num_nodes=int(phi.shape[0]))
+        adj = graph_adjoint_edges(
+            dual, edge_u=edge_u, edge_v=edge_v, num_nodes=int(phi.shape[0])
+        )
         total_grad = grad_smooth + adj
         stat = stationarity_residual_torch(
             total_grad=total_grad,
@@ -100,13 +111,15 @@ def _full_fusion_box_residual_with_dual_balls(
         denom = 1.0 + torch.linalg.norm(grad_smooth) + torch.linalg.norm(adj)
         last_residual = float((torch.linalg.norm(stat) / denom).item())
         iterations = int(iteration + 1)
-        if np.isfinite(previous_residual) and abs(previous_residual - last_residual) <= float(atol) * (
-            1.0 + abs(previous_residual)
-        ):
+        if np.isfinite(previous_residual) and abs(
+            previous_residual - last_residual
+        ) <= float(atol) * (1.0 + abs(previous_residual)):
             converged = True
             break
         previous_residual = last_residual
-        dual = dual - float(step) * graph_forward_edges(stat, edge_u=edge_u, edge_v=edge_v)
+        dual = dual - float(step) * graph_forward_edges(
+            stat, edge_u=edge_u, edge_v=edge_v
+        )
         dual = project_dual_ball(dual, radius)
     info = FullFusionKKTResult(
         residual=float(last_residual),
@@ -135,7 +148,9 @@ def _estimate_lambda_full_light(
     lower = torch.full_like(torch_data.phi_upper, float(eps))
     upper = torch.minimum(torch_data.phi_upper, torch.ones_like(torch_data.phi_upper))
     phi = torch.minimum(torch.maximum(phi, lower), upper)
-    terms = mutation_region_terms_torch(torch_data, phi, major_prior=major_prior, eps=eps)
+    terms = mutation_region_terms_torch(
+        torch_data, phi, major_prior=major_prior, eps=eps
+    )
     stat_tol = max(5.0 * float(tol), 1e-5)
     low = 0.0
     high = max(float(lambda_eq), LAMBDA_SEARCH_MIN)
@@ -176,7 +191,11 @@ def _estimate_lambda_full_light(
         best_high = high
         best_info = residual_info
         for _ in range(12):
-            mid = float(np.sqrt(max(low, LAMBDA_SEARCH_MIN) * best_high)) if low > 0.0 else 0.5 * best_high
+            mid = (
+                float(np.sqrt(max(low, LAMBDA_SEARCH_MIN) * best_high))
+                if low > 0.0
+                else 0.5 * best_high
+            )
             mid_residual, mid_info = _full_fusion_box_residual_with_dual_balls(
                 grad_smooth=terms.grad,
                 phi=phi,
@@ -259,7 +278,9 @@ def _initial_adaptive_lambda_bracket(
     lambda_full = max(float(lambda_full), float(lambda_eq), LAMBDA_SEARCH_MIN)
     lambda_min_scale = 64.0 if sparse_anchors else 128.0
     lambda_min = max(float(lambda_eq) / lambda_min_scale, LAMBDA_SEARCH_MIN)
-    lambda_anchor_max = min(max(float(lambda_full), float(lambda_eq) * 4.0), LAMBDA_SEARCH_MAX)
+    lambda_anchor_max = min(
+        max(float(lambda_full), float(lambda_eq) * 4.0), LAMBDA_SEARCH_MAX
+    )
     if sparse_anchors:
         raw_anchors = [
             0.0,
@@ -287,7 +308,9 @@ def _initial_adaptive_lambda_bracket(
         ]
     anchors = _sorted_unique_lambdas(
         [
-            0.0 if float(value) <= 0.0 else min(max(float(value), lambda_min), lambda_anchor_max)
+            0.0
+            if float(value) <= 0.0
+            else min(max(float(value), lambda_min), lambda_anchor_max)
             for value in raw_anchors
         ]
     )
@@ -328,12 +351,18 @@ def _score_maximized(normalized_score: str) -> bool:
 def _adaptive_first_pass_options(base_options: FitOptions) -> FitOptions:
     return replace(
         base_options,
-        outer_max_iter=max(int(base_options.outer_max_iter), ADAPTIVE_FIRST_PASS_OUTER_MAX_ITER),
-        inner_max_iter=max(int(base_options.inner_max_iter), ADAPTIVE_FIRST_PASS_INNER_MAX_ITER),
+        outer_max_iter=max(
+            int(base_options.outer_max_iter), ADAPTIVE_FIRST_PASS_OUTER_MAX_ITER
+        ),
+        inner_max_iter=max(
+            int(base_options.inner_max_iter), ADAPTIVE_FIRST_PASS_INNER_MAX_ITER
+        ),
     )
 
 
-def _score_strictly_better(score: float, reference: float, *, normalized_score: str) -> bool:
+def _score_strictly_better(
+    score: float, reference: float, *, normalized_score: str
+) -> bool:
     if not np.isfinite(score) or not np.isfinite(reference):
         return False
     margin = 1e-8 * (1.0 + abs(float(reference)))
@@ -350,10 +379,20 @@ def _best_candidate_rows_by_lambda(
     if search_df.empty:
         return search_df.copy()
     ranked = _add_bic_selection_eligible(search_df)
-    if "bic_refit_finite_candidate_found" not in ranked.columns and "bic_refit_converged" in ranked.columns:
-        ranked["bic_refit_finite_candidate_found"] = ranked["bic_refit_converged"].astype(bool)
-    if "bic_refit_converged" not in ranked.columns and "bic_refit_finite_candidate_found" in ranked.columns:
-        ranked["bic_refit_converged"] = ranked["bic_refit_finite_candidate_found"].astype(bool)
+    if (
+        "bic_refit_finite_candidate_found" not in ranked.columns
+        and "bic_refit_converged" in ranked.columns
+    ):
+        ranked["bic_refit_finite_candidate_found"] = ranked[
+            "bic_refit_converged"
+        ].astype(bool)
+    if (
+        "bic_refit_converged" not in ranked.columns
+        and "bic_refit_finite_candidate_found" in ranked.columns
+    ):
+        ranked["bic_refit_converged"] = ranked[
+            "bic_refit_finite_candidate_found"
+        ].astype(bool)
     ranked["_lambda_key"] = np.round(ranked["lambda"].to_numpy(dtype=float), 12)
     score_column = _adaptive_score_column(normalized_score)
     defaults = {
@@ -380,7 +419,11 @@ def _best_candidate_rows_by_lambda(
     ]
     ascending = [True, False, False, False, False, True, True, True]
     ranked = ranked.sort_values(sort_columns, ascending=ascending)
-    return ranked.drop_duplicates("_lambda_key", keep="first").drop(columns=["_lambda_key"]).reset_index(drop=True)
+    return (
+        ranked.drop_duplicates("_lambda_key", keep="first")
+        .drop(columns=["_lambda_key"])
+        .reset_index(drop=True)
+    )
 
 
 def _row_candidate_id(row: pd.Series) -> int | None:
@@ -406,7 +449,11 @@ def _row_cluster_count(row: pd.Series) -> int | None:
 def _lambda_interval_log10_width(left_lambda: float, right_lambda: float) -> float:
     left_lambda = float(left_lambda)
     right_lambda = float(right_lambda)
-    if not np.isfinite(left_lambda) or not np.isfinite(right_lambda) or right_lambda <= left_lambda:
+    if (
+        not np.isfinite(left_lambda)
+        or not np.isfinite(right_lambda)
+        or right_lambda <= left_lambda
+    ):
         return 0.0
     if left_lambda > 0.0:
         return float(max(np.log10(right_lambda) - np.log10(left_lambda), 0.0))
@@ -418,7 +465,11 @@ def _lambda_interval_log10_width(left_lambda: float, right_lambda: float) -> flo
 def _lambda_interval_midpoint(left_lambda: float, right_lambda: float) -> float | None:
     left_lambda = float(left_lambda)
     right_lambda = float(right_lambda)
-    if not np.isfinite(left_lambda) or not np.isfinite(right_lambda) or right_lambda <= left_lambda:
+    if (
+        not np.isfinite(left_lambda)
+        or not np.isfinite(right_lambda)
+        or right_lambda <= left_lambda
+    ):
         return None
     if left_lambda <= 0.0:
         if right_lambda <= LAMBDA_SEARCH_MIN * (1.0 + 1e-12):
@@ -450,12 +501,16 @@ def _adaptive_transition_probe_records(
     if not np.isfinite(lambda_full) or lambda_full <= 0.0:
         lambda_full = lambda_eq
     transition_upper = min(max(lambda_full, 4.0 * lambda_eq), LAMBDA_SEARCH_MAX)
-    evaluated_keys = {_canonical_lambda(value) for value in _sorted_unique_lambdas(evaluated_lambdas)}
+    evaluated_keys = {
+        _canonical_lambda(value) for value in _sorted_unique_lambdas(evaluated_lambdas)
+    }
 
     records: list[_AdaptiveIntervalProposal] = []
     seen = set(evaluated_keys)
 
-    def _add_probe(left_lambda: float, right_lambda: float, reason: str, priority_order: int) -> None:
+    def _add_probe(
+        left_lambda: float, right_lambda: float, reason: str, priority_order: int
+    ) -> None:
         if len(records) >= int(max_new):
             return
         left = float(max(left_lambda, 0.0))
@@ -513,10 +568,14 @@ def _adaptive_interval_proposal_records(
     max_new: int,
     partition_labels_by_candidate_id: dict[int, np.ndarray] | None = None,
 ) -> list[_AdaptiveIntervalProposal]:
-    path_df = _best_candidate_rows_by_lambda(
-        search_df,
-        normalized_score=normalized_score,
-    ).sort_values("lambda").reset_index(drop=True)
+    path_df = (
+        _best_candidate_rows_by_lambda(
+            search_df,
+            normalized_score=normalized_score,
+        )
+        .sort_values("lambda")
+        .reset_index(drop=True)
+    )
     if path_df.shape[0] < 2 or int(max_new) <= 0:
         return []
     score_column = _adaptive_score_column(normalized_score)
@@ -540,7 +599,9 @@ def _adaptive_interval_proposal_records(
             continue
         left_candidate_id = _row_candidate_id(left)
         right_candidate_id = _row_candidate_id(right)
-        partition_changed = str(left.get("partition_signature", "")) != str(right.get("partition_signature", ""))
+        partition_changed = str(left.get("partition_signature", "")) != str(
+            right.get("partition_signature", "")
+        )
         p_left = float(left.get("profile_penalty", np.nan))
         p_right = float(right.get("profile_penalty", np.nan))
         monotonicity_violation = bool(
@@ -553,7 +614,9 @@ def _adaptive_interval_proposal_records(
             v_left = float(left["penalized_objective"])
             v_right = float(right["penalized_objective"])
             trapezoid = 0.5 * (p_left + p_right) * (right_lambda - left_lambda)
-            value_error = abs((v_right - v_left) - trapezoid) / (1.0 + abs(v_left) + abs(v_right))
+            value_error = abs((v_right - v_left) - trapezoid) / (
+                1.0 + abs(v_left) + abs(v_right)
+            )
             value_curve_score = min(value_error / ADAPTIVE_PATH_VALUE_CURVE_TOL, 4.0)
         score_focus = 0.0
         if np.isfinite(best_score):
@@ -572,17 +635,17 @@ def _adaptive_interval_proposal_records(
         right_kkt = float(right.get("fixed_objective_kkt_residual", np.inf))
         kkt_risk = (
             1.0
-            if (
-                not left_ok
-                or not right_ok
-                or min(left_kkt, right_kkt) <= near_kkt_tol
-            )
+            if (not left_ok or not right_ok or min(left_kkt, right_kkt) <= near_kkt_tol)
             else 0.0
         )
         left_k = _row_cluster_count(left)
         right_k = _row_cluster_count(right)
-        cluster_jump = 0 if left_k is None or right_k is None else abs(int(right_k) - int(left_k))
-        k_increases = bool(left_k is not None and right_k is not None and int(right_k) > int(left_k))
+        cluster_jump = (
+            0 if left_k is None or right_k is None else abs(int(right_k) - int(left_k))
+        )
+        k_increases = bool(
+            left_k is not None and right_k is not None and int(right_k) > int(left_k)
+        )
         nonnested_partition_change = False
         if (
             partition_labels_by_candidate_id is not None
@@ -619,9 +682,6 @@ def _adaptive_interval_proposal_records(
         elif cluster_jump > 1:
             priority_class = 2
             reason = "cluster_count_jump"
-        elif score_focus and partition_changed:
-            priority_class = 3
-            reason = "selected_partition_boundary"
         elif log_width > ADAPTIVE_PATH_LOG10_WIDTH_TOL:
             priority_class = 4
             reason = "wide_same_partition_interval"
@@ -696,23 +756,35 @@ def _selected_lambda_signature_interval(
 ) -> tuple[float | None, float | None, float | None]:
     if search_df.empty or "_candidate_id" not in search_df.columns:
         return None, None, None
-    selected = search_df.loc[search_df["_candidate_id"].astype(int) == int(selected_candidate_id)]
+    selected = search_df.loc[
+        search_df["_candidate_id"].astype(int) == int(selected_candidate_id)
+    ]
     if selected.empty:
         return None, None, None
     selected_row = selected.iloc[0]
-    if "lambda_applicable" in selected_row and not bool(selected_row.get("lambda_applicable", True)):
+    if "lambda_applicable" in selected_row and not bool(
+        selected_row.get("lambda_applicable", True)
+    ):
         return None, None, None
     selected_lambda = float(selected_row["lambda"])
     signature = str(selected_row.get("partition_signature", ""))
     eligible = search_df.loc[_bic_selection_eligible_mask(search_df)].copy()
     if eligible.empty:
         eligible = search_df.copy()
-    eligible = _best_candidate_rows_by_lambda(
-        eligible,
-        normalized_score=normalized_score,
-    ).sort_values("lambda").reset_index(drop=True)
+    eligible = (
+        _best_candidate_rows_by_lambda(
+            eligible,
+            normalized_score=normalized_score,
+        )
+        .sort_values("lambda")
+        .reset_index(drop=True)
+    )
     lambdas = eligible["lambda"].to_numpy(dtype=float)
-    signatures = eligible["partition_signature"].astype(str).to_numpy() if "partition_signature" in eligible.columns else np.full(eligible.shape[0], signature)
+    signatures = (
+        eligible["partition_signature"].astype(str).to_numpy()
+        if "partition_signature" in eligible.columns
+        else np.full(eligible.shape[0], signature)
+    )
     if lambdas.size == 0:
         return selected_lambda, selected_lambda, 0.0
     if selected_lambda > 0.0:
@@ -734,7 +806,11 @@ def _selected_lambda_signature_interval(
         right_idx += 1
     left_lambda = float(lambdas[left_idx])
     right_lambda = float(lambdas[right_idx])
-    log_width = float(np.log10(right_lambda) - np.log10(left_lambda)) if right_lambda > 0.0 and left_lambda > 0.0 else 0.0
+    log_width = (
+        float(np.log10(right_lambda) - np.log10(left_lambda))
+        if right_lambda > 0.0 and left_lambda > 0.0
+        else 0.0
+    )
     return left_lambda, right_lambda, log_width
 
 

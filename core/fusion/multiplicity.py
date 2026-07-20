@@ -65,14 +65,10 @@ def infer_multiplicity_posterior_numpy(
         1.0 - probability_eps,
     )
     log_minor = (
-        alt * np.log(prob_minor)
-        + nonalt * np.log1p(-prob_minor)
-        + np.log1p(-prior)
+        alt * np.log(prob_minor) + nonalt * np.log1p(-prob_minor) + np.log1p(-prior)
     )
     log_major = (
-        alt * np.log(prob_major)
-        + nonalt * np.log1p(-prob_major)
-        + np.log(prior)
+        alt * np.log(prob_major) + nonalt * np.log1p(-prob_major) + np.log(prior)
     )
 
     # exp(-logaddexp(0, -delta)) is a stable sigmoid(delta).

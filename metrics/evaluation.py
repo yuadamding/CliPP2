@@ -59,19 +59,19 @@ def _adjusted_rand_index(labels_true: np.ndarray, labels_pred: np.ndarray) -> fl
 
     _, true_inverse = np.unique(labels_true, return_inverse=True)
     _, pred_inverse = np.unique(labels_pred, return_inverse=True)
-    n_true = int(true_inverse.max()) + 1 if true_inverse.size else 0
-    n_pred = int(pred_inverse.max()) + 1 if pred_inverse.size else 0
+    n_true = int(true_inverse.max()) + 1
+    n_pred = int(pred_inverse.max()) + 1
 
-    pair_codes = true_inverse.astype(np.int64, copy=False) * int(max(n_pred, 1)) + pred_inverse.astype(np.int64, copy=False)
-    pair_counts = np.bincount(pair_codes, minlength=int(max(n_true * n_pred, 1)))
+    pair_codes = true_inverse.astype(
+        np.int64, copy=False
+    ) * n_pred + pred_inverse.astype(np.int64, copy=False)
+    pair_counts = np.bincount(pair_codes, minlength=n_true * n_pred)
     sum_comb_contingency = float(np.sum(_comb2(pair_counts[pair_counts > 0])))
     true_counts = np.bincount(true_inverse, minlength=n_true)
     pred_counts = np.bincount(pred_inverse, minlength=n_pred)
     sum_comb_true = float(np.sum(_comb2(true_counts)))
     sum_comb_pred = float(np.sum(_comb2(pred_counts)))
     total_comb = float(n_regions * (n_regions - 1) * 0.5)
-    if total_comb <= 0.0:
-        return 1.0
 
     expected_index = (sum_comb_true * sum_comb_pred) / total_comb
     max_index = 0.5 * (sum_comb_true + sum_comb_pred)
@@ -210,7 +210,11 @@ def _load_single_region_truth(
     )
     raw_clusters = truth_df["cluster_id"].to_numpy(dtype=int)
     truth_clusters = _reindex_by_mutation_id(
-        raw_clusters, truth_ids, data.mutation_ids, "truth.txt/cluster_id", data.tumor_id
+        raw_clusters,
+        truth_ids,
+        data.mutation_ids,
+        "truth.txt/cluster_id",
+        data.tumor_id,
     )
 
     truth_cp = pd.read_csv(tumor_dir / "truth_cp.txt", sep="\t")
@@ -231,7 +235,9 @@ def _load_single_region_truth(
     if cna_path.exists():
         cna = pd.read_csv(cna_path, sep="\t")
         if "multiplicity" in cna.columns and cna.shape[0] == data.num_mutations:
-            truth_multiplicity = cna["multiplicity"].to_numpy(dtype=np.float32).reshape(-1, 1)
+            truth_multiplicity = (
+                cna["multiplicity"].to_numpy(dtype=np.float32).reshape(-1, 1)
+            )
 
     return truth_clusters, truth_phi, truth_multiplicity
 
@@ -241,8 +247,6 @@ def _cluster_level_clonal_fraction(phi: np.ndarray, labels: np.ndarray) -> float
         return float("nan")
 
     _, relabeled = np.unique(labels.astype(np.int64), return_inverse=True)
-    if relabeled.size == 0:
-        return float("nan")
 
     num_clusters = int(relabeled.max()) + 1
     centers = np.zeros((num_clusters, phi.shape[1]), dtype=np.float32)
@@ -262,10 +266,14 @@ def load_simulation_truth(
 ) -> SimulationTruth:
     tumor_dir = Path(simulation_root) / data.tumor_id
     if not tumor_dir.exists():
-        raise FileNotFoundError(f"Simulation directory not found for tumor '{data.tumor_id}': {tumor_dir}")
+        raise FileNotFoundError(
+            f"Simulation directory not found for tumor '{data.tumor_id}': {tumor_dir}"
+        )
 
     if data.num_regions == 1 and (tumor_dir / "truth_cp.txt").exists():
-        truth_clusters, truth_phi, truth_multiplicity = _load_single_region_truth(tumor_dir=tumor_dir, data=data)
+        truth_clusters, truth_phi, truth_multiplicity = _load_single_region_truth(
+            tumor_dir=tumor_dir, data=data
+        )
         return SimulationTruth(
             truth_clusters=truth_clusters,
             truth_phi=truth_phi,
@@ -280,11 +288,17 @@ def load_simulation_truth(
     )
     raw_clusters = truth_df["cluster_id"].to_numpy(dtype=int)
     truth_clusters = _reindex_by_mutation_id(
-        raw_clusters, truth_ids, data.mutation_ids, "truth.txt/cluster_id", data.tumor_id
+        raw_clusters,
+        truth_ids,
+        data.mutation_ids,
+        "truth.txt/cluster_id",
+        data.tumor_id,
     )
 
     truth_phi = np.zeros((data.num_mutations, data.num_regions), dtype=np.float32)
-    truth_multiplicity = np.zeros((data.num_mutations, data.num_regions), dtype=np.float32)
+    truth_multiplicity = np.zeros(
+        (data.num_mutations, data.num_regions), dtype=np.float32
+    )
 
     for column, region_id in enumerate(data.region_ids):
         region_index = _region_index_from_label(region_id)
@@ -337,16 +351,16 @@ def evaluate_fit_against_simulation(
 ) -> SimulationEvaluation:
     if simulation_truth is None:
         if simulation_root is None:
-            raise ValueError("Either simulation_root or simulation_truth must be provided.")
+            raise ValueError(
+                "Either simulation_root or simulation_truth must be provided."
+            )
         simulation_truth = load_simulation_truth(data, simulation_root)
 
     truth_clusters = simulation_truth.truth_clusters
     truth_phi = simulation_truth.truth_phi
     truth_multiplicity = simulation_truth.truth_multiplicity
 
-    eval_mask = np.ones(data.num_mutations, dtype=bool)
-    n_eval_mutations = int(eval_mask.sum())
-    n_filtered_mutations = 0
+    n_eval_mutations = int(data.num_mutations)
     if n_eval_mutations == 0:
         return SimulationEvaluation(
             ari=float("nan"),
@@ -365,17 +379,17 @@ def evaluate_fit_against_simulation(
             multiplicity_estimable_f1=float("nan"),
         )
 
-    ari = _adjusted_rand_index(truth_clusters[eval_mask], fit.cluster_labels[eval_mask])
-    raw_cp_rmse = float(np.sqrt(np.mean((fit.phi[eval_mask] - truth_phi[eval_mask]) ** 2)))
-    summary_cp_rmse = float(np.sqrt(np.mean((fit.phi_clustered[eval_mask] - truth_phi[eval_mask]) ** 2)))
+    ari = _adjusted_rand_index(truth_clusters, fit.cluster_labels)
+    raw_cp_rmse = float(np.sqrt(np.mean((fit.phi - truth_phi) ** 2)))
+    summary_cp_rmse = float(np.sqrt(np.mean((fit.phi_clustered - truth_phi) ** 2)))
     cp_rmse = summary_cp_rmse
     estimated_clonal_fraction = _cluster_level_clonal_fraction(
-        fit.phi_clustered[eval_mask],
-        fit.cluster_labels[eval_mask],
+        fit.phi_clustered,
+        fit.cluster_labels,
     )
     true_clonal_fraction = _cluster_level_clonal_fraction(
-        truth_phi[eval_mask],
-        truth_clusters[eval_mask],
+        truth_phi,
+        truth_clusters,
     )
     clonal_fraction_error = float(estimated_clonal_fraction - true_clonal_fraction)
     if truth_multiplicity is None:
@@ -403,7 +417,11 @@ def evaluate_fit_against_simulation(
 
     bic_refit_ari: float | None = None
     bic_refit_cp_rmse: float | None = None
-    refit_phi = bic_refit_phi if bic_refit_phi is not None else getattr(fit, "bic_refit_phi", None)
+    refit_phi = (
+        bic_refit_phi
+        if bic_refit_phi is not None
+        else getattr(fit, "bic_refit_phi", None)
+    )
     refit_labels = (
         bic_partition_labels
         if bic_partition_labels is not None
@@ -415,12 +433,8 @@ def evaluate_fit_against_simulation(
         and refit_phi.shape == fit.phi_clustered.shape
         and refit_labels.shape == fit.cluster_labels.shape
     ):
-        bic_refit_ari = _adjusted_rand_index(
-            truth_clusters[eval_mask], refit_labels[eval_mask]
-        )
-        bic_refit_cp_rmse = float(
-            np.sqrt(np.mean((refit_phi[eval_mask] - truth_phi[eval_mask]) ** 2))
-        )
+        bic_refit_ari = _adjusted_rand_index(truth_clusters, refit_labels)
+        bic_refit_cp_rmse = float(np.sqrt(np.mean((refit_phi - truth_phi) ** 2)))
 
     return SimulationEvaluation(
         ari=ari,
@@ -432,7 +446,7 @@ def evaluate_fit_against_simulation(
         true_clusters=int(np.unique(truth_clusters).shape[0]),
         estimated_clusters=int(fit.n_clusters),
         n_eval_mutations=n_eval_mutations,
-        n_filtered_mutations=n_filtered_mutations,
+        n_filtered_mutations=0,
         raw_cp_rmse=raw_cp_rmse,
         summary_cp_rmse=summary_cp_rmse,
         bic_refit_ari=bic_refit_ari,

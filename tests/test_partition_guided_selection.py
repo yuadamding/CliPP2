@@ -6,11 +6,14 @@ import pytest
 import torch
 
 import CliPP2.runners.model_selection as runner
+from CliPP2.core.fusion.graph import build_complete_uniform_graph
+from CliPP2.core.fusion.partition_starts import PartitionCandidate
 from CliPP2.core.model import FitOptions
 from CliPP2.core.fusion.types import (
     DenseEdgeCertificate,
     DenseWarmState,
     SolverState,
+    TorchRuntime,
 )
 from CliPP2.io.data import TumorData, compute_phi_init_from_counts
 from CliPP2.model_selection.scoring import _positive_exact_fusion_selection_mask
@@ -60,6 +63,54 @@ def _two_group_tumor() -> TumorData:
         init_major_mask=init_major_mask,
         count_observed=np.ones_like(alt, dtype=bool),
     )
+
+
+def test_partition_candidate_records_effective_runtime() -> None:
+    data = _two_group_tumor()
+    graph = build_complete_uniform_graph(data.num_mutations)
+    labels = np.asarray([0, 0, 0, 1, 1, 1], dtype=np.int64)
+    centers = np.asarray([[0.2, 0.25], [0.8, 0.75]], dtype=np.float64)
+    candidate = PartitionCandidate(
+        labels=labels,
+        K=2,
+        source="test",
+        theta=centers,
+        phi_start=centers[labels],
+        fit_loss=10.0,
+        bic=20.0,
+    )
+    runtime = TorchRuntime(
+        device=torch.device("cpu"),
+        device_name="cpu",
+        dtype=torch.float32,
+    )
+
+    fit, _, row, _ = runner._evaluate_partition_candidate(
+        data=data,
+        fit_options=FitOptions(
+            lambda_value=0.0,
+            graph=graph,
+            device="cuda",
+            dtype="float64",
+        ),
+        candidate=candidate,
+        candidate_rank=1,
+        bic_df_scale=1.0,
+        bic_cluster_penalty=0.0,
+        simulation_truth=None,
+        evaluate_candidate=False,
+        selection_method="test",
+        profile_name="test",
+        selection_step=0,
+        selection_score="partition_icl",
+        static_metadata=runner._candidate_static_metadata(
+            data, graph, candidate.phi_start
+        ),
+        runtime=runtime,
+    )
+
+    assert (fit.device, fit.dtype) == ("cpu", "float32")
+    assert (row["device"], row["dtype"]) == ("cpu", "float32")
 
 
 def test_partition_guided_mode_selects_only_positive_complete_graph_admm(
@@ -160,8 +211,6 @@ def test_persistent_solver_state_offload_preserves_values_and_shared_storage() -
     state = SolverState(
         phi=phi.detach(),
         dual=dual.detach(),
-        split=None,
-        curvature=torch.ones_like(phi),
         previous_lambda=3.5,
         warm_state=DenseWarmState(
             phi=phi.detach(),
@@ -181,8 +230,8 @@ def test_persistent_solver_state_offload_preserves_values_and_shared_storage() -
     assert observed is not None
     assert observed.phi.device.type == "cpu"
     assert observed.dual is not None and observed.dual.device.type == "cpu"
-    assert observed.curvature is not None and observed.curvature.device.type == "cpu"
-    assert observed.split is None
+    assert not hasattr(observed, "curvature")
+    assert not hasattr(observed, "split")
     assert observed.previous_lambda == pytest.approx(3.5)
     assert isinstance(observed.warm_state, DenseWarmState)
     assert isinstance(observed.certificate, DenseEdgeCertificate)

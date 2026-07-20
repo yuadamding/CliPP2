@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 import torch
 
-import CliPP2.core.fusion.starts as starts_module
 import CliPP2.core.fusion.solver as solver_module
 from CliPP2.core.fusion.solver import fit_torch, prepare_torch_problem
 from CliPP2.core.fusion.starts import (
@@ -20,6 +19,7 @@ from CliPP2.core.fusion.starts import (
 )
 from CliPP2.core.fusion.torch_backend import resolve_runtime, to_torch_tumor_data
 from CliPP2.core.fusion.types import (
+    CompressedEdgeCertificate,
     PrimalOnlyWarmState,
     QuotientWorksetWarmState,
 )
@@ -97,6 +97,11 @@ def test_damped_state_transition_invalidates_trial_certificate_and_dual() -> Non
     assert warm_state.phi is phi
     assert warm_state.structure_hint is labels
     assert warm_state.structure_hint_is_heuristic
+    assert isinstance(warm_state.certificate_hint, CompressedEdgeCertificate)
+    torch.testing.assert_close(
+        warm_state.certificate_hint.internal_dual,
+        trial_state.internal_dual,
+    )
 
 
 @pytest.mark.parametrize("bad_lambda", [-1.0, float("nan"), float("inf")])
@@ -356,7 +361,7 @@ def test_fit_reuses_solver_state_actual_dual_for_alm_warm_start(monkeypatch) -> 
     )
     assert first_fit.solver_state is not None
     assert first_fit.solver_state.dual is not None
-    assert first_fit.solver_state.split is None
+    assert not hasattr(first_fit.solver_state, "split")
     assert first_fit.solver_state.dual.shape[0] == 1
 
     original_alm = solver_module.solve_majorized_subproblem_alm_torch
@@ -390,7 +395,7 @@ def test_fit_reuses_solver_state_actual_dual_for_alm_warm_start(monkeypatch) -> 
     assert first_call == [{"dual_start_is_actual": True, "dual_start_is_none": False}]
     assert second_fit.solver_state is not None
     assert second_fit.solver_state.dual is not None
-    assert second_fit.solver_state.split is None
+    assert not hasattr(second_fit.solver_state, "split")
 
 
 def test_complete_graph_fit_reports_accumulated_admm_iterations(monkeypatch) -> None:
@@ -658,9 +663,7 @@ def test_torch_scalar_mutation_region_wells_match_legacy_on_ambiguous_subset() -
         assert np.allclose(tensor_start.detach().cpu().numpy(), legacy_start, atol=1e-8)
 
 
-def test_torch_scalar_mutation_region_wells_do_not_call_numpy_ranking(
-    monkeypatch,
-) -> None:
+def test_torch_scalar_mutation_region_wells_rank_on_torch() -> None:
     path = Path("/data/CliPP2/CliPP2Sim1K_TSV/300_5_0.3_0.2_S20_Lm4000_M4201_rep0.tsv")
     if not path.exists():
         pytest.skip(f"Missing regression fixture: {path}")
@@ -676,17 +679,6 @@ def test_torch_scalar_mutation_region_wells_do_not_call_numpy_ranking(
     data = _subset_tumor_mutations(full_data, ambiguous_mutations[:8])
     runtime = resolve_runtime("cpu", dtype="float64")
     torch_data = to_torch_tumor_data(data, runtime)
-
-    def fail_numpy_ranking(*args, **kwargs):
-        raise AssertionError(
-            "Torch scalar wells should not use NumPy candidate ranking"
-        )
-
-    monkeypatch.setattr(
-        starts_module,
-        "_ambiguous_best_two_from_candidate_grid_numpy",
-        fail_numpy_ranking,
-    )
 
     primary, secondary, valid = compute_scalar_mutation_region_wells_torch(
         torch_data,

@@ -20,10 +20,11 @@ from CliPP2.core.fusion.quotient_workset import (
     lifted_inner_objective,
     quotient_inner_objective,
 )
-from CliPP2.core.fusion.solver import prepare_torch_problem
+from CliPP2.core.fusion.solver import prepare_torch_problem, torch_data_from_context
 from CliPP2.core.fusion.torch_backend import (
     graph_fusion_kkt_residual_from_grad_torch,
     project_stationarity_cone_torch,
+    to_torch_tumor_data,
 )
 from CliPP2.core.fusion.types import (
     CertificateOptions,
@@ -432,6 +433,84 @@ def test_likelihood_only_context_rejects_a_resolved_graph() -> None:
         )
 
 
+def test_prepared_torch_data_identity_survives_context_reuse() -> None:
+    data = _toy_data()
+    runtime = solver_module.resolve_runtime("cpu", dtype="float64")
+    torch_data = to_torch_tumor_data(data, runtime)
+
+    context = solver_module.prepare_torch_problem(
+        data,
+        major_prior=0.5,
+        eps=1e-6,
+        tol=1e-5,
+        inner_max_iter=32,
+        exact_pilot=data.phi_init,
+        runtime=runtime,
+        torch_data=torch_data,
+        defer_graph=True,
+    )
+
+    reused = torch_data_from_context(context)
+    assert context.data_fingerprint == torch_data.data_fingerprint
+    assert reused.data_fingerprint == torch_data.data_fingerprint
+
+
+def test_preparation_rejects_stale_torch_data_identity() -> None:
+    data = _toy_data()
+    runtime = solver_module.resolve_runtime("cpu", dtype="float64")
+    stale_torch_data = to_torch_tumor_data(data, runtime)
+    different_data = replace(data, tumor_id="different-tumor")
+
+    with pytest.raises(ValueError, match="fingerprint does not match"):
+        solver_module.prepare_torch_problem(
+            different_data,
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-5,
+            inner_max_iter=32,
+            exact_pilot=different_data.phi_init,
+            runtime=runtime,
+            torch_data=stale_torch_data,
+            defer_graph=True,
+        )
+
+
+@pytest.mark.parametrize("invalid_kind", ["shape", "dtype", "device"])
+def test_preparation_rejects_runtime_incompatible_torch_data(
+    invalid_kind: str,
+) -> None:
+    data = _toy_data()
+    runtime = solver_module.resolve_runtime("cpu", dtype="float64")
+    torch_data = to_torch_tumor_data(data, runtime)
+    expected_message = ""
+    if invalid_kind == "shape":
+        torch_data = replace(torch_data, alt=torch_data.alt[:-1])
+        expected_message = "must have shape"
+    elif invalid_kind == "dtype":
+        torch_data = replace(torch_data, alt=torch_data.alt.to(torch.float32))
+        expected_message = "must use runtime dtype"
+    else:
+        runtime = TorchRuntime(
+            device=torch.device("cuda"),
+            device_name="cuda",
+            dtype=torch.float64,
+        )
+        expected_message = "must be on runtime device"
+
+    with pytest.raises(ValueError, match=expected_message):
+        solver_module.prepare_torch_problem(
+            data,
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-5,
+            inner_max_iter=32,
+            exact_pilot=data.phi_init,
+            runtime=runtime,
+            torch_data=torch_data,
+            defer_graph=True,
+        )
+
+
 def test_prebuilt_tensor_graph_is_reused_without_reupload(monkeypatch) -> None:
     data = _toy_data()
     runtime = solver_module.resolve_runtime("cpu", dtype="float64")
@@ -617,6 +696,55 @@ def test_guided_initialization_resource_policy_fails_closed(
     assert isinstance(error.value.__cause__, failure_type)
 
 
+@pytest.mark.parametrize(
+    "policy,host_retry",
+    [
+        ("auto", False),
+        ("device_only", False),
+        ("error", False),
+        ("cpu_allowed", True),
+    ],
+)
+def test_guided_graph_cuda_oom_respects_fallback_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+    host_retry: bool,
+) -> None:
+    _, guide, _, device_context = _guided_resource_policy_context()
+    original_as_tensor = torch.as_tensor
+
+    def as_cpu_tensor(value, **kwargs):
+        return original_as_tensor(value, dtype=kwargs.get("dtype"), device="cpu")
+
+    def raise_cuda_oom(*args, **kwargs):
+        raise MemoryError("CUDA OOM")
+
+    monkeypatch.setattr(model_selection_runner.torch, "as_tensor", as_cpu_tensor)
+    monkeypatch.setattr(
+        model_selection_runner,
+        "build_likelihood_noise_regularized_adaptive_tensor_graph",
+        raise_cuda_oom,
+    )
+
+    def build():
+        return (
+            model_selection_runner._build_partition_guided_graph_with_resource_policy(
+                guide_phi=guide,
+                guide_curvature=torch.ones_like(device_context.lower),
+                solver_context=device_context,
+                fit_options=FitOptions(lambda_value=0.0, dense_fallback_policy=policy),
+                noise_divisor=2.0,
+            )
+        )
+
+    if not host_retry:
+        with pytest.raises(ExactSolverResourceLimit, match="host retry is disabled"):
+            build()
+        return
+    graph, tensor_graph, tau = build()
+    assert tensor_graph is None and graph.edge_u.size == 3 and tau > 0.0
+
+
 def test_quotient_fit_is_eligible_only_with_observed_full_graph_certificate() -> None:
     data = _toy_data()
     common = dict(
@@ -699,6 +827,7 @@ def test_damped_state_is_primal_only_and_resource_batch_continues(
     assert not dual_is_actual
     assert isinstance(warm, PrimalOnlyWarmState)
     assert warm.structure_hint_is_heuristic
+    assert isinstance(warm.certificate_hint, CompressedEdgeCertificate)
 
     input_dir = tmp_path / "inputs"
     output_dir = tmp_path / "outputs"

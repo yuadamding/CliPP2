@@ -4,23 +4,29 @@ import argparse
 from pathlib import Path
 
 from .core.bic import LAMBDA_GRID_MODES
+from .core.fusion.defaults import (
+    DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
+    DEFAULT_CERTIFICATE_MAX_ITER,
+    DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
+    DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
+    DEFAULT_DENSE_FALLBACK_POLICY,
+    DEFAULT_DEVICE,
+    DEFAULT_DTYPE,
+    DEFAULT_INNER_BACKEND,
+    DEFAULT_WORKSET_ADD_BATCH,
+    DEFAULT_WORKSET_MAX_BYTES,
+    DEFAULT_WORKSET_MAX_EXPANSIONS,
+    DENSE_FALLBACK_POLICIES,
+    INNER_BACKENDS,
+    normalize_dense_fallback_policy,
+    normalize_inner_backend,
+)
 from .core.model import FitOptions
 from .model_selection.config import DEFAULT_SELECTION_SCORE, SELECTION_SCORE_NAMES
 from .runners.pipeline import process_one_file, run_directory
 
 
-def _resolve_effective_device(device: str | None) -> str:
-    requested = "auto" if device is None else str(device).strip().lower()
-    if requested in {"cpu", "cuda"}:
-        return requested
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            return "cuda"
-    except Exception:
-        pass
-    return "cpu"
+DEFAULT_LAMBDA_GRID_MODE = "partition_guided_admm"
 
 
 def _parse_lambda_grid(value: str | None) -> list[float] | None:
@@ -44,7 +50,7 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--lambda-grid-mode",
         choices=list(LAMBDA_GRID_MODES),
-        default="partition_guided_admm",
+        default=DEFAULT_LAMBDA_GRID_MODE,
         help=(
             "Automatic lambda strategy. partition_guided_admm discovers lambda "
             "online from the likelihood-partition initializer and ADMM fits and "
@@ -118,38 +124,66 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda"],
-        default="cuda",
-        help="Execution device for the Torch fusion backend. CUDA is the default; use 'auto' for CPU fallback.",
+        default=DEFAULT_DEVICE,
+        help=(
+            "Torch execution device. CUDA is required by default; 'auto' allows "
+            "the runtime to select CPU when CUDA is unavailable."
+        ),
     )
     parser.add_argument(
         "--dtype",
         choices=["auto", "float16", "float32", "float64"],
-        default="float64",
-        help="Numeric dtype for Torch execution. Float64 is the default for BIC model selection; float16 requires CUDA.",
+        default=DEFAULT_DTYPE,
+        help=(
+            "Torch numeric dtype. Float64 is the production default; float16 "
+            "requires CUDA."
+        ),
     )
     parser.add_argument(
         "--inner-backend",
-        choices=["auto", "dense", "quotient-workset"],
-        default="dense",
+        choices=[value.replace("_", "-") for value in INNER_BACKENDS],
+        default=DEFAULT_INNER_BACKEND.replace("_", "-"),
         help=(
-            "Inner fusion backend. Quotient-workset remains opt-in; auto may "
-            "fall back to the dense exact solver when compression is not useful."
+            "Inner fusion backend. Dense is the production default, quotient-"
+            "workset is opt-in, and auto is a compatibility alias for dense."
         ),
     )
-    parser.add_argument("--workset-max-bytes", type=int, default=256 * 1024 * 1024)
     parser.add_argument(
-        "--compressed-cache-max-bytes", type=int, default=256 * 1024 * 1024
+        "--workset-max-bytes", type=int, default=DEFAULT_WORKSET_MAX_BYTES
+    )
+    parser.add_argument(
+        "--compressed-cache-max-bytes",
+        type=int,
+        default=DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
     )
     parser.add_argument(
         "--dense-fallback-policy",
-        choices=["auto", "device-only", "cpu-allowed", "error"],
-        default="auto",
+        choices=[value.replace("_", "-") for value in DENSE_FALLBACK_POLICIES],
+        default=DEFAULT_DENSE_FALLBACK_POLICY.replace("_", "-"),
+        help=(
+            "Exact fallback policy. device-only never moves solver work to CPU; "
+            "cpu-allowed permits CPU fallback; error disables dense fallback."
+        ),
     )
-    parser.add_argument("--workset-add-batch", type=int, default=64)
-    parser.add_argument("--workset-max-expansions", type=int, default=16)
-    parser.add_argument("--certificate-max-iter", type=int, default=512)
-    parser.add_argument("--certificate-refinement-rounds", type=int, default=2)
-    parser.add_argument("--certificate-column-tol-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--workset-add-batch", type=int, default=DEFAULT_WORKSET_ADD_BATCH
+    )
+    parser.add_argument(
+        "--workset-max-expansions", type=int, default=DEFAULT_WORKSET_MAX_EXPANSIONS
+    )
+    parser.add_argument(
+        "--certificate-max-iter", type=int, default=DEFAULT_CERTIFICATE_MAX_ITER
+    )
+    parser.add_argument(
+        "--certificate-refinement-rounds",
+        type=int,
+        default=DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
+    )
+    parser.add_argument(
+        "--certificate-column-tol-scale",
+        type=float,
+        default=DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
+    )
     parser.add_argument(
         "--allow-heuristic-structure-splits",
         action=argparse.BooleanOptionalAction,
@@ -159,8 +193,9 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         "--materialize-full-dual",
         action="store_true",
         help=(
-            "Debugging option: materialize the guided E-by-S dual after a dense "
-            "memory preflight. The default keeps guided state compressed."
+            "Quotient-workset debugging option: also materialize the guided "
+            "E-by-S dual after a memory preflight. Dense already materializes "
+            "the guide dual it requires."
         ),
     )
     parser.add_argument(
@@ -175,17 +210,13 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument(
         "--input-dir",
-        default="CliPP2Sim_TSV",
         help="Directory with per-tumor TSV files.",
     )
-    parser.add_argument(
-        "--input-file", default=None, help="Optional single tumor TSV file."
-    )
-    parser.add_argument(
-        "--outdir", default="multi_region_clipp_results", help="Output directory."
-    )
+    inputs.add_argument("--input-file", help="Single tumor TSV file.")
+    parser.add_argument("--outdir", default="clipp2_results", help="Output directory.")
     parser.add_argument(
         "--simulation-root",
         default=None,
@@ -216,15 +247,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipp2",
         description=(
-            "CliPP2 BIC model selection for objective-faithful observed-data pairwise fusion."
+            "CliPP2 objective-faithful observed-data pairwise fusion. Production "
+            "defaults use CUDA, float64, dense device-only fusion, "
+            "partition-guided ADMM, and partition ICL."
         ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     fit_parser = subparsers.add_parser(
-        "fit", help="Fit TSV files with certified BIC model selection."
+        "fit",
+        help="Fit TSV files with certified partition-ICL model selection.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     _add_fit_args(fit_parser)
     return parser
+
+
+def _validate_fit_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    try:
+        lambda_grid = _parse_lambda_grid(args.lambda_grid)
+    except ValueError as exc:
+        parser.error(f"invalid --lambda-grid: {exc}")
+
+    if args.lambda_grid_mode != DEFAULT_LAMBDA_GRID_MODE:
+        return
+    if lambda_grid is not None:
+        parser.error(
+            "--lambda-grid is incompatible with partition_guided_admm; use "
+            "--lambda-grid-mode adaptive_bic for prespecified values"
+        )
+    if args.selection_score != DEFAULT_SELECTION_SCORE:
+        parser.error(
+            "partition_guided_admm requires --selection-score partition_icl; "
+            "use --lambda-grid-mode adaptive_bic for bic or extended_bic"
+        )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    _validate_fit_args(parser, args)
+    return args
 
 
 def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
@@ -236,12 +301,14 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         summary_tol=args.summary_tol,
         bic_partition_tol=args.bic_partition_tol,
         major_prior=args.major_prior,
-        device=_resolve_effective_device(args.device),
+        device=args.device,
         dtype=args.dtype,
-        inner_backend=args.inner_backend,
+        inner_backend=normalize_inner_backend(args.inner_backend),
         workset_max_bytes=args.workset_max_bytes,
         compressed_cache_max_bytes=args.compressed_cache_max_bytes,
-        dense_fallback_policy=args.dense_fallback_policy,
+        dense_fallback_policy=normalize_dense_fallback_policy(
+            args.dense_fallback_policy
+        ),
         workset_add_batch=args.workset_add_batch,
         workset_max_expansions=args.workset_max_expansions,
         certificate_max_iter=args.certificate_max_iter,
@@ -299,12 +366,11 @@ def _run_fit(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parse_args(argv)
     _run_fit(args)
 
 
-__all__ = ["build_parser", "main"]
+__all__ = ["build_parser", "main", "parse_args"]
 
 
 if __name__ == "__main__":

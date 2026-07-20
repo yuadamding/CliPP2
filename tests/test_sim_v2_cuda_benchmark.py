@@ -39,6 +39,7 @@ def test_parser_normalizes_backend_and_one_lambda_override() -> None:
     assert args.backend == "quotient_workset"
     assert args.strict_backend is True
     assert args.max_unique_lambdas == 1
+    assert args.dense_fallback_policy == "device_only"
     assert args.cases == [Path("/tmp/case.tsv")]
 
 

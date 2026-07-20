@@ -310,7 +310,7 @@ def test_unconverged_workset_refinement_fails_closed_after_three_attempts() -> N
     assert result.status == "workset_incomplete"
     assert result.diagnostics.kkt_residual > 5e-12
     assert result.work_counters.workset_iterations == 3
-    assert result.work_counters.workset_expansions == 2
+    assert result.work_counters.workset_expansions == 0
 
 
 def test_mm_certificate_is_not_reused_as_observed_objective_authority() -> None:

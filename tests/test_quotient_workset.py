@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+import CliPP2.core.fusion.quotient_workset as quotient_module
 from CliPP2.core.fusion.solver import prepare_torch_problem
 from CliPP2.core.fusion.quotient_workset import (
     QuotientCacheResourceError,
@@ -102,50 +103,6 @@ def test_exact_quotient_preserves_lifted_objective_and_boxes() -> None:
         )
 
 
-def test_node_to_block_weights_reproduce_analytic_between_adjoint() -> None:
-    dtype = torch.float64
-    graph = _complete_graph(5, dtype=dtype)
-    labels = torch.tensor([0, 0, 1, 1, 2], dtype=torch.long)
-    h = torch.ones((5, 2), dtype=dtype)
-    U = torch.zeros_like(h)
-    quotient = aggregate_exact_quotient_problem(
-        h=h,
-        U=U,
-        lower=torch.zeros_like(h),
-        upper=torch.ones_like(h),
-        labels=labels,
-        graph=graph,
-    )
-    centers = torch.tensor([[0.1, 0.2], [0.7, 0.3], [0.4, 0.9]], dtype=dtype)
-    phi = centers.index_select(0, quotient.labels)
-    diff = phi.index_select(0, graph.edge_u) - phi.index_select(0, graph.edge_v)
-    between = quotient.labels.index_select(0, graph.edge_u) != (
-        quotient.labels.index_select(0, graph.edge_v)
-    )
-    dual = torch.zeros_like(diff)
-    norm = torch.linalg.vector_norm(diff[between], dim=1)
-    dual[between] = 0.6 * graph.weight[between, None] * diff[between] / norm[:, None]
-    expected = torch.zeros_like(phi)
-    expected.index_add_(0, graph.edge_u, dual)
-    expected.index_add_(0, graph.edge_v, dual, alpha=-1.0)
-
-    actual = torch.zeros_like(phi)
-    for node in range(int(phi.shape[0])):
-        block = int(quotient.labels[node].item())
-        for other in range(quotient.num_blocks):
-            if other == block:
-                continue
-            center_diff = centers[block] - centers[other]
-            actual[node] += (
-                0.6
-                * quotient.node_to_block_weight[node, other]
-                * center_diff
-                / torch.linalg.vector_norm(center_diff)
-            )
-
-    torch.testing.assert_close(actual, expected, rtol=1e-13, atol=1e-13)
-
-
 def test_exact_quotient_cache_budget_fails_before_large_cache_allocation() -> None:
     dtype = torch.float64
     graph = _complete_graph(5, dtype=dtype)
@@ -229,7 +186,7 @@ def test_compatible_warm_certificate_skips_quotient_and_workset_iterations() -> 
         previous_lambda=lambda_value,
     )
 
-    result, work = solve_majorized_subproblem_quotient_workset_torch(
+    attempt = solve_majorized_subproblem_quotient_workset_torch(
         runtime=TorchRuntime(
             device=torch.device("cpu"), device_name="cpu", dtype=dtype
         ),
@@ -248,6 +205,9 @@ def test_compatible_warm_certificate_skips_quotient_and_workset_iterations() -> 
         partition_tolerance=1e-8,
     )
 
+    result = attempt.certified_result
+    work = attempt.work_counters
+    assert attempt.status == "certified"
     assert result is not None
     torch.testing.assert_close(result.phi, phi, rtol=0.0, atol=0.0)
     assert result.surrogate_kkt.kkt_residual <= 5e-8
@@ -256,6 +216,67 @@ def test_compatible_warm_certificate_skips_quotient_and_workset_iterations() -> 
     assert work.workset_iterations == 0
     assert work.dense_iterations == 0
     assert work.streamed_edge_passes == 2
+
+
+def test_unconverged_quotient_returns_no_worse_seed_without_workset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dtype = torch.float64
+    graph = _complete_graph(3, dtype=dtype)
+    phi_start = torch.tensor([[0.2], [0.2], [0.9]], dtype=dtype)
+    U = torch.tensor([[0.3], [0.3], [0.7]], dtype=dtype)
+
+    def unconverged_quotient(**kwargs):
+        centers = kwargs["U"].clone()
+        dual = torch.zeros(
+            (int(kwargs["edge_u"].numel()), 1),
+            dtype=dtype,
+        )
+        return centers, dual, dual, 3, False, 1.0
+
+    monkeypatch.setattr(
+        quotient_module,
+        "solve_majorized_subproblem_alm_torch",
+        unconverged_quotient,
+    )
+    monkeypatch.setattr(
+        quotient_module,
+        "refine_graph_fusion_certificate",
+        lambda **_kwargs: pytest.fail("workset refinement must be convergence-gated"),
+    )
+
+    attempt = solve_majorized_subproblem_quotient_workset_torch(
+        runtime=TorchRuntime(
+            device=torch.device("cpu"), device_name="cpu", dtype=dtype
+        ),
+        U=U,
+        h=torch.ones_like(U),
+        lower=torch.zeros_like(U),
+        upper=torch.ones_like(U),
+        lambda_value=0.01,
+        graph=graph,
+        graph_hash="unconverged-seed",
+        tol=1e-8,
+        max_iter=20,
+        phi_start=phi_start,
+        warm_state=None,
+        certificate_options=CertificateOptions(),
+        partition_tolerance=1e-8,
+    )
+
+    assert attempt.status == "quotient_unconverged"
+    torch.testing.assert_close(attempt.phi_candidate, U)
+    assert attempt.certified_result is None
+    assert attempt.work_counters.quotient_iterations == 3
+    assert attempt.exact_inner_objective <= float(
+        lifted_inner_objective(
+            phi=phi_start,
+            h=torch.ones_like(U),
+            U=U,
+            graph=graph,
+            lambda_value=0.01,
+        ).item()
+    )
 
 
 def test_opt_in_quotient_backend_returns_observed_full_graph_certificate() -> None:
@@ -298,10 +319,9 @@ def test_opt_in_quotient_backend_returns_observed_full_graph_certificate() -> No
     assert fit.inner_backend == "quotient_workset_complete_graph"
     assert fit.admm_iterations == 0
     assert fit.quotient_iterations > 0
-    # The inherited compressed certificate already passes the full-graph
-    # audit on this favorable problem, so refinement must take the exact fast
-    # path without an unnecessary projected-gradient workset loop.
-    assert fit.workset_iterations == 0
+    # A fresh quotient proposal first passes the cheap retained-edge and omitted-
+    # column gates; only then does it pay for the authoritative full-graph audit.
+    assert fit.workset_iterations == 1
     assert fit.workset_expansions == 0
     assert fit.streamed_edge_passes > 0
     assert fit.dense_iterations == 0
@@ -384,7 +404,7 @@ def test_resource_limit_is_explicit_when_workset_and_dense_fallback_do_not_fit(
             data,
             replace(
                 options,
-                inner_backend="auto",
+                inner_backend="quotient_workset",
                 dense_fallback_policy="error",
             ),
             phi_start=np.full_like(alt, 0.5),
@@ -405,8 +425,19 @@ def test_resource_limit_is_explicit_when_workset_and_dense_fallback_do_not_fit(
     assert dense_fallback.dense_iterations > 0
     assert dense_fallback.admm_iterations == dense_fallback.dense_iterations
     assert dense_fallback.inner_iterations > dense_fallback.admm_iterations
+    assert "dense_current_device_after_resource_limit" in dense_fallback.fallback_reason
+
+    continued = fit_fixed_objective(
+        data,
+        options,
+        solver_context=context,
+        solver_state=dense_fallback.solver_state,
+        start_mode="warm_only",
+        compute_summary=False,
+    )
+    assert continued.quotient_iterations == 0
     assert (
-        "dense_current_device_after_quotient_attempt" in dense_fallback.fallback_reason
+        "dense_current_device_after_prior_quotient_failure" in continued.fallback_reason
     )
 
     monkeypatch.setenv("CLIPP2_MAX_COMPLETE_GRAPH_BYTES", "1")

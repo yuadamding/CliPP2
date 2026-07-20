@@ -570,23 +570,35 @@ def _refine_compressed_certificate(
     edge_passes = tree_passes + between_passes + activity_passes
     column_residual = float("inf")
     node_residual = float("inf")
-    before = _compressed_graph_fusion_kkt(
-        certificate=certificate,
+    # A nonempty inherited support may already be authoritative, so give it one
+    # full-graph fast-path audit. Fresh proposals go directly to the cheap
+    # workset/missing-column gates and pay for a full audit only if those pass.
+    has_inherited_fast_path = bool(inherited_ids.numel())
+    before = _resource_limit_diagnostics(
         phi=phi,
         grad_smooth=grad_smooth,
-        graph=graph,
-        graph_hash=graph_hash,
         lower=lower,
         upper=upper,
-        lambda_value=lambda_value,
         atol=atol,
     )
-    edge_passes += _compressed_audit_edge_passes(
-        num_edges=int(graph.edge_u.numel()),
-        num_regions=int(phi.shape[1]),
-        dtype=phi.dtype,
-    )
-    if before.kkt_residual <= 5.0 * float(atol):
+    if has_inherited_fast_path:
+        before = _compressed_graph_fusion_kkt(
+            certificate=certificate,
+            phi=phi,
+            grad_smooth=grad_smooth,
+            graph=graph,
+            graph_hash=graph_hash,
+            lower=lower,
+            upper=upper,
+            lambda_value=lambda_value,
+            atol=atol,
+        )
+        edge_passes += _compressed_audit_edge_passes(
+            num_edges=int(graph.edge_u.numel()),
+            num_regions=int(phi.shape[1]),
+            dtype=phi.dtype,
+        )
+    if has_inherited_fast_path and before.kkt_residual <= 5.0 * float(atol):
         # The inherited compressed state has already passed a full
         # original-graph audit.  Re-optimizing its workset cannot strengthen
         # that certificate and was the dominant CUDA cost on favorable warm
@@ -660,56 +672,46 @@ def _refine_compressed_certificate(
             graph_hash=graph_hash,
             gradient_scope=gradient_scope,
         )
-        final_diag = _compressed_graph_fusion_kkt(
-            certificate=current,
-            phi=phi,
-            grad_smooth=grad_smooth,
-            graph=graph,
-            graph_hash=graph_hash,
-            lower=lower,
-            upper=upper,
-            lambda_value=lambda_value,
-            atol=atol,
+        mapping_ready = bool(
+            math.isfinite(mapping_residual)
+            and mapping_residual <= float(options.mapping_tolerance)
         )
-        edge_passes += max(
-            1,
-            (
-                int(graph.edge_u.numel())
-                + _compressed_edge_chunk_size(
-                    num_edges=int(graph.edge_u.numel()),
-                    num_regions=int(phi.shape[1]),
-                    dtype=phi.dtype,
-                )
-                - 1
+        if not mapping_ready:
+            unconverged_worksets += 1
+            if unconverged_worksets >= _MAX_CONSECUTIVE_UNCONVERGED_WORKSETS:
+                status = "workset_incomplete"
+                certificate = current
+                break
+            # More columns cannot certify an unresolved retained-edge problem.
+            continue
+        unconverged_worksets = 0
+
+        column_ready = column_residual <= float(options.column_tolerance)
+        should_expand = not column_ready
+        if column_ready:
+            final_diag = _compressed_graph_fusion_kkt(
+                certificate=current,
+                phi=phi,
+                grad_smooth=grad_smooth,
+                graph=graph,
+                graph_hash=graph_hash,
+                lower=lower,
+                upper=upper,
+                lambda_value=lambda_value,
+                atol=atol,
             )
-            // _compressed_edge_chunk_size(
+            edge_passes += _compressed_audit_edge_passes(
                 num_edges=int(graph.edge_u.numel()),
                 num_regions=int(phi.shape[1]),
                 dtype=phi.dtype,
-            ),
-        )
-        if final_diag.kkt_residual <= 5.0 * float(atol):
-            status = "certified"
-            certificate = current
-            break
-        if not math.isfinite(mapping_residual) or mapping_residual > float(
-            options.mapping_tolerance
-        ):
-            unconverged_worksets += 1
-        else:
-            unconverged_worksets = 0
-        if unconverged_worksets >= _MAX_CONSECUTIVE_UNCONVERGED_WORKSETS:
-            # The omitted-edge scan cannot certify optimal columns while the
-            # included-edge projected-gradient mapping remains unresolved.
-            # Return no authority and let the existing caller select dense
-            # fallback, CPU fallback, or an error according to policy.
-            status = "workset_incomplete"
-            certificate = current
-            break
-        should_expand = column_residual > float(options.column_tolerance)
-        if not should_expand and force_rounds < int(options.refinement_rounds):
-            should_expand = bool(proposed_ids.numel())
-            force_rounds += 1
+            )
+            if final_diag.kkt_residual <= 5.0 * float(atol):
+                status = "certified"
+                certificate = current
+                break
+            if force_rounds < int(options.refinement_rounds):
+                should_expand = bool(proposed_ids.numel())
+                force_rounds += 1
         if not should_expand or not proposed_ids.numel():
             status = "not_certified"
             certificate = current

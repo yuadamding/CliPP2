@@ -12,11 +12,16 @@ from .config import (
     LIKELIHOOD_PARTITION_K_MAX,
 )
 
+
 def _likelihood_partition_k_grid(num_mutations: int) -> list[int]:
     k_max = min(int(LIKELIHOOD_PARTITION_K_MAX), int(num_mutations))
     if k_max <= 0:
         return []
-    anchors = [int(value) for value in LIKELIHOOD_PARTITION_K_ANCHORS if 1 <= int(value) <= k_max]
+    anchors = [
+        int(value)
+        for value in LIKELIHOOD_PARTITION_K_ANCHORS
+        if 1 <= int(value) <= k_max
+    ]
     if k_max not in anchors:
         anchors.append(k_max)
     return sorted(set(anchors))
@@ -29,7 +34,9 @@ def _partition_candidate_requested_k(candidate: PartitionCandidate) -> int:
     return int(round(float(value)))
 
 
-def _best_partition_candidate(candidates: list[PartitionCandidate]) -> PartitionCandidate | None:
+def _best_partition_candidate(
+    candidates: list[PartitionCandidate],
+) -> PartitionCandidate | None:
     finite_candidates = [
         candidate
         for candidate in candidates
@@ -170,7 +177,9 @@ def _partition_signature(labels: np.ndarray) -> str:
     return f"{len(blocks)}:{hasher.hexdigest()}"
 
 
-def _partition_is_coarsening(fine_labels: np.ndarray, coarse_labels: np.ndarray) -> bool:
+def _partition_is_coarsening(
+    fine_labels: np.ndarray, coarse_labels: np.ndarray
+) -> bool:
     fine = _canonical_partition_labels(fine_labels)
     coarse = _canonical_partition_labels(coarse_labels)
     if fine.shape != coarse.shape:
@@ -195,8 +204,9 @@ def _max_cluster_diameter(diameters: np.ndarray) -> float:
     return float(np.max(values)) if values.size else 0.0
 
 
-
-def _centers_from_partition_labels(phi: np.ndarray, labels: np.ndarray, num_clusters: int) -> np.ndarray:
+def _centers_from_partition_labels(
+    phi: np.ndarray, labels: np.ndarray, num_clusters: int
+) -> np.ndarray:
     phi = np.asarray(phi, dtype=np.float64)
     labels = _canonical_partition_labels(labels)
     centers = np.zeros((int(num_clusters), phi.shape[1]), dtype=np.float64)

@@ -6,12 +6,22 @@ from typing import Literal, Mapping, TypeAlias
 import numpy as np
 import torch
 
+from .defaults import (
+    DEFAULT_CERTIFICATE_MAX_ITER,
+    DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
+    DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
+    DEFAULT_WORKSET_ADD_BATCH,
+    DEFAULT_WORKSET_MAX_BYTES,
+    DEFAULT_WORKSET_MAX_EXPANSIONS,
+    DenseFallbackPolicy as DenseFallbackPolicy,
+    InnerBackend as InnerBackend,
+)
+
 
 SmoothGradientScope: TypeAlias = Literal[
     "mm_surrogate",
     "observed_objective",
 ]
-InnerBackend: TypeAlias = Literal["auto", "dense", "quotient_workset"]
 CertificateScope: TypeAlias = Literal["full_original_graph"]
 CertificateStatus: TypeAlias = Literal[
     "certified",
@@ -19,12 +29,6 @@ CertificateStatus: TypeAlias = Literal[
     "not_certified",
     "resource_limit",
     "dense_fallback",
-]
-DenseFallbackPolicy: TypeAlias = Literal[
-    "auto",
-    "device_only",
-    "cpu_allowed",
-    "error",
 ]
 
 
@@ -34,9 +38,8 @@ class ExactSolverResourceLimit(MemoryError):
 
 @dataclass(frozen=True, slots=True)
 class WorksetMemoryOptions:
-    max_workset_bytes: int = 256 * 1024 * 1024
-    max_compressed_cache_bytes: int = 256 * 1024 * 1024
-    dense_fallback_policy: DenseFallbackPolicy = "auto"
+    max_workset_bytes: int = DEFAULT_WORKSET_MAX_BYTES
+    max_compressed_cache_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES
     allow_heuristic_split_before_dense_fallback: bool = True
 
     def __post_init__(self) -> None:
@@ -48,10 +51,10 @@ class WorksetMemoryOptions:
 
 @dataclass(frozen=True, slots=True)
 class CertificateOptions:
-    max_iter: int = 512
-    refinement_rounds: int = 2
-    max_expansions: int = 16
-    add_batch: int = 64
+    max_iter: int = DEFAULT_CERTIFICATE_MAX_ITER
+    refinement_rounds: int = DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS
+    max_expansions: int = DEFAULT_WORKSET_MAX_EXPANSIONS
+    add_batch: int = DEFAULT_WORKSET_ADD_BATCH
     mapping_tolerance: float = 1e-6
     column_tolerance: float = 1e-6
     memory: WorksetMemoryOptions = WorksetMemoryOptions()
@@ -153,15 +156,6 @@ class CompressedEdgeCertificate:
     certificate_scope: CertificateScope = "full_original_graph"
 
 
-@dataclass(frozen=True, slots=True)
-class ImplicitGuidedCertificate:
-    labels: torch.Tensor
-    centers: torch.Tensor
-    within_flow_demand: torch.Tensor
-    lambda_value: float
-    graph_hash: str
-
-
 GraphFusionCertificate: TypeAlias = DenseEdgeCertificate | CompressedEdgeCertificate
 
 
@@ -189,6 +183,7 @@ class QuotientWorksetWarmState:
 class PrimalOnlyWarmState:
     phi: torch.Tensor
     structure_hint: torch.Tensor | None = None
+    certificate_hint: GraphFusionCertificate | None = None
     structure_hint_is_heuristic: bool = True
 
 
@@ -218,6 +213,27 @@ class InnerSolveResult:
     backend_iterations: int
     work_counters: BackendWorkCounters
     fallback_reason: str = ""
+
+
+QuotientAttemptStatus: TypeAlias = Literal[
+    "certified",
+    "not_certified",
+    "workset_incomplete",
+    "resource_limit",
+    "quotient_unconverged",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class QuotientAttemptResult:
+    status: QuotientAttemptStatus
+    phi_candidate: torch.Tensor
+    warm_state: QuotientWorksetWarmState | PrimalOnlyWarmState
+    certificate_hint: CompressedEdgeCertificate | None
+    exact_inner_objective: float
+    work_counters: BackendWorkCounters
+    reason: str
+    certified_result: InnerSolveResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,8 +444,6 @@ class SolverContext:
 class SolverState:
     phi: torch.Tensor
     dual: torch.Tensor | None
-    split: torch.Tensor | None
-    curvature: torch.Tensor | None
     previous_lambda: float
     warm_state: BackendWarmState | None = None
     certificate: GraphFusionCertificate | None = None
