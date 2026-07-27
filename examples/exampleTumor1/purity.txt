@@ -1,3 +1,0 @@
-sample_id	purity
-region1	0.72
-region2	0.65

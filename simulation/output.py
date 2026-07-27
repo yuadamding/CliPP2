@@ -12,12 +12,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ..io.tumor_input import (
-    REGION_TABLE_COLUMNS,
-    REQUIRED_REGION_FILES,
-    REQUIRED_ROOT_FILES,
-    ROOT_TABLE_COLUMNS,
-    load_tumor_directory,
+from ..io.tumor_txt import (
+    REQUIRED_COLUMNS as TUMOR_TXT_COLUMNS,
+    TUMOR_TXT_SCHEMA,
+    load_tumor_txt,
 )
 from .config import (
     GENERATOR_VERSION,
@@ -65,62 +63,78 @@ def _generator_provenance() -> tuple[str, str | None]:
     return source_hash, completed.stdout.strip() or None
 
 
+def _canonical_input_path(data_dir: Path) -> Path:
+    candidates = sorted(
+        path
+        for path in data_dir.iterdir()
+        if path.is_file() and path.name.endswith(".clipp2.txt")
+    )
+    if len(candidates) != 1:
+        raise ValueError(
+            f"Generated tumor must contain exactly one root .clipp2.txt input; "
+            f"observed {[path.name for path in candidates]}."
+        )
+    return candidates[0]
+
+
 def _output_file_hashes(data_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
-    input_hashes: dict[str, str] = {}
+    canonical_input = _canonical_input_path(data_dir)
+    input_hashes = {
+        canonical_input.relative_to(data_dir).as_posix(): _sha256_file(canonical_input)
+    }
     truth_hashes: dict[str, str] = {}
     for path in sorted(data_dir.rglob("*")):
-        if not path.is_file() or path.name == "scenario_manifest.json":
+        if (
+            not path.is_file()
+            or path == canonical_input
+            or path.name == "scenario_manifest.json"
+        ):
             continue
         relative_path = path.relative_to(data_dir).as_posix()
-        destination = truth_hashes if path.name.startswith("truth") else input_hashes
-        destination[relative_path] = _sha256_file(path)
+        if not path.name.startswith("truth"):
+            raise ValueError(
+                "Generated bundles may contain only the canonical input, "
+                f"truth files, and scenario_manifest.json; found {relative_path!r}."
+            )
+        truth_hashes[relative_path] = _sha256_file(path)
     return input_hashes, truth_hashes
 
 
-def _require_exact_columns(path: Path, expected: tuple[str, ...]) -> None:
-    observed = tuple(pd.read_csv(path, sep="\t", nrows=0).columns)
-    if observed != expected:
-        raise ValueError(
-            f"{path} columns must be exactly {list(expected)}; observed {list(observed)}."
-        )
-
-
 def validate_generated_tumor_directory(tumor_dir: str | Path) -> None:
-    """Require a generated bundle to contain exactly the public input contract."""
+    """Validate a benchmark bundle with one canonical observed tumor input."""
 
     tumor_dir = Path(tumor_dir)
-    for filename, columns in ROOT_TABLE_COLUMNS.items():
-        _require_exact_columns(tumor_dir / filename, columns)
-
-    unexpected_root = {
+    canonical_input = _canonical_input_path(tumor_dir)
+    unexpected_root = sorted(
         path.name
         for path in tumor_dir.iterdir()
         if path.is_file()
-        and not path.name.startswith("truth")
+        and path != canonical_input
         and path.name != "scenario_manifest.json"
-        and path.name not in REQUIRED_ROOT_FILES
-    }
+        and not path.name.startswith("truth")
+    )
     if unexpected_root:
         raise ValueError(
-            f"Generated tumor has non-contract root files: {sorted(unexpected_root)}."
+            f"Generated tumor has non-contract root files: {unexpected_root}."
         )
 
-    data = load_tumor_directory(tumor_dir)
+    data = load_tumor_txt(canonical_input)
+    if data.tumor_id != tumor_dir.name:
+        raise ValueError(
+            "Canonical tumor_id must match its benchmark bundle directory: "
+            f"{data.tumor_id!r} != {tumor_dir.name!r}."
+        )
     for region_id in data.region_ids:
         region_dir = tumor_dir / region_id
-        for filename, columns in REGION_TABLE_COLUMNS.items():
-            _require_exact_columns(region_dir / filename, columns)
-        unexpected_region = {
+        if not region_dir.is_dir():
+            raise ValueError(f"Missing truth directory for sample {region_id!r}.")
+        unexpected_region = sorted(
             path.name
             for path in region_dir.iterdir()
-            if path.is_file()
-            and not path.name.startswith("truth")
-            and path.name not in REQUIRED_REGION_FILES
-        }
+            if path.is_file() and not path.name.startswith("truth")
+        )
         if unexpected_region:
-            raise ValueError(
-                f"{region_id} has non-contract files: {sorted(unexpected_region)}."
-            )
+            raise ValueError(f"{region_id} has non-truth files: {unexpected_region}.")
 
     unsupported = np.asarray(data.path_unsupported_reason, dtype=object)
     if any(value not in {None, ""} for value in unsupported.reshape(-1)):
@@ -225,6 +239,113 @@ def _local_cn_state_table(
     ):
         raise AssertionError("Region-local CN-state fractions do not sum to one.")
     return table, dominant_a, dominant_b, dominant_fraction, dominant_state_id
+
+
+def _canonical_observation_table(
+    *,
+    mutation_ids: np.ndarray,
+    mutation_segment: np.ndarray,
+    mutation_position: np.ndarray,
+    alt_count: np.ndarray,
+    ref_count: np.ndarray,
+    purity: float,
+    sample_id: str,
+    local_state_table: pd.DataFrame,
+    segments: list[GenomeSegment],
+) -> pd.DataFrame:
+    """Build one sample's rows in the canonical long tumor schema."""
+
+    mutation_ids = np.asarray(mutation_ids, dtype=object)
+    mutation_segment = np.asarray(mutation_segment, dtype=int)
+    mutation_position = np.asarray(mutation_position, dtype=int)
+    alt_count = np.asarray(alt_count, dtype=int)
+    ref_count = np.asarray(ref_count, dtype=int)
+    expected_shape = (mutation_ids.size,)
+    for name, values in (
+        ("mutation_segment", mutation_segment),
+        ("mutation_position", mutation_position),
+        ("alt_count", alt_count),
+        ("ref_count", ref_count),
+    ):
+        if values.shape != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_shape}, not {values.shape}."
+            )
+
+    unphased = local_state_table.copy()
+    unphased["allele_a_cn"] = np.maximum(
+        unphased["allele_a_cn"].to_numpy(dtype=int),
+        unphased["allele_b_cn"].to_numpy(dtype=int),
+    )
+    unphased["allele_b_cn"] = np.minimum(
+        local_state_table["allele_a_cn"].to_numpy(dtype=int),
+        local_state_table["allele_b_cn"].to_numpy(dtype=int),
+    )
+    unphased = (
+        unphased.groupby(
+            ["segment_id", "allele_a_cn", "allele_b_cn"],
+            as_index=False,
+            sort=True,
+        )["tumor_fraction"]
+        .sum()
+        .loc[lambda table: table["tumor_fraction"] > 0.0]
+    )
+
+    states_by_segment: dict[int, list[dict[str, int | float | str]]] = {}
+    for segment_id, state_rows in unphased.groupby("segment_id", sort=True):
+        if not np.isclose(
+            state_rows["tumor_fraction"].sum(),
+            1.0,
+            atol=1e-8,
+            rtol=0.0,
+        ):
+            raise ValueError(
+                f"Canonical CN-state fractions do not sum to one for "
+                f"sample {sample_id!r}, segment {segment_id!r}."
+            )
+        states_by_segment[int(segment_id)] = [
+            {
+                "cn_state_id": f"state{state_index + 1}",
+                "cn_state_fraction": float(row.tumor_fraction),
+                "allele_a_cn": int(row.allele_a_cn),
+                "allele_b_cn": int(row.allele_b_cn),
+            }
+            for state_index, row in enumerate(state_rows.itertuples(index=False))
+        ]
+
+    bases = ("A", "C", "G", "T")
+    rows: list[dict[str, object]] = []
+    for mutation_index, mutation_id in enumerate(mutation_ids):
+        segment_id = int(mutation_segment[mutation_index])
+        segment = segments[segment_id]
+        states = states_by_segment.get(segment_id)
+        if not states:
+            raise ValueError(
+                f"No positive canonical CN state for sample {sample_id!r}, "
+                f"segment {segment_id}."
+            )
+        for state in states:
+            rows.append(
+                {
+                    "mutation_id": str(mutation_id),
+                    "sample_id": str(sample_id),
+                    "chromosome": int(segment.chromosome),
+                    "position": int(mutation_position[mutation_index]),
+                    "ref": bases[mutation_index % len(bases)],
+                    "alt": bases[(mutation_index + 1) % len(bases)],
+                    "alt_count": int(alt_count[mutation_index]),
+                    "ref_count": int(ref_count[mutation_index]),
+                    "count_observed": 1,
+                    "purity": float(purity),
+                    "normal_cn": 2,
+                    "segment_id": int(segment_id),
+                    "segment_start": int(segment.start),
+                    "segment_end": int(segment.end),
+                    **state,
+                    "allele_mode": "unphased",
+                }
+            )
+    return pd.DataFrame(rows, columns=TUMOR_TXT_COLUMNS)
 
 
 def _numeric_summary(values: np.ndarray) -> dict[str, float]:
@@ -337,7 +458,10 @@ def _realized_cn_complexity(
     profiles = np.asarray(unique_cn_profiles, dtype=int)
     state_count_by_segment = np.asarray(
         [
-            np.unique(profiles[:, segment_id, :], axis=0).shape[0]
+            np.unique(
+                np.sort(profiles[:, segment_id, :], axis=1),
+                axis=0,
+            ).shape[0]
             for segment_id in range(profiles.shape[1])
         ],
         dtype=int,
@@ -428,6 +552,8 @@ def _write_scenario_manifest(
         "rng": rng_metadata,
         "realized_factors": realized_factors,
         "rejection_counts": rejection_counts,
+        "input_schema": TUMOR_TXT_SCHEMA,
+        "canonical_input_file": next(iter(input_hashes)),
         "input_file_hashes": input_hashes,
         "truth_file_hashes": truth_hashes,
     }

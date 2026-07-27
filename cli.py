@@ -4,6 +4,8 @@ import argparse
 import math
 from pathlib import Path
 
+import pandas as pd
+
 from .core.bic import LAMBDA_GRID_MODES
 from .core.fusion.defaults import (
     DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
@@ -25,6 +27,10 @@ from .core.fusion.defaults import (
 )
 from .core.model import FitOptions
 from .io.tumor_input import DEFAULT_DOSAGE_PRIOR_PENALTY
+from .io.tumor_txt import (
+    convert_tumor_directory_to_txt,
+    load_tumor_txt,
+)
 from .model_selection.config import (
     DEFAULT_LAMBDA_GRID_MODE,
     DEFAULT_SELECTION_SCORE,
@@ -218,12 +224,20 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument(
+        "--input-file",
+        help="Canonical one-tumor .clipp2.txt or .clipp2.txt.gz input.",
+    )
+    inputs.add_argument(
+        "--input-dir",
+        help="Directory of canonical .clipp2.txt or .clipp2.txt.gz tumor files.",
+    )
+    inputs.add_argument(
         "--cohort-dir",
-        help="Directory whose immediate child directories are CliPP2 tumors.",
+        help="Legacy directory whose immediate children are tumor bundles.",
     )
     inputs.add_argument(
         "--tumor-dir",
-        help="One directory in CliPP2's required tumor input format.",
+        help="One legacy CliPP2 tumor-directory bundle.",
     )
     parser.add_argument(
         "--unsupported-policy",
@@ -284,10 +298,43 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     fit_parser = subparsers.add_parser(
         "fit",
-        help="Fit tumor directories with certified partition-ICL model selection.",
+        help="Fit canonical tumor files with certified partition-ICL model selection.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     _add_fit_args(fit_parser)
+    validate_parser = subparsers.add_parser(
+        "validate",
+        help="Validate one canonical tumor file without fitting.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    validate_parser.add_argument("--input-file", required=True)
+    validate_parser.add_argument(
+        "--unsupported-policy",
+        choices=["error", "mask"],
+        default="mask",
+        help=(
+            "Report compiler-unsupported cells by default; use 'error' to fail "
+            "on the first unsupported local CN mixture."
+        ),
+    )
+    validate_parser.add_argument(
+        "--dosage-prior-penalty",
+        type=float,
+        default=DEFAULT_DOSAGE_PRIOR_PENALTY,
+    )
+    convert_parser = subparsers.add_parser(
+        "convert",
+        help="Convert one legacy tumor directory to a canonical tumor file.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    convert_parser.add_argument("--tumor-dir", required=True)
+    convert_parser.add_argument("--output", required=True)
+    convert_parser.add_argument(
+        "--allele-map",
+        default=None,
+        help="Optional TSV with mutation_id, ref, and alt columns.",
+    )
+    convert_parser.add_argument("--genome-build", default="unknown")
     simulate_parser = subparsers.add_parser(
         "simulate",
         help="Generate one canonical tumor with hidden benchmark truth.",
@@ -308,8 +355,8 @@ def _validate_fit_args(
     prior_penalty = float(args.dosage_prior_penalty)
     if not math.isfinite(prior_penalty) or prior_penalty < 0.0:
         parser.error("--dosage-prior-penalty must be finite and nonnegative")
-    if args.tumor_dir and args.max_tumors is not None:
-        parser.error("--max-tumors is valid only with --cohort-dir")
+    if (args.tumor_dir or args.input_file) and args.max_tumors is not None:
+        parser.error("--max-tumors is valid only with --input-dir or --cohort-dir")
 
     if args.lambda_grid_mode != DEFAULT_LAMBDA_GRID_MODE:
         return
@@ -330,6 +377,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.command == "fit":
         _validate_fit_args(parser, args)
+    elif args.command == "validate":
+        prior_penalty = float(args.dosage_prior_penalty)
+        if not math.isfinite(prior_penalty) or prior_penalty < 0.0:
+            parser.error("--dosage-prior-penalty must be finite and nonnegative")
     return args
 
 
@@ -365,9 +416,10 @@ def _run_fit(args: argparse.Namespace) -> None:
     fit_options = _fit_options_from_args(args)
     lambda_grid = _parse_lambda_grid(args.lambda_grid)
 
-    if args.tumor_dir:
+    single_input = args.input_file or args.tumor_dir
+    if single_input:
         summary = process_tumor(
-            tumor_dir=Path(args.tumor_dir),
+            tumor_dir=Path(single_input),
             outdir=Path(args.outdir),
             simulation_root=Path(args.simulation_root)
             if args.simulation_root
@@ -383,12 +435,13 @@ def _run_fit(args: argparse.Namespace) -> None:
             graph_file=Path(args.graph_file) if args.graph_file else None,
             unsupported_policy=args.unsupported_policy,
             dosage_prior_penalty=args.dosage_prior_penalty,
+            input_format="canonical" if args.input_file else "legacy",
         )
         print(summary)
         return
 
     summary_df = run_cohort(
-        cohort_dir=Path(args.cohort_dir),
+        cohort_dir=Path(args.input_dir or args.cohort_dir),
         outdir=Path(args.outdir),
         simulation_root=Path(args.simulation_root) if args.simulation_root else None,
         lambda_grid=lambda_grid,
@@ -404,6 +457,7 @@ def _run_fit(args: argparse.Namespace) -> None:
         unsupported_policy=args.unsupported_policy,
         dosage_prior_penalty=args.dosage_prior_penalty,
         workers=args.workers,
+        input_files=bool(args.input_dir),
     )
     print(summary_df.head().to_string(index=False))
 
@@ -413,10 +467,79 @@ def _run_simulate(args: argparse.Namespace) -> None:
     print(output_dir)
 
 
+def _run_validate(args: argparse.Namespace) -> None:
+    data = load_tumor_txt(
+        Path(args.input_file),
+        unsupported_policy=args.unsupported_policy,
+        dosage_prior_penalty=args.dosage_prior_penalty,
+    )
+    unsupported_values = [
+        str(value)
+        for value in data.path_unsupported_reason.reshape(-1)
+        if value not in {None, ""}
+    ]
+    unsupported_reason_counts = (
+        pd.Series(unsupported_values, dtype=str).value_counts().sort_index().to_dict()
+        if unsupported_values
+        else {}
+    )
+    cell_count = int(data.num_mutations * data.num_regions)
+    usable_count_cells = (
+        cell_count if data.count_observed is None else int(data.count_observed.sum())
+    )
+    print(
+        {
+            "schema_valid": True,
+            "biologically_valid": True,
+            "compiler_supported": not unsupported_values,
+            "tumor_id": data.tumor_id,
+            "mutations": data.num_mutations,
+            "samples": data.num_regions,
+            "compiler_supported_cells": cell_count - len(unsupported_values),
+            "usable_count_cells": usable_count_cells,
+            "unsupported_reason_counts": unsupported_reason_counts,
+        }
+    )
+
+
+def _run_convert(args: argparse.Namespace) -> None:
+    alleles = None
+    if args.allele_map is not None:
+        allele_frame = pd.read_csv(
+            args.allele_map,
+            sep="\t",
+            dtype=str,
+            keep_default_na=False,
+        )
+        required = {"mutation_id", "ref", "alt"}
+        missing = sorted(required.difference(allele_frame.columns))
+        if missing:
+            raise ValueError(f"Allele map is missing required columns: {missing}.")
+        if bool(allele_frame["mutation_id"].duplicated().any()):
+            raise ValueError("Allele map contains duplicate mutation_id values.")
+        alleles = {
+            str(row.mutation_id): (str(row.ref), str(row.alt))
+            for row in allele_frame.itertuples(index=False)
+        }
+    output = convert_tumor_directory_to_txt(
+        Path(args.tumor_dir),
+        Path(args.output),
+        alleles=alleles,
+        genome_build=args.genome_build,
+    )
+    print(output)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if args.command == "fit":
         _run_fit(args)
+        return
+    if args.command == "validate":
+        _run_validate(args)
+        return
+    if args.command == "convert":
+        _run_convert(args)
         return
     _run_simulate(args)
 

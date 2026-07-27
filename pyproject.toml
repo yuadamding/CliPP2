@@ -40,6 +40,12 @@ include-package-data = false
 [tool.setuptools.dynamic]
 version = { attr = "CliPP2._version.__version__" }
 
+[tool.setuptools.package-data]
+CliPP2 = [
+    "examples/README.md",
+    "examples/*.clipp2.txt",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["../tests/clipp2"]
 

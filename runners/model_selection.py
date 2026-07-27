@@ -42,7 +42,7 @@ from ..core.fusion.types import (
     SolverContext,
     SolverState,
 )
-from ..io.data import TumorData
+from ..io.data import TumorData, tumor_objective_fingerprint
 from ..metrics.evaluation import (
     SimulationEvaluation,
     SimulationTruth,
@@ -155,27 +155,9 @@ def _hash_array(hasher: "hashlib._Hash", array: np.ndarray) -> None:
 
 
 def _input_data_hash(data: TumorData) -> str:
-    hasher = hashlib.blake2b(digest_size=16)
-    for value in data.mutation_ids:
-        hasher.update(str(value).encode("utf-8"))
-        hasher.update(b"\0")
-    hasher.update(b"\1")
-    for value in data.region_ids:
-        hasher.update(str(value).encode("utf-8"))
-        hasher.update(b"\0")
-    for array in (
-        data.alt_counts,
-        data.total_counts,
-        data.purity,
-        data.major_cn,
-        data.minor_cn,
-        data.normal_cn,
-        data.has_cna.astype(np.int8, copy=False),
-        data.scaling,
-        data.phi_upper,
-    ):
-        _hash_array(hasher, np.asarray(array))
-    return hasher.hexdigest()
+    """Return the solver's complete, objective-sensitive input identity."""
+
+    return tumor_objective_fingerprint(data)
 
 
 def _edge_list_hash(edge_u: np.ndarray, edge_v: np.ndarray, edge_w: np.ndarray) -> str:
@@ -483,6 +465,11 @@ def _build_partition_guided_graph_with_resource_policy(
             host_array(guide_curvature),
             lower=host_array(solver_context.lower),
             upper=host_array(solver_context.upper),
+            count_observed=(
+                None
+                if solver_context.problem.count_observed is None
+                else host_array(solver_context.problem.count_observed)
+            ),
             **graph_options,
         )
 
@@ -502,6 +489,7 @@ def _build_partition_guided_graph_with_resource_policy(
             runtime,
             lower=solver_context.lower,
             upper=solver_context.upper,
+            count_observed=solver_context.problem.count_observed,
             **graph_options,
         )
         return tensor_graph_to_pairwise_graph(tensor_graph), tensor_graph, tau

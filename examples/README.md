@@ -1,32 +1,34 @@
 # exampleTumor1
 
-`exampleTumor1/` is a complete 300-SNV, two-region CliPP2 input. It contains
-10 genomic CN intervals. Sixty percent of its SNVs have two local
-allele-specific CN states, 70% lie in a segment with a CNA state, and each
-region has non-diploid dominant calls in 50% of the intervals.
+[`exampleTumor1.clipp2.txt`](exampleTumor1.clipp2.txt) is a complete canonical
+input with 300 SNVs, samples `region1` and `region2`, and 10 sample-specific CN
+intervals. It has 600 mutation-sample cells and 998 data rows because 398 cells
+(66.3%) contain two local CN states. Every cell has at least one non-diploid
+local state.
 
-Validate and inspect it without fitting:
+Validate and inspect it:
 
 ```bash
-python - <<'PY'
-from CliPP2 import load_tumor_directory
+clipp2 validate --input-file examples/exampleTumor1.clipp2.txt
+```
 
-tumor = load_tumor_directory("examples/exampleTumor1")
-print(tumor.tumor_id, tumor.num_mutations, tumor.num_regions)
-PY
+```python
+from CliPP2 import load_tumor_txt
+
+tumor = load_tumor_txt("examples/exampleTumor1.clipp2.txt")
+print(tumor.tumor_id, tumor.num_mutations, tumor.region_ids)
 ```
 
 Run it on CPU:
 
 ```bash
 clipp2 fit \
-  --tumor-dir examples/exampleTumor1 \
+  --input-file examples/exampleTumor1.clipp2.txt \
   --outdir exampleTumor1_results \
   --device cpu
 ```
 
-Generate a fresh 300-SNV, two-region evolutionary benchmark with hidden
-multiplicity truth:
+Generate a fresh evolutionary benchmark with hidden multiplicity truth:
 
 ```bash
 clipp2 simulate \
@@ -37,6 +39,6 @@ clipp2 simulate \
   --seed 1
 ```
 
-The committed example is a compact observed-input fixture. The generated
-benchmark additionally contains only truth-prefixed simulator tables and a
-manifest that separates input hashes from truth hashes.
+The generated benchmark bundle contains the canonical input, truth-prefixed
+tables, sample truth subdirectories, and a manifest that hashes input and truth
+separately.

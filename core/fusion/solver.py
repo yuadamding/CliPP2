@@ -6,7 +6,11 @@ import hashlib
 import numpy as np
 import torch
 
-from ...io.data import TumorData, tumor_data_fingerprint
+from ...io.data import (
+    TumorData,
+    tumor_data_fingerprint,
+    tumor_objective_fingerprint,
+)
 from .defaults import (
     DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
     DEFAULT_CERTIFICATE_MAX_ITER,
@@ -520,7 +524,7 @@ def _normalize_objective_shape(objective_shape: str) -> str:
 
 
 def _graph_fingerprint(graph: PairwiseFusionGraph) -> str:
-    """Return an order-sensitive identity for the original weighted graph."""
+    """Return an order-sensitive identity for the graph's numeric objective."""
 
     digest = hashlib.sha256()
     for name, values in (
@@ -539,22 +543,20 @@ def _graph_fingerprint(graph: PairwiseFusionGraph) -> str:
         for dimension in array.shape:
             digest.update(int(dimension).to_bytes(8, "little", signed=True))
         digest.update(array.tobytes())
-    digest.update(str(graph.name).encode("utf-8"))
-    digest.update(int(graph.degree_bound).to_bytes(8, "little", signed=True))
     return digest.hexdigest()
 
 
 def _objective_spec_fingerprint(
     *,
-    data_fingerprint: str,
+    objective_data_fingerprint: str,
     graph_hash: str,
     major_prior: float,
     eps: float,
 ) -> str:
     digest = hashlib.sha256()
     for value in (
-        "clipp2_observed_objective_v1",
-        data_fingerprint,
+        "clipp2_observed_objective_v2",
+        objective_data_fingerprint,
         graph_hash,
         float(major_prior).hex(),
         float(eps).hex(),
@@ -1037,6 +1039,7 @@ def prepare_torch_problem(
         tensor_graph = build_complete_adaptive_tensor_graph(
             exact_pilot_tensor,
             effective_runtime,
+            count_observed=effective_torch_data.count_observed,
             gamma=float(adaptive_weight_gamma),
             tau=max(float(adaptive_weight_floor), float(eps)),
             baseline=float(adaptive_weight_baseline),
@@ -1093,7 +1096,7 @@ def prepare_torch_problem(
     )
     graph_hash = _graph_fingerprint(effective_graph)
     objective_spec_hash = _objective_spec_fingerprint(
-        data_fingerprint=data_fingerprint,
+        objective_data_fingerprint=tumor_objective_fingerprint(data),
         graph_hash=graph_hash,
         major_prior=float(major_prior),
         eps=float(eps),

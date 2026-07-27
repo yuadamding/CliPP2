@@ -7,6 +7,7 @@ from .core.model import FitResult, Problem, SolverOptions, fit
 from .core.fusion.types import PairwiseFusionGraph
 from .io.data import TumorData
 from .io.tumor_input import load_tumor_directory
+from .io.tumor_txt import load_tumor_txt
 
 __all__ = [
     "FitResult",
@@ -17,4 +18,5 @@ __all__ = [
     "__version__",
     "fit",
     "load_tumor_directory",
+    "load_tumor_txt",
 ]

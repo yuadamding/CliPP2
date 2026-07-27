@@ -250,9 +250,22 @@ def _complete_adaptive_raw_weights(
     *,
     edge_u: torch.Tensor,
     edge_v: torch.Tensor,
+    count_observed: torch.Tensor | None,
     gamma: float,
     tau: float,
 ) -> torch.Tensor:
+    """Compute adaptive weights from jointly observed pilot coordinates.
+
+    With ``k`` jointly observed coordinates out of ``S``, distances are scaled
+    by ``sqrt(S / k)`` so every edge remains on the historical ``S``-sample
+    Euclidean scale.  An edge with no joint observations uses the deterministic
+    unit-box diameter ``sqrt(S)``.  The all-observed branch deliberately keeps
+    the historical vector-norm calculation byte-for-byte.
+    """
+
+    observed = count_observed
+    all_observed = observed is None or bool(torch.all(observed).item())
+    num_regions = int(pilot.shape[1])
     num_edges = int(edge_u.numel())
     raw_weight = torch.empty((num_edges,), dtype=pilot.dtype, device=pilot.device)
     chunk_size = max(
@@ -271,7 +284,24 @@ def _complete_adaptive_raw_weights(
             edge_u=edge_u[start:stop],
             edge_v=edge_v[start:stop],
         )
-        distance = torch.linalg.vector_norm(diff, dim=1)
+        if all_observed:
+            distance = torch.linalg.vector_norm(diff, dim=1)
+        else:
+            assert observed is not None
+            jointly_observed = observed.index_select(
+                0, edge_u[start:stop]
+            ) & observed.index_select(0, edge_v[start:stop])
+            diff.masked_fill_(~jointly_observed, 0.0)
+            shared_count = torch.sum(jointly_observed, dim=1)
+            normalized_squared_distance = torch.sum(torch.square(diff), dim=1) * (
+                float(num_regions) / shared_count.clamp_min(1).to(dtype=pilot.dtype)
+            )
+            distance = torch.sqrt(normalized_squared_distance)
+            distance = torch.where(
+                shared_count > 0,
+                distance,
+                torch.full_like(distance, np.sqrt(float(num_regions))),
+            )
         raw_weight[start:stop] = distance.clamp_min(float(tau)).pow(-float(gamma))
     return raw_weight
 
@@ -368,6 +398,7 @@ def build_complete_adaptive_tensor_graph(
     pilot_phi: torch.Tensor,
     runtime: TorchRuntime,
     *,
+    count_observed: torch.Tensor | None = None,
     gamma: float = 1.0,
     tau: float = 1e-6,
     baseline: float = 1.0,
@@ -388,6 +419,15 @@ def build_complete_adaptive_tensor_graph(
 
     weight_work_dtype = _adaptive_weight_work_dtype(runtime.dtype)
     pilot = pilot_phi.to(dtype=weight_work_dtype, device=runtime.device)
+    observed = (
+        None
+        if count_observed is None
+        else count_observed.to(dtype=torch.bool, device=runtime.device)
+    )
+    if observed is not None and observed.shape != pilot.shape:
+        raise ValueError(
+            "count_observed must have the same mutation-by-region shape as pilot_phi."
+        )
     num_nodes = int(pilot.shape[0])
     _check_complete_tensor_graph_memory(
         num_nodes=num_nodes,
@@ -418,6 +458,7 @@ def build_complete_adaptive_tensor_graph(
         pilot,
         edge_u=edge_index[0],
         edge_v=edge_index[1],
+        count_observed=observed,
         gamma=float(gamma),
         tau=float(tau),
     )
@@ -504,6 +545,7 @@ def build_likelihood_noise_regularized_adaptive_tensor_graph(
     *,
     lower: torch.Tensor,
     upper: torch.Tensor,
+    count_observed: torch.Tensor | None = None,
     gamma: float = 1.0,
     minimum_tau: float = 1e-6,
     baseline: float = 1.0,
@@ -545,6 +587,7 @@ def build_likelihood_noise_regularized_adaptive_tensor_graph(
     graph = build_complete_adaptive_tensor_graph(
         pilot_phi,
         runtime,
+        count_observed=count_observed,
         gamma=float(gamma),
         tau=tau,
         baseline=float(baseline),

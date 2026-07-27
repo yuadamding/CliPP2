@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from ..io.tumor_txt import TUMOR_TXT_SCHEMA, write_tumor_txt
 from .config import (
     CopyNumberEvolutionConfig,
     SimulationGridConfig,
@@ -24,6 +25,7 @@ from .evolution import (
     simulate_genome_segments,
 )
 from .output import (
+    _canonical_observation_table,
     _cn_clone_profile_table,
     _local_cn_state_table,
     _numeric_summary,
@@ -235,9 +237,20 @@ def _write_patient_simulation(
     for region_id in region_labels:
         (data_dir / region_id).mkdir(parents=True, exist_ok=True)
 
-    pd.DataFrame({"cluster_id": cluster_id}).to_csv(
-        data_dir / "truth.txt", sep="\t", index=False
+    mutation_id_width = max(3, len(str(no_mutations)))
+    mutation_ids = np.asarray(
+        [
+            f"m{mutation_index + 1:0{mutation_id_width}d}"
+            for mutation_index in range(no_mutations)
+        ],
+        dtype=object,
     )
+    pd.DataFrame(
+        {
+            "mutation_id": mutation_ids,
+            "cluster_id": cluster_id,
+        }
+    ).to_csv(data_dir / "truth.txt", sep="\t", index=False)
     pd.DataFrame(
         {"clone_id": np.arange(K, dtype=int), "ccf": ccf_patient_clones}
     ).to_csv(data_dir / "truth_clone_patient.txt", sep="\t", index=False)
@@ -255,7 +268,11 @@ def _write_patient_simulation(
         }
     ).to_csv(data_dir / "truth_lineage_patient.txt", sep="\t", index=False)
     pd.DataFrame(
-        {"cluster_id": cluster_id, "ccf": ccf_patient_clones[cluster_id]}
+        {
+            "mutation_id": mutation_ids,
+            "cluster_id": cluster_id,
+            "ccf": ccf_patient_clones[cluster_id],
+        }
     ).to_csv(data_dir / "truth_cp_patient.txt", sep="\t", index=False)
     parent = np.asarray(sim_tree["parent"], dtype=int)
     pd.DataFrame(
@@ -302,12 +319,6 @@ def _write_patient_simulation(
     sample_purities = streams["seed_purity"].beta(alpha_p, beta_p)
     pd.DataFrame(
         {
-            "sample_id": region_labels,
-            "purity": sample_purities,
-        }
-    ).to_csv(data_dir / "purity.txt", sep="\t", index=False)
-    pd.DataFrame(
-        {
             "sample_id": np.arange(n_samples, dtype=int),
             "tau_lineage": tau_vec,
         }
@@ -326,7 +337,6 @@ def _write_patient_simulation(
         data_dir / "truth_cna_events.tsv", sep="\t", index=False
     )
 
-    mutation_ids = np.arange(no_mutations, dtype=int)
     mutation_chromosome = np.asarray(
         [segments[int(segment_id)].chromosome for segment_id in mutation_segment],
         dtype=int,
@@ -358,27 +368,6 @@ def _write_patient_simulation(
         }
     ).to_csv(data_dir / "truth_mutation_clone_dosage.tsv", sep="\t", index=False)
 
-    observed_cn_profiles = _cn_clone_profile_table(unique_cn_profiles, segments)
-    observed_cn_profiles[
-        [
-            "cn_clone_id",
-            "segment_id",
-            "chromosome",
-            "start",
-            "end",
-            "allele_a_cn",
-            "allele_b_cn",
-        ]
-    ].to_csv(data_dir / "cn_clone_profiles.tsv", sep="\t", index=False)
-    pd.DataFrame(
-        {
-            "sample_id": np.repeat(region_labels, unique_cn_profiles.shape[0]),
-            "cn_clone_id": np.tile(
-                np.arange(unique_cn_profiles.shape[0], dtype=int), n_samples
-            ),
-            "tumor_fraction": cn_clone_fraction_samples.T.reshape(-1),
-        }
-    ).to_csv(data_dir / "cn_clone_fractions.tsv", sep="\t", index=False)
     pd.DataFrame(
         {
             "mutation_id": mutation_ids,
@@ -386,16 +375,17 @@ def _write_patient_simulation(
             "chromosome": mutation_chromosome,
             "position": mutation_position,
         }
-    ).to_csv(data_dir / "mutation_segments.tsv", sep="\t", index=False)
+    ).to_csv(data_dir / "truth_mutation_segments.tsv", sep="\t", index=False)
 
     truth_mutation_sample_tables: list[pd.DataFrame] = []
+    canonical_observation_tables: list[pd.DataFrame] = []
     depth_arrays: list[np.ndarray] = []
     for j in range(n_samples):
         region_id = region_labels[j]
         (
             local_state_table,
-            dominant_a,
-            dominant_b,
+            _dominant_a,
+            _dominant_b,
             _dominant_fraction,
             _dominant_state_id,
         ) = _local_cn_state_table(
@@ -409,17 +399,6 @@ def _write_patient_simulation(
             sep="\t",
             index=False,
         )
-        major_cn_segments = np.maximum(dominant_a, dominant_b)
-        minor_cn_segments = np.minimum(dominant_a, dominant_b)
-        pd.DataFrame(
-            {
-                "chromosome_index": [segment.chromosome for segment in segments],
-                "start_position": [segment.start for segment in segments],
-                "end_position": [segment.end for segment in segments],
-                "major_cn": major_cn_segments,
-                "minor_cn": minor_cn_segments,
-            }
-        ).to_csv(data_dir / region_id / "cna.txt", sep="\t", index=False)
 
         purity_j = sample_purities[j]
         truth = compute_mutation_sample_truth(
@@ -447,20 +426,27 @@ def _write_patient_simulation(
         ref_j = n_j - r_j
         depth_arrays.append(n_j)
 
+        canonical_observation_tables.append(
+            _canonical_observation_table(
+                mutation_ids=mutation_ids,
+                mutation_segment=mutation_segment,
+                mutation_position=mutation_position,
+                alt_count=r_j,
+                ref_count=ref_j,
+                purity=float(purity_j),
+                sample_id=region_id,
+                local_state_table=local_state_table,
+                segments=segments,
+            )
+        )
+
         pd.DataFrame(
             {
-                "chromosome_index": mutation_chromosome,
-                "position": mutation_position,
-                "alt_count": r_j,
-                "ref_count": ref_j,
+                "mutation_id": mutation_ids,
+                "cluster_id": cluster_id,
+                "ccf": mutation_ccf_sample_j,
+                "sample_id": j,
             }
-        ).to_csv(data_dir / region_id / "snv.txt", sep="\t", index=False)
-
-        with open(data_dir / region_id / "purity.txt", "w", encoding="utf-8") as handle:
-            handle.write(f"{purity_j}\n")
-
-        pd.DataFrame(
-            {"cluster_id": cluster_id, "ccf": mutation_ccf_sample_j, "sample_id": j}
         ).to_csv(data_dir / region_id / "truth_cp.txt", sep="\t", index=False)
         truth_mutation_sample_tables.append(
             pd.DataFrame(
@@ -484,6 +470,47 @@ def _write_patient_simulation(
         data_dir / "truth_mutation_sample.tsv",
         sep="\t",
         index=False,
+    )
+    canonical_observations = pd.concat(
+        canonical_observation_tables,
+        ignore_index=True,
+    ).sort_values(
+        ["mutation_id", "sample_id", "cn_state_id"],
+        kind="stable",
+        ignore_index=True,
+    )
+    canonical_state_counts = canonical_observations.groupby(
+        ["mutation_id", "sample_id"],
+        sort=False,
+    ).size()
+    maximum_local_states = copy_number_config.max_local_cn_states_per_mutation
+    if maximum_local_states is not None and bool(
+        (canonical_state_counts > int(maximum_local_states)).any()
+    ):
+        raise AssertionError(
+            "Canonical output exceeded max_local_cn_states_per_mutation."
+        )
+    minimum_two_state_fraction = copy_number_config.min_two_state_snv_fraction
+    canonical_two_state_fraction = float(np.mean(canonical_state_counts == 2))
+    if minimum_two_state_fraction is not None and canonical_two_state_fraction < float(
+        minimum_two_state_fraction
+    ):
+        raise RuntimeError(
+            "Canonical unphased output did not satisfy "
+            "min_two_state_snv_fraction: "
+            f"required={minimum_two_state_fraction}, "
+            f"observed={canonical_two_state_fraction:.6f}."
+        )
+    write_tumor_txt(
+        data_dir / f"{directory_name}.clipp2.txt",
+        canonical_observations,
+        {
+            "schema": TUMOR_TXT_SCHEMA,
+            "tumor_id": directory_name,
+            "genome_build": "synthetic",
+            "coordinate_system": "1-based-inclusive",
+            "missing_value": ".",
+        },
     )
     intended_factors = {
         "mean_depth": int(N_mean),

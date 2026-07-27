@@ -10,97 +10,90 @@ objective-faithful pairwise fusion.
 pip install .
 ```
 
-## Sole public input
+## Input
 
-CliPP2 accepts one tool-neutral tumor-directory format. All tabular files are
-tab-delimited with a header, and genomic coordinates are 1-based and
-inclusive. This is input schema version `2`; additional columns are ignored:
+The public input is one UTF-8, tab-delimited file per tumor:
 
 ```text
-tumor_name/
-├── mutation_segments.tsv
-├── cn_clone_profiles.tsv
-├── cn_clone_fractions.tsv
-├── purity.txt
-├── region1/
-│   ├── snv.txt
-│   ├── cna.txt
-│   └── purity.txt
-├── region2/
-│   ├── snv.txt
-│   ├── cna.txt
-│   └── purity.txt
-└── ...
+exampleTumor1.clipp2.txt
 ```
 
-The required columns are:
+It uses schema `clipp2.tumor.long.v1`, one ordinary header, and one row per
+mutation × sample × local copy-number state:
 
-| File | Required columns |
-| --- | --- |
-| `mutation_segments.tsv` | `mutation_id`, `segment_id`, `chromosome`, `position` |
-| `cn_clone_profiles.tsv` | `cn_clone_id`, `segment_id`, `chromosome`, `start`, `end`, `allele_a_cn`, `allele_b_cn` |
-| `cn_clone_fractions.tsv` | `sample_id`, `cn_clone_id`, `tumor_fraction` |
-| root `purity.txt` | `sample_id`, `purity` |
-| `regionN/snv.txt` | `chromosome_index`, `position`, `alt_count`, `ref_count` |
-| `regionN/cna.txt` | `chromosome_index`, `start_position`, `end_position`, `major_cn`, `minor_cn` |
+```text
+##schema=clipp2.tumor.long.v1
+##tumor_id=exampleTumor1
+##genome_build=GRCh38
+##coordinate_system=1-based-inclusive
+##missing_value=.
+mutation_id	sample_id	chromosome	position	ref	alt	alt_count	ref_count	count_observed	purity	normal_cn	segment_id	segment_start	segment_end	cn_state_id	cn_state_fraction	allele_a_cn	allele_b_cn	allele_mode
+```
 
-Each `regionN/purity.txt` is a single numeric value without a header. Root
-`sample_id` values must be the one-based labels `region1` through `regionS`,
-matching the directory names exactly.
+The 19 columns above are required. Extra columns are allowed as reporting
+metadata and never alter the objective. IDs are strings, including leading
+zeros; sample names are unrestricted identifiers. Rows may be reordered, and
+`.clipp2.txt.gz` is supported.
 
-The loader rejects an incomplete or inconsistent bundle:
+The main rules are:
 
-- Mutation IDs are unique and every mutation lies within its declared segment.
-- Clone profiles form the complete clone-by-segment product, segment
-  coordinates agree across clones, and allele copy numbers are nonnegative
-  integers.
-- Clone fractions form the complete region-by-clone product, are finite and
-  nonnegative, and sum to one per region within `1e-8`.
-- Root purity has exactly one value in `(0, 1]` per region; the region-local
-  scalar must match it.
-- Every region SNV table has exactly one unique coordinate row for every
-  mutation. CNA intervals are nonoverlapping and cover every mutation. Read
-  counts are nonnegative integers; copy numbers are finite, nonnegative, and
-  satisfy `major_cn >= minor_cn`.
-- Every positive-fraction region/segment mixture used by a mutation has at
-  most two distinct allele-specific copy-number states and at least one
-  positive persistent-homolog dosage path.
+- `ref` and `alt` are distinct uppercase SNV alleles in `A/C/G/T`.
+- Observed counts are nonnegative integers with `count_observed=1`. Missing or
+  quality-masked counts use `count_observed=0` and may use `.` for both counts.
+- Purity is constant per sample and lies in `(0, 1]`. `normal_cn` is explicit
+  and may differ from 2.
+- Segment IDs are sample-specific; each 1-based mutation position must fall
+  within its inclusive segment bounds.
+- Local state fractions are positive, conditional on tumor cells, and sum to
+  one per sample-segment.
+- `allele_mode=phased` means A/B are persistent homolog labels.
+  `allele_mode=unphased` means ordinary major/minor calls and requires
+  `allele_a_cn >= allele_b_cn`.
+- The current single-switch compiler supports one or two distinct positive
+  local CN states. Larger mixtures are rejected or explicitly count-masked
+  with `--unsupported-policy mask`.
 
-Hidden truth, mutation histories, true cluster labels, and true dosages are
-never consumed during inference.
+Repeated mutation, observation, segment, and state fields are checked for
+consistency before any inference runs. Hidden truth, mutation histories,
+clusters, and dosages are never valid inference inputs.
 
 ## Fit
 
-Fit one tumor directory:
+Validate a tumor:
 
 ```bash
-clipp2 fit --tumor-dir inputs/tumor0 --outdir clipp2_results
+clipp2 validate --input-file inputs/exampleTumor1.clipp2.txt
 ```
 
-Fit immediate child tumor directories in a cohort:
+Fit one tumor:
 
 ```bash
 clipp2 fit \
-  --cohort-dir inputs \
+  --input-file inputs/exampleTumor1.clipp2.txt \
+  --outdir clipp2_results
+```
+
+Fit every `.clipp2.txt` or `.clipp2.txt.gz` file in a cohort directory:
+
+```bash
+clipp2 fit \
+  --input-dir inputs \
   --max-tumors 100 \
   --workers 4 \
   --outdir clipp2_results
 ```
 
-Exactly one of `--tumor-dir` and `--cohort-dir` is required, and
-`--max-tumors` is cohort-only. Unsupported three-or-more-state cells fail by
-default; `--unsupported-policy mask` explicitly count-masks them and records a
-reason. `--dosage-prior-penalty` controls the fixed endpoint excess-dosage
-prior penalty and defaults to `3`.
+`--dosage-prior-penalty` controls the fixed endpoint excess-dosage prior and
+defaults to `3`.
 
 The module entry point is equivalent:
 
 ```bash
-python -m CliPP2 fit --tumor-dir inputs/tumor0
+python -m CliPP2 fit --input-file inputs/exampleTumor1.clipp2.txt
 ```
 
 For a complete inspectable input and CPU command, see
-[`examples/exampleTumor1`](examples/exampleTumor1) and
+[`examples/exampleTumor1.clipp2.txt`](examples/exampleTumor1.clipp2.txt) and
 [`examples/README.md`](examples/README.md).
 
 Production defaults use CUDA float64 tensors, dense device-only fusion, online
@@ -115,13 +108,15 @@ cost even when edge tensors are streamed in bounded chunks. Run
 ## Preprocessing boundary
 
 Battenberg and DPClust belong upstream of CliPP2. Native outputs from those
-packages are not accepted. Preprocessing must convert observed data into the
-single directory contract above; CliPP2 exposes no Battenberg- or
-DPClust-specific inference path.
+packages are not accepted directly. Preprocessing joins observed
+mutation-sample counts to sample-segment CN states and writes the package-owned
+one-file contract above. CliPP2 contains no caller-specific inference branch
+and does not require global CN-clone reconstruction when segment-local state
+fractions are available.
 
-The loader compiles the directory into `PathLikelihoodSpec`, the internal
-boundary between preprocessing and inference. It contains fixed normalized
-path priors and numeric `(mutation, region, path)` arrays for:
+The loader compiles the file into `PathLikelihoodSpec`, the internal boundary
+between preprocessing and inference. It contains fixed normalized path priors
+and numeric `(mutation, sample, path)` arrays for:
 
 ```text
 M(phi) = first_copy * min(phi, switch_fraction)
@@ -130,6 +125,20 @@ M(phi) = first_copy * min(phi, switch_fraction)
 
 Fitting, refitting, scoring, and certification consume this numeric contract
 without branching on an upstream package name.
+
+The former clone-resolved tumor directory remains readable only for migration:
+
+```bash
+clipp2 fit --tumor-dir legacy_bundle --outdir clipp2_results
+clipp2 convert \
+  --tumor-dir legacy_bundle \
+  --allele-map mutation_alleles.tsv \
+  --output tumor.clipp2.txt
+```
+
+The allele map has `mutation_id`, `ref`, and `alt` columns. It is required when
+the legacy bundle does not contain alleles; CliPP2 does not invent biological
+REF/ALT labels.
 
 ## Simulation benchmarking
 
@@ -161,14 +170,14 @@ orchestration, and CLI parsing live in separate modules with one-way
 dependencies. `python -m CliPP2.simulation --help` exposes the standalone
 generator command.
 
-This creates `simulations/exampleTumor1`. Its ten observed input files have
-exactly the columns listed above. Simulator-only tables are prefixed with
-`truth`, and `scenario_manifest.json` records separate hashes for observed
-input and hidden truth. The generated directory is immediately loadable:
+This creates a benchmark bundle at `simulations/exampleTumor1`. Its sole
+observed input is `exampleTumor1.clipp2.txt`; simulator-only tables are
+prefixed with `truth`, and `scenario_manifest.json` records separate hashes
+for the canonical input and hidden truth. Fit the generated input with:
 
 ```bash
 clipp2 fit \
-  --tumor-dir simulations/exampleTumor1 \
+  --input-file simulations/exampleTumor1/exampleTumor1.clipp2.txt \
   --outdir exampleTumor1_results
 ```
 

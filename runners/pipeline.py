@@ -20,6 +20,7 @@ from ..io.tumor_input import (
     is_tumor_directory,
     load_tumor_directory,
 )
+from ..io.tumor_txt import _read_tumor_txt_metadata, load_tumor_txt
 from ..metrics.evaluation import evaluate_fit_against_simulation
 from ..model_selection.config import (
     DEFAULT_LAMBDA_GRID_MODE,
@@ -32,12 +33,14 @@ from .outputs import write_fit_outputs
 def _exact_resource_limit_summary(
     tumor_dir: str | Path,
     exc: ExactSolverResourceLimit,
+    *,
+    tumor_id: str | None = None,
 ) -> dict[str, float | int | str | bool]:
     """Record one fail-closed tumor without terminating a directory batch."""
 
     path = Path(tumor_dir)
     return {
-        "tumor_id": path.name,
+        "tumor_id": path.name if tumor_id is None else str(tumor_id),
         "tumor_directory": str(path),
         "selection_eligible": False,
         "raw_kkt_eligible": False,
@@ -58,6 +61,13 @@ def _normalize_resource_limit(exc: BaseException) -> ExactSolverResourceLimit:
     )
 
 
+def _is_tumor_txt_path(path: Path) -> bool:
+    name = path.name.lower()
+    return path.is_file() and (
+        name.endswith(".clipp2.txt") or name.endswith(".clipp2.txt.gz")
+    )
+
+
 def process_tumor_bundle(
     tumor_dir: str | Path,
     outdir: str | Path,
@@ -75,13 +85,31 @@ def process_tumor_bundle(
     unsupported_policy: str = "error",
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     evaluate_all_candidates: bool | None = None,
+    input_format: str = "auto",
 ) -> tuple[dict[str, float | int | str | bool], pd.DataFrame]:
-    """Fit one tumor directory and return its summary and model-search table."""
+    """Fit one canonical tumor file or legacy directory."""
 
     start_time = perf_counter()
     tumor_dir = Path(tumor_dir)
     outdir = Path(outdir)
-    data = load_tumor_directory(
+    normalized_input_format = str(input_format).strip().lower()
+    if normalized_input_format not in {"auto", "canonical", "legacy"}:
+        raise ValueError("input_format must be 'auto', 'canonical', or 'legacy'.")
+    if normalized_input_format == "canonical":
+        if not tumor_dir.is_file():
+            raise FileNotFoundError(
+                f"Canonical tumor input must be a file: {tumor_dir}"
+            )
+        loader = load_tumor_txt
+    elif normalized_input_format == "legacy":
+        if not tumor_dir.is_dir():
+            raise FileNotFoundError(
+                f"Legacy tumor input must be a directory: {tumor_dir}"
+            )
+        loader = load_tumor_directory
+    else:
+        loader = load_tumor_txt if tumor_dir.is_file() else load_tumor_directory
+    data = loader(
         tumor_dir,
         unsupported_policy=unsupported_policy,
         dosage_prior_penalty=dosage_prior_penalty,
@@ -938,8 +966,9 @@ def process_tumor(
     unsupported_policy: str = "error",
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     evaluate_all_candidates: bool | None = None,
+    input_format: str = "auto",
 ) -> dict[str, float | int | str | bool]:
-    """Fit one tumor directory and return its run summary."""
+    """Fit one canonical tumor file or legacy directory."""
 
     summary, _ = process_tumor_bundle(
         tumor_dir=tumor_dir,
@@ -958,6 +987,7 @@ def process_tumor(
         evaluate_all_candidates=evaluate_all_candidates,
         unsupported_policy=unsupported_policy,
         dosage_prior_penalty=dosage_prior_penalty,
+        input_format=input_format,
     )
     return summary
 
@@ -981,19 +1011,47 @@ def run_cohort(
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     workers: int = 1,
     evaluate_all_candidates: bool | None = None,
+    input_files: bool = False,
 ) -> pd.DataFrame:
-    """Fit each valid immediate child tumor directory in a cohort."""
+    """Fit canonical tumor files or legacy directories in one input folder."""
 
     cohort_dir = Path(cohort_dir)
-    tumor_dirs = sorted(
-        (path for path in cohort_dir.iterdir() if is_tumor_directory(path)),
-        key=lambda path: path.name,
-    )
+    if input_files:
+        tumor_dirs = sorted(
+            (path for path in cohort_dir.iterdir() if _is_tumor_txt_path(path)),
+            key=lambda path: path.name,
+        )
+        input_description = "canonical CliPP2 tumor files"
+    else:
+        tumor_dirs = sorted(
+            (path for path in cohort_dir.iterdir() if is_tumor_directory(path)),
+            key=lambda path: path.name,
+        )
+        input_description = "legacy CliPP2 tumor directories"
     if max_tumors is not None:
         tumor_dirs = tumor_dirs[: max(0, int(max_tumors))]
 
     if not tumor_dirs:
-        raise RuntimeError(f"No CliPP2 tumor input directories found in {cohort_dir}.")
+        raise RuntimeError(f"No {input_description} found in {cohort_dir}.")
+
+    tumor_id_by_path = {
+        path: (_read_tumor_txt_metadata(path)["tumor_id"] if input_files else path.name)
+        for path in tumor_dirs
+    }
+    if input_files:
+        paths_by_tumor_id: dict[str, list[Path]] = {}
+        for path, tumor_id in tumor_id_by_path.items():
+            paths_by_tumor_id.setdefault(tumor_id, []).append(path)
+        duplicates = {
+            tumor_id: [path.name for path in paths]
+            for tumor_id, paths in paths_by_tumor_id.items()
+            if len(paths) > 1
+        }
+        if duplicates:
+            raise RuntimeError(
+                "Canonical cohort tumor_id values must be unique to prevent "
+                f"output collisions: {duplicates}."
+            )
 
     summaries = []
     worker_count = max(int(workers), 1)
@@ -1017,6 +1075,7 @@ def run_cohort(
                     evaluate_all_candidates=evaluate_all_candidates,
                     unsupported_policy=unsupported_policy,
                     dosage_prior_penalty=dosage_prior_penalty,
+                    input_format="canonical" if input_files else "legacy",
                 )
             except (
                 ExactSolverResourceLimit,
@@ -1024,7 +1083,9 @@ def run_cohort(
                 torch.OutOfMemoryError,
             ) as exc:
                 summary = _exact_resource_limit_summary(
-                    tumor_dir, _normalize_resource_limit(exc)
+                    tumor_dir,
+                    _normalize_resource_limit(exc),
+                    tumor_id=tumor_id_by_path[tumor_dir],
                 )
             summaries.append(summary)
     else:
@@ -1071,6 +1132,7 @@ def run_cohort(
                     evaluate_all_candidates=evaluate_all_candidates,
                     unsupported_policy=unsupported_policy,
                     dosage_prior_penalty=dosage_prior_penalty,
+                    input_format="canonical" if input_files else "legacy",
                 ): tumor_dir
                 for tumor_dir in tumor_dirs
             }
@@ -1085,7 +1147,9 @@ def run_cohort(
                     torch.OutOfMemoryError,
                 ) as exc:
                     ordered[tumor_dir.name] = _exact_resource_limit_summary(
-                        tumor_dir, _normalize_resource_limit(exc)
+                        tumor_dir,
+                        _normalize_resource_limit(exc),
+                        tumor_id=tumor_id_by_path[tumor_dir],
                     )
                 except Exception as exc:
                     raise RuntimeError(f"Worker failed on {tumor_dir}: {exc}") from exc

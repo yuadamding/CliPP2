@@ -17,6 +17,60 @@ def _complete_graph_weight(num_mutations: int) -> float:
     return 1.0 / float(max(int(num_mutations) - 1, 1))
 
 
+def _complete_adaptive_pairwise_distances(
+    pilot_phi: np.ndarray,
+    *,
+    edge_u: np.ndarray,
+    edge_v: np.ndarray,
+    count_observed: np.ndarray | None,
+) -> np.ndarray:
+    """Return observation-aware distances on the original sample scale.
+
+    Each edge uses only samples observed for both endpoint mutations.  When
+    only ``k`` of ``S`` samples are shared, its Euclidean norm is multiplied by
+    ``sqrt(S / k)``.  This RMS normalization makes edges with different shared
+    dimensions comparable and is exactly the historical Euclidean distance
+    when every cell is observed.
+
+    If an edge has no jointly observed sample, its distance is the diameter
+    ``sqrt(S)`` of the feasible CCF box ``[0, 1]^S``.  This deterministic
+    fallback treats absence of comparable data as maximally separated instead
+    of allowing arbitrary values in masked cells to create spurious affinity.
+    """
+
+    if count_observed is None:
+        return np.linalg.norm(pilot_phi[edge_u] - pilot_phi[edge_v], axis=1)
+
+    observed = np.asarray(count_observed, dtype=bool)
+    if observed.shape != pilot_phi.shape:
+        raise ValueError(
+            "count_observed must have the same mutation-by-region shape as pilot_phi."
+        )
+    if bool(np.all(observed)):
+        return np.linalg.norm(pilot_phi[edge_u] - pilot_phi[edge_v], axis=1)
+
+    num_regions = int(pilot_phi.shape[1])
+    jointly_observed = observed[edge_u] & observed[edge_v]
+    shared_count = np.sum(jointly_observed, axis=1, dtype=np.int64)
+    difference = np.where(
+        jointly_observed,
+        pilot_phi[edge_u] - pilot_phi[edge_v],
+        0.0,
+    )
+    squared_distance = np.sum(np.square(difference), axis=1, dtype=np.float64)
+    distance = np.full(
+        edge_u.shape,
+        np.sqrt(float(num_regions)),
+        dtype=np.float64,
+    )
+    has_shared_sample = shared_count > 0
+    distance[has_shared_sample] = np.sqrt(
+        squared_distance[has_shared_sample]
+        * (float(num_regions) / shared_count[has_shared_sample])
+    )
+    return distance
+
+
 def build_complete_uniform_graph(num_mutations: int) -> PairwiseFusionGraph:
     edge_u, edge_v = _complete_graph_edges(num_mutations)
     edge_w = np.full(
@@ -34,6 +88,7 @@ def build_complete_uniform_graph(num_mutations: int) -> PairwiseFusionGraph:
 def build_complete_adaptive_graph(
     pilot_phi: np.ndarray,
     *,
+    count_observed: np.ndarray | None = None,
     gamma: float = 1.0,
     tau: float = 1e-6,
     baseline: float = 1.0,
@@ -63,7 +118,12 @@ def build_complete_adaptive_graph(
             degree_bound=max(num_mutations - 1, 1),
         )
 
-    pairwise_norm = np.linalg.norm(pilot_phi[edge_u] - pilot_phi[edge_v], axis=1)
+    pairwise_norm = _complete_adaptive_pairwise_distances(
+        pilot_phi,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        count_observed=count_observed,
+    )
     raw_edge_w = 1.0 / np.power(np.maximum(pairwise_norm, float(tau)), float(gamma))
     mean_raw_weight = float(np.mean(raw_edge_w)) if raw_edge_w.size else 1.0
     if not np.isfinite(mean_raw_weight) or mean_raw_weight <= 0.0:
@@ -127,6 +187,7 @@ def build_likelihood_noise_regularized_adaptive_graph(
     *,
     lower: np.ndarray,
     upper: np.ndarray,
+    count_observed: np.ndarray | None = None,
     gamma: float = 1.0,
     minimum_tau: float = 1e-6,
     baseline: float = 1.0,
@@ -155,6 +216,7 @@ def build_likelihood_noise_regularized_adaptive_graph(
     )
     graph = build_complete_adaptive_graph(
         pilot_phi,
+        count_observed=count_observed,
         gamma=float(gamma),
         tau=float(tau),
         baseline=float(baseline),
@@ -177,6 +239,7 @@ def resolve_pairwise_fusion_graph(
     *,
     graph: PairwiseFusionGraph | None,
     pilot_phi: np.ndarray | None = None,
+    count_observed: np.ndarray | None = None,
     gamma: float = 1.0,
     tau: float = 1e-6,
     baseline: float = 1.0,
@@ -186,6 +249,7 @@ def resolve_pairwise_fusion_graph(
     if pilot_phi is not None:
         return build_complete_adaptive_graph(
             pilot_phi,
+            count_observed=count_observed,
             gamma=gamma,
             tau=tau,
             baseline=baseline,

@@ -367,6 +367,59 @@ def tumor_data_fingerprint(data: TumorData) -> str:
     return digest.hexdigest()
 
 
+def tumor_objective_fingerprint(data: TumorData) -> str:
+    """Return a representation-neutral identity for the numeric likelihood.
+
+    Initialization, reporting fields, display identifiers, and compiler
+    version labels are deliberately excluded. The solver combines this digest
+    with its graph arrays, epsilon, and effective prior to identify the full
+    optimization objective.
+    """
+
+    digest = hashlib.sha256()
+
+    def update_array(name: str, values: np.ndarray) -> None:
+        encoded_name = name.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(8, "little"))
+        digest.update(encoded_name)
+        array = np.ascontiguousarray(np.asarray(values))
+        encoded_dtype = str(array.dtype).encode("utf-8")
+        digest.update(len(encoded_dtype).to_bytes(8, "little"))
+        digest.update(encoded_dtype)
+        digest.update(len(array.shape).to_bytes(8, "little"))
+        for dimension in array.shape:
+            digest.update(int(dimension).to_bytes(8, "little", signed=True))
+        digest.update(array.tobytes())
+
+    for name in ("alt_counts", "total_counts", "scaling", "phi_upper"):
+        update_array(name, getattr(data, name))
+    count_observed = getattr(data, "count_observed", None)
+    update_array(
+        "count_observed",
+        np.ones_like(np.asarray(data.alt_counts), dtype=bool)
+        if count_observed is None
+        else np.asarray(count_observed, dtype=bool),
+    )
+
+    path_likelihood = getattr(data, "path_likelihood", None)
+    if path_likelihood is None:
+        for name in ("major_cn", "minor_cn", "has_cna"):
+            update_array(name, getattr(data, name))
+    else:
+        path_likelihood.validate_observation_shape(
+            (int(data.num_mutations), int(data.num_regions))
+        )
+        for name in (
+            "first_copy",
+            "second_copy",
+            "switch_fraction",
+            "log_prior",
+            "valid",
+        ):
+            update_array(f"path_likelihood.{name}", getattr(path_likelihood, name))
+    return digest.hexdigest()
+
+
 def legacy_path_likelihood_spec(
     data: TumorData,
     *,
@@ -558,7 +611,17 @@ def _load_observation_tsv(
     validation_mode: str = "strict",
 ) -> TumorData:
     file_path = Path(file_path)
-    df = pd.read_csv(file_path, sep="\t").copy()
+    df = pd.read_csv(
+        file_path,
+        sep="\t",
+        dtype={
+            "mutation_id": str,
+            "sample_id": str,
+            "region_id": str,
+        },
+        keep_default_na=False,
+        na_values=[""],
+    ).copy()
 
     required = {
         "mutation_id",
@@ -775,4 +838,5 @@ __all__ = [
     "compute_phi_init_from_counts",
     "legacy_path_likelihood_spec",
     "tumor_data_fingerprint",
+    "tumor_objective_fingerprint",
 ]
