@@ -30,12 +30,12 @@ def _complete_adaptive_pairwise_distances(
     only ``k`` of ``S`` samples are shared, its Euclidean norm is multiplied by
     ``sqrt(S / k)``.  This RMS normalization makes edges with different shared
     dimensions comparable and is exactly the historical Euclidean distance
-    when every cell is observed.
+    when every unit is observed.
 
     If an edge has no jointly observed sample, its distance is the diameter
     ``sqrt(S)`` of the feasible CCF box ``[0, 1]^S``.  This deterministic
     fallback treats absence of comparable data as maximally separated instead
-    of allowing arbitrary values in masked cells to create spurious affinity.
+    of allowing arbitrary values in masked units to create spurious affinity.
     """
 
     if count_observed is None:

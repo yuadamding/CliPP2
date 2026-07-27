@@ -135,9 +135,9 @@ def _ordered_occupancy_summary_arrays(
         for region_index in range(shape[1]):
             if not supported[mutation_index, region_index]:
                 continue
-            cell_single = 0.0
-            cell_multi = 0.0
-            cell_boundary = 0.0
+            unit_single = 0.0
+            unit_multi = 0.0
+            unit_boundary = 0.0
             valid_paths = np.flatnonzero(
                 np.asarray(spec.valid[mutation_index, region_index], dtype=bool)
             )
@@ -189,12 +189,12 @@ def _ordered_occupancy_summary_arrays(
                     path_boundary
                 )
                 path_posterior = posterior[mutation_index, region_index, path_index]
-                cell_single += path_posterior * path_single
-                cell_multi += path_posterior * path_multi
-                cell_boundary += path_posterior * path_boundary
-            single[mutation_index, region_index] = cell_single
-            multi[mutation_index, region_index] = cell_multi
-            boundary[mutation_index, region_index] = cell_boundary
+                unit_single += path_posterior * path_single
+                unit_multi += path_posterior * path_multi
+                unit_boundary += path_posterior * path_boundary
+            single[mutation_index, region_index] = unit_single
+            multi[mutation_index, region_index] = unit_multi
+            boundary[mutation_index, region_index] = unit_boundary
 
     return {
         "single_probability": single,
@@ -649,14 +649,14 @@ def evaluation_to_frame(evaluation: SimulationEvaluation) -> pd.DataFrame:
                 "summary_amplified_mutant_copy_f1": (
                     evaluation.summary_amplified_mutant_copy_f1
                 ),
-                "n_effective_multiplicity_cells": (
-                    evaluation.n_effective_multiplicity_cells
+                "n_effective_multiplicity_units": (
+                    evaluation.n_effective_multiplicity_units
                 ),
-                "n_amplified_mutant_copy_cells": (
-                    evaluation.n_amplified_mutant_copy_cells
+                "n_amplified_mutant_copy_units": (
+                    evaluation.n_amplified_mutant_copy_units
                 ),
-                "n_true_amplified_mutant_copy_cells": (
-                    evaluation.n_true_amplified_mutant_copy_cells
+                "n_true_amplified_mutant_copy_units": (
+                    evaluation.n_true_amplified_mutant_copy_units
                 ),
                 "estimated_clonal_fraction": evaluation.estimated_clonal_fraction,
                 "true_clonal_fraction": evaluation.true_clonal_fraction,

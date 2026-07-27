@@ -209,10 +209,10 @@ class PathLikelihoodSpec:
 
     @property
     def has_fixed_linear_emission(self) -> bool:
-        """Whether every valid candidate in a cell has one shared linear slope.
+        """Whether every valid candidate in a unit has one shared linear slope.
 
         Such a categorical specification is only redundant bookkeeping: after
-        marginalizing its normalized prior, each cell has the same fixed-copy
+        marginalizing its normalized prior, each unit has the same fixed-copy
         likelihood as the existing scalar CliPP2 model.
         """
 

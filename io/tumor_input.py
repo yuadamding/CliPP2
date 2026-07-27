@@ -756,7 +756,7 @@ def _attach_path_likelihood(
             "TumorData regions must exactly match tumor input region IDs."
         )
 
-    compiled_cells: list[list[CompiledPathSet]] = []
+    compiled_units: list[list[CompiledPathSet]] = []
     unsupported = np.full(
         (data.num_mutations, data.num_regions),
         None,
@@ -807,10 +807,10 @@ def _attach_path_likelihood(
                     biological_duplicate_count=(1,),
                 )
             compiled_row.append(compiled)
-        compiled_cells.append(compiled_row)
+        compiled_units.append(compiled_row)
 
     likelihood, _biological_duplicates = build_path_likelihood(
-        compiled_cells,
+        compiled_units,
         model_id=MODEL_ID,
         model_version=MODEL_VERSION,
         candidate_generator_version=CANDIDATE_GENERATOR_VERSION,

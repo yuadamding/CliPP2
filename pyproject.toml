@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "clipp2"
 dynamic = ["version"]
-description = "Objective-faithful multi-region cellular prevalence clustering."
+description = "Objective-faithful multi-region mutation prevalence clustering."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

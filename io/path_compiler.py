@@ -178,24 +178,24 @@ def compile_single_switch_paths(
 
 
 def build_path_likelihood(
-    compiled_cells: Sequence[Sequence[CompiledPathSet]],
+    compiled_units: Sequence[Sequence[CompiledPathSet]],
     *,
     model_id: str,
     model_version: str,
     candidate_generator_version: str = PATH_CANDIDATE_GENERATOR_VERSION,
     prior_mode: str,
 ) -> tuple[PathLikelihoodSpec, np.ndarray]:
-    """Pad compiled cell paths into one immutable likelihood specification."""
+    """Pad compiled unit paths into one immutable likelihood specification."""
 
-    num_mutations = len(compiled_cells)
+    num_mutations = len(compiled_units)
     if num_mutations == 0:
-        raise ValueError("compiled_cells must contain at least one mutation.")
-    num_samples = len(compiled_cells[0])
-    if num_samples == 0 or any(len(row) != num_samples for row in compiled_cells):
-        raise ValueError("compiled_cells must be a nonempty rectangular matrix.")
-    max_paths = max(len(compiled.paths) for row in compiled_cells for compiled in row)
+        raise ValueError("compiled_units must contain at least one mutation.")
+    num_samples = len(compiled_units[0])
+    if num_samples == 0 or any(len(row) != num_samples for row in compiled_units):
+        raise ValueError("compiled_units must be a nonempty rectangular matrix.")
+    max_paths = max(len(compiled.paths) for row in compiled_units for compiled in row)
     if max_paths == 0:
-        raise ValueError("Every compiled cell must contain at least one path.")
+        raise ValueError("Every compiled unit must contain at least one path.")
     shape = (num_mutations, num_samples, max_paths)
     first_copy = np.zeros(shape, dtype=np.float64)
     second_copy = np.zeros(shape, dtype=np.float64)
@@ -203,10 +203,10 @@ def build_path_likelihood(
     log_prior = np.full(shape, -np.inf, dtype=np.float64)
     valid = np.zeros(shape, dtype=bool)
     biological_duplicates = np.zeros(shape, dtype=np.int64)
-    for mutation_index, row in enumerate(compiled_cells):
+    for mutation_index, row in enumerate(compiled_units):
         for sample_index, compiled in enumerate(row):
             if not compiled.paths:
-                raise ValueError("Every compiled cell must contain at least one path.")
+                raise ValueError("Every compiled unit must contain at least one path.")
             if not (
                 len(compiled.paths)
                 == len(compiled.log_prior)
@@ -245,7 +245,7 @@ def initialize_path_marginal_phi(
     *,
     eps: float,
 ) -> np.ndarray:
-    """Return the canonical exact scalar minimizer of each path-marginal cell."""
+    """Return the canonical exact scalar minimizer of each path-marginal unit."""
 
     if data.path_likelihood is None:
         raise ValueError("TumorData must contain a path likelihood.")

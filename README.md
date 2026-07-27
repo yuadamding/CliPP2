@@ -1,6 +1,6 @@
 # CliPP2
 
-CliPP2 estimates cellular prevalence, clusters SNVs, and infers mutant-copy
+CliPP2 estimates mutation prevalence, clusters SNVs, and infers mutant-copy
 multiplicity from single- or multi-region tumor sequencing data with
 objective-faithful pairwise fusion.
 
@@ -44,8 +44,8 @@ The main rules are:
   and may differ from 2.
 - Segment IDs are sample-specific; each 1-based mutation position must fall
   within its inclusive segment bounds.
-- Local state fractions are positive, conditional on tumor cells, and sum to
-  one per sample-segment.
+- Local state fractions are positive, conditional on the tumor population, and
+  sum to one per sample-segment.
 - `allele_mode=phased` means A/B are persistent homolog labels.
   `allele_mode=unphased` means ordinary major/minor calls and requires
   `allele_a_cn >= allele_b_cn`.

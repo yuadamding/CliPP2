@@ -81,9 +81,9 @@ def _evaluate_simulation_metrics(
         "amplified_mutant_copy_f1": np.nan,
         "raw_amplified_mutant_copy_f1": np.nan,
         "summary_amplified_mutant_copy_f1": np.nan,
-        "n_effective_multiplicity_cells": np.nan,
-        "n_amplified_mutant_copy_cells": np.nan,
-        "n_true_amplified_mutant_copy_cells": np.nan,
+        "n_effective_multiplicity_units": np.nan,
+        "n_amplified_mutant_copy_units": np.nan,
+        "n_true_amplified_mutant_copy_units": np.nan,
         "estimated_clonal_fraction": np.nan,
         "true_clonal_fraction": np.nan,
         "clonal_fraction_error": np.nan,
@@ -161,14 +161,14 @@ def _evaluate_simulation_metrics(
                 if evaluation.summary_amplified_mutant_copy_f1 is None
                 else evaluation.summary_amplified_mutant_copy_f1
             ),
-            "n_effective_multiplicity_cells": int(
-                evaluation.n_effective_multiplicity_cells
+            "n_effective_multiplicity_units": int(
+                evaluation.n_effective_multiplicity_units
             ),
-            "n_amplified_mutant_copy_cells": int(
-                evaluation.n_amplified_mutant_copy_cells
+            "n_amplified_mutant_copy_units": int(
+                evaluation.n_amplified_mutant_copy_units
             ),
-            "n_true_amplified_mutant_copy_cells": int(
-                evaluation.n_true_amplified_mutant_copy_cells
+            "n_true_amplified_mutant_copy_units": int(
+                evaluation.n_true_amplified_mutant_copy_units
             ),
             "estimated_clonal_fraction": float(evaluation.estimated_clonal_fraction),
             "true_clonal_fraction": float(evaluation.true_clonal_fraction),

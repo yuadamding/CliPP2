@@ -48,11 +48,11 @@ class SimulationEvaluation:
     amplified_mutant_copy_f1: float | None = None
     raw_amplified_mutant_copy_f1: float | None = None
     summary_amplified_mutant_copy_f1: float | None = None
-    n_effective_multiplicity_cells: int = 0
-    # Number of finite cells entering amplified-copy classification, followed
-    # by the number of positive truth labels among those cells.
-    n_amplified_mutant_copy_cells: int = 0
-    n_true_amplified_mutant_copy_cells: int = 0
+    n_effective_multiplicity_units: int = 0
+    # Number of finite units entering amplified-copy classification, followed
+    # by the number of positive truth labels among those units.
+    n_amplified_mutant_copy_units: int = 0
+    n_true_amplified_mutant_copy_units: int = 0
 
 
 @dataclass(frozen=True)
@@ -69,7 +69,7 @@ def path_truth_emission_distance(
     truth_phi: np.ndarray,
     truth_mutant_copy_mass: np.ndarray,
 ) -> np.ndarray:
-    """Return the closest compiled mutant-copy mass for each benchmark truth cell."""
+    """Return the closest compiled mutant-copy mass for each benchmark truth unit."""
 
     spec = data.path_likelihood
     if spec is None or spec.model_id != TUMOR_DIRECTORY_MODEL_ID:
@@ -603,9 +603,9 @@ def _revised_multiplicity_metrics(
             "amplified_mutant_copy_f1": float("nan"),
             "raw_amplified_mutant_copy_f1": float("nan"),
             "summary_amplified_mutant_copy_f1": float("nan"),
-            "n_effective_multiplicity_cells": 0,
-            "n_amplified_mutant_copy_cells": 0,
-            "n_true_amplified_mutant_copy_cells": 0,
+            "n_effective_multiplicity_units": 0,
+            "n_amplified_mutant_copy_units": 0,
+            "n_true_amplified_mutant_copy_units": 0,
         }
 
     raw_effective, raw_amplified = _path_effective_predictions(
@@ -643,9 +643,9 @@ def _revised_multiplicity_metrics(
             "amplified_mutant_copy_f1": float("nan"),
             "raw_amplified_mutant_copy_f1": float("nan"),
             "summary_amplified_mutant_copy_f1": float("nan"),
-            "n_effective_multiplicity_cells": 0,
-            "n_amplified_mutant_copy_cells": 0,
-            "n_true_amplified_mutant_copy_cells": 0,
+            "n_effective_multiplicity_units": 0,
+            "n_amplified_mutant_copy_units": 0,
+            "n_true_amplified_mutant_copy_units": 0,
         }
     raw_rmse = float(
         np.sqrt(np.mean((raw_effective[finite] - truth_effective[finite]) ** 2))
@@ -669,9 +669,9 @@ def _revised_multiplicity_metrics(
         "amplified_mutant_copy_f1": summary_f1,
         "raw_amplified_mutant_copy_f1": raw_f1,
         "summary_amplified_mutant_copy_f1": summary_f1,
-        "n_effective_multiplicity_cells": int(np.sum(finite)),
-        "n_amplified_mutant_copy_cells": int(np.sum(finite)),
-        "n_true_amplified_mutant_copy_cells": int(np.sum(true_amplified[finite])),
+        "n_effective_multiplicity_units": int(np.sum(finite)),
+        "n_amplified_mutant_copy_units": int(np.sum(finite)),
+        "n_true_amplified_mutant_copy_units": int(np.sum(true_amplified[finite])),
     }
 
 
@@ -717,9 +717,9 @@ def evaluate_fit_against_simulation(
             amplified_mutant_copy_f1=float("nan"),
             raw_amplified_mutant_copy_f1=float("nan"),
             summary_amplified_mutant_copy_f1=float("nan"),
-            n_effective_multiplicity_cells=0,
-            n_amplified_mutant_copy_cells=0,
-            n_true_amplified_mutant_copy_cells=0,
+            n_effective_multiplicity_units=0,
+            n_amplified_mutant_copy_units=0,
+            n_true_amplified_mutant_copy_units=0,
         )
 
     ari = _adjusted_rand_index(truth_clusters, fit.cluster_labels)
@@ -818,13 +818,13 @@ def evaluate_fit_against_simulation(
         summary_amplified_mutant_copy_f1=float(
             revised_metrics["summary_amplified_mutant_copy_f1"]
         ),
-        n_effective_multiplicity_cells=int(
-            revised_metrics["n_effective_multiplicity_cells"]
+        n_effective_multiplicity_units=int(
+            revised_metrics["n_effective_multiplicity_units"]
         ),
-        n_amplified_mutant_copy_cells=int(
-            revised_metrics["n_amplified_mutant_copy_cells"]
+        n_amplified_mutant_copy_units=int(
+            revised_metrics["n_amplified_mutant_copy_units"]
         ),
-        n_true_amplified_mutant_copy_cells=int(
-            revised_metrics["n_true_amplified_mutant_copy_cells"]
+        n_true_amplified_mutant_copy_units=int(
+            revised_metrics["n_true_amplified_mutant_copy_units"]
         ),
     )

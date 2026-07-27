@@ -17,7 +17,7 @@ _ROOT_SCAN_POINTS = 65
 
 
 def _fixed_linear_path_scale_torch(torch_data: TorchTumorData) -> torch.Tensor | None:
-    """Return the shared per-cell path slope when the categorical model is fixed."""
+    """Return the shared per-unit path slope when the categorical model is fixed."""
 
     path = torch_data.path_likelihood
     if path is None:
@@ -1273,7 +1273,7 @@ def _mutation_region_breakpoints(
     return np.clip(point_array, float(lower), float(upper))
 
 
-def _path_cell_loss_and_gradient_numpy(
+def _path_unit_loss_and_gradient_numpy(
     beta_values: np.ndarray,
     *,
     alt: float,
@@ -1314,7 +1314,7 @@ def _path_cell_loss_and_gradient_numpy(
     return loss, gradient
 
 
-def _path_cell_base_points_numpy(
+def _path_unit_base_points_numpy(
     *,
     alt: float,
     total: float,
@@ -1373,7 +1373,7 @@ def _path_cell_base_points_numpy(
     )
 
 
-def _path_cell_best_two_betas_numpy(
+def _path_unit_best_two_betas_numpy(
     *,
     alt: float,
     total: float,
@@ -1389,7 +1389,7 @@ def _path_cell_best_two_betas_numpy(
     tol: float,
     max_iter: int,
 ) -> tuple[float, float | None]:
-    base_points, hard_points = _path_cell_base_points_numpy(
+    base_points, hard_points = _path_unit_base_points_numpy(
         alt=alt,
         total=total,
         first_scale=first_scale,
@@ -1404,7 +1404,7 @@ def _path_cell_best_two_betas_numpy(
     candidates: list[float] = base_points.tolist()
 
     def evaluate(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        return _path_cell_loss_and_gradient_numpy(
+        return _path_unit_loss_and_gradient_numpy(
             values,
             alt=alt,
             total=total,
@@ -1538,7 +1538,7 @@ def _path_scalar_wells_from_arrays(
     secondary = np.full_like(primary, np.nan)
     valid_secondary = np.zeros_like(primary, dtype=bool)
     for index in np.flatnonzero(observed):
-        best, alternate = _path_cell_best_two_betas_numpy(
+        best, alternate = _path_unit_best_two_betas_numpy(
             alt=float(flat_alt[index]),
             total=float(flat_total[index]),
             first_scale=flat_first[index],
@@ -1646,7 +1646,7 @@ def _path_pooled_start_from_arrays(
             values = np.asarray(values, dtype=np.float64)
             loss = np.zeros_like(values)
             for mutation_index in member_indices:
-                cell_loss, _ = _path_cell_loss_and_gradient_numpy(
+                unit_loss, _ = _path_unit_loss_and_gradient_numpy(
                     values,
                     alt=float(alt[mutation_index, region_index]),
                     total=float(total[mutation_index, region_index]),
@@ -1657,7 +1657,7 @@ def _path_pooled_start_from_arrays(
                     valid=valid[mutation_index, region_index],
                     eps=float(eps),
                 )
-                loss += cell_loss
+                loss += unit_loss
             return loss
 
         losses = objective(grid)

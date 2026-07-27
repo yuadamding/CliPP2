@@ -313,7 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["error", "mask"],
         default="mask",
         help=(
-            "Report compiler-unsupported cells by default; use 'error' to fail "
+            "Report compiler-unsupported units by default; use 'error' to fail "
             "on the first unsupported local CN mixture."
         ),
     )
@@ -483,9 +483,9 @@ def _run_validate(args: argparse.Namespace) -> None:
         if unsupported_values
         else {}
     )
-    cell_count = int(data.num_mutations * data.num_regions)
-    usable_count_cells = (
-        cell_count if data.count_observed is None else int(data.count_observed.sum())
+    unit_count = int(data.num_mutations * data.num_regions)
+    usable_count_units = (
+        unit_count if data.count_observed is None else int(data.count_observed.sum())
     )
     print(
         {
@@ -495,8 +495,8 @@ def _run_validate(args: argparse.Namespace) -> None:
             "tumor_id": data.tumor_id,
             "mutations": data.num_mutations,
             "samples": data.num_regions,
-            "compiler_supported_cells": cell_count - len(unsupported_values),
-            "usable_count_cells": usable_count_cells,
+            "compiler_supported_units": unit_count - len(unsupported_values),
+            "usable_count_units": usable_count_units,
             "unsupported_reason_counts": unsupported_reason_counts,
         }
     )

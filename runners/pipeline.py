@@ -889,18 +889,18 @@ def process_tumor_bundle(
         if best_evaluation is None
         or getattr(best_evaluation, "summary_amplified_mutant_copy_f1", None) is None
         else float(best_evaluation.summary_amplified_mutant_copy_f1),
-        "n_effective_multiplicity_cells": 0
+        "n_effective_multiplicity_units": 0
         if best_evaluation is None
-        else int(getattr(best_evaluation, "n_effective_multiplicity_cells", 0)),
-        "n_amplified_mutant_copy_cells": 0
+        else int(getattr(best_evaluation, "n_effective_multiplicity_units", 0)),
+        "n_amplified_mutant_copy_units": 0
         if best_evaluation is None
-        else int(getattr(best_evaluation, "n_amplified_mutant_copy_cells", 0)),
-        "n_true_amplified_mutant_copy_cells": 0
+        else int(getattr(best_evaluation, "n_amplified_mutant_copy_units", 0)),
+        "n_true_amplified_mutant_copy_units": 0
         if best_evaluation is None
         else int(
             getattr(
                 best_evaluation,
-                "n_true_amplified_mutant_copy_cells",
+                "n_true_amplified_mutant_copy_units",
                 0,
             )
         ),

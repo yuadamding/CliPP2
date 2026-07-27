@@ -2,8 +2,8 @@
 
 [`exampleTumor1.clipp2.txt`](exampleTumor1.clipp2.txt) is a complete canonical
 input with 300 SNVs, samples `region1` and `region2`, and 10 sample-specific CN
-intervals. It has 600 mutation-sample cells and 998 data rows because 398 cells
-(66.3%) contain two local CN states. Every cell has at least one non-diploid
+intervals. It has 600 mutation-sample units and 998 data rows because 398 units
+(66.3%) contain two local CN states. Every unit has at least one non-diploid
 local state.
 
 Validate and inspect it:

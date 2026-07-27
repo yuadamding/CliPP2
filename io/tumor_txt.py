@@ -81,7 +81,7 @@ class TumorTxtAnnotations:
     metadata: dict[str, str]
     optional_columns: tuple[str, ...]
     rows: pd.DataFrame
-    _cell_values: dict[str, np.ndarray]
+    _unit_values: dict[str, np.ndarray]
     _biological_duplicates: np.ndarray
 
     def columns_for_indices(self, indices: np.ndarray) -> dict[str, list[object]]:
@@ -92,7 +92,7 @@ class TumorTxtAnnotations:
         path = indices[:, 2]
         result = {
             f"input_{name}": values[mutation, sample].tolist()
-            for name, values in self._cell_values.items()
+            for name, values in self._unit_values.items()
         }
         result["biological_duplicate_count"] = self._biological_duplicates[
             mutation, sample, path
@@ -107,7 +107,7 @@ class _ValidatedLongTable:
     optional_columns: tuple[str, ...]
     mutation_ids: tuple[str, ...]
     sample_ids: tuple[str, ...]
-    rows_by_cell: dict[tuple[str, str], tuple[dict[str, Any], ...]]
+    rows_by_unit: dict[tuple[str, str], tuple[dict[str, Any], ...]]
     states_by_segment: dict[
         tuple[str, str], tuple[str, tuple[LocalCopyNumberState, ...]]
     ]
@@ -454,7 +454,7 @@ def _validate_long_table(
         _normalize_row(row, row_number=index + 1)
         for index, row in enumerate(table.to_dict(orient="records"))
     ]
-    rows_by_cell_mutable: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    rows_by_unit_mutable: dict[tuple[str, str], list[dict[str, Any]]] = {}
     mutation_definitions: dict[str, tuple[str, int, str, str]] = {}
     sample_purities: dict[str, list[float]] = {}
     segment_definitions: dict[tuple[str, str], tuple[str, int, int, str]] = {}
@@ -516,7 +516,7 @@ def _validate_long_table(
                 row["allele_mode"],
             )
         )
-        rows_by_cell_mutable.setdefault((mutation_id, sample_id), []).append(row)
+        rows_by_unit_mutable.setdefault((mutation_id, sample_id), []).append(row)
 
     canonical_purity: dict[str, float] = {}
     for sample_id, purities in sample_purities.items():
@@ -584,42 +584,42 @@ def _validate_long_table(
 
     mutation_ids = tuple(sorted(mutation_definitions))
     sample_ids = tuple(sorted(sample_purities))
-    expected_cells = {
+    expected_units = {
         (mutation_id, sample_id)
         for mutation_id in mutation_ids
         for sample_id in sample_ids
     }
-    observed_cells = set(rows_by_cell_mutable)
-    if observed_cells != expected_cells:
-        missing = sorted(expected_cells.difference(observed_cells))[:5]
+    observed_units = set(rows_by_unit_mutable)
+    if observed_units != expected_units:
+        missing = sorted(expected_units.difference(observed_units))[:5]
         raise TumorTxtError(
-            "Every mutation/sample cell must be represented; "
+            "Every mutation/sample unit must be represented; "
             f"missing examples: {missing}."
         )
 
-    rows_by_cell: dict[tuple[str, str], tuple[dict[str, Any], ...]] = {}
-    for cell, cell_rows in rows_by_cell_mutable.items():
-        reference = cell_rows[0]
+    rows_by_unit: dict[tuple[str, str], tuple[dict[str, Any], ...]] = {}
+    for unit, unit_rows in rows_by_unit_mutable.items():
+        reference = unit_rows[0]
         if any(
             not _observation_fields_agree(reference, candidate)
-            for candidate in cell_rows[1:]
+            for candidate in unit_rows[1:]
         ):
             raise TumorTxtError(
-                f"Repeated observation fields disagree within cell {cell!r}."
+                f"Repeated observation fields disagree within unit {unit!r}."
             )
-        canonical_normal_cn = min(row["normal_cn"] for row in cell_rows)
-        for row in cell_rows:
+        canonical_normal_cn = min(row["normal_cn"] for row in unit_rows)
+        for row in unit_rows:
             row["normal_cn"] = canonical_normal_cn
         segment_key = (reference["sample_id"], reference["segment_id"])
         expected_state_ids = state_ids_by_segment[segment_key]
-        observed_state_ids = {row["cn_state_id"] for row in cell_rows}
+        observed_state_ids = {row["cn_state_id"] for row in unit_rows}
         if observed_state_ids != expected_state_ids:
             raise TumorTxtError(
-                f"Cell {cell!r} does not contain every state from segment "
+                f"Unit {unit!r} does not contain every state from segment "
                 f"{segment_key!r}."
             )
-        rows_by_cell[cell] = tuple(
-            sorted(cell_rows, key=lambda row: row["cn_state_id"])
+        rows_by_unit[unit] = tuple(
+            sorted(unit_rows, key=lambda row: row["cn_state_id"])
         )
 
     return _ValidatedLongTable(
@@ -630,7 +630,7 @@ def _validate_long_table(
         ),
         mutation_ids=mutation_ids,
         sample_ids=sample_ids,
-        rows_by_cell=rows_by_cell,
+        rows_by_unit=rows_by_unit,
         states_by_segment=states_by_segment,
     )
 
@@ -674,12 +674,12 @@ def _build_tumor_data(
     has_cna = np.empty(shape, dtype=bool)
     mean_total_cn = np.empty(shape, dtype=np.float64)
     unsupported_reason = np.full(shape, None, dtype=object)
-    compiled_cells: list[list[CompiledPathSet]] = [
+    compiled_units: list[list[CompiledPathSet]] = [
         [CompiledPathSet((), (), ()) for _ in sample_ids] for _ in mutation_ids
     ]
 
-    for cell, rows in validated.rows_by_cell.items():
-        mutation_id, sample_id = cell
+    for unit, rows in validated.rows_by_unit.items():
+        mutation_id, sample_id = unit
         i = mutation_index[mutation_id]
         j = sample_index[sample_id]
         row = rows[0]
@@ -729,53 +729,53 @@ def _build_tumor_data(
                 log_prior=(0.0,),
                 biological_duplicate_count=(1,),
             )
-        compiled_cells[i][j] = compiled
+        compiled_units[i][j] = compiled
 
     alt_counts = np.where(count_observed, alt_counts, 0.0)
     total_counts = np.where(count_observed, total_counts, 0.0)
     denominator = (1.0 - purity) * normal_cn + purity * mean_total_cn
     if np.any(~np.isfinite(denominator)) or np.any(denominator <= 0.0):
         raise TumorTxtError(
-            "Every mutation/sample cell must have a positive normal-plus-tumor "
+            "Every mutation/sample unit must have a positive normal-plus-tumor "
             "copy-number denominator."
         )
     scaling = purity / denominator
     path_likelihood, biological_duplicates = build_path_likelihood(
-        compiled_cells,
+        compiled_units,
         model_id=TUMOR_TXT_MODEL_ID,
         model_version=TUMOR_TXT_MODEL_VERSION,
         candidate_generator_version=TUMOR_TXT_CANDIDATE_GENERATOR_VERSION,
         prior_mode=path_prior_mode(dosage_prior_penalty),
     )
 
-    optional_cell_values: dict[str, np.ndarray] = {}
+    optional_unit_values: dict[str, np.ndarray] = {}
     for column in validated.optional_columns:
         values = np.full(shape, ".", dtype=object)
-        all_cell_constant = True
-        for cell, rows in validated.rows_by_cell.items():
+        all_unit_constant = True
+        for unit, rows in validated.rows_by_unit.items():
             source_indices = [
                 validated.source_rows.index[
-                    (validated.source_rows["mutation_id"] == cell[0])
-                    & (validated.source_rows["sample_id"] == cell[1])
+                    (validated.source_rows["mutation_id"] == unit[0])
+                    & (validated.source_rows["sample_id"] == unit[1])
                 ].tolist()
             ][0]
             source_values = {
                 str(validated.source_rows.at[index, column]) for index in source_indices
             }
             if len(source_values) != 1:
-                all_cell_constant = False
+                all_unit_constant = False
                 break
-            values[mutation_index[cell[0]], sample_index[cell[1]]] = next(
+            values[mutation_index[unit[0]], sample_index[unit[1]]] = next(
                 iter(source_values)
             )
-        if all_cell_constant:
-            optional_cell_values[column] = values
+        if all_unit_constant:
+            optional_unit_values[column] = values
 
     annotations = TumorTxtAnnotations(
         metadata=dict(validated.metadata),
         optional_columns=validated.optional_columns,
         rows=validated.source_rows.copy(),
-        _cell_values=optional_cell_values,
+        _unit_values=optional_unit_values,
         _biological_duplicates=biological_duplicates,
     )
     data = TumorData(
@@ -877,7 +877,7 @@ def _format_number(value: float) -> str:
     return f"{float(value):.17g}"
 
 
-def _canonical_text_cell(value: object) -> str:
+def _canonical_text_value(value: object) -> str:
     if value is None or (
         isinstance(value, (float, np.floating)) and bool(np.isnan(value))
     ):
@@ -892,7 +892,7 @@ def _canonical_text_cell(value: object) -> str:
         return _format_number(float(value))
     text = str(value)
     if "\r" in text or "\n" in text:
-        raise TumorTxtError("Long tumor table cells may not contain newlines.")
+        raise TumorTxtError("Long tumor table values may not contain newlines.")
     return text
 
 
@@ -954,7 +954,7 @@ def write_tumor_txt(
     ]
     ordered_columns = [*REQUIRED_COLUMNS, *optional_columns]
     frame = frame.loc[:, ordered_columns].apply(
-        lambda column: column.map(_canonical_text_cell)
+        lambda column: column.map(_canonical_text_value)
     )
     if frame.empty:
         raise TumorTxtError("Long tumor table may not be empty.")
