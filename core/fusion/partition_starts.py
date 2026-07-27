@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import heapq
 from collections.abc import Callable, Sequence
 
@@ -25,6 +25,8 @@ from .torch_backend import (
     TorchTumorData,
     as_runtime_tensor,
     mutation_region_loss_grid_torch,
+    mutation_region_terms_torch,
+    path_mutation_region_terms_numpy,
     resolve_runtime,
     to_torch_tumor_data,
 )
@@ -81,6 +83,27 @@ def _partition_work_dtype(dtype: torch.dtype) -> torch.dtype:
 def _copy_torch_tumor_data(
     data: TorchTumorData, *, dtype: torch.dtype, device: torch.device
 ) -> TorchTumorData:
+    path_likelihood = (
+        None
+        if data.path_likelihood is None
+        else replace(
+            data.path_likelihood,
+            first_scale=data.path_likelihood.first_scale.to(dtype=dtype, device=device),
+            second_scale=data.path_likelihood.second_scale.to(
+                dtype=dtype, device=device
+            ),
+            switch_fraction=data.path_likelihood.switch_fraction.to(
+                dtype=dtype, device=device
+            ),
+            log_prior=data.path_likelihood.log_prior.to(dtype=dtype, device=device),
+            valid=data.path_likelihood.valid.to(device=device),
+            legacy_major_indicator=(
+                None
+                if data.path_likelihood.legacy_major_indicator is None
+                else data.path_likelihood.legacy_major_indicator.to(device=device)
+            ),
+        )
+    )
     return TorchTumorData(
         alt=data.alt.to(dtype=dtype, device=device),
         total=data.total.to(dtype=dtype, device=device),
@@ -93,6 +116,7 @@ def _copy_torch_tumor_data(
         count_observed=None
         if data.count_observed is None
         else data.count_observed.to(device=device),
+        path_likelihood=path_likelihood,
         data_fingerprint=data.data_fingerprint,
     )
 
@@ -247,6 +271,13 @@ def _mutation_region_loss_matrix_torch(
     major_prior: float,
     eps: float,
 ) -> torch.Tensor:
+    if torch_data.path_likelihood is not None:
+        return mutation_region_terms_torch(
+            torch_data,
+            beta,
+            major_prior=float(major_prior),
+            eps=float(eps),
+        ).loss
     return mutation_region_loss_grid_torch(
         beta,
         alt=torch_data.alt,
@@ -342,6 +373,53 @@ def observed_curvature_at_pilot(
     arrays = _data_arrays(data)
     upper = arrays["upper"]
     lower = float(eps)
+    path_spec = getattr(data, "path_likelihood", None)
+    if path_spec is not None:
+        x0 = np.minimum(np.maximum(phi0, lower), upper)
+        width = np.maximum(upper - lower, 0.0)
+        step = np.maximum(
+            float(min_step),
+            float(step_fraction)
+            * np.maximum.reduce([width, np.abs(x0), np.ones_like(x0)]),
+        )
+        left = np.maximum(lower, x0 - step)
+        right = np.minimum(upper, x0 + step)
+        h_left = x0 - left
+        h_right = right - x0
+        valid = (h_left > 1e-12) & (h_right > 1e-12)
+
+        def path_loss(phi: np.ndarray) -> np.ndarray:
+            return path_mutation_region_terms_numpy(
+                path_spec,
+                scaling=np.asarray(data.scaling, dtype=np.float64),
+                alt=np.asarray(data.alt_counts, dtype=np.float64),
+                total=np.asarray(data.total_counts, dtype=np.float64),
+                phi=phi,
+                eps=float(eps),
+                count_observed=data.count_observed,
+            ).loss
+
+        f_left = path_loss(left)
+        f0 = path_loss(x0)
+        f_right = path_loss(right)
+        denominator = h_left * h_right * (h_left + h_right)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            curvature = (
+                2.0
+                * (h_left * f_right - (h_left + h_right) * f0 + h_right * f_left)
+                / denominator
+            )
+        curvature = np.where(
+            valid & np.isfinite(curvature),
+            np.maximum(curvature, float(curvature_floor)),
+            float(curvature_floor),
+        )
+        finite = curvature[np.isfinite(curvature)]
+        if finite.size and 0.0 < float(curvature_cap_quantile) < 1.0:
+            cap = float(np.quantile(finite, float(curvature_cap_quantile)))
+            if np.isfinite(cap) and cap > float(curvature_floor):
+                curvature = np.minimum(curvature, cap)
+        return np.maximum(curvature, float(curvature_floor))
     h = np.full(phi0.shape, float(curvature_floor), dtype=np.float64)
 
     for mutation_idx in range(phi0.shape[0]):
@@ -691,8 +769,29 @@ def _loss_to_centers(
     num_clusters = int(centers.shape[0])
     cost = np.zeros((num_mutations, num_clusters), dtype=np.float64)
     infeasible = np.zeros((num_mutations, num_clusters), dtype=bool)
+    path_spec = getattr(data, "path_likelihood", None)
 
     for cluster_idx in range(num_clusters):
+        if path_spec is not None:
+            phi_for_center = np.broadcast_to(
+                centers[cluster_idx][None, :],
+                (num_mutations, int(data.num_regions)),
+            )
+            path_terms = path_mutation_region_terms_numpy(
+                path_spec,
+                scaling=np.asarray(data.scaling, dtype=np.float64),
+                alt=np.asarray(data.alt_counts, dtype=np.float64),
+                total=np.asarray(data.total_counts, dtype=np.float64),
+                phi=phi_for_center,
+                eps=float(eps),
+                count_observed=data.count_observed,
+            )
+            cost[:, cluster_idx] = np.sum(path_terms.loss, axis=1)
+            infeasible[:, cluster_idx] = np.any(
+                phi_for_center > arrays["upper"] + max(float(eps), 1e-8),
+                axis=1,
+            )
+            continue
         for region_idx in range(int(data.num_regions)):
             beta = float(centers[cluster_idx, region_idx])
             region_loss = _mutation_region_loss_vector_numpy(
@@ -741,6 +840,35 @@ def _loss_to_centers_torch(
         dtype=dtype,
     )
     centers_t = _as_torch(centers, runtime=runtime)
+    if torch_data.path_likelihood is not None:
+        cost_columns: list[torch.Tensor] = []
+        for cluster_idx in range(int(centers_t.shape[0])):
+            phi_for_center = (
+                centers_t[cluster_idx].unsqueeze(0).expand(int(data.num_mutations), -1)
+            )
+            terms = mutation_region_terms_torch(
+                torch_data,
+                phi_for_center,
+                major_prior=float(major_prior),
+                eps=float(eps),
+            )
+            cost_column = torch.sum(terms.loss, dim=1)
+            infeasible = torch.any(
+                phi_for_center > torch_data.phi_upper + max(float(eps), 1e-8),
+                dim=1,
+            )
+            safe_penalty = min(
+                float(infeasible_penalty),
+                float(torch.finfo(cost_column.dtype).max) / 16.0,
+            )
+            cost_columns.append(
+                torch.where(
+                    infeasible,
+                    torch.full_like(cost_column, safe_penalty),
+                    cost_column,
+                )
+            )
+        return torch.stack(cost_columns, dim=1)
     beta = centers_t.unsqueeze(0)
     loss = mutation_region_loss_grid_torch(
         beta,
@@ -999,6 +1127,16 @@ def partition_constrained_observed_refit_torch(
     tol = float(tol)
     if not np.isfinite(tol) or tol <= 0.0:
         raise ValueError("Partition refit tolerance must be a positive finite value.")
+    if getattr(data, "path_likelihood", None) is not None:
+        return partition_constrained_observed_refit(
+            data,
+            labels,
+            major_prior=float(major_prior),
+            eps=float(eps),
+            tol=float(tol),
+            max_iter=max(int(max_iter), 32),
+            hint_phi=None if hint_phi is None else _as_numpy(hint_phi),
+        )
     runtime, torch_data = _resolve_partition_runtime(
         data=data,
         exact_pilot=hint_phi,
@@ -1171,6 +1309,20 @@ def refine_partition_likelihood_torch(
     allow_component_death: bool = False,
     _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
 ) -> tuple[np.ndarray, PartitionRefitResult]:
+    if getattr(data, "path_likelihood", None) is not None:
+        return refine_partition_likelihood(
+            data,
+            labels,
+            major_prior=float(major_prior),
+            eps=float(eps),
+            tol=float(tol),
+            max_iter=int(max_iter),
+            refit_max_iter=int(refit_max_iter),
+            hint_phi=None if hint_phi is None else _as_numpy(hint_phi),
+            classification_weight_alpha=classification_weight_alpha,
+            allow_component_death=bool(allow_component_death),
+            _refit_labels=_refit_labels,
+        )
     runtime, torch_data = _resolve_partition_runtime(
         data=data,
         exact_pilot=hint_phi,

@@ -16,6 +16,7 @@ from .defaults import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
     DEFAULT_INNER_BACKEND,
+    DEFAULT_OPTIMIZATION_TOLERANCE,
     DEFAULT_WORKSET_ADD_BATCH,
     DEFAULT_WORKSET_MAX_BYTES,
     DEFAULT_WORKSET_MAX_EXPANSIONS,
@@ -30,6 +31,7 @@ from .graph import resolve_pairwise_fusion_graph
 from .graph_ops import (
     build_complete_adaptive_tensor_graph,
     dense_complete_solver_memory_preflight,
+    graph_adjoint_edges,
     project_dual_ball,
     tensor_graph_to_pairwise_graph,
     tensorize_graph,
@@ -51,6 +53,9 @@ from .torch_backend import (
     dtype_name,
     em_surrogate_terms_torch,
     graph_fusion_kkt_residual_from_grad_torch,
+    path_downward_kink_mask_torch,
+    path_internal_breakpoints_torch,
+    path_one_sided_gradients_torch,
     pairwise_penalty_torch,
     resolve_runtime,
     solve_majorized_subproblem_alm_torch,
@@ -323,6 +328,98 @@ _OUTER_KKT_CHECK_EVERY = 4
 _PERIODIC_CERTIFICATE_MAX_ITER = 96
 _FULL_STEP_MAX_CURVATURE_ATTEMPTS = 24
 _UNIMODAL_GLOBAL_OPTIMALITY_BASIS = "assumed_unimodal_objective_plus_kkt"
+PATH_OBJECTIVE_SHAPE = "generic_nonconvex"
+
+
+def uses_explicit_path_likelihood(data: TumorData) -> bool:
+    """Whether ``data`` carries an explicit categorical occupancy-path model."""
+
+    return getattr(data, "path_likelihood", None) is not None
+
+
+def uses_nonconvex_path_likelihood(data: TumorData) -> bool:
+    """Whether an explicit path family requires generic nonconvex handling."""
+
+    path = getattr(data, "path_likelihood", None)
+    return bool(
+        path is not None and not bool(getattr(path, "has_fixed_linear_emission", False))
+    )
+
+
+def _effective_major_prior(data: TumorData, major_prior: float) -> float:
+    """Canonicalize a legacy option that is absent from fixed-prior path models."""
+
+    if uses_explicit_path_likelihood(data):
+        return 0.5
+    return float(major_prior)
+
+
+def objective_shape_for_data(data: TumorData, requested: str) -> str:
+    """Return the only solver shape declaration valid for this likelihood.
+
+    Competing or genuinely piecewise paths can be multimodal and therefore
+    always use the generic route. A path specification whose valid candidates
+    all reduce to the same fixed linear emission reuses the existing scalar
+    route without discarding its path provenance.
+    """
+
+    normalized = _normalize_objective_shape(requested)
+    if uses_nonconvex_path_likelihood(data):
+        return PATH_OBJECTIVE_SHAPE
+    return normalized
+
+
+def _path_smooth_interval_bounds(
+    torch_data: TorchTumorData,
+    phi: torch.Tensor,
+    *,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Restrict one MM trial to the current smooth path interval.
+
+    The path kernel returns the left derivative at an exact breakpoint, so an
+    exact breakpoint is treated as the upper end of its left interval.  The
+    nonconvex start bank separately seeds both sides of nearby occupancy
+    switches.
+    """
+
+    path = torch_data.path_likelihood
+    if path is None:
+        return lower, upper
+    points, valid = path_internal_breakpoints_torch(path, eps=float(eps))
+    valid = (
+        valid
+        & torch.isfinite(points)
+        & (points > lower.unsqueeze(-1))
+        & (points < upper.unsqueeze(-1))
+    )
+    # Ordering, rather than an approximate equality test, is essential here:
+    # a point infinitesimally to the right of a kink is still on the right
+    # smooth branch.  Projection onto a breakpoint reuses the exact tensor
+    # value, so true breakpoint iterates compare equal.
+    below = valid & (points < phi.unsqueeze(-1))
+    above = valid & ~below
+    local_lower = torch.max(
+        torch.where(
+            below,
+            points,
+            lower.unsqueeze(-1).expand_as(points),
+        ),
+        dim=-1,
+    ).values
+    local_upper = torch.min(
+        torch.where(
+            above,
+            points,
+            upper.unsqueeze(-1).expand_as(points),
+        ),
+        dim=-1,
+    ).values
+    local_lower = torch.minimum(local_lower, phi)
+    local_upper = torch.maximum(local_upper, phi)
+    return local_lower, local_upper
 
 
 def _safe_surrogate_curvature_and_gradient(
@@ -373,6 +470,39 @@ def _combine_fallback_reasons(*reasons: str) -> str:
         if normalized and normalized not in unique:
             unique.append(normalized)
     return ";".join(unique)
+
+
+def _prefer_multistart_fit(
+    candidate: FusionFitArtifacts,
+    incumbent: FusionFitArtifacts,
+) -> bool:
+    """Rank finite starts by the observed objective they all optimize.
+
+    Certification remains mandatory downstream. It cannot change the target
+    function here: if the best observed-objective basin is unfinished, the
+    candidate must enter same-lambda recovery or fail closed rather than be
+    replaced by a materially worse stationary basin.
+    """
+
+    candidate_finite = bool(np.isfinite(candidate.penalized_objective))
+    incumbent_finite = bool(np.isfinite(incumbent.penalized_objective))
+    if candidate_finite != incumbent_finite:
+        return candidate_finite
+    if candidate_finite:
+        objective_delta = float(candidate.penalized_objective) - float(
+            incumbent.penalized_objective
+        )
+        if abs(objective_delta) > 1e-8:
+            return bool(objective_delta < 0.0)
+    candidate_status = (
+        bool(candidate.selection_eligible),
+        bool(candidate.converged),
+    )
+    incumbent_status = (
+        bool(incumbent.selection_eligible),
+        bool(incumbent.converged),
+    )
+    return candidate_status > incumbent_status
 
 
 def _normalize_objective_shape(objective_shape: str) -> str:
@@ -657,6 +787,7 @@ def _tensor_problem_from_torch_data(
         eps=float(eps),
         major_prior=prior,
         count_observed=torch_data.count_observed,
+        path_likelihood=torch_data.path_likelihood,
     )
 
 
@@ -672,7 +803,123 @@ def torch_data_from_context(context: SolverContext) -> TorchTumorData:
         b_plus=problem.b_plus,
         b_fixed=problem.b_fixed,
         count_observed=problem.count_observed,
+        path_likelihood=problem.path_likelihood,
         data_fingerprint=context.data_fingerprint,
+    )
+
+
+def escape_path_breakpoint_solver_state(
+    state: SolverState | None,
+    *,
+    context: SolverContext,
+    tol: float,
+) -> tuple[SolverState | None, int]:
+    """Nudge a failed dense-certificate state off exact path breakpoints.
+
+    The dense certificate supplies the fusion adjoint.  At each exact
+    breakpoint, the one-sided observed gradients plus that adjoint choose a
+    retry side.  A changed primal invalidates every dual/certificate warm
+    object because none remains valid at the new point.
+    """
+
+    certificate = None if state is None else state.certificate
+    path = context.problem.path_likelihood
+    if (
+        state is None
+        or path is None
+        or not isinstance(certificate, DenseEdgeCertificate)
+        or certificate.certificate_scope != "full_original_graph"
+        or certificate.gradient_scope == "mm_surrogate"
+        or certificate.graph_hash != str(context.graph_hash)
+        or not torch.is_tensor(certificate.dual)
+    ):
+        return state, 0
+
+    tolerance = _validate_solver_tolerance(tol)
+    phi = as_runtime_tensor(state.phi, context.runtime)
+    expected_shape = tuple(context.problem.alt.shape)
+    if tuple(phi.shape) != expected_shape or not bool(torch.all(torch.isfinite(phi))):
+        return state, 0
+    dual = as_runtime_tensor(certificate.dual, context.runtime)
+    expected_dual_shape = (
+        int(context.graph.edge_u.numel()),
+        int(phi.shape[1]),
+    )
+    if tuple(dual.shape) != expected_dual_shape or not bool(
+        torch.all(torch.isfinite(dual))
+    ):
+        return state, 0
+
+    torch_data = torch_data_from_context(context)
+    with torch.no_grad():
+        fusion_adjustment = graph_adjoint_edges(
+            dual,
+            edge_u=context.graph.edge_u,
+            edge_v=context.graph.edge_v,
+            num_nodes=int(phi.shape[0]),
+        )
+        gradient_left, gradient_right, at_breakpoint = path_one_sided_gradients_torch(
+            torch_data,
+            phi,
+            eps=float(context.problem.eps),
+        )
+        left_total = gradient_left + fusion_adjustment
+        right_total = gradient_right + fusion_adjustment
+        dtype_epsilon = float(torch.finfo(phi.dtype).eps)
+        numerical_threshold = (
+            64.0
+            * dtype_epsilon
+            * (
+                1.0
+                + torch.abs(gradient_left)
+                + torch.abs(gradient_right)
+                + torch.abs(fusion_adjustment)
+            )
+        )
+        direction_threshold = torch.maximum(
+            torch.full_like(phi, 1e-3 * tolerance),
+            numerical_threshold,
+        )
+        left_descends = (
+            at_breakpoint & (phi > context.lower) & (left_total > direction_threshold)
+        )
+        right_descends = (
+            at_breakpoint & (phi < context.upper) & (right_total < -direction_threshold)
+        )
+        choose_right = right_descends & (~left_descends | (-right_total >= left_total))
+        choose_left = left_descends & ~choose_right
+        base_offset = max(
+            10.0 * float(context.problem.eps),
+            0.2 * tolerance,
+        )
+        offset = torch.maximum(
+            torch.full_like(phi, base_offset),
+            64.0 * dtype_epsilon * (1.0 + torch.abs(phi)),
+        )
+        escaped = torch.where(
+            choose_right,
+            phi + offset,
+            torch.where(
+                choose_left,
+                phi - offset,
+                phi,
+            ),
+        )
+        escaped = torch.minimum(torch.maximum(escaped, context.lower), context.upper)
+        changed = escaped != phi
+        changed_count = int(torch.count_nonzero(changed).item())
+        if changed_count == 0:
+            return state, 0
+
+    return (
+        replace(
+            state,
+            phi=escaped.detach(),
+            dual=None,
+            warm_state=None,
+            certificate=None,
+        ),
+        changed_count,
     )
 
 
@@ -701,7 +948,8 @@ def prepare_torch_problem(
     defer_graph: bool = False,
 ) -> SolverContext:
     tol = _validate_solver_tolerance(tol)
-    objective_shape = _normalize_objective_shape(objective_shape)
+    objective_shape = objective_shape_for_data(data, objective_shape)
+    major_prior = _effective_major_prior(data, major_prior)
     use_unimodal_objective = objective_shape.startswith("unimodal")
     effective_runtime = (
         resolve_runtime(device, dtype=dtype) if runtime is None else runtime
@@ -1352,7 +1600,7 @@ def _fit_from_start(
     verbose: bool,
 ) -> FusionFitArtifacts:
     tol = _validate_solver_tolerance(tol)
-    objective_shape = _normalize_objective_shape(objective_shape)
+    objective_shape = objective_shape_for_data(data, objective_shape)
     requested_inner_backend = normalize_inner_backend(inner_backend)
     normalized_fallback_policy = normalize_dense_fallback_policy(dense_fallback_policy)
     certificate_options = CertificateOptions(
@@ -1563,7 +1811,11 @@ def _fit_from_start(
             surrogate_terms = em_surrogate_terms_torch(
                 torch_data,
                 phi,
-                omega_major=gamma_major,
+                omega_major=(
+                    current_mutation_region_terms.path_posterior
+                    if current_mutation_region_terms.path_posterior is not None
+                    else gamma_major
+                ),
                 major_prior=major_prior,
                 eps=eps,
             )
@@ -1572,6 +1824,16 @@ def _fit_from_start(
             surrogate_terms,
             torch_data.count_observed,
         )
+        if use_unimodal_objective:
+            smooth_lower, smooth_upper = lower, upper
+        else:
+            smooth_lower, smooth_upper = _path_smooth_interval_bounds(
+                torch_data,
+                phi,
+                lower=lower,
+                upper=upper,
+                eps=float(eps),
+            )
         if require_full_step_backtracking:
             forcing_certificate = certificate
             if use_compressed_certificates and forcing_certificate is None:
@@ -1670,8 +1932,8 @@ def _fit_from_start(
                     num_mutations=data.num_mutations,
                     U=U,
                     h=h,
-                    lower=lower,
-                    upper=upper,
+                    lower=smooth_lower,
+                    upper=smooth_upper,
                     lambda_value=lambda_value,
                     edge_u=edge_u,
                     edge_v=edge_v,
@@ -1822,7 +2084,11 @@ def _fit_from_start(
                     trial_surrogate_terms = em_surrogate_terms_torch(
                         torch_data,
                         phi_trial,
-                        omega_major=gamma_major,
+                        omega_major=(
+                            current_mutation_region_terms.path_posterior
+                            if current_mutation_region_terms.path_posterior is not None
+                            else gamma_major
+                        ),
                         major_prior=major_prior,
                         eps=eps,
                     )
@@ -2259,46 +2525,131 @@ def _fit_from_start(
             graph_hash=graph_hash,
             gradient_scope="observed_objective",
         )
-    final_certificate_refinement = refine_graph_fusion_certificate(
-        certificate=certificate,
-        phi=phi,
-        grad_smooth=final_terms.grad,
-        gradient_scope="observed_objective",
-        graph=tensor_graph,
-        graph_hash=graph_hash,
-        lower=lower,
-        upper=upper,
-        lambda_value=lambda_value,
-        atol=tol,
-        max_iter=int(certificate_options.max_iter),
-        options=(
-            certificate_options
-            if isinstance(certificate, CompressedEdgeCertificate)
-            else None
-        ),
-    )
-    workset_iterations += int(
-        final_certificate_refinement.work_counters.workset_iterations
-    )
-    workset_expansions += int(
-        final_certificate_refinement.work_counters.workset_expansions
-    )
-    streamed_edge_passes += int(
-        final_certificate_refinement.work_counters.streamed_edge_passes
-    )
-    certificate_iterations += int(
-        final_certificate_refinement.work_counters.certificate_iterations
-    )
-    activity_passes += int(final_certificate_refinement.work_counters.activity_passes)
-    analytic_adjoint_passes += int(
-        final_certificate_refinement.work_counters.analytic_adjoint_passes
-    )
-    column_scan_passes += int(
-        final_certificate_refinement.work_counters.column_scan_passes
-    )
-    full_certificate_audit_passes += int(
-        final_certificate_refinement.work_counters.full_certificate_audit_passes
-    )
+    certificate_gradient = final_terms.grad
+    at_path_breakpoint = torch.zeros_like(phi, dtype=torch.bool)
+    gradient_scope = "observed_objective"
+    gradient_lower = certificate_gradient
+    gradient_upper = certificate_gradient
+    directional_kink_admissible = True
+    if torch_data.path_likelihood is not None:
+        gradient_left, gradient_right, at_path_breakpoint = (
+            path_one_sided_gradients_torch(torch_data, phi, eps=float(eps))
+        )
+        gradient_lower = torch.minimum(gradient_left, gradient_right)
+        gradient_upper = torch.maximum(gradient_left, gradient_right)
+        # A Clarke interval containing zero does not rule out a downward kink,
+        # which admits a one-sided descent direction. Until a full fusion-aware
+        # directional audit is available, keep such points selection-ineligible.
+        downward_kink = path_downward_kink_mask_torch(
+            gradient_left,
+            gradient_right,
+            at_path_breakpoint,
+            tol=float(tol),
+        )
+        directional_kink_admissible = not bool(torch.any(downward_kink).item())
+        gradient_lower = torch.where(
+            at_path_breakpoint, gradient_lower, certificate_gradient
+        )
+        gradient_upper = torch.where(
+            at_path_breakpoint, gradient_upper, certificate_gradient
+        )
+        certificate_gradient = torch.minimum(
+            torch.maximum(certificate_gradient, gradient_lower),
+            gradient_upper,
+        )
+        if bool(torch.any(at_path_breakpoint).item()):
+            gradient_scope = "clarke_piecewise_observed_objective_subgradient"
+
+    final_refinements = []
+    certificate_needs_final_pass = False
+    for _ in range(4):
+        final_certificate_refinement = refine_graph_fusion_certificate(
+            certificate=certificate,
+            phi=phi,
+            grad_smooth=certificate_gradient,
+            gradient_scope=gradient_scope,
+            graph=tensor_graph,
+            graph_hash=graph_hash,
+            lower=lower,
+            upper=upper,
+            lambda_value=lambda_value,
+            atol=tol,
+            max_iter=int(certificate_options.max_iter),
+            options=(
+                certificate_options
+                if isinstance(certificate, CompressedEdgeCertificate)
+                else None
+            ),
+        )
+        final_refinements.append(final_certificate_refinement)
+        certificate = final_certificate_refinement.certificate
+        certificate_needs_final_pass = False
+        if not bool(torch.any(at_path_breakpoint).item()):
+            break
+        interval_dual = getattr(certificate, "dual", None)
+        if not torch.is_tensor(interval_dual):
+            # A selected endpoint gradient is already a valid member of the
+            # subgradient interval; compressed certificates simply cannot
+            # improve a false negative by alternating the interval choice.
+            break
+        fusion_adjustment = graph_adjoint_edges(
+            interval_dual,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            num_nodes=int(phi.shape[0]),
+        )
+        ideal_gradient = -fusion_adjustment
+        next_gradient = torch.minimum(
+            torch.maximum(ideal_gradient, gradient_lower),
+            gradient_upper,
+        )
+        next_gradient = torch.where(
+            at_path_breakpoint,
+            next_gradient,
+            final_terms.grad,
+        )
+        if torch.allclose(
+            next_gradient,
+            certificate_gradient,
+            rtol=0.0,
+            atol=max(float(tol) * 0.1, 1e-12),
+        ):
+            break
+        certificate_gradient = next_gradient
+        certificate_needs_final_pass = True
+
+    if certificate_needs_final_pass:
+        final_certificate_refinement = refine_graph_fusion_certificate(
+            certificate=certificate,
+            phi=phi,
+            grad_smooth=certificate_gradient,
+            gradient_scope=gradient_scope,
+            graph=tensor_graph,
+            graph_hash=graph_hash,
+            lower=lower,
+            upper=upper,
+            lambda_value=lambda_value,
+            atol=tol,
+            max_iter=int(certificate_options.max_iter),
+            options=(
+                certificate_options
+                if isinstance(certificate, CompressedEdgeCertificate)
+                else None
+            ),
+        )
+        final_refinements.append(final_certificate_refinement)
+
+    for refinement in final_refinements:
+        workset_iterations += int(refinement.work_counters.workset_iterations)
+        workset_expansions += int(refinement.work_counters.workset_expansions)
+        streamed_edge_passes += int(refinement.work_counters.streamed_edge_passes)
+        certificate_iterations += int(refinement.work_counters.certificate_iterations)
+        activity_passes += int(refinement.work_counters.activity_passes)
+        analytic_adjoint_passes += int(refinement.work_counters.analytic_adjoint_passes)
+        column_scan_passes += int(refinement.work_counters.column_scan_passes)
+        full_certificate_audit_passes += int(
+            refinement.work_counters.full_certificate_audit_passes
+        )
     certificate = final_certificate_refinement.certificate
     final_outer_diag = final_certificate_refinement.diagnostics.as_dict()
     final_dual = getattr(certificate, "dual", None)
@@ -2325,11 +2676,13 @@ def _fit_from_start(
         and converged_outer
         and valid_dual_certificate
         and mm_consistency_violations == 0
+        and directional_kink_admissible
     )
     full_kkt_certified = bool(
         np.isfinite(float(final_outer_diag["kkt_residual"]))
         and converged_outer
         and valid_dual_certificate
+        and directional_kink_admissible
     )
     exactness_provenance = ExactFusionProvenance(
         schema_version=1,
@@ -2342,7 +2695,7 @@ def _fit_from_start(
             lambda_value=lambda_value,
         ),
         certificate_scope="full_original_graph",
-        gradient_scope="observed_objective",
+        gradient_scope=str(gradient_scope),
         full_kkt_certified=full_kkt_certified,
         status=str(outer_kkt_certificate_status),
         residual=float(final_outer_diag["kkt_residual"]),
@@ -2394,6 +2747,16 @@ def _fit_from_start(
 
     phi_np = phi.detach().cpu().numpy()
     gamma_np = gamma_major.detach().cpu().numpy()
+    path_posterior_np = (
+        None
+        if final_terms.path_posterior is None
+        else final_terms.path_posterior.detach().cpu().numpy()
+    )
+    likelihood_model_id = (
+        "clipp2_legacy_major_minor_v1"
+        if torch_data.path_likelihood is None
+        else str(torch_data.path_likelihood.model_id)
+    )
     effective_summary_tol = (
         max(10.0 * float(tol), 1e-4)
         if summary_tol is None
@@ -2438,9 +2801,21 @@ def _fit_from_start(
         phi_clustered = phi_np.astype(phi_np.dtype, copy=False)
         summary_loglik = float("nan")
 
-    major_probability, major_call, multiplicity_call = _multiplicity_calls(
-        data, gamma_np, phi_np.dtype
-    )
+    if torch_data.path_likelihood is None:
+        major_probability, major_call, multiplicity_call = _multiplicity_calls(
+            data, gamma_np, phi_np.dtype
+        )
+        multiplicity_estimated_mask = data.multiplicity_estimation_mask.astype(
+            bool, copy=False
+        )
+    else:
+        # These binary compatibility fields do not have a valid interpretation
+        # for a categorical occupancy-path model.  Path-specific posterior
+        # fields below are the source of truth.
+        major_probability = np.full_like(phi_np, np.nan, dtype=phi_np.dtype)
+        major_call = np.zeros_like(phi_np, dtype=bool)
+        multiplicity_call = np.full_like(phi_np, np.nan, dtype=phi_np.dtype)
+        multiplicity_estimated_mask = np.zeros_like(phi_np, dtype=bool)
     if isinstance(certificate, CompressedEdgeCertificate):
         quotient_dual = (
             warm_state.quotient_dual
@@ -2512,6 +2887,11 @@ def _fit_from_start(
         inner_solver=str(inner_solver),
         certificate=certificate,
         exactness_provenance=exactness_provenance,
+        path_posterior=(
+            None
+            if final_terms.path_posterior is None
+            else final_terms.path_posterior.detach()
+        ),
     )
 
     return FusionFitArtifacts(
@@ -2526,9 +2906,7 @@ def _fit_from_start(
         major_probability=major_probability.astype(phi_np.dtype, copy=False),
         major_call=major_call.astype(bool, copy=False),
         multiplicity_call=multiplicity_call.astype(phi_np.dtype, copy=False),
-        multiplicity_estimated_mask=data.multiplicity_estimation_mask.astype(
-            bool, copy=False
-        ),
+        multiplicity_estimated_mask=multiplicity_estimated_mask,
         loglik=float(-fit_loss),
         summary_loglik=summary_loglik,
         penalized_objective=float(objective),
@@ -2628,6 +3006,8 @@ def _fit_from_start(
         inner_solver=str(inner_solver),
         certificate=certificate,
         exactness_provenance=exactness_provenance,
+        path_posterior=path_posterior_np,
+        likelihood_model_id=likelihood_model_id,
     )
 
 
@@ -2639,7 +3019,7 @@ def fit_torch(
     state: SolverState | None = None,
     outer_max_iter: int = 8,
     inner_max_iter: int = 30,
-    tol: float = 1e-4,
+    tol: float = DEFAULT_OPTIMIZATION_TOLERANCE,
     summary_tol: float | None = None,
     start_mode: str = "warm_only",
     verbose: bool = False,
@@ -2713,7 +3093,8 @@ def fit_observed_data_pairwise_fusion(
 ) -> FusionFitArtifacts:
     tol = _validate_solver_tolerance(tol)
     lambda_value = validate_lambda_value(lambda_value)
-    objective_shape = _normalize_objective_shape(objective_shape)
+    objective_shape = objective_shape_for_data(data, objective_shape)
+    major_prior = _effective_major_prior(data, major_prior)
     normalized_fallback_policy = normalize_dense_fallback_policy(dense_fallback_policy)
     if solver_context is None:
         solver_context = prepare_torch_problem_with_resource_policy(
@@ -2769,10 +3150,23 @@ def fit_observed_data_pairwise_fusion(
         if scalar_well_starts is None
         else tuple(scalar_well_starts)
     )
+    if (
+        uses_explicit_path_likelihood(data)
+        and not effective_scalar_well_starts
+        and solver_context.scalar_well_starts
+    ):
+        # Callers historically used an explicit empty sequence to suppress the
+        # legacy secondary start.  A categorical path objective is genuinely
+        # multimodal, so retain the path-aware bank already cached in context.
+        effective_scalar_well_starts = solver_context.scalar_well_starts
 
     normalized_start_mode = str(start_mode).strip().lower()
     if normalized_start_mode not in {"full", "warm_plus_pilot", "warm_only"}:
         raise ValueError(f"Unknown start_mode: {start_mode}")
+    if uses_explicit_path_likelihood(data):
+        # Every production/retry path must retain the nonconvex start bank.
+        # Warm states remain useful and are simply included as an extra start.
+        normalized_start_mode = "full"
 
     if objective_shape.startswith("unimodal"):
         start_bank = [phi_start] if phi_start is not None else [effective_exact_pilot]
@@ -3138,14 +3532,7 @@ def fit_observed_data_pairwise_fusion(
         if best_artifacts is None:
             best_artifacts = artifacts
             continue
-        if artifacts.converged and not best_artifacts.converged:
-            best_artifacts = artifacts
-            continue
-        if (
-            artifacts.converged == best_artifacts.converged
-            and artifacts.penalized_objective
-            < best_artifacts.penalized_objective - 1e-8
-        ):
+        if _prefer_multistart_fit(artifacts, best_artifacts):
             best_artifacts = artifacts
 
     if best_artifacts is None:

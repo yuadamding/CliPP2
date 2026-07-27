@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 from .core.bic import LAMBDA_GRID_MODES
@@ -13,6 +14,7 @@ from .core.fusion.defaults import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
     DEFAULT_INNER_BACKEND,
+    DEFAULT_OPTIMIZATION_TOLERANCE,
     DEFAULT_WORKSET_ADD_BATCH,
     DEFAULT_WORKSET_MAX_BYTES,
     DEFAULT_WORKSET_MAX_EXPANSIONS,
@@ -22,11 +24,18 @@ from .core.fusion.defaults import (
     normalize_inner_backend,
 )
 from .core.model import FitOptions
-from .model_selection.config import DEFAULT_SELECTION_SCORE, SELECTION_SCORE_NAMES
-from .runners.pipeline import process_one_file, run_directory
-
-
-DEFAULT_LAMBDA_GRID_MODE = "partition_guided_admm"
+from .io.tumor_input import DEFAULT_DOSAGE_PRIOR_PENALTY
+from .model_selection.config import (
+    DEFAULT_LAMBDA_GRID_MODE,
+    DEFAULT_SELECTION_SCORE,
+    SELECTION_SCORE_NAMES,
+)
+from .runners.pipeline import process_tumor, run_cohort
+from .simulation import simulate_tumor
+from .simulation.cli import (
+    add_simulation_arguments,
+    tumor_simulation_config_from_args,
+)
 
 
 def _parse_lambda_grid(value: str | None) -> list[float] | None:
@@ -75,7 +84,10 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         help="Maximum inner convex-solver iterations.",
     )
     parser.add_argument(
-        "--tol", type=float, default=1e-4, help="Optimization tolerance."
+        "--tol",
+        type=float,
+        default=DEFAULT_OPTIMIZATION_TOLERANCE,
+        help="Optimization tolerance.",
     )
     parser.add_argument(
         "--summary-tol",
@@ -199,12 +211,6 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--missing-cna-policy",
-        choices=["error", "all_true"],
-        default="error",
-        help="Behavior when neither has_cna nor cna_observed is present in an input TSV.",
-    )
-    parser.add_argument(
         "--verbose", action="store_true", help="Print optimizer progress."
     )
 
@@ -212,10 +218,32 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument(
-        "--input-dir",
-        help="Directory with per-tumor TSV files.",
+        "--cohort-dir",
+        help="Directory whose immediate child directories are CliPP2 tumors.",
     )
-    inputs.add_argument("--input-file", help="Single tumor TSV file.")
+    inputs.add_argument(
+        "--tumor-dir",
+        help="One directory in CliPP2's required tumor input format.",
+    )
+    parser.add_argument(
+        "--unsupported-policy",
+        choices=["error", "mask"],
+        default="error",
+        help=(
+            "Fail on local copy-number mixtures outside the one/two-state model, "
+            "or mask those mutation-sample count likelihoods with reason codes."
+        ),
+    )
+    parser.add_argument(
+        "--dosage-prior-penalty",
+        type=float,
+        default=DEFAULT_DOSAGE_PRIOR_PENALTY,
+        help=(
+            "Fixed phi-independent penalty alpha on endpoint mutant-copy mass: "
+            "path weight is exp(-alpha * max(M_path(1)-1, 0)); the calibrated "
+            f"default is {DEFAULT_DOSAGE_PRIOR_PENALTY:g}."
+        ),
+    )
     parser.add_argument("--outdir", default="clipp2_results", help="Output directory.")
     parser.add_argument(
         "--simulation-root",
@@ -236,10 +264,10 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         help="Process-level parallelism for directory runs.",
     )
     parser.add_argument(
-        "--max-files",
+        "--max-tumors",
         type=int,
         default=None,
-        help="Optional cap on the number of files processed.",
+        help="Optional cap on the number of tumors processed.",
     )
 
 
@@ -247,19 +275,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipp2",
         description=(
-            "CliPP2 objective-faithful observed-data pairwise fusion. Production "
-            "defaults use CUDA, float64, dense device-only fusion, "
-            "partition-guided ADMM, and partition ICL."
+            "CliPP2 canonical simulation and objective-faithful observed-data "
+            "pairwise fusion. Production fitting defaults use CUDA, float64, "
+            "dense device-only fusion, partition-guided ADMM, and partition ICL."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     fit_parser = subparsers.add_parser(
         "fit",
-        help="Fit TSV files with certified partition-ICL model selection.",
+        help="Fit tumor directories with certified partition-ICL model selection.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     _add_fit_args(fit_parser)
+    simulate_parser = subparsers.add_parser(
+        "simulate",
+        help="Generate one canonical tumor with hidden benchmark truth.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_simulation_arguments(simulate_parser)
     return parser
 
 
@@ -270,6 +304,12 @@ def _validate_fit_args(
         lambda_grid = _parse_lambda_grid(args.lambda_grid)
     except ValueError as exc:
         parser.error(f"invalid --lambda-grid: {exc}")
+
+    prior_penalty = float(args.dosage_prior_penalty)
+    if not math.isfinite(prior_penalty) or prior_penalty < 0.0:
+        parser.error("--dosage-prior-penalty must be finite and nonnegative")
+    if args.tumor_dir and args.max_tumors is not None:
+        parser.error("--max-tumors is valid only with --cohort-dir")
 
     if args.lambda_grid_mode != DEFAULT_LAMBDA_GRID_MODE:
         return
@@ -288,7 +328,8 @@ def _validate_fit_args(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
-    _validate_fit_args(parser, args)
+    if args.command == "fit":
+        _validate_fit_args(parser, args)
     return args
 
 
@@ -324,9 +365,9 @@ def _run_fit(args: argparse.Namespace) -> None:
     fit_options = _fit_options_from_args(args)
     lambda_grid = _parse_lambda_grid(args.lambda_grid)
 
-    if args.input_file:
-        summary = process_one_file(
-            file_path=Path(args.input_file),
+    if args.tumor_dir:
+        summary = process_tumor(
+            tumor_dir=Path(args.tumor_dir),
             outdir=Path(args.outdir),
             simulation_root=Path(args.simulation_root)
             if args.simulation_root
@@ -340,34 +381,44 @@ def _run_fit(args: argparse.Namespace) -> None:
             use_warm_starts=not args.disable_warm_start,
             write_outputs=not args.skip_outputs,
             graph_file=Path(args.graph_file) if args.graph_file else None,
-            missing_cna_policy=args.missing_cna_policy,
+            unsupported_policy=args.unsupported_policy,
+            dosage_prior_penalty=args.dosage_prior_penalty,
         )
         print(summary)
         return
 
-    summary_df = run_directory(
-        input_dir=Path(args.input_dir),
+    summary_df = run_cohort(
+        cohort_dir=Path(args.cohort_dir),
         outdir=Path(args.outdir),
         simulation_root=Path(args.simulation_root) if args.simulation_root else None,
         lambda_grid=lambda_grid,
         lambda_grid_mode=args.lambda_grid_mode,
         fit_options=fit_options,
-        max_files=args.max_files,
+        max_tumors=args.max_tumors,
         bic_df_scale=args.bic_df_scale,
         bic_cluster_penalty=args.bic_cluster_penalty,
         selection_score=args.selection_score,
         use_warm_starts=not args.disable_warm_start,
         write_outputs=not args.skip_outputs,
         graph_file=Path(args.graph_file) if args.graph_file else None,
-        missing_cna_policy=args.missing_cna_policy,
+        unsupported_policy=args.unsupported_policy,
+        dosage_prior_penalty=args.dosage_prior_penalty,
         workers=args.workers,
     )
     print(summary_df.head().to_string(index=False))
 
 
+def _run_simulate(args: argparse.Namespace) -> None:
+    output_dir = simulate_tumor(tumor_simulation_config_from_args(args))
+    print(output_dir)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    _run_fit(args)
+    if args.command == "fit":
+        _run_fit(args)
+        return
+    _run_simulate(args)
 
 
 __all__ = ["build_parser", "main", "parse_args"]

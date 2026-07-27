@@ -5,13 +5,205 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from ..core.fusion.path_summary import (
+    DEFAULT_AMPLIFIED_MUTANT_COPY_TOL,
+    path_posterior_at_phi_numpy,
+    summarize_path_posterior_numpy,
+)
 from ..core.model import FitResult
 from ..io.data import TumorData
 from ..metrics.evaluation import SimulationEvaluation
 
 
+_ORDERED_CN_OCCUPANCY_SEMANTICS = "ordered_extreme_cn_state_occupancy_v1"
+_AMPLIFIED_MUTANT_COPY_TOL = DEFAULT_AMPLIFIED_MUTANT_COPY_TOL
+
+
 def _display_region_label(label: str) -> str:
-    return str(label).replace("sample", "region")
+    return str(label)
+
+
+def _path_supported_mask(
+    data: TumorData,
+    shape: tuple[int, int],
+) -> np.ndarray:
+    reasons = getattr(data, "path_unsupported_reason", None)
+    if reasons is None:
+        return np.ones(shape, dtype=bool)
+    reason_array = np.asarray(reasons, dtype=object)
+    if tuple(reason_array.shape) != tuple(shape):
+        raise ValueError(
+            "TumorData.path_unsupported_reason shape does not match "
+            f"mutation-region observations: {reason_array.shape} != {shape}."
+        )
+    supported = np.asarray(pd.isna(reason_array), dtype=bool)
+    count_observed = getattr(data, "count_observed", None)
+    observed = (
+        np.ones(shape, dtype=bool)
+        if count_observed is None
+        else np.asarray(count_observed, dtype=bool)
+    )
+    if tuple(observed.shape) != tuple(shape):
+        raise ValueError(
+            "TumorData.count_observed shape does not match mutation-region "
+            f"observations: {observed.shape} != {shape}."
+        )
+    if np.any((~supported) & observed):
+        raise ValueError(
+            "Every path_unsupported_reason must correspond to count_observed=False."
+        )
+    return supported
+
+
+def _path_summary_arrays(
+    data: TumorData,
+    fit: FitResult,
+    *,
+    phi_values: np.ndarray | None = None,
+    posterior_values: np.ndarray | None = None,
+) -> dict[str, np.ndarray] | None:
+    spec = getattr(data, "path_likelihood", None)
+    posterior = (
+        getattr(fit, "path_posterior", None)
+        if posterior_values is None
+        else posterior_values
+    )
+    if spec is None or posterior is None:
+        return None
+    supported = _path_supported_mask(data, spec.shape[:2])
+    phi = (
+        np.asarray(fit.phi, dtype=np.float64)
+        if phi_values is None
+        else np.asarray(phi_values, dtype=np.float64)
+    )
+    return summarize_path_posterior_numpy(
+        spec,
+        phi=phi,
+        posterior=np.asarray(posterior, dtype=np.float64),
+        supported=supported,
+    )
+
+
+def _summary_ccf_path_arrays(
+    data: TumorData,
+    fit: FitResult,
+) -> dict[str, np.ndarray] | None:
+    if (
+        getattr(data, "path_likelihood", None) is None
+        or getattr(fit, "path_posterior", None) is None
+    ):
+        return None
+    summary_phi = np.asarray(fit.phi_clustered, dtype=np.float64)
+    summary_posterior = path_posterior_at_phi_numpy(
+        data,
+        summary_phi,
+        eps=float(getattr(fit, "likelihood_eps", 1e-6)),
+    )
+    return _path_summary_arrays(
+        data,
+        fit,
+        phi_values=summary_phi,
+        posterior_values=summary_posterior,
+    )
+
+
+def _ordered_occupancy_summary_arrays(
+    data: TumorData,
+    fit: FitResult,
+    path_summary: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Push canonical-path posterior mass onto reporting-only biological aliases."""
+
+    spec = data.path_likelihood
+    annotations = data.path_annotations
+    if spec is None or annotations is None:
+        raise ValueError("Ordered occupancy reporting requires aligned annotations.")
+
+    shape = spec.shape
+    supported = np.asarray(path_summary["supported"], dtype=bool)
+    posterior = np.asarray(path_summary["posterior"], dtype=np.float64)
+    phi = np.asarray(fit.phi, dtype=np.float64)
+    conditional_single = np.full(shape, np.nan, dtype=np.float64)
+    conditional_multi = np.full(shape, np.nan, dtype=np.float64)
+    conditional_boundary = np.full(shape, np.nan, dtype=np.float64)
+    single = np.full(shape[:2], np.nan, dtype=np.float64)
+    multi = np.full(shape[:2], np.nan, dtype=np.float64)
+    boundary = np.full(shape[:2], np.nan, dtype=np.float64)
+    boundary_tol = 1e-8
+
+    for mutation_index in range(shape[0]):
+        for region_index in range(shape[1]):
+            if not supported[mutation_index, region_index]:
+                continue
+            cell_single = 0.0
+            cell_multi = 0.0
+            cell_boundary = 0.0
+            valid_paths = np.flatnonzero(
+                np.asarray(spec.valid[mutation_index, region_index], dtype=bool)
+            )
+            for path_index in valid_paths:
+                annotation = annotations[mutation_index][region_index][path_index]
+                aliases = () if annotation is None else annotation.aliases
+                if aliases:
+                    alias_switches = np.asarray(
+                        [alias.switch_fraction for alias in aliases],
+                        dtype=np.float64,
+                    )
+                    alias_weights = np.asarray(
+                        [alias.prior_mass for alias in aliases],
+                        dtype=np.float64,
+                    )
+                    alias_weights /= np.sum(alias_weights)
+                    alias_is_clonal = np.asarray(
+                        [alias.mapping_id == "clonal" for alias in aliases],
+                        dtype=bool,
+                    )
+                else:
+                    alias_switches = np.asarray(
+                        [
+                            spec.switch_fraction[
+                                mutation_index, region_index, path_index
+                            ]
+                        ],
+                        dtype=np.float64,
+                    )
+                    alias_weights = np.asarray([1.0], dtype=np.float64)
+                    alias_is_clonal = np.asarray([False], dtype=bool)
+
+                fitted_phi = phi[mutation_index, region_index]
+                is_single = alias_is_clonal | (
+                    fitted_phi < alias_switches - boundary_tol
+                )
+                is_multi = (~alias_is_clonal) & (
+                    fitted_phi > alias_switches + boundary_tol
+                )
+                is_boundary = ~(is_single | is_multi)
+                path_single = float(np.sum(alias_weights * is_single))
+                path_multi = float(np.sum(alias_weights * is_multi))
+                path_boundary = float(np.sum(alias_weights * is_boundary))
+                conditional_single[mutation_index, region_index, path_index] = (
+                    path_single
+                )
+                conditional_multi[mutation_index, region_index, path_index] = path_multi
+                conditional_boundary[mutation_index, region_index, path_index] = (
+                    path_boundary
+                )
+                path_posterior = posterior[mutation_index, region_index, path_index]
+                cell_single += path_posterior * path_single
+                cell_multi += path_posterior * path_multi
+                cell_boundary += path_posterior * path_boundary
+            single[mutation_index, region_index] = cell_single
+            multi[mutation_index, region_index] = cell_multi
+            boundary[mutation_index, region_index] = cell_boundary
+
+    return {
+        "single_probability": single,
+        "multi_probability": multi,
+        "boundary_probability": boundary,
+        "conditional_single_probability": conditional_single,
+        "conditional_multi_probability": conditional_multi,
+        "conditional_boundary_probability": conditional_boundary,
+    }
 
 
 def mutation_output_table(
@@ -90,7 +282,7 @@ def mutation_region_output_table(
         data.num_mutations,
     )
     cluster_labels = np.repeat(fit.cluster_labels + 1, data.num_regions)
-    return pd.DataFrame(
+    table = pd.DataFrame(
         {
             "tumor_id": np.repeat(
                 np.asarray(data.tumor_id, dtype=object), mutation_ids.shape[0]
@@ -115,6 +307,320 @@ def mutation_region_output_table(
             "multiplicity_call": fit.multiplicity_call.reshape(-1),
         }
     )
+    path_spec = getattr(data, "path_likelihood", None)
+    if path_spec is not None:
+        # Binary major/minor multiplicity fields have no defined interpretation
+        # for categorical occupancy paths.  Retain the legacy columns for schema
+        # stability, but never populate them with compatibility placeholders.
+        unavailable_integer = pd.array(
+            [pd.NA] * len(table),
+            dtype="Int64",
+        )
+        table["multiplicity_estimated"] = unavailable_integer
+        table["gamma_major"] = np.nan
+        table["major_call"] = unavailable_integer.copy()
+        table["multiplicity_call"] = np.nan
+
+    path_summary = _path_summary_arrays(data, fit)
+    if path_summary is not None:
+        ordered_occupancy = (
+            getattr(data, "path_reporting_semantics", None)
+            == _ORDERED_CN_OCCUPANCY_SEMANTICS
+        )
+        reporting_fingerprint = getattr(data, "path_reporting_fingerprint", None)
+        table["likelihood_model_id"] = str(fit.likelihood_model_id)
+        if reporting_fingerprint:
+            table["path_reporting_fingerprint"] = str(reporting_fingerprint)
+        map_index = path_summary["map_index"].reshape(-1)
+        table["map_path"] = pd.array(
+            [pd.NA if value < 0 else int(value) + 1 for value in map_index],
+            dtype="Int64",
+        )
+        table["pre_switch_path_probability"] = path_summary[
+            "single_probability"
+        ].reshape(-1)
+        table["post_switch_path_probability"] = path_summary[
+            "multi_probability"
+        ].reshape(-1)
+        if ordered_occupancy:
+            occupancy_summary = _ordered_occupancy_summary_arrays(
+                data, fit, path_summary
+            )
+            table["single_state_occupancy_probability"] = occupancy_summary[
+                "single_probability"
+            ].reshape(-1)
+            table["multi_state_occupancy_probability"] = occupancy_summary[
+                "multi_probability"
+            ].reshape(-1)
+            # This is compatibility with the multi-state portion of an ordered
+            # occupancy path at fitted phi. It is not mutation/CNA timing evidence.
+            table["ordered_path_multi_state_compatibility_probability"] = (
+                occupancy_summary["multi_probability"].reshape(-1)
+            )
+            # Under the declared ordered extreme-occupancy approximation,
+            # carriers in both local CN states are compatible with
+            # pre-divergence acquisition. This remains a compatibility statistic.
+            table["pre_cna_compatibility_probability"] = occupancy_summary[
+                "multi_probability"
+            ].reshape(-1)
+        table["switch_boundary_ambiguity_probability"] = (
+            occupancy_summary["boundary_probability"].reshape(-1)
+            if ordered_occupancy
+            else path_summary["boundary_probability"].reshape(-1)
+        )
+        table["posterior_mutant_copy_mass"] = path_summary[
+            "posterior_mutant_copy_mass"
+        ].reshape(-1)
+        table["posterior_effective_multiplicity"] = path_summary[
+            "posterior_effective_multiplicity"
+        ].reshape(-1)
+        table["map_mutant_copy_mass"] = path_summary["map_mutant_copy_mass"].reshape(-1)
+        table["map_effective_multiplicity"] = path_summary[
+            "map_effective_multiplicity"
+        ].reshape(-1)
+        table["amplified_mutant_copy_probability"] = path_summary[
+            "amplified_mutant_copy_probability"
+        ].reshape(-1)
+        amplified_call = path_summary["amplified_mutant_copy_call"].reshape(-1)
+        table["amplified_mutant_copy_call"] = pd.array(
+            [
+                pd.NA if not np.isfinite(value) else int(value)
+                for value in amplified_call
+            ],
+            dtype="Int64",
+        )
+        table["path_entropy"] = path_summary["path_entropy"].reshape(-1)
+        summary_path = _summary_ccf_path_arrays(data, fit)
+        if summary_path is not None:
+            summary_map_index = summary_path["map_index"].reshape(-1)
+            table["summary_map_path"] = pd.array(
+                [pd.NA if value < 0 else int(value) + 1 for value in summary_map_index],
+                dtype="Int64",
+            )
+            table["summary_pre_switch_path_probability"] = summary_path[
+                "single_probability"
+            ].reshape(-1)
+            table["summary_post_switch_path_probability"] = summary_path[
+                "multi_probability"
+            ].reshape(-1)
+            table["summary_switch_boundary_ambiguity_probability"] = summary_path[
+                "boundary_probability"
+            ].reshape(-1)
+            table["summary_posterior_mutant_copy_mass"] = summary_path[
+                "posterior_mutant_copy_mass"
+            ].reshape(-1)
+            table["summary_posterior_effective_multiplicity"] = summary_path[
+                "posterior_effective_multiplicity"
+            ].reshape(-1)
+            table["summary_map_mutant_copy_mass"] = summary_path[
+                "map_mutant_copy_mass"
+            ].reshape(-1)
+            table["summary_map_effective_multiplicity"] = summary_path[
+                "map_effective_multiplicity"
+            ].reshape(-1)
+            table["summary_amplified_mutant_copy_probability"] = summary_path[
+                "amplified_mutant_copy_probability"
+            ].reshape(-1)
+            summary_amplified_call = summary_path["amplified_mutant_copy_call"].reshape(
+                -1
+            )
+            table["summary_amplified_mutant_copy_call"] = pd.array(
+                [
+                    pd.NA if not np.isfinite(value) else int(value)
+                    for value in summary_amplified_call
+                ],
+                dtype="Int64",
+            )
+            table["summary_path_entropy"] = summary_path["path_entropy"].reshape(-1)
+        unsupported = getattr(data, "path_unsupported_reason", None)
+        if unsupported is not None:
+            reason = np.asarray(unsupported, dtype=object).reshape(-1)
+            supported = path_summary["supported"].reshape(-1)
+            table["path_supported"] = supported.astype(int)
+            table["path_unsupported_reason"] = pd.array(
+                np.where(supported, None, reason),
+                dtype="string",
+            )
+    return table
+
+
+def path_posterior_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame:
+    """Return one row per supported, valid mutation-region occupancy path."""
+
+    spec = getattr(data, "path_likelihood", None)
+    summary = _path_summary_arrays(data, fit)
+    if spec is None or summary is None:
+        return pd.DataFrame()
+    summary_ccf = _summary_ccf_path_arrays(data, fit)
+    if summary_ccf is None:
+        raise ValueError("Path data must have a summary-CCF path posterior.")
+
+    supported = _path_supported_mask(data, spec.shape[:2])
+    reportable = np.asarray(spec.valid, dtype=bool) & supported[..., None]
+    valid_indices = np.argwhere(reportable)
+    if valid_indices.size == 0:
+        return pd.DataFrame()
+    mutation_idx = valid_indices[:, 0]
+    region_idx = valid_indices[:, 1]
+    path_idx = valid_indices[:, 2]
+    posterior = summary["posterior"][mutation_idx, region_idx, path_idx]
+    phi = np.asarray(fit.phi, dtype=np.float64)[mutation_idx, region_idx]
+    summary_phi = np.asarray(fit.phi_clustered, dtype=np.float64)[
+        mutation_idx, region_idx
+    ]
+    switch = np.asarray(spec.switch_fraction)[mutation_idx, region_idx, path_idx]
+    boundary_tol = 1e-8
+    path_segment = np.where(
+        phi < switch - boundary_tol,
+        "first_linear_segment_at_fitted_phi",
+        np.where(
+            phi > switch + boundary_tol,
+            "second_linear_segment_at_fitted_phi",
+            "switch_boundary_at_fitted_phi",
+        ),
+    )
+    table = pd.DataFrame(
+        {
+            "tumor_id": data.tumor_id,
+            "mutation_id": np.asarray(data.mutation_ids, dtype=object)[mutation_idx],
+            "region_id": np.asarray(
+                [_display_region_label(value) for value in data.region_ids],
+                dtype=object,
+            )[region_idx],
+            "likelihood_model_id": str(spec.model_id),
+            "likelihood_model_version": str(spec.model_version),
+            "candidate_generator_version": str(spec.candidate_generator_version),
+            "path_prior_mode": str(spec.prior_mode),
+            "path_reporting_fingerprint": str(
+                getattr(data, "path_reporting_fingerprint", None) or ""
+            ),
+            "path_scope": "region_local",
+            "path_index": path_idx + 1,
+            "path_probability": posterior,
+            "map_path": (
+                summary["map_index"][mutation_idx, region_idx] == path_idx
+            ).astype(int),
+            "summary_phi": summary_phi,
+            "summary_path_probability": summary_ccf["posterior"][
+                mutation_idx, region_idx, path_idx
+            ],
+            "summary_map_path": (
+                summary_ccf["map_index"][mutation_idx, region_idx] == path_idx
+            ).astype(int),
+            "first_copy": np.asarray(spec.first_copy)[
+                mutation_idx, region_idx, path_idx
+            ],
+            "second_copy": np.asarray(spec.second_copy)[
+                mutation_idx, region_idx, path_idx
+            ],
+            "switch_fraction": switch,
+            "path_prior": np.exp(
+                np.asarray(spec.log_prior)[mutation_idx, region_idx, path_idx]
+            ),
+            "mutant_copy_mass": summary["mass"][mutation_idx, region_idx, path_idx],
+            "effective_multiplicity": np.divide(
+                summary["mass"][mutation_idx, region_idx, path_idx],
+                phi,
+                out=np.full_like(phi, np.nan, dtype=np.float64),
+                where=phi > 0.0,
+            ),
+            "amplified_mutant_copy": (
+                summary["mass"][mutation_idx, region_idx, path_idx]
+                > phi + _AMPLIFIED_MUTANT_COPY_TOL
+            ).astype(int),
+            "path_segment_at_fitted_phi": path_segment,
+            "summary_mutant_copy_mass": summary_ccf["mass"][
+                mutation_idx, region_idx, path_idx
+            ],
+            "summary_effective_multiplicity": np.divide(
+                summary_ccf["mass"][mutation_idx, region_idx, path_idx],
+                summary_phi,
+                out=np.full_like(summary_phi, np.nan, dtype=np.float64),
+                where=summary_phi > 0.0,
+            ),
+            "summary_amplified_mutant_copy": (
+                summary_ccf["mass"][mutation_idx, region_idx, path_idx]
+                > summary_phi + _AMPLIFIED_MUTANT_COPY_TOL
+            ).astype(int),
+            "summary_path_segment_at_clustered_phi": np.where(
+                summary_phi < switch - boundary_tol,
+                "first_linear_segment_at_clustered_phi",
+                np.where(
+                    summary_phi > switch + boundary_tol,
+                    "second_linear_segment_at_clustered_phi",
+                    "switch_boundary_at_clustered_phi",
+                ),
+            ),
+        }
+    )
+    if (
+        getattr(data, "path_reporting_semantics", None)
+        == _ORDERED_CN_OCCUPANCY_SEMANTICS
+    ):
+        occupancy_summary = _ordered_occupancy_summary_arrays(data, fit, summary)
+        conditional_single = occupancy_summary["conditional_single_probability"][
+            mutation_idx, region_idx, path_idx
+        ]
+        conditional_multi = occupancy_summary["conditional_multi_probability"][
+            mutation_idx, region_idx, path_idx
+        ]
+        conditional_boundary = occupancy_summary["conditional_boundary_probability"][
+            mutation_idx, region_idx, path_idx
+        ]
+        table["single_state_occupancy_probability_given_path"] = conditional_single
+        table["multi_state_occupancy_probability_given_path"] = conditional_multi
+        table["switch_boundary_probability_given_path"] = conditional_boundary
+        table["occupancy_interpretation"] = np.select(
+            (
+                conditional_single >= 1.0 - 1e-12,
+                conditional_multi >= 1.0 - 1e-12,
+                conditional_boundary >= 1.0 - 1e-12,
+            ),
+            (
+                "ordered_path_single_state_occupancy_at_fitted_phi",
+                "ordered_path_multi_state_occupancy_at_fitted_phi",
+                "ordered_path_switch_boundary_at_fitted_phi",
+            ),
+            default="ordered_path_alias_mixed_occupancy_at_fitted_phi",
+        )
+    annotations = getattr(data, "path_annotations", None)
+    if annotations is not None and hasattr(annotations, "columns_for_indices"):
+        for name, values in annotations.columns_for_indices(valid_indices).items():
+            table[str(name)] = values
+    elif annotations is not None:
+        aligned_paths = [
+            annotations[int(mutation)][int(region)][int(path)]
+            for mutation, region, path in valid_indices
+        ]
+
+        def alias_values(path, attribute: str) -> list[str]:
+            if path is None:
+                return []
+            return sorted(
+                {
+                    str(getattr(alias, attribute))
+                    for alias in getattr(path, "aliases", ())
+                }
+            )
+
+        table["biological_duplicate_count"] = [
+            0 if path is None else int(path.biological_duplicate_count)
+            for path in aligned_paths
+        ]
+        for column, attribute in (
+            ("homolog_mapping_aliases", "mapping_id"),
+            ("homolog_aliases", "homolog_id"),
+            ("first_state_aliases", "first_state"),
+            ("state1_allele_aliases", "state1_allele"),
+            ("state2_allele_aliases", "state2_allele"),
+            ("copy_relation_aliases", "copy_relation"),
+            ("state1_dosage_aliases", "q1"),
+            ("state2_dosage_aliases", "q2"),
+        ):
+            table[column] = [
+                ";".join(alias_values(path, attribute)) for path in aligned_paths
+            ]
+    return table
 
 
 def evaluation_to_frame(evaluation: SimulationEvaluation) -> pd.DataFrame:
@@ -129,6 +635,29 @@ def evaluation_to_frame(evaluation: SimulationEvaluation) -> pd.DataFrame:
                 "multiplicity_f1": evaluation.multiplicity_f1,
                 "multiplicity_asymmetric_f1": evaluation.multiplicity_asymmetric_f1,
                 "multiplicity_estimable_f1": evaluation.multiplicity_estimable_f1,
+                "effective_multiplicity_rmse": evaluation.effective_multiplicity_rmse,
+                "raw_effective_multiplicity_rmse": (
+                    evaluation.raw_effective_multiplicity_rmse
+                ),
+                "summary_effective_multiplicity_rmse": (
+                    evaluation.summary_effective_multiplicity_rmse
+                ),
+                "amplified_mutant_copy_f1": evaluation.amplified_mutant_copy_f1,
+                "raw_amplified_mutant_copy_f1": (
+                    evaluation.raw_amplified_mutant_copy_f1
+                ),
+                "summary_amplified_mutant_copy_f1": (
+                    evaluation.summary_amplified_mutant_copy_f1
+                ),
+                "n_effective_multiplicity_cells": (
+                    evaluation.n_effective_multiplicity_cells
+                ),
+                "n_amplified_mutant_copy_cells": (
+                    evaluation.n_amplified_mutant_copy_cells
+                ),
+                "n_true_amplified_mutant_copy_cells": (
+                    evaluation.n_true_amplified_mutant_copy_cells
+                ),
                 "estimated_clonal_fraction": evaluation.estimated_clonal_fraction,
                 "true_clonal_fraction": evaluation.true_clonal_fraction,
                 "clonal_fraction_error": evaluation.clonal_fraction_error,
@@ -169,6 +698,13 @@ def write_fit_outputs(
         sep="\t",
         index=False,
     )
+    path_table = path_posterior_output_table(data, fit)
+    if not path_table.empty:
+        path_table.to_csv(
+            outdir / f"{data.tumor_id}_mutation_region_path_posterior.tsv",
+            sep="\t",
+            index=False,
+        )
     search_df.to_csv(
         outdir / f"{data.tumor_id}_lambda_search.tsv",
         sep="\t",
@@ -193,5 +729,6 @@ __all__ = [
     "cluster_output_table",
     "evaluation_to_frame",
     "mutation_output_table",
+    "path_posterior_output_table",
     "write_fit_outputs",
 ]

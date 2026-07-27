@@ -25,8 +25,11 @@ from ..core.fusion.partition_starts import (
 )
 from ..core.fusion.refit import PartitionRefitResult
 from ..core.fusion.solver import (
+    escape_path_breakpoint_solver_state,
+    objective_shape_for_data,
     prepare_torch_problem_with_resource_policy,
     torch_data_from_context,
+    uses_nonconvex_path_likelihood,
 )
 from ..core.fusion.torch_backend import dtype_name
 from ..core.fusion.types import (
@@ -127,6 +130,21 @@ from ..model_selection.types import (
     SimulationDiagnostics,
     StartArray,
 )
+
+
+class NoEligibleModelSelectionCandidatesError(RuntimeError):
+    """Model selection failed after every annotated candidate was rejected."""
+
+    tumor_id: str
+    search_df: pd.DataFrame
+
+    def __init__(self, tumor_id: str, search_df: pd.DataFrame) -> None:
+        self.tumor_id = str(tumor_id)
+        self.search_df = search_df.copy()
+        super().__init__(
+            f"No candidates were eligible for model selection for tumor "
+            f"{self.tumor_id}."
+        )
 
 
 def _hash_array(hasher: "hashlib._Hash", array: np.ndarray) -> None:
@@ -308,6 +326,31 @@ def _offload_solver_state_to_cpu(state: SolverState | None) -> SolverState | Non
     )
 
 
+def _escape_path_breakpoint_retry_state(
+    state: SolverState | None,
+    *,
+    start_source: str,
+    start_lambda: float,
+    target_lambda: float,
+    context: SolverContext,
+    tol: float,
+) -> tuple[SolverState | None, int]:
+    same_lambda_failure = start_source in {
+        "same_lambda_retry",
+        "best_same_lambda_kkt_state",
+    } and _canonical_lambda(start_lambda) == _canonical_lambda(target_lambda)
+    if state is None or not same_lambda_failure:
+        return state, 0
+    return escape_path_breakpoint_solver_state(state, context=context, tol=tol)
+
+
+def _skip_terminal_solver_recovery(data: TumorData, proposal_phase: str) -> bool:
+    return bool(
+        str(proposal_phase) == "solver_recovery"
+        and uses_nonconvex_path_likelihood(data)
+    )
+
+
 def _build_guided_initialization_with_resource_policy(
     *,
     data: TumorData,
@@ -388,7 +431,7 @@ def _build_guided_initialization_with_resource_policy(
                 adaptive_weight_baseline=float(fit_options.adaptive_weight_baseline),
                 exact_pilot=cpu_guide_phi,
                 pooled_start=cpu_guide_phi,
-                scalar_well_starts=(),
+                scalar_well_starts=solver_context.scalar_well_starts,
                 device="cpu",
                 dtype=dtype_name(solver_context.runtime.dtype),
                 objective_shape=str(fit_options.objective_shape),
@@ -625,8 +668,9 @@ def _assemble_selection_result(
     num_converged_candidates = int(np.sum(converged_mask))
     num_selection_eligible_candidates = int(np.sum(candidate_selection_eligible_mask))
     if num_selection_eligible_candidates == 0:
-        raise RuntimeError(
-            f"No candidates were eligible for model selection for tumor {data.tumor_id}."
+        raise NoEligibleModelSelectionCandidatesError(
+            tumor_id=data.tumor_id,
+            search_df=search_df,
         )
     selection_df = search_df.loc[candidate_selection_eligible_mask].copy()
     converged_ari_df = _ari_candidate_frame(selection_df)
@@ -1016,7 +1060,6 @@ def _partition_guided_admm_selection(
             "partition_guided_admm requires at least two mutations so that a "
             "positive pairwise penalty is solved by ADMM."
         )
-
     prepare_start_time = perf_counter()
     pilot_context = prepare_torch_problem_with_resource_policy(
         data,
@@ -1118,7 +1161,7 @@ def _partition_guided_admm_selection(
         adaptive_weight_baseline=float(fit_options.adaptive_weight_baseline),
         exact_pilot=guide_phi,
         pooled_start=guide_phi,
-        scalar_well_starts=(),
+        scalar_well_starts=pilot_context.scalar_well_starts,
         device=fit_options.device,
         dtype=fit_options.dtype,
         runtime=pilot_runtime,
@@ -1200,10 +1243,14 @@ def _partition_guided_admm_selection(
     guide_signature = _partition_signature(np.asarray(guide.labels, dtype=np.int64))
     guide_matrix_hash = _pilot_matrix_hash(guide_phi)
     next_step = 0
+    terminal_stop_reason: str | None = None
 
     while True:
         proposal = controller.propose()
         if proposal is None:
+            break
+        if _skip_terminal_solver_recovery(data, proposal.phase):
+            terminal_stop_reason = "online_lambda_uncertified_exact_fusion_result"
             break
         lambda_key = _canonical_lambda(proposal.lambda_value)
         warm_fit = None
@@ -1268,11 +1315,6 @@ def _partition_guided_admm_selection(
             solver_state_start = guided_initialization.solver_state
             lambda_start_source = "guided_kkt_fallback"
             lambda_start_value = float(guided_initialization.lambda_value)
-        phi_start = _clone_start(
-            solver_state_start.phi
-            if solver_state_start is not None and solver_state_start.phi is not None
-            else guide_phi
-        )
 
         candidate_fit_options = effective_fit_options
         if proposal.phase == "solver_recovery":
@@ -1280,7 +1322,17 @@ def _partition_guided_admm_selection(
                 effective_fit_options,
                 outer_max_iter=max(int(effective_fit_options.outer_max_iter) * 5, 40),
                 inner_max_iter=max(int(effective_fit_options.inner_max_iter) * 5, 150),
-                objective_shape="unimodal_full_step_backtracking",
+                # A tighter inner solve can leave a substantially better
+                # observed-objective primal even though its final certificate
+                # is stricter.  This recovery therefore strengthens rather
+                # than relaxes the KKT gate.
+                tol=max(
+                    0.5 * float(effective_fit_options.tol),
+                    float(np.finfo(np.float64).eps),
+                ),
+                objective_shape=objective_shape_for_data(
+                    data, "unimodal_full_step_backtracking"
+                ),
             )
         elif proposal.retry_number > 0:
             effort_factor = int(proposal.retry_number) + 1
@@ -1294,7 +1346,27 @@ def _partition_guided_admm_selection(
                     int(effective_fit_options.inner_max_iter) * effort_factor,
                     int(effective_fit_options.inner_max_iter),
                 ),
+                tol=max(
+                    0.5 * float(effective_fit_options.tol),
+                    float(np.finfo(np.float64).eps),
+                ),
             )
+
+        solver_state_start, path_breakpoint_escape_changed_count = (
+            _escape_path_breakpoint_retry_state(
+                solver_state_start,
+                start_source=lambda_start_source,
+                start_lambda=lambda_start_value,
+                target_lambda=float(proposal.lambda_value),
+                context=solver_context,
+                tol=float(candidate_fit_options.tol),
+            )
+        )
+        phi_start = _clone_start(
+            solver_state_start.phi
+            if solver_state_start is not None and solver_state_start.phi is not None
+            else guide_phi
+        )
 
         fit, evaluation, row, artifact = _evaluate_candidate(
             data=data,
@@ -1335,6 +1407,12 @@ def _partition_guided_admm_selection(
                 "lambda_retry_number": int(proposal.retry_number),
                 "lambda_start_source": str(lambda_start_source),
                 "lambda_start_value": float(lambda_start_value),
+                "path_breakpoint_escape_applied": bool(
+                    path_breakpoint_escape_changed_count > 0
+                ),
+                "path_breakpoint_escape_changed_count": int(
+                    path_breakpoint_escape_changed_count
+                ),
                 "persistent_solver_state_device": "cpu",
                 "lambda_warm_start_value": np.nan
                 if proposal.warm_start_lambda is None
@@ -1444,7 +1522,11 @@ def _partition_guided_admm_selection(
         .sort_values(["lambda", "selection_step"])
         .reset_index(drop=True)
     )
-    stop_reason = str(controller.stop_reason or "online_lambda_no_terminal_reason")
+    stop_reason = str(
+        terminal_stop_reason
+        or controller.stop_reason
+        or "online_lambda_no_terminal_reason"
+    )
     refinement_rounds = sum(
         1 for proposal in controller.proposal_history if "refine" in str(proposal.phase)
     )
@@ -1481,6 +1563,7 @@ def _grid_search_selection(
     profile_name: str,
     selection_method: str,
     selection_score: str,
+    include_likelihood_partition_candidates: bool | None,
 ) -> BICSelectionResult:
     selection_start_time = perf_counter()
     explicit_lambda_grid = lambda_grid is not None
@@ -1526,7 +1609,11 @@ def _grid_search_selection(
             f"lambda_grid_mode={lambda_search_mode!r} requires an explicit lambda grid."
         )
     lambda_grid = [] if lambda_grid is None else _sorted_unique_lambdas(lambda_grid)
-    likelihood_partition_pool_enabled = bool(ENABLE_LIKELIHOOD_PARTITION_CANDIDATES)
+    likelihood_partition_pool_enabled = (
+        bool(ENABLE_LIKELIHOOD_PARTITION_CANDIDATES)
+        if include_likelihood_partition_candidates is None
+        else bool(include_likelihood_partition_candidates)
+    )
 
     prepare_start_time = perf_counter()
     solver_context = prepare_torch_problem_with_resource_policy(
@@ -2039,8 +2126,17 @@ def select_model(
     use_warm_starts: bool,
     evaluate_all_candidates: bool,
     finalize_selected_fit: bool = True,
+    include_likelihood_partition_candidates: bool | None = None,
 ) -> BICSelectionResult:
     normalized_score = _normalize_selection_score_name(selection_score)
+    effective_objective_shape = objective_shape_for_data(
+        data, str(fit_options.objective_shape)
+    )
+    if effective_objective_shape != str(fit_options.objective_shape):
+        fit_options = replace(
+            fit_options,
+            objective_shape=effective_objective_shape,
+        )
 
     effective_lambda_grid_mode = str(lambda_grid_mode)
     effective_bic_df_scale = float(bic_df_scale)
@@ -2094,12 +2190,16 @@ def select_model(
         profile_name=profile_name,
         selection_method=selection_method,
         selection_score=selection_score,
+        include_likelihood_partition_candidates=(
+            include_likelihood_partition_candidates
+        ),
     )
 
 
 __all__ = [
     "BICSelectionResult",
     "ModelSelectionResult",
+    "NoEligibleModelSelectionCandidatesError",
     "SelectionArtifact",
     "SimulationDiagnostics",
     "select_model",

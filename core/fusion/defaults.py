@@ -10,6 +10,7 @@ DenseFallbackPolicy: TypeAlias = Literal["device_only", "cpu_allowed", "error"]
 
 DEFAULT_DEVICE: Final = "cuda"
 DEFAULT_DTYPE: Final = "float64"
+DEFAULT_OPTIMIZATION_TOLERANCE: Final = 5e-5
 DEFAULT_INNER_BACKEND: Final[InnerBackend] = "dense"
 DEFAULT_DENSE_FALLBACK_POLICY: Final[DenseFallbackPolicy] = "device_only"
 

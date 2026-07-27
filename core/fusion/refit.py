@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
-from ...io.data import TumorData
+from ...io.data import PathLikelihoodSpec, TumorData
 from .starts import (
     _mutation_region_breakpoints,
     _golden_section_minimize,
@@ -94,6 +94,94 @@ def _objective_grid(
     )
 
 
+def _path_objective_grid(
+    values: np.ndarray,
+    *,
+    alt: np.ndarray,
+    total: np.ndarray,
+    scaling: np.ndarray,
+    spec: PathLikelihoodSpec,
+    eps: float,
+) -> np.ndarray:
+    """Vectorized fixed-prior path loss for one cluster-region coordinate."""
+
+    beta = np.asarray(values, dtype=np.float64).reshape(1, -1, 1)
+    alt = np.asarray(alt, dtype=np.float64).reshape(-1, 1, 1)
+    nonalt = np.asarray(total, dtype=np.float64).reshape(-1, 1, 1) - alt
+    scale = np.asarray(scaling, dtype=np.float64).reshape(-1, 1, 1)
+    first = np.asarray(spec.first_copy[:, 0, :], dtype=np.float64)[:, None, :]
+    second = np.asarray(spec.second_copy[:, 0, :], dtype=np.float64)[:, None, :]
+    switch = np.asarray(spec.switch_fraction[:, 0, :], dtype=np.float64)[:, None, :]
+    valid = np.asarray(spec.valid[:, 0, :], dtype=bool)[:, None, :]
+    log_prior = np.asarray(spec.log_prior[:, 0, :], dtype=np.float64)[:, None, :]
+    mass = scale * (
+        first * np.minimum(beta, switch) + second * np.maximum(beta - switch, 0.0)
+    )
+    prob = np.clip(mass, float(eps), 1.0 - float(eps))
+    log_joint = np.where(
+        valid,
+        alt * np.log(prob) + nonalt * np.log1p(-prob) + log_prior,
+        -np.inf,
+    )
+    maximum = np.max(log_joint, axis=-1, keepdims=True)
+    log_normalizer = maximum + np.log(
+        np.sum(np.exp(log_joint - maximum), axis=-1, keepdims=True)
+    )
+    return -np.sum(log_normalizer[..., 0], axis=0)
+
+
+def _path_cluster_region_breakpoints(
+    *,
+    alt: np.ndarray,
+    total: np.ndarray,
+    scaling: np.ndarray,
+    spec: PathLikelihoodSpec,
+    lower: float,
+    upper: float,
+    eps: float,
+) -> np.ndarray:
+    """Switches, inverse-VAF points, and clipping boundaries for path refits."""
+
+    points: list[float] = [float(lower), float(upper)]
+    first = np.asarray(spec.first_copy[:, 0, :], dtype=np.float64)
+    second = np.asarray(spec.second_copy[:, 0, :], dtype=np.float64)
+    switch = np.asarray(spec.switch_fraction[:, 0, :], dtype=np.float64)
+    valid = np.asarray(spec.valid[:, 0, :], dtype=bool)
+    scale = np.asarray(scaling, dtype=np.float64)[:, None]
+    smoothed_vaf = (np.asarray(alt, dtype=np.float64)[:, None] + 0.5) / (
+        np.asarray(total, dtype=np.float64)[:, None] + 1.0
+    )
+
+    def add_mass_inverse(target_mass: np.ndarray) -> None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            left = target_mass / first
+            right = switch + (target_mass - first * switch) / second
+        left_ok = (
+            valid
+            & (first > 0.0)
+            & np.isfinite(left)
+            & (left >= lower)
+            & (left <= np.minimum(switch, upper))
+        )
+        right_ok = (
+            valid
+            & (second > 0.0)
+            & np.isfinite(right)
+            & (right >= np.maximum(switch, lower))
+            & (right <= upper)
+        )
+        points.extend(left[left_ok].tolist())
+        points.extend(right[right_ok].tolist())
+
+    points.extend(switch[valid & (switch >= lower) & (switch <= upper)].tolist())
+    with np.errstate(divide="ignore", invalid="ignore"):
+        add_mass_inverse(smoothed_vaf / scale)
+        add_mass_inverse(np.full_like(first, float(eps)) / scale)
+        add_mass_inverse(np.full_like(first, 1.0 - float(eps)) / scale)
+    result = np.unique(np.round(np.asarray(points, dtype=np.float64), 14))
+    return result[(result >= lower - 1e-12) & (result <= upper + 1e-12)]
+
+
 def _cluster_region_candidate_grid(
     *,
     lower: float,
@@ -141,6 +229,48 @@ def _cluster_region_candidate_grid(
     return np.clip(grid, float(lower), float(upper))
 
 
+def _path_cluster_region_candidate_grid(
+    *,
+    alt: np.ndarray,
+    total: np.ndarray,
+    scaling: np.ndarray,
+    spec: PathLikelihoodSpec,
+    lower: float,
+    upper: float,
+    eps: float,
+    hint: float | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if upper <= lower + 1e-12:
+        point = np.asarray([float(lower)], dtype=np.float64)
+        return point, point
+    hard_breakpoints = _path_cluster_region_breakpoints(
+        alt=alt,
+        total=total,
+        scaling=scaling,
+        spec=spec,
+        lower=float(lower),
+        upper=float(upper),
+        eps=float(eps),
+    )
+    points: list[float] = hard_breakpoints.tolist()
+    if hint is not None and np.isfinite(float(hint)):
+        points.append(float(np.clip(float(hint), lower, upper)))
+    points.extend(
+        np.geomspace(
+            max(float(lower), float(eps)),
+            float(upper),
+            num=129,
+            dtype=np.float64,
+        ).tolist()
+    )
+    points.extend(
+        np.linspace(float(lower), float(upper), num=65, dtype=np.float64).tolist()
+    )
+    grid = np.unique(np.round(np.asarray(points, dtype=np.float64), 14))
+    grid = grid[(grid >= lower - 1e-12) & (grid <= upper + 1e-12)]
+    return np.clip(grid, lower, upper), hard_breakpoints
+
+
 def _refit_cluster_region(
     *,
     alt: np.ndarray,
@@ -156,35 +286,24 @@ def _refit_cluster_region(
     tol: float,
     max_iter: int,
     hint: float | None,
+    path_spec: PathLikelihoodSpec | None = None,
+    path_scaling: np.ndarray | None = None,
 ) -> _RefitCoordinateResult:
     lower = float(lower)
     upper = float(upper)
-    if upper <= lower + 1e-12:
-        loss = float(
-            _objective_grid(
-                np.asarray([lower], dtype=np.float64),
-                alt=alt,
-                total=total,
-                b_minus=b_minus,
-                b_plus=b_plus,
-                b_fixed=b_fixed,
-                ambiguous=ambiguous,
-                major_prior=major_prior,
-                eps=eps,
-            )[0]
-        )
-        return _RefitCoordinateResult(
-            beta=lower,
-            loss=loss,
-            finite_candidate_found=bool(np.isfinite(loss)),
-            grid_points=1,
-            max_grid_spacing=0.0,
-            candidate_basins=1 if np.isfinite(loss) else 0,
-            refined_candidates=0,
-            best_second_loss_gap=float("inf"),
-        )
 
     def objective(values):
+        if path_spec is not None:
+            if path_scaling is None:
+                raise ValueError("path_scaling is required with path_spec.")
+            return _path_objective_grid(
+                values,
+                alt=alt,
+                total=total,
+                scaling=path_scaling,
+                spec=path_spec,
+                eps=eps,
+            )
         return _objective_grid(
             values,
             alt=alt,
@@ -197,16 +316,44 @@ def _refit_cluster_region(
             eps=eps,
         )
 
-    grid = _cluster_region_candidate_grid(
-        lower=lower,
-        upper=upper,
-        b_minus=b_minus,
-        b_plus=b_plus,
-        b_fixed=b_fixed,
-        ambiguous=ambiguous,
-        eps=eps,
-        hint=hint,
-    )
+    if upper <= lower + 1e-12:
+        loss = float(objective(np.asarray([lower], dtype=np.float64))[0])
+        return _RefitCoordinateResult(
+            beta=lower,
+            loss=loss,
+            finite_candidate_found=bool(np.isfinite(loss)),
+            grid_points=1,
+            max_grid_spacing=0.0,
+            candidate_basins=1 if np.isfinite(loss) else 0,
+            refined_candidates=0,
+            best_second_loss_gap=float("inf"),
+        )
+
+    if path_spec is None:
+        grid = _cluster_region_candidate_grid(
+            lower=lower,
+            upper=upper,
+            b_minus=b_minus,
+            b_plus=b_plus,
+            b_fixed=b_fixed,
+            ambiguous=ambiguous,
+            eps=eps,
+            hint=hint,
+        )
+        hard_breakpoints = np.asarray([], dtype=np.float64)
+    else:
+        if path_scaling is None:
+            raise ValueError("path_scaling is required with path_spec.")
+        grid, hard_breakpoints = _path_cluster_region_candidate_grid(
+            alt=alt,
+            total=total,
+            scaling=path_scaling,
+            spec=path_spec,
+            lower=lower,
+            upper=upper,
+            eps=eps,
+            hint=hint,
+        )
     losses = objective(grid)
     finite = np.isfinite(losses)
     max_grid_spacing = float(np.max(np.diff(grid))) if grid.size > 1 else 0.0
@@ -253,23 +400,40 @@ def _refit_cluster_region(
     for idx in selected_indices:
         if np.isfinite(losses[idx]):
             candidate_losses.append(float(losses[idx]))
-        left = float(grid[max(idx - 1, 0)])
-        right = float(grid[min(idx + 1, grid.size - 1)])
-        if right <= left + 1e-12:
-            continue
-        refined_beta, refined_loss = _golden_section_minimize(
-            objective,
-            left=left,
-            right=right,
-            tol=float(tol),
-            max_iter=max(int(max_iter), 32),
+        center = float(grid[idx])
+        is_hard_breakpoint = bool(
+            hard_breakpoints.size
+            and np.any(np.isclose(center, hard_breakpoints, rtol=0.0, atol=1e-12))
         )
-        refined_candidates += 1
-        if np.isfinite(refined_loss):
-            candidate_losses.append(float(refined_loss))
-        if np.isfinite(refined_loss) and refined_loss < best_loss:
-            best_beta = float(refined_beta)
-            best_loss = float(refined_loss)
+        intervals = (
+            [
+                (float(grid[max(idx - 1, 0)]), center),
+                (center, float(grid[min(idx + 1, grid.size - 1)])),
+            ]
+            if is_hard_breakpoint
+            else [
+                (
+                    float(grid[max(idx - 1, 0)]),
+                    float(grid[min(idx + 1, grid.size - 1)]),
+                )
+            ]
+        )
+        for left, right in intervals:
+            if right <= left + 1e-12:
+                continue
+            refined_beta, refined_loss = _golden_section_minimize(
+                objective,
+                left=left,
+                right=right,
+                tol=float(tol),
+                max_iter=max(int(max_iter), 32),
+            )
+            refined_candidates += 1
+            if np.isfinite(refined_loss):
+                candidate_losses.append(float(refined_loss))
+            if np.isfinite(refined_loss) and refined_loss < best_loss:
+                best_beta = float(refined_beta)
+                best_loss = float(refined_loss)
 
     if hint is not None and np.isfinite(float(hint)):
         hint_beta = float(np.clip(float(hint), lower, upper))
@@ -342,6 +506,7 @@ def partition_constrained_observed_refit(
         data.fixed_multiplicity, dtype=np.float64
     )
     ambiguous = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
+    path_spec = getattr(data, "path_likelihood", None)
     upper_matrix = np.asarray(data.phi_upper, dtype=np.float64)
     hint_matrix = None if hint_phi is None else np.asarray(hint_phi, dtype=np.float64)
     # Only observed mutation_regions contribute to the likelihood, exactly as the torch fit
@@ -408,6 +573,40 @@ def partition_constrained_observed_refit(
                 tol=tol,
                 max_iter=max(int(max_iter), 32),
                 hint=hint,
+                path_spec=(
+                    None
+                    if path_spec is None
+                    else replace(
+                        path_spec,
+                        first_copy=path_spec.first_copy[
+                            obs_rows, region_idx : region_idx + 1, :
+                        ],
+                        second_copy=path_spec.second_copy[
+                            obs_rows, region_idx : region_idx + 1, :
+                        ],
+                        switch_fraction=path_spec.switch_fraction[
+                            obs_rows, region_idx : region_idx + 1, :
+                        ],
+                        log_prior=path_spec.log_prior[
+                            obs_rows, region_idx : region_idx + 1, :
+                        ],
+                        valid=path_spec.valid[obs_rows, region_idx : region_idx + 1, :],
+                        legacy_major_indicator=(
+                            None
+                            if path_spec.legacy_major_indicator is None
+                            else path_spec.legacy_major_indicator[
+                                obs_rows, region_idx : region_idx + 1, :
+                            ]
+                        ),
+                    )
+                ),
+                path_scaling=(
+                    None
+                    if path_spec is None
+                    else np.asarray(data.scaling, dtype=np.float64)[
+                        obs_rows, region_idx
+                    ]
+                ),
             )
             beta = float(coordinate.beta)
             loss = float(coordinate.loss)
@@ -450,6 +649,11 @@ def partition_constrained_observed_refit(
         refit_total_candidate_basins=int(refit_total_candidate_basins),
         refit_total_refined_candidates=int(refit_total_refined_candidates),
         refit_min_best_second_loss_gap=float(refit_min_best_second_loss_gap),
+        loglik_source=(
+            "partition_constrained_observed_mle"
+            if path_spec is None
+            else "partition_constrained_observed_mle_path_multibasin"
+        ),
     )
 
 

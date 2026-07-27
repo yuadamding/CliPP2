@@ -32,6 +32,7 @@ packages = [
     "CliPP2.metrics",
     "CliPP2.model_selection",
     "CliPP2.runners",
+    "CliPP2.simulation",
 ]
 package-dir = { CliPP2 = "." }
 include-package-data = false
@@ -40,7 +41,7 @@ include-package-data = false
 version = { attr = "CliPP2._version.__version__" }
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["../tests/clipp2"]
 
 [tool.ruff]
 target-version = "py310"

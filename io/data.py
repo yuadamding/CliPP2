@@ -1,11 +1,237 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+
+def canonicalize_single_switch_path_values(
+    candidates: Iterable[tuple[float, float, float]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Canonicalize numeric single-switch paths and assign a uniform prior.
+
+    Each candidate is ``(first_copy, second_copy, switch_fraction)``. Equal
+    slopes describe the same linear function for every switch, so they are
+    represented with ``switch_fraction=1`` before exact deduplication.
+    """
+
+    canonical: set[tuple[float, float, float]] = set()
+    for index, candidate in enumerate(candidates):
+        values = np.asarray(candidate, dtype=np.float64)
+        if values.shape != (3,):
+            raise ValueError(
+                "Every path candidate must be a three-value "
+                "(first_copy, second_copy, switch_fraction) tuple; "
+                f"candidate {index} has shape {values.shape}."
+            )
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Path candidate {index} contains a non-finite value.")
+        first_copy, second_copy, switch_fraction = (float(value) for value in values)
+        if first_copy < 0.0 or second_copy < 0.0:
+            raise ValueError(
+                f"Path candidate {index} has a negative copy-number slope."
+            )
+        if not 0.0 <= switch_fraction <= 1.0:
+            raise ValueError(
+                f"Path candidate {index} has switch_fraction outside [0, 1]."
+            )
+        if first_copy == second_copy:
+            switch_fraction = 1.0
+        canonical.add((first_copy, second_copy, switch_fraction))
+
+    if not canonical:
+        raise ValueError("At least one path candidate is required.")
+    ordered = sorted(canonical, key=lambda item: (item[2], item[0], item[1]))
+    paths = np.asarray(ordered, dtype=np.float64)
+    log_prior = np.full(len(ordered), -np.log(float(len(ordered))), dtype=np.float64)
+    paths.setflags(write=False)
+    log_prior.setflags(write=False)
+    return paths, log_prior
+
+
+@dataclass(frozen=True, slots=True)
+class PathLikelihoodSpec:
+    """Immutable region-local categorical CCF path likelihood.
+
+    Arrays have shape ``(mutation, region, path)``.  A path's unscaled
+    mutant-copy mass is
+
+    ``first_copy * min(phi, switch_fraction)
+       + second_copy * max(phi - switch_fraction, 0)``.
+
+    Every path has full CCF support on ``[0, 1]``. ``log_prior`` is fixed over
+    CCF and normalized over ``valid`` paths for every mutation-region entry.
+    ``legacy_major_indicator`` is optional
+    compatibility metadata; it lets the generic likelihood reproduce the
+    historical scalar major-copy posterior without assigning that meaning to
+    new path families.  Model, generator, and prior identifiers are included
+    in the parent ``TumorData`` fingerprint together with every numeric array.
+    """
+
+    model_id: str
+    first_copy: np.ndarray
+    second_copy: np.ndarray
+    switch_fraction: np.ndarray
+    log_prior: np.ndarray
+    valid: np.ndarray
+    model_version: str = "1"
+    candidate_generator_version: str = "unspecified"
+    prior_mode: str = "fixed_canonical_path_prior"
+    legacy_major_indicator: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        model_id = str(self.model_id).strip()
+        model_version = str(self.model_version).strip()
+        candidate_generator_version = str(self.candidate_generator_version).strip()
+        prior_mode = str(self.prior_mode).strip()
+        if not model_id:
+            raise ValueError("PathLikelihoodSpec.model_id must be nonempty.")
+        if not model_version:
+            raise ValueError("PathLikelihoodSpec.model_version must be nonempty.")
+        if not candidate_generator_version:
+            raise ValueError(
+                "PathLikelihoodSpec.candidate_generator_version must be nonempty."
+            )
+        if not prior_mode:
+            raise ValueError("PathLikelihoodSpec.prior_mode must be nonempty.")
+
+        numeric: dict[str, np.ndarray] = {}
+        for name in (
+            "first_copy",
+            "second_copy",
+            "switch_fraction",
+            "log_prior",
+        ):
+            value = np.array(
+                getattr(self, name), dtype=np.float64, copy=True, order="C"
+            )
+            if value.ndim != 3:
+                raise ValueError(
+                    f"PathLikelihoodSpec.{name} must have shape (M, S, K)."
+                )
+            numeric[name] = value
+        shape = numeric["first_copy"].shape
+        if shape[2] <= 0:
+            raise ValueError("PathLikelihoodSpec must contain at least one path.")
+        for name, value in numeric.items():
+            if value.shape != shape:
+                raise ValueError(
+                    f"PathLikelihoodSpec.{name} must have shape {shape}, "
+                    f"not {value.shape}."
+                )
+
+        valid = np.array(self.valid, dtype=bool, copy=True, order="C")
+        if valid.shape != shape:
+            raise ValueError(
+                f"PathLikelihoodSpec.valid must have shape {shape}, not {valid.shape}."
+            )
+        if not np.all(np.any(valid, axis=-1)):
+            raise ValueError(
+                "Every mutation-region entry must have at least one valid path."
+            )
+        if np.any(~np.isfinite(numeric["first_copy"][valid])) or np.any(
+            numeric["first_copy"][valid] < 0.0
+        ):
+            raise ValueError("Valid first_copy values must be finite and nonnegative.")
+        if np.any(~np.isfinite(numeric["second_copy"][valid])) or np.any(
+            numeric["second_copy"][valid] < 0.0
+        ):
+            raise ValueError("Valid second_copy values must be finite and nonnegative.")
+        switches = numeric["switch_fraction"][valid]
+        if np.any(~np.isfinite(switches)) or np.any(
+            (switches < 0.0) | (switches > 1.0)
+        ):
+            raise ValueError(
+                "Valid switch_fraction values must be finite and lie in [0, 1]."
+            )
+        valid_log_prior = numeric["log_prior"][valid]
+        if np.any(~np.isfinite(valid_log_prior)):
+            raise ValueError("Valid log_prior values must be finite.")
+
+        for name in ("first_copy", "second_copy", "switch_fraction"):
+            numeric[name] = np.where(valid, numeric[name], 0.0)
+        canonical_log_prior = np.where(valid, numeric["log_prior"], -np.inf)
+        max_log_prior = np.max(canonical_log_prior, axis=-1, keepdims=True)
+        log_normalizer = np.squeeze(
+            max_log_prior
+            + np.log(
+                np.sum(
+                    np.exp(canonical_log_prior - max_log_prior),
+                    axis=-1,
+                    keepdims=True,
+                )
+            ),
+            axis=-1,
+        )
+        if not np.allclose(log_normalizer, 0.0, rtol=0.0, atol=1e-10):
+            raise ValueError(
+                "PathLikelihoodSpec.log_prior must be normalized over valid paths."
+            )
+        numeric["log_prior"] = canonical_log_prior
+
+        indicator = self.legacy_major_indicator
+        if indicator is not None:
+            indicator = np.array(indicator, dtype=bool, copy=True, order="C")
+            if indicator.shape != shape:
+                raise ValueError(
+                    "PathLikelihoodSpec.legacy_major_indicator must have shape "
+                    f"{shape}, not {indicator.shape}."
+                )
+            indicator &= valid
+            indicator.setflags(write=False)
+
+        for name, value in numeric.items():
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+        valid.setflags(write=False)
+        object.__setattr__(self, "valid", valid)
+        object.__setattr__(self, "model_id", model_id)
+        object.__setattr__(self, "model_version", model_version)
+        object.__setattr__(
+            self,
+            "candidate_generator_version",
+            candidate_generator_version,
+        )
+        object.__setattr__(self, "prior_mode", prior_mode)
+        object.__setattr__(self, "legacy_major_indicator", indicator)
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return tuple(int(value) for value in self.first_copy.shape)
+
+    @property
+    def num_paths(self) -> int:
+        return int(self.first_copy.shape[-1])
+
+    @property
+    def has_fixed_linear_emission(self) -> bool:
+        """Whether every valid candidate in a cell has one shared linear slope.
+
+        Such a categorical specification is only redundant bookkeeping: after
+        marginalizing its normalized prior, each cell has the same fixed-copy
+        likelihood as the existing scalar CliPP2 model.
+        """
+
+        first_valid_index = np.argmax(self.valid, axis=-1, keepdims=True)
+        reference = np.take_along_axis(
+            self.first_copy,
+            first_valid_index,
+            axis=-1,
+        )
+        linear = (~self.valid) | (self.first_copy == self.second_copy)
+        shared = (~self.valid) | (self.first_copy == reference)
+        return bool(np.all(linear & shared))
+
+    def validate_observation_shape(self, shape: tuple[int, int]) -> None:
+        if tuple(self.first_copy.shape[:2]) != tuple(shape):
+            raise ValueError(
+                "PathLikelihoodSpec mutation-region shape "
+                f"{self.first_copy.shape[:2]} does not match observations {shape}."
+            )
 
 
 @dataclass
@@ -27,6 +253,15 @@ class TumorData:
     count_observed: np.ndarray | None = (
         None  # bool (M, S) — True if counts observed; None means all observed
     )
+    path_likelihood: PathLikelihoodSpec | None = None
+    # Reporting-only metadata aligned to ``path_likelihood``.  These fields do
+    # not alter the observed objective and are therefore intentionally excluded
+    # from ``tumor_data_fingerprint``.
+    path_annotations: object | None = None
+    path_reporting_semantics: str | None = None
+    path_reporting_fingerprint: str | None = None
+    path_unsupported_reason: np.ndarray | None = None
+    mean_tumor_total_cn: np.ndarray | None = None
 
     @property
     def num_mutations(self) -> int:
@@ -104,7 +339,79 @@ def tumor_data_fingerprint(data: TumorData) -> str:
         if count_observed is None
         else np.asarray(count_observed, dtype=bool),
     )
+    path_likelihood = getattr(data, "path_likelihood", None)
+    if path_likelihood is not None:
+        path_likelihood.validate_observation_shape(
+            (int(data.num_mutations), int(data.num_regions))
+        )
+        update_text("path_likelihood:present")
+        update_text(path_likelihood.model_id)
+        update_text(path_likelihood.model_version)
+        update_text(path_likelihood.candidate_generator_version)
+        update_text(path_likelihood.prior_mode)
+        for name in (
+            "first_copy",
+            "second_copy",
+            "switch_fraction",
+            "log_prior",
+            "valid",
+        ):
+            update_array(f"path_likelihood.{name}", getattr(path_likelihood, name))
+        indicator = path_likelihood.legacy_major_indicator
+        update_text(
+            "path_likelihood.legacy_major_indicator:"
+            + ("none" if indicator is None else "present")
+        )
+        if indicator is not None:
+            update_array("path_likelihood.legacy_major_indicator", indicator)
     return digest.hexdigest()
+
+
+def legacy_path_likelihood_spec(
+    data: TumorData,
+    *,
+    major_prior: float,
+) -> PathLikelihoodSpec:
+    """Represent the historical fixed/major-minor likelihood categorically.
+
+    This adapter is intentionally explicit rather than installed by default:
+    leaving ``TumorData.path_likelihood`` unset keeps every legacy solver path
+    and result bit-for-bit unchanged while allowing parity tests and gradual
+    generic-likelihood integration.
+    """
+
+    prior = float(major_prior)
+    if not np.isfinite(prior) or not (0.0 < prior < 1.0):
+        raise ValueError("major_prior must lie strictly in (0, 1).")
+    shape = (int(data.num_mutations), int(data.num_regions), 2)
+    ambiguous = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
+    first_copy = np.stack(
+        (
+            np.asarray(data.minor_cn, dtype=np.float64),
+            np.asarray(data.major_cn, dtype=np.float64),
+        ),
+        axis=-1,
+    )
+    second_copy = first_copy.copy()
+    switch_fraction = np.ones(shape, dtype=np.float64)
+    valid = np.stack((ambiguous, np.ones_like(ambiguous)), axis=-1)
+    log_prior = np.full(shape, -np.inf, dtype=np.float64)
+    log_prior[..., 0] = np.where(ambiguous, np.log1p(-prior), -np.inf)
+    log_prior[..., 1] = np.where(ambiguous, np.log(prior), 0.0)
+    legacy_major_indicator = np.zeros(shape, dtype=bool)
+    legacy_major_indicator[..., 1] = True
+    return PathLikelihoodSpec(
+        model_id="clipp2_legacy_major_minor_v1",
+        model_version="1",
+        candidate_generator_version="legacy_major_minor_adapter_v1",
+        prior_mode="configured_major_prior_v1",
+        first_copy=first_copy,
+        second_copy=second_copy,
+        switch_fraction=switch_fraction,
+        log_prior=log_prior,
+        valid=valid,
+        legacy_major_indicator=legacy_major_indicator,
+    )
 
 
 def _first_seen(values: pd.Series) -> list[str]:
@@ -243,7 +550,7 @@ def _validate_inputs_strict(
         raise ValueError(f"Invalid input data in {file_path}: {'; '.join(errors)}")
 
 
-def load_tumor_tsv(
+def _load_observation_tsv(
     file_path: str | Path,
     eps: float = 1e-6,
     *,
@@ -462,8 +769,10 @@ def load_tumor_tsv(
 
 
 __all__ = [
+    "PathLikelihoodSpec",
     "TumorData",
+    "canonicalize_single_switch_path_values",
     "compute_phi_init_from_counts",
-    "load_tumor_tsv",
+    "legacy_path_likelihood_spec",
     "tumor_data_fingerprint",
 ]

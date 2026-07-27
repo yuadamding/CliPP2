@@ -13,6 +13,14 @@ from ..core.bic import (
 from .config import PARTITION_ICL_DIRICHLET_ALPHA, SELECTION_SCORE_NAMES
 
 
+_EXACT_OBSERVED_OBJECTIVE_GRADIENT_SCOPES = frozenset(
+    {
+        "observed_objective",
+        "clarke_piecewise_observed_objective_subgradient",
+    }
+)
+
+
 def _normalize_selection_score_name(selection_score: str) -> str:
     normalized = str(selection_score).strip().lower()
     if normalized == "ebic":
@@ -207,8 +215,10 @@ def _exact_fusion_certificate_mask(search_df: pd.DataFrame) -> np.ndarray:
         & _required_text_mask(search_df, "original_graph_hash")
         & _required_text_mask(search_df, "certificate_problem_hash")
         & _required_text_mask(search_df, "certificate_scope", "full_original_graph")
-        & _required_text_mask(
-            search_df, "certificate_gradient_scope", "observed_objective"
+        & _required_text_membership_mask(
+            search_df,
+            "certificate_gradient_scope",
+            _EXACT_OBSERVED_OBJECTIVE_GRADIENT_SCOPES,
         )
         & _required_bool_mask(search_df, "full_kkt_certified")
         & _required_text_membership_mask(
@@ -538,10 +548,18 @@ def _prefer_fit_candidate(candidate: FitResult, incumbent: FitResult | None) -> 
         return True
     if candidate.selection_eligible != incumbent.selection_eligible:
         return False
-    if candidate.selection_eligible and incumbent.selection_eligible:
-        return bool(
-            candidate.penalized_objective < incumbent.penalized_objective - 1e-8
-        )
+    candidate_objective = float(candidate.penalized_objective)
+    incumbent_objective = float(incumbent.penalized_objective)
+    if (
+        np.isfinite(candidate_objective)
+        and np.isfinite(incumbent_objective)
+        and abs(candidate_objective - incumbent_objective) > 1e-8
+    ):
+        return bool(candidate_objective < incumbent_objective)
+    if np.isfinite(candidate_objective) and not np.isfinite(incumbent_objective):
+        return True
+    if not np.isfinite(candidate_objective) and np.isfinite(incumbent_objective):
+        return False
     candidate_kkt = float(candidate.fixed_objective_kkt_residual)
     incumbent_kkt = float(incumbent.fixed_objective_kkt_residual)
     if (
@@ -552,9 +570,7 @@ def _prefer_fit_candidate(candidate: FitResult, incumbent: FitResult | None) -> 
         return bool(candidate_kkt < incumbent_kkt)
     if np.isfinite(candidate_kkt) and not np.isfinite(incumbent_kkt):
         return True
-    if not np.isfinite(candidate_kkt) and np.isfinite(incumbent_kkt):
-        return False
-    return bool(candidate.penalized_objective < incumbent.penalized_objective - 1e-8)
+    return False
 
 
 def _effective_bic_partition_tol(options: FitOptions) -> float:

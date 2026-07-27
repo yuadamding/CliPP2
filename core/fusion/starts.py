@@ -4,10 +4,36 @@ import numpy as np
 import torch
 
 from ...io.data import TumorData
-from .torch_backend import TorchRuntime, TorchTumorData, mutation_region_loss_grid_torch
+from .torch_backend import (
+    TorchRuntime,
+    TorchTumorData,
+    mutation_region_loss_grid_torch,
+    mutation_region_terms_torch,
+    path_internal_breakpoints_torch,
+)
 
 
 _ROOT_SCAN_POINTS = 65
+
+
+def _fixed_linear_path_scale_torch(torch_data: TorchTumorData) -> torch.Tensor | None:
+    """Return the shared per-cell path slope when the categorical model is fixed."""
+
+    path = torch_data.path_likelihood
+    if path is None:
+        return None
+    first_valid_index = torch.argmax(path.valid.to(dtype=torch.int64), dim=-1)
+    reference = torch.gather(
+        path.first_scale,
+        -1,
+        first_valid_index.unsqueeze(-1),
+    )
+    fixed = (~path.valid) | (
+        (path.first_scale == path.second_scale) & (path.first_scale == reference)
+    )
+    if not bool(torch.all(fixed).item()):
+        return None
+    return reference.squeeze(-1)
 
 
 def _golden_section_minimize(
@@ -920,6 +946,23 @@ def _pooled_sample_loss_grid_torch(
     else:
         beta_grid = beta_by_sample
         squeeze = False
+    if torch_data.path_likelihood is not None:
+        columns: list[torch.Tensor] = []
+        for grid_index in range(int(beta_grid.shape[1])):
+            phi = (
+                beta_grid[:, grid_index]
+                .unsqueeze(0)
+                .expand(int(torch_data.alt.shape[0]), -1)
+            )
+            terms = mutation_region_terms_torch(
+                torch_data,
+                phi,
+                major_prior=float(major_prior),
+                eps=float(eps),
+            )
+            columns.append(torch.sum(terms.loss, dim=0))
+        sample_losses = torch.stack(columns, dim=1)
+        return sample_losses.squeeze(-1) if squeeze else sample_losses
     num_mutations = int(torch_data.alt.shape[0])
     beta = beta_grid.unsqueeze(0).expand(num_mutations, -1, -1)
     losses = mutation_region_loss_grid_torch(
@@ -1230,6 +1273,447 @@ def _mutation_region_breakpoints(
     return np.clip(point_array, float(lower), float(upper))
 
 
+def _path_cell_loss_and_gradient_numpy(
+    beta_values: np.ndarray,
+    *,
+    alt: float,
+    total: float,
+    first_scale: np.ndarray,
+    second_scale: np.ndarray,
+    switch_fraction: np.ndarray,
+    log_prior: np.ndarray,
+    valid: np.ndarray,
+    eps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    beta = np.asarray(beta_values, dtype=np.float64).reshape(-1, 1)
+    first = np.asarray(first_scale, dtype=np.float64).reshape(1, -1)
+    second = np.asarray(second_scale, dtype=np.float64).reshape(1, -1)
+    switch = np.asarray(switch_fraction, dtype=np.float64).reshape(1, -1)
+    valid = np.asarray(valid, dtype=bool).reshape(1, -1)
+    log_prior = np.asarray(log_prior, dtype=np.float64).reshape(1, -1)
+    mass = first * np.minimum(beta, switch) + second * np.maximum(beta - switch, 0.0)
+    prob = np.clip(mass, float(eps), 1.0 - float(eps))
+    segment_slope = np.where(beta <= switch, first, second)
+    slope = np.where(
+        (mass > float(eps)) & (mass < 1.0 - float(eps)),
+        segment_slope,
+        0.0,
+    )
+    nonalt = float(total) - float(alt)
+    log_joint = np.where(
+        valid,
+        float(alt) * np.log(prob) + nonalt * np.log1p(-prob) + log_prior,
+        -np.inf,
+    )
+    maximum = np.max(log_joint, axis=1, keepdims=True)
+    unnormalized = np.where(valid, np.exp(log_joint - maximum), 0.0)
+    posterior = unnormalized / np.sum(unnormalized, axis=1, keepdims=True)
+    loss = -(maximum[:, 0] + np.log(np.sum(unnormalized, axis=1, keepdims=True)[:, 0]))
+    state_score = slope * (float(alt) / prob - nonalt / (1.0 - prob))
+    gradient = -np.sum(posterior * state_score, axis=1)
+    return loss, gradient
+
+
+def _path_cell_base_points_numpy(
+    *,
+    alt: float,
+    total: float,
+    first_scale: np.ndarray,
+    second_scale: np.ndarray,
+    switch_fraction: np.ndarray,
+    valid: np.ndarray,
+    lower: float,
+    upper: float,
+    hint: float,
+    eps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    points: list[float] = [float(lower), float(upper), float(hint)]
+    hard: list[float] = [float(lower), float(upper)]
+    first = np.asarray(first_scale, dtype=np.float64)
+    second = np.asarray(second_scale, dtype=np.float64)
+    switch = np.asarray(switch_fraction, dtype=np.float64)
+    valid = np.asarray(valid, dtype=bool)
+    points.extend(switch[valid].tolist())
+    hard.extend(switch[valid].tolist())
+    smoothed_vaf = (float(alt) + 0.5) / (float(total) + 1.0)
+
+    def add_probability_inverse(target: float, *, is_hard: bool) -> None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            left = float(target) / first
+            right = switch + (float(target) - first * switch) / second
+        left_ok = (
+            valid
+            & (first > 0.0)
+            & np.isfinite(left)
+            & (left >= lower)
+            & (left <= np.minimum(switch, upper))
+        )
+        right_ok = (
+            valid
+            & (second > 0.0)
+            & np.isfinite(right)
+            & (right >= np.maximum(switch, lower))
+            & (right <= upper)
+        )
+        values = np.concatenate((left[left_ok], right[right_ok]))
+        points.extend(values.tolist())
+        if is_hard:
+            hard.extend(values.tolist())
+
+    add_probability_inverse(smoothed_vaf, is_hard=False)
+    add_probability_inverse(float(eps), is_hard=True)
+    add_probability_inverse(1.0 - float(eps), is_hard=True)
+    point_array = np.unique(np.round(np.asarray(points, dtype=np.float64), 14))
+    hard_array = np.unique(np.round(np.asarray(hard, dtype=np.float64), 14))
+    keep = (point_array >= lower - 1e-12) & (point_array <= upper + 1e-12)
+    hard_keep = (hard_array >= lower - 1e-12) & (hard_array <= upper + 1e-12)
+    return (
+        np.clip(point_array[keep], lower, upper),
+        np.clip(hard_array[hard_keep], lower, upper),
+    )
+
+
+def _path_cell_best_two_betas_numpy(
+    *,
+    alt: float,
+    total: float,
+    first_scale: np.ndarray,
+    second_scale: np.ndarray,
+    switch_fraction: np.ndarray,
+    log_prior: np.ndarray,
+    valid: np.ndarray,
+    lower: float,
+    upper: float,
+    hint: float,
+    eps: float,
+    tol: float,
+    max_iter: int,
+) -> tuple[float, float | None]:
+    base_points, hard_points = _path_cell_base_points_numpy(
+        alt=alt,
+        total=total,
+        first_scale=first_scale,
+        second_scale=second_scale,
+        switch_fraction=switch_fraction,
+        valid=valid,
+        lower=lower,
+        upper=upper,
+        hint=hint,
+        eps=eps,
+    )
+    candidates: list[float] = base_points.tolist()
+
+    def evaluate(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return _path_cell_loss_and_gradient_numpy(
+            values,
+            alt=alt,
+            total=total,
+            first_scale=first_scale,
+            second_scale=second_scale,
+            switch_fraction=switch_fraction,
+            log_prior=log_prior,
+            valid=valid,
+            eps=eps,
+        )
+
+    for left, right in zip(hard_points[:-1], hard_points[1:]):
+        if right <= left + 1e-12:
+            continue
+        scan_left = np.nextafter(float(left), float(right))
+        scan_right = np.nextafter(float(right), float(left))
+        scan = np.linspace(
+            scan_left,
+            scan_right,
+            num=_ROOT_SCAN_POINTS,
+            dtype=np.float64,
+        )
+        _, gradient = evaluate(scan)
+        finite = np.isfinite(gradient)
+        candidates.extend(scan[finite].tolist())
+        near_zero = finite & (np.abs(gradient) <= 1e-10)
+        candidates.extend(scan[near_zero].tolist())
+        for index in range(scan.size - 1):
+            if not finite[index] or not finite[index + 1]:
+                continue
+            left_gradient = float(gradient[index])
+            right_gradient = float(gradient[index + 1])
+            if left_gradient == 0.0 or right_gradient == 0.0:
+                continue
+            if left_gradient * right_gradient > 0.0:
+                continue
+            root_left = float(scan[index])
+            root_right = float(scan[index + 1])
+            root_gradient = left_gradient
+            for _ in range(max(int(max_iter), 32)):
+                midpoint = 0.5 * (root_left + root_right)
+                _, midpoint_gradient_array = evaluate(
+                    np.asarray([midpoint], dtype=np.float64)
+                )
+                midpoint_gradient = float(midpoint_gradient_array[0])
+                if not np.isfinite(midpoint_gradient):
+                    break
+                if abs(midpoint_gradient) <= 1e-12 or root_right - root_left <= float(
+                    tol
+                ) * (1.0 + abs(midpoint)):
+                    root_left = midpoint
+                    root_right = midpoint
+                    break
+                if root_gradient * midpoint_gradient <= 0.0:
+                    root_right = midpoint
+                else:
+                    root_left = midpoint
+                    root_gradient = midpoint_gradient
+            candidates.append(0.5 * (root_left + root_right))
+
+    candidate_array = np.unique(
+        np.round(np.clip(np.asarray(candidates, dtype=np.float64), lower, upper), 14)
+    )
+    losses, _ = evaluate(candidate_array)
+    finite = np.isfinite(losses)
+    if not np.any(finite):
+        return float(np.clip(hint, lower, upper)), None
+    candidate_array = candidate_array[finite]
+    losses = losses[finite]
+    local_betas, local_losses = _local_minimum_representatives(
+        candidate_array,
+        losses,
+        hint=hint,
+        loss_tol=max(float(tol) * 10.0, 1e-10),
+    )
+    if local_betas.size:
+        order = np.lexsort((np.abs(local_betas - hint), local_losses))
+        ordered_beta = local_betas[order]
+    else:
+        ordered_beta = candidate_array[np.argsort(losses, kind="stable")]
+    primary = float(ordered_beta[0])
+    beta_tol = max(float(tol) * 10.0, 1e-8 * max(1.0, abs(primary)))
+    secondary = next(
+        (
+            float(value)
+            for value in ordered_beta[1:]
+            if abs(float(value) - primary) > beta_tol
+        ),
+        None,
+    )
+    return primary, secondary
+
+
+def _path_scalar_wells_from_arrays(
+    *,
+    alt: np.ndarray,
+    total: np.ndarray,
+    first_scale: np.ndarray,
+    second_scale: np.ndarray,
+    switch_fraction: np.ndarray,
+    log_prior: np.ndarray,
+    valid: np.ndarray,
+    phi_upper: np.ndarray,
+    phi_init: np.ndarray,
+    count_observed: np.ndarray | None,
+    eps: float,
+    tol: float,
+    max_iter: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    shape = tuple(np.asarray(alt).shape)
+    flat_alt = np.asarray(alt, dtype=np.float64).reshape(-1)
+    flat_total = np.asarray(total, dtype=np.float64).reshape(-1)
+    path_count = int(np.asarray(first_scale).shape[-1])
+    flat_first = np.asarray(first_scale, dtype=np.float64).reshape(-1, path_count)
+    flat_second = np.asarray(second_scale, dtype=np.float64).reshape(-1, path_count)
+    flat_switch = np.asarray(switch_fraction, dtype=np.float64).reshape(-1, path_count)
+    flat_prior = np.asarray(log_prior, dtype=np.float64).reshape(-1, path_count)
+    flat_valid = np.asarray(valid, dtype=bool).reshape(-1, path_count)
+    flat_upper = np.asarray(phi_upper, dtype=np.float64).reshape(-1)
+    flat_hint = np.clip(
+        np.asarray(phi_init, dtype=np.float64).reshape(-1),
+        float(eps),
+        flat_upper,
+    )
+    observed = (
+        np.ones(shape, dtype=bool).reshape(-1)
+        if count_observed is None
+        else np.asarray(count_observed, dtype=bool).reshape(-1)
+    )
+    primary = flat_hint.copy()
+    secondary = np.full_like(primary, np.nan)
+    valid_secondary = np.zeros_like(primary, dtype=bool)
+    for index in np.flatnonzero(observed):
+        best, alternate = _path_cell_best_two_betas_numpy(
+            alt=float(flat_alt[index]),
+            total=float(flat_total[index]),
+            first_scale=flat_first[index],
+            second_scale=flat_second[index],
+            switch_fraction=flat_switch[index],
+            log_prior=flat_prior[index],
+            valid=flat_valid[index],
+            lower=float(eps),
+            upper=float(flat_upper[index]),
+            hint=float(flat_hint[index]),
+            eps=float(eps),
+            tol=float(tol),
+            max_iter=int(max_iter),
+        )
+        primary[index] = best
+        if alternate is not None:
+            secondary[index] = alternate
+            valid_secondary[index] = True
+    return (
+        primary.reshape(shape),
+        secondary.reshape(shape),
+        valid_secondary.reshape(shape),
+    )
+
+
+def _path_pooled_start_from_arrays(
+    *,
+    alt: np.ndarray,
+    total: np.ndarray,
+    first_scale: np.ndarray,
+    second_scale: np.ndarray,
+    switch_fraction: np.ndarray,
+    log_prior: np.ndarray,
+    valid: np.ndarray,
+    phi_upper: np.ndarray,
+    count_observed: np.ndarray | None,
+    beta_hints: np.ndarray,
+    eps: float,
+    tol: float,
+    max_iter: int,
+) -> np.ndarray:
+    alt = np.asarray(alt, dtype=np.float64)
+    total = np.asarray(total, dtype=np.float64)
+    first_scale = np.asarray(first_scale, dtype=np.float64)
+    second_scale = np.asarray(second_scale, dtype=np.float64)
+    switch_fraction = np.asarray(switch_fraction, dtype=np.float64)
+    log_prior = np.asarray(log_prior, dtype=np.float64)
+    valid = np.asarray(valid, dtype=bool)
+    upper_matrix = np.asarray(phi_upper, dtype=np.float64)
+    hints = np.asarray(beta_hints, dtype=np.float64)
+    observed = (
+        np.ones_like(alt, dtype=bool)
+        if count_observed is None
+        else np.asarray(count_observed, dtype=bool)
+    )
+    num_mutations, num_regions = alt.shape
+    pooled = np.empty((num_regions,), dtype=np.float64)
+
+    for region_index in range(num_regions):
+        lower = float(eps)
+        upper = float(np.min(upper_matrix[:, region_index]))
+        if upper <= lower + 1e-12:
+            pooled[region_index] = lower
+            continue
+        region_observed = observed[:, region_index]
+        if not np.any(region_observed):
+            pooled[region_index] = 0.5 * (lower + upper)
+            continue
+        switches = switch_fraction[region_observed, region_index, :][
+            valid[region_observed, region_index, :]
+        ]
+        hard = np.unique(
+            np.round(
+                np.concatenate(
+                    (
+                        np.asarray([lower, upper], dtype=np.float64),
+                        switches,
+                    )
+                ),
+                14,
+            )
+        )
+        hard = hard[(hard >= lower - 1e-12) & (hard <= upper + 1e-12)]
+        hint_values = np.clip(hints[region_observed, region_index], lower, upper)
+        if hint_values.size > 33:
+            hint_values = np.quantile(hint_values, np.linspace(0.0, 1.0, num=33))
+        grid = np.unique(
+            np.round(
+                np.concatenate(
+                    (
+                        hard,
+                        hint_values,
+                        np.geomspace(max(lower, float(eps)), upper, num=257),
+                        np.linspace(lower, upper, num=129),
+                    )
+                ),
+                14,
+            )
+        )
+        grid = grid[(grid >= lower - 1e-12) & (grid <= upper + 1e-12)]
+
+        member_indices = np.flatnonzero(region_observed)
+
+        def objective(values: np.ndarray) -> np.ndarray:
+            values = np.asarray(values, dtype=np.float64)
+            loss = np.zeros_like(values)
+            for mutation_index in member_indices:
+                cell_loss, _ = _path_cell_loss_and_gradient_numpy(
+                    values,
+                    alt=float(alt[mutation_index, region_index]),
+                    total=float(total[mutation_index, region_index]),
+                    first_scale=first_scale[mutation_index, region_index],
+                    second_scale=second_scale[mutation_index, region_index],
+                    switch_fraction=switch_fraction[mutation_index, region_index],
+                    log_prior=log_prior[mutation_index, region_index],
+                    valid=valid[mutation_index, region_index],
+                    eps=float(eps),
+                )
+                loss += cell_loss
+            return loss
+
+        losses = objective(grid)
+        finite_indices = np.flatnonzero(np.isfinite(losses))
+        if finite_indices.size == 0:
+            pooled[region_index] = float(np.median(hint_values))
+            continue
+        local_indices = [
+            int(index)
+            for index in finite_indices
+            if (
+                (index == 0 or losses[index] <= losses[index - 1] + 1e-10)
+                and (
+                    index + 1 == losses.size
+                    or losses[index] <= losses[index + 1] + 1e-10
+                )
+            )
+        ]
+        if not local_indices:
+            local_indices = [int(finite_indices[np.argmin(losses[finite_indices])])]
+        best_index = int(finite_indices[np.argmin(losses[finite_indices])])
+        best_beta = float(grid[best_index])
+        best_loss = float(losses[best_index])
+        for index in sorted(local_indices, key=lambda item: float(losses[item]))[:16]:
+            center = float(grid[index])
+            at_switch = bool(np.any(np.isclose(center, hard, rtol=0.0, atol=1e-12)))
+            intervals = (
+                [
+                    (float(grid[max(index - 1, 0)]), center),
+                    (center, float(grid[min(index + 1, grid.size - 1)])),
+                ]
+                if at_switch
+                else [
+                    (
+                        float(grid[max(index - 1, 0)]),
+                        float(grid[min(index + 1, grid.size - 1)]),
+                    )
+                ]
+            )
+            for left, right in intervals:
+                if right <= left + 1e-12:
+                    continue
+                refined_beta, refined_loss = _golden_section_minimize(
+                    objective,
+                    left=left,
+                    right=right,
+                    tol=float(tol),
+                    max_iter=max(int(max_iter), 32),
+                )
+                if np.isfinite(refined_loss) and refined_loss < best_loss:
+                    best_beta = float(refined_beta)
+                    best_loss = float(refined_loss)
+        pooled[region_index] = float(np.clip(best_beta, lower, upper))
+    return np.tile(pooled[None, :], (num_mutations, 1))
+
+
 def compute_scalar_mutation_region_wells(
     data: TumorData,
     *,
@@ -1238,6 +1722,24 @@ def compute_scalar_mutation_region_wells(
     tol: float,
     max_iter: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    path_spec = getattr(data, "path_likelihood", None)
+    if path_spec is not None:
+        scale = np.asarray(data.scaling, dtype=np.float64)[..., None]
+        return _path_scalar_wells_from_arrays(
+            alt=np.asarray(data.alt_counts, dtype=np.float64),
+            total=np.asarray(data.total_counts, dtype=np.float64),
+            first_scale=scale * path_spec.first_copy,
+            second_scale=scale * path_spec.second_copy,
+            switch_fraction=path_spec.switch_fraction,
+            log_prior=path_spec.log_prior,
+            valid=path_spec.valid,
+            phi_upper=np.asarray(data.phi_upper, dtype=np.float64),
+            phi_init=np.asarray(data.phi_init, dtype=np.float64),
+            count_observed=data.count_observed,
+            eps=float(eps),
+            tol=float(tol),
+            max_iter=int(max_iter),
+        )
     alt = np.asarray(data.alt_counts, dtype=np.float64).reshape(-1)
     total = np.asarray(data.total_counts, dtype=np.float64).reshape(-1)
     b_minus = (
@@ -1326,6 +1828,37 @@ def compute_scalar_mutation_region_wells_torch(
     dtype = torch_data.alt.dtype
     device = torch_data.alt.device
     shape = tuple(torch_data.alt.shape)
+    fixed_path_scale = _fixed_linear_path_scale_torch(torch_data)
+    if torch_data.path_likelihood is not None and fixed_path_scale is None:
+        path = torch_data.path_likelihood
+        primary, secondary, valid_secondary = _path_scalar_wells_from_arrays(
+            alt=torch_data.alt.detach().cpu().numpy(),
+            total=torch_data.total.detach().cpu().numpy(),
+            first_scale=path.first_scale.detach().cpu().numpy(),
+            second_scale=path.second_scale.detach().cpu().numpy(),
+            switch_fraction=path.switch_fraction.detach().cpu().numpy(),
+            log_prior=path.log_prior.detach().cpu().numpy(),
+            valid=path.valid.detach().cpu().numpy(),
+            phi_upper=torch_data.phi_upper.detach().cpu().numpy(),
+            phi_init=(
+                phi_init.detach().cpu().numpy()
+                if torch.is_tensor(phi_init)
+                else np.asarray(phi_init)
+            ),
+            count_observed=(
+                None
+                if torch_data.count_observed is None
+                else torch_data.count_observed.detach().cpu().numpy()
+            ),
+            eps=float(eps),
+            tol=float(tol),
+            max_iter=int(max_iter),
+        )
+        return (
+            torch.as_tensor(primary, dtype=dtype, device=device),
+            torch.as_tensor(secondary, dtype=dtype, device=device),
+            torch.as_tensor(valid_secondary, dtype=torch.bool, device=device),
+        )
     lower = torch.full_like(torch_data.phi_upper, float(eps))
     upper = torch_data.phi_upper
     hint = torch.as_tensor(phi_init, dtype=dtype, device=device).reshape(shape)
@@ -1335,9 +1868,17 @@ def compute_scalar_mutation_region_wells_torch(
     secondary = torch.full_like(hint, float("nan"))
     valid_secondary = torch.zeros(shape, dtype=torch.bool, device=device)
 
-    fixed_mask = ~torch_data.ambiguous
+    effective_ambiguous = (
+        torch.zeros_like(torch_data.ambiguous)
+        if fixed_path_scale is not None
+        else torch_data.ambiguous
+    )
+    effective_b_fixed = (
+        fixed_path_scale if fixed_path_scale is not None else torch_data.b_fixed
+    )
+    fixed_mask = ~effective_ambiguous
     if bool(torch.any(fixed_mask).item()):
-        fixed_valid = fixed_mask & (torch_data.total > 0.0) & (torch_data.b_fixed > 0.0)
+        fixed_valid = fixed_mask & (torch_data.total > 0.0) & (effective_b_fixed > 0.0)
         fixed_solution = torch.where(fixed_mask, hint, refined)
         if bool(torch.any(fixed_valid).item()):
             p_hat = torch.clamp(
@@ -1346,12 +1887,12 @@ def compute_scalar_mutation_region_wells_torch(
                 min=float(eps),
                 max=1.0 - float(eps),
             )
-            beta_hat = p_hat / torch.clamp(torch_data.b_fixed, min=float(eps))
+            beta_hat = p_hat / torch.clamp(effective_b_fixed, min=float(eps))
             fixed_solution = torch.where(fixed_valid, beta_hat, fixed_solution)
         fixed_solution = torch.minimum(torch.maximum(fixed_solution, lower), upper)
         refined = torch.where(fixed_mask, fixed_solution, refined)
 
-    ambiguous_mask = torch_data.ambiguous
+    ambiguous_mask = effective_ambiguous
     if bool(torch.any(ambiguous_mask).item()):
         flat_mask = ambiguous_mask.reshape(-1)
         alt = torch_data.alt.reshape(-1)[flat_mask]
@@ -1418,6 +1959,36 @@ def compute_pooled_observed_data_start_torch(
     device = torch_data.alt.device
     num_mutations = int(torch_data.alt.shape[0])
     num_regions = int(torch_data.alt.shape[1])
+    if torch_data.path_likelihood is not None:
+        path = torch_data.path_likelihood
+        if beta_hints is None:
+            hints = 0.5 * (float(eps) + torch_data.phi_upper.detach().cpu().numpy())
+        else:
+            hints = (
+                beta_hints.detach().cpu().numpy()
+                if torch.is_tensor(beta_hints)
+                else np.asarray(beta_hints)
+            )
+        pooled = _path_pooled_start_from_arrays(
+            alt=torch_data.alt.detach().cpu().numpy(),
+            total=torch_data.total.detach().cpu().numpy(),
+            first_scale=path.first_scale.detach().cpu().numpy(),
+            second_scale=path.second_scale.detach().cpu().numpy(),
+            switch_fraction=path.switch_fraction.detach().cpu().numpy(),
+            log_prior=path.log_prior.detach().cpu().numpy(),
+            valid=path.valid.detach().cpu().numpy(),
+            phi_upper=torch_data.phi_upper.detach().cpu().numpy(),
+            count_observed=(
+                None
+                if torch_data.count_observed is None
+                else torch_data.count_observed.detach().cpu().numpy()
+            ),
+            beta_hints=hints,
+            eps=float(eps),
+            tol=float(tol),
+            max_iter=int(max_iter),
+        )
+        return torch.as_tensor(pooled, dtype=dtype, device=device)
     lower = torch.full((num_regions,), float(eps), dtype=dtype, device=device)
     upper = torch.min(torch_data.phi_upper, dim=0).values
 
@@ -1491,6 +2062,28 @@ def compute_pooled_observed_data_start(
     max_iter: int,
     beta_hints: np.ndarray | None = None,
 ) -> np.ndarray:
+    path_spec = getattr(data, "path_likelihood", None)
+    if path_spec is not None:
+        scale = np.asarray(data.scaling, dtype=np.float64)[..., None]
+        return _path_pooled_start_from_arrays(
+            alt=np.asarray(data.alt_counts, dtype=np.float64),
+            total=np.asarray(data.total_counts, dtype=np.float64),
+            first_scale=scale * path_spec.first_copy,
+            second_scale=scale * path_spec.second_copy,
+            switch_fraction=path_spec.switch_fraction,
+            log_prior=path_spec.log_prior,
+            valid=path_spec.valid,
+            phi_upper=np.asarray(data.phi_upper, dtype=np.float64),
+            count_observed=data.count_observed,
+            beta_hints=(
+                np.asarray(data.phi_init, dtype=np.float64)
+                if beta_hints is None
+                else np.asarray(beta_hints, dtype=np.float64)
+            ),
+            eps=float(eps),
+            tol=float(tol),
+            max_iter=int(max_iter),
+        )
     ambiguous = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
     b_minus = np.asarray(data.scaling, dtype=np.float64) * np.asarray(
         data.minor_cn, dtype=np.float64
@@ -1612,8 +2205,46 @@ def compute_scalar_well_start_bank(
     valid_secondary = np.asarray(valid_secondary, dtype=bool)
 
     starts: list[np.ndarray] = [exact_pilot.copy()]
+    path_spec = getattr(data, "path_likelihood", None)
+    if path_spec is not None:
+        switch = np.asarray(path_spec.switch_fraction, dtype=np.float64)
+        valid = np.asarray(path_spec.valid, dtype=bool)
+        interior = (
+            valid
+            & (switch > float(eps))
+            & (switch < np.asarray(data.phi_upper, dtype=np.float64)[..., None])
+        )
+        distance = np.where(
+            interior,
+            np.abs(switch - exact_pilot[..., None]),
+            np.inf,
+        )
+        closest_index = np.argmin(distance, axis=-1)
+        closest = np.take_along_axis(switch, closest_index[..., None], axis=-1)[..., 0]
+        has_switch = np.any(interior, axis=-1)
+        offset = max(float(eps) * 10.0, 1e-6)
+        for direction in (-1.0, 1.0):
+            switch_start = np.where(
+                has_switch,
+                closest + direction * offset,
+                exact_pilot,
+            )
+            starts.append(
+                np.clip(
+                    switch_start,
+                    float(eps),
+                    np.asarray(data.phi_upper, dtype=np.float64),
+                )
+            )
     if not np.any(valid_secondary):
-        return starts
+        return [
+            candidate
+            for index, candidate in enumerate(starts)
+            if not any(
+                np.allclose(candidate, earlier, rtol=0.0, atol=1e-8)
+                for earlier in starts[:index]
+            )
+        ]
 
     global_alternate = exact_pilot.copy()
     global_alternate[valid_secondary] = secondary[valid_secondary]
@@ -1674,14 +2305,45 @@ def compute_scalar_well_start_bank_torch(
     pilot = torch.minimum(torch.maximum(pilot, lower), torch_data.phi_upper)
 
     starts: list[torch.Tensor] = [pilot]
+    if torch_data.path_likelihood is not None:
+        path = torch_data.path_likelihood
+        breakpoints, breakpoint_valid = path_internal_breakpoints_torch(
+            path, eps=float(eps)
+        )
+        interior = (
+            breakpoint_valid
+            & (breakpoints > float(eps))
+            & (breakpoints < torch_data.phi_upper.unsqueeze(-1))
+        )
+        distance = torch.where(
+            interior,
+            torch.abs(breakpoints - pilot.unsqueeze(-1)),
+            torch.full_like(breakpoints, float("inf")),
+        )
+        closest_index = torch.argmin(distance, dim=-1, keepdim=True)
+        closest = torch.gather(breakpoints, -1, closest_index).squeeze(-1)
+        has_switch = torch.any(interior, dim=-1)
+        offset = max(float(eps) * 10.0, 1e-6)
+        for direction in (-1.0, 1.0):
+            switch_start = torch.where(
+                has_switch,
+                closest + float(direction) * offset,
+                pilot,
+            )
+            starts.append(
+                torch.minimum(
+                    torch.maximum(switch_start, lower),
+                    torch_data.phi_upper,
+                )
+            )
     if secondary_wells is None or valid_secondary is None:
-        return tuple(starts)
+        return _deduplicate_tensor_starts(starts)
 
     secondary = torch.as_tensor(secondary_wells, dtype=dtype, device=device)
     valid = torch.as_tensor(valid_secondary, dtype=torch.bool, device=device)
     valid = valid & torch.isfinite(secondary)
     if not bool(torch.any(valid).item()):
-        return tuple(starts)
+        return _deduplicate_tensor_starts(starts)
 
     global_alternate = torch.where(valid, secondary, pilot)
     starts.append(

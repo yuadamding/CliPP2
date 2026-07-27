@@ -15,6 +15,7 @@ from .fusion.defaults import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
     DEFAULT_INNER_BACKEND,
+    DEFAULT_OPTIMIZATION_TOLERANCE,
     DEFAULT_WORKSET_ADD_BATCH,
     DEFAULT_WORKSET_MAX_BYTES,
     DEFAULT_WORKSET_MAX_EXPANSIONS,
@@ -33,7 +34,7 @@ class FitOptions:
     lambda_value: float
     outer_max_iter: int = 8
     inner_max_iter: int = 30
-    tol: float = 1e-4
+    tol: float = DEFAULT_OPTIMIZATION_TOLERANCE
     major_prior: float = 0.5
     eps: float = 1e-6
     graph: PairwiseFusionGraph | None = None
@@ -72,7 +73,7 @@ class Problem:
 class SolverOptions:
     outer_max_iter: int = 8
     inner_max_iter: int = 30
-    tol: float = 1e-4
+    tol: float = DEFAULT_OPTIMIZATION_TOLERANCE
     device: str = DEFAULT_DEVICE
     dtype: str = DEFAULT_DTYPE
     compute_summary: bool = False
@@ -273,6 +274,9 @@ class FitResult:
     full_kkt_certificate_status: str = "not_audited"
     full_kkt_tolerance: float = 0.0
     exactness_provenance: ExactFusionProvenance | None = None
+    path_posterior: np.ndarray | None = None
+    likelihood_model_id: str = "clipp2_legacy_major_minor_v1"
+    likelihood_eps: float = 1e-6
 
     @property
     def estimate(self) -> Estimate:
@@ -573,6 +577,15 @@ def fit_fixed_objective(
             provenance.tolerance if provenance is not None else 0.0
         ),
         exactness_provenance=provenance,
+        path_posterior=getattr(artifacts, "path_posterior", None),
+        likelihood_model_id=str(
+            getattr(
+                artifacts,
+                "likelihood_model_id",
+                "clipp2_legacy_major_minor_v1",
+            )
+        ),
+        likelihood_eps=float(options.eps),
     )
 
 

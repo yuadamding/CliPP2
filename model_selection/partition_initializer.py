@@ -9,6 +9,7 @@ from ..core.fusion.partition_starts import (
     hessian_weighted_ward_label_sets_torch,
     observed_curvature_at_pilot_torch,
 )
+from ..core.fusion.solver import uses_explicit_path_likelihood
 from ..core.model import FitOptions
 from ..io.data import TumorData
 from .config import (
@@ -108,7 +109,7 @@ def generate_partition_initializer_pool(
             torch_data=torch_data,
             device=runtime.device,
             dtype=runtime.dtype,
-            use_torch=True,
+            use_torch=not uses_explicit_path_likelihood(data),
             classification_weight_alpha=(
                 float(PARTITION_ICL_DIRICHLET_ALPHA)
                 if normalized_score == "partition_icl"

@@ -15,23 +15,30 @@ from ..core.fusion.defaults import DEFAULT_DEVICE
 from ..core.fusion.graph import load_pairwise_fusion_graph_tsv
 from ..core.fusion.types import ExactSolverResourceLimit
 from ..core.model import FitOptions
-from ..io.data import load_tumor_tsv
+from ..io.tumor_input import (
+    DEFAULT_DOSAGE_PRIOR_PENALTY,
+    is_tumor_directory,
+    load_tumor_directory,
+)
 from ..metrics.evaluation import evaluate_fit_against_simulation
-from ..model_selection.config import DEFAULT_SELECTION_SCORE
+from ..model_selection.config import (
+    DEFAULT_LAMBDA_GRID_MODE,
+    DEFAULT_SELECTION_SCORE,
+)
 from .model_selection import select_model
 from .outputs import write_fit_outputs
 
 
 def _exact_resource_limit_summary(
-    file_path: str | Path,
+    tumor_dir: str | Path,
     exc: ExactSolverResourceLimit,
 ) -> dict[str, float | int | str | bool]:
     """Record one fail-closed tumor without terminating a directory batch."""
 
-    path = Path(file_path)
+    path = Path(tumor_dir)
     return {
-        "tumor_id": path.stem,
-        "input_file": str(path),
+        "tumor_id": path.name,
+        "tumor_directory": str(path),
         "selection_eligible": False,
         "raw_kkt_eligible": False,
         "bic_selection_eligible": False,
@@ -51,12 +58,12 @@ def _normalize_resource_limit(exc: BaseException) -> ExactSolverResourceLimit:
     )
 
 
-def process_one_file_bundle(
-    file_path: str | Path,
+def process_tumor_bundle(
+    tumor_dir: str | Path,
     outdir: str | Path,
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
-    lambda_grid_mode: str = "partition_guided_admm",
+    lambda_grid_mode: str = DEFAULT_LAMBDA_GRID_MODE,
     fit_options: FitOptions | None = None,
     bic_df_scale: float = 1.0,
     bic_cluster_penalty: float = 0.0,
@@ -65,13 +72,20 @@ def process_one_file_bundle(
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
     finalize_selected_fit: bool | None = None,
-    missing_cna_policy: str = "error",
+    unsupported_policy: str = "error",
+    dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     evaluate_all_candidates: bool | None = None,
 ) -> tuple[dict[str, float | int | str | bool], pd.DataFrame]:
+    """Fit one tumor directory and return its summary and model-search table."""
+
     start_time = perf_counter()
-    file_path = Path(file_path)
+    tumor_dir = Path(tumor_dir)
     outdir = Path(outdir)
-    data = load_tumor_tsv(file_path, missing_cna_policy=missing_cna_policy)
+    data = load_tumor_directory(
+        tumor_dir,
+        unsupported_policy=unsupported_policy,
+        dosage_prior_penalty=dosage_prior_penalty,
+    )
 
     if fit_options is None:
         fit_options = FitOptions(lambda_value=0.0)
@@ -547,10 +561,43 @@ def process_one_file_bundle(
         "tested_lambda_count": tested_lambda_count,
         "num_regions": int(data.num_regions),
         "num_mutations": int(data.num_mutations),
+        "likelihood_model_id": str(best_fit.likelihood_model_id),
+        "path_model_region_local": bool(
+            getattr(data, "path_likelihood", None) is not None
+        ),
+        "path_candidate_generator_version": str(
+            getattr(
+                getattr(data, "path_likelihood", None),
+                "candidate_generator_version",
+                "",
+            )
+        ),
+        "path_prior_mode": str(
+            getattr(getattr(data, "path_likelihood", None), "prior_mode", "")
+        ),
+        "path_reporting_fingerprint": str(
+            getattr(data, "path_reporting_fingerprint", None) or ""
+        ),
+        "path_masked_mutation_region_count": int(
+            0
+            if data.path_unsupported_reason is None
+            else np.sum(
+                ~pd.isna(np.asarray(data.path_unsupported_reason, dtype=object))
+            )
+        ),
+        "bic_dimension_interpretation": (
+            "nominal_K_times_S_nonregular_path_mixture"
+            if getattr(data, "path_likelihood", None) is not None
+            else "nominal_K_times_S"
+        ),
         "depth_scale": float(data.depth_scale),
         "mean_purity": float(np.mean(data.purity)),
         "non_diploid_rate": float(
-            np.mean(data.has_cna & ((data.major_cn != 1.0) | (data.minor_cn != 1.0)))
+            np.mean(data.has_cna)
+            if getattr(data, "path_likelihood", None) is not None
+            else np.mean(
+                data.has_cna & ((data.major_cn != 1.0) | (data.minor_cn != 1.0))
+            )
         ),
         "lambda_grid_mode": str(
             lambda_grid_mode if lambda_grid is None else "explicit"
@@ -790,6 +837,45 @@ def process_one_file_bundle(
         if best_evaluation is None
         or getattr(best_evaluation, "multiplicity_estimable_f1", None) is None
         else float(best_evaluation.multiplicity_estimable_f1),
+        "effective_multiplicity_rmse": np.nan
+        if best_evaluation is None
+        or getattr(best_evaluation, "effective_multiplicity_rmse", None) is None
+        else float(best_evaluation.effective_multiplicity_rmse),
+        "raw_effective_multiplicity_rmse": np.nan
+        if best_evaluation is None
+        or getattr(best_evaluation, "raw_effective_multiplicity_rmse", None) is None
+        else float(best_evaluation.raw_effective_multiplicity_rmse),
+        "summary_effective_multiplicity_rmse": np.nan
+        if best_evaluation is None
+        or getattr(best_evaluation, "summary_effective_multiplicity_rmse", None) is None
+        else float(best_evaluation.summary_effective_multiplicity_rmse),
+        "amplified_mutant_copy_f1": np.nan
+        if best_evaluation is None
+        or getattr(best_evaluation, "amplified_mutant_copy_f1", None) is None
+        else float(best_evaluation.amplified_mutant_copy_f1),
+        "raw_amplified_mutant_copy_f1": np.nan
+        if best_evaluation is None
+        or getattr(best_evaluation, "raw_amplified_mutant_copy_f1", None) is None
+        else float(best_evaluation.raw_amplified_mutant_copy_f1),
+        "summary_amplified_mutant_copy_f1": np.nan
+        if best_evaluation is None
+        or getattr(best_evaluation, "summary_amplified_mutant_copy_f1", None) is None
+        else float(best_evaluation.summary_amplified_mutant_copy_f1),
+        "n_effective_multiplicity_cells": 0
+        if best_evaluation is None
+        else int(getattr(best_evaluation, "n_effective_multiplicity_cells", 0)),
+        "n_amplified_mutant_copy_cells": 0
+        if best_evaluation is None
+        else int(getattr(best_evaluation, "n_amplified_mutant_copy_cells", 0)),
+        "n_true_amplified_mutant_copy_cells": 0
+        if best_evaluation is None
+        else int(
+            getattr(
+                best_evaluation,
+                "n_true_amplified_mutant_copy_cells",
+                0,
+            )
+        ),
         "estimated_clonal_fraction": np.nan
         if best_evaluation is None
         else float(best_evaluation.estimated_clonal_fraction),
@@ -835,12 +921,12 @@ def process_one_file_bundle(
     return summary, search_df
 
 
-def process_one_file(
-    file_path: str | Path,
+def process_tumor(
+    tumor_dir: str | Path,
     outdir: str | Path,
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
-    lambda_grid_mode: str = "partition_guided_admm",
+    lambda_grid_mode: str = DEFAULT_LAMBDA_GRID_MODE,
     fit_options: FitOptions | None = None,
     bic_df_scale: float = 1.0,
     bic_cluster_penalty: float = 0.0,
@@ -849,11 +935,14 @@ def process_one_file(
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
     finalize_selected_fit: bool | None = None,
-    missing_cna_policy: str = "error",
+    unsupported_policy: str = "error",
+    dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     evaluate_all_candidates: bool | None = None,
 ) -> dict[str, float | int | str | bool]:
-    summary, _ = process_one_file_bundle(
-        file_path=file_path,
+    """Fit one tumor directory and return its run summary."""
+
+    summary, _ = process_tumor_bundle(
+        tumor_dir=tumor_dir,
         outdir=outdir,
         simulation_root=simulation_root,
         lambda_grid=lambda_grid,
@@ -867,19 +956,20 @@ def process_one_file(
         graph_file=graph_file,
         finalize_selected_fit=finalize_selected_fit,
         evaluate_all_candidates=evaluate_all_candidates,
-        missing_cna_policy=missing_cna_policy,
+        unsupported_policy=unsupported_policy,
+        dosage_prior_penalty=dosage_prior_penalty,
     )
     return summary
 
 
-def run_directory(
-    input_dir: str | Path,
+def run_cohort(
+    cohort_dir: str | Path,
     outdir: str | Path,
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
-    lambda_grid_mode: str = "partition_guided_admm",
+    lambda_grid_mode: str = DEFAULT_LAMBDA_GRID_MODE,
     fit_options: FitOptions | None = None,
-    max_files: int | None = None,
+    max_tumors: int | None = None,
     bic_df_scale: float = 1.0,
     bic_cluster_penalty: float = 0.0,
     selection_score: str = DEFAULT_SELECTION_SCORE,
@@ -887,25 +977,31 @@ def run_directory(
     write_outputs: bool = True,
     graph_file: str | Path | None = None,
     finalize_selected_fit: bool | None = None,
-    missing_cna_policy: str = "error",
+    unsupported_policy: str = "error",
+    dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     workers: int = 1,
     evaluate_all_candidates: bool | None = None,
 ) -> pd.DataFrame:
-    input_dir = Path(input_dir)
-    files = sorted(input_dir.glob("*.tsv"))
-    if max_files is not None:
-        files = files[: max(0, int(max_files))]
+    """Fit each valid immediate child tumor directory in a cohort."""
 
-    if not files:
-        raise RuntimeError(f"No TSV files found in {input_dir}")
+    cohort_dir = Path(cohort_dir)
+    tumor_dirs = sorted(
+        (path for path in cohort_dir.iterdir() if is_tumor_directory(path)),
+        key=lambda path: path.name,
+    )
+    if max_tumors is not None:
+        tumor_dirs = tumor_dirs[: max(0, int(max_tumors))]
+
+    if not tumor_dirs:
+        raise RuntimeError(f"No CliPP2 tumor input directories found in {cohort_dir}.")
 
     summaries = []
     worker_count = max(int(workers), 1)
     if worker_count <= 1:
-        for file_path in files:
+        for tumor_dir in tumor_dirs:
             try:
-                summary = process_one_file(
-                    file_path=file_path,
+                summary = process_tumor(
+                    tumor_dir=tumor_dir,
                     outdir=outdir,
                     simulation_root=simulation_root,
                     lambda_grid=lambda_grid,
@@ -919,7 +1015,8 @@ def run_directory(
                     graph_file=graph_file,
                     finalize_selected_fit=finalize_selected_fit,
                     evaluate_all_candidates=evaluate_all_candidates,
-                    missing_cna_policy=missing_cna_policy,
+                    unsupported_policy=unsupported_policy,
+                    dosage_prior_penalty=dosage_prior_penalty,
                 )
             except (
                 ExactSolverResourceLimit,
@@ -927,7 +1024,7 @@ def run_directory(
                 torch.OutOfMemoryError,
             ) as exc:
                 summary = _exact_resource_limit_summary(
-                    file_path, _normalize_resource_limit(exc)
+                    tumor_dir, _normalize_resource_limit(exc)
                 )
             summaries.append(summary)
     else:
@@ -957,8 +1054,8 @@ def run_directory(
         ) as executor:
             future_map = {
                 executor.submit(
-                    process_one_file,
-                    file_path=file_path,
+                    process_tumor,
+                    tumor_dir=tumor_dir,
                     outdir=outdir,
                     simulation_root=simulation_root,
                     lambda_grid=lambda_grid,
@@ -972,26 +1069,27 @@ def run_directory(
                     graph_file=graph_file,
                     finalize_selected_fit=finalize_selected_fit,
                     evaluate_all_candidates=evaluate_all_candidates,
-                    missing_cna_policy=missing_cna_policy,
-                ): file_path
-                for file_path in files
+                    unsupported_policy=unsupported_policy,
+                    dosage_prior_penalty=dosage_prior_penalty,
+                ): tumor_dir
+                for tumor_dir in tumor_dirs
             }
             ordered: dict[str, dict[str, float | int | str | bool]] = {}
             for future in cf.as_completed(future_map):
-                file_path = future_map[future]
+                tumor_dir = future_map[future]
                 try:
-                    ordered[file_path.stem] = future.result()
+                    ordered[tumor_dir.name] = future.result()
                 except (
                     ExactSolverResourceLimit,
                     MemoryError,
                     torch.OutOfMemoryError,
                 ) as exc:
-                    ordered[file_path.stem] = _exact_resource_limit_summary(
-                        file_path, _normalize_resource_limit(exc)
+                    ordered[tumor_dir.name] = _exact_resource_limit_summary(
+                        tumor_dir, _normalize_resource_limit(exc)
                     )
                 except Exception as exc:
-                    raise RuntimeError(f"Worker failed on {file_path}: {exc}") from exc
-            summaries = [ordered[file_path.stem] for file_path in files]
+                    raise RuntimeError(f"Worker failed on {tumor_dir}: {exc}") from exc
+            summaries = [ordered[tumor_dir.name] for tumor_dir in tumor_dirs]
 
     summary_df = pd.DataFrame(summaries)
     sort_column = "tumor_id"

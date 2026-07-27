@@ -14,7 +14,11 @@ from ..core.fusion.refit import (
     PartitionRefitResult,
     partition_constrained_observed_refit,
 )
-from ..core.fusion.solver import cluster_diameters_from_edges, cluster_labels_from_edges
+from ..core.fusion.solver import (
+    cluster_diameters_from_edges,
+    cluster_labels_from_edges,
+    uses_explicit_path_likelihood,
+)
 from ..core.fusion.torch_backend import dtype_name
 from ..core.fusion.types import SolverState, TorchRuntime
 from ..io.data import TumorData
@@ -33,6 +37,7 @@ from .partitions import (
     _cluster_sizes_text,
     _max_cluster_diameter,
     _multiplicity_summary_for_phi,
+    _path_posterior_for_phi,
     _partition_signature,
 )
 from .scoring import (
@@ -70,6 +75,15 @@ def _evaluate_simulation_metrics(
         "multiplicity_f1": np.nan,
         "multiplicity_asymmetric_f1": np.nan,
         "multiplicity_estimable_f1": np.nan,
+        "effective_multiplicity_rmse": np.nan,
+        "raw_effective_multiplicity_rmse": np.nan,
+        "summary_effective_multiplicity_rmse": np.nan,
+        "amplified_mutant_copy_f1": np.nan,
+        "raw_amplified_mutant_copy_f1": np.nan,
+        "summary_amplified_mutant_copy_f1": np.nan,
+        "n_effective_multiplicity_cells": np.nan,
+        "n_amplified_mutant_copy_cells": np.nan,
+        "n_true_amplified_mutant_copy_cells": np.nan,
         "estimated_clonal_fraction": np.nan,
         "true_clonal_fraction": np.nan,
         "clonal_fraction_error": np.nan,
@@ -116,6 +130,45 @@ def _evaluate_simulation_metrics(
                 np.nan
                 if evaluation.multiplicity_estimable_f1 is None
                 else evaluation.multiplicity_estimable_f1
+            ),
+            "effective_multiplicity_rmse": float(
+                np.nan
+                if evaluation.effective_multiplicity_rmse is None
+                else evaluation.effective_multiplicity_rmse
+            ),
+            "raw_effective_multiplicity_rmse": float(
+                np.nan
+                if evaluation.raw_effective_multiplicity_rmse is None
+                else evaluation.raw_effective_multiplicity_rmse
+            ),
+            "summary_effective_multiplicity_rmse": float(
+                np.nan
+                if evaluation.summary_effective_multiplicity_rmse is None
+                else evaluation.summary_effective_multiplicity_rmse
+            ),
+            "amplified_mutant_copy_f1": float(
+                np.nan
+                if evaluation.amplified_mutant_copy_f1 is None
+                else evaluation.amplified_mutant_copy_f1
+            ),
+            "raw_amplified_mutant_copy_f1": float(
+                np.nan
+                if evaluation.raw_amplified_mutant_copy_f1 is None
+                else evaluation.raw_amplified_mutant_copy_f1
+            ),
+            "summary_amplified_mutant_copy_f1": float(
+                np.nan
+                if evaluation.summary_amplified_mutant_copy_f1 is None
+                else evaluation.summary_amplified_mutant_copy_f1
+            ),
+            "n_effective_multiplicity_cells": int(
+                evaluation.n_effective_multiplicity_cells
+            ),
+            "n_amplified_mutant_copy_cells": int(
+                evaluation.n_amplified_mutant_copy_cells
+            ),
+            "n_true_amplified_mutant_copy_cells": int(
+                evaluation.n_true_amplified_mutant_copy_cells
             ),
             "estimated_clonal_fraction": float(evaluation.estimated_clonal_fraction),
             "true_clonal_fraction": float(evaluation.true_clonal_fraction),
@@ -212,7 +265,8 @@ def _evaluate_candidate(
     else:
         bic_refit_start_time = perf_counter()
         use_cuda_refit = bool(
-            getattr(runtime, "device", None) is not None
+            not uses_explicit_path_likelihood(data)
+            and getattr(runtime, "device", None) is not None
             and runtime.device.type == "cuda"
             and str(effective_fit_options.objective_shape)
             .strip()
@@ -652,6 +706,11 @@ def _evaluate_partition_candidate(
             eps=float(fit_options.eps),
         )
     )
+    path_posterior = _path_posterior_for_phi(
+        data,
+        phi_clustered,
+        eps=float(fit_options.eps),
+    )
     summary_tol = (
         max(10.0 * float(fit_options.tol), 1e-4)
         if fit_options.summary_tol is None
@@ -772,7 +831,11 @@ def _evaluate_partition_candidate(
         selection_eligible=bool(bic_selection_eligible),
         stationarity_certified=False,
         global_optimality_certified=False,
-        global_optimality_basis="partition_refit_unimodal_coordinate_search",
+        global_optimality_basis=(
+            "partition_refit_unimodal_coordinate_search"
+            if getattr(data, "path_likelihood", None) is None
+            else "partition_refit_path_multibasin_no_global_certificate"
+        ),
         number_of_starts=1,
         number_of_finite_starts=1 if finite_candidate_found else 0,
         best_start_objective=fit_loss,
@@ -781,6 +844,13 @@ def _evaluate_partition_candidate(
         selected_start_objective_rank=1,
         history=[],
         solver_state=None,
+        path_posterior=path_posterior,
+        likelihood_model_id=(
+            "clipp2_legacy_major_minor_v1"
+            if getattr(data, "path_likelihood", None) is None
+            else str(data.path_likelihood.model_id)
+        ),
+        likelihood_eps=float(fit_options.eps),
     )
     artifact = SelectionArtifact(
         bic=float(bic),
@@ -914,7 +984,11 @@ def _evaluate_partition_candidate(
         "raw_fit_status": "not_raw_fused_fit",
         "stationarity_certified": False,
         "global_optimality_certified": False,
-        "global_optimality_basis": "partition_refit_unimodal_coordinate_search",
+        "global_optimality_basis": (
+            "partition_refit_unimodal_coordinate_search"
+            if getattr(data, "path_likelihood", None) is None
+            else "partition_refit_path_multibasin_no_global_certificate"
+        ),
         "number_of_starts": 1,
         "number_of_finite_starts": 1 if finite_candidate_found else 0,
         "best_start_objective": float(fit_loss),

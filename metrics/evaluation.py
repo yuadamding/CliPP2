@@ -7,8 +7,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from ..core.fusion.path_summary import (
+    path_posterior_at_phi_numpy,
+    summarize_path_posterior_numpy,
+)
 from ..core.model import FitResult
 from ..io.data import TumorData
+from ..io.tumor_input import MODEL_ID as TUMOR_DIRECTORY_MODEL_ID
 
 
 @dataclass
@@ -33,6 +38,21 @@ class SimulationEvaluation:
     # asymmetric-copy metric. The explicit fields make both masks inspectable.
     multiplicity_asymmetric_f1: float | None = None
     multiplicity_estimable_f1: float | None = None
+    # Tumor-directory simulations have continuous effective multiplicity.
+    # The compatibility ``multiplicity_f1`` above remains the historical
+    # asymmetric major/minor score; the explicitly named fields below are the
+    # primary path-model multiplicity metrics.
+    effective_multiplicity_rmse: float | None = None
+    raw_effective_multiplicity_rmse: float | None = None
+    summary_effective_multiplicity_rmse: float | None = None
+    amplified_mutant_copy_f1: float | None = None
+    raw_amplified_mutant_copy_f1: float | None = None
+    summary_amplified_mutant_copy_f1: float | None = None
+    n_effective_multiplicity_cells: int = 0
+    # Number of finite cells entering amplified-copy classification, followed
+    # by the number of positive truth labels among those cells.
+    n_amplified_mutant_copy_cells: int = 0
+    n_true_amplified_mutant_copy_cells: int = 0
 
 
 @dataclass(frozen=True)
@@ -40,6 +60,62 @@ class SimulationTruth:
     truth_clusters: np.ndarray
     truth_phi: np.ndarray
     truth_multiplicity: np.ndarray | None
+    truth_effective_multiplicity: np.ndarray | None = None
+    truth_mutant_copy_mass: np.ndarray | None = None
+
+
+def path_truth_emission_distance(
+    data: TumorData,
+    truth_phi: np.ndarray,
+    truth_mutant_copy_mass: np.ndarray,
+) -> np.ndarray:
+    """Return the closest compiled mutant-copy mass for each benchmark truth cell."""
+
+    spec = data.path_likelihood
+    if spec is None or spec.model_id != TUMOR_DIRECTORY_MODEL_ID:
+        raise ValueError(
+            "TumorData does not contain a compiled tumor-directory likelihood."
+        )
+    shape = (data.num_mutations, data.num_regions)
+    phi = np.asarray(truth_phi, dtype=np.float64)
+    truth_mass = np.asarray(truth_mutant_copy_mass, dtype=np.float64)
+    if phi.shape != shape or truth_mass.shape != shape:
+        raise ValueError(
+            "truth_phi and truth_mutant_copy_mass must both have shape "
+            f"{shape}; received {phi.shape} and {truth_mass.shape}."
+        )
+    if not np.all(np.isfinite(phi)) or np.any((phi < -1e-8) | (phi > 1.0 + 1e-8)):
+        raise ValueError("truth_phi must be finite and lie within tolerance of [0, 1].")
+    phi = np.clip(phi, 0.0, 1.0)
+    if not np.all(np.isfinite(truth_mass)) or np.any(truth_mass < 0.0):
+        raise ValueError("truth_mutant_copy_mass must be finite and nonnegative.")
+
+    expanded_phi = phi[..., None]
+    candidate_mass = spec.first_copy * np.minimum(
+        expanded_phi,
+        spec.switch_fraction,
+    )
+    candidate_mass += spec.second_copy * np.maximum(
+        expanded_phi - spec.switch_fraction,
+        0.0,
+    )
+    candidate_distance = np.where(
+        spec.valid,
+        np.abs(candidate_mass - truth_mass[..., None]),
+        np.inf,
+    )
+    distance = np.min(candidate_distance, axis=-1)
+
+    unsupported = data.path_unsupported_reason
+    if unsupported is not None:
+        unsupported_array = np.asarray(unsupported, dtype=object)
+        if unsupported_array.shape != shape:
+            raise ValueError(
+                "TumorData.path_unsupported_reason must have shape "
+                f"{shape}, not {unsupported_array.shape}."
+            )
+        distance = np.where(pd.isna(unsupported_array), distance, np.inf)
+    return distance
 
 
 def _comb2(values: np.ndarray) -> np.ndarray:
@@ -112,6 +188,22 @@ def _macro_binary_f1(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(0.5 * (_f1(tp0, fp0, fn0) + _f1(tp1, fp1, fn1)))
 
 
+def _positive_binary_f1(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Return positive-class F1, or NaN when truth contains no positives."""
+
+    truth = np.asarray(y_true, dtype=bool).reshape(-1)
+    prediction = np.asarray(y_pred, dtype=bool).reshape(-1)
+    if truth.shape != prediction.shape:
+        raise ValueError("y_true and y_pred must have the same shape.")
+    true_positive = int(np.sum(truth & prediction))
+    false_positive = int(np.sum(~truth & prediction))
+    false_negative = int(np.sum(truth & ~prediction))
+    if true_positive + false_negative == 0:
+        return float("nan")
+    denominator = 2 * true_positive + false_positive + false_negative
+    return 0.0 if denominator == 0 else float(2 * true_positive / denominator)
+
+
 def _multiplicity_f1_for_mask(
     *,
     truth_multiplicity: np.ndarray,
@@ -137,10 +229,10 @@ def _multiplicity_f1_for_mask(
 
 
 def _region_index_from_label(region_id: str) -> int:
-    match = re.search(r"(?:sample|region)(\d+)$", region_id)
+    match = re.fullmatch(r"region([1-9]\d*)", str(region_id))
     if match is None:
         raise ValueError(f"Could not parse region index from '{region_id}'")
-    return int(match.group(1))
+    return int(match.group(1)) - 1
 
 
 def _reindex_by_mutation_id(
@@ -242,6 +334,117 @@ def _load_single_region_truth(
     return truth_clusters, truth_phi, truth_multiplicity
 
 
+def _truth_sample_index(value: object) -> int:
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        numeric = float(value)
+        if np.isfinite(numeric) and numeric.is_integer():
+            return int(numeric)
+    return _region_index_from_label(str(value))
+
+
+def _load_revised_mutation_sample_truth(
+    *,
+    tumor_dir: Path,
+    data: TumorData,
+    truth_clusters: np.ndarray,
+) -> SimulationTruth:
+    """Load continuous clone-mixture truth without reading observed CNA calls."""
+
+    truth_path = tumor_dir / "truth_mutation_sample.tsv"
+    frame = pd.read_csv(truth_path, sep="\t")
+    required = {
+        "mutation_id",
+        "sample_id",
+        "ccf",
+        "mutant_copy_mass",
+        "effective_multiplicity",
+    }
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(
+            f"Revised simulation truth is missing columns {missing}: {truth_path}"
+        )
+    frame = frame.copy()
+    frame["_mutation_id"] = frame["mutation_id"].astype(str)
+    frame["_sample_index"] = [
+        _truth_sample_index(value) for value in frame["sample_id"]
+    ]
+    if bool(frame.duplicated(["_mutation_id", "_sample_index"]).any()):
+        raise ValueError(
+            f"Duplicate mutation_id/sample_id rows in revised truth: {truth_path}"
+        )
+    expected_samples = {
+        _region_index_from_label(region_id) for region_id in data.region_ids
+    }
+    if set(frame["_sample_index"]) != expected_samples:
+        raise ValueError(
+            f"Revised truth sample IDs do not match TumorData regions for "
+            f"{data.tumor_id!r}."
+        )
+    expected_pairs = {
+        (str(mutation_id), sample_index)
+        for mutation_id in data.mutation_ids
+        for sample_index in expected_samples
+    }
+    observed_pairs = set(zip(frame["_mutation_id"], frame["_sample_index"]))
+    if observed_pairs != expected_pairs:
+        missing_pairs = sorted(expected_pairs.difference(observed_pairs))[:5]
+        extra_pairs = sorted(observed_pairs.difference(expected_pairs))[:5]
+        raise ValueError(
+            "Revised truth does not contain the complete mutation-region product; "
+            f"missing={missing_pairs}, extra={extra_pairs}."
+        )
+
+    lookup = frame.set_index(["_mutation_id", "_sample_index"])
+    shape = (data.num_mutations, data.num_regions)
+    truth_phi = np.empty(shape, dtype=np.float64)
+    truth_mass = np.empty(shape, dtype=np.float64)
+    truth_effective = np.empty(shape, dtype=np.float64)
+    for mutation_index, mutation_id in enumerate(data.mutation_ids):
+        for region_index, region_id in enumerate(data.region_ids):
+            sample_index = _region_index_from_label(region_id)
+            row = lookup.loc[(str(mutation_id), sample_index)]
+            truth_phi[mutation_index, region_index] = float(row["ccf"])
+            truth_mass[mutation_index, region_index] = float(row["mutant_copy_mass"])
+            truth_effective[mutation_index, region_index] = float(
+                row["effective_multiplicity"]
+            )
+
+    for name, values in (
+        ("ccf", truth_phi),
+        ("mutant_copy_mass", truth_mass),
+        ("effective_multiplicity", truth_effective),
+    ):
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Revised simulation truth {name} must be finite.")
+    if np.any((truth_phi <= 0.0) | (truth_phi > 1.0 + 1e-8)):
+        raise ValueError("Revised simulation truth CCF must lie in (0, 1].")
+    if np.any(truth_mass <= 0.0) or np.any(truth_effective <= 0.0):
+        raise ValueError(
+            "Revised simulation mutant-copy mass and effective multiplicity "
+            "must be positive."
+        )
+    if not np.allclose(
+        truth_mass,
+        truth_phi * truth_effective,
+        atol=1e-8,
+        rtol=1e-8,
+    ):
+        raise ValueError(
+            "Revised simulation effective multiplicity is inconsistent with "
+            "mutant-copy mass / CCF."
+        )
+    return SimulationTruth(
+        truth_clusters=truth_clusters,
+        truth_phi=truth_phi,
+        truth_multiplicity=None,
+        truth_effective_multiplicity=truth_effective,
+        truth_mutant_copy_mass=truth_mass,
+    )
+
+
 def _cluster_level_clonal_fraction(phi: np.ndarray, labels: np.ndarray) -> float:
     if phi.size == 0 or labels.size == 0:
         return float("nan")
@@ -270,16 +473,6 @@ def load_simulation_truth(
             f"Simulation directory not found for tumor '{data.tumor_id}': {tumor_dir}"
         )
 
-    if data.num_regions == 1 and (tumor_dir / "truth_cp.txt").exists():
-        truth_clusters, truth_phi, truth_multiplicity = _load_single_region_truth(
-            tumor_dir=tumor_dir, data=data
-        )
-        return SimulationTruth(
-            truth_clusters=truth_clusters,
-            truth_phi=truth_phi,
-            truth_multiplicity=truth_multiplicity,
-        )
-
     truth_df = pd.read_csv(tumor_dir / "truth.txt", sep="\t")
     truth_ids: list[str] | None = (
         truth_df["mutation_id"].astype(str).tolist()
@@ -294,6 +487,22 @@ def load_simulation_truth(
         "truth.txt/cluster_id",
         data.tumor_id,
     )
+    if (tumor_dir / "truth_mutation_sample.tsv").is_file():
+        return _load_revised_mutation_sample_truth(
+            tumor_dir=tumor_dir,
+            data=data,
+            truth_clusters=truth_clusters,
+        )
+
+    if data.num_regions == 1 and (tumor_dir / "truth_cp.txt").exists():
+        truth_clusters, truth_phi, truth_multiplicity = _load_single_region_truth(
+            tumor_dir=tumor_dir, data=data
+        )
+        return SimulationTruth(
+            truth_clusters=truth_clusters,
+            truth_phi=truth_phi,
+            truth_multiplicity=truth_multiplicity,
+        )
 
     truth_phi = np.zeros((data.num_mutations, data.num_regions), dtype=np.float32)
     truth_multiplicity = np.zeros(
@@ -301,8 +510,8 @@ def load_simulation_truth(
     )
 
     for column, region_id in enumerate(data.region_ids):
-        region_index = _region_index_from_label(region_id)
-        region_dir = tumor_dir / f"sample{region_index}"
+        _region_index_from_label(region_id)
+        region_dir = tumor_dir / str(region_id)
         truth_cp = pd.read_csv(region_dir / "truth_cp.txt", sep="\t")
         cna = pd.read_csv(region_dir / "cna.txt", sep="\t")
 
@@ -315,7 +524,7 @@ def load_simulation_truth(
             truth_cp["ccf"].to_numpy(dtype=np.float32),
             cp_ids,
             data.mutation_ids,
-            f"sample{region_index}/truth_cp.txt/ccf",
+            f"{region_id}/truth_cp.txt/ccf",
             data.tumor_id,
         )
         truth_phi[:, column] = aligned_ccf
@@ -329,7 +538,7 @@ def load_simulation_truth(
             cna["multiplicity"].to_numpy(dtype=np.float32),
             cna_ids,
             data.mutation_ids,
-            f"sample{region_index}/cna.txt/multiplicity",
+            f"{region_id}/cna.txt/multiplicity",
             data.tumor_id,
         )
         truth_multiplicity[:, column] = aligned_mult
@@ -339,6 +548,131 @@ def load_simulation_truth(
         truth_phi=truth_phi,
         truth_multiplicity=truth_multiplicity,
     )
+
+
+def _path_effective_predictions(
+    *,
+    fit: FitResult,
+    data: TumorData,
+    phi: np.ndarray,
+    posterior: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    spec = data.path_likelihood
+    if spec is None:
+        multiplicity = np.asarray(fit.multiplicity_call, dtype=np.float64)
+        return multiplicity, multiplicity > 1.0 + 1e-8
+    evaluated_posterior = (
+        path_posterior_at_phi_numpy(
+            data,
+            phi,
+            eps=float(getattr(fit, "likelihood_eps", 1e-6)),
+        )
+        if posterior is None
+        else np.asarray(posterior, dtype=np.float64)
+    )
+    observed = (
+        np.ones_like(np.asarray(phi), dtype=bool)
+        if data.count_observed is None
+        else np.asarray(data.count_observed, dtype=bool)
+    )
+    summary = summarize_path_posterior_numpy(
+        spec,
+        phi=np.asarray(phi, dtype=np.float64),
+        posterior=evaluated_posterior,
+        supported=observed,
+    )
+    return (
+        np.asarray(summary["posterior_effective_multiplicity"], dtype=np.float64),
+        np.asarray(summary["amplified_mutant_copy_call"], dtype=np.float64) >= 0.5,
+    )
+
+
+def _revised_multiplicity_metrics(
+    *,
+    fit: FitResult,
+    data: TumorData,
+    truth: SimulationTruth,
+) -> dict[str, float | int]:
+    truth_effective = truth.truth_effective_multiplicity
+    truth_mass = truth.truth_mutant_copy_mass
+    if truth_effective is None or truth_mass is None:
+        return {
+            "effective_multiplicity_rmse": float("nan"),
+            "raw_effective_multiplicity_rmse": float("nan"),
+            "summary_effective_multiplicity_rmse": float("nan"),
+            "amplified_mutant_copy_f1": float("nan"),
+            "raw_amplified_mutant_copy_f1": float("nan"),
+            "summary_amplified_mutant_copy_f1": float("nan"),
+            "n_effective_multiplicity_cells": 0,
+            "n_amplified_mutant_copy_cells": 0,
+            "n_true_amplified_mutant_copy_cells": 0,
+        }
+
+    raw_effective, raw_amplified = _path_effective_predictions(
+        fit=fit,
+        data=data,
+        phi=np.asarray(fit.phi, dtype=np.float64),
+        posterior=getattr(fit, "path_posterior", None),
+    )
+    summary_effective, summary_amplified = _path_effective_predictions(
+        fit=fit,
+        data=data,
+        phi=np.asarray(fit.phi_clustered, dtype=np.float64),
+        posterior=(
+            None
+            if data.path_likelihood is not None
+            else getattr(fit, "path_posterior", None)
+        ),
+    )
+    observed = (
+        np.ones_like(truth_effective, dtype=bool)
+        if data.count_observed is None
+        else np.asarray(data.count_observed, dtype=bool)
+    )
+    finite = (
+        observed
+        & np.isfinite(truth_effective)
+        & np.isfinite(raw_effective)
+        & np.isfinite(summary_effective)
+    )
+    if not np.any(finite):
+        return {
+            "effective_multiplicity_rmse": float("nan"),
+            "raw_effective_multiplicity_rmse": float("nan"),
+            "summary_effective_multiplicity_rmse": float("nan"),
+            "amplified_mutant_copy_f1": float("nan"),
+            "raw_amplified_mutant_copy_f1": float("nan"),
+            "summary_amplified_mutant_copy_f1": float("nan"),
+            "n_effective_multiplicity_cells": 0,
+            "n_amplified_mutant_copy_cells": 0,
+            "n_true_amplified_mutant_copy_cells": 0,
+        }
+    raw_rmse = float(
+        np.sqrt(np.mean((raw_effective[finite] - truth_effective[finite]) ** 2))
+    )
+    summary_rmse = float(
+        np.sqrt(np.mean((summary_effective[finite] - truth_effective[finite]) ** 2))
+    )
+    true_amplified = np.asarray(truth_mass) > np.asarray(truth.truth_phi) + 1e-8
+    raw_f1 = _positive_binary_f1(
+        true_amplified[finite],
+        raw_amplified[finite],
+    )
+    summary_f1 = _positive_binary_f1(
+        true_amplified[finite],
+        summary_amplified[finite],
+    )
+    return {
+        "effective_multiplicity_rmse": summary_rmse,
+        "raw_effective_multiplicity_rmse": raw_rmse,
+        "summary_effective_multiplicity_rmse": summary_rmse,
+        "amplified_mutant_copy_f1": summary_f1,
+        "raw_amplified_mutant_copy_f1": raw_f1,
+        "summary_amplified_mutant_copy_f1": summary_f1,
+        "n_effective_multiplicity_cells": int(np.sum(finite)),
+        "n_amplified_mutant_copy_cells": int(np.sum(finite)),
+        "n_true_amplified_mutant_copy_cells": int(np.sum(true_amplified[finite])),
+    }
 
 
 def evaluate_fit_against_simulation(
@@ -377,6 +711,15 @@ def evaluate_fit_against_simulation(
             summary_cp_rmse=float("nan"),
             multiplicity_asymmetric_f1=float("nan"),
             multiplicity_estimable_f1=float("nan"),
+            effective_multiplicity_rmse=float("nan"),
+            raw_effective_multiplicity_rmse=float("nan"),
+            summary_effective_multiplicity_rmse=float("nan"),
+            amplified_mutant_copy_f1=float("nan"),
+            raw_amplified_mutant_copy_f1=float("nan"),
+            summary_amplified_mutant_copy_f1=float("nan"),
+            n_effective_multiplicity_cells=0,
+            n_amplified_mutant_copy_cells=0,
+            n_true_amplified_mutant_copy_cells=0,
         )
 
     ari = _adjusted_rand_index(truth_clusters, fit.cluster_labels)
@@ -414,6 +757,12 @@ def evaluate_fit_against_simulation(
             mask=data.multiplicity_estimation_mask,
         )
         multiplicity_f1 = multiplicity_asymmetric_f1
+
+    revised_metrics = _revised_multiplicity_metrics(
+        fit=fit,
+        data=data,
+        truth=simulation_truth,
+    )
 
     bic_refit_ari: float | None = None
     bic_refit_cp_rmse: float | None = None
@@ -453,4 +802,29 @@ def evaluate_fit_against_simulation(
         bic_refit_cp_rmse=bic_refit_cp_rmse,
         multiplicity_asymmetric_f1=multiplicity_asymmetric_f1,
         multiplicity_estimable_f1=multiplicity_estimable_f1,
+        effective_multiplicity_rmse=float(
+            revised_metrics["effective_multiplicity_rmse"]
+        ),
+        raw_effective_multiplicity_rmse=float(
+            revised_metrics["raw_effective_multiplicity_rmse"]
+        ),
+        summary_effective_multiplicity_rmse=float(
+            revised_metrics["summary_effective_multiplicity_rmse"]
+        ),
+        amplified_mutant_copy_f1=float(revised_metrics["amplified_mutant_copy_f1"]),
+        raw_amplified_mutant_copy_f1=float(
+            revised_metrics["raw_amplified_mutant_copy_f1"]
+        ),
+        summary_amplified_mutant_copy_f1=float(
+            revised_metrics["summary_amplified_mutant_copy_f1"]
+        ),
+        n_effective_multiplicity_cells=int(
+            revised_metrics["n_effective_multiplicity_cells"]
+        ),
+        n_amplified_mutant_copy_cells=int(
+            revised_metrics["n_amplified_mutant_copy_cells"]
+        ),
+        n_true_amplified_mutant_copy_cells=int(
+            revised_metrics["n_true_amplified_mutant_copy_cells"]
+        ),
     )

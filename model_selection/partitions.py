@@ -6,6 +6,7 @@ import numpy as np
 
 from ..io.data import TumorData
 from ..core.fusion.multiplicity import infer_multiplicity_posterior_numpy
+from ..core.fusion.torch_backend import path_mutation_region_terms_numpy
 from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.fusion.refit import _canonical_labels as _canonical_partition_labels
 from .config import (
@@ -207,6 +208,15 @@ def _multiplicity_summary_for_phi(
     major_prior: float = 0.5,
     eps: float = 1e-6,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    path_spec = getattr(data, "path_likelihood", None)
+    if path_spec is not None:
+        shape = np.asarray(phi).shape
+        return (
+            np.full(shape, np.nan, dtype=np.float64),
+            np.zeros(shape, dtype=bool),
+            np.full(shape, np.nan, dtype=np.float64),
+            np.zeros(shape, dtype=bool),
+        )
     posterior = infer_multiplicity_posterior_numpy(
         data,
         phi,
@@ -219,3 +229,23 @@ def _multiplicity_summary_for_phi(
         posterior.multiplicity_call,
         posterior.estimation_mask,
     )
+
+
+def _path_posterior_for_phi(
+    data: TumorData,
+    phi: np.ndarray,
+    *,
+    eps: float,
+) -> np.ndarray | None:
+    path_spec = getattr(data, "path_likelihood", None)
+    if path_spec is None:
+        return None
+    return path_mutation_region_terms_numpy(
+        path_spec,
+        scaling=np.asarray(data.scaling, dtype=np.float64),
+        alt=np.asarray(data.alt_counts, dtype=np.float64),
+        total=np.asarray(data.total_counts, dtype=np.float64),
+        phi=np.asarray(phi, dtype=np.float64),
+        eps=float(eps),
+        count_observed=data.count_observed,
+    ).path_posterior

@@ -21,6 +21,7 @@ from .defaults import (
 SmoothGradientScope: TypeAlias = Literal[
     "mm_surrogate",
     "observed_objective",
+    "clarke_piecewise_observed_objective_subgradient",
 ]
 CertificateScope: TypeAlias = Literal["full_original_graph"]
 CertificateStatus: TypeAlias = Literal[
@@ -394,6 +395,8 @@ class FusionFitArtifacts:
     inner_solver: str = "unknown"
     certificate: GraphFusionCertificate | None = None
     exactness_provenance: ExactFusionProvenance | None = None
+    path_posterior: np.ndarray | None = None
+    likelihood_model_id: str = "clipp2_legacy_major_minor_v1"
 
 
 @dataclass(frozen=True)
@@ -416,6 +419,9 @@ class TensorProblem:
     eps: float
     major_prior: float
     count_observed: torch.Tensor | None = None
+    # Kept opaque here to avoid a types/backend import cycle.  The concrete
+    # value is ``TorchPathLikelihoodSpec`` when an explicit path model is used.
+    path_likelihood: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -507,3 +513,4 @@ class TorchFitResult:
     inner_solver: str = "unknown"
     certificate: GraphFusionCertificate | None = None
     exactness_provenance: ExactFusionProvenance | None = None
+    path_posterior: torch.Tensor | None = None

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 DEFAULT_SELECTION_SCORE = "partition_icl"
+DEFAULT_LAMBDA_GRID_MODE = "partition_guided_admm"
 SELECTION_SCORE_NAMES = ("partition_icl", "bic", "extended_bic")
 PARTITION_ICL_DIRICHLET_ALPHA = 1.0
 
