@@ -1,6 +1,8 @@
-"""Compact facade for the fixed pairwise-fusion estimator internals."""
+"""Fixed pairwise-fusion estimator internals.
 
-from .solver import fit_observed_data_pairwise_fusion as fit
-from .types import PairwiseFusionGraph
-
-__all__ = ["PairwiseFusionGraph", "fit"]
+Deliberately empty: every consumer imports the submodule it needs directly
+(``from .fusion.solver import ...``, ``from ..core.fusion.types import ...``).
+Re-exporting here would force the solver and the whole Torch backend to load on
+any ``core.fusion`` import, which defeats the leaf-module layering that
+``core/bic.py`` and ``core/fusion/types.py`` are designed around.
+"""

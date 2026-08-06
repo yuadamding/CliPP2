@@ -1,56 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-
-def canonicalize_single_switch_path_values(
-    candidates: Iterable[tuple[float, float, float]],
-) -> tuple[np.ndarray, np.ndarray]:
-    """Canonicalize numeric single-switch paths and assign a uniform prior.
-
-    Each candidate is ``(first_copy, second_copy, switch_fraction)``. Equal
-    slopes describe the same linear function for every switch, so they are
-    represented with ``switch_fraction=1`` before exact deduplication.
-    """
-
-    canonical: set[tuple[float, float, float]] = set()
-    for index, candidate in enumerate(candidates):
-        values = np.asarray(candidate, dtype=np.float64)
-        if values.shape != (3,):
-            raise ValueError(
-                "Every path candidate must be a three-value "
-                "(first_copy, second_copy, switch_fraction) tuple; "
-                f"candidate {index} has shape {values.shape}."
-            )
-        if not np.all(np.isfinite(values)):
-            raise ValueError(f"Path candidate {index} contains a non-finite value.")
-        first_copy, second_copy, switch_fraction = (float(value) for value in values)
-        if first_copy < 0.0 or second_copy < 0.0:
-            raise ValueError(
-                f"Path candidate {index} has a negative copy-number slope."
-            )
-        if not 0.0 <= switch_fraction <= 1.0:
-            raise ValueError(
-                f"Path candidate {index} has switch_fraction outside [0, 1]."
-            )
-        if first_copy == second_copy:
-            switch_fraction = 1.0
-        canonical.add((first_copy, second_copy, switch_fraction))
-
-    if not canonical:
-        raise ValueError("At least one path candidate is required.")
-    ordered = sorted(canonical, key=lambda item: (item[2], item[0], item[1]))
-    paths = np.asarray(ordered, dtype=np.float64)
-    log_prior = np.full(len(ordered), -np.log(float(len(ordered))), dtype=np.float64)
-    paths.setflags(write=False)
-    log_prior.setflags(write=False)
-    return paths, log_prior
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,53 +375,6 @@ def tumor_objective_fingerprint(data: TumorData) -> str:
     return digest.hexdigest()
 
 
-def legacy_path_likelihood_spec(
-    data: TumorData,
-    *,
-    major_prior: float,
-) -> PathLikelihoodSpec:
-    """Represent the historical fixed/major-minor likelihood categorically.
-
-    This adapter is intentionally explicit rather than installed by default:
-    leaving ``TumorData.path_likelihood`` unset keeps every legacy solver path
-    and result bit-for-bit unchanged while allowing parity tests and gradual
-    generic-likelihood integration.
-    """
-
-    prior = float(major_prior)
-    if not np.isfinite(prior) or not (0.0 < prior < 1.0):
-        raise ValueError("major_prior must lie strictly in (0, 1).")
-    shape = (int(data.num_mutations), int(data.num_regions), 2)
-    ambiguous = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
-    first_copy = np.stack(
-        (
-            np.asarray(data.minor_cn, dtype=np.float64),
-            np.asarray(data.major_cn, dtype=np.float64),
-        ),
-        axis=-1,
-    )
-    second_copy = first_copy.copy()
-    switch_fraction = np.ones(shape, dtype=np.float64)
-    valid = np.stack((ambiguous, np.ones_like(ambiguous)), axis=-1)
-    log_prior = np.full(shape, -np.inf, dtype=np.float64)
-    log_prior[..., 0] = np.where(ambiguous, np.log1p(-prior), -np.inf)
-    log_prior[..., 1] = np.where(ambiguous, np.log(prior), 0.0)
-    legacy_major_indicator = np.zeros(shape, dtype=bool)
-    legacy_major_indicator[..., 1] = True
-    return PathLikelihoodSpec(
-        model_id="clipp2_legacy_major_minor_v1",
-        model_version="1",
-        candidate_generator_version="legacy_major_minor_adapter_v1",
-        prior_mode="configured_major_prior_v1",
-        first_copy=first_copy,
-        second_copy=second_copy,
-        switch_fraction=switch_fraction,
-        log_prior=log_prior,
-        valid=valid,
-        legacy_major_indicator=legacy_major_indicator,
-    )
-
-
 def _first_seen(values: pd.Series) -> list[str]:
     return list(pd.Index(values.astype(str)).drop_duplicates())
 
@@ -834,9 +742,7 @@ def _load_observation_tsv(
 __all__ = [
     "PathLikelihoodSpec",
     "TumorData",
-    "canonicalize_single_switch_path_values",
     "compute_phi_init_from_counts",
-    "legacy_path_likelihood_spec",
     "tumor_data_fingerprint",
     "tumor_objective_fingerprint",
 ]

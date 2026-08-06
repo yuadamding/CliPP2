@@ -60,101 +60,6 @@ class FitOptions:
     verbose: bool = False
 
 
-@dataclass(frozen=True)
-class Problem:
-    data: TumorData
-    graph: PairwiseFusionGraph
-    lambda_value: float
-    major_prior: float = 0.5
-    eps: float = 1e-6
-
-
-@dataclass(frozen=True)
-class SolverOptions:
-    outer_max_iter: int = 8
-    inner_max_iter: int = 30
-    tol: float = DEFAULT_OPTIMIZATION_TOLERANCE
-    device: str = DEFAULT_DEVICE
-    dtype: str = DEFAULT_DTYPE
-    compute_summary: bool = False
-    summary_tol: float | None = 1e-4
-    bic_partition_tol: float | None = 1e-4
-    inner_backend: str = DEFAULT_INNER_BACKEND
-    workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES
-    compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES
-    dense_fallback_policy: str = DEFAULT_DENSE_FALLBACK_POLICY
-    workset_add_batch: int = DEFAULT_WORKSET_ADD_BATCH
-    workset_max_expansions: int = DEFAULT_WORKSET_MAX_EXPANSIONS
-    certificate_max_iter: int = DEFAULT_CERTIFICATE_MAX_ITER
-    certificate_refinement_rounds: int = DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS
-    certificate_column_tol_scale: float = DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE
-    allow_heuristic_structure_splits: bool = True
-    materialize_full_dual: bool = False
-    verbose: bool = False
-
-    def to_fit_options(self, problem: Problem) -> FitOptions:
-        return FitOptions(
-            lambda_value=float(problem.lambda_value),
-            outer_max_iter=int(self.outer_max_iter),
-            inner_max_iter=int(self.inner_max_iter),
-            tol=float(self.tol),
-            major_prior=float(problem.major_prior),
-            eps=float(problem.eps),
-            graph=problem.graph,
-            device=str(self.device),
-            dtype=str(self.dtype),
-            summary_tol=self.summary_tol,
-            bic_partition_tol=self.bic_partition_tol,
-            inner_backend=str(self.inner_backend),
-            workset_max_bytes=int(self.workset_max_bytes),
-            compressed_cache_max_bytes=int(self.compressed_cache_max_bytes),
-            dense_fallback_policy=str(self.dense_fallback_policy),
-            workset_add_batch=int(self.workset_add_batch),
-            workset_max_expansions=int(self.workset_max_expansions),
-            certificate_max_iter=int(self.certificate_max_iter),
-            certificate_refinement_rounds=int(self.certificate_refinement_rounds),
-            certificate_column_tol_scale=float(self.certificate_column_tol_scale),
-            allow_heuristic_structure_splits=bool(
-                self.allow_heuristic_structure_splits
-            ),
-            materialize_full_dual=bool(self.materialize_full_dual),
-            verbose=bool(self.verbose),
-        )
-
-
-@dataclass(frozen=True)
-class Estimate:
-    phi: np.ndarray
-    objective: float
-    loglik: float
-    lambda_value: float
-    graph_name: str
-
-
-@dataclass(frozen=True)
-class Diagnostics:
-    converged: bool
-    outer_iterations: int
-    inner_iterations: int
-    objective_history: tuple[float, ...]
-    fixed_objective_kkt_residual: float | None = None
-    inner_kkt_residual: float | None = None
-    failure_reason: str | None = None
-    admm_iterations: int = 0
-    inner_solver: str = "unknown"
-    full_kkt_certified: bool = False
-    certificate_scope: str = "unknown"
-    certificate_gradient_scope: str = "unknown"
-
-
-@dataclass(frozen=True)
-class Summary:
-    cluster_labels: np.ndarray | None = None
-    cluster_centers: np.ndarray | None = None
-    major_probability: np.ndarray | None = None
-    multiplicity_call: np.ndarray | None = None
-
-
 @dataclass
 class FitResult:
     phi: np.ndarray
@@ -277,46 +182,6 @@ class FitResult:
     path_posterior: np.ndarray | None = None
     likelihood_model_id: str = "clipp2_legacy_major_minor_v1"
     likelihood_eps: float = 1e-6
-
-    @property
-    def estimate(self) -> Estimate:
-        return Estimate(
-            phi=self.phi,
-            objective=float(self.penalized_objective),
-            loglik=float(self.loglik),
-            lambda_value=float(self.lambda_value),
-            graph_name=str(self.graph_name),
-        )
-
-    @property
-    def diagnostics(self) -> Diagnostics:
-        return Diagnostics(
-            converged=bool(self.converged),
-            outer_iterations=int(self.iterations),
-            inner_iterations=int(self.inner_iterations),
-            objective_history=tuple(float(value) for value in self.history),
-            fixed_objective_kkt_residual=float(self.fixed_objective_kkt_residual),
-            inner_kkt_residual=float(self.inner_kkt_residual),
-            failure_reason=str(self.failure_reason or ""),
-            admm_iterations=int(self.admm_iterations),
-            inner_solver=str(self.inner_solver),
-            full_kkt_certified=bool(self.full_kkt_certified),
-            certificate_scope=str(self.certificate_scope),
-            certificate_gradient_scope=str(self.certificate_gradient_scope),
-        )
-
-    @property
-    def summary(self) -> Summary | None:
-        if not self.summary_available:
-            return None
-        if self.cluster_labels is None and self.cluster_centers is None:
-            return None
-        return Summary(
-            cluster_labels=self.cluster_labels,
-            cluster_centers=self.cluster_centers,
-            major_probability=self.major_probability,
-            multiplicity_call=self.multiplicity_call,
-        )
 
 
 def fit_fixed_objective(
@@ -589,23 +454,8 @@ def fit_fixed_objective(
     )
 
 
-def fit(problem: Problem, options: SolverOptions | None = None) -> FitResult:
-    solver_options = SolverOptions() if options is None else options
-    return fit_fixed_objective(
-        problem.data,
-        solver_options.to_fit_options(problem),
-        compute_summary=bool(solver_options.compute_summary),
-    )
-
-
 __all__ = [
-    "Diagnostics",
-    "Estimate",
     "FitOptions",
     "FitResult",
-    "Problem",
-    "SolverOptions",
-    "Summary",
-    "fit",
     "fit_fixed_objective",
 ]

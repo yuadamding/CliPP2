@@ -8,7 +8,6 @@ from pathlib import Path
 import numpy as np
 
 DEFAULT_CNA_EVENT_RATE = 1.5
-DEFAULT_CNA_EVENT_RATE_GRID = (1.0, 1.5, 2.0)
 DEFAULT_MAX_LOCAL_CN_STATES_PER_MUTATION = 2
 DEFAULT_MIN_TWO_STATE_SNV_FRACTION = 0.60
 GENERATOR_VERSION = "evolution_gain_only_benchmark_v5"
@@ -37,36 +36,6 @@ class CopyNumberEvolutionConfig:
     allow_losses: bool = False
     allow_cnloh: bool = False
     allow_wgd: bool = False
-
-
-@dataclass(frozen=True)
-class SimulationGridConfig:
-    out_dir: str | Path = "CliPP2Sim"
-    purity_list: tuple[float, ...] = (0.3, 0.6, 0.9)
-    amp_rate_list: tuple[float, ...] = DEFAULT_CNA_EVENT_RATE_GRID
-    N_list: tuple[int, ...] = (50, 75, 100, 200, 300, 400, 500, 1000)
-    n_samples_list: tuple[int, ...] = (2, 5, 10, 15)
-    reps: int = 20
-    seed: int | None = None
-    K_min: int = 2
-    K_max: int = 10
-    lambda_mut: int = 2000
-    lambda_mut_list: tuple[int, ...] | None = (300, 600, 1000, 2000, 4000)
-    alpha_mut: float = 10.0
-    alpha_split: float = 1.0
-    alpha_lambda: float = 5.0
-    tau_lineage_min: float = 1.0
-    tau_lineage_max: float = 50.0
-    purity_conc: float = 50.0
-    lineage_zero_prob: float = 0.0
-    min_clone_ccf: float = 0.02
-    min_clone_ccf_l2_norm: float = 0.05
-    min_mutations_per_clone: int = 15
-    min_clone_ccf_distance: float = 0.10
-    max_rejection_tries: int = 1024
-    copy_number: CopyNumberEvolutionConfig = field(
-        default_factory=CopyNumberEvolutionConfig
-    )
 
 
 @dataclass(frozen=True)
@@ -147,6 +116,5 @@ def _validate_copy_number_config(config: CopyNumberEvolutionConfig) -> None:
 
 __all__ = [
     "CopyNumberEvolutionConfig",
-    "SimulationGridConfig",
     "TumorSimulationConfig",
 ]

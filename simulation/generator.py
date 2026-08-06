@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import itertools as its
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -13,7 +12,6 @@ import pandas as pd
 from ..io.tumor_txt import TUMOR_TXT_SCHEMA, write_tumor_txt
 from .config import (
     CopyNumberEvolutionConfig,
-    SimulationGridConfig,
     TumorSimulationConfig,
     _validate_copy_number_config,
 )
@@ -577,62 +575,6 @@ def _write_patient_simulation(
     return data_dir
 
 
-def write_patient_simulation(
-    rng: np.random.Generator,
-    out_dir: str | Path,
-    N_mean: int,
-    simu_purity: float,
-    amp_rate: float,
-    n_samples: int,
-    sim: int,
-    K_min: int = 2,
-    K_max: int = 10,
-    lambda_mut: int = 2000,
-    alpha_mut: float = 10.0,
-    alpha_split: float = 1.0,
-    alpha_lambda: float = 5.0,
-    tau_lineage_min: float = 1.0,
-    tau_lineage_max: float = 50.0,
-    purity_conc: float = 50.0,
-    lineage_zero_prob: float = 0.0,
-    min_clone_ccf: float = 0.02,
-    min_clone_ccf_l2_norm: float = 0.05,
-    min_mutations_per_clone: int = 15,
-    min_clone_ccf_distance: float = 0.10,
-    max_rejection_tries: int = 1024,
-    copy_number_config: CopyNumberEvolutionConfig | None = None,
-    mutation_count: int | None = None,
-    tumor_id: str | None = None,
-) -> Path:
-    return _write_patient_simulation(
-        rng=rng,
-        out_dir=Path(out_dir),
-        N_mean=N_mean,
-        simu_purity=simu_purity,
-        amp_rate=amp_rate,
-        n_samples=n_samples,
-        sim=sim,
-        K_min=K_min,
-        K_max=K_max,
-        lambda_mut=lambda_mut,
-        alpha_mut=alpha_mut,
-        alpha_split=alpha_split,
-        alpha_lambda=alpha_lambda,
-        tau_lineage_min=tau_lineage_min,
-        tau_lineage_max=tau_lineage_max,
-        purity_conc=purity_conc,
-        lineage_zero_prob=lineage_zero_prob,
-        min_clone_ccf=min_clone_ccf,
-        min_clone_ccf_l2_norm=min_clone_ccf_l2_norm,
-        min_mutations_per_clone=min_mutations_per_clone,
-        min_clone_ccf_distance=min_clone_ccf_distance,
-        max_rejection_tries=max_rejection_tries,
-        copy_number_config=copy_number_config,
-        mutation_count=mutation_count,
-        tumor_id=tumor_id,
-    )
-
-
 def simulate_tumor(
     config: TumorSimulationConfig = TumorSimulationConfig(),
 ) -> Path:
@@ -687,128 +629,7 @@ def simulate_tumor(
     )
 
 
-def run_simulation_grid(
-    out_dir: str | Path = "CliPP2Sim",
-    purity_list: list[float] | None = None,
-    amp_rate_list: list[float] | None = None,
-    N_list: list[int] | None = None,
-    n_samples_list: list[int] | None = None,
-    reps: int = 20,
-    seed: int | None = None,
-    K_min: int = 2,
-    K_max: int = 10,
-    lambda_mut: int = 2000,
-    lambda_mut_list: list[int] | None = None,
-    alpha_mut: float = 10.0,
-    alpha_split: float = 1.0,
-    alpha_lambda: float = 5.0,
-    tau_lineage_min: float = 1.0,
-    tau_lineage_max: float = 50.0,
-    purity_conc: float = 50.0,
-    lineage_zero_prob: float = 0.0,
-    min_clone_ccf: float = 0.02,
-    min_clone_ccf_l2_norm: float = 0.05,
-    min_mutations_per_clone: int = 15,
-    min_clone_ccf_distance: float = 0.10,
-    max_rejection_tries: int = 1024,
-    copy_number_config: CopyNumberEvolutionConfig | None = None,
-) -> list[Path]:
-    if purity_list is None:
-        purity_list = list(SimulationGridConfig.purity_list)
-    if amp_rate_list is None:
-        amp_rate_list = list(SimulationGridConfig.amp_rate_list)
-    if N_list is None:
-        N_list = list(SimulationGridConfig.N_list)
-    if n_samples_list is None:
-        n_samples_list = list(SimulationGridConfig.n_samples_list)
-    if lambda_mut_list is None:
-        config_default = SimulationGridConfig.lambda_mut_list
-        lambda_mut_list = (
-            list(config_default) if config_default is not None else [int(lambda_mut)]
-        )
-
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    master_seed_sequence = np.random.SeedSequence(seed)
-    written_dirs: list[Path] = []
-
-    for N_mean, simu_purity, amp_rate, n_samples, lambda_mut_value in its.product(
-        N_list,
-        purity_list,
-        amp_rate_list,
-        n_samples_list,
-        lambda_mut_list,
-    ):
-        for sim in range(reps):
-            patient_seed_sequence = master_seed_sequence.spawn(1)[0]
-            child_rng = np.random.default_rng(patient_seed_sequence)
-            written_dirs.append(
-                _write_patient_simulation(
-                    rng=child_rng,
-                    out_dir=out_dir,
-                    N_mean=N_mean,
-                    simu_purity=simu_purity,
-                    amp_rate=amp_rate,
-                    n_samples=n_samples,
-                    sim=sim,
-                    K_min=K_min,
-                    K_max=K_max,
-                    lambda_mut=int(lambda_mut_value),
-                    alpha_mut=alpha_mut,
-                    alpha_split=alpha_split,
-                    alpha_lambda=alpha_lambda,
-                    tau_lineage_min=tau_lineage_min,
-                    tau_lineage_max=tau_lineage_max,
-                    purity_conc=purity_conc,
-                    lineage_zero_prob=lineage_zero_prob,
-                    min_clone_ccf=min_clone_ccf,
-                    min_clone_ccf_l2_norm=min_clone_ccf_l2_norm,
-                    min_mutations_per_clone=min_mutations_per_clone,
-                    min_clone_ccf_distance=min_clone_ccf_distance,
-                    max_rejection_tries=max_rejection_tries,
-                    copy_number_config=copy_number_config,
-                    seed_sequence=patient_seed_sequence,
-                )
-            )
-
-    return written_dirs
-
-
-def run_simulation_grid_from_config(config: SimulationGridConfig) -> list[Path]:
-    return run_simulation_grid(
-        out_dir=config.out_dir,
-        purity_list=list(config.purity_list),
-        amp_rate_list=list(config.amp_rate_list),
-        N_list=list(config.N_list),
-        n_samples_list=list(config.n_samples_list),
-        reps=config.reps,
-        seed=config.seed,
-        K_min=config.K_min,
-        K_max=config.K_max,
-        lambda_mut=config.lambda_mut,
-        lambda_mut_list=list(config.lambda_mut_list)
-        if config.lambda_mut_list is not None
-        else None,
-        alpha_mut=config.alpha_mut,
-        alpha_split=config.alpha_split,
-        alpha_lambda=config.alpha_lambda,
-        tau_lineage_min=config.tau_lineage_min,
-        tau_lineage_max=config.tau_lineage_max,
-        purity_conc=config.purity_conc,
-        lineage_zero_prob=config.lineage_zero_prob,
-        min_clone_ccf=config.min_clone_ccf,
-        min_clone_ccf_l2_norm=config.min_clone_ccf_l2_norm,
-        min_mutations_per_clone=config.min_mutations_per_clone,
-        min_clone_ccf_distance=config.min_clone_ccf_distance,
-        max_rejection_tries=config.max_rejection_tries,
-        copy_number_config=config.copy_number,
-    )
-
-
 __all__ = [
     "RNG_STREAM_NAMES",
-    "run_simulation_grid",
-    "run_simulation_grid_from_config",
     "simulate_tumor",
-    "write_patient_simulation",
 ]

@@ -358,42 +358,6 @@ def tensorize_graph(
     )
 
 
-def build_complete_uniform_tensor_graph(
-    num_nodes: int,
-    runtime: TorchRuntime,
-    *,
-    memory_limit_bytes: int | None = None,
-) -> TensorFusionGraph:
-    _check_complete_tensor_graph_memory(
-        num_nodes=int(num_nodes),
-        num_regions=1,
-        runtime=runtime,
-        adaptive=False,
-        memory_limit_bytes=memory_limit_bytes,
-    )
-    edge_index = torch.triu_indices(
-        int(num_nodes),
-        int(num_nodes),
-        offset=1,
-        dtype=torch.long,
-        device=runtime.device,
-    )
-    weight = torch.full(
-        (int(edge_index.shape[1]),),
-        _complete_graph_weight(num_nodes),
-        dtype=runtime.dtype,
-        device=runtime.device,
-    )
-    return _tensor_graph_from_edges(
-        edge_u=edge_index[0],
-        edge_v=edge_index[1],
-        weight=weight,
-        num_nodes=int(num_nodes),
-        name="complete_uniform",
-        known_complete=True,
-    )
-
-
 def build_complete_adaptive_tensor_graph(
     pilot_phi: torch.Tensor,
     runtime: TorchRuntime,
@@ -623,10 +587,6 @@ def tensor_graph_to_pairwise_graph(graph: TensorFusionGraph) -> PairwiseFusionGr
     )
 
 
-def graph_forward(phi: torch.Tensor, graph: TensorFusionGraph) -> torch.Tensor:
-    return graph_forward_edges(phi, edge_u=graph.edge_u, edge_v=graph.edge_v)
-
-
 def graph_forward_edges(
     phi: torch.Tensor,
     *,
@@ -634,15 +594,6 @@ def graph_forward_edges(
     edge_v: torch.Tensor,
 ) -> torch.Tensor:
     return phi.index_select(0, edge_u) - phi.index_select(0, edge_v)
-
-
-def graph_adjoint(dual: torch.Tensor, graph: TensorFusionGraph) -> torch.Tensor:
-    return graph_adjoint_edges(
-        dual,
-        edge_u=graph.edge_u,
-        edge_v=graph.edge_v,
-        num_nodes=graph.num_nodes,
-    )
 
 
 def graph_adjoint_edges(

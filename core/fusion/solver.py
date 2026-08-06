@@ -20,7 +20,6 @@ from .defaults import (
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
     DEFAULT_INNER_BACKEND,
-    DEFAULT_OPTIMIZATION_TOLERANCE,
     DEFAULT_WORKSET_ADD_BATCH,
     DEFAULT_WORKSET_MAX_BYTES,
     DEFAULT_WORKSET_MAX_EXPANSIONS,
@@ -3012,45 +3011,6 @@ def _fit_from_start(
         path_posterior=path_posterior_np,
         likelihood_model_id=likelihood_model_id,
     )
-
-
-def fit_torch(
-    data: TumorData,
-    *,
-    context: SolverContext,
-    lambda_value: float,
-    state: SolverState | None = None,
-    outer_max_iter: int = 8,
-    inner_max_iter: int = 30,
-    tol: float = DEFAULT_OPTIMIZATION_TOLERANCE,
-    summary_tol: float | None = None,
-    start_mode: str = "warm_only",
-    verbose: bool = False,
-) -> tuple[TorchFitResult, SolverState]:
-    start = state.phi if state is not None else context.exact_pilot
-    artifacts = fit_observed_data_pairwise_fusion(
-        data,
-        lambda_value=float(lambda_value),
-        major_prior=float(context.problem.major_prior),
-        eps=float(context.problem.eps),
-        outer_max_iter=int(outer_max_iter),
-        inner_max_iter=int(inner_max_iter),
-        tol=float(tol),
-        phi_start=start,
-        start_mode=start_mode,
-        device=context.runtime.device_name,
-        dtype=dtype_name(context.runtime.dtype),
-        summary_tol=summary_tol,
-        solver_context=context,
-        solver_state=state,
-        compute_summary=False,
-        verbose=bool(verbose),
-    )
-    if artifacts.torch_result is None or artifacts.solver_state is None:
-        raise RuntimeError(
-            "Torch fit did not produce a tensor result and solver state."
-        )
-    return artifacts.torch_result, artifacts.solver_state
 
 
 def fit_observed_data_pairwise_fusion(

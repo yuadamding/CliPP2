@@ -24,13 +24,6 @@ SmoothGradientScope: TypeAlias = Literal[
     "clarke_piecewise_observed_objective_subgradient",
 ]
 CertificateScope: TypeAlias = Literal["full_original_graph"]
-CertificateStatus: TypeAlias = Literal[
-    "certified",
-    "workset_incomplete",
-    "not_certified",
-    "resource_limit",
-    "dense_fallback",
-]
 
 
 class ExactSolverResourceLimit(MemoryError):

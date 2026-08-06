@@ -28,59 +28,6 @@ from math import exp, isfinite, log
 import numpy as np
 
 
-def objective_balance_lambda(
-    *,
-    pilot_loss: float,
-    pilot_penalty_unit: float,
-    guide_loss: float,
-    guide_penalty_unit: float,
-    lambda_min: float,
-    lambda_max: float,
-) -> float:
-    """Return the positive pilot/guide objective-crossing lambda.
-
-    For ``Q_lambda(phi) = loss(phi) + lambda * penalty_unit(phi)``, the
-    crossing solves ``Q_lambda(pilot) == Q_lambda(guide)``.  A guide that has
-    no larger loss already dominates at lambda zero, so the numerical lower
-    search bound is the correct first positive value.  A guide that does not
-    reduce the pairwise penalty cannot define a regularization scale and is
-    rejected instead of falling back to an arbitrary constant.
-    """
-
-    values = (
-        float(pilot_loss),
-        float(pilot_penalty_unit),
-        float(guide_loss),
-        float(guide_penalty_unit),
-        float(lambda_min),
-        float(lambda_max),
-    )
-    if not all(isfinite(value) for value in values):
-        raise ValueError("Objective values and lambda bounds must be finite.")
-    if lambda_min <= 0.0 or lambda_max <= lambda_min:
-        raise ValueError("Require 0 < lambda_min < lambda_max.")
-
-    penalty_reduction = float(pilot_penalty_unit - guide_penalty_unit)
-    penalty_scale = (
-        1.0 + abs(float(pilot_penalty_unit)) + abs(float(guide_penalty_unit))
-    )
-    numerical_tol = np.finfo(np.float64).eps * penalty_scale
-    if penalty_reduction <= numerical_tol:
-        raise ValueError(
-            "The partition guide must have a smaller unit pairwise penalty than the pilot."
-        )
-
-    excess_guide_loss = float(guide_loss - pilot_loss)
-    if excess_guide_loss <= 0.0:
-        return float(lambda_min)
-    crossing = excess_guide_loss / penalty_reduction
-    if not isfinite(crossing) or crossing <= 0.0:
-        raise ValueError(
-            "The pilot/guide objective crossing is not a finite positive value."
-        )
-    return float(min(max(crossing, float(lambda_min)), float(lambda_max)))
-
-
 @dataclass(frozen=True)
 class OnlineLambdaConfig:
     """Numerical and resource limits, none of which prescribe a lambda path."""
@@ -730,5 +677,4 @@ __all__ = [
     "OnlineLambdaController",
     "OnlineLambdaObservation",
     "OnlineLambdaProposal",
-    "objective_balance_lambda",
 ]

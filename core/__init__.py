@@ -1,10 +1,9 @@
 from .fusion.types import PairwiseFusionGraph
-from .model import FitResult, Problem, SolverOptions, fit
+from .model import FitOptions, FitResult, fit_fixed_objective
 
 __all__ = [
+    "FitOptions",
     "FitResult",
     "PairwiseFusionGraph",
-    "Problem",
-    "SolverOptions",
-    "fit",
+    "fit_fixed_objective",
 ]

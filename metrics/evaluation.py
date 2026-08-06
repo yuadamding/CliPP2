@@ -13,7 +13,6 @@ from ..core.fusion.path_summary import (
 )
 from ..core.model import FitResult
 from ..io.data import TumorData
-from ..io.tumor_input import MODEL_ID as TUMOR_DIRECTORY_MODEL_ID
 
 
 @dataclass
@@ -62,60 +61,6 @@ class SimulationTruth:
     truth_multiplicity: np.ndarray | None
     truth_effective_multiplicity: np.ndarray | None = None
     truth_mutant_copy_mass: np.ndarray | None = None
-
-
-def path_truth_emission_distance(
-    data: TumorData,
-    truth_phi: np.ndarray,
-    truth_mutant_copy_mass: np.ndarray,
-) -> np.ndarray:
-    """Return the closest compiled mutant-copy mass for each benchmark truth unit."""
-
-    spec = data.path_likelihood
-    if spec is None or spec.model_id != TUMOR_DIRECTORY_MODEL_ID:
-        raise ValueError(
-            "TumorData does not contain a compiled tumor-directory likelihood."
-        )
-    shape = (data.num_mutations, data.num_regions)
-    phi = np.asarray(truth_phi, dtype=np.float64)
-    truth_mass = np.asarray(truth_mutant_copy_mass, dtype=np.float64)
-    if phi.shape != shape or truth_mass.shape != shape:
-        raise ValueError(
-            "truth_phi and truth_mutant_copy_mass must both have shape "
-            f"{shape}; received {phi.shape} and {truth_mass.shape}."
-        )
-    if not np.all(np.isfinite(phi)) or np.any((phi < -1e-8) | (phi > 1.0 + 1e-8)):
-        raise ValueError("truth_phi must be finite and lie within tolerance of [0, 1].")
-    phi = np.clip(phi, 0.0, 1.0)
-    if not np.all(np.isfinite(truth_mass)) or np.any(truth_mass < 0.0):
-        raise ValueError("truth_mutant_copy_mass must be finite and nonnegative.")
-
-    expanded_phi = phi[..., None]
-    candidate_mass = spec.first_copy * np.minimum(
-        expanded_phi,
-        spec.switch_fraction,
-    )
-    candidate_mass += spec.second_copy * np.maximum(
-        expanded_phi - spec.switch_fraction,
-        0.0,
-    )
-    candidate_distance = np.where(
-        spec.valid,
-        np.abs(candidate_mass - truth_mass[..., None]),
-        np.inf,
-    )
-    distance = np.min(candidate_distance, axis=-1)
-
-    unsupported = data.path_unsupported_reason
-    if unsupported is not None:
-        unsupported_array = np.asarray(unsupported, dtype=object)
-        if unsupported_array.shape != shape:
-            raise ValueError(
-                "TumorData.path_unsupported_reason must have shape "
-                f"{shape}, not {unsupported_array.shape}."
-            )
-        distance = np.where(pd.isna(unsupported_array), distance, np.inf)
-    return distance
 
 
 def _comb2(values: np.ndarray) -> np.ndarray:

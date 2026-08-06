@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -8,7 +8,6 @@ import torch
 from ...io.data import (
     PathLikelihoodSpec,
     TumorData,
-    legacy_path_likelihood_spec,
     tumor_data_fingerprint,
 )
 from .graph_ops import (
@@ -412,19 +411,6 @@ def to_torch_tumor_data(data: TumorData, runtime: TorchRuntime) -> TorchTumorDat
     )
 
 
-def to_torch_legacy_path_tumor_data(
-    data: TumorData,
-    runtime: TorchRuntime,
-    *,
-    major_prior: float,
-) -> TorchTumorData:
-    """Create categorical Torch data for parity checks and staged migration."""
-
-    legacy_spec = legacy_path_likelihood_spec(data, major_prior=major_prior)
-    path_data = replace(data, path_likelihood=legacy_spec)
-    return to_torch_tumor_data(path_data, runtime)
-
-
 def validate_torch_tumor_data(
     tensor_data: TorchTumorData,
     *,
@@ -753,24 +739,6 @@ def path_one_sided_gradients_torch(
     return gradient_left, gradient_right, at_breakpoint
 
 
-def path_gradient_interval_torch(
-    data: TorchTumorData,
-    phi: torch.Tensor,
-    *,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Clarke interval and exact-breakpoint mask for the observed path loss."""
-
-    gradient_left, gradient_right, at_breakpoint = path_one_sided_gradients_torch(
-        data, phi, eps=eps
-    )
-    return (
-        torch.minimum(gradient_left, gradient_right),
-        torch.maximum(gradient_left, gradient_right),
-        at_breakpoint,
-    )
-
-
 def path_downward_kink_mask_torch(
     gradient_left: torch.Tensor,
     gradient_right: torch.Tensor,
@@ -871,44 +839,6 @@ def path_mutation_region_terms_torch(
         gamma_major=gamma_major,
         path_posterior=posterior,
     )
-
-
-def path_mutation_region_loss_grid_torch(
-    beta_grid: torch.Tensor,
-    *,
-    alt: torch.Tensor,
-    total: torch.Tensor,
-    path: TorchPathLikelihoodSpec,
-    eps: float,
-) -> torch.Tensor:
-    """Scalar-oracle loss grid for a single mutation-region path family."""
-
-    if path.first_scale.ndim != 1:
-        raise ValueError("Scalar path loss grids require one-dimensional path arrays.")
-    expected_shape = tuple(path.first_scale.shape)
-    for name in (
-        "second_scale",
-        "switch_fraction",
-        "log_prior",
-        "valid",
-    ):
-        if tuple(getattr(path, name).shape) != expected_shape:
-            raise ValueError(f"Torch path field {name} has an incompatible shape.")
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not (0.0 < epsilon < 0.5):
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
-
-    beta = beta_grid.unsqueeze(-1)
-    mass = path.first_scale * torch.minimum(beta, path.switch_fraction)
-    mass = mass + path.second_scale * torch.clamp(
-        beta - path.switch_fraction,
-        min=0.0,
-    )
-    prob = torch.clamp(mass, min=epsilon, max=1.0 - epsilon)
-    nonalt = total - alt
-    log_kernel = alt * torch.log(prob) + nonalt * torch.log1p(-prob)
-    log_joint = (log_kernel + path.log_prior).masked_fill(~path.valid, -torch.inf)
-    return -torch.logsumexp(log_joint, dim=-1)
 
 
 def path_mutation_region_terms_numpy(

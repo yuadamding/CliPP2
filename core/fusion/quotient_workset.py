@@ -282,22 +282,6 @@ def aggregate_exact_quotient_problem(
     )
 
 
-def lifted_inner_objective(
-    *,
-    phi: torch.Tensor,
-    h: torch.Tensor,
-    U: torch.Tensor,
-    graph: TensorFusionGraph,
-    lambda_value: float,
-) -> torch.Tensor:
-    quadratic = 0.5 * torch.sum(h * torch.square(phi - U))
-    diff = phi.index_select(0, graph.edge_u) - phi.index_select(0, graph.edge_v)
-    penalty = float(lambda_value) * torch.sum(
-        graph.weight * torch.linalg.vector_norm(diff, dim=1)
-    )
-    return quadratic + penalty
-
-
 def quotient_inner_objective(
     *,
     centers: torch.Tensor,

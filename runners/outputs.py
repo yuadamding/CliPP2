@@ -15,7 +15,6 @@ from ..io.data import TumorData
 from ..metrics.evaluation import SimulationEvaluation
 
 
-_ORDERED_CN_OCCUPANCY_SEMANTICS = "ordered_extreme_cn_state_occupancy_v1"
 _AMPLIFIED_MUTANT_COPY_TOL = DEFAULT_AMPLIFIED_MUTANT_COPY_TOL
 
 
@@ -105,105 +104,6 @@ def _summary_ccf_path_arrays(
         phi_values=summary_phi,
         posterior_values=summary_posterior,
     )
-
-
-def _ordered_occupancy_summary_arrays(
-    data: TumorData,
-    fit: FitResult,
-    path_summary: dict[str, np.ndarray],
-) -> dict[str, np.ndarray]:
-    """Push canonical-path posterior mass onto reporting-only biological aliases."""
-
-    spec = data.path_likelihood
-    annotations = data.path_annotations
-    if spec is None or annotations is None:
-        raise ValueError("Ordered occupancy reporting requires aligned annotations.")
-
-    shape = spec.shape
-    supported = np.asarray(path_summary["supported"], dtype=bool)
-    posterior = np.asarray(path_summary["posterior"], dtype=np.float64)
-    phi = np.asarray(fit.phi, dtype=np.float64)
-    conditional_single = np.full(shape, np.nan, dtype=np.float64)
-    conditional_multi = np.full(shape, np.nan, dtype=np.float64)
-    conditional_boundary = np.full(shape, np.nan, dtype=np.float64)
-    single = np.full(shape[:2], np.nan, dtype=np.float64)
-    multi = np.full(shape[:2], np.nan, dtype=np.float64)
-    boundary = np.full(shape[:2], np.nan, dtype=np.float64)
-    boundary_tol = 1e-8
-
-    for mutation_index in range(shape[0]):
-        for region_index in range(shape[1]):
-            if not supported[mutation_index, region_index]:
-                continue
-            unit_single = 0.0
-            unit_multi = 0.0
-            unit_boundary = 0.0
-            valid_paths = np.flatnonzero(
-                np.asarray(spec.valid[mutation_index, region_index], dtype=bool)
-            )
-            for path_index in valid_paths:
-                annotation = annotations[mutation_index][region_index][path_index]
-                aliases = () if annotation is None else annotation.aliases
-                if aliases:
-                    alias_switches = np.asarray(
-                        [alias.switch_fraction for alias in aliases],
-                        dtype=np.float64,
-                    )
-                    alias_weights = np.asarray(
-                        [alias.prior_mass for alias in aliases],
-                        dtype=np.float64,
-                    )
-                    alias_weights /= np.sum(alias_weights)
-                    alias_is_clonal = np.asarray(
-                        [alias.mapping_id == "clonal" for alias in aliases],
-                        dtype=bool,
-                    )
-                else:
-                    alias_switches = np.asarray(
-                        [
-                            spec.switch_fraction[
-                                mutation_index, region_index, path_index
-                            ]
-                        ],
-                        dtype=np.float64,
-                    )
-                    alias_weights = np.asarray([1.0], dtype=np.float64)
-                    alias_is_clonal = np.asarray([False], dtype=bool)
-
-                fitted_phi = phi[mutation_index, region_index]
-                is_single = alias_is_clonal | (
-                    fitted_phi < alias_switches - boundary_tol
-                )
-                is_multi = (~alias_is_clonal) & (
-                    fitted_phi > alias_switches + boundary_tol
-                )
-                is_boundary = ~(is_single | is_multi)
-                path_single = float(np.sum(alias_weights * is_single))
-                path_multi = float(np.sum(alias_weights * is_multi))
-                path_boundary = float(np.sum(alias_weights * is_boundary))
-                conditional_single[mutation_index, region_index, path_index] = (
-                    path_single
-                )
-                conditional_multi[mutation_index, region_index, path_index] = path_multi
-                conditional_boundary[mutation_index, region_index, path_index] = (
-                    path_boundary
-                )
-                path_posterior = posterior[mutation_index, region_index, path_index]
-                unit_single += path_posterior * path_single
-                unit_multi += path_posterior * path_multi
-                unit_boundary += path_posterior * path_boundary
-            single[mutation_index, region_index] = unit_single
-            multi[mutation_index, region_index] = unit_multi
-            boundary[mutation_index, region_index] = unit_boundary
-
-    return {
-        "single_probability": single,
-        "multi_probability": multi,
-        "boundary_probability": boundary,
-        "conditional_single_probability": conditional_single,
-        "conditional_multi_probability": conditional_multi,
-        "conditional_boundary_probability": conditional_boundary,
-    }
 
 
 def mutation_output_table(
@@ -323,10 +223,6 @@ def mutation_region_output_table(
 
     path_summary = _path_summary_arrays(data, fit)
     if path_summary is not None:
-        ordered_occupancy = (
-            getattr(data, "path_reporting_semantics", None)
-            == _ORDERED_CN_OCCUPANCY_SEMANTICS
-        )
         reporting_fingerprint = getattr(data, "path_reporting_fingerprint", None)
         table["likelihood_model_id"] = str(fit.likelihood_model_id)
         if reporting_fingerprint:
@@ -342,32 +238,9 @@ def mutation_region_output_table(
         table["post_switch_path_probability"] = path_summary[
             "multi_probability"
         ].reshape(-1)
-        if ordered_occupancy:
-            occupancy_summary = _ordered_occupancy_summary_arrays(
-                data, fit, path_summary
-            )
-            table["single_state_occupancy_probability"] = occupancy_summary[
-                "single_probability"
-            ].reshape(-1)
-            table["multi_state_occupancy_probability"] = occupancy_summary[
-                "multi_probability"
-            ].reshape(-1)
-            # This is compatibility with the multi-state portion of an ordered
-            # occupancy path at fitted phi. It is not mutation/CNA timing evidence.
-            table["ordered_path_multi_state_compatibility_probability"] = (
-                occupancy_summary["multi_probability"].reshape(-1)
-            )
-            # Under the declared ordered extreme-occupancy approximation,
-            # carriers in both local CN states are compatible with
-            # pre-divergence acquisition. This remains a compatibility statistic.
-            table["pre_cna_compatibility_probability"] = occupancy_summary[
-                "multi_probability"
-            ].reshape(-1)
-        table["switch_boundary_ambiguity_probability"] = (
-            occupancy_summary["boundary_probability"].reshape(-1)
-            if ordered_occupancy
-            else path_summary["boundary_probability"].reshape(-1)
-        )
+        table["switch_boundary_ambiguity_probability"] = path_summary[
+            "boundary_probability"
+        ].reshape(-1)
         table["posterior_mutant_copy_mass"] = path_summary[
             "posterior_mutant_copy_mass"
         ].reshape(-1)
@@ -553,36 +426,6 @@ def path_posterior_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame
             ),
         }
     )
-    if (
-        getattr(data, "path_reporting_semantics", None)
-        == _ORDERED_CN_OCCUPANCY_SEMANTICS
-    ):
-        occupancy_summary = _ordered_occupancy_summary_arrays(data, fit, summary)
-        conditional_single = occupancy_summary["conditional_single_probability"][
-            mutation_idx, region_idx, path_idx
-        ]
-        conditional_multi = occupancy_summary["conditional_multi_probability"][
-            mutation_idx, region_idx, path_idx
-        ]
-        conditional_boundary = occupancy_summary["conditional_boundary_probability"][
-            mutation_idx, region_idx, path_idx
-        ]
-        table["single_state_occupancy_probability_given_path"] = conditional_single
-        table["multi_state_occupancy_probability_given_path"] = conditional_multi
-        table["switch_boundary_probability_given_path"] = conditional_boundary
-        table["occupancy_interpretation"] = np.select(
-            (
-                conditional_single >= 1.0 - 1e-12,
-                conditional_multi >= 1.0 - 1e-12,
-                conditional_boundary >= 1.0 - 1e-12,
-            ),
-            (
-                "ordered_path_single_state_occupancy_at_fitted_phi",
-                "ordered_path_multi_state_occupancy_at_fitted_phi",
-                "ordered_path_switch_boundary_at_fitted_phi",
-            ),
-            default="ordered_path_alias_mixed_occupancy_at_fitted_phi",
-        )
     annotations = getattr(data, "path_annotations", None)
     if annotations is not None and hasattr(annotations, "columns_for_indices"):
         for name, values in annotations.columns_for_indices(valid_indices).items():
