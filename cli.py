@@ -225,11 +225,13 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument(
         "--input-file",
-        help="Canonical one-tumor .clipp2.txt or .clipp2.txt.gz input.",
+        help="One-tumor .tsv, .tsv.gz, .clipp2.txt, or .clipp2.txt.gz input.",
     )
     inputs.add_argument(
         "--input-dir",
-        help="Directory of canonical .clipp2.txt or .clipp2.txt.gz tumor files.",
+        help=(
+            "Directory of .tsv, .tsv.gz, .clipp2.txt, or .clipp2.txt.gz tumor files."
+        ),
     )
     inputs.add_argument(
         "--cohort-dir",

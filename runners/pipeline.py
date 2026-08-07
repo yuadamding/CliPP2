@@ -64,7 +64,10 @@ def _normalize_resource_limit(exc: BaseException) -> ExactSolverResourceLimit:
 def _is_tumor_txt_path(path: Path) -> bool:
     name = path.name.lower()
     return path.is_file() and (
-        name.endswith(".clipp2.txt") or name.endswith(".clipp2.txt.gz")
+        name.endswith(".clipp2.txt")
+        or name.endswith(".clipp2.txt.gz")
+        or name.endswith(".tsv")
+        or name.endswith(".tsv.gz")
     )
 
 

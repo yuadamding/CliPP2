@@ -157,19 +157,37 @@ def _parse_metadata(line: str, *, path: Path, line_number: int) -> tuple[str, st
     return key, value
 
 
+def _default_tumor_id(path: Path) -> str:
+    """Derive the tumor id from the file name: strip .gz, .tsv/.txt, .clipp2."""
+    name = path.name
+    for suffix in (".gz", ".tsv", ".txt", ".clipp2"):
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+    return name
+
+
 def _validate_metadata(metadata: dict[str, str], *, path: Path) -> dict[str, str]:
-    missing_metadata = sorted(set(REQUIRED_METADATA).difference(metadata))
-    if missing_metadata:
-        raise TumorTxtError(f"{path} is missing required metadata: {missing_metadata}.")
-    if metadata["schema"] != TUMOR_TXT_SCHEMA:
-        raise TumorTxtError(
-            f"{path} schema must be {TUMOR_TXT_SCHEMA!r}, not {metadata['schema']!r}."
-        )
-    if metadata["coordinate_system"] != "1-based-inclusive":
-        raise TumorTxtError(f"{path} coordinate_system must be '1-based-inclusive'.")
-    if metadata["missing_value"] != ".":
-        raise TumorTxtError(f"{path} missing_value must be '.'.")
+    """Apply defaults for absent metadata and validate whatever is present.
+
+    The ``##key=value`` block is optional: a plain TSV with only a header is a
+    valid input. ``tumor_id`` defaults to the file name stem, the schema and
+    conventions default to their single supported values, and any key that IS
+    declared must carry the supported value.
+    """
     validated = dict(metadata)
+    validated.setdefault("schema", TUMOR_TXT_SCHEMA)
+    validated.setdefault("tumor_id", _default_tumor_id(path))
+    validated.setdefault("genome_build", "unknown")
+    validated.setdefault("coordinate_system", "1-based-inclusive")
+    validated.setdefault("missing_value", ".")
+    if validated["schema"] != TUMOR_TXT_SCHEMA:
+        raise TumorTxtError(
+            f"{path} schema must be {TUMOR_TXT_SCHEMA!r}, not {validated['schema']!r}."
+        )
+    if validated["coordinate_system"] != "1-based-inclusive":
+        raise TumorTxtError(f"{path} coordinate_system must be '1-based-inclusive'.")
+    if validated["missing_value"] != ".":
+        raise TumorTxtError(f"{path} missing_value must be '.'.")
     validated["tumor_id"] = _safe_tumor_id(validated["tumor_id"])
     _identifier(validated["genome_build"], name="genome_build")
     return validated

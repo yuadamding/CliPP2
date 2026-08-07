@@ -43,6 +43,7 @@ version = { attr = "CliPP2._version.__version__" }
 [tool.setuptools.package-data]
 CliPP2 = [
     "examples/README.md",
+    "examples/*.tsv",
     "examples/*.clipp2.txt",
 ]
 

@@ -1,6 +1,6 @@
 # exampleTumor1
 
-[`exampleTumor1.clipp2.txt`](exampleTumor1.clipp2.txt) is a complete canonical
+[`exampleTumor1.tsv`](exampleTumor1.tsv) is a complete canonical
 input with 300 SNVs, samples `region1` and `region2`, and 10 sample-specific CN
 intervals. It has 600 mutation-sample units and 998 data rows because 398 units
 (66.3%) contain two local CN states. Every unit has at least one non-diploid
@@ -16,13 +16,13 @@ takes its default, `unphased`. Writers such as `clipp2 simulate` emit the full
 Validate and inspect it:
 
 ```bash
-clipp2 validate --input-file examples/exampleTumor1.clipp2.txt
+clipp2 validate --input-file examples/exampleTumor1.tsv
 ```
 
 ```python
 from CliPP2 import load_tumor_txt
 
-tumor = load_tumor_txt("examples/exampleTumor1.clipp2.txt")
+tumor = load_tumor_txt("examples/exampleTumor1.tsv")
 print(tumor.tumor_id, tumor.num_mutations, tumor.region_ids)
 ```
 
@@ -33,7 +33,7 @@ finishing at all:
 
 ```bash
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 clipp2 fit \
-  --input-file examples/exampleTumor1.clipp2.txt \
+  --input-file examples/exampleTumor1.tsv \
   --outdir exampleTumor1_results \
   --device cpu
 ```

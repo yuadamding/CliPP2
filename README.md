@@ -11,25 +11,28 @@ pip install .
 
 ## Input
 
-The public input is one tab-delimited file per tumor:
+The public input is one plain tab-delimited file per tumor — an ordinary
+header line and one row per mutation × sample × local copy-number state.
+The **12 required columns are exactly the ones the objective is computed
+from**, and the shipped example, [`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv),
+is exactly that:
 
 ```text
-exampleTumor1.clipp2.txt
-```
-
-It uses schema `clipp2.tumor.long.v1`, one ordinary header, and one row per
-mutation × sample × local copy-number state. The **12 required columns are
-exactly the ones the objective is computed from**, and the shipped example uses
-only those:
-
-```text
-##schema=clipp2.tumor.long.v1
-##tumor_id=exampleTumor1
-##genome_build=synthetic
-##coordinate_system=1-based-inclusive
-##missing_value=.
 mutation_id	sample_id	alt_count	ref_count	count_observed	purity	normal_cn	segment_id	cn_state_id	cn_state_fraction	allele_a_cn	allele_b_cn
+m001	region1	31	70	1	0.578	2	1	state1	0.534	1	1
+...
 ```
+
+The tumor id is the file name stem: `exampleTumor1.tsv` names the tumor
+`exampleTumor1` (`.gz`, `.tsv`/`.txt`, and a trailing `.clipp2` are stripped).
+Accepted extensions are `.tsv`, `.tsv.gz`, `.clipp2.txt`, and `.clipp2.txt.gz`.
+
+An optional `##key=value` metadata block may precede the header to declare
+`tumor_id` (overriding the file-name default), `genome_build`, and the fixed
+conventions `schema=clipp2.tumor.long.v1`, `coordinate_system=1-based-inclusive`,
+`missing_value=.`. Any key that is declared must carry its supported value; a
+file with no metadata at all is fully valid. Files written by `clipp2 convert`
+and the simulator carry the full block.
 
 Seven further canonical columns — `chromosome`, `position`, `ref`, `alt`,
 `segment_start`, `segment_end`, `allele_mode` — are identity and coordinate
@@ -46,12 +49,11 @@ remains fully supported as input.
 
 Extra columns beyond the 19 are also allowed as reporting metadata and never
 alter the objective. IDs are strings, including leading zeros; sample names are
-unrestricted identifiers. Rows may be reordered, and `.clipp2.txt.gz` is
-supported. `.` is the only missing marker: NA-style spellings (`NA`, `NaN`,
-`null`, an empty field) are rejected everywhere — but note that `NA` *is*
-accepted as an ordinary identifier string, so a preprocessing bug that writes
-`NA` into an ID column creates a real mutation or sample named `NA` rather than
-an error.
+unrestricted identifiers. Rows may be reordered. `.` is the only missing
+marker: NA-style spellings (`NA`, `NaN`, `null`, an empty field) are rejected
+everywhere — but note that `NA` *is* accepted as an ordinary identifier string,
+so a preprocessing bug that writes `NA` into an ID column creates a real
+mutation or sample named `NA` rather than an error.
 
 The main rules are:
 
@@ -124,7 +126,7 @@ changes at `switch_fraction`.
 
 Mixing is allowed and expected: a tumor may have some one-state and some
 two-state segments. The shipped
-[`examples/exampleTumor1.clipp2.txt`](examples/exampleTumor1.clipp2.txt) has 6
+[`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv) has 6
 one-state and 14 two-state sample-segments.
 
 Note that `--unsupported-policy` has opposite defaults on the two subcommands:
@@ -135,22 +137,22 @@ first one.
 ## Fit
 
 Every command below runs against the shipped example,
-[`examples/exampleTumor1.clipp2.txt`](examples/exampleTumor1.clipp2.txt) —
+[`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv) —
 300 SNVs across two regions. Paths are relative to the package directory; a
 pip-installed copy keeps the file under `site-packages/CliPP2/examples/`.
-Substitute your own `.clipp2.txt` once these work.
+Substitute your own `.tsv` once these work.
 
 Validate it:
 
 ```bash
-clipp2 validate --input-file examples/exampleTumor1.clipp2.txt
+clipp2 validate --input-file examples/exampleTumor1.tsv
 ```
 
 Fit it. On a machine with CUDA:
 
 ```bash
 clipp2 fit \
-  --input-file examples/exampleTumor1.clipp2.txt \
+  --input-file examples/exampleTumor1.tsv \
   --outdir exampleTumor1_results
 ```
 
@@ -161,20 +163,20 @@ not finishing at all:
 
 ```bash
 OMP_NUM_THREADS=1 clipp2 fit \
-  --input-file examples/exampleTumor1.clipp2.txt \
+  --input-file examples/exampleTumor1.tsv \
   --outdir exampleTumor1_results \
   --device cpu
 ```
 
 See [Device and precision](#device-and-precision) for why, and for the
-`--workers` cohort mode that fits every `.clipp2.txt` or `.clipp2.txt.gz` in a
+`--workers` cohort mode that fits every accepted tumor file in a
 directory via `--input-dir`. `--dosage-prior-penalty` controls the fixed
 endpoint excess-dosage prior and defaults to `3`.
 
 The module entry point is equivalent:
 
 ```bash
-python -m CliPP2 fit --input-file examples/exampleTumor1.clipp2.txt --device cpu
+python -m CliPP2 fit --input-file examples/exampleTumor1.tsv --device cpu
 ```
 
 The example itself is documented in [`examples/README.md`](examples/README.md).
@@ -248,7 +250,7 @@ So the CPU form of the quickstart is:
 
 ```bash
 clipp2 fit \
-  --input-file examples/exampleTumor1.clipp2.txt \
+  --input-file examples/exampleTumor1.tsv \
   --outdir exampleTumor1_results \
   --device cpu
 ```
@@ -318,7 +320,7 @@ spin time and is itself unstable (two runs of the same fit measured 423 s and
 
 ```bash
 OMP_NUM_THREADS=1 clipp2 fit \
-  --input-file examples/exampleTumor1.clipp2.txt \
+  --input-file examples/exampleTumor1.tsv \
   --outdir exampleTumor1_results \
   --device cpu
 ```
@@ -341,7 +343,7 @@ the setting starts to matter again.
 
 ### Cohort runs and `--workers`
 
-`--input-dir` fits every `.clipp2.txt` or `.clipp2.txt.gz` in a directory. The
+`--input-dir` fits every `.tsv`, `.tsv.gz`, `.clipp2.txt`, or `.clipp2.txt.gz` in a directory. The
 shipped `examples/` directory contains exactly one, so this is a runnable
 one-tumor cohort:
 
