@@ -139,47 +139,50 @@ first one.
 
 ## Fit
 
-Validate a tumor:
+Every command below runs against the shipped example,
+[`examples/exampleTumor1.clipp2.txt`](examples/exampleTumor1.clipp2.txt) —
+300 SNVs across two regions. Paths are relative to the package directory; a
+pip-installed copy keeps the file under `site-packages/CliPP2/examples/`.
+Substitute your own `.clipp2.txt` once these work.
+
+Validate it:
 
 ```bash
-clipp2 validate --input-file inputs/exampleTumor1.clipp2.txt
+clipp2 validate --input-file examples/exampleTumor1.clipp2.txt
 ```
 
-Fit one tumor:
+Fit it. On a machine with CUDA:
 
 ```bash
 clipp2 fit \
-  --input-file inputs/exampleTumor1.clipp2.txt \
-  --outdir clipp2_results
+  --input-file examples/exampleTumor1.clipp2.txt \
+  --outdir exampleTumor1_results
 ```
 
-Fit every `.clipp2.txt` or `.clipp2.txt.gz` file in a cohort directory:
+On a CPU-only machine, `--device cpu` is mandatory (the default device is
+`cuda`) and limiting the Torch thread count is strongly recommended — on this
+300-SNV input it is the difference between finishing in about half an hour and
+not finishing at all:
 
 ```bash
-clipp2 fit \
-  --input-dir inputs \
-  --max-tumors 100 \
-  --workers 4 \
-  --outdir clipp2_results \
+OMP_NUM_THREADS=1 clipp2 fit \
+  --input-file examples/exampleTumor1.clipp2.txt \
+  --outdir exampleTumor1_results \
   --device cpu
 ```
 
-`--workers` above is paired with `--device cpu` deliberately: process
-parallelism and the default CUDA device do not mix. See
-[Device and precision](#device-and-precision).
-
-`--dosage-prior-penalty` controls the fixed endpoint excess-dosage prior and
-defaults to `3`.
+See [Device and precision](#device-and-precision) for why, and for the
+`--workers` cohort mode that fits every `.clipp2.txt` or `.clipp2.txt.gz` in a
+directory via `--input-dir`. `--dosage-prior-penalty` controls the fixed
+endpoint excess-dosage prior and defaults to `3`.
 
 The module entry point is equivalent:
 
 ```bash
-python -m CliPP2 fit --input-file inputs/exampleTumor1.clipp2.txt
+python -m CliPP2 fit --input-file examples/exampleTumor1.clipp2.txt --device cpu
 ```
 
-For a complete inspectable input and CPU command, see
-[`examples/exampleTumor1.clipp2.txt`](examples/exampleTumor1.clipp2.txt) and
-[`examples/README.md`](examples/README.md).
+The example itself is documented in [`examples/README.md`](examples/README.md).
 
 Production defaults use CUDA float64 tensors, dense device-only fusion, online
 partition-guided ADMM lambda selection, and assignment-aware partition ICL.
@@ -228,8 +231,8 @@ So the CPU form of the quickstart is:
 
 ```bash
 clipp2 fit \
-  --input-file inputs/exampleTumor1.clipp2.txt \
-  --outdir clipp2_results \
+  --input-file examples/exampleTumor1.clipp2.txt \
+  --outdir exampleTumor1_results \
   --device cpu
 ```
 
@@ -298,8 +301,8 @@ spin time and is itself unstable (two runs of the same fit measured 423 s and
 
 ```bash
 OMP_NUM_THREADS=1 clipp2 fit \
-  --input-file inputs/exampleTumor1.clipp2.txt \
-  --outdir clipp2_results \
+  --input-file examples/exampleTumor1.clipp2.txt \
+  --outdir exampleTumor1_results \
   --device cpu
 ```
 
@@ -321,10 +324,23 @@ the setting starts to matter again.
 
 ### Cohort runs and `--workers`
 
-`--workers` defaults to `1` and only affects directory inputs (`--input-dir`,
-`--cohort-dir`); it is accepted but silently ignored for `--input-file` and
-`--tumor-dir`, which always fit in-process. Values below 1 are clamped to 1
-rather than rejected. Workers are separate `spawn` processes, never forked.
+`--input-dir` fits every `.clipp2.txt` or `.clipp2.txt.gz` in a directory. The
+shipped `examples/` directory contains exactly one, so this is a runnable
+one-tumor cohort:
+
+```bash
+OMP_NUM_THREADS=1 clipp2 fit \
+  --input-dir examples \
+  --outdir exampleTumor1_results \
+  --device cpu
+```
+
+For a real cohort, add `--workers N` (one process per concurrent tumor) and
+`--max-tumors` to cap the run. `--workers` defaults to `1` and only affects
+directory inputs (`--input-dir`, `--cohort-dir`); it is accepted but silently
+ignored for `--input-file` and `--tumor-dir`, which always fit in-process.
+Values below 1 are clamped to 1 rather than rejected. Workers are separate
+`spawn` processes, never forked.
 
 Combining `--workers > 1` with CUDA is not blocked, only warned about:
 
