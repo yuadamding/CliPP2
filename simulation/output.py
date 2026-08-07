@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from ..io.tumor_txt import (
-    REQUIRED_COLUMNS as TUMOR_TXT_COLUMNS,
+    SCHEMA_COLUMNS as TUMOR_TXT_COLUMNS,
     TUMOR_TXT_SCHEMA,
     load_tumor_txt,
 )

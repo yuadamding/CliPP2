@@ -30,25 +30,51 @@ mutation × sample × local copy-number state:
 mutation_id	sample_id	chromosome	position	ref	alt	alt_count	ref_count	count_observed	purity	normal_cn	segment_id	segment_start	segment_end	cn_state_id	cn_state_fraction	allele_a_cn	allele_b_cn	allele_mode
 ```
 
-The 19 columns above are required. Extra columns are allowed as reporting
-metadata and never alter the objective. IDs are strings, including leading
-zeros; sample names are unrestricted identifiers. Rows may be reordered, and
-`.clipp2.txt.gz` is supported.
+The header above shows the full canonical column set, but only the **12
+columns the objective is computed from are required**:
+
+```text
+mutation_id  sample_id  alt_count  ref_count  count_observed  purity
+normal_cn  segment_id  cn_state_id  cn_state_fraction  allele_a_cn  allele_b_cn
+```
+
+The other 7 — `chromosome`, `position`, `ref`, `alt`, `segment_start`,
+`segment_end`, `allele_mode` — are identity and coordinate metadata that never
+enter the likelihood. Each may be omitted from the file entirely, or carry the
+missing marker `.` in any row. A minimal 12-column file produces byte-identical
+results to the full 19-column file. When the optional columns are present and
+non-missing they are still validated: provide `ref` and `alt` together or not at
+all, provide both segment bounds together, and the position-within-bounds check
+runs only when position and bounds are all present. A missing `allele_mode`
+defaults to `unphased`; declare `phased` explicitly if your `allele_a_cn` /
+`allele_b_cn` are persistent homolog labels with `a < b` anywhere.
+
+Extra columns beyond the 19 are also allowed as reporting metadata and never
+alter the objective. IDs are strings, including leading zeros; sample names are
+unrestricted identifiers. Rows may be reordered, and `.clipp2.txt.gz` is
+supported. `.` is the only missing marker: NA-style spellings (`NA`, `NaN`,
+`null`, an empty field) are rejected everywhere — but note that `NA` *is*
+accepted as an ordinary identifier string, so a preprocessing bug that writes
+`NA` into an ID column creates a real mutation or sample named `NA` rather than
+an error.
 
 The main rules are:
 
-- `ref` and `alt` are distinct uppercase SNV alleles in `A/C/G/T`.
+- `ref` and `alt`, when provided, are distinct uppercase SNV alleles in
+  `A/C/G/T`.
 - Observed counts are nonnegative integers with `count_observed=1`. Missing or
   quality-masked counts use `count_observed=0` and may use `.` for both counts.
 - Purity is constant per sample and lies in `(0, 1]`. `normal_cn` is explicit
-  and may differ from 2.
-- Segment IDs are sample-specific; each 1-based mutation position must fall
-  within its inclusive segment bounds.
+  and may differ from 2 — it enters the prevalence scaling directly, which is
+  why it is required rather than defaulted.
+- Segment IDs are sample-specific; when position and segment bounds are
+  provided, each 1-based mutation position must fall within its inclusive
+  segment bounds.
 - Local state fractions are positive, conditional on the tumor population, and
   sum to one per sample-segment.
 - `allele_mode=phased` means A/B are persistent homolog labels.
-  `allele_mode=unphased` means ordinary major/minor calls and requires
-  `allele_a_cn >= allele_b_cn`.
+  `allele_mode=unphased` (the default when the column is absent or `.`) means
+  ordinary major/minor calls and requires `allele_a_cn >= allele_b_cn`.
 
 Repeated mutation, observation, segment, and state fields are checked for
 consistency before any inference runs. Hidden truth, mutation histories,
