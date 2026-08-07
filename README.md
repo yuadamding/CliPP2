@@ -42,13 +42,6 @@ python -m CliPP2 fit --input-file examples/exampleTumor1.tsv --device cpu
 
 The example itself is documented in [`examples/README.md`](examples/README.md).
 
-Model selection enforces a strict clonal restriction: every scored candidate
-must contain one cluster pinned at the clonal center, φ = 1 in every region
-(clipped to the feasibility box). The pinned centers are constants, so a
-K-cluster model is charged (K − 1) × S degrees of freedom. A one-cluster model
-is therefore admissible only when the whole tumor is consistent with φ = 1,
-which is what makes weakly separated subclones detectable.
-
 Run
 `clipp2 fit --help` for solver and custom-graph controls.
 
