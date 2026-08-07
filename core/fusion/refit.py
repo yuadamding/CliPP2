@@ -32,6 +32,9 @@ class PartitionRefitResult:
     refit_total_refined_candidates: int
     refit_min_best_second_loss_gap: float
     loglik_source: str = "partition_constrained_observed_mle"
+    # Index of the cluster pinned at the clonal center (phi = 1 clipped to the
+    # feasibility box) under the strict clonal-anchored selection restriction.
+    clonal_cluster: int | None = None
 
     @property
     def converged(self) -> bool:
@@ -469,6 +472,65 @@ def _refit_cluster_region(
     )
 
 
+def _pinned_cluster_region_loss(
+    data: TumorData,
+    *,
+    obs_rows: np.ndarray,
+    region_idx: int,
+    beta: float,
+    alt: np.ndarray,
+    total: np.ndarray,
+    b_minus: np.ndarray,
+    b_plus: np.ndarray,
+    b_fixed: np.ndarray,
+    ambiguous: np.ndarray,
+    path_spec,
+    major_prior: float,
+    eps: float,
+) -> float:
+    """Observed loss of one cluster-region evaluated at a fixed center."""
+    values = np.asarray([float(beta)], dtype=np.float64)
+    if path_spec is None:
+        grid = _objective_grid(
+            values,
+            alt=alt[obs_rows, region_idx],
+            total=total[obs_rows, region_idx],
+            b_minus=b_minus[obs_rows, region_idx],
+            b_plus=b_plus[obs_rows, region_idx],
+            b_fixed=b_fixed[obs_rows, region_idx],
+            ambiguous=ambiguous[obs_rows, region_idx],
+            major_prior=float(major_prior),
+            eps=float(eps),
+        )
+    else:
+        sliced = replace(
+            path_spec,
+            first_copy=path_spec.first_copy[obs_rows, region_idx : region_idx + 1, :],
+            second_copy=path_spec.second_copy[obs_rows, region_idx : region_idx + 1, :],
+            switch_fraction=path_spec.switch_fraction[
+                obs_rows, region_idx : region_idx + 1, :
+            ],
+            log_prior=path_spec.log_prior[obs_rows, region_idx : region_idx + 1, :],
+            valid=path_spec.valid[obs_rows, region_idx : region_idx + 1, :],
+            legacy_major_indicator=(
+                None
+                if path_spec.legacy_major_indicator is None
+                else path_spec.legacy_major_indicator[
+                    obs_rows, region_idx : region_idx + 1, :
+                ]
+            ),
+        )
+        grid = _path_objective_grid(
+            values,
+            alt=alt[obs_rows, region_idx],
+            total=total[obs_rows, region_idx],
+            scaling=np.asarray(data.scaling, dtype=np.float64)[obs_rows, region_idx],
+            spec=sliced,
+            eps=float(eps),
+        )
+    return float(grid[0])
+
+
 def partition_constrained_observed_refit(
     data: TumorData,
     labels: np.ndarray,
@@ -530,6 +592,9 @@ def partition_constrained_observed_refit(
     refit_total_candidate_basins = 0
     refit_total_refined_candidates = 0
     refit_min_best_second_loss_gap = float("inf")
+    cluster_region_loss = np.zeros((n_clusters, n_regions), dtype=np.float64)
+    cluster_region_boundary = np.zeros((n_clusters, n_regions), dtype=bool)
+    cluster_region_active = np.zeros((n_clusters, n_regions), dtype=bool)
 
     for cluster_idx in range(n_clusters):
         member_mask = labels == int(cluster_idx)
@@ -630,6 +695,59 @@ def partition_constrained_observed_refit(
             )
             boundary_count += int(at_boundary)
             active_df += int(not at_boundary)
+            cluster_region_loss[cluster_idx, region_idx] = float(loss)
+            cluster_region_boundary[cluster_idx, region_idx] = at_boundary
+            cluster_region_active[cluster_idx, region_idx] = not at_boundary
+
+    # Strict clonal-anchored selection restriction: exactly one cluster must sit
+    # at the clonal center, phi = 1 clipped to the feasibility box, in every
+    # region. The freely refit cluster with the highest mean center is pinned
+    # there and its likelihood recomputed at the pinned value; its centers are
+    # constants, so they carry no degrees of freedom (see bic_degrees_of_freedom).
+    clonal_cluster: int | None = None
+    if n_clusters >= 1:
+        occupied = [int(c) for c in range(n_clusters) if np.any(labels == c)]
+        clonal_cluster = int(
+            occupied[int(np.argmax([centers[c].mean() for c in occupied]))]
+        )
+        member_rows = np.where(labels == clonal_cluster)[0]
+        for region_idx in range(n_regions):
+            lower = float(eps)
+            upper = float(np.min(upper_matrix[member_rows, region_idx]))
+            if not np.isfinite(upper) or upper < lower:
+                upper = lower
+            pinned = float(min(1.0, upper))
+            if observed_matrix is None:
+                obs_rows = member_rows
+            else:
+                obs_rows = member_rows[observed_matrix[member_rows, region_idx]]
+            if obs_rows.size == 0:
+                centers[clonal_cluster, region_idx] = pinned
+                continue
+            pinned_loss = float(
+                _pinned_cluster_region_loss(
+                    data,
+                    obs_rows=obs_rows,
+                    region_idx=region_idx,
+                    beta=pinned,
+                    alt=alt,
+                    total=total,
+                    b_minus=b_minus,
+                    b_plus=b_plus,
+                    b_fixed=b_fixed,
+                    ambiguous=ambiguous,
+                    path_spec=path_spec,
+                    major_prior=float(major_prior),
+                    eps=float(eps),
+                )
+            )
+            total_loss += pinned_loss - float(
+                cluster_region_loss[clonal_cluster, region_idx]
+            )
+            centers[clonal_cluster, region_idx] = pinned
+            # The pinned coordinate is a constant, not a boundary-active estimate.
+            boundary_count -= int(cluster_region_boundary[clonal_cluster, region_idx])
+            active_df -= int(cluster_region_active[clonal_cluster, region_idx])
 
     if labels.size:
         phi = centers[labels]
@@ -650,10 +768,11 @@ def partition_constrained_observed_refit(
         refit_total_refined_candidates=int(refit_total_refined_candidates),
         refit_min_best_second_loss_gap=float(refit_min_best_second_loss_gap),
         loglik_source=(
-            "partition_constrained_observed_mle"
+            "clonal_anchored_partition_observed_mle"
             if path_spec is None
-            else "partition_constrained_observed_mle_path_multibasin"
+            else "clonal_anchored_partition_observed_mle_path_multibasin"
         ),
+        clonal_cluster=clonal_cluster,
     )
 
 

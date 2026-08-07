@@ -63,12 +63,15 @@ def effective_bic_depth_count(data: TumorData) -> float:
 
 
 def bic_degrees_of_freedom(num_clusters: int, data: TumorData) -> int:
-    """Nominal BIC degrees of freedom: K * S.
+    """Nominal BIC degrees of freedom under the clonal-anchored restriction.
 
-    Upper bound; active df (parameters not at a boundary) is typically smaller.
-    Both should be reported when a refit result is available.
+    Model selection requires exactly one cluster pinned at the clonal center
+    (phi = 1 in every region, clipped to the feasibility box; see
+    ``core.fusion.refit.partition_constrained_observed_refit``). The pinned
+    centers are constants, so a K-cluster model estimates (K - 1) * S center
+    parameters. Upper bound; active df is typically smaller.
     """
-    return max(int(num_clusters), 1) * int(data.num_regions)
+    return max(int(num_clusters) - 1, 0) * int(data.num_regions)
 
 
 def compute_bic_with_df(

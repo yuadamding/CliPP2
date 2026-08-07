@@ -8,7 +8,6 @@ import numpy as np
 from ..core.model import FitOptions, FitResult, fit_fixed_objective
 from ..core.fusion.partition_starts import (
     PartitionCandidate,
-    partition_constrained_observed_refit_torch,
 )
 from ..core.fusion.refit import (
     PartitionRefitResult,
@@ -17,7 +16,6 @@ from ..core.fusion.refit import (
 from ..core.fusion.solver import (
     cluster_diameters_from_edges,
     cluster_labels_from_edges,
-    uses_explicit_path_likelihood,
 )
 from ..core.fusion.torch_backend import dtype_name
 from ..core.fusion.types import SolverState, TorchRuntime
@@ -264,38 +262,18 @@ def _evaluate_candidate(
         bic_refit_elapsed_seconds = 0.0
     else:
         bic_refit_start_time = perf_counter()
-        use_cuda_refit = bool(
-            not uses_explicit_path_likelihood(data)
-            and getattr(runtime, "device", None) is not None
-            and runtime.device.type == "cuda"
-            and str(effective_fit_options.objective_shape)
-            .strip()
-            .lower()
-            .startswith("unimodal")
+        # The clonal-anchored numpy refit is the single scoring authority on
+        # every device: the unanchored CUDA refit would pair a free-center
+        # loglik with the anchored (K-1)*S degrees of freedom.
+        bic_refit = partition_constrained_observed_refit(
+            data,
+            bic_labels,
+            major_prior=float(effective_fit_options.major_prior),
+            eps=float(effective_fit_options.eps),
+            tol=float(effective_fit_options.tol),
+            max_iter=max(int(effective_fit_options.inner_max_iter), 32),
+            hint_phi=fit.phi,
         )
-        if use_cuda_refit:
-            bic_refit = partition_constrained_observed_refit_torch(
-                data,
-                bic_labels,
-                major_prior=float(effective_fit_options.major_prior),
-                eps=float(effective_fit_options.eps),
-                tol=float(effective_fit_options.tol),
-                max_iter=max(int(effective_fit_options.inner_max_iter), 32),
-                hint_phi=fit.phi,
-                torch_data=torch_data,
-                device=runtime.device,
-                dtype=runtime.dtype,
-            )
-        else:
-            bic_refit = partition_constrained_observed_refit(
-                data,
-                bic_labels,
-                major_prior=float(effective_fit_options.major_prior),
-                eps=float(effective_fit_options.eps),
-                tol=float(effective_fit_options.tol),
-                max_iter=max(int(effective_fit_options.inner_max_iter), 32),
-                hint_phi=fit.phi,
-            )
         bic_refit_elapsed_seconds = float(perf_counter() - bic_refit_start_time)
         if bic_refit_cache is not None:
             bic_refit_cache[partition_hash] = bic_refit
