@@ -47,7 +47,8 @@ Run
 
 ## Outputs
 
-A fit writes a deliberately compact result set into `--outdir`:
+A fit writes four scientific tables into `--outdir`, prefixed with the tumor id
+(the input file name stem, unless a `##tumor_id` metadata line overrides it):
 
 | File | One row per | Contents |
 | --- | --- | --- |
@@ -56,3 +57,11 @@ A fit writes a deliberately compact result set into `--outdir`:
 | `{tumor_id}_mutation_region_multiplicity.tsv` | mutation × region | the same three phi estimates, local `major_cn`/`minor_cn`, and the mutant-copy summaries: MAP path, path probabilities, posterior/MAP mutant-copy mass and effective multiplicity, amplification call, path entropy (plus `summary_*` twins at the clustered phi) |
 | `{tumor_id}_mutation_region_path_posterior.tsv` | supported path | per-path posterior, dosage endpoints (`first_copy`, `second_copy`, `switch_fraction`), prior, mass and multiplicity — written only when a path likelihood exists |
 | `{tumor_id}_simulation_eval.tsv` | run | benchmark metrics; only with `--simulation-root` |
+
+No other file is written. Solver and selection diagnostics — the selected
+lambda, log-likelihoods, BIC/ICL, convergence and certificate fields,
+input/objective hashes, `software_version` — exist only in the run summary that
+`clipp2 fit` prints to stdout; redirect it to keep a record. Timings never
+enter the tables, so refitting the same input on the same device and dtype
+reproduces the output directory byte for byte. `--skip-outputs` suppresses the
+tables and prints the summary only.
