@@ -6,16 +6,11 @@ import numpy as np
 import pandas as pd
 
 from ..core.fusion.path_summary import (
-    DEFAULT_AMPLIFIED_MUTANT_COPY_TOL,
     path_posterior_at_phi_numpy,
     summarize_path_posterior_numpy,
 )
 from ..core.model import FitResult
 from ..io.data import TumorData
-from ..metrics.evaluation import SimulationEvaluation
-
-
-_AMPLIFIED_MUTANT_COPY_TOL = DEFAULT_AMPLIFIED_MUTANT_COPY_TOL
 
 
 def _display_region_label(label: str) -> str:
@@ -300,207 +295,17 @@ def mutation_region_output_table(
     return table
 
 
-def path_posterior_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame:
-    """Return one row per supported, valid mutation-region occupancy path."""
-
-    spec = getattr(data, "path_likelihood", None)
-    summary = _path_summary_arrays(data, fit)
-    if spec is None or summary is None:
-        return pd.DataFrame()
-    summary_ccf = _summary_ccf_path_arrays(data, fit)
-    if summary_ccf is None:
-        raise ValueError("Path data must have a summary-CCF path posterior.")
-
-    supported = _path_supported_mask(data, spec.shape[:2])
-    reportable = np.asarray(spec.valid, dtype=bool) & supported[..., None]
-    valid_indices = np.argwhere(reportable)
-    if valid_indices.size == 0:
-        return pd.DataFrame()
-    mutation_idx = valid_indices[:, 0]
-    region_idx = valid_indices[:, 1]
-    path_idx = valid_indices[:, 2]
-    posterior = summary["posterior"][mutation_idx, region_idx, path_idx]
-    phi = np.asarray(fit.phi, dtype=np.float64)[mutation_idx, region_idx]
-    summary_phi = np.asarray(fit.phi_clustered, dtype=np.float64)[
-        mutation_idx, region_idx
-    ]
-    switch = np.asarray(spec.switch_fraction)[mutation_idx, region_idx, path_idx]
-    boundary_tol = 1e-8
-    path_segment = np.where(
-        phi < switch - boundary_tol,
-        "first_linear_segment_at_fitted_phi",
-        np.where(
-            phi > switch + boundary_tol,
-            "second_linear_segment_at_fitted_phi",
-            "switch_boundary_at_fitted_phi",
-        ),
-    )
-    table = pd.DataFrame(
-        {
-            "tumor_id": data.tumor_id,
-            "mutation_id": np.asarray(data.mutation_ids, dtype=object)[mutation_idx],
-            "region_id": np.asarray(
-                [_display_region_label(value) for value in data.region_ids],
-                dtype=object,
-            )[region_idx],
-            "path_index": path_idx + 1,
-            "path_probability": posterior,
-            "map_path": (
-                summary["map_index"][mutation_idx, region_idx] == path_idx
-            ).astype(int),
-            "summary_phi": summary_phi,
-            "summary_path_probability": summary_ccf["posterior"][
-                mutation_idx, region_idx, path_idx
-            ],
-            "summary_map_path": (
-                summary_ccf["map_index"][mutation_idx, region_idx] == path_idx
-            ).astype(int),
-            "first_copy": np.asarray(spec.first_copy)[
-                mutation_idx, region_idx, path_idx
-            ],
-            "second_copy": np.asarray(spec.second_copy)[
-                mutation_idx, region_idx, path_idx
-            ],
-            "switch_fraction": switch,
-            "path_prior": np.exp(
-                np.asarray(spec.log_prior)[mutation_idx, region_idx, path_idx]
-            ),
-            "mutant_copy_mass": summary["mass"][mutation_idx, region_idx, path_idx],
-            "effective_multiplicity": np.divide(
-                summary["mass"][mutation_idx, region_idx, path_idx],
-                phi,
-                out=np.full_like(phi, np.nan, dtype=np.float64),
-                where=phi > 0.0,
-            ),
-            "amplified_mutant_copy": (
-                summary["mass"][mutation_idx, region_idx, path_idx]
-                > phi + _AMPLIFIED_MUTANT_COPY_TOL
-            ).astype(int),
-            "path_segment_at_fitted_phi": path_segment,
-            "summary_mutant_copy_mass": summary_ccf["mass"][
-                mutation_idx, region_idx, path_idx
-            ],
-            "summary_effective_multiplicity": np.divide(
-                summary_ccf["mass"][mutation_idx, region_idx, path_idx],
-                summary_phi,
-                out=np.full_like(summary_phi, np.nan, dtype=np.float64),
-                where=summary_phi > 0.0,
-            ),
-            "summary_amplified_mutant_copy": (
-                summary_ccf["mass"][mutation_idx, region_idx, path_idx]
-                > summary_phi + _AMPLIFIED_MUTANT_COPY_TOL
-            ).astype(int),
-            "summary_path_segment_at_clustered_phi": np.where(
-                summary_phi < switch - boundary_tol,
-                "first_linear_segment_at_clustered_phi",
-                np.where(
-                    summary_phi > switch + boundary_tol,
-                    "second_linear_segment_at_clustered_phi",
-                    "switch_boundary_at_clustered_phi",
-                ),
-            ),
-        }
-    )
-    annotations = getattr(data, "path_annotations", None)
-    if annotations is not None and hasattr(annotations, "columns_for_indices"):
-        for name, values in annotations.columns_for_indices(valid_indices).items():
-            table[str(name)] = values
-    elif annotations is not None:
-        aligned_paths = [
-            annotations[int(mutation)][int(region)][int(path)]
-            for mutation, region, path in valid_indices
-        ]
-
-        def alias_values(path, attribute: str) -> list[str]:
-            if path is None:
-                return []
-            return sorted(
-                {
-                    str(getattr(alias, attribute))
-                    for alias in getattr(path, "aliases", ())
-                }
-            )
-
-        table["biological_duplicate_count"] = [
-            0 if path is None else int(path.biological_duplicate_count)
-            for path in aligned_paths
-        ]
-        for column, attribute in (
-            ("homolog_mapping_aliases", "mapping_id"),
-            ("homolog_aliases", "homolog_id"),
-            ("first_state_aliases", "first_state"),
-            ("state1_allele_aliases", "state1_allele"),
-            ("state2_allele_aliases", "state2_allele"),
-            ("copy_relation_aliases", "copy_relation"),
-            ("state1_dosage_aliases", "q1"),
-            ("state2_dosage_aliases", "q2"),
-        ):
-            table[column] = [
-                ";".join(alias_values(path, attribute)) for path in aligned_paths
-            ]
-    return table
-
-
-def evaluation_to_frame(evaluation: SimulationEvaluation) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "ARI": evaluation.ari,
-                "cp_rmse": evaluation.cp_rmse,
-                "raw_cp_rmse": evaluation.raw_cp_rmse,
-                "summary_cp_rmse": evaluation.summary_cp_rmse,
-                "bic_refit_cp_rmse": evaluation.bic_refit_cp_rmse,
-                "multiplicity_f1": evaluation.multiplicity_f1,
-                "multiplicity_asymmetric_f1": evaluation.multiplicity_asymmetric_f1,
-                "multiplicity_estimable_f1": evaluation.multiplicity_estimable_f1,
-                "effective_multiplicity_rmse": evaluation.effective_multiplicity_rmse,
-                "raw_effective_multiplicity_rmse": (
-                    evaluation.raw_effective_multiplicity_rmse
-                ),
-                "summary_effective_multiplicity_rmse": (
-                    evaluation.summary_effective_multiplicity_rmse
-                ),
-                "amplified_mutant_copy_f1": evaluation.amplified_mutant_copy_f1,
-                "raw_amplified_mutant_copy_f1": (
-                    evaluation.raw_amplified_mutant_copy_f1
-                ),
-                "summary_amplified_mutant_copy_f1": (
-                    evaluation.summary_amplified_mutant_copy_f1
-                ),
-                "n_effective_multiplicity_units": (
-                    evaluation.n_effective_multiplicity_units
-                ),
-                "n_amplified_mutant_copy_units": (
-                    evaluation.n_amplified_mutant_copy_units
-                ),
-                "n_true_amplified_mutant_copy_units": (
-                    evaluation.n_true_amplified_mutant_copy_units
-                ),
-                "estimated_clonal_fraction": evaluation.estimated_clonal_fraction,
-                "true_clonal_fraction": evaluation.true_clonal_fraction,
-                "clonal_fraction_error": evaluation.clonal_fraction_error,
-                "true_clusters": evaluation.true_clusters,
-                "estimated_clusters": evaluation.estimated_clusters,
-                "n_eval_mutations": evaluation.n_eval_mutations,
-                "n_filtered_mutations": evaluation.n_filtered_mutations,
-            }
-        ]
-    )
-
-
 def write_fit_outputs(
     outdir: Path,
     data: TumorData,
     fit: FitResult,
-    evaluation: SimulationEvaluation | None,
     bic_refit_phi: np.ndarray | None = None,
     bic_refit_cluster_centers: np.ndarray | None = None,
 ) -> None:
-    """Write the compact per-tumor result set.
+    """Write the three per-tumor result tables.
 
-    Deliberately no lambda_search.tsv and no run_summary.tsv: solver and
-    selection diagnostics are returned in the summary dict (printed by the
-    CLI and aggregated into the cohort table), not persisted per tumor.
+    Deliberately nothing else: solver, selection, and benchmark diagnostics
+    live in the summary dict the CLI prints to stdout.
     """
     outdir.mkdir(parents=True, exist_ok=True)
     mutation_output_table(data, fit, bic_refit_phi=bic_refit_phi).to_csv(
@@ -520,26 +325,11 @@ def write_fit_outputs(
         sep="\t",
         index=False,
     )
-    path_table = path_posterior_output_table(data, fit)
-    if not path_table.empty:
-        path_table.to_csv(
-            outdir / f"{data.tumor_id}_mutation_region_path_posterior.tsv",
-            sep="\t",
-            index=False,
-        )
-    if evaluation is not None:
-        evaluation_to_frame(evaluation).to_csv(
-            outdir / f"{data.tumor_id}_simulation_eval.tsv",
-            sep="\t",
-            index=False,
-        )
 
 
 __all__ = [
     "mutation_region_output_table",
     "cluster_output_table",
-    "evaluation_to_frame",
     "mutation_output_table",
-    "path_posterior_output_table",
     "write_fit_outputs",
 ]
