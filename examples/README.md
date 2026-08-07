@@ -19,14 +19,22 @@ tumor = load_tumor_txt("examples/exampleTumor1.clipp2.txt")
 print(tumor.tumor_id, tumor.num_mutations, tumor.region_ids)
 ```
 
-Run it on CPU:
+Run it on CPU. `--device cpu` is required because `--device` defaults to `cuda`,
+and limiting the Torch thread count is strongly recommended — on this 300-SNV
+input it is the difference between finishing in about half an hour and not
+finishing at all:
 
 ```bash
-clipp2 fit \
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 clipp2 fit \
   --input-file examples/exampleTumor1.clipp2.txt \
   --outdir exampleTumor1_results \
   --device cpu
 ```
+
+See [Device and precision](../README.md#device-and-precision) for why, and for
+the GPU equivalents. Paths above are relative to the package directory; a
+pip-installed copy keeps these files under
+`site-packages/CliPP2/examples/`.
 
 Generate a fresh evolutionary benchmark with hidden multiplicity truth:
 
@@ -40,5 +48,5 @@ clipp2 simulate \
 ```
 
 The generated benchmark bundle contains the canonical input, truth-prefixed
-tables, sample truth subdirectories, and a manifest that hashes input and truth
-separately.
+tables, one `regionN/` truth subdirectory per region, and a manifest that hashes
+input and truth separately.
