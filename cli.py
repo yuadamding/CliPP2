@@ -36,7 +36,7 @@ from .model_selection.config import (
     DEFAULT_SELECTION_SCORE,
     SELECTION_SCORE_NAMES,
 )
-from .runners.pipeline import process_tumor, run_cohort
+from .runners.pipeline import process_tumor
 from .simulation import simulate_tumor
 from .simulation.cli import (
     add_simulation_arguments,
@@ -222,24 +222,10 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
-    inputs = parser.add_mutually_exclusive_group(required=True)
-    inputs.add_argument(
+    parser.add_argument(
         "--input-file",
+        required=True,
         help="One-tumor .tsv, .tsv.gz, .clipp2.txt, or .clipp2.txt.gz input.",
-    )
-    inputs.add_argument(
-        "--input-dir",
-        help=(
-            "Directory of .tsv, .tsv.gz, .clipp2.txt, or .clipp2.txt.gz tumor files."
-        ),
-    )
-    inputs.add_argument(
-        "--cohort-dir",
-        help="Legacy directory whose immediate children are tumor bundles.",
-    )
-    inputs.add_argument(
-        "--tumor-dir",
-        help="One legacy CliPP2 tumor-directory bundle.",
     )
     parser.add_argument(
         "--unsupported-policy",
@@ -271,19 +257,7 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         "--skip-outputs",
         "--skip-tumor-outputs",
         action="store_true",
-        help="Skip per-tumor mutation/cluster/lambda files.",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=1,
-        help="Process-level parallelism for directory runs.",
-    )
-    parser.add_argument(
-        "--max-tumors",
-        type=int,
-        default=None,
-        help="Optional cap on the number of tumors processed.",
+        help="Skip the per-tumor result tables.",
     )
 
 
@@ -357,9 +331,6 @@ def _validate_fit_args(
     prior_penalty = float(args.dosage_prior_penalty)
     if not math.isfinite(prior_penalty) or prior_penalty < 0.0:
         parser.error("--dosage-prior-penalty must be finite and nonnegative")
-    if (args.tumor_dir or args.input_file) and args.max_tumors is not None:
-        parser.error("--max-tumors is valid only with --input-dir or --cohort-dir")
-
     if args.lambda_grid_mode != DEFAULT_LAMBDA_GRID_MODE:
         return
     if lambda_grid is not None:
@@ -418,38 +389,13 @@ def _run_fit(args: argparse.Namespace) -> None:
     fit_options = _fit_options_from_args(args)
     lambda_grid = _parse_lambda_grid(args.lambda_grid)
 
-    single_input = args.input_file or args.tumor_dir
-    if single_input:
-        summary = process_tumor(
-            tumor_dir=Path(single_input),
-            outdir=Path(args.outdir),
-            simulation_root=Path(args.simulation_root)
-            if args.simulation_root
-            else None,
-            lambda_grid=lambda_grid,
-            lambda_grid_mode=args.lambda_grid_mode,
-            fit_options=fit_options,
-            bic_df_scale=args.bic_df_scale,
-            bic_cluster_penalty=args.bic_cluster_penalty,
-            selection_score=args.selection_score,
-            use_warm_starts=not args.disable_warm_start,
-            write_outputs=not args.skip_outputs,
-            graph_file=Path(args.graph_file) if args.graph_file else None,
-            unsupported_policy=args.unsupported_policy,
-            dosage_prior_penalty=args.dosage_prior_penalty,
-            input_format="canonical" if args.input_file else "legacy",
-        )
-        print(summary)
-        return
-
-    summary_df = run_cohort(
-        cohort_dir=Path(args.input_dir or args.cohort_dir),
+    summary = process_tumor(
+        tumor_file=Path(args.input_file),
         outdir=Path(args.outdir),
         simulation_root=Path(args.simulation_root) if args.simulation_root else None,
         lambda_grid=lambda_grid,
         lambda_grid_mode=args.lambda_grid_mode,
         fit_options=fit_options,
-        max_tumors=args.max_tumors,
         bic_df_scale=args.bic_df_scale,
         bic_cluster_penalty=args.bic_cluster_penalty,
         selection_score=args.selection_score,
@@ -458,10 +404,8 @@ def _run_fit(args: argparse.Namespace) -> None:
         graph_file=Path(args.graph_file) if args.graph_file else None,
         unsupported_policy=args.unsupported_policy,
         dosage_prior_penalty=args.dosage_prior_penalty,
-        workers=args.workers,
-        input_files=bool(args.input_dir),
     )
-    print(summary_df.head().to_string(index=False))
+    print(summary)
 
 
 def _run_simulate(args: argparse.Namespace) -> None:

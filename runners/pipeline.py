@@ -1,26 +1,17 @@
 from __future__ import annotations
 
-import concurrent.futures as cf
-import multiprocessing as mp
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
 
 import numpy as np
 import pandas as pd
-import torch
 
 from .._version import __version__ as _SOFTWARE_VERSION
-from ..core.fusion.defaults import DEFAULT_DEVICE
 from ..core.fusion.graph import load_pairwise_fusion_graph_tsv
-from ..core.fusion.types import ExactSolverResourceLimit
 from ..core.model import FitOptions
-from ..io.tumor_input import (
-    DEFAULT_DOSAGE_PRIOR_PENALTY,
-    is_tumor_directory,
-    load_tumor_directory,
-)
-from ..io.tumor_txt import _read_tumor_txt_metadata, load_tumor_txt
+from ..io.tumor_input import DEFAULT_DOSAGE_PRIOR_PENALTY
+from ..io.tumor_txt import load_tumor_txt
 from ..metrics.evaluation import evaluate_fit_against_simulation
 from ..model_selection.config import (
     DEFAULT_LAMBDA_GRID_MODE,
@@ -30,49 +21,8 @@ from .model_selection import select_model
 from .outputs import write_fit_outputs
 
 
-def _exact_resource_limit_summary(
-    tumor_dir: str | Path,
-    exc: ExactSolverResourceLimit,
-    *,
-    tumor_id: str | None = None,
-) -> dict[str, float | int | str | bool]:
-    """Record one fail-closed tumor without terminating a directory batch."""
-
-    path = Path(tumor_dir)
-    return {
-        "tumor_id": path.name if tumor_id is None else str(tumor_id),
-        "tumor_directory": str(path),
-        "selection_eligible": False,
-        "raw_kkt_eligible": False,
-        "bic_selection_eligible": False,
-        "full_kkt_certified": False,
-        "full_kkt_certificate_status": "resource_limit",
-        "failure_reason": "exact_solver_resource_limit",
-        "error_message": str(exc),
-        "software_version": str(_SOFTWARE_VERSION),
-    }
-
-
-def _normalize_resource_limit(exc: BaseException) -> ExactSolverResourceLimit:
-    if isinstance(exc, ExactSolverResourceLimit):
-        return exc
-    return ExactSolverResourceLimit(
-        "exact_solver_resource_limit: an exact solver allocation exhausted memory."
-    )
-
-
-def _is_tumor_txt_path(path: Path) -> bool:
-    name = path.name.lower()
-    return path.is_file() and (
-        name.endswith(".clipp2.txt")
-        or name.endswith(".clipp2.txt.gz")
-        or name.endswith(".tsv")
-        or name.endswith(".tsv.gz")
-    )
-
-
 def process_tumor_bundle(
-    tumor_dir: str | Path,
+    tumor_file: str | Path,
     outdir: str | Path,
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
@@ -88,32 +38,16 @@ def process_tumor_bundle(
     unsupported_policy: str = "error",
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     evaluate_all_candidates: bool | None = None,
-    input_format: str = "auto",
 ) -> tuple[dict[str, float | int | str | bool], pd.DataFrame]:
-    """Fit one canonical tumor file or legacy directory."""
+    """Fit one tumor TSV file (a legacy directory must be converted first)."""
 
     start_time = perf_counter()
-    tumor_dir = Path(tumor_dir)
+    tumor_file = Path(tumor_file)
     outdir = Path(outdir)
-    normalized_input_format = str(input_format).strip().lower()
-    if normalized_input_format not in {"auto", "canonical", "legacy"}:
-        raise ValueError("input_format must be 'auto', 'canonical', or 'legacy'.")
-    if normalized_input_format == "canonical":
-        if not tumor_dir.is_file():
-            raise FileNotFoundError(
-                f"Canonical tumor input must be a file: {tumor_dir}"
-            )
-        loader = load_tumor_txt
-    elif normalized_input_format == "legacy":
-        if not tumor_dir.is_dir():
-            raise FileNotFoundError(
-                f"Legacy tumor input must be a directory: {tumor_dir}"
-            )
-        loader = load_tumor_directory
-    else:
-        loader = load_tumor_txt if tumor_dir.is_file() else load_tumor_directory
-    data = loader(
-        tumor_dir,
+    if not tumor_file.is_file():
+        raise FileNotFoundError(f"Tumor input must be a file: {tumor_file}")
+    data = load_tumor_txt(
+        tumor_file,
         unsupported_policy=unsupported_policy,
         dosage_prior_penalty=dosage_prior_penalty,
     )
@@ -951,7 +885,7 @@ def process_tumor_bundle(
 
 
 def process_tumor(
-    tumor_dir: str | Path,
+    tumor_file: str | Path,
     outdir: str | Path,
     simulation_root: str | Path | None = None,
     lambda_grid: list[float] | None = None,
@@ -967,12 +901,11 @@ def process_tumor(
     unsupported_policy: str = "error",
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     evaluate_all_candidates: bool | None = None,
-    input_format: str = "auto",
 ) -> dict[str, float | int | str | bool]:
-    """Fit one canonical tumor file or legacy directory."""
+    """Fit one tumor TSV file."""
 
     summary, _ = process_tumor_bundle(
-        tumor_dir=tumor_dir,
+        tumor_file=tumor_file,
         outdir=outdir,
         simulation_root=simulation_root,
         lambda_grid=lambda_grid,
@@ -988,177 +921,5 @@ def process_tumor(
         evaluate_all_candidates=evaluate_all_candidates,
         unsupported_policy=unsupported_policy,
         dosage_prior_penalty=dosage_prior_penalty,
-        input_format=input_format,
     )
     return summary
-
-
-def run_cohort(
-    cohort_dir: str | Path,
-    outdir: str | Path,
-    simulation_root: str | Path | None = None,
-    lambda_grid: list[float] | None = None,
-    lambda_grid_mode: str = DEFAULT_LAMBDA_GRID_MODE,
-    fit_options: FitOptions | None = None,
-    max_tumors: int | None = None,
-    bic_df_scale: float = 1.0,
-    bic_cluster_penalty: float = 0.0,
-    selection_score: str = DEFAULT_SELECTION_SCORE,
-    use_warm_starts: bool = True,
-    write_outputs: bool = True,
-    graph_file: str | Path | None = None,
-    finalize_selected_fit: bool | None = None,
-    unsupported_policy: str = "error",
-    dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
-    workers: int = 1,
-    evaluate_all_candidates: bool | None = None,
-    input_files: bool = False,
-) -> pd.DataFrame:
-    """Fit canonical tumor files or legacy directories in one input folder."""
-
-    cohort_dir = Path(cohort_dir)
-    if input_files:
-        tumor_dirs = sorted(
-            (path for path in cohort_dir.iterdir() if _is_tumor_txt_path(path)),
-            key=lambda path: path.name,
-        )
-        input_description = "canonical CliPP2 tumor files"
-    else:
-        tumor_dirs = sorted(
-            (path for path in cohort_dir.iterdir() if is_tumor_directory(path)),
-            key=lambda path: path.name,
-        )
-        input_description = "legacy CliPP2 tumor directories"
-    if max_tumors is not None:
-        tumor_dirs = tumor_dirs[: max(0, int(max_tumors))]
-
-    if not tumor_dirs:
-        raise RuntimeError(f"No {input_description} found in {cohort_dir}.")
-
-    tumor_id_by_path = {
-        path: (_read_tumor_txt_metadata(path)["tumor_id"] if input_files else path.name)
-        for path in tumor_dirs
-    }
-    if input_files:
-        paths_by_tumor_id: dict[str, list[Path]] = {}
-        for path, tumor_id in tumor_id_by_path.items():
-            paths_by_tumor_id.setdefault(tumor_id, []).append(path)
-        duplicates = {
-            tumor_id: [path.name for path in paths]
-            for tumor_id, paths in paths_by_tumor_id.items()
-            if len(paths) > 1
-        }
-        if duplicates:
-            raise RuntimeError(
-                "Canonical cohort tumor_id values must be unique to prevent "
-                f"output collisions: {duplicates}."
-            )
-
-    summaries = []
-    worker_count = max(int(workers), 1)
-    if worker_count <= 1:
-        for tumor_dir in tumor_dirs:
-            try:
-                summary = process_tumor(
-                    tumor_dir=tumor_dir,
-                    outdir=outdir,
-                    simulation_root=simulation_root,
-                    lambda_grid=lambda_grid,
-                    lambda_grid_mode=lambda_grid_mode,
-                    fit_options=fit_options,
-                    bic_df_scale=bic_df_scale,
-                    bic_cluster_penalty=bic_cluster_penalty,
-                    selection_score=selection_score,
-                    use_warm_starts=use_warm_starts,
-                    write_outputs=write_outputs,
-                    graph_file=graph_file,
-                    finalize_selected_fit=finalize_selected_fit,
-                    evaluate_all_candidates=evaluate_all_candidates,
-                    unsupported_policy=unsupported_policy,
-                    dosage_prior_penalty=dosage_prior_penalty,
-                    input_format="canonical" if input_files else "legacy",
-                )
-            except (
-                ExactSolverResourceLimit,
-                MemoryError,
-                torch.OutOfMemoryError,
-            ) as exc:
-                summary = _exact_resource_limit_summary(
-                    tumor_dir,
-                    _normalize_resource_limit(exc),
-                    tumor_id=tumor_id_by_path[tumor_dir],
-                )
-            summaries.append(summary)
-    else:
-        # Guard against multi-process CUDA: each spawned process would independently
-        # initialize the same device, risking OOM or allocator contention.
-        effective_device = (
-            getattr(fit_options, "device", DEFAULT_DEVICE)
-            if fit_options is not None
-            else DEFAULT_DEVICE
-        )
-        if str(effective_device).strip().lower() not in {"cpu", "auto"} or (
-            str(effective_device).strip().lower() == "auto"
-            and torch.cuda.is_available()
-        ):
-            import warnings
-
-            warnings.warn(
-                f"workers={worker_count} with device={effective_device!r}: multiple processes may "
-                "each initialize the same CUDA device, causing OOM or contention. "
-                "Use workers=1 for CUDA mode, or set device='cpu'.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        with cf.ProcessPoolExecutor(
-            max_workers=worker_count,
-            mp_context=mp.get_context("spawn"),
-        ) as executor:
-            future_map = {
-                executor.submit(
-                    process_tumor,
-                    tumor_dir=tumor_dir,
-                    outdir=outdir,
-                    simulation_root=simulation_root,
-                    lambda_grid=lambda_grid,
-                    lambda_grid_mode=lambda_grid_mode,
-                    fit_options=fit_options,
-                    bic_df_scale=bic_df_scale,
-                    bic_cluster_penalty=bic_cluster_penalty,
-                    selection_score=selection_score,
-                    use_warm_starts=use_warm_starts,
-                    write_outputs=write_outputs,
-                    graph_file=graph_file,
-                    finalize_selected_fit=finalize_selected_fit,
-                    evaluate_all_candidates=evaluate_all_candidates,
-                    unsupported_policy=unsupported_policy,
-                    dosage_prior_penalty=dosage_prior_penalty,
-                    input_format="canonical" if input_files else "legacy",
-                ): tumor_dir
-                for tumor_dir in tumor_dirs
-            }
-            ordered: dict[str, dict[str, float | int | str | bool]] = {}
-            for future in cf.as_completed(future_map):
-                tumor_dir = future_map[future]
-                try:
-                    ordered[tumor_dir.name] = future.result()
-                except (
-                    ExactSolverResourceLimit,
-                    MemoryError,
-                    torch.OutOfMemoryError,
-                ) as exc:
-                    ordered[tumor_dir.name] = _exact_resource_limit_summary(
-                        tumor_dir,
-                        _normalize_resource_limit(exc),
-                        tumor_id=tumor_id_by_path[tumor_dir],
-                    )
-                except Exception as exc:
-                    raise RuntimeError(f"Worker failed on {tumor_dir}: {exc}") from exc
-            summaries = [ordered[tumor_dir.name] for tumor_dir in tumor_dirs]
-
-    summary_df = pd.DataFrame(summaries)
-    sort_column = "tumor_id"
-    summary_df = summary_df.sort_values(sort_column).reset_index(drop=True)
-    Path(outdir).mkdir(parents=True, exist_ok=True)
-    summary_df.to_csv(Path(outdir) / "single_stage_summary.tsv", sep="\t", index=False)
-    return summary_df
