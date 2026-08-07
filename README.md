@@ -168,15 +168,24 @@ cost even when edge tensors are streamed in bounded chunks. Run
 
 ### CUDA is the default, so CPU-only machines must opt in
 
-`--device` accepts `auto`, `cpu` or `cuda` and **defaults to `cuda`**. Every
-`clipp2 fit` command shown above therefore requires a working CUDA build. There
-is no silent fallback: on a machine without CUDA, `--device cuda` fails
-immediately with
+`--device` accepts `auto`, `cpu` or `cuda` and **defaults to `cuda`**. It exists
+only on `fit`; `validate`, `convert` and `simulate` never touch a device. Every
+`clipp2 fit` command shown above therefore requires a working CUDA build. Under
+the default fallback policy there is no silent downgrade: on a machine without
+CUDA, `--device cuda` fails immediately with exit status 1 and
 
 ```text
 CudaUnavailableError: Requested Torch device 'cuda', but CUDA is not available.
 Use device='cpu' or device='auto' to permit CPU execution.
 ```
+
+One flag changes that. `--dense-fallback-policy cpu-allowed` also rescues an
+*unavailable device*, not just an out-of-memory one: it catches
+`CudaUnavailableError`, re-resolves the runtime to CPU and completes the fit. The
+only trace is in the run summary, where `fallback_reason` becomes
+`dense_cpu_after_context_resource_limit` and `inner_solver` becomes
+`admm_complete_graph_cpu_fallback`. If you use that policy, check those two
+columns before reporting a run as GPU-accelerated.
 
 | `--device` | Behaviour |
 | --- | --- |
@@ -201,53 +210,95 @@ clipp2 fit \
 ### Precision
 
 `--dtype` accepts `auto`, `float16`, `float32` or `float64` and **defaults to
-`float64`**; `auto` also resolves to `float64`, on both devices. `float16` is
-CUDA-only and raises `RuntimeError: Float16 runtime dtype is only supported on
-CUDA` on CPU.
+`float64`**; `auto` also resolves to `float64` on both devices, so it never
+selects reduced precision for a GPU. `float16` is CUDA-only and raises
+`RuntimeError: Float16 runtime dtype is only supported on CUDA` elsewhere. The
+device is validated before the dtype, so on a CPU-only host
+`--dtype float16` at the default device reports the CUDA error, not the float16
+one.
 
-Keep `float64` unless you have a specific reason not to. The binomial
-log-likelihood is stiff near the prevalence floor — on the shipped 300-mutation
-example the gradient norm reaches roughly `7e6` at a prevalence of `1e-4` — and
-the KKT residuals that gate model selection are compared against tolerances
-around `5e-5`, so reduced precision erodes exactly the quantities the estimator
-certifies against.
+**Keep `float64`.** `float32` does run to completion, but the case against it is
+structural rather than a matter of accumulated round-off:
+
+- Many solver and certificate thresholds are computed as multiples of
+  `torch.finfo(dtype).eps`, which is `2.2e-16` for float64 and `1.2e-7` for
+  float32. Dropping precision therefore *loosens the convergence and stationarity
+  criteria by orders of magnitude* rather than merely adding noise.
+- The certification target does not compensate: `full_kkt_tolerance` is
+  `5 × --tol` regardless of dtype.
+- The likelihood is stiff where it matters. On the shipped 300-mutation example
+  the gradient norm reaches roughly `7e6` at a prevalence of `1e-4`, and low
+  prevalence is exactly the regime this tool exists to resolve.
+- Reduced precision is not a speed win here. On a 4-mutation input a float32 fit
+  took substantially *longer* than float64 because the lambda search explored more
+  candidates. That specific ratio is input-dependent and should not be
+  generalised, but there is no measured case of float32 being faster.
+- Nothing warns you. The output TSVs are cast to float64 for reporting either
+  way, and the partition-refit `bic_loglik` is always computed in NumPy float64,
+  so a float32 fit *looks* like a float64 fit in its own results. Only the
+  `dtype` column records the resolved precision.
+
+`--dtype` is never cross-validated against `--tol`, so a loose dtype with a tight
+tolerance is accepted silently.
 
 ### Running on CPU: limit the thread count
 
 This matters more than any other CPU setting. The tensors are small — `(M × S)`
-per node and `(E × S)` per edge, where a complete graph has `E = M(M−1)/2` — so
-Torch's intra-op thread pool spends more time synchronising than computing, and
-it is enabled by default. **Nothing in CliPP2 sets the thread count for you.**
+per node and `(E × S)` per edge, where the default complete graph has
+`E = M(M−1)/2` — so no tensor in the fit reaches Torch's parallelisation grain
+size, and the intra-op thread pool spends its time synchronising rather than
+computing. It is on by default, and **nothing in CliPP2 sets the thread count for
+you.**
 
-Measured on one simulated 60-mutation, two-region tumor, same inputs and
-byte-identical outputs:
+Sweep on an 8-mutation, two-region fit, sequential runs on one host:
 
-| CPU threading | CPU time |
-| --- | --- |
-| Torch default | 18 min |
-| `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1` | 1 min 36 s |
+| Intra-op threads | CPU time | Wall time |
+| --- | --- | --- |
+| 1 | 16.5 s | 16.5 s |
+| 2 | 26.9 s | 16.6 s |
+| 4 | 44.4 s | 17.3 s |
+| 8 | 74.9 s | 16.8 s |
+| Torch default (23 here) | 423 s | 35.5 s |
 
-The effect is large enough to change what is feasible: the shipped 300-mutation
-example did not finish within 900 s under default threading, but completes in
-about 29 minutes single-threaded. Compare CPU time rather than wall clock, since
-the oversubscribed run also competes with itself.
+So threading buys nothing at all in wall time up to 8 threads while burning up to
+4.5× the CPU, and at Torch's own default it is **2.2× worse in wall time and
+~26× worse in CPU time**. The results are unaffected: across 1, 2, 4, 8 and
+default threads every non-timing column of `run_summary.tsv` and
+`lambda_search.tsv` matched, and the four per-mutation tables were byte-identical.
+
+Treat CPU time as the number to compare — the multi-threaded figure is mostly
+spin time and is itself unstable (two runs of the same fit measured 423 s and
+297 s of CPU, against a single-threaded run stable near 16 s).
 
 ```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 clipp2 fit \
+OMP_NUM_THREADS=1 clipp2 fit \
   --input-file inputs/exampleTumor1.clipp2.txt \
   --outdir clipp2_results \
   --device cpu
 ```
 
-Library users can equivalently call `torch.set_num_threads(1)` before fitting.
-Do **not** apply this to CUDA runs — there the work is on the device and the
-CPU thread pool is not the bottleneck.
+`OMP_NUM_THREADS=1` alone is sufficient. Note the precedence: Torch reads
+`OMP_NUM_THREADS` but `MKL_NUM_THREADS` overrides it when both are set, so a
+stray `MKL_NUM_THREADS` from a cluster module file will win. Library users can
+call `torch.set_num_threads(1)` before fitting instead.
+
+The effect compounds in cohort mode: `--workers N` spawns N processes that each
+independently default to the full intra-op thread count, so `--workers 8` without
+a thread limit oversubscribes by roughly 8 × 23 threads. Set the environment
+variable once — it is inherited by the workers — and treat one thread per worker
+as the baseline.
+
+Do **not** apply this to CUDA runs: the solver tensors live on the device, and the
+CPU pool governs only host kernels. The one exception is
+`--dense-fallback-policy cpu-allowed`, where a fallback run becomes a CPU run and
+the setting starts to matter again.
 
 ### Cohort runs and `--workers`
 
 `--workers` defaults to `1` and only affects directory inputs (`--input-dir`,
-`--cohort-dir`); it is ignored for `--input-file`, which always fits in-process.
-Workers are separate `spawn` processes.
+`--cohort-dir`); it is accepted but silently ignored for `--input-file` and
+`--tumor-dir`, which always fit in-process. Values below 1 are clamped to 1
+rather than rejected. Workers are separate `spawn` processes, never forked.
 
 Combining `--workers > 1` with CUDA is not blocked, only warned about:
 
@@ -257,10 +308,37 @@ initialize the same CUDA device, causing OOM or contention.
 Use workers=1 for CUDA mode, or set device='cpu'.
 ```
 
-The warning also fires for `--device auto` on a machine that has a GPU, because
-`auto` resolves to CUDA there. Use `--workers 1` for GPU runs and reserve
-process parallelism for `--device cpu`, where it composes well with the
-single-thread setting above (one thread per worker).
+The concrete hazard is that the dense-solver memory preflight sizes itself
+against 80% of the *currently free* device memory, and every worker computes that
+independently and concurrently — so N workers can each conclude the problem fits
+and then collectively exhaust the GPU. Nothing pins workers to different devices,
+so on a multi-GPU host you must partition them yourself with
+`CUDA_VISIBLE_DEVICES`.
+
+The warning also fires for `--device auto` on a machine that has a GPU, since
+`auto` resolves to CUDA there. It is keyed on the *requested* device string, so
+`--device cuda --workers 2` warns even on a host with no GPU at all. Use
+`--workers 1` for GPU runs and reserve process parallelism for `--device cpu`.
+
+### How failures are handled in a cohort
+
+Worth knowing before launching a long run, because the two cases differ sharply:
+
+- **Memory failures are per-tumor and recoverable.**
+  `ExactSolverResourceLimit`, `MemoryError` and `torch.OutOfMemoryError` are
+  caught per tumor, recorded as a summary row with `selection_eligible=False`,
+  and the cohort continues.
+- **Any other exception aborts the whole cohort.** The summary table is written
+  only after the loop completes, so tumors that already succeeded lose their
+  cohort-level row. A tumor that is merely hard to fit can do this: exhausting
+  the lambda search without a certified candidate raises
+  `NoEligibleModelSelectionCandidatesError`, which is not in the recoverable set.
+  Until that is addressed, prefer batching a large cohort into several smaller
+  `--input-dir` invocations.
+
+Single-tumor mode has no resource-limit handler at all: a memory failure there
+terminates the command with a traceback and a non-zero exit status rather than a
+summary row.
 
 ### Device memory
 
@@ -269,34 +347,72 @@ its dense edge tensors in device memory. It defaults to `device-only`.
 
 | Policy | Behaviour on device-memory exhaustion |
 | --- | --- |
-| `device-only` *(default)* | Never migrates solver work to the host; surfaces an explicit resource-limit error instead. |
-| `cpu-allowed` | Retries the affected solve on CPU. |
-| `error` | Disables dense fallback outright. |
+| `device-only` *(default)* | Never migrates solver work to the host; raises `ExactSolverResourceLimit` instead. |
+| `cpu-allowed` | Re-resolves the runtime to CPU and redoes the affected work there. Also rescues an unavailable CUDA device, as noted above. Cannot rescue `--dtype float16`, which has no CPU implementation. |
+| `error` | Intended to disable dense fallback outright. |
 
-`--workset-max-bytes` and `--compressed-cache-max-bytes` are byte budgets for
-the working-set and compressed-certificate machinery, which the dense default
-backend does not use; they matter only with `--inner-backend
-quotient-workset`.
+With the default dense backend, `error` and `device-only` are indistinguishable:
+every out-of-memory handler tests only for `cpu_allowed`, and the two branches
+that behave differently under `error` are reachable only through
+`--inner-backend quotient-workset`. Do not expect `error` to add a guard to a
+default-backend run.
+
+For scripting, note the exception hierarchy is not uniform:
+`ExactSolverResourceLimit` subclasses **`MemoryError`**, while
+`CudaUnavailableError` subclasses **`RuntimeError`**. Catch both explicitly rather
+than relying on a common base.
+
+`CLIPP2_MAX_COMPLETE_GRAPH_BYTES` overrides the preflight's memory budget with a
+fixed per-process byte cap, taking precedence over both the CUDA and the host
+query. It must be a positive number when set. This is the lever to use when the
+automatic 80%-of-free heuristic misjudges a shared GPU.
+
+`--workset-max-bytes` and `--compressed-cache-max-bytes` are byte budgets for the
+working-set and compressed-certificate machinery, which the dense default backend
+does not use; they matter only with `--inner-backend quotient-workset`.
 
 ### Reproducibility across devices and runs
 
-For a fixed device and dtype, CPU fits are bit-reproducible: two runs of the
+For a fixed device and dtype, CPU fits are bit-reproducible: repeated runs of the
 same input produce byte-identical cluster, prevalence, multiplicity and
-path-posterior tables. Only the `*_elapsed_seconds` columns differ, and because
-those are embedded in the result tables the files themselves are not byte-equal
-even when every scientific value is.
+path-posterior tables, and this holds across thread counts too. Only the
+`*_elapsed_seconds` columns differ — and because those are embedded in the result
+tables, the files themselves are never byte-equal even when every scientific value
+is. Compare columns, not checksums.
 
-CUDA is weaker, by design of the underlying kernels:
+Across devices the guarantee is weaker than a pure dispatch would give you,
+because the device selects the implementation and not merely where it runs:
 
+- **The fusion graph is built by different code on CPU and CUDA.** The non-CUDA
+  path uses a NumPy builder in float64; the CUDA path uses a Torch builder at the
+  run's dtype. They implement the same formula but not the same arithmetic, and in
+  float64 their edge weights agree only to about `6e-16` relative. Consequently
+  `original_graph_hash` and `edge_list_hash` **differ between a CPU run and a CUDA
+  run of the same input**: those hashes identify a device-and-dtype-specific
+  problem, so do not use them to assert two runs solved the same problem across
+  devices. Whether that last-bit difference can flip a final label is unresolved.
 - **CUDA fits are not bit-reproducible run to run.** The float `index_add_` used
-  to accumulate the edge adjoint is nondeterministic on GPU.
+  to accumulate the edge adjoint has duplicate indices and is documented by
+  PyTorch as nondeterministic on CUDA. It sits on the hot path of the default
+  dense solver.
 - **CPU and GPU can assign different labels near lambda-path decision
   boundaries**, where two candidate partitions are nearly tied.
 
+One divergence that does *not* apply to the documented input format: a CUDA-only
+partition-refit implementation exists and would feed `bic_loglik` and therefore the
+selected cluster count, but it is reachable only for legacy inputs without a
+compiled path likelihood. Files using the `clipp2.tumor.long.v1` contract bypass it
+on every device.
+
 For reproducible GPU runs, enable `torch.use_deterministic_algorithms(True)` and
-set `CUBLAS_WORKSPACE_CONFIG` before fitting. If you need an auditable result,
-record `--device` and `--dtype` alongside the `input_data_hash`,
-`objective_spec_hash` and `original_graph_hash` that every run reports.
+set `CUBLAS_WORKSPACE_CONFIG` before fitting; CliPP2 does not enable either itself.
+For an auditable result, record `--device` and `--dtype` alongside the
+`input_data_hash`, `objective_spec_hash` and `original_graph_hash` that every run
+reports, and compare runs only within a fixed device and dtype.
+
+GPU-specific statements in this section are derived from the implementation rather
+than measured, since the reference environment used to write them had no usable
+CUDA device.
 
 ## Preprocessing boundary
 
