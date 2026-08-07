@@ -6,6 +6,13 @@ intervals. It has 600 mutation-sample units and 998 data rows because 398 units
 (66.3%) contain two local CN states. Every unit has at least one non-diploid
 local state.
 
+The file carries only the 12 required columns — the ones the objective is
+computed from — demonstrating the compact form of the schema. The seven optional
+identity/coordinate columns (`chromosome`, `position`, `ref`, `alt`,
+`segment_start`, `segment_end`, `allele_mode`) are omitted, so `allele_mode`
+takes its default, `unphased`. Writers such as `clipp2 simulate` emit the full
+19-column form; both load to bit-identical data.
+
 Validate and inspect it:
 
 ```bash

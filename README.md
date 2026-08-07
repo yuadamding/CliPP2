@@ -1,8 +1,7 @@
 # CliPP2
 
 CliPP2 estimates mutation prevalence, clusters SNVs, and infers mutant-copy
-multiplicity from single- or multi-region tumor sequencing data with
-objective-faithful pairwise fusion.
+multiplicity from single- or multi-region tumor sequencing data with pairwise fusion.
 
 ## Install
 
@@ -12,42 +11,38 @@ pip install .
 
 ## Input
 
-The public input is one UTF-8, tab-delimited file per tumor:
+The public input is one tab-delimited file per tumor:
 
 ```text
 exampleTumor1.clipp2.txt
 ```
 
 It uses schema `clipp2.tumor.long.v1`, one ordinary header, and one row per
-mutation × sample × local copy-number state:
+mutation × sample × local copy-number state. The **12 required columns are
+exactly the ones the objective is computed from**, and the shipped example uses
+only those:
 
 ```text
 ##schema=clipp2.tumor.long.v1
 ##tumor_id=exampleTumor1
-##genome_build=GRCh38
+##genome_build=synthetic
 ##coordinate_system=1-based-inclusive
 ##missing_value=.
-mutation_id	sample_id	chromosome	position	ref	alt	alt_count	ref_count	count_observed	purity	normal_cn	segment_id	segment_start	segment_end	cn_state_id	cn_state_fraction	allele_a_cn	allele_b_cn	allele_mode
+mutation_id	sample_id	alt_count	ref_count	count_observed	purity	normal_cn	segment_id	cn_state_id	cn_state_fraction	allele_a_cn	allele_b_cn
 ```
 
-The header above shows the full canonical column set, but only the **12
-columns the objective is computed from are required**:
-
-```text
-mutation_id  sample_id  alt_count  ref_count  count_observed  purity
-normal_cn  segment_id  cn_state_id  cn_state_fraction  allele_a_cn  allele_b_cn
-```
-
-The other 7 — `chromosome`, `position`, `ref`, `alt`, `segment_start`,
-`segment_end`, `allele_mode` — are identity and coordinate metadata that never
-enter the likelihood. Each may be omitted from the file entirely, or carry the
-missing marker `.` in any row. A minimal 12-column file produces byte-identical
-results to the full 19-column file. When the optional columns are present and
+Seven further canonical columns — `chromosome`, `position`, `ref`, `alt`,
+`segment_start`, `segment_end`, `allele_mode` — are identity and coordinate
+metadata that never enter the likelihood. Each may be omitted from the file
+entirely, or carry the missing marker `.` in any row; a 12-column file produces
+byte-identical results to a full 19-column file. When they are present and
 non-missing they are still validated: provide `ref` and `alt` together or not at
 all, provide both segment bounds together, and the position-within-bounds check
 runs only when position and bounds are all present. A missing `allele_mode`
 defaults to `unphased`; declare `phased` explicitly if your `allele_a_cn` /
-`allele_b_cn` are persistent homolog labels with `a < b` anywhere.
+`allele_b_cn` are persistent homolog labels with `a < b` anywhere. Writers —
+`clipp2 convert` and the simulator — always emit the full 19-column form, which
+remains fully supported as input.
 
 Extra columns beyond the 19 are also allowed as reporting metadata and never
 alter the objective. IDs are strings, including leading zeros; sample names are
