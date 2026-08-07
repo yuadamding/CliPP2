@@ -940,9 +940,7 @@ def process_tumor_bundle(
             outdir=outdir,
             data=data,
             fit=best_fit,
-            search_df=search_df,
             evaluation=best_evaluation,
-            run_summary=summary,
             bic_refit_phi=_artifact_value("bic_refit_phi"),
             bic_refit_cluster_centers=_artifact_value("bic_refit_cluster_centers"),
         )

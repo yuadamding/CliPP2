@@ -111,18 +111,13 @@ def mutation_output_table(
     fit: FitResult,
     bic_refit_phi: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    cluster_sizes = np.bincount(fit.cluster_labels, minlength=fit.n_clusters)
-    cluster_diameters = np.asarray(fit.cluster_diameters, dtype=np.float64)
+    # Cluster-level attributes (size, diameter, diameter_exact) live in
+    # cluster_centers.tsv, joinable on cluster_label.
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, data.num_mutations),
             "mutation_id": data.mutation_ids,
             "cluster_label": fit.cluster_labels + 1,
-            "cluster_size": cluster_sizes[fit.cluster_labels],
-            "cluster_diameter": cluster_diameters[fit.cluster_labels],
-            "cluster_diameter_exact": np.repeat(
-                bool(fit.cluster_diameter_exact), data.num_mutations
-            ),
         }
     )
     for column, region_id in enumerate(data.region_ids):
@@ -199,34 +194,22 @@ def mutation_region_output_table(
             ).reshape(-1),
             "major_cn": data.major_cn.reshape(-1),
             "minor_cn": data.minor_cn.reshape(-1),
-            "multiplicity_estimated": fit.multiplicity_estimated_mask.reshape(
-                -1
-            ).astype(int),
-            "gamma_major": fit.gamma_major.reshape(-1),
-            "major_call": fit.major_call.reshape(-1).astype(int),
-            "multiplicity_call": fit.multiplicity_call.reshape(-1),
         }
     )
     path_spec = getattr(data, "path_likelihood", None)
-    if path_spec is not None:
-        # Binary major/minor multiplicity fields have no defined interpretation
-        # for categorical occupancy paths.  Retain the legacy columns for schema
-        # stability, but never populate them with compatibility placeholders.
-        unavailable_integer = pd.array(
-            [pd.NA] * len(table),
-            dtype="Int64",
-        )
-        table["multiplicity_estimated"] = unavailable_integer
-        table["gamma_major"] = np.nan
-        table["major_call"] = unavailable_integer.copy()
-        table["multiplicity_call"] = np.nan
+    if path_spec is None:
+        # Binary major/minor multiplicity fields only exist for the legacy
+        # two-point likelihood; categorical occupancy paths report the path
+        # posterior columns below instead.
+        table["multiplicity_estimated"] = fit.multiplicity_estimated_mask.reshape(
+            -1
+        ).astype(int)
+        table["gamma_major"] = fit.gamma_major.reshape(-1)
+        table["major_call"] = fit.major_call.reshape(-1).astype(int)
+        table["multiplicity_call"] = fit.multiplicity_call.reshape(-1)
 
     path_summary = _path_summary_arrays(data, fit)
     if path_summary is not None:
-        reporting_fingerprint = getattr(data, "path_reporting_fingerprint", None)
-        table["likelihood_model_id"] = str(fit.likelihood_model_id)
-        if reporting_fingerprint:
-            table["path_reporting_fingerprint"] = str(reporting_fingerprint)
         map_index = path_summary["map_index"].reshape(-1)
         table["map_path"] = pd.array(
             [pd.NA if value < 0 else int(value) + 1 for value in map_index],
@@ -360,14 +343,6 @@ def path_posterior_output_table(data: TumorData, fit: FitResult) -> pd.DataFrame
                 [_display_region_label(value) for value in data.region_ids],
                 dtype=object,
             )[region_idx],
-            "likelihood_model_id": str(spec.model_id),
-            "likelihood_model_version": str(spec.model_version),
-            "candidate_generator_version": str(spec.candidate_generator_version),
-            "path_prior_mode": str(spec.prior_mode),
-            "path_reporting_fingerprint": str(
-                getattr(data, "path_reporting_fingerprint", None) or ""
-            ),
-            "path_scope": "region_local",
             "path_index": path_idx + 1,
             "path_probability": posterior,
             "map_path": (
@@ -517,12 +492,16 @@ def write_fit_outputs(
     outdir: Path,
     data: TumorData,
     fit: FitResult,
-    search_df: pd.DataFrame,
     evaluation: SimulationEvaluation | None,
-    run_summary: dict[str, float | int | str | bool] | None = None,
     bic_refit_phi: np.ndarray | None = None,
     bic_refit_cluster_centers: np.ndarray | None = None,
 ) -> None:
+    """Write the compact per-tumor result set.
+
+    Deliberately no lambda_search.tsv and no run_summary.tsv: solver and
+    selection diagnostics are returned in the summary dict (printed by the
+    CLI and aggregated into the cohort table), not persisted per tumor.
+    """
     outdir.mkdir(parents=True, exist_ok=True)
     mutation_output_table(data, fit, bic_refit_phi=bic_refit_phi).to_csv(
         outdir / f"{data.tumor_id}_mutation_clusters.tsv",
@@ -548,20 +527,9 @@ def write_fit_outputs(
             sep="\t",
             index=False,
         )
-    search_df.to_csv(
-        outdir / f"{data.tumor_id}_lambda_search.tsv",
-        sep="\t",
-        index=False,
-    )
     if evaluation is not None:
         evaluation_to_frame(evaluation).to_csv(
             outdir / f"{data.tumor_id}_simulation_eval.tsv",
-            sep="\t",
-            index=False,
-        )
-    if run_summary is not None:
-        pd.DataFrame([run_summary]).to_csv(
-            outdir / f"{data.tumor_id}_run_summary.tsv",
             sep="\t",
             index=False,
         )

@@ -188,6 +188,28 @@ certified complete-graph ADMM fit. Complete graphs retain quadratic compute
 cost even when edge tensors are streamed in bounded chunks. Run
 `clipp2 fit --help` for solver and custom-graph controls.
 
+## Outputs
+
+A fit writes a deliberately compact result set into `--outdir` — scientific
+tables only, one row per entity, prefixed with the tumor id:
+
+| File | One row per | Contents |
+| --- | --- | --- |
+| `{tumor_id}_mutation_clusters.tsv` | mutation | `cluster_label` plus three prevalence estimates per region: `phi_*` (raw fused fit), `summary_phi_*` (cluster-collapsed), `bic_refit_phi_*` (partition-constrained refit) |
+| `{tumor_id}_cluster_centers.tsv` | cluster | `cluster_size`, `cluster_diameter`, `cluster_diameter_exact`, and per-region centers; join to mutations on `cluster_label` |
+| `{tumor_id}_mutation_region_multiplicity.tsv` | mutation × region | the same three phi estimates, local `major_cn`/`minor_cn`, and the mutant-copy summaries: MAP path, path probabilities, posterior/MAP mutant-copy mass and effective multiplicity, amplification call, path entropy (plus `summary_*` twins at the clustered phi) |
+| `{tumor_id}_mutation_region_path_posterior.tsv` | supported path | per-path posterior, dosage endpoints (`first_copy`, `second_copy`, `switch_fraction`), prior, mass and multiplicity — written only when a path likelihood exists |
+| `{tumor_id}_simulation_eval.tsv` | run | benchmark metrics; only with `--simulation-root` |
+
+Cohort runs add one `single_stage_summary.tsv` with a full diagnostics row per
+tumor. **No `lambda_search.tsv` or `run_summary.tsv` is written**: solver and
+selection diagnostics (selected lambda, log-likelihoods, BIC/ICL, convergence
+and certificate fields, input/objective hashes, `software_version`) are printed
+to stdout as the run summary — redirect it to keep a record for single-tumor
+runs — and are preserved per tumor in the cohort table. Because timings never
+enter the per-tumor files, repeated runs of the same input on the same device
+and dtype produce a byte-identical output directory.
+
 ## Device and precision
 
 ### CUDA is the default, so CPU-only machines must opt in
@@ -206,10 +228,10 @@ Use device='cpu' or device='auto' to permit CPU execution.
 One flag changes that. `--dense-fallback-policy cpu-allowed` also rescues an
 *unavailable device*, not just an out-of-memory one: it catches
 `CudaUnavailableError`, re-resolves the runtime to CPU and completes the fit. The
-only trace is in the run summary, where `fallback_reason` becomes
-`dense_cpu_after_context_resource_limit` and `inner_solver` becomes
-`admm_complete_graph_cpu_fallback`. If you use that policy, check those two
-columns before reporting a run as GPU-accelerated.
+only trace is in the run summary printed to stdout (and the cohort table), where
+`fallback_reason` becomes `dense_cpu_after_context_resource_limit` and
+`inner_solver` becomes `admm_complete_graph_cpu_fallback`. If you use that
+policy, check those two fields before reporting a run as GPU-accelerated.
 
 | `--device` | Behaviour |
 | --- | --- |
@@ -287,8 +309,8 @@ Sweep on an 8-mutation, two-region fit, sequential runs on one host:
 So threading buys nothing at all in wall time up to 8 threads while burning up to
 4.5× the CPU, and at Torch's own default it is **2.2× worse in wall time and
 ~26× worse in CPU time**. The results are unaffected: across 1, 2, 4, 8 and
-default threads every non-timing column of `run_summary.tsv` and
-`lambda_search.tsv` matched, and the four per-mutation tables were byte-identical.
+default threads every non-timing field of the run summary matched, and the
+output tables were byte-identical.
 
 Treat CPU time as the number to compare — the multi-threaded figure is mostly
 spin time and is itself unstable (two runs of the same fit measured 423 s and
@@ -411,11 +433,10 @@ does not use; they matter only with `--inner-backend quotient-workset`.
 ### Reproducibility across devices and runs
 
 For a fixed device and dtype, CPU fits are bit-reproducible: repeated runs of the
-same input produce byte-identical cluster, prevalence, multiplicity and
-path-posterior tables, and this holds across thread counts too. Only the
-`*_elapsed_seconds` columns differ — and because those are embedded in the result
-tables, the files themselves are never byte-equal even when every scientific value
-is. Compare columns, not checksums.
+same input produce a **byte-identical output directory**, and this holds across
+thread counts too. Wall-clock timings appear only in the run summary printed to
+stdout and in the cohort-level `single_stage_summary.tsv`, never in the per-tumor
+result files — so a single-tumor output directory can be compared by checksum.
 
 Across devices the guarantee is weaker than a pure dispatch would give you,
 because the device selects the implementation and not merely where it runs:
