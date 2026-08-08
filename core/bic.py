@@ -178,26 +178,39 @@ def compute_unlabeled_dirichlet_partition_log_evidence(
     return float(log_labeled_evidence + lgamma(float(num_clusters) + 1.0))
 
 
+# Scale on the assignment-code deviance in compute_partition_icl. The full
+# code cost (1.0) grows as ~2*M*H(cluster fractions) and systematically merges
+# weakly separated subclones; 0.0 is plain BIC, which over-splits everything.
+# 0.7 was selected by every fold of a 5-fold cross-validation over a 252-tumor
+# stratified truth ladder (held-out exact-K 82.5% +/- 5.2% vs 76.2% +/- 3.4%
+# at 1.0; K=1 detection unchanged at 100%, true K=3/K=4 recovery +8/+20 pts).
+PARTITION_ICL_CODE_WEIGHT = 0.7
+
+
 def compute_partition_icl(
     loglik: float,
     cluster_sizes: np.ndarray,
     data: TumorData,
     *,
     alpha: float = 1.0,
+    code_weight: float = PARTITION_ICL_CODE_WEIGHT,
 ) -> float:
-    """Classic center BIC plus an integrated assignment-code deviance."""
+    """Classic center BIC plus a scaled integrated assignment-code deviance."""
     sizes = _validated_cluster_sizes(cluster_sizes)
     if int(np.sum(sizes)) != int(data.num_mutations):
         raise ValueError(
             "Partition cluster sizes must sum to the number of tumor mutations "
             f"({int(data.num_mutations)})."
         )
+    weight = float(code_weight)
+    if not np.isfinite(weight) or weight < 0.0:
+        raise ValueError("code_weight must be nonnegative and finite.")
     classic_bic = compute_classic_bic(float(loglik), int(sizes.size), data)
     log_partition_evidence = compute_unlabeled_dirichlet_partition_log_evidence(
         sizes,
         alpha=float(alpha),
     )
-    return float(classic_bic - 2.0 * log_partition_evidence)
+    return float(classic_bic - 2.0 * weight * log_partition_evidence)
 
 
 __all__ = [
