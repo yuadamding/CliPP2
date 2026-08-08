@@ -123,8 +123,10 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         choices=list(SELECTION_SCORE_NAMES),
         default=DEFAULT_SELECTION_SCORE,
         help=(
-            "Model-selection criterion. partition_icl is assignment-aware and "
-            "recommended; bic retains the legacy center-only criterion."
+            "Model-selection criterion. marginal_bic (default) integrates "
+            "assignments out at CEM-stabilized centers; partition_icl is the "
+            "previous assignment-code criterion; bic is the legacy "
+            "center-only criterion."
         ),
     )
     parser.add_argument(
@@ -338,10 +340,11 @@ def _validate_fit_args(
             "--lambda-grid is incompatible with partition_guided_admm; use "
             "--lambda-grid-mode adaptive_bic for prespecified values"
         )
-    if args.selection_score != DEFAULT_SELECTION_SCORE:
+    if args.selection_score not in ("marginal_bic", "partition_icl"):
         parser.error(
-            "partition_guided_admm requires --selection-score partition_icl; "
-            "use --lambda-grid-mode adaptive_bic for bic or extended_bic"
+            "partition_guided_admm requires --selection-score marginal_bic "
+            "or partition_icl; use --lambda-grid-mode adaptive_bic for bic "
+            "or extended_bic"
         )
 
 

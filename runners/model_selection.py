@@ -533,6 +533,12 @@ def _rescore_partition_candidates(
     lets those operations follow the requested criterion while the candidate
     output rows continue to report classic BIC explicitly.
     """
+    # Generation-time ordering only; the marginal criterion needs stabilized
+    # refits that do not exist yet at this stage, so it orders by partition
+    # ICL and leaves the marginal computation to final candidate scoring.
+    ordering_score = (
+        "partition_icl" if normalized_score == "marginal_bic" else normalized_score
+    )
     rescored: list[PartitionCandidate] = []
     for candidate in candidates:
         cluster_sizes = cluster_sizes_from_labels(candidate.labels)
@@ -542,7 +548,7 @@ def _rescore_partition_candidates(
             data=data,
             bic_df_scale=float(bic_df_scale),
             bic_cluster_penalty=float(bic_cluster_penalty),
-            selection_score=normalized_score,
+            selection_score=ordering_score,
             cluster_sizes=cluster_sizes,
         )
         diagnostics = dict(candidate.diagnostics)
@@ -1038,10 +1044,10 @@ def _partition_guided_admm_selection(
 
     selection_start_time = perf_counter()
     normalized_score = _normalize_selection_score_name(selection_score)
-    if normalized_score != "partition_icl":
+    if normalized_score not in ("marginal_bic", "partition_icl"):
         raise ValueError(
-            "partition_guided_admm currently requires selection_score='partition_icl'; "
-            "use lambda_grid_mode='adaptive_bic' for another score."
+            "partition_guided_admm requires selection_score='marginal_bic' or "
+            "'partition_icl'; use lambda_grid_mode='adaptive_bic' for another score."
         )
     if int(data.num_mutations) < 2:
         raise ValueError(
@@ -1482,7 +1488,9 @@ def _partition_guided_admm_selection(
                 lambda_value=float(proposal.lambda_value),
                 n_clusters=int(row["n_clusters"]),
                 partition_signature=str(row["partition_signature"]),
-                partition_icl=float(row["partition_icl"]),
+                # The active selection score steers the online-lambda
+                # controller (the observation field name is historical).
+                partition_icl=float(row["bic"]),
                 kkt_residual=float(row["fixed_objective_kkt_residual"]),
                 exact_candidate_eligible=bool(exact_raw_eligible),
                 certificate_status=str(
@@ -2147,10 +2155,10 @@ def select_model(
         and is_partition_guided_lambda_grid_mode(effective_lambda_grid_mode_normalized)
     )
     if guided_default:
-        if normalized_score != "partition_icl":
+        if normalized_score not in ("marginal_bic", "partition_icl"):
             raise ValueError(
-                "partition_guided_admm currently requires "
-                "selection_score='partition_icl'; use "
+                "partition_guided_admm requires "
+                "selection_score='marginal_bic' or 'partition_icl'; use "
                 "lambda_grid_mode='adaptive_bic' for another score."
             )
         profile_name = f"partition_guided_admm_{normalized_score}"

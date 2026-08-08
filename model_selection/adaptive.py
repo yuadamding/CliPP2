@@ -340,6 +340,8 @@ def _adaptive_score_column(normalized_score: str) -> str:
         return "extended_bic"
     if normalized_score == "partition_icl":
         return "partition_icl"
+    if normalized_score == "marginal_bic":
+        return "marginal_bic"
     raise ValueError(f"Unknown normalized selection score: {normalized_score}")
 
 

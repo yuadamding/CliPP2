@@ -47,9 +47,12 @@ must contain one cluster pinned at the clonal center, φ = 1 in every region
 (clipped to the feasibility box). The pinned centers are constants, so a
 K-cluster model is charged (K − 1) × S degrees of freedom. A one-cluster model
 is therefore admissible only when the whole tumor is consistent with φ = 1,
-which is what makes weakly separated subclones detectable. After selection,
-one hard E-step against the anchored refit centers reassigns boundary
-mutations (K held fixed) before the tables are written.
+which is what makes weakly separated subclones detectable. Candidates are
+compared by marginal-mixture BIC: each partition is stabilized by
+classification-EM (K held fixed) and scored with the mutation assignments
+integrated out, so boundary mutations are not charged for their ambiguity.
+After selection, one hard E-step against the anchored refit centers
+reassigns boundary mutations (K held fixed) before the tables are written.
 
 Run
 `clipp2 fit --help` for solver and custom-graph controls.

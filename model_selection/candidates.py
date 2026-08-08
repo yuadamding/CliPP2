@@ -8,9 +8,11 @@ import numpy as np
 from ..core.model import FitOptions, FitResult, fit_fixed_objective
 from ..core.fusion.partition_starts import (
     PartitionCandidate,
+    _loss_to_centers,
 )
 from ..core.fusion.refit import (
     PartitionRefitResult,
+    _canonical_labels,
     partition_constrained_observed_refit,
 )
 from ..core.fusion.solver import (
@@ -27,6 +29,7 @@ from ..metrics.evaluation import (
 )
 from .config import (
     LIKELIHOOD_PARTITION_SENTINEL_LAMBDA,
+    MARGINAL_BIC_MAX_CEM_ITERATIONS,
     PARTITION_ICL_DIRICHLET_ALPHA,
 )
 from .partitions import (
@@ -54,6 +57,74 @@ from ..core.bic import (
     effective_bic_mutation_region_count,
     effective_bic_depth_count,
 )
+
+
+def _cem_stabilized_marginal_loglik(
+    data: TumorData,
+    labels: np.ndarray,
+    *,
+    fit_options: FitOptions,
+    hint_phi: np.ndarray | None,
+    initial_refit: PartitionRefitResult | None = None,
+) -> tuple[float, int]:
+    """Marginal mixture log-likelihood of a CEM-stabilized partition.
+
+    Hard-assignment criteria charge boundary mutations for their ambiguity,
+    which systematically merges weakly separated subclones (on the CliPPSim
+    corpus the truth partition loses to the under-clustered selection by
+    hundreds of ICL units). The marginal criterion integrates assignments out:
+    the candidate is first stabilized by classification-EM (argmin assignment
+    cost + clonal-anchored refit; a step that would empty a cluster is
+    rejected, so K is preserved), then scored at the stabilized centers as
+    ``sum_m logsumexp_c(log pi_c - cost_mc)`` with ``pi`` the hard cluster
+    fractions.
+    """
+    labels = _canonical_labels(np.asarray(labels, dtype=np.int64).reshape(-1))
+    refit_kwargs = dict(
+        major_prior=float(fit_options.major_prior),
+        eps=float(fit_options.eps),
+        tol=float(fit_options.tol),
+        max_iter=max(int(fit_options.inner_max_iter), 32),
+    )
+    refit = initial_refit
+    if refit is None:
+        refit = partition_constrained_observed_refit(
+            data, labels, hint_phi=hint_phi, **refit_kwargs
+        )
+    n_clusters = int(refit.n_clusters)
+    cem_iterations = 0
+    for _ in range(MARGINAL_BIC_MAX_CEM_ITERATIONS):
+        cost = _loss_to_centers(
+            data,
+            np.asarray(refit.cluster_centers, dtype=np.float64),
+            major_prior=float(fit_options.major_prior),
+            eps=float(fit_options.eps),
+        )
+        proposed = np.argmin(cost, axis=1).astype(np.int64)
+        if np.unique(proposed).size != n_clusters:
+            break
+        proposed = _canonical_labels(proposed)
+        if np.array_equal(proposed, labels):
+            break
+        labels = proposed
+        cem_iterations += 1
+        refit = partition_constrained_observed_refit(
+            data, labels, hint_phi=hint_phi, **refit_kwargs
+        )
+    cost = _loss_to_centers(
+        data,
+        np.asarray(refit.cluster_centers, dtype=np.float64),
+        major_prior=float(fit_options.major_prior),
+        eps=float(fit_options.eps),
+    )
+    mixing = np.bincount(labels, minlength=n_clusters).astype(np.float64)
+    mixing /= float(max(labels.size, 1))
+    log_scores = np.log(np.clip(mixing, 1e-300, None))[None, :] - cost
+    shift = np.max(log_scores, axis=1)
+    marginal_loglik = float(
+        np.sum(shift + np.log(np.sum(np.exp(log_scores - shift[:, None]), axis=1)))
+    )
+    return marginal_loglik, cem_iterations
 
 
 def _evaluate_simulation_metrics(
@@ -280,6 +351,29 @@ def _evaluate_candidate(
     bic_n_clusters = int(bic_refit.n_clusters)
     bic_loglik = float(bic_refit.loglik)
     bic_cluster_sizes = cluster_sizes_from_labels(bic_labels)
+    marginal_loglik_value = float("nan")
+    cem_iterations_value = -1
+    if canonical_score_name == "marginal_bic":
+        marginal_cache_key = (partition_hash, "marginal")
+        if bic_refit_cache is not None and marginal_cache_key in bic_refit_cache:
+            marginal_loglik_value, cem_iterations_value = bic_refit_cache[
+                marginal_cache_key
+            ]
+        else:
+            marginal_loglik_value, cem_iterations_value = (
+                _cem_stabilized_marginal_loglik(
+                    data,
+                    bic_labels,
+                    fit_options=effective_fit_options,
+                    hint_phi=fit.phi,
+                    initial_refit=bic_refit,
+                )
+            )
+            if bic_refit_cache is not None:
+                bic_refit_cache[marginal_cache_key] = (
+                    marginal_loglik_value,
+                    cem_iterations_value,
+                )
     bic, classic_bic, extended_bic, partition_icl = _selection_score_value(
         loglik=bic_loglik,
         num_clusters=bic_n_clusters,
@@ -288,6 +382,7 @@ def _evaluate_candidate(
         bic_cluster_penalty=bic_cluster_penalty,
         selection_score=selection_score,
         cluster_sizes=bic_cluster_sizes,
+        marginal_loglik=marginal_loglik_value,
     )
     partition_code_deviance = float(partition_icl - classic_bic)
     partition_log_evidence = float(-0.5 * partition_code_deviance)
@@ -390,6 +485,11 @@ def _evaluate_candidate(
         "partition_log_evidence": float(partition_log_evidence),
         "partition_code_deviance": float(partition_code_deviance),
         "partition_dirichlet_alpha": float(PARTITION_ICL_DIRICHLET_ALPHA),
+        "marginal_bic": (
+            float(bic) if canonical_score_name == "marginal_bic" else float("nan")
+        ),
+        "bic_marginal_loglik": float(marginal_loglik_value),
+        "bic_cem_iterations": int(cem_iterations_value),
         "classic_bic_mutation_region_n": float(classic_bic),
         "classic_bic_depth_n": float(classic_bic_depth_n),
         "classic_bic_active_df": float(classic_bic_active_df),
@@ -638,6 +738,17 @@ def _evaluate_partition_candidate(
     loglik = float(-fit_loss)
 
     cluster_sizes = cluster_sizes_from_labels(labels)
+    marginal_loglik_value = float("nan")
+    cem_iterations_value = -1
+    if canonical_score_name == "marginal_bic":
+        marginal_loglik_value, cem_iterations_value = (
+            _cem_stabilized_marginal_loglik(
+                data,
+                labels,
+                fit_options=fit_options,
+                hint_phi=phi,
+            )
+        )
     bic, classic_bic, extended_bic, partition_icl = _selection_score_value(
         loglik=loglik,
         num_clusters=num_clusters,
@@ -646,6 +757,7 @@ def _evaluate_partition_candidate(
         bic_cluster_penalty=bic_cluster_penalty,
         selection_score=selection_score,
         cluster_sizes=cluster_sizes,
+        marginal_loglik=marginal_loglik_value,
     )
     partition_code_deviance = float(partition_icl - classic_bic)
     partition_log_evidence = float(-0.5 * partition_code_deviance)
@@ -906,6 +1018,11 @@ def _evaluate_partition_candidate(
         "partition_log_evidence": float(partition_log_evidence),
         "partition_code_deviance": float(partition_code_deviance),
         "partition_dirichlet_alpha": float(PARTITION_ICL_DIRICHLET_ALPHA),
+        "marginal_bic": (
+            float(bic) if canonical_score_name == "marginal_bic" else float("nan")
+        ),
+        "bic_marginal_loglik": float(marginal_loglik_value),
+        "bic_cem_iterations": int(cem_iterations_value),
         "classic_bic_mutation_region_n": float(classic_bic),
         "classic_bic_depth_n": float(classic_bic_depth_n),
         "classic_bic_active_df": float(classic_bic_active_df),

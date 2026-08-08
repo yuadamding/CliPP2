@@ -43,6 +43,7 @@ def _selection_score_value(
     selection_score: str,
     cluster_sizes: np.ndarray | None = None,
     partition_icl_alpha: float = PARTITION_ICL_DIRICHLET_ALPHA,
+    marginal_loglik: float | None = None,
 ) -> tuple[float, float, float, float]:
     classic_bic = compute_classic_bic(loglik, num_clusters, data)
     extended_bic = compute_extended_bic(
@@ -67,6 +68,17 @@ def _selection_score_value(
         selected_score = classic_bic
     elif normalized == "extended_bic":
         selected_score = extended_bic
+    elif normalized == "marginal_bic":
+        if marginal_loglik is None or not np.isfinite(float(marginal_loglik)):
+            raise ValueError(
+                "marginal_bic selection requires a finite marginal "
+                "mixture log-likelihood."
+            )
+        # Same (K-1)*S*log(n_eff) penalty as classic BIC; only the likelihood
+        # differs (assignments integrated out at the CEM-stabilized centers).
+        selected_score = compute_classic_bic(
+            float(marginal_loglik), num_clusters, data
+        )
     elif normalized == "partition_icl":
         if not np.isfinite(partition_icl):
             raise ValueError(
