@@ -94,7 +94,11 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         "--tol",
         type=float,
         default=DEFAULT_OPTIMIZATION_TOLERANCE,
-        help="Optimization tolerance.",
+        help=(
+            "Optimization tolerance for the fusion solver; also drives the "
+            "clonal-anchored partition refits, CEM stabilization, and the "
+            "post-selection E-step polish."
+        ),
     )
     parser.add_argument(
         "--summary-tol",
@@ -259,7 +263,14 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
             f"default is {DEFAULT_DOSAGE_PRIOR_PENALTY:g}."
         ),
     )
-    parser.add_argument("--outdir", default="clipp2_results", help="Output directory.")
+    parser.add_argument(
+        "--outdir",
+        default="clipp2_results",
+        help=(
+            "Output directory for the three per-tumor tables "
+            "(mutation_clusters, cluster_centers, mutation_region_multiplicity)."
+        ),
+    )
     parser.add_argument(
         "--simulation-root",
         default=None,
@@ -280,14 +291,19 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "CliPP2 canonical simulation and objective-faithful observed-data "
             "pairwise fusion. Production fitting defaults use CUDA, float64, "
-            "dense device-only fusion, partition-guided ADMM, and partition ICL."
+            "dense device-only fusion, partition-guided ADMM, clonal-anchored "
+            "refits, and marginal-mixture BIC model selection with final-phi "
+            "Ward-ladder candidates."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     fit_parser = subparsers.add_parser(
         "fit",
-        help="Fit canonical tumor files with certified partition-ICL model selection.",
+        help=(
+            "Fit one canonical tumor file with clonal-anchored marginal-mixture "
+            "BIC model selection."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     _add_fit_args(fit_parser)
