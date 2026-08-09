@@ -1262,27 +1262,6 @@ def _initial_outer_diag() -> dict[str, float | int]:
     }
 
 
-def _multiplicity_calls(
-    data: TumorData,
-    gamma_np: np.ndarray,
-    dtype: np.dtype,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Resolve per-mutation_region major-copy probability, the boolean major call, and the
-    chosen multiplicity, holding non-ambiguous mutation_regions at their fixed value."""
-    major_probability = np.where(
-        data.multiplicity_estimation_mask,
-        gamma_np,
-        1.0,
-    ).astype(dtype, copy=False)
-    major_call = major_probability >= 0.5
-    multiplicity_call = np.where(
-        data.multiplicity_estimation_mask,
-        np.where(major_call, data.major_cn, data.minor_cn),
-        data.fixed_multiplicity,
-    ).astype(dtype, copy=False)
-    return major_probability, major_call, multiplicity_call
-
-
 def _classify_failure_reason(
     *,
     converged: bool,
@@ -2803,21 +2782,13 @@ def _fit_from_start(
         phi_clustered = phi_np.astype(phi_np.dtype, copy=False)
         summary_loglik = float("nan")
 
-    if torch_data.path_likelihood is None:
-        major_probability, major_call, multiplicity_call = _multiplicity_calls(
-            data, gamma_np, phi_np.dtype
-        )
-        multiplicity_estimated_mask = data.multiplicity_estimation_mask.astype(
-            bool, copy=False
-        )
-    else:
-        # These binary compatibility fields do not have a valid interpretation
-        # for a categorical occupancy-path model.  Path-specific posterior
-        # fields below are the source of truth.
-        major_probability = np.full_like(phi_np, np.nan, dtype=phi_np.dtype)
-        major_call = np.zeros_like(phi_np, dtype=bool)
-        multiplicity_call = np.full_like(phi_np, np.nan, dtype=phi_np.dtype)
-        multiplicity_estimated_mask = np.zeros_like(phi_np, dtype=bool)
+    # These binary compatibility fields do not have a valid interpretation
+    # for a categorical occupancy-path model.  Path-specific posterior
+    # fields below are the source of truth.
+    major_probability = np.full_like(phi_np, np.nan, dtype=phi_np.dtype)
+    major_call = np.zeros_like(phi_np, dtype=bool)
+    multiplicity_call = np.full_like(phi_np, np.nan, dtype=phi_np.dtype)
+    multiplicity_estimated_mask = np.zeros_like(phi_np, dtype=bool)
     if isinstance(certificate, CompressedEdgeCertificate):
         quotient_dual = (
             warm_state.quotient_dual
@@ -3140,14 +3111,6 @@ def fit_observed_data_pairwise_fusion(
         if normalized_start_mode == "full":
             start_bank.extend(effective_scalar_well_starts)
             start_bank.append(effective_pooled_start)
-        elif normalized_start_mode == "warm_plus_pilot":
-            if phi_start is None:
-                start_bank.extend(effective_scalar_well_starts)
-                start_bank.append(effective_pooled_start)
-            else:
-                start_bank.extend(effective_scalar_well_starts)
-        elif phi_start is None:
-            start_bank.append(effective_exact_pilot)
     start_bank = _deduplicate_starts(start_bank, runtime=effective_runtime)
 
     def run_start(

@@ -159,10 +159,6 @@ class PathLikelihoodSpec:
         return tuple(int(value) for value in self.first_copy.shape)
 
     @property
-    def num_paths(self) -> int:
-        return int(self.first_copy.shape[-1])
-
-    @property
     def has_fixed_linear_emission(self) -> bool:
         """Whether every valid candidate in a unit has one shared linear slope.
 
@@ -212,8 +208,6 @@ class TumorData:
     # Reporting-only metadata aligned to ``path_likelihood``.  These fields do
     # not alter the observed objective and are therefore intentionally excluded
     # from ``tumor_data_fingerprint``.
-    path_annotations: object | None = None
-    path_reporting_semantics: str | None = None
     path_reporting_fingerprint: str | None = None
     path_unsupported_reason: np.ndarray | None = None
     mean_tumor_total_cn: np.ndarray | None = None

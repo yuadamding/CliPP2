@@ -47,10 +47,6 @@ class ExactQuotientProblem:
     quadratic_constant: torch.Tensor
     common_box_feasible: bool
 
-    @property
-    def num_blocks(self) -> int:
-        return int(self.h.shape[0])
-
 
 def estimate_exact_quotient_cache_bytes(
     *,

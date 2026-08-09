@@ -34,6 +34,7 @@ from .io.tumor_txt import (
 from .model_selection.config import (
     DEFAULT_LAMBDA_GRID_MODE,
     DEFAULT_SELECTION_SCORE,
+    FINAL_PHI_WARD_LADDER_KMAX,
     SELECTION_SCORE_NAMES,
 )
 from .runners.pipeline import process_tumor
@@ -93,7 +94,11 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         "--tol",
         type=float,
         default=DEFAULT_OPTIMIZATION_TOLERANCE,
-        help="Optimization tolerance.",
+        help=(
+            "Optimization tolerance for the fusion solver; also drives the "
+            "clonal-anchored partition refits, CEM stabilization, and the "
+            "post-selection E-step polish."
+        ),
     )
     parser.add_argument(
         "--summary-tol",
@@ -119,12 +124,24 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         help="Prior probability assigned to major-copy multiplicity.",
     )
     parser.add_argument(
+        "--kmax",
+        type=int,
+        default=FINAL_PHI_WARD_LADDER_KMAX,
+        help=(
+            "Largest K for the final-phi Ward-ladder candidates added to "
+            "model selection after the lambda path (default "
+            f"{FINAL_PHI_WARD_LADDER_KMAX}; 0 disables the ladder)."
+        ),
+    )
+    parser.add_argument(
         "--selection-score",
         choices=list(SELECTION_SCORE_NAMES),
         default=DEFAULT_SELECTION_SCORE,
         help=(
-            "Model-selection criterion. partition_icl is assignment-aware and "
-            "recommended; bic retains the legacy center-only criterion."
+            "Model-selection criterion. marginal_bic (default) integrates "
+            "assignments out at CEM-stabilized centers; partition_icl is the "
+            "previous assignment-code criterion; bic is the legacy "
+            "center-only criterion."
         ),
     )
     parser.add_argument(
@@ -246,7 +263,14 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
             f"default is {DEFAULT_DOSAGE_PRIOR_PENALTY:g}."
         ),
     )
-    parser.add_argument("--outdir", default="clipp2_results", help="Output directory.")
+    parser.add_argument(
+        "--outdir",
+        default="clipp2_results",
+        help=(
+            "Output directory for the three per-tumor tables "
+            "(mutation_clusters, cluster_centers, mutation_region_multiplicity)."
+        ),
+    )
     parser.add_argument(
         "--simulation-root",
         default=None,
@@ -267,14 +291,19 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "CliPP2 canonical simulation and objective-faithful observed-data "
             "pairwise fusion. Production fitting defaults use CUDA, float64, "
-            "dense device-only fusion, partition-guided ADMM, and partition ICL."
+            "dense device-only fusion, partition-guided ADMM, clonal-anchored "
+            "refits, and marginal-mixture BIC model selection with final-phi "
+            "Ward-ladder candidates."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     fit_parser = subparsers.add_parser(
         "fit",
-        help="Fit canonical tumor files with certified partition-ICL model selection.",
+        help=(
+            "Fit one canonical tumor file with clonal-anchored marginal-mixture "
+            "BIC model selection."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     _add_fit_args(fit_parser)
@@ -338,10 +367,11 @@ def _validate_fit_args(
             "--lambda-grid is incompatible with partition_guided_admm; use "
             "--lambda-grid-mode adaptive_bic for prespecified values"
         )
-    if args.selection_score != DEFAULT_SELECTION_SCORE:
+    if args.selection_score not in ("marginal_bic", "partition_icl"):
         parser.error(
-            "partition_guided_admm requires --selection-score partition_icl; "
-            "use --lambda-grid-mode adaptive_bic for bic or extended_bic"
+            "partition_guided_admm requires --selection-score marginal_bic "
+            "or partition_icl; use --lambda-grid-mode adaptive_bic for bic "
+            "or extended_bic"
         )
 
 
@@ -404,6 +434,7 @@ def _run_fit(args: argparse.Namespace) -> None:
         graph_file=Path(args.graph_file) if args.graph_file else None,
         unsupported_policy=args.unsupported_policy,
         dosage_prior_penalty=args.dosage_prior_penalty,
+        ward_ladder_kmax=max(int(args.kmax), 0),
     )
     print(summary)
 

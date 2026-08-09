@@ -34,7 +34,6 @@ TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
 TUMOR_TXT_MODEL_ID = PATH_LIKELIHOOD_MODEL_ID
 TUMOR_TXT_MODEL_VERSION = PATH_LIKELIHOOD_MODEL_VERSION
 TUMOR_TXT_CANDIDATE_GENERATOR_VERSION = PATH_CANDIDATE_GENERATOR_VERSION
-TUMOR_TXT_REPORTING_SEMANTICS = "tumor_long_path_mixture_v1"
 DEFAULT_DOSAGE_PRIOR_PENALTY = 3.0
 MORE_THAN_TWO_STATES = "MORE_THAN_TWO_LOCAL_CN_STATES"
 NO_POSITIVE_PATH = "NO_POSITIVE_MUTANT_COPY_PATH"
@@ -92,32 +91,6 @@ _NUMERIC_TOL = 1e-10
 
 class TumorTxtError(ValueError):
     """Raised when a long tumor file violates its public input contract."""
-
-
-@dataclass(slots=True)
-class TumorTxtAnnotations:
-    """Reporting-only source metadata retained by :func:`load_tumor_txt`."""
-
-    metadata: dict[str, str]
-    optional_columns: tuple[str, ...]
-    rows: pd.DataFrame
-    _unit_values: dict[str, np.ndarray]
-    _biological_duplicates: np.ndarray
-
-    def columns_for_indices(self, indices: np.ndarray) -> dict[str, list[object]]:
-        """Return safely aligned reporting columns for valid path indices."""
-
-        mutation = indices[:, 0]
-        sample = indices[:, 1]
-        path = indices[:, 2]
-        result = {
-            f"input_{name}": values[mutation, sample].tolist()
-            for name, values in self._unit_values.items()
-        }
-        result["biological_duplicate_count"] = self._biological_duplicates[
-            mutation, sample, path
-        ].tolist()
-        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,40 +164,6 @@ def _validate_metadata(metadata: dict[str, str], *, path: Path) -> dict[str, str
     validated["tumor_id"] = _safe_tumor_id(validated["tumor_id"])
     _identifier(validated["genome_build"], name="genome_build")
     return validated
-
-
-def _read_tumor_txt_metadata(path: str | Path) -> dict[str, str]:
-    """Read and validate only the metadata prefix of one canonical input."""
-
-    input_path = Path(path).resolve()
-    if not input_path.is_file():
-        raise FileNotFoundError(f"Tumor input file does not exist: {input_path}")
-    metadata: dict[str, str] = {}
-    header_found = False
-    with _open_text(input_path, "rt") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.rstrip("\r\n")
-            if not line:
-                continue
-            if line.startswith("##"):
-                key, value = _parse_metadata(
-                    line,
-                    path=input_path,
-                    line_number=line_number,
-                )
-                if key in metadata:
-                    raise TumorTxtError(
-                        f"{input_path}:{line_number}: duplicate metadata key {key!r}."
-                    )
-                metadata[key] = value
-                continue
-            if line.startswith("#"):
-                continue
-            header_found = True
-            break
-    if not header_found:
-        raise TumorTxtError(f"{input_path} does not contain a table header.")
-    return _validate_metadata(metadata, path=input_path)
 
 
 def _read_text_table(path: Path) -> tuple[dict[str, str], pd.DataFrame]:
@@ -814,7 +753,7 @@ def _build_tumor_data(
             "copy-number denominator."
         )
     scaling = purity / denominator
-    path_likelihood, biological_duplicates = build_path_likelihood(
+    path_likelihood, _ = build_path_likelihood(
         compiled_units,
         model_id=TUMOR_TXT_MODEL_ID,
         model_version=TUMOR_TXT_MODEL_VERSION,
@@ -822,36 +761,6 @@ def _build_tumor_data(
         prior_mode=path_prior_mode(dosage_prior_penalty),
     )
 
-    optional_unit_values: dict[str, np.ndarray] = {}
-    for column in validated.optional_columns:
-        values = np.full(shape, ".", dtype=object)
-        all_unit_constant = True
-        for unit, rows in validated.rows_by_unit.items():
-            source_indices = [
-                validated.source_rows.index[
-                    (validated.source_rows["mutation_id"] == unit[0])
-                    & (validated.source_rows["sample_id"] == unit[1])
-                ].tolist()
-            ][0]
-            source_values = {
-                str(validated.source_rows.at[index, column]) for index in source_indices
-            }
-            if len(source_values) != 1:
-                all_unit_constant = False
-                break
-            values[mutation_index[unit[0]], sample_index[unit[1]]] = next(
-                iter(source_values)
-            )
-        if all_unit_constant:
-            optional_unit_values[column] = values
-
-    annotations = TumorTxtAnnotations(
-        metadata=dict(validated.metadata),
-        optional_columns=validated.optional_columns,
-        rows=validated.source_rows.copy(),
-        _unit_values=optional_unit_values,
-        _biological_duplicates=biological_duplicates,
-    )
     data = TumorData(
         tumor_id=validated.metadata["tumor_id"],
         mutation_ids=mutation_ids,
@@ -869,8 +778,6 @@ def _build_tumor_data(
         init_major_mask=np.zeros(shape, dtype=bool),
         count_observed=count_observed,
         path_likelihood=path_likelihood,
-        path_annotations=annotations,
-        path_reporting_semantics=TUMOR_TXT_REPORTING_SEMANTICS,
         path_reporting_fingerprint=_reporting_fingerprint(
             validated.metadata,
             validated.optional_columns,
@@ -1174,7 +1081,6 @@ __all__ = [
     "REQUIRED_METADATA",
     "SCHEMA_COLUMNS",
     "TUMOR_TXT_SCHEMA",
-    "TumorTxtAnnotations",
     "TumorTxtError",
     "convert_tumor_directory_to_txt",
     "load_tumor_txt",

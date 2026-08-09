@@ -176,9 +176,6 @@ class BICSelectionResult:
         return self.simulation.best_ari_certified
 
 
-ModelSelectionResult = BICSelectionResult
-
-
 @dataclass(frozen=True)
 class _AdaptiveIntervalProposal:
     lambda_value: float

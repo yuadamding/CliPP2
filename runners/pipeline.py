@@ -9,16 +9,112 @@ import pandas as pd
 
 from .._version import __version__ as _SOFTWARE_VERSION
 from ..core.fusion.graph import load_pairwise_fusion_graph_tsv
-from ..core.model import FitOptions
+from ..core.fusion.partition_starts import _loss_to_centers
+from ..core.fusion.refit import (
+    _canonical_labels,
+    partition_constrained_observed_refit,
+)
+from ..core.fusion.solver import _cluster_summary_from_labels
+from ..core.model import FitOptions, FitResult
 from ..io.tumor_input import DEFAULT_DOSAGE_PRIOR_PENALTY
 from ..io.tumor_txt import load_tumor_txt
 from ..metrics.evaluation import evaluate_fit_against_simulation
 from ..model_selection.config import (
     DEFAULT_LAMBDA_GRID_MODE,
     DEFAULT_SELECTION_SCORE,
+    FINAL_PHI_WARD_LADDER_KMAX,
 )
 from .model_selection import select_model
 from .outputs import write_fit_outputs
+
+
+def _cluster_diameters_dense(
+    phi: np.ndarray, labels: np.ndarray
+) -> tuple[np.ndarray, bool]:
+    """Exact per-cluster L2 diameters, chunked so memory stays O(block * M)."""
+    n_clusters = int(labels.max()) + 1 if labels.size else 0
+    diameters = np.zeros(n_clusters, dtype=np.float64)
+    for cluster in range(n_clusters):
+        rows = np.asarray(phi[labels == cluster], dtype=np.float64)
+        best = 0.0
+        for start in range(0, rows.shape[0], 512):
+            block = rows[start : start + 512]
+            distances = np.linalg.norm(block[:, None, :] - rows[None, :, :], axis=-1)
+            if distances.size:
+                best = max(best, float(distances.max()))
+        diameters[cluster] = best
+    return diameters, True
+
+
+def _polish_selected_labels(
+    data,
+    fit: FitResult,
+    bic_refit_phi: np.ndarray | None,
+    bic_refit_cluster_centers: np.ndarray | None,
+    fit_options: FitOptions,
+) -> tuple[FitResult, np.ndarray | None, np.ndarray | None]:
+    """One hard E-step against the anchored refit's assignment cost, then a
+    final anchored refit, applied to the selected partition before outputs.
+
+    Only boundary mutations whose observed reads fit another cluster's center
+    strictly better are moved (~2% of mutations corpus-wide), which repairs
+    the absorption of near-clonal mutations into the pinned clonal cluster.
+    K is held fixed — a step that would empty a cluster is rejected — so model
+    selection is untouched. Any failure falls back to the unpolished fit.
+    """
+    labels = np.asarray(fit.cluster_labels, dtype=np.int64).reshape(-1)
+    if labels.size == 0 or int(fit.n_clusters) < 2:
+        return fit, bic_refit_phi, bic_refit_cluster_centers
+    if not np.array_equal(_canonical_labels(labels), labels):
+        # Refit centers are indexed in canonical label order; with any other
+        # numbering they would not align with the output cluster_label order.
+        return fit, bic_refit_phi, bic_refit_cluster_centers
+    try:
+        refit_kwargs = dict(
+            major_prior=float(fit_options.major_prior),
+            eps=float(fit_options.eps),
+            tol=float(fit_options.tol),
+            max_iter=max(int(fit_options.inner_max_iter), 32),
+        )
+        hint_phi = np.asarray(fit.phi, dtype=np.float64)
+        base = partition_constrained_observed_refit(
+            data, labels, hint_phi=hint_phi, **refit_kwargs
+        )
+        cost = _loss_to_centers(
+            data,
+            np.asarray(base.cluster_centers, dtype=np.float64),
+            major_prior=float(fit_options.major_prior),
+            eps=float(fit_options.eps),
+        )
+        proposed = np.argmin(cost, axis=1).astype(np.int64)
+        if (
+            np.array_equal(proposed, labels)
+            or np.unique(proposed).size != int(fit.n_clusters)
+        ):
+            return fit, bic_refit_phi, bic_refit_cluster_centers
+        proposed = _canonical_labels(proposed)
+        polished = partition_constrained_observed_refit(
+            data, proposed, hint_phi=hint_phi, **refit_kwargs
+        )
+    except Exception:
+        return fit, bic_refit_phi, bic_refit_cluster_centers
+    phi = np.asarray(fit.phi, dtype=np.float64)
+    centers, phi_clustered = _cluster_summary_from_labels(phi, proposed)
+    diameters, diameter_exact = _cluster_diameters_dense(phi, proposed)
+    fit = replace(
+        fit,
+        cluster_labels=proposed,
+        cluster_centers=centers.astype(np.asarray(fit.cluster_centers).dtype, copy=False),
+        phi_clustered=phi_clustered.astype(np.asarray(fit.phi_clustered).dtype, copy=False),
+        cluster_diameters=diameters,
+        max_cluster_diameter=float(np.max(diameters)) if diameters.size else 0.0,
+        cluster_diameter_exact=bool(diameter_exact),
+    )
+    return (
+        fit,
+        np.asarray(polished.phi, dtype=np.float64),
+        np.asarray(polished.cluster_centers, dtype=np.float64),
+    )
 
 
 def process_tumor_bundle(
@@ -38,6 +134,7 @@ def process_tumor_bundle(
     unsupported_policy: str = "error",
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     evaluate_all_candidates: bool | None = None,
+    ward_ladder_kmax: int = FINAL_PHI_WARD_LADDER_KMAX,
 ) -> tuple[dict[str, float | int | str | bool], pd.DataFrame]:
     """Fit one tumor TSV file (a legacy directory must be converted first)."""
 
@@ -86,6 +183,7 @@ def process_tumor_bundle(
         use_warm_starts=use_warm_starts,
         evaluate_all_candidates=evaluate_all_candidates_flag,
         finalize_selected_fit=bool(finalize_selected_fit),
+        ward_ladder_kmax=int(ward_ladder_kmax),
     )
     best_fit = selection_result.best_fit
     selection_artifact = getattr(selection_result, "selected_artifact", None)
@@ -873,12 +971,21 @@ def process_tumor_bundle(
     }
 
     if write_outputs:
+        polished_fit, polished_refit_phi, polished_refit_centers = (
+            _polish_selected_labels(
+                data,
+                best_fit,
+                _artifact_value("bic_refit_phi", None),
+                _artifact_value("bic_refit_cluster_centers", None),
+                fit_options,
+            )
+        )
         write_fit_outputs(
             outdir=outdir,
             data=data,
-            fit=best_fit,
-            bic_refit_phi=_artifact_value("bic_refit_phi"),
-            bic_refit_cluster_centers=_artifact_value("bic_refit_cluster_centers"),
+            fit=polished_fit,
+            bic_refit_phi=polished_refit_phi,
+            bic_refit_cluster_centers=polished_refit_centers,
         )
     return summary, search_df
 
@@ -900,6 +1007,7 @@ def process_tumor(
     unsupported_policy: str = "error",
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     evaluate_all_candidates: bool | None = None,
+    ward_ladder_kmax: int = FINAL_PHI_WARD_LADDER_KMAX,
 ) -> dict[str, float | int | str | bool]:
     """Fit one tumor TSV file."""
 
@@ -920,5 +1028,6 @@ def process_tumor(
         evaluate_all_candidates=evaluate_all_candidates,
         unsupported_policy=unsupported_policy,
         dosage_prior_penalty=dosage_prior_penalty,
+        ward_ladder_kmax=int(ward_ladder_kmax),
     )
     return summary

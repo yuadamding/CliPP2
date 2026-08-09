@@ -21,9 +21,14 @@ from ..core.fusion.graph_ops import (
 )
 from ..core.fusion.partition_starts import (
     PartitionCandidate,
+    compute_partition_bic,
+    hessian_weighted_ward_label_sets_torch,
     observed_curvature_at_pilot_torch,
 )
-from ..core.fusion.refit import PartitionRefitResult
+from ..core.fusion.refit import (
+    PartitionRefitResult,
+    partition_constrained_observed_refit,
+)
 from ..core.fusion.solver import (
     escape_path_breakpoint_solver_state,
     objective_shape_for_data,
@@ -81,6 +86,7 @@ from ..model_selection.config import (
     ADAPTIVE_PATH_REFINE_PER_ROUND,
     ADAPTIVE_PATH_TRANSITION_PROBE_MAX_CANDIDATES,
     ENABLE_LIKELIHOOD_PARTITION_CANDIDATES,
+    FINAL_PHI_WARD_LADDER_KMAX,
     PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT,
     PARTITION_GUIDED_ADMM_MAX_SOLVER_RETRIES_PER_LAMBDA,
     PARTITION_GUIDED_ADMM_MAX_UNIQUE_LAMBDAS,
@@ -100,6 +106,7 @@ from ..model_selection.partition_initializer import (
 )
 from ..model_selection.partitions import (
     _best_partition_candidate,
+    _canonical_partition_labels,
     _partition_candidate_requested_k,
     _partition_signature,
 )
@@ -125,7 +132,6 @@ from ..model_selection.scoring import (
 from ..model_selection.types import (
     BICSelectionResult,
     CandidateStaticMetadata,
-    ModelSelectionResult,
     SelectionArtifact,
     SimulationDiagnostics,
     StartArray,
@@ -533,6 +539,12 @@ def _rescore_partition_candidates(
     lets those operations follow the requested criterion while the candidate
     output rows continue to report classic BIC explicitly.
     """
+    # Generation-time ordering only; the marginal criterion needs stabilized
+    # refits that do not exist yet at this stage, so it orders by partition
+    # ICL and leaves the marginal computation to final candidate scoring.
+    ordering_score = (
+        "partition_icl" if normalized_score == "marginal_bic" else normalized_score
+    )
     rescored: list[PartitionCandidate] = []
     for candidate in candidates:
         cluster_sizes = cluster_sizes_from_labels(candidate.labels)
@@ -542,7 +554,7 @@ def _rescore_partition_candidates(
             data=data,
             bic_df_scale=float(bic_df_scale),
             bic_cluster_penalty=float(bic_cluster_penalty),
-            selection_score=normalized_score,
+            selection_score=ordering_score,
             cluster_sizes=cluster_sizes,
         )
         diagnostics = dict(candidate.diagnostics)
@@ -652,6 +664,20 @@ def _assemble_selection_result(
         else _bic_selection_eligible_mask(search_df)
     )
     if strict_positive_exact_fusion:
+        # Likelihood-partition candidates (final-phi Ward ladder) carry no
+        # positive-lambda fusion certificate — their scoring authority is the
+        # clonal-anchored refit itself — so they compete for selection through
+        # the ordinary finite-refit eligibility contract instead.
+        if "candidate_pool_source" in search_df.columns:
+            partition_rows = (
+                search_df["candidate_pool_source"]
+                .astype(str)
+                .eq("likelihood_partition")
+                .to_numpy(dtype=bool)
+            )
+            candidate_selection_eligible_mask = candidate_selection_eligible_mask | (
+                partition_rows & _bic_selection_eligible_mask(search_df)
+            )
         search_df["bic_selection_eligible"] = candidate_selection_eligible_mask
     num_converged_candidates = int(np.sum(converged_mask))
     num_selection_eligible_candidates = int(np.sum(candidate_selection_eligible_mask))
@@ -1023,6 +1049,7 @@ def _partition_guided_admm_selection(
     profile_name: str,
     selection_method: str,
     selection_score: str,
+    ward_ladder_kmax: int = FINAL_PHI_WARD_LADDER_KMAX,
 ) -> BICSelectionResult:
     """Select a positive pairwise-fusion fit with an online ADMM lambda search.
 
@@ -1038,11 +1065,6 @@ def _partition_guided_admm_selection(
 
     selection_start_time = perf_counter()
     normalized_score = _normalize_selection_score_name(selection_score)
-    if normalized_score != "partition_icl":
-        raise ValueError(
-            "partition_guided_admm currently requires selection_score='partition_icl'; "
-            "use lambda_grid_mode='adaptive_bic' for another score."
-        )
     if int(data.num_mutations) < 2:
         raise ValueError(
             "partition_guided_admm requires at least two mutations so that a "
@@ -1482,7 +1504,9 @@ def _partition_guided_admm_selection(
                 lambda_value=float(proposal.lambda_value),
                 n_clusters=int(row["n_clusters"]),
                 partition_signature=str(row["partition_signature"]),
-                partition_icl=float(row["partition_icl"]),
+                # The active selection score steers the online-lambda
+                # controller (the observation field name is historical).
+                partition_icl=float(row["bic"]),
                 kkt_residual=float(row["fixed_objective_kkt_residual"]),
                 exact_candidate_eligible=bool(exact_raw_eligible),
                 certificate_status=str(
@@ -1505,6 +1529,100 @@ def _partition_guided_admm_selection(
         raise RuntimeError(
             f"No guided ADMM candidates were evaluated for tumor {data.tumor_id}."
         )
+    # Final-phi Ward-ladder candidates. Path partitions inherit the fusion
+    # solve's membership commitments; the ladder re-draws memberships per K
+    # from the best fused phi, which marginal-BIC selection needs — its
+    # scores are far more sensitive to membership quality at each K than the
+    # complete-data criteria (validated on the CliPPSim corpus, where ladder
+    # candidates recover under-clustered K3/K4 selections the path pool
+    # cannot supply).
+    finite_path_entries = (
+        [
+            (entry_fit, entry_row)
+            for entry_fit, _, entry_row, _ in result_entries
+            if np.isfinite(float(entry_row.get("bic", np.nan)))
+            and bool(entry_row.get("bic_refit_finite_candidate_found", False))
+        ]
+        if int(ward_ladder_kmax) >= 1
+        else []
+    )
+    if finite_path_entries:
+        ladder_fit, _ = min(finite_path_entries, key=lambda item: float(item[1]["bic"]))
+        ladder_phi = np.asarray(ladder_fit.phi, dtype=np.float64)
+        ladder_label_sets = hessian_weighted_ward_label_sets_torch(
+            ladder_phi,
+            np.ones_like(ladder_phi),
+            K_grid=list(range(1, int(ward_ladder_kmax) + 1)),
+            device="cpu",
+        )
+        seen_signatures = {
+            str(entry_row.get("partition_signature"))
+            for _, _, entry_row, _ in result_entries
+        }
+        ladder_rank = 0
+        for ladder_k in sorted(ladder_label_sets):
+            ladder_labels = _canonical_partition_labels(
+                np.asarray(ladder_label_sets[ladder_k], dtype=np.int64)
+            )
+            if int(np.unique(ladder_labels).size) != int(ladder_k):
+                continue
+            ladder_signature = _partition_signature(ladder_labels)
+            if ladder_signature in seen_signatures:
+                continue
+            seen_signatures.add(ladder_signature)
+            ladder_refit = partition_constrained_observed_refit(
+                data,
+                ladder_labels,
+                major_prior=float(fit_options.major_prior),
+                eps=float(fit_options.eps),
+                tol=float(fit_options.tol),
+                max_iter=max(int(fit_options.inner_max_iter), 32),
+                hint_phi=ladder_phi,
+            )
+            ladder_fit_loss = float(-ladder_refit.loglik)
+            ladder_rank += 1
+            ladder_candidate = PartitionCandidate(
+                labels=ladder_labels,
+                K=int(ladder_k),
+                source="final_phi_ward_ladder",
+                theta=np.asarray(ladder_refit.cluster_centers, dtype=np.float64),
+                phi_start=ladder_phi,
+                fit_loss=ladder_fit_loss,
+                bic=compute_partition_bic(
+                    fit_loss=ladder_fit_loss,
+                    num_clusters=int(ladder_k),
+                    data=data,
+                ),
+                diagnostics={"final_phi_ward_ladder": 1.0},
+            )
+            fit, evaluation, row, artifact = _evaluate_partition_candidate(
+                data=data,
+                fit_options=effective_fit_options,
+                candidate=ladder_candidate,
+                candidate_rank=ladder_rank,
+                bic_df_scale=bic_df_scale,
+                bic_cluster_penalty=bic_cluster_penalty,
+                simulation_truth=simulation_truth,
+                evaluate_candidate=evaluate_all_candidates,
+                selection_method=selection_method,
+                profile_name=profile_name,
+                selection_step=next_step,
+                selection_score=selection_score,
+                static_metadata=static_metadata,
+                runtime=runtime,
+            )
+            row.update(
+                {
+                    "search_round": int(next_step),
+                    "search_phase": "final_phi_ward_ladder",
+                    "lambda_source": "likelihood_partition",
+                    "lambda_search_mode": "partition_guided_admm",
+                    "likelihood_partition_pool_enabled": True,
+                }
+            )
+            row["_candidate_id"] = int(len(result_entries))
+            result_entries.append((fit, evaluation, row, artifact))
+            next_step += 1
     search_df = (
         pd.DataFrame([row for _, _, row, _ in result_entries])
         .sort_values(["lambda", "selection_step"])
@@ -1551,21 +1669,11 @@ def _grid_search_selection(
     profile_name: str,
     selection_method: str,
     selection_score: str,
-    include_likelihood_partition_candidates: bool | None,
+    ward_ladder_kmax: int = FINAL_PHI_WARD_LADDER_KMAX,
 ) -> BICSelectionResult:
     selection_start_time = perf_counter()
     explicit_lambda_grid = lambda_grid is not None
     normalized_lambda_grid_mode = str(lambda_grid_mode).strip().lower()
-    if normalized_lambda_grid_mode not in LAMBDA_GRID_MODES:
-        raise ValueError(f"Unknown lambda_grid_mode: {lambda_grid_mode}")
-    if (
-        is_partition_guided_lambda_grid_mode(normalized_lambda_grid_mode)
-        and lambda_grid is not None
-    ):
-        raise ValueError(
-            "partition_guided_admm does not accept a prespecified lambda grid; "
-            "use lambda_grid_mode='adaptive_bic' for legacy grid search."
-        )
     partition_guided_mode = bool(
         lambda_grid is None
         and is_partition_guided_lambda_grid_mode(normalized_lambda_grid_mode)
@@ -1590,6 +1698,7 @@ def _grid_search_selection(
             profile_name=profile_name,
             selection_method=selection_method,
             selection_score=selection_score,
+            ward_ladder_kmax=int(ward_ladder_kmax),
         )
     lambda_bracket: LambdaBracket | None = None
     if lambda_grid is None and not adaptive_lambda_mode:
@@ -1597,11 +1706,7 @@ def _grid_search_selection(
             f"lambda_grid_mode={lambda_search_mode!r} requires an explicit lambda grid."
         )
     lambda_grid = [] if lambda_grid is None else _sorted_unique_lambdas(lambda_grid)
-    likelihood_partition_pool_enabled = (
-        bool(ENABLE_LIKELIHOOD_PARTITION_CANDIDATES)
-        if include_likelihood_partition_candidates is None
-        else bool(include_likelihood_partition_candidates)
-    )
+    likelihood_partition_pool_enabled = bool(ENABLE_LIKELIHOOD_PARTITION_CANDIDATES)
 
     prepare_start_time = perf_counter()
     solver_context = prepare_torch_problem_with_resource_policy(
@@ -1711,10 +1816,8 @@ def _grid_search_selection(
         *,
         search_round: int,
         search_phase: str,
-        allow_revisit: bool = False,
         candidate_fit_options: FitOptions | None = None,
         start_mode: str = "full",
-        compute_summary: bool = True,
         phi_start_by_lambda: dict[float, StartArray] | None = None,
         solver_state_start_by_lambda: dict[float, SolverState] | None = None,
         scalar_well_starts_by_lambda: dict[float, list[StartArray]] | None = None,
@@ -1725,7 +1828,7 @@ def _grid_search_selection(
         ordered_lambdas = [
             value
             for value in _sorted_unique_lambdas(lambda_values_to_run)
-            if allow_revisit or _canonical_lambda(value) not in fit_by_lambda
+            if _canonical_lambda(value) not in fit_by_lambda
         ]
         if not ordered_lambdas:
             return
@@ -1780,7 +1883,7 @@ def _grid_search_selection(
                 torch_data=torch_data,
                 solver_context=solver_context,
                 solver_state=solver_state_start if use_warm_starts else None,
-                compute_summary=compute_summary,
+                compute_summary=True,
                 selection_method=selection_method,
                 profile_name=profile_name,
                 selection_step=next_step,
@@ -1833,7 +1936,6 @@ def _grid_search_selection(
         search_round=0,
         search_phase="base",
         start_mode="warm_only" if adaptive_lambda_mode and use_warm_starts else "full",
-        compute_summary=True,
     )
 
     if adaptive_lambda_mode and lambda_bracket is not None:
@@ -1899,7 +2001,6 @@ def _grid_search_selection(
                     effective_fit_options
                 ),
                 start_mode="full",
-                compute_summary=True,
                 phi_start_by_lambda=transition_phi_by_lambda,
                 solver_state_start_by_lambda=transition_state_by_lambda,
                 scalar_well_starts_by_lambda=transition_starts_by_lambda,
@@ -1992,7 +2093,6 @@ def _grid_search_selection(
                 search_round=adaptive_round,
                 search_phase=f"adaptive_refine_{adaptive_round}",
                 start_mode="full",
-                compute_summary=True,
                 phi_start_by_lambda=proposal_phi_by_lambda,
                 solver_state_start_by_lambda=proposal_state_by_lambda,
                 scalar_well_starts_by_lambda=proposal_scalar_starts_by_lambda,
@@ -2114,7 +2214,7 @@ def select_model(
     use_warm_starts: bool,
     evaluate_all_candidates: bool,
     finalize_selected_fit: bool = True,
-    include_likelihood_partition_candidates: bool | None = None,
+    ward_ladder_kmax: int = FINAL_PHI_WARD_LADDER_KMAX,
 ) -> BICSelectionResult:
     normalized_score = _normalize_selection_score_name(selection_score)
     effective_objective_shape = objective_shape_for_data(
@@ -2147,10 +2247,10 @@ def select_model(
         and is_partition_guided_lambda_grid_mode(effective_lambda_grid_mode_normalized)
     )
     if guided_default:
-        if normalized_score != "partition_icl":
+        if normalized_score not in ("marginal_bic", "partition_icl"):
             raise ValueError(
-                "partition_guided_admm currently requires "
-                "selection_score='partition_icl'; use "
+                "partition_guided_admm requires "
+                "selection_score='marginal_bic' or 'partition_icl'; use "
                 "lambda_grid_mode='adaptive_bic' for another score."
             )
         profile_name = f"partition_guided_admm_{normalized_score}"
@@ -2178,15 +2278,12 @@ def select_model(
         profile_name=profile_name,
         selection_method=selection_method,
         selection_score=selection_score,
-        include_likelihood_partition_candidates=(
-            include_likelihood_partition_candidates
-        ),
+        ward_ladder_kmax=int(ward_ladder_kmax),
     )
 
 
 __all__ = [
     "BICSelectionResult",
-    "ModelSelectionResult",
     "NoEligibleModelSelectionCandidatesError",
     "SelectionArtifact",
     "SimulationDiagnostics",

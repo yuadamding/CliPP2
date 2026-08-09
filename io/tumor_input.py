@@ -43,12 +43,10 @@ from .path_compiler import (
 )
 
 
-INPUT_SCHEMA_VERSION = "3"
 MODEL_ID = PATH_LIKELIHOOD_MODEL_ID
 MODEL_VERSION = PATH_LIKELIHOOD_MODEL_VERSION
 CANDIDATE_GENERATOR_VERSION = PATH_CANDIDATE_GENERATOR_VERSION
 PRIOR_MODE = "endpoint_excess_dosage_penalty_biological_alias_mass_v1"
-REPORTING_SEMANTICS = "ordered_local_cn_state_occupancy_v1"
 DEFAULT_DOSAGE_PRIOR_PENALTY = 3.0
 MORE_THAN_TWO_STATES = "MORE_THAN_TWO_LOCAL_CN_STATES"
 NO_POSITIVE_PATH = "NO_POSITIVE_UNPHASED_COPY_PATH"
@@ -61,7 +59,6 @@ ROOT_TABLE_COLUMNS = {
     ),
     "purity.txt": ("sample_id", "purity"),
 }
-REQUIRED_ROOT_FILES = tuple(ROOT_TABLE_COLUMNS)
 REGION_TABLE_COLUMNS = {
     "snv.txt": ("chromosome_index", "position", "alt_count", "ref_count"),
     "cna.txt": (
@@ -75,7 +72,6 @@ REGION_TABLE_COLUMNS = {
         "minor_cn",
     ),
 }
-REQUIRED_REGION_FILES = ("snv.txt", "cna.txt", "purity.txt")
 _FRACTION_TOL = 1e-8
 
 
@@ -101,15 +97,6 @@ class UnsupportedTumorInputError(ValueError):
         super().__init__(
             f"{self.reason}: {self.region_id}, segment {self.segment_id}: {self.detail}"
         )
-
-
-def is_tumor_directory(path: str | Path) -> bool:
-    """Return whether ``path`` has the required root-level input files."""
-
-    directory = Path(path)
-    return directory.is_dir() and all(
-        (directory / name).is_file() for name in REQUIRED_ROOT_FILES
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -829,8 +816,6 @@ def _attach_path_likelihood(
         else np.asarray(data.count_observed, dtype=bool)
     )
     data.path_likelihood = likelihood
-    data.path_annotations = None
-    data.path_reporting_semantics = REPORTING_SEMANTICS
     fingerprint_payload = (
         MODEL_ID,
         MODEL_VERSION,
@@ -860,14 +845,10 @@ def _attach_path_likelihood(
 
 __all__ = [
     "DEFAULT_DOSAGE_PRIOR_PENALTY",
-    "INPUT_SCHEMA_VERSION",
     "MODEL_ID",
-    "REQUIRED_ROOT_FILES",
-    "REQUIRED_REGION_FILES",
     "ROOT_TABLE_COLUMNS",
     "REGION_TABLE_COLUMNS",
     "TumorInputError",
     "UnsupportedTumorInputError",
-    "is_tumor_directory",
     "load_tumor_directory",
 ]
