@@ -7,6 +7,11 @@ SELECTION_SCORE_NAMES = ("marginal_bic", "partition_icl", "bic", "extended_bic")
 # mixture log-likelihood is evaluated (cluster-emptying E-steps are rejected,
 # so the candidate's K is preserved).
 MARGINAL_BIC_MAX_CEM_ITERATIONS = 6
+# Ward-ladder candidates built on the best fused phi after the lambda path.
+# Path partitions inherit fusion's membership commitments; the ladder supplies
+# independently drawn memberships per K, which the marginal criterion needs
+# (its scores are far more sensitive to membership quality than ICL's).
+FINAL_PHI_WARD_LADDER_KMAX = 7
 PARTITION_ICL_DIRICHLET_ALPHA = 1.0
 
 LAMBDA_SEARCH_MIN = 1e-6

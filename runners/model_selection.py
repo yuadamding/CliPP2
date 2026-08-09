@@ -21,9 +21,14 @@ from ..core.fusion.graph_ops import (
 )
 from ..core.fusion.partition_starts import (
     PartitionCandidate,
+    compute_partition_bic,
+    hessian_weighted_ward_label_sets_torch,
     observed_curvature_at_pilot_torch,
 )
-from ..core.fusion.refit import PartitionRefitResult
+from ..core.fusion.refit import (
+    PartitionRefitResult,
+    partition_constrained_observed_refit,
+)
 from ..core.fusion.solver import (
     escape_path_breakpoint_solver_state,
     objective_shape_for_data,
@@ -81,6 +86,7 @@ from ..model_selection.config import (
     ADAPTIVE_PATH_REFINE_PER_ROUND,
     ADAPTIVE_PATH_TRANSITION_PROBE_MAX_CANDIDATES,
     ENABLE_LIKELIHOOD_PARTITION_CANDIDATES,
+    FINAL_PHI_WARD_LADDER_KMAX,
     PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT,
     PARTITION_GUIDED_ADMM_MAX_SOLVER_RETRIES_PER_LAMBDA,
     PARTITION_GUIDED_ADMM_MAX_UNIQUE_LAMBDAS,
@@ -100,6 +106,7 @@ from ..model_selection.partition_initializer import (
 )
 from ..model_selection.partitions import (
     _best_partition_candidate,
+    _canonical_partition_labels,
     _partition_candidate_requested_k,
     _partition_signature,
 )
@@ -658,6 +665,20 @@ def _assemble_selection_result(
         else _bic_selection_eligible_mask(search_df)
     )
     if strict_positive_exact_fusion:
+        # Likelihood-partition candidates (final-phi Ward ladder) carry no
+        # positive-lambda fusion certificate — their scoring authority is the
+        # clonal-anchored refit itself — so they compete for selection through
+        # the ordinary finite-refit eligibility contract instead.
+        if "candidate_pool_source" in search_df.columns:
+            partition_rows = (
+                search_df["candidate_pool_source"]
+                .astype(str)
+                .eq("likelihood_partition")
+                .to_numpy(dtype=bool)
+            )
+            candidate_selection_eligible_mask = candidate_selection_eligible_mask | (
+                partition_rows & _bic_selection_eligible_mask(search_df)
+            )
         search_df["bic_selection_eligible"] = candidate_selection_eligible_mask
     num_converged_candidates = int(np.sum(converged_mask))
     num_selection_eligible_candidates = int(np.sum(candidate_selection_eligible_mask))
@@ -1513,6 +1534,96 @@ def _partition_guided_admm_selection(
         raise RuntimeError(
             f"No guided ADMM candidates were evaluated for tumor {data.tumor_id}."
         )
+    # Final-phi Ward-ladder candidates. Path partitions inherit the fusion
+    # solve's membership commitments; the ladder re-draws memberships per K
+    # from the best fused phi, which marginal-BIC selection needs — its
+    # scores are far more sensitive to membership quality at each K than the
+    # complete-data criteria (validated on the CliPPSim corpus, where ladder
+    # candidates recover under-clustered K3/K4 selections the path pool
+    # cannot supply).
+    finite_path_entries = [
+        (entry_fit, entry_row)
+        for entry_fit, _, entry_row, _ in result_entries
+        if np.isfinite(float(entry_row.get("bic", np.nan)))
+        and bool(entry_row.get("bic_refit_finite_candidate_found", False))
+    ]
+    if finite_path_entries:
+        ladder_fit, _ = min(finite_path_entries, key=lambda item: float(item[1]["bic"]))
+        ladder_phi = np.asarray(ladder_fit.phi, dtype=np.float64)
+        ladder_label_sets = hessian_weighted_ward_label_sets_torch(
+            ladder_phi,
+            np.ones_like(ladder_phi),
+            K_grid=list(range(1, int(FINAL_PHI_WARD_LADDER_KMAX) + 1)),
+            device="cpu",
+        )
+        seen_signatures = {
+            str(entry_row.get("partition_signature"))
+            for _, _, entry_row, _ in result_entries
+        }
+        ladder_rank = 0
+        for ladder_k in sorted(ladder_label_sets):
+            ladder_labels = _canonical_partition_labels(
+                np.asarray(ladder_label_sets[ladder_k], dtype=np.int64)
+            )
+            if int(np.unique(ladder_labels).size) != int(ladder_k):
+                continue
+            ladder_signature = _partition_signature(ladder_labels)
+            if ladder_signature in seen_signatures:
+                continue
+            seen_signatures.add(ladder_signature)
+            ladder_refit = partition_constrained_observed_refit(
+                data,
+                ladder_labels,
+                major_prior=float(fit_options.major_prior),
+                eps=float(fit_options.eps),
+                tol=float(fit_options.tol),
+                max_iter=max(int(fit_options.inner_max_iter), 32),
+                hint_phi=ladder_phi,
+            )
+            ladder_fit_loss = float(-ladder_refit.loglik)
+            ladder_rank += 1
+            ladder_candidate = PartitionCandidate(
+                labels=ladder_labels,
+                K=int(ladder_k),
+                source="final_phi_ward_ladder",
+                theta=np.asarray(ladder_refit.cluster_centers, dtype=np.float64),
+                phi_start=ladder_phi,
+                fit_loss=ladder_fit_loss,
+                bic=compute_partition_bic(
+                    fit_loss=ladder_fit_loss,
+                    num_clusters=int(ladder_k),
+                    data=data,
+                ),
+                diagnostics={"final_phi_ward_ladder": 1.0},
+            )
+            fit, evaluation, row, artifact = _evaluate_partition_candidate(
+                data=data,
+                fit_options=effective_fit_options,
+                candidate=ladder_candidate,
+                candidate_rank=ladder_rank,
+                bic_df_scale=bic_df_scale,
+                bic_cluster_penalty=bic_cluster_penalty,
+                simulation_truth=simulation_truth,
+                evaluate_candidate=evaluate_all_candidates,
+                selection_method=selection_method,
+                profile_name=profile_name,
+                selection_step=next_step,
+                selection_score=selection_score,
+                static_metadata=static_metadata,
+                runtime=runtime,
+            )
+            row.update(
+                {
+                    "search_round": int(next_step),
+                    "search_phase": "final_phi_ward_ladder",
+                    "lambda_source": "likelihood_partition",
+                    "lambda_search_mode": "partition_guided_admm",
+                    "likelihood_partition_pool_enabled": True,
+                }
+            )
+            row["_candidate_id"] = int(len(result_entries))
+            result_entries.append((fit, evaluation, row, artifact))
+            next_step += 1
     search_df = (
         pd.DataFrame([row for _, _, row, _ in result_entries])
         .sort_values(["lambda", "selection_step"])
