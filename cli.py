@@ -120,7 +120,7 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         help="Prior probability assigned to major-copy multiplicity.",
     )
     parser.add_argument(
-        "--ward-ladder-kmax",
+        "--kmax",
         type=int,
         default=FINAL_PHI_WARD_LADDER_KMAX,
         help=(
@@ -418,7 +418,7 @@ def _run_fit(args: argparse.Namespace) -> None:
         graph_file=Path(args.graph_file) if args.graph_file else None,
         unsupported_policy=args.unsupported_policy,
         dosage_prior_penalty=args.dosage_prior_penalty,
-        ward_ladder_kmax=max(int(args.ward_ladder_kmax), 0),
+        ward_ladder_kmax=max(int(args.kmax), 0),
     )
     print(summary)
 
