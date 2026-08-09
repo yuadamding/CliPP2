@@ -34,6 +34,7 @@ from .io.tumor_txt import (
 from .model_selection.config import (
     DEFAULT_LAMBDA_GRID_MODE,
     DEFAULT_SELECTION_SCORE,
+    FINAL_PHI_WARD_LADDER_KMAX,
     SELECTION_SCORE_NAMES,
 )
 from .runners.pipeline import process_tumor
@@ -117,6 +118,16 @@ def _add_common_selection_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=0.5,
         help="Prior probability assigned to major-copy multiplicity.",
+    )
+    parser.add_argument(
+        "--ward-ladder-kmax",
+        type=int,
+        default=FINAL_PHI_WARD_LADDER_KMAX,
+        help=(
+            "Largest K for the final-phi Ward-ladder candidates added to "
+            "model selection after the lambda path (default "
+            f"{FINAL_PHI_WARD_LADDER_KMAX}; 0 disables the ladder)."
+        ),
     )
     parser.add_argument(
         "--selection-score",
@@ -407,6 +418,7 @@ def _run_fit(args: argparse.Namespace) -> None:
         graph_file=Path(args.graph_file) if args.graph_file else None,
         unsupported_policy=args.unsupported_policy,
         dosage_prior_penalty=args.dosage_prior_penalty,
+        ward_ladder_kmax=max(int(args.ward_ladder_kmax), 0),
     )
     print(summary)
 

@@ -1050,6 +1050,7 @@ def _partition_guided_admm_selection(
     profile_name: str,
     selection_method: str,
     selection_score: str,
+    ward_ladder_kmax: int = FINAL_PHI_WARD_LADDER_KMAX,
 ) -> BICSelectionResult:
     """Select a positive pairwise-fusion fit with an online ADMM lambda search.
 
@@ -1541,19 +1542,23 @@ def _partition_guided_admm_selection(
     # complete-data criteria (validated on the CliPPSim corpus, where ladder
     # candidates recover under-clustered K3/K4 selections the path pool
     # cannot supply).
-    finite_path_entries = [
-        (entry_fit, entry_row)
-        for entry_fit, _, entry_row, _ in result_entries
-        if np.isfinite(float(entry_row.get("bic", np.nan)))
-        and bool(entry_row.get("bic_refit_finite_candidate_found", False))
-    ]
+    finite_path_entries = (
+        [
+            (entry_fit, entry_row)
+            for entry_fit, _, entry_row, _ in result_entries
+            if np.isfinite(float(entry_row.get("bic", np.nan)))
+            and bool(entry_row.get("bic_refit_finite_candidate_found", False))
+        ]
+        if int(ward_ladder_kmax) >= 1
+        else []
+    )
     if finite_path_entries:
         ladder_fit, _ = min(finite_path_entries, key=lambda item: float(item[1]["bic"]))
         ladder_phi = np.asarray(ladder_fit.phi, dtype=np.float64)
         ladder_label_sets = hessian_weighted_ward_label_sets_torch(
             ladder_phi,
             np.ones_like(ladder_phi),
-            K_grid=list(range(1, int(FINAL_PHI_WARD_LADDER_KMAX) + 1)),
+            K_grid=list(range(1, int(ward_ladder_kmax) + 1)),
             device="cpu",
         )
         seen_signatures = {
@@ -1671,6 +1676,7 @@ def _grid_search_selection(
     selection_method: str,
     selection_score: str,
     include_likelihood_partition_candidates: bool | None,
+    ward_ladder_kmax: int = FINAL_PHI_WARD_LADDER_KMAX,
 ) -> BICSelectionResult:
     selection_start_time = perf_counter()
     explicit_lambda_grid = lambda_grid is not None
@@ -1709,6 +1715,7 @@ def _grid_search_selection(
             profile_name=profile_name,
             selection_method=selection_method,
             selection_score=selection_score,
+            ward_ladder_kmax=int(ward_ladder_kmax),
         )
     lambda_bracket: LambdaBracket | None = None
     if lambda_grid is None and not adaptive_lambda_mode:
@@ -2234,6 +2241,7 @@ def select_model(
     evaluate_all_candidates: bool,
     finalize_selected_fit: bool = True,
     include_likelihood_partition_candidates: bool | None = None,
+    ward_ladder_kmax: int = FINAL_PHI_WARD_LADDER_KMAX,
 ) -> BICSelectionResult:
     normalized_score = _normalize_selection_score_name(selection_score)
     effective_objective_shape = objective_shape_for_data(
@@ -2300,6 +2308,7 @@ def select_model(
         include_likelihood_partition_candidates=(
             include_likelihood_partition_candidates
         ),
+        ward_ladder_kmax=int(ward_ladder_kmax),
     )
 
 

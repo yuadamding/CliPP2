@@ -22,6 +22,7 @@ from ..metrics.evaluation import evaluate_fit_against_simulation
 from ..model_selection.config import (
     DEFAULT_LAMBDA_GRID_MODE,
     DEFAULT_SELECTION_SCORE,
+    FINAL_PHI_WARD_LADDER_KMAX,
 )
 from .model_selection import select_model
 from .outputs import write_fit_outputs
@@ -133,6 +134,7 @@ def process_tumor_bundle(
     unsupported_policy: str = "error",
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     evaluate_all_candidates: bool | None = None,
+    ward_ladder_kmax: int = FINAL_PHI_WARD_LADDER_KMAX,
 ) -> tuple[dict[str, float | int | str | bool], pd.DataFrame]:
     """Fit one tumor TSV file (a legacy directory must be converted first)."""
 
@@ -181,6 +183,7 @@ def process_tumor_bundle(
         use_warm_starts=use_warm_starts,
         evaluate_all_candidates=evaluate_all_candidates_flag,
         finalize_selected_fit=bool(finalize_selected_fit),
+        ward_ladder_kmax=int(ward_ladder_kmax),
     )
     best_fit = selection_result.best_fit
     selection_artifact = getattr(selection_result, "selected_artifact", None)
@@ -1004,6 +1007,7 @@ def process_tumor(
     unsupported_policy: str = "error",
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     evaluate_all_candidates: bool | None = None,
+    ward_ladder_kmax: int = FINAL_PHI_WARD_LADDER_KMAX,
 ) -> dict[str, float | int | str | bool]:
     """Fit one tumor TSV file."""
 
@@ -1024,5 +1028,6 @@ def process_tumor(
         evaluate_all_candidates=evaluate_all_candidates,
         unsupported_policy=unsupported_policy,
         dosage_prior_penalty=dosage_prior_penalty,
+        ward_ladder_kmax=int(ward_ladder_kmax),
     )
     return summary
