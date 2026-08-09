@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
 
 import numpy as np
 import torch
@@ -2293,19 +2294,55 @@ def _complete_graph_isotropic_box_qp_torch(
     h: torch.Tensor,
     lower: torch.Tensor,
     upper: torch.Tensor,
-    rho: float,
+    rho: float | torch.Tensor,
     q: torch.Tensor,
     max_iter: int,
 ) -> torch.Tensor:
+    rho_t = (
+        rho.to(dtype=U.dtype, device=U.device)
+        if torch.is_tensor(rho)
+        else torch.as_tensor(float(rho), dtype=U.dtype, device=U.device)
+    )
+    if U.device.type == "cuda" and U.dtype == torch.float64:
+        return _complete_graph_isotropic_box_qp_cuda(
+            U,
+            h,
+            lower,
+            upper,
+            rho_t,
+            q,
+            max(int(max_iter), 16),
+        )
+    return _complete_graph_isotropic_box_qp_impl(
+        U,
+        h,
+        lower,
+        upper,
+        rho_t,
+        q,
+        max(int(max_iter), 16),
+    )
+
+
+def _complete_graph_isotropic_box_qp_impl(
+    U: torch.Tensor,
+    h: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    rho_t: torch.Tensor,
+    q: torch.Tensor,
+    num_sweeps: int,
+) -> torch.Tensor:
+    """Tensor-only box-QP kernel suitable for CUDA graph compilation."""
+
     num_mutations = int(U.shape[0])
-    rho_t = torch.as_tensor(float(rho), dtype=U.dtype, device=U.device)
     rhs = h * U + rho_t * q
     denom = h + rho_t * float(num_mutations)
 
     lo = torch.sum(lower, dim=0)
     hi = torch.sum(upper, dim=0)
     mid = 0.5 * (lo + hi)
-    for _ in range(max(int(max_iter), 16)):
+    for _ in range(num_sweeps):
         mid = 0.5 * (lo + hi)
         x_mid = torch.minimum(
             torch.maximum((rhs + rho_t * mid.unsqueeze(0)) / denom, lower),
@@ -2321,6 +2358,42 @@ def _complete_graph_isotropic_box_qp_torch(
         torch.maximum((rhs + rho_t * mid.unsqueeze(0)) / denom, lower),
         upper,
     )
+
+
+# The bounded QP is called once per ADMM iteration. In eager CUDA mode its
+# short, dependent bisection sweeps produce thousands of tiny kernel launches
+# per fit. Inductor keeps the scalar rho device-backed (so different candidates
+# reuse one compiled graph) and fuses those sweeps. Compilation remains lazy.
+# CPU and lower-precision paths stay eager: float32 fusion can move the bounded
+# solution by enough to matter at the default optimization tolerance.
+_compiled_complete_graph_isotropic_box_qp_cuda = torch.compile(
+    _complete_graph_isotropic_box_qp_impl,
+    fullgraph=True,
+    dynamic=False,
+)
+_cuda_box_qp_compile_failed = False
+
+
+def _complete_graph_isotropic_box_qp_cuda(*args) -> torch.Tensor:
+    """Run the compiled CUDA kernel, falling back only on compiler failures."""
+
+    global _cuda_box_qp_compile_failed
+    if _cuda_box_qp_compile_failed:
+        return _complete_graph_isotropic_box_qp_impl(*args)
+    try:
+        return _compiled_complete_graph_isotropic_box_qp_cuda(*args)
+    except Exception as exc:
+        exception_module = type(exc).__module__
+        if not exception_module.startswith(("torch._dynamo", "torch._inductor")):
+            raise
+        _cuda_box_qp_compile_failed = True
+        warnings.warn(
+            "CUDA box-QP compilation failed; falling back to eager Torch kernels: "
+            f"{exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return _complete_graph_isotropic_box_qp_impl(*args)
 
 
 def _closed_form_box_fusion_result(
@@ -2411,6 +2484,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
     rho = _initial_complete_graph_rho(
         h, num_mutations=num_mutations, spectral_rho=spectral_rho
     )
+    rho_t = torch.as_tensor(rho, dtype=runtime.dtype, device=runtime.device)
     radius = float(lambda_value) * edge_w
     if dual_start is not None and tuple(dual_start.shape) == (
         int(edge_u.numel()),
@@ -2465,7 +2539,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
             h=h,
             lower=lower,
             upper=upper,
-            rho=rho,
+            rho=rho_t,
             q=q,
             max_iter=box_iter,
         )
@@ -2503,6 +2577,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
                 # parameterization, then update the group-shrinkage radius.
                 scaled_dual_new = scaled_dual_new * (float(rho) / next_rho)
                 rho = float(next_rho)
+                rho_t.fill_(rho)
                 shrink_radius = radius / float(rho)
                 actual_dual = float(rho) * scaled_dual_new
             del z_delta, dual_residual_node
@@ -2632,6 +2707,7 @@ def _solve_majorized_subproblem_alm_streaming_torch(
     rho = _initial_complete_graph_rho(
         h, num_mutations=num_mutations, spectral_rho=spectral_rho
     )
+    rho_t = torch.as_tensor(rho, dtype=runtime.dtype, device=runtime.device)
 
     expected_dual_shape = (num_edges, num_regions)
     scaled_dual = torch.empty(
@@ -2743,7 +2819,7 @@ def _solve_majorized_subproblem_alm_streaming_torch(
             h=h,
             lower=lower,
             upper=upper,
-            rho=rho,
+            rho=rho_t,
             q=q,
             max_iter=box_iter,
         )
@@ -2801,6 +2877,7 @@ def _solve_majorized_subproblem_alm_streaming_torch(
             if next_rho != float(rho):
                 scaled_dual.mul_(float(rho) / next_rho)
                 rho = float(next_rho)
+                rho_t.fill_(rho)
             del dual_residual_node, primal_sum_squares
 
         phi = phi_new
