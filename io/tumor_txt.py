@@ -27,14 +27,10 @@ from .path_compiler import (
     initialize_path_marginal_phi,
     path_prior_mode,
 )
-from .tumor_input import UnsupportedTumorInputError
-
-
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
 TUMOR_TXT_MODEL_ID = PATH_LIKELIHOOD_MODEL_ID
 TUMOR_TXT_MODEL_VERSION = PATH_LIKELIHOOD_MODEL_VERSION
 TUMOR_TXT_CANDIDATE_GENERATOR_VERSION = PATH_CANDIDATE_GENERATOR_VERSION
-TUMOR_TXT_REPORTING_SEMANTICS = "tumor_long_path_mixture_v1"
 DEFAULT_DOSAGE_PRIOR_PENALTY = 3.0
 MORE_THAN_TWO_STATES = "MORE_THAN_TWO_LOCAL_CN_STATES"
 NO_POSITIVE_PATH = "NO_POSITIVE_MUTANT_COPY_PATH"
@@ -94,30 +90,24 @@ class TumorTxtError(ValueError):
     """Raised when a long tumor file violates its public input contract."""
 
 
-@dataclass(slots=True)
-class TumorTxtAnnotations:
-    """Reporting-only source metadata retained by :func:`load_tumor_txt`."""
+class UnsupportedTumorInputError(ValueError):
+    """Raised when a local state mixture is outside the single-switch model."""
 
-    metadata: dict[str, str]
-    optional_columns: tuple[str, ...]
-    rows: pd.DataFrame
-    _unit_values: dict[str, np.ndarray]
-    _biological_duplicates: np.ndarray
-
-    def columns_for_indices(self, indices: np.ndarray) -> dict[str, list[object]]:
-        """Return safely aligned reporting columns for valid path indices."""
-
-        mutation = indices[:, 0]
-        sample = indices[:, 1]
-        path = indices[:, 2]
-        result = {
-            f"input_{name}": values[mutation, sample].tolist()
-            for name, values in self._unit_values.items()
-        }
-        result["biological_duplicate_count"] = self._biological_duplicates[
-            mutation, sample, path
-        ].tolist()
-        return result
+    def __init__(
+        self,
+        reason: str,
+        *,
+        region_id: str,
+        segment_id: str,
+        detail: str,
+    ) -> None:
+        self.reason = str(reason)
+        self.region_id = str(region_id)
+        self.segment_id = str(segment_id)
+        self.detail = str(detail)
+        super().__init__(
+            f"{self.reason}: {self.region_id}, segment {self.segment_id}: {self.detail}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,40 +181,6 @@ def _validate_metadata(metadata: dict[str, str], *, path: Path) -> dict[str, str
     validated["tumor_id"] = _safe_tumor_id(validated["tumor_id"])
     _identifier(validated["genome_build"], name="genome_build")
     return validated
-
-
-def _read_tumor_txt_metadata(path: str | Path) -> dict[str, str]:
-    """Read and validate only the metadata prefix of one canonical input."""
-
-    input_path = Path(path).resolve()
-    if not input_path.is_file():
-        raise FileNotFoundError(f"Tumor input file does not exist: {input_path}")
-    metadata: dict[str, str] = {}
-    header_found = False
-    with _open_text(input_path, "rt") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.rstrip("\r\n")
-            if not line:
-                continue
-            if line.startswith("##"):
-                key, value = _parse_metadata(
-                    line,
-                    path=input_path,
-                    line_number=line_number,
-                )
-                if key in metadata:
-                    raise TumorTxtError(
-                        f"{input_path}:{line_number}: duplicate metadata key {key!r}."
-                    )
-                metadata[key] = value
-                continue
-            if line.startswith("#"):
-                continue
-            header_found = True
-            break
-    if not header_found:
-        raise TumorTxtError(f"{input_path} does not contain a table header.")
-    return _validate_metadata(metadata, path=input_path)
 
 
 def _read_text_table(path: Path) -> tuple[dict[str, str], pd.DataFrame]:
@@ -814,7 +770,7 @@ def _build_tumor_data(
             "copy-number denominator."
         )
     scaling = purity / denominator
-    path_likelihood, biological_duplicates = build_path_likelihood(
+    path_likelihood, _ = build_path_likelihood(
         compiled_units,
         model_id=TUMOR_TXT_MODEL_ID,
         model_version=TUMOR_TXT_MODEL_VERSION,
@@ -822,36 +778,6 @@ def _build_tumor_data(
         prior_mode=path_prior_mode(dosage_prior_penalty),
     )
 
-    optional_unit_values: dict[str, np.ndarray] = {}
-    for column in validated.optional_columns:
-        values = np.full(shape, ".", dtype=object)
-        all_unit_constant = True
-        for unit, rows in validated.rows_by_unit.items():
-            source_indices = [
-                validated.source_rows.index[
-                    (validated.source_rows["mutation_id"] == unit[0])
-                    & (validated.source_rows["sample_id"] == unit[1])
-                ].tolist()
-            ][0]
-            source_values = {
-                str(validated.source_rows.at[index, column]) for index in source_indices
-            }
-            if len(source_values) != 1:
-                all_unit_constant = False
-                break
-            values[mutation_index[unit[0]], sample_index[unit[1]]] = next(
-                iter(source_values)
-            )
-        if all_unit_constant:
-            optional_unit_values[column] = values
-
-    annotations = TumorTxtAnnotations(
-        metadata=dict(validated.metadata),
-        optional_columns=validated.optional_columns,
-        rows=validated.source_rows.copy(),
-        _unit_values=optional_unit_values,
-        _biological_duplicates=biological_duplicates,
-    )
     data = TumorData(
         tumor_id=validated.metadata["tumor_id"],
         mutation_ids=mutation_ids,
@@ -869,8 +795,6 @@ def _build_tumor_data(
         init_major_mask=np.zeros(shape, dtype=bool),
         count_observed=count_observed,
         path_likelihood=path_likelihood,
-        path_annotations=annotations,
-        path_reporting_semantics=TUMOR_TXT_REPORTING_SEMANTICS,
         path_reporting_fingerprint=_reporting_fingerprint(
             validated.metadata,
             validated.optional_columns,
@@ -911,40 +835,6 @@ def load_tumor_txt(
         dosage_prior_penalty=penalty,
         eps=epsilon,
     )
-
-
-def _alleles_for_mutations(
-    mutation: pd.DataFrame,
-    mutation_ids: list[str],
-    alleles: Mapping[str, tuple[str, str]] | None,
-) -> dict[str, tuple[str, str]]:
-    if {"ref", "alt"}.issubset(mutation.columns):
-        result = {
-            str(row.mutation_id): (str(row.ref), str(row.alt))
-            for row in mutation.itertuples(index=False)
-        }
-    elif alleles is not None:
-        result = {
-            str(mutation_id): (str(values[0]), str(values[1]))
-            for mutation_id, values in alleles.items()
-        }
-    else:
-        raise TumorTxtError(
-            "The legacy directory does not contain ref/alt alleles. Supply an "
-            "alleles mapping keyed by mutation_id for a lossless conversion."
-        )
-    missing = sorted(set(mutation_ids).difference(result))
-    if missing:
-        raise TumorTxtError(f"Missing ref/alt alleles for mutation IDs: {missing[:5]}.")
-    for mutation_id in mutation_ids:
-        ref, alt = result[mutation_id]
-        if ref not in {"A", "C", "G", "T"} or alt not in {"A", "C", "G", "T"}:
-            raise TumorTxtError(
-                f"Alleles for mutation {mutation_id!r} must be uppercase SNVs."
-            )
-        if ref == alt:
-            raise TumorTxtError(f"Alleles for mutation {mutation_id!r} must differ.")
-    return result
 
 
 def _format_number(value: float) -> str:
@@ -1050,123 +940,6 @@ def write_tumor_txt(
     return destination
 
 
-def convert_tumor_directory_to_txt(
-    tumor_dir: str | Path,
-    output_path: str | Path,
-    *,
-    alleles: Mapping[str, tuple[str, str]] | None = None,
-    genome_build: str = "unknown",
-) -> Path:
-    """Export the current legacy directory format to one canonical long file.
-
-    Legacy bundles do not normally contain REF/ALT alleles, so callers must
-    supply ``alleles`` unless those columns were added to
-    ``mutation_segments.tsv``.
-    """
-
-    from .tumor_input import _build_observation_frame, load_tumor_directory
-
-    directory = Path(tumor_dir).resolve()
-    raw_observations, _tables = _build_observation_frame(directory)
-    observation_lookup = {
-        (str(row.mutation_id), str(row.sample_id)): row
-        for row in raw_observations.itertuples(index=False)
-    }
-    data = load_tumor_directory(directory, unsupported_policy="mask")
-    mutation_path = directory / "mutation_segments.tsv"
-    mutation = pd.read_csv(
-        mutation_path,
-        sep="\t",
-        dtype=str,
-        keep_default_na=False,
-    )
-    mutation["mutation_id"] = mutation["mutation_id"].astype(str)
-    allele_lookup = _alleles_for_mutations(
-        mutation,
-        data.mutation_ids,
-        alleles,
-    )
-    mutation_lookup = {
-        str(row.mutation_id): row for row in mutation.itertuples(index=False)
-    }
-    rows: list[list[object]] = []
-    for sample_index, sample_id in enumerate(data.region_ids):
-        cna = pd.read_csv(
-            directory / sample_id / "cna.txt",
-            sep="\t",
-            dtype=str,
-            keep_default_na=False,
-        )
-        for mutation_index, mutation_id in enumerate(data.mutation_ids):
-            mutation_row = mutation_lookup[mutation_id]
-            segment_id = str(mutation_row.segment_id)
-            state_rows = cna.loc[cna["segment_id"].astype(str) == segment_id]
-            if state_rows.empty:
-                raise TumorTxtError(
-                    f"{sample_id}/cna.txt has no rows for segment {segment_id!r}."
-                )
-            ref, alt = allele_lookup[mutation_id]
-            raw_observation = observation_lookup[(mutation_id, sample_id)]
-            alt_count = str(int(raw_observation.alt_counts))
-            ref_count = str(int(raw_observation.ref_counts))
-            aggregated_states: dict[tuple[int, int], float] = {}
-            first_state_row: dict[tuple[int, int], object] = {}
-            for state in state_rows.itertuples(index=False):
-                copy_state = (
-                    int(float(state.major_cn)),
-                    int(float(state.minor_cn)),
-                )
-                aggregated_states[copy_state] = aggregated_states.get(
-                    copy_state, 0.0
-                ) + float(state.tumor_fraction)
-                first_state_row.setdefault(copy_state, state)
-            retained_states = [
-                (copy_state, fraction)
-                for copy_state, fraction in sorted(aggregated_states.items())
-                if fraction > _FRACTION_TOL
-            ]
-            for state_index, (copy_state, fraction) in enumerate(
-                retained_states,
-                start=1,
-            ):
-                state = first_state_row[copy_state]
-                rows.append(
-                    [
-                        mutation_id,
-                        sample_id,
-                        str(mutation_row.chromosome),
-                        str(mutation_row.position),
-                        ref,
-                        alt,
-                        alt_count,
-                        ref_count,
-                        1,
-                        _format_number(data.purity[mutation_index, sample_index]),
-                        _format_number(data.normal_cn[mutation_index, sample_index]),
-                        segment_id,
-                        str(state.start_position),
-                        str(state.end_position),
-                        f"state{state_index}",
-                        _format_number(fraction),
-                        str(copy_state[0]),
-                        str(copy_state[1]),
-                        "unphased",
-                    ]
-                )
-
-    return write_tumor_txt(
-        output_path,
-        pd.DataFrame(rows, columns=SCHEMA_COLUMNS),
-        {
-            "schema": TUMOR_TXT_SCHEMA,
-            "tumor_id": data.tumor_id,
-            "genome_build": _identifier(genome_build, name="genome_build"),
-            "coordinate_system": "1-based-inclusive",
-            "missing_value": ".",
-        },
-    )
-
-
 __all__ = [
     "DEFAULT_DOSAGE_PRIOR_PENALTY",
     "OPTIONAL_COLUMNS",
@@ -1174,9 +947,7 @@ __all__ = [
     "REQUIRED_METADATA",
     "SCHEMA_COLUMNS",
     "TUMOR_TXT_SCHEMA",
-    "TumorTxtAnnotations",
     "TumorTxtError",
-    "convert_tumor_directory_to_txt",
     "load_tumor_txt",
     "write_tumor_txt",
 ]

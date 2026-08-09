@@ -43,8 +43,6 @@ class CertificateRefinementResult:
     stationarity_before: float
     stationarity_after: float
     work_counters: BackendWorkCounters = BackendWorkCounters()
-    node_residual: float = float("inf")
-    column_residual: float = float("inf")
 
 
 def _analytic_nonfused_adjoint(
@@ -309,9 +307,9 @@ def _optimize_internal_workset(
     upper: torch.Tensor,
     lambda_value: float,
     options: CertificateOptions,
-) -> tuple[torch.Tensor, torch.Tensor, float, float, int]:
+) -> tuple[torch.Tensor, torch.Tensor, float, int]:
     if edge_ids.numel() == 0:
-        residual, adj, _ = _workset_residual(
+        residual, _, _ = _workset_residual(
             base_grad=base_grad,
             dual=dual_start,
             edge_u=graph.edge_u[:0],
@@ -320,18 +318,7 @@ def _optimize_internal_workset(
             lower=lower,
             upper=upper,
         )
-        scale = (
-            1.0
-            + float(torch.linalg.norm(base_grad).item())
-            + float(torch.linalg.norm(adj).item())
-        )
-        return (
-            dual_start,
-            residual,
-            float(torch.linalg.norm(residual).item()) / scale,
-            0.0,
-            0,
-        )
+        return dual_start, residual, 0.0, 0
     edge_u = graph.edge_u.index_select(0, edge_ids)
     edge_v = graph.edge_v.index_select(0, edge_ids)
     radius = float(lambda_value) * graph.weight.index_select(0, edge_ids)
@@ -376,7 +363,7 @@ def _optimize_internal_workset(
             )
             if mapping_residual <= float(options.mapping_tolerance):
                 break
-    residual, adj, _ = _workset_residual(
+    residual, _, _ = _workset_residual(
         base_grad=base_grad,
         dual=dual,
         edge_u=edge_u,
@@ -385,13 +372,7 @@ def _optimize_internal_workset(
         lower=lower,
         upper=upper,
     )
-    scale = (
-        1.0
-        + float(torch.linalg.norm(base_grad).item())
-        + float(torch.linalg.norm(adj).item())
-    )
-    node_residual = float(torch.linalg.norm(residual).item()) / max(scale, 1e-300)
-    return dual, residual, node_residual, mapping_residual, iterations
+    return dual, residual, mapping_residual, iterations
 
 
 def _scan_omitted_internal_edges(
@@ -574,8 +555,6 @@ def _refine_compressed_certificate(
     edge_passes = tree_passes + between_passes + activity_passes
     column_scan_passes = 0
     full_certificate_audit_passes = 0
-    column_residual = float("inf")
-    node_residual = float("inf")
     # A nonempty inherited support may already be authoritative, so give it one
     # full-graph fast-path audit. Fresh proposals go directly to the cheap
     # workset/missing-column gates and pay for a full audit only if those pass.
@@ -635,8 +614,6 @@ def _refine_compressed_certificate(
                 column_scan_passes=column_scan_passes,
                 full_certificate_audit_passes=full_certificate_audit_passes,
             ),
-            node_residual=before.stationarity_residual,
-            column_residual=before.edge_subgradient_residual,
         )
     status = "not_certified"
     expansions = 0
@@ -644,7 +621,7 @@ def _refine_compressed_certificate(
     unconverged_worksets = 0
     final_diag = before
     for _expansion in range(int(options.max_expansions)):
-        dual, residual, node_residual, mapping_residual, iterations = (
+        dual, residual, mapping_residual, iterations = (
             _optimize_internal_workset(
                 base_grad=base_grad,
                 dual_start=dual,
@@ -779,8 +756,6 @@ def _refine_compressed_certificate(
             column_scan_passes=column_scan_passes,
             full_certificate_audit_passes=full_certificate_audit_passes,
         ),
-        node_residual=node_residual,
-        column_residual=column_residual,
     )
 
 

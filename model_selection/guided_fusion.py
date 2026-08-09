@@ -1238,7 +1238,6 @@ def build_guided_fusion_initialization(
     guide_labels: GuideLabels,
     *,
     solver_context: SolverContext,
-    grad_smooth: GuideArray | None = None,
     partition_tolerance: float = 1e-8,
     kkt_atol: float = 1e-8,
     max_capacity_iterations: int = 64,
@@ -1258,9 +1257,6 @@ def build_guided_fusion_initialization(
         finite likelihood-noise floor. Guided mode distributes that floor over
         the complete-graph degree so the proposal informs, but cannot make its
         within-block weights singular.
-    grad_smooth
-        Optional precomputed smooth observed-loss gradient, mainly useful for
-        deterministic tests. When omitted it is evaluated from the context.
     materialize_dense_dual
         Preserve the historical dense actual-dual state when true. When false,
         reconstruct edge duals only in bounded chunks and return a compressed
@@ -1309,23 +1305,14 @@ def build_guided_fusion_initialization(
         partition_tolerance=float(partition_tolerance),
     )
 
-    if grad_smooth is None:
-        terms = mutation_region_terms_torch(
-            torch_data_from_context(solver_context),
-            phi,
-            major_prior=float(solver_context.problem.major_prior),
-            eps=float(solver_context.problem.eps),
-        )
-        grad = terms.grad.detach()
-        gradient_source = "observed_likelihood"
-    else:
-        grad = torch.as_tensor(grad_smooth, dtype=phi.dtype, device=phi.device)
-        if tuple(grad.shape) != tuple(phi.shape):
-            raise ValueError(f"grad_smooth must have shape {tuple(phi.shape)}.")
-        if not bool(torch.all(torch.isfinite(grad)).item()):
-            raise ValueError("grad_smooth must contain only finite values.")
-        grad = grad.detach()
-        gradient_source = "provided"
+    terms = mutation_region_terms_torch(
+        torch_data_from_context(solver_context),
+        phi,
+        major_prior=float(solver_context.problem.major_prior),
+        eps=float(solver_context.problem.eps),
+    )
+    grad = terms.grad.detach()
+    gradient_source = "observed_likelihood"
 
     graph = solver_context.graph
     edge_u, edge_v, edge_w = graph.edge_u, graph.edge_v, graph.weight

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 from .types import PairwiseFusionGraph
 
@@ -330,79 +328,3 @@ def edge_degree_bound(
         minlength=int(num_mutations),
     )
     return max(int(np.max(degree)), 1)
-
-
-def load_pairwise_fusion_graph_tsv(
-    file_path: str | Path,
-    *,
-    num_mutations: int,
-    mutation_ids: list[str] | None = None,
-    default_weight: float = 1.0,
-) -> PairwiseFusionGraph:
-    file_path = Path(file_path)
-    df = pd.read_csv(file_path, sep="\t").copy()
-    if df.empty:
-        raise ValueError(f"Graph file {file_path} is empty.")
-
-    if {"edge_u", "edge_v"}.issubset(df.columns):
-        edge_u = df["edge_u"].to_numpy(dtype=np.int32, copy=True)
-        edge_v = df["edge_v"].to_numpy(dtype=np.int32, copy=True)
-    else:
-        left_col = (
-            "mutation_u"
-            if "mutation_u" in df.columns
-            else "mutation_id_u"
-            if "mutation_id_u" in df.columns
-            else None
-        )
-        right_col = (
-            "mutation_v"
-            if "mutation_v" in df.columns
-            else "mutation_id_v"
-            if "mutation_id_v" in df.columns
-            else None
-        )
-        if left_col is None or right_col is None:
-            raise ValueError(
-                f"Graph file {file_path} must contain either ('edge_u', 'edge_v') or "
-                f"('mutation_u'/'mutation_id_u', 'mutation_v'/'mutation_id_v')."
-            )
-        if mutation_ids is None:
-            raise ValueError(
-                f"Graph file {file_path} uses mutation IDs, but no mutation_ids mapping was provided."
-            )
-        mutation_index = {
-            str(mutation_id): idx for idx, mutation_id in enumerate(mutation_ids)
-        }
-        try:
-            edge_u = (
-                df[left_col]
-                .astype(str)
-                .map(mutation_index.__getitem__)
-                .to_numpy(dtype=np.int32, copy=True)
-            )
-            edge_v = (
-                df[right_col]
-                .astype(str)
-                .map(mutation_index.__getitem__)
-                .to_numpy(dtype=np.int32, copy=True)
-            )
-        except KeyError as exc:
-            raise ValueError(
-                f"Graph file {file_path} references unknown mutation ID {exc.args[0]!r}."
-            ) from exc
-
-    if "edge_w" in df.columns:
-        edge_w = df["edge_w"].to_numpy(dtype=np.float64, copy=True)
-    else:
-        edge_w = np.full(edge_u.shape[0], float(default_weight), dtype=np.float64)
-
-    return coerce_graph(
-        num_mutations,
-        PairwiseFusionGraph(
-            edge_u=edge_u,
-            edge_v=edge_v,
-            edge_w=edge_w,
-            name=file_path.stem,
-        ),
-    )

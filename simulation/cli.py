@@ -12,12 +12,6 @@ from .config import (
 from .generator import simulate_tumor
 
 
-def parse_int_list(value: str) -> list[int]:
-    return [int(part) for part in value.split(",") if part.strip()]
-
-
-def parse_float_list(value: str) -> list[float]:
-    return [float(part) for part in value.split(",") if part.strip()]
 
 
 def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:

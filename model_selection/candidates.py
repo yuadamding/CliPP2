@@ -22,11 +22,6 @@ from ..core.fusion.solver import (
 from ..core.fusion.torch_backend import dtype_name
 from ..core.fusion.types import SolverState, TorchRuntime
 from ..io.data import TumorData
-from ..metrics.evaluation import (
-    SimulationEvaluation,
-    SimulationTruth,
-    evaluate_fit_against_simulation,
-)
 from .config import (
     LIKELIHOOD_PARTITION_SENTINEL_LAMBDA,
     MARGINAL_BIC_MAX_CEM_ITERATIONS,
@@ -127,130 +122,6 @@ def _cem_stabilized_marginal_loglik(
     return marginal_loglik, cem_iterations
 
 
-def _evaluate_simulation_metrics(
-    *,
-    data: TumorData,
-    fit: FitResult,
-    artifact: SelectionArtifact,
-    simulation_truth: SimulationTruth | None,
-    enabled: bool,
-) -> tuple[SimulationEvaluation | None, dict[str, float | int], float]:
-    metrics: dict[str, float | int] = {
-        "ARI": np.nan,
-        "cp_rmse": np.nan,
-        "raw_cp_rmse": np.nan,
-        "summary_cp_rmse": np.nan,
-        "bic_refit_cp_rmse": np.nan,
-        "multiplicity_f1": np.nan,
-        "multiplicity_asymmetric_f1": np.nan,
-        "multiplicity_estimable_f1": np.nan,
-        "effective_multiplicity_rmse": np.nan,
-        "raw_effective_multiplicity_rmse": np.nan,
-        "summary_effective_multiplicity_rmse": np.nan,
-        "amplified_mutant_copy_f1": np.nan,
-        "raw_amplified_mutant_copy_f1": np.nan,
-        "summary_amplified_mutant_copy_f1": np.nan,
-        "n_effective_multiplicity_units": np.nan,
-        "n_amplified_mutant_copy_units": np.nan,
-        "n_true_amplified_mutant_copy_units": np.nan,
-        "estimated_clonal_fraction": np.nan,
-        "true_clonal_fraction": np.nan,
-        "clonal_fraction_error": np.nan,
-        "estimated_clusters": np.nan,
-        "true_clusters": np.nan,
-        "n_eval_mutations": np.nan,
-        "n_filtered_mutations": np.nan,
-    }
-    if not enabled or simulation_truth is None:
-        return None, metrics, 0.0
-
-    start_time = perf_counter()
-    evaluation = evaluate_fit_against_simulation(
-        fit=fit,
-        data=data,
-        simulation_truth=simulation_truth,
-        bic_refit_phi=artifact.bic_refit_phi,
-        bic_partition_labels=artifact.bic_partition_labels,
-    )
-    metrics.update(
-        {
-            "ARI": float(evaluation.ari),
-            "cp_rmse": float(evaluation.cp_rmse),
-            "raw_cp_rmse": float(
-                evaluation.raw_cp_rmse if evaluation.raw_cp_rmse is not None else np.nan
-            ),
-            "summary_cp_rmse": float(
-                evaluation.summary_cp_rmse
-                if evaluation.summary_cp_rmse is not None
-                else evaluation.cp_rmse
-            ),
-            "bic_refit_cp_rmse": float(
-                evaluation.bic_refit_cp_rmse
-                if evaluation.bic_refit_cp_rmse is not None
-                else np.nan
-            ),
-            "multiplicity_f1": float(evaluation.multiplicity_f1),
-            "multiplicity_asymmetric_f1": float(
-                evaluation.multiplicity_f1
-                if evaluation.multiplicity_asymmetric_f1 is None
-                else evaluation.multiplicity_asymmetric_f1
-            ),
-            "multiplicity_estimable_f1": float(
-                np.nan
-                if evaluation.multiplicity_estimable_f1 is None
-                else evaluation.multiplicity_estimable_f1
-            ),
-            "effective_multiplicity_rmse": float(
-                np.nan
-                if evaluation.effective_multiplicity_rmse is None
-                else evaluation.effective_multiplicity_rmse
-            ),
-            "raw_effective_multiplicity_rmse": float(
-                np.nan
-                if evaluation.raw_effective_multiplicity_rmse is None
-                else evaluation.raw_effective_multiplicity_rmse
-            ),
-            "summary_effective_multiplicity_rmse": float(
-                np.nan
-                if evaluation.summary_effective_multiplicity_rmse is None
-                else evaluation.summary_effective_multiplicity_rmse
-            ),
-            "amplified_mutant_copy_f1": float(
-                np.nan
-                if evaluation.amplified_mutant_copy_f1 is None
-                else evaluation.amplified_mutant_copy_f1
-            ),
-            "raw_amplified_mutant_copy_f1": float(
-                np.nan
-                if evaluation.raw_amplified_mutant_copy_f1 is None
-                else evaluation.raw_amplified_mutant_copy_f1
-            ),
-            "summary_amplified_mutant_copy_f1": float(
-                np.nan
-                if evaluation.summary_amplified_mutant_copy_f1 is None
-                else evaluation.summary_amplified_mutant_copy_f1
-            ),
-            "n_effective_multiplicity_units": int(
-                evaluation.n_effective_multiplicity_units
-            ),
-            "n_amplified_mutant_copy_units": int(
-                evaluation.n_amplified_mutant_copy_units
-            ),
-            "n_true_amplified_mutant_copy_units": int(
-                evaluation.n_true_amplified_mutant_copy_units
-            ),
-            "estimated_clonal_fraction": float(evaluation.estimated_clonal_fraction),
-            "true_clonal_fraction": float(evaluation.true_clonal_fraction),
-            "clonal_fraction_error": float(evaluation.clonal_fraction_error),
-            "estimated_clusters": int(evaluation.estimated_clusters),
-            "true_clusters": int(evaluation.true_clusters),
-            "n_eval_mutations": int(evaluation.n_eval_mutations),
-            "n_filtered_mutations": int(evaluation.n_filtered_mutations),
-        }
-    )
-    return evaluation, metrics, float(perf_counter() - start_time)
-
-
 def _evaluate_candidate(
     *,
     data: TumorData,
@@ -258,8 +129,6 @@ def _evaluate_candidate(
     candidate_fit_options: FitOptions | None,
     bic_df_scale: float,
     bic_cluster_penalty: float,
-    simulation_truth: SimulationTruth | None,
-    evaluate_candidate: bool,
     phi_start: StartArray | None,
     exact_pilot: StartArray | None,
     pooled_start: StartArray | None,
@@ -279,7 +148,6 @@ def _evaluate_candidate(
     bic_refit_cache: dict[str, PartitionRefitResult] | None = None,
 ) -> tuple[
     FitResult,
-    SimulationEvaluation | None,
     dict[str, float | int | str | bool],
     SelectionArtifact,
 ]:
@@ -452,16 +320,6 @@ def _evaluate_candidate(
         classic_bic=float(classic_bic),
         selection_score_value=float(bic),
         bic_refit_finite_candidate_found=bic_refit_finite_candidate_found,
-    )
-
-    evaluation, evaluation_metrics, evaluation_elapsed_seconds = (
-        _evaluate_simulation_metrics(
-            data=data,
-            fit=fit,
-            artifact=artifact,
-            simulation_truth=simulation_truth,
-            enabled=evaluate_candidate,
-        )
     )
 
     candidate_elapsed_seconds = float(perf_counter() - candidate_start_time)
@@ -661,7 +519,6 @@ def _evaluate_candidate(
         "candidate_elapsed_seconds": float(candidate_elapsed_seconds),
         "raw_fit_elapsed_seconds": float(raw_fit_elapsed_seconds),
         "bic_refit_elapsed_seconds": float(bic_refit_elapsed_seconds),
-        "candidate_evaluation_elapsed_seconds": float(evaluation_elapsed_seconds),
         "partition_tol": float(bic_partition_tol),
         "primary_phi_source": "raw_penalized_fit",
         "bic_refit_phi_source": "secondary_partition_refit",
@@ -688,13 +545,11 @@ def _evaluate_candidate(
         "edge_list_hash": str(static_metadata.edge_list_hash),
         "pilot_matrix_hash": str(static_metadata.pilot_matrix_hash),
         "input_data_hash": str(static_metadata.input_data_hash),
-        "evaluation_mode": ("full" if evaluation is not None else "not_evaluated"),
         "fit_compute_summary": bool(compute_summary),
         "fit_start_mode": str(start_mode),
         "solver_state_warm_start": bool(solver_state is not None),
-        **evaluation_metrics,
     }
-    return fit, evaluation, row, artifact
+    return fit, row, artifact
 
 
 def _evaluate_partition_candidate(
@@ -705,8 +560,6 @@ def _evaluate_partition_candidate(
     candidate_rank: int,
     bic_df_scale: float,
     bic_cluster_penalty: float,
-    simulation_truth: SimulationTruth | None,
-    evaluate_candidate: bool,
     selection_method: str,
     profile_name: str,
     selection_step: int,
@@ -715,7 +568,6 @@ def _evaluate_partition_candidate(
     runtime: TorchRuntime,
 ) -> tuple[
     FitResult,
-    SimulationEvaluation | None,
     dict[str, float | int | str | bool],
     SelectionArtifact,
 ]:
@@ -977,16 +829,6 @@ def _evaluate_partition_candidate(
         selection_score_name=str(canonical_score_name),
     )
 
-    evaluation, evaluation_metrics, evaluation_elapsed_seconds = (
-        _evaluate_simulation_metrics(
-            data=data,
-            fit=fit,
-            artifact=artifact,
-            simulation_truth=simulation_truth,
-            enabled=evaluate_candidate,
-        )
-    )
-
     candidate_elapsed_seconds = float(perf_counter() - candidate_start_time)
 
     requested_k = int(candidate.diagnostics.get("requested_K", candidate.K))
@@ -1176,7 +1018,6 @@ def _evaluate_partition_candidate(
         "candidate_elapsed_seconds": float(candidate_elapsed_seconds),
         "raw_fit_elapsed_seconds": 0.0,
         "bic_refit_elapsed_seconds": 0.0,
-        "candidate_evaluation_elapsed_seconds": float(evaluation_elapsed_seconds),
         "partition_tol": float(bic_partition_tol),
         "primary_phi_source": "likelihood_partition_refit",
         "bic_refit_phi_source": "likelihood_partition_refit",
@@ -1199,10 +1040,8 @@ def _evaluate_partition_candidate(
         "edge_list_hash": str(static_metadata.edge_list_hash),
         "pilot_matrix_hash": str(static_metadata.pilot_matrix_hash),
         "input_data_hash": str(static_metadata.input_data_hash),
-        "evaluation_mode": ("full" if evaluation is not None else "not_evaluated"),
         "fit_compute_summary": True,
         "fit_start_mode": "likelihood_partition",
         "solver_state_warm_start": False,
-        **evaluation_metrics,
     }
-    return fit, evaluation, row, artifact
+    return fit, row, artifact

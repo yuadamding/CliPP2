@@ -1319,33 +1319,6 @@ def objective_terms_torch(
     )
 
 
-def objective_value_torch(
-    data: TorchTumorData,
-    phi: torch.Tensor,
-    *,
-    edge_u: torch.Tensor,
-    edge_v: torch.Tensor,
-    edge_w: torch.Tensor,
-    lambda_value: float,
-    major_prior: float,
-    eps: float,
-) -> tuple[float, float, float, torch.Tensor]:
-    terms = objective_terms_torch(
-        data,
-        phi,
-        edge_u=edge_u,
-        edge_v=edge_v,
-        edge_w=edge_w,
-        lambda_value=lambda_value,
-        major_prior=major_prior,
-        eps=eps,
-    )
-    return (
-        float(terms.fit.item()),
-        float(terms.penalty.item()),
-        float(terms.total.item()),
-        terms.gamma_major,
-    )
 
 
 def project_stationarity_cone_torch(

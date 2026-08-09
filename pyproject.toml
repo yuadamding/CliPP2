@@ -29,7 +29,6 @@ packages = [
     "CliPP2.core",
     "CliPP2.core.fusion",
     "CliPP2.io",
-    "CliPP2.metrics",
     "CliPP2.model_selection",
     "CliPP2.runners",
     "CliPP2.simulation",
