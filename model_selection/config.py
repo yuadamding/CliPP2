@@ -11,7 +11,8 @@ MARGINAL_BIC_MAX_CEM_ITERATIONS = 6
 # Path partitions inherit fusion's membership commitments; the ladder supplies
 # independently drawn memberships per K, which the marginal criterion needs
 # (its scores are far more sensitive to membership quality than ICL's).
-FINAL_PHI_WARD_LADDER_KMAX = 7
+# Override per run with --kmax (0 disables the ladder).
+FINAL_PHI_WARD_LADDER_KMAX = 30
 PARTITION_ICL_DIRICHLET_ALPHA = 1.0
 
 LAMBDA_SEARCH_MIN = 1e-6
