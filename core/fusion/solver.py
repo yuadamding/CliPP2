@@ -2727,7 +2727,6 @@ def _fit_from_start(
     )
 
     phi_np = phi.detach().cpu().numpy()
-    gamma_np = gamma_major.detach().cpu().numpy()
     path_posterior_np = (
         None
         if final_terms.path_posterior is None

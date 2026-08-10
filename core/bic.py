@@ -1,4 +1,4 @@
-"""Single source of truth for BIC primitives and lambda-grid mode helpers.
+"""Single source of truth for model-selection score primitives.
 
 This is a leaf module: it depends only on numpy and ``io.data.TumorData`` so that
 both the ``core.fusion`` layer (partition refits / candidate BIC) and the
@@ -9,34 +9,11 @@ BIC arithmetic in one place avoids the correctness-drift risk of re-deriving
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from math import fsum, lgamma
 
 import numpy as np
 
 from ..io.data import TumorData
-
-
-PARTITION_GUIDED_LAMBDA_GRID_MODES = ("partition_guided_admm",)
-ADAPTIVE_LAMBDA_GRID_MODES = ("adaptive_bic",)
-LAMBDA_GRID_MODES = PARTITION_GUIDED_LAMBDA_GRID_MODES + ADAPTIVE_LAMBDA_GRID_MODES
-
-
-@dataclass(frozen=True)
-class LambdaBracket:
-    lambda_min: float
-    lambda_eq: float
-    lambda_full: float
-    anchors: list[float]
-    diagnostics: dict[str, float]
-
-
-def is_adaptive_lambda_grid_mode(mode: str) -> bool:
-    return str(mode).strip().lower() in ADAPTIVE_LAMBDA_GRID_MODES
-
-
-def is_partition_guided_lambda_grid_mode(mode: str) -> bool:
-    return str(mode).strip().lower() in PARTITION_GUIDED_LAMBDA_GRID_MODES
 
 
 def _observed_positive_depth_mask(data: TumorData) -> np.ndarray:
@@ -214,10 +191,6 @@ def compute_partition_icl(
 
 
 __all__ = [
-    "ADAPTIVE_LAMBDA_GRID_MODES",
-    "LAMBDA_GRID_MODES",
-    "PARTITION_GUIDED_LAMBDA_GRID_MODES",
-    "LambdaBracket",
     "bic_degrees_of_freedom",
     "cluster_sizes_from_labels",
     "compute_bic_with_df",
@@ -228,6 +201,4 @@ __all__ = [
     "compute_unlabeled_dirichlet_partition_log_evidence",
     "effective_bic_mutation_region_count",
     "effective_bic_depth_count",
-    "is_adaptive_lambda_grid_mode",
-    "is_partition_guided_lambda_grid_mode",
 ]

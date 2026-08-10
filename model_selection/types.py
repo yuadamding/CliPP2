@@ -1,35 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 import torch
 
 from ..core.model import FitResult
-from ..metrics.evaluation import SimulationEvaluation
-
 StartArray = np.ndarray | torch.Tensor
-
-
-@dataclass
-class SimulationDiagnostics:
-    selected_evaluation: SimulationEvaluation | None = None
-    selected_ari: float | None = None
-    best_ari: float | None = None
-    ari_optimal_lambda_min: float | None = None
-    ari_optimal_lambda_max: float | None = None
-    ari_optimal_lambda_count: int = 0
-    best_converged_ari: float | None = None
-    best_converged_lambda_min: float | None = None
-    best_converged_lambda_max: float | None = None
-    best_converged_lambda_count: int = 0
-    ari_hits_lower_boundary: bool = False
-    ari_hits_upper_boundary: bool = False
-    ari_boundary_unresolved: bool = False
-    ari_optimum_resolved: bool = True
-    best_ari_all_evaluated: float | None = None
-    best_ari_certified: float | None = None
 
 
 @dataclass
@@ -105,99 +83,7 @@ class BICSelectionResult:
     selected_lambda_left: float | None
     selected_lambda_right: float | None
     selected_lambda_interval_log10_width: float | None
-    lambda_bracket_min: float | None
-    lambda_bracket_eq: float | None
-    lambda_bracket_full: float | None
     adaptive_refinement_rounds_completed: int
-    simulation: SimulationDiagnostics = field(default_factory=SimulationDiagnostics)
-
-    @property
-    def best_evaluation(self) -> SimulationEvaluation | None:
-        return self.simulation.selected_evaluation
-
-    @property
-    def selected_ari(self) -> float | None:
-        return self.simulation.selected_ari
-
-    @property
-    def best_ari(self) -> float | None:
-        return self.simulation.best_ari
-
-    @property
-    def ari_optimal_lambda_min(self) -> float | None:
-        return self.simulation.ari_optimal_lambda_min
-
-    @property
-    def ari_optimal_lambda_max(self) -> float | None:
-        return self.simulation.ari_optimal_lambda_max
-
-    @property
-    def ari_optimal_lambda_count(self) -> int:
-        return self.simulation.ari_optimal_lambda_count
-
-    @property
-    def best_converged_ari(self) -> float | None:
-        return self.simulation.best_converged_ari
-
-    @property
-    def best_converged_lambda_min(self) -> float | None:
-        return self.simulation.best_converged_lambda_min
-
-    @property
-    def best_converged_lambda_max(self) -> float | None:
-        return self.simulation.best_converged_lambda_max
-
-    @property
-    def best_converged_lambda_count(self) -> int:
-        return self.simulation.best_converged_lambda_count
-
-    @property
-    def ari_hits_lower_boundary(self) -> bool:
-        return self.simulation.ari_hits_lower_boundary
-
-    @property
-    def ari_hits_upper_boundary(self) -> bool:
-        return self.simulation.ari_hits_upper_boundary
-
-    @property
-    def ari_boundary_unresolved(self) -> bool:
-        return self.simulation.ari_boundary_unresolved
-
-    @property
-    def ari_optimum_resolved(self) -> bool:
-        return self.simulation.ari_optimum_resolved
-
-    @property
-    def best_ari_all_evaluated(self) -> float | None:
-        return self.simulation.best_ari_all_evaluated
-
-    @property
-    def best_ari_certified(self) -> float | None:
-        return self.simulation.best_ari_certified
-
-
-@dataclass(frozen=True)
-class _AdaptiveIntervalProposal:
-    lambda_value: float
-    left_lambda: float
-    right_lambda: float
-    left_candidate_id: int | None
-    right_candidate_id: int | None
-    priority_key: tuple[int, float, float, float, float]
-    reason: str
-    log_width: float
-    partition_changed: bool
-    nonagglomerative_or_numerically_inconsistent: bool
-
-
-@dataclass(frozen=True)
-class FullFusionKKTResult:
-    residual: float
-    iterations: int
-    converged: bool
-    lambda_value: float
-
-
 @dataclass(frozen=True)
 class CandidateStaticMetadata:
     edge_count: int

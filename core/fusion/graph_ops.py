@@ -603,6 +603,14 @@ def graph_adjoint_edges(
     edge_v: torch.Tensor,
     num_nodes: int,
 ) -> torch.Tensor:
+    if dual.device.type == "cpu" and int(dual.shape[1]) == 1 and edge_u.numel():
+        # CliPPSim's single-region complete graphs spend a large fraction of
+        # ADMM time in two generic indexed scatters.  Bincount performs the
+        # same signed node reduction with contiguous scalar weights and is
+        # substantially faster on CPU.
+        outgoing = torch.bincount(edge_u, weights=dual[:, 0], minlength=int(num_nodes))
+        incoming = torch.bincount(edge_v, weights=dual[:, 0], minlength=int(num_nodes))
+        return (outgoing - incoming).unsqueeze(1)
     result = dual.new_zeros((int(num_nodes), int(dual.shape[1])))
     if edge_u.numel():
         result.index_add_(0, edge_u, dual)

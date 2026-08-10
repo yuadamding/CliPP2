@@ -161,20 +161,6 @@ def _partition_signature(labels: np.ndarray) -> str:
     return f"{len(blocks)}:{hasher.hexdigest()}"
 
 
-def _partition_is_coarsening(
-    fine_labels: np.ndarray, coarse_labels: np.ndarray
-) -> bool:
-    fine = _canonical_partition_labels(fine_labels)
-    coarse = _canonical_partition_labels(coarse_labels)
-    if fine.shape != coarse.shape:
-        return False
-    for label in np.unique(fine):
-        coarse_values = np.unique(coarse[fine == int(label)])
-        if coarse_values.size > 1:
-            return False
-    return True
-
-
 def _cluster_sizes_text(labels: np.ndarray) -> str:
     labels = np.asarray(labels, dtype=np.int64)
     if labels.size == 0:

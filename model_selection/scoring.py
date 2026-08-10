@@ -526,31 +526,12 @@ def _canonical_lambda(value: float) -> float:
     return float(np.round(float(value), 12))
 
 
-def _lambda_warm_start_distance(*, source_lambda: float, target_lambda: float) -> float:
-    source = float(source_lambda)
-    target = float(target_lambda)
-    if source > 0.0 and target > 0.0:
-        return float(abs(np.log(source) - np.log(target)))
-    if source <= 0.0 and target <= 0.0:
-        return 0.0
-    if target <= 0.0:
-        return float(abs(source - target))
-    return float("inf")
-
-
 def _sorted_unique_lambdas(values: list[float] | np.ndarray) -> list[float]:
     array = np.asarray(list(values), dtype=float)
     array = array[np.isfinite(array) & (array >= 0.0)]
     if array.size == 0:
         return []
     return [float(value) for value in np.unique(np.round(np.sort(array), 12))]
-
-
-def _ari_candidate_frame(search_df: pd.DataFrame) -> pd.DataFrame:
-    if search_df.empty or "ARI" not in search_df.columns:
-        return search_df.iloc[0:0].copy()
-    ari_df = search_df.loc[np.isfinite(search_df["ARI"].to_numpy(dtype=float))].copy()
-    return ari_df.sort_values(["lambda", "selection_step"]).reset_index(drop=True)
 
 
 def _prefer_fit_candidate(candidate: FitResult, incumbent: FitResult | None) -> bool:
@@ -597,3 +578,163 @@ def _profile_penalty_from_fit(fit: FitResult) -> tuple[float, float]:
     if float(fit.lambda_value) > 0.0:
         return penalty, float(penalty / float(fit.lambda_value))
     return penalty, float("nan")
+
+def _adaptive_score_column(normalized_score: str) -> str:
+    if normalized_score == "bic":
+        return "classic_bic"
+    if normalized_score == "extended_bic":
+        return "extended_bic"
+    if normalized_score == "partition_icl":
+        return "partition_icl"
+    if normalized_score == "marginal_bic":
+        return "marginal_bic"
+    raise ValueError(f"Unknown normalized selection score: {normalized_score}")
+
+def _score_strictly_better(score: float, reference: float) -> bool:
+    if not np.isfinite(score) or not np.isfinite(reference):
+        return False
+    margin = 1e-8 * (1.0 + abs(float(reference)))
+    return bool(float(score) < float(reference) - margin)
+
+def _best_candidate_rows_by_lambda(
+    search_df: pd.DataFrame,
+    *,
+    normalized_score: str = "bic",
+) -> pd.DataFrame:
+    if search_df.empty:
+        return search_df.copy()
+    ranked = _add_bic_selection_eligible(search_df)
+    if (
+        "bic_refit_finite_candidate_found" not in ranked.columns
+        and "bic_refit_converged" in ranked.columns
+    ):
+        ranked["bic_refit_finite_candidate_found"] = ranked[
+            "bic_refit_converged"
+        ].astype(bool)
+    if (
+        "bic_refit_converged" not in ranked.columns
+        and "bic_refit_finite_candidate_found" in ranked.columns
+    ):
+        ranked["bic_refit_converged"] = ranked[
+            "bic_refit_finite_candidate_found"
+        ].astype(bool)
+    ranked["_lambda_key"] = np.round(ranked["lambda"].to_numpy(dtype=float), 12)
+    score_column = _adaptive_score_column(normalized_score)
+    defaults = {
+        "selection_eligible": False,
+        "bic_refit_finite_candidate_found": False,
+        "bic_refit_converged": False,
+        "converged": False,
+        score_column: np.inf,
+        "penalized_objective": np.inf,
+        "selection_step": np.arange(ranked.shape[0], dtype=int),
+    }
+    for column, default in defaults.items():
+        if column not in ranked.columns:
+            ranked[column] = default
+    sort_columns = [
+        "_lambda_key",
+        "bic_selection_eligible",
+        "selection_eligible",
+        "bic_refit_finite_candidate_found",
+        "bic_refit_converged",
+        score_column,
+        "penalized_objective",
+        "selection_step",
+    ]
+    ascending = [True, False, False, False, False, True, True, True]
+    ranked = ranked.sort_values(sort_columns, ascending=ascending)
+    return (
+        ranked.drop_duplicates("_lambda_key", keep="first")
+        .drop(columns=["_lambda_key"])
+        .reset_index(drop=True)
+    )
+
+def _selected_lambda_signature_interval(
+    search_df: pd.DataFrame,
+    *,
+    selected_candidate_id: int,
+    normalized_score: str = "bic",
+) -> tuple[float | None, float | None, float | None]:
+    if search_df.empty or "_candidate_id" not in search_df.columns:
+        return None, None, None
+    selected = search_df.loc[
+        search_df["_candidate_id"].astype(int) == int(selected_candidate_id)
+    ]
+    if selected.empty:
+        return None, None, None
+    selected_row = selected.iloc[0]
+    if "lambda_applicable" in selected_row and not bool(
+        selected_row.get("lambda_applicable", True)
+    ):
+        return None, None, None
+    selected_lambda = float(selected_row["lambda"])
+    signature = str(selected_row.get("partition_signature", ""))
+    eligible = search_df.loc[_bic_selection_eligible_mask(search_df)].copy()
+    if eligible.empty:
+        eligible = search_df.copy()
+    eligible = (
+        _best_candidate_rows_by_lambda(
+            eligible,
+            normalized_score=normalized_score,
+        )
+        .sort_values("lambda")
+        .reset_index(drop=True)
+    )
+    lambdas = eligible["lambda"].to_numpy(dtype=float)
+    signatures = (
+        eligible["partition_signature"].astype(str).to_numpy()
+        if "partition_signature" in eligible.columns
+        else np.full(eligible.shape[0], signature)
+    )
+    if lambdas.size == 0:
+        return selected_lambda, selected_lambda, 0.0
+    if selected_lambda > 0.0:
+        distances = np.full(lambdas.shape, np.inf, dtype=float)
+        positive_lambda_mask = lambdas > 0.0
+        distances[positive_lambda_mask] = np.abs(
+            np.log(lambdas[positive_lambda_mask]) - np.log(selected_lambda)
+        )
+        if not np.any(np.isfinite(distances)):
+            distances = np.abs(lambdas - selected_lambda)
+    else:
+        distances = np.abs(lambdas - selected_lambda)
+    idx = int(np.argmin(distances))
+    left_idx = idx
+    while left_idx > 0 and signatures[left_idx - 1] == signature:
+        left_idx -= 1
+    right_idx = idx
+    while right_idx + 1 < lambdas.size and signatures[right_idx + 1] == signature:
+        right_idx += 1
+    left_lambda = float(lambdas[left_idx])
+    right_lambda = float(lambdas[right_idx])
+    log_width = (
+        float(np.log10(right_lambda) - np.log10(left_lambda))
+        if right_lambda > 0.0 and left_lambda > 0.0
+        else 0.0
+    )
+    return left_lambda, right_lambda, log_width
+
+def _lambda_boundary_flags(
+    evaluated_lambdas: list[float],
+    *,
+    best_lambda_min: float | None,
+    best_lambda_max: float | None,
+) -> tuple[bool, bool]:
+    sorted_lambdas = _sorted_unique_lambdas(evaluated_lambdas)
+    if not sorted_lambdas or best_lambda_min is None or best_lambda_max is None:
+        return False, False
+    lower_hit = np.isclose(best_lambda_min, sorted_lambdas[0], rtol=0.0, atol=1e-12)
+    upper_hit = np.isclose(best_lambda_max, sorted_lambdas[-1], rtol=0.0, atol=1e-12)
+    return bool(lower_hit), bool(upper_hit)
+
+def _lambda_boundary_unresolved(
+    *,
+    evaluated_lambdas: list[float],
+    lower_hit: bool,
+    upper_hit: bool,
+) -> bool:
+    sorted_lambdas = _sorted_unique_lambdas(evaluated_lambdas)
+    if not sorted_lambdas:
+        return False
+    return bool(lower_hit or upper_hit)

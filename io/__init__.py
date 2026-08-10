@@ -1,1 +1,1 @@
-"""Tumor input/output: submodules ``data``, ``tumor_input``, ``tumor_txt``."""
+"""Canonical tumor data structures and long-TSV input/output."""
