@@ -807,7 +807,9 @@ def _assemble_selection_result(
     selection_elapsed_seconds = float(perf_counter() - selection_start_time)
     search_df["selection_elapsed_seconds"] = float(selection_elapsed_seconds)
 
-    best_fit, _, selected_artifact = result_entries[int(best_row["_candidate_id"])]
+    best_fit, _, selected_artifact = result_entries[
+        int(best_row["_candidate_id"])
+    ]
     search_df = search_df.drop(columns=["_candidate_id"])
     return BICSelectionResult(
         best_fit=best_fit,
