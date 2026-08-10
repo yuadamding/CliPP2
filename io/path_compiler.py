@@ -157,22 +157,29 @@ def compile_single_switch_paths(
                             )
                         )
 
-    prior_mass: dict[tuple[float, float, float], float] = {}
+    log_prior_mass: dict[tuple[float, float, float], float] = {}
     duplicate_count: dict[tuple[float, float, float], int] = {}
     for path in candidates:
         first, second, switch = path
         endpoint_mass = first * switch + second * (1.0 - switch)
-        weight = float(np.exp(-penalty * max(endpoint_mass - 1.0, 0.0)))
-        prior_mass[path] = prior_mass.get(path, 0.0) + weight
+        log_weight = -penalty * max(endpoint_mass - 1.0, 0.0)
+        if path in log_prior_mass:
+            log_prior_mass[path] = float(
+                np.logaddexp(log_prior_mass[path], log_weight)
+            )
+        else:
+            log_prior_mass[path] = float(log_weight)
         duplicate_count[path] = duplicate_count.get(path, 0) + 1
-    if not prior_mass:
+    if not log_prior_mass:
         return CompiledPathSet((), (), ())
-    paths = tuple(sorted(prior_mass, key=lambda item: (item[2], item[0], item[1])))
-    weights = np.asarray([prior_mass[path] for path in paths], dtype=np.float64)
-    weights /= np.sum(weights)
+    paths = tuple(
+        sorted(log_prior_mass, key=lambda item: (item[2], item[0], item[1]))
+    )
+    log_prior = np.asarray([log_prior_mass[path] for path in paths], dtype=np.float64)
+    log_prior -= np.logaddexp.reduce(log_prior)
     return CompiledPathSet(
         paths=paths,
-        log_prior=tuple(float(np.log(weight)) for weight in weights),
+        log_prior=tuple(float(value) for value in log_prior),
         biological_duplicate_count=tuple(duplicate_count[path] for path in paths),
     )
 
