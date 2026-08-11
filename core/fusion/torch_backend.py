@@ -2301,7 +2301,12 @@ def _complete_graph_isotropic_box_qp_torch(
         if torch.is_tensor(rho)
         else torch.as_tensor(float(rho), dtype=U.dtype, device=U.device)
     )
-    if U.device.type == "cuda" and U.dtype == torch.float64:
+    if (
+        U.device.type == "cuda"
+        and U.dtype == torch.float64
+        and U.ndim == 2
+        and int(U.shape[1]) > 1
+    ):
         return _complete_graph_isotropic_box_qp_cuda(
             U,
             h,
@@ -2311,28 +2316,91 @@ def _complete_graph_isotropic_box_qp_torch(
             q,
             max(int(max_iter), 16),
         )
-    return _complete_graph_isotropic_box_qp_impl(
-        U,
-        h,
-        lower,
-        upper,
-        rho_t,
-        q,
-        max(int(max_iter), 16),
+    if U.device.type == "cpu" and U.ndim == 2 and int(U.shape[1]) == 1:
+        exact = _complete_graph_scalar_box_qp_cpu(
+            U=U,
+            h=h,
+            lower=lower,
+            upper=upper,
+            rho_t=rho_t,
+            q=q,
+        )
+        if exact is not None:
+            return exact
+    return _complete_graph_isotropic_box_qp_bisection(
+        U=U,
+        h=h,
+        lower=lower,
+        upper=upper,
+        rho_t=rho_t,
+        q=q,
+        max_iter=max_iter,
     )
 
 
-def _complete_graph_isotropic_box_qp_impl(
+def _complete_graph_scalar_box_qp_cpu(
+    *,
     U: torch.Tensor,
     h: torch.Tensor,
     lower: torch.Tensor,
     upper: torch.Tensor,
     rho_t: torch.Tensor,
     q: torch.Tensor,
-    num_sweeps: int,
-) -> torch.Tensor:
-    """Tensor-only box-QP kernel suitable for CUDA graph compilation."""
+) -> torch.Tensor | None:
+    """Solve the one-region complete-graph box QP by its exact breakpoints."""
 
+    num_mutations = int(U.shape[0])
+    rhs = h * U + rho_t * q
+    denom = h + rho_t * float(num_mutations)
+    intercept = (rhs / denom)[:, 0]
+    slope = (rho_t / denom)[:, 0]
+    lower_scalar = lower[:, 0]
+    upper_scalar = upper[:, 0]
+    lower_break = (lower_scalar - intercept) / slope
+    upper_break = (upper_scalar - intercept) / slope
+    breakpoints = torch.cat((lower_break, upper_break))
+    delta_intercept = torch.cat(
+        (intercept - lower_scalar, upper_scalar - intercept)
+    )
+    delta_slope = torch.cat((slope, -slope))
+    order = torch.argsort(breakpoints, stable=True)
+    breakpoints = breakpoints[order]
+    piece_intercept = torch.sum(lower_scalar) + torch.cumsum(
+        delta_intercept[order], dim=0
+    )
+    piece_slope = -torch.ones((), dtype=U.dtype) + torch.cumsum(
+        delta_slope[order], dim=0
+    )
+    roots = -piece_intercept / piece_slope
+    next_breakpoints = torch.cat(
+        (
+            breakpoints[1:],
+            torch.full((1,), torch.inf, dtype=U.dtype),
+        )
+    )
+    valid = torch.isfinite(roots) & (roots >= breakpoints) & (
+        roots <= next_breakpoints
+    )
+    root_indices = torch.nonzero(valid, as_tuple=False)
+    if root_indices.numel() == 0:
+        return None
+    root = roots[root_indices[0, 0]]
+    return torch.minimum(
+        torch.maximum((rhs + rho_t * root) / denom, lower),
+        upper,
+    )
+
+
+def _complete_graph_isotropic_box_qp_bisection(
+    *,
+    U: torch.Tensor,
+    h: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    rho_t: torch.Tensor,
+    q: torch.Tensor,
+    max_iter: int,
+) -> torch.Tensor:
     num_mutations = int(U.shape[0])
     rhs = h * U + rho_t * q
     denom = h + rho_t * float(num_mutations)
@@ -2340,7 +2408,7 @@ def _complete_graph_isotropic_box_qp_impl(
     lo = torch.sum(lower, dim=0)
     hi = torch.sum(upper, dim=0)
     mid = 0.5 * (lo + hi)
-    for _ in range(num_sweeps):
+    for _ in range(max(int(max_iter), 16)):
         mid = 0.5 * (lo + hi)
         x_mid = torch.minimum(
             torch.maximum((rhs + rho_t * mid.unsqueeze(0)) / denom, lower),
@@ -2358,14 +2426,31 @@ def _complete_graph_isotropic_box_qp_impl(
     )
 
 
-# The bounded QP is called once per ADMM iteration. In eager CUDA mode its
-# short, dependent bisection sweeps produce thousands of tiny kernel launches
-# per fit. Inductor keeps the scalar rho device-backed (so different candidates
-# reuse one compiled graph) and fuses those sweeps. Compilation remains lazy.
-# CPU and lower-precision paths stay eager: float32 fusion can move the bounded
-# solution by enough to matter at the default optimization tolerance.
+def _complete_graph_isotropic_box_qp_compiled_impl(
+    U: torch.Tensor,
+    h: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    rho_t: torch.Tensor,
+    q: torch.Tensor,
+    max_iter: int,
+) -> torch.Tensor:
+    return _complete_graph_isotropic_box_qp_bisection(
+        U=U,
+        h=h,
+        lower=lower,
+        upper=upper,
+        rho_t=rho_t,
+        q=q,
+        max_iter=max_iter,
+    )
+
+
+# Multi-region path fits invoke this bounded QP many thousands of times.  A
+# shape-specific Inductor kernel amortizes compilation there, while the common
+# one-region workflow stays eager to avoid paying its cold-start cost.
 _compiled_complete_graph_isotropic_box_qp_cuda = torch.compile(
-    _complete_graph_isotropic_box_qp_impl,
+    _complete_graph_isotropic_box_qp_compiled_impl,
     fullgraph=True,
     dynamic=False,
 )
@@ -2373,11 +2458,9 @@ _cuda_box_qp_compile_failed = False
 
 
 def _complete_graph_isotropic_box_qp_cuda(*args) -> torch.Tensor:
-    """Run the compiled CUDA kernel, falling back only on compiler failures."""
-
     global _cuda_box_qp_compile_failed
     if _cuda_box_qp_compile_failed:
-        return _complete_graph_isotropic_box_qp_impl(*args)
+        return _complete_graph_isotropic_box_qp_compiled_impl(*args)
     try:
         return _compiled_complete_graph_isotropic_box_qp_cuda(*args)
     except Exception as exc:
@@ -2391,7 +2474,7 @@ def _complete_graph_isotropic_box_qp_cuda(*args) -> torch.Tensor:
             RuntimeWarning,
             stacklevel=2,
         )
-        return _complete_graph_isotropic_box_qp_impl(*args)
+        return _complete_graph_isotropic_box_qp_compiled_impl(*args)
 
 
 def _closed_form_box_fusion_result(
@@ -2530,8 +2613,9 @@ def _solve_majorized_subproblem_alm_dense_torch(
             edge_u=edge_u,
             edge_v=edge_v,
             num_nodes=int(phi.shape[0]),
+            prefer_cpu_bincount=True,
         )
-        del edge_diff, z_argument, z_norm, shrink, rhs_edge
+        del z_argument, z_norm, shrink, rhs_edge
         phi_new = _complete_graph_isotropic_box_qp_torch(
             U=U,
             h=h,
@@ -2555,6 +2639,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
                 edge_u=edge_u,
                 edge_v=edge_v,
                 num_nodes=int(phi.shape[0]),
+                prefer_cpu_bincount=True,
             )
             dual_norm = float(torch.linalg.norm(dual_residual_node).item())
             # Compare scale-free residuals.  Multiplying the whole objective by
@@ -2597,6 +2682,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
                 edge_u=edge_u,
                 edge_v=edge_v,
                 num_nodes=int(phi.shape[0]),
+                prefer_cpu_bincount=True,
             )
             grad_smooth, stationarity_residual = (
                 _complete_graph_admm_stationarity_components_torch(

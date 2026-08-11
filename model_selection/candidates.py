@@ -178,20 +178,25 @@ def _evaluate_candidate(
         raise RuntimeError(
             "Model-selection candidates require a resolved pairwise-fusion graph."
         )
-    bic_labels = cluster_labels_from_edges(
-        fit.phi,
-        edge_u=graph.edge_u,
-        edge_v=graph.edge_v,
-        tol=bic_partition_tol,
-    )
-    bic_partition_diameters, bic_partition_diameter_exact = (
-        cluster_diameters_from_edges(
+    if float(fit.summary_tol) == float(bic_partition_tol):
+        bic_labels = fit.cluster_labels
+        bic_partition_diameters = fit.cluster_diameters
+        bic_partition_diameter_exact = fit.cluster_diameter_exact
+    else:
+        bic_labels = cluster_labels_from_edges(
             fit.phi,
-            bic_labels,
             edge_u=graph.edge_u,
             edge_v=graph.edge_v,
+            tol=bic_partition_tol,
         )
-    )
+        bic_partition_diameters, bic_partition_diameter_exact = (
+            cluster_diameters_from_edges(
+                fit.phi,
+                bic_labels,
+                edge_u=graph.edge_u,
+                edge_v=graph.edge_v,
+            )
+        )
     bic_partition_max_diameter = _max_cluster_diameter(bic_partition_diameters)
     partition_hash = _partition_signature(bic_labels)
     bic_refit_cache_hit = False

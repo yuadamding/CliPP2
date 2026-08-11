@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .data import TumorData
+from .data import TumorData, compute_phi_init_from_counts
 from .path_compiler import (
     CompiledPathSet,
     LocalCopyNumberState,
@@ -689,6 +689,16 @@ def _build_tumor_data(
     dosage_prior_penalty: float,
     eps: float,
 ) -> TumorData:
+    # The categorical occupancy-path likelihood is needed only when the input
+    # actually contains subclonal copy number.  For entirely one-state input,
+    # retain CliPP2's historical major/minor likelihood: it has exactly the
+    # two biologically supported endpoint dosages and uses the substantially
+    # faster convex/legacy solver route.  Mixed one/two-state tumors continue
+    # to use the path model for every unit so that one coherent likelihood is
+    # optimized across regions.
+    uses_path_likelihood = any(
+        len(states) > 1 for _mode, states in validated.states_by_segment.values()
+    )
     mutation_ids = list(validated.mutation_ids)
     sample_ids = list(validated.sample_ids)
     mutation_index = {value: index for index, value in enumerate(mutation_ids)}
@@ -707,6 +717,7 @@ def _build_tumor_data(
     compiled_units: list[list[CompiledPathSet]] = [
         [CompiledPathSet((), (), ()) for _ in sample_ids] for _ in mutation_ids
     ]
+    compiled_by_segment: dict[tuple[str, str], CompiledPathSet] = {}
 
     for unit, rows in validated.rows_by_unit.items():
         mutation_id, sample_id = unit
@@ -735,15 +746,27 @@ def _build_tumor_data(
             reason = MORE_THAN_TWO_STATES
             detail = f"observed {len(states)} distinct positive local CN states"
             compiled = CompiledPathSet((), (), ())
-        else:
-            compiled = compile_single_switch_paths(
-                states,
-                allele_mode=mode,
-                dosage_prior_penalty=dosage_prior_penalty,
-            )
+        elif not any(
+            state.allele_a_cn > 0 or state.allele_b_cn > 0 for state in states
+        ):
+            reason = NO_POSITIVE_PATH
+            detail = "no positive mutant-copy dosage path exists"
+            compiled = CompiledPathSet((), (), ())
+        elif uses_path_likelihood:
+            segment_key = (sample_id, row["segment_id"])
+            compiled = compiled_by_segment.get(segment_key)
+            if compiled is None:
+                compiled = compile_single_switch_paths(
+                    states,
+                    allele_mode=mode,
+                    dosage_prior_penalty=dosage_prior_penalty,
+                )
+                compiled_by_segment[segment_key] = compiled
             if not compiled.paths:
                 reason = NO_POSITIVE_PATH
                 detail = "no positive mutant-copy dosage path exists"
+        else:
+            compiled = CompiledPathSet((), (), ())
         if reason is not None:
             if unsupported_policy == "error":
                 raise UnsupportedTumorInputError(
@@ -770,14 +793,23 @@ def _build_tumor_data(
             "copy-number denominator."
         )
     scaling = purity / denominator
-    path_likelihood, _ = build_path_likelihood(
-        compiled_units,
-        model_id=TUMOR_TXT_MODEL_ID,
-        model_version=TUMOR_TXT_MODEL_VERSION,
-        candidate_generator_version=TUMOR_TXT_CANDIDATE_GENERATOR_VERSION,
-        prior_mode=path_prior_mode(dosage_prior_penalty),
-    )
-
+    if uses_path_likelihood:
+        path_likelihood, _ = build_path_likelihood(
+            compiled_units,
+            model_id=TUMOR_TXT_MODEL_ID,
+            model_version=TUMOR_TXT_MODEL_VERSION,
+            candidate_generator_version=TUMOR_TXT_CANDIDATE_GENERATOR_VERSION,
+            prior_mode=path_prior_mode(dosage_prior_penalty),
+        )
+        phi_upper = np.ones(shape, dtype=np.float64)
+    else:
+        path_likelihood = None
+        max_prob_scale = np.maximum(scaling * major_cn, scaling * minor_cn)
+        phi_upper = np.minimum(
+            1.0,
+            (1.0 - eps) / np.clip(max_prob_scale, eps, None),
+        )
+        phi_upper = np.clip(phi_upper, eps, 1.0)
     data = TumorData(
         tumor_id=validated.metadata["tumor_id"],
         mutation_ids=mutation_ids,
@@ -790,21 +822,36 @@ def _build_tumor_data(
         normal_cn=normal_cn,
         has_cna=has_cna,
         scaling=scaling,
-        phi_upper=np.ones(shape, dtype=np.float64),
+        phi_upper=phi_upper,
         phi_init=np.full(shape, 0.5, dtype=np.float64),
         init_major_mask=np.zeros(shape, dtype=bool),
         count_observed=count_observed,
         path_likelihood=path_likelihood,
-        path_reporting_fingerprint=_reporting_fingerprint(
-            validated.metadata,
-            validated.optional_columns,
-            validated.source_rows,
+        path_reporting_fingerprint=(
+            _reporting_fingerprint(
+                validated.metadata,
+                validated.optional_columns,
+                validated.source_rows,
+            )
+            if uses_path_likelihood
+            else None
         ),
         path_unsupported_reason=unsupported_reason,
         mean_tumor_total_cn=mean_total_cn,
     )
 
-    data.phi_init = initialize_path_marginal_phi(data, eps=eps)
+    if uses_path_likelihood:
+        data.phi_init = initialize_path_marginal_phi(data, eps=eps)
+    else:
+        data.phi_init, data.init_major_mask = compute_phi_init_from_counts(
+            alt_counts=data.alt_counts,
+            total_counts=data.total_counts,
+            scaling=data.scaling,
+            major_cn=data.major_cn,
+            minor_cn=data.minor_cn,
+            phi_upper=data.phi_upper,
+            eps=eps,
+        )
     return data
 
 

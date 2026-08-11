@@ -108,10 +108,11 @@ def generate_partition_initializer_pool(
             torch_data=torch_data,
             device=runtime.device,
             dtype=runtime.dtype,
-            # The clonal-anchored numpy refit is the single scoring authority;
-            # the torch CEM refinement would rank guides with unanchored
-            # logliks against the anchored degrees of freedom.
-            use_torch=False,
+            # The clonal-anchored NumPy refit remains the scoring authority for
+            # categorical occupancy paths.  Entirely one-state inputs retain
+            # the historical Torch major/minor refit, which has the same
+            # objective and avoids the serial path-refit overhead.
+            use_torch=getattr(data, "path_likelihood", None) is None,
             classification_weight_alpha=(
                 float(PARTITION_ICL_DIRICHLET_ALPHA)
                 if normalized_score == "partition_icl"

@@ -135,6 +135,31 @@ def _cluster_labels(
     if edge_u.size == 0:
         return np.arange(num_mutations, dtype=np.int64)
 
+    # For a complete graph with one region, threshold-connected components are
+    # exactly the runs obtained after sorting phi and splitting at adjacent
+    # gaps larger than tol.  This avoids scanning O(M^2) edges and, more
+    # importantly, avoids one Python union/find operation per fused edge.  Map
+    # the runs back to the historical first-mutation label order so serialized
+    # outputs remain stable as well as the underlying partition.
+    expected_complete_edges = num_mutations * (num_mutations - 1) // 2
+    if phi.ndim == 2 and phi.shape[1] == 1 and edge_u.size == expected_complete_edges:
+        order = np.argsort(phi[:, 0], kind="stable")
+        sorted_phi = phi[order, 0]
+        sorted_groups = np.zeros(num_mutations, dtype=np.int64)
+        if num_mutations > 1:
+            sorted_groups[1:] = np.cumsum(
+                np.abs(np.diff(sorted_phi)) > float(tol), dtype=np.int64
+            )
+        n_groups = int(sorted_groups[-1]) + 1
+        first_mutation = np.full(n_groups, num_mutations, dtype=np.int64)
+        np.minimum.at(first_mutation, sorted_groups, order)
+        group_order = np.argsort(first_mutation, kind="stable")
+        group_to_label = np.empty(n_groups, dtype=np.int64)
+        group_to_label[group_order] = np.arange(n_groups, dtype=np.int64)
+        labels = np.empty(num_mutations, dtype=np.int64)
+        labels[order] = group_to_label[sorted_groups]
+        return labels
+
     fused = np.linalg.norm(phi[edge_u] - phi[edge_v], axis=1) <= float(tol)
     if not np.any(fused):
         return np.arange(num_mutations, dtype=np.int64)
@@ -191,6 +216,14 @@ def cluster_diameters_from_edges(
     expected_complete_edges = n_rows * (n_rows - 1) // 2
     cluster_sizes = np.bincount(labels, minlength=n_clusters)
     exact = bool(edge_u.size == expected_complete_edges or np.all(cluster_sizes <= 1))
+    if phi.ndim == 2 and phi.shape[1] == 1 and edge_u.size == expected_complete_edges:
+        minima = np.full(n_clusters, np.inf, dtype=np.float64)
+        maxima = np.full(n_clusters, -np.inf, dtype=np.float64)
+        scalar_phi = phi[:, 0].astype(np.float64, copy=False)
+        np.minimum.at(minima, labels, scalar_phi)
+        np.maximum.at(maxima, labels, scalar_phi)
+        diameters = maxima - minima
+        return diameters, True
     if edge_u.size == 0 or edge_v.size == 0:
         return diameters, exact
     same_cluster = labels[edge_u] == labels[edge_v]

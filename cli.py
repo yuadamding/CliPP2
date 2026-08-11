@@ -40,7 +40,14 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         "--unsupported-policy", choices=["error", "mask"], default="error"
     )
     parser.add_argument(
-        "--dosage-prior-penalty", type=float, default=DEFAULT_DOSAGE_PRIOR_PENALTY
+        "--dosage-prior-penalty",
+        type=float,
+        default=DEFAULT_DOSAGE_PRIOR_PENALTY,
+        help=(
+            "Fixed phi-independent penalty alpha on endpoint mutant-copy mass. "
+            "This applies only when at least one locus contains subclonal copy "
+            "number."
+        ),
     )
     parser.add_argument("--outer-max-iter", type=int, default=8)
     parser.add_argument("--inner-max-iter", type=int, default=30)

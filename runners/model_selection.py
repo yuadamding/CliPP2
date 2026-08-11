@@ -1022,10 +1022,13 @@ def _partition_guided_admm_selection(
         raise ValueError(
             "partition_guided_admm CPU fallback changed the complete fusion graph."
         )
-    guided_initialization = replace(
-        guided_initialization,
-        solver_state=_offload_solver_state_to_cpu(guided_initialization.solver_state),
-    )
+    if runtime.device.type != "cuda":
+        guided_initialization = replace(
+            guided_initialization,
+            solver_state=_offload_solver_state_to_cpu(
+                guided_initialization.solver_state
+            ),
+        )
     prepare_elapsed_seconds = float(perf_counter() - prepare_start_time)
 
     controller = OnlineLambdaController(
@@ -1059,6 +1062,7 @@ def _partition_guided_admm_selection(
     guide_matrix_hash = _pilot_matrix_hash(guide_phi)
     next_step = 0
     terminal_stop_reason: str | None = None
+    retained_cuda_fit: FitResult | None = None
 
     while True:
         proposal = controller.propose()
@@ -1130,6 +1134,20 @@ def _partition_guided_admm_selection(
             solver_state_start = guided_initialization.solver_state
             lambda_start_source = "guided_kkt_fallback"
             lambda_start_value = float(guided_initialization.lambda_value)
+
+        # Retain at most the most recently produced CUDA state.  If it is the
+        # requested warm start, the next fit consumes it directly on device;
+        # otherwise offload it before allocating the new candidate.  This
+        # bounds accelerator memory while eliminating the unconditional
+        # D2H/H2D round trip between consecutive candidates.
+        if (
+            retained_cuda_fit is not None
+            and solver_state_start is not retained_cuda_fit.solver_state
+        ):
+            retained_cuda_fit.solver_state = _offload_solver_state_to_cpu(
+                retained_cuda_fit.solver_state
+            )
+            retained_cuda_fit = None
 
         candidate_fit_options = effective_fit_options
         if proposal.phase == "solver_recovery":
@@ -1207,7 +1225,21 @@ def _partition_guided_admm_selection(
             bic_refit_cache=bic_refit_cache,
             static_metadata=static_metadata,
         )
-        fit.solver_state = _offload_solver_state_to_cpu(fit.solver_state)
+        if runtime.device.type == "cuda":
+            if retained_cuda_fit is not None:
+                retained_cuda_fit.solver_state = _offload_solver_state_to_cpu(
+                    retained_cuda_fit.solver_state
+                )
+            retained_cuda_fit = fit
+            if guided_initialization.solver_state is not None:
+                guided_initialization = replace(
+                    guided_initialization,
+                    solver_state=_offload_solver_state_to_cpu(
+                        guided_initialization.solver_state
+                    ),
+                )
+        else:
+            fit.solver_state = _offload_solver_state_to_cpu(fit.solver_state)
 
         row.update(
             {
@@ -1328,6 +1360,10 @@ def _partition_guided_admm_selection(
             )
         )
         next_step += 1
+    if retained_cuda_fit is not None:
+        retained_cuda_fit.solver_state = _offload_solver_state_to_cpu(
+            retained_cuda_fit.solver_state
+        )
     if not result_entries:
         raise RuntimeError(
             f"No guided ADMM candidates were evaluated for tumor {data.tumor_id}."
