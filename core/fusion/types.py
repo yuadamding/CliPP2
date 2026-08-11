@@ -30,6 +30,10 @@ class ExactSolverResourceLimit(MemoryError):
     """No configured exact backend can fit or fallback under its resource policy."""
 
 
+class InfeasibleRawClonalAnchor(ValueError):
+    """A requested hard CCF anchor lies outside a mutation's support."""
+
+
 @dataclass(frozen=True, slots=True)
 class WorksetMemoryOptions:
     max_workset_bytes: int = DEFAULT_WORKSET_MAX_BYTES
@@ -451,6 +455,11 @@ class SolverContext:
     graph_hash: str = ""
     objective_spec_hash: str = ""
     resource_fallback: str | None = None
+    clonal_anchor_mutation_index: int | None = None
+    clonal_anchor_target: torch.Tensor | None = None
+    clonal_anchor_source: str = "none"
+    clonal_anchor_mode: str = "none"
+    clonal_anchor_feasibility_tolerance: float = 0.0
 
 
 @dataclass(slots=True)
@@ -461,6 +470,7 @@ class SolverState:
     warm_state: BackendWarmState | None = None
     certificate: GraphFusionCertificate | None = None
     quotient_failure: QuotientFailureProvenance | None = None
+    objective_spec_hash: str = ""
 
 
 @dataclass(frozen=True, slots=True)

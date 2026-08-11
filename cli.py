@@ -66,7 +66,32 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         "--selection-anchor",
         choices=["clonal-required", "none"],
         default="clonal-required",
+        help=(
+            "Clonal-required fixes one deterministically selected mutation at "
+            "its feasible clonal CCF in the raw fusion objective; none leaves "
+            "all raw CCF coordinates free."
+        ),
     )
+    parser.add_argument(
+        "--raw-clonal-anchor-mode",
+        choices=["none", "specified-seed", "enumerated-seed", "screened-seed"],
+        default="screened-seed",
+        help=(
+            "Hard CCF=1 raw-anchor search: specified seed, complete enumeration, "
+            "or an explicitly incomplete deviance-screened candidate set."
+        ),
+    )
+    parser.add_argument(
+        "--raw-clonal-anchor-mutation",
+        action="append",
+        default=[],
+        help="Retained mutation ID for specified-seed mode (exactly one).",
+    )
+    parser.add_argument("--raw-clonal-anchor-target", type=float, default=1.0)
+    parser.add_argument(
+        "--raw-clonal-anchor-feasibility-tol", type=float, default=1e-8
+    )
+    parser.add_argument("--raw-clonal-anchor-candidate-max", type=int, default=8)
     parser.add_argument("--disable-warm-start", action="store_true")
     parser.add_argument("--major-prior", type=float, default=0.5)
     parser.add_argument(
@@ -182,6 +207,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 f"--selection-score {args.selection_score} requires "
                 f"--selection-anchor {expected_anchor}"
             )
+        raw_anchor_mode = str(args.raw_clonal_anchor_mode)
+        expected_raw_anchor = expected_anchor == "clonal-required"
+        if expected_raw_anchor == (raw_anchor_mode == "none"):
+            parser.error(
+                "clonal-fixed-partition-bic requires a non-none raw clonal "
+                "anchor mode; fixed-partition-bic requires mode none"
+            )
+        if raw_anchor_mode == "specified-seed" and len(
+            args.raw_clonal_anchor_mutation
+        ) != 1:
+            parser.error("specified-seed requires exactly one anchor mutation")
+        if raw_anchor_mode != "specified-seed" and args.raw_clonal_anchor_mutation:
+            parser.error("anchor mutation IDs apply only to specified-seed mode")
+        if float(args.raw_clonal_anchor_target) != 1.0:
+            parser.error("production raw clonal-anchor target must equal 1")
+        if (
+            not math.isfinite(float(args.raw_clonal_anchor_feasibility_tol))
+            or float(args.raw_clonal_anchor_feasibility_tol) < 0.0
+        ):
+            parser.error("raw clonal-anchor feasibility tolerance must be nonnegative")
+        if raw_anchor_mode == "screened-seed" and int(
+            args.raw_clonal_anchor_candidate_max
+        ) < 1:
+            parser.error("screened-seed candidate maximum must be positive")
     return args
 
 
@@ -194,6 +243,11 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         summary_tol=args.summary_tol,
         selection_score=args.selection_score.replace("-", "_"),
         selection_anchor=args.selection_anchor.replace("-", "_"),
+        raw_clonal_anchor_mode=args.raw_clonal_anchor_mode.replace("-", "_"),
+        raw_clonal_anchor_mutation_ids=tuple(args.raw_clonal_anchor_mutation),
+        raw_clonal_anchor_target=args.raw_clonal_anchor_target,
+        raw_clonal_anchor_feasibility_tol=args.raw_clonal_anchor_feasibility_tol,
+        raw_clonal_anchor_candidate_max=args.raw_clonal_anchor_candidate_max,
         selection_partition_tol=args.selection_partition_tol,
         selection_refit_tol=args.selection_refit_tol,
         selection_refit_max_iter=args.selection_refit_max_iter,

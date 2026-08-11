@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, replace
 from time import perf_counter
 
@@ -56,6 +57,53 @@ def validate_candidate_identity(candidate: RawFusionCandidate) -> None:
         raise AssertionError("Refit partition signature does not match raw partition.")
     if score.partition_signature != partition.signature:
         raise AssertionError("Selection score does not match raw partition.")
+    if score.name == "clonal_fixed_partition_bic":
+        anchor_index = candidate.raw_fit.raw_clonal_anchor_mutation_index
+        anchor_target = candidate.raw_fit.raw_clonal_anchor_target
+        if anchor_index is None or anchor_target is None:
+            raise AssertionError("Clonal BIC requires an explicit raw-fusion anchor.")
+        anchor_index = int(anchor_index)
+        if not 0 <= anchor_index < int(partition.labels.size):
+            raise AssertionError("Raw-fusion anchor mutation index is invalid.")
+        if str(candidate.raw_fit.raw_clonal_anchor_source) == "none":
+            raise AssertionError("Raw-fusion anchor provenance is missing.")
+        raw_anchor_cluster = int(partition.labels[anchor_index])
+        if refit.clonal_cluster != raw_anchor_cluster:
+            raise AssertionError(
+                "Fixed-partition refit did not preserve the raw anchor cluster."
+            )
+        if refit.fixed_anchor_target is None or not np.allclose(
+            np.asarray(refit.cluster_centers)[raw_anchor_cluster],
+            np.asarray(anchor_target, dtype=np.float64),
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise AssertionError("Fixed-partition refit changed the raw anchor target.")
+        expected_anchor_signature = _anchor_block_signature(
+            partition.labels, raw_anchor_cluster
+        )
+        if score.anchor_block_signature != expected_anchor_signature:
+            raise AssertionError("Score anchor block differs from the raw anchor block.")
+        if candidate.anchor_seed_index != anchor_index:
+            raise AssertionError("Candidate anchor seed differs from its raw fit.")
+        if candidate.anchor_cluster_label != raw_anchor_cluster:
+            raise AssertionError("Candidate anchor cluster differs from its partition.")
+        if candidate.anchor_block_signature != expected_anchor_signature:
+            raise AssertionError("Candidate anchor-block signature is inconsistent.")
+        if candidate.anchor_target is None or not np.array_equal(
+            np.asarray(candidate.anchor_target), np.asarray(anchor_target)
+        ):
+            raise AssertionError("Candidate anchor target differs from its raw fit.")
+        raw_anchor_phi = np.asarray(candidate.raw_fit.phi, dtype=np.float64)[
+            anchor_index
+        ]
+        if not np.allclose(
+            raw_anchor_phi,
+            np.asarray(anchor_target, dtype=np.float64),
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise AssertionError("Raw-fusion anchor is not at its fixed target.")
     score_tolerance = 1e-10 * (1.0 + abs(float(score.value)))
     if not np.isclose(
         float(score.loglik),
@@ -92,6 +140,8 @@ def _ineligibility_reason(
     refit_finite: bool,
     refit_numerically_resolved: bool,
     score_finite: bool,
+    raw_clonal_anchor_certified: bool,
+    raw_anchor_search_resolved: bool,
 ) -> str:
     if float(fit.lambda_value) <= 0.0:
         return "nonpositive_lambda"
@@ -101,6 +151,10 @@ def _ineligibility_reason(
         return "raw_objective_not_faithful"
     if not bool(fit.full_kkt_certified) or not bool(fit.selection_eligible):
         return "raw_objective_not_kkt_certified"
+    if not raw_clonal_anchor_certified:
+        return "raw_clonal_anchor_not_certified"
+    if not raw_anchor_search_resolved:
+        return "raw_clonal_anchor_search_unresolved"
     if not partition.certified:
         return str(partition.certification_failure_reason)
     if not refit_finite:
@@ -129,15 +183,31 @@ def _likelihood_model_id(data: TumorData) -> str:
     )
 
 
+def _anchor_block_signature(labels: np.ndarray, cluster: int | None) -> str:
+    if cluster is None:
+        return "none"
+    mask = np.asarray(labels, dtype=np.int64).reshape(-1) == int(cluster)
+    digest = hashlib.sha256(np.ascontiguousarray(mask).tobytes()).hexdigest()[:24]
+    return f"{int(np.count_nonzero(mask))}:{digest}"
+
+
 def _selection_refit_cache_key(
     *,
     data: TumorData,
     partition: FusionPartition,
     selection_options: FitOptions,
+    raw_anchor_cluster: int | None = None,
+    raw_anchor_target: np.ndarray | None = None,
 ) -> tuple[object, ...]:
     return (
         partition.signature,
         str(selection_options.selection_anchor),
+        None if raw_anchor_cluster is None else int(raw_anchor_cluster),
+        (
+            None
+            if raw_anchor_target is None
+            else tuple(float(value) for value in np.asarray(raw_anchor_target).reshape(-1))
+        ),
         float(selection_options.major_prior),
         float(selection_options.eps),
         float(selection_options.selection_refit_tol),
@@ -153,11 +223,15 @@ def _fixed_partition_refit(
     partition: FusionPartition,
     selection_options: FitOptions,
     cache: dict[object, _CachedPartitionRefit] | None,
+    raw_anchor_cluster: int | None = None,
+    raw_anchor_target: np.ndarray | None = None,
 ) -> tuple[_CachedPartitionRefit, bool]:
     refit_spec_key = _selection_refit_cache_key(
         data=data,
         partition=partition,
         selection_options=selection_options,
+        raw_anchor_cluster=raw_anchor_cluster,
+        raw_anchor_target=raw_anchor_target,
     )
     if cache is not None and refit_spec_key in cache:
         return cache[refit_spec_key], True
@@ -168,6 +242,11 @@ def _fixed_partition_refit(
         tol=float(selection_options.selection_refit_tol),
         max_iter=int(selection_options.selection_refit_max_iter),
         anchor_mode=str(selection_options.selection_anchor),
+        anchor_cluster=raw_anchor_cluster,
+        fixed_anchor_target=raw_anchor_target,
+        anchor_feasibility_tol=float(
+            selection_options.raw_clonal_anchor_feasibility_tol
+        ),
     )
     coarse = partition_constrained_observed_refit(
         data,
@@ -263,6 +342,11 @@ def _build_refit_summary(
         refit_min_best_second_loss_gap=float(
             refit.refit_min_best_second_loss_gap
         ),
+        fixed_anchor_target=(
+            None
+            if refit.fixed_anchor_target is None
+            else np.asarray(refit.fixed_anchor_target, dtype=np.float64).copy()
+        ),
     )
 
 
@@ -316,6 +400,8 @@ def _evaluate_candidate(
     selection_score: str,
     static_metadata: CandidateStaticMetadata,
     bic_refit_cache: dict[object, _CachedPartitionRefit] | None = None,
+    precomputed_fit: FitResult | None = None,
+    raw_anchor_search_resolved: bool = True,
 ) -> tuple[
     FitResult,
     dict[str, float | int | str | bool],
@@ -329,20 +415,26 @@ def _evaluate_candidate(
     selection_options = fit_options
 
     raw_fit_start_time = perf_counter()
-    fit = fit_fixed_objective(
-        data=data,
-        options=replace(raw_fit_options, lambda_value=float(lambda_value)),
-        phi_start=phi_start,
-        exact_pilot=exact_pilot,
-        pooled_start=pooled_start,
-        scalar_well_starts=scalar_well_starts,
-        start_mode=start_mode,
-        runtime=runtime,
-        torch_data=torch_data,
-        solver_context=solver_context,
-        solver_state=solver_state,
-        compute_summary=compute_summary,
-    )
+    fit = precomputed_fit
+    if fit is None:
+        fit = fit_fixed_objective(
+            data=data,
+            options=replace(raw_fit_options, lambda_value=float(lambda_value)),
+            phi_start=phi_start,
+            exact_pilot=exact_pilot,
+            pooled_start=pooled_start,
+            scalar_well_starts=scalar_well_starts,
+            start_mode=start_mode,
+            runtime=runtime,
+            torch_data=torch_data,
+            solver_context=solver_context,
+            solver_state=solver_state,
+            compute_summary=compute_summary,
+        )
+    elif not np.isclose(
+        float(fit.lambda_value), float(lambda_value), rtol=0.0, atol=1e-12
+    ):
+        raise ValueError("Precomputed raw fit has the wrong lambda value.")
     raw_fit_elapsed_seconds = float(perf_counter() - raw_fit_start_time)
     graph = selection_options.graph
     if graph is None:
@@ -356,24 +448,54 @@ def _evaluate_candidate(
         tolerance=partition_tolerance,
     )
 
+    anchor_required = (
+        str(selection_options.selection_anchor).strip().lower()
+        == "clonal_required"
+    )
+    raw_anchor_index = fit.raw_clonal_anchor_mutation_index
+    raw_anchor_target = fit.raw_clonal_anchor_target
+    raw_anchor_cluster: int | None = None
+    raw_clonal_anchor_certified = not anchor_required
+    if anchor_required and raw_anchor_index is not None and raw_anchor_target is not None:
+        raw_anchor_index = int(raw_anchor_index)
+        if 0 <= raw_anchor_index < int(data.num_mutations):
+            raw_anchor_cluster = int(partition.labels[raw_anchor_index])
+            raw_clonal_anchor_certified = bool(
+                str(fit.raw_clonal_anchor_source) != "none"
+                and np.allclose(
+                    np.asarray(fit.phi, dtype=np.float64)[raw_anchor_index],
+                    np.asarray(raw_anchor_target, dtype=np.float64),
+                    rtol=0.0,
+                    atol=max(5.0 * float(raw_fit_options.tol), 1e-12),
+                )
+            )
+
     refit_start_time = perf_counter()
     cached_refit, cache_hit = _fixed_partition_refit(
         data=data,
         partition=partition,
         selection_options=selection_options,
         cache=bic_refit_cache,
+        raw_anchor_cluster=raw_anchor_cluster,
+        raw_anchor_target=raw_anchor_target,
     )
     refit_result = cached_refit.result
     refit_elapsed_seconds = (
         0.0 if cache_hit else float(perf_counter() - refit_start_time)
     )
 
+    anchor_block_signature = _anchor_block_signature(
+        partition.labels, raw_anchor_cluster
+    )
     score = fixed_partition_bic(
         loglik=float(refit_result.loglik),
         num_clusters=int(partition.n_clusters),
         data=data,
         anchor_mode=str(selection_options.selection_anchor),
         partition_signature=partition.signature,
+        anchor_block_signature=anchor_block_signature,
+        labels=partition.labels,
+        anchor_cluster=raw_anchor_cluster,
     )
     if str(score.name) != canonical_score_name:
         raise AssertionError(
@@ -398,6 +520,8 @@ def _evaluate_candidate(
         refit_finite=bool(refit.finite_candidate_found),
         refit_numerically_resolved=bool(refit.refit_numerically_resolved),
         score_finite=bool(np.isfinite(score.value)),
+        raw_clonal_anchor_certified=bool(raw_clonal_anchor_certified),
+        raw_anchor_search_resolved=bool(raw_anchor_search_resolved),
     )
     candidate = RawFusionCandidate(
         raw_fit=fit,
@@ -407,6 +531,22 @@ def _evaluate_candidate(
         raw_objective_certified=raw_objective_certified,
         eligible_for_selection=reason == "none",
         ineligibility_reason=reason,
+        anchor_seed_index=(
+            None if raw_anchor_index is None else int(raw_anchor_index)
+        ),
+        anchor_seed_mutation_id=(
+            "none"
+            if raw_anchor_index is None
+            else str(data.mutation_ids[int(raw_anchor_index)])
+        ),
+        anchor_cluster_label=raw_anchor_cluster,
+        anchor_block_signature=str(anchor_block_signature),
+        anchor_target=(
+            None
+            if raw_anchor_target is None
+            else np.asarray(raw_anchor_target, dtype=np.float64).copy()
+        ),
+        anchor_search_complete=bool(fit.raw_clonal_anchor_search_complete),
     )
     validate_candidate_identity(candidate)
 
@@ -490,6 +630,10 @@ def _evaluate_candidate(
             refit.second_best_anchor_deviance_increase
         ),
         "partition_signature": str(partition.signature),
+        "anchor_block_signature": str(anchor_block_signature),
+        "selection_model_signature": (
+            f"{partition.signature}|anchor:{anchor_block_signature}"
+        ),
         "partition_hash": str(partition.signature),
         "partition_source": str(partition.source),
         "partition_tol": float(partition.tolerance),
@@ -516,6 +660,81 @@ def _evaluate_candidate(
         "ineligibility_reason": str(candidate.ineligibility_reason),
         "raw_kkt_eligible": bool(fit.selection_eligible),
         "raw_objective_certified": bool(raw_objective_certified),
+        "raw_clonal_anchor_required": bool(anchor_required),
+        "raw_clonal_anchor_certified": bool(raw_clonal_anchor_certified),
+        "raw_clonal_anchor_mutation_index": (
+            -1 if raw_anchor_index is None else int(raw_anchor_index)
+        ),
+        "raw_clonal_anchor_mutation_id": (
+            "none"
+            if raw_anchor_index is None
+            else str(data.mutation_ids[int(raw_anchor_index)])
+        ),
+        "raw_clonal_anchor_cluster": (
+            -1 if raw_anchor_cluster is None else int(raw_anchor_cluster)
+        ),
+        "raw_clonal_anchor_target": (
+            "none"
+            if raw_anchor_target is None
+            else ",".join(
+                format(float(value), ".17g")
+                for value in np.asarray(raw_anchor_target).reshape(-1)
+            )
+        ),
+        "raw_clonal_anchor_source": str(fit.raw_clonal_anchor_source),
+        "raw_anchor_seed_index": (
+            -1 if raw_anchor_index is None else int(raw_anchor_index)
+        ),
+        "raw_anchor_seed_mutation_id": (
+            "none"
+            if raw_anchor_index is None
+            else str(data.mutation_ids[int(raw_anchor_index)])
+        ),
+        "raw_anchor_target": (
+            "none"
+            if raw_anchor_target is None
+            else ",".join(
+                format(float(value), ".17g")
+                for value in np.asarray(raw_anchor_target).reshape(-1)
+            )
+        ),
+        "raw_anchor_constraint_residual": float(
+            fit.raw_clonal_anchor_constraint_residual
+        ),
+        "raw_anchor_search_complete": bool(fit.raw_clonal_anchor_search_complete),
+        "raw_anchor_candidates_evaluated": int(
+            fit.raw_clonal_anchor_candidates_evaluated
+        ),
+        "raw_anchor_objective_rank": int(fit.raw_clonal_anchor_objective_rank),
+        "raw_anchor_objective_gap_to_second": float(
+            fit.raw_clonal_anchor_objective_gap_to_second
+        ),
+        "raw_clonal_anchor_mode": str(fit.raw_clonal_anchor_mode),
+        "raw_clonal_anchor_constraint_residual": float(
+            fit.raw_clonal_anchor_constraint_residual
+        ),
+        "raw_clonal_anchor_frozen_coordinate_count": int(
+            fit.raw_clonal_anchor_frozen_coordinate_count
+        ),
+        "raw_clonal_anchor_search_complete": bool(
+            fit.raw_clonal_anchor_search_complete
+        ),
+        "raw_clonal_anchor_search_resolved": bool(raw_anchor_search_resolved),
+        "raw_clonal_anchor_total_eligible_candidates": int(
+            fit.raw_clonal_anchor_total_eligible_candidates
+        ),
+        "raw_clonal_anchor_candidates_evaluated": int(
+            fit.raw_clonal_anchor_candidates_evaluated
+        ),
+        "raw_clonal_anchor_objective_rank": int(
+            fit.raw_clonal_anchor_objective_rank
+        ),
+        "raw_clonal_anchor_objective_gap_to_second": float(
+            fit.raw_clonal_anchor_objective_gap_to_second
+        ),
+        "raw_clonal_anchor_screening_rule": str(
+            fit.raw_clonal_anchor_screening_rule
+        ),
         "converged": bool(fit.converged),
         "raw_fit_status": str(fit.failure_reason),
         "loglik": float(fit.loglik),
@@ -562,6 +781,7 @@ def _evaluate_candidate(
         "full_kkt_certificate_status": str(fit.full_kkt_certificate_status),
         "full_kkt_tolerance": float(fit.full_kkt_tolerance),
         "outer_kkt_certificate_status": str(fit.outer_kkt_certificate_status),
+        "outer_num_frozen_coordinates": int(fit.outer_num_frozen_coordinates),
         "mm_consistency_violations": int(fit.mm_consistency_violations),
         "failure_reason": str(fit.failure_reason),
         "candidate_elapsed_seconds": float(perf_counter() - candidate_start_time),

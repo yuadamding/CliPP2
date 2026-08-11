@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from time import perf_counter
 
 import numpy as np
 import pandas as pd
 import torch
 
-from ..core.model import FitOptions, FitResult
+from ..core.model import FitOptions, FitResult, RawClonalAnchorSpec, fit_fixed_objective
 from ..core.fusion.defaults import (
     normalize_dense_fallback_policy,
     normalize_inner_backend,
@@ -29,7 +29,7 @@ from ..core.fusion.solver import (
     torch_data_from_context,
     uses_nonconvex_path_likelihood,
 )
-from ..core.fusion.torch_backend import dtype_name
+from ..core.fusion.torch_backend import dtype_name, mutation_region_terms_torch
 from ..core.fusion.types import (
     CompressedEdgeCertificate,
     DenseEdgeCertificate,
@@ -114,6 +114,169 @@ class NoEligibleModelSelectionCandidatesError(RuntimeError):
             f"No candidates were eligible for model selection for tumor "
             f"{self.tumor_id}."
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _RawClonalAnchorSearch:
+    spec: RawClonalAnchorSpec
+    total_eligible_candidates: int
+    search_complete: bool
+    screening_rule: str
+    deviance_by_index: dict[int, float]
+    lower_bound_by_index: dict[int, float]
+
+
+@torch.no_grad()
+def _build_raw_clonal_anchor_search(
+    data: TumorData,
+    context: SolverContext,
+    *,
+    fit_options: FitOptions,
+) -> _RawClonalAnchorSearch:
+    """Build the explicit hard-anchor seed set before the lambda path."""
+
+    mode = str(fit_options.raw_clonal_anchor_mode).strip().lower()
+    valid_modes = {"none", "specified_seed", "enumerated_seed", "screened_seed"}
+    if mode not in valid_modes:
+        raise ValueError(
+            "raw_clonal_anchor_mode must be none, specified_seed, "
+            "enumerated_seed, or screened_seed."
+        )
+    target = np.full(
+        int(data.num_regions),
+        float(fit_options.raw_clonal_anchor_target),
+        dtype=np.float64,
+    )
+    feasibility_tolerance = float(fit_options.raw_clonal_anchor_feasibility_tol)
+    if not np.all(np.isfinite(target)) or not np.all(target == 1.0):
+        raise ValueError("Production raw clonal anchors require target CCF exactly 1.")
+    if not np.isfinite(feasibility_tolerance) or feasibility_tolerance < 0.0:
+        raise ValueError("Raw clonal-anchor feasibility tolerance must be nonnegative.")
+    upper = context.upper.detach().cpu().numpy()
+    eligible = np.flatnonzero(
+        np.all(target[None, :] <= upper + feasibility_tolerance, axis=1)
+    ).astype(np.int64)
+    if mode == "none":
+        return _RawClonalAnchorSearch(
+            spec=RawClonalAnchorSpec(
+                mode="none",
+                target=target,
+                candidate_mutation_indices=(),
+                feasibility_tolerance=feasibility_tolerance,
+            ),
+            total_eligible_candidates=int(eligible.size),
+            search_complete=True,
+            screening_rule="none",
+            deviance_by_index={},
+            lower_bound_by_index={},
+        )
+    if eligible.size == 0:
+        raise RuntimeError("no_feasible_raw_clonal_anchor")
+    torch_data = torch_data_from_context(context)
+    free_phi = context.exact_pilot
+    target_tensor = torch.as_tensor(
+        target, dtype=free_phi.dtype, device=free_phi.device
+    ).expand_as(free_phi)
+    free_terms = mutation_region_terms_torch(
+        torch_data,
+        free_phi,
+        major_prior=float(fit_options.major_prior),
+        eps=float(fit_options.eps),
+    )
+    anchored_terms = mutation_region_terms_torch(
+        torch_data,
+        target_tensor,
+        major_prior=float(fit_options.major_prior),
+        eps=float(fit_options.eps),
+    )
+    free_loss = free_terms.loss.sum(dim=1)
+    anchored_loss = anchored_terms.loss.sum(dim=1)
+    increases = (anchored_loss - free_loss).detach().cpu().numpy().astype(
+        np.float64, copy=False
+    )
+    eligible = eligible[np.isfinite(increases[eligible])]
+    if eligible.size == 0:
+        raise RuntimeError("no_finite_feasible_raw_clonal_anchor")
+    numerical_tolerance = max(
+        1e-10,
+        float(fit_options.eps) * (1.0 + abs(float(torch.sum(free_loss).item()))),
+    )
+    if float(np.min(increases[eligible])) < -numerical_tolerance:
+        raise RuntimeError(
+            "The zero-penalty pilot is inconsistent with raw anchor screening."
+        )
+    increases = np.maximum(increases, 0.0)
+    ordered = sorted(
+        eligible.tolist(),
+        key=lambda index: (float(increases[index]), int(index)),
+    )
+    screening_rule = "none"
+    if mode == "specified_seed":
+        id_to_index = {str(value): index for index, value in enumerate(data.mutation_ids)}
+        requested_ids = tuple(str(value) for value in fit_options.raw_clonal_anchor_mutation_ids)
+        if len(requested_ids) != 1 or requested_ids[0] not in id_to_index:
+            raise ValueError(
+                "specified_seed requires exactly one retained mutation ID."
+            )
+        specified_index = int(id_to_index[requested_ids[0]])
+        if specified_index not in set(eligible.tolist()):
+            raise RuntimeError("no_feasible_raw_clonal_anchor")
+        evaluated = (specified_index,)
+        screening_rule = "user_specified_retained_mutation_id"
+        search_complete = True
+    elif mode == "enumerated_seed":
+        evaluated = tuple(int(index) for index in ordered)
+        screening_rule = "complete_feasible_seed_enumeration"
+        search_complete = True
+    else:
+        candidate_max = fit_options.raw_clonal_anchor_candidate_max
+        if candidate_max is None or int(candidate_max) < 1:
+            raise ValueError("screened_seed requires a positive candidate maximum.")
+        evaluated = tuple(int(index) for index in ordered[: int(candidate_max)])
+        screening_rule = "zero_penalty_anchor_deviance_then_input_order"
+        search_complete = len(evaluated) == len(ordered)
+    base_loss = float(torch.sum(free_loss).item())
+    return _RawClonalAnchorSearch(
+        spec=RawClonalAnchorSpec(
+            mode=mode,
+            target=target,
+            candidate_mutation_indices=evaluated,
+            feasibility_tolerance=feasibility_tolerance,
+        ),
+        total_eligible_candidates=int(eligible.size),
+        search_complete=bool(search_complete),
+        screening_rule=screening_rule,
+        deviance_by_index={
+            int(index): float(2.0 * increases[int(index)]) for index in evaluated
+        },
+        lower_bound_by_index={
+            int(index): float(base_loss + increases[int(index)]) for index in evaluated
+        },
+    )
+
+
+def _raw_anchor_guide_labels(
+    labels: np.ndarray,
+    *,
+    anchor_mutation_index: int | None,
+) -> np.ndarray:
+    """Split the fixed mutation from a multi-mutation guide block.
+
+    The Ward/CEM guide remains the graph pilot.  Splitting only its warm-start
+    label makes that starting state compatible with the raw fixed coordinate;
+    it does not restrict which mutations the fusion estimator can recruit.
+    """
+
+    raw = np.asarray(labels, dtype=np.int64).reshape(-1).copy()
+    if anchor_mutation_index is not None:
+        index = int(anchor_mutation_index)
+        if int(np.count_nonzero(raw == raw[index])) > 1:
+            raw[index] = int(np.max(raw)) + 1
+    canonical = np.empty_like(raw)
+    mapping: dict[int, int] = {}
+    for index, value in enumerate(raw.tolist()):
+        canonical[index] = mapping.setdefault(int(value), len(mapping))
+    return canonical
 
 
 def _hash_array(hasher: "hashlib._Hash", array: np.ndarray) -> None:
@@ -274,6 +437,7 @@ def _offload_solver_state_to_cpu(state: SolverState | None) -> SolverState | Non
         warm_state=warm_state,
         certificate=certificate,
         quotient_failure=state.quotient_failure,
+        objective_spec_hash=str(state.objective_spec_hash),
     )
 
 
@@ -386,6 +550,15 @@ def _build_guided_initialization_with_resource_policy(
                 device="cpu",
                 dtype=dtype_name(solver_context.runtime.dtype),
                 objective_shape=str(fit_options.objective_shape),
+                clonal_anchor_mutation_index=(
+                    solver_context.clonal_anchor_mutation_index
+                ),
+                clonal_anchor_target=solver_context.clonal_anchor_target,
+                clonal_anchor_source=str(solver_context.clonal_anchor_source),
+                clonal_anchor_mode=str(solver_context.clonal_anchor_mode),
+                clonal_anchor_feasibility_tolerance=float(
+                    solver_context.clonal_anchor_feasibility_tolerance
+                ),
             )
             guided = build(
                 context=cpu_context,
@@ -585,10 +758,15 @@ def _assemble_selection_result(
         score_column=score_column,
     )
     selected_lambda_applicable = _row_lambda_applicable(best_row)
+    model_key = (
+        "selection_model_signature"
+        if "selection_model_signature" in selection_df.columns
+        else "partition_signature"
+    )
     selected_signature_mask = (
-        selection_df["partition_signature"]
+        selection_df[model_key]
         .astype(str)
-        .eq(str(best_row["partition_signature"]))
+        .eq(str(best_row[model_key]))
         .to_numpy(dtype=bool)
     )
     selection_lambda_min, selection_lambda_max, selection_lambda_count = (
@@ -839,7 +1017,9 @@ def _partition_guided_admm_selection(
     The best Ward/CEM partition-ICL guide defines the default adaptive graph,
     supplies the primal start, and sets the initial lambda scale. The graph is
     then frozen for the complete raw-fusion path; Ward/CEM rows themselves are
-    never selectable. Its pairwise weight contrast is bounded by a
+    never selectable. In clonal-required mode, one mutation is selected once
+    from the zero-penalty likelihood pilot and fixed at its feasible clonal CCF
+    in every raw solve. Its pairwise weight contrast is bounded by a
     likelihood-curvature noise floor distributed over a mild degree^1.05
     complete-graph correction, avoiding the effectively infinite contrast of
     an exactly fused pilot with a fixed numerical floor. Blockwise KKT capacity
@@ -879,6 +1059,19 @@ def _partition_guided_admm_selection(
     pilot_phi: StartArray = pilot_context.exact_pilot
     pilot_runtime = pilot_context.runtime
     pilot_torch_data = torch_data_from_context(pilot_context)
+    raw_anchor_search = _build_raw_clonal_anchor_search(
+        data,
+        pilot_context,
+        fit_options=fit_options,
+    )
+    anchor_required = (
+        str(fit_options.selection_anchor).strip().lower() == "clonal_required"
+    )
+    if anchor_required != (raw_anchor_search.spec.mode != "none"):
+        raise ValueError(
+            "Clonal fixed-partition BIC requires a raw clonal-anchor mode; "
+            "unanchored BIC requires raw_clonal_anchor_mode='none'."
+        )
 
     curvature_start = perf_counter()
     guide_curvature = observed_curvature_at_pilot_torch(
@@ -914,6 +1107,10 @@ def _partition_guided_admm_selection(
     # CUDA graph construction uploads this small M x S matrix once; the O(M^2)
     # graph itself stays device-backed and is reused by context preparation.
     guide_phi: StartArray = np.asarray(guide.phi_start)
+    partition_guide_signature = _partition_signature(
+        np.asarray(guide.labels, dtype=np.int64)
+    )
+    partition_guide_matrix_hash = _pilot_matrix_hash(guide_phi)
     if fit_options.graph is None:
         complete_graph_degree = float(max(int(data.num_mutations) - 1, 1))
         likelihood_noise_degree_exponent = float(
@@ -941,7 +1138,7 @@ def _partition_guided_admm_selection(
         likelihood_noise_degree_exponent = float("nan")
         graph_source = "user_supplied"
         graph_pilot_phi = pilot_phi
-    solver_context = prepare_torch_problem_with_resource_policy(
+    base_solver_context = prepare_torch_problem_with_resource_policy(
         data,
         dense_fallback_policy=str(fit_options.dense_fallback_policy),
         inherited_resource_fallback=pilot_context.resource_fallback,
@@ -968,8 +1165,8 @@ def _partition_guided_admm_selection(
         torch_data=pilot_torch_data,
         objective_shape=str(fit_options.objective_shape),
     )
-    effective_graph = solver_context.graph_spec
-    effective_tensor_graph = solver_context.graph
+    effective_graph = base_solver_context.graph_spec
+    effective_tensor_graph = base_solver_context.graph
     if not bool(effective_tensor_graph.is_complete) or int(
         effective_graph.degree_bound
     ) != int(data.num_mutations - 1):
@@ -978,19 +1175,83 @@ def _partition_guided_admm_selection(
             "inner solver is ADMM."
         )
     effective_fit_options = replace(fit_options, graph=effective_graph)
-    guided_initialization, solver_context, guide_phi = (
-        _build_guided_initialization_with_resource_policy(
-            data=data,
-            guide_phi=guide_phi,
-            guide_labels=np.asarray(guide.labels, dtype=np.int64),
-            solver_context=solver_context,
-            fit_options=effective_fit_options,
-        )
+    anchor_keys = (
+        raw_anchor_search.spec.candidate_mutation_indices
+        if raw_anchor_search.spec.mode != "none"
+        else (-1,)
     )
-    runtime = solver_context.runtime
-    torch_data = torch_data_from_context(solver_context)
-    effective_graph = solver_context.graph_spec
-    effective_tensor_graph = solver_context.graph
+    solver_context_by_anchor: dict[int, SolverContext] = {}
+    guided_initialization_by_anchor: dict[int, GuidedFusionInitialization] = {}
+    guide_phi_by_anchor: dict[int, StartArray] = {}
+    guide_labels_by_anchor: dict[int, np.ndarray] = {}
+    for anchor_key in anchor_keys:
+        anchor_index = None if int(anchor_key) < 0 else int(anchor_key)
+        context = (
+            base_solver_context
+            if anchor_index is None
+            else prepare_torch_problem_with_resource_policy(
+                data,
+                dense_fallback_policy=str(fit_options.dense_fallback_policy),
+                inherited_resource_fallback=pilot_context.resource_fallback,
+                major_prior=float(fit_options.major_prior),
+                eps=float(fit_options.eps),
+                tol=float(fit_options.tol),
+                graph=effective_graph,
+                prebuilt_tensor_graph=effective_tensor_graph,
+                inner_max_iter=max(int(fit_options.inner_max_iter), 16),
+                adaptive_weight_gamma=float(fit_options.adaptive_weight_gamma),
+                adaptive_weight_floor=float(fit_options.adaptive_weight_floor),
+                adaptive_weight_baseline=float(fit_options.adaptive_weight_baseline),
+                exact_pilot=guide_phi,
+                pooled_start=guide_phi,
+                scalar_well_starts=pilot_context.scalar_well_starts,
+                device=fit_options.device,
+                dtype=fit_options.dtype,
+                runtime=pilot_runtime,
+                torch_data=pilot_torch_data,
+                objective_shape=str(fit_options.objective_shape),
+                clonal_anchor_mutation_index=anchor_index,
+                clonal_anchor_target=raw_anchor_search.spec.target,
+                clonal_anchor_source=str(raw_anchor_search.screening_rule),
+                clonal_anchor_mode=str(raw_anchor_search.spec.mode),
+                clonal_anchor_feasibility_tolerance=float(
+                    raw_anchor_search.spec.feasibility_tolerance
+                ),
+            )
+        )
+        anchor_guide_labels = _raw_anchor_guide_labels(
+            np.asarray(guide.labels, dtype=np.int64),
+            anchor_mutation_index=context.clonal_anchor_mutation_index,
+        )
+        anchor_guide_phi: StartArray = context.exact_pilot
+        initialization, context, anchor_guide_phi = (
+            _build_guided_initialization_with_resource_policy(
+                data=data,
+                guide_phi=anchor_guide_phi,
+                guide_labels=anchor_guide_labels,
+                solver_context=context,
+                fit_options=effective_fit_options,
+            )
+        )
+        initialization = replace(
+            initialization,
+            solver_state=_offload_solver_state_to_cpu(initialization.solver_state),
+        )
+        key = int(anchor_key)
+        solver_context_by_anchor[key] = context
+        guided_initialization_by_anchor[key] = initialization
+        guide_phi_by_anchor[key] = anchor_guide_phi
+        guide_labels_by_anchor[key] = anchor_guide_labels
+    runtime = next(iter(solver_context_by_anchor.values())).runtime
+    if any(
+        context.runtime.device != runtime.device
+        or context.runtime.dtype != runtime.dtype
+        for context in solver_context_by_anchor.values()
+    ):
+        raise RuntimeError("All raw anchor seeds must use one tensor runtime.")
+    torch_data = torch_data_from_context(next(iter(solver_context_by_anchor.values())))
+    effective_graph = next(iter(solver_context_by_anchor.values())).graph_spec
+    effective_tensor_graph = next(iter(solver_context_by_anchor.values())).graph
     effective_fit_options = replace(fit_options, graph=effective_graph)
     if not bool(effective_tensor_graph.is_complete) or int(
         effective_graph.degree_bound
@@ -998,20 +1259,20 @@ def _partition_guided_admm_selection(
         raise ValueError(
             "partition_guided_admm CPU fallback changed the complete fusion graph."
         )
-    if runtime.device.type != "cuda":
-        guided_initialization = replace(
-            guided_initialization,
-            solver_state=_offload_solver_state_to_cpu(
-                guided_initialization.solver_state
-            ),
-        )
     prepare_elapsed_seconds = float(perf_counter() - prepare_start_time)
 
     controller = OnlineLambdaController(
-        initial_lambda=float(guided_initialization.lambda_value),
+        initial_lambda=float(
+            min(
+                initialization.lambda_value
+                for initialization in guided_initialization_by_anchor.values()
+            )
+        ),
         initial_reason="partition_guide_kkt_balance",
         config=OnlineLambdaConfig(
-            guide_n_clusters=int(guide.K),
+            guide_n_clusters=int(
+                max(np.unique(labels).size for labels in guide_labels_by_anchor.values())
+            ),
             num_mutations=int(data.num_mutations),
             kkt_tolerance=5.0 * float(effective_fit_options.tol),
             max_unique_lambdas=int(PARTITION_GUIDED_ADMM_MAX_UNIQUE_LAMBDAS),
@@ -1029,16 +1290,15 @@ def _partition_guided_admm_selection(
         ]
     ] = []
     fit_by_lambda: dict[float, FitResult] = {}
+    fit_by_anchor_and_lambda: dict[tuple[int, float], FitResult] = {}
+    attempts_by_anchor_and_lambda: dict[tuple[int, float], list[FitResult]] = {}
     bic_refit_cache: dict[object, _CachedPartitionRefit] = {}
     static_metadata = _candidate_static_metadata(
         data, effective_graph, pilot_phi=graph_pilot_phi
     )
     scalar_likelihood_pilot_hash = _pilot_matrix_hash(pilot_phi)
-    guide_signature = _partition_signature(np.asarray(guide.labels, dtype=np.int64))
-    guide_matrix_hash = _pilot_matrix_hash(guide_phi)
     next_step = 0
     terminal_stop_reason: str | None = None
-    retained_cuda_fit: FitResult | None = None
 
     while True:
         proposal = controller.propose()
@@ -1048,83 +1308,6 @@ def _partition_guided_admm_selection(
             terminal_stop_reason = "online_lambda_uncertified_exact_fusion_result"
             break
         lambda_key = _canonical_lambda(proposal.lambda_value)
-        warm_fit = None
-        if proposal.warm_start_lambda is not None:
-            warm_fit = fit_by_lambda.get(_canonical_lambda(proposal.warm_start_lambda))
-        alternate_fit = None
-        if proposal.alternate_start_lambda is not None:
-            alternate_fit = fit_by_lambda.get(
-                _canonical_lambda(proposal.alternate_start_lambda)
-            )
-
-        if proposal.phase == "solver_recovery":
-            finite_failed_entries = [
-                (fit, row)
-                for fit, row, _ in result_entries
-                if fit.solver_state is not None
-                and _canonical_lambda(fit.lambda_value)
-                == _canonical_lambda(proposal.lambda_value)
-                and np.isfinite(float(row.get("fixed_objective_kkt_residual", np.nan)))
-            ]
-            if finite_failed_entries:
-                best_failed_fit, _ = min(
-                    finite_failed_entries,
-                    key=lambda item: float(item[1]["fixed_objective_kkt_residual"]),
-                )
-                solver_state_start = best_failed_fit.solver_state
-                lambda_start_source = "best_same_lambda_kkt_state"
-                lambda_start_value = float(best_failed_fit.lambda_value)
-            else:
-                solver_state_start = guided_initialization.solver_state
-                lambda_start_source = "guided_kkt_solver_recovery"
-                lambda_start_value = float(guided_initialization.lambda_value)
-        elif proposal.phase == "initial":
-            solver_state_start = guided_initialization.solver_state
-            lambda_start_source = "guided_kkt_state"
-            lambda_start_value = float(guided_initialization.lambda_value)
-        elif (
-            use_warm_starts
-            and int(proposal.retry_number) == 1
-            and alternate_fit is not None
-            and alternate_fit.solver_state is not None
-        ):
-            # A failed midpoint can be basin-dependent.  Retry once from the
-            # other certified endpoint before spending more work at the failed
-            # target state itself.
-            solver_state_start = alternate_fit.solver_state
-            lambda_start_source = "alternate_bracket_endpoint"
-            lambda_start_value = float(proposal.alternate_start_lambda)
-        elif (
-            use_warm_starts
-            and warm_fit is not None
-            and warm_fit.solver_state is not None
-        ):
-            solver_state_start = warm_fit.solver_state
-            lambda_start_source = (
-                "same_lambda_retry"
-                if int(proposal.retry_number) > 0
-                else "warm_endpoint"
-            )
-            lambda_start_value = float(proposal.warm_start_lambda)
-        else:
-            solver_state_start = guided_initialization.solver_state
-            lambda_start_source = "guided_kkt_fallback"
-            lambda_start_value = float(guided_initialization.lambda_value)
-
-        # Retain at most the most recently produced CUDA state.  If it is the
-        # requested warm start, the next fit consumes it directly on device;
-        # otherwise offload it before allocating the new candidate.  This
-        # bounds accelerator memory while eliminating the unconditional
-        # D2H/H2D round trip between consecutive candidates.
-        if (
-            retained_cuda_fit is not None
-            and solver_state_start is not retained_cuda_fit.solver_state
-        ):
-            retained_cuda_fit.solver_state = _offload_solver_state_to_cpu(
-                retained_cuda_fit.solver_state
-            )
-            retained_cuda_fit = None
-
         candidate_fit_options = effective_fit_options
         if proposal.phase == "solver_recovery":
             candidate_fit_options = replace(
@@ -1161,38 +1344,210 @@ def _partition_guided_admm_selection(
                 ),
             )
 
-        solver_state_start, path_breakpoint_escape_changed_count = (
-            _escape_path_breakpoint_retry_state(
+        raw_anchor_fit_start = perf_counter()
+        seed_fits: list[tuple[int, FitResult]] = []
+        seed_start_metadata: dict[int, tuple[str, float, int]] = {}
+        for anchor_key in anchor_keys:
+            key = int(anchor_key)
+            context = solver_context_by_anchor[key]
+            initialization = guided_initialization_by_anchor[key]
+            anchor_guide_phi = guide_phi_by_anchor[key]
+            warm_fit = None
+            if proposal.warm_start_lambda is not None:
+                warm_fit = fit_by_anchor_and_lambda.get(
+                    (key, _canonical_lambda(proposal.warm_start_lambda))
+                )
+            alternate_fit = None
+            if proposal.alternate_start_lambda is not None:
+                alternate_fit = fit_by_anchor_and_lambda.get(
+                    (key, _canonical_lambda(proposal.alternate_start_lambda))
+                )
+            same_lambda_attempts = attempts_by_anchor_and_lambda.get(
+                (key, lambda_key), []
+            )
+            finite_failed = [
+                attempt
+                for attempt in same_lambda_attempts
+                if attempt.solver_state is not None
+                and np.isfinite(float(attempt.fixed_objective_kkt_residual))
+            ]
+            if proposal.phase == "solver_recovery" and finite_failed:
+                best_failed_fit = min(
+                    finite_failed,
+                    key=lambda attempt: float(attempt.fixed_objective_kkt_residual),
+                )
+                solver_state_start = best_failed_fit.solver_state
+                lambda_start_source = "best_same_lambda_kkt_state"
+                lambda_start_value = float(best_failed_fit.lambda_value)
+            elif proposal.phase in {"solver_recovery", "initial"}:
+                solver_state_start = initialization.solver_state
+                lambda_start_source = (
+                    "guided_kkt_solver_recovery"
+                    if proposal.phase == "solver_recovery"
+                    else "guided_kkt_state"
+                )
+                lambda_start_value = float(initialization.lambda_value)
+            elif (
+                use_warm_starts
+                and int(proposal.retry_number) == 1
+                and alternate_fit is not None
+                and alternate_fit.solver_state is not None
+            ):
+                solver_state_start = alternate_fit.solver_state
+                lambda_start_source = "alternate_bracket_endpoint"
+                lambda_start_value = float(proposal.alternate_start_lambda)
+            elif (
+                use_warm_starts
+                and warm_fit is not None
+                and warm_fit.solver_state is not None
+            ):
+                solver_state_start = warm_fit.solver_state
+                lambda_start_source = (
+                    "same_lambda_retry"
+                    if int(proposal.retry_number) > 0
+                    else "warm_endpoint"
+                )
+                lambda_start_value = float(proposal.warm_start_lambda)
+            else:
+                solver_state_start = initialization.solver_state
+                lambda_start_source = "guided_kkt_fallback"
+                lambda_start_value = float(initialization.lambda_value)
+            solver_state_start, changed_count = _escape_path_breakpoint_retry_state(
                 solver_state_start,
                 start_source=lambda_start_source,
                 start_lambda=lambda_start_value,
                 target_lambda=float(proposal.lambda_value),
-                context=solver_context,
+                context=context,
                 tol=float(candidate_fit_options.tol),
             )
-        )
-        phi_start = _clone_start(
-            solver_state_start.phi
-            if solver_state_start is not None and solver_state_start.phi is not None
-            else guide_phi
+            phi_start = _clone_start(
+                solver_state_start.phi
+                if solver_state_start is not None
+                and solver_state_start.phi is not None
+                else anchor_guide_phi
+            )
+            seed_fit = fit_fixed_objective(
+                data=data,
+                options=replace(
+                    candidate_fit_options,
+                    lambda_value=float(proposal.lambda_value),
+                ),
+                phi_start=phi_start,
+                exact_pilot=anchor_guide_phi,
+                pooled_start=anchor_guide_phi,
+                scalar_well_starts=[],
+                start_mode="warm_only",
+                runtime=context.runtime,
+                torch_data=torch_data_from_context(context),
+                solver_context=context,
+                solver_state=solver_state_start,
+                compute_summary=False,
+            )
+            if seed_fit.solver_state is not None:
+                seed_fit.solver_state = _offload_solver_state_to_cpu(
+                    seed_fit.solver_state
+                )
+            initialization_state = initialization.solver_state
+            if initialization_state is not None:
+                guided_initialization_by_anchor[key] = replace(
+                    initialization,
+                    solver_state=_offload_solver_state_to_cpu(initialization_state),
+                )
+            attempts_by_anchor_and_lambda.setdefault((key, lambda_key), []).append(
+                seed_fit
+            )
+            incumbent = fit_by_anchor_and_lambda.get((key, lambda_key))
+            if _prefer_fit_candidate(seed_fit, incumbent):
+                fit_by_anchor_and_lambda[(key, lambda_key)] = seed_fit
+            seed_fits.append((key, seed_fit))
+            seed_start_metadata[key] = (
+                str(lambda_start_source),
+                float(lambda_start_value),
+                int(changed_count),
+            )
+        raw_anchor_fit_elapsed_seconds = float(
+            perf_counter() - raw_anchor_fit_start
         )
 
+        individually_certified = [
+            (key, seed_fit)
+            for key, seed_fit in seed_fits
+            if float(seed_fit.lambda_value) > 0.0
+            and bool(seed_fit.objective_faithful)
+            and bool(seed_fit.full_kkt_certified)
+            and bool(seed_fit.selection_eligible)
+        ]
+        if individually_certified:
+            ranked_certified = sorted(
+                individually_certified,
+                key=lambda item: (
+                    float(item[1].penalized_objective),
+                    int(item[0]),
+                ),
+            )
+            winning_anchor_key, winning_fit = ranked_certified[0]
+            second_objective = (
+                float(ranked_certified[1][1].penalized_objective)
+                if len(ranked_certified) > 1
+                else float("inf")
+            )
+            objective_gap = second_objective - float(winning_fit.penalized_objective)
+            failed_seed_keys = {
+                key for key, _ in seed_fits
+            }.difference(key for key, _ in individually_certified)
+            objective_tolerance = 1e-10 * (
+                1.0 + abs(float(winning_fit.penalized_objective))
+            )
+            anchor_competition_resolved = not any(
+                raw_anchor_search.lower_bound_by_index.get(key, float("inf"))
+                <= float(winning_fit.penalized_objective) + objective_tolerance
+                for key in failed_seed_keys
+            )
+        else:
+            winning_anchor_key, winning_fit = min(
+                seed_fits,
+                key=lambda item: (
+                    float(item[1].fixed_objective_kkt_residual),
+                    float(item[1].penalized_objective),
+                    int(item[0]),
+                ),
+            )
+            objective_gap = float("inf")
+            anchor_competition_resolved = False
+        winning_fit.raw_clonal_anchor_search_complete = bool(
+            raw_anchor_search.search_complete
+        )
+        winning_fit.raw_clonal_anchor_total_eligible_candidates = int(
+            raw_anchor_search.total_eligible_candidates
+        )
+        winning_fit.raw_clonal_anchor_candidates_evaluated = int(
+            len(seed_fits) if raw_anchor_search.spec.mode != "none" else 0
+        )
+        winning_fit.raw_clonal_anchor_objective_rank = int(
+            1 if raw_anchor_search.spec.mode != "none" else 0
+        )
+        winning_fit.raw_clonal_anchor_objective_gap_to_second = float(objective_gap)
+        winning_fit.raw_clonal_anchor_screening_rule = str(
+            raw_anchor_search.screening_rule
+        )
+        winning_context = solver_context_by_anchor[int(winning_anchor_key)]
+        winning_guide_phi = guide_phi_by_anchor[int(winning_anchor_key)]
         fit, row, artifact = _evaluate_candidate(
             data=data,
             fit_options=effective_fit_options,
             candidate_fit_options=candidate_fit_options,
             bic_df_scale=bic_df_scale,
             bic_cluster_penalty=bic_cluster_penalty,
-            phi_start=phi_start,
-            exact_pilot=guide_phi,
-            pooled_start=guide_phi,
+            phi_start=None,
+            exact_pilot=winning_guide_phi,
+            pooled_start=winning_guide_phi,
             scalar_well_starts=[],
             start_mode="warm_only",
             runtime=runtime,
             torch_data=torch_data,
-            solver_context=solver_context,
-            solver_state=solver_state_start,
-            compute_summary=True,
+            solver_context=winning_context,
+            solver_state=winning_fit.solver_state,
+            compute_summary=False,
             selection_method=selection_method,
             profile_name=profile_name,
             selection_step=next_step,
@@ -1200,22 +1555,42 @@ def _partition_guided_admm_selection(
             selection_score=selection_score,
             bic_refit_cache=bic_refit_cache,
             static_metadata=static_metadata,
+            precomputed_fit=winning_fit,
+            raw_anchor_search_resolved=bool(anchor_competition_resolved),
         )
-        if runtime.device.type == "cuda":
-            if retained_cuda_fit is not None:
-                retained_cuda_fit.solver_state = _offload_solver_state_to_cpu(
-                    retained_cuda_fit.solver_state
-                )
-            retained_cuda_fit = fit
-            if guided_initialization.solver_state is not None:
-                guided_initialization = replace(
-                    guided_initialization,
-                    solver_state=_offload_solver_state_to_cpu(
-                        guided_initialization.solver_state
-                    ),
-                )
-        else:
-            fit.solver_state = _offload_solver_state_to_cpu(fit.solver_state)
+        lambda_start_source, lambda_start_value, path_breakpoint_escape_changed_count = (
+            seed_start_metadata[int(winning_anchor_key)]
+        )
+        row["raw_fit_elapsed_seconds"] = float(raw_anchor_fit_elapsed_seconds)
+        row["raw_anchor_seed_fit_elapsed_seconds"] = float(
+            raw_anchor_fit_elapsed_seconds
+        )
+        row["raw_anchor_mean_seed_fit_elapsed_seconds"] = float(
+            raw_anchor_fit_elapsed_seconds / max(len(seed_fits), 1)
+        )
+        row["raw_anchor_evaluated_seed_indices"] = ",".join(
+            str(key) for key, _ in seed_fits if key >= 0
+        )
+        row["raw_anchor_evaluated_seed_mutation_ids"] = ",".join(
+            str(data.mutation_ids[key]) for key, _ in seed_fits if key >= 0
+        )
+        row["raw_anchor_evaluated_penalized_objectives"] = ",".join(
+            f"{key}:{float(seed_fit.penalized_objective):.17g}"
+            for key, seed_fit in seed_fits
+            if key >= 0
+        )
+        row["raw_anchor_evaluated_kkt_certified"] = ",".join(
+            f"{key}:{int(bool(seed_fit.full_kkt_certified and seed_fit.selection_eligible))}"
+            for key, seed_fit in seed_fits
+            if key >= 0
+        )
+        guided_initialization = guided_initialization_by_anchor[
+            int(winning_anchor_key)
+        ]
+        raw_guide_labels = guide_labels_by_anchor[int(winning_anchor_key)]
+        guide_phi = guide_phi_by_anchor[int(winning_anchor_key)]
+        guide_signature = _partition_signature(raw_guide_labels)
+        guide_matrix_hash = _pilot_matrix_hash(guide_phi)
 
         row.update(
             {
@@ -1251,11 +1626,32 @@ def _partition_guided_admm_selection(
                 "initialization_mode": "ward_cem_partition_icl_kkt",
                 "initializer_selection_score": "partition_icl",
                 "initializer_score_value": float(guide.bic),
-                "initializer_K": int(guide.K),
+                "initializer_K": int(np.unique(raw_guide_labels).size),
                 "initializer_requested_K": int(_partition_candidate_requested_k(guide)),
-                "initializer_source": str(guide.source),
+                "initializer_source": (
+                    f"{guide.source}_raw_anchor_compatible"
+                    if raw_anchor_search.spec.mode != "none"
+                    else str(guide.source)
+                ),
                 "initializer_partition_signature": str(guide_signature),
                 "initializer_matrix_hash": str(guide_matrix_hash),
+                "partition_guide_K": int(guide.K),
+                "partition_guide_signature": str(partition_guide_signature),
+                "partition_guide_matrix_hash": str(partition_guide_matrix_hash),
+                "raw_clonal_anchor_selection_deviance_increase": (
+                    np.nan
+                    if int(winning_anchor_key) < 0
+                    else float(
+                        raw_anchor_search.deviance_by_index[int(winning_anchor_key)]
+                    )
+                ),
+                "raw_clonal_anchor_second_ranked_deviance_increase": (
+                    np.nan
+                    if len(raw_anchor_search.deviance_by_index) < 2
+                    else float(
+                        sorted(raw_anchor_search.deviance_by_index.values())[1]
+                    )
+                ),
                 "fusion_graph_source": str(graph_source),
                 "fusion_graph_pilot_matrix_hash": str(
                     static_metadata.pilot_matrix_hash
@@ -1310,13 +1706,16 @@ def _partition_guided_admm_selection(
         raw_exact_certified = bool(
             _exact_fusion_certificate_mask(pd.DataFrame([row]))[0]
             and bool(effective_tensor_graph.is_complete)
+            and bool(anchor_competition_resolved)
         )
         selection_score_available = bool(artifact.eligible_for_selection)
         controller.observe(
             OnlineLambdaObservation(
                 lambda_value=float(proposal.lambda_value),
                 n_clusters=int(row["n_clusters"]),
-                partition_signature=str(row["partition_signature"]),
+                partition_signature=str(
+                    row.get("selection_model_signature", row["partition_signature"])
+                ),
                 # The active selection score steers the online-lambda
                 # controller (the observation field name is historical).
                 partition_icl=(
@@ -1345,10 +1744,6 @@ def _partition_guided_admm_selection(
             )
         )
         next_step += 1
-    if retained_cuda_fit is not None:
-        retained_cuda_fit.solver_state = _offload_solver_state_to_cpu(
-            retained_cuda_fit.solver_state
-        )
     if not result_entries:
         raise RuntimeError(
             f"No guided ADMM candidates were evaluated for tumor {data.tumor_id}."

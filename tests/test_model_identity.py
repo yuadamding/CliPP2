@@ -14,17 +14,21 @@ import torch
 from CliPP2.core.bic import effective_bic_mutation_region_count, fixed_partition_bic
 from CliPP2.core.fusion.graph import build_complete_uniform_graph
 from CliPP2.core.fusion.refit import partition_constrained_observed_refit
+from CliPP2.core.fusion.solver import prepare_torch_problem
 from CliPP2.core.fusion.types import (
     CompressedEdgeCertificate,
+    InfeasibleRawClonalAnchor,
     QuotientWorksetWarmState,
+    SolverState,
 )
-from CliPP2.core.model import FitOptions
+from CliPP2.core.model import FitOptions, fit_fixed_objective
 from CliPP2.io.data import PathLikelihoodSpec, TumorData
 from CliPP2.model_selection.partitions import (
     _partition_signature,
     extract_certified_fusion_partition,
 )
 from CliPP2.model_selection.candidates import (
+    _anchor_block_signature,
     _build_refit_summary,
     _fixed_partition_refit,
     _selection_refit_cache_key,
@@ -42,6 +46,7 @@ from CliPP2.model_selection.types import (
     SelectedModel,
 )
 from CliPP2.runners.outputs import write_fit_outputs
+from CliPP2.runners.model_selection import _build_raw_clonal_anchor_search
 
 
 def _toy_data() -> TumorData:
@@ -182,6 +187,143 @@ class ModelIdentityTests(unittest.TestCase):
             anchored.second_best_anchor_deviance_increase,
         )
 
+    def test_explicit_raw_anchor_cluster_is_preserved_by_refit(self) -> None:
+        data = _toy_data()
+        data.phi_upper = np.asarray([[0.25], [0.25], [1.0], [1.0]])
+        labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+        refit = partition_constrained_observed_refit(
+            data,
+            labels,
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-7,
+            max_iter=64,
+            anchor_mode="clonal_required",
+            anchor_cluster=1,
+        )
+        self.assertEqual(refit.clonal_cluster, 1)
+        self.assertAlmostEqual(refit.cluster_centers[1, 0], 1.0)
+        self.assertEqual(
+            refit.loglik_source,
+            "raw_clonal_anchor_preserved_partition_observed_mle",
+        )
+
+    def test_raw_anchor_is_a_frozen_hashed_objective_coordinate(self) -> None:
+        data = _toy_data()
+        kwargs = dict(
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-6,
+            inner_max_iter=32,
+            defer_graph=True,
+            device="cpu",
+            dtype="float64",
+        )
+        pilot = prepare_torch_problem(data, **kwargs)
+        options = FitOptions(
+            lambda_value=0.0,
+            raw_clonal_anchor_mode="screened_seed",
+            raw_clonal_anchor_candidate_max=2,
+        )
+        search = _build_raw_clonal_anchor_search(
+            data,
+            pilot,
+            fit_options=options,
+        )
+        anchor_index = int(search.spec.candidate_mutation_indices[0])
+        anchored = prepare_torch_problem(
+            data,
+            **kwargs,
+            clonal_anchor_mutation_index=anchor_index,
+            clonal_anchor_target=search.spec.target,
+            clonal_anchor_source=search.screening_rule,
+            clonal_anchor_mode=search.spec.mode,
+            clonal_anchor_feasibility_tolerance=search.spec.feasibility_tolerance,
+        )
+        index = anchor_index
+        self.assertNotEqual(pilot.objective_spec_hash, anchored.objective_spec_hash)
+        self.assertTrue(torch.equal(anchored.lower[index], anchored.upper[index]))
+        self.assertTrue(
+            torch.equal(anchored.exact_pilot[index], anchored.upper[index])
+        )
+        np.testing.assert_array_equal(
+            anchored.clonal_anchor_target.detach().cpu().numpy(),
+            search.spec.target,
+        )
+        second_index = int(search.spec.candidate_mutation_indices[1])
+        second = prepare_torch_problem(
+            data,
+            **kwargs,
+            clonal_anchor_mutation_index=second_index,
+            clonal_anchor_target=search.spec.target,
+            clonal_anchor_source=search.screening_rule,
+            clonal_anchor_mode=search.spec.mode,
+            clonal_anchor_feasibility_tolerance=search.spec.feasibility_tolerance,
+        )
+        self.assertNotEqual(anchored.objective_spec_hash, second.objective_spec_hash)
+        self.assertFalse(search.search_complete)
+        self.assertEqual(search.total_eligible_candidates, data.num_mutations)
+        self.assertEqual(len(search.spec.candidate_mutation_indices), 2)
+
+    def test_infeasible_raw_anchor_fails_and_warm_states_are_seed_specific(self) -> None:
+        data = _toy_data()
+        data.phi_upper[0, 0] = 0.5
+        common = dict(
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-6,
+            inner_max_iter=32,
+            graph=build_complete_uniform_graph(data.num_mutations),
+            device="cpu",
+            dtype="float64",
+            clonal_anchor_target=np.ones(data.num_regions),
+            clonal_anchor_source="unit_test",
+            clonal_anchor_mode="specified_seed",
+            clonal_anchor_feasibility_tolerance=1e-8,
+        )
+        with self.assertRaises(InfeasibleRawClonalAnchor):
+            prepare_torch_problem(
+                data,
+                **common,
+                clonal_anchor_mutation_index=0,
+            )
+        first = prepare_torch_problem(
+            data,
+            **common,
+            clonal_anchor_mutation_index=1,
+        )
+        second = prepare_torch_problem(
+            data,
+            **common,
+            clonal_anchor_mutation_index=2,
+        )
+        state = SolverState(
+            phi=first.exact_pilot,
+            dual=None,
+            previous_lambda=1.0,
+            objective_spec_hash=first.objective_spec_hash,
+        )
+        with self.assertRaisesRegex(ValueError, "different raw objective"):
+            fit_fixed_objective(
+                data,
+                FitOptions(
+                    lambda_value=1.0,
+                    graph=common["graph"],
+                    device="cpu",
+                    dtype="float64",
+                ),
+                phi_start=second.exact_pilot,
+                exact_pilot=second.exact_pilot,
+                pooled_start=second.exact_pilot,
+                scalar_well_starts=[],
+                start_mode="warm_only",
+                runtime=second.runtime,
+                torch_data=None,
+                solver_context=second,
+                solver_state=state,
+                compute_summary=False,
+            )
+
     def test_selected_score_reconstructs_exactly(self) -> None:
         data = _toy_data()
         score = fixed_partition_bic(
@@ -198,6 +340,23 @@ class ModelIdentityTests(unittest.TestCase):
         self.assertEqual(score.degrees_of_freedom, expected_df)
         self.assertAlmostEqual(score.value, expected, places=12)
         self.assertAlmostEqual(score.value, -2.0 * score.loglik + score.penalty)
+
+    def test_missing_nonanchor_coordinates_do_not_count_toward_bic_df(self) -> None:
+        data = _toy_data()
+        labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+        data.count_observed[labels == 1, 0] = False
+        score = fixed_partition_bic(
+            loglik=-12.5,
+            num_clusters=2,
+            data=data,
+            anchor_mode="clonal_required",
+            partition_signature="2:test",
+            anchor_block_signature="2:anchor",
+            labels=labels,
+            anchor_cluster=0,
+        )
+        self.assertEqual(score.degrees_of_freedom, 0)
+        self.assertEqual(score.penalty, 0.0)
 
     def test_selection_refit_is_independent_of_raw_retry_effort(self) -> None:
         data = _toy_data()
@@ -225,11 +384,13 @@ class ModelIdentityTests(unittest.TestCase):
                 data=data,
                 partition=partition,
                 selection_options=base,
+                raw_anchor_cluster=1,
             ),
             _selection_refit_cache_key(
                 data=data,
                 partition=partition,
                 selection_options=recovery,
+                raw_anchor_cluster=1,
             ),
         )
         cache = {}
@@ -238,12 +399,14 @@ class ModelIdentityTests(unittest.TestCase):
             partition=partition,
             selection_options=base,
             cache=cache,
+            raw_anchor_cluster=1,
         )
         second, second_hit = _fixed_partition_refit(
             data=data,
             partition=partition,
             selection_options=recovery,
             cache=cache,
+            raw_anchor_cluster=1,
         )
         self.assertFalse(first_hit)
         self.assertTrue(second_hit)
@@ -344,6 +507,9 @@ class ModelIdentityTests(unittest.TestCase):
             data=data,
             anchor_mode=options.selection_anchor,
             partition_signature=partition.signature,
+            anchor_block_signature=_anchor_block_signature(
+                labels, int(resolution.result.clonal_cluster)
+            ),
         )
         refit = _build_refit_summary(
             resolution.result,
@@ -351,7 +517,16 @@ class ModelIdentityTests(unittest.TestCase):
             nominal_df=score.degrees_of_freedom,
             resolution=resolution,
         )
-        raw_fit = SimpleNamespace(lambda_value=1.0)
+        anchor_cluster = int(resolution.result.clonal_cluster)
+        anchor_index = int(np.flatnonzero(labels == anchor_cluster)[0])
+        raw_phi = np.asarray(resolution.result.phi, dtype=np.float64).copy()
+        raw_fit = SimpleNamespace(
+            lambda_value=1.0,
+            phi=raw_phi,
+            raw_clonal_anchor_mutation_index=anchor_index,
+            raw_clonal_anchor_target=raw_phi[anchor_index].copy(),
+            raw_clonal_anchor_source="unit_test_raw_anchor",
+        )
         candidate = RawFusionCandidate(
             raw_fit=raw_fit,
             partition=partition,
@@ -360,6 +535,12 @@ class ModelIdentityTests(unittest.TestCase):
             raw_objective_certified=True,
             eligible_for_selection=True,
             ineligibility_reason="none",
+            anchor_seed_index=anchor_index,
+            anchor_seed_mutation_id=data.mutation_ids[anchor_index],
+            anchor_cluster_label=anchor_cluster,
+            anchor_block_signature=score.anchor_block_signature,
+            anchor_target=raw_phi[anchor_index].copy(),
+            anchor_search_complete=True,
         )
         validate_candidate_identity(candidate)
         SelectedModel(
@@ -420,6 +601,25 @@ class ModelIdentityTests(unittest.TestCase):
         self.assertEqual(float(selected["lambda"]), 1.0)
         self.assertEqual(score, 10.0)
         np.testing.assert_array_equal(optimal, [True, True, False])
+
+    def test_different_anchor_blocks_are_different_selection_models(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "partition_signature": ["same", "same"],
+                "selection_model_signature": ["same|anchor:a", "same|anchor:b"],
+                "selection_score": [12.0, 10.0],
+                "lambda": [1.0, 2.0],
+                "penalized_objective": [5.0, 6.0],
+                "selection_step": [0, 1],
+            }
+        )
+        selected, score, optimal = _select_best_partition_leftmost(
+            frame,
+            score_column="selection_score",
+        )
+        self.assertEqual(selected["selection_model_signature"], "same|anchor:b")
+        self.assertEqual(score, 10.0)
+        np.testing.assert_array_equal(optimal, [False, True])
 
     def test_write_outputs_is_pure_and_explicit(self) -> None:
         data = _toy_data()

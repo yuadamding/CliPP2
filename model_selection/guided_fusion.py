@@ -1227,6 +1227,7 @@ def _build_compressed_guided_initialization(
         previous_lambda=float(lambda_value),
         warm_state=warm_state,
         certificate=None,
+        objective_spec_hash=str(solver_context.objective_spec_hash),
     )
     return GuidedFusionInitialization(
         lambda_value=float(lambda_value), solver_state=state, diagnostics=diagnostics
@@ -1520,6 +1521,7 @@ def build_guided_fusion_initialization(
         phi=phi.detach(),
         dual=dual.detach(),
         previous_lambda=float(lambda_value),
+        objective_spec_hash=str(solver_context.objective_spec_hash),
     )
     return GuidedFusionInitialization(
         lambda_value=float(lambda_value), solver_state=state, diagnostics=diagnostics

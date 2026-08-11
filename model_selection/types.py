@@ -72,6 +72,7 @@ class PartitionRefitSummary:
     refit_total_candidate_basins: int = 0
     refit_total_refined_candidates: int = 0
     refit_min_best_second_loss_gap: float = float("inf")
+    fixed_anchor_target: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.global_optimum_certified:
@@ -94,6 +95,14 @@ class PartitionRefitSummary:
             "cluster_centers",
             _immutable_array(self.cluster_centers, dtype=np.dtype(np.float64)),
         )
+        if self.fixed_anchor_target is not None:
+            object.__setattr__(
+                self,
+                "fixed_anchor_target",
+                _immutable_array(
+                    self.fixed_anchor_target, dtype=np.dtype(np.float64)
+                ),
+            )
 
 
 @dataclass(frozen=True)
@@ -105,6 +114,7 @@ class SelectionScore:
     degrees_of_freedom: int
     n_eff: int
     partition_signature: str
+    anchor_block_signature: str = "none"
 
 
 @dataclass(frozen=True)
@@ -116,6 +126,20 @@ class RawFusionCandidate:
     raw_objective_certified: bool
     eligible_for_selection: bool
     ineligibility_reason: str
+    anchor_seed_index: int | None = None
+    anchor_seed_mutation_id: str = "none"
+    anchor_cluster_label: int | None = None
+    anchor_block_signature: str = "none"
+    anchor_target: np.ndarray | None = None
+    anchor_search_complete: bool = False
+
+    def __post_init__(self) -> None:
+        if self.anchor_target is not None:
+            object.__setattr__(
+                self,
+                "anchor_target",
+                _immutable_array(self.anchor_target, dtype=np.dtype(np.float64)),
+            )
 
 
 @dataclass(frozen=True)
@@ -145,6 +169,17 @@ class SelectedModel:
             raise ValueError("Selected model must have a certified partition.")
         if candidate.score.partition_signature != self.selected_partition_signature:
             raise ValueError("Selected-model score signature is inconsistent.")
+        if candidate.score.name == "clonal_fixed_partition_bic":
+            anchor_index = candidate.raw_fit.raw_clonal_anchor_mutation_index
+            if anchor_index is None:
+                raise ValueError("Selected clonal model must have a raw-fusion anchor.")
+            raw_anchor_cluster = int(candidate.partition.labels[int(anchor_index)])
+            if candidate.refit.clonal_cluster != raw_anchor_cluster:
+                raise ValueError(
+                    "Selected refit must preserve the raw-fusion anchor cluster."
+                )
+            if candidate.anchor_block_signature != candidate.score.anchor_block_signature:
+                raise ValueError("Selected anchor-block score identity is inconsistent.")
 
 
 @dataclass

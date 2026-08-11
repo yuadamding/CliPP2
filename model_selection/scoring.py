@@ -394,8 +394,13 @@ def _select_best_partition_leftmost(
     if frame.empty:
         raise ValueError("Partition-first selection requires at least one row.")
 
+    model_key = (
+        "selection_model_signature"
+        if "selection_model_signature" in frame.columns
+        else "partition_signature"
+    )
     partition_scores: dict[str, float] = {}
-    for signature, rows in frame.groupby("partition_signature", sort=False):
+    for signature, rows in frame.groupby(model_key, sort=False):
         scores = rows[score_column].to_numpy(dtype=float)
         if not np.all(np.isfinite(scores)):
             raise ValueError("Every selectable fixed-partition score must be finite.")
@@ -415,7 +420,7 @@ def _select_best_partition_leftmost(
         if np.isclose(value, best_value, rtol=0.0, atol=1e-12)
     }
     optimal_mask = (
-        frame["partition_signature"].astype(str).isin(best_signatures).to_numpy(bool)
+        frame[model_key].astype(str).isin(best_signatures).to_numpy(bool)
     )
     tied = frame.loc[optimal_mask].copy()
     if "penalized_objective" not in tied.columns:
@@ -540,13 +545,18 @@ def _selected_lambda_signature_interval(
     ):
         return None, None, None
     selected_lambda = float(selected_row["lambda"])
-    signature = str(selected_row.get("partition_signature", ""))
+    model_key = (
+        "selection_model_signature"
+        if "selection_model_signature" in search_df.columns
+        else "partition_signature"
+    )
+    signature = str(selected_row.get(model_key, ""))
     del normalized_score
     eligible = search_df.loc[_bic_selection_eligible_mask(search_df)].copy()
-    if eligible.empty or "partition_signature" not in eligible.columns:
+    if eligible.empty or model_key not in eligible.columns:
         return selected_lambda, selected_lambda, 0.0
     same_partition = eligible.loc[
-        eligible["partition_signature"].astype(str).eq(signature)
+        eligible[model_key].astype(str).eq(signature)
     ]
     lambdas = pd.to_numeric(same_partition["lambda"], errors="coerce").to_numpy(
         dtype=float

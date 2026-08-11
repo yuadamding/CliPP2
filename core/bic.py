@@ -46,11 +46,12 @@ def effective_bic_depth_count(data: TumorData) -> float:
 def bic_degrees_of_freedom(num_clusters: int, data: TumorData) -> int:
     """Nominal BIC degrees of freedom under the clonal-anchored restriction.
 
-    Model selection requires exactly one cluster pinned at the clonal center
-    (phi = 1 in every region, clipped to the feasibility box; see
-    ``core.fusion.refit.partition_constrained_observed_refit``). The pinned
-    centers are constants, so a K-cluster model estimates (K - 1) * S center
-    parameters. Upper bound; active df is typically smaller.
+    Model selection requires one mutation coordinate pinned at its feasible
+    clonal center inside the raw pairwise-fusion objective. The immutable raw
+    partition determines its clonal block, and the fixed-label refit preserves
+    that block at its common feasible clonal center. Those pinned centers are
+    constants, so a K-cluster model estimates (K - 1) * S center parameters.
+    Upper bound; active df is typically smaller.
     """
     return max(int(num_clusters) - 1, 0) * int(data.num_regions)
 
@@ -77,6 +78,9 @@ def fixed_partition_bic(
     data: TumorData,
     anchor_mode: str,
     partition_signature: str,
+    anchor_block_signature: str = "none",
+    labels: np.ndarray | None = None,
+    anchor_cluster: int | None = None,
 ) -> "SelectionScore":
     """Return the explicitly named BIC for one immutable partition refit."""
 
@@ -89,6 +93,21 @@ def fixed_partition_bic(
         score_name = "clonal_fixed_partition_bic"
     else:
         raise ValueError("anchor_mode must be either 'none' or 'clonal_required'.")
+    if labels is not None:
+        labels_array = np.asarray(labels, dtype=np.int64).reshape(-1)
+        if labels_array.size != int(data.num_mutations):
+            raise ValueError("BIC labels must contain one value per mutation.")
+        observed = _observed_positive_depth_mask(data)
+        identifiable_df = 0
+        for cluster in range(int(num_clusters)):
+            if normalized_anchor == "clonal_required" and cluster == anchor_cluster:
+                continue
+            members = labels_array == int(cluster)
+            identifiable_df += sum(
+                bool(np.any(observed[members, region]))
+                for region in range(int(data.num_regions))
+            )
+        degrees_of_freedom = int(identifiable_df)
     n_eff = effective_bic_mutation_region_count(data)
     penalty = float(degrees_of_freedom * np.log(max(int(n_eff), 1)))
     value = float(-2.0 * float(loglik) + penalty)
@@ -104,6 +123,7 @@ def fixed_partition_bic(
         degrees_of_freedom=int(degrees_of_freedom),
         n_eff=int(n_eff),
         partition_signature=str(partition_signature),
+        anchor_block_signature=str(anchor_block_signature),
     )
 
 

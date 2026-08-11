@@ -104,15 +104,32 @@ def mutation_output_table(
 ) -> pd.DataFrame:
     raw_phi, labels = _validate_identity(raw_fit, partition, refit)
     refit_phi = _validated_profile(data, refit.phi, name="refit.phi")
+    raw_anchor_index = getattr(raw_fit, "raw_clonal_anchor_mutation_index", None)
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, data.num_mutations),
             "mutation_id": data.mutation_ids,
             "selected_cluster_label": labels + 1,
+            "raw_clonal_anchor_mutation": np.arange(data.num_mutations)
+            == int(raw_anchor_index if raw_anchor_index is not None else -1),
+            "raw_clonal_anchor_seed": np.arange(data.num_mutations)
+            == int(raw_anchor_index if raw_anchor_index is not None else -1),
+            "raw_clonal_anchor_constraint_residual": np.repeat(
+                float(
+                    getattr(raw_fit, "raw_clonal_anchor_constraint_residual", 0.0)
+                ),
+                data.num_mutations,
+            ),
         }
     )
     for column, region_id in enumerate(data.region_ids):
         region = _display_region_label(region_id)
+        anchor_target = getattr(raw_fit, "raw_clonal_anchor_target", None)
+        table[f"raw_clonal_anchor_target_{region}"] = (
+            np.nan
+            if anchor_target is None
+            else float(np.asarray(anchor_target, dtype=np.float64)[column])
+        )
         table[f"raw_phi_{region}"] = raw_phi[:, column]
         table[f"fixed_partition_refit_phi_{region}"] = refit_phi[:, column]
         table[f"raw_to_refit_delta_{region}"] = (
@@ -171,6 +188,14 @@ def cluster_output_table(
             ),
             "clonal_anchor_cluster": np.arange(partition.n_clusters)
             == int(refit.clonal_cluster if refit.clonal_cluster is not None else -1),
+            "raw_clonal_anchor_cluster": np.arange(partition.n_clusters)
+            == int(refit.clonal_cluster if refit.clonal_cluster is not None else -1),
+            "is_raw_clonal_anchor_cluster": np.arange(partition.n_clusters)
+            == int(refit.clonal_cluster if refit.clonal_cluster is not None else -1),
+            "raw_clonal_anchor_source": np.repeat(
+                str(getattr(raw_fit, "raw_clonal_anchor_source", "none")),
+                partition.n_clusters,
+            ),
             "anchor_deviance_increase": np.repeat(
                 float(refit.anchor_deviance_increase), partition.n_clusters
             ),
@@ -207,6 +232,12 @@ def cluster_output_table(
         table[f"raw_cluster_min_phi_{region}"] = minima
         table[f"raw_cluster_max_phi_{region}"] = maxima
         table[f"fixed_partition_refit_phi_{region}"] = centers[:, column]
+        anchor_target = getattr(raw_fit, "raw_clonal_anchor_target", None)
+        table[f"raw_clonal_anchor_target_{region}"] = (
+            np.nan
+            if anchor_target is None
+            else float(np.asarray(anchor_target, dtype=np.float64)[column])
+        )
     return table
 
 
@@ -281,12 +312,32 @@ def mutation_region_output_table(
         np.asarray([_display_region_label(x) for x in data.region_ids], dtype=object),
         data.num_mutations,
     )
+    anchor_index = getattr(raw_fit, "raw_clonal_anchor_mutation_index", None)
+    anchor_target = getattr(raw_fit, "raw_clonal_anchor_target", None)
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, mutation_ids.shape[0]),
             "mutation_id": mutation_ids,
             "region_id": region_ids,
             "selected_cluster_label": np.repeat(labels + 1, data.num_regions),
+            "raw_clonal_anchor_seed": np.repeat(
+                np.arange(data.num_mutations)
+                == int(anchor_index if anchor_index is not None else -1),
+                data.num_regions,
+            ),
+            "raw_clonal_anchor_target": (
+                np.full(raw_phi.size, np.nan, dtype=np.float64)
+                if anchor_target is None
+                else np.tile(
+                    np.asarray(anchor_target, dtype=np.float64), data.num_mutations
+                )
+            ),
+            "raw_clonal_anchor_constraint_residual": np.repeat(
+                float(
+                    getattr(raw_fit, "raw_clonal_anchor_constraint_residual", 0.0)
+                ),
+                raw_phi.size,
+            ),
             "raw_phi": raw_phi.reshape(-1),
             "fixed_partition_refit_phi": refit_phi.reshape(-1),
             "raw_to_refit_delta": (refit_phi - raw_phi).reshape(-1),

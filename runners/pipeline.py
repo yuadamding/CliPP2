@@ -104,6 +104,53 @@ def process_tumor_bundle(
         "selected_refit_global_optimum_certified": bool(
             refit.global_optimum_certified
         ),
+        "selected_raw_clonal_anchor_mutation_index": (
+            -1
+            if best_fit.raw_clonal_anchor_mutation_index is None
+            else int(best_fit.raw_clonal_anchor_mutation_index)
+        ),
+        "selected_raw_clonal_anchor_mutation_id": (
+            "none"
+            if best_fit.raw_clonal_anchor_mutation_index is None
+            else str(data.mutation_ids[int(best_fit.raw_clonal_anchor_mutation_index)])
+        ),
+        "selected_raw_clonal_anchor_cluster": (
+            -1 if refit.clonal_cluster is None else int(refit.clonal_cluster)
+        ),
+        "selected_raw_clonal_anchor_target": (
+            "none"
+            if best_fit.raw_clonal_anchor_target is None
+            else ",".join(
+                format(float(value), ".17g")
+                for value in np.asarray(best_fit.raw_clonal_anchor_target).reshape(-1)
+            )
+        ),
+        "selected_raw_clonal_anchor_source": str(
+            best_fit.raw_clonal_anchor_source
+        ),
+        "selected_raw_clonal_anchor_mode": str(best_fit.raw_clonal_anchor_mode),
+        "selected_raw_clonal_anchor_constraint_residual": float(
+            best_fit.raw_clonal_anchor_constraint_residual
+        ),
+        "selected_raw_clonal_anchor_frozen_coordinate_count": int(
+            best_fit.raw_clonal_anchor_frozen_coordinate_count
+        ),
+        "selected_raw_clonal_anchor_search_complete": bool(
+            best_fit.raw_clonal_anchor_search_complete
+        ),
+        "selected_raw_clonal_anchor_total_eligible_candidates": int(
+            best_fit.raw_clonal_anchor_total_eligible_candidates
+        ),
+        "selected_raw_clonal_anchor_candidates_evaluated": int(
+            best_fit.raw_clonal_anchor_candidates_evaluated
+        ),
+        "selected_raw_clonal_anchor_objective_gap_to_second": float(
+            best_fit.raw_clonal_anchor_objective_gap_to_second
+        ),
+        "selected_raw_clonal_anchor_screening_rule": str(
+            best_fit.raw_clonal_anchor_screening_rule
+        ),
+        "selected_anchor_block_signature": str(score.anchor_block_signature),
         "selected_objective_spec_hash": str(best_fit.objective_spec_hash),
         "selected_original_graph_hash": str(best_fit.original_graph_hash),
         "selection_metric_value": (

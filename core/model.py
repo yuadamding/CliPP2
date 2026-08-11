@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 import torch
@@ -29,6 +30,24 @@ from .fusion.types import (
 )
 
 
+@dataclass(frozen=True)
+class RawClonalAnchorSpec:
+    mode: Literal["none", "specified_seed", "enumerated_seed", "screened_seed"]
+    target: np.ndarray
+    candidate_mutation_indices: tuple[int, ...]
+    feasibility_tolerance: float
+
+    def __post_init__(self) -> None:
+        target = np.asarray(self.target, dtype=np.float64).reshape(-1).copy()
+        target.setflags(write=False)
+        object.__setattr__(self, "target", target)
+        object.__setattr__(
+            self,
+            "candidate_mutation_indices",
+            tuple(int(index) for index in self.candidate_mutation_indices),
+        )
+
+
 @dataclass
 class FitOptions:
     lambda_value: float
@@ -46,6 +65,11 @@ class FitOptions:
     summary_tol: float | None = 1e-4
     selection_score: str = "clonal_fixed_partition_bic"
     selection_anchor: str = "clonal_required"
+    raw_clonal_anchor_mode: str = "screened_seed"
+    raw_clonal_anchor_mutation_ids: tuple[str, ...] = ()
+    raw_clonal_anchor_target: float = 1.0
+    raw_clonal_anchor_feasibility_tol: float = 1e-8
+    raw_clonal_anchor_candidate_max: int | None = 8
     selection_partition_tol: float = 1e-4
     selection_refit_tol: float = 1e-7
     selection_refit_max_iter: int = 128
@@ -187,6 +211,18 @@ class FitResult:
     path_posterior: np.ndarray | None = None
     likelihood_model_id: str = "clipp2_legacy_major_minor_v1"
     likelihood_eps: float = 1e-6
+    raw_clonal_anchor_mutation_index: int | None = None
+    raw_clonal_anchor_target: np.ndarray | None = None
+    raw_clonal_anchor_source: str = "none"
+    raw_clonal_anchor_mode: str = "none"
+    raw_clonal_anchor_constraint_residual: float = 0.0
+    raw_clonal_anchor_frozen_coordinate_count: int = 0
+    raw_clonal_anchor_search_complete: bool = False
+    raw_clonal_anchor_total_eligible_candidates: int = 0
+    raw_clonal_anchor_candidates_evaluated: int = 0
+    raw_clonal_anchor_objective_rank: int = 0
+    raw_clonal_anchor_objective_gap_to_second: float = float("inf")
+    raw_clonal_anchor_screening_rule: str = "none"
 
 
 def fit_fixed_objective(
@@ -456,11 +492,53 @@ def fit_fixed_objective(
             )
         ),
         likelihood_eps=float(options.eps),
+        raw_clonal_anchor_mutation_index=(
+            None
+            if solver_context is None
+            or solver_context.clonal_anchor_mutation_index is None
+            else int(solver_context.clonal_anchor_mutation_index)
+        ),
+        raw_clonal_anchor_target=(
+            None
+            if solver_context is None or solver_context.clonal_anchor_target is None
+            else solver_context.clonal_anchor_target.detach().cpu().numpy().copy()
+        ),
+        raw_clonal_anchor_source=(
+            "none"
+            if solver_context is None
+            else str(solver_context.clonal_anchor_source)
+        ),
+        raw_clonal_anchor_mode=(
+            "none" if solver_context is None else str(solver_context.clonal_anchor_mode)
+        ),
+        raw_clonal_anchor_constraint_residual=(
+            0.0
+            if solver_context is None
+            or solver_context.clonal_anchor_mutation_index is None
+            or solver_context.clonal_anchor_target is None
+            else float(
+                np.max(
+                    np.abs(
+                        np.asarray(artifacts.phi, dtype=np.float64)[
+                            int(solver_context.clonal_anchor_mutation_index)
+                        ]
+                        - solver_context.clonal_anchor_target.detach().cpu().numpy()
+                    )
+                )
+            )
+        ),
+        raw_clonal_anchor_frozen_coordinate_count=(
+            0
+            if solver_context is None
+            or solver_context.clonal_anchor_mutation_index is None
+            else int(data.num_regions)
+        ),
     )
 
 
 __all__ = [
     "FitOptions",
     "FitResult",
+    "RawClonalAnchorSpec",
     "fit_fixed_objective",
 ]

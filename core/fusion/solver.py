@@ -74,6 +74,7 @@ from .types import (
     DenseEdgeCertificate,
     DenseWarmState,
     ExactSolverResourceLimit,
+    InfeasibleRawClonalAnchor,
     ExactFusionProvenance,
     FusionFitArtifacts,
     GraphFusionCertificate,
@@ -584,18 +585,51 @@ def _objective_spec_fingerprint(
     graph_hash: str,
     major_prior: float,
     eps: float,
+    clonal_anchor_mutation_index: int | None = None,
+    clonal_anchor_target: np.ndarray | None = None,
+    clonal_anchor_source: str = "none",
+    clonal_anchor_mode: str = "none",
+    clonal_anchor_feasibility_tolerance: float = 0.0,
+    constrained_lower: np.ndarray | None = None,
+    constrained_upper: np.ndarray | None = None,
 ) -> str:
     digest = hashlib.sha256()
     for value in (
-        "clipp2_observed_objective_v2",
+        "clipp2_observed_objective_v3_raw_clonal_anchor",
         objective_data_fingerprint,
         graph_hash,
         float(major_prior).hex(),
         float(eps).hex(),
+        (
+            "none"
+            if clonal_anchor_mutation_index is None
+            else str(int(clonal_anchor_mutation_index))
+        ),
+        str(clonal_anchor_source),
+        str(clonal_anchor_mode),
+        float(clonal_anchor_feasibility_tolerance).hex(),
     ):
         encoded = value.encode("utf-8")
         digest.update(len(encoded).to_bytes(8, "little"))
         digest.update(encoded)
+    if clonal_anchor_target is not None:
+        target = np.ascontiguousarray(
+            np.asarray(clonal_anchor_target, dtype=np.float64)
+        )
+        digest.update(str(target.shape).encode("ascii"))
+        digest.update(target.dtype.str.encode("ascii"))
+        digest.update(target.tobytes(order="C"))
+    for name, values in (
+        ("constrained_lower", constrained_lower),
+        ("constrained_upper", constrained_upper),
+    ):
+        if values is None:
+            continue
+        array = np.ascontiguousarray(np.asarray(values, dtype=np.float64))
+        digest.update(name.encode("ascii"))
+        digest.update(str(array.shape).encode("ascii"))
+        digest.update(array.dtype.str.encode("ascii"))
+        digest.update(array.tobytes(order="C"))
     return digest.hexdigest()
 
 
@@ -980,6 +1014,11 @@ def prepare_torch_problem(
     torch_data: TorchTumorData | None = None,
     objective_shape: str = "unimodal",
     defer_graph: bool = False,
+    clonal_anchor_mutation_index: int | None = None,
+    clonal_anchor_target: float | np.ndarray | torch.Tensor | None = None,
+    clonal_anchor_source: str = "none",
+    clonal_anchor_mode: str = "none",
+    clonal_anchor_feasibility_tolerance: float = 0.0,
 ) -> SolverContext:
     tol = _validate_solver_tolerance(tol)
     objective_shape = objective_shape_for_data(data, objective_shape)
@@ -1121,6 +1160,74 @@ def prepare_torch_problem(
     upper = torch.minimum(
         effective_torch_data.phi_upper, torch.ones_like(effective_torch_data.phi_upper)
     )
+    anchor_index: int | None = None
+    anchor_target: torch.Tensor | None = None
+    normalized_anchor_source = str(clonal_anchor_source).strip() or "none"
+    normalized_anchor_mode = str(clonal_anchor_mode).strip().lower() or "none"
+    anchor_feasibility_tolerance = float(clonal_anchor_feasibility_tolerance)
+    if not np.isfinite(anchor_feasibility_tolerance) or anchor_feasibility_tolerance < 0:
+        raise ValueError("Raw clonal-anchor feasibility tolerance must be finite and nonnegative.")
+    if clonal_anchor_mutation_index is not None:
+        anchor_index = int(clonal_anchor_mutation_index)
+        if not 0 <= anchor_index < int(data.num_mutations):
+            raise ValueError(
+                "clonal_anchor_mutation_index must identify one tumor mutation."
+            )
+        if normalized_anchor_source == "none":
+            raise ValueError("A raw clonal anchor requires explicit provenance.")
+        if normalized_anchor_mode not in {
+            "specified_seed",
+            "enumerated_seed",
+            "screened_seed",
+        }:
+            raise ValueError("A raw clonal anchor requires an explicit anchor mode.")
+        if clonal_anchor_target is None:
+            raise ValueError("A raw clonal anchor requires an explicit target.")
+        target_tensor = torch.as_tensor(
+            np.asarray(clonal_anchor_target, dtype=np.float64).copy(),
+            dtype=upper.dtype,
+            device=upper.device,
+        ).reshape(-1)
+        if int(target_tensor.numel()) == 1:
+            target_tensor = target_tensor.expand(int(data.num_regions))
+        if tuple(target_tensor.shape) != (int(data.num_regions),):
+            raise ValueError("Raw clonal-anchor target must have one value per region.")
+        if not bool(torch.all(torch.isfinite(target_tensor)).item()):
+            raise ValueError("Raw clonal-anchor target must be finite.")
+        if bool(torch.any(target_tensor < lower[anchor_index]).item()) or bool(
+            torch.any(target_tensor > 1.0).item()
+        ):
+            raise InfeasibleRawClonalAnchor(
+                "Raw clonal-anchor target lies outside the CCF domain."
+            )
+        if bool(
+            torch.any(
+                target_tensor
+                > upper[anchor_index] + float(anchor_feasibility_tolerance)
+            ).item()
+        ):
+            raise InfeasibleRawClonalAnchor(
+                "no_feasible_raw_clonal_anchor: target exceeds mutation support."
+            )
+        anchor_target = target_tensor.detach().clone()
+        lower = lower.clone()
+        upper = upper.clone()
+        lower[anchor_index] = anchor_target
+        upper[anchor_index] = anchor_target
+
+        def project_start(start: torch.Tensor) -> torch.Tensor:
+            return torch.minimum(torch.maximum(start, lower), upper)
+
+        exact_pilot_tensor = project_start(exact_pilot_tensor)
+        pooled_start_tensor = project_start(pooled_start_tensor)
+        scalar_well_starts_seq = tuple(
+            project_start(_tensor_from_start(start, effective_runtime))
+            for start in scalar_well_starts_seq
+        )
+    else:
+        normalized_anchor_source = "none"
+        normalized_anchor_mode = "none"
+        anchor_feasibility_tolerance = 0.0
     problem = _tensor_problem_from_torch_data(
         effective_torch_data,
         major_prior=float(major_prior),
@@ -1132,6 +1239,17 @@ def prepare_torch_problem(
         graph_hash=graph_hash,
         major_prior=float(major_prior),
         eps=float(eps),
+        clonal_anchor_mutation_index=anchor_index,
+        clonal_anchor_target=(
+            None
+            if anchor_target is None
+            else anchor_target.detach().cpu().numpy()
+        ),
+        clonal_anchor_source=normalized_anchor_source,
+        clonal_anchor_mode=normalized_anchor_mode,
+        clonal_anchor_feasibility_tolerance=anchor_feasibility_tolerance,
+        constrained_lower=lower.detach().cpu().numpy(),
+        constrained_upper=upper.detach().cpu().numpy(),
     )
     return SolverContext(
         problem=problem,
@@ -1149,6 +1267,11 @@ def prepare_torch_problem(
         data_fingerprint=data_fingerprint,
         graph_hash=graph_hash,
         objective_spec_hash=objective_spec_hash,
+        clonal_anchor_mutation_index=anchor_index,
+        clonal_anchor_target=anchor_target,
+        clonal_anchor_source=normalized_anchor_source,
+        clonal_anchor_mode=normalized_anchor_mode,
+        clonal_anchor_feasibility_tolerance=anchor_feasibility_tolerance,
     )
 
 
@@ -1614,6 +1737,14 @@ def _fit_from_start(
     verbose: bool,
 ) -> FusionFitArtifacts:
     tol = _validate_solver_tolerance(tol)
+    if (
+        solver_state is not None
+        and str(solver_state.objective_spec_hash)
+        and str(solver_state.objective_spec_hash) != str(objective_spec_hash)
+    ):
+        raise ValueError(
+            "Solver warm state belongs to a different raw objective/anchor."
+        )
     objective_shape = objective_shape_for_data(data, objective_shape)
     requested_inner_backend = normalize_inner_backend(inner_backend)
     normalized_fallback_policy = normalize_dense_fallback_policy(dense_fallback_policy)
@@ -2855,6 +2986,7 @@ def _fit_from_start(
         quotient_failure=(
             quotient_failure if requested_inner_backend == "quotient_workset" else None
         ),
+        objective_spec_hash=str(objective_spec_hash),
     )
     torch_result = TorchFitResult(
         phi_raw=phi.detach(),

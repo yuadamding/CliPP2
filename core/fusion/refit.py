@@ -39,6 +39,7 @@ class PartitionRefitResult:
     # Index of the cluster pinned at the clonal center (phi = 1 clipped to the
     # feasibility box) under the strict clonal-anchored selection restriction.
     clonal_cluster: int | None = None
+    fixed_anchor_target: np.ndarray | None = None
 
 @dataclass(frozen=True)
 class _RefitCoordinateResult:
@@ -558,6 +559,9 @@ def partition_constrained_observed_refit(
     tol: float,
     max_iter: int,
     anchor_mode: str = "clonal_required",
+    anchor_cluster: int | None = None,
+    fixed_anchor_target: np.ndarray | None = None,
+    anchor_feasibility_tol: float = 1e-8,
     grid_refinement_factor: int = 1,
 ) -> PartitionRefitResult:
     tol = float(tol)
@@ -576,6 +580,25 @@ def partition_constrained_observed_refit(
     if normalized_anchor_mode not in {"none", "clonal_required"}:
         raise ValueError("anchor_mode must be either 'none' or 'clonal_required'.")
     n_clusters = int(labels.max()) + 1 if labels.size else 0
+    if anchor_cluster is not None:
+        anchor_cluster = int(anchor_cluster)
+        if normalized_anchor_mode != "clonal_required":
+            raise ValueError("anchor_cluster requires anchor_mode='clonal_required'.")
+        if not 0 <= anchor_cluster < n_clusters:
+            raise ValueError("anchor_cluster must identify one occupied partition block.")
+    if fixed_anchor_target is not None:
+        fixed_anchor_target = np.asarray(
+            fixed_anchor_target, dtype=np.float64
+        ).reshape(-1)
+        if anchor_cluster is None:
+            raise ValueError("fixed_anchor_target requires anchor_cluster.")
+        if fixed_anchor_target.shape != (int(data.num_regions),):
+            raise ValueError("fixed_anchor_target must have one value per region.")
+        if not np.all(np.isfinite(fixed_anchor_target)):
+            raise ValueError("fixed_anchor_target must be finite.")
+    anchor_feasibility_tol = float(anchor_feasibility_tol)
+    if not np.isfinite(anchor_feasibility_tol) or anchor_feasibility_tol < 0.0:
+        raise ValueError("anchor_feasibility_tol must be finite and nonnegative.")
     n_regions = int(data.num_regions)
     centers = np.zeros((n_clusters, n_regions), dtype=np.float64)
     phi = np.zeros((int(data.num_mutations), n_regions), dtype=np.float64)
@@ -739,7 +762,16 @@ def partition_constrained_observed_refit(
                 upper = float(np.min(upper_matrix[member_rows, region_idx]))
                 if not np.isfinite(upper) or upper < lower:
                     upper = lower
-                pinned = float(min(1.0, upper))
+                pinned = float(
+                    min(1.0, upper)
+                    if fixed_anchor_target is None
+                    or candidate_cluster != anchor_cluster
+                    else fixed_anchor_target[region_idx]
+                )
+                if pinned > upper + anchor_feasibility_tol:
+                    raise ValueError(
+                        "Raw anchor block cannot preserve its strict CCF target."
+                    )
                 anchored_centers[candidate_cluster, region_idx] = pinned
                 if observed_matrix is None:
                     obs_rows = member_rows
@@ -775,11 +807,18 @@ def partition_constrained_observed_refit(
             occupied,
             key=lambda cluster: (float(anchor_increases[cluster]), int(cluster)),
         )
-        clonal_cluster = int(ordered_anchor_clusters[0])
+        clonal_cluster = int(
+            ordered_anchor_clusters[0]
+            if anchor_cluster is None
+            else anchor_cluster
+        )
         anchor_deviance_increase = float(anchor_increases[clonal_cluster])
-        if len(ordered_anchor_clusters) > 1:
+        alternative_clusters = [
+            cluster for cluster in ordered_anchor_clusters if cluster != clonal_cluster
+        ]
+        if alternative_clusters:
             second_best_anchor_deviance_increase = float(
-                anchor_increases[ordered_anchor_clusters[1]]
+                anchor_increases[alternative_clusters[0]]
             )
         member_rows = np.where(labels == clonal_cluster)[0]
         for region_idx in range(n_regions):
@@ -826,18 +865,31 @@ def partition_constrained_observed_refit(
         ),
         loglik_source=(
             (
-                "clonal_anchored_partition_observed_mle"
+                (
+                    "raw_clonal_anchor_preserved_partition_observed_mle"
+                    if anchor_cluster is not None
+                    else "clonal_anchored_partition_observed_mle"
+                )
                 if normalized_anchor_mode == "clonal_required"
                 else "fixed_partition_observed_mle"
             )
             if path_spec is None
             else (
-                "clonal_anchored_partition_observed_mle_path_multibasin"
+                (
+                    "raw_clonal_anchor_preserved_partition_observed_mle_path_multibasin"
+                    if anchor_cluster is not None
+                    else "clonal_anchored_partition_observed_mle_path_multibasin"
+                )
                 if normalized_anchor_mode == "clonal_required"
                 else "fixed_partition_observed_mle_path_multibasin"
             )
         ),
         clonal_cluster=clonal_cluster,
+        fixed_anchor_target=(
+            None
+            if clonal_cluster is None
+            else centers[int(clonal_cluster)].astype(np.float64, copy=True)
+        ),
     )
 
 

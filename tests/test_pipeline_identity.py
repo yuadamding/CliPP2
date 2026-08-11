@@ -62,6 +62,15 @@ class PipelineIdentityTests(unittest.TestCase):
                 )
             ].iloc[0]
             self.assertTrue(bool(selected["raw_objective_certified"]))
+            self.assertTrue(bool(selected["raw_clonal_anchor_certified"]))
+            self.assertTrue(bool(selected["raw_clonal_anchor_search_complete"]))
+            self.assertEqual(
+                int(selected["raw_clonal_anchor_candidates_evaluated"]), 4
+            )
+            self.assertEqual(
+                int(selected["raw_clonal_anchor_frozen_coordinate_count"]), 2
+            )
+            self.assertGreaterEqual(int(selected["outer_num_frozen_coordinates"]), 2)
             self.assertTrue(bool(selected["partition_certified"]))
             self.assertTrue(bool(selected["partition_maximal"]))
             self.assertTrue(bool(selected["refit_numerically_resolved"]))
@@ -101,6 +110,27 @@ class PipelineIdentityTests(unittest.TestCase):
                     if column == "selected_cluster_label"
                 ],
                 ["selected_cluster_label"],
+            )
+            anchor_rows = mutation_table.loc[
+                mutation_table["raw_clonal_anchor_mutation"].astype(bool)
+            ]
+            self.assertEqual(len(anchor_rows), 1)
+            anchor_row = anchor_rows.iloc[0]
+            self.assertEqual(
+                str(anchor_row["mutation_id"]),
+                str(output_summary["selected_raw_clonal_anchor_mutation_id"]),
+            )
+            target = np.fromstring(
+                str(output_summary["selected_raw_clonal_anchor_target"]), sep=","
+            )
+            raw_columns = [
+                column for column in mutation_table if column.startswith("raw_phi_")
+            ]
+            np.testing.assert_allclose(
+                anchor_row[raw_columns].to_numpy(dtype=np.float64),
+                target,
+                rtol=0.0,
+                atol=1e-12,
             )
 
 
