@@ -27,7 +27,15 @@ class FusionPartition:
     max_diameter: float
     diameter_exact: bool
     certified: bool
-    source: Literal["solver_quotient", "verified_primal_equalities"]
+    source: Literal[
+        "solver_quotient",
+        "verified_primal_equalities",
+        "tolerance_defined_primal",
+    ]
+    maximal: bool = False
+    cross_close_edge_found: bool = False
+    certificate_graph_hash_matches: bool = True
+    certification_failure_reason: str = "none"
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -54,8 +62,23 @@ class PartitionRefitSummary:
     finite_candidate_found: bool
     global_optimum_certified: bool
     loglik_source: str
+    refit_numerically_resolved: bool = False
+    refit_loglik_refinement_delta: float = float("inf")
+    refit_max_center_refinement_delta: float = float("inf")
+    refit_coordinate_count: int = 0
+    refit_finite_coordinate_count: int = 0
+    refit_total_grid_points: int = 0
+    refit_max_grid_spacing: float = float("inf")
+    refit_total_candidate_basins: int = 0
+    refit_total_refined_candidates: int = 0
+    refit_min_best_second_loss_gap: float = float("inf")
 
     def __post_init__(self) -> None:
+        if self.global_optimum_certified:
+            raise ValueError(
+                "Partition refits cannot claim global optimality without a "
+                "separate certificate object."
+            )
         object.__setattr__(
             self,
             "labels",
@@ -84,7 +107,7 @@ class SelectionScore:
     partition_signature: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class RawFusionCandidate:
     raw_fit: FitResult
     partition: FusionPartition
@@ -104,6 +127,7 @@ class SelectedModel:
     selected_partition_right_lambda: float | None
 
     def __post_init__(self) -> None:
+        candidate = self.candidate
         if self.selected_partition_signature != self.candidate.partition.signature:
             raise ValueError("Selected-model partition signature is inconsistent.")
         if not np.isclose(
@@ -113,6 +137,14 @@ class SelectedModel:
             atol=1e-12,
         ):
             raise ValueError("Selected-model lambda is inconsistent with its raw fit.")
+        if not candidate.eligible_for_selection:
+            raise ValueError("Selected model must be eligible for selection.")
+        if not candidate.raw_objective_certified:
+            raise ValueError("Selected model must have a certified raw objective.")
+        if not candidate.partition.certified:
+            raise ValueError("Selected model must have a certified partition.")
+        if candidate.score.partition_signature != self.selected_partition_signature:
+            raise ValueError("Selected-model score signature is inconsistent.")
 
 
 @dataclass

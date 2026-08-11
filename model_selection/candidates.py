@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from time import perf_counter
 
 import numpy as np
@@ -29,8 +29,10 @@ from .scoring import (
 )
 from .types import (
     CandidateStaticMetadata,
+    FusionPartition,
     PartitionRefitSummary,
     RawFusionCandidate,
+    SelectionScore,
     StartArray,
 )
 
@@ -54,13 +56,41 @@ def validate_candidate_identity(candidate: RawFusionCandidate) -> None:
         raise AssertionError("Refit partition signature does not match raw partition.")
     if score.partition_signature != partition.signature:
         raise AssertionError("Selection score does not match raw partition.")
+    score_tolerance = 1e-10 * (1.0 + abs(float(score.value)))
+    if not np.isclose(
+        float(score.loglik),
+        float(refit.loglik),
+        rtol=0.0,
+        atol=score_tolerance,
+    ):
+        raise AssertionError("Score likelihood differs from stored refit likelihood.")
+    if int(score.degrees_of_freedom) != int(refit.nominal_df):
+        raise AssertionError("Score and refit degrees of freedom differ.")
+    expected_penalty = float(score.degrees_of_freedom) * np.log(
+        max(int(score.n_eff), 1)
+    )
+    if not np.isclose(
+        float(score.penalty), expected_penalty, rtol=0.0, atol=score_tolerance
+    ):
+        raise AssertionError("Stored BIC penalty is not reconstructible.")
+    expected_score = -2.0 * float(refit.loglik) + expected_penalty
+    if not np.isclose(
+        float(score.value), expected_score, rtol=0.0, atol=score_tolerance
+    ):
+        raise AssertionError("Stored score is not reconstructible.")
+    expected_phi = np.asarray(refit.cluster_centers)[np.asarray(refit.labels)]
+    if not np.allclose(
+        np.asarray(refit.phi), expected_phi, rtol=0.0, atol=1e-12
+    ):
+        raise AssertionError("Refit phi does not match centers indexed by labels.")
 
 
 def _ineligibility_reason(
     *,
     fit: FitResult,
-    partition_certified: bool,
+    partition: FusionPartition,
     refit_finite: bool,
+    refit_numerically_resolved: bool,
     score_finite: bool,
 ) -> str:
     if float(fit.lambda_value) <= 0.0:
@@ -71,13 +101,123 @@ def _ineligibility_reason(
         return "raw_objective_not_faithful"
     if not bool(fit.full_kkt_certified) or not bool(fit.selection_eligible):
         return "raw_objective_not_kkt_certified"
-    if not partition_certified:
-        return "raw_partition_chaining_or_solver_tolerance"
+    if not partition.certified:
+        return str(partition.certification_failure_reason)
     if not refit_finite:
         return "fixed_partition_refit_nonfinite"
+    if not refit_numerically_resolved:
+        return "fixed_partition_refit_numerically_unresolved"
     if not score_finite:
         return "fixed_partition_score_nonfinite"
     return "none"
+
+
+@dataclass(frozen=True)
+class _CachedPartitionRefit:
+    result: PartitionRefitResult
+    loglik_refinement_delta: float
+    max_center_refinement_delta: float
+    numerically_resolved: bool
+
+
+def _likelihood_model_id(data: TumorData) -> str:
+    path = getattr(data, "path_likelihood", None)
+    return (
+        "legacy_major_minor_mixture_v1"
+        if path is None
+        else str(path.model_id)
+    )
+
+
+def _selection_refit_cache_key(
+    *,
+    data: TumorData,
+    partition: FusionPartition,
+    selection_options: FitOptions,
+) -> tuple[object, ...]:
+    return (
+        partition.signature,
+        str(selection_options.selection_anchor),
+        float(selection_options.major_prior),
+        float(selection_options.eps),
+        float(selection_options.selection_refit_tol),
+        int(selection_options.selection_refit_max_iter),
+        _likelihood_model_id(data),
+        "independent_grid_refinement_v1",
+    )
+
+
+def _fixed_partition_refit(
+    *,
+    data: TumorData,
+    partition: FusionPartition,
+    selection_options: FitOptions,
+    cache: dict[object, _CachedPartitionRefit] | None,
+) -> tuple[_CachedPartitionRefit, bool]:
+    refit_spec_key = _selection_refit_cache_key(
+        data=data,
+        partition=partition,
+        selection_options=selection_options,
+    )
+    if cache is not None and refit_spec_key in cache:
+        return cache[refit_spec_key], True
+
+    kwargs = dict(
+        major_prior=float(selection_options.major_prior),
+        eps=float(selection_options.eps),
+        tol=float(selection_options.selection_refit_tol),
+        max_iter=int(selection_options.selection_refit_max_iter),
+        anchor_mode=str(selection_options.selection_anchor),
+    )
+    coarse = partition_constrained_observed_refit(
+        data,
+        partition.labels,
+        grid_refinement_factor=1,
+        **kwargs,
+    )
+    refined = partition_constrained_observed_refit(
+        data,
+        partition.labels,
+        grid_refinement_factor=2,
+        **kwargs,
+    )
+    loglik_delta = abs(float(refined.loglik) - float(coarse.loglik))
+    center_delta = float(
+        np.max(
+            np.abs(
+                np.asarray(refined.cluster_centers, dtype=np.float64)
+                - np.asarray(coarse.cluster_centers, dtype=np.float64)
+            )
+        )
+    )
+    loglik_tolerance = max(
+        float(selection_options.selection_refit_tol)
+        * (1.0 + abs(float(refined.loglik))),
+        1e-10,
+    )
+    center_tolerance = max(
+        10.0 * float(selection_options.selection_refit_tol),
+        1e-10,
+    )
+    numerically_resolved = bool(
+        refined.finite_candidate_found
+        and int(refined.refit_finite_coordinate_count)
+        == int(refined.refit_coordinate_count)
+        and np.isfinite(loglik_delta)
+        and loglik_delta <= loglik_tolerance
+        and np.isfinite(center_delta)
+        and center_delta <= center_tolerance
+        and float(refined.anchor_deviance_increase) >= -loglik_tolerance
+    )
+    cached = _CachedPartitionRefit(
+        result=refined,
+        loglik_refinement_delta=float(loglik_delta),
+        max_center_refinement_delta=float(center_delta),
+        numerically_resolved=numerically_resolved,
+    )
+    if cache is not None:
+        cache[refit_spec_key] = cached
+    return cached, False
 
 
 def _build_refit_summary(
@@ -85,7 +225,7 @@ def _build_refit_summary(
     *,
     partition_signature: str,
     nominal_df: int,
-    path_likelihood_present: bool,
+    resolution: _CachedPartitionRefit,
 ) -> PartitionRefitSummary:
     return PartitionRefitSummary(
         labels=np.asarray(refit.labels, dtype=np.int64).copy(),
@@ -105,11 +245,51 @@ def _build_refit_summary(
             refit.second_best_anchor_deviance_increase
         ),
         finite_candidate_found=bool(refit.finite_candidate_found),
-        global_optimum_certified=bool(
-            refit.finite_candidate_found and not path_likelihood_present
-        ),
+        global_optimum_certified=False,
         loglik_source=str(refit.loglik_source),
+        refit_numerically_resolved=bool(resolution.numerically_resolved),
+        refit_loglik_refinement_delta=float(
+            resolution.loglik_refinement_delta
+        ),
+        refit_max_center_refinement_delta=float(
+            resolution.max_center_refinement_delta
+        ),
+        refit_coordinate_count=int(refit.refit_coordinate_count),
+        refit_finite_coordinate_count=int(refit.refit_finite_coordinate_count),
+        refit_total_grid_points=int(refit.refit_total_grid_points),
+        refit_max_grid_spacing=float(refit.refit_max_grid_spacing),
+        refit_total_candidate_basins=int(refit.refit_total_candidate_basins),
+        refit_total_refined_candidates=int(refit.refit_total_refined_candidates),
+        refit_min_best_second_loss_gap=float(
+            refit.refit_min_best_second_loss_gap
+        ),
     )
+
+
+def _selection_score_diagnostics(
+    *,
+    data: TumorData,
+    refit: PartitionRefitSummary,
+    score: SelectionScore,
+) -> dict[str, float]:
+    diagnostic_df = int(score.degrees_of_freedom)
+    return {
+        "classic_bic": compute_bic_with_df(
+            refit.loglik,
+            diagnostic_df,
+            score.n_eff,
+        ),
+        "classic_bic_active_df": compute_bic_with_df(
+            refit.loglik,
+            refit.active_df,
+            score.n_eff,
+        ),
+        "classic_bic_depth_n": compute_bic_with_df(
+            refit.loglik,
+            diagnostic_df,
+            effective_bic_depth_count(data),
+        ),
+    }
 
 
 def _evaluate_candidate(
@@ -135,7 +315,7 @@ def _evaluate_candidate(
     lambda_value: float,
     selection_score: str,
     static_metadata: CandidateStaticMetadata,
-    bic_refit_cache: dict[object, PartitionRefitResult] | None = None,
+    bic_refit_cache: dict[object, _CachedPartitionRefit] | None = None,
 ) -> tuple[
     FitResult,
     dict[str, float | int | str | bool],
@@ -143,14 +323,15 @@ def _evaluate_candidate(
 ]:
     candidate_start_time = perf_counter()
     canonical_score_name = _normalize_selection_score_name(selection_score)
-    effective_fit_options = (
+    raw_fit_options = (
         fit_options if candidate_fit_options is None else candidate_fit_options
     )
+    selection_options = fit_options
 
     raw_fit_start_time = perf_counter()
     fit = fit_fixed_objective(
         data=data,
-        options=replace(effective_fit_options, lambda_value=float(lambda_value)),
+        options=replace(raw_fit_options, lambda_value=float(lambda_value)),
         phi_start=phi_start,
         exact_pilot=exact_pilot,
         pooled_start=pooled_start,
@@ -163,47 +344,26 @@ def _evaluate_candidate(
         compute_summary=compute_summary,
     )
     raw_fit_elapsed_seconds = float(perf_counter() - raw_fit_start_time)
-    graph = effective_fit_options.graph
+    graph = selection_options.graph
     if graph is None:
         raise RuntimeError(
             "Model-selection candidates require a resolved pairwise-fusion graph."
         )
-    partition_tolerance = _effective_bic_partition_tol(effective_fit_options)
+    partition_tolerance = _effective_bic_partition_tol(selection_options)
     partition = extract_certified_fusion_partition(
         fit,
         graph=graph,
         tolerance=partition_tolerance,
     )
 
-    refit_spec_key = (
-        partition.signature,
-        str(effective_fit_options.selection_anchor),
-        float(effective_fit_options.major_prior),
-        float(effective_fit_options.eps),
-        float(effective_fit_options.tol),
-        max(int(effective_fit_options.inner_max_iter), 32),
-    )
-    cache_allowed = getattr(data, "path_likelihood", None) is None
-    cache_hit = bool(
-        cache_allowed
-        and bic_refit_cache is not None
-        and refit_spec_key in bic_refit_cache
-    )
     refit_start_time = perf_counter()
-    if cache_hit:
-        refit_result = bic_refit_cache[refit_spec_key]
-    else:
-        refit_result = partition_constrained_observed_refit(
-            data,
-            partition.labels,
-            major_prior=float(effective_fit_options.major_prior),
-            eps=float(effective_fit_options.eps),
-            tol=float(effective_fit_options.tol),
-            max_iter=max(int(effective_fit_options.inner_max_iter), 32),
-            anchor_mode=str(effective_fit_options.selection_anchor),
-        )
-        if cache_allowed and bic_refit_cache is not None:
-            bic_refit_cache[refit_spec_key] = refit_result
+    cached_refit, cache_hit = _fixed_partition_refit(
+        data=data,
+        partition=partition,
+        selection_options=selection_options,
+        cache=bic_refit_cache,
+    )
+    refit_result = cached_refit.result
     refit_elapsed_seconds = (
         0.0 if cache_hit else float(perf_counter() - refit_start_time)
     )
@@ -212,7 +372,7 @@ def _evaluate_candidate(
         loglik=float(refit_result.loglik),
         num_clusters=int(partition.n_clusters),
         data=data,
-        anchor_mode=str(effective_fit_options.selection_anchor),
+        anchor_mode=str(selection_options.selection_anchor),
         partition_signature=partition.signature,
     )
     if str(score.name) != canonical_score_name:
@@ -223,7 +383,7 @@ def _evaluate_candidate(
         refit_result,
         partition_signature=partition.signature,
         nominal_df=int(score.degrees_of_freedom),
-        path_likelihood_present=getattr(data, "path_likelihood", None) is not None,
+        resolution=cached_refit,
     )
     raw_objective_certified = bool(
         float(fit.lambda_value) > 0.0
@@ -234,8 +394,9 @@ def _evaluate_candidate(
     )
     reason = _ineligibility_reason(
         fit=fit,
-        partition_certified=bool(partition.certified),
+        partition=partition,
         refit_finite=bool(refit.finite_candidate_found),
+        refit_numerically_resolved=bool(refit.refit_numerically_resolved),
         score_finite=bool(np.isfinite(score.value)),
     )
     candidate = RawFusionCandidate(
@@ -250,21 +411,10 @@ def _evaluate_candidate(
     validate_candidate_identity(candidate)
 
     penalty_value, profile_penalty_value = _profile_penalty_from_fit(fit)
-    classic_df = max(int(partition.n_clusters) - 1, 0) * int(data.num_regions)
-    classic_bic = compute_bic_with_df(
-        refit.loglik,
-        classic_df,
-        score.n_eff,
-    )
-    active_bic = compute_bic_with_df(
-        refit.loglik,
-        refit.active_df,
-        score.n_eff,
-    )
-    depth_bic = compute_bic_with_df(
-        refit.loglik,
-        classic_df,
-        effective_bic_depth_count(data),
+    score_diagnostics = _selection_score_diagnostics(
+        data=data,
+        refit=refit,
+        score=score,
     )
     row: dict[str, float | int | str | bool] = {
         "tumor_id": data.tumor_id,
@@ -277,9 +427,13 @@ def _evaluate_candidate(
         "estimator_role": str(fit.estimator_role),
         "selection_score_name": str(score.name),
         "selection_score": float(score.value),
+        "selection_loglik": float(score.loglik),
+        "selection_df": int(score.degrees_of_freedom),
+        "selection_penalty": float(score.penalty),
+        "selection_n_eff": int(score.n_eff),
         "bic": float(score.value),
         "bic_value": float(score.value),
-        "classic_bic": float(classic_bic),
+        "classic_bic": float(score_diagnostics["classic_bic"]),
         "clonal_fixed_partition_bic": (
             float(score.value)
             if score.name == "clonal_fixed_partition_bic"
@@ -295,12 +449,35 @@ def _evaluate_candidate(
         "bic_penalty": float(score.penalty),
         "bic_active_penalty": float(refit.active_df * np.log(max(score.n_eff, 1))),
         "bic_n_eff": int(score.n_eff),
-        "classic_bic_depth_n": float(depth_bic),
-        "classic_bic_active_df": float(active_bic),
+        "classic_bic_depth_n": float(score_diagnostics["classic_bic_depth_n"]),
+        "classic_bic_active_df": float(
+            score_diagnostics["classic_bic_active_df"]
+        ),
         "bic_refit_finite_candidate_found": bool(refit.finite_candidate_found),
-        "bic_refit_converged": bool(refit.finite_candidate_found),
         "bic_refit_cache_hit": bool(cache_hit),
         "refit_global_optimum_certified": bool(refit.global_optimum_certified),
+        "refit_numerically_resolved": bool(refit.refit_numerically_resolved),
+        "refit_loglik_refinement_delta": float(
+            refit.refit_loglik_refinement_delta
+        ),
+        "refit_max_center_refinement_delta": float(
+            refit.refit_max_center_refinement_delta
+        ),
+        "refit_coordinate_count": int(refit.refit_coordinate_count),
+        "refit_finite_coordinate_count": int(
+            refit.refit_finite_coordinate_count
+        ),
+        "refit_total_grid_points": int(refit.refit_total_grid_points),
+        "refit_max_grid_spacing": float(refit.refit_max_grid_spacing),
+        "refit_total_candidate_basins": int(
+            refit.refit_total_candidate_basins
+        ),
+        "refit_total_refined_candidates": int(
+            refit.refit_total_refined_candidates
+        ),
+        "refit_min_best_second_loss_gap": float(
+            refit.refit_min_best_second_loss_gap
+        ),
         "refit_loglik": float(refit.loglik),
         "refit_fit_loss": float(refit.fit_loss),
         "refit_active_df": int(refit.active_df),
@@ -316,8 +493,18 @@ def _evaluate_candidate(
         "partition_hash": str(partition.signature),
         "partition_source": str(partition.source),
         "partition_tol": float(partition.tolerance),
-        "reporting_partition_tol": float(effective_fit_options.reporting_partition_tol),
+        "reporting_partition_tol": float(selection_options.reporting_partition_tol),
         "partition_certified": bool(partition.certified),
+        "partition_maximal": bool(partition.maximal),
+        "partition_cross_close_edge_found": bool(
+            partition.cross_close_edge_found
+        ),
+        "partition_certificate_graph_hash_matches": bool(
+            partition.certificate_graph_hash_matches
+        ),
+        "partition_certification_failure_reason": str(
+            partition.certification_failure_reason
+        ),
         "partition_max_diameter": float(partition.max_diameter),
         "partition_diameter_exact": bool(partition.diameter_exact),
         "n_clusters": int(partition.n_clusters),
@@ -384,11 +571,15 @@ def _evaluate_candidate(
         "refit_phi_source": "fixed_partition_refit",
         "device": str(fit.device),
         "dtype": str(fit.dtype),
-        "tol": float(effective_fit_options.tol),
-        "outer_max_iter": int(effective_fit_options.outer_max_iter),
-        "inner_max_iter": int(effective_fit_options.inner_max_iter),
-        "eps": float(effective_fit_options.eps),
-        "major_prior": float(effective_fit_options.major_prior),
+        "tol": float(raw_fit_options.tol),
+        "outer_max_iter": int(raw_fit_options.outer_max_iter),
+        "inner_max_iter": int(raw_fit_options.inner_max_iter),
+        "eps": float(raw_fit_options.eps),
+        "major_prior": float(raw_fit_options.major_prior),
+        "selection_refit_tol": float(selection_options.selection_refit_tol),
+        "selection_refit_max_iter": int(
+            selection_options.selection_refit_max_iter
+        ),
         "graph_name": str(fit.graph_name),
         "num_edges": int(static_metadata.edge_count),
         "edge_weight_min": float(static_metadata.edge_weight_min),
@@ -406,4 +597,10 @@ def _evaluate_candidate(
     return fit, row, candidate
 
 
-__all__ = ["_evaluate_candidate", "validate_candidate_identity"]
+__all__ = [
+    "_evaluate_candidate",
+    "_fixed_partition_refit",
+    "_selection_refit_cache_key",
+    "_selection_score_diagnostics",
+    "validate_candidate_identity",
+]

@@ -34,7 +34,7 @@ def _bic_selection_eligible_mask(search_df: pd.DataFrame) -> np.ndarray:
         for column in (
             "raw_kkt_eligible",
             "bic_refit_finite_candidate_found",
-            "bic_refit_converged",
+            "refit_numerically_resolved",
             "classic_bic",
             "bic",
         )
@@ -306,11 +306,10 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
     partition_certified = _required_bool_mask(enriched, "partition_certified")
     if "bic_refit_finite_candidate_found" in enriched.columns:
         bic_refit = _strict_bool_mask(enriched["bic_refit_finite_candidate_found"])
-    elif "bic_refit_converged" in enriched.columns:
-        bic_refit = _strict_bool_mask(enriched["bic_refit_converged"])
     else:
         # Absent certificate means unknown, treated as False (not True)
         bic_refit = np.zeros(n_rows, dtype=bool)
+    refit_resolved = _required_bool_mask(enriched, "refit_numerically_resolved")
     if "classic_bic" in enriched.columns:
         classic_bic = enriched["classic_bic"].to_numpy(dtype=float)
     elif "bic" in enriched.columns:
@@ -325,6 +324,7 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
         raw_kkt
         & partition_certified
         & bic_refit
+        & refit_resolved
         & np.isfinite(classic_bic)
         & np.isfinite(selected_score)
     )

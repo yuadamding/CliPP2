@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from time import perf_counter
 
@@ -13,6 +14,15 @@ from ..model_selection.config import FINAL_PHI_WARD_LADDER_KMAX
 from .model_selection import select_model
 from ..model_selection.candidates import validate_candidate_identity
 from .outputs import write_fit_outputs
+
+
+def _array_fingerprint(values: np.ndarray, *, dtype: np.dtype) -> str:
+    array = np.ascontiguousarray(np.asarray(values, dtype=dtype))
+    digest = hashlib.sha256()
+    digest.update(str(array.shape).encode("ascii"))
+    digest.update(array.dtype.str.encode("ascii"))
+    digest.update(array.tobytes(order="C"))
+    return digest.hexdigest()
 
 
 def process_tumor_bundle(
@@ -64,7 +74,38 @@ def process_tumor_bundle(
         ),
         "selected_n_clusters": int(partition.n_clusters),
         "selected_partition_signature": str(partition.signature),
+        "selected_partition_certified": bool(partition.certified),
+        "selected_partition_maximal": bool(partition.maximal),
+        "selected_labels_hash": _array_fingerprint(
+            partition.labels,
+            dtype=np.dtype(np.int64),
+        ),
+        "selected_raw_phi_hash": _array_fingerprint(
+            best_fit.phi,
+            dtype=np.dtype(np.float64),
+        ),
+        "selected_fixed_partition_refit_phi_hash": _array_fingerprint(
+            refit.phi,
+            dtype=np.dtype(np.float64),
+        ),
+        "selected_fixed_partition_refit_centers_hash": _array_fingerprint(
+            refit.cluster_centers,
+            dtype=np.dtype(np.float64),
+        ),
         "selection_score_name": str(score.name),
+        "selection_score": float(score.value),
+        "selection_loglik": float(score.loglik),
+        "selection_df": int(score.degrees_of_freedom),
+        "selection_penalty": float(score.penalty),
+        "selection_n_eff": int(score.n_eff),
+        "selected_refit_numerically_resolved": bool(
+            refit.refit_numerically_resolved
+        ),
+        "selected_refit_global_optimum_certified": bool(
+            refit.global_optimum_certified
+        ),
+        "selected_objective_spec_hash": str(best_fit.objective_spec_hash),
+        "selected_original_graph_hash": str(best_fit.original_graph_hash),
         "selection_metric_value": (
             np.nan
             if selection_result.selection_metric_value is None

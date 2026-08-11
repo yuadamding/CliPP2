@@ -56,11 +56,13 @@ def generate_partition_initializer_pool(
     curvature=None,
     curvature_elapsed_seconds: float | None = None,
 ) -> PartitionInitializerPool:
-    """Generate the Ward/CEM partition pool used as either proposals or a guide.
+    """Generate the deterministic Ward/CEM pool used to choose one guide.
 
-    The score is supplied explicitly so guided fusion can always choose its
-    initializer by partition ICL without coupling that choice to the final
-    fusion-candidate reporting criterion.
+    The score is supplied explicitly so guided fusion can choose its guide by
+    partition ICL without coupling that choice to the final raw-fusion score.
+    In the default adaptive-graph workflow the chosen guide defines the frozen
+    edge weights as well as the initial solver state and lambda scale. These
+    partitions are preprocessing artifacts and are never selectable models.
     """
 
     generation_start = perf_counter()

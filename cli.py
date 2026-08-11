@@ -54,6 +54,8 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tol", type=float, default=DEFAULT_OPTIMIZATION_TOLERANCE)
     parser.add_argument("--summary-tol", type=float, default=1e-4)
     parser.add_argument("--selection-partition-tol", type=float, default=1e-4)
+    parser.add_argument("--selection-refit-tol", type=float, default=1e-7)
+    parser.add_argument("--selection-refit-max-iter", type=int, default=128)
     parser.add_argument("--reporting-partition-tol", type=float, default=1e-4)
     parser.add_argument(
         "--selection-score",
@@ -158,6 +160,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("--dosage-prior-penalty must be finite and nonnegative")
         for option_name in (
             "selection_partition_tol",
+            "selection_refit_tol",
             "reporting_partition_tol",
         ):
             value = float(getattr(args, option_name))
@@ -165,6 +168,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 parser.error(
                     f"--{option_name.replace('_', '-')} must be positive and finite"
                 )
+        if int(args.selection_refit_max_iter) < 1:
+            parser.error("--selection-refit-max-iter must be positive")
         if int(args.kmax) != 0:
             parser.error("--kmax is deprecated and must be 0 in production mode")
         expected_anchor = (
@@ -190,6 +195,8 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         selection_score=args.selection_score.replace("-", "_"),
         selection_anchor=args.selection_anchor.replace("-", "_"),
         selection_partition_tol=args.selection_partition_tol,
+        selection_refit_tol=args.selection_refit_tol,
+        selection_refit_max_iter=args.selection_refit_max_iter,
         reporting_partition_tol=args.reporting_partition_tol,
         major_prior=args.major_prior,
         device=args.device,

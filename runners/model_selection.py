@@ -22,7 +22,6 @@ from ..core.fusion.partition_starts import (
     PartitionCandidate,
     observed_curvature_at_pilot_torch,
 )
-from ..core.fusion.refit import PartitionRefitResult
 from ..core.fusion.solver import (
     escape_path_breakpoint_solver_state,
     objective_shape_for_data,
@@ -45,6 +44,7 @@ from ..io.data import TumorData, tumor_objective_fingerprint
 from ..core.bic import cluster_sizes_from_labels, compute_partition_icl
 
 from ..model_selection.candidates import (
+    _CachedPartitionRefit,
     _evaluate_candidate,
     validate_candidate_identity,
 )
@@ -836,14 +836,16 @@ def _partition_guided_admm_selection(
 ) -> BICSelectionResult:
     """Select a positive pairwise-fusion fit with an online ADMM lambda search.
 
-    Ward/CEM likelihood partitions are proposal-only.  The best partition-ICL
-    proposal supplies a primal start and adaptive-weight pilot. Its pairwise
-    weight contrast is bounded by a likelihood-curvature noise floor distributed
-    over a mild degree^1.05 complete-graph correction, avoiding the effectively
-    infinite contrast of an exactly fused pilot with a fixed numerical floor.
-    Blockwise KKT capacity supplies the first positive lambda and actual-dual state. Every
-    subsequent lambda is proposed one at a time from observed certified ADMM
-    fits; no lambda grid or multiplier sequence exists in this mode.
+    The best Ward/CEM partition-ICL guide defines the default adaptive graph,
+    supplies the primal start, and sets the initial lambda scale. The graph is
+    then frozen for the complete raw-fusion path; Ward/CEM rows themselves are
+    never selectable. Its pairwise weight contrast is bounded by a
+    likelihood-curvature noise floor distributed over a mild degree^1.05
+    complete-graph correction, avoiding the effectively infinite contrast of
+    an exactly fused pilot with a fixed numerical floor. Blockwise KKT capacity
+    supplies the first positive lambda and actual-dual state. Every subsequent
+    lambda is proposed one at a time from observed certified ADMM fits; no
+    lambda grid or multiplier sequence exists in this mode.
     """
 
     selection_start_time = perf_counter()
@@ -1027,7 +1029,7 @@ def _partition_guided_admm_selection(
         ]
     ] = []
     fit_by_lambda: dict[float, FitResult] = {}
-    bic_refit_cache: dict[object, PartitionRefitResult] = {}
+    bic_refit_cache: dict[object, _CachedPartitionRefit] = {}
     static_metadata = _candidate_static_metadata(
         data, effective_graph, pilot_phi=graph_pilot_phi
     )
@@ -1305,11 +1307,11 @@ def _partition_guided_admm_selection(
         if _prefer_fit_candidate(fit, incumbent):
             fit_by_lambda[lambda_key] = fit
 
-        exact_raw_eligible = bool(
-            artifact.eligible_for_selection
-            and _exact_fusion_certificate_mask(pd.DataFrame([row]))[0]
+        raw_exact_certified = bool(
+            _exact_fusion_certificate_mask(pd.DataFrame([row]))[0]
             and bool(effective_tensor_graph.is_complete)
         )
+        selection_score_available = bool(artifact.eligible_for_selection)
         controller.observe(
             OnlineLambdaObservation(
                 lambda_value=float(proposal.lambda_value),
@@ -1317,9 +1319,16 @@ def _partition_guided_admm_selection(
                 partition_signature=str(row["partition_signature"]),
                 # The active selection score steers the online-lambda
                 # controller (the observation field name is historical).
-                partition_icl=float(row["bic"]),
+                partition_icl=(
+                    float(artifact.score.value)
+                    if selection_score_available
+                    else float("inf")
+                ),
                 kkt_residual=float(row["fixed_objective_kkt_residual"]),
-                exact_candidate_eligible=bool(exact_raw_eligible),
+                exact_candidate_eligible=bool(raw_exact_certified),
+                raw_objective_certified=bool(raw_exact_certified),
+                partition_certified=bool(artifact.partition.certified),
+                selection_score_available=selection_score_available,
                 certificate_status=str(
                     row.get(
                         "full_kkt_certificate_status",

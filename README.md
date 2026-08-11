@@ -19,10 +19,22 @@ certified partition can be selected. The default score is
 the least-cost cluster anchored at the feasible clonal CCF. The unanchored
 `fixed_partition_bic` sensitivity mode uses `K × S` degrees of freedom.
 
-Ward and CEM partitions are initializer proposals only: each proposal must pass
-through a complete raw fusion solve and full KKT audit before it can contribute
-a selectable candidate. Output writing is serialization only and cannot change
-the selected estimator, partition, refit, or score.
+In the default adaptive-graph workflow, a deterministic Ward/CEM guide is an
+objective-defining preprocessing result: it defines the adaptive graph weights,
+supplies the initial raw-fusion state, and sets the initial positive-lambda
+scale. The resulting complete graph is frozen and hashed before the lambda
+path. Ward/CEM partitions are never selectable candidates; every selectable
+result is still a raw fusion solution on that one frozen graph. With a
+user-supplied graph, Ward/CEM supplies initialization and the initial lambda
+scale but does not define the graph.
+
+The fixed-partition refit uses its own immutable numerical specification
+(`--selection-refit-tol` and `--selection-refit-max-iter`), independent of raw
+solver retries or recovery. CliPP2 repeats the refit on a nested denser grid and
+requires the two results to agree before the partition is score-eligible. This
+is a numerical-resolution check, not a claim of a globally certified mixture
+MLE. Output writing is serialization only and cannot change the selected
+estimator, partition, refit, or score.
 
 ## Install
 
@@ -67,6 +79,9 @@ solution of the λ-penalized objective.
 exactly the selected raw fusion partition. It debiases center summaries but
 never changes membership or replaces the raw estimator.
 
-The production selection tolerance controls the certified BIC partition.
+The production selection tolerance deterministically derives the selected
+partition from the final raw CCFs on the frozen graph. Certification requires
+both within-block compactness and no cross-block graph edge at or below that
+tolerance.
 `--reporting-partition-tol` is recorded for reporting compatibility but never
 changes selected K, labels, membership, or BIC.

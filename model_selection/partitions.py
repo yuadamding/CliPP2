@@ -11,7 +11,6 @@ from ..core.fusion.refit import _canonical_labels as _canonical_partition_labels
 from ..core.fusion.types import (
     CompressedEdgeCertificate,
     PairwiseFusionGraph,
-    QuotientWorksetWarmState,
 )
 from .config import (
     LIKELIHOOD_PARTITION_K_ANCHORS,
@@ -188,6 +187,27 @@ def _exact_partition_diameters(phi: np.ndarray, labels: np.ndarray) -> np.ndarra
     return diameters
 
 
+def _has_cross_close_edge(
+    phi: np.ndarray,
+    labels: np.ndarray,
+    graph: PairwiseFusionGraph,
+    *,
+    tolerance: float,
+) -> bool:
+    edge_u = np.asarray(graph.edge_u, dtype=np.int64)
+    edge_v = np.asarray(graph.edge_v, dtype=np.int64)
+    for start in range(0, edge_u.size, 262_144):
+        u = edge_u[start : start + 262_144]
+        v = edge_v[start : start + 262_144]
+        cross = labels[u] != labels[v]
+        if not np.any(cross):
+            continue
+        distances = np.linalg.norm(phi[u[cross]] - phi[v[cross]], axis=1)
+        if np.any(distances <= float(tolerance)):
+            return True
+    return False
+
+
 def extract_certified_fusion_partition(
     fit: FitResult,
     *,
@@ -203,37 +223,46 @@ def extract_certified_fusion_partition(
     if phi.ndim != 2:
         raise ValueError("fit.phi must be a mutation-by-region matrix.")
 
-    state = getattr(fit, "solver_state", None)
-    certificate = getattr(state, "certificate", None)
-    warm_state = getattr(state, "warm_state", None)
-    if bool(getattr(fit, "full_kkt_certified", False)) and isinstance(
-        certificate, CompressedEdgeCertificate
-    ):
-        labels = _canonical_partition_labels(
-            certificate.labels.detach().cpu().numpy().astype(np.int64, copy=False)
+    labels = _canonical_partition_labels(
+        cluster_labels_from_edges(
+            phi,
+            edge_u=graph.edge_u,
+            edge_v=graph.edge_v,
+            tol=tol,
         )
-        source = "solver_quotient"
-    elif isinstance(warm_state, QuotientWorksetWarmState):
-        labels = _canonical_partition_labels(
-            warm_state.labels.detach().cpu().numpy().astype(np.int64, copy=False)
-        )
-        source = "solver_quotient"
-    else:
-        labels = _canonical_partition_labels(
-            cluster_labels_from_edges(
-                phi,
-                edge_u=graph.edge_u,
-                edge_v=graph.edge_v,
-                tol=tol,
-            )
-        )
-        source = "verified_primal_equalities"
+    )
 
     if labels.shape != (phi.shape[0],):
         raise ValueError("Partition labels do not match the raw fit mutation count.")
     diameters = _exact_partition_diameters(phi, labels)
     max_diameter = float(np.max(diameters)) if diameters.size else 0.0
-    certified = bool(np.all(np.isfinite(diameters)) and max_diameter <= tol)
+    within_ok = bool(np.all(np.isfinite(diameters)) and max_diameter <= tol)
+    cross_close = _has_cross_close_edge(
+        phi,
+        labels,
+        graph,
+        tolerance=tol,
+    )
+    state = getattr(fit, "solver_state", None)
+    certificate = getattr(state, "certificate", None)
+    certificate_graph_hash_matches = True
+    if isinstance(certificate, CompressedEdgeCertificate):
+        expected_graph_hash = str(getattr(fit, "original_graph_hash", ""))
+        certificate_graph_hash_matches = bool(
+            expected_graph_hash
+            and str(certificate.graph_hash) == expected_graph_hash
+        )
+    certified = bool(
+        within_ok and not cross_close and certificate_graph_hash_matches
+    )
+    if not certificate_graph_hash_matches:
+        failure_reason = "compressed_certificate_graph_hash_mismatch"
+    elif cross_close:
+        failure_reason = "cross_block_edge_within_partition_tolerance"
+    elif not within_ok:
+        failure_reason = "raw_partition_chaining_or_solver_tolerance"
+    else:
+        failure_reason = "none"
     return FusionPartition(
         labels=labels.astype(np.int64, copy=False),
         signature=_partition_signature(labels),
@@ -242,7 +271,11 @@ def extract_certified_fusion_partition(
         max_diameter=max_diameter,
         diameter_exact=True,
         certified=certified,
-        source=source,
+        source="tolerance_defined_primal",
+        maximal=not cross_close,
+        cross_close_edge_found=bool(cross_close),
+        certificate_graph_hash_matches=bool(certificate_graph_hash_matches),
+        certification_failure_reason=str(failure_reason),
     )
 
 

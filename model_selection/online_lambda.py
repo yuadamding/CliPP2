@@ -87,6 +87,9 @@ class OnlineLambdaObservation:
     raw_kkt_eligible: bool = False
     admm_iterations: int = 0
     exact_candidate_eligible: bool | None = None
+    raw_objective_certified: bool | None = None
+    partition_certified: bool = True
+    selection_score_available: bool | None = None
     certificate_status: str = "unknown"
     backend_name: str = "unknown"
     solver_iterations: int = 0
@@ -193,7 +196,7 @@ class OnlineLambdaController:
         finite = [
             item
             for item in self._certified.values()
-            if isfinite(float(item.partition_icl))
+            if self._selection_score_is_available(item)
         ]
         if not finite:
             return None
@@ -216,7 +219,9 @@ class OnlineLambdaController:
         )
 
     def _is_exact_fusion_certified(self, observation: OnlineLambdaObservation) -> bool:
-        if observation.exact_candidate_eligible is None:
+        if observation.raw_objective_certified is not None:
+            certificate_ok = bool(observation.raw_objective_certified)
+        elif observation.exact_candidate_eligible is None:
             # Compatibility for callers and persisted observations written
             # before explicit exactness provenance was introduced.
             certificate_ok = bool(
@@ -229,6 +234,18 @@ class OnlineLambdaController:
             and isfinite(float(observation.kkt_residual))
             and float(observation.kkt_residual) <= float(self.config.kkt_tolerance)
         )
+
+    @staticmethod
+    def _selection_score_is_available(
+        observation: OnlineLambdaObservation,
+    ) -> bool:
+        explicit = observation.selection_score_available
+        available = (
+            bool(explicit)
+            if explicit is not None
+            else bool(observation.partition_certified)
+        )
+        return bool(available and isfinite(float(observation.partition_icl)))
 
     def _record_proposal(self, proposal: OnlineLambdaProposal) -> OnlineLambdaProposal:
         key = _lambda_key(proposal.lambda_value)
@@ -257,8 +274,19 @@ class OnlineLambdaController:
         self._pending = None
         if self._is_exact_fusion_certified(observation):
             incumbent = self._certified.get(key)
-            if incumbent is None or float(observation.kkt_residual) < float(
-                incumbent.kkt_residual
+            observation_scored = self._selection_score_is_available(observation)
+            incumbent_scored = bool(
+                incumbent is not None
+                and self._selection_score_is_available(incumbent)
+            )
+            if (
+                incumbent is None
+                or (observation_scored and not incumbent_scored)
+                or (
+                    observation_scored == incumbent_scored
+                    and float(observation.kkt_residual)
+                    < float(incumbent.kkt_residual)
+                )
             ):
                 self._certified[key] = observation
             self._retry_key = None
@@ -567,8 +595,7 @@ class OnlineLambdaController:
     ) -> OnlineLambdaProposal | None:
         best = self.best_observation
         if best is None:
-            self._stop_reason = "online_lambda_no_finite_partition_icl"
-            return None
+            return self._unresolved_partition_proposal(points)
         best_index = next(
             idx
             for idx, item in enumerate(points)
@@ -659,10 +686,47 @@ class OnlineLambdaController:
             not isfinite(float(guard.partition_icl))
             for _, _, guard in boundary_intervals
         ):
-            self._stop_reason = "online_lambda_nonfinite_icl_guard"
+            self._stop_reason = "online_lambda_raw_certified_partition_unresolved"
             return None
         self._stop_reason = "online_lambda_score_basin_resolved"
         return None
+
+    def _unresolved_partition_proposal(
+        self,
+        points: list[OnlineLambdaObservation],
+    ) -> OnlineLambdaProposal | None:
+        """Search adjacent lambdas without retrying an already certified raw fit."""
+
+        if not points:
+            self._stop_reason = "online_lambda_raw_certified_partition_unresolved"
+            return None
+        left = points[0]
+        right = points[-1]
+        can_expand_lower = bool(
+            float(left.lambda_value) > float(self.config.lambda_min)
+            and int(left.n_clusters) < int(self.config.num_mutations)
+        )
+        can_expand_upper = bool(
+            float(right.lambda_value) < float(self.config.lambda_max)
+            and int(right.n_clusters) > 1
+        )
+        if not can_expand_lower and not can_expand_upper:
+            self._stop_reason = "online_lambda_raw_certified_partition_unresolved"
+            return None
+        if can_expand_lower and can_expand_upper:
+            lower_span = max(log(self.initial_lambda) - log(left.lambda_value), 0.0)
+            upper_span = max(log(right.lambda_value) - log(self.initial_lambda), 0.0)
+            direction = -1 if lower_span < upper_span else 1
+        else:
+            direction = -1 if can_expand_lower else 1
+        proposal = self._outward_proposal(
+            points,
+            direction=direction,
+            reason="raw_certified_partition_unresolved_search_neighbor",
+        )
+        if proposal is None and self._stop_reason is not None:
+            self._stop_reason = "online_lambda_raw_certified_partition_unresolved"
+        return proposal
 
 
 def guard_score(observation: OnlineLambdaObservation) -> float:

@@ -40,12 +40,6 @@ class PartitionRefitResult:
     # feasibility box) under the strict clonal-anchored selection restriction.
     clonal_cluster: int | None = None
 
-    @property
-    def converged(self) -> bool:
-        # Backward-compatible alias; use finite_candidate_found for new code.
-        return self.finite_candidate_found
-
-
 @dataclass(frozen=True)
 class _RefitCoordinateResult:
     beta: float
@@ -199,6 +193,7 @@ def _cluster_region_candidate_grid(
     ambiguous: np.ndarray,
     eps: float,
     hint: float | None,
+    grid_refinement_factor: int,
 ) -> np.ndarray:
     if upper <= lower + 1e-12:
         return np.asarray([float(lower)], dtype=np.float64)
@@ -207,13 +202,22 @@ def _cluster_region_candidate_grid(
     if hint is not None and np.isfinite(float(hint)):
         points.append(float(np.clip(float(hint), lower, upper)))
 
+    factor = max(int(grid_refinement_factor), 1)
     points.extend(
         np.geomspace(
-            max(float(lower), float(eps)), float(upper), num=97, dtype=np.float64
+            max(float(lower), float(eps)),
+            float(upper),
+            num=96 * factor + 1,
+            dtype=np.float64,
         ).tolist()
     )
     points.extend(
-        np.linspace(float(lower), float(upper), num=49, dtype=np.float64).tolist()
+        np.linspace(
+            float(lower),
+            float(upper),
+            num=48 * factor + 1,
+            dtype=np.float64,
+        ).tolist()
     )
 
     for idx in range(int(b_minus.shape[0])):
@@ -246,6 +250,7 @@ def _path_cluster_region_candidate_grid(
     upper: float,
     eps: float,
     hint: float | None,
+    grid_refinement_factor: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     if upper <= lower + 1e-12:
         point = np.asarray([float(lower)], dtype=np.float64)
@@ -262,16 +267,22 @@ def _path_cluster_region_candidate_grid(
     points: list[float] = hard_breakpoints.tolist()
     if hint is not None and np.isfinite(float(hint)):
         points.append(float(np.clip(float(hint), lower, upper)))
+    factor = max(int(grid_refinement_factor), 1)
     points.extend(
         np.geomspace(
             max(float(lower), float(eps)),
             float(upper),
-            num=129,
+            num=128 * factor + 1,
             dtype=np.float64,
         ).tolist()
     )
     points.extend(
-        np.linspace(float(lower), float(upper), num=65, dtype=np.float64).tolist()
+        np.linspace(
+            float(lower),
+            float(upper),
+            num=64 * factor + 1,
+            dtype=np.float64,
+        ).tolist()
     )
     grid = np.unique(np.round(np.asarray(points, dtype=np.float64), 14))
     grid = grid[(grid >= lower - 1e-12) & (grid <= upper + 1e-12)]
@@ -293,6 +304,7 @@ def _refit_cluster_region(
     tol: float,
     max_iter: int,
     hint: float | None,
+    grid_refinement_factor: int,
     path_spec: PathLikelihoodSpec | None = None,
     path_scaling: np.ndarray | None = None,
 ) -> _RefitCoordinateResult:
@@ -346,6 +358,7 @@ def _refit_cluster_region(
             ambiguous=ambiguous,
             eps=eps,
             hint=hint,
+            grid_refinement_factor=grid_refinement_factor,
         )
         hard_breakpoints = np.asarray([], dtype=np.float64)
     else:
@@ -360,6 +373,7 @@ def _refit_cluster_region(
             upper=upper,
             eps=eps,
             hint=hint,
+            grid_refinement_factor=grid_refinement_factor,
         )
     losses = objective(grid)
     finite = np.isfinite(losses)
@@ -544,10 +558,13 @@ def partition_constrained_observed_refit(
     tol: float,
     max_iter: int,
     anchor_mode: str = "clonal_required",
+    grid_refinement_factor: int = 1,
 ) -> PartitionRefitResult:
     tol = float(tol)
     if not np.isfinite(tol) or tol <= 0.0:
         raise ValueError("Partition refit tolerance must be a positive finite value.")
+    if int(grid_refinement_factor) < 1:
+        raise ValueError("grid_refinement_factor must be a positive integer.")
     labels = np.asarray(labels, dtype=np.int64).reshape(-1)
     if labels.size != int(data.num_mutations):
         raise ValueError(
@@ -641,6 +658,7 @@ def partition_constrained_observed_refit(
                 tol=tol,
                 max_iter=max(int(max_iter), 32),
                 hint=None,
+                grid_refinement_factor=int(grid_refinement_factor),
                 path_spec=(
                     None
                     if path_spec is None

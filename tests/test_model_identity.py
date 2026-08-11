@@ -3,25 +3,44 @@ from __future__ import annotations
 import copy
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import torch
 
 from CliPP2.core.bic import effective_bic_mutation_region_count, fixed_partition_bic
 from CliPP2.core.fusion.graph import build_complete_uniform_graph
 from CliPP2.core.fusion.refit import partition_constrained_observed_refit
+from CliPP2.core.fusion.types import (
+    CompressedEdgeCertificate,
+    QuotientWorksetWarmState,
+)
+from CliPP2.core.model import FitOptions
 from CliPP2.io.data import PathLikelihoodSpec, TumorData
 from CliPP2.model_selection.partitions import (
     _partition_signature,
     extract_certified_fusion_partition,
 )
+from CliPP2.model_selection.candidates import (
+    _build_refit_summary,
+    _fixed_partition_refit,
+    _selection_refit_cache_key,
+    _selection_score_diagnostics,
+    validate_candidate_identity,
+)
 from CliPP2.model_selection.scoring import (
     _positive_exact_fusion_selection_mask,
     _select_best_partition_leftmost,
 )
-from CliPP2.model_selection.types import FusionPartition, PartitionRefitSummary
+from CliPP2.model_selection.types import (
+    FusionPartition,
+    PartitionRefitSummary,
+    RawFusionCandidate,
+    SelectedModel,
+)
 from CliPP2.runners.outputs import write_fit_outputs
 
 
@@ -60,6 +79,59 @@ class ModelIdentityTests(unittest.TestCase):
         self.assertEqual(partition.n_clusters, 1)
         self.assertAlmostEqual(partition.max_diameter, 1.8e-4, places=12)
         self.assertFalse(partition.certified)
+
+    def test_tolerance_partition_merges_finer_quotient_blocks(self) -> None:
+        phi = np.asarray([[0.2], [0.20005]])
+        warm_state = QuotientWorksetWarmState(
+            phi=torch.as_tensor(phi),
+            labels=torch.as_tensor([0, 1]),
+            centers=torch.as_tensor(phi),
+            quotient_dual=None,
+            internal_edge_ids=torch.empty(0, dtype=torch.int64),
+            internal_dual=torch.empty((0, 1), dtype=torch.float64),
+            graph_hash="graph",
+            previous_lambda=1.0,
+        )
+        fit = SimpleNamespace(
+            phi=phi,
+            solver_state=SimpleNamespace(warm_state=warm_state, certificate=None),
+        )
+        partition = extract_certified_fusion_partition(
+            fit,
+            graph=build_complete_uniform_graph(2),
+            tolerance=1e-4,
+        )
+        self.assertEqual(partition.n_clusters, 1)
+        self.assertTrue(partition.certified)
+        self.assertTrue(partition.maximal)
+        self.assertEqual(partition.source, "tolerance_defined_primal")
+
+    def test_compressed_certificate_must_match_original_graph(self) -> None:
+        phi = np.asarray([[0.2], [0.8]])
+        certificate = CompressedEdgeCertificate(
+            labels=torch.as_tensor([0, 1]),
+            centers=torch.as_tensor(phi),
+            internal_edge_ids=torch.empty(0, dtype=torch.int64),
+            internal_dual=torch.empty((0, 1), dtype=torch.float64),
+            graph_hash="wrong-graph",
+            gradient_scope="observed_objective",
+        )
+        fit = SimpleNamespace(
+            phi=phi,
+            original_graph_hash="right-graph",
+            solver_state=SimpleNamespace(certificate=certificate),
+        )
+        partition = extract_certified_fusion_partition(
+            fit,
+            graph=build_complete_uniform_graph(2),
+            tolerance=1e-4,
+        )
+        self.assertFalse(partition.certified)
+        self.assertFalse(partition.certificate_graph_hash_matches)
+        self.assertEqual(
+            partition.certification_failure_reason,
+            "compressed_certificate_graph_hash_mismatch",
+        )
 
     def test_refit_never_changes_labels(self) -> None:
         data = _toy_data()
@@ -126,6 +198,185 @@ class ModelIdentityTests(unittest.TestCase):
         self.assertEqual(score.degrees_of_freedom, expected_df)
         self.assertAlmostEqual(score.value, expected, places=12)
         self.assertAlmostEqual(score.value, -2.0 * score.loglik + score.penalty)
+
+    def test_selection_refit_is_independent_of_raw_retry_effort(self) -> None:
+        data = _toy_data()
+        labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+        partition = FusionPartition(
+            labels=labels,
+            signature=_partition_signature(labels),
+            n_clusters=2,
+            tolerance=1e-4,
+            max_diameter=0.0,
+            diameter_exact=True,
+            certified=True,
+            source="tolerance_defined_primal",
+            maximal=True,
+        )
+        base = FitOptions(lambda_value=0.0)
+        recovery = replace(
+            base,
+            tol=0.5 * base.tol,
+            inner_max_iter=5 * base.inner_max_iter,
+            outer_max_iter=5 * base.outer_max_iter,
+        )
+        self.assertEqual(
+            _selection_refit_cache_key(
+                data=data,
+                partition=partition,
+                selection_options=base,
+            ),
+            _selection_refit_cache_key(
+                data=data,
+                partition=partition,
+                selection_options=recovery,
+            ),
+        )
+        cache = {}
+        first, first_hit = _fixed_partition_refit(
+            data=data,
+            partition=partition,
+            selection_options=base,
+            cache=cache,
+        )
+        second, second_hit = _fixed_partition_refit(
+            data=data,
+            partition=partition,
+            selection_options=recovery,
+            cache=cache,
+        )
+        self.assertFalse(first_hit)
+        self.assertTrue(second_hit)
+        np.testing.assert_array_equal(
+            first.result.cluster_centers,
+            second.result.cluster_centers,
+        )
+        self.assertEqual(first.result.loglik, second.result.loglik)
+        first_score = fixed_partition_bic(
+            loglik=first.result.loglik,
+            num_clusters=partition.n_clusters,
+            data=data,
+            anchor_mode=base.selection_anchor,
+            partition_signature=partition.signature,
+        )
+        second_score = fixed_partition_bic(
+            loglik=second.result.loglik,
+            num_clusters=partition.n_clusters,
+            data=data,
+            anchor_mode=base.selection_anchor,
+            partition_signature=partition.signature,
+        )
+        self.assertEqual(first_score.value, second_score.value)
+
+    def test_refit_certificate_is_honest_and_unanchored_bic_is_consistent(self) -> None:
+        data = _toy_data()
+        labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+        partition = FusionPartition(
+            labels=labels,
+            signature=_partition_signature(labels),
+            n_clusters=2,
+            tolerance=1e-4,
+            max_diameter=0.0,
+            diameter_exact=True,
+            certified=True,
+            source="tolerance_defined_primal",
+            maximal=True,
+        )
+        options = FitOptions(
+            lambda_value=0.0,
+            selection_score="fixed_partition_bic",
+            selection_anchor="none",
+        )
+        resolution, _ = _fixed_partition_refit(
+            data=data,
+            partition=partition,
+            selection_options=options,
+            cache={},
+        )
+        score = fixed_partition_bic(
+            loglik=resolution.result.loglik,
+            num_clusters=partition.n_clusters,
+            data=data,
+            anchor_mode="none",
+            partition_signature=partition.signature,
+        )
+        refit = _build_refit_summary(
+            resolution.result,
+            partition_signature=partition.signature,
+            nominal_df=score.degrees_of_freedom,
+            resolution=resolution,
+        )
+        diagnostics = _selection_score_diagnostics(
+            data=data,
+            refit=refit,
+            score=score,
+        )
+        self.assertFalse(refit.global_optimum_certified)
+        self.assertTrue(refit.refit_numerically_resolved)
+        self.assertEqual(score.degrees_of_freedom, 2 * data.num_regions)
+        self.assertEqual(refit.nominal_df, score.degrees_of_freedom)
+        self.assertAlmostEqual(diagnostics["classic_bic"], score.value)
+
+    def test_selected_model_enforces_full_identity_contract(self) -> None:
+        data = _toy_data()
+        labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+        partition = FusionPartition(
+            labels=labels,
+            signature=_partition_signature(labels),
+            n_clusters=2,
+            tolerance=1e-4,
+            max_diameter=0.0,
+            diameter_exact=True,
+            certified=True,
+            source="tolerance_defined_primal",
+            maximal=True,
+        )
+        options = FitOptions(lambda_value=0.0)
+        resolution, _ = _fixed_partition_refit(
+            data=data,
+            partition=partition,
+            selection_options=options,
+            cache={},
+        )
+        score = fixed_partition_bic(
+            loglik=resolution.result.loglik,
+            num_clusters=partition.n_clusters,
+            data=data,
+            anchor_mode=options.selection_anchor,
+            partition_signature=partition.signature,
+        )
+        refit = _build_refit_summary(
+            resolution.result,
+            partition_signature=partition.signature,
+            nominal_df=score.degrees_of_freedom,
+            resolution=resolution,
+        )
+        raw_fit = SimpleNamespace(lambda_value=1.0)
+        candidate = RawFusionCandidate(
+            raw_fit=raw_fit,
+            partition=partition,
+            refit=refit,
+            score=score,
+            raw_objective_certified=True,
+            eligible_for_selection=True,
+            ineligibility_reason="none",
+        )
+        validate_candidate_identity(candidate)
+        SelectedModel(
+            candidate=candidate,
+            selected_lambda=1.0,
+            selected_partition_signature=partition.signature,
+            selected_partition_left_lambda=1.0,
+            selected_partition_right_lambda=1.0,
+        )
+        with self.assertRaisesRegex(ValueError, "eligible"):
+            SelectedModel(
+                candidate=replace(candidate, eligible_for_selection=False),
+                selected_lambda=1.0,
+                selected_partition_signature=partition.signature,
+                selected_partition_left_lambda=1.0,
+                selected_partition_right_lambda=1.0,
+            )
 
     def test_only_certified_raw_fusion_candidate_can_win(self) -> None:
         base = {
@@ -200,7 +451,7 @@ class ModelIdentityTests(unittest.TestCase):
             anchor_deviance_increase=0.1,
             second_best_anchor_deviance_increase=2.0,
             finite_candidate_found=True,
-            global_optimum_certified=True,
+            global_optimum_certified=False,
             loglik_source="test",
         )
         before = copy.deepcopy((raw_phi, labels, refit_phi))

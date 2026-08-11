@@ -47,6 +47,8 @@ class FitOptions:
     selection_score: str = "clonal_fixed_partition_bic"
     selection_anchor: str = "clonal_required"
     selection_partition_tol: float = 1e-4
+    selection_refit_tol: float = 1e-7
+    selection_refit_max_iter: int = 128
     reporting_partition_tol: float = 1e-4
     objective_shape: str = "unimodal"
     inner_backend: str = DEFAULT_INNER_BACKEND
