@@ -53,10 +53,26 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--inner-max-iter", type=int, default=30)
     parser.add_argument("--tol", type=float, default=DEFAULT_OPTIMIZATION_TOLERANCE)
     parser.add_argument("--summary-tol", type=float, default=1e-4)
-    parser.add_argument("--bic-partition-tol", type=float, default=1e-4)
+    parser.add_argument("--selection-partition-tol", type=float, default=1e-4)
+    parser.add_argument("--reporting-partition-tol", type=float, default=1e-4)
+    parser.add_argument(
+        "--selection-score",
+        choices=["clonal-fixed-partition-bic", "fixed-partition-bic"],
+        default="clonal-fixed-partition-bic",
+    )
+    parser.add_argument(
+        "--selection-anchor",
+        choices=["clonal-required", "none"],
+        default="clonal-required",
+    )
     parser.add_argument("--disable-warm-start", action="store_true")
     parser.add_argument("--major-prior", type=float, default=0.5)
-    parser.add_argument("--kmax", type=int, default=FINAL_PHI_WARD_LADDER_KMAX)
+    parser.add_argument(
+        "--kmax",
+        type=int,
+        default=FINAL_PHI_WARD_LADDER_KMAX,
+        help="Deprecated compatibility option; production requires 0",
+    )
     parser.add_argument(
         "--device", choices=["auto", "cpu", "cuda"], default=DEFAULT_DEVICE
     )
@@ -70,7 +86,9 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         choices=[value.replace("_", "-") for value in INNER_BACKENDS],
         default=DEFAULT_INNER_BACKEND.replace("_", "-"),
     )
-    parser.add_argument("--workset-max-bytes", type=int, default=DEFAULT_WORKSET_MAX_BYTES)
+    parser.add_argument(
+        "--workset-max-bytes", type=int, default=DEFAULT_WORKSET_MAX_BYTES
+    )
     parser.add_argument(
         "--compressed-cache-max-bytes",
         type=int,
@@ -114,8 +132,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipp2",
         description=(
-            "Fit one canonical tumor file with partition-guided ADMM, "
-            "marginal BIC, and the final-phi Ward ladder."
+            "Fit certified raw pairwise-fusion candidates and select an "
+            "immutable partition by fixed-partition BIC."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -138,6 +156,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         penalty = float(args.dosage_prior_penalty)
         if not math.isfinite(penalty) or penalty < 0.0:
             parser.error("--dosage-prior-penalty must be finite and nonnegative")
+        for option_name in (
+            "selection_partition_tol",
+            "reporting_partition_tol",
+        ):
+            value = float(getattr(args, option_name))
+            if not math.isfinite(value) or value <= 0.0:
+                parser.error(
+                    f"--{option_name.replace('_', '-')} must be positive and finite"
+                )
+        if int(args.kmax) != 0:
+            parser.error("--kmax is deprecated and must be 0 in production mode")
+        expected_anchor = (
+            "clonal-required"
+            if args.selection_score == "clonal-fixed-partition-bic"
+            else "none"
+        )
+        if args.selection_anchor != expected_anchor:
+            parser.error(
+                f"--selection-score {args.selection_score} requires "
+                f"--selection-anchor {expected_anchor}"
+            )
     return args
 
 
@@ -148,7 +187,10 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         inner_max_iter=args.inner_max_iter,
         tol=args.tol,
         summary_tol=args.summary_tol,
-        bic_partition_tol=args.bic_partition_tol,
+        selection_score=args.selection_score.replace("-", "_"),
+        selection_anchor=args.selection_anchor.replace("-", "_"),
+        selection_partition_tol=args.selection_partition_tol,
+        reporting_partition_tol=args.reporting_partition_tol,
         major_prior=args.major_prior,
         device=args.device,
         dtype=args.dtype,

@@ -873,7 +873,6 @@ def refine_partition_likelihood(
             eps=float(eps),
             tol=float(tol),
             max_iter=max(int(refit_max_iter), 32),
-            hint_phi=hint_phi,
         )
 
     refit: PartitionRefitResult | None = None
@@ -967,7 +966,6 @@ def partition_constrained_observed_refit_torch(
             eps=float(eps),
             tol=float(tol),
             max_iter=max(int(max_iter), 32),
-            hint_phi=None if hint_phi is None else _as_numpy(hint_phi),
         )
     runtime, torch_data = _resolve_partition_runtime(
         data=data,
@@ -998,6 +996,10 @@ def partition_constrained_observed_refit_torch(
             refit_total_candidate_basins=0,
             refit_total_refined_candidates=0,
             refit_min_best_second_loss_gap=float("inf"),
+            labels=labels_np.astype(np.int64, copy=True),
+            anchor_mode="none",
+            anchor_deviance_increase=0.0,
+            second_best_anchor_deviance_increase=float("inf"),
             loglik_source="partition_constrained_observed_mle_cuda_unimodal",
         )
 
@@ -1119,6 +1121,10 @@ def partition_constrained_observed_refit_torch(
         refit_total_candidate_basins=refit_coordinate_count,
         refit_total_refined_candidates=refit_coordinate_count,
         refit_min_best_second_loss_gap=float(best_second_loss_gap),
+        labels=labels_np.astype(np.int64, copy=True),
+        anchor_mode="none",
+        anchor_deviance_increase=0.0,
+        second_best_anchor_deviance_increase=float("inf"),
         loglik_source="partition_constrained_observed_mle_cuda_unimodal",
     )
 
@@ -1353,7 +1359,6 @@ def generate_likelihood_partition_starts(
                 eps=float(eps),
                 tol=float(tol),
                 max_iter=max(int(refit_max_iter), 32),
-                hint_phi=phi0,
             )
         refit_cache[labels_key] = result
         return result

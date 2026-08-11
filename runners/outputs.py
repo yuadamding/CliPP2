@@ -5,31 +5,63 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from ..core.fusion.multiplicity import infer_multiplicity_posterior_numpy
 from ..core.fusion.path_summary import (
     path_posterior_at_phi_numpy,
     summarize_path_posterior_numpy,
 )
 from ..core.model import FitResult
 from ..io.data import TumorData
+from ..model_selection.partitions import _partition_signature
+from ..model_selection.types import FusionPartition, PartitionRefitSummary
 
 
 def _display_region_label(label: str) -> str:
     return str(label)
 
 
-def _path_supported_mask(
+def _validated_profile(
     data: TumorData,
-    shape: tuple[int, int],
+    values: np.ndarray,
+    *,
+    name: str,
 ) -> np.ndarray:
+    profile = np.asarray(values, dtype=np.float64)
+    expected = (int(data.num_mutations), int(data.num_regions))
+    if profile.shape != expected:
+        raise ValueError(f"{name} has shape {profile.shape}; expected {expected}.")
+    if not np.all(np.isfinite(profile)):
+        raise ValueError(f"{name} must contain only finite values.")
+    return profile
+
+
+def _validate_identity(
+    raw_fit: FitResult,
+    partition: FusionPartition,
+    refit: PartitionRefitSummary,
+) -> tuple[np.ndarray, np.ndarray]:
+    raw_phi = np.asarray(raw_fit.phi, dtype=np.float64)
+    labels = np.asarray(partition.labels, dtype=np.int64)
+    if labels.shape != (raw_phi.shape[0],):
+        raise AssertionError("Selected partition does not match raw fit mutations.")
+    if not np.array_equal(labels, np.asarray(refit.labels, dtype=np.int64)):
+        raise AssertionError("Selected partition and fixed refit labels differ.")
+    if partition.signature != _partition_signature(labels):
+        raise AssertionError("Selected partition signature does not match its labels.")
+    if partition.signature != refit.partition_signature:
+        raise AssertionError("Selected partition and fixed refit signatures differ.")
+    if not partition.certified:
+        raise AssertionError("Refusing to serialize an uncertified partition.")
+    return raw_phi, labels
+
+
+def _path_supported_mask(data: TumorData, shape: tuple[int, int]) -> np.ndarray:
     reasons = getattr(data, "path_unsupported_reason", None)
     if reasons is None:
         return np.ones(shape, dtype=bool)
     reason_array = np.asarray(reasons, dtype=object)
     if tuple(reason_array.shape) != tuple(shape):
-        raise ValueError(
-            "TumorData.path_unsupported_reason shape does not match "
-            f"mutation-region observations: {reason_array.shape} != {shape}."
-        )
+        raise ValueError("path_unsupported_reason shape does not match observations.")
     supported = np.asarray(pd.isna(reason_array), dtype=bool)
     count_observed = getattr(data, "count_observed", None)
     observed = (
@@ -38,10 +70,7 @@ def _path_supported_mask(
         else np.asarray(count_observed, dtype=bool)
     )
     if tuple(observed.shape) != tuple(shape):
-        raise ValueError(
-            "TumorData.count_observed shape does not match mutation-region "
-            f"observations: {observed.shape} != {shape}."
-        )
+        raise ValueError("count_observed shape does not match observations.")
     if np.any((~supported) & observed):
         raise ValueError(
             "Every path_unsupported_reason must correspond to count_observed=False."
@@ -49,278 +78,284 @@ def _path_supported_mask(
     return supported
 
 
-def _path_summary_arrays(
+def _path_summary_for_profile(
     data: TumorData,
-    fit: FitResult,
+    phi: np.ndarray,
     *,
-    phi_values: np.ndarray | None = None,
-    posterior_values: np.ndarray | None = None,
+    eps: float,
 ) -> dict[str, np.ndarray] | None:
     spec = getattr(data, "path_likelihood", None)
-    posterior = (
-        getattr(fit, "path_posterior", None)
-        if posterior_values is None
-        else posterior_values
-    )
-    if spec is None or posterior is None:
+    if spec is None:
         return None
-    supported = _path_supported_mask(data, spec.shape[:2])
-    phi = (
-        np.asarray(fit.phi, dtype=np.float64)
-        if phi_values is None
-        else np.asarray(phi_values, dtype=np.float64)
-    )
+    posterior = path_posterior_at_phi_numpy(data, phi, eps=float(eps))
     return summarize_path_posterior_numpy(
         spec,
-        phi=phi,
+        phi=np.asarray(phi, dtype=np.float64),
         posterior=np.asarray(posterior, dtype=np.float64),
-        supported=supported,
-    )
-
-
-def _summary_ccf_path_arrays(
-    data: TumorData,
-    fit: FitResult,
-) -> dict[str, np.ndarray] | None:
-    if (
-        getattr(data, "path_likelihood", None) is None
-        or getattr(fit, "path_posterior", None) is None
-    ):
-        return None
-    summary_phi = np.asarray(fit.phi_clustered, dtype=np.float64)
-    summary_posterior = path_posterior_at_phi_numpy(
-        data,
-        summary_phi,
-        eps=float(getattr(fit, "likelihood_eps", 1e-6)),
-    )
-    return _path_summary_arrays(
-        data,
-        fit,
-        phi_values=summary_phi,
-        posterior_values=summary_posterior,
+        supported=_path_supported_mask(data, spec.shape[:2]),
     )
 
 
 def mutation_output_table(
     data: TumorData,
-    fit: FitResult,
-    bic_refit_phi: np.ndarray | None = None,
+    raw_fit: FitResult,
+    partition: FusionPartition,
+    refit: PartitionRefitSummary,
 ) -> pd.DataFrame:
-    # Cluster-level attributes (size, diameter, diameter_exact) live in
-    # cluster_centers.tsv, joinable on cluster_label.
+    raw_phi, labels = _validate_identity(raw_fit, partition, refit)
+    refit_phi = _validated_profile(data, refit.phi, name="refit.phi")
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, data.num_mutations),
             "mutation_id": data.mutation_ids,
-            "cluster_label": fit.cluster_labels + 1,
+            "selected_cluster_label": labels + 1,
         }
     )
     for column, region_id in enumerate(data.region_ids):
-        region_label = _display_region_label(region_id)
-        table[f"phi_{region_label}"] = fit.phi[:, column]
-        table[f"summary_phi_{region_label}"] = fit.phi_clustered[:, column]
-        if bic_refit_phi is not None:
-            table[f"bic_refit_phi_{region_label}"] = bic_refit_phi[:, column]
+        region = _display_region_label(region_id)
+        table[f"raw_phi_{region}"] = raw_phi[:, column]
+        table[f"fixed_partition_refit_phi_{region}"] = refit_phi[:, column]
+        table[f"raw_to_refit_delta_{region}"] = (
+            refit_phi[:, column] - raw_phi[:, column]
+        )
     return table
+
+
+def _cluster_raw_diameters(raw_phi: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    n_clusters = int(labels.max()) + 1 if labels.size else 0
+    result = np.zeros(n_clusters, dtype=np.float64)
+    for cluster in range(n_clusters):
+        values = raw_phi[labels == cluster]
+        if values.shape[0] <= 1:
+            continue
+        maximum = 0.0
+        for start in range(0, values.shape[0], 512):
+            block = values[start : start + 512]
+            distances = np.linalg.norm(block[:, None, :] - values[None, :, :], axis=-1)
+            if distances.size:
+                maximum = max(maximum, float(np.max(distances)))
+        result[cluster] = maximum
+    return result
 
 
 def cluster_output_table(
     data: TumorData,
-    fit: FitResult,
-    bic_refit_cluster_centers: np.ndarray | None = None,
+    raw_fit: FitResult,
+    partition: FusionPartition,
+    refit: PartitionRefitSummary,
 ) -> pd.DataFrame:
-    cluster_sizes = np.bincount(fit.cluster_labels, minlength=fit.n_clusters)
-    cluster_diameters = np.asarray(fit.cluster_diameters, dtype=np.float64)
+    raw_phi, labels = _validate_identity(raw_fit, partition, refit)
+    centers = np.asarray(refit.cluster_centers, dtype=np.float64)
+    expected = (int(partition.n_clusters), int(data.num_regions))
+    if centers.shape != expected or not np.all(np.isfinite(centers)):
+        raise ValueError(f"refit.cluster_centers must have shape {expected}.")
+    sizes = np.bincount(labels, minlength=int(partition.n_clusters))
+    diameters = _cluster_raw_diameters(raw_phi, labels)
+    if diameters.size and not np.isclose(
+        float(np.max(diameters)),
+        float(partition.max_diameter),
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise AssertionError(
+            "Serialized raw diameter differs from certified partition."
+        )
     table = pd.DataFrame(
         {
-            "tumor_id": np.repeat(data.tumor_id, fit.n_clusters),
-            "cluster_label": np.arange(1, fit.n_clusters + 1, dtype=int),
-            "cluster_size": cluster_sizes,
-            "cluster_diameter": cluster_diameters,
-            "cluster_diameter_exact": np.repeat(
-                bool(fit.cluster_diameter_exact), fit.n_clusters
+            "tumor_id": np.repeat(data.tumor_id, partition.n_clusters),
+            "cluster_label": np.arange(1, partition.n_clusters + 1, dtype=int),
+            "cluster_size": sizes,
+            "raw_cluster_diameter": diameters,
+            "raw_cluster_diameter_exact": np.repeat(
+                bool(partition.diameter_exact), partition.n_clusters
+            ),
+            "clonal_anchor_cluster": np.arange(partition.n_clusters)
+            == int(refit.clonal_cluster if refit.clonal_cluster is not None else -1),
+            "anchor_deviance_increase": np.repeat(
+                float(refit.anchor_deviance_increase), partition.n_clusters
+            ),
+            "second_best_anchor_deviance_increase": np.repeat(
+                float(refit.second_best_anchor_deviance_increase),
+                partition.n_clusters,
+            ),
+            "partition_signature": np.repeat(
+                str(partition.signature), partition.n_clusters
             ),
         }
     )
     for column, region_id in enumerate(data.region_ids):
-        table[f"phi_{_display_region_label(region_id)}"] = fit.cluster_centers[
-            :, column
-        ]
-        if (
-            bic_refit_cluster_centers is not None
-            and bic_refit_cluster_centers.shape[0] == fit.n_clusters
-        ):
-            table[f"bic_refit_phi_{_display_region_label(region_id)}"] = (
-                bic_refit_cluster_centers[:, column]
-            )
+        region = _display_region_label(region_id)
+        means = np.asarray(
+            [
+                np.mean(raw_phi[labels == cluster, column])
+                for cluster in range(partition.n_clusters)
+            ]
+        )
+        minima = np.asarray(
+            [
+                np.min(raw_phi[labels == cluster, column])
+                for cluster in range(partition.n_clusters)
+            ]
+        )
+        maxima = np.asarray(
+            [
+                np.max(raw_phi[labels == cluster, column])
+                for cluster in range(partition.n_clusters)
+            ]
+        )
+        table[f"raw_cluster_mean_phi_{region}"] = means
+        table[f"raw_cluster_min_phi_{region}"] = minima
+        table[f"raw_cluster_max_phi_{region}"] = maxima
+        table[f"fixed_partition_refit_phi_{region}"] = centers[:, column]
     return table
+
+
+def _add_legacy_multiplicity(
+    table: pd.DataFrame,
+    *,
+    data: TumorData,
+    phi: np.ndarray,
+    prefix: str,
+    major_prior: float,
+    eps: float,
+) -> None:
+    posterior = infer_multiplicity_posterior_numpy(
+        data,
+        phi,
+        major_prior=float(major_prior),
+        eps=float(eps),
+    )
+    table[f"{prefix}_multiplicity_estimated"] = posterior.estimation_mask.reshape(
+        -1
+    ).astype(int)
+    table[f"{prefix}_gamma_major"] = posterior.gamma_major.reshape(-1)
+    table[f"{prefix}_major_call"] = posterior.major_call.reshape(-1).astype(int)
+    table[f"{prefix}_multiplicity_call"] = posterior.multiplicity_call.reshape(-1)
+
+
+def _add_path_summary(
+    table: pd.DataFrame,
+    summary: dict[str, np.ndarray],
+    *,
+    prefix: str,
+) -> None:
+    map_index = summary["map_index"].reshape(-1)
+    table[f"{prefix}_map_path"] = pd.array(
+        [pd.NA if value < 0 else int(value) + 1 for value in map_index],
+        dtype="Int64",
+    )
+    fields = {
+        "pre_switch_path_probability": "single_probability",
+        "post_switch_path_probability": "multi_probability",
+        "switch_boundary_ambiguity_probability": "boundary_probability",
+        "posterior_mutant_copy_mass": "posterior_mutant_copy_mass",
+        "posterior_effective_multiplicity": "posterior_effective_multiplicity",
+        "map_mutant_copy_mass": "map_mutant_copy_mass",
+        "map_effective_multiplicity": "map_effective_multiplicity",
+        "amplified_mutant_copy_probability": "amplified_mutant_copy_probability",
+        "path_entropy": "path_entropy",
+    }
+    for output_name, source_name in fields.items():
+        table[f"{prefix}_{output_name}"] = summary[source_name].reshape(-1)
+    amplified = summary["amplified_mutant_copy_call"].reshape(-1)
+    table[f"{prefix}_amplified_mutant_copy_call"] = pd.array(
+        [pd.NA if not np.isfinite(value) else int(value) for value in amplified],
+        dtype="Int64",
+    )
 
 
 def mutation_region_output_table(
     data: TumorData,
-    fit: FitResult,
-    bic_refit_phi: np.ndarray | None = None,
+    raw_fit: FitResult,
+    partition: FusionPartition,
+    refit: PartitionRefitSummary,
+    *,
+    major_prior: float = 0.5,
 ) -> pd.DataFrame:
+    raw_phi, labels = _validate_identity(raw_fit, partition, refit)
+    refit_phi = _validated_profile(data, refit.phi, name="refit.phi")
     mutation_ids = np.repeat(
         np.asarray(data.mutation_ids, dtype=object), data.num_regions
     )
     region_ids = np.tile(
-        np.asarray(
-            [_display_region_label(region_id) for region_id in data.region_ids],
-            dtype=object,
-        ),
+        np.asarray([_display_region_label(x) for x in data.region_ids], dtype=object),
         data.num_mutations,
     )
-    cluster_labels = np.repeat(fit.cluster_labels + 1, data.num_regions)
     table = pd.DataFrame(
         {
-            "tumor_id": np.repeat(
-                np.asarray(data.tumor_id, dtype=object), mutation_ids.shape[0]
-            ),
+            "tumor_id": np.repeat(data.tumor_id, mutation_ids.shape[0]),
             "mutation_id": mutation_ids,
             "region_id": region_ids,
-            "cluster_label": cluster_labels,
-            "phi": fit.phi.reshape(-1),
-            "summary_phi": fit.phi_clustered.reshape(-1),
-            "bic_refit_phi": (
-                np.full_like(fit.phi, np.nan, dtype=np.float64)
-                if bic_refit_phi is None
-                else bic_refit_phi
-            ).reshape(-1),
+            "selected_cluster_label": np.repeat(labels + 1, data.num_regions),
+            "raw_phi": raw_phi.reshape(-1),
+            "fixed_partition_refit_phi": refit_phi.reshape(-1),
+            "raw_to_refit_delta": (refit_phi - raw_phi).reshape(-1),
             "major_cn": data.major_cn.reshape(-1),
             "minor_cn": data.minor_cn.reshape(-1),
         }
     )
-    path_spec = getattr(data, "path_likelihood", None)
-    if path_spec is None:
-        # Binary major/minor multiplicity fields only exist for the legacy
-        # two-point likelihood; categorical occupancy paths report the path
-        # posterior columns below instead.
-        table["multiplicity_estimated"] = fit.multiplicity_estimated_mask.reshape(
-            -1
-        ).astype(int)
-        table["gamma_major"] = fit.gamma_major.reshape(-1)
-        table["major_call"] = fit.major_call.reshape(-1).astype(int)
-        table["multiplicity_call"] = fit.multiplicity_call.reshape(-1)
-
-    path_summary = _path_summary_arrays(data, fit)
-    if path_summary is not None:
-        map_index = path_summary["map_index"].reshape(-1)
-        table["map_path"] = pd.array(
-            [pd.NA if value < 0 else int(value) + 1 for value in map_index],
-            dtype="Int64",
+    eps = float(getattr(raw_fit, "likelihood_eps", 1e-6))
+    if getattr(data, "path_likelihood", None) is None:
+        _add_legacy_multiplicity(
+            table,
+            data=data,
+            phi=raw_phi,
+            prefix="raw",
+            major_prior=major_prior,
+            eps=eps,
         )
-        table["pre_switch_path_probability"] = path_summary[
-            "single_probability"
-        ].reshape(-1)
-        table["post_switch_path_probability"] = path_summary[
-            "multi_probability"
-        ].reshape(-1)
-        table["switch_boundary_ambiguity_probability"] = path_summary[
-            "boundary_probability"
-        ].reshape(-1)
-        table["posterior_mutant_copy_mass"] = path_summary[
-            "posterior_mutant_copy_mass"
-        ].reshape(-1)
-        table["posterior_effective_multiplicity"] = path_summary[
-            "posterior_effective_multiplicity"
-        ].reshape(-1)
-        table["map_mutant_copy_mass"] = path_summary["map_mutant_copy_mass"].reshape(-1)
-        table["map_effective_multiplicity"] = path_summary[
-            "map_effective_multiplicity"
-        ].reshape(-1)
-        table["amplified_mutant_copy_probability"] = path_summary[
-            "amplified_mutant_copy_probability"
-        ].reshape(-1)
-        amplified_call = path_summary["amplified_mutant_copy_call"].reshape(-1)
-        table["amplified_mutant_copy_call"] = pd.array(
-            [
-                pd.NA if not np.isfinite(value) else int(value)
-                for value in amplified_call
-            ],
-            dtype="Int64",
+        _add_legacy_multiplicity(
+            table,
+            data=data,
+            phi=refit_phi,
+            prefix="refit",
+            major_prior=major_prior,
+            eps=eps,
         )
-        table["path_entropy"] = path_summary["path_entropy"].reshape(-1)
-        summary_path = _summary_ccf_path_arrays(data, fit)
-        if summary_path is not None:
-            summary_map_index = summary_path["map_index"].reshape(-1)
-            table["summary_map_path"] = pd.array(
-                [pd.NA if value < 0 else int(value) + 1 for value in summary_map_index],
-                dtype="Int64",
-            )
-            table["summary_pre_switch_path_probability"] = summary_path[
-                "single_probability"
-            ].reshape(-1)
-            table["summary_post_switch_path_probability"] = summary_path[
-                "multi_probability"
-            ].reshape(-1)
-            table["summary_switch_boundary_ambiguity_probability"] = summary_path[
-                "boundary_probability"
-            ].reshape(-1)
-            table["summary_posterior_mutant_copy_mass"] = summary_path[
-                "posterior_mutant_copy_mass"
-            ].reshape(-1)
-            table["summary_posterior_effective_multiplicity"] = summary_path[
-                "posterior_effective_multiplicity"
-            ].reshape(-1)
-            table["summary_map_mutant_copy_mass"] = summary_path[
-                "map_mutant_copy_mass"
-            ].reshape(-1)
-            table["summary_map_effective_multiplicity"] = summary_path[
-                "map_effective_multiplicity"
-            ].reshape(-1)
-            table["summary_amplified_mutant_copy_probability"] = summary_path[
-                "amplified_mutant_copy_probability"
-            ].reshape(-1)
-            summary_amplified_call = summary_path["amplified_mutant_copy_call"].reshape(
-                -1
-            )
-            table["summary_amplified_mutant_copy_call"] = pd.array(
-                [
-                    pd.NA if not np.isfinite(value) else int(value)
-                    for value in summary_amplified_call
-                ],
-                dtype="Int64",
-            )
-            table["summary_path_entropy"] = summary_path["path_entropy"].reshape(-1)
-        unsupported = getattr(data, "path_unsupported_reason", None)
-        if unsupported is not None:
-            reason = np.asarray(unsupported, dtype=object).reshape(-1)
-            supported = path_summary["supported"].reshape(-1)
-            table["path_supported"] = supported.astype(int)
+    else:
+        raw_summary = _path_summary_for_profile(data, raw_phi, eps=eps)
+        refit_summary = _path_summary_for_profile(data, refit_phi, eps=eps)
+        if raw_summary is None or refit_summary is None:
+            raise AssertionError("Path likelihood did not produce both summaries.")
+        _add_path_summary(table, raw_summary, prefix="raw")
+        _add_path_summary(table, refit_summary, prefix="refit")
+        supported = raw_summary["supported"].reshape(-1)
+        table["path_supported"] = supported.astype(int)
+        reasons = getattr(data, "path_unsupported_reason", None)
+        if reasons is not None:
+            reason = np.asarray(reasons, dtype=object).reshape(-1)
             table["path_unsupported_reason"] = pd.array(
-                np.where(supported, None, reason),
-                dtype="string",
+                np.where(supported, None, reason), dtype="string"
             )
     return table
 
 
 def write_fit_outputs(
+    *,
     outdir: Path,
     data: TumorData,
-    fit: FitResult,
-    bic_refit_phi: np.ndarray | None = None,
-    bic_refit_cluster_centers: np.ndarray | None = None,
+    raw_fit: FitResult,
+    partition: FusionPartition,
+    refit: PartitionRefitSummary,
+    major_prior: float = 0.5,
 ) -> None:
-    """Write the three per-tumor result tables.
+    """Purely serialize one already selected, identity-validated model."""
 
-    Deliberately nothing else: solver, selection, and benchmark diagnostics
-    live in the summary dict the CLI prints to stdout.
-    """
+    _validate_identity(raw_fit, partition, refit)
     outdir.mkdir(parents=True, exist_ok=True)
-    mutation_output_table(data, fit, bic_refit_phi=bic_refit_phi).to_csv(
-        outdir / f"{data.tumor_id}_mutation_clusters.tsv",
-        sep="\t",
-        index=False,
+    mutation_output_table(data, raw_fit, partition, refit).to_csv(
+        outdir / f"{data.tumor_id}_mutation_clusters.tsv", sep="\t", index=False
     )
-    cluster_output_table(
-        data, fit, bic_refit_cluster_centers=bic_refit_cluster_centers
+    cluster_output_table(data, raw_fit, partition, refit).to_csv(
+        outdir / f"{data.tumor_id}_cluster_centers.tsv", sep="\t", index=False
+    )
+    mutation_region_output_table(
+        data,
+        raw_fit,
+        partition,
+        refit,
+        major_prior=float(major_prior),
     ).to_csv(
-        outdir / f"{data.tumor_id}_cluster_centers.tsv",
-        sep="\t",
-        index=False,
-    )
-    mutation_region_output_table(data, fit, bic_refit_phi=bic_refit_phi).to_csv(
         outdir / f"{data.tumor_id}_mutation_region_multiplicity.tsv",
         sep="\t",
         index=False,
@@ -328,8 +363,8 @@ def write_fit_outputs(
 
 
 __all__ = [
-    "mutation_region_output_table",
     "cluster_output_table",
     "mutation_output_table",
+    "mutation_region_output_table",
     "write_fit_outputs",
 ]

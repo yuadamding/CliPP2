@@ -1,55 +1,123 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 import torch
 
 from ..core.model import FitResult
+
 StartArray = np.ndarray | torch.Tensor
 
 
+def _immutable_array(values: np.ndarray, *, dtype: np.dtype) -> np.ndarray:
+    result = np.array(values, dtype=dtype, copy=True)
+    result.setflags(write=False)
+    return result
+
+
+@dataclass(frozen=True)
+class FusionPartition:
+    labels: np.ndarray
+    signature: str
+    n_clusters: int
+    tolerance: float
+    max_diameter: float
+    diameter_exact: bool
+    certified: bool
+    source: Literal["solver_quotient", "verified_primal_equalities"]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "labels",
+            _immutable_array(self.labels, dtype=np.dtype(np.int64)),
+        )
+
+
+@dataclass(frozen=True)
+class PartitionRefitSummary:
+    labels: np.ndarray
+    partition_signature: str
+    phi: np.ndarray
+    cluster_centers: np.ndarray
+    loglik: float
+    fit_loss: float
+    nominal_df: int
+    active_df: int
+    anchor_mode: Literal["none", "clonal_required"]
+    clonal_cluster: int | None
+    anchor_deviance_increase: float
+    second_best_anchor_deviance_increase: float
+    finite_candidate_found: bool
+    global_optimum_certified: bool
+    loglik_source: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "labels",
+            _immutable_array(self.labels, dtype=np.dtype(np.int64)),
+        )
+        object.__setattr__(
+            self,
+            "phi",
+            _immutable_array(self.phi, dtype=np.dtype(np.float64)),
+        )
+        object.__setattr__(
+            self,
+            "cluster_centers",
+            _immutable_array(self.cluster_centers, dtype=np.dtype(np.float64)),
+        )
+
+
+@dataclass(frozen=True)
+class SelectionScore:
+    name: Literal["fixed_partition_bic", "clonal_fixed_partition_bic"]
+    value: float
+    loglik: float
+    penalty: float
+    degrees_of_freedom: int
+    n_eff: int
+    partition_signature: str
+
+
 @dataclass
-class SelectionArtifact:
-    bic: float | None = None
-    classic_bic: float | None = None
-    extended_bic: float | None = None
-    partition_icl: float | None = None
-    partition_log_evidence: float | None = None
-    partition_code_deviance: float | None = None
-    partition_dirichlet_alpha: float | None = None
-    classic_bic_depth_n: float | None = None
-    classic_bic_active_df: float | None = None
-    classic_bic_active_df_depth_n: float | None = None
-    bic_loglik: float | None = None
-    bic_loglik_source: str | None = None
-    bic_df: float | None = None
-    bic_active_df: float | None = None
-    bic_n_eff: float | None = None
-    bic_depth_n_eff: float | None = None
-    bic_partition_tol: float | None = None
-    bic_refit_boundary_count: int | None = None
-    bic_refit_finite_candidate_found: bool | None = None
-    bic_refit_global_optimum_certified: bool | None = None
-    bic_refit_coordinate_count: int | None = None
-    bic_refit_finite_coordinate_count: int | None = None
-    bic_refit_total_grid_points: int | None = None
-    bic_refit_max_grid_spacing: float | None = None
-    bic_refit_total_candidate_basins: int | None = None
-    bic_refit_total_refined_candidates: int | None = None
-    bic_refit_min_best_second_loss_gap: float | None = None
-    bic_refit_converged: bool | None = None
-    bic_refit_phi: np.ndarray | None = None
-    bic_refit_cluster_centers: np.ndarray | None = None
-    bic_partition_labels: np.ndarray | None = None
-    selection_score_name: str | None = None
+class RawFusionCandidate:
+    raw_fit: FitResult
+    partition: FusionPartition
+    refit: PartitionRefitSummary
+    score: SelectionScore
+    raw_objective_certified: bool
+    eligible_for_selection: bool
+    ineligibility_reason: str
+
+
+@dataclass(frozen=True)
+class SelectedModel:
+    candidate: RawFusionCandidate
+    selected_lambda: float
+    selected_partition_signature: str
+    selected_partition_left_lambda: float | None
+    selected_partition_right_lambda: float | None
+
+    def __post_init__(self) -> None:
+        if self.selected_partition_signature != self.candidate.partition.signature:
+            raise ValueError("Selected-model partition signature is inconsistent.")
+        if not np.isclose(
+            float(self.selected_lambda),
+            float(self.candidate.raw_fit.lambda_value),
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            raise ValueError("Selected-model lambda is inconsistent with its raw fit.")
 
 
 @dataclass
 class BICSelectionResult:
-    best_fit: FitResult
-    selected_artifact: SelectionArtifact
+    selected_model: SelectedModel
     search_df: pd.DataFrame
     bic_df_scale: float
     bic_cluster_penalty: float
@@ -84,6 +152,12 @@ class BICSelectionResult:
     selected_lambda_right: float | None
     selected_lambda_interval_log10_width: float | None
     adaptive_refinement_rounds_completed: int
+
+    @property
+    def best_fit(self) -> FitResult:
+        return self.selected_model.candidate.raw_fit
+
+
 @dataclass(frozen=True)
 class CandidateStaticMetadata:
     edge_count: int

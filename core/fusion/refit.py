@@ -31,6 +31,10 @@ class PartitionRefitResult:
     refit_total_candidate_basins: int
     refit_total_refined_candidates: int
     refit_min_best_second_loss_gap: float
+    labels: np.ndarray
+    anchor_mode: str
+    anchor_deviance_increase: float
+    second_best_anchor_deviance_increase: float
     loglik_source: str = "partition_constrained_observed_mle"
     # Index of the cluster pinned at the clonal center (phi = 1 clipped to the
     # feasibility box) under the strict clonal-anchored selection restriction.
@@ -539,7 +543,7 @@ def partition_constrained_observed_refit(
     eps: float,
     tol: float,
     max_iter: int,
-    hint_phi: np.ndarray | None = None,
+    anchor_mode: str = "clonal_required",
 ) -> PartitionRefitResult:
     tol = float(tol)
     if not np.isfinite(tol) or tol <= 0.0:
@@ -551,6 +555,9 @@ def partition_constrained_observed_refit(
             f"({int(data.num_mutations)})."
         )
     labels = _canonical_labels(labels)
+    normalized_anchor_mode = str(anchor_mode).strip().lower()
+    if normalized_anchor_mode not in {"none", "clonal_required"}:
+        raise ValueError("anchor_mode must be either 'none' or 'clonal_required'.")
     n_clusters = int(labels.max()) + 1 if labels.size else 0
     n_regions = int(data.num_regions)
     centers = np.zeros((n_clusters, n_regions), dtype=np.float64)
@@ -570,7 +577,6 @@ def partition_constrained_observed_refit(
     ambiguous = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
     path_spec = getattr(data, "path_likelihood", None)
     upper_matrix = np.asarray(data.phi_upper, dtype=np.float64)
-    hint_matrix = None if hint_phi is None else np.asarray(hint_phi, dtype=np.float64)
     # Only observed mutation_regions contribute to the likelihood, exactly as the torch fit
     # objective masks them (torch_backend.mutation_region_terms_torch). The BIC denominator
     # (effective_bic_mutation_region_count) also excludes them, so the refit loglik numerator
@@ -621,9 +627,6 @@ def partition_constrained_observed_refit(
                 refit_coordinate_count += 1
                 refit_finite_coordinate_count += 1
                 continue
-            hint = None
-            if hint_matrix is not None:
-                hint = float(np.median(hint_matrix[obs_rows, region_idx]))
             coordinate = _refit_cluster_region(
                 alt=alt[obs_rows, region_idx],
                 total=total[obs_rows, region_idx],
@@ -637,7 +640,7 @@ def partition_constrained_observed_refit(
                 eps=float(eps),
                 tol=tol,
                 max_iter=max(int(max_iter), 32),
-                hint=hint,
+                hint=None,
                 path_spec=(
                     None
                     if path_spec is None
@@ -699,24 +702,70 @@ def partition_constrained_observed_refit(
             cluster_region_boundary[cluster_idx, region_idx] = at_boundary
             cluster_region_active[cluster_idx, region_idx] = not at_boundary
 
-    # Strict clonal-anchored selection restriction: exactly one cluster must sit
-    # at the clonal center, phi = 1 clipped to the feasibility box, in every
-    # region. The freely refit cluster with the highest mean center is pinned
-    # there and its likelihood recomputed at the pinned value; its centers are
-    # constants, so they carry no degrees of freedom (see bic_degrees_of_freedom).
+    # Under the clonal restriction, enumerate every possible anchored cluster
+    # and choose the one with the smallest exact increase in observed loss.
+    # Labels remain immutable throughout.
     clonal_cluster: int | None = None
-    if n_clusters >= 1:
+    anchor_deviance_increase = 0.0
+    second_best_anchor_deviance_increase = float("inf")
+    if n_clusters >= 1 and normalized_anchor_mode == "clonal_required":
         occupied = [int(c) for c in range(n_clusters) if np.any(labels == c)]
-        clonal_cluster = int(
-            occupied[int(np.argmax([centers[c].mean() for c in occupied]))]
+        anchored_losses = np.zeros((n_clusters, n_regions), dtype=np.float64)
+        anchored_centers = np.zeros((n_clusters, n_regions), dtype=np.float64)
+        anchor_increases = np.full(n_clusters, np.inf, dtype=np.float64)
+        for candidate_cluster in occupied:
+            member_rows = np.where(labels == candidate_cluster)[0]
+            increase = 0.0
+            for region_idx in range(n_regions):
+                lower = float(eps)
+                upper = float(np.min(upper_matrix[member_rows, region_idx]))
+                if not np.isfinite(upper) or upper < lower:
+                    upper = lower
+                pinned = float(min(1.0, upper))
+                anchored_centers[candidate_cluster, region_idx] = pinned
+                if observed_matrix is None:
+                    obs_rows = member_rows
+                else:
+                    obs_rows = member_rows[observed_matrix[member_rows, region_idx]]
+                pinned_loss = (
+                    0.0
+                    if obs_rows.size == 0
+                    else float(
+                        _pinned_cluster_region_loss(
+                            data,
+                            obs_rows=obs_rows,
+                            region_idx=region_idx,
+                            beta=pinned,
+                            alt=alt,
+                            total=total,
+                            b_minus=b_minus,
+                            b_plus=b_plus,
+                            b_fixed=b_fixed,
+                            ambiguous=ambiguous,
+                            path_spec=path_spec,
+                            major_prior=float(major_prior),
+                            eps=float(eps),
+                        )
+                    )
+                )
+                anchored_losses[candidate_cluster, region_idx] = pinned_loss
+                increase += pinned_loss - float(
+                    cluster_region_loss[candidate_cluster, region_idx]
+                )
+            anchor_increases[candidate_cluster] = float(increase)
+        ordered_anchor_clusters = sorted(
+            occupied,
+            key=lambda cluster: (float(anchor_increases[cluster]), int(cluster)),
         )
+        clonal_cluster = int(ordered_anchor_clusters[0])
+        anchor_deviance_increase = float(anchor_increases[clonal_cluster])
+        if len(ordered_anchor_clusters) > 1:
+            second_best_anchor_deviance_increase = float(
+                anchor_increases[ordered_anchor_clusters[1]]
+            )
         member_rows = np.where(labels == clonal_cluster)[0]
         for region_idx in range(n_regions):
-            lower = float(eps)
-            upper = float(np.min(upper_matrix[member_rows, region_idx]))
-            if not np.isfinite(upper) or upper < lower:
-                upper = lower
-            pinned = float(min(1.0, upper))
+            pinned = float(anchored_centers[clonal_cluster, region_idx])
             if observed_matrix is None:
                 obs_rows = member_rows
             else:
@@ -724,23 +773,7 @@ def partition_constrained_observed_refit(
             if obs_rows.size == 0:
                 centers[clonal_cluster, region_idx] = pinned
                 continue
-            pinned_loss = float(
-                _pinned_cluster_region_loss(
-                    data,
-                    obs_rows=obs_rows,
-                    region_idx=region_idx,
-                    beta=pinned,
-                    alt=alt,
-                    total=total,
-                    b_minus=b_minus,
-                    b_plus=b_plus,
-                    b_fixed=b_fixed,
-                    ambiguous=ambiguous,
-                    path_spec=path_spec,
-                    major_prior=float(major_prior),
-                    eps=float(eps),
-                )
-            )
+            pinned_loss = float(anchored_losses[clonal_cluster, region_idx])
             total_loss += pinned_loss - float(
                 cluster_region_loss[clonal_cluster, region_idx]
             )
@@ -767,10 +800,24 @@ def partition_constrained_observed_refit(
         refit_total_candidate_basins=int(refit_total_candidate_basins),
         refit_total_refined_candidates=int(refit_total_refined_candidates),
         refit_min_best_second_loss_gap=float(refit_min_best_second_loss_gap),
+        labels=labels.astype(np.int64, copy=True),
+        anchor_mode=normalized_anchor_mode,
+        anchor_deviance_increase=float(anchor_deviance_increase),
+        second_best_anchor_deviance_increase=float(
+            second_best_anchor_deviance_increase
+        ),
         loglik_source=(
-            "clonal_anchored_partition_observed_mle"
+            (
+                "clonal_anchored_partition_observed_mle"
+                if normalized_anchor_mode == "clonal_required"
+                else "fixed_partition_observed_mle"
+            )
             if path_spec is None
-            else "clonal_anchored_partition_observed_mle_path_multibasin"
+            else (
+                "clonal_anchored_partition_observed_mle_path_multibasin"
+                if normalized_anchor_mode == "clonal_required"
+                else "fixed_partition_observed_mle_path_multibasin"
+            )
         ),
         clonal_cluster=clonal_cluster,
     )

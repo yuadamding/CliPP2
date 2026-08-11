@@ -4,13 +4,7 @@ import numpy as np
 import pandas as pd
 
 from ..core.model import FitOptions, FitResult
-from ..io.data import TumorData
-from ..core.bic import (
-    compute_classic_bic,
-    compute_extended_bic,
-    compute_partition_icl,
-)
-from .config import PARTITION_ICL_DIRICHLET_ALPHA, SELECTION_SCORE_NAMES
+from .config import SELECTION_SCORE_NAMES
 
 
 _EXACT_OBSERVED_OBJECTIVE_GRADIENT_SCOPES = frozenset(
@@ -22,102 +16,12 @@ _EXACT_OBSERVED_OBJECTIVE_GRADIENT_SCOPES = frozenset(
 
 
 def _normalize_selection_score_name(selection_score: str) -> str:
-    normalized = str(selection_score).strip().lower()
-    if normalized == "ebic":
-        normalized = "extended_bic"
+    normalized = str(selection_score).strip().lower().replace("-", "_")
     if normalized in SELECTION_SCORE_NAMES:
         return normalized
     allowed = ", ".join(SELECTION_SCORE_NAMES)
     raise ValueError(
         f"Unknown selection_score: {selection_score}. Expected one of: {allowed}."
-    )
-
-
-def _selection_score_value(
-    *,
-    loglik: float,
-    num_clusters: int,
-    data: TumorData,
-    bic_df_scale: float,
-    bic_cluster_penalty: float,
-    selection_score: str,
-    cluster_sizes: np.ndarray | None = None,
-    partition_icl_alpha: float = PARTITION_ICL_DIRICHLET_ALPHA,
-    marginal_loglik: float | None = None,
-) -> tuple[float, float, float, float]:
-    classic_bic = compute_classic_bic(loglik, num_clusters, data)
-    extended_bic = compute_extended_bic(
-        loglik,
-        num_clusters,
-        data,
-        bic_df_scale=bic_df_scale,
-        bic_cluster_penalty=bic_cluster_penalty,
-    )
-    partition_icl = (
-        float("nan")
-        if cluster_sizes is None
-        else compute_partition_icl(
-            loglik,
-            cluster_sizes,
-            data,
-            alpha=float(partition_icl_alpha),
-        )
-    )
-    normalized = _normalize_selection_score_name(selection_score)
-    if normalized == "bic":
-        selected_score = classic_bic
-    elif normalized == "extended_bic":
-        selected_score = extended_bic
-    elif normalized == "marginal_bic":
-        if marginal_loglik is None or not np.isfinite(float(marginal_loglik)):
-            raise ValueError(
-                "marginal_bic selection requires a finite marginal "
-                "mixture log-likelihood."
-            )
-        # Same (K-1)*S*log(n_eff) penalty as classic BIC; only the likelihood
-        # differs (assignments integrated out at the CEM-stabilized centers).
-        selected_score = compute_classic_bic(
-            float(marginal_loglik), num_clusters, data
-        )
-    elif normalized == "partition_icl":
-        if not np.isfinite(partition_icl):
-            raise ValueError(
-                "partition_icl selection requires candidate cluster sizes or labels."
-            )
-        selected_score = partition_icl
-    else:
-        raise ValueError(f"Unknown normalized selection_score: {selection_score}")
-    return (
-        float(selected_score),
-        float(classic_bic),
-        float(extended_bic),
-        float(partition_icl),
-    )
-
-
-def _is_bic_selection_eligible(
-    *,
-    raw_kkt_eligible: bool,
-    classic_bic: float,
-    selection_score_value: float | None = None,
-    bic_refit_finite_candidate_found: bool | None = None,
-    bic_refit_converged: bool | None = None,
-) -> bool:
-    refit_finite = (
-        _bool_with_default(bic_refit_finite_candidate_found, default=False)
-        if bic_refit_finite_candidate_found is not None
-        else _bool_with_default(bic_refit_converged, default=False)
-    )
-    selected_score_finite = (
-        np.isfinite(float(classic_bic))
-        if selection_score_value is None
-        else np.isfinite(float(selection_score_value))
-    )
-    return bool(
-        _bool_with_default(raw_kkt_eligible, default=False)
-        and refit_finite
-        and np.isfinite(float(classic_bic))
-        and selected_score_finite
     )
 
 
@@ -305,7 +209,14 @@ def _positive_exact_fusion_selection_mask(search_df: pd.DataFrame) -> np.ndarray
         return _false_mask(search_df)
     lambdas = pd.to_numeric(search_df["lambda"], errors="coerce").to_numpy(dtype=float)
     lambda_ok = np.isfinite(lambdas) & (lambdas > 0.0)
-    return eligible & source_ok & lambda_ok & _exact_fusion_certificate_mask(search_df)
+    partition_ok = _required_bool_mask(search_df, "partition_certified")
+    return (
+        eligible
+        & source_ok
+        & lambda_ok
+        & partition_ok
+        & _exact_fusion_certificate_mask(search_df)
+    )
 
 
 def _row_bic_selection_eligible(row: pd.Series) -> bool:
@@ -392,20 +303,7 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
         raw_kkt = _strict_bool_mask(enriched["converged"])
     else:
         raw_kkt = np.zeros(n_rows, dtype=bool)
-    if "candidate_pool_source" in enriched.columns:
-        candidate_source = enriched["candidate_pool_source"].astype(str)
-        partition_candidate = candidate_source.eq("likelihood_partition").to_numpy(
-            dtype=bool
-        )
-    elif "search_phase" in enriched.columns:
-        partition_candidate = (
-            enriched["search_phase"]
-            .astype(str)
-            .eq("likelihood_partition")
-            .to_numpy(dtype=bool)
-        )
-    else:
-        partition_candidate = np.zeros(n_rows, dtype=bool)
+    partition_certified = _required_bool_mask(enriched, "partition_certified")
     if "bic_refit_finite_candidate_found" in enriched.columns:
         bic_refit = _strict_bool_mask(enriched["bic_refit_finite_candidate_found"])
     elif "bic_refit_converged" in enriched.columns:
@@ -424,7 +322,8 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
     else:
         selected_score = classic_bic
     enriched["bic_selection_eligible"] = (
-        (raw_kkt | partition_candidate)
+        raw_kkt
+        & partition_certified
         & bic_refit
         & np.isfinite(classic_bic)
         & np.isfinite(selected_score)
@@ -474,30 +373,58 @@ def _annotate_bic_diagnostics(search_df: pd.DataFrame) -> pd.DataFrame:
     return enriched
 
 
-def _optimal_lambda_range(
-    values: np.ndarray,
-    lambdas: np.ndarray,
+def _select_best_partition_leftmost(
+    frame: pd.DataFrame,
     *,
-    maximize: bool,
-) -> tuple[float | None, float | None, int, float | None, np.ndarray]:
-    finite_mask = np.isfinite(values)
-    if not np.any(finite_mask):
-        empty_mask = np.zeros_like(values, dtype=bool)
-        return None, None, 0, None, empty_mask
+    score_column: str,
+) -> tuple[pd.Series, float, np.ndarray]:
+    """Select the best partition, then its least penalized certified raw fit."""
 
-    finite_values = values[finite_mask]
-    best_value = float(np.max(finite_values) if maximize else np.min(finite_values))
-    optimal_mask = finite_mask & np.isclose(values, best_value, rtol=0.0, atol=1e-12)
-    lambda_values = np.unique(
-        np.round(lambdas[optimal_mask].astype(float, copy=False), 12)
+    required = {
+        "partition_signature",
+        "lambda",
+        "selection_step",
+        score_column,
+    }
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(
+            "Partition-first selection is missing columns: " + ", ".join(missing)
+        )
+    if frame.empty:
+        raise ValueError("Partition-first selection requires at least one row.")
+
+    partition_scores: dict[str, float] = {}
+    for signature, rows in frame.groupby("partition_signature", sort=False):
+        scores = rows[score_column].to_numpy(dtype=float)
+        if not np.all(np.isfinite(scores)):
+            raise ValueError("Every selectable fixed-partition score must be finite.")
+        reference = float(scores[0])
+        tolerance = 1e-10 * (1.0 + abs(reference))
+        if not np.allclose(scores, reference, rtol=0.0, atol=tolerance):
+            raise AssertionError(
+                "One partition signature produced inconsistent fixed-partition "
+                "scores; the refit is not search-order invariant."
+            )
+        partition_scores[str(signature)] = reference
+
+    best_value = float(min(partition_scores.values()))
+    best_signatures = {
+        signature
+        for signature, value in partition_scores.items()
+        if np.isclose(value, best_value, rtol=0.0, atol=1e-12)
+    }
+    optimal_mask = (
+        frame["partition_signature"].astype(str).isin(best_signatures).to_numpy(bool)
     )
-    return (
-        float(np.min(lambda_values)),
-        float(np.max(lambda_values)),
-        int(lambda_values.size),
-        best_value,
-        optimal_mask,
+    tied = frame.loc[optimal_mask].copy()
+    if "penalized_objective" not in tied.columns:
+        tied["penalized_objective"] = np.inf
+    tied = tied.sort_values(
+        ["lambda", "penalized_objective", "selection_step"],
+        ascending=[True, True, True],
     )
+    return tied.iloc[0], best_value, optimal_mask
 
 
 def _lambda_range_for_optimal_rows(
@@ -567,9 +494,7 @@ def _prefer_fit_candidate(candidate: FitResult, incumbent: FitResult | None) -> 
 
 
 def _effective_bic_partition_tol(options: FitOptions) -> float:
-    value = options.bic_partition_tol
-    if value is None:
-        value = 1e-4
+    value = options.selection_partition_tol
     return float(max(float(value), 1e-12))
 
 
@@ -579,16 +504,15 @@ def _profile_penalty_from_fit(fit: FitResult) -> tuple[float, float]:
         return penalty, float(penalty / float(fit.lambda_value))
     return penalty, float("nan")
 
+
 def _adaptive_score_column(normalized_score: str) -> str:
-    if normalized_score == "bic":
-        return "classic_bic"
-    if normalized_score == "extended_bic":
-        return "extended_bic"
-    if normalized_score == "partition_icl":
-        return "partition_icl"
-    if normalized_score == "marginal_bic":
-        return "marginal_bic"
+    if normalized_score in {
+        "fixed_partition_bic",
+        "clonal_fixed_partition_bic",
+    }:
+        return "selection_score"
     raise ValueError(f"Unknown normalized selection score: {normalized_score}")
+
 
 def _score_strictly_better(score: float, reference: float) -> bool:
     if not np.isfinite(score) or not np.isfinite(reference):
@@ -596,59 +520,6 @@ def _score_strictly_better(score: float, reference: float) -> bool:
     margin = 1e-8 * (1.0 + abs(float(reference)))
     return bool(float(score) < float(reference) - margin)
 
-def _best_candidate_rows_by_lambda(
-    search_df: pd.DataFrame,
-    *,
-    normalized_score: str = "bic",
-) -> pd.DataFrame:
-    if search_df.empty:
-        return search_df.copy()
-    ranked = _add_bic_selection_eligible(search_df)
-    if (
-        "bic_refit_finite_candidate_found" not in ranked.columns
-        and "bic_refit_converged" in ranked.columns
-    ):
-        ranked["bic_refit_finite_candidate_found"] = ranked[
-            "bic_refit_converged"
-        ].astype(bool)
-    if (
-        "bic_refit_converged" not in ranked.columns
-        and "bic_refit_finite_candidate_found" in ranked.columns
-    ):
-        ranked["bic_refit_converged"] = ranked[
-            "bic_refit_finite_candidate_found"
-        ].astype(bool)
-    ranked["_lambda_key"] = np.round(ranked["lambda"].to_numpy(dtype=float), 12)
-    score_column = _adaptive_score_column(normalized_score)
-    defaults = {
-        "selection_eligible": False,
-        "bic_refit_finite_candidate_found": False,
-        "bic_refit_converged": False,
-        "converged": False,
-        score_column: np.inf,
-        "penalized_objective": np.inf,
-        "selection_step": np.arange(ranked.shape[0], dtype=int),
-    }
-    for column, default in defaults.items():
-        if column not in ranked.columns:
-            ranked[column] = default
-    sort_columns = [
-        "_lambda_key",
-        "bic_selection_eligible",
-        "selection_eligible",
-        "bic_refit_finite_candidate_found",
-        "bic_refit_converged",
-        score_column,
-        "penalized_objective",
-        "selection_step",
-    ]
-    ascending = [True, False, False, False, False, True, True, True]
-    ranked = ranked.sort_values(sort_columns, ascending=ascending)
-    return (
-        ranked.drop_duplicates("_lambda_key", keep="first")
-        .drop(columns=["_lambda_key"])
-        .reset_index(drop=True)
-    )
 
 def _selected_lambda_signature_interval(
     search_df: pd.DataFrame,
@@ -670,50 +541,28 @@ def _selected_lambda_signature_interval(
         return None, None, None
     selected_lambda = float(selected_row["lambda"])
     signature = str(selected_row.get("partition_signature", ""))
+    del normalized_score
     eligible = search_df.loc[_bic_selection_eligible_mask(search_df)].copy()
-    if eligible.empty:
-        eligible = search_df.copy()
-    eligible = (
-        _best_candidate_rows_by_lambda(
-            eligible,
-            normalized_score=normalized_score,
-        )
-        .sort_values("lambda")
-        .reset_index(drop=True)
+    if eligible.empty or "partition_signature" not in eligible.columns:
+        return selected_lambda, selected_lambda, 0.0
+    same_partition = eligible.loc[
+        eligible["partition_signature"].astype(str).eq(signature)
+    ]
+    lambdas = pd.to_numeric(same_partition["lambda"], errors="coerce").to_numpy(
+        dtype=float
     )
-    lambdas = eligible["lambda"].to_numpy(dtype=float)
-    signatures = (
-        eligible["partition_signature"].astype(str).to_numpy()
-        if "partition_signature" in eligible.columns
-        else np.full(eligible.shape[0], signature)
-    )
+    lambdas = lambdas[np.isfinite(lambdas) & (lambdas > 0.0)]
     if lambdas.size == 0:
         return selected_lambda, selected_lambda, 0.0
-    if selected_lambda > 0.0:
-        distances = np.full(lambdas.shape, np.inf, dtype=float)
-        positive_lambda_mask = lambdas > 0.0
-        distances[positive_lambda_mask] = np.abs(
-            np.log(lambdas[positive_lambda_mask]) - np.log(selected_lambda)
-        )
-        if not np.any(np.isfinite(distances)):
-            distances = np.abs(lambdas - selected_lambda)
-    else:
-        distances = np.abs(lambdas - selected_lambda)
-    idx = int(np.argmin(distances))
-    left_idx = idx
-    while left_idx > 0 and signatures[left_idx - 1] == signature:
-        left_idx -= 1
-    right_idx = idx
-    while right_idx + 1 < lambdas.size and signatures[right_idx + 1] == signature:
-        right_idx += 1
-    left_lambda = float(lambdas[left_idx])
-    right_lambda = float(lambdas[right_idx])
+    left_lambda = float(np.min(lambdas))
+    right_lambda = float(np.max(lambdas))
     log_width = (
         float(np.log10(right_lambda) - np.log10(left_lambda))
         if right_lambda > 0.0 and left_lambda > 0.0
         else 0.0
     )
     return left_lambda, right_lambda, log_width
+
 
 def _lambda_boundary_flags(
     evaluated_lambdas: list[float],
@@ -727,6 +576,7 @@ def _lambda_boundary_flags(
     lower_hit = np.isclose(best_lambda_min, sorted_lambdas[0], rtol=0.0, atol=1e-12)
     upper_hit = np.isclose(best_lambda_max, sorted_lambdas[-1], rtol=0.0, atol=1e-12)
     return bool(lower_hit), bool(upper_hit)
+
 
 def _lambda_boundary_unresolved(
     *,

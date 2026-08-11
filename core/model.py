@@ -44,7 +44,10 @@ class FitOptions:
     device: str = DEFAULT_DEVICE
     dtype: str = DEFAULT_DTYPE
     summary_tol: float | None = 1e-4
-    bic_partition_tol: float | None = 1e-4
+    selection_score: str = "clonal_fixed_partition_bic"
+    selection_anchor: str = "clonal_required"
+    selection_partition_tol: float = 1e-4
+    reporting_partition_tol: float = 1e-4
     objective_shape: str = "unimodal"
     inner_backend: str = DEFAULT_INNER_BACKEND
     workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES

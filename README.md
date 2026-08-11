@@ -1,7 +1,28 @@
 # CliPP2
 
-CliPP2 estimates mutation prevalence, clusters SNVs, and infers mutant-copy
-multiplicity from single- or multi-region tumor sequencing data with pairwise fusion.
+CliPP2 estimates mutation cancer-cell fractions (CCFs), clusters SNVs, and
+infers mutant-copy multiplicity from single- or multi-region tumor sequencing
+data with observed-data pairwise fusion.
+
+## Production model-selection contract
+
+For every positive fusion penalty λ, CliPP2:
+
+1. solves the fixed raw pairwise-fusion objective;
+2. extracts and diameter-verifies one fusion partition from that raw solution;
+3. refits unpenalized cluster centers without changing any label; and
+4. scores that immutable partition with fixed-partition BIC.
+
+Only objective-faithful, full-KKT-certified raw fusion candidates with a
+certified partition can be selected. The default score is
+`clonal_fixed_partition_bic`, with `(K - 1) × S` nominal degrees of freedom and
+the least-cost cluster anchored at the feasible clonal CCF. The unanchored
+`fixed_partition_bic` sensitivity mode uses `K × S` degrees of freedom.
+
+Ward and CEM partitions are initializer proposals only: each proposal must pass
+through a complete raw fusion solve and full KKT audit before it can contribute
+a selectable candidate. Output writing is serialization only and cannot change
+the selected estimator, partition, refit, or score.
 
 ## Install
 
@@ -11,8 +32,9 @@ pip install .
 
 ## Input
 
-The public input is one plain tab-delimited file per tumor, see example, [`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv).
-
+The public input is one tab-delimited file per tumor. See
+[`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv) and
+[`examples/README.md`](examples/README.md).
 
 ## Fit
 
@@ -24,24 +46,27 @@ clipp2 fit \
   --outdir exampleTumor1_results
 ```
 
-Use `--device cpu` on a CPU-only machine:
-
-```bash
-python -m CliPP2 fit --input-file examples/exampleTumor1.tsv --device cpu
-```
-
-The example itself is documented in [`examples/README.md`](examples/README.md).
-
-Run `clipp2 fit --help` for solver and resource controls.
+Use `--device cpu` on a CPU-only machine. Run `clipp2 fit --help` for solver,
+resource, selection-score, anchor, and partition-tolerance controls.
 
 ## Outputs
 
-A fit writes three tables into `--outdir`, prefixed with the tumor id
-(the input file name stem, unless a `##tumor_id` metadata line overrides it):
+A fit writes three tables into `--outdir`, prefixed with the tumor id (the input
+file stem unless a `##tumor_id` metadata line overrides it):
 
-| File | One row per | Contents |
+| File | One row per | Main fields |
 | --- | --- | --- |
-| `{tumor_id}_mutation_clusters.tsv` | mutation | `cluster_label` plus three prevalence estimates per region: `phi_*` (raw fused fit), `summary_phi_*` (cluster-collapsed), `bic_refit_phi_*` (clonal-anchored partition refit; the clonal cluster is pinned at φ = 1 per region) |
-| `{tumor_id}_cluster_centers.tsv` | cluster | `cluster_size`, `cluster_diameter`, `cluster_diameter_exact`, and per-region centers; join to mutations on `cluster_label` |
-| `{tumor_id}_mutation_region_multiplicity.tsv` | mutation × region | the same three phi estimates, local `major_cn`/`minor_cn`, and the mutant-copy summaries: MAP path, path probabilities, posterior/MAP mutant-copy mass and effective multiplicity, amplification call, path entropy (plus `summary_*` twins at the clustered phi) |
+| `{tumor_id}_mutation_clusters.tsv` | mutation | `selected_cluster_label`, `raw_phi_<region>`, `fixed_partition_refit_phi_<region>`, and their delta |
+| `{tumor_id}_cluster_centers.tsv` | selected cluster | size, raw mean/min/max and diameter, fixed-partition refit center, clonal-anchor diagnostics, and partition signature |
+| `{tumor_id}_mutation_region_multiplicity.tsv` | mutation × region | raw and refit CCFs plus separately prefixed multiplicity or occupancy-path summaries at both profiles |
 
+`raw_phi_*` is the primary pairwise-fusion estimator. It is the returned
+solution of the λ-penalized objective.
+
+`fixed_partition_refit_phi_*` is a secondary unpenalized center refit using
+exactly the selected raw fusion partition. It debiases center summaries but
+never changes membership or replaces the raw estimator.
+
+The production selection tolerance controls the certified BIC partition.
+`--reporting-partition-tol` is recorded for reporting compatibility but never
+changes selected K, labels, membership, or BIC.

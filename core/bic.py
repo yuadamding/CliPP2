@@ -10,10 +10,14 @@ BIC arithmetic in one place avoids the correctness-drift risk of re-deriving
 from __future__ import annotations
 
 from math import fsum, lgamma
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from ..io.data import TumorData
+
+if TYPE_CHECKING:
+    from ..model_selection.types import SelectionScore
 
 
 def _observed_positive_depth_mask(data: TumorData) -> np.ndarray:
@@ -64,6 +68,43 @@ def compute_classic_bic(loglik: float, num_clusters: int, data: TumorData) -> fl
     num_observations = effective_bic_mutation_region_count(data)
     degrees_of_freedom = bic_degrees_of_freedom(num_clusters, data)
     return compute_bic_with_df(loglik, degrees_of_freedom, num_observations)
+
+
+def fixed_partition_bic(
+    *,
+    loglik: float,
+    num_clusters: int,
+    data: TumorData,
+    anchor_mode: str,
+    partition_signature: str,
+) -> "SelectionScore":
+    """Return the explicitly named BIC for one immutable partition refit."""
+
+    normalized_anchor = str(anchor_mode).strip().lower()
+    if normalized_anchor == "none":
+        degrees_of_freedom = int(num_clusters) * int(data.num_regions)
+        score_name = "fixed_partition_bic"
+    elif normalized_anchor == "clonal_required":
+        degrees_of_freedom = max(int(num_clusters) - 1, 0) * int(data.num_regions)
+        score_name = "clonal_fixed_partition_bic"
+    else:
+        raise ValueError("anchor_mode must be either 'none' or 'clonal_required'.")
+    n_eff = effective_bic_mutation_region_count(data)
+    penalty = float(degrees_of_freedom * np.log(max(int(n_eff), 1)))
+    value = float(-2.0 * float(loglik) + penalty)
+    # Imported lazily to keep this score-primitives module usable by the lower
+    # fusion layer without introducing a module-import cycle.
+    from ..model_selection.types import SelectionScore
+
+    return SelectionScore(
+        name=score_name,
+        value=value,
+        loglik=float(loglik),
+        penalty=penalty,
+        degrees_of_freedom=int(degrees_of_freedom),
+        n_eff=int(n_eff),
+        partition_signature=str(partition_signature),
+    )
 
 
 def compute_classic_bic_depth_n(
@@ -201,4 +242,5 @@ __all__ = [
     "compute_unlabeled_dirichlet_partition_log_evidence",
     "effective_bic_mutation_region_count",
     "effective_bic_depth_count",
+    "fixed_partition_bic",
 ]

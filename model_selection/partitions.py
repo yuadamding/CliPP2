@@ -4,15 +4,20 @@ import hashlib
 
 import numpy as np
 
-from ..io.data import TumorData
-from ..core.fusion.multiplicity import infer_multiplicity_posterior_numpy
-from ..core.fusion.torch_backend import path_mutation_region_terms_numpy
+from ..core.model import FitResult
+from ..core.fusion.solver import cluster_labels_from_edges
 from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.fusion.refit import _canonical_labels as _canonical_partition_labels
+from ..core.fusion.types import (
+    CompressedEdgeCertificate,
+    PairwiseFusionGraph,
+    QuotientWorksetWarmState,
+)
 from .config import (
     LIKELIHOOD_PARTITION_K_ANCHORS,
     LIKELIHOOD_PARTITION_K_MAX,
 )
+from .types import FusionPartition
 
 
 def _likelihood_partition_k_grid(num_mutations: int) -> list[int]:
@@ -161,77 +166,89 @@ def _partition_signature(labels: np.ndarray) -> str:
     return f"{len(blocks)}:{hasher.hexdigest()}"
 
 
+def _exact_partition_diameters(phi: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    values = np.asarray(phi, dtype=np.float64)
+    canonical = _canonical_partition_labels(labels)
+    n_clusters = int(canonical.max()) + 1 if canonical.size else 0
+    diameters = np.zeros(n_clusters, dtype=np.float64)
+    for cluster in range(n_clusters):
+        rows = values[canonical == cluster]
+        if rows.shape[0] <= 1:
+            continue
+        if rows.shape[1] == 1:
+            diameters[cluster] = float(np.max(rows[:, 0]) - np.min(rows[:, 0]))
+            continue
+        maximum = 0.0
+        for start in range(0, rows.shape[0], 512):
+            block = rows[start : start + 512]
+            distances = np.linalg.norm(block[:, None, :] - rows[None, :, :], axis=-1)
+            if distances.size:
+                maximum = max(maximum, float(np.max(distances)))
+        diameters[cluster] = maximum
+    return diameters
+
+
+def extract_certified_fusion_partition(
+    fit: FitResult,
+    *,
+    graph: PairwiseFusionGraph,
+    tolerance: float,
+) -> FusionPartition:
+    """Extract one raw-fit partition and fail closed on tolerance chaining."""
+
+    tol = float(tolerance)
+    if not np.isfinite(tol) or tol <= 0.0:
+        raise ValueError("Partition tolerance must be positive and finite.")
+    phi = np.asarray(fit.phi, dtype=np.float64)
+    if phi.ndim != 2:
+        raise ValueError("fit.phi must be a mutation-by-region matrix.")
+
+    state = getattr(fit, "solver_state", None)
+    certificate = getattr(state, "certificate", None)
+    warm_state = getattr(state, "warm_state", None)
+    if bool(getattr(fit, "full_kkt_certified", False)) and isinstance(
+        certificate, CompressedEdgeCertificate
+    ):
+        labels = _canonical_partition_labels(
+            certificate.labels.detach().cpu().numpy().astype(np.int64, copy=False)
+        )
+        source = "solver_quotient"
+    elif isinstance(warm_state, QuotientWorksetWarmState):
+        labels = _canonical_partition_labels(
+            warm_state.labels.detach().cpu().numpy().astype(np.int64, copy=False)
+        )
+        source = "solver_quotient"
+    else:
+        labels = _canonical_partition_labels(
+            cluster_labels_from_edges(
+                phi,
+                edge_u=graph.edge_u,
+                edge_v=graph.edge_v,
+                tol=tol,
+            )
+        )
+        source = "verified_primal_equalities"
+
+    if labels.shape != (phi.shape[0],):
+        raise ValueError("Partition labels do not match the raw fit mutation count.")
+    diameters = _exact_partition_diameters(phi, labels)
+    max_diameter = float(np.max(diameters)) if diameters.size else 0.0
+    certified = bool(np.all(np.isfinite(diameters)) and max_diameter <= tol)
+    return FusionPartition(
+        labels=labels.astype(np.int64, copy=False),
+        signature=_partition_signature(labels),
+        n_clusters=int(np.unique(labels).size),
+        tolerance=tol,
+        max_diameter=max_diameter,
+        diameter_exact=True,
+        certified=certified,
+        source=source,
+    )
+
+
 def _cluster_sizes_text(labels: np.ndarray) -> str:
     labels = np.asarray(labels, dtype=np.int64)
     if labels.size == 0:
         return ""
     counts = np.bincount(labels, minlength=int(labels.max()) + 1)
     return ",".join(str(int(value)) for value in counts.tolist())
-
-
-def _max_cluster_diameter(diameters: np.ndarray) -> float:
-    values = np.asarray(diameters, dtype=np.float64)
-    return float(np.max(values)) if values.size else 0.0
-
-
-def _centers_from_partition_labels(
-    phi: np.ndarray, labels: np.ndarray, num_clusters: int
-) -> np.ndarray:
-    phi = np.asarray(phi, dtype=np.float64)
-    labels = _canonical_partition_labels(labels)
-    centers = np.zeros((int(num_clusters), phi.shape[1]), dtype=np.float64)
-    for label in range(int(num_clusters)):
-        mask = labels == int(label)
-        if np.any(mask):
-            centers[label] = np.mean(phi[mask], axis=0)
-    return centers
-
-
-def _multiplicity_summary_for_phi(
-    data: TumorData,
-    phi: np.ndarray,
-    *,
-    major_prior: float = 0.5,
-    eps: float = 1e-6,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    path_spec = getattr(data, "path_likelihood", None)
-    if path_spec is not None:
-        shape = np.asarray(phi).shape
-        return (
-            np.full(shape, np.nan, dtype=np.float64),
-            np.zeros(shape, dtype=bool),
-            np.full(shape, np.nan, dtype=np.float64),
-            np.zeros(shape, dtype=bool),
-        )
-    posterior = infer_multiplicity_posterior_numpy(
-        data,
-        phi,
-        major_prior=float(major_prior),
-        eps=float(eps),
-    )
-    return (
-        posterior.gamma_major,
-        posterior.major_call,
-        posterior.multiplicity_call,
-        posterior.estimation_mask,
-    )
-
-
-def _path_posterior_for_phi(
-    data: TumorData,
-    phi: np.ndarray,
-    *,
-    eps: float,
-) -> np.ndarray | None:
-    path_spec = getattr(data, "path_likelihood", None)
-    if path_spec is None:
-        return None
-    return path_mutation_region_terms_numpy(
-        path_spec,
-        scaling=np.asarray(data.scaling, dtype=np.float64),
-        alt=np.asarray(data.alt_counts, dtype=np.float64),
-        total=np.asarray(data.total_counts, dtype=np.float64),
-        phi=np.asarray(phi, dtype=np.float64),
-        eps=float(eps),
-        count_observed=data.count_observed,
-    ).path_posterior

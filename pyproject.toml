@@ -47,7 +47,7 @@ CliPP2 = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["../tests/clipp2"]
+testpaths = ["tests"]
 
 [tool.ruff]
 target-version = "py310"
