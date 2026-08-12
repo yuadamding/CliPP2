@@ -40,6 +40,7 @@ class PartitionRefitResult:
     # feasibility box) under the strict clonal-anchored selection restriction.
     clonal_cluster: int | None = None
     fixed_anchor_target: np.ndarray | None = None
+    fixed_anchor_block_signature: str = "none"
 
 @dataclass(frozen=True)
 class _RefitCoordinateResult:
@@ -561,6 +562,7 @@ def partition_constrained_observed_refit(
     anchor_mode: str = "clonal_required",
     anchor_cluster: int | None = None,
     fixed_anchor_target: np.ndarray | None = None,
+    fixed_anchor_block_signature: str = "none",
     anchor_feasibility_tol: float = 1e-8,
     grid_refinement_factor: int = 1,
 ) -> PartitionRefitResult:
@@ -596,6 +598,11 @@ def partition_constrained_observed_refit(
             raise ValueError("fixed_anchor_target must have one value per region.")
         if not np.all(np.isfinite(fixed_anchor_target)):
             raise ValueError("fixed_anchor_target must be finite.")
+    fixed_anchor_block_signature = str(fixed_anchor_block_signature)
+    if anchor_cluster is not None and fixed_anchor_block_signature == "none":
+        raise ValueError(
+            "An explicit raw clonal cluster requires its block signature."
+        )
     anchor_feasibility_tol = float(anchor_feasibility_tol)
     if not np.isfinite(anchor_feasibility_tol) or anchor_feasibility_tol < 0.0:
         raise ValueError("anchor_feasibility_tol must be finite and nonnegative.")
@@ -889,6 +896,9 @@ def partition_constrained_observed_refit(
             None
             if clonal_cluster is None
             else centers[int(clonal_cluster)].astype(np.float64, copy=True)
+        ),
+        fixed_anchor_block_signature=(
+            fixed_anchor_block_signature if clonal_cluster is not None else "none"
         ),
     )
 

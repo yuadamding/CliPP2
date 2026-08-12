@@ -65,6 +65,42 @@ class OnlineLambdaContractTests(unittest.TestCase):
         self.assertEqual(retry.phase, "retry_same_lambda")
         self.assertEqual(retry.lambda_value, initial.lambda_value)
 
+    def test_branch_switch_is_not_a_monotonicity_failure(self) -> None:
+        controller = self._controller()
+        left = OnlineLambdaObservation(
+            lambda_value=1.0,
+            n_clusters=2,
+            partition_signature="left",
+            partition_icl=10.0,
+            kkt_residual=1e-5,
+            raw_objective_certified=True,
+            branch_signature="clonal-block-a",
+        )
+        right = OnlineLambdaObservation(
+            lambda_value=2.0,
+            n_clusters=3,
+            partition_signature="right",
+            partition_icl=9.0,
+            kkt_residual=1e-5,
+            raw_objective_certified=True,
+            branch_signature="clonal-block-b",
+        )
+        self.assertIsNone(
+            controller._unresolved_monotonicity_interval([left, right])
+        )
+        same_branch_right = OnlineLambdaObservation(
+            **{
+                **right.__dict__,
+                "branch_signature": "clonal-block-a",
+            }
+        )
+        self.assertEqual(
+            controller._unresolved_monotonicity_interval(
+                [left, same_branch_right]
+            ),
+            (left, same_branch_right),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

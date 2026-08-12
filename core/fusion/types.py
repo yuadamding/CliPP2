@@ -454,8 +454,12 @@ class SolverContext:
     data_fingerprint: str
     graph_hash: str = ""
     objective_spec_hash: str = ""
+    base_fusion_objective_hash: str = ""
+    raw_clonal_union_model_hash: str = ""
+    witness_subproblem_hash: str = ""
     resource_fallback: str | None = None
     clonal_anchor_mutation_index: int | None = None
+    clonal_anchor_frozen_mutation_indices: tuple[int, ...] = ()
     clonal_anchor_target: torch.Tensor | None = None
     clonal_anchor_source: str = "none"
     clonal_anchor_mode: str = "none"

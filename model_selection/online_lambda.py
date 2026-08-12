@@ -93,6 +93,7 @@ class OnlineLambdaObservation:
     certificate_status: str = "unknown"
     backend_name: str = "unknown"
     solver_iterations: int = 0
+    branch_signature: str = "unanchored"
 
 
 @dataclass(frozen=True)
@@ -420,6 +421,7 @@ class OnlineLambdaController:
             (left, right)
             for left, right in zip(points[:-1], points[1:])
             if int(right.n_clusters) > int(left.n_clusters)
+            and str(right.branch_signature) == str(left.branch_signature)
         ]
         if not violations:
             return None

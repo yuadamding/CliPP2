@@ -63,6 +63,7 @@ def process_tumor_bundle(
     partition = selected_candidate.partition
     refit = selected_candidate.refit
     score = selected_candidate.score
+    clonal_block = selected_candidate.clonal_block
     search_df = selection_result.search_df
     elapsed_seconds = float(perf_counter() - start_time)
     selected_lambda = selection_result.selected_lambda_representative
@@ -117,6 +118,48 @@ def process_tumor_bundle(
         "selected_raw_clonal_anchor_cluster": (
             -1 if refit.clonal_cluster is None else int(refit.clonal_cluster)
         ),
+        "selected_raw_clonal_cluster_signature": (
+            "none" if clonal_block is None else str(clonal_block.block_signature)
+        ),
+        "selected_raw_clonal_cluster_size": (
+            0 if clonal_block is None else int(clonal_block.cluster_size)
+        ),
+        "selected_raw_clonal_cluster_centroid_residual": (
+            np.nan if clonal_block is None else float(clonal_block.centroid_residual)
+        ),
+        "selected_raw_clonal_cluster_max_member_residual": (
+            np.nan
+            if clonal_block is None
+            else float(clonal_block.maximum_member_residual)
+        ),
+        "selected_raw_clonal_cluster_observed_support_per_region": (
+            "none"
+            if clonal_block is None
+            else ",".join(
+                str(int(value))
+                for value in clonal_block.observed_support_per_region
+            )
+        ),
+        "selected_raw_clonal_cluster_common_center": (
+            "none"
+            if clonal_block is None
+            else ",".join(
+                format(float(value), ".17g")
+                for value in clonal_block.common_center
+            )
+        ),
+        "selected_raw_clonal_cluster_centroid": (
+            "none"
+            if clonal_block is None
+            else ",".join(
+                format(float(value), ".17g") for value in clonal_block.centroid
+            )
+        ),
+        "selected_raw_clonal_witness_mutation_id": (
+            "none"
+            if clonal_block is None
+            else str(clonal_block.witness_mutation_id)
+        ),
         "selected_raw_clonal_anchor_target": (
             "none"
             if best_fit.raw_clonal_anchor_target is None
@@ -135,6 +178,9 @@ def process_tumor_bundle(
         "selected_raw_clonal_anchor_frozen_coordinate_count": int(
             best_fit.raw_clonal_anchor_frozen_coordinate_count
         ),
+        "selected_raw_clonal_anchor_frozen_mutation_count": int(
+            len(best_fit.raw_clonal_anchor_frozen_mutation_indices)
+        ),
         "selected_raw_clonal_anchor_search_complete": bool(
             best_fit.raw_clonal_anchor_search_complete
         ),
@@ -152,6 +198,15 @@ def process_tumor_bundle(
         ),
         "selected_anchor_block_signature": str(score.anchor_block_signature),
         "selected_objective_spec_hash": str(best_fit.objective_spec_hash),
+        "selected_base_fusion_objective_hash": str(
+            best_fit.base_fusion_objective_hash
+        ),
+        "selected_raw_clonal_union_model_hash": str(
+            best_fit.raw_clonal_union_model_hash
+        ),
+        "selected_witness_subproblem_hash": str(
+            best_fit.witness_subproblem_hash
+        ),
         "selected_original_graph_hash": str(best_fit.original_graph_hash),
         "selection_metric_value": (
             np.nan
@@ -181,6 +236,7 @@ def process_tumor_bundle(
             raw_fit=best_fit,
             partition=partition,
             refit=refit,
+            clonal_block=clonal_block,
             major_prior=float(fit_options.major_prior),
         )
     return summary, search_df

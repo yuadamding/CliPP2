@@ -8,7 +8,12 @@ import numpy as np
 import pandas as pd
 import torch
 
-from ..core.model import FitOptions, FitResult, RawClonalAnchorSpec, fit_fixed_objective
+from ..core.model import (
+    FitOptions,
+    FitResult,
+    RawClonalClusterConstraint,
+    fit_fixed_objective,
+)
 from ..core.fusion.defaults import (
     normalize_dense_fallback_policy,
     normalize_inner_backend,
@@ -118,12 +123,96 @@ class NoEligibleModelSelectionCandidatesError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class _RawClonalAnchorSearch:
-    spec: RawClonalAnchorSpec
+    spec: RawClonalClusterConstraint
     total_eligible_candidates: int
     search_complete: bool
     screening_rule: str
     deviance_by_index: dict[int, float]
     lower_bound_by_index: dict[int, float]
+
+
+def _raw_clonal_witness_competition_resolved(
+    search: _RawClonalAnchorSearch,
+    *,
+    evaluated_keys: set[int],
+    certified_keys: set[int],
+    incumbent_objective: float,
+    objective_tolerance: float,
+) -> bool:
+    """Return true only when every model witness is solved or safely pruned."""
+
+    unresolved = set(search.spec.eligible_witness_indices).difference(
+        certified_keys
+    )
+    # Failed evaluated branches and omitted branches are treated identically:
+    # neither may be ignored when its mathematical lower bound can beat the
+    # incumbent. ``evaluated_keys`` remains explicit for audit/test clarity.
+    _ = evaluated_keys
+    return not any(
+        search.lower_bound_by_index.get(key, float("-inf"))
+        <= float(incumbent_objective) + float(objective_tolerance)
+        for key in unresolved
+    )
+
+
+def _raw_objective_minimizers(
+    data: TumorData,
+    certified_fits: list[tuple[int, FitResult]],
+) -> tuple[list[tuple[int, FitResult]], list[tuple[int, FitResult]], float]:
+    """Rank certified branches and retain every numerical raw minimizer."""
+
+    ranked = sorted(
+        certified_fits,
+        key=lambda item: (
+            float(item[1].penalized_objective),
+            "none" if int(item[0]) < 0 else str(data.mutation_ids[int(item[0])]),
+        ),
+    )
+    if not ranked:
+        return [], [], 0.0
+    best_objective = float(ranked[0][1].penalized_objective)
+    tolerance = 1e-10 * (1.0 + abs(best_objective))
+    tied = [
+        item
+        for item in ranked
+        if float(item[1].penalized_objective) <= best_objective + tolerance
+    ]
+    return ranked, tied, tolerance
+
+
+def _prune_witness_warm_fit_cache(
+    cache: dict[tuple[int, float], FitResult],
+    *,
+    current_lambda_key: float,
+    max_states_per_witness: int = 4,
+) -> None:
+    """Bound host dual storage without changing any fitted candidate."""
+
+    if int(max_states_per_witness) < 1:
+        raise ValueError("max_states_per_witness must be positive.")
+    by_witness: dict[int, list[tuple[int, float]]] = {}
+    for key in cache:
+        by_witness.setdefault(int(key[0]), []).append(key)
+    for keys in by_witness.values():
+        if len(keys) <= int(max_states_per_witness):
+            continue
+        ordered = sorted(keys, key=lambda item: float(item[1]))
+        retain = {ordered[0], ordered[-1]}
+        current = min(
+            ordered,
+            key=lambda item: abs(float(item[1]) - float(current_lambda_key)),
+        )
+        retain.add(current)
+        remaining = sorted(
+            (item for item in ordered if item not in retain),
+            key=lambda item: abs(float(item[1]) - float(current_lambda_key)),
+        )
+        retain.update(
+            remaining[: max(int(max_states_per_witness) - len(retain), 0)]
+        )
+        for key in keys:
+            if key not in retain:
+                del cache[key]
 
 
 @torch.no_grad()
@@ -133,14 +222,25 @@ def _build_raw_clonal_anchor_search(
     *,
     fit_options: FitOptions,
 ) -> _RawClonalAnchorSearch:
-    """Build the explicit hard-anchor seed set before the lambda path."""
+    """Build the explicit CCF-one cluster witness set before the lambda path."""
 
-    mode = str(fit_options.raw_clonal_anchor_mode).strip().lower()
-    valid_modes = {"none", "specified_seed", "enumerated_seed", "screened_seed"}
-    if mode not in valid_modes:
+    requested_mode = str(fit_options.raw_clonal_anchor_mode).strip().lower()
+    mode_aliases = {
+        "none": "none",
+        "specified_seed": "specified_witness",
+        "specified_witness": "specified_witness",
+        "enumerated_seed": "enumerated_witness",
+        "enumerated_witness": "enumerated_witness",
+        "screened_seed": "screened_witness",
+        "screened_witness": "screened_witness",
+        "adaptive_exact": "adaptive_exact",
+    }
+    mode = mode_aliases.get(requested_mode)
+    valid_modes = set(mode_aliases)
+    if requested_mode not in valid_modes or mode is None:
         raise ValueError(
-            "raw_clonal_anchor_mode must be none, specified_seed, "
-            "enumerated_seed, or screened_seed."
+            "raw_clonal_anchor_mode must be none, specified_witness, "
+            "enumerated_witness, adaptive_exact, or screened_witness."
         )
     target = np.full(
         int(data.num_regions),
@@ -152,17 +252,37 @@ def _build_raw_clonal_anchor_search(
         raise ValueError("Production raw clonal anchors require target CCF exactly 1.")
     if not np.isfinite(feasibility_tolerance) or feasibility_tolerance < 0.0:
         raise ValueError("Raw clonal-anchor feasibility tolerance must be nonnegative.")
+    equality_tolerance = float(fit_options.raw_clonal_cluster_equality_tol)
+    if not np.isfinite(equality_tolerance) or equality_tolerance <= 0.0:
+        raise ValueError("Raw clonal-cluster equality tolerance must be positive.")
+    if int(fit_options.raw_clonal_cluster_min_size) < 1:
+        raise ValueError("Raw clonal-cluster minimum size must be positive.")
+    if int(fit_options.raw_clonal_cluster_min_observed_support_per_region) < 0:
+        raise ValueError("Raw clonal-cluster observed support must be nonnegative.")
     upper = context.upper.detach().cpu().numpy()
-    eligible = np.flatnonzero(
-        np.all(target[None, :] <= upper + feasibility_tolerance, axis=1)
-    ).astype(np.int64)
+    # Strict support preserves the original feasible box.  The feasibility
+    # tolerance is diagnostic only and never expands a witness coordinate.
+    eligible = np.flatnonzero(np.all(target[None, :] <= upper, axis=1)).astype(
+        np.int64
+    )
     if mode == "none":
         return _RawClonalAnchorSearch(
-            spec=RawClonalAnchorSpec(
-                mode="none",
+            spec=RawClonalClusterConstraint(
+                witness_mode="none",
                 target=target,
-                candidate_mutation_indices=(),
+                witness_indices=(),
+                eligible_witness_indices=(),
+                mandatory_member_indices=(),
                 feasibility_tolerance=feasibility_tolerance,
+                equality_tolerance=float(
+                    fit_options.raw_clonal_cluster_equality_tol
+                ),
+                minimum_cluster_size=int(
+                    fit_options.raw_clonal_cluster_min_size
+                ),
+                minimum_observed_support_per_region=int(
+                    fit_options.raw_clonal_cluster_min_observed_support_per_region
+                ),
             ),
             total_eligible_candidates=int(eligible.size),
             search_complete=True,
@@ -208,49 +328,126 @@ def _build_raw_clonal_anchor_search(
     increases = np.maximum(increases, 0.0)
     ordered = sorted(
         eligible.tolist(),
-        key=lambda index: (float(increases[index]), int(index)),
+        key=lambda index: (
+            float(increases[index]),
+            str(data.mutation_ids[int(index)]),
+        ),
     )
     screening_rule = "none"
-    if mode == "specified_seed":
+    count_observed = getattr(data, "count_observed", None)
+    observed = np.asarray(data.total_counts, dtype=np.float64) > 0.0
+    if count_observed is not None:
+        observed &= np.asarray(count_observed, dtype=bool)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        single_copy_unpenalized_ccf = np.divide(
+            np.asarray(data.alt_counts, dtype=np.float64),
+            np.asarray(data.total_counts, dtype=np.float64)
+            * np.asarray(data.scaling, dtype=np.float64),
+            out=np.zeros_like(np.asarray(data.alt_counts, dtype=np.float64)),
+            where=observed,
+        )
+    # A mutation whose single-copy, mutation-specific unpenalized CCF exceeds
+    # one in every observed region cannot be represented above the biological
+    # CCF boundary.  It is therefore a mandatory member of the CCF-one clonal
+    # block.  The single-copy calculation is conservative over all positive
+    # multiplicities: any true-multiplicity CCF above one is included here.
+    mandatory_mask = (
+        np.any(observed, axis=1)
+        & np.all(
+            (~observed) | (single_copy_unpenalized_ccf > target[None, :]),
+            axis=1,
+        )
+        & bool(fit_options.raw_clonal_include_unpenalized_overflow)
+    )
+    mandatory = tuple(
+        int(index)
+        for index in sorted(
+            eligible[mandatory_mask[eligible]].tolist(),
+            key=lambda index: str(data.mutation_ids[int(index)]),
+        )
+    )
+    if mode == "specified_witness":
         id_to_index = {str(value): index for index, value in enumerate(data.mutation_ids)}
         requested_ids = tuple(str(value) for value in fit_options.raw_clonal_anchor_mutation_ids)
         if len(requested_ids) != 1 or requested_ids[0] not in id_to_index:
             raise ValueError(
-                "specified_seed requires exactly one retained mutation ID."
+                "specified_witness requires exactly one retained mutation ID."
             )
         specified_index = int(id_to_index[requested_ids[0]])
         if specified_index not in set(eligible.tolist()):
             raise RuntimeError("no_feasible_raw_clonal_anchor")
+        if mandatory and specified_index not in set(mandatory):
+            raise ValueError(
+                "The specified witness must be one of the mutation-specific "
+                "single-copy unpenalized CCF estimates above the clonal boundary."
+            )
         evaluated = (specified_index,)
-        screening_rule = "user_specified_retained_mutation_id"
+        screening_rule = (
+            "user_specified_witness_with_mandatory_unpenalized_overflow_block"
+            if mandatory
+            else "user_specified_retained_mutation_id"
+        )
         search_complete = True
-    elif mode == "enumerated_seed":
+    elif mandatory:
+        # Once the model-native unpenalized fit identifies rows whose CCF MLE
+        # saturates at one, those rows are mandatory members of the clonal
+        # block.  A single stable member is sufficient as computational
+        # witness; enumerating other witnesses would solve the same subproblem.
+        representative = min(
+            mandatory,
+            key=lambda index: (
+                float(increases[index]),
+                str(data.mutation_ids[index]),
+            ),
+        )
+        evaluated = (int(representative),)
+        screening_rule = "mandatory_single_copy_unpenalized_ccf_overflow_block"
+        search_complete = True
+    elif mode == "enumerated_witness":
         evaluated = tuple(int(index) for index in ordered)
-        screening_rule = "complete_feasible_seed_enumeration"
+        screening_rule = "complete_feasible_witness_enumeration"
         search_complete = True
     else:
         candidate_max = fit_options.raw_clonal_anchor_candidate_max
         if candidate_max is None or int(candidate_max) < 1:
-            raise ValueError("screened_seed requires a positive candidate maximum.")
+            raise ValueError(
+                "adaptive_exact and screened_witness require a positive initial batch."
+            )
         evaluated = tuple(int(index) for index in ordered[: int(candidate_max)])
-        screening_rule = "zero_penalty_anchor_deviance_then_input_order"
+        screening_rule = (
+            "adaptive_exact_zero_penalty_lower_bound"
+            if mode == "adaptive_exact"
+            else "restricted_zero_penalty_witness_screen"
+        )
         search_complete = len(evaluated) == len(ordered)
     base_loss = float(torch.sum(free_loss).item())
+    model_eligible = (
+        tuple(int(index) for index in evaluated)
+        if mode == "specified_witness" or mandatory
+        else tuple(int(index) for index in ordered)
+    )
     return _RawClonalAnchorSearch(
-        spec=RawClonalAnchorSpec(
-            mode=mode,
+        spec=RawClonalClusterConstraint(
+            witness_mode=mode,
             target=target,
-            candidate_mutation_indices=evaluated,
+            witness_indices=evaluated,
+            eligible_witness_indices=model_eligible,
+            mandatory_member_indices=mandatory,
             feasibility_tolerance=feasibility_tolerance,
+            equality_tolerance=float(fit_options.raw_clonal_cluster_equality_tol),
+            minimum_cluster_size=int(fit_options.raw_clonal_cluster_min_size),
+            minimum_observed_support_per_region=int(
+                fit_options.raw_clonal_cluster_min_observed_support_per_region
+            ),
         ),
         total_eligible_candidates=int(eligible.size),
         search_complete=bool(search_complete),
         screening_rule=screening_rule,
         deviance_by_index={
-            int(index): float(2.0 * increases[int(index)]) for index in evaluated
+            int(index): float(2.0 * increases[int(index)]) for index in ordered
         },
         lower_bound_by_index={
-            int(index): float(base_loss + increases[int(index)]) for index in evaluated
+            int(index): float(base_loss + increases[int(index)]) for index in ordered
         },
     )
 
@@ -258,9 +455,9 @@ def _build_raw_clonal_anchor_search(
 def _raw_anchor_guide_labels(
     labels: np.ndarray,
     *,
-    anchor_mutation_index: int | None,
+    anchor_mutation_indices: tuple[int, ...],
 ) -> np.ndarray:
-    """Split the fixed mutation from a multi-mutation guide block.
+    """Protect the fixed clonal members as one guide block.
 
     The Ward/CEM guide remains the graph pilot.  Splitting only its warm-start
     label makes that starting state compatible with the raw fixed coordinate;
@@ -268,10 +465,9 @@ def _raw_anchor_guide_labels(
     """
 
     raw = np.asarray(labels, dtype=np.int64).reshape(-1).copy()
-    if anchor_mutation_index is not None:
-        index = int(anchor_mutation_index)
-        if int(np.count_nonzero(raw == raw[index])) > 1:
-            raw[index] = int(np.max(raw)) + 1
+    fixed = tuple(sorted(set(int(index) for index in anchor_mutation_indices)))
+    if fixed:
+        raw[np.asarray(fixed, dtype=np.int64)] = int(np.max(raw)) + 1
     canonical = np.empty_like(raw)
     mapping: dict[int, int] = {}
     for index, value in enumerate(raw.tolist()):
@@ -284,6 +480,45 @@ def _hash_array(hasher: "hashlib._Hash", array: np.ndarray) -> None:
     hasher.update(str(contiguous.dtype).encode("utf-8"))
     hasher.update(np.asarray(contiguous.shape, dtype=np.int64).tobytes())
     hasher.update(contiguous.tobytes())
+
+
+def _raw_clonal_union_model_hash(
+    *,
+    base_fusion_objective_hash: str,
+    data: TumorData,
+    constraint: RawClonalClusterConstraint,
+) -> str:
+    """Hash the existential CCF-one model independently of search strategy."""
+
+    digest = hashlib.sha256()
+    for value in (
+        "clipp2_raw_clonal_union_model_v1",
+        str(base_fusion_objective_hash),
+        str(int(constraint.minimum_cluster_size)),
+        str(int(constraint.minimum_observed_support_per_region)),
+        float(constraint.equality_tolerance).hex(),
+    ):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    _hash_array(digest, np.asarray(constraint.target, dtype=np.float64))
+    mandatory_ids = sorted(
+        str(data.mutation_ids[int(index)])
+        for index in constraint.mandatory_member_indices
+    )
+    for mutation_id in mandatory_ids:
+        encoded = mutation_id.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    eligible_ids = sorted(
+        str(data.mutation_ids[int(index)])
+        for index in constraint.eligible_witness_indices
+    )
+    for mutation_id in eligible_ids:
+        encoded = mutation_id.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "little"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 def _input_data_hash(data: TumorData) -> str:
@@ -1017,9 +1252,10 @@ def _partition_guided_admm_selection(
     The best Ward/CEM partition-ICL guide defines the default adaptive graph,
     supplies the primal start, and sets the initial lambda scale. The graph is
     then frozen for the complete raw-fusion path; Ward/CEM rows themselves are
-    never selectable. In clonal-required mode, one mutation is selected once
-    from the zero-penalty likelihood pilot and fixed at its feasible clonal CCF
-    in every raw solve. Its pairwise weight contrast is bounded by a
+    never selectable. In clonal-required mode, witness-conditioned branches
+    realize an existential exact CCF-one fusion block. Adaptive exact search
+    solves every witness that cannot be excluded by its likelihood lower bound.
+    The witness pairwise weight contrast is bounded by a
     likelihood-curvature noise floor distributed over a mild degree^1.05
     complete-graph correction, avoiding the effectively infinite contrast of
     an exactly fused pilot with a fixed numerical floor. Blockwise KKT capacity
@@ -1175,7 +1411,16 @@ def _partition_guided_admm_selection(
             "inner solver is ADMM."
         )
     effective_fit_options = replace(fit_options, graph=effective_graph)
-    anchor_keys = (
+    union_model_hash = _raw_clonal_union_model_hash(
+        base_fusion_objective_hash=base_solver_context.base_fusion_objective_hash,
+        data=data,
+        constraint=raw_anchor_search.spec,
+    )
+    base_solver_context = replace(
+        base_solver_context,
+        raw_clonal_union_model_hash=union_model_hash,
+    )
+    initial_anchor_keys = (
         raw_anchor_search.spec.candidate_mutation_indices
         if raw_anchor_search.spec.mode != "none"
         else (-1,)
@@ -1184,7 +1429,10 @@ def _partition_guided_admm_selection(
     guided_initialization_by_anchor: dict[int, GuidedFusionInitialization] = {}
     guide_phi_by_anchor: dict[int, StartArray] = {}
     guide_labels_by_anchor: dict[int, np.ndarray] = {}
-    for anchor_key in anchor_keys:
+    def ensure_anchor_resources(anchor_key: int) -> None:
+        key = int(anchor_key)
+        if key in solver_context_by_anchor:
+            return
         anchor_index = None if int(anchor_key) < 0 else int(anchor_key)
         context = (
             base_solver_context
@@ -1211,17 +1459,21 @@ def _partition_guided_admm_selection(
                 torch_data=pilot_torch_data,
                 objective_shape=str(fit_options.objective_shape),
                 clonal_anchor_mutation_index=anchor_index,
+                clonal_anchor_mandatory_mutation_indices=(
+                    raw_anchor_search.spec.mandatory_member_indices
+                ),
                 clonal_anchor_target=raw_anchor_search.spec.target,
                 clonal_anchor_source=str(raw_anchor_search.screening_rule),
                 clonal_anchor_mode=str(raw_anchor_search.spec.mode),
                 clonal_anchor_feasibility_tolerance=float(
                     raw_anchor_search.spec.feasibility_tolerance
                 ),
+                raw_clonal_union_model_hash=union_model_hash,
             )
         )
         anchor_guide_labels = _raw_anchor_guide_labels(
             np.asarray(guide.labels, dtype=np.int64),
-            anchor_mutation_index=context.clonal_anchor_mutation_index,
+            anchor_mutation_indices=context.clonal_anchor_frozen_mutation_indices,
         )
         anchor_guide_phi: StartArray = context.exact_pilot
         initialization, context, anchor_guide_phi = (
@@ -1237,21 +1489,24 @@ def _partition_guided_admm_selection(
             initialization,
             solver_state=_offload_solver_state_to_cpu(initialization.solver_state),
         )
-        key = int(anchor_key)
         solver_context_by_anchor[key] = context
         guided_initialization_by_anchor[key] = initialization
         guide_phi_by_anchor[key] = anchor_guide_phi
         guide_labels_by_anchor[key] = anchor_guide_labels
-    runtime = next(iter(solver_context_by_anchor.values())).runtime
+
+    for anchor_key in initial_anchor_keys:
+        ensure_anchor_resources(int(anchor_key))
+
+    runtime = base_solver_context.runtime
     if any(
         context.runtime.device != runtime.device
         or context.runtime.dtype != runtime.dtype
         for context in solver_context_by_anchor.values()
     ):
-        raise RuntimeError("All raw anchor seeds must use one tensor runtime.")
-    torch_data = torch_data_from_context(next(iter(solver_context_by_anchor.values())))
-    effective_graph = next(iter(solver_context_by_anchor.values())).graph_spec
-    effective_tensor_graph = next(iter(solver_context_by_anchor.values())).graph
+        raise RuntimeError("All raw clonal witnesses must use one tensor runtime.")
+    torch_data = torch_data_from_context(base_solver_context)
+    effective_graph = base_solver_context.graph_spec
+    effective_tensor_graph = base_solver_context.graph
     effective_fit_options = replace(fit_options, graph=effective_graph)
     if not bool(effective_tensor_graph.is_complete) or int(
         effective_graph.degree_bound
@@ -1308,6 +1563,9 @@ def _partition_guided_admm_selection(
             terminal_stop_reason = "online_lambda_uncertified_exact_fusion_result"
             break
         lambda_key = _canonical_lambda(proposal.lambda_value)
+        for attempt_key in list(attempts_by_anchor_and_lambda):
+            if float(attempt_key[1]) != float(lambda_key):
+                del attempts_by_anchor_and_lambda[attempt_key]
         candidate_fit_options = effective_fit_options
         if proposal.phase == "solver_recovery":
             candidate_fit_options = replace(
@@ -1347,8 +1605,10 @@ def _partition_guided_admm_selection(
         raw_anchor_fit_start = perf_counter()
         seed_fits: list[tuple[int, FitResult]] = []
         seed_start_metadata: dict[int, tuple[str, float, int]] = {}
-        for anchor_key in anchor_keys:
+
+        def solve_witness_branch(anchor_key: int) -> FitResult:
             key = int(anchor_key)
+            ensure_anchor_resources(key)
             context = solver_context_by_anchor[key]
             initialization = guided_initialization_by_anchor[key]
             anchor_guide_phi = guide_phi_by_anchor[key]
@@ -1465,6 +1725,56 @@ def _partition_guided_admm_selection(
                 float(lambda_start_value),
                 int(changed_count),
             )
+            return seed_fit
+
+        solved_keys: set[int] = set()
+        for anchor_key in initial_anchor_keys:
+            key = int(anchor_key)
+            solve_witness_branch(key)
+            solved_keys.add(key)
+
+        if raw_anchor_search.spec.mode == "adaptive_exact":
+            all_witnesses = tuple(
+                int(index)
+                for index in raw_anchor_search.spec.eligible_witness_indices
+            )
+            while True:
+                certified_so_far = [
+                    seed_fit
+                    for _, seed_fit in seed_fits
+                    if float(seed_fit.lambda_value) > 0.0
+                    and bool(seed_fit.objective_faithful)
+                    and bool(seed_fit.full_kkt_certified)
+                    and bool(seed_fit.selection_eligible)
+                ]
+                incumbent_objective = (
+                    min(float(item.penalized_objective) for item in certified_so_far)
+                    if certified_so_far
+                    else float("inf")
+                )
+                objective_tolerance = (
+                    1e-10 * (1.0 + abs(incumbent_objective))
+                    if np.isfinite(incumbent_objective)
+                    else 0.0
+                )
+                unresolved = [
+                    key
+                    for key in all_witnesses
+                    if key not in solved_keys
+                    and raw_anchor_search.lower_bound_by_index[key]
+                    <= incumbent_objective + objective_tolerance
+                ]
+                if not unresolved:
+                    break
+                next_key = min(
+                    unresolved,
+                    key=lambda key: (
+                        raw_anchor_search.lower_bound_by_index[key],
+                        str(data.mutation_ids[key]),
+                    ),
+                )
+                solve_witness_branch(next_key)
+                solved_keys.add(next_key)
         raw_anchor_fit_elapsed_seconds = float(
             perf_counter() - raw_anchor_fit_start
         )
@@ -1478,12 +1788,11 @@ def _partition_guided_admm_selection(
             and bool(seed_fit.selection_eligible)
         ]
         if individually_certified:
-            ranked_certified = sorted(
-                individually_certified,
-                key=lambda item: (
-                    float(item[1].penalized_objective),
-                    int(item[0]),
-                ),
+            ranked_certified, tied_certified, objective_tolerance = (
+                _raw_objective_minimizers(
+                    data,
+                    individually_certified,
+                )
             )
             winning_anchor_key, winning_fit = ranked_certified[0]
             second_objective = (
@@ -1492,16 +1801,12 @@ def _partition_guided_admm_selection(
                 else float("inf")
             )
             objective_gap = second_objective - float(winning_fit.penalized_objective)
-            failed_seed_keys = {
-                key for key, _ in seed_fits
-            }.difference(key for key, _ in individually_certified)
-            objective_tolerance = 1e-10 * (
-                1.0 + abs(float(winning_fit.penalized_objective))
-            )
-            anchor_competition_resolved = not any(
-                raw_anchor_search.lower_bound_by_index.get(key, float("inf"))
-                <= float(winning_fit.penalized_objective) + objective_tolerance
-                for key in failed_seed_keys
+            anchor_competition_resolved = _raw_clonal_witness_competition_resolved(
+                raw_anchor_search,
+                evaluated_keys={key for key, _ in seed_fits},
+                certified_keys={key for key, _ in individually_certified},
+                incumbent_objective=float(winning_fit.penalized_objective),
+                objective_tolerance=objective_tolerance,
             )
         else:
             winning_anchor_key, winning_fit = min(
@@ -1514,22 +1819,43 @@ def _partition_guided_admm_selection(
             )
             objective_gap = float("inf")
             anchor_competition_resolved = False
-        winning_fit.raw_clonal_anchor_search_complete = bool(
-            raw_anchor_search.search_complete
-        )
-        winning_fit.raw_clonal_anchor_total_eligible_candidates = int(
-            raw_anchor_search.total_eligible_candidates
-        )
-        winning_fit.raw_clonal_anchor_candidates_evaluated = int(
-            len(seed_fits) if raw_anchor_search.spec.mode != "none" else 0
-        )
-        winning_fit.raw_clonal_anchor_objective_rank = int(
-            1 if raw_anchor_search.spec.mode != "none" else 0
-        )
-        winning_fit.raw_clonal_anchor_objective_gap_to_second = float(objective_gap)
-        winning_fit.raw_clonal_anchor_screening_rule = str(
-            raw_anchor_search.screening_rule
-        )
+            tied_certified = []
+        rank_by_key = {
+            int(key): rank
+            for rank, (key, _) in enumerate(
+                sorted(
+                    seed_fits,
+                    key=lambda item: (
+                        float(item[1].penalized_objective),
+                        (
+                            "none"
+                            if int(item[0]) < 0
+                            else str(data.mutation_ids[int(item[0])])
+                        ),
+                    ),
+                ),
+                start=1,
+            )
+        }
+        for key, branch_fit in seed_fits:
+            branch_fit.raw_clonal_anchor_search_complete = bool(
+                anchor_competition_resolved
+            )
+            branch_fit.raw_clonal_anchor_total_eligible_candidates = int(
+                raw_anchor_search.total_eligible_candidates
+            )
+            branch_fit.raw_clonal_anchor_candidates_evaluated = int(
+                len(seed_fits) if raw_anchor_search.spec.mode != "none" else 0
+            )
+            branch_fit.raw_clonal_anchor_objective_rank = int(
+                rank_by_key[int(key)] if raw_anchor_search.spec.mode != "none" else 0
+            )
+            branch_fit.raw_clonal_anchor_objective_gap_to_second = float(
+                objective_gap
+            )
+            branch_fit.raw_clonal_anchor_screening_rule = str(
+                raw_anchor_search.screening_rule
+            )
         winning_context = solver_context_by_anchor[int(winning_anchor_key)]
         winning_guide_phi = guide_phi_by_anchor[int(winning_anchor_key)]
         fit, row, artifact = _evaluate_candidate(
@@ -1696,53 +2022,175 @@ def _partition_guided_admm_selection(
                 **_partition_pool_row_metadata(initializer_pool),
             }
         )
-        candidate_id = int(len(result_entries))
-        row["_candidate_id"] = candidate_id
-        result_entries.append((fit, row, artifact))
-        incumbent = fit_by_lambda.get(lambda_key)
-        if _prefer_fit_candidate(fit, incumbent):
-            fit_by_lambda[lambda_key] = fit
+        lambda_entries: list[
+            tuple[FitResult, dict[str, float | int | str | bool], RawFusionCandidate]
+        ] = [(fit, row, artifact)]
+        for tied_key, tied_fit in tied_certified:
+            if int(tied_key) == int(winning_anchor_key):
+                continue
+            tied_context = solver_context_by_anchor[int(tied_key)]
+            tied_guide_phi = guide_phi_by_anchor[int(tied_key)]
+            tied_result = _evaluate_candidate(
+                data=data,
+                fit_options=effective_fit_options,
+                candidate_fit_options=candidate_fit_options,
+                bic_df_scale=bic_df_scale,
+                bic_cluster_penalty=bic_cluster_penalty,
+                phi_start=None,
+                exact_pilot=tied_guide_phi,
+                pooled_start=tied_guide_phi,
+                scalar_well_starts=[],
+                start_mode="warm_only",
+                runtime=runtime,
+                torch_data=torch_data,
+                solver_context=tied_context,
+                solver_state=tied_fit.solver_state,
+                compute_summary=False,
+                selection_method=selection_method,
+                profile_name=profile_name,
+                selection_step=next_step,
+                lambda_value=float(proposal.lambda_value),
+                selection_score=selection_score,
+                bic_refit_cache=bic_refit_cache,
+                static_metadata=static_metadata,
+                precomputed_fit=tied_fit,
+                raw_anchor_search_resolved=bool(anchor_competition_resolved),
+            )
+            tied_output_fit, tied_row, tied_artifact = tied_result
+            decorated_tied_row = dict(row)
+            decorated_tied_row.update(tied_row)
+            tied_start_source, tied_start_value, tied_changed_count = (
+                seed_start_metadata[int(tied_key)]
+            )
+            tied_initialization = guided_initialization_by_anchor[int(tied_key)]
+            tied_labels = guide_labels_by_anchor[int(tied_key)]
+            decorated_tied_row.update(
+                {
+                    "raw_fit_elapsed_seconds": float(raw_anchor_fit_elapsed_seconds),
+                    "raw_anchor_seed_fit_elapsed_seconds": float(
+                        raw_anchor_fit_elapsed_seconds
+                    ),
+                    "raw_anchor_mean_seed_fit_elapsed_seconds": float(
+                        raw_anchor_fit_elapsed_seconds / max(len(seed_fits), 1)
+                    ),
+                    "lambda_start_source": str(tied_start_source),
+                    "lambda_start_value": float(tied_start_value),
+                    "path_breakpoint_escape_applied": bool(tied_changed_count > 0),
+                    "path_breakpoint_escape_changed_count": int(
+                        tied_changed_count
+                    ),
+                    "initializer_K": int(np.unique(tied_labels).size),
+                    "initializer_partition_signature": str(
+                        _partition_signature(tied_labels)
+                    ),
+                    "initializer_matrix_hash": str(
+                        _pilot_matrix_hash(tied_guide_phi)
+                    ),
+                    "initializer_lambda": float(tied_initialization.lambda_value),
+                    "initializer_kkt_residual": float(
+                        tied_initialization.diagnostics.kkt_residual
+                    ),
+                    "raw_clonal_anchor_selection_deviance_increase": float(
+                        raw_anchor_search.deviance_by_index[int(tied_key)]
+                    ),
+                    "raw_objective_tied_minimizer": True,
+                }
+            )
+            lambda_entries.append(
+                (tied_output_fit, decorated_tied_row, tied_artifact)
+            )
+        row["raw_objective_tied_minimizer"] = len(lambda_entries) > 1
 
-        raw_exact_certified = bool(
-            _exact_fusion_certificate_mask(pd.DataFrame([row]))[0]
-            and bool(effective_tensor_graph.is_complete)
-            and bool(anchor_competition_resolved)
+        for entry_fit, entry_row, entry_artifact in lambda_entries:
+            candidate_id = int(len(result_entries))
+            entry_row["_candidate_id"] = candidate_id
+            result_entries.append((entry_fit, entry_row, entry_artifact))
+            incumbent = fit_by_lambda.get(lambda_key)
+            if _prefer_fit_candidate(entry_fit, incumbent):
+                fit_by_lambda[lambda_key] = entry_fit
+
+        controller_fit, controller_row, controller_artifact = min(
+            lambda_entries,
+            key=lambda item: (
+                0 if item[2].eligible_for_selection else 1,
+                float(item[2].score.value),
+                str(item[2].anchor_block_signature),
+                str(item[2].anchor_seed_mutation_id),
+            ),
         )
-        selection_score_available = bool(artifact.eligible_for_selection)
+
+        conditional_raw_exact_certified = bool(
+            _exact_fusion_certificate_mask(pd.DataFrame([controller_row]))[0]
+            and bool(effective_tensor_graph.is_complete)
+        )
+        # A deliberately restricted screen can leave the union-model search
+        # unresolved even though its evaluated witness branch is already KKT
+        # certified. Re-solving that branch cannot resolve omitted witnesses,
+        # so do not route this search-layer failure through raw-solver retry.
+        raw_exact_certified = bool(
+            conditional_raw_exact_certified
+            and (
+                bool(anchor_competition_resolved)
+                or raw_anchor_search.spec.mode == "screened_witness"
+            )
+        )
+        selection_score_available = bool(controller_artifact.eligible_for_selection)
         controller.observe(
             OnlineLambdaObservation(
                 lambda_value=float(proposal.lambda_value),
-                n_clusters=int(row["n_clusters"]),
+                n_clusters=int(controller_row["n_clusters"]),
                 partition_signature=str(
-                    row.get("selection_model_signature", row["partition_signature"])
+                    controller_row.get(
+                        "selection_model_signature",
+                        controller_row["partition_signature"],
+                    )
                 ),
                 # The active selection score steers the online-lambda
                 # controller (the observation field name is historical).
                 partition_icl=(
-                    float(artifact.score.value)
+                    float(controller_artifact.score.value)
                     if selection_score_available
                     else float("inf")
                 ),
-                kkt_residual=float(row["fixed_objective_kkt_residual"]),
+                kkt_residual=float(
+                    controller_row["fixed_objective_kkt_residual"]
+                ),
                 exact_candidate_eligible=bool(raw_exact_certified),
                 raw_objective_certified=bool(raw_exact_certified),
-                partition_certified=bool(artifact.partition.certified),
+                partition_certified=bool(controller_artifact.partition.certified),
                 selection_score_available=selection_score_available,
                 certificate_status=str(
-                    row.get(
+                    controller_row.get(
                         "full_kkt_certificate_status",
-                        fit.outer_kkt_certificate_status,
+                        controller_fit.outer_kkt_certificate_status,
                     )
                 ),
-                backend_name=str(row.get("inner_backend", fit.inner_solver)),
+                backend_name=str(
+                    controller_row.get("inner_backend", controller_fit.inner_solver)
+                ),
                 solver_iterations=int(
-                    row.get("backend_iterations", fit.inner_iterations)
+                    controller_row.get(
+                        "backend_iterations", controller_fit.inner_iterations
+                    )
+                ),
+                branch_signature=str(
+                    controller_artifact.anchor_block_signature
+                    if controller_artifact.clonal_block is not None
+                    else "unanchored"
                 ),
                 # Compatibility diagnostics for pre-provenance consumers.
-                raw_kkt_eligible=bool(row.get("raw_kkt_eligible", False)),
-                admm_iterations=int(fit.admm_iterations),
+                raw_kkt_eligible=bool(
+                    controller_row.get("raw_kkt_eligible", False)
+                ),
+                admm_iterations=int(controller_fit.admm_iterations),
             )
         )
+        if len(solver_context_by_anchor) > 8:
+            _prune_witness_warm_fit_cache(
+                fit_by_anchor_and_lambda,
+                current_lambda_key=lambda_key,
+                max_states_per_witness=4,
+            )
         next_step += 1
     if not result_entries:
         raise RuntimeError(

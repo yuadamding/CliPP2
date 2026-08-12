@@ -295,6 +295,15 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
         return search_df.copy()
     enriched = search_df.copy()
     n_rows = int(enriched.shape[0])
+    explicit_candidate_eligible: np.ndarray | None = None
+    for column in ("eligible_for_selection", "selection_eligible"):
+        if column in enriched.columns:
+            values = _strict_bool_mask(enriched[column])
+            explicit_candidate_eligible = (
+                values
+                if explicit_candidate_eligible is None
+                else explicit_candidate_eligible & values
+            )
     if "raw_kkt_eligible" in enriched.columns:
         raw_kkt = _strict_bool_mask(enriched["raw_kkt_eligible"])
     elif "selection_eligible" in enriched.columns:
@@ -320,7 +329,7 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
         selected_score = enriched["bic"].to_numpy(dtype=float)
     else:
         selected_score = classic_bic
-    enriched["bic_selection_eligible"] = (
+    eligible = (
         raw_kkt
         & partition_certified
         & bic_refit
@@ -328,6 +337,9 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
         & np.isfinite(classic_bic)
         & np.isfinite(selected_score)
     )
+    if explicit_candidate_eligible is not None:
+        eligible &= explicit_candidate_eligible
+    enriched["bic_selection_eligible"] = eligible
     return enriched
 
 

@@ -31,11 +31,24 @@ from .fusion.types import (
 
 
 @dataclass(frozen=True)
-class RawClonalAnchorSpec:
-    mode: Literal["none", "specified_seed", "enumerated_seed", "screened_seed"]
+class RawClonalClusterConstraint:
+    """Existential raw CCF-one cluster model and its witness search plan."""
+
+    witness_mode: Literal[
+        "none",
+        "specified_witness",
+        "enumerated_witness",
+        "adaptive_exact",
+        "screened_witness",
+    ]
     target: np.ndarray
-    candidate_mutation_indices: tuple[int, ...]
+    witness_indices: tuple[int, ...]
+    eligible_witness_indices: tuple[int, ...]
+    mandatory_member_indices: tuple[int, ...]
     feasibility_tolerance: float
+    equality_tolerance: float
+    minimum_cluster_size: int
+    minimum_observed_support_per_region: int
 
     def __post_init__(self) -> None:
         target = np.asarray(self.target, dtype=np.float64).reshape(-1).copy()
@@ -43,9 +56,33 @@ class RawClonalAnchorSpec:
         object.__setattr__(self, "target", target)
         object.__setattr__(
             self,
-            "candidate_mutation_indices",
-            tuple(int(index) for index in self.candidate_mutation_indices),
+            "witness_indices",
+            tuple(int(index) for index in self.witness_indices),
         )
+        object.__setattr__(
+            self,
+            "eligible_witness_indices",
+            tuple(int(index) for index in self.eligible_witness_indices),
+        )
+        object.__setattr__(
+            self,
+            "mandatory_member_indices",
+            tuple(int(index) for index in self.mandatory_member_indices),
+        )
+
+    @property
+    def mode(self) -> str:
+        return str(self.witness_mode)
+
+    @property
+    def candidate_mutation_indices(self) -> tuple[int, ...]:
+        """Compatibility alias for pre-cluster-anchor callers."""
+
+        return self.witness_indices
+
+
+# Compatibility import for code written against the first witness-seed draft.
+RawClonalAnchorSpec = RawClonalClusterConstraint
 
 
 @dataclass
@@ -65,11 +102,15 @@ class FitOptions:
     summary_tol: float | None = 1e-4
     selection_score: str = "clonal_fixed_partition_bic"
     selection_anchor: str = "clonal_required"
-    raw_clonal_anchor_mode: str = "screened_seed"
+    raw_clonal_anchor_mode: str = "adaptive_exact"
     raw_clonal_anchor_mutation_ids: tuple[str, ...] = ()
     raw_clonal_anchor_target: float = 1.0
     raw_clonal_anchor_feasibility_tol: float = 1e-8
     raw_clonal_anchor_candidate_max: int | None = 8
+    raw_clonal_include_unpenalized_overflow: bool = True
+    raw_clonal_cluster_equality_tol: float = 1e-8
+    raw_clonal_cluster_min_size: int = 1
+    raw_clonal_cluster_min_observed_support_per_region: int = 1
     selection_partition_tol: float = 1e-4
     selection_refit_tol: float = 1e-7
     selection_refit_max_iter: int = 128
@@ -200,6 +241,9 @@ class FitResult:
     estimator_role: str = "raw_fused_lambda_path"
     objective_faithful: bool = False
     objective_spec_hash: str = ""
+    base_fusion_objective_hash: str = ""
+    raw_clonal_union_model_hash: str = ""
+    witness_subproblem_hash: str = ""
     original_graph_hash: str = ""
     certificate_problem_hash: str = ""
     certificate_scope: str = "unknown"
@@ -217,6 +261,7 @@ class FitResult:
     raw_clonal_anchor_mode: str = "none"
     raw_clonal_anchor_constraint_residual: float = 0.0
     raw_clonal_anchor_frozen_coordinate_count: int = 0
+    raw_clonal_anchor_frozen_mutation_indices: tuple[int, ...] = ()
     raw_clonal_anchor_search_complete: bool = False
     raw_clonal_anchor_total_eligible_candidates: int = 0
     raw_clonal_anchor_candidates_evaluated: int = 0
@@ -461,6 +506,19 @@ def fit_fixed_objective(
         objective_spec_hash=str(
             provenance.objective_spec_hash if provenance is not None else ""
         ),
+        base_fusion_objective_hash=(
+            ""
+            if solver_context is None
+            else str(solver_context.base_fusion_objective_hash)
+        ),
+        raw_clonal_union_model_hash=(
+            ""
+            if solver_context is None
+            else str(solver_context.raw_clonal_union_model_hash)
+        ),
+        witness_subproblem_hash=(
+            "" if solver_context is None else str(solver_context.witness_subproblem_hash)
+        ),
         original_graph_hash=str(
             provenance.original_graph_hash if provenance is not None else ""
         ),
@@ -514,15 +572,20 @@ def fit_fixed_objective(
         raw_clonal_anchor_constraint_residual=(
             0.0
             if solver_context is None
-            or solver_context.clonal_anchor_mutation_index is None
+            or not solver_context.clonal_anchor_frozen_mutation_indices
             or solver_context.clonal_anchor_target is None
             else float(
                 np.max(
                     np.abs(
                         np.asarray(artifacts.phi, dtype=np.float64)[
-                            int(solver_context.clonal_anchor_mutation_index)
+                            np.asarray(
+                                solver_context.clonal_anchor_frozen_mutation_indices,
+                                dtype=np.int64,
+                            )
                         ]
-                        - solver_context.clonal_anchor_target.detach().cpu().numpy()
+                        - solver_context.clonal_anchor_target.detach()
+                        .cpu()
+                        .numpy()[None, :]
                     )
                 )
             )
@@ -530,8 +593,18 @@ def fit_fixed_objective(
         raw_clonal_anchor_frozen_coordinate_count=(
             0
             if solver_context is None
-            or solver_context.clonal_anchor_mutation_index is None
-            else int(data.num_regions)
+            else int(
+                len(solver_context.clonal_anchor_frozen_mutation_indices)
+                * data.num_regions
+            )
+        ),
+        raw_clonal_anchor_frozen_mutation_indices=(
+            ()
+            if solver_context is None
+            else tuple(
+                int(index)
+                for index in solver_context.clonal_anchor_frozen_mutation_indices
+            )
         ),
     )
 

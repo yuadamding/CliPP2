@@ -25,10 +25,10 @@ from CliPP2.core.model import FitOptions, fit_fixed_objective
 from CliPP2.io.data import PathLikelihoodSpec, TumorData
 from CliPP2.model_selection.partitions import (
     _partition_signature,
+    extract_exact_raw_clonal_block,
     extract_certified_fusion_partition,
 )
 from CliPP2.model_selection.candidates import (
-    _anchor_block_signature,
     _build_refit_summary,
     _fixed_partition_refit,
     _selection_refit_cache_key,
@@ -36,6 +36,7 @@ from CliPP2.model_selection.candidates import (
     validate_candidate_identity,
 )
 from CliPP2.model_selection.scoring import (
+    _annotate_bic_diagnostics,
     _positive_exact_fusion_selection_mask,
     _select_best_partition_leftmost,
 )
@@ -46,7 +47,12 @@ from CliPP2.model_selection.types import (
     SelectedModel,
 )
 from CliPP2.runners.outputs import write_fit_outputs
-from CliPP2.runners.model_selection import _build_raw_clonal_anchor_search
+from CliPP2.runners.model_selection import (
+    _build_raw_clonal_anchor_search,
+    _raw_clonal_witness_competition_resolved,
+    _raw_objective_minimizers,
+    _prune_witness_warm_fit_cache,
+)
 
 
 def _toy_data() -> TumorData:
@@ -110,6 +116,105 @@ class ModelIdentityTests(unittest.TestCase):
         self.assertTrue(partition.certified)
         self.assertTrue(partition.maximal)
         self.assertEqual(partition.source, "tolerance_defined_primal")
+
+    def test_exact_clonal_block_is_protected_from_near_one_neighbor(self) -> None:
+        data = _toy_data()
+        phi = np.asarray([[1.0], [0.99995], [0.5], [0.5]])
+        fit = SimpleNamespace(
+            phi=phi,
+            solver_state=None,
+            original_graph_hash="graph",
+        )
+        clonal_block = extract_exact_raw_clonal_block(
+            fit,
+            data=data,
+            witness_index=0,
+            target=np.ones(1),
+            anchor_tolerance=1e-10,
+        )
+        self.assertTrue(clonal_block.certified)
+        np.testing.assert_array_equal(clonal_block.member_indices, [0])
+        np.testing.assert_allclose(clonal_block.centroid, [1.0], atol=0.0)
+        partition = extract_certified_fusion_partition(
+            fit,
+            graph=build_complete_uniform_graph(data.num_mutations),
+            tolerance=1e-4,
+            clonal_block=clonal_block,
+            mutation_ids=tuple(data.mutation_ids),
+        )
+        self.assertTrue(partition.certified)
+        self.assertNotEqual(partition.labels[0], partition.labels[1])
+        clonal_label = int(partition.labels[0])
+        np.testing.assert_array_equal(
+            np.flatnonzero(partition.labels == clonal_label), [0]
+        )
+        self.assertEqual(partition.source, "anchor_protected_tolerance_primal")
+
+    def test_clonal_block_requires_observed_support(self) -> None:
+        data = _toy_data()
+        data.count_observed[0, :] = False
+        fit = SimpleNamespace(
+            phi=np.asarray([[1.0], [0.8], [0.5], [0.4]]),
+            solver_state=None,
+            original_graph_hash="graph",
+        )
+        clonal_block = extract_exact_raw_clonal_block(
+            fit,
+            data=data,
+            witness_index=0,
+            target=np.ones(1),
+            anchor_tolerance=1e-10,
+            minimum_observed_support_per_region=1,
+        )
+        self.assertFalse(clonal_block.certified)
+        self.assertEqual(
+            clonal_block.failure_reason,
+            "clonal_block_insufficient_observed_support",
+        )
+
+    def test_partition_and_clonal_signatures_are_input_order_invariant(self) -> None:
+        labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+        mutation_ids = ("m0", "m1", "m2", "m3")
+        permutation = np.asarray([2, 0, 3, 1], dtype=np.int64)
+        self.assertEqual(
+            _partition_signature(labels, mutation_ids),
+            _partition_signature(
+                labels[permutation],
+                tuple(mutation_ids[index] for index in permutation),
+            ),
+        )
+
+    def test_all_raw_objective_tied_witnesses_are_retained(self) -> None:
+        data = _toy_data()
+        fits = [
+            (2, SimpleNamespace(penalized_objective=10.0)),
+            (0, SimpleNamespace(penalized_objective=10.0 + 5e-11)),
+            (1, SimpleNamespace(penalized_objective=10.1)),
+        ]
+        ranked, tied, tolerance = _raw_objective_minimizers(data, fits)
+        self.assertGreater(tolerance, 5e-11)
+        self.assertEqual([key for key, _ in tied], [2, 0])
+        self.assertEqual([key for key, _ in ranked], [2, 0, 1])
+
+    def test_witness_warm_cache_is_bounded_per_branch(self) -> None:
+        cache = {
+            (witness, float(lambda_value)): SimpleNamespace()
+            for witness in (0, 1)
+            for lambda_value in range(1, 8)
+        }
+        _prune_witness_warm_fit_cache(
+            cache,
+            current_lambda_key=4.0,
+            max_states_per_witness=4,
+        )
+        for witness in (0, 1):
+            retained = {
+                lambda_value
+                for key_witness, lambda_value in cache
+                if key_witness == witness
+            }
+            self.assertLessEqual(len(retained), 4)
+            self.assertTrue({1.0, 4.0, 7.0}.issubset(retained))
 
     def test_compressed_certificate_must_match_original_graph(self) -> None:
         phi = np.asarray([[0.2], [0.8]])
@@ -200,6 +305,7 @@ class ModelIdentityTests(unittest.TestCase):
             max_iter=64,
             anchor_mode="clonal_required",
             anchor_cluster=1,
+            fixed_anchor_block_signature="2:test-anchor",
         )
         self.assertEqual(refit.clonal_cluster, 1)
         self.assertAlmostEqual(refit.cluster_centers[1, 0], 1.0)
@@ -224,6 +330,7 @@ class ModelIdentityTests(unittest.TestCase):
             lambda_value=0.0,
             raw_clonal_anchor_mode="screened_seed",
             raw_clonal_anchor_candidate_max=2,
+            raw_clonal_include_unpenalized_overflow=False,
         )
         search = _build_raw_clonal_anchor_search(
             data,
@@ -261,9 +368,68 @@ class ModelIdentityTests(unittest.TestCase):
             clonal_anchor_feasibility_tolerance=search.spec.feasibility_tolerance,
         )
         self.assertNotEqual(anchored.objective_spec_hash, second.objective_spec_hash)
+        same_witness_different_search = prepare_torch_problem(
+            data,
+            **kwargs,
+            clonal_anchor_mutation_index=anchor_index,
+            clonal_anchor_target=search.spec.target,
+            clonal_anchor_source="different_search_provenance",
+            clonal_anchor_mode="adaptive_exact",
+            clonal_anchor_feasibility_tolerance=0.0,
+        )
+        self.assertEqual(
+            anchored.objective_spec_hash,
+            same_witness_different_search.objective_spec_hash,
+        )
         self.assertFalse(search.search_complete)
         self.assertEqual(search.total_eligible_candidates, data.num_mutations)
         self.assertEqual(len(search.spec.candidate_mutation_indices), 2)
+        evaluated = set(search.spec.candidate_mutation_indices)
+        certified = {int(search.spec.candidate_mutation_indices[0])}
+        self.assertFalse(
+            _raw_clonal_witness_competition_resolved(
+                search,
+                evaluated_keys=evaluated,
+                certified_keys=certified,
+                incumbent_objective=max(search.lower_bound_by_index.values()),
+                objective_tolerance=0.0,
+            )
+        )
+
+    def test_unpenalized_overflow_rows_are_mandatory_clonal_members(self) -> None:
+        data = _toy_data()
+        kwargs = dict(
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-6,
+            inner_max_iter=32,
+            defer_graph=True,
+            device="cpu",
+            dtype="float64",
+        )
+        pilot = prepare_torch_problem(data, **kwargs)
+        options = FitOptions(lambda_value=0.0, raw_clonal_anchor_mode="adaptive_exact")
+        search = _build_raw_clonal_anchor_search(data, pilot, fit_options=options)
+        self.assertEqual(search.spec.mandatory_member_indices, (2, 3))
+        self.assertEqual(len(search.spec.witness_indices), 1)
+        witness = int(search.spec.witness_indices[0])
+        anchored = prepare_torch_problem(
+            data,
+            **kwargs,
+            clonal_anchor_mutation_index=witness,
+            clonal_anchor_mandatory_mutation_indices=(2, 3),
+            clonal_anchor_target=search.spec.target,
+            clonal_anchor_source=search.screening_rule,
+            clonal_anchor_mode=search.spec.mode,
+        )
+        self.assertEqual(anchored.clonal_anchor_frozen_mutation_indices, (2, 3))
+        np.testing.assert_allclose(
+            anchored.lower[[2, 3]].detach().cpu().numpy(),
+            np.ones((2, 1)),
+            rtol=0.0,
+            atol=0.0,
+        )
+        self.assertTrue(torch.equal(anchored.lower[[2, 3]], anchored.upper[[2, 3]]))
 
     def test_infeasible_raw_anchor_fails_and_warm_states_are_seed_specific(self) -> None:
         data = _toy_data()
@@ -281,6 +447,13 @@ class ModelIdentityTests(unittest.TestCase):
             clonal_anchor_mode="specified_seed",
             clonal_anchor_feasibility_tolerance=1e-8,
         )
+        with self.assertRaises(InfeasibleRawClonalAnchor):
+            prepare_torch_problem(
+                data,
+                **common,
+                clonal_anchor_mutation_index=0,
+            )
+        data.phi_upper[0, 0] = 1.0 - 5e-9
         with self.assertRaises(InfeasibleRawClonalAnchor):
             prepare_torch_problem(
                 data,
@@ -400,6 +573,7 @@ class ModelIdentityTests(unittest.TestCase):
             selection_options=base,
             cache=cache,
             raw_anchor_cluster=1,
+            raw_anchor_block_signature="2:test-anchor",
         )
         second, second_hit = _fixed_partition_refit(
             data=data,
@@ -407,6 +581,7 @@ class ModelIdentityTests(unittest.TestCase):
             selection_options=recovery,
             cache=cache,
             raw_anchor_cluster=1,
+            raw_anchor_block_signature="2:test-anchor",
         )
         self.assertFalse(first_hit)
         self.assertTrue(second_hit)
@@ -495,11 +670,35 @@ class ModelIdentityTests(unittest.TestCase):
             maximal=True,
         )
         options = FitOptions(lambda_value=0.0)
+        anchor_cluster = 1
+        anchor_index = int(np.flatnonzero(labels == anchor_cluster)[0])
+        raw_phi = np.asarray([[0.25], [0.25], [1.0], [1.0]])
+        raw_fit = SimpleNamespace(
+            lambda_value=1.0,
+            phi=raw_phi,
+            solver_state=None,
+            original_graph_hash="graph",
+            objective_spec_hash="witness",
+            witness_subproblem_hash="witness",
+            raw_clonal_anchor_mutation_index=anchor_index,
+            raw_clonal_anchor_target=np.ones(1),
+            raw_clonal_anchor_source="unit_test_raw_anchor",
+        )
+        clonal_block = extract_exact_raw_clonal_block(
+            raw_fit,
+            data=data,
+            witness_index=anchor_index,
+            target=np.ones(1),
+            anchor_tolerance=1e-10,
+        )
         resolution, _ = _fixed_partition_refit(
             data=data,
             partition=partition,
             selection_options=options,
             cache={},
+            raw_anchor_cluster=anchor_cluster,
+            raw_anchor_target=np.ones(1),
+            raw_anchor_block_signature=clonal_block.block_signature,
         )
         score = fixed_partition_bic(
             loglik=resolution.result.loglik,
@@ -507,25 +706,14 @@ class ModelIdentityTests(unittest.TestCase):
             data=data,
             anchor_mode=options.selection_anchor,
             partition_signature=partition.signature,
-            anchor_block_signature=_anchor_block_signature(
-                labels, int(resolution.result.clonal_cluster)
-            ),
+            anchor_block_signature=clonal_block.block_signature,
         )
         refit = _build_refit_summary(
             resolution.result,
             partition_signature=partition.signature,
             nominal_df=score.degrees_of_freedom,
             resolution=resolution,
-        )
-        anchor_cluster = int(resolution.result.clonal_cluster)
-        anchor_index = int(np.flatnonzero(labels == anchor_cluster)[0])
-        raw_phi = np.asarray(resolution.result.phi, dtype=np.float64).copy()
-        raw_fit = SimpleNamespace(
-            lambda_value=1.0,
-            phi=raw_phi,
-            raw_clonal_anchor_mutation_index=anchor_index,
-            raw_clonal_anchor_target=raw_phi[anchor_index].copy(),
-            raw_clonal_anchor_source="unit_test_raw_anchor",
+            anchor_block_signature=clonal_block.block_signature,
         )
         candidate = RawFusionCandidate(
             raw_fit=raw_fit,
@@ -541,6 +729,7 @@ class ModelIdentityTests(unittest.TestCase):
             anchor_block_signature=score.anchor_block_signature,
             anchor_target=raw_phi[anchor_index].copy(),
             anchor_search_complete=True,
+            clonal_block=clonal_block,
         )
         validate_candidate_identity(candidate)
         SelectedModel(
@@ -582,6 +771,22 @@ class ModelIdentityTests(unittest.TestCase):
         rows = [base, {**base, "candidate_pool_source": "likelihood_partition"}]
         mask = _positive_exact_fusion_selection_mask(pd.DataFrame(rows))
         np.testing.assert_array_equal(mask, [True, False])
+
+    def test_bic_annotation_preserves_explicit_candidate_ineligibility(self) -> None:
+        row = pd.DataFrame(
+            {
+                "raw_kkt_eligible": [True],
+                "partition_certified": [True],
+                "bic_refit_finite_candidate_found": [True],
+                "refit_numerically_resolved": [True],
+                "classic_bic": [10.0],
+                "bic": [10.0],
+                "eligible_for_selection": [False],
+                "selection_eligible": [False],
+            }
+        )
+        annotated = _annotate_bic_diagnostics(row)
+        self.assertFalse(bool(annotated.loc[0, "bic_selection_eligible"]))
 
     def test_selected_partition_plateau_uses_leftmost_lambda(self) -> None:
         frame = pd.DataFrame(

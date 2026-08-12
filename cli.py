@@ -67,31 +67,59 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         choices=["clonal-required", "none"],
         default="clonal-required",
         help=(
-            "Clonal-required fixes one deterministically selected mutation at "
-            "its feasible clonal CCF in the raw fusion objective; none leaves "
-            "all raw CCF coordinates free."
+            "Clonal-required constrains one exact raw fusion block to common "
+            "CCF 1; a witness mutation realizes each optimization branch."
         ),
     )
     parser.add_argument(
         "--raw-clonal-anchor-mode",
-        choices=["none", "specified-seed", "enumerated-seed", "screened-seed"],
-        default="screened-seed",
+        choices=[
+            "none",
+            "specified-witness",
+            "enumerated-witness",
+            "adaptive-exact",
+            "screened-witness",
+            # Compatibility aliases for the pre-cluster-anchor draft.
+            "specified-seed",
+            "enumerated-seed",
+            "screened-seed",
+        ],
+        default="adaptive-exact",
         help=(
-            "Hard CCF=1 raw-anchor search: specified seed, complete enumeration, "
-            "or an explicitly incomplete deviance-screened candidate set."
+            "Witness search for an exact raw CCF-one cluster: specified, full "
+            "enumeration, adaptive exact lower-bound pruning, or an explicitly "
+            "restricted screen."
         ),
     )
     parser.add_argument(
         "--raw-clonal-anchor-mutation",
         action="append",
         default=[],
-        help="Retained mutation ID for specified-seed mode (exactly one).",
+        help="Retained witness mutation ID for specified mode (exactly one).",
     )
     parser.add_argument("--raw-clonal-anchor-target", type=float, default=1.0)
     parser.add_argument(
         "--raw-clonal-anchor-feasibility-tol", type=float, default=1e-8
     )
     parser.add_argument("--raw-clonal-anchor-candidate-max", type=int, default=8)
+    parser.add_argument(
+        "--raw-clonal-include-unpenalized-overflow",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require mutations whose single-copy unpenalized CCF exceeds one "
+            "in every observed region to belong to the raw clonal block."
+        ),
+    )
+    parser.add_argument(
+        "--raw-clonal-cluster-equality-tol", type=float, default=1e-8
+    )
+    parser.add_argument("--raw-clonal-cluster-min-size", type=int, default=1)
+    parser.add_argument(
+        "--raw-clonal-cluster-min-observed-support-per-region",
+        type=int,
+        default=1,
+    )
     parser.add_argument("--disable-warm-start", action="store_true")
     parser.add_argument("--major-prior", type=float, default=0.5)
     parser.add_argument(
@@ -214,12 +242,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 "clonal-fixed-partition-bic requires a non-none raw clonal "
                 "anchor mode; fixed-partition-bic requires mode none"
             )
-        if raw_anchor_mode == "specified-seed" and len(
+        specified_modes = {"specified-seed", "specified-witness"}
+        if raw_anchor_mode in specified_modes and len(
             args.raw_clonal_anchor_mutation
         ) != 1:
-            parser.error("specified-seed requires exactly one anchor mutation")
-        if raw_anchor_mode != "specified-seed" and args.raw_clonal_anchor_mutation:
-            parser.error("anchor mutation IDs apply only to specified-seed mode")
+            parser.error("specified witness mode requires exactly one mutation")
+        if raw_anchor_mode not in specified_modes and args.raw_clonal_anchor_mutation:
+            parser.error("witness mutation IDs apply only to specified mode")
         if float(args.raw_clonal_anchor_target) != 1.0:
             parser.error("production raw clonal-anchor target must equal 1")
         if (
@@ -227,10 +256,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             or float(args.raw_clonal_anchor_feasibility_tol) < 0.0
         ):
             parser.error("raw clonal-anchor feasibility tolerance must be nonnegative")
-        if raw_anchor_mode == "screened-seed" and int(
+        if raw_anchor_mode in {
+            "screened-seed",
+            "screened-witness",
+            "adaptive-exact",
+        } and int(
             args.raw_clonal_anchor_candidate_max
         ) < 1:
-            parser.error("screened-seed candidate maximum must be positive")
+            parser.error("initial witness candidate maximum must be positive")
+        if (
+            not math.isfinite(float(args.raw_clonal_cluster_equality_tol))
+            or float(args.raw_clonal_cluster_equality_tol) <= 0.0
+        ):
+            parser.error("raw clonal-cluster equality tolerance must be positive")
+        if int(args.raw_clonal_cluster_min_size) < 1:
+            parser.error("raw clonal-cluster minimum size must be positive")
+        if int(args.raw_clonal_cluster_min_observed_support_per_region) < 0:
+            parser.error("raw clonal-cluster observed support must be nonnegative")
     return args
 
 
@@ -248,6 +290,14 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         raw_clonal_anchor_target=args.raw_clonal_anchor_target,
         raw_clonal_anchor_feasibility_tol=args.raw_clonal_anchor_feasibility_tol,
         raw_clonal_anchor_candidate_max=args.raw_clonal_anchor_candidate_max,
+        raw_clonal_include_unpenalized_overflow=(
+            args.raw_clonal_include_unpenalized_overflow
+        ),
+        raw_clonal_cluster_equality_tol=args.raw_clonal_cluster_equality_tol,
+        raw_clonal_cluster_min_size=args.raw_clonal_cluster_min_size,
+        raw_clonal_cluster_min_observed_support_per_region=(
+            args.raw_clonal_cluster_min_observed_support_per_region
+        ),
         selection_partition_tol=args.selection_partition_tol,
         selection_refit_tol=args.selection_refit_tol,
         selection_refit_max_iter=args.selection_refit_max_iter,

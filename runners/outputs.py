@@ -13,7 +13,11 @@ from ..core.fusion.path_summary import (
 from ..core.model import FitResult
 from ..io.data import TumorData
 from ..model_selection.partitions import _partition_signature
-from ..model_selection.types import FusionPartition, PartitionRefitSummary
+from ..model_selection.types import (
+    FusionPartition,
+    PartitionRefitSummary,
+    RawClonalBlockCertificate,
+)
 
 
 def _display_region_label(label: str) -> str:
@@ -46,7 +50,10 @@ def _validate_identity(
         raise AssertionError("Selected partition does not match raw fit mutations.")
     if not np.array_equal(labels, np.asarray(refit.labels, dtype=np.int64)):
         raise AssertionError("Selected partition and fixed refit labels differ.")
-    if partition.signature != _partition_signature(labels):
+    if partition.signature != _partition_signature(
+        labels,
+        partition.mutation_ids if partition.mutation_ids else None,
+    ):
         raise AssertionError("Selected partition signature does not match its labels.")
     if partition.signature != refit.partition_signature:
         raise AssertionError("Selected partition and fixed refit signatures differ.")
@@ -101,10 +108,17 @@ def mutation_output_table(
     raw_fit: FitResult,
     partition: FusionPartition,
     refit: PartitionRefitSummary,
+    clonal_block: RawClonalBlockCertificate | None = None,
 ) -> pd.DataFrame:
     raw_phi, labels = _validate_identity(raw_fit, partition, refit)
     refit_phi = _validated_profile(data, refit.phi, name="refit.phi")
     raw_anchor_index = getattr(raw_fit, "raw_clonal_anchor_mutation_index", None)
+    frozen_indices = tuple(
+        int(index)
+        for index in getattr(
+            raw_fit, "raw_clonal_anchor_frozen_mutation_indices", ()
+        )
+    )
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, data.num_mutations),
@@ -114,6 +128,34 @@ def mutation_output_table(
             == int(raw_anchor_index if raw_anchor_index is not None else -1),
             "raw_clonal_anchor_seed": np.arange(data.num_mutations)
             == int(raw_anchor_index if raw_anchor_index is not None else -1),
+            "raw_clonal_witness_mutation": np.arange(data.num_mutations)
+            == int(raw_anchor_index if raw_anchor_index is not None else -1),
+            "raw_clonal_constraint_frozen_member": np.isin(
+                np.arange(data.num_mutations), frozen_indices
+            ),
+            "is_raw_clonal_cluster_member": (
+                np.zeros(data.num_mutations, dtype=bool)
+                if clonal_block is None
+                else np.isin(
+                    np.arange(data.num_mutations), clonal_block.member_indices
+                )
+            ),
+            "raw_clonal_cluster_signature": np.repeat(
+                "none" if clonal_block is None else clonal_block.block_signature,
+                data.num_mutations,
+            ),
+            "raw_clonal_cluster_max_member_residual": np.repeat(
+                np.nan
+                if clonal_block is None
+                else float(clonal_block.maximum_member_residual),
+                data.num_mutations,
+            ),
+            "raw_clonal_cluster_centroid_residual": np.repeat(
+                np.nan
+                if clonal_block is None
+                else float(clonal_block.centroid_residual),
+                data.num_mutations,
+            ),
             "raw_clonal_anchor_constraint_residual": np.repeat(
                 float(
                     getattr(raw_fit, "raw_clonal_anchor_constraint_residual", 0.0)
@@ -160,6 +202,7 @@ def cluster_output_table(
     raw_fit: FitResult,
     partition: FusionPartition,
     refit: PartitionRefitSummary,
+    clonal_block: RawClonalBlockCertificate | None = None,
 ) -> pd.DataFrame:
     raw_phi, labels = _validate_identity(raw_fit, partition, refit)
     centers = np.asarray(refit.cluster_centers, dtype=np.float64)
@@ -168,6 +211,9 @@ def cluster_output_table(
         raise ValueError(f"refit.cluster_centers must have shape {expected}.")
     sizes = np.bincount(labels, minlength=int(partition.n_clusters))
     diameters = _cluster_raw_diameters(raw_phi, labels)
+    is_clonal_cluster = np.arange(partition.n_clusters) == int(
+        refit.clonal_cluster if refit.clonal_cluster is not None else -1
+    )
     if diameters.size and not np.isclose(
         float(np.max(diameters)),
         float(partition.max_diameter),
@@ -186,12 +232,41 @@ def cluster_output_table(
             "raw_cluster_diameter_exact": np.repeat(
                 bool(partition.diameter_exact), partition.n_clusters
             ),
-            "clonal_anchor_cluster": np.arange(partition.n_clusters)
-            == int(refit.clonal_cluster if refit.clonal_cluster is not None else -1),
-            "raw_clonal_anchor_cluster": np.arange(partition.n_clusters)
-            == int(refit.clonal_cluster if refit.clonal_cluster is not None else -1),
-            "is_raw_clonal_anchor_cluster": np.arange(partition.n_clusters)
-            == int(refit.clonal_cluster if refit.clonal_cluster is not None else -1),
+            "clonal_anchor_cluster": is_clonal_cluster,
+            "raw_clonal_anchor_cluster": is_clonal_cluster,
+            "is_raw_clonal_anchor_cluster": is_clonal_cluster,
+            "is_raw_clonal_cluster": is_clonal_cluster,
+            "raw_clonal_cluster_size": np.where(
+                is_clonal_cluster,
+                0 if clonal_block is None else int(clonal_block.cluster_size),
+                0,
+            ),
+            "raw_clonal_cluster_signature": np.where(
+                is_clonal_cluster,
+                "none" if clonal_block is None else clonal_block.block_signature,
+                "none",
+            ),
+            "raw_clonal_cluster_centroid_residual": np.where(
+                is_clonal_cluster,
+                np.nan
+                if clonal_block is None
+                else float(clonal_block.centroid_residual),
+                np.nan,
+            ),
+            "raw_clonal_cluster_max_member_residual": np.where(
+                is_clonal_cluster,
+                np.nan
+                if clonal_block is None
+                else float(clonal_block.maximum_member_residual),
+                np.nan,
+            ),
+            "raw_clonal_witness_mutation": np.where(
+                is_clonal_cluster,
+                "none"
+                if clonal_block is None
+                else str(clonal_block.witness_mutation_id),
+                "none",
+            ),
             "raw_clonal_anchor_source": np.repeat(
                 str(getattr(raw_fit, "raw_clonal_anchor_source", "none")),
                 partition.n_clusters,
@@ -237,6 +312,30 @@ def cluster_output_table(
             np.nan
             if anchor_target is None
             else float(np.asarray(anchor_target, dtype=np.float64)[column])
+        )
+        table[f"raw_clonal_cluster_centroid_{region}"] = np.where(
+            is_clonal_cluster,
+            np.nan if clonal_block is None else float(clonal_block.centroid[column]),
+            np.nan,
+        )
+        table[f"raw_clonal_cluster_common_center_{region}"] = np.where(
+            is_clonal_cluster,
+            np.nan
+            if clonal_block is None
+            else float(clonal_block.common_center[column]),
+            np.nan,
+        )
+        table[f"raw_clonal_cluster_target_{region}"] = np.where(
+            is_clonal_cluster,
+            np.nan if clonal_block is None else float(clonal_block.target[column]),
+            np.nan,
+        )
+        table[f"raw_clonal_cluster_observed_support_{region}"] = np.where(
+            is_clonal_cluster,
+            0
+            if clonal_block is None
+            else int(clonal_block.observed_support_per_region[column]),
+            0,
         )
     return table
 
@@ -388,16 +487,17 @@ def write_fit_outputs(
     raw_fit: FitResult,
     partition: FusionPartition,
     refit: PartitionRefitSummary,
+    clonal_block: RawClonalBlockCertificate | None = None,
     major_prior: float = 0.5,
 ) -> None:
     """Purely serialize one already selected, identity-validated model."""
 
     _validate_identity(raw_fit, partition, refit)
     outdir.mkdir(parents=True, exist_ok=True)
-    mutation_output_table(data, raw_fit, partition, refit).to_csv(
+    mutation_output_table(data, raw_fit, partition, refit, clonal_block).to_csv(
         outdir / f"{data.tumor_id}_mutation_clusters.tsv", sep="\t", index=False
     )
-    cluster_output_table(data, raw_fit, partition, refit).to_csv(
+    cluster_output_table(data, raw_fit, partition, refit, clonal_block).to_csv(
         outdir / f"{data.tumor_id}_cluster_centers.tsv", sep="\t", index=False
     )
     mutation_region_output_table(

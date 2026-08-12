@@ -21,6 +21,7 @@ from ..io.data import TumorData
 from .partitions import (
     _cluster_sizes_text,
     _partition_signature,
+    extract_exact_raw_clonal_block,
     extract_certified_fusion_partition,
 )
 from .scoring import (
@@ -33,6 +34,7 @@ from .types import (
     FusionPartition,
     PartitionRefitSummary,
     RawFusionCandidate,
+    RawClonalBlockCertificate,
     SelectionScore,
     StartArray,
 )
@@ -46,7 +48,10 @@ def validate_candidate_identity(candidate: RawFusionCandidate) -> None:
     score = candidate.score
     if not np.array_equal(partition.labels, refit.labels):
         raise AssertionError("Fixed-partition refit changed raw fusion labels.")
-    actual_signature = _partition_signature(partition.labels)
+    actual_signature = _partition_signature(
+        partition.labels,
+        partition.mutation_ids if partition.mutation_ids else None,
+    )
     if partition.signature != actual_signature:
         raise AssertionError(
             "Raw fusion partition signature does not match its labels."
@@ -58,6 +63,9 @@ def validate_candidate_identity(candidate: RawFusionCandidate) -> None:
     if score.partition_signature != partition.signature:
         raise AssertionError("Selection score does not match raw partition.")
     if score.name == "clonal_fixed_partition_bic":
+        clonal_block = candidate.clonal_block
+        if clonal_block is None or not clonal_block.certified:
+            raise AssertionError("Clonal BIC requires a certified raw CCF-one block.")
         anchor_index = candidate.raw_fit.raw_clonal_anchor_mutation_index
         anchor_target = candidate.raw_fit.raw_clonal_anchor_target
         if anchor_index is None or anchor_target is None:
@@ -67,7 +75,38 @@ def validate_candidate_identity(candidate: RawFusionCandidate) -> None:
             raise AssertionError("Raw-fusion anchor mutation index is invalid.")
         if str(candidate.raw_fit.raw_clonal_anchor_source) == "none":
             raise AssertionError("Raw-fusion anchor provenance is missing.")
+        witness_hash = str(
+            getattr(candidate.raw_fit, "witness_subproblem_hash", "")
+        )
+        objective_hash = str(getattr(candidate.raw_fit, "objective_spec_hash", ""))
+        if witness_hash and witness_hash != objective_hash:
+            raise AssertionError("Witness subproblem hash differs from raw objective.")
         raw_anchor_cluster = int(partition.labels[anchor_index])
+        block_members = np.flatnonzero(partition.labels == raw_anchor_cluster)
+        if not np.array_equal(
+            np.sort(block_members), np.sort(clonal_block.member_indices)
+        ):
+            raise AssertionError(
+                "Selection partition expanded or contracted the exact clonal block."
+            )
+        target_array = np.asarray(clonal_block.target, dtype=np.float64)
+        raw_block_phi = np.asarray(candidate.raw_fit.phi, dtype=np.float64)[
+            clonal_block.member_indices
+        ]
+        if not np.allclose(
+            raw_block_phi,
+            target_array[None, :],
+            rtol=0.0,
+            atol=float(clonal_block.equality_tolerance),
+        ):
+            raise AssertionError("A raw clonal-block member is not at CCF one.")
+        if not np.allclose(
+            np.mean(raw_block_phi, axis=0),
+            target_array,
+            rtol=0.0,
+            atol=float(clonal_block.equality_tolerance),
+        ):
+            raise AssertionError("Raw clonal-block centroid is not at CCF one.")
         if refit.clonal_cluster != raw_anchor_cluster:
             raise AssertionError(
                 "Fixed-partition refit did not preserve the raw anchor cluster."
@@ -79,9 +118,7 @@ def validate_candidate_identity(candidate: RawFusionCandidate) -> None:
             atol=1e-12,
         ):
             raise AssertionError("Fixed-partition refit changed the raw anchor target.")
-        expected_anchor_signature = _anchor_block_signature(
-            partition.labels, raw_anchor_cluster
-        )
+        expected_anchor_signature = str(clonal_block.block_signature)
         if score.anchor_block_signature != expected_anchor_signature:
             raise AssertionError("Score anchor block differs from the raw anchor block.")
         if candidate.anchor_seed_index != anchor_index:
@@ -94,6 +131,8 @@ def validate_candidate_identity(candidate: RawFusionCandidate) -> None:
             np.asarray(candidate.anchor_target), np.asarray(anchor_target)
         ):
             raise AssertionError("Candidate anchor target differs from its raw fit.")
+        if refit.anchor_block_signature != expected_anchor_signature:
+            raise AssertionError("Refit clonal-block signature is inconsistent.")
         raw_anchor_phi = np.asarray(candidate.raw_fit.phi, dtype=np.float64)[
             anchor_index
         ]
@@ -152,9 +191,9 @@ def _ineligibility_reason(
     if not bool(fit.full_kkt_certified) or not bool(fit.selection_eligible):
         return "raw_objective_not_kkt_certified"
     if not raw_clonal_anchor_certified:
-        return "raw_clonal_anchor_not_certified"
+        return "raw_clonal_cluster_not_certified"
     if not raw_anchor_search_resolved:
-        return "raw_clonal_anchor_search_unresolved"
+        return "raw_clonal_witness_search_unresolved"
     if not partition.certified:
         return str(partition.certification_failure_reason)
     if not refit_finite:
@@ -198,11 +237,13 @@ def _selection_refit_cache_key(
     selection_options: FitOptions,
     raw_anchor_cluster: int | None = None,
     raw_anchor_target: np.ndarray | None = None,
+    raw_anchor_block_signature: str = "none",
 ) -> tuple[object, ...]:
     return (
         partition.signature,
         str(selection_options.selection_anchor),
         None if raw_anchor_cluster is None else int(raw_anchor_cluster),
+        str(raw_anchor_block_signature),
         (
             None
             if raw_anchor_target is None
@@ -225,6 +266,7 @@ def _fixed_partition_refit(
     cache: dict[object, _CachedPartitionRefit] | None,
     raw_anchor_cluster: int | None = None,
     raw_anchor_target: np.ndarray | None = None,
+    raw_anchor_block_signature: str = "none",
 ) -> tuple[_CachedPartitionRefit, bool]:
     refit_spec_key = _selection_refit_cache_key(
         data=data,
@@ -232,6 +274,7 @@ def _fixed_partition_refit(
         selection_options=selection_options,
         raw_anchor_cluster=raw_anchor_cluster,
         raw_anchor_target=raw_anchor_target,
+        raw_anchor_block_signature=raw_anchor_block_signature,
     )
     if cache is not None and refit_spec_key in cache:
         return cache[refit_spec_key], True
@@ -244,6 +287,7 @@ def _fixed_partition_refit(
         anchor_mode=str(selection_options.selection_anchor),
         anchor_cluster=raw_anchor_cluster,
         fixed_anchor_target=raw_anchor_target,
+        fixed_anchor_block_signature=raw_anchor_block_signature,
         anchor_feasibility_tol=float(
             selection_options.raw_clonal_anchor_feasibility_tol
         ),
@@ -305,6 +349,7 @@ def _build_refit_summary(
     partition_signature: str,
     nominal_df: int,
     resolution: _CachedPartitionRefit,
+    anchor_block_signature: str = "none",
 ) -> PartitionRefitSummary:
     return PartitionRefitSummary(
         labels=np.asarray(refit.labels, dtype=np.int64).copy(),
@@ -347,6 +392,7 @@ def _build_refit_summary(
             if refit.fixed_anchor_target is None
             else np.asarray(refit.fixed_anchor_target, dtype=np.float64).copy()
         ),
+        anchor_block_signature=str(refit.fixed_anchor_block_signature),
     )
 
 
@@ -441,34 +487,59 @@ def _evaluate_candidate(
         raise RuntimeError(
             "Model-selection candidates require a resolved pairwise-fusion graph."
         )
-    partition_tolerance = _effective_bic_partition_tol(selection_options)
-    partition = extract_certified_fusion_partition(
-        fit,
-        graph=graph,
-        tolerance=partition_tolerance,
-    )
-
     anchor_required = (
         str(selection_options.selection_anchor).strip().lower()
         == "clonal_required"
     )
     raw_anchor_index = fit.raw_clonal_anchor_mutation_index
     raw_anchor_target = fit.raw_clonal_anchor_target
+    clonal_block: RawClonalBlockCertificate | None = None
+    if anchor_required and raw_anchor_index is not None and raw_anchor_target is not None:
+        clonal_block = extract_exact_raw_clonal_block(
+            fit,
+            data=data,
+            witness_index=int(raw_anchor_index),
+            target=np.asarray(raw_anchor_target, dtype=np.float64),
+            anchor_tolerance=float(selection_options.raw_clonal_cluster_equality_tol),
+            minimum_cluster_size=int(selection_options.raw_clonal_cluster_min_size),
+            minimum_observed_support_per_region=int(
+                selection_options.raw_clonal_cluster_min_observed_support_per_region
+            ),
+        )
+
+    partition_tolerance = _effective_bic_partition_tol(selection_options)
+    partition = extract_certified_fusion_partition(
+        fit,
+        graph=graph,
+        tolerance=partition_tolerance,
+        clonal_block=clonal_block,
+        mutation_ids=tuple(str(value) for value in data.mutation_ids),
+    )
+
     raw_anchor_cluster: int | None = None
     raw_clonal_anchor_certified = not anchor_required
-    if anchor_required and raw_anchor_index is not None and raw_anchor_target is not None:
+    if (
+        anchor_required
+        and clonal_block is not None
+        and raw_anchor_index is not None
+        and raw_anchor_target is not None
+    ):
         raw_anchor_index = int(raw_anchor_index)
         if 0 <= raw_anchor_index < int(data.num_mutations):
             raw_anchor_cluster = int(partition.labels[raw_anchor_index])
             raw_clonal_anchor_certified = bool(
+                clonal_block.certified
+                and
                 str(fit.raw_clonal_anchor_source) != "none"
-                and np.allclose(
-                    np.asarray(fit.phi, dtype=np.float64)[raw_anchor_index],
-                    np.asarray(raw_anchor_target, dtype=np.float64),
-                    rtol=0.0,
-                    atol=max(5.0 * float(raw_fit_options.tol), 1e-12),
+                and np.array_equal(
+                    np.flatnonzero(partition.labels == raw_anchor_cluster),
+                    clonal_block.member_indices,
                 )
             )
+
+    anchor_block_signature = (
+        "none" if clonal_block is None else str(clonal_block.block_signature)
+    )
 
     refit_start_time = perf_counter()
     cached_refit, cache_hit = _fixed_partition_refit(
@@ -478,15 +549,13 @@ def _evaluate_candidate(
         cache=bic_refit_cache,
         raw_anchor_cluster=raw_anchor_cluster,
         raw_anchor_target=raw_anchor_target,
+        raw_anchor_block_signature=anchor_block_signature,
     )
     refit_result = cached_refit.result
     refit_elapsed_seconds = (
         0.0 if cache_hit else float(perf_counter() - refit_start_time)
     )
 
-    anchor_block_signature = _anchor_block_signature(
-        partition.labels, raw_anchor_cluster
-    )
     score = fixed_partition_bic(
         loglik=float(refit_result.loglik),
         num_clusters=int(partition.n_clusters),
@@ -506,6 +575,7 @@ def _evaluate_candidate(
         partition_signature=partition.signature,
         nominal_df=int(score.degrees_of_freedom),
         resolution=cached_refit,
+        anchor_block_signature=anchor_block_signature,
     )
     raw_objective_certified = bool(
         float(fit.lambda_value) > 0.0
@@ -547,6 +617,7 @@ def _evaluate_candidate(
             else np.asarray(raw_anchor_target, dtype=np.float64).copy()
         ),
         anchor_search_complete=bool(fit.raw_clonal_anchor_search_complete),
+        clonal_block=clonal_block,
     )
     validate_candidate_identity(candidate)
 
@@ -662,6 +733,57 @@ def _evaluate_candidate(
         "raw_objective_certified": bool(raw_objective_certified),
         "raw_clonal_anchor_required": bool(anchor_required),
         "raw_clonal_anchor_certified": bool(raw_clonal_anchor_certified),
+        "raw_clonal_cluster_certified": bool(
+            clonal_block is not None and clonal_block.certified
+        ),
+        "raw_clonal_cluster_failure_reason": (
+            "none" if clonal_block is None else str(clonal_block.failure_reason)
+        ),
+        "raw_clonal_cluster_size": (
+            0 if clonal_block is None else int(clonal_block.cluster_size)
+        ),
+        "raw_clonal_cluster_signature": str(anchor_block_signature),
+        "raw_clonal_cluster_max_member_residual": (
+            float("nan")
+            if clonal_block is None
+            else float(clonal_block.maximum_member_residual)
+        ),
+        "raw_clonal_cluster_centroid_residual": (
+            float("nan")
+            if clonal_block is None
+            else float(clonal_block.centroid_residual)
+        ),
+        "raw_clonal_cluster_observed_support_per_region": (
+            "none"
+            if clonal_block is None
+            else ",".join(
+                str(int(value))
+                for value in clonal_block.observed_support_per_region
+            )
+        ),
+        "raw_clonal_cluster_common_center": (
+            "none"
+            if clonal_block is None
+            else ",".join(
+                format(float(value), ".17g")
+                for value in clonal_block.common_center
+            )
+        ),
+        "raw_clonal_cluster_centroid": (
+            "none"
+            if clonal_block is None
+            else ",".join(
+                format(float(value), ".17g") for value in clonal_block.centroid
+            )
+        ),
+        "raw_clonal_witness_mutation_index": (
+            -1 if raw_anchor_index is None else int(raw_anchor_index)
+        ),
+        "raw_clonal_witness_mutation_id": (
+            "none"
+            if raw_anchor_index is None
+            else str(data.mutation_ids[int(raw_anchor_index)])
+        ),
         "raw_clonal_anchor_mutation_index": (
             -1 if raw_anchor_index is None else int(raw_anchor_index)
         ),
@@ -773,6 +895,9 @@ def _evaluate_candidate(
         "exactness_provenance_version": int(fit.exactness_provenance_version),
         "objective_faithful": bool(fit.objective_faithful),
         "objective_spec_hash": str(fit.objective_spec_hash),
+        "base_fusion_objective_hash": str(fit.base_fusion_objective_hash),
+        "raw_clonal_union_model_hash": str(fit.raw_clonal_union_model_hash),
+        "witness_subproblem_hash": str(fit.witness_subproblem_hash),
         "original_graph_hash": str(fit.original_graph_hash),
         "certificate_problem_hash": str(fit.certificate_problem_hash),
         "certificate_scope": str(fit.certificate_scope),

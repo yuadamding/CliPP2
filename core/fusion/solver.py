@@ -587,27 +587,16 @@ def _objective_spec_fingerprint(
     eps: float,
     clonal_anchor_mutation_index: int | None = None,
     clonal_anchor_target: np.ndarray | None = None,
-    clonal_anchor_source: str = "none",
-    clonal_anchor_mode: str = "none",
-    clonal_anchor_feasibility_tolerance: float = 0.0,
     constrained_lower: np.ndarray | None = None,
     constrained_upper: np.ndarray | None = None,
 ) -> str:
     digest = hashlib.sha256()
     for value in (
-        "clipp2_observed_objective_v3_raw_clonal_anchor",
+        "clipp2_observed_objective_v5_constrained_box_subproblem",
         objective_data_fingerprint,
         graph_hash,
         float(major_prior).hex(),
         float(eps).hex(),
-        (
-            "none"
-            if clonal_anchor_mutation_index is None
-            else str(int(clonal_anchor_mutation_index))
-        ),
-        str(clonal_anchor_source),
-        str(clonal_anchor_mode),
-        float(clonal_anchor_feasibility_tolerance).hex(),
     ):
         encoded = value.encode("utf-8")
         digest.update(len(encoded).to_bytes(8, "little"))
@@ -1015,10 +1004,12 @@ def prepare_torch_problem(
     objective_shape: str = "unimodal",
     defer_graph: bool = False,
     clonal_anchor_mutation_index: int | None = None,
+    clonal_anchor_mandatory_mutation_indices: tuple[int, ...] = (),
     clonal_anchor_target: float | np.ndarray | torch.Tensor | None = None,
     clonal_anchor_source: str = "none",
     clonal_anchor_mode: str = "none",
     clonal_anchor_feasibility_tolerance: float = 0.0,
+    raw_clonal_union_model_hash: str = "",
 ) -> SolverContext:
     tol = _validate_solver_tolerance(tol)
     objective_shape = objective_shape_for_data(data, objective_shape)
@@ -1160,7 +1151,10 @@ def prepare_torch_problem(
     upper = torch.minimum(
         effective_torch_data.phi_upper, torch.ones_like(effective_torch_data.phi_upper)
     )
+    base_lower = lower
+    base_upper = upper
     anchor_index: int | None = None
+    anchor_frozen_indices: tuple[int, ...] = ()
     anchor_target: torch.Tensor | None = None
     normalized_anchor_source = str(clonal_anchor_source).strip() or "none"
     normalized_anchor_mode = str(clonal_anchor_mode).strip().lower() or "none"
@@ -1179,6 +1173,10 @@ def prepare_torch_problem(
             "specified_seed",
             "enumerated_seed",
             "screened_seed",
+            "specified_witness",
+            "enumerated_witness",
+            "screened_witness",
+            "adaptive_exact",
         }:
             raise ValueError("A raw clonal anchor requires an explicit anchor mode.")
         if clonal_anchor_target is None:
@@ -1200,20 +1198,37 @@ def prepare_torch_problem(
             raise InfeasibleRawClonalAnchor(
                 "Raw clonal-anchor target lies outside the CCF domain."
             )
-        if bool(
-            torch.any(
-                target_tensor
-                > upper[anchor_index] + float(anchor_feasibility_tolerance)
-            ).item()
-        ):
+        if bool(torch.any(target_tensor > upper[anchor_index]).item()):
             raise InfeasibleRawClonalAnchor(
                 "no_feasible_raw_clonal_anchor: target exceeds mutation support."
             )
         anchor_target = target_tensor.detach().clone()
+        mandatory_indices = tuple(
+            sorted(set(int(index) for index in clonal_anchor_mandatory_mutation_indices))
+        )
+        if any(
+            index < 0 or index >= int(data.num_mutations)
+            for index in mandatory_indices
+        ):
+            raise ValueError(
+                "clonal_anchor_mandatory_mutation_indices contains an invalid index."
+            )
+        anchor_frozen_indices = tuple(sorted(set(mandatory_indices + (anchor_index,))))
+        frozen_index_tensor = torch.as_tensor(
+            anchor_frozen_indices,
+            dtype=torch.long,
+            device=upper.device,
+        )
+        if bool(
+            torch.any(upper.index_select(0, frozen_index_tensor) < anchor_target).item()
+        ):
+            raise InfeasibleRawClonalAnchor(
+                "no_feasible_raw_clonal_anchor: target exceeds mandatory member support."
+            )
         lower = lower.clone()
         upper = upper.clone()
-        lower[anchor_index] = anchor_target
-        upper[anchor_index] = anchor_target
+        lower[frozen_index_tensor] = anchor_target
+        upper[frozen_index_tensor] = anchor_target
 
         def project_start(start: torch.Tensor) -> torch.Tensor:
             return torch.minimum(torch.maximum(start, lower), upper)
@@ -1234,6 +1249,14 @@ def prepare_torch_problem(
         eps=float(eps),
     )
     graph_hash = _graph_fingerprint(effective_graph)
+    base_fusion_objective_hash = _objective_spec_fingerprint(
+        objective_data_fingerprint=tumor_objective_fingerprint(data),
+        graph_hash=graph_hash,
+        major_prior=float(major_prior),
+        eps=float(eps),
+        constrained_lower=base_lower.detach().cpu().numpy(),
+        constrained_upper=base_upper.detach().cpu().numpy(),
+    )
     objective_spec_hash = _objective_spec_fingerprint(
         objective_data_fingerprint=tumor_objective_fingerprint(data),
         graph_hash=graph_hash,
@@ -1245,12 +1268,12 @@ def prepare_torch_problem(
             if anchor_target is None
             else anchor_target.detach().cpu().numpy()
         ),
-        clonal_anchor_source=normalized_anchor_source,
-        clonal_anchor_mode=normalized_anchor_mode,
-        clonal_anchor_feasibility_tolerance=anchor_feasibility_tolerance,
         constrained_lower=lower.detach().cpu().numpy(),
         constrained_upper=upper.detach().cpu().numpy(),
     )
+    union_model_hash = str(raw_clonal_union_model_hash).strip()
+    if not union_model_hash:
+        union_model_hash = base_fusion_objective_hash
     return SolverContext(
         problem=problem,
         graph=tensor_graph,
@@ -1267,7 +1290,11 @@ def prepare_torch_problem(
         data_fingerprint=data_fingerprint,
         graph_hash=graph_hash,
         objective_spec_hash=objective_spec_hash,
+        base_fusion_objective_hash=base_fusion_objective_hash,
+        raw_clonal_union_model_hash=union_model_hash,
+        witness_subproblem_hash=objective_spec_hash,
         clonal_anchor_mutation_index=anchor_index,
+        clonal_anchor_frozen_mutation_indices=anchor_frozen_indices,
         clonal_anchor_target=anchor_target,
         clonal_anchor_source=normalized_anchor_source,
         clonal_anchor_mode=normalized_anchor_mode,
