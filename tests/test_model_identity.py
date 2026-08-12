@@ -11,7 +11,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-from CliPP2.core.bic import effective_bic_mutation_region_count, fixed_partition_bic
+from CliPP2.core.bic import (
+    anchor_prior_adjusted_bic_value,
+    effective_bic_mutation_region_count,
+    fixed_partition_bic,
+)
 from CliPP2.core.fusion.graph import build_complete_uniform_graph
 from CliPP2.core.fusion.refit import partition_constrained_observed_refit
 from CliPP2.core.fusion.solver import prepare_torch_problem
@@ -21,10 +25,15 @@ from CliPP2.core.fusion.types import (
     QuotientWorksetWarmState,
     SolverState,
 )
-from CliPP2.core.model import FitOptions, fit_fixed_objective
+from CliPP2.core.model import (
+    FitOptions,
+    effective_raw_clonal_equality_tolerance,
+    fit_fixed_objective,
+)
 from CliPP2.io.data import PathLikelihoodSpec, TumorData
 from CliPP2.model_selection.partitions import (
     _partition_signature,
+    evaluate_raw_clonal_block_evidence,
     extract_exact_raw_clonal_block,
     extract_certified_fusion_partition,
 )
@@ -79,6 +88,36 @@ def _toy_data() -> TumorData:
 
 
 class ModelIdentityTests(unittest.TestCase):
+    def test_clonal_equality_tolerance_is_bound_to_solver_precision(self) -> None:
+        options = FitOptions(lambda_value=0.0)
+        self.assertEqual(
+            effective_raw_clonal_equality_tolerance(options),
+            float(options.tol),
+        )
+        self.assertEqual(
+            effective_raw_clonal_equality_tolerance(
+                replace(
+                    options,
+                    tol=1e-7,
+                    certificate_column_tol_scale=2.0,
+                    raw_clonal_cluster_equality_tol=3e-7,
+                )
+            ),
+            3e-7,
+        )
+        self.assertEqual(
+            effective_raw_clonal_equality_tolerance(
+                replace(
+                    options,
+                    tol=1e-8,
+                    certificate_column_tol_scale=1.0,
+                    raw_clonal_cluster_equality_tol=1e-8,
+                    dtype="float32",
+                )
+            ),
+            float(np.finfo(np.float32).eps),
+        )
+
     def test_chain_partition_fails_closed(self) -> None:
         phi = np.asarray([[0.20000], [0.20009], [0.20018]])
         fit = SimpleNamespace(phi=phi, solver_state=None)
@@ -150,7 +189,9 @@ class ModelIdentityTests(unittest.TestCase):
         )
         self.assertEqual(partition.source, "anchor_protected_tolerance_primal")
 
-    def test_clonal_block_requires_observed_support(self) -> None:
+    def test_clonal_block_evidence_is_separate_from_mathematical_certificate(
+        self,
+    ) -> None:
         data = _toy_data()
         data.count_observed[0, :] = False
         fit = SimpleNamespace(
@@ -164,11 +205,18 @@ class ModelIdentityTests(unittest.TestCase):
             witness_index=0,
             target=np.ones(1),
             anchor_tolerance=1e-10,
+        )
+        self.assertTrue(clonal_block.mathematically_certified)
+        self.assertEqual(clonal_block.failure_reason, "none")
+        evidence = evaluate_raw_clonal_block_evidence(
+            clonal_block,
+            data=data,
+            minimum_cluster_size=1,
             minimum_observed_support_per_region=1,
         )
-        self.assertFalse(clonal_block.certified)
+        self.assertFalse(evidence.evidence_gate_passed)
         self.assertEqual(
-            clonal_block.failure_reason,
+            evidence.evidence_failure_reason,
             "clonal_block_insufficient_observed_support",
         )
 
@@ -195,6 +243,66 @@ class ModelIdentityTests(unittest.TestCase):
         self.assertGreater(tolerance, 5e-11)
         self.assertEqual([key for key, _ in tied], [2, 0])
         self.assertEqual([key for key, _ in ranked], [2, 0, 1])
+
+    def test_witness_lower_bounds_fail_closed_and_prune_only_above_incumbent(
+        self,
+    ) -> None:
+        data = _toy_data()
+        context = prepare_torch_problem(
+            data,
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-6,
+            inner_max_iter=32,
+            defer_graph=True,
+            device="cpu",
+            dtype="float64",
+        )
+        search = _build_raw_clonal_anchor_search(
+            data,
+            context,
+            fit_options=FitOptions(
+                lambda_value=0.0,
+                raw_clonal_anchor_mode="adaptive_bound_complete",
+                raw_clonal_anchor_candidate_max=1,
+            ),
+        )
+        ordered = sorted(
+            search.spec.eligible_witness_indices,
+            key=lambda index: search.lower_bound_by_index[index],
+        )
+        incumbent_key = int(ordered[0])
+        competitive_key = int(ordered[1])
+        incumbent = float(search.lower_bound_by_index[competitive_key])
+        self.assertFalse(
+            _raw_clonal_witness_competition_resolved(
+                search,
+                evaluated_keys={incumbent_key},
+                certified_keys={incumbent_key},
+                incumbent_objective=incumbent,
+                objective_tolerance=0.0,
+            )
+        )
+        safely_pruned_incumbent = max(search.lower_bound_by_index.values()) - 1e-8
+        certified = {
+            int(index)
+            for index, lower_bound in search.lower_bound_by_index.items()
+            if lower_bound <= safely_pruned_incumbent
+        }
+        self.assertTrue(
+            _raw_clonal_witness_competition_resolved(
+                search,
+                evaluated_keys=certified,
+                certified_keys=certified,
+                incumbent_objective=safely_pruned_incumbent,
+                objective_tolerance=0.0,
+            )
+        )
+        for index in set(search.spec.eligible_witness_indices) - certified:
+            self.assertGreater(
+                search.lower_bound_by_index[index],
+                safely_pruned_incumbent,
+            )
 
     def test_witness_warm_cache_is_bounded_per_branch(self) -> None:
         cache = {
@@ -374,7 +482,7 @@ class ModelIdentityTests(unittest.TestCase):
             clonal_anchor_mutation_index=anchor_index,
             clonal_anchor_target=search.spec.target,
             clonal_anchor_source="different_search_provenance",
-            clonal_anchor_mode="adaptive_exact",
+            clonal_anchor_mode="adaptive_bound_complete",
             clonal_anchor_feasibility_tolerance=0.0,
         )
         self.assertEqual(
@@ -396,8 +504,12 @@ class ModelIdentityTests(unittest.TestCase):
             )
         )
 
-    def test_unpenalized_overflow_rows_are_mandatory_clonal_members(self) -> None:
+    def test_high_multiplicity_overflow_is_not_forced_clonal(self) -> None:
         data = _toy_data()
+        # eta=0.4, multiplicity=2, true CCF=0.6 gives expected VAF=0.48 and
+        # a single-copy inversion of 1.2. This is not evidence of CCF one.
+        data.alt_counts[2, 0] = 4.8
+        data.scaling[2, 0] = 0.4
         kwargs = dict(
             major_prior=0.5,
             eps=1e-6,
@@ -408,28 +520,85 @@ class ModelIdentityTests(unittest.TestCase):
             dtype="float64",
         )
         pilot = prepare_torch_problem(data, **kwargs)
-        options = FitOptions(lambda_value=0.0, raw_clonal_anchor_mode="adaptive_exact")
+        options = FitOptions(
+            lambda_value=0.0,
+            raw_clonal_anchor_mode="adaptive_bound_complete",
+            # The deprecated switch is accepted but cannot change the model.
+            raw_clonal_include_unpenalized_overflow=True,
+        )
         search = _build_raw_clonal_anchor_search(data, pilot, fit_options=options)
-        self.assertEqual(search.spec.mandatory_member_indices, (2, 3))
-        self.assertEqual(len(search.spec.witness_indices), 1)
-        witness = int(search.spec.witness_indices[0])
+        search_without_deprecated_flag = _build_raw_clonal_anchor_search(
+            data,
+            pilot,
+            fit_options=replace(
+                options,
+                raw_clonal_include_unpenalized_overflow=False,
+            ),
+        )
+        self.assertEqual(search.spec.mandatory_member_indices, ())
+        self.assertEqual(
+            search.spec.eligible_witness_indices,
+            search_without_deprecated_flag.spec.eligible_witness_indices,
+        )
+        self.assertEqual(
+            search.spec.initial_witness_indices,
+            search_without_deprecated_flag.spec.initial_witness_indices,
+        )
+        self.assertEqual(
+            search.lower_bound_by_index,
+            search_without_deprecated_flag.lower_bound_by_index,
+        )
+        witness = int(search.spec.initial_witness_indices[0])
         anchored = prepare_torch_problem(
             data,
             **kwargs,
             clonal_anchor_mutation_index=witness,
-            clonal_anchor_mandatory_mutation_indices=(2, 3),
             clonal_anchor_target=search.spec.target,
             clonal_anchor_source=search.screening_rule,
             clonal_anchor_mode=search.spec.mode,
         )
-        self.assertEqual(anchored.clonal_anchor_frozen_mutation_indices, (2, 3))
+        self.assertEqual(
+            anchored.clonal_anchor_frozen_mutation_indices,
+            (witness,),
+        )
+        overflow_indices = (2, 3)
+        for index in overflow_indices:
+            if index == witness:
+                continue
+            self.assertNotIn(index, anchored.clonal_anchor_frozen_mutation_indices)
+            self.assertFalse(torch.equal(anchored.lower[index], anchored.upper[index]))
+
+    def test_sampling_noise_overflow_is_not_a_hard_constraint(self) -> None:
+        data = _toy_data()
+        # m3 has a one-copy inversion of 1.8, which could also arise from
+        # binomial sampling noise.  Specifying another feasible witness must
+        # leave m3's raw coordinate free.
+        kwargs = dict(
+            major_prior=0.5,
+            eps=1e-6,
+            tol=1e-6,
+            inner_max_iter=32,
+            defer_graph=True,
+            device="cpu",
+            dtype="float64",
+        )
+        anchored = prepare_torch_problem(
+            data,
+            **kwargs,
+            clonal_anchor_mutation_index=0,
+            clonal_anchor_target=np.ones(1),
+            clonal_anchor_source="unit_test",
+            clonal_anchor_mode="specified_witness",
+        )
+        self.assertEqual(anchored.clonal_anchor_frozen_mutation_indices, (0,))
+        self.assertFalse(torch.equal(anchored.lower[3], anchored.upper[3]))
         np.testing.assert_allclose(
-            anchored.lower[[2, 3]].detach().cpu().numpy(),
-            np.ones((2, 1)),
+            anchored.lower[[0]].detach().cpu().numpy(),
+            np.ones((1, 1)),
             rtol=0.0,
             atol=0.0,
         )
-        self.assertTrue(torch.equal(anchored.lower[[2, 3]], anchored.upper[[2, 3]]))
+        self.assertTrue(torch.equal(anchored.lower[[0]], anchored.upper[[0]]))
 
     def test_infeasible_raw_anchor_fails_and_warm_states_are_seed_specific(self) -> None:
         data = _toy_data()
@@ -654,6 +823,31 @@ class ModelIdentityTests(unittest.TestCase):
         self.assertEqual(score.degrees_of_freedom, 2 * data.num_regions)
         self.assertEqual(refit.nominal_df, score.degrees_of_freedom)
         self.assertAlmostEqual(diagnostics["classic_bic"], score.value)
+
+    def test_anchor_prior_score_is_reported_only_as_sensitivity(self) -> None:
+        data = _toy_data()
+        clonal = fixed_partition_bic(
+            loglik=-10.0,
+            num_clusters=2,
+            data=data,
+            anchor_mode="clonal_required",
+            partition_signature="two",
+        )
+        self.assertAlmostEqual(
+            anchor_prior_adjusted_bic_value(clonal, num_clusters=2),
+            clonal.value + 2.0 * np.log(2.0),
+        )
+        unanchored = fixed_partition_bic(
+            loglik=-10.0,
+            num_clusters=2,
+            data=data,
+            anchor_mode="none",
+            partition_signature="two",
+        )
+        self.assertEqual(
+            anchor_prior_adjusted_bic_value(unanchored, num_clusters=2),
+            unanchored.value,
+        )
 
     def test_selected_model_enforces_full_identity_contract(self) -> None:
         data = _toy_data()

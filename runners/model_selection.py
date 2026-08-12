@@ -12,6 +12,7 @@ from ..core.model import (
     FitOptions,
     FitResult,
     RawClonalClusterConstraint,
+    effective_raw_clonal_equality_tolerance,
     fit_fixed_objective,
 )
 from ..core.fusion.defaults import (
@@ -76,6 +77,7 @@ from ..model_selection.partitions import (
     _best_partition_candidate,
     _partition_candidate_requested_k,
     _partition_signature,
+    extract_exact_raw_clonal_block,
 )
 from ..model_selection.scoring import (
     _adaptive_score_column,
@@ -180,6 +182,35 @@ def _raw_objective_minimizers(
     return ranked, tied, tolerance
 
 
+def _raw_clonal_branch_mathematically_certified(
+    data: TumorData,
+    fit: FitResult,
+    *,
+    equality_tolerance: float,
+) -> bool:
+    """Require branch KKT certification and a valid CCF-one raw block."""
+
+    if not (
+        float(fit.lambda_value) > 0.0
+        and bool(fit.objective_faithful)
+        and bool(fit.full_kkt_certified)
+        and bool(fit.selection_eligible)
+    ):
+        return False
+    witness = fit.raw_clonal_anchor_mutation_index
+    target = fit.raw_clonal_anchor_target
+    if witness is None or target is None:
+        return True
+    block = extract_exact_raw_clonal_block(
+        fit,
+        data=data,
+        witness_index=int(witness),
+        target=np.asarray(target, dtype=np.float64),
+        anchor_tolerance=float(equality_tolerance),
+    )
+    return bool(block.mathematically_certified)
+
+
 def _prune_witness_warm_fit_cache(
     cache: dict[tuple[int, float], FitResult],
     *,
@@ -233,14 +264,16 @@ def _build_raw_clonal_anchor_search(
         "enumerated_witness": "enumerated_witness",
         "screened_seed": "screened_witness",
         "screened_witness": "screened_witness",
-        "adaptive_exact": "adaptive_exact",
+        # Compatibility alias; the old name overstated branch global optimality.
+        "adaptive_exact": "adaptive_bound_complete",
+        "adaptive_bound_complete": "adaptive_bound_complete",
     }
     mode = mode_aliases.get(requested_mode)
     valid_modes = set(mode_aliases)
     if requested_mode not in valid_modes or mode is None:
         raise ValueError(
             "raw_clonal_anchor_mode must be none, specified_witness, "
-            "enumerated_witness, adaptive_exact, or screened_witness."
+            "enumerated_witness, adaptive_bound_complete, or screened_witness."
         )
     target = np.full(
         int(data.num_regions),
@@ -252,13 +285,18 @@ def _build_raw_clonal_anchor_search(
         raise ValueError("Production raw clonal anchors require target CCF exactly 1.")
     if not np.isfinite(feasibility_tolerance) or feasibility_tolerance < 0.0:
         raise ValueError("Raw clonal-anchor feasibility tolerance must be nonnegative.")
-    equality_tolerance = float(fit_options.raw_clonal_cluster_equality_tol)
-    if not np.isfinite(equality_tolerance) or equality_tolerance <= 0.0:
-        raise ValueError("Raw clonal-cluster equality tolerance must be positive.")
+    equality_tolerance = effective_raw_clonal_equality_tolerance(fit_options)
+    if equality_tolerance > float(fit_options.selection_partition_tol):
+        raise ValueError(
+            "Raw clonal equality tolerance must not exceed the selection "
+            "partition tolerance."
+        )
     if int(fit_options.raw_clonal_cluster_min_size) < 1:
         raise ValueError("Raw clonal-cluster minimum size must be positive.")
     if int(fit_options.raw_clonal_cluster_min_observed_support_per_region) < 0:
         raise ValueError("Raw clonal-cluster observed support must be nonnegative.")
+    if int(fit_options.raw_clonal_evidence_min_observed_support_per_region) < 0:
+        raise ValueError("Raw clonal evidence support must be nonnegative.")
     upper = context.upper.detach().cpu().numpy()
     # Strict support preserves the original feasible box.  The feasibility
     # tolerance is diagnostic only and never expands a witness coordinate.
@@ -270,19 +308,10 @@ def _build_raw_clonal_anchor_search(
             spec=RawClonalClusterConstraint(
                 witness_mode="none",
                 target=target,
-                witness_indices=(),
+                initial_witness_indices=(),
                 eligible_witness_indices=(),
-                mandatory_member_indices=(),
                 feasibility_tolerance=feasibility_tolerance,
-                equality_tolerance=float(
-                    fit_options.raw_clonal_cluster_equality_tol
-                ),
-                minimum_cluster_size=int(
-                    fit_options.raw_clonal_cluster_min_size
-                ),
-                minimum_observed_support_per_region=int(
-                    fit_options.raw_clonal_cluster_min_observed_support_per_region
-                ),
+                equality_tolerance=equality_tolerance,
             ),
             total_eligible_candidates=int(eligible.size),
             search_complete=True,
@@ -334,38 +363,6 @@ def _build_raw_clonal_anchor_search(
         ),
     )
     screening_rule = "none"
-    count_observed = getattr(data, "count_observed", None)
-    observed = np.asarray(data.total_counts, dtype=np.float64) > 0.0
-    if count_observed is not None:
-        observed &= np.asarray(count_observed, dtype=bool)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        single_copy_unpenalized_ccf = np.divide(
-            np.asarray(data.alt_counts, dtype=np.float64),
-            np.asarray(data.total_counts, dtype=np.float64)
-            * np.asarray(data.scaling, dtype=np.float64),
-            out=np.zeros_like(np.asarray(data.alt_counts, dtype=np.float64)),
-            where=observed,
-        )
-    # A mutation whose single-copy, mutation-specific unpenalized CCF exceeds
-    # one in every observed region cannot be represented above the biological
-    # CCF boundary.  It is therefore a mandatory member of the CCF-one clonal
-    # block.  The single-copy calculation is conservative over all positive
-    # multiplicities: any true-multiplicity CCF above one is included here.
-    mandatory_mask = (
-        np.any(observed, axis=1)
-        & np.all(
-            (~observed) | (single_copy_unpenalized_ccf > target[None, :]),
-            axis=1,
-        )
-        & bool(fit_options.raw_clonal_include_unpenalized_overflow)
-    )
-    mandatory = tuple(
-        int(index)
-        for index in sorted(
-            eligible[mandatory_mask[eligible]].tolist(),
-            key=lambda index: str(data.mutation_ids[int(index)]),
-        )
-    )
     if mode == "specified_witness":
         id_to_index = {str(value): index for index, value in enumerate(data.mutation_ids)}
         requested_ids = tuple(str(value) for value in fit_options.raw_clonal_anchor_mutation_ids)
@@ -376,32 +373,8 @@ def _build_raw_clonal_anchor_search(
         specified_index = int(id_to_index[requested_ids[0]])
         if specified_index not in set(eligible.tolist()):
             raise RuntimeError("no_feasible_raw_clonal_anchor")
-        if mandatory and specified_index not in set(mandatory):
-            raise ValueError(
-                "The specified witness must be one of the mutation-specific "
-                "single-copy unpenalized CCF estimates above the clonal boundary."
-            )
         evaluated = (specified_index,)
-        screening_rule = (
-            "user_specified_witness_with_mandatory_unpenalized_overflow_block"
-            if mandatory
-            else "user_specified_retained_mutation_id"
-        )
-        search_complete = True
-    elif mandatory:
-        # Once the model-native unpenalized fit identifies rows whose CCF MLE
-        # saturates at one, those rows are mandatory members of the clonal
-        # block.  A single stable member is sufficient as computational
-        # witness; enumerating other witnesses would solve the same subproblem.
-        representative = min(
-            mandatory,
-            key=lambda index: (
-                float(increases[index]),
-                str(data.mutation_ids[index]),
-            ),
-        )
-        evaluated = (int(representative),)
-        screening_rule = "mandatory_single_copy_unpenalized_ccf_overflow_block"
+        screening_rule = "user_specified_retained_mutation_id"
         search_complete = True
     elif mode == "enumerated_witness":
         evaluated = tuple(int(index) for index in ordered)
@@ -411,34 +384,30 @@ def _build_raw_clonal_anchor_search(
         candidate_max = fit_options.raw_clonal_anchor_candidate_max
         if candidate_max is None or int(candidate_max) < 1:
             raise ValueError(
-                "adaptive_exact and screened_witness require a positive initial batch."
+                "adaptive_bound_complete and screened_witness require a positive "
+                "initial batch."
             )
         evaluated = tuple(int(index) for index in ordered[: int(candidate_max)])
         screening_rule = (
-            "adaptive_exact_zero_penalty_lower_bound"
-            if mode == "adaptive_exact"
+            "adaptive_bound_complete_zero_penalty_lower_bound"
+            if mode == "adaptive_bound_complete"
             else "restricted_zero_penalty_witness_screen"
         )
         search_complete = len(evaluated) == len(ordered)
     base_loss = float(torch.sum(free_loss).item())
     model_eligible = (
         tuple(int(index) for index in evaluated)
-        if mode == "specified_witness" or mandatory
+        if mode == "specified_witness"
         else tuple(int(index) for index in ordered)
     )
     return _RawClonalAnchorSearch(
         spec=RawClonalClusterConstraint(
             witness_mode=mode,
             target=target,
-            witness_indices=evaluated,
+            initial_witness_indices=evaluated,
             eligible_witness_indices=model_eligible,
-            mandatory_member_indices=mandatory,
             feasibility_tolerance=feasibility_tolerance,
-            equality_tolerance=float(fit_options.raw_clonal_cluster_equality_tol),
-            minimum_cluster_size=int(fit_options.raw_clonal_cluster_min_size),
-            minimum_observed_support_per_region=int(
-                fit_options.raw_clonal_cluster_min_observed_support_per_region
-            ),
+            equality_tolerance=equality_tolerance,
         ),
         total_eligible_candidates=int(eligible.size),
         search_complete=bool(search_complete),
@@ -492,24 +461,13 @@ def _raw_clonal_union_model_hash(
 
     digest = hashlib.sha256()
     for value in (
-        "clipp2_raw_clonal_union_model_v1",
+        "clipp2_raw_clonal_union_model_v2",
         str(base_fusion_objective_hash),
-        str(int(constraint.minimum_cluster_size)),
-        str(int(constraint.minimum_observed_support_per_region)),
-        float(constraint.equality_tolerance).hex(),
     ):
         encoded = value.encode("utf-8")
         digest.update(len(encoded).to_bytes(8, "little"))
         digest.update(encoded)
     _hash_array(digest, np.asarray(constraint.target, dtype=np.float64))
-    mandatory_ids = sorted(
-        str(data.mutation_ids[int(index)])
-        for index in constraint.mandatory_member_indices
-    )
-    for mutation_id in mandatory_ids:
-        encoded = mutation_id.encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "little"))
-        digest.update(encoded)
     eligible_ids = sorted(
         str(data.mutation_ids[int(index)])
         for index in constraint.eligible_witness_indices
@@ -1459,9 +1417,6 @@ def _partition_guided_admm_selection(
                 torch_data=pilot_torch_data,
                 objective_shape=str(fit_options.objective_shape),
                 clonal_anchor_mutation_index=anchor_index,
-                clonal_anchor_mandatory_mutation_indices=(
-                    raw_anchor_search.spec.mandatory_member_indices
-                ),
                 clonal_anchor_target=raw_anchor_search.spec.target,
                 clonal_anchor_source=str(raw_anchor_search.screening_rule),
                 clonal_anchor_mode=str(raw_anchor_search.spec.mode),
@@ -1494,8 +1449,8 @@ def _partition_guided_admm_selection(
         guide_phi_by_anchor[key] = anchor_guide_phi
         guide_labels_by_anchor[key] = anchor_guide_labels
 
-    for anchor_key in initial_anchor_keys:
-        ensure_anchor_resources(int(anchor_key))
+    controller_anchor_key = int(initial_anchor_keys[0])
+    ensure_anchor_resources(controller_anchor_key)
 
     runtime = base_solver_context.runtime
     if any(
@@ -1516,17 +1471,18 @@ def _partition_guided_admm_selection(
         )
     prepare_elapsed_seconds = float(perf_counter() - prepare_start_time)
 
+    # Bind the lambda controller to the same deterministic first witness in
+    # adaptive and exhaustive modes. Taking a minimum or maximum across the
+    # initially materialized witness bank would make the lambda path depend on
+    # search strategy rather than the existential model.
     controller = OnlineLambdaController(
         initial_lambda=float(
-            min(
-                initialization.lambda_value
-                for initialization in guided_initialization_by_anchor.values()
-            )
+            guided_initialization_by_anchor[controller_anchor_key].lambda_value
         ),
         initial_reason="partition_guide_kkt_balance",
         config=OnlineLambdaConfig(
             guide_n_clusters=int(
-                max(np.unique(labels).size for labels in guide_labels_by_anchor.values())
+                np.unique(guide_labels_by_anchor[controller_anchor_key]).size
             ),
             num_mutations=int(data.num_mutations),
             kkt_tolerance=5.0 * float(effective_fit_options.tol),
@@ -1733,7 +1689,7 @@ def _partition_guided_admm_selection(
             solve_witness_branch(key)
             solved_keys.add(key)
 
-        if raw_anchor_search.spec.mode == "adaptive_exact":
+        if raw_anchor_search.spec.mode == "adaptive_bound_complete":
             all_witnesses = tuple(
                 int(index)
                 for index in raw_anchor_search.spec.eligible_witness_indices
@@ -1742,10 +1698,15 @@ def _partition_guided_admm_selection(
                 certified_so_far = [
                     seed_fit
                     for _, seed_fit in seed_fits
-                    if float(seed_fit.lambda_value) > 0.0
-                    and bool(seed_fit.objective_faithful)
-                    and bool(seed_fit.full_kkt_certified)
-                    and bool(seed_fit.selection_eligible)
+                    if _raw_clonal_branch_mathematically_certified(
+                        data,
+                        seed_fit,
+                        equality_tolerance=float(
+                            effective_raw_clonal_equality_tolerance(
+                                effective_fit_options
+                            )
+                        ),
+                    )
                 ]
                 incumbent_objective = (
                     min(float(item.penalized_objective) for item in certified_so_far)
@@ -1782,10 +1743,15 @@ def _partition_guided_admm_selection(
         individually_certified = [
             (key, seed_fit)
             for key, seed_fit in seed_fits
-            if float(seed_fit.lambda_value) > 0.0
-            and bool(seed_fit.objective_faithful)
-            and bool(seed_fit.full_kkt_certified)
-            and bool(seed_fit.selection_eligible)
+            if _raw_clonal_branch_mathematically_certified(
+                data,
+                seed_fit,
+                equality_tolerance=float(
+                    effective_raw_clonal_equality_tolerance(
+                        effective_fit_options
+                    )
+                ),
+            )
         ]
         if individually_certified:
             ranked_certified, tied_certified, objective_tolerance = (
@@ -1856,6 +1822,15 @@ def _partition_guided_admm_selection(
             branch_fit.raw_clonal_anchor_screening_rule = str(
                 raw_anchor_search.screening_rule
             )
+            branch_fit.raw_clonal_witness_coverage_certified = bool(
+                anchor_competition_resolved
+            )
+            branch_fit.raw_clonal_branch_stationarity_certified = bool(
+                branch_fit.full_kkt_certified and branch_fit.selection_eligible
+            )
+            # KKT stationarity plus lower-bound witness coverage does not prove
+            # global solution of a generic nonconvex observed-data branch.
+            branch_fit.raw_clonal_union_global_optimum_certified = False
         winning_context = solver_context_by_anchor[int(winning_anchor_key)]
         winning_guide_phi = guide_phi_by_anchor[int(winning_anchor_key)]
         fit, row, artifact = _evaluate_candidate(
@@ -2174,9 +2149,7 @@ def _partition_guided_admm_selection(
                     )
                 ),
                 branch_signature=str(
-                    controller_artifact.anchor_block_signature
-                    if controller_artifact.clonal_block is not None
-                    else "unanchored"
+                    controller_fit.witness_subproblem_hash or "unanchored"
                 ),
                 # Compatibility diagnostics for pre-provenance consumers.
                 raw_kkt_eligible=bool(

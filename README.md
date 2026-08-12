@@ -17,23 +17,31 @@ For every positive fusion penalty λ, CliPP2:
 Only objective-faithful, full-KKT-certified raw fusion candidates with a
 certified partition can be selected. The default score is
 `clonal_fixed_partition_bic`, with `(K - 1) × S` nominal degrees of freedom and
-one exact raw fusion block constrained to common CCF 1 in every region.
-By default, every mutation whose single-copy, mutation-specific unpenalized
-CCF exceeds one in every observed region is a mandatory member of this block.
-This conservative rule includes any positive true-multiplicity CCF overflow
-without using unknown truth multiplicity. A named mutation is only a
-computational witness; the biological model object is the complete exact
-CCF-one block. Every member and the block centroid must pass the strict clonal
-equality tolerance.
+one numerically certified raw fusion block constrained to common CCF 1 in every
+region. This changes the raw feasible set and defines a clonal-anchored
+estimator distinct from the unanchored fixed objective.
 
-The graph and weights are frozen before clonal-constraint construction. When
-the unpenalized-overflow set is nonempty, it defines the mandatory CCF-one
-block and one stable member suffices as computational witness. If that set is
-empty, the default adaptive-exact search starts from eight lower-bound-ranked
-witnesses and evaluates every additional witness that cannot be safely
-pruned. An unresolved or uncertified witness that could beat the incumbent
-makes the candidate ineligible. All distinct raw-objective-tied minimizers
-reach fixed-partition scoring.
+The constraint is existential: at least one feasible mutation row must equal
+the all-ones CCF target. CliPP2 decomposes this union into witness-conditioned
+subproblems, freezes only the current witness row, and minimizes over the
+certified subproblems. No mutation is forced clonal from VAF, read depth,
+single-copy CCF inversion, inferred multiplicity, or another count-derived
+heuristic. Such quantities cannot establish CCF one under multiplicity
+ambiguity or sampling noise.
+
+A named mutation is only computational provenance. The biological model
+object is the complete set of solved raw CCF rows within the strict clonal
+equality tolerance of the all-ones target. Every member and the block centroid
+must pass that tolerance. The effective equality tolerance is the maximum of
+its configured floor, machine precision, raw primal tolerance, and certificate
+column tolerance, and it cannot exceed the selection-partition tolerance. The
+graph and weights are frozen before the
+clonal-constraint search. The default `adaptive-bound-complete` search starts
+from eight witnesses ranked by observed-data anchor deviance and evaluates
+every additional witness whose valid likelihood lower bound can still beat the
+incumbent. An unresolved or uncertified competitive witness makes the lambda
+candidate ineligible. All distinct raw-objective-tied minimizers reach
+fixed-partition scoring.
 
 The exact CCF-one block is protected from the looser general partition
 tolerance: near-one mutations cannot be absorbed into it merely because they
@@ -44,34 +52,36 @@ CCF support does not strictly include one are ineligible. The unanchored
 With missing mutation-region counts, only observed non-anchor cluster-region
 centers contribute to the identifiable BIC dimension.
 
-Raw clonal-witness modes are explicit. With the default
-`--raw-clonal-include-unpenalized-overflow`, the modes control witness
-provenance or fallback search without allowing an overflow mutation to leave
-the clonal block:
+Raw clonal-witness modes are explicit:
 
 - `specified-witness` solves one user-named retained mutation and is exact for
   that specified biological model.
 - `enumerated-witness` solves every feasible retained mutation.
-- `adaptive-exact` is the default exact existential-cluster estimator and uses
-  valid likelihood lower bounds to prune witnesses that cannot win.
+- `adaptive-bound-complete` is the default existential-cluster estimator. It
+  uses valid likelihood lower bounds to certify witness coverage without
+  claiming global optimality of each nonconvex branch.
 - `screened-witness` evaluates only the requested initial screen. It becomes
   selection-eligible only if lower bounds prove every omitted witness cannot
   beat the incumbent; otherwise it fails closed.
 - `none` is required by the unanchored sensitivity score.
 
 The output makes the raw clonal cluster primary and records its size, centroid,
-target, maximum member residual, observed support per region, and stable block
-signature. The witness mutation remains computational provenance. Base-fusion,
-existential-union-model, and witness-subproblem hashes are separate; search
-mode and screening source are provenance rather than objective ingredients.
-Warm states cannot cross witness subproblems.
+target, maximum member residual, and stable block signature. A separate
+biological-evidence object reports observed support, total depth, median depth,
+and its QC status; evidence does not alter the raw feasible set, mathematical
+certificate, candidate eligibility, or BIC. Singleton blocks are valid for the
+exact existential model. The witness mutation remains computational
+provenance. Base-fusion, existential-union-model, and witness-subproblem hashes
+are separate; search mode and screening source are provenance rather than
+objective ingredients. Warm states cannot cross witness subproblems.
 
-Singleton clonal blocks remain valid when no unpenalized-overflow mutation is
-available (`--raw-clonal-cluster-min-size=1`), but the block must contain at
-least one observed positive-depth mutation in every region. Both requirements
-are explicit CLI controls and are reported in the block certificate. The
-overflow inclusion rule has a Boolean sensitivity switch, but is enabled in
-the production default.
+The exactness fields are also separate: witness coverage records that every
+competitive witness was solved or lower-bound-pruned; branch stationarity
+records full raw KKT certification; union global optimality is normally false
+for the generic nonconvex observed-data objective. The ordinary conditional
+BIC remains the selection criterion. `anchor_prior_adjusted_selection_score`
+reports the prespecified uniform-block sensitivity `BIC + 2 log(K)` but does
+not steer selection.
 
 In the default adaptive-graph workflow, a deterministic Ward/CEM guide is an
 objective-defining preprocessing result: it defines the adaptive graph weights,

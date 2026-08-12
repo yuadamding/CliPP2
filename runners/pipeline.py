@@ -8,7 +8,8 @@ import numpy as np
 import pandas as pd
 
 from .._version import __version__ as _SOFTWARE_VERSION
-from ..core.model import FitOptions
+from ..core.bic import anchor_prior_adjusted_bic_value
+from ..core.model import FitOptions, effective_raw_clonal_equality_tolerance
 from ..io.tumor_txt import DEFAULT_DOSAGE_PRIOR_PENALTY, load_tumor_txt
 from ..model_selection.config import FINAL_PHI_WARD_LADDER_KMAX
 from .model_selection import select_model
@@ -64,6 +65,7 @@ def process_tumor_bundle(
     refit = selected_candidate.refit
     score = selected_candidate.score
     clonal_block = selected_candidate.clonal_block
+    clonal_block_evidence = selected_candidate.clonal_block_evidence
     search_df = selection_result.search_df
     elapsed_seconds = float(perf_counter() - start_time)
     selected_lambda = selection_result.selected_lambda_representative
@@ -95,10 +97,17 @@ def process_tumor_bundle(
         ),
         "selection_score_name": str(score.name),
         "selection_score": float(score.value),
+        "anchor_prior_adjusted_selection_score": float(
+            anchor_prior_adjusted_bic_value(
+                score,
+                num_clusters=int(partition.n_clusters),
+            )
+        ),
         "selection_loglik": float(score.loglik),
         "selection_df": int(score.degrees_of_freedom),
         "selection_penalty": float(score.penalty),
         "selection_n_eff": int(score.n_eff),
+        "selected_raw_penalized_objective": float(best_fit.penalized_objective),
         "selected_refit_numerically_resolved": bool(
             refit.refit_numerically_resolved
         ),
@@ -124,6 +133,17 @@ def process_tumor_bundle(
         "selected_raw_clonal_cluster_size": (
             0 if clonal_block is None else int(clonal_block.cluster_size)
         ),
+        "selected_raw_clonal_cluster_mathematically_certified": bool(
+            clonal_block is not None and clonal_block.mathematically_certified
+        ),
+        "raw_clonal_model_fitted": bool(
+            clonal_block is not None and clonal_block.mathematically_certified
+        ),
+        "selected_raw_clonal_cluster_equality_tol": float(
+            effective_raw_clonal_equality_tolerance(fit_options)
+        ),
+        "selected_raw_solver_primal_tol": float(fit_options.tol),
+        "selected_full_kkt_tolerance": float(best_fit.full_kkt_tolerance),
         "selected_raw_clonal_cluster_centroid_residual": (
             np.nan if clonal_block is None else float(clonal_block.centroid_residual)
         ),
@@ -134,10 +154,39 @@ def process_tumor_bundle(
         ),
         "selected_raw_clonal_cluster_observed_support_per_region": (
             "none"
-            if clonal_block is None
+            if clonal_block_evidence is None
             else ",".join(
                 str(int(value))
-                for value in clonal_block.observed_support_per_region
+                for value in clonal_block_evidence.observed_support_per_region
+            )
+        ),
+        "selected_raw_clonal_cluster_evidence_supported": bool(
+            clonal_block_evidence is not None
+            and clonal_block_evidence.evidence_gate_passed
+        ),
+        "clonal_block_biologically_supported": bool(
+            clonal_block_evidence is not None
+            and clonal_block_evidence.evidence_gate_passed
+        ),
+        "selected_raw_clonal_cluster_evidence_failure_reason": (
+            "none"
+            if clonal_block_evidence is None
+            else str(clonal_block_evidence.evidence_failure_reason)
+        ),
+        "selected_raw_clonal_cluster_total_depth_per_region": (
+            "none"
+            if clonal_block_evidence is None
+            else ",".join(
+                format(float(value), ".17g")
+                for value in clonal_block_evidence.total_depth_per_region
+            )
+        ),
+        "selected_raw_clonal_cluster_median_depth_per_region": (
+            "none"
+            if clonal_block_evidence is None
+            else ",".join(
+                format(float(value), ".17g")
+                for value in clonal_block_evidence.median_depth_per_region
             )
         ),
         "selected_raw_clonal_cluster_common_center": (
@@ -183,6 +232,15 @@ def process_tumor_bundle(
         ),
         "selected_raw_clonal_anchor_search_complete": bool(
             best_fit.raw_clonal_anchor_search_complete
+        ),
+        "selected_raw_clonal_witness_coverage_certified": bool(
+            best_fit.raw_clonal_witness_coverage_certified
+        ),
+        "selected_raw_clonal_branch_stationarity_certified": bool(
+            best_fit.raw_clonal_branch_stationarity_certified
+        ),
+        "selected_raw_clonal_union_global_optimum_certified": bool(
+            best_fit.raw_clonal_union_global_optimum_certified
         ),
         "selected_raw_clonal_anchor_total_eligible_candidates": int(
             best_fit.raw_clonal_anchor_total_eligible_candidates
@@ -237,6 +295,7 @@ def process_tumor_bundle(
             partition=partition,
             refit=refit,
             clonal_block=clonal_block,
+            clonal_block_evidence=clonal_block_evidence,
             major_prior=float(fit_options.major_prior),
         )
     return summary, search_df

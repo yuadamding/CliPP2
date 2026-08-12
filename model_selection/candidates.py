@@ -7,11 +7,17 @@ from time import perf_counter
 import numpy as np
 
 from ..core.bic import (
+    anchor_prior_adjusted_bic_value,
     compute_bic_with_df,
     effective_bic_depth_count,
     fixed_partition_bic,
 )
-from ..core.model import FitOptions, FitResult, fit_fixed_objective
+from ..core.model import (
+    FitOptions,
+    FitResult,
+    effective_raw_clonal_equality_tolerance,
+    fit_fixed_objective,
+)
 from ..core.fusion.refit import (
     PartitionRefitResult,
     partition_constrained_observed_refit,
@@ -21,6 +27,7 @@ from ..io.data import TumorData
 from .partitions import (
     _cluster_sizes_text,
     _partition_signature,
+    evaluate_raw_clonal_block_evidence,
     extract_exact_raw_clonal_block,
     extract_certified_fusion_partition,
 )
@@ -35,6 +42,7 @@ from .types import (
     PartitionRefitSummary,
     RawFusionCandidate,
     RawClonalBlockCertificate,
+    RawClonalBlockEvidence,
     SelectionScore,
     StartArray,
 )
@@ -66,6 +74,9 @@ def validate_candidate_identity(candidate: RawFusionCandidate) -> None:
         clonal_block = candidate.clonal_block
         if clonal_block is None or not clonal_block.certified:
             raise AssertionError("Clonal BIC requires a certified raw CCF-one block.")
+        evidence = candidate.clonal_block_evidence
+        if evidence is not None and evidence.block_signature != clonal_block.block_signature:
+            raise AssertionError("Clonal evidence refers to a different raw block.")
         anchor_index = candidate.raw_fit.raw_clonal_anchor_mutation_index
         anchor_target = candidate.raw_fit.raw_clonal_anchor_target
         if anchor_index is None or anchor_target is None:
@@ -494,16 +505,36 @@ def _evaluate_candidate(
     raw_anchor_index = fit.raw_clonal_anchor_mutation_index
     raw_anchor_target = fit.raw_clonal_anchor_target
     clonal_block: RawClonalBlockCertificate | None = None
+    clonal_block_evidence: RawClonalBlockEvidence | None = None
     if anchor_required and raw_anchor_index is not None and raw_anchor_target is not None:
+        raw_clonal_equality_tolerance = effective_raw_clonal_equality_tolerance(
+            selection_options
+        )
+        if raw_clonal_equality_tolerance > float(
+            _effective_bic_partition_tol(selection_options)
+        ):
+            raise ValueError(
+                "Raw clonal equality tolerance must not exceed the selection "
+                "partition tolerance."
+            )
         clonal_block = extract_exact_raw_clonal_block(
             fit,
             data=data,
             witness_index=int(raw_anchor_index),
             target=np.asarray(raw_anchor_target, dtype=np.float64),
-            anchor_tolerance=float(selection_options.raw_clonal_cluster_equality_tol),
+            anchor_tolerance=raw_clonal_equality_tolerance,
+        )
+        clonal_block_evidence = evaluate_raw_clonal_block_evidence(
+            clonal_block,
+            data=data,
             minimum_cluster_size=int(selection_options.raw_clonal_cluster_min_size),
-            minimum_observed_support_per_region=int(
-                selection_options.raw_clonal_cluster_min_observed_support_per_region
+            minimum_observed_support_per_region=max(
+                int(
+                    selection_options.raw_clonal_cluster_min_observed_support_per_region
+                ),
+                int(
+                    selection_options.raw_clonal_evidence_min_observed_support_per_region
+                ),
             ),
         )
 
@@ -618,6 +649,7 @@ def _evaluate_candidate(
         ),
         anchor_search_complete=bool(fit.raw_clonal_anchor_search_complete),
         clonal_block=clonal_block,
+        clonal_block_evidence=clonal_block_evidence,
     )
     validate_candidate_identity(candidate)
 
@@ -638,6 +670,12 @@ def _evaluate_candidate(
         "estimator_role": str(fit.estimator_role),
         "selection_score_name": str(score.name),
         "selection_score": float(score.value),
+        "anchor_prior_adjusted_selection_score": float(
+            anchor_prior_adjusted_bic_value(
+                score,
+                num_clusters=int(partition.n_clusters),
+            )
+        ),
         "selection_loglik": float(score.loglik),
         "selection_df": int(score.degrees_of_freedom),
         "selection_penalty": float(score.penalty),
@@ -705,6 +743,8 @@ def _evaluate_candidate(
         "selection_model_signature": (
             f"{partition.signature}|anchor:{anchor_block_signature}"
         ),
+        "solver_branch_signature": str(fit.witness_subproblem_hash),
+        "biological_block_signature": str(anchor_block_signature),
         "partition_hash": str(partition.signature),
         "partition_source": str(partition.source),
         "partition_tol": float(partition.tolerance),
@@ -736,8 +776,14 @@ def _evaluate_candidate(
         "raw_clonal_cluster_certified": bool(
             clonal_block is not None and clonal_block.certified
         ),
+        "raw_clonal_model_fitted": bool(
+            clonal_block is not None and clonal_block.mathematically_certified
+        ),
         "raw_clonal_cluster_failure_reason": (
             "none" if clonal_block is None else str(clonal_block.failure_reason)
+        ),
+        "raw_clonal_cluster_equality_tol": float(
+            effective_raw_clonal_equality_tolerance(selection_options)
         ),
         "raw_clonal_cluster_size": (
             0 if clonal_block is None else int(clonal_block.cluster_size)
@@ -755,11 +801,40 @@ def _evaluate_candidate(
         ),
         "raw_clonal_cluster_observed_support_per_region": (
             "none"
-            if clonal_block is None
+            if clonal_block_evidence is None
             else ",".join(
                 str(int(value))
-                for value in clonal_block.observed_support_per_region
+                for value in clonal_block_evidence.observed_support_per_region
             )
+        ),
+        "raw_clonal_cluster_total_depth_per_region": (
+            "none"
+            if clonal_block_evidence is None
+            else ",".join(
+                format(float(value), ".17g")
+                for value in clonal_block_evidence.total_depth_per_region
+            )
+        ),
+        "raw_clonal_cluster_median_depth_per_region": (
+            "none"
+            if clonal_block_evidence is None
+            else ",".join(
+                format(float(value), ".17g")
+                for value in clonal_block_evidence.median_depth_per_region
+            )
+        ),
+        "raw_clonal_cluster_evidence_supported": bool(
+            clonal_block_evidence is not None
+            and clonal_block_evidence.evidence_gate_passed
+        ),
+        "clonal_block_biologically_supported": bool(
+            clonal_block_evidence is not None
+            and clonal_block_evidence.evidence_gate_passed
+        ),
+        "raw_clonal_cluster_evidence_failure_reason": (
+            "none"
+            if clonal_block_evidence is None
+            else str(clonal_block_evidence.evidence_failure_reason)
         ),
         "raw_clonal_cluster_common_center": (
             "none"
@@ -842,6 +917,15 @@ def _evaluate_candidate(
             fit.raw_clonal_anchor_search_complete
         ),
         "raw_clonal_anchor_search_resolved": bool(raw_anchor_search_resolved),
+        "raw_clonal_witness_coverage_certified": bool(
+            fit.raw_clonal_witness_coverage_certified
+        ),
+        "raw_clonal_branch_stationarity_certified": bool(
+            fit.raw_clonal_branch_stationarity_certified
+        ),
+        "raw_clonal_union_global_optimum_certified": bool(
+            fit.raw_clonal_union_global_optimum_certified
+        ),
         "raw_clonal_anchor_total_eligible_candidates": int(
             fit.raw_clonal_anchor_total_eligible_candidates
         ),
@@ -905,6 +989,7 @@ def _evaluate_candidate(
         "full_kkt_certified": bool(fit.full_kkt_certified),
         "full_kkt_certificate_status": str(fit.full_kkt_certificate_status),
         "full_kkt_tolerance": float(fit.full_kkt_tolerance),
+        "raw_solver_primal_tol": float(raw_fit_options.tol),
         "outer_kkt_certificate_status": str(fit.outer_kkt_certificate_status),
         "outer_num_frozen_coordinates": int(fit.outer_num_frozen_coordinates),
         "mm_consistency_violations": int(fit.mm_consistency_violations),

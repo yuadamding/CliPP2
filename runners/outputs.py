@@ -17,6 +17,7 @@ from ..model_selection.types import (
     FusionPartition,
     PartitionRefitSummary,
     RawClonalBlockCertificate,
+    RawClonalBlockEvidence,
 )
 
 
@@ -109,6 +110,7 @@ def mutation_output_table(
     partition: FusionPartition,
     refit: PartitionRefitSummary,
     clonal_block: RawClonalBlockCertificate | None = None,
+    clonal_block_evidence: RawClonalBlockEvidence | None = None,
 ) -> pd.DataFrame:
     raw_phi, labels = _validate_identity(raw_fit, partition, refit)
     refit_phi = _validated_profile(data, refit.phi, name="refit.phi")
@@ -139,6 +141,20 @@ def mutation_output_table(
                 else np.isin(
                     np.arange(data.num_mutations), clonal_block.member_indices
                 )
+            ),
+            "raw_clonal_cluster_evidence_supported": np.repeat(
+                bool(
+                    clonal_block_evidence is not None
+                    and clonal_block_evidence.evidence_gate_passed
+                ),
+                data.num_mutations,
+            ),
+            "clonal_block_biologically_supported": np.repeat(
+                bool(
+                    clonal_block_evidence is not None
+                    and clonal_block_evidence.evidence_gate_passed
+                ),
+                data.num_mutations,
             ),
             "raw_clonal_cluster_signature": np.repeat(
                 "none" if clonal_block is None else clonal_block.block_signature,
@@ -203,6 +219,7 @@ def cluster_output_table(
     partition: FusionPartition,
     refit: PartitionRefitSummary,
     clonal_block: RawClonalBlockCertificate | None = None,
+    clonal_block_evidence: RawClonalBlockEvidence | None = None,
 ) -> pd.DataFrame:
     raw_phi, labels = _validate_identity(raw_fit, partition, refit)
     centers = np.asarray(refit.cluster_centers, dtype=np.float64)
@@ -259,6 +276,29 @@ def cluster_output_table(
                 if clonal_block is None
                 else float(clonal_block.maximum_member_residual),
                 np.nan,
+            ),
+            "raw_clonal_cluster_evidence_supported": np.where(
+                is_clonal_cluster,
+                bool(
+                    clonal_block_evidence is not None
+                    and clonal_block_evidence.evidence_gate_passed
+                ),
+                False,
+            ),
+            "clonal_block_biologically_supported": np.where(
+                is_clonal_cluster,
+                bool(
+                    clonal_block_evidence is not None
+                    and clonal_block_evidence.evidence_gate_passed
+                ),
+                False,
+            ),
+            "raw_clonal_cluster_evidence_failure_reason": np.where(
+                is_clonal_cluster,
+                "none"
+                if clonal_block_evidence is None
+                else clonal_block_evidence.evidence_failure_reason,
+                "none",
             ),
             "raw_clonal_witness_mutation": np.where(
                 is_clonal_cluster,
@@ -333,8 +373,22 @@ def cluster_output_table(
         table[f"raw_clonal_cluster_observed_support_{region}"] = np.where(
             is_clonal_cluster,
             0
-            if clonal_block is None
-            else int(clonal_block.observed_support_per_region[column]),
+            if clonal_block_evidence is None
+            else int(clonal_block_evidence.observed_support_per_region[column]),
+            0,
+        )
+        table[f"raw_clonal_cluster_total_depth_{region}"] = np.where(
+            is_clonal_cluster,
+            0.0
+            if clonal_block_evidence is None
+            else float(clonal_block_evidence.total_depth_per_region[column]),
+            0.0,
+        )
+        table[f"raw_clonal_cluster_median_depth_{region}"] = np.where(
+            is_clonal_cluster,
+            0.0
+            if clonal_block_evidence is None
+            else float(clonal_block_evidence.median_depth_per_region[column]),
             0,
         )
     return table
@@ -488,16 +542,31 @@ def write_fit_outputs(
     partition: FusionPartition,
     refit: PartitionRefitSummary,
     clonal_block: RawClonalBlockCertificate | None = None,
+    clonal_block_evidence: RawClonalBlockEvidence | None = None,
     major_prior: float = 0.5,
 ) -> None:
     """Purely serialize one already selected, identity-validated model."""
 
     _validate_identity(raw_fit, partition, refit)
     outdir.mkdir(parents=True, exist_ok=True)
-    mutation_output_table(data, raw_fit, partition, refit, clonal_block).to_csv(
+    mutation_output_table(
+        data,
+        raw_fit,
+        partition,
+        refit,
+        clonal_block,
+        clonal_block_evidence,
+    ).to_csv(
         outdir / f"{data.tumor_id}_mutation_clusters.tsv", sep="\t", index=False
     )
-    cluster_output_table(data, raw_fit, partition, refit, clonal_block).to_csv(
+    cluster_output_table(
+        data,
+        raw_fit,
+        partition,
+        refit,
+        clonal_block,
+        clonal_block_evidence,
+    ).to_csv(
         outdir / f"{data.tumor_id}_cluster_centers.tsv", sep="\t", index=False
     )
     mutation_region_output_table(

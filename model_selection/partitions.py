@@ -17,7 +17,11 @@ from .config import (
     LIKELIHOOD_PARTITION_K_ANCHORS,
     LIKELIHOOD_PARTITION_K_MAX,
 )
-from .types import FusionPartition, RawClonalBlockCertificate
+from .types import (
+    FusionPartition,
+    RawClonalBlockCertificate,
+    RawClonalBlockEvidence,
+)
 
 
 def _likelihood_partition_k_grid(num_mutations: int) -> list[int]:
@@ -199,8 +203,6 @@ def extract_exact_raw_clonal_block(
     witness_index: int,
     target: np.ndarray,
     anchor_tolerance: float,
-    minimum_cluster_size: int = 1,
-    minimum_observed_support_per_region: int = 1,
 ) -> RawClonalBlockCertificate:
     """Certify the exact raw CCF-one block containing a witness mutation."""
 
@@ -216,10 +218,6 @@ def extract_exact_raw_clonal_block(
         raise ValueError("Raw clonal-block equality tolerance must be positive.")
     if not 0 <= witness < int(data.num_mutations):
         raise ValueError("Raw clonal witness index is invalid.")
-    if int(minimum_cluster_size) < 1:
-        raise ValueError("Raw clonal minimum cluster size must be positive.")
-    if int(minimum_observed_support_per_region) < 0:
-        raise ValueError("Raw clonal minimum observed support must be nonnegative.")
 
     state = getattr(fit, "solver_state", None)
     certificate = getattr(state, "certificate", None)
@@ -233,10 +231,10 @@ def extract_exact_raw_clonal_block(
         certificate_labels = certificate.labels.detach().cpu().numpy()
         if certificate_labels.shape != (int(data.num_mutations),):
             raise ValueError("Compressed certificate labels have the wrong shape.")
-    # The biological block is the complete equal-row target set, not a possibly
-    # finer solver-compression block.  This also ensures that every raw
-    # mutation-specific estimate saturated at the CCF-one boundary remains in
-    # the protected clonal block.
+    # The biological block is the complete numerically equal-row target set,
+    # not a possibly finer solver-compression block. Membership is determined
+    # only from the solved raw CCF matrix; read-count heuristics never force a
+    # mutation into this set.
     member_mask = np.max(np.abs(phi - target_array[None, :]), axis=1) <= tolerance
     member_mask[witness] = True
     member_indices = np.flatnonzero(member_mask).astype(np.int64)
@@ -248,24 +246,14 @@ def extract_exact_raw_clonal_block(
         np.max(np.abs(member_phi - target_array[None, :]))
     )
     centroid_residual = float(np.max(np.abs(centroid - target_array)))
-    observed = np.asarray(data.total_counts, dtype=np.float64) > 0.0
-    count_observed = getattr(data, "count_observed", None)
-    if count_observed is not None:
-        observed &= np.asarray(count_observed, dtype=bool)
-    observed_support = np.sum(observed[member_indices], axis=0).astype(np.int64)
-
     if not certificate_graph_hash_matches:
         failure_reason = "clonal_block_certificate_graph_hash_mismatch"
     elif member_residual > tolerance:
         failure_reason = "clonal_block_member_not_at_target"
     elif centroid_residual > tolerance:
         failure_reason = "clonal_block_centroid_not_at_target"
-    elif member_indices.size < int(minimum_cluster_size):
-        failure_reason = "clonal_block_below_minimum_size"
-    elif np.any(
-        observed_support < int(minimum_observed_support_per_region)
-    ):
-        failure_reason = "clonal_block_insufficient_observed_support"
+    elif member_indices.size < 1:
+        failure_reason = "clonal_block_empty"
     else:
         failure_reason = "none"
     return RawClonalBlockCertificate(
@@ -279,11 +267,60 @@ def extract_exact_raw_clonal_block(
         centroid=centroid,
         maximum_member_residual=member_residual,
         centroid_residual=centroid_residual,
-        cluster_size=int(member_indices.size),
-        observed_support_per_region=observed_support,
         equality_tolerance=tolerance,
-        certified=failure_reason == "none",
+        mathematically_certified=failure_reason == "none",
         failure_reason=failure_reason,
+    )
+
+
+def evaluate_raw_clonal_block_evidence(
+    block: RawClonalBlockCertificate,
+    *,
+    data: TumorData,
+    minimum_cluster_size: int = 1,
+    minimum_observed_support_per_region: int = 1,
+) -> RawClonalBlockEvidence:
+    """Evaluate biological support without changing raw-model eligibility."""
+
+    min_size = int(minimum_cluster_size)
+    min_support = int(minimum_observed_support_per_region)
+    if min_size < 1:
+        raise ValueError("Raw clonal evidence minimum size must be positive.")
+    if min_support < 0:
+        raise ValueError("Raw clonal evidence support must be nonnegative.")
+    members = np.asarray(block.member_indices, dtype=np.int64)
+    depth = np.asarray(data.total_counts, dtype=np.float64)[members]
+    observed = depth > 0.0
+    count_observed = getattr(data, "count_observed", None)
+    if count_observed is not None:
+        observed &= np.asarray(count_observed, dtype=bool)[members]
+    observed_support = np.sum(observed, axis=0).astype(np.int64)
+    total_depth = np.sum(np.where(observed, depth, 0.0), axis=0)
+    median_depth = np.asarray(
+        [
+            float(np.median(depth[observed[:, region], region]))
+            if np.any(observed[:, region])
+            else 0.0
+            for region in range(int(data.num_regions))
+        ],
+        dtype=np.float64,
+    )
+    if int(block.cluster_size) < min_size:
+        failure_reason = "clonal_block_below_evidence_minimum_size"
+    elif np.any(observed_support < min_support):
+        failure_reason = "clonal_block_insufficient_observed_support"
+    else:
+        failure_reason = "none"
+    return RawClonalBlockEvidence(
+        block_signature=str(block.block_signature),
+        cluster_size=int(block.cluster_size),
+        observed_support_per_region=observed_support,
+        total_depth_per_region=np.asarray(total_depth, dtype=np.float64),
+        median_depth_per_region=median_depth,
+        minimum_cluster_size=min_size,
+        minimum_observed_support_per_region=min_support,
+        evidence_gate_passed=failure_reason == "none",
+        evidence_failure_reason=failure_reason,
     )
 
 

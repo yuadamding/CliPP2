@@ -4,6 +4,8 @@ import argparse
 import math
 from pathlib import Path
 
+import numpy as np
+
 from .core.fusion.defaults import (
     DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
     DEFAULT_CERTIFICATE_MAX_ITER,
@@ -77,6 +79,8 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
             "none",
             "specified-witness",
             "enumerated-witness",
+            "adaptive-bound-complete",
+            # Deprecated compatibility alias.
             "adaptive-exact",
             "screened-witness",
             # Compatibility aliases for the pre-cluster-anchor draft.
@@ -84,11 +88,11 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
             "enumerated-seed",
             "screened-seed",
         ],
-        default="adaptive-exact",
+        default="adaptive-bound-complete",
         help=(
             "Witness search for an exact raw CCF-one cluster: specified, full "
-            "enumeration, adaptive exact lower-bound pruning, or an explicitly "
-            "restricted screen."
+            "enumeration, adaptive lower-bound-complete coverage, or an "
+            "explicitly restricted screen."
         ),
     )
     parser.add_argument(
@@ -105,20 +109,48 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--raw-clonal-include-unpenalized-overflow",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "Require mutations whose single-copy unpenalized CCF exceeds one "
-            "in every observed region to belong to the raw clonal block."
+            "Deprecated compatibility switch. Count-derived CCF overflow no "
+            "longer changes the raw feasible set."
         ),
     )
     parser.add_argument(
-        "--raw-clonal-cluster-equality-tol", type=float, default=1e-8
+        "--raw-clonal-cluster-equality-tol",
+        type=float,
+        default=1e-8,
+        help=(
+            "Floor for numerical CCF-one equality. The effective tolerance is "
+            "the maximum of this value, machine precision, raw solver "
+            "tolerance, and certificate column tolerance."
+        ),
     )
-    parser.add_argument("--raw-clonal-cluster-min-size", type=int, default=1)
+    parser.add_argument(
+        "--raw-clonal-cluster-min-size",
+        type=int,
+        default=1,
+        help=(
+            "Biological-evidence/QC threshold only. It does not constrain the "
+            "raw existential CCF-one estimator."
+        ),
+    )
     parser.add_argument(
         "--raw-clonal-cluster-min-observed-support-per-region",
         type=int,
+        default=0,
+        help=(
+            "Deprecated evidence/QC threshold; it does not affect raw model "
+            "feasibility or selection eligibility."
+        ),
+    )
+    parser.add_argument(
+        "--raw-clonal-evidence-min-observed-support-per-region",
+        type=int,
         default=1,
+        help=(
+            "Observed positive-depth support required for the separately "
+            "reported biological-evidence status."
+        ),
     )
     parser.add_argument("--disable-warm-start", action="store_true")
     parser.add_argument("--major-prior", type=float, default=0.5)
@@ -259,6 +291,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if raw_anchor_mode in {
             "screened-seed",
             "screened-witness",
+            "adaptive-bound-complete",
             "adaptive-exact",
         } and int(
             args.raw_clonal_anchor_candidate_max
@@ -273,6 +306,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parser.error("raw clonal-cluster minimum size must be positive")
         if int(args.raw_clonal_cluster_min_observed_support_per_region) < 0:
             parser.error("raw clonal-cluster observed support must be nonnegative")
+        if int(args.raw_clonal_evidence_min_observed_support_per_region) < 0:
+            parser.error("raw clonal evidence support must be nonnegative")
+        effective_clonal_equality_tol = max(
+            float(args.raw_clonal_cluster_equality_tol),
+            float(args.tol),
+            float(args.certificate_column_tol_scale) * float(args.tol),
+            float(np.finfo(np.float64).eps),
+        )
+        if effective_clonal_equality_tol > float(args.selection_partition_tol):
+            parser.error(
+                "effective raw clonal-cluster equality tolerance (the maximum "
+                "of its configured floor and solver/certificate tolerances) "
+                "must not exceed the selection partition tolerance"
+            )
     return args
 
 
@@ -297,6 +344,9 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         raw_clonal_cluster_min_size=args.raw_clonal_cluster_min_size,
         raw_clonal_cluster_min_observed_support_per_region=(
             args.raw_clonal_cluster_min_observed_support_per_region
+        ),
+        raw_clonal_evidence_min_observed_support_per_region=(
+            args.raw_clonal_evidence_min_observed_support_per_region
         ),
         selection_partition_tol=args.selection_partition_tol,
         selection_refit_tol=args.selection_refit_tol,

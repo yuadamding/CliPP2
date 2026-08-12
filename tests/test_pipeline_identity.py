@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -118,6 +119,11 @@ class PipelineIdentityTests(unittest.TestCase):
                 float(permuted_summary["selection_score"]),
                 places=9,
             )
+            self.assertAlmostEqual(
+                float(output_summary["selected_raw_penalized_objective"]),
+                float(permuted_summary["selected_raw_penalized_objective"]),
+                places=9,
+            )
 
             elapsed_columns = [
                 column
@@ -145,6 +151,15 @@ class PipelineIdentityTests(unittest.TestCase):
             self.assertTrue(bool(selected["raw_objective_certified"]))
             self.assertTrue(bool(selected["raw_clonal_anchor_certified"]))
             self.assertTrue(bool(selected["raw_clonal_anchor_search_complete"]))
+            self.assertTrue(
+                bool(selected["raw_clonal_witness_coverage_certified"])
+            )
+            self.assertTrue(
+                bool(selected["raw_clonal_branch_stationarity_certified"])
+            )
+            self.assertFalse(
+                bool(selected["raw_clonal_union_global_optimum_certified"])
+            )
             self.assertEqual(
                 int(selected["raw_clonal_anchor_candidates_evaluated"]), 4
             )
@@ -241,12 +256,71 @@ class PipelineIdentityTests(unittest.TestCase):
                 len(clonal_rows),
                 int(output_summary["selected_raw_clonal_cluster_size"]),
             )
+            self.assertEqual(len(frozen_rows), 1)
+            self.assertTrue(
+                bool(
+                    output_summary[
+                        "selected_raw_clonal_cluster_mathematically_certified"
+                    ]
+                )
+            )
             np.testing.assert_allclose(
                 clonal_rows[raw_columns].to_numpy(dtype=np.float64),
                 np.broadcast_to(target, (len(clonal_rows), len(target))),
                 rtol=0.0,
-                atol=float(options.raw_clonal_cluster_equality_tol),
+                atol=float(
+                    output_summary["selected_raw_clonal_cluster_equality_tol"]
+                ),
             )
+
+    def test_adaptive_and_exhaustive_witness_search_agree(self) -> None:
+        input_file = Path(__file__).parent / "data" / "tinyTumor.tsv"
+        base = FitOptions(
+            lambda_value=0.0,
+            device="cpu",
+            dtype="float64",
+            raw_clonal_anchor_candidate_max=1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adaptive_summary, adaptive_search = process_tumor_bundle(
+                input_file,
+                root / "adaptive",
+                replace(base, raw_clonal_anchor_mode="adaptive_bound_complete"),
+                write_outputs=False,
+            )
+            exhaustive_summary, exhaustive_search = process_tumor_bundle(
+                input_file,
+                root / "exhaustive",
+                replace(base, raw_clonal_anchor_mode="enumerated_witness"),
+                write_outputs=False,
+            )
+        for key in (
+            "selected_partition_signature",
+            "selected_raw_clonal_cluster_signature",
+            "selected_raw_clonal_witness_mutation_id",
+        ):
+            self.assertEqual(adaptive_summary[key], exhaustive_summary[key], key)
+        for key in (
+            "selected_lambda",
+            "selection_score",
+            "selected_raw_penalized_objective",
+        ):
+            self.assertAlmostEqual(
+                float(adaptive_summary[key]),
+                float(exhaustive_summary[key]),
+                places=10,
+                msg=key,
+            )
+        self.assertTrue(
+            bool(adaptive_summary["selected_raw_clonal_witness_coverage_certified"])
+        )
+        np.testing.assert_allclose(
+            np.sort(adaptive_search["lambda"].unique()),
+            np.sort(exhaustive_search["lambda"].unique()),
+            rtol=0.0,
+            atol=1e-12,
+        )
 
 
 if __name__ == "__main__":

@@ -1004,7 +1004,6 @@ def prepare_torch_problem(
     objective_shape: str = "unimodal",
     defer_graph: bool = False,
     clonal_anchor_mutation_index: int | None = None,
-    clonal_anchor_mandatory_mutation_indices: tuple[int, ...] = (),
     clonal_anchor_target: float | np.ndarray | torch.Tensor | None = None,
     clonal_anchor_source: str = "none",
     clonal_anchor_mode: str = "none",
@@ -1177,6 +1176,7 @@ def prepare_torch_problem(
             "enumerated_witness",
             "screened_witness",
             "adaptive_exact",
+            "adaptive_bound_complete",
         }:
             raise ValueError("A raw clonal anchor requires an explicit anchor mode.")
         if clonal_anchor_target is None:
@@ -1203,17 +1203,7 @@ def prepare_torch_problem(
                 "no_feasible_raw_clonal_anchor: target exceeds mutation support."
             )
         anchor_target = target_tensor.detach().clone()
-        mandatory_indices = tuple(
-            sorted(set(int(index) for index in clonal_anchor_mandatory_mutation_indices))
-        )
-        if any(
-            index < 0 or index >= int(data.num_mutations)
-            for index in mandatory_indices
-        ):
-            raise ValueError(
-                "clonal_anchor_mandatory_mutation_indices contains an invalid index."
-            )
-        anchor_frozen_indices = tuple(sorted(set(mandatory_indices + (anchor_index,))))
+        anchor_frozen_indices = (anchor_index,)
         frozen_index_tensor = torch.as_tensor(
             anchor_frozen_indices,
             dtype=torch.long,
@@ -1223,7 +1213,7 @@ def prepare_torch_problem(
             torch.any(upper.index_select(0, frozen_index_tensor) < anchor_target).item()
         ):
             raise InfeasibleRawClonalAnchor(
-                "no_feasible_raw_clonal_anchor: target exceeds mandatory member support."
+                "no_feasible_raw_clonal_anchor: target exceeds witness support."
             )
         lower = lower.clone()
         upper = upper.clone()

@@ -71,10 +71,8 @@ class RawClonalBlockCertificate:
     centroid: np.ndarray
     maximum_member_residual: float
     centroid_residual: float
-    cluster_size: int
-    observed_support_per_region: np.ndarray
     equality_tolerance: float
-    certified: bool
+    mathematically_certified: bool
     failure_reason: str
 
     def __post_init__(self) -> None:
@@ -94,13 +92,42 @@ class RawClonalBlockCertificate:
                 name,
                 _immutable_array(getattr(self, name), dtype=np.dtype(np.float64)),
             )
-        object.__setattr__(
-            self,
-            "observed_support_per_region",
-            _immutable_array(
-                self.observed_support_per_region, dtype=np.dtype(np.int64)
-            ),
-        )
+    @property
+    def cluster_size(self) -> int:
+        return int(self.member_indices.size)
+
+    @property
+    def certified(self) -> bool:
+        """Compatibility alias for mathematical certification only."""
+
+        return bool(self.mathematically_certified)
+
+
+@dataclass(frozen=True)
+class RawClonalBlockEvidence:
+    """Biological support diagnostics, separate from model feasibility."""
+
+    block_signature: str
+    cluster_size: int
+    observed_support_per_region: np.ndarray
+    total_depth_per_region: np.ndarray
+    median_depth_per_region: np.ndarray
+    minimum_cluster_size: int
+    minimum_observed_support_per_region: int
+    evidence_gate_passed: bool
+    evidence_failure_reason: str
+
+    def __post_init__(self) -> None:
+        for name, dtype in (
+            ("observed_support_per_region", np.dtype(np.int64)),
+            ("total_depth_per_region", np.dtype(np.float64)),
+            ("median_depth_per_region", np.dtype(np.float64)),
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _immutable_array(getattr(self, name), dtype=dtype),
+            )
 
 
 @dataclass(frozen=True)
@@ -192,6 +219,7 @@ class RawFusionCandidate:
     anchor_target: np.ndarray | None = None
     anchor_search_complete: bool = False
     clonal_block: RawClonalBlockCertificate | None = None
+    clonal_block_evidence: RawClonalBlockEvidence | None = None
 
     def __post_init__(self) -> None:
         if self.anchor_target is not None:

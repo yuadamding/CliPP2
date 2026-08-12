@@ -46,12 +46,11 @@ def effective_bic_depth_count(data: TumorData) -> float:
 def bic_degrees_of_freedom(num_clusters: int, data: TumorData) -> int:
     """Nominal BIC degrees of freedom under the clonal-anchored restriction.
 
-    Model selection requires one mutation coordinate pinned at its feasible
-    clonal center inside the raw pairwise-fusion objective. The immutable raw
-    partition determines its clonal block, and the fixed-label refit preserves
-    that block at its common feasible clonal center. Those pinned centers are
-    constants, so a K-cluster model estimates (K - 1) * S center parameters.
-    Upper bound; active df is typically smaller.
+    Model selection requires one complete raw clonal block to have a fixed
+    common center at CCF one. The immutable raw partition determines this
+    block, and the fixed-label refit preserves it. That common center is a
+    constant, so a K-cluster model estimates (K - 1) * S center parameters.
+    This is an upper bound; the identifiable active df can be smaller.
     """
     return max(int(num_clusters) - 1, 0) * int(data.num_regions)
 
@@ -125,6 +124,26 @@ def fixed_partition_bic(
         partition_signature=str(partition_signature),
         anchor_block_signature=str(anchor_block_signature),
     )
+
+
+def anchor_prior_adjusted_bic_value(
+    score: "SelectionScore",
+    *,
+    num_clusters: int,
+) -> float:
+    """Return a uniform anchor-block-prior sensitivity for conditional BIC.
+
+    The production criterion remains ``score.value``. This diagnostic adds
+    ``2 * log(K)`` for a prespecified uniform prior over the K partition
+    blocks that could have been named clonal.
+    """
+
+    clusters = int(num_clusters)
+    if clusters < 1:
+        raise ValueError("num_clusters must be positive.")
+    if str(score.name) != "clonal_fixed_partition_bic":
+        return float(score.value)
+    return float(score.value + 2.0 * np.log(float(clusters)))
 
 
 def compute_classic_bic_depth_n(
@@ -252,6 +271,7 @@ def compute_partition_icl(
 
 
 __all__ = [
+    "anchor_prior_adjusted_bic_value",
     "bic_degrees_of_freedom",
     "cluster_sizes_from_labels",
     "compute_bic_with_df",

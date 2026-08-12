@@ -38,17 +38,14 @@ class RawClonalClusterConstraint:
         "none",
         "specified_witness",
         "enumerated_witness",
-        "adaptive_exact",
+        "adaptive_bound_complete",
         "screened_witness",
     ]
     target: np.ndarray
-    witness_indices: tuple[int, ...]
+    initial_witness_indices: tuple[int, ...]
     eligible_witness_indices: tuple[int, ...]
-    mandatory_member_indices: tuple[int, ...]
     feasibility_tolerance: float
     equality_tolerance: float
-    minimum_cluster_size: int
-    minimum_observed_support_per_region: int
 
     def __post_init__(self) -> None:
         target = np.asarray(self.target, dtype=np.float64).reshape(-1).copy()
@@ -56,18 +53,13 @@ class RawClonalClusterConstraint:
         object.__setattr__(self, "target", target)
         object.__setattr__(
             self,
-            "witness_indices",
-            tuple(int(index) for index in self.witness_indices),
+            "initial_witness_indices",
+            tuple(int(index) for index in self.initial_witness_indices),
         )
         object.__setattr__(
             self,
             "eligible_witness_indices",
             tuple(int(index) for index in self.eligible_witness_indices),
-        )
-        object.__setattr__(
-            self,
-            "mandatory_member_indices",
-            tuple(int(index) for index in self.mandatory_member_indices),
         )
 
     @property
@@ -78,7 +70,19 @@ class RawClonalClusterConstraint:
     def candidate_mutation_indices(self) -> tuple[int, ...]:
         """Compatibility alias for pre-cluster-anchor callers."""
 
-        return self.witness_indices
+        return self.initial_witness_indices
+
+    @property
+    def witness_indices(self) -> tuple[int, ...]:
+        """Compatibility alias for the initial witness queue."""
+
+        return self.initial_witness_indices
+
+    @property
+    def mandatory_member_indices(self) -> tuple[int, ...]:
+        """Removed count-derived constraint; retained only for compatibility."""
+
+        return ()
 
 
 # Compatibility import for code written against the first witness-seed draft.
@@ -102,15 +106,17 @@ class FitOptions:
     summary_tol: float | None = 1e-4
     selection_score: str = "clonal_fixed_partition_bic"
     selection_anchor: str = "clonal_required"
-    raw_clonal_anchor_mode: str = "adaptive_exact"
+    raw_clonal_anchor_mode: str = "adaptive_bound_complete"
     raw_clonal_anchor_mutation_ids: tuple[str, ...] = ()
     raw_clonal_anchor_target: float = 1.0
     raw_clonal_anchor_feasibility_tol: float = 1e-8
     raw_clonal_anchor_candidate_max: int | None = 8
-    raw_clonal_include_unpenalized_overflow: bool = True
+    # Deprecated compatibility switch. It no longer changes the feasible set.
+    raw_clonal_include_unpenalized_overflow: bool = False
     raw_clonal_cluster_equality_tol: float = 1e-8
     raw_clonal_cluster_min_size: int = 1
-    raw_clonal_cluster_min_observed_support_per_region: int = 1
+    raw_clonal_cluster_min_observed_support_per_region: int = 0
+    raw_clonal_evidence_min_observed_support_per_region: int = 1
     selection_partition_tol: float = 1e-4
     selection_refit_tol: float = 1e-7
     selection_refit_max_iter: int = 128
@@ -128,6 +134,30 @@ class FitOptions:
     allow_heuristic_structure_splits: bool = True
     materialize_full_dual: bool = False
     verbose: bool = False
+
+
+def effective_raw_clonal_equality_tolerance(options: FitOptions) -> float:
+    """Numerical CCF-one equality tolerance bound to solver precision.
+
+    The configured value is a floor, not an independent claim of greater
+    precision. The default certificate column tolerance is the raw primal
+    tolerance multiplied by ``certificate_column_tol_scale``.
+    """
+
+    dtype_name = str(options.dtype).strip().lower()
+    if dtype_name == "float16":
+        machine_epsilon = float(np.finfo(np.float16).eps)
+    elif dtype_name == "float32":
+        machine_epsilon = float(np.finfo(np.float32).eps)
+    else:
+        machine_epsilon = float(np.finfo(np.float64).eps)
+    configured = float(options.raw_clonal_cluster_equality_tol)
+    primal = float(options.tol)
+    certificate = float(options.certificate_column_tol_scale) * primal
+    values = (configured, machine_epsilon, primal, certificate)
+    if not all(np.isfinite(value) and value > 0.0 for value in values):
+        raise ValueError("Raw clonal equality tolerance inputs must be positive.")
+    return float(max(values))
 
 
 @dataclass
@@ -268,6 +298,9 @@ class FitResult:
     raw_clonal_anchor_objective_rank: int = 0
     raw_clonal_anchor_objective_gap_to_second: float = float("inf")
     raw_clonal_anchor_screening_rule: str = "none"
+    raw_clonal_witness_coverage_certified: bool = False
+    raw_clonal_branch_stationarity_certified: bool = False
+    raw_clonal_union_global_optimum_certified: bool = False
 
 
 def fit_fixed_objective(
@@ -612,6 +645,8 @@ def fit_fixed_objective(
 __all__ = [
     "FitOptions",
     "FitResult",
+    "RawClonalClusterConstraint",
     "RawClonalAnchorSpec",
+    "effective_raw_clonal_equality_tolerance",
     "fit_fixed_objective",
 ]
