@@ -30,14 +30,6 @@ clipp2 fit \
 Use `--device cpu` on a CPU-only machine. Run `clipp2 fit --help` for profile,
 solver, resource, selection-score, and partition-tolerance controls.
 
-For the full statistical and operational contract, read the
-[maintainer guide](../docs/maintainer-guide.md). Benchmark definitions—including
-the required CNA-only multiplicity macro-F1—are in the
-[evaluation protocol](../docs/evaluation.md). The dated
-[correctness audit](../docs/CliPP2_model_selection_correctness_audit_2026-08-12.md)
-preserves historical evidence and superseded designs.
-
-
 ## Outputs
 
 A fit writes three tables into `--outdir`, prefixed with the tumor id (the input
