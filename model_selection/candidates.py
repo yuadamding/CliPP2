@@ -7,10 +7,10 @@ from time import perf_counter
 import numpy as np
 
 from ..core.bic import (
-    anchor_prior_adjusted_bic_value,
     compute_bic_with_df,
     effective_bic_depth_count,
     fixed_partition_bic,
+    uniform_all_blocks_anchor_prior_adjusted_score,
 )
 from ..core.model import (
     FitOptions,
@@ -176,6 +176,11 @@ def validate_candidate_identity(candidate: RawFusionCandidate) -> None:
         float(score.value), expected_score, rtol=0.0, atol=score_tolerance
     ):
         raise AssertionError("Stored score is not reconstructible.")
+    minimum_uncertainty = 2.0 * max(float(refit.global_optimality_gap), 0.0)
+    if float(score.numerical_uncertainty) + score_tolerance < minimum_uncertainty:
+        raise AssertionError("Score uncertainty does not cover the refit certificate gap.")
+    if candidate.eligible_for_selection and not refit.global_optimum_certified:
+        raise AssertionError("Selectable BIC requires a globally certified refit.")
     expected_phi = np.asarray(refit.cluster_centers)[np.asarray(refit.labels)]
     if not np.allclose(
         np.asarray(refit.phi), expected_phi, rtol=0.0, atol=1e-12
@@ -265,7 +270,7 @@ def _selection_refit_cache_key(
         float(selection_options.selection_refit_tol),
         int(selection_options.selection_refit_max_iter),
         _likelihood_model_id(data),
-        "independent_grid_refinement_v1",
+        "certified_interval_refit_v1",
     )
 
 
@@ -303,44 +308,26 @@ def _fixed_partition_refit(
             selection_options.raw_clonal_anchor_feasibility_tol
         ),
     )
-    coarse = partition_constrained_observed_refit(
-        data,
-        partition.labels,
-        grid_refinement_factor=1,
-        **kwargs,
-    )
     refined = partition_constrained_observed_refit(
         data,
         partition.labels,
-        grid_refinement_factor=2,
         **kwargs,
     )
-    loglik_delta = abs(float(refined.loglik) - float(coarse.loglik))
-    center_delta = float(
-        np.max(
-            np.abs(
-                np.asarray(refined.cluster_centers, dtype=np.float64)
-                - np.asarray(coarse.cluster_centers, dtype=np.float64)
-            )
-        )
-    )
+    loglik_delta = float(refined.global_optimality_gap)
+    center_delta = 0.0
     loglik_tolerance = max(
         float(selection_options.selection_refit_tol)
         * (1.0 + abs(float(refined.loglik))),
         1e-10,
     )
-    center_tolerance = max(
-        10.0 * float(selection_options.selection_refit_tol),
-        1e-10,
-    )
     numerically_resolved = bool(
         refined.finite_candidate_found
+        and refined.global_optimum_certified
         and int(refined.refit_finite_coordinate_count)
         == int(refined.refit_coordinate_count)
         and np.isfinite(loglik_delta)
         and loglik_delta <= loglik_tolerance
         and np.isfinite(center_delta)
-        and center_delta <= center_tolerance
         and float(refined.anchor_deviance_increase) >= -loglik_tolerance
     )
     cached = _CachedPartitionRefit(
@@ -380,7 +367,7 @@ def _build_refit_summary(
             refit.second_best_anchor_deviance_increase
         ),
         finite_candidate_found=bool(refit.finite_candidate_found),
-        global_optimum_certified=False,
+        global_optimum_certified=bool(refit.global_optimum_certified),
         loglik_source=str(refit.loglik_source),
         refit_numerically_resolved=bool(resolution.numerically_resolved),
         refit_loglik_refinement_delta=float(
@@ -404,6 +391,10 @@ def _build_refit_summary(
             else np.asarray(refit.fixed_anchor_target, dtype=np.float64).copy()
         ),
         anchor_block_signature=str(refit.fixed_anchor_block_signature),
+        global_lower_bound=float(refit.global_lower_bound),
+        global_optimality_gap=float(refit.global_optimality_gap),
+        global_certificate_method=str(refit.global_certificate_method),
+        global_certificate_intervals=int(refit.global_certificate_intervals),
     )
 
 
@@ -596,6 +587,7 @@ def _evaluate_candidate(
         anchor_block_signature=anchor_block_signature,
         labels=partition.labels,
         anchor_cluster=raw_anchor_cluster,
+        loglik_uncertainty=float(refit_result.global_optimality_gap),
     )
     if str(score.name) != canonical_score_name:
         raise AssertionError(
@@ -654,6 +646,12 @@ def _evaluate_candidate(
     validate_candidate_identity(candidate)
 
     penalty_value, profile_penalty_value = _profile_penalty_from_fit(fit)
+    raw_objective_uncertainty = max(
+        1e-10 * (1.0 + abs(float(fit.penalized_objective))),
+        32.0
+        * np.finfo(np.float64).eps
+        * (1.0 + abs(float(fit.penalized_objective))),
+    )
     score_diagnostics = _selection_score_diagnostics(
         data=data,
         refit=refit,
@@ -665,17 +663,33 @@ def _evaluate_candidate(
         "selection_profile": profile_name,
         "selection_step": int(selection_step),
         "lambda": float(fit.lambda_value),
+        "raw_objective_numerical_uncertainty": float(
+            raw_objective_uncertainty
+        ),
+        "raw_objective_lower_bound": float(
+            fit.penalized_objective - raw_objective_uncertainty
+        ),
+        "raw_objective_upper_bound": float(
+            fit.penalized_objective + raw_objective_uncertainty
+        ),
+        "raw_objective_uncertainty_certified": False,
         "lambda_applicable": True,
         "candidate_pool_source": "raw_fused_lambda_path",
         "estimator_role": str(fit.estimator_role),
         "selection_score_name": str(score.name),
         "selection_score": float(score.value),
-        "anchor_prior_adjusted_selection_score": float(
-            anchor_prior_adjusted_bic_value(
+        "uniform_all_blocks_anchor_prior_adjusted_score": float(
+            uniform_all_blocks_anchor_prior_adjusted_score(
                 score,
                 num_clusters=int(partition.n_clusters),
             )
         ),
+        "anchor_prior_assumption": "uniform_over_all_partition_blocks",
+        "selection_score_numerical_uncertainty": float(
+            score.numerical_uncertainty
+        ),
+        "selection_score_lower_bound": float(score.lower_bound),
+        "selection_score_upper_bound": float(score.upper_bound),
         "selection_loglik": float(score.loglik),
         "selection_df": int(score.degrees_of_freedom),
         "selection_penalty": float(score.penalty),
@@ -705,6 +719,12 @@ def _evaluate_candidate(
         "bic_refit_finite_candidate_found": bool(refit.finite_candidate_found),
         "bic_refit_cache_hit": bool(cache_hit),
         "refit_global_optimum_certified": bool(refit.global_optimum_certified),
+        "refit_global_lower_bound": float(refit.global_lower_bound),
+        "refit_global_optimality_gap": float(refit.global_optimality_gap),
+        "refit_global_certificate_method": str(refit.global_certificate_method),
+        "refit_global_certificate_intervals": int(
+            refit.global_certificate_intervals
+        ),
         "refit_numerically_resolved": bool(refit.refit_numerically_resolved),
         "refit_loglik_refinement_delta": float(
             refit.refit_loglik_refinement_delta
@@ -779,6 +799,9 @@ def _evaluate_candidate(
         "raw_clonal_model_fitted": bool(
             clonal_block is not None and clonal_block.mathematically_certified
         ),
+        "clonal_constraint_satisfied": bool(
+            clonal_block is not None and clonal_block.mathematically_certified
+        ),
         "raw_clonal_cluster_failure_reason": (
             "none" if clonal_block is None else str(clonal_block.failure_reason)
         ),
@@ -830,6 +853,16 @@ def _evaluate_candidate(
         "clonal_block_biologically_supported": bool(
             clonal_block_evidence is not None
             and clonal_block_evidence.evidence_gate_passed
+        ),
+        "clonal_cluster_statistically_identified": bool(
+            clonal_block_evidence is not None
+            and clonal_block_evidence.evidence_gate_passed
+        ),
+        "clonal_cluster_statistical_identification_reason": (
+            "insufficient_support"
+            if clonal_block_evidence is None
+            or not clonal_block_evidence.evidence_gate_passed
+            else "support_thresholds_satisfied"
         ),
         "raw_clonal_cluster_evidence_failure_reason": (
             "none"

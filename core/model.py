@@ -135,6 +135,89 @@ class FitOptions:
     materialize_full_dual: bool = False
     verbose: bool = False
 
+    def __post_init__(self) -> None:
+        score = str(self.selection_score).strip().lower().replace("-", "_")
+        anchor = str(self.selection_anchor).strip().lower().replace("-", "_")
+        mode_aliases = {
+            "none": "none",
+            "specified_seed": "specified_witness",
+            "specified_witness": "specified_witness",
+            "enumerated_seed": "enumerated_witness",
+            "enumerated_witness": "enumerated_witness",
+            "adaptive_exact": "adaptive_bound_complete",
+            "adaptive_bound_complete": "adaptive_bound_complete",
+            "screened_seed": "screened_witness",
+            "screened_witness": "screened_witness",
+        }
+        mode = mode_aliases.get(str(self.raw_clonal_anchor_mode).strip().lower())
+        if score not in {"fixed_partition_bic", "clonal_fixed_partition_bic"}:
+            raise ValueError("Unknown fixed-partition selection score.")
+        if anchor not in {"none", "clonal_required"}:
+            raise ValueError("selection_anchor must be none or clonal_required.")
+        if mode is None:
+            raise ValueError("Unknown raw_clonal_anchor_mode.")
+        if (score == "clonal_fixed_partition_bic") != (
+            anchor == "clonal_required"
+        ):
+            raise ValueError("Selection score and anchor mode are inconsistent.")
+        if (anchor == "clonal_required") != (mode != "none"):
+            raise ValueError("Selection anchor and raw anchor mode are inconsistent.")
+        self.selection_score = score
+        self.selection_anchor = anchor
+        self.raw_clonal_anchor_mode = mode
+        self.raw_clonal_anchor_mutation_ids = tuple(
+            str(value) for value in self.raw_clonal_anchor_mutation_ids
+        )
+        finite_positive = {
+            "tol": self.tol,
+            "eps": self.eps,
+            "selection_partition_tol": self.selection_partition_tol,
+            "selection_refit_tol": self.selection_refit_tol,
+            "reporting_partition_tol": self.reporting_partition_tol,
+            "raw_clonal_cluster_equality_tol": self.raw_clonal_cluster_equality_tol,
+            "certificate_column_tol_scale": self.certificate_column_tol_scale,
+        }
+        for name, value in finite_positive.items():
+            if not np.isfinite(float(value)) or float(value) <= 0.0:
+                raise ValueError(f"{name} must be positive and finite.")
+        if not np.isfinite(float(self.lambda_value)) or float(self.lambda_value) < 0.0:
+            raise ValueError("lambda_value must be finite and nonnegative.")
+        if not 0.0 < float(self.major_prior) < 1.0:
+            raise ValueError("major_prior must lie strictly in (0, 1).")
+        if float(self.raw_clonal_anchor_target) != 1.0:
+            raise ValueError("The production raw clonal target must equal CCF one.")
+        if (
+            not np.isfinite(float(self.raw_clonal_anchor_feasibility_tol))
+            or float(self.raw_clonal_anchor_feasibility_tol) < 0.0
+        ):
+            raise ValueError("Raw anchor feasibility tolerance must be nonnegative.")
+        if int(self.selection_refit_max_iter) < 1:
+            raise ValueError("selection_refit_max_iter must be positive.")
+        if mode == "specified_witness" and len(
+            self.raw_clonal_anchor_mutation_ids
+        ) != 1:
+            raise ValueError("specified_witness requires exactly one mutation ID.")
+        if mode != "specified_witness" and self.raw_clonal_anchor_mutation_ids:
+            raise ValueError("Witness mutation IDs apply only to specified mode.")
+        if mode in {"adaptive_bound_complete", "screened_witness"} and (
+            self.raw_clonal_anchor_candidate_max is None
+            or int(self.raw_clonal_anchor_candidate_max) < 1
+        ):
+            raise ValueError("Adaptive/screened witness search requires a positive batch.")
+        if int(self.raw_clonal_cluster_min_size) < 1:
+            raise ValueError("Raw clonal cluster minimum size must be positive.")
+        if int(self.raw_clonal_cluster_min_observed_support_per_region) < 0:
+            raise ValueError("Raw clonal observed support must be nonnegative.")
+        if int(self.raw_clonal_evidence_min_observed_support_per_region) < 0:
+            raise ValueError("Raw clonal evidence support must be nonnegative.")
+        if effective_raw_clonal_equality_tolerance(self) > float(
+            self.selection_partition_tol
+        ):
+            raise ValueError(
+                "Effective raw clonal equality tolerance must not exceed the "
+                "selection partition tolerance."
+            )
+
 
 def effective_raw_clonal_equality_tolerance(options: FitOptions) -> float:
     """Numerical CCF-one equality tolerance bound to solver precision.

@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .._version import __version__ as _SOFTWARE_VERSION
-from ..core.bic import anchor_prior_adjusted_bic_value
+from ..core.bic import uniform_all_blocks_anchor_prior_adjusted_score
 from ..core.model import FitOptions, effective_raw_clonal_equality_tolerance
 from ..io.tumor_txt import DEFAULT_DOSAGE_PRIOR_PENALTY, load_tumor_txt
 from ..model_selection.config import FINAL_PHI_WARD_LADDER_KMAX
@@ -97,11 +97,15 @@ def process_tumor_bundle(
         ),
         "selection_score_name": str(score.name),
         "selection_score": float(score.value),
-        "anchor_prior_adjusted_selection_score": float(
-            anchor_prior_adjusted_bic_value(
+        "uniform_all_blocks_anchor_prior_adjusted_score": float(
+            uniform_all_blocks_anchor_prior_adjusted_score(
                 score,
                 num_clusters=int(partition.n_clusters),
             )
+        ),
+        "anchor_prior_assumption": "uniform_over_all_partition_blocks",
+        "selection_score_numerical_uncertainty": float(
+            score.numerical_uncertainty
         ),
         "selection_loglik": float(score.loglik),
         "selection_df": int(score.degrees_of_freedom),
@@ -113,6 +117,13 @@ def process_tumor_bundle(
         ),
         "selected_refit_global_optimum_certified": bool(
             refit.global_optimum_certified
+        ),
+        "selected_refit_global_optimality_gap": float(
+            refit.global_optimality_gap
+        ),
+        "selected_refit_global_lower_bound": float(refit.global_lower_bound),
+        "selected_refit_global_certificate_method": str(
+            refit.global_certificate_method
         ),
         "selected_raw_clonal_anchor_mutation_index": (
             -1
@@ -137,6 +148,9 @@ def process_tumor_bundle(
             clonal_block is not None and clonal_block.mathematically_certified
         ),
         "raw_clonal_model_fitted": bool(
+            clonal_block is not None and clonal_block.mathematically_certified
+        ),
+        "clonal_constraint_satisfied": bool(
             clonal_block is not None and clonal_block.mathematically_certified
         ),
         "selected_raw_clonal_cluster_equality_tol": float(
@@ -167,6 +181,16 @@ def process_tumor_bundle(
         "clonal_block_biologically_supported": bool(
             clonal_block_evidence is not None
             and clonal_block_evidence.evidence_gate_passed
+        ),
+        "clonal_cluster_statistically_identified": bool(
+            clonal_block_evidence is not None
+            and clonal_block_evidence.evidence_gate_passed
+        ),
+        "clonal_cluster_statistical_identification_reason": (
+            "insufficient_support"
+            if clonal_block_evidence is None
+            or not clonal_block_evidence.evidence_gate_passed
+            else "support_thresholds_satisfied"
         ),
         "selected_raw_clonal_cluster_evidence_failure_reason": (
             "none"

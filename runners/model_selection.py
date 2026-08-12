@@ -28,6 +28,10 @@ from ..core.fusion.partition_starts import (
     PartitionCandidate,
     observed_curvature_at_pilot_torch,
 )
+from ..core.fusion.scalar_global import (
+    certify_tumor_scalar_minimum,
+    evaluate_tumor_scalar_loss,
+)
 from ..core.fusion.solver import (
     escape_path_breakpoint_solver_state,
     objective_shape_for_data,
@@ -35,7 +39,7 @@ from ..core.fusion.solver import (
     torch_data_from_context,
     uses_nonconvex_path_likelihood,
 )
-from ..core.fusion.torch_backend import dtype_name, mutation_region_terms_torch
+from ..core.fusion.torch_backend import dtype_name
 from ..core.fusion.types import (
     CompressedEdgeCertificate,
     DenseEdgeCertificate,
@@ -131,6 +135,8 @@ class _RawClonalAnchorSearch:
     screening_rule: str
     deviance_by_index: dict[int, float]
     lower_bound_by_index: dict[int, float]
+    scalar_lower_bounds_certified: bool = False
+    scalar_certificate_method: str = "none"
 
 
 def _raw_clonal_witness_competition_resolved(
@@ -163,21 +169,38 @@ def _raw_objective_minimizers(
 ) -> tuple[list[tuple[int, FitResult]], list[tuple[int, FitResult]], float]:
     """Rank certified branches and retain every numerical raw minimizer."""
 
-    ranked = sorted(
+    ranked_by_value = sorted(
         certified_fits,
         key=lambda item: (
             float(item[1].penalized_objective),
             "none" if int(item[0]) < 0 else str(data.mutation_ids[int(item[0])]),
         ),
     )
-    if not ranked:
+    if not ranked_by_value:
         return [], [], 0.0
-    best_objective = float(ranked[0][1].penalized_objective)
-    tolerance = 1e-10 * (1.0 + abs(best_objective))
+    best_objective = float(ranked_by_value[0][1].penalized_objective)
+    tolerance = max(
+        1e-10 * (1.0 + abs(best_objective)),
+        32.0 * np.finfo(np.float64).eps * (1.0 + abs(best_objective)),
+    )
+    minimum_upper = min(
+        float(item[1].penalized_objective) + tolerance
+        for item in ranked_by_value
+    )
     tied = [
         item
-        for item in ranked
-        if float(item[1].penalized_objective) <= best_objective + tolerance
+        for item in ranked_by_value
+        if float(item[1].penalized_objective) - tolerance <= minimum_upper
+    ]
+    tied = sorted(
+        tied,
+        key=lambda item: (
+            "none" if int(item[0]) < 0 else str(data.mutation_ids[int(item[0])]),
+        ),
+    )
+    tied_ids = {id(item[1]) for item in tied}
+    ranked = tied + [
+        item for item in ranked_by_value if id(item[1]) not in tied_ids
     ]
     return ranked, tied, tolerance
 
@@ -321,34 +344,62 @@ def _build_raw_clonal_anchor_search(
         )
     if eligible.size == 0:
         raise RuntimeError("no_feasible_raw_clonal_anchor")
-    torch_data = torch_data_from_context(context)
-    free_phi = context.exact_pilot
-    target_tensor = torch.as_tensor(
-        target, dtype=free_phi.dtype, device=free_phi.device
-    ).expand_as(free_phi)
-    free_terms = mutation_region_terms_torch(
-        torch_data,
-        free_phi,
-        major_prior=float(fit_options.major_prior),
-        eps=float(fit_options.eps),
+    num_mutations = int(data.num_mutations)
+    num_regions = int(data.num_regions)
+    scalar_tolerance = float(fit_options.selection_refit_tol) / max(
+        num_mutations * num_regions, 1
     )
-    anchored_terms = mutation_region_terms_torch(
-        torch_data,
-        target_tensor,
-        major_prior=float(fit_options.major_prior),
-        eps=float(fit_options.eps),
-    )
-    free_loss = free_terms.loss.sum(dim=1)
-    anchored_loss = anchored_terms.loss.sum(dim=1)
-    increases = (anchored_loss - free_loss).detach().cpu().numpy().astype(
-        np.float64, copy=False
-    )
+    cell_lower = np.zeros((num_mutations, num_regions), dtype=np.float64)
+    cell_attained = np.zeros_like(cell_lower)
+    scalar_lower_bounds_certified = True
+    scalar_methods: set[str] = set()
+    for mutation_index in range(num_mutations):
+        for region_index in range(num_regions):
+            certificate = certify_tumor_scalar_minimum(
+                data,
+                np.asarray([mutation_index], dtype=np.int64),
+                region_index,
+                lower=float(fit_options.eps),
+                upper=float(data.phi_upper[mutation_index, region_index]),
+                major_prior=float(fit_options.major_prior),
+                eps=float(fit_options.eps),
+                tolerance=scalar_tolerance,
+                max_intervals=max(
+                    int(fit_options.selection_refit_max_iter) * 128, 4096
+                ),
+                hint=float(data.phi_init[mutation_index, region_index]),
+            )
+            cell_lower[mutation_index, region_index] = float(
+                certificate.global_lower_bound
+            )
+            cell_attained[mutation_index, region_index] = float(
+                certificate.attained_value
+            )
+            scalar_lower_bounds_certified &= bool(
+                certificate.lower_bound_certified
+            )
+            scalar_methods.add(str(certificate.method))
+
+    anchored_loss = np.full(num_mutations, np.inf, dtype=np.float64)
+    for mutation_index in eligible.tolist():
+        anchored_loss[int(mutation_index)] = sum(
+            evaluate_tumor_scalar_loss(
+                data,
+                np.asarray([mutation_index], dtype=np.int64),
+                region_index,
+                float(target[region_index]),
+                major_prior=float(fit_options.major_prior),
+                eps=float(fit_options.eps),
+            )
+            for region_index in range(num_regions)
+        )
+    increases = anchored_loss - np.sum(cell_attained, axis=1)
     eligible = eligible[np.isfinite(increases[eligible])]
     if eligible.size == 0:
         raise RuntimeError("no_finite_feasible_raw_clonal_anchor")
     numerical_tolerance = max(
         1e-10,
-        float(fit_options.eps) * (1.0 + abs(float(torch.sum(free_loss).item()))),
+        float(fit_options.eps) * (1.0 + abs(float(np.sum(cell_attained)))),
     )
     if float(np.min(increases[eligible])) < -numerical_tolerance:
         raise RuntimeError(
@@ -387,14 +438,18 @@ def _build_raw_clonal_anchor_search(
                 "adaptive_bound_complete and screened_witness require a positive "
                 "initial batch."
             )
-        evaluated = tuple(int(index) for index in ordered[: int(candidate_max)])
-        screening_rule = (
-            "adaptive_bound_complete_zero_penalty_lower_bound"
-            if mode == "adaptive_bound_complete"
-            else "restricted_zero_penalty_witness_screen"
-        )
+        if mode == "adaptive_bound_complete" and not scalar_lower_bounds_certified:
+            evaluated = tuple(int(index) for index in ordered)
+            screening_rule = "complete_enumeration_scalar_bound_unavailable"
+        else:
+            evaluated = tuple(int(index) for index in ordered[: int(candidate_max)])
+            screening_rule = (
+                "adaptive_bound_complete_certified_scalar_lower_bound"
+                if mode == "adaptive_bound_complete"
+                else "restricted_zero_penalty_witness_screen"
+            )
         search_complete = len(evaluated) == len(ordered)
-    base_loss = float(torch.sum(free_loss).item())
+    base_lower_bound = float(np.sum(cell_lower))
     model_eligible = (
         tuple(int(index) for index in evaluated)
         if mode == "specified_witness"
@@ -416,8 +471,15 @@ def _build_raw_clonal_anchor_search(
             int(index): float(2.0 * increases[int(index)]) for index in ordered
         },
         lower_bound_by_index={
-            int(index): float(base_loss + increases[int(index)]) for index in ordered
+            int(index): float(
+                base_lower_bound
+                - np.sum(cell_lower[int(index)])
+                + anchored_loss[int(index)]
+            )
+            for index in ordered
         },
+        scalar_lower_bounds_certified=bool(scalar_lower_bounds_certified),
+        scalar_certificate_method="+".join(sorted(scalar_methods)),
     )
 
 
@@ -1490,6 +1552,7 @@ def _partition_guided_admm_selection(
             max_solver_retries_per_lambda=int(
                 PARTITION_GUIDED_ADMM_MAX_SOLVER_RETRIES_PER_LAMBDA
             ),
+            partition_event_mode=bool(raw_anchor_search.spec.mode != "none"),
         ),
     )
 
@@ -1953,6 +2016,20 @@ def _partition_guided_admm_selection(
                         sorted(raw_anchor_search.deviance_by_index.values())[1]
                     )
                 ),
+                "winning_witness_set_signature": ",".join(
+                    sorted(
+                        str(data.mutation_ids[int(key)])
+                        for key, _ in tied_certified
+                        if int(key) >= 0
+                    )
+                )
+                or "unanchored",
+                "raw_scalar_lower_bounds_certified": bool(
+                    raw_anchor_search.scalar_lower_bounds_certified
+                ),
+                "raw_scalar_certificate_method": str(
+                    raw_anchor_search.scalar_certificate_method
+                ),
                 "fusion_graph_source": str(graph_source),
                 "fusion_graph_pilot_matrix_hash": str(
                     static_metadata.pilot_matrix_hash
@@ -2110,6 +2187,13 @@ def _partition_guided_admm_selection(
             )
         )
         selection_score_available = bool(controller_artifact.eligible_for_selection)
+        winning_witness_set_signature = ",".join(
+            sorted(
+                str(data.mutation_ids[int(key)])
+                for key, _ in tied_certified
+                if int(key) >= 0
+            )
+        ) or str(controller_row.get("raw_clonal_witness_mutation_id", "unanchored"))
         controller.observe(
             OnlineLambdaObservation(
                 lambda_value=float(proposal.lambda_value),
@@ -2150,6 +2234,19 @@ def _partition_guided_admm_selection(
                 ),
                 branch_signature=str(
                     controller_fit.witness_subproblem_hash or "unanchored"
+                ),
+                model_signature=str(
+                    controller_row.get(
+                        "selection_model_signature",
+                        controller_row["partition_signature"],
+                    )
+                ),
+                winning_witness_set_signature=winning_witness_set_signature,
+                score_numerical_uncertainty=float(
+                    controller_artifact.score.numerical_uncertainty
+                ),
+                degrees_of_freedom=int(
+                    controller_artifact.score.degrees_of_freedom
                 ),
                 # Compatibility diagnostics for pre-provenance consumers.
                 raw_kkt_eligible=bool(

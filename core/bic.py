@@ -80,6 +80,7 @@ def fixed_partition_bic(
     anchor_block_signature: str = "none",
     labels: np.ndarray | None = None,
     anchor_cluster: int | None = None,
+    loglik_uncertainty: float = 0.0,
 ) -> "SelectionScore":
     """Return the explicitly named BIC for one immutable partition refit."""
 
@@ -110,6 +111,10 @@ def fixed_partition_bic(
     n_eff = effective_bic_mutation_region_count(data)
     penalty = float(degrees_of_freedom * np.log(max(int(n_eff), 1)))
     value = float(-2.0 * float(loglik) + penalty)
+    likelihood_uncertainty = max(float(loglik_uncertainty), 0.0)
+    arithmetic_uncertainty = 16.0 * np.finfo(np.float64).eps * (
+        1.0 + abs(value)
+    )
     # Imported lazily to keep this score-primitives module usable by the lower
     # fusion layer without introducing a module-import cycle.
     from ..model_selection.types import SelectionScore
@@ -123,15 +128,18 @@ def fixed_partition_bic(
         n_eff=int(n_eff),
         partition_signature=str(partition_signature),
         anchor_block_signature=str(anchor_block_signature),
+        numerical_uncertainty=float(
+            2.0 * likelihood_uncertainty + arithmetic_uncertainty
+        ),
     )
 
 
-def anchor_prior_adjusted_bic_value(
+def uniform_all_blocks_anchor_prior_adjusted_score(
     score: "SelectionScore",
     *,
     num_clusters: int,
 ) -> float:
-    """Return a uniform anchor-block-prior sensitivity for conditional BIC.
+    """Return a uniform-all-blocks anchor-prior sensitivity score.
 
     The production criterion remains ``score.value``. This diagnostic adds
     ``2 * log(K)`` for a prespecified uniform prior over the K partition
@@ -144,6 +152,11 @@ def anchor_prior_adjusted_bic_value(
     if str(score.name) != "clonal_fixed_partition_bic":
         return float(score.value)
     return float(score.value + 2.0 * np.log(float(clusters)))
+
+
+# Compatibility alias for callers written before the prior assumption was
+# made explicit in the diagnostic's name.
+anchor_prior_adjusted_bic_value = uniform_all_blocks_anchor_prior_adjusted_score
 
 
 def compute_classic_bic_depth_n(
@@ -283,4 +296,5 @@ __all__ = [
     "effective_bic_mutation_region_count",
     "effective_bic_depth_count",
     "fixed_partition_bic",
+    "uniform_all_blocks_anchor_prior_adjusted_score",
 ]

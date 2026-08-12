@@ -41,6 +41,7 @@ class OnlineLambdaConfig:
     score_relative_tolerance: float = 1e-8
     max_unique_lambdas: int = 40
     max_solver_retries_per_lambda: int = 2
+    partition_event_mode: bool = False
 
     def __post_init__(self) -> None:
         if int(self.num_mutations) < 1:
@@ -94,6 +95,10 @@ class OnlineLambdaObservation:
     backend_name: str = "unknown"
     solver_iterations: int = 0
     branch_signature: str = "unanchored"
+    model_signature: str = ""
+    winning_witness_set_signature: str = ""
+    score_numerical_uncertainty: float = 0.0
+    degrees_of_freedom: int = 0
 
 
 @dataclass(frozen=True)
@@ -201,6 +206,28 @@ class OnlineLambdaController:
         ]
         if not finite:
             return None
+        if bool(self.config.partition_event_mode):
+            minimum_upper = min(
+                float(item.partition_icl)
+                + max(float(item.score_numerical_uncertainty), 0.0)
+                for item in finite
+            )
+            tied = [
+                item
+                for item in finite
+                if float(item.partition_icl)
+                - max(float(item.score_numerical_uncertainty), 0.0)
+                <= minimum_upper
+            ]
+            return min(
+                tied,
+                key=lambda item: (
+                    int(item.n_clusters),
+                    int(item.degrees_of_freedom),
+                    float(item.lambda_value),
+                    str(item.model_signature or item.partition_signature),
+                ),
+            )
         best_score = min(float(item.partition_icl) for item in finite)
         score_tol = float(self.config.score_relative_tolerance) * (
             1.0 + abs(best_score)
@@ -377,6 +404,9 @@ class OnlineLambdaController:
     def _choose_from_certified_path(self) -> OnlineLambdaProposal | None:
         points = list(self.observations)
 
+        if bool(self.config.partition_event_mode):
+            return self._choose_from_partition_events(points)
+
         inconsistency = self._unresolved_monotonicity_interval(points)
         if inconsistency is not None:
             left, right = inconsistency
@@ -412,6 +442,146 @@ class OnlineLambdaController:
                 )
 
         return self._score_basin_proposal(points)
+
+    @staticmethod
+    def _event_signature(observation: OnlineLambdaObservation) -> tuple[object, ...]:
+        return (
+            str(observation.model_signature or observation.partition_signature),
+            str(
+                observation.winning_witness_set_signature
+                or observation.branch_signature
+            ),
+            int(observation.n_clusters),
+            bool(observation.partition_certified),
+            bool(OnlineLambdaController._selection_score_is_available(observation)),
+        )
+
+    def _choose_from_partition_events(
+        self,
+        points: list[OnlineLambdaObservation],
+    ) -> OnlineLambdaProposal | None:
+        """Refine union-model events without assuming a monotone guide-K path."""
+
+        best = self.best_observation
+        best_upper = (
+            float("inf")
+            if best is None
+            else float(best.partition_icl)
+            + max(float(best.score_numerical_uncertainty), 0.0)
+        )
+        score_margin = float(self.config.score_relative_tolerance) * (
+            1.0 + abs(best_upper) if np.isfinite(best_upper) else 1.0
+        )
+        event_intervals: list[
+            tuple[OnlineLambdaObservation, OnlineLambdaObservation]
+        ] = []
+        for left, right in zip(points[:-1], points[1:]):
+            if self._event_signature(left) == self._event_signature(right):
+                continue
+            competitive = best is None or any(
+                self._selection_score_is_available(item)
+                and float(item.partition_icl)
+                - max(float(item.score_numerical_uncertainty), 0.0)
+                <= best_upper + score_margin
+                for item in (left, right)
+            )
+            if competitive and not self._interval_resolved(left, right):
+                event_intervals.append((left, right))
+        if event_intervals:
+            left, right = max(
+                event_intervals,
+                key=lambda pair: (
+                    _log10_width(pair[0].lambda_value, pair[1].lambda_value),
+                    -float(pair[0].lambda_value),
+                ),
+            )
+            return self._midpoint_proposal(
+                left,
+                right,
+                phase="refine_partition_event",
+                reason="union_model_partition_or_witness_event",
+            )
+
+        if best is None:
+            direction = -1 if len(points) % 2 == 0 else 1
+            return self._event_outward_proposal(
+                points,
+                direction=direction,
+                reason="seek_first_available_union_model_score",
+            )
+
+        best_index = points.index(best)
+        best_event = self._event_signature(best)
+        run_left = best_index
+        while run_left > 0 and self._event_signature(points[run_left - 1]) == best_event:
+            run_left -= 1
+        run_right = best_index
+        while (
+            run_right + 1 < len(points)
+            and self._event_signature(points[run_right + 1]) == best_event
+        ):
+            run_right += 1
+        missing_left = run_left == 0
+        missing_right = run_right + 1 == len(points)
+        if missing_left or missing_right:
+            if missing_left and missing_right:
+                lower_span = max(
+                    log(self.initial_lambda) - log(points[0].lambda_value), 0.0
+                )
+                upper_span = max(
+                    log(points[-1].lambda_value) - log(self.initial_lambda), 0.0
+                )
+                direction = -1 if lower_span <= upper_span else 1
+            else:
+                direction = -1 if missing_left else 1
+            return self._event_outward_proposal(
+                points,
+                direction=direction,
+                reason="bracket_best_union_model_event",
+            )
+
+        self._stop_reason = "online_lambda_partition_event_basin_resolved"
+        return None
+
+    def _event_outward_proposal(
+        self,
+        points: list[OnlineLambdaObservation],
+        *,
+        direction: int,
+        reason: str,
+    ) -> OnlineLambdaProposal | None:
+        frontier = points[-1] if direction > 0 else points[0]
+        neighbor = (
+            points[-2]
+            if direction > 0 and len(points) > 1
+            else points[1]
+            if direction < 0 and len(points) > 1
+            else None
+        )
+        previous_step = (
+            1.0
+            if neighbor is None
+            else abs(log(frontier.lambda_value) - log(neighbor.lambda_value))
+        )
+        step = max(previous_step, 1.0)
+        candidate = exp(log(frontier.lambda_value) + direction * step)
+        candidate = min(
+            max(candidate, float(self.config.lambda_min)),
+            float(self.config.lambda_max),
+        )
+        if _lambda_key(candidate) == _lambda_key(frontier.lambda_value):
+            self._stop_reason = (
+                "online_lambda_upper_search_bound_reached"
+                if direction > 0
+                else "online_lambda_lower_search_bound_reached"
+            )
+            return None
+        return OnlineLambdaProposal(
+            lambda_value=float(candidate),
+            phase="expand_union_upper" if direction > 0 else "expand_union_lower",
+            reason=str(reason),
+            warm_start_lambda=float(frontier.lambda_value),
+        )
 
     def _unresolved_monotonicity_interval(
         self,

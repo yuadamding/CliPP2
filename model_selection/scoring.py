@@ -411,7 +411,7 @@ def _select_best_partition_leftmost(
         if "selection_model_signature" in frame.columns
         else "partition_signature"
     )
-    partition_scores: dict[str, float] = {}
+    partition_scores: dict[str, tuple[float, float]] = {}
     for signature, rows in frame.groupby(model_key, sort=False):
         scores = rows[score_column].to_numpy(dtype=float)
         if not np.all(np.isfinite(scores)):
@@ -423,16 +423,40 @@ def _select_best_partition_leftmost(
                 "One partition signature produced inconsistent fixed-partition "
                 "scores; the refit is not search-order invariant."
             )
-        partition_scores[str(signature)] = reference
+        uncertainty = (
+            float(np.max(rows["selection_score_numerical_uncertainty"]))
+            if "selection_score_numerical_uncertainty" in rows.columns
+            else 0.0
+        )
+        partition_scores[str(signature)] = (reference, max(uncertainty, 0.0))
 
-    best_value = float(min(partition_scores.values()))
-    best_signatures = {
+    minimum_upper = min(
+        value + uncertainty for value, uncertainty in partition_scores.values()
+    )
+    tied_signatures = {
         signature
-        for signature, value in partition_scores.items()
-        if np.isclose(value, best_value, rtol=0.0, atol=1e-12)
+        for signature, (value, uncertainty) in partition_scores.items()
+        if value - uncertainty <= minimum_upper
     }
+    signature_order: list[tuple[int, int, float, str]] = []
+    for signature in tied_signatures:
+        rows = frame.loc[frame[model_key].astype(str) == signature]
+        signature_order.append(
+            (
+                int(rows["n_clusters"].min())
+                if "n_clusters" in rows.columns
+                else np.iinfo(np.int64).max,
+                int(rows["selection_df"].min())
+                if "selection_df" in rows.columns
+                else np.iinfo(np.int64).max,
+                float(rows["lambda"].min()),
+                str(signature),
+            )
+        )
+    selected_signature = min(signature_order)[-1]
+    best_value = float(partition_scores[selected_signature][0])
     optimal_mask = (
-        frame[model_key].astype(str).isin(best_signatures).to_numpy(bool)
+        frame[model_key].astype(str).eq(selected_signature).to_numpy(bool)
     )
     tied = frame.loc[optimal_mask].copy()
     if "penalized_objective" not in tied.columns:

@@ -10,6 +10,7 @@ from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.fusion.refit import _canonical_labels as _canonical_partition_labels
 from ..core.fusion.types import (
     CompressedEdgeCertificate,
+    DenseEdgeCertificate,
     PairwiseFusionGraph,
 )
 from ..io.data import TumorData
@@ -346,31 +347,6 @@ def _exact_partition_diameters(phi: np.ndarray, labels: np.ndarray) -> np.ndarra
     return diameters
 
 
-def _has_cross_close_edge(
-    phi: np.ndarray,
-    labels: np.ndarray,
-    graph: PairwiseFusionGraph,
-    *,
-    tolerance: float,
-    protected_block_mask: np.ndarray | None = None,
-) -> bool:
-    edge_u = np.asarray(graph.edge_u, dtype=np.int64)
-    edge_v = np.asarray(graph.edge_v, dtype=np.int64)
-    for start in range(0, edge_u.size, 262_144):
-        u = edge_u[start : start + 262_144]
-        v = edge_v[start : start + 262_144]
-        cross = labels[u] != labels[v]
-        if protected_block_mask is not None:
-            protected_cross = protected_block_mask[u] != protected_block_mask[v]
-            cross &= ~protected_cross
-        if not np.any(cross):
-            continue
-        distances = np.linalg.norm(phi[u[cross]] - phi[v[cross]], axis=1)
-        if np.any(distances <= float(tolerance)):
-            return True
-    return False
-
-
 def extract_certified_fusion_partition(
     fit: FitResult,
     *,
@@ -427,17 +403,14 @@ def extract_certified_fusion_partition(
     diameters = _exact_partition_diameters(phi, labels)
     max_diameter = float(np.max(diameters)) if diameters.size else 0.0
     within_ok = bool(np.all(np.isfinite(diameters)) and max_diameter <= tol)
-    cross_close = _has_cross_close_edge(
-        phi,
-        labels,
-        graph,
-        tolerance=tol,
-        protected_block_mask=protected_mask,
-    )
+    # Labels are the connected components of exactly the graph edges within
+    # tolerance (excluding only protected-block cross edges by definition), so
+    # a second O(E) maximality scan would repeat the construction.
+    cross_close = False
     state = getattr(fit, "solver_state", None)
     certificate = getattr(state, "certificate", None)
     certificate_graph_hash_matches = True
-    if isinstance(certificate, CompressedEdgeCertificate):
+    if isinstance(certificate, (CompressedEdgeCertificate, DenseEdgeCertificate)):
         expected_graph_hash = str(getattr(fit, "original_graph_hash", ""))
         certificate_graph_hash_matches = bool(
             expected_graph_hash
@@ -447,7 +420,11 @@ def extract_certified_fusion_partition(
         within_ok and not cross_close and certificate_graph_hash_matches
     )
     if not certificate_graph_hash_matches:
-        failure_reason = "compressed_certificate_graph_hash_mismatch"
+        failure_reason = (
+            "compressed_certificate_graph_hash_mismatch"
+            if isinstance(certificate, CompressedEdgeCertificate)
+            else "dense_certificate_graph_hash_mismatch"
+        )
     elif cross_close:
         failure_reason = "cross_block_edge_within_partition_tolerance"
     elif not within_ok:

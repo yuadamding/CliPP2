@@ -159,13 +159,19 @@ class PartitionRefitSummary:
     refit_min_best_second_loss_gap: float = float("inf")
     fixed_anchor_target: np.ndarray | None = None
     anchor_block_signature: str = "none"
+    global_lower_bound: float = float("-inf")
+    global_optimality_gap: float = float("inf")
+    global_certificate_method: str = "none"
+    global_certificate_intervals: int = 0
 
     def __post_init__(self) -> None:
-        if self.global_optimum_certified:
-            raise ValueError(
-                "Partition refits cannot claim global optimality without a "
-                "separate certificate object."
-            )
+        if self.global_optimum_certified and (
+            not np.isfinite(float(self.global_lower_bound))
+            or not np.isfinite(float(self.global_optimality_gap))
+            or float(self.global_optimality_gap) < 0.0
+            or str(self.global_certificate_method) == "none"
+        ):
+            raise ValueError("A global refit claim requires a finite certificate.")
         object.__setattr__(
             self,
             "labels",
@@ -201,6 +207,15 @@ class SelectionScore:
     n_eff: int
     partition_signature: str
     anchor_block_signature: str = "none"
+    numerical_uncertainty: float = 0.0
+
+    @property
+    def lower_bound(self) -> float:
+        return float(self.value - self.numerical_uncertainty)
+
+    @property
+    def upper_bound(self) -> float:
+        return float(self.value + self.numerical_uncertainty)
 
 
 @dataclass(frozen=True)
@@ -255,6 +270,8 @@ class SelectedModel:
             raise ValueError("Selected model must have a certified raw objective.")
         if not candidate.partition.certified:
             raise ValueError("Selected model must have a certified partition.")
+        if not candidate.refit.global_optimum_certified:
+            raise ValueError("Selected model must have a globally certified refit.")
         if candidate.score.partition_signature != self.selected_partition_signature:
             raise ValueError("Selected-model score signature is inconsistent.")
         if candidate.score.name == "clonal_fixed_partition_bic":

@@ -95,6 +95,20 @@ from .types import (
 )
 
 
+def _inadmissible_downward_kink_mask(
+    downward_kink: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    phi: torch.Tensor,
+) -> torch.Tensor:
+    """Mask downward kinks only where a coordinate can actually move."""
+
+    resolution = 8.0 * torch.finfo(phi.dtype).eps * (
+        1.0 + torch.maximum(torch.abs(lower), torch.abs(upper))
+    )
+    return downward_kink & ((upper - lower) > resolution)
+
+
 class _UnionFind:
     def __init__(self, n: int) -> None:
         self.parent = np.arange(n, dtype=np.int64)
@@ -2708,7 +2722,13 @@ def _fit_from_start(
             at_path_breakpoint,
             tol=float(tol),
         )
-        directional_kink_admissible = not bool(torch.any(downward_kink).item())
+        directional_kink_admissible = not bool(
+            torch.any(
+                _inadmissible_downward_kink_mask(
+                    downward_kink, lower, upper, phi
+                )
+            ).item()
+        )
         gradient_lower = torch.where(
             at_path_breakpoint, gradient_lower, certificate_gradient
         )

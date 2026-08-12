@@ -156,6 +156,17 @@ def mutation_output_table(
                 ),
                 data.num_mutations,
             ),
+            "clonal_constraint_satisfied": np.repeat(
+                bool(clonal_block is not None and clonal_block.mathematically_certified),
+                data.num_mutations,
+            ),
+            "clonal_cluster_statistically_identified": np.repeat(
+                bool(
+                    clonal_block_evidence is not None
+                    and clonal_block_evidence.evidence_gate_passed
+                ),
+                data.num_mutations,
+            ),
             "raw_clonal_cluster_signature": np.repeat(
                 "none" if clonal_block is None else clonal_block.block_signature,
                 data.num_mutations,
@@ -286,6 +297,19 @@ def cluster_output_table(
                 False,
             ),
             "clonal_block_biologically_supported": np.where(
+                is_clonal_cluster,
+                bool(
+                    clonal_block_evidence is not None
+                    and clonal_block_evidence.evidence_gate_passed
+                ),
+                False,
+            ),
+            "clonal_constraint_satisfied": np.where(
+                is_clonal_cluster,
+                bool(clonal_block is not None and clonal_block.mathematically_certified),
+                False,
+            ),
+            "clonal_cluster_statistically_identified": np.where(
                 is_clonal_cluster,
                 bool(
                     clonal_block_evidence is not None
