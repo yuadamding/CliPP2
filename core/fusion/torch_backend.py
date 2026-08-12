@@ -1525,12 +1525,21 @@ def graph_fusion_kkt_residual_from_grad_torch(
 
     adj = torch.zeros_like(phi)
     if num_edges > 0 and lambda_value > 0.0 and dual is not None:
-        for edge_slice in _edge_slices(num_edges, chunk_size):
-            dual_chunk = dual[edge_slice]
-            if dual_scale_value != 1.0:
-                dual_chunk = dual_scale_value * dual_chunk
-            adj.index_add_(0, edge_u[edge_slice], dual_chunk)
-            adj.index_add_(0, edge_v[edge_slice], dual_chunk, alpha=-1.0)
+        if dual_scale_value == 1.0:
+            # This routes CUDA complete graphs through the deterministic
+            # reduction used by the solver, so certification audits the same
+            # numerical operator instead of a second atomic-scatter ordering.
+            adj = graph_adjoint_edges(
+                dual,
+                edge_u=edge_u,
+                edge_v=edge_v,
+                num_nodes=int(phi.shape[0]),
+            )
+        else:
+            for edge_slice in _edge_slices(num_edges, chunk_size):
+                dual_chunk = dual_scale_value * dual[edge_slice]
+                adj.index_add_(0, edge_u[edge_slice], dual_chunk)
+                adj.index_add_(0, edge_v[edge_slice], dual_chunk, alpha=-1.0)
     zero = torch.zeros((), dtype=phi.dtype, device=phi.device)
     max_edge_residual = zero
     max_ball_residual = zero

@@ -51,8 +51,23 @@ class PartitionCandidate:
     bic: float
     active_df: int | None = None
     finite_candidate_found: bool = True
-    diagnostics: dict[str, float] = field(default_factory=dict)
+    diagnostics: dict[str, object] = field(default_factory=dict)
     refit: PartitionRefitResult | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class PartitionRefinementResult:
+    labels: np.ndarray
+    refit: PartitionRefitResult
+    initial_labels: np.ndarray
+    iterations: int
+    accepted_updates: int
+    initial_k: int
+    final_k: int
+    component_death_count: int
+    score_before: float
+    score_after: float
+    score_path: tuple[float, ...]
 
 
 def compute_partition_bic(
@@ -879,7 +894,7 @@ def _validated_classification_code_weight(code_weight: float) -> float:
     return weight
 
 
-def refine_partition_likelihood(
+def refine_partition_likelihood_with_trace(
     data: TumorData,
     labels: np.ndarray,
     *,
@@ -893,8 +908,10 @@ def refine_partition_likelihood(
     classification_code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
     allow_component_death: bool = False,
     _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
-) -> tuple[np.ndarray, PartitionRefitResult]:
+) -> PartitionRefinementResult:
     labels = _validated_refinement_labels(data, labels)
+    initial_labels = labels.copy()
+    initial_k = int(np.unique(initial_labels).size)
     _validate_classification_weight_alpha(classification_weight_alpha)
     classification_code_weight = _validated_classification_code_weight(
         classification_code_weight
@@ -913,10 +930,12 @@ def refine_partition_likelihood(
         )
 
     refit = refit_labels(labels)
+    initial_refit = refit
     refit_key = _label_key(labels)
     best_labels: np.ndarray | None = None
     best_refit: PartitionRefitResult | None = None
     best_score = float("inf")
+    score_path: list[float] = []
     if classification_weight_alpha is not None:
         best_score = _classification_refit_score(
             data,
@@ -927,7 +946,13 @@ def refine_partition_likelihood(
         )
         best_labels = labels.copy()
         best_refit = refit
-    for _ in range(max(int(max_iter), 0)):
+        score_path.append(float(best_score))
+    else:
+        score_path.append(float(refit.fit_loss))
+    iterations = 0
+    accepted_updates = 0
+    for iteration in range(max(int(max_iter), 0)):
+        iterations = int(iteration + 1)
         labels_key = _label_key(labels)
         if refit_key != labels_key:
             refit = refit_labels(labels)
@@ -973,11 +998,13 @@ def refine_partition_likelihood(
             ):
                 break
             best_score = float(proposed_score)
+            score_path.append(float(best_score))
             best_labels = labels_next.copy()
             best_refit = proposed_refit
             refit = proposed_refit
             refit_key = _label_key(labels_next)
         labels = labels_next
+        accepted_updates += 1
     labels_key = _label_key(labels)
     if refit_key != labels_key:
         refit = refit_labels(labels)
@@ -986,8 +1013,38 @@ def refine_partition_likelihood(
         and best_labels is not None
         and best_refit is not None
     ):
-        return _canonical_labels(best_labels), best_refit
-    return _canonical_labels(labels), refit
+        final_labels = _canonical_labels(best_labels)
+        final_refit = best_refit
+    else:
+        final_labels = _canonical_labels(labels)
+        final_refit = refit
+        if not score_path or score_path[-1] != float(final_refit.fit_loss):
+            score_path.append(float(final_refit.fit_loss))
+    final_k = int(np.unique(final_labels).size)
+    return PartitionRefinementResult(
+        labels=final_labels,
+        refit=final_refit,
+        initial_labels=initial_labels,
+        iterations=int(iterations),
+        accepted_updates=int(accepted_updates),
+        initial_k=int(initial_k),
+        final_k=int(final_k),
+        component_death_count=max(int(initial_k - final_k), 0),
+        score_before=float(score_path[0] if score_path else initial_refit.fit_loss),
+        score_after=float(score_path[-1] if score_path else final_refit.fit_loss),
+        score_path=tuple(float(value) for value in score_path),
+    )
+
+
+def refine_partition_likelihood(
+    data: TumorData,
+    labels: np.ndarray,
+    **kwargs,
+) -> tuple[np.ndarray, PartitionRefitResult]:
+    """Backward-compatible two-value wrapper around traced CEM refinement."""
+
+    trace = refine_partition_likelihood_with_trace(data, labels, **kwargs)
+    return trace.labels, trace.refit
 
 
 @torch.no_grad()
@@ -1173,7 +1230,7 @@ def partition_constrained_observed_refit_torch(
 
 
 @torch.no_grad()
-def refine_partition_likelihood_torch(
+def refine_partition_likelihood_torch_with_trace(
     data: TumorData,
     labels: np.ndarray,
     *,
@@ -1190,9 +1247,9 @@ def refine_partition_likelihood_torch(
     classification_code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
     allow_component_death: bool = False,
     _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
-) -> tuple[np.ndarray, PartitionRefitResult]:
+) -> PartitionRefinementResult:
     if getattr(data, "path_likelihood", None) is not None:
-        return refine_partition_likelihood(
+        return refine_partition_likelihood_with_trace(
             data,
             labels,
             major_prior=float(major_prior),
@@ -1214,6 +1271,8 @@ def refine_partition_likelihood_torch(
         dtype=dtype,
     )
     labels = _validated_refinement_labels(data, labels)
+    initial_labels = labels.copy()
+    initial_k = int(np.unique(initial_labels).size)
     _validate_classification_weight_alpha(classification_weight_alpha)
     classification_code_weight = _validated_classification_code_weight(
         classification_code_weight
@@ -1236,10 +1295,12 @@ def refine_partition_likelihood_torch(
         )
 
     refit = refit_labels(labels)
+    initial_refit = refit
     refit_key = _label_key(labels)
     best_labels: np.ndarray | None = None
     best_refit: PartitionRefitResult | None = None
     best_score = float("inf")
+    score_path: list[float] = []
     if classification_weight_alpha is not None:
         best_score = _classification_refit_score(
             data,
@@ -1250,7 +1311,13 @@ def refine_partition_likelihood_torch(
         )
         best_labels = labels.copy()
         best_refit = refit
-    for _ in range(max(int(max_iter), 0)):
+        score_path.append(float(best_score))
+    else:
+        score_path.append(float(refit.fit_loss))
+    iterations = 0
+    accepted_updates = 0
+    for iteration in range(max(int(max_iter), 0)):
+        iterations = int(iteration + 1)
         labels_key = _label_key(labels)
         if refit_key != labels_key:
             refit = refit_labels(labels)
@@ -1308,11 +1375,13 @@ def refine_partition_likelihood_torch(
             ):
                 break
             best_score = float(proposed_score)
+            score_path.append(float(best_score))
             best_labels = labels_next.copy()
             best_refit = proposed_refit
             refit = proposed_refit
             refit_key = _label_key(labels_next)
         labels = labels_next
+        accepted_updates += 1
     labels_key = _label_key(labels)
     if refit_key != labels_key:
         refit = refit_labels(labels)
@@ -1321,8 +1390,38 @@ def refine_partition_likelihood_torch(
         and best_labels is not None
         and best_refit is not None
     ):
-        return _canonical_labels(best_labels), best_refit
-    return _canonical_labels(labels), refit
+        final_labels = _canonical_labels(best_labels)
+        final_refit = best_refit
+    else:
+        final_labels = _canonical_labels(labels)
+        final_refit = refit
+        if not score_path or score_path[-1] != float(final_refit.fit_loss):
+            score_path.append(float(final_refit.fit_loss))
+    final_k = int(np.unique(final_labels).size)
+    return PartitionRefinementResult(
+        labels=final_labels,
+        refit=final_refit,
+        initial_labels=initial_labels,
+        iterations=int(iterations),
+        accepted_updates=int(accepted_updates),
+        initial_k=int(initial_k),
+        final_k=int(final_k),
+        component_death_count=max(int(initial_k - final_k), 0),
+        score_before=float(score_path[0] if score_path else initial_refit.fit_loss),
+        score_after=float(score_path[-1] if score_path else final_refit.fit_loss),
+        score_path=tuple(float(value) for value in score_path),
+    )
+
+
+def refine_partition_likelihood_torch(
+    data: TumorData,
+    labels: np.ndarray,
+    **kwargs,
+) -> tuple[np.ndarray, PartitionRefitResult]:
+    """Backward-compatible two-value wrapper around traced Torch refinement."""
+
+    trace = refine_partition_likelihood_torch_with_trace(data, labels, **kwargs)
+    return trace.labels, trace.refit
 
 
 def _label_key(labels: np.ndarray) -> bytes:
@@ -1350,6 +1449,8 @@ def generate_likelihood_partition_starts(
     classification_weight_alpha: float | None = None,
     classification_code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
     allow_component_death: bool = False,
+    include_plain_ward: bool = True,
+    include_ward_cem: bool = True,
 ) -> list[PartitionCandidate]:
     _validate_classification_weight_alpha(classification_weight_alpha)
     classification_code_weight = _validated_classification_code_weight(
@@ -1425,17 +1526,22 @@ def generate_likelihood_partition_starts(
 
     for requested_k in sorted(label_sets):
         labels0 = _canonical_labels(label_sets[int(requested_k)])
-        for source, labels in (
-            (f"hessian_ward_K{int(requested_k)}", labels0),
-            (f"hessian_ward_cem_K{int(requested_k)}", labels0),
-        ):
+        source_labels: list[tuple[str, np.ndarray]] = []
+        if include_plain_ward:
+            source_labels.append((f"hessian_ward_K{int(requested_k)}", labels0))
+        if include_ward_cem:
+            source_labels.append(
+                (f"hessian_ward_cem_K{int(requested_k)}", labels0)
+            )
+        for source, labels in source_labels:
+            trace: PartitionRefinementResult | None = None
             if source.startswith("hessian_ward_cem"):
                 if (
                     use_torch_runtime
                     and runtime is not None
                     and partition_torch_data is not None
                 ):
-                    labels_used, refit = refine_partition_likelihood_torch(
+                    trace = refine_partition_likelihood_torch_with_trace(
                         data,
                         labels,
                         major_prior=float(major_prior),
@@ -1453,7 +1559,7 @@ def generate_likelihood_partition_starts(
                         _refit_labels=cached_refit,
                     )
                 else:
-                    labels_used, refit = refine_partition_likelihood(
+                    trace = refine_partition_likelihood_with_trace(
                         data,
                         labels,
                         major_prior=float(major_prior),
@@ -1467,6 +1573,7 @@ def generate_likelihood_partition_starts(
                         allow_component_death=bool(allow_component_death),
                         _refit_labels=cached_refit,
                     )
+                labels_used, refit = trace.labels, trace.refit
             else:
                 refit = cached_refit(labels)
                 labels_used = labels
@@ -1505,6 +1612,27 @@ def generate_likelihood_partition_starts(
                     finite_candidate_found=bool(refit.finite_candidate_found),
                     diagnostics={
                         "requested_K": float(requested_k),
+                        "pre_refinement_signature": _label_key(labels0).hex(),
+                        "cem_iterations": float(0 if trace is None else trace.iterations),
+                        "cem_accepted_updates": float(
+                            0 if trace is None else trace.accepted_updates
+                        ),
+                        "initial_K": float(
+                            int(np.unique(labels0).size)
+                            if trace is None
+                            else trace.initial_k
+                        ),
+                        "final_K": float(candidate_k),
+                        "component_death_count": float(
+                            0 if trace is None else trace.component_death_count
+                        ),
+                        "refinement_score_before": float(
+                            refit.fit_loss if trace is None else trace.score_before
+                        ),
+                        "refinement_score_after": float(
+                            refit.fit_loss if trace is None else trace.score_after
+                        ),
+                        "deterministic_generation": 1.0,
                         "partition_generation_classic_bic": float(classic_bic),
                         "refit_boundary_count": float(refit.boundary_count),
                         "refit_coordinate_count": float(refit.refit_coordinate_count),
@@ -1528,6 +1656,7 @@ def generate_likelihood_partition_starts(
                             and runtime.device.type == "cuda"
                         ),
                     },
+                    refit=refit,
                 )
             )
 

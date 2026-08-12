@@ -329,7 +329,7 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
         selected_score = enriched["bic"].to_numpy(dtype=float)
     else:
         selected_score = classic_bic
-    eligible = (
+    raw_eligible = (
         raw_kkt
         & partition_certified
         & bic_refit
@@ -337,6 +337,25 @@ def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
         & np.isfinite(classic_bic)
         & np.isfinite(selected_score)
     )
+    direct_mask = (
+        enriched["candidate_family"]
+        .astype(str)
+        .eq("direct_partition")
+        .to_numpy(dtype=bool)
+        if "candidate_family" in enriched.columns
+        else np.zeros(n_rows, dtype=bool)
+    )
+    direct_identity = _required_bool_mask(
+        enriched, "direct_partition_identity_certified"
+    )
+    direct_eligible = (
+        direct_identity
+        & bic_refit
+        & refit_resolved
+        & np.isfinite(classic_bic)
+        & np.isfinite(selected_score)
+    )
+    eligible = np.where(direct_mask, direct_eligible, raw_eligible)
     if explicit_candidate_eligible is not None:
         eligible &= explicit_candidate_eligible
     enriched["bic_selection_eligible"] = eligible
@@ -438,9 +457,22 @@ def _select_best_partition_leftmost(
         for signature, (value, uncertainty) in partition_scores.items()
         if value - uncertainty <= minimum_upper
     }
-    signature_order: list[tuple[int, int, float, str]] = []
+    signature_order: list[tuple[int, int, float, int, str]] = []
     for signature in tied_signatures:
         rows = frame.loc[frame[model_key].astype(str) == signature]
+        applicable = _lambda_applicable_mask(rows)
+        applicable_lambdas = rows.loc[applicable, "lambda"].to_numpy(dtype=float)
+        left_lambda = (
+            float(np.min(applicable_lambdas))
+            if applicable_lambdas.size
+            else float("inf")
+        )
+        raw_source_rank = (
+            0
+            if "candidate_family" in rows.columns
+            and bool(rows["candidate_family"].astype(str).eq("raw_fusion").any())
+            else 1
+        )
         signature_order.append(
             (
                 int(rows["n_clusters"].min())
@@ -449,7 +481,8 @@ def _select_best_partition_leftmost(
                 int(rows["selection_df"].min())
                 if "selection_df" in rows.columns
                 else np.iinfo(np.int64).max,
-                float(rows["lambda"].min()),
+                left_lambda,
+                raw_source_rank,
                 str(signature),
             )
         )
@@ -459,9 +492,25 @@ def _select_best_partition_leftmost(
     tied = frame.loc[optimal_mask].copy()
     if "penalized_objective" not in tied.columns:
         tied["penalized_objective"] = np.inf
+    tied["_selection_lambda_sort"] = np.where(
+        _lambda_applicable_mask(tied),
+        pd.to_numeric(tied["lambda"], errors="coerce"),
+        np.inf,
+    )
+    tied["_selection_family_sort"] = (
+        tied.get("candidate_family", pd.Series("raw_fusion", index=tied.index))
+        .astype(str)
+        .map({"raw_fusion": 0, "direct_partition": 1})
+        .fillna(2)
+    )
     tied = tied.sort_values(
-        ["lambda", "penalized_objective", "selection_step"],
-        ascending=[True, True, True],
+        [
+            "_selection_lambda_sort",
+            "_selection_family_sort",
+            "penalized_objective",
+            "selection_step",
+        ],
+        ascending=[True, True, True, True],
     )
     return tied.iloc[0], best_value, optimal_mask
 

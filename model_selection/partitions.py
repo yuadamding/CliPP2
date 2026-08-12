@@ -13,24 +13,9 @@ from ..core.fusion.types import (
     PairwiseFusionGraph,
 )
 from .config import (
-    LIKELIHOOD_PARTITION_K_ANCHORS,
     LIKELIHOOD_PARTITION_K_MAX,
 )
 from .types import FusionPartition
-
-
-def _likelihood_partition_k_grid(num_mutations: int) -> list[int]:
-    k_max = min(int(LIKELIHOOD_PARTITION_K_MAX), int(num_mutations))
-    if k_max <= 0:
-        return []
-    anchors = [
-        int(value)
-        for value in LIKELIHOOD_PARTITION_K_ANCHORS
-        if 1 <= int(value) <= k_max
-    ]
-    if k_max not in anchors:
-        anchors.append(k_max)
-    return sorted(set(anchors))
 
 
 def _partition_candidate_requested_k(candidate: PartitionCandidate) -> int:
@@ -330,10 +315,7 @@ def extract_certified_fusion_partition(
     if phi.ndim != 2:
         raise ValueError("fit.phi must be a mutation-by-region matrix.")
 
-    labels = _diameter_constrained_labels(
-        phi,
-        tolerance=tol,
-    )
+    labels = _diameter_constrained_labels(phi, tolerance=tol)
     source = "tolerance_defined_primal"
 
     if labels.shape != (phi.shape[0],):
@@ -385,6 +367,105 @@ def extract_certified_fusion_partition(
         source=source,
         maximal=bool(within_ok and not cross_close),
         cross_close_edge_found=bool(cross_close),
+        certificate_graph_hash_matches=bool(certificate_graph_hash_matches),
+        certification_failure_reason=str(failure_reason),
+        mutation_ids=() if mutation_ids is None else tuple(mutation_ids),
+    )
+
+
+def extract_connected_component_partition(
+    fit: FitResult,
+    *,
+    graph: PairwiseFusionGraph,
+    tolerance: float,
+    mutation_ids: tuple[str, ...] | list[str] | None = None,
+) -> FusionPartition:
+    """Extract the declared legacy threshold-connectivity raw summary.
+
+    This is a partition summary of the certified raw matrix, not a replacement
+    raw optimizer. It is available only through the explicit legacy contract
+    because transitive chains may have diameters larger than ``tolerance``.
+    """
+
+    tol = float(tolerance)
+    if not np.isfinite(tol) or tol <= 0.0:
+        raise ValueError("Partition tolerance must be positive and finite.")
+    phi = np.asarray(fit.phi, dtype=np.float64)
+    if phi.ndim != 2:
+        raise ValueError("fit.phi must be a mutation-by-region matrix.")
+    num_mutations = int(phi.shape[0])
+    expected_edges = num_mutations * max(num_mutations - 1, 0) // 2
+    edge_u = np.asarray(graph.edge_u, dtype=np.int64)
+    edge_v = np.asarray(graph.edge_v, dtype=np.int64)
+    complete_graph = bool(
+        edge_u.size == expected_edges
+        and edge_v.size == expected_edges
+        and int(graph.degree_bound) == max(num_mutations - 1, 0)
+    )
+    parent = np.arange(num_mutations, dtype=np.int64)
+    rank = np.zeros(num_mutations, dtype=np.int8)
+
+    def find(value: int) -> int:
+        root = int(value)
+        while int(parent[root]) != root:
+            parent[root] = parent[int(parent[root])]
+            root = int(parent[root])
+        return root
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            return
+        if rank[left_root] < rank[right_root]:
+            left_root, right_root = right_root, left_root
+        parent[right_root] = left_root
+        if rank[left_root] == rank[right_root]:
+            rank[left_root] += 1
+
+    for start in range(0, int(edge_u.size), 1_000_000):
+        stop = min(start + 1_000_000, int(edge_u.size))
+        left = edge_u[start:stop]
+        right = edge_v[start:stop]
+        distances = np.linalg.norm(phi[left] - phi[right], axis=1)
+        for left_value, right_value in zip(
+            left[distances <= tol], right[distances <= tol], strict=True
+        ):
+            union(int(left_value), int(right_value))
+    labels = _canonical_partition_labels(
+        np.asarray([find(index) for index in range(num_mutations)], dtype=np.int64)
+    )
+    diameters = _exact_partition_diameters(phi, labels)
+    max_diameter = float(np.max(diameters)) if diameters.size else 0.0
+    state = getattr(fit, "solver_state", None)
+    certificate = getattr(state, "certificate", None)
+    certificate_graph_hash_matches = True
+    if isinstance(certificate, (CompressedEdgeCertificate, DenseEdgeCertificate)):
+        expected_graph_hash = str(getattr(fit, "original_graph_hash", ""))
+        certificate_graph_hash_matches = bool(
+            expected_graph_hash and str(certificate.graph_hash) == expected_graph_hash
+        )
+    certified = bool(complete_graph and certificate_graph_hash_matches)
+    failure_reason = (
+        "none"
+        if certified
+        else (
+            "legacy_connected_component_requires_complete_graph"
+            if not complete_graph
+            else "raw_certificate_graph_hash_mismatch"
+        )
+    )
+    return FusionPartition(
+        labels=labels,
+        signature=_partition_signature(labels, mutation_ids),
+        n_clusters=int(np.unique(labels).size),
+        tolerance=tol,
+        max_diameter=max_diameter,
+        diameter_exact=True,
+        certified=certified,
+        source="legacy_connected_components",
+        maximal=bool(certified),
+        cross_close_edge_found=False,
         certificate_graph_hash_matches=bool(certificate_graph_hash_matches),
         certification_failure_reason=str(failure_reason),
         mutation_ids=() if mutation_ids is None else tuple(mutation_ids),

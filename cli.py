@@ -24,6 +24,10 @@ from .core.fusion.profiles import (
     get_computation_profile,
 )
 from .core.model import FitOptions
+from .model_selection.contracts import (
+    DEFAULT_SELECTION_CONTRACT,
+    SELECTION_CONTRACT_IDS,
+)
 from .io.tumor_txt import DEFAULT_DOSAGE_PRIOR_PENALTY
 from .runners.pipeline import process_tumor
 from .simulation import simulate_tumor
@@ -86,13 +90,25 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--selection-refit-tol", type=float, default=None)
     parser.add_argument("--selection-refit-max-iter", type=int, default=None)
     parser.add_argument(
+        "--selection-contract",
+        choices=SELECTION_CONTRACT_IDS,
+        default=DEFAULT_SELECTION_CONTRACT,
+        help=(
+            "Immutable partition-selection contract. Raw-only preserves the "
+            "0.3 estimator; hybrid adds selectable Ward/CEM partitions; the "
+            "legacy compatibility contract uses its declared float64, graph, "
+            "Dirichlet-weight, component-death, and raw-partition settings."
+        ),
+    )
+    parser.add_argument(
         "--selection-score",
         type=_selection_score_argument,
         default="fixed-partition-dirichlet-score",
         help=(
             "Fixed-label selection criterion. The Dirichlet score is BIC plus "
-            "0.7 times the deviance of one exact allocation under an "
-            "integrated Dirichlet(1) prior. This is not posterior-entropy ICL."
+            "the active selection contract's declared weight times the "
+            "deviance of one exact allocation under its integrated symmetric "
+            "Dirichlet prior. This is not posterior-entropy ICL."
         ),
     )
     parser.add_argument("--disable-warm-start", action="store_true")
@@ -242,6 +258,7 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         selection_partition_tol=args.selection_partition_tol,
         selection_refit_tol=args.selection_refit_tol,
         selection_refit_max_iter=args.selection_refit_max_iter,
+        selection_contract=args.selection_contract,
         major_prior=args.major_prior,
         device=args.device,
         dtype=args.dtype,

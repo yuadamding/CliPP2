@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Union
 
 import numpy as np
 import pandas as pd
@@ -31,6 +31,7 @@ class FusionPartition:
         "solver_quotient",
         "verified_primal_equalities",
         "tolerance_defined_primal",
+        "legacy_connected_components",
     ]
     maximal: bool = False
     cross_close_edge_found: bool = False
@@ -125,6 +126,7 @@ class SelectionScore:
     assignment_model_id: str = "none"
     assignment_symmetry_mode: str = "none"
     assignment_arithmetic_uncertainty: float = 0.0
+    selection_contract_id: str = "raw-fusion-only-v0.3"
 
     @property
     def lower_bound(self) -> float:
@@ -148,35 +150,164 @@ class RawFusionCandidate:
 
 
 @dataclass(frozen=True)
+class DirectPartition:
+    labels: np.ndarray
+    signature: str
+    n_clusters: int
+    source: Literal[
+        "pilot_hessian_ward",
+        "pilot_hessian_ward_cem",
+        "pilot_hessian_ward_cem_component_death",
+        "final_phi_hessian_ward",
+        "final_phi_hessian_ward_cem",
+        "final_phi_hessian_ward_cem_component_death",
+        "local_split",
+        "local_merge",
+    ]
+    requested_k: int
+    mutation_ids: tuple[str, ...]
+    generation_contract_id: str
+    parent_raw_candidate_id: int | None = None
+    parent_raw_lambda: float | None = None
+    parent_raw_phi_hash: str = ""
+    pre_refinement_signature: str = ""
+    cem_iterations: int = 0
+    component_death_count: int = 0
+    refinement_score_before: float = float("nan")
+    refinement_score_after: float = float("nan")
+    deterministic_generation: bool = True
+
+    def __post_init__(self) -> None:
+        labels = _immutable_array(self.labels, dtype=np.dtype(np.int64))
+        if labels.ndim != 1 or labels.size == 0:
+            raise ValueError("Direct partition labels must be nonempty and 1-D.")
+        unique = np.unique(labels)
+        expected = np.arange(unique.size, dtype=np.int64)
+        if not np.array_equal(unique, expected):
+            raise ValueError("Direct partition labels must be canonical zero-based IDs.")
+        if int(self.n_clusters) != int(unique.size):
+            raise ValueError("Direct partition cluster count is inconsistent.")
+        mutation_ids = tuple(str(value) for value in self.mutation_ids)
+        if len(mutation_ids) != labels.size or len(set(mutation_ids)) != labels.size:
+            raise ValueError(
+                "Direct partition mutation IDs must uniquely identify every label."
+            )
+        if int(self.requested_k) < 1:
+            raise ValueError("Direct partition requested_k must be positive.")
+        if not str(self.signature) or not str(self.generation_contract_id):
+            raise ValueError("Direct partition identity provenance is required.")
+        object.__setattr__(self, "labels", labels)
+        object.__setattr__(self, "mutation_ids", mutation_ids)
+
+
+@dataclass(frozen=True)
+class DirectPartitionCandidate:
+    partition: DirectPartition
+    refit: PartitionRefitSummary
+    score: SelectionScore
+    eligible_for_selection: bool
+    ineligibility_reason: str
+    computation_profile: str
+    candidate_family: str = "direct_partition"
+
+
+SelectablePartitionCandidate = Union[RawFusionCandidate, DirectPartitionCandidate]
+
+
+@dataclass(frozen=True)
+class CandidateRecord:
+    candidate_id: int
+    candidate: SelectablePartitionCandidate
+    row: dict[str, object]
+
+    @property
+    def score(self) -> SelectionScore:
+        return self.candidate.score
+
+    @property
+    def partition_signature(self) -> str:
+        return self.candidate.partition.signature
+
+    @property
+    def family(self) -> str:
+        return (
+            "raw_fusion"
+            if isinstance(self.candidate, RawFusionCandidate)
+            else "direct_partition"
+        )
+
+
+@dataclass(frozen=True)
 class SelectedModel:
-    candidate: RawFusionCandidate
-    selected_lambda: float
+    raw_reference: RawFusionCandidate
+    partition_candidate: SelectablePartitionCandidate
     selected_partition_signature: str
+    selected_candidate_family: str
+    selected_lambda: float | None
     selected_partition_left_lambda: float | None
     selected_partition_right_lambda: float | None
 
     def __post_init__(self) -> None:
-        candidate = self.candidate
+        raw = self.raw_reference
+        candidate = self.partition_candidate
         strict = str(candidate.computation_profile) == "strict"
-        if self.selected_partition_signature != self.candidate.partition.signature:
+        if self.selected_partition_signature != candidate.partition.signature:
             raise ValueError("Selected-model partition signature is inconsistent.")
-        if not np.isclose(
-            float(self.selected_lambda),
-            float(self.candidate.raw_fit.lambda_value),
-            rtol=0.0,
-            atol=1e-12,
-        ):
-            raise ValueError("Selected-model lambda is inconsistent with its raw fit.")
+        expected_family = (
+            "raw_fusion" if isinstance(candidate, RawFusionCandidate) else "direct_partition"
+        )
+        if str(self.selected_candidate_family) != expected_family:
+            raise ValueError("Selected-model candidate family is inconsistent.")
         if not candidate.eligible_for_selection:
             raise ValueError("Selected model must be eligible for selection.")
-        if not candidate.raw_objective_certified:
-            raise ValueError("Selected model must have a certified raw objective.")
-        if not candidate.partition.certified:
-            raise ValueError("Selected model must have a certified partition.")
+        if isinstance(candidate, RawFusionCandidate):
+            if self.selected_lambda is None or not np.isclose(
+                float(self.selected_lambda),
+                float(candidate.raw_fit.lambda_value),
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                raise ValueError(
+                    "Selected-model lambda is inconsistent with its raw fit."
+                )
+            if not candidate.raw_objective_certified:
+                raise ValueError("Selected raw model must have a certified objective.")
+            if not candidate.partition.certified:
+                raise ValueError("Selected raw model must have a certified partition.")
+        elif self.selected_lambda is not None:
+            raise ValueError("Direct partition candidates do not have a selected lambda.")
         if strict and not candidate.refit.global_optimum_certified:
             raise ValueError("Selected model must have a globally certified refit.")
         if candidate.score.partition_signature != self.selected_partition_signature:
             raise ValueError("Selected-model score signature is inconsistent.")
+        if (
+            not raw.eligible_for_selection
+            or not raw.raw_objective_certified
+            or not raw.partition.certified
+        ):
+            raise ValueError("Raw reference must remain a certified raw-fusion model.")
+
+    @property
+    def candidate(self) -> SelectablePartitionCandidate:
+        """Compatibility alias for the selected partition candidate."""
+
+        return self.partition_candidate
+
+    @property
+    def partition(self) -> FusionPartition | DirectPartition:
+        return self.partition_candidate.partition
+
+    @property
+    def refit(self) -> PartitionRefitSummary:
+        return self.partition_candidate.refit
+
+    @property
+    def score(self) -> SelectionScore:
+        return self.partition_candidate.score
+
+    @property
+    def raw_fit(self) -> FitResult:
+        return self.raw_reference.raw_fit
 
 
 @dataclass
@@ -216,10 +347,14 @@ class BICSelectionResult:
     selected_lambda_right: float | None
     selected_lambda_interval_log10_width: float | None
     adaptive_refinement_rounds_completed: int
+    ward_candidate_pool_complete: bool = False
+    raw_lambda_path_resolved: bool = False
+    best_over_evaluated_candidates: bool = True
+    global_hybrid_optimum_certified: bool = False
 
     @property
     def best_fit(self) -> FitResult:
-        return self.selected_model.candidate.raw_fit
+        return self.selected_model.raw_fit
 
 
 @dataclass(frozen=True)

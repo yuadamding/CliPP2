@@ -48,6 +48,9 @@ class FitOptions:
     selection_partition_tol: float = 2e-4
     selection_refit_tol: float = 1e-5
     selection_refit_max_iter: int = 64
+    selection_contract: str = "raw-fusion-only-v0.3"
+    selection_dirichlet_alpha: float = 1.0
+    selection_dirichlet_code_weight: float = 0.7
     objective_shape: str = "unimodal"
     workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES
     compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES
@@ -62,8 +65,20 @@ class FitOptions:
     computation_profile: str = DEFAULT_COMPUTATION_PROFILE
 
     def __post_init__(self) -> None:
+        from ..model_selection.contracts import get_selection_contract
+
         profile = get_computation_profile(self.computation_profile)
         self.computation_profile = profile.name
+        contract = get_selection_contract(self.selection_contract)
+        self.selection_contract = contract.contract_id
+        self.selection_dirichlet_alpha = float(
+            contract.partition_config.classification_alpha
+        )
+        self.selection_dirichlet_code_weight = float(
+            contract.partition_config.classification_code_weight
+        )
+        if contract.force_float64:
+            self.dtype = "float64"
         score = str(self.selection_score).strip().lower().replace("-", "_")
         if score not in {
             "fixed_partition_bic",
@@ -77,6 +92,7 @@ class FitOptions:
             "selection_partition_tol": self.selection_partition_tol,
             "selection_refit_tol": self.selection_refit_tol,
             "certificate_column_tol_scale": self.certificate_column_tol_scale,
+            "selection_dirichlet_alpha": self.selection_dirichlet_alpha,
         }
         for name, value in finite_positive.items():
             if not np.isfinite(float(value)) or float(value) <= 0.0:
@@ -87,6 +103,13 @@ class FitOptions:
             raise ValueError("major_prior must lie strictly in (0, 1).")
         if int(self.selection_refit_max_iter) < 1:
             raise ValueError("selection_refit_max_iter must be positive.")
+        if (
+            not np.isfinite(float(self.selection_dirichlet_code_weight))
+            or float(self.selection_dirichlet_code_weight) < 0.0
+        ):
+            raise ValueError(
+                "selection_dirichlet_code_weight must be nonnegative and finite."
+            )
 
 
 @dataclass

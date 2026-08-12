@@ -48,8 +48,10 @@ from ..core.bic import cluster_sizes_from_labels, compute_partition_dirichlet_sc
 from ..model_selection.candidates import (
     _CachedPartitionRefit,
     _evaluate_candidate,
+    evaluate_direct_partition_candidate,
     validate_candidate_identity,
 )
+from ..model_selection.contracts import get_selection_contract
 from ..model_selection.config import (
     PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT,
 )
@@ -93,6 +95,7 @@ from ..model_selection.scoring import (
 )
 from ..model_selection.types import (
     BICSelectionResult,
+    CandidateRecord,
     CandidateStaticMetadata,
     RawFusionCandidate,
     SelectedModel,
@@ -549,6 +552,8 @@ def _rescore_partition_candidates(
     normalized_score: str,
     bic_df_scale: float,
     bic_cluster_penalty: float,
+    classification_alpha: float,
+    classification_code_weight: float,
 ) -> list[PartitionCandidate]:
     """Put the active selection score in ``PartitionCandidate.bic``.
 
@@ -557,9 +562,10 @@ def _rescore_partition_candidates(
     lets those operations follow the requested criterion while the candidate
     output rows continue to report classic BIC explicitly.
     """
-    # Ward/CEM is proposal-only. The exact-partition Dirichlet score may order
-    # initializer starts,
-    # but it never enters the production selection pool.
+    # This score orders deterministic Ward/CEM proposals and chooses the raw
+    # guide. Under a selectable hybrid contract, the authoritative evaluator
+    # later refits every retained label set and recomputes the common score;
+    # generation-time values never become selection authority directly.
     rescored: list[PartitionCandidate] = []
     for candidate in candidates:
         cluster_sizes = cluster_sizes_from_labels(candidate.labels)
@@ -567,6 +573,8 @@ def _rescore_partition_candidates(
             -float(candidate.fit_loss),
             cluster_sizes,
             data=data,
+            alpha=float(classification_alpha),
+            code_weight=float(classification_code_weight),
         )
         diagnostics = dict(candidate.diagnostics)
         diagnostics["partition_generation_selection_score"] = float(selected_score)
@@ -615,6 +623,87 @@ def _adaptive_stop_certifies_global_optimum(stop_reason: str) -> bool:
     return str(stop_reason) == "online_lambda_global_optimum_certified"
 
 
+def _direct_partition_source(
+    proposal: PartitionCandidate,
+    *,
+    stage: str,
+) -> str:
+    cem = str(proposal.source).startswith("hessian_ward_cem")
+    death = int(proposal.diagnostics.get("component_death_count", 0)) > 0
+    prefix = "pilot" if stage == "pilot" else "final_phi"
+    suffix = "hessian_ward_cem" if cem else "hessian_ward"
+    if cem and death:
+        suffix += "_component_death"
+    return f"{prefix}_{suffix}"
+
+
+def _candidate_record_representatives(
+    records: list[CandidateRecord],
+) -> set[int]:
+    """Choose one deterministic selection representative per final signature."""
+
+    best: dict[str, CandidateRecord] = {}
+    for record in records:
+        if not record.candidate.eligible_for_selection:
+            continue
+        incumbent = best.get(record.partition_signature)
+        candidate_key = (
+            float(record.score.value),
+            float(record.score.numerical_uncertainty),
+            0 if record.candidate.refit.global_optimum_certified else 1,
+            0 if record.family == "raw_fusion" else 1,
+            str(record.candidate.partition.source),
+            (
+                float(record.candidate.raw_fit.lambda_value)
+                if isinstance(record.candidate, RawFusionCandidate)
+                else float("inf")
+            ),
+            int(record.candidate_id),
+        )
+        if incumbent is None:
+            best[record.partition_signature] = record
+            continue
+        incumbent_key = (
+            float(incumbent.score.value),
+            float(incumbent.score.numerical_uncertainty),
+            0 if incumbent.candidate.refit.global_optimum_certified else 1,
+            0 if incumbent.family == "raw_fusion" else 1,
+            str(incumbent.candidate.partition.source),
+            (
+                float(incumbent.candidate.raw_fit.lambda_value)
+                if isinstance(incumbent.candidate, RawFusionCandidate)
+                else float("inf")
+            ),
+            int(incumbent.candidate_id),
+        )
+        if candidate_key < incumbent_key:
+            best[record.partition_signature] = record
+    return {int(record.candidate_id) for record in best.values()}
+
+
+def _select_raw_reference(records: list[CandidateRecord]) -> CandidateRecord:
+    eligible = [
+        record
+        for record in records
+        if isinstance(record.candidate, RawFusionCandidate)
+        and record.candidate.eligible_for_selection
+        and record.candidate.raw_objective_certified
+        and record.candidate.partition.certified
+    ]
+    if not eligible:
+        raise ValueError("Hybrid selection requires a certified raw-fusion reference.")
+    return min(
+        eligible,
+        key=lambda record: (
+            float(record.score.value),
+            float(record.score.numerical_uncertainty),
+            float(record.candidate.raw_fit.lambda_value),
+            float(record.candidate.raw_fit.penalized_objective),
+            int(record.candidate_id),
+        ),
+    )
+
+
 def _assemble_selection_result(
     *,
     search_df,
@@ -631,8 +720,13 @@ def _assemble_selection_result(
     adaptive_refinement_rounds_completed,
     selection_start_time,
     strict_positive_exact_fusion: bool = False,
+    ward_candidate_pool_complete: bool = False,
 ) -> BICSelectionResult:
     search_df = _annotate_bic_diagnostics(search_df)
+    representative_ids = _candidate_record_representatives(result_entries)
+    search_df["signature_selection_representative"] = (
+        search_df["_candidate_id"].astype(int).isin(representative_ids)
+    )
     num_candidates = int(search_df.shape[0])
     converged_mask = search_df["converged"].astype(bool).to_numpy(dtype=bool)
     candidate_selection_eligible_mask = (
@@ -640,6 +734,9 @@ def _assemble_selection_result(
         if strict_positive_exact_fusion
         else _bic_selection_eligible_mask(search_df)
     )
+    candidate_selection_eligible_mask &= search_df[
+        "signature_selection_representative"
+    ].to_numpy(dtype=bool)
     if strict_positive_exact_fusion:
         search_df["bic_selection_eligible"] = candidate_selection_eligible_mask
     num_converged_candidates = int(np.sum(converged_mask))
@@ -692,9 +789,18 @@ def _assemble_selection_result(
         if "mm_consistency_violations" in search_df.columns
         else np.zeros(search_df.shape[0], dtype=float)
     )
+    direct_rows = (
+        search_df.get(
+            "candidate_family",
+            pd.Series("raw_fusion", index=search_df.index),
+        )
+        .astype(str)
+        .eq("direct_partition")
+        .to_numpy(dtype=bool)
+    )
     provisional_mask = (
         np.isfinite(all_scores)
-        & np.isfinite(all_objectives)
+        & (np.isfinite(all_objectives) | direct_rows)
         & (all_mm_violations <= 0.0)
     )
     provisional_df = search_df.loc[provisional_mask].copy()
@@ -859,20 +965,26 @@ def _assemble_selection_result(
     selection_elapsed_seconds = float(perf_counter() - selection_start_time)
     search_df["selection_elapsed_seconds"] = float(selection_elapsed_seconds)
 
-    best_fit, _, selected_candidate = result_entries[int(best_row["_candidate_id"])]
-    if not isinstance(selected_candidate, RawFusionCandidate):
-        raise AssertionError("Selected entry is not a raw fusion candidate.")
+    records_by_id = {int(record.candidate_id): record for record in result_entries}
+    selected_record = records_by_id[int(best_row["_candidate_id"])]
+    selected_candidate = selected_record.candidate
     validate_candidate_identity(selected_candidate)
-    if selected_candidate.raw_fit is not best_fit:
-        raise AssertionError("Selected raw fit identity changed during assembly.")
     if not selected_candidate.eligible_for_selection:
-        raise AssertionError("Ineligible raw fusion candidate reached selection.")
+        raise AssertionError("Ineligible partition candidate reached selection.")
+    raw_reference_record = _select_raw_reference(result_entries)
+    raw_reference = raw_reference_record.candidate
+    if not isinstance(raw_reference, RawFusionCandidate):  # pragma: no cover
+        raise AssertionError("Raw-reference selection returned a direct partition.")
+    validate_candidate_identity(raw_reference)
+    selected_is_raw = isinstance(selected_candidate, RawFusionCandidate)
     selected_model = SelectedModel(
-        candidate=selected_candidate,
-        selected_lambda=float(best_row["lambda"]),
+        raw_reference=raw_reference,
+        partition_candidate=selected_candidate,
         selected_partition_signature=str(selected_candidate.partition.signature),
-        selected_partition_left_lambda=selected_lambda_left,
-        selected_partition_right_lambda=selected_lambda_right,
+        selected_candidate_family=("raw_fusion" if selected_is_raw else "direct_partition"),
+        selected_lambda=(float(best_row["lambda"]) if selected_is_raw else None),
+        selected_partition_left_lambda=(selected_lambda_left if selected_is_raw else None),
+        selected_partition_right_lambda=(selected_lambda_right if selected_is_raw else None),
     )
     search_df = search_df.drop(columns=["_candidate_id"])
     return BICSelectionResult(
@@ -913,6 +1025,10 @@ def _assemble_selection_result(
         best_score_certified_kkt_residual=best_score_certified_kkt_residual,
         selection_optimizer_limited=selection_optimizer_limited,
         selection_optimizer_limited_reason=selection_optimizer_limited_reason,
+        ward_candidate_pool_complete=bool(ward_candidate_pool_complete),
+        raw_lambda_path_resolved=bool(adaptive_search_global_optimum_certified),
+        best_over_evaluated_candidates=True,
+        global_hybrid_optimum_certified=bool(selection_optimum_resolved),
     )
 
 
@@ -922,30 +1038,27 @@ def _partition_guided_admm_selection(
     fit_options: FitOptions,
     use_warm_starts: bool,
 ) -> BICSelectionResult:
-    """Select a positive pairwise-fusion fit with an online ADMM lambda search.
+    """Run the certified raw path and select under one immutable contract.
 
-    The best Ward/CEM exact-partition Dirichlet guide defines the adaptive graph,
-    supplies the primal start, and sets the initial lambda scale. The graph is
-    then frozen for the complete raw-fusion path; Ward/CEM rows themselves are
-    never selectable. A likelihood-curvature noise floor distributed over a
-    mild degree^1.05 complete-graph correction bounds the pairwise weight
-    contrast. Blockwise KKT capacity supplies the first positive lambda and
-    actual-dual state. Every subsequent lambda is proposed one at a time from
-    observed certified ADMM fits; no lambda grid or multiplier sequence exists
-    in this mode.
+    Ward/CEM supplies the primal start and initial-lambda scale. The contract
+    declares whether the guide or zero-penalty pilot defines the frozen graph,
+    and whether retained pilot/final-raw-phi partitions enter the secondary
+    selection pool. Direct proposals are evaluated only after the raw lambda
+    controller terminates, so they cannot steer or replace the raw optimizer.
     """
 
     selection_start_time = perf_counter()
     computation_profile = get_computation_profile(
         fit_options.computation_profile
     )
+    selection_contract = get_selection_contract(fit_options.selection_contract)
     bic_df_scale = 1.0
     bic_cluster_penalty = 0.0
     selection_score = str(fit_options.selection_score)
     normalized_score = selection_score
-    profile_name = (
-        f"{computation_profile.name}_partition_guided_admm_{selection_score}"
-    )
+    profile_name = f"{computation_profile.name}_partition_guided_admm_{selection_score}"
+    if selection_contract.contract_id != "raw-fusion-only-v0.3":
+        profile_name += f"_{selection_contract.contract_id}"
     selection_method = "online_partition_guided_admm"
     if int(data.num_mutations) < 2:
         raise ValueError(
@@ -1011,9 +1124,13 @@ def _partition_guided_admm_selection(
     )
     partition_guide_matrix_hash = _pilot_matrix_hash(guide_phi)
     if fit_options.graph is None:
-        graph_builder_phi: StartArray = (
-            guide_phi if computation_profile.is_strict else pilot_phi
-        )
+        graph_pilot_source = str(selection_contract.graph_pilot_source)
+        if graph_pilot_source == "partition_guide":
+            graph_builder_phi = guide_phi
+        elif graph_pilot_source == "zero_penalty_pilot":
+            graph_builder_phi = pilot_phi
+        else:
+            graph_builder_phi = guide_phi if computation_profile.is_strict else pilot_phi
         complete_graph_degree = float(max(int(data.num_mutations) - 1, 1))
         likelihood_noise_degree_exponent = float(
             PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT
@@ -1032,7 +1149,7 @@ def _partition_guided_admm_selection(
         )
         graph_source = (
             "partition_guide_likelihood_noise_degree_regularized"
-            if computation_profile.is_strict
+            if graph_builder_phi is guide_phi
             else "zero_penalty_likelihood_pilot_degree_regularized"
         )
         graph_pilot_phi: StartArray = graph_builder_phi
@@ -1129,13 +1246,7 @@ def _partition_guided_admm_selection(
         ),
     )
 
-    result_entries: list[
-        tuple[
-            FitResult,
-            dict[str, float | int | str | bool],
-            RawFusionCandidate,
-        ]
-    ] = []
+    result_entries: list[CandidateRecord] = []
     fit_by_lambda: dict[float, FitResult] = {}
     attempts_by_lambda: dict[float, list[FitResult]] = {}
     bic_refit_cache: dict[object, _CachedPartitionRefit] = {}
@@ -1144,8 +1255,6 @@ def _partition_guided_admm_selection(
     )
     scalar_likelihood_pilot_hash = _pilot_matrix_hash(pilot_phi)
     next_step = 0
-    terminal_stop_reason: str | None = None
-
     while True:
         proposal = controller.propose()
         if proposal is None:
@@ -1564,13 +1673,22 @@ def _partition_guided_admm_selection(
                 "adaptive_transition_probe_max_candidates": 0,
                 "adaptive_initial_lambda_count": 1,
                 "likelihood_partition_pool_enabled": True,
-                "likelihood_partition_selection_enabled": False,
+                "likelihood_partition_selection_enabled": bool(
+                    selection_contract.selectable_partition_pool
+                ),
                 **_partition_pool_row_metadata(initializer_pool),
             }
         )
         candidate_id = int(len(result_entries))
         row["_candidate_id"] = candidate_id
-        result_entries.append((fit, row, artifact))
+        row["candidate_id"] = candidate_id
+        result_entries.append(
+            CandidateRecord(
+                candidate_id=candidate_id,
+                candidate=artifact,
+                row=row,
+            )
+        )
         incumbent = fit_by_lambda.get(lambda_key)
         if _prefer_fit_candidate(fit, incumbent):
             fit_by_lambda[lambda_key] = fit
@@ -1630,20 +1748,135 @@ def _partition_guided_admm_selection(
             )
         )
         next_step += 1
+
+    ward_candidate_pool_complete = False
+    if selection_contract.selectable_partition_pool:
+        direct_proposals: list[
+            tuple[
+                PartitionCandidate,
+                str,
+                CandidateRecord | None,
+                PartitionInitializerPool,
+            ]
+        ] = [
+            (proposal, "pilot", None, initializer_pool)
+            for proposal in initializer_pool.candidates
+        ]
+        config = selection_contract.partition_config
+        if config.include_final_phi_ladder and config.final_phi_ladder_kmax > 0:
+            raw_parent_records = sorted(
+                (
+                    record
+                    for record in result_entries
+                    if isinstance(record.candidate, RawFusionCandidate)
+                    and record.candidate.eligible_for_selection
+                ),
+                key=lambda record: (
+                    float(record.score.value),
+                    float(record.score.numerical_uncertainty),
+                    float(record.candidate.raw_fit.lambda_value),
+                    int(record.candidate_id),
+                ),
+            )[: int(config.final_phi_parent_count)]
+            final_k_grid = tuple(
+                range(
+                    1,
+                    min(
+                        int(config.final_phi_ladder_kmax),
+                        int(data.num_mutations),
+                    )
+                    + 1,
+                )
+            )
+            for parent_record in raw_parent_records:
+                parent = parent_record.candidate
+                if not isinstance(parent, RawFusionCandidate):  # pragma: no cover
+                    continue
+                final_pool = generate_partition_initializer_pool(
+                    data=data,
+                    pilot_phi=np.asarray(parent.raw_fit.phi, dtype=np.float64),
+                    fit_options=effective_fit_options,
+                    normalized_score="partition_icl",
+                    runtime=runtime,
+                    torch_data=torch_data,
+                    rescore_candidates=_rescore_partition_candidates,
+                    bic_df_scale=float(bic_df_scale),
+                    bic_cluster_penalty=float(bic_cluster_penalty),
+                    declared_k_grid=final_k_grid,
+                    enable_refinement=False,
+                )
+                direct_proposals.extend(
+                    (proposal, "final_phi", parent_record, final_pool)
+                    for proposal in final_pool.candidates
+                )
+
+        for proposal, stage, parent_record, proposal_pool in direct_proposals:
+            parent_candidate = (
+                None if parent_record is None else parent_record.candidate
+            )
+            parent_raw = (
+                parent_candidate
+                if isinstance(parent_candidate, RawFusionCandidate)
+                else None
+            )
+            source = _direct_partition_source(proposal, stage=stage)
+            candidate_id = int(len(result_entries))
+            direct_row, direct_candidate = evaluate_direct_partition_candidate(
+                data=data,
+                proposal=proposal,
+                selection_options=effective_fit_options,
+                candidate_id=candidate_id,
+                source=source,
+                parent_raw_candidate_id=(
+                    None if parent_record is None else int(parent_record.candidate_id)
+                ),
+                parent_raw_lambda=(
+                    None
+                    if parent_raw is None
+                    else float(parent_raw.raw_fit.lambda_value)
+                ),
+                parent_raw_phi_hash=(
+                    ""
+                    if parent_raw is None
+                    else _pilot_matrix_hash(parent_raw.raw_fit.phi)
+                ),
+                generation_contract_id=selection_contract.contract_id,
+                refit_cache=bic_refit_cache,
+            )
+            direct_row.update(
+                {
+                    "selection_method": selection_method,
+                    "selection_profile": profile_name,
+                    "search_round": int(next_step),
+                    "search_phase": f"{stage}_direct_partition_pool",
+                    "lambda_search_mode": "partition_guided_admm",
+                    "candidate_role": "secondary_partition_selection",
+                    "likelihood_partition_pool_enabled": True,
+                    "likelihood_partition_selection_enabled": True,
+                    "ward_candidate_pool_complete": True,
+                    **_partition_pool_row_metadata(proposal_pool),
+                }
+            )
+            result_entries.append(
+                CandidateRecord(
+                    candidate_id=candidate_id,
+                    candidate=direct_candidate,
+                    row=direct_row,
+                )
+            )
+            next_step += 1
+        ward_candidate_pool_complete = True
+
     if not result_entries:
         raise RuntimeError(
             f"No guided ADMM candidates were evaluated for tumor {data.tumor_id}."
         )
     search_df = (
-        pd.DataFrame([row for _, row, _ in result_entries])
+        pd.DataFrame([record.row for record in result_entries])
         .sort_values(["lambda", "selection_step"])
         .reset_index(drop=True)
     )
-    stop_reason = str(
-        terminal_stop_reason
-        or controller.stop_reason
-        or "online_lambda_no_terminal_reason"
-    )
+    stop_reason = str(controller.stop_reason or "online_lambda_no_terminal_reason")
     refinement_rounds = sum(
         1 for proposal in controller.proposal_history if "refine" in str(proposal.phase)
     )
@@ -1661,7 +1894,10 @@ def _partition_guided_admm_selection(
         adaptive_search_rounds_completed=int(len(controller.proposal_history)),
         adaptive_refinement_rounds_completed=int(refinement_rounds),
         selection_start_time=selection_start_time,
-        strict_positive_exact_fusion=True,
+        strict_positive_exact_fusion=not bool(
+            selection_contract.selectable_partition_pool
+        ),
+        ward_candidate_pool_complete=bool(ward_candidate_pool_complete),
     )
 
 

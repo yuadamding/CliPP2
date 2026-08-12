@@ -7,8 +7,6 @@ import numpy as np
 
 from ..core.bic import (
     DIRICHLET_EXACT_PARTITION_MODEL_ID,
-    PARTITION_DIRICHLET_ALPHA,
-    PARTITION_DIRICHLET_SCORE_WEIGHT,
     cluster_sizes_from_labels,
     compute_bic_with_df,
     compute_dirichlet_exact_partition_log_mass,
@@ -17,8 +15,10 @@ from ..core.bic import (
     fixed_partition_dirichlet_score,
 )
 from ..core.model import FitOptions, FitResult, fit_fixed_objective
+from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.fusion.refit import (
     PartitionRefitResult,
+    _canonical_labels as _canonical_partition_labels,
     partition_constrained_observed_refit,
 )
 from ..core.fusion.profiles import get_computation_profile
@@ -28,7 +28,9 @@ from .partitions import (
     _cluster_sizes_text,
     _partition_signature,
     extract_certified_fusion_partition,
+    extract_connected_component_partition,
 )
+from .contracts import get_selection_contract
 from .scoring import (
     _effective_bic_partition_tol,
     _normalize_selection_score_name,
@@ -36,34 +38,35 @@ from .scoring import (
 )
 from .types import (
     CandidateStaticMetadata,
+    DirectPartition,
+    DirectPartitionCandidate,
     FusionPartition,
     PartitionRefitSummary,
     RawFusionCandidate,
     SelectionScore,
+    SelectablePartitionCandidate,
     StartArray,
 )
 
 
-def validate_candidate_identity(candidate: RawFusionCandidate) -> None:
-    """Fail fast when raw partition, refit, and score identities diverge."""
+def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None:
+    """Fail fast when partition, refit, score, or estimator identity diverges."""
 
     partition = candidate.partition
     refit = candidate.refit
     score = candidate.score
     if not np.array_equal(partition.labels, refit.labels):
-        raise AssertionError("Fixed-partition refit changed raw fusion labels.")
+        raise AssertionError("Fixed-partition refit changed selected labels.")
     actual_signature = _partition_signature(
         partition.labels,
         partition.mutation_ids if partition.mutation_ids else None,
     )
     if partition.signature != actual_signature:
-        raise AssertionError(
-            "Raw fusion partition signature does not match its labels."
-        )
+        raise AssertionError("Partition signature does not match its labels.")
     if int(partition.n_clusters) != int(np.unique(partition.labels).size):
-        raise AssertionError("Raw fusion partition cluster count is inconsistent.")
+        raise AssertionError("Partition cluster count is inconsistent.")
     if refit.partition_signature != partition.signature:
-        raise AssertionError("Refit partition signature does not match raw partition.")
+        raise AssertionError("Refit partition signature does not match partition.")
     if score.partition_signature != partition.signature:
         raise AssertionError("Selection score does not match raw partition.")
     if str(score.name).startswith("clonal_"):
@@ -89,22 +92,19 @@ def validate_candidate_identity(candidate: RawFusionCandidate) -> None:
         }
     )
     if dirichlet_score:
+        contract = get_selection_contract(score.selection_contract_id)
+        expected_weight = float(
+            contract.partition_config.classification_code_weight
+        )
+        expected_alpha = float(contract.partition_config.classification_alpha)
         if not np.isclose(
-            float(score.assignment_code_weight),
-            PARTITION_DIRICHLET_SCORE_WEIGHT,
-            rtol=0.0,
-            atol=0.0,
+            float(score.assignment_code_weight), expected_weight, rtol=0.0, atol=0.0
         ):
-            raise AssertionError(
-                "Dirichlet allocation-code weight differs from production."
-            )
+            raise AssertionError("Dirichlet code weight differs from its contract.")
         if not np.isclose(
-            float(score.assignment_dirichlet_alpha),
-            PARTITION_DIRICHLET_ALPHA,
-            rtol=0.0,
-            atol=0.0,
+            float(score.assignment_dirichlet_alpha), expected_alpha, rtol=0.0, atol=0.0
         ):
-            raise AssertionError("Dirichlet alpha differs from production.")
+            raise AssertionError("Dirichlet alpha differs from its contract.")
         if str(score.assignment_model_id) != DIRICHLET_EXACT_PARTITION_MODEL_ID:
             raise AssertionError("Dirichlet assignment-model provenance is missing.")
         if str(score.assignment_symmetry_mode) != "all_blocks_exchangeable":
@@ -177,6 +177,20 @@ def validate_candidate_identity(candidate: RawFusionCandidate) -> None:
     expected_phi = np.asarray(refit.cluster_centers)[np.asarray(refit.labels)]
     if not np.allclose(np.asarray(refit.phi), expected_phi, rtol=0.0, atol=1e-12):
         raise AssertionError("Refit phi does not match centers indexed by labels.")
+    if isinstance(candidate, RawFusionCandidate):
+        if candidate.eligible_for_selection and (
+            not candidate.raw_objective_certified or not candidate.partition.certified
+        ):
+            raise AssertionError("Selectable raw candidates require both certificates.")
+    elif isinstance(candidate, DirectPartitionCandidate):
+        if not candidate.partition.deterministic_generation:
+            raise AssertionError("Direct partition generation is not deterministic.")
+        if candidate.partition.mutation_ids != tuple(
+            str(value) for value in partition.mutation_ids
+        ):
+            raise AssertionError("Direct partition mutation identity changed.")
+    else:  # pragma: no cover - union exhaustiveness guard
+        raise TypeError(f"Unsupported candidate type: {type(candidate)!r}")
 
 
 def _ineligibility_reason(
@@ -207,6 +221,26 @@ def _ineligibility_reason(
     return "none"
 
 
+def _direct_partition_ineligibility_reason(
+    *,
+    partition: DirectPartition,
+    refit: PartitionRefitSummary,
+    score: SelectionScore,
+    require_global_refit: bool,
+) -> str:
+    if partition.n_clusters < 1:
+        return "empty_partition"
+    if not partition.deterministic_generation:
+        return "nondeterministic_partition_generation"
+    if not refit.finite_candidate_found:
+        return "fixed_partition_refit_nonfinite"
+    if require_global_refit and not refit.global_optimum_certified:
+        return "fixed_partition_refit_numerically_unresolved"
+    if not np.isfinite(score.value):
+        return "fixed_partition_score_nonfinite"
+    return "none"
+
+
 @dataclass(frozen=True)
 class _CachedPartitionRefit:
     result: PartitionRefitResult
@@ -223,12 +257,12 @@ def _likelihood_model_id(data: TumorData) -> str:
 def _selection_refit_cache_key(
     *,
     data: TumorData,
-    partition: FusionPartition,
+    partition_signature: str,
     selection_options: FitOptions,
 ) -> tuple[object, ...]:
     profile = get_computation_profile(selection_options.computation_profile)
     return (
-        partition.signature,
+        str(partition_signature),
         float(selection_options.major_prior),
         float(selection_options.eps),
         float(selection_options.selection_refit_tol),
@@ -237,21 +271,22 @@ def _selection_refit_cache_key(
         str(profile.scalar_mode),
         int(profile.scalar_grid_points),
         int(profile.scalar_local_steps),
-        "unanchored_profiled_partition_refit_v3",
+        "unanchored_profiled_partition_refit_v4",
     )
 
 
-def _fixed_partition_refit(
+def _fixed_labels_refit(
     *,
     data: TumorData,
-    partition: FusionPartition,
+    labels: np.ndarray,
+    partition_signature: str,
     selection_options: FitOptions,
     cache: dict[object, _CachedPartitionRefit] | None,
 ) -> tuple[_CachedPartitionRefit, bool]:
     profile = get_computation_profile(selection_options.computation_profile)
     refit_spec_key = _selection_refit_cache_key(
         data=data,
-        partition=partition,
+        partition_signature=partition_signature,
         selection_options=selection_options,
     )
     if cache is not None and refit_spec_key in cache:
@@ -268,7 +303,7 @@ def _fixed_partition_refit(
     )
     refined = partition_constrained_observed_refit(
         data,
-        partition.labels,
+        np.asarray(labels, dtype=np.int64),
         **kwargs,
     )
     loglik_delta = float(refined.global_optimality_gap)
@@ -302,6 +337,24 @@ def _fixed_partition_refit(
     if cache is not None:
         cache[refit_spec_key] = cached
     return cached, False
+
+
+def _fixed_partition_refit(
+    *,
+    data: TumorData,
+    partition: FusionPartition,
+    selection_options: FitOptions,
+    cache: dict[object, _CachedPartitionRefit] | None,
+) -> tuple[_CachedPartitionRefit, bool]:
+    """Compatibility wrapper around the source-neutral fixed-label refit."""
+
+    return _fixed_labels_refit(
+        data=data,
+        labels=partition.labels,
+        partition_signature=partition.signature,
+        selection_options=selection_options,
+        cache=cache,
+    )
 
 
 def _build_refit_summary(
@@ -365,6 +418,50 @@ def _selection_score_diagnostics(
             effective_bic_depth_count(data),
         ),
     }
+
+
+def _score_fixed_labels(
+    *,
+    data: TumorData,
+    labels: np.ndarray,
+    partition_signature: str,
+    refit_result: PartitionRefitResult,
+    selection_options: FitOptions,
+    selection_score: str,
+) -> SelectionScore:
+    canonical_score_name = _normalize_selection_score_name(selection_score)
+    computation_profile = get_computation_profile(
+        selection_options.computation_profile
+    )
+    score_function = (
+        fixed_partition_dirichlet_score
+        if canonical_score_name == "fixed_partition_dirichlet_score"
+        else fixed_partition_bic
+    )
+    score_kwargs: dict[str, object] = {
+        "loglik": float(refit_result.loglik),
+        "num_clusters": int(np.unique(labels).size),
+        "data": data,
+        "partition_signature": str(partition_signature),
+        "labels": np.asarray(labels, dtype=np.int64),
+        "loglik_uncertainty": (
+            float(refit_result.global_optimality_gap)
+            if computation_profile.is_strict
+            else 0.0
+        ),
+        "selection_contract_id": str(selection_options.selection_contract),
+    }
+    if canonical_score_name == "fixed_partition_dirichlet_score":
+        score_kwargs.update(
+            alpha=float(selection_options.selection_dirichlet_alpha),
+            code_weight=float(selection_options.selection_dirichlet_code_weight),
+        )
+    score = score_function(**score_kwargs)
+    if str(score.name) != canonical_score_name:
+        raise AssertionError(
+            f"Requested score {canonical_score_name} produced {score.name}."
+        )
+    return score
 
 
 def _evaluate_candidate(
@@ -433,7 +530,13 @@ def _evaluate_candidate(
             "Model-selection candidates require a resolved pairwise-fusion graph."
         )
     partition_tolerance = _effective_bic_partition_tol(selection_options)
-    partition = extract_certified_fusion_partition(
+    contract = get_selection_contract(selection_options.selection_contract)
+    partition_extractor = (
+        extract_connected_component_partition
+        if contract.raw_partition_rule == "legacy_connected_components"
+        else extract_certified_fusion_partition
+    )
+    partition = partition_extractor(
         fit,
         graph=graph,
         tolerance=partition_tolerance,
@@ -452,30 +555,14 @@ def _evaluate_candidate(
         0.0 if cache_hit else float(perf_counter() - refit_start_time)
     )
 
-    score_function = (
-        fixed_partition_dirichlet_score
-        if canonical_score_name
-        in {
-            "fixed_partition_dirichlet_score",
-        }
-        else fixed_partition_bic
-    )
-    score = score_function(
-        loglik=float(refit_result.loglik),
-        num_clusters=int(partition.n_clusters),
+    score = _score_fixed_labels(
         data=data,
-        partition_signature=partition.signature,
         labels=partition.labels,
-        loglik_uncertainty=(
-            float(refit_result.global_optimality_gap)
-            if computation_profile.is_strict
-            else 0.0
-        ),
+        partition_signature=partition.signature,
+        refit_result=refit_result,
+        selection_options=selection_options,
+        selection_score=canonical_score_name,
     )
-    if str(score.name) != canonical_score_name:
-        raise AssertionError(
-            f"Requested score {canonical_score_name} produced {score.name}."
-        )
     refit = _build_refit_summary(
         refit_result,
         partition_signature=partition.signature,
@@ -522,6 +609,8 @@ def _evaluate_candidate(
     row: dict[str, float | int | str | bool] = {
         "tumor_id": data.tumor_id,
         "selection_method": selection_method,
+        "selection_contract_id": str(contract.contract_id),
+        "selection_contract_json": str(contract.to_json()),
         "selection_profile": profile_name,
         "computation_profile": str(computation_profile.name),
         "target_estimator": "complete_graph_pairwise_fusion",
@@ -547,6 +636,7 @@ def _evaluate_candidate(
         "raw_objective_uncertainty_certified": False,
         "lambda_applicable": True,
         "candidate_pool_source": "raw_fused_lambda_path",
+        "candidate_family": "raw_fusion",
         "estimator_role": str(fit.estimator_role),
         "selection_score_name": str(score.name),
         "selection_score": float(score.value),
@@ -621,6 +711,7 @@ def _evaluate_candidate(
         "partition_source": str(partition.source),
         "partition_tol": float(partition.tolerance),
         "partition_certified": bool(partition.certified),
+        "partition_certification_applicable": True,
         "partition_maximal": bool(partition.maximal),
         "partition_cross_close_edge_found": bool(partition.cross_close_edge_found),
         "partition_certificate_graph_hash_matches": bool(
@@ -634,6 +725,9 @@ def _evaluate_candidate(
         "n_clusters": int(partition.n_clusters),
         "bic_n_clusters": int(partition.n_clusters),
         "cluster_sizes": _cluster_sizes_text(partition.labels),
+        "partition_labels_0based": ",".join(
+            str(int(value)) for value in np.asarray(partition.labels, dtype=np.int64)
+        ),
         "eligible_for_selection": bool(candidate.eligible_for_selection),
         "bic_selection_eligible": bool(candidate.eligible_for_selection),
         "selection_eligible": bool(candidate.eligible_for_selection),
@@ -721,10 +815,244 @@ def _evaluate_candidate(
     return fit, row, candidate
 
 
+def evaluate_direct_partition_candidate(
+    *,
+    data: TumorData,
+    proposal: PartitionCandidate,
+    selection_options: FitOptions,
+    candidate_id: int,
+    source: str,
+    parent_raw_candidate_id: int | None,
+    parent_raw_lambda: float | None,
+    generation_contract_id: str,
+    refit_cache: dict[object, _CachedPartitionRefit] | None,
+    parent_raw_phi_hash: str = "",
+) -> tuple[dict[str, object], DirectPartitionCandidate]:
+    """Evaluate one deterministic non-fusion partition under the common score."""
+
+    started = perf_counter()
+    labels = _canonical_partition_labels(
+        np.asarray(proposal.labels, dtype=np.int64).reshape(-1)
+    )
+    mutation_ids = tuple(str(value) for value in data.mutation_ids)
+    signature = _partition_signature(labels, mutation_ids)
+    n_clusters = int(np.unique(labels).size)
+    requested_k_value = proposal.diagnostics.get("requested_K", proposal.K)
+    requested_k = int(round(float(requested_k_value)))
+    pre_signature = str(
+        proposal.diagnostics.get("pre_refinement_signature", signature)
+    )
+    partition = DirectPartition(
+        labels=labels,
+        signature=signature,
+        n_clusters=n_clusters,
+        source=source,
+        requested_k=requested_k,
+        mutation_ids=mutation_ids,
+        generation_contract_id=str(generation_contract_id),
+        parent_raw_candidate_id=parent_raw_candidate_id,
+        parent_raw_lambda=parent_raw_lambda,
+        parent_raw_phi_hash=str(parent_raw_phi_hash),
+        pre_refinement_signature=pre_signature,
+        cem_iterations=int(proposal.diagnostics.get("cem_iterations", 0.0)),
+        component_death_count=int(
+            proposal.diagnostics.get("component_death_count", 0.0)
+        ),
+        refinement_score_before=float(
+            proposal.diagnostics.get("refinement_score_before", np.nan)
+        ),
+        refinement_score_after=float(
+            proposal.diagnostics.get("refinement_score_after", np.nan)
+        ),
+        deterministic_generation=bool(
+            proposal.diagnostics.get("deterministic_generation", 1.0)
+        ),
+    )
+    cached_refit, cache_hit = _fixed_labels_refit(
+        data=data,
+        labels=labels,
+        partition_signature=signature,
+        selection_options=selection_options,
+        cache=refit_cache,
+    )
+    refit_result = cached_refit.result
+    score = _score_fixed_labels(
+        data=data,
+        labels=labels,
+        partition_signature=signature,
+        refit_result=refit_result,
+        selection_options=selection_options,
+        selection_score=selection_options.selection_score,
+    )
+    refit = _build_refit_summary(
+        refit_result,
+        partition_signature=signature,
+        nominal_df=int(score.degrees_of_freedom),
+        resolution=cached_refit,
+    )
+    profile = get_computation_profile(selection_options.computation_profile)
+    reason = _direct_partition_ineligibility_reason(
+        partition=partition,
+        refit=refit,
+        score=score,
+        require_global_refit=bool(profile.is_strict),
+    )
+    candidate = DirectPartitionCandidate(
+        partition=partition,
+        refit=refit,
+        score=score,
+        eligible_for_selection=reason == "none",
+        ineligibility_reason=reason,
+        computation_profile=str(profile.name),
+    )
+    validate_candidate_identity(candidate)
+    score_diagnostics = _selection_score_diagnostics(
+        data=data,
+        refit=refit,
+        score=score,
+    )
+    row: dict[str, object] = {
+        "_candidate_id": int(candidate_id),
+        "tumor_id": str(data.tumor_id),
+        "candidate_id": int(candidate_id),
+        "candidate_family": "direct_partition",
+        "candidate_pool_source": str(source),
+        "partition_source": str(source),
+        "partition_signature": str(signature),
+        "selection_model_signature": str(signature),
+        "partition_hash": str(signature),
+        "requested_K": int(requested_k),
+        "n_clusters": int(n_clusters),
+        "bic_n_clusters": int(n_clusters),
+        "cluster_sizes": _cluster_sizes_text(labels),
+        "partition_labels_0based": ",".join(str(int(value)) for value in labels),
+        "lambda": float("nan"),
+        "lambda_applicable": False,
+        "parent_raw_candidate_id": (
+            float("nan")
+            if parent_raw_candidate_id is None
+            else int(parent_raw_candidate_id)
+        ),
+        "parent_raw_lambda": (
+            float("nan") if parent_raw_lambda is None else float(parent_raw_lambda)
+        ),
+        "parent_raw_phi_hash": str(parent_raw_phi_hash),
+        "selection_contract_id": str(generation_contract_id),
+        "selection_contract_json": get_selection_contract(
+            generation_contract_id
+        ).to_json(),
+        "generation_contract_id": str(generation_contract_id),
+        "pre_refinement_signature": str(pre_signature),
+        "cem_iterations": int(partition.cem_iterations),
+        "component_death_count": int(partition.component_death_count),
+        "refinement_score_before": float(partition.refinement_score_before),
+        "refinement_score_after": float(partition.refinement_score_after),
+        "deterministic_partition_generation": bool(
+            partition.deterministic_generation
+        ),
+        "direct_partition_identity_certified": True,
+        "partition_certified": False,
+        "partition_certification_applicable": False,
+        # These are fusion-summary predicates, not direct-partition
+        # certification claims.  The direct candidate is certified through
+        # its deterministic identity, fixed-label refit, and reconstructible
+        # score instead.
+        "partition_maximal": False,
+        "partition_diameter_exact": False,
+        "partition_max_diameter": float("nan"),
+        "partition_certification_failure_reason": "not_applicable_direct_partition",
+        "selection_score_name": str(score.name),
+        "selection_score": float(score.value),
+        "selection_score_numerical_uncertainty": float(score.numerical_uncertainty),
+        "selection_score_lower_bound": float(score.lower_bound),
+        "selection_score_upper_bound": float(score.upper_bound),
+        "selection_loglik": float(score.loglik),
+        "selection_df": int(score.degrees_of_freedom),
+        "selection_penalty": float(score.penalty),
+        "selection_n_eff": int(score.n_eff),
+        "selection_bic_penalty": float(score.penalty - score.assignment_penalty),
+        "selection_assignment_log_evidence": float(score.assignment_log_evidence),
+        "selection_assignment_code_weight": float(score.assignment_code_weight),
+        "selection_assignment_penalty": float(score.assignment_penalty),
+        "selection_assignment_dirichlet_alpha": float(
+            score.assignment_dirichlet_alpha
+        ),
+        "selection_assignment_model_id": str(score.assignment_model_id),
+        "selection_assignment_symmetry_mode": str(score.assignment_symmetry_mode),
+        "selection_assignment_arithmetic_uncertainty": float(
+            score.assignment_arithmetic_uncertainty
+        ),
+        "classic_bic": float(score_diagnostics["classic_bic"]),
+        "bic": float(score_diagnostics["classic_bic"]),
+        "bic_value": float(score_diagnostics["classic_bic"]),
+        "fixed_partition_bic": float(score_diagnostics["classic_bic"]),
+        "fixed_partition_dirichlet_score": (
+            float(score.value)
+            if score.name == "fixed_partition_dirichlet_score"
+            else float("nan")
+        ),
+        "bic_loglik": float(score.loglik),
+        "bic_loglik_source": str(refit.loglik_source),
+        "bic_df": int(score.degrees_of_freedom),
+        "bic_active_df": int(refit.active_df),
+        "bic_n_eff": int(score.n_eff),
+        "bic_refit_finite_candidate_found": bool(refit.finite_candidate_found),
+        "bic_refit_cache_hit": bool(cache_hit),
+        "refit_global_optimum_certified": bool(refit.global_optimum_certified),
+        "refit_global_lower_bound": float(refit.global_lower_bound),
+        "refit_global_optimality_gap": float(refit.global_optimality_gap),
+        "refit_global_certificate_method": str(refit.global_certificate_method),
+        "refit_global_certificate_intervals": int(
+            refit.global_certificate_intervals
+        ),
+        "refit_numerically_resolved": bool(refit.refit_numerically_resolved),
+        "refit_loglik": float(refit.loglik),
+        "refit_fit_loss": float(refit.fit_loss),
+        "refit_active_df": int(refit.active_df),
+        "refit_mode": str(refit.refit_mode),
+        "refit_coordinate_count": int(refit.refit_coordinate_count),
+        "refit_finite_coordinate_count": int(refit.refit_finite_coordinate_count),
+        "refit_total_grid_points": int(refit.refit_total_grid_points),
+        "refit_max_grid_spacing": float(refit.refit_max_grid_spacing),
+        "refit_total_candidate_basins": int(refit.refit_total_candidate_basins),
+        "refit_total_refined_candidates": int(
+            refit.refit_total_refined_candidates
+        ),
+        "refit_min_best_second_loss_gap": float(
+            refit.refit_min_best_second_loss_gap
+        ),
+        "eligible_for_selection": bool(candidate.eligible_for_selection),
+        "bic_selection_eligible": bool(candidate.eligible_for_selection),
+        "selection_eligible": bool(candidate.eligible_for_selection),
+        "ineligibility_reason": str(candidate.ineligibility_reason),
+        "converged": bool(refit.finite_candidate_found),
+        "estimator_role": "direct_partition_candidate",
+        "raw_objective_certified": False,
+        "raw_kkt_eligible": False,
+        "objective_faithful": False,
+        "raw_certificate_status": "not_applicable_direct_partition",
+        "full_kkt_certified": False,
+        "full_kkt_certificate_status": "not_applicable_direct_partition",
+        "fixed_objective_kkt_residual": float("nan"),
+        "raw_kkt_residual": float("nan"),
+        "penalized_objective": float("nan"),
+        "raw_objective": float("nan"),
+        "mm_consistency_violations": 0,
+        "selection_step": int(candidate_id),
+        "candidate_elapsed_seconds": float(perf_counter() - started),
+        "computation_profile": str(profile.name),
+        "primary_phi_source": "raw_pairwise_fusion_reference",
+        "refit_phi_source": "selected_direct_partition_refit",
+    }
+    return row, candidate
+
+
 __all__ = [
     "_evaluate_candidate",
+    "_fixed_labels_refit",
     "_fixed_partition_refit",
     "_selection_refit_cache_key",
     "_selection_score_diagnostics",
+    "evaluate_direct_partition_candidate",
     "validate_candidate_identity",
 ]

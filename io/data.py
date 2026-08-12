@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,35 +367,6 @@ def tumor_objective_fingerprint(data: TumorData) -> str:
     return digest.hexdigest()
 
 
-def _first_seen(values: pd.Series) -> list[str]:
-    return list(pd.Index(values.astype(str)).drop_duplicates())
-
-
-def _parse_bool_like(value: object, *, column_name: str) -> bool:
-    if isinstance(value, (bool, np.bool_)):
-        return bool(value)
-    if value is None or (isinstance(value, float) and np.isnan(value)):
-        raise ValueError(f"Missing boolean value in column '{column_name}'.")
-    if isinstance(value, (int, np.integer)):
-        if int(value) in {0, 1}:
-            return bool(int(value))
-        raise ValueError(
-            f"Invalid integer boolean value {value!r} in column '{column_name}'."
-        )
-    if isinstance(value, (float, np.floating)):
-        if float(value) in {0.0, 1.0}:
-            return bool(int(value))
-        raise ValueError(
-            f"Invalid float boolean value {value!r} in column '{column_name}'."
-        )
-    normalized = str(value).strip().lower()
-    if normalized in {"true", "t", "yes", "y", "1"}:
-        return True
-    if normalized in {"false", "f", "no", "n", "0"}:
-        return False
-    raise ValueError(f"Invalid boolean value {value!r} in column '{column_name}'.")
-
-
 def _safe_probability(
     scale: np.ndarray, multiplicity: np.ndarray, phi: np.ndarray, eps: float
 ) -> np.ndarray:
@@ -453,56 +422,6 @@ def compute_phi_init_from_counts(
     phi_init = np.where(init_major_mask, phi_major, phi_minor)
     phi_init = np.clip(phi_init, eps, phi_upper)
     return phi_init.astype(np.float64), init_major_mask.astype(bool)
-
-
-def _validate_inputs_strict(
-    *,
-    file_path: Path,
-    alt_counts: np.ndarray,
-    total_counts: np.ndarray,
-    purity: np.ndarray,
-    major_cn: np.ndarray,
-    minor_cn: np.ndarray,
-    normal_cn: np.ndarray,
-) -> None:
-    errors: list[str] = []
-    for name, matrix in [
-        ("alt_counts", alt_counts),
-        ("total_counts", total_counts),
-        ("purity", purity),
-        ("major_cn", major_cn),
-        ("minor_cn", minor_cn),
-        ("normal_cn", normal_cn),
-    ]:
-        if not np.all(np.isfinite(matrix)):
-            errors.append(f"Non-finite values in '{name}'.")
-    if errors:
-        raise ValueError(f"Invalid input data in {file_path}: {'; '.join(errors)}")
-
-    if np.any(alt_counts < 0.0):
-        errors.append("Negative alt_counts found.")
-    if np.any(total_counts < 0.0):
-        errors.append("Negative total_counts found.")
-    if np.any(alt_counts > total_counts + 0.5):
-        errors.append("alt_counts > total_counts found.")
-    if np.any(np.abs(alt_counts - np.round(alt_counts)) > 1e-6):
-        errors.append("Non-integer alt_counts found.")
-    if np.any(np.abs(total_counts - np.round(total_counts)) > 1e-6):
-        errors.append("Non-integer total_counts found.")
-    if np.any(purity <= 0.0):
-        errors.append("Purity must be strictly positive (purity <= 0 found).")
-    if np.any(purity > 1.0 + 1e-9):
-        errors.append("Purity > 1 found.")
-    if np.any(major_cn < 0.0):
-        errors.append("Negative major_cn found.")
-    if np.any(minor_cn < 0.0):
-        errors.append("Negative minor_cn found.")
-    if np.any(major_cn < minor_cn - 1e-9):
-        errors.append("major_cn < minor_cn found (major must be >= minor).")
-    if np.any(normal_cn <= 0.0):
-        errors.append("Nonpositive normal_cn found.")
-    if errors:
-        raise ValueError(f"Invalid input data in {file_path}: {'; '.join(errors)}")
 
 
 __all__ = [

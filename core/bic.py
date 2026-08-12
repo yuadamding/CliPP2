@@ -72,6 +72,7 @@ def fixed_partition_bic(
     partition_signature: str,
     labels: np.ndarray | None = None,
     loglik_uncertainty: float = 0.0,
+    selection_contract_id: str = "raw-fusion-only-v0.3",
 ) -> "SelectionScore":
     """Return the explicitly named BIC for one immutable partition refit."""
 
@@ -100,6 +101,7 @@ def fixed_partition_bic(
         numerical_uncertainty=float(
             2.0 * likelihood_uncertainty + arithmetic_uncertainty
         ),
+        selection_contract_id=str(selection_contract_id),
     )
 
 
@@ -214,6 +216,7 @@ def fixed_partition_dirichlet_score(
     loglik_uncertainty: float = 0.0,
     alpha: float = PARTITION_DIRICHLET_ALPHA,
     code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
+    selection_contract_id: str = "raw-fusion-only-v0.3",
 ) -> "SelectionScore":
     """Return BIC plus a Dirichlet-integrated exact-partition deviance.
 
@@ -244,6 +247,7 @@ def fixed_partition_dirichlet_score(
         partition_signature=partition_signature,
         labels=labels_array,
         loglik_uncertainty=loglik_uncertainty,
+        selection_contract_id=str(selection_contract_id),
     )
     log_evidence, log_evidence_uncertainty = (
         _dirichlet_exact_partition_log_mass_and_uncertainty(
@@ -283,6 +287,7 @@ def fixed_partition_dirichlet_score(
         assignment_model_id=DIRICHLET_EXACT_PARTITION_MODEL_ID,
         assignment_symmetry_mode="all_blocks_exchangeable",
         assignment_arithmetic_uncertainty=assignment_arithmetic_uncertainty,
+        selection_contract_id=str(selection_contract_id),
     )
 
 

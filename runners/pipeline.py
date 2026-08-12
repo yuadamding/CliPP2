@@ -13,7 +13,9 @@ from ..core.model import FitOptions
 from ..io.tumor_txt import DEFAULT_DOSAGE_PRIOR_PENALTY, load_tumor_txt
 from .model_selection import select_model
 from ..model_selection.candidates import validate_candidate_identity
-from .outputs import _without_retired_constraint_fields, write_fit_outputs
+from ..model_selection.contracts import get_selection_contract
+from ..model_selection.types import DirectPartition, FusionPartition
+from .outputs import write_fit_outputs
 
 
 def _array_fingerprint(values: np.ndarray, *, dtype: np.dtype) -> str:
@@ -56,18 +58,29 @@ def process_tumor_bundle(
         use_warm_starts=use_warm_starts,
     )
     selected_model = selection_result.selected_model
-    selected_candidate = selected_model.candidate
+    selected_candidate = getattr(
+        selected_model, "partition_candidate", selected_model.candidate
+    )
     validate_candidate_identity(selected_candidate)
-    best_fit = selected_candidate.raw_fit
+    raw_reference = getattr(selected_model, "raw_reference", selected_candidate)
+    validate_candidate_identity(raw_reference)
+    best_fit = raw_reference.raw_fit
+    raw_partition = raw_reference.partition
     partition = selected_candidate.partition
     refit = selected_candidate.refit
     score = selected_candidate.score
-    search_df = _without_retired_constraint_fields(selection_result.search_df)
+    search_df = selection_result.search_df
     elapsed_seconds = float(perf_counter() - start_time)
     selected_lambda = selection_result.selected_lambda_representative
     selection_optimum_resolved = bool(selection_result.selection_optimum_resolved)
     selection_status = (
         "resolved" if selection_optimum_resolved else "provisional_unresolved"
+    )
+    selection_contract = get_selection_contract(
+        getattr(fit_options, "selection_contract", "raw-fusion-only-v0.3")
+    )
+    selected_partition_certified = bool(
+        isinstance(partition, FusionPartition) and partition.certified
     )
     summary: dict[str, float | int | str | bool] = {
         "tumor_id": data.tumor_id,
@@ -81,6 +94,8 @@ def process_tumor_bundle(
         ),
         "selection_status": selection_status,
         "selection_constraint": "none",
+        "selection_contract_id": str(selection_contract.contract_id),
+        "selection_contract_json": str(selection_contract.to_json()),
         "selection_optimum_resolved": selection_optimum_resolved,
         "selection_boundary_unresolved": bool(
             selection_result.selection_boundary_unresolved
@@ -99,13 +114,51 @@ def process_tumor_bundle(
         "selected_lambda": (
             np.nan if selected_lambda is None else float(selected_lambda)
         ),
+        "selected_lambda_applicable": bool(selected_lambda is not None),
+        "raw_reference_lambda": float(
+            getattr(
+                best_fit,
+                "lambda_value",
+                np.nan if selected_lambda is None else selected_lambda,
+            )
+        ),
+        "raw_reference_partition_signature": str(raw_partition.signature),
+        "raw_reference_objective_certified": bool(
+            getattr(raw_reference, "raw_objective_certified", True)
+        ),
+        "selected_candidate_family": str(
+            getattr(selected_model, "selected_candidate_family", "raw_fusion")
+        ),
+        "selected_partition_source": str(partition.source),
+        "selected_partition_parent_lambda": (
+            float(partition.parent_raw_lambda)
+            if isinstance(partition, DirectPartition)
+            and partition.parent_raw_lambda is not None
+            else np.nan
+        ),
         "selected_n_clusters": int(partition.n_clusters),
         "selected_partition_signature": str(partition.signature),
-        "selected_partition_certified": bool(partition.certified),
-        "selected_partition_maximal": bool(partition.maximal),
+        "selected_partition_certified": bool(selected_partition_certified),
+        "selected_partition_certification_applicable": bool(
+            isinstance(partition, FusionPartition)
+        ),
+        "selected_partition_maximal": bool(
+            partition.maximal if isinstance(partition, FusionPartition) else False
+        ),
+        "selected_direct_partition_identity_certified": bool(
+            isinstance(partition, DirectPartition)
+            and partition.deterministic_generation
+        ),
+        "raw_partition_matches_selected_partition": bool(
+            raw_partition.signature == partition.signature
+        ),
         "selected_labels_hash": _array_fingerprint(
             partition.labels,
             dtype=np.dtype(np.int64),
+        ),
+        "raw_reference_phi_hash": _array_fingerprint(
+            best_fit.phi,
+            dtype=np.dtype(np.float64),
         ),
         "selected_raw_phi_hash": _array_fingerprint(
             best_fit.phi,
@@ -157,6 +210,21 @@ def process_tumor_bundle(
         "selection_method": str(selection_result.selection_method),
         "num_candidates": int(selection_result.num_candidates),
         "num_candidates_certified": int(selection_result.num_candidates_certified),
+        "partition_candidate_pool_complete": bool(
+            getattr(selection_result, "ward_candidate_pool_complete", False)
+        ),
+        "ward_candidate_pool_complete": bool(
+            getattr(selection_result, "ward_candidate_pool_complete", False)
+        ),
+        "raw_lambda_path_complete": bool(
+            getattr(selection_result, "raw_lambda_path_resolved", False)
+        ),
+        "best_over_evaluated_candidates": bool(
+            getattr(selection_result, "best_over_evaluated_candidates", True)
+        ),
+        "global_hybrid_optimum_certified": bool(
+            getattr(selection_result, "global_hybrid_optimum_certified", False)
+        ),
         "selected_kkt_residual": (
             np.nan
             if selection_result.selected_kkt_residual is None
@@ -171,13 +239,6 @@ def process_tumor_bundle(
 
     if write_outputs:
         validate_candidate_identity(selected_candidate)
-        selection_provenance = {
-            "selection_status": selection_status,
-            "selection_optimum_resolved": selection_optimum_resolved,
-            "selection_stop_reason": str(selection_result.adaptive_search_stop_reason),
-            "computation_profile": str(computation_profile.name),
-            "selection_score_name": str(score.name),
-        }
         write_fit_outputs(
             outdir=outdir,
             data=data,
@@ -185,9 +246,6 @@ def process_tumor_bundle(
             partition=partition,
             refit=refit,
             major_prior=float(fit_options.major_prior),
-            selection_provenance=selection_provenance,
-            run_summary=summary,
-            search_df=search_df,
         )
     return summary, search_df
 

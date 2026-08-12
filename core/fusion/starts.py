@@ -881,35 +881,6 @@ def _ambiguous_best_two_from_candidate_grid_torch(
     return primary, secondary, valid_secondary
 
 
-def _sample_loss_grid_numpy(
-    beta_values: np.ndarray,
-    *,
-    alt: np.ndarray,
-    total: np.ndarray,
-    b_minus: np.ndarray,
-    b_plus: np.ndarray,
-    b_fixed: np.ndarray,
-    ambiguous: np.ndarray,
-    major_prior: float,
-    eps: float,
-) -> np.ndarray:
-    beta = np.asarray(beta_values, dtype=np.float64)
-    losses = np.zeros(beta.shape, dtype=np.float64)
-    for idx in range(int(alt.shape[0])):
-        losses += _mutation_region_loss_grid_numpy(
-            beta,
-            alt=float(alt[idx]),
-            total=float(total[idx]),
-            b_minus=float(b_minus[idx]),
-            b_plus=float(b_plus[idx]),
-            b_fixed=float(b_fixed[idx]),
-            ambiguous=bool(ambiguous[idx]),
-            major_prior=major_prior,
-            eps=eps,
-        )
-    return losses
-
-
 def _pooled_sample_loss_grid_torch(
     torch_data: TorchTumorData,
     beta_by_sample: torch.Tensor,
@@ -1211,43 +1182,6 @@ def _ambiguous_candidate_grid_torch(
 
     columns.extend([zero_roots, interval_roots])
     return torch.cat([col[:, None] if col.ndim == 1 else col for col in columns], dim=1)
-
-
-def _mutation_region_breakpoints(
-    *,
-    lower: float,
-    upper: float,
-    b_minus: float,
-    b_plus: float,
-    b_fixed: float,
-    ambiguous: bool,
-    eps: float,
-) -> np.ndarray:
-    points = [float(lower), float(upper)]
-    if ambiguous:
-        b_low = float(min(b_minus, b_plus))
-        b_high = float(max(b_minus, b_plus))
-        if b_low > 0.0 and b_high > 0.0:
-            points.extend(
-                [
-                    float(eps) / b_high,
-                    float(eps) / b_low,
-                    float(1.0 - float(eps)) / b_high,
-                    float(1.0 - float(eps)) / b_low,
-                ]
-            )
-    elif float(b_fixed) > 0.0:
-        points.extend(
-            [
-                float(eps) / float(b_fixed),
-                float(1.0 - float(eps)) / float(b_fixed),
-            ]
-        )
-    point_array = np.unique(np.round(np.asarray(points, dtype=np.float64), 12))
-    point_array = point_array[
-        (point_array >= float(lower) - 1e-12) & (point_array <= float(upper) + 1e-12)
-    ]
-    return np.clip(point_array, float(lower), float(upper))
 
 
 def _path_unit_loss_and_gradient_numpy(

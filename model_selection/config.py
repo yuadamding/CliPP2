@@ -4,13 +4,8 @@ SELECTION_SCORE_NAMES = (
     "fixed_partition_dirichlet_score",
     "fixed_partition_bic",
 )
-PARTITION_GUIDED_ADMM_MAX_UNIQUE_LAMBDAS = 12
-PARTITION_GUIDED_ADMM_MAX_SOLVER_RETRIES_PER_LAMBDA = 4
 # A mild superlinear degree correction keeps the adaptive guide traversable
 # while reducing shrinkage transmitted between clearly separated groups.
 PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT = 1.05
 LIKELIHOOD_PARTITION_K_MAX = 50
 LIKELIHOOD_PARTITION_K_ANCHORS = (*range(1, 16), 20, 25, 30, 40, 50)
-LIKELIHOOD_PARTITION_MAX_CANDIDATES_PER_K = 5
-LIKELIHOOD_PARTITION_CEM_MAX_ITER = 8
-LIKELIHOOD_PARTITION_REFIT_MAX_ITER = 32

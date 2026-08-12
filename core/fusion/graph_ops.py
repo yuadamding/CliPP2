@@ -13,6 +13,13 @@ COMPLETE_GRAPH_MEMORY_SAFETY_FRACTION = 0.80
 COMPLETE_GRAPH_MEMORY_LIMIT_ENV = "CLIPP2_MAX_COMPLETE_GRAPH_BYTES"
 COMPLETE_ADAPTIVE_WEIGHT_CHUNK_BYTES = 64 * 1024 * 1024
 COMPLETE_ADMM_EDGE_WORK_BYTES = 64 * 1024 * 1024
+# CUDA ``index_add_`` uses atomic reductions whose rounding order changes from
+# launch to launch.  For complete graphs that can move a borderline KKT result
+# across its certification threshold.  A dense upper-triangle workspace is
+# both deterministic and faster for the small/medium complete graphs used by
+# the single-tumor workflow; cap it so larger problems retain the bounded-memory
+# scatter implementation.
+DETERMINISTIC_COMPLETE_ADJOINT_MAX_BYTES = 64 * 1024 * 1024
 
 
 def _complete_graph_weight(num_nodes: int) -> float:
@@ -605,6 +612,25 @@ def graph_adjoint_edges(
     prefer_cpu_bincount: bool = False,
 ) -> torch.Tensor:
     num_regions = int(dual.shape[1])
+    complete_edge_count = int(num_nodes) * max(int(num_nodes) - 1, 0) // 2
+    dense_workspace_bytes = (
+        int(num_nodes)
+        * int(num_nodes)
+        * max(num_regions, 1)
+        * int(dual.element_size())
+    )
+    if (
+        dual.device.type == "cuda"
+        and int(edge_u.numel()) == complete_edge_count
+        and dense_workspace_bytes <= DETERMINISTIC_COMPLETE_ADJOINT_MAX_BYTES
+    ):
+        # Complete graphs are canonical simple upper-triangle graphs.  Each
+        # (u, v) destination is unique, so indexed assignment has no atomic
+        # write conflict.  The two dense reductions are deterministic under
+        # PyTorch's deterministic-algorithm contract, unlike CUDA index_add_.
+        upper = dual.new_zeros((int(num_nodes), int(num_nodes), num_regions))
+        upper[edge_u, edge_v] = dual
+        return upper.sum(dim=1) - upper.sum(dim=0)
     if (
         dual.device.type == "cpu"
         and prefer_cpu_bincount

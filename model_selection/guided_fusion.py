@@ -267,6 +267,37 @@ def _box_stationarity_targets(
     return target
 
 
+def _complete_block_flow_terms(
+    adjusted_grad: torch.Tensor,
+    *,
+    phi: torch.Tensor,
+    labels: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return complete-block flow demand, targets, and block sizes."""
+
+    flow_demand = torch.zeros_like(adjusted_grad)
+    stationarity_target = torch.zeros_like(adjusted_grad)
+    num_clusters = int(torch.max(labels).item()) + 1
+    cluster_sizes = torch.bincount(labels, minlength=num_clusters)
+    for cluster in range(num_clusters):
+        members = torch.nonzero(labels == int(cluster), as_tuple=False).flatten()
+        block_target = _box_stationarity_targets(
+            adjusted_grad.index_select(0, members),
+            phi=phi.index_select(0, members),
+            lower=lower.index_select(0, members),
+            upper=upper.index_select(0, members),
+        )
+        stationarity_target.index_copy_(0, members, block_target)
+        flow_demand.index_copy_(
+            0,
+            members,
+            adjusted_grad.index_select(0, members) - block_target,
+        )
+    return flow_demand, stationarity_target, cluster_sizes
+
+
 def _assemble_actual_dual(
     *,
     lambda_value: float,
