@@ -9,13 +9,13 @@ from ..core.fusion.partition_starts import (
     hessian_weighted_ward_label_sets_torch,
     observed_curvature_at_pilot_torch,
 )
+from ..core.bic import PARTITION_DIRICHLET_ALPHA, PARTITION_DIRICHLET_SCORE_WEIGHT
 from ..core.model import FitOptions
 from ..io.data import TumorData
 from .config import (
     LIKELIHOOD_PARTITION_CEM_MAX_ITER,
     LIKELIHOOD_PARTITION_MAX_CANDIDATES_PER_K,
     LIKELIHOOD_PARTITION_REFIT_MAX_ITER,
-    PARTITION_ICL_DIRICHLET_ALPHA,
 )
 from .partitions import (
     _deduplicate_partition_candidates,
@@ -59,10 +59,13 @@ def generate_partition_initializer_pool(
     """Generate the deterministic Ward/CEM pool used to choose one guide.
 
     The score is supplied explicitly so guided fusion can choose its guide by
-    partition ICL without coupling that choice to the final raw-fusion score.
-    In the default adaptive-graph workflow the chosen guide defines the frozen
-    edge weights as well as the initial solver state and lambda scale. These
-    partitions are preprocessing artifacts and are never selectable models.
+    exact-partition Dirichlet score without coupling that choice to the final
+    raw-fusion score.
+    The chosen guide always supplies the initial solver state and lambda scale.
+    It defines the frozen adaptive edge weights in strict mode; approximate
+    profiles instead weight the graph from the zero-penalty likelihood pilot.
+    These partitions are preprocessing artifacts and are never selectable
+    models.
     """
 
     generation_start = perf_counter()
@@ -110,16 +113,17 @@ def generate_partition_initializer_pool(
             torch_data=torch_data,
             device=runtime.device,
             dtype=runtime.dtype,
-            # The clonal-anchored NumPy refit remains the scoring authority for
+            # The unanchored NumPy refit remains the scoring authority for
             # categorical occupancy paths.  Entirely one-state inputs retain
             # the historical Torch major/minor refit, which has the same
             # objective and avoids the serial path-refit overhead.
             use_torch=getattr(data, "path_likelihood", None) is None,
             classification_weight_alpha=(
-                float(PARTITION_ICL_DIRICHLET_ALPHA)
+                float(PARTITION_DIRICHLET_ALPHA)
                 if normalized_score == "partition_icl"
                 else None
             ),
+            classification_code_weight=float(PARTITION_DIRICHLET_SCORE_WEIGHT),
             allow_component_death=bool(normalized_score == "partition_icl"),
         )
         generation_elapsed = float(perf_counter() - generation_start)

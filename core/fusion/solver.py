@@ -19,12 +19,10 @@ from .defaults import (
     DEFAULT_DENSE_FALLBACK_POLICY,
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
-    DEFAULT_INNER_BACKEND,
     DEFAULT_WORKSET_ADD_BATCH,
     DEFAULT_WORKSET_MAX_BYTES,
     DEFAULT_WORKSET_MAX_EXPANSIONS,
     normalize_dense_fallback_policy,
-    normalize_inner_backend,
 )
 from .certificates import (
     audit_graph_fusion_certificate,
@@ -38,10 +36,6 @@ from .graph_ops import (
     project_dual_ball,
     tensor_graph_to_pairwise_graph,
     tensorize_graph,
-)
-from .quotient_workset import (
-    compressed_certificate_for_primal,
-    solve_majorized_subproblem_quotient_workset_torch,
 )
 from .starts import (
     compute_pooled_observed_data_start_torch,
@@ -74,7 +68,6 @@ from .types import (
     DenseEdgeCertificate,
     DenseWarmState,
     ExactSolverResourceLimit,
-    InfeasibleRawClonalAnchor,
     ExactFusionProvenance,
     FusionFitArtifacts,
     GraphFusionCertificate,
@@ -84,8 +77,6 @@ from .types import (
     OuterDiagnostics,
     PairwiseFusionGraph,
     PrimalOnlyWarmState,
-    QuotientFailureProvenance,
-    QuotientWorksetWarmState,
     SolverContext,
     SolverState,
     TensorFusionGraph,
@@ -599,8 +590,6 @@ def _objective_spec_fingerprint(
     graph_hash: str,
     major_prior: float,
     eps: float,
-    clonal_anchor_mutation_index: int | None = None,
-    clonal_anchor_target: np.ndarray | None = None,
     constrained_lower: np.ndarray | None = None,
     constrained_upper: np.ndarray | None = None,
 ) -> str:
@@ -615,13 +604,6 @@ def _objective_spec_fingerprint(
         encoded = value.encode("utf-8")
         digest.update(len(encoded).to_bytes(8, "little"))
         digest.update(encoded)
-    if clonal_anchor_target is not None:
-        target = np.ascontiguousarray(
-            np.asarray(clonal_anchor_target, dtype=np.float64)
-        )
-        digest.update(str(target.shape).encode("ascii"))
-        digest.update(target.dtype.str.encode("ascii"))
-        digest.update(target.tobytes(order="C"))
     for name, values in (
         ("constrained_lower", constrained_lower),
         ("constrained_upper", constrained_upper),
@@ -708,14 +690,17 @@ def _validate_prebuilt_tensor_graph(
     tensor_edge_v = (
         tensor_graph.edge_v.detach().cpu().numpy().astype(np.int64, copy=False)
     )
-    tensor_weight = (
-        tensor_graph.weight.detach().cpu().numpy().astype(np.float64, copy=False)
-    )
+    tensor_weight_native = tensor_graph.weight.detach().cpu().numpy()
     if not np.array_equal(tensor_edge_u, np.asarray(graph.edge_u, dtype=np.int64)):
         raise ValueError("prebuilt_tensor_graph edge_u does not match graph.")
     if not np.array_equal(tensor_edge_v, np.asarray(graph.edge_v, dtype=np.int64)):
         raise ValueError("prebuilt_tensor_graph edge_v does not match graph.")
-    if not np.array_equal(tensor_weight, np.asarray(graph.edge_w, dtype=np.float64)):
+    # The tensor values are the numeric objective actually optimized.  Compare
+    # the host specification after applying the same runtime-dtype rounding;
+    # comparing rounded float32 values with their float64 source bit-for-bit
+    # incorrectly rejects a correctly paired graph.
+    expected_weight = np.asarray(graph.edge_w, dtype=tensor_weight_native.dtype)
+    if not np.array_equal(tensor_weight_native, expected_weight):
         raise ValueError("prebuilt_tensor_graph weights do not match graph.")
 
 
@@ -744,25 +729,12 @@ def _project_state_dual(
 def _invalidate_damped_trial_state(
     *,
     phi: torch.Tensor,
-    trial_warm_state: DenseWarmState | QuotientWorksetWarmState | PrimalOnlyWarmState,
+    trial_warm_state: DenseWarmState | PrimalOnlyWarmState,
 ) -> tuple[None, None, None, PrimalOnlyWarmState, bool]:
     """Create the only state that may be promoted for a damped MM endpoint."""
 
-    structure_hint = (
-        trial_warm_state.labels
-        if isinstance(trial_warm_state, QuotientWorksetWarmState)
-        else None
-    )
-    if isinstance(trial_warm_state, QuotientWorksetWarmState):
-        certificate_hint: GraphFusionCertificate | None = CompressedEdgeCertificate(
-            labels=trial_warm_state.labels,
-            centers=trial_warm_state.centers,
-            internal_edge_ids=trial_warm_state.internal_edge_ids,
-            internal_dual=trial_warm_state.internal_dual,
-            graph_hash=trial_warm_state.graph_hash,
-            gradient_scope="mm_surrogate",
-        )
-    elif isinstance(trial_warm_state, DenseWarmState) and torch.is_tensor(
+    structure_hint = None
+    if isinstance(trial_warm_state, DenseWarmState) and torch.is_tensor(
         trial_warm_state.dual
     ):
         certificate_hint = DenseEdgeCertificate(
@@ -788,6 +760,37 @@ def _invalidate_damped_trial_state(
     )
 
 
+def _compressed_certificate_for_primal(
+    phi: torch.Tensor,
+    *,
+    graph_hash: str,
+    gradient_scope: str,
+) -> CompressedEdgeCertificate:
+    """Represent exact-equal primal rows without materializing a full dual."""
+
+    _, labels = torch.unique(phi, dim=0, sorted=True, return_inverse=True)
+    num_blocks = int(torch.max(labels).item()) + 1 if labels.numel() else 0
+    roots = torch.full(
+        (num_blocks,),
+        int(phi.shape[0]),
+        dtype=torch.long,
+        device=phi.device,
+    )
+    if labels.numel():
+        nodes = torch.arange(int(labels.numel()), device=phi.device)
+        roots.scatter_reduce_(0, labels, nodes, reduce="amin", include_self=True)
+    return CompressedEdgeCertificate(
+        labels=labels,
+        centers=phi.index_select(0, roots),
+        internal_edge_ids=torch.empty(0, dtype=torch.long, device=phi.device),
+        internal_dual=torch.empty(
+            (0, int(phi.shape[1])), dtype=phi.dtype, device=phi.device
+        ),
+        graph_hash=str(graph_hash),
+        gradient_scope=gradient_scope,
+    )
+
+
 def _rebase_certificate_hint(
     hint: GraphFusionCertificate | None,
     *,
@@ -802,7 +805,7 @@ def _rebase_certificate_hint(
         return None
     if isinstance(hint, DenseEdgeCertificate):
         return hint
-    rebased = compressed_certificate_for_primal(
+    rebased = _compressed_certificate_for_primal(
         phi,
         graph_hash=graph_hash,
         gradient_scope="observed_objective",
@@ -1017,12 +1020,6 @@ def prepare_torch_problem(
     torch_data: TorchTumorData | None = None,
     objective_shape: str = "unimodal",
     defer_graph: bool = False,
-    clonal_anchor_mutation_index: int | None = None,
-    clonal_anchor_target: float | np.ndarray | torch.Tensor | None = None,
-    clonal_anchor_source: str = "none",
-    clonal_anchor_mode: str = "none",
-    clonal_anchor_feasibility_tolerance: float = 0.0,
-    raw_clonal_union_model_hash: str = "",
 ) -> SolverContext:
     tol = _validate_solver_tolerance(tol)
     objective_shape = objective_shape_for_data(data, objective_shape)
@@ -1133,6 +1130,12 @@ def prepare_torch_problem(
             effective_graph, effective_runtime, num_nodes=data.num_mutations
         )
 
+    # Canonical provenance follows the finite-precision graph that enters the
+    # solver, not an upstream higher-precision array that was rounded during
+    # tensorization. This keeps graph hashes and reused contexts
+    # identical on CPU and CUDA.
+    effective_graph = tensor_graph_to_pairwise_graph(tensor_graph)
+
     if use_unimodal_objective and pooled_start is None:
         pooled_start_tensor = exact_pilot_tensor
     elif pooled_start is None:
@@ -1164,89 +1167,6 @@ def prepare_torch_problem(
     upper = torch.minimum(
         effective_torch_data.phi_upper, torch.ones_like(effective_torch_data.phi_upper)
     )
-    base_lower = lower
-    base_upper = upper
-    anchor_index: int | None = None
-    anchor_frozen_indices: tuple[int, ...] = ()
-    anchor_target: torch.Tensor | None = None
-    normalized_anchor_source = str(clonal_anchor_source).strip() or "none"
-    normalized_anchor_mode = str(clonal_anchor_mode).strip().lower() or "none"
-    anchor_feasibility_tolerance = float(clonal_anchor_feasibility_tolerance)
-    if not np.isfinite(anchor_feasibility_tolerance) or anchor_feasibility_tolerance < 0:
-        raise ValueError("Raw clonal-anchor feasibility tolerance must be finite and nonnegative.")
-    if clonal_anchor_mutation_index is not None:
-        anchor_index = int(clonal_anchor_mutation_index)
-        if not 0 <= anchor_index < int(data.num_mutations):
-            raise ValueError(
-                "clonal_anchor_mutation_index must identify one tumor mutation."
-            )
-        if normalized_anchor_source == "none":
-            raise ValueError("A raw clonal anchor requires explicit provenance.")
-        if normalized_anchor_mode not in {
-            "specified_seed",
-            "enumerated_seed",
-            "screened_seed",
-            "specified_witness",
-            "enumerated_witness",
-            "screened_witness",
-            "adaptive_exact",
-            "adaptive_bound_complete",
-        }:
-            raise ValueError("A raw clonal anchor requires an explicit anchor mode.")
-        if clonal_anchor_target is None:
-            raise ValueError("A raw clonal anchor requires an explicit target.")
-        target_tensor = torch.as_tensor(
-            np.asarray(clonal_anchor_target, dtype=np.float64).copy(),
-            dtype=upper.dtype,
-            device=upper.device,
-        ).reshape(-1)
-        if int(target_tensor.numel()) == 1:
-            target_tensor = target_tensor.expand(int(data.num_regions))
-        if tuple(target_tensor.shape) != (int(data.num_regions),):
-            raise ValueError("Raw clonal-anchor target must have one value per region.")
-        if not bool(torch.all(torch.isfinite(target_tensor)).item()):
-            raise ValueError("Raw clonal-anchor target must be finite.")
-        if bool(torch.any(target_tensor < lower[anchor_index]).item()) or bool(
-            torch.any(target_tensor > 1.0).item()
-        ):
-            raise InfeasibleRawClonalAnchor(
-                "Raw clonal-anchor target lies outside the CCF domain."
-            )
-        if bool(torch.any(target_tensor > upper[anchor_index]).item()):
-            raise InfeasibleRawClonalAnchor(
-                "no_feasible_raw_clonal_anchor: target exceeds mutation support."
-            )
-        anchor_target = target_tensor.detach().clone()
-        anchor_frozen_indices = (anchor_index,)
-        frozen_index_tensor = torch.as_tensor(
-            anchor_frozen_indices,
-            dtype=torch.long,
-            device=upper.device,
-        )
-        if bool(
-            torch.any(upper.index_select(0, frozen_index_tensor) < anchor_target).item()
-        ):
-            raise InfeasibleRawClonalAnchor(
-                "no_feasible_raw_clonal_anchor: target exceeds witness support."
-            )
-        lower = lower.clone()
-        upper = upper.clone()
-        lower[frozen_index_tensor] = anchor_target
-        upper[frozen_index_tensor] = anchor_target
-
-        def project_start(start: torch.Tensor) -> torch.Tensor:
-            return torch.minimum(torch.maximum(start, lower), upper)
-
-        exact_pilot_tensor = project_start(exact_pilot_tensor)
-        pooled_start_tensor = project_start(pooled_start_tensor)
-        scalar_well_starts_seq = tuple(
-            project_start(_tensor_from_start(start, effective_runtime))
-            for start in scalar_well_starts_seq
-        )
-    else:
-        normalized_anchor_source = "none"
-        normalized_anchor_mode = "none"
-        anchor_feasibility_tolerance = 0.0
     problem = _tensor_problem_from_torch_data(
         effective_torch_data,
         major_prior=float(major_prior),
@@ -1258,26 +1178,10 @@ def prepare_torch_problem(
         graph_hash=graph_hash,
         major_prior=float(major_prior),
         eps=float(eps),
-        constrained_lower=base_lower.detach().cpu().numpy(),
-        constrained_upper=base_upper.detach().cpu().numpy(),
-    )
-    objective_spec_hash = _objective_spec_fingerprint(
-        objective_data_fingerprint=tumor_objective_fingerprint(data),
-        graph_hash=graph_hash,
-        major_prior=float(major_prior),
-        eps=float(eps),
-        clonal_anchor_mutation_index=anchor_index,
-        clonal_anchor_target=(
-            None
-            if anchor_target is None
-            else anchor_target.detach().cpu().numpy()
-        ),
         constrained_lower=lower.detach().cpu().numpy(),
         constrained_upper=upper.detach().cpu().numpy(),
     )
-    union_model_hash = str(raw_clonal_union_model_hash).strip()
-    if not union_model_hash:
-        union_model_hash = base_fusion_objective_hash
+    objective_spec_hash = base_fusion_objective_hash
     return SolverContext(
         problem=problem,
         graph=tensor_graph,
@@ -1295,14 +1199,6 @@ def prepare_torch_problem(
         graph_hash=graph_hash,
         objective_spec_hash=objective_spec_hash,
         base_fusion_objective_hash=base_fusion_objective_hash,
-        raw_clonal_union_model_hash=union_model_hash,
-        witness_subproblem_hash=objective_spec_hash,
-        clonal_anchor_mutation_index=anchor_index,
-        clonal_anchor_frozen_mutation_indices=anchor_frozen_indices,
-        clonal_anchor_target=anchor_target,
-        clonal_anchor_source=normalized_anchor_source,
-        clonal_anchor_mode=normalized_anchor_mode,
-        clonal_anchor_feasibility_tolerance=anchor_feasibility_tolerance,
     )
 
 
@@ -1537,18 +1433,10 @@ def _solve_inner_subproblem(
     pdhg_tau_node,
     backend_name: str,
     graph_hash: str,
-    backend_mode: str,
-    tensor_graph: TensorFusionGraph,
-    warm_state,
-    certificate_options: CertificateOptions,
-    partition_tolerance: float,
-    dense_fallback_policy: str,
 ) -> InnerSolveResult:
     """Dispatch the majorized inner subproblem to the ALM (complete-graph) or PDHG
     solver and wrap its legacy tuple in a representation-aware result."""
-    quotient_attempt_work = BackendWorkCounters()
-    quotient_fallback_reason = ""
-    if use_alm and backend_mode == "dense":
+    if use_alm:
         dense_fits, dense_bytes, dense_limit = dense_complete_solver_memory_preflight(
             num_nodes=num_mutations,
             num_regions=int(U.shape[1]),
@@ -1560,57 +1448,6 @@ def _solve_inner_subproblem(
                 f"approximately {dense_bytes} bytes (available policy limit: "
                 f"{dense_limit})."
             )
-    if use_alm and backend_mode == "quotient_workset":
-        quotient_attempt = solve_majorized_subproblem_quotient_workset_torch(
-            runtime=runtime,
-            U=U,
-            h=h,
-            lower=lower,
-            upper=upper,
-            lambda_value=lambda_value,
-            graph=tensor_graph,
-            graph_hash=graph_hash,
-            tol=tol,
-            max_iter=max(inner_max_iter, 10),
-            phi_start=phi,
-            warm_state=(
-                warm_state
-                if isinstance(
-                    warm_state, (QuotientWorksetWarmState, PrimalOnlyWarmState)
-                )
-                else None
-            ),
-            certificate_options=certificate_options,
-            partition_tolerance=partition_tolerance,
-        )
-        quotient_attempt_work = quotient_attempt.work_counters
-        if quotient_attempt.certified_result is not None:
-            return quotient_attempt.certified_result
-        if dense_fallback_policy == "error":
-            raise ExactSolverResourceLimit(
-                "exact_solver_resource_limit: quotient/workset could not certify "
-                f"this inner problem ({quotient_attempt.reason}) and dense "
-                "fallback is disabled by policy."
-            )
-        dense_fits, dense_bytes, dense_limit = dense_complete_solver_memory_preflight(
-            num_nodes=num_mutations,
-            num_regions=int(U.shape[1]),
-            runtime=runtime,
-        )
-        if not dense_fits:
-            raise ExactSolverResourceLimit(
-                "exact_solver_resource_limit: quotient/workset was not certified "
-                f"and dense fallback needs approximately {dense_bytes} bytes "
-                f"(available policy limit: {dense_limit})."
-            )
-        phi = quotient_attempt.phi_candidate
-        dual = None
-        dual_start_is_actual = False
-        quotient_fallback_reason = (
-            "dense_current_device_after_"
-            f"{quotient_attempt.status}:{quotient_attempt.reason}"
-        )
-
     surrogate_diag_values: dict[str, float | int] = {}
     if use_alm:
         (
@@ -1696,11 +1533,7 @@ def _solve_inner_subproblem(
         else None
     )
     dense_iterations = int(inner_iterations) if use_alm else 0
-    total_inner_iterations = (
-        int(inner_iterations)
-        + int(quotient_attempt_work.quotient_iterations)
-        + int(quotient_attempt_work.workset_iterations)
-    )
+    total_inner_iterations = int(inner_iterations)
     return InnerSolveResult(
         phi=phi_trial,
         backend_name=str(backend_name),
@@ -1716,20 +1549,8 @@ def _solve_inner_subproblem(
         inner_iterations=total_inner_iterations,
         backend_iterations=total_inner_iterations,
         work_counters=BackendWorkCounters(
-            quotient_iterations=int(quotient_attempt_work.quotient_iterations),
-            workset_iterations=int(quotient_attempt_work.workset_iterations),
-            workset_expansions=int(quotient_attempt_work.workset_expansions),
-            streamed_edge_passes=int(quotient_attempt_work.streamed_edge_passes),
             dense_iterations=dense_iterations,
-            certificate_iterations=int(quotient_attempt_work.certificate_iterations),
-            activity_passes=int(quotient_attempt_work.activity_passes),
-            analytic_adjoint_passes=int(quotient_attempt_work.analytic_adjoint_passes),
-            column_scan_passes=int(quotient_attempt_work.column_scan_passes),
-            full_certificate_audit_passes=int(
-                quotient_attempt_work.full_certificate_audit_passes
-            ),
         ),
-        fallback_reason=quotient_fallback_reason,
     )
 
 
@@ -1755,10 +1576,8 @@ def _fit_from_start(
     summary_tol: float | None,
     compute_summary: bool,
     objective_shape: str,
-    inner_backend: str,
     workset_max_bytes: int,
     compressed_cache_max_bytes: int,
-    dense_fallback_policy: str,
     workset_add_batch: int,
     workset_max_expansions: int,
     certificate_max_iter: int,
@@ -1774,11 +1593,9 @@ def _fit_from_start(
         and str(solver_state.objective_spec_hash) != str(objective_spec_hash)
     ):
         raise ValueError(
-            "Solver warm state belongs to a different raw objective/anchor."
+            "Solver warm state belongs to a different raw objective."
         )
     objective_shape = objective_shape_for_data(data, objective_shape)
-    requested_inner_backend = normalize_inner_backend(inner_backend)
-    normalized_fallback_policy = normalize_dense_fallback_policy(dense_fallback_policy)
     certificate_options = CertificateOptions(
         max_iter=max(int(certificate_max_iter), 1),
         refinement_rounds=max(int(certificate_refinement_rounds), 0),
@@ -1807,10 +1624,6 @@ def _fit_from_start(
         tensor_graph.is_complete
         and int(graph.degree_bound) == max(int(data.num_mutations) - 1, 1)
     )
-    if requested_inner_backend == "quotient_workset" and not use_alm:
-        raise ValueError(
-            "inner_backend='quotient_workset' requires the complete original graph."
-        )
     edge_u, edge_v, edge_w = (
         tensor_graph.edge_u,
         tensor_graph.edge_v,
@@ -1825,21 +1638,6 @@ def _fit_from_start(
     else:
         dense_inner_solver = "pdhg"
     inner_solver = dense_inner_solver
-    prior_failure = solver_state.quotient_failure if solver_state is not None else None
-    prior_quotient_failure = bool(
-        requested_inner_backend == "quotient_workset"
-        and lambda_value > 0.0
-        and prior_failure is not None
-        and prior_failure.graph_hash == str(graph_hash)
-        and prior_failure.lambda_value == float(lambda_value)
-    )
-    use_compressed_certificates = bool(
-        requested_inner_backend == "quotient_workset"
-        and not prior_quotient_failure
-        and tensor_graph.is_complete
-        and lambda_value > 0.0
-    )
-
     if (
         solver_state is not None
         and solver_state.phi is not None
@@ -1850,17 +1648,13 @@ def _fit_from_start(
         phi = _tensor_from_start(phi_start, runtime)
     phi = torch.minimum(torch.maximum(phi, lower), upper)
 
-    state_dual = (
-        None
-        if use_compressed_certificates
-        else _project_state_dual(
-            solver_state,
-            runtime=runtime,
-            edge_w=edge_w,
-            lambda_value=lambda_value,
-            num_edges=int(edge_u.numel()),
-            num_regions=int(phi.shape[1]),
-        )
+    state_dual = _project_state_dual(
+        solver_state,
+        runtime=runtime,
+        edge_w=edge_w,
+        lambda_value=lambda_value,
+        num_edges=int(edge_u.numel()),
+        num_regions=int(phi.shape[1]),
     )
     dual = state_dual
     dual_kkt = state_dual
@@ -1891,14 +1685,6 @@ def _fit_from_start(
             else None
         )
     )
-    if use_compressed_certificates and not isinstance(
-        certificate, CompressedEdgeCertificate
-    ):
-        certificate = compressed_certificate_for_primal(
-            phi,
-            graph_hash=graph_hash,
-            gradient_scope="observed_objective",
-        )
     dual_start_is_actual = bool(use_alm and state_dual is not None)
     history: list[float] = []
     converged = False
@@ -1906,7 +1692,6 @@ def _fit_from_start(
     converged_outer = False
     iterations = 0
     inner_iterations = 0
-    quotient_iterations = 0
     workset_iterations = 0
     workset_expansions = 0
     streamed_edge_passes = 0
@@ -1916,15 +1701,7 @@ def _fit_from_start(
     analytic_adjoint_passes = 0
     column_scan_passes = 0
     full_certificate_audit_passes = 0
-    fallback_reason = (
-        "dense_current_device_after_prior_quotient_failure"
-        if prior_quotient_failure
-        else ""
-    )
-    quotient_failure = prior_failure if prior_quotient_failure else None
-    active_inner_backend = (
-        "dense" if prior_quotient_failure else requested_inner_backend
-    )
+    fallback_reason = ""
     current_inner_converged = False
     current_inner_kkt_residual = np.nan
     final_relative_objective_change = np.inf
@@ -2012,8 +1789,8 @@ def _fit_from_start(
             )
         if require_full_step_backtracking:
             forcing_certificate = certificate
-            if use_compressed_certificates and forcing_certificate is None:
-                forcing_certificate = compressed_certificate_for_primal(
+            if forcing_certificate is None:
+                forcing_certificate = _compressed_certificate_for_primal(
                     phi,
                     graph_hash=graph_hash,
                     gradient_scope="observed_objective",
@@ -2097,11 +1874,9 @@ def _fit_from_start(
             inner_phi_start = phi
             inner_dual_start = dual
             inner_dual_start_is_actual = dual_start_is_actual
-            inner_warm_start = warm_state
             attempted_inner_iterations = 0
             inner_batch_limit = 8 if require_full_step_backtracking else 1
             for _inner_batch in range(inner_batch_limit):
-                attempted_quotient = active_inner_backend == "quotient_workset"
                 inner_result = _solve_inner_subproblem(
                     use_alm=use_alm,
                     runtime=runtime,
@@ -2124,15 +1899,6 @@ def _fit_from_start(
                     pdhg_tau_node=tensor_graph.pdhg_tau_node,
                     backend_name=dense_inner_solver,
                     graph_hash=graph_hash,
-                    backend_mode=active_inner_backend,
-                    tensor_graph=tensor_graph,
-                    warm_state=inner_warm_start,
-                    certificate_options=certificate_options,
-                    partition_tolerance=max(float(tol), 1e-12),
-                    dense_fallback_policy=normalized_fallback_policy,
-                )
-                quotient_iterations += int(
-                    inner_result.work_counters.quotient_iterations
                 )
                 workset_iterations += int(inner_result.work_counters.workset_iterations)
                 workset_expansions += int(inner_result.work_counters.workset_expansions)
@@ -2151,22 +1917,6 @@ def _fit_from_start(
                 full_certificate_audit_passes += int(
                     inner_result.work_counters.full_certificate_audit_passes
                 )
-                fallback_reason = _combine_fallback_reasons(
-                    fallback_reason,
-                    inner_result.fallback_reason,
-                )
-                if (
-                    attempted_quotient
-                    and lambda_value > 0.0
-                    and inner_result.fallback_reason
-                ):
-                    quotient_failure = QuotientFailureProvenance(
-                        lambda_value=float(lambda_value),
-                        graph_hash=str(graph_hash),
-                        reason=str(inner_result.fallback_reason),
-                    )
-                if inner_result.fallback_reason:
-                    active_inner_backend = "dense"
                 phi_trial = inner_result.phi
                 dense_warm_state = inner_result.warm_state
                 dual_trial = getattr(dense_warm_state, "dual", None)
@@ -2203,7 +1953,6 @@ def _fit_from_start(
                 inner_phi_start = phi_trial
                 inner_dual_start = dual_kkt_trial if use_alm else dual_trial
                 inner_dual_start_is_actual = bool(use_alm)
-                inner_warm_start = inner_result.warm_state
             inner_iterations += int(attempted_inner_iterations)
             attempted_outer_steps += 1
             last_attempted_inner_kkt_residual = float(inner_residual)
@@ -2587,18 +2336,9 @@ def _fit_from_start(
                 )
             should_refine = bool(
                 certificate is None
-                or inner_solver == "quotient_workset_complete_graph"
                 or isinstance(observed_start, CompressedEdgeCertificate)
             )
             if should_refine:
-                if inner_solver == "quotient_workset_complete_graph" and not isinstance(
-                    observed_start, CompressedEdgeCertificate
-                ):
-                    observed_start = compressed_certificate_for_primal(
-                        phi,
-                        graph_hash=graph_hash,
-                        gradient_scope="observed_objective",
-                    )
                 observed_refinement = refine_graph_fusion_certificate(
                     certificate=observed_start,
                     phi=phi,
@@ -2692,14 +2432,6 @@ def _fit_from_start(
             graph=tensor_graph,
             graph_hash=graph_hash,
             lambda_value=lambda_value,
-        )
-    if inner_solver == "quotient_workset_complete_graph" and not isinstance(
-        certificate, CompressedEdgeCertificate
-    ):
-        certificate = compressed_certificate_for_primal(
-            phi,
-            graph_hash=graph_hash,
-            gradient_scope="observed_objective",
         )
     certificate_gradient = final_terms.grad
     at_path_breakpoint = torch.zeros_like(phi, dtype=torch.bool)
@@ -2884,7 +2616,6 @@ def _fit_from_start(
         tolerance=5.0 * float(tol),
         backend_name=str(inner_solver),
         backend_iterations=int(inner_iterations),
-        quotient_iterations=int(quotient_iterations),
         workset_iterations=int(workset_iterations),
         workset_expansions=int(workset_expansions),
         streamed_edge_passes=int(streamed_edge_passes),
@@ -2990,22 +2721,11 @@ def _fit_from_start(
     multiplicity_call = np.full_like(phi_np, np.nan, dtype=phi_np.dtype)
     multiplicity_estimated_mask = np.zeros_like(phi_np, dtype=bool)
     if isinstance(certificate, CompressedEdgeCertificate):
-        quotient_dual = (
-            warm_state.quotient_dual
-            if isinstance(warm_state, QuotientWorksetWarmState)
-            else None
-        )
-        terminal_warm_state = QuotientWorksetWarmState(
+        terminal_warm_state = PrimalOnlyWarmState(
             phi=phi.detach(),
-            labels=certificate.labels.detach(),
-            centers=certificate.centers.detach(),
-            quotient_dual=(
-                quotient_dual.detach() if torch.is_tensor(quotient_dual) else None
-            ),
-            internal_edge_ids=certificate.internal_edge_ids.detach(),
-            internal_dual=certificate.internal_dual.detach(),
-            graph_hash=str(graph_hash),
-            previous_lambda=float(lambda_value),
+            structure_hint=certificate.labels.detach(),
+            certificate_hint=certificate,
+            structure_hint_is_heuristic=False,
         )
     else:
         terminal_warm_state = DenseWarmState(
@@ -3020,9 +2740,6 @@ def _fit_from_start(
         previous_lambda=float(lambda_value),
         warm_state=terminal_warm_state,
         certificate=certificate,
-        quotient_failure=(
-            quotient_failure if requested_inner_backend == "quotient_workset" else None
-        ),
         objective_spec_hash=str(objective_spec_hash),
     )
     torch_result = TorchFitResult(
@@ -3214,7 +2931,6 @@ def fit_observed_data_pairwise_fusion(
     solver_state: SolverState | None = None,
     compute_summary: bool = True,
     objective_shape: str = "unimodal",
-    inner_backend: str = DEFAULT_INNER_BACKEND,
     workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES,
     compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
     dense_fallback_policy: str = DEFAULT_DENSE_FALLBACK_POLICY,
@@ -3319,8 +3035,6 @@ def fit_observed_data_pairwise_fusion(
         context: SolverContext,
         start: np.ndarray | torch.Tensor,
         state: SolverState | None,
-        backend: str,
-        fallback_policy: str,
     ) -> FusionFitArtifacts:
         return _fit_from_start(
             data,
@@ -3343,10 +3057,8 @@ def fit_observed_data_pairwise_fusion(
             summary_tol=summary_tol,
             compute_summary=compute_summary,
             objective_shape=objective_shape,
-            inner_backend=backend,
             workset_max_bytes=workset_max_bytes,
             compressed_cache_max_bytes=compressed_cache_max_bytes,
-            dense_fallback_policy=fallback_policy,
             workset_add_batch=workset_add_batch,
             workset_max_expansions=workset_max_expansions,
             certificate_max_iter=certificate_max_iter,
@@ -3361,7 +3073,6 @@ def fit_observed_data_pairwise_fusion(
         *,
         reason: str,
         backend_name: str | None = None,
-        quotient_failure_reason: str | None = None,
     ) -> FusionFitArtifacts:
         fallback_backend = (
             str(backend_name) if backend_name is not None else artifacts.inner_solver
@@ -3387,20 +3098,9 @@ def fit_observed_data_pairwise_fusion(
             if artifacts.torch_result is not None
             else None
         )
-        fallback_solver_state = artifacts.solver_state
-        if quotient_failure_reason is not None and fallback_solver_state is not None:
-            fallback_solver_state = replace(
-                fallback_solver_state,
-                quotient_failure=QuotientFailureProvenance(
-                    lambda_value=float(lambda_value),
-                    graph_hash=str(solver_context.graph_hash),
-                    reason=str(quotient_failure_reason),
-                ),
-            )
         return replace(
             artifacts,
             inner_solver=fallback_backend,
-            solver_state=fallback_solver_state,
             exactness_provenance=fallback_provenance,
             torch_result=fallback_torch_result,
         )
@@ -3422,10 +3122,6 @@ def fit_observed_data_pairwise_fusion(
             backend_iterations=(
                 int(current_provenance.backend_iterations)
                 + int(attempted_provenance.backend_iterations)
-            ),
-            quotient_iterations=(
-                int(current_provenance.quotient_iterations)
-                + int(attempted_provenance.quotient_iterations)
             ),
             workset_iterations=(
                 int(current_provenance.workset_iterations)
@@ -3502,21 +3198,11 @@ def fit_observed_data_pairwise_fusion(
         )
         cpu_seed = state_for_start.phi if state_for_start is not None else start
         attempted_artifacts: FusionFitArtifacts | None = None
-        quotient_terminal_failure_reason: str | None = None
-        backend_for_start = (
-            "dense" if context_prepared_by_cpu_fallback else inner_backend
-        )
         try:
             artifacts = run_start(
                 context=solver_context,
                 start=start,
                 state=state_for_start,
-                backend=backend_for_start,
-                fallback_policy=(
-                    "device_only"
-                    if context_prepared_by_cpu_fallback
-                    else dense_fallback_policy
-                ),
             )
             provenance = artifacts.exactness_provenance
             compressed_terminal_not_certified = bool(
@@ -3536,10 +3222,6 @@ def fit_observed_data_pairwise_fusion(
             )
             if compressed_terminal_not_certified:
                 attempted_artifacts = artifacts
-                if normalize_inner_backend(backend_for_start) == "quotient_workset":
-                    quotient_terminal_failure_reason = (
-                        "dense_current_device_after_compressed_not_certified"
-                    )
                 cpu_seed = (
                     artifacts.torch_result.phi_raw
                     if artifacts.torch_result is not None
@@ -3555,14 +3237,11 @@ def fit_observed_data_pairwise_fusion(
                     context=solver_context,
                     start=cpu_seed,
                     state=None,
-                    backend="dense",
-                    fallback_policy="device_only",
                 )
                 artifacts = merge_attempted_work(artifacts, attempted_artifacts)
                 artifacts = mark_fallback(
                     artifacts,
                     reason="dense_current_device_after_compressed_not_certified",
-                    quotient_failure_reason=quotient_terminal_failure_reason,
                 )
             if context_prepared_by_cpu_fallback:
                 artifacts = mark_fallback(
@@ -3638,8 +3317,6 @@ def fit_observed_data_pairwise_fusion(
                     context=cpu_fallback_context,
                     start=cpu_start,
                     state=None,
-                    backend="dense",
-                    fallback_policy="device_only",
                 )
             except (MemoryError, torch.OutOfMemoryError) as cpu_exc:
                 if isinstance(cpu_exc, ExactSolverResourceLimit):
@@ -3653,7 +3330,6 @@ def fit_observed_data_pairwise_fusion(
                 artifacts,
                 reason="dense_cpu_after_solver_resource_limit",
                 backend_name="admm_complete_graph_cpu_fallback",
-                quotient_failure_reason=quotient_terminal_failure_reason,
             )
         start_artifacts.append(artifacts)
         if best_artifacts is None:

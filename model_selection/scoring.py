@@ -455,9 +455,7 @@ def _select_best_partition_leftmost(
         )
     selected_signature = min(signature_order)[-1]
     best_value = float(partition_scores[selected_signature][0])
-    optimal_mask = (
-        frame[model_key].astype(str).eq(selected_signature).to_numpy(bool)
-    )
+    optimal_mask = frame[model_key].astype(str).eq(selected_signature).to_numpy(bool)
     tied = frame.loc[optimal_mask].copy()
     if "penalized_objective" not in tied.columns:
         tied["penalized_objective"] = np.inf
@@ -549,7 +547,7 @@ def _profile_penalty_from_fit(fit: FitResult) -> tuple[float, float]:
 def _adaptive_score_column(normalized_score: str) -> str:
     if normalized_score in {
         "fixed_partition_bic",
-        "clonal_fixed_partition_bic",
+        "fixed_partition_dirichlet_score",
     }:
         return "selection_score"
     raise ValueError(f"Unknown normalized selection score: {normalized_score}")
@@ -591,9 +589,7 @@ def _selected_lambda_signature_interval(
     eligible = search_df.loc[_bic_selection_eligible_mask(search_df)].copy()
     if eligible.empty or model_key not in eligible.columns:
         return selected_lambda, selected_lambda, 0.0
-    same_partition = eligible.loc[
-        eligible[model_key].astype(str).eq(signature)
-    ]
+    same_partition = eligible.loc[eligible[model_key].astype(str).eq(signature)]
     lambdas = pd.to_numeric(same_partition["lambda"], errors="coerce").to_numpy(
         dtype=float
     )

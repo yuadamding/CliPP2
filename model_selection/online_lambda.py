@@ -39,7 +39,11 @@ class OnlineLambdaConfig:
     lambda_max: float = 1e6
     transition_log10_width_tolerance: float = 0.05
     score_relative_tolerance: float = 1e-8
+    # Exploration and boundary/event refinement have separate budgets.  A
+    # refinement must not silently consume the last opportunity to explore a
+    # new part of the lambda path (or vice versa).
     max_unique_lambdas: int = 40
+    max_refinement_lambdas: int = 40
     max_solver_retries_per_lambda: int = 2
     partition_event_mode: bool = False
 
@@ -69,6 +73,8 @@ class OnlineLambdaConfig:
             raise ValueError("score_relative_tolerance must be finite and nonnegative.")
         if int(self.max_unique_lambdas) < 1:
             raise ValueError("max_unique_lambdas must be positive.")
+        if int(self.max_refinement_lambdas) < 0:
+            raise ValueError("max_refinement_lambdas must be nonnegative.")
         if int(self.max_solver_retries_per_lambda) < 0:
             raise ValueError("max_solver_retries_per_lambda must be nonnegative.")
 
@@ -94,9 +100,7 @@ class OnlineLambdaObservation:
     certificate_status: str = "unknown"
     backend_name: str = "unknown"
     solver_iterations: int = 0
-    branch_signature: str = "unanchored"
     model_signature: str = ""
-    winning_witness_set_signature: str = ""
     score_numerical_uncertainty: float = 0.0
     degrees_of_freedom: int = 0
 
@@ -132,6 +136,12 @@ def _geometric_midpoint(left: float, right: float) -> float | None:
     if not (float(left) < midpoint < float(right)):
         return None
     return float(midpoint)
+
+
+def _is_refinement_phase(phase: str) -> bool:
+    """Return whether a proposal spends the dedicated refinement budget."""
+
+    return str(phase).startswith("refine_")
 
 
 class OnlineLambdaController:
@@ -175,8 +185,10 @@ class OnlineLambdaController:
         self._retry_key: float | None = None
         self._attempt_count: dict[float, int] = {}
         self._attempted_lambda: dict[float, float] = {}
+        self._attempted_phase: dict[float, str] = {}
         self._proposal_history: list[OnlineLambdaProposal] = []
         self._solver_recovery_keys: set[float] = set()
+        self._uncertified_exhausted_keys: set[float] = set()
         self._stop_reason: str | None = None
 
     @property
@@ -279,6 +291,7 @@ class OnlineLambdaController:
         key = _lambda_key(proposal.lambda_value)
         if key not in self._attempted_lambda:
             self._attempted_lambda[key] = float(proposal.lambda_value)
+            self._attempted_phase[key] = str(proposal.phase)
         self._pending = proposal
         self._proposal_history.append(proposal)
         return proposal
@@ -346,10 +359,6 @@ class OnlineLambdaController:
                     warm_start_lambda=None,
                 )
             )
-        if len(self._attempted_lambda) >= int(self.config.max_unique_lambdas):
-            self._stop_reason = "online_lambda_candidate_budget_reached"
-            return None
-
         proposal = self._choose_from_certified_path()
         if proposal is None:
             return None
@@ -357,7 +366,76 @@ class OnlineLambdaController:
         if key in self._attempted_lambda:
             self._stop_reason = "online_lambda_no_distinct_float_available"
             return None
+        refinement_count = sum(
+            _is_refinement_phase(phase) for phase in self._attempted_phase.values()
+        )
+        exploration_count = len(self._attempted_phase) - int(refinement_count)
+        if (
+            _is_refinement_phase(proposal.phase)
+            and exploration_count < int(self.config.max_unique_lambdas)
+        ):
+            # Establish broad path coverage before spending the independent
+            # event-resolution budget.  Refining the first local transition
+            # encountered can otherwise consume the small balanced budget and
+            # hide a remote, better partition behind two worse guards.
+            fallback = self._budget_fallback_exploration()
+            if fallback is not None:
+                proposal = fallback
+        if _is_refinement_phase(proposal.phase):
+            if refinement_count >= int(self.config.max_refinement_lambdas):
+                # A locally preferred refinement must not strand unused
+                # exploration capacity.  Continue widening the observed path
+                # when possible; only stop once that independent budget is
+                # also unavailable.
+                if exploration_count < int(self.config.max_unique_lambdas):
+                    fallback = self._budget_fallback_exploration()
+                    if fallback is not None:
+                        proposal = fallback
+                    else:
+                        self._stop_reason = (
+                            "online_lambda_refinement_budget_reached"
+                        )
+                        return None
+                else:
+                    self._stop_reason = "online_lambda_refinement_budget_reached"
+                    return None
+        elif exploration_count >= int(self.config.max_unique_lambdas):
+            self._stop_reason = "online_lambda_candidate_budget_reached"
+            return None
+        key = _lambda_key(proposal.lambda_value)
+        if key in self._attempted_lambda:
+            self._stop_reason = "online_lambda_no_distinct_float_available"
+            return None
         return self._record_proposal(proposal)
+
+    def _budget_fallback_exploration(self) -> OnlineLambdaProposal | None:
+        """Use spare exploration capacity after local refinement is exhausted."""
+
+        points = list(self.observations)
+        if not points:
+            return None
+        lower_span = max(log(self.initial_lambda) - log(points[0].lambda_value), 0.0)
+        upper_span = max(log(points[-1].lambda_value) - log(self.initial_lambda), 0.0)
+        directions = (-1, 1) if lower_span <= upper_span else (1, -1)
+        original_stop_reason = self._stop_reason
+        for direction in directions:
+            self._stop_reason = None
+            if bool(self.config.partition_event_mode):
+                proposal = self._event_outward_proposal(
+                    points,
+                    direction=direction,
+                    reason="refinement_budget_exhausted_continue_union_exploration",
+                )
+            else:
+                proposal = self._outward_proposal(
+                    points,
+                    direction=direction,
+                    reason="refinement_budget_exhausted_continue_path_exploration",
+                )
+            if proposal is not None:
+                return proposal
+        self._stop_reason = original_stop_reason
+        return None
 
     def _retry_proposal(self) -> OnlineLambdaProposal | None:
         if self._retry_key is None:
@@ -373,10 +451,19 @@ class OnlineLambdaController:
                 return OnlineLambdaProposal(
                     lambda_value=float(failed.lambda_value),
                     phase="solver_recovery",
-                    reason="monotone_full_step_solver_recovery",
+                    reason="higher_effort_fixed_objective_solver_recovery",
                     warm_start_lambda=None,
                     retry_number=attempts,
                 )
+            if self._certified:
+                # One locally uncertifiable lambda must not erase already
+                # certified path evidence or prevent refinement of other
+                # observed partition events.  Record it as an impassable
+                # numerical boundary and continue elsewhere; the final search
+                # remains explicitly unresolved.
+                self._uncertified_exhausted_keys.add(self._retry_key)
+                self._retry_key = None
+                return None
             self._stop_reason = "online_lambda_uncertified_exact_fusion_result"
             return None
         failed = self._last_observation
@@ -447,10 +534,6 @@ class OnlineLambdaController:
     def _event_signature(observation: OnlineLambdaObservation) -> tuple[object, ...]:
         return (
             str(observation.model_signature or observation.partition_signature),
-            str(
-                observation.winning_witness_set_signature
-                or observation.branch_signature
-            ),
             int(observation.n_clusters),
             bool(observation.partition_certified),
             bool(OnlineLambdaController._selection_score_is_available(observation)),
@@ -460,38 +543,30 @@ class OnlineLambdaController:
         self,
         points: list[OnlineLambdaObservation],
     ) -> OnlineLambdaProposal | None:
-        """Refine union-model events without assuming a monotone guide-K path."""
+        """Refine partition events without assuming a monotone guide-K path."""
 
         best = self.best_observation
-        best_upper = (
-            float("inf")
-            if best is None
-            else float(best.partition_icl)
-            + max(float(best.score_numerical_uncertainty), 0.0)
-        )
-        score_margin = float(self.config.score_relative_tolerance) * (
-            1.0 + abs(best_upper) if np.isfinite(best_upper) else 1.0
-        )
         event_intervals: list[
             tuple[OnlineLambdaObservation, OnlineLambdaObservation]
         ] = []
         for left, right in zip(points[:-1], points[1:]):
             if self._event_signature(left) == self._event_signature(right):
                 continue
-            competitive = best is None or any(
-                self._selection_score_is_available(item)
-                and float(item.partition_icl)
-                - max(float(item.score_numerical_uncertainty), 0.0)
-                <= best_upper + score_margin
-                for item in (left, right)
-            )
-            if competitive and not self._interval_resolved(left, right):
+            # Endpoint scores cannot rule out an unobserved partition inside
+            # the interval.  Retain every unresolved model event; otherwise a
+            # remote optimum can be hidden behind two inferior endpoint
+            # partitions.  The resource budget controls how many are refined.
+            if not self._interval_resolved(left, right):
                 event_intervals.append((left, right))
         if event_intervals:
             left, right = max(
                 event_intervals,
                 key=lambda pair: (
                     _log10_width(pair[0].lambda_value, pair[1].lambda_value),
+                    abs(
+                        log(float(pair[1].n_clusters))
+                        - log(float(pair[0].n_clusters))
+                    ),
                     -float(pair[0].lambda_value),
                 ),
             )
@@ -499,7 +574,7 @@ class OnlineLambdaController:
                 left,
                 right,
                 phase="refine_partition_event",
-                reason="union_model_partition_or_witness_event",
+                reason="partition_event",
             )
 
         if best is None:
@@ -507,7 +582,7 @@ class OnlineLambdaController:
             return self._event_outward_proposal(
                 points,
                 direction=direction,
-                reason="seek_first_available_union_model_score",
+                reason="seek_first_available_partition_score",
             )
 
         best_index = points.index(best)
@@ -537,7 +612,7 @@ class OnlineLambdaController:
             return self._event_outward_proposal(
                 points,
                 direction=direction,
-                reason="bracket_best_union_model_event",
+                reason="bracket_best_partition_event",
             )
 
         self._stop_reason = "online_lambda_partition_event_basin_resolved"
@@ -549,6 +624,7 @@ class OnlineLambdaController:
         *,
         direction: int,
         reason: str,
+        allow_opposite: bool = True,
     ) -> OnlineLambdaProposal | None:
         frontier = points[-1] if direction > 0 else points[0]
         neighbor = (
@@ -569,6 +645,16 @@ class OnlineLambdaController:
             max(candidate, float(self.config.lambda_min)),
             float(self.config.lambda_max),
         )
+        if _lambda_key(candidate) in self._uncertified_exhausted_keys:
+            if allow_opposite:
+                return self._event_outward_proposal(
+                    points,
+                    direction=-int(direction),
+                    reason=f"{reason}_opposite_of_uncertified_boundary",
+                    allow_opposite=False,
+                )
+            self._stop_reason = "online_lambda_uncertified_boundaries_exhausted"
+            return None
         if _lambda_key(candidate) == _lambda_key(frontier.lambda_value):
             self._stop_reason = (
                 "online_lambda_upper_search_bound_reached"
@@ -591,7 +677,6 @@ class OnlineLambdaController:
             (left, right)
             for left, right in zip(points[:-1], points[1:])
             if int(right.n_clusters) > int(left.n_clusters)
-            and str(right.branch_signature) == str(left.branch_signature)
         ]
         if not violations:
             return None
@@ -661,6 +746,7 @@ class OnlineLambdaController:
         *,
         direction: int,
         reason: str,
+        allow_opposite: bool = True,
     ) -> OnlineLambdaProposal | None:
         if direction not in (-1, 1):
             raise ValueError("direction must be -1 or +1.")
@@ -682,6 +768,16 @@ class OnlineLambdaController:
                 if direction > 0
                 else "online_lambda_lower_search_bound_reached"
             )
+            return None
+        if _lambda_key(candidate) in self._uncertified_exhausted_keys:
+            if allow_opposite:
+                return self._outward_proposal(
+                    points,
+                    direction=-int(direction),
+                    reason=f"{reason}_opposite_of_uncertified_boundary",
+                    allow_opposite=False,
+                )
+            self._stop_reason = "online_lambda_uncertified_boundaries_exhausted"
             return None
         return OnlineLambdaProposal(
             lambda_value=float(candidate),

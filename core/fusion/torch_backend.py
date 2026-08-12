@@ -11,6 +11,7 @@ from ...io.data import (
     TumorData,
     tumor_data_fingerprint,
 )
+from .defaults import DEFAULT_DTYPE
 from .graph_ops import (
     PDHG_PRECONDITIONER_ETA,
     graph_adjoint_edges,
@@ -281,8 +282,8 @@ def resolve_runtime(device: str | None, *, dtype: str | None = None) -> TorchRun
         runtime_device = torch.device("cpu")
     requested_dtype = "auto" if dtype is None else str(dtype).strip().lower()
     if requested_dtype == "auto":
-        runtime_dtype = torch.float64
-    elif requested_dtype == "float16":
+        requested_dtype = DEFAULT_DTYPE
+    if requested_dtype == "float16":
         runtime_dtype = torch.float16
     elif requested_dtype == "float32":
         runtime_dtype = torch.float32

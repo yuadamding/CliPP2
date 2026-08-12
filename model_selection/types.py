@@ -31,7 +31,6 @@ class FusionPartition:
         "solver_quotient",
         "verified_primal_equalities",
         "tolerance_defined_primal",
-        "anchor_protected_tolerance_primal",
     ]
     maximal: bool = False
     cross_close_edge_found: bool = False
@@ -53,84 +52,6 @@ class FusionPartition:
 
 
 @dataclass(frozen=True)
-class RawClonalBlockCertificate:
-    """Exact raw CCF-one block witnessed by one constrained mutation.
-
-    The witness identifies a seed-conditioned optimization branch.  The
-    biological model object is ``member_indices`` and its common CCF-one
-    profile, not the witness itself.
-    """
-
-    witness_index: int
-    witness_mutation_id: str
-    member_indices: np.ndarray
-    member_mutation_ids: tuple[str, ...]
-    block_signature: str
-    target: np.ndarray
-    common_center: np.ndarray
-    centroid: np.ndarray
-    maximum_member_residual: float
-    centroid_residual: float
-    equality_tolerance: float
-    mathematically_certified: bool
-    failure_reason: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "member_indices",
-            _immutable_array(self.member_indices, dtype=np.dtype(np.int64)),
-        )
-        object.__setattr__(
-            self,
-            "member_mutation_ids",
-            tuple(str(value) for value in self.member_mutation_ids),
-        )
-        for name in ("target", "common_center", "centroid"):
-            object.__setattr__(
-                self,
-                name,
-                _immutable_array(getattr(self, name), dtype=np.dtype(np.float64)),
-            )
-    @property
-    def cluster_size(self) -> int:
-        return int(self.member_indices.size)
-
-    @property
-    def certified(self) -> bool:
-        """Compatibility alias for mathematical certification only."""
-
-        return bool(self.mathematically_certified)
-
-
-@dataclass(frozen=True)
-class RawClonalBlockEvidence:
-    """Biological support diagnostics, separate from model feasibility."""
-
-    block_signature: str
-    cluster_size: int
-    observed_support_per_region: np.ndarray
-    total_depth_per_region: np.ndarray
-    median_depth_per_region: np.ndarray
-    minimum_cluster_size: int
-    minimum_observed_support_per_region: int
-    evidence_gate_passed: bool
-    evidence_failure_reason: str
-
-    def __post_init__(self) -> None:
-        for name, dtype in (
-            ("observed_support_per_region", np.dtype(np.int64)),
-            ("total_depth_per_region", np.dtype(np.float64)),
-            ("median_depth_per_region", np.dtype(np.float64)),
-        ):
-            object.__setattr__(
-                self,
-                name,
-                _immutable_array(getattr(self, name), dtype=dtype),
-            )
-
-
-@dataclass(frozen=True)
 class PartitionRefitSummary:
     labels: np.ndarray
     partition_signature: str
@@ -140,10 +61,6 @@ class PartitionRefitSummary:
     fit_loss: float
     nominal_df: int
     active_df: int
-    anchor_mode: Literal["none", "clonal_required"]
-    clonal_cluster: int | None
-    anchor_deviance_increase: float
-    second_best_anchor_deviance_increase: float
     finite_candidate_found: bool
     global_optimum_certified: bool
     loglik_source: str
@@ -157,12 +74,11 @@ class PartitionRefitSummary:
     refit_total_candidate_basins: int = 0
     refit_total_refined_candidates: int = 0
     refit_min_best_second_loss_gap: float = float("inf")
-    fixed_anchor_target: np.ndarray | None = None
-    anchor_block_signature: str = "none"
     global_lower_bound: float = float("-inf")
     global_optimality_gap: float = float("inf")
     global_certificate_method: str = "none"
     global_certificate_intervals: int = 0
+    refit_mode: str = "interval_certified"
 
     def __post_init__(self) -> None:
         if self.global_optimum_certified and (
@@ -187,27 +103,28 @@ class PartitionRefitSummary:
             "cluster_centers",
             _immutable_array(self.cluster_centers, dtype=np.dtype(np.float64)),
         )
-        if self.fixed_anchor_target is not None:
-            object.__setattr__(
-                self,
-                "fixed_anchor_target",
-                _immutable_array(
-                    self.fixed_anchor_target, dtype=np.dtype(np.float64)
-                ),
-            )
 
 
 @dataclass(frozen=True)
 class SelectionScore:
-    name: Literal["fixed_partition_bic", "clonal_fixed_partition_bic"]
+    name: Literal[
+        "fixed_partition_bic",
+        "fixed_partition_dirichlet_score",
+    ]
     value: float
     loglik: float
     penalty: float
     degrees_of_freedom: int
     n_eff: int
     partition_signature: str
-    anchor_block_signature: str = "none"
     numerical_uncertainty: float = 0.0
+    assignment_log_evidence: float = 0.0
+    assignment_code_weight: float = 0.0
+    assignment_penalty: float = 0.0
+    assignment_dirichlet_alpha: float = 1.0
+    assignment_model_id: str = "none"
+    assignment_symmetry_mode: str = "none"
+    assignment_arithmetic_uncertainty: float = 0.0
 
     @property
     def lower_bound(self) -> float:
@@ -227,22 +144,7 @@ class RawFusionCandidate:
     raw_objective_certified: bool
     eligible_for_selection: bool
     ineligibility_reason: str
-    anchor_seed_index: int | None = None
-    anchor_seed_mutation_id: str = "none"
-    anchor_cluster_label: int | None = None
-    anchor_block_signature: str = "none"
-    anchor_target: np.ndarray | None = None
-    anchor_search_complete: bool = False
-    clonal_block: RawClonalBlockCertificate | None = None
-    clonal_block_evidence: RawClonalBlockEvidence | None = None
-
-    def __post_init__(self) -> None:
-        if self.anchor_target is not None:
-            object.__setattr__(
-                self,
-                "anchor_target",
-                _immutable_array(self.anchor_target, dtype=np.dtype(np.float64)),
-            )
+    computation_profile: str = "strict"
 
 
 @dataclass(frozen=True)
@@ -255,6 +157,7 @@ class SelectedModel:
 
     def __post_init__(self) -> None:
         candidate = self.candidate
+        strict = str(candidate.computation_profile) == "strict"
         if self.selected_partition_signature != self.candidate.partition.signature:
             raise ValueError("Selected-model partition signature is inconsistent.")
         if not np.isclose(
@@ -270,33 +173,10 @@ class SelectedModel:
             raise ValueError("Selected model must have a certified raw objective.")
         if not candidate.partition.certified:
             raise ValueError("Selected model must have a certified partition.")
-        if not candidate.refit.global_optimum_certified:
+        if strict and not candidate.refit.global_optimum_certified:
             raise ValueError("Selected model must have a globally certified refit.")
         if candidate.score.partition_signature != self.selected_partition_signature:
             raise ValueError("Selected-model score signature is inconsistent.")
-        if candidate.score.name == "clonal_fixed_partition_bic":
-            clonal_block = candidate.clonal_block
-            if clonal_block is None or not clonal_block.certified:
-                raise ValueError(
-                    "Selected clonal model must have a certified raw CCF-one block."
-                )
-            if not candidate.anchor_search_complete:
-                raise ValueError(
-                    "Selected clonal model requires exact witness-search resolution."
-                )
-            if candidate.anchor_cluster_label is None:
-                raise ValueError("Selected clonal model is missing its cluster label.")
-            raw_anchor_cluster = int(candidate.anchor_cluster_label)
-            if candidate.refit.clonal_cluster != raw_anchor_cluster:
-                raise ValueError(
-                    "Selected refit must preserve the exact raw clonal cluster."
-                )
-            if candidate.anchor_block_signature != candidate.score.anchor_block_signature:
-                raise ValueError("Selected anchor-block score identity is inconsistent.")
-            if candidate.anchor_block_signature != clonal_block.block_signature:
-                raise ValueError("Selected clonal-block identity is inconsistent.")
-            if candidate.refit.anchor_block_signature != clonal_block.block_signature:
-                raise ValueError("Selected refit clonal-block identity is inconsistent.")
 
 
 @dataclass

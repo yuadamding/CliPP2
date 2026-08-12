@@ -5,7 +5,6 @@ import hashlib
 import numpy as np
 
 from ..core.model import FitResult
-from ..core.fusion.solver import cluster_labels_from_edges
 from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.fusion.refit import _canonical_labels as _canonical_partition_labels
 from ..core.fusion.types import (
@@ -13,16 +12,11 @@ from ..core.fusion.types import (
     DenseEdgeCertificate,
     PairwiseFusionGraph,
 )
-from ..io.data import TumorData
 from .config import (
     LIKELIHOOD_PARTITION_K_ANCHORS,
     LIKELIHOOD_PARTITION_K_MAX,
 )
-from .types import (
-    FusionPartition,
-    RawClonalBlockCertificate,
-    RawClonalBlockEvidence,
-)
+from .types import FusionPartition
 
 
 def _likelihood_partition_k_grid(num_mutations: int) -> list[int]:
@@ -187,144 +181,6 @@ def _partition_signature(
     return f"{len(blocks)}:{hasher.hexdigest()}"
 
 
-def _raw_clonal_block_signature(member_mutation_ids: tuple[str, ...]) -> str:
-    members = tuple(sorted(str(value) for value in member_mutation_ids))
-    digest = hashlib.sha256()
-    for value in members:
-        encoded = value.encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "little"))
-        digest.update(encoded)
-    return f"{len(members)}:{digest.hexdigest()[:24]}"
-
-
-def extract_exact_raw_clonal_block(
-    fit: FitResult,
-    *,
-    data: TumorData,
-    witness_index: int,
-    target: np.ndarray,
-    anchor_tolerance: float,
-) -> RawClonalBlockCertificate:
-    """Certify the exact raw CCF-one block containing a witness mutation."""
-
-    phi = np.asarray(fit.phi, dtype=np.float64)
-    target_array = np.asarray(target, dtype=np.float64).reshape(-1)
-    tolerance = float(anchor_tolerance)
-    witness = int(witness_index)
-    if phi.shape != (int(data.num_mutations), int(data.num_regions)):
-        raise ValueError("Raw CCF matrix does not match the tumor dimensions.")
-    if target_array.shape != (int(data.num_regions),):
-        raise ValueError("Raw clonal target must contain one value per region.")
-    if not np.isfinite(tolerance) or tolerance <= 0.0:
-        raise ValueError("Raw clonal-block equality tolerance must be positive.")
-    if not 0 <= witness < int(data.num_mutations):
-        raise ValueError("Raw clonal witness index is invalid.")
-
-    state = getattr(fit, "solver_state", None)
-    certificate = getattr(state, "certificate", None)
-    certificate_graph_hash_matches = True
-    if isinstance(certificate, CompressedEdgeCertificate):
-        expected_graph_hash = str(getattr(fit, "original_graph_hash", ""))
-        certificate_graph_hash_matches = bool(
-            expected_graph_hash
-            and str(certificate.graph_hash) == expected_graph_hash
-        )
-        certificate_labels = certificate.labels.detach().cpu().numpy()
-        if certificate_labels.shape != (int(data.num_mutations),):
-            raise ValueError("Compressed certificate labels have the wrong shape.")
-    # The biological block is the complete numerically equal-row target set,
-    # not a possibly finer solver-compression block. Membership is determined
-    # only from the solved raw CCF matrix; read-count heuristics never force a
-    # mutation into this set.
-    member_mask = np.max(np.abs(phi - target_array[None, :]), axis=1) <= tolerance
-    member_mask[witness] = True
-    member_indices = np.flatnonzero(member_mask).astype(np.int64)
-    member_ids = tuple(str(data.mutation_ids[index]) for index in member_indices)
-    member_phi = phi[member_indices]
-    centroid = np.mean(member_phi, axis=0)
-    common_center = phi[witness].copy()
-    member_residual = float(
-        np.max(np.abs(member_phi - target_array[None, :]))
-    )
-    centroid_residual = float(np.max(np.abs(centroid - target_array)))
-    if not certificate_graph_hash_matches:
-        failure_reason = "clonal_block_certificate_graph_hash_mismatch"
-    elif member_residual > tolerance:
-        failure_reason = "clonal_block_member_not_at_target"
-    elif centroid_residual > tolerance:
-        failure_reason = "clonal_block_centroid_not_at_target"
-    elif member_indices.size < 1:
-        failure_reason = "clonal_block_empty"
-    else:
-        failure_reason = "none"
-    return RawClonalBlockCertificate(
-        witness_index=witness,
-        witness_mutation_id=str(data.mutation_ids[witness]),
-        member_indices=member_indices,
-        member_mutation_ids=member_ids,
-        block_signature=_raw_clonal_block_signature(member_ids),
-        target=target_array,
-        common_center=common_center,
-        centroid=centroid,
-        maximum_member_residual=member_residual,
-        centroid_residual=centroid_residual,
-        equality_tolerance=tolerance,
-        mathematically_certified=failure_reason == "none",
-        failure_reason=failure_reason,
-    )
-
-
-def evaluate_raw_clonal_block_evidence(
-    block: RawClonalBlockCertificate,
-    *,
-    data: TumorData,
-    minimum_cluster_size: int = 1,
-    minimum_observed_support_per_region: int = 1,
-) -> RawClonalBlockEvidence:
-    """Evaluate biological support without changing raw-model eligibility."""
-
-    min_size = int(minimum_cluster_size)
-    min_support = int(minimum_observed_support_per_region)
-    if min_size < 1:
-        raise ValueError("Raw clonal evidence minimum size must be positive.")
-    if min_support < 0:
-        raise ValueError("Raw clonal evidence support must be nonnegative.")
-    members = np.asarray(block.member_indices, dtype=np.int64)
-    depth = np.asarray(data.total_counts, dtype=np.float64)[members]
-    observed = depth > 0.0
-    count_observed = getattr(data, "count_observed", None)
-    if count_observed is not None:
-        observed &= np.asarray(count_observed, dtype=bool)[members]
-    observed_support = np.sum(observed, axis=0).astype(np.int64)
-    total_depth = np.sum(np.where(observed, depth, 0.0), axis=0)
-    median_depth = np.asarray(
-        [
-            float(np.median(depth[observed[:, region], region]))
-            if np.any(observed[:, region])
-            else 0.0
-            for region in range(int(data.num_regions))
-        ],
-        dtype=np.float64,
-    )
-    if int(block.cluster_size) < min_size:
-        failure_reason = "clonal_block_below_evidence_minimum_size"
-    elif np.any(observed_support < min_support):
-        failure_reason = "clonal_block_insufficient_observed_support"
-    else:
-        failure_reason = "none"
-    return RawClonalBlockEvidence(
-        block_signature=str(block.block_signature),
-        cluster_size=int(block.cluster_size),
-        observed_support_per_region=observed_support,
-        total_depth_per_region=np.asarray(total_depth, dtype=np.float64),
-        median_depth_per_region=median_depth,
-        minimum_cluster_size=min_size,
-        minimum_observed_support_per_region=min_support,
-        evidence_gate_passed=failure_reason == "none",
-        evidence_failure_reason=failure_reason,
-    )
-
-
 def _exact_partition_diameters(phi: np.ndarray, labels: np.ndarray) -> np.ndarray:
     values = np.asarray(phi, dtype=np.float64)
     canonical = _canonical_partition_labels(labels)
@@ -347,15 +203,125 @@ def _exact_partition_diameters(phi: np.ndarray, labels: np.ndarray) -> np.ndarra
     return diameters
 
 
+def _maximum_cross_distance(
+    phi: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+    *,
+    stop_above: float,
+) -> float:
+    """Return the exact maximum cross-block distance with bounded workspace."""
+
+    if left.size == 0 or right.size == 0:
+        return 0.0
+    values = np.asarray(phi, dtype=np.float64)
+    # Limit the temporary ``left x right x region`` tensor.  This matters when a
+    # nearly fused tumor contains one very large block.
+    regions = max(int(values.shape[1]), 1)
+    rows_per_chunk = max(1, (8 * 1024 * 1024) // max(right.size * regions * 8, 1))
+    maximum = 0.0
+    for start in range(0, int(left.size), rows_per_chunk):
+        chunk = left[start : start + rows_per_chunk]
+        distances = np.linalg.norm(
+            values[chunk, None, :] - values[None, right, :],
+            axis=2,
+        )
+        if distances.size:
+            maximum = max(maximum, float(np.max(distances)))
+            if maximum > float(stop_above):
+                break
+    return maximum
+
+
+def _diameter_constrained_labels(
+    phi: np.ndarray,
+    *,
+    tolerance: float,
+) -> np.ndarray:
+    """Build a deterministic, merge-maximal complete-link partition.
+
+    A block is admissible exactly when its Euclidean diameter is no larger than
+    ``tolerance``.  Mutations are visited in lexicographic raw-CCF order and put
+    in the first block for which *every* pair remains in tolerance.  A block
+    created later has a seed that failed every earlier block and block growth
+    cannot reduce that distance, so the result is pairwise merge-maximal.  The
+    Each mutation follows the identical complete-link admission rule.
+    """
+
+    values = np.asarray(phi, dtype=np.float64)
+    num_mutations = int(values.shape[0])
+    if num_mutations == 0:
+        return np.zeros(0, dtype=np.int64)
+
+    blocks: list[list[int]] = []
+    remaining = np.arange(num_mutations, dtype=np.int64)
+    if remaining.size:
+        # ``np.lexsort`` uses the last key as primary.  Mutation index is the
+        # final tie-breaker, so equal raw CCF rows remain reproducible.
+        sort_keys: list[np.ndarray] = [remaining]
+        sort_keys.extend(
+            values[remaining, region]
+            for region in range(int(values.shape[1]) - 1, -1, -1)
+        )
+        remaining = remaining[np.lexsort(tuple(sort_keys))]
+
+    for index in remaining:
+        assigned = False
+        for block in blocks:
+            block_indices = np.asarray(block, dtype=np.int64)
+            distances = np.linalg.norm(
+                values[block_indices] - values[int(index)],
+                axis=1,
+            )
+            if distances.size and bool(
+                np.all(np.isfinite(distances))
+                and float(np.max(distances)) <= float(tolerance)
+            ):
+                block.append(int(index))
+                assigned = True
+                break
+        if not assigned:
+            blocks.append([int(index)])
+
+    labels = np.empty(num_mutations, dtype=np.int64)
+    for block_label, block in enumerate(blocks):
+        labels[np.asarray(block, dtype=np.int64)] = int(block_label)
+    return _canonical_partition_labels(labels)
+
+
+def _mergeable_cross_block_pair_found(
+    phi: np.ndarray,
+    labels: np.ndarray,
+    *,
+    tolerance: float,
+) -> bool:
+    """Return whether two reported blocks can be merged without excess diameter."""
+
+    canonical = _canonical_partition_labels(labels)
+    blocks = [
+        np.flatnonzero(canonical == cluster).astype(np.int64, copy=False)
+        for cluster in range(int(canonical.max()) + 1 if canonical.size else 0)
+    ]
+    for left_index, left in enumerate(blocks):
+        for right in blocks[left_index + 1 :]:
+            if _maximum_cross_distance(
+                phi,
+                left,
+                right,
+                stop_above=float(tolerance),
+            ) <= float(tolerance):
+                return True
+    return False
+
+
 def extract_certified_fusion_partition(
     fit: FitResult,
     *,
     graph: PairwiseFusionGraph,
     tolerance: float,
-    clonal_block: RawClonalBlockCertificate | None = None,
     mutation_ids: tuple[str, ...] | list[str] | None = None,
 ) -> FusionPartition:
-    """Extract one partition while protecting an exact raw CCF-one block."""
+    """Extract one deterministic, diameter-constrained raw-fusion partition."""
 
     tol = float(tolerance)
     if not np.isfinite(tol) or tol <= 0.0:
@@ -364,60 +330,37 @@ def extract_certified_fusion_partition(
     if phi.ndim != 2:
         raise ValueError("fit.phi must be a mutation-by-region matrix.")
 
-    protected_mask: np.ndarray | None = None
-    if clonal_block is None:
-        labels = _canonical_partition_labels(
-            cluster_labels_from_edges(
-                phi,
-                edge_u=graph.edge_u,
-                edge_v=graph.edge_v,
-                tol=tol,
-            )
-        )
-        source = "tolerance_defined_primal"
-    else:
-        protected_mask = np.zeros(phi.shape[0], dtype=bool)
-        protected_mask[np.asarray(clonal_block.member_indices, dtype=np.int64)] = True
-        if not np.any(protected_mask):
-            raise ValueError("Raw clonal block must contain at least one mutation.")
-        labels = np.zeros(phi.shape[0], dtype=np.int64)
-        remaining = np.flatnonzero(~protected_mask).astype(np.int64)
-        if remaining.size:
-            remap = np.full(phi.shape[0], -1, dtype=np.int64)
-            remap[remaining] = np.arange(remaining.size, dtype=np.int64)
-            edge_u = np.asarray(graph.edge_u, dtype=np.int64)
-            edge_v = np.asarray(graph.edge_v, dtype=np.int64)
-            keep = (~protected_mask[edge_u]) & (~protected_mask[edge_v])
-            remaining_labels = cluster_labels_from_edges(
-                phi[remaining],
-                edge_u=remap[edge_u[keep]],
-                edge_v=remap[edge_v[keep]],
-                tol=tol,
-            )
-            labels[remaining] = np.asarray(remaining_labels, dtype=np.int64) + 1
-        labels = _canonical_partition_labels(labels)
-        source = "anchor_protected_tolerance_primal"
+    labels = _diameter_constrained_labels(
+        phi,
+        tolerance=tol,
+    )
+    source = "tolerance_defined_primal"
 
     if labels.shape != (phi.shape[0],):
         raise ValueError("Partition labels do not match the raw fit mutation count.")
     diameters = _exact_partition_diameters(phi, labels)
     max_diameter = float(np.max(diameters)) if diameters.size else 0.0
     within_ok = bool(np.all(np.isfinite(diameters)) and max_diameter <= tol)
-    # Labels are the connected components of exactly the graph edges within
-    # tolerance (excluding only protected-block cross edges by definition), so
-    # a second O(E) maximality scan would repeat the construction.
-    cross_close = False
+    # ``cross_close`` retains its schema name but now has the precise complete-
+    # linkage meaning: two whole blocks, rather than merely one chaining edge,
+    # can be combined while preserving the diameter contract.
+    cross_close = _mergeable_cross_block_pair_found(
+        phi,
+        labels,
+        tolerance=tol,
+    )
     state = getattr(fit, "solver_state", None)
     certificate = getattr(state, "certificate", None)
     certificate_graph_hash_matches = True
     if isinstance(certificate, (CompressedEdgeCertificate, DenseEdgeCertificate)):
         expected_graph_hash = str(getattr(fit, "original_graph_hash", ""))
         certificate_graph_hash_matches = bool(
-            expected_graph_hash
-            and str(certificate.graph_hash) == expected_graph_hash
+            expected_graph_hash and str(certificate.graph_hash) == expected_graph_hash
         )
     certified = bool(
-        within_ok and not cross_close and certificate_graph_hash_matches
+        within_ok
+        and not cross_close
+        and certificate_graph_hash_matches
     )
     if not certificate_graph_hash_matches:
         failure_reason = (
@@ -425,10 +368,10 @@ def extract_certified_fusion_partition(
             if isinstance(certificate, CompressedEdgeCertificate)
             else "dense_certificate_graph_hash_mismatch"
         )
-    elif cross_close:
-        failure_reason = "cross_block_edge_within_partition_tolerance"
     elif not within_ok:
         failure_reason = "raw_partition_chaining_or_solver_tolerance"
+    elif cross_close:
+        failure_reason = "mergeable_cross_block_pair_within_partition_tolerance"
     else:
         failure_reason = "none"
     return FusionPartition(
@@ -440,7 +383,7 @@ def extract_certified_fusion_partition(
         diameter_exact=True,
         certified=certified,
         source=source,
-        maximal=not cross_close,
+        maximal=bool(within_ok and not cross_close),
         cross_close_edge_found=bool(cross_close),
         certificate_graph_hash_matches=bool(certificate_graph_hash_matches),
         certification_failure_reason=str(failure_reason),

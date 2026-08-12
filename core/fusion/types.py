@@ -14,7 +14,6 @@ from .defaults import (
     DEFAULT_WORKSET_MAX_BYTES,
     DEFAULT_WORKSET_MAX_EXPANSIONS,
     DenseFallbackPolicy as DenseFallbackPolicy,
-    InnerBackend as InnerBackend,
 )
 
 
@@ -28,10 +27,6 @@ CertificateScope: TypeAlias = Literal["full_original_graph"]
 
 class ExactSolverResourceLimit(MemoryError):
     """No configured exact backend can fit or fallback under its resource policy."""
-
-
-class InfeasibleRawClonalAnchor(ValueError):
-    """A requested hard CCF anchor lies outside a mutation's support."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,18 +161,6 @@ class DenseWarmState:
 
 
 @dataclass(frozen=True, slots=True)
-class QuotientWorksetWarmState:
-    phi: torch.Tensor
-    labels: torch.Tensor
-    centers: torch.Tensor
-    quotient_dual: torch.Tensor | None
-    internal_edge_ids: torch.Tensor
-    internal_dual: torch.Tensor
-    graph_hash: str
-    previous_lambda: float
-
-
-@dataclass(frozen=True, slots=True)
 class PrimalOnlyWarmState:
     phi: torch.Tensor
     structure_hint: torch.Tensor | None = None
@@ -185,21 +168,11 @@ class PrimalOnlyWarmState:
     structure_hint_is_heuristic: bool = True
 
 
-BackendWarmState: TypeAlias = (
-    DenseWarmState | QuotientWorksetWarmState | PrimalOnlyWarmState
-)
-
-
-@dataclass(frozen=True, slots=True)
-class QuotientFailureProvenance:
-    lambda_value: float
-    graph_hash: str
-    reason: str
+BackendWarmState: TypeAlias = DenseWarmState | PrimalOnlyWarmState
 
 
 @dataclass(frozen=True, slots=True)
 class BackendWorkCounters:
-    quotient_iterations: int = 0
     workset_iterations: int = 0
     workset_expansions: int = 0
     streamed_edge_passes: int = 0
@@ -225,27 +198,6 @@ class InnerSolveResult:
     fallback_reason: str = ""
 
 
-QuotientAttemptStatus: TypeAlias = Literal[
-    "certified",
-    "not_certified",
-    "workset_incomplete",
-    "resource_limit",
-    "quotient_unconverged",
-]
-
-
-@dataclass(frozen=True, slots=True)
-class QuotientAttemptResult:
-    status: QuotientAttemptStatus
-    phi_candidate: torch.Tensor
-    warm_state: QuotientWorksetWarmState | PrimalOnlyWarmState
-    certificate_hint: CompressedEdgeCertificate | None
-    exact_inner_objective: float
-    work_counters: BackendWorkCounters
-    reason: str
-    certified_result: InnerSolveResult | None = None
-
-
 @dataclass(frozen=True, slots=True)
 class ExactFusionProvenance:
     """Evidence used to decide fixed-objective candidate eligibility.
@@ -269,7 +221,6 @@ class ExactFusionProvenance:
     tolerance: float = 0.0
     backend_name: str = "unknown"
     backend_iterations: int = 0
-    quotient_iterations: int = 0
     workset_iterations: int = 0
     workset_expansions: int = 0
     streamed_edge_passes: int = 0
@@ -455,15 +406,7 @@ class SolverContext:
     graph_hash: str = ""
     objective_spec_hash: str = ""
     base_fusion_objective_hash: str = ""
-    raw_clonal_union_model_hash: str = ""
-    witness_subproblem_hash: str = ""
     resource_fallback: str | None = None
-    clonal_anchor_mutation_index: int | None = None
-    clonal_anchor_frozen_mutation_indices: tuple[int, ...] = ()
-    clonal_anchor_target: torch.Tensor | None = None
-    clonal_anchor_source: str = "none"
-    clonal_anchor_mode: str = "none"
-    clonal_anchor_feasibility_tolerance: float = 0.0
 
 
 @dataclass(slots=True)
@@ -473,7 +416,6 @@ class SolverState:
     previous_lambda: float
     warm_state: BackendWarmState | None = None
     certificate: GraphFusionCertificate | None = None
-    quotient_failure: QuotientFailureProvenance | None = None
     objective_spec_hash: str = ""
 
 

@@ -1,25 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
-
 import numpy as np
 import torch
 
 from ..io.data import TumorData
 from .fusion.defaults import (
     DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
-    DEFAULT_CERTIFICATE_MAX_ITER,
-    DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
     DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
     DEFAULT_DENSE_FALLBACK_POLICY,
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
-    DEFAULT_INNER_BACKEND,
     DEFAULT_OPTIMIZATION_TOLERANCE,
     DEFAULT_WORKSET_ADD_BATCH,
     DEFAULT_WORKSET_MAX_BYTES,
     DEFAULT_WORKSET_MAX_EXPANSIONS,
+)
+from .fusion.profiles import (
+    DEFAULT_COMPUTATION_PROFILE,
+    get_computation_profile,
 )
 from .fusion.solver import fit_observed_data_pairwise_fusion
 from .fusion.types import (
@@ -30,70 +29,11 @@ from .fusion.types import (
 )
 
 
-@dataclass(frozen=True)
-class RawClonalClusterConstraint:
-    """Existential raw CCF-one cluster model and its witness search plan."""
-
-    witness_mode: Literal[
-        "none",
-        "specified_witness",
-        "enumerated_witness",
-        "adaptive_bound_complete",
-        "screened_witness",
-    ]
-    target: np.ndarray
-    initial_witness_indices: tuple[int, ...]
-    eligible_witness_indices: tuple[int, ...]
-    feasibility_tolerance: float
-    equality_tolerance: float
-
-    def __post_init__(self) -> None:
-        target = np.asarray(self.target, dtype=np.float64).reshape(-1).copy()
-        target.setflags(write=False)
-        object.__setattr__(self, "target", target)
-        object.__setattr__(
-            self,
-            "initial_witness_indices",
-            tuple(int(index) for index in self.initial_witness_indices),
-        )
-        object.__setattr__(
-            self,
-            "eligible_witness_indices",
-            tuple(int(index) for index in self.eligible_witness_indices),
-        )
-
-    @property
-    def mode(self) -> str:
-        return str(self.witness_mode)
-
-    @property
-    def candidate_mutation_indices(self) -> tuple[int, ...]:
-        """Compatibility alias for pre-cluster-anchor callers."""
-
-        return self.initial_witness_indices
-
-    @property
-    def witness_indices(self) -> tuple[int, ...]:
-        """Compatibility alias for the initial witness queue."""
-
-        return self.initial_witness_indices
-
-    @property
-    def mandatory_member_indices(self) -> tuple[int, ...]:
-        """Removed count-derived constraint; retained only for compatibility."""
-
-        return ()
-
-
-# Compatibility import for code written against the first witness-seed draft.
-RawClonalAnchorSpec = RawClonalClusterConstraint
-
-
 @dataclass
 class FitOptions:
     lambda_value: float
-    outer_max_iter: int = 8
-    inner_max_iter: int = 30
+    outer_max_iter: int = 6
+    inner_max_iter: int = 25
     tol: float = DEFAULT_OPTIMIZATION_TOLERANCE
     major_prior: float = 0.5
     eps: float = 1e-6
@@ -103,78 +43,39 @@ class FitOptions:
     adaptive_weight_baseline: float = 1.0
     device: str = DEFAULT_DEVICE
     dtype: str = DEFAULT_DTYPE
-    summary_tol: float | None = 1e-4
-    selection_score: str = "clonal_fixed_partition_bic"
-    selection_anchor: str = "clonal_required"
-    raw_clonal_anchor_mode: str = "adaptive_bound_complete"
-    raw_clonal_anchor_mutation_ids: tuple[str, ...] = ()
-    raw_clonal_anchor_target: float = 1.0
-    raw_clonal_anchor_feasibility_tol: float = 1e-8
-    raw_clonal_anchor_candidate_max: int | None = 8
-    # Deprecated compatibility switch. It no longer changes the feasible set.
-    raw_clonal_include_unpenalized_overflow: bool = False
-    raw_clonal_cluster_equality_tol: float = 1e-8
-    raw_clonal_cluster_min_size: int = 1
-    raw_clonal_cluster_min_observed_support_per_region: int = 0
-    raw_clonal_evidence_min_observed_support_per_region: int = 1
-    selection_partition_tol: float = 1e-4
-    selection_refit_tol: float = 1e-7
-    selection_refit_max_iter: int = 128
-    reporting_partition_tol: float = 1e-4
+    summary_tol: float | None = 2e-4
+    selection_score: str = "fixed_partition_dirichlet_score"
+    selection_partition_tol: float = 2e-4
+    selection_refit_tol: float = 1e-5
+    selection_refit_max_iter: int = 64
     objective_shape: str = "unimodal"
-    inner_backend: str = DEFAULT_INNER_BACKEND
     workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES
     compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES
     dense_fallback_policy: str = DEFAULT_DENSE_FALLBACK_POLICY
     workset_add_batch: int = DEFAULT_WORKSET_ADD_BATCH
     workset_max_expansions: int = DEFAULT_WORKSET_MAX_EXPANSIONS
-    certificate_max_iter: int = DEFAULT_CERTIFICATE_MAX_ITER
-    certificate_refinement_rounds: int = DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS
+    certificate_max_iter: int = 128
+    certificate_refinement_rounds: int = 1
     certificate_column_tol_scale: float = DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE
     allow_heuristic_structure_splits: bool = True
-    materialize_full_dual: bool = False
     verbose: bool = False
+    computation_profile: str = DEFAULT_COMPUTATION_PROFILE
 
     def __post_init__(self) -> None:
+        profile = get_computation_profile(self.computation_profile)
+        self.computation_profile = profile.name
         score = str(self.selection_score).strip().lower().replace("-", "_")
-        anchor = str(self.selection_anchor).strip().lower().replace("-", "_")
-        mode_aliases = {
-            "none": "none",
-            "specified_seed": "specified_witness",
-            "specified_witness": "specified_witness",
-            "enumerated_seed": "enumerated_witness",
-            "enumerated_witness": "enumerated_witness",
-            "adaptive_exact": "adaptive_bound_complete",
-            "adaptive_bound_complete": "adaptive_bound_complete",
-            "screened_seed": "screened_witness",
-            "screened_witness": "screened_witness",
-        }
-        mode = mode_aliases.get(str(self.raw_clonal_anchor_mode).strip().lower())
-        if score not in {"fixed_partition_bic", "clonal_fixed_partition_bic"}:
+        if score not in {
+            "fixed_partition_bic",
+            "fixed_partition_dirichlet_score",
+        }:
             raise ValueError("Unknown fixed-partition selection score.")
-        if anchor not in {"none", "clonal_required"}:
-            raise ValueError("selection_anchor must be none or clonal_required.")
-        if mode is None:
-            raise ValueError("Unknown raw_clonal_anchor_mode.")
-        if (score == "clonal_fixed_partition_bic") != (
-            anchor == "clonal_required"
-        ):
-            raise ValueError("Selection score and anchor mode are inconsistent.")
-        if (anchor == "clonal_required") != (mode != "none"):
-            raise ValueError("Selection anchor and raw anchor mode are inconsistent.")
         self.selection_score = score
-        self.selection_anchor = anchor
-        self.raw_clonal_anchor_mode = mode
-        self.raw_clonal_anchor_mutation_ids = tuple(
-            str(value) for value in self.raw_clonal_anchor_mutation_ids
-        )
         finite_positive = {
             "tol": self.tol,
             "eps": self.eps,
             "selection_partition_tol": self.selection_partition_tol,
             "selection_refit_tol": self.selection_refit_tol,
-            "reporting_partition_tol": self.reporting_partition_tol,
-            "raw_clonal_cluster_equality_tol": self.raw_clonal_cluster_equality_tol,
             "certificate_column_tol_scale": self.certificate_column_tol_scale,
         }
         for name, value in finite_positive.items():
@@ -184,63 +85,8 @@ class FitOptions:
             raise ValueError("lambda_value must be finite and nonnegative.")
         if not 0.0 < float(self.major_prior) < 1.0:
             raise ValueError("major_prior must lie strictly in (0, 1).")
-        if float(self.raw_clonal_anchor_target) != 1.0:
-            raise ValueError("The production raw clonal target must equal CCF one.")
-        if (
-            not np.isfinite(float(self.raw_clonal_anchor_feasibility_tol))
-            or float(self.raw_clonal_anchor_feasibility_tol) < 0.0
-        ):
-            raise ValueError("Raw anchor feasibility tolerance must be nonnegative.")
         if int(self.selection_refit_max_iter) < 1:
             raise ValueError("selection_refit_max_iter must be positive.")
-        if mode == "specified_witness" and len(
-            self.raw_clonal_anchor_mutation_ids
-        ) != 1:
-            raise ValueError("specified_witness requires exactly one mutation ID.")
-        if mode != "specified_witness" and self.raw_clonal_anchor_mutation_ids:
-            raise ValueError("Witness mutation IDs apply only to specified mode.")
-        if mode in {"adaptive_bound_complete", "screened_witness"} and (
-            self.raw_clonal_anchor_candidate_max is None
-            or int(self.raw_clonal_anchor_candidate_max) < 1
-        ):
-            raise ValueError("Adaptive/screened witness search requires a positive batch.")
-        if int(self.raw_clonal_cluster_min_size) < 1:
-            raise ValueError("Raw clonal cluster minimum size must be positive.")
-        if int(self.raw_clonal_cluster_min_observed_support_per_region) < 0:
-            raise ValueError("Raw clonal observed support must be nonnegative.")
-        if int(self.raw_clonal_evidence_min_observed_support_per_region) < 0:
-            raise ValueError("Raw clonal evidence support must be nonnegative.")
-        if effective_raw_clonal_equality_tolerance(self) > float(
-            self.selection_partition_tol
-        ):
-            raise ValueError(
-                "Effective raw clonal equality tolerance must not exceed the "
-                "selection partition tolerance."
-            )
-
-
-def effective_raw_clonal_equality_tolerance(options: FitOptions) -> float:
-    """Numerical CCF-one equality tolerance bound to solver precision.
-
-    The configured value is a floor, not an independent claim of greater
-    precision. The default certificate column tolerance is the raw primal
-    tolerance multiplied by ``certificate_column_tol_scale``.
-    """
-
-    dtype_name = str(options.dtype).strip().lower()
-    if dtype_name == "float16":
-        machine_epsilon = float(np.finfo(np.float16).eps)
-    elif dtype_name == "float32":
-        machine_epsilon = float(np.finfo(np.float32).eps)
-    else:
-        machine_epsilon = float(np.finfo(np.float64).eps)
-    configured = float(options.raw_clonal_cluster_equality_tol)
-    primal = float(options.tol)
-    certificate = float(options.certificate_column_tol_scale) * primal
-    values = (configured, machine_epsilon, primal, certificate)
-    if not all(np.isfinite(value) and value > 0.0 for value in values):
-        raise ValueError("Raw clonal equality tolerance inputs must be positive.")
-    return float(max(values))
 
 
 @dataclass
@@ -339,7 +185,6 @@ class FitResult:
     inner_solver: str = "unknown"
     inner_backend: str = "unknown"
     backend_iterations: int = 0
-    quotient_iterations: int = 0
     workset_iterations: int = 0
     workset_expansions: int = 0
     streamed_edge_passes: int = 0
@@ -355,8 +200,6 @@ class FitResult:
     objective_faithful: bool = False
     objective_spec_hash: str = ""
     base_fusion_objective_hash: str = ""
-    raw_clonal_union_model_hash: str = ""
-    witness_subproblem_hash: str = ""
     original_graph_hash: str = ""
     certificate_problem_hash: str = ""
     certificate_scope: str = "unknown"
@@ -368,22 +211,6 @@ class FitResult:
     path_posterior: np.ndarray | None = None
     likelihood_model_id: str = "clipp2_legacy_major_minor_v1"
     likelihood_eps: float = 1e-6
-    raw_clonal_anchor_mutation_index: int | None = None
-    raw_clonal_anchor_target: np.ndarray | None = None
-    raw_clonal_anchor_source: str = "none"
-    raw_clonal_anchor_mode: str = "none"
-    raw_clonal_anchor_constraint_residual: float = 0.0
-    raw_clonal_anchor_frozen_coordinate_count: int = 0
-    raw_clonal_anchor_frozen_mutation_indices: tuple[int, ...] = ()
-    raw_clonal_anchor_search_complete: bool = False
-    raw_clonal_anchor_total_eligible_candidates: int = 0
-    raw_clonal_anchor_candidates_evaluated: int = 0
-    raw_clonal_anchor_objective_rank: int = 0
-    raw_clonal_anchor_objective_gap_to_second: float = float("inf")
-    raw_clonal_anchor_screening_rule: str = "none"
-    raw_clonal_witness_coverage_certified: bool = False
-    raw_clonal_branch_stationarity_certified: bool = False
-    raw_clonal_union_global_optimum_certified: bool = False
 
 
 def fit_fixed_objective(
@@ -421,7 +248,6 @@ def fit_fixed_objective(
         dtype=str(options.dtype),
         summary_tol=options.summary_tol,
         objective_shape=str(options.objective_shape),
-        inner_backend=str(options.inner_backend),
         workset_max_bytes=int(options.workset_max_bytes),
         compressed_cache_max_bytes=int(options.compressed_cache_max_bytes),
         dense_fallback_policy=str(options.dense_fallback_policy),
@@ -575,9 +401,6 @@ def fit_fixed_objective(
             if provenance is not None
             else getattr(artifacts, "inner_iterations", 0)
         ),
-        quotient_iterations=int(
-            provenance.quotient_iterations if provenance is not None else 0
-        ),
         workset_iterations=int(
             provenance.workset_iterations if provenance is not None else 0
         ),
@@ -627,14 +450,6 @@ def fit_fixed_objective(
             if solver_context is None
             else str(solver_context.base_fusion_objective_hash)
         ),
-        raw_clonal_union_model_hash=(
-            ""
-            if solver_context is None
-            else str(solver_context.raw_clonal_union_model_hash)
-        ),
-        witness_subproblem_hash=(
-            "" if solver_context is None else str(solver_context.witness_subproblem_hash)
-        ),
         original_graph_hash=str(
             provenance.original_graph_hash if provenance is not None else ""
         ),
@@ -666,70 +481,11 @@ def fit_fixed_objective(
             )
         ),
         likelihood_eps=float(options.eps),
-        raw_clonal_anchor_mutation_index=(
-            None
-            if solver_context is None
-            or solver_context.clonal_anchor_mutation_index is None
-            else int(solver_context.clonal_anchor_mutation_index)
-        ),
-        raw_clonal_anchor_target=(
-            None
-            if solver_context is None or solver_context.clonal_anchor_target is None
-            else solver_context.clonal_anchor_target.detach().cpu().numpy().copy()
-        ),
-        raw_clonal_anchor_source=(
-            "none"
-            if solver_context is None
-            else str(solver_context.clonal_anchor_source)
-        ),
-        raw_clonal_anchor_mode=(
-            "none" if solver_context is None else str(solver_context.clonal_anchor_mode)
-        ),
-        raw_clonal_anchor_constraint_residual=(
-            0.0
-            if solver_context is None
-            or not solver_context.clonal_anchor_frozen_mutation_indices
-            or solver_context.clonal_anchor_target is None
-            else float(
-                np.max(
-                    np.abs(
-                        np.asarray(artifacts.phi, dtype=np.float64)[
-                            np.asarray(
-                                solver_context.clonal_anchor_frozen_mutation_indices,
-                                dtype=np.int64,
-                            )
-                        ]
-                        - solver_context.clonal_anchor_target.detach()
-                        .cpu()
-                        .numpy()[None, :]
-                    )
-                )
-            )
-        ),
-        raw_clonal_anchor_frozen_coordinate_count=(
-            0
-            if solver_context is None
-            else int(
-                len(solver_context.clonal_anchor_frozen_mutation_indices)
-                * data.num_regions
-            )
-        ),
-        raw_clonal_anchor_frozen_mutation_indices=(
-            ()
-            if solver_context is None
-            else tuple(
-                int(index)
-                for index in solver_context.clonal_anchor_frozen_mutation_indices
-            )
-        ),
     )
 
 
 __all__ = [
     "FitOptions",
     "FitResult",
-    "RawClonalClusterConstraint",
-    "RawClonalAnchorSpec",
-    "effective_raw_clonal_equality_tolerance",
     "fit_fixed_objective",
 ]

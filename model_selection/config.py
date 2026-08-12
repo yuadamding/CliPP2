@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 SELECTION_SCORE_NAMES = (
-    "clonal_fixed_partition_bic",
+    "fixed_partition_dirichlet_score",
     "fixed_partition_bic",
 )
-FINAL_PHI_WARD_LADDER_KMAX = 0
-PARTITION_ICL_DIRICHLET_ALPHA = 1.0
-
 PARTITION_GUIDED_ADMM_MAX_UNIQUE_LAMBDAS = 12
 PARTITION_GUIDED_ADMM_MAX_SOLVER_RETRIES_PER_LAMBDA = 4
 # A mild superlinear degree correction keeps the adaptive guide traversable

@@ -9,10 +9,11 @@ import torch
 
 from ...io.data import TumorData
 from ..bic import (
+    PARTITION_DIRICHLET_SCORE_WEIGHT,
     bic_degrees_of_freedom,
     cluster_sizes_from_labels,
     compute_bic_with_df,
-    compute_partition_icl,
+    compute_partition_dirichlet_score,
     effective_bic_mutation_region_count,
 )
 from .refit import (
@@ -761,18 +762,19 @@ def _repair_empty_clusters(labels: np.ndarray, cost: np.ndarray) -> np.ndarray:
     return labels
 
 
-def _classification_log_cluster_weights(
+def _classification_leave_one_out_log_cluster_weights(
     labels: np.ndarray,
     *,
     num_clusters: int,
     alpha: float,
 ) -> np.ndarray:
-    """Return smoothed log cluster proportions for classification-EM.
+    """Return each mutation's Dirichlet conditional log cluster weights.
 
-    The read-count likelihood used by the partition refit is conditional on the
-    mutation labels.  Adding ``log(pi_k)`` to the classification likelihood makes
-    the reassignment step account for the probability of those labels instead of
-    treating every requested component as equally likely regardless of support.
+    For mutation ``i`` and block ``k``, the integrated allocation conditional is
+    ``(n[k, -i] + alpha) / (n - 1 + K * alpha)``. The mutation being reassigned
+    must therefore be removed from its current block count. Using the full count
+    would create a self-reinforcing update that is not a conditional move under
+    the Dirichlet-integrated exact-partition score.
     """
     labels = np.asarray(labels, dtype=np.int64).reshape(-1)
     num_clusters = int(num_clusters)
@@ -787,8 +789,12 @@ def _classification_log_cluster_weights(
         raise ValueError("labels must be in [0, num_clusters).")
 
     counts = np.bincount(labels, minlength=num_clusters).astype(np.float64, copy=False)
-    probabilities = (counts + alpha) / (
-        float(labels.size) + alpha * float(num_clusters)
+    leave_one_out_counts = np.broadcast_to(
+        counts[None, :], (labels.size, num_clusters)
+    ).copy()
+    leave_one_out_counts[np.arange(labels.size), labels] -= 1.0
+    probabilities = (leave_one_out_counts + alpha) / (
+        float(labels.size - 1) + alpha * float(num_clusters)
     )
     return np.log(probabilities)
 
@@ -798,19 +804,21 @@ def _classification_assignment_cost(
     labels: np.ndarray,
     *,
     alpha: float,
+    code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
 ) -> np.ndarray:
-    """Add the negative log cluster-proportion term to mutation/cluster costs."""
+    """Add the weighted negative log allocation term to assignment costs."""
     count_cost = np.asarray(count_cost)
     if count_cost.ndim != 2 or count_cost.shape[1] <= 0:
         raise ValueError("count_cost must be a non-empty mutation-by-cluster matrix.")
     if np.asarray(labels).reshape(-1).size != int(count_cost.shape[0]):
         raise ValueError("labels must contain one entry per mutation cost row.")
-    log_weights = _classification_log_cluster_weights(
+    log_weights = _classification_leave_one_out_log_cluster_weights(
         labels,
         num_clusters=int(count_cost.shape[1]),
         alpha=float(alpha),
     )
-    return count_cost - log_weights[None, :]
+    weight = _validated_classification_code_weight(code_weight)
+    return count_cost - weight * log_weights
 
 
 def _classification_refit_score(
@@ -819,13 +827,31 @@ def _classification_refit_score(
     refit: PartitionRefitResult,
     *,
     alpha: float,
+    code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
 ) -> float:
-    return compute_partition_icl(
+    return compute_partition_dirichlet_score(
         float(refit.loglik),
         cluster_sizes_from_labels(labels),
         data,
         alpha=float(alpha),
+        code_weight=_validated_classification_code_weight(code_weight),
     )
+
+
+def _classification_score_strictly_improves(
+    proposed_score: float,
+    current_score: float,
+) -> bool:
+    """Require a deterministic improvement before accepting a CEM update."""
+
+    proposed = float(proposed_score)
+    current = float(current_score)
+    if not np.isfinite(proposed):
+        return False
+    if not np.isfinite(current):
+        return True
+    tolerance = 64.0 * np.finfo(np.float64).eps * (1.0 + abs(proposed) + abs(current))
+    return bool(proposed < current - tolerance)
 
 
 def _validated_refinement_labels(
@@ -846,6 +872,13 @@ def _validate_classification_weight_alpha(alpha: float | None) -> None:
         raise ValueError("classification_weight_alpha must be positive and finite.")
 
 
+def _validated_classification_code_weight(code_weight: float) -> float:
+    weight = float(code_weight)
+    if not np.isfinite(weight) or weight < 0.0:
+        raise ValueError("classification_code_weight must be nonnegative and finite.")
+    return weight
+
+
 def refine_partition_likelihood(
     data: TumorData,
     labels: np.ndarray,
@@ -857,11 +890,15 @@ def refine_partition_likelihood(
     refit_max_iter: int = 32,
     hint_phi: np.ndarray | None = None,
     classification_weight_alpha: float | None = None,
+    classification_code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
     allow_component_death: bool = False,
     _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
 ) -> tuple[np.ndarray, PartitionRefitResult]:
     labels = _validated_refinement_labels(data, labels)
     _validate_classification_weight_alpha(classification_weight_alpha)
+    classification_code_weight = _validated_classification_code_weight(
+        classification_code_weight
+    )
 
     def refit_labels(current_labels: np.ndarray) -> PartitionRefitResult:
         if _refit_labels is not None:
@@ -875,27 +912,26 @@ def refine_partition_likelihood(
             max_iter=max(int(refit_max_iter), 32),
         )
 
-    refit: PartitionRefitResult | None = None
-    refit_key: bytes | None = None
+    refit = refit_labels(labels)
+    refit_key = _label_key(labels)
     best_labels: np.ndarray | None = None
     best_refit: PartitionRefitResult | None = None
     best_score = float("inf")
+    if classification_weight_alpha is not None:
+        best_score = _classification_refit_score(
+            data,
+            labels,
+            refit,
+            alpha=float(classification_weight_alpha),
+            code_weight=classification_code_weight,
+        )
+        best_labels = labels.copy()
+        best_refit = refit
     for _ in range(max(int(max_iter), 0)):
         labels_key = _label_key(labels)
-        if refit is None or refit_key != labels_key:
+        if refit_key != labels_key:
             refit = refit_labels(labels)
             refit_key = labels_key
-        if classification_weight_alpha is not None:
-            current_score = _classification_refit_score(
-                data,
-                labels,
-                refit,
-                alpha=float(classification_weight_alpha),
-            )
-            if current_score < best_score:
-                best_score = float(current_score)
-                best_labels = labels.copy()
-                best_refit = refit
         count_cost = _loss_to_centers(
             data,
             refit.cluster_centers,
@@ -909,6 +945,7 @@ def refine_partition_likelihood(
                 count_cost,
                 labels,
                 alpha=float(classification_weight_alpha),
+                code_weight=classification_code_weight,
             )
         )
         labels_next = np.argmin(assignment_cost, axis=1).astype(np.int64, copy=False)
@@ -918,20 +955,32 @@ def refine_partition_likelihood(
         if _label_key(labels_next) == labels_key:
             labels = labels_next
             break
+        if classification_weight_alpha is not None:
+            proposed_refit = refit_labels(labels_next)
+            proposed_score = _classification_refit_score(
+                data,
+                labels_next,
+                proposed_refit,
+                alpha=float(classification_weight_alpha),
+                code_weight=classification_code_weight,
+            )
+            # A simultaneous reassignment is only a proposal. Accept it only
+            # after an exact fixed-label refit proves that the declared score
+            # decreased; otherwise retain the current best state and stop.
+            if not _classification_score_strictly_improves(
+                proposed_score,
+                best_score,
+            ):
+                break
+            best_score = float(proposed_score)
+            best_labels = labels_next.copy()
+            best_refit = proposed_refit
+            refit = proposed_refit
+            refit_key = _label_key(labels_next)
         labels = labels_next
     labels_key = _label_key(labels)
-    if refit is None or refit_key != labels_key:
+    if refit_key != labels_key:
         refit = refit_labels(labels)
-        if classification_weight_alpha is not None:
-            final_score = _classification_refit_score(
-                data,
-                labels,
-                refit,
-                alpha=float(classification_weight_alpha),
-            )
-            if final_score < best_score:
-                best_labels = labels.copy()
-                best_refit = refit
     if (
         classification_weight_alpha is not None
         and best_labels is not None
@@ -997,9 +1046,6 @@ def partition_constrained_observed_refit_torch(
             refit_total_refined_candidates=0,
             refit_min_best_second_loss_gap=float("inf"),
             labels=labels_np.astype(np.int64, copy=True),
-            anchor_mode="none",
-            anchor_deviance_increase=0.0,
-            second_best_anchor_deviance_increase=float("inf"),
             loglik_source="partition_constrained_observed_mle_cuda_unimodal",
         )
 
@@ -1122,9 +1168,6 @@ def partition_constrained_observed_refit_torch(
         refit_total_refined_candidates=refit_coordinate_count,
         refit_min_best_second_loss_gap=float(best_second_loss_gap),
         labels=labels_np.astype(np.int64, copy=True),
-        anchor_mode="none",
-        anchor_deviance_increase=0.0,
-        second_best_anchor_deviance_increase=float("inf"),
         loglik_source="partition_constrained_observed_mle_cuda_unimodal",
     )
 
@@ -1144,6 +1187,7 @@ def refine_partition_likelihood_torch(
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
     classification_weight_alpha: float | None = None,
+    classification_code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
     allow_component_death: bool = False,
     _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
 ) -> tuple[np.ndarray, PartitionRefitResult]:
@@ -1158,6 +1202,7 @@ def refine_partition_likelihood_torch(
             refit_max_iter=int(refit_max_iter),
             hint_phi=None if hint_phi is None else _as_numpy(hint_phi),
             classification_weight_alpha=classification_weight_alpha,
+            classification_code_weight=classification_code_weight,
             allow_component_death=bool(allow_component_death),
             _refit_labels=_refit_labels,
         )
@@ -1170,6 +1215,9 @@ def refine_partition_likelihood_torch(
     )
     labels = _validated_refinement_labels(data, labels)
     _validate_classification_weight_alpha(classification_weight_alpha)
+    classification_code_weight = _validated_classification_code_weight(
+        classification_code_weight
+    )
 
     def refit_labels(current_labels: np.ndarray) -> PartitionRefitResult:
         if _refit_labels is not None:
@@ -1187,27 +1235,26 @@ def refine_partition_likelihood_torch(
             dtype=runtime.dtype,
         )
 
-    refit: PartitionRefitResult | None = None
-    refit_key: bytes | None = None
+    refit = refit_labels(labels)
+    refit_key = _label_key(labels)
     best_labels: np.ndarray | None = None
     best_refit: PartitionRefitResult | None = None
     best_score = float("inf")
+    if classification_weight_alpha is not None:
+        best_score = _classification_refit_score(
+            data,
+            labels,
+            refit,
+            alpha=float(classification_weight_alpha),
+            code_weight=classification_code_weight,
+        )
+        best_labels = labels.copy()
+        best_refit = refit
     for _ in range(max(int(max_iter), 0)):
         labels_key = _label_key(labels)
-        if refit is None or refit_key != labels_key:
+        if refit_key != labels_key:
             refit = refit_labels(labels)
             refit_key = labels_key
-        if classification_weight_alpha is not None:
-            current_score = _classification_refit_score(
-                data,
-                labels,
-                refit,
-                alpha=float(classification_weight_alpha),
-            )
-            if current_score < best_score:
-                best_score = float(current_score)
-                best_labels = labels.copy()
-                best_refit = refit
         cost_t = _loss_to_centers_torch(
             data,
             refit.cluster_centers,
@@ -1220,16 +1267,16 @@ def refine_partition_likelihood_torch(
         if classification_weight_alpha is None:
             assignment_cost_t = cost_t
         else:
-            log_weights = _classification_log_cluster_weights(
+            log_weights = _classification_leave_one_out_log_cluster_weights(
                 labels,
                 num_clusters=int(cost_t.shape[1]),
                 alpha=float(classification_weight_alpha),
             )
-            assignment_cost_t = cost_t - torch.as_tensor(
+            assignment_cost_t = cost_t - classification_code_weight * torch.as_tensor(
                 log_weights,
                 dtype=cost_t.dtype,
                 device=cost_t.device,
-            ).unsqueeze(0)
+            )
         labels_next = (
             torch.argmin(assignment_cost_t, dim=1)
             .detach()
@@ -1246,20 +1293,29 @@ def refine_partition_likelihood_torch(
         if _label_key(labels_next) == labels_key:
             labels = labels_next
             break
+        if classification_weight_alpha is not None:
+            proposed_refit = refit_labels(labels_next)
+            proposed_score = _classification_refit_score(
+                data,
+                labels_next,
+                proposed_refit,
+                alpha=float(classification_weight_alpha),
+                code_weight=classification_code_weight,
+            )
+            if not _classification_score_strictly_improves(
+                proposed_score,
+                best_score,
+            ):
+                break
+            best_score = float(proposed_score)
+            best_labels = labels_next.copy()
+            best_refit = proposed_refit
+            refit = proposed_refit
+            refit_key = _label_key(labels_next)
         labels = labels_next
     labels_key = _label_key(labels)
-    if refit is None or refit_key != labels_key:
+    if refit_key != labels_key:
         refit = refit_labels(labels)
-        if classification_weight_alpha is not None:
-            final_score = _classification_refit_score(
-                data,
-                labels,
-                refit,
-                alpha=float(classification_weight_alpha),
-            )
-            if final_score < best_score:
-                best_labels = labels.copy()
-                best_refit = refit
     if (
         classification_weight_alpha is not None
         and best_labels is not None
@@ -1292,9 +1348,13 @@ def generate_likelihood_partition_starts(
     dtype: str | torch.dtype | None = None,
     use_torch: bool = True,
     classification_weight_alpha: float | None = None,
+    classification_code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
     allow_component_death: bool = False,
 ) -> list[PartitionCandidate]:
     _validate_classification_weight_alpha(classification_weight_alpha)
+    classification_code_weight = _validated_classification_code_weight(
+        classification_code_weight
+    )
     use_torch_runtime = bool(use_torch)
     runtime: TorchRuntime | None = None
     partition_torch_data: TorchTumorData | None = None
@@ -1388,6 +1448,7 @@ def generate_likelihood_partition_starts(
                         device=runtime.device,
                         dtype=runtime.dtype,
                         classification_weight_alpha=classification_weight_alpha,
+                        classification_code_weight=classification_code_weight,
                         allow_component_death=bool(allow_component_death),
                         _refit_labels=cached_refit,
                     )
@@ -1402,6 +1463,7 @@ def generate_likelihood_partition_starts(
                         refit_max_iter=int(refit_max_iter),
                         hint_phi=phi0,
                         classification_weight_alpha=classification_weight_alpha,
+                        classification_code_weight=classification_code_weight,
                         allow_component_death=bool(allow_component_death),
                         _refit_labels=cached_refit,
                     )
@@ -1422,11 +1484,12 @@ def generate_likelihood_partition_starts(
             bic = (
                 classic_bic
                 if classification_weight_alpha is None
-                else compute_partition_icl(
+                else compute_partition_dirichlet_score(
                     -float(refit.fit_loss),
                     cluster_sizes_from_labels(labels_used),
                     data,
                     alpha=float(classification_weight_alpha),
+                    code_weight=classification_code_weight,
                 )
             )
             candidates.append(

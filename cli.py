@@ -4,8 +4,6 @@ import argparse
 import math
 from pathlib import Path
 
-import numpy as np
-
 from .core.fusion.defaults import (
     DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
     DEFAULT_CERTIFICATE_MAX_ITER,
@@ -13,20 +11,20 @@ from .core.fusion.defaults import (
     DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
     DEFAULT_DENSE_FALLBACK_POLICY,
     DEFAULT_DEVICE,
-    DEFAULT_DTYPE,
-    DEFAULT_INNER_BACKEND,
-    DEFAULT_OPTIMIZATION_TOLERANCE,
     DEFAULT_WORKSET_ADD_BATCH,
     DEFAULT_WORKSET_MAX_BYTES,
     DEFAULT_WORKSET_MAX_EXPANSIONS,
     DENSE_FALLBACK_POLICIES,
-    INNER_BACKENDS,
     normalize_dense_fallback_policy,
-    normalize_inner_backend,
+)
+
+from .core.fusion.profiles import (
+    COMPUTATION_PROFILE_NAMES,
+    DEFAULT_COMPUTATION_PROFILE,
+    get_computation_profile,
 )
 from .core.model import FitOptions
 from .io.tumor_txt import DEFAULT_DOSAGE_PRIOR_PENALTY
-from .model_selection.config import FINAL_PHI_WARD_LADDER_KMAX
 from .runners.pipeline import process_tumor
 from .simulation import simulate_tumor
 from .simulation.cli import (
@@ -35,9 +33,38 @@ from .simulation.cli import (
 )
 
 
+def _selection_score_argument(value: str) -> str:
+    normalized = str(value).strip().lower().replace("_", "-")
+    if normalized.startswith("clonal-"):
+        raise argparse.ArgumentTypeError(
+            "clonal-anchor selection scores were removed; use "
+            "fixed-partition-dirichlet-score or fixed-partition-bic"
+        )
+    allowed = {
+        "fixed-partition-dirichlet-score",
+        "fixed-partition-bic",
+    }
+    if normalized not in allowed:
+        raise argparse.ArgumentTypeError(
+            "selection score must be fixed-partition-dirichlet-score, "
+            "or fixed-partition-bic"
+        )
+    return normalized
+
+
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input-file", required=True)
     parser.add_argument("--outdir", default="clipp2_results")
+    parser.add_argument(
+        "--profile",
+        choices=COMPUTATION_PROFILE_NAMES,
+        default=DEFAULT_COMPUTATION_PROFILE,
+        help=(
+            "Single-tumor computation contract. Strict strengthens "
+            "per-candidate KKT checks and fixed-partition refit certification; "
+            "all profiles use a bounded lambda search."
+        ),
+    )
     parser.add_argument(
         "--unsupported-policy", choices=["error", "mask"], default="error"
     )
@@ -51,127 +78,32 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
             "number."
         ),
     )
-    parser.add_argument("--outer-max-iter", type=int, default=8)
-    parser.add_argument("--inner-max-iter", type=int, default=30)
-    parser.add_argument("--tol", type=float, default=DEFAULT_OPTIMIZATION_TOLERANCE)
-    parser.add_argument("--summary-tol", type=float, default=1e-4)
-    parser.add_argument("--selection-partition-tol", type=float, default=1e-4)
-    parser.add_argument("--selection-refit-tol", type=float, default=1e-7)
-    parser.add_argument("--selection-refit-max-iter", type=int, default=128)
-    parser.add_argument("--reporting-partition-tol", type=float, default=1e-4)
+    parser.add_argument("--outer-max-iter", type=int, default=None)
+    parser.add_argument("--inner-max-iter", type=int, default=None)
+    parser.add_argument("--tol", type=float, default=None)
+    parser.add_argument("--summary-tol", type=float, default=None)
+    parser.add_argument("--selection-partition-tol", type=float, default=None)
+    parser.add_argument("--selection-refit-tol", type=float, default=None)
+    parser.add_argument("--selection-refit-max-iter", type=int, default=None)
     parser.add_argument(
         "--selection-score",
-        choices=["clonal-fixed-partition-bic", "fixed-partition-bic"],
-        default="clonal-fixed-partition-bic",
-    )
-    parser.add_argument(
-        "--selection-anchor",
-        choices=["clonal-required", "none"],
-        default="clonal-required",
+        type=_selection_score_argument,
+        default="fixed-partition-dirichlet-score",
         help=(
-            "Clonal-required constrains one exact raw fusion block to common "
-            "CCF 1; a witness mutation realizes each optimization branch."
-        ),
-    )
-    parser.add_argument(
-        "--raw-clonal-anchor-mode",
-        choices=[
-            "none",
-            "specified-witness",
-            "enumerated-witness",
-            "adaptive-bound-complete",
-            # Deprecated compatibility alias.
-            "adaptive-exact",
-            "screened-witness",
-            # Compatibility aliases for the pre-cluster-anchor draft.
-            "specified-seed",
-            "enumerated-seed",
-            "screened-seed",
-        ],
-        default="adaptive-bound-complete",
-        help=(
-            "Witness search for an exact raw CCF-one cluster: specified, full "
-            "enumeration, adaptive lower-bound-complete coverage, or an "
-            "explicitly restricted screen."
-        ),
-    )
-    parser.add_argument(
-        "--raw-clonal-anchor-mutation",
-        action="append",
-        default=[],
-        help="Retained witness mutation ID for specified mode (exactly one).",
-    )
-    parser.add_argument("--raw-clonal-anchor-target", type=float, default=1.0)
-    parser.add_argument(
-        "--raw-clonal-anchor-feasibility-tol", type=float, default=1e-8
-    )
-    parser.add_argument("--raw-clonal-anchor-candidate-max", type=int, default=8)
-    parser.add_argument(
-        "--raw-clonal-include-unpenalized-overflow",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Deprecated compatibility switch. Count-derived CCF overflow no "
-            "longer changes the raw feasible set."
-        ),
-    )
-    parser.add_argument(
-        "--raw-clonal-cluster-equality-tol",
-        type=float,
-        default=1e-8,
-        help=(
-            "Floor for numerical CCF-one equality. The effective tolerance is "
-            "the maximum of this value, machine precision, raw solver "
-            "tolerance, and certificate column tolerance."
-        ),
-    )
-    parser.add_argument(
-        "--raw-clonal-cluster-min-size",
-        type=int,
-        default=1,
-        help=(
-            "Biological-evidence/QC threshold only. It does not constrain the "
-            "raw existential CCF-one estimator."
-        ),
-    )
-    parser.add_argument(
-        "--raw-clonal-cluster-min-observed-support-per-region",
-        type=int,
-        default=0,
-        help=(
-            "Deprecated evidence/QC threshold; it does not affect raw model "
-            "feasibility or selection eligibility."
-        ),
-    )
-    parser.add_argument(
-        "--raw-clonal-evidence-min-observed-support-per-region",
-        type=int,
-        default=1,
-        help=(
-            "Observed positive-depth support required for the separately "
-            "reported biological-evidence status."
+            "Fixed-label selection criterion. The Dirichlet score is BIC plus "
+            "0.7 times the deviance of one exact allocation under an "
+            "integrated Dirichlet(1) prior. This is not posterior-entropy ICL."
         ),
     )
     parser.add_argument("--disable-warm-start", action="store_true")
     parser.add_argument("--major-prior", type=float, default=0.5)
-    parser.add_argument(
-        "--kmax",
-        type=int,
-        default=FINAL_PHI_WARD_LADDER_KMAX,
-        help="Deprecated compatibility option; production requires 0",
-    )
     parser.add_argument(
         "--device", choices=["auto", "cpu", "cuda"], default=DEFAULT_DEVICE
     )
     parser.add_argument(
         "--dtype",
         choices=["auto", "float16", "float32", "float64"],
-        default=DEFAULT_DTYPE,
-    )
-    parser.add_argument(
-        "--inner-backend",
-        choices=[value.replace("_", "-") for value in INNER_BACKENDS],
-        default=DEFAULT_INNER_BACKEND.replace("_", "-"),
+        default=None,
     )
     parser.add_argument(
         "--workset-max-bytes", type=int, default=DEFAULT_WORKSET_MAX_BYTES
@@ -192,13 +124,11 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--workset-max-expansions", type=int, default=DEFAULT_WORKSET_MAX_EXPANSIONS
     )
-    parser.add_argument(
-        "--certificate-max-iter", type=int, default=DEFAULT_CERTIFICATE_MAX_ITER
-    )
+    parser.add_argument("--certificate-max-iter", type=int, default=None)
     parser.add_argument(
         "--certificate-refinement-rounds",
         type=int,
-        default=DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
+        default=None,
     )
     parser.add_argument(
         "--certificate-column-tol-scale",
@@ -210,7 +140,6 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--materialize-full-dual", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--skip-outputs", action="store_true")
 
@@ -219,8 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipp2",
         description=(
-            "Fit certified raw pairwise-fusion candidates and select an "
-            "immutable partition by fixed-partition BIC."
+            "Fit raw pairwise-fusion candidates and select an immutable "
+            "partition by a reconstructible fixed-partition score under an "
+            "explicit computation profile."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -236,17 +166,60 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_profile_defaults(args: argparse.Namespace) -> None:
+    """Resolve profile-controlled defaults while preserving CLI overrides."""
+
+    profile = get_computation_profile(args.profile)
+    defaults = {
+        "outer_max_iter": int(profile.outer_max_iter),
+        "inner_max_iter": int(profile.inner_max_iter),
+        "tol": float(profile.solver_tolerance),
+        "dtype": str(profile.raw_dtype),
+        "summary_tol": (
+            1e-4
+            if profile.is_strict
+            else (2e-4 if profile.name == "balanced" else 1e-3)
+        ),
+        "selection_partition_tol": (
+            1e-4
+            if profile.is_strict
+            else (2e-4 if profile.name == "balanced" else 1e-3)
+        ),
+        "selection_refit_tol": (
+            1e-7
+            if profile.is_strict
+            else (1e-5 if profile.name == "balanced" else 1e-4)
+        ),
+        "selection_refit_max_iter": (
+            128 if profile.is_strict else (64 if profile.name == "balanced" else 32)
+        ),
+        "certificate_max_iter": (
+            int(DEFAULT_CERTIFICATE_MAX_ITER)
+            if profile.is_strict
+            else (128 if profile.name == "balanced" else 64)
+        ),
+        "certificate_refinement_rounds": (
+            int(DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS)
+            if profile.is_strict
+            else (1 if profile.name == "balanced" else 0)
+        ),
+    }
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "fit":
+        _resolve_profile_defaults(args)
         penalty = float(args.dosage_prior_penalty)
         if not math.isfinite(penalty) or penalty < 0.0:
             parser.error("--dosage-prior-penalty must be finite and nonnegative")
         for option_name in (
             "selection_partition_tol",
             "selection_refit_tol",
-            "reporting_partition_tol",
         ):
             value = float(getattr(args, option_name))
             if not math.isfinite(value) or value <= 0.0:
@@ -255,71 +228,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 )
         if int(args.selection_refit_max_iter) < 1:
             parser.error("--selection-refit-max-iter must be positive")
-        if int(args.kmax) != 0:
-            parser.error("--kmax is deprecated and must be 0 in production mode")
-        expected_anchor = (
-            "clonal-required"
-            if args.selection_score == "clonal-fixed-partition-bic"
-            else "none"
-        )
-        if args.selection_anchor != expected_anchor:
-            parser.error(
-                f"--selection-score {args.selection_score} requires "
-                f"--selection-anchor {expected_anchor}"
-            )
-        raw_anchor_mode = str(args.raw_clonal_anchor_mode)
-        expected_raw_anchor = expected_anchor == "clonal-required"
-        if expected_raw_anchor == (raw_anchor_mode == "none"):
-            parser.error(
-                "clonal-fixed-partition-bic requires a non-none raw clonal "
-                "anchor mode; fixed-partition-bic requires mode none"
-            )
-        specified_modes = {"specified-seed", "specified-witness"}
-        if raw_anchor_mode in specified_modes and len(
-            args.raw_clonal_anchor_mutation
-        ) != 1:
-            parser.error("specified witness mode requires exactly one mutation")
-        if raw_anchor_mode not in specified_modes and args.raw_clonal_anchor_mutation:
-            parser.error("witness mutation IDs apply only to specified mode")
-        if float(args.raw_clonal_anchor_target) != 1.0:
-            parser.error("production raw clonal-anchor target must equal 1")
-        if (
-            not math.isfinite(float(args.raw_clonal_anchor_feasibility_tol))
-            or float(args.raw_clonal_anchor_feasibility_tol) < 0.0
-        ):
-            parser.error("raw clonal-anchor feasibility tolerance must be nonnegative")
-        if raw_anchor_mode in {
-            "screened-seed",
-            "screened-witness",
-            "adaptive-bound-complete",
-            "adaptive-exact",
-        } and int(
-            args.raw_clonal_anchor_candidate_max
-        ) < 1:
-            parser.error("initial witness candidate maximum must be positive")
-        if (
-            not math.isfinite(float(args.raw_clonal_cluster_equality_tol))
-            or float(args.raw_clonal_cluster_equality_tol) <= 0.0
-        ):
-            parser.error("raw clonal-cluster equality tolerance must be positive")
-        if int(args.raw_clonal_cluster_min_size) < 1:
-            parser.error("raw clonal-cluster minimum size must be positive")
-        if int(args.raw_clonal_cluster_min_observed_support_per_region) < 0:
-            parser.error("raw clonal-cluster observed support must be nonnegative")
-        if int(args.raw_clonal_evidence_min_observed_support_per_region) < 0:
-            parser.error("raw clonal evidence support must be nonnegative")
-        effective_clonal_equality_tol = max(
-            float(args.raw_clonal_cluster_equality_tol),
-            float(args.tol),
-            float(args.certificate_column_tol_scale) * float(args.tol),
-            float(np.finfo(np.float64).eps),
-        )
-        if effective_clonal_equality_tol > float(args.selection_partition_tol):
-            parser.error(
-                "effective raw clonal-cluster equality tolerance (the maximum "
-                "of its configured floor and solver/certificate tolerances) "
-                "must not exceed the selection partition tolerance"
-            )
     return args
 
 
@@ -331,31 +239,12 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         tol=args.tol,
         summary_tol=args.summary_tol,
         selection_score=args.selection_score.replace("-", "_"),
-        selection_anchor=args.selection_anchor.replace("-", "_"),
-        raw_clonal_anchor_mode=args.raw_clonal_anchor_mode.replace("-", "_"),
-        raw_clonal_anchor_mutation_ids=tuple(args.raw_clonal_anchor_mutation),
-        raw_clonal_anchor_target=args.raw_clonal_anchor_target,
-        raw_clonal_anchor_feasibility_tol=args.raw_clonal_anchor_feasibility_tol,
-        raw_clonal_anchor_candidate_max=args.raw_clonal_anchor_candidate_max,
-        raw_clonal_include_unpenalized_overflow=(
-            args.raw_clonal_include_unpenalized_overflow
-        ),
-        raw_clonal_cluster_equality_tol=args.raw_clonal_cluster_equality_tol,
-        raw_clonal_cluster_min_size=args.raw_clonal_cluster_min_size,
-        raw_clonal_cluster_min_observed_support_per_region=(
-            args.raw_clonal_cluster_min_observed_support_per_region
-        ),
-        raw_clonal_evidence_min_observed_support_per_region=(
-            args.raw_clonal_evidence_min_observed_support_per_region
-        ),
         selection_partition_tol=args.selection_partition_tol,
         selection_refit_tol=args.selection_refit_tol,
         selection_refit_max_iter=args.selection_refit_max_iter,
-        reporting_partition_tol=args.reporting_partition_tol,
         major_prior=args.major_prior,
         device=args.device,
         dtype=args.dtype,
-        inner_backend=normalize_inner_backend(args.inner_backend),
         workset_max_bytes=args.workset_max_bytes,
         compressed_cache_max_bytes=args.compressed_cache_max_bytes,
         dense_fallback_policy=normalize_dense_fallback_policy(
@@ -367,8 +256,8 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         certificate_refinement_rounds=args.certificate_refinement_rounds,
         certificate_column_tol_scale=args.certificate_column_tol_scale,
         allow_heuristic_structure_splits=args.allow_heuristic_structure_splits,
-        materialize_full_dual=args.materialize_full_dual,
         verbose=args.verbose,
+        computation_profile=args.profile,
     )
 
 
@@ -385,7 +274,6 @@ def main(argv: list[str] | None = None) -> None:
         write_outputs=not args.skip_outputs,
         unsupported_policy=args.unsupported_policy,
         dosage_prior_penalty=args.dosage_prior_penalty,
-        ward_ladder_kmax=max(int(args.kmax), 0),
     )
     print(summary)
 
