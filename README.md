@@ -13,8 +13,7 @@ pip install .
 ## Input
 
 The public input is one tab-delimited file per tumor. See
-[`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv) and
-the external [input-format contract](../docs/input-format.md).
+[`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv).
 
 ## Fit
 
@@ -41,5 +40,3 @@ file stem unless a `##tumor_id` metadata line overrides it):
 | `{tumor_id}_cluster_centers.tsv` | selected cluster | size, raw-partition diameter, and final CCF per region |
 | `{tumor_id}_mutation_region_multiplicity.tsv` | mutation × region | final CCF, copy number, and multiplicity or occupancy-path summary |
 
-The Python pipeline still returns the run summary and candidate-search table in
-memory for diagnostics; they are not written as result files.
