@@ -6,11 +6,8 @@ intervals. It has 600 mutation-sample units and 998 data rows because 398 units
 (66.3%) contain two local CN states. Every unit has at least one non-diploid
 local state.
 
-The authoritative schema, metadata defaults, missing-count rules, and local
-copy-number-state invariants are in the
-[input-format contract](../../docs/input-format.md). In particular, every mutation
-must have one unit for every sample, and repeated rows within a unit enumerate
-the complete state set for that sample's segment.
+Every mutation must have one unit for every sample. Repeated rows within a unit
+enumerate that sample segment's complete local copy-number state set.
 
 Fit it on CPU:
 

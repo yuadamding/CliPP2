@@ -8,4 +8,3 @@ SELECTION_SCORE_NAMES = (
 # while reducing shrinkage transmitted between clearly separated groups.
 PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT = 1.05
 LIKELIHOOD_PARTITION_K_MAX = 50
-LIKELIHOOD_PARTITION_K_ANCHORS = (*range(1, 16), 20, 25, 30, 40, 50)

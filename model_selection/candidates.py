@@ -469,8 +469,6 @@ def _evaluate_candidate(
     data: TumorData,
     fit_options: FitOptions,
     candidate_fit_options: FitOptions | None,
-    bic_df_scale: float,
-    bic_cluster_penalty: float,
     phi_start: StartArray | None,
     exact_pilot: StartArray | None,
     pooled_start: StartArray | None,
@@ -647,7 +645,6 @@ def _evaluate_candidate(
         "selection_df": int(score.degrees_of_freedom),
         "selection_penalty": float(score.penalty),
         "selection_n_eff": int(score.n_eff),
-        "selection_bic_penalty": float(score.penalty - score.assignment_penalty),
         "selection_assignment_log_evidence": float(score.assignment_log_evidence),
         "selection_assignment_code_weight": float(score.assignment_code_weight),
         "selection_assignment_penalty": float(score.assignment_penalty),
@@ -657,30 +654,8 @@ def _evaluate_candidate(
         "selection_assignment_arithmetic_uncertainty": float(
             score.assignment_arithmetic_uncertainty
         ),
-        "bic": float(score_diagnostics["classic_bic"]),
-        "bic_value": float(score_diagnostics["classic_bic"]),
         "classic_bic": float(score_diagnostics["classic_bic"]),
-        "fixed_partition_bic": (
-            float(score_diagnostics["classic_bic"])
-            if score.name
-            in {
-                "fixed_partition_bic",
-                "fixed_partition_dirichlet_score",
-            }
-            else float("nan")
-        ),
-        "fixed_partition_dirichlet_score": (
-            float(score.value)
-            if score.name == "fixed_partition_dirichlet_score"
-            else float("nan")
-        ),
-        "bic_loglik": float(score.loglik),
         "bic_loglik_source": str(refit.loglik_source),
-        "bic_df": int(score.degrees_of_freedom),
-        "bic_active_df": int(refit.active_df),
-        "bic_penalty": float(score.penalty - score.assignment_penalty),
-        "bic_active_penalty": float(refit.active_df * np.log(max(score.n_eff, 1))),
-        "bic_n_eff": int(score.n_eff),
         "classic_bic_depth_n": float(score_diagnostics["classic_bic_depth_n"]),
         "classic_bic_active_df": float(score_diagnostics["classic_bic_active_df"]),
         "bic_refit_finite_candidate_found": bool(refit.finite_candidate_found),
@@ -706,8 +681,6 @@ def _evaluate_candidate(
         "refit_fit_loss": float(refit.fit_loss),
         "refit_active_df": int(refit.active_df),
         "partition_signature": str(partition.signature),
-        "selection_model_signature": str(partition.signature),
-        "partition_hash": str(partition.signature),
         "partition_source": str(partition.source),
         "partition_tol": float(partition.tolerance),
         "partition_certified": bool(partition.certified),
@@ -723,29 +696,22 @@ def _evaluate_candidate(
         "partition_max_diameter": float(partition.max_diameter),
         "partition_diameter_exact": bool(partition.diameter_exact),
         "n_clusters": int(partition.n_clusters),
-        "bic_n_clusters": int(partition.n_clusters),
         "cluster_sizes": _cluster_sizes_text(partition.labels),
         "partition_labels_0based": ",".join(
             str(int(value)) for value in np.asarray(partition.labels, dtype=np.int64)
         ),
         "eligible_for_selection": bool(candidate.eligible_for_selection),
-        "bic_selection_eligible": bool(candidate.eligible_for_selection),
-        "selection_eligible": bool(candidate.eligible_for_selection),
         "ineligibility_reason": str(candidate.ineligibility_reason),
         "raw_kkt_eligible": bool(fit.selection_eligible),
         "raw_objective_certified": bool(raw_objective_certified),
         "converged": bool(fit.converged),
         "raw_fit_status": str(fit.failure_reason),
         "loglik": float(fit.loglik),
-        "raw_loglik": float(fit.loglik),
         "fit_loss": float(-fit.loglik),
         "penalized_objective": float(fit.penalized_objective),
-        "raw_objective": float(fit.penalized_objective),
         "penalty": float(penalty_value),
-        "raw_penalty": float(penalty_value),
         "profile_penalty": float(profile_penalty_value),
         "fixed_objective_kkt_residual": float(fit.fixed_objective_kkt_residual),
-        "raw_kkt_residual": float(fit.fixed_objective_kkt_residual),
         "stationarity_certified": bool(fit.stationarity_certified),
         "global_optimality_certified": bool(fit.global_optimality_certified),
         "global_optimality_basis": str(fit.global_optimality_basis),
@@ -809,8 +775,6 @@ def _evaluate_candidate(
         "fit_compute_summary": bool(compute_summary),
         "fit_start_mode": str(start_mode),
         "solver_state_warm_start": bool(solver_state is not None),
-        "bic_df_scale": float(bic_df_scale),
-        "bic_cluster_penalty": float(bic_cluster_penalty),
     }
     return fit, row, candidate
 
@@ -919,11 +883,8 @@ def evaluate_direct_partition_candidate(
         "candidate_pool_source": str(source),
         "partition_source": str(source),
         "partition_signature": str(signature),
-        "selection_model_signature": str(signature),
-        "partition_hash": str(signature),
         "requested_K": int(requested_k),
         "n_clusters": int(n_clusters),
-        "bic_n_clusters": int(n_clusters),
         "cluster_sizes": _cluster_sizes_text(labels),
         "partition_labels_0based": ",".join(str(int(value)) for value in labels),
         "lambda": float("nan"),
@@ -970,7 +931,6 @@ def evaluate_direct_partition_candidate(
         "selection_df": int(score.degrees_of_freedom),
         "selection_penalty": float(score.penalty),
         "selection_n_eff": int(score.n_eff),
-        "selection_bic_penalty": float(score.penalty - score.assignment_penalty),
         "selection_assignment_log_evidence": float(score.assignment_log_evidence),
         "selection_assignment_code_weight": float(score.assignment_code_weight),
         "selection_assignment_penalty": float(score.assignment_penalty),
@@ -983,19 +943,7 @@ def evaluate_direct_partition_candidate(
             score.assignment_arithmetic_uncertainty
         ),
         "classic_bic": float(score_diagnostics["classic_bic"]),
-        "bic": float(score_diagnostics["classic_bic"]),
-        "bic_value": float(score_diagnostics["classic_bic"]),
-        "fixed_partition_bic": float(score_diagnostics["classic_bic"]),
-        "fixed_partition_dirichlet_score": (
-            float(score.value)
-            if score.name == "fixed_partition_dirichlet_score"
-            else float("nan")
-        ),
-        "bic_loglik": float(score.loglik),
         "bic_loglik_source": str(refit.loglik_source),
-        "bic_df": int(score.degrees_of_freedom),
-        "bic_active_df": int(refit.active_df),
-        "bic_n_eff": int(score.n_eff),
         "bic_refit_finite_candidate_found": bool(refit.finite_candidate_found),
         "bic_refit_cache_hit": bool(cache_hit),
         "refit_global_optimum_certified": bool(refit.global_optimum_certified),
@@ -1022,8 +970,6 @@ def evaluate_direct_partition_candidate(
             refit.refit_min_best_second_loss_gap
         ),
         "eligible_for_selection": bool(candidate.eligible_for_selection),
-        "bic_selection_eligible": bool(candidate.eligible_for_selection),
-        "selection_eligible": bool(candidate.eligible_for_selection),
         "ineligibility_reason": str(candidate.ineligibility_reason),
         "converged": bool(refit.finite_candidate_found),
         "estimator_role": "direct_partition_candidate",
@@ -1034,9 +980,7 @@ def evaluate_direct_partition_candidate(
         "full_kkt_certified": False,
         "full_kkt_certificate_status": "not_applicable_direct_partition",
         "fixed_objective_kkt_residual": float("nan"),
-        "raw_kkt_residual": float("nan"),
         "penalized_objective": float("nan"),
-        "raw_objective": float("nan"),
         "mm_consistency_violations": 0,
         "selection_step": int(candidate_id),
         "candidate_elapsed_seconds": float(perf_counter() - started),

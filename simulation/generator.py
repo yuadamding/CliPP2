@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -10,11 +10,7 @@ import numpy as np
 import pandas as pd
 
 from ..io.tumor_txt import TUMOR_TXT_SCHEMA, write_tumor_txt
-from .config import (
-    CopyNumberEvolutionConfig,
-    TumorSimulationConfig,
-    _validate_copy_number_config,
-)
+from .config import TumorSimulationConfig, _validate_copy_number_config
 from .evolution import (
     _simulate_constrained_cn_evolution,
     aggregate_cn_clone_fractions,
@@ -58,11 +54,6 @@ def _json_seed_entropy(entropy: Any) -> int | list[int]:
     return [int(value) for value in values.reshape(-1)]
 
 
-def _seed_sequence_from_generator(rng: np.random.Generator) -> np.random.SeedSequence:
-    entropy = rng.integers(0, 2**32, size=4, dtype=np.uint32)
-    return np.random.SeedSequence([int(value) for value in entropy])
-
-
 def _named_random_streams(
     seed_sequence: np.random.SeedSequence,
 ) -> tuple[dict[str, np.random.Generator], dict[str, object]]:
@@ -94,58 +85,38 @@ def _named_random_streams(
 
 
 def _write_patient_simulation(
-    rng: np.random.Generator,
-    out_dir: Path,
-    N_mean: int,
-    simu_purity: float,
-    amp_rate: float,
-    n_samples: int,
-    sim: int,
-    K_min: int,
-    K_max: int,
-    lambda_mut: int,
-    alpha_mut: float,
-    alpha_split: float,
-    alpha_lambda: float,
-    tau_lineage_min: float,
-    tau_lineage_max: float,
-    purity_conc: float,
-    lineage_zero_prob: float,
-    min_clone_ccf: float,
-    min_clone_ccf_l2_norm: float,
-    min_mutations_per_clone: int,
-    min_clone_ccf_distance: float,
-    max_rejection_tries: int,
-    copy_number_config: CopyNumberEvolutionConfig | None = None,
-    seed_sequence: np.random.SeedSequence | None = None,
-    mutation_count: int | None = None,
-    tumor_id: str | None = None,
+    config: TumorSimulationConfig,
 ) -> Path:
+    out_dir = Path(config.out_dir)
+    N_mean = int(config.mean_depth)
+    simu_purity = float(config.purity)
+    n_samples = int(config.region_count)
+    K_min = K_max = int(config.clone_count)
+    lambda_mut = mutation_count = int(config.mutation_count)
+    min_mutations_per_clone = int(config.min_mutations_per_clone)
+    max_rejection_tries = int(config.max_rejection_tries)
+    copy_number_config = config.copy_number
+    alpha_mut, alpha_split, alpha_lambda = 10.0, 1.0, 5.0
+    tau_lineage_min, tau_lineage_max = 1.0, 50.0
+    purity_conc, lineage_zero_prob = 50.0, 0.0
+    min_clone_ccf, min_clone_ccf_l2_norm = 0.02, 0.05
+    min_clone_ccf_distance = 0.10
     if not 0.0 < float(simu_purity) < 1.0:
         raise ValueError("simu_purity must lie strictly between zero and one.")
     if purity_conc <= 0.0:
         raise ValueError("purity_conc must be positive.")
-    explicit_directory_name: str | None = None
-    if tumor_id is not None:
-        explicit_directory_name = str(tumor_id).strip()
-        if (
-            not explicit_directory_name
-            or explicit_directory_name in {".", ".."}
-            or Path(explicit_directory_name).name != explicit_directory_name
-        ):
-            raise ValueError("tumor_id must be one nonempty directory name.")
-        explicit_data_dir = out_dir / explicit_directory_name
-        if explicit_data_dir.exists():
-            raise FileExistsError(
-                f"Refusing to overwrite existing tumor: {explicit_data_dir}"
-            )
-    copy_number_config = replace(
-        copy_number_config or CopyNumberEvolutionConfig(),
-        cna_event_rate=float(amp_rate),
-    )
+    directory_name = str(config.tumor_id).strip()
+    if (
+        not directory_name
+        or directory_name in {".", ".."}
+        or Path(directory_name).name != directory_name
+    ):
+        raise ValueError("tumor_id must be one nonempty directory name.")
+    data_dir = out_dir / directory_name
+    if data_dir.exists():
+        raise FileExistsError(f"Refusing to overwrite existing tumor: {data_dir}")
     _validate_copy_number_config(copy_number_config)
-    if seed_sequence is None:
-        seed_sequence = _seed_sequence_from_generator(rng)
+    seed_sequence = np.random.SeedSequence(int(config.seed))
     streams, rng_metadata = _named_random_streams(seed_sequence)
 
     K = streams["seed_tree"].integers(K_min, K_max + 1)
@@ -222,14 +193,6 @@ def _write_patient_simulation(
         cn_clone_id,
     )
 
-    if explicit_directory_name is None:
-        directory_name = (
-            f"{N_mean}_{K}_{simu_purity}_{amp_rate}_S{n_samples}_"
-            f"Lm{int(lambda_mut)}_M{no_mutations}_rep{sim}"
-        )
-    else:
-        directory_name = explicit_directory_name
-    data_dir = out_dir / directory_name
     data_dir.mkdir(parents=True, exist_ok=True)
     region_labels = tuple(f"region{j + 1}" for j in range(n_samples))
     for region_id in region_labels:
@@ -513,21 +476,15 @@ def _write_patient_simulation(
     intended_factors = {
         "mean_depth": int(N_mean),
         "purity_mean": float(simu_purity),
-        "cna_event_rate": float(amp_rate),
+        "cna_event_rate": float(copy_number_config.cna_event_rate),
         "sample_count": int(n_samples),
-        "replicate": int(sim),
+        "replicate": 0,
         "clone_count_min": int(K_min),
         "clone_count_max": int(K_max),
-        "mutation_count_mode": "fixed" if mutation_count is not None else "poisson",
-        "mutation_count": (
-            int(mutation_count) if mutation_count is not None else int(lambda_mut)
-        ),
-        "mutation_count_poisson_mean": (
-            None if mutation_count is not None else int(lambda_mut)
-        ),
-        "fixed_mutation_count": (
-            int(mutation_count) if mutation_count is not None else None
-        ),
+        "mutation_count_mode": "fixed",
+        "mutation_count": int(mutation_count),
+        "mutation_count_poisson_mean": None,
+        "fixed_mutation_count": int(mutation_count),
         "alpha_mut": float(alpha_mut),
         "alpha_split": float(alpha_split),
         "alpha_lambda": float(alpha_lambda),
@@ -598,35 +555,7 @@ def simulate_tumor(
             "Canonical CliPP2 simulations require more than 50% two-state SNVs."
         )
 
-    seed_sequence = np.random.SeedSequence(int(config.seed))
-    return _write_patient_simulation(
-        rng=np.random.default_rng(seed_sequence),
-        out_dir=Path(config.out_dir),
-        N_mean=int(config.mean_depth),
-        simu_purity=float(config.purity),
-        amp_rate=float(config.copy_number.cna_event_rate),
-        n_samples=int(config.region_count),
-        sim=0,
-        K_min=int(config.clone_count),
-        K_max=int(config.clone_count),
-        lambda_mut=int(config.mutation_count),
-        alpha_mut=10.0,
-        alpha_split=1.0,
-        alpha_lambda=5.0,
-        tau_lineage_min=1.0,
-        tau_lineage_max=50.0,
-        purity_conc=50.0,
-        lineage_zero_prob=0.0,
-        min_clone_ccf=0.02,
-        min_clone_ccf_l2_norm=0.05,
-        min_mutations_per_clone=int(config.min_mutations_per_clone),
-        min_clone_ccf_distance=0.10,
-        max_rejection_tries=int(config.max_rejection_tries),
-        copy_number_config=config.copy_number,
-        seed_sequence=seed_sequence,
-        mutation_count=int(config.mutation_count),
-        tumor_id=config.tumor_id,
-    )
+    return _write_patient_simulation(config)
 
 
 __all__ = [

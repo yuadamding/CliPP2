@@ -203,12 +203,7 @@ class TumorData:
         None  # bool (M, S) — True if counts observed; None means all observed
     )
     path_likelihood: PathLikelihoodSpec | None = None
-    # Reporting-only metadata aligned to ``path_likelihood``.  These fields do
-    # not alter the observed objective and are therefore intentionally excluded
-    # from ``tumor_data_fingerprint``.
-    path_reporting_fingerprint: str | None = None
     path_unsupported_reason: np.ndarray | None = None
-    mean_tumor_total_cn: np.ndarray | None = None
 
     @property
     def num_mutations(self) -> int:
@@ -217,13 +212,6 @@ class TumorData:
     @property
     def num_regions(self) -> int:
         return int(self.alt_counts.shape[1])
-
-    @property
-    def depth_scale(self) -> float:
-        positive_depth = self.total_counts[self.total_counts > 0]
-        if positive_depth.size == 0:
-            return 1.0
-        return float(np.median(positive_depth))
 
     @property
     def multiplicity_estimation_mask(self) -> np.ndarray:

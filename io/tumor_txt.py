@@ -6,8 +6,6 @@ from collections.abc import Mapping
 import csv
 from dataclasses import dataclass
 import gzip
-import hashlib
-import json
 from pathlib import Path
 from typing import Any
 
@@ -113,8 +111,6 @@ class UnsupportedTumorInputError(ValueError):
 @dataclass(frozen=True, slots=True)
 class _ValidatedLongTable:
     metadata: dict[str, str]
-    source_rows: pd.DataFrame
-    optional_columns: tuple[str, ...]
     mutation_ids: tuple[str, ...]
     sample_ids: tuple[str, ...]
     rows_by_unit: dict[tuple[str, str], tuple[dict[str, Any], ...]]
@@ -654,33 +650,11 @@ def _validate_long_table(
 
     return _ValidatedLongTable(
         metadata=dict(metadata),
-        source_rows=table.copy(),
-        optional_columns=tuple(
-            column for column in table.columns if column not in SCHEMA_COLUMNS
-        ),
         mutation_ids=mutation_ids,
         sample_ids=sample_ids,
         rows_by_unit=rows_by_unit,
         states_by_segment=states_by_segment,
     )
-
-
-def _reporting_fingerprint(
-    metadata: Mapping[str, str],
-    optional_columns: tuple[str, ...],
-    rows: pd.DataFrame,
-) -> str:
-    payload = {
-        "metadata": sorted((str(key), str(value)) for key, value in metadata.items()),
-        "optional_columns": list(optional_columns),
-        "optional_rows": rows.loc[:, list(optional_columns)].to_dict(orient="records")
-        if optional_columns
-        else [],
-    }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
 
 def _build_tumor_data(
     validated: _ValidatedLongTable,
@@ -715,7 +689,7 @@ def _build_tumor_data(
     mean_total_cn = np.empty(shape, dtype=np.float64)
     unsupported_reason = np.full(shape, None, dtype=object)
     compiled_units: list[list[CompiledPathSet]] = [
-        [CompiledPathSet((), (), ()) for _ in sample_ids] for _ in mutation_ids
+        [CompiledPathSet((), ()) for _ in sample_ids] for _ in mutation_ids
     ]
     compiled_by_segment: dict[tuple[str, str], CompiledPathSet] = {}
 
@@ -745,13 +719,13 @@ def _build_tumor_data(
         if len(states) > 2:
             reason = MORE_THAN_TWO_STATES
             detail = f"observed {len(states)} distinct positive local CN states"
-            compiled = CompiledPathSet((), (), ())
+            compiled = CompiledPathSet((), ())
         elif not any(
             state.allele_a_cn > 0 or state.allele_b_cn > 0 for state in states
         ):
             reason = NO_POSITIVE_PATH
             detail = "no positive mutant-copy dosage path exists"
-            compiled = CompiledPathSet((), (), ())
+            compiled = CompiledPathSet((), ())
         elif uses_path_likelihood:
             segment_key = (sample_id, row["segment_id"])
             compiled = compiled_by_segment.get(segment_key)
@@ -766,7 +740,7 @@ def _build_tumor_data(
                 reason = NO_POSITIVE_PATH
                 detail = "no positive mutant-copy dosage path exists"
         else:
-            compiled = CompiledPathSet((), (), ())
+            compiled = CompiledPathSet((), ())
         if reason is not None:
             if unsupported_policy == "error":
                 raise UnsupportedTumorInputError(
@@ -780,7 +754,6 @@ def _build_tumor_data(
             compiled = CompiledPathSet(
                 paths=((1.0, 1.0, 1.0),),
                 log_prior=(0.0,),
-                biological_duplicate_count=(1,),
             )
         compiled_units[i][j] = compiled
 
@@ -794,7 +767,7 @@ def _build_tumor_data(
         )
     scaling = purity / denominator
     if uses_path_likelihood:
-        path_likelihood, _ = build_path_likelihood(
+        path_likelihood = build_path_likelihood(
             compiled_units,
             model_id=TUMOR_TXT_MODEL_ID,
             model_version=TUMOR_TXT_MODEL_VERSION,
@@ -827,17 +800,7 @@ def _build_tumor_data(
         init_major_mask=np.zeros(shape, dtype=bool),
         count_observed=count_observed,
         path_likelihood=path_likelihood,
-        path_reporting_fingerprint=(
-            _reporting_fingerprint(
-                validated.metadata,
-                validated.optional_columns,
-                validated.source_rows,
-            )
-            if uses_path_likelihood
-            else None
-        ),
         path_unsupported_reason=unsupported_reason,
-        mean_tumor_total_cn=mean_total_cn,
     )
 
     if uses_path_likelihood:

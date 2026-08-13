@@ -26,29 +26,7 @@ def _normalize_selection_score_name(selection_score: str) -> str:
 
 
 def _bic_selection_eligible_mask(search_df: pd.DataFrame) -> np.ndarray:
-    n_rows = int(search_df.shape[0])
-    if "bic_selection_eligible" in search_df.columns:
-        return _strict_bool_mask(search_df["bic_selection_eligible"])
-    if any(
-        column in search_df.columns
-        for column in (
-            "raw_kkt_eligible",
-            "bic_refit_finite_candidate_found",
-            "refit_numerically_resolved",
-            "classic_bic",
-            "bic",
-        )
-    ):
-        return (
-            _add_bic_selection_eligible(search_df)["bic_selection_eligible"]
-            .astype(bool)
-            .to_numpy(dtype=bool)
-        )
-    if "selection_eligible" in search_df.columns:
-        return _strict_bool_mask(search_df["selection_eligible"])
-    if "converged" in search_df.columns:
-        return _strict_bool_mask(search_df["converged"])
-    return np.zeros(n_rows, dtype=bool)
+    return _required_bool_mask(search_df, "eligible_for_selection")
 
 
 def _false_mask(search_df: pd.DataFrame) -> np.ndarray:
@@ -98,33 +76,20 @@ def _required_text_membership_mask(
 
 
 def _exact_fusion_certificate_mask(search_df: pd.DataFrame) -> np.ndarray:
-    """Return rows carrying an accepted full fixed-objective certificate.
-
-    Versioned provenance is authoritative and deliberately independent of the
-    inner backend. Rows written before provenance schema v1 retain the previous
-    dense-ADMM rule. A present but invalid/unsupported schema value fails closed
-    rather than falling back to solver identity.
-    """
+    """Return current-schema rows with a full fixed-objective certificate."""
 
     if search_df.empty:
         return _false_mask(search_df)
 
-    raw_kkt_ok = _required_bool_mask(search_df, "raw_kkt_eligible")
-    if "exactness_provenance_version" in search_df.columns:
-        schema_values = search_df["exactness_provenance_version"]
-        schema_present = schema_values.notna().to_numpy(dtype=bool)
-        schema_version = pd.to_numeric(schema_values, errors="coerce").to_numpy(
-            dtype=float
-        )
-    else:
-        schema_present = _false_mask(search_df)
-        schema_version = np.full(search_df.shape[0], np.nan, dtype=float)
+    if "exactness_provenance_version" not in search_df.columns:
+        return _false_mask(search_df)
 
-    explicit = (
-        schema_present
-        & np.isfinite(schema_version)
-        & (schema_version == 1.0)
-        & raw_kkt_ok
+    schema_version = pd.to_numeric(
+        search_df["exactness_provenance_version"], errors="coerce"
+    ).to_numpy(dtype=float)
+    certified = (
+        (schema_version == 1.0)
+        & _required_bool_mask(search_df, "raw_kkt_eligible")
         & _required_text_mask(search_df, "estimator_role", "raw_fused_lambda_path")
         & _required_bool_mask(search_df, "objective_faithful")
         & _required_text_mask(search_df, "objective_spec_hash")
@@ -164,31 +129,14 @@ def _exact_fusion_certificate_mask(search_df: pd.DataFrame) -> np.ndarray:
         ).to_numpy(dtype=float)
     else:
         tolerance = np.full(search_df.shape[0], np.nan, dtype=float)
-    explicit &= (
+    certified &= (
         np.isfinite(residual)
         & np.isfinite(tolerance)
         & (tolerance > 0.0)
         & (residual <= tolerance)
     )
 
-    legacy = ~schema_present & raw_kkt_ok
-    if (
-        "inner_solver" not in search_df.columns
-        or "admm_iterations" not in search_df.columns
-    ):
-        legacy &= False
-    else:
-        solver_ok = (
-            search_df["inner_solver"]
-            .astype(str)
-            .eq("admm_complete_graph")
-            .to_numpy(dtype=bool)
-        )
-        admm_iterations = pd.to_numeric(
-            search_df["admm_iterations"], errors="coerce"
-        ).to_numpy(dtype=float)
-        legacy &= solver_ok & np.isfinite(admm_iterations) & (admm_iterations > 0.0)
-    return explicit | legacy
+    return certified
 
 
 def _positive_exact_fusion_selection_mask(search_df: pd.DataFrame) -> np.ndarray:
@@ -217,14 +165,6 @@ def _positive_exact_fusion_selection_mask(search_df: pd.DataFrame) -> np.ndarray
         & partition_ok
         & _exact_fusion_certificate_mask(search_df)
     )
-
-
-def _row_bic_selection_eligible(row: pd.Series) -> bool:
-    value = row.get(
-        "bic_selection_eligible",
-        row.get("selection_eligible", row.get("converged", False)),
-    )
-    return _bool_with_default(value, default=False)
 
 
 def _bool_with_default(value: object, default: bool = False) -> bool:
@@ -265,18 +205,6 @@ def _row_lambda_applicable(row: pd.Series) -> bool:
     return _bool_with_default(row["lambda_applicable"], default=False)
 
 
-def _row_lambda_if_applicable(row: pd.Series) -> float | None:
-    if not _row_lambda_applicable(row):
-        return None
-    try:
-        value = float(row.get("lambda", np.nan))
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(value) or value < 0.0:
-        return None
-    return value
-
-
 def _lambda_applicable_mask(frame: pd.DataFrame) -> np.ndarray:
     if frame.empty:
         return np.zeros(0, dtype=bool)
@@ -291,117 +219,13 @@ def _lambda_applicable_mask(frame: pd.DataFrame) -> np.ndarray:
 
 
 def _add_bic_selection_eligible(search_df: pd.DataFrame) -> pd.DataFrame:
-    if search_df.empty:
-        return search_df.copy()
     enriched = search_df.copy()
-    n_rows = int(enriched.shape[0])
-    explicit_candidate_eligible: np.ndarray | None = None
-    for column in ("eligible_for_selection", "selection_eligible"):
-        if column in enriched.columns:
-            values = _strict_bool_mask(enriched[column])
-            explicit_candidate_eligible = (
-                values
-                if explicit_candidate_eligible is None
-                else explicit_candidate_eligible & values
-            )
-    if "raw_kkt_eligible" in enriched.columns:
-        raw_kkt = _strict_bool_mask(enriched["raw_kkt_eligible"])
-    elif "selection_eligible" in enriched.columns:
-        raw_kkt = _strict_bool_mask(enriched["selection_eligible"])
-    elif "converged" in enriched.columns:
-        raw_kkt = _strict_bool_mask(enriched["converged"])
-    else:
-        raw_kkt = np.zeros(n_rows, dtype=bool)
-    partition_certified = _required_bool_mask(enriched, "partition_certified")
-    if "bic_refit_finite_candidate_found" in enriched.columns:
-        bic_refit = _strict_bool_mask(enriched["bic_refit_finite_candidate_found"])
-    else:
-        # Absent certificate means unknown, treated as False (not True)
-        bic_refit = np.zeros(n_rows, dtype=bool)
-    refit_resolved = _required_bool_mask(enriched, "refit_numerically_resolved")
-    if "classic_bic" in enriched.columns:
-        classic_bic = enriched["classic_bic"].to_numpy(dtype=float)
-    elif "bic" in enriched.columns:
-        classic_bic = enriched["bic"].to_numpy(dtype=float)
-    else:
-        classic_bic = np.full(n_rows, np.nan, dtype=float)
-    if "bic" in enriched.columns:
-        selected_score = enriched["bic"].to_numpy(dtype=float)
-    else:
-        selected_score = classic_bic
-    raw_eligible = (
-        raw_kkt
-        & partition_certified
-        & bic_refit
-        & refit_resolved
-        & np.isfinite(classic_bic)
-        & np.isfinite(selected_score)
-    )
-    direct_mask = (
-        enriched["candidate_family"]
-        .astype(str)
-        .eq("direct_partition")
-        .to_numpy(dtype=bool)
-        if "candidate_family" in enriched.columns
-        else np.zeros(n_rows, dtype=bool)
-    )
-    direct_identity = _required_bool_mask(
-        enriched, "direct_partition_identity_certified"
-    )
-    direct_eligible = (
-        direct_identity
-        & bic_refit
-        & refit_resolved
-        & np.isfinite(classic_bic)
-        & np.isfinite(selected_score)
-    )
-    eligible = np.where(direct_mask, direct_eligible, raw_eligible)
-    if explicit_candidate_eligible is not None:
-        eligible &= explicit_candidate_eligible
-    enriched["bic_selection_eligible"] = eligible
+    enriched["bic_selection_eligible"] = _bic_selection_eligible_mask(enriched)
     return enriched
 
 
 def _annotate_bic_diagnostics(search_df: pd.DataFrame) -> pd.DataFrame:
-    if search_df.empty:
-        return search_df.copy()
-    enriched = _add_bic_selection_eligible(search_df)
-    if {"bic_df", "bic_n_eff"}.issubset(enriched.columns):
-        bic_df = enriched["bic_df"].to_numpy(dtype=float)
-        bic_n_eff = np.maximum(enriched["bic_n_eff"].to_numpy(dtype=float), 1.0)
-        enriched["bic_penalty"] = bic_df * np.log(bic_n_eff)
-    elif "bic_penalty" not in enriched.columns:
-        enriched["bic_penalty"] = np.nan
-
-    for column in ("delta_loglik_vs_one_cluster", "delta_bic_vs_one_cluster"):
-        if column not in enriched.columns:
-            enriched[column] = np.nan
-    if not {"n_clusters", "classic_bic", "bic_loglik"}.issubset(enriched.columns):
-        return enriched
-    n_clusters = enriched["n_clusters"].to_numpy(dtype=float)
-    one_cluster = enriched.loc[
-        (n_clusters == 1.0) & np.isfinite(enriched["classic_bic"].to_numpy(dtype=float))
-    ].copy()
-    if one_cluster.empty:
-        return enriched
-    one_cluster["_bic_eligible_for_baseline"] = _bic_selection_eligible_mask(
-        one_cluster
-    )
-    baseline = one_cluster.sort_values(
-        ["_bic_eligible_for_baseline", "classic_bic", "lambda", "selection_step"],
-        ascending=[False, True, True, True],
-    ).iloc[0]
-    baseline_loglik = float(baseline.get("bic_loglik", np.nan))
-    baseline_bic = float(baseline.get("classic_bic", np.nan))
-    if np.isfinite(baseline_loglik):
-        enriched["delta_loglik_vs_one_cluster"] = (
-            enriched["bic_loglik"].to_numpy(dtype=float) - baseline_loglik
-        )
-    if np.isfinite(baseline_bic):
-        enriched["delta_bic_vs_one_cluster"] = (
-            enriched["classic_bic"].to_numpy(dtype=float) - baseline_bic
-        )
-    return enriched
+    return _add_bic_selection_eligible(search_df)
 
 
 def _select_best_partition_leftmost(

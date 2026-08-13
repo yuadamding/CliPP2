@@ -85,7 +85,6 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--outer-max-iter", type=int, default=None)
     parser.add_argument("--inner-max-iter", type=int, default=None)
     parser.add_argument("--tol", type=float, default=None)
-    parser.add_argument("--summary-tol", type=float, default=None)
     parser.add_argument("--selection-partition-tol", type=float, default=None)
     parser.add_argument("--selection-refit-tol", type=float, default=None)
     parser.add_argument("--selection-refit-max-iter", type=int, default=None)
@@ -151,11 +150,6 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
     )
-    parser.add_argument(
-        "--allow-heuristic-structure-splits",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--skip-outputs", action="store_true")
 
@@ -191,11 +185,6 @@ def _resolve_profile_defaults(args: argparse.Namespace) -> None:
         "inner_max_iter": int(profile.inner_max_iter),
         "tol": float(profile.solver_tolerance),
         "dtype": str(profile.raw_dtype),
-        "summary_tol": (
-            1e-4
-            if profile.is_strict
-            else (2e-4 if profile.name == "balanced" else 1e-3)
-        ),
         "selection_partition_tol": (
             1e-4
             if profile.is_strict
@@ -253,7 +242,6 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         outer_max_iter=args.outer_max_iter,
         inner_max_iter=args.inner_max_iter,
         tol=args.tol,
-        summary_tol=args.summary_tol,
         selection_score=args.selection_score.replace("-", "_"),
         selection_partition_tol=args.selection_partition_tol,
         selection_refit_tol=args.selection_refit_tol,
@@ -272,7 +260,6 @@ def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
         certificate_max_iter=args.certificate_max_iter,
         certificate_refinement_rounds=args.certificate_refinement_rounds,
         certificate_column_tol_scale=args.certificate_column_tol_scale,
-        allow_heuristic_structure_splits=args.allow_heuristic_structure_splits,
         verbose=args.verbose,
         computation_profile=args.profile,
     )

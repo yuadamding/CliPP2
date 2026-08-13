@@ -188,21 +188,6 @@ def _cluster_labels(
     return labels
 
 
-def cluster_labels_from_edges(
-    phi: np.ndarray,
-    *,
-    edge_u: np.ndarray,
-    edge_v: np.ndarray,
-    tol: float,
-) -> np.ndarray:
-    return _cluster_labels(
-        np.asarray(phi),
-        edge_u=np.asarray(edge_u, dtype=np.int64),
-        edge_v=np.asarray(edge_v, dtype=np.int64),
-        tol=float(tol),
-    )
-
-
 def cluster_diameters_from_edges(
     phi: np.ndarray,
     labels: np.ndarray,
@@ -1583,7 +1568,6 @@ def _fit_from_start(
     certificate_max_iter: int,
     certificate_refinement_rounds: int,
     certificate_column_tol_scale: float,
-    allow_heuristic_structure_splits: bool,
     verbose: bool,
 ) -> FusionFitArtifacts:
     tol = _validate_solver_tolerance(tol)
@@ -1609,9 +1593,6 @@ def _fit_from_start(
         memory=WorksetMemoryOptions(
             max_workset_bytes=int(workset_max_bytes),
             max_compressed_cache_bytes=int(compressed_cache_max_bytes),
-            allow_heuristic_split_before_dense_fallback=bool(
-                allow_heuristic_structure_splits
-            ),
         ),
     )
     use_unimodal_objective = objective_shape.startswith("unimodal")
@@ -2939,7 +2920,6 @@ def fit_observed_data_pairwise_fusion(
     certificate_max_iter: int = DEFAULT_CERTIFICATE_MAX_ITER,
     certificate_refinement_rounds: int = DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
     certificate_column_tol_scale: float = DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
-    allow_heuristic_structure_splits: bool = True,
     verbose: bool = False,
 ) -> FusionFitArtifacts:
     tol = _validate_solver_tolerance(tol)
@@ -3064,7 +3044,6 @@ def fit_observed_data_pairwise_fusion(
             certificate_max_iter=certificate_max_iter,
             certificate_refinement_rounds=certificate_refinement_rounds,
             certificate_column_tol_scale=certificate_column_tol_scale,
-            allow_heuristic_structure_splits=allow_heuristic_structure_splits,
             verbose=verbose,
         )
 

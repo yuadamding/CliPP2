@@ -48,8 +48,6 @@ def generate_partition_initializer_pool(
     runtime,
     torch_data,
     rescore_candidates,
-    bic_df_scale: float,
-    bic_cluster_penalty: float,
     curvature=None,
     curvature_elapsed_seconds: float | None = None,
     declared_k_grid: tuple[int, ...] | None = None,
@@ -57,9 +55,8 @@ def generate_partition_initializer_pool(
 ) -> PartitionInitializerPool:
     """Generate the deterministic Ward/CEM pool used to choose one guide.
 
-    The score is supplied explicitly so guided fusion can choose its guide by
-    exact-partition Dirichlet score without coupling that choice to the final
-    raw-fusion score.
+    The score is supplied explicitly so guide generation and retention use the
+    same criterion as final partition selection.
     The chosen guide always supplies the initial solver state and lambda scale.
     It defines the frozen adaptive edge weights in strict mode; approximate
     profiles instead weight the graph from the zero-penalty likelihood pilot.
@@ -144,11 +141,19 @@ def generate_partition_initializer_pool(
             use_torch=getattr(data, "path_likelihood", None) is None,
             classification_weight_alpha=(
                 float(config.classification_alpha)
-                if normalized_score == "partition_icl"
+                if normalized_score == "fixed_partition_dirichlet_score"
                 else None
             ),
             classification_code_weight=float(config.classification_code_weight),
-            allow_component_death=bool(config.allow_component_death),
+            # With fixed K, likelihood-only CEM is exactly aligned with BIC
+            # because its complexity penalty is constant.  Component death
+            # would change K and would require a full BIC-aware move rule, so
+            # keep it disabled for BIC generation rather than silently using
+            # the Dirichlet move semantics.
+            allow_component_death=bool(
+                config.allow_component_death
+                and normalized_score == "fixed_partition_dirichlet_score"
+            ),
             include_plain_ward=bool(config.include_plain_ward),
             include_ward_cem=bool(config.include_ward_cem),
         )
@@ -158,8 +163,6 @@ def generate_partition_initializer_pool(
                 candidates,
                 data=data,
                 normalized_score=normalized_score,
-                bic_df_scale=bic_df_scale,
-                bic_cluster_penalty=bic_cluster_penalty,
                 classification_alpha=float(config.classification_alpha),
                 classification_code_weight=float(config.classification_code_weight),
             ),

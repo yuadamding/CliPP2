@@ -133,7 +133,11 @@ SELECTION_CONTRACTS: dict[str, SelectionContract] = {
     )
 }
 SELECTION_CONTRACT_IDS = tuple(SELECTION_CONTRACTS)
-DEFAULT_SELECTION_CONTRACT = RAW_FUSION_ONLY_V03.contract_id
+# The raw-only contract remains available as the exact v0.3 compatibility
+# surface.  Production defaults to the hybrid union because the deterministic
+# Ward/CEM partitions cover statistically competitive low-K models that the
+# bounded non-convex raw lambda path can skip entirely.
+DEFAULT_SELECTION_CONTRACT = HYBRID_WARD_CEM_V1.contract_id
 
 
 def normalize_selection_contract_id(value: str) -> str:

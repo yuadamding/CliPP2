@@ -48,7 +48,7 @@ class FitOptions:
     selection_partition_tol: float = 2e-4
     selection_refit_tol: float = 1e-5
     selection_refit_max_iter: int = 64
-    selection_contract: str = "raw-fusion-only-v0.3"
+    selection_contract: str = "hybrid-ward-cem-v1"
     selection_dirichlet_alpha: float = 1.0
     selection_dirichlet_code_weight: float = 0.7
     objective_shape: str = "unimodal"
@@ -60,7 +60,6 @@ class FitOptions:
     certificate_max_iter: int = 128
     certificate_refinement_rounds: int = 1
     certificate_column_tol_scale: float = DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE
-    allow_heuristic_structure_splits: bool = True
     verbose: bool = False
     computation_profile: str = DEFAULT_COMPUTATION_PROFILE
 
@@ -279,7 +278,6 @@ def fit_fixed_objective(
         certificate_max_iter=int(options.certificate_max_iter),
         certificate_refinement_rounds=int(options.certificate_refinement_rounds),
         certificate_column_tol_scale=float(options.certificate_column_tol_scale),
-        allow_heuristic_structure_splits=bool(options.allow_heuristic_structure_splits),
         runtime=runtime,
         torch_data=torch_data,
         solver_context=solver_context,

@@ -58,14 +58,15 @@ def process_tumor_bundle(
         use_warm_starts=use_warm_starts,
     )
     selected_model = selection_result.selected_model
-    selected_candidate = getattr(
-        selected_model, "partition_candidate", selected_model.candidate
-    )
+    selected_candidate = getattr(selected_model, "partition_candidate", None)
+    if selected_candidate is None:  # Compatibility for lightweight test doubles.
+        selected_candidate = selected_model.candidate
     validate_candidate_identity(selected_candidate)
     raw_reference = getattr(selected_model, "raw_reference", selected_candidate)
     validate_candidate_identity(raw_reference)
     best_fit = raw_reference.raw_fit
     raw_partition = raw_reference.partition
+    partition_parent_raw = getattr(selected_model, "partition_parent_raw", None)
     partition = selected_candidate.partition
     refit = selected_candidate.refit
     score = selected_candidate.score
@@ -77,7 +78,7 @@ def process_tumor_bundle(
         "resolved" if selection_optimum_resolved else "provisional_unresolved"
     )
     selection_contract = get_selection_contract(
-        getattr(fit_options, "selection_contract", "raw-fusion-only-v0.3")
+        getattr(fit_options, "selection_contract", "hybrid-ward-cem-v1")
     )
     selected_partition_certified = bool(
         isinstance(partition, FusionPartition) and partition.certified
@@ -136,6 +137,17 @@ def process_tumor_bundle(
             and partition.parent_raw_lambda is not None
             else np.nan
         ),
+        "selected_partition_parent_phi_hash": (
+            str(partition.parent_raw_phi_hash)
+            if isinstance(partition, DirectPartition)
+            and partition_parent_raw is not None
+            else ""
+        ),
+        "selected_partition_parent_signature": (
+            str(partition_parent_raw.partition.signature)
+            if partition_parent_raw is not None
+            else ""
+        ),
         "selected_n_clusters": int(partition.n_clusters),
         "selected_partition_signature": str(partition.signature),
         "selected_partition_certified": bool(selected_partition_certified),
@@ -149,23 +161,12 @@ def process_tumor_bundle(
             isinstance(partition, DirectPartition)
             and partition.deterministic_generation
         ),
-        "raw_partition_matches_selected_partition": bool(
-            raw_partition.signature == partition.signature
-        ),
         "selected_labels_hash": _array_fingerprint(
             partition.labels,
             dtype=np.dtype(np.int64),
         ),
         "raw_reference_phi_hash": _array_fingerprint(
             best_fit.phi,
-            dtype=np.dtype(np.float64),
-        ),
-        "selected_raw_phi_hash": _array_fingerprint(
-            best_fit.phi,
-            dtype=np.dtype(np.float64),
-        ),
-        "selected_fixed_partition_refit_phi_hash": _array_fingerprint(
-            refit.phi,
             dtype=np.dtype(np.float64),
         ),
         "selected_fixed_partition_refit_centers_hash": _array_fingerprint(
@@ -179,7 +180,6 @@ def process_tumor_bundle(
         "selection_df": int(score.degrees_of_freedom),
         "selection_penalty": float(score.penalty),
         "selection_n_eff": int(score.n_eff),
-        "selection_bic_penalty": float(score.penalty - score.assignment_penalty),
         "selection_assignment_log_evidence": float(score.assignment_log_evidence),
         "selection_assignment_code_weight": float(score.assignment_code_weight),
         "selection_assignment_penalty": float(score.assignment_penalty),
@@ -202,25 +202,14 @@ def process_tumor_bundle(
         "selected_objective_spec_hash": str(best_fit.objective_spec_hash),
         "selected_base_fusion_objective_hash": str(best_fit.base_fusion_objective_hash),
         "selected_original_graph_hash": str(best_fit.original_graph_hash),
-        "selection_metric_value": (
-            np.nan
-            if selection_result.selection_metric_value is None
-            else float(selection_result.selection_metric_value)
-        ),
         "selection_method": str(selection_result.selection_method),
         "num_candidates": int(selection_result.num_candidates),
         "num_candidates_certified": int(selection_result.num_candidates_certified),
-        "partition_candidate_pool_complete": bool(
-            getattr(selection_result, "ward_candidate_pool_complete", False)
-        ),
         "ward_candidate_pool_complete": bool(
             getattr(selection_result, "ward_candidate_pool_complete", False)
         ),
         "raw_lambda_path_complete": bool(
             getattr(selection_result, "raw_lambda_path_resolved", False)
-        ),
-        "best_over_evaluated_candidates": bool(
-            getattr(selection_result, "best_over_evaluated_candidates", True)
         ),
         "global_hybrid_optimum_certified": bool(
             getattr(selection_result, "global_hybrid_optimum_certified", False)

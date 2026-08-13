@@ -73,7 +73,7 @@ BALANCED_PROFILE: Final = ComputationProfile(
     lambda_refinement_budget=2,
     outer_max_iter=6,
     inner_max_iter=25,
-    solver_tolerance=2e-4,
+    solver_tolerance=8e-4,
     solver_retry_limit=1,
 )
 

@@ -22,10 +22,6 @@ from ..model_selection.types import (
 SelectedPartition = FusionPartition | DirectPartition
 
 
-def _display_region_label(label: str) -> str:
-    return str(label)
-
-
 def _validated_profile(
     data: TumorData,
     values: np.ndarray,
@@ -45,7 +41,7 @@ def _validate_identity(
     raw_fit: FitResult,
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray:
     raw_phi = np.asarray(raw_fit.phi, dtype=np.float64)
     labels = np.asarray(partition.labels, dtype=np.int64)
     if labels.shape != (raw_phi.shape[0],):
@@ -61,9 +57,12 @@ def _validate_identity(
         raise AssertionError("Selected partition and fixed refit signatures differ.")
     if isinstance(partition, FusionPartition) and not partition.certified:
         raise AssertionError("Refusing to serialize an uncertified raw partition.")
-    if isinstance(partition, DirectPartition) and not partition.deterministic_generation:
+    if (
+        isinstance(partition, DirectPartition)
+        and not partition.deterministic_generation
+    ):
         raise AssertionError("Refusing to serialize a nondeterministic partition.")
-    return raw_phi, labels
+    return labels
 
 
 def _path_supported_mask(data: TumorData, shape: tuple[int, int]) -> np.ndarray:
@@ -113,7 +112,7 @@ def mutation_output_table(
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
 ) -> pd.DataFrame:
-    _, labels = _validate_identity(raw_fit, partition, refit)
+    labels = _validate_identity(raw_fit, partition, refit)
     refit_phi = _validated_profile(data, refit.phi, name="refit.phi")
     table = pd.DataFrame(
         {
@@ -123,29 +122,12 @@ def mutation_output_table(
         }
     )
     for column, region_id in enumerate(data.region_ids):
-        region = _display_region_label(region_id)
+        region = str(region_id)
         # The selected fixed-partition refit is the authoritative reported CCF.
         # Keep the compact v0.2.1-style public name requested by downstream
         # consumers; raw-fusion diagnostics remain in the audit tables.
         table[f"phi_{region}"] = refit_phi[:, column]
     return table
-
-
-def _cluster_raw_diameters(raw_phi: np.ndarray, labels: np.ndarray) -> np.ndarray:
-    n_clusters = int(labels.max()) + 1 if labels.size else 0
-    result = np.zeros(n_clusters, dtype=np.float64)
-    for cluster in range(n_clusters):
-        values = raw_phi[labels == cluster]
-        if values.shape[0] <= 1:
-            continue
-        maximum = 0.0
-        for start in range(0, values.shape[0], 512):
-            block = values[start : start + 512]
-            distances = np.linalg.norm(block[:, None, :] - values[None, :, :], axis=-1)
-            if distances.size:
-                maximum = max(maximum, float(np.max(distances)))
-        result[cluster] = maximum
-    return result
 
 
 def cluster_output_table(
@@ -154,40 +136,21 @@ def cluster_output_table(
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
 ) -> pd.DataFrame:
-    raw_phi, labels = _validate_identity(raw_fit, partition, refit)
+    labels = _validate_identity(raw_fit, partition, refit)
     centers = np.asarray(refit.cluster_centers, dtype=np.float64)
     expected = (int(partition.n_clusters), int(data.num_regions))
     if centers.shape != expected or not np.all(np.isfinite(centers)):
         raise ValueError(f"refit.cluster_centers must have shape {expected}.")
     sizes = np.bincount(labels, minlength=int(partition.n_clusters))
-    diameters = _cluster_raw_diameters(raw_phi, labels)
-    if isinstance(partition, FusionPartition) and diameters.size and not np.isclose(
-        float(np.max(diameters)),
-        float(partition.max_diameter),
-        rtol=0.0,
-        atol=1e-12,
-    ):
-        raise AssertionError(
-            "Serialized raw diameter differs from certified partition."
-        )
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, partition.n_clusters),
             "cluster_label": np.arange(1, partition.n_clusters + 1, dtype=int),
             "cluster_size": sizes,
-            "cluster_diameter": diameters,
-            "cluster_diameter_exact": np.repeat(
-                bool(
-                    partition.diameter_exact
-                    if isinstance(partition, FusionPartition)
-                    else False
-                ),
-                partition.n_clusters,
-            ),
         }
     )
     for column, region_id in enumerate(data.region_ids):
-        region = _display_region_label(region_id)
+        region = str(region_id)
         table[f"phi_{region}"] = centers[:, column]
     return table
 
@@ -197,7 +160,6 @@ def _add_legacy_multiplicity(
     *,
     data: TumorData,
     phi: np.ndarray,
-    prefix: str,
     major_prior: float,
     eps: float,
 ) -> None:
@@ -207,24 +169,20 @@ def _add_legacy_multiplicity(
         major_prior=float(major_prior),
         eps=float(eps),
     )
-    stem = f"{prefix}_" if prefix else ""
-    table[f"{stem}multiplicity_estimated"] = posterior.estimation_mask.reshape(
+    table["multiplicity_estimated"] = posterior.estimation_mask.reshape(
         -1
     ).astype(int)
-    table[f"{stem}gamma_major"] = posterior.gamma_major.reshape(-1)
-    table[f"{stem}major_call"] = posterior.major_call.reshape(-1).astype(int)
-    table[f"{stem}multiplicity_call"] = posterior.multiplicity_call.reshape(-1)
+    table["gamma_major"] = posterior.gamma_major.reshape(-1)
+    table["major_call"] = posterior.major_call.reshape(-1).astype(int)
+    table["multiplicity_call"] = posterior.multiplicity_call.reshape(-1)
 
 
 def _add_path_summary(
     table: pd.DataFrame,
     summary: dict[str, np.ndarray],
-    *,
-    prefix: str,
 ) -> None:
-    stem = f"{prefix}_" if prefix else ""
     map_index = summary["map_index"].reshape(-1)
-    table[f"{stem}map_path"] = pd.array(
+    table["map_path"] = pd.array(
         [pd.NA if value < 0 else int(value) + 1 for value in map_index],
         dtype="Int64",
     )
@@ -240,9 +198,9 @@ def _add_path_summary(
         "path_entropy": "path_entropy",
     }
     for output_name, source_name in fields.items():
-        table[f"{stem}{output_name}"] = summary[source_name].reshape(-1)
+        table[output_name] = summary[source_name].reshape(-1)
     amplified = summary["amplified_mutant_copy_call"].reshape(-1)
-    table[f"{stem}amplified_mutant_copy_call"] = pd.array(
+    table["amplified_mutant_copy_call"] = pd.array(
         [pd.NA if not np.isfinite(value) else int(value) for value in amplified],
         dtype="Int64",
     )
@@ -256,13 +214,13 @@ def mutation_region_output_table(
     *,
     major_prior: float = 0.5,
 ) -> pd.DataFrame:
-    _, labels = _validate_identity(raw_fit, partition, refit)
+    labels = _validate_identity(raw_fit, partition, refit)
     refit_phi = _validated_profile(data, refit.phi, name="refit.phi")
     mutation_ids = np.repeat(
         np.asarray(data.mutation_ids, dtype=object), data.num_regions
     )
     region_ids = np.tile(
-        np.asarray([_display_region_label(x) for x in data.region_ids], dtype=object),
+        np.asarray([str(x) for x in data.region_ids], dtype=object),
         data.num_mutations,
     )
     table = pd.DataFrame(
@@ -282,7 +240,6 @@ def mutation_region_output_table(
             table,
             data=data,
             phi=refit_phi,
-            prefix="",
             major_prior=major_prior,
             eps=eps,
         )
@@ -290,7 +247,7 @@ def mutation_region_output_table(
         refit_summary = _path_summary_for_profile(data, refit_phi, eps=eps)
         if refit_summary is None:
             raise AssertionError("Path likelihood did not produce a refit summary.")
-        _add_path_summary(table, refit_summary, prefix="")
+        _add_path_summary(table, refit_summary)
         supported = refit_summary["supported"].reshape(-1)
         table["path_supported"] = supported.astype(int)
         reasons = getattr(data, "path_unsupported_reason", None)

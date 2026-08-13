@@ -30,7 +30,6 @@ class CompiledPathSet:
 
     paths: tuple[tuple[float, float, float], ...]
     log_prior: tuple[float, ...]
-    biological_duplicate_count: tuple[int, ...]
 
 
 def path_prior_mode(dosage_prior_penalty: float) -> str:
@@ -93,7 +92,7 @@ def compile_single_switch_paths(
         raise ValueError("dosage_prior_penalty must be finite and nonnegative.")
     normalized_states = tuple(states)
     if len(normalized_states) not in {1, 2}:
-        return CompiledPathSet((), (), ())
+        return CompiledPathSet((), ())
     for state in normalized_states:
         if (
             not np.isfinite(state.fraction)
@@ -158,7 +157,6 @@ def compile_single_switch_paths(
                         )
 
     log_prior_mass: dict[tuple[float, float, float], float] = {}
-    duplicate_count: dict[tuple[float, float, float], int] = {}
     for path in candidates:
         first, second, switch = path
         endpoint_mass = first * switch + second * (1.0 - switch)
@@ -169,9 +167,8 @@ def compile_single_switch_paths(
             )
         else:
             log_prior_mass[path] = float(log_weight)
-        duplicate_count[path] = duplicate_count.get(path, 0) + 1
     if not log_prior_mass:
-        return CompiledPathSet((), (), ())
+        return CompiledPathSet((), ())
     paths = tuple(
         sorted(log_prior_mass, key=lambda item: (item[2], item[0], item[1]))
     )
@@ -180,7 +177,6 @@ def compile_single_switch_paths(
     return CompiledPathSet(
         paths=paths,
         log_prior=tuple(float(value) for value in log_prior),
-        biological_duplicate_count=tuple(duplicate_count[path] for path in paths),
     )
 
 
@@ -191,7 +187,7 @@ def build_path_likelihood(
     model_version: str,
     candidate_generator_version: str = PATH_CANDIDATE_GENERATOR_VERSION,
     prior_mode: str,
-) -> tuple[PathLikelihoodSpec, np.ndarray]:
+) -> PathLikelihoodSpec:
     """Pad compiled unit paths into one immutable likelihood specification."""
 
     num_mutations = len(compiled_units)
@@ -209,16 +205,11 @@ def build_path_likelihood(
     switch_fraction = np.zeros(shape, dtype=np.float64)
     log_prior = np.full(shape, -np.inf, dtype=np.float64)
     valid = np.zeros(shape, dtype=bool)
-    biological_duplicates = np.zeros(shape, dtype=np.int64)
     for mutation_index, row in enumerate(compiled_units):
         for sample_index, compiled in enumerate(row):
             if not compiled.paths:
                 raise ValueError("Every compiled unit must contain at least one path.")
-            if not (
-                len(compiled.paths)
-                == len(compiled.log_prior)
-                == len(compiled.biological_duplicate_count)
-            ):
+            if len(compiled.paths) != len(compiled.log_prior):
                 raise ValueError("Compiled path arrays have inconsistent lengths.")
             for path_index, path in enumerate(compiled.paths):
                 first_copy[mutation_index, sample_index, path_index] = path[0]
@@ -227,23 +218,17 @@ def build_path_likelihood(
                 log_prior[mutation_index, sample_index, path_index] = (
                     compiled.log_prior[path_index]
                 )
-                biological_duplicates[mutation_index, sample_index, path_index] = (
-                    compiled.biological_duplicate_count[path_index]
-                )
                 valid[mutation_index, sample_index, path_index] = True
-    return (
-        PathLikelihoodSpec(
-            model_id=model_id,
-            model_version=model_version,
-            candidate_generator_version=candidate_generator_version,
-            prior_mode=prior_mode,
-            first_copy=first_copy,
-            second_copy=second_copy,
-            switch_fraction=switch_fraction,
-            log_prior=log_prior,
-            valid=valid,
-        ),
-        biological_duplicates,
+    return PathLikelihoodSpec(
+        model_id=model_id,
+        model_version=model_version,
+        candidate_generator_version=candidate_generator_version,
+        prior_mode=prior_mode,
+        first_copy=first_copy,
+        second_copy=second_copy,
+        switch_fraction=switch_fraction,
+        log_prior=log_prior,
+        valid=valid,
     )
 
 

@@ -316,8 +316,6 @@ def simulate_clonal_tree_ccf(
             "ccf_samples_clones": ccf_samples_clones,
             "exclusive_clone_fraction_patient": exclusive_clone_fraction_patient,
             "exclusive_clone_fraction_samples": exclusive_clone_fraction_samples,
-            "clone_ccf_patient": ccf_patient_clones,
-            "clone_ccf_samples": ccf_samples_clones,
             "generation_attempts": int(generation_attempt),
             "topology_rejections": int(topology_rejections),
         }

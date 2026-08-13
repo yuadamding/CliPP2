@@ -33,7 +33,6 @@ class ExactSolverResourceLimit(MemoryError):
 class WorksetMemoryOptions:
     max_workset_bytes: int = DEFAULT_WORKSET_MAX_BYTES
     max_compressed_cache_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES
-    allow_heuristic_split_before_dense_fallback: bool = True
 
     def __post_init__(self) -> None:
         if int(self.max_workset_bytes) <= 0:
@@ -241,12 +240,6 @@ class PairwiseFusionGraph:
     name: str = "complete_uniform"
     degree_bound: int = 1
 
-    def clear_torch_cache(self) -> None:
-        # Backward-compatible no-op. Device tensors are owned by SolverContext
-        # or per-run TensorFusionGraph objects, not cached on this host graph.
-        return None
-
-
 @dataclass(frozen=True)
 class FusionFitArtifacts:
     phi: np.ndarray
@@ -417,14 +410,6 @@ class SolverState:
     warm_state: BackendWarmState | None = None
     certificate: GraphFusionCertificate | None = None
     objective_spec_hash: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class ObjectiveTerms:
-    fit: torch.Tensor
-    penalty: torch.Tensor
-    total: torch.Tensor
-    gamma_major: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)

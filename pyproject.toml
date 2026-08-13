@@ -43,12 +43,7 @@ version = { attr = "CliPP2._version.__version__" }
 CliPP2 = [
     "examples/README.md",
     "examples/*.tsv",
-    "examples/*.clipp2.txt",
 ]
-
-[tool.pytest.ini_options]
-testpaths = ["../tests/CliPP2_current"]
-pythonpath = [".", ".."]
 
 [tool.ruff]
 target-version = "py310"

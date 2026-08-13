@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -164,7 +165,19 @@ def _cpu_memory_limit_bytes(runtime: TorchRuntime) -> int | None:
         return None
     if int(page_count) <= 0 or int(page_size) <= 0:
         return None
-    return int(COMPLETE_GRAPH_MEMORY_SAFETY_FRACTION * int(page_count) * int(page_size))
+    available_bytes = int(page_count) * int(page_size)
+    # SC_AVPHYS_PAGES counts only immediately free pages and ignores reclaimable
+    # page cache. Large read-heavy simulation campaigns can therefore report a
+    # tiny limit on an otherwise healthy host. Linux MemAvailable is the
+    # appropriate admission quantity; keep sysconf as the portable fallback.
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                available_bytes = int(line.split()[1]) * 1024
+                break
+    except (FileNotFoundError, OSError, ValueError, IndexError):
+        pass
+    return int(COMPLETE_GRAPH_MEMORY_SAFETY_FRACTION * int(available_bytes))
 
 
 def _complete_graph_memory_limit_bytes(
@@ -614,10 +627,7 @@ def graph_adjoint_edges(
     num_regions = int(dual.shape[1])
     complete_edge_count = int(num_nodes) * max(int(num_nodes) - 1, 0) // 2
     dense_workspace_bytes = (
-        int(num_nodes)
-        * int(num_nodes)
-        * max(num_regions, 1)
-        * int(dual.element_size())
+        int(num_nodes) * int(num_nodes) * max(num_regions, 1) * int(dual.element_size())
     )
     if (
         dual.device.type == "cuda"
@@ -634,20 +644,16 @@ def graph_adjoint_edges(
     if (
         dual.device.type == "cpu"
         and prefer_cpu_bincount
-        and 1 <= num_regions <= 4
+        and 1 <= num_regions <= 5
         and edge_u.numel()
     ):
         # Small-region complete-graph workflows otherwise spend much of ADMM
         # in two generic indexed scatters. Per-region bincount performs the
-        # same signed reductions in optimized contiguous kernels; above four
+        # same signed reductions in optimized contiguous kernels; above five
         # regions the generic vector scatter benchmarks faster.
         columns = [
-            torch.bincount(
-                edge_u, weights=dual[:, region], minlength=int(num_nodes)
-            )
-            - torch.bincount(
-                edge_v, weights=dual[:, region], minlength=int(num_nodes)
-            )
+            torch.bincount(edge_u, weights=dual[:, region], minlength=int(num_nodes))
+            - torch.bincount(edge_v, weights=dual[:, region], minlength=int(num_nodes))
             for region in range(num_regions)
         ]
         return torch.stack(columns, dim=1)

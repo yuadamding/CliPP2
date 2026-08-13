@@ -18,7 +18,7 @@ from .graph_ops import (
     graph_forward_edges,
     project_dual_ball,
 )
-from .types import ObjectiveTerms, TorchRuntime
+from .types import TorchRuntime
 
 
 @dataclass(frozen=True)
@@ -1290,34 +1290,6 @@ def pairwise_penalty_torch(
     return (
         torch.as_tensor(float(lambda_value), dtype=phi.dtype, device=phi.device)
         * weighted_norm
-    )
-
-
-def objective_terms_torch(
-    data: TorchTumorData,
-    phi: torch.Tensor,
-    *,
-    edge_u: torch.Tensor,
-    edge_v: torch.Tensor,
-    edge_w: torch.Tensor,
-    lambda_value: float,
-    major_prior: float,
-    eps: float,
-) -> ObjectiveTerms:
-    terms = mutation_region_terms_torch(data, phi, major_prior=major_prior, eps=eps)
-    fit_loss = torch.sum(terms.loss)
-    penalty = pairwise_penalty_torch(
-        phi,
-        edge_u=edge_u,
-        edge_v=edge_v,
-        edge_w=edge_w,
-        lambda_value=lambda_value,
-    )
-    return ObjectiveTerms(
-        fit=fit_loss,
-        penalty=penalty,
-        total=fit_loss + penalty,
-        gamma_major=terms.gamma_major,
     )
 
 

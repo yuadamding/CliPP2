@@ -72,7 +72,7 @@ def fixed_partition_bic(
     partition_signature: str,
     labels: np.ndarray | None = None,
     loglik_uncertainty: float = 0.0,
-    selection_contract_id: str = "raw-fusion-only-v0.3",
+    selection_contract_id: str = "hybrid-ward-cem-v1",
 ) -> "SelectionScore":
     """Return the explicitly named BIC for one immutable partition refit."""
 
@@ -148,6 +148,7 @@ DIRICHLET_EXACT_PARTITION_MODEL_ID = "symmetric_dirichlet_integrated_exact_parti
 PARTITION_DIRICHLET_SCORE_WEIGHT = 0.7
 PARTITION_DIRICHLET_ALPHA = 1.0
 
+
 def _dirichlet_exact_partition_log_mass_and_uncertainty(
     cluster_sizes: np.ndarray,
     *,
@@ -216,7 +217,7 @@ def fixed_partition_dirichlet_score(
     loglik_uncertainty: float = 0.0,
     alpha: float = PARTITION_DIRICHLET_ALPHA,
     code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
-    selection_contract_id: str = "raw-fusion-only-v0.3",
+    selection_contract_id: str = "hybrid-ward-cem-v1",
 ) -> "SelectionScore":
     """Return BIC plus a Dirichlet-integrated exact-partition deviance.
 

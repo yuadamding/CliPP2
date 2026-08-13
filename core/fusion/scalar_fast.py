@@ -26,79 +26,6 @@ def _observed_mask(data: TumorData) -> np.ndarray:
     return observed
 
 
-def evaluate_cellwise_observed_loss(
-    data: TumorData,
-    phi: np.ndarray,
-    *,
-    major_prior: float,
-    eps: float,
-) -> np.ndarray:
-    """Evaluate all mutation-region losses in one vectorized operation."""
-
-    beta = np.asarray(phi, dtype=np.float64)
-    shape = (int(data.num_mutations), int(data.num_regions))
-    if beta.shape != shape:
-        raise ValueError(f"phi must have shape {shape}, not {beta.shape}.")
-    alt = np.asarray(data.alt_counts, dtype=np.float64)
-    total = np.asarray(data.total_counts, dtype=np.float64)
-    nonalt = total - alt
-    path = data.path_likelihood
-    if path is not None:
-        scale = np.asarray(data.scaling, dtype=np.float64)[..., None]
-        expanded = beta[..., None]
-        first = scale * np.asarray(path.first_copy, dtype=np.float64)
-        second = scale * np.asarray(path.second_copy, dtype=np.float64)
-        switch = np.asarray(path.switch_fraction, dtype=np.float64)
-        mass = first * np.minimum(expanded, switch)
-        mass += second * np.maximum(expanded - switch, 0.0)
-        probability = np.clip(mass, float(eps), 1.0 - float(eps))
-        joint = (
-            alt[..., None] * np.log(probability)
-            + nonalt[..., None] * np.log1p(-probability)
-            + np.asarray(path.log_prior, dtype=np.float64)
-        )
-        joint = np.where(np.asarray(path.valid, dtype=bool), joint, -np.inf)
-        loss = -np.logaddexp.reduce(joint, axis=-1)
-    else:
-        prior = float(major_prior)
-        if not np.isfinite(prior) or not 0.0 < prior < 1.0:
-            raise ValueError("major_prior must lie strictly in (0, 1).")
-        scale = np.asarray(data.scaling, dtype=np.float64)
-        fixed_scale = scale * np.asarray(data.fixed_multiplicity, dtype=np.float64)
-        minor_scale = scale * np.asarray(data.minor_cn, dtype=np.float64)
-        major_scale = scale * np.asarray(data.major_cn, dtype=np.float64)
-        fixed_probability = np.clip(
-            beta * fixed_scale, float(eps), 1.0 - float(eps)
-        )
-        fixed_loss = -(
-            alt * np.log(fixed_probability)
-            + nonalt * np.log1p(-fixed_probability)
-        )
-        minor_probability = np.clip(
-            beta * minor_scale, float(eps), 1.0 - float(eps)
-        )
-        major_probability = np.clip(
-            beta * major_scale, float(eps), 1.0 - float(eps)
-        )
-        minor_joint = (
-            alt * np.log(minor_probability)
-            + nonalt * np.log1p(-minor_probability)
-            + np.log1p(-prior)
-        )
-        major_joint = (
-            alt * np.log(major_probability)
-            + nonalt * np.log1p(-major_probability)
-            + np.log(prior)
-        )
-        ambiguous_loss = -np.logaddexp(minor_joint, major_joint)
-        loss = np.where(
-            np.asarray(data.multiplicity_estimation_mask, dtype=bool),
-            ambiguous_loss,
-            fixed_loss,
-        )
-    return np.where(_observed_mask(data), loss, 0.0)
-
-
 def evaluate_tumor_scalar_loss_grid(
     data: TumorData,
     mutation_indices: np.ndarray,
@@ -301,6 +228,5 @@ def approximate_tumor_scalar_minimum(
 __all__ = [
     "ApproximateScalarMinimum",
     "approximate_tumor_scalar_minimum",
-    "evaluate_cellwise_observed_loss",
     "evaluate_tumor_scalar_loss_grid",
 ]

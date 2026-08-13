@@ -126,7 +126,7 @@ class SelectionScore:
     assignment_model_id: str = "none"
     assignment_symmetry_mode: str = "none"
     assignment_arithmetic_uncertainty: float = 0.0
-    selection_contract_id: str = "raw-fusion-only-v0.3"
+    selection_contract_id: str = "hybrid-ward-cem-v1"
 
     @property
     def lower_bound(self) -> float:
@@ -161,8 +161,6 @@ class DirectPartition:
         "final_phi_hessian_ward",
         "final_phi_hessian_ward_cem",
         "final_phi_hessian_ward_cem_component_death",
-        "local_split",
-        "local_merge",
     ]
     requested_k: int
     mutation_ids: tuple[str, ...]
@@ -184,7 +182,9 @@ class DirectPartition:
         unique = np.unique(labels)
         expected = np.arange(unique.size, dtype=np.int64)
         if not np.array_equal(unique, expected):
-            raise ValueError("Direct partition labels must be canonical zero-based IDs.")
+            raise ValueError(
+                "Direct partition labels must be canonical zero-based IDs."
+            )
         if int(self.n_clusters) != int(unique.size):
             raise ValueError("Direct partition cluster count is inconsistent.")
         mutation_ids = tuple(str(value) for value in self.mutation_ids)
@@ -208,7 +208,6 @@ class DirectPartitionCandidate:
     eligible_for_selection: bool
     ineligibility_reason: str
     computation_profile: str
-    candidate_family: str = "direct_partition"
 
 
 SelectablePartitionCandidate = Union[RawFusionCandidate, DirectPartitionCandidate]
@@ -246,6 +245,11 @@ class SelectedModel:
     selected_lambda: float | None
     selected_partition_left_lambda: float | None
     selected_partition_right_lambda: float | None
+    # For a final-raw-Phi direct proposal this is the exact raw candidate whose
+    # Phi generated the deterministic Ward/CEM ladder.  It is deliberately
+    # separate from ``raw_reference``, which is selected independently as the
+    # best certified raw-fusion result for estimator provenance.
+    partition_parent_raw: RawFusionCandidate | None = None
 
     def __post_init__(self) -> None:
         raw = self.raw_reference
@@ -254,13 +258,17 @@ class SelectedModel:
         if self.selected_partition_signature != candidate.partition.signature:
             raise ValueError("Selected-model partition signature is inconsistent.")
         expected_family = (
-            "raw_fusion" if isinstance(candidate, RawFusionCandidate) else "direct_partition"
+            "raw_fusion"
+            if isinstance(candidate, RawFusionCandidate)
+            else "direct_partition"
         )
         if str(self.selected_candidate_family) != expected_family:
             raise ValueError("Selected-model candidate family is inconsistent.")
         if not candidate.eligible_for_selection:
             raise ValueError("Selected model must be eligible for selection.")
         if isinstance(candidate, RawFusionCandidate):
+            if self.partition_parent_raw is not None:
+                raise ValueError("Raw selected models cannot have a direct parent.")
             if self.selected_lambda is None or not np.isclose(
                 float(self.selected_lambda),
                 float(candidate.raw_fit.lambda_value),
@@ -274,8 +282,25 @@ class SelectedModel:
                 raise ValueError("Selected raw model must have a certified objective.")
             if not candidate.partition.certified:
                 raise ValueError("Selected raw model must have a certified partition.")
-        elif self.selected_lambda is not None:
-            raise ValueError("Direct partition candidates do not have a selected lambda.")
+        else:
+            if self.selected_lambda is not None:
+                raise ValueError(
+                    "Direct partition candidates do not have a selected lambda."
+                )
+            parent_id = candidate.partition.parent_raw_candidate_id
+            if (parent_id is None) != (self.partition_parent_raw is None):
+                raise ValueError(
+                    "Direct-partition parent provenance is incomplete or spurious."
+                )
+            if self.partition_parent_raw is not None:
+                parent_lambda = candidate.partition.parent_raw_lambda
+                if parent_lambda is None or not np.isclose(
+                    float(parent_lambda),
+                    float(self.partition_parent_raw.raw_fit.lambda_value),
+                    rtol=0.0,
+                    atol=1e-12,
+                ):
+                    raise ValueError("Direct-partition parent lambda is inconsistent.")
         if strict and not candidate.refit.global_optimum_certified:
             raise ValueError("Selected model must have a globally certified refit.")
         if candidate.score.partition_signature != self.selected_partition_signature:
@@ -287,74 +312,23 @@ class SelectedModel:
         ):
             raise ValueError("Raw reference must remain a certified raw-fusion model.")
 
-    @property
-    def candidate(self) -> SelectablePartitionCandidate:
-        """Compatibility alias for the selected partition candidate."""
-
-        return self.partition_candidate
-
-    @property
-    def partition(self) -> FusionPartition | DirectPartition:
-        return self.partition_candidate.partition
-
-    @property
-    def refit(self) -> PartitionRefitSummary:
-        return self.partition_candidate.refit
-
-    @property
-    def score(self) -> SelectionScore:
-        return self.partition_candidate.score
-
-    @property
-    def raw_fit(self) -> FitResult:
-        return self.raw_reference.raw_fit
-
-
 @dataclass
 class BICSelectionResult:
     selected_model: SelectedModel
     search_df: pd.DataFrame
-    bic_df_scale: float
-    bic_cluster_penalty: float
     selection_method: str
-    profile_name: str
-    selection_metric_value: float | None
-    selection_lambda_min: float | None
-    selection_lambda_max: float | None
-    selection_lambda_count: int
     selection_hits_lower_boundary: bool
     selection_hits_upper_boundary: bool
     selection_boundary_unresolved: bool
     selection_optimum_resolved: bool
-    adaptive_search_rounds_completed: int
     adaptive_search_stop_reason: str
     num_candidates: int
-    num_converged_candidates: int
-    num_candidates_all: int
     num_candidates_certified: int
     selected_kkt_residual: float | None
-    best_score_all_evaluated_lambda: float | None
-    best_score_all_evaluated_kkt_residual: float | None
-    best_score_all_evaluated_selection_eligible: bool
-    best_score_certified_lambda: float | None
-    best_score_certified_kkt_residual: float | None
-    selection_optimizer_limited: bool
-    selection_optimizer_limited_reason: str
-    selection_used_convergence_fallback: bool
-    lambda_search_mode: str
     selected_lambda_representative: float | None
-    selected_lambda_left: float | None
-    selected_lambda_right: float | None
-    selected_lambda_interval_log10_width: float | None
-    adaptive_refinement_rounds_completed: int
     ward_candidate_pool_complete: bool = False
     raw_lambda_path_resolved: bool = False
-    best_over_evaluated_candidates: bool = True
     global_hybrid_optimum_certified: bool = False
-
-    @property
-    def best_fit(self) -> FitResult:
-        return self.selected_model.raw_fit
 
 
 @dataclass(frozen=True)
