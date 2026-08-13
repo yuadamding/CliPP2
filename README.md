@@ -13,7 +13,8 @@ pip install .
 ## Input
 
 The public input is one tab-delimited file per tumor. See
-[`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv).
+[`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv) and
+the external [input-format contract](../docs/input-format.md).
 
 ## Fit
 
@@ -29,11 +30,6 @@ clipp2 fit \
 Use `--device cpu` on a CPU-only machine. Run `clipp2 fit --help` for profile,
 solver, resource, selection-score, and partition-tolerance controls.
 
-The default selection contract is `hybrid-ward-cem-v1`: certified raw-fusion
-partitions and deterministic pilot/final-raw-Phi Ward/CEM partitions share one
-immutable-label refit and score gate. Use `--selection-contract
-raw-fusion-only-v0.3` only for the retained v0.3 compatibility ablation.
-
 ## Outputs
 
 A fit writes three tables into `--outdir`, prefixed with the tumor id (the input
@@ -42,11 +38,8 @@ file stem unless a `##tumor_id` metadata line overrides it):
 | File | One row per | Main fields |
 | --- | --- | --- |
 | `{tumor_id}_mutation_clusters.tsv` | mutation | selected cluster and final fixed-partition CCF per region |
-| `{tumor_id}_cluster_centers.tsv` | selected cluster | size and final CCF per region |
+| `{tumor_id}_cluster_centers.tsv` | selected cluster | size, raw-partition diameter, and final CCF per region |
 | `{tumor_id}_mutation_region_multiplicity.tsv` | mutation × region | final CCF, copy number, and multiplicity or occupancy-path summary |
 
 The Python pipeline still returns the run summary and candidate-search table in
 memory for diagnostics; they are not written as result files.
-
-Raw-partition diameter diagnostics remain internal and are not serialized in
-the compact biological tables.
