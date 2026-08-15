@@ -245,25 +245,21 @@ def _canonical_observation_table(
     *,
     mutation_ids: np.ndarray,
     mutation_segment: np.ndarray,
-    mutation_position: np.ndarray,
     alt_count: np.ndarray,
     ref_count: np.ndarray,
     purity: float,
     sample_id: str,
     local_state_table: pd.DataFrame,
-    segments: list[GenomeSegment],
 ) -> pd.DataFrame:
     """Build one sample's rows in the canonical long tumor schema."""
 
     mutation_ids = np.asarray(mutation_ids, dtype=object)
     mutation_segment = np.asarray(mutation_segment, dtype=int)
-    mutation_position = np.asarray(mutation_position, dtype=int)
     alt_count = np.asarray(alt_count, dtype=int)
     ref_count = np.asarray(ref_count, dtype=int)
     expected_shape = (mutation_ids.size,)
     for name, values in (
         ("mutation_segment", mutation_segment),
-        ("mutation_position", mutation_position),
         ("alt_count", alt_count),
         ("ref_count", ref_count),
     ):
@@ -313,11 +309,9 @@ def _canonical_observation_table(
             for state_index, row in enumerate(state_rows.itertuples(index=False))
         ]
 
-    bases = ("A", "C", "G", "T")
     rows: list[dict[str, object]] = []
     for mutation_index, mutation_id in enumerate(mutation_ids):
         segment_id = int(mutation_segment[mutation_index])
-        segment = segments[segment_id]
         states = states_by_segment.get(segment_id)
         if not states:
             raise ValueError(
@@ -329,20 +323,13 @@ def _canonical_observation_table(
                 {
                     "mutation_id": str(mutation_id),
                     "sample_id": str(sample_id),
-                    "chromosome": int(segment.chromosome),
-                    "position": int(mutation_position[mutation_index]),
-                    "ref": bases[mutation_index % len(bases)],
-                    "alt": bases[(mutation_index + 1) % len(bases)],
                     "alt_count": int(alt_count[mutation_index]),
                     "ref_count": int(ref_count[mutation_index]),
                     "count_observed": 1,
                     "purity": float(purity),
                     "normal_cn": 2,
                     "segment_id": int(segment_id),
-                    "segment_start": int(segment.start),
-                    "segment_end": int(segment.end),
                     **state,
-                    "allele_mode": "unphased",
                 }
             )
     return pd.DataFrame(rows, columns=TUMOR_TXT_COLUMNS)

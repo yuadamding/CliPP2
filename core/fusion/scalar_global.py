@@ -26,7 +26,6 @@ class ScalarGlobalMinimumCertificate:
     global_lower_bound: float
     optimality_gap: float
     globally_certified: bool
-    lower_bound_certified: bool
     method: str
     intervals_evaluated: int
 
@@ -294,7 +293,6 @@ def certify_tumor_scalar_minimum(
             global_lower_bound=0.0,
             optimality_gap=0.0,
             globally_certified=True,
-            lower_bound_certified=True,
             method="interval_binomial_mixture_bound_v1",
             intervals_evaluated=0,
         )
@@ -309,7 +307,6 @@ def certify_tumor_scalar_minimum(
             global_lower_bound=loss,
             optimality_gap=0.0,
             globally_certified=bool(np.isfinite(loss)),
-            lower_bound_certified=bool(np.isfinite(loss)),
             method="fixed_scalar_coordinate_v1",
             intervals_evaluated=1,
         )
@@ -390,7 +387,6 @@ def certify_tumor_scalar_minimum(
         global_lower_bound=float(global_lower),
         optimality_gap=float(gap),
         globally_certified=globally_certified,
-        lower_bound_certified=bool(np.isfinite(global_lower)),
         method="interval_binomial_mixture_bound_v1",
         intervals_evaluated=int(intervals_evaluated),
     )

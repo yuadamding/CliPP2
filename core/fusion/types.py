@@ -144,7 +144,6 @@ class CompressedEdgeCertificate:
     internal_dual: torch.Tensor
     graph_hash: str
     gradient_scope: SmoothGradientScope
-    nonfused_dual_mode: Literal["analytic_streamed"] = "analytic_streamed"
     certificate_scope: CertificateScope = "full_original_graph"
 
 
@@ -164,7 +163,6 @@ class PrimalOnlyWarmState:
     phi: torch.Tensor
     structure_hint: torch.Tensor | None = None
     certificate_hint: GraphFusionCertificate | None = None
-    structure_hint_is_heuristic: bool = True
 
 
 BackendWarmState: TypeAlias = DenseWarmState | PrimalOnlyWarmState
@@ -337,7 +335,6 @@ class FusionFitArtifacts:
     certificate: GraphFusionCertificate | None = None
     exactness_provenance: ExactFusionProvenance | None = None
     path_posterior: np.ndarray | None = None
-    likelihood_model_id: str = "clipp2_legacy_major_minor_v1"
 
 
 @dataclass(frozen=True)

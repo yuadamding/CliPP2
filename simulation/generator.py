@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..io.tumor_txt import TUMOR_TXT_SCHEMA, write_tumor_txt
+from ..io.tumor_txt import write_tumor_txt
 from .config import TumorSimulationConfig, _validate_copy_number_config
 from .evolution import (
     _simulate_constrained_cn_evolution,
@@ -391,13 +391,11 @@ def _write_patient_simulation(
             _canonical_observation_table(
                 mutation_ids=mutation_ids,
                 mutation_segment=mutation_segment,
-                mutation_position=mutation_position,
                 alt_count=r_j,
                 ref_count=ref_j,
                 purity=float(purity_j),
                 sample_id=region_id,
                 local_state_table=local_state_table,
-                segments=segments,
             )
         )
 
@@ -462,17 +460,7 @@ def _write_patient_simulation(
             f"required={minimum_two_state_fraction}, "
             f"observed={canonical_two_state_fraction:.6f}."
         )
-    write_tumor_txt(
-        data_dir / f"{directory_name}.clipp2.txt",
-        canonical_observations,
-        {
-            "schema": TUMOR_TXT_SCHEMA,
-            "tumor_id": directory_name,
-            "genome_build": "synthetic",
-            "coordinate_system": "1-based-inclusive",
-            "missing_value": ".",
-        },
-    )
+    write_tumor_txt(data_dir / f"{directory_name}.clipp2.txt", canonical_observations)
     intended_factors = {
         "mean_depth": int(N_mean),
         "purity_mean": float(simu_purity),

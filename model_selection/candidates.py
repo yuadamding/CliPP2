@@ -93,9 +93,7 @@ def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None
     )
     if dirichlet_score:
         contract = get_selection_contract(score.selection_contract_id)
-        expected_weight = float(
-            contract.partition_config.classification_code_weight
-        )
+        expected_weight = float(contract.partition_config.classification_code_weight)
         expected_alpha = float(contract.partition_config.classification_alpha)
         if not np.isclose(
             float(score.assignment_code_weight), expected_weight, rtol=0.0, atol=0.0
@@ -430,9 +428,7 @@ def _score_fixed_labels(
     selection_score: str,
 ) -> SelectionScore:
     canonical_score_name = _normalize_selection_score_name(selection_score)
-    computation_profile = get_computation_profile(
-        selection_options.computation_profile
-    )
+    computation_profile = get_computation_profile(selection_options.computation_profile)
     score_function = (
         fixed_partition_dirichlet_score
         if canonical_score_name == "fixed_partition_dirichlet_score"
@@ -712,6 +708,25 @@ def _evaluate_candidate(
         "penalty": float(penalty_value),
         "profile_penalty": float(profile_penalty_value),
         "fixed_objective_kkt_residual": float(fit.fixed_objective_kkt_residual),
+        "outer_stationarity_residual": float(fit.outer_stationarity_residual),
+        "outer_projected_stationarity_norm": float(
+            fit.outer_projected_stationarity_norm
+        ),
+        "outer_stationarity_normalizer": float(fit.outer_stationarity_normalizer),
+        "outer_smooth_gradient_norm": float(fit.outer_smooth_gradient_norm),
+        "outer_fusion_adjustment_norm": float(fit.outer_fusion_adjustment_norm),
+        "outer_edge_subgradient_residual": float(fit.outer_edge_subgradient_residual),
+        "outer_dual_ball_residual": float(fit.outer_dual_ball_residual),
+        "outer_box_residual": float(fit.outer_box_residual),
+        "outer_box_primal_violation": float(fit.outer_box_primal_violation),
+        "outer_stationarity_residual_before_dual_refine": float(
+            fit.outer_stationarity_residual_before_dual_refine
+        ),
+        "outer_stationarity_residual_after_dual_refine": float(
+            fit.outer_stationarity_residual_after_dual_refine
+        ),
+        "outer_kkt_fused_edges": int(fit.outer_kkt_fused_edges),
+        "outer_kkt_nonzero_edges": int(fit.outer_kkt_nonzero_edges),
         "stationarity_certified": bool(fit.stationarity_certified),
         "global_optimality_certified": bool(fit.global_optimality_certified),
         "global_optimality_basis": str(fit.global_optimality_basis),
@@ -732,6 +747,19 @@ def _evaluate_candidate(
         "streamed_edge_passes": int(fit.streamed_edge_passes),
         "dense_iterations": int(fit.dense_iterations),
         "certificate_iterations": int(fit.certificate_iterations),
+        "accepted_outer_steps": int(fit.accepted_outer_steps),
+        "attempted_outer_steps": int(fit.attempted_outer_steps),
+        "accepted_full_steps": int(fit.accepted_full_steps),
+        "accepted_damped_steps": int(fit.accepted_damped_steps),
+        "failed_majorization_checks": int(fit.failed_majorization_checks),
+        "failed_inner_model_checks": int(fit.failed_inner_model_checks),
+        "failed_em_envelope_checks": int(fit.failed_em_envelope_checks),
+        "failed_descent_checks": int(fit.failed_descent_checks),
+        "failed_nonfinite_checks": int(fit.failed_nonfinite_checks),
+        "final_relative_objective_change": float(fit.final_relative_objective_change),
+        "final_step_residual": float(fit.final_step_residual),
+        "converged_inner": bool(fit.converged_inner),
+        "converged_outer": bool(fit.converged_outer),
         "full_certificate_audit_passes": int(fit.full_certificate_audit_passes),
         "fallback_reason": str(fit.fallback_reason),
         "exactness_provenance_version": int(fit.exactness_provenance_version),
@@ -803,9 +831,7 @@ def evaluate_direct_partition_candidate(
     n_clusters = int(np.unique(labels).size)
     requested_k_value = proposal.diagnostics.get("requested_K", proposal.K)
     requested_k = int(round(float(requested_k_value)))
-    pre_signature = str(
-        proposal.diagnostics.get("pre_refinement_signature", signature)
-    )
+    pre_signature = str(proposal.diagnostics.get("pre_refinement_signature", signature))
     partition = DirectPartition(
         labels=labels,
         signature=signature,
@@ -817,7 +843,6 @@ def evaluate_direct_partition_candidate(
         parent_raw_candidate_id=parent_raw_candidate_id,
         parent_raw_lambda=parent_raw_lambda,
         parent_raw_phi_hash=str(parent_raw_phi_hash),
-        pre_refinement_signature=pre_signature,
         cem_iterations=int(proposal.diagnostics.get("cem_iterations", 0.0)),
         component_death_count=int(
             proposal.diagnostics.get("component_death_count", 0.0)
@@ -908,9 +933,7 @@ def evaluate_direct_partition_candidate(
         "component_death_count": int(partition.component_death_count),
         "refinement_score_before": float(partition.refinement_score_before),
         "refinement_score_after": float(partition.refinement_score_after),
-        "deterministic_partition_generation": bool(
-            partition.deterministic_generation
-        ),
+        "deterministic_partition_generation": bool(partition.deterministic_generation),
         "direct_partition_identity_certified": True,
         "partition_certified": False,
         "partition_certification_applicable": False,
@@ -934,9 +957,7 @@ def evaluate_direct_partition_candidate(
         "selection_assignment_log_evidence": float(score.assignment_log_evidence),
         "selection_assignment_code_weight": float(score.assignment_code_weight),
         "selection_assignment_penalty": float(score.assignment_penalty),
-        "selection_assignment_dirichlet_alpha": float(
-            score.assignment_dirichlet_alpha
-        ),
+        "selection_assignment_dirichlet_alpha": float(score.assignment_dirichlet_alpha),
         "selection_assignment_model_id": str(score.assignment_model_id),
         "selection_assignment_symmetry_mode": str(score.assignment_symmetry_mode),
         "selection_assignment_arithmetic_uncertainty": float(
@@ -950,9 +971,7 @@ def evaluate_direct_partition_candidate(
         "refit_global_lower_bound": float(refit.global_lower_bound),
         "refit_global_optimality_gap": float(refit.global_optimality_gap),
         "refit_global_certificate_method": str(refit.global_certificate_method),
-        "refit_global_certificate_intervals": int(
-            refit.global_certificate_intervals
-        ),
+        "refit_global_certificate_intervals": int(refit.global_certificate_intervals),
         "refit_numerically_resolved": bool(refit.refit_numerically_resolved),
         "refit_loglik": float(refit.loglik),
         "refit_fit_loss": float(refit.fit_loss),
@@ -963,12 +982,8 @@ def evaluate_direct_partition_candidate(
         "refit_total_grid_points": int(refit.refit_total_grid_points),
         "refit_max_grid_spacing": float(refit.refit_max_grid_spacing),
         "refit_total_candidate_basins": int(refit.refit_total_candidate_basins),
-        "refit_total_refined_candidates": int(
-            refit.refit_total_refined_candidates
-        ),
-        "refit_min_best_second_loss_gap": float(
-            refit.refit_min_best_second_loss_gap
-        ),
+        "refit_total_refined_candidates": int(refit.refit_total_refined_candidates),
+        "refit_min_best_second_loss_gap": float(refit.refit_min_best_second_loss_gap),
         "eligible_for_selection": bool(candidate.eligible_for_selection),
         "ineligibility_reason": str(candidate.ineligibility_reason),
         "converged": bool(refit.finite_candidate_found),

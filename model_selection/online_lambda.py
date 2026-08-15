@@ -15,9 +15,12 @@ The controller is intentionally solver-agnostic. The caller owns solver warm
 starts and passes the resulting diagnostics back via
 ``OnlineLambdaObservation``. An uncertified exact-fusion result is first retried at
 the same lambda.  If any online-proposed lambda exhausts those ordinary
-retries, the controller permits one monotone full-step solver recovery at that
-same value.  This changes solver effort, not the lambda path; a recovered point
-is observed normally before the next lambda can be proposed.
+retries, the controller permits one higher-effort fixed-objective recovery at
+that same value.  If the initial lambda still cannot establish any certified
+raw reference, a bounded geometric sequence of distinct-lambda certification
+anchors is permitted.  The runner evaluates those anchors at recovery effort
+from independent cold starts; the KKT gate and fixed objective remain
+unchanged.
 """
 
 from __future__ import annotations
@@ -45,6 +48,11 @@ class OnlineLambdaConfig:
     max_unique_lambdas: int = 40
     max_refinement_lambdas: int = 40
     max_solver_retries_per_lambda: int = 2
+    # If the guide-derived first lambda remains uncertified after ordinary
+    # retry and recovery, permit a small number of independent certification
+    # anchors before failing the entire raw path.  These probes are separate
+    # from the statistical exploration budget because no path exists yet.
+    max_bootstrap_anchor_lambdas: int = 3
     partition_event_mode: bool = False
 
     def __post_init__(self) -> None:
@@ -77,6 +85,8 @@ class OnlineLambdaConfig:
             raise ValueError("max_refinement_lambdas must be nonnegative.")
         if int(self.max_solver_retries_per_lambda) < 0:
             raise ValueError("max_solver_retries_per_lambda must be nonnegative.")
+        if int(self.max_bootstrap_anchor_lambdas) < 0:
+            raise ValueError("max_bootstrap_anchor_lambdas must be nonnegative.")
 
 
 @dataclass(frozen=True)
@@ -88,19 +98,9 @@ class OnlineLambdaObservation:
     partition_signature: str
     partition_icl: float
     kkt_residual: float
-    # Deprecated dense-ADMM provenance retained for callers predating the
-    # backend-neutral certificate contract. It is consulted only when
-    # ``exact_candidate_eligible`` is None.
-    raw_kkt_eligible: bool = False
-    admm_iterations: int = 0
-    exact_candidate_eligible: bool | None = None
-    raw_objective_certified: bool | None = None
-    partition_certified: bool = True
-    selection_score_available: bool | None = None
-    certificate_status: str = "unknown"
-    backend_name: str = "unknown"
-    solver_iterations: int = 0
-    model_signature: str = ""
+    raw_objective_certified: bool
+    partition_certified: bool
+    selection_score_available: bool
     score_numerical_uncertainty: float = 0.0
     degrees_of_freedom: int = 0
 
@@ -188,6 +188,7 @@ class OnlineLambdaController:
         self._attempted_phase: dict[float, str] = {}
         self._proposal_history: list[OnlineLambdaProposal] = []
         self._solver_recovery_keys: set[float] = set()
+        self._bootstrap_anchor_keys: set[float] = set()
         self._uncertified_exhausted_keys: set[float] = set()
         self._stop_reason: str | None = None
 
@@ -204,10 +205,6 @@ class OnlineLambdaController:
         return tuple(
             sorted(self._certified.values(), key=lambda item: item.lambda_value)
         )
-
-    @property
-    def proposal_history(self) -> tuple[OnlineLambdaProposal, ...]:
-        return tuple(self._proposal_history)
 
     @property
     def best_observation(self) -> OnlineLambdaObservation | None:
@@ -237,7 +234,7 @@ class OnlineLambdaController:
                     int(item.n_clusters),
                     int(item.degrees_of_freedom),
                     float(item.lambda_value),
-                    str(item.model_signature or item.partition_signature),
+                    str(item.partition_signature),
                 ),
             )
         best_score = min(float(item.partition_icl) for item in finite)
@@ -259,18 +256,8 @@ class OnlineLambdaController:
         )
 
     def _is_exact_fusion_certified(self, observation: OnlineLambdaObservation) -> bool:
-        if observation.raw_objective_certified is not None:
-            certificate_ok = bool(observation.raw_objective_certified)
-        elif observation.exact_candidate_eligible is None:
-            # Compatibility for callers and persisted observations written
-            # before explicit exactness provenance was introduced.
-            certificate_ok = bool(
-                observation.raw_kkt_eligible and int(observation.admm_iterations) > 0
-            )
-        else:
-            certificate_ok = bool(observation.exact_candidate_eligible)
         return bool(
-            certificate_ok
+            observation.raw_objective_certified
             and isfinite(float(observation.kkt_residual))
             and float(observation.kkt_residual) <= float(self.config.kkt_tolerance)
         )
@@ -279,13 +266,10 @@ class OnlineLambdaController:
     def _selection_score_is_available(
         observation: OnlineLambdaObservation,
     ) -> bool:
-        explicit = observation.selection_score_available
-        available = (
-            bool(explicit)
-            if explicit is not None
-            else bool(observation.partition_certified)
+        return bool(
+            observation.selection_score_available
+            and isfinite(float(observation.partition_icl))
         )
-        return bool(available and isfinite(float(observation.partition_icl)))
 
     def _record_proposal(self, proposal: OnlineLambdaProposal) -> OnlineLambdaProposal:
         key = _lambda_key(proposal.lambda_value)
@@ -317,16 +301,14 @@ class OnlineLambdaController:
             incumbent = self._certified.get(key)
             observation_scored = self._selection_score_is_available(observation)
             incumbent_scored = bool(
-                incumbent is not None
-                and self._selection_score_is_available(incumbent)
+                incumbent is not None and self._selection_score_is_available(incumbent)
             )
             if (
                 incumbent is None
                 or (observation_scored and not incumbent_scored)
                 or (
                     observation_scored == incumbent_scored
-                    and float(observation.kkt_residual)
-                    < float(incumbent.kkt_residual)
+                    and float(observation.kkt_residual) < float(incumbent.kkt_residual)
                 )
             ):
                 self._certified[key] = observation
@@ -366,13 +348,17 @@ class OnlineLambdaController:
         if key in self._attempted_lambda:
             self._stop_reason = "online_lambda_no_distinct_float_available"
             return None
-        refinement_count = sum(
-            _is_refinement_phase(phase) for phase in self._attempted_phase.values()
+        statistical_phases = tuple(
+            phase
+            for phase in self._attempted_phase.values()
+            if str(phase) != "bootstrap_certification_anchor"
         )
-        exploration_count = len(self._attempted_phase) - int(refinement_count)
-        if (
-            _is_refinement_phase(proposal.phase)
-            and exploration_count < int(self.config.max_unique_lambdas)
+        refinement_count = sum(
+            _is_refinement_phase(phase) for phase in statistical_phases
+        )
+        exploration_count = len(statistical_phases) - int(refinement_count)
+        if _is_refinement_phase(proposal.phase) and exploration_count < int(
+            self.config.max_unique_lambdas
         ):
             # Establish broad path coverage before spending the independent
             # event-resolution budget.  Refining the first local transition
@@ -392,9 +378,7 @@ class OnlineLambdaController:
                     if fallback is not None:
                         proposal = fallback
                     else:
-                        self._stop_reason = (
-                            "online_lambda_refinement_budget_reached"
-                        )
+                        self._stop_reason = "online_lambda_refinement_budget_reached"
                         return None
                 else:
                     self._stop_reason = "online_lambda_refinement_budget_reached"
@@ -441,6 +425,19 @@ class OnlineLambdaController:
         if self._retry_key is None:
             return None
         attempts = int(self._attempt_count.get(self._retry_key, 0))
+        if self._retry_key in self._bootstrap_anchor_keys:
+            # Each bootstrap anchor is already evaluated at recovery effort
+            # with the runner's independent cold-start bank.  Move outward to
+            # the next geometric anchor instead of retrying its correlated
+            # terminal state.
+            bootstrap = self._bootstrap_anchor_proposal(self._last_observation)
+            if bootstrap is not None:
+                self._uncertified_exhausted_keys.add(self._retry_key)
+                self._retry_key = None
+                self._bootstrap_anchor_keys.add(_lambda_key(bootstrap.lambda_value))
+                return bootstrap
+            self._stop_reason = "online_lambda_bootstrap_anchor_uncertified"
+            return None
         if attempts > int(self.config.max_solver_retries_per_lambda):
             if self._retry_key not in self._solver_recovery_keys:
                 failed = self._last_observation
@@ -464,6 +461,12 @@ class OnlineLambdaController:
                 self._uncertified_exhausted_keys.add(self._retry_key)
                 self._retry_key = None
                 return None
+            bootstrap = self._bootstrap_anchor_proposal(self._last_observation)
+            if bootstrap is not None:
+                self._uncertified_exhausted_keys.add(self._retry_key)
+                self._retry_key = None
+                self._bootstrap_anchor_keys.add(_lambda_key(bootstrap.lambda_value))
+                return bootstrap
             self._stop_reason = "online_lambda_uncertified_exact_fusion_result"
             return None
         failed = self._last_observation
@@ -487,6 +490,51 @@ class OnlineLambdaController:
             else previous.bracket_right_lambda,
             retry_number=attempts,
         )
+
+    def _bootstrap_anchor_proposal(
+        self,
+        failed: OnlineLambdaObservation | None,
+    ) -> OnlineLambdaProposal | None:
+        """Return the next geometric lambda for raw-provenance bootstrap.
+
+        A higher lambda is preferred because its stronger fusion penalty is a
+        numerically simpler certification target.  Successive failures move to
+        ``initial_lambda * exp(1)``, ``* exp(2)``, and so on.  The corresponding
+        lower anchors are deterministic boundary fallbacks.  The runner
+        evaluates each proposal at recovery effort with independent guide,
+        zero-penalty, and pooled starts.
+        """
+
+        if failed is None or len(self._bootstrap_anchor_keys) >= int(
+            self.config.max_bootstrap_anchor_lambdas
+        ):
+            return None
+        anchor_index = int(len(self._bootstrap_anchor_keys) + 1)
+        for direction in (1.0, -1.0):
+            candidate = float(
+                min(
+                    max(
+                        float(self.initial_lambda)
+                        * exp(direction * float(anchor_index)),
+                        float(self.config.lambda_min),
+                    ),
+                    float(self.config.lambda_max),
+                )
+            )
+            key = _lambda_key(candidate)
+            if (
+                key == _lambda_key(float(failed.lambda_value))
+                or key in self._attempted_lambda
+            ):
+                continue
+            return OnlineLambdaProposal(
+                lambda_value=candidate,
+                phase="bootstrap_certification_anchor",
+                reason="initial_lambda_uncertified_probe_distinct_anchor",
+                warm_start_lambda=None,
+                retry_number=0,
+            )
+        return None
 
     def _choose_from_certified_path(self) -> OnlineLambdaProposal | None:
         points = list(self.observations)
@@ -533,7 +581,7 @@ class OnlineLambdaController:
     @staticmethod
     def _event_signature(observation: OnlineLambdaObservation) -> tuple[object, ...]:
         return (
-            str(observation.model_signature or observation.partition_signature),
+            str(observation.partition_signature),
             int(observation.n_clusters),
             bool(observation.partition_certified),
             bool(OnlineLambdaController._selection_score_is_available(observation)),
@@ -564,8 +612,7 @@ class OnlineLambdaController:
                 key=lambda pair: (
                     _log10_width(pair[0].lambda_value, pair[1].lambda_value),
                     abs(
-                        log(float(pair[1].n_clusters))
-                        - log(float(pair[0].n_clusters))
+                        log(float(pair[1].n_clusters)) - log(float(pair[0].n_clusters))
                     ),
                     -float(pair[0].lambda_value),
                 ),
@@ -588,7 +635,9 @@ class OnlineLambdaController:
         best_index = points.index(best)
         best_event = self._event_signature(best)
         run_left = best_index
-        while run_left > 0 and self._event_signature(points[run_left - 1]) == best_event:
+        while (
+            run_left > 0 and self._event_signature(points[run_left - 1]) == best_event
+        ):
             run_left -= 1
         run_right = best_index
         while (

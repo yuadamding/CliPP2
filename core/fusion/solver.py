@@ -739,7 +739,6 @@ def _invalidate_damped_trial_state(
             phi=phi,
             structure_hint=structure_hint,
             certificate_hint=certificate_hint,
-            structure_hint_is_heuristic=True,
         ),
         False,
     )
@@ -2645,11 +2644,6 @@ def _fit_from_start(
         if final_terms.path_posterior is None
         else final_terms.path_posterior.detach().cpu().numpy()
     )
-    likelihood_model_id = (
-        "clipp2_legacy_major_minor_v1"
-        if torch_data.path_likelihood is None
-        else str(torch_data.path_likelihood.model_id)
-    )
     effective_summary_tol = (
         max(10.0 * float(tol), 1e-4)
         if summary_tol is None
@@ -2706,7 +2700,6 @@ def _fit_from_start(
             phi=phi.detach(),
             structure_hint=certificate.labels.detach(),
             certificate_hint=certificate,
-            structure_hint_is_heuristic=False,
         )
     else:
         terminal_warm_state = DenseWarmState(
@@ -2879,7 +2872,6 @@ def _fit_from_start(
         certificate=certificate,
         exactness_provenance=exactness_provenance,
         path_posterior=path_posterior_np,
-        likelihood_model_id=likelihood_model_id,
     )
 
 

@@ -45,21 +45,17 @@ class PartitionCandidate:
     labels: np.ndarray
     K: int
     source: str
-    theta: np.ndarray
     phi_start: np.ndarray
     fit_loss: float
     bic: float
-    active_df: int | None = None
     finite_candidate_found: bool = True
     diagnostics: dict[str, object] = field(default_factory=dict)
-    refit: PartitionRefitResult | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
 class PartitionRefinementResult:
     labels: np.ndarray
     refit: PartitionRefitResult
-    initial_labels: np.ndarray
     iterations: int
     accepted_updates: int
     initial_k: int
@@ -67,7 +63,6 @@ class PartitionRefinementResult:
     component_death_count: int
     score_before: float
     score_after: float
-    score_path: tuple[float, ...]
 
 
 def compute_partition_bic(
@@ -910,8 +905,7 @@ def refine_partition_likelihood_with_trace(
     _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
 ) -> PartitionRefinementResult:
     labels = _validated_refinement_labels(data, labels)
-    initial_labels = labels.copy()
-    initial_k = int(np.unique(initial_labels).size)
+    initial_k = int(np.unique(labels).size)
     _validate_classification_weight_alpha(classification_weight_alpha)
     classification_code_weight = _validated_classification_code_weight(
         classification_code_weight
@@ -930,12 +924,10 @@ def refine_partition_likelihood_with_trace(
         )
 
     refit = refit_labels(labels)
-    initial_refit = refit
     refit_key = _label_key(labels)
     best_labels: np.ndarray | None = None
     best_refit: PartitionRefitResult | None = None
     best_score = float("inf")
-    score_path: list[float] = []
     if classification_weight_alpha is not None:
         best_score = _classification_refit_score(
             data,
@@ -946,9 +938,9 @@ def refine_partition_likelihood_with_trace(
         )
         best_labels = labels.copy()
         best_refit = refit
-        score_path.append(float(best_score))
+        score_before = score_after = float(best_score)
     else:
-        score_path.append(float(refit.fit_loss))
+        score_before = score_after = float(refit.fit_loss)
     iterations = 0
     accepted_updates = 0
     for iteration in range(max(int(max_iter), 0)):
@@ -998,7 +990,7 @@ def refine_partition_likelihood_with_trace(
             ):
                 break
             best_score = float(proposed_score)
-            score_path.append(float(best_score))
+            score_after = float(best_score)
             best_labels = labels_next.copy()
             best_refit = proposed_refit
             refit = proposed_refit
@@ -1018,21 +1010,18 @@ def refine_partition_likelihood_with_trace(
     else:
         final_labels = _canonical_labels(labels)
         final_refit = refit
-        if not score_path or score_path[-1] != float(final_refit.fit_loss):
-            score_path.append(float(final_refit.fit_loss))
+        score_after = float(final_refit.fit_loss)
     final_k = int(np.unique(final_labels).size)
     return PartitionRefinementResult(
         labels=final_labels,
         refit=final_refit,
-        initial_labels=initial_labels,
         iterations=int(iterations),
         accepted_updates=int(accepted_updates),
         initial_k=int(initial_k),
         final_k=int(final_k),
         component_death_count=max(int(initial_k - final_k), 0),
-        score_before=float(score_path[0] if score_path else initial_refit.fit_loss),
-        score_after=float(score_path[-1] if score_path else final_refit.fit_loss),
-        score_path=tuple(float(value) for value in score_path),
+        score_before=float(score_before),
+        score_after=float(score_after),
     )
 
 
@@ -1271,8 +1260,7 @@ def refine_partition_likelihood_torch_with_trace(
         dtype=dtype,
     )
     labels = _validated_refinement_labels(data, labels)
-    initial_labels = labels.copy()
-    initial_k = int(np.unique(initial_labels).size)
+    initial_k = int(np.unique(labels).size)
     _validate_classification_weight_alpha(classification_weight_alpha)
     classification_code_weight = _validated_classification_code_weight(
         classification_code_weight
@@ -1295,12 +1283,10 @@ def refine_partition_likelihood_torch_with_trace(
         )
 
     refit = refit_labels(labels)
-    initial_refit = refit
     refit_key = _label_key(labels)
     best_labels: np.ndarray | None = None
     best_refit: PartitionRefitResult | None = None
     best_score = float("inf")
-    score_path: list[float] = []
     if classification_weight_alpha is not None:
         best_score = _classification_refit_score(
             data,
@@ -1311,9 +1297,9 @@ def refine_partition_likelihood_torch_with_trace(
         )
         best_labels = labels.copy()
         best_refit = refit
-        score_path.append(float(best_score))
+        score_before = score_after = float(best_score)
     else:
-        score_path.append(float(refit.fit_loss))
+        score_before = score_after = float(refit.fit_loss)
     iterations = 0
     accepted_updates = 0
     for iteration in range(max(int(max_iter), 0)):
@@ -1375,7 +1361,7 @@ def refine_partition_likelihood_torch_with_trace(
             ):
                 break
             best_score = float(proposed_score)
-            score_path.append(float(best_score))
+            score_after = float(best_score)
             best_labels = labels_next.copy()
             best_refit = proposed_refit
             refit = proposed_refit
@@ -1395,21 +1381,18 @@ def refine_partition_likelihood_torch_with_trace(
     else:
         final_labels = _canonical_labels(labels)
         final_refit = refit
-        if not score_path or score_path[-1] != float(final_refit.fit_loss):
-            score_path.append(float(final_refit.fit_loss))
+        score_after = float(final_refit.fit_loss)
     final_k = int(np.unique(final_labels).size)
     return PartitionRefinementResult(
         labels=final_labels,
         refit=final_refit,
-        initial_labels=initial_labels,
         iterations=int(iterations),
         accepted_updates=int(accepted_updates),
         initial_k=int(initial_k),
         final_k=int(final_k),
         component_death_count=max(int(initial_k - final_k), 0),
-        score_before=float(score_path[0] if score_path else initial_refit.fit_loss),
-        score_after=float(score_path[-1] if score_path else final_refit.fit_loss),
-        score_path=tuple(float(value) for value in score_path),
+        score_before=float(score_before),
+        score_after=float(score_after),
     )
 
 
@@ -1604,11 +1587,9 @@ def generate_likelihood_partition_starts(
                     labels=_canonical_labels(labels_used),
                     K=candidate_k,
                     source=source,
-                    theta=refit.cluster_centers,
                     phi_start=refit.phi,
                     fit_loss=float(refit.fit_loss),
                     bic=float(bic),
-                    active_df=int(refit.active_degrees_of_freedom),
                     finite_candidate_found=bool(refit.finite_candidate_found),
                     diagnostics={
                         "requested_K": float(requested_k),
@@ -1633,30 +1614,7 @@ def generate_likelihood_partition_starts(
                             refit.fit_loss if trace is None else trace.score_after
                         ),
                         "deterministic_generation": 1.0,
-                        "partition_generation_classic_bic": float(classic_bic),
-                        "refit_boundary_count": float(refit.boundary_count),
-                        "refit_coordinate_count": float(refit.refit_coordinate_count),
-                        "refit_finite_coordinate_count": float(
-                            refit.refit_finite_coordinate_count
-                        ),
-                        "refit_total_grid_points": float(refit.refit_total_grid_points),
-                        "refit_max_grid_spacing": float(refit.refit_max_grid_spacing),
-                        "refit_total_candidate_basins": float(
-                            refit.refit_total_candidate_basins
-                        ),
-                        "refit_total_refined_candidates": float(
-                            refit.refit_total_refined_candidates
-                        ),
-                        "refit_min_best_second_loss_gap": float(
-                            refit.refit_min_best_second_loss_gap
-                        ),
-                        "partition_generation_cuda": float(
-                            use_torch_runtime
-                            and runtime is not None
-                            and runtime.device.type == "cuda"
-                        ),
                     },
-                    refit=refit,
                 )
             )
 

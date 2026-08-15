@@ -168,7 +168,6 @@ class DirectPartition:
     parent_raw_candidate_id: int | None = None
     parent_raw_lambda: float | None = None
     parent_raw_phi_hash: str = ""
-    pre_refinement_signature: str = ""
     cem_iterations: int = 0
     component_death_count: int = 0
     refinement_score_before: float = float("nan")

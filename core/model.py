@@ -136,7 +136,6 @@ class FitResult:
     dtype: str
     graph_name: str
     summary_tol: float
-    summary_available: bool
     inner_kkt_residual: float
     accepted_inner_kkt_residual: float
     last_attempted_inner_kkt_residual: float
@@ -231,7 +230,6 @@ class FitResult:
     full_kkt_tolerance: float = 0.0
     exactness_provenance: ExactFusionProvenance | None = None
     path_posterior: np.ndarray | None = None
-    likelihood_model_id: str = "clipp2_legacy_major_minor_v1"
     likelihood_eps: float = 1e-6
 
 
@@ -312,7 +310,6 @@ def fit_fixed_objective(
         dtype=str(artifacts.dtype),
         graph_name=str(artifacts.graph_name),
         summary_tol=float(artifacts.summary_tol),
-        summary_available=bool(compute_summary),
         inner_kkt_residual=float(artifacts.inner_kkt_residual),
         accepted_inner_kkt_residual=float(artifacts.accepted_inner_kkt_residual),
         last_attempted_inner_kkt_residual=float(
@@ -494,13 +491,6 @@ def fit_fixed_objective(
         ),
         exactness_provenance=provenance,
         path_posterior=getattr(artifacts, "path_posterior", None),
-        likelihood_model_id=str(
-            getattr(
-                artifacts,
-                "likelihood_model_id",
-                "clipp2_legacy_major_minor_v1",
-            )
-        ),
         likelihood_eps=float(options.eps),
     )
 

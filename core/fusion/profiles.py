@@ -41,11 +41,6 @@ class ComputationProfile:
         # pilot for weights, so they are not the identical fixed objective.
         return self.is_strict
 
-    @property
-    def refit_globally_certified(self) -> bool:
-        return self.scalar_mode == "interval_certified"
-
-
 STRICT_PROFILE: Final = ComputationProfile(
     name="strict",
     raw_dtype="float64",
