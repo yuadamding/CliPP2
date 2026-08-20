@@ -3,12 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from time import perf_counter
 
-import pandas as pd
-
 from ..config import FitConfig, resolve_fit_config
 from ..io.tumor_txt import DEFAULT_DOSAGE_PRIOR_PENALTY, load_tumor_txt
 from .model_selection import select_model
 from ..model_selection.candidates import validate_candidate_identity
+from ..model_selection.types import SearchCandidate
 from .serialization import (
     AnalysisSerialization,
     analysis_summary,
@@ -24,7 +23,7 @@ def process_tumor_bundle(
     write_outputs: bool = True,
     unsupported_policy: str = "error",
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
-) -> tuple[dict[str, object], pd.DataFrame]:
+) -> tuple[dict[str, object], tuple[SearchCandidate, ...]]:
     """Fit one canonical tumor TSV file with the default workflow."""
 
     start_time = perf_counter()
@@ -63,7 +62,7 @@ def process_tumor_bundle(
             analysis,
             outdir=outdir,
         )
-    return summary, selection_result.search_df
+    return summary, selection_result.search
 
 
 def process_tumor(

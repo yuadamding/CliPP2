@@ -119,102 +119,6 @@ def select_raw_start_attempt(
     return incumbent
 
 
-def raw_fit_diagnostic(
-    fit: RawFit,
-    *,
-    fit_options: FitConfig | None = None,
-) -> dict[str, object]:
-    """Flatten one nested raw result at the reporting boundary."""
-    certificate = fit.certificate
-    progress = certificate.progress
-    convergence = fit.convergence
-    work = fit.work
-    provenance = fit.provenance
-    solver = None if fit_options is None else fit_options.solver
-    return {
-        "lambda": float(provenance.lambda_value),
-        "n_clusters": int(fit.multistart.threshold_component_count),
-        "penalized_objective": float(fit.objective.total),
-        "loglik": float(fit.objective.loglik),
-        "kkt_residual": float(certificate.components.residual),
-        "working_precision_kkt_residual": float(certificate.working_residual),
-        "backward_error_stationarity_residual": float(
-            certificate.components.stationarity
-        ),
-        "backward_error_edge_subgradient_residual": float(
-            certificate.components.edge_subgradient
-        ),
-        "backward_error_dual_ball_residual": float(
-            certificate.components.dual_ball
-        ),
-        "certificate_residual_method": str(
-            certificate.residual_method
-        ),
-        "working_dtype": str(certificate.working_dtype),
-        "certificate_audit_dtype": str(certificate.audit_dtype),
-        "precision_polish_applied": bool(certificate.precision_polished),
-        "precision_polish_max_abs_phi_delta": float(
-            certificate.precision_polish_delta
-        ),
-        "kkt_tolerance": float(certificate.tolerance),
-        "stationarity_residual": float(progress.stationarity_residual),
-        "edge_subgradient_residual": float(progress.edge_subgradient_residual),
-        "dual_ball_residual": float(progress.dual_ball_residual),
-        "box_residual": float(progress.box_residual),
-        "projected_stationarity_norm": float(progress.projected_stationarity_norm),
-        "stationarity_normalizer": float(progress.stationarity_normalizer),
-        "smooth_gradient_norm": float(progress.smooth_gradient_norm),
-        "fusion_adjustment_norm": float(progress.fusion_adjustment_norm),
-        "stationarity_before_dual_refine": float(
-            certificate.stationarity_before
-        ),
-        "stationarity_after_dual_refine": float(
-            certificate.stationarity_after
-        ),
-        "fused_edges": int(certificate.fused_edges),
-        "nonzero_edges": int(certificate.nonzero_edges),
-        "outer_iterations": int(convergence.iterations),
-        "inner_iterations": int(work.inner_iterations),
-        "admm_iterations": int(work.dense_iterations if provenance.inner_solver == "admm_complete_graph" else 0),
-        "certificate_iterations": int(work.certificate_iterations),
-        "accepted_outer_steps": int(convergence.accepted_outer_steps),
-        "attempted_outer_steps": int(convergence.attempted_outer_steps),
-        "outer_max_iter": np.nan if solver is None else int(solver.outer_max_iter),
-        "inner_max_iter": np.nan if solver is None else int(solver.inner_max_iter),
-        "certificate_max_iter": (
-            np.nan if solver is None else int(solver.certificate.max_iter)
-        ),
-        "certificate_refinement_rounds": (
-            np.nan
-            if solver is None
-            else int(solver.certificate.refinement_rounds)
-        ),
-        "full_kkt_certified": bool(certificate.certified),
-        "selection_eligible": bool(certificate.admissible),
-        "converged_inner": bool(convergence.inner_converged),
-        "converged_outer": bool(convergence.outer_converged),
-        "certificate_status": str(certificate.status),
-        "outer_certificate_status": str(certificate.status),
-        "failure_reason": str(convergence.failure_reason),
-        "mm_consistency_violations": int(convergence.mm_consistency_violations),
-    }
-
-
-def raw_start_attempt_diagnostic(
-    attempt: RawStartAttempt,
-    *,
-    fit_options: FitConfig,
-) -> dict[str, object]:
-    return {
-        "source": str(attempt.source),
-        "start_value": float(attempt.start_value),
-        **raw_fit_diagnostic(attempt.fit, fit_options=fit_options),
-        "breakpoint_escape_changed_count": int(
-            attempt.breakpoint_escape_changed_count
-        ),
-    }
-
-
 def _hash_array(hasher: "hashlib._Hash", array: np.ndarray) -> None:
     contiguous = np.ascontiguousarray(array)
     hasher.update(str(contiguous.dtype).encode("utf-8"))
@@ -720,7 +624,6 @@ __all__ = [
     "offload_solver_state_to_cpu",
     "partition_pool_row_metadata",
     "pilot_matrix_hash",
-    "raw_start_attempt_diagnostic",
     "rescore_partition_candidates",
     "select_raw_start_attempt",
     "solver_recovery_fit_options",

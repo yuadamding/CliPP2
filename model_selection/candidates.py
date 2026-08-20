@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from time import perf_counter
-
 import numpy as np
 
 from ..core.bic import (
     DIRICHLET_EXACT_PARTITION_MODEL_ID,
     cluster_sizes_from_labels,
-    compute_bic_with_df,
     compute_dirichlet_exact_partition_log_mass,
-    effective_bic_depth_count,
     fixed_partition_bic,
     fixed_partition_dirichlet_score,
 )
@@ -36,7 +32,6 @@ from .scoring import (
     _normalize_selection_score_name,
 )
 from .types import (
-    CandidateStaticMetadata,
     DirectPartition,
     DirectPartitionCandidate,
     FusionPartition,
@@ -379,32 +374,6 @@ def _build_refit_summary(
     )
 
 
-def _selection_score_diagnostics(
-    *,
-    data: TumorData,
-    refit: PartitionRefitSummary,
-    score: SelectionScore,
-) -> dict[str, float]:
-    diagnostic_df = int(score.degrees_of_freedom)
-    return {
-        "classic_bic": compute_bic_with_df(
-            refit.loglik,
-            diagnostic_df,
-            score.n_eff,
-        ),
-        "classic_bic_active_df": compute_bic_with_df(
-            refit.loglik,
-            refit.active_df,
-            score.n_eff,
-        ),
-        "classic_bic_depth_n": compute_bic_with_df(
-            refit.loglik,
-            diagnostic_df,
-            effective_bic_depth_count(data),
-        ),
-    }
-
-
 def _score_fixed_labels(
     *,
     data: TumorData,
@@ -503,20 +472,11 @@ def evaluate_raw_fusion_candidate(
     torch_data,
     solver_context,
     solver_state: SolverState | None,
-    selection_method: str,
-    profile_name: str,
-    selection_step: int,
     lambda_value: float,
     selection_score: str,
-    static_metadata: CandidateStaticMetadata,
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] | None = None,
     precomputed_fit: RawFit | None = None,
-) -> tuple[
-    RawFit,
-    dict[str, object],
-    RawFusionCandidate,
-]:
-    candidate_start_time = perf_counter()
+) -> tuple[RawFit, RawFusionCandidate]:
     canonical_score_name = _normalize_selection_score_name(selection_score)
     raw_fit_options = (
         fit_options if candidate_fit_options is None else candidate_fit_options
@@ -524,7 +484,6 @@ def evaluate_raw_fusion_candidate(
     selection_options = fit_options
     computation_profile = selection_options.computation_profile
 
-    raw_fit_start_time = perf_counter()
     fit = precomputed_fit
     if fit is None:
         fit = fit_fixed_objective(
@@ -544,7 +503,6 @@ def evaluate_raw_fusion_candidate(
         float(fit.provenance.lambda_value), float(lambda_value), rtol=0.0, atol=1e-12
     ):
         raise ValueError("Precomputed raw fit has the wrong lambda value.")
-    raw_fit_elapsed_seconds = float(perf_counter() - raw_fit_start_time)
     graph = selection_options.graph.graph
     if graph is None:
         raise RuntimeError(
@@ -564,16 +522,12 @@ def evaluate_raw_fusion_candidate(
         mutation_ids=tuple(str(value) for value in data.mutation_ids),
     )
 
-    refit_start_time = perf_counter()
     evaluation = evaluate_partition(
         data=data,
         partition=partition,
         selection_options=selection_options,
         refit_cache=bic_refit_cache,
         selection_score=canonical_score_name,
-    )
-    refit_elapsed_seconds = (
-        0.0 if evaluation.cache_hit else float(perf_counter() - refit_start_time)
     )
     refit = evaluation.refit
     score = evaluation.score
@@ -603,49 +557,7 @@ def evaluate_raw_fusion_candidate(
     )
     validate_candidate_identity(candidate)
 
-    score_diagnostics = _selection_score_diagnostics(
-        data=data,
-        refit=refit,
-        score=score,
-    )
-    diagnostics: dict[str, object] = {
-        "tumor_id": data.tumor_id,
-        "selection_method": selection_method,
-        "selection_contract_json": str(contract.to_json()),
-        "selection_profile": profile_name,
-        "objective_equivalent_to_strict_graph": bool(
-            computation_profile.objective_equivalent_to_strict
-        ),
-        "refit_global_certificate_required": bool(computation_profile.is_strict),
-        "selection_step": int(selection_step),
-        "classic_bic": float(score_diagnostics["classic_bic"]),
-        "bic_refit_cache_hit": bool(evaluation.cache_hit),
-        "classic_bic_depth_n": float(score_diagnostics["classic_bic_depth_n"]),
-        "classic_bic_active_df": float(score_diagnostics["classic_bic_active_df"]),
-        "candidate_elapsed_seconds": float(perf_counter() - candidate_start_time),
-        "raw_fit_elapsed_seconds": float(raw_fit_elapsed_seconds),
-        "bic_refit_elapsed_seconds": float(refit_elapsed_seconds),
-        "raw_solver_primal_tol": float(raw_fit_options.solver.tolerance),
-        "tol": float(raw_fit_options.solver.tolerance),
-        "outer_max_iter": int(raw_fit_options.solver.outer_max_iter),
-        "inner_max_iter": int(raw_fit_options.solver.inner_max_iter),
-        "eps": float(raw_fit_options.eps),
-        "major_prior": float(raw_fit_options.major_prior),
-        "selection_refit_tol": float(selection_options.selection.refit.tolerance),
-        "selection_refit_max_iter": int(selection_options.selection.refit.max_iter),
-        "graph_name": str(fit.provenance.graph_name),
-        "num_edges": int(static_metadata.edge_count),
-        "edge_weight_min": float(static_metadata.edge_weight_min),
-        "edge_weight_max": float(static_metadata.edge_weight_max),
-        "edge_weight_mean": float(static_metadata.edge_weight_mean),
-        "edge_list_hash": str(static_metadata.edge_list_hash),
-        "pilot_matrix_hash": str(static_metadata.pilot_matrix_hash),
-        "input_data_hash": str(static_metadata.input_data_hash),
-        "fit_compute_summary": False,
-        "fit_start_mode": str(start_mode),
-        "solver_state_warm_start": bool(solver_state is not None),
-    }
-    return fit, diagnostics, candidate
+    return fit, candidate
 
 
 def evaluate_direct_partition_candidate(
@@ -653,17 +565,15 @@ def evaluate_direct_partition_candidate(
     data: TumorData,
     proposal: PartitionCandidate,
     selection_options: FitConfig,
-    candidate_id: int,
     source: str,
     parent_raw_candidate_id: int | None,
     parent_raw_lambda: float | None,
     generation_contract_id: str,
     refit_cache: dict[object, PartitionRefitCacheEntry] | None,
     parent_raw_phi_hash: str = "",
-) -> tuple[dict[str, object], DirectPartitionCandidate]:
+) -> DirectPartitionCandidate:
     """Evaluate one deterministic non-fusion partition under the common score."""
 
-    started = perf_counter()
     labels = _canonical_partition_labels(
         np.asarray(proposal.labels, dtype=np.int64).reshape(-1)
     )
@@ -672,7 +582,6 @@ def evaluate_direct_partition_candidate(
     n_clusters = int(np.unique(labels).size)
     requested_k_value = proposal.diagnostics.get("requested_K", proposal.K)
     requested_k = int(round(float(requested_k_value)))
-    pre_signature = str(proposal.diagnostics.get("pre_refinement_signature", signature))
     partition = DirectPartition(
         labels=labels,
         signature=signature,
@@ -723,26 +632,12 @@ def evaluate_direct_partition_candidate(
         computation_profile=str(profile.name),
     )
     validate_candidate_identity(candidate)
-    score_diagnostics = _selection_score_diagnostics(
-        data=data,
-        refit=refit,
-        score=score,
-    )
-    diagnostics: dict[str, object] = {
-        "tumor_id": str(data.tumor_id),
-        "selection_contract_json": selection_options.selection.contract.to_json(),
-        "pre_refinement_signature": str(pre_signature),
-        "classic_bic": float(score_diagnostics["classic_bic"]),
-        "bic_refit_cache_hit": bool(evaluation.cache_hit),
-        "candidate_elapsed_seconds": float(perf_counter() - started),
-    }
-    return diagnostics, candidate
+    return candidate
 
 
 __all__ = [
     "_fixed_labels_refit",
     "_selection_refit_cache_key",
-    "_selection_score_diagnostics",
     "PartitionEvaluation",
     "PartitionRefitCacheEntry",
     "evaluate_direct_partition_candidate",

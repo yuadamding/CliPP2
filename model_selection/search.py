@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from time import perf_counter
 
 import numpy as np
-import pandas as pd
 
 from ..config import FitConfig
 from ..core.model import fit_fixed_objective
@@ -43,9 +42,6 @@ from ..model_selection.partition_initializer import (
 )
 from ..model_selection.partitions import (
     _best_partition_candidate,
-    _cluster_sizes_text,
-    _partition_candidate_requested_k,
-    _partition_signature,
 )
 from ..model_selection.proposals import (
     RawStartAttempt as _RawStartAttempt,
@@ -54,15 +50,11 @@ from ..model_selection.proposals import (
     bootstrap_independent_start_specs as _bootstrap_independent_start_specs,
     build_guided_initialization_with_resource_policy as _build_guided_initialization_with_resource_policy,
     build_partition_guided_graph_with_resource_policy as _build_partition_guided_graph_with_resource_policy,
-    candidate_static_metadata as _candidate_static_metadata,
     clone_start as _clone_start,
     direct_partition_source as _direct_partition_source,
     escape_path_breakpoint_retry_state as _escape_path_breakpoint_retry_state,
     offload_solver_state_to_cpu as _offload_solver_state_to_cpu,
-    partition_pool_row_metadata as _partition_pool_row_metadata,
     pilot_matrix_hash as _pilot_matrix_hash,
-    raw_fit_diagnostic as _raw_fit_diagnostic,
-    raw_start_attempt_diagnostic as _raw_start_attempt_diagnostic,
     rescore_partition_candidates as _rescore_partition_candidates,
     select_raw_start_attempt as _select_raw_start_attempt,
     solver_recovery_fit_options as _solver_recovery_fit_options,
@@ -70,47 +62,70 @@ from ..model_selection.proposals import (
 from ..model_selection.scoring import (
     _canonical_lambda,
     _prefer_fit_candidate,
-    _sorted_unique_lambdas,
     candidate_representative_ids,
     raw_candidate_has_exact_fusion_certificate,
     select_candidate_records,
 )
 from ..model_selection.types import (
     BICSelectionResult,
+    CandidateTrace,
     CandidateRecord,
+    RawAttemptTrace,
     RawFusionCandidate,
+    SearchCandidate,
     SelectedModel,
     StartArray,
 )
 
 
 class NoEligibleModelSelectionCandidatesError(RuntimeError):
-    """Model selection failed after every annotated candidate was rejected."""
+    """Model selection failed after every typed candidate was rejected."""
 
-    tumor_id: str
-    search_df: pd.DataFrame
-
-    def __init__(self, tumor_id: str, search_df: pd.DataFrame) -> None:
+    def __init__(self, tumor_id: str, candidates: tuple[CandidateRecord, ...]) -> None:
         self.tumor_id = str(tumor_id)
-        self.search_df = search_df.copy()
+        self.candidates = tuple(candidates)
         super().__init__(
             f"No candidates were eligible for model selection for tumor "
             f"{self.tumor_id}."
         )
 
 
+@dataclass(frozen=True, slots=True)
+class BestRawAttemptDiagnostics:
+    search_round: int
+    search_phase: str
+    lambda_value: float
+    source: str
+    kkt_residual: float
+    kkt_tolerance: float
+    dominant_kkt_component: str
+    outer_max_iter: int
+    inner_max_iter: int
+    certificate_max_iter: int
+
+
+@dataclass(frozen=True, slots=True)
+class RawReferenceFailureDiagnostics:
+    raw_candidate_count: int
+    raw_solver_attempt_count: int
+    raw_certified_count: int
+    partition_certified_count: int
+    direct_candidate_count: int
+    direct_eligible_count: int
+    min_kkt_residual: float
+    min_kkt_tolerance: float
+    best_raw_attempt: BestRawAttemptDiagnostics | None
+    dominant_kkt_component: str
+    mm_violation_min: int
+    mm_violating_count: int
+    ineligibility_reason_counts: tuple[tuple[str, int], ...]
+    certificate_status_counts: tuple[tuple[str, int], ...]
+    search_phase_counts: tuple[tuple[str, int], ...]
+    start_source_counts: tuple[tuple[str, int], ...]
+
+
 class NoCertifiedRawReferenceError(RuntimeError):
-    """Hybrid selection found direct candidates but no certified raw reference.
-
-    The full in-memory search table is retained on the exception so a failed
-    batch case remains diagnosable without widening the three public output
-    tables or weakening the raw-fusion KKT contract.
-    """
-
-    tumor_id: str
-    search_df: pd.DataFrame
-    adaptive_search_stop_reason: str
-    diagnostics: dict[str, object]
+    """Hybrid selection found direct candidates but no certified raw reference."""
 
     def __init__(
         self,
@@ -120,59 +135,65 @@ class NoCertifiedRawReferenceError(RuntimeError):
         adaptive_search_stop_reason: str,
     ) -> None:
         self.tumor_id = str(tumor_id)
-        self.search_df = candidates_to_dataframe(records)
+        self.candidates = tuple(records)
         self.adaptive_search_stop_reason = str(adaptive_search_stop_reason)
         self.diagnostics = _raw_reference_failure_diagnostics(records)
-        reason_counts = self.diagnostics["ineligibility_reason_counts"]
-        certificate_counts = self.diagnostics["certificate_status_counts"]
+        reason_counts = dict(self.diagnostics.ineligibility_reason_counts)
+        certificate_counts = dict(self.diagnostics.certificate_status_counts)
         super().__init__(
             "Hybrid selection requires a certified raw-fusion reference for "
             f"tumor {self.tumor_id}; "
             f"stop={self.adaptive_search_stop_reason}; "
-            f"raw_candidates={self.diagnostics['raw_candidate_count']}; "
-            f"raw_solver_attempts={self.diagnostics['raw_solver_attempt_count']}; "
-            f"raw_certified={self.diagnostics['raw_certified_count']}; "
-            f"partition_certified={self.diagnostics['partition_certified_count']}; "
-            f"min_kkt_residual={self.diagnostics['min_kkt_residual']}; "
-            f"min_kkt_tolerance={self.diagnostics['min_kkt_tolerance']}; "
-            "dominant_kkt_component="
-            f"{self.diagnostics['best_raw_attempt_dominant_kkt_component']}; "
-            f"mm_violating={self.diagnostics['mm_violating_count']}; "
+            f"raw_candidates={self.diagnostics.raw_candidate_count}; "
+            f"raw_solver_attempts={self.diagnostics.raw_solver_attempt_count}; "
+            f"raw_certified={self.diagnostics.raw_certified_count}; "
+            f"partition_certified={self.diagnostics.partition_certified_count}; "
+            f"min_kkt_residual={self.diagnostics.min_kkt_residual}; "
+            f"min_kkt_tolerance={self.diagnostics.min_kkt_tolerance}; "
+            f"dominant_kkt_component={self.diagnostics.dominant_kkt_component}; "
+            f"mm_violating={self.diagnostics.mm_violating_count}; "
             f"ineligibility_reasons={reason_counts}; "
             f"certificate_statuses={certificate_counts}."
         )
 
 
-def _stable_counts(values) -> dict[str, int]:
-    normalized = ["<missing>" if pd.isna(value) else str(value) for value in values]
-    return {value: normalized.count(value) for value in sorted(set(normalized))}
+def _stable_counts(values) -> tuple[tuple[str, int], ...]:
+    normalized = ["<missing>" if value is None else str(value) for value in values]
+    return tuple(
+        (value, normalized.count(value)) for value in sorted(set(normalized))
+    )
 
 
-def _raw_attempts(record: CandidateRecord) -> tuple[_RawStartAttempt, ...]:
-    attempts = record.diagnostics.get("_raw_start_attempts", ())
-    if attempts:
-        return tuple(attempts)
+def _raw_attempts(record: CandidateRecord) -> tuple[RawAttemptTrace, ...]:
+    if record.trace.raw_attempts:
+        return record.trace.raw_attempts
     candidate = record.candidate
     if not isinstance(candidate, RawFusionCandidate):
         return ()
-    fit = candidate.raw_fit
     return (
-        _RawStartAttempt(
-            fit=fit,
-            source=str(record.diagnostics.get("lambda_start_source", "unknown")),
-            start_value=float(record.diagnostics.get("lambda_start_value", np.nan)),
+        RawAttemptTrace(
+            fit=candidate.raw_fit,
+            source=str(record.trace.start_source),
+            start_value=(
+                float("nan")
+                if record.trace.start_value is None
+                else float(record.trace.start_value)
+            ),
             breakpoint_escape_changed_count=int(
-                record.diagnostics.get("path_breakpoint_escape_changed_count", 0)
+                record.trace.breakpoint_escape_changed_count
             ),
             mathematically_certified=bool(candidate.raw_objective_certified),
+            outer_max_iter=0,
+            inner_max_iter=0,
+            certificate_max_iter=0,
         ),
     )
 
 
 def _raw_reference_failure_diagnostics(
     records: list[CandidateRecord],
-) -> dict[str, object]:
-    """Summarize typed raw candidates and their typed solver attempts."""
+) -> RawReferenceFailureDiagnostics:
+    """Summarize raw candidates without flattening solver state."""
 
     raw = [
         record for record in records if isinstance(record.candidate, RawFusionCandidate)
@@ -187,75 +208,39 @@ def _raw_reference_failure_diagnostics(
     ]
     min_residual = float("nan")
     min_tolerance = float("nan")
-    best_attempt: dict[str, object] = {}
+    best_attempt: BestRawAttemptDiagnostics | None = None
     dominant_component = "unknown"
     if finite_attempts:
         attempt, record = min(
             finite_attempts,
             key=lambda pair: float(pair[0].fit.certificate.components.residual),
         )
-        fit = attempt.fit
-        certificate = fit.certificate
+        certificate = attempt.fit.certificate
         min_residual = float(certificate.components.residual)
-        tolerance = float(certificate.tolerance)
-        if np.isfinite(tolerance):
-            min_tolerance = tolerance
-        backward_error_available = bool(
-            str(certificate.residual_method)
-            == "componentwise_box_cone_backward_error_v1"
-        )
-        source = certificate.components if backward_error_available else certificate.progress
+        if np.isfinite(float(certificate.tolerance)):
+            min_tolerance = float(certificate.tolerance)
         components = {
-            "stationarity": float(
-                source.stationarity
-                if backward_error_available
-                else source.stationarity_residual
-            ),
-            "edge_subgradient": float(
-                source.edge_subgradient
-                if backward_error_available
-                else source.edge_subgradient_residual
-            ),
-            "dual_ball": float(
-                source.dual_ball
-                if backward_error_available
-                else source.dual_ball_residual
-            ),
-            "box": float(
-                source.box if backward_error_available else source.box_residual
-            ),
+            "stationarity": float(certificate.components.stationarity),
+            "edge_subgradient": float(certificate.components.edge_subgradient),
+            "dual_ball": float(certificate.components.dual_ball),
+            "box": float(certificate.components.box),
         }
-        components = {key: value for key, value in components.items() if np.isfinite(value)}
-        if components:
-            dominant_component = max(components, key=components.get)
-        options = record.diagnostics.get("_raw_start_fit_options")
-        best_attempt = {
-            "search_round": record.diagnostics.get("search_round"),
-            "search_phase": record.diagnostics.get("search_phase"),
-            "lambda": float(fit.provenance.lambda_value),
-            "source": str(attempt.source),
-            "n_clusters": int(fit.multistart.threshold_component_count),
-            "outer_iterations": int(fit.convergence.iterations),
-            "inner_iterations": int(fit.work.inner_iterations),
-            "admm_iterations": int(
-                fit.work.dense_iterations
-                if fit.provenance.inner_solver == "admm_complete_graph"
-                else 0
-            ),
-            "certificate_iterations": int(fit.work.certificate_iterations),
-            "stationarity_before_dual_refine": float(certificate.stationarity_before),
-            "stationarity_after_dual_refine": float(certificate.stationarity_after),
+        finite_components = {
+            name: value for name, value in components.items() if np.isfinite(value)
         }
-        if options is not None:
-            best_attempt.update(
-                outer_max_iter=int(options.solver.outer_max_iter),
-                inner_max_iter=int(options.solver.inner_max_iter),
-                certificate_max_iter=int(options.solver.certificate.max_iter),
-            )
-        best_attempt.update(
+        if finite_components:
+            dominant_component = max(finite_components, key=finite_components.get)
+        best_attempt = BestRawAttemptDiagnostics(
+            search_round=int(record.trace.search_round),
+            search_phase=str(record.trace.search_phase),
+            lambda_value=float(attempt.fit.provenance.lambda_value),
+            source=str(attempt.source),
             kkt_residual=min_residual,
             kkt_tolerance=min_tolerance,
             dominant_kkt_component=dominant_component,
+            outer_max_iter=int(attempt.outer_max_iter),
+            inner_max_iter=int(attempt.inner_max_iter),
+            certificate_max_iter=int(attempt.certificate_max_iter),
         )
 
     mm_values = [
@@ -263,483 +248,38 @@ def _raw_reference_failure_diagnostics(
         for attempt, _ in attempts
     ]
     direct = [record for record in records if record.family == "direct_partition"]
-    return {
-        "raw_candidate_count": len(raw),
-        "raw_solver_attempt_count": len(attempts),
-        "raw_certified_count": sum(
+    return RawReferenceFailureDiagnostics(
+        raw_candidate_count=len(raw),
+        raw_solver_attempt_count=len(attempts),
+        raw_certified_count=sum(
             bool(record.candidate.raw_objective_certified) for record in raw
         ),
-        "partition_certified_count": sum(
+        partition_certified_count=sum(
             bool(record.candidate.partition.certified) for record in raw
         ),
-        "direct_candidate_count": len(direct),
-        "direct_eligible_count": sum(
-            record.eligible_for_selection for record in direct
-        ),
-        "min_kkt_residual": min_residual,
-        "min_kkt_tolerance": min_tolerance,
-        "best_raw_attempt": best_attempt,
-        "best_raw_attempt_dominant_kkt_component": dominant_component,
-        "mm_violation_min": min(mm_values, default=0),
-        "mm_violating_count": sum(value > 0 for value in mm_values),
-        "ineligibility_reason_counts": _stable_counts(
+        direct_candidate_count=len(direct),
+        direct_eligible_count=sum(record.eligible_for_selection for record in direct),
+        min_kkt_residual=min_residual,
+        min_kkt_tolerance=min_tolerance,
+        best_raw_attempt=best_attempt,
+        dominant_kkt_component=dominant_component,
+        mm_violation_min=min(mm_values, default=0),
+        mm_violating_count=sum(value > 0 for value in mm_values),
+        ineligibility_reason_counts=_stable_counts(
             record.candidate.ineligibility_reason for record in raw
         ),
-        "certificate_status_counts": _stable_counts(
-            getattr(attempt.fit, "full_kkt_certificate_status", "unknown")
-            for attempt, _ in attempts
+        certificate_status_counts=_stable_counts(
+            attempt.fit.certificate.status for attempt, _ in attempts
         ),
-        "search_phase_counts": _stable_counts(
-            record.diagnostics.get("search_phase") for record in raw
-        ),
-        "start_source_counts": _stable_counts(
-            record.diagnostics.get("lambda_start_source") for record in raw
-        ),
-    }
+        search_phase_counts=_stable_counts(record.trace.search_phase for record in raw),
+        start_source_counts=_stable_counts(record.trace.start_source for record in raw),
+    )
 
 
 def _candidate_record_representatives(records: list[CandidateRecord]) -> set[int]:
     """Runner-facade compatibility for the typed representative selector."""
 
     return set(candidate_representative_ids(records))
-
-
-_INTERNAL_DIAGNOSTIC_KEYS = frozenset({"_raw_start_attempts", "_raw_start_fit_options"})
-
-
-def _copy_diagnostics(
-    row: dict[str, object], diagnostics: dict[str, object], names: str
-) -> None:
-    for name in names.split():
-        row[name] = diagnostics.get(name, np.nan)
-
-
-def _score_refit_row(
-    record: CandidateRecord, *, raw_details: bool
-) -> dict[str, object]:
-    score = record.score
-    refit = record.candidate.refit
-    diagnostics = record.diagnostics
-    row: dict[str, object] = {
-        "selection_score_name": str(score.name),
-        "selection_score": float(score.value),
-        "selection_score_numerical_uncertainty": float(score.numerical_uncertainty),
-        "selection_score_lower_bound": float(score.lower_bound),
-        "selection_score_upper_bound": float(score.upper_bound),
-        "selection_loglik": float(score.loglik),
-        "selection_df": int(score.degrees_of_freedom),
-        "selection_penalty": float(score.penalty),
-        "selection_n_eff": int(score.n_eff),
-    }
-    row.update(
-        {
-            f"selection_assignment_{name}": getattr(score, f"assignment_{name}")
-            for name in "log_evidence code_weight penalty dirichlet_alpha model_id symmetry_mode arithmetic_uncertainty".split()
-        }
-    )
-    row.update(
-        classic_bic=float(diagnostics.get("classic_bic", np.nan)),
-        bic_loglik_source=str(refit.loglik_source),
-        bic_refit_finite_candidate_found=bool(refit.finite_candidate_found),
-        bic_refit_cache_hit=bool(diagnostics.get("bic_refit_cache_hit", False)),
-    )
-    row.update(
-        {
-            f"refit_{name}": getattr(
-                refit,
-                f"refit_{name}" if name in ("numerically_resolved", "mode") else name,
-            )
-            for name in "global_optimum_certified global_lower_bound global_optimality_gap global_certificate_method global_certificate_intervals numerically_resolved loglik fit_loss active_df mode".split()
-        }
-    )
-    row.update(
-        {
-            name: getattr(refit, name)
-            for name in "refit_coordinate_count refit_finite_coordinate_count refit_total_grid_points refit_max_grid_spacing refit_total_candidate_basins refit_total_refined_candidates refit_min_best_second_loss_gap".split()
-        }
-    )
-    if raw_details:
-        row.update(
-            classic_bic_depth_n=float(diagnostics.get("classic_bic_depth_n", np.nan)),
-            classic_bic_active_df=float(
-                diagnostics.get("classic_bic_active_df", np.nan)
-            ),
-            refit_loglik_refinement_delta=float(refit.refit_loglik_refinement_delta),
-            refit_max_center_refinement_delta=float(
-                refit.refit_max_center_refinement_delta
-            ),
-        )
-    return row
-
-
-def _remaining_diagnostics(
-    diagnostics: dict[str, object], consumed: set[str]
-) -> dict[str, object]:
-    remaining: dict[str, object] = {}
-    fit_options = diagnostics.get("_raw_start_fit_options")
-    for key, value in diagnostics.items():
-        if key == "_raw_start_attempts":
-            remaining["raw_start_attempt_diagnostics"] = tuple(
-                _raw_start_attempt_diagnostic(attempt, fit_options=fit_options)
-                for attempt in value
-            )
-        elif key not in consumed and key not in _INTERNAL_DIAGNOSTIC_KEYS:
-            remaining[key] = value
-    return remaining
-
-
-def _raw_candidate_row(record: CandidateRecord) -> dict[str, object]:
-    candidate = record.candidate
-    if not isinstance(candidate, RawFusionCandidate):  # pragma: no cover
-        raise TypeError("Expected a raw-fusion candidate.")
-    fit, partition, refit = candidate.raw_fit, candidate.partition, candidate.refit
-    diagnostics = record.diagnostics
-    profile = str(candidate.computation_profile)
-    raw_diagnostic = _raw_fit_diagnostic(
-        fit,
-        fit_options=diagnostics.get("_raw_start_fit_options"),
-    )
-    objective = float(raw_diagnostic["penalized_objective"])
-    loglik = float(raw_diagnostic["loglik"])
-    certificate = fit.certificate
-    progress = certificate.progress
-    convergence = fit.convergence
-    work = fit.work
-    multistart = fit.multistart
-    provenance = fit.provenance
-    uncertainty = max(
-        1e-10 * (1.0 + abs(objective)),
-        32.0 * np.finfo(np.float64).eps * (1.0 + abs(objective)),
-    )
-    penalty = max(objective + loglik, 0.0)
-    profile_penalty = (
-        penalty / float(raw_diagnostic["lambda"])
-        if float(raw_diagnostic["lambda"]) > 0.0
-        else np.nan
-    )
-    consumed = set(
-        "tumor_id selection_method selection_contract_json selection_profile objective_equivalent_to_strict_graph refit_global_certificate_required selection_step classic_bic bic_refit_cache_hit classic_bic_depth_n classic_bic_active_df candidate_elapsed_seconds raw_fit_elapsed_seconds bic_refit_elapsed_seconds raw_solver_primal_tol tol outer_max_iter inner_max_iter eps major_prior selection_refit_tol selection_refit_max_iter num_edges edge_weight_min edge_weight_max edge_weight_mean edge_list_hash pilot_matrix_hash input_data_hash fit_compute_summary fit_start_mode solver_state_warm_start".split()
-    )
-    row: dict[str, object] = {
-        "tumor_id": str(diagnostics.get("tumor_id", "")),
-        "selection_method": str(diagnostics.get("selection_method", "")),
-        "selection_contract_id": str(record.score.selection_contract_id),
-        "selection_contract_json": str(diagnostics.get("selection_contract_json", "")),
-        "selection_profile": str(diagnostics.get("selection_profile", "")),
-        "computation_profile": profile,
-        "target_estimator": "complete_graph_pairwise_fusion",
-        "solution_mode": (
-            "strict_certified"
-            if profile == "strict"
-            else "approximate_single_tumor_search"
-        ),
-        "objective_equivalent_to_strict_graph": bool(
-            diagnostics.get("objective_equivalent_to_strict_graph", False)
-        ),
-        "refit_mode": str(refit.refit_mode),
-        "refit_global_certificate_required": bool(
-            diagnostics.get("refit_global_certificate_required", profile == "strict")
-        ),
-        "selection_step": int(diagnostics.get("selection_step", record.candidate_id)),
-        "lambda": float(raw_diagnostic["lambda"]),
-        "raw_objective_numerical_uncertainty": uncertainty,
-        "raw_objective_lower_bound": objective - uncertainty,
-        "raw_objective_upper_bound": objective + uncertainty,
-        "raw_objective_uncertainty_certified": False,
-        "lambda_applicable": True,
-        "candidate_pool_source": "raw_fused_lambda_path",
-        "candidate_family": "raw_fusion",
-        "estimator_role": str(certificate.estimator_role),
-    }
-    row.update(_score_refit_row(record, raw_details=True))
-    row.update(
-        {
-            "partition_signature": str(partition.signature),
-            "partition_source": str(partition.source),
-            "partition_tol": float(partition.tolerance),
-            "partition_certified": bool(partition.certified),
-            "partition_certification_applicable": True,
-            "partition_maximal": bool(partition.maximal),
-            "partition_cross_close_edge_found": bool(partition.cross_close_edge_found),
-            "partition_certificate_graph_hash_matches": bool(
-                partition.certificate_graph_hash_matches
-            ),
-            "partition_certification_failure_reason": str(
-                partition.certification_failure_reason
-            ),
-            "partition_max_diameter": float(partition.max_diameter),
-            "partition_diameter_exact": bool(partition.diameter_exact),
-            "n_clusters": int(partition.n_clusters),
-            "cluster_sizes": _cluster_sizes_text(partition.labels),
-            "partition_labels_0based": ",".join(map(str, partition.labels.tolist())),
-            "eligible_for_selection": bool(candidate.eligible_for_selection),
-            "ineligibility_reason": str(candidate.ineligibility_reason),
-            "raw_kkt_eligible": bool(certificate.admissible),
-            "raw_objective_certified": bool(candidate.raw_objective_certified),
-            "converged": bool(convergence.converged),
-            "raw_fit_status": str(convergence.failure_reason),
-            "loglik": loglik,
-            "fit_loss": -loglik,
-            "penalized_objective": objective,
-            "penalty": float(penalty),
-            "profile_penalty": float(profile_penalty),
-        }
-    )
-    row.update(
-        {
-            "fixed_objective_kkt_residual": float(certificate.components.residual),
-            "working_precision_kkt_residual": float(certificate.working_residual),
-            "outer_backward_error_stationarity_residual": float(
-                certificate.components.stationarity
-            ),
-            "outer_backward_error_edge_subgradient_residual": float(
-                certificate.components.edge_subgradient
-            ),
-            "outer_backward_error_dual_ball_residual": float(
-                certificate.components.dual_ball
-            ),
-            "certificate_residual_method": str(certificate.residual_method),
-            "working_dtype": str(certificate.working_dtype),
-            "certificate_audit_dtype": str(certificate.audit_dtype),
-            "precision_polish_applied": bool(certificate.precision_polished),
-            "precision_polish_max_abs_phi_delta": float(
-                certificate.precision_polish_delta
-            ),
-            "directional_kink_admissible": bool(
-                certificate.directional_admissible
-            ),
-            "outer_stationarity_residual": float(progress.stationarity_residual),
-            "outer_projected_stationarity_norm": float(
-                progress.projected_stationarity_norm
-            ),
-            "outer_stationarity_normalizer": float(
-                progress.stationarity_normalizer
-            ),
-            "outer_smooth_gradient_norm": float(progress.smooth_gradient_norm),
-            "outer_fusion_adjustment_norm": float(
-                progress.fusion_adjustment_norm
-            ),
-            "outer_edge_subgradient_residual": float(
-                progress.edge_subgradient_residual
-            ),
-            "outer_dual_ball_residual": float(progress.dual_ball_residual),
-            "outer_box_residual": float(progress.box_residual),
-            "outer_box_primal_violation": float(progress.box_primal_violation),
-            "outer_stationarity_residual_before_dual_refine": float(
-                certificate.stationarity_before
-            ),
-            "outer_stationarity_residual_after_dual_refine": float(
-                certificate.stationarity_after
-            ),
-            "outer_kkt_fused_edges": int(certificate.fused_edges),
-            "outer_kkt_nonzero_edges": int(certificate.nonzero_edges),
-            "stationarity_certified": bool(certificate.stationary),
-            "global_optimality_certified": bool(certificate.global_optimum),
-            "global_optimality_basis": str(
-                provenance.global_optimality_basis
-            ),
-        }
-    )
-    row.update(
-        {
-            "number_of_starts": int(multistart.number_of_starts),
-            "number_of_finite_starts": int(multistart.number_of_finite_starts),
-            "best_start_objective": float(multistart.best_objective),
-            "second_best_start_objective": float(multistart.second_best_objective),
-            "objective_spread_across_starts": float(multistart.objective_spread),
-            "selected_start_objective_rank": int(
-                multistart.selected_objective_rank
-            ),
-            "iterations": int(convergence.iterations),
-            "inner_iterations": int(work.inner_iterations),
-            "admm_iterations": int(
-                work.dense_iterations
-                if provenance.inner_solver == "admm_complete_graph"
-                else 0
-            ),
-            "inner_solver": str(provenance.inner_solver),
-            "inner_backend": str(certificate.backend_name),
-            "backend_iterations": int(work.inner_iterations),
-        }
-    )
-    for name in (
-        "workset_iterations", "workset_expansions", "streamed_edge_passes",
-        "dense_iterations", "certificate_iterations",
-    ):
-        row[name] = int(getattr(work, name))
-    for name in (
-        "accepted_outer_steps", "attempted_outer_steps", "accepted_full_steps",
-        "accepted_damped_steps", "failed_majorization_checks",
-        "failed_inner_model_checks", "failed_em_envelope_checks",
-        "failed_descent_checks", "failed_nonfinite_checks",
-    ):
-        row[name] = int(getattr(convergence, name))
-    row.update(
-        {
-            "final_relative_objective_change": float(
-                convergence.relative_objective_change
-            ),
-            "final_step_residual": float(convergence.step_residual),
-            "converged_inner": bool(convergence.inner_converged),
-            "converged_outer": bool(convergence.outer_converged),
-            "full_certificate_audit_passes": int(
-                work.full_certificate_audit_passes
-            ),
-            "fallback_reason": str(certificate.fallback_reason),
-            "exactness_provenance_version": int(certificate.schema_version),
-            "objective_faithful": bool(certificate.objective_faithful),
-            "objective_spec_hash": str(provenance.objective_spec_hash),
-            "base_fusion_objective_hash": str(
-                provenance.base_fusion_objective_hash
-            ),
-            "original_graph_hash": str(provenance.original_graph_hash),
-            "certificate_problem_hash": str(
-                provenance.certificate_problem_hash
-            ),
-            "certificate_scope": str(certificate.scope),
-            "certificate_gradient_scope": str(certificate.gradient_scope),
-        }
-    )
-    row.update(
-        {
-            "full_kkt_certified": bool(certificate.certified),
-            "full_kkt_certificate_status": str(certificate.status),
-            "full_kkt_tolerance": float(certificate.tolerance),
-            "raw_solver_primal_tol": float(
-                diagnostics.get("raw_solver_primal_tol", np.nan)
-            ),
-            "outer_kkt_certificate_status": str(certificate.status),
-            "outer_num_frozen_coordinates": int(progress.num_frozen_coordinates),
-            "mm_consistency_violations": int(
-                convergence.mm_consistency_violations
-            ),
-            "failure_reason": str(convergence.failure_reason),
-        }
-    )
-    for name in "candidate_elapsed_seconds raw_fit_elapsed_seconds bic_refit_elapsed_seconds".split():
-        row[name] = float(diagnostics.get(name, np.nan))
-    row.update(
-        {
-            "primary_phi_source": "raw_pairwise_fusion",
-            "refit_phi_source": "fixed_partition_refit",
-            "device": str(provenance.device),
-            "dtype": str(provenance.dtype),
-        }
-    )
-    _copy_diagnostics(
-        row,
-        diagnostics,
-        "tol outer_max_iter inner_max_iter eps major_prior selection_refit_tol selection_refit_max_iter",
-    )
-    row["graph_name"] = str(provenance.graph_name)
-    _copy_diagnostics(
-        row,
-        diagnostics,
-        "num_edges edge_weight_min edge_weight_max edge_weight_mean edge_list_hash pilot_matrix_hash input_data_hash fit_compute_summary fit_start_mode solver_state_warm_start",
-    )
-    for key, value in _remaining_diagnostics(diagnostics, consumed).items():
-        row.setdefault(key, value)
-    row["_candidate_id"] = int(record.candidate_id)
-    row["candidate_id"] = int(record.candidate_id)
-    return row
-
-
-def _direct_candidate_row(record: CandidateRecord) -> dict[str, object]:
-    candidate, diagnostics = record.candidate, record.diagnostics
-    partition = candidate.partition
-    consumed = set(
-        "tumor_id selection_contract_json pre_refinement_signature classic_bic bic_refit_cache_hit candidate_elapsed_seconds".split()
-    )
-    row: dict[str, object] = {
-        "tumor_id": str(diagnostics.get("tumor_id", "")),
-        "candidate_id": int(record.candidate_id),
-        "candidate_family": "direct_partition",
-        "candidate_pool_source": str(partition.source),
-        "partition_source": str(partition.source),
-        "partition_signature": str(partition.signature),
-        "requested_K": int(partition.requested_k),
-        "n_clusters": int(partition.n_clusters),
-        "cluster_sizes": _cluster_sizes_text(partition.labels),
-        "partition_labels_0based": ",".join(map(str, partition.labels.tolist())),
-        "lambda": np.nan,
-        "lambda_applicable": False,
-        "parent_raw_candidate_id": (
-            np.nan
-            if partition.parent_raw_candidate_id is None
-            else int(partition.parent_raw_candidate_id)
-        ),
-        "parent_raw_lambda": (
-            np.nan
-            if partition.parent_raw_lambda is None
-            else float(partition.parent_raw_lambda)
-        ),
-        "parent_raw_phi_hash": str(partition.parent_raw_phi_hash),
-        "selection_contract_id": str(record.score.selection_contract_id),
-        "selection_contract_json": str(diagnostics.get("selection_contract_json", "")),
-        "generation_contract_id": str(partition.generation_contract_id),
-        "pre_refinement_signature": str(
-            diagnostics.get("pre_refinement_signature", partition.signature)
-        ),
-        "cem_iterations": int(partition.cem_iterations),
-        "component_death_count": int(partition.component_death_count),
-        "refinement_score_before": float(partition.refinement_score_before),
-        "refinement_score_after": float(partition.refinement_score_after),
-        "deterministic_partition_generation": bool(partition.deterministic_generation),
-        "direct_partition_identity_certified": True,
-        "partition_certified": False,
-        "partition_certification_applicable": False,
-        "partition_maximal": False,
-        "partition_diameter_exact": False,
-        "partition_max_diameter": np.nan,
-        "partition_certification_failure_reason": "not_applicable_direct_partition",
-    }
-    row.update(_score_refit_row(record, raw_details=False))
-    row.update(
-        {
-            "eligible_for_selection": bool(candidate.eligible_for_selection),
-            "ineligibility_reason": str(candidate.ineligibility_reason),
-            "converged": bool(candidate.refit.finite_candidate_found),
-            "estimator_role": "direct_partition_candidate",
-            "raw_objective_certified": False,
-            "raw_kkt_eligible": False,
-            "objective_faithful": False,
-            "raw_certificate_status": "not_applicable_direct_partition",
-            "full_kkt_certified": False,
-            "full_kkt_certificate_status": "not_applicable_direct_partition",
-            "fixed_objective_kkt_residual": np.nan,
-            "penalized_objective": np.nan,
-            "mm_consistency_violations": 0,
-            "selection_step": int(record.candidate_id),
-            "candidate_elapsed_seconds": float(
-                diagnostics.get("candidate_elapsed_seconds", np.nan)
-            ),
-            "computation_profile": str(candidate.computation_profile),
-            "primary_phi_source": "raw_pairwise_fusion_reference",
-            "refit_phi_source": "selected_direct_partition_refit",
-        }
-    )
-    for key, value in _remaining_diagnostics(diagnostics, consumed).items():
-        row.setdefault(key, value)
-    row["_candidate_id"] = int(record.candidate_id)
-    return row
-
-
-def candidates_to_dataframe(records: list[CandidateRecord]) -> pd.DataFrame:
-    """Serialize authoritative typed candidates once, after model selection."""
-
-    rows = [
-        _raw_candidate_row(record)
-        if isinstance(record.candidate, RawFusionCandidate)
-        else _direct_candidate_row(record)
-        for record in records
-    ]
-    if not rows:
-        return pd.DataFrame()
-    return (
-        pd.DataFrame(rows)
-        .sort_values(["lambda", "selection_step"], kind="stable")
-        .reset_index(drop=True)
-    )
 
 
 def _select_raw_reference(
@@ -775,35 +315,21 @@ def _select_raw_reference(
 def _assemble_selection_result(
     *,
     data,
-    normalized_score,
     result_entries,
     selection_method,
     adaptive_search_stop_reason,
-    selection_start_time,
     strict_positive_exact_fusion: bool = False,
     ward_candidate_pool_complete: bool = False,
 ) -> BICSelectionResult:
-    del normalized_score  # Every typed record already carries its active score.
     try:
         decision = select_candidate_records(
             result_entries,
             strict_positive_exact_fusion=bool(strict_positive_exact_fusion),
         )
     except ValueError as exc:
-        search_df = candidates_to_dataframe(result_entries)
-        search_df["bic_selection_eligible"] = False
-        representative_ids = candidate_representative_ids(
-            result_entries,
-            strict_positive_exact_fusion=bool(strict_positive_exact_fusion),
-        )
-        search_df["signature_selection_representative"] = (
-            search_df["_candidate_id"].astype(int).isin(representative_ids)
-        )
-        if strict_positive_exact_fusion:
-            search_df["bic_selection_eligible"] = False
         raise NoEligibleModelSelectionCandidatesError(
             tumor_id=data.tumor_id,
-            search_df=search_df,
+            candidates=tuple(result_entries),
         ) from exc
 
     selected_record = decision.selected
@@ -853,17 +379,6 @@ def _assemble_selection_result(
         and not decision.selection_boundary_unresolved
     )
     selected_lambda = selected_record.lambda_value
-    selected_lambda_log10_width = (
-        float(
-            np.log10(decision.selected_lambda_right)
-            - np.log10(decision.selected_lambda_left)
-        )
-        if decision.selected_lambda_left is not None
-        and decision.selected_lambda_right is not None
-        and decision.selected_lambda_left > 0.0
-        and decision.selected_lambda_right > 0.0
-        else (None if selected_lambda is None else 0.0)
-    )
     selected_kkt_value = (
         float(selected_candidate.raw_fit.certificate.components.residual)
         if selected_is_raw
@@ -871,58 +386,6 @@ def _assemble_selection_result(
     )
     selected_kkt_residual = (
         selected_kkt_value if np.isfinite(selected_kkt_value) else None
-    )
-
-    # Reporting starts only after the typed selection decision is complete.
-    search_df = candidates_to_dataframe(result_entries)
-    search_df["bic_selection_eligible"] = search_df["eligible_for_selection"].astype(
-        bool
-    )
-    ids = search_df["_candidate_id"].astype(int)
-    search_df["signature_selection_representative"] = ids.isin(
-        decision.representative_ids
-    )
-    if strict_positive_exact_fusion:
-        search_df["bic_selection_eligible"] = ids.isin(decision.eligible_ids)
-    search_df["eligible_for_selection"] = ids.isin(decision.eligible_ids)
-    search_df["lambda_values_evaluated"] = ",".join(
-        f"{float(value):.12g}"
-        for value in _sorted_unique_lambdas(
-            [
-                float(record.lambda_value)
-                for record in result_entries
-                if record.lambda_value is not None
-            ]
-        )
-    )
-    search_df["optimizer_limited_candidate"] = ids.isin(decision.optimizer_limited_ids)
-    search_df["is_selection_optimal"] = ids.isin(decision.optimal_ids)
-    search_df["is_selected_best_row"] = ids.eq(int(selected_record.candidate_id))
-    search_df["adaptive_search_stop_reason"] = final_adaptive_search_stop_reason
-    search_df["adaptive_search_global_optimum_certified"] = bool(
-        adaptive_search_global_optimum_certified
-    )
-    search_df["selection_optimum_resolved"] = bool(selection_optimum_resolved)
-    search_df["selected_lambda_representative"] = (
-        np.nan if selected_lambda is None else float(selected_lambda)
-    )
-    search_df["selected_lambda_left"] = (
-        np.nan
-        if decision.selected_lambda_left is None
-        else float(decision.selected_lambda_left)
-    )
-    search_df["selected_lambda_right"] = (
-        np.nan
-        if decision.selected_lambda_right is None
-        else float(decision.selected_lambda_right)
-    )
-    search_df["selected_lambda_interval_log10_width"] = (
-        np.nan
-        if selected_lambda_log10_width is None
-        else float(selected_lambda_log10_width)
-    )
-    search_df["selection_elapsed_seconds"] = float(
-        perf_counter() - selection_start_time
     )
 
     selected_model = SelectedModel(
@@ -941,10 +404,32 @@ def _assemble_selection_result(
         ),
         partition_parent_raw=partition_parent_raw,
     )
-    search_df = search_df.drop(columns=["_candidate_id"])
+    ordered_records = sorted(
+        result_entries,
+        key=lambda record: (
+            record.lambda_value is None,
+            float("inf") if record.lambda_value is None else record.lambda_value,
+            int(record.candidate_id),
+        ),
+    )
+    search = tuple(
+        SearchCandidate(
+            record=record,
+            signature_representative=(
+                int(record.candidate_id) in decision.representative_ids
+            ),
+            selection_eligible=int(record.candidate_id) in decision.eligible_ids,
+            optimizer_limited=(
+                int(record.candidate_id) in decision.optimizer_limited_ids
+            ),
+            selection_optimal=int(record.candidate_id) in decision.optimal_ids,
+            selected=int(record.candidate_id) == int(selected_record.candidate_id),
+        )
+        for record in ordered_records
+    )
     return BICSelectionResult(
         selected_model=selected_model,
-        search_df=search_df,
+        search=search,
         selection_method=selection_method,
         selection_hits_lower_boundary=decision.selection_hits_lower_boundary,
         selection_hits_upper_boundary=decision.selection_hits_upper_boundary,
@@ -978,21 +463,15 @@ def _partition_guided_admm_selection(
     controller terminates, so they cannot steer or replace the raw optimizer.
     """
 
-    selection_start_time = perf_counter()
-    computation_profile = fit_options.computation_profile
     selection_contract = fit_options.selection.contract
     selection_score = str(fit_options.selection.score)
     normalized_score = selection_score
-    profile_name = f"{computation_profile.name}_partition_guided_admm_{selection_score}"
-    if selection_contract.contract_id != "raw-fusion-only-v0.3":
-        profile_name += f"_{selection_contract.contract_id}"
     selection_method = "online_partition_guided_admm"
     if int(data.num_mutations) < 2:
         raise ValueError(
             "partition_guided_admm requires at least two mutations so that a "
             "positive pairwise penalty is solved by ADMM."
         )
-    prepare_start_time = perf_counter()
     pilot_context = prepare_torch_problem_with_resource_policy(
         data,
         dense_fallback_policy=str(fit_options.runtime.fallback),
@@ -1044,10 +523,6 @@ def _partition_guided_admm_selection(
     # CUDA graph construction uploads this small M x S matrix once; the O(M^2)
     # graph itself stays device-backed and is reused by context preparation.
     guide_phi: StartArray = np.asarray(guide.phi_start)
-    partition_guide_signature = _partition_signature(
-        np.asarray(guide.labels, dtype=np.int64)
-    )
-    partition_guide_matrix_hash = _pilot_matrix_hash(guide_phi)
     if fit_options.graph.graph is None:
         graph_pilot_source = str(fit_options.selection.graph_pilot_source)
         if graph_pilot_source == "partition_guide":
@@ -1063,7 +538,7 @@ def _partition_guided_admm_selection(
         likelihood_noise_divisor = float(
             complete_graph_degree**likelihood_noise_degree_exponent
         )
-        selection_graph, prebuilt_tensor_graph, likelihood_noise_tau = (
+        selection_graph, prebuilt_tensor_graph, _ = (
             _build_partition_guided_graph_with_resource_policy(
                 guide_phi=graph_builder_phi,
                 guide_curvature=guide_curvature,
@@ -1072,20 +547,9 @@ def _partition_guided_admm_selection(
                 noise_divisor=likelihood_noise_divisor,
             )
         )
-        graph_source = (
-            "partition_guide_likelihood_noise_degree_regularized"
-            if graph_builder_phi is guide_phi
-            else "zero_penalty_likelihood_pilot_degree_regularized"
-        )
-        graph_pilot_phi: StartArray = graph_builder_phi
     else:
         selection_graph = fit_options.graph.graph
         prebuilt_tensor_graph = None
-        likelihood_noise_tau = float("nan")
-        likelihood_noise_divisor = float("nan")
-        likelihood_noise_degree_exponent = float("nan")
-        graph_source = "user_supplied"
-        graph_pilot_phi = pilot_phi
     base_solver_context = prepare_torch_problem_with_resource_policy(
         data,
         dense_fallback_policy=str(fit_options.runtime.fallback),
@@ -1158,8 +622,6 @@ def _partition_guided_admm_selection(
         raise ValueError(
             "partition_guided_admm CPU fallback changed the complete fusion graph."
         )
-    prepare_elapsed_seconds = float(perf_counter() - prepare_start_time)
-
     controller = OnlineLambdaController(
         initial_lambda=float(guided_initialization.lambda_value),
         initial_reason="partition_guide_kkt_balance",
@@ -1185,10 +647,6 @@ def _partition_guided_admm_selection(
     partition_k_by_lambda: dict[float, int] = {}
     attempts_by_lambda: dict[float, list[RawFit]] = {}
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] = {}
-    static_metadata = _candidate_static_metadata(
-        data, effective_graph, pilot_phi=graph_pilot_phi
-    )
-    scalar_likelihood_pilot_hash = _pilot_matrix_hash(pilot_phi)
     next_step = 0
     while True:
         proposal = controller.propose()
@@ -1229,16 +687,11 @@ def _partition_guided_admm_selection(
                 ),
             )
 
-        raw_fit_start = perf_counter()
-        raw_start_attempt_count = 0
-        raw_start_sources: list[str] = []
-
         def solve_raw_path() -> tuple[
             RawFit,
             _RawStartAttempt,
             tuple[_RawStartAttempt, ...],
         ]:
-            nonlocal raw_start_attempt_count
             context = base_solver_context
             initialization = guided_initialization
             warm_fit = None
@@ -1517,9 +970,6 @@ def _partition_guided_admm_selection(
                         mathematically_certified=bool(mathematically_certified),
                     )
                 )
-                raw_start_attempt_count += 1
-                raw_start_sources.append(str(lambda_start_source))
-
             selected_attempt = _select_raw_start_attempt(start_attempts)
             seed_fit = selected_attempt.fit
             # Subsequent bracket proposals must warm-start from the same raw
@@ -1528,8 +978,7 @@ def _partition_guided_admm_selection(
             return seed_fit, selected_attempt, tuple(start_attempts)
 
         selected_raw_fit, selected_start, raw_start_attempts = solve_raw_path()
-        raw_fit_elapsed_seconds = float(perf_counter() - raw_fit_start)
-        fit, diagnostics, artifact = evaluate_raw_fusion_candidate(
+        fit, artifact = evaluate_raw_fusion_candidate(
             data=data,
             fit_options=effective_fit_options,
             candidate_fit_options=candidate_fit_options,
@@ -1542,13 +991,9 @@ def _partition_guided_admm_selection(
             torch_data=torch_data,
             solver_context=base_solver_context,
             solver_state=selected_raw_fit.state,
-            selection_method=selection_method,
-            profile_name=profile_name,
-            selection_step=next_step,
             lambda_value=float(proposal.lambda_value),
             selection_score=selection_score,
             bic_refit_cache=bic_refit_cache,
-            static_metadata=static_metadata,
             precomputed_fit=selected_raw_fit,
         )
         (
@@ -1560,139 +1005,45 @@ def _partition_guided_admm_selection(
             float(selected_start.start_value),
             int(selected_start.breakpoint_escape_changed_count),
         )
-        certified_objectives = [
-            float(attempt.fit.objective.total)
-            for attempt in raw_start_attempts
-            if attempt.mathematically_certified
-            and np.isfinite(float(attempt.fit.objective.total))
-        ]
-        certified_min = min(certified_objectives) if certified_objectives else np.nan
-        certified_max = max(certified_objectives) if certified_objectives else np.nan
-        diagnostics["raw_fit_elapsed_seconds"] = float(raw_fit_elapsed_seconds)
-        diagnostics["raw_mean_start_fit_elapsed_seconds"] = float(
-            raw_fit_elapsed_seconds / max(raw_start_attempt_count, 1)
-        )
-        diagnostics["raw_start_attempt_count"] = int(raw_start_attempt_count)
-        diagnostics["raw_start_attempt_sources"] = ",".join(raw_start_sources)
-        diagnostics["raw_multistart_applied"] = bool(raw_start_attempt_count > 1)
-        diagnostics["raw_selected_start_attempt_count"] = len(raw_start_attempts)
-        diagnostics["raw_selected_start_certified_count"] = len(certified_objectives)
-        diagnostics["raw_selected_start_certified_objective_min"] = float(certified_min)
-        diagnostics["raw_selected_start_certified_objective_max"] = float(certified_max)
-        diagnostics["raw_selected_start_certified_objective_spread"] = (
-            float(certified_max - certified_min) if certified_objectives else np.nan
-        )
-        diagnostics["raw_selected_start_source"] = str(selected_start.source)
-        diagnostics["raw_start_objectives"] = ",".join(
-            f"{attempt.source}:{float(attempt.fit.objective.total):.17g}:"
-            f"{int(attempt.mathematically_certified)}"
-            for attempt in raw_start_attempts
-        )
-        diagnostics["_raw_start_fit_options"] = candidate_fit_options
-        diagnostics["_raw_start_attempts"] = raw_start_attempts
-        guide_signature = _partition_signature(raw_guide_labels)
-        guide_matrix_hash = _pilot_matrix_hash(raw_guide_phi)
-
-        diagnostics.update(
-            {
-                "search_round": int(next_step),
-                "search_phase": str(proposal.phase),
-                "lambda_source": "online_partition_guide_kkt",
-                "lambda_search_mode": "partition_guided_admm",
-                "lambda_path_prespecified": False,
-                "lambda_proposal_reason": str(proposal.reason),
-                "lambda_retry_number": int(proposal.retry_number),
-                "lambda_start_source": str(lambda_start_source),
-                "lambda_start_value": float(lambda_start_value),
-                "path_breakpoint_escape_applied": bool(
-                    path_breakpoint_escape_changed_count > 0
-                ),
-                "path_breakpoint_escape_changed_count": int(
-                    path_breakpoint_escape_changed_count
-                ),
-                "persistent_solver_state_device": "cpu",
-                "lambda_warm_start_value": np.nan
-                if proposal.warm_start_lambda is None
-                else float(proposal.warm_start_lambda),
-                "lambda_alternate_start_value": np.nan
-                if proposal.alternate_start_lambda is None
-                else float(proposal.alternate_start_lambda),
-                "lambda_observed_bracket_left": np.nan
-                if proposal.bracket_left_lambda is None
-                else float(proposal.bracket_left_lambda),
-                "lambda_observed_bracket_right": np.nan
-                if proposal.bracket_right_lambda is None
-                else float(proposal.bracket_right_lambda),
-                "candidate_role": "pairwise_fusion_selection",
-                "initialization_mode": "ward_cem_active_selection_score_kkt",
-                "initializer_selection_score": str(normalized_score),
-                "initializer_score_value": float(guide.bic),
-                "initializer_K": int(np.unique(raw_guide_labels).size),
-                "initializer_requested_K": int(_partition_candidate_requested_k(guide)),
-                "initializer_source": str(guide.source),
-                "initializer_partition_signature": str(guide_signature),
-                "initializer_matrix_hash": str(guide_matrix_hash),
-                "partition_guide_K": int(guide.K),
-                "partition_guide_signature": str(partition_guide_signature),
-                "partition_guide_matrix_hash": str(partition_guide_matrix_hash),
-                "fusion_graph_source": str(graph_source),
-                "fusion_graph_pilot_matrix_hash": str(
-                    static_metadata.pilot_matrix_hash
-                ),
-                "scalar_likelihood_pilot_matrix_hash": str(
-                    scalar_likelihood_pilot_hash
-                ),
-                "fusion_graph_likelihood_noise_tau": float(likelihood_noise_tau),
-                "fusion_graph_likelihood_noise_divisor": float(
-                    likelihood_noise_divisor
-                ),
-                "fusion_graph_likelihood_noise_degree_exponent": float(
-                    likelihood_noise_degree_exponent
-                ),
-                "initializer_pool_size": int(len(initializer_pool.candidates)),
-                "initializer_lambda": float(guided_initialization.lambda_value),
-                "initializer_kkt_residual": float(
-                    guided_initialization.diagnostics.kkt_residual
-                ),
-                "initializer_max_dual_ball_ratio": float(
-                    guided_initialization.diagnostics.max_dual_ball_ratio
-                ),
-                "initializer_capacity_iterations": int(
-                    guided_initialization.diagnostics.capacity_iterations
-                ),
-                "initializer_capacity_converged": bool(
-                    guided_initialization.diagnostics.capacity_converged
-                ),
-                "initializer_capacity_status": str(
-                    guided_initialization.diagnostics.capacity_status
-                ),
-                "selection_prepare_elapsed_seconds": float(prepare_elapsed_seconds),
-                "adaptive_candidate_budget": int(
-                    fit_options.selection.lambda_search.exploration_budget
-                ),
-                "adaptive_refinement_candidate_budget": int(
-                    fit_options.selection.lambda_search.refinement_budget
-                ),
-                "adaptive_max_rounds": int(
-                    fit_options.selection.lambda_search.exploration_budget
-                    + fit_options.selection.lambda_search.refinement_budget
-                ),
-                "adaptive_refine_per_round": 1,
-                "adaptive_transition_probe_max_candidates": 0,
-                "adaptive_initial_lambda_count": 1,
-                "likelihood_partition_pool_enabled": True,
-                "likelihood_partition_selection_enabled": bool(
-                    selection_contract.selectable_partition_pool
-                ),
-                **_partition_pool_row_metadata(initializer_pool),
-            }
-        )
         candidate_id = int(len(result_entries))
         result_entries.append(
             CandidateRecord(
                 candidate_id=candidate_id,
                 candidate=artifact,
-                diagnostics=diagnostics,
+                trace=CandidateTrace(
+                    search_round=int(next_step),
+                    search_phase=str(proposal.phase),
+                    lambda_proposal_reason=str(proposal.reason),
+                    lambda_retry_number=int(proposal.retry_number),
+                    start_source=str(lambda_start_source),
+                    start_value=float(lambda_start_value),
+                    breakpoint_escape_changed_count=int(
+                        path_breakpoint_escape_changed_count
+                    ),
+                    raw_attempts=tuple(
+                        RawAttemptTrace(
+                            fit=attempt.fit,
+                            source=str(attempt.source),
+                            start_value=float(attempt.start_value),
+                            breakpoint_escape_changed_count=int(
+                                attempt.breakpoint_escape_changed_count
+                            ),
+                            mathematically_certified=bool(
+                                attempt.mathematically_certified
+                            ),
+                            outer_max_iter=int(
+                                candidate_fit_options.solver.outer_max_iter
+                            ),
+                            inner_max_iter=int(
+                                candidate_fit_options.solver.inner_max_iter
+                            ),
+                            certificate_max_iter=int(
+                                candidate_fit_options.solver.certificate.max_iter
+                            ),
+                        )
+                        for attempt in raw_start_attempts
+                    ),
+                ),
             )
         )
         incumbent = fit_by_lambda.get(lambda_key)
@@ -1797,11 +1148,10 @@ def _partition_guided_admm_selection(
             )
             source = _direct_partition_source(proposal, stage=stage)
             candidate_id = int(len(result_entries))
-            direct_diagnostics, direct_candidate = evaluate_direct_partition_candidate(
+            direct_candidate = evaluate_direct_partition_candidate(
                 data=data,
                 proposal=proposal,
                 selection_options=effective_fit_options,
-                candidate_id=candidate_id,
                 source=source,
                 parent_raw_candidate_id=(
                     None if parent_record is None else int(parent_record.candidate_id)
@@ -1819,25 +1169,14 @@ def _partition_guided_admm_selection(
                 generation_contract_id=selection_contract.contract_id,
                 refit_cache=bic_refit_cache,
             )
-            direct_diagnostics.update(
-                {
-                    "selection_method": selection_method,
-                    "selection_profile": profile_name,
-                    "search_round": int(next_step),
-                    "search_phase": f"{stage}_direct_partition_pool",
-                    "lambda_search_mode": "partition_guided_admm",
-                    "candidate_role": "secondary_partition_selection",
-                    "likelihood_partition_pool_enabled": True,
-                    "likelihood_partition_selection_enabled": True,
-                    "ward_candidate_pool_complete": True,
-                    **_partition_pool_row_metadata(proposal_pool),
-                }
-            )
             result_entries.append(
                 CandidateRecord(
                     candidate_id=candidate_id,
                     candidate=direct_candidate,
-                    diagnostics=direct_diagnostics,
+                    trace=CandidateTrace(
+                        search_round=int(next_step),
+                        search_phase=f"{stage}_direct_partition_pool",
+                    ),
                 )
             )
             next_step += 1
@@ -1850,11 +1189,9 @@ def _partition_guided_admm_selection(
     stop_reason = str(controller.stop_reason or "online_lambda_no_terminal_reason")
     return _assemble_selection_result(
         data=data,
-        normalized_score=normalized_score,
         result_entries=result_entries,
         selection_method=selection_method,
         adaptive_search_stop_reason=stop_reason,
-        selection_start_time=selection_start_time,
         strict_positive_exact_fusion=not bool(
             selection_contract.selectable_partition_pool
         ),
@@ -1888,6 +1225,5 @@ __all__ = [
     "BICSelectionResult",
     "NoCertifiedRawReferenceError",
     "NoEligibleModelSelectionCandidatesError",
-    "candidates_to_dataframe",
     "select_model",
 ]

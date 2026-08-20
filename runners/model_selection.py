@@ -18,7 +18,6 @@ from ..model_selection.search import (
     _select_raw_reference,
     _select_raw_start_attempt,
     _solver_recovery_fit_options,
-    candidates_to_dataframe,
     select_model,
 )
 
@@ -35,6 +34,5 @@ __all__ = [
     "_select_raw_reference",
     "_select_raw_start_attempt",
     "_solver_recovery_fit_options",
-    "candidates_to_dataframe",
     "select_model",
 ]

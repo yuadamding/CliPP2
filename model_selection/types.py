@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Union
 
 import numpy as np
-import pandas as pd
 import torch
 
 from ..core.bic import SelectionScore
@@ -183,13 +182,13 @@ SelectablePartitionCandidate = Union[RawFusionCandidate, DirectPartitionCandidat
 CandidateFamily = Literal["raw_fusion", "direct_partition"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CandidateRecord:
-    """Typed selection unit; diagnostics never control admission or selection."""
+    """Typed selection unit and its compact search provenance."""
 
     candidate_id: int
     candidate: SelectablePartitionCandidate
-    diagnostics: dict[str, object]
+    trace: CandidateTrace = field(default_factory=lambda: CandidateTrace())
 
     def __post_init__(self) -> None:
         if int(self.candidate_id) < 0:
@@ -236,6 +235,58 @@ class CandidateRecord:
         if isinstance(self.candidate, RawFusionCandidate):
             return int(self.candidate.raw_fit.convergence.mm_consistency_violations)
         return 0
+
+
+@dataclass(frozen=True, slots=True)
+class RawAttemptTrace:
+    """Failure-relevant provenance for one authorized raw optimizer start."""
+
+    fit: RawFit
+    source: str
+    start_value: float
+    breakpoint_escape_changed_count: int
+    mathematically_certified: bool
+    outer_max_iter: int
+    inner_max_iter: int
+    certificate_max_iter: int
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateTrace:
+    """Small immutable trace retained after the adaptive search finishes."""
+
+    search_round: int = -1
+    search_phase: str = "unknown"
+    lambda_proposal_reason: str = ""
+    lambda_retry_number: int = 0
+    start_source: str = "not_applicable"
+    start_value: float | None = None
+    breakpoint_escape_changed_count: int = 0
+    raw_attempts: tuple[RawAttemptTrace, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SearchCandidate:
+    """One immutable candidate plus selection-decision annotations."""
+
+    record: CandidateRecord
+    signature_representative: bool
+    selection_eligible: bool
+    optimizer_limited: bool
+    selection_optimal: bool
+    selected: bool
+
+    @property
+    def candidate_id(self) -> int:
+        return int(self.record.candidate_id)
+
+    @property
+    def candidate(self) -> SelectablePartitionCandidate:
+        return self.record.candidate
+
+    @property
+    def trace(self) -> CandidateTrace:
+        return self.record.trace
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,10 +382,10 @@ class SelectedModel:
             raise ValueError("Raw reference must remain a certified raw-fusion model.")
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class BICSelectionResult:
     selected_model: SelectedModel
-    search_df: pd.DataFrame
+    search: tuple[SearchCandidate, ...]
     selection_method: str
     selection_hits_lower_boundary: bool
     selection_hits_upper_boundary: bool
