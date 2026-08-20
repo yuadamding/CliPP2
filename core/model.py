@@ -49,7 +49,6 @@ def fit_fixed_objective(
         start_mode=str(start_mode),
         device=str(config.runtime.device),
         dtype=str(config.runtime.dtype),
-        summary_tol=solver.component_tolerance,
         objective_shape=str(solver.objective_shape),
         workset_max_bytes=int(resources.workset_max_bytes),
         compressed_cache_max_bytes=int(resources.compressed_cache_max_bytes),

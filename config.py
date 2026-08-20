@@ -84,7 +84,6 @@ class SolverConfig:
     objective_shape: str
     certificate: CertificateConfig
     resources: ResourceConfig = field(default_factory=ResourceConfig)
-    component_tolerance: float | None = 2e-4
 
     def __post_init__(self) -> None:
         _positive("tol", self.tolerance)
@@ -193,7 +192,6 @@ def resolve_fit_config(
     adaptive_weight_baseline: float = 1.0,
     device: str = DEFAULT_DEVICE,
     dtype: str | None = None,
-    summary_tol: float | None = 2e-4,
     objective_shape: str = "auto",
     workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES,
     compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
@@ -237,7 +235,6 @@ def resolve_fit_config(
             workset_add_batch=int(workset_add_batch),
             workset_max_expansions=int(workset_max_expansions),
         ),
-        component_tolerance=summary_tol,
     )
     selection = SelectionConfig(
         score=str(selection_score),

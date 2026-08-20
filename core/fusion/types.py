@@ -18,7 +18,12 @@ from .defaults import (
 )
 
 if TYPE_CHECKING:
-    from ..objective import BaseObjectiveKey, LambdaObjectiveKey, ObservedModel
+    from ..objective import (
+        BaseObjectiveKey,
+        LambdaObjectiveKey,
+        ObservedModel,
+        TorchObservedModel,
+    )
 
 
 _GRAPH_FINGERPRINT_SCHEMA = "clipp2.pairwise-fusion-graph.v1"
@@ -285,22 +290,14 @@ class TorchRuntime:
 
 @dataclass(frozen=True, slots=True)
 class TensorProblem:
-    alt: torch.Tensor
-    total: torch.Tensor
-    nonalt: torch.Tensor
-    phi_upper: torch.Tensor
-    ambiguous: torch.Tensor
-    b_minus: torch.Tensor
-    b_plus: torch.Tensor
-    b_fixed: torch.Tensor
+    observed_model: TorchObservedModel
     eps: float
     major_prior: float
-    count_observed: torch.Tensor | None = None
-    # Kept opaque here to avoid a types/backend import cycle.  The concrete
-    # value is ``TorchPathLikelihoodSpec`` when an explicit path model is used.
-    path_likelihood: object | None = None
-    # Immutable float64 source for rebuilding every audit-precision runtime view.
     source_model: ObservedModel | None = None
+
+    @property
+    def count_observed(self) -> torch.Tensor:
+        return self.observed_model.observed
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,10 +382,8 @@ class CertificateResult:
     """Terminal full-objective certificate and exactness provenance."""
 
     components: KKTComponents
-    progress: KKTDiagnostics
     certified: bool
     admissible: bool
-    stationary: bool
     global_optimum: bool
     status: str
     tolerance: float
@@ -402,12 +397,7 @@ class CertificateResult:
     precision_polished: bool
     precision_polish_delta: float
     residual_method: str
-    backend_name: str
     fallback_reason: str
-    fused_edges: int
-    nonzero_edges: int
-    stationarity_before: float
-    stationarity_after: float
 
     @property
     def schema_version(self) -> int:
@@ -456,21 +446,7 @@ class CertificateResult:
 
 @dataclass(frozen=True, slots=True)
 class ConvergenceResult:
-    iterations: int
     converged: bool
-    inner_converged: bool
-    outer_converged: bool
-    relative_objective_change: float
-    step_residual: float
-    accepted_outer_steps: int
-    accepted_full_steps: int
-    accepted_damped_steps: int
-    attempted_outer_steps: int
-    failed_majorization_checks: int
-    failed_inner_model_checks: int
-    failed_em_envelope_checks: int
-    failed_descent_checks: int
-    failed_nonfinite_checks: int
     mm_consistency_violations: int
     failure_reason: str
 
@@ -483,7 +459,6 @@ class MultiStartResult:
     second_best_objective: float
     objective_spread: float
     selected_objective_rank: int
-    threshold_component_count: int
 
 
 @dataclass(frozen=True, slots=True)
