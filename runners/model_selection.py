@@ -46,9 +46,9 @@ from ..io.data import TumorData, tumor_objective_fingerprint
 from ..core.bic import compute_classic_bic, compute_partition_dirichlet_score
 
 from ..model_selection.candidates import (
-    _CachedPartitionRefit,
-    _evaluate_candidate,
+    PartitionRefitCacheEntry,
     evaluate_direct_partition_candidate,
+    evaluate_raw_fusion_candidate,
     validate_candidate_identity,
 )
 from ..model_selection.contracts import get_selection_contract
@@ -70,26 +70,18 @@ from ..model_selection.partition_initializer import (
 )
 from ..model_selection.partitions import (
     _best_partition_candidate,
+    _cluster_sizes_text,
     _partition_candidate_requested_k,
     _partition_signature,
 )
 from ..model_selection.scoring import (
-    _adaptive_score_column,
     _annotate_bic_diagnostics,
-    _bic_selection_eligible_mask,
     _canonical_lambda,
-    _exact_fusion_certificate_mask,
-    _lambda_applicable_mask,
-    _lambda_boundary_flags,
-    _lambda_boundary_unresolved,
-    _lambda_range_for_optimal_rows,
-    _positive_exact_fusion_selection_mask,
     _prefer_fit_candidate,
-    _row_lambda_applicable,
-    _score_strictly_better,
-    _select_best_partition_leftmost,
-    _selected_lambda_signature_interval,
     _sorted_unique_lambdas,
+    candidate_representative_ids,
+    raw_candidate_has_exact_fusion_certificate,
+    select_candidate_records,
 )
 from ..model_selection.types import (
     BICSelectionResult,
@@ -1001,63 +993,238 @@ def _direct_partition_source(
 def _candidate_record_representatives(
     records: list[CandidateRecord],
 ) -> set[int]:
-    """Choose one deterministic selection representative per final signature."""
+    """Compatibility wrapper for the typed exact-admission selector."""
 
-    best: dict[str, CandidateRecord] = {}
+    return set(candidate_representative_ids(records))
+
+
+def candidates_to_dataframe(records: list[CandidateRecord]) -> pd.DataFrame:
+    """Materialize the compatibility search table at the reporting boundary."""
+
+    rows: list[dict[str, object]] = []
     for record in records:
-        if not record.candidate.eligible_for_selection:
-            continue
-        incumbent = best.get(record.partition_signature)
-        candidate_key = (
-            float(record.score.value),
-            float(record.score.numerical_uncertainty),
-            0 if record.candidate.refit.global_optimum_certified else 1,
-            0 if record.family == "raw_fusion" else 1,
-            str(record.candidate.partition.source),
-            (
-                float(record.candidate.raw_fit.lambda_value)
-                if isinstance(record.candidate, RawFusionCandidate)
-                else float("inf")
-            ),
-            int(record.candidate_id),
+        candidate = record.candidate
+        raw = candidate if isinstance(candidate, RawFusionCandidate) else None
+        partition = candidate.partition
+        refit = candidate.refit
+        score = candidate.score
+        row = dict(record.row)
+        # Typed identity and inferential fields are authoritative. Diagnostic
+        # payloads may add columns but cannot silently change model selection.
+        row.update(
+            {
+                "_candidate_id": int(record.candidate_id),
+                "candidate_id": int(record.candidate_id),
+                "candidate_family": str(record.family),
+                "candidate_pool_source": (
+                    "raw_fused_lambda_path"
+                    if raw is not None
+                    else str(partition.source)
+                ),
+                "partition_source": str(partition.source),
+                "partition_signature": str(record.partition_signature),
+                "n_clusters": int(record.n_clusters),
+                "cluster_sizes": _cluster_sizes_text(partition.labels),
+                "partition_labels_0based": ",".join(
+                    str(int(value))
+                    for value in np.asarray(partition.labels, dtype=np.int64)
+                ),
+                "selection_score_name": str(score.name),
+                "selection_score": float(score.value),
+                "selection_score_numerical_uncertainty": float(
+                    score.numerical_uncertainty
+                ),
+                "selection_score_lower_bound": float(score.lower_bound),
+                "selection_score_upper_bound": float(score.upper_bound),
+                "selection_loglik": float(score.loglik),
+                "selection_df": int(score.degrees_of_freedom),
+                "selection_penalty": float(score.penalty),
+                "selection_n_eff": int(score.n_eff),
+                "selection_contract_id": str(score.selection_contract_id),
+                "bic_loglik_source": str(refit.loglik_source),
+                "bic_refit_finite_candidate_found": bool(
+                    refit.finite_candidate_found
+                ),
+                "refit_mode": str(refit.refit_mode),
+                "computation_profile": str(candidate.computation_profile),
+                "eligible_for_selection": bool(record.eligible_for_selection),
+                "ineligibility_reason": str(candidate.ineligibility_reason),
+                "lambda": (
+                    float(record.lambda_value)
+                    if record.lambda_value is not None
+                    else float("nan")
+                ),
+                "lambda_applicable": bool(record.lambda_value is not None),
+                "penalized_objective": (
+                    float(record.penalized_objective)
+                    if record.penalized_objective is not None
+                    else float("nan")
+                ),
+                "mm_consistency_violations": int(
+                    record.mm_consistency_violations
+                ),
+                "partition_certified": bool(
+                    raw is not None and partition.certified
+                ),
+                "partition_certification_applicable": bool(raw is not None),
+                "raw_objective_certified": bool(
+                    raw is not None and raw.raw_objective_certified
+                ),
+            }
         )
-        if incumbent is None:
-            best[record.partition_signature] = record
-            continue
-        incumbent_key = (
-            float(incumbent.score.value),
-            float(incumbent.score.numerical_uncertainty),
-            0 if incumbent.candidate.refit.global_optimum_certified else 1,
-            0 if incumbent.family == "raw_fusion" else 1,
-            str(incumbent.candidate.partition.source),
-            (
-                float(incumbent.candidate.raw_fit.lambda_value)
-                if isinstance(incumbent.candidate, RawFusionCandidate)
-                else float("inf")
-            ),
-            int(incumbent.candidate_id),
+        row.update(
+            {
+                f"selection_assignment_{name}": getattr(score, f"assignment_{name}")
+                for name in (
+                    "log_evidence",
+                    "code_weight",
+                    "penalty",
+                    "dirichlet_alpha",
+                    "model_id",
+                    "symmetry_mode",
+                    "arithmetic_uncertainty",
+                )
+            }
         )
-        if candidate_key < incumbent_key:
-            best[record.partition_signature] = record
-    return {int(record.candidate_id) for record in best.values()}
+        row.update(
+            {
+                f"refit_{name}": getattr(refit, name)
+                for name in (
+                    "global_optimum_certified",
+                    "global_lower_bound",
+                    "global_optimality_gap",
+                    "global_certificate_method",
+                    "global_certificate_intervals",
+                    "loglik",
+                    "fit_loss",
+                    "active_df",
+                )
+            }
+        )
+        row.update(
+            {
+                name: getattr(refit, name)
+                for name in (
+                    "refit_numerically_resolved",
+                    "refit_coordinate_count",
+                    "refit_finite_coordinate_count",
+                    "refit_total_grid_points",
+                    "refit_max_grid_spacing",
+                    "refit_total_candidate_basins",
+                    "refit_total_refined_candidates",
+                    "refit_min_best_second_loss_gap",
+                )
+            }
+        )
+        if raw is not None:
+            fit = raw.raw_fit
+            provenance = getattr(fit, "exactness_provenance", None)
+            row.update(
+                {
+                    "partition_tol": float(partition.tolerance),
+                    "partition_maximal": bool(partition.maximal),
+                    "partition_cross_close_edge_found": bool(
+                        partition.cross_close_edge_found
+                    ),
+                    "partition_certificate_graph_hash_matches": bool(
+                        partition.certificate_graph_hash_matches
+                    ),
+                    "partition_certification_failure_reason": str(
+                        partition.certification_failure_reason
+                    ),
+                    "partition_max_diameter": float(partition.max_diameter),
+                    "partition_diameter_exact": bool(partition.diameter_exact),
+                    "raw_kkt_eligible": bool(fit.selection_eligible),
+                    "estimator_role": str(fit.estimator_role),
+                    "objective_faithful": bool(fit.objective_faithful),
+                    "objective_spec_hash": str(fit.objective_spec_hash),
+                    "original_graph_hash": str(fit.original_graph_hash),
+                    "certificate_problem_hash": str(
+                        fit.certificate_problem_hash
+                    ),
+                    "certificate_scope": str(fit.certificate_scope),
+                    "certificate_gradient_scope": str(
+                        fit.certificate_gradient_scope
+                    ),
+                    "full_kkt_certified": bool(fit.full_kkt_certified),
+                    "full_kkt_certificate_status": str(
+                        fit.full_kkt_certificate_status
+                    ),
+                    "full_kkt_tolerance": float(fit.full_kkt_tolerance),
+                    "fixed_objective_kkt_residual": float(
+                        fit.fixed_objective_kkt_residual
+                    ),
+                    "exactness_provenance_version": int(
+                        fit.exactness_provenance_version
+                    ),
+                    "certificate_residual_method": str(
+                        getattr(provenance, "residual_method", "unknown")
+                    ),
+                    "certificate_audit_dtype": str(
+                        fit.certificate_audit_dtype
+                    ),
+                }
+            )
+        else:
+            row.update(
+                {
+                    "requested_K": int(partition.requested_k),
+                    "parent_raw_candidate_id": (
+                        float("nan")
+                        if partition.parent_raw_candidate_id is None
+                        else int(partition.parent_raw_candidate_id)
+                    ),
+                    "parent_raw_lambda": (
+                        float("nan")
+                        if partition.parent_raw_lambda is None
+                        else float(partition.parent_raw_lambda)
+                    ),
+                    "parent_raw_phi_hash": str(partition.parent_raw_phi_hash),
+                    "generation_contract_id": str(
+                        partition.generation_contract_id
+                    ),
+                    "cem_iterations": int(partition.cem_iterations),
+                    "component_death_count": int(
+                        partition.component_death_count
+                    ),
+                    "refinement_score_before": float(
+                        partition.refinement_score_before
+                    ),
+                    "refinement_score_after": float(
+                        partition.refinement_score_after
+                    ),
+                    "deterministic_partition_generation": bool(
+                        partition.deterministic_generation
+                    ),
+                }
+            )
+        row.setdefault("selection_step", int(record.candidate_id))
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["lambda", "selection_step"], kind="stable")
+        .reset_index(drop=True)
+    )
 
 
 def _select_raw_reference(
     records: list[CandidateRecord],
     *,
     tumor_id: str,
-    search_df: pd.DataFrame,
+    search_df: pd.DataFrame | None = None,
     adaptive_search_stop_reason: str,
 ) -> CandidateRecord:
     eligible = [
         record
         for record in records
         if isinstance(record.candidate, RawFusionCandidate)
-        and record.candidate.eligible_for_selection
-        and record.candidate.raw_objective_certified
-        and record.candidate.partition.certified
+        and raw_candidate_has_exact_fusion_certificate(record.candidate)
     ]
     if not eligible:
+        if search_df is None:
+            search_df = candidates_to_dataframe(records)
         raise NoCertifiedRawReferenceError(
             tumor_id=tumor_id,
             search_df=search_df,
@@ -1077,7 +1244,6 @@ def _select_raw_reference(
 
 def _assemble_selection_result(
     *,
-    search_df,
     data,
     normalized_score,
     result_entries,
@@ -1087,188 +1253,51 @@ def _assemble_selection_result(
     strict_positive_exact_fusion: bool = False,
     ward_candidate_pool_complete: bool = False,
 ) -> BICSelectionResult:
-    search_df = _annotate_bic_diagnostics(search_df)
-    representative_ids = _candidate_record_representatives(result_entries)
-    search_df["signature_selection_representative"] = (
-        search_df["_candidate_id"].astype(int).isin(representative_ids)
-    )
-    num_candidates = int(search_df.shape[0])
-    candidate_selection_eligible_mask = (
-        _positive_exact_fusion_selection_mask(search_df)
-        if strict_positive_exact_fusion
-        else _bic_selection_eligible_mask(search_df)
-    )
-    candidate_selection_eligible_mask &= search_df[
-        "signature_selection_representative"
-    ].to_numpy(dtype=bool)
-    if strict_positive_exact_fusion:
-        search_df["bic_selection_eligible"] = candidate_selection_eligible_mask
-    num_selection_eligible_candidates = int(np.sum(candidate_selection_eligible_mask))
-    if num_selection_eligible_candidates == 0:
+    del normalized_score  # Every typed record already carries its active score.
+    try:
+        decision = select_candidate_records(
+            result_entries,
+            strict_positive_exact_fusion=bool(strict_positive_exact_fusion),
+        )
+    except ValueError as exc:
+        search_df = _annotate_bic_diagnostics(
+            candidates_to_dataframe(result_entries)
+        )
+        representative_ids = candidate_representative_ids(
+            result_entries,
+            strict_positive_exact_fusion=bool(strict_positive_exact_fusion),
+        )
+        search_df["signature_selection_representative"] = search_df[
+            "_candidate_id"
+        ].astype(int).isin(representative_ids)
+        if strict_positive_exact_fusion:
+            search_df["bic_selection_eligible"] = False
         raise NoEligibleModelSelectionCandidatesError(
             tumor_id=data.tumor_id,
             search_df=search_df,
-        )
-    selection_df = search_df.loc[candidate_selection_eligible_mask].copy()
-    score_column = _adaptive_score_column(normalized_score)
-    best_row, _, selection_mask = _select_best_partition_leftmost(
-        selection_df,
-        score_column=score_column,
-    )
-    selected_lambda_applicable = _row_lambda_applicable(best_row)
-    model_key = "partition_signature"
-    selected_signature_mask = (
-        selection_df[model_key]
-        .astype(str)
-        .eq(str(best_row[model_key]))
-        .to_numpy(dtype=bool)
-    )
-    selection_lambda_min, selection_lambda_max, _ = _lambda_range_for_optimal_rows(
-        selection_df,
-        selected_signature_mask,
-    )
-    selection_lambda_values = selection_df["lambda"].to_numpy(dtype=float)
+        ) from exc
 
-    all_scores = (
-        search_df[score_column].to_numpy(dtype=float)
-        if score_column in search_df.columns
-        else np.full(search_df.shape[0], np.nan, dtype=float)
-    )
-    all_objectives = (
-        search_df["penalized_objective"].to_numpy(dtype=float)
-        if "penalized_objective" in search_df.columns
-        else np.full(search_df.shape[0], np.nan, dtype=float)
-    )
-    all_mm_violations = (
-        search_df["mm_consistency_violations"].to_numpy(dtype=float)
-        if "mm_consistency_violations" in search_df.columns
-        else np.zeros(search_df.shape[0], dtype=float)
-    )
-    direct_rows = (
-        search_df.get(
-            "candidate_family",
-            pd.Series("raw_fusion", index=search_df.index),
-        )
-        .astype(str)
-        .eq("direct_partition")
-        .to_numpy(dtype=bool)
-    )
-    provisional_mask = (
-        np.isfinite(all_scores)
-        & (np.isfinite(all_objectives) | direct_rows)
-        & (all_mm_violations <= 0.0)
-    )
-    num_candidates_certified = int(np.sum(candidate_selection_eligible_mask))
-
-    selected_kkt_residual = (
-        float(best_row["fixed_objective_kkt_residual"])
-        if "fixed_objective_kkt_residual" in best_row
-        and np.isfinite(float(best_row["fixed_objective_kkt_residual"]))
-        else None
-    )
-    selected_provisional_score = float(best_row.get(score_column, np.nan))
-    optimizer_limited_ids: set[int] = set()
-
-    if "_candidate_id" in search_df.columns and np.isfinite(selected_provisional_score):
-        for _, candidate_row in search_df.loc[
-            provisional_mask & ~candidate_selection_eligible_mask
-        ].iterrows():
-            candidate_score = float(candidate_row.get(score_column, np.nan))
-            if _score_strictly_better(
-                candidate_score,
-                selected_provisional_score,
-            ):
-                optimizer_limited_ids.add(int(candidate_row["_candidate_id"]))
-
-    lambda_applicable_mask = _lambda_applicable_mask(selection_df)
-    selection_boundary_lambda_values = selection_lambda_values[lambda_applicable_mask]
-    selection_lower_hit, selection_upper_hit = _lambda_boundary_flags(
-        selection_boundary_lambda_values,
-        best_lambda_min=selection_lambda_min,
-        best_lambda_max=selection_lambda_max,
-    )
-    selection_boundary_unresolved = _lambda_boundary_unresolved(
-        evaluated_lambdas=selection_boundary_lambda_values,
-        lower_hit=selection_lower_hit,
-        upper_hit=selection_upper_hit,
-    )
-    selection_optimal_ids = set(
-        selection_df.loc[selection_mask, "_candidate_id"].astype(int).tolist()
-    )
-    final_adaptive_search_stop_reason = adaptive_search_stop_reason
-    adaptive_search_global_optimum_certified = _adaptive_stop_certifies_global_optimum(
-        final_adaptive_search_stop_reason
-    )
-    selection_optimum_resolved = bool(
-        adaptive_search_global_optimum_certified and not selection_boundary_unresolved
-    )
-    eligible_mask = candidate_selection_eligible_mask
-    search_df["eligible_for_selection"] = eligible_mask
-    lambda_values_evaluated = ",".join(
-        f"{float(value):.12g}"
-        for value in _sorted_unique_lambdas(search_df["lambda"].to_numpy(dtype=float))
-    )
-    search_df["lambda_values_evaluated"] = lambda_values_evaluated
-    if "optimizer_limited_candidate" not in search_df.columns:
-        search_df["optimizer_limited_candidate"] = False
-    if optimizer_limited_ids and "_candidate_id" in search_df.columns:
-        search_df["optimizer_limited_candidate"] = (
-            search_df["_candidate_id"].astype(int).isin(optimizer_limited_ids)
-        )
-    search_df["is_selection_optimal"] = (
-        search_df["_candidate_id"].astype(int).isin(selection_optimal_ids)
-    )
-    selected_candidate_id = int(best_row["_candidate_id"])
-    search_df["is_selected_best_row"] = (
-        search_df["_candidate_id"].astype(int) == selected_candidate_id
-    )
-    search_df["adaptive_search_stop_reason"] = str(final_adaptive_search_stop_reason)
-    search_df["adaptive_search_global_optimum_certified"] = bool(
-        adaptive_search_global_optimum_certified
-    )
-    search_df["selection_optimum_resolved"] = bool(selection_optimum_resolved)
-    selected_lambda_left, selected_lambda_right, selected_lambda_log10_width = (
-        _selected_lambda_signature_interval(
-            search_df,
-            selected_candidate_id=selected_candidate_id,
-            normalized_score=normalized_score,
-        )
-    )
-    selected_lambda_representative_value = (
-        float(best_row["lambda"]) if selected_lambda_applicable else np.nan
-    )
-    search_df["selected_lambda_representative"] = selected_lambda_representative_value
-    search_df["selected_lambda_left"] = (
-        np.nan if selected_lambda_left is None else float(selected_lambda_left)
-    )
-    search_df["selected_lambda_right"] = (
-        np.nan if selected_lambda_right is None else float(selected_lambda_right)
-    )
-    search_df["selected_lambda_interval_log10_width"] = (
-        np.nan
-        if selected_lambda_log10_width is None
-        else float(selected_lambda_log10_width)
-    )
-    selection_elapsed_seconds = float(perf_counter() - selection_start_time)
-    search_df["selection_elapsed_seconds"] = float(selection_elapsed_seconds)
-
-    records_by_id = {int(record.candidate_id): record for record in result_entries}
-    selected_record = records_by_id[int(best_row["_candidate_id"])]
+    selected_record = decision.selected
     selected_candidate = selected_record.candidate
     validate_candidate_identity(selected_candidate)
     if not selected_candidate.eligible_for_selection:
         raise AssertionError("Ineligible partition candidate reached selection.")
+
+    # The raw estimator reference is chosen independently from the selected
+    # partition and never inherited by a direct candidate.
+    base_search_df = candidates_to_dataframe(result_entries)
     raw_reference_record = _select_raw_reference(
         result_entries,
         tumor_id=str(data.tumor_id),
-        search_df=search_df,
-        adaptive_search_stop_reason=str(final_adaptive_search_stop_reason),
+        search_df=base_search_df,
+        adaptive_search_stop_reason=str(adaptive_search_stop_reason),
     )
     raw_reference = raw_reference_record.candidate
     if not isinstance(raw_reference, RawFusionCandidate):  # pragma: no cover
         raise AssertionError("Raw-reference selection returned a direct partition.")
     validate_candidate_identity(raw_reference)
     selected_is_raw = isinstance(selected_candidate, RawFusionCandidate)
+    records_by_id = {int(record.candidate_id): record for record in result_entries}
     partition_parent_raw: RawFusionCandidate | None = None
     if not selected_is_raw:
         parent_id = selected_candidate.partition.parent_raw_candidate_id
@@ -1287,6 +1316,87 @@ def _assemble_selection_result(
                 raise AssertionError(
                     "Direct partition parent-Phi provenance is inconsistent."
                 )
+
+    final_adaptive_search_stop_reason = str(adaptive_search_stop_reason)
+    adaptive_search_global_optimum_certified = _adaptive_stop_certifies_global_optimum(
+        final_adaptive_search_stop_reason
+    )
+    selection_optimum_resolved = bool(
+        adaptive_search_global_optimum_certified
+        and not decision.selection_boundary_unresolved
+    )
+    selected_lambda = selected_record.lambda_value
+    selected_lambda_log10_width = (
+        float(
+            np.log10(decision.selected_lambda_right)
+            - np.log10(decision.selected_lambda_left)
+        )
+        if decision.selected_lambda_left is not None
+        and decision.selected_lambda_right is not None
+        and decision.selected_lambda_left > 0.0
+        and decision.selected_lambda_right > 0.0
+        else (None if selected_lambda is None else 0.0)
+    )
+    selected_kkt_value = (
+        float(selected_candidate.raw_fit.fixed_objective_kkt_residual)
+        if selected_is_raw
+        else float("nan")
+    )
+    selected_kkt_residual = (
+        selected_kkt_value if np.isfinite(selected_kkt_value) else None
+    )
+
+    # Reporting starts only after the typed selection decision is complete.
+    search_df = _annotate_bic_diagnostics(base_search_df)
+    ids = search_df["_candidate_id"].astype(int)
+    search_df["signature_selection_representative"] = ids.isin(
+        decision.representative_ids
+    )
+    if strict_positive_exact_fusion:
+        search_df["bic_selection_eligible"] = ids.isin(decision.eligible_ids)
+    search_df["eligible_for_selection"] = ids.isin(decision.eligible_ids)
+    search_df["lambda_values_evaluated"] = ",".join(
+        f"{float(value):.12g}"
+        for value in _sorted_unique_lambdas(
+            [
+                float(record.lambda_value)
+                for record in result_entries
+                if record.lambda_value is not None
+            ]
+        )
+    )
+    search_df["optimizer_limited_candidate"] = ids.isin(
+        decision.optimizer_limited_ids
+    )
+    search_df["is_selection_optimal"] = ids.isin(decision.optimal_ids)
+    search_df["is_selected_best_row"] = ids.eq(int(selected_record.candidate_id))
+    search_df["adaptive_search_stop_reason"] = final_adaptive_search_stop_reason
+    search_df["adaptive_search_global_optimum_certified"] = bool(
+        adaptive_search_global_optimum_certified
+    )
+    search_df["selection_optimum_resolved"] = bool(selection_optimum_resolved)
+    search_df["selected_lambda_representative"] = (
+        np.nan if selected_lambda is None else float(selected_lambda)
+    )
+    search_df["selected_lambda_left"] = (
+        np.nan
+        if decision.selected_lambda_left is None
+        else float(decision.selected_lambda_left)
+    )
+    search_df["selected_lambda_right"] = (
+        np.nan
+        if decision.selected_lambda_right is None
+        else float(decision.selected_lambda_right)
+    )
+    search_df["selected_lambda_interval_log10_width"] = (
+        np.nan
+        if selected_lambda_log10_width is None
+        else float(selected_lambda_log10_width)
+    )
+    search_df["selection_elapsed_seconds"] = float(
+        perf_counter() - selection_start_time
+    )
+
     selected_model = SelectedModel(
         raw_reference=raw_reference,
         partition_candidate=selected_candidate,
@@ -1294,12 +1404,12 @@ def _assemble_selection_result(
         selected_candidate_family=(
             "raw_fusion" if selected_is_raw else "direct_partition"
         ),
-        selected_lambda=(float(best_row["lambda"]) if selected_is_raw else None),
+        selected_lambda=(float(selected_lambda) if selected_is_raw else None),
         selected_partition_left_lambda=(
-            selected_lambda_left if selected_is_raw else None
+            decision.selected_lambda_left if selected_is_raw else None
         ),
         selected_partition_right_lambda=(
-            selected_lambda_right if selected_is_raw else None
+            decision.selected_lambda_right if selected_is_raw else None
         ),
         partition_parent_raw=partition_parent_raw,
     )
@@ -1308,16 +1418,16 @@ def _assemble_selection_result(
         selected_model=selected_model,
         search_df=search_df,
         selection_method=selection_method,
-        selection_hits_lower_boundary=selection_lower_hit,
-        selection_hits_upper_boundary=selection_upper_hit,
-        selection_boundary_unresolved=selection_boundary_unresolved,
+        selection_hits_lower_boundary=decision.selection_hits_lower_boundary,
+        selection_hits_upper_boundary=decision.selection_hits_upper_boundary,
+        selection_boundary_unresolved=decision.selection_boundary_unresolved,
         selection_optimum_resolved=bool(selection_optimum_resolved),
         adaptive_search_stop_reason=str(final_adaptive_search_stop_reason),
-        num_candidates=num_candidates,
-        selected_lambda_representative=None
-        if not selected_lambda_applicable
-        else float(best_row["lambda"]),
-        num_candidates_certified=num_candidates_certified,
+        num_candidates=int(len(result_entries)),
+        selected_lambda_representative=(
+            None if selected_lambda is None else float(selected_lambda)
+        ),
+        num_candidates_certified=int(len(decision.eligible_ids)),
         selected_kkt_residual=selected_kkt_residual,
         ward_candidate_pool_complete=bool(ward_candidate_pool_complete),
         raw_lambda_path_resolved=bool(adaptive_search_global_optimum_certified),
@@ -1536,7 +1646,7 @@ def _partition_guided_admm_selection(
     fit_by_lambda: dict[float, FitResult] = {}
     partition_k_by_lambda: dict[float, int] = {}
     attempts_by_lambda: dict[float, list[FitResult]] = {}
-    bic_refit_cache: dict[object, _CachedPartitionRefit] = {}
+    bic_refit_cache: dict[object, PartitionRefitCacheEntry] = {}
     static_metadata = _candidate_static_metadata(
         data, effective_graph, pilot_phi=graph_pilot_phi
     )
@@ -1907,7 +2017,7 @@ def _partition_guided_admm_selection(
 
         selected_raw_fit, selected_start, raw_start_diagnostics = solve_raw_path()
         raw_fit_elapsed_seconds = float(perf_counter() - raw_fit_start)
-        fit, row, artifact = _evaluate_candidate(
+        fit, row, artifact = evaluate_raw_fusion_candidate(
             data=data,
             fit_options=effective_fit_options,
             candidate_fit_options=candidate_fit_options,
@@ -2077,7 +2187,7 @@ def _partition_guided_admm_selection(
             partition_k_by_lambda[lambda_key] = int(row["n_clusters"])
 
         raw_exact_certified = bool(
-            _exact_fusion_certificate_mask(pd.DataFrame([row]))[0]
+            raw_candidate_has_exact_fusion_certificate(artifact)
             and bool(effective_tensor_graph.is_complete)
         )
         selection_score_available = bool(artifact.eligible_for_selection)
@@ -2123,7 +2233,9 @@ def _partition_guided_admm_selection(
                     record
                     for record in result_entries
                     if isinstance(record.candidate, RawFusionCandidate)
-                    and record.candidate.eligible_for_selection
+                    and raw_candidate_has_exact_fusion_certificate(
+                        record.candidate
+                    )
                 ),
                 key=lambda record: (
                     float(record.score.value),
@@ -2223,14 +2335,8 @@ def _partition_guided_admm_selection(
         raise RuntimeError(
             f"No guided ADMM candidates were evaluated for tumor {data.tumor_id}."
         )
-    search_df = (
-        pd.DataFrame([record.row for record in result_entries])
-        .sort_values(["lambda", "selection_step"])
-        .reset_index(drop=True)
-    )
     stop_reason = str(controller.stop_reason or "online_lambda_no_terminal_reason")
     return _assemble_selection_result(
-        search_df=search_df,
         data=data,
         normalized_score=normalized_score,
         result_entries=result_entries,

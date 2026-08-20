@@ -210,13 +210,25 @@ class DirectPartitionCandidate:
 
 
 SelectablePartitionCandidate = Union[RawFusionCandidate, DirectPartitionCandidate]
+CandidateFamily = Literal["raw_fusion", "direct_partition"]
 
 
 @dataclass(frozen=True)
 class CandidateRecord:
+    """Typed selection unit with an inert reporting payload.
+
+    ``row`` is retained for the in-memory search-table compatibility surface.
+    Numerical admission and model choice must use the typed properties below,
+    never values recovered from that reporting dictionary.
+    """
+
     candidate_id: int
     candidate: SelectablePartitionCandidate
     row: dict[str, object]
+
+    def __post_init__(self) -> None:
+        if int(self.candidate_id) < 0:
+            raise ValueError("candidate_id must be nonnegative.")
 
     @property
     def score(self) -> SelectionScore:
@@ -227,12 +239,56 @@ class CandidateRecord:
         return self.candidate.partition.signature
 
     @property
-    def family(self) -> str:
+    def family(self) -> CandidateFamily:
         return (
             "raw_fusion"
             if isinstance(self.candidate, RawFusionCandidate)
             else "direct_partition"
         )
+
+    @property
+    def eligible_for_selection(self) -> bool:
+        return bool(self.candidate.eligible_for_selection)
+
+    @property
+    def lambda_value(self) -> float | None:
+        if isinstance(self.candidate, RawFusionCandidate):
+            return float(self.candidate.raw_fit.lambda_value)
+        return None
+
+    @property
+    def n_clusters(self) -> int:
+        return int(self.candidate.partition.n_clusters)
+
+    @property
+    def penalized_objective(self) -> float | None:
+        if isinstance(self.candidate, RawFusionCandidate):
+            return float(
+                getattr(self.candidate.raw_fit, "penalized_objective", float("nan"))
+            )
+        return None
+
+    @property
+    def mm_consistency_violations(self) -> int:
+        if isinstance(self.candidate, RawFusionCandidate):
+            return int(getattr(self.candidate.raw_fit, "mm_consistency_violations", 0))
+        return 0
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateSelectionDecision:
+    """Complete typed outcome of partition-first candidate selection."""
+
+    selected: CandidateRecord
+    representative_ids: frozenset[int]
+    eligible_ids: frozenset[int]
+    optimal_ids: frozenset[int]
+    optimizer_limited_ids: frozenset[int]
+    selected_lambda_left: float | None
+    selected_lambda_right: float | None
+    selection_hits_lower_boundary: bool
+    selection_hits_upper_boundary: bool
+    selection_boundary_unresolved: bool
 
 
 @dataclass(frozen=True)

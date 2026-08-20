@@ -191,48 +191,44 @@ def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None
         raise TypeError(f"Unsupported candidate type: {type(candidate)!r}")
 
 
-def _ineligibility_reason(
+def _candidate_ineligibility_reason(
     *,
-    fit: FitResult,
-    partition: FusionPartition,
-    refit_finite: bool,
-    refit_numerically_resolved: bool,
-    score_finite: bool,
-    require_global_refit: bool = True,
-) -> str:
-    if float(fit.lambda_value) <= 0.0:
-        return "nonpositive_lambda"
-    if str(fit.estimator_role) != "raw_fused_lambda_path":
-        return "not_raw_fused_lambda_path"
-    if not bool(fit.objective_faithful):
-        return "raw_objective_not_faithful"
-    if not bool(fit.full_kkt_certified) or not bool(fit.selection_eligible):
-        return "raw_objective_not_kkt_certified"
-    if not partition.certified:
-        return str(partition.certification_failure_reason)
-    if not refit_finite:
-        return "fixed_partition_refit_nonfinite"
-    if require_global_refit and not refit_numerically_resolved:
-        return "fixed_partition_refit_numerically_unresolved"
-    if not score_finite:
-        return "fixed_partition_score_nonfinite"
-    return "none"
-
-
-def _direct_partition_ineligibility_reason(
-    *,
-    partition: DirectPartition,
+    partition: FusionPartition | DirectPartition,
     refit: PartitionRefitSummary,
     score: SelectionScore,
-    require_global_refit: bool,
+    raw_fit: FitResult | None = None,
+    require_global_refit: bool = True,
 ) -> str:
-    if partition.n_clusters < 1:
-        return "empty_partition"
-    if not partition.deterministic_generation:
-        return "nondeterministic_partition_generation"
+    if isinstance(partition, FusionPartition):
+        if raw_fit is None:
+            raise ValueError("Raw-fusion eligibility requires its raw fit.")
+        if float(raw_fit.lambda_value) <= 0.0:
+            return "nonpositive_lambda"
+        if str(raw_fit.estimator_role) != "raw_fused_lambda_path":
+            return "not_raw_fused_lambda_path"
+        if not bool(raw_fit.objective_faithful):
+            return "raw_objective_not_faithful"
+        if not bool(raw_fit.full_kkt_certified) or not bool(
+            raw_fit.selection_eligible
+        ):
+            return "raw_objective_not_kkt_certified"
+        if not partition.certified:
+            return str(partition.certification_failure_reason)
+    else:
+        if raw_fit is not None:
+            raise ValueError("Direct-partition eligibility cannot inherit a raw fit.")
+        if partition.n_clusters < 1:
+            return "empty_partition"
+        if not partition.deterministic_generation:
+            return "nondeterministic_partition_generation"
     if not refit.finite_candidate_found:
         return "fixed_partition_refit_nonfinite"
-    if require_global_refit and not refit.global_optimum_certified:
+    resolved = (
+        refit.refit_numerically_resolved
+        if isinstance(partition, FusionPartition)
+        else refit.global_optimum_certified
+    )
+    if require_global_refit and not resolved:
         return "fixed_partition_refit_numerically_unresolved"
     if not np.isfinite(score.value):
         return "fixed_partition_score_nonfinite"
@@ -240,11 +236,20 @@ def _direct_partition_ineligibility_reason(
 
 
 @dataclass(frozen=True)
-class _CachedPartitionRefit:
+class PartitionRefitCacheEntry:
     result: PartitionRefitResult
     loglik_refinement_delta: float
     max_center_refinement_delta: float
     numerically_resolved: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionEvaluation:
+    """Source-neutral fixed-label refit and score for one partition."""
+
+    refit: PartitionRefitSummary
+    score: SelectionScore
+    cache_hit: bool
 
 
 def _likelihood_model_id(data: TumorData) -> str:
@@ -279,8 +284,8 @@ def _fixed_labels_refit(
     labels: np.ndarray,
     partition_signature: str,
     selection_options: FitOptions,
-    cache: dict[object, _CachedPartitionRefit] | None,
-) -> tuple[_CachedPartitionRefit, bool]:
+    cache: dict[object, PartitionRefitCacheEntry] | None,
+) -> tuple[PartitionRefitCacheEntry, bool]:
     profile = get_computation_profile(selection_options.computation_profile)
     refit_spec_key = _selection_refit_cache_key(
         data=data,
@@ -326,7 +331,7 @@ def _fixed_labels_refit(
             else np.isfinite(float(refined.loglik))
         )
     )
-    cached = _CachedPartitionRefit(
+    cached = PartitionRefitCacheEntry(
         result=refined,
         loglik_refinement_delta=float(loglik_delta),
         max_center_refinement_delta=float(center_delta),
@@ -337,30 +342,12 @@ def _fixed_labels_refit(
     return cached, False
 
 
-def _fixed_partition_refit(
-    *,
-    data: TumorData,
-    partition: FusionPartition,
-    selection_options: FitOptions,
-    cache: dict[object, _CachedPartitionRefit] | None,
-) -> tuple[_CachedPartitionRefit, bool]:
-    """Compatibility wrapper around the source-neutral fixed-label refit."""
-
-    return _fixed_labels_refit(
-        data=data,
-        labels=partition.labels,
-        partition_signature=partition.signature,
-        selection_options=selection_options,
-        cache=cache,
-    )
-
-
 def _build_refit_summary(
     refit: PartitionRefitResult,
     *,
     partition_signature: str,
     nominal_df: int,
-    resolution: _CachedPartitionRefit,
+    resolution: PartitionRefitCacheEntry,
 ) -> PartitionRefitSummary:
     return PartitionRefitSummary(
         labels=np.asarray(refit.labels, dtype=np.int64).copy(),
@@ -522,7 +509,49 @@ def _score_fixed_labels(
     return score
 
 
-def _evaluate_candidate(
+def evaluate_partition(
+    *,
+    data: TumorData,
+    partition: FusionPartition | DirectPartition,
+    selection_options: FitOptions,
+    refit_cache: dict[object, PartitionRefitCacheEntry] | None,
+    selection_score: str | None = None,
+) -> PartitionEvaluation:
+    """Evaluate raw and direct label sets through one refit/score path."""
+
+    cached_refit, cache_hit = _fixed_labels_refit(
+        data=data,
+        labels=partition.labels,
+        partition_signature=partition.signature,
+        selection_options=selection_options,
+        cache=refit_cache,
+    )
+    refit_result = cached_refit.result
+    score = _score_fixed_labels(
+        data=data,
+        labels=partition.labels,
+        partition_signature=partition.signature,
+        refit_result=refit_result,
+        selection_options=selection_options,
+        selection_score=(
+            selection_options.selection_score
+            if selection_score is None
+            else selection_score
+        ),
+    )
+    return PartitionEvaluation(
+        refit=_build_refit_summary(
+            refit_result,
+            partition_signature=partition.signature,
+            nominal_df=int(score.degrees_of_freedom),
+            resolution=cached_refit,
+        ),
+        score=score,
+        cache_hit=bool(cache_hit),
+    )
+
+
+def evaluate_raw_fusion_candidate(
     *,
     data: TumorData,
     fit_options: FitOptions,
@@ -543,7 +572,7 @@ def _evaluate_candidate(
     lambda_value: float,
     selection_score: str,
     static_metadata: CandidateStaticMetadata,
-    bic_refit_cache: dict[object, _CachedPartitionRefit] | None = None,
+    bic_refit_cache: dict[object, PartitionRefitCacheEntry] | None = None,
     precomputed_fit: FitResult | None = None,
 ) -> tuple[
     FitResult,
@@ -600,31 +629,18 @@ def _evaluate_candidate(
     )
 
     refit_start_time = perf_counter()
-    cached_refit, cache_hit = _fixed_partition_refit(
+    evaluation = evaluate_partition(
         data=data,
         partition=partition,
         selection_options=selection_options,
-        cache=bic_refit_cache,
-    )
-    refit_result = cached_refit.result
-    refit_elapsed_seconds = (
-        0.0 if cache_hit else float(perf_counter() - refit_start_time)
-    )
-
-    score = _score_fixed_labels(
-        data=data,
-        labels=partition.labels,
-        partition_signature=partition.signature,
-        refit_result=refit_result,
-        selection_options=selection_options,
+        refit_cache=bic_refit_cache,
         selection_score=canonical_score_name,
     )
-    refit = _build_refit_summary(
-        refit_result,
-        partition_signature=partition.signature,
-        nominal_df=int(score.degrees_of_freedom),
-        resolution=cached_refit,
+    refit_elapsed_seconds = (
+        0.0 if evaluation.cache_hit else float(perf_counter() - refit_start_time)
     )
+    refit = evaluation.refit
+    score = evaluation.score
     raw_objective_certified = bool(
         float(fit.lambda_value) > 0.0
         and str(fit.estimator_role) == "raw_fused_lambda_path"
@@ -632,12 +648,11 @@ def _evaluate_candidate(
         and bool(fit.full_kkt_certified)
         and bool(fit.selection_eligible)
     )
-    reason = _ineligibility_reason(
-        fit=fit,
+    reason = _candidate_ineligibility_reason(
         partition=partition,
-        refit_finite=bool(refit.finite_candidate_found),
-        refit_numerically_resolved=bool(refit.refit_numerically_resolved),
-        score_finite=bool(np.isfinite(score.value)),
+        refit=refit,
+        score=score,
+        raw_fit=fit,
         require_global_refit=bool(computation_profile.is_strict),
     )
     candidate = RawFusionCandidate(
@@ -693,7 +708,7 @@ def _evaluate_candidate(
             data=data,
             refit=refit,
             score=score,
-            cache_hit=cache_hit,
+            cache_hit=evaluation.cache_hit,
             raw_details=True,
         ),
         "partition_signature": str(partition.signature),
@@ -865,7 +880,7 @@ def evaluate_direct_partition_candidate(
     parent_raw_candidate_id: int | None,
     parent_raw_lambda: float | None,
     generation_contract_id: str,
-    refit_cache: dict[object, _CachedPartitionRefit] | None,
+    refit_cache: dict[object, PartitionRefitCacheEntry] | None,
     parent_raw_phi_hash: str = "",
 ) -> tuple[dict[str, object], DirectPartitionCandidate]:
     """Evaluate one deterministic non-fusion partition under the common score."""
@@ -905,33 +920,20 @@ def evaluate_direct_partition_candidate(
             proposal.diagnostics.get("deterministic_generation", 1.0)
         ),
     )
-    cached_refit, cache_hit = _fixed_labels_refit(
+    evaluation = evaluate_partition(
         data=data,
-        labels=labels,
-        partition_signature=signature,
+        partition=partition,
         selection_options=selection_options,
-        cache=refit_cache,
+        refit_cache=refit_cache,
     )
-    refit_result = cached_refit.result
-    score = _score_fixed_labels(
-        data=data,
-        labels=labels,
-        partition_signature=signature,
-        refit_result=refit_result,
-        selection_options=selection_options,
-        selection_score=selection_options.selection_score,
-    )
-    refit = _build_refit_summary(
-        refit_result,
-        partition_signature=signature,
-        nominal_df=int(score.degrees_of_freedom),
-        resolution=cached_refit,
-    )
+    refit = evaluation.refit
+    score = evaluation.score
     profile = get_computation_profile(selection_options.computation_profile)
-    reason = _direct_partition_ineligibility_reason(
+    reason = _candidate_ineligibility_reason(
         partition=partition,
         refit=refit,
         score=score,
+        raw_fit=None,
         require_global_refit=bool(profile.is_strict),
     )
     candidate = DirectPartitionCandidate(
@@ -992,7 +994,7 @@ def evaluate_direct_partition_candidate(
             data=data,
             refit=refit,
             score=score,
-            cache_hit=cache_hit,
+            cache_hit=evaluation.cache_hit,
             raw_details=False,
         ),
         "eligible_for_selection": bool(candidate.eligible_for_selection),
@@ -1018,11 +1020,13 @@ def evaluate_direct_partition_candidate(
 
 
 __all__ = [
-    "_evaluate_candidate",
     "_fixed_labels_refit",
-    "_fixed_partition_refit",
     "_selection_refit_cache_key",
     "_selection_score_diagnostics",
+    "PartitionEvaluation",
+    "PartitionRefitCacheEntry",
     "evaluate_direct_partition_candidate",
+    "evaluate_partition",
+    "evaluate_raw_fusion_candidate",
     "validate_candidate_identity",
 ]
