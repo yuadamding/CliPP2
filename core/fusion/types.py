@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Literal, Mapping, TypeAlias
+from typing import TYPE_CHECKING, Literal, Mapping, TypeAlias
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from ..objective import ObservedModel
 
 from .defaults import (
     DEFAULT_CERTIFICATE_MAX_ITER,
@@ -365,6 +368,10 @@ class TensorProblem:
     # Kept opaque here to avoid a types/backend import cycle.  The concrete
     # value is ``TorchPathLikelihoodSpec`` when an explicit path model is used.
     path_likelihood: object | None = None
+    # Immutable float64 source for rebuilding an audit-precision runtime view.
+    # Optional until SolverContext ownership migrates from the compatibility
+    # tensors; never synthesize it by promoting those tensors.
+    source_model: ObservedModel | None = None
 
 
 @dataclass(frozen=True, slots=True)
