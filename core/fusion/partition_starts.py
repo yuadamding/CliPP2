@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from ...io.data import TumorData
+from ..objective import ObservedModel, compile_observed_model, observed_terms_numpy
 from ..bic import (
     PARTITION_DIRICHLET_SCORE_WEIGHT,
     bic_degrees_of_freedom,
@@ -21,14 +22,12 @@ from .refit import (
     _canonical_labels,
     partition_constrained_observed_refit,
 )
-from .starts import _mutation_region_loss_grid_numpy
 from .torch_backend import (
     TorchTumorData,
     as_runtime_tensor,
     copy_torch_tumor_data,
     mutation_region_loss_grid_torch,
     mutation_region_terms_torch,
-    path_mutation_region_terms_numpy,
     resolve_runtime,
     to_torch_tumor_data,
 )
@@ -163,52 +162,6 @@ def _as_torch(
     return as_runtime_tensor(array, runtime)
 
 
-def _data_arrays(data: TumorData) -> dict[str, np.ndarray]:
-    return {
-        "alt": np.asarray(data.alt_counts, dtype=np.float64),
-        "total": np.asarray(data.total_counts, dtype=np.float64),
-        "b_minus": np.asarray(data.scaling, dtype=np.float64)
-        * np.asarray(data.minor_cn, dtype=np.float64),
-        "b_plus": np.asarray(data.scaling, dtype=np.float64)
-        * np.asarray(data.major_cn, dtype=np.float64),
-        "b_fixed": np.asarray(data.scaling, dtype=np.float64)
-        * np.asarray(data.fixed_multiplicity, dtype=np.float64),
-        "ambiguous": np.asarray(data.multiplicity_estimation_mask, dtype=bool),
-        "upper": np.asarray(data.phi_upper, dtype=np.float64),
-    }
-
-
-def _mutation_region_loss_vector_numpy(
-    beta: float,
-    *,
-    alt: np.ndarray,
-    total: np.ndarray,
-    b_minus: np.ndarray,
-    b_plus: np.ndarray,
-    b_fixed: np.ndarray,
-    ambiguous: np.ndarray,
-    major_prior: float,
-    eps: float,
-) -> np.ndarray:
-    beta_values = np.full(np.asarray(alt).shape, float(beta), dtype=np.float64)
-    out = np.empty_like(beta_values, dtype=np.float64)
-    for idx in np.ndindex(beta_values.shape):
-        out[idx] = float(
-            _mutation_region_loss_grid_numpy(
-                np.asarray([beta_values[idx]], dtype=np.float64),
-                alt=float(alt[idx]),
-                total=float(total[idx]),
-                b_minus=float(b_minus[idx]),
-                b_plus=float(b_plus[idx]),
-                b_fixed=float(b_fixed[idx]),
-                ambiguous=bool(ambiguous[idx]),
-                major_prior=float(major_prior),
-                eps=float(eps),
-            )[0]
-        )
-    return out
-
-
 def _mutation_region_loss_matrix_torch(
     torch_data: TorchTumorData,
     beta: torch.Tensor,
@@ -216,24 +169,12 @@ def _mutation_region_loss_matrix_torch(
     major_prior: float,
     eps: float,
 ) -> torch.Tensor:
-    if torch_data.path_likelihood is not None:
-        return mutation_region_terms_torch(
-            torch_data,
-            beta,
-            major_prior=float(major_prior),
-            eps=float(eps),
-        ).loss
-    return mutation_region_loss_grid_torch(
+    return mutation_region_terms_torch(
+        torch_data,
         beta,
-        alt=torch_data.alt,
-        total=torch_data.total,
-        b_minus=torch_data.b_minus,
-        b_plus=torch_data.b_plus,
-        b_fixed=torch_data.b_fixed,
-        ambiguous=torch_data.ambiguous,
         major_prior=float(major_prior),
         eps=float(eps),
-    )
+    ).loss
 
 
 @torch.no_grad()
@@ -565,59 +506,26 @@ def _loss_to_centers(
     major_prior: float,
     eps: float,
     infeasible_penalty: float = 1e100,
+    _model: ObservedModel | None = None,
 ) -> np.ndarray:
     centers = np.asarray(centers, dtype=np.float64)
-    arrays = _data_arrays(data)
+    model = (
+        compile_observed_model(data, major_prior=major_prior, eps=eps)
+        if _model is None
+        else _model
+    )
     num_mutations = int(data.num_mutations)
     num_clusters = int(centers.shape[0])
     cost = np.zeros((num_mutations, num_clusters), dtype=np.float64)
     infeasible = np.zeros((num_mutations, num_clusters), dtype=bool)
-    path_spec = getattr(data, "path_likelihood", None)
 
     for cluster_idx in range(num_clusters):
-        if path_spec is not None:
-            phi_for_center = np.broadcast_to(
-                centers[cluster_idx][None, :],
-                (num_mutations, int(data.num_regions)),
-            )
-            path_terms = path_mutation_region_terms_numpy(
-                path_spec,
-                scaling=np.asarray(data.scaling, dtype=np.float64),
-                alt=np.asarray(data.alt_counts, dtype=np.float64),
-                total=np.asarray(data.total_counts, dtype=np.float64),
-                phi=phi_for_center,
-                eps=float(eps),
-                count_observed=data.count_observed,
-            )
-            cost[:, cluster_idx] = np.sum(path_terms.loss, axis=1)
-            infeasible[:, cluster_idx] = np.any(
-                phi_for_center > arrays["upper"] + max(float(eps), 1e-8),
-                axis=1,
-            )
-            continue
-        for region_idx in range(int(data.num_regions)):
-            beta = float(centers[cluster_idx, region_idx])
-            region_loss = _mutation_region_loss_vector_numpy(
-                beta,
-                alt=arrays["alt"][:, region_idx],
-                total=arrays["total"][:, region_idx],
-                b_minus=arrays["b_minus"][:, region_idx],
-                b_plus=arrays["b_plus"][:, region_idx],
-                b_fixed=arrays["b_fixed"][:, region_idx],
-                ambiguous=arrays["ambiguous"][:, region_idx],
-                major_prior=major_prior,
-                eps=eps,
-            )
-            if data.count_observed is not None:
-                region_loss = np.where(
-                    np.asarray(data.count_observed, dtype=bool)[:, region_idx],
-                    region_loss,
-                    0.0,
-                )
-            cost[:, cluster_idx] += region_loss
-            infeasible[:, cluster_idx] |= beta > arrays["upper"][:, region_idx] + max(
-                float(eps), 1e-8
-            )
+        phi_for_center = np.broadcast_to(centers[cluster_idx], model.shape)
+        terms = observed_terms_numpy(model, phi_for_center, eps=float(eps))
+        cost[:, cluster_idx] = np.sum(terms.loss, axis=1)
+        infeasible[:, cluster_idx] = np.any(
+            phi_for_center > model.upper + max(float(eps), 1e-8), axis=1
+        )
 
     cost[infeasible] = float(infeasible_penalty)
     return cost
@@ -863,12 +771,18 @@ def refine_partition_likelihood_with_trace(
     classification_code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
     allow_component_death: bool = False,
     _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
+    _model: ObservedModel | None = None,
 ) -> PartitionRefinementResult:
     labels = _validated_refinement_labels(data, labels)
     initial_k = int(np.unique(labels).size)
     _validate_classification_weight_alpha(classification_weight_alpha)
     classification_code_weight = _validated_classification_code_weight(
         classification_code_weight
+    )
+    model = (
+        compile_observed_model(data, major_prior=major_prior, eps=eps)
+        if _model is None
+        else _model
     )
 
     def refit_labels(current_labels: np.ndarray) -> PartitionRefitResult:
@@ -881,6 +795,7 @@ def refine_partition_likelihood_with_trace(
             eps=float(eps),
             tol=float(tol),
             max_iter=max(int(refit_max_iter), 32),
+            _model=model,
         )
 
     refit = refit_labels(labels)
@@ -914,6 +829,7 @@ def refine_partition_likelihood_with_trace(
             refit.cluster_centers,
             major_prior=float(major_prior),
             eps=float(eps),
+            _model=model,
         )
         assignment_cost = (
             count_cost
@@ -1407,6 +1323,9 @@ def generate_likelihood_partition_starts(
     }
     candidates: list[PartitionCandidate] = []
     seen: set[bytes] = set()
+    source_model = compile_observed_model(
+        data, major_prior=float(major_prior), eps=float(eps)
+    )
     # This cache never escapes one generation call, so labels fully identify a
     # refit under the shared data, tolerance, hint, runtime, and backend.
     refit_cache: dict[bytes, PartitionRefitResult] = {}
@@ -1441,6 +1360,7 @@ def generate_likelihood_partition_starts(
                 eps=float(eps),
                 tol=float(tol),
                 max_iter=max(int(refit_max_iter), 32),
+                _model=source_model,
             )
         refit_cache[labels_key] = result
         return result
@@ -1493,6 +1413,7 @@ def generate_likelihood_partition_starts(
                         classification_code_weight=classification_code_weight,
                         allow_component_death=bool(allow_component_death),
                         _refit_labels=cached_refit,
+                        _model=source_model,
                     )
                 labels_used, refit = trace.labels, trace.refit
             else:

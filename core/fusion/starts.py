@@ -4,6 +4,13 @@ import numpy as np
 import torch
 
 from ...io.data import TumorData
+from ..objective import ObservedModel, compile_observed_model
+from ..scalar import (
+    ScalarProblem,
+    scalar_loss,
+    scalar_loss_and_gradient,
+    scalar_problem_from_model,
+)
 from .torch_backend import (
     TorchTumorData,
     mutation_region_loss_grid_torch,
@@ -33,6 +40,41 @@ def _fixed_linear_path_scale_torch(torch_data: TorchTumorData) -> torch.Tensor |
     if not bool(torch.all(fixed).item()):
         return None
     return reference.squeeze(-1)
+
+
+def _host_observed_model(torch_data: TorchTumorData) -> ObservedModel:
+    """Return the immutable source model, with a low-level runtime fallback."""
+
+    if torch_data.source_model is not None:
+        return torch_data.source_model
+    runtime_model = torch_data.observed_model
+    if runtime_model is None:  # pragma: no cover - guarded by TorchTumorData
+        raise ValueError("TorchTumorData does not contain an observed model.")
+
+    def numeric(value: torch.Tensor) -> np.ndarray:
+        return value.detach().cpu().numpy().astype(np.float64, copy=False)
+
+    def boolean(value: torch.Tensor) -> np.ndarray:
+        return value.detach().cpu().numpy().astype(bool, copy=False)
+
+    return ObservedModel(
+        alt=numeric(runtime_model.alt),
+        nonalt=numeric(runtime_model.nonalt),
+        observed=boolean(runtime_model.observed),
+        lower=numeric(runtime_model.lower),
+        upper=numeric(runtime_model.upper),
+        first_scale=numeric(runtime_model.first_scale),
+        second_scale=numeric(runtime_model.second_scale),
+        switch=numeric(runtime_model.switch),
+        log_prior=numeric(runtime_model.log_prior),
+        valid=boolean(runtime_model.valid),
+        legacy_major=(
+            None
+            if runtime_model.legacy_major is None
+            else boolean(runtime_model.legacy_major)
+        ),
+        model_id=runtime_model.model_id,
+    )
 
 
 def _golden_section_minimize(
@@ -442,6 +484,7 @@ def _local_minimum_representatives(
 
 
 def _mutation_region_best_two_betas(
+    problem: ScalarProblem,
     *,
     alt: float,
     total: float,
@@ -458,6 +501,7 @@ def _mutation_region_best_two_betas(
     hint: float | None,
 ) -> tuple[float, float | None]:
     return _mutation_region_best_two_from_candidates(
+        problem,
         _mutation_region_candidate_betas(
             alt=alt,
             total=total,
@@ -473,34 +517,15 @@ def _mutation_region_best_two_betas(
             max_iter=max_iter,
             hint=hint,
         ),
-        alt=alt,
-        total=total,
-        b_minus=b_minus,
-        b_plus=b_plus,
-        b_fixed=b_fixed,
-        ambiguous=ambiguous,
-        lower=lower,
-        upper=upper,
-        major_prior=major_prior,
-        eps=eps,
         tol=tol,
         hint=hint,
     )
 
 
 def _mutation_region_best_two_from_candidates(
+    problem: ScalarProblem,
     candidate_array: np.ndarray,
     *,
-    alt: float,
-    total: float,
-    b_minus: float,
-    b_plus: float,
-    b_fixed: float,
-    ambiguous: bool,
-    lower: float,
-    upper: float,
-    major_prior: float,
-    eps: float,
     tol: float,
     hint: float | None,
 ) -> tuple[float, float | None]:
@@ -508,29 +533,19 @@ def _mutation_region_best_two_from_candidates(
     candidate_array = candidate_array[np.isfinite(candidate_array)]
     candidate_array = np.unique(np.round(candidate_array, 12))
     candidate_array = candidate_array[
-        (candidate_array >= float(lower) - 1e-12)
-        & (candidate_array <= float(upper) + 1e-12)
+        (candidate_array >= problem.lower - 1e-12)
+        & (candidate_array <= problem.upper + 1e-12)
     ]
-    candidate_array = np.clip(candidate_array, float(lower), float(upper))
+    candidate_array = np.clip(candidate_array, problem.lower, problem.upper)
     if candidate_array.size == 0:
         fallback = (
-            float(lower)
+            problem.lower
             if hint is None
-            else _project_to_interval(float(hint), float(lower), float(upper))
+            else _project_to_interval(float(hint), problem.lower, problem.upper)
         )
         candidate_array = np.asarray([fallback], dtype=np.float64)
 
-    losses = _mutation_region_loss_grid_numpy(
-        candidate_array,
-        alt=float(alt),
-        total=float(total),
-        b_minus=float(b_minus),
-        b_plus=float(b_plus),
-        b_fixed=float(b_fixed),
-        ambiguous=bool(ambiguous),
-        major_prior=major_prior,
-        eps=eps,
-    )
+    losses = np.asarray(scalar_loss(problem, candidate_array), dtype=np.float64)
     loss_tol = max(float(tol) * 10.0, 1e-10)
     local_betas, local_losses = _local_minimum_representatives(
         candidate_array,
@@ -564,38 +579,6 @@ def _mutation_region_best_two_from_candidates(
             secondary = float(beta)
             break
     return primary, secondary
-
-
-def _mutation_region_loss_grid_numpy(
-    beta_values: np.ndarray,
-    *,
-    alt: float,
-    total: float,
-    b_minus: float,
-    b_plus: float,
-    b_fixed: float,
-    ambiguous: bool,
-    major_prior: float,
-    eps: float,
-) -> np.ndarray:
-    beta = np.asarray(beta_values, dtype=np.float64)
-    alt = float(alt)
-    total = float(total)
-    nonalt = total - alt
-    if not ambiguous:
-        prob = np.clip(beta * float(b_fixed), eps, 1.0 - eps)
-        return -(alt * np.log(prob) + nonalt * np.log1p(-prob))
-
-    log_prior_minor, log_prior_major = _major_prior_logs_numpy(major_prior)
-    prob_minus = np.clip(beta * float(b_minus), eps, 1.0 - eps)
-    prob_plus = np.clip(beta * float(b_plus), eps, 1.0 - eps)
-    log_minor = (
-        alt * np.log(prob_minus) + nonalt * np.log1p(-prob_minus) + log_prior_minor
-    )
-    log_major = (
-        alt * np.log(prob_plus) + nonalt * np.log1p(-prob_plus) + log_prior_major
-    )
-    return -np.logaddexp(log_minor, log_major)
 
 
 def _scatter_min_by_row_block(
@@ -1184,69 +1167,25 @@ def _ambiguous_candidate_grid_torch(
     return torch.cat([col[:, None] if col.ndim == 1 else col for col in columns], dim=1)
 
 
-def _path_unit_loss_and_gradient_numpy(
-    beta_values: np.ndarray,
-    *,
-    alt: float,
-    total: float,
-    first_scale: np.ndarray,
-    second_scale: np.ndarray,
-    switch_fraction: np.ndarray,
-    log_prior: np.ndarray,
-    valid: np.ndarray,
-    eps: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    beta = np.asarray(beta_values, dtype=np.float64).reshape(-1, 1)
-    first = np.asarray(first_scale, dtype=np.float64).reshape(1, -1)
-    second = np.asarray(second_scale, dtype=np.float64).reshape(1, -1)
-    switch = np.asarray(switch_fraction, dtype=np.float64).reshape(1, -1)
-    valid = np.asarray(valid, dtype=bool).reshape(1, -1)
-    log_prior = np.asarray(log_prior, dtype=np.float64).reshape(1, -1)
-    mass = first * np.minimum(beta, switch) + second * np.maximum(beta - switch, 0.0)
-    prob = np.clip(mass, float(eps), 1.0 - float(eps))
-    segment_slope = np.where(beta <= switch, first, second)
-    slope = np.where(
-        (mass > float(eps)) & (mass < 1.0 - float(eps)),
-        segment_slope,
-        0.0,
-    )
-    nonalt = float(total) - float(alt)
-    log_joint = np.where(
-        valid,
-        float(alt) * np.log(prob) + nonalt * np.log1p(-prob) + log_prior,
-        -np.inf,
-    )
-    maximum = np.max(log_joint, axis=1, keepdims=True)
-    unnormalized = np.where(valid, np.exp(log_joint - maximum), 0.0)
-    posterior = unnormalized / np.sum(unnormalized, axis=1, keepdims=True)
-    loss = -(maximum[:, 0] + np.log(np.sum(unnormalized, axis=1, keepdims=True)[:, 0]))
-    state_score = slope * (float(alt) / prob - nonalt / (1.0 - prob))
-    gradient = -np.sum(posterior * state_score, axis=1)
-    return loss, gradient
-
-
 def _path_unit_base_points_numpy(
+    problem: ScalarProblem,
     *,
-    alt: float,
-    total: float,
-    first_scale: np.ndarray,
-    second_scale: np.ndarray,
-    switch_fraction: np.ndarray,
-    valid: np.ndarray,
-    lower: float,
-    upper: float,
     hint: float,
-    eps: float,
 ) -> tuple[np.ndarray, np.ndarray]:
+    if problem.alt.size != 1:
+        raise ValueError("Path-well base points require one mutation-region row.")
+    lower = problem.lower
+    upper = problem.upper
     points: list[float] = [float(lower), float(upper), float(hint)]
     hard: list[float] = [float(lower), float(upper)]
-    first = np.asarray(first_scale, dtype=np.float64)
-    second = np.asarray(second_scale, dtype=np.float64)
-    switch = np.asarray(switch_fraction, dtype=np.float64)
-    valid = np.asarray(valid, dtype=bool)
+    first = problem.first_scale[0]
+    second = problem.second_scale[0]
+    switch = problem.switch[0]
+    valid = problem.valid[0]
     points.extend(switch[valid].tolist())
     hard.extend(switch[valid].tolist())
-    smoothed_vaf = (float(alt) + 0.5) / (float(total) + 1.0)
+    total = float(problem.alt[0] + problem.nonalt[0])
+    smoothed_vaf = (float(problem.alt[0]) + 0.5) / (total + 1.0)
 
     def add_probability_inverse(target: float, *, is_hard: bool) -> None:
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -1272,8 +1211,8 @@ def _path_unit_base_points_numpy(
             hard.extend(values.tolist())
 
     add_probability_inverse(smoothed_vaf, is_hard=False)
-    add_probability_inverse(float(eps), is_hard=True)
-    add_probability_inverse(1.0 - float(eps), is_hard=True)
+    add_probability_inverse(problem.eps, is_hard=True)
+    add_probability_inverse(1.0 - problem.eps, is_hard=True)
     point_array = np.unique(np.round(np.asarray(points, dtype=np.float64), 14))
     hard_array = np.unique(np.round(np.asarray(hard, dtype=np.float64), 14))
     keep = (point_array >= lower - 1e-12) & (point_array <= upper + 1e-12)
@@ -1285,46 +1224,23 @@ def _path_unit_base_points_numpy(
 
 
 def _path_unit_best_two_betas_numpy(
+    problem: ScalarProblem,
     *,
-    alt: float,
-    total: float,
-    first_scale: np.ndarray,
-    second_scale: np.ndarray,
-    switch_fraction: np.ndarray,
-    log_prior: np.ndarray,
-    valid: np.ndarray,
-    lower: float,
-    upper: float,
     hint: float,
-    eps: float,
     tol: float,
     max_iter: int,
 ) -> tuple[float, float | None]:
     base_points, hard_points = _path_unit_base_points_numpy(
-        alt=alt,
-        total=total,
-        first_scale=first_scale,
-        second_scale=second_scale,
-        switch_fraction=switch_fraction,
-        valid=valid,
-        lower=lower,
-        upper=upper,
+        problem,
         hint=hint,
-        eps=eps,
     )
     candidates: list[float] = base_points.tolist()
 
     def evaluate(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        return _path_unit_loss_and_gradient_numpy(
-            values,
-            alt=alt,
-            total=total,
-            first_scale=first_scale,
-            second_scale=second_scale,
-            switch_fraction=switch_fraction,
-            log_prior=log_prior,
-            valid=valid,
-            eps=eps,
+        loss, gradient = scalar_loss_and_gradient(problem, values)
+        return (
+            np.asarray(loss, dtype=np.float64),
+            np.asarray(gradient, dtype=np.float64),
         )
 
     for left, right in zip(hard_points[:-1], hard_points[1:]):
@@ -1377,12 +1293,19 @@ def _path_unit_best_two_betas_numpy(
             candidates.append(0.5 * (root_left + root_right))
 
     candidate_array = np.unique(
-        np.round(np.clip(np.asarray(candidates, dtype=np.float64), lower, upper), 14)
+        np.round(
+            np.clip(
+                np.asarray(candidates, dtype=np.float64),
+                problem.lower,
+                problem.upper,
+            ),
+            14,
+        )
     )
     losses, _ = evaluate(candidate_array)
     finite = np.isfinite(losses)
     if not np.any(finite):
-        return float(np.clip(hint, lower, upper)), None
+        return float(np.clip(hint, problem.lower, problem.upper)), None
     candidate_array = candidate_array[finite]
     losses = losses[finite]
     local_betas, local_losses = _local_minimum_representatives(
@@ -1409,58 +1332,38 @@ def _path_unit_best_two_betas_numpy(
     return primary, secondary
 
 
-def _path_scalar_wells_from_arrays(
+def _path_scalar_wells_from_model(
+    model: ObservedModel,
     *,
-    alt: np.ndarray,
-    total: np.ndarray,
-    first_scale: np.ndarray,
-    second_scale: np.ndarray,
-    switch_fraction: np.ndarray,
-    log_prior: np.ndarray,
-    valid: np.ndarray,
-    phi_upper: np.ndarray,
     phi_init: np.ndarray,
-    count_observed: np.ndarray | None,
     eps: float,
     tol: float,
     max_iter: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    shape = tuple(np.asarray(alt).shape)
-    flat_alt = np.asarray(alt, dtype=np.float64).reshape(-1)
-    flat_total = np.asarray(total, dtype=np.float64).reshape(-1)
-    path_count = int(np.asarray(first_scale).shape[-1])
-    flat_first = np.asarray(first_scale, dtype=np.float64).reshape(-1, path_count)
-    flat_second = np.asarray(second_scale, dtype=np.float64).reshape(-1, path_count)
-    flat_switch = np.asarray(switch_fraction, dtype=np.float64).reshape(-1, path_count)
-    flat_prior = np.asarray(log_prior, dtype=np.float64).reshape(-1, path_count)
-    flat_valid = np.asarray(valid, dtype=bool).reshape(-1, path_count)
-    flat_upper = np.asarray(phi_upper, dtype=np.float64).reshape(-1)
+    shape = model.shape
+    flat_upper = model.upper.reshape(-1)
     flat_hint = np.clip(
         np.asarray(phi_init, dtype=np.float64).reshape(-1),
         float(eps),
         flat_upper,
     )
-    observed = (
-        np.ones(shape, dtype=bool).reshape(-1)
-        if count_observed is None
-        else np.asarray(count_observed, dtype=bool).reshape(-1)
-    )
+    observed = (model.observed & ((model.alt + model.nonalt) > 0.0)).reshape(-1)
     primary = flat_hint.copy()
     secondary = np.full_like(primary, np.nan)
     valid_secondary = np.zeros_like(primary, dtype=bool)
     for index in np.flatnonzero(observed):
-        best, alternate = _path_unit_best_two_betas_numpy(
-            alt=float(flat_alt[index]),
-            total=float(flat_total[index]),
-            first_scale=flat_first[index],
-            second_scale=flat_second[index],
-            switch_fraction=flat_switch[index],
-            log_prior=flat_prior[index],
-            valid=flat_valid[index],
+        mutation_index, region_index = np.unravel_index(index, shape)
+        problem = scalar_problem_from_model(
+            model,
+            np.asarray([mutation_index], dtype=np.int64),
+            int(region_index),
             lower=float(eps),
             upper=float(flat_upper[index]),
-            hint=float(flat_hint[index]),
             eps=float(eps),
+        )
+        best, alternate = _path_unit_best_two_betas_numpy(
+            problem,
+            hint=float(flat_hint[index]),
             tol=float(tol),
             max_iter=int(max_iter),
         )
@@ -1475,51 +1378,32 @@ def _path_scalar_wells_from_arrays(
     )
 
 
-def _path_pooled_start_from_arrays(
+def _path_pooled_start_from_model(
+    model: ObservedModel,
     *,
-    alt: np.ndarray,
-    total: np.ndarray,
-    first_scale: np.ndarray,
-    second_scale: np.ndarray,
-    switch_fraction: np.ndarray,
-    log_prior: np.ndarray,
-    valid: np.ndarray,
-    phi_upper: np.ndarray,
-    count_observed: np.ndarray | None,
     beta_hints: np.ndarray,
     eps: float,
     tol: float,
     max_iter: int,
 ) -> np.ndarray:
-    alt = np.asarray(alt, dtype=np.float64)
-    total = np.asarray(total, dtype=np.float64)
-    first_scale = np.asarray(first_scale, dtype=np.float64)
-    second_scale = np.asarray(second_scale, dtype=np.float64)
-    switch_fraction = np.asarray(switch_fraction, dtype=np.float64)
-    log_prior = np.asarray(log_prior, dtype=np.float64)
-    valid = np.asarray(valid, dtype=bool)
-    upper_matrix = np.asarray(phi_upper, dtype=np.float64)
     hints = np.asarray(beta_hints, dtype=np.float64)
-    observed = (
-        np.ones_like(alt, dtype=bool)
-        if count_observed is None
-        else np.asarray(count_observed, dtype=bool)
-    )
-    num_mutations, num_regions = alt.shape
+    num_mutations, num_regions = model.shape
     pooled = np.empty((num_regions,), dtype=np.float64)
 
     for region_index in range(num_regions):
         lower = float(eps)
-        upper = float(np.min(upper_matrix[:, region_index]))
+        upper = float(np.min(model.upper[:, region_index]))
         if upper <= lower + 1e-12:
             pooled[region_index] = lower
             continue
-        region_observed = observed[:, region_index]
+        region_observed = model.observed[:, region_index] & (
+            (model.alt[:, region_index] + model.nonalt[:, region_index]) > 0.0
+        )
         if not np.any(region_observed):
             pooled[region_index] = 0.5 * (lower + upper)
             continue
-        switches = switch_fraction[region_observed, region_index, :][
-            valid[region_observed, region_index, :]
+        switches = model.switch[region_observed, region_index, :][
+            model.valid[region_observed, region_index, :]
         ]
         hard = np.unique(
             np.round(
@@ -1552,24 +1436,17 @@ def _path_pooled_start_from_arrays(
         grid = grid[(grid >= lower - 1e-12) & (grid <= upper + 1e-12)]
 
         member_indices = np.flatnonzero(region_observed)
+        problem = scalar_problem_from_model(
+            model,
+            member_indices,
+            region_index,
+            lower=lower,
+            upper=upper,
+            eps=float(eps),
+        )
 
         def objective(values: np.ndarray) -> np.ndarray:
-            values = np.asarray(values, dtype=np.float64)
-            loss = np.zeros_like(values)
-            for mutation_index in member_indices:
-                unit_loss, _ = _path_unit_loss_and_gradient_numpy(
-                    values,
-                    alt=float(alt[mutation_index, region_index]),
-                    total=float(total[mutation_index, region_index]),
-                    first_scale=first_scale[mutation_index, region_index],
-                    second_scale=second_scale[mutation_index, region_index],
-                    switch_fraction=switch_fraction[mutation_index, region_index],
-                    log_prior=log_prior[mutation_index, region_index],
-                    valid=valid[mutation_index, region_index],
-                    eps=float(eps),
-                )
-                loss += unit_loss
-            return loss
+            return np.asarray(scalar_loss(problem, values), dtype=np.float64)
 
         losses = objective(grid)
         finite_indices = np.flatnonzero(np.isfinite(losses))
@@ -1633,20 +1510,12 @@ def compute_scalar_mutation_region_wells(
     tol: float,
     max_iter: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    model = compile_observed_model(data, major_prior=major_prior, eps=eps)
     path_spec = getattr(data, "path_likelihood", None)
     if path_spec is not None:
-        scale = np.asarray(data.scaling, dtype=np.float64)[..., None]
-        return _path_scalar_wells_from_arrays(
-            alt=np.asarray(data.alt_counts, dtype=np.float64),
-            total=np.asarray(data.total_counts, dtype=np.float64),
-            first_scale=scale * path_spec.first_copy,
-            second_scale=scale * path_spec.second_copy,
-            switch_fraction=path_spec.switch_fraction,
-            log_prior=path_spec.log_prior,
-            valid=path_spec.valid,
-            phi_upper=np.asarray(data.phi_upper, dtype=np.float64),
+        return _path_scalar_wells_from_model(
+            model,
             phi_init=np.asarray(data.phi_init, dtype=np.float64),
-            count_observed=data.count_observed,
             eps=float(eps),
             tol=float(tol),
             max_iter=int(max_iter),
@@ -1695,7 +1564,20 @@ def compute_scalar_mutation_region_wells(
 
     amb_indices = np.flatnonzero(ambiguous)
     for idx in amb_indices:
+        mutation_index, region_index = np.unravel_index(idx, model.shape)
+        problem = scalar_problem_from_model(
+            model,
+            np.asarray([mutation_index], dtype=np.int64),
+            int(region_index),
+            lower=float(lower[idx]),
+            upper=float(upper[idx]),
+            eps=float(eps),
+            # Historical exact pilots use count information even where the
+            # fit mask is false; those coordinates still define the graph.
+            respect_observed=False,
+        )
         primary, alternate = _mutation_region_best_two_betas(
+            problem,
             alt=float(alt[idx]),
             total=float(total[idx]),
             b_minus=float(b_minus[idx]),
@@ -1741,25 +1623,12 @@ def compute_scalar_mutation_region_wells_torch(
     shape = tuple(torch_data.alt.shape)
     fixed_path_scale = _fixed_linear_path_scale_torch(torch_data)
     if torch_data.path_likelihood is not None and fixed_path_scale is None:
-        path = torch_data.path_likelihood
-        primary, secondary, valid_secondary = _path_scalar_wells_from_arrays(
-            alt=torch_data.alt.detach().cpu().numpy(),
-            total=torch_data.total.detach().cpu().numpy(),
-            first_scale=path.first_scale.detach().cpu().numpy(),
-            second_scale=path.second_scale.detach().cpu().numpy(),
-            switch_fraction=path.switch_fraction.detach().cpu().numpy(),
-            log_prior=path.log_prior.detach().cpu().numpy(),
-            valid=path.valid.detach().cpu().numpy(),
-            phi_upper=torch_data.phi_upper.detach().cpu().numpy(),
+        primary, secondary, valid_secondary = _path_scalar_wells_from_model(
+            _host_observed_model(torch_data),
             phi_init=(
                 phi_init.detach().cpu().numpy()
                 if torch.is_tensor(phi_init)
                 else np.asarray(phi_init)
-            ),
-            count_observed=(
-                None
-                if torch_data.count_observed is None
-                else torch_data.count_observed.detach().cpu().numpy()
             ),
             eps=float(eps),
             tol=float(tol),
@@ -1871,7 +1740,6 @@ def compute_pooled_observed_data_start_torch(
     num_mutations = int(torch_data.alt.shape[0])
     num_regions = int(torch_data.alt.shape[1])
     if torch_data.path_likelihood is not None:
-        path = torch_data.path_likelihood
         if beta_hints is None:
             hints = 0.5 * (float(eps) + torch_data.phi_upper.detach().cpu().numpy())
         else:
@@ -1880,20 +1748,8 @@ def compute_pooled_observed_data_start_torch(
                 if torch.is_tensor(beta_hints)
                 else np.asarray(beta_hints)
             )
-        pooled = _path_pooled_start_from_arrays(
-            alt=torch_data.alt.detach().cpu().numpy(),
-            total=torch_data.total.detach().cpu().numpy(),
-            first_scale=path.first_scale.detach().cpu().numpy(),
-            second_scale=path.second_scale.detach().cpu().numpy(),
-            switch_fraction=path.switch_fraction.detach().cpu().numpy(),
-            log_prior=path.log_prior.detach().cpu().numpy(),
-            valid=path.valid.detach().cpu().numpy(),
-            phi_upper=torch_data.phi_upper.detach().cpu().numpy(),
-            count_observed=(
-                None
-                if torch_data.count_observed is None
-                else torch_data.count_observed.detach().cpu().numpy()
-            ),
+        pooled = _path_pooled_start_from_model(
+            _host_observed_model(torch_data),
             beta_hints=hints,
             eps=float(eps),
             tol=float(tol),
