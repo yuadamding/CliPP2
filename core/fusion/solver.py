@@ -478,7 +478,8 @@ _MISSING_SURROGATE_CURVATURE = 1e-6
 _OUTER_KKT_CHECK_EVERY = 4
 _PERIODIC_CERTIFICATE_MAX_ITER = 96
 _FULL_STEP_MAX_CURVATURE_ATTEMPTS = 24
-_UNIMODAL_GLOBAL_OPTIMALITY_BASIS = "assumed_unimodal_objective_plus_kkt"
+_CONVEX_GLOBAL_OPTIMALITY_BASIS = "convex_fixed_linear_objective_plus_kkt"
+OBJECTIVE_SHAPE_AUTO = "auto"
 PATH_OBJECTIVE_SHAPE = "generic_nonconvex"
 
 
@@ -495,6 +496,21 @@ def uses_nonconvex_path_likelihood(data: TumorData) -> bool:
     return bool(
         path is not None and not bool(getattr(path, "has_fixed_linear_emission", False))
     )
+
+
+def uses_nonconvex_observed_likelihood(data: TumorData) -> bool:
+    """Whether the observed-data likelihood can contain competing wells.
+
+    A legacy major/minor mixture is no more globally unimodal than an explicit
+    occupancy-path mixture.  Only a fixed linear emission is known to retain
+    the convex binomial-loss contract used by the global KKT claim.
+    """
+
+    legacy_mixture = bool(
+        getattr(data, "path_likelihood", None) is None
+        and np.any(np.asarray(data.multiplicity_estimation_mask, dtype=bool))
+    )
+    return bool(legacy_mixture or uses_nonconvex_path_likelihood(data))
 
 
 def _effective_major_prior(data: TumorData, major_prior: float) -> float:
@@ -517,7 +533,7 @@ def objective_shape_for_data(data: TumorData, requested: str) -> str:
     normalized = _normalize_objective_shape(requested)
     if uses_nonconvex_path_likelihood(data):
         return PATH_OBJECTIVE_SHAPE
-    return normalized
+    return "unimodal" if normalized == OBJECTIVE_SHAPE_AUTO else normalized
 
 
 def _path_smooth_interval_bounds(
@@ -659,12 +675,13 @@ def _prefer_multistart_fit(
 def _normalize_objective_shape(objective_shape: str) -> str:
     normalized = str(objective_shape).strip().lower()
     if normalized not in {
+        OBJECTIVE_SHAPE_AUTO,
         "unimodal",
         "unimodal_full_step_backtracking",
         "generic_nonconvex",
     }:
         raise ValueError(
-            "objective_shape must be 'unimodal', "
+            "objective_shape must be 'auto', 'unimodal', "
             "'unimodal_full_step_backtracking', or 'generic_nonconvex'."
         )
     return normalized
@@ -1183,7 +1200,7 @@ def prepare_torch_problem(
     dtype: str | None = DEFAULT_DTYPE,
     runtime=None,
     torch_data: TorchTumorData | None = None,
-    objective_shape: str = "unimodal",
+    objective_shape: str = OBJECTIVE_SHAPE_AUTO,
     defer_graph: bool = False,
 ) -> SolverContext:
     tol = _validate_solver_tolerance(tol)
@@ -2847,9 +2864,13 @@ def _fit_from_start(
         fallback_reason=str(fallback_reason),
     )
     stationarity_certified = bool(selection_eligible)
-    global_optimality_certified = bool(selection_eligible and use_unimodal_objective)
+    global_optimality_certified = bool(
+        selection_eligible
+        and use_unimodal_objective
+        and not uses_nonconvex_observed_likelihood(data)
+    )
     global_optimality_basis = (
-        _UNIMODAL_GLOBAL_OPTIMALITY_BASIS
+        _CONVEX_GLOBAL_OPTIMALITY_BASIS
         if global_optimality_certified
         else "not_certified"
     )
@@ -3160,7 +3181,7 @@ def fit_observed_data_pairwise_fusion(
     solver_context: SolverContext | None = None,
     solver_state: SolverState | None = None,
     compute_summary: bool = True,
-    objective_shape: str = "unimodal",
+    objective_shape: str = OBJECTIVE_SHAPE_AUTO,
     workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES,
     compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
     dense_fallback_policy: str = DEFAULT_DENSE_FALLBACK_POLICY,

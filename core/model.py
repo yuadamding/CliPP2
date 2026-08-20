@@ -51,7 +51,7 @@ class FitOptions:
     selection_contract: str = "hybrid-ward-cem-v1"
     selection_dirichlet_alpha: float = 1.0
     selection_dirichlet_code_weight: float = 0.7
-    objective_shape: str = "unimodal"
+    objective_shape: str = "auto"
     workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES
     compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES
     dense_fallback_policy: str = DEFAULT_DENSE_FALLBACK_POLICY
