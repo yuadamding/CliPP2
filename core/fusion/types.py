@@ -18,7 +18,7 @@ from .defaults import (
 )
 
 if TYPE_CHECKING:
-    from ..objective import BaseObjectiveKey, ObservedModel
+    from ..objective import BaseObjectiveKey, LambdaObjectiveKey, ObservedModel
 
 
 _GRAPH_FINGERPRINT_SCHEMA = "clipp2.pairwise-fusion-graph.v1"
@@ -186,7 +186,9 @@ BackendWarmState: TypeAlias = DenseWarmState | PrimalOnlyWarmState
 
 
 @dataclass(frozen=True, slots=True)
-class BackendWorkCounters:
+class WorkCounters:
+    outer_iterations: int = 0
+    inner_iterations: int = 0
     workset_iterations: int = 0
     workset_expansions: int = 0
     streamed_edge_passes: int = 0
@@ -197,10 +199,10 @@ class BackendWorkCounters:
     column_scan_passes: int = 0
     full_certificate_audit_passes: int = 0
 
-    def __add__(self, other: "BackendWorkCounters") -> "BackendWorkCounters":
-        if not isinstance(other, BackendWorkCounters):
+    def __add__(self, other: "WorkCounters") -> "WorkCounters":
+        if not isinstance(other, WorkCounters):
             return NotImplemented
-        return BackendWorkCounters(
+        return WorkCounters(
             **{
                 item.name: int(getattr(self, item.name))
                 + int(getattr(other, item.name))
@@ -209,7 +211,7 @@ class BackendWorkCounters:
         )
 
     @classmethod
-    def from_attributes(cls, value: object) -> "BackendWorkCounters":
+    def from_attributes(cls, value: object) -> "WorkCounters":
         return cls(
             **{
                 item.name: int(getattr(value, item.name, 0))
@@ -231,49 +233,7 @@ class InnerSolveResult:
     converged: bool
     inner_iterations: int
     backend_iterations: int
-    work_counters: BackendWorkCounters
-    fallback_reason: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class ExactFusionProvenance:
-    """Evidence used to decide fixed-objective candidate eligibility.
-
-    Solver identity and iteration counts are deliberately diagnostic.  Exact
-    eligibility is carried only by the objective/graph scopes and the normalized
-    terminal KKT certificate.
-    """
-
-    schema_version: int = 1
-    estimator_role: str = "raw_fused_lambda_path"
-    objective_faithful: bool = True
-    objective_spec_hash: str = ""
-    original_graph_hash: str = ""
-    certificate_problem_hash: str = ""
-    certificate_scope: str = "full_original_graph"
-    gradient_scope: str = "observed_objective"
-    full_kkt_certified: bool = False
-    status: str = "not_audited"
-    residual: float = float("inf")
-    tolerance: float = 0.0
-    working_precision_residual: float = float("inf")
-    working_dtype: str = "unknown"
-    certificate_audit_dtype: str = "unknown"
-    precision_polish_applied: bool = False
-    precision_polish_max_abs_phi_delta: float = 0.0
-    residual_method: str = "legacy_global_l2_projected_step_v1"
-    directional_kink_admissible: bool = False
-    backend_name: str = "unknown"
-    backend_iterations: int = 0
-    workset_iterations: int = 0
-    workset_expansions: int = 0
-    streamed_edge_passes: int = 0
-    dense_iterations: int = 0
-    certificate_iterations: int = 0
-    activity_passes: int = 0
-    analytic_adjoint_passes: int = 0
-    column_scan_passes: int = 0
-    full_certificate_audit_passes: int = 0
+    work_counters: WorkCounters
     fallback_reason: str = ""
 
 
@@ -315,74 +275,6 @@ class PairwiseFusionGraph:
             "fingerprint",
             _graph_source_fingerprint(edge_u, edge_v, edge_w),
         )
-
-@dataclass
-class FusionFitArtifacts:
-    phi: np.ndarray
-    loglik: float
-    penalized_objective: float
-    lambda_value: float
-    n_clusters: int
-    iterations: int
-    converged: bool
-    device: str
-    dtype: str
-    graph_name: str
-    outer_stationarity_residual: float
-    outer_projected_stationarity_norm: float
-    outer_stationarity_normalizer: float
-    outer_smooth_gradient_norm: float
-    outer_fusion_adjustment_norm: float
-    outer_edge_subgradient_residual: float
-    outer_dual_ball_residual: float
-    outer_box_primal_violation: float
-    outer_num_frozen_coordinates: int
-    outer_box_residual: float
-    outer_backward_error_stationarity_residual: float
-    outer_backward_error_edge_subgradient_residual: float
-    outer_backward_error_dual_ball_residual: float
-    fixed_objective_kkt_residual: float
-    outer_kkt_certificate_status: str
-    outer_kkt_fused_edges: int
-    outer_kkt_nonzero_edges: int
-    outer_stationarity_residual_before_dual_refine: float
-    outer_stationarity_residual_after_dual_refine: float
-    converged_inner: bool
-    converged_outer: bool
-    final_relative_objective_change: float
-    final_step_residual: float
-    accepted_outer_steps: int
-    accepted_full_steps: int
-    accepted_damped_steps: int
-    attempted_outer_steps: int
-    failed_majorization_checks: int
-    failed_inner_model_checks: int
-    failed_em_envelope_checks: int
-    failed_descent_checks: int
-    failed_nonfinite_checks: int
-    mm_consistency_violations: int
-    failure_reason: str
-    selection_eligible: bool
-    stationarity_certified: bool
-    global_optimality_certified: bool
-    global_optimality_basis: str
-    number_of_starts: int
-    number_of_finite_starts: int
-    best_start_objective: float
-    second_best_start_objective: float
-    objective_spread_across_starts: float
-    selected_start_objective_rank: int
-    solver_state: SolverState | None = None
-    torch_result: TorchFitResult | None = None
-    # Backward-compatible solver provenance. ``iterations`` above remains the
-    # number of outer MM iterations; this is the accumulated work performed by
-    # the inner convex solver for the selected start.
-    inner_iterations: int = 0
-    admm_iterations: int = 0
-    inner_solver: str = "unknown"
-    certificate: GraphFusionCertificate | None = None
-    exactness_provenance: ExactFusionProvenance | None = None
-
 
 @dataclass(frozen=True)
 class TorchRuntime:
@@ -460,19 +352,186 @@ class SolverState:
 
 
 @dataclass(frozen=True, slots=True)
-class InnerDiagnostics:
-    iterations: int
-    kkt_residual: float
-    primal_delta: float
-    dual_delta: float
-    converged: bool
+class ObjectiveValue:
+    """Observed fit loss and lambda-weighted fusion objective."""
+
+    fit_loss: float
+    fusion_penalty: float
+    total: float
+
+    @property
+    def loglik(self) -> float:
+        return float(-self.fit_loss)
 
 
 @dataclass(frozen=True, slots=True)
-class TorchFitResult:
-    phi_raw: torch.Tensor
-    dual: torch.Tensor | None
-    inner: InnerDiagnostics
-    inner_solver: str = "unknown"
-    certificate: GraphFusionCertificate | None = None
-    exactness_provenance: ExactFusionProvenance | None = None
+class KKTComponents:
+    """Scale-stable componentwise terminal backward error."""
+
+    stationarity: float
+    edge_subgradient: float
+    dual_ball: float
+    box: float
+
+    @property
+    def residual(self) -> float:
+        return float(
+            max(self.stationarity, self.edge_subgradient, self.dual_ball, self.box)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CertificateResult:
+    """Terminal full-objective certificate and exactness provenance."""
+
+    components: KKTComponents
+    progress: KKTDiagnostics
+    certified: bool
+    admissible: bool
+    stationary: bool
+    global_optimum: bool
+    status: str
+    tolerance: float
+    scope: str
+    gradient_scope: str
+    directional_admissible: bool
+    witness: GraphFusionCertificate | None
+    working_residual: float
+    working_dtype: str
+    audit_dtype: str
+    precision_polished: bool
+    precision_polish_delta: float
+    residual_method: str
+    backend_name: str
+    fallback_reason: str
+    fused_edges: int
+    nonzero_edges: int
+    stationarity_before: float
+    stationarity_after: float
+
+    @property
+    def schema_version(self) -> int:
+        return 2
+
+    @property
+    def estimator_role(self) -> str:
+        return "raw_fused_lambda_path"
+
+    @property
+    def objective_faithful(self) -> bool:
+        return True
+
+    @property
+    def full_kkt_certified(self) -> bool:
+        return bool(self.certified)
+
+    @property
+    def residual(self) -> float:
+        return self.components.residual
+
+    @property
+    def certificate_scope(self) -> str:
+        return str(self.scope)
+
+    @property
+    def directional_kink_admissible(self) -> bool:
+        return bool(self.directional_admissible)
+
+    @property
+    def working_precision_residual(self) -> float:
+        return float(self.working_residual)
+
+    @property
+    def certificate_audit_dtype(self) -> str:
+        return str(self.audit_dtype)
+
+    @property
+    def precision_polish_applied(self) -> bool:
+        return bool(self.precision_polished)
+
+    @property
+    def precision_polish_max_abs_phi_delta(self) -> float:
+        return float(self.precision_polish_delta)
+
+
+@dataclass(frozen=True, slots=True)
+class ConvergenceResult:
+    iterations: int
+    converged: bool
+    inner_converged: bool
+    outer_converged: bool
+    relative_objective_change: float
+    step_residual: float
+    accepted_outer_steps: int
+    accepted_full_steps: int
+    accepted_damped_steps: int
+    attempted_outer_steps: int
+    failed_majorization_checks: int
+    failed_inner_model_checks: int
+    failed_em_envelope_checks: int
+    failed_descent_checks: int
+    failed_nonfinite_checks: int
+    mm_consistency_violations: int
+    failure_reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class MultiStartResult:
+    number_of_starts: int
+    number_of_finite_starts: int
+    best_objective: float
+    second_best_objective: float
+    objective_spread: float
+    selected_objective_rank: int
+    threshold_component_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class FitProvenance:
+    objective_key: LambdaObjectiveKey
+    graph_name: str
+    device: str
+    dtype: str
+    inner_solver: str
+    global_optimality_basis: str
+    likelihood_eps: float
+
+    @property
+    def lambda_value(self) -> float:
+        return float.fromhex(str(self.objective_key.lambda_hex))
+
+    @property
+    def objective_spec_hash(self) -> str:
+        return str(self.objective_key.base.fingerprint)
+
+    @property
+    def base_fusion_objective_hash(self) -> str:
+        return str(self.objective_key.base.fingerprint)
+
+    @property
+    def original_graph_hash(self) -> str:
+        return str(self.objective_key.base.graph_hash)
+
+    @property
+    def certificate_problem_hash(self) -> str:
+        return str(self.objective_key.fingerprint)
+
+
+@dataclass(frozen=True, slots=True)
+class RawFit:
+    """Compact raw fixed-objective fit; partitions remain a secondary layer."""
+
+    phi: np.ndarray
+    objective: ObjectiveValue
+    certificate: CertificateResult
+    convergence: ConvergenceResult
+    work: WorkCounters
+    multistart: MultiStartResult
+    state: SolverState | None
+    provenance: FitProvenance
+
+    def __post_init__(self) -> None:
+        phi = np.array(self.phi, copy=True, order="C")
+        if phi.ndim != 2 or not np.all(np.isfinite(phi)):
+            raise ValueError("RawFit.phi must be a finite mutation-by-region matrix.")
+        object.__setattr__(self, "phi", phi)

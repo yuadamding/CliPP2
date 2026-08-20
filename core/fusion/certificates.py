@@ -17,7 +17,7 @@ from .torch_backend import (
 )
 from .graph_ops import project_dual_ball
 from .types import (
-    BackendWorkCounters,
+    WorkCounters,
     CertificateOptions,
     CompressedEdgeCertificate,
     DenseEdgeCertificate,
@@ -78,7 +78,7 @@ class CertificateGradient:
 
 
 @dataclass(frozen=True, slots=True)
-class CertificateResult:
+class CertificateAttempt:
     certificate: GraphFusionCertificate | None
     diagnostics: KKTDiagnostics
     status: str
@@ -87,7 +87,7 @@ class CertificateResult:
     nonzero_edges: int
     stationarity_before: float
     stationarity_after: float
-    work_counters: BackendWorkCounters = BackendWorkCounters()
+    work_counters: WorkCounters = WorkCounters()
 
 
 def _inadmissible_downward_kink_mask(
@@ -590,7 +590,7 @@ def _refine_compressed_certificate(
     lambda_value: float,
     atol: float,
     options: CertificateOptions,
-) -> CertificateResult:
+) -> CertificateAttempt:
     if certificate.graph_hash != str(graph_hash):
         raise ValueError("Compressed certificate graph hash does not match the graph.")
     raw_edge_ids = certificate.internal_edge_ids
@@ -617,7 +617,7 @@ def _refine_compressed_certificate(
             upper=upper,
             atol=atol,
         )
-        return CertificateResult(
+        return CertificateAttempt(
             certificate=certificate,
             diagnostics=diag,
             status="resource_limit",
@@ -626,7 +626,7 @@ def _refine_compressed_certificate(
             nonzero_edges=nonzero_edges,
             stationarity_before=diag.stationarity_residual,
             stationarity_after=diag.stationarity_residual,
-            work_counters=BackendWorkCounters(
+            work_counters=WorkCounters(
                 streamed_edge_passes=activity_passes,
                 activity_passes=activity_passes,
             ),
@@ -662,7 +662,7 @@ def _refine_compressed_certificate(
             upper=upper,
             atol=atol,
         )
-        return CertificateResult(
+        return CertificateAttempt(
             certificate=certificate,
             diagnostics=diag,
             status="resource_limit",
@@ -671,7 +671,7 @@ def _refine_compressed_certificate(
             nonzero_edges=nonzero_edges,
             stationarity_before=diag.stationarity_residual,
             stationarity_after=diag.stationarity_residual,
-            work_counters=BackendWorkCounters(
+            work_counters=WorkCounters(
                 streamed_edge_passes=tree_passes + activity_passes,
                 activity_passes=activity_passes,
             ),
@@ -743,7 +743,7 @@ def _refine_compressed_certificate(
             graph_hash=certificate.graph_hash,
             gradient_scope=gradient_scope,
         )
-        return CertificateResult(
+        return CertificateAttempt(
             certificate=certified,
             diagnostics=before,
             status="certified",
@@ -752,7 +752,7 @@ def _refine_compressed_certificate(
             nonzero_edges=nonzero_edges,
             stationarity_before=before.stationarity_residual,
             stationarity_after=before.stationarity_residual,
-            work_counters=BackendWorkCounters(
+            work_counters=WorkCounters(
                 streamed_edge_passes=edge_passes,
                 activity_passes=activity_passes,
                 analytic_adjoint_passes=between_passes,
@@ -883,7 +883,7 @@ def _refine_compressed_certificate(
             graph_hash=graph_hash,
             gradient_scope=gradient_scope,
         )
-    return CertificateResult(
+    return CertificateAttempt(
         certificate=certificate,
         diagnostics=final_diag,
         status=status,
@@ -892,7 +892,7 @@ def _refine_compressed_certificate(
         nonzero_edges=nonzero_edges,
         stationarity_before=before.stationarity_residual,
         stationarity_after=final_diag.stationarity_residual,
-        work_counters=BackendWorkCounters(
+        work_counters=WorkCounters(
             workset_iterations=total_iterations,
             workset_expansions=expansions,
             streamed_edge_passes=edge_passes,
@@ -1155,7 +1155,7 @@ def _refine_certificate(
     problem: CertificateProblem,
     max_iter: int = 96,
     options: CertificateOptions | None = None,
-) -> CertificateResult:
+) -> CertificateAttempt:
 
     if isinstance(certificate, CompressedEdgeCertificate):
         effective_options = options or CertificateOptions(
@@ -1199,7 +1199,7 @@ def _refine_certificate(
         if torch.is_tensor(dual)
         else None
     )
-    return CertificateResult(
+    return CertificateAttempt(
         certificate=refined_certificate,
         diagnostics=KKTDiagnostics.from_mapping(dense["diag"]),
         status=str(dense["status"]),
@@ -1208,7 +1208,7 @@ def _refine_certificate(
         nonzero_edges=int(dense["nonzero_edges"]),
         stationarity_before=float(dense["stationarity_before"]),
         stationarity_after=float(dense["stationarity_after"]),
-        work_counters=BackendWorkCounters(
+        work_counters=WorkCounters(
             certificate_iterations=int(dense["refinement_iterations"])
         ),
     )
@@ -1223,7 +1223,7 @@ def certify(
     refine: bool,
     max_iter: int = 96,
     options: CertificateOptions | None = None,
-) -> CertificateResult:
+) -> CertificateAttempt:
     """Refine and/or audit one full-original-graph certificate.
 
     This is the authoritative high-level entry point.  Dense and compressed
@@ -1256,7 +1256,7 @@ def certify(
         grad_smooth=gradient.value,
         problem=problem,
     )
-    return CertificateResult(
+    return CertificateAttempt(
         certificate=witness,
         diagnostics=diagnostics,
         status="audited",

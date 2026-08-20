@@ -69,26 +69,29 @@ from .torch_backend import (
     validate_lambda_value,
 )
 from .types import (
-    BackendWorkCounters,
+    CertificateResult,
     CertificateOptions,
     CompressedEdgeCertificate,
+    ConvergenceResult,
     DenseEdgeCertificate,
     DenseWarmState,
     ExactSolverResourceLimit,
-    ExactFusionProvenance,
-    FusionFitArtifacts,
+    FitProvenance,
     GraphFusionCertificate,
-    InnerDiagnostics,
     InnerSolveResult,
+    KKTComponents,
     KKTDiagnostics,
+    MultiStartResult,
+    ObjectiveValue,
     PairwiseFusionGraph,
     PrimalOnlyWarmState,
+    RawFit,
     SolverContext,
     SolverState,
     TensorFusionGraph,
     TensorProblem,
-    TorchFitResult,
     TorchRuntime,
+    WorkCounters,
     WorksetMemoryOptions,
 )
 
@@ -500,8 +503,8 @@ def _combine_fallback_reasons(*reasons: str) -> str:
 
 
 def _prefer_multistart_fit(
-    candidate: FusionFitArtifacts,
-    incumbent: FusionFitArtifacts,
+    candidate: RawFit,
+    incumbent: RawFit,
 ) -> bool:
     """Rank finite starts by the observed objective they all optimize.
 
@@ -511,23 +514,23 @@ def _prefer_multistart_fit(
     replaced by a materially worse stationary basin.
     """
 
-    candidate_finite = bool(np.isfinite(candidate.penalized_objective))
-    incumbent_finite = bool(np.isfinite(incumbent.penalized_objective))
+    candidate_finite = bool(np.isfinite(candidate.objective.total))
+    incumbent_finite = bool(np.isfinite(incumbent.objective.total))
     if candidate_finite != incumbent_finite:
         return candidate_finite
     if candidate_finite:
-        objective_delta = float(candidate.penalized_objective) - float(
-            incumbent.penalized_objective
+        objective_delta = float(candidate.objective.total) - float(
+            incumbent.objective.total
         )
         if abs(objective_delta) > 1e-8:
             return bool(objective_delta < 0.0)
     candidate_status = (
-        bool(candidate.selection_eligible),
-        bool(candidate.converged),
+        bool(candidate.certificate.admissible),
+        bool(candidate.convergence.converged),
     )
     incumbent_status = (
-        bool(incumbent.selection_eligible),
-        bool(incumbent.converged),
+        bool(incumbent.certificate.admissible),
+        bool(incumbent.convergence.converged),
     )
     return candidate_status > incumbent_status
 
@@ -551,15 +554,6 @@ def _graph_fingerprint(graph: PairwiseFusionGraph) -> str:
     """Return the immutable host graph's numerical source identity."""
 
     return graph.fingerprint
-
-
-def _certificate_problem_fingerprint(
-    *, base_objective_key: BaseObjectiveKey, lambda_value: float
-) -> str:
-    return make_lambda_objective_key(
-        base_objective_key,
-        lambda_value=lambda_value,
-    ).fingerprint
 
 
 def _tensor_from_start(
@@ -1565,7 +1559,7 @@ def _solve_inner_subproblem(
         converged=bool(inner_ok),
         inner_iterations=total_inner_iterations,
         backend_iterations=total_inner_iterations,
-        work_counters=BackendWorkCounters(
+        work_counters=WorkCounters(
             dense_iterations=dense_iterations,
         ),
     )
@@ -1602,7 +1596,7 @@ def _fit_from_start(
     certificate_refinement_rounds: int,
     certificate_column_tol_scale: float,
     verbose: bool,
-) -> FusionFitArtifacts:
+) -> RawFit:
     tol = _validate_solver_tolerance(tol)
     if base_objective_key.fingerprint != str(objective_spec_hash):
         raise ValueError("Base objective key does not match objective_spec_hash.")
@@ -1715,13 +1709,11 @@ def _fit_from_start(
     converged_outer = False
     iterations = 0
     inner_iterations = 0
-    work_counters = BackendWorkCounters()
+    work_counters = WorkCounters()
     fallback_reason = ""
     current_inner_converged = False
-    current_inner_kkt_residual = np.nan
     final_relative_objective_change = np.inf
     final_step_residual = np.inf
-    final_inner_kkt_residual = np.nan
     final_outer_diag = _initial_outer_diag()
     outer_kkt_certificate_status = "not_audited"
     outer_kkt_fused_edges = 0
@@ -1834,7 +1826,6 @@ def _fit_from_start(
         candidate_fit_loss = fit_loss
         candidate_gamma = gamma_major
         candidate_mutation_region_terms = current_mutation_region_terms
-        candidate_inner_residual = np.nan
         inner_converged = False
 
         curvature_attempts = (
@@ -2094,7 +2085,6 @@ def _fit_from_start(
                 candidate_fit_loss = trial_fit_loss
                 candidate_gamma = trial_gamma
                 candidate_mutation_region_terms = trial_mutation_region_terms
-                candidate_inner_residual = float(inner_residual)
                 inner_converged = bool(
                     (
                         np.isfinite(float(inner_residual))
@@ -2216,7 +2206,6 @@ def _fit_from_start(
                     candidate_fit_loss = theta_fit_loss
                     candidate_gamma = theta_gamma
                     candidate_mutation_region_terms = theta_mutation_region_terms
-                    candidate_inner_residual = np.nan
                     inner_converged = False
                     break
                 theta *= 0.5
@@ -2325,8 +2314,6 @@ def _fit_from_start(
         final_step_residual = float(step_residual)
         if accepted:
             current_inner_converged = bool(inner_converged)
-            current_inner_kkt_residual = float(candidate_inner_residual)
-        final_inner_kkt_residual = float(current_inner_kkt_residual)
         if do_outer_kkt_audit:
             final_outer_diag = outer_diag
         converged_inner = bool(current_inner_converged)
@@ -2466,7 +2453,7 @@ def _fit_from_start(
             directional_kink_admissible
             and audit_directional_admissible
         )
-        work_counters = work_counters + BackendWorkCounters(
+        work_counters = work_counters + WorkCounters(
             full_certificate_audit_passes=1
         )
     admission_diag = admission_diagnostics.as_dict()
@@ -2516,34 +2503,6 @@ def _fit_from_start(
         and converged_outer
         and valid_dual_certificate
         and directional_kink_admissible
-    )
-    exactness_provenance = ExactFusionProvenance(
-        schema_version=2,
-        estimator_role="raw_fused_lambda_path",
-        objective_faithful=True,
-        objective_spec_hash=str(objective_spec_hash),
-        original_graph_hash=str(graph_hash),
-        certificate_problem_hash=_certificate_problem_fingerprint(
-            base_objective_key=base_objective_key,
-            lambda_value=lambda_value,
-        ),
-        certificate_scope="full_original_graph",
-        gradient_scope=str(gradient_scope),
-        full_kkt_certified=full_kkt_certified,
-        status=str(outer_kkt_certificate_status),
-        residual=float(authoritative_kkt_residual),
-        tolerance=5.0 * float(tol),
-        working_precision_residual=float(working_precision_kkt_residual),
-        working_dtype=dtype_name(runtime.dtype),
-        certificate_audit_dtype=str(certificate_audit_dtype),
-        precision_polish_applied=False,
-        precision_polish_max_abs_phi_delta=0.0,
-        residual_method="componentwise_box_cone_backward_error_v1",
-        directional_kink_admissible=bool(directional_kink_admissible),
-        backend_name=str(inner_solver),
-        backend_iterations=int(inner_iterations),
-        **work_counters.as_dict(),
-        fallback_reason=str(fallback_reason),
     )
     stationarity_certified = bool(selection_eligible)
     global_optimality_certified = bool(
@@ -2613,103 +2572,107 @@ def _fit_from_start(
         certificate=certificate,
         objective_spec_hash=str(objective_spec_hash),
     )
-    torch_result = TorchFitResult(
-        phi_raw=phi.detach(),
-        dual=solver_state_out.dual,
-        inner=InnerDiagnostics(
-            iterations=int(inner_iterations),
-            kkt_residual=float(final_inner_kkt_residual),
-            primal_delta=float(final_step_residual),
-            dual_delta=float("nan"),
-            converged=bool(converged_inner),
+    terminal_components = KKTComponents(
+        stationarity=float(admission_diag["backward_error_stationarity_residual"]),
+        edge_subgradient=float(
+            admission_diag["backward_error_edge_subgradient_residual"]
         ),
-        inner_solver=str(inner_solver),
-        certificate=certificate,
-        exactness_provenance=exactness_provenance,
+        dual_ball=float(admission_diag["backward_error_dual_ball_residual"]),
+        # Box feasibility is enforced by every primal update. The normalized
+        # stationarity component already incorporates the box normal cone.
+        box=0.0,
     )
-
-    return FusionFitArtifacts(
-        phi=phi_np.astype(phi_np.dtype, copy=False),
-        loglik=float(-authoritative_fit_loss),
-        penalized_objective=float(authoritative_objective),
-        lambda_value=float(lambda_value),
-        n_clusters=n_clusters,
-        iterations=int(iterations),
-        converged=bool(converged),
-        device=runtime.device_name,
-        dtype=dtype_name(runtime.dtype),
-        graph_name=str(graph.name),
-        outer_stationarity_residual=float(final_outer_diag["stationarity_residual"]),
-        outer_projected_stationarity_norm=float(
-            final_outer_diag["projected_stationarity_norm"]
-        ),
-        outer_stationarity_normalizer=float(
-            final_outer_diag["stationarity_normalizer"]
-        ),
-        outer_smooth_gradient_norm=float(final_outer_diag["smooth_gradient_norm"]),
-        outer_fusion_adjustment_norm=float(final_outer_diag["fusion_adjustment_norm"]),
-        outer_edge_subgradient_residual=float(
-            final_outer_diag["edge_subgradient_residual"]
-        ),
-        outer_dual_ball_residual=float(final_outer_diag["dual_ball_residual"]),
-        outer_box_primal_violation=float(final_outer_diag["box_primal_violation"]),
-        outer_num_frozen_coordinates=int(final_outer_diag["num_frozen_coordinates"]),
-        outer_box_residual=float(final_outer_diag["box_residual"]),
-        outer_backward_error_stationarity_residual=float(
-            final_outer_diag["backward_error_stationarity_residual"]
-        ),
-        outer_backward_error_edge_subgradient_residual=float(
-            final_outer_diag["backward_error_edge_subgradient_residual"]
-        ),
-        outer_backward_error_dual_ball_residual=float(
-            final_outer_diag["backward_error_dual_ball_residual"]
-        ),
-        fixed_objective_kkt_residual=float(authoritative_kkt_residual),
-        outer_kkt_certificate_status=str(outer_kkt_certificate_status),
-        outer_kkt_fused_edges=int(outer_kkt_fused_edges),
-        outer_kkt_nonzero_edges=int(outer_kkt_nonzero_edges),
-        outer_stationarity_residual_before_dual_refine=float(
-            outer_stationarity_residual_before_dual_refine
-        ),
-        outer_stationarity_residual_after_dual_refine=float(
-            outer_stationarity_residual_after_dual_refine
-        ),
-        converged_inner=bool(converged_inner),
-        converged_outer=bool(converged_outer),
-        final_relative_objective_change=float(final_relative_objective_change),
-        final_step_residual=float(final_step_residual),
-        accepted_outer_steps=int(accepted_outer_steps),
-        accepted_full_steps=int(accepted_full_steps),
-        accepted_damped_steps=int(accepted_damped_steps),
-        attempted_outer_steps=int(attempted_outer_steps),
-        failed_majorization_checks=int(failed_majorization_checks),
-        failed_inner_model_checks=int(failed_inner_model_checks),
-        failed_em_envelope_checks=int(failed_em_envelope_checks),
-        failed_descent_checks=int(failed_descent_checks),
-        failed_nonfinite_checks=int(failed_nonfinite_checks),
-        mm_consistency_violations=int(mm_consistency_violations),
-        failure_reason=str(failure_reason),
-        selection_eligible=bool(selection_eligible),
-        stationarity_certified=bool(stationarity_certified),
-        global_optimality_certified=bool(global_optimality_certified),
-        global_optimality_basis=str(global_optimality_basis),
-        number_of_starts=1,
-        number_of_finite_starts=int(np.isfinite(float(authoritative_objective))),
-        best_start_objective=float(authoritative_objective),
-        second_best_start_objective=float("nan"),
-        objective_spread_across_starts=0.0,
-        selected_start_objective_rank=1,
-        solver_state=solver_state_out,
-        torch_result=torch_result,
+    if not np.isclose(
+        terminal_components.residual,
+        authoritative_kkt_residual,
+        rtol=0.0,
+        atol=8.0 * np.finfo(np.float64).eps * (1.0 + authoritative_kkt_residual),
+    ):
+        raise AssertionError("Terminal KKT components do not reproduce the audit.")
+    terminal_work = replace(
+        work_counters,
+        outer_iterations=int(iterations),
         inner_iterations=int(inner_iterations),
-        admm_iterations=(
-            int(work_counters.dense_iterations)
-            if inner_solver == "admm_complete_graph"
-            else 0
+    )
+    return RawFit(
+        phi=phi_np.astype(phi_np.dtype, copy=False),
+        objective=ObjectiveValue(
+            fit_loss=float(authoritative_fit_loss),
+            fusion_penalty=float(authoritative_objective - authoritative_fit_loss),
+            total=float(authoritative_objective),
         ),
-        inner_solver=str(inner_solver),
-        certificate=certificate,
-        exactness_provenance=exactness_provenance,
+        certificate=CertificateResult(
+            components=terminal_components,
+            progress=KKTDiagnostics.from_mapping(final_outer_diag),
+            certified=bool(full_kkt_certified),
+            admissible=bool(selection_eligible),
+            stationary=bool(stationarity_certified),
+            global_optimum=bool(global_optimality_certified),
+            status=str(outer_kkt_certificate_status),
+            tolerance=5.0 * float(tol),
+            scope="full_original_graph",
+            gradient_scope=str(gradient_scope),
+            directional_admissible=bool(directional_kink_admissible),
+            witness=certificate,
+            working_residual=float(working_precision_kkt_residual),
+            working_dtype=dtype_name(runtime.dtype),
+            audit_dtype=str(certificate_audit_dtype),
+            precision_polished=False,
+            precision_polish_delta=0.0,
+            residual_method="componentwise_box_cone_backward_error_v1",
+            backend_name=str(inner_solver),
+            fallback_reason=str(fallback_reason),
+            fused_edges=int(outer_kkt_fused_edges),
+            nonzero_edges=int(outer_kkt_nonzero_edges),
+            stationarity_before=float(
+                outer_stationarity_residual_before_dual_refine
+            ),
+            stationarity_after=float(
+                outer_stationarity_residual_after_dual_refine
+            ),
+        ),
+        convergence=ConvergenceResult(
+            iterations=int(iterations),
+            converged=bool(converged),
+            inner_converged=bool(converged_inner),
+            outer_converged=bool(converged_outer),
+            relative_objective_change=float(final_relative_objective_change),
+            step_residual=float(final_step_residual),
+            accepted_outer_steps=int(accepted_outer_steps),
+            accepted_full_steps=int(accepted_full_steps),
+            accepted_damped_steps=int(accepted_damped_steps),
+            attempted_outer_steps=int(attempted_outer_steps),
+            failed_majorization_checks=int(failed_majorization_checks),
+            failed_inner_model_checks=int(failed_inner_model_checks),
+            failed_em_envelope_checks=int(failed_em_envelope_checks),
+            failed_descent_checks=int(failed_descent_checks),
+            failed_nonfinite_checks=int(failed_nonfinite_checks),
+            mm_consistency_violations=int(mm_consistency_violations),
+            failure_reason=str(failure_reason),
+        ),
+        work=terminal_work,
+        multistart=MultiStartResult(
+            number_of_starts=1,
+            number_of_finite_starts=int(np.isfinite(authoritative_objective)),
+            best_objective=float(authoritative_objective),
+            second_best_objective=float("nan"),
+            objective_spread=0.0,
+            selected_objective_rank=1,
+            threshold_component_count=int(n_clusters),
+        ),
+        state=solver_state_out,
+        provenance=FitProvenance(
+            objective_key=make_lambda_objective_key(
+                base_objective_key,
+                lambda_value=float(lambda_value),
+            ),
+            graph_name=str(graph.name),
+            device=runtime.device_name,
+            dtype=dtype_name(runtime.dtype),
+            inner_solver=str(inner_solver),
+            global_optimality_basis=str(global_optimality_basis),
+            likelihood_eps=float(eps),
+        ),
     )
 
 
@@ -2751,7 +2714,7 @@ def fit_observed_data_pairwise_fusion(
     certificate_refinement_rounds: int = DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
     certificate_column_tol_scale: float = DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
     verbose: bool = False,
-) -> FusionFitArtifacts:
+) -> RawFit:
     tol = _validate_solver_tolerance(tol)
     lambda_value = validate_lambda_value(lambda_value)
     objective_shape = objective_shape_for_data(data, objective_shape)
@@ -2846,7 +2809,7 @@ def fit_observed_data_pairwise_fusion(
         start: np.ndarray | torch.Tensor,
         state: SolverState | None,
         polish: bool = False,
-    ) -> FusionFitArtifacts:
+    ) -> RawFit:
         if context.base_objective_key is None:
             raise ValueError("SolverContext lacks a typed base-objective key.")
         return _fit_from_start(
@@ -2898,41 +2861,36 @@ def fit_observed_data_pairwise_fusion(
     )
 
     def precision_residual_is_only_blocker(
-        working: FusionFitArtifacts,
+        working: RawFit,
     ) -> bool:
-        provenance = working.exactness_provenance
-        if provenance is None:
-            return False
-        status = str(provenance.status)
+        terminal = working.certificate
+        status = str(terminal.status)
         residual_only_compressed = bool(
-            isinstance(working.certificate, CompressedEdgeCertificate)
+            isinstance(terminal.witness, CompressedEdgeCertificate)
             and status == "not_certified"
-            and int(provenance.full_certificate_audit_passes) > 0
+            and int(working.work.full_certificate_audit_passes) > 0
         )
         return bool(
-            np.isfinite(float(working.penalized_objective))
-            and int(working.mm_consistency_violations) == 0
-            and bool(provenance.directional_kink_admissible)
+            np.isfinite(float(working.objective.total))
+            and int(working.convergence.mm_consistency_violations) == 0
+            and bool(terminal.directional_admissible)
             and (status in accepted_certificate_statuses or residual_only_compressed)
-            and np.isfinite(float(working.fixed_objective_kkt_residual))
-            and float(working.fixed_objective_kkt_residual)
-            > float(provenance.tolerance)
+            and np.isfinite(float(terminal.components.residual))
+            and float(terminal.components.residual) > float(terminal.tolerance)
         )
 
     def compressed_representation_requires_fallback(
-        working: FusionFitArtifacts,
+        working: RawFit,
     ) -> bool:
-        if not isinstance(working.certificate, CompressedEdgeCertificate):
+        terminal = working.certificate
+        if not isinstance(terminal.witness, CompressedEdgeCertificate):
             return False
-        provenance = working.exactness_provenance
-        if provenance is None:
-            return True
-        status = str(provenance.status)
+        status = str(terminal.status)
         return bool(
             status in {"resource_limit", "workset_incomplete"}
             or (
                 status == "not_certified"
-                and int(provenance.full_certificate_audit_passes) == 0
+                and int(working.work.full_certificate_audit_passes) == 0
             )
         )
 
@@ -2941,7 +2899,7 @@ def fit_observed_data_pairwise_fusion(
         context: SolverContext,
         start: np.ndarray | torch.Tensor,
         state: SolverState | None,
-    ) -> FusionFitArtifacts:
+    ) -> RawFit:
         """Solve and audit one start in the requested working precision."""
 
         return solve_start_once(context=context, start=start, state=state)
@@ -2949,12 +2907,12 @@ def fit_observed_data_pairwise_fusion(
     def polish_selected_start(
         *,
         context: SolverContext,
-        working: FusionFitArtifacts,
-    ) -> FusionFitArtifacts:
+        working: RawFit,
+    ) -> RawFit:
         """Continue only the objective-best start in float64 when necessary."""
 
         nonlocal precision_context, precision_source_context
-        if str(working.dtype) == "float64" or working.selection_eligible:
+        if working.provenance.dtype == "float64" or working.certificate.admissible:
             return working
 
         if not precision_residual_is_only_blocker(working):
@@ -2982,21 +2940,21 @@ def fit_observed_data_pairwise_fusion(
                 dtype=torch.float64,
             )
             precision_source_context = context
-        working_phi = torch.as_tensor(
+        working_phi = torch.tensor(
             working.phi,
             dtype=torch.float64,
             device=precision_context.runtime.device,
         )
-        working_objective64 = float(working.penalized_objective)
+        working_objective64 = float(working.objective.total)
         polished = solve_start_once(
             context=precision_context,
             start=working_phi,
-            state=working.solver_state,
+            state=working.state,
             polish=True,
         )
-        if str(polished.exactness_provenance.objective_spec_hash) != str(
+        if str(polished.provenance.objective_spec_hash) != str(
             context.objective_spec_hash
-        ) or str(polished.exactness_provenance.original_graph_hash) != str(
+        ) or str(polished.provenance.original_graph_hash) != str(
             context.graph_hash
         ):
             raise AssertionError("Precision polishing changed estimator identity.")
@@ -3007,8 +2965,8 @@ def fit_observed_data_pairwise_fusion(
             * (1.0 + abs(float(working_objective64))),
         )
         if (
-            not np.isfinite(float(polished.penalized_objective))
-            or float(polished.penalized_objective)
+            not np.isfinite(float(polished.objective.total))
+            or float(polished.objective.total)
             > float(working_objective64) + objective_slack
         ):
             raise AssertionError(
@@ -3023,130 +2981,74 @@ def fit_observed_data_pairwise_fusion(
             )
         )
         polished = merge_attempted_work(polished, working)
-        polished_provenance = polished.exactness_provenance
-        if polished_provenance is None:
-            raise AssertionError("Precision-polished fit lacks exactness provenance.")
-        polished_provenance = replace(
-            polished_provenance,
-            schema_version=2,
-            working_precision_residual=float(
-                working.exactness_provenance.working_precision_residual
-                if working.exactness_provenance is not None
-                else working.fixed_objective_kkt_residual
-            ),
-            working_dtype=str(working.dtype),
-            certificate_audit_dtype="float64",
-            precision_polish_applied=True,
-            precision_polish_max_abs_phi_delta=float(max_phi_delta),
+        polished_certificate = replace(
+            polished.certificate,
+            working_residual=float(working.certificate.working_residual),
+            working_dtype=str(working.provenance.dtype),
+            audit_dtype="float64",
+            precision_polished=True,
+            precision_polish_delta=float(max_phi_delta),
             fallback_reason=_combine_fallback_reasons(
-                polished_provenance.fallback_reason,
+                polished.certificate.fallback_reason,
                 "float64_fixed_objective_precision_polish",
             ),
         )
-        torch_result = polished.torch_result
-        if torch_result is not None:
-            torch_result = replace(
-                torch_result,
-                exactness_provenance=polished_provenance,
-            )
-        return replace(
-            polished,
-            exactness_provenance=polished_provenance,
-            torch_result=torch_result,
-        )
+        return replace(polished, certificate=polished_certificate)
 
     def mark_fallback(
-        artifacts: FusionFitArtifacts,
+        artifacts: RawFit,
         *,
         reason: str,
         backend_name: str | None = None,
-    ) -> FusionFitArtifacts:
-        fallback_backend = (
-            str(backend_name) if backend_name is not None else artifacts.inner_solver
+    ) -> RawFit:
+        fallback_backend = str(
+            backend_name
+            if backend_name is not None
+            else artifacts.provenance.inner_solver
         )
-        fallback_provenance = (
-            replace(
-                artifacts.exactness_provenance,
-                backend_name=fallback_backend,
-                fallback_reason=_combine_fallback_reasons(
-                    artifacts.exactness_provenance.fallback_reason,
-                    reason,
-                ),
-            )
-            if artifacts.exactness_provenance is not None
-            else None
-        )
-        fallback_torch_result = (
-            replace(
-                artifacts.torch_result,
-                inner_solver=fallback_backend,
-                exactness_provenance=fallback_provenance,
-            )
-            if artifacts.torch_result is not None
-            else None
+        fallback_certificate = replace(
+            artifacts.certificate,
+            backend_name=fallback_backend,
+            fallback_reason=_combine_fallback_reasons(
+                artifacts.certificate.fallback_reason,
+                reason,
+            ),
         )
         return replace(
             artifacts,
-            inner_solver=fallback_backend,
-            exactness_provenance=fallback_provenance,
-            torch_result=fallback_torch_result,
+            certificate=fallback_certificate,
+            provenance=replace(
+                artifacts.provenance,
+                inner_solver=fallback_backend,
+            ),
         )
 
     def merge_attempted_work(
-        artifacts: FusionFitArtifacts,
-        attempted: FusionFitArtifacts | None,
-    ) -> FusionFitArtifacts:
+        artifacts: RawFit,
+        attempted: RawFit | None,
+    ) -> RawFit:
         """Preserve diagnostic work from a completed attempt before retrying."""
 
         if attempted is None:
             return artifacts
-        current_provenance = artifacts.exactness_provenance
-        attempted_provenance = attempted.exactness_provenance
-        if current_provenance is None or attempted_provenance is None:
-            return artifacts
-        merged_work = (
-            BackendWorkCounters.from_attributes(current_provenance)
-            + BackendWorkCounters.from_attributes(attempted_provenance)
-        )
-        merged_provenance = replace(
-            current_provenance,
-            backend_iterations=(
-                int(current_provenance.backend_iterations)
-                + int(attempted_provenance.backend_iterations)
-            ),
-            **merged_work.as_dict(),
+        merged_work = artifacts.work + attempted.work
+        merged_certificate = replace(
+            artifacts.certificate,
             fallback_reason=_combine_fallback_reasons(
-                attempted_provenance.fallback_reason,
-                current_provenance.fallback_reason,
+                attempted.certificate.fallback_reason,
+                artifacts.certificate.fallback_reason,
             ),
         )
-        merged_inner_iterations = int(artifacts.inner_iterations) + int(
-            attempted.inner_iterations
-        )
-        merged_torch_result = artifacts.torch_result
-        if merged_torch_result is not None:
-            merged_torch_result = replace(
-                merged_torch_result,
-                inner=replace(
-                    merged_torch_result.inner,
-                    iterations=(
-                        int(merged_torch_result.inner.iterations)
-                        + int(attempted.inner_iterations)
-                    ),
-                ),
-                exactness_provenance=merged_provenance,
-            )
         return replace(
             artifacts,
-            inner_iterations=merged_inner_iterations,
-            exactness_provenance=merged_provenance,
-            torch_result=merged_torch_result,
+            work=merged_work,
+            certificate=merged_certificate,
         )
 
     cpu_fallback_context: SolverContext | None = None
-    best_artifacts: FusionFitArtifacts | None = None
+    best_artifacts: RawFit | None = None
     best_artifacts_index = -1
-    start_artifacts: list[FusionFitArtifacts] = []
+    start_artifacts: list[RawFit] = []
     start_contexts: list[SolverContext] = []
     for start in start_bank:
         state_for_start = (
@@ -3155,7 +3057,7 @@ def fit_observed_data_pairwise_fusion(
             else None
         )
         cpu_seed = state_for_start.phi if state_for_start is not None else start
-        attempted_artifacts: FusionFitArtifacts | None = None
+        attempted_artifacts: RawFit | None = None
         artifacts_context = solver_context
         try:
             artifacts = run_start(
@@ -3169,8 +3071,8 @@ def fit_observed_data_pairwise_fusion(
             if compressed_terminal_not_certified:
                 attempted_artifacts = artifacts
                 cpu_seed = (
-                    artifacts.torch_result.phi_raw
-                    if artifacts.torch_result is not None
+                    artifacts.state.phi
+                    if artifacts.state is not None
                     else artifacts.phi
                 )
                 if normalized_fallback_policy == "error":
@@ -3337,7 +3239,7 @@ def fit_observed_data_pairwise_fusion(
         )
     start_artifacts[best_artifacts_index] = best_artifacts
     objectives = np.asarray(
-        [float(item.penalized_objective) for item in start_artifacts], dtype=np.float64
+        [float(item.objective.total) for item in start_artifacts], dtype=np.float64
     )
     finite_objectives = objectives[np.isfinite(objectives)]
     if finite_objectives.size:
@@ -3347,7 +3249,7 @@ def fit_observed_data_pairwise_fusion(
             float(sorted_objectives[1]) if sorted_objectives.size >= 2 else float("nan")
         )
         objective_spread = float(sorted_objectives[-1] - sorted_objectives[0])
-        selected_objective = float(best_artifacts.penalized_objective)
+        selected_objective = float(best_artifacts.objective.total)
         selected_rank = int(1 + np.sum(finite_objectives < selected_objective - 1e-8))
     else:
         best_start_objective = float("nan")
@@ -3356,10 +3258,13 @@ def fit_observed_data_pairwise_fusion(
         selected_rank = 0
     return replace(
         best_artifacts,
-        number_of_starts=int(len(start_artifacts)),
-        number_of_finite_starts=int(finite_objectives.size),
-        best_start_objective=float(best_start_objective),
-        second_best_start_objective=float(second_best_start_objective),
-        objective_spread_across_starts=float(objective_spread),
-        selected_start_objective_rank=int(selected_rank),
+        multistart=replace(
+            best_artifacts.multistart,
+            number_of_starts=int(len(start_artifacts)),
+            number_of_finite_starts=int(finite_objectives.size),
+            best_objective=float(best_start_objective),
+            second_best_objective=float(second_best_start_objective),
+            objective_spread=float(objective_spread),
+            selected_objective_rank=int(selected_rank),
+        ),
     )
