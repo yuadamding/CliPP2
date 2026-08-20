@@ -25,7 +25,6 @@ from ..core.fusion.profiles import get_computation_profile
 from ..core.fusion.types import SolverState
 from ..io.data import TumorData
 from .partitions import (
-    _cluster_sizes_text,
     _partition_signature,
     extract_certified_fusion_partition,
     extract_connected_component_partition,
@@ -34,7 +33,6 @@ from .contracts import get_selection_contract
 from .scoring import (
     _effective_bic_partition_tol,
     _normalize_selection_score_name,
-    _profile_penalty_from_fit,
 )
 from .types import (
     CandidateStaticMetadata,
@@ -208,9 +206,7 @@ def _candidate_ineligibility_reason(
             return "not_raw_fused_lambda_path"
         if not bool(raw_fit.objective_faithful):
             return "raw_objective_not_faithful"
-        if not bool(raw_fit.full_kkt_certified) or not bool(
-            raw_fit.selection_eligible
-        ):
+        if not bool(raw_fit.full_kkt_certified) or not bool(raw_fit.selection_eligible):
             return "raw_objective_not_kkt_certified"
         if not partition.certified:
             return str(partition.certification_failure_reason)
@@ -405,68 +401,6 @@ def _selection_score_diagnostics(
     }
 
 
-def _selection_refit_row(
-    *,
-    data: TumorData,
-    refit: PartitionRefitSummary,
-    score: SelectionScore,
-    cache_hit: bool,
-    raw_details: bool,
-) -> dict[str, object]:
-    diagnostics = _selection_score_diagnostics(data=data, refit=refit, score=score)
-    row: dict[str, object] = {
-        "selection_score_name": str(score.name),
-        "selection_score": float(score.value),
-        "selection_score_numerical_uncertainty": float(score.numerical_uncertainty),
-        "selection_score_lower_bound": float(score.lower_bound),
-        "selection_score_upper_bound": float(score.upper_bound),
-        "selection_loglik": float(score.loglik),
-        "selection_df": int(score.degrees_of_freedom),
-        "selection_penalty": float(score.penalty),
-        "selection_n_eff": int(score.n_eff),
-        "selection_assignment_log_evidence": float(score.assignment_log_evidence),
-        "selection_assignment_code_weight": float(score.assignment_code_weight),
-        "selection_assignment_penalty": float(score.assignment_penalty),
-        "selection_assignment_dirichlet_alpha": float(score.assignment_dirichlet_alpha),
-        "selection_assignment_model_id": str(score.assignment_model_id),
-        "selection_assignment_symmetry_mode": str(score.assignment_symmetry_mode),
-        "selection_assignment_arithmetic_uncertainty": float(
-            score.assignment_arithmetic_uncertainty
-        ),
-        "classic_bic": float(diagnostics["classic_bic"]),
-        "bic_loglik_source": str(refit.loglik_source),
-        "bic_refit_finite_candidate_found": bool(refit.finite_candidate_found),
-        "bic_refit_cache_hit": bool(cache_hit),
-        "refit_global_optimum_certified": bool(refit.global_optimum_certified),
-        "refit_global_lower_bound": float(refit.global_lower_bound),
-        "refit_global_optimality_gap": float(refit.global_optimality_gap),
-        "refit_global_certificate_method": str(refit.global_certificate_method),
-        "refit_global_certificate_intervals": int(refit.global_certificate_intervals),
-        "refit_numerically_resolved": bool(refit.refit_numerically_resolved),
-        "refit_loglik": float(refit.loglik),
-        "refit_fit_loss": float(refit.fit_loss),
-        "refit_active_df": int(refit.active_df),
-        "refit_mode": str(refit.refit_mode),
-        "refit_coordinate_count": int(refit.refit_coordinate_count),
-        "refit_finite_coordinate_count": int(refit.refit_finite_coordinate_count),
-        "refit_total_grid_points": int(refit.refit_total_grid_points),
-        "refit_max_grid_spacing": float(refit.refit_max_grid_spacing),
-        "refit_total_candidate_basins": int(refit.refit_total_candidate_basins),
-        "refit_total_refined_candidates": int(refit.refit_total_refined_candidates),
-        "refit_min_best_second_loss_gap": float(refit.refit_min_best_second_loss_gap),
-    }
-    if raw_details:
-        row.update(
-            classic_bic_depth_n=float(diagnostics["classic_bic_depth_n"]),
-            classic_bic_active_df=float(diagnostics["classic_bic_active_df"]),
-            refit_loglik_refinement_delta=float(refit.refit_loglik_refinement_delta),
-            refit_max_center_refinement_delta=float(
-                refit.refit_max_center_refinement_delta
-            ),
-        )
-    return row
-
-
 def _score_fixed_labels(
     *,
     data: TumorData,
@@ -576,7 +510,7 @@ def evaluate_raw_fusion_candidate(
     precomputed_fit: FitResult | None = None,
 ) -> tuple[
     FitResult,
-    dict[str, float | int | str | bool],
+    dict[str, object],
     RawFusionCandidate,
 ]:
     candidate_start_time = perf_counter()
@@ -667,187 +601,29 @@ def evaluate_raw_fusion_candidate(
     )
     validate_candidate_identity(candidate)
 
-    penalty_value, profile_penalty_value = _profile_penalty_from_fit(fit)
-    raw_objective_uncertainty = max(
-        1e-10 * (1.0 + abs(float(fit.penalized_objective))),
-        32.0 * np.finfo(np.float64).eps * (1.0 + abs(float(fit.penalized_objective))),
+    score_diagnostics = _selection_score_diagnostics(
+        data=data,
+        refit=refit,
+        score=score,
     )
-    row: dict[str, float | int | str | bool] = {
+    diagnostics: dict[str, object] = {
         "tumor_id": data.tumor_id,
         "selection_method": selection_method,
-        "selection_contract_id": str(contract.contract_id),
         "selection_contract_json": str(contract.to_json()),
         "selection_profile": profile_name,
-        "computation_profile": str(computation_profile.name),
-        "target_estimator": "complete_graph_pairwise_fusion",
-        "solution_mode": (
-            "strict_certified"
-            if computation_profile.is_strict
-            else "approximate_single_tumor_search"
-        ),
         "objective_equivalent_to_strict_graph": bool(
             computation_profile.objective_equivalent_to_strict
         ),
-        "refit_mode": str(refit.refit_mode),
         "refit_global_certificate_required": bool(computation_profile.is_strict),
         "selection_step": int(selection_step),
-        "lambda": float(fit.lambda_value),
-        "raw_objective_numerical_uncertainty": float(raw_objective_uncertainty),
-        "raw_objective_lower_bound": float(
-            fit.penalized_objective - raw_objective_uncertainty
-        ),
-        "raw_objective_upper_bound": float(
-            fit.penalized_objective + raw_objective_uncertainty
-        ),
-        "raw_objective_uncertainty_certified": False,
-        "lambda_applicable": True,
-        "candidate_pool_source": "raw_fused_lambda_path",
-        "candidate_family": "raw_fusion",
-        "estimator_role": str(fit.estimator_role),
-        **_selection_refit_row(
-            data=data,
-            refit=refit,
-            score=score,
-            cache_hit=evaluation.cache_hit,
-            raw_details=True,
-        ),
-        "partition_signature": str(partition.signature),
-        "partition_source": str(partition.source),
-        "partition_tol": float(partition.tolerance),
-        "partition_certified": bool(partition.certified),
-        "partition_certification_applicable": True,
-        "partition_maximal": bool(partition.maximal),
-        "partition_cross_close_edge_found": bool(partition.cross_close_edge_found),
-        "partition_certificate_graph_hash_matches": bool(
-            partition.certificate_graph_hash_matches
-        ),
-        "partition_certification_failure_reason": str(
-            partition.certification_failure_reason
-        ),
-        "partition_max_diameter": float(partition.max_diameter),
-        "partition_diameter_exact": bool(partition.diameter_exact),
-        "n_clusters": int(partition.n_clusters),
-        "cluster_sizes": _cluster_sizes_text(partition.labels),
-        "partition_labels_0based": ",".join(
-            str(int(value)) for value in np.asarray(partition.labels, dtype=np.int64)
-        ),
-        "eligible_for_selection": bool(candidate.eligible_for_selection),
-        "ineligibility_reason": str(candidate.ineligibility_reason),
-        "raw_kkt_eligible": bool(fit.selection_eligible),
-        "raw_objective_certified": bool(raw_objective_certified),
-        "converged": bool(fit.converged),
-        "raw_fit_status": str(fit.failure_reason),
-        "loglik": float(fit.loglik),
-        "fit_loss": float(-fit.loglik),
-        "penalized_objective": float(fit.penalized_objective),
-        "penalty": float(penalty_value),
-        "profile_penalty": float(profile_penalty_value),
-        "fixed_objective_kkt_residual": float(fit.fixed_objective_kkt_residual),
-        "working_precision_kkt_residual": float(
-            fit.working_precision_kkt_residual
-        ),
-        "outer_backward_error_stationarity_residual": float(
-            fit.outer_backward_error_stationarity_residual
-        ),
-        "outer_backward_error_edge_subgradient_residual": float(
-            fit.outer_backward_error_edge_subgradient_residual
-        ),
-        "outer_backward_error_dual_ball_residual": float(
-            fit.outer_backward_error_dual_ball_residual
-        ),
-        "certificate_residual_method": str(
-            fit.exactness_provenance.residual_method
-            if fit.exactness_provenance is not None
-            else "unknown"
-        ),
-        "working_dtype": str(fit.working_dtype),
-        "certificate_audit_dtype": str(fit.certificate_audit_dtype),
-        "precision_polish_applied": bool(fit.precision_polish_applied),
-        "precision_polish_max_abs_phi_delta": float(
-            fit.precision_polish_max_abs_phi_delta
-        ),
-        "directional_kink_admissible": bool(
-            fit.exactness_provenance.directional_kink_admissible
-            if fit.exactness_provenance is not None
-            else False
-        ),
-        "outer_stationarity_residual": float(fit.outer_stationarity_residual),
-        "outer_projected_stationarity_norm": float(
-            fit.outer_projected_stationarity_norm
-        ),
-        "outer_stationarity_normalizer": float(fit.outer_stationarity_normalizer),
-        "outer_smooth_gradient_norm": float(fit.outer_smooth_gradient_norm),
-        "outer_fusion_adjustment_norm": float(fit.outer_fusion_adjustment_norm),
-        "outer_edge_subgradient_residual": float(fit.outer_edge_subgradient_residual),
-        "outer_dual_ball_residual": float(fit.outer_dual_ball_residual),
-        "outer_box_residual": float(fit.outer_box_residual),
-        "outer_box_primal_violation": float(fit.outer_box_primal_violation),
-        "outer_stationarity_residual_before_dual_refine": float(
-            fit.outer_stationarity_residual_before_dual_refine
-        ),
-        "outer_stationarity_residual_after_dual_refine": float(
-            fit.outer_stationarity_residual_after_dual_refine
-        ),
-        "outer_kkt_fused_edges": int(fit.outer_kkt_fused_edges),
-        "outer_kkt_nonzero_edges": int(fit.outer_kkt_nonzero_edges),
-        "stationarity_certified": bool(fit.stationarity_certified),
-        "global_optimality_certified": bool(fit.global_optimality_certified),
-        "global_optimality_basis": str(fit.global_optimality_basis),
-        "number_of_starts": int(fit.number_of_starts),
-        "number_of_finite_starts": int(fit.number_of_finite_starts),
-        "best_start_objective": float(fit.best_start_objective),
-        "second_best_start_objective": float(fit.second_best_start_objective),
-        "objective_spread_across_starts": float(fit.objective_spread_across_starts),
-        "selected_start_objective_rank": int(fit.selected_start_objective_rank),
-        "iterations": int(fit.iterations),
-        "inner_iterations": int(fit.inner_iterations),
-        "admm_iterations": int(fit.admm_iterations),
-        "inner_solver": str(fit.inner_solver),
-        "inner_backend": str(fit.inner_backend),
-        "backend_iterations": int(fit.backend_iterations),
-        "workset_iterations": int(fit.workset_iterations),
-        "workset_expansions": int(fit.workset_expansions),
-        "streamed_edge_passes": int(fit.streamed_edge_passes),
-        "dense_iterations": int(fit.dense_iterations),
-        "certificate_iterations": int(fit.certificate_iterations),
-        "accepted_outer_steps": int(fit.accepted_outer_steps),
-        "attempted_outer_steps": int(fit.attempted_outer_steps),
-        "accepted_full_steps": int(fit.accepted_full_steps),
-        "accepted_damped_steps": int(fit.accepted_damped_steps),
-        "failed_majorization_checks": int(fit.failed_majorization_checks),
-        "failed_inner_model_checks": int(fit.failed_inner_model_checks),
-        "failed_em_envelope_checks": int(fit.failed_em_envelope_checks),
-        "failed_descent_checks": int(fit.failed_descent_checks),
-        "failed_nonfinite_checks": int(fit.failed_nonfinite_checks),
-        "final_relative_objective_change": float(fit.final_relative_objective_change),
-        "final_step_residual": float(fit.final_step_residual),
-        "converged_inner": bool(fit.converged_inner),
-        "converged_outer": bool(fit.converged_outer),
-        "full_certificate_audit_passes": int(fit.full_certificate_audit_passes),
-        "fallback_reason": str(fit.fallback_reason),
-        "exactness_provenance_version": int(fit.exactness_provenance_version),
-        "objective_faithful": bool(fit.objective_faithful),
-        "objective_spec_hash": str(fit.objective_spec_hash),
-        "base_fusion_objective_hash": str(fit.base_fusion_objective_hash),
-        "original_graph_hash": str(fit.original_graph_hash),
-        "certificate_problem_hash": str(fit.certificate_problem_hash),
-        "certificate_scope": str(fit.certificate_scope),
-        "certificate_gradient_scope": str(fit.certificate_gradient_scope),
-        "full_kkt_certified": bool(fit.full_kkt_certified),
-        "full_kkt_certificate_status": str(fit.full_kkt_certificate_status),
-        "full_kkt_tolerance": float(fit.full_kkt_tolerance),
-        "raw_solver_primal_tol": float(raw_fit_options.tol),
-        "outer_kkt_certificate_status": str(fit.outer_kkt_certificate_status),
-        "outer_num_frozen_coordinates": int(fit.outer_num_frozen_coordinates),
-        "mm_consistency_violations": int(fit.mm_consistency_violations),
-        "failure_reason": str(fit.failure_reason),
+        "classic_bic": float(score_diagnostics["classic_bic"]),
+        "bic_refit_cache_hit": bool(evaluation.cache_hit),
+        "classic_bic_depth_n": float(score_diagnostics["classic_bic_depth_n"]),
+        "classic_bic_active_df": float(score_diagnostics["classic_bic_active_df"]),
         "candidate_elapsed_seconds": float(perf_counter() - candidate_start_time),
         "raw_fit_elapsed_seconds": float(raw_fit_elapsed_seconds),
         "bic_refit_elapsed_seconds": float(refit_elapsed_seconds),
-        "primary_phi_source": "raw_pairwise_fusion",
-        "refit_phi_source": "fixed_partition_refit",
-        "device": str(fit.device),
-        "dtype": str(fit.dtype),
+        "raw_solver_primal_tol": float(raw_fit_options.tol),
         "tol": float(raw_fit_options.tol),
         "outer_max_iter": int(raw_fit_options.outer_max_iter),
         "inner_max_iter": int(raw_fit_options.inner_max_iter),
@@ -867,7 +643,7 @@ def evaluate_raw_fusion_candidate(
         "fit_start_mode": str(start_mode),
         "solver_state_warm_start": bool(solver_state is not None),
     }
-    return fit, row, candidate
+    return fit, diagnostics, candidate
 
 
 def evaluate_direct_partition_candidate(
@@ -945,78 +721,22 @@ def evaluate_direct_partition_candidate(
         computation_profile=str(profile.name),
     )
     validate_candidate_identity(candidate)
-    row: dict[str, object] = {
-        "_candidate_id": int(candidate_id),
+    score_diagnostics = _selection_score_diagnostics(
+        data=data,
+        refit=refit,
+        score=score,
+    )
+    diagnostics: dict[str, object] = {
         "tumor_id": str(data.tumor_id),
-        "candidate_id": int(candidate_id),
-        "candidate_family": "direct_partition",
-        "candidate_pool_source": str(source),
-        "partition_source": str(source),
-        "partition_signature": str(signature),
-        "requested_K": int(requested_k),
-        "n_clusters": int(n_clusters),
-        "cluster_sizes": _cluster_sizes_text(labels),
-        "partition_labels_0based": ",".join(str(int(value)) for value in labels),
-        "lambda": float("nan"),
-        "lambda_applicable": False,
-        "parent_raw_candidate_id": (
-            float("nan")
-            if parent_raw_candidate_id is None
-            else int(parent_raw_candidate_id)
-        ),
-        "parent_raw_lambda": (
-            float("nan") if parent_raw_lambda is None else float(parent_raw_lambda)
-        ),
-        "parent_raw_phi_hash": str(parent_raw_phi_hash),
-        "selection_contract_id": str(generation_contract_id),
         "selection_contract_json": get_selection_contract(
             generation_contract_id
         ).to_json(),
-        "generation_contract_id": str(generation_contract_id),
         "pre_refinement_signature": str(pre_signature),
-        "cem_iterations": int(partition.cem_iterations),
-        "component_death_count": int(partition.component_death_count),
-        "refinement_score_before": float(partition.refinement_score_before),
-        "refinement_score_after": float(partition.refinement_score_after),
-        "deterministic_partition_generation": bool(partition.deterministic_generation),
-        "direct_partition_identity_certified": True,
-        "partition_certified": False,
-        "partition_certification_applicable": False,
-        # These are fusion-summary predicates, not direct-partition
-        # certification claims.  The direct candidate is certified through
-        # its deterministic identity, fixed-label refit, and reconstructible
-        # score instead.
-        "partition_maximal": False,
-        "partition_diameter_exact": False,
-        "partition_max_diameter": float("nan"),
-        "partition_certification_failure_reason": "not_applicable_direct_partition",
-        **_selection_refit_row(
-            data=data,
-            refit=refit,
-            score=score,
-            cache_hit=evaluation.cache_hit,
-            raw_details=False,
-        ),
-        "eligible_for_selection": bool(candidate.eligible_for_selection),
-        "ineligibility_reason": str(candidate.ineligibility_reason),
-        "converged": bool(refit.finite_candidate_found),
-        "estimator_role": "direct_partition_candidate",
-        "raw_objective_certified": False,
-        "raw_kkt_eligible": False,
-        "objective_faithful": False,
-        "raw_certificate_status": "not_applicable_direct_partition",
-        "full_kkt_certified": False,
-        "full_kkt_certificate_status": "not_applicable_direct_partition",
-        "fixed_objective_kkt_residual": float("nan"),
-        "penalized_objective": float("nan"),
-        "mm_consistency_violations": 0,
-        "selection_step": int(candidate_id),
+        "classic_bic": float(score_diagnostics["classic_bic"]),
+        "bic_refit_cache_hit": bool(evaluation.cache_hit),
         "candidate_elapsed_seconds": float(perf_counter() - started),
-        "computation_profile": str(profile.name),
-        "primary_phi_source": "raw_pairwise_fusion_reference",
-        "refit_phi_source": "selected_direct_partition_refit",
     }
-    return row, candidate
+    return diagnostics, candidate
 
 
 __all__ = [

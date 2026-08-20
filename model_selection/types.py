@@ -185,16 +185,11 @@ CandidateFamily = Literal["raw_fusion", "direct_partition"]
 
 @dataclass(frozen=True)
 class CandidateRecord:
-    """Typed selection unit with an inert reporting payload.
-
-    ``row`` is retained for the in-memory search-table compatibility surface.
-    Numerical admission and model choice must use the typed properties below,
-    never values recovered from that reporting dictionary.
-    """
+    """Typed selection unit; diagnostics never control admission or selection."""
 
     candidate_id: int
     candidate: SelectablePartitionCandidate
-    row: dict[str, object]
+    diagnostics: dict[str, object]
 
     def __post_init__(self) -> None:
         if int(self.candidate_id) < 0:
@@ -336,6 +331,7 @@ class SelectedModel:
             or not raw.partition.certified
         ):
             raise ValueError("Raw reference must remain a certified raw-fusion model.")
+
 
 @dataclass
 class BICSelectionResult:

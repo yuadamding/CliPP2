@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
 
 from ..core.model import FitOptions, FitResult
 from .config import SELECTION_SCORE_NAMES
@@ -19,9 +18,7 @@ _EXACT_OBSERVED_OBJECTIVE_GRADIENT_SCOPES = frozenset(
     }
 )
 _EXACT_CERTIFICATE_SCHEMA_VERSION = 2
-_EXACT_CERTIFICATE_RESIDUAL_METHOD = (
-    "componentwise_box_cone_backward_error_v1"
-)
+_EXACT_CERTIFICATE_RESIDUAL_METHOD = "componentwise_box_cone_backward_error_v1"
 _EXACT_CERTIFICATE_STATUSES = frozenset(
     {
         "certified",
@@ -50,63 +47,14 @@ def _normalize_selection_score_name(selection_score: str) -> str:
     )
 
 
-def _exact_fusion_certificate_mask(search_df: pd.DataFrame) -> np.ndarray:
-    """Compatibility parser for persisted current-schema search rows."""
-
-    def text(row: pd.Series, column: str) -> str:
-        value = row.get(column)
-        try:
-            if pd.isna(value):
-                return ""
-        except (TypeError, ValueError):
-            return ""
-        return str(value).strip()
-
-    def number(row: pd.Series, column: str) -> float:
-        return _number_or_nan(row.get(column, np.nan))
-
-    def certified(row: pd.Series) -> bool:
-        residual = number(row, "fixed_objective_kkt_residual")
-        tolerance = number(row, "full_kkt_tolerance")
-        return bool(
-            number(row, "exactness_provenance_version")
-            == _EXACT_CERTIFICATE_SCHEMA_VERSION
-            and text(row, "certificate_residual_method")
-            == _EXACT_CERTIFICATE_RESIDUAL_METHOD
-            and text(row, "certificate_audit_dtype") == "float64"
-            and _bool_with_default(row.get("raw_kkt_eligible"))
-            and text(row, "estimator_role") == "raw_fused_lambda_path"
-            and _bool_with_default(row.get("objective_faithful"))
-            and bool(text(row, "objective_spec_hash"))
-            and bool(text(row, "original_graph_hash"))
-            and bool(text(row, "certificate_problem_hash"))
-            and text(row, "certificate_scope") == "full_original_graph"
-            and text(row, "certificate_gradient_scope")
-            in _EXACT_OBSERVED_OBJECTIVE_GRADIENT_SCOPES
-            and _bool_with_default(row.get("full_kkt_certified"))
-            and text(row, "full_kkt_certificate_status")
-            in _EXACT_CERTIFICATE_STATUSES
-            and np.isfinite(residual)
-            and np.isfinite(tolerance)
-            and tolerance > 0.0
-            and residual <= tolerance
-        )
-
-    if search_df.empty:
-        return np.zeros(0, dtype=bool)
-    return search_df.apply(certified, axis=1).to_numpy(dtype=bool)
-
-
 def raw_candidate_has_exact_fusion_certificate(
     candidate: RawFusionCandidate,
 ) -> bool:
     """Apply the complete schema-2 raw admission contract.
 
-    The DataFrame mask below remains a compatibility parser for historical
-    diagnostics. Current model-selection control flow calls this function on
-    the immutable raw candidate instead.  Keep every raw-candidate consumer on
-    this predicate so selection, raw-reference provenance, final-Phi parents,
-    and controller certification cannot drift apart.
+    Keep every raw-candidate consumer on this typed predicate so selection,
+    raw-reference provenance, final-Phi parents, and controller certification
+    cannot drift apart.
     """
 
     fit = candidate.raw_fit
@@ -154,9 +102,7 @@ def candidate_is_selection_eligible(
     candidate = record.candidate
     if isinstance(candidate, RawFusionCandidate):
         return raw_candidate_has_exact_fusion_certificate(candidate)
-    return bool(
-        candidate.eligible_for_selection and not strict_positive_exact_fusion
-    )
+    return bool(candidate.eligible_for_selection and not strict_positive_exact_fusion)
 
 
 def _assert_same_signature_consistency(records: list[CandidateRecord]) -> None:
@@ -174,19 +120,15 @@ def _assert_same_signature_consistency(records: list[CandidateRecord]) -> None:
         for record in matches[1:]:
             score = record.score
             refit = record.candidate.refit
-            score_consistent = (
-                (score.name, score.degrees_of_freedom, score.n_eff)
-                == (
-                    reference_score.name,
-                    reference_score.degrees_of_freedom,
-                    reference_score.n_eff,
-                )
-                and np.allclose(
-                    [score.value, score.numerical_uncertainty],
-                    [reference_score.value, reference_score.numerical_uncertainty],
-                    rtol=0.0,
-                    atol=1e-10 * (1.0 + abs(float(reference_score.value))),
-                )
+            score_consistent = (score.name, score.degrees_of_freedom, score.n_eff) == (
+                reference_score.name,
+                reference_score.degrees_of_freedom,
+                reference_score.n_eff,
+            ) and np.allclose(
+                [score.value, score.numerical_uncertainty],
+                [reference_score.value, reference_score.numerical_uncertainty],
+                rtol=0.0,
+                atol=1e-10 * (1.0 + abs(float(reference_score.value))),
             )
             refit_consistent = (
                 refit.partition_signature == signature
@@ -403,48 +345,6 @@ def _candidate_is_provisionally_comparable(record: CandidateRecord) -> bool:
         return True
     objective = record.penalized_objective
     return bool(objective is not None and np.isfinite(float(objective)))
-
-
-def _bool_with_default(value: object, default: bool = False) -> bool:
-    if value is None:
-        return bool(default)
-    try:
-        if pd.isna(value):
-            return bool(default)
-    except (TypeError, ValueError):
-        pass
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"0", "false", "f", "no", "n", ""}:
-            return False
-        if normalized in {"1", "true", "t", "yes", "y"}:
-            return True
-        return bool(default)
-    if isinstance(value, (bool, np.bool_)):
-        return bool(value)
-    if isinstance(value, (int, np.integer, float, np.floating)):
-        numeric = float(value)
-        if numeric == 0.0:
-            return False
-        if numeric == 1.0:
-            return True
-    return bool(default)
-
-
-def _strict_bool_mask(values: pd.Series) -> np.ndarray:
-    return values.map(lambda value: _bool_with_default(value, default=False)).to_numpy(
-        dtype=bool, copy=True
-    )
-
-
-def _annotate_bic_diagnostics(search_df: pd.DataFrame) -> pd.DataFrame:
-    enriched = search_df.copy()
-    eligible = enriched.get(
-        "eligible_for_selection",
-        pd.Series(False, index=enriched.index),
-    )
-    enriched["bic_selection_eligible"] = _strict_bool_mask(eligible)
-    return enriched
 
 
 def _canonical_lambda(value: float) -> float:
