@@ -23,7 +23,7 @@ from .core.fusion.profiles import (
     DEFAULT_COMPUTATION_PROFILE,
     get_computation_profile,
 )
-from .core.model import FitOptions
+from .config import FitOptions
 from .model_selection.contracts import (
     DEFAULT_SELECTION_CONTRACT,
     SELECTION_CONTRACT_IDS,

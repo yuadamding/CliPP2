@@ -4,111 +4,14 @@ from dataclasses import dataclass, fields
 import numpy as np
 import torch
 
+from ..config import FitConfig, FitOptions
 from ..io.data import TumorData
-from .fusion.defaults import (
-    DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
-    DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
-    DEFAULT_DENSE_FALLBACK_POLICY,
-    DEFAULT_DEVICE,
-    DEFAULT_DTYPE,
-    DEFAULT_OPTIMIZATION_TOLERANCE,
-    DEFAULT_WORKSET_ADD_BATCH,
-    DEFAULT_WORKSET_MAX_BYTES,
-    DEFAULT_WORKSET_MAX_EXPANSIONS,
-)
-from .fusion.profiles import (
-    DEFAULT_COMPUTATION_PROFILE,
-    get_computation_profile,
-)
 from .fusion.solver import fit_observed_data_pairwise_fusion
 from .fusion.types import (
     FusionFitArtifacts,
-    PairwiseFusionGraph,
     SolverContext,
     SolverState,
 )
-
-
-@dataclass
-class FitOptions:
-    lambda_value: float
-    outer_max_iter: int = 6
-    inner_max_iter: int = 25
-    tol: float = DEFAULT_OPTIMIZATION_TOLERANCE
-    major_prior: float = 0.5
-    eps: float = 1e-6
-    graph: PairwiseFusionGraph | None = None
-    adaptive_weight_gamma: float = 1.0
-    adaptive_weight_floor: float = 1e-6
-    adaptive_weight_baseline: float = 1.0
-    device: str = DEFAULT_DEVICE
-    dtype: str = DEFAULT_DTYPE
-    summary_tol: float | None = 2e-4
-    selection_score: str = "fixed_partition_dirichlet_score"
-    selection_partition_tol: float = 2e-4
-    selection_refit_tol: float = 1e-5
-    selection_refit_max_iter: int = 64
-    selection_contract: str = "hybrid-ward-cem-v1"
-    selection_dirichlet_alpha: float = 1.0
-    selection_dirichlet_code_weight: float = 0.7
-    objective_shape: str = "auto"
-    workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES
-    compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES
-    dense_fallback_policy: str = DEFAULT_DENSE_FALLBACK_POLICY
-    workset_add_batch: int = DEFAULT_WORKSET_ADD_BATCH
-    workset_max_expansions: int = DEFAULT_WORKSET_MAX_EXPANSIONS
-    certificate_max_iter: int = 128
-    certificate_refinement_rounds: int = 1
-    certificate_column_tol_scale: float = DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE
-    verbose: bool = False
-    computation_profile: str = DEFAULT_COMPUTATION_PROFILE
-
-    def __post_init__(self) -> None:
-        from ..model_selection.contracts import get_selection_contract
-
-        profile = get_computation_profile(self.computation_profile)
-        self.computation_profile = profile.name
-        contract = get_selection_contract(self.selection_contract)
-        self.selection_contract = contract.contract_id
-        self.selection_dirichlet_alpha = float(
-            contract.partition_config.classification_alpha
-        )
-        self.selection_dirichlet_code_weight = float(
-            contract.partition_config.classification_code_weight
-        )
-        if contract.force_float64:
-            self.dtype = "float64"
-        score = str(self.selection_score).strip().lower().replace("-", "_")
-        if score not in {
-            "fixed_partition_bic",
-            "fixed_partition_dirichlet_score",
-        }:
-            raise ValueError("Unknown fixed-partition selection score.")
-        self.selection_score = score
-        finite_positive = {
-            "tol": self.tol,
-            "eps": self.eps,
-            "selection_partition_tol": self.selection_partition_tol,
-            "selection_refit_tol": self.selection_refit_tol,
-            "certificate_column_tol_scale": self.certificate_column_tol_scale,
-            "selection_dirichlet_alpha": self.selection_dirichlet_alpha,
-        }
-        for name, value in finite_positive.items():
-            if not np.isfinite(float(value)) or float(value) <= 0.0:
-                raise ValueError(f"{name} must be positive and finite.")
-        if not np.isfinite(float(self.lambda_value)) or float(self.lambda_value) < 0.0:
-            raise ValueError("lambda_value must be finite and nonnegative.")
-        if not 0.0 < float(self.major_prior) < 1.0:
-            raise ValueError("major_prior must lie strictly in (0, 1).")
-        if int(self.selection_refit_max_iter) < 1:
-            raise ValueError("selection_refit_max_iter must be positive.")
-        if (
-            not np.isfinite(float(self.selection_dirichlet_code_weight))
-            or float(self.selection_dirichlet_code_weight) < 0.0
-        ):
-            raise ValueError(
-                "selection_dirichlet_code_weight must be nonnegative and finite."
-            )
 
 
 @dataclass
@@ -169,7 +72,7 @@ class FitResult(FusionFitArtifacts):
 
 def fit_fixed_objective(
     data: TumorData,
-    options: FitOptions,
+    options: FitOptions | FitConfig,
     phi_start: np.ndarray | torch.Tensor | None = None,
     exact_pilot: np.ndarray | torch.Tensor | None = None,
     pooled_start: np.ndarray | torch.Tensor | None = None,
@@ -181,6 +84,8 @@ def fit_fixed_objective(
     solver_state: SolverState | None = None,
     compute_summary: bool = True,
 ) -> FitResult:
+    if isinstance(options, FitConfig):
+        options = options.to_options()
     artifacts = fit_observed_data_pairwise_fusion(
         data=data,
         lambda_value=float(options.lambda_value),
