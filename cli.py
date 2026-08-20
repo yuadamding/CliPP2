@@ -6,8 +6,6 @@ from pathlib import Path
 
 from .core.fusion.defaults import (
     DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
-    DEFAULT_CERTIFICATE_MAX_ITER,
-    DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
     DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
     DEFAULT_DENSE_FALLBACK_POLICY,
     DEFAULT_DEVICE,
@@ -21,9 +19,8 @@ from .core.fusion.defaults import (
 from .core.fusion.profiles import (
     COMPUTATION_PROFILE_NAMES,
     DEFAULT_COMPUTATION_PROFILE,
-    get_computation_profile,
 )
-from .config import FitOptions
+from .config import FitConfig, resolve_fit_config
 from .model_selection.contracts import (
     DEFAULT_SELECTION_CONTRACT,
     SELECTION_CONTRACT_IDS,
@@ -176,49 +173,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_profile_defaults(args: argparse.Namespace) -> None:
-    """Resolve profile-controlled defaults while preserving CLI overrides."""
-
-    profile = get_computation_profile(args.profile)
-    defaults = {
-        "outer_max_iter": int(profile.outer_max_iter),
-        "inner_max_iter": int(profile.inner_max_iter),
-        "tol": float(profile.solver_tolerance),
-        "dtype": str(profile.raw_dtype),
-        "selection_partition_tol": (
-            1e-4
-            if profile.is_strict
-            else (2e-4 if profile.name == "balanced" else 1e-3)
-        ),
-        "selection_refit_tol": (
-            1e-7
-            if profile.is_strict
-            else (1e-5 if profile.name == "balanced" else 1e-4)
-        ),
-        "selection_refit_max_iter": (
-            128 if profile.is_strict else (64 if profile.name == "balanced" else 32)
-        ),
-        "certificate_max_iter": (
-            int(DEFAULT_CERTIFICATE_MAX_ITER)
-            if profile.is_strict
-            else (128 if profile.name == "balanced" else 64)
-        ),
-        "certificate_refinement_rounds": (
-            int(DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS)
-            if profile.is_strict
-            else (1 if profile.name == "balanced" else 0)
-        ),
-    }
-    for name, value in defaults.items():
-        if getattr(args, name) is None:
-            setattr(args, name, value)
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "fit":
-        _resolve_profile_defaults(args)
         penalty = float(args.dosage_prior_penalty)
         if not math.isfinite(penalty) or penalty < 0.0:
             parser.error("--dosage-prior-penalty must be finite and nonnegative")
@@ -226,18 +184,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "selection_partition_tol",
             "selection_refit_tol",
         ):
-            value = float(getattr(args, option_name))
-            if not math.isfinite(value) or value <= 0.0:
+            raw_value = getattr(args, option_name)
+            if raw_value is not None and (
+                not math.isfinite(float(raw_value)) or float(raw_value) <= 0.0
+            ):
                 parser.error(
                     f"--{option_name.replace('_', '-')} must be positive and finite"
                 )
-        if int(args.selection_refit_max_iter) < 1:
+        if (
+            args.selection_refit_max_iter is not None
+            and int(args.selection_refit_max_iter) < 1
+        ):
             parser.error("--selection-refit-max-iter must be positive")
     return args
 
 
-def _fit_options_from_args(args: argparse.Namespace) -> FitOptions:
-    return FitOptions(
+def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
+    return resolve_fit_config(
         lambda_value=0.0,
         outer_max_iter=args.outer_max_iter,
         inner_max_iter=args.inner_max_iter,
@@ -273,7 +236,7 @@ def main(argv: list[str] | None = None) -> None:
     summary = process_tumor(
         tumor_file=Path(args.input_file),
         outdir=Path(args.outdir),
-        fit_options=_fit_options_from_args(args),
+        fit_config=_fit_config_from_args(args),
         use_warm_starts=not args.disable_warm_start,
         write_outputs=not args.skip_outputs,
         unsupported_policy=args.unsupported_policy,

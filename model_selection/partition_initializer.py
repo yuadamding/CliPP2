@@ -9,12 +9,11 @@ from ..core.fusion.partition_starts import (
     hessian_weighted_ward_label_sets_torch,
     observed_curvature_at_pilot_torch,
 )
-from ..core.model import FitOptions
+from ..config import FitConfig
 from ..io.data import TumorData
 from .config import (
     LIKELIHOOD_PARTITION_K_MAX,
 )
-from .contracts import get_selection_contract
 from .partitions import (
     _deduplicate_partition_candidates,
     _likelihood_partition_refinement_k_grid,
@@ -43,7 +42,7 @@ def generate_partition_initializer_pool(
     *,
     data: TumorData,
     pilot_phi,
-    fit_options: FitOptions,
+    fit_options: FitConfig,
     normalized_score: str,
     runtime,
     torch_data,
@@ -66,7 +65,7 @@ def generate_partition_initializer_pool(
     """
 
     generation_start = perf_counter()
-    contract = get_selection_contract(fit_options.selection_contract)
+    contract = fit_options.selection.contract
     config = contract.partition_config
     if declared_k_grid is None:
         sparse_k_grid = [
@@ -128,7 +127,7 @@ def generate_partition_initializer_pool(
             max_candidates_per_K=int(config.max_candidates_per_k),
             cem_max_iter=int(config.cem_max_iter),
             refit_max_iter=int(config.generation_refit_max_iter),
-            tol=float(fit_options.tol),
+            tol=float(fit_options.solver.tolerance),
             curvature=curvature,
             label_sets=label_sets,
             torch_data=torch_data,

@@ -18,11 +18,9 @@ from typing import cast
 import numpy as np
 
 from .._version import __version__ as _SOFTWARE_VERSION
-from ..config import FitOptions
-from ..core.fusion.profiles import ComputationProfile
-from ..core.model import FitResult
+from ..config import FitConfig
+from ..core.fusion.types import RawFit
 from ..io.data import TumorData
-from ..model_selection.contracts import get_selection_contract
 from ..model_selection.types import (
     BICSelectionResult,
     DirectPartition,
@@ -58,8 +56,7 @@ class AnalysisSerialization:
 
     data: TumorData
     input_file: Path
-    fit_options: FitOptions
-    computation_profile: ComputationProfile
+    fit_config: FitConfig
     selection_result: BICSelectionResult
     selected_candidate: SelectablePartitionCandidate
     raw_reference: RawFusionCandidate
@@ -71,8 +68,7 @@ class AnalysisSerialization:
         *,
         data: TumorData,
         input_file: Path,
-        fit_options: FitOptions,
-        computation_profile: ComputationProfile,
+        fit_config: FitConfig,
         selection_result: BICSelectionResult,
     ) -> AnalysisSerialization:
         selected_model = selection_result.selected_model
@@ -82,8 +78,7 @@ class AnalysisSerialization:
         return cls(
             data=data,
             input_file=Path(input_file),
-            fit_options=fit_options,
-            computation_profile=computation_profile,
+            fit_config=fit_config,
             selection_result=selection_result,
             selected_candidate=cast(SelectablePartitionCandidate, selected_candidate),
             raw_reference=cast(
@@ -97,7 +92,7 @@ class AnalysisSerialization:
         )
 
     @property
-    def raw_fit(self) -> FitResult:
+    def raw_fit(self) -> RawFit:
         return self.raw_reference.raw_fit
 
     @property
@@ -121,8 +116,8 @@ def analysis_summary(
     """Serialize schema-v3 diagnostics without changing estimator state."""
 
     data = analysis.data
-    fit_options = analysis.fit_options
-    profile = analysis.computation_profile
+    fit_config = analysis.fit_config
+    profile = fit_config.computation_profile
     result = analysis.selection_result
     selected_model = result.selected_model
     raw_reference = analysis.raw_reference
@@ -134,13 +129,11 @@ def analysis_summary(
     score = analysis.score
     selected_lambda = result.selected_lambda_representative
     optimum_resolved = bool(result.selection_optimum_resolved)
-    selection_contract = get_selection_contract(
-        getattr(fit_options, "selection_contract", "hybrid-ward-cem-v1")
-    )
+    selection_contract = fit_config.selection.contract
     selected_partition_certified = bool(
         isinstance(partition, FusionPartition) and partition.certified
     )
-    exactness = getattr(raw_fit, "exactness_provenance", None)
+    exactness = raw_fit.certificate
 
     return {
         "summary_schema_version": SUMMARY_SCHEMA_VERSION,
@@ -164,18 +157,14 @@ def analysis_summary(
         "objective_equivalent_to_strict_graph": bool(
             profile.objective_equivalent_to_strict
         ),
-        "scalar_mode": str(profile.scalar_mode),
+        "scalar_mode": str(fit_config.selection.refit.mode),
         "selected_refit_mode": str(refit.refit_mode),
         "selected_lambda": (
             np.nan if selected_lambda is None else float(selected_lambda)
         ),
         "selected_lambda_applicable": bool(selected_lambda is not None),
         "raw_reference_lambda": float(
-            getattr(
-                raw_fit,
-                "lambda_value",
-                np.nan if selected_lambda is None else selected_lambda,
-            )
+            raw_fit.provenance.lambda_value
         ),
         "raw_reference_partition_signature": str(raw_partition.signature),
         "raw_reference_objective_certified": bool(
@@ -241,7 +230,7 @@ def analysis_summary(
         "selection_assignment_arithmetic_uncertainty": float(
             score.assignment_arithmetic_uncertainty
         ),
-        "selected_raw_penalized_objective": float(raw_fit.penalized_objective),
+        "selected_raw_penalized_objective": float(raw_fit.objective.total),
         "selected_refit_numerically_resolved": bool(refit.refit_numerically_resolved),
         "selected_refit_global_optimum_certified": bool(
             refit.global_optimum_certified
@@ -251,33 +240,33 @@ def analysis_summary(
         "selected_refit_global_certificate_method": str(
             refit.global_certificate_method
         ),
-        "selected_raw_solver_primal_tol": float(fit_options.tol),
-        "selected_full_kkt_tolerance": float(raw_fit.full_kkt_tolerance),
+        "selected_raw_solver_primal_tol": float(fit_config.solver.tolerance),
+        "selected_full_kkt_tolerance": float(raw_fit.certificate.tolerance),
         "selected_full_kkt_residual_method": str(
             getattr(exactness, "residual_method", "unknown")
             if exactness is not None
             else "unknown"
         ),
         "selected_working_precision_kkt_residual": float(
-            getattr(raw_fit, "working_precision_kkt_residual", np.nan)
+            raw_fit.certificate.working_residual
         ),
         "selected_working_dtype": str(
-            getattr(raw_fit, "working_dtype", getattr(raw_fit, "dtype", "unknown"))
+            raw_fit.certificate.working_dtype
         ),
         "selected_certificate_audit_dtype": str(
-            getattr(raw_fit, "certificate_audit_dtype", "unknown")
+            raw_fit.certificate.audit_dtype
         ),
         "selected_precision_polish_applied": bool(
-            getattr(raw_fit, "precision_polish_applied", False)
+            raw_fit.certificate.precision_polished
         ),
         "selected_precision_polish_max_abs_phi_delta": float(
-            getattr(raw_fit, "precision_polish_max_abs_phi_delta", 0.0)
+            raw_fit.certificate.precision_polish_delta
         ),
-        "selected_objective_spec_hash": str(raw_fit.objective_spec_hash),
+        "selected_objective_spec_hash": str(raw_fit.provenance.objective_spec_hash),
         "selected_base_fusion_objective_hash": str(
-            raw_fit.base_fusion_objective_hash
+            raw_fit.provenance.base_fusion_objective_hash
         ),
-        "selected_original_graph_hash": str(raw_fit.original_graph_hash),
+        "selected_original_graph_hash": str(raw_fit.provenance.original_graph_hash),
         "selection_method": str(result.selection_method),
         "num_candidates": int(result.num_candidates),
         "num_candidates_certified": int(result.num_candidates_certified),
@@ -296,8 +285,8 @@ def analysis_summary(
             else float(result.selected_kkt_residual)
         ),
         "search_stop_reason": str(result.adaptive_search_stop_reason),
-        "device": str(raw_fit.device),
-        "dtype": str(raw_fit.dtype),
+        "device": str(raw_fit.provenance.device),
+        "dtype": str(raw_fit.provenance.dtype),
         "elapsed_seconds": float(elapsed_seconds),
         "software_version": _SOFTWARE_VERSION,
     }
@@ -316,7 +305,7 @@ def write_analysis_outputs(
         raw_fit=analysis.raw_fit,
         partition=analysis.partition,
         refit=analysis.refit,
-        major_prior=float(analysis.fit_options.major_prior),
+        major_prior=float(analysis.fit_config.major_prior),
     )
 
 

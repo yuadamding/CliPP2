@@ -14,14 +14,15 @@ from ..core.bic import (
     fixed_partition_bic,
     fixed_partition_dirichlet_score,
 )
-from ..core.model import FitOptions, FitResult, fit_fixed_objective
+from ..config import FitConfig
+from ..core.model import fit_fixed_objective
+from ..core.fusion.types import RawFit
 from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.fusion.refit import (
     PartitionRefitResult,
     _canonical_labels as _canonical_partition_labels,
     partition_constrained_observed_refit,
 )
-from ..core.fusion.profiles import get_computation_profile
 from ..core.fusion.types import SolverState
 from ..io.data import TumorData
 from .partitions import (
@@ -194,19 +195,21 @@ def _candidate_ineligibility_reason(
     partition: FusionPartition | DirectPartition,
     refit: PartitionRefitSummary,
     score: SelectionScore,
-    raw_fit: FitResult | None = None,
+    raw_fit: RawFit | None = None,
     require_global_refit: bool = True,
 ) -> str:
     if isinstance(partition, FusionPartition):
         if raw_fit is None:
             raise ValueError("Raw-fusion eligibility requires its raw fit.")
-        if float(raw_fit.lambda_value) <= 0.0:
+        if float(raw_fit.provenance.lambda_value) <= 0.0:
             return "nonpositive_lambda"
-        if str(raw_fit.estimator_role) != "raw_fused_lambda_path":
+        if str(raw_fit.certificate.estimator_role) != "raw_fused_lambda_path":
             return "not_raw_fused_lambda_path"
-        if not bool(raw_fit.objective_faithful):
+        if not bool(raw_fit.certificate.objective_faithful):
             return "raw_objective_not_faithful"
-        if not bool(raw_fit.full_kkt_certified) or not bool(raw_fit.selection_eligible):
+        if not bool(raw_fit.certificate.certified) or not bool(
+            raw_fit.certificate.admissible
+        ):
             return "raw_objective_not_kkt_certified"
         if not partition.certified:
             return str(partition.certification_failure_reason)
@@ -257,19 +260,19 @@ def _selection_refit_cache_key(
     *,
     data: TumorData,
     partition_signature: str,
-    selection_options: FitOptions,
+    selection_options: FitConfig,
 ) -> tuple[object, ...]:
-    profile = get_computation_profile(selection_options.computation_profile)
+    refit = selection_options.selection.refit
     return (
         str(partition_signature),
         float(selection_options.major_prior),
         float(selection_options.eps),
-        float(selection_options.selection_refit_tol),
-        int(selection_options.selection_refit_max_iter),
+        float(refit.tolerance),
+        int(refit.max_iter),
         _likelihood_model_id(data),
-        str(profile.scalar_mode),
-        int(profile.scalar_grid_points),
-        int(profile.scalar_local_steps),
+        str(refit.mode),
+        int(refit.grid_points),
+        int(refit.local_steps),
         "unanchored_profiled_partition_refit_v4",
     )
 
@@ -279,10 +282,11 @@ def _fixed_labels_refit(
     data: TumorData,
     labels: np.ndarray,
     partition_signature: str,
-    selection_options: FitOptions,
+    selection_options: FitConfig,
     cache: dict[object, PartitionRefitCacheEntry] | None,
 ) -> tuple[PartitionRefitCacheEntry, bool]:
-    profile = get_computation_profile(selection_options.computation_profile)
+    profile = selection_options.computation_profile
+    refit_config = selection_options.selection.refit
     refit_spec_key = _selection_refit_cache_key(
         data=data,
         partition_signature=partition_signature,
@@ -294,11 +298,11 @@ def _fixed_labels_refit(
     kwargs = dict(
         major_prior=float(selection_options.major_prior),
         eps=float(selection_options.eps),
-        tol=float(selection_options.selection_refit_tol),
-        max_iter=int(selection_options.selection_refit_max_iter),
-        scalar_mode=str(profile.scalar_mode),
-        scalar_grid_points=int(profile.scalar_grid_points),
-        scalar_local_steps=int(profile.scalar_local_steps),
+        tol=float(refit_config.tolerance),
+        max_iter=int(refit_config.max_iter),
+        scalar_mode=str(refit_config.mode),
+        scalar_grid_points=int(refit_config.grid_points),
+        scalar_local_steps=int(refit_config.local_steps),
     )
     refined = partition_constrained_observed_refit(
         data,
@@ -308,7 +312,7 @@ def _fixed_labels_refit(
     loglik_delta = float(refined.global_optimality_gap)
     center_delta = 0.0
     loglik_tolerance = max(
-        float(selection_options.selection_refit_tol)
+        float(refit_config.tolerance)
         * (1.0 + abs(float(refined.loglik))),
         1e-10,
     )
@@ -407,11 +411,11 @@ def _score_fixed_labels(
     labels: np.ndarray,
     partition_signature: str,
     refit_result: PartitionRefitResult,
-    selection_options: FitOptions,
+    selection_options: FitConfig,
     selection_score: str,
 ) -> SelectionScore:
     canonical_score_name = _normalize_selection_score_name(selection_score)
-    computation_profile = get_computation_profile(selection_options.computation_profile)
+    computation_profile = selection_options.computation_profile
     score_function = (
         fixed_partition_dirichlet_score
         if canonical_score_name == "fixed_partition_dirichlet_score"
@@ -428,12 +432,12 @@ def _score_fixed_labels(
             if computation_profile.is_strict
             else 0.0
         ),
-        "selection_contract_id": str(selection_options.selection_contract),
+        "selection_contract_id": str(selection_options.selection.contract_id),
     }
     if canonical_score_name == "fixed_partition_dirichlet_score":
         score_kwargs.update(
-            alpha=float(selection_options.selection_dirichlet_alpha),
-            code_weight=float(selection_options.selection_dirichlet_code_weight),
+            alpha=float(selection_options.selection.dirichlet_alpha),
+            code_weight=float(selection_options.selection.dirichlet_code_weight),
         )
     score = score_function(**score_kwargs)
     if str(score.name) != canonical_score_name:
@@ -447,7 +451,7 @@ def evaluate_partition(
     *,
     data: TumorData,
     partition: FusionPartition | DirectPartition,
-    selection_options: FitOptions,
+    selection_options: FitConfig,
     refit_cache: dict[object, PartitionRefitCacheEntry] | None,
     selection_score: str | None = None,
 ) -> PartitionEvaluation:
@@ -468,7 +472,7 @@ def evaluate_partition(
         refit_result=refit_result,
         selection_options=selection_options,
         selection_score=(
-            selection_options.selection_score
+            selection_options.selection.score
             if selection_score is None
             else selection_score
         ),
@@ -488,8 +492,8 @@ def evaluate_partition(
 def evaluate_raw_fusion_candidate(
     *,
     data: TumorData,
-    fit_options: FitOptions,
-    candidate_fit_options: FitOptions | None,
+    fit_options: FitConfig,
+    candidate_fit_options: FitConfig | None,
     phi_start: StartArray | None,
     exact_pilot: StartArray | None,
     pooled_start: StartArray | None,
@@ -499,7 +503,6 @@ def evaluate_raw_fusion_candidate(
     torch_data,
     solver_context,
     solver_state: SolverState | None,
-    compute_summary: bool,
     selection_method: str,
     profile_name: str,
     selection_step: int,
@@ -507,9 +510,9 @@ def evaluate_raw_fusion_candidate(
     selection_score: str,
     static_metadata: CandidateStaticMetadata,
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] | None = None,
-    precomputed_fit: FitResult | None = None,
+    precomputed_fit: RawFit | None = None,
 ) -> tuple[
-    FitResult,
+    RawFit,
     dict[str, object],
     RawFusionCandidate,
 ]:
@@ -519,14 +522,14 @@ def evaluate_raw_fusion_candidate(
         fit_options if candidate_fit_options is None else candidate_fit_options
     )
     selection_options = fit_options
-    computation_profile = get_computation_profile(selection_options.computation_profile)
+    computation_profile = selection_options.computation_profile
 
     raw_fit_start_time = perf_counter()
     fit = precomputed_fit
     if fit is None:
         fit = fit_fixed_objective(
             data=data,
-            options=replace(raw_fit_options, lambda_value=float(lambda_value)),
+            config=replace(raw_fit_options, lambda_value=float(lambda_value)),
             phi_start=phi_start,
             exact_pilot=exact_pilot,
             pooled_start=pooled_start,
@@ -536,20 +539,19 @@ def evaluate_raw_fusion_candidate(
             torch_data=torch_data,
             solver_context=solver_context,
             solver_state=solver_state,
-            compute_summary=compute_summary,
         )
     elif not np.isclose(
-        float(fit.lambda_value), float(lambda_value), rtol=0.0, atol=1e-12
+        float(fit.provenance.lambda_value), float(lambda_value), rtol=0.0, atol=1e-12
     ):
         raise ValueError("Precomputed raw fit has the wrong lambda value.")
     raw_fit_elapsed_seconds = float(perf_counter() - raw_fit_start_time)
-    graph = selection_options.graph
+    graph = selection_options.graph.graph
     if graph is None:
         raise RuntimeError(
             "Model-selection candidates require a resolved pairwise-fusion graph."
         )
     partition_tolerance = _effective_bic_partition_tol(selection_options)
-    contract = get_selection_contract(selection_options.selection_contract)
+    contract = selection_options.selection.contract
     partition_extractor = (
         extract_connected_component_partition
         if contract.raw_partition_rule == "legacy_connected_components"
@@ -576,11 +578,11 @@ def evaluate_raw_fusion_candidate(
     refit = evaluation.refit
     score = evaluation.score
     raw_objective_certified = bool(
-        float(fit.lambda_value) > 0.0
-        and str(fit.estimator_role) == "raw_fused_lambda_path"
-        and bool(fit.objective_faithful)
-        and bool(fit.full_kkt_certified)
-        and bool(fit.selection_eligible)
+        float(fit.provenance.lambda_value) > 0.0
+        and str(fit.certificate.estimator_role) == "raw_fused_lambda_path"
+        and bool(fit.certificate.objective_faithful)
+        and bool(fit.certificate.certified)
+        and bool(fit.certificate.admissible)
     )
     reason = _candidate_ineligibility_reason(
         partition=partition,
@@ -623,15 +625,15 @@ def evaluate_raw_fusion_candidate(
         "candidate_elapsed_seconds": float(perf_counter() - candidate_start_time),
         "raw_fit_elapsed_seconds": float(raw_fit_elapsed_seconds),
         "bic_refit_elapsed_seconds": float(refit_elapsed_seconds),
-        "raw_solver_primal_tol": float(raw_fit_options.tol),
-        "tol": float(raw_fit_options.tol),
-        "outer_max_iter": int(raw_fit_options.outer_max_iter),
-        "inner_max_iter": int(raw_fit_options.inner_max_iter),
+        "raw_solver_primal_tol": float(raw_fit_options.solver.tolerance),
+        "tol": float(raw_fit_options.solver.tolerance),
+        "outer_max_iter": int(raw_fit_options.solver.outer_max_iter),
+        "inner_max_iter": int(raw_fit_options.solver.inner_max_iter),
         "eps": float(raw_fit_options.eps),
         "major_prior": float(raw_fit_options.major_prior),
-        "selection_refit_tol": float(selection_options.selection_refit_tol),
-        "selection_refit_max_iter": int(selection_options.selection_refit_max_iter),
-        "graph_name": str(fit.graph_name),
+        "selection_refit_tol": float(selection_options.selection.refit.tolerance),
+        "selection_refit_max_iter": int(selection_options.selection.refit.max_iter),
+        "graph_name": str(fit.provenance.graph_name),
         "num_edges": int(static_metadata.edge_count),
         "edge_weight_min": float(static_metadata.edge_weight_min),
         "edge_weight_max": float(static_metadata.edge_weight_max),
@@ -639,7 +641,7 @@ def evaluate_raw_fusion_candidate(
         "edge_list_hash": str(static_metadata.edge_list_hash),
         "pilot_matrix_hash": str(static_metadata.pilot_matrix_hash),
         "input_data_hash": str(static_metadata.input_data_hash),
-        "fit_compute_summary": bool(compute_summary),
+        "fit_compute_summary": False,
         "fit_start_mode": str(start_mode),
         "solver_state_warm_start": bool(solver_state is not None),
     }
@@ -650,7 +652,7 @@ def evaluate_direct_partition_candidate(
     *,
     data: TumorData,
     proposal: PartitionCandidate,
-    selection_options: FitOptions,
+    selection_options: FitConfig,
     candidate_id: int,
     source: str,
     parent_raw_candidate_id: int | None,
@@ -704,7 +706,7 @@ def evaluate_direct_partition_candidate(
     )
     refit = evaluation.refit
     score = evaluation.score
-    profile = get_computation_profile(selection_options.computation_profile)
+    profile = selection_options.computation_profile
     reason = _candidate_ineligibility_reason(
         partition=partition,
         refit=refit,
@@ -728,9 +730,7 @@ def evaluate_direct_partition_candidate(
     )
     diagnostics: dict[str, object] = {
         "tumor_id": str(data.tumor_id),
-        "selection_contract_json": get_selection_contract(
-            generation_contract_id
-        ).to_json(),
+        "selection_contract_json": selection_options.selection.contract.to_json(),
         "pre_refinement_signature": str(pre_signature),
         "classic_bic": float(score_diagnostics["classic_bic"]),
         "bic_refit_cache_hit": bool(evaluation.cache_hit),

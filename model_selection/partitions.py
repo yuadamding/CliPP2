@@ -4,7 +4,7 @@ import hashlib
 
 import numpy as np
 
-from ..core.model import FitResult
+from ..core.fusion.types import RawFit
 from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.fusion.refit import _canonical_labels as _canonical_partition_labels
 from ..core.fusion.types import (
@@ -300,7 +300,7 @@ def _mergeable_cross_block_pair_found(
 
 
 def extract_certified_fusion_partition(
-    fit: FitResult,
+    fit: RawFit,
     *,
     graph: PairwiseFusionGraph,
     tolerance: float,
@@ -331,11 +331,11 @@ def extract_certified_fusion_partition(
         labels,
         tolerance=tol,
     )
-    state = getattr(fit, "solver_state", None)
+    state = fit.state
     certificate = getattr(state, "certificate", None)
     certificate_graph_hash_matches = True
     if isinstance(certificate, (CompressedEdgeCertificate, DenseEdgeCertificate)):
-        expected_graph_hash = str(getattr(fit, "original_graph_hash", ""))
+        expected_graph_hash = str(fit.provenance.original_graph_hash)
         certificate_graph_hash_matches = bool(
             expected_graph_hash and str(certificate.graph_hash) == expected_graph_hash
         )
@@ -374,7 +374,7 @@ def extract_certified_fusion_partition(
 
 
 def extract_connected_component_partition(
-    fit: FitResult,
+    fit: RawFit,
     *,
     graph: PairwiseFusionGraph,
     tolerance: float,

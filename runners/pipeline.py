@@ -5,8 +5,7 @@ from time import perf_counter
 
 import pandas as pd
 
-from ..core.fusion.profiles import get_computation_profile
-from ..core.model import FitOptions
+from ..config import FitConfig, resolve_fit_config
 from ..io.tumor_txt import DEFAULT_DOSAGE_PRIOR_PENALTY, load_tumor_txt
 from .model_selection import select_model
 from ..model_selection.candidates import validate_candidate_identity
@@ -20,7 +19,7 @@ from .serialization import (
 def process_tumor_bundle(
     tumor_file: str | Path,
     outdir: str | Path,
-    fit_options: FitOptions | None = None,
+    fit_config: FitConfig | None = None,
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     unsupported_policy: str = "error",
@@ -39,19 +38,17 @@ def process_tumor_bundle(
         dosage_prior_penalty=dosage_prior_penalty,
     )
 
-    if fit_options is None:
-        fit_options = FitOptions(lambda_value=0.0)
-    computation_profile = get_computation_profile(fit_options.computation_profile)
+    if fit_config is None:
+        fit_config = resolve_fit_config()
     selection_result = select_model(
         data=data,
-        fit_options=fit_options,
+        fit_config=fit_config,
         use_warm_starts=use_warm_starts,
     )
     analysis = AnalysisSerialization.from_selection(
         data=data,
         input_file=tumor_file,
-        fit_options=fit_options,
-        computation_profile=computation_profile,
+        fit_config=fit_config,
         selection_result=selection_result,
     )
     validate_candidate_identity(analysis.selected_candidate)
@@ -72,7 +69,7 @@ def process_tumor_bundle(
 def process_tumor(
     tumor_file: str | Path,
     outdir: str | Path,
-    fit_options: FitOptions | None = None,
+    fit_config: FitConfig | None = None,
     use_warm_starts: bool = True,
     write_outputs: bool = True,
     unsupported_policy: str = "error",
@@ -83,7 +80,7 @@ def process_tumor(
     summary, _ = process_tumor_bundle(
         tumor_file=tumor_file,
         outdir=outdir,
-        fit_options=fit_options,
+        fit_config=fit_config,
         use_warm_starts=use_warm_starts,
         write_outputs=write_outputs,
         unsupported_policy=unsupported_policy,

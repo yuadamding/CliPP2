@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 
 from ..core.bic import SelectionScore
-from ..core.model import FitResult
+from ..core.fusion.types import RawFit
 
 StartArray = np.ndarray | torch.Tensor
 
@@ -109,7 +109,7 @@ class PartitionRefitSummary:
 
 @dataclass(frozen=True)
 class RawFusionCandidate:
-    raw_fit: FitResult
+    raw_fit: RawFit
     partition: FusionPartition
     refit: PartitionRefitSummary
     score: SelectionScore
@@ -218,7 +218,7 @@ class CandidateRecord:
     @property
     def lambda_value(self) -> float | None:
         if isinstance(self.candidate, RawFusionCandidate):
-            return float(self.candidate.raw_fit.lambda_value)
+            return float(self.candidate.raw_fit.provenance.lambda_value)
         return None
 
     @property
@@ -228,15 +228,13 @@ class CandidateRecord:
     @property
     def penalized_objective(self) -> float | None:
         if isinstance(self.candidate, RawFusionCandidate):
-            return float(
-                getattr(self.candidate.raw_fit, "penalized_objective", float("nan"))
-            )
+            return float(self.candidate.raw_fit.objective.total)
         return None
 
     @property
     def mm_consistency_violations(self) -> int:
         if isinstance(self.candidate, RawFusionCandidate):
-            return int(getattr(self.candidate.raw_fit, "mm_consistency_violations", 0))
+            return int(self.candidate.raw_fit.convergence.mm_consistency_violations)
         return 0
 
 
@@ -291,7 +289,7 @@ class SelectedModel:
                 raise ValueError("Raw selected models cannot have a direct parent.")
             if self.selected_lambda is None or not np.isclose(
                 float(self.selected_lambda),
-                float(candidate.raw_fit.lambda_value),
+                float(candidate.raw_fit.provenance.lambda_value),
                 rtol=0.0,
                 atol=1e-12,
             ):
@@ -316,7 +314,7 @@ class SelectedModel:
                 parent_lambda = candidate.partition.parent_raw_lambda
                 if parent_lambda is None or not np.isclose(
                     float(parent_lambda),
-                    float(self.partition_parent_raw.raw_fit.lambda_value),
+                    float(self.partition_parent_raw.raw_fit.provenance.lambda_value),
                     rtol=0.0,
                     atol=1e-12,
                 ):

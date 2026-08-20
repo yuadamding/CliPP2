@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..core.model import FitOptions, FitResult
+from ..config import FitConfig
+from ..core.fusion.types import RawFit
 from .config import SELECTION_SCORE_NAMES
 from .types import (
     CandidateRecord,
@@ -58,32 +59,31 @@ def raw_candidate_has_exact_fusion_certificate(
     """
 
     fit = candidate.raw_fit
-    provenance = getattr(fit, "exactness_provenance", None)
-    residual_method = str(getattr(provenance, "residual_method", ""))
-    residual = _number_or_nan(getattr(fit, "fixed_objective_kkt_residual", np.nan))
-    tolerance = _number_or_nan(getattr(fit, "full_kkt_tolerance", np.nan))
-    schema_version = _number_or_nan(
-        getattr(fit, "exactness_provenance_version", np.nan)
-    )
+    certificate = fit.certificate
+    provenance = fit.provenance
+    residual_method = str(certificate.residual_method)
+    residual = _number_or_nan(certificate.components.residual)
+    tolerance = _number_or_nan(certificate.tolerance)
+    schema_version = _number_or_nan(certificate.schema_version)
     return bool(
         candidate.eligible_for_selection
         and candidate.raw_objective_certified
-        and float(getattr(fit, "lambda_value", 0.0)) > 0.0
+        and float(provenance.lambda_value) > 0.0
         and candidate.partition.certified
         and schema_version == _EXACT_CERTIFICATE_SCHEMA_VERSION
         and residual_method == _EXACT_CERTIFICATE_RESIDUAL_METHOD
-        and str(getattr(fit, "certificate_audit_dtype", "")) == "float64"
-        and bool(getattr(fit, "selection_eligible", False))
-        and str(getattr(fit, "estimator_role", "")) == "raw_fused_lambda_path"
-        and bool(getattr(fit, "objective_faithful", False))
-        and bool(str(getattr(fit, "objective_spec_hash", "")).strip())
-        and bool(str(getattr(fit, "original_graph_hash", "")).strip())
-        and bool(str(getattr(fit, "certificate_problem_hash", "")).strip())
-        and str(getattr(fit, "certificate_scope", "")) == "full_original_graph"
-        and str(getattr(fit, "certificate_gradient_scope", ""))
+        and str(certificate.audit_dtype) == "float64"
+        and bool(certificate.admissible)
+        and str(certificate.estimator_role) == "raw_fused_lambda_path"
+        and bool(certificate.objective_faithful)
+        and bool(str(provenance.objective_spec_hash).strip())
+        and bool(str(provenance.original_graph_hash).strip())
+        and bool(str(provenance.certificate_problem_hash).strip())
+        and str(certificate.scope) == "full_original_graph"
+        and str(certificate.gradient_scope)
         in _EXACT_OBSERVED_OBJECTIVE_GRADIENT_SCOPES
-        and bool(getattr(fit, "full_kkt_certified", False))
-        and str(getattr(fit, "full_kkt_certificate_status", ""))
+        and bool(certificate.certified)
+        and str(certificate.status)
         in _EXACT_CERTIFICATE_STATUSES
         and np.isfinite(residual)
         and np.isfinite(tolerance)
@@ -359,15 +359,15 @@ def _sorted_unique_lambdas(values: list[float] | np.ndarray) -> list[float]:
     return [float(value) for value in np.unique(np.round(np.sort(array), 12))]
 
 
-def _prefer_fit_candidate(candidate: FitResult, incumbent: FitResult | None) -> bool:
+def _prefer_fit_candidate(candidate: RawFit, incumbent: RawFit | None) -> bool:
     if incumbent is None:
         return True
-    if candidate.selection_eligible and not incumbent.selection_eligible:
+    if candidate.certificate.admissible and not incumbent.certificate.admissible:
         return True
-    if candidate.selection_eligible != incumbent.selection_eligible:
+    if candidate.certificate.admissible != incumbent.certificate.admissible:
         return False
-    candidate_objective = float(candidate.penalized_objective)
-    incumbent_objective = float(incumbent.penalized_objective)
+    candidate_objective = float(candidate.objective.total)
+    incumbent_objective = float(incumbent.objective.total)
     if (
         np.isfinite(candidate_objective)
         and np.isfinite(incumbent_objective)
@@ -378,8 +378,8 @@ def _prefer_fit_candidate(candidate: FitResult, incumbent: FitResult | None) -> 
         return True
     if not np.isfinite(candidate_objective) and np.isfinite(incumbent_objective):
         return False
-    candidate_kkt = float(candidate.fixed_objective_kkt_residual)
-    incumbent_kkt = float(incumbent.fixed_objective_kkt_residual)
+    candidate_kkt = float(candidate.certificate.components.residual)
+    incumbent_kkt = float(incumbent.certificate.components.residual)
     if (
         np.isfinite(candidate_kkt)
         and np.isfinite(incumbent_kkt)
@@ -391,15 +391,15 @@ def _prefer_fit_candidate(candidate: FitResult, incumbent: FitResult | None) -> 
     return False
 
 
-def _effective_bic_partition_tol(options: FitOptions) -> float:
-    value = options.selection_partition_tol
+def _effective_bic_partition_tol(options: FitConfig) -> float:
+    value = options.selection.partition_tolerance
     return float(max(float(value), 1e-12))
 
 
-def _profile_penalty_from_fit(fit: FitResult) -> tuple[float, float]:
-    penalty = max(float(fit.penalized_objective + fit.loglik), 0.0)
-    if float(fit.lambda_value) > 0.0:
-        return penalty, float(penalty / float(fit.lambda_value))
+def _profile_penalty_from_fit(fit: RawFit) -> tuple[float, float]:
+    penalty = max(float(fit.objective.total + fit.objective.loglik), 0.0)
+    if float(fit.provenance.lambda_value) > 0.0:
+        return penalty, float(penalty / float(fit.provenance.lambda_value))
     return penalty, float("nan")
 
 

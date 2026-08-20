@@ -29,6 +29,11 @@ class ComputationProfile:
     inner_max_iter: int
     solver_tolerance: float
     solver_retry_limit: int
+    partition_tolerance: float
+    refit_tolerance: float
+    refit_max_iter: int
+    certificate_max_iter: int
+    certificate_refinement_rounds: int
 
     @property
     def is_strict(self) -> bool:
@@ -53,6 +58,11 @@ STRICT_PROFILE: Final = ComputationProfile(
     inner_max_iter=30,
     solver_tolerance=5e-5,
     solver_retry_limit=4,
+    partition_tolerance=1e-4,
+    refit_tolerance=1e-7,
+    refit_max_iter=128,
+    certificate_max_iter=512,
+    certificate_refinement_rounds=2,
 )
 
 # For a single tumor, the complete graph is retained in balanced mode to avoid
@@ -70,6 +80,11 @@ BALANCED_PROFILE: Final = ComputationProfile(
     inner_max_iter=25,
     solver_tolerance=8e-4,
     solver_retry_limit=1,
+    partition_tolerance=2e-4,
+    refit_tolerance=1e-5,
+    refit_max_iter=64,
+    certificate_max_iter=128,
+    certificate_refinement_rounds=1,
 )
 
 FAST_PROFILE: Final = ComputationProfile(
@@ -84,6 +99,11 @@ FAST_PROFILE: Final = ComputationProfile(
     inner_max_iter=16,
     solver_tolerance=1e-3,
     solver_retry_limit=0,
+    partition_tolerance=1e-3,
+    refit_tolerance=1e-4,
+    refit_max_iter=32,
+    certificate_max_iter=64,
+    certificate_refinement_rounds=0,
 )
 
 COMPUTATION_PROFILES: Final = {

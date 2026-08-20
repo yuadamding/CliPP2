@@ -29,7 +29,8 @@ from ..core.fusion.types import (
     SolverContext,
     SolverState,
 )
-from ..core.model import FitOptions, FitResult
+from ..config import FitConfig
+from ..core.fusion.types import RawFit
 from ..io.data import TumorData, tumor_objective_fingerprint
 from .guided_fusion import GuidedFusionInitialization, build_guided_fusion_initialization
 from .partition_initializer import PartitionInitializerPool
@@ -41,7 +42,7 @@ from .types import CandidateStaticMetadata, StartArray
 class RawStartAttempt:
     """One fixed-objective solve from an authorized optimizer state."""
 
-    fit: FitResult
+    fit: RawFit
     source: str
     start_value: float
     breakpoint_escape_changed_count: int
@@ -96,13 +97,13 @@ def select_raw_start_attempt(
             certified,
             key=lambda item: (
                 (
-                    float(item.fit.penalized_objective)
-                    if np.isfinite(float(item.fit.penalized_objective))
+                    float(item.fit.objective.total)
+                    if np.isfinite(float(item.fit.objective.total))
                     else float("inf")
                 ),
                 (
-                    float(item.fit.fixed_objective_kkt_residual)
-                    if np.isfinite(float(item.fit.fixed_objective_kkt_residual))
+                    float(item.fit.certificate.components.residual)
+                    if np.isfinite(float(item.fit.certificate.components.residual))
                     else float("inf")
                 ),
                 str(item.source),
@@ -118,80 +119,99 @@ def select_raw_start_attempt(
     return incumbent
 
 
+def raw_fit_diagnostic(
+    fit: RawFit,
+    *,
+    fit_options: FitConfig | None = None,
+) -> dict[str, object]:
+    """Flatten one nested raw result at the reporting boundary."""
+    certificate = fit.certificate
+    progress = certificate.progress
+    convergence = fit.convergence
+    work = fit.work
+    provenance = fit.provenance
+    solver = None if fit_options is None else fit_options.solver
+    return {
+        "lambda": float(provenance.lambda_value),
+        "n_clusters": int(fit.multistart.threshold_component_count),
+        "penalized_objective": float(fit.objective.total),
+        "loglik": float(fit.objective.loglik),
+        "kkt_residual": float(certificate.components.residual),
+        "working_precision_kkt_residual": float(certificate.working_residual),
+        "backward_error_stationarity_residual": float(
+            certificate.components.stationarity
+        ),
+        "backward_error_edge_subgradient_residual": float(
+            certificate.components.edge_subgradient
+        ),
+        "backward_error_dual_ball_residual": float(
+            certificate.components.dual_ball
+        ),
+        "certificate_residual_method": str(
+            certificate.residual_method
+        ),
+        "working_dtype": str(certificate.working_dtype),
+        "certificate_audit_dtype": str(certificate.audit_dtype),
+        "precision_polish_applied": bool(certificate.precision_polished),
+        "precision_polish_max_abs_phi_delta": float(
+            certificate.precision_polish_delta
+        ),
+        "kkt_tolerance": float(certificate.tolerance),
+        "stationarity_residual": float(progress.stationarity_residual),
+        "edge_subgradient_residual": float(progress.edge_subgradient_residual),
+        "dual_ball_residual": float(progress.dual_ball_residual),
+        "box_residual": float(progress.box_residual),
+        "projected_stationarity_norm": float(progress.projected_stationarity_norm),
+        "stationarity_normalizer": float(progress.stationarity_normalizer),
+        "smooth_gradient_norm": float(progress.smooth_gradient_norm),
+        "fusion_adjustment_norm": float(progress.fusion_adjustment_norm),
+        "stationarity_before_dual_refine": float(
+            certificate.stationarity_before
+        ),
+        "stationarity_after_dual_refine": float(
+            certificate.stationarity_after
+        ),
+        "fused_edges": int(certificate.fused_edges),
+        "nonzero_edges": int(certificate.nonzero_edges),
+        "outer_iterations": int(convergence.iterations),
+        "inner_iterations": int(work.inner_iterations),
+        "admm_iterations": int(work.dense_iterations if provenance.inner_solver == "admm_complete_graph" else 0),
+        "certificate_iterations": int(work.certificate_iterations),
+        "accepted_outer_steps": int(convergence.accepted_outer_steps),
+        "attempted_outer_steps": int(convergence.attempted_outer_steps),
+        "outer_max_iter": np.nan if solver is None else int(solver.outer_max_iter),
+        "inner_max_iter": np.nan if solver is None else int(solver.inner_max_iter),
+        "certificate_max_iter": (
+            np.nan if solver is None else int(solver.certificate.max_iter)
+        ),
+        "certificate_refinement_rounds": (
+            np.nan
+            if solver is None
+            else int(solver.certificate.refinement_rounds)
+        ),
+        "full_kkt_certified": bool(certificate.certified),
+        "selection_eligible": bool(certificate.admissible),
+        "converged_inner": bool(convergence.inner_converged),
+        "converged_outer": bool(convergence.outer_converged),
+        "certificate_status": str(certificate.status),
+        "outer_certificate_status": str(certificate.status),
+        "failure_reason": str(convergence.failure_reason),
+        "mm_consistency_violations": int(convergence.mm_consistency_violations),
+    }
+
+
 def raw_start_attempt_diagnostic(
     attempt: RawStartAttempt,
     *,
-    fit_options: FitOptions,
+    fit_options: FitConfig,
 ) -> dict[str, object]:
-    """Return the complete bounded diagnostic for one raw solver attempt."""
-
-    fit = attempt.fit
     return {
         "source": str(attempt.source),
         "start_value": float(attempt.start_value),
-        "lambda": float(fit.lambda_value),
-        "n_clusters": int(fit.n_clusters),
-        "penalized_objective": float(fit.penalized_objective),
-        "kkt_residual": float(fit.fixed_objective_kkt_residual),
-        "working_precision_kkt_residual": float(
-            fit.working_precision_kkt_residual
+        **raw_fit_diagnostic(attempt.fit, fit_options=fit_options),
+        "breakpoint_escape_changed_count": int(
+            attempt.breakpoint_escape_changed_count
         ),
-        "backward_error_stationarity_residual": float(
-            fit.outer_backward_error_stationarity_residual
-        ),
-        "backward_error_edge_subgradient_residual": float(
-            fit.outer_backward_error_edge_subgradient_residual
-        ),
-        "backward_error_dual_ball_residual": float(
-            fit.outer_backward_error_dual_ball_residual
-        ),
-        "certificate_residual_method": str(
-            fit.exactness_provenance.residual_method
-            if fit.exactness_provenance is not None
-            else "unknown"
-        ),
-        "working_dtype": str(fit.working_dtype),
-        "certificate_audit_dtype": str(fit.certificate_audit_dtype),
-        "precision_polish_applied": bool(fit.precision_polish_applied),
-        "precision_polish_max_abs_phi_delta": float(
-            fit.precision_polish_max_abs_phi_delta
-        ),
-        "kkt_tolerance": float(fit.full_kkt_tolerance),
-        "stationarity_residual": float(fit.outer_stationarity_residual),
-        "edge_subgradient_residual": float(fit.outer_edge_subgradient_residual),
-        "dual_ball_residual": float(fit.outer_dual_ball_residual),
-        "box_residual": float(fit.outer_box_residual),
-        "projected_stationarity_norm": float(fit.outer_projected_stationarity_norm),
-        "stationarity_normalizer": float(fit.outer_stationarity_normalizer),
-        "smooth_gradient_norm": float(fit.outer_smooth_gradient_norm),
-        "fusion_adjustment_norm": float(fit.outer_fusion_adjustment_norm),
-        "stationarity_before_dual_refine": float(
-            fit.outer_stationarity_residual_before_dual_refine
-        ),
-        "stationarity_after_dual_refine": float(
-            fit.outer_stationarity_residual_after_dual_refine
-        ),
-        "fused_edges": int(fit.outer_kkt_fused_edges),
-        "nonzero_edges": int(fit.outer_kkt_nonzero_edges),
-        "outer_iterations": int(fit.iterations),
-        "inner_iterations": int(fit.inner_iterations),
-        "admm_iterations": int(fit.admm_iterations),
-        "certificate_iterations": int(fit.certificate_iterations),
-        "accepted_outer_steps": int(fit.accepted_outer_steps),
-        "attempted_outer_steps": int(fit.attempted_outer_steps),
-        "outer_max_iter": int(fit_options.outer_max_iter),
-        "inner_max_iter": int(fit_options.inner_max_iter),
-        "certificate_max_iter": int(fit_options.certificate_max_iter),
-        "certificate_refinement_rounds": int(fit_options.certificate_refinement_rounds),
-        "full_kkt_certified": bool(fit.full_kkt_certified),
-        "selection_eligible": bool(fit.selection_eligible),
-        "converged_inner": bool(fit.converged_inner),
-        "converged_outer": bool(fit.converged_outer),
-        "certificate_status": str(fit.full_kkt_certificate_status),
-        "outer_certificate_status": str(fit.outer_kkt_certificate_status),
-        "failure_reason": str(fit.failure_reason),
-        "mm_consistency_violations": int(fit.mm_consistency_violations),
-        "breakpoint_escape_changed_count": int(attempt.breakpoint_escape_changed_count),
     }
 
 
@@ -360,10 +380,10 @@ def escape_path_breakpoint_retry_state(
 
 def solver_recovery_fit_options(
     data: TumorData,
-    fit_options: FitOptions,
+    fit_options: FitConfig,
     *,
     retry_number: int | None = None,
-) -> FitOptions:
+) -> FitConfig:
     """Increase solver effort without changing the fixed objective family.
 
     Occupancy-path likelihoods are generically nonconvex.  Their recovery run
@@ -375,34 +395,30 @@ def solver_recovery_fit_options(
 
     del retry_number
     effort_factor = 6
+    solver = fit_options.solver
+    certificate = solver.certificate
     return replace(
         fit_options,
         # The large multi-region failure audit showed that 18/75 continuation
         # reduced the residual materially but stopped above the unchanged KKT
         # gate.  Give the one terminal same-lambda continuation 36/150 or six
         # profile-sized budgets.  Solves still stop early after certification.
-        outer_max_iter=max(
-            int(fit_options.outer_max_iter) * effort_factor,
-            36,
-        ),
-        inner_max_iter=max(
-            int(fit_options.inner_max_iter) * effort_factor,
-            150,
-        ),
-        certificate_max_iter=max(
-            int(fit_options.certificate_max_iter) * 2,
-            256,
-        ),
-        certificate_refinement_rounds=max(
-            int(fit_options.certificate_refinement_rounds) + 1,
-            2,
-        ),
-        # More recovery iterations must not silently tighten the declared
-        # full-KKT admission threshold.  The controller and every attempt at
-        # this lambda therefore use one immutable profile tolerance.
-        tol=float(fit_options.tol),
-        objective_shape=objective_shape_for_data(
-            data, "unimodal_full_step_backtracking"
+        solver=replace(
+            solver,
+            outer_max_iter=max(int(solver.outer_max_iter) * effort_factor, 36),
+            inner_max_iter=max(int(solver.inner_max_iter) * effort_factor, 150),
+            certificate=replace(
+                certificate,
+                max_iter=max(int(certificate.max_iter) * 2, 256),
+                refinement_rounds=max(int(certificate.refinement_rounds) + 1, 2),
+            ),
+            # More recovery iterations must not silently tighten the declared
+            # full-KKT admission threshold.  The controller and every attempt
+            # at this lambda therefore use one immutable profile tolerance.
+            tolerance=float(solver.tolerance),
+            objective_shape=objective_shape_for_data(
+                data, "unimodal_full_step_backtracking"
+            ),
         ),
     )
 
@@ -413,11 +429,11 @@ def build_guided_initialization_with_resource_policy(
     guide_phi: StartArray,
     guide_labels: np.ndarray | torch.Tensor,
     solver_context: SolverContext,
-    fit_options: FitOptions,
+    fit_options: FitConfig,
 ) -> tuple[GuidedFusionInitialization, SolverContext, StartArray]:
     """Build guided state with typed allocation failure and optional CPU retry."""
 
-    fallback_policy = normalize_dense_fallback_policy(fit_options.dense_fallback_policy)
+    fallback_policy = normalize_dense_fallback_policy(fit_options.runtime.fallback)
 
     def build(
         *,
@@ -434,8 +450,8 @@ def build_guided_initialization_with_resource_policy(
             phi,
             labels,
             solver_context=context,
-            partition_tolerance=max(float(fit_options.tol), 1e-8),
-            kkt_atol=float(fit_options.tol),
+            partition_tolerance=max(float(fit_options.solver.tolerance), 1e-8),
+            kkt_atol=float(fit_options.solver.tolerance),
         )
 
     try:
@@ -482,18 +498,18 @@ def build_guided_initialization_with_resource_policy(
                 inherited_resource_fallback="dense_cpu",
                 major_prior=float(solver_context.problem.major_prior),
                 eps=float(solver_context.problem.eps),
-                tol=float(fit_options.tol),
+                tol=float(fit_options.solver.tolerance),
                 graph=solver_context.graph_spec,
-                inner_max_iter=max(int(fit_options.inner_max_iter), 16),
-                adaptive_weight_gamma=float(fit_options.adaptive_weight_gamma),
-                adaptive_weight_floor=float(fit_options.adaptive_weight_floor),
-                adaptive_weight_baseline=float(fit_options.adaptive_weight_baseline),
+                inner_max_iter=max(int(fit_options.solver.inner_max_iter), 16),
+                adaptive_weight_gamma=float(fit_options.graph.adaptive_weight_gamma),
+                adaptive_weight_floor=float(fit_options.graph.adaptive_weight_floor),
+                adaptive_weight_baseline=float(fit_options.graph.adaptive_weight_baseline),
                 exact_pilot=cpu_start(solver_context.exact_pilot),
                 pooled_start=cpu_start(solver_context.pooled_start),
                 scalar_well_starts=solver_context.scalar_well_starts,
                 device="cpu",
                 dtype=dtype_name(solver_context.runtime.dtype),
-                objective_shape=str(fit_options.objective_shape),
+                objective_shape=str(fit_options.solver.objective_shape),
             )
             guided = build(
                 context=cpu_context,
@@ -515,17 +531,17 @@ def build_partition_guided_graph_with_resource_policy(
     guide_phi: StartArray,
     guide_curvature: torch.Tensor,
     solver_context: SolverContext,
-    fit_options: FitOptions,
+    fit_options: FitConfig,
     noise_divisor: float,
 ):
     """Build the adaptive graph on CUDA, with an explicitly authorized host retry."""
 
     graph_options = {
-        "gamma": float(fit_options.adaptive_weight_gamma),
+        "gamma": float(fit_options.graph.adaptive_weight_gamma),
         "minimum_tau": max(
-            float(fit_options.adaptive_weight_floor), float(fit_options.eps)
+            float(fit_options.graph.adaptive_weight_floor), float(fit_options.eps)
         ),
-        "baseline": float(fit_options.adaptive_weight_baseline),
+        "baseline": float(fit_options.graph.adaptive_weight_baseline),
         "noise_divisor": float(noise_divisor),
     }
 
@@ -572,7 +588,7 @@ def build_partition_guided_graph_with_resource_policy(
         return tensor_graph_to_pairwise_graph(tensor_graph), tensor_graph, tau
     except (MemoryError, torch.OutOfMemoryError) as exc:
         if (
-            normalize_dense_fallback_policy(fit_options.dense_fallback_policy)
+            normalize_dense_fallback_policy(fit_options.runtime.fallback)
             != "cpu_allowed"
         ):
             raise ExactSolverResourceLimit(

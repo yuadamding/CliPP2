@@ -10,7 +10,7 @@ from ..core.fusion.path_summary import (
     path_posterior_at_phi_numpy,
     summarize_path_posterior_numpy,
 )
-from ..core.model import FitResult
+from ..core.fusion.types import RawFit
 from ..io.data import TumorData
 from ..model_selection.partitions import _partition_signature
 from ..model_selection.types import (
@@ -38,7 +38,7 @@ def _validated_profile(
 
 
 def _validate_identity(
-    raw_fit: FitResult,
+    raw_fit: RawFit,
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
 ) -> np.ndarray:
@@ -108,7 +108,7 @@ def _path_summary_for_profile(
 
 def mutation_output_table(
     data: TumorData,
-    raw_fit: FitResult,
+    raw_fit: RawFit,
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
 ) -> pd.DataFrame:
@@ -132,7 +132,7 @@ def mutation_output_table(
 
 def cluster_output_table(
     data: TumorData,
-    raw_fit: FitResult,
+    raw_fit: RawFit,
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
 ) -> pd.DataFrame:
@@ -208,7 +208,7 @@ def _add_path_summary(
 
 def mutation_region_output_table(
     data: TumorData,
-    raw_fit: FitResult,
+    raw_fit: RawFit,
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
     *,
@@ -263,7 +263,7 @@ def write_fit_outputs(
     *,
     outdir: Path,
     data: TumorData,
-    raw_fit: FitResult,
+    raw_fit: RawFit,
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
     major_prior: float = 0.5,
