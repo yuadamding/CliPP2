@@ -319,19 +319,7 @@ class PairwiseFusionGraph:
 @dataclass
 class FusionFitArtifacts:
     phi: np.ndarray
-    phi_clustered: np.ndarray
-    cluster_labels: np.ndarray
-    cluster_centers: np.ndarray
-    cluster_diameters: np.ndarray
-    max_cluster_diameter: float
-    cluster_diameter_exact: bool
-    gamma_major: np.ndarray
-    major_probability: np.ndarray
-    major_call: np.ndarray
-    multiplicity_call: np.ndarray
-    multiplicity_estimated_mask: np.ndarray
     loglik: float
-    summary_loglik: float
     penalized_objective: float
     lambda_value: float
     n_clusters: int
@@ -340,22 +328,7 @@ class FusionFitArtifacts:
     device: str
     dtype: str
     graph_name: str
-    summary_tol: float
-    history: list[float]
-    inner_kkt_residual: float
-    accepted_inner_kkt_residual: float
-    last_attempted_inner_kkt_residual: float
-    best_attempted_inner_kkt_residual: float
-    last_attempted_objective_gap: float
-    best_attempted_objective_gap: float
-    last_attempted_surrogate_gap: float
-    best_attempted_surrogate_gap: float
-    last_attempted_inner_model_gap: float
-    best_attempted_inner_model_gap: float
-    last_attempted_em_envelope_gap: float
-    best_attempted_em_envelope_gap: float
     outer_stationarity_residual: float
-    outer_projected_stationarity_residual: float
     outer_projected_stationarity_norm: float
     outer_stationarity_normalizer: float
     outer_smooth_gradient_norm: float
@@ -363,18 +336,13 @@ class FusionFitArtifacts:
     outer_edge_subgradient_residual: float
     outer_dual_ball_residual: float
     outer_box_primal_violation: float
-    outer_num_interior_coordinates: int
-    outer_num_lower_active_coordinates: int
-    outer_num_upper_active_coordinates: int
     outer_num_frozen_coordinates: int
     outer_box_residual: float
     outer_backward_error_stationarity_residual: float
     outer_backward_error_edge_subgradient_residual: float
     outer_backward_error_dual_ball_residual: float
-    outer_backward_error_kkt_residual: float
     fixed_objective_kkt_residual: float
     outer_kkt_certificate_status: str
-    outer_kkt_dual_refined: bool
     outer_kkt_fused_edges: int
     outer_kkt_nonzero_edges: int
     outer_stationarity_residual_before_dual_refine: float
@@ -393,8 +361,6 @@ class FusionFitArtifacts:
     failed_descent_checks: int
     failed_nonfinite_checks: int
     mm_consistency_violations: int
-    accepted_step_type: str
-    last_reject_reason: str
     failure_reason: str
     selection_eligible: bool
     stationarity_certified: bool
@@ -416,7 +382,6 @@ class FusionFitArtifacts:
     inner_solver: str = "unknown"
     certificate: GraphFusionCertificate | None = None
     exactness_provenance: ExactFusionProvenance | None = None
-    path_posterior: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -504,29 +469,10 @@ class InnerDiagnostics:
 
 
 @dataclass(frozen=True, slots=True)
-class OuterDiagnostics:
-    iterations: int
-    objective_history: tuple[float, ...]
-    stationarity_residual: float
-    majorization_failures: int
-    accepted_full_steps: int
-    accepted_damped_steps: int
-    converged: bool
-
-
-@dataclass(frozen=True, slots=True)
 class TorchFitResult:
     phi_raw: torch.Tensor
-    gamma_major: torch.Tensor
     dual: torch.Tensor | None
-    fit_loss: torch.Tensor
-    fusion_penalty: torch.Tensor
-    objective: torch.Tensor
     inner: InnerDiagnostics
-    outer: OuterDiagnostics
-    graph_name: str
-    admm_iterations: int = 0
     inner_solver: str = "unknown"
     certificate: GraphFusionCertificate | None = None
     exactness_provenance: ExactFusionProvenance | None = None
-    path_posterior: torch.Tensor | None = None

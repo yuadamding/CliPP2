@@ -125,15 +125,6 @@ def fit_fixed_objective(
     values = {
         item.name: getattr(artifacts, item.name) for item in fields(FusionFitArtifacts)
     }
-    values.update(
-        cluster_labels=artifacts.cluster_labels.astype(np.int64, copy=False),
-        cluster_diameters=artifacts.cluster_diameters.astype(np.float64, copy=False),
-        major_call=artifacts.major_call.astype(bool, copy=False),
-        multiplicity_estimated_mask=artifacts.multiplicity_estimated_mask.astype(
-            bool, copy=False
-        ),
-        history=list(artifacts.history),
-    )
     return FitResult(
         **values,
         base_fusion_objective_hash=(

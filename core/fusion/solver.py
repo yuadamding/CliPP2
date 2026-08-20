@@ -81,7 +81,6 @@ from .types import (
     InnerDiagnostics,
     InnerSolveResult,
     KKTDiagnostics,
-    OuterDiagnostics,
     PairwiseFusionGraph,
     PrimalOnlyWarmState,
     SolverContext,
@@ -208,146 +207,58 @@ def _terminal_backward_error_audit_float64(
     )
 
 
-class _UnionFind:
-    def __init__(self, n: int) -> None:
-        self.parent = np.arange(n, dtype=np.int64)
-        self.rank = np.zeros(n, dtype=np.int64)
-
-    def find(self, value: int) -> int:
-        parent = self.parent[value]
-        while parent != self.parent[parent]:
-            self.parent[parent] = self.parent[self.parent[parent]]
-            parent = self.parent[parent]
-        self.parent[value] = parent
-        return int(parent)
-
-    def union(self, left: int, right: int) -> None:
-        root_left = self.find(int(left))
-        root_right = self.find(int(right))
-        if root_left == root_right:
-            return
-        if self.rank[root_left] < self.rank[root_right]:
-            self.parent[root_left] = root_right
-        elif self.rank[root_left] > self.rank[root_right]:
-            self.parent[root_right] = root_left
-        else:
-            self.parent[root_right] = root_left
-            self.rank[root_left] += 1
-
-
-def _cluster_labels(
+def _number_of_threshold_components(
     phi: np.ndarray,
     *,
     edge_u: np.ndarray,
     edge_v: np.ndarray,
     tol: float,
-) -> np.ndarray:
+) -> int:
+    """Count historical threshold components without retaining cluster labels."""
+
     num_mutations = int(phi.shape[0])
     if num_mutations == 0:
-        return np.zeros((0,), dtype=np.int64)
+        return 0
 
     if edge_u.size == 0:
-        return np.arange(num_mutations, dtype=np.int64)
+        return num_mutations
 
     # For a complete graph with one region, threshold-connected components are
     # exactly the runs obtained after sorting phi and splitting at adjacent
     # gaps larger than tol.  This avoids scanning O(M^2) edges and, more
-    # importantly, avoids one Python union/find operation per fused edge.  Map
-    # the runs back to the historical first-mutation label order so serialized
-    # outputs remain stable as well as the underlying partition.
+    # importantly, avoids one Python union/find operation per fused edge.
     expected_complete_edges = num_mutations * (num_mutations - 1) // 2
     if phi.ndim == 2 and phi.shape[1] == 1 and edge_u.size == expected_complete_edges:
-        order = np.argsort(phi[:, 0], kind="stable")
-        sorted_phi = phi[order, 0]
-        sorted_groups = np.zeros(num_mutations, dtype=np.int64)
-        if num_mutations > 1:
-            sorted_groups[1:] = np.cumsum(
-                np.abs(np.diff(sorted_phi)) > float(tol), dtype=np.int64
-            )
-        n_groups = int(sorted_groups[-1]) + 1
-        first_mutation = np.full(n_groups, num_mutations, dtype=np.int64)
-        np.minimum.at(first_mutation, sorted_groups, order)
-        group_order = np.argsort(first_mutation, kind="stable")
-        group_to_label = np.empty(n_groups, dtype=np.int64)
-        group_to_label[group_order] = np.arange(n_groups, dtype=np.int64)
-        labels = np.empty(num_mutations, dtype=np.int64)
-        labels[order] = group_to_label[sorted_groups]
-        return labels
+        sorted_phi = np.sort(phi[:, 0], kind="stable")
+        return 1 + int(np.count_nonzero(np.abs(np.diff(sorted_phi)) > float(tol)))
 
     fused = np.linalg.norm(phi[edge_u] - phi[edge_v], axis=1) <= float(tol)
     if not np.any(fused):
-        return np.arange(num_mutations, dtype=np.int64)
+        return num_mutations
 
-    uf = _UnionFind(num_mutations)
+    parent = np.arange(num_mutations, dtype=np.int64)
+    rank = np.zeros(num_mutations, dtype=np.int8)
+
+    def find(value: int) -> int:
+        root = int(value)
+        while int(parent[root]) != root:
+            parent[root] = parent[int(parent[root])]
+            root = int(parent[root])
+        return root
+
+    n_components = num_mutations
     for left, right in zip(edge_u[fused], edge_v[fused]):
-        uf.union(int(left), int(right))
-
-    labels = np.empty(num_mutations, dtype=np.int64)
-    root_to_label: dict[int, int] = {}
-    next_label = 0
-    for idx in range(num_mutations):
-        root = uf.find(idx)
-        label = root_to_label.get(root)
-        if label is None:
-            label = next_label
-            root_to_label[root] = label
-            next_label += 1
-        labels[idx] = int(label)
-    return labels
-
-
-def cluster_diameters_from_edges(
-    phi: np.ndarray,
-    labels: np.ndarray,
-    *,
-    edge_u: np.ndarray,
-    edge_v: np.ndarray,
-) -> tuple[np.ndarray, bool]:
-    phi = np.asarray(phi)
-    labels = np.asarray(labels, dtype=np.int64)
-    edge_u = np.asarray(edge_u, dtype=np.int64)
-    edge_v = np.asarray(edge_v, dtype=np.int64)
-    n_clusters = int(labels.max()) + 1 if labels.size else 0
-    diameters = np.zeros(n_clusters, dtype=np.float64)
-    if labels.size == 0:
-        return diameters, False
-    n_rows = int(labels.shape[0])
-    expected_complete_edges = n_rows * (n_rows - 1) // 2
-    cluster_sizes = np.bincount(labels, minlength=n_clusters)
-    exact = bool(edge_u.size == expected_complete_edges or np.all(cluster_sizes <= 1))
-    if phi.ndim == 2 and phi.shape[1] == 1 and edge_u.size == expected_complete_edges:
-        minima = np.full(n_clusters, np.inf, dtype=np.float64)
-        maxima = np.full(n_clusters, -np.inf, dtype=np.float64)
-        scalar_phi = phi[:, 0].astype(np.float64, copy=False)
-        np.minimum.at(minima, labels, scalar_phi)
-        np.maximum.at(maxima, labels, scalar_phi)
-        diameters = maxima - minima
-        return diameters, True
-    if edge_u.size == 0 or edge_v.size == 0:
-        return diameters, exact
-    same_cluster = labels[edge_u] == labels[edge_v]
-    if not np.any(same_cluster):
-        return diameters, exact
-    same_u = edge_u[same_cluster]
-    same_v = edge_v[same_cluster]
-    distances = np.linalg.norm(phi[same_u] - phi[same_v], axis=1)
-    np.maximum.at(diameters, labels[same_u], distances.astype(np.float64, copy=False))
-    return diameters, exact
-
-
-def _cluster_summary_from_labels(
-    phi: np.ndarray,
-    labels: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    n_clusters = int(labels.max()) + 1 if labels.size else 0
-    centers = np.zeros((n_clusters, phi.shape[1]), dtype=phi.dtype)
-    counts = np.bincount(labels, minlength=n_clusters).astype(np.float64)
-    np.add.at(centers, labels, phi)
-    centers /= np.clip(counts[:, None], 1.0, None)
-    phi_clustered = centers[labels]
-    return centers.astype(phi.dtype, copy=False), phi_clustered.astype(
-        phi.dtype, copy=False
-    )
+        left_root = find(int(left))
+        right_root = find(int(right))
+        if left_root == right_root:
+            continue
+        if rank[left_root] < rank[right_root]:
+            left_root, right_root = right_root, left_root
+        parent[right_root] = left_root
+        if rank[left_root] == rank[right_root]:
+            rank[left_root] += 1
+        n_components -= 1
+    return int(n_components)
 
 
 def _deduplicate_starts(
@@ -421,41 +332,6 @@ def _objective_value_from_mutation_region_terms_torch(
         ).cpu()
     )
     return fit_loss, penalty, objective, mutation_region_terms.gamma_major
-
-
-def _objective_value_once_torch(
-    torch_data: TorchTumorData,
-    phi: torch.Tensor,
-    *,
-    edge_u: torch.Tensor,
-    edge_v: torch.Tensor,
-    edge_w: torch.Tensor,
-    lambda_value: float,
-    major_prior: float,
-    eps: float,
-) -> tuple[float, float, float, torch.Tensor]:
-    terms = mutation_region_terms_torch(
-        torch_data,
-        phi,
-        major_prior=major_prior,
-        eps=eps,
-    )
-    return _objective_value_from_mutation_region_terms_torch(
-        terms,
-        phi,
-        edge_u=edge_u,
-        edge_v=edge_v,
-        edge_w=edge_w,
-        lambda_value=lambda_value,
-    )
-
-
-def _update_minimum(current: float, candidate: float) -> float:
-    if not np.isfinite(candidate):
-        return float(current)
-    if not np.isfinite(current):
-        return float(candidate)
-    return float(min(current, candidate))
 
 
 _MISSING_SURROGATE_CURVATURE = 1e-6
@@ -1834,7 +1710,6 @@ def _fit_from_start(
         )
     )
     dual_start_is_actual = bool(use_alm and state_dual is not None)
-    history: list[float] = []
     converged = False
     converged_inner = False
     converged_outer = False
@@ -1849,7 +1724,6 @@ def _fit_from_start(
     final_inner_kkt_residual = np.nan
     final_outer_diag = _initial_outer_diag()
     outer_kkt_certificate_status = "not_audited"
-    outer_kkt_dual_refined = False
     outer_kkt_fused_edges = 0
     outer_kkt_nonzero_edges = 0
     outer_stationarity_residual_before_dual_refine = np.inf
@@ -1864,18 +1738,6 @@ def _fit_from_start(
     failed_descent_checks = 0
     failed_nonfinite_checks = 0
     mm_consistency_violations = 0
-    last_attempted_inner_kkt_residual = np.nan
-    best_attempted_inner_kkt_residual = np.nan
-    last_attempted_objective_gap = np.nan
-    best_attempted_objective_gap = np.nan
-    last_attempted_surrogate_gap = np.nan
-    best_attempted_surrogate_gap = np.nan
-    last_attempted_inner_model_gap = np.nan
-    best_attempted_inner_model_gap = np.nan
-    last_attempted_em_envelope_gap = np.nan
-    best_attempted_em_envelope_gap = np.nan
-    accepted_step_type = "none"
-    last_reject_reason = "not_attempted"
     full_step_curvature_multiplier = torch.ones_like(phi)
 
     current_mutation_region_terms = mutation_region_terms_torch(
@@ -1891,8 +1753,6 @@ def _fit_from_start(
             lambda_value=lambda_value,
         )
     )
-    history.append(float(objective))
-
     for outer_iter in range(max(int(outer_max_iter), 1)):
         iterations = outer_iter + 1
         previous_phi = phi.clone()
@@ -1975,7 +1835,6 @@ def _fit_from_start(
         candidate_gamma = gamma_major
         candidate_mutation_region_terms = current_mutation_region_terms
         candidate_inner_residual = np.nan
-        candidate_step_type = "none"
         inner_converged = False
 
         curvature_attempts = (
@@ -2084,11 +1943,6 @@ def _fit_from_start(
                 inner_dual_start_is_actual = bool(use_alm)
             inner_iterations += int(attempted_inner_iterations)
             attempted_outer_steps += 1
-            last_attempted_inner_kkt_residual = float(inner_residual)
-            best_attempted_inner_kkt_residual = _update_minimum(
-                float(best_attempted_inner_kkt_residual),
-                float(inner_residual),
-            )
             delta = phi_trial - phi
             trial_mutation_region_terms = mutation_region_terms_torch(
                 torch_data, phi_trial, major_prior=major_prior, eps=eps
@@ -2154,22 +2008,6 @@ def _fit_from_start(
                         (trial_fit_loss - fit_loss)
                         - (trial_surrogate_loss - surrogate_fit_loss)
                     )
-            last_attempted_objective_gap = objective_gap
-            best_attempted_objective_gap = _update_minimum(
-                float(best_attempted_objective_gap), objective_gap
-            )
-            last_attempted_surrogate_gap = surrogate_gap
-            best_attempted_surrogate_gap = _update_minimum(
-                float(best_attempted_surrogate_gap), surrogate_gap
-            )
-            last_attempted_inner_model_gap = inner_model_gap
-            best_attempted_inner_model_gap = _update_minimum(
-                float(best_attempted_inner_model_gap), inner_model_gap
-            )
-            last_attempted_em_envelope_gap = em_envelope_gap
-            best_attempted_em_envelope_gap = _update_minimum(
-                float(best_attempted_em_envelope_gap), em_envelope_gap
-            )
             finite_attempt = all(
                 np.isfinite(value)
                 for value in [
@@ -2201,7 +2039,6 @@ def _fit_from_start(
             envelope_tol = 1e-8 * (1.0 + abs(fit_loss))
             if not finite_attempt:
                 failed_nonfinite_checks += 1
-                last_reject_reason = "rejected_nonfinite_objective"
                 scale *= 2.0
                 if require_full_step_backtracking:
                     curvature_multiplier = torch.clamp(
@@ -2212,7 +2049,6 @@ def _fit_from_start(
                 continue
             if audit_quadratic_majorizer and inner_model_gap > inner_model_tol:
                 failed_inner_model_checks += 1
-                last_reject_reason = "rejected_inner_model_not_decreased"
                 if require_full_step_backtracking:
                     break
                 scale *= 2.0
@@ -2223,12 +2059,10 @@ def _fit_from_start(
                 and surrogate_gap > majorization_tol
             ):
                 failed_majorization_checks += 1
-                last_reject_reason = "rejected_majorization_failed"
                 scale *= 2.0
                 continue
             if not use_unimodal_objective and em_envelope_gap > envelope_tol:
                 failed_em_envelope_checks += 1
-                last_reject_reason = "rejected_em_envelope_failed"
                 scale *= 2.0
                 continue
             if require_full_step_backtracking and not (
@@ -2236,7 +2070,6 @@ def _fit_from_start(
                 and float(inner_residual) <= inner_progress_tolerance
             ):
                 failed_inner_model_checks += 1
-                last_reject_reason = "rejected_uncertified_inner_admm_step"
                 break
             recovery_armijo_rhs = (
                 1e-4 * min(float(inner_model_gap), 0.0) + objective_tol
@@ -2262,8 +2095,6 @@ def _fit_from_start(
                 candidate_gamma = trial_gamma
                 candidate_mutation_region_terms = trial_mutation_region_terms
                 candidate_inner_residual = float(inner_residual)
-                candidate_step_type = "full_inner_step"
-                accepted_step_type = candidate_step_type
                 inner_converged = bool(
                     (
                         np.isfinite(float(inner_residual))
@@ -2292,7 +2123,6 @@ def _fit_from_start(
                 # If the resource limit is exhausted, leave this outer iterate
                 # unchanged and uncertified rather than interpolating phi.
                 failed_descent_checks += 1
-                last_reject_reason = "rejected_full_step_for_curvature_backtracking"
                 delta_square = torch.square(delta)
                 resolution = torch.finfo(phi.dtype).eps * (1.0 + torch.square(phi))
                 secant_remainder = (
@@ -2387,15 +2217,12 @@ def _fit_from_start(
                     candidate_gamma = theta_gamma
                     candidate_mutation_region_terms = theta_mutation_region_terms
                     candidate_inner_residual = np.nan
-                    candidate_step_type = "damped_mm_direction"
-                    accepted_step_type = candidate_step_type
                     inner_converged = False
                     break
                 theta *= 0.5
             if damped_accepted:
                 break
             failed_descent_checks += 1
-            last_reject_reason = "rejected_exact_descent_failed"
             scale *= 2.0
 
         if not accepted:
@@ -2410,8 +2237,6 @@ def _fit_from_start(
             candidate_fit_loss = fit_loss
             candidate_gamma = gamma_major
             candidate_mutation_region_terms = current_mutation_region_terms
-            candidate_step_type = "none"
-
         phi = candidate_phi
         dual = candidate_dual
         dual_kkt = candidate_dual_kkt
@@ -2424,8 +2249,6 @@ def _fit_from_start(
         gamma_major = candidate_gamma
         current_mutation_region_terms = candidate_mutation_region_terms
         penalty = objective - fit_loss
-        history.append(float(objective))
-
         if verbose:
             print(
                 f"[pairwise-fusion:{runtime.device_name}] iter={iterations:02d} objective={objective:.6f} "
@@ -2659,7 +2482,6 @@ def _fit_from_start(
     )
     final_dual = getattr(certificate, "dual", None)
     outer_kkt_certificate_status = str(final_certificate_refinement.status)
-    outer_kkt_dual_refined = bool(final_certificate_refinement.dual_refined)
     outer_kkt_fused_edges = int(final_certificate_refinement.fused_edges)
     outer_kkt_nonzero_edges = int(final_certificate_refinement.nonzero_edges)
     outer_stationarity_residual_before_dual_refine = float(
@@ -2759,62 +2581,17 @@ def _fit_from_start(
     )
 
     phi_np = phi.detach().cpu().numpy()
-    path_posterior_np = (
-        None
-        if final_terms.path_posterior is None
-        else final_terms.path_posterior.detach().cpu().numpy()
-    )
     effective_summary_tol = (
         max(10.0 * float(tol), 1e-4)
         if summary_tol is None
         else max(float(summary_tol), 1e-12)
     )
-    cluster_labels = _cluster_labels(
+    n_clusters = _number_of_threshold_components(
         phi_np,
         edge_u=edge_u_np,
         edge_v=edge_v_np,
         tol=effective_summary_tol,
     )
-    n_clusters = int(cluster_labels.max()) + 1 if cluster_labels.size else 0
-    cluster_diameters, cluster_diameter_exact = cluster_diameters_from_edges(
-        phi_np,
-        cluster_labels,
-        edge_u=edge_u_np,
-        edge_v=edge_v_np,
-    )
-    max_cluster_diameter = (
-        float(np.max(cluster_diameters)) if cluster_diameters.size else 0.0
-    )
-    if compute_summary:
-        cluster_centers, phi_clustered = _cluster_summary_from_labels(
-            phi_np, cluster_labels
-        )
-        phi_clustered_torch = torch.as_tensor(
-            phi_clustered, dtype=runtime.dtype, device=runtime.device
-        )
-        summary_fit_loss, _, _, _ = _objective_value_once_torch(
-            torch_data,
-            phi_clustered_torch,
-            edge_u=edge_u,
-            edge_v=edge_v,
-            edge_w=edge_w,
-            lambda_value=0.0,
-            major_prior=major_prior,
-            eps=eps,
-        )
-        summary_loglik = float(-summary_fit_loss)
-    else:
-        cluster_centers = np.zeros((n_clusters, phi_np.shape[1]), dtype=phi_np.dtype)
-        phi_clustered = phi_np.astype(phi_np.dtype, copy=False)
-        summary_loglik = float("nan")
-
-    # These binary compatibility fields do not have a valid interpretation
-    # for a categorical occupancy-path model.  Path-specific posterior
-    # fields below are the source of truth.
-    major_probability = np.full_like(phi_np, np.nan, dtype=phi_np.dtype)
-    major_call = np.zeros_like(phi_np, dtype=bool)
-    multiplicity_call = np.full_like(phi_np, np.nan, dtype=phi_np.dtype)
-    multiplicity_estimated_mask = np.zeros_like(phi_np, dtype=bool)
     if isinstance(certificate, CompressedEdgeCertificate):
         terminal_warm_state = PrimalOnlyWarmState(
             phi=phi.detach(),
@@ -2838,23 +2615,7 @@ def _fit_from_start(
     )
     torch_result = TorchFitResult(
         phi_raw=phi.detach(),
-        gamma_major=final_terms.gamma_major.detach(),
         dual=solver_state_out.dual,
-        fit_loss=torch.as_tensor(
-            float(authoritative_fit_loss),
-            dtype=runtime.dtype,
-            device=runtime.device,
-        ),
-        fusion_penalty=torch.as_tensor(
-            float(authoritative_objective - authoritative_fit_loss),
-            dtype=runtime.dtype,
-            device=runtime.device,
-        ),
-        objective=torch.as_tensor(
-            float(authoritative_objective),
-            dtype=runtime.dtype,
-            device=runtime.device,
-        ),
         inner=InnerDiagnostics(
             iterations=int(inner_iterations),
             kkt_residual=float(final_inner_kkt_residual),
@@ -2862,46 +2623,14 @@ def _fit_from_start(
             dual_delta=float("nan"),
             converged=bool(converged_inner),
         ),
-        outer=OuterDiagnostics(
-            iterations=int(iterations),
-            objective_history=tuple(float(value) for value in history),
-            stationarity_residual=float(final_outer_diag["stationarity_residual"]),
-            majorization_failures=int(failed_majorization_checks),
-            accepted_full_steps=int(accepted_full_steps),
-            accepted_damped_steps=int(accepted_damped_steps),
-            converged=bool(converged_outer),
-        ),
-        graph_name=str(graph.name),
-        admm_iterations=(
-            int(work_counters.dense_iterations)
-            if inner_solver == "admm_complete_graph"
-            else 0
-        ),
         inner_solver=str(inner_solver),
         certificate=certificate,
         exactness_provenance=exactness_provenance,
-        path_posterior=(
-            None
-            if final_terms.path_posterior is None
-            else final_terms.path_posterior.detach()
-        ),
     )
 
     return FusionFitArtifacts(
         phi=phi_np.astype(phi_np.dtype, copy=False),
-        phi_clustered=phi_clustered.astype(phi_np.dtype, copy=False),
-        cluster_labels=cluster_labels.astype(np.int64, copy=False),
-        cluster_centers=cluster_centers.astype(phi_np.dtype, copy=False),
-        cluster_diameters=cluster_diameters.astype(np.float64, copy=False),
-        max_cluster_diameter=float(max_cluster_diameter),
-        cluster_diameter_exact=bool(cluster_diameter_exact),
-        gamma_major=major_probability.astype(phi_np.dtype, copy=False),
-        major_probability=major_probability.astype(phi_np.dtype, copy=False),
-        major_call=major_call.astype(bool, copy=False),
-        multiplicity_call=multiplicity_call.astype(phi_np.dtype, copy=False),
-        multiplicity_estimated_mask=multiplicity_estimated_mask,
         loglik=float(-authoritative_fit_loss),
-        summary_loglik=summary_loglik,
         penalized_objective=float(authoritative_objective),
         lambda_value=float(lambda_value),
         n_clusters=n_clusters,
@@ -2910,24 +2639,7 @@ def _fit_from_start(
         device=runtime.device_name,
         dtype=dtype_name(runtime.dtype),
         graph_name=str(graph.name),
-        summary_tol=float(effective_summary_tol),
-        history=[float(value) for value in history],
-        inner_kkt_residual=float(final_inner_kkt_residual),
-        accepted_inner_kkt_residual=float(final_inner_kkt_residual),
-        last_attempted_inner_kkt_residual=float(last_attempted_inner_kkt_residual),
-        best_attempted_inner_kkt_residual=float(best_attempted_inner_kkt_residual),
-        last_attempted_objective_gap=float(last_attempted_objective_gap),
-        best_attempted_objective_gap=float(best_attempted_objective_gap),
-        last_attempted_surrogate_gap=float(last_attempted_surrogate_gap),
-        best_attempted_surrogate_gap=float(best_attempted_surrogate_gap),
-        last_attempted_inner_model_gap=float(last_attempted_inner_model_gap),
-        best_attempted_inner_model_gap=float(best_attempted_inner_model_gap),
-        last_attempted_em_envelope_gap=float(last_attempted_em_envelope_gap),
-        best_attempted_em_envelope_gap=float(best_attempted_em_envelope_gap),
         outer_stationarity_residual=float(final_outer_diag["stationarity_residual"]),
-        outer_projected_stationarity_residual=float(
-            final_outer_diag["projected_stationarity_residual"]
-        ),
         outer_projected_stationarity_norm=float(
             final_outer_diag["projected_stationarity_norm"]
         ),
@@ -2941,15 +2653,6 @@ def _fit_from_start(
         ),
         outer_dual_ball_residual=float(final_outer_diag["dual_ball_residual"]),
         outer_box_primal_violation=float(final_outer_diag["box_primal_violation"]),
-        outer_num_interior_coordinates=int(
-            final_outer_diag["num_interior_coordinates"]
-        ),
-        outer_num_lower_active_coordinates=int(
-            final_outer_diag["num_lower_active_coordinates"]
-        ),
-        outer_num_upper_active_coordinates=int(
-            final_outer_diag["num_upper_active_coordinates"]
-        ),
         outer_num_frozen_coordinates=int(final_outer_diag["num_frozen_coordinates"]),
         outer_box_residual=float(final_outer_diag["box_residual"]),
         outer_backward_error_stationarity_residual=float(
@@ -2961,12 +2664,8 @@ def _fit_from_start(
         outer_backward_error_dual_ball_residual=float(
             final_outer_diag["backward_error_dual_ball_residual"]
         ),
-        outer_backward_error_kkt_residual=float(
-            final_outer_diag["backward_error_kkt_residual"]
-        ),
         fixed_objective_kkt_residual=float(authoritative_kkt_residual),
         outer_kkt_certificate_status=str(outer_kkt_certificate_status),
-        outer_kkt_dual_refined=bool(outer_kkt_dual_refined),
         outer_kkt_fused_edges=int(outer_kkt_fused_edges),
         outer_kkt_nonzero_edges=int(outer_kkt_nonzero_edges),
         outer_stationarity_residual_before_dual_refine=float(
@@ -2989,8 +2688,6 @@ def _fit_from_start(
         failed_descent_checks=int(failed_descent_checks),
         failed_nonfinite_checks=int(failed_nonfinite_checks),
         mm_consistency_violations=int(mm_consistency_violations),
-        accepted_step_type=str(accepted_step_type),
-        last_reject_reason=str(last_reject_reason),
         failure_reason=str(failure_reason),
         selection_eligible=bool(selection_eligible),
         stationarity_certified=bool(stationarity_certified),
@@ -3013,7 +2710,6 @@ def _fit_from_start(
         inner_solver=str(inner_solver),
         certificate=certificate,
         exactness_provenance=exactness_provenance,
-        path_posterior=path_posterior_np,
     )
 
 
