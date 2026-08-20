@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from ..core.bic import SelectionScore
 from ..core.model import FitResult
 
 StartArray = np.ndarray | torch.Tensor
@@ -104,37 +105,6 @@ class PartitionRefitSummary:
             "cluster_centers",
             _immutable_array(self.cluster_centers, dtype=np.dtype(np.float64)),
         )
-
-
-@dataclass(frozen=True)
-class SelectionScore:
-    name: Literal[
-        "fixed_partition_bic",
-        "fixed_partition_dirichlet_score",
-    ]
-    value: float
-    loglik: float
-    penalty: float
-    degrees_of_freedom: int
-    n_eff: int
-    partition_signature: str
-    numerical_uncertainty: float = 0.0
-    assignment_log_evidence: float = 0.0
-    assignment_code_weight: float = 0.0
-    assignment_penalty: float = 0.0
-    assignment_dirichlet_alpha: float = 1.0
-    assignment_model_id: str = "none"
-    assignment_symmetry_mode: str = "none"
-    assignment_arithmetic_uncertainty: float = 0.0
-    selection_contract_id: str = "hybrid-ward-cem-v1"
-
-    @property
-    def lower_bound(self) -> float:
-        return float(self.value - self.numerical_uncertainty)
-
-    @property
-    def upper_bound(self) -> float:
-        return float(self.value + self.numerical_uncertainty)
 
 
 @dataclass(frozen=True)

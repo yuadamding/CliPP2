@@ -9,15 +9,46 @@ BIC arithmetic in one place avoids the correctness-drift risk of re-deriving
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from math import fsum, lgamma
-from typing import TYPE_CHECKING
+from typing import Literal
 
 import numpy as np
 
 from ..io.data import TumorData
 
-if TYPE_CHECKING:
-    from ..model_selection.types import SelectionScore
+
+@dataclass(frozen=True, slots=True)
+class SelectionScore:
+    """Immutable value returned by the fixed-partition score evaluators."""
+
+    name: Literal[
+        "fixed_partition_bic",
+        "fixed_partition_dirichlet_score",
+    ]
+    value: float
+    loglik: float
+    penalty: float
+    degrees_of_freedom: int
+    n_eff: int
+    partition_signature: str
+    numerical_uncertainty: float = 0.0
+    assignment_log_evidence: float = 0.0
+    assignment_code_weight: float = 0.0
+    assignment_penalty: float = 0.0
+    assignment_dirichlet_alpha: float = 1.0
+    assignment_model_id: str = "none"
+    assignment_symmetry_mode: str = "none"
+    assignment_arithmetic_uncertainty: float = 0.0
+    selection_contract_id: str = "hybrid-ward-cem-v1"
+
+    @property
+    def lower_bound(self) -> float:
+        return float(self.value - self.numerical_uncertainty)
+
+    @property
+    def upper_bound(self) -> float:
+        return float(self.value + self.numerical_uncertainty)
 
 
 def _observed_positive_depth_mask(data: TumorData) -> np.ndarray:
@@ -73,7 +104,7 @@ def fixed_partition_bic(
     labels: np.ndarray | None = None,
     loglik_uncertainty: float = 0.0,
     selection_contract_id: str = "hybrid-ward-cem-v1",
-) -> "SelectionScore":
+) -> SelectionScore:
     """Return the explicitly named BIC for one immutable partition refit."""
 
     degrees_of_freedom = int(num_clusters) * int(data.num_regions)
@@ -86,10 +117,6 @@ def fixed_partition_bic(
     value = float(-2.0 * float(loglik) + penalty)
     likelihood_uncertainty = max(float(loglik_uncertainty), 0.0)
     arithmetic_uncertainty = 16.0 * np.finfo(np.float64).eps * (1.0 + abs(value))
-    # Imported lazily to keep this score-primitives module usable by the lower
-    # fusion layer without introducing a module-import cycle.
-    from ..model_selection.types import SelectionScore
-
     return SelectionScore(
         name="fixed_partition_bic",
         value=value,
@@ -218,7 +245,7 @@ def fixed_partition_dirichlet_score(
     alpha: float = PARTITION_DIRICHLET_ALPHA,
     code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
     selection_contract_id: str = "hybrid-ward-cem-v1",
-) -> "SelectionScore":
+) -> SelectionScore:
     """Return BIC plus a Dirichlet-integrated exact-partition deviance.
 
     The likelihood and center degrees of freedom are exactly those of
@@ -266,8 +293,6 @@ def fixed_partition_dirichlet_score(
         * np.finfo(np.float64).eps
         * (1.0 + abs(float(base.value)) + abs(assignment_penalty))
     )
-    from ..model_selection.types import SelectionScore
-
     return SelectionScore(
         name="fixed_partition_dirichlet_score",
         value=score_value,
@@ -332,4 +357,5 @@ __all__ = [
     "fixed_partition_dirichlet_score",
     "PARTITION_DIRICHLET_ALPHA",
     "PARTITION_DIRICHLET_SCORE_WEIGHT",
+    "SelectionScore",
 ]
