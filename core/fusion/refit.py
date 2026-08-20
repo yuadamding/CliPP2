@@ -7,9 +7,12 @@ from dataclasses import dataclass
 import numpy as np
 
 from ...io.data import TumorData
-from .scalar_fast import approximate_tumor_scalar_minimum
-from .scalar_global import (
-    certify_tumor_scalar_minimum,
+from ..objective import compile_observed_model
+from ..scalar import (
+    ScalarProblem,
+    approximate_scalar_minimum,
+    certify_scalar_minimum,
+    scalar_problem_from_model,
 )
 
 
@@ -66,63 +69,37 @@ def _canonical_labels(labels: np.ndarray) -> np.ndarray:
     return remapped
 
 
-def _certified_refit_cluster_region(
-    data: TumorData,
+def _fit_coordinate(
+    problem: ScalarProblem,
     *,
-    mutation_indices: np.ndarray,
-    region_index: int,
-    lower: float,
-    upper: float,
-    major_prior: float,
-    eps: float,
-    tol: float,
+    mode: str,
+    tolerance: float,
     max_iter: int,
-) -> _RefitCoordinateResult:
-    certificate = certify_tumor_scalar_minimum(
-        data,
-        np.asarray(mutation_indices, dtype=np.int64),
-        int(region_index),
-        lower=float(lower),
-        upper=float(upper),
-        major_prior=float(major_prior),
-        eps=float(eps),
-        tolerance=float(tol),
-        max_intervals=max(int(max_iter) * 256, 4096),
-    )
-    return _RefitCoordinateResult(
-        beta=float(certificate.argmin),
-        loss=float(certificate.attained_value),
-        global_lower_bound=float(certificate.global_lower_bound),
-        optimality_gap=float(certificate.optimality_gap),
-        finite_candidate_found=bool(np.isfinite(certificate.attained_value)),
-        globally_certified=bool(certificate.globally_certified),
-        certificate_method=str(certificate.method),
-        certificate_intervals=int(certificate.intervals_evaluated),
-    )
-
-
-def _approximate_refit_cluster_region(
-    data: TumorData,
-    *,
-    mutation_indices: np.ndarray,
-    region_index: int,
-    lower: float,
-    upper: float,
-    major_prior: float,
-    eps: float,
     grid_points: int,
     local_steps: int,
+    include_breakpoints: bool,
 ) -> _RefitCoordinateResult:
-    result = approximate_tumor_scalar_minimum(
-        data,
-        np.asarray(mutation_indices, dtype=np.int64),
-        int(region_index),
-        lower=float(lower),
-        upper=float(upper),
-        major_prior=float(major_prior),
-        eps=float(eps),
-        grid_points=int(grid_points),
-        local_steps=int(local_steps),
+    if mode == "interval_certified":
+        result = certify_scalar_minimum(
+            problem,
+            tolerance=tolerance,
+            max_intervals=max(int(max_iter) * 256, 4096),
+        )
+        return _RefitCoordinateResult(
+            beta=float(result.argmin),
+            loss=float(result.attained_value),
+            global_lower_bound=float(result.global_lower_bound),
+            optimality_gap=float(result.optimality_gap),
+            finite_candidate_found=bool(np.isfinite(result.attained_value)),
+            globally_certified=bool(result.globally_certified),
+            certificate_method=str(result.method),
+            certificate_intervals=int(result.intervals_evaluated),
+        )
+    result = approximate_scalar_minimum(
+        problem,
+        grid_points=grid_points,
+        local_steps=local_steps,
+        include_breakpoints=include_breakpoints,
     )
     return _RefitCoordinateResult(
         beta=float(result.argmin),
@@ -137,13 +114,6 @@ def _approximate_refit_cluster_region(
         grid_spacing=float(result.final_grid_spacing),
         best_second_loss_gap=float(result.best_second_loss_gap),
     )
-
-
-def _observed_positive_depth_mask(data: TumorData) -> np.ndarray:
-    observed = np.asarray(data.total_counts, dtype=np.float64) > 0.0
-    if data.count_observed is not None:
-        observed &= np.asarray(data.count_observed, dtype=bool)
-    return observed
 
 
 def partition_constrained_observed_refit(
@@ -180,8 +150,9 @@ def partition_constrained_observed_refit(
     n_clusters = int(labels.max()) + 1 if labels.size else 0
     n_regions = int(data.num_regions)
 
-    upper_matrix = np.asarray(data.phi_upper, dtype=np.float64)
-    observed = _observed_positive_depth_mask(data)
+    model = compile_observed_model(data, major_prior=major_prior, eps=eps)
+    upper_matrix = model.upper
+    observed = model.observed & ((model.alt + model.nonalt) > 0.0)
     centers = np.zeros((n_clusters, n_regions), dtype=np.float64)
     coordinate_lower = np.zeros((n_clusters, n_regions), dtype=np.float64)
     coordinate_certified = np.ones((n_clusters, n_regions), dtype=bool)
@@ -204,30 +175,23 @@ def partition_constrained_observed_refit(
             upper = float(np.min(upper_matrix[members, region]))
             if not np.isfinite(upper) or upper < lower:
                 upper = lower
-            if normalized_scalar_mode == "interval_certified":
-                coordinate = _certified_refit_cluster_region(
-                    data,
-                    mutation_indices=members,
-                    region_index=region,
-                    lower=lower,
-                    upper=upper,
-                    major_prior=float(major_prior),
-                    eps=eps,
-                    tol=coordinate_tolerance,
-                    max_iter=int(max_iter),
-                )
-            else:
-                coordinate = _approximate_refit_cluster_region(
-                    data,
-                    mutation_indices=members,
-                    region_index=region,
-                    lower=lower,
-                    upper=upper,
-                    major_prior=float(major_prior),
-                    eps=eps,
-                    grid_points=int(scalar_grid_points),
-                    local_steps=int(scalar_local_steps),
-                )
+            problem = scalar_problem_from_model(
+                model,
+                members,
+                region,
+                lower=lower,
+                upper=upper,
+                eps=eps,
+            )
+            coordinate = _fit_coordinate(
+                problem,
+                mode=normalized_scalar_mode,
+                tolerance=coordinate_tolerance,
+                max_iter=max_iter,
+                grid_points=scalar_grid_points,
+                local_steps=scalar_local_steps,
+                include_breakpoints=data.path_likelihood is not None,
+            )
             centers[cluster, region] = coordinate.beta
             coordinate_lower[cluster, region] = coordinate.global_lower_bound
             coordinate_certified[cluster, region] = coordinate.globally_certified
