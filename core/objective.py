@@ -313,6 +313,18 @@ class TorchObservedModel:
     model_id: str
     source_fingerprint: str
 
+    @property
+    def shape(self) -> tuple[int, int]:
+        return tuple(int(value) for value in self.alt.shape)
+
+    @property
+    def path_shape(self) -> tuple[int, int, int]:
+        return tuple(int(value) for value in self.first_scale.shape)
+
+    @property
+    def total(self) -> torch.Tensor:
+        return self.alt + self.nonalt
+
 
 @dataclass(frozen=True, slots=True)
 class ObservedTerms:
@@ -330,6 +342,20 @@ class TorchObservedTerms:
     hessian_upper: torch.Tensor
     posterior: torch.Tensor
     legacy_major_probability: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class _NumpyPathKernel:
+    mass: np.ndarray
+    probability: np.ndarray
+    slope: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class _TorchPathKernel:
+    mass: torch.Tensor
+    probability: torch.Tensor
+    slope: torch.Tensor
 
 
 def _compile_legacy_as_paths(data: "TumorData", major_prior: float) -> dict[str, object]:
@@ -512,17 +538,20 @@ def make_lambda_objective_key(
     return LambdaObjectiveKey(base=base, lambda_hex=value.hex())
 
 
-def observed_terms_numpy(
+def _validated_epsilon(eps: float) -> float:
+    epsilon = float(eps)
+    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
+        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
+    return epsilon
+
+
+def _path_kernel_numpy(
     model: ObservedModel,
     phi: np.ndarray,
     *,
     eps: float,
-) -> ObservedTerms:
-    """Evaluate loss, left-gradient, curvature majorant, and path posterior."""
-
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
+) -> _NumpyPathKernel:
+    epsilon = _validated_epsilon(eps)
     phi_array = np.asarray(phi, dtype=np.float64)
     if phi_array.shape != model.shape or not np.all(np.isfinite(phi_array)):
         raise ValueError(f"phi must be a finite array with shape {model.shape}.")
@@ -540,6 +569,63 @@ def observed_terms_numpy(
         segment_slope,
         0.0,
     )
+    return _NumpyPathKernel(mass=mass, probability=probability, slope=slope)
+
+
+def _path_kernel_torch(
+    model: TorchObservedModel,
+    phi: torch.Tensor,
+    *,
+    eps: float,
+) -> _TorchPathKernel:
+    """Evaluate every canonical path over optional trailing grid dimensions.
+
+    ``phi`` has shape ``(M, S, *grid)``. Runtime model arrays are reshaped,
+    not copied, so the kernel stays resident on its original device while a
+    caller evaluates any number of candidate CCFs per mutation-region.
+    """
+
+    epsilon = _validated_epsilon(eps)
+    if phi.ndim < 2 or tuple(phi.shape[:2]) != model.shape:
+        raise ValueError(
+            "phi must start with the observed-model shape "
+            f"{model.shape}, not {tuple(phi.shape)}."
+        )
+    if phi.dtype != model.alt.dtype or phi.device != model.alt.device:
+        raise ValueError("phi must use the observed model's runtime dtype and device.")
+    grid_ndim = phi.ndim - 2
+    path_shape = (*model.shape, *((1,) * grid_ndim), model.path_shape[-1])
+
+    def path_view(value: torch.Tensor) -> torch.Tensor:
+        return value.reshape(path_shape)
+
+    expanded_phi = phi.unsqueeze(-1)
+    first = path_view(model.first_scale)
+    second = path_view(model.second_scale)
+    switch = path_view(model.switch)
+    mass = first * torch.minimum(expanded_phi, switch)
+    mass = mass + second * torch.clamp(expanded_phi - switch, min=0.0)
+    probability = torch.clamp(mass, min=epsilon, max=1.0 - epsilon)
+    segment_slope = torch.where(expanded_phi <= switch, first, second)
+    slope = torch.where(
+        (mass > epsilon) & (mass < 1.0 - epsilon),
+        segment_slope,
+        torch.zeros_like(segment_slope),
+    )
+    return _TorchPathKernel(mass=mass, probability=probability, slope=slope)
+
+
+def observed_terms_numpy(
+    model: ObservedModel,
+    phi: np.ndarray,
+    *,
+    eps: float,
+) -> ObservedTerms:
+    """Evaluate loss, left-gradient, curvature majorant, and path posterior."""
+
+    kernel = _path_kernel_numpy(model, phi, eps=eps)
+    probability = kernel.probability
+    slope = kernel.slope
     joint = np.where(
         model.valid,
         model.alt[..., None] * np.log(probability)
@@ -592,27 +678,11 @@ def observed_terms_torch(
 ) -> TorchObservedTerms:
     """Torch counterpart of :func:`observed_terms_numpy`."""
 
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
     if tuple(phi.shape) != tuple(model.alt.shape):
         raise ValueError(f"phi must have shape {tuple(model.alt.shape)}.")
-    expanded_phi = phi.unsqueeze(-1)
-    mass = model.first_scale * torch.minimum(expanded_phi, model.switch)
-    mass = mass + model.second_scale * torch.clamp(
-        expanded_phi - model.switch, min=0.0
-    )
-    probability = torch.clamp(mass, min=epsilon, max=1.0 - epsilon)
-    segment_slope = torch.where(
-        expanded_phi <= model.switch,
-        model.first_scale,
-        model.second_scale,
-    )
-    slope = torch.where(
-        (mass > epsilon) & (mass < 1.0 - epsilon),
-        segment_slope,
-        torch.zeros_like(segment_slope),
-    )
+    kernel = _path_kernel_torch(model, phi, eps=eps)
+    probability = kernel.probability
+    slope = kernel.slope
     joint = (
         model.alt.unsqueeze(-1) * torch.log(probability)
         + model.nonalt.unsqueeze(-1) * torch.log1p(-probability)
@@ -654,6 +724,237 @@ def observed_terms_torch(
     )
 
 
+def observed_loss_grid_torch(
+    model: TorchObservedModel,
+    phi: torch.Tensor,
+    *,
+    eps: float,
+    respect_observed: bool = True,
+) -> torch.Tensor:
+    """Evaluate the canonical observed loss over trailing candidate grids.
+
+    ``phi`` must have shape ``(M, S, *grid)`` and the result has the same
+    shape. This is the sole batched likelihood used by pilot and partition
+    start generation.
+    """
+
+    kernel = _path_kernel_torch(model, phi, eps=eps)
+    grid_ndim = phi.ndim - 2
+    observation_shape = (*model.shape, *((1,) * grid_ndim))
+    path_shape = (*observation_shape, model.path_shape[-1])
+
+    def observation_view(value: torch.Tensor) -> torch.Tensor:
+        return value.reshape(observation_shape)
+
+    def path_view(value: torch.Tensor) -> torch.Tensor:
+        return value.reshape(path_shape)
+
+    joint = (
+        observation_view(model.alt).unsqueeze(-1) * torch.log(kernel.probability)
+        + observation_view(model.nonalt).unsqueeze(-1)
+        * torch.log1p(-kernel.probability)
+        + path_view(model.log_prior)
+    ).masked_fill(~path_view(model.valid), -torch.inf)
+    loss = -torch.logsumexp(joint, dim=-1)
+    if not bool(respect_observed):
+        return loss
+    return torch.where(
+        observation_view(model.observed),
+        loss,
+        torch.zeros_like(loss),
+    )
+
+
+def observed_em_terms_torch(
+    model: TorchObservedModel,
+    phi: torch.Tensor,
+    *,
+    responsibilities: torch.Tensor,
+    eps: float,
+) -> TorchObservedTerms:
+    """Evaluate one categorical EM surrogate for any observed model."""
+
+    if tuple(phi.shape) != model.shape:
+        raise ValueError(f"phi must have shape {model.shape}.")
+    if tuple(responsibilities.shape) != model.path_shape:
+        raise ValueError(
+            f"responsibilities must have shape {model.path_shape}, "
+            f"not {tuple(responsibilities.shape)}."
+        )
+    if responsibilities.dtype != model.alt.dtype or (
+        responsibilities.device != model.alt.device
+    ):
+        raise ValueError(
+            "responsibilities must use the observed model's dtype and device."
+        )
+    if not bool(torch.all(torch.isfinite(responsibilities)).item()) or bool(
+        torch.any(responsibilities < 0.0).item()
+    ):
+        raise ValueError("responsibilities must be finite and nonnegative.")
+
+    weights = responsibilities.masked_fill(~model.valid, 0.0)
+    normalizer = torch.sum(weights, dim=-1, keepdim=True)
+    if bool(torch.any(normalizer <= 0.0).item()):
+        raise ValueError("responsibilities must assign mass to a valid path.")
+    weights = weights / normalizer
+    kernel = _path_kernel_torch(model, phi, eps=eps)
+    log_kernel = (
+        model.alt.unsqueeze(-1) * torch.log(kernel.probability)
+        + model.nonalt.unsqueeze(-1) * torch.log1p(-kernel.probability)
+    )
+    complete_loss = torch.where(
+        model.valid,
+        -(log_kernel + model.log_prior),
+        torch.zeros_like(log_kernel),
+    )
+    entropy = torch.where(
+        weights > 0.0,
+        weights * torch.log(torch.clamp(weights, min=torch.finfo(weights.dtype).tiny)),
+        torch.zeros_like(weights),
+    )
+    loss = torch.sum(weights * complete_loss + entropy, dim=-1)
+    state_gradient = kernel.slope * (
+        model.alt.unsqueeze(-1) / kernel.probability
+        - model.nonalt.unsqueeze(-1) / (1.0 - kernel.probability)
+    )
+    state_curvature = torch.square(kernel.slope) * (
+        model.alt.unsqueeze(-1) / torch.square(kernel.probability)
+        + model.nonalt.unsqueeze(-1) / torch.square(1.0 - kernel.probability)
+    )
+    gradient = -torch.sum(weights * state_gradient, dim=-1)
+    hessian_upper = torch.sum(weights * state_curvature, dim=-1)
+    prior = torch.exp(model.log_prior).masked_fill(~model.valid, 0.0)
+    posterior = torch.where(model.observed.unsqueeze(-1), weights, prior)
+    loss = torch.where(model.observed, loss, torch.zeros_like(loss))
+    gradient = torch.where(model.observed, gradient, torch.zeros_like(gradient))
+    hessian_upper = torch.where(
+        model.observed,
+        torch.clamp(hessian_upper, min=1e-8),
+        torch.zeros_like(hessian_upper),
+    )
+    legacy_major_probability = (
+        torch.ones_like(loss)
+        if model.legacy_major is None
+        else torch.sum(
+            posterior * model.legacy_major.to(dtype=posterior.dtype), dim=-1
+        )
+    )
+    return TorchObservedTerms(
+        loss=loss,
+        gradient=gradient,
+        hessian_upper=hessian_upper,
+        posterior=posterior,
+        legacy_major_probability=legacy_major_probability,
+    )
+
+
+def observed_probability_and_slope_torch(
+    model: TorchObservedModel,
+    phi: torch.Tensor,
+    *,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return canonical path probabilities and left-segment slopes."""
+
+    if tuple(phi.shape) != model.shape:
+        raise ValueError(f"phi must have shape {model.shape}.")
+    kernel = _path_kernel_torch(model, phi, eps=eps)
+    return kernel.probability, kernel.slope
+
+
+def observed_internal_breakpoints_torch(
+    model: TorchObservedModel,
+    *,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return path switches and clipping points with aligned validity."""
+
+    epsilon = _validated_epsilon(eps)
+    points = [model.switch]
+    masks = [model.valid]
+    for target in (epsilon, 1.0 - epsilon):
+        left = torch.where(
+            model.first_scale > 0.0,
+            model.first_scale.new_full((), target) / model.first_scale,
+            torch.full_like(model.first_scale, float("nan")),
+        )
+        left_valid = (
+            model.valid
+            & torch.isfinite(left)
+            & (left >= 0.0)
+            & (left <= model.switch)
+        )
+        right = torch.where(
+            model.second_scale > 0.0,
+            model.switch
+            + (
+                model.second_scale.new_full((), target)
+                - model.first_scale * model.switch
+            )
+            / model.second_scale,
+            torch.full_like(model.second_scale, float("nan")),
+        )
+        right_valid = (
+            model.valid
+            & torch.isfinite(right)
+            & (right >= model.switch)
+            & (right <= 1.0)
+        )
+        points.extend((left, right))
+        masks.extend((left_valid, right_valid))
+    return torch.cat(points, dim=-1), torch.cat(masks, dim=-1)
+
+
+def observed_one_sided_gradients_torch(
+    model: TorchObservedModel,
+    phi: torch.Tensor,
+    *,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return exact left/right loss gradients at canonical breakpoints."""
+
+    epsilon = _validated_epsilon(eps)
+    if tuple(phi.shape) != model.shape:
+        raise ValueError(f"phi must have shape {model.shape}.")
+    kernel = _path_kernel_torch(model, phi, eps=epsilon)
+    expanded_phi = phi.unsqueeze(-1)
+    left_slope = torch.where(
+        expanded_phi <= model.switch, model.first_scale, model.second_scale
+    )
+    right_slope = torch.where(
+        expanded_phi < model.switch, model.first_scale, model.second_scale
+    )
+    outside = (kernel.mass < epsilon) | (kernel.mass > 1.0 - epsilon)
+    left_slope = torch.where(outside, torch.zeros_like(left_slope), left_slope)
+    right_slope = torch.where(outside, torch.zeros_like(right_slope), right_slope)
+    left_slope = torch.where(
+        kernel.mass <= epsilon, torch.zeros_like(left_slope), left_slope
+    )
+    right_slope = torch.where(
+        kernel.mass >= 1.0 - epsilon, torch.zeros_like(right_slope), right_slope
+    )
+    joint = (
+        model.alt.unsqueeze(-1) * torch.log(kernel.probability)
+        + model.nonalt.unsqueeze(-1) * torch.log1p(-kernel.probability)
+        + model.log_prior
+    ).masked_fill(~model.valid, -torch.inf)
+    posterior = torch.softmax(joint, dim=-1)
+    state_factor = model.alt.unsqueeze(-1) / kernel.probability - model.nonalt.unsqueeze(
+        -1
+    ) / (1.0 - kernel.probability)
+    gradient_left = -torch.sum(posterior * left_slope * state_factor, dim=-1)
+    gradient_right = -torch.sum(posterior * right_slope * state_factor, dim=-1)
+    gradient_left = torch.where(
+        model.observed, gradient_left, torch.zeros_like(gradient_left)
+    )
+    gradient_right = torch.where(
+        model.observed, gradient_right, torch.zeros_like(gradient_right)
+    )
+    points, valid = observed_internal_breakpoints_torch(model, eps=epsilon)
+    at_breakpoint = torch.any(valid & (points == expanded_phi), dim=-1)
+    return gradient_left, gradient_right, at_breakpoint
+
+
 __all__ = [
     "BaseObjectiveKey",
     "LambdaObjectiveKey",
@@ -665,6 +966,11 @@ __all__ = [
     "make_base_objective_key",
     "make_lambda_objective_key",
     "model_to_torch",
+    "observed_em_terms_torch",
+    "observed_internal_breakpoints_torch",
+    "observed_loss_grid_torch",
+    "observed_one_sided_gradients_torch",
+    "observed_probability_and_slope_torch",
     "observed_terms_numpy",
     "observed_terms_torch",
 ]

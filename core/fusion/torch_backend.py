@@ -6,17 +6,14 @@ import warnings
 import numpy as np
 import torch
 
-from ...io.data import (
-    PathLikelihoodSpec,
-    TumorData,
-    tumor_data_fingerprint,
-)
+from ...io.data import TumorData, tumor_data_fingerprint
 from ..objective import (
     ObservedModel,
     TorchObservedModel,
     compile_observed_model,
     model_to_torch,
-    observed_terms_numpy,
+    observed_em_terms_torch,
+    observed_loss_grid_torch,
     observed_terms_torch,
 )
 from .defaults import DEFAULT_DTYPE
@@ -31,63 +28,32 @@ from .types import TorchRuntime
 
 
 @dataclass(frozen=True)
-class TorchPathLikelihoodSpec:
-    """Device representation of a fixed-prior piecewise-affine path family."""
-
-    first_scale: torch.Tensor
-    second_scale: torch.Tensor
-    switch_fraction: torch.Tensor
-    log_prior: torch.Tensor
-    valid: torch.Tensor
-    model_id: str
-    model_version: str = "1"
-    candidate_generator_version: str = "unspecified"
-    prior_mode: str = "fixed_canonical_path_prior"
-    legacy_major_indicator: torch.Tensor | None = None
-
-
-@dataclass(frozen=True)
 class TorchTumorData:
-    """Solver compatibility view backed by one canonical observed model.
+    """Runtime tumor payload with one authoritative observed-likelihood model."""
 
-    The flat legacy fields remain available while starts, context reuse, and
-    public low-level helpers migrate independently.  All production observed
-    likelihood and EM evaluation uses ``observed_model``.
-    """
-
-    alt: torch.Tensor
-    total: torch.Tensor
-    nonalt: torch.Tensor
-    phi_upper: torch.Tensor
-    ambiguous: torch.Tensor
-    b_minus: torch.Tensor
-    b_plus: torch.Tensor
-    b_fixed: torch.Tensor
-    count_observed: torch.Tensor | None = None  # bool (M, S); None means all observed
-    path_likelihood: TorchPathLikelihoodSpec | None = None
-    data_fingerprint: str = ""
+    observed_model: TorchObservedModel
+    data_fingerprint: str
     source_model: ObservedModel | None = None
-    observed_model: TorchObservedModel | None = None
 
-    def __post_init__(self) -> None:
-        if self.observed_model is None:
-            observed_model = (
-                _observed_model_from_compatibility_fields(self)
-                if self.source_model is None
-                else model_to_torch(
-                    self.source_model,
-                    TorchRuntime(
-                        device=self.alt.device,
-                        device_name=str(self.alt.device),
-                        dtype=self.alt.dtype,
-                    ),
-                )
-            )
-            object.__setattr__(
-                self,
-                "observed_model",
-                observed_model,
-            )
+    @property
+    def alt(self) -> torch.Tensor:
+        return self.observed_model.alt
+
+    @property
+    def total(self) -> torch.Tensor:
+        return self.observed_model.total
+
+    @property
+    def nonalt(self) -> torch.Tensor:
+        return self.observed_model.nonalt
+
+    @property
+    def phi_upper(self) -> torch.Tensor:
+        return self.observed_model.upper
+
+    @property
+    def count_observed(self) -> torch.Tensor:
+        return self.observed_model.observed
 
 
 @dataclass(frozen=True)
@@ -97,75 +63,6 @@ class TorchMutationRegionTerms:
     hess_upper: torch.Tensor
     gamma_major: torch.Tensor
     path_posterior: torch.Tensor | None = None
-
-
-@dataclass(frozen=True)
-class NumpyPathMutationRegionTerms:
-    loss: np.ndarray
-    grad: np.ndarray
-    hess_upper: np.ndarray
-    path_posterior: np.ndarray
-    gamma_major: np.ndarray
-
-
-def _observed_model_from_compatibility_fields(
-    data: TorchTumorData,
-) -> TorchObservedModel:
-    """Reconstruct the canonical runtime view used by legacy solver contexts."""
-
-    observed = (
-        torch.ones_like(data.alt, dtype=torch.bool)
-        if data.count_observed is None
-        else data.count_observed
-    )
-    path = data.path_likelihood
-    if path is None:
-        first = torch.stack(
-            (torch.where(data.ambiguous, data.b_minus, data.b_fixed), data.b_plus),
-            dim=-1,
-        )
-        valid = torch.stack(
-            (torch.ones_like(data.ambiguous), data.ambiguous),
-            dim=-1,
-        )
-        log_half = data.alt.new_full((), float(np.log(0.5)))
-        log_prior = torch.stack(
-            (
-                torch.where(data.ambiguous, log_half, torch.zeros_like(data.alt)),
-                log_half.expand_as(data.alt),
-            ),
-            dim=-1,
-        ).masked_fill(~valid, -torch.inf)
-        legacy_major = torch.stack(
-            (~data.ambiguous, torch.ones_like(data.ambiguous)),
-            dim=-1,
-        ) & valid
-        second = first
-        switch = torch.zeros_like(first)
-        model_id = "legacy_major_minor_as_paths_v1"
-    else:
-        first = path.first_scale
-        second = path.second_scale
-        switch = path.switch_fraction
-        log_prior = path.log_prior
-        valid = path.valid
-        legacy_major = path.legacy_major_indicator
-        model_id = path.model_id
-    return TorchObservedModel(
-        alt=data.alt,
-        nonalt=data.nonalt,
-        observed=observed,
-        lower=torch.zeros_like(data.phi_upper),
-        upper=data.phi_upper,
-        first_scale=first,
-        second_scale=second,
-        switch=switch,
-        log_prior=log_prior,
-        valid=valid,
-        legacy_major=legacy_major,
-        model_id=model_id,
-        source_fingerprint=str(data.data_fingerprint),
-    )
 
 
 def _copy_torch_observed_model(
@@ -200,100 +97,24 @@ def copy_torch_tumor_data(
     dtype: torch.dtype,
     device: torch.device,
 ) -> TorchTumorData:
-    """Rebuild a runtime view from source, with a legacy cast-only fallback."""
+    """Rebuild a runtime view from source, with a cast-only foreign fallback."""
 
     if data.source_model is not None:
         runtime = TorchRuntime(device=device, device_name=str(device), dtype=dtype)
         observed_model = model_to_torch(data.source_model, runtime)
-        path_likelihood = (
-            None
-            if data.path_likelihood is None
-            else replace(
-                data.path_likelihood,
-                first_scale=observed_model.first_scale,
-                second_scale=observed_model.second_scale,
-                switch_fraction=observed_model.switch,
-                log_prior=observed_model.log_prior,
-                valid=observed_model.valid,
-                legacy_major_indicator=observed_model.legacy_major,
-            )
-        )
-        if path_likelihood is None:
-            ambiguous = observed_model.valid[..., 1]
-            b_minus = observed_model.first_scale[..., 0]
-            b_plus = observed_model.first_scale[..., 1]
-            b_fixed = torch.where(ambiguous, b_plus, b_minus)
-        else:
-            ambiguous = data.ambiguous.to(device=device)
-            b_minus = data.b_minus.to(dtype=dtype, device=device)
-            b_plus = data.b_plus.to(dtype=dtype, device=device)
-            b_fixed = data.b_fixed.to(dtype=dtype, device=device)
         return TorchTumorData(
-            alt=observed_model.alt,
-            total=observed_model.alt + observed_model.nonalt,
-            nonalt=observed_model.nonalt,
-            phi_upper=observed_model.upper,
-            ambiguous=ambiguous,
-            b_minus=b_minus,
-            b_plus=b_plus,
-            b_fixed=b_fixed,
-            count_observed=(
-                None if data.count_observed is None else observed_model.observed
-            ),
-            path_likelihood=path_likelihood,
+            observed_model=observed_model,
             data_fingerprint=data.data_fingerprint,
             source_model=data.source_model,
-            observed_model=observed_model,
         )
-
-    path_likelihood = (
-        None
-        if data.path_likelihood is None
-        else replace(
-            data.path_likelihood,
-            first_scale=data.path_likelihood.first_scale.to(
-                dtype=dtype, device=device
-            ),
-            second_scale=data.path_likelihood.second_scale.to(
-                dtype=dtype, device=device
-            ),
-            switch_fraction=data.path_likelihood.switch_fraction.to(
-                dtype=dtype, device=device
-            ),
-            log_prior=data.path_likelihood.log_prior.to(dtype=dtype, device=device),
-            valid=data.path_likelihood.valid.to(device=device),
-            legacy_major_indicator=(
-                None
-                if data.path_likelihood.legacy_major_indicator is None
-                else data.path_likelihood.legacy_major_indicator.to(device=device)
-            ),
-        )
-    )
-    observed_model = data.observed_model
-    if observed_model is None:  # Defensive for foreign compatibility objects.
-        observed_model = _observed_model_from_compatibility_fields(data)
     return TorchTumorData(
-        alt=data.alt.to(dtype=dtype, device=device),
-        total=data.total.to(dtype=dtype, device=device),
-        nonalt=data.nonalt.to(dtype=dtype, device=device),
-        phi_upper=data.phi_upper.to(dtype=dtype, device=device),
-        ambiguous=data.ambiguous.to(device=device),
-        b_minus=data.b_minus.to(dtype=dtype, device=device),
-        b_plus=data.b_plus.to(dtype=dtype, device=device),
-        b_fixed=data.b_fixed.to(dtype=dtype, device=device),
-        count_observed=(
-            None
-            if data.count_observed is None
-            else data.count_observed.to(device=device)
-        ),
-        path_likelihood=path_likelihood,
-        data_fingerprint=data.data_fingerprint,
-        source_model=data.source_model,
         observed_model=_copy_torch_observed_model(
-            observed_model,
+            data.observed_model,
             dtype=dtype,
             device=device,
         ),
+        data_fingerprint=data.data_fingerprint,
+        source_model=None,
     )
 
 
@@ -577,130 +398,23 @@ def resolve_runtime(device: str | None, *, dtype: str | None = None) -> TorchRun
     )
 
 
-def to_torch_path_likelihood_spec(
-    spec: PathLikelihoodSpec,
-    *,
-    scaling: np.ndarray,
-    runtime: TorchRuntime,
-) -> TorchPathLikelihoodSpec:
-    """Move a host path family to a runtime and apply observation scaling."""
-
-    scaling_array = np.asarray(scaling, dtype=np.float64)
-    spec.validate_observation_shape(tuple(int(value) for value in scaling_array.shape))
-    expanded_scaling = scaling_array[..., None]
-    dtype = runtime.dtype
-    device = runtime.device
-    indicator = spec.legacy_major_indicator
-    return TorchPathLikelihoodSpec(
-        first_scale=torch.as_tensor(
-            expanded_scaling * spec.first_copy,
-            dtype=dtype,
-            device=device,
-        ),
-        second_scale=torch.as_tensor(
-            expanded_scaling * spec.second_copy,
-            dtype=dtype,
-            device=device,
-        ),
-        switch_fraction=torch.as_tensor(
-            np.array(spec.switch_fraction, copy=True),
-            dtype=dtype,
-            device=device,
-        ),
-        log_prior=torch.as_tensor(
-            np.array(spec.log_prior, copy=True),
-            dtype=dtype,
-            device=device,
-        ),
-        valid=torch.as_tensor(
-            np.array(spec.valid, copy=True),
-            dtype=torch.bool,
-            device=device,
-        ),
-        model_id=spec.model_id,
-        model_version=spec.model_version,
-        candidate_generator_version=spec.candidate_generator_version,
-        prior_mode=spec.prior_mode,
-        legacy_major_indicator=(
-            None
-            if indicator is None
-            else torch.as_tensor(
-                np.array(indicator, copy=True),
-                dtype=torch.bool,
-                device=device,
-            )
-        ),
-    )
-
-
 def to_torch_tumor_data(
     data: TumorData,
     runtime: TorchRuntime,
     *,
     source_model: ObservedModel | None = None,
+    major_prior: float = 0.5,
+    eps: float = 1e-6,
 ) -> TorchTumorData:
-    dtype = runtime.dtype
-    device = runtime.device
     source_model = (
-        compile_observed_model(data, major_prior=0.5, eps=1e-6)
+        compile_observed_model(data, major_prior=float(major_prior), eps=float(eps))
         if source_model is None
         else source_model
     )
-    observed_model = model_to_torch(source_model, runtime)
-    scaling = np.asarray(data.scaling, dtype=np.float64)
-    count_obs_np = getattr(data, "count_observed", None)
-    count_obs_tensor = (
-        torch.as_tensor(count_obs_np, dtype=torch.bool, device=device)
-        if count_obs_np is not None
-        else None
-    )
-    path_spec = getattr(data, "path_likelihood", None)
-    if path_spec is not None and not np.allclose(
-        np.asarray(data.phi_upper, dtype=np.float64),
-        1.0,
-        rtol=0.0,
-        atol=1e-12,
-    ):
-        raise ValueError("A PathLikelihoodSpec requires full CCF support [0, 1].")
-    torch_path_spec = (
-        None
-        if path_spec is None
-        else to_torch_path_likelihood_spec(
-            path_spec,
-            scaling=scaling,
-            runtime=runtime,
-        )
-    )
     return TorchTumorData(
-        alt=torch.as_tensor(data.alt_counts, dtype=dtype, device=device),
-        total=torch.as_tensor(data.total_counts, dtype=dtype, device=device),
-        nonalt=torch.as_tensor(
-            data.total_counts - data.alt_counts, dtype=dtype, device=device
-        ),
-        phi_upper=torch.as_tensor(data.phi_upper, dtype=dtype, device=device),
-        ambiguous=torch.as_tensor(
-            data.multiplicity_estimation_mask, dtype=torch.bool, device=device
-        ),
-        b_minus=torch.as_tensor(
-            scaling * np.asarray(data.minor_cn, dtype=np.float64),
-            dtype=dtype,
-            device=device,
-        ),
-        b_plus=torch.as_tensor(
-            scaling * np.asarray(data.major_cn, dtype=np.float64),
-            dtype=dtype,
-            device=device,
-        ),
-        b_fixed=torch.as_tensor(
-            scaling * np.asarray(data.fixed_multiplicity, dtype=np.float64),
-            dtype=dtype,
-            device=device,
-        ),
-        count_observed=count_obs_tensor,
-        path_likelihood=torch_path_spec,
+        observed_model=model_to_torch(source_model, runtime),
         data_fingerprint=tumor_data_fingerprint(data),
         source_model=source_model,
-        observed_model=observed_model,
     )
 
 
@@ -736,91 +450,8 @@ def validate_torch_tumor_data(
         ):
             raise ValueError(f"{label} must be on runtime device {runtime.device_name}.")
 
-    def validate_field(name: str, *, dtype: torch.dtype) -> None:
-        validate_tensor(
-            f"TorchTumorData.{name}",
-            getattr(tensor_data, name),
-            shape=expected_shape,
-            dtype=dtype,
-        )
-
-    for name in (
-        "alt",
-        "total",
-        "nonalt",
-        "phi_upper",
-        "b_minus",
-        "b_plus",
-        "b_fixed",
-    ):
-        validate_field(name, dtype=runtime.dtype)
-    validate_field("ambiguous", dtype=torch.bool)
-
-    expected_observation_mask = data.count_observed is not None
-    if (tensor_data.count_observed is not None) != expected_observation_mask:
-        raise ValueError(
-            "TorchTumorData.count_observed presence does not match TumorData."
-        )
-    if tensor_data.count_observed is not None:
-        validate_field("count_observed", dtype=torch.bool)
-
     host_path = getattr(data, "path_likelihood", None)
-    tensor_path = tensor_data.path_likelihood
-    if (host_path is None) != (tensor_path is None):
-        raise ValueError(
-            "TorchTumorData.path_likelihood presence does not match TumorData."
-        )
-    if host_path is not None and tensor_path is not None:
-        expected_path_shape = host_path.shape
-
-        for name in (
-            "first_scale",
-            "second_scale",
-            "switch_fraction",
-            "log_prior",
-        ):
-            validate_tensor(
-                f"TorchPathLikelihoodSpec.{name}",
-                getattr(tensor_path, name),
-                shape=expected_path_shape,
-                dtype=runtime.dtype,
-            )
-        validate_tensor(
-            "TorchPathLikelihoodSpec.valid",
-            tensor_path.valid,
-            shape=expected_path_shape,
-            dtype=torch.bool,
-        )
-        if tensor_path.model_id != host_path.model_id:
-            raise ValueError("Torch path model_id does not match TumorData.")
-        if tensor_path.model_version != host_path.model_version:
-            raise ValueError("Torch path model_version does not match TumorData.")
-        if (
-            tensor_path.candidate_generator_version
-            != host_path.candidate_generator_version
-        ):
-            raise ValueError(
-                "Torch path candidate_generator_version does not match TumorData."
-            )
-        if tensor_path.prior_mode != host_path.prior_mode:
-            raise ValueError("Torch path prior_mode does not match TumorData.")
-        host_indicator = host_path.legacy_major_indicator
-        tensor_indicator = tensor_path.legacy_major_indicator
-        if (host_indicator is None) != (tensor_indicator is None):
-            raise ValueError(
-                "Torch path legacy_major_indicator presence does not match TumorData."
-            )
-        if tensor_indicator is not None:
-            validate_tensor(
-                "TorchPathLikelihoodSpec.legacy_major_indicator",
-                tensor_indicator,
-                shape=expected_path_shape,
-                dtype=torch.bool,
-            )
-
     observed_model = tensor_data.observed_model
-    if observed_model is None:
-        raise ValueError("TorchTumorData.observed_model is required.")
     expected_model_shape = (
         *expected_shape,
         2 if host_path is None else int(host_path.shape[-1]),
@@ -861,6 +492,11 @@ def validate_torch_tumor_data(
         )
     if not observed_model.source_fingerprint:
         raise ValueError("TorchObservedModel.source_fingerprint must be nonempty.")
+    expected_model_id = (
+        "legacy_major_minor_as_paths_v1" if host_path is None else host_path.model_id
+    )
+    if observed_model.model_id != expected_model_id:
+        raise ValueError("TorchObservedModel model_id does not match TumorData.")
 
     source_model = tensor_data.source_model
     if source_model is not None:
@@ -876,272 +512,19 @@ def validate_torch_tumor_data(
             )
 
 
-def clip_probability_and_slope(
-    beta: torch.Tensor, scale: torch.Tensor, eps: float
-) -> tuple[torch.Tensor, torch.Tensor]:
-    linear = scale * beta
-    prob = torch.clamp(linear, min=float(eps), max=float(1.0 - eps))
-    interior = (linear > float(eps)) & (linear < float(1.0 - eps))
-    slope = torch.where(interior, scale, torch.zeros_like(scale))
-    return prob, slope
-
-
-def _major_prior_log_tensors(
-    major_prior: float,
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    prior = float(major_prior)
-    if not np.isfinite(prior) or not (0.0 < prior < 1.0):
-        raise ValueError("major_prior must lie strictly in (0, 1).")
-    prior_tensor = torch.as_tensor(prior, dtype=dtype, device=device)
-    return torch.log1p(-prior_tensor), torch.log(prior_tensor)
-
-
-def _observed_model_for_terms(
-    data: TorchTumorData,
-    *,
-    major_prior: float | None = None,
-) -> TorchObservedModel:
-    """Return the canonical runtime model with the requested legacy prior."""
-
-    model = data.observed_model
-    if model is None:  # ``__post_init__`` supplies this; keep a defensive guard.
-        raise ValueError("TorchTumorData does not contain an observed model.")
-    if data.path_likelihood is not None or major_prior is None:
-        return model
-
-    log_minor, log_major = _major_prior_log_tensors(
-        major_prior,
-        dtype=model.alt.dtype,
-        device=model.alt.device,
-    )
-    ambiguous = data.ambiguous
-    log_prior = torch.stack(
-        (
-            torch.where(ambiguous, log_minor, torch.zeros_like(model.alt)),
-            log_major.expand_as(model.alt),
-        ),
-        dim=-1,
-    ).masked_fill(~model.valid, -torch.inf)
-    return replace(model, log_prior=log_prior)
-
-
 def _mutation_terms_from_observed(
     terms,
-    *,
-    expose_path_posterior: bool,
 ) -> TorchMutationRegionTerms:
     return TorchMutationRegionTerms(
         loss=terms.loss,
         grad=terms.gradient,
         hess_upper=terms.hessian_upper,
         gamma_major=terms.legacy_major_probability,
-        path_posterior=terms.posterior if expose_path_posterior else None,
+        path_posterior=terms.posterior,
     )
 
 
-def state_log_kernel_grad_and_curvature(
-    *,
-    alt: torch.Tensor,
-    nonalt: torch.Tensor,
-    prob: torch.Tensor,
-    slope: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    grad = slope * (alt / prob - nonalt / (1.0 - prob))
-    curvature = torch.square(slope) * (
-        alt / torch.square(prob) + nonalt / torch.square(1.0 - prob)
-    )
-    return grad, curvature
-
-
-def path_probability_and_slope_torch(
-    path: TorchPathLikelihoodSpec,
-    phi: torch.Tensor,
-    *,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Evaluate clipped path probabilities and their within-segment slopes.
-
-    At a path switch the returned slope is the left derivative.  Optimizers
-    that cross switches must still audit the right derivative separately.
-    """
-
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not (0.0 < epsilon < 0.5):
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
-    if path.first_scale.ndim != 3:
-        raise ValueError("Torch path arrays must have shape (M, S, K).")
-    expected_path_shape = tuple(path.first_scale.shape)
-    for name in (
-        "second_scale",
-        "switch_fraction",
-        "log_prior",
-        "valid",
-    ):
-        if tuple(getattr(path, name).shape) != expected_path_shape:
-            raise ValueError(f"Torch path field {name} has an incompatible shape.")
-    if tuple(phi.shape) != expected_path_shape[:2]:
-        raise ValueError(
-            f"phi must have shape {expected_path_shape[:2]}, not {tuple(phi.shape)}."
-        )
-
-    expanded_phi = phi.unsqueeze(-1)
-    switch = path.switch_fraction
-    mass = path.first_scale * torch.minimum(expanded_phi, switch)
-    mass = mass + path.second_scale * torch.clamp(expanded_phi - switch, min=0.0)
-    prob = torch.clamp(mass, min=epsilon, max=1.0 - epsilon)
-    segment_slope = torch.where(
-        expanded_phi <= switch,
-        path.first_scale,
-        path.second_scale,
-    )
-    interior = (mass > epsilon) & (mass < 1.0 - epsilon)
-    slope = torch.where(interior, segment_slope, torch.zeros_like(segment_slope))
-    return prob, slope
-
-
-def path_internal_breakpoints_torch(
-    path: TorchPathLikelihoodSpec,
-    *,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return every switch and clipping breakpoint with an aligned validity mask."""
-
-    points = [path.switch_fraction]
-    masks = [path.valid]
-    for target in (float(eps), 1.0 - float(eps)):
-        left = torch.where(
-            path.first_scale > 0.0,
-            path.first_scale.new_full((), target) / path.first_scale,
-            torch.full_like(path.first_scale, float("nan")),
-        )
-        left_valid = (
-            path.valid
-            & torch.isfinite(left)
-            & (left >= 0.0)
-            & (left <= path.switch_fraction)
-        )
-        right = torch.where(
-            path.second_scale > 0.0,
-            path.switch_fraction
-            + (
-                path.second_scale.new_full((), target)
-                - path.first_scale * path.switch_fraction
-            )
-            / path.second_scale,
-            torch.full_like(path.second_scale, float("nan")),
-        )
-        right_valid = (
-            path.valid
-            & torch.isfinite(right)
-            & (right >= path.switch_fraction)
-            & (right <= 1.0)
-        )
-        points.extend((left, right))
-        masks.extend((left_valid, right_valid))
-    return torch.cat(points, dim=-1), torch.cat(masks, dim=-1)
-
-
-def path_one_sided_gradients_torch(
-    data: TorchTumorData,
-    phi: torch.Tensor,
-    *,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exact left/right observed-loss gradients at all path breakpoints."""
-
-    path = data.path_likelihood
-    if path is None:
-        raise ValueError("TorchTumorData does not contain a path likelihood.")
-    model = _observed_model_for_terms(data)
-    expanded_phi = phi.unsqueeze(-1)
-    switch = model.switch
-    mass = model.first_scale * torch.minimum(expanded_phi, switch)
-    mass = mass + model.second_scale * torch.clamp(
-        expanded_phi - switch,
-        min=0.0,
-    )
-    prob = torch.clamp(mass, min=float(eps), max=1.0 - float(eps))
-    log_kernel = _path_log_kernel_torch(
-        alt=model.alt,
-        nonalt=model.nonalt,
-        prob=prob,
-    )
-    log_joint = (log_kernel + model.log_prior).masked_fill(~model.valid, -torch.inf)
-    posterior = torch.softmax(log_joint, dim=-1)
-
-    left_slope = torch.where(
-        expanded_phi <= switch,
-        model.first_scale,
-        model.second_scale,
-    )
-    right_slope = torch.where(
-        expanded_phi < switch,
-        model.first_scale,
-        model.second_scale,
-    )
-    lower_clip = mass <= float(eps)
-    upper_clip = mass >= 1.0 - float(eps)
-    left_slope = torch.where(
-        (mass < float(eps)) | (mass > 1.0 - float(eps)),
-        torch.zeros_like(left_slope),
-        left_slope,
-    )
-    right_slope = torch.where(
-        (mass < float(eps)) | (mass > 1.0 - float(eps)),
-        torch.zeros_like(right_slope),
-        right_slope,
-    )
-    # Positive retained-mutation dosages imply increasing mass.  At the lower
-    # clipping boundary the left branch is flat; at the upper boundary the
-    # right branch is flat.
-    left_slope = torch.where(
-        lower_clip,
-        torch.zeros_like(left_slope),
-        left_slope,
-    )
-    right_slope = torch.where(
-        upper_clip,
-        torch.zeros_like(right_slope),
-        right_slope,
-    )
-    state_factor = model.alt.unsqueeze(-1) / prob - model.nonalt.unsqueeze(-1) / (
-        1.0 - prob
-    )
-    gradient_left = -torch.sum(posterior * left_slope * state_factor, dim=-1)
-    gradient_right = -torch.sum(posterior * right_slope * state_factor, dim=-1)
-    gradient_left = torch.where(
-        model.observed,
-        gradient_left,
-        torch.zeros_like(gradient_left),
-    )
-    gradient_right = torch.where(
-        model.observed,
-        gradient_right,
-        torch.zeros_like(gradient_right),
-    )
-    points, valid_points = path_internal_breakpoints_torch(
-        replace(
-            path,
-            first_scale=model.first_scale,
-            second_scale=model.second_scale,
-            switch_fraction=model.switch,
-            log_prior=model.log_prior,
-            valid=model.valid,
-            legacy_major_indicator=model.legacy_major,
-        ),
-        eps=float(eps),
-    )
-    at_breakpoint = torch.any(
-        valid_points & (points == expanded_phi),
-        dim=-1,
-    )
-    return gradient_left, gradient_right, at_breakpoint
-
-
-def path_downward_kink_mask_torch(
+def downward_kink_mask_torch(
     gradient_left: torch.Tensor,
     gradient_right: torch.Tensor,
     at_breakpoint: torch.Tensor,
@@ -1153,142 +536,20 @@ def path_downward_kink_mask_torch(
     return at_breakpoint & (gradient_left > gradient_right + max(float(tol), 1e-12))
 
 
-def _path_log_kernel_torch(
-    *,
-    alt: torch.Tensor,
-    nonalt: torch.Tensor,
-    prob: torch.Tensor,
-) -> torch.Tensor:
-    return alt.unsqueeze(-1) * torch.log(prob) + nonalt.unsqueeze(-1) * torch.log1p(
-        -prob
-    )
-
-
-def path_mutation_region_terms_torch(
-    data: TorchTumorData,
-    phi: torch.Tensor,
-    *,
-    eps: float,
-) -> TorchMutationRegionTerms:
-    """Observed categorical path likelihood and its fixed-posterior curvature."""
-
-    if data.path_likelihood is None:
-        raise ValueError("TorchTumorData does not contain a path likelihood.")
-    return _mutation_terms_from_observed(
-        observed_terms_torch(
-            _observed_model_for_terms(data),
-            phi,
-            eps=eps,
-        ),
-        expose_path_posterior=True,
-    )
-
-
-def path_mutation_region_terms_numpy(
-    spec: PathLikelihoodSpec,
-    *,
-    scaling: np.ndarray,
-    alt: np.ndarray,
-    total: np.ndarray,
-    phi: np.ndarray,
-    eps: float,
-    count_observed: np.ndarray | None = None,
-) -> NumpyPathMutationRegionTerms:
-    """Compatibility adapter from an explicit path spec to the canonical model."""
-
-    observation_shape = spec.shape[:2]
-    scaling_array = np.asarray(scaling, dtype=np.float64)
-    alt_array = np.asarray(alt, dtype=np.float64)
-    total_array = np.asarray(total, dtype=np.float64)
-    observed = (
-        np.ones(observation_shape, dtype=bool)
-        if count_observed is None
-        else np.asarray(count_observed, dtype=bool)
-    )
-    model = ObservedModel(
-        alt=alt_array,
-        nonalt=total_array - alt_array,
-        observed=observed,
-        lower=np.full(observation_shape, float(eps)),
-        upper=np.ones(observation_shape, dtype=np.float64),
-        first_scale=scaling_array[..., None] * spec.first_copy,
-        second_scale=scaling_array[..., None] * spec.second_copy,
-        switch=spec.switch_fraction,
-        log_prior=spec.log_prior,
-        valid=spec.valid,
-        legacy_major=spec.legacy_major_indicator,
-        model_id=spec.model_id,
-    )
-    terms = observed_terms_numpy(model, phi, eps=eps)
-    return NumpyPathMutationRegionTerms(
-        loss=terms.loss,
-        grad=terms.gradient,
-        hess_upper=terms.hessian_upper,
-        path_posterior=terms.posterior,
-        gamma_major=terms.legacy_major_probability,
-    )
-
-
 def mutation_region_loss_grid_torch(
+    data: TorchTumorData,
     beta_grid: torch.Tensor,
     *,
-    alt: torch.Tensor,
-    total: torch.Tensor,
-    b_minus: torch.Tensor,
-    b_plus: torch.Tensor,
-    b_fixed: torch.Tensor,
-    ambiguous: torch.Tensor,
-    major_prior: float,
     eps: float,
+    respect_observed: bool = True,
 ) -> torch.Tensor:
-    # This grid API intentionally accepts arbitrary broadcast dimensions used
-    # by pilot/refit starts, whereas ``TorchObservedModel`` represents one
-    # (M, S) point.  Keep only this broadcast adapter and evaluate the same
-    # two-path canonical mixture as the production observed-model kernel.
-    (
-        beta,
-        alt,
-        total,
-        b_minus,
-        b_plus,
-        b_fixed,
-        ambiguous,
-    ) = torch.broadcast_tensors(
+    """Evaluate canonical loss for ``(M, S, *grid)`` candidate CCFs."""
+
+    return observed_loss_grid_torch(
+        data.observed_model,
         beta_grid,
-        alt,
-        total,
-        b_minus,
-        b_plus,
-        b_fixed,
-        ambiguous,
-    )
-    log_prior_minor, log_prior_major = _major_prior_log_tensors(
-        major_prior,
-        dtype=beta.dtype,
-        device=beta.device,
-    )
-    valid = torch.stack((torch.ones_like(ambiguous), ambiguous), dim=-1)
-    scale = torch.stack(
-        (torch.where(ambiguous, b_minus, b_fixed), b_plus),
-        dim=-1,
-    )
-    log_prior = torch.stack(
-        (
-            torch.where(ambiguous, log_prior_minor, torch.zeros_like(beta)),
-            log_prior_major.expand_as(beta),
-        ),
-        dim=-1,
-    ).masked_fill(~valid, -torch.inf)
-    probability = torch.clamp(
-        beta.unsqueeze(-1) * scale,
-        min=float(eps),
-        max=float(1.0 - eps),
-    )
-    log_kernel = alt.unsqueeze(-1) * torch.log(probability)
-    log_kernel += (total - alt).unsqueeze(-1) * torch.log1p(-probability)
-    return -torch.logsumexp(
-        (log_kernel + log_prior).masked_fill(~valid, -torch.inf),
-        dim=-1,
+        eps=eps,
+        respect_observed=respect_observed,
     )
 
 
@@ -1299,142 +560,18 @@ def mutation_region_terms_torch(
     major_prior: float,
     eps: float,
 ) -> TorchMutationRegionTerms:
+    # ``major_prior`` remains in this public low-level signature while callers
+    # migrate; the immutable source model already contains the authoritative
+    # prior and no runtime likelihood branch may rewrite it.
+    prior = float(major_prior)
+    if not np.isfinite(prior) or not 0.0 < prior < 1.0:
+        raise ValueError("major_prior must lie strictly in (0, 1).")
     return _mutation_terms_from_observed(
         observed_terms_torch(
-            _observed_model_for_terms(data, major_prior=major_prior),
+            data.observed_model,
             phi,
             eps=eps,
         ),
-        expose_path_posterior=data.path_likelihood is not None,
-    )
-
-
-def _observed_em_surrogate_terms_torch(
-    model: TorchObservedModel,
-    phi: torch.Tensor,
-    *,
-    weights: torch.Tensor,
-    eps: float,
-    use_prior_for_unobserved: bool,
-    expose_path_posterior: bool,
-) -> TorchMutationRegionTerms:
-    """One categorical EM kernel for every canonical observed model."""
-
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
-    if tuple(phi.shape) != tuple(model.alt.shape):
-        raise ValueError(f"phi must have shape {tuple(model.alt.shape)}.")
-    if tuple(weights.shape) != tuple(model.first_scale.shape):
-        raise ValueError(
-            f"responsibilities must have shape {tuple(model.first_scale.shape)}."
-        )
-
-    expanded_phi = phi.unsqueeze(-1)
-    mass = model.first_scale * torch.minimum(expanded_phi, model.switch)
-    mass = mass + model.second_scale * torch.clamp(
-        expanded_phi - model.switch,
-        min=0.0,
-    )
-    probability = torch.clamp(mass, min=epsilon, max=1.0 - epsilon)
-    segment_slope = torch.where(
-        expanded_phi <= model.switch,
-        model.first_scale,
-        model.second_scale,
-    )
-    slope = torch.where(
-        (mass > epsilon) & (mass < 1.0 - epsilon),
-        segment_slope,
-        torch.zeros_like(segment_slope),
-    )
-    log_kernel = (
-        model.alt.unsqueeze(-1) * torch.log(probability)
-        + model.nonalt.unsqueeze(-1) * torch.log1p(-probability)
-    )
-    complete_loss = torch.where(
-        model.valid,
-        -(log_kernel + model.log_prior),
-        torch.zeros_like(log_kernel),
-    )
-    entropy = torch.where(
-        weights > 0.0,
-        weights * torch.log(torch.clamp(weights, min=torch.finfo(weights.dtype).tiny)),
-        torch.zeros_like(weights),
-    )
-    loss = torch.sum(weights * complete_loss + entropy, dim=-1)
-    state_gradient = slope * (
-        model.alt.unsqueeze(-1) / probability
-        - model.nonalt.unsqueeze(-1) / (1.0 - probability)
-    )
-    state_curvature = torch.square(slope) * (
-        model.alt.unsqueeze(-1) / torch.square(probability)
-        + model.nonalt.unsqueeze(-1) / torch.square(1.0 - probability)
-    )
-    gradient = -torch.sum(weights * state_gradient, dim=-1)
-    hessian_upper = torch.sum(weights * state_curvature, dim=-1)
-
-    posterior = weights
-    if use_prior_for_unobserved:
-        prior = torch.exp(model.log_prior).masked_fill(~model.valid, 0.0)
-        posterior = torch.where(model.observed.unsqueeze(-1), posterior, prior)
-    loss = torch.where(model.observed, loss, torch.zeros_like(loss))
-    gradient = torch.where(model.observed, gradient, torch.zeros_like(gradient))
-    hessian_upper = torch.where(
-        model.observed,
-        torch.clamp(hessian_upper, min=1e-8),
-        torch.zeros_like(hessian_upper),
-    )
-    gamma_major = (
-        torch.ones_like(loss)
-        if model.legacy_major is None
-        else torch.sum(
-            posterior * model.legacy_major.to(dtype=posterior.dtype),
-            dim=-1,
-        )
-    )
-    return TorchMutationRegionTerms(
-        loss=loss,
-        grad=gradient,
-        hess_upper=hessian_upper,
-        gamma_major=gamma_major,
-        path_posterior=posterior if expose_path_posterior else None,
-    )
-
-
-def path_em_surrogate_terms_torch(
-    data: TorchTumorData,
-    phi: torch.Tensor,
-    *,
-    omega_path: torch.Tensor,
-    eps: float,
-) -> TorchMutationRegionTerms:
-    """Categorical EM surrogate for fixed path responsibilities."""
-
-    path = data.path_likelihood
-    if path is None:
-        raise ValueError("TorchTumorData does not contain a path likelihood.")
-    if tuple(omega_path.shape) != tuple(path.first_scale.shape):
-        raise ValueError(
-            "omega_path must have shape "
-            f"{tuple(path.first_scale.shape)}, not {tuple(omega_path.shape)}."
-        )
-    if not bool(torch.all(torch.isfinite(omega_path)).item()) or bool(
-        torch.any(omega_path < 0.0).item()
-    ):
-        raise ValueError("omega_path must be finite and nonnegative.")
-    model = _observed_model_for_terms(data)
-    weights = omega_path.masked_fill(~model.valid, 0.0)
-    weight_sum = torch.sum(weights, dim=-1, keepdim=True)
-    if bool(torch.any(weight_sum <= 0.0).item()):
-        raise ValueError("omega_path must assign positive mass to a valid path.")
-    weights = weights / weight_sum
-    return _observed_em_surrogate_terms_torch(
-        model,
-        phi,
-        weights=weights,
-        eps=eps,
-        use_prior_for_unobserved=True,
-        expose_path_posterior=True,
     )
 
 
@@ -1442,40 +579,16 @@ def em_surrogate_terms_torch(
     data: TorchTumorData,
     phi: torch.Tensor,
     *,
-    omega_major: torch.Tensor,
-    major_prior: float,
+    responsibilities: torch.Tensor,
     eps: float,
 ) -> TorchMutationRegionTerms:
-    if data.path_likelihood is not None:
-        path_shape = tuple(data.path_likelihood.first_scale.shape)
-        if tuple(omega_major.shape) == path_shape:
-            omega_path = omega_major
-        else:
-            raise ValueError(
-                "Categorical path EM requires responsibilities with shape "
-                f"{path_shape}."
-            )
-        return path_em_surrogate_terms_torch(
-            data,
+    return _mutation_terms_from_observed(
+        observed_em_terms_torch(
+            data.observed_model,
             phi,
-            omega_path=omega_path,
+            responsibilities=responsibilities,
             eps=eps,
         )
-
-    model = _observed_model_for_terms(data, major_prior=major_prior)
-    omega = torch.broadcast_to(
-        torch.clamp(omega_major, min=0.0, max=1.0),
-        model.alt.shape,
-    )
-    omega = torch.where(data.ambiguous, omega, torch.zeros_like(omega))
-    weights = torch.stack((1.0 - omega, omega), dim=-1)
-    return _observed_em_surrogate_terms_torch(
-        model,
-        phi,
-        weights=weights,
-        eps=eps,
-        use_prior_for_unobserved=False,
-        expose_path_posterior=False,
     )
 
 

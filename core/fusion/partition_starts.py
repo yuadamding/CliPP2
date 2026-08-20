@@ -99,6 +99,8 @@ def _resolve_partition_runtime(
     torch_data: TorchTumorData | None = None,
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
+    major_prior: float = 0.5,
+    eps: float = 1e-6,
 ) -> tuple[TorchRuntime, TorchTumorData]:
     if torch_data is not None:
         runtime_device = (
@@ -153,7 +155,12 @@ def _resolve_partition_runtime(
                 device_name=runtime.device_name,
                 dtype=torch.float32,
             )
-    return runtime, to_torch_tumor_data(data, runtime)
+    return runtime, to_torch_tumor_data(
+        data,
+        runtime,
+        major_prior=float(major_prior),
+        eps=float(eps),
+    )
 
 
 def _as_torch(
@@ -198,6 +205,8 @@ def observed_curvature_at_pilot_torch(
         torch_data=torch_data,
         device=device,
         dtype=dtype,
+        major_prior=major_prior,
+        eps=eps,
     )
     phi0 = _as_torch(exact_pilot, runtime=runtime)
     upper = torch_data.phi_upper
@@ -549,58 +558,19 @@ def _loss_to_centers_torch(
         torch_data=torch_data,
         device=device,
         dtype=dtype,
+        major_prior=major_prior,
+        eps=eps,
     )
     centers_t = _as_torch(centers, runtime=runtime)
-    if torch_data.path_likelihood is not None:
-        cost_columns: list[torch.Tensor] = []
-        for cluster_idx in range(int(centers_t.shape[0])):
-            phi_for_center = (
-                centers_t[cluster_idx].unsqueeze(0).expand(int(data.num_mutations), -1)
-            )
-            terms = mutation_region_terms_torch(
-                torch_data,
-                phi_for_center,
-                major_prior=float(major_prior),
-                eps=float(eps),
-            )
-            cost_column = torch.sum(terms.loss, dim=1)
-            infeasible = torch.any(
-                phi_for_center > torch_data.phi_upper + max(float(eps), 1e-8),
-                dim=1,
-            )
-            safe_penalty = min(
-                float(infeasible_penalty),
-                float(torch.finfo(cost_column.dtype).max) / 16.0,
-            )
-            cost_columns.append(
-                torch.where(
-                    infeasible,
-                    torch.full_like(cost_column, safe_penalty),
-                    cost_column,
-                )
-            )
-        return torch.stack(cost_columns, dim=1)
-    beta = centers_t.unsqueeze(0)
+    beta = centers_t.T.unsqueeze(0).expand(int(data.num_mutations), -1, -1)
     loss = mutation_region_loss_grid_torch(
+        torch_data,
         beta,
-        alt=torch_data.alt.unsqueeze(1),
-        total=torch_data.total.unsqueeze(1),
-        b_minus=torch_data.b_minus.unsqueeze(1),
-        b_plus=torch_data.b_plus.unsqueeze(1),
-        b_fixed=torch_data.b_fixed.unsqueeze(1),
-        ambiguous=torch_data.ambiguous.unsqueeze(1),
-        major_prior=float(major_prior),
         eps=float(eps),
     )
-    if torch_data.count_observed is not None:
-        loss = torch.where(
-            torch_data.count_observed.unsqueeze(1),
-            loss,
-            torch.zeros_like(loss),
-        )
-    cost = torch.sum(loss, dim=2)
+    cost = torch.sum(loss, dim=1)
     infeasible = torch.any(
-        beta > torch_data.phi_upper.unsqueeze(1) + max(float(eps), 1e-8), dim=2
+        beta > torch_data.phi_upper.unsqueeze(-1) + max(float(eps), 1e-8), dim=1
     )
     safe_penalty = min(
         float(infeasible_penalty), float(torch.finfo(cost.dtype).max) / 16.0
@@ -918,21 +888,14 @@ def partition_constrained_observed_refit_torch(
     tol = float(tol)
     if not np.isfinite(tol) or tol <= 0.0:
         raise ValueError("Partition refit tolerance must be a positive finite value.")
-    if getattr(data, "path_likelihood", None) is not None:
-        return partition_constrained_observed_refit(
-            data,
-            labels,
-            major_prior=float(major_prior),
-            eps=float(eps),
-            tol=float(tol),
-            max_iter=max(int(max_iter), 32),
-        )
     runtime, torch_data = _resolve_partition_runtime(
         data=data,
         exact_pilot=hint_phi,
         torch_data=torch_data,
         device=device,
         dtype=dtype,
+        major_prior=major_prior,
+        eps=eps,
     )
     labels_np = _validated_refinement_labels(data, labels)
     n_clusters = int(labels_np.max()) + 1 if labels_np.size else 0
@@ -976,28 +939,13 @@ def partition_constrained_observed_refit_torch(
     initial_width = torch.clamp(upper - lower, min=0.0)
 
     def objective(beta_ks: torch.Tensor) -> torch.Tensor:
-        beta = beta_ks.unsqueeze(0)
+        beta = beta_ks.T.unsqueeze(0).expand(int(data.num_mutations), -1, -1)
         loss = mutation_region_loss_grid_torch(
+            torch_data,
             beta,
-            alt=torch_data.alt.unsqueeze(1),
-            total=torch_data.total.unsqueeze(1),
-            b_minus=torch_data.b_minus.unsqueeze(1),
-            b_plus=torch_data.b_plus.unsqueeze(1),
-            b_fixed=torch_data.b_fixed.unsqueeze(1),
-            ambiguous=torch_data.ambiguous.unsqueeze(1),
-            major_prior=float(major_prior),
             eps=float(eps),
         )
-        # Mask unobserved mutation_regions out of the likelihood, matching the fit objective
-        # (torch_backend.mutation_region_terms_torch) and the numpy refit; torch.where avoids
-        # inf*0 = nan when an infeasible beta makes the loss non-finite.
-        if torch_data.count_observed is not None:
-            loss = torch.where(
-                torch_data.count_observed.unsqueeze(1),
-                loss,
-                torch.zeros_like(loss),
-            )
-        return torch.sum(loss * membership.unsqueeze(2), dim=0)
+        return torch.sum(loss.permute(0, 2, 1) * membership.unsqueeze(2), dim=0)
 
     left = lower.clone()
     right = upper.clone()
@@ -1102,27 +1050,14 @@ def refine_partition_likelihood_torch_with_trace(
     allow_component_death: bool = False,
     _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
 ) -> PartitionRefinementResult:
-    if getattr(data, "path_likelihood", None) is not None:
-        return refine_partition_likelihood_with_trace(
-            data,
-            labels,
-            major_prior=float(major_prior),
-            eps=float(eps),
-            tol=float(tol),
-            max_iter=int(max_iter),
-            refit_max_iter=int(refit_max_iter),
-            hint_phi=None if hint_phi is None else _as_numpy(hint_phi),
-            classification_weight_alpha=classification_weight_alpha,
-            classification_code_weight=classification_code_weight,
-            allow_component_death=bool(allow_component_death),
-            _refit_labels=_refit_labels,
-        )
     runtime, torch_data = _resolve_partition_runtime(
         data=data,
         exact_pilot=hint_phi,
         torch_data=torch_data,
         device=device,
         dtype=dtype,
+        major_prior=major_prior,
+        eps=eps,
     )
     labels = _validated_refinement_labels(data, labels)
     initial_k = int(np.unique(labels).size)
@@ -1303,6 +1238,8 @@ def generate_likelihood_partition_starts(
             torch_data=torch_data,
             device=device,
             dtype=dtype,
+            major_prior=major_prior,
+            eps=eps,
         )
     phi0 = (
         _as_torch(exact_pilot, runtime=runtime).detach().cpu().numpy()

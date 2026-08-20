@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -50,17 +50,15 @@ def infer_multiplicity_posterior_numpy(
     if not np.isfinite(probability_eps) or not (0.0 < probability_eps < 0.5):
         raise ValueError("eps must lie strictly in (0, 0.5).")
 
-    # This API is specifically the historical major/minor report.  Preserve
-    # that contract even if a caller also attached an explicit path model;
-    # explicit-path reporting has its own helper in ``path_summary``.
-    legacy_data = (
-        data if data.path_likelihood is None else replace(data, path_likelihood=None)
-    )
     model = compile_observed_model(
-        legacy_data,
+        data,
         major_prior=prior,
         eps=probability_eps,
     )
+    if model.legacy_major is None:
+        raise ValueError(
+            "Multiplicity reporting requires canonical legacy-major indicators."
+        )
     posterior_major = observed_terms_numpy(
         model,
         phi_array,

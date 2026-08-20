@@ -6,12 +6,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ..objective import observed_one_sided_gradients_torch
 from .torch_backend import (
+    downward_kink_mask_torch,
     edge_kkt_maxima_from_diff_torch,
     graph_fusion_kkt_diagnostics_from_components_torch,
     graph_fusion_kkt_residual_from_grad_torch,
-    path_downward_kink_mask_torch,
-    path_one_sided_gradients_torch,
     project_stationarity_cone_torch,
     refine_graph_fusion_dual_certificate_torch,
 )
@@ -117,8 +117,8 @@ def build_certificate_gradient(
 ) -> CertificateGradient:
     """Build the sole generalized-gradient representation used by audits.
 
-    The observed kernel supplies the left derivative.  At explicit-path
-    breakpoints, a supplied fusion adjoint selects the interval member closest
+    The observed kernel supplies the left derivative. At any canonical
+    breakpoint, a supplied fusion adjoint selects the interval member closest
     to stationarity; without one, the left derivative is retained exactly.
     Downward kinks remain selection-ineligible independently of that choice.
     """
@@ -134,17 +134,10 @@ def build_certificate_gradient(
     if fusion_adjoint is not None and tuple(fusion_adjoint.shape) != expected_shape:
         raise ValueError(f"fusion_adjoint must have shape {expected_shape}.")
 
-    at_breakpoint = torch.zeros_like(phi, dtype=torch.bool)
-    if data.path_likelihood is None:
-        return CertificateGradient(
-            value=smooth_gradient,
-            scope="observed_objective",
-            directional_admissible=True,
-            at_breakpoint=at_breakpoint,
-        )
-
     gradient_left, gradient_right, at_breakpoint = (
-        path_one_sided_gradients_torch(data, phi, eps=float(eps))
+        observed_one_sided_gradients_torch(
+            data.observed_model, phi, eps=float(eps)
+        )
     )
     gradient_lower = torch.where(
         at_breakpoint,
@@ -162,7 +155,7 @@ def build_certificate_gradient(
         torch.minimum(torch.maximum(target, gradient_lower), gradient_upper),
         smooth_gradient,
     )
-    downward_kink = path_downward_kink_mask_torch(
+    downward_kink = downward_kink_mask_torch(
         gradient_left,
         gradient_right,
         at_breakpoint,

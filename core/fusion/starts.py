@@ -4,7 +4,11 @@ import numpy as np
 import torch
 
 from ...io.data import TumorData
-from ..objective import ObservedModel, compile_observed_model
+from ..objective import (
+    ObservedModel,
+    compile_observed_model,
+    observed_internal_breakpoints_torch,
+)
 from ..scalar import (
     ScalarProblem,
     scalar_breakpoints,
@@ -15,7 +19,6 @@ from ..scalar import (
 from .torch_backend import (
     TorchTumorData,
     mutation_region_loss_grid_torch,
-    path_internal_breakpoints_torch,
 )
 
 
@@ -25,21 +28,37 @@ _ROOT_SCAN_POINTS = 65
 def _fixed_linear_path_scale_torch(torch_data: TorchTumorData) -> torch.Tensor | None:
     """Return the shared per-unit path slope when the categorical model is fixed."""
 
-    path = torch_data.path_likelihood
-    if path is None:
-        return None
-    first_valid_index = torch.argmax(path.valid.to(dtype=torch.int64), dim=-1)
+    model = torch_data.observed_model
+    first_valid_index = torch.argmax(model.valid.to(dtype=torch.int64), dim=-1)
     reference = torch.gather(
-        path.first_scale,
+        model.first_scale,
         -1,
         first_valid_index.unsqueeze(-1),
     )
-    fixed = (~path.valid) | (
-        (path.first_scale == path.second_scale) & (path.first_scale == reference)
+    fixed = (~model.valid) | (
+        (model.first_scale == model.second_scale)
+        & (model.first_scale == reference)
     )
     if not bool(torch.all(fixed).item()):
         return None
     return reference.squeeze(-1)
+
+
+def _binary_linear_model(model: ObservedModel | object) -> bool:
+    """Whether a canonical model admits the exact two-linear-path fast search."""
+
+    first = model.first_scale
+    if int(first.shape[-1]) != 2:
+        return False
+    if torch.is_tensor(first):
+        return bool(
+            torch.all(first == model.second_scale).item()
+            and torch.all(model.valid[..., 0]).item()
+        )
+    return bool(
+        np.array_equal(np.asarray(first), np.asarray(model.second_scale))
+        and np.all(np.asarray(model.valid)[..., 0])
+    )
 
 
 def _source_observed_model(torch_data: TorchTumorData) -> ObservedModel:
@@ -561,23 +580,17 @@ def _select_secondary_lexicographic_rows_torch(
 def _ambiguous_best_two_from_candidate_grid_torch(
     candidate_grid: torch.Tensor,
     *,
-    alt: torch.Tensor,
-    total: torch.Tensor,
-    b_minus: torch.Tensor,
-    b_plus: torch.Tensor,
+    evaluate_loss,
     lower: torch.Tensor,
     upper: torch.Tensor,
     hint: torch.Tensor,
-    major_prior: float,
-    eps: float,
     tol: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     candidates = torch.round(
-        candidate_grid.to(dtype=alt.dtype, device=alt.device), decimals=12
+        candidate_grid.to(dtype=lower.dtype, device=lower.device), decimals=12
     )
-    lower = lower.to(dtype=alt.dtype, device=alt.device)
-    upper = upper.to(dtype=alt.dtype, device=alt.device)
-    hint = hint.to(dtype=alt.dtype, device=alt.device)
+    upper = upper.to(dtype=lower.dtype, device=lower.device)
+    hint = hint.to(dtype=lower.dtype, device=lower.device)
     valid = (
         torch.isfinite(candidates)
         & (candidates >= lower[:, None] - 1e-12)
@@ -618,17 +631,7 @@ def _ambiguous_best_two_from_candidate_grid_torch(
         beta[:, 0] = torch.where(empty_rows, fallback, beta[:, 0])
         valid[:, 0] = valid[:, 0] | empty_rows
 
-    loss = mutation_region_loss_grid_torch(
-        beta,
-        alt=alt[:, None],
-        total=total[:, None],
-        b_minus=b_minus[:, None],
-        b_plus=b_plus[:, None],
-        b_fixed=b_plus[:, None],
-        ambiguous=torch.ones_like(beta, dtype=torch.bool),
-        major_prior=major_prior,
-        eps=eps,
-    )
+    loss = evaluate_loss(beta)
     loss = torch.where(valid, loss, torch.full_like(loss, float("inf")))
     loss_tol = max(float(tol) * 10.0, 1e-10)
 
@@ -787,15 +790,10 @@ def _pooled_sample_loss_grid_torch(
     num_mutations = int(torch_data.alt.shape[0])
     beta = beta_grid.unsqueeze(0).expand(num_mutations, -1, -1)
     losses = mutation_region_loss_grid_torch(
+        torch_data,
         beta,
-        alt=torch_data.alt.unsqueeze(-1),
-        total=torch_data.total.unsqueeze(-1),
-        b_minus=torch_data.b_minus.unsqueeze(-1),
-        b_plus=torch_data.b_plus.unsqueeze(-1),
-        b_fixed=torch_data.b_fixed.unsqueeze(-1),
-        ambiguous=torch_data.ambiguous.unsqueeze(-1),
-        major_prior=major_prior,
         eps=eps,
+        respect_observed=False,
     )
     sample_losses = torch.sum(losses, dim=0)
     return sample_losses.squeeze(-1) if squeeze else sample_losses
@@ -1363,8 +1361,7 @@ def compute_scalar_mutation_region_wells(
     max_iter: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     model = compile_observed_model(data, major_prior=major_prior, eps=eps)
-    path_spec = getattr(data, "path_likelihood", None)
-    if path_spec is not None:
+    if not _binary_linear_model(model):
         return _path_scalar_wells_from_model(
             model,
             phi_init=np.asarray(data.phi_init, dtype=np.float64),
@@ -1464,8 +1461,9 @@ def compute_scalar_mutation_region_wells_torch(
     dtype = torch_data.alt.dtype
     device = torch_data.alt.device
     shape = tuple(torch_data.alt.shape)
+    model = torch_data.observed_model
     fixed_path_scale = _fixed_linear_path_scale_torch(torch_data)
-    if torch_data.path_likelihood is not None and fixed_path_scale is None:
+    if fixed_path_scale is None and not _binary_linear_model(model):
         primary, secondary, valid_secondary = _path_scalar_wells_from_model(
             _source_observed_model(torch_data),
             phi_init=(
@@ -1492,12 +1490,12 @@ def compute_scalar_mutation_region_wells_torch(
     valid_secondary = torch.zeros(shape, dtype=torch.bool, device=device)
 
     effective_ambiguous = (
-        torch.zeros_like(torch_data.ambiguous)
+        torch.zeros_like(model.valid[..., 0])
         if fixed_path_scale is not None
-        else torch_data.ambiguous
+        else model.valid[..., 1]
     )
     effective_b_fixed = (
-        fixed_path_scale if fixed_path_scale is not None else torch_data.b_fixed
+        fixed_path_scale if fixed_path_scale is not None else model.first_scale[..., 0]
     )
     fixed_mask = ~effective_ambiguous
     if bool(torch.any(fixed_mask).item()):
@@ -1520,8 +1518,8 @@ def compute_scalar_mutation_region_wells_torch(
         flat_mask = ambiguous_mask.reshape(-1)
         alt = torch_data.alt.reshape(-1)[flat_mask]
         total = torch_data.total.reshape(-1)[flat_mask]
-        b_minus = torch_data.b_minus.reshape(-1)[flat_mask]
-        b_plus = torch_data.b_plus.reshape(-1)[flat_mask]
+        b_minus = model.first_scale[..., 0].reshape(-1)[flat_mask]
+        b_plus = model.first_scale[..., 1].reshape(-1)[flat_mask]
         lower_flat = lower.reshape(-1)[flat_mask]
         upper_flat = upper.reshape(-1)[flat_mask]
         hint_flat = hint.reshape(-1)[flat_mask]
@@ -1539,18 +1537,23 @@ def compute_scalar_mutation_region_wells_torch(
             max_iter=max_iter,
         )
 
+        def evaluate_loss(beta: torch.Tensor) -> torch.Tensor:
+            full = hint.reshape(-1, 1).expand(-1, int(beta.shape[1])).clone()
+            full[flat_mask] = beta
+            return mutation_region_loss_grid_torch(
+                torch_data,
+                full.reshape(*shape, int(beta.shape[1])),
+                eps=eps,
+                respect_observed=False,
+            ).reshape(-1, int(beta.shape[1]))[flat_mask]
+
         primary, alternate, valid_alternate = (
             _ambiguous_best_two_from_candidate_grid_torch(
                 candidate_grid,
-                alt=alt,
-                total=total,
-                b_minus=b_minus,
-                b_plus=b_plus,
+                evaluate_loss=evaluate_loss,
                 lower=lower_flat,
                 upper=upper_flat,
                 hint=hint_flat,
-                major_prior=major_prior,
-                eps=eps,
                 tol=tol,
             )
         )
@@ -1582,7 +1585,7 @@ def compute_pooled_observed_data_start_torch(
     device = torch_data.alt.device
     num_mutations = int(torch_data.alt.shape[0])
     num_regions = int(torch_data.alt.shape[1])
-    if torch_data.path_likelihood is not None:
+    if not _binary_linear_model(torch_data.observed_model):
         if beta_hints is None:
             hints = 0.5 * (float(eps) + torch_data.phi_upper.detach().cpu().numpy())
         else:
@@ -1691,10 +1694,11 @@ def compute_scalar_well_start_bank_torch(
     pilot = torch.minimum(torch.maximum(pilot, lower), torch_data.phi_upper)
 
     starts: list[torch.Tensor] = [pilot]
-    if torch_data.path_likelihood is not None:
-        path = torch_data.path_likelihood
-        breakpoints, breakpoint_valid = path_internal_breakpoints_torch(
-            path, eps=float(eps)
+    model = torch_data.observed_model
+    piecewise = model.valid & (model.first_scale != model.second_scale)
+    if bool(torch.any(piecewise).item()):
+        breakpoints, breakpoint_valid = observed_internal_breakpoints_torch(
+            model, eps=float(eps)
         )
         interior = (
             breakpoint_valid
