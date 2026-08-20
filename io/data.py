@@ -226,31 +226,33 @@ class TumorData:
         return self.major_cn.astype(np.float64, copy=True)
 
 
+def _hash_text(digest, value: str) -> None:
+    encoded = str(value).encode("utf-8")
+    digest.update(len(encoded).to_bytes(8, "little"))
+    digest.update(encoded)
+
+
+def _hash_array(digest, name: str, values: np.ndarray) -> None:
+    _hash_text(digest, name)
+    array = np.ascontiguousarray(np.asarray(values))
+    _hash_text(digest, str(array.dtype))
+    digest.update(len(array.shape).to_bytes(8, "little"))
+    for dimension in array.shape:
+        digest.update(int(dimension).to_bytes(8, "little", signed=True))
+    digest.update(array.tobytes())
+
+
 def tumor_data_fingerprint(data: TumorData) -> str:
     """Return a deterministic identity for every observed-objective input."""
 
     digest = hashlib.sha256()
 
-    def update_text(value: str) -> None:
-        encoded = str(value).encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "little"))
-        digest.update(encoded)
-
     def update_text_sequence(values: list[str]) -> None:
         digest.update(len(values).to_bytes(8, "little"))
         for value in values:
-            update_text(value)
+            _hash_text(digest, value)
 
-    def update_array(name: str, values: np.ndarray) -> None:
-        update_text(name)
-        array = np.ascontiguousarray(np.asarray(values))
-        update_text(str(array.dtype))
-        digest.update(len(array.shape).to_bytes(8, "little"))
-        for dimension in array.shape:
-            digest.update(int(dimension).to_bytes(8, "little", signed=True))
-        digest.update(array.tobytes())
-
-    update_text(data.tumor_id)
+    _hash_text(digest, data.tumor_id)
     update_text_sequence(list(data.mutation_ids))
     update_text_sequence(list(data.region_ids))
     for name in (
@@ -266,9 +268,10 @@ def tumor_data_fingerprint(data: TumorData) -> str:
         "phi_init",
         "init_major_mask",
     ):
-        update_array(name, getattr(data, name))
+        _hash_array(digest, name, getattr(data, name))
     count_observed = getattr(data, "count_observed", None)
-    update_array(
+    _hash_array(
+        digest,
         "count_observed",
         np.ones_like(np.asarray(data.alt_counts), dtype=bool)
         if count_observed is None
@@ -279,11 +282,11 @@ def tumor_data_fingerprint(data: TumorData) -> str:
         path_likelihood.validate_observation_shape(
             (int(data.num_mutations), int(data.num_regions))
         )
-        update_text("path_likelihood:present")
-        update_text(path_likelihood.model_id)
-        update_text(path_likelihood.model_version)
-        update_text(path_likelihood.candidate_generator_version)
-        update_text(path_likelihood.prior_mode)
+        _hash_text(digest, "path_likelihood:present")
+        _hash_text(digest, path_likelihood.model_id)
+        _hash_text(digest, path_likelihood.model_version)
+        _hash_text(digest, path_likelihood.candidate_generator_version)
+        _hash_text(digest, path_likelihood.prior_mode)
         for name in (
             "first_copy",
             "second_copy",
@@ -291,14 +294,17 @@ def tumor_data_fingerprint(data: TumorData) -> str:
             "log_prior",
             "valid",
         ):
-            update_array(f"path_likelihood.{name}", getattr(path_likelihood, name))
+            _hash_array(
+                digest, f"path_likelihood.{name}", getattr(path_likelihood, name)
+            )
         indicator = path_likelihood.legacy_major_indicator
-        update_text(
+        _hash_text(
+            digest,
             "path_likelihood.legacy_major_indicator:"
             + ("none" if indicator is None else "present")
         )
         if indicator is not None:
-            update_array("path_likelihood.legacy_major_indicator", indicator)
+            _hash_array(digest, "path_likelihood.legacy_major_indicator", indicator)
     return digest.hexdigest()
 
 
@@ -313,23 +319,11 @@ def tumor_objective_fingerprint(data: TumorData) -> str:
 
     digest = hashlib.sha256()
 
-    def update_array(name: str, values: np.ndarray) -> None:
-        encoded_name = name.encode("utf-8")
-        digest.update(len(encoded_name).to_bytes(8, "little"))
-        digest.update(encoded_name)
-        array = np.ascontiguousarray(np.asarray(values))
-        encoded_dtype = str(array.dtype).encode("utf-8")
-        digest.update(len(encoded_dtype).to_bytes(8, "little"))
-        digest.update(encoded_dtype)
-        digest.update(len(array.shape).to_bytes(8, "little"))
-        for dimension in array.shape:
-            digest.update(int(dimension).to_bytes(8, "little", signed=True))
-        digest.update(array.tobytes())
-
     for name in ("alt_counts", "total_counts", "scaling", "phi_upper"):
-        update_array(name, getattr(data, name))
+        _hash_array(digest, name, getattr(data, name))
     count_observed = getattr(data, "count_observed", None)
-    update_array(
+    _hash_array(
+        digest,
         "count_observed",
         np.ones_like(np.asarray(data.alt_counts), dtype=bool)
         if count_observed is None
@@ -339,7 +333,7 @@ def tumor_objective_fingerprint(data: TumorData) -> str:
     path_likelihood = getattr(data, "path_likelihood", None)
     if path_likelihood is None:
         for name in ("major_cn", "minor_cn", "has_cna"):
-            update_array(name, getattr(data, name))
+            _hash_array(digest, name, getattr(data, name))
     else:
         path_likelihood.validate_observation_shape(
             (int(data.num_mutations), int(data.num_regions))
@@ -351,7 +345,9 @@ def tumor_objective_fingerprint(data: TumorData) -> str:
             "log_prior",
             "valid",
         ):
-            update_array(f"path_likelihood.{name}", getattr(path_likelihood, name))
+            _hash_array(
+                digest, f"path_likelihood.{name}", getattr(path_likelihood, name)
+            )
     return digest.hexdigest()
 
 

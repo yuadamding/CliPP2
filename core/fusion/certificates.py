@@ -6,6 +6,7 @@ import math
 import torch
 
 from .torch_backend import (
+    backward_error_stationarity_residual_torch,
     graph_fusion_kkt_residual_from_grad_torch,
     project_stationarity_cone_torch,
     refine_graph_fusion_dual_certificate_torch,
@@ -874,12 +875,14 @@ def _compressed_graph_fusion_kkt(
     max_edge_residual = 0.0
     max_ball_residual = 0.0
     max_radius = 0.0
+    max_scaled_edge_residual = 0.0
+    max_scaled_ball_residual = 0.0
     for start in range(0, num_edges, chunk_size):
         stop = min(start + chunk_size, num_edges)
         edge_u = graph.edge_u[start:stop]
         edge_v = graph.edge_v[start:stop]
         diff = phi.index_select(0, edge_u) - phi.index_select(0, edge_v)
-        radius = float(lambda_value) * graph.weight[start:stop]
+        radius = float(lambda_value) * graph.weight[start:stop].to(dtype=phi.dtype)
         dual_chunk = torch.zeros_like(diff)
         if lambda_value > 0.0:
             same = labels.index_select(0, edge_u) == labels.index_select(0, edge_v)
@@ -936,6 +939,19 @@ def _compressed_graph_fusion_kkt(
                 max_radius,
                 float(torch.max(radius).item()) if radius.numel() else 0.0,
             )
+            scale = torch.maximum(torch.ones_like(radius), radius)
+            max_scaled_edge_residual = max(
+                max_scaled_edge_residual,
+                float(torch.max(edge_residual / scale).item())
+                if edge_residual.numel()
+                else 0.0,
+            )
+            max_scaled_ball_residual = max(
+                max_scaled_ball_residual,
+                float(torch.max(ball_residual / scale).item())
+                if ball_residual.numel()
+                else 0.0,
+            )
 
     total_grad = grad_smooth + adj
     stat = stationarity_residual_torch(
@@ -951,6 +967,15 @@ def _compressed_graph_fusion_kkt(
     stationarity_normalizer = 1.0 + smooth_gradient_norm + fusion_adjustment_norm
     stationarity_residual = projected_stationarity_norm / max(
         stationarity_normalizer, 1e-300
+    )
+    backward_error_stationarity_residual = float(
+        backward_error_stationarity_residual_torch(
+            grad_smooth=grad_smooth,
+            adj=adj,
+            phi=phi,
+            lower=lower,
+            upper=upper,
+        ).item()
     )
     frozen = upper <= lower + float(atol)
     lower_active = phi <= lower + float(atol)
@@ -971,6 +996,12 @@ def _compressed_graph_fusion_kkt(
     box_residual = box_primal_violation / max(box_scale, 1e-300)
     edge_subgradient_residual = max_edge_residual / (1.0 + max_radius)
     dual_ball_residual = max_ball_residual / (1.0 + max_radius)
+    backward_error_kkt_residual = max(
+        backward_error_stationarity_residual,
+        max_scaled_edge_residual,
+        max_scaled_ball_residual,
+        float(box_residual),
+    )
     return KKTDiagnostics(
         stationarity_residual=float(stationarity_residual),
         projected_stationarity_residual=float(stationarity_residual),
@@ -992,6 +1023,14 @@ def _compressed_graph_fusion_kkt(
             float(dual_ball_residual),
             float(box_residual),
         ),
+        backward_error_stationarity_residual=(
+            backward_error_stationarity_residual
+        ),
+        backward_error_edge_subgradient_residual=float(
+            max_scaled_edge_residual
+        ),
+        backward_error_dual_ball_residual=float(max_scaled_ball_residual),
+        backward_error_kkt_residual=float(backward_error_kkt_residual),
     )
 
 

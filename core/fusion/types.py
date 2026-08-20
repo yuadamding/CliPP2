@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Literal, Mapping, TypeAlias
 
 import numpy as np
@@ -85,47 +85,41 @@ class KKTDiagnostics:
     num_frozen_coordinates: int
     box_residual: float
     kkt_residual: float
+    # Scale-stable full-certificate diagnostics.  The historical fields above
+    # remain solver-progress diagnostics; terminal raw-candidate admission uses
+    # the backward-error residual under exactness-provenance schema v2.
+    backward_error_stationarity_residual: float = float("inf")
+    backward_error_edge_subgradient_residual: float = float("inf")
+    backward_error_dual_ball_residual: float = float("inf")
+    backward_error_kkt_residual: float = float("inf")
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, float | int]) -> "KKTDiagnostics":
+        integer_fields = {
+            "num_interior_coordinates",
+            "num_lower_active_coordinates",
+            "num_upper_active_coordinates",
+            "num_frozen_coordinates",
+        }
+        fail_closed_fields = {
+            "backward_error_stationarity_residual",
+            "backward_error_edge_subgradient_residual",
+            "backward_error_dual_ball_residual",
+            "backward_error_kkt_residual",
+        }
         return cls(
-            stationarity_residual=float(values["stationarity_residual"]),
-            projected_stationarity_residual=float(
-                values["projected_stationarity_residual"]
-            ),
-            projected_stationarity_norm=float(values["projected_stationarity_norm"]),
-            stationarity_normalizer=float(values["stationarity_normalizer"]),
-            smooth_gradient_norm=float(values["smooth_gradient_norm"]),
-            fusion_adjustment_norm=float(values["fusion_adjustment_norm"]),
-            edge_subgradient_residual=float(values["edge_subgradient_residual"]),
-            dual_ball_residual=float(values["dual_ball_residual"]),
-            box_primal_violation=float(values["box_primal_violation"]),
-            num_interior_coordinates=int(values["num_interior_coordinates"]),
-            num_lower_active_coordinates=int(values["num_lower_active_coordinates"]),
-            num_upper_active_coordinates=int(values["num_upper_active_coordinates"]),
-            num_frozen_coordinates=int(values["num_frozen_coordinates"]),
-            box_residual=float(values["box_residual"]),
-            kkt_residual=float(values["kkt_residual"]),
+            **{
+                item.name: (int if item.name in integer_fields else float)(
+                    values.get(item.name, float("inf"))
+                    if item.name in fail_closed_fields
+                    else values[item.name]
+                )
+                for item in fields(cls)
+            }
         )
 
     def as_dict(self) -> dict[str, float | int]:
-        return {
-            "stationarity_residual": self.stationarity_residual,
-            "projected_stationarity_residual": self.projected_stationarity_residual,
-            "projected_stationarity_norm": self.projected_stationarity_norm,
-            "stationarity_normalizer": self.stationarity_normalizer,
-            "smooth_gradient_norm": self.smooth_gradient_norm,
-            "fusion_adjustment_norm": self.fusion_adjustment_norm,
-            "edge_subgradient_residual": self.edge_subgradient_residual,
-            "dual_ball_residual": self.dual_ball_residual,
-            "box_primal_violation": self.box_primal_violation,
-            "num_interior_coordinates": self.num_interior_coordinates,
-            "num_lower_active_coordinates": self.num_lower_active_coordinates,
-            "num_upper_active_coordinates": self.num_upper_active_coordinates,
-            "num_frozen_coordinates": self.num_frozen_coordinates,
-            "box_residual": self.box_residual,
-            "kkt_residual": self.kkt_residual,
-        }
+        return {item.name: getattr(self, item.name) for item in fields(self)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +210,13 @@ class ExactFusionProvenance:
     status: str = "not_audited"
     residual: float = float("inf")
     tolerance: float = 0.0
+    working_precision_residual: float = float("inf")
+    working_dtype: str = "unknown"
+    certificate_audit_dtype: str = "unknown"
+    precision_polish_applied: bool = False
+    precision_polish_max_abs_phi_delta: float = 0.0
+    residual_method: str = "legacy_global_l2_projected_step_v1"
+    directional_kink_admissible: bool = False
     backend_name: str = "unknown"
     backend_iterations: int = 0
     workset_iterations: int = 0
@@ -238,7 +239,7 @@ class PairwiseFusionGraph:
     name: str = "complete_uniform"
     degree_bound: int = 1
 
-@dataclass(frozen=True)
+@dataclass
 class FusionFitArtifacts:
     phi: np.ndarray
     phi_clustered: np.ndarray
@@ -290,6 +291,10 @@ class FusionFitArtifacts:
     outer_num_upper_active_coordinates: int
     outer_num_frozen_coordinates: int
     outer_box_residual: float
+    outer_backward_error_stationarity_residual: float
+    outer_backward_error_edge_subgradient_residual: float
+    outer_backward_error_dual_ball_residual: float
+    outer_backward_error_kkt_residual: float
     fixed_objective_kkt_residual: float
     outer_kkt_certificate_status: str
     outer_kkt_dual_refined: bool

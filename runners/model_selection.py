@@ -256,6 +256,29 @@ def _raw_start_attempt_diagnostic(
         "n_clusters": int(fit.n_clusters),
         "penalized_objective": float(fit.penalized_objective),
         "kkt_residual": float(fit.fixed_objective_kkt_residual),
+        "working_precision_kkt_residual": float(
+            fit.working_precision_kkt_residual
+        ),
+        "backward_error_stationarity_residual": float(
+            fit.outer_backward_error_stationarity_residual
+        ),
+        "backward_error_edge_subgradient_residual": float(
+            fit.outer_backward_error_edge_subgradient_residual
+        ),
+        "backward_error_dual_ball_residual": float(
+            fit.outer_backward_error_dual_ball_residual
+        ),
+        "certificate_residual_method": str(
+            fit.exactness_provenance.residual_method
+            if fit.exactness_provenance is not None
+            else "unknown"
+        ),
+        "working_dtype": str(fit.working_dtype),
+        "certificate_audit_dtype": str(fit.certificate_audit_dtype),
+        "precision_polish_applied": bool(fit.precision_polish_applied),
+        "precision_polish_max_abs_phi_delta": float(
+            fit.precision_polish_max_abs_phi_delta
+        ),
         "kkt_tolerance": float(fit.full_kkt_tolerance),
         "stationarity_residual": float(fit.outer_stationarity_residual),
         "edge_subgradient_residual": float(fit.outer_edge_subgradient_residual),
@@ -370,12 +393,25 @@ def _raw_reference_failure_diagnostics(search_df: pd.DataFrame) -> dict[str, obj
             ).iloc[0]
             if np.isfinite(float(tolerance)):
                 min_tolerance = float(tolerance)
-        component_columns = {
-            "stationarity": "stationarity_residual",
-            "edge_subgradient": "edge_subgradient_residual",
-            "dual_ball": "dual_ball_residual",
-            "box": "box_residual",
-        }
+        backward_error_available = bool(
+            str(best_row.get("certificate_residual_method", ""))
+            == "componentwise_box_cone_backward_error_v1"
+        )
+        component_columns = (
+            {
+                "stationarity": "backward_error_stationarity_residual",
+                "edge_subgradient": "backward_error_edge_subgradient_residual",
+                "dual_ball": "backward_error_dual_ball_residual",
+                "box": "box_residual",
+            }
+            if backward_error_available
+            else {
+                "stationarity": "stationarity_residual",
+                "edge_subgradient": "edge_subgradient_residual",
+                "dual_ball": "dual_ball_residual",
+                "box": "box_residual",
+            }
+        )
         components = {
             name: float(best_row[column])
             for name, column in component_columns.items()

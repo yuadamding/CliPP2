@@ -199,6 +199,26 @@ def process_tumor_bundle(
         ),
         "selected_raw_solver_primal_tol": float(fit_options.tol),
         "selected_full_kkt_tolerance": float(best_fit.full_kkt_tolerance),
+        "selected_full_kkt_residual_method": str(
+            getattr(best_fit.exactness_provenance, "residual_method", "unknown")
+            if getattr(best_fit, "exactness_provenance", None) is not None
+            else "unknown"
+        ),
+        "selected_working_precision_kkt_residual": float(
+            getattr(best_fit, "working_precision_kkt_residual", np.nan)
+        ),
+        "selected_working_dtype": str(
+            getattr(best_fit, "working_dtype", getattr(best_fit, "dtype", "unknown"))
+        ),
+        "selected_certificate_audit_dtype": str(
+            getattr(best_fit, "certificate_audit_dtype", "unknown")
+        ),
+        "selected_precision_polish_applied": bool(
+            getattr(best_fit, "precision_polish_applied", False)
+        ),
+        "selected_precision_polish_max_abs_phi_delta": float(
+            getattr(best_fit, "precision_polish_max_abs_phi_delta", 0.0)
+        ),
         "selected_objective_spec_hash": str(best_fit.objective_spec_hash),
         "selected_base_fusion_objective_hash": str(best_fit.base_fusion_objective_hash),
         "selected_original_graph_hash": str(best_fit.original_graph_hash),

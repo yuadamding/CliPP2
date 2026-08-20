@@ -46,9 +46,11 @@ from .torch_backend import (
     CudaUnavailableError,
     TorchTumorData,
     as_runtime_tensor,
+    copy_torch_tumor_data,
     mutation_region_terms_torch,
     dtype_name,
     em_surrogate_terms_torch,
+    graph_adjoint_edges_in_dtype,
     graph_fusion_kkt_residual_from_grad_torch,
     path_downward_kink_mask_torch,
     path_internal_breakpoints_torch,
@@ -98,6 +100,128 @@ def _inadmissible_downward_kink_mask(
         1.0 + torch.maximum(torch.abs(lower), torch.abs(upper))
     )
     return downward_kink & ((upper - lower) > resolution)
+
+
+def _terminal_backward_error_audit_float64(
+    *,
+    torch_data: TorchTumorData,
+    phi: torch.Tensor,
+    certificate: GraphFusionCertificate | None,
+    graph: TensorFusionGraph,
+    graph_hash: str,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    lambda_value: float,
+    major_prior: float,
+    eps: float,
+    tol: float,
+) -> tuple[KKTDiagnostics, str, bool, float, float]:
+    """Audit the unchanged terminal witness with float64 backward error."""
+
+    device = phi.device
+    data64 = copy_torch_tumor_data(
+        torch_data,
+        dtype=torch.float64,
+        device=device,
+    )
+    phi64 = phi.to(dtype=torch.float64, device=device)
+    lower64 = lower.to(dtype=torch.float64, device=device)
+    upper64 = upper.to(dtype=torch.float64, device=device)
+    terms64 = mutation_region_terms_torch(
+        data64,
+        phi64,
+        major_prior=float(major_prior),
+        eps=float(eps),
+    )
+    certificate_gradient = terms64.grad
+    gradient_scope = "observed_objective"
+    directional_kink_admissible = True
+    if data64.path_likelihood is not None:
+        gradient_left, gradient_right, at_breakpoint = (
+            path_one_sided_gradients_torch(data64, phi64, eps=float(eps))
+        )
+        gradient_lower = torch.minimum(gradient_left, gradient_right)
+        gradient_upper = torch.maximum(gradient_left, gradient_right)
+        downward_kink = path_downward_kink_mask_torch(
+            gradient_left,
+            gradient_right,
+            at_breakpoint,
+            tol=float(tol),
+        )
+        directional_kink_admissible = not bool(
+            torch.any(
+                _inadmissible_downward_kink_mask(
+                    downward_kink,
+                    lower64,
+                    upper64,
+                    phi64,
+                )
+            ).item()
+        )
+        gradient_lower = torch.where(
+            at_breakpoint,
+            gradient_lower,
+            terms64.grad,
+        )
+        gradient_upper = torch.where(
+            at_breakpoint,
+            gradient_upper,
+            terms64.grad,
+        )
+        certificate_gradient = torch.minimum(
+            torch.maximum(terms64.grad, gradient_lower),
+            gradient_upper,
+        )
+        dense_dual = getattr(certificate, "dual", None)
+        if torch.is_tensor(dense_dual) and bool(torch.any(at_breakpoint).item()):
+            adjustment = graph_adjoint_edges_in_dtype(
+                dense_dual,
+                edge_u=graph.edge_u,
+                edge_v=graph.edge_v,
+                num_nodes=int(phi64.shape[0]),
+                dtype=torch.float64,
+                device=device,
+            )
+            ideal_gradient = -adjustment
+            certificate_gradient = torch.where(
+                at_breakpoint,
+                torch.minimum(
+                    torch.maximum(ideal_gradient, gradient_lower),
+                    gradient_upper,
+                ),
+                terms64.grad,
+            )
+        if bool(torch.any(at_breakpoint).item()):
+            gradient_scope = "clarke_piecewise_observed_objective_subgradient"
+
+    diagnostics = audit_graph_fusion_certificate(
+        certificate=certificate,
+        phi=phi64,
+        grad_smooth=certificate_gradient,
+        graph=graph,
+        graph_hash=str(graph_hash),
+        lower=lower64,
+        upper=upper64,
+        lambda_value=float(lambda_value),
+        atol=float(tol),
+    )
+    fit_loss64, _, objective64, _ = (
+        _objective_value_from_mutation_region_terms_torch(
+            terms64,
+            phi64,
+            edge_u=graph.edge_u,
+            edge_v=graph.edge_v,
+            edge_w=graph.weight,
+            lambda_value=float(lambda_value),
+        )
+    )
+    return (
+        diagnostics,
+        gradient_scope,
+        directional_kink_admissible,
+        float(fit_loss64),
+        float(objective64),
+    )
 
 
 class _UnionFind:
@@ -863,6 +987,63 @@ def torch_data_from_context(context: SolverContext) -> TorchTumorData:
         count_observed=problem.count_observed,
         path_likelihood=problem.path_likelihood,
         data_fingerprint=context.data_fingerprint,
+    )
+
+
+def promote_solver_context_dtype(
+    context: SolverContext,
+    *,
+    dtype: torch.dtype,
+    device: torch.device | None = None,
+) -> SolverContext:
+    """Copy one frozen numerical problem without rebuilding its estimator."""
+
+    if dtype not in {torch.float32, torch.float64}:
+        raise ValueError("Promoted solver contexts require float32 or float64.")
+    target_device = context.runtime.device if device is None else torch.device(device)
+    if context.runtime.dtype == dtype and context.runtime.device == target_device:
+        return context
+    promoted_data = copy_torch_tumor_data(
+        torch_data_from_context(context),
+        dtype=dtype,
+        device=target_device,
+    )
+    runtime = replace(
+        context.runtime,
+        dtype=dtype,
+        device=target_device,
+        device_name=str(target_device),
+    )
+    graph = replace(
+        context.graph,
+        # Edge identities are precision-independent and are shared unless the
+        # resource fallback changes devices.
+        edge_index=context.graph.edge_index.to(device=target_device),
+        weight=context.graph.weight.to(dtype=dtype, device=target_device),
+        degree=context.graph.degree.to(dtype=dtype, device=target_device),
+        pdhg_tau_node=context.graph.pdhg_tau_node.to(
+            dtype=dtype,
+            device=target_device,
+        ),
+    )
+    problem = _tensor_problem_from_torch_data(
+        promoted_data,
+        major_prior=float(context.problem.major_prior),
+        eps=float(context.problem.eps),
+    )
+    return replace(
+        context,
+        problem=problem,
+        graph=graph,
+        exact_pilot=context.exact_pilot.to(dtype=dtype, device=target_device),
+        pooled_start=context.pooled_start.to(dtype=dtype, device=target_device),
+        scalar_well_starts=tuple(
+            start.to(dtype=dtype, device=target_device)
+            for start in context.scalar_well_starts
+        ),
+        lower=context.lower.to(dtype=dtype, device=target_device),
+        upper=context.upper.to(dtype=dtype, device=target_device),
+        runtime=runtime,
     )
 
 
@@ -2546,6 +2727,51 @@ def _fit_from_start(
         )
     certificate = final_certificate_refinement.certificate
     final_outer_diag = final_certificate_refinement.diagnostics.as_dict()
+    working_precision_kkt_residual = float(
+        final_outer_diag["backward_error_kkt_residual"]
+    )
+    certificate_audit_dtype = dtype_name(runtime.dtype)
+    authoritative_fit_loss = float(fit_loss)
+    authoritative_objective = float(objective)
+    if runtime.dtype == torch.float64:
+        admission_diagnostics = final_certificate_refinement.diagnostics
+    else:
+        (
+            admission_diagnostics,
+            audit_gradient_scope,
+            audit_directional_kink_admissible,
+            authoritative_fit_loss,
+            authoritative_objective,
+        ) = _terminal_backward_error_audit_float64(
+            torch_data=torch_data,
+            phi=phi,
+            certificate=certificate,
+            graph=tensor_graph,
+            graph_hash=graph_hash,
+            lower=lower,
+            upper=upper,
+            lambda_value=lambda_value,
+            major_prior=major_prior,
+            eps=eps,
+            tol=tol,
+        )
+        certificate_audit_dtype = "float64"
+        gradient_scope = str(audit_gradient_scope)
+        directional_kink_admissible = bool(
+            directional_kink_admissible and audit_directional_kink_admissible
+        )
+        full_certificate_audit_passes += 1
+    admission_diag = admission_diagnostics.as_dict()
+    for key in (
+        "backward_error_stationarity_residual",
+        "backward_error_edge_subgradient_residual",
+        "backward_error_dual_ball_residual",
+        "backward_error_kkt_residual",
+    ):
+        final_outer_diag[key] = admission_diag[key]
+    authoritative_kkt_residual = float(
+        admission_diag["backward_error_kkt_residual"]
+    )
     final_dual = getattr(certificate, "dual", None)
     outer_kkt_certificate_status = str(final_certificate_refinement.status)
     outer_kkt_dual_refined = bool(final_certificate_refinement.dual_refined)
@@ -2557,7 +2783,7 @@ def _fit_from_start(
     outer_stationarity_residual_after_dual_refine = float(
         final_certificate_refinement.stationarity_after
     )
-    converged_outer = bool(float(final_outer_diag["kkt_residual"]) <= 5.0 * tol)
+    converged_outer = bool(authoritative_kkt_residual <= 5.0 * tol)
     valid_dual_certificate = outer_kkt_certificate_status in {
         "zero_penalty_no_dual_needed",
         "analytic_nonfused_dual",
@@ -2565,21 +2791,27 @@ def _fit_from_start(
         "input_dual_retained",
         "certified",
     }
+    if converged_outer and directional_kink_admissible:
+        # The full-original-graph backward-error audit is the certificate;
+        # compressed workset stopping labels cannot invalidate that stronger
+        # terminal result.
+        outer_kkt_certificate_status = "certified"
+        valid_dual_certificate = True
     selection_eligible = bool(
-        np.isfinite(float(objective))
+        np.isfinite(float(authoritative_objective))
         and converged_outer
         and valid_dual_certificate
         and mm_consistency_violations == 0
         and directional_kink_admissible
     )
     full_kkt_certified = bool(
-        np.isfinite(float(final_outer_diag["kkt_residual"]))
+        np.isfinite(authoritative_kkt_residual)
         and converged_outer
         and valid_dual_certificate
         and directional_kink_admissible
     )
     exactness_provenance = ExactFusionProvenance(
-        schema_version=1,
+        schema_version=2,
         estimator_role="raw_fused_lambda_path",
         objective_faithful=True,
         objective_spec_hash=str(objective_spec_hash),
@@ -2592,8 +2824,15 @@ def _fit_from_start(
         gradient_scope=str(gradient_scope),
         full_kkt_certified=full_kkt_certified,
         status=str(outer_kkt_certificate_status),
-        residual=float(final_outer_diag["kkt_residual"]),
+        residual=float(authoritative_kkt_residual),
         tolerance=5.0 * float(tol),
+        working_precision_residual=float(working_precision_kkt_residual),
+        working_dtype=dtype_name(runtime.dtype),
+        certificate_audit_dtype=str(certificate_audit_dtype),
+        precision_polish_applied=False,
+        precision_polish_max_abs_phi_delta=0.0,
+        residual_method="componentwise_box_cone_backward_error_v1",
+        directional_kink_admissible=bool(directional_kink_admissible),
         backend_name=str(inner_solver),
         backend_iterations=int(inner_iterations),
         workset_iterations=int(workset_iterations),
@@ -2624,9 +2863,9 @@ def _fit_from_start(
         accepted_damped_steps=accepted_damped_steps,
         accepted_full_steps=accepted_full_steps,
         mm_consistency_violations=mm_consistency_violations,
-        objective=float(objective),
-        fit_loss=float(fit_loss),
-        kkt_residual=float(final_outer_diag["kkt_residual"]),
+        objective=float(authoritative_objective),
+        fit_loss=float(authoritative_fit_loss),
+        kkt_residual=float(authoritative_kkt_residual),
         tol=tol,
         failed_nonfinite_checks=failed_nonfinite_checks,
         attempted_outer_steps=attempted_outer_steps,
@@ -2721,13 +2960,19 @@ def _fit_from_start(
         gamma_major=final_terms.gamma_major.detach(),
         dual=solver_state_out.dual,
         fit_loss=torch.as_tensor(
-            float(fit_loss), dtype=runtime.dtype, device=runtime.device
+            float(authoritative_fit_loss),
+            dtype=runtime.dtype,
+            device=runtime.device,
         ),
         fusion_penalty=torch.as_tensor(
-            float(objective - fit_loss), dtype=runtime.dtype, device=runtime.device
+            float(authoritative_objective - authoritative_fit_loss),
+            dtype=runtime.dtype,
+            device=runtime.device,
         ),
         objective=torch.as_tensor(
-            float(objective), dtype=runtime.dtype, device=runtime.device
+            float(authoritative_objective),
+            dtype=runtime.dtype,
+            device=runtime.device,
         ),
         inner=InnerDiagnostics(
             iterations=int(inner_iterations),
@@ -2772,9 +3017,9 @@ def _fit_from_start(
         major_call=major_call.astype(bool, copy=False),
         multiplicity_call=multiplicity_call.astype(phi_np.dtype, copy=False),
         multiplicity_estimated_mask=multiplicity_estimated_mask,
-        loglik=float(-fit_loss),
+        loglik=float(-authoritative_fit_loss),
         summary_loglik=summary_loglik,
-        penalized_objective=float(objective),
+        penalized_objective=float(authoritative_objective),
         lambda_value=float(lambda_value),
         n_clusters=n_clusters,
         iterations=int(iterations),
@@ -2824,7 +3069,19 @@ def _fit_from_start(
         ),
         outer_num_frozen_coordinates=int(final_outer_diag["num_frozen_coordinates"]),
         outer_box_residual=float(final_outer_diag["box_residual"]),
-        fixed_objective_kkt_residual=float(final_outer_diag["kkt_residual"]),
+        outer_backward_error_stationarity_residual=float(
+            final_outer_diag["backward_error_stationarity_residual"]
+        ),
+        outer_backward_error_edge_subgradient_residual=float(
+            final_outer_diag["backward_error_edge_subgradient_residual"]
+        ),
+        outer_backward_error_dual_ball_residual=float(
+            final_outer_diag["backward_error_dual_ball_residual"]
+        ),
+        outer_backward_error_kkt_residual=float(
+            final_outer_diag["backward_error_kkt_residual"]
+        ),
+        fixed_objective_kkt_residual=float(authoritative_kkt_residual),
         outer_kkt_certificate_status=str(outer_kkt_certificate_status),
         outer_kkt_dual_refined=bool(outer_kkt_dual_refined),
         outer_kkt_fused_edges=int(outer_kkt_fused_edges),
@@ -2857,8 +3114,8 @@ def _fit_from_start(
         global_optimality_certified=bool(global_optimality_certified),
         global_optimality_basis=str(global_optimality_basis),
         number_of_starts=1,
-        number_of_finite_starts=int(np.isfinite(float(objective))),
-        best_start_objective=float(objective),
+        number_of_finite_starts=int(np.isfinite(float(authoritative_objective))),
+        best_start_objective=float(authoritative_objective),
         second_best_start_objective=float("nan"),
         objective_spread_across_starts=0.0,
         selected_start_objective_rank=1,
@@ -3002,11 +3259,12 @@ def fit_observed_data_pairwise_fusion(
             start_bank.append(effective_pooled_start)
     start_bank = _deduplicate_starts(start_bank, runtime=effective_runtime)
 
-    def run_start(
+    def solve_start_once(
         *,
         context: SolverContext,
         start: np.ndarray | torch.Tensor,
         state: SolverState | None,
+        polish: bool = False,
     ) -> FusionFitArtifacts:
         return _fit_from_start(
             data,
@@ -3019,7 +3277,11 @@ def fit_observed_data_pairwise_fusion(
             lambda_value=lambda_value,
             major_prior=major_prior,
             eps=eps,
-            outer_max_iter=outer_max_iter,
+            # One outer continuation step bounds added work.  It repaired the
+            # measured precision-floor sentinel, but is not assumed to be a
+            # general convergence guarantee; the terminal audit remains
+            # fail-closed.
+            outer_max_iter=1 if polish else outer_max_iter,
             inner_max_iter=inner_max_iter,
             tol=tol,
             phi_start=start,
@@ -3037,6 +3299,176 @@ def fit_observed_data_pairwise_fusion(
             certificate_refinement_rounds=certificate_refinement_rounds,
             certificate_column_tol_scale=certificate_column_tol_scale,
             verbose=verbose,
+        )
+
+    precision_context: SolverContext | None = None
+    precision_source_context: SolverContext | None = None
+    accepted_certificate_statuses = frozenset(
+        {
+            "certified",
+            "input_dual_retained",
+            "analytic_nonfused_dual",
+            "refined_fused_edge_dual",
+            "zero_penalty_no_dual_needed",
+        }
+    )
+
+    def precision_residual_is_only_blocker(
+        working: FusionFitArtifacts,
+    ) -> bool:
+        provenance = working.exactness_provenance
+        if provenance is None:
+            return False
+        status = str(provenance.status)
+        residual_only_compressed = bool(
+            isinstance(working.certificate, CompressedEdgeCertificate)
+            and status == "not_certified"
+            and int(provenance.full_certificate_audit_passes) > 0
+        )
+        return bool(
+            np.isfinite(float(working.penalized_objective))
+            and int(working.mm_consistency_violations) == 0
+            and bool(provenance.directional_kink_admissible)
+            and (status in accepted_certificate_statuses or residual_only_compressed)
+            and np.isfinite(float(working.fixed_objective_kkt_residual))
+            and float(working.fixed_objective_kkt_residual)
+            > float(provenance.tolerance)
+        )
+
+    def compressed_representation_requires_fallback(
+        working: FusionFitArtifacts,
+    ) -> bool:
+        if not isinstance(working.certificate, CompressedEdgeCertificate):
+            return False
+        provenance = working.exactness_provenance
+        if provenance is None:
+            return True
+        status = str(provenance.status)
+        return bool(
+            status in {"resource_limit", "workset_incomplete"}
+            or (
+                status == "not_certified"
+                and int(provenance.full_certificate_audit_passes) == 0
+            )
+        )
+
+    def run_start(
+        *,
+        context: SolverContext,
+        start: np.ndarray | torch.Tensor,
+        state: SolverState | None,
+    ) -> FusionFitArtifacts:
+        """Solve and audit one start in the requested working precision."""
+
+        return solve_start_once(context=context, start=start, state=state)
+
+    def polish_selected_start(
+        *,
+        context: SolverContext,
+        working: FusionFitArtifacts,
+    ) -> FusionFitArtifacts:
+        """Continue only the objective-best start in float64 when necessary."""
+
+        nonlocal precision_context, precision_source_context
+        if str(working.dtype) == "float64" or working.selection_eligible:
+            return working
+
+        if not precision_residual_is_only_blocker(working):
+            return working
+
+        if precision_context is None or precision_source_context is not context:
+            precision_runtime = replace(context.runtime, dtype=torch.float64)
+            if context.graph.is_complete:
+                precision_fits, precision_bytes, precision_limit = (
+                    dense_complete_solver_memory_preflight(
+                        num_nodes=int(data.num_mutations),
+                        num_regions=int(data.num_regions),
+                        runtime=precision_runtime,
+                    )
+                )
+                if not precision_fits:
+                    raise ExactSolverResourceLimit(
+                        "exact_solver_resource_limit: float64 fixed-objective "
+                        "precision polish needs approximately "
+                        f"{precision_bytes} bytes (available policy limit: "
+                        f"{precision_limit})."
+                    )
+            precision_context = promote_solver_context_dtype(
+                context,
+                dtype=torch.float64,
+            )
+            precision_source_context = context
+        working_phi = torch.as_tensor(
+            working.phi,
+            dtype=torch.float64,
+            device=precision_context.runtime.device,
+        )
+        working_objective64 = float(working.penalized_objective)
+        polished = solve_start_once(
+            context=precision_context,
+            start=working_phi,
+            state=working.solver_state,
+            polish=True,
+        )
+        if str(polished.exactness_provenance.objective_spec_hash) != str(
+            context.objective_spec_hash
+        ) or str(polished.exactness_provenance.original_graph_hash) != str(
+            context.graph_hash
+        ):
+            raise AssertionError("Precision polishing changed estimator identity.")
+        objective_slack = max(
+            1e-10 * (1.0 + abs(float(working_objective64))),
+            64.0
+            * np.finfo(np.float64).eps
+            * (1.0 + abs(float(working_objective64))),
+        )
+        if (
+            not np.isfinite(float(polished.penalized_objective))
+            or float(polished.penalized_objective)
+            > float(working_objective64) + objective_slack
+        ):
+            raise AssertionError(
+                "Float64 fixed-objective polishing increased the objective."
+            )
+        max_phi_delta = float(
+            np.max(
+                np.abs(
+                    np.asarray(polished.phi, dtype=np.float64)
+                    - np.asarray(working.phi, dtype=np.float64)
+                )
+            )
+        )
+        polished = merge_attempted_work(polished, working)
+        polished_provenance = polished.exactness_provenance
+        if polished_provenance is None:
+            raise AssertionError("Precision-polished fit lacks exactness provenance.")
+        polished_provenance = replace(
+            polished_provenance,
+            schema_version=2,
+            working_precision_residual=float(
+                working.exactness_provenance.working_precision_residual
+                if working.exactness_provenance is not None
+                else working.fixed_objective_kkt_residual
+            ),
+            working_dtype=str(working.dtype),
+            certificate_audit_dtype="float64",
+            precision_polish_applied=True,
+            precision_polish_max_abs_phi_delta=float(max_phi_delta),
+            fallback_reason=_combine_fallback_reasons(
+                polished_provenance.fallback_reason,
+                "float64_fixed_objective_precision_polish",
+            ),
+        )
+        torch_result = polished.torch_result
+        if torch_result is not None:
+            torch_result = replace(
+                torch_result,
+                exactness_provenance=polished_provenance,
+            )
+        return replace(
+            polished,
+            exactness_provenance=polished_provenance,
+            torch_result=torch_result,
         )
 
     def mark_fallback(
@@ -3160,7 +3592,9 @@ def fit_observed_data_pairwise_fusion(
 
     cpu_fallback_context: SolverContext | None = None
     best_artifacts: FusionFitArtifacts | None = None
+    best_artifacts_index = -1
     start_artifacts: list[FusionFitArtifacts] = []
+    start_contexts: list[SolverContext] = []
     for start in start_bank:
         state_for_start = (
             solver_state
@@ -3169,27 +3603,15 @@ def fit_observed_data_pairwise_fusion(
         )
         cpu_seed = state_for_start.phi if state_for_start is not None else start
         attempted_artifacts: FusionFitArtifacts | None = None
+        artifacts_context = solver_context
         try:
             artifacts = run_start(
                 context=solver_context,
                 start=start,
                 state=state_for_start,
             )
-            provenance = artifacts.exactness_provenance
             compressed_terminal_not_certified = bool(
-                isinstance(artifacts.certificate, CompressedEdgeCertificate)
-                and (
-                    provenance is None
-                    or not bool(provenance.full_kkt_certified)
-                    or str(provenance.status)
-                    not in {
-                        "certified",
-                        "input_dual_retained",
-                        "analytic_nonfused_dual",
-                        "refined_fused_edge_dual",
-                        "zero_penalty_no_dual_needed",
-                    }
-                )
+                compressed_representation_requires_fallback(artifacts)
             )
             if compressed_terminal_not_certified:
                 attempted_artifacts = artifacts
@@ -3302,15 +3724,65 @@ def fit_observed_data_pairwise_fusion(
                 reason="dense_cpu_after_solver_resource_limit",
                 backend_name="admm_complete_graph_cpu_fallback",
             )
+            artifacts_context = cpu_fallback_context
         start_artifacts.append(artifacts)
+        start_contexts.append(artifacts_context)
         if best_artifacts is None:
             best_artifacts = artifacts
+            best_artifacts_index = len(start_artifacts) - 1
             continue
         if _prefer_multistart_fit(artifacts, best_artifacts):
             best_artifacts = artifacts
+            best_artifacts_index = len(start_artifacts) - 1
 
     if best_artifacts is None:
         raise RuntimeError("No valid start produced a fusion fit.")
+    if best_artifacts_index < 0:
+        raise AssertionError("Best multistart fit lacks a source context.")
+    selected_start_context = start_contexts[best_artifacts_index]
+    try:
+        best_artifacts = polish_selected_start(
+            context=selected_start_context,
+            working=best_artifacts,
+        )
+    except (MemoryError, torch.OutOfMemoryError) as polish_exc:
+        cpu_polish_allowed = bool(
+            normalized_fallback_policy == "cpu_allowed"
+            and selected_start_context.runtime.device.type != "cpu"
+        )
+        if not cpu_polish_allowed:
+            raise
+        cpu_precision_runtime = resolve_runtime("cpu", dtype="float64")
+        if selected_start_context.graph.is_complete:
+            cpu_precision_fits, cpu_precision_bytes, cpu_precision_limit = (
+                dense_complete_solver_memory_preflight(
+                    num_nodes=int(data.num_mutations),
+                    num_regions=int(data.num_regions),
+                    runtime=cpu_precision_runtime,
+                )
+            )
+            if not cpu_precision_fits:
+                raise ExactSolverResourceLimit(
+                    "exact_solver_resource_limit: CPU float64 fixed-objective "
+                    "precision polish needs approximately "
+                    f"{cpu_precision_bytes} bytes (available policy limit: "
+                    f"{cpu_precision_limit})."
+                ) from polish_exc
+        cpu_precision_context = promote_solver_context_dtype(
+            selected_start_context,
+            dtype=torch.float64,
+            device=cpu_precision_runtime.device,
+        )
+        best_artifacts = polish_selected_start(
+            context=cpu_precision_context,
+            working=best_artifacts,
+        )
+        best_artifacts = mark_fallback(
+            best_artifacts,
+            reason="float64_precision_polish_cpu_after_cuda_resource_limit",
+            backend_name="admm_complete_graph_cpu_precision_polish",
+        )
+    start_artifacts[best_artifacts_index] = best_artifacts
     objectives = np.asarray(
         [float(item.penalized_objective) for item in start_artifacts], dtype=np.float64
     )

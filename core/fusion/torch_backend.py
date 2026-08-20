@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import warnings
 
 import numpy as np
@@ -13,6 +13,7 @@ from ...io.data import (
 )
 from .defaults import DEFAULT_DTYPE
 from .graph_ops import (
+    DETERMINISTIC_COMPLETE_ADJOINT_MAX_BYTES,
     PDHG_PRECONDITIONER_ETA,
     graph_adjoint_edges,
     graph_forward_edges,
@@ -68,6 +69,60 @@ class NumpyPathMutationRegionTerms:
     hess_upper: np.ndarray
     path_posterior: np.ndarray
     gamma_major: np.ndarray
+
+
+def copy_torch_tumor_data(
+    data: TorchTumorData,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> TorchTumorData:
+    """Copy a frozen numerical likelihood to another runtime precision.
+
+    This deliberately promotes the tensors already defining the objective;
+    it does not rebuild dosage paths, priors, or scaling from source data.
+    """
+
+    path_likelihood = (
+        None
+        if data.path_likelihood is None
+        else replace(
+            data.path_likelihood,
+            first_scale=data.path_likelihood.first_scale.to(
+                dtype=dtype, device=device
+            ),
+            second_scale=data.path_likelihood.second_scale.to(
+                dtype=dtype, device=device
+            ),
+            switch_fraction=data.path_likelihood.switch_fraction.to(
+                dtype=dtype, device=device
+            ),
+            log_prior=data.path_likelihood.log_prior.to(dtype=dtype, device=device),
+            valid=data.path_likelihood.valid.to(device=device),
+            legacy_major_indicator=(
+                None
+                if data.path_likelihood.legacy_major_indicator is None
+                else data.path_likelihood.legacy_major_indicator.to(device=device)
+            ),
+        )
+    )
+    return TorchTumorData(
+        alt=data.alt.to(dtype=dtype, device=device),
+        total=data.total.to(dtype=dtype, device=device),
+        nonalt=data.nonalt.to(dtype=dtype, device=device),
+        phi_upper=data.phi_upper.to(dtype=dtype, device=device),
+        ambiguous=data.ambiguous.to(device=device),
+        b_minus=data.b_minus.to(dtype=dtype, device=device),
+        b_plus=data.b_plus.to(dtype=dtype, device=device),
+        b_fixed=data.b_fixed.to(dtype=dtype, device=device),
+        count_observed=(
+            None
+            if data.count_observed is None
+            else data.count_observed.to(device=device)
+        ),
+        path_likelihood=path_likelihood,
+        data_fingerprint=data.data_fingerprint,
+    )
 
 
 DEFAULT_INNER_KKT_CHECK_EVERY = 8
@@ -157,6 +212,69 @@ def _edge_tensor_nbytes(*, num_edges: int, num_regions: int, dtype: torch.dtype)
 def _edge_slices(num_edges: int, chunk_size: int):
     for start in range(0, int(num_edges), max(int(chunk_size), 1)):
         yield slice(start, min(start + int(chunk_size), int(num_edges)))
+
+
+def graph_adjoint_edges_in_dtype(
+    dual: torch.Tensor,
+    *,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    num_nodes: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    scale: float = 1.0,
+    edge_work_bytes: int | None = None,
+) -> torch.Tensor:
+    """Apply the graph adjoint with bounded cross-precision work storage."""
+
+    dual_scale = float(scale)
+    if not np.isfinite(dual_scale):
+        raise ValueError("dual adjoint scale must be finite.")
+    source = dual.to(device=device)
+    if source.dtype == dtype and dual_scale == 1.0:
+        return graph_adjoint_edges(
+            source,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            num_nodes=int(num_nodes),
+        )
+    num_edges = int(edge_u.numel())
+    num_regions = int(source.shape[1])
+    complete_edge_count = int(num_nodes) * max(int(num_nodes) - 1, 0) // 2
+    dense_workspace_bytes = (
+        int(num_nodes)
+        * int(num_nodes)
+        * max(num_regions, 1)
+        * int(torch.empty((), dtype=dtype).element_size())
+    )
+    if (
+        device.type == "cuda"
+        and num_edges == complete_edge_count
+        and dense_workspace_bytes <= DETERMINISTIC_COMPLETE_ADJOINT_MAX_BYTES
+    ):
+        promoted = source.to(dtype=dtype)
+        if dual_scale != 1.0:
+            promoted = dual_scale * promoted
+        return graph_adjoint_edges(
+            promoted,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            num_nodes=int(num_nodes),
+        )
+    chunk_size = _edge_chunk_size(
+        num_edges=num_edges,
+        num_regions=num_regions,
+        dtype=dtype,
+        work_bytes=edge_work_bytes,
+    )
+    adj = torch.zeros((int(num_nodes), num_regions), dtype=dtype, device=device)
+    for edge_slice in _edge_slices(num_edges, chunk_size):
+        chunk = source[edge_slice].to(dtype=dtype)
+        if dual_scale != 1.0:
+            chunk = dual_scale * chunk
+        adj.index_add_(0, edge_u[edge_slice], chunk)
+        adj.index_add_(0, edge_v[edge_slice], chunk, alpha=-1.0)
+    return adj
 
 
 def _graph_edge_activity_counts_torch(
@@ -1338,16 +1456,43 @@ def stationarity_residual_torch(
     return phi - projected
 
 
+def backward_error_stationarity_residual_torch(
+    *,
+    grad_smooth: torch.Tensor,
+    adj: torch.Tensor,
+    phi: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+) -> torch.Tensor:
+    """Return a dimension-stable componentwise box-KKT backward error."""
+
+    total_grad = grad_smooth + adj
+    cone_projection = project_stationarity_cone_torch(
+        total_grad,
+        phi=phi,
+        lower=lower,
+        upper=upper,
+    )
+    violation = total_grad - cone_projection
+    scale = torch.maximum(
+        torch.ones_like(violation),
+        torch.abs(grad_smooth) + torch.abs(adj),
+    )
+    if violation.numel() == 0:
+        return torch.zeros((), dtype=phi.dtype, device=phi.device)
+    return torch.max(torch.abs(violation) / scale)
+
+
 def _edge_kkt_maxima_from_diff_torch(
     *,
     diff: torch.Tensor,
     dual: torch.Tensor | None,
     radius: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return unnormalized edge-subgradient, dual-ball, and radius maxima."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return legacy and componentwise-scaled edge KKT maxima."""
     if diff.shape[0] == 0:
         zero = torch.zeros((), dtype=diff.dtype, device=diff.device)
-        return zero, zero, zero
+        return zero, zero, zero, zero, zero
     prox_input = diff if dual is None else diff + dual
     prox_input_norm = torch.linalg.vector_norm(prox_input, dim=1)
     big = prox_input_norm >= radius
@@ -1366,10 +1511,13 @@ def _edge_kkt_maxima_from_diff_torch(
         torch.linalg.vector_norm(active_residual, dim=1),
         torch.linalg.vector_norm(diff, dim=1),
     )
+    scale = torch.maximum(torch.ones_like(radius), radius)
     return (
         torch.max(edge_residual),
         torch.max(ball_residual),
         torch.max(radius),
+        torch.max(edge_residual / scale),
+        torch.max(ball_residual / scale),
     )
 
 
@@ -1384,6 +1532,8 @@ def _graph_fusion_kkt_diagnostics_from_components_torch(
     max_edge_residual: float | torch.Tensor,
     max_ball_residual: float | torch.Tensor,
     max_radius: float | torch.Tensor,
+    max_scaled_edge_residual: float | torch.Tensor | None = None,
+    max_scaled_ball_residual: float | torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Assemble exact KKT diagnostics from an adjoint and edgewise maxima."""
     total_grad = grad_smooth + adj
@@ -1400,6 +1550,15 @@ def _graph_fusion_kkt_diagnostics_from_components_torch(
     stationarity_normalizer = float(1.0 + smooth_gradient_norm + fusion_adjustment_norm)
     stationarity_residual = float(
         projected_stationarity_norm / max(stationarity_normalizer, 1e-300)
+    )
+    backward_error_stationarity_residual = float(
+        backward_error_stationarity_residual_torch(
+            grad_smooth=grad_smooth,
+            adj=adj,
+            phi=phi,
+            lower=lower,
+            upper=upper,
+        ).item()
     )
     lower_active = phi <= lower + float(atol)
     upper_active = phi >= upper - float(atol)
@@ -1436,6 +1595,30 @@ def _graph_fusion_kkt_diagnostics_from_components_torch(
     edge_denom = 1.0 + radius_max
     edge_subgradient_residual = edge_max / edge_denom
     dual_ball_residual = ball_max / edge_denom
+    backward_error_edge_subgradient_residual = (
+        edge_subgradient_residual
+        if max_scaled_edge_residual is None
+        else float(
+            max_scaled_edge_residual.item()
+            if torch.is_tensor(max_scaled_edge_residual)
+            else max_scaled_edge_residual
+        )
+    )
+    backward_error_dual_ball_residual = (
+        dual_ball_residual
+        if max_scaled_ball_residual is None
+        else float(
+            max_scaled_ball_residual.item()
+            if torch.is_tensor(max_scaled_ball_residual)
+            else max_scaled_ball_residual
+        )
+    )
+    backward_error_kkt_residual = max(
+        backward_error_stationarity_residual,
+        backward_error_edge_subgradient_residual,
+        backward_error_dual_ball_residual,
+        float(box_residual),
+    )
 
     return {
         "stationarity_residual": stationarity_residual,
@@ -1458,6 +1641,14 @@ def _graph_fusion_kkt_diagnostics_from_components_torch(
             dual_ball_residual,
             float(box_residual),
         ),
+        "backward_error_stationarity_residual": (
+            backward_error_stationarity_residual
+        ),
+        "backward_error_edge_subgradient_residual": (
+            backward_error_edge_subgradient_residual
+        ),
+        "backward_error_dual_ball_residual": backward_error_dual_ball_residual,
+        "backward_error_kkt_residual": backward_error_kkt_residual,
     }
 
 
@@ -1487,7 +1678,10 @@ def graph_fusion_kkt_residual_from_grad_torch(
     )
     dual = None
     if valid_dual:
-        dual = dual_kkt.to(dtype=phi.dtype, device=phi.device)
+        # Keep a cross-precision witness in its source dtype.  Terminal
+        # float64 audits cast one bounded edge chunk at a time instead of
+        # materializing another complete E x S dual.
+        dual = dual_kkt.to(device=phi.device)
     chunk_size = _edge_chunk_size(
         num_edges=num_edges,
         num_regions=num_regions,
@@ -1497,25 +1691,24 @@ def graph_fusion_kkt_residual_from_grad_torch(
 
     adj = torch.zeros_like(phi)
     if num_edges > 0 and lambda_value > 0.0 and dual is not None:
-        if dual_scale_value == 1.0:
-            # This routes CUDA complete graphs through the deterministic
-            # reduction used by the solver, so certification audits the same
-            # numerical operator instead of a second atomic-scatter ordering.
-            adj = graph_adjoint_edges(
-                dual,
-                edge_u=edge_u,
-                edge_v=edge_v,
-                num_nodes=int(phi.shape[0]),
-            )
-        else:
-            for edge_slice in _edge_slices(num_edges, chunk_size):
-                dual_chunk = dual_scale_value * dual[edge_slice]
-                adj.index_add_(0, edge_u[edge_slice], dual_chunk)
-                adj.index_add_(0, edge_v[edge_slice], dual_chunk, alpha=-1.0)
+        # Same-precision CUDA follows the solver's preferred reduction;
+        # cross-precision audits cast only bounded edge chunks.
+        adj = graph_adjoint_edges_in_dtype(
+            dual,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            num_nodes=int(phi.shape[0]),
+            dtype=phi.dtype,
+            device=phi.device,
+            scale=dual_scale_value,
+            edge_work_bytes=edge_work_bytes,
+        )
     zero = torch.zeros((), dtype=phi.dtype, device=phi.device)
     max_edge_residual = zero
     max_ball_residual = zero
     max_radius = zero
+    max_scaled_edge_residual = zero
+    max_scaled_ball_residual = zero
     if num_edges == 0 or lambda_value <= 0.0:
         return _graph_fusion_kkt_diagnostics_from_components_torch(
             phi=phi,
@@ -1527,6 +1720,8 @@ def graph_fusion_kkt_residual_from_grad_torch(
             max_edge_residual=max_edge_residual,
             max_ball_residual=max_ball_residual,
             max_radius=max_radius,
+            max_scaled_edge_residual=max_scaled_edge_residual,
+            max_scaled_ball_residual=max_scaled_ball_residual,
         )
 
     # Proximal fixed-point residual: R_e = d_e - prox_{r_e*|.|_2}(d_e + y_e).
@@ -1539,11 +1734,19 @@ def graph_fusion_kkt_residual_from_grad_torch(
             edge_u=edge_u[edge_slice],
             edge_v=edge_v[edge_slice],
         )
-        radius = float(lambda_value) * edge_w[edge_slice]
-        dual_chunk = None if dual is None else dual[edge_slice]
+        radius = float(lambda_value) * edge_w[edge_slice].to(dtype=phi.dtype)
+        dual_chunk = (
+            None if dual is None else dual[edge_slice].to(dtype=phi.dtype)
+        )
         if dual_chunk is not None and dual_scale_value != 1.0:
             dual_chunk = dual_scale_value * dual_chunk
-        edge_max, ball_max, radius_max = _edge_kkt_maxima_from_diff_torch(
+        (
+            edge_max,
+            ball_max,
+            radius_max,
+            scaled_edge_max,
+            scaled_ball_max,
+        ) = _edge_kkt_maxima_from_diff_torch(
             diff=diff,
             dual=dual_chunk,
             radius=radius,
@@ -1551,6 +1754,12 @@ def graph_fusion_kkt_residual_from_grad_torch(
         max_edge_residual = torch.maximum(max_edge_residual, edge_max)
         max_ball_residual = torch.maximum(max_ball_residual, ball_max)
         max_radius = torch.maximum(max_radius, radius_max)
+        max_scaled_edge_residual = torch.maximum(
+            max_scaled_edge_residual, scaled_edge_max
+        )
+        max_scaled_ball_residual = torch.maximum(
+            max_scaled_ball_residual, scaled_ball_max
+        )
 
     return _graph_fusion_kkt_diagnostics_from_components_torch(
         phi=phi,
@@ -1562,6 +1771,8 @@ def graph_fusion_kkt_residual_from_grad_torch(
         max_edge_residual=max_edge_residual,
         max_ball_residual=max_ball_residual,
         max_radius=max_radius,
+        max_scaled_edge_residual=max_scaled_edge_residual,
+        max_scaled_ball_residual=max_scaled_ball_residual,
     )
 
 
@@ -2682,7 +2893,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
             audit_due = False
         if audit_due:
             kkt_audits += 1
-            edge_max, ball_max, radius_max = _edge_kkt_maxima_from_diff_torch(
+            edge_max, ball_max, radius_max, _, _ = _edge_kkt_maxima_from_diff_torch(
                 diff=edge_diff,
                 dual=actual_dual,
                 radius=radius,
@@ -2977,10 +3188,12 @@ def _solve_majorized_subproblem_alm_streaming_torch(
                     edge_u=edge_u[edge_slice],
                     edge_v=edge_v[edge_slice],
                 )
-                edge_max, ball_max, radius_max = _edge_kkt_maxima_from_diff_torch(
+                edge_max, ball_max, radius_max, _, _ = (
+                    _edge_kkt_maxima_from_diff_torch(
                     diff=edge_diff,
                     dual=float(rho) * scaled_dual[edge_slice],
                     radius=float(lambda_value) * edge_w[edge_slice],
+                    )
                 )
                 max_edge_residual = torch.maximum(max_edge_residual, edge_max)
                 max_ball_residual = torch.maximum(max_ball_residual, ball_max)

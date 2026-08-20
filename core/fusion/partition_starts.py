@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import heapq
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from collections.abc import Callable, Sequence
 
 import numpy as np
@@ -25,6 +25,7 @@ from .starts import _mutation_region_loss_grid_numpy
 from .torch_backend import (
     TorchTumorData,
     as_runtime_tensor,
+    copy_torch_tumor_data,
     mutation_region_loss_grid_torch,
     mutation_region_terms_torch,
     path_mutation_region_terms_numpy,
@@ -92,47 +93,6 @@ def _partition_work_dtype(dtype: torch.dtype) -> torch.dtype:
     return torch.float32 if dtype == torch.float16 else dtype
 
 
-def _copy_torch_tumor_data(
-    data: TorchTumorData, *, dtype: torch.dtype, device: torch.device
-) -> TorchTumorData:
-    path_likelihood = (
-        None
-        if data.path_likelihood is None
-        else replace(
-            data.path_likelihood,
-            first_scale=data.path_likelihood.first_scale.to(dtype=dtype, device=device),
-            second_scale=data.path_likelihood.second_scale.to(
-                dtype=dtype, device=device
-            ),
-            switch_fraction=data.path_likelihood.switch_fraction.to(
-                dtype=dtype, device=device
-            ),
-            log_prior=data.path_likelihood.log_prior.to(dtype=dtype, device=device),
-            valid=data.path_likelihood.valid.to(device=device),
-            legacy_major_indicator=(
-                None
-                if data.path_likelihood.legacy_major_indicator is None
-                else data.path_likelihood.legacy_major_indicator.to(device=device)
-            ),
-        )
-    )
-    return TorchTumorData(
-        alt=data.alt.to(dtype=dtype, device=device),
-        total=data.total.to(dtype=dtype, device=device),
-        nonalt=data.nonalt.to(dtype=dtype, device=device),
-        phi_upper=data.phi_upper.to(dtype=dtype, device=device),
-        ambiguous=data.ambiguous.to(device=device),
-        b_minus=data.b_minus.to(dtype=dtype, device=device),
-        b_plus=data.b_plus.to(dtype=dtype, device=device),
-        b_fixed=data.b_fixed.to(dtype=dtype, device=device),
-        count_observed=None
-        if data.count_observed is None
-        else data.count_observed.to(device=device),
-        path_likelihood=path_likelihood,
-        data_fingerprint=data.data_fingerprint,
-    )
-
-
 def _resolve_partition_runtime(
     *,
     data: TumorData,
@@ -161,7 +121,7 @@ def _resolve_partition_runtime(
             device_name=_torch_device_name(runtime_device),
             dtype=runtime_dtype,
         )
-        return runtime, _copy_torch_tumor_data(
+        return runtime, copy_torch_tumor_data(
             torch_data, dtype=runtime.dtype, device=runtime.device
         )
 
@@ -1025,17 +985,6 @@ def refine_partition_likelihood_with_trace(
     )
 
 
-def refine_partition_likelihood(
-    data: TumorData,
-    labels: np.ndarray,
-    **kwargs,
-) -> tuple[np.ndarray, PartitionRefitResult]:
-    """Backward-compatible two-value wrapper around traced CEM refinement."""
-
-    trace = refine_partition_likelihood_with_trace(data, labels, **kwargs)
-    return trace.labels, trace.refit
-
-
 @torch.no_grad()
 def partition_constrained_observed_refit_torch(
     data: TumorData,
@@ -1394,17 +1343,6 @@ def refine_partition_likelihood_torch_with_trace(
         score_before=float(score_before),
         score_after=float(score_after),
     )
-
-
-def refine_partition_likelihood_torch(
-    data: TumorData,
-    labels: np.ndarray,
-    **kwargs,
-) -> tuple[np.ndarray, PartitionRefitResult]:
-    """Backward-compatible two-value wrapper around traced Torch refinement."""
-
-    trace = refine_partition_likelihood_torch_with_trace(data, labels, **kwargs)
-    return trace.labels, trace.refit
 
 
 def _label_key(labels: np.ndarray) -> bytes:

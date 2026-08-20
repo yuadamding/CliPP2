@@ -13,6 +13,10 @@ _EXACT_OBSERVED_OBJECTIVE_GRADIENT_SCOPES = frozenset(
         "clarke_piecewise_observed_objective_subgradient",
     }
 )
+_EXACT_CERTIFICATE_SCHEMA_VERSION = 2
+_EXACT_CERTIFICATE_RESIDUAL_METHOD = (
+    "componentwise_box_cone_backward_error_v1"
+)
 
 
 def _normalize_selection_score_name(selection_score: str) -> str:
@@ -88,7 +92,13 @@ def _exact_fusion_certificate_mask(search_df: pd.DataFrame) -> np.ndarray:
         search_df["exactness_provenance_version"], errors="coerce"
     ).to_numpy(dtype=float)
     certified = (
-        (schema_version == 1.0)
+        (schema_version == float(_EXACT_CERTIFICATE_SCHEMA_VERSION))
+        & _required_text_mask(
+            search_df,
+            "certificate_residual_method",
+            _EXACT_CERTIFICATE_RESIDUAL_METHOD,
+        )
+        & _required_text_mask(search_df, "certificate_audit_dtype", "float64")
         & _required_bool_mask(search_df, "raw_kkt_eligible")
         & _required_text_mask(search_df, "estimator_role", "raw_fused_lambda_path")
         & _required_bool_mask(search_df, "objective_faithful")

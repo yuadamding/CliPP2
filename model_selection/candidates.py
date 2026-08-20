@@ -418,6 +418,68 @@ def _selection_score_diagnostics(
     }
 
 
+def _selection_refit_row(
+    *,
+    data: TumorData,
+    refit: PartitionRefitSummary,
+    score: SelectionScore,
+    cache_hit: bool,
+    raw_details: bool,
+) -> dict[str, object]:
+    diagnostics = _selection_score_diagnostics(data=data, refit=refit, score=score)
+    row: dict[str, object] = {
+        "selection_score_name": str(score.name),
+        "selection_score": float(score.value),
+        "selection_score_numerical_uncertainty": float(score.numerical_uncertainty),
+        "selection_score_lower_bound": float(score.lower_bound),
+        "selection_score_upper_bound": float(score.upper_bound),
+        "selection_loglik": float(score.loglik),
+        "selection_df": int(score.degrees_of_freedom),
+        "selection_penalty": float(score.penalty),
+        "selection_n_eff": int(score.n_eff),
+        "selection_assignment_log_evidence": float(score.assignment_log_evidence),
+        "selection_assignment_code_weight": float(score.assignment_code_weight),
+        "selection_assignment_penalty": float(score.assignment_penalty),
+        "selection_assignment_dirichlet_alpha": float(score.assignment_dirichlet_alpha),
+        "selection_assignment_model_id": str(score.assignment_model_id),
+        "selection_assignment_symmetry_mode": str(score.assignment_symmetry_mode),
+        "selection_assignment_arithmetic_uncertainty": float(
+            score.assignment_arithmetic_uncertainty
+        ),
+        "classic_bic": float(diagnostics["classic_bic"]),
+        "bic_loglik_source": str(refit.loglik_source),
+        "bic_refit_finite_candidate_found": bool(refit.finite_candidate_found),
+        "bic_refit_cache_hit": bool(cache_hit),
+        "refit_global_optimum_certified": bool(refit.global_optimum_certified),
+        "refit_global_lower_bound": float(refit.global_lower_bound),
+        "refit_global_optimality_gap": float(refit.global_optimality_gap),
+        "refit_global_certificate_method": str(refit.global_certificate_method),
+        "refit_global_certificate_intervals": int(refit.global_certificate_intervals),
+        "refit_numerically_resolved": bool(refit.refit_numerically_resolved),
+        "refit_loglik": float(refit.loglik),
+        "refit_fit_loss": float(refit.fit_loss),
+        "refit_active_df": int(refit.active_df),
+        "refit_mode": str(refit.refit_mode),
+        "refit_coordinate_count": int(refit.refit_coordinate_count),
+        "refit_finite_coordinate_count": int(refit.refit_finite_coordinate_count),
+        "refit_total_grid_points": int(refit.refit_total_grid_points),
+        "refit_max_grid_spacing": float(refit.refit_max_grid_spacing),
+        "refit_total_candidate_basins": int(refit.refit_total_candidate_basins),
+        "refit_total_refined_candidates": int(refit.refit_total_refined_candidates),
+        "refit_min_best_second_loss_gap": float(refit.refit_min_best_second_loss_gap),
+    }
+    if raw_details:
+        row.update(
+            classic_bic_depth_n=float(diagnostics["classic_bic_depth_n"]),
+            classic_bic_active_df=float(diagnostics["classic_bic_active_df"]),
+            refit_loglik_refinement_delta=float(refit.refit_loglik_refinement_delta),
+            refit_max_center_refinement_delta=float(
+                refit.refit_max_center_refinement_delta
+            ),
+        )
+    return row
+
+
 def _score_fixed_labels(
     *,
     data: TumorData,
@@ -595,11 +657,6 @@ def _evaluate_candidate(
         1e-10 * (1.0 + abs(float(fit.penalized_objective))),
         32.0 * np.finfo(np.float64).eps * (1.0 + abs(float(fit.penalized_objective))),
     )
-    score_diagnostics = _selection_score_diagnostics(
-        data=data,
-        refit=refit,
-        score=score,
-    )
     row: dict[str, float | int | str | bool] = {
         "tumor_id": data.tumor_id,
         "selection_method": selection_method,
@@ -632,50 +689,13 @@ def _evaluate_candidate(
         "candidate_pool_source": "raw_fused_lambda_path",
         "candidate_family": "raw_fusion",
         "estimator_role": str(fit.estimator_role),
-        "selection_score_name": str(score.name),
-        "selection_score": float(score.value),
-        "selection_score_numerical_uncertainty": float(score.numerical_uncertainty),
-        "selection_score_lower_bound": float(score.lower_bound),
-        "selection_score_upper_bound": float(score.upper_bound),
-        "selection_loglik": float(score.loglik),
-        "selection_df": int(score.degrees_of_freedom),
-        "selection_penalty": float(score.penalty),
-        "selection_n_eff": int(score.n_eff),
-        "selection_assignment_log_evidence": float(score.assignment_log_evidence),
-        "selection_assignment_code_weight": float(score.assignment_code_weight),
-        "selection_assignment_penalty": float(score.assignment_penalty),
-        "selection_assignment_dirichlet_alpha": float(score.assignment_dirichlet_alpha),
-        "selection_assignment_model_id": str(score.assignment_model_id),
-        "selection_assignment_symmetry_mode": str(score.assignment_symmetry_mode),
-        "selection_assignment_arithmetic_uncertainty": float(
-            score.assignment_arithmetic_uncertainty
+        **_selection_refit_row(
+            data=data,
+            refit=refit,
+            score=score,
+            cache_hit=cache_hit,
+            raw_details=True,
         ),
-        "classic_bic": float(score_diagnostics["classic_bic"]),
-        "bic_loglik_source": str(refit.loglik_source),
-        "classic_bic_depth_n": float(score_diagnostics["classic_bic_depth_n"]),
-        "classic_bic_active_df": float(score_diagnostics["classic_bic_active_df"]),
-        "bic_refit_finite_candidate_found": bool(refit.finite_candidate_found),
-        "bic_refit_cache_hit": bool(cache_hit),
-        "refit_global_optimum_certified": bool(refit.global_optimum_certified),
-        "refit_global_lower_bound": float(refit.global_lower_bound),
-        "refit_global_optimality_gap": float(refit.global_optimality_gap),
-        "refit_global_certificate_method": str(refit.global_certificate_method),
-        "refit_global_certificate_intervals": int(refit.global_certificate_intervals),
-        "refit_numerically_resolved": bool(refit.refit_numerically_resolved),
-        "refit_loglik_refinement_delta": float(refit.refit_loglik_refinement_delta),
-        "refit_max_center_refinement_delta": float(
-            refit.refit_max_center_refinement_delta
-        ),
-        "refit_coordinate_count": int(refit.refit_coordinate_count),
-        "refit_finite_coordinate_count": int(refit.refit_finite_coordinate_count),
-        "refit_total_grid_points": int(refit.refit_total_grid_points),
-        "refit_max_grid_spacing": float(refit.refit_max_grid_spacing),
-        "refit_total_candidate_basins": int(refit.refit_total_candidate_basins),
-        "refit_total_refined_candidates": int(refit.refit_total_refined_candidates),
-        "refit_min_best_second_loss_gap": float(refit.refit_min_best_second_loss_gap),
-        "refit_loglik": float(refit.loglik),
-        "refit_fit_loss": float(refit.fit_loss),
-        "refit_active_df": int(refit.active_df),
         "partition_signature": str(partition.signature),
         "partition_source": str(partition.source),
         "partition_tol": float(partition.tolerance),
@@ -708,6 +728,34 @@ def _evaluate_candidate(
         "penalty": float(penalty_value),
         "profile_penalty": float(profile_penalty_value),
         "fixed_objective_kkt_residual": float(fit.fixed_objective_kkt_residual),
+        "working_precision_kkt_residual": float(
+            fit.working_precision_kkt_residual
+        ),
+        "outer_backward_error_stationarity_residual": float(
+            fit.outer_backward_error_stationarity_residual
+        ),
+        "outer_backward_error_edge_subgradient_residual": float(
+            fit.outer_backward_error_edge_subgradient_residual
+        ),
+        "outer_backward_error_dual_ball_residual": float(
+            fit.outer_backward_error_dual_ball_residual
+        ),
+        "certificate_residual_method": str(
+            fit.exactness_provenance.residual_method
+            if fit.exactness_provenance is not None
+            else "unknown"
+        ),
+        "working_dtype": str(fit.working_dtype),
+        "certificate_audit_dtype": str(fit.certificate_audit_dtype),
+        "precision_polish_applied": bool(fit.precision_polish_applied),
+        "precision_polish_max_abs_phi_delta": float(
+            fit.precision_polish_max_abs_phi_delta
+        ),
+        "directional_kink_admissible": bool(
+            fit.exactness_provenance.directional_kink_admissible
+            if fit.exactness_provenance is not None
+            else False
+        ),
         "outer_stationarity_residual": float(fit.outer_stationarity_residual),
         "outer_projected_stationarity_norm": float(
             fit.outer_projected_stationarity_norm
@@ -895,11 +943,6 @@ def evaluate_direct_partition_candidate(
         computation_profile=str(profile.name),
     )
     validate_candidate_identity(candidate)
-    score_diagnostics = _selection_score_diagnostics(
-        data=data,
-        refit=refit,
-        score=score,
-    )
     row: dict[str, object] = {
         "_candidate_id": int(candidate_id),
         "tumor_id": str(data.tumor_id),
@@ -945,45 +988,13 @@ def evaluate_direct_partition_candidate(
         "partition_diameter_exact": False,
         "partition_max_diameter": float("nan"),
         "partition_certification_failure_reason": "not_applicable_direct_partition",
-        "selection_score_name": str(score.name),
-        "selection_score": float(score.value),
-        "selection_score_numerical_uncertainty": float(score.numerical_uncertainty),
-        "selection_score_lower_bound": float(score.lower_bound),
-        "selection_score_upper_bound": float(score.upper_bound),
-        "selection_loglik": float(score.loglik),
-        "selection_df": int(score.degrees_of_freedom),
-        "selection_penalty": float(score.penalty),
-        "selection_n_eff": int(score.n_eff),
-        "selection_assignment_log_evidence": float(score.assignment_log_evidence),
-        "selection_assignment_code_weight": float(score.assignment_code_weight),
-        "selection_assignment_penalty": float(score.assignment_penalty),
-        "selection_assignment_dirichlet_alpha": float(score.assignment_dirichlet_alpha),
-        "selection_assignment_model_id": str(score.assignment_model_id),
-        "selection_assignment_symmetry_mode": str(score.assignment_symmetry_mode),
-        "selection_assignment_arithmetic_uncertainty": float(
-            score.assignment_arithmetic_uncertainty
+        **_selection_refit_row(
+            data=data,
+            refit=refit,
+            score=score,
+            cache_hit=cache_hit,
+            raw_details=False,
         ),
-        "classic_bic": float(score_diagnostics["classic_bic"]),
-        "bic_loglik_source": str(refit.loglik_source),
-        "bic_refit_finite_candidate_found": bool(refit.finite_candidate_found),
-        "bic_refit_cache_hit": bool(cache_hit),
-        "refit_global_optimum_certified": bool(refit.global_optimum_certified),
-        "refit_global_lower_bound": float(refit.global_lower_bound),
-        "refit_global_optimality_gap": float(refit.global_optimality_gap),
-        "refit_global_certificate_method": str(refit.global_certificate_method),
-        "refit_global_certificate_intervals": int(refit.global_certificate_intervals),
-        "refit_numerically_resolved": bool(refit.refit_numerically_resolved),
-        "refit_loglik": float(refit.loglik),
-        "refit_fit_loss": float(refit.fit_loss),
-        "refit_active_df": int(refit.active_df),
-        "refit_mode": str(refit.refit_mode),
-        "refit_coordinate_count": int(refit.refit_coordinate_count),
-        "refit_finite_coordinate_count": int(refit.refit_finite_coordinate_count),
-        "refit_total_grid_points": int(refit.refit_total_grid_points),
-        "refit_max_grid_spacing": float(refit.refit_max_grid_spacing),
-        "refit_total_candidate_basins": int(refit.refit_total_candidate_basins),
-        "refit_total_refined_candidates": int(refit.refit_total_refined_candidates),
-        "refit_min_best_second_loss_gap": float(refit.refit_min_best_second_loss_gap),
         "eligible_for_selection": bool(candidate.eligible_for_selection),
         "ineligibility_reason": str(candidate.ineligibility_reason),
         "converged": bool(refit.finite_candidate_found),
