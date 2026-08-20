@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import heapq
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from collections.abc import Callable, Sequence
 
 import numpy as np
@@ -17,9 +17,9 @@ from ..bic import (
     compute_partition_dirichlet_score,
     effective_bic_mutation_region_count,
 )
-from .refit import (
+from ..scalar import (
     PartitionRefitResult,
-    _canonical_labels,
+    canonical_partition_labels as _canonical_labels,
     partition_constrained_observed_refit,
 )
 from .torch_backend import (
@@ -49,20 +49,17 @@ class PartitionCandidate:
     fit_loss: float
     bic: float
     finite_candidate_found: bool = True
-    diagnostics: dict[str, object] = field(default_factory=dict)
+    requested_k: int | None = None
+    component_death_count: int = 0
 
 
 @dataclass(frozen=True)
 class PartitionRefinementResult:
     labels: np.ndarray
     refit: PartitionRefitResult
-    iterations: int
-    accepted_updates: int
     initial_k: int
     final_k: int
     component_death_count: int
-    score_before: float
-    score_after: float
 
 
 def compute_partition_bic(
@@ -783,13 +780,7 @@ def refine_partition_likelihood_with_trace(
         )
         best_labels = labels.copy()
         best_refit = refit
-        score_before = score_after = float(best_score)
-    else:
-        score_before = score_after = float(refit.fit_loss)
-    iterations = 0
-    accepted_updates = 0
-    for iteration in range(max(int(max_iter), 0)):
-        iterations = int(iteration + 1)
+    for _ in range(max(int(max_iter), 0)):
         labels_key = _label_key(labels)
         if refit_key != labels_key:
             refit = refit_labels(labels)
@@ -836,13 +827,11 @@ def refine_partition_likelihood_with_trace(
             ):
                 break
             best_score = float(proposed_score)
-            score_after = float(best_score)
             best_labels = labels_next.copy()
             best_refit = proposed_refit
             refit = proposed_refit
             refit_key = _label_key(labels_next)
         labels = labels_next
-        accepted_updates += 1
     labels_key = _label_key(labels)
     if refit_key != labels_key:
         refit = refit_labels(labels)
@@ -856,18 +845,13 @@ def refine_partition_likelihood_with_trace(
     else:
         final_labels = _canonical_labels(labels)
         final_refit = refit
-        score_after = float(final_refit.fit_loss)
     final_k = int(np.unique(final_labels).size)
     return PartitionRefinementResult(
         labels=final_labels,
         refit=final_refit,
-        iterations=int(iterations),
-        accepted_updates=int(accepted_updates),
         initial_k=int(initial_k),
         final_k=int(final_k),
         component_death_count=max(int(initial_k - final_k), 0),
-        score_before=float(score_before),
-        score_after=float(score_after),
     )
 
 
@@ -1097,13 +1081,7 @@ def refine_partition_likelihood_torch_with_trace(
         )
         best_labels = labels.copy()
         best_refit = refit
-        score_before = score_after = float(best_score)
-    else:
-        score_before = score_after = float(refit.fit_loss)
-    iterations = 0
-    accepted_updates = 0
-    for iteration in range(max(int(max_iter), 0)):
-        iterations = int(iteration + 1)
+    for _ in range(max(int(max_iter), 0)):
         labels_key = _label_key(labels)
         if refit_key != labels_key:
             refit = refit_labels(labels)
@@ -1161,13 +1139,11 @@ def refine_partition_likelihood_torch_with_trace(
             ):
                 break
             best_score = float(proposed_score)
-            score_after = float(best_score)
             best_labels = labels_next.copy()
             best_refit = proposed_refit
             refit = proposed_refit
             refit_key = _label_key(labels_next)
         labels = labels_next
-        accepted_updates += 1
     labels_key = _label_key(labels)
     if refit_key != labels_key:
         refit = refit_labels(labels)
@@ -1181,18 +1157,13 @@ def refine_partition_likelihood_torch_with_trace(
     else:
         final_labels = _canonical_labels(labels)
         final_refit = refit
-        score_after = float(final_refit.fit_loss)
     final_k = int(np.unique(final_labels).size)
     return PartitionRefinementResult(
         labels=final_labels,
         refit=final_refit,
-        iterations=int(iterations),
-        accepted_updates=int(accepted_updates),
         initial_k=int(initial_k),
         final_k=int(final_k),
         component_death_count=max(int(initial_k - final_k), 0),
-        score_before=float(score_before),
-        score_after=float(score_after),
     )
 
 
@@ -1387,30 +1358,10 @@ def generate_likelihood_partition_starts(
                     fit_loss=float(refit.fit_loss),
                     bic=float(bic),
                     finite_candidate_found=bool(refit.finite_candidate_found),
-                    diagnostics={
-                        "requested_K": float(requested_k),
-                        "pre_refinement_signature": _label_key(labels0).hex(),
-                        "cem_iterations": float(0 if trace is None else trace.iterations),
-                        "cem_accepted_updates": float(
-                            0 if trace is None else trace.accepted_updates
-                        ),
-                        "initial_K": float(
-                            int(np.unique(labels0).size)
-                            if trace is None
-                            else trace.initial_k
-                        ),
-                        "final_K": float(candidate_k),
-                        "component_death_count": float(
-                            0 if trace is None else trace.component_death_count
-                        ),
-                        "refinement_score_before": float(
-                            refit.fit_loss if trace is None else trace.score_before
-                        ),
-                        "refinement_score_after": float(
-                            refit.fit_loss if trace is None else trace.score_after
-                        ),
-                        "deterministic_generation": 1.0,
-                    },
+                    requested_k=int(requested_k),
+                    component_death_count=(
+                        0 if trace is None else int(trace.component_death_count)
+                    ),
                 )
             )
 

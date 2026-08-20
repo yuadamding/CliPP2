@@ -786,12 +786,6 @@ def graph_fusion_kkt_diagnostics_from_components_torch(
             upper=upper,
         ).item()
     )
-    lower_active = phi <= lower + float(atol)
-    upper_active = phi >= upper - float(atol)
-    frozen = upper <= lower + float(atol)
-    interior = ~(lower_active | upper_active | frozen)
-    diagnostic_upper_active = upper_active & ~frozen
-    diagnostic_lower_active = lower_active & ~upper_active & ~frozen
     box_violation = torch.maximum(
         torch.clamp(lower - phi, min=0.0),
         torch.clamp(phi - upper, min=0.0),
@@ -848,18 +842,8 @@ def graph_fusion_kkt_diagnostics_from_components_torch(
 
     return {
         "stationarity_residual": stationarity_residual,
-        "projected_stationarity_residual": stationarity_residual,
-        "projected_stationarity_norm": projected_stationarity_norm,
-        "stationarity_normalizer": stationarity_normalizer,
-        "smooth_gradient_norm": smooth_gradient_norm,
-        "fusion_adjustment_norm": fusion_adjustment_norm,
         "edge_subgradient_residual": edge_subgradient_residual,
         "dual_ball_residual": dual_ball_residual,
-        "box_primal_violation": box_primal_violation,
-        "num_interior_coordinates": int(torch.sum(interior).item()),
-        "num_lower_active_coordinates": int(torch.sum(diagnostic_lower_active).item()),
-        "num_upper_active_coordinates": int(torch.sum(diagnostic_upper_active).item()),
-        "num_frozen_coordinates": int(torch.sum(frozen).item()),
         "box_residual": float(box_residual),
         "kkt_residual": max(
             stationarity_residual,

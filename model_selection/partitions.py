@@ -6,7 +6,7 @@ import numpy as np
 
 from ..core.fusion.types import RawFit
 from ..core.fusion.partition_starts import PartitionCandidate
-from ..core.fusion.refit import _canonical_labels as _canonical_partition_labels
+from ..core.scalar import canonical_partition_labels as _canonical_partition_labels
 from ..core.fusion.types import (
     CompressedEdgeCertificate,
     DenseEdgeCertificate,
@@ -19,10 +19,7 @@ from .types import FusionPartition
 
 
 def _partition_candidate_requested_k(candidate: PartitionCandidate) -> int:
-    value = candidate.diagnostics.get("requested_K", candidate.K)
-    if not np.isfinite(float(value)):
-        return int(candidate.K)
-    return int(round(float(value)))
+    return int(candidate.K if candidate.requested_k is None else candidate.requested_k)
 
 
 def _best_partition_candidate(
@@ -316,8 +313,6 @@ def extract_certified_fusion_partition(
         raise ValueError("fit.phi must be a mutation-by-region matrix.")
 
     labels = _diameter_constrained_labels(phi, tolerance=tol)
-    source = "tolerance_defined_primal"
-
     if labels.shape != (phi.shape[0],):
         raise ValueError("Partition labels do not match the raw fit mutation count.")
     diameters = _exact_partition_diameters(phi, labels)
@@ -359,15 +354,8 @@ def extract_certified_fusion_partition(
     return FusionPartition(
         labels=labels.astype(np.int64, copy=False),
         signature=_partition_signature(labels, mutation_ids),
-        n_clusters=int(np.unique(labels).size),
-        tolerance=tol,
-        max_diameter=max_diameter,
-        diameter_exact=True,
         certified=certified,
-        source=source,
-        maximal=bool(within_ok and not cross_close),
-        cross_close_edge_found=bool(cross_close),
-        certificate_graph_hash_matches=bool(certificate_graph_hash_matches),
+        source="tolerance_defined_primal",
         certification_failure_reason=str(failure_reason),
         mutation_ids=() if mutation_ids is None else tuple(mutation_ids),
     )
@@ -435,13 +423,11 @@ def extract_connected_component_partition(
     labels = _canonical_partition_labels(
         np.asarray([find(index) for index in range(num_mutations)], dtype=np.int64)
     )
-    diameters = _exact_partition_diameters(phi, labels)
-    max_diameter = float(np.max(diameters)) if diameters.size else 0.0
-    state = getattr(fit, "solver_state", None)
-    certificate = getattr(state, "certificate", None)
+    state = fit.state
+    certificate = None if state is None else state.certificate
     certificate_graph_hash_matches = True
     if isinstance(certificate, (CompressedEdgeCertificate, DenseEdgeCertificate)):
-        expected_graph_hash = str(getattr(fit, "original_graph_hash", ""))
+        expected_graph_hash = str(fit.provenance.original_graph_hash)
         certificate_graph_hash_matches = bool(
             expected_graph_hash and str(certificate.graph_hash) == expected_graph_hash
         )
@@ -458,23 +444,8 @@ def extract_connected_component_partition(
     return FusionPartition(
         labels=labels,
         signature=_partition_signature(labels, mutation_ids),
-        n_clusters=int(np.unique(labels).size),
-        tolerance=tol,
-        max_diameter=max_diameter,
-        diameter_exact=True,
         certified=certified,
         source="legacy_connected_components",
-        maximal=bool(certified),
-        cross_close_edge_found=False,
-        certificate_graph_hash_matches=bool(certificate_graph_hash_matches),
         certification_failure_reason=str(failure_reason),
         mutation_ids=() if mutation_ids is None else tuple(mutation_ids),
     )
-
-
-def _cluster_sizes_text(labels: np.ndarray) -> str:
-    labels = np.asarray(labels, dtype=np.int64)
-    if labels.size == 0:
-        return ""
-    counts = np.bincount(labels, minlength=int(labels.max()) + 1)
-    return ",".join(str(int(value)) for value in counts.tolist())

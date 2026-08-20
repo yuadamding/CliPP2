@@ -74,8 +74,6 @@ def raw_candidate_has_exact_fusion_certificate(
         and residual_method == _EXACT_CERTIFICATE_RESIDUAL_METHOD
         and str(certificate.audit_dtype) == "float64"
         and bool(certificate.admissible)
-        and str(certificate.estimator_role) == "raw_fused_lambda_path"
-        and bool(certificate.objective_faithful)
         and bool(str(provenance.objective_spec_hash).strip())
         and bool(str(provenance.original_graph_hash).strip())
         and bool(str(provenance.certificate_problem_hash).strip())
@@ -275,17 +273,6 @@ def select_candidate_records(
         )
 
     selected = min(optimal, key=final_representative_key)
-    eligible_ids = frozenset(int(record.candidate_id) for record in eligible)
-    optimal_ids = frozenset(int(record.candidate_id) for record in optimal)
-    selected_score = float(selected.score.value)
-    optimizer_limited_ids = frozenset(
-        int(record.candidate_id)
-        for record in records
-        if int(record.candidate_id) not in eligible_ids
-        and _candidate_is_provisionally_comparable(record)
-        and _score_strictly_better(float(record.score.value), selected_score)
-    )
-
     # Model choice remains representative-only, while the reported lambda
     # interval spans every admitted raw fit that reconstructs the selected
     # immutable partition.
@@ -324,31 +311,36 @@ def select_candidate_records(
     )
     return CandidateSelectionDecision(
         selected=selected,
-        representative_ids=representative_ids,
-        eligible_ids=eligible_ids,
-        optimal_ids=optimal_ids,
-        optimizer_limited_ids=optimizer_limited_ids,
+        num_eligible=len(eligible),
         selected_lambda_left=selected_lambda_left,
         selected_lambda_right=selected_lambda_right,
         selection_hits_lower_boundary=bool(lower_hit),
         selection_hits_upper_boundary=bool(upper_hit),
         selection_boundary_unresolved=bool(boundary_unresolved),
     )
-
-
-def _candidate_is_provisionally_comparable(record: CandidateRecord) -> bool:
-    if not np.isfinite(float(record.score.value)):
-        return False
-    if record.mm_consistency_violations > 0:
-        return False
-    if record.family == "direct_partition":
-        return True
-    objective = record.penalized_objective
-    return bool(objective is not None and np.isfinite(float(objective)))
-
-
 def _canonical_lambda(value: float) -> float:
     return float(np.round(float(value), 12))
+
+
+def _prefer_fit_candidate(candidate: RawFit, incumbent: RawFit | None) -> bool:
+    if incumbent is None:
+        return True
+    certified = candidate.certificate.admissible
+    if certified != incumbent.certificate.admissible:
+        return bool(certified)
+    candidate_values = (candidate.objective.total, candidate.certificate.components.residual)
+    incumbent_values = (incumbent.objective.total, incumbent.certificate.components.residual)
+    for candidate_value, incumbent_value in zip(
+        candidate_values, incumbent_values, strict=True
+    ):
+        candidate_finite, incumbent_finite = np.isfinite(
+            (candidate_value, incumbent_value)
+        )
+        if candidate_finite != incumbent_finite:
+            return bool(candidate_finite)
+        if candidate_finite and abs(candidate_value - incumbent_value) > 1e-8:
+            return bool(candidate_value < incumbent_value)
+    return False
 
 
 def _sorted_unique_lambdas(values: list[float] | np.ndarray) -> list[float]:
@@ -359,55 +351,9 @@ def _sorted_unique_lambdas(values: list[float] | np.ndarray) -> list[float]:
     return [float(value) for value in np.unique(np.round(np.sort(array), 12))]
 
 
-def _prefer_fit_candidate(candidate: RawFit, incumbent: RawFit | None) -> bool:
-    if incumbent is None:
-        return True
-    if candidate.certificate.admissible and not incumbent.certificate.admissible:
-        return True
-    if candidate.certificate.admissible != incumbent.certificate.admissible:
-        return False
-    candidate_objective = float(candidate.objective.total)
-    incumbent_objective = float(incumbent.objective.total)
-    if (
-        np.isfinite(candidate_objective)
-        and np.isfinite(incumbent_objective)
-        and abs(candidate_objective - incumbent_objective) > 1e-8
-    ):
-        return bool(candidate_objective < incumbent_objective)
-    if np.isfinite(candidate_objective) and not np.isfinite(incumbent_objective):
-        return True
-    if not np.isfinite(candidate_objective) and np.isfinite(incumbent_objective):
-        return False
-    candidate_kkt = float(candidate.certificate.components.residual)
-    incumbent_kkt = float(incumbent.certificate.components.residual)
-    if (
-        np.isfinite(candidate_kkt)
-        and np.isfinite(incumbent_kkt)
-        and abs(candidate_kkt - incumbent_kkt) > 1e-8
-    ):
-        return bool(candidate_kkt < incumbent_kkt)
-    if np.isfinite(candidate_kkt) and not np.isfinite(incumbent_kkt):
-        return True
-    return False
-
-
 def _effective_bic_partition_tol(options: FitConfig) -> float:
     value = options.selection.partition_tolerance
     return float(max(float(value), 1e-12))
-
-
-def _profile_penalty_from_fit(fit: RawFit) -> tuple[float, float]:
-    penalty = max(float(fit.objective.total + fit.objective.loglik), 0.0)
-    if float(fit.provenance.lambda_value) > 0.0:
-        return penalty, float(penalty / float(fit.provenance.lambda_value))
-    return penalty, float("nan")
-
-
-def _score_strictly_better(score: float, reference: float) -> bool:
-    if not np.isfinite(score) or not np.isfinite(reference):
-        return False
-    margin = 1e-8 * (1.0 + abs(float(reference)))
-    return bool(float(score) < float(reference) - margin)
 
 
 def _lambda_boundary_flags(

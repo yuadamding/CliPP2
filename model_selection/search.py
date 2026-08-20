@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from time import perf_counter
-
 import numpy as np
 
 from ..config import FitConfig
@@ -36,10 +34,7 @@ from ..model_selection.online_lambda import (
     OnlineLambdaController,
     OnlineLambdaObservation,
 )
-from ..model_selection.partition_initializer import (
-    PartitionInitializerPool,
-    generate_partition_initializer_pool,
-)
+from ..model_selection.partition_initializer import generate_partition_initializer_pool
 from ..model_selection.partitions import (
     _best_partition_candidate,
 )
@@ -62,7 +57,6 @@ from ..model_selection.proposals import (
 from ..model_selection.scoring import (
     _canonical_lambda,
     _prefer_fit_candidate,
-    candidate_representative_ids,
     raw_candidate_has_exact_fusion_certificate,
     select_candidate_records,
 )
@@ -276,12 +270,6 @@ def _raw_reference_failure_diagnostics(
     )
 
 
-def _candidate_record_representatives(records: list[CandidateRecord]) -> set[int]:
-    """Runner-facade compatibility for the typed representative selector."""
-
-    return set(candidate_representative_ids(records))
-
-
 def _select_raw_reference(
     records: list[CandidateRecord],
     *,
@@ -391,17 +379,6 @@ def _assemble_selection_result(
     selected_model = SelectedModel(
         raw_reference=raw_reference,
         partition_candidate=selected_candidate,
-        selected_partition_signature=str(selected_candidate.partition.signature),
-        selected_candidate_family=(
-            "raw_fusion" if selected_is_raw else "direct_partition"
-        ),
-        selected_lambda=(float(selected_lambda) if selected_is_raw else None),
-        selected_partition_left_lambda=(
-            decision.selected_lambda_left if selected_is_raw else None
-        ),
-        selected_partition_right_lambda=(
-            decision.selected_lambda_right if selected_is_raw else None
-        ),
         partition_parent_raw=partition_parent_raw,
     )
     ordered_records = sorted(
@@ -415,14 +392,6 @@ def _assemble_selection_result(
     search = tuple(
         SearchCandidate(
             record=record,
-            signature_representative=(
-                int(record.candidate_id) in decision.representative_ids
-            ),
-            selection_eligible=int(record.candidate_id) in decision.eligible_ids,
-            optimizer_limited=(
-                int(record.candidate_id) in decision.optimizer_limited_ids
-            ),
-            selection_optimal=int(record.candidate_id) in decision.optimal_ids,
             selected=int(record.candidate_id) == int(selected_record.candidate_id),
         )
         for record in ordered_records
@@ -440,7 +409,7 @@ def _assemble_selection_result(
         selected_lambda_representative=(
             None if selected_lambda is None else float(selected_lambda)
         ),
-        num_candidates_certified=int(len(decision.eligible_ids)),
+        num_candidates_certified=int(decision.num_eligible),
         selected_kkt_residual=selected_kkt_residual,
         ward_candidate_pool_complete=bool(ward_candidate_pool_complete),
         raw_lambda_path_resolved=bool(adaptive_search_global_optimum_certified),
@@ -490,7 +459,6 @@ def _partition_guided_admm_selection(
     pilot_phi: StartArray = pilot_context.exact_pilot
     pilot_runtime = pilot_context.runtime
     pilot_torch_data = torch_data_from_context(pilot_context)
-    curvature_start = perf_counter()
     guide_curvature = observed_curvature_at_pilot_torch(
         data,
         pilot_phi,
@@ -500,7 +468,6 @@ def _partition_guided_admm_selection(
         device=pilot_runtime.device,
         dtype=pilot_runtime.dtype,
     )
-    guide_curvature_elapsed = float(perf_counter() - curvature_start)
     initializer_pool = generate_partition_initializer_pool(
         data=data,
         pilot_phi=pilot_phi,
@@ -510,9 +477,8 @@ def _partition_guided_admm_selection(
         torch_data=pilot_torch_data,
         rescore_candidates=_rescore_partition_candidates,
         curvature=guide_curvature,
-        curvature_elapsed_seconds=float(guide_curvature_elapsed),
     )
-    guide = _best_partition_candidate(list(initializer_pool.candidates))
+    guide = _best_partition_candidate(list(initializer_pool))
     if guide is None:
         raise RuntimeError(
             "No finite active-score partition initializer was available for tumor "
@@ -957,7 +923,6 @@ def _partition_guided_admm_selection(
                 attempts_by_lambda.setdefault(lambda_key, []).append(seed_fit)
                 mathematically_certified = bool(
                     float(seed_fit.provenance.lambda_value) > 0.0
-                    and seed_fit.certificate.objective_faithful
                     and seed_fit.certificate.certified
                     and seed_fit.certificate.admissible
                 )
@@ -1013,8 +978,6 @@ def _partition_guided_admm_selection(
                 trace=CandidateTrace(
                     search_round=int(next_step),
                     search_phase=str(proposal.phase),
-                    lambda_proposal_reason=str(proposal.reason),
-                    lambda_retry_number=int(proposal.retry_number),
                     start_source=str(lambda_start_source),
                     start_value=float(lambda_start_value),
                     breakpoint_escape_changed_count=int(
@@ -1085,11 +1048,10 @@ def _partition_guided_admm_selection(
                 PartitionCandidate,
                 str,
                 CandidateRecord | None,
-                PartitionInitializerPool,
             ]
         ] = [
-            (proposal, "pilot", None, initializer_pool)
-            for proposal in initializer_pool.candidates
+            (proposal, "pilot", None)
+            for proposal in initializer_pool
         ]
         config = selection_contract.partition_config
         if config.include_final_phi_ladder and config.final_phi_ladder_kmax > 0:
@@ -1133,11 +1095,11 @@ def _partition_guided_admm_selection(
                     enable_refinement=False,
                 )
                 direct_proposals.extend(
-                    (proposal, "final_phi", parent_record, final_pool)
-                    for proposal in final_pool.candidates
+                    (proposal, "final_phi", parent_record)
+                    for proposal in final_pool
                 )
 
-        for proposal, stage, parent_record, proposal_pool in direct_proposals:
+        for proposal, stage, parent_record in direct_proposals:
             parent_candidate = (
                 None if parent_record is None else parent_record.candidate
             )
@@ -1166,7 +1128,6 @@ def _partition_guided_admm_selection(
                     if parent_raw is None
                     else _pilot_matrix_hash(parent_raw.raw_fit.phi)
                 ),
-                generation_contract_id=selection_contract.contract_id,
                 refit_cache=bic_refit_cache,
             )
             result_entries.append(

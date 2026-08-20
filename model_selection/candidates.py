@@ -4,7 +4,6 @@ from dataclasses import dataclass, replace
 import numpy as np
 
 from ..core.bic import (
-    DIRICHLET_EXACT_PARTITION_MODEL_ID,
     cluster_sizes_from_labels,
     compute_dirichlet_exact_partition_log_mass,
     fixed_partition_bic,
@@ -14,9 +13,9 @@ from ..config import FitConfig
 from ..core.model import fit_fixed_objective
 from ..core.fusion.types import RawFit
 from ..core.fusion.partition_starts import PartitionCandidate
-from ..core.fusion.refit import (
+from ..core.scalar import (
     PartitionRefitResult,
-    _canonical_labels as _canonical_partition_labels,
+    canonical_partition_labels as _canonical_partition_labels,
     partition_constrained_observed_refit,
 )
 from ..core.fusion.types import SolverState
@@ -26,7 +25,6 @@ from .partitions import (
     extract_certified_fusion_partition,
     extract_connected_component_partition,
 )
-from .contracts import get_selection_contract
 from .scoring import (
     _effective_bic_partition_tol,
     _normalize_selection_score_name,
@@ -73,34 +71,11 @@ def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None
         atol=score_tolerance,
     ):
         raise AssertionError("Score likelihood differs from stored refit likelihood.")
-    if int(score.degrees_of_freedom) != int(refit.nominal_df):
-        raise AssertionError("Score and refit degrees of freedom differ.")
     expected_bic_penalty = float(score.degrees_of_freedom) * np.log(
         max(int(score.n_eff), 1)
     )
-    dirichlet_score = bool(
-        str(score.assignment_model_id) == DIRICHLET_EXACT_PARTITION_MODEL_ID
-        or score.name
-        in {
-            "fixed_partition_dirichlet_score",
-        }
-    )
+    dirichlet_score = score.name == "fixed_partition_dirichlet_score"
     if dirichlet_score:
-        contract = get_selection_contract(score.selection_contract_id)
-        expected_weight = float(contract.partition_config.classification_code_weight)
-        expected_alpha = float(contract.partition_config.classification_alpha)
-        if not np.isclose(
-            float(score.assignment_code_weight), expected_weight, rtol=0.0, atol=0.0
-        ):
-            raise AssertionError("Dirichlet code weight differs from its contract.")
-        if not np.isclose(
-            float(score.assignment_dirichlet_alpha), expected_alpha, rtol=0.0, atol=0.0
-        ):
-            raise AssertionError("Dirichlet alpha differs from its contract.")
-        if str(score.assignment_model_id) != DIRICHLET_EXACT_PARTITION_MODEL_ID:
-            raise AssertionError("Dirichlet assignment-model provenance is missing.")
-        if str(score.assignment_symmetry_mode) != "all_blocks_exchangeable":
-            raise AssertionError("Dirichlet partition symmetry is inconsistent.")
         expected_log_evidence = compute_dirichlet_exact_partition_log_mass(
             cluster_sizes_from_labels(partition.labels),
             alpha=float(score.assignment_dirichlet_alpha),
@@ -151,21 +126,14 @@ def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None
         float(score.value), expected_score, rtol=0.0, atol=score_tolerance
     ):
         raise AssertionError("Stored score is not reconstructible.")
-    strict = str(candidate.computation_profile) == "strict"
     minimum_uncertainty = 2.0 * max(float(refit.global_optimality_gap), 0.0)
     if (
-        strict
+        refit.global_optimum_certified
         and float(score.numerical_uncertainty) + score_tolerance < minimum_uncertainty
     ):
         raise AssertionError(
             "Score uncertainty does not cover the refit certificate gap."
         )
-    if (
-        strict
-        and candidate.eligible_for_selection
-        and not refit.global_optimum_certified
-    ):
-        raise AssertionError("Selectable BIC requires a globally certified refit.")
     expected_phi = np.asarray(refit.cluster_centers)[np.asarray(refit.labels)]
     if not np.allclose(np.asarray(refit.phi), expected_phi, rtol=0.0, atol=1e-12):
         raise AssertionError("Refit phi does not match centers indexed by labels.")
@@ -175,8 +143,6 @@ def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None
         ):
             raise AssertionError("Selectable raw candidates require both certificates.")
     elif isinstance(candidate, DirectPartitionCandidate):
-        if not candidate.partition.deterministic_generation:
-            raise AssertionError("Direct partition generation is not deterministic.")
         if candidate.partition.mutation_ids != tuple(
             str(value) for value in partition.mutation_ids
         ):
@@ -198,10 +164,6 @@ def _candidate_ineligibility_reason(
             raise ValueError("Raw-fusion eligibility requires its raw fit.")
         if float(raw_fit.provenance.lambda_value) <= 0.0:
             return "nonpositive_lambda"
-        if str(raw_fit.certificate.estimator_role) != "raw_fused_lambda_path":
-            return "not_raw_fused_lambda_path"
-        if not bool(raw_fit.certificate.objective_faithful):
-            return "raw_objective_not_faithful"
         if not bool(raw_fit.certificate.certified) or not bool(
             raw_fit.certificate.admissible
         ):
@@ -213,8 +175,6 @@ def _candidate_ineligibility_reason(
             raise ValueError("Direct-partition eligibility cannot inherit a raw fit.")
         if partition.n_clusters < 1:
             return "empty_partition"
-        if not partition.deterministic_generation:
-            return "nondeterministic_partition_generation"
     if not refit.finite_candidate_found:
         return "fixed_partition_refit_nonfinite"
     resolved = (
@@ -232,8 +192,6 @@ def _candidate_ineligibility_reason(
 @dataclass(frozen=True)
 class PartitionRefitCacheEntry:
     result: PartitionRefitResult
-    loglik_refinement_delta: float
-    max_center_refinement_delta: float
     numerically_resolved: bool
 
 
@@ -243,7 +201,6 @@ class PartitionEvaluation:
 
     refit: PartitionRefitSummary
     score: SelectionScore
-    cache_hit: bool
 
 
 def _likelihood_model_id(data: TumorData) -> str:
@@ -279,7 +236,7 @@ def _fixed_labels_refit(
     partition_signature: str,
     selection_options: FitConfig,
     cache: dict[object, PartitionRefitCacheEntry] | None,
-) -> tuple[PartitionRefitCacheEntry, bool]:
+) -> PartitionRefitCacheEntry:
     profile = selection_options.computation_profile
     refit_config = selection_options.selection.refit
     refit_spec_key = _selection_refit_cache_key(
@@ -288,7 +245,7 @@ def _fixed_labels_refit(
         selection_options=selection_options,
     )
     if cache is not None and refit_spec_key in cache:
-        return cache[refit_spec_key], True
+        return cache[refit_spec_key]
 
     kwargs = dict(
         major_prior=float(selection_options.major_prior),
@@ -305,7 +262,6 @@ def _fixed_labels_refit(
         **kwargs,
     )
     loglik_delta = float(refined.global_optimality_gap)
-    center_delta = 0.0
     loglik_tolerance = max(
         float(refit_config.tolerance)
         * (1.0 + abs(float(refined.loglik))),
@@ -315,7 +271,6 @@ def _fixed_labels_refit(
         refined.finite_candidate_found
         and int(refined.refit_finite_coordinate_count)
         == int(refined.refit_coordinate_count)
-        and np.isfinite(center_delta)
         and (
             (
                 refined.global_optimum_certified
@@ -328,20 +283,17 @@ def _fixed_labels_refit(
     )
     cached = PartitionRefitCacheEntry(
         result=refined,
-        loglik_refinement_delta=float(loglik_delta),
-        max_center_refinement_delta=float(center_delta),
         numerically_resolved=numerically_resolved,
     )
     if cache is not None:
         cache[refit_spec_key] = cached
-    return cached, False
+    return cached
 
 
 def _build_refit_summary(
     refit: PartitionRefitResult,
     *,
     partition_signature: str,
-    nominal_df: int,
     resolution: PartitionRefitCacheEntry,
 ) -> PartitionRefitSummary:
     return PartitionRefitSummary(
@@ -350,26 +302,12 @@ def _build_refit_summary(
         phi=np.asarray(refit.phi, dtype=np.float64).copy(),
         cluster_centers=np.asarray(refit.cluster_centers, dtype=np.float64).copy(),
         loglik=float(refit.loglik),
-        fit_loss=float(refit.fit_loss),
-        nominal_df=int(nominal_df),
-        active_df=int(refit.active_degrees_of_freedom),
         finite_candidate_found=bool(refit.finite_candidate_found),
         global_optimum_certified=bool(refit.global_optimum_certified),
-        loglik_source=str(refit.loglik_source),
         refit_numerically_resolved=bool(resolution.numerically_resolved),
-        refit_loglik_refinement_delta=float(resolution.loglik_refinement_delta),
-        refit_max_center_refinement_delta=float(resolution.max_center_refinement_delta),
-        refit_coordinate_count=int(refit.refit_coordinate_count),
-        refit_finite_coordinate_count=int(refit.refit_finite_coordinate_count),
-        refit_total_grid_points=int(refit.refit_total_grid_points),
-        refit_max_grid_spacing=float(refit.refit_max_grid_spacing),
-        refit_total_candidate_basins=int(refit.refit_total_candidate_basins),
-        refit_total_refined_candidates=int(refit.refit_total_refined_candidates),
-        refit_min_best_second_loss_gap=float(refit.refit_min_best_second_loss_gap),
         global_lower_bound=float(refit.global_lower_bound),
         global_optimality_gap=float(refit.global_optimality_gap),
         global_certificate_method=str(refit.global_certificate_method),
-        global_certificate_intervals=int(refit.global_certificate_intervals),
         refit_mode=str(refit.refit_mode),
     )
 
@@ -401,7 +339,6 @@ def _score_fixed_labels(
             if computation_profile.is_strict
             else 0.0
         ),
-        "selection_contract_id": str(selection_options.selection.contract_id),
     }
     if canonical_score_name == "fixed_partition_dirichlet_score":
         score_kwargs.update(
@@ -426,7 +363,7 @@ def evaluate_partition(
 ) -> PartitionEvaluation:
     """Evaluate raw and direct label sets through one refit/score path."""
 
-    cached_refit, cache_hit = _fixed_labels_refit(
+    cached_refit = _fixed_labels_refit(
         data=data,
         labels=partition.labels,
         partition_signature=partition.signature,
@@ -450,11 +387,9 @@ def evaluate_partition(
         refit=_build_refit_summary(
             refit_result,
             partition_signature=partition.signature,
-            nominal_df=int(score.degrees_of_freedom),
             resolution=cached_refit,
         ),
         score=score,
-        cache_hit=bool(cache_hit),
     )
 
 
@@ -531,13 +466,6 @@ def evaluate_raw_fusion_candidate(
     )
     refit = evaluation.refit
     score = evaluation.score
-    raw_objective_certified = bool(
-        float(fit.provenance.lambda_value) > 0.0
-        and str(fit.certificate.estimator_role) == "raw_fused_lambda_path"
-        and bool(fit.certificate.objective_faithful)
-        and bool(fit.certificate.certified)
-        and bool(fit.certificate.admissible)
-    )
     reason = _candidate_ineligibility_reason(
         partition=partition,
         refit=refit,
@@ -550,10 +478,8 @@ def evaluate_raw_fusion_candidate(
         partition=partition,
         refit=refit,
         score=score,
-        raw_objective_certified=raw_objective_certified,
         eligible_for_selection=reason == "none",
         ineligibility_reason=reason,
-        computation_profile=str(computation_profile.name),
     )
     validate_candidate_identity(candidate)
 
@@ -568,7 +494,6 @@ def evaluate_direct_partition_candidate(
     source: str,
     parent_raw_candidate_id: int | None,
     parent_raw_lambda: float | None,
-    generation_contract_id: str,
     refit_cache: dict[object, PartitionRefitCacheEntry] | None,
     parent_raw_phi_hash: str = "",
 ) -> DirectPartitionCandidate:
@@ -579,33 +504,14 @@ def evaluate_direct_partition_candidate(
     )
     mutation_ids = tuple(str(value) for value in data.mutation_ids)
     signature = _partition_signature(labels, mutation_ids)
-    n_clusters = int(np.unique(labels).size)
-    requested_k_value = proposal.diagnostics.get("requested_K", proposal.K)
-    requested_k = int(round(float(requested_k_value)))
     partition = DirectPartition(
         labels=labels,
         signature=signature,
-        n_clusters=n_clusters,
         source=source,
-        requested_k=requested_k,
         mutation_ids=mutation_ids,
-        generation_contract_id=str(generation_contract_id),
         parent_raw_candidate_id=parent_raw_candidate_id,
         parent_raw_lambda=parent_raw_lambda,
         parent_raw_phi_hash=str(parent_raw_phi_hash),
-        cem_iterations=int(proposal.diagnostics.get("cem_iterations", 0.0)),
-        component_death_count=int(
-            proposal.diagnostics.get("component_death_count", 0.0)
-        ),
-        refinement_score_before=float(
-            proposal.diagnostics.get("refinement_score_before", np.nan)
-        ),
-        refinement_score_after=float(
-            proposal.diagnostics.get("refinement_score_after", np.nan)
-        ),
-        deterministic_generation=bool(
-            proposal.diagnostics.get("deterministic_generation", 1.0)
-        ),
     )
     evaluation = evaluate_partition(
         data=data,
@@ -629,15 +535,12 @@ def evaluate_direct_partition_candidate(
         score=score,
         eligible_for_selection=reason == "none",
         ineligibility_reason=reason,
-        computation_profile=str(profile.name),
     )
     validate_candidate_identity(candidate)
     return candidate
 
 
 __all__ = [
-    "_fixed_labels_refit",
-    "_selection_refit_cache_key",
     "PartitionEvaluation",
     "PartitionRefitCacheEntry",
     "evaluate_direct_partition_candidate",

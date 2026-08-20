@@ -99,18 +99,8 @@ class KKTDiagnostics:
     """Backend-neutral normalized graph-fusion KKT diagnostics."""
 
     stationarity_residual: float
-    projected_stationarity_residual: float
-    projected_stationarity_norm: float
-    stationarity_normalizer: float
-    smooth_gradient_norm: float
-    fusion_adjustment_norm: float
     edge_subgradient_residual: float
     dual_ball_residual: float
-    box_primal_violation: float
-    num_interior_coordinates: int
-    num_lower_active_coordinates: int
-    num_upper_active_coordinates: int
-    num_frozen_coordinates: int
     box_residual: float
     kkt_residual: float
     # Scale-stable full-certificate diagnostics.  The historical fields above
@@ -123,12 +113,6 @@ class KKTDiagnostics:
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, float | int]) -> "KKTDiagnostics":
-        integer_fields = {
-            "num_interior_coordinates",
-            "num_lower_active_coordinates",
-            "num_upper_active_coordinates",
-            "num_frozen_coordinates",
-        }
         fail_closed_fields = {
             "backward_error_stationarity_residual",
             "backward_error_edge_subgradient_residual",
@@ -137,7 +121,7 @@ class KKTDiagnostics:
         }
         return cls(
             **{
-                item.name: (int if item.name in integer_fields else float)(
+                item.name: float(
                     values.get(item.name, float("inf"))
                     if item.name in fail_closed_fields
                     else values[item.name]
@@ -192,40 +176,17 @@ BackendWarmState: TypeAlias = DenseWarmState | PrimalOnlyWarmState
 
 @dataclass(frozen=True, slots=True)
 class WorkCounters:
-    outer_iterations: int = 0
-    inner_iterations: int = 0
-    workset_iterations: int = 0
-    workset_expansions: int = 0
-    streamed_edge_passes: int = 0
-    dense_iterations: int = 0
-    certificate_iterations: int = 0
-    activity_passes: int = 0
-    analytic_adjoint_passes: int = 0
-    column_scan_passes: int = 0
     full_certificate_audit_passes: int = 0
 
     def __add__(self, other: "WorkCounters") -> "WorkCounters":
         if not isinstance(other, WorkCounters):
             return NotImplemented
         return WorkCounters(
-            **{
-                item.name: int(getattr(self, item.name))
-                + int(getattr(other, item.name))
-                for item in fields(self)
-            }
+            full_certificate_audit_passes=(
+                int(self.full_certificate_audit_passes)
+                + int(other.full_certificate_audit_passes)
+            )
         )
-
-    @classmethod
-    def from_attributes(cls, value: object) -> "WorkCounters":
-        return cls(
-            **{
-                item.name: int(getattr(value, item.name, 0))
-                for item in fields(cls)
-            }
-        )
-
-    def as_dict(self) -> dict[str, int]:
-        return {item.name: int(getattr(self, item.name)) for item in fields(self)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,9 +197,6 @@ class InnerSolveResult:
     surrogate_certificate: GraphFusionCertificate | None
     surrogate_kkt: KKTDiagnostics
     converged: bool
-    inner_iterations: int
-    backend_iterations: int
-    work_counters: WorkCounters
     fallback_reason: str = ""
 
 
@@ -350,15 +308,9 @@ class SolverState:
 
 @dataclass(frozen=True, slots=True)
 class ObjectiveValue:
-    """Observed fit loss and lambda-weighted fusion objective."""
+    """Lambda-weighted observed fusion objective."""
 
-    fit_loss: float
-    fusion_penalty: float
     total: float
-
-    @property
-    def loglik(self) -> float:
-        return float(-self.fit_loss)
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,68 +355,16 @@ class CertificateResult:
     def schema_version(self) -> int:
         return 2
 
-    @property
-    def estimator_role(self) -> str:
-        return "raw_fused_lambda_path"
-
-    @property
-    def objective_faithful(self) -> bool:
-        return True
-
-    @property
-    def full_kkt_certified(self) -> bool:
-        return bool(self.certified)
-
-    @property
-    def residual(self) -> float:
-        return self.components.residual
-
-    @property
-    def certificate_scope(self) -> str:
-        return str(self.scope)
-
-    @property
-    def directional_kink_admissible(self) -> bool:
-        return bool(self.directional_admissible)
-
-    @property
-    def working_precision_residual(self) -> float:
-        return float(self.working_residual)
-
-    @property
-    def certificate_audit_dtype(self) -> str:
-        return str(self.audit_dtype)
-
-    @property
-    def precision_polish_applied(self) -> bool:
-        return bool(self.precision_polished)
-
-    @property
-    def precision_polish_max_abs_phi_delta(self) -> float:
-        return float(self.precision_polish_delta)
-
 
 @dataclass(frozen=True, slots=True)
 class ConvergenceResult:
     converged: bool
     mm_consistency_violations: int
-    failure_reason: str
-
-
-@dataclass(frozen=True, slots=True)
-class MultiStartResult:
-    number_of_starts: int
-    number_of_finite_starts: int
-    best_objective: float
-    second_best_objective: float
-    objective_spread: float
-    selected_objective_rank: int
 
 
 @dataclass(frozen=True, slots=True)
 class FitProvenance:
     objective_key: LambdaObjectiveKey
-    graph_name: str
     device: str
     dtype: str
     inner_solver: str
@@ -501,7 +401,6 @@ class RawFit:
     certificate: CertificateResult
     convergence: ConvergenceResult
     work: WorkCounters
-    multistart: MultiStartResult
     state: SolverState | None
     provenance: FitProvenance
 

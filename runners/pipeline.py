@@ -5,7 +5,7 @@ from time import perf_counter
 
 from ..config import FitConfig, resolve_fit_config
 from ..io.tumor_txt import DEFAULT_DOSAGE_PRIOR_PENALTY, load_tumor_txt
-from .model_selection import select_model
+from ..model_selection.search import select_model
 from ..model_selection.candidates import validate_candidate_identity
 from ..model_selection.types import SearchCandidate
 from .serialization import (
@@ -44,9 +44,9 @@ def process_tumor_bundle(
         fit_config=fit_config,
         use_warm_starts=use_warm_starts,
     )
-    analysis = AnalysisSerialization.from_selection(
+    analysis = AnalysisSerialization(
         data=data,
-        input_file=tumor_file,
+        input_file=Path(tumor_file),
         fit_config=fit_config,
         selection_result=selection_result,
     )

@@ -82,11 +82,6 @@ class CertificateAttempt:
     certificate: GraphFusionCertificate | None
     diagnostics: KKTDiagnostics
     status: str
-    dual_refined: bool
-    fused_edges: int
-    nonzero_edges: int
-    stationarity_before: float
-    stationarity_after: float
     work_counters: WorkCounters = WorkCounters()
 
 
@@ -189,7 +184,7 @@ def _analytic_nonfused_adjoint(
     labels: torch.Tensor,
     graph: TensorFusionGraph,
     lambda_value: float,
-) -> tuple[torch.Tensor, int]:
+) -> torch.Tensor:
     adj = torch.zeros_like(phi)
     num_edges = int(graph.edge_u.numel())
     chunk_size = _compressed_edge_chunk_size(
@@ -197,12 +192,10 @@ def _analytic_nonfused_adjoint(
         num_regions=int(phi.shape[1]),
         dtype=phi.dtype,
     )
-    edge_passes = 0
     if lambda_value <= 0.0:
-        return adj, edge_passes
+        return adj
     for start in range(0, num_edges, chunk_size):
         stop = min(start + chunk_size, num_edges)
-        edge_passes += 1
         edge_u = graph.edge_u[start:stop]
         edge_v = graph.edge_v[start:stop]
         between = labels.index_select(0, edge_u) != labels.index_select(0, edge_v)
@@ -223,35 +216,7 @@ def _analytic_nonfused_adjoint(
         active_v = edge_v[active]
         adj.index_add_(0, active_u, dual)
         adj.index_add_(0, active_v, dual, alpha=-1.0)
-    return adj, edge_passes
-
-
-def _stream_edge_activity_counts(
-    *,
-    phi: torch.Tensor,
-    graph: TensorFusionGraph,
-    atol: float,
-) -> tuple[int, int, int]:
-    """Count fused/nonzero edges without materializing a full edge matrix."""
-
-    num_edges = int(graph.edge_u.numel())
-    chunk_size = _compressed_edge_chunk_size(
-        num_edges=num_edges,
-        num_regions=int(phi.shape[1]),
-        dtype=phi.dtype,
-    )
-    nonzero_edges = 0
-    edge_passes = 0
-    for start in range(0, num_edges, chunk_size):
-        stop = min(start + chunk_size, num_edges)
-        edge_passes += 1
-        diff = phi.index_select(0, graph.edge_u[start:stop]) - phi.index_select(
-            0, graph.edge_v[start:stop]
-        )
-        nonzero_edges += int(
-            torch.sum(torch.linalg.vector_norm(diff, dim=1) > float(atol)).item()
-        )
-    return num_edges - nonzero_edges, nonzero_edges, edge_passes
+    return adj
 
 
 def _initial_internal_tree_ids(
@@ -259,9 +224,9 @@ def _initial_internal_tree_ids(
     labels: torch.Tensor,
     graph: TensorFusionGraph,
     dtype: torch.dtype,
-) -> tuple[torch.Tensor, int]:
+) -> torch.Tensor:
     if labels.numel() == 0:
-        return torch.empty(0, dtype=torch.long, device=labels.device), 0
+        return torch.empty(0, dtype=torch.long, device=labels.device)
     num_blocks = int(torch.max(labels).item()) + 1
     if graph.is_complete:
         # Complete tensor graphs use canonical torch.triu_indices ordering, so
@@ -278,7 +243,7 @@ def _initial_internal_tree_ids(
         local_rank = node_ids - sorted_starts
         child_positions = node_ids[local_rank > 0]
         if child_positions.numel() == 0:
-            return torch.empty(0, dtype=torch.long, device=labels.device), 0
+            return torch.empty(0, dtype=torch.long, device=labels.device)
         child_rank = local_rank.index_select(0, child_positions)
         parent_positions = (
             sorted_starts.index_select(0, child_positions) + (child_rank - 1) // 2
@@ -288,7 +253,7 @@ def _initial_internal_tree_ids(
         edge_u = torch.minimum(parent_nodes, child_nodes)
         edge_v = torch.maximum(parent_nodes, child_nodes)
         edge_ids = edge_u * (2 * num_nodes - edge_u - 1) // 2 + edge_v - edge_u - 1
-        return torch.sort(edge_ids).values, 0
+        return torch.sort(edge_ids).values
 
     # Defensive fallback for non-complete graphs.  The compressed quotient
     # backend currently requires a complete graph, but certificate utilities
@@ -308,10 +273,8 @@ def _initial_internal_tree_ids(
         dtype=dtype,
     )
     selected: list[torch.Tensor] = []
-    edge_passes = 0
     for start in range(0, num_edges, chunk_size):
         stop = min(start + chunk_size, num_edges)
-        edge_passes += 1
         edge_u = graph.edge_u[start:stop]
         edge_v = graph.edge_v[start:stop]
         label_u = labels.index_select(0, edge_u)
@@ -322,8 +285,8 @@ def _initial_internal_tree_ids(
         if bool(torch.any(star).item()):
             selected.append(torch.arange(start, stop, device=labels.device)[star])
     if not selected:
-        return torch.empty(0, dtype=torch.long, device=labels.device), edge_passes
-    return torch.cat(selected), edge_passes
+        return torch.empty(0, dtype=torch.long, device=labels.device)
+    return torch.cat(selected)
 
 
 def _merge_internal_support(
@@ -375,12 +338,6 @@ def _resource_limit_diagnostics(
 ) -> KKTDiagnostics:
     """Fail-closed diagnostics when a certificate cannot be loaded safely."""
 
-    frozen = upper <= lower + float(atol)
-    lower_active = phi <= lower + float(atol)
-    upper_active = phi >= upper - float(atol)
-    diagnostic_lower = lower_active & ~upper_active & ~frozen
-    diagnostic_upper = upper_active & ~frozen
-    interior = ~(lower_active | upper_active | frozen)
     box_violation = torch.maximum(
         torch.clamp(lower - phi, min=0.0), torch.clamp(phi - upper, min=0.0)
     )
@@ -393,18 +350,8 @@ def _resource_limit_diagnostics(
     )
     return KKTDiagnostics(
         stationarity_residual=float("inf"),
-        projected_stationarity_residual=float("inf"),
-        projected_stationarity_norm=float("inf"),
-        stationarity_normalizer=1.0 + float(torch.linalg.norm(grad_smooth).item()),
-        smooth_gradient_norm=float(torch.linalg.norm(grad_smooth).item()),
-        fusion_adjustment_norm=float("inf"),
         edge_subgradient_residual=float("inf"),
         dual_ball_residual=float("inf"),
-        box_primal_violation=box_primal_violation,
-        num_interior_coordinates=int(torch.sum(interior).item()),
-        num_lower_active_coordinates=int(torch.sum(diagnostic_lower).item()),
-        num_upper_active_coordinates=int(torch.sum(diagnostic_upper).item()),
-        num_frozen_coordinates=int(torch.sum(frozen).item()),
         box_residual=box_primal_violation / max(box_scale, 1e-300),
         kkt_residual=float("inf"),
     )
@@ -521,7 +468,7 @@ def _scan_omitted_internal_edges(
     graph: TensorFusionGraph,
     scale: float,
     add_batch: int,
-) -> tuple[float, torch.Tensor, int]:
+) -> tuple[float, torch.Tensor]:
     num_edges = int(graph.edge_u.numel())
     chunk_size = _compressed_edge_chunk_size(
         num_edges=num_edges,
@@ -531,10 +478,8 @@ def _scan_omitted_internal_edges(
     best_scores: list[torch.Tensor] = []
     best_ids: list[torch.Tensor] = []
     maximum = 0.0
-    edge_passes = 0
     for start in range(0, num_edges, chunk_size):
         stop = min(start + chunk_size, num_edges)
-        edge_passes += 1
         edge_u = graph.edge_u[start:stop]
         edge_v = graph.edge_v[start:stop]
         internal = labels.index_select(0, edge_u) == labels.index_select(0, edge_v)
@@ -558,16 +503,12 @@ def _scan_omitted_internal_edges(
         best_scores.append(values)
         best_ids.append(chunk_ids[internal].index_select(0, positions))
     if not best_scores:
-        return (
-            maximum,
-            torch.empty(0, dtype=torch.long, device=residual.device),
-            edge_passes,
-        )
+        return maximum, torch.empty(0, dtype=torch.long, device=residual.device)
     scores = torch.cat(best_scores)
     ids = torch.cat(best_ids)
     count = min(int(add_batch), int(scores.numel()))
     _values, positions = torch.topk(scores, k=count, largest=True, sorted=True)
-    return maximum, ids.index_select(0, positions), edge_passes
+    return maximum, ids.index_select(0, positions)
 
 
 def _refine_compressed_certificate(
@@ -598,11 +539,6 @@ def _refine_compressed_certificate(
         num_regions=int(phi.shape[1]),
         dtype=phi.dtype,
     ) > int(options.memory.max_workset_bytes):
-        fused_edges, nonzero_edges, activity_passes = _stream_edge_activity_counts(
-            phi=phi,
-            graph=graph,
-            atol=atol,
-        )
         diag = _resource_limit_diagnostics(
             phi=phi,
             grad_smooth=grad_smooth,
@@ -614,15 +550,6 @@ def _refine_compressed_certificate(
             certificate=certificate,
             diagnostics=diag,
             status="resource_limit",
-            dual_refined=False,
-            fused_edges=fused_edges,
-            nonzero_edges=nonzero_edges,
-            stationarity_before=diag.stationarity_residual,
-            stationarity_after=diag.stationarity_residual,
-            work_counters=WorkCounters(
-                streamed_edge_passes=activity_passes,
-                activity_passes=activity_passes,
-            ),
         )
     labels, centers, inherited_ids, inherited_dual = _validated_compressed_tensors(
         certificate,
@@ -630,7 +557,7 @@ def _refine_compressed_certificate(
         graph=graph,
         graph_hash=graph_hash,
     )
-    tree_ids, tree_passes = _initial_internal_tree_ids(
+    tree_ids = _initial_internal_tree_ids(
         labels=labels,
         graph=graph,
         dtype=phi.dtype,
@@ -643,11 +570,6 @@ def _refine_compressed_certificate(
         num_regions=int(phi.shape[1]),
         dtype=phi.dtype,
     ) > int(options.memory.max_workset_bytes):
-        fused_edges, nonzero_edges, activity_passes = _stream_edge_activity_counts(
-            phi=phi,
-            graph=graph,
-            atol=atol,
-        )
         diag = _resource_limit_diagnostics(
             phi=phi,
             grad_smooth=grad_smooth,
@@ -659,15 +581,6 @@ def _refine_compressed_certificate(
             certificate=certificate,
             diagnostics=diag,
             status="resource_limit",
-            dual_refined=False,
-            fused_edges=fused_edges,
-            nonzero_edges=nonzero_edges,
-            stationarity_before=diag.stationarity_residual,
-            stationarity_after=diag.stationarity_residual,
-            work_counters=WorkCounters(
-                streamed_edge_passes=tree_passes + activity_passes,
-                activity_passes=activity_passes,
-            ),
         )
     support_ids, dual = _merge_internal_support(
         inherited_ids=inherited_ids,
@@ -677,21 +590,13 @@ def _refine_compressed_certificate(
         dtype=phi.dtype,
         device=phi.device,
     )
-    fused_edges, nonzero_edges, activity_passes = _stream_edge_activity_counts(
-        phi=phi,
-        graph=graph,
-        atol=atol,
-    )
-    between_adj, between_passes = _analytic_nonfused_adjoint(
+    between_adj = _analytic_nonfused_adjoint(
         phi=phi,
         labels=labels,
         graph=graph,
         lambda_value=lambda_value,
     )
     base_grad = grad_smooth + between_adj
-    total_iterations = 0
-    edge_passes = tree_passes + between_passes + activity_passes
-    column_scan_passes = 0
     full_certificate_audit_passes = 0
     # A nonempty inherited support may already be authoritative, so give it one
     # full-graph fast-path audit. Fresh proposals go directly to the cheap
@@ -716,13 +621,7 @@ def _refine_compressed_certificate(
             lambda_value=lambda_value,
             atol=atol,
         )
-        audit_passes = _compressed_audit_edge_passes(
-            num_edges=int(graph.edge_u.numel()),
-            num_regions=int(phi.shape[1]),
-            dtype=phi.dtype,
-        )
-        edge_passes += audit_passes
-        full_certificate_audit_passes += audit_passes
+        full_certificate_audit_passes += 1
     if has_inherited_fast_path and before.kkt_residual <= 5.0 * float(atol):
         # The inherited compressed state has already passed a full
         # original-graph audit.  Re-optimizing its workset cannot strengthen
@@ -740,21 +639,11 @@ def _refine_compressed_certificate(
             certificate=certified,
             diagnostics=before,
             status="certified",
-            dual_refined=False,
-            fused_edges=fused_edges,
-            nonzero_edges=nonzero_edges,
-            stationarity_before=before.stationarity_residual,
-            stationarity_after=before.stationarity_residual,
             work_counters=WorkCounters(
-                streamed_edge_passes=edge_passes,
-                activity_passes=activity_passes,
-                analytic_adjoint_passes=between_passes,
-                column_scan_passes=column_scan_passes,
                 full_certificate_audit_passes=full_certificate_audit_passes,
             ),
         )
     status = "not_certified"
-    expansions = 0
     force_rounds = 0
     unconverged_worksets = 0
     final_diag = before
@@ -772,7 +661,6 @@ def _refine_compressed_certificate(
                 options=options,
             )
         )
-        total_iterations += iterations
         current = CompressedEdgeCertificate(
             labels=labels,
             centers=centers,
@@ -806,7 +694,7 @@ def _refine_compressed_certificate(
             + float(torch.linalg.norm(grad_smooth).item())
             + float(torch.linalg.norm(between_adj + work_adj).item())
         )
-        column_residual, proposed_ids, scan_passes = _scan_omitted_internal_edges(
+        column_residual, proposed_ids = _scan_omitted_internal_edges(
             residual=residual,
             labels=labels,
             support_ids=support_ids,
@@ -814,8 +702,6 @@ def _refine_compressed_certificate(
             scale=scale,
             add_batch=int(options.add_batch),
         )
-        edge_passes += scan_passes
-        column_scan_passes += scan_passes
         column_ready = column_residual <= float(options.column_tolerance)
         should_expand = not column_ready
         if column_ready:
@@ -830,13 +716,7 @@ def _refine_compressed_certificate(
                 lambda_value=lambda_value,
                 atol=atol,
             )
-            audit_passes = _compressed_audit_edge_passes(
-                num_edges=int(graph.edge_u.numel()),
-                num_regions=int(phi.shape[1]),
-                dtype=phi.dtype,
-            )
-            edge_passes += audit_passes
-            full_certificate_audit_passes += audit_passes
+            full_certificate_audit_passes += 1
             if final_diag.kkt_residual <= 5.0 * float(atol):
                 status = "certified"
                 certificate = current
@@ -865,7 +745,6 @@ def _refine_compressed_certificate(
             dtype=phi.dtype,
             device=phi.device,
         )
-        expansions += 1
     else:
         status = "workset_incomplete"
         certificate = CompressedEdgeCertificate(
@@ -880,18 +759,7 @@ def _refine_compressed_certificate(
         certificate=certificate,
         diagnostics=final_diag,
         status=status,
-        dual_refined=True,
-        fused_edges=fused_edges,
-        nonzero_edges=nonzero_edges,
-        stationarity_before=before.stationarity_residual,
-        stationarity_after=final_diag.stationarity_residual,
         work_counters=WorkCounters(
-            workset_iterations=total_iterations,
-            workset_expansions=expansions,
-            streamed_edge_passes=edge_passes,
-            activity_passes=activity_passes,
-            analytic_adjoint_passes=between_passes,
-            column_scan_passes=column_scan_passes,
             full_certificate_audit_passes=full_certificate_audit_passes,
         ),
     )
@@ -914,19 +782,6 @@ def _compressed_edge_chunk_size(
     if num_edges > 1:
         proposed = min(proposed, num_edges - 1)
     return proposed
-
-
-def _compressed_audit_edge_passes(
-    *, num_edges: int, num_regions: int, dtype: torch.dtype
-) -> int:
-    if int(num_edges) <= 0:
-        return 0
-    chunk_size = _compressed_edge_chunk_size(
-        num_edges=int(num_edges),
-        num_regions=int(num_regions),
-        dtype=dtype,
-    )
-    return (int(num_edges) + chunk_size - 1) // chunk_size
 
 
 def _validated_compressed_tensors(
@@ -1196,14 +1051,6 @@ def _refine_certificate(
         certificate=refined_certificate,
         diagnostics=KKTDiagnostics.from_mapping(dense["diag"]),
         status=str(dense["status"]),
-        dual_refined=bool(dense["dual_refined"]),
-        fused_edges=int(dense["fused_edges"]),
-        nonzero_edges=int(dense["nonzero_edges"]),
-        stationarity_before=float(dense["stationarity_before"]),
-        stationarity_after=float(dense["stationarity_after"]),
-        work_counters=WorkCounters(
-            certificate_iterations=int(dense["refinement_iterations"])
-        ),
     )
 
 
@@ -1253,9 +1100,4 @@ def certify(
         certificate=witness,
         diagnostics=diagnostics,
         status="audited",
-        dual_refined=False,
-        fused_edges=0,
-        nonzero_edges=0,
-        stationarity_before=diagnostics.stationarity_residual,
-        stationarity_after=diagnostics.stationarity_residual,
     )

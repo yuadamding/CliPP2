@@ -57,23 +57,18 @@ def _validate_identity(
         raise AssertionError("Selected partition and fixed refit signatures differ.")
     if isinstance(partition, FusionPartition) and not partition.certified:
         raise AssertionError("Refusing to serialize an uncertified raw partition.")
-    if (
-        isinstance(partition, DirectPartition)
-        and not partition.deterministic_generation
-    ):
-        raise AssertionError("Refusing to serialize a nondeterministic partition.")
     return labels
 
 
 def _path_supported_mask(data: TumorData, shape: tuple[int, int]) -> np.ndarray:
-    reasons = getattr(data, "path_unsupported_reason", None)
+    reasons = data.path_unsupported_reason
     if reasons is None:
         return np.ones(shape, dtype=bool)
     reason_array = np.asarray(reasons, dtype=object)
     if tuple(reason_array.shape) != tuple(shape):
         raise ValueError("path_unsupported_reason shape does not match observations.")
     supported = np.asarray(pd.isna(reason_array), dtype=bool)
-    count_observed = getattr(data, "count_observed", None)
+    count_observed = data.count_observed
     observed = (
         np.ones(shape, dtype=bool)
         if count_observed is None
@@ -94,7 +89,7 @@ def _path_summary_for_profile(
     *,
     eps: float,
 ) -> dict[str, np.ndarray] | None:
-    spec = getattr(data, "path_likelihood", None)
+    spec = data.path_likelihood
     if spec is None:
         return None
     posterior = path_posterior_at_phi_numpy(data, phi, eps=float(eps))
@@ -234,8 +229,8 @@ def mutation_region_output_table(
             "minor_cn": data.minor_cn.reshape(-1),
         }
     )
-    eps = float(getattr(raw_fit, "likelihood_eps", 1e-6))
-    if getattr(data, "path_likelihood", None) is None:
+    eps = float(raw_fit.provenance.likelihood_eps)
+    if data.path_likelihood is None:
         _add_legacy_multiplicity(
             table,
             data=data,
@@ -250,7 +245,7 @@ def mutation_region_output_table(
         _add_path_summary(table, refit_summary)
         supported = refit_summary["supported"].reshape(-1)
         table["path_supported"] = supported.astype(int)
-        reasons = getattr(data, "path_unsupported_reason", None)
+        reasons = data.path_unsupported_reason
         if reasons is not None:
             reason = np.asarray(reasons, dtype=object).reshape(-1)
             table["path_unsupported_reason"] = pd.array(

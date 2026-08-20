@@ -308,49 +308,6 @@ def tumor_data_fingerprint(data: TumorData) -> str:
     return digest.hexdigest()
 
 
-def tumor_objective_fingerprint(data: TumorData) -> str:
-    """Return a representation-neutral identity for the numeric likelihood.
-
-    Initialization, reporting fields, display identifiers, and compiler
-    version labels are deliberately excluded. The solver combines this digest
-    with its graph arrays, epsilon, and effective prior to identify the full
-    optimization objective.
-    """
-
-    digest = hashlib.sha256()
-
-    for name in ("alt_counts", "total_counts", "scaling", "phi_upper"):
-        _hash_array(digest, name, getattr(data, name))
-    count_observed = getattr(data, "count_observed", None)
-    _hash_array(
-        digest,
-        "count_observed",
-        np.ones_like(np.asarray(data.alt_counts), dtype=bool)
-        if count_observed is None
-        else np.asarray(count_observed, dtype=bool),
-    )
-
-    path_likelihood = getattr(data, "path_likelihood", None)
-    if path_likelihood is None:
-        for name in ("major_cn", "minor_cn", "has_cna"):
-            _hash_array(digest, name, getattr(data, name))
-    else:
-        path_likelihood.validate_observation_shape(
-            (int(data.num_mutations), int(data.num_regions))
-        )
-        for name in (
-            "first_copy",
-            "second_copy",
-            "switch_fraction",
-            "log_prior",
-            "valid",
-        ):
-            _hash_array(
-                digest, f"path_likelihood.{name}", getattr(path_likelihood, name)
-            )
-    return digest.hexdigest()
-
-
 def _safe_probability(
     scale: np.ndarray, multiplicity: np.ndarray, phi: np.ndarray, eps: float
 ) -> np.ndarray:
@@ -413,5 +370,4 @@ __all__ = [
     "TumorData",
     "compute_phi_init_from_counts",
     "tumor_data_fingerprint",
-    "tumor_objective_fingerprint",
 ]

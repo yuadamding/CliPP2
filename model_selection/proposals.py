@@ -31,11 +31,10 @@ from ..core.fusion.types import (
 )
 from ..config import FitConfig
 from ..core.fusion.types import RawFit
-from ..io.data import TumorData, tumor_objective_fingerprint
+from ..io.data import TumorData
 from .guided_fusion import GuidedFusionInitialization, build_guided_fusion_initialization
-from .partition_initializer import PartitionInitializerPool
 from .scoring import _canonical_lambda, _prefer_fit_candidate
-from .types import CandidateStaticMetadata, StartArray
+from .types import StartArray
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,14 +125,6 @@ def _hash_array(hasher: "hashlib._Hash", array: np.ndarray) -> None:
     hasher.update(contiguous.tobytes())
 
 
-def _edge_list_hash(edge_u: np.ndarray, edge_v: np.ndarray, edge_w: np.ndarray) -> str:
-    hasher = hashlib.blake2b(digest_size=16)
-    _hash_array(hasher, np.asarray(edge_u, dtype=np.int64))
-    _hash_array(hasher, np.asarray(edge_v, dtype=np.int64))
-    _hash_array(hasher, np.asarray(edge_w, dtype=np.float64))
-    return hasher.hexdigest()
-
-
 def pilot_matrix_hash(pilot_phi: StartArray | None) -> str:
     if pilot_phi is None:
         return ""
@@ -144,29 +135,6 @@ def pilot_matrix_hash(pilot_phi: StartArray | None) -> str:
     hasher = hashlib.blake2b(digest_size=16)
     _hash_array(hasher, np.asarray(array, dtype=np.float64))
     return hasher.hexdigest()
-
-
-def candidate_static_metadata(
-    data: TumorData, graph, pilot_phi: StartArray | None = None
-) -> CandidateStaticMetadata:
-    edge_count = int(graph.edge_u.size)
-    if edge_count:
-        edge_weight_min = float(np.min(graph.edge_w))
-        edge_weight_max = float(np.max(graph.edge_w))
-        edge_weight_mean = float(np.mean(graph.edge_w))
-    else:
-        edge_weight_min = float("nan")
-        edge_weight_max = float("nan")
-        edge_weight_mean = float("nan")
-    return CandidateStaticMetadata(
-        edge_count=edge_count,
-        edge_weight_min=edge_weight_min,
-        edge_weight_max=edge_weight_max,
-        edge_weight_mean=edge_weight_mean,
-        edge_list_hash=_edge_list_hash(graph.edge_u, graph.edge_v, graph.edge_w),
-        pilot_matrix_hash=pilot_matrix_hash(pilot_phi),
-        input_data_hash=tumor_objective_fingerprint(data),
-    )
 
 
 def clone_start(start: StartArray) -> StartArray:
@@ -560,30 +528,6 @@ def rescore_partition_candidates(
     return rescored
 
 
-def partition_pool_row_metadata(
-    pool: PartitionInitializerPool,
-) -> dict[str, float | int | str]:
-    return {
-        "partition_generation_elapsed_seconds": float(pool.generation_elapsed_seconds),
-        "partition_curvature_elapsed_seconds": float(pool.curvature_elapsed_seconds),
-        "partition_ward_elapsed_seconds": float(pool.ward_elapsed_seconds),
-        "partition_refine_ward_elapsed_seconds": float(
-            pool.refine_ward_elapsed_seconds
-        ),
-        "partition_initial_generation_elapsed_seconds": float(
-            pool.initial_generation_elapsed_seconds
-        ),
-        "partition_refine_generation_elapsed_seconds": float(
-            pool.refine_generation_elapsed_seconds
-        ),
-        "partition_candidate_count": int(len(pool.candidates)),
-        "partition_candidate_refinement_reason": str(pool.refinement_reason),
-        "partition_candidate_sparse_k_grid": ",".join(map(str, pool.sparse_k_grid)),
-        "partition_candidate_refine_k_grid": ",".join(map(str, pool.refine_k_grid)),
-        "partition_candidate_k_grid": ",".join(map(str, pool.combined_k_grid)),
-    }
-
-
 def adaptive_stop_certifies_global_optimum(stop_reason: str) -> bool:
     """Fail closed until a controller stop carries an explicit global proof.
 
@@ -601,7 +545,7 @@ def direct_partition_source(
     stage: str,
 ) -> str:
     cem = str(proposal.source).startswith("hessian_ward_cem")
-    death = int(proposal.diagnostics.get("component_death_count", 0)) > 0
+    death = int(proposal.component_death_count) > 0
     prefix = "pilot" if stage == "pilot" else "final_phi"
     suffix = "hessian_ward_cem" if cem else "hessian_ward"
     if cem and death:
@@ -617,12 +561,10 @@ __all__ = [
     "bootstrap_independent_start_specs",
     "build_guided_initialization_with_resource_policy",
     "build_partition_guided_graph_with_resource_policy",
-    "candidate_static_metadata",
     "clone_start",
     "direct_partition_source",
     "escape_path_breakpoint_retry_state",
     "offload_solver_state_to_cpu",
-    "partition_pool_row_metadata",
     "pilot_matrix_hash",
     "rescore_partition_candidates",
     "select_raw_start_attempt",

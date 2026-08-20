@@ -35,21 +35,12 @@ class SelectionScore:
     numerical_uncertainty: float = 0.0
     assignment_log_evidence: float = 0.0
     assignment_code_weight: float = 0.0
-    assignment_penalty: float = 0.0
     assignment_dirichlet_alpha: float = 1.0
-    assignment_model_id: str = "none"
-    assignment_symmetry_mode: str = "none"
     assignment_arithmetic_uncertainty: float = 0.0
-    selection_contract_id: str = "hybrid-ward-cem-v1"
 
     @property
-    def lower_bound(self) -> float:
-        return float(self.value - self.numerical_uncertainty)
-
-    @property
-    def upper_bound(self) -> float:
-        return float(self.value + self.numerical_uncertainty)
-
+    def assignment_penalty(self) -> float:
+        return float(-2.0 * self.assignment_code_weight * self.assignment_log_evidence)
 
 def _observed_positive_depth_mask(data: TumorData) -> np.ndarray:
     """Boolean (M, S) mask of mutation_regions that contribute to the likelihood.
@@ -103,7 +94,6 @@ def fixed_partition_bic(
     partition_signature: str,
     labels: np.ndarray | None = None,
     loglik_uncertainty: float = 0.0,
-    selection_contract_id: str = "hybrid-ward-cem-v1",
 ) -> SelectionScore:
     """Return the explicitly named BIC for one immutable partition refit."""
 
@@ -128,7 +118,6 @@ def fixed_partition_bic(
         numerical_uncertainty=float(
             2.0 * likelihood_uncertainty + arithmetic_uncertainty
         ),
-        selection_contract_id=str(selection_contract_id),
     )
 
 
@@ -167,7 +156,6 @@ def _validated_cluster_sizes(cluster_sizes: np.ndarray) -> np.ndarray:
     return values.astype(np.int64)
 
 
-DIRICHLET_EXACT_PARTITION_MODEL_ID = "symmetric_dirichlet_integrated_exact_partition_v1"
 # Preserve the production allocation-code weight selected before the clonal
 # anchor was removed.  Removing a fixed CCF-one block changes the symmetry and
 # center degrees of freedom; it must not silently retune the independent
@@ -244,7 +232,6 @@ def fixed_partition_dirichlet_score(
     loglik_uncertainty: float = 0.0,
     alpha: float = PARTITION_DIRICHLET_ALPHA,
     code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
-    selection_contract_id: str = "hybrid-ward-cem-v1",
 ) -> SelectionScore:
     """Return BIC plus a Dirichlet-integrated exact-partition deviance.
 
@@ -275,7 +262,6 @@ def fixed_partition_dirichlet_score(
         partition_signature=partition_signature,
         labels=labels_array,
         loglik_uncertainty=loglik_uncertainty,
-        selection_contract_id=str(selection_contract_id),
     )
     log_evidence, log_evidence_uncertainty = (
         _dirichlet_exact_partition_log_mass_and_uncertainty(
@@ -308,12 +294,8 @@ def fixed_partition_dirichlet_score(
         ),
         assignment_log_evidence=float(log_evidence),
         assignment_code_weight=weight,
-        assignment_penalty=assignment_penalty,
         assignment_dirichlet_alpha=alpha,
-        assignment_model_id=DIRICHLET_EXACT_PARTITION_MODEL_ID,
-        assignment_symmetry_mode="all_blocks_exchangeable",
         assignment_arithmetic_uncertainty=assignment_arithmetic_uncertainty,
-        selection_contract_id=str(selection_contract_id),
     )
 
 
@@ -350,7 +332,6 @@ __all__ = [
     "compute_classic_bic",
     "compute_dirichlet_exact_partition_log_mass",
     "compute_partition_dirichlet_score",
-    "DIRICHLET_EXACT_PARTITION_MODEL_ID",
     "effective_bic_mutation_region_count",
     "effective_bic_depth_count",
     "fixed_partition_bic",

@@ -87,7 +87,6 @@ from .types import (
     InnerSolveResult,
     KKTComponents,
     KKTDiagnostics,
-    MultiStartResult,
     ObjectiveValue,
     PairwiseFusionGraph,
     PrimalOnlyWarmState,
@@ -113,7 +112,7 @@ def _terminal_backward_error_audit_float64(
     major_prior: float,
     eps: float,
     tol: float,
-) -> tuple[KKTDiagnostics, str, bool, float, float]:
+) -> tuple[KKTDiagnostics, str, bool, float]:
     """Audit the unchanged terminal witness with float64 backward error."""
 
     device = phi.device
@@ -197,7 +196,7 @@ def _terminal_backward_error_audit_float64(
         witness=certificate,
         refine=False,
     )
-    fit_loss64, _, objective64 = (
+    _, _, objective64 = (
         _objective_value_from_mutation_region_terms_torch(
             terms64,
             phi64,
@@ -211,7 +210,6 @@ def _terminal_backward_error_audit_float64(
         result.diagnostics,
         gradient.scope,
         gradient.directional_admissible,
-        float(fit_loss64),
         float(objective64),
     )
 
@@ -921,7 +919,7 @@ def escape_path_breakpoint_solver_state(
         state is None
         or model.model_id == "legacy_major_minor_as_paths_v1"
         or not isinstance(certificate, DenseEdgeCertificate)
-        or certificate.certificate_scope != "full_original_graph"
+        or certificate.scope != "full_original_graph"
         or certificate.gradient_scope == "mm_surrogate"
         or certificate.graph_hash != str(context.graph_hash)
         or not torch.is_tensor(certificate.dual)
@@ -1338,90 +1336,14 @@ def prepare_torch_problem_with_resource_policy(
 
 
 def _initial_outer_diag() -> dict[str, float | int]:
-    """Default outer-KKT diagnostics (all residuals +inf, all counts 0) used until
-    the first audit fills them in."""
+    """Fail-closed residuals used until the first outer KKT audit."""
     return {
         "stationarity_residual": np.inf,
-        "projected_stationarity_residual": np.inf,
-        "projected_stationarity_norm": np.inf,
-        "stationarity_normalizer": np.inf,
-        "smooth_gradient_norm": np.inf,
-        "fusion_adjustment_norm": np.inf,
         "edge_subgradient_residual": np.inf,
         "dual_ball_residual": np.inf,
-        "box_primal_violation": np.inf,
-        "num_interior_coordinates": 0,
-        "num_lower_active_coordinates": 0,
-        "num_upper_active_coordinates": 0,
-        "num_frozen_coordinates": 0,
         "box_residual": np.inf,
         "kkt_residual": np.inf,
     }
-
-
-def _classify_failure_reason(
-    *,
-    converged: bool,
-    selection_eligible: bool,
-    accepted_outer_steps: int,
-    accepted_damped_steps: int,
-    accepted_full_steps: int,
-    mm_consistency_violations: int,
-    objective: float,
-    fit_loss: float,
-    kkt_residual: float,
-    tol: float,
-    failed_nonfinite_checks: int,
-    attempted_outer_steps: int,
-    failed_inner_model_checks: int,
-    failed_majorization_checks: int,
-    failed_em_envelope_checks: int,
-    failed_descent_checks: int,
-    converged_outer: bool,
-    converged_inner: bool,
-) -> str:
-    """Map the terminal solver state to a human-readable failure/convergence label."""
-    if converged:
-        return "converged"
-    if selection_eligible and accepted_outer_steps == 0:
-        return "start_already_stationary"
-    if selection_eligible and accepted_damped_steps > 0 and accepted_full_steps == 0:
-        return "fixed_objective_kkt_certified_after_damped_steps"
-    if selection_eligible:
-        return "fixed_objective_kkt_certified"
-    if mm_consistency_violations > 0:
-        return "mm_consistency_violation"
-    if accepted_outer_steps == 0:
-        final_penalty = float(objective - fit_loss)
-        if final_penalty <= 1e-8 and kkt_residual > 5.0 * tol:
-            return "pooled_start_not_stationary_no_descent_step_found"
-        if (
-            failed_nonfinite_checks > 0
-            and failed_nonfinite_checks >= attempted_outer_steps
-        ):
-            return "all_trials_nonfinite"
-        if failed_inner_model_checks > 0 and failed_inner_model_checks >= max(
-            attempted_outer_steps - failed_nonfinite_checks, 1
-        ):
-            return "all_trials_failed_inner_model_decrease"
-        if (
-            failed_majorization_checks > 0
-            and failed_descent_checks == 0
-            and failed_em_envelope_checks == 0
-        ):
-            return "all_trials_failed_majorization"
-        if failed_em_envelope_checks > 0 and failed_descent_checks == 0:
-            return "all_trials_failed_em_envelope"
-        if failed_descent_checks > 0:
-            return "all_trials_failed_exact_descent"
-        return "no_accepted_outer_step"
-    if accepted_damped_steps > 0 and accepted_full_steps == 0:
-        return "only_damped_steps_accepted"
-    if not converged_outer:
-        return "outer_stationarity_residual_above_tolerance"
-    if not converged_inner:
-        return "inner_kkt_residual_above_tolerance"
-    return "outer_stopping_criteria_not_met"
 
 
 def _solve_inner_subproblem(
@@ -1468,9 +1390,9 @@ def _solve_inner_subproblem(
             phi_trial,
             dual_trial,
             dual_kkt_trial,
-            inner_iterations,
+            _inner_iterations,
             inner_ok,
-            inner_residual,
+            _inner_residual,
         ) = solve_majorized_subproblem_alm_torch(
             runtime=runtime,
             num_mutations=num_mutations,
@@ -1495,9 +1417,9 @@ def _solve_inner_subproblem(
             phi_trial,
             dual_trial,
             dual_kkt_trial,
-            inner_iterations,
+            _inner_iterations,
             inner_ok,
-            inner_residual,
+            _inner_residual,
         ) = solve_majorized_subproblem_pdhg_torch(
             runtime=runtime,
             num_mutations=num_mutations,
@@ -1546,8 +1468,6 @@ def _solve_inner_subproblem(
         if torch.is_tensor(dual_kkt_trial)
         else None
     )
-    dense_iterations = int(inner_iterations) if use_alm else 0
-    total_inner_iterations = int(inner_iterations)
     return InnerSolveResult(
         phi=phi_trial,
         backend_name=str(backend_name),
@@ -1560,11 +1480,6 @@ def _solve_inner_subproblem(
         surrogate_certificate=certificate,
         surrogate_kkt=KKTDiagnostics.from_mapping(surrogate_diag),
         converged=bool(inner_ok),
-        inner_iterations=total_inner_iterations,
-        backend_iterations=total_inner_iterations,
-        work_counters=WorkCounters(
-            dense_iterations=dense_iterations,
-        ),
     )
 
 
@@ -1704,23 +1619,12 @@ def _fit_from_start(
     )
     dual_start_is_actual = bool(use_alm and state_dual is not None)
     converged = False
-    converged_inner = False
     converged_outer = False
     iterations = 0
-    inner_iterations = 0
     work_counters = WorkCounters()
     current_inner_converged = False
     final_outer_diag = _initial_outer_diag()
     outer_kkt_certificate_status = "not_audited"
-    accepted_outer_steps = 0
-    accepted_full_steps = 0
-    accepted_damped_steps = 0
-    attempted_outer_steps = 0
-    failed_majorization_checks = 0
-    failed_inner_model_checks = 0
-    failed_em_envelope_checks = 0
-    failed_descent_checks = 0
-    failed_nonfinite_checks = 0
     mm_consistency_violations = 0
     full_step_curvature_multiplier = torch.ones_like(phi)
 
@@ -1858,7 +1762,6 @@ def _fit_from_start(
             inner_phi_start = phi
             inner_dual_start = dual
             inner_dual_start_is_actual = dual_start_is_actual
-            attempted_inner_iterations = 0
             inner_batch_limit = 8 if require_full_step_backtracking else 1
             for _inner_batch in range(inner_batch_limit):
                 inner_result = _solve_inner_subproblem(
@@ -1884,16 +1787,13 @@ def _fit_from_start(
                     backend_name=dense_inner_solver,
                     graph_hash=graph_hash,
                 )
-                work_counters = work_counters + inner_result.work_counters
                 phi_trial = inner_result.phi
                 dense_warm_state = inner_result.warm_state
                 dual_trial = getattr(dense_warm_state, "dual", None)
                 surrogate_certificate = inner_result.surrogate_certificate
                 dual_kkt_trial = getattr(surrogate_certificate, "dual", None)
-                batch_inner_iterations = int(inner_result.inner_iterations)
                 inner_ok = bool(inner_result.converged)
                 inner_residual = float(inner_result.surrogate_kkt.kkt_residual)
-                attempted_inner_iterations += int(batch_inner_iterations)
                 batch_inner_certified = bool(inner_ok)
                 if require_full_step_backtracking:
                     batch_inner_certified = bool(
@@ -1921,8 +1821,6 @@ def _fit_from_start(
                 inner_phi_start = phi_trial
                 inner_dual_start = dual_kkt_trial if use_alm else dual_trial
                 inner_dual_start_is_actual = bool(use_alm)
-            inner_iterations += int(attempted_inner_iterations)
-            attempted_outer_steps += 1
             delta = phi_trial - phi
             trial_mutation_region_terms = mutation_region_terms_torch(
                 torch_data, phi_trial, major_prior=major_prior, eps=eps
@@ -2013,7 +1911,6 @@ def _fit_from_start(
                 objective_tol = 1e-8 * (1.0 + abs(previous_objective))
             envelope_tol = 1e-8 * (1.0 + abs(fit_loss))
             if not finite_attempt:
-                failed_nonfinite_checks += 1
                 scale *= 2.0
                 if require_full_step_backtracking:
                     curvature_multiplier = torch.clamp(
@@ -2023,7 +1920,6 @@ def _fit_from_start(
                     full_step_curvature_multiplier = curvature_multiplier
                 continue
             if audit_quadratic_majorizer and inner_model_gap > inner_model_tol:
-                failed_inner_model_checks += 1
                 if require_full_step_backtracking:
                     break
                 scale *= 2.0
@@ -2033,18 +1929,15 @@ def _fit_from_start(
                 and not require_full_step_backtracking
                 and surrogate_gap > majorization_tol
             ):
-                failed_majorization_checks += 1
                 scale *= 2.0
                 continue
             if not use_unimodal_objective and em_envelope_gap > envelope_tol:
-                failed_em_envelope_checks += 1
                 scale *= 2.0
                 continue
             if require_full_step_backtracking and not (
                 np.isfinite(float(inner_residual))
                 and float(inner_residual) <= inner_progress_tolerance
             ):
-                failed_inner_model_checks += 1
                 break
             recovery_armijo_rhs = (
                 1e-4 * min(float(inner_model_gap), 0.0) + objective_tol
@@ -2053,8 +1946,6 @@ def _fit_from_start(
             )
             if objective_gap <= recovery_armijo_rhs:
                 accepted = True
-                accepted_outer_steps += 1
-                accepted_full_steps += 1
                 candidate_phi = phi_trial
                 # The complete-graph ADMM backend also returns the actual KKT
                 # multiplier y=rho*u. Carry y, not the rho-dependent scaled u,
@@ -2095,7 +1986,6 @@ def _fit_from_start(
                 # curvature and accept only a full proximal-MM/ADMM endpoint.
                 # If the resource limit is exhausted, leave this outer iterate
                 # unchanged and uncertified rather than interpolating phi.
-                failed_descent_checks += 1
                 delta_square = torch.square(delta)
                 resolution = torch.finfo(phi.dtype).eps * (1.0 + torch.square(phi))
                 secant_remainder = (
@@ -2171,8 +2061,6 @@ def _fit_from_start(
                 ):
                     accepted = True
                     damped_accepted = True
-                    accepted_outer_steps += 1
-                    accepted_damped_steps += 1
                     candidate_phi = phi_theta
                     (
                         candidate_dual,
@@ -2193,7 +2081,6 @@ def _fit_from_start(
                 theta *= 0.5
             if damped_accepted:
                 break
-            failed_descent_checks += 1
             scale *= 2.0
 
         if not accepted:
@@ -2294,7 +2181,6 @@ def _fit_from_start(
             current_inner_converged = bool(inner_converged)
         if do_outer_kkt_audit:
             final_outer_diag = outer_diag
-        converged_inner = bool(current_inner_converged)
         converged_outer = bool(outer_converged)
         if (
             rel_change <= tol
@@ -2401,7 +2287,6 @@ def _fit_from_start(
         final_outer_diag["backward_error_kkt_residual"]
     )
     certificate_audit_dtype = dtype_name(runtime.dtype)
-    authoritative_fit_loss = float(fit_loss)
     authoritative_objective = float(objective)
     gradient_scope = certificate_gradient.scope
     directional_kink_admissible = certificate_gradient.directional_admissible
@@ -2412,7 +2297,6 @@ def _fit_from_start(
             admission_diagnostics,
             audit_gradient_scope,
             audit_directional_admissible,
-            authoritative_fit_loss,
             authoritative_objective,
         ) = _terminal_backward_error_audit_float64(
             torch_data=torch_data,
@@ -2487,27 +2371,6 @@ def _fit_from_start(
     if use_unimodal_objective and global_optimality_certified:
         converged = True
 
-    failure_reason = _classify_failure_reason(
-        converged=converged,
-        selection_eligible=selection_eligible,
-        accepted_outer_steps=accepted_outer_steps,
-        accepted_damped_steps=accepted_damped_steps,
-        accepted_full_steps=accepted_full_steps,
-        mm_consistency_violations=mm_consistency_violations,
-        objective=float(authoritative_objective),
-        fit_loss=float(authoritative_fit_loss),
-        kkt_residual=float(authoritative_kkt_residual),
-        tol=tol,
-        failed_nonfinite_checks=failed_nonfinite_checks,
-        attempted_outer_steps=attempted_outer_steps,
-        failed_inner_model_checks=failed_inner_model_checks,
-        failed_majorization_checks=failed_majorization_checks,
-        failed_em_envelope_checks=failed_em_envelope_checks,
-        failed_descent_checks=failed_descent_checks,
-        converged_outer=converged_outer,
-        converged_inner=converged_inner,
-    )
-
     phi_np = phi.detach().cpu().numpy()
     if isinstance(certificate, CompressedEdgeCertificate):
         terminal_warm_state = PrimalOnlyWarmState(
@@ -2547,18 +2410,9 @@ def _fit_from_start(
         atol=8.0 * np.finfo(np.float64).eps * (1.0 + authoritative_kkt_residual),
     ):
         raise AssertionError("Terminal KKT components do not reproduce the audit.")
-    terminal_work = replace(
-        work_counters,
-        outer_iterations=int(iterations),
-        inner_iterations=int(inner_iterations),
-    )
     return RawFit(
         phi=phi_np.astype(phi_np.dtype, copy=False),
-        objective=ObjectiveValue(
-            fit_loss=float(authoritative_fit_loss),
-            fusion_penalty=float(authoritative_objective - authoritative_fit_loss),
-            total=float(authoritative_objective),
-        ),
+        objective=ObjectiveValue(total=float(authoritative_objective)),
         certificate=CertificateResult(
             components=terminal_components,
             certified=bool(full_kkt_certified),
@@ -2581,24 +2435,14 @@ def _fit_from_start(
         convergence=ConvergenceResult(
             converged=bool(converged),
             mm_consistency_violations=int(mm_consistency_violations),
-            failure_reason=str(failure_reason),
         ),
-        work=terminal_work,
-        multistart=MultiStartResult(
-            number_of_starts=1,
-            number_of_finite_starts=int(np.isfinite(authoritative_objective)),
-            best_objective=float(authoritative_objective),
-            second_best_objective=float("nan"),
-            objective_spread=0.0,
-            selected_objective_rank=1,
-        ),
+        work=work_counters,
         state=solver_state_out,
         provenance=FitProvenance(
             objective_key=make_lambda_objective_key(
                 base_objective_key,
                 lambda_value=float(lambda_value),
             ),
-            graph_name=str(graph.name),
             device=runtime.device_name,
             dtype=dtype_name(runtime.dtype),
             inner_solver=str(inner_solver),
@@ -2990,34 +2834,4 @@ def fit_observed_data_pairwise_fusion(
                 raise policy_state.resource_error
             case NextAction.DENSE_CURRENT_DEVICE:
                 raise AssertionError("Precision policy requested a dense retry.")
-    start_artifacts[best_artifacts_index] = best_artifacts
-    objectives = np.asarray(
-        [float(item.objective.total) for item in start_artifacts], dtype=np.float64
-    )
-    finite_objectives = objectives[np.isfinite(objectives)]
-    if finite_objectives.size:
-        sorted_objectives = np.sort(finite_objectives)
-        best_start_objective = float(sorted_objectives[0])
-        second_best_start_objective = (
-            float(sorted_objectives[1]) if sorted_objectives.size >= 2 else float("nan")
-        )
-        objective_spread = float(sorted_objectives[-1] - sorted_objectives[0])
-        selected_objective = float(best_artifacts.objective.total)
-        selected_rank = int(1 + np.sum(finite_objectives < selected_objective - 1e-8))
-    else:
-        best_start_objective = float("nan")
-        second_best_start_objective = float("nan")
-        objective_spread = float("nan")
-        selected_rank = 0
-    return replace(
-        best_artifacts,
-        multistart=replace(
-            best_artifacts.multistart,
-            number_of_starts=int(len(start_artifacts)),
-            number_of_finite_starts=int(finite_objectives.size),
-            best_objective=float(best_start_objective),
-            second_best_objective=float(second_best_start_objective),
-            objective_spread=float(objective_spread),
-            selected_objective_rank=int(selected_rank),
-        ),
-    )
+    return best_artifacts
