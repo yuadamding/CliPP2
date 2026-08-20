@@ -270,28 +270,20 @@ def write_fit_outputs(
 ) -> None:
     """Purely serialize one already selected, identity-validated model."""
 
-    _validate_identity(raw_fit, partition, refit)
+    tables = {
+        "mutation_clusters": mutation_output_table(data, raw_fit, partition, refit),
+        "cluster_centers": cluster_output_table(data, raw_fit, partition, refit),
+        "mutation_region_multiplicity": mutation_region_output_table(
+            data,
+            raw_fit,
+            partition,
+            refit,
+            major_prior=float(major_prior),
+        ),
+    }
     outdir.mkdir(parents=True, exist_ok=True)
-    mutation_table = mutation_output_table(data, raw_fit, partition, refit)
-    mutation_table.to_csv(
-        outdir / f"{data.tumor_id}_mutation_clusters.tsv", sep="\t", index=False
-    )
-    cluster_table = cluster_output_table(data, raw_fit, partition, refit)
-    cluster_table.to_csv(
-        outdir / f"{data.tumor_id}_cluster_centers.tsv", sep="\t", index=False
-    )
-    mutation_region_table = mutation_region_output_table(
-        data,
-        raw_fit,
-        partition,
-        refit,
-        major_prior=float(major_prior),
-    )
-    mutation_region_table.to_csv(
-        outdir / f"{data.tumor_id}_mutation_region_multiplicity.tsv",
-        sep="\t",
-        index=False,
-    )
+    for suffix, table in tables.items():
+        table.to_csv(outdir / f"{data.tumor_id}_{suffix}.tsv", sep="\t", index=False)
 
 
 __all__ = [
