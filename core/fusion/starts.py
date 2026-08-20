@@ -7,6 +7,7 @@ from ...io.data import TumorData
 from ..objective import ObservedModel, compile_observed_model
 from ..scalar import (
     ScalarProblem,
+    scalar_breakpoints,
     scalar_loss,
     scalar_loss_and_gradient,
     scalar_problem_from_model,
@@ -14,7 +15,6 @@ from ..scalar import (
 from .torch_backend import (
     TorchTumorData,
     mutation_region_loss_grid_torch,
-    mutation_region_terms_torch,
     path_internal_breakpoints_torch,
 )
 
@@ -42,39 +42,12 @@ def _fixed_linear_path_scale_torch(torch_data: TorchTumorData) -> torch.Tensor |
     return reference.squeeze(-1)
 
 
-def _host_observed_model(torch_data: TorchTumorData) -> ObservedModel:
-    """Return the immutable source model, with a low-level runtime fallback."""
+def _source_observed_model(torch_data: TorchTumorData) -> ObservedModel:
+    """Return the immutable float64 source required by host scalar searches."""
 
-    if torch_data.source_model is not None:
-        return torch_data.source_model
-    runtime_model = torch_data.observed_model
-    if runtime_model is None:  # pragma: no cover - guarded by TorchTumorData
-        raise ValueError("TorchTumorData does not contain an observed model.")
-
-    def numeric(value: torch.Tensor) -> np.ndarray:
-        return value.detach().cpu().numpy().astype(np.float64, copy=False)
-
-    def boolean(value: torch.Tensor) -> np.ndarray:
-        return value.detach().cpu().numpy().astype(bool, copy=False)
-
-    return ObservedModel(
-        alt=numeric(runtime_model.alt),
-        nonalt=numeric(runtime_model.nonalt),
-        observed=boolean(runtime_model.observed),
-        lower=numeric(runtime_model.lower),
-        upper=numeric(runtime_model.upper),
-        first_scale=numeric(runtime_model.first_scale),
-        second_scale=numeric(runtime_model.second_scale),
-        switch=numeric(runtime_model.switch),
-        log_prior=numeric(runtime_model.log_prior),
-        valid=boolean(runtime_model.valid),
-        legacy_major=(
-            None
-            if runtime_model.legacy_major is None
-            else boolean(runtime_model.legacy_major)
-        ),
-        model_id=runtime_model.model_id,
-    )
+    if torch_data.source_model is None:
+        raise ValueError("Host scalar searches require an immutable source model.")
+    return torch_data.source_model
 
 
 def _golden_section_minimize(
@@ -120,23 +93,6 @@ def _project_to_interval(value: float, left: float, right: float) -> float:
     return float(min(max(float(value), float(left)), float(right)))
 
 
-def _interval_endpoints(
-    *,
-    left: float,
-    right: float,
-    include_hint: float | None = None,
-) -> list[float]:
-    candidates = [float(left), float(right)]
-    if include_hint is not None and np.isfinite(include_hint):
-        candidates.append(
-            _project_to_interval(float(include_hint), float(left), float(right))
-        )
-    return [
-        float(value)
-        for value in np.unique(np.round(np.asarray(candidates, dtype=np.float64), 15))
-    ]
-
-
 def _scaled_sum(
     sign_left: float, logabs_left: float, sign_right: float, logabs_right: float
 ) -> float:
@@ -149,13 +105,6 @@ def _scaled_sum(
         sign_left * np.exp(float(logabs_left) - anchor)
         + sign_right * np.exp(float(logabs_right) - anchor)
     )
-
-
-def _major_prior_logs_numpy(major_prior: float) -> tuple[float, float]:
-    prior = float(major_prior)
-    if not np.isfinite(prior) or not (0.0 < prior < 1.0):
-        raise ValueError("major_prior must lie strictly in (0, 1).")
-    return float(np.log1p(-prior)), float(np.log(prior))
 
 
 def _ambiguous_middle_stationarity(
@@ -182,7 +131,11 @@ def _ambiguous_middle_stationarity(
     sign_plus = float(np.sign(delta_plus))
     if sign_minus == 0.0 and sign_plus == 0.0:
         return 0.0
-    log_prior_minor, log_prior_major = _major_prior_logs_numpy(major_prior)
+    prior = float(major_prior)
+    if not np.isfinite(prior) or not 0.0 < prior < 1.0:
+        raise ValueError("major_prior must lie strictly in (0, 1).")
+    log_prior_minor = float(np.log1p(-prior))
+    log_prior_major = float(np.log(prior))
 
     logabs_minus = (
         log_prior_minor
@@ -315,14 +268,12 @@ def _middle_regime_roots(
     ]
 
 
-def _mutation_region_candidate_betas(
+def _ambiguous_candidate_betas_numpy(
     *,
     alt: float,
     total: float,
     b_minus: float,
     b_plus: float,
-    b_fixed: float,
-    ambiguous: bool,
     lower: float,
     upper: float,
     major_prior: float,
@@ -336,20 +287,6 @@ def _mutation_region_candidate_betas(
     hint = None if hint is None else float(hint)
     if upper <= lower + 1e-12:
         return np.asarray([float(lower)], dtype=np.float64)
-
-    if not ambiguous:
-        if float(total) <= 0.0 or float(b_fixed) <= 0.0:
-            return np.asarray(
-                [_project_to_interval(lower if hint is None else hint, lower, upper)],
-                dtype=np.float64,
-            )
-        p_hat = _project_to_interval(
-            float(alt) / float(total), float(eps), float(1.0 - eps)
-        )
-        return np.asarray(
-            [_project_to_interval(p_hat / float(b_fixed), lower, upper)],
-            dtype=np.float64,
-        )
 
     if float(total) <= 0.0:
         return np.asarray(
@@ -370,7 +307,9 @@ def _mutation_region_candidate_betas(
     r3 = float(1.0 - float(eps)) / b_high
     r4 = float(1.0 - float(eps)) / b_low
 
-    candidates = _interval_endpoints(left=lower, right=upper, include_hint=hint)
+    candidates = [lower, upper]
+    if hint is not None and np.isfinite(hint):
+        candidates.append(_project_to_interval(hint, lower, upper))
     for kink in (r1, r2, r3, r4):
         if lower <= kink <= upper:
             candidates.append(float(kink))
@@ -483,55 +422,17 @@ def _local_minimum_representatives(
     )
 
 
-def _mutation_region_best_two_betas(
-    problem: ScalarProblem,
-    *,
-    alt: float,
-    total: float,
-    b_minus: float,
-    b_plus: float,
-    b_fixed: float,
-    ambiguous: bool,
-    lower: float,
-    upper: float,
-    major_prior: float,
-    eps: float,
-    tol: float,
-    max_iter: int,
-    hint: float | None,
-) -> tuple[float, float | None]:
-    return _mutation_region_best_two_from_candidates(
-        problem,
-        _mutation_region_candidate_betas(
-            alt=alt,
-            total=total,
-            b_minus=b_minus,
-            b_plus=b_plus,
-            b_fixed=b_fixed,
-            ambiguous=ambiguous,
-            lower=lower,
-            upper=upper,
-            major_prior=major_prior,
-            eps=eps,
-            tol=tol,
-            max_iter=max_iter,
-            hint=hint,
-        ),
-        tol=tol,
-        hint=hint,
-    )
-
-
-def _mutation_region_best_two_from_candidates(
+def _best_two_candidate_wells_numpy(
     problem: ScalarProblem,
     candidate_array: np.ndarray,
     *,
     tol: float,
     hint: float | None,
+    decimals: int = 12,
 ) -> tuple[float, float | None]:
     candidate_array = np.asarray(candidate_array, dtype=np.float64)
     candidate_array = candidate_array[np.isfinite(candidate_array)]
-    candidate_array = np.unique(np.round(candidate_array, 12))
+    candidate_array = np.unique(np.round(candidate_array, int(decimals)))
     candidate_array = candidate_array[
         (candidate_array >= problem.lower - 1e-12)
         & (candidate_array <= problem.upper + 1e-12)
@@ -546,6 +447,12 @@ def _mutation_region_best_two_from_candidates(
         candidate_array = np.asarray([fallback], dtype=np.float64)
 
     losses = np.asarray(scalar_loss(problem, candidate_array), dtype=np.float64)
+    finite = np.isfinite(losses)
+    if not np.any(finite):
+        fallback = problem.lower if hint is None else float(hint)
+        return _project_to_interval(fallback, problem.lower, problem.upper), None
+    candidate_array = candidate_array[finite]
+    losses = losses[finite]
     loss_tol = max(float(tol) * 10.0, 1e-10)
     local_betas, local_losses = _local_minimum_representatives(
         candidate_array,
@@ -877,23 +784,6 @@ def _pooled_sample_loss_grid_torch(
     else:
         beta_grid = beta_by_sample
         squeeze = False
-    if torch_data.path_likelihood is not None:
-        columns: list[torch.Tensor] = []
-        for grid_index in range(int(beta_grid.shape[1])):
-            phi = (
-                beta_grid[:, grid_index]
-                .unsqueeze(0)
-                .expand(int(torch_data.alt.shape[0]), -1)
-            )
-            terms = mutation_region_terms_torch(
-                torch_data,
-                phi,
-                major_prior=float(major_prior),
-                eps=float(eps),
-            )
-            columns.append(torch.sum(terms.loss, dim=0))
-        sample_losses = torch.stack(columns, dim=1)
-        return sample_losses.squeeze(-1) if squeeze else sample_losses
     num_mutations = int(torch_data.alt.shape[0])
     beta = beta_grid.unsqueeze(0).expand(num_mutations, -1, -1)
     losses = mutation_region_loss_grid_torch(
@@ -1174,20 +1064,17 @@ def _path_unit_base_points_numpy(
 ) -> tuple[np.ndarray, np.ndarray]:
     if problem.alt.size != 1:
         raise ValueError("Path-well base points require one mutation-region row.")
-    lower = problem.lower
-    upper = problem.upper
-    points: list[float] = [float(lower), float(upper), float(hint)]
-    hard: list[float] = [float(lower), float(upper)]
+    lower, upper = problem.lower, problem.upper
+    hard = scalar_breakpoints(problem, observed_only=False)
+    points: list[float] = [*hard.tolist(), float(hint)]
     first = problem.first_scale[0]
     second = problem.second_scale[0]
     switch = problem.switch[0]
     valid = problem.valid[0]
-    points.extend(switch[valid].tolist())
-    hard.extend(switch[valid].tolist())
     total = float(problem.alt[0] + problem.nonalt[0])
     smoothed_vaf = (float(problem.alt[0]) + 0.5) / (total + 1.0)
 
-    def add_probability_inverse(target: float, *, is_hard: bool) -> None:
+    def add_probability_inverse(target: float) -> None:
         with np.errstate(divide="ignore", invalid="ignore"):
             left = float(target) / first
             right = switch + (float(target) - first * switch) / second
@@ -1207,14 +1094,10 @@ def _path_unit_base_points_numpy(
         )
         values = np.concatenate((left[left_ok], right[right_ok]))
         points.extend(values.tolist())
-        if is_hard:
-            hard.extend(values.tolist())
 
-    add_probability_inverse(smoothed_vaf, is_hard=False)
-    add_probability_inverse(problem.eps, is_hard=True)
-    add_probability_inverse(1.0 - problem.eps, is_hard=True)
+    add_probability_inverse(smoothed_vaf)
     point_array = np.unique(np.round(np.asarray(points, dtype=np.float64), 14))
-    hard_array = np.unique(np.round(np.asarray(hard, dtype=np.float64), 14))
+    hard_array = np.unique(np.round(hard, 14))
     keep = (point_array >= lower - 1e-12) & (point_array <= upper + 1e-12)
     hard_keep = (hard_array >= lower - 1e-12) & (hard_array <= upper + 1e-12)
     return (
@@ -1292,44 +1175,13 @@ def _path_unit_best_two_betas_numpy(
                     root_gradient = midpoint_gradient
             candidates.append(0.5 * (root_left + root_right))
 
-    candidate_array = np.unique(
-        np.round(
-            np.clip(
-                np.asarray(candidates, dtype=np.float64),
-                problem.lower,
-                problem.upper,
-            ),
-            14,
-        )
-    )
-    losses, _ = evaluate(candidate_array)
-    finite = np.isfinite(losses)
-    if not np.any(finite):
-        return float(np.clip(hint, problem.lower, problem.upper)), None
-    candidate_array = candidate_array[finite]
-    losses = losses[finite]
-    local_betas, local_losses = _local_minimum_representatives(
-        candidate_array,
-        losses,
+    return _best_two_candidate_wells_numpy(
+        problem,
+        np.asarray(candidates, dtype=np.float64),
+        tol=tol,
         hint=hint,
-        loss_tol=max(float(tol) * 10.0, 1e-10),
+        decimals=14,
     )
-    if local_betas.size:
-        order = np.lexsort((np.abs(local_betas - hint), local_losses))
-        ordered_beta = local_betas[order]
-    else:
-        ordered_beta = candidate_array[np.argsort(losses, kind="stable")]
-    primary = float(ordered_beta[0])
-    beta_tol = max(float(tol) * 10.0, 1e-8 * max(1.0, abs(primary)))
-    secondary = next(
-        (
-            float(value)
-            for value in ordered_beta[1:]
-            if abs(float(value) - primary) > beta_tol
-        ),
-        None,
-    )
-    return primary, secondary
 
 
 def _path_scalar_wells_from_model(
@@ -1520,23 +1372,14 @@ def compute_scalar_mutation_region_wells(
             tol=float(tol),
             max_iter=int(max_iter),
         )
-    alt = np.asarray(data.alt_counts, dtype=np.float64).reshape(-1)
-    total = np.asarray(data.total_counts, dtype=np.float64).reshape(-1)
-    b_minus = (
-        np.asarray(data.scaling, dtype=np.float64)
-        * np.asarray(data.minor_cn, dtype=np.float64)
-    ).reshape(-1)
-    b_plus = (
-        np.asarray(data.scaling, dtype=np.float64)
-        * np.asarray(data.major_cn, dtype=np.float64)
-    ).reshape(-1)
-    b_fixed = (
-        np.asarray(data.scaling, dtype=np.float64)
-        * np.asarray(data.fixed_multiplicity, dtype=np.float64)
-    ).reshape(-1)
-    ambiguous = np.asarray(data.multiplicity_estimation_mask, dtype=bool).reshape(-1)
+    alt = model.alt.reshape(-1)
+    total = (model.alt + model.nonalt).reshape(-1)
+    b_minus = model.first_scale[..., 0].reshape(-1)
+    b_plus = model.first_scale[..., 1].reshape(-1)
+    b_fixed = model.first_scale[..., 0].reshape(-1)
+    ambiguous = model.valid[..., 1].reshape(-1)
     lower = np.full_like(alt, float(eps), dtype=np.float64)
-    upper = np.asarray(data.phi_upper, dtype=np.float64).reshape(-1)
+    upper = model.upper.reshape(-1)
     hint = np.clip(
         np.asarray(data.phi_init, dtype=np.float64).reshape(-1), lower, upper
     )
@@ -1576,20 +1419,22 @@ def compute_scalar_mutation_region_wells(
             # fit mask is false; those coordinates still define the graph.
             respect_observed=False,
         )
-        primary, alternate = _mutation_region_best_two_betas(
+        primary, alternate = _best_two_candidate_wells_numpy(
             problem,
-            alt=float(alt[idx]),
-            total=float(total[idx]),
-            b_minus=float(b_minus[idx]),
-            b_plus=float(b_plus[idx]),
-            b_fixed=float(b_fixed[idx]),
-            ambiguous=True,
-            lower=float(lower[idx]),
-            upper=float(upper[idx]),
-            major_prior=major_prior,
-            eps=eps,
+            _ambiguous_candidate_betas_numpy(
+                alt=float(alt[idx]),
+                total=float(total[idx]),
+                b_minus=float(b_minus[idx]),
+                b_plus=float(b_plus[idx]),
+                lower=float(lower[idx]),
+                upper=float(upper[idx]),
+                major_prior=major_prior,
+                eps=eps,
+                tol=tol,
+                max_iter=max_iter,
+                hint=float(hint[idx]),
+            ),
             tol=tol,
-            max_iter=max_iter,
             hint=float(hint[idx]),
         )
         refined[idx] = float(primary)
@@ -1599,11 +1444,9 @@ def compute_scalar_mutation_region_wells(
                 float(tol) * 10.0, 1e-8
             )
 
-    shape = data.phi_init.shape
+    shape = model.shape
     return (
-        np.clip(
-            refined.reshape(shape), eps, np.asarray(data.phi_upper, dtype=np.float64)
-        ),
+        np.clip(refined.reshape(shape), eps, model.upper),
         secondary.reshape(shape),
         valid_secondary.reshape(shape),
     )
@@ -1624,7 +1467,7 @@ def compute_scalar_mutation_region_wells_torch(
     fixed_path_scale = _fixed_linear_path_scale_torch(torch_data)
     if torch_data.path_likelihood is not None and fixed_path_scale is None:
         primary, secondary, valid_secondary = _path_scalar_wells_from_model(
-            _host_observed_model(torch_data),
+            _source_observed_model(torch_data),
             phi_init=(
                 phi_init.detach().cpu().numpy()
                 if torch.is_tensor(phi_init)
@@ -1749,7 +1592,7 @@ def compute_pooled_observed_data_start_torch(
                 else np.asarray(beta_hints)
             )
         pooled = _path_pooled_start_from_model(
-            _host_observed_model(torch_data),
+            _source_observed_model(torch_data),
             beta_hints=hints,
             eps=float(eps),
             tol=float(tol),
