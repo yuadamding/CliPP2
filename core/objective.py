@@ -1,11 +1,9 @@
 """Canonical source representation of CliPP2's observed-count likelihood.
 
-This module is intentionally not wired into the production solver yet.  It
-provides one representation in which both the historical major/minor model
-and an explicit occupancy-path model are mixtures of clipped piecewise-affine
-binomial emissions.  Runtime tensors are always rebuilt from the immutable
-float64 source arrays; a lower-precision runtime is never the source of a
-higher-precision view.
+Both the historical major/minor model and an explicit occupancy-path model are
+represented as mixtures of clipped piecewise-affine binomial emissions.
+Runtime tensors are always rebuilt from immutable float64 source arrays; a
+lower-precision runtime is never the source of a higher-precision view.
 """
 
 from __future__ import annotations
@@ -23,6 +21,10 @@ if TYPE_CHECKING:
 
 
 _MODEL_FINGERPRINT_SCHEMA = "clipp2.observed-model.v1"
+_LIKELIHOOD_FINGERPRINT_SCHEMA = "clipp2.observed-likelihood.v1"
+_BOX_FINGERPRINT_SCHEMA = "clipp2.objective-box.v1"
+_BASE_OBJECTIVE_KEY_SCHEMA = "clipp2.base-objective-key.v1"
+_LAMBDA_OBJECTIVE_KEY_SCHEMA = "clipp2.lambda-objective-key.v1"
 
 
 def _readonly_array(value: object, *, dtype: np.dtype) -> np.ndarray:
@@ -68,6 +70,77 @@ def _model_fingerprint(model: "ObservedModel") -> str:
     return digest.hexdigest()
 
 
+def _likelihood_fingerprint(model: "ObservedModel") -> str:
+    """Hash only the observed likelihood, excluding its feasible box."""
+
+    digest = hashlib.sha256()
+    _hash_text(digest, _LIKELIHOOD_FINGERPRINT_SCHEMA)
+    for name in (
+        "alt",
+        "nonalt",
+        "observed",
+        "first_scale",
+        "second_scale",
+        "switch",
+        "log_prior",
+        "valid",
+    ):
+        _hash_array(digest, name, getattr(model, name))
+    return digest.hexdigest()
+
+
+def _box_fingerprint(lower: np.ndarray, upper: np.ndarray) -> str:
+    digest = hashlib.sha256()
+    _hash_text(digest, _BOX_FINGERPRINT_SCHEMA)
+    _hash_array(digest, "lower", np.asarray(lower, dtype=np.float64))
+    _hash_array(digest, "upper", np.asarray(upper, dtype=np.float64))
+    return digest.hexdigest()
+
+
+def _key_fingerprint(schema: str, *values: str) -> str:
+    digest = hashlib.sha256()
+    _hash_text(digest, schema)
+    for value in values:
+        _hash_text(digest, value)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class BaseObjectiveKey:
+    """Source identity of the likelihood, graph, box, and clipping rule."""
+
+    likelihood_hash: str
+    graph_hash: str
+    box_hash: str
+    eps_hex: str
+
+    @property
+    def fingerprint(self) -> str:
+        return _key_fingerprint(
+            _BASE_OBJECTIVE_KEY_SCHEMA,
+            self.likelihood_hash,
+            self.graph_hash,
+            self.box_hash,
+            self.eps_hex,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class LambdaObjectiveKey:
+    """A base objective bound to one nonnegative fusion penalty."""
+
+    base: BaseObjectiveKey
+    lambda_hex: str
+
+    @property
+    def fingerprint(self) -> str:
+        return _key_fingerprint(
+            _LAMBDA_OBJECTIVE_KEY_SCHEMA,
+            self.base.fingerprint,
+            self.lambda_hex,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ObservedModel:
     """Immutable float64 source model for observed mutation counts.
@@ -95,6 +168,7 @@ class ObservedModel:
     legacy_major: np.ndarray | None
     model_id: str
     fingerprint: str = field(init=False)
+    likelihood_fingerprint: str = field(init=False)
 
     def __post_init__(self) -> None:
         observation_arrays = {
@@ -206,6 +280,11 @@ class ObservedModel:
         )
         object.__setattr__(self, "model_id", model_id)
         object.__setattr__(self, "fingerprint", _model_fingerprint(self))
+        object.__setattr__(
+            self,
+            "likelihood_fingerprint",
+            _likelihood_fingerprint(self),
+        )
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -386,6 +465,53 @@ def model_to_torch(
     )
 
 
+def make_base_objective_key(
+    model: ObservedModel,
+    *,
+    graph_hash: str,
+    eps: float,
+    lower: np.ndarray | None = None,
+    upper: np.ndarray | None = None,
+) -> BaseObjectiveKey:
+    """Construct a dtype-invariant base-objective identity from host sources."""
+
+    epsilon = float(eps)
+    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
+        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
+    graph_fingerprint = str(graph_hash).strip()
+    if not graph_fingerprint:
+        raise ValueError("graph_hash must be nonempty.")
+    box_lower = model.lower if lower is None else np.asarray(lower, dtype=np.float64)
+    box_upper = model.upper if upper is None else np.asarray(upper, dtype=np.float64)
+    if box_lower.shape != model.shape or box_upper.shape != model.shape:
+        raise ValueError(f"Objective bounds must have shape {model.shape}.")
+    if (
+        np.any(~np.isfinite(box_lower))
+        or np.any(~np.isfinite(box_upper))
+        or np.any(box_lower > box_upper)
+    ):
+        raise ValueError("Objective bounds must be finite with lower <= upper.")
+    return BaseObjectiveKey(
+        likelihood_hash=model.likelihood_fingerprint,
+        graph_hash=graph_fingerprint,
+        box_hash=_box_fingerprint(box_lower, box_upper),
+        eps_hex=epsilon.hex(),
+    )
+
+
+def make_lambda_objective_key(
+    base: BaseObjectiveKey,
+    *,
+    lambda_value: float,
+) -> LambdaObjectiveKey:
+    """Bind one base objective to an exact hexadecimal lambda identity."""
+
+    value = float(lambda_value)
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError("lambda_value must be finite and nonnegative.")
+    return LambdaObjectiveKey(base=base, lambda_hex=value.hex())
+
+
 def observed_terms_numpy(
     model: ObservedModel,
     phi: np.ndarray,
@@ -529,11 +655,15 @@ def observed_terms_torch(
 
 
 __all__ = [
+    "BaseObjectiveKey",
+    "LambdaObjectiveKey",
     "ObservedModel",
     "ObservedTerms",
     "TorchObservedModel",
     "TorchObservedTerms",
     "compile_observed_model",
+    "make_base_objective_key",
+    "make_lambda_objective_key",
     "model_to_torch",
     "observed_terms_numpy",
     "observed_terms_torch",

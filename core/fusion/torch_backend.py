@@ -71,10 +71,22 @@ class TorchTumorData:
 
     def __post_init__(self) -> None:
         if self.observed_model is None:
+            observed_model = (
+                _observed_model_from_compatibility_fields(self)
+                if self.source_model is None
+                else model_to_torch(
+                    self.source_model,
+                    TorchRuntime(
+                        device=self.alt.device,
+                        device_name=str(self.alt.device),
+                        dtype=self.alt.dtype,
+                    ),
+                )
+            )
             object.__setattr__(
                 self,
                 "observed_model",
-                _observed_model_from_compatibility_fields(self),
+                observed_model,
             )
 
 
@@ -188,11 +200,51 @@ def copy_torch_tumor_data(
     dtype: torch.dtype,
     device: torch.device,
 ) -> TorchTumorData:
-    """Copy a frozen numerical likelihood to another runtime precision.
+    """Rebuild a runtime view from source, with a legacy cast-only fallback."""
 
-    This deliberately promotes the tensors already defining the objective;
-    it does not rebuild dosage paths, priors, or scaling from source data.
-    """
+    if data.source_model is not None:
+        runtime = TorchRuntime(device=device, device_name=str(device), dtype=dtype)
+        observed_model = model_to_torch(data.source_model, runtime)
+        path_likelihood = (
+            None
+            if data.path_likelihood is None
+            else replace(
+                data.path_likelihood,
+                first_scale=observed_model.first_scale,
+                second_scale=observed_model.second_scale,
+                switch_fraction=observed_model.switch,
+                log_prior=observed_model.log_prior,
+                valid=observed_model.valid,
+                legacy_major_indicator=observed_model.legacy_major,
+            )
+        )
+        if path_likelihood is None:
+            ambiguous = observed_model.valid[..., 1]
+            b_minus = observed_model.first_scale[..., 0]
+            b_plus = observed_model.first_scale[..., 1]
+            b_fixed = torch.where(ambiguous, b_plus, b_minus)
+        else:
+            ambiguous = data.ambiguous.to(device=device)
+            b_minus = data.b_minus.to(dtype=dtype, device=device)
+            b_plus = data.b_plus.to(dtype=dtype, device=device)
+            b_fixed = data.b_fixed.to(dtype=dtype, device=device)
+        return TorchTumorData(
+            alt=observed_model.alt,
+            total=observed_model.alt + observed_model.nonalt,
+            nonalt=observed_model.nonalt,
+            phi_upper=observed_model.upper,
+            ambiguous=ambiguous,
+            b_minus=b_minus,
+            b_plus=b_plus,
+            b_fixed=b_fixed,
+            count_observed=(
+                None if data.count_observed is None else observed_model.observed
+            ),
+            path_likelihood=path_likelihood,
+            data_fingerprint=data.data_fingerprint,
+            source_model=data.source_model,
+            observed_model=observed_model,
+        )
 
     path_likelihood = (
         None
@@ -581,15 +633,19 @@ def to_torch_path_likelihood_spec(
     )
 
 
-def to_torch_tumor_data(data: TumorData, runtime: TorchRuntime) -> TorchTumorData:
+def to_torch_tumor_data(
+    data: TumorData,
+    runtime: TorchRuntime,
+    *,
+    source_model: ObservedModel | None = None,
+) -> TorchTumorData:
     dtype = runtime.dtype
     device = runtime.device
-    # ``to_torch_tumor_data`` predates the numerical options that bind the
-    # legacy major/minor prior and the clipping epsilon.  Retain an immutable
-    # default-bound source template here; production term calls rebind their
-    # requested prior on the runtime view.  A later context migration can bind
-    # the actual options on this float64 source before rebuilding an audit view.
-    source_model = compile_observed_model(data, major_prior=0.5, eps=1e-6)
+    source_model = (
+        compile_observed_model(data, major_prior=0.5, eps=1e-6)
+        if source_model is None
+        else source_model
+    )
     observed_model = model_to_torch(source_model, runtime)
     scaling = np.asarray(data.scaling, dtype=np.float64)
     count_obs_np = getattr(data, "count_observed", None)
@@ -1066,7 +1122,18 @@ def path_one_sided_gradients_torch(
         gradient_right,
         torch.zeros_like(gradient_right),
     )
-    points, valid_points = path_internal_breakpoints_torch(path, eps=float(eps))
+    points, valid_points = path_internal_breakpoints_torch(
+        replace(
+            path,
+            first_scale=model.first_scale,
+            second_scale=model.second_scale,
+            switch_fraction=model.switch,
+            log_prior=model.log_prior,
+            valid=model.valid,
+            legacy_major_indicator=model.legacy_major,
+        ),
+        eps=float(eps),
+    )
     at_breakpoint = torch.any(
         valid_points & (points == expanded_phi),
         dim=-1,

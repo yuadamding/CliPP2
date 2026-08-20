@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-import hashlib
 
 import numpy as np
 import torch
@@ -9,7 +8,13 @@ import torch
 from ...io.data import (
     TumorData,
     tumor_data_fingerprint,
-    tumor_objective_fingerprint,
+)
+from ..objective import (
+    BaseObjectiveKey,
+    compile_observed_model,
+    make_base_objective_key,
+    make_lambda_objective_key,
+    model_to_torch,
 )
 from .defaults import (
     DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
@@ -84,6 +89,7 @@ from .types import (
     TensorFusionGraph,
     TensorProblem,
     TorchFitResult,
+    TorchRuntime,
     WorksetMemoryOptions,
 )
 
@@ -107,10 +113,8 @@ def _terminal_backward_error_audit_float64(
     torch_data: TorchTumorData,
     phi: torch.Tensor,
     certificate: GraphFusionCertificate | None,
-    graph: TensorFusionGraph,
+    graph_spec: PairwiseFusionGraph,
     graph_hash: str,
-    lower: torch.Tensor,
-    upper: torch.Tensor,
     lambda_value: float,
     major_prior: float,
     eps: float,
@@ -119,14 +123,35 @@ def _terminal_backward_error_audit_float64(
     """Audit the unchanged terminal witness with float64 backward error."""
 
     device = phi.device
+    source_model = torch_data.source_model
+    if source_model is None:
+        raise ValueError("Float64 audit requires an immutable observed-model source.")
+    audit_runtime = TorchRuntime(
+        device=device,
+        device_name=str(device),
+        dtype=torch.float64,
+    )
     data64 = copy_torch_tumor_data(
         torch_data,
         dtype=torch.float64,
         device=device,
     )
+    graph64 = tensorize_graph(
+        graph_spec,
+        audit_runtime,
+        num_nodes=int(source_model.shape[0]),
+    )
     phi64 = phi.to(dtype=torch.float64, device=device)
-    lower64 = lower.to(dtype=torch.float64, device=device)
-    upper64 = upper.to(dtype=torch.float64, device=device)
+    lower64 = torch.as_tensor(
+        np.array(source_model.lower, copy=True),
+        dtype=torch.float64,
+        device=device,
+    )
+    upper64 = torch.as_tensor(
+        np.array(source_model.upper, copy=True),
+        dtype=torch.float64,
+        device=device,
+    )
     terms64 = mutation_region_terms_torch(
         data64,
         phi64,
@@ -176,8 +201,8 @@ def _terminal_backward_error_audit_float64(
         if torch.is_tensor(dense_dual) and bool(torch.any(at_breakpoint).item()):
             adjustment = graph_adjoint_edges_in_dtype(
                 dense_dual,
-                edge_u=graph.edge_u,
-                edge_v=graph.edge_v,
+                edge_u=graph64.edge_u,
+                edge_v=graph64.edge_v,
                 num_nodes=int(phi64.shape[0]),
                 dtype=torch.float64,
                 device=device,
@@ -198,7 +223,7 @@ def _terminal_backward_error_audit_float64(
         certificate=certificate,
         phi=phi64,
         grad_smooth=certificate_gradient,
-        graph=graph,
+        graph=graph64,
         graph_hash=str(graph_hash),
         lower=lower64,
         upper=upper64,
@@ -209,9 +234,9 @@ def _terminal_backward_error_audit_float64(
         _objective_value_from_mutation_region_terms_torch(
             terms64,
             phi64,
-            edge_u=graph.edge_u,
-            edge_v=graph.edge_v,
-            edge_w=graph.weight,
+            edge_u=graph64.edge_u,
+            edge_v=graph64.edge_v,
+            edge_w=graph64.weight,
             lambda_value=float(lambda_value),
         )
     )
@@ -688,71 +713,18 @@ def _normalize_objective_shape(objective_shape: str) -> str:
 
 
 def _graph_fingerprint(graph: PairwiseFusionGraph) -> str:
-    """Return an order-sensitive identity for the graph's numeric objective."""
+    """Return the immutable host graph's numerical source identity."""
 
-    digest = hashlib.sha256()
-    for name, values in (
-        ("edge_u", graph.edge_u),
-        ("edge_v", graph.edge_v),
-        ("edge_w", graph.edge_w),
-    ):
-        encoded_name = name.encode("utf-8")
-        digest.update(len(encoded_name).to_bytes(8, "little"))
-        digest.update(encoded_name)
-        array = np.ascontiguousarray(np.asarray(values))
-        encoded_dtype = str(array.dtype).encode("utf-8")
-        digest.update(len(encoded_dtype).to_bytes(8, "little"))
-        digest.update(encoded_dtype)
-        digest.update(len(array.shape).to_bytes(8, "little"))
-        for dimension in array.shape:
-            digest.update(int(dimension).to_bytes(8, "little", signed=True))
-        digest.update(array.tobytes())
-    return digest.hexdigest()
-
-
-def _objective_spec_fingerprint(
-    *,
-    objective_data_fingerprint: str,
-    graph_hash: str,
-    major_prior: float,
-    eps: float,
-    constrained_lower: np.ndarray | None = None,
-    constrained_upper: np.ndarray | None = None,
-) -> str:
-    digest = hashlib.sha256()
-    for value in (
-        "clipp2_observed_objective_v5_constrained_box_subproblem",
-        objective_data_fingerprint,
-        graph_hash,
-        float(major_prior).hex(),
-        float(eps).hex(),
-    ):
-        encoded = value.encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "little"))
-        digest.update(encoded)
-    for name, values in (
-        ("constrained_lower", constrained_lower),
-        ("constrained_upper", constrained_upper),
-    ):
-        if values is None:
-            continue
-        array = np.ascontiguousarray(np.asarray(values, dtype=np.float64))
-        digest.update(name.encode("ascii"))
-        digest.update(str(array.shape).encode("ascii"))
-        digest.update(array.dtype.str.encode("ascii"))
-        digest.update(array.tobytes(order="C"))
-    return digest.hexdigest()
+    return graph.fingerprint
 
 
 def _certificate_problem_fingerprint(
-    *, objective_spec_hash: str, lambda_value: float
+    *, base_objective_key: BaseObjectiveKey, lambda_value: float
 ) -> str:
-    digest = hashlib.sha256()
-    for value in (objective_spec_hash, float(lambda_value).hex()):
-        encoded = value.encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "little"))
-        digest.update(encoded)
-    return digest.hexdigest()
+    return make_lambda_objective_key(
+        base_objective_key,
+        lambda_value=lambda_value,
+    ).fingerprint
 
 
 def _tensor_from_start(
@@ -987,6 +959,7 @@ def _tensor_problem_from_torch_data(
         major_prior=prior,
         count_observed=torch_data.count_observed,
         path_likelihood=torch_data.path_likelihood,
+        source_model=torch_data.source_model,
     )
 
 
@@ -1004,6 +977,7 @@ def torch_data_from_context(context: SolverContext) -> TorchTumorData:
         count_observed=problem.count_observed,
         path_likelihood=problem.path_likelihood,
         data_fingerprint=context.data_fingerprint,
+        source_model=problem.source_model,
     )
 
 
@@ -1013,13 +987,16 @@ def promote_solver_context_dtype(
     dtype: torch.dtype,
     device: torch.device | None = None,
 ) -> SolverContext:
-    """Copy one frozen numerical problem without rebuilding its estimator."""
+    """Rebuild one frozen objective from its immutable host sources."""
 
     if dtype not in {torch.float32, torch.float64}:
         raise ValueError("Promoted solver contexts require float32 or float64.")
     target_device = context.runtime.device if device is None else torch.device(device)
     if context.runtime.dtype == dtype and context.runtime.device == target_device:
         return context
+    source_model = context.problem.source_model
+    if source_model is None:
+        raise ValueError("SolverContext lacks an immutable observed-model source.")
     promoted_data = copy_torch_tumor_data(
         torch_data_from_context(context),
         dtype=dtype,
@@ -1031,17 +1008,10 @@ def promote_solver_context_dtype(
         device=target_device,
         device_name=str(target_device),
     )
-    graph = replace(
-        context.graph,
-        # Edge identities are precision-independent and are shared unless the
-        # resource fallback changes devices.
-        edge_index=context.graph.edge_index.to(device=target_device),
-        weight=context.graph.weight.to(dtype=dtype, device=target_device),
-        degree=context.graph.degree.to(dtype=dtype, device=target_device),
-        pdhg_tau_node=context.graph.pdhg_tau_node.to(
-            dtype=dtype,
-            device=target_device,
-        ),
+    graph = tensorize_graph(
+        context.graph_spec,
+        runtime,
+        num_nodes=int(source_model.shape[0]),
     )
     problem = _tensor_problem_from_torch_data(
         promoted_data,
@@ -1058,8 +1028,16 @@ def promote_solver_context_dtype(
             start.to(dtype=dtype, device=target_device)
             for start in context.scalar_well_starts
         ),
-        lower=context.lower.to(dtype=dtype, device=target_device),
-        upper=context.upper.to(dtype=dtype, device=target_device),
+        lower=torch.as_tensor(
+            np.array(source_model.lower, copy=True),
+            dtype=dtype,
+            device=target_device,
+        ),
+        upper=torch.as_tensor(
+            np.array(source_model.upper, copy=True),
+            dtype=dtype,
+            device=target_device,
+        ),
         runtime=runtime,
     )
 
@@ -1210,11 +1188,24 @@ def prepare_torch_problem(
     effective_runtime = (
         resolve_runtime(device, dtype=dtype) if runtime is None else runtime
     )
+    source_model = compile_observed_model(
+        data,
+        major_prior=float(major_prior),
+        eps=float(eps),
+    )
     if torch_data is None:
-        effective_torch_data = to_torch_tumor_data(data, effective_runtime)
+        effective_torch_data = to_torch_tumor_data(
+            data,
+            effective_runtime,
+            source_model=source_model,
+        )
         data_fingerprint = effective_torch_data.data_fingerprint
     else:
-        effective_torch_data = torch_data
+        effective_torch_data = replace(
+            torch_data,
+            source_model=source_model,
+            observed_model=model_to_torch(source_model, effective_runtime),
+        )
         data_fingerprint = tumor_data_fingerprint(data)
         validate_torch_tumor_data(
             effective_torch_data,
@@ -1290,7 +1281,7 @@ def prepare_torch_problem(
         )
         tensor_graph = prebuilt_tensor_graph
     elif graph is None:
-        tensor_graph = build_complete_adaptive_tensor_graph(
+        working_tensor_graph = build_complete_adaptive_tensor_graph(
             exact_pilot_tensor,
             effective_runtime,
             count_observed=effective_torch_data.count_observed,
@@ -1298,7 +1289,15 @@ def prepare_torch_problem(
             tau=max(float(adaptive_weight_floor), float(eps)),
             baseline=float(adaptive_weight_baseline),
         )
-        effective_graph = tensor_graph_to_pairwise_graph(tensor_graph)
+        # Adaptive construction intentionally follows working-runtime
+        # arithmetic. Freeze that one result as the immutable host source, then
+        # recreate every runtime view from it.
+        effective_graph = tensor_graph_to_pairwise_graph(working_tensor_graph)
+        tensor_graph = tensorize_graph(
+            effective_graph,
+            effective_runtime,
+            num_nodes=data.num_mutations,
+        )
     else:
         effective_graph = resolve_pairwise_fusion_graph(
             data.num_mutations,
@@ -1311,12 +1310,6 @@ def prepare_torch_problem(
         tensor_graph = tensorize_graph(
             effective_graph, effective_runtime, num_nodes=data.num_mutations
         )
-
-    # Canonical provenance follows the finite-precision graph that enters the
-    # solver, not an upstream higher-precision array that was rounded during
-    # tensorization. This keeps graph hashes and reused contexts
-    # identical on CPU and CUDA.
-    effective_graph = tensor_graph_to_pairwise_graph(tensor_graph)
 
     if use_unimodal_objective and pooled_start is None:
         pooled_start_tensor = exact_pilot_tensor
@@ -1345,9 +1338,15 @@ def prepare_torch_problem(
     else:
         scalar_well_starts_seq = list(scalar_well_starts)
 
-    lower = torch.full_like(effective_torch_data.phi_upper, float(eps))
-    upper = torch.minimum(
-        effective_torch_data.phi_upper, torch.ones_like(effective_torch_data.phi_upper)
+    lower = torch.as_tensor(
+        np.array(source_model.lower, copy=True),
+        dtype=effective_runtime.dtype,
+        device=effective_runtime.device,
+    )
+    upper = torch.as_tensor(
+        np.array(source_model.upper, copy=True),
+        dtype=effective_runtime.dtype,
+        device=effective_runtime.device,
     )
     problem = _tensor_problem_from_torch_data(
         effective_torch_data,
@@ -1355,14 +1354,14 @@ def prepare_torch_problem(
         eps=float(eps),
     )
     graph_hash = _graph_fingerprint(effective_graph)
-    base_fusion_objective_hash = _objective_spec_fingerprint(
-        objective_data_fingerprint=tumor_objective_fingerprint(data),
+    base_objective_key = make_base_objective_key(
+        source_model,
         graph_hash=graph_hash,
-        major_prior=float(major_prior),
         eps=float(eps),
-        constrained_lower=lower.detach().cpu().numpy(),
-        constrained_upper=upper.detach().cpu().numpy(),
+        lower=source_model.lower,
+        upper=source_model.upper,
     )
+    base_fusion_objective_hash = base_objective_key.fingerprint
     objective_spec_hash = base_fusion_objective_hash
     return SolverContext(
         problem=problem,
@@ -1381,6 +1380,7 @@ def prepare_torch_problem(
         graph_hash=graph_hash,
         objective_spec_hash=objective_spec_hash,
         base_fusion_objective_hash=base_fusion_objective_hash,
+        base_objective_key=base_objective_key,
     )
 
 
@@ -1744,6 +1744,7 @@ def _fit_from_start(
     graph: PairwiseFusionGraph,
     tensor_graph: TensorFusionGraph,
     graph_hash: str,
+    base_objective_key: BaseObjectiveKey,
     objective_spec_hash: str,
     lambda_value: float,
     major_prior: float,
@@ -1768,6 +1769,8 @@ def _fit_from_start(
     verbose: bool,
 ) -> FusionFitArtifacts:
     tol = _validate_solver_tolerance(tol)
+    if base_objective_key.fingerprint != str(objective_spec_hash):
+        raise ValueError("Base objective key does not match objective_spec_hash.")
     if (
         solver_state is not None
         and str(solver_state.objective_spec_hash)
@@ -2763,10 +2766,8 @@ def _fit_from_start(
             torch_data=torch_data,
             phi=phi,
             certificate=certificate,
-            graph=tensor_graph,
+            graph_spec=graph,
             graph_hash=graph_hash,
-            lower=lower,
-            upper=upper,
             lambda_value=lambda_value,
             major_prior=major_prior,
             eps=eps,
@@ -2834,7 +2835,7 @@ def _fit_from_start(
         objective_spec_hash=str(objective_spec_hash),
         original_graph_hash=str(graph_hash),
         certificate_problem_hash=_certificate_problem_fingerprint(
-            objective_spec_hash=objective_spec_hash,
+            base_objective_key=base_objective_key,
             lambda_value=lambda_value,
         ),
         certificate_scope="full_original_graph",
@@ -3287,6 +3288,8 @@ def fit_observed_data_pairwise_fusion(
         state: SolverState | None,
         polish: bool = False,
     ) -> FusionFitArtifacts:
+        if context.base_objective_key is None:
+            raise ValueError("SolverContext lacks a typed base-objective key.")
         return _fit_from_start(
             data,
             torch_data=torch_data_from_context(context),
@@ -3294,6 +3297,7 @@ def fit_observed_data_pairwise_fusion(
             graph=context.graph_spec,
             tensor_graph=context.graph,
             graph_hash=str(context.graph_hash),
+            base_objective_key=context.base_objective_key,
             objective_spec_hash=str(context.objective_spec_hash),
             lambda_value=lambda_value,
             major_prior=major_prior,

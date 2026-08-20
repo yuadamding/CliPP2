@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
+import hashlib
 from typing import TYPE_CHECKING, Literal, Mapping, TypeAlias
 
 import numpy as np
 import torch
-
-if TYPE_CHECKING:
-    from ..objective import ObservedModel
 
 from .defaults import (
     DEFAULT_CERTIFICATE_MAX_ITER,
@@ -18,6 +16,28 @@ from .defaults import (
     DEFAULT_WORKSET_MAX_EXPANSIONS,
     DenseFallbackPolicy as DenseFallbackPolicy,
 )
+
+if TYPE_CHECKING:
+    from ..objective import BaseObjectiveKey, ObservedModel
+
+
+_GRAPH_FINGERPRINT_SCHEMA = "clipp2.pairwise-fusion-graph.v1"
+
+
+def _graph_source_fingerprint(
+    edge_u: np.ndarray,
+    edge_v: np.ndarray,
+    edge_w: np.ndarray,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(_GRAPH_FINGERPRINT_SCHEMA.encode("ascii"))
+    for name, value in (("edge_u", edge_u), ("edge_v", edge_v), ("edge_w", edge_w)):
+        array = np.ascontiguousarray(value)
+        digest.update(name.encode("ascii"))
+        digest.update(array.dtype.str.encode("ascii"))
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(array.tobytes())
+    return digest.hexdigest()
 
 
 SmoothGradientScope: TypeAlias = Literal[
@@ -234,13 +254,44 @@ class ExactFusionProvenance:
     fallback_reason: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PairwiseFusionGraph:
     edge_u: np.ndarray
     edge_v: np.ndarray
     edge_w: np.ndarray
     name: str = "complete_uniform"
     degree_bound: int = 1
+    fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        edge_u = np.array(self.edge_u, dtype=np.int32, copy=True, order="C")
+        edge_v = np.array(self.edge_v, dtype=np.int32, copy=True, order="C")
+        edge_w = np.array(self.edge_w, dtype=np.float64, copy=True, order="C")
+        if edge_u.ndim != 1 or edge_v.ndim != 1 or edge_w.ndim != 1:
+            raise ValueError("PairwiseFusionGraph edge arrays must be one-dimensional.")
+        if edge_u.shape != edge_v.shape or edge_u.shape != edge_w.shape:
+            raise ValueError("PairwiseFusionGraph edge arrays must have identical shapes.")
+        if np.any(edge_u < 0) or np.any(edge_v < 0):
+            raise ValueError("PairwiseFusionGraph edge indices must be nonnegative.")
+        if np.any(edge_u == edge_v):
+            raise ValueError("PairwiseFusionGraph may not contain self-loops.")
+        if np.any(~np.isfinite(edge_w)) or np.any(edge_w < 0.0):
+            raise ValueError(
+                "PairwiseFusionGraph weights must be finite and nonnegative."
+            )
+        edge_u.setflags(write=False)
+        edge_v.setflags(write=False)
+        edge_w.setflags(write=False)
+        object.__setattr__(self, "edge_u", edge_u)
+        object.__setattr__(self, "edge_v", edge_v)
+        object.__setattr__(self, "edge_w", edge_w)
+        object.__setattr__(self, "name", str(self.name))
+        object.__setattr__(self, "degree_bound", max(int(self.degree_bound), 1))
+        object.__setattr__(
+            self,
+            "fingerprint",
+            _graph_source_fingerprint(edge_u, edge_v, edge_w),
+        )
 
 @dataclass
 class FusionFitArtifacts:
@@ -368,9 +419,7 @@ class TensorProblem:
     # Kept opaque here to avoid a types/backend import cycle.  The concrete
     # value is ``TorchPathLikelihoodSpec`` when an explicit path model is used.
     path_likelihood: object | None = None
-    # Immutable float64 source for rebuilding an audit-precision runtime view.
-    # Optional until SolverContext ownership migrates from the compatibility
-    # tensors; never synthesize it by promoting those tensors.
+    # Immutable float64 source for rebuilding every audit-precision runtime view.
     source_model: ObservedModel | None = None
 
 
@@ -408,6 +457,7 @@ class SolverContext:
     graph_hash: str = ""
     objective_spec_hash: str = ""
     base_fusion_objective_hash: str = ""
+    base_objective_key: BaseObjectiveKey | None = None
     resource_fallback: str | None = None
 
 

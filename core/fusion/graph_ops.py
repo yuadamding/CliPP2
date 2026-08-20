@@ -366,9 +366,11 @@ def tensorize_graph(
     *,
     num_nodes: int,
 ) -> TensorFusionGraph:
-    edge_u = torch.as_tensor(graph.edge_u, dtype=torch.long, device=runtime.device)
-    edge_v = torch.as_tensor(graph.edge_v, dtype=torch.long, device=runtime.device)
-    weight = torch.as_tensor(graph.edge_w, dtype=runtime.dtype, device=runtime.device)
+    # The host arrays are intentionally read-only. ``torch.tensor`` creates an
+    # independent runtime view instead of aliasing immutable NumPy storage.
+    edge_u = torch.tensor(graph.edge_u, dtype=torch.long, device=runtime.device)
+    edge_v = torch.tensor(graph.edge_v, dtype=torch.long, device=runtime.device)
+    weight = torch.tensor(graph.edge_w, dtype=runtime.dtype, device=runtime.device)
     return _tensor_graph_from_edges(
         edge_u=edge_u,
         edge_v=edge_v,
