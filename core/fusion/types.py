@@ -197,6 +197,29 @@ class BackendWorkCounters:
     column_scan_passes: int = 0
     full_certificate_audit_passes: int = 0
 
+    def __add__(self, other: "BackendWorkCounters") -> "BackendWorkCounters":
+        if not isinstance(other, BackendWorkCounters):
+            return NotImplemented
+        return BackendWorkCounters(
+            **{
+                item.name: int(getattr(self, item.name))
+                + int(getattr(other, item.name))
+                for item in fields(self)
+            }
+        )
+
+    @classmethod
+    def from_attributes(cls, value: object) -> "BackendWorkCounters":
+        return cls(
+            **{
+                item.name: int(getattr(value, item.name, 0))
+                for item in fields(cls)
+            }
+        )
+
+    def as_dict(self) -> dict[str, int]:
+        return {item.name: int(getattr(self, item.name)) for item in fields(self)}
+
 
 @dataclass(frozen=True, slots=True)
 class InnerSolveResult:

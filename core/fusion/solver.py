@@ -30,8 +30,9 @@ from .defaults import (
     normalize_dense_fallback_policy,
 )
 from .certificates import (
-    audit_graph_fusion_certificate,
-    refine_graph_fusion_certificate,
+    CertificateProblem,
+    build_certificate_gradient,
+    certify,
 )
 from .graph import resolve_pairwise_fusion_graph
 from .graph_ops import (
@@ -57,7 +58,6 @@ from .torch_backend import (
     em_surrogate_terms_torch,
     graph_adjoint_edges_in_dtype,
     graph_fusion_kkt_residual_from_grad_torch,
-    path_downward_kink_mask_torch,
     path_internal_breakpoints_torch,
     path_one_sided_gradients_torch,
     pairwise_penalty_torch,
@@ -92,20 +92,6 @@ from .types import (
     TorchRuntime,
     WorksetMemoryOptions,
 )
-
-
-def _inadmissible_downward_kink_mask(
-    downward_kink: torch.Tensor,
-    lower: torch.Tensor,
-    upper: torch.Tensor,
-    phi: torch.Tensor,
-) -> torch.Tensor:
-    """Mask downward kinks only where a coordinate can actually move."""
-
-    resolution = 8.0 * torch.finfo(phi.dtype).eps * (
-        1.0 + torch.maximum(torch.abs(lower), torch.abs(upper))
-    )
-    return downward_kink & ((upper - lower) > resolution)
 
 
 def _terminal_backward_error_audit_float64(
@@ -158,77 +144,50 @@ def _terminal_backward_error_audit_float64(
         major_prior=float(major_prior),
         eps=float(eps),
     )
-    certificate_gradient = terms64.grad
-    gradient_scope = "observed_objective"
-    directional_kink_admissible = True
-    if data64.path_likelihood is not None:
-        gradient_left, gradient_right, at_breakpoint = (
-            path_one_sided_gradients_torch(data64, phi64, eps=float(eps))
-        )
-        gradient_lower = torch.minimum(gradient_left, gradient_right)
-        gradient_upper = torch.maximum(gradient_left, gradient_right)
-        downward_kink = path_downward_kink_mask_torch(
-            gradient_left,
-            gradient_right,
-            at_breakpoint,
-            tol=float(tol),
-        )
-        directional_kink_admissible = not bool(
-            torch.any(
-                _inadmissible_downward_kink_mask(
-                    downward_kink,
-                    lower64,
-                    upper64,
-                    phi64,
-                )
-            ).item()
-        )
-        gradient_lower = torch.where(
-            at_breakpoint,
-            gradient_lower,
-            terms64.grad,
-        )
-        gradient_upper = torch.where(
-            at_breakpoint,
-            gradient_upper,
-            terms64.grad,
-        )
-        certificate_gradient = torch.minimum(
-            torch.maximum(terms64.grad, gradient_lower),
-            gradient_upper,
-        )
-        dense_dual = getattr(certificate, "dual", None)
-        if torch.is_tensor(dense_dual) and bool(torch.any(at_breakpoint).item()):
-            adjustment = graph_adjoint_edges_in_dtype(
-                dense_dual,
-                edge_u=graph64.edge_u,
-                edge_v=graph64.edge_v,
-                num_nodes=int(phi64.shape[0]),
-                dtype=torch.float64,
-                device=device,
-            )
-            ideal_gradient = -adjustment
-            certificate_gradient = torch.where(
-                at_breakpoint,
-                torch.minimum(
-                    torch.maximum(ideal_gradient, gradient_lower),
-                    gradient_upper,
-                ),
-                terms64.grad,
-            )
-        if bool(torch.any(at_breakpoint).item()):
-            gradient_scope = "clarke_piecewise_observed_objective_subgradient"
-
-    diagnostics = audit_graph_fusion_certificate(
-        certificate=certificate,
+    gradient = build_certificate_gradient(
+        data64,
         phi=phi64,
-        grad_smooth=certificate_gradient,
-        graph=graph64,
-        graph_hash=str(graph_hash),
+        smooth_gradient=terms64.grad,
         lower=lower64,
         upper=upper64,
-        lambda_value=float(lambda_value),
-        atol=float(tol),
+        eps=float(eps),
+        tol=float(tol),
+    )
+    dense_dual = getattr(certificate, "dual", None)
+    if torch.is_tensor(dense_dual) and bool(
+        torch.any(gradient.at_breakpoint).item()
+    ):
+        adjustment = graph_adjoint_edges_in_dtype(
+            dense_dual,
+            edge_u=graph64.edge_u,
+            edge_v=graph64.edge_v,
+            num_nodes=int(phi64.shape[0]),
+            dtype=torch.float64,
+            device=device,
+        )
+        gradient = build_certificate_gradient(
+            data64,
+            phi=phi64,
+            smooth_gradient=terms64.grad,
+            lower=lower64,
+            upper=upper64,
+            eps=float(eps),
+            tol=float(tol),
+            fusion_adjoint=adjustment,
+        )
+    result = certify(
+        problem=CertificateProblem(
+            graph=graph64,
+            graph_hash=str(graph_hash),
+            lower=lower64,
+            upper=upper64,
+            lambda_value=float(lambda_value),
+            atol=float(tol),
+        ),
+        phi=phi64,
+        gradient=gradient,
+        witness=certificate,
+        refine=False,
     )
     fit_loss64, _, objective64, _ = (
         _objective_value_from_mutation_region_terms_torch(
@@ -241,9 +200,9 @@ def _terminal_backward_error_audit_float64(
         )
     )
     return (
-        diagnostics,
-        gradient_scope,
-        directional_kink_admissible,
+        result.diagnostics,
+        gradient.scope,
+        gradient.directional_admissible,
         float(fit_loss64),
         float(objective64),
     )
@@ -1795,6 +1754,14 @@ def _fit_from_start(
             max_compressed_cache_bytes=int(compressed_cache_max_bytes),
         ),
     )
+    certificate_problem = CertificateProblem(
+        graph=tensor_graph,
+        graph_hash=str(graph_hash),
+        lower=lower,
+        upper=upper,
+        lambda_value=float(lambda_value),
+        atol=float(tol),
+    )
     use_unimodal_objective = objective_shape.startswith("unimodal")
     require_full_step_backtracking = (
         objective_shape == "unimodal_full_step_backtracking"
@@ -1873,15 +1840,7 @@ def _fit_from_start(
     converged_outer = False
     iterations = 0
     inner_iterations = 0
-    workset_iterations = 0
-    workset_expansions = 0
-    streamed_edge_passes = 0
-    dense_iterations = 0
-    certificate_iterations = 0
-    activity_passes = 0
-    analytic_adjoint_passes = 0
-    column_scan_passes = 0
-    full_certificate_audit_passes = 0
+    work_counters = BackendWorkCounters()
     fallback_reason = ""
     current_inner_converged = False
     current_inner_kkt_residual = np.nan
@@ -1976,17 +1935,22 @@ def _fit_from_start(
                     graph_hash=graph_hash,
                     gradient_scope="observed_objective",
                 )
-            forcing_diag = audit_graph_fusion_certificate(
-                certificate=forcing_certificate,
+            forcing_gradient = build_certificate_gradient(
+                torch_data,
                 phi=phi,
-                grad_smooth=current_mutation_region_terms.grad,
-                graph=tensor_graph,
-                graph_hash=graph_hash,
+                smooth_gradient=current_mutation_region_terms.grad,
                 lower=lower,
                 upper=upper,
-                lambda_value=lambda_value,
-                atol=tol,
-            ).as_dict()
+                eps=eps,
+                tol=tol,
+            )
+            forcing_diag = certify(
+                problem=certificate_problem,
+                phi=phi,
+                gradient=forcing_gradient,
+                witness=forcing_certificate,
+                refine=False,
+            ).diagnostics.as_dict()
             inner_progress_tolerance = max(
                 5.0 * tol,
                 min(
@@ -2081,23 +2045,7 @@ def _fit_from_start(
                     backend_name=dense_inner_solver,
                     graph_hash=graph_hash,
                 )
-                workset_iterations += int(inner_result.work_counters.workset_iterations)
-                workset_expansions += int(inner_result.work_counters.workset_expansions)
-                streamed_edge_passes += int(
-                    inner_result.work_counters.streamed_edge_passes
-                )
-                dense_iterations += int(inner_result.work_counters.dense_iterations)
-                certificate_iterations += int(
-                    inner_result.work_counters.certificate_iterations
-                )
-                activity_passes += int(inner_result.work_counters.activity_passes)
-                analytic_adjoint_passes += int(
-                    inner_result.work_counters.analytic_adjoint_passes
-                )
-                column_scan_passes += int(inner_result.work_counters.column_scan_passes)
-                full_certificate_audit_passes += int(
-                    inner_result.work_counters.full_certificate_audit_passes
-                )
+                work_counters = work_counters + inner_result.work_counters
                 phi_trial = inner_result.phi
                 dense_warm_state = inner_result.warm_state
                 dual_trial = getattr(dense_warm_state, "dual", None)
@@ -2519,72 +2467,36 @@ def _fit_from_start(
                 certificate is None
                 or isinstance(observed_start, CompressedEdgeCertificate)
             )
+            periodic_gradient = build_certificate_gradient(
+                torch_data,
+                phi,
+                smooth_gradient=outer_terms.grad,
+                lower=lower,
+                upper=upper,
+                eps=eps,
+                tol=tol,
+            )
+            periodic_limit = min(
+                int(certificate_options.max_iter),
+                _PERIODIC_CERTIFICATE_MAX_ITER,
+            )
+            observed_refinement = certify(
+                problem=certificate_problem,
+                phi=phi,
+                gradient=periodic_gradient,
+                witness=observed_start,
+                refine=should_refine,
+                max_iter=periodic_limit,
+                options=(
+                    replace(certificate_options, max_iter=periodic_limit)
+                    if isinstance(observed_start, CompressedEdgeCertificate)
+                    else None
+                ),
+            )
             if should_refine:
-                observed_refinement = refine_graph_fusion_certificate(
-                    certificate=observed_start,
-                    phi=phi,
-                    grad_smooth=outer_terms.grad,
-                    gradient_scope="observed_objective",
-                    graph=tensor_graph,
-                    graph_hash=graph_hash,
-                    lower=lower,
-                    upper=upper,
-                    lambda_value=lambda_value,
-                    atol=tol,
-                    max_iter=min(
-                        int(certificate_options.max_iter),
-                        _PERIODIC_CERTIFICATE_MAX_ITER,
-                    ),
-                    options=(
-                        replace(
-                            certificate_options,
-                            max_iter=min(
-                                int(certificate_options.max_iter),
-                                _PERIODIC_CERTIFICATE_MAX_ITER,
-                            ),
-                        )
-                        if isinstance(observed_start, CompressedEdgeCertificate)
-                        else None
-                    ),
-                )
-                workset_iterations += int(
-                    observed_refinement.work_counters.workset_iterations
-                )
-                workset_expansions += int(
-                    observed_refinement.work_counters.workset_expansions
-                )
-                streamed_edge_passes += int(
-                    observed_refinement.work_counters.streamed_edge_passes
-                )
-                certificate_iterations += int(
-                    observed_refinement.work_counters.certificate_iterations
-                )
-                activity_passes += int(
-                    observed_refinement.work_counters.activity_passes
-                )
-                analytic_adjoint_passes += int(
-                    observed_refinement.work_counters.analytic_adjoint_passes
-                )
-                column_scan_passes += int(
-                    observed_refinement.work_counters.column_scan_passes
-                )
-                full_certificate_audit_passes += int(
-                    observed_refinement.work_counters.full_certificate_audit_passes
-                )
-                certificate = observed_refinement.certificate
-                outer_diag = observed_refinement.diagnostics.as_dict()
-            else:
-                outer_diag = audit_graph_fusion_certificate(
-                    certificate=certificate,
-                    phi=phi,
-                    grad_smooth=outer_terms.grad,
-                    graph=tensor_graph,
-                    graph_hash=graph_hash,
-                    lower=lower,
-                    upper=upper,
-                    lambda_value=lambda_value,
-                    atol=tol,
-                ).as_dict()
+                work_counters = work_counters + observed_refinement.work_counters
+            certificate = observed_refinement.certificate
+            outer_diag = observed_refinement.diagnostics.as_dict()
             outer_converged = bool(outer_diag["kkt_residual"] <= 5.0 * tol)
         final_relative_objective_change = float(rel_change)
         final_step_residual = float(step_residual)
@@ -2614,61 +2526,25 @@ def _fit_from_start(
             graph_hash=graph_hash,
             lambda_value=lambda_value,
         )
-    certificate_gradient = final_terms.grad
-    at_path_breakpoint = torch.zeros_like(phi, dtype=torch.bool)
-    gradient_scope = "observed_objective"
-    gradient_lower = certificate_gradient
-    gradient_upper = certificate_gradient
-    directional_kink_admissible = True
-    if torch_data.path_likelihood is not None:
-        gradient_left, gradient_right, at_path_breakpoint = (
-            path_one_sided_gradients_torch(torch_data, phi, eps=float(eps))
-        )
-        gradient_lower = torch.minimum(gradient_left, gradient_right)
-        gradient_upper = torch.maximum(gradient_left, gradient_right)
-        # A Clarke interval containing zero does not rule out a downward kink,
-        # which admits a one-sided descent direction. Until a full fusion-aware
-        # directional audit is available, keep such points selection-ineligible.
-        downward_kink = path_downward_kink_mask_torch(
-            gradient_left,
-            gradient_right,
-            at_path_breakpoint,
-            tol=float(tol),
-        )
-        directional_kink_admissible = not bool(
-            torch.any(
-                _inadmissible_downward_kink_mask(
-                    downward_kink, lower, upper, phi
-                )
-            ).item()
-        )
-        gradient_lower = torch.where(
-            at_path_breakpoint, gradient_lower, certificate_gradient
-        )
-        gradient_upper = torch.where(
-            at_path_breakpoint, gradient_upper, certificate_gradient
-        )
-        certificate_gradient = torch.minimum(
-            torch.maximum(certificate_gradient, gradient_lower),
-            gradient_upper,
-        )
-        if bool(torch.any(at_path_breakpoint).item()):
-            gradient_scope = "clarke_piecewise_observed_objective_subgradient"
+    certificate_gradient = build_certificate_gradient(
+        torch_data,
+        phi,
+        smooth_gradient=final_terms.grad,
+        lower=lower,
+        upper=upper,
+        eps=eps,
+        tol=tol,
+    )
 
     final_refinements = []
     certificate_needs_final_pass = False
     for _ in range(4):
-        final_certificate_refinement = refine_graph_fusion_certificate(
-            certificate=certificate,
+        final_certificate_refinement = certify(
+            problem=certificate_problem,
             phi=phi,
-            grad_smooth=certificate_gradient,
-            gradient_scope=gradient_scope,
-            graph=tensor_graph,
-            graph_hash=graph_hash,
-            lower=lower,
-            upper=upper,
-            lambda_value=lambda_value,
-            atol=tol,
+            gradient=certificate_gradient,
+            witness=certificate,
+            refine=True,
             max_iter=int(certificate_options.max_iter),
             options=(
                 certificate_options
@@ -2679,7 +2555,7 @@ def _fit_from_start(
         final_refinements.append(final_certificate_refinement)
         certificate = final_certificate_refinement.certificate
         certificate_needs_final_pass = False
-        if not bool(torch.any(at_path_breakpoint).item()):
+        if not bool(torch.any(certificate_gradient.at_breakpoint).item()):
             break
         interval_dual = getattr(certificate, "dual", None)
         if not torch.is_tensor(interval_dual):
@@ -2693,19 +2569,19 @@ def _fit_from_start(
             edge_v=edge_v,
             num_nodes=int(phi.shape[0]),
         )
-        ideal_gradient = -fusion_adjustment
-        next_gradient = torch.minimum(
-            torch.maximum(ideal_gradient, gradient_lower),
-            gradient_upper,
-        )
-        next_gradient = torch.where(
-            at_path_breakpoint,
-            next_gradient,
-            final_terms.grad,
+        next_gradient = build_certificate_gradient(
+            torch_data,
+            phi,
+            smooth_gradient=final_terms.grad,
+            lower=lower,
+            upper=upper,
+            eps=eps,
+            tol=tol,
+            fusion_adjoint=fusion_adjustment,
         )
         if torch.allclose(
-            next_gradient,
-            certificate_gradient,
+            next_gradient.value,
+            certificate_gradient.value,
             rtol=0.0,
             atol=max(float(tol) * 0.1, 1e-12),
         ):
@@ -2714,17 +2590,12 @@ def _fit_from_start(
         certificate_needs_final_pass = True
 
     if certificate_needs_final_pass:
-        final_certificate_refinement = refine_graph_fusion_certificate(
-            certificate=certificate,
+        final_certificate_refinement = certify(
+            problem=certificate_problem,
             phi=phi,
-            grad_smooth=certificate_gradient,
-            gradient_scope=gradient_scope,
-            graph=tensor_graph,
-            graph_hash=graph_hash,
-            lower=lower,
-            upper=upper,
-            lambda_value=lambda_value,
-            atol=tol,
+            gradient=certificate_gradient,
+            witness=certificate,
+            refine=True,
             max_iter=int(certificate_options.max_iter),
             options=(
                 certificate_options
@@ -2735,16 +2606,7 @@ def _fit_from_start(
         final_refinements.append(final_certificate_refinement)
 
     for refinement in final_refinements:
-        workset_iterations += int(refinement.work_counters.workset_iterations)
-        workset_expansions += int(refinement.work_counters.workset_expansions)
-        streamed_edge_passes += int(refinement.work_counters.streamed_edge_passes)
-        certificate_iterations += int(refinement.work_counters.certificate_iterations)
-        activity_passes += int(refinement.work_counters.activity_passes)
-        analytic_adjoint_passes += int(refinement.work_counters.analytic_adjoint_passes)
-        column_scan_passes += int(refinement.work_counters.column_scan_passes)
-        full_certificate_audit_passes += int(
-            refinement.work_counters.full_certificate_audit_passes
-        )
+        work_counters = work_counters + refinement.work_counters
     certificate = final_certificate_refinement.certificate
     final_outer_diag = final_certificate_refinement.diagnostics.as_dict()
     working_precision_kkt_residual = float(
@@ -2753,13 +2615,15 @@ def _fit_from_start(
     certificate_audit_dtype = dtype_name(runtime.dtype)
     authoritative_fit_loss = float(fit_loss)
     authoritative_objective = float(objective)
+    gradient_scope = certificate_gradient.scope
+    directional_kink_admissible = certificate_gradient.directional_admissible
     if runtime.dtype == torch.float64:
         admission_diagnostics = final_certificate_refinement.diagnostics
     else:
         (
             admission_diagnostics,
             audit_gradient_scope,
-            audit_directional_kink_admissible,
+            audit_directional_admissible,
             authoritative_fit_loss,
             authoritative_objective,
         ) = _terminal_backward_error_audit_float64(
@@ -2774,11 +2638,14 @@ def _fit_from_start(
             tol=tol,
         )
         certificate_audit_dtype = "float64"
-        gradient_scope = str(audit_gradient_scope)
+        gradient_scope = audit_gradient_scope
         directional_kink_admissible = bool(
-            directional_kink_admissible and audit_directional_kink_admissible
+            directional_kink_admissible
+            and audit_directional_admissible
         )
-        full_certificate_audit_passes += 1
+        work_counters = work_counters + BackendWorkCounters(
+            full_certificate_audit_passes=1
+        )
     admission_diag = admission_diagnostics.as_dict()
     for key in (
         "backward_error_stationarity_residual",
@@ -2853,15 +2720,7 @@ def _fit_from_start(
         directional_kink_admissible=bool(directional_kink_admissible),
         backend_name=str(inner_solver),
         backend_iterations=int(inner_iterations),
-        workset_iterations=int(workset_iterations),
-        workset_expansions=int(workset_expansions),
-        streamed_edge_passes=int(streamed_edge_passes),
-        dense_iterations=int(dense_iterations),
-        certificate_iterations=int(certificate_iterations),
-        activity_passes=int(activity_passes),
-        analytic_adjoint_passes=int(analytic_adjoint_passes),
-        column_scan_passes=int(column_scan_passes),
-        full_certificate_audit_passes=int(full_certificate_audit_passes),
+        **work_counters.as_dict(),
         fallback_reason=str(fallback_reason),
     )
     stationarity_certified = bool(selection_eligible)
@@ -3014,7 +2873,9 @@ def _fit_from_start(
         ),
         graph_name=str(graph.name),
         admm_iterations=(
-            int(dense_iterations) if inner_solver == "admm_complete_graph" else 0
+            int(work_counters.dense_iterations)
+            if inner_solver == "admm_complete_graph"
+            else 0
         ),
         inner_solver=str(inner_solver),
         certificate=certificate,
@@ -3145,7 +3006,9 @@ def _fit_from_start(
         torch_result=torch_result,
         inner_iterations=int(inner_iterations),
         admm_iterations=(
-            int(dense_iterations) if inner_solver == "admm_complete_graph" else 0
+            int(work_counters.dense_iterations)
+            if inner_solver == "admm_complete_graph"
+            else 0
         ),
         inner_solver=str(inner_solver),
         certificate=certificate,
@@ -3545,48 +3408,17 @@ def fit_observed_data_pairwise_fusion(
         attempted_provenance = attempted.exactness_provenance
         if current_provenance is None or attempted_provenance is None:
             return artifacts
+        merged_work = (
+            BackendWorkCounters.from_attributes(current_provenance)
+            + BackendWorkCounters.from_attributes(attempted_provenance)
+        )
         merged_provenance = replace(
             current_provenance,
             backend_iterations=(
                 int(current_provenance.backend_iterations)
                 + int(attempted_provenance.backend_iterations)
             ),
-            workset_iterations=(
-                int(current_provenance.workset_iterations)
-                + int(attempted_provenance.workset_iterations)
-            ),
-            workset_expansions=(
-                int(current_provenance.workset_expansions)
-                + int(attempted_provenance.workset_expansions)
-            ),
-            streamed_edge_passes=(
-                int(current_provenance.streamed_edge_passes)
-                + int(attempted_provenance.streamed_edge_passes)
-            ),
-            dense_iterations=(
-                int(current_provenance.dense_iterations)
-                + int(attempted_provenance.dense_iterations)
-            ),
-            certificate_iterations=(
-                int(current_provenance.certificate_iterations)
-                + int(attempted_provenance.certificate_iterations)
-            ),
-            activity_passes=(
-                int(current_provenance.activity_passes)
-                + int(attempted_provenance.activity_passes)
-            ),
-            analytic_adjoint_passes=(
-                int(current_provenance.analytic_adjoint_passes)
-                + int(attempted_provenance.analytic_adjoint_passes)
-            ),
-            column_scan_passes=(
-                int(current_provenance.column_scan_passes)
-                + int(attempted_provenance.column_scan_passes)
-            ),
-            full_certificate_audit_passes=(
-                int(current_provenance.full_certificate_audit_passes)
-                + int(attempted_provenance.full_certificate_audit_passes)
-            ),
+            **merged_work.as_dict(),
             fallback_reason=_combine_fallback_reasons(
                 attempted_provenance.fallback_reason,
                 current_provenance.fallback_reason,

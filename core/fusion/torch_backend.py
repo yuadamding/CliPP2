@@ -1596,7 +1596,7 @@ def backward_error_stationarity_residual_torch(
     return torch.max(torch.abs(violation) / scale)
 
 
-def _edge_kkt_maxima_from_diff_torch(
+def edge_kkt_maxima_from_diff_torch(
     *,
     diff: torch.Tensor,
     dual: torch.Tensor | None,
@@ -1634,7 +1634,7 @@ def _edge_kkt_maxima_from_diff_torch(
     )
 
 
-def _graph_fusion_kkt_diagnostics_from_components_torch(
+def graph_fusion_kkt_diagnostics_from_components_torch(
     *,
     phi: torch.Tensor,
     grad_smooth: torch.Tensor,
@@ -1823,7 +1823,7 @@ def graph_fusion_kkt_residual_from_grad_torch(
     max_scaled_edge_residual = zero
     max_scaled_ball_residual = zero
     if num_edges == 0 or lambda_value <= 0.0:
-        return _graph_fusion_kkt_diagnostics_from_components_torch(
+        return graph_fusion_kkt_diagnostics_from_components_torch(
             phi=phi,
             grad_smooth=grad_smooth,
             adj=adj,
@@ -1859,7 +1859,7 @@ def graph_fusion_kkt_residual_from_grad_torch(
             radius_max,
             scaled_edge_max,
             scaled_ball_max,
-        ) = _edge_kkt_maxima_from_diff_torch(
+        ) = edge_kkt_maxima_from_diff_torch(
             diff=diff,
             dual=dual_chunk,
             radius=radius,
@@ -1874,7 +1874,7 @@ def graph_fusion_kkt_residual_from_grad_torch(
             max_scaled_ball_residual, scaled_ball_max
         )
 
-    return _graph_fusion_kkt_diagnostics_from_components_torch(
+    return graph_fusion_kkt_diagnostics_from_components_torch(
         phi=phi,
         grad_smooth=grad_smooth,
         adj=adj,
@@ -2445,7 +2445,7 @@ def _complete_graph_admm_kkt_residual_from_maxima_torch(
     atol: float,
     diagnostics_out: dict[str, float | int] | None = None,
 ) -> float:
-    diag = _graph_fusion_kkt_diagnostics_from_components_torch(
+    diag = graph_fusion_kkt_diagnostics_from_components_torch(
         phi=phi,
         grad_smooth=grad_smooth,
         adj=adj,
@@ -2794,7 +2794,7 @@ def _closed_form_box_fusion_result(
     diagnostics_out: dict[str, float | int] | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
     projected = torch.minimum(torch.maximum(U, lower), upper)
-    diag = _graph_fusion_kkt_diagnostics_from_components_torch(
+    diag = graph_fusion_kkt_diagnostics_from_components_torch(
         phi=projected,
         grad_smooth=h * (projected - U),
         adj=torch.zeros_like(projected),
@@ -3006,7 +3006,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
             audit_due = False
         if audit_due:
             kkt_audits += 1
-            edge_max, ball_max, radius_max, _, _ = _edge_kkt_maxima_from_diff_torch(
+            edge_max, ball_max, radius_max, _, _ = edge_kkt_maxima_from_diff_torch(
                 diff=edge_diff,
                 dual=actual_dual,
                 radius=radius,
@@ -3302,7 +3302,7 @@ def _solve_majorized_subproblem_alm_streaming_torch(
                     edge_v=edge_v[edge_slice],
                 )
                 edge_max, ball_max, radius_max, _, _ = (
-                    _edge_kkt_maxima_from_diff_torch(
+                    edge_kkt_maxima_from_diff_torch(
                     diff=edge_diff,
                     dual=float(rho) * scaled_dual[edge_slice],
                     radius=float(lambda_value) * edge_w[edge_slice],

@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from typing import TYPE_CHECKING
 
 import torch
 
 from .torch_backend import (
-    backward_error_stationarity_residual_torch,
+    edge_kkt_maxima_from_diff_torch,
+    graph_fusion_kkt_diagnostics_from_components_torch,
     graph_fusion_kkt_residual_from_grad_torch,
+    path_downward_kink_mask_torch,
+    path_one_sided_gradients_torch,
     project_stationarity_cone_torch,
     refine_graph_fusion_dual_certificate_torch,
-    stationarity_residual_torch,
 )
 from .graph_ops import project_dual_ball
 from .types import (
@@ -24,6 +27,9 @@ from .types import (
     TensorFusionGraph,
 )
 
+if TYPE_CHECKING:
+    from .torch_backend import TorchTumorData
+
 
 # Column generation assumes that the retained-edge subproblem has itself been
 # solved.  Repeatedly enlarging an unconverged workset is both non-authoritative
@@ -34,7 +40,45 @@ _MAX_CONSECUTIVE_UNCONVERGED_WORKSETS = 3
 
 
 @dataclass(frozen=True, slots=True)
-class CertificateRefinementResult:
+class CertificateProblem:
+    """Fixed graph-fusion objective surface used by every certificate pass."""
+
+    graph: TensorFusionGraph
+    graph_hash: str
+    lower: torch.Tensor
+    upper: torch.Tensor
+    lambda_value: float
+    atol: float
+
+    def __post_init__(self) -> None:
+        if not str(self.graph_hash):
+            raise ValueError("Certificate graph hash must be nonempty.")
+        if self.lower.ndim != 2 or tuple(self.lower.shape) != tuple(
+            self.upper.shape
+        ):
+            raise ValueError("Certificate bounds must have one identical 2-D shape.")
+        if int(self.lower.shape[0]) != int(self.graph.num_nodes):
+            raise ValueError("Certificate bounds must have shape (M, S).")
+        if float(self.lambda_value) < 0.0 or not math.isfinite(
+            float(self.lambda_value)
+        ):
+            raise ValueError("Certificate lambda must be finite and nonnegative.")
+        if float(self.atol) < 0.0 or not math.isfinite(float(self.atol)):
+            raise ValueError("Certificate tolerance must be finite and nonnegative.")
+
+
+@dataclass(frozen=True, slots=True)
+class CertificateGradient:
+    """One observed-objective generalized gradient and its kink provenance."""
+
+    value: torch.Tensor
+    scope: SmoothGradientScope
+    directional_admissible: bool
+    at_breakpoint: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class CertificateResult:
     certificate: GraphFusionCertificate | None
     diagnostics: KKTDiagnostics
     status: str
@@ -44,6 +88,106 @@ class CertificateRefinementResult:
     stationarity_before: float
     stationarity_after: float
     work_counters: BackendWorkCounters = BackendWorkCounters()
+
+
+def _inadmissible_downward_kink_mask(
+    downward_kink: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    phi: torch.Tensor,
+) -> torch.Tensor:
+    """Mask downward kinks only where a coordinate can actually move."""
+
+    resolution = 8.0 * torch.finfo(phi.dtype).eps * (
+        1.0 + torch.maximum(torch.abs(lower), torch.abs(upper))
+    )
+    return downward_kink & ((upper - lower) > resolution)
+
+
+def build_certificate_gradient(
+    data: TorchTumorData,
+    phi: torch.Tensor,
+    *,
+    smooth_gradient: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    eps: float,
+    tol: float,
+    fusion_adjoint: torch.Tensor | None = None,
+) -> CertificateGradient:
+    """Build the sole generalized-gradient representation used by audits.
+
+    The observed kernel supplies the left derivative.  At explicit-path
+    breakpoints, a supplied fusion adjoint selects the interval member closest
+    to stationarity; without one, the left derivative is retained exactly.
+    Downward kinks remain selection-ineligible independently of that choice.
+    """
+
+    expected_shape = tuple(phi.shape)
+    for name, value in (
+        ("smooth_gradient", smooth_gradient),
+        ("lower", lower),
+        ("upper", upper),
+    ):
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(f"{name} must have shape {expected_shape}.")
+    if fusion_adjoint is not None and tuple(fusion_adjoint.shape) != expected_shape:
+        raise ValueError(f"fusion_adjoint must have shape {expected_shape}.")
+
+    at_breakpoint = torch.zeros_like(phi, dtype=torch.bool)
+    if data.path_likelihood is None:
+        return CertificateGradient(
+            value=smooth_gradient,
+            scope="observed_objective",
+            directional_admissible=True,
+            at_breakpoint=at_breakpoint,
+        )
+
+    gradient_left, gradient_right, at_breakpoint = (
+        path_one_sided_gradients_torch(data, phi, eps=float(eps))
+    )
+    gradient_lower = torch.where(
+        at_breakpoint,
+        torch.minimum(gradient_left, gradient_right),
+        smooth_gradient,
+    )
+    gradient_upper = torch.where(
+        at_breakpoint,
+        torch.maximum(gradient_left, gradient_right),
+        smooth_gradient,
+    )
+    target = smooth_gradient if fusion_adjoint is None else -fusion_adjoint
+    value = torch.where(
+        at_breakpoint,
+        torch.minimum(torch.maximum(target, gradient_lower), gradient_upper),
+        smooth_gradient,
+    )
+    downward_kink = path_downward_kink_mask_torch(
+        gradient_left,
+        gradient_right,
+        at_breakpoint,
+        tol=float(tol),
+    )
+    directional_admissible = not bool(
+        torch.any(
+            _inadmissible_downward_kink_mask(
+                downward_kink,
+                lower,
+                upper,
+                phi,
+            )
+        ).item()
+    )
+    return CertificateGradient(
+        value=value,
+        scope=(
+            "clarke_piecewise_observed_objective_subgradient"
+            if bool(torch.any(at_breakpoint).item())
+            else "observed_objective"
+        ),
+        directional_admissible=directional_admissible,
+        at_breakpoint=at_breakpoint,
+    )
 
 
 def _analytic_nonfused_adjoint(
@@ -446,7 +590,7 @@ def _refine_compressed_certificate(
     lambda_value: float,
     atol: float,
     options: CertificateOptions,
-) -> CertificateRefinementResult:
+) -> CertificateResult:
     if certificate.graph_hash != str(graph_hash):
         raise ValueError("Compressed certificate graph hash does not match the graph.")
     raw_edge_ids = certificate.internal_edge_ids
@@ -473,7 +617,7 @@ def _refine_compressed_certificate(
             upper=upper,
             atol=atol,
         )
-        return CertificateRefinementResult(
+        return CertificateResult(
             certificate=certificate,
             diagnostics=diag,
             status="resource_limit",
@@ -518,7 +662,7 @@ def _refine_compressed_certificate(
             upper=upper,
             atol=atol,
         )
-        return CertificateRefinementResult(
+        return CertificateResult(
             certificate=certificate,
             diagnostics=diag,
             status="resource_limit",
@@ -599,7 +743,7 @@ def _refine_compressed_certificate(
             graph_hash=certificate.graph_hash,
             gradient_scope=gradient_scope,
         )
-        return CertificateRefinementResult(
+        return CertificateResult(
             certificate=certified,
             diagnostics=before,
             status="certified",
@@ -739,7 +883,7 @@ def _refine_compressed_certificate(
             graph_hash=graph_hash,
             gradient_scope=gradient_scope,
         )
-    return CertificateRefinementResult(
+    return CertificateResult(
         certificate=certificate,
         diagnostics=final_diag,
         status=status,
@@ -907,130 +1051,50 @@ def _compressed_graph_fusion_kkt(
         adj.index_add_(0, edge_v, dual_chunk, alpha=-1.0)
 
         if num_edges > 0 and lambda_value > 0.0:
-            prox_input = diff + dual_chunk
-            prox_input_norm = torch.linalg.vector_norm(prox_input, dim=1)
-            big = prox_input_norm >= radius
-            safe_norm = prox_input_norm.clamp_min(1e-300)
-            active_residual = (
-                -dual_chunk + radius[:, None] * prox_input / safe_norm[:, None]
-            )
-            edge_residual = torch.where(
-                big,
-                torch.linalg.vector_norm(active_residual, dim=1),
-                torch.linalg.vector_norm(diff, dim=1),
-            )
-            ball_residual = torch.clamp(
-                torch.linalg.vector_norm(dual_chunk, dim=1) - radius,
-                min=0.0,
+            (
+                edge_residual,
+                ball_residual,
+                radius_max,
+                scaled_edge_residual,
+                scaled_ball_residual,
+            ) = edge_kkt_maxima_from_diff_torch(
+                diff=diff,
+                dual=dual_chunk,
+                radius=radius,
             )
             max_edge_residual = max(
                 max_edge_residual,
-                float(torch.max(edge_residual).item())
-                if edge_residual.numel()
-                else 0.0,
+                float(edge_residual.item()),
             )
             max_ball_residual = max(
                 max_ball_residual,
-                float(torch.max(ball_residual).item())
-                if ball_residual.numel()
-                else 0.0,
+                float(ball_residual.item()),
             )
             max_radius = max(
                 max_radius,
-                float(torch.max(radius).item()) if radius.numel() else 0.0,
+                float(radius_max.item()),
             )
-            scale = torch.maximum(torch.ones_like(radius), radius)
             max_scaled_edge_residual = max(
-                max_scaled_edge_residual,
-                float(torch.max(edge_residual / scale).item())
-                if edge_residual.numel()
-                else 0.0,
+                max_scaled_edge_residual, float(scaled_edge_residual.item())
             )
             max_scaled_ball_residual = max(
-                max_scaled_ball_residual,
-                float(torch.max(ball_residual / scale).item())
-                if ball_residual.numel()
-                else 0.0,
+                max_scaled_ball_residual, float(scaled_ball_residual.item())
             )
 
-    total_grad = grad_smooth + adj
-    stat = stationarity_residual_torch(
-        total_grad=total_grad,
-        phi=phi,
-        lower=lower,
-        upper=upper,
-        atol=atol,
-    )
-    smooth_gradient_norm = float(torch.linalg.norm(grad_smooth).item())
-    fusion_adjustment_norm = float(torch.linalg.norm(adj).item())
-    projected_stationarity_norm = float(torch.linalg.norm(stat).item())
-    stationarity_normalizer = 1.0 + smooth_gradient_norm + fusion_adjustment_norm
-    stationarity_residual = projected_stationarity_norm / max(
-        stationarity_normalizer, 1e-300
-    )
-    backward_error_stationarity_residual = float(
-        backward_error_stationarity_residual_torch(
+    return KKTDiagnostics.from_mapping(
+        graph_fusion_kkt_diagnostics_from_components_torch(
+            phi=phi,
             grad_smooth=grad_smooth,
             adj=adj,
-            phi=phi,
             lower=lower,
             upper=upper,
-        ).item()
-    )
-    frozen = upper <= lower + float(atol)
-    lower_active = phi <= lower + float(atol)
-    upper_active = phi >= upper - float(atol)
-    interior = ~(lower_active | upper_active | frozen)
-    diagnostic_lower = lower_active & ~upper_active & ~frozen
-    diagnostic_upper = upper_active & ~frozen
-    box_violation = torch.maximum(
-        torch.clamp(lower - phi, min=0.0), torch.clamp(phi - upper, min=0.0)
-    )
-    box_primal_violation = (
-        float(torch.max(box_violation).item()) if box_violation.numel() else 0.0
-    )
-    box_scale = 1.0 + max(
-        float(torch.max(torch.abs(lower)).item()) if lower.numel() else 0.0,
-        float(torch.max(torch.abs(upper)).item()) if upper.numel() else 0.0,
-    )
-    box_residual = box_primal_violation / max(box_scale, 1e-300)
-    edge_subgradient_residual = max_edge_residual / (1.0 + max_radius)
-    dual_ball_residual = max_ball_residual / (1.0 + max_radius)
-    backward_error_kkt_residual = max(
-        backward_error_stationarity_residual,
-        max_scaled_edge_residual,
-        max_scaled_ball_residual,
-        float(box_residual),
-    )
-    return KKTDiagnostics(
-        stationarity_residual=float(stationarity_residual),
-        projected_stationarity_residual=float(stationarity_residual),
-        projected_stationarity_norm=projected_stationarity_norm,
-        stationarity_normalizer=float(stationarity_normalizer),
-        smooth_gradient_norm=smooth_gradient_norm,
-        fusion_adjustment_norm=fusion_adjustment_norm,
-        edge_subgradient_residual=float(edge_subgradient_residual),
-        dual_ball_residual=float(dual_ball_residual),
-        box_primal_violation=box_primal_violation,
-        num_interior_coordinates=int(torch.sum(interior).item()),
-        num_lower_active_coordinates=int(torch.sum(diagnostic_lower).item()),
-        num_upper_active_coordinates=int(torch.sum(diagnostic_upper).item()),
-        num_frozen_coordinates=int(torch.sum(frozen).item()),
-        box_residual=float(box_residual),
-        kkt_residual=max(
-            float(stationarity_residual),
-            float(edge_subgradient_residual),
-            float(dual_ball_residual),
-            float(box_residual),
-        ),
-        backward_error_stationarity_residual=(
-            backward_error_stationarity_residual
-        ),
-        backward_error_edge_subgradient_residual=float(
-            max_scaled_edge_residual
-        ),
-        backward_error_dual_ball_residual=float(max_scaled_ball_residual),
-        backward_error_kkt_residual=float(backward_error_kkt_residual),
+            atol=atol,
+            max_edge_residual=max_edge_residual,
+            max_ball_residual=max_ball_residual,
+            max_radius=max_radius,
+            max_scaled_edge_residual=max_scaled_edge_residual,
+            max_scaled_ball_residual=max_scaled_ball_residual,
+        )
     )
 
 
@@ -1046,63 +1110,52 @@ def _dense_dual_for_graph(
     return certificate.dual
 
 
-def audit_graph_fusion_certificate(
+def _audit_certificate(
     *,
     certificate: GraphFusionCertificate | None,
     phi: torch.Tensor,
     grad_smooth: torch.Tensor,
-    graph: TensorFusionGraph,
-    graph_hash: str,
-    lower: torch.Tensor,
-    upper: torch.Tensor,
-    lambda_value: float,
-    atol: float,
+    problem: CertificateProblem,
 ) -> KKTDiagnostics:
-    """Audit a certificate without imposing a dense representation contract."""
-
     if isinstance(certificate, CompressedEdgeCertificate):
         return _compressed_graph_fusion_kkt(
             certificate=certificate,
             phi=phi,
             grad_smooth=grad_smooth,
-            graph=graph,
-            graph_hash=graph_hash,
-            lower=lower,
-            upper=upper,
-            lambda_value=lambda_value,
-            atol=atol,
+            graph=problem.graph,
+            graph_hash=problem.graph_hash,
+            lower=problem.lower,
+            upper=problem.upper,
+            lambda_value=problem.lambda_value,
+            atol=problem.atol,
         )
     values = graph_fusion_kkt_residual_from_grad_torch(
         phi=phi,
         grad_smooth=grad_smooth,
-        dual_kkt=_dense_dual_for_graph(certificate, graph_hash=graph_hash),
-        lower=lower,
-        upper=upper,
-        edge_u=graph.edge_u,
-        edge_v=graph.edge_v,
-        edge_w=graph.weight,
-        lambda_value=lambda_value,
-        atol=atol,
+        dual_kkt=_dense_dual_for_graph(
+            certificate, graph_hash=problem.graph_hash
+        ),
+        lower=problem.lower,
+        upper=problem.upper,
+        edge_u=problem.graph.edge_u,
+        edge_v=problem.graph.edge_v,
+        edge_w=problem.graph.weight,
+        lambda_value=problem.lambda_value,
+        atol=problem.atol,
     )
     return KKTDiagnostics.from_mapping(values)
 
 
-def refine_graph_fusion_certificate(
+def _refine_certificate(
     *,
     certificate: GraphFusionCertificate | None,
     phi: torch.Tensor,
     grad_smooth: torch.Tensor,
     gradient_scope: SmoothGradientScope,
-    graph: TensorFusionGraph,
-    graph_hash: str,
-    lower: torch.Tensor,
-    upper: torch.Tensor,
-    lambda_value: float,
-    atol: float,
+    problem: CertificateProblem,
     max_iter: int = 96,
     options: CertificateOptions | None = None,
-) -> CertificateRefinementResult:
-    """Refine and audit a certificate for the supplied fixed smooth gradient."""
+) -> CertificateResult:
 
     if isinstance(certificate, CompressedEdgeCertificate):
         effective_options = options or CertificateOptions(
@@ -1113,38 +1166,40 @@ def refine_graph_fusion_certificate(
             phi=phi,
             grad_smooth=grad_smooth,
             gradient_scope=gradient_scope,
-            graph=graph,
-            graph_hash=graph_hash,
-            lower=lower,
-            upper=upper,
-            lambda_value=lambda_value,
-            atol=atol,
+            graph=problem.graph,
+            graph_hash=problem.graph_hash,
+            lower=problem.lower,
+            upper=problem.upper,
+            lambda_value=problem.lambda_value,
+            atol=problem.atol,
             options=effective_options,
         )
     dense = refine_graph_fusion_dual_certificate_torch(
         phi=phi,
         grad_smooth=grad_smooth,
-        dual_kkt=_dense_dual_for_graph(certificate, graph_hash=graph_hash),
-        lower=lower,
-        upper=upper,
-        edge_u=graph.edge_u,
-        edge_v=graph.edge_v,
-        edge_w=graph.weight,
-        lambda_value=lambda_value,
-        atol=atol,
+        dual_kkt=_dense_dual_for_graph(
+            certificate, graph_hash=problem.graph_hash
+        ),
+        lower=problem.lower,
+        upper=problem.upper,
+        edge_u=problem.graph.edge_u,
+        edge_v=problem.graph.edge_v,
+        edge_w=problem.graph.weight,
+        lambda_value=problem.lambda_value,
+        atol=problem.atol,
         max_iter=max_iter,
     )
     dual = dense["dual"]
     refined_certificate = (
         DenseEdgeCertificate(
             dual=dual,
-            graph_hash=str(graph_hash),
+            graph_hash=str(problem.graph_hash),
             gradient_scope=gradient_scope,
         )
         if torch.is_tensor(dual)
         else None
     )
-    return CertificateRefinementResult(
+    return CertificateResult(
         certificate=refined_certificate,
         diagnostics=KKTDiagnostics.from_mapping(dense["diag"]),
         status=str(dense["status"]),
@@ -1156,4 +1211,58 @@ def refine_graph_fusion_certificate(
         work_counters=BackendWorkCounters(
             certificate_iterations=int(dense["refinement_iterations"])
         ),
+    )
+
+
+def certify(
+    *,
+    problem: CertificateProblem,
+    phi: torch.Tensor,
+    gradient: CertificateGradient,
+    witness: GraphFusionCertificate | None,
+    refine: bool,
+    max_iter: int = 96,
+    options: CertificateOptions | None = None,
+) -> CertificateResult:
+    """Refine and/or audit one full-original-graph certificate.
+
+    This is the authoritative high-level entry point.  Dense and compressed
+    representations remain internal choices and always return the same typed
+    result surface.
+    """
+
+    expected_shape = tuple(problem.lower.shape)
+    if tuple(phi.shape) != expected_shape:
+        raise ValueError(f"Certificate phi must have shape {expected_shape}.")
+    if tuple(gradient.value.shape) != expected_shape:
+        raise ValueError(f"Certificate gradient must have shape {expected_shape}.")
+    if tuple(gradient.at_breakpoint.shape) != expected_shape:
+        raise ValueError(
+            f"Certificate breakpoint mask must have shape {expected_shape}."
+        )
+    if refine:
+        return _refine_certificate(
+            certificate=witness,
+            phi=phi,
+            grad_smooth=gradient.value,
+            gradient_scope=gradient.scope,
+            problem=problem,
+            max_iter=max_iter,
+            options=options,
+        )
+    diagnostics = _audit_certificate(
+        certificate=witness,
+        phi=phi,
+        grad_smooth=gradient.value,
+        problem=problem,
+    )
+    return CertificateResult(
+        certificate=witness,
+        diagnostics=diagnostics,
+        status="audited",
+        dual_refined=False,
+        fused_edges=0,
+        nonzero_edges=0,
+        stationarity_before=diagnostics.stationarity_residual,
+        stationarity_after=diagnostics.stationarity_residual,
     )
