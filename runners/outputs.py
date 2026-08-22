@@ -10,7 +10,7 @@ from ..core.fusion.path_summary import (
     path_posterior_at_phi_numpy,
     summarize_path_posterior_numpy,
 )
-from ..core.model import FitResult
+from ..core.fusion.types import RawFit
 from ..io.data import TumorData
 from ..model_selection.partitions import _partition_signature
 from ..model_selection.types import (
@@ -38,7 +38,7 @@ def _validated_profile(
 
 
 def _validate_identity(
-    raw_fit: FitResult,
+    raw_fit: RawFit,
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
 ) -> np.ndarray:
@@ -57,23 +57,18 @@ def _validate_identity(
         raise AssertionError("Selected partition and fixed refit signatures differ.")
     if isinstance(partition, FusionPartition) and not partition.certified:
         raise AssertionError("Refusing to serialize an uncertified raw partition.")
-    if (
-        isinstance(partition, DirectPartition)
-        and not partition.deterministic_generation
-    ):
-        raise AssertionError("Refusing to serialize a nondeterministic partition.")
     return labels
 
 
 def _path_supported_mask(data: TumorData, shape: tuple[int, int]) -> np.ndarray:
-    reasons = getattr(data, "path_unsupported_reason", None)
+    reasons = data.path_unsupported_reason
     if reasons is None:
         return np.ones(shape, dtype=bool)
     reason_array = np.asarray(reasons, dtype=object)
     if tuple(reason_array.shape) != tuple(shape):
         raise ValueError("path_unsupported_reason shape does not match observations.")
     supported = np.asarray(pd.isna(reason_array), dtype=bool)
-    count_observed = getattr(data, "count_observed", None)
+    count_observed = data.count_observed
     observed = (
         np.ones(shape, dtype=bool)
         if count_observed is None
@@ -94,7 +89,7 @@ def _path_summary_for_profile(
     *,
     eps: float,
 ) -> dict[str, np.ndarray] | None:
-    spec = getattr(data, "path_likelihood", None)
+    spec = data.path_likelihood
     if spec is None:
         return None
     posterior = path_posterior_at_phi_numpy(data, phi, eps=float(eps))
@@ -108,7 +103,7 @@ def _path_summary_for_profile(
 
 def mutation_output_table(
     data: TumorData,
-    raw_fit: FitResult,
+    raw_fit: RawFit,
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
 ) -> pd.DataFrame:
@@ -132,7 +127,7 @@ def mutation_output_table(
 
 def cluster_output_table(
     data: TumorData,
-    raw_fit: FitResult,
+    raw_fit: RawFit,
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
 ) -> pd.DataFrame:
@@ -208,7 +203,7 @@ def _add_path_summary(
 
 def mutation_region_output_table(
     data: TumorData,
-    raw_fit: FitResult,
+    raw_fit: RawFit,
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
     *,
@@ -234,8 +229,8 @@ def mutation_region_output_table(
             "minor_cn": data.minor_cn.reshape(-1),
         }
     )
-    eps = float(getattr(raw_fit, "likelihood_eps", 1e-6))
-    if getattr(data, "path_likelihood", None) is None:
+    eps = float(raw_fit.provenance.likelihood_eps)
+    if data.path_likelihood is None:
         _add_legacy_multiplicity(
             table,
             data=data,
@@ -250,7 +245,7 @@ def mutation_region_output_table(
         _add_path_summary(table, refit_summary)
         supported = refit_summary["supported"].reshape(-1)
         table["path_supported"] = supported.astype(int)
-        reasons = getattr(data, "path_unsupported_reason", None)
+        reasons = data.path_unsupported_reason
         if reasons is not None:
             reason = np.asarray(reasons, dtype=object).reshape(-1)
             table["path_unsupported_reason"] = pd.array(
@@ -263,35 +258,27 @@ def write_fit_outputs(
     *,
     outdir: Path,
     data: TumorData,
-    raw_fit: FitResult,
+    raw_fit: RawFit,
     partition: SelectedPartition,
     refit: PartitionRefitSummary,
     major_prior: float = 0.5,
 ) -> None:
     """Purely serialize one already selected, identity-validated model."""
 
-    _validate_identity(raw_fit, partition, refit)
+    tables = {
+        "mutation_clusters": mutation_output_table(data, raw_fit, partition, refit),
+        "cluster_centers": cluster_output_table(data, raw_fit, partition, refit),
+        "mutation_region_multiplicity": mutation_region_output_table(
+            data,
+            raw_fit,
+            partition,
+            refit,
+            major_prior=float(major_prior),
+        ),
+    }
     outdir.mkdir(parents=True, exist_ok=True)
-    mutation_table = mutation_output_table(data, raw_fit, partition, refit)
-    mutation_table.to_csv(
-        outdir / f"{data.tumor_id}_mutation_clusters.tsv", sep="\t", index=False
-    )
-    cluster_table = cluster_output_table(data, raw_fit, partition, refit)
-    cluster_table.to_csv(
-        outdir / f"{data.tumor_id}_cluster_centers.tsv", sep="\t", index=False
-    )
-    mutation_region_table = mutation_region_output_table(
-        data,
-        raw_fit,
-        partition,
-        refit,
-        major_prior=float(major_prior),
-    )
-    mutation_region_table.to_csv(
-        outdir / f"{data.tumor_id}_mutation_region_multiplicity.tsv",
-        sep="\t",
-        index=False,
-    )
+    for suffix, table in tables.items():
+        table.to_csv(outdir / f"{data.tumor_id}_{suffix}.tsv", sep="\t", index=False)
 
 
 __all__ = [

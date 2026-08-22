@@ -214,11 +214,22 @@ class TumorData:
         return int(self.alt_counts.shape[1])
 
     @property
+    def multiplicity_low(self) -> np.ndarray:
+        # Low candidate of the binary multiplicity mixture: the minor copy
+        # number when it is a distinct positive copy count, otherwise one
+        # mutant copy. Under LOH (minor == 0) and balanced gains
+        # (major == minor > 1) a single mutant copy is a physically valid
+        # state that major_cn alone cannot represent.
+        minor = np.asarray(self.minor_cn, dtype=np.float64)
+        major = np.asarray(self.major_cn, dtype=np.float64)
+        keep_minor = (minor >= 1.0) & ~np.isclose(minor, major)
+        return np.where(keep_minor, minor, 1.0).astype(np.float64, copy=False)
+
+    @property
     def multiplicity_estimation_mask(self) -> np.ndarray:
-        distinct_candidates = ~np.isclose(self.major_cn, self.minor_cn)
-        positive_candidates = (self.major_cn > 0.0) & (self.minor_cn > 0.0)
-        non_diploid = (self.major_cn != 1.0) | (self.minor_cn != 1.0)
-        return self.has_cna & non_diploid & distinct_candidates & positive_candidates
+        low = self.multiplicity_low
+        major = np.asarray(self.major_cn, dtype=np.float64)
+        return self.has_cna & (low < major) & ~np.isclose(low, major)
 
     @property
     def fixed_multiplicity(self) -> np.ndarray:
@@ -226,31 +237,33 @@ class TumorData:
         return self.major_cn.astype(np.float64, copy=True)
 
 
+def _hash_text(digest, value: str) -> None:
+    encoded = str(value).encode("utf-8")
+    digest.update(len(encoded).to_bytes(8, "little"))
+    digest.update(encoded)
+
+
+def _hash_array(digest, name: str, values: np.ndarray) -> None:
+    _hash_text(digest, name)
+    array = np.ascontiguousarray(np.asarray(values))
+    _hash_text(digest, str(array.dtype))
+    digest.update(len(array.shape).to_bytes(8, "little"))
+    for dimension in array.shape:
+        digest.update(int(dimension).to_bytes(8, "little", signed=True))
+    digest.update(array.tobytes())
+
+
 def tumor_data_fingerprint(data: TumorData) -> str:
     """Return a deterministic identity for every observed-objective input."""
 
     digest = hashlib.sha256()
 
-    def update_text(value: str) -> None:
-        encoded = str(value).encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, "little"))
-        digest.update(encoded)
-
     def update_text_sequence(values: list[str]) -> None:
         digest.update(len(values).to_bytes(8, "little"))
         for value in values:
-            update_text(value)
+            _hash_text(digest, value)
 
-    def update_array(name: str, values: np.ndarray) -> None:
-        update_text(name)
-        array = np.ascontiguousarray(np.asarray(values))
-        update_text(str(array.dtype))
-        digest.update(len(array.shape).to_bytes(8, "little"))
-        for dimension in array.shape:
-            digest.update(int(dimension).to_bytes(8, "little", signed=True))
-        digest.update(array.tobytes())
-
-    update_text(data.tumor_id)
+    _hash_text(digest, data.tumor_id)
     update_text_sequence(list(data.mutation_ids))
     update_text_sequence(list(data.region_ids))
     for name in (
@@ -266,9 +279,10 @@ def tumor_data_fingerprint(data: TumorData) -> str:
         "phi_init",
         "init_major_mask",
     ):
-        update_array(name, getattr(data, name))
+        _hash_array(digest, name, getattr(data, name))
     count_observed = getattr(data, "count_observed", None)
-    update_array(
+    _hash_array(
+        digest,
         "count_observed",
         np.ones_like(np.asarray(data.alt_counts), dtype=bool)
         if count_observed is None
@@ -279,11 +293,11 @@ def tumor_data_fingerprint(data: TumorData) -> str:
         path_likelihood.validate_observation_shape(
             (int(data.num_mutations), int(data.num_regions))
         )
-        update_text("path_likelihood:present")
-        update_text(path_likelihood.model_id)
-        update_text(path_likelihood.model_version)
-        update_text(path_likelihood.candidate_generator_version)
-        update_text(path_likelihood.prior_mode)
+        _hash_text(digest, "path_likelihood:present")
+        _hash_text(digest, path_likelihood.model_id)
+        _hash_text(digest, path_likelihood.model_version)
+        _hash_text(digest, path_likelihood.candidate_generator_version)
+        _hash_text(digest, path_likelihood.prior_mode)
         for name in (
             "first_copy",
             "second_copy",
@@ -291,67 +305,17 @@ def tumor_data_fingerprint(data: TumorData) -> str:
             "log_prior",
             "valid",
         ):
-            update_array(f"path_likelihood.{name}", getattr(path_likelihood, name))
+            _hash_array(
+                digest, f"path_likelihood.{name}", getattr(path_likelihood, name)
+            )
         indicator = path_likelihood.legacy_major_indicator
-        update_text(
+        _hash_text(
+            digest,
             "path_likelihood.legacy_major_indicator:"
             + ("none" if indicator is None else "present")
         )
         if indicator is not None:
-            update_array("path_likelihood.legacy_major_indicator", indicator)
-    return digest.hexdigest()
-
-
-def tumor_objective_fingerprint(data: TumorData) -> str:
-    """Return a representation-neutral identity for the numeric likelihood.
-
-    Initialization, reporting fields, display identifiers, and compiler
-    version labels are deliberately excluded. The solver combines this digest
-    with its graph arrays, epsilon, and effective prior to identify the full
-    optimization objective.
-    """
-
-    digest = hashlib.sha256()
-
-    def update_array(name: str, values: np.ndarray) -> None:
-        encoded_name = name.encode("utf-8")
-        digest.update(len(encoded_name).to_bytes(8, "little"))
-        digest.update(encoded_name)
-        array = np.ascontiguousarray(np.asarray(values))
-        encoded_dtype = str(array.dtype).encode("utf-8")
-        digest.update(len(encoded_dtype).to_bytes(8, "little"))
-        digest.update(encoded_dtype)
-        digest.update(len(array.shape).to_bytes(8, "little"))
-        for dimension in array.shape:
-            digest.update(int(dimension).to_bytes(8, "little", signed=True))
-        digest.update(array.tobytes())
-
-    for name in ("alt_counts", "total_counts", "scaling", "phi_upper"):
-        update_array(name, getattr(data, name))
-    count_observed = getattr(data, "count_observed", None)
-    update_array(
-        "count_observed",
-        np.ones_like(np.asarray(data.alt_counts), dtype=bool)
-        if count_observed is None
-        else np.asarray(count_observed, dtype=bool),
-    )
-
-    path_likelihood = getattr(data, "path_likelihood", None)
-    if path_likelihood is None:
-        for name in ("major_cn", "minor_cn", "has_cna"):
-            update_array(name, getattr(data, name))
-    else:
-        path_likelihood.validate_observation_shape(
-            (int(data.num_mutations), int(data.num_regions))
-        )
-        for name in (
-            "first_copy",
-            "second_copy",
-            "switch_fraction",
-            "log_prior",
-            "valid",
-        ):
-            update_array(f"path_likelihood.{name}", getattr(path_likelihood, name))
+            _hash_array(digest, "path_likelihood.legacy_major_indicator", indicator)
     return digest.hexdigest()
 
 
@@ -380,6 +344,11 @@ def compute_phi_init_from_counts(
 
     smoothed_vaf = (alt_counts + 0.5) / (total_counts + 1.0)
 
+    # The low candidate mirrors TumorData.multiplicity_low so initialization
+    # and the observed mixture rank the same two states.
+    keep_minor = (minor_cn >= 1.0) & ~np.isclose(minor_cn, major_cn)
+    low_cn = np.where(keep_minor, minor_cn, 1.0)
+
     phi_major = np.divide(
         smoothed_vaf,
         np.clip(scaling * major_cn, eps, None),
@@ -390,14 +359,14 @@ def compute_phi_init_from_counts(
 
     phi_minor = np.divide(
         smoothed_vaf,
-        np.clip(scaling * minor_cn, eps, None),
+        np.clip(scaling * low_cn, eps, None),
         out=np.zeros_like(smoothed_vaf),
-        where=minor_cn > 0,
+        where=low_cn > 0,
     )
     phi_minor = np.clip(phi_minor, 0.0, phi_upper)
 
     p_major = _safe_probability(scaling, major_cn, phi_major, eps)
-    p_minor = _safe_probability(scaling, minor_cn, phi_minor, eps)
+    p_minor = _safe_probability(scaling, low_cn, phi_minor, eps)
 
     loglik_major = alt_counts * np.log(p_major) + (
         total_counts - alt_counts
@@ -417,5 +386,4 @@ __all__ = [
     "TumorData",
     "compute_phi_init_from_counts",
     "tumor_data_fingerprint",
-    "tumor_objective_fingerprint",
 ]

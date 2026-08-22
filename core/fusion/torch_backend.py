@@ -1,18 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import warnings
 
 import numpy as np
 import torch
 
-from ...io.data import (
-    PathLikelihoodSpec,
-    TumorData,
-    tumor_data_fingerprint,
+from ...io.data import TumorData, tumor_data_fingerprint
+from ..objective import (
+    ObservedModel,
+    TorchObservedModel,
+    compile_observed_model,
+    model_to_torch,
+    observed_em_terms_torch,
+    observed_loss_grid_torch,
+    observed_terms_torch,
 )
 from .defaults import DEFAULT_DTYPE
 from .graph_ops import (
+    DETERMINISTIC_COMPLETE_ADJOINT_MAX_BYTES,
     PDHG_PRECONDITIONER_ETA,
     graph_adjoint_edges,
     graph_forward_edges,
@@ -22,34 +28,32 @@ from .types import TorchRuntime
 
 
 @dataclass(frozen=True)
-class TorchPathLikelihoodSpec:
-    """Device representation of a fixed-prior piecewise-affine path family."""
-
-    first_scale: torch.Tensor
-    second_scale: torch.Tensor
-    switch_fraction: torch.Tensor
-    log_prior: torch.Tensor
-    valid: torch.Tensor
-    model_id: str
-    model_version: str = "1"
-    candidate_generator_version: str = "unspecified"
-    prior_mode: str = "fixed_canonical_path_prior"
-    legacy_major_indicator: torch.Tensor | None = None
-
-
-@dataclass(frozen=True)
 class TorchTumorData:
-    alt: torch.Tensor
-    total: torch.Tensor
-    nonalt: torch.Tensor
-    phi_upper: torch.Tensor
-    ambiguous: torch.Tensor
-    b_minus: torch.Tensor
-    b_plus: torch.Tensor
-    b_fixed: torch.Tensor
-    count_observed: torch.Tensor | None = None  # bool (M, S); None means all observed
-    path_likelihood: TorchPathLikelihoodSpec | None = None
-    data_fingerprint: str = ""
+    """Runtime tumor payload with one authoritative observed-likelihood model."""
+
+    observed_model: TorchObservedModel
+    data_fingerprint: str
+    source_model: ObservedModel | None = None
+
+    @property
+    def alt(self) -> torch.Tensor:
+        return self.observed_model.alt
+
+    @property
+    def total(self) -> torch.Tensor:
+        return self.observed_model.total
+
+    @property
+    def nonalt(self) -> torch.Tensor:
+        return self.observed_model.nonalt
+
+    @property
+    def phi_upper(self) -> torch.Tensor:
+        return self.observed_model.upper
+
+    @property
+    def count_observed(self) -> torch.Tensor:
+        return self.observed_model.observed
 
 
 @dataclass(frozen=True)
@@ -61,13 +65,57 @@ class TorchMutationRegionTerms:
     path_posterior: torch.Tensor | None = None
 
 
-@dataclass(frozen=True)
-class NumpyPathMutationRegionTerms:
-    loss: np.ndarray
-    grad: np.ndarray
-    hess_upper: np.ndarray
-    path_posterior: np.ndarray
-    gamma_major: np.ndarray
+def _copy_torch_observed_model(
+    model: TorchObservedModel,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> TorchObservedModel:
+    return replace(
+        model,
+        alt=model.alt.to(dtype=dtype, device=device),
+        nonalt=model.nonalt.to(dtype=dtype, device=device),
+        observed=model.observed.to(device=device),
+        lower=model.lower.to(dtype=dtype, device=device),
+        upper=model.upper.to(dtype=dtype, device=device),
+        first_scale=model.first_scale.to(dtype=dtype, device=device),
+        second_scale=model.second_scale.to(dtype=dtype, device=device),
+        switch=model.switch.to(dtype=dtype, device=device),
+        log_prior=model.log_prior.to(dtype=dtype, device=device),
+        valid=model.valid.to(device=device),
+        legacy_major=(
+            None
+            if model.legacy_major is None
+            else model.legacy_major.to(device=device)
+        ),
+    )
+
+
+def copy_torch_tumor_data(
+    data: TorchTumorData,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> TorchTumorData:
+    """Rebuild a runtime view from source, with a cast-only foreign fallback."""
+
+    if data.source_model is not None:
+        runtime = TorchRuntime(device=device, device_name=str(device), dtype=dtype)
+        observed_model = model_to_torch(data.source_model, runtime)
+        return TorchTumorData(
+            observed_model=observed_model,
+            data_fingerprint=data.data_fingerprint,
+            source_model=data.source_model,
+        )
+    return TorchTumorData(
+        observed_model=_copy_torch_observed_model(
+            data.observed_model,
+            dtype=dtype,
+            device=device,
+        ),
+        data_fingerprint=data.data_fingerprint,
+        source_model=None,
+    )
 
 
 DEFAULT_INNER_KKT_CHECK_EVERY = 8
@@ -159,6 +207,69 @@ def _edge_slices(num_edges: int, chunk_size: int):
         yield slice(start, min(start + int(chunk_size), int(num_edges)))
 
 
+def graph_adjoint_edges_in_dtype(
+    dual: torch.Tensor,
+    *,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    num_nodes: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    scale: float = 1.0,
+    edge_work_bytes: int | None = None,
+) -> torch.Tensor:
+    """Apply the graph adjoint with bounded cross-precision work storage."""
+
+    dual_scale = float(scale)
+    if not np.isfinite(dual_scale):
+        raise ValueError("dual adjoint scale must be finite.")
+    source = dual.to(device=device)
+    if source.dtype == dtype and dual_scale == 1.0:
+        return graph_adjoint_edges(
+            source,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            num_nodes=int(num_nodes),
+        )
+    num_edges = int(edge_u.numel())
+    num_regions = int(source.shape[1])
+    complete_edge_count = int(num_nodes) * max(int(num_nodes) - 1, 0) // 2
+    dense_workspace_bytes = (
+        int(num_nodes)
+        * int(num_nodes)
+        * max(num_regions, 1)
+        * int(torch.empty((), dtype=dtype).element_size())
+    )
+    if (
+        device.type == "cuda"
+        and num_edges == complete_edge_count
+        and dense_workspace_bytes <= DETERMINISTIC_COMPLETE_ADJOINT_MAX_BYTES
+    ):
+        promoted = source.to(dtype=dtype)
+        if dual_scale != 1.0:
+            promoted = dual_scale * promoted
+        return graph_adjoint_edges(
+            promoted,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            num_nodes=int(num_nodes),
+        )
+    chunk_size = _edge_chunk_size(
+        num_edges=num_edges,
+        num_regions=num_regions,
+        dtype=dtype,
+        work_bytes=edge_work_bytes,
+    )
+    adj = torch.zeros((int(num_nodes), num_regions), dtype=dtype, device=device)
+    for edge_slice in _edge_slices(num_edges, chunk_size):
+        chunk = source[edge_slice].to(dtype=dtype)
+        if dual_scale != 1.0:
+            chunk = dual_scale * chunk
+        adj.index_add_(0, edge_u[edge_slice], chunk)
+        adj.index_add_(0, edge_v[edge_slice], chunk, alpha=-1.0)
+    return adj
+
+
 def _graph_edge_activity_counts_torch(
     *,
     phi: torch.Tensor,
@@ -233,18 +344,6 @@ def _box_qp_sweeps_for_atol(
     return max(16, min(max(int(max_iter), 16), requested))
 
 
-def _binary_entropy_offset_torch(weight: torch.Tensor) -> torch.Tensor:
-    clipped = torch.clamp(weight, min=0.0, max=1.0)
-    positive = clipped > 0.0
-    one_minus = 1.0 - clipped
-    positive_complement = one_minus > 0.0
-    term = torch.zeros_like(clipped)
-    term = torch.where(positive, term + clipped * torch.log(clipped), term)
-    return torch.where(
-        positive_complement, term + one_minus * torch.log(one_minus), term
-    )
-
-
 def resolve_runtime(device: str | None, *, dtype: str | None = None) -> TorchRuntime:
     """Resolve a device/dtype string pair into a TorchRuntime (the single place
     that maps strings to torch.device/torch.dtype).
@@ -299,117 +398,23 @@ def resolve_runtime(device: str | None, *, dtype: str | None = None) -> TorchRun
     )
 
 
-def to_torch_path_likelihood_spec(
-    spec: PathLikelihoodSpec,
-    *,
-    scaling: np.ndarray,
+def to_torch_tumor_data(
+    data: TumorData,
     runtime: TorchRuntime,
-) -> TorchPathLikelihoodSpec:
-    """Move a host path family to a runtime and apply observation scaling."""
-
-    scaling_array = np.asarray(scaling, dtype=np.float64)
-    spec.validate_observation_shape(tuple(int(value) for value in scaling_array.shape))
-    expanded_scaling = scaling_array[..., None]
-    dtype = runtime.dtype
-    device = runtime.device
-    indicator = spec.legacy_major_indicator
-    return TorchPathLikelihoodSpec(
-        first_scale=torch.as_tensor(
-            expanded_scaling * spec.first_copy,
-            dtype=dtype,
-            device=device,
-        ),
-        second_scale=torch.as_tensor(
-            expanded_scaling * spec.second_copy,
-            dtype=dtype,
-            device=device,
-        ),
-        switch_fraction=torch.as_tensor(
-            np.array(spec.switch_fraction, copy=True),
-            dtype=dtype,
-            device=device,
-        ),
-        log_prior=torch.as_tensor(
-            np.array(spec.log_prior, copy=True),
-            dtype=dtype,
-            device=device,
-        ),
-        valid=torch.as_tensor(
-            np.array(spec.valid, copy=True),
-            dtype=torch.bool,
-            device=device,
-        ),
-        model_id=spec.model_id,
-        model_version=spec.model_version,
-        candidate_generator_version=spec.candidate_generator_version,
-        prior_mode=spec.prior_mode,
-        legacy_major_indicator=(
-            None
-            if indicator is None
-            else torch.as_tensor(
-                np.array(indicator, copy=True),
-                dtype=torch.bool,
-                device=device,
-            )
-        ),
-    )
-
-
-def to_torch_tumor_data(data: TumorData, runtime: TorchRuntime) -> TorchTumorData:
-    dtype = runtime.dtype
-    device = runtime.device
-    scaling = np.asarray(data.scaling, dtype=np.float64)
-    count_obs_np = getattr(data, "count_observed", None)
-    count_obs_tensor = (
-        torch.as_tensor(count_obs_np, dtype=torch.bool, device=device)
-        if count_obs_np is not None
-        else None
-    )
-    path_spec = getattr(data, "path_likelihood", None)
-    if path_spec is not None and not np.allclose(
-        np.asarray(data.phi_upper, dtype=np.float64),
-        1.0,
-        rtol=0.0,
-        atol=1e-12,
-    ):
-        raise ValueError("A PathLikelihoodSpec requires full CCF support [0, 1].")
-    torch_path_spec = (
-        None
-        if path_spec is None
-        else to_torch_path_likelihood_spec(
-            path_spec,
-            scaling=scaling,
-            runtime=runtime,
-        )
+    *,
+    source_model: ObservedModel | None = None,
+    major_prior: float = 0.5,
+    eps: float = 1e-6,
+) -> TorchTumorData:
+    source_model = (
+        compile_observed_model(data, major_prior=float(major_prior), eps=float(eps))
+        if source_model is None
+        else source_model
     )
     return TorchTumorData(
-        alt=torch.as_tensor(data.alt_counts, dtype=dtype, device=device),
-        total=torch.as_tensor(data.total_counts, dtype=dtype, device=device),
-        nonalt=torch.as_tensor(
-            data.total_counts - data.alt_counts, dtype=dtype, device=device
-        ),
-        phi_upper=torch.as_tensor(data.phi_upper, dtype=dtype, device=device),
-        ambiguous=torch.as_tensor(
-            data.multiplicity_estimation_mask, dtype=torch.bool, device=device
-        ),
-        b_minus=torch.as_tensor(
-            scaling * np.asarray(data.minor_cn, dtype=np.float64),
-            dtype=dtype,
-            device=device,
-        ),
-        b_plus=torch.as_tensor(
-            scaling * np.asarray(data.major_cn, dtype=np.float64),
-            dtype=dtype,
-            device=device,
-        ),
-        b_fixed=torch.as_tensor(
-            scaling * np.asarray(data.fixed_multiplicity, dtype=np.float64),
-            dtype=dtype,
-            device=device,
-        ),
-        count_observed=count_obs_tensor,
-        path_likelihood=torch_path_spec,
+        observed_model=model_to_torch(source_model, runtime),
         data_fingerprint=tumor_data_fingerprint(data),
+        source_model=source_model,
     )
 
 
@@ -428,320 +433,98 @@ def validate_torch_tumor_data(
 
     expected_shape = (int(data.num_mutations), int(data.num_regions))
 
-    def validate_field(name: str, *, dtype: torch.dtype) -> None:
-        value = getattr(tensor_data, name)
-        if not torch.is_tensor(value) or tuple(value.shape) != expected_shape:
-            raise ValueError(f"TorchTumorData.{name} must have shape {expected_shape}.")
+    def validate_tensor(
+        label: str,
+        value: torch.Tensor,
+        *,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ) -> None:
+        if not torch.is_tensor(value) or tuple(value.shape) != shape:
+            raise ValueError(f"{label} must have shape {shape}.")
         if value.dtype != dtype:
-            raise ValueError(f"TorchTumorData.{name} must use runtime dtype {dtype}.")
+            raise ValueError(f"{label} must use runtime dtype {dtype}.")
         if value.device.type != runtime.device.type or (
             runtime.device.index is not None
             and value.device.index != runtime.device.index
         ):
-            raise ValueError(
-                f"TorchTumorData.{name} must be on runtime device "
-                f"{runtime.device_name}."
-            )
-
-    for name in (
-        "alt",
-        "total",
-        "nonalt",
-        "phi_upper",
-        "b_minus",
-        "b_plus",
-        "b_fixed",
-    ):
-        validate_field(name, dtype=runtime.dtype)
-    validate_field("ambiguous", dtype=torch.bool)
-
-    expected_observation_mask = data.count_observed is not None
-    if (tensor_data.count_observed is not None) != expected_observation_mask:
-        raise ValueError(
-            "TorchTumorData.count_observed presence does not match TumorData."
-        )
-    if tensor_data.count_observed is not None:
-        validate_field("count_observed", dtype=torch.bool)
+            raise ValueError(f"{label} must be on runtime device {runtime.device_name}.")
 
     host_path = getattr(data, "path_likelihood", None)
-    tensor_path = tensor_data.path_likelihood
-    if (host_path is None) != (tensor_path is None):
-        raise ValueError(
-            "TorchTumorData.path_likelihood presence does not match TumorData."
+    observed_model = tensor_data.observed_model
+    expected_model_shape = (
+        *expected_shape,
+        2 if host_path is None else int(host_path.shape[-1]),
+    )
+
+    for name in ("alt", "nonalt", "lower", "upper"):
+        validate_tensor(
+            f"TorchObservedModel.{name}",
+            getattr(observed_model, name),
+            shape=expected_shape,
+            dtype=runtime.dtype,
         )
-    if host_path is not None and tensor_path is not None:
-        expected_path_shape = host_path.shape
+    validate_tensor(
+        "TorchObservedModel.observed",
+        observed_model.observed,
+        shape=expected_shape,
+        dtype=torch.bool,
+    )
+    for name in ("first_scale", "second_scale", "switch", "log_prior"):
+        validate_tensor(
+            f"TorchObservedModel.{name}",
+            getattr(observed_model, name),
+            shape=expected_model_shape,
+            dtype=runtime.dtype,
+        )
+    validate_tensor(
+        "TorchObservedModel.valid",
+        observed_model.valid,
+        shape=expected_model_shape,
+        dtype=torch.bool,
+    )
+    if observed_model.legacy_major is not None:
+        validate_tensor(
+            "TorchObservedModel.legacy_major",
+            observed_model.legacy_major,
+            shape=expected_model_shape,
+            dtype=torch.bool,
+        )
+    if not observed_model.source_fingerprint:
+        raise ValueError("TorchObservedModel.source_fingerprint must be nonempty.")
+    expected_model_id = (
+        "legacy_major_low_as_paths_v2" if host_path is None else host_path.model_id
+    )
+    if observed_model.model_id != expected_model_id:
+        raise ValueError("TorchObservedModel model_id does not match TumorData.")
 
-        def validate_path_field(name: str, *, dtype: torch.dtype) -> None:
-            value = getattr(tensor_path, name)
-            if not torch.is_tensor(value) or tuple(value.shape) != expected_path_shape:
-                raise ValueError(
-                    f"TorchPathLikelihoodSpec.{name} must have shape "
-                    f"{expected_path_shape}."
-                )
-            if value.dtype != dtype:
-                raise ValueError(
-                    f"TorchPathLikelihoodSpec.{name} must use dtype {dtype}."
-                )
-            if value.device.type != runtime.device.type or (
-                runtime.device.index is not None
-                and value.device.index != runtime.device.index
-            ):
-                raise ValueError(
-                    f"TorchPathLikelihoodSpec.{name} must be on runtime device "
-                    f"{runtime.device_name}."
-                )
-
-        for name in (
-            "first_scale",
-            "second_scale",
-            "switch_fraction",
-            "log_prior",
-        ):
-            validate_path_field(name, dtype=runtime.dtype)
-        validate_path_field("valid", dtype=torch.bool)
-        if tensor_path.model_id != host_path.model_id:
-            raise ValueError("Torch path model_id does not match TumorData.")
-        if tensor_path.model_version != host_path.model_version:
-            raise ValueError("Torch path model_version does not match TumorData.")
-        if (
-            tensor_path.candidate_generator_version
-            != host_path.candidate_generator_version
-        ):
+    source_model = tensor_data.source_model
+    if source_model is not None:
+        if source_model.shape != expected_shape:
+            raise ValueError(f"ObservedModel source must have shape {expected_shape}.")
+        if source_model.path_shape != expected_model_shape:
             raise ValueError(
-                "Torch path candidate_generator_version does not match TumorData."
+                f"ObservedModel source paths must have shape {expected_model_shape}."
             )
-        if tensor_path.prior_mode != host_path.prior_mode:
-            raise ValueError("Torch path prior_mode does not match TumorData.")
-        host_indicator = host_path.legacy_major_indicator
-        tensor_indicator = tensor_path.legacy_major_indicator
-        if (host_indicator is None) != (tensor_indicator is None):
+        if source_model.fingerprint != observed_model.source_fingerprint:
             raise ValueError(
-                "Torch path legacy_major_indicator presence does not match TumorData."
+                "TorchObservedModel was not built from the retained ObservedModel."
             )
-        if tensor_indicator is not None:
-            validate_path_field("legacy_major_indicator", dtype=torch.bool)
 
 
-def _as_loss_shape(mask: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    result = mask
-    while result.ndim < target.ndim:
-        result = result.unsqueeze(-1)
-    return result
-
-
-def clip_probability_and_slope(
-    beta: torch.Tensor, scale: torch.Tensor, eps: float
-) -> tuple[torch.Tensor, torch.Tensor]:
-    linear = scale * beta
-    prob = torch.clamp(linear, min=float(eps), max=float(1.0 - eps))
-    interior = (linear > float(eps)) & (linear < float(1.0 - eps))
-    slope = torch.where(interior, scale, torch.zeros_like(scale))
-    return prob, slope
-
-
-def _major_prior_log_tensors(
-    major_prior: float,
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    prior = float(major_prior)
-    if not np.isfinite(prior) or not (0.0 < prior < 1.0):
-        raise ValueError("major_prior must lie strictly in (0, 1).")
-    prior_tensor = torch.as_tensor(prior, dtype=dtype, device=device)
-    return torch.log1p(-prior_tensor), torch.log(prior_tensor)
-
-
-def state_log_kernel_grad_and_curvature(
-    *,
-    alt: torch.Tensor,
-    nonalt: torch.Tensor,
-    prob: torch.Tensor,
-    slope: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    grad = slope * (alt / prob - nonalt / (1.0 - prob))
-    curvature = torch.square(slope) * (
-        alt / torch.square(prob) + nonalt / torch.square(1.0 - prob)
+def _mutation_terms_from_observed(
+    terms,
+) -> TorchMutationRegionTerms:
+    return TorchMutationRegionTerms(
+        loss=terms.loss,
+        grad=terms.gradient,
+        hess_upper=terms.hessian_upper,
+        gamma_major=terms.legacy_major_probability,
+        path_posterior=terms.posterior,
     )
-    return grad, curvature
 
 
-def path_probability_and_slope_torch(
-    path: TorchPathLikelihoodSpec,
-    phi: torch.Tensor,
-    *,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Evaluate clipped path probabilities and their within-segment slopes.
-
-    At a path switch the returned slope is the left derivative.  Optimizers
-    that cross switches must still audit the right derivative separately.
-    """
-
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not (0.0 < epsilon < 0.5):
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
-    if path.first_scale.ndim != 3:
-        raise ValueError("Torch path arrays must have shape (M, S, K).")
-    expected_path_shape = tuple(path.first_scale.shape)
-    for name in (
-        "second_scale",
-        "switch_fraction",
-        "log_prior",
-        "valid",
-    ):
-        if tuple(getattr(path, name).shape) != expected_path_shape:
-            raise ValueError(f"Torch path field {name} has an incompatible shape.")
-    if tuple(phi.shape) != expected_path_shape[:2]:
-        raise ValueError(
-            f"phi must have shape {expected_path_shape[:2]}, not {tuple(phi.shape)}."
-        )
-
-    expanded_phi = phi.unsqueeze(-1)
-    switch = path.switch_fraction
-    mass = path.first_scale * torch.minimum(expanded_phi, switch)
-    mass = mass + path.second_scale * torch.clamp(expanded_phi - switch, min=0.0)
-    prob = torch.clamp(mass, min=epsilon, max=1.0 - epsilon)
-    segment_slope = torch.where(
-        expanded_phi <= switch,
-        path.first_scale,
-        path.second_scale,
-    )
-    interior = (mass > epsilon) & (mass < 1.0 - epsilon)
-    slope = torch.where(interior, segment_slope, torch.zeros_like(segment_slope))
-    return prob, slope
-
-
-def path_internal_breakpoints_torch(
-    path: TorchPathLikelihoodSpec,
-    *,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return every switch and clipping breakpoint with an aligned validity mask."""
-
-    points = [path.switch_fraction]
-    masks = [path.valid]
-    for target in (float(eps), 1.0 - float(eps)):
-        left = torch.where(
-            path.first_scale > 0.0,
-            path.first_scale.new_full((), target) / path.first_scale,
-            torch.full_like(path.first_scale, float("nan")),
-        )
-        left_valid = (
-            path.valid
-            & torch.isfinite(left)
-            & (left >= 0.0)
-            & (left <= path.switch_fraction)
-        )
-        right = torch.where(
-            path.second_scale > 0.0,
-            path.switch_fraction
-            + (
-                path.second_scale.new_full((), target)
-                - path.first_scale * path.switch_fraction
-            )
-            / path.second_scale,
-            torch.full_like(path.second_scale, float("nan")),
-        )
-        right_valid = (
-            path.valid
-            & torch.isfinite(right)
-            & (right >= path.switch_fraction)
-            & (right <= 1.0)
-        )
-        points.extend((left, right))
-        masks.extend((left_valid, right_valid))
-    return torch.cat(points, dim=-1), torch.cat(masks, dim=-1)
-
-
-def path_one_sided_gradients_torch(
-    data: TorchTumorData,
-    phi: torch.Tensor,
-    *,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exact left/right observed-loss gradients at all path breakpoints."""
-
-    path = data.path_likelihood
-    if path is None:
-        raise ValueError("TorchTumorData does not contain a path likelihood.")
-    expanded_phi = phi.unsqueeze(-1)
-    switch = path.switch_fraction
-    mass = path.first_scale * torch.minimum(expanded_phi, switch)
-    mass = mass + path.second_scale * torch.clamp(
-        expanded_phi - switch,
-        min=0.0,
-    )
-    prob = torch.clamp(mass, min=float(eps), max=1.0 - float(eps))
-    log_kernel = _path_log_kernel_torch(
-        alt=data.alt,
-        nonalt=data.nonalt,
-        prob=prob,
-    )
-    log_joint = (log_kernel + path.log_prior).masked_fill(~path.valid, -torch.inf)
-    posterior = torch.softmax(log_joint, dim=-1)
-
-    left_slope = torch.where(
-        expanded_phi <= switch,
-        path.first_scale,
-        path.second_scale,
-    )
-    right_slope = torch.where(
-        expanded_phi < switch,
-        path.first_scale,
-        path.second_scale,
-    )
-    lower_clip = mass <= float(eps)
-    upper_clip = mass >= 1.0 - float(eps)
-    left_slope = torch.where(
-        (mass < float(eps)) | (mass > 1.0 - float(eps)),
-        torch.zeros_like(left_slope),
-        left_slope,
-    )
-    right_slope = torch.where(
-        (mass < float(eps)) | (mass > 1.0 - float(eps)),
-        torch.zeros_like(right_slope),
-        right_slope,
-    )
-    # Positive retained-mutation dosages imply increasing mass.  At the lower
-    # clipping boundary the left branch is flat; at the upper boundary the
-    # right branch is flat.
-    left_slope = torch.where(
-        lower_clip,
-        torch.zeros_like(left_slope),
-        left_slope,
-    )
-    right_slope = torch.where(
-        upper_clip,
-        torch.zeros_like(right_slope),
-        right_slope,
-    )
-    state_factor = data.alt.unsqueeze(-1) / prob - data.nonalt.unsqueeze(-1) / (
-        1.0 - prob
-    )
-    gradient_left = -torch.sum(posterior * left_slope * state_factor, dim=-1)
-    gradient_right = -torch.sum(posterior * right_slope * state_factor, dim=-1)
-    if data.count_observed is not None:
-        gradient_left = torch.where(
-            data.count_observed,
-            gradient_left,
-            torch.zeros_like(gradient_left),
-        )
-        gradient_right = torch.where(
-            data.count_observed,
-            gradient_right,
-            torch.zeros_like(gradient_right),
-        )
-    points, valid_points = path_internal_breakpoints_torch(path, eps=float(eps))
-    at_breakpoint = torch.any(
-        valid_points & (points == expanded_phi),
-        dim=-1,
-    )
-    return gradient_left, gradient_right, at_breakpoint
-
-
-def path_downward_kink_mask_torch(
+def downward_kink_mask_torch(
     gradient_left: torch.Tensor,
     gradient_right: torch.Tensor,
     at_breakpoint: torch.Tensor,
@@ -753,232 +536,21 @@ def path_downward_kink_mask_torch(
     return at_breakpoint & (gradient_left > gradient_right + max(float(tol), 1e-12))
 
 
-def _path_log_kernel_torch(
-    *,
-    alt: torch.Tensor,
-    nonalt: torch.Tensor,
-    prob: torch.Tensor,
-) -> torch.Tensor:
-    return alt.unsqueeze(-1) * torch.log(prob) + nonalt.unsqueeze(-1) * torch.log1p(
-        -prob
-    )
-
-
-def _path_gamma_major_torch(
-    path: TorchPathLikelihoodSpec,
-    posterior: torch.Tensor,
-) -> torch.Tensor:
-    indicator = path.legacy_major_indicator
-    if indicator is None:
-        return torch.ones(
-            posterior.shape[:-1],
-            dtype=posterior.dtype,
-            device=posterior.device,
-        )
-    return torch.sum(posterior * indicator.to(dtype=posterior.dtype), dim=-1)
-
-
-def path_mutation_region_terms_torch(
-    data: TorchTumorData,
-    phi: torch.Tensor,
-    *,
-    eps: float,
-) -> TorchMutationRegionTerms:
-    """Observed categorical path likelihood and its fixed-posterior curvature."""
-
-    path = data.path_likelihood
-    if path is None:
-        raise ValueError("TorchTumorData does not contain a path likelihood.")
-    if tuple(data.alt.shape) != tuple(phi.shape):
-        raise ValueError(
-            f"phi must have shape {tuple(data.alt.shape)}, not {tuple(phi.shape)}."
-        )
-    if not bool(torch.all(torch.any(path.valid, dim=-1)).item()):
-        raise ValueError("Every mutation-region entry must have a valid path.")
-
-    prob, slope = path_probability_and_slope_torch(path, phi, eps=eps)
-    log_kernel = _path_log_kernel_torch(
-        alt=data.alt,
-        nonalt=data.nonalt,
-        prob=prob,
-    )
-    log_joint = (log_kernel + path.log_prior).masked_fill(~path.valid, -torch.inf)
-    log_normalizer = torch.logsumexp(log_joint, dim=-1)
-    posterior = torch.softmax(log_joint, dim=-1)
-
-    state_grad, state_curvature = state_log_kernel_grad_and_curvature(
-        alt=data.alt.unsqueeze(-1),
-        nonalt=data.nonalt.unsqueeze(-1),
-        prob=prob,
-        slope=slope,
-    )
-    loss = -log_normalizer
-    grad = -torch.sum(posterior * state_grad, dim=-1)
-    hess_upper = torch.sum(posterior * state_curvature, dim=-1)
-
-    if data.count_observed is not None:
-        prior = torch.exp(path.log_prior).masked_fill(~path.valid, 0.0)
-        posterior = torch.where(
-            data.count_observed.unsqueeze(-1),
-            posterior,
-            prior,
-        )
-        loss = torch.where(data.count_observed, loss, torch.zeros_like(loss))
-        grad = torch.where(data.count_observed, grad, torch.zeros_like(grad))
-
-    gamma_major = _path_gamma_major_torch(path, posterior)
-    hess_upper = torch.clamp(hess_upper, min=1e-8)
-    if data.count_observed is not None:
-        hess_upper = torch.where(
-            data.count_observed,
-            hess_upper,
-            torch.zeros_like(hess_upper),
-        )
-    return TorchMutationRegionTerms(
-        loss=loss,
-        grad=grad,
-        hess_upper=hess_upper,
-        gamma_major=gamma_major,
-        path_posterior=posterior,
-    )
-
-
-def path_mutation_region_terms_numpy(
-    spec: PathLikelihoodSpec,
-    *,
-    scaling: np.ndarray,
-    alt: np.ndarray,
-    total: np.ndarray,
-    phi: np.ndarray,
-    eps: float,
-    count_observed: np.ndarray | None = None,
-) -> NumpyPathMutationRegionTerms:
-    """NumPy reference for refit, CEM, output, and Torch parity checks."""
-
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not (0.0 < epsilon < 0.5):
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
-    observation_shape = spec.shape[:2]
-
-    def observation_array(name: str, value: np.ndarray) -> np.ndarray:
-        array = np.asarray(value, dtype=np.float64)
-        if tuple(array.shape) != observation_shape:
-            raise ValueError(
-                f"{name} must have shape {observation_shape}, not {array.shape}."
-            )
-        if not np.all(np.isfinite(array)):
-            raise ValueError(f"{name} must contain only finite values.")
-        return array
-
-    scaling_array = observation_array("scaling", scaling)
-    alt_array = observation_array("alt", alt)
-    total_array = observation_array("total", total)
-    phi_array = observation_array("phi", phi)
-    nonalt = total_array - alt_array
-    expanded_phi = phi_array[..., None]
-    first_scale = scaling_array[..., None] * spec.first_copy
-    second_scale = scaling_array[..., None] * spec.second_copy
-    mass = first_scale * np.minimum(expanded_phi, spec.switch_fraction)
-    mass += second_scale * np.maximum(expanded_phi - spec.switch_fraction, 0.0)
-    prob = np.clip(mass, epsilon, 1.0 - epsilon)
-    segment_slope = np.where(
-        expanded_phi <= spec.switch_fraction,
-        first_scale,
-        second_scale,
-    )
-    slope = np.where(
-        (mass > epsilon) & (mass < 1.0 - epsilon),
-        segment_slope,
-        0.0,
-    )
-    log_kernel = alt_array[..., None] * np.log(prob) + nonalt[..., None] * np.log1p(
-        -prob
-    )
-    log_joint = np.where(spec.valid, log_kernel + spec.log_prior, -np.inf)
-    maximum = np.max(log_joint, axis=-1, keepdims=True)
-    unnormalized = np.where(spec.valid, np.exp(log_joint - maximum), 0.0)
-    denominator = np.sum(unnormalized, axis=-1, keepdims=True)
-    posterior = unnormalized / denominator
-    log_normalizer = np.squeeze(maximum + np.log(denominator), axis=-1)
-
-    state_grad = slope * (
-        alt_array[..., None] / prob - nonalt[..., None] / (1.0 - prob)
-    )
-    state_curvature = np.square(slope) * (
-        alt_array[..., None] / np.square(prob)
-        + nonalt[..., None] / np.square(1.0 - prob)
-    )
-    loss = -log_normalizer
-    grad = -np.sum(posterior * state_grad, axis=-1)
-    hess_upper = np.sum(posterior * state_curvature, axis=-1)
-
-    if count_observed is not None:
-        observed = np.asarray(count_observed, dtype=bool)
-        if tuple(observed.shape) != observation_shape:
-            raise ValueError(
-                "count_observed must have shape "
-                f"{observation_shape}, not {observed.shape}."
-            )
-        prior = np.where(spec.valid, np.exp(spec.log_prior), 0.0)
-        posterior = np.where(observed[..., None], posterior, prior)
-        loss = np.where(observed, loss, 0.0)
-        grad = np.where(observed, grad, 0.0)
-    else:
-        observed = None
-
-    if spec.legacy_major_indicator is None:
-        gamma_major = np.ones(observation_shape, dtype=np.float64)
-    else:
-        gamma_major = np.sum(
-            posterior * spec.legacy_major_indicator.astype(np.float64),
-            axis=-1,
-        )
-    hess_upper = np.maximum(hess_upper, 1e-8)
-    if observed is not None:
-        hess_upper = np.where(observed, hess_upper, 0.0)
-    return NumpyPathMutationRegionTerms(
-        loss=loss,
-        grad=grad,
-        hess_upper=hess_upper,
-        path_posterior=posterior,
-        gamma_major=gamma_major,
-    )
-
-
 def mutation_region_loss_grid_torch(
+    data: TorchTumorData,
     beta_grid: torch.Tensor,
     *,
-    alt: torch.Tensor,
-    total: torch.Tensor,
-    b_minus: torch.Tensor,
-    b_plus: torch.Tensor,
-    b_fixed: torch.Tensor,
-    ambiguous: torch.Tensor,
-    major_prior: float,
     eps: float,
+    respect_observed: bool = True,
 ) -> torch.Tensor:
-    beta = beta_grid
-    nonalt = total - alt
-    log_prior_minor, log_prior_major = _major_prior_log_tensors(
-        major_prior,
-        dtype=beta.dtype,
-        device=beta.device,
-    )
-    prob_fixed = torch.clamp(beta * b_fixed, min=float(eps), max=float(1.0 - eps))
-    fixed_loss = -(alt * torch.log(prob_fixed) + nonalt * torch.log1p(-prob_fixed))
+    """Evaluate canonical loss for ``(M, S, *grid)`` candidate CCFs."""
 
-    prob_minus = torch.clamp(beta * b_minus, min=float(eps), max=float(1.0 - eps))
-    prob_plus = torch.clamp(beta * b_plus, min=float(eps), max=float(1.0 - eps))
-    log_minor = (
-        alt * torch.log(prob_minus)
-        + nonalt * torch.log1p(-prob_minus)
-        + log_prior_minor
+    return observed_loss_grid_torch(
+        data.observed_model,
+        beta_grid,
+        eps=eps,
+        respect_observed=respect_observed,
     )
-    log_major = (
-        alt * torch.log(prob_plus) + nonalt * torch.log1p(-prob_plus) + log_prior_major
-    )
-    amb_loss = -torch.logaddexp(log_minor, log_major)
-    return torch.where(_as_loss_shape(ambiguous, beta), amb_loss, fixed_loss)
 
 
 def mutation_region_terms_torch(
@@ -988,167 +560,18 @@ def mutation_region_terms_torch(
     major_prior: float,
     eps: float,
 ) -> TorchMutationRegionTerms:
-    if data.path_likelihood is not None:
-        return path_mutation_region_terms_torch(data, phi, eps=eps)
-
-    alt = data.alt
-    nonalt = data.nonalt
-    amb = data.ambiguous
-    log_prior_minor, log_prior_major = _major_prior_log_tensors(
-        major_prior,
-        dtype=phi.dtype,
-        device=phi.device,
-    )
-
-    prob_fixed, slope_fixed = clip_probability_and_slope(phi, data.b_fixed, eps)
-    loss_fixed = -(alt * torch.log(prob_fixed) + nonalt * torch.log1p(-prob_fixed))
-    grad_fixed_state, curvature_fixed = state_log_kernel_grad_and_curvature(
-        alt=alt,
-        nonalt=nonalt,
-        prob=prob_fixed,
-        slope=slope_fixed,
-    )
-
-    prob_minus, slope_minus = clip_probability_and_slope(phi, data.b_minus, eps)
-    prob_plus, slope_plus = clip_probability_and_slope(phi, data.b_plus, eps)
-    log_minor = (
-        alt * torch.log(prob_minus)
-        + nonalt * torch.log1p(-prob_minus)
-        + log_prior_minor
-    )
-    log_major = (
-        alt * torch.log(prob_plus) + nonalt * torch.log1p(-prob_plus) + log_prior_major
-    )
-    norm = torch.logaddexp(log_minor, log_major)
-    gamma = torch.sigmoid(log_major - log_minor)
-    grad_minus, curvature_minus = state_log_kernel_grad_and_curvature(
-        alt=alt,
-        nonalt=nonalt,
-        prob=prob_minus,
-        slope=slope_minus,
-    )
-    grad_plus, curvature_plus = state_log_kernel_grad_and_curvature(
-        alt=alt,
-        nonalt=nonalt,
-        prob=prob_plus,
-        slope=slope_plus,
-    )
-    amb_loss = -norm
-    amb_grad = -((1.0 - gamma) * grad_minus + gamma * grad_plus)
-    amb_curvature = (1.0 - gamma) * curvature_minus + gamma * curvature_plus
-
-    loss = torch.where(amb, amb_loss, loss_fixed)
-    grad = torch.where(amb, amb_grad, -grad_fixed_state)
-    hess_upper = torch.where(amb, amb_curvature, curvature_fixed)
-    gamma_major = torch.where(amb, gamma, torch.ones_like(gamma))
-
-    if data.count_observed is not None:
-        loss = torch.where(data.count_observed, loss, torch.zeros_like(loss))
-        grad = torch.where(data.count_observed, grad, torch.zeros_like(grad))
-        # A masked ambiguous entry contributes no count evidence, so its
-        # posterior remains the configured prior.  Keeping a posterior derived
-        # from the stored-but-masked counts would make raw solver summaries
-        # disagree with the observed-data likelihood and the NumPy posterior
-        # used by partition candidates.
-        prior_major = torch.exp(log_prior_major)
-        gamma_major = torch.where(
-            data.count_observed,
-            gamma_major,
-            torch.where(amb, prior_major, torch.ones_like(gamma_major)),
-        )
-
-    hess_upper = torch.clamp(hess_upper, min=1e-8)
-    if data.count_observed is not None:
-        hess_upper = torch.where(
-            data.count_observed, hess_upper, torch.zeros_like(hess_upper)
-        )
-    return TorchMutationRegionTerms(
-        loss=loss,
-        grad=grad,
-        hess_upper=hess_upper,
-        gamma_major=gamma_major,
-        path_posterior=None,
-    )
-
-
-def path_em_surrogate_terms_torch(
-    data: TorchTumorData,
-    phi: torch.Tensor,
-    *,
-    omega_path: torch.Tensor,
-    eps: float,
-) -> TorchMutationRegionTerms:
-    """Categorical EM surrogate for fixed path responsibilities."""
-
-    path = data.path_likelihood
-    if path is None:
-        raise ValueError("TorchTumorData does not contain a path likelihood.")
-    if tuple(omega_path.shape) != tuple(path.first_scale.shape):
-        raise ValueError(
-            "omega_path must have shape "
-            f"{tuple(path.first_scale.shape)}, not {tuple(omega_path.shape)}."
-        )
-    if not bool(torch.all(torch.isfinite(omega_path)).item()) or bool(
-        torch.any(omega_path < 0.0).item()
-    ):
-        raise ValueError("omega_path must be finite and nonnegative.")
-    weights = omega_path.masked_fill(~path.valid, 0.0)
-    weight_sum = torch.sum(weights, dim=-1, keepdim=True)
-    if bool(torch.any(weight_sum <= 0.0).item()):
-        raise ValueError("omega_path must assign positive mass to a valid path.")
-    weights = weights / weight_sum
-
-    prob, slope = path_probability_and_slope_torch(path, phi, eps=eps)
-    log_kernel = _path_log_kernel_torch(
-        alt=data.alt,
-        nonalt=data.nonalt,
-        prob=prob,
-    )
-    complete_loss = torch.where(
-        path.valid,
-        -(log_kernel + path.log_prior),
-        torch.zeros_like(log_kernel),
-    )
-    entropy = torch.where(
-        weights > 0.0,
-        weights * torch.log(torch.clamp(weights, min=torch.finfo(weights.dtype).tiny)),
-        torch.zeros_like(weights),
-    )
-    loss = torch.sum(weights * complete_loss + entropy, dim=-1)
-    state_grad, state_curvature = state_log_kernel_grad_and_curvature(
-        alt=data.alt.unsqueeze(-1),
-        nonalt=data.nonalt.unsqueeze(-1),
-        prob=prob,
-        slope=slope,
-    )
-    grad = -torch.sum(weights * state_grad, dim=-1)
-    hess_upper = torch.sum(weights * state_curvature, dim=-1)
-
-    posterior = weights
-    if data.count_observed is not None:
-        prior = torch.exp(path.log_prior).masked_fill(~path.valid, 0.0)
-        posterior = torch.where(
-            data.count_observed.unsqueeze(-1),
-            posterior,
-            prior,
-        )
-        loss = torch.where(data.count_observed, loss, torch.zeros_like(loss))
-        grad = torch.where(data.count_observed, grad, torch.zeros_like(grad))
-
-    gamma_major = _path_gamma_major_torch(path, posterior)
-    hess_upper = torch.clamp(hess_upper, min=1e-8)
-    if data.count_observed is not None:
-        hess_upper = torch.where(
-            data.count_observed,
-            hess_upper,
-            torch.zeros_like(hess_upper),
-        )
-    return TorchMutationRegionTerms(
-        loss=loss,
-        grad=grad,
-        hess_upper=hess_upper,
-        gamma_major=gamma_major,
-        path_posterior=posterior,
+    # ``major_prior`` remains in this public low-level signature while callers
+    # migrate; the immutable source model already contains the authoritative
+    # prior and no runtime likelihood branch may rewrite it.
+    prior = float(major_prior)
+    if not np.isfinite(prior) or not 0.0 < prior < 1.0:
+        raise ValueError("major_prior must lie strictly in (0, 1).")
+    return _mutation_terms_from_observed(
+        observed_terms_torch(
+            data.observed_model,
+            phi,
+            eps=eps,
+        ),
     )
 
 
@@ -1156,95 +579,16 @@ def em_surrogate_terms_torch(
     data: TorchTumorData,
     phi: torch.Tensor,
     *,
-    omega_major: torch.Tensor,
-    major_prior: float,
+    responsibilities: torch.Tensor,
     eps: float,
 ) -> TorchMutationRegionTerms:
-    if data.path_likelihood is not None:
-        path_shape = tuple(data.path_likelihood.first_scale.shape)
-        if tuple(omega_major.shape) == path_shape:
-            omega_path = omega_major
-        else:
-            raise ValueError(
-                "Categorical path EM requires responsibilities with shape "
-                f"{path_shape}."
-            )
-        return path_em_surrogate_terms_torch(
-            data,
+    return _mutation_terms_from_observed(
+        observed_em_terms_torch(
+            data.observed_model,
             phi,
-            omega_path=omega_path,
+            responsibilities=responsibilities,
             eps=eps,
         )
-
-    alt = data.alt
-    nonalt = data.nonalt
-    amb = data.ambiguous
-    log_prior_minor, log_prior_major = _major_prior_log_tensors(
-        major_prior,
-        dtype=phi.dtype,
-        device=phi.device,
-    )
-
-    prob_fixed, slope_fixed = clip_probability_and_slope(phi, data.b_fixed, eps)
-    loss_fixed = -(alt * torch.log(prob_fixed) + nonalt * torch.log1p(-prob_fixed))
-    grad_fixed_state, curvature_fixed = state_log_kernel_grad_and_curvature(
-        alt=alt,
-        nonalt=nonalt,
-        prob=prob_fixed,
-        slope=slope_fixed,
-    )
-
-    omega = torch.clamp(omega_major, min=0.0, max=1.0)
-    prob_minus, slope_minus = clip_probability_and_slope(phi, data.b_minus, eps)
-    prob_plus, slope_plus = clip_probability_and_slope(phi, data.b_plus, eps)
-    log_minor = (
-        alt * torch.log(prob_minus)
-        + nonalt * torch.log1p(-prob_minus)
-        + log_prior_minor
-    )
-    log_major = (
-        alt * torch.log(prob_plus) + nonalt * torch.log1p(-prob_plus) + log_prior_major
-    )
-    grad_minus, curvature_minus = state_log_kernel_grad_and_curvature(
-        alt=alt,
-        nonalt=nonalt,
-        prob=prob_minus,
-        slope=slope_minus,
-    )
-    grad_plus, curvature_plus = state_log_kernel_grad_and_curvature(
-        alt=alt,
-        nonalt=nonalt,
-        prob=prob_plus,
-        slope=slope_plus,
-    )
-
-    loss_major = -log_major
-    loss_minor = -log_minor
-    entropy_offset = _binary_entropy_offset_torch(omega)
-    amb_loss = (1.0 - omega) * loss_minor + omega * loss_major + entropy_offset
-    amb_grad = -((1.0 - omega) * grad_minus + omega * grad_plus)
-    amb_curvature = (1.0 - omega) * curvature_minus + omega * curvature_plus
-
-    loss = torch.where(amb, amb_loss, loss_fixed)
-    grad = torch.where(amb, amb_grad, -grad_fixed_state)
-    hess_upper = torch.where(amb, amb_curvature, curvature_fixed)
-    gamma_major = torch.where(amb, omega, torch.ones_like(omega))
-
-    if data.count_observed is not None:
-        loss = torch.where(data.count_observed, loss, torch.zeros_like(loss))
-        grad = torch.where(data.count_observed, grad, torch.zeros_like(grad))
-
-    hess_upper = torch.clamp(hess_upper, min=1e-8)
-    if data.count_observed is not None:
-        hess_upper = torch.where(
-            data.count_observed, hess_upper, torch.zeros_like(hess_upper)
-        )
-    return TorchMutationRegionTerms(
-        loss=loss,
-        grad=grad,
-        hess_upper=hess_upper,
-        gamma_major=gamma_major,
-        path_posterior=None,
     )
 
 
@@ -1338,16 +682,43 @@ def stationarity_residual_torch(
     return phi - projected
 
 
-def _edge_kkt_maxima_from_diff_torch(
+def backward_error_stationarity_residual_torch(
+    *,
+    grad_smooth: torch.Tensor,
+    adj: torch.Tensor,
+    phi: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+) -> torch.Tensor:
+    """Return a dimension-stable componentwise box-KKT backward error."""
+
+    total_grad = grad_smooth + adj
+    cone_projection = project_stationarity_cone_torch(
+        total_grad,
+        phi=phi,
+        lower=lower,
+        upper=upper,
+    )
+    violation = total_grad - cone_projection
+    scale = torch.maximum(
+        torch.ones_like(violation),
+        torch.abs(grad_smooth) + torch.abs(adj),
+    )
+    if violation.numel() == 0:
+        return torch.zeros((), dtype=phi.dtype, device=phi.device)
+    return torch.max(torch.abs(violation) / scale)
+
+
+def edge_kkt_maxima_from_diff_torch(
     *,
     diff: torch.Tensor,
     dual: torch.Tensor | None,
     radius: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return unnormalized edge-subgradient, dual-ball, and radius maxima."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return legacy and componentwise-scaled edge KKT maxima."""
     if diff.shape[0] == 0:
         zero = torch.zeros((), dtype=diff.dtype, device=diff.device)
-        return zero, zero, zero
+        return zero, zero, zero, zero, zero
     prox_input = diff if dual is None else diff + dual
     prox_input_norm = torch.linalg.vector_norm(prox_input, dim=1)
     big = prox_input_norm >= radius
@@ -1366,14 +737,17 @@ def _edge_kkt_maxima_from_diff_torch(
         torch.linalg.vector_norm(active_residual, dim=1),
         torch.linalg.vector_norm(diff, dim=1),
     )
+    scale = torch.maximum(torch.ones_like(radius), radius)
     return (
         torch.max(edge_residual),
         torch.max(ball_residual),
         torch.max(radius),
+        torch.max(edge_residual / scale),
+        torch.max(ball_residual / scale),
     )
 
 
-def _graph_fusion_kkt_diagnostics_from_components_torch(
+def graph_fusion_kkt_diagnostics_from_components_torch(
     *,
     phi: torch.Tensor,
     grad_smooth: torch.Tensor,
@@ -1384,6 +758,8 @@ def _graph_fusion_kkt_diagnostics_from_components_torch(
     max_edge_residual: float | torch.Tensor,
     max_ball_residual: float | torch.Tensor,
     max_radius: float | torch.Tensor,
+    max_scaled_edge_residual: float | torch.Tensor | None = None,
+    max_scaled_ball_residual: float | torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Assemble exact KKT diagnostics from an adjoint and edgewise maxima."""
     total_grad = grad_smooth + adj
@@ -1401,12 +777,15 @@ def _graph_fusion_kkt_diagnostics_from_components_torch(
     stationarity_residual = float(
         projected_stationarity_norm / max(stationarity_normalizer, 1e-300)
     )
-    lower_active = phi <= lower + float(atol)
-    upper_active = phi >= upper - float(atol)
-    frozen = upper <= lower + float(atol)
-    interior = ~(lower_active | upper_active | frozen)
-    diagnostic_upper_active = upper_active & ~frozen
-    diagnostic_lower_active = lower_active & ~upper_active & ~frozen
+    backward_error_stationarity_residual = float(
+        backward_error_stationarity_residual_torch(
+            grad_smooth=grad_smooth,
+            adj=adj,
+            phi=phi,
+            lower=lower,
+            upper=upper,
+        ).item()
+    )
     box_violation = torch.maximum(
         torch.clamp(lower - phi, min=0.0),
         torch.clamp(phi - upper, min=0.0),
@@ -1436,21 +815,35 @@ def _graph_fusion_kkt_diagnostics_from_components_torch(
     edge_denom = 1.0 + radius_max
     edge_subgradient_residual = edge_max / edge_denom
     dual_ball_residual = ball_max / edge_denom
+    backward_error_edge_subgradient_residual = (
+        edge_subgradient_residual
+        if max_scaled_edge_residual is None
+        else float(
+            max_scaled_edge_residual.item()
+            if torch.is_tensor(max_scaled_edge_residual)
+            else max_scaled_edge_residual
+        )
+    )
+    backward_error_dual_ball_residual = (
+        dual_ball_residual
+        if max_scaled_ball_residual is None
+        else float(
+            max_scaled_ball_residual.item()
+            if torch.is_tensor(max_scaled_ball_residual)
+            else max_scaled_ball_residual
+        )
+    )
+    backward_error_kkt_residual = max(
+        backward_error_stationarity_residual,
+        backward_error_edge_subgradient_residual,
+        backward_error_dual_ball_residual,
+        float(box_residual),
+    )
 
     return {
         "stationarity_residual": stationarity_residual,
-        "projected_stationarity_residual": stationarity_residual,
-        "projected_stationarity_norm": projected_stationarity_norm,
-        "stationarity_normalizer": stationarity_normalizer,
-        "smooth_gradient_norm": smooth_gradient_norm,
-        "fusion_adjustment_norm": fusion_adjustment_norm,
         "edge_subgradient_residual": edge_subgradient_residual,
         "dual_ball_residual": dual_ball_residual,
-        "box_primal_violation": box_primal_violation,
-        "num_interior_coordinates": int(torch.sum(interior).item()),
-        "num_lower_active_coordinates": int(torch.sum(diagnostic_lower_active).item()),
-        "num_upper_active_coordinates": int(torch.sum(diagnostic_upper_active).item()),
-        "num_frozen_coordinates": int(torch.sum(frozen).item()),
         "box_residual": float(box_residual),
         "kkt_residual": max(
             stationarity_residual,
@@ -1458,6 +851,14 @@ def _graph_fusion_kkt_diagnostics_from_components_torch(
             dual_ball_residual,
             float(box_residual),
         ),
+        "backward_error_stationarity_residual": (
+            backward_error_stationarity_residual
+        ),
+        "backward_error_edge_subgradient_residual": (
+            backward_error_edge_subgradient_residual
+        ),
+        "backward_error_dual_ball_residual": backward_error_dual_ball_residual,
+        "backward_error_kkt_residual": backward_error_kkt_residual,
     }
 
 
@@ -1487,7 +888,10 @@ def graph_fusion_kkt_residual_from_grad_torch(
     )
     dual = None
     if valid_dual:
-        dual = dual_kkt.to(dtype=phi.dtype, device=phi.device)
+        # Keep a cross-precision witness in its source dtype.  Terminal
+        # float64 audits cast one bounded edge chunk at a time instead of
+        # materializing another complete E x S dual.
+        dual = dual_kkt.to(device=phi.device)
     chunk_size = _edge_chunk_size(
         num_edges=num_edges,
         num_regions=num_regions,
@@ -1497,27 +901,26 @@ def graph_fusion_kkt_residual_from_grad_torch(
 
     adj = torch.zeros_like(phi)
     if num_edges > 0 and lambda_value > 0.0 and dual is not None:
-        if dual_scale_value == 1.0:
-            # This routes CUDA complete graphs through the deterministic
-            # reduction used by the solver, so certification audits the same
-            # numerical operator instead of a second atomic-scatter ordering.
-            adj = graph_adjoint_edges(
-                dual,
-                edge_u=edge_u,
-                edge_v=edge_v,
-                num_nodes=int(phi.shape[0]),
-            )
-        else:
-            for edge_slice in _edge_slices(num_edges, chunk_size):
-                dual_chunk = dual_scale_value * dual[edge_slice]
-                adj.index_add_(0, edge_u[edge_slice], dual_chunk)
-                adj.index_add_(0, edge_v[edge_slice], dual_chunk, alpha=-1.0)
+        # Same-precision CUDA follows the solver's preferred reduction;
+        # cross-precision audits cast only bounded edge chunks.
+        adj = graph_adjoint_edges_in_dtype(
+            dual,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            num_nodes=int(phi.shape[0]),
+            dtype=phi.dtype,
+            device=phi.device,
+            scale=dual_scale_value,
+            edge_work_bytes=edge_work_bytes,
+        )
     zero = torch.zeros((), dtype=phi.dtype, device=phi.device)
     max_edge_residual = zero
     max_ball_residual = zero
     max_radius = zero
+    max_scaled_edge_residual = zero
+    max_scaled_ball_residual = zero
     if num_edges == 0 or lambda_value <= 0.0:
-        return _graph_fusion_kkt_diagnostics_from_components_torch(
+        return graph_fusion_kkt_diagnostics_from_components_torch(
             phi=phi,
             grad_smooth=grad_smooth,
             adj=adj,
@@ -1527,6 +930,8 @@ def graph_fusion_kkt_residual_from_grad_torch(
             max_edge_residual=max_edge_residual,
             max_ball_residual=max_ball_residual,
             max_radius=max_radius,
+            max_scaled_edge_residual=max_scaled_edge_residual,
+            max_scaled_ball_residual=max_scaled_ball_residual,
         )
 
     # Proximal fixed-point residual: R_e = d_e - prox_{r_e*|.|_2}(d_e + y_e).
@@ -1539,11 +944,19 @@ def graph_fusion_kkt_residual_from_grad_torch(
             edge_u=edge_u[edge_slice],
             edge_v=edge_v[edge_slice],
         )
-        radius = float(lambda_value) * edge_w[edge_slice]
-        dual_chunk = None if dual is None else dual[edge_slice]
+        radius = float(lambda_value) * edge_w[edge_slice].to(dtype=phi.dtype)
+        dual_chunk = (
+            None if dual is None else dual[edge_slice].to(dtype=phi.dtype)
+        )
         if dual_chunk is not None and dual_scale_value != 1.0:
             dual_chunk = dual_scale_value * dual_chunk
-        edge_max, ball_max, radius_max = _edge_kkt_maxima_from_diff_torch(
+        (
+            edge_max,
+            ball_max,
+            radius_max,
+            scaled_edge_max,
+            scaled_ball_max,
+        ) = edge_kkt_maxima_from_diff_torch(
             diff=diff,
             dual=dual_chunk,
             radius=radius,
@@ -1551,8 +964,14 @@ def graph_fusion_kkt_residual_from_grad_torch(
         max_edge_residual = torch.maximum(max_edge_residual, edge_max)
         max_ball_residual = torch.maximum(max_ball_residual, ball_max)
         max_radius = torch.maximum(max_radius, radius_max)
+        max_scaled_edge_residual = torch.maximum(
+            max_scaled_edge_residual, scaled_edge_max
+        )
+        max_scaled_ball_residual = torch.maximum(
+            max_scaled_ball_residual, scaled_ball_max
+        )
 
-    return _graph_fusion_kkt_diagnostics_from_components_torch(
+    return graph_fusion_kkt_diagnostics_from_components_torch(
         phi=phi,
         grad_smooth=grad_smooth,
         adj=adj,
@@ -1562,6 +981,8 @@ def graph_fusion_kkt_residual_from_grad_torch(
         max_edge_residual=max_edge_residual,
         max_ball_residual=max_ball_residual,
         max_radius=max_radius,
+        max_scaled_edge_residual=max_scaled_edge_residual,
+        max_scaled_ball_residual=max_scaled_ball_residual,
     )
 
 
@@ -2121,7 +1542,7 @@ def _complete_graph_admm_kkt_residual_from_maxima_torch(
     atol: float,
     diagnostics_out: dict[str, float | int] | None = None,
 ) -> float:
-    diag = _graph_fusion_kkt_diagnostics_from_components_torch(
+    diag = graph_fusion_kkt_diagnostics_from_components_torch(
         phi=phi,
         grad_smooth=grad_smooth,
         adj=adj,
@@ -2470,7 +1891,7 @@ def _closed_form_box_fusion_result(
     diagnostics_out: dict[str, float | int] | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
     projected = torch.minimum(torch.maximum(U, lower), upper)
-    diag = _graph_fusion_kkt_diagnostics_from_components_torch(
+    diag = graph_fusion_kkt_diagnostics_from_components_torch(
         phi=projected,
         grad_smooth=h * (projected - U),
         adj=torch.zeros_like(projected),
@@ -2682,7 +2103,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
             audit_due = False
         if audit_due:
             kkt_audits += 1
-            edge_max, ball_max, radius_max = _edge_kkt_maxima_from_diff_torch(
+            edge_max, ball_max, radius_max, _, _ = edge_kkt_maxima_from_diff_torch(
                 diff=edge_diff,
                 dual=actual_dual,
                 radius=radius,
@@ -2977,10 +2398,12 @@ def _solve_majorized_subproblem_alm_streaming_torch(
                     edge_u=edge_u[edge_slice],
                     edge_v=edge_v[edge_slice],
                 )
-                edge_max, ball_max, radius_max = _edge_kkt_maxima_from_diff_torch(
+                edge_max, ball_max, radius_max, _, _ = (
+                    edge_kkt_maxima_from_diff_torch(
                     diff=edge_diff,
                     dual=float(rho) * scaled_dual[edge_slice],
                     radius=float(lambda_value) * edge_w[edge_slice],
+                    )
                 )
                 max_edge_residual = torch.maximum(max_edge_residual, edge_max)
                 max_ball_residual = torch.maximum(max_ball_residual, ball_max)

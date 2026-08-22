@@ -25,60 +25,26 @@ from .path_compiler import (
     initialize_path_marginal_phi,
     path_prior_mode,
 )
+
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
-TUMOR_TXT_MODEL_ID = PATH_LIKELIHOOD_MODEL_ID
-TUMOR_TXT_MODEL_VERSION = PATH_LIKELIHOOD_MODEL_VERSION
-TUMOR_TXT_CANDIDATE_GENERATOR_VERSION = PATH_CANDIDATE_GENERATOR_VERSION
 DEFAULT_DOSAGE_PRIOR_PENALTY = 3.0
 MORE_THAN_TWO_STATES = "MORE_THAN_TWO_LOCAL_CN_STATES"
 NO_POSITIVE_PATH = "NO_POSITIVE_MUTANT_COPY_PATH"
-REQUIRED_METADATA = (
-    "schema",
-    "tumor_id",
-    "genome_build",
-    "coordinate_system",
-    "missing_value",
-)
-# Canonical column order of a full clipp2.tumor.long.v1 table. Writers emit
-# these first, in this order, followed by any extra reporting columns.
+# The complete model-defining schema is the header of exampleTumor1.tsv.
+# Writers emit these first, followed by any inert provenance columns.
 SCHEMA_COLUMNS = (
     "mutation_id",
     "sample_id",
-    "chromosome",
-    "position",
-    "ref",
-    "alt",
     "alt_count",
     "ref_count",
     "count_observed",
     "purity",
     "normal_cn",
     "segment_id",
-    "segment_start",
-    "segment_end",
     "cn_state_id",
     "cn_state_fraction",
     "allele_a_cn",
     "allele_b_cn",
-    "allele_mode",
-)
-# Columns that never enter the objective: identity/coordinate metadata and the
-# phasing declaration. They may be omitted entirely or carry "." per row.
-# A missing allele_mode defaults to "unphased" (which enforces
-# allele_a_cn >= allele_b_cn); declare "phased" explicitly to lift that rule.
-OPTIONAL_COLUMNS = (
-    "chromosome",
-    "position",
-    "ref",
-    "alt",
-    "segment_start",
-    "segment_end",
-    "allele_mode",
-)
-# Columns whose absence is an error: everything the likelihood, the masking,
-# or the unit/state structure is computed from.
-REQUIRED_COLUMNS = tuple(
-    column for column in SCHEMA_COLUMNS if column not in OPTIONAL_COLUMNS
 )
 _FRACTION_TOL = 1e-8
 _NUMERIC_TOL = 1e-10
@@ -114,9 +80,7 @@ class _ValidatedLongTable:
     mutation_ids: tuple[str, ...]
     sample_ids: tuple[str, ...]
     rows_by_unit: dict[tuple[str, str], tuple[dict[str, Any], ...]]
-    states_by_segment: dict[
-        tuple[str, str], tuple[str, tuple[LocalCopyNumberState, ...]]
-    ]
+    states_by_segment: dict[tuple[str, str], tuple[LocalCopyNumberState, ...]]
 
 
 def _open_text(path: Path, mode: str):
@@ -153,13 +117,7 @@ def _default_tumor_id(path: Path) -> str:
 
 
 def _validate_metadata(metadata: dict[str, str], *, path: Path) -> dict[str, str]:
-    """Apply defaults for absent metadata and validate whatever is present.
-
-    The ``##key=value`` block is optional: a plain TSV with only a header is a
-    valid input. ``tumor_id`` defaults to the file name stem, the schema and
-    conventions default to their single supported values, and any key that IS
-    declared must carry the supported value.
-    """
+    """Apply canonical defaults and validate supplied identity metadata."""
     validated = dict(metadata)
     validated.setdefault("schema", TUMOR_TXT_SCHEMA)
     validated.setdefault("tumor_id", _default_tumor_id(path))
@@ -243,15 +201,13 @@ def _read_text_table(path: Path) -> tuple[dict[str, str], pd.DataFrame]:
     if not rows:
         raise TumorTxtError(f"{path} does not contain any tumor rows.")
     metadata = _validate_metadata(metadata, path=path)
-    missing_columns = sorted(set(REQUIRED_COLUMNS).difference(header))
+    missing_columns = sorted(set(SCHEMA_COLUMNS).difference(header))
     if missing_columns:
         raise TumorTxtError(f"{path} is missing required columns: {missing_columns}.")
+    # Extra columns are accepted as provenance but never enter normalization,
+    # likelihood construction, or the objective identity.
     table = pd.DataFrame(rows, columns=header, dtype=object)
-    # Absent optional columns are equivalent to a "." in every row.
-    for column in OPTIONAL_COLUMNS:
-        if column not in table.columns:
-            table[column] = "."
-    return metadata, table
+    return metadata, table.loc[:, SCHEMA_COLUMNS]
 
 
 def _identifier(value: object, *, name: str) -> str:
@@ -307,14 +263,6 @@ def _nonnegative_integer(
     return int(round(numeric))
 
 
-def _positive_integer(value: object, *, name: str) -> int:
-    result = _nonnegative_integer(value, name=name)
-    assert result is not None
-    if result <= 0:
-        raise TumorTxtError(f"{name} must be strictly positive.")
-    return result
-
-
 def _same_float(left: float, right: float) -> bool:
     return bool(np.isclose(left, right, rtol=0.0, atol=_NUMERIC_TOL))
 
@@ -323,25 +271,6 @@ def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, A
     context = f"row {row_number}"
     mutation_id = _identifier(row["mutation_id"], name=f"{context} mutation_id")
     sample_id = _identifier(row["sample_id"], name=f"{context} sample_id")
-    chromosome = (
-        None
-        if str(row["chromosome"]) == "."
-        else _identifier(row["chromosome"], name=f"{context} chromosome")
-    )
-    ref = None if str(row["ref"]) == "." else str(row["ref"])
-    alt = None if str(row["alt"]) == "." else str(row["alt"])
-    if (ref is None) != (alt is None):
-        raise TumorTxtError(
-            f"{context} ref and alt must both be provided or both be '.'."
-        )
-    if ref is not None and alt is not None:
-        if ref not in {"A", "C", "G", "T"} or alt not in {"A", "C", "G", "T"}:
-            raise TumorTxtError(
-                f"{context} ref and alt must each be one uppercase nucleotide "
-                "in A/C/G/T."
-            )
-        if ref == alt:
-            raise TumorTxtError(f"{context} ref and alt must differ.")
     observed_text = str(row["count_observed"])
     if observed_text not in {"0", "1"}:
         raise TumorTxtError(f"{context} count_observed must be 0 or 1.")
@@ -362,24 +291,6 @@ def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, A
     normal_cn = _finite_float(row["normal_cn"], name=f"{context} normal_cn")
     if normal_cn < 0.0:
         raise TumorTxtError(f"{context} normal_cn must be nonnegative.")
-    segment_start = (
-        None
-        if str(row["segment_start"]) == "."
-        else _positive_integer(row["segment_start"], name=f"{context} segment_start")
-    )
-    segment_end = (
-        None
-        if str(row["segment_end"]) == "."
-        else _positive_integer(row["segment_end"], name=f"{context} segment_end")
-    )
-    if (segment_start is None) != (segment_end is None):
-        raise TumorTxtError(
-            f"{context} segment_start and segment_end must both be provided "
-            "or both be '.'."
-        )
-    if segment_start is not None and segment_end is not None:
-        if segment_end < segment_start:
-            raise TumorTxtError(f"{context} segment_end must be >= segment_start.")
     fraction = _finite_float(
         row["cn_state_fraction"],
         name=f"{context} cn_state_fraction",
@@ -395,38 +306,11 @@ def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, A
         name=f"{context} allele_b_cn",
     )
     assert allele_a is not None and allele_b is not None
-    allele_mode = str(row["allele_mode"])
-    if allele_mode == ".":
-        # An undeclared phasing mode is the ordinary major/minor convention.
-        allele_mode = "unphased"
-    if allele_mode not in {"phased", "unphased"}:
-        raise TumorTxtError(f"{context} allele_mode must be 'phased' or 'unphased'.")
-    if allele_mode == "unphased" and allele_a < allele_b:
-        raise TumorTxtError(
-            f"{context} unphased states require allele_a_cn >= allele_b_cn "
-            "(declare allele_mode=phased to keep persistent homolog labels)."
-        )
-    position = (
-        None
-        if str(row["position"]) == "."
-        else _positive_integer(row["position"], name=f"{context} position")
-    )
-    if (
-        position is not None
-        and segment_start is not None
-        and segment_end is not None
-        and not segment_start <= position <= segment_end
-    ):
-        raise TumorTxtError(
-            f"{context} mutation position does not lie within its segment bounds."
-        )
+    if allele_a < allele_b:
+        raise TumorTxtError(f"{context} requires allele_a_cn >= allele_b_cn.")
     return {
         "mutation_id": mutation_id,
         "sample_id": sample_id,
-        "chromosome": chromosome,
-        "position": position,
-        "ref": ref,
-        "alt": alt,
         "alt_count": alt_count,
         "ref_count": ref_count,
         "count_observed": count_observed,
@@ -436,8 +320,6 @@ def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, A
             row["segment_id"],
             name=f"{context} segment_id",
         ),
-        "segment_start": segment_start,
-        "segment_end": segment_end,
         "cn_state_id": _identifier(
             row["cn_state_id"],
             name=f"{context} cn_state_id",
@@ -445,7 +327,6 @@ def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, A
         "cn_state_fraction": fraction,
         "allele_a_cn": allele_a,
         "allele_b_cn": allele_b,
-        "allele_mode": allele_mode,
     }
 
 
@@ -453,18 +334,7 @@ def _observation_fields_agree(
     reference: Mapping[str, Any],
     candidate: Mapping[str, Any],
 ) -> bool:
-    exact = (
-        "chromosome",
-        "position",
-        "ref",
-        "alt",
-        "alt_count",
-        "ref_count",
-        "count_observed",
-        "segment_id",
-        "segment_start",
-        "segment_end",
-    )
+    exact = ("alt_count", "ref_count", "count_observed", "segment_id")
     if any(reference[name] != candidate[name] for name in exact):
         return False
     return _same_float(reference["purity"], candidate["purity"]) and _same_float(
@@ -481,12 +351,8 @@ def _validate_long_table(
         for index, row in enumerate(table.to_dict(orient="records"))
     ]
     rows_by_unit_mutable: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    mutation_definitions: dict[str, tuple[str, int, str, str]] = {}
     sample_purities: dict[str, list[float]] = {}
-    segment_definitions: dict[tuple[str, str], tuple[str, int, int, str]] = {}
-    state_definitions: dict[
-        tuple[str, str, str], list[tuple[float, int, int, str]]
-    ] = {}
+    state_definitions: dict[tuple[str, str, str], list[tuple[float, int, int]]] = {}
     observed_triples: set[tuple[str, str, str]] = set()
 
     for row in normalized:
@@ -494,37 +360,8 @@ def _validate_long_table(
         sample_id = row["sample_id"]
         segment_id = row["segment_id"]
         state_id = row["cn_state_id"]
-        mutation_definition = (
-            row["chromosome"],
-            row["position"],
-            row["ref"],
-            row["alt"],
-        )
-        previous_mutation = mutation_definitions.setdefault(
-            mutation_id,
-            mutation_definition,
-        )
-        if previous_mutation != mutation_definition:
-            raise TumorTxtError(
-                f"mutation_id {mutation_id!r} maps to inconsistent variant definitions."
-            )
         sample_purities.setdefault(sample_id, []).append(row["purity"])
         segment_key = (sample_id, segment_id)
-        segment_definition = (
-            row["chromosome"],
-            row["segment_start"],
-            row["segment_end"],
-            row["allele_mode"],
-        )
-        previous_segment = segment_definitions.setdefault(
-            segment_key,
-            segment_definition,
-        )
-        if previous_segment != segment_definition:
-            raise TumorTxtError(
-                f"Segment {segment_key!r} has inconsistent chromosome, bounds, "
-                "or allele_mode."
-            )
         triple = (mutation_id, sample_id, state_id)
         if triple in observed_triples:
             raise TumorTxtError(
@@ -539,7 +376,6 @@ def _validate_long_table(
                 row["cn_state_fraction"],
                 row["allele_a_cn"],
                 row["allele_b_cn"],
-                row["allele_mode"],
             )
         )
         rows_by_unit_mutable.setdefault((mutation_id, sample_id), []).append(row)
@@ -562,7 +398,7 @@ def _validate_long_table(
     for key, definitions in state_definitions.items():
         fractions = np.asarray([definition[0] for definition in definitions])
         allele_definitions = {
-            (definition[1], definition[2], definition[3]) for definition in definitions
+            (definition[1], definition[2]) for definition in definitions
         }
         if len(allele_definitions) != 1 or not np.allclose(
             fractions,
@@ -571,7 +407,7 @@ def _validate_long_table(
             atol=_NUMERIC_TOL,
         ):
             raise TumorTxtError(f"CN state {key!r} has an inconsistent definition.")
-        allele_a, allele_b, _mode = next(iter(allele_definitions))
+        allele_a, allele_b = next(iter(allele_definitions))
         state_lookup[key] = LocalCopyNumberState(
             fraction=float(np.min(fractions)),
             allele_a_cn=int(allele_a),
@@ -579,11 +415,8 @@ def _validate_long_table(
         )
         state_ids_by_segment.setdefault(key[:2], set()).add(key[2])
 
-    states_by_segment: dict[
-        tuple[str, str], tuple[str, tuple[LocalCopyNumberState, ...]]
-    ] = {}
+    states_by_segment: dict[tuple[str, str], tuple[LocalCopyNumberState, ...]] = {}
     for segment_key, state_ids in state_ids_by_segment.items():
-        mode = segment_definitions[segment_key][3]
         aggregated: dict[tuple[int, int], float] = {}
         for state_id in sorted(state_ids):
             state = state_lookup[(*segment_key, state_id)]
@@ -606,9 +439,11 @@ def _validate_long_table(
             )
             for (allele_a, allele_b), fraction in sorted(aggregated.items())
         )
-        states_by_segment[segment_key] = (mode, states)
+        states_by_segment[segment_key] = states
 
-    mutation_ids = tuple(sorted(mutation_definitions))
+    mutation_ids = tuple(
+        sorted({mutation_id for mutation_id, _ in rows_by_unit_mutable})
+    )
     sample_ids = tuple(sorted(sample_purities))
     expected_units = {
         (mutation_id, sample_id)
@@ -656,6 +491,7 @@ def _validate_long_table(
         states_by_segment=states_by_segment,
     )
 
+
 def _build_tumor_data(
     validated: _ValidatedLongTable,
     *,
@@ -671,7 +507,7 @@ def _build_tumor_data(
     # to use the path model for every unit so that one coherent likelihood is
     # optimized across regions.
     uses_path_likelihood = any(
-        len(states) > 1 for _mode, states in validated.states_by_segment.values()
+        len(states) > 1 for states in validated.states_by_segment.values()
     )
     mutation_ids = list(validated.mutation_ids)
     sample_ids = list(validated.sample_ids)
@@ -705,7 +541,7 @@ def _build_tumor_data(
             total_counts[i, j] = float(row["alt_count"] + row["ref_count"])
         purity[i, j] = float(row["purity"])
         normal_cn[i, j] = float(row["normal_cn"])
-        mode, states = validated.states_by_segment[(sample_id, row["segment_id"])]
+        states = validated.states_by_segment[(sample_id, row["segment_id"])]
         mean_total_cn[i, j] = sum(
             state.fraction * (state.allele_a_cn + state.allele_b_cn) for state in states
         )
@@ -732,7 +568,7 @@ def _build_tumor_data(
             if compiled is None:
                 compiled = compile_single_switch_paths(
                     states,
-                    allele_mode=mode,
+                    allele_mode="unphased",
                     dosage_prior_penalty=dosage_prior_penalty,
                 )
                 compiled_by_segment[segment_key] = compiled
@@ -769,9 +605,9 @@ def _build_tumor_data(
     if uses_path_likelihood:
         path_likelihood = build_path_likelihood(
             compiled_units,
-            model_id=TUMOR_TXT_MODEL_ID,
-            model_version=TUMOR_TXT_MODEL_VERSION,
-            candidate_generator_version=TUMOR_TXT_CANDIDATE_GENERATOR_VERSION,
+            model_id=PATH_LIKELIHOOD_MODEL_ID,
+            model_version=PATH_LIKELIHOOD_MODEL_VERSION,
+            candidate_generator_version=PATH_CANDIDATE_GENERATOR_VERSION,
             prior_mode=path_prior_mode(dosage_prior_penalty),
         )
         phi_upper = np.ones(shape, dtype=np.float64)
@@ -873,12 +709,12 @@ def _canonical_text_value(value: object) -> str:
 def write_tumor_txt(
     path: str | Path,
     table: pd.DataFrame,
-    metadata: Mapping[str, object],
+    metadata: Mapping[str, object] | None = None,
 ) -> Path:
     """Validate and write one canonical ``clipp2.tumor.long.v1`` file."""
 
     normalized_metadata: dict[str, str] = {}
-    for raw_key, raw_value in dict(metadata).items():
+    for raw_key, raw_value in dict(metadata or {}).items():
         key = str(raw_key)
         value = str(raw_value)
         if (
@@ -892,17 +728,8 @@ def write_tumor_txt(
                 "tabs or newlines."
             )
         normalized_metadata[key] = value
-    missing_metadata = sorted(set(REQUIRED_METADATA).difference(normalized_metadata))
-    if missing_metadata:
-        raise TumorTxtError(f"Missing required metadata: {missing_metadata}.")
-    if normalized_metadata["schema"] != TUMOR_TXT_SCHEMA:
-        raise TumorTxtError(f"schema must be {TUMOR_TXT_SCHEMA!r}.")
-    if normalized_metadata["coordinate_system"] != "1-based-inclusive":
-        raise TumorTxtError("coordinate_system must be '1-based-inclusive'.")
-    if normalized_metadata["missing_value"] != ".":
-        raise TumorTxtError("missing_value must be '.'.")
-    normalized_metadata["tumor_id"] = _safe_tumor_id(normalized_metadata["tumor_id"])
-    _identifier(normalized_metadata["genome_build"], name="genome_build")
+    destination = Path(path).resolve()
+    validated_metadata = _validate_metadata(normalized_metadata, path=destination)
 
     frame = pd.DataFrame(table).copy()
     if not frame.columns.is_unique:
@@ -918,7 +745,7 @@ def write_tumor_txt(
                 "Long tumor table column names must be nonempty strings without "
                 "surrounding whitespace, tabs, or newlines."
             )
-    missing_columns = sorted(set(REQUIRED_COLUMNS).difference(frame.columns))
+    missing_columns = sorted(set(SCHEMA_COLUMNS).difference(frame.columns))
     if missing_columns:
         raise TumorTxtError(
             f"Long tumor table is missing required columns: {missing_columns}."
@@ -933,14 +760,10 @@ def write_tumor_txt(
         raise TumorTxtError("Long tumor table may not be empty.")
     if bool((frame == "").to_numpy().any()):
         raise TumorTxtError("Missing values must be represented by '.'.")
-    _validate_long_table(normalized_metadata, frame)
+    _validate_long_table(validated_metadata, frame.loc[:, SCHEMA_COLUMNS])
 
-    destination = Path(path).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    metadata_order = [
-        *REQUIRED_METADATA,
-        *sorted(set(normalized_metadata).difference(REQUIRED_METADATA)),
-    ]
+    metadata_order = sorted(normalized_metadata)
     with _open_text(destination, "wt") as handle:
         for key in metadata_order:
             handle.write(f"##{key}={normalized_metadata[key]}\n")
@@ -952,9 +775,6 @@ def write_tumor_txt(
 
 __all__ = [
     "DEFAULT_DOSAGE_PRIOR_PENALTY",
-    "OPTIONAL_COLUMNS",
-    "REQUIRED_COLUMNS",
-    "REQUIRED_METADATA",
     "SCHEMA_COLUMNS",
     "TUMOR_TXT_SCHEMA",
     "TumorTxtError",

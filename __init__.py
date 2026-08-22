@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from ._version import __version__
-from .core.model import FitOptions, FitResult, fit_fixed_objective
+from .config import FitConfig, resolve_fit_config
+from .core.model import FitResult, fit_fixed_objective
 from .io.data import TumorData
 from .io.tumor_txt import load_tumor_txt
 
 __all__ = [
-    "FitOptions",
+    "FitConfig",
     "FitResult",
     "TumorData",
     "__version__",
     "fit_fixed_objective",
     "load_tumor_txt",
+    "resolve_fit_config",
 ]

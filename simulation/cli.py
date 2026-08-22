@@ -12,8 +12,6 @@ from .config import (
 from .generator import simulate_tumor
 
 
-
-
 def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the compact, canonical single-tumor simulation interface."""
 

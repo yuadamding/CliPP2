@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ...io.data import TumorData
+from ..objective import compile_observed_model, observed_terms_numpy
 
 
 @dataclass(frozen=True)
@@ -49,51 +50,27 @@ def infer_multiplicity_posterior_numpy(
     if not np.isfinite(probability_eps) or not (0.0 < probability_eps < 0.5):
         raise ValueError("eps must lie strictly in (0, 0.5).")
 
-    alt = np.asarray(data.alt_counts, dtype=np.float64)
-    total = np.asarray(data.total_counts, dtype=np.float64)
-    nonalt = total - alt
-    scaling = np.asarray(data.scaling, dtype=np.float64)
-
-    prob_minor = np.clip(
-        scaling * np.asarray(data.minor_cn, dtype=np.float64) * phi_array,
-        probability_eps,
-        1.0 - probability_eps,
+    model = compile_observed_model(
+        data,
+        major_prior=prior,
+        eps=probability_eps,
     )
-    prob_major = np.clip(
-        scaling * np.asarray(data.major_cn, dtype=np.float64) * phi_array,
-        probability_eps,
-        1.0 - probability_eps,
-    )
-    log_minor = (
-        alt * np.log(prob_minor) + nonalt * np.log1p(-prob_minor) + np.log1p(-prior)
-    )
-    log_major = (
-        alt * np.log(prob_major) + nonalt * np.log1p(-prob_major) + np.log(prior)
-    )
-
-    # exp(-logaddexp(0, -delta)) is a stable sigmoid(delta).
-    posterior_major = np.exp(-np.logaddexp(0.0, log_minor - log_major))
-    estimation_mask = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
-    count_observed = getattr(data, "count_observed", None)
-    observed_mask = (
-        np.ones_like(estimation_mask, dtype=bool)
-        if count_observed is None
-        else np.asarray(count_observed, dtype=bool)
-    )
-    if observed_mask.shape != estimation_mask.shape:
+    if model.legacy_major is None:
         raise ValueError(
-            "count_observed must have the same mutation-region shape as the tumor data."
+            "Multiplicity reporting requires canonical legacy-major indicators."
         )
-
-    major_probability = np.ones_like(phi_array, dtype=np.float64)
-    informed_mask = estimation_mask & observed_mask
-    major_probability[estimation_mask] = prior
-    major_probability[informed_mask] = posterior_major[informed_mask]
+    posterior_major = observed_terms_numpy(
+        model,
+        phi_array,
+        eps=probability_eps,
+    ).legacy_major_probability
+    estimation_mask = np.asarray(data.multiplicity_estimation_mask, dtype=bool)
+    major_probability = np.asarray(posterior_major, dtype=np.float64)
 
     major_call = major_probability >= 0.5
     multiplicity_call = np.where(
         estimation_mask,
-        np.where(major_call, data.major_cn, data.minor_cn),
+        np.where(major_call, data.major_cn, data.multiplicity_low),
         data.fixed_multiplicity,
     ).astype(np.float64, copy=False)
     return MultiplicityPosterior(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from ...io.data import PathLikelihoodSpec, TumorData
-from .torch_backend import path_mutation_region_terms_numpy
+from ..objective import compile_observed_model, observed_terms_numpy
 
 
 DEFAULT_PATH_BOUNDARY_TOL = 1e-8
@@ -22,19 +22,15 @@ def path_posterior_at_phi_numpy(
     kernel and fixed path prior as fitting, but does not alter a fitted objective.
     """
 
-    spec = data.path_likelihood
-    if spec is None:
+    if data.path_likelihood is None:
         raise ValueError("TumorData does not contain a path likelihood.")
-    terms = path_mutation_region_terms_numpy(
-        spec,
-        scaling=data.scaling,
-        alt=data.alt_counts,
-        total=data.total_counts,
-        phi=np.asarray(phi, dtype=np.float64),
+    model = compile_observed_model(data, major_prior=0.5, eps=float(eps))
+    terms = observed_terms_numpy(
+        model,
+        np.asarray(phi, dtype=np.float64),
         eps=float(eps),
-        count_observed=data.count_observed,
     )
-    return terms.path_posterior
+    return terms.posterior
 
 
 def summarize_path_posterior_numpy(

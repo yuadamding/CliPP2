@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import heapq
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from collections.abc import Callable, Sequence
 
 import numpy as np
 import torch
 
 from ...io.data import TumorData
+from ..objective import ObservedModel, compile_observed_model, observed_terms_numpy
 from ..bic import (
     PARTITION_DIRICHLET_SCORE_WEIGHT,
     bic_degrees_of_freedom,
@@ -16,18 +17,17 @@ from ..bic import (
     compute_partition_dirichlet_score,
     effective_bic_mutation_region_count,
 )
-from .refit import (
+from ..scalar import (
     PartitionRefitResult,
-    _canonical_labels,
+    canonical_partition_labels as _canonical_labels,
     partition_constrained_observed_refit,
 )
-from .starts import _mutation_region_loss_grid_numpy
 from .torch_backend import (
     TorchTumorData,
     as_runtime_tensor,
+    copy_torch_tumor_data,
     mutation_region_loss_grid_torch,
     mutation_region_terms_torch,
-    path_mutation_region_terms_numpy,
     resolve_runtime,
     to_torch_tumor_data,
 )
@@ -45,29 +45,21 @@ class PartitionCandidate:
     labels: np.ndarray
     K: int
     source: str
-    theta: np.ndarray
     phi_start: np.ndarray
     fit_loss: float
     bic: float
-    active_df: int | None = None
     finite_candidate_found: bool = True
-    diagnostics: dict[str, object] = field(default_factory=dict)
-    refit: PartitionRefitResult | None = field(default=None, repr=False, compare=False)
+    requested_k: int | None = None
+    component_death_count: int = 0
 
 
 @dataclass(frozen=True)
 class PartitionRefinementResult:
     labels: np.ndarray
     refit: PartitionRefitResult
-    initial_labels: np.ndarray
-    iterations: int
-    accepted_updates: int
     initial_k: int
     final_k: int
     component_death_count: int
-    score_before: float
-    score_after: float
-    score_path: tuple[float, ...]
 
 
 def compute_partition_bic(
@@ -97,47 +89,6 @@ def _partition_work_dtype(dtype: torch.dtype) -> torch.dtype:
     return torch.float32 if dtype == torch.float16 else dtype
 
 
-def _copy_torch_tumor_data(
-    data: TorchTumorData, *, dtype: torch.dtype, device: torch.device
-) -> TorchTumorData:
-    path_likelihood = (
-        None
-        if data.path_likelihood is None
-        else replace(
-            data.path_likelihood,
-            first_scale=data.path_likelihood.first_scale.to(dtype=dtype, device=device),
-            second_scale=data.path_likelihood.second_scale.to(
-                dtype=dtype, device=device
-            ),
-            switch_fraction=data.path_likelihood.switch_fraction.to(
-                dtype=dtype, device=device
-            ),
-            log_prior=data.path_likelihood.log_prior.to(dtype=dtype, device=device),
-            valid=data.path_likelihood.valid.to(device=device),
-            legacy_major_indicator=(
-                None
-                if data.path_likelihood.legacy_major_indicator is None
-                else data.path_likelihood.legacy_major_indicator.to(device=device)
-            ),
-        )
-    )
-    return TorchTumorData(
-        alt=data.alt.to(dtype=dtype, device=device),
-        total=data.total.to(dtype=dtype, device=device),
-        nonalt=data.nonalt.to(dtype=dtype, device=device),
-        phi_upper=data.phi_upper.to(dtype=dtype, device=device),
-        ambiguous=data.ambiguous.to(device=device),
-        b_minus=data.b_minus.to(dtype=dtype, device=device),
-        b_plus=data.b_plus.to(dtype=dtype, device=device),
-        b_fixed=data.b_fixed.to(dtype=dtype, device=device),
-        count_observed=None
-        if data.count_observed is None
-        else data.count_observed.to(device=device),
-        path_likelihood=path_likelihood,
-        data_fingerprint=data.data_fingerprint,
-    )
-
-
 def _resolve_partition_runtime(
     *,
     data: TumorData,
@@ -145,6 +96,8 @@ def _resolve_partition_runtime(
     torch_data: TorchTumorData | None = None,
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
+    major_prior: float = 0.5,
+    eps: float = 1e-6,
 ) -> tuple[TorchRuntime, TorchTumorData]:
     if torch_data is not None:
         runtime_device = (
@@ -166,7 +119,7 @@ def _resolve_partition_runtime(
             device_name=_torch_device_name(runtime_device),
             dtype=runtime_dtype,
         )
-        return runtime, _copy_torch_tumor_data(
+        return runtime, copy_torch_tumor_data(
             torch_data, dtype=runtime.dtype, device=runtime.device
         )
 
@@ -199,59 +152,18 @@ def _resolve_partition_runtime(
                 device_name=runtime.device_name,
                 dtype=torch.float32,
             )
-    return runtime, to_torch_tumor_data(data, runtime)
+    return runtime, to_torch_tumor_data(
+        data,
+        runtime,
+        major_prior=float(major_prior),
+        eps=float(eps),
+    )
 
 
 def _as_torch(
     array: np.ndarray | torch.Tensor | object, *, runtime: TorchRuntime
 ) -> torch.Tensor:
     return as_runtime_tensor(array, runtime)
-
-
-def _data_arrays(data: TumorData) -> dict[str, np.ndarray]:
-    return {
-        "alt": np.asarray(data.alt_counts, dtype=np.float64),
-        "total": np.asarray(data.total_counts, dtype=np.float64),
-        "b_minus": np.asarray(data.scaling, dtype=np.float64)
-        * np.asarray(data.minor_cn, dtype=np.float64),
-        "b_plus": np.asarray(data.scaling, dtype=np.float64)
-        * np.asarray(data.major_cn, dtype=np.float64),
-        "b_fixed": np.asarray(data.scaling, dtype=np.float64)
-        * np.asarray(data.fixed_multiplicity, dtype=np.float64),
-        "ambiguous": np.asarray(data.multiplicity_estimation_mask, dtype=bool),
-        "upper": np.asarray(data.phi_upper, dtype=np.float64),
-    }
-
-
-def _mutation_region_loss_vector_numpy(
-    beta: float,
-    *,
-    alt: np.ndarray,
-    total: np.ndarray,
-    b_minus: np.ndarray,
-    b_plus: np.ndarray,
-    b_fixed: np.ndarray,
-    ambiguous: np.ndarray,
-    major_prior: float,
-    eps: float,
-) -> np.ndarray:
-    beta_values = np.full(np.asarray(alt).shape, float(beta), dtype=np.float64)
-    out = np.empty_like(beta_values, dtype=np.float64)
-    for idx in np.ndindex(beta_values.shape):
-        out[idx] = float(
-            _mutation_region_loss_grid_numpy(
-                np.asarray([beta_values[idx]], dtype=np.float64),
-                alt=float(alt[idx]),
-                total=float(total[idx]),
-                b_minus=float(b_minus[idx]),
-                b_plus=float(b_plus[idx]),
-                b_fixed=float(b_fixed[idx]),
-                ambiguous=bool(ambiguous[idx]),
-                major_prior=float(major_prior),
-                eps=float(eps),
-            )[0]
-        )
-    return out
 
 
 def _mutation_region_loss_matrix_torch(
@@ -261,24 +173,12 @@ def _mutation_region_loss_matrix_torch(
     major_prior: float,
     eps: float,
 ) -> torch.Tensor:
-    if torch_data.path_likelihood is not None:
-        return mutation_region_terms_torch(
-            torch_data,
-            beta,
-            major_prior=float(major_prior),
-            eps=float(eps),
-        ).loss
-    return mutation_region_loss_grid_torch(
+    return mutation_region_terms_torch(
+        torch_data,
         beta,
-        alt=torch_data.alt,
-        total=torch_data.total,
-        b_minus=torch_data.b_minus,
-        b_plus=torch_data.b_plus,
-        b_fixed=torch_data.b_fixed,
-        ambiguous=torch_data.ambiguous,
         major_prior=float(major_prior),
         eps=float(eps),
-    )
+    ).loss
 
 
 @torch.no_grad()
@@ -302,6 +202,8 @@ def observed_curvature_at_pilot_torch(
         torch_data=torch_data,
         device=device,
         dtype=dtype,
+        major_prior=major_prior,
+        eps=eps,
     )
     phi0 = _as_torch(exact_pilot, runtime=runtime)
     upper = torch_data.phi_upper
@@ -610,59 +512,26 @@ def _loss_to_centers(
     major_prior: float,
     eps: float,
     infeasible_penalty: float = 1e100,
+    _model: ObservedModel | None = None,
 ) -> np.ndarray:
     centers = np.asarray(centers, dtype=np.float64)
-    arrays = _data_arrays(data)
+    model = (
+        compile_observed_model(data, major_prior=major_prior, eps=eps)
+        if _model is None
+        else _model
+    )
     num_mutations = int(data.num_mutations)
     num_clusters = int(centers.shape[0])
     cost = np.zeros((num_mutations, num_clusters), dtype=np.float64)
     infeasible = np.zeros((num_mutations, num_clusters), dtype=bool)
-    path_spec = getattr(data, "path_likelihood", None)
 
     for cluster_idx in range(num_clusters):
-        if path_spec is not None:
-            phi_for_center = np.broadcast_to(
-                centers[cluster_idx][None, :],
-                (num_mutations, int(data.num_regions)),
-            )
-            path_terms = path_mutation_region_terms_numpy(
-                path_spec,
-                scaling=np.asarray(data.scaling, dtype=np.float64),
-                alt=np.asarray(data.alt_counts, dtype=np.float64),
-                total=np.asarray(data.total_counts, dtype=np.float64),
-                phi=phi_for_center,
-                eps=float(eps),
-                count_observed=data.count_observed,
-            )
-            cost[:, cluster_idx] = np.sum(path_terms.loss, axis=1)
-            infeasible[:, cluster_idx] = np.any(
-                phi_for_center > arrays["upper"] + max(float(eps), 1e-8),
-                axis=1,
-            )
-            continue
-        for region_idx in range(int(data.num_regions)):
-            beta = float(centers[cluster_idx, region_idx])
-            region_loss = _mutation_region_loss_vector_numpy(
-                beta,
-                alt=arrays["alt"][:, region_idx],
-                total=arrays["total"][:, region_idx],
-                b_minus=arrays["b_minus"][:, region_idx],
-                b_plus=arrays["b_plus"][:, region_idx],
-                b_fixed=arrays["b_fixed"][:, region_idx],
-                ambiguous=arrays["ambiguous"][:, region_idx],
-                major_prior=major_prior,
-                eps=eps,
-            )
-            if data.count_observed is not None:
-                region_loss = np.where(
-                    np.asarray(data.count_observed, dtype=bool)[:, region_idx],
-                    region_loss,
-                    0.0,
-                )
-            cost[:, cluster_idx] += region_loss
-            infeasible[:, cluster_idx] |= beta > arrays["upper"][:, region_idx] + max(
-                float(eps), 1e-8
-            )
+        phi_for_center = np.broadcast_to(centers[cluster_idx], model.shape)
+        terms = observed_terms_numpy(model, phi_for_center, eps=float(eps))
+        cost[:, cluster_idx] = np.sum(terms.loss, axis=1)
+        infeasible[:, cluster_idx] = np.any(
+            phi_for_center > model.upper + max(float(eps), 1e-8), axis=1
+        )
 
     cost[infeasible] = float(infeasible_penalty)
     return cost
@@ -686,58 +555,19 @@ def _loss_to_centers_torch(
         torch_data=torch_data,
         device=device,
         dtype=dtype,
+        major_prior=major_prior,
+        eps=eps,
     )
     centers_t = _as_torch(centers, runtime=runtime)
-    if torch_data.path_likelihood is not None:
-        cost_columns: list[torch.Tensor] = []
-        for cluster_idx in range(int(centers_t.shape[0])):
-            phi_for_center = (
-                centers_t[cluster_idx].unsqueeze(0).expand(int(data.num_mutations), -1)
-            )
-            terms = mutation_region_terms_torch(
-                torch_data,
-                phi_for_center,
-                major_prior=float(major_prior),
-                eps=float(eps),
-            )
-            cost_column = torch.sum(terms.loss, dim=1)
-            infeasible = torch.any(
-                phi_for_center > torch_data.phi_upper + max(float(eps), 1e-8),
-                dim=1,
-            )
-            safe_penalty = min(
-                float(infeasible_penalty),
-                float(torch.finfo(cost_column.dtype).max) / 16.0,
-            )
-            cost_columns.append(
-                torch.where(
-                    infeasible,
-                    torch.full_like(cost_column, safe_penalty),
-                    cost_column,
-                )
-            )
-        return torch.stack(cost_columns, dim=1)
-    beta = centers_t.unsqueeze(0)
+    beta = centers_t.T.unsqueeze(0).expand(int(data.num_mutations), -1, -1)
     loss = mutation_region_loss_grid_torch(
+        torch_data,
         beta,
-        alt=torch_data.alt.unsqueeze(1),
-        total=torch_data.total.unsqueeze(1),
-        b_minus=torch_data.b_minus.unsqueeze(1),
-        b_plus=torch_data.b_plus.unsqueeze(1),
-        b_fixed=torch_data.b_fixed.unsqueeze(1),
-        ambiguous=torch_data.ambiguous.unsqueeze(1),
-        major_prior=float(major_prior),
         eps=float(eps),
     )
-    if torch_data.count_observed is not None:
-        loss = torch.where(
-            torch_data.count_observed.unsqueeze(1),
-            loss,
-            torch.zeros_like(loss),
-        )
-    cost = torch.sum(loss, dim=2)
+    cost = torch.sum(loss, dim=1)
     infeasible = torch.any(
-        beta > torch_data.phi_upper.unsqueeze(1) + max(float(eps), 1e-8), dim=2
+        beta > torch_data.phi_upper.unsqueeze(-1) + max(float(eps), 1e-8), dim=1
     )
     safe_penalty = min(
         float(infeasible_penalty), float(torch.finfo(cost.dtype).max) / 16.0
@@ -908,13 +738,18 @@ def refine_partition_likelihood_with_trace(
     classification_code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
     allow_component_death: bool = False,
     _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
+    _model: ObservedModel | None = None,
 ) -> PartitionRefinementResult:
     labels = _validated_refinement_labels(data, labels)
-    initial_labels = labels.copy()
-    initial_k = int(np.unique(initial_labels).size)
+    initial_k = int(np.unique(labels).size)
     _validate_classification_weight_alpha(classification_weight_alpha)
     classification_code_weight = _validated_classification_code_weight(
         classification_code_weight
+    )
+    model = (
+        compile_observed_model(data, major_prior=major_prior, eps=eps)
+        if _model is None
+        else _model
     )
 
     def refit_labels(current_labels: np.ndarray) -> PartitionRefitResult:
@@ -927,15 +762,14 @@ def refine_partition_likelihood_with_trace(
             eps=float(eps),
             tol=float(tol),
             max_iter=max(int(refit_max_iter), 32),
+            _model=model,
         )
 
     refit = refit_labels(labels)
-    initial_refit = refit
     refit_key = _label_key(labels)
     best_labels: np.ndarray | None = None
     best_refit: PartitionRefitResult | None = None
     best_score = float("inf")
-    score_path: list[float] = []
     if classification_weight_alpha is not None:
         best_score = _classification_refit_score(
             data,
@@ -946,13 +780,7 @@ def refine_partition_likelihood_with_trace(
         )
         best_labels = labels.copy()
         best_refit = refit
-        score_path.append(float(best_score))
-    else:
-        score_path.append(float(refit.fit_loss))
-    iterations = 0
-    accepted_updates = 0
-    for iteration in range(max(int(max_iter), 0)):
-        iterations = int(iteration + 1)
+    for _ in range(max(int(max_iter), 0)):
         labels_key = _label_key(labels)
         if refit_key != labels_key:
             refit = refit_labels(labels)
@@ -962,6 +790,7 @@ def refine_partition_likelihood_with_trace(
             refit.cluster_centers,
             major_prior=float(major_prior),
             eps=float(eps),
+            _model=model,
         )
         assignment_cost = (
             count_cost
@@ -998,13 +827,11 @@ def refine_partition_likelihood_with_trace(
             ):
                 break
             best_score = float(proposed_score)
-            score_path.append(float(best_score))
             best_labels = labels_next.copy()
             best_refit = proposed_refit
             refit = proposed_refit
             refit_key = _label_key(labels_next)
         labels = labels_next
-        accepted_updates += 1
     labels_key = _label_key(labels)
     if refit_key != labels_key:
         refit = refit_labels(labels)
@@ -1018,33 +845,14 @@ def refine_partition_likelihood_with_trace(
     else:
         final_labels = _canonical_labels(labels)
         final_refit = refit
-        if not score_path or score_path[-1] != float(final_refit.fit_loss):
-            score_path.append(float(final_refit.fit_loss))
     final_k = int(np.unique(final_labels).size)
     return PartitionRefinementResult(
         labels=final_labels,
         refit=final_refit,
-        initial_labels=initial_labels,
-        iterations=int(iterations),
-        accepted_updates=int(accepted_updates),
         initial_k=int(initial_k),
         final_k=int(final_k),
         component_death_count=max(int(initial_k - final_k), 0),
-        score_before=float(score_path[0] if score_path else initial_refit.fit_loss),
-        score_after=float(score_path[-1] if score_path else final_refit.fit_loss),
-        score_path=tuple(float(value) for value in score_path),
     )
-
-
-def refine_partition_likelihood(
-    data: TumorData,
-    labels: np.ndarray,
-    **kwargs,
-) -> tuple[np.ndarray, PartitionRefitResult]:
-    """Backward-compatible two-value wrapper around traced CEM refinement."""
-
-    trace = refine_partition_likelihood_with_trace(data, labels, **kwargs)
-    return trace.labels, trace.refit
 
 
 @torch.no_grad()
@@ -1064,21 +872,14 @@ def partition_constrained_observed_refit_torch(
     tol = float(tol)
     if not np.isfinite(tol) or tol <= 0.0:
         raise ValueError("Partition refit tolerance must be a positive finite value.")
-    if getattr(data, "path_likelihood", None) is not None:
-        return partition_constrained_observed_refit(
-            data,
-            labels,
-            major_prior=float(major_prior),
-            eps=float(eps),
-            tol=float(tol),
-            max_iter=max(int(max_iter), 32),
-        )
     runtime, torch_data = _resolve_partition_runtime(
         data=data,
         exact_pilot=hint_phi,
         torch_data=torch_data,
         device=device,
         dtype=dtype,
+        major_prior=major_prior,
+        eps=eps,
     )
     labels_np = _validated_refinement_labels(data, labels)
     n_clusters = int(labels_np.max()) + 1 if labels_np.size else 0
@@ -1122,28 +923,13 @@ def partition_constrained_observed_refit_torch(
     initial_width = torch.clamp(upper - lower, min=0.0)
 
     def objective(beta_ks: torch.Tensor) -> torch.Tensor:
-        beta = beta_ks.unsqueeze(0)
+        beta = beta_ks.T.unsqueeze(0).expand(int(data.num_mutations), -1, -1)
         loss = mutation_region_loss_grid_torch(
+            torch_data,
             beta,
-            alt=torch_data.alt.unsqueeze(1),
-            total=torch_data.total.unsqueeze(1),
-            b_minus=torch_data.b_minus.unsqueeze(1),
-            b_plus=torch_data.b_plus.unsqueeze(1),
-            b_fixed=torch_data.b_fixed.unsqueeze(1),
-            ambiguous=torch_data.ambiguous.unsqueeze(1),
-            major_prior=float(major_prior),
             eps=float(eps),
         )
-        # Mask unobserved mutation_regions out of the likelihood, matching the fit objective
-        # (torch_backend.mutation_region_terms_torch) and the numpy refit; torch.where avoids
-        # inf*0 = nan when an infeasible beta makes the loss non-finite.
-        if torch_data.count_observed is not None:
-            loss = torch.where(
-                torch_data.count_observed.unsqueeze(1),
-                loss,
-                torch.zeros_like(loss),
-            )
-        return torch.sum(loss * membership.unsqueeze(2), dim=0)
+        return torch.sum(loss.permute(0, 2, 1) * membership.unsqueeze(2), dim=0)
 
     left = lower.clone()
     right = upper.clone()
@@ -1248,31 +1034,17 @@ def refine_partition_likelihood_torch_with_trace(
     allow_component_death: bool = False,
     _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
 ) -> PartitionRefinementResult:
-    if getattr(data, "path_likelihood", None) is not None:
-        return refine_partition_likelihood_with_trace(
-            data,
-            labels,
-            major_prior=float(major_prior),
-            eps=float(eps),
-            tol=float(tol),
-            max_iter=int(max_iter),
-            refit_max_iter=int(refit_max_iter),
-            hint_phi=None if hint_phi is None else _as_numpy(hint_phi),
-            classification_weight_alpha=classification_weight_alpha,
-            classification_code_weight=classification_code_weight,
-            allow_component_death=bool(allow_component_death),
-            _refit_labels=_refit_labels,
-        )
     runtime, torch_data = _resolve_partition_runtime(
         data=data,
         exact_pilot=hint_phi,
         torch_data=torch_data,
         device=device,
         dtype=dtype,
+        major_prior=major_prior,
+        eps=eps,
     )
     labels = _validated_refinement_labels(data, labels)
-    initial_labels = labels.copy()
-    initial_k = int(np.unique(initial_labels).size)
+    initial_k = int(np.unique(labels).size)
     _validate_classification_weight_alpha(classification_weight_alpha)
     classification_code_weight = _validated_classification_code_weight(
         classification_code_weight
@@ -1295,12 +1067,10 @@ def refine_partition_likelihood_torch_with_trace(
         )
 
     refit = refit_labels(labels)
-    initial_refit = refit
     refit_key = _label_key(labels)
     best_labels: np.ndarray | None = None
     best_refit: PartitionRefitResult | None = None
     best_score = float("inf")
-    score_path: list[float] = []
     if classification_weight_alpha is not None:
         best_score = _classification_refit_score(
             data,
@@ -1311,13 +1081,7 @@ def refine_partition_likelihood_torch_with_trace(
         )
         best_labels = labels.copy()
         best_refit = refit
-        score_path.append(float(best_score))
-    else:
-        score_path.append(float(refit.fit_loss))
-    iterations = 0
-    accepted_updates = 0
-    for iteration in range(max(int(max_iter), 0)):
-        iterations = int(iteration + 1)
+    for _ in range(max(int(max_iter), 0)):
         labels_key = _label_key(labels)
         if refit_key != labels_key:
             refit = refit_labels(labels)
@@ -1375,13 +1139,11 @@ def refine_partition_likelihood_torch_with_trace(
             ):
                 break
             best_score = float(proposed_score)
-            score_path.append(float(best_score))
             best_labels = labels_next.copy()
             best_refit = proposed_refit
             refit = proposed_refit
             refit_key = _label_key(labels_next)
         labels = labels_next
-        accepted_updates += 1
     labels_key = _label_key(labels)
     if refit_key != labels_key:
         refit = refit_labels(labels)
@@ -1395,33 +1157,14 @@ def refine_partition_likelihood_torch_with_trace(
     else:
         final_labels = _canonical_labels(labels)
         final_refit = refit
-        if not score_path or score_path[-1] != float(final_refit.fit_loss):
-            score_path.append(float(final_refit.fit_loss))
     final_k = int(np.unique(final_labels).size)
     return PartitionRefinementResult(
         labels=final_labels,
         refit=final_refit,
-        initial_labels=initial_labels,
-        iterations=int(iterations),
-        accepted_updates=int(accepted_updates),
         initial_k=int(initial_k),
         final_k=int(final_k),
         component_death_count=max(int(initial_k - final_k), 0),
-        score_before=float(score_path[0] if score_path else initial_refit.fit_loss),
-        score_after=float(score_path[-1] if score_path else final_refit.fit_loss),
-        score_path=tuple(float(value) for value in score_path),
     )
-
-
-def refine_partition_likelihood_torch(
-    data: TumorData,
-    labels: np.ndarray,
-    **kwargs,
-) -> tuple[np.ndarray, PartitionRefitResult]:
-    """Backward-compatible two-value wrapper around traced Torch refinement."""
-
-    trace = refine_partition_likelihood_torch_with_trace(data, labels, **kwargs)
-    return trace.labels, trace.refit
 
 
 def _label_key(labels: np.ndarray) -> bytes:
@@ -1466,6 +1209,8 @@ def generate_likelihood_partition_starts(
             torch_data=torch_data,
             device=device,
             dtype=dtype,
+            major_prior=major_prior,
+            eps=eps,
         )
     phi0 = (
         _as_torch(exact_pilot, runtime=runtime).detach().cpu().numpy()
@@ -1486,6 +1231,9 @@ def generate_likelihood_partition_starts(
     }
     candidates: list[PartitionCandidate] = []
     seen: set[bytes] = set()
+    source_model = compile_observed_model(
+        data, major_prior=float(major_prior), eps=float(eps)
+    )
     # This cache never escapes one generation call, so labels fully identify a
     # refit under the shared data, tolerance, hint, runtime, and backend.
     refit_cache: dict[bytes, PartitionRefitResult] = {}
@@ -1520,6 +1268,7 @@ def generate_likelihood_partition_starts(
                 eps=float(eps),
                 tol=float(tol),
                 max_iter=max(int(refit_max_iter), 32),
+                _model=source_model,
             )
         refit_cache[labels_key] = result
         return result
@@ -1572,6 +1321,7 @@ def generate_likelihood_partition_starts(
                         classification_code_weight=classification_code_weight,
                         allow_component_death=bool(allow_component_death),
                         _refit_labels=cached_refit,
+                        _model=source_model,
                     )
                 labels_used, refit = trace.labels, trace.refit
             else:
@@ -1604,59 +1354,14 @@ def generate_likelihood_partition_starts(
                     labels=_canonical_labels(labels_used),
                     K=candidate_k,
                     source=source,
-                    theta=refit.cluster_centers,
                     phi_start=refit.phi,
                     fit_loss=float(refit.fit_loss),
                     bic=float(bic),
-                    active_df=int(refit.active_degrees_of_freedom),
                     finite_candidate_found=bool(refit.finite_candidate_found),
-                    diagnostics={
-                        "requested_K": float(requested_k),
-                        "pre_refinement_signature": _label_key(labels0).hex(),
-                        "cem_iterations": float(0 if trace is None else trace.iterations),
-                        "cem_accepted_updates": float(
-                            0 if trace is None else trace.accepted_updates
-                        ),
-                        "initial_K": float(
-                            int(np.unique(labels0).size)
-                            if trace is None
-                            else trace.initial_k
-                        ),
-                        "final_K": float(candidate_k),
-                        "component_death_count": float(
-                            0 if trace is None else trace.component_death_count
-                        ),
-                        "refinement_score_before": float(
-                            refit.fit_loss if trace is None else trace.score_before
-                        ),
-                        "refinement_score_after": float(
-                            refit.fit_loss if trace is None else trace.score_after
-                        ),
-                        "deterministic_generation": 1.0,
-                        "partition_generation_classic_bic": float(classic_bic),
-                        "refit_boundary_count": float(refit.boundary_count),
-                        "refit_coordinate_count": float(refit.refit_coordinate_count),
-                        "refit_finite_coordinate_count": float(
-                            refit.refit_finite_coordinate_count
-                        ),
-                        "refit_total_grid_points": float(refit.refit_total_grid_points),
-                        "refit_max_grid_spacing": float(refit.refit_max_grid_spacing),
-                        "refit_total_candidate_basins": float(
-                            refit.refit_total_candidate_basins
-                        ),
-                        "refit_total_refined_candidates": float(
-                            refit.refit_total_refined_candidates
-                        ),
-                        "refit_min_best_second_loss_gap": float(
-                            refit.refit_min_best_second_loss_gap
-                        ),
-                        "partition_generation_cuda": float(
-                            use_torch_runtime
-                            and runtime is not None
-                            and runtime.device.type == "cuda"
-                        ),
-                    },
-                    refit=refit,
+                    requested_k=int(requested_k),
+                    component_death_count=(
+                        0 if trace is None else int(trace.component_death_count)
+                    ),
                 )
             )
 
