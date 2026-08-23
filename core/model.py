@@ -38,6 +38,11 @@ def fit_fixed_objective(
         outer_max_iter=max(int(solver.outer_max_iter), 1),
         inner_max_iter=max(int(solver.inner_max_iter), 16),
         tol=float(solver.tolerance),
+        certification_tol=(
+            float(solver.tolerance)
+            if solver.certification_tolerance is None
+            else float(solver.certification_tolerance)
+        ),
         phi_start=phi_start,
         graph=graph.graph,
         adaptive_weight_gamma=float(graph.adaptive_weight_gamma),

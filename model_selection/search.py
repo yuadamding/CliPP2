@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import numpy as np
+import torch
 
 from ..config import FitConfig
 from ..core.model import fit_fixed_objective
@@ -12,6 +13,7 @@ from ..core.fusion.partition_starts import (
 from ..core.fusion.solver import (
     objective_shape_for_data,
     prepare_torch_problem_with_resource_policy,
+    promote_solver_context_dtype,
     torch_data_from_context,
 )
 from ..core.fusion.types import (
@@ -614,6 +616,9 @@ def _partition_guided_admm_selection(
     attempts_by_lambda: dict[float, list[RawFit]] = {}
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] = {}
     next_step = 0
+    # Lazily promoted float64 twin of the working context, built at most once
+    # per tumor and only when a certification-recovery attempt needs it.
+    float64_recovery_context: list = [None]
     while True:
         proposal = controller.propose()
         if proposal is None:
@@ -659,6 +664,27 @@ def _partition_guided_admm_selection(
             tuple[_RawStartAttempt, ...],
         ]:
             context = base_solver_context
+            # Certification-recovery attempts run at float64: iteration budget
+            # alone measurably plateaus above the KKT gate on widened-mixture
+            # tumors, while the float64 re-solve of the same frozen objective
+            # (identical objective_spec_hash) removes the float32 stationarity
+            # floor. Promotion is best-effort; without memory the attempt
+            # keeps the working precision and its existing failure mode.
+            recovery_promoted = False
+            if (
+                proposal.phase in {"solver_recovery", "bootstrap_certification_anchor"}
+                and context.runtime.dtype != torch.float64
+            ):
+                if float64_recovery_context[0] is None:
+                    try:
+                        float64_recovery_context[0] = promote_solver_context_dtype(
+                            context, dtype=torch.float64
+                        )
+                    except (MemoryError, torch.OutOfMemoryError, RuntimeError):
+                        float64_recovery_context[0] = context
+                if float64_recovery_context[0] is not context:
+                    context = float64_recovery_context[0]
+                    recovery_promoted = True
             initialization = guided_initialization
             warm_fit = None
             if proposal.warm_start_lambda is not None:
@@ -875,24 +901,41 @@ def _partition_guided_admm_selection(
                 original_state,
                 explicit_phi_start,
             ) in start_specs:
-                solver_state_start, changed_count = _escape_path_breakpoint_retry_state(
-                    original_state,
-                    start_source=lambda_start_source,
-                    start_lambda=lambda_start_value,
-                    target_lambda=float(proposal.lambda_value),
-                    context=context,
-                    tol=float(candidate_fit_options.solver.tolerance),
-                )
-                phi_start = _clone_start(
-                    solver_state_start.phi
-                    if solver_state_start is not None
-                    and solver_state_start.phi is not None
-                    else (
-                        explicit_phi_start
-                        if explicit_phi_start is not None
-                        else raw_guide_phi
+                if recovery_promoted:
+                    # A promoted attempt keeps only the primal start: working-
+                    # precision dual/certificate state is not carried across
+                    # the dtype boundary, and the float64 solve refines fresh
+                    # duals before certification.
+                    solver_state_start, changed_count = None, 0
+                    phi_start = _clone_start(
+                        original_state.phi
+                        if original_state is not None
+                        and original_state.phi is not None
+                        else (
+                            explicit_phi_start
+                            if explicit_phi_start is not None
+                            else raw_guide_phi
+                        )
                     )
-                )
+                else:
+                    solver_state_start, changed_count = _escape_path_breakpoint_retry_state(
+                        original_state,
+                        start_source=lambda_start_source,
+                        start_lambda=lambda_start_value,
+                        target_lambda=float(proposal.lambda_value),
+                        context=context,
+                        tol=float(candidate_fit_options.solver.tolerance),
+                    )
+                    phi_start = _clone_start(
+                        solver_state_start.phi
+                        if solver_state_start is not None
+                        and solver_state_start.phi is not None
+                        else (
+                            explicit_phi_start
+                            if explicit_phi_start is not None
+                            else raw_guide_phi
+                        )
+                    )
                 seed_fit = fit_fixed_objective(
                     data=data,
                     config=replace(
@@ -1011,7 +1054,15 @@ def _partition_guided_admm_selection(
         )
         incumbent = fit_by_lambda.get(lambda_key)
         if _prefer_fit_candidate(fit, incumbent):
-            fit_by_lambda[lambda_key] = fit
+            fit_by_lambda[lambda_key] = (
+                replace(fit, state=None)
+                if (
+                    fit.state is not None
+                    and str(fit.provenance.dtype) == "float64"
+                    and base_solver_context.runtime.dtype != torch.float64
+                )
+                else fit
+            )
             partition_k_by_lambda[lambda_key] = int(artifact.partition.n_clusters)
 
         raw_exact_certified = bool(

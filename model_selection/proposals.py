@@ -277,17 +277,30 @@ def solver_recovery_fit_options(
         # profile-sized budgets.  Solves still stop early after certification.
         solver=replace(
             solver,
-            outer_max_iter=max(int(solver.outer_max_iter) * effort_factor, 36),
+            outer_max_iter=max(int(solver.outer_max_iter) * 24, 144),
             inner_max_iter=max(int(solver.inner_max_iter) * effort_factor, 150),
             certificate=replace(
                 certificate,
                 max_iter=max(int(certificate.max_iter) * 2, 256),
                 refinement_rounds=max(int(certificate.refinement_rounds) + 1, 2),
             ),
-            # More recovery iterations must not silently tighten the declared
-            # full-KKT admission threshold.  The controller and every attempt
-            # at this lambda therefore use one immutable profile tolerance.
-            tolerance=float(solver.tolerance),
+            # The controller's full-KKT admission threshold stays the
+            # immutable profile value (it is derived from the effective
+            # options before any recovery).  The recovery SOLVE, however,
+            # stops much deeper: under the widened multiplicity mixture the
+            # inner convergence measure plateaus far above true stationarity
+            # at the profile tolerance (measured residual 0.07-0.3 against a
+            # 0.004 gate), while the same solve driven to 5e-5 certifies.
+            # Per-attempt certification at the tighter tolerance is a
+            # strictly harder admission, never a weaker one.
+            tolerance=min(float(solver.tolerance), 5e-5),
+            # Admission stays at the immutable contract gate even though the
+            # recovery solve iterates far deeper.
+            certification_tolerance=(
+                float(solver.tolerance)
+                if solver.certification_tolerance is None
+                else float(solver.certification_tolerance)
+            ),
             objective_shape=objective_shape_for_data(
                 data, "unimodal_full_step_backtracking"
             ),

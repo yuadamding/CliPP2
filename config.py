@@ -84,9 +84,16 @@ class SolverConfig:
     objective_shape: str
     certificate: CertificateConfig
     resources: ResourceConfig = field(default_factory=ResourceConfig)
+    # When set, KKT admission and certificate construction use this tolerance
+    # while ``tolerance`` only controls how deep the solver iterates. A deep
+    # recovery solve can then be admitted against the immutable profile gate
+    # instead of an accidentally tighter one. None means both coincide.
+    certification_tolerance: float | None = None
 
     def __post_init__(self) -> None:
         _positive("tol", self.tolerance)
+        if self.certification_tolerance is not None:
+            _positive("certification_tolerance", self.certification_tolerance)
 
 
 @dataclass(frozen=True, slots=True)

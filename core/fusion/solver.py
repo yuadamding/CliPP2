@@ -926,7 +926,7 @@ def escape_path_breakpoint_solver_state(
         state is None
         or model.model_id == "legacy_major_low_as_paths_v2"
         or not isinstance(certificate, DenseEdgeCertificate)
-        or certificate.scope != "full_original_graph"
+        or certificate.certificate_scope != "full_original_graph"
         or certificate.gradient_scope == "mm_surrogate"
         or certificate.graph_hash != str(context.graph_hash)
         or not torch.is_tensor(certificate.dual)
@@ -1506,6 +1506,7 @@ def _fit_from_start(
     outer_max_iter: int,
     inner_max_iter: int,
     tol: float,
+    certification_tol: float,
     phi_start: np.ndarray | torch.Tensor,
     solver_state: SolverState | None,
     lower: torch.Tensor,
@@ -1521,6 +1522,7 @@ def _fit_from_start(
     verbose: bool,
 ) -> RawFit:
     tol = _validate_solver_tolerance(tol)
+    cert_tol = _validate_solver_tolerance(certification_tol)
     if base_objective_key.fingerprint != str(objective_spec_hash):
         raise ValueError("Base objective key does not match objective_spec_hash.")
     if (
@@ -1537,9 +1539,9 @@ def _fit_from_start(
         refinement_rounds=max(int(certificate_refinement_rounds), 0),
         max_expansions=max(int(workset_max_expansions), 1),
         add_batch=max(int(workset_add_batch), 1),
-        mapping_tolerance=max(0.1 * float(tol), float(torch.finfo(runtime.dtype).eps)),
+        mapping_tolerance=max(0.1 * float(cert_tol), float(torch.finfo(runtime.dtype).eps)),
         column_tolerance=max(
-            float(certificate_column_tol_scale) * float(tol),
+            float(certificate_column_tol_scale) * float(cert_tol),
             float(torch.finfo(runtime.dtype).eps),
         ),
         memory=WorksetMemoryOptions(
@@ -1553,7 +1555,7 @@ def _fit_from_start(
         lower=lower,
         upper=upper,
         lambda_value=float(lambda_value),
-        atol=float(tol),
+        atol=float(cert_tol),
     )
     use_unimodal_objective = objective_shape.startswith("unimodal")
     require_full_step_backtracking = (
@@ -1695,7 +1697,7 @@ def _fit_from_start(
                 lower=lower,
                 upper=upper,
                 eps=eps,
-                tol=tol,
+                tol=cert_tol,
             )
             forcing_diag = certify(
                 problem=certificate_problem,
@@ -2160,7 +2162,7 @@ def _fit_from_start(
                 lower=lower,
                 upper=upper,
                 eps=eps,
-                tol=tol,
+                tol=cert_tol,
             )
             periodic_limit = min(
                 int(certificate_options.max_iter),
@@ -2183,7 +2185,7 @@ def _fit_from_start(
                 work_counters = work_counters + observed_refinement.work_counters
             certificate = observed_refinement.certificate
             outer_diag = observed_refinement.diagnostics.as_dict()
-            outer_converged = bool(outer_diag["kkt_residual"] <= 5.0 * tol)
+            outer_converged = bool(outer_diag["kkt_residual"] <= 5.0 * cert_tol)
         if accepted:
             current_inner_converged = bool(inner_converged)
         if do_outer_kkt_audit:
@@ -2214,7 +2216,7 @@ def _fit_from_start(
         lower=lower,
         upper=upper,
         eps=eps,
-        tol=tol,
+        tol=cert_tol,
     )
 
     final_refinements = []
@@ -2257,14 +2259,14 @@ def _fit_from_start(
             lower=lower,
             upper=upper,
             eps=eps,
-            tol=tol,
+            tol=cert_tol,
             fusion_adjoint=fusion_adjustment,
         )
         if torch.allclose(
             next_gradient.value,
             certificate_gradient.value,
             rtol=0.0,
-            atol=max(float(tol) * 0.1, 1e-12),
+            atol=max(float(cert_tol) * 0.1, 1e-12),
         ):
             break
         certificate_gradient = next_gradient
@@ -2314,7 +2316,7 @@ def _fit_from_start(
             lambda_value=lambda_value,
             major_prior=major_prior,
             eps=eps,
-            tol=tol,
+            tol=cert_tol,
         )
         certificate_audit_dtype = "float64"
         gradient_scope = audit_gradient_scope
@@ -2338,7 +2340,7 @@ def _fit_from_start(
     )
     final_dual = getattr(certificate, "dual", None)
     outer_kkt_certificate_status = str(final_certificate_refinement.status)
-    converged_outer = bool(authoritative_kkt_residual <= 5.0 * tol)
+    converged_outer = bool(authoritative_kkt_residual <= 5.0 * cert_tol)
     valid_dual_certificate = outer_kkt_certificate_status in {
         "zero_penalty_no_dual_needed",
         "analytic_nonfused_dual",
@@ -2426,7 +2428,7 @@ def _fit_from_start(
             admissible=bool(selection_eligible),
             global_optimum=bool(global_optimality_certified),
             status=str(outer_kkt_certificate_status),
-            tolerance=5.0 * float(tol),
+            tolerance=5.0 * float(cert_tol),
             scope="full_original_graph",
             gradient_scope=str(gradient_scope),
             directional_admissible=bool(directional_kink_admissible),
@@ -2468,6 +2470,7 @@ def fit_observed_data_pairwise_fusion(
     outer_max_iter: int,
     inner_max_iter: int,
     tol: float,
+    certification_tol: float | None = None,
     phi_start: np.ndarray | torch.Tensor | None = None,
     graph: PairwiseFusionGraph | None = None,
     adaptive_weight_gamma: float = 1.0,
@@ -2497,6 +2500,9 @@ def fit_observed_data_pairwise_fusion(
     verbose: bool = False,
 ) -> RawFit:
     tol = _validate_solver_tolerance(tol)
+    certification_tol = _validate_solver_tolerance(
+        tol if certification_tol is None else certification_tol
+    )
     lambda_value = validate_lambda_value(lambda_value)
     objective_shape = objective_shape_for_data(data, objective_shape)
     major_prior = _effective_major_prior(data, major_prior)
@@ -2602,6 +2608,7 @@ def fit_observed_data_pairwise_fusion(
             outer_max_iter=1 if polish else outer_max_iter,
             inner_max_iter=inner_max_iter,
             tol=tol,
+            certification_tol=certification_tol,
             phi_start=start,
             solver_state=state,
             lower=context.lower,
