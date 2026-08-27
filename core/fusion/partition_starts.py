@@ -908,9 +908,8 @@ def partition_constrained_observed_refit_torch(
         )
 
     labels_t = torch.as_tensor(labels_np, dtype=torch.long, device=runtime.device)
-    membership = torch.nn.functional.one_hot(labels_t, num_classes=n_clusters).to(
-        dtype=runtime.dtype
-    )
+    label_order = torch.argsort(labels_t, stable=True)
+    cluster_counts = torch.bincount(labels_t, minlength=n_clusters)
     lower = torch.full(
         (n_clusters, n_regions), float(eps), dtype=runtime.dtype, device=runtime.device
     )
@@ -923,33 +922,60 @@ def partition_constrained_observed_refit_torch(
     initial_width = torch.clamp(upper - lower, min=0.0)
 
     def objective(beta_ks: torch.Tensor) -> torch.Tensor:
-        beta = beta_ks.T.unsqueeze(0).expand(int(data.num_mutations), -1, -1)
-        loss = mutation_region_loss_grid_torch(
+        assigned_beta = beta_ks.index_select(0, labels_t)
+        assigned_loss = mutation_region_loss_grid_torch(
             torch_data,
-            beta,
+            assigned_beta,
             eps=float(eps),
         )
-        return torch.sum(loss.permute(0, 2, 1) * membership.unsqueeze(2), dim=0)
+        return torch.segment_reduce(
+            assigned_loss.index_select(0, label_order),
+            reduce="sum",
+            lengths=cluster_counts,
+        )
 
     left = lower.clone()
     right = upper.clone()
     ratio = 0.5 * (np.sqrt(5.0) - 1.0)
     n_iter = max(int(max_iter), 32)
-    for _ in range(n_iter):
-        if bool(
-            torch.all(
-                torch.abs(right - left)
-                <= tol * (1.0 + torch.abs(left) + torch.abs(right))
-            ).item()
-        ):
-            break
+    objective_evaluations = 0
+    needs_refinement = not bool(
+        torch.all(
+            torch.abs(right - left)
+            <= tol * (1.0 + torch.abs(left) + torch.abs(right))
+        ).item()
+    )
+    if needs_refinement:
         x1 = right - float(ratio) * (right - left)
         x2 = left + float(ratio) * (right - left)
         f1 = objective(x1)
         f2 = objective(x2)
-        keep_left_interval = f1 <= f2
-        right = torch.where(keep_left_interval, x2, right)
-        left = torch.where(keep_left_interval, left, x1)
+        objective_evaluations += 2
+        for _ in range(n_iter):
+            if bool(
+                torch.all(
+                    torch.abs(right - left)
+                    <= tol * (1.0 + torch.abs(left) + torch.abs(right))
+                ).item()
+            ):
+                break
+            keep_left_interval = f1 <= f2
+            next_left = torch.where(keep_left_interval, left, x1)
+            next_right = torch.where(keep_left_interval, x2, right)
+            new_point = torch.where(
+                keep_left_interval,
+                next_right - float(ratio) * (next_right - next_left),
+                next_left + float(ratio) * (next_right - next_left),
+            )
+            new_loss = objective(new_point)
+            objective_evaluations += 1
+            next_x1 = torch.where(keep_left_interval, new_point, x2)
+            next_f1 = torch.where(keep_left_interval, new_loss, f2)
+            next_x2 = torch.where(keep_left_interval, x1, new_point)
+            next_f2 = torch.where(keep_left_interval, f1, new_loss)
+            left, right = next_left, next_right
+            x1, f1 = next_x1, next_f1
+            x2, f2 = next_x2, next_f2
 
     midpoint = 0.5 * (left + right)
     candidates = [midpoint, left, right, lower, upper]
@@ -966,6 +992,7 @@ def partition_constrained_observed_refit_torch(
     candidate_losses = torch.stack(
         [objective(candidate) for candidate in candidates], dim=0
     )
+    objective_evaluations += len(candidates)
     best_idx = torch.argmin(candidate_losses, dim=0, keepdim=True)
     centers = torch.gather(candidate_values, 0, best_idx).squeeze(0)
     best_loss = torch.gather(candidate_losses, 0, best_idx).squeeze(0)
@@ -1002,7 +1029,7 @@ def partition_constrained_observed_refit_torch(
         refit_coordinate_count=refit_coordinate_count,
         refit_finite_coordinate_count=finite_coordinate_count,
         refit_total_grid_points=int(
-            refit_coordinate_count * (2 * n_iter + len(candidates))
+            refit_coordinate_count * objective_evaluations
         ),
         refit_max_grid_spacing=float(torch.max(initial_width).detach().cpu().item())
         if initial_width.numel()

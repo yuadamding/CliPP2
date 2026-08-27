@@ -230,6 +230,7 @@ class RawAttemptTrace:
     outer_max_iter: int
     inner_max_iter: int
     certificate_max_iter: int
+    promotion_status: str = "not_recorded"
 
 
 @dataclass(frozen=True, slots=True)

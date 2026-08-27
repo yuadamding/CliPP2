@@ -89,6 +89,9 @@ class SolverConfig:
     # recovery solve can then be admitted against the immutable profile gate
     # instead of an accidentally tighter one. None means both coincide.
     certification_tolerance: float | None = None
+    # Internal recovery mode: once the frozen context is float64, iterative
+    # progress uses the same componentwise residual as terminal admission.
+    use_backward_error_progress: bool = False
 
     def __post_init__(self) -> None:
         _positive("tol", self.tolerance)

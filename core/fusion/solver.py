@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -101,6 +101,68 @@ from .types import (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _Float64AuditContext:
+    runtime: TorchRuntime
+    torch_data: TorchTumorData
+    graph: TensorFusionGraph
+    lower: torch.Tensor
+    upper: torch.Tensor
+
+
+def _float64_audit_context(
+    *,
+    torch_data: TorchTumorData,
+    graph_spec: PairwiseFusionGraph,
+    graph_hash: str,
+    cache: dict[tuple[str, str, str], object] | None,
+) -> _Float64AuditContext:
+    """Return the immutable float64 audit tensors for one tumor/graph/device."""
+
+    source_model = torch_data.source_model
+    if source_model is None:
+        raise ValueError("Float64 audit requires an immutable observed-model source.")
+    device = torch_data.alt.device
+    key = (str(source_model.fingerprint), str(graph_hash), str(device))
+    if cache is not None:
+        cached = cache.get(key)
+        if cached is not None:
+            if not isinstance(cached, _Float64AuditContext):
+                raise TypeError("SolverContext float64 audit cache is corrupted.")
+            return cached
+    runtime = TorchRuntime(
+        device=device,
+        device_name=str(device),
+        dtype=torch.float64,
+    )
+    context = _Float64AuditContext(
+        runtime=runtime,
+        torch_data=copy_torch_tumor_data(
+            torch_data,
+            dtype=torch.float64,
+            device=device,
+        ),
+        graph=tensorize_graph(
+            graph_spec,
+            runtime,
+            num_nodes=int(source_model.shape[0]),
+        ),
+        lower=torch.as_tensor(
+            np.array(source_model.lower, copy=True),
+            dtype=torch.float64,
+            device=device,
+        ),
+        upper=torch.as_tensor(
+            np.array(source_model.upper, copy=True),
+            dtype=torch.float64,
+            device=device,
+        ),
+    )
+    if cache is not None:
+        cache[key] = context
+    return context
+
+
 def _terminal_backward_error_audit_float64(
     *,
     torch_data: TorchTumorData,
@@ -112,39 +174,21 @@ def _terminal_backward_error_audit_float64(
     major_prior: float,
     eps: float,
     tol: float,
+    audit_context_cache: dict[tuple[str, str, str], object] | None = None,
 ) -> tuple[KKTDiagnostics, str, bool, float]:
     """Audit the unchanged terminal witness with float64 backward error."""
 
-    device = phi.device
-    source_model = torch_data.source_model
-    if source_model is None:
-        raise ValueError("Float64 audit requires an immutable observed-model source.")
-    audit_runtime = TorchRuntime(
-        device=device,
-        device_name=str(device),
-        dtype=torch.float64,
+    audit = _float64_audit_context(
+        torch_data=torch_data,
+        graph_spec=graph_spec,
+        graph_hash=graph_hash,
+        cache=audit_context_cache,
     )
-    data64 = copy_torch_tumor_data(
-        torch_data,
-        dtype=torch.float64,
-        device=device,
-    )
-    graph64 = tensorize_graph(
-        graph_spec,
-        audit_runtime,
-        num_nodes=int(source_model.shape[0]),
-    )
-    phi64 = phi.to(dtype=torch.float64, device=device)
-    lower64 = torch.as_tensor(
-        np.array(source_model.lower, copy=True),
-        dtype=torch.float64,
-        device=device,
-    )
-    upper64 = torch.as_tensor(
-        np.array(source_model.upper, copy=True),
-        dtype=torch.float64,
-        device=device,
-    )
+    data64 = audit.torch_data
+    graph64 = audit.graph
+    lower64 = audit.lower
+    upper64 = audit.upper
+    phi64 = phi.to(dtype=torch.float64, device=audit.runtime.device)
     terms64 = mutation_region_terms_torch(
         data64,
         phi64,
@@ -170,7 +214,7 @@ def _terminal_backward_error_audit_float64(
             edge_v=graph64.edge_v,
             num_nodes=int(phi64.shape[0]),
             dtype=torch.float64,
-            device=device,
+            device=audit.runtime.device,
         )
         gradient = build_certificate_gradient(
             data64,
@@ -1353,6 +1397,45 @@ def _initial_outer_diag() -> dict[str, float | int]:
     }
 
 
+def _backward_error_kkt_within_gate(
+    diagnostics: dict[str, float | int],
+    *,
+    certification_tol: float,
+) -> bool:
+    """Apply the immutable full-KKT gate to the componentwise residual.
+
+    The legacy globally normalized L2 residual remains available for progress
+    reporting, but its dimension-dependent scaling cannot terminate an outer
+    solve whose authoritative componentwise backward error is still too high.
+    Missing and nonfinite schema-v2 diagnostics fail closed.
+    """
+
+    residual = float(
+        diagnostics.get("backward_error_kkt_residual", float("inf"))
+    )
+    return bool(
+        np.isfinite(residual)
+        and residual >= 0.0
+        and residual <= 5.0 * _validate_solver_tolerance(certification_tol)
+    )
+
+
+def _uses_backward_error_progress(
+    *,
+    requested: bool,
+    runtime_dtype: torch.dtype,
+) -> bool:
+    """Use schema-v2 progress only for float64 certification recovery.
+
+    Ordinary fits retain the legacy progress signal and their required float64
+    terminal audit. Explicit recovery mode survives equal solve/certification
+    tolerances (for example strict) but remains disabled if float64 context
+    promotion failed.
+    """
+
+    return bool(requested and runtime_dtype == torch.float64)
+
+
 def _solve_inner_subproblem(
     *,
     use_alm: bool,
@@ -1373,6 +1456,7 @@ def _solve_inner_subproblem(
     dual,
     dual_start_is_actual: bool,
     spectral_rho: bool,
+    use_backward_error_stopping: bool,
     pdhg_tau_node,
     backend_name: str,
     graph_hash: str,
@@ -1417,6 +1501,7 @@ def _solve_inner_subproblem(
             dual_start=dual,
             dual_start_is_actual=dual_start_is_actual,
             spectral_rho=bool(spectral_rho),
+            use_backward_error_stopping=bool(use_backward_error_stopping),
             diagnostics_out=surrogate_diag_values,
         )
     else:
@@ -1444,6 +1529,8 @@ def _solve_inner_subproblem(
             phi_start=phi,
             dual_start=dual,
             tau_node=pdhg_tau_node,
+            use_backward_error_stopping=bool(use_backward_error_stopping),
+            diagnostics_out=surrogate_diag_values,
         )
     if use_alm:
         # The outer MM loop carries the rho-invariant actual multiplier y.
@@ -1487,6 +1574,7 @@ def _solve_inner_subproblem(
         surrogate_certificate=certificate,
         surrogate_kkt=KKTDiagnostics.from_mapping(surrogate_diag),
         converged=bool(inner_ok),
+        iterations=int(_inner_iterations),
     )
 
 
@@ -1507,6 +1595,7 @@ def _fit_from_start(
     inner_max_iter: int,
     tol: float,
     certification_tol: float,
+    use_backward_error_progress: bool,
     phi_start: np.ndarray | torch.Tensor,
     solver_state: SolverState | None,
     lower: torch.Tensor,
@@ -1520,6 +1609,7 @@ def _fit_from_start(
     certificate_refinement_rounds: int,
     certificate_column_tol_scale: float,
     verbose: bool,
+    audit_context_cache: dict[tuple[str, str, str], object] | None = None,
 ) -> RawFit:
     tol = _validate_solver_tolerance(tol)
     cert_tol = _validate_solver_tolerance(certification_tol)
@@ -1560,6 +1650,10 @@ def _fit_from_start(
     use_unimodal_objective = objective_shape.startswith("unimodal")
     require_full_step_backtracking = (
         objective_shape == "unimodal_full_step_backtracking"
+    )
+    use_backward_error_progress = _uses_backward_error_progress(
+        requested=use_backward_error_progress,
+        runtime_dtype=runtime.dtype,
     )
     use_alm = bool(
         tensor_graph.is_complete
@@ -1635,6 +1729,19 @@ def _fit_from_start(
     final_outer_diag = _initial_outer_diag()
     outer_kkt_certificate_status = "not_audited"
     mm_consistency_violations = 0
+    total_inner_iterations = 0
+    inner_solve_calls = 0
+    accepted_full_steps = 0
+    accepted_damped_steps = 0
+    rejected_outer_steps = 0
+    outer_stop_reason = "outer_iteration_limit"
+    legacy_stop_kkt_residual = float("inf")
+    componentwise_stop_kkt_residual = float("inf")
+    progress_residual_method = (
+        "componentwise_box_cone_backward_error_v1"
+        if use_backward_error_progress
+        else "legacy_global_l2_progress_v1"
+    )
     full_step_curvature_multiplier = torch.ones_like(phi)
 
     current_mutation_region_terms = mutation_region_terms_torch(
@@ -1706,11 +1813,16 @@ def _fit_from_start(
                 witness=forcing_certificate,
                 refine=False,
             ).diagnostics.as_dict()
+            forcing_residual_key = (
+                "backward_error_kkt_residual"
+                if use_backward_error_progress
+                else "kkt_residual"
+            )
             inner_progress_tolerance = max(
                 5.0 * tol,
                 min(
                     float(np.sqrt(tol)),
-                    0.9 * float(forcing_diag["kkt_residual"]),
+                    0.9 * float(forcing_diag[forcing_residual_key]),
                 ),
             )
         else:
@@ -1792,17 +1904,26 @@ def _fit_from_start(
                     dual=inner_dual_start,
                     dual_start_is_actual=inner_dual_start_is_actual,
                     spectral_rho=bool(require_full_step_backtracking),
+                    use_backward_error_stopping=use_backward_error_progress,
                     pdhg_tau_node=tensor_graph.pdhg_tau_node,
                     backend_name=dense_inner_solver,
                     graph_hash=graph_hash,
                 )
+                inner_solve_calls += 1
+                total_inner_iterations += int(inner_result.iterations)
                 phi_trial = inner_result.phi
                 dense_warm_state = inner_result.warm_state
                 dual_trial = getattr(dense_warm_state, "dual", None)
                 surrogate_certificate = inner_result.surrogate_certificate
                 dual_kkt_trial = getattr(surrogate_certificate, "dual", None)
                 inner_ok = bool(inner_result.converged)
-                inner_residual = float(inner_result.surrogate_kkt.kkt_residual)
+                inner_residual = float(
+                    (
+                        inner_result.surrogate_kkt.backward_error_kkt_residual
+                        if use_backward_error_progress
+                        else inner_result.surrogate_kkt.kkt_residual
+                    )
+                )
                 batch_inner_certified = bool(inner_ok)
                 if require_full_step_backtracking:
                     batch_inner_certified = bool(
@@ -1955,6 +2076,7 @@ def _fit_from_start(
             )
             if objective_gap <= recovery_armijo_rhs:
                 accepted = True
+                accepted_full_steps += 1
                 candidate_phi = phi_trial
                 # The complete-graph ADMM backend also returns the actual KKT
                 # multiplier y=rho*u. Carry y, not the rho-dependent scaled u,
@@ -2070,6 +2192,7 @@ def _fit_from_start(
                 ):
                     accepted = True
                     damped_accepted = True
+                    accepted_damped_steps += 1
                     candidate_phi = phi_theta
                     (
                         candidate_dual,
@@ -2093,6 +2216,7 @@ def _fit_from_start(
             scale *= 2.0
 
         if not accepted:
+            rejected_outer_steps += 1
             candidate_phi = phi
             candidate_dual = dual
             candidate_dual_kkt = dual_kkt
@@ -2185,7 +2309,18 @@ def _fit_from_start(
                 work_counters = work_counters + observed_refinement.work_counters
             certificate = observed_refinement.certificate
             outer_diag = observed_refinement.diagnostics.as_dict()
-            outer_converged = bool(outer_diag["kkt_residual"] <= 5.0 * cert_tol)
+            legacy_stop_kkt_residual = float(outer_diag["kkt_residual"])
+            componentwise_stop_kkt_residual = float(
+                outer_diag.get("backward_error_kkt_residual", float("inf"))
+            )
+            outer_converged = bool(
+                _backward_error_kkt_within_gate(
+                    outer_diag,
+                    certification_tol=cert_tol,
+                )
+                if use_backward_error_progress
+                else float(outer_diag["kkt_residual"]) <= 5.0 * cert_tol
+            )
         if accepted:
             current_inner_converged = bool(inner_converged)
         if do_outer_kkt_audit:
@@ -2198,6 +2333,11 @@ def _fit_from_start(
             and outer_converged
         ):
             converged = True
+            outer_stop_reason = (
+                "componentwise_backward_error_converged"
+                if use_backward_error_progress
+                else "legacy_progress_converged"
+            )
             break
 
     final_terms = current_mutation_region_terms
@@ -2317,6 +2457,7 @@ def _fit_from_start(
             major_prior=major_prior,
             eps=eps,
             tol=cert_tol,
+            audit_context_cache=audit_context_cache,
         )
         certificate_audit_dtype = "float64"
         gradient_scope = audit_gradient_scope
@@ -2338,6 +2479,8 @@ def _fit_from_start(
     authoritative_kkt_residual = float(
         admission_diag["backward_error_kkt_residual"]
     )
+    if not np.isfinite(float(authoritative_objective)):
+        outer_stop_reason = "nonfinite_objective"
     final_dual = getattr(certificate, "dual", None)
     outer_kkt_certificate_status = str(final_certificate_refinement.status)
     converged_outer = bool(authoritative_kkt_residual <= 5.0 * cert_tol)
@@ -2444,6 +2587,21 @@ def _fit_from_start(
         convergence=ConvergenceResult(
             converged=bool(converged),
             mm_consistency_violations=int(mm_consistency_violations),
+            stage_outer_iterations=int(iterations),
+            stage_outer_max_iter=max(int(outer_max_iter), 1),
+            stage_inner_iterations=int(total_inner_iterations),
+            stage_inner_max_iter=max(int(inner_max_iter), 10),
+            stage_inner_solve_calls=int(inner_solve_calls),
+            stop_reason=str(outer_stop_reason),
+            progress_residual_method=str(progress_residual_method),
+            solve_tolerance=float(tol),
+            legacy_stop_kkt_residual=float(legacy_stop_kkt_residual),
+            componentwise_stop_kkt_residual=float(
+                componentwise_stop_kkt_residual
+            ),
+            accepted_full_steps=int(accepted_full_steps),
+            accepted_damped_steps=int(accepted_damped_steps),
+            rejected_outer_steps=int(rejected_outer_steps),
         ),
         work=work_counters,
         state=solver_state_out,
@@ -2471,6 +2629,7 @@ def fit_observed_data_pairwise_fusion(
     inner_max_iter: int,
     tol: float,
     certification_tol: float | None = None,
+    use_backward_error_progress: bool = False,
     phi_start: np.ndarray | torch.Tensor | None = None,
     graph: PairwiseFusionGraph | None = None,
     adaptive_weight_gamma: float = 1.0,
@@ -2482,6 +2641,7 @@ def fit_observed_data_pairwise_fusion(
     | tuple[np.ndarray | torch.Tensor, ...]
     | None = None,
     start_mode: str = "full",
+    append_default_nonconvex_starts: bool | None = None,
     device: str | None = DEFAULT_DEVICE,
     dtype: str | None = DEFAULT_DTYPE,
     runtime=None,
@@ -2570,8 +2730,13 @@ def fit_observed_data_pairwise_fusion(
     normalized_start_mode = str(start_mode).strip().lower()
     if normalized_start_mode not in {"full", "warm_plus_pilot", "warm_only"}:
         raise ValueError(f"Unknown start_mode: {start_mode}")
-    if uses_explicit_path_likelihood(data):
-        normalized_start_mode = "full"
+    append_defaults = normalized_start_mode == "full"
+    if append_default_nonconvex_starts is None:
+        append_defaults = bool(
+            append_defaults or uses_explicit_path_likelihood(data)
+        )
+    else:
+        append_defaults = bool(append_default_nonconvex_starts)
 
     if objective_shape.startswith("unimodal"):
         start_bank = [phi_start] if phi_start is not None else [effective_exact_pilot]
@@ -2579,7 +2744,7 @@ def fit_observed_data_pairwise_fusion(
         start_bank: list[np.ndarray | torch.Tensor] = []
         if phi_start is not None:
             start_bank.append(phi_start)
-        if normalized_start_mode == "full":
+        if append_defaults:
             start_bank.extend(effective_scalar_well_starts)
             start_bank.append(effective_pooled_start)
     start_bank = _deduplicate_starts(start_bank, runtime=effective_runtime)
@@ -2609,6 +2774,7 @@ def fit_observed_data_pairwise_fusion(
             inner_max_iter=inner_max_iter,
             tol=tol,
             certification_tol=certification_tol,
+            use_backward_error_progress=use_backward_error_progress,
             phi_start=start,
             solver_state=state,
             lower=context.lower,
@@ -2622,6 +2788,7 @@ def fit_observed_data_pairwise_fusion(
             certificate_refinement_rounds=certificate_refinement_rounds,
             certificate_column_tol_scale=certificate_column_tol_scale,
             verbose=verbose,
+            audit_context_cache=context.audit_context_cache,
         )
 
     cpu_fallback_context: SolverContext | None = None

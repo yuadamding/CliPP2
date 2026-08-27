@@ -11,6 +11,7 @@ from ..core.bic import (
 )
 from ..config import FitConfig
 from ..core.model import fit_fixed_objective
+from ..core.objective import ObservedModel
 from ..core.fusion.types import RawFit
 from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.scalar import (
@@ -236,6 +237,7 @@ def _fixed_labels_refit(
     partition_signature: str,
     selection_options: FitConfig,
     cache: dict[object, PartitionRefitCacheEntry] | None,
+    source_model: ObservedModel | None = None,
 ) -> PartitionRefitCacheEntry:
     profile = selection_options.computation_profile
     refit_config = selection_options.selection.refit
@@ -259,6 +261,7 @@ def _fixed_labels_refit(
     refined = partition_constrained_observed_refit(
         data,
         np.asarray(labels, dtype=np.int64),
+        _model=source_model,
         **kwargs,
     )
     loglik_delta = float(refined.global_optimality_gap)
@@ -360,6 +363,7 @@ def evaluate_partition(
     selection_options: FitConfig,
     refit_cache: dict[object, PartitionRefitCacheEntry] | None,
     selection_score: str | None = None,
+    source_model: ObservedModel | None = None,
 ) -> PartitionEvaluation:
     """Evaluate raw and direct label sets through one refit/score path."""
 
@@ -369,6 +373,7 @@ def evaluate_partition(
         partition_signature=partition.signature,
         selection_options=selection_options,
         cache=refit_cache,
+        source_model=source_model,
     )
     refit_result = cached_refit.result
     score = _score_fixed_labels(
@@ -411,6 +416,7 @@ def evaluate_raw_fusion_candidate(
     selection_score: str,
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] | None = None,
     precomputed_fit: RawFit | None = None,
+    source_model: ObservedModel | None = None,
 ) -> tuple[RawFit, RawFusionCandidate]:
     canonical_score_name = _normalize_selection_score_name(selection_score)
     raw_fit_options = (
@@ -463,6 +469,7 @@ def evaluate_raw_fusion_candidate(
         selection_options=selection_options,
         refit_cache=bic_refit_cache,
         selection_score=canonical_score_name,
+        source_model=source_model,
     )
     refit = evaluation.refit
     score = evaluation.score
@@ -496,6 +503,7 @@ def evaluate_direct_partition_candidate(
     parent_raw_lambda: float | None,
     refit_cache: dict[object, PartitionRefitCacheEntry] | None,
     parent_raw_phi_hash: str = "",
+    source_model: ObservedModel | None = None,
 ) -> DirectPartitionCandidate:
     """Evaluate one deterministic non-fusion partition under the common score."""
 
@@ -518,6 +526,7 @@ def evaluate_direct_partition_candidate(
         partition=partition,
         selection_options=selection_options,
         refit_cache=refit_cache,
+        source_model=source_model,
     )
     refit = evaluation.refit
     score = evaluation.score

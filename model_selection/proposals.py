@@ -46,6 +46,7 @@ class RawStartAttempt:
     start_value: float
     breakpoint_escape_changed_count: int
     mathematically_certified: bool
+    promotion_status: str = "not_recorded"
 
 
 RawStartSpec = tuple[str, float, SolverState | None, StartArray | None]
@@ -74,6 +75,27 @@ def bootstrap_independent_start_specs(
         (f"cold_zero_penalty_{normalized_suffix}", 0.0, None, exact_pilot),
         (f"cold_pooled_likelihood_{normalized_suffix}", 0.0, None, pooled_start),
     )
+
+
+def explicit_path_default_start_specs(
+    *,
+    scalar_well_starts: tuple[StartArray, ...] | list[StartArray],
+    pooled_start: StartArray,
+) -> tuple[RawStartSpec, ...]:
+    """Expose the low-level explicit-path defaults as one flat start bank.
+
+    Model selection combines these specifications with its warm and guided
+    starts, then performs one stable deduplication pass. This avoids nesting
+    the complete default bank inside every externally named start while
+    preserving every distinct cold basin and its provenance.
+    """
+
+    specs = [
+        (f"cold_scalar_well_{index}", 0.0, None, start)
+        for index, start in enumerate(scalar_well_starts)
+    ]
+    specs.append(("cold_pooled_likelihood_default", 0.0, None, pooled_start))
+    return tuple(specs)
 
 
 def select_raw_start_attempt(
@@ -301,6 +323,7 @@ def solver_recovery_fit_options(
                 if solver.certification_tolerance is None
                 else float(solver.certification_tolerance)
             ),
+            use_backward_error_progress=True,
             objective_shape=objective_shape_for_data(
                 data, "unimodal_full_step_backtracking"
             ),
@@ -572,6 +595,7 @@ __all__ = [
     "RawStartAttempt",
     "adaptive_stop_certifies_global_optimum",
     "bootstrap_independent_start_specs",
+    "explicit_path_default_start_specs",
     "build_guided_initialization_with_resource_policy",
     "build_partition_guided_graph_with_resource_policy",
     "clone_start",

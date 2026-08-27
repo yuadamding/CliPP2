@@ -15,9 +15,11 @@ from ..core.fusion.solver import (
     prepare_torch_problem_with_resource_policy,
     promote_solver_context_dtype,
     torch_data_from_context,
+    uses_explicit_path_likelihood,
 )
 from ..core.fusion.types import (
     RawFit,
+    SolverContext,
     SolverState,
 )
 from ..io.data import TumorData
@@ -50,6 +52,7 @@ from ..model_selection.proposals import (
     clone_start as _clone_start,
     direct_partition_source as _direct_partition_source,
     escape_path_breakpoint_retry_state as _escape_path_breakpoint_retry_state,
+    explicit_path_default_start_specs as _explicit_path_default_start_specs,
     offload_solver_state_to_cpu as _offload_solver_state_to_cpu,
     pilot_matrix_hash as _pilot_matrix_hash,
     rescore_partition_candidates as _rescore_partition_candidates,
@@ -98,6 +101,24 @@ class BestRawAttemptDiagnostics:
     outer_max_iter: int
     inner_max_iter: int
     certificate_max_iter: int
+    working_dtype: str = "not_recorded"
+    audit_dtype: str = "not_recorded"
+    precision_polished: bool = False
+    promotion_status: str = "not_recorded"
+    stage_outer_iterations: int = 0
+    stage_outer_max_iter: int = 0
+    stage_inner_iterations: int = 0
+    stage_inner_max_iter: int = 0
+    stage_inner_solve_calls: int = 0
+    stop_reason: str = "not_recorded"
+    progress_residual_method: str = "not_recorded"
+    solve_tolerance: float = float("nan")
+    legacy_stop_kkt_residual: float = float("inf")
+    componentwise_stop_kkt_residual: float = float("inf")
+    accepted_full_steps: int = 0
+    accepted_damped_steps: int = 0
+    rejected_outer_steps: int = 0
+    fallback_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +139,8 @@ class RawReferenceFailureDiagnostics:
     certificate_status_counts: tuple[tuple[str, int], ...]
     search_phase_counts: tuple[tuple[str, int], ...]
     start_source_counts: tuple[tuple[str, int], ...]
+    promotion_status_counts: tuple[tuple[str, int], ...] = ()
+    attempt_summaries: tuple[str, ...] = ()
 
 
 class NoCertifiedRawReferenceError(RuntimeError):
@@ -136,6 +159,37 @@ class NoCertifiedRawReferenceError(RuntimeError):
         self.diagnostics = _raw_reference_failure_diagnostics(records)
         reason_counts = dict(self.diagnostics.ineligibility_reason_counts)
         certificate_counts = dict(self.diagnostics.certificate_status_counts)
+        promotion_counts = dict(self.diagnostics.promotion_status_counts)
+        best = self.diagnostics.best_raw_attempt
+        best_summary = (
+            None
+            if best is None
+            else {
+                "phase": best.search_phase,
+                "source": best.source,
+                "lambda": best.lambda_value,
+                "dtype": f"{best.working_dtype}/{best.audit_dtype}",
+                "promotion": best.promotion_status,
+                "polished": best.precision_polished,
+                "stage_outer": (
+                    f"{best.stage_outer_iterations}/{best.stage_outer_max_iter}"
+                ),
+                "stage_inner": best.stage_inner_iterations,
+                "stage_inner_max": best.stage_inner_max_iter,
+                "stage_inner_calls": best.stage_inner_solve_calls,
+                "stop": best.stop_reason,
+                "progress": best.progress_residual_method,
+                "solve_tol": best.solve_tolerance,
+                "legacy_kkt": best.legacy_stop_kkt_residual,
+                "componentwise_kkt": best.componentwise_stop_kkt_residual,
+                "steps": (
+                    f"{best.accepted_full_steps}/"
+                    f"{best.accepted_damped_steps}/"
+                    f"{best.rejected_outer_steps}"
+                ),
+                "fallback": best.fallback_reason,
+            }
+        )
         super().__init__(
             "Hybrid selection requires a certified raw-fusion reference for "
             f"tumor {self.tumor_id}; "
@@ -149,7 +203,10 @@ class NoCertifiedRawReferenceError(RuntimeError):
             f"dominant_kkt_component={self.diagnostics.dominant_kkt_component}; "
             f"mm_violating={self.diagnostics.mm_violating_count}; "
             f"ineligibility_reasons={reason_counts}; "
-            f"certificate_statuses={certificate_counts}."
+            f"certificate_statuses={certificate_counts}; "
+            f"promotion_statuses={promotion_counts}; "
+            f"best_attempt={best_summary}; "
+            f"attempts={self.diagnostics.attempt_summaries}."
         )
 
 
@@ -157,6 +214,136 @@ def _stable_counts(values) -> tuple[tuple[str, int], ...]:
     normalized = ["<missing>" if value is None else str(value) for value in values]
     return tuple(
         (value, normalized.count(value)) for value in sorted(set(normalized))
+    )
+
+
+def _try_promote_recovery_context(
+    context: SolverContext,
+) -> tuple[SolverContext, str]:
+    """Promote one frozen recovery context and retain a typed outcome."""
+
+    if context.runtime.dtype == torch.float64:
+        return context, "not_needed"
+    try:
+        promoted = promote_solver_context_dtype(context, dtype=torch.float64)
+    except (MemoryError, torch.OutOfMemoryError):
+        return context, "failed_memory"
+    except RuntimeError:
+        return context, "failed_runtime"
+    return promoted, "applied"
+
+
+def _raw_attempt_diagnostics(
+    attempt: RawAttemptTrace,
+    record: CandidateRecord,
+) -> BestRawAttemptDiagnostics:
+    fit = attempt.fit
+    certificate = fit.certificate
+    convergence = fit.convergence
+    work = fit.work
+    components = {
+        "stationarity": float(certificate.components.stationarity),
+        "edge_subgradient": float(certificate.components.edge_subgradient),
+        "dual_ball": float(certificate.components.dual_ball),
+        "box": float(certificate.components.box),
+    }
+    finite_components = {
+        name: value for name, value in components.items() if np.isfinite(value)
+    }
+    return BestRawAttemptDiagnostics(
+        search_round=int(record.trace.search_round),
+        search_phase=str(record.trace.search_phase),
+        lambda_value=float(fit.provenance.lambda_value),
+        source=str(attempt.source),
+        kkt_residual=float(certificate.components.residual),
+        kkt_tolerance=float(certificate.tolerance),
+        dominant_kkt_component=(
+            max(finite_components, key=finite_components.get)
+            if finite_components
+            else "unknown"
+        ),
+        outer_max_iter=int(attempt.outer_max_iter),
+        inner_max_iter=int(attempt.inner_max_iter),
+        certificate_max_iter=int(attempt.certificate_max_iter),
+        working_dtype=str(certificate.working_dtype),
+        audit_dtype=str(certificate.audit_dtype),
+        precision_polished=bool(certificate.precision_polished),
+        promotion_status=str(attempt.promotion_status),
+        stage_outer_iterations=int(
+            getattr(
+                convergence,
+                "stage_outer_iterations",
+                getattr(convergence, "iterations", 0),
+            )
+        ),
+        stage_outer_max_iter=int(
+            getattr(convergence, "stage_outer_max_iter", attempt.outer_max_iter)
+        ),
+        stage_inner_iterations=int(
+            getattr(
+                convergence,
+                "stage_inner_iterations",
+                getattr(work, "inner_iterations", 0),
+            )
+        ),
+        stage_inner_max_iter=int(
+            getattr(convergence, "stage_inner_max_iter", attempt.inner_max_iter)
+        ),
+        stage_inner_solve_calls=int(
+            getattr(convergence, "stage_inner_solve_calls", 0)
+        ),
+        stop_reason=str(getattr(convergence, "stop_reason", "not_recorded")),
+        progress_residual_method=str(
+            getattr(convergence, "progress_residual_method", "not_recorded")
+        ),
+        solve_tolerance=float(
+            getattr(convergence, "solve_tolerance", float("nan"))
+        ),
+        legacy_stop_kkt_residual=float(
+            getattr(convergence, "legacy_stop_kkt_residual", float("inf"))
+        ),
+        componentwise_stop_kkt_residual=float(
+            getattr(
+                convergence,
+                "componentwise_stop_kkt_residual",
+                float("inf"),
+            )
+        ),
+        accepted_full_steps=int(getattr(convergence, "accepted_full_steps", 0)),
+        accepted_damped_steps=int(
+            getattr(convergence, "accepted_damped_steps", 0)
+        ),
+        rejected_outer_steps=int(getattr(convergence, "rejected_outer_steps", 0)),
+        fallback_reason=str(certificate.fallback_reason),
+    )
+
+
+def _compact_raw_attempt_summary(
+    attempt: RawAttemptTrace,
+    record: CandidateRecord,
+) -> str:
+    """Render one scalar-only attempt token suitable for scheduler stderr."""
+
+    item = _raw_attempt_diagnostics(attempt, record)
+    steps = (
+        f"{item.accepted_full_steps}/{item.accepted_damped_steps}/"
+        f"{item.rejected_outer_steps}"
+    )
+    return (
+        f"r{item.search_round}:{item.search_phase}:{item.source}@{item.lambda_value:.6g}"
+        f"|kkt={item.kkt_residual:.6g}/{item.kkt_tolerance:.6g}"
+        f"|dtype={item.working_dtype}/{item.audit_dtype}"
+        f"|prom={item.promotion_status}|polish={int(item.precision_polished)}"
+        f"|progress={item.progress_residual_method}"
+        f"|solve_tol={item.solve_tolerance:.6g}"
+        f"|outer={item.stage_outer_iterations}/{item.stage_outer_max_iter}"
+        f"|inner={item.stage_inner_iterations}/"
+        f"{item.stage_inner_solve_calls}x{item.stage_inner_max_iter}"
+        f"|stop={item.stop_reason}"
+        f"|stop_kkt={item.legacy_stop_kkt_residual:.6g}/"
+        f"{item.componentwise_stop_kkt_residual:.6g}"
+        f"|steps={steps}"
+        f"|fallback={item.fallback_reason or 'none'}"
     )
 
 
@@ -211,33 +398,11 @@ def _raw_reference_failure_diagnostics(
             finite_attempts,
             key=lambda pair: float(pair[0].fit.certificate.components.residual),
         )
-        certificate = attempt.fit.certificate
-        min_residual = float(certificate.components.residual)
-        if np.isfinite(float(certificate.tolerance)):
-            min_tolerance = float(certificate.tolerance)
-        components = {
-            "stationarity": float(certificate.components.stationarity),
-            "edge_subgradient": float(certificate.components.edge_subgradient),
-            "dual_ball": float(certificate.components.dual_ball),
-            "box": float(certificate.components.box),
-        }
-        finite_components = {
-            name: value for name, value in components.items() if np.isfinite(value)
-        }
-        if finite_components:
-            dominant_component = max(finite_components, key=finite_components.get)
-        best_attempt = BestRawAttemptDiagnostics(
-            search_round=int(record.trace.search_round),
-            search_phase=str(record.trace.search_phase),
-            lambda_value=float(attempt.fit.provenance.lambda_value),
-            source=str(attempt.source),
-            kkt_residual=min_residual,
-            kkt_tolerance=min_tolerance,
-            dominant_kkt_component=dominant_component,
-            outer_max_iter=int(attempt.outer_max_iter),
-            inner_max_iter=int(attempt.inner_max_iter),
-            certificate_max_iter=int(attempt.certificate_max_iter),
-        )
+        best_attempt = _raw_attempt_diagnostics(attempt, record)
+        min_residual = float(best_attempt.kkt_residual)
+        if np.isfinite(float(best_attempt.kkt_tolerance)):
+            min_tolerance = float(best_attempt.kkt_tolerance)
+        dominant_component = str(best_attempt.dominant_kkt_component)
 
     mm_values = [
         int(attempt.fit.convergence.mm_consistency_violations)
@@ -269,6 +434,13 @@ def _raw_reference_failure_diagnostics(
         ),
         search_phase_counts=_stable_counts(record.trace.search_phase for record in raw),
         start_source_counts=_stable_counts(record.trace.start_source for record in raw),
+        promotion_status_counts=_stable_counts(
+            attempt.promotion_status for attempt, _ in attempts
+        ),
+        attempt_summaries=tuple(
+            _compact_raw_attempt_summary(attempt, record)
+            for attempt, record in attempts
+        ),
     )
 
 
@@ -619,6 +791,7 @@ def _partition_guided_admm_selection(
     # Lazily promoted float64 twin of the working context, built at most once
     # per tumor and only when a certification-recovery attempt needs it.
     float64_recovery_context: list = [None]
+    float64_recovery_status = ["not_requested"]
     while True:
         proposal = controller.propose()
         if proposal is None:
@@ -671,20 +844,23 @@ def _partition_guided_admm_selection(
             # floor. Promotion is best-effort; without memory the attempt
             # keeps the working precision and its existing failure mode.
             recovery_promoted = False
-            if (
-                proposal.phase in {"solver_recovery", "bootstrap_certification_anchor"}
-                and context.runtime.dtype != torch.float64
-            ):
-                if float64_recovery_context[0] is None:
-                    try:
-                        float64_recovery_context[0] = promote_solver_context_dtype(
-                            context, dtype=torch.float64
-                        )
-                    except (MemoryError, torch.OutOfMemoryError, RuntimeError):
-                        float64_recovery_context[0] = context
-                if float64_recovery_context[0] is not context:
-                    context = float64_recovery_context[0]
-                    recovery_promoted = True
+            recovery_promotion_status = "not_requested"
+            if proposal.phase in {
+                "solver_recovery",
+                "bootstrap_certification_anchor",
+            }:
+                if context.runtime.dtype == torch.float64:
+                    recovery_promotion_status = "not_needed"
+                else:
+                    if float64_recovery_context[0] is None:
+                        (
+                            float64_recovery_context[0],
+                            float64_recovery_status[0],
+                        ) = _try_promote_recovery_context(context)
+                    recovery_promotion_status = str(float64_recovery_status[0])
+                    if float64_recovery_context[0] is not context:
+                        context = float64_recovery_context[0]
+                        recovery_promoted = True
             initialization = guided_initialization
             warm_fit = None
             if proposal.warm_start_lambda is not None:
@@ -894,6 +1070,15 @@ def _partition_guided_admm_selection(
                         context.pooled_start,
                     )
 
+            if uses_explicit_path_likelihood(data):
+                for source, start_value, state, phi in (
+                    _explicit_path_default_start_specs(
+                        scalar_well_starts=context.scalar_well_starts,
+                        pooled_start=context.pooled_start,
+                    )
+                ):
+                    append_distinct_start(source, start_value, state, phi)
+
             start_attempts: list[_RawStartAttempt] = []
             for (
                 lambda_start_source,
@@ -947,6 +1132,7 @@ def _partition_guided_admm_selection(
                     pooled_start=context.pooled_start,
                     scalar_well_starts=context.scalar_well_starts,
                     start_mode="warm_only",
+                    append_default_nonconvex_starts=False,
                     runtime=context.runtime,
                     torch_data=torch_data_from_context(context),
                     solver_context=context,
@@ -976,6 +1162,7 @@ def _partition_guided_admm_selection(
                         start_value=float(lambda_start_value),
                         breakpoint_escape_changed_count=int(changed_count),
                         mathematically_certified=bool(mathematically_certified),
+                        promotion_status=str(recovery_promotion_status),
                     )
                 )
             selected_attempt = _select_raw_start_attempt(start_attempts)
@@ -1003,6 +1190,7 @@ def _partition_guided_admm_selection(
             selection_score=selection_score,
             bic_refit_cache=bic_refit_cache,
             precomputed_fit=selected_raw_fit,
+            source_model=base_solver_context.problem.source_model,
         )
         (
             lambda_start_source,
@@ -1046,6 +1234,7 @@ def _partition_guided_admm_selection(
                             certificate_max_iter=int(
                                 candidate_fit_options.solver.certificate.max_iter
                             ),
+                            promotion_status=str(attempt.promotion_status),
                         )
                         for attempt in raw_start_attempts
                     ),
@@ -1180,6 +1369,7 @@ def _partition_guided_admm_selection(
                     else _pilot_matrix_hash(parent_raw.raw_fit.phi)
                 ),
                 refit_cache=bic_refit_cache,
+                source_model=base_solver_context.problem.source_model,
             )
             result_entries.append(
                 CandidateRecord(

@@ -19,6 +19,7 @@ def fit_fixed_objective(
     pooled_start: np.ndarray | torch.Tensor | None = None,
     scalar_well_starts: list[np.ndarray | torch.Tensor] | None = None,
     start_mode: str = "full",
+    append_default_nonconvex_starts: bool | None = None,
     runtime=None,
     torch_data=None,
     solver_context: SolverContext | None = None,
@@ -43,6 +44,7 @@ def fit_fixed_objective(
             if solver.certification_tolerance is None
             else float(solver.certification_tolerance)
         ),
+        use_backward_error_progress=bool(solver.use_backward_error_progress),
         phi_start=phi_start,
         graph=graph.graph,
         adaptive_weight_gamma=float(graph.adaptive_weight_gamma),
@@ -52,6 +54,7 @@ def fit_fixed_objective(
         pooled_start=pooled_start,
         scalar_well_starts=scalar_well_starts,
         start_mode=str(start_mode),
+        append_default_nonconvex_starts=append_default_nonconvex_starts,
         device=str(config.runtime.device),
         dtype=str(config.runtime.dtype),
         objective_shape=str(solver.objective_shape),

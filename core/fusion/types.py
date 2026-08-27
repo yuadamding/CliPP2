@@ -198,6 +198,7 @@ class InnerSolveResult:
     surrogate_kkt: KKTDiagnostics
     converged: bool
     fallback_reason: str = ""
+    iterations: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,6 +295,11 @@ class SolverContext:
     base_fusion_objective_hash: str = ""
     base_objective_key: BaseObjectiveKey | None = None
     resource_fallback: str | None = None
+    audit_context_cache: dict[tuple[str, str, str], object] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(slots=True)
@@ -360,6 +366,19 @@ class CertificateResult:
 class ConvergenceResult:
     converged: bool
     mm_consistency_violations: int
+    stage_outer_iterations: int = 0
+    stage_outer_max_iter: int = 0
+    stage_inner_iterations: int = 0
+    stage_inner_max_iter: int = 0
+    stage_inner_solve_calls: int = 0
+    stop_reason: str = "not_recorded"
+    progress_residual_method: str = "not_recorded"
+    solve_tolerance: float = float("nan")
+    legacy_stop_kkt_residual: float = float("inf")
+    componentwise_stop_kkt_residual: float = float("inf")
+    accepted_full_steps: int = 0
+    accepted_damped_steps: int = 0
+    rejected_outer_steps: int = 0
 
 
 @dataclass(frozen=True, slots=True)

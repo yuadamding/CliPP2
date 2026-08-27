@@ -1514,7 +1514,7 @@ def _complete_graph_admm_stationarity_components_torch(
     upper: torch.Tensor,
     adj: torch.Tensor,
     atol: float,
-) -> tuple[torch.Tensor, float]:
+) -> tuple[torch.Tensor, float, float]:
     grad_smooth = h * (phi - U)
     stat = stationarity_residual_torch(
         total_grad=grad_smooth + adj,
@@ -1526,7 +1526,14 @@ def _complete_graph_admm_stationarity_components_torch(
     residual = torch.linalg.vector_norm(stat) / (
         1.0 + torch.linalg.vector_norm(grad_smooth) + torch.linalg.vector_norm(adj)
     )
-    return grad_smooth, float(residual.item())
+    backward_error = backward_error_stationarity_residual_torch(
+        grad_smooth=grad_smooth,
+        adj=adj,
+        phi=phi,
+        lower=lower,
+        upper=upper,
+    )
+    return grad_smooth, float(residual.item()), float(backward_error.item())
 
 
 def _complete_graph_admm_kkt_residual_from_maxima_torch(
@@ -1539,7 +1546,10 @@ def _complete_graph_admm_kkt_residual_from_maxima_torch(
     max_edge_residual: float | torch.Tensor,
     max_ball_residual: float | torch.Tensor,
     max_radius: float | torch.Tensor,
+    max_scaled_edge_residual: float | torch.Tensor,
+    max_scaled_ball_residual: float | torch.Tensor,
     atol: float,
+    use_backward_error_stopping: bool,
     diagnostics_out: dict[str, float | int] | None = None,
 ) -> float:
     diag = graph_fusion_kkt_diagnostics_from_components_torch(
@@ -1552,11 +1562,18 @@ def _complete_graph_admm_kkt_residual_from_maxima_torch(
         max_edge_residual=max_edge_residual,
         max_ball_residual=max_ball_residual,
         max_radius=max_radius,
+        max_scaled_edge_residual=max_scaled_edge_residual,
+        max_scaled_ball_residual=max_scaled_ball_residual,
     )
     if diagnostics_out is not None:
         diagnostics_out.clear()
         diagnostics_out.update(diag)
-    return float(diag["kkt_residual"])
+    key = (
+        "backward_error_kkt_residual"
+        if use_backward_error_stopping
+        else "kkt_residual"
+    )
+    return float(diag[key])
 
 
 def solve_majorized_subproblem_pdhg_torch(
@@ -1578,6 +1595,8 @@ def solve_majorized_subproblem_pdhg_torch(
     dual_start: torch.Tensor | None,
     tau_node: torch.Tensor | None = None,
     kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
+    use_backward_error_stopping: bool = False,
+    diagnostics_out: dict[str, float | int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, bool, float]:
     lambda_value = validate_lambda_value(lambda_value)
     phi = torch.minimum(
@@ -1669,7 +1688,8 @@ def solve_majorized_subproblem_pdhg_torch(
 
         if audit_due:
             cheap_converged = bool(primal_delta <= tol and dual_delta <= tol)
-            last_residual = inner_kkt_residual_torch(
+            iteration_diagnostics: dict[str, float | int] = {}
+            legacy_residual = inner_kkt_residual_torch(
                 phi=phi,
                 dual=dual,
                 U=U,
@@ -1681,6 +1701,15 @@ def solve_majorized_subproblem_pdhg_torch(
                 edge_v=edge_v,
                 edge_w=edge_w,
                 atol=tol,
+                diagnostics_out=iteration_diagnostics,
+            )
+            if diagnostics_out is not None:
+                diagnostics_out.clear()
+                diagnostics_out.update(iteration_diagnostics)
+            last_residual = float(
+                iteration_diagnostics["backward_error_kkt_residual"]
+                if use_backward_error_stopping
+                else legacy_residual
             )
             if cheap_converged and last_residual <= 5.0 * tol:
                 converged = True
@@ -1945,6 +1974,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
     dual_start: torch.Tensor | None,
     dual_start_is_actual: bool = False,
     spectral_rho: bool = False,
+    use_backward_error_stopping: bool = False,
     kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
     box_phi_atol: float = DEFAULT_BOX_PHI_ATOL,
     box_max_iter: int = DEFAULT_BOX_MAX_ITER,
@@ -2087,7 +2117,7 @@ def _solve_majorized_subproblem_alm_dense_torch(
                 num_nodes=int(phi.shape[0]),
                 prefer_cpu_bincount=True,
             )
-            grad_smooth, stationarity_residual = (
+            grad_smooth, stationarity_residual, backward_error_stationarity_residual = (
                 _complete_graph_admm_stationarity_components_torch(
                     phi=phi,
                     U=U,
@@ -2098,12 +2128,25 @@ def _solve_majorized_subproblem_alm_dense_torch(
                     atol=tol,
                 )
             )
-            audit_due = bool(final_iteration or stationarity_residual <= kkt_stop_tol)
+            progress_stationarity_residual = (
+                backward_error_stationarity_residual
+                if use_backward_error_stopping
+                else stationarity_residual
+            )
+            audit_due = bool(
+                final_iteration or progress_stationarity_residual <= kkt_stop_tol
+            )
         else:
             audit_due = False
         if audit_due:
             kkt_audits += 1
-            edge_max, ball_max, radius_max, _, _ = edge_kkt_maxima_from_diff_torch(
+            (
+                edge_max,
+                ball_max,
+                radius_max,
+                scaled_edge_max,
+                scaled_ball_max,
+            ) = edge_kkt_maxima_from_diff_torch(
                 diff=edge_diff,
                 dual=actual_dual,
                 radius=radius,
@@ -2117,11 +2160,15 @@ def _solve_majorized_subproblem_alm_dense_torch(
                 max_edge_residual=edge_max,
                 max_ball_residual=ball_max,
                 max_radius=radius_max,
+                max_scaled_edge_residual=scaled_edge_max,
+                max_scaled_ball_residual=scaled_ball_max,
                 atol=tol,
+                use_backward_error_stopping=use_backward_error_stopping,
                 diagnostics_out=diagnostics_out,
             )
-            # The audited residual is the full box-QP KKT certificate
-            # (stationarity, edge subgradient, dual ball, and box feasibility).
+            # The audit carries both legacy and componentwise box-QP KKT
+            # residuals. Ordinary solves stop on the former; promoted
+            # certification recovery stops on the latter.
             # Once it is below tolerance, separate iterate-delta heuristics are
             # not an additional optimality requirement and must not force ADMM
             # to exhaust its budget.
@@ -2158,6 +2205,7 @@ def _solve_majorized_subproblem_alm_streaming_torch(
     dual_start: torch.Tensor | None,
     dual_start_is_actual: bool = False,
     spectral_rho: bool = False,
+    use_backward_error_stopping: bool = False,
     kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
     box_phi_atol: float = DEFAULT_BOX_PHI_ATOL,
     box_max_iter: int = DEFAULT_BOX_MAX_ITER,
@@ -2371,7 +2419,7 @@ def _solve_majorized_subproblem_alm_streaming_torch(
         phi = phi_new
         if check_due:
             stationarity_checks += 1
-            grad_smooth, stationarity_residual = (
+            grad_smooth, stationarity_residual, backward_error_stationarity_residual = (
                 _complete_graph_admm_stationarity_components_torch(
                     phi=phi,
                     U=U,
@@ -2382,7 +2430,14 @@ def _solve_majorized_subproblem_alm_streaming_torch(
                     atol=tol,
                 )
             )
-            audit_due = bool(final_iteration or stationarity_residual <= kkt_stop_tol)
+            progress_stationarity_residual = (
+                backward_error_stationarity_residual
+                if use_backward_error_stopping
+                else stationarity_residual
+            )
+            audit_due = bool(
+                final_iteration or progress_stationarity_residual <= kkt_stop_tol
+            )
         else:
             audit_due = False
         if audit_due:
@@ -2392,13 +2447,21 @@ def _solve_majorized_subproblem_alm_streaming_torch(
             )
             max_ball_residual = torch.zeros_like(max_edge_residual)
             max_radius = torch.zeros_like(max_edge_residual)
+            max_scaled_edge_residual = torch.zeros_like(max_edge_residual)
+            max_scaled_ball_residual = torch.zeros_like(max_edge_residual)
             for edge_slice in _edge_slices(num_edges, chunk_size):
                 edge_diff = graph_forward_edges(
                     phi,
                     edge_u=edge_u[edge_slice],
                     edge_v=edge_v[edge_slice],
                 )
-                edge_max, ball_max, radius_max, _, _ = (
+                (
+                    edge_max,
+                    ball_max,
+                    radius_max,
+                    scaled_edge_max,
+                    scaled_ball_max,
+                ) = (
                     edge_kkt_maxima_from_diff_torch(
                     diff=edge_diff,
                     dual=float(rho) * scaled_dual[edge_slice],
@@ -2408,6 +2471,12 @@ def _solve_majorized_subproblem_alm_streaming_torch(
                 max_edge_residual = torch.maximum(max_edge_residual, edge_max)
                 max_ball_residual = torch.maximum(max_ball_residual, ball_max)
                 max_radius = torch.maximum(max_radius, radius_max)
+                max_scaled_edge_residual = torch.maximum(
+                    max_scaled_edge_residual, scaled_edge_max
+                )
+                max_scaled_ball_residual = torch.maximum(
+                    max_scaled_ball_residual, scaled_ball_max
+                )
                 del edge_diff
             last_residual = _complete_graph_admm_kkt_residual_from_maxima_torch(
                 phi=phi,
@@ -2418,7 +2487,10 @@ def _solve_majorized_subproblem_alm_streaming_torch(
                 max_edge_residual=max_edge_residual,
                 max_ball_residual=max_ball_residual,
                 max_radius=max_radius,
+                max_scaled_edge_residual=max_scaled_edge_residual,
+                max_scaled_ball_residual=max_scaled_ball_residual,
                 atol=tol,
+                use_backward_error_stopping=use_backward_error_stopping,
                 diagnostics_out=diagnostics_out,
             )
             if last_residual <= kkt_stop_tol:
@@ -2464,6 +2536,7 @@ def solve_majorized_subproblem_alm_torch(
     dual_start: torch.Tensor | None,
     dual_start_is_actual: bool = False,
     spectral_rho: bool = False,
+    use_backward_error_stopping: bool = False,
     kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
     box_phi_atol: float = DEFAULT_BOX_PHI_ATOL,
     box_max_iter: int = DEFAULT_BOX_MAX_ITER,
@@ -2512,6 +2585,7 @@ def solve_majorized_subproblem_alm_torch(
         dual_start=dual_start,
         dual_start_is_actual=dual_start_is_actual,
         spectral_rho=spectral_rho,
+        use_backward_error_stopping=use_backward_error_stopping,
         kkt_check_every=kkt_check_every,
         box_phi_atol=box_phi_atol,
         box_max_iter=box_max_iter,
