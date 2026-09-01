@@ -1,11 +1,8 @@
-"""Versioned serialization boundary for one completed tumor analysis.
+"""Versioned serialization boundary for one CliPP2 tumor analysis.
 
-The numerical and model-selection layers return typed in-memory objects.  This
-module is the only runner boundary that translates those objects into the
-compatibility summary and the three public TSVs.  Raw-fusion references and
-direct-partition parent identity stay inside :class:`AnalysisSerialization`;
-the public table writer receives only the selected partition and its immutable
-fixed-label refit.
+Primary, conditional-secondary, and diagnostic-only outcomes share one status
+schema. Only a primary outcome with an independently certified raw reference
+may use the three historical compatibility filenames.
 """
 
 from __future__ import annotations
@@ -21,17 +18,37 @@ from ..config import FitConfig
 from ..core.fusion.types import RawFit
 from ..io.data import TumorData
 from ..model_selection.types import (
-    BICSelectionResult,
     DirectPartition,
     FusionPartition,
     PartitionRefitSummary,
     RawFusionCandidate,
+    SecondaryFallbackResult,
     SelectablePartitionCandidate,
     SelectionScore,
+    TumorSelectionOutcome,
 )
+from .cluster_order import CCF_CLUSTER_ORDERING_METHOD
 from .outputs import write_fit_outputs
+from .status_outputs import (
+    cluster_region_estimates_table,
+    mutation_region_estimates_table,
+    raw_attempts_table,
+    region_status_table,
+    secondary_cluster_centers_table,
+    write_status_outputs,
+)
 
-SUMMARY_SCHEMA_VERSION = 3
+
+SUMMARY_SCHEMA_VERSION = 5
+_PRIMARY_SUFFIXES = (
+    "mutation_clusters.tsv",
+    "cluster_centers.tsv",
+    "mutation_region_multiplicity.tsv",
+)
+_SECONDARY_SUFFIXES = (
+    "secondary_cluster_centers.tsv",
+    "secondary_mutation_region_estimates.tsv",
+)
 
 
 def _array_fingerprint(values: np.ndarray, *, dtype: np.dtype) -> str:
@@ -45,43 +62,102 @@ def _array_fingerprint(values: np.ndarray, *, dtype: np.dtype) -> str:
 
 @dataclass(frozen=True, slots=True)
 class AnalysisSerialization:
-    """One normalized, output-ready view of a completed selection result.
-
-    Everything downstream consumes this normalized typed boundary.
-    """
+    """One normalized, output-ready view of any typed selection outcome."""
 
     data: TumorData
     input_file: Path
     fit_config: FitConfig
-    selection_result: BICSelectionResult
+    selection_result: TumorSelectionOutcome
 
     @property
-    def selected_candidate(self) -> SelectablePartitionCandidate:
-        return self.selection_result.selected_model.partition_candidate
+    def primary_estimator_available(self) -> bool:
+        return bool(
+            getattr(
+                self.selection_result,
+                "primary_estimator_available",
+                hasattr(self.selection_result, "selected_model"),
+            )
+        )
 
     @property
-    def raw_reference(self) -> RawFusionCandidate:
-        return self.selection_result.selected_model.raw_reference
+    def selected_candidate(self) -> SelectablePartitionCandidate | None:
+        result = self.selection_result
+        if hasattr(result, "selected_model"):
+            return result.selected_model.partition_candidate
+        if isinstance(result, SecondaryFallbackResult):
+            return result.selected_partition
+        return None
+
+    @property
+    def raw_reference(self) -> RawFusionCandidate | None:
+        result = self.selection_result
+        if hasattr(result, "selected_model"):
+            return result.selected_model.raw_reference
+        return None
 
     @property
     def partition_parent_raw(self) -> RawFusionCandidate | None:
-        return self.selection_result.selected_model.partition_parent_raw
+        result = self.selection_result
+        if hasattr(result, "selected_model"):
+            return result.selected_model.partition_parent_raw
+        return None
 
     @property
-    def raw_fit(self) -> RawFit:
-        return self.raw_reference.raw_fit
+    def raw_fit(self) -> RawFit | None:
+        reference = self.raw_reference
+        return None if reference is None else reference.raw_fit
 
     @property
-    def partition(self) -> FusionPartition | DirectPartition:
-        return self.selected_candidate.partition
+    def diagnostic_raw_fit(self) -> RawFit | None:
+        raw = self.raw_fit
+        if raw is not None:
+            return raw
+        return getattr(self.selection_result, "best_raw_attempt", None)
 
     @property
-    def refit(self) -> PartitionRefitSummary:
-        return self.selected_candidate.refit
+    def partition(self) -> FusionPartition | DirectPartition | None:
+        candidate = self.selected_candidate
+        return None if candidate is None else candidate.partition
 
     @property
-    def score(self) -> SelectionScore:
-        return self.selected_candidate.score
+    def refit(self) -> PartitionRefitSummary | None:
+        candidate = self.selected_candidate
+        return None if candidate is None else candidate.refit
+
+    @property
+    def score(self) -> SelectionScore | None:
+        candidate = self.selected_candidate
+        return None if candidate is None else candidate.score
+
+    @property
+    def failure_reason(self) -> str:
+        return str(getattr(self.selection_result, "reason", ""))
+
+
+def _raw_summary(raw_fit: RawFit | None) -> dict[str, object]:
+    if raw_fit is None:
+        return {
+            "diagnostic_best_raw_lambda": None,
+            "diagnostic_best_raw_objective": None,
+            "diagnostic_best_raw_kkt_residual": None,
+            "diagnostic_best_raw_kkt_tolerance": None,
+            "diagnostic_best_raw_certificate_status": None,
+        }
+    certificate = raw_fit.certificate
+    components = getattr(certificate, "components", None)
+    residual = getattr(components, "residual", None)
+    status = getattr(certificate, "status", None)
+    return {
+        "diagnostic_best_raw_lambda": float(raw_fit.provenance.lambda_value),
+        "diagnostic_best_raw_objective": float(raw_fit.objective.total),
+        "diagnostic_best_raw_kkt_residual": (
+            None if residual is None else float(residual)
+        ),
+        "diagnostic_best_raw_kkt_tolerance": float(certificate.tolerance),
+        "diagnostic_best_raw_certificate_status": (
+            None if status is None else str(status)
+        ),
+    }
 
 
 def analysis_summary(
@@ -89,51 +165,76 @@ def analysis_summary(
     *,
     elapsed_seconds: float,
 ) -> dict[str, object]:
-    """Serialize schema-v3 diagnostics without changing estimator state."""
+    """Serialize schema-v5 status without changing estimator state."""
 
     data = analysis.data
     fit_config = analysis.fit_config
-    profile = fit_config.computation_profile
     result = analysis.selection_result
-    selected_model = result.selected_model
-    raw_reference = analysis.raw_reference
-    raw_fit = analysis.raw_fit
-    parent_raw = analysis.partition_parent_raw
+    candidate = analysis.selected_candidate
     partition = analysis.partition
     refit = analysis.refit
     score = analysis.score
-    selected_lambda = result.selected_lambda_representative
-    optimum_resolved = bool(result.selection_optimum_resolved)
-    selection_contract = fit_config.selection.contract
-    selected_partition_certified = bool(
-        isinstance(partition, FusionPartition) and partition.certified
+    raw_reference = analysis.raw_reference
+    raw_fit = analysis.raw_fit
+    parent_raw = analysis.partition_parent_raw
+    primary = bool(analysis.primary_estimator_available)
+    optimum_resolved = bool(getattr(result, "selection_optimum_resolved", False))
+    selected_lambda = getattr(result, "selected_lambda_representative", None)
+    analysis_tier = (
+        "joint_certified"
+        if primary
+        else (
+            "conditional_partition_refit"
+            if candidate is not None
+            else "unsupported_or_unidentified"
+        )
     )
-    exactness = raw_fit.certificate
-
-    return {
+    summary: dict[str, object] = {
         "summary_schema_version": SUMMARY_SCHEMA_VERSION,
+        "ccf_cluster_ordering_method": CCF_CLUSTER_ORDERING_METHOD,
         "tumor_id": data.tumor_id,
         "input_file": str(analysis.input_file),
-        "computation_profile": str(profile.name),
+        "computation_profile": str(fit_config.computation_profile.name),
+        "analysis_tier": analysis_tier,
+        "primary_estimator_available": primary,
+        "failure_reason": analysis.failure_reason,
         "selection_status": (
-            "resolved" if optimum_resolved else "provisional_unresolved"
+            ("resolved" if optimum_resolved else "provisional_unresolved")
+            if primary
+            else analysis_tier
         ),
-        "selection_contract_id": str(selection_contract.contract_id),
+        "selection_contract_id": str(fit_config.selection.contract.contract_id),
         "selection_optimum_resolved": optimum_resolved,
-        "selection_boundary_unresolved": bool(result.selection_boundary_unresolved),
-        "selection_hits_lower_boundary": bool(result.selection_hits_lower_boundary),
-        "selection_hits_upper_boundary": bool(result.selection_hits_upper_boundary),
+        "selection_boundary_unresolved": bool(
+            getattr(result, "selection_boundary_unresolved", True)
+        ),
+        "selection_hits_lower_boundary": bool(
+            getattr(result, "selection_hits_lower_boundary", False)
+        ),
+        "selection_hits_upper_boundary": bool(
+            getattr(result, "selection_hits_upper_boundary", False)
+        ),
         "selected_lambda": (
             None if selected_lambda is None else float(selected_lambda)
         ),
-        "raw_reference_lambda": float(
-            raw_fit.provenance.lambda_value
+        "raw_reference_lambda": (
+            None if raw_fit is None else float(raw_fit.provenance.lambda_value)
         ),
         "raw_reference_objective_certified": bool(
-            raw_reference.raw_objective_certified
+            raw_reference is not None and raw_reference.raw_objective_certified
         ),
-        "selected_candidate_family": str(selected_model.selected_candidate_family),
-        "selected_partition_source": str(partition.source),
+        "selected_candidate_family": (
+            None
+            if candidate is None
+            else (
+                "raw_fusion"
+                if isinstance(candidate, RawFusionCandidate)
+                else "direct_partition"
+            )
+        ),
+        "selected_partition_source": (
+            None if partition is None else str(partition.source)
+        ),
         "selected_partition_parent_lambda": (
             float(partition.parent_raw_lambda)
             if isinstance(partition, DirectPartition)
@@ -142,110 +243,234 @@ def analysis_summary(
         ),
         "selected_partition_parent_phi_hash": (
             str(partition.parent_raw_phi_hash)
-            if isinstance(partition, DirectPartition) and parent_raw is not None
+            if isinstance(partition, DirectPartition) and partition.parent_raw_phi_hash
             else ""
         ),
         "selected_partition_parent_signature": (
             str(parent_raw.partition.signature) if parent_raw is not None else ""
         ),
-        "selected_n_clusters": int(partition.n_clusters),
-        "selected_partition_signature": str(partition.signature),
-        "selected_partition_certified": selected_partition_certified,
-        "selected_labels_hash": _array_fingerprint(
-            partition.labels,
-            dtype=np.dtype(np.int64),
+        "selected_n_clusters": (
+            None if partition is None else int(partition.n_clusters)
         ),
-        "raw_reference_phi_hash": _array_fingerprint(
-            raw_fit.phi,
-            dtype=np.dtype(np.float64),
+        "selected_partition_signature": (
+            "" if partition is None else str(partition.signature)
         ),
-        "selected_fixed_partition_refit_centers_hash": _array_fingerprint(
-            refit.cluster_centers,
-            dtype=np.dtype(np.float64),
+        "selected_partition_certified": bool(
+            isinstance(partition, FusionPartition) and partition.certified
         ),
-        "selection_score_name": str(score.name),
-        "selection_score": float(score.value),
-        "selection_score_numerical_uncertainty": float(score.numerical_uncertainty),
-        "selection_loglik": float(score.loglik),
-        "selection_df": int(score.degrees_of_freedom),
-        "selection_penalty": float(score.penalty),
-        "selection_n_eff": int(score.n_eff),
-        "selection_assignment_log_evidence": float(score.assignment_log_evidence),
-        "selection_assignment_code_weight": float(score.assignment_code_weight),
-        "selection_assignment_penalty": float(score.assignment_penalty),
-        "selection_assignment_dirichlet_alpha": float(
-            score.assignment_dirichlet_alpha
+        "selected_labels_hash": (
+            ""
+            if partition is None
+            else _array_fingerprint(partition.labels, dtype=np.dtype(np.int64))
         ),
-        "selected_raw_penalized_objective": float(raw_fit.objective.total),
-        "selected_refit_numerically_resolved": bool(refit.refit_numerically_resolved),
+        "raw_reference_phi_hash": (
+            ""
+            if raw_fit is None
+            else _array_fingerprint(raw_fit.phi, dtype=np.dtype(np.float64))
+        ),
+        "selected_fixed_partition_refit_centers_hash": (
+            ""
+            if refit is None
+            else _array_fingerprint(refit.cluster_centers, dtype=np.dtype(np.float64))
+        ),
+        "selection_score_name": None if score is None else str(score.name),
+        "selection_score": None if score is None else float(score.value),
+        "selection_score_numerical_uncertainty": (
+            None if score is None else float(score.numerical_uncertainty)
+        ),
+        "selection_loglik": None if score is None else float(score.loglik),
+        "selection_df": None if score is None else int(score.degrees_of_freedom),
+        "selection_penalty": None if score is None else float(score.penalty),
+        "selection_n_eff": None if score is None else int(score.n_eff),
+        "selection_assignment_log_evidence": (
+            None if score is None else float(score.assignment_log_evidence)
+        ),
+        "selection_assignment_code_weight": (
+            None if score is None else float(score.assignment_code_weight)
+        ),
+        "selection_assignment_penalty": (
+            None if score is None else float(score.assignment_penalty)
+        ),
+        "selection_assignment_dirichlet_alpha": (
+            None if score is None else float(score.assignment_dirichlet_alpha)
+        ),
+        "selected_raw_penalized_objective": (
+            None if raw_fit is None else float(raw_fit.objective.total)
+        ),
+        "selected_refit_numerically_resolved": bool(
+            refit is not None and refit.refit_numerically_resolved
+        ),
         "selected_refit_global_optimum_certified": bool(
-            refit.global_optimum_certified
+            refit is not None and refit.global_optimum_certified
         ),
-        "selected_refit_global_optimality_gap": float(refit.global_optimality_gap),
-        "selected_refit_global_lower_bound": float(refit.global_lower_bound),
-        "selected_refit_global_certificate_method": str(
-            refit.global_certificate_method
+        "selected_refit_global_optimality_gap": (
+            None if refit is None else float(refit.global_optimality_gap)
+        ),
+        "selected_refit_global_lower_bound": (
+            None if refit is None else float(refit.global_lower_bound)
+        ),
+        "selected_refit_global_certificate_method": (
+            None if refit is None else str(refit.global_certificate_method)
         ),
         "selected_raw_solver_primal_tol": float(fit_config.solver.tolerance),
-        "selected_full_kkt_tolerance": float(raw_fit.certificate.tolerance),
-        "selected_full_kkt_residual_method": str(
-            exactness.residual_method
+        "selected_full_kkt_tolerance": (
+            None if raw_fit is None else float(raw_fit.certificate.tolerance)
         ),
-        "selected_working_precision_kkt_residual": float(
-            raw_fit.certificate.working_residual
+        "selected_full_kkt_residual_method": (
+            None if raw_fit is None else str(raw_fit.certificate.residual_method)
         ),
-        "selected_working_dtype": str(
-            raw_fit.certificate.working_dtype
+        "selected_working_precision_kkt_residual": (
+            None if raw_fit is None else float(raw_fit.certificate.working_residual)
         ),
-        "selected_certificate_audit_dtype": str(
-            raw_fit.certificate.audit_dtype
+        "selected_working_dtype": (
+            None if raw_fit is None else str(raw_fit.certificate.working_dtype)
+        ),
+        "selected_certificate_audit_dtype": (
+            None if raw_fit is None else str(raw_fit.certificate.audit_dtype)
         ),
         "selected_precision_polish_applied": bool(
-            raw_fit.certificate.precision_polished
+            raw_fit is not None and raw_fit.certificate.precision_polished
         ),
-        "selected_precision_polish_max_abs_phi_delta": float(
-            raw_fit.certificate.precision_polish_delta
-        ),
-        "selected_base_fusion_objective_hash": str(
-            raw_fit.provenance.base_fusion_objective_hash
-        ),
-        "selected_original_graph_hash": str(raw_fit.provenance.original_graph_hash),
-        "selection_method": str(result.selection_method),
-        "num_candidates": int(result.num_candidates),
-        "num_candidates_certified": int(result.num_candidates_certified),
-        "ward_candidate_pool_complete": bool(result.ward_candidate_pool_complete),
-        "raw_lambda_path_complete": bool(result.raw_lambda_path_resolved),
-        "global_hybrid_optimum_certified": bool(
-            result.global_hybrid_optimum_certified
-        ),
-        "selected_kkt_residual": (
+        "selected_precision_polish_max_abs_phi_delta": (
             None
-            if result.selected_kkt_residual is None
-            else float(result.selected_kkt_residual)
+            if raw_fit is None
+            else float(raw_fit.certificate.precision_polish_delta)
         ),
-        "search_stop_reason": str(result.adaptive_search_stop_reason),
-        "device": str(raw_fit.provenance.device),
-        "dtype": str(raw_fit.provenance.dtype),
+        "selected_base_fusion_objective_hash": (
+            ""
+            if raw_fit is None
+            else str(raw_fit.provenance.base_fusion_objective_hash)
+        ),
+        "selected_original_graph_hash": (
+            "" if raw_fit is None else str(raw_fit.provenance.original_graph_hash)
+        ),
+        "selection_method": str(getattr(result, "selection_method", "none")),
+        "num_candidates": int(getattr(result, "num_candidates", 0)),
+        "num_candidates_certified": int(getattr(result, "num_candidates_certified", 0)),
+        "ward_candidate_pool_complete": bool(
+            getattr(result, "ward_candidate_pool_complete", False)
+        ),
+        "raw_lambda_path_complete": bool(
+            getattr(result, "raw_lambda_path_resolved", False)
+        ),
+        "global_hybrid_optimum_certified": bool(
+            getattr(result, "global_hybrid_optimum_certified", False)
+        ),
+        "selected_kkt_residual": getattr(result, "selected_kkt_residual", None),
+        "search_stop_reason": str(
+            getattr(result, "adaptive_search_stop_reason", "not_recorded")
+        ),
+        "device": None if raw_fit is None else str(raw_fit.provenance.device),
+        "dtype": None if raw_fit is None else str(raw_fit.provenance.dtype),
+        "count_available_fraction": float(np.mean(data.count_available)),
+        "likelihood_supported_fraction": float(np.mean(data.likelihood_supported)),
+        "likelihood_included_fraction": float(np.mean(data.objective_inclusion_mask())),
         "elapsed_seconds": float(elapsed_seconds),
         "software_version": _SOFTWARE_VERSION,
     }
+    summary.update(_raw_summary(analysis.diagnostic_raw_fit))
+    return summary
+
+
+def _remove_exact_outputs(
+    outdir: Path,
+    tumor_id: str,
+    suffixes: tuple[str, ...],
+) -> None:
+    for suffix in suffixes:
+        path = outdir / f"{tumor_id}_{suffix}"
+        if path.is_file() or path.is_symlink():
+            path.unlink()
 
 
 def write_analysis_outputs(
     analysis: AnalysisSerialization,
     *,
     outdir: Path,
+    summary: dict[str, object],
 ) -> None:
-    """Write only the three stable public tables for ``analysis``."""
+    """Write primary compatibility files and universal status-rich outputs."""
 
-    write_fit_outputs(
-        outdir=Path(outdir),
+    destination = Path(outdir)
+    destination.mkdir(parents=True, exist_ok=True)
+    candidate = analysis.selected_candidate
+    raw_fit = analysis.raw_fit
+    diagnostic_raw = analysis.diagnostic_raw_fit
+    primary = bool(analysis.primary_estimator_available)
+    eps = float(
+        analysis.fit_config.eps
+        if diagnostic_raw is None
+        else diagnostic_raw.provenance.likelihood_eps
+    )
+    cluster_region = cluster_region_estimates_table(
         data=analysis.data,
-        raw_fit=analysis.raw_fit,
-        partition=analysis.partition,
-        refit=analysis.refit,
+        candidate=candidate,
+        primary_estimator_available=primary,
+        diagnostic_raw_fit=diagnostic_raw,
+        eps=eps,
         major_prior=float(analysis.fit_config.major_prior),
     )
+    region_status = region_status_table(
+        data=analysis.data,
+        candidate=candidate,
+        primary_estimator_available=primary,
+        diagnostic_raw_fit=diagnostic_raw,
+        failure_reason=analysis.failure_reason,
+    )
+    mutation_region = mutation_region_estimates_table(
+        data=analysis.data,
+        candidate=candidate,
+        primary_estimator_available=primary,
+        eps=eps,
+        major_prior=float(analysis.fit_config.major_prior),
+    )
+    attempts = raw_attempts_table(tuple(analysis.selection_result.search))
+    write_status_outputs(
+        outdir=destination,
+        data=analysis.data,
+        summary=summary,
+        region_status=region_status,
+        raw_attempts=attempts,
+        cluster_region_estimates=cluster_region,
+        mutation_region_estimates=mutation_region,
+    )
+
+    tumor_id = str(analysis.data.tumor_id)
+    if primary:
+        partition = analysis.partition
+        refit = analysis.refit
+        if raw_fit is None or candidate is None or partition is None or refit is None:
+            raise AssertionError(
+                "Primary serialization requires a complete selected model."
+            )
+        _remove_exact_outputs(destination, tumor_id, _SECONDARY_SUFFIXES)
+        write_fit_outputs(
+            outdir=destination,
+            data=analysis.data,
+            raw_fit=raw_fit,
+            partition=partition,
+            refit=refit,
+            major_prior=float(analysis.fit_config.major_prior),
+        )
+        return
+
+    _remove_exact_outputs(destination, tumor_id, _PRIMARY_SUFFIXES)
+    if candidate is not None:
+        secondary_cluster_centers_table(
+            data=analysis.data,
+            candidate=candidate,
+        ).to_csv(
+            destination / f"{tumor_id}_secondary_cluster_centers.tsv",
+            sep="\t",
+            index=False,
+        )
+        mutation_region.to_csv(
+            destination / f"{tumor_id}_secondary_mutation_region_estimates.tsv",
+            sep="\t",
+            index=False,
+        )
+    else:
+        _remove_exact_outputs(destination, tumor_id, _SECONDARY_SUFFIXES)
 
 
 __all__ = [

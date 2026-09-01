@@ -50,9 +50,16 @@ def _observed_positive_depth_mask(data: TumorData) -> np.ndarray:
     by the partition refit numerator so the two never disagree.
     """
     mask = np.asarray(data.total_counts, dtype=np.float64) > 0.0
-    count_observed = getattr(data, "count_observed", None)
-    if count_observed is not None:
-        mask = mask & np.asarray(count_observed, dtype=bool)
+    inclusion_method = getattr(data, "objective_inclusion_mask", None)
+    likelihood_included = (
+        inclusion_method()
+        if callable(inclusion_method)
+        else getattr(data, "likelihood_included", None)
+    )
+    if likelihood_included is None:
+        likelihood_included = getattr(data, "count_observed", None)
+    if likelihood_included is not None:
+        mask = mask & np.asarray(likelihood_included, dtype=bool)
     return mask
 
 

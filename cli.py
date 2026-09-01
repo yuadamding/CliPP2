@@ -26,7 +26,11 @@ from .model_selection.contracts import (
     SELECTION_CONTRACT_IDS,
 )
 from .io.tumor_txt import DEFAULT_DOSAGE_PRIOR_PENALTY
-from .runners.pipeline import process_tumor
+from .runners.pipeline import (
+    DEFAULT_FAILURE_POLICY,
+    FAILURE_POLICIES,
+    process_tumor,
+)
 from .simulation import simulate_tumor
 from .simulation.cli import (
     add_simulation_arguments,
@@ -68,6 +72,17 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--unsupported-policy", choices=["error", "mask"], default="error"
+    )
+    parser.add_argument(
+        "--failure-policy",
+        choices=FAILURE_POLICIES,
+        default=DEFAULT_FAILURE_POLICY,
+        help=(
+            "Behavior when no primary certified estimator is available. "
+            "Best-effort saves the highest valid typed tier; save-diagnostics "
+            "suppresses conditional point estimates; error exits. No policy "
+            "relaxes a certificate gate."
+        ),
     )
     parser.add_argument(
         "--dosage-prior-penalty",
@@ -258,6 +273,7 @@ def main(argv: list[str] | None = None) -> None:
         write_outputs=not args.skip_outputs,
         unsupported_policy=args.unsupported_policy,
         dosage_prior_penalty=args.dosage_prior_penalty,
+        failure_policy=args.failure_policy,
     )
     print(_printable_summary(summary))
 

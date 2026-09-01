@@ -86,6 +86,15 @@ class ScalarGlobalMinimumCertificate:
     globally_certified: bool
     method: str
     intervals_evaluated: int
+    argmin_lower: float | None = None
+    argmin_upper: float | None = None
+    statistically_identified: bool = True
+
+    @property
+    def representative(self) -> float:
+        """Return the finite display representative of the argmin set."""
+
+        return float(self.argmin)
 
 
 def scalar_problem_from_model(
@@ -433,9 +442,26 @@ def certify_scalar_minimum(
     if int(max_intervals) < 1:
         raise ValueError("max_intervals must be positive.")
     if not np.any(problem.observed):
-        beta = float(0.5 * (problem.lower + problem.upper))
+        representative = float(
+            np.clip(
+                0.5 * (problem.lower + problem.upper)
+                if hint is None or not np.isfinite(float(hint))
+                else float(hint),
+                problem.lower,
+                problem.upper,
+            )
+        )
         return ScalarGlobalMinimumCertificate(
-            beta, 0.0, 0.0, 0.0, True, "interval_binomial_mixture_bound_v1", 0
+            representative,
+            0.0,
+            0.0,
+            0.0,
+            True,
+            "flat_unobserved_coordinate_v1",
+            0,
+            argmin_lower=float(problem.lower),
+            argmin_upper=float(problem.upper),
+            statistically_identified=False,
         )
     if problem.upper <= problem.lower:
         loss = float(scalar_loss(problem, problem.lower))
@@ -447,6 +473,9 @@ def certify_scalar_minimum(
             bool(np.isfinite(loss)),
             "fixed_scalar_coordinate_v1",
             1,
+            argmin_lower=float(problem.lower),
+            argmin_upper=float(problem.upper),
+            statistically_identified=bool(np.any(problem.observed)),
         )
     points = np.concatenate(
         (
@@ -521,6 +550,9 @@ def certify_scalar_minimum(
         globally_certified=certified,
         method="interval_binomial_mixture_bound_v1",
         intervals_evaluated=intervals,
+        argmin_lower=float(np.clip(best_beta, problem.lower, problem.upper)),
+        argmin_upper=float(np.clip(best_beta, problem.lower, problem.upper)),
+        statistically_identified=True,
     )
 
 
@@ -551,6 +583,9 @@ class PartitionRefitResult:
     global_certificate_method: str = "none"
     global_certificate_intervals: int = 0
     refit_mode: str = "interval_certified"
+    coordinate_argmin_lower: np.ndarray | None = None
+    coordinate_argmin_upper: np.ndarray | None = None
+    coordinate_statistically_identified: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -563,6 +598,9 @@ class _RefitCoordinateResult:
     globally_certified: bool
     certificate_method: str
     certificate_intervals: int
+    argmin_lower: float
+    argmin_upper: float
+    statistically_identified: bool
     grid_points: int = 0
     grid_spacing: float = 0.0
     best_second_loss_gap: float = float("inf")
@@ -588,7 +626,31 @@ def _fit_coordinate(
     grid_points: int,
     local_steps: int,
     include_breakpoints: bool,
+    hint: float | None = None,
 ) -> _RefitCoordinateResult:
+    if not np.any(problem.observed):
+        representative = float(
+            np.clip(
+                0.5 * (problem.lower + problem.upper)
+                if hint is None or not np.isfinite(float(hint))
+                else float(hint),
+                problem.lower,
+                problem.upper,
+            )
+        )
+        return _RefitCoordinateResult(
+            beta=representative,
+            loss=0.0,
+            global_lower_bound=0.0,
+            optimality_gap=0.0,
+            finite_candidate_found=True,
+            globally_certified=True,
+            certificate_method="flat_unobserved_coordinate_v1",
+            certificate_intervals=0,
+            argmin_lower=float(problem.lower),
+            argmin_upper=float(problem.upper),
+            statistically_identified=False,
+        )
     if mode == "interval_certified":
         result = certify_scalar_minimum(
             problem,
@@ -604,6 +666,9 @@ def _fit_coordinate(
             globally_certified=bool(result.globally_certified),
             certificate_method=str(result.method),
             certificate_intervals=int(result.intervals_evaluated),
+            argmin_lower=float(result.argmin_lower),
+            argmin_upper=float(result.argmin_upper),
+            statistically_identified=bool(result.statistically_identified),
         )
     result = approximate_scalar_minimum(
         problem,
@@ -620,6 +685,9 @@ def _fit_coordinate(
         globally_certified=False,
         certificate_method=str(result.method),
         certificate_intervals=0,
+        argmin_lower=float(result.argmin),
+        argmin_upper=float(result.argmin),
+        statistically_identified=True,
         grid_points=int(result.grid_points_evaluated),
         grid_spacing=float(result.final_grid_spacing),
         best_second_loss_gap=float(result.best_second_loss_gap),
@@ -673,6 +741,9 @@ def partition_constrained_observed_refit(
     upper_matrix = model.upper
     observed = model.observed & ((model.alt + model.nonalt) > 0.0)
     centers = np.zeros((n_clusters, n_regions), dtype=np.float64)
+    argmin_lower = np.zeros((n_clusters, n_regions), dtype=np.float64)
+    argmin_upper = np.zeros((n_clusters, n_regions), dtype=np.float64)
+    statistically_identified = np.zeros((n_clusters, n_regions), dtype=bool)
     coordinate_lower = np.zeros((n_clusters, n_regions), dtype=np.float64)
     coordinate_certified = np.ones((n_clusters, n_regions), dtype=bool)
     certificate_methods: set[str] = set()
@@ -709,8 +780,14 @@ def partition_constrained_observed_refit(
                 grid_points=scalar_grid_points,
                 local_steps=scalar_local_steps,
                 include_breakpoints=data.path_likelihood is not None,
+                hint=float(np.mean(np.asarray(data.phi_init)[members, region])),
             )
             centers[cluster, region] = coordinate.beta
+            argmin_lower[cluster, region] = coordinate.argmin_lower
+            argmin_upper[cluster, region] = coordinate.argmin_upper
+            statistically_identified[cluster, region] = (
+                coordinate.statistically_identified
+            )
             coordinate_lower[cluster, region] = coordinate.global_lower_bound
             coordinate_certified[cluster, region] = coordinate.globally_certified
             certificate_intervals += coordinate.certificate_intervals
@@ -796,4 +873,7 @@ def partition_constrained_observed_refit(
         ),
         global_certificate_intervals=int(certificate_intervals),
         refit_mode=mode,
+        coordinate_argmin_lower=argmin_lower,
+        coordinate_argmin_upper=argmin_upper,
+        coordinate_statistically_identified=statistically_identified,
     )

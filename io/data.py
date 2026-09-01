@@ -199,11 +199,133 @@ class TumorData:
     phi_upper: np.ndarray  # float64 (M, S)
     phi_init: np.ndarray  # float64 (M, S)
     init_major_mask: np.ndarray  # bool (M, S)
-    count_observed: np.ndarray | None = (
-        None  # bool (M, S) — True if counts observed; None means all observed
-    )
+    # ``count_observed`` is retained as a constructor/API compatibility alias
+    # for ``count_available``.  It describes whether the input supplied read
+    # counts; it must never be rewritten merely because the current
+    # likelihood cannot model a local copy-number state.
+    count_observed: np.ndarray | None = None
     path_likelihood: PathLikelihoodSpec | None = None
     path_unsupported_reason: np.ndarray | None = None
+    count_available: np.ndarray | None = None
+    likelihood_supported: np.ndarray | None = None
+    likelihood_included: np.ndarray | None = None
+    likelihood_exclusion_reason: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        shape = tuple(np.asarray(self.alt_counts).shape)
+        if len(shape) != 2 or shape != tuple(np.asarray(self.total_counts).shape):
+            raise ValueError(
+                "TumorData alt_counts and total_counts must have one 2-D shape."
+            )
+
+        legacy_available = self.count_observed
+        explicit_available = self.count_available
+        if explicit_available is None:
+            available = (
+                np.ones(shape, dtype=bool)
+                if legacy_available is None
+                else np.asarray(legacy_available, dtype=bool)
+            )
+        else:
+            available = np.asarray(explicit_available, dtype=bool)
+            if legacy_available is not None and not np.array_equal(
+                available,
+                np.asarray(legacy_available, dtype=bool),
+            ):
+                raise ValueError(
+                    "count_observed and count_available must agree when both "
+                    "are supplied."
+                )
+        if tuple(available.shape) != shape:
+            raise ValueError(f"count_available must have shape {shape}.")
+
+        legacy_reason_value = self.path_unsupported_reason
+        if self.likelihood_supported is None:
+            supported = np.ones(shape, dtype=bool)
+            if legacy_reason_value is not None:
+                legacy_reason_array = np.asarray(legacy_reason_value, dtype=object)
+                if tuple(legacy_reason_array.shape) != shape:
+                    raise ValueError(
+                        f"path_unsupported_reason must have shape {shape}."
+                    )
+                supported = np.equal(legacy_reason_array, None)  # noqa: E711
+        else:
+            supported = np.asarray(self.likelihood_supported, dtype=bool)
+        if tuple(supported.shape) != shape:
+            raise ValueError(f"likelihood_supported must have shape {shape}.")
+        included = (
+            available & supported
+            if self.likelihood_included is None
+            else np.asarray(self.likelihood_included, dtype=bool)
+        )
+        if tuple(included.shape) != shape:
+            raise ValueError(f"likelihood_included must have shape {shape}.")
+        if np.any(included & (~available | ~supported)):
+            raise ValueError(
+                "likelihood_included may be true only where counts are available "
+                "and the likelihood is supported."
+            )
+
+        legacy_reason = legacy_reason_value
+        explicit_reason = self.likelihood_exclusion_reason
+        if explicit_reason is None:
+            reasons = (
+                np.full(shape, None, dtype=object)
+                if legacy_reason is None
+                else np.asarray(legacy_reason, dtype=object)
+            )
+        else:
+            reasons = np.asarray(explicit_reason, dtype=object)
+            if legacy_reason is not None:
+                legacy = np.asarray(legacy_reason, dtype=object)
+                legacy_present = ~np.equal(legacy, None)  # noqa: E711
+                if tuple(legacy.shape) != shape or np.any(
+                    legacy_present
+                    & ~np.equal(legacy, reasons)
+                ):
+                    raise ValueError(
+                        "path_unsupported_reason and likelihood_exclusion_reason "
+                        "must agree on every legacy support failure."
+                    )
+        if tuple(reasons.shape) != shape:
+            raise ValueError(f"likelihood_exclusion_reason must have shape {shape}.")
+
+        # Reject contradictory provenance rather than silently erasing it.
+        # Keep a reason for available-but-excluded coordinates so diagnostics
+        # retain the precise model/data-policy boundary.
+        reasons = np.array(reasons, dtype=object, copy=True)
+        if np.any(included & ~np.equal(reasons, None)):  # noqa: E711
+            raise ValueError(
+                "Included likelihood coordinates cannot have an exclusion reason."
+            )
+        reason_missing = np.equal(reasons, None)  # noqa: E711
+        reasons[(~supported) & reason_missing] = "LIKELIHOOD_UNSUPPORTED"
+        reason_missing = np.equal(reasons, None)  # noqa: E711
+        reasons[(~available) & reason_missing] = "COUNT_UNAVAILABLE"
+        reason_missing = np.equal(reasons, None)  # noqa: E711
+        reasons[(~included) & reason_missing] = "LIKELIHOOD_EXCLUDED_BY_POLICY"
+
+        self.count_available = np.array(available, dtype=bool, copy=True)
+        self.count_observed = self.count_available
+        self.likelihood_supported = np.array(supported, dtype=bool, copy=True)
+        self.likelihood_included = np.array(included, dtype=bool, copy=True)
+        self.likelihood_exclusion_reason = reasons
+        # Compatibility alias for consumers that predate the three-mask
+        # contract.  Keep only model-support failures under the old name.
+        self.path_unsupported_reason = np.where(~supported, reasons, None)
+
+    def objective_inclusion_mask(self) -> np.ndarray:
+        """Return the authoritative mask used by likelihood and score code.
+
+        Legacy programmatic callers sometimes rebind ``count_observed`` after
+        construction. Preserve its masking behavior without allowing it to
+        re-enable an explicitly excluded or unsupported coordinate.
+        """
+
+        available = np.asarray(self.count_observed, dtype=bool)
+        if available.shape != np.asarray(self.alt_counts).shape:
+            raise ValueError("count_observed shape no longer matches tumor counts.")
+        return available & np.asarray(self.likelihood_included, dtype=bool)
 
     @property
     def num_mutations(self) -> int:
@@ -280,14 +402,21 @@ def tumor_data_fingerprint(data: TumorData) -> str:
         "init_major_mask",
     ):
         _hash_array(digest, name, getattr(data, name))
-    count_observed = getattr(data, "count_observed", None)
+    count_available = getattr(data, "count_available", None)
     _hash_array(
         digest,
         "count_observed",
         np.ones_like(np.asarray(data.alt_counts), dtype=bool)
-        if count_observed is None
-        else np.asarray(count_observed, dtype=bool),
+        if count_available is None
+        else np.asarray(count_available, dtype=bool),
     )
+    supported = np.asarray(data.likelihood_supported, dtype=bool)
+    included = np.asarray(data.objective_inclusion_mask(), dtype=bool)
+    available = np.asarray(data.count_available, dtype=bool)
+    if not np.all(supported) or not np.array_equal(included, available):
+        _hash_text(digest, "likelihood-mask-schema-v1")
+        _hash_array(digest, "likelihood_supported", supported)
+        _hash_array(digest, "likelihood_included", included)
     path_likelihood = getattr(data, "path_likelihood", None)
     if path_likelihood is not None:
         path_likelihood.validate_observation_shape(

@@ -516,7 +516,9 @@ def _build_tumor_data(
     shape = (len(mutation_ids), len(sample_ids))
     alt_counts = np.zeros(shape, dtype=np.float64)
     total_counts = np.zeros(shape, dtype=np.float64)
-    count_observed = np.zeros(shape, dtype=bool)
+    count_available = np.zeros(shape, dtype=bool)
+    likelihood_supported = np.ones(shape, dtype=bool)
+    likelihood_included = np.zeros(shape, dtype=bool)
     purity = np.empty(shape, dtype=np.float64)
     normal_cn = np.empty(shape, dtype=np.float64)
     major_cn = np.empty(shape, dtype=np.float64)
@@ -534,7 +536,7 @@ def _build_tumor_data(
         i = mutation_index[mutation_id]
         j = sample_index[sample_id]
         row = rows[0]
-        count_observed[i, j] = bool(row["count_observed"])
+        count_available[i, j] = bool(row["count_observed"])
         if row["count_observed"]:
             assert row["alt_count"] is not None and row["ref_count"] is not None
             alt_counts[i, j] = float(row["alt_count"])
@@ -585,16 +587,17 @@ def _build_tumor_data(
                     segment_id=row["segment_id"],
                     detail=detail,
                 )
-            count_observed[i, j] = False
+            likelihood_supported[i, j] = False
             unsupported_reason[i, j] = reason
             compiled = CompiledPathSet(
                 paths=((1.0, 1.0, 1.0),),
                 log_prior=(0.0,),
             )
+        likelihood_included[i, j] = bool(
+            count_available[i, j] and likelihood_supported[i, j]
+        )
         compiled_units[i][j] = compiled
 
-    alt_counts = np.where(count_observed, alt_counts, 0.0)
-    total_counts = np.where(count_observed, total_counts, 0.0)
     denominator = (1.0 - purity) * normal_cn + purity * mean_total_cn
     if np.any(~np.isfinite(denominator)) or np.any(denominator <= 0.0):
         raise TumorTxtError(
@@ -634,9 +637,13 @@ def _build_tumor_data(
         phi_upper=phi_upper,
         phi_init=np.full(shape, 0.5, dtype=np.float64),
         init_major_mask=np.zeros(shape, dtype=bool),
-        count_observed=count_observed,
+        count_observed=count_available,
         path_likelihood=path_likelihood,
         path_unsupported_reason=unsupported_reason,
+        count_available=count_available,
+        likelihood_supported=likelihood_supported,
+        likelihood_included=likelihood_included,
+        likelihood_exclusion_reason=unsupported_reason,
     )
 
     if uses_path_likelihood:

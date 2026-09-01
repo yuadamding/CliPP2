@@ -18,6 +18,7 @@ from ..model_selection.types import (
     FusionPartition,
     PartitionRefitSummary,
 )
+from .cluster_order import ccf_cluster_order
 
 SelectedPartition = FusionPartition | DirectPartition
 
@@ -61,25 +62,20 @@ def _validate_identity(
 
 
 def _path_supported_mask(data: TumorData, shape: tuple[int, int]) -> np.ndarray:
-    reasons = data.path_unsupported_reason
-    if reasons is None:
-        return np.ones(shape, dtype=bool)
-    reason_array = np.asarray(reasons, dtype=object)
-    if tuple(reason_array.shape) != tuple(shape):
-        raise ValueError("path_unsupported_reason shape does not match observations.")
-    supported = np.asarray(pd.isna(reason_array), dtype=bool)
-    count_observed = data.count_observed
-    observed = (
-        np.ones(shape, dtype=bool)
-        if count_observed is None
-        else np.asarray(count_observed, dtype=bool)
-    )
-    if tuple(observed.shape) != tuple(shape):
-        raise ValueError("count_observed shape does not match observations.")
-    if np.any((~supported) & observed):
-        raise ValueError(
-            "Every path_unsupported_reason must correspond to count_observed=False."
-        )
+    value = getattr(data, "likelihood_supported", None)
+    if value is None:
+        reasons = data.path_unsupported_reason
+        if reasons is None:
+            return np.ones(shape, dtype=bool)
+        reason_array = np.asarray(reasons, dtype=object)
+        if tuple(reason_array.shape) != tuple(shape):
+            raise ValueError(
+                "path_unsupported_reason shape does not match observations."
+            )
+        return np.asarray(pd.isna(reason_array), dtype=bool)
+    supported = np.array(value, dtype=bool, copy=True)
+    if tuple(supported.shape) != tuple(shape):
+        raise ValueError("likelihood_supported shape does not match observations.")
     return supported
 
 
@@ -88,17 +84,53 @@ def _path_summary_for_profile(
     phi: np.ndarray,
     *,
     eps: float,
+    reportable: np.ndarray | None = None,
 ) -> dict[str, np.ndarray] | None:
     spec = data.path_likelihood
     if spec is None:
         return None
     posterior = path_posterior_at_phi_numpy(data, phi, eps=float(eps))
+    included = np.asarray(data.objective_inclusion_mask(), dtype=bool)
+    supported = _path_supported_mask(data, spec.shape[:2])
+    if reportable is not None:
+        eligible = np.asarray(reportable, dtype=bool)
+        if tuple(eligible.shape) != tuple(spec.shape[:2]):
+            raise ValueError("reportable path mask does not match observations.")
+        supported &= eligible
+    supported &= included
     return summarize_path_posterior_numpy(
         spec,
         phi=np.asarray(phi, dtype=np.float64),
         posterior=np.asarray(posterior, dtype=np.float64),
-        supported=_path_supported_mask(data, spec.shape[:2]),
+        supported=supported,
     )
+
+
+def _refit_identification_mask(
+    refit: PartitionRefitSummary,
+    labels: np.ndarray,
+    shape: tuple[int, int],
+) -> np.ndarray:
+    identified = getattr(refit, "coordinate_statistically_identified", None)
+    if identified is None:
+        return np.ones(shape, dtype=bool)
+    coordinate = np.asarray(identified, dtype=bool)
+    expected = (int(np.max(labels)) + 1, shape[1])
+    if tuple(coordinate.shape) != expected:
+        raise ValueError(
+            "refit coordinate identification shape does not match its partition."
+        )
+    return coordinate[labels]
+
+
+def _cluster_order(
+    refit: PartitionRefitSummary,
+    centers: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    identified = getattr(refit, "coordinate_statistically_identified", None)
+    if identified is None:
+        raise ValueError("refit coordinate identification is required for ordering.")
+    return ccf_cluster_order(centers, statistically_identified=identified)
 
 
 def mutation_output_table(
@@ -109,11 +141,15 @@ def mutation_output_table(
 ) -> pd.DataFrame:
     labels = _validate_identity(raw_fit, partition, refit)
     refit_phi = _validated_profile(data, refit.phi, name="refit.phi")
+    ordered_labels, _distances, _counts = _cluster_order(
+        refit, refit.cluster_centers
+    )
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, data.num_mutations),
             "mutation_id": data.mutation_ids,
             "cluster_label": labels + 1,
+            "ccf_ordered_cluster_label": ordered_labels[labels],
         }
     )
     for column, region_id in enumerate(data.region_ids):
@@ -137,10 +173,14 @@ def cluster_output_table(
     if centers.shape != expected or not np.all(np.isfinite(centers)):
         raise ValueError(f"refit.cluster_centers must have shape {expected}.")
     sizes = np.bincount(labels, minlength=int(partition.n_clusters))
+    ordered_labels, distances, identified_counts = _cluster_order(refit, centers)
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, partition.n_clusters),
             "cluster_label": np.arange(1, partition.n_clusters + 1, dtype=int),
+            "ccf_ordered_cluster_label": ordered_labels,
+            "ccf_distance_to_one": distances,
+            "ccf_distance_identified_region_count": identified_counts,
             "cluster_size": sizes,
         }
     )
@@ -157,6 +197,7 @@ def _add_legacy_multiplicity(
     phi: np.ndarray,
     major_prior: float,
     eps: float,
+    reportable: np.ndarray,
 ) -> None:
     posterior = infer_multiplicity_posterior_numpy(
         data,
@@ -164,12 +205,19 @@ def _add_legacy_multiplicity(
         major_prior=float(major_prior),
         eps=float(eps),
     )
-    table["multiplicity_estimated"] = posterior.estimation_mask.reshape(
-        -1
-    ).astype(int)
-    table["gamma_major"] = posterior.gamma_major.reshape(-1)
-    table["major_call"] = posterior.major_call.reshape(-1).astype(int)
-    table["multiplicity_call"] = posterior.multiplicity_call.reshape(-1)
+    eligible = np.asarray(reportable, dtype=bool).reshape(-1)
+    estimated = posterior.estimation_mask.reshape(-1).astype(int)
+    gamma = posterior.gamma_major.reshape(-1)
+    major = posterior.major_call.reshape(-1).astype(int)
+    multiplicity = posterior.multiplicity_call.reshape(-1)
+    table["multiplicity_estimated"] = pd.array(
+        np.where(eligible, estimated, None), dtype="Int64"
+    )
+    table["gamma_major"] = np.where(eligible, gamma, np.nan)
+    table["major_call"] = pd.array(
+        np.where(eligible, major, None), dtype="Int64"
+    )
+    table["multiplicity_call"] = np.where(eligible, multiplicity, np.nan)
 
 
 def _add_path_summary(
@@ -211,6 +259,13 @@ def mutation_region_output_table(
 ) -> pd.DataFrame:
     labels = _validate_identity(raw_fit, partition, refit)
     refit_phi = _validated_profile(data, refit.phi, name="refit.phi")
+    ordered_labels, _distances, _counts = _cluster_order(
+        refit, refit.cluster_centers
+    )
+    identified = _refit_identification_mask(refit, labels, refit_phi.shape)
+    reportable = (
+        np.asarray(data.objective_inclusion_mask(), dtype=bool) & identified
+    )
     mutation_ids = np.repeat(
         np.asarray(data.mutation_ids, dtype=object), data.num_regions
     )
@@ -224,6 +279,9 @@ def mutation_region_output_table(
             "mutation_id": mutation_ids,
             "region_id": region_ids,
             "cluster_label": np.repeat(labels + 1, data.num_regions),
+            "ccf_ordered_cluster_label": np.repeat(
+                ordered_labels[labels], data.num_regions
+            ),
             "phi": refit_phi.reshape(-1),
             "major_cn": data.major_cn.reshape(-1),
             "minor_cn": data.minor_cn.reshape(-1),
@@ -237,19 +295,25 @@ def mutation_region_output_table(
             phi=refit_phi,
             major_prior=major_prior,
             eps=eps,
+            reportable=reportable,
         )
     else:
-        refit_summary = _path_summary_for_profile(data, refit_phi, eps=eps)
+        refit_summary = _path_summary_for_profile(
+            data,
+            refit_phi,
+            eps=eps,
+            reportable=identified,
+        )
         if refit_summary is None:
             raise AssertionError("Path likelihood did not produce a refit summary.")
         _add_path_summary(table, refit_summary)
-        supported = refit_summary["supported"].reshape(-1)
-        table["path_supported"] = supported.astype(int)
+        path_supported = _path_supported_mask(data, refit_phi.shape).reshape(-1)
+        table["path_supported"] = path_supported.astype(int)
         reasons = data.path_unsupported_reason
         if reasons is not None:
             reason = np.asarray(reasons, dtype=object).reshape(-1)
             table["path_unsupported_reason"] = pd.array(
-                np.where(supported, None, reason), dtype="string"
+                np.where(path_supported, None, reason), dtype="string"
             )
     return table
 

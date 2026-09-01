@@ -497,43 +497,47 @@ class OnlineLambdaController:
     ) -> OnlineLambdaProposal | None:
         """Return the next geometric lambda for raw-provenance bootstrap.
 
-        A higher lambda is preferred because its stronger fusion penalty is a
-        numerically simpler certification target.  Successive failures move to
-        ``initial_lambda * exp(1)``, ``* exp(2)``, and so on.  The corresponding
-        lower anchors are deterministic boundary fallbacks.  The runner
-        evaluates each proposal at recovery effort with independent guide,
-        zero-penalty, and pooled starts.
+        A higher lambda is tried first because its stronger fusion penalty is a
+        numerically simpler certification target. Distinct probes then
+        alternate around the initial value at offsets ``+1, -1, +2, -2, ...``
+        in log-lambda space. This keeps the nearest lower anchor from being
+        skipped and treats clipped boundary duplicates deterministically. The
+        runner evaluates each proposal at recovery effort with independent
+        guide, zero-penalty, and pooled starts.
         """
 
         if failed is None or len(self._bootstrap_anchor_keys) >= int(
             self.config.max_bootstrap_anchor_lambdas
         ):
             return None
-        anchor_index = int(len(self._bootstrap_anchor_keys) + 1)
-        for direction in (1.0, -1.0):
-            candidate = float(
-                min(
-                    max(
-                        float(self.initial_lambda)
-                        * exp(direction * float(anchor_index)),
-                        float(self.config.lambda_min),
-                    ),
-                    float(self.config.lambda_max),
+        for distance in range(
+            1,
+            int(self.config.max_bootstrap_anchor_lambdas) + 1,
+        ):
+            for direction in (1.0, -1.0):
+                candidate = float(
+                    min(
+                        max(
+                            float(self.initial_lambda)
+                            * exp(direction * float(distance)),
+                            float(self.config.lambda_min),
+                        ),
+                        float(self.config.lambda_max),
+                    )
                 )
-            )
-            key = _lambda_key(candidate)
-            if (
-                key == _lambda_key(float(failed.lambda_value))
-                or key in self._attempted_lambda
-            ):
-                continue
-            return OnlineLambdaProposal(
-                lambda_value=candidate,
-                phase="bootstrap_certification_anchor",
-                reason="initial_lambda_uncertified_probe_distinct_anchor",
-                warm_start_lambda=None,
-                retry_number=0,
-            )
+                key = _lambda_key(candidate)
+                if (
+                    key == _lambda_key(float(failed.lambda_value))
+                    or key in self._attempted_lambda
+                ):
+                    continue
+                return OnlineLambdaProposal(
+                    lambda_value=candidate,
+                    phase="bootstrap_certification_anchor",
+                    reason="initial_lambda_uncertified_probe_distinct_anchor",
+                    warm_start_lambda=None,
+                    retry_number=0,
+                )
         return None
 
     def _choose_from_certified_path(self) -> OnlineLambdaProposal | None:

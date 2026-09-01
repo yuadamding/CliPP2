@@ -312,6 +312,23 @@ def _build_refit_summary(
         global_optimality_gap=float(refit.global_optimality_gap),
         global_certificate_method=str(refit.global_certificate_method),
         refit_mode=str(refit.refit_mode),
+        coordinate_argmin_lower=(
+            None
+            if refit.coordinate_argmin_lower is None
+            else np.asarray(refit.coordinate_argmin_lower, dtype=np.float64).copy()
+        ),
+        coordinate_argmin_upper=(
+            None
+            if refit.coordinate_argmin_upper is None
+            else np.asarray(refit.coordinate_argmin_upper, dtype=np.float64).copy()
+        ),
+        coordinate_statistically_identified=(
+            None
+            if refit.coordinate_statistically_identified is None
+            else np.asarray(
+                refit.coordinate_statistically_identified, dtype=bool
+            ).copy()
+        ),
     )
 
 

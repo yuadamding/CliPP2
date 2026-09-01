@@ -1903,7 +1903,10 @@ def _fit_from_start(
                     phi=inner_phi_start,
                     dual=inner_dual_start,
                     dual_start_is_actual=inner_dual_start_is_actual,
-                    spectral_rho=bool(require_full_step_backtracking),
+                    spectral_rho=bool(
+                        require_full_step_backtracking
+                        or (use_alm and use_backward_error_progress)
+                    ),
                     use_backward_error_stopping=use_backward_error_progress,
                     pdhg_tau_node=tensor_graph.pdhg_tau_node,
                     backend_name=dense_inner_solver,

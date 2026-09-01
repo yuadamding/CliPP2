@@ -7,9 +7,24 @@ import numpy as np
 import torch
 
 from ..core.bic import SelectionScore
-from ..core.fusion.types import RawFit
+from ..core.fusion.types import RawFit, SolverState
 
 StartArray = np.ndarray | torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class SolveOutcome:
+    """A durable scalar fit paired with transient continuation state."""
+
+    fit: RawFit
+    state: SolverState | None
+
+    def __post_init__(self) -> None:
+        if getattr(self.fit, "state", None) is not None:
+            raise ValueError("SolveOutcome.fit must not retain SolverState.")
+        certificate = getattr(self.fit, "certificate", None)
+        if getattr(certificate, "witness", None) is not None:
+            raise ValueError("SolveOutcome.fit must not retain a certificate witness.")
 
 
 def _immutable_array(values: np.ndarray, *, dtype: np.dtype) -> np.ndarray:
@@ -63,6 +78,9 @@ class PartitionRefitSummary:
     global_optimality_gap: float = float("inf")
     global_certificate_method: str = "none"
     refit_mode: str = "interval_certified"
+    coordinate_argmin_lower: np.ndarray | None = None
+    coordinate_argmin_upper: np.ndarray | None = None
+    coordinate_statistically_identified: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.global_optimum_certified and (
@@ -86,6 +104,45 @@ class PartitionRefitSummary:
             self,
             "cluster_centers",
             _immutable_array(self.cluster_centers, dtype=np.dtype(np.float64)),
+        )
+        center_shape = tuple(np.asarray(self.cluster_centers).shape)
+        lower = (
+            np.asarray(self.cluster_centers, dtype=np.float64)
+            if self.coordinate_argmin_lower is None
+            else np.asarray(self.coordinate_argmin_lower, dtype=np.float64)
+        )
+        upper = (
+            np.asarray(self.cluster_centers, dtype=np.float64)
+            if self.coordinate_argmin_upper is None
+            else np.asarray(self.coordinate_argmin_upper, dtype=np.float64)
+        )
+        identified = (
+            np.ones(center_shape, dtype=bool)
+            if self.coordinate_statistically_identified is None
+            else np.asarray(self.coordinate_statistically_identified, dtype=bool)
+        )
+        if tuple(lower.shape) != center_shape or tuple(upper.shape) != center_shape:
+            raise ValueError("Refit argmin intervals must match cluster_centers.")
+        if tuple(identified.shape) != center_shape:
+            raise ValueError("Refit identification flags must match cluster_centers.")
+        if np.any(~np.isfinite(lower)) or np.any(~np.isfinite(upper)) or np.any(
+            lower > upper
+        ):
+            raise ValueError("Refit argmin intervals must be finite and ordered.")
+        object.__setattr__(
+            self,
+            "coordinate_argmin_lower",
+            _immutable_array(lower, dtype=np.dtype(np.float64)),
+        )
+        object.__setattr__(
+            self,
+            "coordinate_argmin_upper",
+            _immutable_array(upper, dtype=np.dtype(np.float64)),
+        )
+        object.__setattr__(
+            self,
+            "coordinate_statistically_identified",
+            _immutable_array(identified, dtype=np.dtype(bool)),
         )
 
 
@@ -219,10 +276,14 @@ class CandidateRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class RawAttemptTrace:
-    """Failure-relevant provenance for one authorized raw optimizer start."""
+class RawAttemptSummary:
+    """Tensor-free provenance for one authorized raw optimizer start.
 
-    fit: RawFit
+    Retry ownership ends with the adaptive search.  Durable candidate traces
+    retain the scalar evidence needed for diagnostics and serialization, but
+    never another ``RawFit``, fitted Phi, solver state, or certificate witness.
+    """
+
     source: str
     start_value: float
     breakpoint_escape_changed_count: int
@@ -230,7 +291,153 @@ class RawAttemptTrace:
     outer_max_iter: int
     inner_max_iter: int
     certificate_max_iter: int
+    objective: float
+    lambda_value: float
+    stationarity: float
+    edge_subgradient: float
+    dual_ball: float
+    box: float
+    kkt_residual: float
+    kkt_tolerance: float
+    certificate_status: str
+    certificate_admissible: bool
+    working_dtype: str
+    audit_dtype: str
+    precision_polished: bool
+    precision_polish_delta: float
+    mm_consistency_violations: int
+    stage_outer_iterations: int
+    stage_outer_max_iter: int
+    stage_inner_iterations: int
+    stage_inner_max_iter: int
+    stage_inner_solve_calls: int
+    stop_reason: str
+    progress_residual_method: str
+    solve_tolerance: float
+    legacy_stop_kkt_residual: float
+    componentwise_stop_kkt_residual: float
+    accepted_full_steps: int
+    accepted_damped_steps: int
+    rejected_outer_steps: int
+    work_inner_iterations: int
+    work_certificate_iterations: int
+    device: str
+    dtype: str
+    objective_spec_hash: str
+    original_graph_hash: str
+    certificate_problem_hash: str
+    fallback_reason: str
     promotion_status: str = "not_recorded"
+
+    @classmethod
+    def from_fit(
+        cls,
+        fit: RawFit,
+        *,
+        source: str,
+        start_value: float,
+        breakpoint_escape_changed_count: int,
+        mathematically_certified: bool,
+        outer_max_iter: int,
+        inner_max_iter: int,
+        certificate_max_iter: int,
+        promotion_status: str = "not_recorded",
+    ) -> "RawAttemptSummary":
+        certificate = fit.certificate
+        components = certificate.components
+        convergence = fit.convergence
+        work = fit.work
+        provenance = fit.provenance
+        return cls(
+            source=str(source),
+            start_value=float(start_value),
+            breakpoint_escape_changed_count=int(breakpoint_escape_changed_count),
+            mathematically_certified=bool(mathematically_certified),
+            outer_max_iter=int(outer_max_iter),
+            inner_max_iter=int(inner_max_iter),
+            certificate_max_iter=int(certificate_max_iter),
+            objective=float(fit.objective.total),
+            lambda_value=float(provenance.lambda_value),
+            stationarity=float(components.stationarity),
+            edge_subgradient=float(components.edge_subgradient),
+            dual_ball=float(components.dual_ball),
+            box=float(components.box),
+            kkt_residual=float(components.residual),
+            kkt_tolerance=float(certificate.tolerance),
+            certificate_status=str(certificate.status),
+            certificate_admissible=bool(certificate.admissible),
+            working_dtype=str(certificate.working_dtype),
+            audit_dtype=str(certificate.audit_dtype),
+            precision_polished=bool(certificate.precision_polished),
+            precision_polish_delta=float(certificate.precision_polish_delta),
+            mm_consistency_violations=int(convergence.mm_consistency_violations),
+            stage_outer_iterations=int(
+                getattr(
+                    convergence,
+                    "stage_outer_iterations",
+                    getattr(convergence, "iterations", 0),
+                )
+            ),
+            stage_outer_max_iter=int(
+                getattr(convergence, "stage_outer_max_iter", outer_max_iter)
+            ),
+            stage_inner_iterations=int(
+                getattr(
+                    convergence,
+                    "stage_inner_iterations",
+                    getattr(work, "inner_iterations", 0),
+                )
+            ),
+            stage_inner_max_iter=int(
+                getattr(convergence, "stage_inner_max_iter", inner_max_iter)
+            ),
+            stage_inner_solve_calls=int(
+                getattr(convergence, "stage_inner_solve_calls", 0)
+            ),
+            stop_reason=str(getattr(convergence, "stop_reason", "not_recorded")),
+            progress_residual_method=str(
+                getattr(convergence, "progress_residual_method", "not_recorded")
+            ),
+            solve_tolerance=float(
+                getattr(convergence, "solve_tolerance", float("nan"))
+            ),
+            legacy_stop_kkt_residual=float(
+                getattr(convergence, "legacy_stop_kkt_residual", float("inf"))
+            ),
+            componentwise_stop_kkt_residual=float(
+                getattr(
+                    convergence,
+                    "componentwise_stop_kkt_residual",
+                    float("inf"),
+                )
+            ),
+            accepted_full_steps=int(
+                getattr(convergence, "accepted_full_steps", 0)
+            ),
+            accepted_damped_steps=int(
+                getattr(convergence, "accepted_damped_steps", 0)
+            ),
+            rejected_outer_steps=int(
+                getattr(convergence, "rejected_outer_steps", 0)
+            ),
+            work_inner_iterations=int(getattr(work, "inner_iterations", 0)),
+            work_certificate_iterations=int(
+                getattr(work, "certificate_iterations", 0)
+            ),
+            device=str(getattr(provenance, "device", "not_recorded")),
+            dtype=str(getattr(provenance, "dtype", "not_recorded")),
+            objective_spec_hash=str(
+                getattr(provenance, "objective_spec_hash", "")
+            ),
+            original_graph_hash=str(
+                getattr(provenance, "original_graph_hash", "")
+            ),
+            certificate_problem_hash=str(
+                getattr(provenance, "certificate_problem_hash", "")
+            ),
+            fallback_reason=str(certificate.fallback_reason),
+            promotion_status=str(promotion_status),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,7 +449,7 @@ class CandidateTrace:
     start_source: str = "not_applicable"
     start_value: float | None = None
     breakpoint_escape_changed_count: int = 0
-    raw_attempts: tuple[RawAttemptTrace, ...] = ()
+    raw_attempts: tuple[RawAttemptSummary, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,3 +567,153 @@ class BICSelectionResult:
     ward_candidate_pool_complete: bool = False
     raw_lambda_path_resolved: bool = False
     global_hybrid_optimum_certified: bool = False
+
+    @property
+    def primary_estimator_available(self) -> bool:
+        return True
+
+
+def _validate_outcome_search(
+    search: tuple[SearchCandidate, ...],
+    *,
+    require_selected: bool,
+) -> SearchCandidate | None:
+    candidate_ids = [int(item.candidate_id) for item in search]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise ValueError("Selection outcome candidate IDs must be unique.")
+    selected = [item for item in search if bool(item.selected)]
+    expected = 1 if require_selected else 0
+    if len(selected) != expected:
+        raise ValueError(
+            f"Selection outcome must contain exactly {expected} selected candidate(s)."
+        )
+    return selected[0] if selected else None
+
+
+def _validate_best_raw_attempt(
+    best_raw_attempt: RawFit | None,
+    search: tuple[SearchCandidate, ...],
+) -> None:
+    if best_raw_attempt is None:
+        return
+    if not any(
+        isinstance(item.candidate, RawFusionCandidate)
+        and item.candidate.raw_fit is best_raw_attempt
+        for item in search
+    ):
+        raise ValueError("best_raw_attempt must come from the retained raw candidates.")
+
+
+@dataclass(frozen=True, slots=True)
+class SecondaryFallbackResult:
+    """A scored direct partition without a certified raw-fusion reference.
+
+    This is deliberately not a ``SelectedModel``.  Its fixed-label refit is a
+    useful conditional estimate, but it carries no primary-estimator or raw-KKT
+    claim and therefore cannot be serialized under the primary compatibility
+    filenames.
+    """
+
+    selected_partition: DirectPartitionCandidate
+    best_raw_attempt: RawFit | None
+    reason: str
+    search: tuple[SearchCandidate, ...]
+    selection_method: str
+    adaptive_search_stop_reason: str
+    num_candidates: int
+    num_candidates_certified: int
+    selection_hits_lower_boundary: bool = False
+    selection_hits_upper_boundary: bool = False
+    selection_boundary_unresolved: bool = True
+    ward_candidate_pool_complete: bool = False
+    raw_lambda_path_resolved: bool = False
+    global_hybrid_optimum_certified: bool = False
+    primary_estimator_available: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        candidate = self.selected_partition
+        if not isinstance(candidate, DirectPartitionCandidate):
+            raise TypeError("A secondary fallback requires a direct partition.")
+        if not candidate.eligible_for_selection:
+            raise ValueError("A secondary fallback partition must be eligible.")
+        if not candidate.refit.finite_candidate_found or not np.isfinite(
+            float(candidate.score.value)
+        ):
+            raise ValueError("A secondary fallback requires a finite refit and score.")
+        if not str(self.reason).strip():
+            raise ValueError("A secondary fallback requires an explicit reason.")
+        selected = _validate_outcome_search(self.search, require_selected=True)
+        if selected is None or selected.candidate is not candidate:
+            raise ValueError(
+                "The selected search record must own the fallback partition."
+            )
+        _validate_best_raw_attempt(self.best_raw_attempt, self.search)
+        if int(self.num_candidates) != len(self.search):
+            raise ValueError("num_candidates must match the retained search.")
+        if int(self.num_candidates_certified) < 0:
+            raise ValueError("num_candidates_certified must be nonnegative.")
+
+    @property
+    def selected_candidate(self) -> DirectPartitionCandidate:
+        return self.selected_partition
+
+    @property
+    def selected_candidate_id(self) -> int:
+        selected = _validate_outcome_search(self.search, require_selected=True)
+        if selected is None:  # pragma: no cover - guarded in __post_init__
+            raise AssertionError("Secondary fallback lost its selected record.")
+        return int(selected.candidate_id)
+
+    @property
+    def selected_lambda_representative(self) -> None:
+        return None
+
+    @property
+    def selected_kkt_residual(self) -> None:
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticOnlyResult:
+    """A retained search with no defensible selected partition point claim."""
+
+    best_raw_attempt: RawFit | None
+    reason: str
+    search: tuple[SearchCandidate, ...]
+    selection_method: str
+    adaptive_search_stop_reason: str
+    num_candidates: int
+    num_candidates_certified: int = 0
+    ward_candidate_pool_complete: bool = False
+    raw_lambda_path_resolved: bool = False
+    global_hybrid_optimum_certified: bool = False
+    primary_estimator_available: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        if not str(self.reason).strip():
+            raise ValueError("A diagnostic-only outcome requires an explicit reason.")
+        _validate_outcome_search(self.search, require_selected=False)
+        _validate_best_raw_attempt(self.best_raw_attempt, self.search)
+        if int(self.num_candidates) != len(self.search):
+            raise ValueError("num_candidates must match the retained search.")
+        if int(self.num_candidates_certified) != 0:
+            raise ValueError("A diagnostic-only outcome cannot claim a selected model.")
+
+    @property
+    def selected_candidate(self) -> None:
+        return None
+
+    @property
+    def selected_lambda_representative(self) -> None:
+        return None
+
+    @property
+    def selected_kkt_residual(self) -> None:
+        return None
+
+
+TumorSelectionOutcome = Union[
+    BICSelectionResult,
+    SecondaryFallbackResult,
+    DiagnosticOnlyResult,
+]

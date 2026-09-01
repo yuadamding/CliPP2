@@ -34,19 +34,27 @@ from ..core.fusion.types import RawFit
 from ..io.data import TumorData
 from .guided_fusion import GuidedFusionInitialization, build_guided_fusion_initialization
 from .scoring import _canonical_lambda, _prefer_fit_candidate
-from .types import StartArray
+from .types import SolveOutcome, StartArray
 
 
 @dataclass(frozen=True, slots=True)
 class RawStartAttempt:
     """One fixed-objective solve from an authorized optimizer state."""
 
-    fit: RawFit
+    outcome: SolveOutcome
     source: str
     start_value: float
     breakpoint_escape_changed_count: int
     mathematically_certified: bool
     promotion_status: str = "not_recorded"
+
+    @property
+    def fit(self) -> RawFit:
+        return self.outcome.fit
+
+    @property
+    def state(self) -> SolverState | None:
+        return self.outcome.state
 
 
 RawStartSpec = tuple[str, float, SolverState | None, StartArray | None]

@@ -432,7 +432,16 @@ def compile_observed_model(
     total = np.asarray(data.total_counts, dtype=np.float64)
     if alt.shape != total.shape:
         raise ValueError("TumorData alt_counts and total_counts must have one shape.")
-    observed_value = getattr(data, "count_observed", None)
+    # Count availability is a reporting/data fact.  Only the explicit
+    # inclusion mask defines which coordinates enter this objective.
+    inclusion_method = getattr(data, "objective_inclusion_mask", None)
+    observed_value = (
+        inclusion_method()
+        if callable(inclusion_method)
+        else getattr(data, "likelihood_included", None)
+    )
+    if observed_value is None:
+        observed_value = getattr(data, "count_observed", None)
     observed = (
         np.ones(alt.shape, dtype=bool)
         if observed_value is None
