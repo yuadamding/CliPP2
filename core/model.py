@@ -45,6 +45,11 @@ def fit_fixed_objective(
             else float(solver.certification_tolerance)
         ),
         use_backward_error_progress=bool(solver.use_backward_error_progress),
+        staged_recovery=bool(
+            solver.use_backward_error_progress
+            and str(solver.recovery_policy) == "staged"
+        ),
+        stagnation_audit_patience=int(solver.stagnation_audit_patience),
         phi_start=phi_start,
         graph=graph.graph,
         adaptive_weight_gamma=float(graph.adaptive_weight_gamma),
@@ -63,6 +68,7 @@ def fit_fixed_objective(
         dense_fallback_policy=str(config.runtime.fallback),
         workset_add_batch=int(resources.workset_add_batch),
         workset_max_expansions=int(resources.workset_max_expansions),
+        max_edge_pass_equivalents=resources.max_attempt_edge_pass_equivalents,
         certificate_max_iter=int(certificate.max_iter),
         certificate_refinement_rounds=int(certificate.refinement_rounds),
         certificate_column_tol_scale=float(certificate.column_tolerance_scale),

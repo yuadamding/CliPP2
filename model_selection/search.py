@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
+from time import perf_counter
+
 import numpy as np
 import torch
 
@@ -21,6 +24,7 @@ from ..core.fusion.types import (
     RawFit,
     SolverContext,
     SolverState,
+    WorkCounters,
 )
 from ..io.data import TumorData
 
@@ -29,6 +33,11 @@ from ..model_selection.candidates import (
     evaluate_direct_partition_candidate,
     evaluate_raw_fusion_candidate,
     validate_candidate_identity,
+)
+from ..model_selection.checkpoint import (
+    build_search_checkpoint_identity,
+    load_search_checkpoint,
+    save_search_checkpoint,
 )
 from ..model_selection.config import (
     PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT,
@@ -63,6 +72,7 @@ from ..model_selection.scoring import (
     _canonical_lambda,
     _prefer_fit_candidate,
     raw_candidate_has_exact_fusion_certificate,
+    raw_fit_has_exact_fusion_certificate,
     select_candidate_records,
 )
 from ..model_selection.types import (
@@ -72,6 +82,7 @@ from ..model_selection.types import (
     DiagnosticOnlyResult,
     DirectPartitionCandidate,
     RawAttemptSummary,
+    RawFusionArtifact,
     RawFusionCandidate,
     SearchCandidate,
     SecondaryFallbackResult,
@@ -79,6 +90,7 @@ from ..model_selection.types import (
     SolveOutcome,
     StartArray,
     TumorSelectionOutcome,
+    UnscoredRawFusionCandidate,
 )
 
 
@@ -92,6 +104,9 @@ class NoEligibleModelSelectionCandidatesError(RuntimeError):
             f"No candidates were eligible for model selection for tumor "
             f"{self.tumor_id}."
         )
+
+
+_RAW_ARTIFACT_TYPES = (RawFusionCandidate, UnscoredRawFusionCandidate)
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,7 +337,7 @@ def _raw_attempts(record: CandidateRecord) -> tuple[RawAttemptSummary, ...]:
     if record.trace.raw_attempts:
         return record.trace.raw_attempts
     candidate = record.candidate
-    if not isinstance(candidate, RawFusionCandidate):
+    if not isinstance(candidate, _RAW_ARTIFACT_TYPES):
         return ()
     return (
         RawAttemptSummary.from_fit(
@@ -336,7 +351,9 @@ def _raw_attempts(record: CandidateRecord) -> tuple[RawAttemptSummary, ...]:
             breakpoint_escape_changed_count=int(
                 record.trace.breakpoint_escape_changed_count
             ),
-            mathematically_certified=bool(candidate.raw_objective_certified),
+            mathematically_certified=bool(
+                raw_fit_has_exact_fusion_certificate(candidate.raw_fit)
+            ),
             outer_max_iter=0,
             inner_max_iter=0,
             certificate_max_iter=0,
@@ -350,7 +367,9 @@ def _raw_reference_failure_diagnostics(
     """Summarize raw candidates without flattening solver state."""
 
     raw = [
-        record for record in records if isinstance(record.candidate, RawFusionCandidate)
+        record
+        for record in records
+        if isinstance(record.candidate, _RAW_ARTIFACT_TYPES)
     ]
     attempts = [
         (attempt, record) for record in raw for attempt in _raw_attempts(record)
@@ -384,7 +403,8 @@ def _raw_reference_failure_diagnostics(
         raw_candidate_count=len(raw),
         raw_solver_attempt_count=len(attempts),
         raw_certified_count=sum(
-            bool(record.candidate.raw_objective_certified) for record in raw
+            raw_fit_has_exact_fusion_certificate(record.candidate.raw_fit)
+            for record in raw
         ),
         partition_certified_count=sum(
             bool(record.candidate.partition.certified) for record in raw
@@ -510,7 +530,7 @@ def _best_retained_raw_fit(records: list[CandidateRecord]) -> RawFit | None:
     raw_records = [
         record
         for record in records
-        if isinstance(record.candidate, RawFusionCandidate)
+        if isinstance(record.candidate, _RAW_ARTIFACT_TYPES)
         and np.isfinite(float(record.candidate.raw_fit.objective.total))
     ]
     if not raw_records:
@@ -536,7 +556,7 @@ def _best_retained_raw_fit(records: list[CandidateRecord]) -> RawFit | None:
     return min(raw_records, key=key).candidate.raw_fit
 
 
-def _compact_raw_candidate(candidate: RawFusionCandidate) -> RawFusionCandidate:
+def _compact_raw_candidate(candidate: RawFusionArtifact) -> RawFusionArtifact:
     """Drop transient solver tensors after scalar attempt provenance is saved."""
 
     raw_fit = candidate.raw_fit
@@ -740,6 +760,8 @@ def _partition_guided_admm_selection(
     data: TumorData,
     fit_options: FitConfig,
     use_warm_starts: bool,
+    checkpoint_path: Path | None = None,
+    resume_checkpoint: bool = False,
 ) -> TumorSelectionOutcome:
     """Run the certified raw path and select under one immutable contract.
 
@@ -750,6 +772,8 @@ def _partition_guided_admm_selection(
     controller terminates, so they cannot steer or replace the raw optimizer.
     """
 
+    search_segment_start = perf_counter()
+    cumulative_search_elapsed_before = 0.0
     selection_contract = fit_options.selection.contract
     selection_score = str(fit_options.selection.score)
     normalized_score = selection_score
@@ -932,11 +956,119 @@ def _partition_guided_admm_selection(
     attempts_by_lambda: dict[float, list[SolveOutcome]] = {}
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] = {}
     next_step = 0
+    total_work = WorkCounters()
+    search_stop_override: str | None = None
     # Lazily promoted float64 twin of the working context, built at most once
     # per tumor and only when a certification-recovery attempt needs it.
     float64_recovery_context: list = [None]
     float64_recovery_status = ["not_requested"]
+    checkpoint_identity = (
+        None
+        if checkpoint_path is None
+        else build_search_checkpoint_identity(
+            data=data,
+            fit_config=effective_fit_options,
+            objective_spec_hash=str(base_solver_context.objective_spec_hash),
+            original_graph_hash=str(base_solver_context.graph_hash),
+            use_warm_starts=bool(use_warm_starts),
+            runtime_device_name=str(base_solver_context.runtime.device_name),
+            runtime_dtype=str(base_solver_context.runtime.dtype),
+        )
+    )
+
+    if resume_checkpoint:
+        if checkpoint_path is None:
+            raise ValueError("resume_checkpoint requires a checkpoint path.")
+        workspace = load_search_checkpoint(
+            checkpoint_path,
+            expected_identity=checkpoint_identity,
+        )
+        controller = OnlineLambdaController.from_state_dict(
+            workspace["controller_state"]
+        )
+        result_entries = list(workspace["result_entries"])
+        outcome_by_lambda = dict(workspace["outcome_by_lambda"])
+        partition_k_by_lambda = dict(workspace["partition_k_by_lambda"])
+        attempts_by_lambda = {
+            float(key): list(value)
+            for key, value in dict(workspace["attempts_by_lambda"]).items()
+        }
+        bic_refit_cache = dict(workspace["bic_refit_cache"])
+        next_step = int(workspace["next_step"])
+        total_work = workspace["total_work"]
+        search_stop_override = workspace.get("search_stop_override")
+        raw_guide_phi = workspace["raw_guide_phi"]
+        guided_initialization = workspace["guided_initialization"]
+        float64_recovery_status[0] = str(
+            workspace.get("float64_recovery_status", "not_requested")
+        )
+        cumulative_search_elapsed_before = float(
+            workspace.get("cumulative_search_active_seconds", 0.0)
+        )
+        if (
+            not np.isfinite(cumulative_search_elapsed_before)
+            or cumulative_search_elapsed_before < 0.0
+        ):
+            raise ValueError("Checkpoint search elapsed time is invalid.")
+        if int(next_step) != len(result_entries):
+            raise ValueError(
+                "Search checkpoint candidate IDs are not continuation-safe."
+            )
+        for expected_id, record in enumerate(result_entries):
+            if int(record.candidate_id) != expected_id:
+                raise ValueError(
+                    "Search checkpoint candidate IDs are not contiguous."
+                )
+        for outcomes in (outcome_by_lambda.values(), *attempts_by_lambda.values()):
+            for outcome in outcomes:
+                fit = outcome.fit
+                if str(fit.provenance.objective_spec_hash) != str(
+                    base_solver_context.objective_spec_hash
+                ) or str(fit.provenance.original_graph_hash) != str(
+                    base_solver_context.graph_hash
+                ):
+                    raise ValueError(
+                        "Checkpoint outcome belongs to a different objective or graph."
+                    )
+                if outcome.state is not None and str(
+                    outcome.state.objective_spec_hash
+                ) != str(base_solver_context.objective_spec_hash):
+                    raise ValueError(
+                        "Checkpoint solver state belongs to a different objective."
+                    )
+
+    def checkpoint_search_state() -> None:
+        if checkpoint_path is None:
+            return
+        if checkpoint_identity is None:  # pragma: no cover - construction guard
+            raise AssertionError("Checkpoint path has no identity guard.")
+        save_search_checkpoint(
+            checkpoint_path,
+            identity=checkpoint_identity,
+            workspace={
+                "controller_state": controller.state_dict(),
+                "result_entries": result_entries,
+                "outcome_by_lambda": outcome_by_lambda,
+                "partition_k_by_lambda": partition_k_by_lambda,
+                "attempts_by_lambda": attempts_by_lambda,
+                "bic_refit_cache": bic_refit_cache,
+                "next_step": int(next_step),
+                "total_work": total_work,
+                "search_stop_override": search_stop_override,
+                "raw_guide_phi": raw_guide_phi,
+                "guided_initialization": guided_initialization,
+                "float64_recovery_status": str(float64_recovery_status[0]),
+                "cumulative_search_active_seconds": float(
+                    cumulative_search_elapsed_before
+                    + perf_counter()
+                    - search_segment_start
+                ),
+            },
+        )
+
     while True:
+        if search_stop_override is not None:
+            break
         proposal = controller.propose()
         if proposal is None:
             break
@@ -996,13 +1128,20 @@ def _partition_guided_admm_selection(
                 if context.runtime.dtype == torch.float64:
                     recovery_promotion_status = "not_needed"
                 else:
-                    if float64_recovery_context[0] is None:
+                    if (
+                        float64_recovery_context[0] is None
+                        and str(float64_recovery_status[0])
+                        not in {"failed_memory", "failed_runtime"}
+                    ):
                         (
                             float64_recovery_context[0],
                             float64_recovery_status[0],
                         ) = _try_promote_recovery_context(context)
                     recovery_promotion_status = str(float64_recovery_status[0])
-                    if float64_recovery_context[0] is not context:
+                    if (
+                        float64_recovery_context[0] is not None
+                        and float64_recovery_context[0] is not context
+                    ):
                         context = float64_recovery_context[0]
                         recovery_promoted = True
             initialization = guided_initialization
@@ -1226,12 +1365,37 @@ def _partition_guided_admm_selection(
                     append_distinct_start(source, start_value, state, phi)
 
             start_attempts: list[_RawStartAttempt] = []
+            proposal_work = WorkCounters()
             for (
                 lambda_start_source,
                 lambda_start_value,
                 original_state,
                 explicit_phi_start,
             ) in start_specs:
+                tumor_work_cap = (
+                    effective_fit_options.solver.resources
+                    .max_tumor_edge_pass_equivalents
+                )
+                attempt_fit_options = candidate_fit_options
+                if tumor_work_cap is not None:
+                    remaining_work = int(tumor_work_cap) - int(
+                        total_work.edge_pass_equivalents
+                        + proposal_work.edge_pass_equivalents
+                    )
+                    if remaining_work <= 0 and start_attempts:
+                        break
+                    attempt_fit_options = replace(
+                        candidate_fit_options,
+                        solver=replace(
+                            candidate_fit_options.solver,
+                            resources=replace(
+                                candidate_fit_options.solver.resources,
+                                max_attempt_edge_pass_equivalents=max(
+                                    int(remaining_work), 1
+                                ),
+                            ),
+                        ),
+                    )
                 if recovery_promoted:
                     # A promoted attempt keeps only the primal start: working-
                     # precision dual/certificate state is not carried across
@@ -1270,7 +1434,7 @@ def _partition_guided_admm_selection(
                 seed_fit = fit_fixed_objective(
                     data=data,
                     config=replace(
-                        candidate_fit_options,
+                        attempt_fit_options,
                         lambda_value=float(proposal.lambda_value),
                     ),
                     phi_start=phi_start,
@@ -1291,11 +1455,14 @@ def _partition_guided_admm_selection(
                         "Raw multistart changed the fixed objective identity."
                     )
                 solve_outcome = _detach_solve_outcome(seed_fit)
+                proposal_work = proposal_work + seed_fit.work
                 attempts_by_lambda.setdefault(lambda_key, []).append(solve_outcome)
+                # Multistart routing must use the same full schema-2,
+                # float64-audited, full-original-graph admission predicate as
+                # scoring and the online controller.  The two convenience
+                # booleans alone are not an exact-fusion certificate.
                 mathematically_certified = bool(
-                    float(seed_fit.provenance.lambda_value) > 0.0
-                    and seed_fit.certificate.certified
-                    and seed_fit.certificate.admissible
+                    raw_fit_has_exact_fusion_certificate(seed_fit)
                 )
                 start_attempts.append(
                     _RawStartAttempt(
@@ -1307,6 +1474,15 @@ def _partition_guided_admm_selection(
                         promotion_status=str(recovery_promotion_status),
                     )
                 )
+                if (
+                    tumor_work_cap is not None
+                    and int(
+                        total_work.edge_pass_equivalents
+                        + proposal_work.edge_pass_equivalents
+                    )
+                    >= int(tumor_work_cap)
+                ):
+                    break
             selected_attempt = _select_raw_start_attempt(start_attempts)
             # Subsequent bracket proposals must warm-start from the same raw
             # basin that was admitted to partition scoring, never from a lower
@@ -1314,6 +1490,8 @@ def _partition_guided_admm_selection(
             return selected_attempt.outcome, selected_attempt, tuple(start_attempts)
 
         selected_outcome, selected_start, raw_start_attempts = solve_raw_path()
+        for raw_attempt in raw_start_attempts:
+            total_work = total_work + raw_attempt.fit.work
         fit, artifact = evaluate_raw_fusion_candidate(
             data=data,
             fit_options=effective_fit_options,
@@ -1333,6 +1511,8 @@ def _partition_guided_admm_selection(
             precomputed_fit=selected_outcome.fit,
             source_model=base_solver_context.problem.source_model,
         )
+        total_work = total_work + artifact.work
+        selected_trace_fit = replace(fit, work=fit.work + artifact.work)
         (
             lambda_start_source,
             lambda_start_value,
@@ -1358,7 +1538,11 @@ def _partition_guided_admm_selection(
                     ),
                     raw_attempts=tuple(
                         RawAttemptSummary.from_fit(
-                            attempt.fit,
+                            (
+                                selected_trace_fit
+                                if attempt is selected_start
+                                else attempt.fit
+                            ),
                             source=str(attempt.source),
                             start_value=float(attempt.start_value),
                             breakpoint_escape_changed_count=int(
@@ -1398,10 +1582,15 @@ def _partition_guided_admm_selection(
             partition_k_by_lambda[lambda_key] = int(artifact.partition.n_clusters)
 
         raw_exact_certified = bool(
-            raw_candidate_has_exact_fusion_certificate(artifact)
+            raw_fit_has_exact_fusion_certificate(fit)
             and bool(effective_tensor_graph.is_complete)
         )
-        selection_score_available = bool(artifact.eligible_for_selection)
+        score = artifact.score
+        selection_score_available = bool(
+            isinstance(artifact, RawFusionCandidate)
+            and artifact.eligible_for_selection
+            and score is not None
+        )
         controller.observe(
             OnlineLambdaObservation(
                 lambda_value=float(proposal.lambda_value),
@@ -1410,7 +1599,7 @@ def _partition_guided_admm_selection(
                 # The active selection score steers the online-lambda
                 # controller (the observation field name is historical).
                 partition_icl=(
-                    float(artifact.score.value)
+                    float(score.value)
                     if selection_score_available
                     else float("inf")
                 ),
@@ -1418,11 +1607,33 @@ def _partition_guided_admm_selection(
                 raw_objective_certified=bool(raw_exact_certified),
                 partition_certified=bool(artifact.partition.certified),
                 selection_score_available=selection_score_available,
-                score_numerical_uncertainty=float(artifact.score.numerical_uncertainty),
-                degrees_of_freedom=int(artifact.score.degrees_of_freedom),
+                score_numerical_uncertainty=(
+                    float(score.numerical_uncertainty)
+                    if selection_score_available
+                    else 0.0
+                ),
+                degrees_of_freedom=(
+                    int(score.degrees_of_freedom)
+                    if selection_score_available
+                    else 0
+                ),
             )
         )
         next_step += 1
+        work_cap = (
+            effective_fit_options.solver.resources.max_tumor_edge_pass_equivalents
+        )
+        if (
+            work_cap is not None
+            and int(getattr(total_work, "edge_pass_equivalents", 0))
+            >= int(work_cap)
+        ):
+            search_stop_override = "tumor_work_budget_reached"
+        checkpoint_search_state()
+
+    # A terminal controller reason is established by ``propose()`` after the
+    # preceding observation, so persist that final scalar state as well.
+    checkpoint_search_state()
 
     ward_candidate_pool_complete = False
     if selection_contract.selectable_partition_pool:
@@ -1514,6 +1725,7 @@ def _partition_guided_admm_selection(
                 refit_cache=bic_refit_cache,
                 source_model=base_solver_context.problem.source_model,
             )
+            total_work = total_work + direct_candidate.work
             result_entries.append(
                 CandidateRecord(
                     candidate_id=candidate_id,
@@ -1531,8 +1743,12 @@ def _partition_guided_admm_selection(
         raise RuntimeError(
             f"No guided ADMM candidates were evaluated for tumor {data.tumor_id}."
         )
-    stop_reason = str(controller.stop_reason or "online_lambda_no_terminal_reason")
-    return _assemble_selection_result(
+    stop_reason = str(
+        search_stop_override
+        or controller.stop_reason
+        or "online_lambda_no_terminal_reason"
+    )
+    outcome = _assemble_selection_result(
         data=data,
         result_entries=result_entries,
         selection_method=selection_method,
@@ -1545,6 +1761,16 @@ def _partition_guided_admm_selection(
             fit_options.computation_profile.is_strict
         ),
     )
+    return replace(
+        outcome,
+        search_work=total_work,
+        cumulative_search_active_seconds=float(
+            cumulative_search_elapsed_before
+            + perf_counter()
+            - search_segment_start
+        ),
+        resumed_from_checkpoint=bool(resume_checkpoint),
+    )
 
 
 def select_model(
@@ -1552,6 +1778,8 @@ def select_model(
     data: TumorData,
     fit_config: FitConfig,
     use_warm_starts: bool,
+    checkpoint_path: str | Path | None = None,
+    resume_checkpoint: bool = False,
 ) -> TumorSelectionOutcome:
     effective_objective_shape = objective_shape_for_data(
         data, str(fit_config.solver.objective_shape)
@@ -1566,6 +1794,10 @@ def select_model(
         data=data,
         fit_options=fit_config,
         use_warm_starts=use_warm_starts,
+        checkpoint_path=(
+            None if checkpoint_path is None else Path(checkpoint_path)
+        ),
+        resume_checkpoint=bool(resume_checkpoint),
     )
 
 

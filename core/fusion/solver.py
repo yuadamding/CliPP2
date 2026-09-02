@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import torch
@@ -58,6 +58,7 @@ from .starts import (
 )
 from .torch_backend import (
     CudaUnavailableError,
+    DEFAULT_INNER_KKT_CHECK_EVERY,
     TorchTumorData,
     as_runtime_tensor,
     copy_torch_tumor_data,
@@ -335,9 +336,427 @@ _MISSING_SURROGATE_CURVATURE = 1e-6
 _OUTER_KKT_CHECK_EVERY = 4
 _PERIODIC_CERTIFICATE_MAX_ITER = 96
 _FULL_STEP_MAX_CURVATURE_ATTEMPTS = 24
+_RECOVERY_STAGNATION_MIN_OUTER_ITER = 16
+_RECOVERY_STAGNATION_AUDIT_WINDOW = 4
+_RECOVERY_STAGNATION_MIN_RESIDUAL_GAIN = float(np.log(1.05))
+_RECOVERY_STAGNATION_OBJECTIVE_GAIN_SCALE = 0.1
+_RECOVERY_STAGNATION_REJECTED_STEPS = 2
+_FINAL_CERTIFICATE_PROBE_MAX_ITER = 32
+_FINAL_CERTIFICATE_DEEPEN_GATE_MULTIPLIER = 10.0
+_MIN_INNER_ITERATIONS = 10
+# One dense/compressed refinement iteration plus its conservative full-graph
+# diagnostics costs at most eight EPE.  The float32 admission audit costs two
+# more.  A capped solve may exceed its limit only by this mandatory terminal
+# allowance when it enters with less than the reserve remaining.
+_MANDATORY_TERMINAL_EDGE_PASS_ALLOWANCE = 10
 _CONVEX_GLOBAL_OPTIMALITY_BASIS = "convex_fixed_linear_objective_plus_kkt"
 OBJECTIVE_SHAPE_AUTO = "auto"
 PATH_OBJECTIVE_SHAPE = "generic_nonconvex"
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryProgressSnapshot:
+    outer_iteration: int
+    best_objective: float
+    best_kkt_residual: float
+    step_residual: float
+    rejected_since_previous_audit: int
+    dominant_component: str
+
+
+@dataclass(slots=True)
+class _RecoveryProgressMonitor:
+    """Detect a recovery-only plateau without making a convergence claim."""
+
+    tolerance: float
+    certification_tolerance: float
+    audit_patience: int = _RECOVERY_STAGNATION_AUDIT_WINDOW
+    snapshots: list[_RecoveryProgressSnapshot] = field(default_factory=list)
+    best_objective: float = float("inf")
+    best_kkt_residual: float = float("inf")
+    best_dominant_component: str = "stationarity"
+    previous_rejected_outer_steps: int = 0
+
+    def observe(
+        self,
+        *,
+        outer_iteration: int,
+        objective: float,
+        diagnostics: dict[str, float | int],
+        step_residual: float,
+        rejected_outer_steps: int,
+    ) -> str | None:
+        """Return a typed stagnation reason, never a certificate decision."""
+
+        objective_value = float(objective)
+        if np.isfinite(objective_value):
+            self.best_objective = min(float(self.best_objective), objective_value)
+
+        components = {
+            "stationarity": float(
+                diagnostics.get(
+                    "backward_error_stationarity_residual", float("inf")
+                )
+            ),
+            "edge_subgradient": float(
+                diagnostics.get(
+                    "backward_error_edge_subgradient_residual", float("inf")
+                )
+            ),
+            "dual_ball": float(
+                diagnostics.get(
+                    "backward_error_dual_ball_residual", float("inf")
+                )
+            ),
+        }
+        residual = float(
+            diagnostics.get("backward_error_kkt_residual", float("inf"))
+        )
+        if np.isfinite(residual) and residual >= 0.0 and residual < float(
+            self.best_kkt_residual
+        ):
+            self.best_kkt_residual = residual
+            finite_components = {
+                name: value
+                for name, value in components.items()
+                if np.isfinite(value) and value >= 0.0
+            }
+            if finite_components:
+                self.best_dominant_component = max(
+                    finite_components, key=finite_components.get
+                )
+
+        rejected_total = max(int(rejected_outer_steps), 0)
+        rejected_increment = max(
+            rejected_total - int(self.previous_rejected_outer_steps), 0
+        )
+        self.previous_rejected_outer_steps = rejected_total
+        self.snapshots.append(
+            _RecoveryProgressSnapshot(
+                outer_iteration=int(outer_iteration),
+                best_objective=float(self.best_objective),
+                best_kkt_residual=float(self.best_kkt_residual),
+                step_residual=float(step_residual),
+                rejected_since_previous_audit=int(rejected_increment),
+                dominant_component=str(self.best_dominant_component),
+            )
+        )
+        patience = max(int(self.audit_patience), 1)
+        if len(self.snapshots) > patience:
+            del self.snapshots[:-patience]
+
+        if (
+            int(outer_iteration) < _RECOVERY_STAGNATION_MIN_OUTER_ITER
+            or len(self.snapshots) < patience
+        ):
+            return None
+        first = self.snapshots[0]
+        last = self.snapshots[-1]
+        gate = 5.0 * _validate_solver_tolerance(self.certification_tolerance)
+        if not (
+            np.isfinite(last.best_objective)
+            and np.isfinite(first.best_objective)
+            and np.isfinite(last.best_kkt_residual)
+            and np.isfinite(first.best_kkt_residual)
+            and last.best_kkt_residual > gate
+        ):
+            return None
+        objective_gain = max(
+            float(first.best_objective) - float(last.best_objective), 0.0
+        ) / (1.0 + abs(float(first.best_objective)))
+        residual_gain = float(
+            np.log(
+                max(float(first.best_kkt_residual), np.finfo(np.float64).tiny)
+                / max(float(last.best_kkt_residual), np.finfo(np.float64).tiny)
+            )
+        )
+        objective_stalled = bool(
+            objective_gain
+            < _RECOVERY_STAGNATION_OBJECTIVE_GAIN_SCALE
+            * _validate_solver_tolerance(self.tolerance)
+        )
+        residual_stalled = bool(
+            residual_gain < _RECOVERY_STAGNATION_MIN_RESIDUAL_GAIN
+        )
+        step_stalled = bool(
+            np.isfinite(last.step_residual)
+            and last.step_residual
+            <= max(1e-8, float(np.sqrt(_validate_solver_tolerance(self.tolerance))))
+        )
+        rejected_in_window = sum(
+            int(item.rejected_since_previous_audit) for item in self.snapshots
+        )
+        repeatedly_rejected = bool(
+            rejected_in_window >= _RECOVERY_STAGNATION_REJECTED_STEPS
+        )
+        if not (
+            objective_stalled
+            and residual_stalled
+            and (step_stalled or repeatedly_rejected)
+        ):
+            return None
+        if repeatedly_rejected:
+            return "solver_stagnation_rejected_mm_steps"
+        return f"solver_stagnation_{last.dominant_component}"
+
+
+@dataclass(frozen=True, slots=True)
+class _AuditedSolverSnapshot:
+    """Self-consistent primal/dual state from one full observed KKT audit."""
+
+    phi: torch.Tensor
+    dual: torch.Tensor | None
+    certificate: GraphFusionCertificate | None
+    warm_state: DenseWarmState | PrimalOnlyWarmState
+    inner_solver: str
+    dual_start_is_actual: bool
+    objective: float
+    fit_loss: float
+    diagnostics: dict[str, float | int]
+    current_inner_converged: bool
+    certified: bool
+
+    @property
+    def kkt_residual(self) -> float:
+        return float(
+            self.diagnostics.get("backward_error_kkt_residual", float("inf"))
+        )
+
+
+def _snapshot_audited_solver_state(
+    *,
+    phi: torch.Tensor,
+    certificate: GraphFusionCertificate | None,
+    graph_hash: str,
+    lambda_value: float,
+    inner_solver: str,
+    objective: float,
+    fit_loss: float,
+    diagnostics: dict[str, float | int],
+    current_inner_converged: bool,
+    certified: bool,
+) -> _AuditedSolverSnapshot:
+    """Detach a full audit from mutable continuation state."""
+
+    phi_copy = phi.detach().clone()
+    if isinstance(certificate, DenseEdgeCertificate):
+        dual_copy = certificate.dual.detach().clone()
+        certificate_copy: GraphFusionCertificate | None = replace(
+            certificate,
+            dual=dual_copy,
+        )
+        warm_state: DenseWarmState | PrimalOnlyWarmState = DenseWarmState(
+            phi=phi_copy,
+            dual=dual_copy,
+            previous_lambda=float(lambda_value),
+            graph_hash=str(graph_hash),
+        )
+        dual_start_is_actual = True
+    elif isinstance(certificate, CompressedEdgeCertificate):
+        certificate_copy = replace(
+            certificate,
+            labels=certificate.labels.detach().clone(),
+            centers=certificate.centers.detach().clone(),
+            internal_edge_ids=certificate.internal_edge_ids.detach().clone(),
+            internal_dual=certificate.internal_dual.detach().clone(),
+        )
+        dual_copy = None
+        warm_state = PrimalOnlyWarmState(
+            phi=phi_copy,
+            structure_hint=certificate_copy.labels,
+            certificate_hint=certificate_copy,
+        )
+        dual_start_is_actual = False
+    else:
+        certificate_copy = None
+        dual_copy = None
+        warm_state = PrimalOnlyWarmState(phi=phi_copy)
+        dual_start_is_actual = False
+    return _AuditedSolverSnapshot(
+        phi=phi_copy,
+        dual=dual_copy,
+        certificate=certificate_copy,
+        warm_state=warm_state,
+        inner_solver=str(inner_solver),
+        dual_start_is_actual=bool(dual_start_is_actual),
+        objective=float(objective),
+        fit_loss=float(fit_loss),
+        diagnostics=dict(diagnostics),
+        current_inner_converged=bool(current_inner_converged),
+        certified=bool(certified),
+    )
+
+
+def _prefer_audited_solver_snapshot(
+    candidate: _AuditedSolverSnapshot,
+    incumbent: _AuditedSolverSnapshot | None,
+) -> bool:
+    """Rank audited recovery states without weakening certificate admission."""
+
+    if incumbent is None:
+        return True
+    if bool(candidate.certified) != bool(incumbent.certified):
+        return bool(candidate.certified)
+    candidate_objective = float(candidate.objective)
+    incumbent_objective = float(incumbent.objective)
+    if candidate.certified:
+        return (not np.isfinite(incumbent_objective)) or (
+            np.isfinite(candidate_objective)
+            and candidate_objective < incumbent_objective
+        )
+    candidate_residual = float(candidate.kkt_residual)
+    incumbent_residual = float(incumbent.kkt_residual)
+    if np.isfinite(candidate_residual) != np.isfinite(incumbent_residual):
+        return bool(np.isfinite(candidate_residual))
+    if candidate_residual != incumbent_residual:
+        return bool(candidate_residual < incumbent_residual)
+    return (not np.isfinite(incumbent_objective)) or (
+        np.isfinite(candidate_objective)
+        and candidate_objective < incumbent_objective
+    )
+
+
+def _remaining_edge_pass_budget(
+    work: WorkCounters,
+    limit: int | None,
+) -> int | None:
+    if limit is None:
+        return None
+    return max(int(limit) - int(work.edge_pass_equivalents), 0)
+
+
+def _inner_edge_pass_bound(
+    iterations: int,
+    *,
+    use_alm: bool,
+    spectral_rho: bool,
+) -> int:
+    """Conservative EPE bound for one low-level inner invocation."""
+
+    count = max(int(iterations), 0)
+    if count == 0:
+        return 0
+    audits = int(np.ceil(count / max(int(DEFAULT_INNER_KKT_CHECK_EVERY), 1)))
+    return (
+        2 * count
+        + 2 * audits
+        + (1 if use_alm else 0)
+        + (count // 10 if use_alm and spectral_rho else 0)
+    )
+
+
+def _budgeted_inner_max_iter(
+    requested: int,
+    *,
+    remaining: int | None,
+    use_alm: bool,
+    spectral_rho: bool,
+) -> int | None:
+    desired = max(int(requested), _MIN_INNER_ITERATIONS)
+    if remaining is None:
+        return desired
+    available = max(int(remaining), 0)
+    if _inner_edge_pass_bound(
+        _MIN_INNER_ITERATIONS,
+        use_alm=use_alm,
+        spectral_rho=spectral_rho,
+    ) > available:
+        return None
+    lower = _MIN_INNER_ITERATIONS
+    upper = desired
+    while lower < upper:
+        midpoint = (lower + upper + 1) // 2
+        if _inner_edge_pass_bound(
+            midpoint,
+            use_alm=use_alm,
+            spectral_rho=spectral_rho,
+        ) <= available:
+            lower = midpoint
+        else:
+            upper = midpoint - 1
+    return lower
+
+
+def _budgeted_certificate_parameters(
+    *,
+    certificate: GraphFusionCertificate | None,
+    options: CertificateOptions,
+    requested_max_iter: int,
+    remaining: int | None,
+    mandatory: bool,
+) -> tuple[int, CertificateOptions] | None:
+    """Bound one refinement by remaining EPE using a conservative cost model."""
+
+    desired_iter = max(int(requested_max_iter), 1)
+    if remaining is None:
+        return desired_iter, replace(options, max_iter=desired_iter)
+    available = max(int(remaining), 0)
+    compressed = isinstance(certificate, CompressedEdgeCertificate)
+    desired_expansions = int(options.max_expansions) if compressed else 1
+
+    def bound(iterations: int, expansions: int) -> int:
+        if not compressed:
+            return 4 * int(iterations) + 4
+        # Each expansion can consume max_iter projected-dual iterations, one
+        # missing-column scan, and one terminal full-graph diagnostic.  The
+        # inherited-certificate fast path contributes one further audit.
+        return (
+            2 * int(expansions) * int(iterations)
+            + 4 * int(expansions)
+            + 2
+        )
+
+    if bound(desired_iter, desired_expansions) <= available:
+        return desired_iter, replace(options, max_iter=desired_iter)
+    for expansions in range(desired_expansions, 0, -1):
+        residual = available - (4 * expansions + (2 if compressed else 0))
+        divisor = 2 * expansions if compressed else 4
+        iterations = min(desired_iter, residual // divisor)
+        if iterations >= 1 and bound(iterations, expansions) <= available:
+            return int(iterations), replace(
+                options,
+                max_iter=int(iterations),
+                max_expansions=int(expansions),
+            )
+    if not mandatory:
+        return None
+    return 1, replace(options, max_iter=1, max_expansions=1)
+
+
+def _certificate_probe_action(
+    *,
+    residual_before: float,
+    probe_residual: float,
+    certification_tolerance: float,
+    recovery_stagnated: bool,
+) -> str:
+    """Choose whether a terminal certificate probe deserves deeper work."""
+
+    gate = 5.0 * _validate_solver_tolerance(certification_tolerance)
+    after = float(probe_residual)
+    if np.isfinite(after) and after >= 0.0 and after <= gate:
+        return "certified"
+    if not recovery_stagnated:
+        return "deepen"
+    before = float(residual_before)
+    if not (
+        np.isfinite(before)
+        and before >= 0.0
+        and np.isfinite(after)
+        and after > _FINAL_CERTIFICATE_DEEPEN_GATE_MULTIPLIER * gate
+    ):
+        return "deepen"
+    gain = float(
+        np.log(
+            max(before, np.finfo(np.float64).tiny)
+            / max(after, np.finfo(np.float64).tiny)
+        )
+    )
+    return (
+        "plateau"
+        if gain < _RECOVERY_STAGNATION_MIN_RESIDUAL_GAIN
+        else "deepen"
+    )
 
 
 def uses_explicit_path_likelihood(data: TumorData) -> bool:
@@ -1496,7 +1915,7 @@ def _solve_inner_subproblem(
             edge_v=edge_v,
             edge_w=edge_w,
             tol=tol,
-            max_iter=max(inner_max_iter, 10),
+            max_iter=max(inner_max_iter, _MIN_INNER_ITERATIONS),
             phi_start=phi,
             dual_start=dual,
             dual_start_is_actual=dual_start_is_actual,
@@ -1525,7 +1944,7 @@ def _solve_inner_subproblem(
             edge_w=edge_w,
             degree_bound=degree_bound,
             tol=tol,
-            max_iter=max(inner_max_iter, 10),
+            max_iter=max(inner_max_iter, _MIN_INNER_ITERATIONS),
             phi_start=phi,
             dual_start=dual,
             tau_node=pdhg_tau_node,
@@ -1553,6 +1972,41 @@ def _solve_inner_subproblem(
             lambda_value=lambda_value,
             atol=tol,
         )
+    inner_iterations = max(int(_inner_iterations), 0)
+    inner_stationarity_checks = int(
+        surrogate_diag_values.get("inner_stationarity_checks", 0)
+    )
+    inner_full_kkt_audits = int(
+        surrogate_diag_values.get("inner_kkt_audits", 0)
+    )
+    if not use_alm and inner_iterations > 0:
+        # PDHG performs one stationarity/full-KKT check at every configured
+        # interval and at its terminal iteration, but its legacy tuple result
+        # does not expose those counters directly.
+        pdhg_audits = int(
+            np.ceil(inner_iterations / max(int(DEFAULT_INNER_KKT_CHECK_EVERY), 1))
+        )
+        inner_stationarity_checks = max(inner_stationarity_checks, pdhg_audits)
+        inner_full_kkt_audits = max(inner_full_kkt_audits, pdhg_audits)
+    inner_work = WorkCounters(
+        inner_iterations=inner_iterations,
+        inner_stationarity_checks=inner_stationarity_checks,
+        inner_full_kkt_audits=inner_full_kkt_audits,
+        # Every dense/streamed ALM or PDHG iteration performs one logical
+        # edge-forward and one logical edge-adjoint sweep.  Stationarity and
+        # full-KKT checks add one normalized sweep each.
+        edge_pass_equivalents=(
+            2 * inner_iterations
+            + inner_stationarity_checks
+            + inner_full_kkt_audits
+            + (1 if use_alm and inner_iterations > 0 else 0)
+            + (
+                inner_iterations // 10
+                if use_alm and spectral_rho
+                else 0
+            )
+        ),
+    )
     certificate = (
         DenseEdgeCertificate(
             dual=dual_kkt_trial,
@@ -1574,7 +2028,8 @@ def _solve_inner_subproblem(
         surrogate_certificate=certificate,
         surrogate_kkt=KKTDiagnostics.from_mapping(surrogate_diag),
         converged=bool(inner_ok),
-        iterations=int(_inner_iterations),
+        iterations=inner_iterations,
+        work=inner_work,
     )
 
 
@@ -1596,6 +2051,8 @@ def _fit_from_start(
     tol: float,
     certification_tol: float,
     use_backward_error_progress: bool,
+    staged_recovery: bool = True,
+    stagnation_audit_patience: int = _RECOVERY_STAGNATION_AUDIT_WINDOW,
     phi_start: np.ndarray | torch.Tensor,
     solver_state: SolverState | None,
     lower: torch.Tensor,
@@ -1605,6 +2062,7 @@ def _fit_from_start(
     compressed_cache_max_bytes: int,
     workset_add_batch: int,
     workset_max_expansions: int,
+    max_edge_pass_equivalents: int | None = None,
     certificate_max_iter: int,
     certificate_refinement_rounds: int,
     certificate_column_tol_scale: float,
@@ -1650,6 +2108,12 @@ def _fit_from_start(
     use_unimodal_objective = objective_shape.startswith("unimodal")
     require_full_step_backtracking = (
         objective_shape == "unimodal_full_step_backtracking"
+    )
+    # This option is internal to fixed-objective certification recovery.  Keep
+    # its requested value as the recovery-only stagnation marker even if a
+    # failed float64 promotion requires legacy arithmetic for solver stopping.
+    recovery_stagnation_enabled = bool(
+        use_backward_error_progress and staged_recovery
     )
     use_backward_error_progress = _uses_backward_error_progress(
         requested=use_backward_error_progress,
@@ -1737,6 +2201,18 @@ def _fit_from_start(
     outer_stop_reason = "outer_iteration_limit"
     legacy_stop_kkt_residual = float("inf")
     componentwise_stop_kkt_residual = float("inf")
+    recovery_progress_monitor = (
+        _RecoveryProgressMonitor(
+            tolerance=float(tol),
+            certification_tolerance=float(cert_tol),
+            audit_patience=max(int(stagnation_audit_patience), 1),
+        )
+        if recovery_stagnation_enabled
+        else None
+    )
+    recovery_stagnated = False
+    best_audited_state: _AuditedSolverSnapshot | None = None
+    work_budget_reached = False
     progress_residual_method = (
         "componentwise_box_cone_backward_error_v1"
         if use_backward_error_progress
@@ -1758,6 +2234,17 @@ def _fit_from_start(
         )
     )
     for outer_iter in range(max(int(outer_max_iter), 1)):
+        remaining_budget = _remaining_edge_pass_budget(
+            work_counters,
+            max_edge_pass_equivalents,
+        )
+        if (
+            remaining_budget is not None
+            and remaining_budget <= _MANDATORY_TERMINAL_EDGE_PASS_ALLOWANCE
+        ):
+            outer_stop_reason = "solver_work_budget_reached"
+            work_budget_reached = True
+            break
         iterations = outer_iter + 1
         previous_phi = phi.clone()
         previous_objective = objective
@@ -1790,6 +2277,18 @@ def _fit_from_start(
                 eps=float(eps),
             )
         if require_full_step_backtracking:
+            remaining_budget = _remaining_edge_pass_budget(
+                work_counters,
+                max_edge_pass_equivalents,
+            )
+            if (
+                remaining_budget is not None
+                and remaining_budget
+                < _MANDATORY_TERMINAL_EDGE_PASS_ALLOWANCE + 2
+            ):
+                outer_stop_reason = "solver_work_budget_reached"
+                work_budget_reached = True
+                break
             forcing_certificate = certificate
             if forcing_certificate is None:
                 forcing_certificate = _compressed_certificate_for_primal(
@@ -1806,13 +2305,15 @@ def _fit_from_start(
                 eps=eps,
                 tol=cert_tol,
             )
-            forcing_diag = certify(
+            forcing_attempt = certify(
                 problem=certificate_problem,
                 phi=phi,
                 gradient=forcing_gradient,
                 witness=forcing_certificate,
                 refine=False,
-            ).diagnostics.as_dict()
+            )
+            work_counters = work_counters + forcing_attempt.work_counters
+            forcing_diag = forcing_attempt.diagnostics.as_dict()
             forcing_residual_key = (
                 "backward_error_kkt_residual"
                 if use_backward_error_progress
@@ -1848,6 +2349,16 @@ def _fit_from_start(
             else (1 if use_unimodal_objective else 10)
         )
         for _curvature_attempt in range(curvature_attempts):
+            remaining_budget = _remaining_edge_pass_budget(
+                work_counters,
+                max_edge_pass_equivalents,
+            )
+            if (
+                remaining_budget is not None
+                and remaining_budget <= _MANDATORY_TERMINAL_EDGE_PASS_ALLOWANCE
+            ):
+                work_budget_reached = True
+                break
             h = (
                 h_base * curvature_multiplier
                 if require_full_step_backtracking
@@ -1885,6 +2396,27 @@ def _fit_from_start(
             inner_dual_start_is_actual = dual_start_is_actual
             inner_batch_limit = 8 if require_full_step_backtracking else 1
             for _inner_batch in range(inner_batch_limit):
+                remaining_budget = _remaining_edge_pass_budget(
+                    work_counters,
+                    max_edge_pass_equivalents,
+                )
+                inner_iteration_limit = _budgeted_inner_max_iter(
+                    inner_max_iter,
+                    remaining=(
+                        None
+                        if remaining_budget is None
+                        else remaining_budget
+                        - _MANDATORY_TERMINAL_EDGE_PASS_ALLOWANCE
+                    ),
+                    use_alm=use_alm,
+                    spectral_rho=bool(
+                        require_full_step_backtracking
+                        or (use_alm and use_backward_error_progress)
+                    ),
+                )
+                if inner_iteration_limit is None:
+                    work_budget_reached = True
+                    break
                 inner_result = _solve_inner_subproblem(
                     use_alm=use_alm,
                     runtime=runtime,
@@ -1899,7 +2431,7 @@ def _fit_from_start(
                     edge_w=edge_w,
                     degree_bound=int(graph.degree_bound),
                     tol=tol,
-                    inner_max_iter=inner_max_iter,
+                    inner_max_iter=inner_iteration_limit,
                     phi=inner_phi_start,
                     dual=inner_dual_start,
                     dual_start_is_actual=inner_dual_start_is_actual,
@@ -1914,6 +2446,7 @@ def _fit_from_start(
                 )
                 inner_solve_calls += 1
                 total_inner_iterations += int(inner_result.iterations)
+                work_counters = work_counters + inner_result.work
                 phi_trial = inner_result.phi
                 dense_warm_state = inner_result.warm_state
                 dual_trial = getattr(dense_warm_state, "dual", None)
@@ -1954,6 +2487,8 @@ def _fit_from_start(
                 inner_phi_start = phi_trial
                 inner_dual_start = dual_kkt_trial if use_alm else dual_trial
                 inner_dual_start_is_actual = bool(use_alm)
+            if work_budget_reached:
+                break
             delta = phi_trial - phi
             trial_mutation_region_terms = mutation_region_terms_torch(
                 torch_data, phi_trial, major_prior=major_prior, eps=eps
@@ -2218,6 +2753,9 @@ def _fit_from_start(
                 break
             scale *= 2.0
 
+        if work_budget_reached:
+            outer_stop_reason = "solver_work_budget_reached"
+
         if not accepted:
             rejected_outer_steps += 1
             candidate_phi = phi
@@ -2265,6 +2803,18 @@ def _fit_from_start(
             or iterations % _OUTER_KKT_CHECK_EVERY == 0
             or not np.isfinite(objective)
         )
+        remaining_budget = _remaining_edge_pass_budget(
+            work_counters,
+            max_edge_pass_equivalents,
+        )
+        if (
+            do_outer_kkt_audit
+            and remaining_budget is not None
+            and remaining_budget
+            < _MANDATORY_TERMINAL_EDGE_PASS_ALLOWANCE + 2
+        ):
+            do_outer_kkt_audit = False
+            work_budget_reached = True
         outer_diag = final_outer_diag
         outer_converged = False
         if do_outer_kkt_audit:
@@ -2295,21 +2845,42 @@ def _fit_from_start(
                 int(certificate_options.max_iter),
                 _PERIODIC_CERTIFICATE_MAX_ITER,
             )
+            periodic_parameters = _budgeted_certificate_parameters(
+                certificate=observed_start,
+                options=certificate_options,
+                requested_max_iter=periodic_limit,
+                remaining=(
+                    None
+                    if remaining_budget is None
+                    else remaining_budget
+                    - _MANDATORY_TERMINAL_EDGE_PASS_ALLOWANCE
+                ),
+                mandatory=False,
+            )
+            if should_refine and periodic_parameters is None:
+                do_outer_kkt_audit = False
+                work_budget_reached = True
+            periodic_max_iter, periodic_options = (
+                (periodic_limit, certificate_options)
+                if periodic_parameters is None
+                else periodic_parameters
+            )
+        if do_outer_kkt_audit:
+            work_counters = work_counters + WorkCounters(outer_kkt_audits=1)
             observed_refinement = certify(
                 problem=certificate_problem,
                 phi=phi,
                 gradient=periodic_gradient,
                 witness=observed_start,
                 refine=should_refine,
-                max_iter=periodic_limit,
+                max_iter=periodic_max_iter,
                 options=(
-                    replace(certificate_options, max_iter=periodic_limit)
+                    periodic_options
                     if isinstance(observed_start, CompressedEdgeCertificate)
                     else None
                 ),
             )
-            if should_refine:
-                work_counters = work_counters + observed_refinement.work_counters
+            work_counters = work_counters + observed_refinement.work_counters
             certificate = observed_refinement.certificate
             outer_diag = observed_refinement.diagnostics.as_dict()
             legacy_stop_kkt_residual = float(outer_diag["kkt_residual"])
@@ -2324,6 +2895,31 @@ def _fit_from_start(
                 if use_backward_error_progress
                 else float(outer_diag["kkt_residual"]) <= 5.0 * cert_tol
             )
+            if recovery_progress_monitor is not None:
+                audited_state = _snapshot_audited_solver_state(
+                    phi=phi,
+                    certificate=certificate,
+                    graph_hash=graph_hash,
+                    lambda_value=lambda_value,
+                    inner_solver=inner_solver,
+                    objective=objective,
+                    fit_loss=fit_loss,
+                    diagnostics=outer_diag,
+                    current_inner_converged=(
+                        bool(inner_converged)
+                        if accepted
+                        else bool(current_inner_converged)
+                    ),
+                    certified=bool(
+                        outer_converged
+                        and periodic_gradient.directional_admissible
+                    ),
+                )
+                if _prefer_audited_solver_snapshot(
+                    audited_state,
+                    best_audited_state,
+                ):
+                    best_audited_state = audited_state
         if accepted:
             current_inner_converged = bool(inner_converged)
         if do_outer_kkt_audit:
@@ -2342,6 +2938,62 @@ def _fit_from_start(
                 else "legacy_progress_converged"
             )
             break
+        if do_outer_kkt_audit and recovery_progress_monitor is not None:
+            stagnation_reason = recovery_progress_monitor.observe(
+                outer_iteration=int(iterations),
+                objective=float(objective),
+                diagnostics=outer_diag,
+                step_residual=float(step_residual),
+                rejected_outer_steps=int(rejected_outer_steps),
+            )
+            if stagnation_reason is not None:
+                outer_stop_reason = str(stagnation_reason)
+                recovery_stagnated = True
+                break
+        if work_budget_reached:
+            outer_stop_reason = "solver_work_budget_reached"
+            break
+        if (
+            max_edge_pass_equivalents is not None
+            and int(work_counters.edge_pass_equivalents)
+            >= int(max_edge_pass_equivalents)
+        ):
+            outer_stop_reason = "solver_work_budget_reached"
+            break
+
+    if (
+        (recovery_stagnated or work_budget_reached)
+        and best_audited_state is not None
+    ):
+        # Terminal certification must start from the best state that actually
+        # passed a full observed-objective audit, not merely the last state in
+        # a stalled trajectory.  All work spent reaching later states remains
+        # charged above.
+        phi = best_audited_state.phi
+        dual = best_audited_state.dual
+        dual_kkt = best_audited_state.dual
+        certificate = best_audited_state.certificate
+        warm_state = best_audited_state.warm_state
+        inner_solver = best_audited_state.inner_solver
+        dual_start_is_actual = best_audited_state.dual_start_is_actual
+        objective = best_audited_state.objective
+        fit_loss = best_audited_state.fit_loss
+        penalty = objective - fit_loss
+        final_outer_diag = dict(best_audited_state.diagnostics)
+        legacy_stop_kkt_residual = float(
+            final_outer_diag.get("kkt_residual", float("inf"))
+        )
+        componentwise_stop_kkt_residual = float(
+            final_outer_diag.get("backward_error_kkt_residual", float("inf"))
+        )
+        current_inner_converged = best_audited_state.current_inner_converged
+        converged_outer = best_audited_state.certified
+        current_mutation_region_terms = mutation_region_terms_torch(
+            torch_data,
+            phi,
+            major_prior=major_prior,
+            eps=eps,
+        )
 
     final_terms = current_mutation_region_terms
     if certificate is None and isinstance(warm_state, PrimalOnlyWarmState):
@@ -2364,22 +3016,99 @@ def _fit_from_start(
 
     final_refinements = []
     certificate_needs_final_pass = False
-    for _ in range(4):
-        final_certificate_refinement = certify(
+    last_refined_certificate_gradient = certificate_gradient
+    residual_before_probe = float(
+        final_outer_diag.get("backward_error_kkt_residual", float("inf"))
+    )
+
+    def terminal_refinement(
+        requested_max_iter: int,
+        *,
+        mandatory: bool,
+    ):
+        nonlocal certificate, last_refined_certificate_gradient, work_counters
+        remaining = _remaining_edge_pass_budget(
+            work_counters,
+            max_edge_pass_equivalents,
+        )
+        # Float32 fits still owe the authoritative float64 terminal audit.
+        refinement_budget = (
+            None
+            if remaining is None
+            else remaining - (2 if runtime.dtype != torch.float64 else 0)
+        )
+        parameters = _budgeted_certificate_parameters(
+            certificate=certificate,
+            options=certificate_options,
+            requested_max_iter=requested_max_iter,
+            remaining=refinement_budget,
+            mandatory=mandatory,
+        )
+        if parameters is None:
+            return None
+        refinement_max_iter, refinement_options = parameters
+        refinement = certify(
             problem=certificate_problem,
             phi=phi,
             gradient=certificate_gradient,
             witness=certificate,
             refine=True,
-            max_iter=int(certificate_options.max_iter),
+            max_iter=refinement_max_iter,
             options=(
-                certificate_options
+                refinement_options
                 if isinstance(certificate, CompressedEdgeCertificate)
                 else None
             ),
         )
-        final_refinements.append(final_certificate_refinement)
-        certificate = final_certificate_refinement.certificate
+        final_refinements.append(refinement)
+        work_counters = work_counters + refinement.work_counters
+        certificate = refinement.certificate
+        last_refined_certificate_gradient = certificate_gradient
+        return refinement
+
+    for refinement_round in range(4):
+        if refinement_round == 0:
+            probe_iter = min(
+                _FINAL_CERTIFICATE_PROBE_MAX_ITER,
+                int(certificate_options.max_iter),
+            )
+            final_certificate_refinement = terminal_refinement(
+                probe_iter,
+                mandatory=True,
+            )
+            assert final_certificate_refinement is not None
+            probe_action = _certificate_probe_action(
+                residual_before=residual_before_probe,
+                probe_residual=float(
+                    final_certificate_refinement.diagnostics.backward_error_kkt_residual
+                ),
+                certification_tolerance=float(cert_tol),
+                recovery_stagnated=bool(recovery_stagnated),
+            )
+            if probe_action == "plateau":
+                outer_stop_reason = "certificate_refinement_plateau"
+                break
+            remaining_iter = int(certificate_options.max_iter) - probe_iter
+            if probe_action != "certified" and remaining_iter > 0:
+                deepened = terminal_refinement(
+                    remaining_iter,
+                    mandatory=False,
+                )
+                if deepened is None:
+                    work_budget_reached = True
+                else:
+                    final_certificate_refinement = deepened
+        else:
+            next_refinement = terminal_refinement(
+                int(certificate_options.max_iter),
+                mandatory=False,
+            )
+            if next_refinement is None:
+                work_budget_reached = True
+                certificate_gradient = last_refined_certificate_gradient
+                certificate_needs_final_pass = False
+                break
+            final_certificate_refinement = next_refinement
         certificate_needs_final_pass = False
         if not bool(torch.any(certificate_gradient.at_breakpoint).item()):
             break
@@ -2389,12 +3118,22 @@ def _fit_from_start(
             # subgradient interval; compressed certificates simply cannot
             # improve a false negative by alternating the interval choice.
             break
+        remaining = _remaining_edge_pass_budget(
+            work_counters,
+            max_edge_pass_equivalents,
+        )
+        if remaining is not None and remaining <= (
+            2 if runtime.dtype != torch.float64 else 0
+        ):
+            work_budget_reached = True
+            break
         fusion_adjustment = graph_adjoint_edges(
             interval_dual,
             edge_u=edge_u,
             edge_v=edge_v,
             num_nodes=int(phi.shape[0]),
         )
+        work_counters = work_counters + WorkCounters(edge_pass_equivalents=1)
         next_gradient = build_certificate_gradient(
             torch_data,
             phi,
@@ -2416,23 +3155,17 @@ def _fit_from_start(
         certificate_needs_final_pass = True
 
     if certificate_needs_final_pass:
-        final_certificate_refinement = certify(
-            problem=certificate_problem,
-            phi=phi,
-            gradient=certificate_gradient,
-            witness=certificate,
-            refine=True,
-            max_iter=int(certificate_options.max_iter),
-            options=(
-                certificate_options
-                if isinstance(certificate, CompressedEdgeCertificate)
-                else None
-            ),
+        reconciled_refinement = terminal_refinement(
+            int(certificate_options.max_iter),
+            mandatory=False,
         )
-        final_refinements.append(final_certificate_refinement)
-
-    for refinement in final_refinements:
-        work_counters = work_counters + refinement.work_counters
+        if reconciled_refinement is None:
+            work_budget_reached = True
+            certificate_gradient = last_refined_certificate_gradient
+        else:
+            final_certificate_refinement = reconciled_refinement
+    if work_budget_reached:
+        outer_stop_reason = "solver_work_budget_reached"
     certificate = final_certificate_refinement.certificate
     final_outer_diag = final_certificate_refinement.diagnostics.as_dict()
     working_precision_kkt_residual = float(
@@ -2469,7 +3202,9 @@ def _fit_from_start(
             and audit_directional_admissible
         )
         work_counters = work_counters + WorkCounters(
-            full_certificate_audit_passes=1
+            certificate_full_graph_passes=1,
+            edge_pass_equivalents=2,
+            full_certificate_audit_passes=1,
         )
     admission_diag = admission_diagnostics.as_dict()
     for key in (
@@ -2633,6 +3368,8 @@ def fit_observed_data_pairwise_fusion(
     tol: float,
     certification_tol: float | None = None,
     use_backward_error_progress: bool = False,
+    staged_recovery: bool = True,
+    stagnation_audit_patience: int = _RECOVERY_STAGNATION_AUDIT_WINDOW,
     phi_start: np.ndarray | torch.Tensor | None = None,
     graph: PairwiseFusionGraph | None = None,
     adaptive_weight_gamma: float = 1.0,
@@ -2657,6 +3394,7 @@ def fit_observed_data_pairwise_fusion(
     dense_fallback_policy: str = DEFAULT_DENSE_FALLBACK_POLICY,
     workset_add_batch: int = DEFAULT_WORKSET_ADD_BATCH,
     workset_max_expansions: int = DEFAULT_WORKSET_MAX_EXPANSIONS,
+    max_edge_pass_equivalents: int | None = None,
     certificate_max_iter: int = DEFAULT_CERTIFICATE_MAX_ITER,
     certificate_refinement_rounds: int = DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
     certificate_column_tol_scale: float = DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
@@ -2752,6 +3490,21 @@ def fit_observed_data_pairwise_fusion(
             start_bank.append(effective_pooled_start)
     start_bank = _deduplicate_starts(start_bank, runtime=effective_runtime)
 
+    attempted_work = WorkCounters()
+
+    def remaining_attempt_budget() -> int | None:
+        return _remaining_edge_pass_budget(
+            attempted_work,
+            max_edge_pass_equivalents,
+        )
+
+    def can_launch_another_solver_attempt() -> bool:
+        remaining = remaining_attempt_budget()
+        return bool(
+            remaining is None
+            or remaining > _MANDATORY_TERMINAL_EDGE_PASS_ALLOWANCE
+        )
+
     def solve_start_once(
         *,
         context: SolverContext,
@@ -2759,9 +3512,10 @@ def fit_observed_data_pairwise_fusion(
         state: SolverState | None,
         polish: bool = False,
     ) -> RawFit:
+        nonlocal attempted_work
         if context.base_objective_key is None:
             raise ValueError("SolverContext lacks a typed base-objective key.")
-        return _fit_from_start(
+        result = _fit_from_start(
             data,
             torch_data=torch_data_from_context(context),
             runtime=context.runtime,
@@ -2778,6 +3532,8 @@ def fit_observed_data_pairwise_fusion(
             tol=tol,
             certification_tol=certification_tol,
             use_backward_error_progress=use_backward_error_progress,
+            staged_recovery=staged_recovery,
+            stagnation_audit_patience=stagnation_audit_patience,
             phi_start=start,
             solver_state=state,
             lower=context.lower,
@@ -2787,12 +3543,15 @@ def fit_observed_data_pairwise_fusion(
             compressed_cache_max_bytes=compressed_cache_max_bytes,
             workset_add_batch=workset_add_batch,
             workset_max_expansions=workset_max_expansions,
+            max_edge_pass_equivalents=remaining_attempt_budget(),
             certificate_max_iter=certificate_max_iter,
             certificate_refinement_rounds=certificate_refinement_rounds,
             certificate_column_tol_scale=certificate_column_tol_scale,
             verbose=verbose,
             audit_context_cache=context.audit_context_cache,
         )
+        attempted_work = attempted_work + result.work
+        return result
 
     cpu_fallback_context: SolverContext | None = None
     best_artifacts: RawFit | None = None
@@ -2800,6 +3559,8 @@ def fit_observed_data_pairwise_fusion(
     start_artifacts: list[RawFit] = []
     start_contexts: list[SolverContext] = []
     for start in start_bank:
+        if start_artifacts and not can_launch_another_solver_attempt():
+            break
         state_for_start = (
             solver_state
             if (solver_state is not None and start is start_bank[0])
@@ -2842,6 +3603,10 @@ def fit_observed_data_pairwise_fusion(
                     attempted_artifacts = policy_state.result
                     if attempted_artifacts is None:
                         raise AssertionError("Dense retry lacks an attempted fit.")
+                    if not can_launch_another_solver_attempt():
+                        artifacts = attempted_artifacts
+                        artifacts_context = attempt_context
+                        break
                     cpu_seed = (
                         attempted_artifacts.state.phi
                         if attempted_artifacts.state is not None
@@ -2955,6 +3720,9 @@ def fit_observed_data_pairwise_fusion(
         action = decide_next_action(policy_state)
         match action:
             case NextAction.FLOAT64_POLISH:
+                if not can_launch_another_solver_attempt():
+                    best_artifacts = working_artifacts
+                    break
                 try:
                     precision_context = _float64_context(
                         data, selected_start_context
@@ -2969,6 +3737,9 @@ def fit_observed_data_pairwise_fusion(
             case NextAction.RETRY_SAME_RUNTIME:
                 if precision_context is None:
                     raise AssertionError("Precision retry lacks a promoted context.")
+                if not can_launch_another_solver_attempt():
+                    best_artifacts = working_artifacts
+                    break
                 try:
                     polished = solve_start_once(
                         context=precision_context,
@@ -3018,4 +3789,4 @@ def fit_observed_data_pairwise_fusion(
                 raise policy_state.resource_error
             case NextAction.DENSE_CURRENT_DEVICE:
                 raise AssertionError("Precision policy requested a dense retry.")
-    return best_artifacts
+    return replace(best_artifacts, work=attempted_work)

@@ -307,7 +307,7 @@ def solver_recovery_fit_options(
         # profile-sized budgets.  Solves still stop early after certification.
         solver=replace(
             solver,
-            outer_max_iter=max(int(solver.outer_max_iter) * 24, 144),
+            outer_max_iter=max(int(solver.outer_max_iter) * effort_factor, 36),
             inner_max_iter=max(int(solver.inner_max_iter) * effort_factor, 150),
             certificate=replace(
                 certificate,

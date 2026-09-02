@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from ..core.bic import SelectionScore
-from ..core.fusion.types import RawFit, SolverState
+from ..core.fusion.types import RawFit, SolverState, WorkCounters
 
 StartArray = np.ndarray | torch.Tensor
 
@@ -81,8 +81,22 @@ class PartitionRefitSummary:
     coordinate_argmin_lower: np.ndarray | None = None
     coordinate_argmin_upper: np.ndarray | None = None
     coordinate_statistically_identified: np.ndarray | None = None
+    refit_coordinate_count: int = 0
+    refit_objective_evaluations: int = 0
 
     def __post_init__(self) -> None:
+        if int(self.refit_coordinate_count) < 0 or int(
+            self.refit_objective_evaluations
+        ) < 0:
+            raise ValueError("Partition-refit work counters must be nonnegative.")
+        object.__setattr__(
+            self, "refit_coordinate_count", int(self.refit_coordinate_count)
+        )
+        object.__setattr__(
+            self,
+            "refit_objective_evaluations",
+            int(self.refit_objective_evaluations),
+        )
         if self.global_optimum_certified and (
             not np.isfinite(float(self.global_lower_bound))
             or not np.isfinite(float(self.global_optimality_gap))
@@ -148,12 +162,15 @@ class PartitionRefitSummary:
 
 @dataclass(frozen=True)
 class RawFusionCandidate:
+    """Raw-fusion partition with an authoritative fixed-label refit and score."""
+
     raw_fit: RawFit
     partition: FusionPartition
     refit: PartitionRefitSummary
     score: SelectionScore
     eligible_for_selection: bool
     ineligibility_reason: str
+    work: WorkCounters = WorkCounters()
 
     @property
     def raw_objective_certified(self) -> bool:
@@ -163,6 +180,40 @@ class RawFusionCandidate:
             and certificate.certified
             and certificate.admissible
         )
+
+
+@dataclass(frozen=True)
+class UnscoredRawFusionCandidate:
+    """Raw optimizer result retained before fixed-partition evaluation.
+
+    A raw fit that fails the exact-fusion admission contract cannot become a
+    selectable partition candidate.  Retaining that attempt as a distinct
+    type preserves its partition and numerical diagnostics without inventing
+    a fixed-label refit or score that downstream selection must ignore.
+    """
+
+    raw_fit: RawFit
+    partition: FusionPartition
+    ineligibility_reason: str
+    refit: None = field(default=None, init=False, repr=False)
+    score: None = field(default=None, init=False, repr=False)
+    eligible_for_selection: Literal[False] = field(default=False, init=False)
+    work: WorkCounters = WorkCounters()
+
+    def __post_init__(self) -> None:
+        reason = str(self.ineligibility_reason).strip()
+        if not reason or reason == "none":
+            raise ValueError(
+                "An unscored raw-fusion candidate requires an ineligibility reason."
+            )
+        object.__setattr__(self, "ineligibility_reason", reason)
+
+    @property
+    def raw_objective_certified(self) -> bool:
+        # Construction and identity validation require failure of the full
+        # exact-fusion admission contract, which is stricter than the solver's
+        # local ``certified``/``admissible`` booleans alone.
+        return False
 
 
 @dataclass(frozen=True)
@@ -214,18 +265,21 @@ class DirectPartitionCandidate:
     score: SelectionScore
     eligible_for_selection: bool
     ineligibility_reason: str
+    work: WorkCounters = WorkCounters()
 
 
+RawFusionArtifact = Union[RawFusionCandidate, UnscoredRawFusionCandidate]
 SelectablePartitionCandidate = Union[RawFusionCandidate, DirectPartitionCandidate]
+SearchArtifact = Union[SelectablePartitionCandidate, UnscoredRawFusionCandidate]
 CandidateFamily = Literal["raw_fusion", "direct_partition"]
 
 
 @dataclass(frozen=True, slots=True)
 class CandidateRecord:
-    """Typed selection unit and its compact search provenance."""
+    """Typed search artifact and its compact provenance."""
 
     candidate_id: int
-    candidate: SelectablePartitionCandidate
+    candidate: SearchArtifact
     trace: CandidateTrace = field(default_factory=lambda: CandidateTrace())
 
     def __post_init__(self) -> None:
@@ -233,7 +287,7 @@ class CandidateRecord:
             raise ValueError("candidate_id must be nonnegative.")
 
     @property
-    def score(self) -> SelectionScore:
+    def score(self) -> SelectionScore | None:
         return self.candidate.score
 
     @property
@@ -244,7 +298,10 @@ class CandidateRecord:
     def family(self) -> CandidateFamily:
         return (
             "raw_fusion"
-            if isinstance(self.candidate, RawFusionCandidate)
+            if isinstance(
+                self.candidate,
+                (RawFusionCandidate, UnscoredRawFusionCandidate),
+            )
             else "direct_partition"
         )
 
@@ -254,7 +311,10 @@ class CandidateRecord:
 
     @property
     def lambda_value(self) -> float | None:
-        if isinstance(self.candidate, RawFusionCandidate):
+        if isinstance(
+            self.candidate,
+            (RawFusionCandidate, UnscoredRawFusionCandidate),
+        ):
             return float(self.candidate.raw_fit.provenance.lambda_value)
         return None
 
@@ -264,13 +324,19 @@ class CandidateRecord:
 
     @property
     def penalized_objective(self) -> float | None:
-        if isinstance(self.candidate, RawFusionCandidate):
+        if isinstance(
+            self.candidate,
+            (RawFusionCandidate, UnscoredRawFusionCandidate),
+        ):
             return float(self.candidate.raw_fit.objective.total)
         return None
 
     @property
     def mm_consistency_violations(self) -> int:
-        if isinstance(self.candidate, RawFusionCandidate):
+        if isinstance(
+            self.candidate,
+            (RawFusionCandidate, UnscoredRawFusionCandidate),
+        ):
             return int(self.candidate.raw_fit.convergence.mm_consistency_violations)
         return 0
 
@@ -328,6 +394,14 @@ class RawAttemptSummary:
     certificate_problem_hash: str
     fallback_reason: str
     promotion_status: str = "not_recorded"
+    work_inner_stationarity_checks: int = 0
+    work_inner_full_kkt_audits: int = 0
+    work_outer_kkt_audits: int = 0
+    work_certificate_full_graph_passes: int = 0
+    work_partition_refit_coordinates: int = 0
+    work_partition_refit_objective_evaluations: int = 0
+    work_edge_pass_equivalents: int = 0
+    work_full_certificate_audit_passes: int = 0
 
     @classmethod
     def from_fit(
@@ -421,8 +495,30 @@ class RawAttemptSummary:
                 getattr(convergence, "rejected_outer_steps", 0)
             ),
             work_inner_iterations=int(getattr(work, "inner_iterations", 0)),
+            work_inner_stationarity_checks=int(
+                getattr(work, "inner_stationarity_checks", 0)
+            ),
+            work_inner_full_kkt_audits=int(
+                getattr(work, "inner_full_kkt_audits", 0)
+            ),
+            work_outer_kkt_audits=int(getattr(work, "outer_kkt_audits", 0)),
             work_certificate_iterations=int(
                 getattr(work, "certificate_iterations", 0)
+            ),
+            work_certificate_full_graph_passes=int(
+                getattr(work, "certificate_full_graph_passes", 0)
+            ),
+            work_partition_refit_coordinates=int(
+                getattr(work, "partition_refit_coordinates", 0)
+            ),
+            work_partition_refit_objective_evaluations=int(
+                getattr(work, "partition_refit_objective_evaluations", 0)
+            ),
+            work_edge_pass_equivalents=int(
+                getattr(work, "edge_pass_equivalents", 0)
+            ),
+            work_full_certificate_audit_passes=int(
+                getattr(work, "full_certificate_audit_passes", 0)
             ),
             device=str(getattr(provenance, "device", "not_recorded")),
             dtype=str(getattr(provenance, "dtype", "not_recorded")),
@@ -464,7 +560,7 @@ class SearchCandidate:
         return int(self.record.candidate_id)
 
     @property
-    def candidate(self) -> SelectablePartitionCandidate:
+    def candidate(self) -> SearchArtifact:
         return self.record.candidate
 
     @property
@@ -567,6 +663,9 @@ class BICSelectionResult:
     ward_candidate_pool_complete: bool = False
     raw_lambda_path_resolved: bool = False
     global_hybrid_optimum_certified: bool = False
+    search_work: WorkCounters = WorkCounters()
+    cumulative_search_active_seconds: float = 0.0
+    resumed_from_checkpoint: bool = False
 
     @property
     def primary_estimator_available(self) -> bool:
@@ -597,7 +696,10 @@ def _validate_best_raw_attempt(
     if best_raw_attempt is None:
         return
     if not any(
-        isinstance(item.candidate, RawFusionCandidate)
+        isinstance(
+            item.candidate,
+            (RawFusionCandidate, UnscoredRawFusionCandidate),
+        )
         and item.candidate.raw_fit is best_raw_attempt
         for item in search
     ):
@@ -628,6 +730,9 @@ class SecondaryFallbackResult:
     ward_candidate_pool_complete: bool = False
     raw_lambda_path_resolved: bool = False
     global_hybrid_optimum_certified: bool = False
+    search_work: WorkCounters = WorkCounters()
+    cumulative_search_active_seconds: float = 0.0
+    resumed_from_checkpoint: bool = False
     primary_estimator_available: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
@@ -687,6 +792,9 @@ class DiagnosticOnlyResult:
     ward_candidate_pool_complete: bool = False
     raw_lambda_path_resolved: bool = False
     global_hybrid_optimum_certified: bool = False
+    search_work: WorkCounters = WorkCounters()
+    cumulative_search_active_seconds: float = 0.0
+    resumed_from_checkpoint: bool = False
     primary_estimator_available: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:

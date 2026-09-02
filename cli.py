@@ -151,6 +151,53 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--workset-max-expansions", type=int, default=DEFAULT_WORKSET_MAX_EXPANSIONS
     )
+    parser.add_argument(
+        "--max-tumor-edge-pass-equivalents",
+        type=int,
+        default=None,
+        help=(
+            "Deterministic cumulative raw-solver work cap. The current lambda "
+            "observation finishes atomically before the search stops unresolved."
+        ),
+    )
+    parser.add_argument(
+        "--recovery-policy",
+        choices=["staged", "legacy"],
+        default="staged",
+        help=(
+            "Staged recovery detects objective/KKT stagnation and probes terminal "
+            "certificate refinement before deepening."
+        ),
+    )
+    parser.add_argument(
+        "--stagnation-audit-patience",
+        type=int,
+        default=4,
+        help="Number of recovery KKT audits in the stagnation window.",
+    )
+    parser.add_argument(
+        "--checkpoint-every-lambda",
+        action="store_true",
+        help=(
+            "Atomically checkpoint controller, candidates, and CPU-offloaded "
+            "solver states after every completed lambda observation."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-file",
+        default=None,
+        help=(
+            "Checkpoint path; defaults to OUTDIR/.clipp2-checkpoints/TUMOR.npz."
+        ),
+    )
+    parser.add_argument(
+        "--resume-checkpoint",
+        default=None,
+        help=(
+            "Resume the exact identity-matched online search from this checkpoint "
+            "and keep updating the same file."
+        ),
+    )
     parser.add_argument("--certificate-max-iter", type=int, default=None)
     parser.add_argument(
         "--certificate-refinement-rounds",
@@ -211,6 +258,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             and int(args.selection_refit_max_iter) < 1
         ):
             parser.error("--selection-refit-max-iter must be positive")
+        if (
+            args.max_tumor_edge_pass_equivalents is not None
+            and int(args.max_tumor_edge_pass_equivalents) < 1
+        ):
+            parser.error("--max-tumor-edge-pass-equivalents must be positive")
+        if int(args.stagnation_audit_patience) < 1:
+            parser.error("--stagnation-audit-patience must be positive")
+        if args.checkpoint_file and not args.checkpoint_every_lambda:
+            parser.error("--checkpoint-file requires --checkpoint-every-lambda")
     return args
 
 
@@ -235,6 +291,9 @@ def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
         ),
         workset_add_batch=args.workset_add_batch,
         workset_max_expansions=args.workset_max_expansions,
+        max_tumor_edge_pass_equivalents=args.max_tumor_edge_pass_equivalents,
+        recovery_policy=args.recovery_policy,
+        stagnation_audit_patience=args.stagnation_audit_patience,
         certificate_max_iter=args.certificate_max_iter,
         certificate_refinement_rounds=args.certificate_refinement_rounds,
         certificate_column_tol_scale=args.certificate_column_tol_scale,
@@ -274,6 +333,9 @@ def main(argv: list[str] | None = None) -> None:
         unsupported_policy=args.unsupported_policy,
         dosage_prior_penalty=args.dosage_prior_penalty,
         failure_policy=args.failure_policy,
+        checkpoint_every_lambda=bool(args.checkpoint_every_lambda),
+        checkpoint_file=args.checkpoint_file,
+        resume_checkpoint=args.resume_checkpoint,
     )
     print(_printable_summary(summary))
 

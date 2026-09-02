@@ -85,6 +85,34 @@ class CertificateAttempt:
     work_counters: WorkCounters = WorkCounters()
 
 
+def _certificate_work_counters(
+    *,
+    iterations: int = 0,
+    full_graph_passes: int = 0,
+    policy_audit_passes: int = 0,
+) -> WorkCounters:
+    """Return deterministic work charged by one certificate operation.
+
+    A projected-dual iteration is charged two normalized edge passes for its
+    adjoint/forward update.  A full-original-graph diagnostic is charged two
+    more for its edge residual and adjoint.  The accounting is intentionally
+    conservative and hardware independent; it never participates in a
+    certificate decision.
+    """
+
+    iteration_count = max(int(iterations), 0)
+    graph_pass_count = max(int(full_graph_passes), 0)
+    policy_pass_count = max(int(policy_audit_passes), 0)
+    return WorkCounters(
+        certificate_iterations=iteration_count,
+        certificate_full_graph_passes=graph_pass_count,
+        edge_pass_equivalents=(
+            2 * iteration_count + 2 * graph_pass_count
+        ),
+        full_certificate_audit_passes=policy_pass_count,
+    )
+
+
 def _inadmissible_downward_kink_mask(
     downward_kink: torch.Tensor,
     lower: torch.Tensor,
@@ -598,6 +626,8 @@ def _refine_compressed_certificate(
     )
     base_grad = grad_smooth + between_adj
     full_certificate_audit_passes = 0
+    certificate_iterations = 0
+    certificate_full_graph_passes = 0
     # A nonempty inherited support may already be authoritative, so give it one
     # full-graph fast-path audit. Fresh proposals go directly to the cheap
     # workset/missing-column gates and pay for a full audit only if those pass.
@@ -622,6 +652,7 @@ def _refine_compressed_certificate(
             atol=atol,
         )
         full_certificate_audit_passes += 1
+        certificate_full_graph_passes += 1
     if has_inherited_fast_path and before.kkt_residual <= 5.0 * float(atol):
         # The inherited compressed state has already passed a full
         # original-graph audit.  Re-optimizing its workset cannot strengthen
@@ -639,8 +670,10 @@ def _refine_compressed_certificate(
             certificate=certified,
             diagnostics=before,
             status="certified",
-            work_counters=WorkCounters(
-                full_certificate_audit_passes=full_certificate_audit_passes,
+            work_counters=_certificate_work_counters(
+                iterations=certificate_iterations,
+                full_graph_passes=certificate_full_graph_passes,
+                policy_audit_passes=full_certificate_audit_passes,
             ),
         )
     status = "not_certified"
@@ -661,6 +694,7 @@ def _refine_compressed_certificate(
                 options=options,
             )
         )
+        certificate_iterations += int(iterations)
         current = CompressedEdgeCertificate(
             labels=labels,
             centers=centers,
@@ -702,6 +736,7 @@ def _refine_compressed_certificate(
             scale=scale,
             add_batch=int(options.add_batch),
         )
+        certificate_full_graph_passes += 1
         column_ready = column_residual <= float(options.column_tolerance)
         should_expand = not column_ready
         if column_ready:
@@ -717,6 +752,7 @@ def _refine_compressed_certificate(
                 atol=atol,
             )
             full_certificate_audit_passes += 1
+            certificate_full_graph_passes += 1
             if final_diag.kkt_residual <= 5.0 * float(atol):
                 status = "certified"
                 certificate = current
@@ -759,8 +795,10 @@ def _refine_compressed_certificate(
         certificate=certificate,
         diagnostics=final_diag,
         status=status,
-        work_counters=WorkCounters(
-            full_certificate_audit_passes=full_certificate_audit_passes,
+        work_counters=_certificate_work_counters(
+            iterations=certificate_iterations,
+            full_graph_passes=certificate_full_graph_passes,
+            policy_audit_passes=full_certificate_audit_passes,
         ),
     )
 
@@ -1037,6 +1075,7 @@ def _refine_certificate(
         atol=problem.atol,
         max_iter=max_iter,
     )
+    refinement_iterations = int(dense.get("refinement_iterations", 0))
     dual = dense["dual"]
     refined_certificate = (
         DenseEdgeCertificate(
@@ -1051,6 +1090,14 @@ def _refine_certificate(
         certificate=refined_certificate,
         diagnostics=KKTDiagnostics.from_mapping(dense["diag"]),
         status=str(dense["status"]),
+        # The dense backend performs one incoming audit and one analytic/final
+        # audit in addition to a full diagnostic after every refinement step.
+        # Charging the early retained-input fast path the same two-pass floor is
+        # deliberately conservative for deterministic budget enforcement.
+        work_counters=_certificate_work_counters(
+            iterations=refinement_iterations,
+            full_graph_passes=refinement_iterations + 2,
+        ),
     )
 
 
@@ -1100,4 +1147,5 @@ def certify(
         certificate=witness,
         diagnostics=diagnostics,
         status="audited",
+        work_counters=_certificate_work_counters(full_graph_passes=1),
     )

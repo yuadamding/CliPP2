@@ -75,6 +75,7 @@ class ApproximateScalarMinimum:
     final_grid_spacing: float
     best_second_loss_gap: float
     method: str = "vectorized_grid_local_v1"
+    objective_evaluations: int = 0
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,7 @@ class ScalarGlobalMinimumCertificate:
     argmin_lower: float | None = None
     argmin_upper: float | None = None
     statistically_identified: bool = True
+    objective_evaluations: int = 0
 
     @property
     def representative(self) -> float:
@@ -299,6 +301,7 @@ def approximate_scalar_minimum(
             grid_points_evaluated=len(evaluated),
             final_grid_spacing=final_spacing,
             best_second_loss_gap=float("inf"),
+            objective_evaluations=len(evaluated),
         )
     ranked = finite[np.argsort(losses[finite], kind="stable")]
     best = int(ranked[0])
@@ -313,6 +316,7 @@ def approximate_scalar_minimum(
         grid_points_evaluated=len(evaluated),
         final_grid_spacing=final_spacing,
         best_second_loss_gap=max(gap, 0.0),
+        objective_evaluations=len(evaluated),
     )
 
 
@@ -462,6 +466,7 @@ def certify_scalar_minimum(
             argmin_lower=float(problem.lower),
             argmin_upper=float(problem.upper),
             statistically_identified=False,
+            objective_evaluations=0,
         )
     if problem.upper <= problem.lower:
         loss = float(scalar_loss(problem, problem.lower))
@@ -476,6 +481,7 @@ def certify_scalar_minimum(
             argmin_lower=float(problem.lower),
             argmin_upper=float(problem.upper),
             statistically_identified=bool(np.any(problem.observed)),
+            objective_evaluations=1,
         )
     points = np.concatenate(
         (
@@ -488,9 +494,11 @@ def certify_scalar_minimum(
     points = np.unique(np.clip(points, problem.lower, problem.upper))
     best_beta = float(points[0])
     best_value = float("inf")
+    objective_evaluations = 0
 
     def consider(beta: float) -> None:
-        nonlocal best_beta, best_value
+        nonlocal best_beta, best_value, objective_evaluations
+        objective_evaluations += 1
         value = float(scalar_loss(problem, beta))
         tie = tolerance * 0.25
         if value < best_value - tie or (
@@ -506,6 +514,7 @@ def certify_scalar_minimum(
     for left, right in zip(points[:-1], points[1:]):
         if right > left:
             bound = _interval_lower_bound(problem, float(left), float(right))
+            objective_evaluations += 1
             heapq.heappush(heap, (bound, float(left), float(right), serial))
             intervals += 1
             serial += 1
@@ -524,6 +533,7 @@ def certify_scalar_minimum(
         consider(midpoint)
         for child_left, child_right in ((left, midpoint), (midpoint, right)):
             child_bound = _interval_lower_bound(problem, child_left, child_right)
+            objective_evaluations += 1
             intervals += 1
             if child_bound <= best_value:
                 heapq.heappush(
@@ -553,6 +563,7 @@ def certify_scalar_minimum(
         argmin_lower=float(np.clip(best_beta, problem.lower, problem.upper)),
         argmin_upper=float(np.clip(best_beta, problem.lower, problem.upper)),
         statistically_identified=True,
+        objective_evaluations=int(objective_evaluations),
     )
 
 
@@ -586,6 +597,7 @@ class PartitionRefitResult:
     coordinate_argmin_lower: np.ndarray | None = None
     coordinate_argmin_upper: np.ndarray | None = None
     coordinate_statistically_identified: np.ndarray | None = None
+    refit_objective_evaluations: int = 0
 
 
 @dataclass(frozen=True)
@@ -604,6 +616,7 @@ class _RefitCoordinateResult:
     grid_points: int = 0
     grid_spacing: float = 0.0
     best_second_loss_gap: float = float("inf")
+    objective_evaluations: int = 0
 
 
 def canonical_partition_labels(labels: np.ndarray) -> np.ndarray:
@@ -650,6 +663,7 @@ def _fit_coordinate(
             argmin_lower=float(problem.lower),
             argmin_upper=float(problem.upper),
             statistically_identified=False,
+            objective_evaluations=0,
         )
     if mode == "interval_certified":
         result = certify_scalar_minimum(
@@ -669,6 +683,7 @@ def _fit_coordinate(
             argmin_lower=float(result.argmin_lower),
             argmin_upper=float(result.argmin_upper),
             statistically_identified=bool(result.statistically_identified),
+            objective_evaluations=int(result.objective_evaluations),
         )
     result = approximate_scalar_minimum(
         problem,
@@ -691,6 +706,7 @@ def _fit_coordinate(
         grid_points=int(result.grid_points_evaluated),
         grid_spacing=float(result.final_grid_spacing),
         best_second_loss_gap=float(result.best_second_loss_gap),
+        objective_evaluations=int(result.objective_evaluations),
     )
 
 
@@ -749,6 +765,7 @@ def partition_constrained_observed_refit(
     certificate_methods: set[str] = set()
     certificate_intervals = 0
     total_grid_points = 0
+    total_objective_evaluations = 0
     max_grid_spacing = 0.0
     best_second_loss_gaps: list[float] = []
     total_loss = 0.0
@@ -792,6 +809,7 @@ def partition_constrained_observed_refit(
             coordinate_certified[cluster, region] = coordinate.globally_certified
             certificate_intervals += coordinate.certificate_intervals
             total_grid_points += int(coordinate.grid_points)
+            total_objective_evaluations += int(coordinate.objective_evaluations)
             max_grid_spacing = max(max_grid_spacing, float(coordinate.grid_spacing))
             if np.isfinite(float(coordinate.best_second_loss_gap)):
                 best_second_loss_gaps.append(float(coordinate.best_second_loss_gap))
@@ -876,4 +894,5 @@ def partition_constrained_observed_refit(
         coordinate_argmin_lower=argmin_lower,
         coordinate_argmin_upper=argmin_upper,
         coordinate_statistically_identified=statistically_identified,
+        refit_objective_evaluations=int(total_objective_evaluations),
     )

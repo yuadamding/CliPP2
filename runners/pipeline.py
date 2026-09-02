@@ -6,6 +6,7 @@ from time import perf_counter
 from typing import Literal
 
 from ..config import FitConfig, resolve_fit_config
+from ..core.fusion.types import WorkCounters
 from ..io.tumor_txt import DEFAULT_DOSAGE_PRIOR_PENALTY, load_tumor_txt
 from ..model_selection.candidates import validate_candidate_identity
 from ..model_selection.search import (
@@ -100,6 +101,13 @@ def _outcome_for_failure_policy(
         ward_candidate_pool_complete=outcome.ward_candidate_pool_complete,
         raw_lambda_path_resolved=outcome.raw_lambda_path_resolved,
         global_hybrid_optimum_certified=False,
+        search_work=getattr(outcome, "search_work", WorkCounters()),
+        cumulative_search_active_seconds=(
+            getattr(outcome, "cumulative_search_active_seconds", 0.0)
+        ),
+        resumed_from_checkpoint=bool(
+            getattr(outcome, "resumed_from_checkpoint", False)
+        ),
     )
 
 
@@ -112,6 +120,9 @@ def process_tumor_bundle(
     unsupported_policy: str = "error",
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     failure_policy: str = DEFAULT_FAILURE_POLICY,
+    checkpoint_every_lambda: bool = False,
+    checkpoint_file: str | Path | None = None,
+    resume_checkpoint: str | Path | None = None,
 ) -> tuple[dict[str, object], tuple[SearchCandidate, ...]]:
     """Fit one canonical tumor TSV file with the default workflow."""
 
@@ -129,11 +140,27 @@ def process_tumor_bundle(
 
     if fit_config is None:
         fit_config = resolve_fit_config()
+    if checkpoint_file is not None and resume_checkpoint is not None:
+        if Path(checkpoint_file).resolve() != Path(resume_checkpoint).resolve():
+            raise ValueError(
+                "checkpoint_file and resume_checkpoint must name the same file."
+            )
+    checkpoint_path: Path | None = None
+    if resume_checkpoint is not None:
+        checkpoint_path = Path(resume_checkpoint)
+    elif checkpoint_file is not None:
+        checkpoint_path = Path(checkpoint_file)
+    elif checkpoint_every_lambda:
+        checkpoint_path = (
+            outdir / ".clipp2-checkpoints" / f"{data.tumor_id}.npz"
+        )
     selection_result = _outcome_for_failure_policy(
         select_model(
             data=data,
             fit_config=fit_config,
             use_warm_starts=use_warm_starts,
+            checkpoint_path=checkpoint_path,
+            resume_checkpoint=resume_checkpoint is not None,
         ),
         failure_policy=normalized_failure_policy,
         tumor_id=str(data.tumor_id),
@@ -171,6 +198,9 @@ def process_tumor(
     unsupported_policy: str = "error",
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
     failure_policy: str = DEFAULT_FAILURE_POLICY,
+    checkpoint_every_lambda: bool = False,
+    checkpoint_file: str | Path | None = None,
+    resume_checkpoint: str | Path | None = None,
 ) -> dict[str, object]:
     """Fit one tumor TSV file."""
 
@@ -183,6 +213,9 @@ def process_tumor(
         unsupported_policy=unsupported_policy,
         dosage_prior_penalty=dosage_prior_penalty,
         failure_policy=failure_policy,
+        checkpoint_every_lambda=checkpoint_every_lambda,
+        checkpoint_file=checkpoint_file,
+        resume_checkpoint=resume_checkpoint,
     )
     return summary
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from .core.fusion.defaults import (
     DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
@@ -74,6 +74,21 @@ class ResourceConfig:
     compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES
     workset_add_batch: int = DEFAULT_WORKSET_ADD_BATCH
     workset_max_expansions: int = DEFAULT_WORKSET_MAX_EXPANSIONS
+    # Hardware-independent, cumulative raw-solver budget.  None deliberately
+    # preserves an unlimited search until a profile-specific cap is calibrated.
+    max_tumor_edge_pass_equivalents: int | None = None
+    # Internal per-solve remainder used to enforce the tumor cap at safe outer
+    # boundaries. It is never a separate public tuning surface.
+    max_attempt_edge_pass_equivalents: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_tumor_edge_pass_equivalents",
+            "max_attempt_edge_pass_equivalents",
+        ):
+            value = getattr(self, name)
+            if value is not None and int(value) <= 0:
+                raise ValueError(f"{name} must be positive when set.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,11 +107,17 @@ class SolverConfig:
     # Internal recovery mode: once the frozen context is float64, iterative
     # progress uses the same componentwise residual as terminal admission.
     use_backward_error_progress: bool = False
+    recovery_policy: Literal["staged", "legacy"] = "staged"
+    stagnation_audit_patience: int = 4
 
     def __post_init__(self) -> None:
         _positive("tol", self.tolerance)
         if self.certification_tolerance is not None:
             _positive("certification_tolerance", self.certification_tolerance)
+        if str(self.recovery_policy) not in {"staged", "legacy"}:
+            raise ValueError("recovery_policy must be staged or legacy.")
+        if int(self.stagnation_audit_patience) < 1:
+            raise ValueError("stagnation_audit_patience must be positive.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +229,9 @@ def resolve_fit_config(
     dense_fallback_policy: str = DEFAULT_DENSE_FALLBACK_POLICY,
     workset_add_batch: int = DEFAULT_WORKSET_ADD_BATCH,
     workset_max_expansions: int = DEFAULT_WORKSET_MAX_EXPANSIONS,
+    max_tumor_edge_pass_equivalents: int | None = None,
+    recovery_policy: str = "staged",
+    stagnation_audit_patience: int = 4,
     verbose: bool = False,
 ) -> FitConfig:
     """Resolve a profile and selection contract once into concrete settings."""
@@ -238,12 +262,19 @@ def resolve_fit_config(
         inner_max_iter=int(profile.inner_max_iter if inner_max_iter is None else inner_max_iter),
         tolerance=float(profile.solver_tolerance if tol is None else tol),
         objective_shape=str(objective_shape),
+        recovery_policy=str(recovery_policy),
+        stagnation_audit_patience=int(stagnation_audit_patience),
         certificate=certificate,
         resources=ResourceConfig(
             workset_max_bytes=int(workset_max_bytes),
             compressed_cache_max_bytes=int(compressed_cache_max_bytes),
             workset_add_batch=int(workset_add_batch),
             workset_max_expansions=int(workset_max_expansions),
+            max_tumor_edge_pass_equivalents=(
+                None
+                if max_tumor_edge_pass_equivalents is None
+                else int(max_tumor_edge_pass_equivalents)
+            ),
         ),
     )
     selection = SelectionConfig(

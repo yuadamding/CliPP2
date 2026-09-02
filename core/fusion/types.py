@@ -176,16 +176,44 @@ BackendWarmState: TypeAlias = DenseWarmState | PrimalOnlyWarmState
 
 @dataclass(frozen=True, slots=True)
 class WorkCounters:
+    """Deterministic optimizer-work accounting.
+
+    ``edge_pass_equivalents`` is the hardware-independent cap unit.  It is a
+    conservative count of normalized complete-edge sweeps, not a kernel-launch
+    or wall-clock estimate.  ``full_certificate_audit_passes`` predates the
+    general accounting surface and remains the narrower policy-routing counter
+    used to distinguish an incomplete compressed representation from an
+    audited one; new budget code must use ``certificate_full_graph_passes`` or
+    ``edge_pass_equivalents`` instead.
+    """
+
+    inner_iterations: int = 0
+    inner_stationarity_checks: int = 0
+    inner_full_kkt_audits: int = 0
+    outer_kkt_audits: int = 0
+    certificate_iterations: int = 0
+    certificate_full_graph_passes: int = 0
+    partition_refit_coordinates: int = 0
+    partition_refit_objective_evaluations: int = 0
+    edge_pass_equivalents: int = 0
     full_certificate_audit_passes: int = 0
+
+    def __post_init__(self) -> None:
+        for item in fields(self):
+            value = int(getattr(self, item.name))
+            if value < 0:
+                raise ValueError(f"Work counter {item.name} must be nonnegative.")
+            object.__setattr__(self, item.name, value)
 
     def __add__(self, other: "WorkCounters") -> "WorkCounters":
         if not isinstance(other, WorkCounters):
             return NotImplemented
         return WorkCounters(
-            full_certificate_audit_passes=(
-                int(self.full_certificate_audit_passes)
-                + int(other.full_certificate_audit_passes)
-            )
+            **{
+                item.name: int(getattr(self, item.name))
+                + int(getattr(other, item.name))
+                for item in fields(self)
+            }
         )
 
 
@@ -199,6 +227,7 @@ class InnerSolveResult:
     converged: bool
     fallback_reason: str = ""
     iterations: int = 0
+    work: WorkCounters = WorkCounters()
 
 
 @dataclass(frozen=True, slots=True)

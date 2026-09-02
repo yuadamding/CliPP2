@@ -7,7 +7,7 @@ may use the three historical compatibility filenames.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import hashlib
 from pathlib import Path
 
@@ -15,10 +15,11 @@ import numpy as np
 
 from .._version import __version__ as _SOFTWARE_VERSION
 from ..config import FitConfig
-from ..core.fusion.types import RawFit
+from ..core.fusion.types import RawFit, WorkCounters
 from ..io.data import TumorData
 from ..model_selection.types import (
     DirectPartition,
+    DirectPartitionCandidate,
     FusionPartition,
     PartitionRefitSummary,
     RawFusionCandidate,
@@ -39,7 +40,7 @@ from .status_outputs import (
 )
 
 
-SUMMARY_SCHEMA_VERSION = 5
+SUMMARY_SCHEMA_VERSION = 6
 _PRIMARY_SUFFIXES = (
     "mutation_clusters.tsv",
     "cluster_centers.tsv",
@@ -160,12 +161,55 @@ def _raw_summary(raw_fit: RawFit | None) -> dict[str, object]:
     }
 
 
+def _search_work_summary(result: TumorSelectionOutcome) -> dict[str, int]:
+    """Aggregate each executed raw attempt and uncached partition refit once."""
+
+    authoritative = getattr(result, "search_work", None)
+    if isinstance(authoritative, WorkCounters):
+        return {
+            f"search_work_{item.name}": int(getattr(authoritative, item.name))
+            for item in fields(authoritative)
+        }
+
+    total = WorkCounters()
+    for item in result.search:
+        for attempt in item.trace.raw_attempts:
+            total = total + WorkCounters(
+                inner_iterations=int(attempt.work_inner_iterations),
+                inner_stationarity_checks=int(
+                    attempt.work_inner_stationarity_checks
+                ),
+                inner_full_kkt_audits=int(attempt.work_inner_full_kkt_audits),
+                outer_kkt_audits=int(attempt.work_outer_kkt_audits),
+                certificate_iterations=int(attempt.work_certificate_iterations),
+                certificate_full_graph_passes=int(
+                    attempt.work_certificate_full_graph_passes
+                ),
+                partition_refit_coordinates=int(
+                    attempt.work_partition_refit_coordinates
+                ),
+                partition_refit_objective_evaluations=int(
+                    attempt.work_partition_refit_objective_evaluations
+                ),
+                edge_pass_equivalents=int(attempt.work_edge_pass_equivalents),
+                full_certificate_audit_passes=int(
+                    attempt.work_full_certificate_audit_passes
+                ),
+            )
+        if isinstance(item.candidate, DirectPartitionCandidate):
+            total = total + item.candidate.work
+    return {
+        f"search_work_{item.name}": int(getattr(total, item.name))
+        for item in fields(total)
+    }
+
+
 def analysis_summary(
     analysis: AnalysisSerialization,
     *,
     elapsed_seconds: float,
 ) -> dict[str, object]:
-    """Serialize schema-v5 status without changing estimator state."""
+    """Serialize schema-v6 status without changing estimator state."""
 
     data = analysis.data
     fit_config = analysis.fit_config
@@ -313,6 +357,13 @@ def analysis_summary(
             None if refit is None else str(refit.global_certificate_method)
         ),
         "selected_raw_solver_primal_tol": float(fit_config.solver.tolerance),
+        "recovery_policy": str(fit_config.solver.recovery_policy),
+        "stagnation_audit_patience": int(
+            fit_config.solver.stagnation_audit_patience
+        ),
+        "max_tumor_edge_pass_equivalents": (
+            fit_config.solver.resources.max_tumor_edge_pass_equivalents
+        ),
         "selected_full_kkt_tolerance": (
             None if raw_fit is None else float(raw_fit.certificate.tolerance)
         ),
@@ -366,9 +417,17 @@ def analysis_summary(
         "likelihood_supported_fraction": float(np.mean(data.likelihood_supported)),
         "likelihood_included_fraction": float(np.mean(data.objective_inclusion_mask())),
         "elapsed_seconds": float(elapsed_seconds),
+        "elapsed_seconds_scope": "current_process_segment",
+        "cumulative_search_active_seconds": float(
+            getattr(result, "cumulative_search_active_seconds", 0.0)
+        ),
+        "resumed_from_checkpoint": bool(
+            getattr(result, "resumed_from_checkpoint", False)
+        ),
         "software_version": _SOFTWARE_VERSION,
     }
     summary.update(_raw_summary(analysis.diagnostic_raw_fit))
+    summary.update(_search_work_summary(result))
     return summary
 
 

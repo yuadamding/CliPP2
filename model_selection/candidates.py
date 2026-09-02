@@ -12,7 +12,7 @@ from ..core.bic import (
 from ..config import FitConfig
 from ..core.model import fit_fixed_objective
 from ..core.objective import ObservedModel
-from ..core.fusion.types import RawFit
+from ..core.fusion.types import RawFit, WorkCounters
 from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.scalar import (
     PartitionRefitResult,
@@ -29,27 +29,34 @@ from .partitions import (
 from .scoring import (
     _effective_bic_partition_tol,
     _normalize_selection_score_name,
+    raw_fit_has_exact_fusion_certificate,
 )
 from .types import (
     DirectPartition,
     DirectPartitionCandidate,
     FusionPartition,
     PartitionRefitSummary,
+    RawFusionArtifact,
     RawFusionCandidate,
+    SearchArtifact,
     SelectionScore,
-    SelectablePartitionCandidate,
     StartArray,
+    UnscoredRawFusionCandidate,
 )
 
 
-def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None:
+def _raw_fit_ineligibility_reason(raw_fit: RawFit) -> str:
+    if float(raw_fit.provenance.lambda_value) <= 0.0:
+        return "nonpositive_lambda"
+    if not raw_fit_has_exact_fusion_certificate(raw_fit):
+        return "raw_objective_not_kkt_certified"
+    return "none"
+
+
+def validate_candidate_identity(candidate: SearchArtifact) -> None:
     """Fail fast when partition, refit, score, or estimator identity diverges."""
 
     partition = candidate.partition
-    refit = candidate.refit
-    score = candidate.score
-    if not np.array_equal(partition.labels, refit.labels):
-        raise AssertionError("Fixed-partition refit changed selected labels.")
     actual_signature = _partition_signature(
         partition.labels,
         partition.mutation_ids if partition.mutation_ids else None,
@@ -58,6 +65,20 @@ def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None
         raise AssertionError("Partition signature does not match its labels.")
     if int(partition.n_clusters) != int(np.unique(partition.labels).size):
         raise AssertionError("Partition cluster count is inconsistent.")
+    if isinstance(candidate, UnscoredRawFusionCandidate):
+        expected_reason = _raw_fit_ineligibility_reason(candidate.raw_fit)
+        if expected_reason == "none":
+            raise AssertionError("An exact-certified raw fit cannot remain unscored.")
+        if candidate.ineligibility_reason != expected_reason:
+            raise AssertionError(
+                "Unscored raw-fusion reason does not match its raw certificate."
+            )
+        return
+
+    refit = candidate.refit
+    score = candidate.score
+    if not np.array_equal(partition.labels, refit.labels):
+        raise AssertionError("Fixed-partition refit changed selected labels.")
     if refit.partition_signature != partition.signature:
         raise AssertionError("Refit partition signature does not match partition.")
     if score.partition_signature != partition.signature:
@@ -165,9 +186,7 @@ def _candidate_ineligibility_reason(
             raise ValueError("Raw-fusion eligibility requires its raw fit.")
         if float(raw_fit.provenance.lambda_value) <= 0.0:
             return "nonpositive_lambda"
-        if not bool(raw_fit.certificate.certified) or not bool(
-            raw_fit.certificate.admissible
-        ):
+        if not raw_fit_has_exact_fusion_certificate(raw_fit):
             return "raw_objective_not_kkt_certified"
         if not partition.certified:
             return str(partition.certification_failure_reason)
@@ -202,6 +221,7 @@ class PartitionEvaluation:
 
     refit: PartitionRefitSummary
     score: SelectionScore
+    work: WorkCounters = WorkCounters()
 
 
 def _likelihood_model_id(data: TumorData) -> str:
@@ -329,6 +349,8 @@ def _build_refit_summary(
                 refit.coordinate_statistically_identified, dtype=bool
             ).copy()
         ),
+        refit_coordinate_count=int(refit.refit_coordinate_count),
+        refit_objective_evaluations=int(refit.refit_objective_evaluations),
     )
 
 
@@ -384,6 +406,12 @@ def evaluate_partition(
 ) -> PartitionEvaluation:
     """Evaluate raw and direct label sets through one refit/score path."""
 
+    refit_key = _selection_refit_cache_key(
+        data=data,
+        partition_signature=partition.signature,
+        selection_options=selection_options,
+    )
+    cache_hit = bool(refit_cache is not None and refit_key in refit_cache)
     cached_refit = _fixed_labels_refit(
         data=data,
         labels=partition.labels,
@@ -412,6 +440,16 @@ def evaluate_partition(
             resolution=cached_refit,
         ),
         score=score,
+        work=WorkCounters(
+            partition_refit_coordinates=(
+                0 if cache_hit else int(refit_result.refit_coordinate_count)
+            ),
+            partition_refit_objective_evaluations=(
+                0
+                if cache_hit
+                else int(refit_result.refit_objective_evaluations)
+            ),
+        ),
     )
 
 
@@ -434,7 +472,7 @@ def evaluate_raw_fusion_candidate(
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] | None = None,
     precomputed_fit: RawFit | None = None,
     source_model: ObservedModel | None = None,
-) -> tuple[RawFit, RawFusionCandidate]:
+) -> tuple[RawFit, RawFusionArtifact]:
     canonical_score_name = _normalize_selection_score_name(selection_score)
     raw_fit_options = (
         fit_options if candidate_fit_options is None else candidate_fit_options
@@ -480,6 +518,16 @@ def evaluate_raw_fusion_candidate(
         mutation_ids=tuple(str(value) for value in data.mutation_ids),
     )
 
+    raw_reason = _raw_fit_ineligibility_reason(fit)
+    if raw_reason != "none":
+        candidate = UnscoredRawFusionCandidate(
+            raw_fit=fit,
+            partition=partition,
+            ineligibility_reason=raw_reason,
+        )
+        validate_candidate_identity(candidate)
+        return fit, candidate
+
     evaluation = evaluate_partition(
         data=data,
         partition=partition,
@@ -504,6 +552,7 @@ def evaluate_raw_fusion_candidate(
         score=score,
         eligible_for_selection=reason == "none",
         ineligibility_reason=reason,
+        work=evaluation.work,
     )
     validate_candidate_identity(candidate)
 
@@ -561,6 +610,7 @@ def evaluate_direct_partition_candidate(
         score=score,
         eligible_for_selection=reason == "none",
         ineligibility_reason=reason,
+        work=evaluation.work,
     )
     validate_candidate_identity(candidate)
     return candidate

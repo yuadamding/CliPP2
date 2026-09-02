@@ -1039,6 +1039,9 @@ def partition_constrained_observed_refit_torch(
         refit_min_best_second_loss_gap=float(best_second_loss_gap),
         labels=labels_np.astype(np.int64, copy=True),
         loglik_source="partition_constrained_observed_mle_cuda_unimodal",
+        refit_objective_evaluations=int(
+            refit_coordinate_count * objective_evaluations
+        ),
     )
 
 
