@@ -129,6 +129,12 @@ DEFAULT_EDGE_WORK_BYTES = 64 * 1024 * 1024
 # the orchestration layer without widening the public KKT schema.  A streamed
 # chunk loop over every edge is one sweep, just like its dense counterpart.
 _EDGE_PASS_EQUIVALENTS_KEY = "_edge_pass_equivalents"
+_EDGE_REGION_VISITS_KEY = "_edge_region_visits"
+# Private activity metadata collected while the KKT edge residual is already
+# visiting every graph edge.  Certificate routing consumes these values, while
+# ``KKTDiagnostics`` continues to expose only its stable public fields.
+_FUSED_EDGE_COUNT_KEY = "_fused_edge_count"
+_NONZERO_EDGE_COUNT_KEY = "_nonzero_edge_count"
 _CERTIFICATE_KKT_ATOL_SCALE = 5.0
 _CERTIFICATE_PLATEAU_PATIENCE = 8
 _CERTIFICATE_MOVING_PLATEAU_PATIENCE = 16
@@ -140,6 +146,18 @@ _DTYPE_TO_NAME = {
     torch.float32: "float32",
     torch.float64: "float64",
 }
+
+
+def _full_edge_region_visits(
+    *, edge_count: int, num_regions: int, edge_passes: int
+) -> int:
+    """Return exact edge-region visits for complete logical traversals."""
+
+    return (
+        max(int(edge_count), 0)
+        * max(int(num_regions), 0)
+        * max(int(edge_passes), 0)
+    )
 
 
 class CudaUnavailableError(RuntimeError):
@@ -264,42 +282,41 @@ def graph_adjoint_edges_in_dtype(
         dtype=dtype,
         work_bytes=edge_work_bytes,
     )
+    return _streaming_graph_adjoint_edges_torch(
+        source,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        num_nodes=num_nodes,
+        dtype=dtype,
+        device=device,
+        scale=dual_scale,
+        chunk_size=chunk_size,
+    )
+
+
+def _streaming_graph_adjoint_edges_torch(
+    dual: torch.Tensor,
+    *,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    num_nodes: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    scale: float,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Apply one logical graph-adjoint traversal with bounded edge chunks."""
+
+    dual_scale = float(scale)
+    num_regions = int(dual.shape[1])
     adj = torch.zeros((int(num_nodes), num_regions), dtype=dtype, device=device)
-    for edge_slice in _edge_slices(num_edges, chunk_size):
-        chunk = source[edge_slice].to(dtype=dtype)
+    for edge_slice in _edge_slices(int(edge_u.numel()), int(chunk_size)):
+        chunk = dual[edge_slice].to(dtype=dtype, device=device)
         if dual_scale != 1.0:
             chunk = dual_scale * chunk
         adj.index_add_(0, edge_u[edge_slice], chunk)
         adj.index_add_(0, edge_v[edge_slice], chunk, alpha=-1.0)
     return adj
-
-
-def _graph_edge_activity_counts_torch(
-    *,
-    phi: torch.Tensor,
-    edge_u: torch.Tensor,
-    edge_v: torch.Tensor,
-    atol: float,
-    edge_work_bytes: int | None,
-) -> tuple[int, int]:
-    num_edges = int(edge_u.numel())
-    chunk_size = _edge_chunk_size(
-        num_edges=num_edges,
-        num_regions=int(phi.shape[1]),
-        dtype=phi.dtype,
-        work_bytes=edge_work_bytes,
-    )
-    nonzero_edges = 0
-    for edge_slice in _edge_slices(num_edges, chunk_size):
-        diff = graph_forward_edges(
-            phi,
-            edge_u=edge_u[edge_slice],
-            edge_v=edge_v[edge_slice],
-        )
-        nonzero_edges += int(
-            torch.sum(torch.linalg.vector_norm(diff, dim=1) > float(atol)).item()
-        )
-    return num_edges - nonzero_edges, nonzero_edges
 
 
 def _update_certificate_refinement_plateau(
@@ -718,13 +735,23 @@ def edge_kkt_maxima_from_diff_torch(
     diff: torch.Tensor,
     dual: torch.Tensor | None,
     radius: torch.Tensor,
+    diff_norm: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return legacy and componentwise-scaled edge KKT maxima."""
     if diff.shape[0] == 0:
         zero = torch.zeros((), dtype=diff.dtype, device=diff.device)
         return zero, zero, zero, zero, zero
+    base_diff_norm = (
+        torch.linalg.vector_norm(diff, dim=1)
+        if diff_norm is None
+        else diff_norm
+    )
     prox_input = diff if dual is None else diff + dual
-    prox_input_norm = torch.linalg.vector_norm(prox_input, dim=1)
+    prox_input_norm = (
+        base_diff_norm
+        if dual is None
+        else torch.linalg.vector_norm(prox_input, dim=1)
+    )
     big = prox_input_norm >= radius
     safe_norm = prox_input_norm.clamp_min(1e-300)
     if dual is None:
@@ -739,7 +766,7 @@ def edge_kkt_maxima_from_diff_torch(
     edge_residual = torch.where(
         big,
         torch.linalg.vector_norm(active_residual, dim=1),
-        torch.linalg.vector_norm(diff, dim=1),
+        base_diff_norm,
     )
     scale = torch.maximum(torch.ones_like(radius), radius)
     return (
@@ -880,7 +907,7 @@ def graph_fusion_kkt_residual_from_grad_torch(
     atol: float,
     dual_scale: float = 1.0,
     edge_work_bytes: int | None = None,
-) -> dict[str, float]:
+) -> dict[str, float | int]:
     lambda_value = validate_lambda_value(lambda_value)
     dual_scale_value = float(dual_scale)
     if not np.isfinite(dual_scale_value) or dual_scale_value < 0.0:
@@ -925,6 +952,7 @@ def graph_fusion_kkt_residual_from_grad_torch(
     max_radius = zero
     max_scaled_edge_residual = zero
     max_scaled_ball_residual = zero
+    nonzero_edge_count = torch.zeros((), dtype=torch.int64, device=phi.device)
     if num_edges == 0 or lambda_value <= 0.0:
         diagnostics = graph_fusion_kkt_diagnostics_from_components_torch(
             phi=phi,
@@ -940,6 +968,13 @@ def graph_fusion_kkt_residual_from_grad_torch(
             max_scaled_ball_residual=max_scaled_ball_residual,
         )
         diagnostics[_EDGE_PASS_EQUIVALENTS_KEY] = edge_pass_equivalents
+        diagnostics[_EDGE_REGION_VISITS_KEY] = _full_edge_region_visits(
+            edge_count=num_edges,
+            num_regions=num_regions,
+            edge_passes=edge_pass_equivalents,
+        )
+        diagnostics[_FUSED_EDGE_COUNT_KEY] = 0
+        diagnostics[_NONZERO_EDGE_COUNT_KEY] = 0
         return diagnostics
 
     # Proximal fixed-point residual: R_e = d_e - prox_{r_e*|.|_2}(d_e + y_e).
@@ -952,6 +987,8 @@ def graph_fusion_kkt_residual_from_grad_torch(
             edge_u=edge_u[edge_slice],
             edge_v=edge_v[edge_slice],
         )
+        diff_norm = torch.linalg.vector_norm(diff, dim=1)
+        nonzero_edge_count.add_(torch.count_nonzero(diff_norm > float(atol)))
         radius = float(lambda_value) * edge_w[edge_slice].to(dtype=phi.dtype)
         dual_chunk = (
             None if dual is None else dual[edge_slice].to(dtype=phi.dtype)
@@ -968,6 +1005,7 @@ def graph_fusion_kkt_residual_from_grad_torch(
             diff=diff,
             dual=dual_chunk,
             radius=radius,
+            diff_norm=diff_norm,
         )
         max_edge_residual = torch.maximum(max_edge_residual, edge_max)
         max_ball_residual = torch.maximum(max_ball_residual, ball_max)
@@ -997,6 +1035,14 @@ def graph_fusion_kkt_residual_from_grad_torch(
         max_scaled_ball_residual=max_scaled_ball_residual,
     )
     diagnostics[_EDGE_PASS_EQUIVALENTS_KEY] = edge_pass_equivalents
+    diagnostics[_EDGE_REGION_VISITS_KEY] = _full_edge_region_visits(
+        edge_count=num_edges,
+        num_regions=num_regions,
+        edge_passes=edge_pass_equivalents,
+    )
+    nonzero_edges = int(nonzero_edge_count.item())
+    diagnostics[_FUSED_EDGE_COUNT_KEY] = num_edges - nonzero_edges
+    diagnostics[_NONZERO_EDGE_COUNT_KEY] = nonzero_edges
     return diagnostics
 
 
@@ -1013,7 +1059,7 @@ def _refine_graph_fusion_dual_certificate_streaming_torch(
     lambda_value: float,
     atol: float,
     max_iter: int,
-    before_diag: dict[str, float],
+    before_diag: dict[str, float | int],
     edge_work_bytes: int | None,
 ) -> dict[str, object]:
     """Memory-bounded counterpart of the final dual-certificate refinement."""
@@ -1036,15 +1082,10 @@ def _refine_graph_fusion_dual_certificate_streaming_torch(
     edge_pass_equivalents = int(
         before_diag.get(_EDGE_PASS_EQUIVALENTS_KEY, 0)
     )
-    fused_edges, nonzero_edges = _graph_edge_activity_counts_torch(
-        phi=phi,
-        edge_u=edge_u,
-        edge_v=edge_v,
-        atol=atol,
-        edge_work_bytes=edge_work_bytes,
-    )
-    if num_edges > 0:
-        edge_pass_equivalents += 1
+    edge_region_visits = int(before_diag.get(_EDGE_REGION_VISITS_KEY, 0))
+    full_edge_region_visits = num_edges * num_regions
+    fused_edges = int(before_diag[_FUSED_EDGE_COUNT_KEY])
+    nonzero_edges = int(before_diag[_NONZERO_EDGE_COUNT_KEY])
 
     dual = torch.zeros(
         (num_edges, num_regions),
@@ -1085,6 +1126,7 @@ def _refine_graph_fusion_dual_certificate_streaming_torch(
             )
     if num_edges > 0:
         edge_pass_equivalents += 1
+        edge_region_visits += full_edge_region_visits
 
     analytic_diag = graph_fusion_kkt_residual_from_grad_torch(
         phi=phi,
@@ -1102,6 +1144,7 @@ def _refine_graph_fusion_dual_certificate_streaming_torch(
     edge_pass_equivalents += int(
         analytic_diag.get(_EDGE_PASS_EQUIVALENTS_KEY, 0)
     )
+    edge_region_visits += int(analytic_diag.get(_EDGE_REGION_VISITS_KEY, 0))
     best_diag = analytic_diag
     best_residual = float(analytic_diag["kkt_residual"])
     best_source = "analytic"
@@ -1126,18 +1169,19 @@ def _refine_graph_fusion_dual_certificate_streaming_torch(
         stalled_iterations = 0
         for _ in range(max(int(max_iter), 1)):
             refinement_iterations += 1
-            adj = torch.zeros_like(phi)
             mapping_delta = 0.0
-            for edge_slice in _edge_slices(num_edges, chunk_size):
-                dual_chunk = dual[edge_slice]
-                adj.index_add_(0, edge_u[edge_slice], dual_chunk)
-                adj.index_add_(
-                    0,
-                    edge_v[edge_slice],
-                    dual_chunk,
-                    alpha=-1.0,
-                )
+            adj = _streaming_graph_adjoint_edges_torch(
+                dual,
+                edge_u=edge_u,
+                edge_v=edge_v,
+                num_nodes=num_nodes,
+                dtype=phi.dtype,
+                device=phi.device,
+                scale=1.0,
+                chunk_size=chunk_size,
+            )
             edge_pass_equivalents += 1
+            edge_region_visits += full_edge_region_visits
             stat = stationarity_residual_torch(
                 total_grad=grad_smooth + adj,
                 phi=phi,
@@ -1158,6 +1202,9 @@ def _refine_graph_fusion_dual_certificate_streaming_torch(
                     stat,
                     edge_u=edge_u[edge_slice],
                     edge_v=edge_v[edge_slice],
+                )
+                edge_region_visits += (
+                    int(edge_u[edge_slice].numel()) * num_regions
                 )
                 radius = float(lambda_value) * edge_w[edge_slice]
                 projected = project_dual_ball(
@@ -1183,6 +1230,7 @@ def _refine_graph_fusion_dual_certificate_streaming_torch(
             # is evaluated only on chunks containing fused edges; charge its
             # logical certificate sweep as one EPE as well.
             edge_pass_equivalents += 2
+            edge_region_visits += full_edge_region_visits
             diag = graph_fusion_kkt_residual_from_grad_torch(
                 phi=phi,
                 grad_smooth=grad_smooth,
@@ -1199,6 +1247,7 @@ def _refine_graph_fusion_dual_certificate_streaming_torch(
             edge_pass_equivalents += int(
                 diag.get(_EDGE_PASS_EQUIVALENTS_KEY, 0)
             )
+            edge_region_visits += int(diag.get(_EDGE_REGION_VISITS_KEY, 0))
             residual = float(diag["kkt_residual"])
             if residual < best_residual:
                 best_residual = residual
@@ -1240,6 +1289,7 @@ def _refine_graph_fusion_dual_certificate_streaming_torch(
         "stationarity_after": float(best_diag["stationarity_residual"]),
         "refinement_iterations": int(refinement_iterations),
         _EDGE_PASS_EQUIVALENTS_KEY: int(edge_pass_equivalents),
+        _EDGE_REGION_VISITS_KEY: int(edge_region_visits),
     }
 
 
@@ -1306,6 +1356,11 @@ def refine_graph_fusion_dual_certificate_torch(
             "stationarity_after": float(after_diag["stationarity_residual"]),
             "refinement_iterations": 0,
             _EDGE_PASS_EQUIVALENTS_KEY: int(edge_pass_equivalents),
+            _EDGE_REGION_VISITS_KEY: _full_edge_region_visits(
+                edge_count=int(edge_u.numel()),
+                num_regions=int(phi.shape[1]),
+                edge_passes=edge_pass_equivalents,
+            ),
         }
 
     budget = (
@@ -1321,15 +1376,8 @@ def refine_graph_fusion_dual_certificate_torch(
         and np.isfinite(incoming_residual)
         and incoming_residual <= _CERTIFICATE_KKT_ATOL_SCALE * float(atol)
     ):
-        fused_edges, nonzero_edges = _graph_edge_activity_counts_torch(
-            phi=phi,
-            edge_u=edge_u,
-            edge_v=edge_v,
-            atol=atol,
-            edge_work_bytes=budget,
-        )
-        if int(edge_u.numel()) > 0:
-            edge_pass_equivalents += 1
+        fused_edges = int(before_diag[_FUSED_EDGE_COUNT_KEY])
+        nonzero_edges = int(before_diag[_NONZERO_EDGE_COUNT_KEY])
         incoming = dual_kkt.to(dtype=phi.dtype, device=phi.device)
         return {
             "dual": incoming,
@@ -1342,6 +1390,11 @@ def refine_graph_fusion_dual_certificate_torch(
             "stationarity_after": float(before_diag["stationarity_residual"]),
             "refinement_iterations": 0,
             _EDGE_PASS_EQUIVALENTS_KEY: int(edge_pass_equivalents),
+            _EDGE_REGION_VISITS_KEY: _full_edge_region_visits(
+                edge_count=int(edge_u.numel()),
+                num_regions=int(phi.shape[1]),
+                edge_passes=edge_pass_equivalents,
+            ),
         }
     if (
         _edge_tensor_nbytes(
@@ -1517,6 +1570,11 @@ def refine_graph_fusion_dual_certificate_torch(
         "stationarity_after": float(best_diag["stationarity_residual"]),
         "refinement_iterations": int(refinement_iterations),
         _EDGE_PASS_EQUIVALENTS_KEY: int(edge_pass_equivalents),
+        _EDGE_REGION_VISITS_KEY: _full_edge_region_visits(
+            edge_count=int(edge_u.numel()),
+            num_regions=int(phi.shape[1]),
+            edge_passes=edge_pass_equivalents,
+        ),
     }
 
 
@@ -1777,6 +1835,11 @@ def solve_majorized_subproblem_pdhg_torch(
 
     if diagnostics_out is not None:
         diagnostics_out[_EDGE_PASS_EQUIVALENTS_KEY] = int(edge_pass_equivalents)
+        diagnostics_out[_EDGE_REGION_VISITS_KEY] = _full_edge_region_visits(
+            edge_count=int(edge_u.numel()),
+            num_regions=int(phi.shape[1]),
+            edge_passes=edge_pass_equivalents,
+        )
         diagnostics_out["inner_kkt_audits"] = int(kkt_audits)
         diagnostics_out["inner_stationarity_checks"] = int(kkt_audits)
     return phi, dual, dual, iterations, converged, float(last_residual)
@@ -2006,6 +2069,7 @@ def _closed_form_box_fusion_result(
             inner_kkt_audits=0,
             inner_stationarity_checks=0,
             **{_EDGE_PASS_EQUIVALENTS_KEY: 0},
+            **{_EDGE_REGION_VISITS_KEY: 0},
         )
     return projected, empty_dual, empty_dual, 0, residual <= tol, residual
 
@@ -2260,6 +2324,11 @@ def _solve_majorized_subproblem_alm_dense_torch(
         diagnostics_out["inner_kkt_audits"] = int(kkt_audits)
         diagnostics_out["inner_stationarity_checks"] = int(stationarity_checks)
         diagnostics_out[_EDGE_PASS_EQUIVALENTS_KEY] = int(edge_pass_equivalents)
+        diagnostics_out[_EDGE_REGION_VISITS_KEY] = _full_edge_region_visits(
+            edge_count=int(edge_u.numel()),
+            num_regions=int(phi.shape[1]),
+            edge_passes=edge_pass_equivalents,
+        )
 
     return phi, scaled_dual, actual_dual, iterations, converged, float(last_residual)
 
@@ -2592,6 +2661,11 @@ def _solve_majorized_subproblem_alm_streaming_torch(
         diagnostics_out["inner_kkt_audits"] = int(kkt_audits)
         diagnostics_out["inner_stationarity_checks"] = int(stationarity_checks)
         diagnostics_out[_EDGE_PASS_EQUIVALENTS_KEY] = int(edge_pass_equivalents)
+        diagnostics_out[_EDGE_REGION_VISITS_KEY] = _full_edge_region_visits(
+            edge_count=num_edges,
+            num_regions=num_regions,
+            edge_passes=edge_pass_equivalents,
+        )
     return (
         phi,
         scaled_dual,

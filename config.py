@@ -77,9 +77,12 @@ class ResourceConfig:
     # Hardware-independent, cumulative raw-solver budget.  None deliberately
     # preserves an unlimited search until a profile-specific cap is calibrated.
     max_tumor_edge_pass_equivalents: int | None = None
-    # Cumulative fixed-partition scalar objective evaluations.  Enforcement is
-    # at candidate boundaries because a certified coordinate minimization is
-    # atomic and its realized interval count is not known in advance.
+    # Cumulative post-mandatory-guide fixed-partition scalar objective
+    # evaluations.  The complete guide defines the graph/objective and is
+    # therefore accounted and reported separately rather than truncated.
+    # Enforcement is at candidate boundaries because a certified coordinate
+    # minimization is atomic and its realized interval count is not known in
+    # advance.
     max_partition_refit_objective_evaluations: int | None = None
     # Exact boundary on the number of direct Ward/CEM candidates evaluated.
     max_direct_partition_candidates: int | None = None

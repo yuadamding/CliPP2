@@ -401,6 +401,7 @@ class RawAttemptSummary:
     work_partition_refit_coordinates: int = 0
     work_partition_refit_objective_evaluations: int = 0
     work_edge_pass_equivalents: int = 0
+    work_edge_region_visits: int = 0
     work_full_certificate_audit_passes: int = 0
 
     @classmethod
@@ -516,6 +517,9 @@ class RawAttemptSummary:
             ),
             work_edge_pass_equivalents=int(
                 getattr(work, "edge_pass_equivalents", 0)
+            ),
+            work_edge_region_visits=int(
+                getattr(work, "edge_region_visits", 0)
             ),
             work_full_certificate_audit_passes=int(
                 getattr(work, "full_certificate_audit_passes", 0)
@@ -664,6 +668,7 @@ class BICSelectionResult:
     raw_lambda_path_resolved: bool = False
     global_hybrid_optimum_certified: bool = False
     search_work: WorkCounters = WorkCounters()
+    mandatory_guide_work: WorkCounters = WorkCounters()
     cumulative_search_active_seconds: float = 0.0
     resumed_from_checkpoint: bool = False
     selection_pool_stop_reason: str = "none"
@@ -732,6 +737,7 @@ class SecondaryFallbackResult:
     raw_lambda_path_resolved: bool = False
     global_hybrid_optimum_certified: bool = False
     search_work: WorkCounters = WorkCounters()
+    mandatory_guide_work: WorkCounters = WorkCounters()
     cumulative_search_active_seconds: float = 0.0
     resumed_from_checkpoint: bool = False
     selection_pool_stop_reason: str = "none"
@@ -795,6 +801,7 @@ class DiagnosticOnlyResult:
     raw_lambda_path_resolved: bool = False
     global_hybrid_optimum_certified: bool = False
     search_work: WorkCounters = WorkCounters()
+    mandatory_guide_work: WorkCounters = WorkCounters()
     cumulative_search_active_seconds: float = 0.0
     resumed_from_checkpoint: bool = False
     selection_pool_stop_reason: str = "none"

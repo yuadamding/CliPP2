@@ -178,9 +178,15 @@ BackendWarmState: TypeAlias = DenseWarmState | PrimalOnlyWarmState
 class WorkCounters:
     """Deterministic optimizer-work accounting.
 
-    ``edge_pass_equivalents`` is the hardware-independent cap unit.  It counts
-    each normalized complete-edge primitive traversal exactly (a streamed
-    traversal over all chunks is one), not kernel launches or wall-clock time.
+    ``edge_region_visits`` is exact realized graph work: each primitive visit
+    to one edge-region coordinate contributes one.  Full dense and streamed
+    traversals therefore contribute ``|E| * S``; compressed workset
+    traversals contribute ``|E_work| * S``.
+
+    ``edge_pass_equivalents`` is the conservative integer cap unit.  A full
+    dense or streamed traversal contributes one, while each partial workset
+    traversal is rounded up to one so prospective budget checks remain safe.
+    It counts logical work, not kernel launches or wall-clock time.
     ``full_certificate_audit_passes`` predates the
     general accounting surface and remains the narrower policy-routing counter
     used to distinguish an incomplete compressed representation from an
@@ -197,6 +203,7 @@ class WorkCounters:
     partition_refit_coordinates: int = 0
     partition_refit_objective_evaluations: int = 0
     edge_pass_equivalents: int = 0
+    edge_region_visits: int = 0
     full_certificate_audit_passes: int = 0
 
     def __post_init__(self) -> None:

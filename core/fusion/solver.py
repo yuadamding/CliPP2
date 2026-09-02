@@ -222,7 +222,12 @@ def _terminal_backward_error_audit_float64(
             dtype=torch.float64,
             device=audit.runtime.device,
         )
-        audit_work = audit_work + WorkCounters(edge_pass_equivalents=1)
+        audit_work = audit_work + WorkCounters(
+            edge_pass_equivalents=1,
+            edge_region_visits=(
+                int(graph64.edge_u.numel()) * int(phi64.shape[1])
+            ),
+        )
         gradient = build_certificate_gradient(
             data64,
             phi=phi64,
@@ -312,7 +317,7 @@ def _evaluate_pairwise_penalty_torch(
     edge_w: torch.Tensor,
     lambda_value: float,
 ) -> tuple[torch.Tensor, WorkCounters]:
-    """Evaluate one penalty and charge its exact complete-edge traversal."""
+    """Evaluate one penalty and charge its budget unit and exact visits."""
 
     penalty = pairwise_penalty_torch(
         phi,
@@ -325,7 +330,12 @@ def _evaluate_pairwise_penalty_torch(
         edge_u=edge_u,
         lambda_value=lambda_value,
     )
-    return penalty, WorkCounters(edge_pass_equivalents=edge_passes)
+    return penalty, WorkCounters(
+        edge_pass_equivalents=edge_passes,
+        edge_region_visits=(
+            edge_passes * int(edge_u.numel()) * int(phi.shape[1])
+        ),
+    )
 
 
 def _pairwise_penalty_edge_passes(
@@ -793,7 +803,7 @@ def _terminal_float64_audit_edge_pass_bound(
     certificate: GraphFusionCertificate | None,
     edge_count: int,
 ) -> int:
-    """Worst-case exact EPE owed after working-precision refinement."""
+    """Worst-case conservative EPE owed after working-precision refinement."""
 
     if runtime_dtype == torch.float64 or int(edge_count) <= 0:
         return 0
@@ -806,9 +816,10 @@ def _terminal_float64_audit_edge_pass_bound(
         # The compressed audit fuses its edge operations into one traversal
         # and does not support interval-dual adjustment.
         return 2
-    # Without a witness the dense diagnostic still performs graph-forward and
-    # edgewise-reduction passes, followed by the objective penalty.
-    return 3
+    # Refinement can materialize a dense witness from a missing witness before
+    # this audit runs. Reserve that reachable dense/breakpoint worst case; the
+    # witness-free three-pass audit applies only if refinement is skipped.
+    return 5
 
 
 def _inner_edge_pass_bound(
@@ -884,10 +895,11 @@ def _budgeted_certificate_parameters(
     def bound(iterations: int, expansions: int) -> int:
         if not compressed:
             # The streamed dense-certificate backend is the worst case: an
-            # incoming audit, activity/analytic construction, analytic audit,
-            # then six complete-edge primitives per streamed projected-dual
-            # iteration.  This is the dense backend's exact worst case.
-            return 6 * int(iterations) + 8
+            # incoming audit, analytic construction, analytic audit, then six
+            # complete-edge primitives per streamed projected-dual iteration.
+            # Edge activity is collected inside the incoming audit, making
+            # this the dense backend's conservative worst case.
+            return 6 * int(iterations) + 7
         # Each expansion can consume max_iter projected-dual iterations, one
         # missing-column scan, and one terminal full-graph diagnostic.  The
         # inherited-certificate fast path contributes one further audit.
@@ -904,7 +916,7 @@ def _budgeted_certificate_parameters(
             residual = available - (4 * expansions + 2)
             divisor = 2 * expansions
         else:
-            residual = available - 8
+            residual = available - 7
             divisor = 6
         iterations = min(desired_iter, residual // divisor)
         if iterations >= 1 and bound(iterations, expansions) <= available:
@@ -1615,7 +1627,10 @@ def escape_path_breakpoint_solver_state(
             num_nodes=int(phi.shape[0]),
         )
         work = WorkCounters(
-            edge_pass_equivalents=int(int(context.graph.edge_u.numel()) > 0)
+            edge_pass_equivalents=int(int(context.graph.edge_u.numel()) > 0),
+            edge_region_visits=(
+                int(context.graph.edge_u.numel()) * int(phi.shape[1])
+            ),
         )
         gradient_left, gradient_right, at_breakpoint = (
             observed_one_sided_gradients_torch(
@@ -2191,12 +2206,12 @@ def _solve_inner_subproblem(
         inner_iterations=inner_iterations,
         inner_stationarity_checks=inner_stationarity_checks,
         inner_full_kkt_audits=inner_full_kkt_audits,
-        # The selected backend reports exact logical full-edge traversals;
-        # dense and streamed implementations intentionally have different
-        # fused-pass counts.
+        # The selected backend reports conservative full-edge budget units;
+        # exact realized work is retained separately as edge-region visits.
         edge_pass_equivalents=int(
             surrogate_diag.get("_edge_pass_equivalents", 0)
         ),
+        edge_region_visits=int(surrogate_diag.get("_edge_region_visits", 0)),
     )
     certificate = (
         DenseEdgeCertificate(
@@ -3290,7 +3305,7 @@ def _fit_from_start(
             max_edge_pass_equivalents,
         )
         # Float32 fits still owe objective evaluation and the authoritative
-        # float64 full-graph audit.  Reserve their exact worst-case passes.
+        # float64 full-graph audit. Reserve their conservative worst case.
         audit_reserve = _terminal_float64_audit_edge_pass_bound(
             runtime_dtype=runtime.dtype,
             certificate=certificate,
@@ -3416,7 +3431,10 @@ def _fit_from_start(
             edge_v=edge_v,
             num_nodes=int(phi.shape[0]),
         )
-        work_counters = work_counters + WorkCounters(edge_pass_equivalents=1)
+        work_counters = work_counters + WorkCounters(
+            edge_pass_equivalents=1,
+            edge_region_visits=int(edge_u.numel()) * int(phi.shape[1]),
+        )
         next_gradient = build_certificate_gradient(
             torch_data,
             phi,
@@ -3496,7 +3514,7 @@ def _fit_from_start(
         + _MANDATORY_TERMINAL_EDGE_PASS_ALLOWANCE
     ):
         raise AssertionError(
-            "Exact edge work exceeded the configured cap plus terminal allowance."
+            "Edge-pass budget exceeded the configured cap plus terminal allowance."
         )
     admission_diag = admission_diagnostics.as_dict()
     for key in (

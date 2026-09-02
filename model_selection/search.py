@@ -109,6 +109,24 @@ class NoEligibleModelSelectionCandidatesError(RuntimeError):
 _RAW_ARTIFACT_TYPES = (RawFusionCandidate, UnscoredRawFusionCandidate)
 
 
+def _post_guide_partition_refit_objective_evaluations(
+    total_work: WorkCounters,
+    mandatory_guide_work: WorkCounters,
+) -> int:
+    """Return budgeted scalar work after immutable guide construction.
+
+    The complete mandatory guide can define the adaptive graph and therefore
+    the estimator itself.  It is always completed, included in total realized
+    work, and excluded only from the optional post-guide resource cap.
+    """
+
+    realized = int(total_work.partition_refit_objective_evaluations)
+    baseline = int(mandatory_guide_work.partition_refit_objective_evaluations)
+    if realized < baseline:
+        raise ValueError("Total search work is below mandatory guide work.")
+    return int(realized - baseline)
+
+
 @dataclass(frozen=True, slots=True)
 class BestRawAttemptDiagnostics:
     search_round: int
@@ -975,7 +993,8 @@ def _partition_guided_admm_selection(
     attempts_by_lambda: dict[float, list[SolveOutcome]] = {}
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] = {}
     next_step = 0
-    total_work = initializer_generation.work
+    mandatory_guide_work = initializer_generation.work
+    total_work = mandatory_guide_work
     search_stop_override: str | None = None
     direct_next_index = 0
     direct_pool_complete = False
@@ -1025,6 +1044,19 @@ def _partition_guided_admm_selection(
         bic_refit_cache = dict(workspace["bic_refit_cache"])
         next_step = int(workspace["next_step"])
         total_work = workspace["total_work"]
+        loaded_mandatory_guide_work = workspace["mandatory_guide_work"]
+        if not isinstance(loaded_mandatory_guide_work, WorkCounters):
+            raise ValueError("Checkpoint mandatory guide work is invalid.")
+        if loaded_mandatory_guide_work != mandatory_guide_work:
+            raise ValueError(
+                "Checkpoint mandatory guide work differs from deterministic "
+                "guide reconstruction."
+            )
+        mandatory_guide_work = loaded_mandatory_guide_work
+        _post_guide_partition_refit_objective_evaluations(
+            total_work,
+            mandatory_guide_work,
+        )
         search_stop_override = workspace.get("search_stop_override")
         direct_next_index = int(workspace.get("direct_next_index", 0))
         direct_pool_complete = bool(workspace.get("direct_pool_complete", False))
@@ -1128,6 +1160,7 @@ def _partition_guided_admm_selection(
                 "bic_refit_cache": bic_refit_cache,
                 "next_step": int(next_step),
                 "total_work": total_work,
+                "mandatory_guide_work": mandatory_guide_work,
                 "search_stop_override": search_stop_override,
                 "direct_next_index": int(direct_next_index),
                 "direct_pool_complete": bool(direct_pool_complete),
@@ -1746,7 +1779,10 @@ def _partition_guided_admm_selection(
         if (
             search_stop_override is None
             and refit_work_cap is not None
-            and int(total_work.partition_refit_objective_evaluations)
+            and _post_guide_partition_refit_objective_evaluations(
+                total_work,
+                mandatory_guide_work,
+            )
             >= int(refit_work_cap)
         ):
             search_stop_override = (
@@ -1768,7 +1804,10 @@ def _partition_guided_admm_selection(
     direct_refit_cap = direct_resources.max_partition_refit_objective_evaluations
     direct_budget_exhausted_before_pool = bool(
         direct_refit_cap is not None
-        and int(total_work.partition_refit_objective_evaluations)
+        and _post_guide_partition_refit_objective_evaluations(
+            total_work,
+            mandatory_guide_work,
+        )
         >= int(direct_refit_cap)
     )
     if direct_budget_exhausted_before_pool:
@@ -1875,7 +1914,10 @@ def _partition_guided_admm_selection(
                     break
                 if (
                     direct_refit_cap is not None
-                    and int(total_work.partition_refit_objective_evaluations)
+                    and _post_guide_partition_refit_objective_evaluations(
+                        total_work,
+                        mandatory_guide_work,
+                    )
                     >= int(direct_refit_cap)
                 ):
                     direct_pool_stop_reason = (
@@ -1956,7 +1998,10 @@ def _partition_guided_admm_selection(
                 break
             if (
                 direct_refit_cap is not None
-                and int(total_work.partition_refit_objective_evaluations)
+                and _post_guide_partition_refit_objective_evaluations(
+                    total_work,
+                    mandatory_guide_work,
+                )
                 >= int(direct_refit_cap)
             ):
                 direct_pool_stop_reason = (
@@ -1981,7 +2026,10 @@ def _partition_guided_admm_selection(
                 if direct_refit_cap is None
                 else max(
                     int(direct_refit_cap)
-                    - int(total_work.partition_refit_objective_evaluations),
+                    - _post_guide_partition_refit_objective_evaluations(
+                        total_work,
+                        mandatory_guide_work,
+                    ),
                     0,
                 )
             )
@@ -2074,6 +2122,7 @@ def _partition_guided_admm_selection(
     return replace(
         outcome,
         search_work=total_work,
+        mandatory_guide_work=mandatory_guide_work,
         cumulative_search_active_seconds=float(
             cumulative_search_elapsed_before
             + perf_counter()

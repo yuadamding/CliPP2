@@ -10,7 +10,9 @@ history after every lambda observation.
 from __future__ import annotations
 
 from contextlib import contextmanager, redirect_stdout
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
+import errno
+import fcntl
 from functools import lru_cache
 import hashlib
 import io
@@ -21,6 +23,7 @@ import platform
 import re
 import stat
 import sys
+import time
 from typing import Any
 import uuid
 
@@ -64,6 +67,31 @@ class CheckpointConcurrentWriterError(RuntimeError):
 
 class LegacyCheckpointFormatError(ValueError):
     """A monolithic v1 NPZ checkpoint cannot be resumed as schema v2."""
+
+
+@dataclass
+class CheckpointSaveStats:
+    """Per-save checkpoint I/O and hashing instrumentation.
+
+    Timings are wall-clock seconds. ``checkpoint_hash_bytes`` counts numeric
+    payload bytes actually passed through SHA-256, while
+    ``checkpoint_new_object_bytes`` counts logical numeric bytes published as
+    new content objects. The manifest byte count is the exact serialized JSON
+    size. A caller may reuse one instance; each save resets it first.
+    """
+
+    checkpoint_encode_seconds: float = 0.0
+    checkpoint_hash_bytes: int = 0
+    checkpoint_new_object_bytes: int = 0
+    checkpoint_manifest_bytes: int = 0
+    checkpoint_fsync_seconds: float = 0.0
+    checkpoint_total_seconds: float = 0.0
+
+    def reset(self) -> None:
+        """Reset all measurements before recording one save."""
+
+        for item in fields(self):
+            setattr(self, item.name, item.default)
 
 
 def _float_token(value: float) -> str:
@@ -345,7 +373,11 @@ def _contiguous_array(value: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(value)
 
 
-def _array_content_digest(value: np.ndarray) -> str:
+def _array_content_digest(
+    value: np.ndarray,
+    *,
+    stats: CheckpointSaveStats | None = None,
+) -> str:
     """Hash logical dtype, shape, and C-order bytes without a full byte copy."""
 
     array = _contiguous_array(value)
@@ -360,15 +392,22 @@ def _array_content_digest(value: np.ndarray) -> str:
     digest.update(len(shape).to_bytes(8, "little"))
     digest.update(shape)
     digest.update(memoryview(array).cast("B"))
-    return digest.hexdigest()
+    result = digest.hexdigest()
+    if stats is not None:
+        stats.checkpoint_hash_bytes += int(array.nbytes)
+    return result
 
 
 def _register_array(
     value: np.ndarray,
     arrays: dict[str, np.ndarray],
+    *,
+    stats: CheckpointSaveStats,
+    digest: str | None = None,
 ) -> str:
     array = _contiguous_array(value)
-    digest = _array_content_digest(array)
+    if digest is None:
+        digest = _array_content_digest(array, stats=stats)
     incumbent = arrays.get(digest)
     if incumbent is not None and (
         incumbent.dtype != array.dtype
@@ -383,6 +422,7 @@ def _encode_value(
     value: Any,
     arrays: dict[str, np.ndarray],
     memo: dict[int, str],
+    stats: CheckpointSaveStats,
 ) -> Any:
     if value is None or isinstance(value, (bool, int, str)):
         return value
@@ -396,7 +436,7 @@ def _encode_value(
             return {"$ref": existing}
         object_id = f"object_{len(memo):08d}"
         memo[id(value)] = object_id
-        key = _register_array(value, arrays)
+        key = _register_array(value, arrays, stats=stats)
         return {
             "$array": key,
             "$id": object_id,
@@ -408,19 +448,23 @@ def _encode_value(
             return {"$ref": existing}
         object_id = f"object_{len(memo):08d}"
         memo[id(value)] = object_id
-        tensor = value.detach().cpu().contiguous()
-        dtype_name = str(tensor.dtype).removeprefix("torch.")
+        dtype_name = str(value.dtype).removeprefix("torch.")
         if dtype_name not in _TORCH_DTYPES:
             raise TypeError(
                 f"Tensor dtype is not supported by search checkpoints: {dtype_name}"
             )
+        # PyTorch's mutation counter does not observe writes through every
+        # foreign alias (notably ``tensor.numpy()``), so tensors are always
+        # hashed rather than relying on an unsound identity/version cache.
+        tensor = value.detach().cpu().contiguous()
         if tensor.dtype == torch.bfloat16:
             array = tensor.view(torch.uint8).numpy()
             byte_view = True
         else:
             array = tensor.numpy()
             byte_view = False
-        key = _register_array(array, arrays)
+        digest = _array_content_digest(array, stats=stats)
+        key = _register_array(array, arrays, stats=stats, digest=digest)
         return {
             "$tensor": key,
             "$id": object_id,
@@ -429,11 +473,13 @@ def _encode_value(
             "byte_view": byte_view,
         }
     if isinstance(value, tuple):
-        return {"$tuple": [_encode_value(item, arrays, memo) for item in value]}
+        return {
+            "$tuple": [_encode_value(item, arrays, memo, stats) for item in value]
+        }
     if isinstance(value, list):
-        return {"$list": [_encode_value(item, arrays, memo) for item in value]}
+        return {"$list": [_encode_value(item, arrays, memo, stats) for item in value]}
     if isinstance(value, set):
-        encoded = [_encode_value(item, arrays, memo) for item in value]
+        encoded = [_encode_value(item, arrays, memo, stats) for item in value]
         return {
             "$set": sorted(
                 encoded,
@@ -444,8 +490,8 @@ def _encode_value(
         return {
             "$dict": [
                 [
-                    _encode_value(key, arrays, memo),
-                    _encode_value(item, arrays, memo),
+                    _encode_value(key, arrays, memo, stats),
+                    _encode_value(item, arrays, memo, stats),
                 ]
                 for key, item in value.items()
             ]
@@ -463,7 +509,9 @@ def _encode_value(
             "$dataclass": type_name,
             "$id": object_id,
             "fields": {
-                item.name: _encode_value(getattr(value, item.name), arrays, memo)
+                item.name: _encode_value(
+                    getattr(value, item.name), arrays, memo, stats
+                )
                 for item in fields(value)
                 if item.init
             },
@@ -927,6 +975,7 @@ def _write_array_object(
     *,
     digest: str,
     value: np.ndarray,
+    stats: CheckpointSaveStats,
 ) -> bool:
     destination = directory / f"{digest}.npy"
     if destination.exists() or destination.is_symlink():
@@ -939,57 +988,102 @@ def _write_array_object(
         with temporary.open("xb") as handle:
             np.save(handle, value, allow_pickle=False)
             handle.flush()
-            os.fsync(handle.fileno())
+            _timed_fsync(handle.fileno(), stats)
         os.chmod(temporary, 0o600)
+        created = False
         try:
             os.link(temporary, destination)
         except FileExistsError:
             _require_safe_object_file(destination)
         else:
             os.chmod(destination, 0o600)
-        return True
+            created = True
+            stats.checkpoint_new_object_bytes += int(value.nbytes)
+        return created
     finally:
         if temporary.exists():
             temporary.unlink()
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+def _timed_fsync(descriptor: int, stats: CheckpointSaveStats) -> None:
+    started = time.perf_counter()
     try:
         os.fsync(descriptor)
+    finally:
+        stats.checkpoint_fsync_seconds += time.perf_counter() - started
+
+
+def _fsync_directory(path: Path, stats: CheckpointSaveStats) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        _timed_fsync(descriptor, stats)
     finally:
         os.close(descriptor)
 
 
 @contextmanager
 def _checkpoint_writer_lock(directory: Path) -> Any:
+    """Hold a crash-released POSIX writer lock on a persistent private file."""
+
     lock_path = directory / _WRITER_LOCK_NAME
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if lock_path.is_symlink():
+        raise ValueError(
+            f"Checkpoint writer lock must be a regular private file: {lock_path}"
+        )
+    flags = os.O_RDWR | os.O_CREAT
     flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(lock_path, flags, 0o600)
-    except FileExistsError as exc:
-        raise CheckpointConcurrentWriterError(
-            f"Checkpoint already has an active or stale writer lock: {lock_path}"
+    except OSError as exc:
+        if exc.errno not in (errno.ELOOP, errno.EISDIR):
+            raise
+        raise ValueError(
+            f"Checkpoint writer lock must be a regular private file: {lock_path}"
         ) from exc
-    status = os.fstat(descriptor)
     try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError(
+                f"Checkpoint writer lock must be a regular file: {lock_path}"
+            )
+        if stat.S_IMODE(status.st_mode) & 0o077:
+            raise PermissionError(
+                f"Checkpoint writer lock is not private: {lock_path}"
+            )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            raise CheckpointConcurrentWriterError(
+                f"Checkpoint already has an active writer lock: {lock_path}"
+            ) from exc
+        try:
+            current = lock_path.lstat()
+        except FileNotFoundError as exc:
+            raise CheckpointConcurrentWriterError(
+                "Checkpoint writer lock disappeared during acquisition."
+            ) from exc
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_dev != status.st_dev
+            or current.st_ino != status.st_ino
+        ):
+            raise CheckpointConcurrentWriterError(
+                "Checkpoint writer lock changed during acquisition."
+            )
         payload = json.dumps(
             {"pid": os.getpid()}, separators=(",", ":")
         ).encode("ascii")
+        os.ftruncate(descriptor, 0)
         os.write(descriptor, payload)
-        os.fsync(descriptor)
         yield
     finally:
-        os.close(descriptor)
         try:
-            current = lock_path.lstat()
-        except FileNotFoundError:
-            current = None
-        if current is not None and (
-            current.st_dev == status.st_dev and current.st_ino == status.st_ino
-        ):
-            lock_path.unlink()
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _manifest_bytes(manifest: dict[str, Any]) -> bytes:
@@ -1001,22 +1095,14 @@ def _manifest_bytes(manifest: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
-def save_search_checkpoint(
+def _save_search_checkpoint_impl(
     path: str | Path,
     *,
     identity: dict[str, Any],
     workspace: dict[str, Any],
-    expected_generation: int | None = None,
+    expected_generation: int | None,
+    active_stats: CheckpointSaveStats,
 ) -> int:
-    """Commit one incremental checkpoint generation after an observation.
-
-    ``path`` is a directory even when a caller retains the historical ``.npz``
-    suffix.  A lock rejects overlapping writers, and a pre-replace generation
-    comparison also rejects writers that ignore that lock. A caller must pass
-    the generation returned by its previous save or load when updating an
-    existing checkpoint, preventing a stale sequential writer from committing.
-    """
-
     destination = Path(path)
     manifest_path, array_directory = _prepare_checkpoint_directory(destination)
     expected_identity = _canonical_identity_value(identity)
@@ -1046,7 +1132,13 @@ def save_search_checkpoint(
         generation = observed_generation + 1
 
         arrays: dict[str, np.ndarray] = {}
-        encoded_workspace = _encode_value(workspace, arrays, {})
+        encode_started = time.perf_counter()
+        try:
+            encoded_workspace = _encode_value(workspace, arrays, {}, active_stats)
+        finally:
+            active_stats.checkpoint_encode_seconds = (
+                time.perf_counter() - encode_started
+            )
         objects = {
             digest: _object_metadata(value)
             for digest, value in sorted(arrays.items())
@@ -1057,9 +1149,10 @@ def save_search_checkpoint(
                 array_directory,
                 digest=digest,
                 value=value,
+                stats=active_stats,
             )
         if wrote_object:
-            _fsync_directory(array_directory)
+            _fsync_directory(array_directory, active_stats)
 
         manifest = {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -1074,6 +1167,7 @@ def save_search_checkpoint(
             "workspace": encoded_workspace,
         }
         contents = _manifest_bytes(manifest)
+        active_stats.checkpoint_manifest_bytes = len(contents)
         temporary = destination / (
             f".manifest-tmp-{os.getpid()}-{uuid.uuid4().hex}"
         )
@@ -1081,7 +1175,7 @@ def save_search_checkpoint(
             with temporary.open("xb") as handle:
                 handle.write(contents)
                 handle.flush()
-                os.fsync(handle.fileno())
+                _timed_fsync(handle.fileno(), active_stats)
             os.chmod(temporary, 0o600)
 
             current_manifest_bytes = (
@@ -1094,11 +1188,44 @@ def save_search_checkpoint(
                     "Checkpoint generation changed before manifest commit."
                 )
             os.replace(temporary, manifest_path)
-            _fsync_directory(destination)
+            _fsync_directory(destination, active_stats)
         finally:
             if temporary.exists():
                 temporary.unlink()
     return generation
+
+
+def save_search_checkpoint(
+    path: str | Path,
+    *,
+    identity: dict[str, Any],
+    workspace: dict[str, Any],
+    expected_generation: int | None = None,
+    stats: CheckpointSaveStats | None = None,
+) -> int:
+    """Commit one incremental checkpoint generation after an observation.
+
+    ``path`` is a directory even when a caller retains the historical ``.npz``
+    suffix. A POSIX advisory lock rejects overlapping live writers but remains
+    harmless after process death. The generation compare-and-swap remains the
+    authoritative stale-writer guard. A caller must pass the generation
+    returned by its previous save or load when updating an existing checkpoint.
+    Optional ``stats`` exposes per-save hashing and I/O measurements.
+    """
+
+    active_stats = CheckpointSaveStats() if stats is None else stats
+    active_stats.reset()
+    total_started = time.perf_counter()
+    try:
+        return _save_search_checkpoint_impl(
+            path,
+            identity=identity,
+            workspace=workspace,
+            expected_generation=expected_generation,
+            active_stats=active_stats,
+        )
+    finally:
+        active_stats.checkpoint_total_seconds = time.perf_counter() - total_started
 
 
 def load_search_checkpoint(
@@ -1139,6 +1266,7 @@ __all__ = [
     "CHECKPOINT_SCHEMA_VERSION",
     "CheckpointConcurrentWriterError",
     "CheckpointIdentityMismatchError",
+    "CheckpointSaveStats",
     "LegacyCheckpointFormatError",
     "build_search_checkpoint_identity",
     "load_search_checkpoint",

@@ -56,14 +56,17 @@ retains the v0.3.5 recovery budgets, certificate implementation, and work
 accounting; it does not reproduce commit `23fc222`, which must be run directly
 for historical performance attribution. Neither policy changes the
 complete-graph objective or the fixed `5 * tol` admission gate. The tumor work
-cap is shared across starts, retries, fallbacks, and polishing; nested solver
-accounting charges every logical full-edge traversal, including objective,
-surrogate, line-search, inner-solver, KKT, and certificate passes. Work stops
-at safe boundaries with at most 10 edge-pass equivalents reserved for the
-mandatory terminal audit. The independent
+cap is shared across starts, retries, fallbacks, and polishing. Exact realized
+graph work is reported as integer edge-region visits; the integer edge-pass
+budget charges every full traversal once and conservatively rounds each partial
+workset traversal up to one pass. Work stops at safe boundaries with at most 10
+edge-pass equivalents reserved for the mandatory terminal audit. The independent
 `--max-partition-refit-objective-evaluations` and
-`--max-direct-partition-candidates` controls bound the scalar/direct pool at
-candidate boundaries; a partial pool is explicitly unresolved. Certified
+`--max-direct-partition-candidates` controls bound post-guide scalar work and
+the direct pool at candidate boundaries; a partial pool is explicitly
+unresolved. The complete mandatory guide is never truncated because it can
+define the graph and objective. Total, mandatory-guide, and post-guide scalar
+work are reported separately in analysis-summary schema 8. Certified
 refinement also stops after `--lambda-no-progress-patience` consecutive
 proposals add no partition, score, KKT, or event-width information. None of
 these resource stops is convergence. Checkpoints use an incremental,

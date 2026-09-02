@@ -32,7 +32,7 @@ from ..model_selection.types import (
 from .cluster_order import ccf_cluster_order
 
 
-STATUS_SCHEMA_VERSION = 6
+STATUS_SCHEMA_VERSION = 7
 
 
 def _mask_hash(mask: np.ndarray) -> str:
@@ -548,6 +548,7 @@ _RAW_ATTEMPT_COLUMNS = [
     "work_partition_refit_coordinates",
     "work_partition_refit_objective_evaluations",
     "work_edge_pass_equivalents",
+    "work_edge_region_visits",
     "work_full_certificate_audit_passes",
     "device",
     "dtype",

@@ -102,6 +102,9 @@ def _outcome_for_failure_policy(
         raw_lambda_path_resolved=outcome.raw_lambda_path_resolved,
         global_hybrid_optimum_certified=False,
         search_work=getattr(outcome, "search_work", WorkCounters()),
+        mandatory_guide_work=getattr(
+            outcome, "mandatory_guide_work", WorkCounters()
+        ),
         cumulative_search_active_seconds=(
             getattr(outcome, "cumulative_search_active_seconds", 0.0)
         ),

@@ -91,11 +91,12 @@ def _certificate_work_counters(
     full_graph_passes: int = 0,
     policy_audit_passes: int = 0,
     edge_pass_equivalents: int | None = None,
+    edge_region_visits: int = 0,
 ) -> WorkCounters:
     """Return deterministic work charged by one certificate operation.
 
-    The explicit override is the exact count emitted by the dense/streamed
-    primitive instrumentation.  The fallback is retained for callers whose
+    The explicit override is the conservative budget-unit count emitted by
+    primitive instrumentation. The fallback is retained for callers whose
     operations have the historical two-pass iteration/audit structure.  Work
     accounting never participates in a certificate decision.
     """
@@ -103,7 +104,7 @@ def _certificate_work_counters(
     iteration_count = max(int(iterations), 0)
     graph_pass_count = max(int(full_graph_passes), 0)
     policy_pass_count = max(int(policy_audit_passes), 0)
-    exact_edge_passes = (
+    budget_edge_passes = (
         2 * iteration_count + 2 * graph_pass_count
         if edge_pass_equivalents is None
         else max(int(edge_pass_equivalents), 0)
@@ -111,7 +112,8 @@ def _certificate_work_counters(
     return WorkCounters(
         certificate_iterations=iteration_count,
         certificate_full_graph_passes=graph_pass_count,
-        edge_pass_equivalents=exact_edge_passes,
+        edge_pass_equivalents=budget_edge_passes,
+        edge_region_visits=max(int(edge_region_visits), 0),
         full_certificate_audit_passes=policy_pass_count,
     )
 
@@ -642,10 +644,15 @@ def _refine_compressed_certificate(
     edge_pass_equivalents = int(
         int(graph.edge_u.numel()) > 0 and float(lambda_value) > 0.0
     )
+    full_edge_region_visits = int(graph.edge_u.numel()) * int(phi.shape[1])
+    edge_region_visits = (
+        full_edge_region_visits if edge_pass_equivalents else 0
+    )
     if not bool(graph.is_complete) and int(graph.edge_u.numel()) > 0:
         # _initial_internal_tree_ids scans a non-complete graph to identify a
         # deterministic star support.  Complete graphs use direct edge IDs.
         edge_pass_equivalents += 1
+        edge_region_visits += full_edge_region_visits
     full_certificate_audit_passes = 0
     certificate_iterations = 0
     certificate_full_graph_passes = 0
@@ -675,6 +682,7 @@ def _refine_compressed_certificate(
         full_certificate_audit_passes += 1
         certificate_full_graph_passes += 1
         edge_pass_equivalents += int(int(graph.edge_u.numel()) > 0)
+        edge_region_visits += full_edge_region_visits
     if has_inherited_fast_path and before.kkt_residual <= 5.0 * float(atol):
         # The inherited compressed state has already passed a full
         # original-graph audit.  Re-optimizing its workset cannot strengthen
@@ -697,6 +705,7 @@ def _refine_compressed_certificate(
                 full_graph_passes=certificate_full_graph_passes,
                 policy_audit_passes=full_certificate_audit_passes,
                 edge_pass_equivalents=edge_pass_equivalents,
+                edge_region_visits=edge_region_visits,
             ),
         )
     status = "not_certified"
@@ -719,6 +728,11 @@ def _refine_compressed_certificate(
         )
         certificate_iterations += int(iterations)
         edge_pass_equivalents += int(workset_passes)
+        edge_region_visits += (
+            int(workset_passes)
+            * int(support_ids.numel())
+            * int(phi.shape[1])
+        )
         current = CompressedEdgeCertificate(
             labels=labels,
             centers=centers,
@@ -756,6 +770,7 @@ def _refine_compressed_certificate(
         )
         certificate_full_graph_passes += 1
         edge_pass_equivalents += int(int(graph.edge_u.numel()) > 0)
+        edge_region_visits += full_edge_region_visits
         column_ready = column_residual <= float(options.column_tolerance)
         should_expand = not column_ready
         if column_ready:
@@ -773,6 +788,7 @@ def _refine_compressed_certificate(
             full_certificate_audit_passes += 1
             certificate_full_graph_passes += 1
             edge_pass_equivalents += int(int(graph.edge_u.numel()) > 0)
+            edge_region_visits += full_edge_region_visits
             if final_diag.kkt_residual <= 5.0 * float(atol):
                 status = "certified"
                 certificate = current
@@ -820,6 +836,7 @@ def _refine_compressed_certificate(
             full_graph_passes=certificate_full_graph_passes,
             policy_audit_passes=full_certificate_audit_passes,
             edge_pass_equivalents=edge_pass_equivalents,
+            edge_region_visits=edge_region_visits,
         ),
     )
 
@@ -1023,8 +1040,9 @@ def _audit_certificate(
     phi: torch.Tensor,
     grad_smooth: torch.Tensor,
     problem: CertificateProblem,
-) -> tuple[KKTDiagnostics, int]:
+) -> tuple[KKTDiagnostics, int, int]:
     if isinstance(certificate, CompressedEdgeCertificate):
+        edge_passes = int(int(problem.graph.edge_u.numel()) > 0)
         return (
             _compressed_graph_fusion_kkt(
                 certificate=certificate,
@@ -1037,7 +1055,12 @@ def _audit_certificate(
                 lambda_value=problem.lambda_value,
                 atol=problem.atol,
             ),
-            int(int(problem.graph.edge_u.numel()) > 0),
+            edge_passes,
+            (
+                edge_passes
+                * int(problem.graph.edge_u.numel())
+                * int(phi.shape[1])
+            ),
         )
     values = graph_fusion_kkt_residual_from_grad_torch(
         phi=phi,
@@ -1056,6 +1079,7 @@ def _audit_certificate(
     return (
         KKTDiagnostics.from_mapping(values),
         int(values.get("_edge_pass_equivalents", 0)),
+        int(values.get("_edge_region_visits", 0)),
     )
 
 
@@ -1125,6 +1149,7 @@ def _refine_certificate(
             edge_pass_equivalents=int(
                 dense.get("_edge_pass_equivalents", 0)
             ),
+            edge_region_visits=int(dense.get("_edge_region_visits", 0)),
         ),
     )
 
@@ -1165,7 +1190,7 @@ def certify(
             max_iter=max_iter,
             options=options,
         )
-    diagnostics, edge_pass_equivalents = _audit_certificate(
+    diagnostics, edge_pass_equivalents, edge_region_visits = _audit_certificate(
         certificate=witness,
         phi=phi,
         grad_smooth=gradient.value,
@@ -1178,5 +1203,6 @@ def certify(
         work_counters=_certificate_work_counters(
             full_graph_passes=1,
             edge_pass_equivalents=edge_pass_equivalents,
+            edge_region_visits=edge_region_visits,
         ),
     )

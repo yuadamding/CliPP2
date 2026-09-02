@@ -42,11 +42,15 @@ jobs:
 
           source = pd.read_csv("examples/exampleTumor1.tsv", sep="\t")
           mutation_ids = source["mutation_id"].drop_duplicates().iloc[:4]
-          smoke = source[source["mutation_id"].isin(mutation_ids)]
+          region_id = source["sample_id"].drop_duplicates().iloc[0]
+          smoke = source[
+              source["mutation_id"].isin(mutation_ids)
+              & source["sample_id"].eq(region_id)
+          ]
           destination = Path(os.environ["RUNNER_TEMP"]) / "exampleTumor1_smoke.tsv"
           smoke.to_csv(destination, sep="\t", index=False)
           PY
-      - name: CPU CLI smoke
+      - name: Bounded checkpoint and resume smoke
         run: |
           clipp2 fit \
             --input-file "$RUNNER_TEMP/exampleTumor1_smoke.tsv" \
@@ -54,20 +58,67 @@ jobs:
             --profile fast \
             --device cpu \
             --dtype float64 \
-            --failure-policy error
+            --failure-policy error \
+            --max-direct-partition-candidates 1 \
+            --checkpoint-every-lambda \
+            --checkpoint-file "$RUNNER_TEMP/clipp2-checkpoint"
+          clipp2 fit \
+            --input-file "$RUNNER_TEMP/exampleTumor1_smoke.tsv" \
+            --outdir "$RUNNER_TEMP/clipp2-resumed" \
+            --profile fast \
+            --device cpu \
+            --dtype float64 \
+            --failure-policy error \
+            --max-direct-partition-candidates 1 \
+            --resume-checkpoint "$RUNNER_TEMP/clipp2-checkpoint"
           python - <<'PY'
           import json
           import os
           from pathlib import Path
 
-          output = Path(os.environ["RUNNER_TEMP"]) / "clipp2-smoke"
-          prefix = output / "exampleTumor1_smoke"
-          status = json.loads(prefix.with_name(prefix.name + "_analysis_status.json").read_text())
-          assert status["analysis_tier"] == "joint_certified"
-          assert status["primary_estimator_available"] is True
-          assert status["computation_profile"] == "fast"
-          assert status["device"] == "cpu"
-          assert status["dtype"] == "float64"
+          root = Path(os.environ["RUNNER_TEMP"])
+
+          def status(directory):
+              return json.loads(
+                  (root / directory / "exampleTumor1_smoke_analysis_status.json")
+                  .read_text()
+              )
+
+          first = status("clipp2-smoke")
+          resumed = status("clipp2-resumed")
+          assert first["summary_schema_version"] == 8
+          assert first["analysis_tier"] == "joint_certified"
+          assert first["primary_estimator_available"] is True
+          assert first["computation_profile"] == "fast"
+          assert first["device"] == "cpu"
+          assert first["dtype"] == "float64"
+          assert first["selection_status"] == "provisional_unresolved"
+          assert first["ward_candidate_pool_complete"] is False
+          assert first["selection_pool_stop_reason"] == (
+              "direct_partition_candidate_budget_reached"
+          )
+          assert first["global_hybrid_optimum_certified"] is False
+          assert first["max_partition_refit_objective_evaluations_scope"] == (
+              "post_mandatory_guide"
+          )
+          total = first["search_work_partition_refit_objective_evaluations"]
+          guide = first["mandatory_guide_partition_refit_objective_evaluations"]
+          post_guide = first["post_guide_partition_refit_objective_evaluations"]
+          assert guide > 0 and post_guide > 0 and total == guide + post_guide
+          assert resumed["resumed_from_checkpoint"] is True
+          for field in (
+              "selected_partition_signature",
+              "search_work_partition_refit_objective_evaluations",
+              "mandatory_guide_partition_refit_objective_evaluations",
+              "post_guide_partition_refit_objective_evaluations",
+              "search_work_edge_pass_equivalents",
+              "selection_pool_stop_reason",
+          ):
+              assert resumed[field] == first[field], field
+          checkpoint = root / "clipp2-checkpoint"
+          assert (checkpoint / "manifest.json").is_file()
+          assert any((checkpoint / "arrays").iterdir())
+          prefix = root / "clipp2-smoke" / "exampleTumor1_smoke"
           for suffix in (
               "cluster_centers.tsv",
               "cluster_region_estimates.tsv",
@@ -79,4 +130,136 @@ jobs:
           ):
               path = prefix.with_name(f"{prefix.name}_{suffix}")
               assert path.is_file() and path.stat().st_size > 0, path
+          PY
+      - name: Work cap and no-progress contracts
+        run: |
+          clipp2 fit \
+            --input-file "$RUNNER_TEMP/exampleTumor1_smoke.tsv" \
+            --outdir "$RUNNER_TEMP/clipp2-work-cap" \
+            --profile fast \
+            --device cpu \
+            --dtype float64 \
+            --failure-policy save-diagnostics \
+            --max-tumor-edge-pass-equivalents 1 \
+            --max-direct-partition-candidates 1
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import torch
+
+          from CliPP2.core.fusion import torch_backend as fusion_backend
+          from CliPP2.model_selection.online_lambda import (
+              OnlineLambdaConfig,
+              OnlineLambdaController,
+              OnlineLambdaObservation,
+              OnlineLambdaProposal,
+          )
+          from CliPP2.model_selection.search import (
+              _adaptive_stop_certifies_global_optimum,
+          )
+
+          status_path = (
+              Path(os.environ["RUNNER_TEMP"])
+              / "clipp2-work-cap"
+              / "exampleTumor1_smoke_analysis_status.json"
+          )
+          status = json.loads(status_path.read_text())
+          assert status["search_stop_reason"] == "tumor_work_budget_reached"
+          assert status["search_work_edge_pass_equivalents"] <= 11
+          assert status["search_work_edge_region_visits"] <= 11 * 6
+          assert status["search_work_edge_region_visits"] == (
+              status["search_work_edge_pass_equivalents"] * 6
+          )
+          assert status["selection_optimum_resolved"] is False
+          assert status["global_hybrid_optimum_certified"] is False
+
+          phi = torch.full((4, 2), 0.5, dtype=torch.float64)
+          edge_index = torch.triu_indices(4, 4, offset=1)
+          edge_u, edge_v = edge_index[0], edge_index[1]
+          forward_visits = 0
+          original_forward = fusion_backend.graph_forward_edges
+
+          def counted_forward(*args, **kwargs):
+              global forward_visits
+              forward_visits += int(kwargs["edge_u"].numel()) * int(
+                  args[0].shape[1]
+              )
+              return original_forward(*args, **kwargs)
+
+          fusion_backend.graph_forward_edges = counted_forward
+          try:
+              certificate = fusion_backend.refine_graph_fusion_dual_certificate_torch(
+                  phi=phi,
+                  grad_smooth=torch.zeros_like(phi),
+                  dual_kkt=torch.zeros((6, 2), dtype=phi.dtype),
+                  lower=torch.zeros_like(phi),
+                  upper=torch.ones_like(phi),
+                  edge_u=edge_u,
+                  edge_v=edge_v,
+                  edge_w=torch.ones(6, dtype=phi.dtype),
+                  lambda_value=0.1,
+                  atol=1e-8,
+                  max_iter=1,
+                  edge_work_bytes=1,
+              )
+          finally:
+              fusion_backend.graph_forward_edges = original_forward
+          full_pass_visits = int(edge_u.numel()) * int(phi.shape[1])
+          assert certificate["status"] == "input_dual_retained"
+          assert forward_visits == full_pass_visits
+          assert certificate["_edge_region_visits"] == (
+              certificate["_edge_pass_equivalents"] * full_pass_visits
+          )
+
+          config = OnlineLambdaConfig(
+              guide_n_clusters=2,
+              num_mutations=4,
+              kkt_tolerance=1e-4,
+              max_unique_lambdas=4,
+              max_refinement_lambdas=4,
+              no_progress_patience=1,
+              partition_event_mode=True,
+          )
+          controller = OnlineLambdaController(initial_lambda=10.0, config=config)
+          initial = controller.propose()
+          assert initial is not None
+          observation = OnlineLambdaObservation(
+              lambda_value=initial.lambda_value,
+              n_clusters=2,
+              partition_signature="same",
+              partition_icl=100.0,
+              kkt_residual=1e-8,
+              raw_objective_certified=True,
+              partition_certified=True,
+              selection_score_available=True,
+          )
+          controller.observe(observation)
+          restored = OnlineLambdaController.from_state_dict(
+              json.loads(json.dumps(controller.state_dict()))
+          )
+          refinement = OnlineLambdaProposal(
+              lambda_value=12.0,
+              phase="refine_ci_interval",
+              reason="deterministic_no_progress_fixture",
+              warm_start_lambda=10.0,
+          )
+          for item in (controller, restored):
+              item._record_proposal(refinement)
+              item.observe(
+                  OnlineLambdaObservation(
+                      lambda_value=refinement.lambda_value,
+                      n_clusters=2,
+                      partition_signature="same",
+                      partition_icl=100.0,
+                      kkt_residual=1e-8,
+                      raw_objective_certified=True,
+                      partition_certified=True,
+                      selection_score_available=True,
+                  )
+              )
+              assert item.propose() is None
+              assert item.stop_reason == "online_lambda_no_meaningful_progress"
+              assert not _adaptive_stop_certifies_global_optimum(item.stop_reason)
+          assert restored.state_dict() == controller.state_dict()
           PY

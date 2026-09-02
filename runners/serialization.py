@@ -40,7 +40,7 @@ from .status_outputs import (
 )
 
 
-SUMMARY_SCHEMA_VERSION = 7
+SUMMARY_SCHEMA_VERSION = 8
 _PRIMARY_SUFFIXES = (
     "mutation_clusters.tsv",
     "cluster_centers.tsv",
@@ -192,6 +192,7 @@ def _search_work_summary(result: TumorSelectionOutcome) -> dict[str, int]:
                     attempt.work_partition_refit_objective_evaluations
                 ),
                 edge_pass_equivalents=int(attempt.work_edge_pass_equivalents),
+                edge_region_visits=int(attempt.work_edge_region_visits),
                 full_certificate_audit_passes=int(
                     attempt.work_full_certificate_audit_passes
                 ),
@@ -204,12 +205,39 @@ def _search_work_summary(result: TumorSelectionOutcome) -> dict[str, int]:
     }
 
 
+def _scalar_refit_budget_summary(
+    result: TumorSelectionOutcome,
+    search_work: dict[str, int],
+) -> dict[str, int | str]:
+    """Separate objective-defining guide work from the post-guide cap ledger."""
+
+    mandatory = getattr(result, "mandatory_guide_work", WorkCounters())
+    if not isinstance(mandatory, WorkCounters):
+        raise TypeError("mandatory_guide_work must be a WorkCounters value.")
+    output: dict[str, int | str] = {
+        "max_partition_refit_objective_evaluations_scope": (
+            "post_mandatory_guide"
+        )
+    }
+    for field_name in (
+        "partition_refit_coordinates",
+        "partition_refit_objective_evaluations",
+    ):
+        total = int(search_work[f"search_work_{field_name}"])
+        guide = int(getattr(mandatory, field_name))
+        if guide > total:
+            raise ValueError("Mandatory guide work exceeds total search work.")
+        output[f"mandatory_guide_{field_name}"] = guide
+        output[f"post_guide_{field_name}"] = int(total - guide)
+    return output
+
+
 def analysis_summary(
     analysis: AnalysisSerialization,
     *,
     elapsed_seconds: float,
 ) -> dict[str, object]:
-    """Serialize schema-v6 status without changing estimator state."""
+    """Serialize the analysis summary without changing estimator state."""
 
     data = analysis.data
     fit_config = analysis.fit_config
@@ -439,7 +467,9 @@ def analysis_summary(
         "software_version": _SOFTWARE_VERSION,
     }
     summary.update(_raw_summary(analysis.diagnostic_raw_fit))
-    summary.update(_search_work_summary(result))
+    search_work_summary = _search_work_summary(result)
+    summary.update(search_work_summary)
+    summary.update(_scalar_refit_budget_summary(result, search_work_summary))
     return summary
 
 

@@ -165,8 +165,10 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help=(
-            "Cumulative scalar-objective budget for fixed-partition refits; "
-            "the current candidate finishes atomically before stopping."
+            "Cumulative post-mandatory-guide scalar-objective budget for "
+            "fixed-partition refits; complete guide construction is reported "
+            "separately and the current candidate finishes atomically before "
+            "stopping."
         ),
     )
     parser.add_argument(
