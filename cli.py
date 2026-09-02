@@ -161,6 +161,21 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--max-partition-refit-objective-evaluations",
+        type=int,
+        default=None,
+        help=(
+            "Cumulative scalar-objective budget for fixed-partition refits; "
+            "the current candidate finishes atomically before stopping."
+        ),
+    )
+    parser.add_argument(
+        "--max-direct-partition-candidates",
+        type=int,
+        default=None,
+        help="Maximum number of direct Ward/CEM candidates evaluated.",
+    )
+    parser.add_argument(
         "--recovery-policy",
         choices=["staged", "legacy"],
         default="staged",
@@ -176,6 +191,15 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         help="Number of recovery KKT audits in the stagnation window.",
     )
     parser.add_argument(
+        "--lambda-no-progress-patience",
+        type=int,
+        default=3,
+        help=(
+            "Certified refinement proposals tolerated without a new scored "
+            "partition, improved score/KKT, or narrower partition event."
+        ),
+    )
+    parser.add_argument(
         "--checkpoint-every-lambda",
         action="store_true",
         help=(
@@ -187,7 +211,8 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         "--checkpoint-file",
         default=None,
         help=(
-            "Checkpoint path; defaults to OUTDIR/.clipp2-checkpoints/TUMOR.npz."
+            "Checkpoint directory; defaults to "
+            "OUTDIR/.clipp2-checkpoints/TUMOR.npz."
         ),
     )
     parser.add_argument(
@@ -195,7 +220,7 @@ def _add_fit_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Resume the exact identity-matched online search from this checkpoint "
-            "and keep updating the same file."
+            "directory and keep updating it."
         ),
     )
     parser.add_argument("--certificate-max-iter", type=int, default=None)
@@ -263,8 +288,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             and int(args.max_tumor_edge_pass_equivalents) < 1
         ):
             parser.error("--max-tumor-edge-pass-equivalents must be positive")
+        if (
+            args.max_partition_refit_objective_evaluations is not None
+            and int(args.max_partition_refit_objective_evaluations) < 1
+        ):
+            parser.error(
+                "--max-partition-refit-objective-evaluations must be positive"
+            )
+        if (
+            args.max_direct_partition_candidates is not None
+            and int(args.max_direct_partition_candidates) < 1
+        ):
+            parser.error("--max-direct-partition-candidates must be positive")
         if int(args.stagnation_audit_patience) < 1:
             parser.error("--stagnation-audit-patience must be positive")
+        if int(args.lambda_no_progress_patience) < 1:
+            parser.error("--lambda-no-progress-patience must be positive")
         if args.checkpoint_file and not args.checkpoint_every_lambda:
             parser.error("--checkpoint-file requires --checkpoint-every-lambda")
     return args
@@ -292,8 +331,13 @@ def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
         workset_add_batch=args.workset_add_batch,
         workset_max_expansions=args.workset_max_expansions,
         max_tumor_edge_pass_equivalents=args.max_tumor_edge_pass_equivalents,
+        max_partition_refit_objective_evaluations=(
+            args.max_partition_refit_objective_evaluations
+        ),
+        max_direct_partition_candidates=args.max_direct_partition_candidates,
         recovery_policy=args.recovery_policy,
         stagnation_audit_patience=args.stagnation_audit_patience,
+        lambda_no_progress_patience=args.lambda_no_progress_patience,
         certificate_max_iter=args.certificate_max_iter,
         certificate_refinement_rounds=args.certificate_refinement_rounds,
         certificate_column_tol_scale=args.certificate_column_tol_scale,

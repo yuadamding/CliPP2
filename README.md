@@ -50,16 +50,31 @@ clipp2 fit \
 
 `--recovery-policy staged` is the default. It detects recovery-only plateaus
 and probes terminal certificate refinement before spending the remaining
-certificate budget; `legacy` disables that staging for attribution. Neither
-policy changes the complete-graph objective or the fixed `5 * tol` admission
-gate. The tumor work cap is shared across starts, retries, fallbacks, and
-polishing; nested solver work stops at safe boundaries with at most 10 edge-pass
-equivalents reserved for the mandatory terminal audit. Reaching it stops the
-bounded search as unresolved, never as converged. Checkpoints are
-atomically replaced after completed observations and fail closed unless tumor,
-objective, graph, contract, full configuration, warm-start policy, runtime,
+certificate budget; `legacy` is retained as a compatibility spelling for the
+unstaged v0.3.5 ablation. It disables stagnation-based early termination but
+retains the v0.3.5 recovery budgets, certificate implementation, and work
+accounting; it does not reproduce commit `23fc222`, which must be run directly
+for historical performance attribution. Neither policy changes the
+complete-graph objective or the fixed `5 * tol` admission gate. The tumor work
+cap is shared across starts, retries, fallbacks, and polishing; nested solver
+accounting charges every logical full-edge traversal, including objective,
+surrogate, line-search, inner-solver, KKT, and certificate passes. Work stops
+at safe boundaries with at most 10 edge-pass equivalents reserved for the
+mandatory terminal audit. The independent
+`--max-partition-refit-objective-evaluations` and
+`--max-direct-partition-candidates` controls bound the scalar/direct pool at
+candidate boundaries; a partial pool is explicitly unresolved. Certified
+refinement also stops after `--lambda-no-progress-patience` consecutive
+proposals add no partition, score, KKT, or event-width information. None of
+these resource stops is convergence. Checkpoints use an incremental,
+content-addressed directory (the default path retains its historical `.npz`
+suffix), save after both lambda observations and direct candidates, and only
+atomically replace `manifest.json` after completed work.
+Resume fails closed unless tumor, objective, graph, contract, full
+configuration, warm-start policy, numerical environment and hardware,
 software, and source-tree identities match exactly. Use `--checkpoint-file`
-with `--checkpoint-every-lambda` to override the hidden default path.
+with `--checkpoint-every-lambda` to override the hidden default path. Legacy
+monolithic NPZ checkpoint files require a fresh run at a new path.
 
 ## Outputs
 

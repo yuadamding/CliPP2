@@ -666,6 +666,7 @@ class BICSelectionResult:
     search_work: WorkCounters = WorkCounters()
     cumulative_search_active_seconds: float = 0.0
     resumed_from_checkpoint: bool = False
+    selection_pool_stop_reason: str = "none"
 
     @property
     def primary_estimator_available(self) -> bool:
@@ -733,6 +734,7 @@ class SecondaryFallbackResult:
     search_work: WorkCounters = WorkCounters()
     cumulative_search_active_seconds: float = 0.0
     resumed_from_checkpoint: bool = False
+    selection_pool_stop_reason: str = "none"
     primary_estimator_available: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
@@ -795,6 +797,7 @@ class DiagnosticOnlyResult:
     search_work: WorkCounters = WorkCounters()
     cumulative_search_active_seconds: float = 0.0
     resumed_from_checkpoint: bool = False
+    selection_pool_stop_reason: str = "none"
     primary_estimator_available: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:

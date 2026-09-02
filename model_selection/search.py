@@ -595,10 +595,17 @@ def _assemble_selection_result(
     strict_positive_exact_fusion: bool = False,
     ward_candidate_pool_complete: bool = False,
     require_global_secondary_refit: bool = False,
+    candidate_pool_complete: bool = True,
+    raw_lambda_path_resolved: bool | None = None,
+    selection_pool_stop_reason: str = "none",
 ) -> TumorSelectionOutcome:
     final_adaptive_search_stop_reason = str(adaptive_search_stop_reason)
-    adaptive_search_global_optimum_certified = _adaptive_stop_certifies_global_optimum(
-        final_adaptive_search_stop_reason
+    raw_path_resolved = bool(
+        _adaptive_stop_certifies_global_optimum(
+            final_adaptive_search_stop_reason
+        )
+        if raw_lambda_path_resolved is None
+        else raw_lambda_path_resolved
     )
     try:
         decision = select_candidate_records(
@@ -620,9 +627,10 @@ def _assemble_selection_result(
             num_candidates_certified=0,
             ward_candidate_pool_complete=bool(ward_candidate_pool_complete),
             raw_lambda_path_resolved=bool(
-                adaptive_search_global_optimum_certified
+                raw_path_resolved
             ),
             global_hybrid_optimum_certified=False,
+            selection_pool_stop_reason=str(selection_pool_stop_reason),
         )
 
     selected_record = decision.selected
@@ -656,6 +664,7 @@ def _assemble_selection_result(
                 ward_candidate_pool_complete=bool(ward_candidate_pool_complete),
                 raw_lambda_path_resolved=False,
                 global_hybrid_optimum_certified=False,
+                selection_pool_stop_reason=str(selection_pool_stop_reason),
             )
         secondary = secondary_record.candidate
         if not isinstance(secondary, DirectPartitionCandidate):  # pragma: no cover
@@ -685,6 +694,7 @@ def _assemble_selection_result(
             ward_candidate_pool_complete=bool(ward_candidate_pool_complete),
             raw_lambda_path_resolved=False,
             global_hybrid_optimum_certified=False,
+            selection_pool_stop_reason=str(selection_pool_stop_reason),
         )
     raw_reference = raw_reference_record.candidate
     if not isinstance(raw_reference, RawFusionCandidate):  # pragma: no cover
@@ -711,9 +721,11 @@ def _assemble_selection_result(
                     "Direct partition parent-Phi provenance is inconsistent."
                 )
 
+    selection_boundary_unresolved = bool(
+        decision.selection_boundary_unresolved or not candidate_pool_complete
+    )
     selection_optimum_resolved = bool(
-        adaptive_search_global_optimum_certified
-        and not decision.selection_boundary_unresolved
+        raw_path_resolved and not selection_boundary_unresolved
     )
     selected_lambda = selected_record.lambda_value
     selected_kkt_value = (
@@ -740,7 +752,7 @@ def _assemble_selection_result(
         selection_method=selection_method,
         selection_hits_lower_boundary=decision.selection_hits_lower_boundary,
         selection_hits_upper_boundary=decision.selection_hits_upper_boundary,
-        selection_boundary_unresolved=decision.selection_boundary_unresolved,
+        selection_boundary_unresolved=selection_boundary_unresolved,
         selection_optimum_resolved=bool(selection_optimum_resolved),
         adaptive_search_stop_reason=str(final_adaptive_search_stop_reason),
         num_candidates=int(len(result_entries)),
@@ -750,8 +762,9 @@ def _assemble_selection_result(
         num_candidates_certified=int(decision.num_eligible),
         selected_kkt_residual=selected_kkt_residual,
         ward_candidate_pool_complete=bool(ward_candidate_pool_complete),
-        raw_lambda_path_resolved=bool(adaptive_search_global_optimum_certified),
+        raw_lambda_path_resolved=bool(raw_path_resolved),
         global_hybrid_optimum_certified=bool(selection_optimum_resolved),
+        selection_pool_stop_reason=str(selection_pool_stop_reason),
     )
 
 
@@ -810,7 +823,7 @@ def _partition_guided_admm_selection(
         device=pilot_runtime.device,
         dtype=pilot_runtime.dtype,
     )
-    initializer_pool = generate_partition_initializer_pool(
+    initializer_generation = generate_partition_initializer_pool(
         data=data,
         pilot_phi=pilot_phi,
         fit_options=fit_options,
@@ -820,6 +833,9 @@ def _partition_guided_admm_selection(
         rescore_candidates=_rescore_partition_candidates,
         curvature=guide_curvature,
     )
+    if not initializer_generation.complete:  # pragma: no cover - no guide cap
+        raise AssertionError("The mandatory partition-guide pool was truncated.")
+    initializer_pool = initializer_generation.candidates
     guide = _best_partition_candidate(list(initializer_pool))
     if guide is None:
         raise RuntimeError(
@@ -946,6 +962,9 @@ def _partition_guided_admm_selection(
             max_solver_retries_per_lambda=int(
                 effective_fit_options.selection.lambda_search.solver_retry_limit
             ),
+            no_progress_patience=int(
+                effective_fit_options.selection.lambda_search.no_progress_patience
+            ),
             partition_event_mode=True,
         ),
     )
@@ -956,8 +975,17 @@ def _partition_guided_admm_selection(
     attempts_by_lambda: dict[float, list[SolveOutcome]] = {}
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] = {}
     next_step = 0
-    total_work = WorkCounters()
+    total_work = initializer_generation.work
     search_stop_override: str | None = None
+    direct_next_index = 0
+    direct_pool_complete = False
+    direct_pool_stop_reason: str | None = None
+    direct_proposal_state: list[
+        tuple[PartitionCandidate, str, int | None]
+    ] | None = None
+    direct_proposal_state_complete = False
+    direct_final_parent_next_index = 0
+    checkpoint_generation = 0
     # Lazily promoted float64 twin of the working context, built at most once
     # per tumor and only when a certification-recovery attempt needs it.
     float64_recovery_context: list = [None]
@@ -979,9 +1007,10 @@ def _partition_guided_admm_selection(
     if resume_checkpoint:
         if checkpoint_path is None:
             raise ValueError("resume_checkpoint requires a checkpoint path.")
-        workspace = load_search_checkpoint(
+        workspace, checkpoint_generation = load_search_checkpoint(
             checkpoint_path,
             expected_identity=checkpoint_identity,
+            return_generation=True,
         )
         controller = OnlineLambdaController.from_state_dict(
             workspace["controller_state"]
@@ -997,6 +1026,49 @@ def _partition_guided_admm_selection(
         next_step = int(workspace["next_step"])
         total_work = workspace["total_work"]
         search_stop_override = workspace.get("search_stop_override")
+        direct_next_index = int(workspace.get("direct_next_index", 0))
+        direct_pool_complete = bool(workspace.get("direct_pool_complete", False))
+        direct_pool_stop_reason = workspace.get("direct_pool_stop_reason")
+        loaded_direct_proposals = workspace.get("direct_proposal_state")
+        direct_proposal_state_complete = bool(
+            workspace.get("direct_proposal_state_complete", False)
+        )
+        direct_final_parent_next_index = int(
+            workspace.get("direct_final_parent_next_index", 0)
+        )
+        if loaded_direct_proposals is not None:
+            if not isinstance(loaded_direct_proposals, (list, tuple)):
+                raise ValueError("Checkpoint direct proposal state is invalid.")
+            direct_proposal_state = []
+            for entry in loaded_direct_proposals:
+                if not isinstance(entry, tuple) or len(entry) != 3:
+                    raise ValueError("Checkpoint direct proposal entry is invalid.")
+                proposal, stage, parent_candidate_id = entry
+                if not isinstance(proposal, PartitionCandidate):
+                    raise ValueError("Checkpoint direct proposal type is invalid.")
+                if not isinstance(stage, str) or not stage:
+                    raise ValueError("Checkpoint direct proposal stage is invalid.")
+                if parent_candidate_id is not None and (
+                    isinstance(parent_candidate_id, bool)
+                    or not isinstance(parent_candidate_id, int)
+                    or int(parent_candidate_id) < 0
+                ):
+                    raise ValueError("Checkpoint direct proposal parent is invalid.")
+                direct_proposal_state.append(
+                    (proposal, stage, parent_candidate_id)
+                )
+        elif direct_proposal_state_complete:
+            raise ValueError(
+                "Checkpoint marks a missing direct proposal pool as complete."
+            )
+        if direct_next_index < 0:
+            raise ValueError("Checkpoint direct-candidate index is invalid.")
+        if direct_final_parent_next_index < 0:
+            raise ValueError("Checkpoint direct-parent index is invalid.")
+        if direct_pool_stop_reason is not None and not isinstance(
+            direct_pool_stop_reason, str
+        ):
+            raise ValueError("Checkpoint direct-pool stop reason is invalid.")
         raw_guide_phi = workspace["raw_guide_phi"]
         guided_initialization = workspace["guided_initialization"]
         float64_recovery_status[0] = str(
@@ -1038,13 +1110,15 @@ def _partition_guided_admm_selection(
                     )
 
     def checkpoint_search_state() -> None:
+        nonlocal checkpoint_generation
         if checkpoint_path is None:
             return
         if checkpoint_identity is None:  # pragma: no cover - construction guard
             raise AssertionError("Checkpoint path has no identity guard.")
-        save_search_checkpoint(
+        checkpoint_generation = save_search_checkpoint(
             checkpoint_path,
             identity=checkpoint_identity,
+            expected_generation=int(checkpoint_generation),
             workspace={
                 "controller_state": controller.state_dict(),
                 "result_entries": result_entries,
@@ -1055,6 +1129,16 @@ def _partition_guided_admm_selection(
                 "next_step": int(next_step),
                 "total_work": total_work,
                 "search_stop_override": search_stop_override,
+                "direct_next_index": int(direct_next_index),
+                "direct_pool_complete": bool(direct_pool_complete),
+                "direct_pool_stop_reason": direct_pool_stop_reason,
+                "direct_proposal_state": direct_proposal_state,
+                "direct_proposal_state_complete": bool(
+                    direct_proposal_state_complete
+                ),
+                "direct_final_parent_next_index": int(
+                    direct_final_parent_next_index
+                ),
                 "raw_guide_phi": raw_guide_phi,
                 "guided_initialization": guided_initialization,
                 "float64_recovery_status": str(float64_recovery_status[0]),
@@ -1376,32 +1460,21 @@ def _partition_guided_admm_selection(
                     effective_fit_options.solver.resources
                     .max_tumor_edge_pass_equivalents
                 )
-                attempt_fit_options = candidate_fit_options
+                remaining_before_escape: int | None = None
                 if tumor_work_cap is not None:
-                    remaining_work = int(tumor_work_cap) - int(
+                    remaining_before_escape = int(tumor_work_cap) - int(
                         total_work.edge_pass_equivalents
                         + proposal_work.edge_pass_equivalents
                     )
-                    if remaining_work <= 0 and start_attempts:
+                    if remaining_before_escape <= 0 and start_attempts:
                         break
-                    attempt_fit_options = replace(
-                        candidate_fit_options,
-                        solver=replace(
-                            candidate_fit_options.solver,
-                            resources=replace(
-                                candidate_fit_options.solver.resources,
-                                max_attempt_edge_pass_equivalents=max(
-                                    int(remaining_work), 1
-                                ),
-                            ),
-                        ),
-                    )
                 if recovery_promoted:
                     # A promoted attempt keeps only the primal start: working-
                     # precision dual/certificate state is not carried across
                     # the dtype boundary, and the float64 solve refines fresh
                     # duals before certification.
                     solver_state_start, changed_count = None, 0
+                    escape_work = WorkCounters()
                     phi_start = _clone_start(
                         original_state.phi
                         if original_state is not None
@@ -1413,14 +1486,29 @@ def _partition_guided_admm_selection(
                         )
                     )
                 else:
-                    solver_state_start, changed_count = _escape_path_breakpoint_retry_state(
-                        original_state,
-                        start_source=lambda_start_source,
-                        start_lambda=lambda_start_value,
-                        target_lambda=float(proposal.lambda_value),
-                        context=context,
-                        tol=float(candidate_fit_options.solver.tolerance),
-                    )
+                    # Breakpoint escape costs one full adjoint.  When only one
+                    # soft-cap pass remains, preserve it for the required fit
+                    # rather than entering an escape that cannot be followed
+                    # without exceeding the aggregate C+10 contract.
+                    if (
+                        remaining_before_escape is not None
+                        and remaining_before_escape <= 1
+                    ):
+                        solver_state_start, changed_count = original_state, 0
+                        escape_work = WorkCounters()
+                    else:
+                        (
+                            solver_state_start,
+                            changed_count,
+                            escape_work,
+                        ) = _escape_path_breakpoint_retry_state(
+                            original_state,
+                            start_source=lambda_start_source,
+                            start_lambda=lambda_start_value,
+                            target_lambda=float(proposal.lambda_value),
+                            context=context,
+                            tol=float(candidate_fit_options.solver.tolerance),
+                        )
                     phi_start = _clone_start(
                         solver_state_start.phi
                         if solver_state_start is not None
@@ -1430,6 +1518,25 @@ def _partition_guided_admm_selection(
                             if explicit_phi_start is not None
                             else raw_guide_phi
                         )
+                    )
+                attempt_fit_options = candidate_fit_options
+                if tumor_work_cap is not None:
+                    remaining_work = int(tumor_work_cap) - int(
+                        total_work.edge_pass_equivalents
+                        + proposal_work.edge_pass_equivalents
+                        + escape_work.edge_pass_equivalents
+                    )
+                    attempt_fit_options = replace(
+                        candidate_fit_options,
+                        solver=replace(
+                            candidate_fit_options.solver,
+                            resources=replace(
+                                candidate_fit_options.solver.resources,
+                                max_attempt_edge_pass_equivalents=max(
+                                    int(remaining_work), 1
+                                ),
+                            ),
+                        ),
                     )
                 seed_fit = fit_fixed_objective(
                     data=data,
@@ -1448,6 +1555,9 @@ def _partition_guided_admm_selection(
                     solver_context=context,
                     solver_state=solver_state_start,
                 )
+                # Keep pre-solve breakpoint work on the corresponding attempt
+                # so both local cap routing and the tumor aggregate see it.
+                seed_fit = replace(seed_fit, work=seed_fit.work + escape_work)
                 if str(seed_fit.provenance.objective_spec_hash) != str(
                     context.objective_spec_hash
                 ):
@@ -1629,125 +1739,317 @@ def _partition_guided_admm_selection(
             >= int(work_cap)
         ):
             search_stop_override = "tumor_work_budget_reached"
+        refit_work_cap = (
+            effective_fit_options.solver.resources
+            .max_partition_refit_objective_evaluations
+        )
+        if (
+            search_stop_override is None
+            and refit_work_cap is not None
+            and int(total_work.partition_refit_objective_evaluations)
+            >= int(refit_work_cap)
+        ):
+            search_stop_override = (
+                "partition_refit_objective_evaluation_budget_reached"
+            )
         checkpoint_search_state()
 
     # A terminal controller reason is established by ``propose()`` after the
     # preceding observation, so persist that final scalar state as well.
     checkpoint_search_state()
 
-    ward_candidate_pool_complete = False
-    if selection_contract.selectable_partition_pool:
-        direct_proposals: list[
-            tuple[
-                PartitionCandidate,
-                str,
-                CandidateRecord | None,
-            ]
-        ] = [
-            (proposal, "pilot", None)
-            for proposal in initializer_pool
-        ]
+    raw_search_stop_reason = str(
+        search_stop_override
+        or controller.stop_reason
+        or "online_lambda_no_terminal_reason"
+    )
+    ward_candidate_pool_complete = bool(direct_pool_complete)
+    direct_resources = effective_fit_options.solver.resources
+    direct_refit_cap = direct_resources.max_partition_refit_objective_evaluations
+    direct_budget_exhausted_before_pool = bool(
+        direct_refit_cap is not None
+        and int(total_work.partition_refit_objective_evaluations)
+        >= int(direct_refit_cap)
+    )
+    if direct_budget_exhausted_before_pool:
+        direct_pool_stop_reason = (
+            "partition_refit_objective_evaluation_budget_reached"
+        )
+    if (
+        selection_contract.selectable_partition_pool
+        and not direct_pool_complete
+        and not direct_budget_exhausted_before_pool
+    ):
+        records_by_id = {
+            int(record.candidate_id): record for record in result_entries
+        }
         config = selection_contract.partition_config
-        if config.include_final_phi_ladder and config.final_phi_ladder_kmax > 0:
-            raw_parent_records = sorted(
-                (
-                    record
-                    for record in result_entries
-                    if isinstance(record.candidate, RawFusionCandidate)
-                    and raw_candidate_has_exact_fusion_certificate(record.candidate)
-                ),
-                key=lambda record: (
-                    float(record.score.value),
-                    float(record.score.numerical_uncertainty),
-                    float(record.candidate.raw_fit.provenance.lambda_value),
-                    int(record.candidate_id),
-                ),
-            )[: int(config.final_phi_parent_count)]
-            final_k_grid = tuple(
-                range(
-                    1,
-                    min(
-                        int(config.final_phi_ladder_kmax),
-                        int(data.num_mutations),
-                    )
-                    + 1,
+        raw_parent_records = sorted(
+            (
+                record
+                for record in result_entries
+                if isinstance(record.candidate, RawFusionCandidate)
+                and raw_candidate_has_exact_fusion_certificate(record.candidate)
+            ),
+            key=lambda record: (
+                float(record.score.value),
+                float(record.score.numerical_uncertainty),
+                float(record.candidate.raw_fit.provenance.lambda_value),
+                int(record.candidate_id),
+            ),
+        )[: int(config.final_phi_parent_count)]
+        final_k_grid = tuple(
+            range(
+                1,
+                min(
+                    int(config.final_phi_ladder_kmax),
+                    int(data.num_mutations),
                 )
+                + 1,
             )
-            for parent_record in raw_parent_records:
-                parent = parent_record.candidate
-                if not isinstance(parent, RawFusionCandidate):  # pragma: no cover
-                    continue
-                final_pool = generate_partition_initializer_pool(
-                    data=data,
-                    pilot_phi=np.asarray(parent.raw_fit.phi, dtype=np.float64),
-                    fit_options=effective_fit_options,
-                    normalized_score=normalized_score,
-                    runtime=runtime,
-                    torch_data=torch_data,
-                    rescore_candidates=_rescore_partition_candidates,
-                    declared_k_grid=final_k_grid,
-                    enable_refinement=False,
+        )
+        final_pool_required = bool(
+            config.include_final_phi_ladder
+            and final_k_grid
+            and raw_parent_records
+        )
+        if int(direct_final_parent_next_index) > len(raw_parent_records):
+            raise ValueError(
+                "Checkpoint direct-parent index exceeds the deterministic parent pool."
+            )
+        if direct_proposal_state is None:
+            direct_proposal_state = [
+                (proposal, "pilot", None)
+                for proposal in initializer_pool
+            ]
+            direct_proposal_state_complete = not final_pool_required
+            direct_final_parent_next_index = 0
+            # Pilot proposals are the first immutable generation transaction.
+            # Evaluate them before spending any optional final-Phi generation
+            # work, then append one complete parent batch at a time.
+            checkpoint_search_state()
+
+        completed_direct_records = [
+            record
+            for record in result_entries
+            if isinstance(record.candidate, DirectPartitionCandidate)
+        ]
+        if len(completed_direct_records) != int(direct_next_index):
+            raise ValueError(
+                "Checkpoint direct-candidate progress does not match retained records."
+            )
+        if int(direct_next_index) > len(direct_proposal_state):
+            raise ValueError(
+                "Checkpoint direct-candidate index exceeds the retained proposal pool."
+            )
+        for direct_index, retained_record in enumerate(completed_direct_records):
+            proposal, stage, parent_candidate_id = direct_proposal_state[direct_index]
+            source = _direct_partition_source(proposal, stage=stage)
+            retained = retained_record.candidate
+            if (
+                str(retained.partition.source) != str(source)
+                or retained.partition.parent_raw_candidate_id
+                != parent_candidate_id
+                or not np.array_equal(
+                    np.asarray(retained.partition.labels, dtype=np.int64),
+                    np.asarray(proposal.labels, dtype=np.int64),
                 )
-                direct_proposals.extend(
-                    (proposal, "final_phi", parent_record)
-                    for proposal in final_pool
+            ):
+                raise ValueError(
+                    "Retained direct pool does not match checkpoint progress."
                 )
 
-        for proposal, stage, parent_record in direct_proposals:
-            parent_candidate = (
-                None if parent_record is None else parent_record.candidate
-            )
-            parent_raw = (
-                parent_candidate
-                if isinstance(parent_candidate, RawFusionCandidate)
-                else None
-            )
-            source = _direct_partition_source(proposal, stage=stage)
-            candidate_id = int(len(result_entries))
-            direct_candidate = evaluate_direct_partition_candidate(
-                data=data,
-                proposal=proposal,
-                selection_options=effective_fit_options,
-                source=source,
-                parent_raw_candidate_id=(
-                    None if parent_record is None else int(parent_record.candidate_id)
-                ),
-                parent_raw_lambda=(
+        while not direct_pool_complete:
+            # Consume every already-generated proposal before generating an
+            # optional final-Phi parent batch. This preserves the historical
+            # pilot-then-parent order and makes each checkpoint resumable.
+            while int(direct_next_index) < len(direct_proposal_state):
+                direct_candidate_cap = direct_resources.max_direct_partition_candidates
+                if (
+                    direct_candidate_cap is not None
+                    and int(direct_next_index) >= int(direct_candidate_cap)
+                ):
+                    direct_pool_stop_reason = (
+                        "direct_partition_candidate_budget_reached"
+                    )
+                    break
+                if (
+                    direct_refit_cap is not None
+                    and int(total_work.partition_refit_objective_evaluations)
+                    >= int(direct_refit_cap)
+                ):
+                    direct_pool_stop_reason = (
+                        "partition_refit_objective_evaluation_budget_reached"
+                    )
+                    break
+
+                proposal, stage, parent_candidate_id = direct_proposal_state[
+                    int(direct_next_index)
+                ]
+                parent_record = (
                     None
-                    if parent_raw is None
-                    else float(parent_raw.raw_fit.provenance.lambda_value)
-                ),
-                parent_raw_phi_hash=(
-                    ""
-                    if parent_raw is None
-                    else _pilot_matrix_hash(parent_raw.raw_fit.phi)
-                ),
-                refit_cache=bic_refit_cache,
-                source_model=base_solver_context.problem.source_model,
-            )
-            total_work = total_work + direct_candidate.work
-            result_entries.append(
-                CandidateRecord(
-                    candidate_id=candidate_id,
-                    candidate=direct_candidate,
-                    trace=CandidateTrace(
-                        search_round=int(next_step),
-                        search_phase=f"{stage}_direct_partition_pool",
+                    if parent_candidate_id is None
+                    else records_by_id.get(int(parent_candidate_id))
+                )
+                if parent_candidate_id is not None and parent_record is None:
+                    raise ValueError(
+                        "Checkpoint direct proposal refers to a missing raw parent."
+                    )
+                parent_candidate = (
+                    None if parent_record is None else parent_record.candidate
+                )
+                parent_raw = (
+                    parent_candidate
+                    if isinstance(parent_candidate, RawFusionCandidate)
+                    else None
+                )
+                source = _direct_partition_source(proposal, stage=stage)
+                candidate_id = int(len(result_entries))
+                direct_candidate = evaluate_direct_partition_candidate(
+                    data=data,
+                    proposal=proposal,
+                    selection_options=effective_fit_options,
+                    source=source,
+                    parent_raw_candidate_id=parent_candidate_id,
+                    parent_raw_lambda=(
+                        None
+                        if parent_raw is None
+                        else float(parent_raw.raw_fit.provenance.lambda_value)
                     ),
+                    parent_raw_phi_hash=(
+                        ""
+                        if parent_raw is None
+                        else _pilot_matrix_hash(parent_raw.raw_fit.phi)
+                    ),
+                    refit_cache=bic_refit_cache,
+                    source_model=base_solver_context.problem.source_model,
+                )
+                total_work = total_work + direct_candidate.work
+                result_entries.append(
+                    CandidateRecord(
+                        candidate_id=candidate_id,
+                        candidate=direct_candidate,
+                        trace=CandidateTrace(
+                            search_round=int(next_step),
+                            search_phase=f"{stage}_direct_partition_pool",
+                        ),
+                    )
+                )
+                next_step += 1
+                direct_next_index += 1
+                checkpoint_search_state()
+
+            if int(direct_next_index) < len(direct_proposal_state):
+                break
+            if direct_pool_stop_reason is not None:
+                break
+            if direct_proposal_state_complete:
+                direct_pool_complete = True
+                break
+
+            direct_candidate_cap = direct_resources.max_direct_partition_candidates
+            if (
+                direct_candidate_cap is not None
+                and int(direct_next_index) >= int(direct_candidate_cap)
+            ):
+                direct_pool_stop_reason = "direct_partition_candidate_budget_reached"
+                break
+            if (
+                direct_refit_cap is not None
+                and int(total_work.partition_refit_objective_evaluations)
+                >= int(direct_refit_cap)
+            ):
+                direct_pool_stop_reason = (
+                    "partition_refit_objective_evaluation_budget_reached"
+                )
+                break
+            if int(direct_final_parent_next_index) >= len(raw_parent_records):
+                direct_proposal_state_complete = True
+                checkpoint_search_state()
+                continue
+
+            remaining_direct_capacity = (
+                None
+                if direct_candidate_cap is None
+                else max(
+                    int(direct_candidate_cap) - int(direct_next_index),
+                    0,
                 )
             )
-            next_step += 1
-        ward_candidate_pool_complete = True
+            remaining_refit_capacity = (
+                None
+                if direct_refit_cap is None
+                else max(
+                    int(direct_refit_cap)
+                    - int(total_work.partition_refit_objective_evaluations),
+                    0,
+                )
+            )
+            parent_record = raw_parent_records[int(direct_final_parent_next_index)]
+            parent = parent_record.candidate
+            if not isinstance(parent, RawFusionCandidate):  # pragma: no cover
+                raise AssertionError("Final-Phi parent is not a raw candidate.")
+            final_generation = generate_partition_initializer_pool(
+                data=data,
+                pilot_phi=np.asarray(parent.raw_fit.phi, dtype=np.float64),
+                fit_options=effective_fit_options,
+                normalized_score=normalized_score,
+                runtime=runtime,
+                torch_data=torch_data,
+                rescore_candidates=_rescore_partition_candidates,
+                declared_k_grid=final_k_grid,
+                enable_refinement=False,
+                max_refit_objective_evaluations=remaining_refit_capacity,
+                max_candidates=remaining_direct_capacity,
+            )
+            total_work = total_work + final_generation.work
+            direct_proposal_state.extend(
+                (
+                    proposal,
+                    "final_phi",
+                    int(parent_record.candidate_id),
+                )
+                for proposal in final_generation.candidates
+            )
+            if final_generation.complete:
+                direct_final_parent_next_index += 1
+                direct_proposal_state_complete = bool(
+                    int(direct_final_parent_next_index) >= len(raw_parent_records)
+                )
+            elif final_generation.stop_reason == "candidate_budget_reached":
+                direct_pool_stop_reason = (
+                    "direct_partition_candidate_budget_reached"
+                )
+            elif (
+                final_generation.stop_reason
+                == "refit_objective_evaluation_budget_reached"
+            ):
+                direct_pool_stop_reason = (
+                    "partition_refit_objective_evaluation_budget_reached"
+                )
+            else:  # pragma: no cover - typed generation invariant
+                raise AssertionError("Unknown partition-generation stop reason.")
+            # Generation is an atomic checkpoint transaction. If interrupted
+            # before this write, resume deterministically regenerates the same
+            # parent pool; after it, only its unevaluated suffix remains.
+            checkpoint_search_state()
+
+        ward_candidate_pool_complete = bool(direct_pool_complete)
+        checkpoint_search_state()
+
+    # Persist a boundary stop even when the budget was already exhausted by
+    # raw-candidate refits before pool generation.
+    if direct_budget_exhausted_before_pool:
+        checkpoint_search_state()
 
     if not result_entries:
         raise RuntimeError(
             f"No guided ADMM candidates were evaluated for tumor {data.tumor_id}."
         )
-    stop_reason = str(
-        search_stop_override
-        or controller.stop_reason
-        or "online_lambda_no_terminal_reason"
-    )
+    # Preserve the raw controller's terminal provenance.  Direct-pool
+    # truncation has its own typed field and must not masquerade as an adaptive
+    # lambda-search stop.
+    stop_reason = str(raw_search_stop_reason)
     outcome = _assemble_selection_result(
         data=data,
         result_entries=result_entries,
@@ -1760,6 +2062,14 @@ def _partition_guided_admm_selection(
         require_global_secondary_refit=bool(
             fit_options.computation_profile.is_strict
         ),
+        candidate_pool_complete=bool(
+            not selection_contract.selectable_partition_pool
+            or ward_candidate_pool_complete
+        ),
+        raw_lambda_path_resolved=bool(
+            _adaptive_stop_certifies_global_optimum(raw_search_stop_reason)
+        ),
+        selection_pool_stop_reason=str(direct_pool_stop_reason or "none"),
     )
     return replace(
         outcome,

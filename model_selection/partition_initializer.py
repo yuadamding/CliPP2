@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ..core.fusion.partition_starts import (
-    PartitionCandidate,
+    PartitionCandidatePool,
     generate_likelihood_partition_starts,
     hessian_weighted_ward_label_sets_torch,
     observed_curvature_at_pilot_torch,
@@ -29,7 +31,9 @@ def generate_partition_initializer_pool(
     curvature=None,
     declared_k_grid: tuple[int, ...] | None = None,
     enable_refinement: bool | None = None,
-) -> tuple[PartitionCandidate, ...]:
+    max_refit_objective_evaluations: int | None = None,
+    max_candidates: int | None = None,
+) -> PartitionCandidatePool:
     """Generate the deterministic Ward/CEM pool used to choose one guide.
 
     The score is supplied explicitly so guide generation and retention use the
@@ -79,7 +83,12 @@ def generate_partition_initializer_pool(
             dtype=runtime.dtype,
         )
 
-    def generate(k_grid: list[int]) -> list[PartitionCandidate]:
+    def generate(
+        k_grid: list[int],
+        *,
+        refit_evaluation_capacity: int | None,
+        candidate_capacity: int | None,
+    ) -> PartitionCandidatePool:
         label_sets = hessian_weighted_ward_label_sets_torch(
             pilot_phi,
             curvature,
@@ -124,18 +133,32 @@ def generate_partition_initializer_pool(
             ),
             include_plain_ward=bool(config.include_plain_ward),
             include_ward_cem=bool(config.include_ward_cem),
+            max_refit_objective_evaluations=refit_evaluation_capacity,
+            max_candidates=candidate_capacity,
         )
-        return rescore_candidates(
+        return replace(
             candidates,
-            data=data,
-            normalized_score=normalized_score,
-            classification_alpha=float(config.classification_alpha),
-            classification_code_weight=float(config.classification_code_weight),
+            candidates=tuple(
+                rescore_candidates(
+                    list(candidates.candidates),
+                    data=data,
+                    normalized_score=normalized_score,
+                    classification_alpha=float(config.classification_alpha),
+                    classification_code_weight=float(
+                        config.classification_code_weight
+                    ),
+                )
+            ),
         )
 
-    candidates = generate(sparse_k_grid)
+    initial = generate(
+        sparse_k_grid,
+        refit_evaluation_capacity=max_refit_objective_evaluations,
+        candidate_capacity=max_candidates,
+    )
+    candidates = list(initial.candidates)
 
-    if refinement_enabled:
+    if refinement_enabled and initial.complete:
         refine_k_grid, _ = _likelihood_partition_refinement_k_grid(
             candidates,
             sparse_k_grid,
@@ -144,10 +167,41 @@ def generate_partition_initializer_pool(
     else:
         refine_k_grid = []
     if refine_k_grid:
-        refine_candidates = generate(refine_k_grid)
-        candidates = _deduplicate_partition_candidates(candidates + refine_candidates)
+        remaining_refit_capacity = (
+            None
+            if max_refit_objective_evaluations is None
+            else max(
+                int(max_refit_objective_evaluations)
+                - int(initial.work.partition_refit_objective_evaluations),
+                0,
+            )
+        )
+        remaining_candidate_capacity = (
+            None
+            if max_candidates is None
+            else max(int(max_candidates) - len(candidates), 0)
+        )
+        refined = generate(
+            refine_k_grid,
+            refit_evaluation_capacity=remaining_refit_capacity,
+            candidate_capacity=remaining_candidate_capacity,
+        )
+        candidates = _deduplicate_partition_candidates(
+            candidates + list(refined.candidates)
+        )
+        return PartitionCandidatePool(
+            candidates=tuple(candidates),
+            work=initial.work + refined.work,
+            complete=bool(refined.complete),
+            stop_reason=refined.stop_reason,
+        )
 
-    return tuple(candidates)
+    return PartitionCandidatePool(
+        candidates=tuple(candidates),
+        work=initial.work,
+        complete=bool(initial.complete),
+        stop_reason=initial.stop_reason,
+    )
 
 
 __all__ = ["generate_partition_initializer_pool"]

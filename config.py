@@ -77,6 +77,12 @@ class ResourceConfig:
     # Hardware-independent, cumulative raw-solver budget.  None deliberately
     # preserves an unlimited search until a profile-specific cap is calibrated.
     max_tumor_edge_pass_equivalents: int | None = None
+    # Cumulative fixed-partition scalar objective evaluations.  Enforcement is
+    # at candidate boundaries because a certified coordinate minimization is
+    # atomic and its realized interval count is not known in advance.
+    max_partition_refit_objective_evaluations: int | None = None
+    # Exact boundary on the number of direct Ward/CEM candidates evaluated.
+    max_direct_partition_candidates: int | None = None
     # Internal per-solve remainder used to enforce the tumor cap at safe outer
     # boundaries. It is never a separate public tuning surface.
     max_attempt_edge_pass_equivalents: int | None = None
@@ -85,6 +91,8 @@ class ResourceConfig:
         for name in (
             "max_tumor_edge_pass_equivalents",
             "max_attempt_edge_pass_equivalents",
+            "max_partition_refit_objective_evaluations",
+            "max_direct_partition_candidates",
         ):
             value = getattr(self, name)
             if value is not None and int(value) <= 0:
@@ -139,6 +147,17 @@ class LambdaSearchConfig:
     exploration_budget: int
     refinement_budget: int
     solver_retry_limit: int
+    no_progress_patience: int = 3
+
+    def __post_init__(self) -> None:
+        if int(self.exploration_budget) < 1:
+            raise ValueError("exploration_budget must be positive.")
+        if int(self.refinement_budget) < 0:
+            raise ValueError("refinement_budget must be nonnegative.")
+        if int(self.solver_retry_limit) < 0:
+            raise ValueError("solver_retry_limit must be nonnegative.")
+        if int(self.no_progress_patience) < 1:
+            raise ValueError("no_progress_patience must be positive.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,8 +249,11 @@ def resolve_fit_config(
     workset_add_batch: int = DEFAULT_WORKSET_ADD_BATCH,
     workset_max_expansions: int = DEFAULT_WORKSET_MAX_EXPANSIONS,
     max_tumor_edge_pass_equivalents: int | None = None,
+    max_partition_refit_objective_evaluations: int | None = None,
+    max_direct_partition_candidates: int | None = None,
     recovery_policy: str = "staged",
     stagnation_audit_patience: int = 4,
+    lambda_no_progress_patience: int = 3,
     verbose: bool = False,
 ) -> FitConfig:
     """Resolve a profile and selection contract once into concrete settings."""
@@ -275,6 +297,16 @@ def resolve_fit_config(
                 if max_tumor_edge_pass_equivalents is None
                 else int(max_tumor_edge_pass_equivalents)
             ),
+            max_partition_refit_objective_evaluations=(
+                None
+                if max_partition_refit_objective_evaluations is None
+                else int(max_partition_refit_objective_evaluations)
+            ),
+            max_direct_partition_candidates=(
+                None
+                if max_direct_partition_candidates is None
+                else int(max_direct_partition_candidates)
+            ),
         ),
     )
     selection = SelectionConfig(
@@ -293,6 +325,7 @@ def resolve_fit_config(
             exploration_budget=int(profile.lambda_budget),
             refinement_budget=int(profile.lambda_refinement_budget),
             solver_retry_limit=int(profile.solver_retry_limit),
+            no_progress_patience=int(lambda_no_progress_patience),
         ),
     )
     return FitConfig(

@@ -40,7 +40,7 @@ from .status_outputs import (
 )
 
 
-SUMMARY_SCHEMA_VERSION = 6
+SUMMARY_SCHEMA_VERSION = 7
 _PRIMARY_SUFFIXES = (
     "mutation_clusters.tsv",
     "cluster_centers.tsv",
@@ -252,6 +252,9 @@ def analysis_summary(
         "selection_boundary_unresolved": bool(
             getattr(result, "selection_boundary_unresolved", True)
         ),
+        "selection_pool_stop_reason": str(
+            getattr(result, "selection_pool_stop_reason", "none")
+        ),
         "selection_hits_lower_boundary": bool(
             getattr(result, "selection_hits_lower_boundary", False)
         ),
@@ -361,8 +364,17 @@ def analysis_summary(
         "stagnation_audit_patience": int(
             fit_config.solver.stagnation_audit_patience
         ),
+        "lambda_no_progress_patience": int(
+            fit_config.selection.lambda_search.no_progress_patience
+        ),
         "max_tumor_edge_pass_equivalents": (
             fit_config.solver.resources.max_tumor_edge_pass_equivalents
+        ),
+        "max_partition_refit_objective_evaluations": (
+            fit_config.solver.resources.max_partition_refit_objective_evaluations
+        ),
+        "max_direct_partition_candidates": (
+            fit_config.solver.resources.max_direct_partition_candidates
         ),
         "selected_full_kkt_tolerance": (
             None if raw_fit is None else float(raw_fit.certificate.tolerance)

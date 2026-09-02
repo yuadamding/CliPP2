@@ -90,25 +90,28 @@ def _certificate_work_counters(
     iterations: int = 0,
     full_graph_passes: int = 0,
     policy_audit_passes: int = 0,
+    edge_pass_equivalents: int | None = None,
 ) -> WorkCounters:
     """Return deterministic work charged by one certificate operation.
 
-    A projected-dual iteration is charged two normalized edge passes for its
-    adjoint/forward update.  A full-original-graph diagnostic is charged two
-    more for its edge residual and adjoint.  The accounting is intentionally
-    conservative and hardware independent; it never participates in a
-    certificate decision.
+    The explicit override is the exact count emitted by the dense/streamed
+    primitive instrumentation.  The fallback is retained for callers whose
+    operations have the historical two-pass iteration/audit structure.  Work
+    accounting never participates in a certificate decision.
     """
 
     iteration_count = max(int(iterations), 0)
     graph_pass_count = max(int(full_graph_passes), 0)
     policy_pass_count = max(int(policy_audit_passes), 0)
+    exact_edge_passes = (
+        2 * iteration_count + 2 * graph_pass_count
+        if edge_pass_equivalents is None
+        else max(int(edge_pass_equivalents), 0)
+    )
     return WorkCounters(
         certificate_iterations=iteration_count,
         certificate_full_graph_passes=graph_pass_count,
-        edge_pass_equivalents=(
-            2 * iteration_count + 2 * graph_pass_count
-        ),
+        edge_pass_equivalents=exact_edge_passes,
         full_certificate_audit_passes=policy_pass_count,
     )
 
@@ -420,7 +423,7 @@ def _optimize_internal_workset(
     upper: torch.Tensor,
     lambda_value: float,
     options: CertificateOptions,
-) -> tuple[torch.Tensor, torch.Tensor, float, int]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, int, int]:
     if edge_ids.numel() == 0:
         residual, _, _ = _workset_residual(
             base_grad=base_grad,
@@ -431,7 +434,7 @@ def _optimize_internal_workset(
             lower=lower,
             upper=upper,
         )
-        return dual_start, residual, 0.0, 0
+        return dual_start, residual, torch.zeros_like(phi), 0.0, 0, 0
     edge_u = graph.edge_u.index_select(0, edge_ids)
     edge_v = graph.edge_v.index_select(0, edge_ids)
     radius = float(lambda_value) * graph.weight.index_select(0, edge_ids)
@@ -452,6 +455,7 @@ def _optimize_internal_workset(
     residual = torch.zeros_like(phi)
     adj = torch.zeros_like(phi)
     iterations = 0
+    edge_pass_equivalents = 0
     for iteration in range(int(options.max_iter)):
         iterations = iteration + 1
         residual, adj, _ = _workset_residual(
@@ -463,9 +467,11 @@ def _optimize_internal_workset(
             lower=lower,
             upper=upper,
         )
+        edge_pass_equivalents += 1
         edge_gradient = residual.index_select(0, edge_u) - residual.index_select(
             0, edge_v
         )
+        edge_pass_equivalents += 1
         projected = project_dual_ball(dual - step * edge_gradient, radius)
         mapping = (dual - projected) / step
         dual = projected
@@ -476,7 +482,7 @@ def _optimize_internal_workset(
             )
             if mapping_residual <= float(options.mapping_tolerance):
                 break
-    residual, _, _ = _workset_residual(
+    residual, adj, _ = _workset_residual(
         base_grad=base_grad,
         dual=dual,
         edge_u=edge_u,
@@ -485,7 +491,15 @@ def _optimize_internal_workset(
         lower=lower,
         upper=upper,
     )
-    return dual, residual, mapping_residual, iterations
+    edge_pass_equivalents += 1
+    return (
+        dual,
+        residual,
+        adj,
+        mapping_residual,
+        iterations,
+        edge_pass_equivalents,
+    )
 
 
 def _scan_omitted_internal_edges(
@@ -625,6 +639,13 @@ def _refine_compressed_certificate(
         lambda_value=lambda_value,
     )
     base_grad = grad_smooth + between_adj
+    edge_pass_equivalents = int(
+        int(graph.edge_u.numel()) > 0 and float(lambda_value) > 0.0
+    )
+    if not bool(graph.is_complete) and int(graph.edge_u.numel()) > 0:
+        # _initial_internal_tree_ids scans a non-complete graph to identify a
+        # deterministic star support.  Complete graphs use direct edge IDs.
+        edge_pass_equivalents += 1
     full_certificate_audit_passes = 0
     certificate_iterations = 0
     certificate_full_graph_passes = 0
@@ -653,6 +674,7 @@ def _refine_compressed_certificate(
         )
         full_certificate_audit_passes += 1
         certificate_full_graph_passes += 1
+        edge_pass_equivalents += int(int(graph.edge_u.numel()) > 0)
     if has_inherited_fast_path and before.kkt_residual <= 5.0 * float(atol):
         # The inherited compressed state has already passed a full
         # original-graph audit.  Re-optimizing its workset cannot strengthen
@@ -674,6 +696,7 @@ def _refine_compressed_certificate(
                 iterations=certificate_iterations,
                 full_graph_passes=certificate_full_graph_passes,
                 policy_audit_passes=full_certificate_audit_passes,
+                edge_pass_equivalents=edge_pass_equivalents,
             ),
         )
     status = "not_certified"
@@ -681,7 +704,7 @@ def _refine_compressed_certificate(
     unconverged_worksets = 0
     final_diag = before
     for _expansion in range(int(options.max_expansions)):
-        dual, residual, mapping_residual, iterations = (
+        dual, residual, work_adj, mapping_residual, iterations, workset_passes = (
             _optimize_internal_workset(
                 base_grad=base_grad,
                 dual_start=dual,
@@ -695,6 +718,7 @@ def _refine_compressed_certificate(
             )
         )
         certificate_iterations += int(iterations)
+        edge_pass_equivalents += int(workset_passes)
         current = CompressedEdgeCertificate(
             labels=labels,
             centers=centers,
@@ -717,12 +741,6 @@ def _refine_compressed_certificate(
             continue
         unconverged_worksets = 0
 
-        work_adj = torch.zeros_like(phi)
-        if support_ids.numel():
-            work_u = graph.edge_u.index_select(0, support_ids)
-            work_v = graph.edge_v.index_select(0, support_ids)
-            work_adj.index_add_(0, work_u, dual)
-            work_adj.index_add_(0, work_v, dual, alpha=-1.0)
         scale = (
             1.0
             + float(torch.linalg.norm(grad_smooth).item())
@@ -737,6 +755,7 @@ def _refine_compressed_certificate(
             add_batch=int(options.add_batch),
         )
         certificate_full_graph_passes += 1
+        edge_pass_equivalents += int(int(graph.edge_u.numel()) > 0)
         column_ready = column_residual <= float(options.column_tolerance)
         should_expand = not column_ready
         if column_ready:
@@ -753,6 +772,7 @@ def _refine_compressed_certificate(
             )
             full_certificate_audit_passes += 1
             certificate_full_graph_passes += 1
+            edge_pass_equivalents += int(int(graph.edge_u.numel()) > 0)
             if final_diag.kkt_residual <= 5.0 * float(atol):
                 status = "certified"
                 certificate = current
@@ -799,6 +819,7 @@ def _refine_compressed_certificate(
             iterations=certificate_iterations,
             full_graph_passes=certificate_full_graph_passes,
             policy_audit_passes=full_certificate_audit_passes,
+            edge_pass_equivalents=edge_pass_equivalents,
         ),
     )
 
@@ -1002,18 +1023,21 @@ def _audit_certificate(
     phi: torch.Tensor,
     grad_smooth: torch.Tensor,
     problem: CertificateProblem,
-) -> KKTDiagnostics:
+) -> tuple[KKTDiagnostics, int]:
     if isinstance(certificate, CompressedEdgeCertificate):
-        return _compressed_graph_fusion_kkt(
-            certificate=certificate,
-            phi=phi,
-            grad_smooth=grad_smooth,
-            graph=problem.graph,
-            graph_hash=problem.graph_hash,
-            lower=problem.lower,
-            upper=problem.upper,
-            lambda_value=problem.lambda_value,
-            atol=problem.atol,
+        return (
+            _compressed_graph_fusion_kkt(
+                certificate=certificate,
+                phi=phi,
+                grad_smooth=grad_smooth,
+                graph=problem.graph,
+                graph_hash=problem.graph_hash,
+                lower=problem.lower,
+                upper=problem.upper,
+                lambda_value=problem.lambda_value,
+                atol=problem.atol,
+            ),
+            int(int(problem.graph.edge_u.numel()) > 0),
         )
     values = graph_fusion_kkt_residual_from_grad_torch(
         phi=phi,
@@ -1029,7 +1053,10 @@ def _audit_certificate(
         lambda_value=problem.lambda_value,
         atol=problem.atol,
     )
-    return KKTDiagnostics.from_mapping(values)
+    return (
+        KKTDiagnostics.from_mapping(values),
+        int(values.get("_edge_pass_equivalents", 0)),
+    )
 
 
 def _refine_certificate(
@@ -1090,13 +1117,14 @@ def _refine_certificate(
         certificate=refined_certificate,
         diagnostics=KKTDiagnostics.from_mapping(dense["diag"]),
         status=str(dense["status"]),
-        # The dense backend performs one incoming audit and one analytic/final
-        # audit in addition to a full diagnostic after every refinement step.
-        # Charging the early retained-input fast path the same two-pass floor is
-        # deliberately conservative for deterministic budget enforcement.
         work_counters=_certificate_work_counters(
             iterations=refinement_iterations,
+            # Keep this category as a count of full diagnostic calls; exact
+            # physical/logical edge sweeps come from the backend counter.
             full_graph_passes=refinement_iterations + 2,
+            edge_pass_equivalents=int(
+                dense.get("_edge_pass_equivalents", 0)
+            ),
         ),
     )
 
@@ -1137,7 +1165,7 @@ def certify(
             max_iter=max_iter,
             options=options,
         )
-    diagnostics = _audit_certificate(
+    diagnostics, edge_pass_equivalents = _audit_certificate(
         certificate=witness,
         phi=phi,
         grad_smooth=gradient.value,
@@ -1147,5 +1175,8 @@ def certify(
         certificate=witness,
         diagnostics=diagnostics,
         status="audited",
-        work_counters=_certificate_work_counters(full_graph_passes=1),
+        work_counters=_certificate_work_counters(
+            full_graph_passes=1,
+            edge_pass_equivalents=edge_pass_equivalents,
+        ),
     )

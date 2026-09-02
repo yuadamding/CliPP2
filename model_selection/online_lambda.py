@@ -32,8 +32,8 @@ from math import exp, isfinite, log
 import numpy as np
 
 
-ONLINE_LAMBDA_STATE_SCHEMA = "clipp2.online-lambda-controller.v1"
-ONLINE_LAMBDA_STATE_SCHEMA_VERSION = 1
+ONLINE_LAMBDA_STATE_SCHEMA = "clipp2.online-lambda-controller.v2"
+ONLINE_LAMBDA_STATE_SCHEMA_VERSION = 2
 
 
 def _encode_float(value: float) -> str:
@@ -140,6 +140,9 @@ class OnlineLambdaConfig:
     # from the statistical exploration budget because no path exists yet.
     max_bootstrap_anchor_lambdas: int = 3
     partition_event_mode: bool = False
+    # Applies only to certified statistical refinement proposals.  Initial
+    # path exploration remains exhaustive within its independent budget.
+    no_progress_patience: int = 3
 
     def __post_init__(self) -> None:
         if int(self.num_mutations) < 1:
@@ -173,6 +176,8 @@ class OnlineLambdaConfig:
             raise ValueError("max_solver_retries_per_lambda must be nonnegative.")
         if int(self.max_bootstrap_anchor_lambdas) < 0:
             raise ValueError("max_bootstrap_anchor_lambdas must be nonnegative.")
+        if int(self.no_progress_patience) < 1:
+            raise ValueError("no_progress_patience must be positive.")
 
 
 @dataclass(frozen=True)
@@ -218,6 +223,7 @@ _CONFIG_STATE_KEYS = {
     "max_solver_retries_per_lambda",
     "max_bootstrap_anchor_lambdas",
     "partition_event_mode",
+    "no_progress_patience",
 }
 _OBSERVATION_STATE_KEYS = {
     "lambda_value",
@@ -257,6 +263,7 @@ _CONTROLLER_STATE_KEYS = {
     "solver_recovery_keys",
     "bootstrap_anchor_keys",
     "uncertified_exhausted_keys",
+    "no_progress_streak",
     "stop_reason",
 }
 
@@ -279,6 +286,7 @@ def _config_to_state(config: OnlineLambdaConfig) -> dict[str, object]:
         ),
         "max_bootstrap_anchor_lambdas": int(config.max_bootstrap_anchor_lambdas),
         "partition_event_mode": bool(config.partition_event_mode),
+        "no_progress_patience": int(config.no_progress_patience),
     }
 
 
@@ -327,6 +335,11 @@ def _config_from_state(value: object) -> OnlineLambdaConfig:
         ),
         partition_event_mode=_boolean(
             state["partition_event_mode"], field="config.partition_event_mode"
+        ),
+        no_progress_patience=_integer(
+            state["no_progress_patience"],
+            field="config.no_progress_patience",
+            minimum=1,
         ),
     )
 
@@ -510,6 +523,7 @@ class OnlineLambdaController:
         self._solver_recovery_keys: set[float] = set()
         self._bootstrap_anchor_keys: set[float] = set()
         self._uncertified_exhausted_keys: set[float] = set()
+        self._no_progress_streak = 0
         self._stop_reason: str | None = None
 
     @property
@@ -587,6 +601,7 @@ class OnlineLambdaController:
                 _encode_float(key)
                 for key in sorted(self._uncertified_exhausted_keys)
             ],
+            "no_progress_streak": int(self._no_progress_streak),
             "stop_reason": self._stop_reason,
         }
 
@@ -764,6 +779,11 @@ class OnlineLambdaController:
             state["uncertified_exhausted_keys"],
             field="controller_state.uncertified_exhausted_keys",
         )
+        controller._no_progress_streak = _integer(
+            state["no_progress_streak"],
+            field="controller_state.no_progress_streak",
+            minimum=0,
+        )
         controller._stop_reason = _optional_text(
             state["stop_reason"], field="controller_state.stop_reason"
         )
@@ -822,6 +842,14 @@ class OnlineLambdaController:
             self.config.max_bootstrap_anchor_lambdas
         ):
             raise ValueError("Controller state exceeds its bootstrap-anchor budget.")
+        if (
+            self._stop_reason == "online_lambda_no_meaningful_progress"
+            and int(self._no_progress_streak)
+            < int(self.config.no_progress_patience)
+        ):
+            raise ValueError(
+                "No-progress stop reason lacks the required certified streak."
+            )
 
         if not self._proposal_history:
             if (
@@ -830,6 +858,7 @@ class OnlineLambdaController:
                 or self._certified
                 or any(tracked_key_sets)
                 or self._retry_key is not None
+                or int(self._no_progress_streak) != 0
                 or self._stop_reason is not None
             ):
                 raise ValueError("Empty proposal history has nonempty controller state.")
@@ -924,6 +953,93 @@ class OnlineLambdaController:
         self._proposal_history.append(proposal)
         return proposal
 
+    def _progress_metrics(
+        self,
+    ) -> tuple[int, int, float, float, tuple[float, ...]]:
+        """Return deterministic search progress from certified observations.
+
+        The tuple records unique scored partitions, the controller's own event
+        signatures, best score/KKT values, and the descending vector of every
+        unresolved event width.  Using the full width vector recognizes a
+        bisection even when another equally wide event remains.
+        """
+
+        certified = sorted(
+            self._certified.values(), key=lambda item: float(item.lambda_value)
+        )
+        scored = [
+            item for item in certified if self._selection_score_is_available(item)
+        ]
+        unique_scored = len({str(item.partition_signature) for item in scored})
+        unique_events = len(
+            {self._event_signature(item) for item in certified}
+        )
+        best_score_upper = min(
+            (
+                float(item.partition_icl)
+                + max(float(item.score_numerical_uncertainty), 0.0)
+                for item in scored
+            ),
+            default=float("inf"),
+        )
+        best_kkt = min(
+            (float(item.kkt_residual) for item in certified),
+            default=float("inf"),
+        )
+        event_widths = tuple(
+            sorted(
+                (
+                    _log10_width(
+                        float(left.lambda_value), float(right.lambda_value)
+                    )
+                    for left, right in zip(
+                        certified[:-1], certified[1:], strict=True
+                    )
+                    if self._event_signature(left) != self._event_signature(right)
+                    and _log10_width(
+                        float(left.lambda_value), float(right.lambda_value)
+                    )
+                    > float(self.config.transition_log10_width_tolerance)
+                ),
+                reverse=True,
+            )
+        )
+        return (
+            unique_scored,
+            unique_events,
+            best_score_upper,
+            best_kkt,
+            event_widths,
+        )
+
+    def _progress_improved(
+        self,
+        before: tuple[int, int, float, float, tuple[float, ...]],
+        after: tuple[int, int, float, float, tuple[float, ...]],
+    ) -> bool:
+        if int(after[0]) > int(before[0]):
+            return True
+        if int(after[1]) > int(before[1]):
+            return True
+        before_score, after_score = float(before[2]), float(after[2])
+        if isfinite(after_score) and (
+            not isfinite(before_score)
+            or after_score
+            < before_score
+            - float(self.config.score_relative_tolerance)
+            * (1.0 + abs(before_score))
+        ):
+            return True
+        before_kkt, after_kkt = float(before[3]), float(after[3])
+        if isfinite(after_kkt) and (
+            not isfinite(before_kkt) or after_kkt < 0.95 * before_kkt
+        ):
+            return True
+        before_widths, after_widths = before[4], after[4]
+        if not before_widths:
+            return False
+        return bool(after_widths < before_widths)
+
     def observe(self, observation: OnlineLambdaObservation) -> None:
         """Consume the exact-fusion result for the outstanding proposal."""
 
@@ -937,6 +1053,8 @@ class OnlineLambdaController:
             )
         if not 1 <= int(observation.n_clusters) <= int(self.config.num_mutations):
             raise ValueError("Observed n_clusters must lie in [1, num_mutations].")
+        pending_phase = str(self._pending.phase)
+        progress_before = self._progress_metrics()
         key = _lambda_key(observation.lambda_value)
         self._attempt_count[key] = int(self._attempt_count.get(key, 0) + 1)
         self._last_observation = observation
@@ -957,6 +1075,15 @@ class OnlineLambdaController:
             ):
                 self._certified[key] = observation
             self._retry_key = None
+            progress_after = self._progress_metrics()
+            if self._progress_improved(progress_before, progress_after):
+                self._no_progress_streak = 0
+            elif _is_refinement_phase(pending_phase):
+                self._no_progress_streak += 1
+                if int(self._no_progress_streak) >= int(
+                    self.config.no_progress_patience
+                ):
+                    self._stop_reason = "online_lambda_no_meaningful_progress"
         else:
             self._retry_key = key
 

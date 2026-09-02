@@ -31,7 +31,7 @@ from .torch_backend import (
     resolve_runtime,
     to_torch_tumor_data,
 )
-from .types import TorchRuntime
+from .types import TorchRuntime, WorkCounters
 
 
 # Bound each temporary used to initialize the dense Ward cost matrix.  The
@@ -51,6 +51,31 @@ class PartitionCandidate:
     finite_candidate_found: bool = True
     requested_k: int | None = None
     component_death_count: int = 0
+
+
+@dataclass(frozen=True)
+class PartitionCandidatePool:
+    """One deterministic generation batch and its uncached scalar work."""
+
+    candidates: tuple[PartitionCandidate, ...]
+    work: WorkCounters = WorkCounters()
+    complete: bool = True
+    stop_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if bool(self.complete) != (self.stop_reason is None):
+            raise ValueError(
+                "A complete partition-candidate pool cannot have a stop reason."
+            )
+
+    def __iter__(self):
+        return iter(self.candidates)
+
+    def __len__(self) -> int:
+        return len(self.candidates)
+
+    def __getitem__(self, index):
+        return self.candidates[index]
 
 
 @dataclass(frozen=True)
@@ -1224,7 +1249,15 @@ def generate_likelihood_partition_starts(
     allow_component_death: bool = False,
     include_plain_ward: bool = True,
     include_ward_cem: bool = True,
-) -> list[PartitionCandidate]:
+    max_refit_objective_evaluations: int | None = None,
+    max_candidates: int | None = None,
+) -> PartitionCandidatePool:
+    if max_refit_objective_evaluations is not None and int(
+        max_refit_objective_evaluations
+    ) < 0:
+        raise ValueError("max_refit_objective_evaluations must be nonnegative.")
+    if max_candidates is not None and int(max_candidates) < 0:
+        raise ValueError("max_candidates must be nonnegative.")
     _validate_classification_weight_alpha(classification_weight_alpha)
     classification_code_weight = _validated_classification_code_weight(
         classification_code_weight
@@ -1267,8 +1300,12 @@ def generate_likelihood_partition_starts(
     # This cache never escapes one generation call, so labels fully identify a
     # refit under the shared data, tolerance, hint, runtime, and backend.
     refit_cache: dict[bytes, PartitionRefitResult] = {}
+    generation_work = WorkCounters()
+    generation_complete = True
+    generation_stop_reason: str | None = None
 
     def cached_refit(labels: np.ndarray) -> PartitionRefitResult:
+        nonlocal generation_work
         labels_key = _label_key(labels)
         cached = refit_cache.get(labels_key)
         if cached is not None:
@@ -1301,6 +1338,12 @@ def generate_likelihood_partition_starts(
                 _model=source_model,
             )
         refit_cache[labels_key] = result
+        generation_work = generation_work + WorkCounters(
+            partition_refit_coordinates=int(result.refit_coordinate_count),
+            partition_refit_objective_evaluations=int(
+                result.refit_objective_evaluations
+            ),
+        )
         return result
 
     for requested_k in sorted(label_sets):
@@ -1313,6 +1356,18 @@ def generate_likelihood_partition_starts(
                 (f"hessian_ward_cem_K{int(requested_k)}", labels0)
             )
         for source, labels in source_labels:
+            if max_candidates is not None and len(candidates) >= int(max_candidates):
+                generation_complete = False
+                generation_stop_reason = "candidate_budget_reached"
+                break
+            if (
+                max_refit_objective_evaluations is not None
+                and int(generation_work.partition_refit_objective_evaluations)
+                >= int(max_refit_objective_evaluations)
+            ):
+                generation_complete = False
+                generation_stop_reason = "refit_objective_evaluation_budget_reached"
+                break
             trace: PartitionRefinementResult | None = None
             if source.startswith("hessian_ward_cem"):
                 if (
@@ -1394,6 +1449,8 @@ def generate_likelihood_partition_starts(
                     ),
                 )
             )
+        if not generation_complete:
+            break
 
     by_k: dict[int, list[PartitionCandidate]] = {}
     for candidate in candidates:
@@ -1405,6 +1462,14 @@ def generate_likelihood_partition_starts(
             key=lambda item: (float(item.bic), float(item.fit_loss), str(item.source)),
         )
         kept.extend(values[: max(int(max_candidates_per_K), 1)])
-    return sorted(
-        kept, key=lambda item: (float(item.bic), int(item.K), str(item.source))
+    return PartitionCandidatePool(
+        candidates=tuple(
+            sorted(
+                kept,
+                key=lambda item: (float(item.bic), int(item.K), str(item.source)),
+            )
+        ),
+        work=generation_work,
+        complete=bool(generation_complete),
+        stop_reason=generation_stop_reason,
     )

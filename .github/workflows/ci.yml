@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  functional:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MKL_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      PYTHONHASHSEED: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: python -m pip install ".[test]"
+      - name: Static checks
+        run: |
+          ruff check .
+          python -m compileall -q .
+      - name: Prepare canonical smoke input
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import pandas as pd
+
+          source = pd.read_csv("examples/exampleTumor1.tsv", sep="\t")
+          mutation_ids = source["mutation_id"].drop_duplicates().iloc[:4]
+          smoke = source[source["mutation_id"].isin(mutation_ids)]
+          destination = Path(os.environ["RUNNER_TEMP"]) / "exampleTumor1_smoke.tsv"
+          smoke.to_csv(destination, sep="\t", index=False)
+          PY
+      - name: CPU CLI smoke
+        run: |
+          clipp2 fit \
+            --input-file "$RUNNER_TEMP/exampleTumor1_smoke.tsv" \
+            --outdir "$RUNNER_TEMP/clipp2-smoke" \
+            --profile fast \
+            --device cpu \
+            --dtype float64 \
+            --failure-policy error
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output = Path(os.environ["RUNNER_TEMP"]) / "clipp2-smoke"
+          prefix = output / "exampleTumor1_smoke"
+          status = json.loads(prefix.with_name(prefix.name + "_analysis_status.json").read_text())
+          assert status["analysis_tier"] == "joint_certified"
+          assert status["primary_estimator_available"] is True
+          assert status["computation_profile"] == "fast"
+          assert status["device"] == "cpu"
+          assert status["dtype"] == "float64"
+          for suffix in (
+              "cluster_centers.tsv",
+              "cluster_region_estimates.tsv",
+              "mutation_clusters.tsv",
+              "mutation_region_estimates.tsv",
+              "mutation_region_multiplicity.tsv",
+              "raw_attempts.tsv",
+              "region_status.tsv",
+          ):
+              path = prefix.with_name(f"{prefix.name}_{suffix}")
+              assert path.is_file() and path.stat().st_size > 0, path
+          PY

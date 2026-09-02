@@ -108,6 +108,9 @@ def _outcome_for_failure_policy(
         resumed_from_checkpoint=bool(
             getattr(outcome, "resumed_from_checkpoint", False)
         ),
+        selection_pool_stop_reason=str(
+            getattr(outcome, "selection_pool_stop_reason", "none")
+        ),
     )
 
 
@@ -143,7 +146,7 @@ def process_tumor_bundle(
     if checkpoint_file is not None and resume_checkpoint is not None:
         if Path(checkpoint_file).resolve() != Path(resume_checkpoint).resolve():
             raise ValueError(
-                "checkpoint_file and resume_checkpoint must name the same file."
+                "checkpoint_file and resume_checkpoint must name the same directory."
             )
     checkpoint_path: Path | None = None
     if resume_checkpoint is not None:

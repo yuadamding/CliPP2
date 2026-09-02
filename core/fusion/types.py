@@ -178,9 +178,10 @@ BackendWarmState: TypeAlias = DenseWarmState | PrimalOnlyWarmState
 class WorkCounters:
     """Deterministic optimizer-work accounting.
 
-    ``edge_pass_equivalents`` is the hardware-independent cap unit.  It is a
-    conservative count of normalized complete-edge sweeps, not a kernel-launch
-    or wall-clock estimate.  ``full_certificate_audit_passes`` predates the
+    ``edge_pass_equivalents`` is the hardware-independent cap unit.  It counts
+    each normalized complete-edge primitive traversal exactly (a streamed
+    traversal over all chunks is one), not kernel launches or wall-clock time.
+    ``full_certificate_audit_passes`` predates the
     general accounting surface and remains the narrower policy-routing counter
     used to distinguish an incomplete compressed representation from an
     audited one; new budget code must use ``certificate_full_graph_passes`` or

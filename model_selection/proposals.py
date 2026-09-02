@@ -28,6 +28,7 @@ from ..core.fusion.types import (
     PrimalOnlyWarmState,
     SolverContext,
     SolverState,
+    WorkCounters,
 )
 from ..config import FitConfig
 from ..core.fusion.types import RawFit
@@ -270,13 +271,13 @@ def escape_path_breakpoint_retry_state(
     target_lambda: float,
     context: SolverContext,
     tol: float,
-) -> tuple[SolverState | None, int]:
+) -> tuple[SolverState | None, int, WorkCounters]:
     same_lambda_failure = start_source in {
         "same_lambda_retry",
         "best_same_lambda_kkt_state",
     } and _canonical_lambda(start_lambda) == _canonical_lambda(target_lambda)
     if state is None or not same_lambda_failure:
-        return state, 0
+        return state, 0, WorkCounters()
     return escape_path_breakpoint_solver_state(state, context=context, tol=tol)
 
 
