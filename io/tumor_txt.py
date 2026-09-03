@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 import csv
 from dataclasses import dataclass
 import gzip
@@ -10,24 +10,23 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 
-from .data import TumorData, compute_phi_init_from_counts
+from ..config import DEFAULT_DOSAGE_PRIOR_PENALTY
+from .data import EmissionPaths, ExclusionCode, TumorData
 from .path_compiler import (
     CompiledPathSet,
     LocalCopyNumberState,
     PATH_CANDIDATE_GENERATOR_VERSION,
     PATH_LIKELIHOOD_MODEL_ID,
     PATH_LIKELIHOOD_MODEL_VERSION,
-    build_path_likelihood,
+    build_emission_paths,
+    build_major_low_emission_paths,
     compile_single_switch_paths,
     dominant_copy_number_state,
-    initialize_path_marginal_phi,
     path_prior_mode,
 )
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
-DEFAULT_DOSAGE_PRIOR_PENALTY = 3.0
 MORE_THAN_TWO_STATES = "MORE_THAN_TWO_LOCAL_CN_STATES"
 NO_POSITIVE_PATH = "NO_POSITIVE_MUTANT_COPY_PATH"
 # The complete model-defining schema is the header of exampleTumor1.tsv.
@@ -137,7 +136,9 @@ def _validate_metadata(metadata: dict[str, str], *, path: Path) -> dict[str, str
     return validated
 
 
-def _read_text_table(path: Path) -> tuple[dict[str, str], pd.DataFrame]:
+def _read_text_table(
+    path: Path,
+) -> tuple[dict[str, str], tuple[dict[str, str], ...]]:
     if not path.is_file():
         raise FileNotFoundError(f"Tumor input file does not exist: {path}")
 
@@ -206,8 +207,10 @@ def _read_text_table(path: Path) -> tuple[dict[str, str], pd.DataFrame]:
         raise TumorTxtError(f"{path} is missing required columns: {missing_columns}.")
     # Extra columns are accepted as provenance but never enter normalization,
     # likelihood construction, or the objective identity.
-    table = pd.DataFrame(rows, columns=header, dtype=object)
-    return metadata, table.loc[:, SCHEMA_COLUMNS]
+    return metadata, tuple(
+        {column: values[header.index(column)] for column in SCHEMA_COLUMNS}
+        for values in rows
+    )
 
 
 def _identifier(value: object, *, name: str) -> str:
@@ -344,11 +347,10 @@ def _observation_fields_agree(
 
 def _validate_long_table(
     metadata: dict[str, str],
-    table: pd.DataFrame,
+    table: Iterable[Mapping[str, object]],
 ) -> _ValidatedLongTable:
     normalized = [
-        _normalize_row(row, row_number=index + 1)
-        for index, row in enumerate(table.to_dict(orient="records"))
+        _normalize_row(row, row_number=index + 1) for index, row in enumerate(table)
     ]
     rows_by_unit_mutable: dict[tuple[str, str], list[dict[str, Any]]] = {}
     sample_purities: dict[str, list[float]] = {}
@@ -497,7 +499,6 @@ def _build_tumor_data(
     *,
     unsupported_policy: str,
     dosage_prior_penalty: float,
-    eps: float,
 ) -> TumorData:
     # The categorical occupancy-path likelihood is needed only when the input
     # actually contains subclonal copy number.  For entirely one-state input,
@@ -506,7 +507,7 @@ def _build_tumor_data(
     # faster convex/legacy solver route.  Mixed one/two-state tumors continue
     # to use the path model for every unit so that one coherent likelihood is
     # optimized across regions.
-    uses_path_likelihood = any(
+    requires_occupancy_paths = any(
         len(states) > 1 for states in validated.states_by_segment.values()
     )
     mutation_ids = list(validated.mutation_ids)
@@ -518,14 +519,13 @@ def _build_tumor_data(
     total_counts = np.zeros(shape, dtype=np.float64)
     count_available = np.zeros(shape, dtype=bool)
     likelihood_supported = np.ones(shape, dtype=bool)
-    likelihood_included = np.zeros(shape, dtype=bool)
+    policy_included = np.ones(shape, dtype=bool)
     purity = np.empty(shape, dtype=np.float64)
     normal_cn = np.empty(shape, dtype=np.float64)
     major_cn = np.empty(shape, dtype=np.float64)
     minor_cn = np.empty(shape, dtype=np.float64)
-    has_cna = np.empty(shape, dtype=bool)
     mean_total_cn = np.empty(shape, dtype=np.float64)
-    unsupported_reason = np.full(shape, None, dtype=object)
+    exclusion_code = np.full(shape, int(ExclusionCode.INCLUDED), dtype=np.uint8)
     compiled_units: list[list[CompiledPathSet]] = [
         [CompiledPathSet((), ()) for _ in sample_ids] for _ in mutation_ids
     ]
@@ -550,9 +550,6 @@ def _build_tumor_data(
         dominant = dominant_copy_number_state(states)
         major_cn[i, j] = float(max(dominant.allele_a_cn, dominant.allele_b_cn))
         minor_cn[i, j] = float(min(dominant.allele_a_cn, dominant.allele_b_cn))
-        has_cna[i, j] = any(
-            state.allele_a_cn != 1 or state.allele_b_cn != 1 for state in states
-        )
         reason: str | None = None
         if len(states) > 2:
             reason = MORE_THAN_TWO_STATES
@@ -564,7 +561,7 @@ def _build_tumor_data(
             reason = NO_POSITIVE_PATH
             detail = "no positive mutant-copy dosage path exists"
             compiled = CompiledPathSet((), ())
-        elif uses_path_likelihood:
+        elif requires_occupancy_paths:
             segment_key = (sample_id, row["segment_id"])
             compiled = compiled_by_segment.get(segment_key)
             if compiled is None:
@@ -588,14 +585,11 @@ def _build_tumor_data(
                     detail=detail,
                 )
             likelihood_supported[i, j] = False
-            unsupported_reason[i, j] = reason
+            exclusion_code[i, j] = int(ExclusionCode[reason])
             compiled = CompiledPathSet(
                 paths=((1.0, 1.0, 1.0),),
                 log_prior=(0.0,),
             )
-        likelihood_included[i, j] = bool(
-            count_available[i, j] and likelihood_supported[i, j]
-        )
         compiled_units[i][j] = compiled
 
     denominator = (1.0 - purity) * normal_cn + purity * mean_total_cn
@@ -604,25 +598,20 @@ def _build_tumor_data(
             "Every mutation/sample unit must have a positive normal-plus-tumor "
             "copy-number denominator."
         )
-    scaling = purity / denominator
-    if uses_path_likelihood:
-        path_likelihood = build_path_likelihood(
+    if requires_occupancy_paths:
+        emission_paths: EmissionPaths = build_emission_paths(
             compiled_units,
             model_id=PATH_LIKELIHOOD_MODEL_ID,
             model_version=PATH_LIKELIHOOD_MODEL_VERSION,
             candidate_generator_version=PATH_CANDIDATE_GENERATOR_VERSION,
             prior_mode=path_prior_mode(dosage_prior_penalty),
         )
-        phi_upper = np.ones(shape, dtype=np.float64)
     else:
-        path_likelihood = None
-        max_prob_scale = np.maximum(scaling * major_cn, scaling * minor_cn)
-        phi_upper = np.minimum(
-            1.0,
-            (1.0 - eps) / np.clip(max_prob_scale, eps, None),
-        )
-        phi_upper = np.clip(phi_upper, eps, 1.0)
-    data = TumorData(
+        emission_paths = build_major_low_emission_paths(major_cn, minor_cn)
+    exclusion_code[likelihood_supported & ~count_available] = int(
+        ExclusionCode.COUNT_UNAVAILABLE
+    )
+    return TumorData(
         tumor_id=validated.metadata["tumor_id"],
         mutation_ids=mutation_ids,
         region_ids=sample_ids,
@@ -632,33 +621,13 @@ def _build_tumor_data(
         major_cn=major_cn,
         minor_cn=minor_cn,
         normal_cn=normal_cn,
-        has_cna=has_cna,
-        scaling=scaling,
-        phi_upper=phi_upper,
-        phi_init=np.full(shape, 0.5, dtype=np.float64),
-        init_major_mask=np.zeros(shape, dtype=bool),
-        count_observed=count_available,
-        path_likelihood=path_likelihood,
-        path_unsupported_reason=unsupported_reason,
+        tumor_total_cn=mean_total_cn,
         count_available=count_available,
         likelihood_supported=likelihood_supported,
-        likelihood_included=likelihood_included,
-        likelihood_exclusion_reason=unsupported_reason,
+        policy_included=policy_included,
+        emission_paths=emission_paths,
+        exclusion_code=exclusion_code,
     )
-
-    if uses_path_likelihood:
-        data.phi_init = initialize_path_marginal_phi(data, eps=eps)
-    else:
-        data.phi_init, data.init_major_mask = compute_phi_init_from_counts(
-            alt_counts=data.alt_counts,
-            total_counts=data.total_counts,
-            scaling=data.scaling,
-            major_cn=data.major_cn,
-            minor_cn=data.minor_cn,
-            phi_upper=data.phi_upper,
-            eps=eps,
-        )
-    return data
 
 
 def load_tumor_txt(
@@ -666,7 +635,6 @@ def load_tumor_txt(
     *,
     unsupported_policy: str = "error",
     dosage_prior_penalty: float = DEFAULT_DOSAGE_PRIOR_PENALTY,
-    eps: float = 1e-6,
 ) -> TumorData:
     """Load one ``clipp2.tumor.long.v1`` file directly into ``TumorData``."""
 
@@ -676,9 +644,6 @@ def load_tumor_txt(
     penalty = float(dosage_prior_penalty)
     if not np.isfinite(penalty) or penalty < 0.0:
         raise ValueError("dosage_prior_penalty must be finite and nonnegative.")
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
     input_path = Path(path).resolve()
     metadata, table = _read_text_table(input_path)
     validated = _validate_long_table(metadata, table)
@@ -686,7 +651,6 @@ def load_tumor_txt(
         validated,
         unsupported_policy=policy,
         dosage_prior_penalty=penalty,
-        eps=epsilon,
     )
 
 
@@ -715,7 +679,7 @@ def _canonical_text_value(value: object) -> str:
 
 def write_tumor_txt(
     path: str | Path,
-    table: pd.DataFrame,
+    table: object,
     metadata: Mapping[str, object] | None = None,
 ) -> Path:
     """Validate and write one canonical ``clipp2.tumor.long.v1`` file."""
@@ -738,10 +702,26 @@ def write_tumor_txt(
     destination = Path(path).resolve()
     validated_metadata = _validate_metadata(normalized_metadata, path=destination)
 
-    frame = pd.DataFrame(table).copy()
-    if not frame.columns.is_unique:
+    raw_columns = getattr(table, "columns", None)
+    row_iterator = getattr(table, "itertuples", None)
+    if raw_columns is not None and callable(row_iterator):
+        columns = list(raw_columns)
+        raw_rows = [
+            dict(zip(columns, values, strict=True))
+            for values in row_iterator(index=False, name=None)
+        ]
+    elif isinstance(table, Iterable) and not isinstance(table, (str, bytes, Mapping)):
+        raw_rows = [dict(row) for row in table]
+        columns = list(raw_rows[0]) if raw_rows else []
+        if any(list(row) != columns for row in raw_rows):
+            raise TumorTxtError("Long tumor table rows must share one column order.")
+    else:
+        raise TypeError(
+            "table must be a DataFrame-like object or iterable of mappings."
+        )
+    if len(columns) != len(set(columns)):
         raise TumorTxtError("Long tumor table columns must be unique.")
-    for column in frame.columns:
+    for column in columns:
         if (
             not isinstance(column, str)
             or not column
@@ -752,22 +732,26 @@ def write_tumor_txt(
                 "Long tumor table column names must be nonempty strings without "
                 "surrounding whitespace, tabs, or newlines."
             )
-    missing_columns = sorted(set(SCHEMA_COLUMNS).difference(frame.columns))
+    missing_columns = sorted(set(SCHEMA_COLUMNS).difference(columns))
     if missing_columns:
         raise TumorTxtError(
             f"Long tumor table is missing required columns: {missing_columns}."
         )
-    schema_columns = [column for column in SCHEMA_COLUMNS if column in frame.columns]
-    extra_columns = [column for column in frame.columns if column not in SCHEMA_COLUMNS]
+    schema_columns = [column for column in SCHEMA_COLUMNS if column in columns]
+    extra_columns = [column for column in columns if column not in SCHEMA_COLUMNS]
     ordered_columns = [*schema_columns, *extra_columns]
-    frame = frame.loc[:, ordered_columns].apply(
-        lambda column: column.map(_canonical_text_value)
-    )
-    if frame.empty:
+    rows = [
+        {column: _canonical_text_value(row[column]) for column in ordered_columns}
+        for row in raw_rows
+    ]
+    if not rows:
         raise TumorTxtError("Long tumor table may not be empty.")
-    if bool((frame == "").to_numpy().any()):
+    if any(value == "" for row in rows for value in row.values()):
         raise TumorTxtError("Missing values must be represented by '.'.")
-    _validate_long_table(validated_metadata, frame.loc[:, SCHEMA_COLUMNS])
+    _validate_long_table(
+        validated_metadata,
+        ({column: row[column] for column in SCHEMA_COLUMNS} for row in rows),
+    )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     metadata_order = sorted(normalized_metadata)
@@ -776,7 +760,7 @@ def write_tumor_txt(
             handle.write(f"##{key}={normalized_metadata[key]}\n")
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
         writer.writerow(ordered_columns)
-        writer.writerows(frame.itertuples(index=False, name=None))
+        writer.writerows([row[column] for column in ordered_columns] for row in rows)
     return destination
 
 

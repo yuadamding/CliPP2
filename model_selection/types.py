@@ -1,15 +1,68 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal, Union
 
 import numpy as np
 import torch
 
 from ..core.bic import SelectionScore
-from ..core.fusion.types import RawFit, SolverState, WorkCounters
+from ..core.fusion.partition_starts import PartitionCandidate
+from ..core.fusion.types import (
+    CertificateResult,
+    ConvergenceResult,
+    FitProvenance,
+    ObjectiveValue,
+    RawFit,
+    SolverState,
+    WorkCounters,
+)
+from ..core.scalar import PartitionFit
 
 StartArray = np.ndarray | torch.Tensor
+PARTITION_REFIT_KEY_SCHEMA = "unanchored_profiled_partition_refit_v5"
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionRefitKey:
+    """Complete identity of one cached fixed-partition refit."""
+
+    partition_signature: str
+    observed_model_hash: str
+    observed_likelihood_hash: str
+    reporting_model_hash: str
+    observed_box_hash: str
+    likelihood_eps_hex: str
+    refit_tolerance_hex: str
+    refit_max_iter: int
+    refit_mode: str
+    refit_grid_points: int
+    refit_local_steps: int
+
+
+DirectProposalStage = Literal["pilot", "final_phi"]
+
+
+@dataclass(frozen=True, slots=True)
+class DirectProposal:
+    """One deterministic direct-partition proposal and its raw parent."""
+
+    candidate: PartitionCandidate
+    stage: DirectProposalStage
+    parent_raw_candidate_id: int | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate, PartitionCandidate):
+            raise TypeError("Direct proposal candidate must be a PartitionCandidate.")
+        if self.stage not in {"pilot", "final_phi"}:
+            raise ValueError("Direct proposal stage must be pilot or final_phi.")
+        parent_id = self.parent_raw_candidate_id
+        if parent_id is not None and (
+            isinstance(parent_id, bool) or not isinstance(parent_id, int) or parent_id < 0
+        ):
+            raise ValueError("Direct proposal parent candidate ID must be nonnegative.")
+        if (self.stage == "pilot") != (parent_id is None):
+            raise ValueError("Only final-Phi proposals may identify a raw parent.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +95,6 @@ class FusionPartition:
         "solver_quotient",
         "verified_primal_equalities",
         "tolerance_defined_primal",
-        "legacy_connected_components",
     ]
     certification_failure_reason: str = "none"
     mutation_ids: tuple[str, ...] = ()
@@ -65,108 +117,12 @@ class FusionPartition:
 
 
 @dataclass(frozen=True)
-class PartitionRefitSummary:
-    labels: np.ndarray
-    partition_signature: str
-    phi: np.ndarray
-    cluster_centers: np.ndarray
-    loglik: float
-    finite_candidate_found: bool
-    global_optimum_certified: bool
-    refit_numerically_resolved: bool = False
-    global_lower_bound: float = float("-inf")
-    global_optimality_gap: float = float("inf")
-    global_certificate_method: str = "none"
-    refit_mode: str = "interval_certified"
-    coordinate_argmin_lower: np.ndarray | None = None
-    coordinate_argmin_upper: np.ndarray | None = None
-    coordinate_statistically_identified: np.ndarray | None = None
-    refit_coordinate_count: int = 0
-    refit_objective_evaluations: int = 0
-
-    def __post_init__(self) -> None:
-        if int(self.refit_coordinate_count) < 0 or int(
-            self.refit_objective_evaluations
-        ) < 0:
-            raise ValueError("Partition-refit work counters must be nonnegative.")
-        object.__setattr__(
-            self, "refit_coordinate_count", int(self.refit_coordinate_count)
-        )
-        object.__setattr__(
-            self,
-            "refit_objective_evaluations",
-            int(self.refit_objective_evaluations),
-        )
-        if self.global_optimum_certified and (
-            not np.isfinite(float(self.global_lower_bound))
-            or not np.isfinite(float(self.global_optimality_gap))
-            or float(self.global_optimality_gap) < 0.0
-            or str(self.global_certificate_method) == "none"
-        ):
-            raise ValueError("A global refit claim requires a finite certificate.")
-        object.__setattr__(
-            self,
-            "labels",
-            _immutable_array(self.labels, dtype=np.dtype(np.int64)),
-        )
-        object.__setattr__(
-            self,
-            "phi",
-            _immutable_array(self.phi, dtype=np.dtype(np.float64)),
-        )
-        object.__setattr__(
-            self,
-            "cluster_centers",
-            _immutable_array(self.cluster_centers, dtype=np.dtype(np.float64)),
-        )
-        center_shape = tuple(np.asarray(self.cluster_centers).shape)
-        lower = (
-            np.asarray(self.cluster_centers, dtype=np.float64)
-            if self.coordinate_argmin_lower is None
-            else np.asarray(self.coordinate_argmin_lower, dtype=np.float64)
-        )
-        upper = (
-            np.asarray(self.cluster_centers, dtype=np.float64)
-            if self.coordinate_argmin_upper is None
-            else np.asarray(self.coordinate_argmin_upper, dtype=np.float64)
-        )
-        identified = (
-            np.ones(center_shape, dtype=bool)
-            if self.coordinate_statistically_identified is None
-            else np.asarray(self.coordinate_statistically_identified, dtype=bool)
-        )
-        if tuple(lower.shape) != center_shape or tuple(upper.shape) != center_shape:
-            raise ValueError("Refit argmin intervals must match cluster_centers.")
-        if tuple(identified.shape) != center_shape:
-            raise ValueError("Refit identification flags must match cluster_centers.")
-        if np.any(~np.isfinite(lower)) or np.any(~np.isfinite(upper)) or np.any(
-            lower > upper
-        ):
-            raise ValueError("Refit argmin intervals must be finite and ordered.")
-        object.__setattr__(
-            self,
-            "coordinate_argmin_lower",
-            _immutable_array(lower, dtype=np.dtype(np.float64)),
-        )
-        object.__setattr__(
-            self,
-            "coordinate_argmin_upper",
-            _immutable_array(upper, dtype=np.dtype(np.float64)),
-        )
-        object.__setattr__(
-            self,
-            "coordinate_statistically_identified",
-            _immutable_array(identified, dtype=np.dtype(bool)),
-        )
-
-
-@dataclass(frozen=True)
 class RawFusionCandidate:
     """Raw-fusion partition with an authoritative fixed-label refit and score."""
 
     raw_fit: RawFit
     partition: FusionPartition
-    refit: PartitionRefitSummary
+    refit: PartitionFit
     score: SelectionScore
     eligible_for_selection: bool
     ineligibility_reason: str
@@ -223,10 +179,8 @@ class DirectPartition:
     source: Literal[
         "pilot_hessian_ward",
         "pilot_hessian_ward_cem",
-        "pilot_hessian_ward_cem_component_death",
         "final_phi_hessian_ward",
         "final_phi_hessian_ward_cem",
-        "final_phi_hessian_ward_cem_component_death",
     ]
     mutation_ids: tuple[str, ...]
     parent_raw_candidate_id: int | None = None
@@ -261,7 +215,7 @@ class DirectPartition:
 @dataclass(frozen=True)
 class DirectPartitionCandidate:
     partition: DirectPartition
-    refit: PartitionRefitSummary
+    refit: PartitionFit
     score: SelectionScore
     eligible_for_selection: bool
     ineligibility_reason: str
@@ -342,67 +296,50 @@ class CandidateRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class RawAttemptSummary:
-    """Tensor-free provenance for one authorized raw optimizer start.
+class AttemptLimits:
+    """Configured iteration limits for one authorized raw solve."""
 
-    Retry ownership ends with the adaptive search.  Durable candidate traces
-    retain the scalar evidence needed for diagnostics and serialization, but
-    never another ``RawFit``, fitted Phi, solver state, or certificate witness.
-    """
+    outer_max_iter: int
+    inner_max_iter: int
+    certificate_max_iter: int
+
+
+@dataclass(frozen=True, slots=True)
+class FitAuditSummary:
+    """A raw fit without fitted arrays, continuation state, or dual witness."""
+
+    objective: ObjectiveValue
+    certificate: CertificateResult
+    convergence: ConvergenceResult
+    work: WorkCounters
+    provenance: FitProvenance
+
+    def __post_init__(self) -> None:
+        if self.certificate.witness is not None:
+            raise ValueError("FitAuditSummary cannot retain a certificate witness.")
+
+    @classmethod
+    def from_fit(cls, fit: RawFit) -> "FitAuditSummary":
+        return cls(
+            objective=fit.objective,
+            certificate=replace(fit.certificate, witness=None),
+            convergence=fit.convergence,
+            work=fit.work,
+            provenance=fit.provenance,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RawAttemptSummary:
+    """One start plus the tensor-free audit of its raw optimizer result."""
 
     source: str
     start_value: float
     breakpoint_escape_changed_count: int
     mathematically_certified: bool
-    outer_max_iter: int
-    inner_max_iter: int
-    certificate_max_iter: int
-    objective: float
-    lambda_value: float
-    stationarity: float
-    edge_subgradient: float
-    dual_ball: float
-    box: float
-    kkt_residual: float
-    kkt_tolerance: float
-    certificate_status: str
-    certificate_admissible: bool
-    working_dtype: str
-    audit_dtype: str
-    precision_polished: bool
-    precision_polish_delta: float
-    mm_consistency_violations: int
-    stage_outer_iterations: int
-    stage_outer_max_iter: int
-    stage_inner_iterations: int
-    stage_inner_max_iter: int
-    stage_inner_solve_calls: int
-    stop_reason: str
-    progress_residual_method: str
-    solve_tolerance: float
-    legacy_stop_kkt_residual: float
-    componentwise_stop_kkt_residual: float
-    accepted_full_steps: int
-    accepted_damped_steps: int
-    rejected_outer_steps: int
-    work_inner_iterations: int
-    work_certificate_iterations: int
-    device: str
-    dtype: str
-    objective_spec_hash: str
-    original_graph_hash: str
-    certificate_problem_hash: str
-    fallback_reason: str
+    limits: AttemptLimits
+    fit: FitAuditSummary
     promotion_status: str = "not_recorded"
-    work_inner_stationarity_checks: int = 0
-    work_inner_full_kkt_audits: int = 0
-    work_outer_kkt_audits: int = 0
-    work_certificate_full_graph_passes: int = 0
-    work_partition_refit_coordinates: int = 0
-    work_partition_refit_objective_evaluations: int = 0
-    work_edge_pass_equivalents: int = 0
-    work_edge_region_visits: int = 0
-    work_full_certificate_audit_passes: int = 0
 
     @classmethod
     def from_fit(
@@ -418,124 +355,17 @@ class RawAttemptSummary:
         certificate_max_iter: int,
         promotion_status: str = "not_recorded",
     ) -> "RawAttemptSummary":
-        certificate = fit.certificate
-        components = certificate.components
-        convergence = fit.convergence
-        work = fit.work
-        provenance = fit.provenance
         return cls(
             source=str(source),
             start_value=float(start_value),
             breakpoint_escape_changed_count=int(breakpoint_escape_changed_count),
             mathematically_certified=bool(mathematically_certified),
-            outer_max_iter=int(outer_max_iter),
-            inner_max_iter=int(inner_max_iter),
-            certificate_max_iter=int(certificate_max_iter),
-            objective=float(fit.objective.total),
-            lambda_value=float(provenance.lambda_value),
-            stationarity=float(components.stationarity),
-            edge_subgradient=float(components.edge_subgradient),
-            dual_ball=float(components.dual_ball),
-            box=float(components.box),
-            kkt_residual=float(components.residual),
-            kkt_tolerance=float(certificate.tolerance),
-            certificate_status=str(certificate.status),
-            certificate_admissible=bool(certificate.admissible),
-            working_dtype=str(certificate.working_dtype),
-            audit_dtype=str(certificate.audit_dtype),
-            precision_polished=bool(certificate.precision_polished),
-            precision_polish_delta=float(certificate.precision_polish_delta),
-            mm_consistency_violations=int(convergence.mm_consistency_violations),
-            stage_outer_iterations=int(
-                getattr(
-                    convergence,
-                    "stage_outer_iterations",
-                    getattr(convergence, "iterations", 0),
-                )
+            limits=AttemptLimits(
+                outer_max_iter=int(outer_max_iter),
+                inner_max_iter=int(inner_max_iter),
+                certificate_max_iter=int(certificate_max_iter),
             ),
-            stage_outer_max_iter=int(
-                getattr(convergence, "stage_outer_max_iter", outer_max_iter)
-            ),
-            stage_inner_iterations=int(
-                getattr(
-                    convergence,
-                    "stage_inner_iterations",
-                    getattr(work, "inner_iterations", 0),
-                )
-            ),
-            stage_inner_max_iter=int(
-                getattr(convergence, "stage_inner_max_iter", inner_max_iter)
-            ),
-            stage_inner_solve_calls=int(
-                getattr(convergence, "stage_inner_solve_calls", 0)
-            ),
-            stop_reason=str(getattr(convergence, "stop_reason", "not_recorded")),
-            progress_residual_method=str(
-                getattr(convergence, "progress_residual_method", "not_recorded")
-            ),
-            solve_tolerance=float(
-                getattr(convergence, "solve_tolerance", float("nan"))
-            ),
-            legacy_stop_kkt_residual=float(
-                getattr(convergence, "legacy_stop_kkt_residual", float("inf"))
-            ),
-            componentwise_stop_kkt_residual=float(
-                getattr(
-                    convergence,
-                    "componentwise_stop_kkt_residual",
-                    float("inf"),
-                )
-            ),
-            accepted_full_steps=int(
-                getattr(convergence, "accepted_full_steps", 0)
-            ),
-            accepted_damped_steps=int(
-                getattr(convergence, "accepted_damped_steps", 0)
-            ),
-            rejected_outer_steps=int(
-                getattr(convergence, "rejected_outer_steps", 0)
-            ),
-            work_inner_iterations=int(getattr(work, "inner_iterations", 0)),
-            work_inner_stationarity_checks=int(
-                getattr(work, "inner_stationarity_checks", 0)
-            ),
-            work_inner_full_kkt_audits=int(
-                getattr(work, "inner_full_kkt_audits", 0)
-            ),
-            work_outer_kkt_audits=int(getattr(work, "outer_kkt_audits", 0)),
-            work_certificate_iterations=int(
-                getattr(work, "certificate_iterations", 0)
-            ),
-            work_certificate_full_graph_passes=int(
-                getattr(work, "certificate_full_graph_passes", 0)
-            ),
-            work_partition_refit_coordinates=int(
-                getattr(work, "partition_refit_coordinates", 0)
-            ),
-            work_partition_refit_objective_evaluations=int(
-                getattr(work, "partition_refit_objective_evaluations", 0)
-            ),
-            work_edge_pass_equivalents=int(
-                getattr(work, "edge_pass_equivalents", 0)
-            ),
-            work_edge_region_visits=int(
-                getattr(work, "edge_region_visits", 0)
-            ),
-            work_full_certificate_audit_passes=int(
-                getattr(work, "full_certificate_audit_passes", 0)
-            ),
-            device=str(getattr(provenance, "device", "not_recorded")),
-            dtype=str(getattr(provenance, "dtype", "not_recorded")),
-            objective_spec_hash=str(
-                getattr(provenance, "objective_spec_hash", "")
-            ),
-            original_graph_hash=str(
-                getattr(provenance, "original_graph_hash", "")
-            ),
-            certificate_problem_hash=str(
-                getattr(provenance, "certificate_problem_hash", "")
-            ),
-            fallback_reason=str(certificate.fallback_reason),
+            fit=FitAuditSummary.from_fit(fit),
             promotion_status=str(promotion_status),
         )
 
@@ -550,26 +380,6 @@ class CandidateTrace:
     start_value: float | None = None
     breakpoint_escape_changed_count: int = 0
     raw_attempts: tuple[RawAttemptSummary, ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class SearchCandidate:
-    """One immutable candidate plus selection-decision annotations."""
-
-    record: CandidateRecord
-    selected: bool
-
-    @property
-    def candidate_id(self) -> int:
-        return int(self.record.candidate_id)
-
-    @property
-    def candidate(self) -> SearchArtifact:
-        return self.record.candidate
-
-    @property
-    def trace(self) -> CandidateTrace:
-        return self.record.trace
 
 
 @dataclass(frozen=True, slots=True)
@@ -651,19 +461,18 @@ class SelectedModel:
 
 
 @dataclass(frozen=True, slots=True)
-class BICSelectionResult:
-    selected_model: SelectedModel
-    search: tuple[SearchCandidate, ...]
+class SearchReport:
+    """Common immutable search evidence shared by every outcome tier."""
+
+    records: tuple[CandidateRecord, ...]
+    selected_id: int | None
     selection_method: str
-    selection_hits_lower_boundary: bool
-    selection_hits_upper_boundary: bool
-    selection_boundary_unresolved: bool
-    selection_optimum_resolved: bool
     adaptive_search_stop_reason: str
-    num_candidates: int
     num_candidates_certified: int
-    selected_kkt_residual: float | None
-    selected_lambda_representative: float | None
+    selection_hits_lower_boundary: bool = False
+    selection_hits_upper_boundary: bool = False
+    selection_boundary_unresolved: bool = True
+    selection_optimum_resolved: bool = False
     ward_candidate_pool_complete: bool = False
     raw_lambda_path_resolved: bool = False
     global_hybrid_optimum_certified: bool = False
@@ -673,31 +482,58 @@ class BICSelectionResult:
     resumed_from_checkpoint: bool = False
     selection_pool_stop_reason: str = "none"
 
+    def __post_init__(self) -> None:
+        ids = tuple(int(record.candidate_id) for record in self.records)
+        if len(ids) != len(set(ids)):
+            raise ValueError("Selection outcome candidate IDs must be unique.")
+        if self.selected_id is not None and int(self.selected_id) not in ids:
+            raise ValueError("Selected candidate ID is absent from search records.")
+
+    @property
+    def num_candidates(self) -> int:
+        return len(self.records)
+
+    @property
+    def selected_record(self) -> CandidateRecord | None:
+        if self.selected_id is None:
+            return None
+        return next(
+            record
+            for record in self.records
+            if int(record.candidate_id) == int(self.selected_id)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BICSelectionResult:
+    selected_model: SelectedModel
+    report: SearchReport
+
+    def __post_init__(self) -> None:
+        selected = self.report.selected_record
+        if selected is None or selected.candidate is not self.selected_model.partition_candidate:
+            raise ValueError("Search report does not own the selected model.")
+
     @property
     def primary_estimator_available(self) -> bool:
         return True
 
+    @property
+    def selected_lambda_representative(self) -> float | None:
+        return self.selected_model.selected_lambda
 
-def _validate_outcome_search(
-    search: tuple[SearchCandidate, ...],
-    *,
-    require_selected: bool,
-) -> SearchCandidate | None:
-    candidate_ids = [int(item.candidate_id) for item in search]
-    if len(candidate_ids) != len(set(candidate_ids)):
-        raise ValueError("Selection outcome candidate IDs must be unique.")
-    selected = [item for item in search if bool(item.selected)]
-    expected = 1 if require_selected else 0
-    if len(selected) != expected:
-        raise ValueError(
-            f"Selection outcome must contain exactly {expected} selected candidate(s)."
-        )
-    return selected[0] if selected else None
+    @property
+    def selected_kkt_residual(self) -> float | None:
+        candidate = self.selected_model.partition_candidate
+        if not isinstance(candidate, RawFusionCandidate):
+            return None
+        residual = float(candidate.raw_fit.certificate.components.residual)
+        return residual if np.isfinite(residual) else None
 
 
 def _validate_best_raw_attempt(
     best_raw_attempt: RawFit | None,
-    search: tuple[SearchCandidate, ...],
+    records: tuple[CandidateRecord, ...],
 ) -> None:
     if best_raw_attempt is None:
         return
@@ -707,7 +543,7 @@ def _validate_best_raw_attempt(
             (RawFusionCandidate, UnscoredRawFusionCandidate),
         )
         and item.candidate.raw_fit is best_raw_attempt
-        for item in search
+        for item in records
     ):
         raise ValueError("best_raw_attempt must come from the retained raw candidates.")
 
@@ -725,22 +561,7 @@ class SecondaryFallbackResult:
     selected_partition: DirectPartitionCandidate
     best_raw_attempt: RawFit | None
     reason: str
-    search: tuple[SearchCandidate, ...]
-    selection_method: str
-    adaptive_search_stop_reason: str
-    num_candidates: int
-    num_candidates_certified: int
-    selection_hits_lower_boundary: bool = False
-    selection_hits_upper_boundary: bool = False
-    selection_boundary_unresolved: bool = True
-    ward_candidate_pool_complete: bool = False
-    raw_lambda_path_resolved: bool = False
-    global_hybrid_optimum_certified: bool = False
-    search_work: WorkCounters = WorkCounters()
-    mandatory_guide_work: WorkCounters = WorkCounters()
-    cumulative_search_active_seconds: float = 0.0
-    resumed_from_checkpoint: bool = False
-    selection_pool_stop_reason: str = "none"
+    report: SearchReport
     primary_estimator_available: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
@@ -755,15 +576,13 @@ class SecondaryFallbackResult:
             raise ValueError("A secondary fallback requires a finite refit and score.")
         if not str(self.reason).strip():
             raise ValueError("A secondary fallback requires an explicit reason.")
-        selected = _validate_outcome_search(self.search, require_selected=True)
+        selected = self.report.selected_record
         if selected is None or selected.candidate is not candidate:
             raise ValueError(
                 "The selected search record must own the fallback partition."
             )
-        _validate_best_raw_attempt(self.best_raw_attempt, self.search)
-        if int(self.num_candidates) != len(self.search):
-            raise ValueError("num_candidates must match the retained search.")
-        if int(self.num_candidates_certified) < 0:
+        _validate_best_raw_attempt(self.best_raw_attempt, self.report.records)
+        if int(self.report.num_candidates_certified) < 0:
             raise ValueError("num_candidates_certified must be nonnegative.")
 
     @property
@@ -772,7 +591,7 @@ class SecondaryFallbackResult:
 
     @property
     def selected_candidate_id(self) -> int:
-        selected = _validate_outcome_search(self.search, require_selected=True)
+        selected = self.report.selected_record
         if selected is None:  # pragma: no cover - guarded in __post_init__
             raise AssertionError("Secondary fallback lost its selected record.")
         return int(selected.candidate_id)
@@ -792,29 +611,16 @@ class DiagnosticOnlyResult:
 
     best_raw_attempt: RawFit | None
     reason: str
-    search: tuple[SearchCandidate, ...]
-    selection_method: str
-    adaptive_search_stop_reason: str
-    num_candidates: int
-    num_candidates_certified: int = 0
-    ward_candidate_pool_complete: bool = False
-    raw_lambda_path_resolved: bool = False
-    global_hybrid_optimum_certified: bool = False
-    search_work: WorkCounters = WorkCounters()
-    mandatory_guide_work: WorkCounters = WorkCounters()
-    cumulative_search_active_seconds: float = 0.0
-    resumed_from_checkpoint: bool = False
-    selection_pool_stop_reason: str = "none"
+    report: SearchReport
     primary_estimator_available: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         if not str(self.reason).strip():
             raise ValueError("A diagnostic-only outcome requires an explicit reason.")
-        _validate_outcome_search(self.search, require_selected=False)
-        _validate_best_raw_attempt(self.best_raw_attempt, self.search)
-        if int(self.num_candidates) != len(self.search):
-            raise ValueError("num_candidates must match the retained search.")
-        if int(self.num_candidates_certified) != 0:
+        if self.report.selected_id is not None:
+            raise ValueError("A diagnostic-only outcome cannot select a candidate.")
+        _validate_best_raw_attempt(self.best_raw_attempt, self.report.records)
+        if int(self.report.num_candidates_certified) != 0:
             raise ValueError("A diagnostic-only outcome cannot claim a selected model.")
 
     @property

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 import hashlib
-from typing import TYPE_CHECKING, Literal, Mapping, TypeAlias
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import numpy as np
 import torch
 
-from .defaults import (
+from ...config import (
     DEFAULT_CERTIFICATE_MAX_ITER,
     DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
     DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
@@ -112,26 +112,16 @@ class KKTDiagnostics:
     backward_error_kkt_residual: float = float("inf")
 
     @classmethod
-    def from_mapping(cls, values: Mapping[str, float | int]) -> "KKTDiagnostics":
-        fail_closed_fields = {
-            "backward_error_stationarity_residual",
-            "backward_error_edge_subgradient_residual",
-            "backward_error_dual_ball_residual",
-            "backward_error_kkt_residual",
-        }
-        return cls(
-            **{
-                item.name: float(
-                    values.get(item.name, float("inf"))
-                    if item.name in fail_closed_fields
-                    else values[item.name]
-                )
-                for item in fields(cls)
-            }
-        )
+    def infinite(cls) -> "KKTDiagnostics":
+        """Return fail-closed diagnostics before any KKT audit."""
 
-    def as_dict(self) -> dict[str, float | int]:
-        return {item.name: getattr(self, item.name) for item in fields(self)}
+        return cls(
+            stationarity_residual=float("inf"),
+            edge_subgradient_residual=float("inf"),
+            dual_ball_residual=float("inf"),
+            box_residual=float("inf"),
+            kkt_residual=float("inf"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,11 +177,9 @@ class WorkCounters:
     dense or streamed traversal contributes one, while each partial workset
     traversal is rounded up to one so prospective budget checks remain safe.
     It counts logical work, not kernel launches or wall-clock time.
-    ``full_certificate_audit_passes`` predates the
-    general accounting surface and remains the narrower policy-routing counter
-    used to distinguish an incomplete compressed representation from an
-    audited one; new budget code must use ``certificate_full_graph_passes`` or
-    ``edge_pass_equivalents`` instead.
+    ``certificate_full_graph_passes`` counts full-graph certificate traversals;
+    certificate status, rather than a work counter, records whether a compressed
+    representation was complete enough for an authoritative KKT audit.
     """
 
     inner_iterations: int = 0
@@ -204,7 +192,6 @@ class WorkCounters:
     partition_refit_objective_evaluations: int = 0
     edge_pass_equivalents: int = 0
     edge_region_visits: int = 0
-    full_certificate_audit_passes: int = 0
 
     def __post_init__(self) -> None:
         for item in fields(self):
@@ -223,6 +210,139 @@ class WorkCounters:
                 for item in fields(self)
             }
         )
+
+
+@dataclass(slots=True)
+class WorkLedger:
+    """Single authority for accumulating deterministic optimizer work."""
+
+    total: WorkCounters = field(default_factory=WorkCounters)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.total, WorkCounters):
+            raise TypeError("WorkLedger total must be WorkCounters.")
+
+    def charge(self, work: WorkCounters) -> None:
+        """Accumulate one immutable work charge."""
+
+        if not isinstance(work, WorkCounters):
+            raise TypeError("WorkLedger charges must be WorkCounters.")
+        self.total = self.total + work
+
+    def charge_edge_passes(
+        self,
+        *,
+        edge_count: int,
+        num_regions: int,
+        passes: int = 1,
+    ) -> None:
+        """Charge complete or partial logical edge traversals exactly once."""
+
+        edge_count = int(edge_count)
+        num_regions = int(num_regions)
+        passes = int(passes)
+        if edge_count < 0 or num_regions < 0 or passes < 0:
+            raise ValueError("Edge-work dimensions and passes must be nonnegative.")
+        if edge_count == 0 or num_regions == 0:
+            passes = 0
+        self.charge(
+            WorkCounters(
+                edge_pass_equivalents=passes,
+                edge_region_visits=edge_count * num_regions * passes,
+            )
+        )
+
+    def charge_inner_work(
+        self,
+        *,
+        iterations: int = 0,
+        stationarity_checks: int = 0,
+        full_kkt_audits: int = 0,
+    ) -> None:
+        """Charge inner iterations and their diagnostic checks."""
+
+        self.charge(
+            WorkCounters(
+                inner_iterations=iterations,
+                inner_stationarity_checks=stationarity_checks,
+                inner_full_kkt_audits=full_kkt_audits,
+            )
+        )
+
+    def charge_outer_kkt_audits(self, count: int = 1) -> None:
+        """Charge full observed-objective outer KKT audits."""
+
+        self.charge(WorkCounters(outer_kkt_audits=count))
+
+    def charge_certificate_work(
+        self,
+        *,
+        iterations: int = 0,
+        full_graph_passes: int = 0,
+    ) -> None:
+        """Charge certificate optimization and full-graph audit work."""
+
+        self.charge(
+            WorkCounters(
+                certificate_iterations=iterations,
+                certificate_full_graph_passes=full_graph_passes,
+            )
+        )
+
+    def charge_partition_refit_work(
+        self,
+        *,
+        coordinates: int = 0,
+        objective_evaluations: int = 0,
+    ) -> None:
+        """Charge fixed-partition refit coordinate and objective work."""
+
+        self.charge(
+            WorkCounters(
+                partition_refit_coordinates=coordinates,
+                partition_refit_objective_evaluations=objective_evaluations,
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class KKTAudit:
+    """Typed KKT diagnostics with their work and edge-activity metadata."""
+
+    diagnostics: KKTDiagnostics
+    work: WorkCounters = WorkCounters()
+    fused_edges: int | None = None
+    nonzero_edges: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.diagnostics, KKTDiagnostics):
+            raise TypeError("KKTAudit diagnostics must be KKTDiagnostics.")
+        if not isinstance(self.work, WorkCounters):
+            raise TypeError("KKTAudit work must be WorkCounters.")
+        if (self.fused_edges is None) != (self.nonzero_edges is None):
+            raise ValueError(
+                "KKTAudit fused and nonzero edge counts must be present together."
+            )
+        if self.fused_edges is None:
+            return
+        fused_edges = int(self.fused_edges)
+        nonzero_edges = int(self.nonzero_edges)
+        if fused_edges < 0 or nonzero_edges < 0:
+            raise ValueError("KKTAudit edge counts must be nonnegative.")
+        object.__setattr__(self, "fused_edges", fused_edges)
+        object.__setattr__(self, "nonzero_edges", nonzero_edges)
+
+    def require_activity(self, *, edge_count: int) -> tuple[int, int]:
+        """Return measured activity, failing closed when it is unavailable."""
+
+        if self.fused_edges is None or self.nonzero_edges is None:
+            raise ValueError("KKTAudit does not contain measured edge activity.")
+        edge_count = int(edge_count)
+        if edge_count < 0:
+            raise ValueError("edge_count must be nonnegative.")
+        if int(self.fused_edges) + int(self.nonzero_edges) != edge_count:
+            raise ValueError("KKTAudit edge activity does not match the graph.")
+        return int(self.fused_edges), int(self.nonzero_edges)
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,7 +374,9 @@ class PairwiseFusionGraph:
         if edge_u.ndim != 1 or edge_v.ndim != 1 or edge_w.ndim != 1:
             raise ValueError("PairwiseFusionGraph edge arrays must be one-dimensional.")
         if edge_u.shape != edge_v.shape or edge_u.shape != edge_w.shape:
-            raise ValueError("PairwiseFusionGraph edge arrays must have identical shapes.")
+            raise ValueError(
+                "PairwiseFusionGraph edge arrays must have identical shapes."
+            )
         if np.any(edge_u < 0) or np.any(edge_v < 0):
             raise ValueError("PairwiseFusionGraph edge indices must be nonnegative.")
         if np.any(edge_u == edge_v):
@@ -277,23 +399,12 @@ class PairwiseFusionGraph:
             _graph_source_fingerprint(edge_u, edge_v, edge_w),
         )
 
+
 @dataclass(frozen=True)
 class TorchRuntime:
     device: torch.device
     device_name: str
     dtype: torch.dtype
-
-
-@dataclass(frozen=True, slots=True)
-class TensorProblem:
-    observed_model: TorchObservedModel
-    eps: float
-    major_prior: float
-    source_model: ObservedModel | None = None
-
-    @property
-    def count_observed(self) -> torch.Tensor:
-        return self.observed_model.observed
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +416,7 @@ class TensorFusionGraph:
     num_nodes: int
     is_complete: bool
     name: str
+    source_graph_fingerprint: str = ""
 
     @property
     def edge_u(self) -> torch.Tensor:
@@ -317,20 +429,17 @@ class TensorFusionGraph:
 
 @dataclass(frozen=True, slots=True)
 class SolverContext:
-    problem: TensorProblem
+    source_model: ObservedModel
+    observed_model: TorchObservedModel
+    eps: float
     graph: TensorFusionGraph
     graph_spec: PairwiseFusionGraph
     exact_pilot: torch.Tensor
     pooled_start: torch.Tensor
     scalar_well_starts: tuple[torch.Tensor, ...]
-    lower: torch.Tensor
-    upper: torch.Tensor
     runtime: TorchRuntime
     data_fingerprint: str
-    graph_hash: str = ""
-    objective_spec_hash: str = ""
-    base_fusion_objective_hash: str = ""
-    base_objective_key: BaseObjectiveKey | None = None
+    base_objective_key: BaseObjectiveKey
     resource_fallback: str | None = None
     audit_context_cache: dict[tuple[str, str, str], object] = field(
         default_factory=dict,
@@ -338,6 +447,43 @@ class SolverContext:
         repr=False,
     )
 
+    def __post_init__(self) -> None:
+        from ..objective import observed_box_fingerprint
+
+        if self.observed_model.source_fingerprint != self.source_model.fingerprint:
+            raise ValueError("Runtime and source observed models do not match.")
+        if self.base_objective_key.likelihood_hash != (
+            self.source_model.likelihood_fingerprint
+        ):
+            raise ValueError("SolverContext likelihood identity is inconsistent.")
+        if self.base_objective_key.graph_hash != self.graph_spec.fingerprint:
+            raise ValueError("SolverContext graph identity is inconsistent.")
+        if self.graph.source_graph_fingerprint != self.graph_spec.fingerprint:
+            raise ValueError("SolverContext runtime graph identity is inconsistent.")
+        if self.base_objective_key.box_hash != observed_box_fingerprint(
+            self.source_model
+        ):
+            raise ValueError("SolverContext objective-box identity is inconsistent.")
+        if self.base_objective_key.eps_hex != float(self.eps).hex():
+            raise ValueError("SolverContext epsilon identity is inconsistent.")
+        if not str(self.data_fingerprint):
+            raise ValueError("SolverContext data fingerprint must be nonempty.")
+        if self.observed_model.alt.dtype != self.runtime.dtype:
+            raise ValueError("SolverContext observed model has the wrong dtype.")
+        if self.observed_model.alt.device != self.runtime.device:
+            raise ValueError("SolverContext observed model has the wrong device.")
+        if self.graph.weight.dtype != self.runtime.dtype:
+            raise ValueError("SolverContext graph has the wrong dtype.")
+        if self.graph.weight.device != self.runtime.device:
+            raise ValueError("SolverContext graph has the wrong device.")
+
+    @property
+    def graph_hash(self) -> str:
+        return str(self.graph_spec.fingerprint)
+
+    @property
+    def objective_spec_hash(self) -> str:
+        return str(self.base_objective_key.fingerprint)
 
 @dataclass(slots=True)
 class SolverState:
@@ -433,10 +579,6 @@ class FitProvenance:
 
     @property
     def objective_spec_hash(self) -> str:
-        return str(self.objective_key.base.fingerprint)
-
-    @property
-    def base_fusion_objective_hash(self) -> str:
         return str(self.objective_key.base.fingerprint)
 
     @property

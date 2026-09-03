@@ -4,7 +4,6 @@ import numpy as np
 
 from ..config import FitConfig
 from ..core.fusion.types import RawFit
-from .config import SELECTION_SCORE_NAMES
 from .types import (
     CandidateRecord,
     CandidateSelectionDecision,
@@ -40,16 +39,6 @@ def _number_or_nan(value: object) -> float:
         return float("nan")
 
 
-def _normalize_selection_score_name(selection_score: str) -> str:
-    normalized = str(selection_score).strip().lower().replace("-", "_")
-    if normalized in SELECTION_SCORE_NAMES:
-        return normalized
-    allowed = ", ".join(SELECTION_SCORE_NAMES)
-    raise ValueError(
-        f"Unknown selection_score: {selection_score}. Expected one of: {allowed}."
-    )
-
-
 def raw_fit_has_exact_fusion_certificate(fit: RawFit) -> bool:
     """Apply the complete schema-2 admission contract to one raw fit.
 
@@ -75,11 +64,9 @@ def raw_fit_has_exact_fusion_certificate(fit: RawFit) -> bool:
         and bool(str(provenance.original_graph_hash).strip())
         and bool(str(provenance.certificate_problem_hash).strip())
         and str(certificate.scope) == "full_original_graph"
-        and str(certificate.gradient_scope)
-        in _EXACT_OBSERVED_OBJECTIVE_GRADIENT_SCOPES
+        and str(certificate.gradient_scope) in _EXACT_OBSERVED_OBJECTIVE_GRADIENT_SCOPES
         and bool(certificate.certified)
-        and str(certificate.status)
-        in _EXACT_CERTIFICATE_STATUSES
+        and str(certificate.status) in _EXACT_CERTIFICATE_STATUSES
         and np.isfinite(residual)
         and np.isfinite(tolerance)
         and tolerance > 0.0
@@ -270,8 +257,7 @@ def select_candidate_records(
         return (
             min(record.n_clusters for record in rows),
             min(
-                int(_require_record_score(record).degrees_of_freedom)
-                for record in rows
+                int(_require_record_score(record).degrees_of_freedom) for record in rows
             ),
             min(raw_lambdas) if raw_lambdas else float("inf"),
             0 if any(record.family == "raw_fusion" for record in rows) else 1,
@@ -304,7 +290,7 @@ def select_candidate_records(
     # immutable partition.
     selected_lambdas = sorted(
         {
-            _canonical_lambda(float(record.lambda_value))
+            canonical_lambda(float(record.lambda_value))
             for record in records
             if record.partition_signature == selected_signature
             and isinstance(record.candidate, RawFusionCandidate)
@@ -344,18 +330,26 @@ def select_candidate_records(
         selection_hits_upper_boundary=bool(upper_hit),
         selection_boundary_unresolved=bool(boundary_unresolved),
     )
-def _canonical_lambda(value: float) -> float:
+
+
+def canonical_lambda(value: float) -> float:
     return float(np.round(float(value), 12))
 
 
-def _prefer_fit_candidate(candidate: RawFit, incumbent: RawFit | None) -> bool:
+def prefer_fit_candidate(candidate: RawFit, incumbent: RawFit | None) -> bool:
     if incumbent is None:
         return True
     certified = candidate.certificate.admissible
     if certified != incumbent.certificate.admissible:
         return bool(certified)
-    candidate_values = (candidate.objective.total, candidate.certificate.components.residual)
-    incumbent_values = (incumbent.objective.total, incumbent.certificate.components.residual)
+    candidate_values = (
+        candidate.objective.total,
+        candidate.certificate.components.residual,
+    )
+    incumbent_values = (
+        incumbent.objective.total,
+        incumbent.certificate.components.residual,
+    )
     for candidate_value, incumbent_value in zip(
         candidate_values, incumbent_values, strict=True
     ):
@@ -377,7 +371,7 @@ def _sorted_unique_lambdas(values: list[float] | np.ndarray) -> list[float]:
     return [float(value) for value in np.unique(np.round(np.sort(array), 12))]
 
 
-def _effective_bic_partition_tol(options: FitConfig) -> float:
+def effective_bic_partition_tol(options: FitConfig) -> float:
     value = options.selection.partition_tolerance
     return float(max(float(value), 1e-12))
 

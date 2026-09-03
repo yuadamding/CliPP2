@@ -10,15 +10,17 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.21",
-    "pandas>=1.5",
     "torch>=2.0",
 ]
 
 [project.optional-dependencies]
 test = [
+    "pandas>=1.5",
     "pytest>=8",
     "ruff>=0.12",
 ]
+simulation = ["pandas>=1.5"]
+pandas = ["pandas>=1.5"]
 
 [project.scripts]
 clipp2 = "CliPP2.cli:main"
@@ -30,8 +32,8 @@ packages = [
     "CliPP2.core.fusion",
     "CliPP2.io",
     "CliPP2.model_selection",
+    "CliPP2.reporting",
     "CliPP2.runners",
-    "CliPP2.simulation",
 ]
 package-dir = { CliPP2 = "." }
 include-package-data = false

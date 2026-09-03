@@ -6,17 +6,28 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from ..core.bic import compute_classic_bic, compute_partition_dirichlet_score
-from ..core.fusion.defaults import normalize_dense_fallback_policy
+from ..core.bic import compute_classic_bic
+from ..config import (
+    FitConfig,
+    LIKELIHOOD_PARTITION_K_MAX,
+    PRODUCTION_SELECTION_POLICY,
+    normalize_dense_fallback_policy,
+)
 from ..core.fusion.graph import build_likelihood_noise_regularized_adaptive_graph
 from ..core.fusion.graph_ops import (
     build_likelihood_noise_regularized_adaptive_tensor_graph,
     tensor_graph_to_pairwise_graph,
 )
-from ..core.fusion.partition_starts import PartitionCandidate
+from ..core.fusion.partition_starts import (
+    PartitionCandidate,
+    PartitionCandidatePool,
+    generate_likelihood_partition_starts,
+    hessian_weighted_ward_label_sets_torch,
+    observed_curvature_at_pilot_torch,
+)
 from ..core.fusion.solver import (
     escape_path_breakpoint_solver_state,
-    objective_shape_for_data,
+    objective_shape_for_model,
     prepare_torch_problem_with_resource_policy,
 )
 from ..core.fusion.torch_backend import dtype_name
@@ -30,11 +41,14 @@ from ..core.fusion.types import (
     SolverState,
     WorkCounters,
 )
-from ..config import FitConfig
 from ..core.fusion.types import RawFit
+from ..core.objective import compile_observed_model
 from ..io.data import TumorData
-from .guided_fusion import GuidedFusionInitialization, build_guided_fusion_initialization
-from .scoring import _canonical_lambda, _prefer_fit_candidate
+from .guided_fusion import (
+    GuidedFusionInitialization,
+    build_guided_fusion_initialization,
+)
+from .scoring import canonical_lambda, prefer_fit_candidate
 from .types import SolveOutcome, StartArray
 
 
@@ -144,7 +158,7 @@ def select_raw_start_attempt(
     # effort at this same lambda.
     incumbent = attempts[0]
     for item in attempts[1:]:
-        if _prefer_fit_candidate(item.fit, incumbent.fit):
+        if prefer_fit_candidate(item.fit, incumbent.fit):
             incumbent = item
     return incumbent
 
@@ -275,14 +289,14 @@ def escape_path_breakpoint_retry_state(
     same_lambda_failure = start_source in {
         "same_lambda_retry",
         "best_same_lambda_kkt_state",
-    } and _canonical_lambda(start_lambda) == _canonical_lambda(target_lambda)
+    } and canonical_lambda(start_lambda) == canonical_lambda(target_lambda)
     if state is None or not same_lambda_failure:
         return state, 0, WorkCounters()
     return escape_path_breakpoint_solver_state(state, context=context, tol=tol)
 
 
 def solver_recovery_fit_options(
-    data: TumorData,
+    source_model,
     fit_options: FitConfig,
     *,
     retry_number: int | None = None,
@@ -333,8 +347,8 @@ def solver_recovery_fit_options(
                 else float(solver.certification_tolerance)
             ),
             use_backward_error_progress=True,
-            objective_shape=objective_shape_for_data(
-                data, "unimodal_full_step_backtracking"
+            objective_shape=objective_shape_for_model(
+                source_model, "unimodal_full_step_backtracking"
             ),
         ),
     )
@@ -413,14 +427,16 @@ def build_guided_initialization_with_resource_policy(
                 data,
                 dense_fallback_policy="device_only",
                 inherited_resource_fallback="dense_cpu",
-                major_prior=float(solver_context.problem.major_prior),
-                eps=float(solver_context.problem.eps),
+                major_prior=float(fit_options.major_prior),
+                eps=float(fit_options.eps),
                 tol=float(fit_options.solver.tolerance),
                 graph=solver_context.graph_spec,
                 inner_max_iter=max(int(fit_options.solver.inner_max_iter), 16),
                 adaptive_weight_gamma=float(fit_options.graph.adaptive_weight_gamma),
                 adaptive_weight_floor=float(fit_options.graph.adaptive_weight_floor),
-                adaptive_weight_baseline=float(fit_options.graph.adaptive_weight_baseline),
+                adaptive_weight_baseline=float(
+                    fit_options.graph.adaptive_weight_baseline
+                ),
                 exact_pilot=cpu_start(solver_context.exact_pilot),
                 pooled_start=cpu_start(solver_context.pooled_start),
                 scalar_well_starts=solver_context.scalar_well_starts,
@@ -473,13 +489,9 @@ def build_partition_guided_graph_with_resource_policy(
         return build_likelihood_noise_regularized_adaptive_graph(
             host_array(guide_phi),
             host_array(guide_curvature),
-            lower=host_array(solver_context.lower),
-            upper=host_array(solver_context.upper),
-            count_observed=(
-                None
-                if solver_context.problem.count_observed is None
-                else host_array(solver_context.problem.count_observed)
-            ),
+            lower=host_array(solver_context.observed_model.lower),
+            upper=host_array(solver_context.observed_model.upper),
+            likelihood_included=host_array(solver_context.observed_model.observed),
             **graph_options,
         )
 
@@ -497,9 +509,9 @@ def build_partition_guided_graph_with_resource_policy(
             ),
             guide_curvature,
             runtime,
-            lower=solver_context.lower,
-            upper=solver_context.upper,
-            count_observed=solver_context.problem.count_observed,
+            lower=solver_context.observed_model.lower,
+            upper=solver_context.observed_model.upper,
+            likelihood_included=solver_context.observed_model.observed,
             **graph_options,
         )
         return tensor_graph_to_pairwise_graph(tensor_graph), tensor_graph, tau
@@ -526,44 +538,20 @@ def rescore_partition_candidates(
     candidates: list[PartitionCandidate],
     *,
     data: TumorData,
-    normalized_score: str,
-    classification_alpha: float,
-    classification_code_weight: float,
 ) -> list[PartitionCandidate]:
-    """Put the active selection score in ``PartitionCandidate.bic``.
+    """Recompute BIC in ``PartitionCandidate.bic``.
 
     Candidate generation historically used that field for per-K ordering,
-    refinement focus, and deduplication.  Keeping the field as the active score
-    lets those operations follow the requested criterion while the candidate
-    output rows continue to report classic BIC explicitly.
+    refinement focus, and deduplication. The authoritative evaluator later
+    refits every retained label set and recomputes the same score.
     """
-    # This score orders deterministic Ward/CEM proposals and chooses the raw
-    # guide. Under a selectable hybrid contract, the authoritative evaluator
-    # later refits every retained label set and recomputes the common score;
-    # generation-time values never become selection authority directly.
     rescored: list[PartitionCandidate] = []
     for candidate in candidates:
-        if normalized_score == "fixed_partition_bic":
-            selected_score = compute_classic_bic(
-                -float(candidate.fit_loss),
-                int(candidate.K),
-                data,
-            )
-        elif normalized_score == "fixed_partition_dirichlet_score":
-            selected_score = compute_partition_dirichlet_score(
-                -float(candidate.fit_loss),
-                np.bincount(
-                    np.asarray(candidate.labels, dtype=np.int64),
-                    minlength=int(candidate.K),
-                ),
-                data=data,
-                alpha=float(classification_alpha),
-                code_weight=float(classification_code_weight),
-            )
-        else:
-            raise ValueError(
-                f"Unsupported partition-generation score {normalized_score!r}."
-            )
+        selected_score = compute_classic_bic(
+            -float(candidate.fit_loss),
+            int(candidate.K),
+            data,
+        )
         rescored.append(
             replace(
                 candidate,
@@ -571,6 +559,130 @@ def rescore_partition_candidates(
             )
         )
     return rescored
+
+
+def generate_partition_initializer_pool(
+    *,
+    data: TumorData,
+    pilot_phi,
+    fit_options: FitConfig,
+    runtime,
+    solver_context: SolverContext | None,
+    rescore_candidates,
+    curvature=None,
+    declared_k_grid: tuple[int, ...] | None = None,
+    max_refit_objective_evaluations: int | None = None,
+    max_candidates: int | None = None,
+) -> PartitionCandidatePool:
+    """Generate the deterministic Ward/CEM pool used to choose one guide.
+
+    BIC orders guide generation and retention exactly as it does final
+    partition selection.
+    The chosen guide always supplies the initial solver state and lambda scale.
+    Frozen adaptive edge weights come from the zero-penalty likelihood pilot;
+    the guide does not define the production graph.
+    These are deterministic generation artifacts; retained labels pass through
+    the separate direct-partition refit/BIC gate after the raw path terminates.
+    """
+
+    config = PRODUCTION_SELECTION_POLICY.partition_config
+    source_model = (
+        compile_observed_model(
+            data,
+            major_prior=float(fit_options.major_prior),
+            eps=float(fit_options.eps),
+        )
+        if solver_context is None
+        else solver_context.source_model
+    )
+    if declared_k_grid is None:
+        sparse_k_grid = [
+            int(value)
+            for value in config.k_anchors
+            if 1 <= int(value) <= int(data.num_mutations)
+        ]
+        k_cap = min(int(LIKELIHOOD_PARTITION_K_MAX), int(data.num_mutations))
+        if k_cap > 0 and k_cap not in sparse_k_grid:
+            sparse_k_grid.append(k_cap)
+        sparse_k_grid = sorted(set(sparse_k_grid))
+    else:
+        sparse_k_grid = sorted(
+            {
+                int(value)
+                for value in declared_k_grid
+                if 1 <= int(value) <= int(data.num_mutations)
+            }
+        )
+    if curvature is None:
+        curvature = observed_curvature_at_pilot_torch(
+            data,
+            pilot_phi,
+            major_prior=float(fit_options.major_prior),
+            eps=float(fit_options.eps),
+            solver_context=solver_context,
+            device=runtime.device,
+            dtype=runtime.dtype,
+        )
+
+    def generate(
+        k_grid: list[int],
+        *,
+        refit_evaluation_capacity: int | None,
+        candidate_capacity: int | None,
+    ) -> PartitionCandidatePool:
+        label_sets = hessian_weighted_ward_label_sets_torch(
+            pilot_phi,
+            curvature,
+            K_grid=k_grid,
+            device=runtime.device,
+            dtype=runtime.dtype,
+        )
+        candidates = generate_likelihood_partition_starts(
+            data,
+            exact_pilot=pilot_phi,
+            major_prior=float(fit_options.major_prior),
+            eps=float(fit_options.eps),
+            K_grid=k_grid,
+            max_candidates_per_K=int(config.max_candidates_per_k),
+            cem_max_iter=int(config.cem_max_iter),
+            refit_max_iter=int(config.generation_refit_max_iter),
+            tol=float(fit_options.solver.tolerance),
+            curvature=curvature,
+            label_sets=label_sets,
+            solver_context=solver_context,
+            device=runtime.device,
+            dtype=runtime.dtype,
+            # The unanchored NumPy refit remains the scoring authority for
+            # categorical occupancy paths.  Entirely one-state inputs retain
+            # the historical Torch major/minor refit, which has the same
+            # objective and avoids the serial path-refit overhead.
+            use_torch=not source_model.requires_generic_path_solver,
+            max_refit_objective_evaluations=refit_evaluation_capacity,
+            max_candidates=candidate_capacity,
+        )
+        return replace(
+            candidates,
+            candidates=tuple(
+                rescore_candidates(
+                    list(candidates.candidates),
+                    data=data,
+                )
+            ),
+        )
+
+    initial = generate(
+        sparse_k_grid,
+        refit_evaluation_capacity=max_refit_objective_evaluations,
+        candidate_capacity=max_candidates,
+    )
+    candidates = list(initial.candidates)
+
+    return PartitionCandidatePool(
+        candidates=tuple(candidates),
+        work=initial.work,
+        complete=bool(initial.complete),
+        stop_reason=initial.stop_reason,
+    )
 
 
 def adaptive_stop_certifies_global_optimum(stop_reason: str) -> bool:
@@ -590,14 +702,9 @@ def direct_partition_source(
     stage: str,
 ) -> str:
     cem = str(proposal.source).startswith("hessian_ward_cem")
-    death = int(proposal.component_death_count) > 0
     prefix = "pilot" if stage == "pilot" else "final_phi"
     suffix = "hessian_ward_cem" if cem else "hessian_ward"
-    if cem and death:
-        suffix += "_component_death"
     return f"{prefix}_{suffix}"
-
-
 
 
 __all__ = [
@@ -605,6 +712,7 @@ __all__ = [
     "adaptive_stop_certifies_global_optimum",
     "bootstrap_independent_start_specs",
     "explicit_path_default_start_specs",
+    "generate_partition_initializer_pool",
     "build_guided_initialization_with_resource_policy",
     "build_partition_guided_graph_with_resource_policy",
     "clone_start",

@@ -2,34 +2,37 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import TYPE_CHECKING
-
+import numpy as np
 import torch
 
-from ..objective import observed_one_sided_gradients_torch
+from ..objective import TorchObservedModel, observed_one_sided_gradients_torch
 from .torch_backend import (
+    DEFAULT_EDGE_WORK_BYTES,
     downward_kink_mask_torch,
+    edge_chunk_size,
     edge_kkt_maxima_from_diff_torch,
+    edge_slices,
+    edge_tensor_nbytes,
     graph_fusion_kkt_diagnostics_from_components_torch,
     graph_fusion_kkt_residual_from_grad_torch,
     project_stationarity_cone_torch,
-    refine_graph_fusion_dual_certificate_torch,
+    stationarity_residual_torch,
+    streaming_graph_adjoint_edges_torch,
+    validate_lambda_value,
 )
-from .graph_ops import project_dual_ball
+from .graph_ops import graph_adjoint_edges, graph_forward_edges, project_dual_ball
 from .types import (
-    WorkCounters,
     CertificateOptions,
     CompressedEdgeCertificate,
     DenseEdgeCertificate,
     GraphFusionCertificate,
+    KKTAudit,
     KKTDiagnostics,
     SmoothGradientScope,
     TensorFusionGraph,
+    WorkCounters,
+    WorkLedger,
 )
-
-if TYPE_CHECKING:
-    from .torch_backend import TorchTumorData
-
 
 # Column generation assumes that the retained-edge subproblem has itself been
 # solved.  Repeatedly enlarging an unconverged workset is both non-authoritative
@@ -37,6 +40,44 @@ if TYPE_CHECKING:
 # leave room for the added columns to improve conditioning before failing closed
 # to the caller's configured dense-fallback policy.
 _MAX_CONSECUTIVE_UNCONVERGED_WORKSETS = 3
+_CERTIFICATE_KKT_ATOL_SCALE = 5.0
+_CERTIFICATE_PLATEAU_PATIENCE = 8
+_CERTIFICATE_MOVING_PLATEAU_PATIENCE = 16
+_CERTIFICATE_PLATEAU_ATOL_SCALE = 0.01
+_CERTIFICATE_PLATEAU_EPS_SCALE = 32.0
+
+
+def _update_refinement_plateau(
+    *,
+    anchor_residual: float,
+    best_residual: float,
+    mapping_delta: float,
+    stalled_iterations: int,
+    atol: float,
+    dtype: torch.dtype,
+) -> tuple[float, int, bool]:
+    """Stop only after both residual progress and dual motion have stalled."""
+
+    scale = max(1.0, abs(float(anchor_residual)))
+    progress_floor = max(
+        _CERTIFICATE_PLATEAU_ATOL_SCALE * float(atol),
+        _CERTIFICATE_PLATEAU_EPS_SCALE * float(torch.finfo(dtype).eps) * scale,
+    )
+    if np.isfinite(best_residual) and (
+        not np.isfinite(anchor_residual)
+        or float(anchor_residual) - float(best_residual) > progress_floor
+    ):
+        return float(best_residual), 0, False
+    stalled = int(stalled_iterations) + 1
+    mapping_stalled = bool(
+        np.isfinite(mapping_delta) and float(mapping_delta) <= progress_floor
+    )
+    patience = (
+        _CERTIFICATE_PLATEAU_PATIENCE
+        if mapping_stalled
+        else _CERTIFICATE_MOVING_PLATEAU_PATIENCE
+    )
+    return float(anchor_residual), stalled, stalled >= patience
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,9 +94,7 @@ class CertificateProblem:
     def __post_init__(self) -> None:
         if not str(self.graph_hash):
             raise ValueError("Certificate graph hash must be nonempty.")
-        if self.lower.ndim != 2 or tuple(self.lower.shape) != tuple(
-            self.upper.shape
-        ):
+        if self.lower.ndim != 2 or tuple(self.lower.shape) != tuple(self.upper.shape):
             raise ValueError("Certificate bounds must have one identical 2-D shape.")
         if int(self.lower.shape[0]) != int(self.graph.num_nodes):
             raise ValueError("Certificate bounds must have shape (M, S).")
@@ -85,37 +124,17 @@ class CertificateAttempt:
     work_counters: WorkCounters = WorkCounters()
 
 
-def _certificate_work_counters(
-    *,
-    iterations: int = 0,
-    full_graph_passes: int = 0,
-    policy_audit_passes: int = 0,
-    edge_pass_equivalents: int | None = None,
-    edge_region_visits: int = 0,
-) -> WorkCounters:
-    """Return deterministic work charged by one certificate operation.
+@dataclass(frozen=True, slots=True)
+class DualRefinementResult:
+    """Explicit-edge dual refinement before witness provenance is attached."""
 
-    The explicit override is the conservative budget-unit count emitted by
-    primitive instrumentation. The fallback is retained for callers whose
-    operations have the historical two-pass iteration/audit structure.  Work
-    accounting never participates in a certificate decision.
-    """
-
-    iteration_count = max(int(iterations), 0)
-    graph_pass_count = max(int(full_graph_passes), 0)
-    policy_pass_count = max(int(policy_audit_passes), 0)
-    budget_edge_passes = (
-        2 * iteration_count + 2 * graph_pass_count
-        if edge_pass_equivalents is None
-        else max(int(edge_pass_equivalents), 0)
-    )
-    return WorkCounters(
-        certificate_iterations=iteration_count,
-        certificate_full_graph_passes=graph_pass_count,
-        edge_pass_equivalents=budget_edge_passes,
-        edge_region_visits=max(int(edge_region_visits), 0),
-        full_certificate_audit_passes=policy_pass_count,
-    )
+    dual: torch.Tensor
+    status: str
+    dual_refined: bool
+    audit: KKTAudit
+    stationarity_before: float
+    stationarity_after: float
+    refinement_iterations: int
 
 
 def _inadmissible_downward_kink_mask(
@@ -126,14 +145,16 @@ def _inadmissible_downward_kink_mask(
 ) -> torch.Tensor:
     """Mask downward kinks only where a coordinate can actually move."""
 
-    resolution = 8.0 * torch.finfo(phi.dtype).eps * (
-        1.0 + torch.maximum(torch.abs(lower), torch.abs(upper))
+    resolution = (
+        8.0
+        * torch.finfo(phi.dtype).eps
+        * (1.0 + torch.maximum(torch.abs(lower), torch.abs(upper)))
     )
     return downward_kink & ((upper - lower) > resolution)
 
 
 def build_certificate_gradient(
-    data: TorchTumorData,
+    model: TorchObservedModel,
     phi: torch.Tensor,
     *,
     smooth_gradient: torch.Tensor,
@@ -162,10 +183,8 @@ def build_certificate_gradient(
     if fusion_adjoint is not None and tuple(fusion_adjoint.shape) != expected_shape:
         raise ValueError(f"fusion_adjoint must have shape {expected_shape}.")
 
-    gradient_left, gradient_right, at_breakpoint = (
-        observed_one_sided_gradients_torch(
-            data.observed_model, phi, eps=float(eps)
-        )
+    gradient_left, gradient_right, at_breakpoint = observed_one_sided_gradients_torch(
+        model, phi, eps=float(eps)
     )
     gradient_lower = torch.where(
         at_breakpoint,
@@ -425,7 +444,14 @@ def _optimize_internal_workset(
     upper: torch.Tensor,
     lambda_value: float,
     options: CertificateOptions,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, int, int]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    float,
+    int,
+    WorkCounters,
+]:
     if edge_ids.numel() == 0:
         residual, _, _ = _workset_residual(
             base_grad=base_grad,
@@ -436,7 +462,14 @@ def _optimize_internal_workset(
             lower=lower,
             upper=upper,
         )
-        return dual_start, residual, torch.zeros_like(phi), 0.0, 0, 0
+        return (
+            dual_start,
+            residual,
+            torch.zeros_like(phi),
+            0.0,
+            0,
+            WorkCounters(),
+        )
     edge_u = graph.edge_u.index_select(0, edge_ids)
     edge_v = graph.edge_v.index_select(0, edge_ids)
     radius = float(lambda_value) * graph.weight.index_select(0, edge_ids)
@@ -457,7 +490,7 @@ def _optimize_internal_workset(
     residual = torch.zeros_like(phi)
     adj = torch.zeros_like(phi)
     iterations = 0
-    edge_pass_equivalents = 0
+    work = WorkLedger()
     for iteration in range(int(options.max_iter)):
         iterations = iteration + 1
         residual, adj, _ = _workset_residual(
@@ -469,11 +502,17 @@ def _optimize_internal_workset(
             lower=lower,
             upper=upper,
         )
-        edge_pass_equivalents += 1
+        work.charge_edge_passes(
+            edge_count=int(edge_ids.numel()),
+            num_regions=int(phi.shape[1]),
+        )
         edge_gradient = residual.index_select(0, edge_u) - residual.index_select(
             0, edge_v
         )
-        edge_pass_equivalents += 1
+        work.charge_edge_passes(
+            edge_count=int(edge_ids.numel()),
+            num_regions=int(phi.shape[1]),
+        )
         projected = project_dual_ball(dual - step * edge_gradient, radius)
         mapping = (dual - projected) / step
         dual = projected
@@ -493,14 +532,17 @@ def _optimize_internal_workset(
         lower=lower,
         upper=upper,
     )
-    edge_pass_equivalents += 1
+    work.charge_edge_passes(
+        edge_count=int(edge_ids.numel()),
+        num_regions=int(phi.shape[1]),
+    )
     return (
         dual,
         residual,
         adj,
         mapping_residual,
         iterations,
-        edge_pass_equivalents,
+        work.total,
     )
 
 
@@ -641,21 +683,22 @@ def _refine_compressed_certificate(
         lambda_value=lambda_value,
     )
     base_grad = grad_smooth + between_adj
-    edge_pass_equivalents = int(
-        int(graph.edge_u.numel()) > 0 and float(lambda_value) > 0.0
+    num_edges = int(graph.edge_u.numel())
+    num_regions = int(phi.shape[1])
+    work = WorkLedger()
+    work.charge_edge_passes(
+        edge_count=num_edges,
+        num_regions=num_regions,
+        passes=int(num_edges > 0 and float(lambda_value) > 0.0),
     )
-    full_edge_region_visits = int(graph.edge_u.numel()) * int(phi.shape[1])
-    edge_region_visits = (
-        full_edge_region_visits if edge_pass_equivalents else 0
-    )
-    if not bool(graph.is_complete) and int(graph.edge_u.numel()) > 0:
+    if not bool(graph.is_complete) and num_edges > 0:
         # _initial_internal_tree_ids scans a non-complete graph to identify a
         # deterministic star support.  Complete graphs use direct edge IDs.
-        edge_pass_equivalents += 1
-        edge_region_visits += full_edge_region_visits
-    full_certificate_audit_passes = 0
-    certificate_iterations = 0
-    certificate_full_graph_passes = 0
+        work.charge_edge_passes(
+            edge_count=num_edges,
+            num_regions=num_regions,
+        )
+    full_kkt_audited = False
     # A nonempty inherited support may already be authoritative, so give it one
     # full-graph fast-path audit. Fresh proposals go directly to the cheap
     # workset/missing-column gates and pay for a full audit only if those pass.
@@ -668,7 +711,7 @@ def _refine_compressed_certificate(
         atol=atol,
     )
     if has_inherited_fast_path:
-        before = _compressed_graph_fusion_kkt(
+        before_audit = _compressed_graph_fusion_kkt(
             certificate=certificate,
             phi=phi,
             grad_smooth=grad_smooth,
@@ -679,10 +722,10 @@ def _refine_compressed_certificate(
             lambda_value=lambda_value,
             atol=atol,
         )
-        full_certificate_audit_passes += 1
-        certificate_full_graph_passes += 1
-        edge_pass_equivalents += int(int(graph.edge_u.numel()) > 0)
-        edge_region_visits += full_edge_region_visits
+        before = before_audit.diagnostics
+        work.charge(before_audit.work)
+        full_kkt_audited = True
+        work.charge_certificate_work(full_graph_passes=1)
     if has_inherited_fast_path and before.kkt_residual <= 5.0 * float(atol):
         # The inherited compressed state has already passed a full
         # original-graph audit.  Re-optimizing its workset cannot strengthen
@@ -700,20 +743,14 @@ def _refine_compressed_certificate(
             certificate=certified,
             diagnostics=before,
             status="certified",
-            work_counters=_certificate_work_counters(
-                iterations=certificate_iterations,
-                full_graph_passes=certificate_full_graph_passes,
-                policy_audit_passes=full_certificate_audit_passes,
-                edge_pass_equivalents=edge_pass_equivalents,
-                edge_region_visits=edge_region_visits,
-            ),
+            work_counters=work.total,
         )
     status = "not_certified"
     force_rounds = 0
     unconverged_worksets = 0
     final_diag = before
     for _expansion in range(int(options.max_expansions)):
-        dual, residual, work_adj, mapping_residual, iterations, workset_passes = (
+        dual, residual, work_adj, mapping_residual, iterations, workset_work = (
             _optimize_internal_workset(
                 base_grad=base_grad,
                 dual_start=dual,
@@ -726,13 +763,8 @@ def _refine_compressed_certificate(
                 options=options,
             )
         )
-        certificate_iterations += int(iterations)
-        edge_pass_equivalents += int(workset_passes)
-        edge_region_visits += (
-            int(workset_passes)
-            * int(support_ids.numel())
-            * int(phi.shape[1])
-        )
+        work.charge_certificate_work(iterations=int(iterations))
+        work.charge(workset_work)
         current = CompressedEdgeCertificate(
             labels=labels,
             centers=centers,
@@ -741,6 +773,9 @@ def _refine_compressed_certificate(
             graph_hash=graph_hash,
             gradient_scope=gradient_scope,
         )
+        # Workset optimization changes the terminal dual, so any audit of an
+        # inherited predecessor no longer certifies this representation.
+        full_kkt_audited = False
         mapping_ready = bool(
             math.isfinite(mapping_residual)
             and mapping_residual <= float(options.mapping_tolerance)
@@ -768,13 +803,15 @@ def _refine_compressed_certificate(
             scale=scale,
             add_batch=int(options.add_batch),
         )
-        certificate_full_graph_passes += 1
-        edge_pass_equivalents += int(int(graph.edge_u.numel()) > 0)
-        edge_region_visits += full_edge_region_visits
+        work.charge_certificate_work(full_graph_passes=1)
+        work.charge_edge_passes(
+            edge_count=num_edges,
+            num_regions=num_regions,
+        )
         column_ready = column_residual <= float(options.column_tolerance)
         should_expand = not column_ready
         if column_ready:
-            final_diag = _compressed_graph_fusion_kkt(
+            final_audit = _compressed_graph_fusion_kkt(
                 certificate=current,
                 phi=phi,
                 grad_smooth=grad_smooth,
@@ -785,10 +822,10 @@ def _refine_compressed_certificate(
                 lambda_value=lambda_value,
                 atol=atol,
             )
-            full_certificate_audit_passes += 1
-            certificate_full_graph_passes += 1
-            edge_pass_equivalents += int(int(graph.edge_u.numel()) > 0)
-            edge_region_visits += full_edge_region_visits
+            final_diag = final_audit.diagnostics
+            work.charge(final_audit.work)
+            full_kkt_audited = True
+            work.charge_certificate_work(full_graph_passes=1)
             if final_diag.kkt_residual <= 5.0 * float(atol):
                 status = "certified"
                 certificate = current
@@ -827,17 +864,16 @@ def _refine_compressed_certificate(
             graph_hash=graph_hash,
             gradient_scope=gradient_scope,
         )
+    if status == "not_certified" and not full_kkt_audited:
+        # ``not_certified`` is reserved for a complete original-graph KKT
+        # audit that misses tolerance. Representation-limited exits remain
+        # explicit so retry policy never depends on work-accounting metadata.
+        status = "workset_incomplete"
     return CertificateAttempt(
         certificate=certificate,
         diagnostics=final_diag,
         status=status,
-        work_counters=_certificate_work_counters(
-            iterations=certificate_iterations,
-            full_graph_passes=certificate_full_graph_passes,
-            policy_audit_passes=full_certificate_audit_passes,
-            edge_pass_equivalents=edge_pass_equivalents,
-            edge_region_visits=edge_region_visits,
-        ),
+        work_counters=work.total,
     )
 
 
@@ -926,7 +962,7 @@ def _compressed_graph_fusion_kkt(
     upper: torch.Tensor,
     lambda_value: float,
     atol: float,
-) -> KKTDiagnostics:
+) -> KKTAudit:
     labels, _centers, support_ids, support_dual = _validated_compressed_tensors(
         certificate,
         phi=phi,
@@ -945,6 +981,7 @@ def _compressed_graph_fusion_kkt(
     max_radius = 0.0
     max_scaled_edge_residual = 0.0
     max_scaled_ball_residual = 0.0
+    nonzero_edge_count = 0
     for start in range(0, num_edges, chunk_size):
         stop = min(start + chunk_size, num_edges)
         edge_u = graph.edge_u[start:stop]
@@ -955,6 +992,9 @@ def _compressed_graph_fusion_kkt(
         if lambda_value > 0.0:
             same = labels.index_select(0, edge_u) == labels.index_select(0, edge_v)
             diff_norm = torch.linalg.vector_norm(diff, dim=1)
+            nonzero_edge_count += int(
+                torch.count_nonzero(diff_norm > float(atol)).item()
+            )
             nonfused = (~same) & (diff_norm > 0.0)
             if bool(torch.any(nonfused).item()):
                 dual_chunk[nonfused] = (
@@ -1005,21 +1045,557 @@ def _compressed_graph_fusion_kkt(
                 max_scaled_ball_residual, float(scaled_ball_residual.item())
             )
 
-    return KKTDiagnostics.from_mapping(
-        graph_fusion_kkt_diagnostics_from_components_torch(
+    diagnostics = graph_fusion_kkt_diagnostics_from_components_torch(
+        phi=phi,
+        grad_smooth=grad_smooth,
+        adj=adj,
+        lower=lower,
+        upper=upper,
+        atol=atol,
+        max_edge_residual=max_edge_residual,
+        max_ball_residual=max_ball_residual,
+        max_radius=max_radius,
+        max_scaled_edge_residual=max_scaled_edge_residual,
+        max_scaled_ball_residual=max_scaled_ball_residual,
+    )
+    work = WorkLedger()
+    work.charge_edge_passes(
+        edge_count=num_edges,
+        num_regions=int(phi.shape[1]),
+    )
+    return KKTAudit(
+        diagnostics=diagnostics,
+        work=work.total,
+        fused_edges=(num_edges - nonzero_edge_count if lambda_value > 0.0 else None),
+        nonzero_edges=(nonzero_edge_count if lambda_value > 0.0 else None),
+    )
+
+
+def _refine_graph_fusion_dual_certificate_streaming_torch(
+    *,
+    phi: torch.Tensor,
+    grad_smooth: torch.Tensor,
+    dual_kkt: torch.Tensor | None,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    edge_w: torch.Tensor,
+    lambda_value: float,
+    atol: float,
+    max_iter: int,
+    before_audit: KKTAudit,
+    edge_work_bytes: int | None,
+) -> DualRefinementResult:
+    """Memory-bounded counterpart of the final dual-certificate refinement."""
+    num_edges = int(edge_u.numel())
+    num_regions = int(phi.shape[1])
+    num_nodes = int(phi.shape[0])
+    chunk_size = edge_chunk_size(
+        num_edges=num_edges,
+        num_regions=num_regions,
+        dtype=phi.dtype,
+        work_bytes=edge_work_bytes,
+    )
+    incoming_valid = bool(
+        dual_kkt is not None and tuple(dual_kkt.shape) == (num_edges, num_regions)
+    )
+    incoming = (
+        dual_kkt.to(dtype=phi.dtype, device=phi.device) if incoming_valid else None
+    )
+
+    work = WorkLedger(before_audit.work)
+    fused_edges, nonzero_edges = before_audit.require_activity(edge_count=num_edges)
+
+    dual = torch.zeros(
+        (num_edges, num_regions),
+        dtype=phi.dtype,
+        device=phi.device,
+    )
+    for edge_slice in edge_slices(num_edges, chunk_size):
+        diff = graph_forward_edges(
+            phi,
+            edge_u=edge_u[edge_slice],
+            edge_v=edge_v[edge_slice],
+        )
+        diff_norm = torch.linalg.vector_norm(diff, dim=1)
+        active = diff_norm > float(atol)
+        radius = float(lambda_value) * edge_w[edge_slice]
+        analytic_chunk = (
+            radius[:, None] * diff / diff_norm[:, None].clamp_min(float(atol))
+        )
+        if incoming is None:
+            dual[edge_slice].copy_(
+                torch.where(
+                    active[:, None],
+                    analytic_chunk,
+                    torch.zeros_like(analytic_chunk),
+                )
+            )
+        else:
+            projected_incoming = project_dual_ball(
+                incoming[edge_slice],
+                radius,
+            )
+            dual[edge_slice].copy_(
+                torch.where(
+                    active[:, None],
+                    analytic_chunk,
+                    projected_incoming,
+                )
+            )
+    if num_edges > 0:
+        work.charge_edge_passes(
+            edge_count=num_edges,
+            num_regions=num_regions,
+        )
+
+    analytic_audit = graph_fusion_kkt_residual_from_grad_torch(
+        phi=phi,
+        grad_smooth=grad_smooth,
+        dual_kkt=dual,
+        lower=lower,
+        upper=upper,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        edge_w=edge_w,
+        lambda_value=lambda_value,
+        atol=atol,
+        edge_work_bytes=edge_work_bytes,
+    )
+    work.charge(analytic_audit.work)
+    best_diag = analytic_audit.diagnostics
+    best_residual = float(analytic_audit.diagnostics.kkt_residual)
+    best_source = "analytic"
+    best_dual: torch.Tensor = dual.clone()
+    if incoming is not None:
+        incoming_residual = float(before_audit.diagnostics.kkt_residual)
+        if np.isfinite(incoming_residual) and incoming_residual <= best_residual:
+            best_diag = before_audit.diagnostics
+            best_residual = incoming_residual
+            best_source = "incoming"
+            best_dual = incoming
+
+    refinement_iterations = 0
+    kkt_target = _CERTIFICATE_KKT_ATOL_SCALE * float(atol)
+    if fused_edges > 0 and best_residual > kkt_target:
+        degree = torch.bincount(edge_u, minlength=num_nodes) + torch.bincount(
+            edge_v,
+            minlength=num_nodes,
+        )
+        step = 0.25 / max(float(torch.max(degree).item()), 1.0)
+        plateau_anchor = best_residual
+        stalled_iterations = 0
+        for _ in range(max(int(max_iter), 1)):
+            refinement_iterations += 1
+            mapping_delta = 0.0
+            adj = streaming_graph_adjoint_edges_torch(
+                dual,
+                edge_u=edge_u,
+                edge_v=edge_v,
+                num_nodes=num_nodes,
+                dtype=phi.dtype,
+                device=phi.device,
+                scale=1.0,
+                chunk_size=chunk_size,
+            )
+            work.charge_edge_passes(
+                edge_count=num_edges,
+                num_regions=num_regions,
+            )
+            stat = stationarity_residual_torch(
+                total_grad=grad_smooth + adj,
+                phi=phi,
+                lower=lower,
+                upper=upper,
+                atol=atol,
+            )
+            stationarity_edge_count = 0
+            for edge_slice in edge_slices(num_edges, chunk_size):
+                diff = graph_forward_edges(
+                    phi,
+                    edge_u=edge_u[edge_slice],
+                    edge_v=edge_v[edge_slice],
+                )
+                fused = torch.linalg.vector_norm(diff, dim=1) <= float(atol)
+                if not bool(torch.any(fused).item()):
+                    continue
+                stat_diff = graph_forward_edges(
+                    stat,
+                    edge_u=edge_u[edge_slice],
+                    edge_v=edge_v[edge_slice],
+                )
+                stationarity_edge_count += int(edge_u[edge_slice].numel())
+                radius = float(lambda_value) * edge_w[edge_slice]
+                projected = project_dual_ball(
+                    dual[edge_slice] - float(step) * stat_diff,
+                    radius,
+                )
+                mapping_delta = max(
+                    mapping_delta,
+                    float(
+                        torch.max(
+                            torch.abs(projected[fused] - dual[edge_slice][fused])
+                        ).item()
+                    ),
+                )
+                dual[edge_slice].copy_(
+                    torch.where(
+                        fused[:, None],
+                        projected,
+                        dual[edge_slice],
+                    )
+                )
+            # The first forward covers every edge.  The stationarity forward
+            # is evaluated only on chunks containing fused edges; charge its
+            # logical certificate sweep as one EPE as well.
+            work.charge_edge_passes(
+                edge_count=num_edges,
+                num_regions=num_regions,
+            )
+            work.charge_edge_passes(
+                edge_count=stationarity_edge_count,
+                num_regions=num_regions,
+            )
+            iteration_audit = graph_fusion_kkt_residual_from_grad_torch(
+                phi=phi,
+                grad_smooth=grad_smooth,
+                dual_kkt=dual,
+                lower=lower,
+                upper=upper,
+                edge_u=edge_u,
+                edge_v=edge_v,
+                edge_w=edge_w,
+                lambda_value=lambda_value,
+                atol=atol,
+                edge_work_bytes=edge_work_bytes,
+            )
+            work.charge(iteration_audit.work)
+            residual = float(iteration_audit.diagnostics.kkt_residual)
+            if residual < best_residual:
+                best_residual = residual
+                best_diag = iteration_audit.diagnostics
+                if best_source == "incoming":
+                    best_dual = dual.clone()
+                else:
+                    best_dual.copy_(dual)
+                best_source = "refined"
+            if residual <= kkt_target:
+                break
+            plateau_anchor, stalled_iterations, plateaued = (
+                _update_refinement_plateau(
+                    anchor_residual=plateau_anchor,
+                    best_residual=best_residual,
+                    mapping_delta=mapping_delta,
+                    stalled_iterations=stalled_iterations,
+                    atol=atol,
+                    dtype=phi.dtype,
+                )
+            )
+            if plateaued:
+                break
+
+    if best_source == "incoming":
+        status = "input_dual_retained"
+    elif fused_edges > 0:
+        status = "refined_fused_edge_dual"
+    else:
+        status = "analytic_nonfused_dual"
+    return DualRefinementResult(
+        dual=best_dual,
+        status=status,
+        dual_refined=bool(best_source != "incoming"),
+        audit=KKTAudit(
+            diagnostics=best_diag,
+            work=work.total,
+            fused_edges=fused_edges,
+            nonzero_edges=nonzero_edges,
+        ),
+        stationarity_before=float(before_audit.diagnostics.stationarity_residual),
+        stationarity_after=float(best_diag.stationarity_residual),
+        refinement_iterations=int(refinement_iterations),
+    )
+
+
+def refine_graph_fusion_dual_certificate_torch(
+    *,
+    phi: torch.Tensor,
+    grad_smooth: torch.Tensor,
+    dual_kkt: torch.Tensor | None,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    edge_w: torch.Tensor,
+    lambda_value: float,
+    atol: float,
+    max_iter: int = 96,
+    edge_work_bytes: int | None = None,
+) -> DualRefinementResult:
+    lambda_value = validate_lambda_value(lambda_value)
+    before_audit = graph_fusion_kkt_residual_from_grad_torch(
+        phi=phi,
+        grad_smooth=grad_smooth,
+        dual_kkt=dual_kkt,
+        lower=lower,
+        upper=upper,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        edge_w=edge_w,
+        lambda_value=lambda_value,
+        atol=atol,
+        edge_work_bytes=edge_work_bytes,
+    )
+    work = WorkLedger(before_audit.work)
+    if edge_u.numel() == 0 or lambda_value <= 0.0:
+        dual = torch.zeros(
+            (int(edge_u.numel()), int(phi.shape[1])), dtype=phi.dtype, device=phi.device
+        )
+        after_audit = graph_fusion_kkt_residual_from_grad_torch(
             phi=phi,
             grad_smooth=grad_smooth,
-            adj=adj,
+            dual_kkt=dual,
             lower=lower,
             upper=upper,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            edge_w=edge_w,
+            lambda_value=lambda_value,
             atol=atol,
-            max_edge_residual=max_edge_residual,
-            max_ball_residual=max_ball_residual,
-            max_radius=max_radius,
-            max_scaled_edge_residual=max_scaled_edge_residual,
-            max_scaled_ball_residual=max_scaled_ball_residual,
+            edge_work_bytes=edge_work_bytes,
         )
+        work.charge(after_audit.work)
+        return DualRefinementResult(
+            dual=dual,
+            status="zero_penalty_no_dual_needed",
+            dual_refined=False,
+            audit=KKTAudit(
+                diagnostics=after_audit.diagnostics,
+                work=work.total,
+            ),
+            stationarity_before=float(
+                before_audit.diagnostics.stationarity_residual
+            ),
+            stationarity_after=float(after_audit.diagnostics.stationarity_residual),
+            refinement_iterations=0,
+        )
+
+    budget = (
+        DEFAULT_EDGE_WORK_BYTES if edge_work_bytes is None else int(edge_work_bytes)
     )
+    incoming_valid = bool(
+        dual_kkt is not None
+        and tuple(dual_kkt.shape) == (int(edge_u.numel()), int(phi.shape[1]))
+    )
+    incoming_residual = float(before_audit.diagnostics.kkt_residual)
+    if (
+        incoming_valid
+        and np.isfinite(incoming_residual)
+        and incoming_residual <= _CERTIFICATE_KKT_ATOL_SCALE * float(atol)
+    ):
+        fused_edges, nonzero_edges = before_audit.require_activity(
+            edge_count=int(edge_u.numel())
+        )
+        incoming = dual_kkt.to(dtype=phi.dtype, device=phi.device)
+        return DualRefinementResult(
+            dual=incoming,
+            status="input_dual_retained",
+            dual_refined=False,
+            audit=KKTAudit(
+                diagnostics=before_audit.diagnostics,
+                work=work.total,
+                fused_edges=fused_edges,
+                nonzero_edges=nonzero_edges,
+            ),
+            stationarity_before=float(
+                before_audit.diagnostics.stationarity_residual
+            ),
+            stationarity_after=float(before_audit.diagnostics.stationarity_residual),
+            refinement_iterations=0,
+        )
+    if (
+        edge_tensor_nbytes(
+            num_edges=int(edge_u.numel()),
+            num_regions=int(phi.shape[1]),
+            dtype=phi.dtype,
+        )
+        > budget
+    ):
+        return _refine_graph_fusion_dual_certificate_streaming_torch(
+            phi=phi,
+            grad_smooth=grad_smooth,
+            dual_kkt=dual_kkt,
+            lower=lower,
+            upper=upper,
+            edge_u=edge_u,
+            edge_v=edge_v,
+            edge_w=edge_w,
+            lambda_value=lambda_value,
+            atol=atol,
+            max_iter=max_iter,
+            before_audit=before_audit,
+            edge_work_bytes=budget,
+        )
+
+    diff = graph_forward_edges(phi, edge_u=edge_u, edge_v=edge_v)
+    work.charge_edge_passes(
+        edge_count=int(edge_u.numel()),
+        num_regions=int(phi.shape[1]),
+    )
+    diff_norm = torch.linalg.norm(diff, dim=1)
+    radius = float(lambda_value) * edge_w
+    active = diff_norm > float(atol)
+    fused = ~active
+    dual = torch.zeros(
+        (int(edge_u.numel()), int(phi.shape[1])), dtype=phi.dtype, device=phi.device
+    )
+    if torch.any(active):
+        dual[active] = (
+            radius[active, None]
+            * diff[active]
+            / diff_norm[active, None].clamp_min(float(atol))
+        )
+    if (
+        torch.any(fused)
+        and dual_kkt is not None
+        and tuple(dual_kkt.shape) == tuple(dual.shape)
+    ):
+        dual[fused] = dual_kkt.to(dtype=phi.dtype, device=phi.device)[fused]
+        fused_radius = radius[fused]
+        dual[fused] = project_dual_ball(dual[fused], fused_radius)
+
+    analytic_audit = graph_fusion_kkt_residual_from_grad_torch(
+        phi=phi,
+        grad_smooth=grad_smooth,
+        dual_kkt=dual,
+        lower=lower,
+        upper=upper,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        edge_w=edge_w,
+        lambda_value=lambda_value,
+        atol=atol,
+    )
+    work.charge(analytic_audit.work)
+    best_dual = dual.clone()
+    best_diag = analytic_audit.diagnostics
+    best_residual = float(analytic_audit.diagnostics.kkt_residual)
+    best_source = "analytic"
+
+    # Reconstructing the analytic active-edge subgradient can improve edge
+    # feasibility while worsening stationarity at a finite-accuracy primal
+    # iterate.  A certificate-refinement routine must be monotone in the full
+    # KKT residual, so retain the incoming actual ADMM multiplier whenever it
+    # is the stronger certificate.
+    if dual_kkt is not None and tuple(dual_kkt.shape) == tuple(dual.shape):
+        incoming_residual = float(before_audit.diagnostics.kkt_residual)
+        if np.isfinite(incoming_residual) and incoming_residual <= best_residual:
+            best_dual = dual_kkt.to(dtype=phi.dtype, device=phi.device).clone()
+            best_diag = before_audit.diagnostics
+            best_residual = incoming_residual
+            best_source = "incoming"
+    refinement_iterations = 0
+    kkt_target = _CERTIFICATE_KKT_ATOL_SCALE * float(atol)
+    if torch.any(fused) and best_residual > kkt_target:
+        degree = torch.bincount(
+            torch.cat([edge_u, edge_v]),
+            minlength=int(phi.shape[0]),
+        ).max()
+        step = 0.25 / max(float(degree.item()), 1.0)
+        plateau_anchor = best_residual
+        stalled_iterations = 0
+        for _ in range(max(int(max_iter), 1)):
+            refinement_iterations += 1
+            adj = graph_adjoint_edges(
+                dual,
+                edge_u=edge_u,
+                edge_v=edge_v,
+                num_nodes=int(phi.shape[0]),
+            )
+            work.charge_edge_passes(
+                edge_count=int(edge_u.numel()),
+                num_regions=int(phi.shape[1]),
+            )
+            total_grad = grad_smooth + adj
+            stat = stationarity_residual_torch(
+                total_grad=total_grad,
+                phi=phi,
+                lower=lower,
+                upper=upper,
+                atol=atol,
+            )
+            fused_before = dual[fused]
+            fused_after = (
+                fused_before
+                - float(step)
+                * (graph_forward_edges(stat, edge_u=edge_u, edge_v=edge_v)[fused])
+            )
+            work.charge_edge_passes(
+                edge_count=int(edge_u.numel()),
+                num_regions=int(phi.shape[1]),
+            )
+            fused_radius = radius[fused]
+            fused_after = project_dual_ball(fused_after, fused_radius)
+            mapping_delta = float(
+                torch.max(torch.abs(fused_after - fused_before)).item()
+            )
+            dual[fused] = fused_after
+            iteration_audit = graph_fusion_kkt_residual_from_grad_torch(
+                phi=phi,
+                grad_smooth=grad_smooth,
+                dual_kkt=dual,
+                lower=lower,
+                upper=upper,
+                edge_u=edge_u,
+                edge_v=edge_v,
+                edge_w=edge_w,
+                lambda_value=lambda_value,
+                atol=atol,
+            )
+            work.charge(iteration_audit.work)
+            residual = float(iteration_audit.diagnostics.kkt_residual)
+            if residual < best_residual:
+                best_residual = residual
+                best_diag = iteration_audit.diagnostics
+                best_dual = dual.clone()
+                best_source = "refined"
+            if residual <= kkt_target:
+                break
+            plateau_anchor, stalled_iterations, plateaued = (
+                _update_refinement_plateau(
+                    anchor_residual=plateau_anchor,
+                    best_residual=best_residual,
+                    mapping_delta=mapping_delta,
+                    stalled_iterations=stalled_iterations,
+                    atol=atol,
+                    dtype=phi.dtype,
+                )
+            )
+            if plateaued:
+                break
+
+    if best_source == "incoming":
+        status = "input_dual_retained"
+    elif torch.any(fused):
+        status = "refined_fused_edge_dual"
+    else:
+        status = "analytic_nonfused_dual"
+
+    return DualRefinementResult(
+        dual=best_dual,
+        status=status,
+        dual_refined=bool(best_source != "incoming"),
+        audit=KKTAudit(
+            diagnostics=best_diag,
+            work=work.total,
+            fused_edges=int(torch.sum(fused).item()),
+            nonzero_edges=int(torch.sum(active).item()),
+        ),
+        stationarity_before=float(before_audit.diagnostics.stationarity_residual),
+        stationarity_after=float(best_diag.stationarity_residual),
+        refinement_iterations=int(refinement_iterations),
+    )
+
 
 
 def _dense_dual_for_graph(
@@ -1040,34 +1616,23 @@ def _audit_certificate(
     phi: torch.Tensor,
     grad_smooth: torch.Tensor,
     problem: CertificateProblem,
-) -> tuple[KKTDiagnostics, int, int]:
+) -> KKTAudit:
     if isinstance(certificate, CompressedEdgeCertificate):
-        edge_passes = int(int(problem.graph.edge_u.numel()) > 0)
-        return (
-            _compressed_graph_fusion_kkt(
-                certificate=certificate,
-                phi=phi,
-                grad_smooth=grad_smooth,
-                graph=problem.graph,
-                graph_hash=problem.graph_hash,
-                lower=problem.lower,
-                upper=problem.upper,
-                lambda_value=problem.lambda_value,
-                atol=problem.atol,
-            ),
-            edge_passes,
-            (
-                edge_passes
-                * int(problem.graph.edge_u.numel())
-                * int(phi.shape[1])
-            ),
+        return _compressed_graph_fusion_kkt(
+            certificate=certificate,
+            phi=phi,
+            grad_smooth=grad_smooth,
+            graph=problem.graph,
+            graph_hash=problem.graph_hash,
+            lower=problem.lower,
+            upper=problem.upper,
+            lambda_value=problem.lambda_value,
+            atol=problem.atol,
         )
-    values = graph_fusion_kkt_residual_from_grad_torch(
+    return graph_fusion_kkt_residual_from_grad_torch(
         phi=phi,
         grad_smooth=grad_smooth,
-        dual_kkt=_dense_dual_for_graph(
-            certificate, graph_hash=problem.graph_hash
-        ),
+        dual_kkt=_dense_dual_for_graph(certificate, graph_hash=problem.graph_hash),
         lower=problem.lower,
         upper=problem.upper,
         edge_u=problem.graph.edge_u,
@@ -1075,11 +1640,6 @@ def _audit_certificate(
         edge_w=problem.graph.weight,
         lambda_value=problem.lambda_value,
         atol=problem.atol,
-    )
-    return (
-        KKTDiagnostics.from_mapping(values),
-        int(values.get("_edge_pass_equivalents", 0)),
-        int(values.get("_edge_region_visits", 0)),
     )
 
 
@@ -1093,7 +1653,6 @@ def _refine_certificate(
     max_iter: int = 96,
     options: CertificateOptions | None = None,
 ) -> CertificateAttempt:
-
     if isinstance(certificate, CompressedEdgeCertificate):
         effective_options = options or CertificateOptions(
             max_iter=max(int(max_iter), 1)
@@ -1114,9 +1673,7 @@ def _refine_certificate(
     dense = refine_graph_fusion_dual_certificate_torch(
         phi=phi,
         grad_smooth=grad_smooth,
-        dual_kkt=_dense_dual_for_graph(
-            certificate, graph_hash=problem.graph_hash
-        ),
+        dual_kkt=_dense_dual_for_graph(certificate, graph_hash=problem.graph_hash),
         lower=problem.lower,
         upper=problem.upper,
         edge_u=problem.graph.edge_u,
@@ -1126,31 +1683,25 @@ def _refine_certificate(
         atol=problem.atol,
         max_iter=max_iter,
     )
-    refinement_iterations = int(dense.get("refinement_iterations", 0))
-    dual = dense["dual"]
-    refined_certificate = (
-        DenseEdgeCertificate(
-            dual=dual,
-            graph_hash=str(problem.graph_hash),
-            gradient_scope=gradient_scope,
-        )
-        if torch.is_tensor(dual)
-        else None
+    refinement_iterations = int(dense.refinement_iterations)
+    dense_audit = dense.audit
+    work = WorkLedger(dense_audit.work)
+    work.charge_certificate_work(
+        iterations=refinement_iterations,
+        # Keep this category as a count of full diagnostic calls; exact
+        # physical/logical edge sweeps come from the backend audit.
+        full_graph_passes=refinement_iterations + 2,
+    )
+    refined_certificate = DenseEdgeCertificate(
+        dual=dense.dual,
+        graph_hash=str(problem.graph_hash),
+        gradient_scope=gradient_scope,
     )
     return CertificateAttempt(
         certificate=refined_certificate,
-        diagnostics=KKTDiagnostics.from_mapping(dense["diag"]),
-        status=str(dense["status"]),
-        work_counters=_certificate_work_counters(
-            iterations=refinement_iterations,
-            # Keep this category as a count of full diagnostic calls; exact
-            # physical/logical edge sweeps come from the backend counter.
-            full_graph_passes=refinement_iterations + 2,
-            edge_pass_equivalents=int(
-                dense.get("_edge_pass_equivalents", 0)
-            ),
-            edge_region_visits=int(dense.get("_edge_region_visits", 0)),
-        ),
+        diagnostics=dense_audit.diagnostics,
+        status=dense.status,
+        work_counters=work.total,
     )
 
 
@@ -1190,19 +1741,17 @@ def certify(
             max_iter=max_iter,
             options=options,
         )
-    diagnostics, edge_pass_equivalents, edge_region_visits = _audit_certificate(
+    audit = _audit_certificate(
         certificate=witness,
         phi=phi,
         grad_smooth=gradient.value,
         problem=problem,
     )
+    work = WorkLedger(audit.work)
+    work.charge_certificate_work(full_graph_passes=1)
     return CertificateAttempt(
         certificate=witness,
-        diagnostics=diagnostics,
+        diagnostics=audit.diagnostics,
         status="audited",
-        work_counters=_certificate_work_counters(
-            full_graph_passes=1,
-            edge_pass_equivalents=edge_pass_equivalents,
-            edge_region_visits=edge_region_visits,
-        ),
+        work_counters=work.total,
     )

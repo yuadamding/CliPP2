@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from ..io.tumor_txt import (
+from CliPP2.io.tumor_txt import (
     SCHEMA_COLUMNS as TUMOR_TXT_COLUMNS,
     TUMOR_TXT_SCHEMA,
     load_tumor_txt,
@@ -136,8 +136,7 @@ def validate_generated_tumor_directory(tumor_dir: str | Path) -> None:
         if unexpected_region:
             raise ValueError(f"{region_id} has non-truth files: {unexpected_region}.")
 
-    unsupported = np.asarray(data.path_unsupported_reason, dtype=object)
-    if any(value not in {None, ""} for value in unsupported.reshape(-1)):
+    if not bool(np.all(np.asarray(data.likelihood_supported, dtype=bool))):
         raise ValueError(
             "Generated tumor contains unsupported local copy-number states."
         )

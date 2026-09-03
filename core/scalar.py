@@ -8,7 +8,12 @@ import heapq
 import numpy as np
 
 from ..io.data import TumorData
-from .objective import ObservedModel, compile_observed_model
+from .objective import (
+    ObservedModel,
+    compile_observed_model,
+    default_phi_initialization,
+    observed_box_fingerprint,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,9 +136,7 @@ def scalar_problem_from_model(
     )
 
 
-def scalar_loss(
-    problem: ScalarProblem, beta: float | np.ndarray
-) -> float | np.ndarray:
+def scalar_loss(problem: ScalarProblem, beta: float | np.ndarray) -> float | np.ndarray:
     loss, _ = _scalar_terms(problem, beta, with_gradient=False)
     return loss
 
@@ -215,7 +218,9 @@ def scalar_breakpoints(
     problem: ScalarProblem, *, observed_only: bool = True
 ) -> np.ndarray:
     points = [problem.lower, problem.upper]
-    rows = np.flatnonzero(problem.observed) if observed_only else range(problem.alt.size)
+    rows = (
+        np.flatnonzero(problem.observed) if observed_only else range(problem.alt.size)
+    )
     for row in rows:
         for path in np.flatnonzero(problem.valid[row]):
             first = float(problem.first_scale[row, path])
@@ -262,9 +267,7 @@ def approximate_scalar_minimum(
     if hint is not None and np.isfinite(float(hint)):
         extras = np.append(extras, np.clip(float(hint), problem.lower, problem.upper))
     grid = np.unique(
-        np.clip(
-            np.concatenate((initial, extras)), problem.lower, problem.upper
-        )
+        np.clip(np.concatenate((initial, extras)), problem.lower, problem.upper)
     )
     evaluated: dict[float, float] = {}
 
@@ -346,9 +349,7 @@ def _probabilities(
 
 
 def _interval_lower_bound(problem: ScalarProblem, left: float, right: float) -> float:
-    alt, nonalt, first, second, switch, log_prior, valid = _active_path_arrays(
-        problem
-    )
+    alt, nonalt, first, second, switch, log_prior, valid = _active_path_arrays(problem)
     probability_left = _probabilities(problem, left, first, second, switch)
     probability_right = _probabilities(problem, right, first, second, switch)
     probability_min = np.minimum(probability_left, probability_right)
@@ -364,9 +365,7 @@ def _interval_lower_bound(problem: ScalarProblem, left: float, right: float) -> 
     mode = np.clip(empirical[:, None], probability_min, probability_max)
     component_upper = np.where(
         valid,
-        alt[:, None] * np.log(mode)
-        + nonalt[:, None] * np.log1p(-mode)
-        + log_prior,
+        alt[:, None] * np.log(mode) + nonalt[:, None] * np.log1p(-mode) + log_prior,
         -np.inf,
     )
     maximum = np.max(component_upper, axis=1)
@@ -403,15 +402,13 @@ def _interval_lower_bound(problem: ScalarProblem, left: float, right: float) -> 
     score_bound = np.where(
         valid,
         slope
-        * (
-            alt[:, None] / probability_min
-            + nonalt[:, None] / (1.0 - probability_max)
-        ),
+        * (alt[:, None] / probability_min + nonalt[:, None] / (1.0 - probability_max)),
         0.0,
     )
     curvature_bound = np.where(
         valid,
-        slope * slope
+        slope
+        * slope
         * (
             alt[:, None] / np.square(probability_min)
             + nonalt[:, None] / np.square(1.0 - probability_max)
@@ -419,9 +416,7 @@ def _interval_lower_bound(problem: ScalarProblem, left: float, right: float) -> 
         0.0,
     )
     hessian_bound = float(
-        np.sum(
-            np.max(curvature_bound, axis=1) + np.square(np.max(score_bound, axis=1))
-        )
+        np.sum(np.max(curvature_bound, axis=1) + np.square(np.max(score_bound, axis=1)))
     )
     taylor_bound = (
         float(scalar_loss(problem, midpoint))
@@ -536,9 +531,7 @@ def certify_scalar_minimum(
             objective_evaluations += 1
             intervals += 1
             if child_bound <= best_value:
-                heapq.heappush(
-                    heap, (child_bound, child_left, child_right, serial)
-                )
+                heapq.heappush(heap, (child_bound, child_left, child_right, serial))
                 serial += 1
             if intervals >= int(max_intervals):
                 break
@@ -546,11 +539,7 @@ def certify_scalar_minimum(
     gap = max(float(best_value - lower_bound), 0.0)
     certified = bool(
         certified
-        or (
-            np.isfinite(best_value)
-            and np.isfinite(lower_bound)
-            and gap <= tolerance
-        )
+        or (np.isfinite(best_value) and np.isfinite(lower_bound) and gap <= tolerance)
     )
     return ScalarGlobalMinimumCertificate(
         argmin=float(np.clip(best_beta, problem.lower, problem.upper)),
@@ -568,29 +557,36 @@ def certify_scalar_minimum(
 
 
 @dataclass(frozen=True)
-class PartitionRefitResult:
+class PartitionFit:
     """Observed-likelihood refit of one immutable partition."""
 
+    labels: np.ndarray
     phi: np.ndarray
     cluster_centers: np.ndarray
     loglik: float
-    fit_loss: float
-    n_clusters: int
-    boundary_count: int
-    active_degrees_of_freedom: int
     finite_candidate_found: bool
-    refit_coordinate_count: int
-    refit_finite_coordinate_count: int
-    refit_total_grid_points: int
-    refit_max_grid_spacing: float
-    refit_total_candidate_basins: int
-    refit_total_refined_candidates: int
-    refit_min_best_second_loss_gap: float
-    labels: np.ndarray
+    observed_model_hash: str
+    observed_likelihood_hash: str
+    reporting_model_hash: str
+    observed_box_hash: str
+    likelihood_eps_hex: str
+    global_optimum_certified: bool = False
+    partition_signature: str = ""
+    refit_numerically_resolved: bool = False
+    fit_loss: float = float("nan")
+    n_clusters: int = 0
+    boundary_count: int = 0
+    active_degrees_of_freedom: int = 0
+    refit_coordinate_count: int = 0
+    refit_finite_coordinate_count: int = 0
+    refit_total_grid_points: int = 0
+    refit_max_grid_spacing: float = 0.0
+    refit_total_candidate_basins: int = 0
+    refit_total_refined_candidates: int = 0
+    refit_min_best_second_loss_gap: float = float("inf")
     loglik_source: str = "partition_constrained_observed_mle"
     global_lower_bound: float = float("-inf")
     global_optimality_gap: float = float("inf")
-    global_optimum_certified: bool = False
     global_certificate_method: str = "none"
     global_certificate_intervals: int = 0
     refit_mode: str = "interval_certified"
@@ -598,6 +594,94 @@ class PartitionRefitResult:
     coordinate_argmin_upper: np.ndarray | None = None
     coordinate_statistically_identified: np.ndarray | None = None
     refit_objective_evaluations: int = 0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "observed_model_hash",
+            "observed_likelihood_hash",
+            "reporting_model_hash",
+            "observed_box_hash",
+        ):
+            value = str(getattr(self, name))
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise ValueError(f"PartitionFit.{name} must be a SHA-256 digest.")
+        eps_token = str(self.likelihood_eps_hex)
+        try:
+            epsilon = float.fromhex(eps_token)
+        except ValueError as exc:
+            raise ValueError(
+                "PartitionFit.likelihood_eps_hex must be a hexadecimal float."
+            ) from exc
+        if (
+            not np.isfinite(epsilon)
+            or not 0.0 < epsilon < 0.5
+            or epsilon.hex() != eps_token
+        ):
+            raise ValueError(
+                "PartitionFit.likelihood_eps_hex must canonically identify a valid eps."
+            )
+        if (
+            int(self.refit_coordinate_count) < 0
+            or int(self.refit_objective_evaluations) < 0
+        ):
+            raise ValueError("Partition-refit work counters must be nonnegative.")
+        if self.global_optimum_certified and (
+            not np.isfinite(float(self.global_lower_bound))
+            or not np.isfinite(float(self.global_optimality_gap))
+            or float(self.global_optimality_gap) < 0.0
+            or str(self.global_certificate_method) == "none"
+        ):
+            raise ValueError("A global refit claim requires a finite certificate.")
+        for name, dtype in (
+            ("labels", np.int64),
+            ("phi", np.float64),
+            ("cluster_centers", np.float64),
+        ):
+            value = np.array(getattr(self, name), dtype=dtype, copy=True)
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+        centers = np.asarray(self.cluster_centers)
+        lower = (
+            centers
+            if self.coordinate_argmin_lower is None
+            else self.coordinate_argmin_lower
+        )
+        upper = (
+            centers
+            if self.coordinate_argmin_upper is None
+            else self.coordinate_argmin_upper
+        )
+        identified = (
+            np.ones(centers.shape, dtype=bool)
+            if self.coordinate_statistically_identified is None
+            else self.coordinate_statistically_identified
+        )
+        for name, values, dtype in (
+            ("coordinate_argmin_lower", lower, np.float64),
+            ("coordinate_argmin_upper", upper, np.float64),
+            ("coordinate_statistically_identified", identified, bool),
+        ):
+            value = np.array(values, dtype=dtype, copy=True)
+            value.setflags(write=False)
+            object.__setattr__(self, name, value)
+
+    def validate_observed_model(self, model: ObservedModel, *, eps: float) -> None:
+        """Fail closed unless this refit belongs to ``model`` and ``eps``."""
+
+        expected = {
+            "observed_model_hash": str(model.fingerprint),
+            "observed_likelihood_hash": str(model.likelihood_fingerprint),
+            "reporting_model_hash": str(model.reporting_fingerprint),
+            "observed_box_hash": observed_box_fingerprint(model),
+            "likelihood_eps_hex": float(eps).hex(),
+        }
+        for name, value in expected.items():
+            if str(getattr(self, name)) != value:
+                raise ValueError(
+                    f"PartitionFit {name} does not match the observed model."
+                )
 
 
 @dataclass(frozen=True)
@@ -722,7 +806,7 @@ def partition_constrained_observed_refit(
     scalar_grid_points: int = 64,
     scalar_local_steps: int = 3,
     _model: ObservedModel | None = None,
-) -> PartitionRefitResult:
+) -> PartitionFit:
     """Refit cluster centers without changing partition labels."""
 
     tolerance = float(tol)
@@ -742,9 +826,7 @@ def partition_constrained_observed_refit(
     if normalized_labels.size != int(data.num_mutations):
         raise ValueError("labels must contain one entry per tumor mutation.")
     normalized_labels = canonical_partition_labels(normalized_labels)
-    n_clusters = (
-        int(normalized_labels.max()) + 1 if normalized_labels.size else 0
-    )
+    n_clusters = int(normalized_labels.max()) + 1 if normalized_labels.size else 0
     n_regions = int(data.num_regions)
 
     model = (
@@ -752,8 +834,11 @@ def partition_constrained_observed_refit(
         if _model is None
         else _model
     )
+    phi_initialization = default_phi_initialization(model, eps=epsilon)
     if model.shape != (int(data.num_mutations), n_regions):
         raise ValueError("The supplied scalar model does not match the tumor shape.")
+    if not np.all(np.asarray(model.lower, dtype=np.float64) == epsilon):
+        raise ValueError("The supplied scalar model does not match the refit eps box.")
     upper_matrix = model.upper
     observed = model.observed & ((model.alt + model.nonalt) > 0.0)
     centers = np.zeros((n_clusters, n_regions), dtype=np.float64)
@@ -796,8 +881,8 @@ def partition_constrained_observed_refit(
                 max_iter=max_iter,
                 grid_points=scalar_grid_points,
                 local_steps=scalar_local_steps,
-                include_breakpoints=data.path_likelihood is not None,
-                hint=float(np.mean(np.asarray(data.phi_init)[members, region])),
+                include_breakpoints=model.has_internal_switches,
+                hint=float(np.mean(phi_initialization[members, region])),
             )
             centers[cluster, region] = coordinate.beta
             argmin_lower[cluster, region] = coordinate.argmin_lower
@@ -848,8 +933,8 @@ def partition_constrained_observed_refit(
         if mode == "interval_certified"
         else "_grid_local_approximate"
     )
-    path_suffix = "_path" if data.path_likelihood is not None else ""
-    return PartitionRefitResult(
+    path_suffix = "_path" if model.requires_generic_path_solver else ""
+    return PartitionFit(
         phi=np.clip(phi, epsilon, upper_matrix).astype(np.float64, copy=False),
         cluster_centers=centers,
         loglik=float(-total_loss),
@@ -860,6 +945,11 @@ def partition_constrained_observed_refit(
         finite_candidate_found=bool(
             finite_coordinates == n_clusters * n_regions and np.isfinite(total_loss)
         ),
+        observed_model_hash=str(model.fingerprint),
+        observed_likelihood_hash=str(model.likelihood_fingerprint),
+        reporting_model_hash=str(model.reporting_fingerprint),
+        observed_box_hash=observed_box_fingerprint(model),
+        likelihood_eps_hex=epsilon.hex(),
         refit_coordinate_count=n_clusters * n_regions,
         refit_finite_coordinate_count=int(finite_coordinates),
         refit_total_grid_points=int(total_grid_points),
@@ -871,16 +961,10 @@ def partition_constrained_observed_refit(
             else int(n_clusters * n_regions * int(scalar_local_steps))
         ),
         refit_min_best_second_loss_gap=(
-            float(min(best_second_loss_gaps))
-            if best_second_loss_gaps
-            else float("inf")
+            float(min(best_second_loss_gaps)) if best_second_loss_gaps else float("inf")
         ),
         labels=normalized_labels.copy(),
-        loglik_source=(
-            "fixed_partition_observed_refit"
-            + path_suffix
-            + method_suffix
-        ),
+        loglik_source=("fixed_partition_observed_refit" + path_suffix + method_suffix),
         global_lower_bound=selected_lower_bound,
         global_optimality_gap=global_gap,
         global_optimum_certified=global_certified,

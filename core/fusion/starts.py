@@ -6,7 +6,9 @@ import torch
 from ...io.data import TumorData
 from ..objective import (
     ObservedModel,
+    TorchObservedModel,
     compile_observed_model,
+    default_phi_initialization,
     observed_internal_breakpoints_torch,
 )
 from ..scalar import (
@@ -17,7 +19,6 @@ from ..scalar import (
     scalar_problem_from_model,
 )
 from .torch_backend import (
-    TorchTumorData,
     mutation_region_loss_grid_torch,
 )
 
@@ -25,10 +26,9 @@ from .torch_backend import (
 _ROOT_SCAN_POINTS = 65
 
 
-def _fixed_linear_path_scale_torch(torch_data: TorchTumorData) -> torch.Tensor | None:
+def _fixed_linear_path_scale_torch(model: TorchObservedModel) -> torch.Tensor | None:
     """Return the shared per-unit path slope when the categorical model is fixed."""
 
-    model = torch_data.observed_model
     first_valid_index = torch.argmax(model.valid.to(dtype=torch.int64), dim=-1)
     reference = torch.gather(
         model.first_scale,
@@ -42,31 +42,6 @@ def _fixed_linear_path_scale_torch(torch_data: TorchTumorData) -> torch.Tensor |
     if not bool(torch.all(fixed).item()):
         return None
     return reference.squeeze(-1)
-
-
-def _binary_linear_model(model: ObservedModel | object) -> bool:
-    """Whether a canonical model admits the exact two-linear-path fast search."""
-
-    first = model.first_scale
-    if int(first.shape[-1]) != 2:
-        return False
-    if torch.is_tensor(first):
-        return bool(
-            torch.all(first == model.second_scale).item()
-            and torch.all(model.valid[..., 0]).item()
-        )
-    return bool(
-        np.array_equal(np.asarray(first), np.asarray(model.second_scale))
-        and np.all(np.asarray(model.valid)[..., 0])
-    )
-
-
-def _source_observed_model(torch_data: TorchTumorData) -> ObservedModel:
-    """Return the immutable float64 source required by host scalar searches."""
-
-    if torch_data.source_model is None:
-        raise ValueError("Host scalar searches require an immutable source model.")
-    return torch_data.source_model
 
 
 def _golden_section_minimize(
@@ -775,7 +750,7 @@ def _ambiguous_best_two_from_candidate_grid_torch(
 
 
 def _pooled_sample_loss_grid_torch(
-    torch_data: TorchTumorData,
+    model: TorchObservedModel,
     beta_by_sample: torch.Tensor,
     *,
     major_prior: float,
@@ -787,10 +762,10 @@ def _pooled_sample_loss_grid_torch(
     else:
         beta_grid = beta_by_sample
         squeeze = False
-    num_mutations = int(torch_data.alt.shape[0])
+    num_mutations = int(model.alt.shape[0])
     beta = beta_grid.unsqueeze(0).expand(num_mutations, -1, -1)
     losses = mutation_region_loss_grid_torch(
-        torch_data,
+        model,
         beta,
         eps=eps,
         respect_observed=False,
@@ -1361,10 +1336,12 @@ def compute_scalar_mutation_region_wells(
     max_iter: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     model = compile_observed_model(data, major_prior=major_prior, eps=eps)
-    if not _binary_linear_model(model):
+    phi_initialization = default_phi_initialization(model, eps=eps)
+    binary_prior = model.binary_linear_mixture_prior
+    if binary_prior is None:
         return _path_scalar_wells_from_model(
             model,
-            phi_init=np.asarray(data.phi_init, dtype=np.float64),
+            phi_init=phi_initialization,
             eps=float(eps),
             tol=float(tol),
             max_iter=int(max_iter),
@@ -1378,7 +1355,7 @@ def compute_scalar_mutation_region_wells(
     lower = np.full_like(alt, float(eps), dtype=np.float64)
     upper = model.upper.reshape(-1)
     hint = np.clip(
-        np.asarray(data.phi_init, dtype=np.float64).reshape(-1), lower, upper
+        phi_initialization.reshape(-1), lower, upper
     )
     refined = np.zeros_like(hint, dtype=np.float64)
     secondary = np.full_like(hint, np.nan, dtype=np.float64)
@@ -1425,7 +1402,7 @@ def compute_scalar_mutation_region_wells(
                 b_plus=float(b_plus[idx]),
                 lower=float(lower[idx]),
                 upper=float(upper[idx]),
-                major_prior=major_prior,
+                major_prior=float(binary_prior),
                 eps=eps,
                 tol=tol,
                 max_iter=max_iter,
@@ -1450,7 +1427,8 @@ def compute_scalar_mutation_region_wells(
 
 
 def compute_scalar_mutation_region_wells_torch(
-    torch_data: TorchTumorData,
+    model: TorchObservedModel,
+    source_model: ObservedModel,
     *,
     phi_init: torch.Tensor | np.ndarray,
     major_prior: float,
@@ -1458,14 +1436,14 @@ def compute_scalar_mutation_region_wells_torch(
     tol: float,
     max_iter: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dtype = torch_data.alt.dtype
-    device = torch_data.alt.device
-    shape = tuple(torch_data.alt.shape)
-    model = torch_data.observed_model
-    fixed_path_scale = _fixed_linear_path_scale_torch(torch_data)
-    if fixed_path_scale is None and not _binary_linear_model(model):
+    dtype = model.alt.dtype
+    device = model.alt.device
+    shape = tuple(model.alt.shape)
+    binary_prior = source_model.binary_linear_mixture_prior
+    fixed_path_scale = _fixed_linear_path_scale_torch(model)
+    if fixed_path_scale is None and binary_prior is None:
         primary, secondary, valid_secondary = _path_scalar_wells_from_model(
-            _source_observed_model(torch_data),
+            source_model,
             phi_init=(
                 phi_init.detach().cpu().numpy()
                 if torch.is_tensor(phi_init)
@@ -1480,9 +1458,14 @@ def compute_scalar_mutation_region_wells_torch(
             torch.as_tensor(secondary, dtype=dtype, device=device),
             torch.as_tensor(valid_secondary, dtype=torch.bool, device=device),
         )
-    lower = torch.full_like(torch_data.phi_upper, float(eps))
-    upper = torch_data.phi_upper
-    hint = torch.as_tensor(phi_init, dtype=dtype, device=device).reshape(shape)
+    lower = torch.full_like(model.upper, float(eps))
+    upper = model.upper
+    hint_source = (
+        phi_init
+        if torch.is_tensor(phi_init)
+        else np.array(phi_init, dtype=np.float64, copy=True)
+    )
+    hint = torch.as_tensor(hint_source, dtype=dtype, device=device).reshape(shape)
     hint = torch.minimum(torch.maximum(hint, lower), upper)
 
     refined = torch.zeros_like(hint)
@@ -1499,12 +1482,11 @@ def compute_scalar_mutation_region_wells_torch(
     )
     fixed_mask = ~effective_ambiguous
     if bool(torch.any(fixed_mask).item()):
-        fixed_valid = fixed_mask & (torch_data.total > 0.0) & (effective_b_fixed > 0.0)
+        fixed_valid = fixed_mask & (model.total > 0.0) & (effective_b_fixed > 0.0)
         fixed_solution = torch.where(fixed_mask, hint, refined)
         if bool(torch.any(fixed_valid).item()):
             p_hat = torch.clamp(
-                torch_data.alt
-                / torch.clamp(torch_data.total, min=torch.finfo(dtype).tiny),
+                model.alt / torch.clamp(model.total, min=torch.finfo(dtype).tiny),
                 min=float(eps),
                 max=1.0 - float(eps),
             )
@@ -1516,8 +1498,8 @@ def compute_scalar_mutation_region_wells_torch(
     ambiguous_mask = effective_ambiguous
     if bool(torch.any(ambiguous_mask).item()):
         flat_mask = ambiguous_mask.reshape(-1)
-        alt = torch_data.alt.reshape(-1)[flat_mask]
-        total = torch_data.total.reshape(-1)[flat_mask]
+        alt = model.alt.reshape(-1)[flat_mask]
+        total = model.total.reshape(-1)[flat_mask]
         b_minus = model.first_scale[..., 0].reshape(-1)[flat_mask]
         b_plus = model.first_scale[..., 1].reshape(-1)[flat_mask]
         lower_flat = lower.reshape(-1)[flat_mask]
@@ -1531,7 +1513,7 @@ def compute_scalar_mutation_region_wells_torch(
             lower=lower_flat,
             upper=upper_flat,
             hint=hint_flat,
-            major_prior=major_prior,
+            major_prior=float(binary_prior),
             eps=eps,
             tol=tol,
             max_iter=max_iter,
@@ -1541,7 +1523,7 @@ def compute_scalar_mutation_region_wells_torch(
             full = hint.reshape(-1, 1).expand(-1, int(beta.shape[1])).clone()
             full[flat_mask] = beta
             return mutation_region_loss_grid_torch(
-                torch_data,
+                model,
                 full.reshape(*shape, int(beta.shape[1])),
                 eps=eps,
                 respect_observed=False,
@@ -1573,7 +1555,8 @@ def compute_scalar_mutation_region_wells_torch(
 
 
 def compute_pooled_observed_data_start_torch(
-    torch_data: TorchTumorData,
+    model: TorchObservedModel,
+    source_model: ObservedModel,
     *,
     major_prior: float,
     eps: float,
@@ -1581,13 +1564,13 @@ def compute_pooled_observed_data_start_torch(
     max_iter: int,
     beta_hints: torch.Tensor | np.ndarray | None = None,
 ) -> torch.Tensor:
-    dtype = torch_data.alt.dtype
-    device = torch_data.alt.device
-    num_mutations = int(torch_data.alt.shape[0])
-    num_regions = int(torch_data.alt.shape[1])
-    if not _binary_linear_model(torch_data.observed_model):
+    dtype = model.alt.dtype
+    device = model.alt.device
+    num_mutations = int(model.alt.shape[0])
+    num_regions = int(model.alt.shape[1])
+    if source_model.binary_linear_mixture_prior is None:
         if beta_hints is None:
-            hints = 0.5 * (float(eps) + torch_data.phi_upper.detach().cpu().numpy())
+            hints = 0.5 * (float(eps) + model.upper.detach().cpu().numpy())
         else:
             hints = (
                 beta_hints.detach().cpu().numpy()
@@ -1595,7 +1578,7 @@ def compute_pooled_observed_data_start_torch(
                 else np.asarray(beta_hints)
             )
         pooled = _path_pooled_start_from_model(
-            _source_observed_model(torch_data),
+            source_model,
             beta_hints=hints,
             eps=float(eps),
             tol=float(tol),
@@ -1603,7 +1586,7 @@ def compute_pooled_observed_data_start_torch(
         )
         return torch.as_tensor(pooled, dtype=dtype, device=device)
     lower = torch.full((num_regions,), float(eps), dtype=dtype, device=device)
-    upper = torch.min(torch_data.phi_upper, dim=0).values
+    upper = torch.min(model.upper, dim=0).values
 
     if beta_hints is None:
         local_left = lower
@@ -1611,8 +1594,8 @@ def compute_pooled_observed_data_start_torch(
     else:
         hints = torch.as_tensor(beta_hints, dtype=dtype, device=device)
         hints = torch.minimum(
-            torch.maximum(hints, torch_data.phi_upper.new_full((), float(eps))),
-            torch_data.phi_upper,
+            torch.maximum(hints, model.upper.new_full((), float(eps))),
+            model.upper,
         )
         hint = torch.median(hints, dim=0).values
         local_left = torch.maximum(lower, hint / 3.0)
@@ -1627,7 +1610,7 @@ def compute_pooled_observed_data_start_torch(
         + (torch.log(local_right) - torch.log(local_left)).unsqueeze(-1) * t
     )
     losses = _pooled_sample_loss_grid_torch(
-        torch_data,
+        model,
         grid,
         major_prior=major_prior,
         eps=eps,
@@ -1644,7 +1627,7 @@ def compute_pooled_observed_data_start_torch(
 
     def objective(values):
         return _pooled_sample_loss_grid_torch(
-            torch_data,
+            model,
             values,
             major_prior=major_prior,
             eps=eps,
@@ -1660,8 +1643,8 @@ def compute_pooled_observed_data_start_torch(
     pooled = torch.where(refined_value <= best_value, refined_beta, best_beta)
     tiled = pooled.unsqueeze(0).expand(num_mutations, -1)
     return torch.minimum(
-        torch.maximum(tiled, torch_data.phi_upper.new_full((), float(eps))),
-        torch_data.phi_upper,
+        torch.maximum(tiled, model.upper.new_full((), float(eps))),
+        model.upper,
     )
 
 
@@ -1679,7 +1662,7 @@ def _deduplicate_tensor_starts(starts: list[torch.Tensor]) -> tuple[torch.Tensor
 
 
 def compute_scalar_well_start_bank_torch(
-    torch_data: TorchTumorData,
+    model: TorchObservedModel,
     *,
     eps: float,
     exact_pilot: torch.Tensor,
@@ -1687,14 +1670,13 @@ def compute_scalar_well_start_bank_torch(
     valid_secondary: torch.Tensor | np.ndarray | None = None,
     max_region_flips: int = 4,
 ) -> tuple[torch.Tensor, ...]:
-    dtype = torch_data.alt.dtype
-    device = torch_data.alt.device
-    lower = torch.full_like(torch_data.phi_upper, float(eps))
+    dtype = model.alt.dtype
+    device = model.alt.device
+    lower = torch.full_like(model.upper, float(eps))
     pilot = exact_pilot.to(dtype=dtype, device=device)
-    pilot = torch.minimum(torch.maximum(pilot, lower), torch_data.phi_upper)
+    pilot = torch.minimum(torch.maximum(pilot, lower), model.upper)
 
     starts: list[torch.Tensor] = [pilot]
-    model = torch_data.observed_model
     piecewise = model.valid & (model.first_scale != model.second_scale)
     if bool(torch.any(piecewise).item()):
         breakpoints, breakpoint_valid = observed_internal_breakpoints_torch(
@@ -1703,7 +1685,7 @@ def compute_scalar_well_start_bank_torch(
         interior = (
             breakpoint_valid
             & (breakpoints > float(eps))
-            & (breakpoints < torch_data.phi_upper.unsqueeze(-1))
+            & (breakpoints < model.upper.unsqueeze(-1))
         )
         distance = torch.where(
             interior,
@@ -1723,7 +1705,7 @@ def compute_scalar_well_start_bank_torch(
             starts.append(
                 torch.minimum(
                     torch.maximum(switch_start, lower),
-                    torch_data.phi_upper,
+                    model.upper,
                 )
             )
     if secondary_wells is None or valid_secondary is None:
@@ -1737,7 +1719,7 @@ def compute_scalar_well_start_bank_torch(
 
     global_alternate = torch.where(valid, secondary, pilot)
     starts.append(
-        torch.minimum(torch.maximum(global_alternate, lower), torch_data.phi_upper)
+        torch.minimum(torch.maximum(global_alternate, lower), model.upper)
     )
 
     region_delta = torch.where(
@@ -1760,7 +1742,7 @@ def compute_scalar_well_start_bank_torch(
             region_start[:, region_idx],
         )
         starts.append(
-            torch.minimum(torch.maximum(region_start, lower), torch_data.phi_upper)
+            torch.minimum(torch.maximum(region_start, lower), model.upper)
         )
 
     return _deduplicate_tensor_starts(starts)

@@ -1,8 +1,14 @@
 # CliPP2
 
-CliPP2 estimates mutation cancer-cell fractions (CCFs), clusters SNVs, and
-infers mutant-copy multiplicity from single- or multi-region tumor sequencing
-data with observed-data pairwise fusion.
+CliPP2 estimates mutation cancer-cell fractions (CCFs), clusters SNVs with
+observed-data pairwise fusion, and reports mutant-copy/path posteriors for a
+single- or multi-region tumor.
+
+All supported copy-number inputs compile to one immutable piecewise-affine
+emission model. The production selection policy is fixed:
+`hybrid-ward-cem-bic-v1`. Certified raw-fusion partitions and deterministic
+Ward/CEM partitions receive the same immutable-label refit and are compared by
+fixed-partition BIC. There is no runtime score or policy switch.
 
 ## Install
 
@@ -10,13 +16,18 @@ data with observed-data pairwise fusion.
 pip install .
 ```
 
+Pandas is not required for fitting or output. Development dependencies are
+available with `pip install '.[test]'`; simulation dependencies are available
+with `pip install '.[simulation]'`.
+
 ## Input
 
-The public input is one tab-delimited file per tumor. See [`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv).
+The public input is one tab-delimited long table per tumor. The 12
+model-defining columns and a small runnable input are in
+[`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv); see
+[`examples/README.md`](examples/README.md) for the column contract.
 
 ## Fit
-
-Fit on CUDA:
 
 ```bash
 clipp2 fit \
@@ -24,87 +35,86 @@ clipp2 fit \
   --outdir exampleTumor1_results
 ```
 
-Use `--device cpu` on a CPU-only machine. Run `clipp2 fit --help` for profile,
-solver, resource, selection-score, partition-tolerance, unsupported-input, and
-failure-policy controls. The default `--failure-policy best-effort` saves the
-highest valid typed outcome without relaxing any certificate gate.
+The `balanced` profile uses CUDA when available. Use `--device cpu` only for
+small smoke tests. The normal command-line surface is intentionally limited to:
 
-Long raw-lambda searches can use bounded staged recovery, deterministic work
-accounting, and exact resume:
+```text
+--input-file  --outdir  --profile  --device  --failure-policy
+--checkpoint  --resume  --config
+```
+
+Expert numerical controls belong in a versioned JSON file:
+
+```json
+{
+  "schema_version": 1,
+  "fit": {
+    "computation_profile": "balanced",
+    "device": "cuda",
+    "dtype": "float32",
+    "max_tumor_edge_pass_equivalents": 200000
+  },
+  "run": {
+    "failure_policy": "best-effort",
+    "unsupported_policy": "error"
+  }
+}
+```
+
+Run it with `--config fit.json`. Explicit `--profile`, `--device`, and
+`--failure-policy` arguments override those JSON values. Unknown sections,
+fields, duplicate keys, and non-finite numbers fail closed.
+
+The default `best-effort` failure policy saves the highest valid typed outcome
+without weakening the raw KKT gate. Complete-graph work remains bounded by the
+resolved profile or expert configuration. A resource stop is unresolved, not
+convergence.
+
+## Checkpoint and resume
 
 ```bash
 clipp2 fit \
   --input-file examples/exampleTumor1.tsv \
   --outdir exampleTumor1_results \
-  --max-tumor-edge-pass-equivalents 200000 \
-  --checkpoint-every-lambda
+  --checkpoint exampleTumor1.checkpoint
 
-# Resume later with the same input, resolved options, runtime, and source tree.
 clipp2 fit \
   --input-file examples/exampleTumor1.tsv \
   --outdir exampleTumor1_results \
-  --max-tumor-edge-pass-equivalents 200000 \
-  --resume-checkpoint \
-  exampleTumor1_results/.clipp2-checkpoints/exampleTumor1.npz
+  --resume exampleTumor1.checkpoint
 ```
 
-`--recovery-policy staged` is the default. It detects recovery-only plateaus
-and probes terminal certificate refinement before spending the remaining
-certificate budget; `legacy` is retained as a compatibility spelling for the
-unstaged v0.3.5 ablation. It disables stagnation-based early termination but
-retains the v0.3.5 recovery budgets, certificate implementation, and work
-accounting; it does not reproduce commit `23fc222`, which must be run directly
-for historical performance attribution. Neither policy changes the
-complete-graph objective or the fixed `5 * tol` admission gate. The tumor work
-cap is shared across starts, retries, fallbacks, and polishing. Exact realized
-graph work is reported as integer edge-region visits; the integer edge-pass
-budget charges every full traversal once and conservatively rounds each partial
-workset traversal up to one pass. Work stops at safe boundaries with at most 10
-edge-pass equivalents reserved for the mandatory terminal audit. The independent
-`--max-partition-refit-objective-evaluations` and
-`--max-direct-partition-candidates` controls bound post-guide scalar work and
-the direct pool at candidate boundaries; a partial pool is explicitly
-unresolved. The complete mandatory guide is never truncated because it can
-define the graph and objective. Total, mandatory-guide, and post-guide scalar
-work are reported separately in analysis-summary schema 8. Certified
-refinement also stops after `--lambda-no-progress-patience` consecutive
-proposals add no partition, score, KKT, or event-width information. None of
-these resource stops is convergence. Checkpoints use an incremental,
-content-addressed directory (the default path retains its historical `.npz`
-suffix), save after both lambda observations and direct candidates, and only
-atomically replace `manifest.json` after completed work.
-Resume fails closed unless tumor, objective, graph, contract, full
-configuration, warm-start policy, numerical environment and hardware,
-software, and source-tree identities match exactly. Use `--checkpoint-file`
-with `--checkpoint-every-lambda` to override the hidden default path. Legacy
-monolithic NPZ checkpoint files require a fresh run at a new path.
+Checkpoints use an explicit search schema, content-addressed NumPy arrays,
+file locking, generation compare-and-swap, and atomic manifest replacement.
+Resume verifies input, objective, graph, configuration, numerical environment,
+software, and source-tree identity. Pickle is never used.
 
 ## Outputs
 
-Saved analyses use the tumor id as a prefix (the input file stem unless a
-`##tumor_id` metadata line overrides it). Every saved primary, conditional, or
-diagnostic outcome writes these status-rich files:
+Every primary, conditional, or diagnostic analysis writes exactly four files:
 
-| File | One row per | Main fields |
+| File | One row per | Purpose |
 | --- | --- | --- |
-| `{tumor_id}_analysis_status.json` | analysis | tier, certification, selection, mask, and failure provenance |
-| `{tumor_id}_region_status.tsv` | input region | estimate tier, data-mask counts, identification, and diagnostics |
-| `{tumor_id}_raw_attempts.tsv` | raw solver start | objective, KKT components, budgets, realized work, dtypes, and hashes |
-| `{tumor_id}_cluster_region_estimates.tsv` | selected cluster × region | best-available CCF and argmin-identification fields |
-| `{tumor_id}_mutation_region_estimates.tsv` | mutation × region | retained counts, support/inclusion masks, CCF tier, and eligible posterior summaries |
+| `{tumor_id}_analysis.json` | analysis | tier, identities, selection, work, masks, and failure provenance |
+| `{tumor_id}_clusters.tsv` | selected cluster x region | CCF estimates, intervals, ordering, and support |
+| `{tumor_id}_mutations.tsv` | mutation x region | observations, CN, CCF tier, intervals, and posterior summaries |
+| `{tumor_id}_attempts.tsv` | raw solver attempt | objectives, KKT diagnostics, limits, work, dtypes, and identities |
 
-Only a primary result (`primary_estimator_available=true`) writes the historical
-compatibility files `mutation_clusters.tsv`, `cluster_centers.tsv`, and
-`mutation_region_multiplicity.tsv`. A conditional fallback instead writes
-`secondary_cluster_centers.tsv` and
-`secondary_mutation_region_estimates.tsv`; a diagnostic-only result writes no
-point-estimate compatibility file.
+`clusters.tsv` is header-only when no partition point claim exists;
+`mutations.tsv` always retains every input mutation-region coordinate.
 
-Every available point estimate also reports `ccf_ordered_cluster_label`, a
-zero-based presentation label: cluster 0 has the smallest root-mean-square
-distance from CCF 1 across its statistically identified regions, and the
-remaining clusters follow in increasing distance. Exact ties use the immutable
-`cluster_label`; clusters with no identified region sort last. This derived
-ordering does not change `cluster_label`, selection, scores, or CCFs, and
-cluster 0 is not a clonal-identifiability claim. Cluster-level tables also
-report `ccf_distance_to_one` and the identified-region count used for it.
+`cluster_label` is the immutable selected partition. The derived
+`ccf_ordered_cluster_label` is presentation-only: cluster 0 is closest to CCF
+1 across statistically identified regions, and the rest follow by increasing
+distance. This ordering never changes selection, scores, labels, or refitted
+CCFs and is not a clonal-identifiability claim.
+
+## Scientific boundary
+
+CliPP2 never forces a clonal anchor or CCF-one mutation. The graph, weights,
+row-group fusion norm, observed-data likelihood, box, and lambda define the raw
+estimator. Fixed-partition refits are secondary, and positive-lambda raw
+admission always requires the full-original-graph float64 terminal KKT audit at
+the unchanged `5 * tol` threshold.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the v0.4 breaking surface.

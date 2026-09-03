@@ -7,12 +7,13 @@ from typing import Sequence
 
 import numpy as np
 
-from .data import PathLikelihoodSpec, TumorData
+from .data import EmissionPaths
 
 
 PATH_LIKELIHOOD_MODEL_ID = "clipp2_single_switch_path_mixture_v1"
 PATH_LIKELIHOOD_MODEL_VERSION = "1"
 PATH_CANDIDATE_GENERATOR_VERSION = "phased_unphased_two_state_positive_dosages_v1"
+MAJOR_LOW_MODEL_ID = "legacy_major_low_as_paths_v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,14 +181,14 @@ def compile_single_switch_paths(
     )
 
 
-def build_path_likelihood(
+def build_emission_paths(
     compiled_units: Sequence[Sequence[CompiledPathSet]],
     *,
     model_id: str,
     model_version: str,
     candidate_generator_version: str = PATH_CANDIDATE_GENERATOR_VERSION,
     prior_mode: str,
-) -> PathLikelihoodSpec:
+) -> EmissionPaths:
     """Pad compiled unit paths into one immutable likelihood specification."""
 
     num_mutations = len(compiled_units)
@@ -219,7 +220,7 @@ def build_path_likelihood(
                     compiled.log_prior[path_index]
                 )
                 valid[mutation_index, sample_index, path_index] = True
-    return PathLikelihoodSpec(
+    return EmissionPaths(
         model_id=model_id,
         model_version=model_version,
         candidate_generator_version=candidate_generator_version,
@@ -232,31 +233,38 @@ def build_path_likelihood(
     )
 
 
-def initialize_path_marginal_phi(
-    data: TumorData,
-    *,
-    eps: float,
-) -> np.ndarray:
-    """Return the canonical exact scalar minimizer of each path-marginal unit."""
+def build_major_low_emission_paths(
+    major_cn: np.ndarray,
+    minor_cn: np.ndarray,
+) -> EmissionPaths:
+    """Normalize the historical major/low mixture into ``EmissionPaths``."""
 
-    if data.path_likelihood is None:
-        raise ValueError("TumorData must contain a path likelihood.")
-    epsilon = float(eps)
-    if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
-        raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
-    data.phi_init = np.full_like(data.alt_counts, 0.5, dtype=np.float64)
-
-    # Delayed import avoids an io/core import cycle during package startup.
-    from ..core.fusion.starts import compute_scalar_mutation_region_wells
-
-    primary, _secondary, _valid_secondary = compute_scalar_mutation_region_wells(
-        data,
-        major_prior=0.5,
-        eps=epsilon,
-        tol=1e-10,
-        max_iter=256,
+    major = np.asarray(major_cn, dtype=np.float64)
+    minor = np.asarray(minor_cn, dtype=np.float64)
+    if major.shape != minor.shape or major.ndim != 2:
+        raise ValueError("major_cn and minor_cn must have one 2-D shape.")
+    keep_minor = (minor >= 1.0) & ~np.isclose(minor, major)
+    low = np.where(keep_minor, minor, 1.0)
+    ambiguous = low < major
+    first_copy = np.stack((np.where(ambiguous, low, major), major), axis=-1)
+    valid = np.stack((np.ones_like(ambiguous), ambiguous), axis=-1)
+    log_prior = np.where(valid, -np.log(2.0), -np.inf)
+    log_prior[..., 0] = np.where(ambiguous, -np.log(2.0), 0.0)
+    major_indicator = np.stack((~ambiguous, np.ones_like(ambiguous)), axis=-1)
+    return EmissionPaths(
+        model_id=MAJOR_LOW_MODEL_ID,
+        model_version="2",
+        candidate_generator_version="major_low_positive_copy_v2",
+        prior_mode="runtime_major_indicator_prior_v1",
+        first_copy=first_copy,
+        second_copy=first_copy,
+        switch_fraction=np.zeros_like(first_copy),
+        log_prior=log_prior,
+        valid=valid,
+        major_indicator=major_indicator & valid,
+        major_prior_weighted=True,
+        constrain_probability_box=True,
     )
-    return np.clip(np.asarray(primary, dtype=np.float64), epsilon, 1.0)
 
 
 __all__ = [
@@ -265,9 +273,9 @@ __all__ = [
     "PATH_CANDIDATE_GENERATOR_VERSION",
     "PATH_LIKELIHOOD_MODEL_ID",
     "PATH_LIKELIHOOD_MODEL_VERSION",
-    "build_path_likelihood",
+    "build_emission_paths",
+    "build_major_low_emission_paths",
     "compile_single_switch_paths",
     "dominant_copy_number_state",
-    "initialize_path_marginal_phi",
     "path_prior_mode",
 ]

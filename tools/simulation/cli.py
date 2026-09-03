@@ -9,7 +9,6 @@ from .config import (
     CopyNumberEvolutionConfig,
     TumorSimulationConfig,
 )
-from .generator import simulate_tumor
 
 
 def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
@@ -126,6 +125,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    from .generator import simulate_tumor
+
     parser = build_parser()
     args = parser.parse_args(argv)
     written_dir = simulate_tumor(tumor_simulation_config_from_args(args))

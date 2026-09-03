@@ -12,17 +12,10 @@ from ..core.fusion.types import (
     DenseEdgeCertificate,
     PairwiseFusionGraph,
 )
-from .config import (
-    LIKELIHOOD_PARTITION_K_MAX,
-)
 from .types import FusionPartition
 
 
-def _partition_candidate_requested_k(candidate: PartitionCandidate) -> int:
-    return int(candidate.K if candidate.requested_k is None else candidate.requested_k)
-
-
-def _best_partition_candidate(
+def best_partition_candidate(
     candidates: list[PartitionCandidate],
 ) -> PartitionCandidate | None:
     finite_candidates = [
@@ -44,86 +37,6 @@ def _best_partition_candidate(
         ),
     )
 
-
-def _likelihood_partition_refinement_k_grid(
-    candidates: list[PartitionCandidate],
-    sparse_grid: list[int],
-    *,
-    num_mutations: int,
-) -> tuple[list[int], str]:
-    if not candidates or not sparse_grid:
-        return [], "none"
-    best = _best_partition_candidate(candidates)
-    if best is None:
-        return [], "none"
-
-    k_cap = min(int(LIKELIHOOD_PARTITION_K_MAX), int(num_mutations))
-    grid = sorted({int(k) for k in sparse_grid if 1 <= int(k) <= k_cap})
-    if not grid:
-        return [], "none"
-
-    requested_k = int(np.clip(_partition_candidate_requested_k(best), 1, k_cap))
-    effective_k = int(np.clip(int(best.K), 1, k_cap))
-    focus_k = requested_k if requested_k in grid else effective_k
-    if focus_k not in grid:
-        focus_k = min(grid, key=lambda value: abs(int(value) - int(effective_k)))
-    focus_idx = grid.index(int(focus_k))
-
-    left_anchor = grid[focus_idx - 1] if focus_idx > 0 else int(focus_k)
-    right_anchor = grid[focus_idx + 1] if focus_idx + 1 < len(grid) else int(focus_k)
-    left_gap = int(focus_k) - int(left_anchor)
-    right_gap = int(right_anchor) - int(focus_k)
-    hits_k_cap = bool(k_cap == int(LIKELIHOOD_PARTITION_K_MAX) and effective_k >= k_cap)
-    in_sparse_interval = bool(left_gap > 1 or right_gap > 1)
-
-    if hits_k_cap and focus_idx > 0:
-        left_anchor = grid[focus_idx - 1]
-        right_anchor = int(focus_k)
-        reason = "k_cap"
-    elif in_sparse_interval:
-        reason = "coarse_interval"
-    else:
-        return [], "none"
-
-    refine_grid = [
-        int(k)
-        for k in range(int(left_anchor) + 1, int(right_anchor))
-        if int(k) not in grid and 1 <= int(k) <= k_cap
-    ]
-    if not refine_grid:
-        return [], "none"
-    return refine_grid, reason
-
-
-def _deduplicate_partition_candidates(
-    candidates: list[PartitionCandidate],
-) -> list[PartitionCandidate]:
-    best_by_signature: dict[str, PartitionCandidate] = {}
-    for candidate in candidates:
-        signature = _partition_signature(candidate.labels)
-        current = best_by_signature.get(signature)
-        if current is None or (
-            float(candidate.bic),
-            float(candidate.fit_loss),
-            int(candidate.K),
-            str(candidate.source),
-        ) < (
-            float(current.bic),
-            float(current.fit_loss),
-            int(current.K),
-            str(current.source),
-        ):
-            best_by_signature[signature] = candidate
-    return sorted(
-        best_by_signature.values(),
-        key=lambda candidate: (
-            float(candidate.bic),
-            int(candidate.K),
-            str(candidate.source),
-        ),
-    )
-
-
 def _partition_blocks(labels: np.ndarray) -> tuple[tuple[int, ...], ...]:
     canonical = _canonical_partition_labels(labels)
     if canonical.size == 0:
@@ -135,7 +48,7 @@ def _partition_blocks(labels: np.ndarray) -> tuple[tuple[int, ...], ...]:
     return tuple(sorted(blocks))
 
 
-def _partition_signature(
+def partition_signature(
     labels: np.ndarray,
     mutation_ids: tuple[str, ...] | list[str] | None = None,
 ) -> str:
@@ -334,11 +247,7 @@ def extract_certified_fusion_partition(
         certificate_graph_hash_matches = bool(
             expected_graph_hash and str(certificate.graph_hash) == expected_graph_hash
         )
-    certified = bool(
-        within_ok
-        and not cross_close
-        and certificate_graph_hash_matches
-    )
+    certified = bool(within_ok and not cross_close and certificate_graph_hash_matches)
     if not certificate_graph_hash_matches:
         failure_reason = (
             "compressed_certificate_graph_hash_mismatch"
@@ -353,99 +262,9 @@ def extract_certified_fusion_partition(
         failure_reason = "none"
     return FusionPartition(
         labels=labels.astype(np.int64, copy=False),
-        signature=_partition_signature(labels, mutation_ids),
+        signature=partition_signature(labels, mutation_ids),
         certified=certified,
         source="tolerance_defined_primal",
-        certification_failure_reason=str(failure_reason),
-        mutation_ids=() if mutation_ids is None else tuple(mutation_ids),
-    )
-
-
-def extract_connected_component_partition(
-    fit: RawFit,
-    *,
-    graph: PairwiseFusionGraph,
-    tolerance: float,
-    mutation_ids: tuple[str, ...] | list[str] | None = None,
-) -> FusionPartition:
-    """Extract the declared legacy threshold-connectivity raw summary.
-
-    This is a partition summary of the certified raw matrix, not a replacement
-    raw optimizer. It is available only through the explicit legacy contract
-    because transitive chains may have diameters larger than ``tolerance``.
-    """
-
-    tol = float(tolerance)
-    if not np.isfinite(tol) or tol <= 0.0:
-        raise ValueError("Partition tolerance must be positive and finite.")
-    phi = np.asarray(fit.phi, dtype=np.float64)
-    if phi.ndim != 2:
-        raise ValueError("fit.phi must be a mutation-by-region matrix.")
-    num_mutations = int(phi.shape[0])
-    expected_edges = num_mutations * max(num_mutations - 1, 0) // 2
-    edge_u = np.asarray(graph.edge_u, dtype=np.int64)
-    edge_v = np.asarray(graph.edge_v, dtype=np.int64)
-    complete_graph = bool(
-        edge_u.size == expected_edges
-        and edge_v.size == expected_edges
-        and int(graph.degree_bound) == max(num_mutations - 1, 0)
-    )
-    parent = np.arange(num_mutations, dtype=np.int64)
-    rank = np.zeros(num_mutations, dtype=np.int8)
-
-    def find(value: int) -> int:
-        root = int(value)
-        while int(parent[root]) != root:
-            parent[root] = parent[int(parent[root])]
-            root = int(parent[root])
-        return root
-
-    def union(left: int, right: int) -> None:
-        left_root = find(left)
-        right_root = find(right)
-        if left_root == right_root:
-            return
-        if rank[left_root] < rank[right_root]:
-            left_root, right_root = right_root, left_root
-        parent[right_root] = left_root
-        if rank[left_root] == rank[right_root]:
-            rank[left_root] += 1
-
-    for start in range(0, int(edge_u.size), 1_000_000):
-        stop = min(start + 1_000_000, int(edge_u.size))
-        left = edge_u[start:stop]
-        right = edge_v[start:stop]
-        distances = np.linalg.norm(phi[left] - phi[right], axis=1)
-        for left_value, right_value in zip(
-            left[distances <= tol], right[distances <= tol], strict=True
-        ):
-            union(int(left_value), int(right_value))
-    labels = _canonical_partition_labels(
-        np.asarray([find(index) for index in range(num_mutations)], dtype=np.int64)
-    )
-    state = fit.state
-    certificate = None if state is None else state.certificate
-    certificate_graph_hash_matches = True
-    if isinstance(certificate, (CompressedEdgeCertificate, DenseEdgeCertificate)):
-        expected_graph_hash = str(fit.provenance.original_graph_hash)
-        certificate_graph_hash_matches = bool(
-            expected_graph_hash and str(certificate.graph_hash) == expected_graph_hash
-        )
-    certified = bool(complete_graph and certificate_graph_hash_matches)
-    failure_reason = (
-        "none"
-        if certified
-        else (
-            "legacy_connected_component_requires_complete_graph"
-            if not complete_graph
-            else "raw_certificate_graph_hash_mismatch"
-        )
-    )
-    return FusionPartition(
-        labels=labels,
-        signature=_partition_signature(labels, mutation_ids),
-        certified=certified,
-        source="legacy_connected_components",
         certification_failure_reason=str(failure_reason),
         mutation_ids=() if mutation_ids is None else tuple(mutation_ids),
     )

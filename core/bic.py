@@ -10,22 +10,21 @@ BIC arithmetic in one place avoids the correctness-drift risk of re-deriving
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import fsum, lgamma
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
 from ..io.data import TumorData
+
+if TYPE_CHECKING:
+    from .scalar import PartitionFit
 
 
 @dataclass(frozen=True, slots=True)
 class SelectionScore:
     """Immutable value returned by the fixed-partition score evaluators."""
 
-    name: Literal[
-        "fixed_partition_bic",
-        "fixed_partition_dirichlet_score",
-    ]
+    name: Literal["fixed_partition_bic"]
     value: float
     loglik: float
     penalty: float
@@ -33,14 +32,44 @@ class SelectionScore:
     n_eff: int
     partition_signature: str
     numerical_uncertainty: float = 0.0
-    assignment_log_evidence: float = 0.0
-    assignment_code_weight: float = 0.0
-    assignment_dirichlet_alpha: float = 1.0
-    assignment_arithmetic_uncertainty: float = 0.0
 
-    @property
-    def assignment_penalty(self) -> float:
-        return float(-2.0 * self.assignment_code_weight * self.assignment_log_evidence)
+    def validate_against(self, refit: "PartitionFit") -> None:
+        """Validate this score against its authoritative fixed-label refit."""
+
+        if self.partition_signature != refit.partition_signature:
+            raise AssertionError("Selection score does not match raw partition.")
+        if self.name != "fixed_partition_bic":
+            raise AssertionError("Production partition selection requires BIC.")
+        tolerance = 1e-10 * (1.0 + abs(float(self.value)))
+        if not np.isclose(
+            float(self.loglik),
+            float(refit.loglik),
+            rtol=0.0,
+            atol=tolerance,
+        ):
+            raise AssertionError("Score likelihood differs from stored refit likelihood.")
+        expected_penalty, expected_value = _bic_components(
+            float(refit.loglik),
+            float(self.degrees_of_freedom),
+            float(self.n_eff),
+        )
+        if not np.isclose(
+            float(self.penalty), expected_penalty, rtol=0.0, atol=tolerance
+        ):
+            raise AssertionError("Stored selection penalty is not reconstructible.")
+        if not np.isclose(
+            float(self.value), expected_value, rtol=0.0, atol=tolerance
+        ):
+            raise AssertionError("Stored score is not reconstructible.")
+        minimum_uncertainty = 2.0 * max(float(refit.global_optimality_gap), 0.0)
+        if (
+            refit.global_optimum_certified
+            and float(self.numerical_uncertainty) + tolerance < minimum_uncertainty
+        ):
+            raise AssertionError(
+                "Score uncertainty does not cover the refit certificate gap."
+            )
+
 
 def _observed_positive_depth_mask(data: TumorData) -> np.ndarray:
     """Boolean (M, S) mask of mutation_regions that contribute to the likelihood.
@@ -50,26 +79,11 @@ def _observed_positive_depth_mask(data: TumorData) -> np.ndarray:
     by the partition refit numerator so the two never disagree.
     """
     mask = np.asarray(data.total_counts, dtype=np.float64) > 0.0
-    inclusion_method = getattr(data, "objective_inclusion_mask", None)
-    likelihood_included = (
-        inclusion_method()
-        if callable(inclusion_method)
-        else getattr(data, "likelihood_included", None)
-    )
-    if likelihood_included is None:
-        likelihood_included = getattr(data, "count_observed", None)
-    if likelihood_included is not None:
-        mask = mask & np.asarray(likelihood_included, dtype=bool)
-    return mask
+    return mask & np.asarray(data.objective_inclusion_mask(), dtype=bool)
 
 
 def effective_bic_mutation_region_count(data: TumorData) -> int:
     return max(int(np.sum(_observed_positive_depth_mask(data))), 1)
-
-
-def effective_bic_depth_count(data: TumorData) -> float:
-    depth = np.asarray(data.total_counts, dtype=np.float64)
-    return float(max(float(np.sum(depth[_observed_positive_depth_mask(data)])), 1.0))
 
 
 def bic_degrees_of_freedom(num_clusters: int, data: TumorData) -> int:
@@ -81,10 +95,18 @@ def bic_degrees_of_freedom(num_clusters: int, data: TumorData) -> int:
 def compute_bic_with_df(
     loglik: float, degrees_of_freedom: float, num_observations: float
 ) -> float:
-    return float(
-        -2.0 * float(loglik)
-        + float(degrees_of_freedom) * np.log(max(float(num_observations), 1.0))
+    return _bic_components(loglik, degrees_of_freedom, num_observations)[1]
+
+
+def _bic_components(
+    loglik: float,
+    degrees_of_freedom: float,
+    num_observations: float,
+) -> tuple[float, float]:
+    penalty = float(
+        float(degrees_of_freedom) * np.log(max(float(num_observations), 1.0))
     )
+    return penalty, float(-2.0 * float(loglik) + penalty)
 
 
 def compute_classic_bic(loglik: float, num_clusters: int, data: TumorData) -> float:
@@ -110,8 +132,7 @@ def fixed_partition_bic(
         if labels_array.size != int(data.num_mutations):
             raise ValueError("BIC labels must contain one value per mutation.")
     n_eff = effective_bic_mutation_region_count(data)
-    penalty = float(degrees_of_freedom * np.log(max(int(n_eff), 1)))
-    value = float(-2.0 * float(loglik) + penalty)
+    penalty, value = _bic_components(loglik, degrees_of_freedom, n_eff)
     likelihood_uncertainty = max(float(loglik_uncertainty), 0.0)
     arithmetic_uncertainty = 16.0 * np.finfo(np.float64).eps * (1.0 + abs(value))
     return SelectionScore(
@@ -128,222 +149,11 @@ def fixed_partition_bic(
     )
 
 
-def cluster_sizes_from_labels(labels: np.ndarray) -> np.ndarray:
-    """Return occupied-cluster sizes, invariant to the numeric label names."""
-    values = np.asarray(labels)
-    if values.ndim != 1:
-        raise ValueError("Partition labels must be a one-dimensional array.")
-    if values.size == 0:
-        raise ValueError("A partition must contain at least one mutation label.")
-    if not np.issubdtype(values.dtype, np.integer):
-        numeric = np.asarray(values, dtype=np.float64)
-        if not np.all(np.isfinite(numeric)) or not np.all(numeric == np.round(numeric)):
-            raise ValueError("Partition labels must be finite integers.")
-        values = numeric.astype(np.int64)
-    _, counts = np.unique(values, return_counts=True)
-    return counts.astype(np.int64, copy=False)
-
-
-def _validated_cluster_sizes(cluster_sizes: np.ndarray) -> np.ndarray:
-    raw = np.asarray(cluster_sizes)
-    if raw.ndim != 1 or raw.size == 0:
-        raise ValueError("cluster_sizes must be a non-empty one-dimensional array.")
-    try:
-        values = np.asarray(raw, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "cluster_sizes must contain finite positive integers."
-        ) from exc
-    if (
-        not np.all(np.isfinite(values))
-        or np.any(values <= 0.0)
-        or not np.all(values == np.round(values))
-    ):
-        raise ValueError("cluster_sizes must contain finite positive integers.")
-    return values.astype(np.int64)
-
-
-# Preserve the production allocation-code weight selected before the clonal
-# anchor was removed.  Removing a fixed CCF-one block changes the symmetry and
-# center degrees of freedom; it must not silently retune the independent
-# assignment-code contribution.
-PARTITION_DIRICHLET_SCORE_WEIGHT = 0.7
-PARTITION_DIRICHLET_ALPHA = 1.0
-
-
-def _dirichlet_exact_partition_log_mass_and_uncertainty(
-    cluster_sizes: np.ndarray,
-    *,
-    alpha: float,
-) -> tuple[float, float]:
-    """Return exact-partition log mass and a conservative arithmetic bound."""
-
-    sizes = _validated_cluster_sizes(cluster_sizes)
-    alpha = float(alpha)
-    if not np.isfinite(alpha) or alpha <= 0.0:
-        raise ValueError("Dirichlet alpha must be positive and finite.")
-    num_clusters = int(sizes.size)
-    num_mutations = int(np.sum(sizes))
-    terms = [
-        lgamma(float(num_clusters) * alpha),
-        -lgamma(float(num_mutations) + float(num_clusters) * alpha),
-    ]
-    for size in sizes:
-        terms.extend((lgamma(float(size) + alpha), -lgamma(alpha)))
-    # Every block is exchangeable in the unanchored model, so integrate over
-    # all K! equivalent component labelings.
-    terms.append(lgamma(float(num_clusters) + 1.0))
-    value = float(fsum(terms))
-    magnitude = float(fsum(abs(term) for term in terms))
-    arithmetic_uncertainty = float(
-        32.0 * np.finfo(np.float64).eps * float(len(terms) + 1) * (1.0 + magnitude)
-    )
-    return value, arithmetic_uncertainty
-
-
-def compute_dirichlet_exact_partition_log_mass(
-    cluster_sizes: np.ndarray,
-    *,
-    alpha: float = PARTITION_DIRICHLET_ALPHA,
-) -> float:
-    """Integrated log mass of one exact occupied set partition.
-
-    A symmetric ``Dirichlet(alpha, ..., alpha)`` prior is placed on the mixing
-    proportions of the ``K`` occupied blocks. Integrating those proportions
-    gives the probability of a particular labeled allocation. The result is
-    then summed over all ``K!`` equivalent block labelings.
-
-    With ``alpha=1`` and no distinguished block this is
-
-    ``log(K! (K-1)! prod_k n_k! / (n+K-1)!)``.
-
-    This is an exact-allocation prior mass, not a posterior classification-
-    entropy term. Consequently, for fixed ``n`` and ``K`` it assigns more mass
-    to imbalanced partitions than to balanced partitions.
-    """
-
-    value, _ = _dirichlet_exact_partition_log_mass_and_uncertainty(
-        cluster_sizes,
-        alpha=float(alpha),
-    )
-    return value
-
-
-def fixed_partition_dirichlet_score(
-    *,
-    loglik: float,
-    num_clusters: int,
-    data: TumorData,
-    partition_signature: str,
-    labels: np.ndarray,
-    loglik_uncertainty: float = 0.0,
-    alpha: float = PARTITION_DIRICHLET_ALPHA,
-    code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
-) -> SelectionScore:
-    """Return BIC plus a Dirichlet-integrated exact-partition deviance.
-
-    The likelihood and center degrees of freedom are exactly those of
-    :func:`fixed_partition_bic`. The additional term is invariant to arbitrary
-    names of exchangeable blocks and is scaled by ``code_weight`` (0.7 by
-    default). All K blocks are exchangeable. This is
-    deliberately named a Dirichlet exact-partition score rather than
-    posterior-entropy ICL.
-    """
-
-    labels_array = np.asarray(labels, dtype=np.int64).reshape(-1)
-    sizes = cluster_sizes_from_labels(labels_array)
-    if int(sizes.size) != int(num_clusters):
-        raise ValueError(
-            "Dirichlet-score cluster count does not match the partition labels."
-        )
-    if int(np.sum(sizes)) != int(data.num_mutations):
-        raise ValueError("Dirichlet-score labels must contain one value per mutation.")
-    alpha = float(alpha)
-    weight = float(code_weight)
-    if not np.isfinite(weight) or weight < 0.0:
-        raise ValueError("code_weight must be nonnegative and finite.")
-    base = fixed_partition_bic(
-        loglik=loglik,
-        num_clusters=num_clusters,
-        data=data,
-        partition_signature=partition_signature,
-        labels=labels_array,
-        loglik_uncertainty=loglik_uncertainty,
-    )
-    log_evidence, log_evidence_uncertainty = (
-        _dirichlet_exact_partition_log_mass_and_uncertainty(
-            sizes,
-            alpha=alpha,
-        )
-    )
-    assignment_penalty = float(-2.0 * weight * log_evidence)
-    assignment_arithmetic_uncertainty = float(
-        2.0 * abs(weight) * log_evidence_uncertainty
-    )
-    score_value = float(base.value + assignment_penalty)
-    addition_uncertainty = float(
-        16.0
-        * np.finfo(np.float64).eps
-        * (1.0 + abs(float(base.value)) + abs(assignment_penalty))
-    )
-    return SelectionScore(
-        name="fixed_partition_dirichlet_score",
-        value=score_value,
-        loglik=float(base.loglik),
-        penalty=float(base.penalty + assignment_penalty),
-        degrees_of_freedom=int(base.degrees_of_freedom),
-        n_eff=int(base.n_eff),
-        partition_signature=str(base.partition_signature),
-        numerical_uncertainty=float(
-            base.numerical_uncertainty
-            + assignment_arithmetic_uncertainty
-            + addition_uncertainty
-        ),
-        assignment_log_evidence=float(log_evidence),
-        assignment_code_weight=weight,
-        assignment_dirichlet_alpha=alpha,
-        assignment_arithmetic_uncertainty=assignment_arithmetic_uncertainty,
-    )
-
-
-def compute_partition_dirichlet_score(
-    loglik: float,
-    cluster_sizes: np.ndarray,
-    data: TumorData,
-    *,
-    alpha: float = PARTITION_DIRICHLET_ALPHA,
-    code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
-) -> float:
-    """Unanchored center BIC plus exact-partition Dirichlet deviance."""
-    sizes = _validated_cluster_sizes(cluster_sizes)
-    if int(np.sum(sizes)) != int(data.num_mutations):
-        raise ValueError(
-            "Partition cluster sizes must sum to the number of tumor mutations "
-            f"({int(data.num_mutations)})."
-        )
-    weight = float(code_weight)
-    if not np.isfinite(weight) or weight < 0.0:
-        raise ValueError("code_weight must be nonnegative and finite.")
-    classic_bic = compute_classic_bic(float(loglik), int(sizes.size), data)
-    log_partition_evidence = compute_dirichlet_exact_partition_log_mass(
-        sizes,
-        alpha=float(alpha),
-    )
-    return float(classic_bic - 2.0 * weight * log_partition_evidence)
-
-
 __all__ = [
     "bic_degrees_of_freedom",
-    "cluster_sizes_from_labels",
     "compute_bic_with_df",
     "compute_classic_bic",
-    "compute_dirichlet_exact_partition_log_mass",
-    "compute_partition_dirichlet_score",
     "effective_bic_mutation_region_count",
-    "effective_bic_depth_count",
     "fixed_partition_bic",
-    "fixed_partition_dirichlet_score",
-    "PARTITION_DIRICHLET_ALPHA",
-    "PARTITION_DIRICHLET_SCORE_WEIGHT",
     "SelectionScore",
 ]

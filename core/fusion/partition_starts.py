@@ -7,31 +7,32 @@ from collections.abc import Callable, Sequence
 import numpy as np
 import torch
 
-from ...io.data import TumorData
-from ..objective import ObservedModel, compile_observed_model, observed_terms_numpy
+from ...io.data import TumorData, tumor_data_fingerprint
+from ..objective import (
+    ObservedModel,
+    TorchObservedModel,
+    compile_observed_model,
+    model_to_torch,
+    observed_box_fingerprint,
+    observed_terms_numpy,
+)
 from ..bic import (
-    PARTITION_DIRICHLET_SCORE_WEIGHT,
     bic_degrees_of_freedom,
-    cluster_sizes_from_labels,
     compute_bic_with_df,
-    compute_partition_dirichlet_score,
     effective_bic_mutation_region_count,
 )
 from ..scalar import (
-    PartitionRefitResult,
+    PartitionFit,
     canonical_partition_labels as _canonical_labels,
     partition_constrained_observed_refit,
 )
 from .torch_backend import (
-    TorchTumorData,
     as_runtime_tensor,
-    copy_torch_tumor_data,
     mutation_region_loss_grid_torch,
     mutation_region_terms_torch,
     resolve_runtime,
-    to_torch_tumor_data,
 )
-from .types import TorchRuntime, WorkCounters
+from .types import SolverContext, TorchRuntime, WorkCounters, WorkLedger
 
 
 # Bound each temporary used to initialize the dense Ward cost matrix.  The
@@ -50,7 +51,6 @@ class PartitionCandidate:
     bic: float
     finite_candidate_found: bool = True
     requested_k: int | None = None
-    component_death_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -76,15 +76,6 @@ class PartitionCandidatePool:
 
     def __getitem__(self, index):
         return self.candidates[index]
-
-
-@dataclass(frozen=True)
-class PartitionRefinementResult:
-    labels: np.ndarray
-    refit: PartitionRefitResult
-    initial_k: int
-    final_k: int
-    component_death_count: int
 
 
 def compute_partition_bic(
@@ -118,18 +109,29 @@ def _resolve_partition_runtime(
     *,
     data: TumorData,
     exact_pilot: np.ndarray | torch.Tensor | object | None = None,
-    torch_data: TorchTumorData | None = None,
+    solver_context: SolverContext | None = None,
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
     major_prior: float = 0.5,
     eps: float = 1e-6,
-) -> tuple[TorchRuntime, TorchTumorData]:
-    if torch_data is not None:
+) -> tuple[TorchRuntime, ObservedModel, TorchObservedModel]:
+    if solver_context is not None:
+        if solver_context.data_fingerprint != tumor_data_fingerprint(data):
+            raise ValueError("SolverContext data fingerprint does not match TumorData.")
+        source_model = compile_observed_model(
+            data,
+            major_prior=float(major_prior),
+            eps=float(eps),
+        )
+        if source_model.fingerprint != solver_context.source_model.fingerprint:
+            raise ValueError("SolverContext observed model does not match TumorData.")
         runtime_device = (
-            torch.device(device) if device is not None else torch_data.alt.device
+            torch.device(device)
+            if device is not None
+            else solver_context.observed_model.alt.device
         )
         runtime_dtype = (
-            torch_data.alt.dtype
+            solver_context.observed_model.alt.dtype
             if dtype is None or isinstance(dtype, torch.dtype)
             else resolve_runtime(
                 str(runtime_device),
@@ -144,9 +146,12 @@ def _resolve_partition_runtime(
             device_name=_torch_device_name(runtime_device),
             dtype=runtime_dtype,
         )
-        return runtime, copy_torch_tumor_data(
-            torch_data, dtype=runtime.dtype, device=runtime.device
+        observed_model = (
+            solver_context.observed_model
+            if runtime == solver_context.runtime
+            else model_to_torch(source_model, runtime)
         )
+        return runtime, source_model, observed_model
 
     if torch.is_tensor(exact_pilot):
         runtime_device = (
@@ -177,12 +182,10 @@ def _resolve_partition_runtime(
                 device_name=runtime.device_name,
                 dtype=torch.float32,
             )
-    return runtime, to_torch_tumor_data(
-        data,
-        runtime,
-        major_prior=float(major_prior),
-        eps=float(eps),
+    source_model = compile_observed_model(
+        data, major_prior=float(major_prior), eps=float(eps)
     )
+    return runtime, source_model, model_to_torch(source_model, runtime)
 
 
 def _as_torch(
@@ -192,16 +195,14 @@ def _as_torch(
 
 
 def _mutation_region_loss_matrix_torch(
-    torch_data: TorchTumorData,
+    model: TorchObservedModel,
     beta: torch.Tensor,
     *,
-    major_prior: float,
     eps: float,
 ) -> torch.Tensor:
     return mutation_region_terms_torch(
-        torch_data,
+        model,
         beta,
-        major_prior=float(major_prior),
         eps=float(eps),
     ).loss
 
@@ -217,21 +218,21 @@ def observed_curvature_at_pilot_torch(
     min_step: float = 1e-4,
     curvature_floor: float = 1e-6,
     curvature_cap_quantile: float = 0.995,
-    torch_data: TorchTumorData | None = None,
+    solver_context: SolverContext | None = None,
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
 ) -> torch.Tensor:
-    runtime, torch_data = _resolve_partition_runtime(
+    runtime, _, observed_model = _resolve_partition_runtime(
         data=data,
         exact_pilot=exact_pilot,
-        torch_data=torch_data,
+        solver_context=solver_context,
         device=device,
         dtype=dtype,
         major_prior=major_prior,
         eps=eps,
     )
     phi0 = _as_torch(exact_pilot, runtime=runtime)
-    upper = torch_data.phi_upper
+    upper = observed_model.upper
     lower_value = float(eps)
     lower = torch.full_like(phi0, lower_value)
     x0 = torch.minimum(torch.maximum(phi0, lower), upper)
@@ -247,15 +248,9 @@ def observed_curvature_at_pilot_torch(
     h_right = right - x0
     valid = (h_left > 1e-12) & (h_right > 1e-12)
 
-    f_left = _mutation_region_loss_matrix_torch(
-        torch_data, left, major_prior=major_prior, eps=eps
-    )
-    f0 = _mutation_region_loss_matrix_torch(
-        torch_data, x0, major_prior=major_prior, eps=eps
-    )
-    f_right = _mutation_region_loss_matrix_torch(
-        torch_data, right, major_prior=major_prior, eps=eps
-    )
+    f_left = _mutation_region_loss_matrix_torch(observed_model, left, eps=eps)
+    f0 = _mutation_region_loss_matrix_torch(observed_model, x0, eps=eps)
+    f_right = _mutation_region_loss_matrix_torch(observed_model, right, eps=eps)
     denom = h_left * h_right * (h_left + h_right)
     curvature = (
         2.0 * (h_left * f_right - (h_left + h_right) * f0 + h_right * f_left) / denom
@@ -570,14 +565,14 @@ def _loss_to_centers_torch(
     major_prior: float,
     eps: float,
     infeasible_penalty: float = 1e100,
-    torch_data: TorchTumorData | None = None,
+    solver_context: SolverContext | None = None,
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
 ) -> torch.Tensor:
-    runtime, torch_data = _resolve_partition_runtime(
+    runtime, _, observed_model = _resolve_partition_runtime(
         data=data,
         exact_pilot=centers,
-        torch_data=torch_data,
+        solver_context=solver_context,
         device=device,
         dtype=dtype,
         major_prior=major_prior,
@@ -586,13 +581,13 @@ def _loss_to_centers_torch(
     centers_t = _as_torch(centers, runtime=runtime)
     beta = centers_t.T.unsqueeze(0).expand(int(data.num_mutations), -1, -1)
     loss = mutation_region_loss_grid_torch(
-        torch_data,
+        observed_model,
         beta,
         eps=float(eps),
     )
     cost = torch.sum(loss, dim=1)
     infeasible = torch.any(
-        beta > torch_data.phi_upper.unsqueeze(-1) + max(float(eps), 1e-8), dim=1
+        beta > observed_model.upper.unsqueeze(-1) + max(float(eps), 1e-8), dim=1
     )
     safe_penalty = min(
         float(infeasible_penalty), float(torch.finfo(cost.dtype).max) / 16.0
@@ -632,98 +627,6 @@ def _repair_empty_clusters(labels: np.ndarray, cost: np.ndarray) -> np.ndarray:
     return labels
 
 
-def _classification_leave_one_out_log_cluster_weights(
-    labels: np.ndarray,
-    *,
-    num_clusters: int,
-    alpha: float,
-) -> np.ndarray:
-    """Return each mutation's Dirichlet conditional log cluster weights.
-
-    For mutation ``i`` and block ``k``, the integrated allocation conditional is
-    ``(n[k, -i] + alpha) / (n - 1 + K * alpha)``. The mutation being reassigned
-    must therefore be removed from its current block count. Using the full count
-    would create a self-reinforcing update that is not a conditional move under
-    the Dirichlet-integrated exact-partition score.
-    """
-    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
-    num_clusters = int(num_clusters)
-    alpha = float(alpha)
-    if num_clusters <= 0:
-        raise ValueError("num_clusters must be positive.")
-    if not np.isfinite(alpha) or alpha <= 0.0:
-        raise ValueError("classification_weight_alpha must be positive and finite.")
-    if labels.size == 0:
-        raise ValueError("classification cluster weights require at least one label.")
-    if np.any(labels < 0) or np.any(labels >= num_clusters):
-        raise ValueError("labels must be in [0, num_clusters).")
-
-    counts = np.bincount(labels, minlength=num_clusters).astype(np.float64, copy=False)
-    leave_one_out_counts = np.broadcast_to(
-        counts[None, :], (labels.size, num_clusters)
-    ).copy()
-    leave_one_out_counts[np.arange(labels.size), labels] -= 1.0
-    probabilities = (leave_one_out_counts + alpha) / (
-        float(labels.size - 1) + alpha * float(num_clusters)
-    )
-    return np.log(probabilities)
-
-
-def _classification_assignment_cost(
-    count_cost: np.ndarray,
-    labels: np.ndarray,
-    *,
-    alpha: float,
-    code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
-) -> np.ndarray:
-    """Add the weighted negative log allocation term to assignment costs."""
-    count_cost = np.asarray(count_cost)
-    if count_cost.ndim != 2 or count_cost.shape[1] <= 0:
-        raise ValueError("count_cost must be a non-empty mutation-by-cluster matrix.")
-    if np.asarray(labels).reshape(-1).size != int(count_cost.shape[0]):
-        raise ValueError("labels must contain one entry per mutation cost row.")
-    log_weights = _classification_leave_one_out_log_cluster_weights(
-        labels,
-        num_clusters=int(count_cost.shape[1]),
-        alpha=float(alpha),
-    )
-    weight = _validated_classification_code_weight(code_weight)
-    return count_cost - weight * log_weights
-
-
-def _classification_refit_score(
-    data: TumorData,
-    labels: np.ndarray,
-    refit: PartitionRefitResult,
-    *,
-    alpha: float,
-    code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
-) -> float:
-    return compute_partition_dirichlet_score(
-        float(refit.loglik),
-        cluster_sizes_from_labels(labels),
-        data,
-        alpha=float(alpha),
-        code_weight=_validated_classification_code_weight(code_weight),
-    )
-
-
-def _classification_score_strictly_improves(
-    proposed_score: float,
-    current_score: float,
-) -> bool:
-    """Require a deterministic improvement before accepting a CEM update."""
-
-    proposed = float(proposed_score)
-    current = float(current_score)
-    if not np.isfinite(proposed):
-        return False
-    if not np.isfinite(current):
-        return True
-    tolerance = 64.0 * np.finfo(np.float64).eps * (1.0 + abs(proposed) + abs(current))
-    return bool(proposed < current - tolerance)
-
-
 def _validated_refinement_labels(
     data: TumorData,
     labels: np.ndarray,
@@ -736,19 +639,6 @@ def _validated_refinement_labels(
         )
     return _canonical_labels(labels)
 
-
-def _validate_classification_weight_alpha(alpha: float | None) -> None:
-    if alpha is not None and (not np.isfinite(float(alpha)) or float(alpha) <= 0.0):
-        raise ValueError("classification_weight_alpha must be positive and finite.")
-
-
-def _validated_classification_code_weight(code_weight: float) -> float:
-    weight = float(code_weight)
-    if not np.isfinite(weight) or weight < 0.0:
-        raise ValueError("classification_code_weight must be nonnegative and finite.")
-    return weight
-
-
 def refine_partition_likelihood_with_trace(
     data: TumorData,
     labels: np.ndarray,
@@ -759,25 +649,17 @@ def refine_partition_likelihood_with_trace(
     max_iter: int = 12,
     refit_max_iter: int = 32,
     hint_phi: np.ndarray | None = None,
-    classification_weight_alpha: float | None = None,
-    classification_code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
-    allow_component_death: bool = False,
-    _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
+    _refit_labels: Callable[[np.ndarray], PartitionFit] | None = None,
     _model: ObservedModel | None = None,
-) -> PartitionRefinementResult:
+) -> PartitionFit:
     labels = _validated_refinement_labels(data, labels)
-    initial_k = int(np.unique(labels).size)
-    _validate_classification_weight_alpha(classification_weight_alpha)
-    classification_code_weight = _validated_classification_code_weight(
-        classification_code_weight
-    )
     model = (
         compile_observed_model(data, major_prior=major_prior, eps=eps)
         if _model is None
         else _model
     )
 
-    def refit_labels(current_labels: np.ndarray) -> PartitionRefitResult:
+    def refit_labels(current_labels: np.ndarray) -> PartitionFit:
         if _refit_labels is not None:
             return _refit_labels(current_labels)
         return partition_constrained_observed_refit(
@@ -792,19 +674,6 @@ def refine_partition_likelihood_with_trace(
 
     refit = refit_labels(labels)
     refit_key = _label_key(labels)
-    best_labels: np.ndarray | None = None
-    best_refit: PartitionRefitResult | None = None
-    best_score = float("inf")
-    if classification_weight_alpha is not None:
-        best_score = _classification_refit_score(
-            data,
-            labels,
-            refit,
-            alpha=float(classification_weight_alpha),
-            code_weight=classification_code_weight,
-        )
-        best_labels = labels.copy()
-        best_refit = refit
     for _ in range(max(int(max_iter), 0)):
         labels_key = _label_key(labels)
         if refit_key != labels_key:
@@ -817,67 +686,18 @@ def refine_partition_likelihood_with_trace(
             eps=float(eps),
             _model=model,
         )
-        assignment_cost = (
-            count_cost
-            if classification_weight_alpha is None
-            else _classification_assignment_cost(
-                count_cost,
-                labels,
-                alpha=float(classification_weight_alpha),
-                code_weight=classification_code_weight,
-            )
-        )
+        assignment_cost = count_cost
         labels_next = np.argmin(assignment_cost, axis=1).astype(np.int64, copy=False)
-        if not bool(allow_component_death):
-            labels_next = _repair_empty_clusters(labels_next, assignment_cost)
+        labels_next = _repair_empty_clusters(labels_next, assignment_cost)
         labels_next = _canonical_labels(labels_next)
         if _label_key(labels_next) == labels_key:
             labels = labels_next
             break
-        if classification_weight_alpha is not None:
-            proposed_refit = refit_labels(labels_next)
-            proposed_score = _classification_refit_score(
-                data,
-                labels_next,
-                proposed_refit,
-                alpha=float(classification_weight_alpha),
-                code_weight=classification_code_weight,
-            )
-            # A simultaneous reassignment is only a proposal. Accept it only
-            # after an exact fixed-label refit proves that the declared score
-            # decreased; otherwise retain the current best state and stop.
-            if not _classification_score_strictly_improves(
-                proposed_score,
-                best_score,
-            ):
-                break
-            best_score = float(proposed_score)
-            best_labels = labels_next.copy()
-            best_refit = proposed_refit
-            refit = proposed_refit
-            refit_key = _label_key(labels_next)
         labels = labels_next
     labels_key = _label_key(labels)
     if refit_key != labels_key:
         refit = refit_labels(labels)
-    if (
-        classification_weight_alpha is not None
-        and best_labels is not None
-        and best_refit is not None
-    ):
-        final_labels = _canonical_labels(best_labels)
-        final_refit = best_refit
-    else:
-        final_labels = _canonical_labels(labels)
-        final_refit = refit
-    final_k = int(np.unique(final_labels).size)
-    return PartitionRefinementResult(
-        labels=final_labels,
-        refit=final_refit,
-        initial_k=int(initial_k),
-        final_k=int(final_k),
-        component_death_count=max(int(initial_k - final_k), 0),
-    )
+    return refit
 
 
 @torch.no_grad()
@@ -890,29 +710,35 @@ def partition_constrained_observed_refit_torch(
     tol: float,
     max_iter: int,
     hint_phi: np.ndarray | torch.Tensor | None = None,
-    torch_data: TorchTumorData | None = None,
+    solver_context: SolverContext | None = None,
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
-) -> PartitionRefitResult:
+) -> PartitionFit:
     tol = float(tol)
     if not np.isfinite(tol) or tol <= 0.0:
         raise ValueError("Partition refit tolerance must be a positive finite value.")
-    runtime, torch_data = _resolve_partition_runtime(
+    runtime, source_model, observed_model = _resolve_partition_runtime(
         data=data,
         exact_pilot=hint_phi,
-        torch_data=torch_data,
+        solver_context=solver_context,
         device=device,
         dtype=dtype,
         major_prior=major_prior,
         eps=eps,
     )
+    if str(observed_model.source_fingerprint) != str(source_model.fingerprint):
+        raise ValueError("The runtime model does not match its float64 source model.")
+    if source_model.shape != (int(data.num_mutations), int(data.num_regions)):
+        raise ValueError("The supplied partition model does not match the tumor shape.")
+    if not np.all(np.asarray(source_model.lower, dtype=np.float64) == float(eps)):
+        raise ValueError("The supplied partition model does not match the refit eps box.")
     labels_np = _validated_refinement_labels(data, labels)
     n_clusters = int(labels_np.max()) + 1 if labels_np.size else 0
     n_regions = int(data.num_regions)
     if n_clusters <= 0:
         empty_centers = np.zeros((0, n_regions), dtype=np.float64)
         empty_phi = np.zeros((int(data.num_mutations), n_regions), dtype=np.float64)
-        return PartitionRefitResult(
+        return PartitionFit(
             phi=empty_phi,
             cluster_centers=empty_centers,
             loglik=0.0,
@@ -921,6 +747,11 @@ def partition_constrained_observed_refit_torch(
             boundary_count=0,
             active_degrees_of_freedom=0,
             finite_candidate_found=True,
+            observed_model_hash=str(source_model.fingerprint),
+            observed_likelihood_hash=str(source_model.likelihood_fingerprint),
+            reporting_model_hash=str(source_model.reporting_fingerprint),
+            observed_box_hash=observed_box_fingerprint(source_model),
+            likelihood_eps_hex=float(eps).hex(),
             refit_coordinate_count=0,
             refit_finite_coordinate_count=0,
             refit_total_grid_points=0,
@@ -942,14 +773,16 @@ def partition_constrained_observed_refit_torch(
     # Canonical labels are contiguous, so every cluster index is present.
     for cluster_idx in range(n_clusters):
         member_mask = labels_t == int(cluster_idx)
-        upper[cluster_idx] = torch.min(torch_data.phi_upper[member_mask], dim=0).values
+        upper[cluster_idx] = torch.min(
+            observed_model.upper[member_mask], dim=0
+        ).values
     upper = torch.where(torch.isfinite(upper) & (upper >= lower), upper, lower)
     initial_width = torch.clamp(upper - lower, min=0.0)
 
     def objective(beta_ks: torch.Tensor) -> torch.Tensor:
         assigned_beta = beta_ks.index_select(0, labels_t)
         assigned_loss = mutation_region_loss_grid_torch(
-            torch_data,
+            observed_model,
             assigned_beta,
             eps=float(eps),
         )
@@ -1035,14 +868,14 @@ def partition_constrained_observed_refit_torch(
     active_df = int(centers.numel() - boundary_count)
     phi = centers[labels_t]
     phi = torch.minimum(
-        torch.maximum(phi, torch.full_like(phi, float(eps))), torch_data.phi_upper
+        torch.maximum(phi, torch.full_like(phi, float(eps))), observed_model.upper
     )
     finite_candidate_found = bool(torch.isfinite(total_loss).item())
     refit_coordinate_count = int(n_clusters * n_regions)
     finite_coordinate_count = int(
         torch.sum(torch.isfinite(best_loss)).detach().cpu().item()
     )
-    return PartitionRefitResult(
+    return PartitionFit(
         phi=phi.detach().cpu().numpy().astype(np.float64, copy=False),
         cluster_centers=centers.detach().cpu().numpy().astype(np.float64, copy=False),
         loglik=float(-total_loss.detach().cpu().item()),
@@ -1051,6 +884,11 @@ def partition_constrained_observed_refit_torch(
         boundary_count=int(boundary_count),
         active_degrees_of_freedom=int(active_df),
         finite_candidate_found=finite_candidate_found,
+        observed_model_hash=str(source_model.fingerprint),
+        observed_likelihood_hash=str(source_model.likelihood_fingerprint),
+        reporting_model_hash=str(source_model.reporting_fingerprint),
+        observed_box_hash=observed_box_fingerprint(source_model),
+        likelihood_eps_hex=float(eps).hex(),
         refit_coordinate_count=refit_coordinate_count,
         refit_finite_coordinate_count=finite_coordinate_count,
         refit_total_grid_points=int(
@@ -1081,31 +919,23 @@ def refine_partition_likelihood_torch_with_trace(
     max_iter: int = 12,
     refit_max_iter: int = 32,
     hint_phi: np.ndarray | torch.Tensor | None = None,
-    torch_data: TorchTumorData | None = None,
+    solver_context: SolverContext | None = None,
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
-    classification_weight_alpha: float | None = None,
-    classification_code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
-    allow_component_death: bool = False,
-    _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
-) -> PartitionRefinementResult:
-    runtime, torch_data = _resolve_partition_runtime(
+    _refit_labels: Callable[[np.ndarray], PartitionFit] | None = None,
+) -> PartitionFit:
+    runtime, _, _ = _resolve_partition_runtime(
         data=data,
         exact_pilot=hint_phi,
-        torch_data=torch_data,
+        solver_context=solver_context,
         device=device,
         dtype=dtype,
         major_prior=major_prior,
         eps=eps,
     )
     labels = _validated_refinement_labels(data, labels)
-    initial_k = int(np.unique(labels).size)
-    _validate_classification_weight_alpha(classification_weight_alpha)
-    classification_code_weight = _validated_classification_code_weight(
-        classification_code_weight
-    )
 
-    def refit_labels(current_labels: np.ndarray) -> PartitionRefitResult:
+    def refit_labels(current_labels: np.ndarray) -> PartitionFit:
         if _refit_labels is not None:
             return _refit_labels(current_labels)
         return partition_constrained_observed_refit_torch(
@@ -1116,26 +946,13 @@ def refine_partition_likelihood_torch_with_trace(
             tol=float(tol),
             max_iter=max(int(refit_max_iter), 32),
             hint_phi=hint_phi,
-            torch_data=torch_data,
+            solver_context=solver_context,
             device=runtime.device,
             dtype=runtime.dtype,
         )
 
     refit = refit_labels(labels)
     refit_key = _label_key(labels)
-    best_labels: np.ndarray | None = None
-    best_refit: PartitionRefitResult | None = None
-    best_score = float("inf")
-    if classification_weight_alpha is not None:
-        best_score = _classification_refit_score(
-            data,
-            labels,
-            refit,
-            alpha=float(classification_weight_alpha),
-            code_weight=classification_code_weight,
-        )
-        best_labels = labels.copy()
-        best_refit = refit
     for _ in range(max(int(max_iter), 0)):
         labels_key = _label_key(labels)
         if refit_key != labels_key:
@@ -1146,23 +963,11 @@ def refine_partition_likelihood_torch_with_trace(
             refit.cluster_centers,
             major_prior=float(major_prior),
             eps=float(eps),
-            torch_data=torch_data,
+            solver_context=solver_context,
             device=runtime.device,
             dtype=runtime.dtype,
         )
-        if classification_weight_alpha is None:
-            assignment_cost_t = cost_t
-        else:
-            log_weights = _classification_leave_one_out_log_cluster_weights(
-                labels,
-                num_clusters=int(cost_t.shape[1]),
-                alpha=float(classification_weight_alpha),
-            )
-            assignment_cost_t = cost_t - classification_code_weight * torch.as_tensor(
-                log_weights,
-                dtype=cost_t.dtype,
-                device=cost_t.device,
-            )
+        assignment_cost_t = cost_t
         labels_next = (
             torch.argmin(assignment_cost_t, dim=1)
             .detach()
@@ -1170,56 +975,19 @@ def refine_partition_likelihood_torch_with_trace(
             .numpy()
             .astype(np.int64, copy=False)
         )
-        if not bool(allow_component_death):
-            labels_next = _repair_empty_clusters(
-                labels_next,
-                assignment_cost_t.detach().cpu().numpy(),
-            )
+        labels_next = _repair_empty_clusters(
+            labels_next,
+            assignment_cost_t.detach().cpu().numpy(),
+        )
         labels_next = _canonical_labels(labels_next)
         if _label_key(labels_next) == labels_key:
             labels = labels_next
             break
-        if classification_weight_alpha is not None:
-            proposed_refit = refit_labels(labels_next)
-            proposed_score = _classification_refit_score(
-                data,
-                labels_next,
-                proposed_refit,
-                alpha=float(classification_weight_alpha),
-                code_weight=classification_code_weight,
-            )
-            if not _classification_score_strictly_improves(
-                proposed_score,
-                best_score,
-            ):
-                break
-            best_score = float(proposed_score)
-            best_labels = labels_next.copy()
-            best_refit = proposed_refit
-            refit = proposed_refit
-            refit_key = _label_key(labels_next)
         labels = labels_next
     labels_key = _label_key(labels)
     if refit_key != labels_key:
         refit = refit_labels(labels)
-    if (
-        classification_weight_alpha is not None
-        and best_labels is not None
-        and best_refit is not None
-    ):
-        final_labels = _canonical_labels(best_labels)
-        final_refit = best_refit
-    else:
-        final_labels = _canonical_labels(labels)
-        final_refit = refit
-    final_k = int(np.unique(final_labels).size)
-    return PartitionRefinementResult(
-        labels=final_labels,
-        refit=final_refit,
-        initial_k=int(initial_k),
-        final_k=int(final_k),
-        component_death_count=max(int(initial_k - final_k), 0),
-    )
+    return refit
 
 
 def _label_key(labels: np.ndarray) -> bytes:
@@ -1240,15 +1008,10 @@ def generate_likelihood_partition_starts(
     tol: float = 1e-3,
     curvature: np.ndarray | torch.Tensor | None = None,
     label_sets: dict[int, np.ndarray] | None = None,
-    torch_data: TorchTumorData | None = None,
+    solver_context: SolverContext | None = None,
     device: str | torch.device | None = None,
     dtype: str | torch.dtype | None = None,
     use_torch: bool = True,
-    classification_weight_alpha: float | None = None,
-    classification_code_weight: float = PARTITION_DIRICHLET_SCORE_WEIGHT,
-    allow_component_death: bool = False,
-    include_plain_ward: bool = True,
-    include_ward_cem: bool = True,
     max_refit_objective_evaluations: int | None = None,
     max_candidates: int | None = None,
 ) -> PartitionCandidatePool:
@@ -1258,23 +1021,24 @@ def generate_likelihood_partition_starts(
         raise ValueError("max_refit_objective_evaluations must be nonnegative.")
     if max_candidates is not None and int(max_candidates) < 0:
         raise ValueError("max_candidates must be nonnegative.")
-    _validate_classification_weight_alpha(classification_weight_alpha)
-    classification_code_weight = _validated_classification_code_weight(
-        classification_code_weight
-    )
     use_torch_runtime = bool(use_torch)
     runtime: TorchRuntime | None = None
-    partition_torch_data: TorchTumorData | None = None
+    partition_context: SolverContext | None = None
+    partition_source_model: ObservedModel | None = None
+    partition_observed_model: TorchObservedModel | None = None
     if use_torch_runtime:
-        runtime, partition_torch_data = _resolve_partition_runtime(
-            data=data,
-            exact_pilot=exact_pilot,
-            torch_data=torch_data,
-            device=device,
-            dtype=dtype,
-            major_prior=major_prior,
-            eps=eps,
+        runtime, partition_source_model, partition_observed_model = (
+            _resolve_partition_runtime(
+                data=data,
+                exact_pilot=exact_pilot,
+                solver_context=solver_context,
+                device=device,
+                dtype=dtype,
+                major_prior=major_prior,
+                eps=eps,
+            )
         )
+        partition_context = solver_context
     phi0 = (
         _as_torch(exact_pilot, runtime=runtime).detach().cpu().numpy()
         if use_torch_runtime and runtime is not None
@@ -1294,18 +1058,21 @@ def generate_likelihood_partition_starts(
     }
     candidates: list[PartitionCandidate] = []
     seen: set[bytes] = set()
-    source_model = compile_observed_model(
-        data, major_prior=float(major_prior), eps=float(eps)
+    source_model = (
+        partition_source_model
+        if partition_source_model is not None
+        else compile_observed_model(
+            data, major_prior=float(major_prior), eps=float(eps)
+        )
     )
     # This cache never escapes one generation call, so labels fully identify a
     # refit under the shared data, tolerance, hint, runtime, and backend.
-    refit_cache: dict[bytes, PartitionRefitResult] = {}
-    generation_work = WorkCounters()
+    refit_cache: dict[bytes, PartitionFit] = {}
+    generation_work = WorkLedger()
     generation_complete = True
     generation_stop_reason: str | None = None
 
-    def cached_refit(labels: np.ndarray) -> PartitionRefitResult:
-        nonlocal generation_work
+    def cached_refit(labels: np.ndarray) -> PartitionFit:
         labels_key = _label_key(labels)
         cached = refit_cache.get(labels_key)
         if cached is not None:
@@ -1313,7 +1080,7 @@ def generate_likelihood_partition_starts(
         if (
             use_torch_runtime
             and runtime is not None
-            and partition_torch_data is not None
+            and partition_observed_model is not None
         ):
             result = partition_constrained_observed_refit_torch(
                 data,
@@ -1323,7 +1090,7 @@ def generate_likelihood_partition_starts(
                 tol=float(tol),
                 max_iter=max(int(refit_max_iter), 32),
                 hint_phi=exact_pilot,
-                torch_data=partition_torch_data,
+                solver_context=partition_context,
                 device=runtime.device,
                 dtype=runtime.dtype,
             )
@@ -1338,23 +1105,18 @@ def generate_likelihood_partition_starts(
                 _model=source_model,
             )
         refit_cache[labels_key] = result
-        generation_work = generation_work + WorkCounters(
-            partition_refit_coordinates=int(result.refit_coordinate_count),
-            partition_refit_objective_evaluations=int(
-                result.refit_objective_evaluations
-            ),
+        generation_work.charge_partition_refit_work(
+            coordinates=int(result.refit_coordinate_count),
+            objective_evaluations=int(result.refit_objective_evaluations),
         )
         return result
 
     for requested_k in sorted(label_sets):
         labels0 = _canonical_labels(label_sets[int(requested_k)])
-        source_labels: list[tuple[str, np.ndarray]] = []
-        if include_plain_ward:
-            source_labels.append((f"hessian_ward_K{int(requested_k)}", labels0))
-        if include_ward_cem:
-            source_labels.append(
-                (f"hessian_ward_cem_K{int(requested_k)}", labels0)
-            )
+        source_labels = [
+            (f"hessian_ward_K{int(requested_k)}", labels0),
+            (f"hessian_ward_cem_K{int(requested_k)}", labels0),
+        ]
         for source, labels in source_labels:
             if max_candidates is not None and len(candidates) >= int(max_candidates):
                 generation_complete = False
@@ -1362,20 +1124,21 @@ def generate_likelihood_partition_starts(
                 break
             if (
                 max_refit_objective_evaluations is not None
-                and int(generation_work.partition_refit_objective_evaluations)
+                and int(
+                    generation_work.total.partition_refit_objective_evaluations
+                )
                 >= int(max_refit_objective_evaluations)
             ):
                 generation_complete = False
                 generation_stop_reason = "refit_objective_evaluation_budget_reached"
                 break
-            trace: PartitionRefinementResult | None = None
             if source.startswith("hessian_ward_cem"):
                 if (
                     use_torch_runtime
                     and runtime is not None
-                    and partition_torch_data is not None
+                    and partition_observed_model is not None
                 ):
-                    trace = refine_partition_likelihood_torch_with_trace(
+                    refit = refine_partition_likelihood_torch_with_trace(
                         data,
                         labels,
                         major_prior=float(major_prior),
@@ -1384,16 +1147,13 @@ def generate_likelihood_partition_starts(
                         max_iter=int(cem_max_iter),
                         refit_max_iter=int(refit_max_iter),
                         hint_phi=exact_pilot,
-                        torch_data=partition_torch_data,
+                        solver_context=partition_context,
                         device=runtime.device,
                         dtype=runtime.dtype,
-                        classification_weight_alpha=classification_weight_alpha,
-                        classification_code_weight=classification_code_weight,
-                        allow_component_death=bool(allow_component_death),
                         _refit_labels=cached_refit,
                     )
                 else:
-                    trace = refine_partition_likelihood_with_trace(
+                    refit = refine_partition_likelihood_with_trace(
                         data,
                         labels,
                         major_prior=float(major_prior),
@@ -1402,13 +1162,10 @@ def generate_likelihood_partition_starts(
                         max_iter=int(cem_max_iter),
                         refit_max_iter=int(refit_max_iter),
                         hint_phi=phi0,
-                        classification_weight_alpha=classification_weight_alpha,
-                        classification_code_weight=classification_code_weight,
-                        allow_component_death=bool(allow_component_death),
                         _refit_labels=cached_refit,
                         _model=source_model,
                     )
-                labels_used, refit = trace.labels, trace.refit
+                labels_used = refit.labels
             else:
                 refit = cached_refit(labels)
                 labels_used = labels
@@ -1418,21 +1175,10 @@ def generate_likelihood_partition_starts(
                 continue
             seen.add(key)
             candidate_k = int(refit.n_clusters)
-            classic_bic = compute_partition_bic(
+            bic = compute_partition_bic(
                 fit_loss=float(refit.fit_loss),
                 num_clusters=candidate_k,
                 data=data,
-            )
-            bic = (
-                classic_bic
-                if classification_weight_alpha is None
-                else compute_partition_dirichlet_score(
-                    -float(refit.fit_loss),
-                    cluster_sizes_from_labels(labels_used),
-                    data,
-                    alpha=float(classification_weight_alpha),
-                    code_weight=classification_code_weight,
-                )
             )
             candidates.append(
                 PartitionCandidate(
@@ -1444,9 +1190,6 @@ def generate_likelihood_partition_starts(
                     bic=float(bic),
                     finite_candidate_found=bool(refit.finite_candidate_found),
                     requested_k=int(requested_k),
-                    component_death_count=(
-                        0 if trace is None else int(trace.component_death_count)
-                    ),
                 )
             )
         if not generation_complete:
@@ -1469,7 +1212,7 @@ def generate_likelihood_partition_starts(
                 key=lambda item: (float(item.bic), int(item.K), str(item.source)),
             )
         ),
-        work=generation_work,
+        work=generation_work.total,
         complete=bool(generation_complete),
         stop_reason=generation_stop_reason,
     )

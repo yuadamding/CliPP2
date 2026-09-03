@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..io.tumor_txt import write_tumor_txt
+from CliPP2.io.tumor_txt import write_tumor_txt
 from .config import TumorSimulationConfig, _validate_copy_number_config
 from .evolution import (
     _simulate_constrained_cn_evolution,
