@@ -54,6 +54,7 @@ def _run_fit(
     config_file: Path,
     *options: str,
     failure_policy: str = "error",
+    profile: str = "fast",
 ) -> dict[str, object]:
     result = subprocess.run(
         [
@@ -66,7 +67,7 @@ def _run_fit(
             "--outdir",
             str(outdir),
             "--profile",
-            "fast",
+            profile,
             "--device",
             "cpu",
             "--failure-policy",
@@ -82,6 +83,32 @@ def _run_fit(
     )
     assert result.returncode == 0, result.stderr
     return json.loads((outdir / "smoke_analysis.json").read_text())
+
+
+def _validate_panel_output(
+    outdir: Path,
+    receipt: Path,
+) -> dict[str, object]:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).with_name("validate_outputs_v4.py")),
+            "--outdir",
+            str(outdir),
+            "--tumor-id",
+            "smoke",
+            "--expected-mutations",
+            "4",
+            "--output",
+            str(receipt),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(receipt.read_text(encoding="utf-8"))
 
 
 def test_cli_checkpoint_resume_and_four_file_output(tmp_path: Path) -> None:
@@ -166,3 +193,47 @@ def test_resource_stop_remains_explicitly_unresolved(tmp_path: Path) -> None:
     assert analysis["search_stop_reason"] == "tumor_work_budget_reached"
     assert analysis["selection_optimum_resolved"] is False
     assert analysis["global_hybrid_optimum_certified"] is False
+
+
+def test_panel_validator_separates_primary_and_conditional_status(tmp_path: Path) -> None:
+    input_file = tmp_path / "smoke.tsv"
+    config_file = tmp_path / "config.json"
+    outdir = tmp_path / "result"
+    _write_smoke_input(input_file)
+    config_file.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "fit": {
+                    "dtype": "float64",
+                    "max_direct_partition_candidates": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _run_fit(input_file, outdir, config_file, profile="balanced")
+
+    primary = _validate_panel_output(outdir, tmp_path / "primary.json")
+    assert primary["execution_status"] == "completed"
+    assert primary["artifact_status"] == "valid"
+    assert primary["scientific_status"] == "primary_estimator_available"
+
+    analysis_path = outdir / "smoke_analysis.json"
+    analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+    analysis.update(
+        {
+            "analysis_tier": "conditional_partition_refit",
+            "primary_estimator_available": False,
+            "raw_reference_objective_certified": False,
+            "selected_raw_reference_objective_spec_hash": "",
+            "selected_raw_reference_original_graph_hash": "",
+            "failure_reason": "NoCertifiedRawReferenceError: CI fixture",
+        }
+    )
+    analysis_path.write_text(json.dumps(analysis), encoding="utf-8")
+
+    conditional = _validate_panel_output(outdir, tmp_path / "conditional.json")
+    assert conditional["execution_status"] == "completed"
+    assert conditional["artifact_status"] == "valid"
+    assert conditional["scientific_status"] == "no_certified_raw_reference"

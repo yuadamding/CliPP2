@@ -6,6 +6,7 @@ import torch
 
 from CliPP2.core.fusion import certificates as fusion_certificates
 from CliPP2.core.fusion import torch_backend as fusion_backend
+from CliPP2.core.fusion.types import KKTComponents, KKTDiagnostics
 from CliPP2.model_selection.online_lambda import (
     OnlineLambdaConfig,
     OnlineLambdaController,
@@ -13,6 +14,36 @@ from CliPP2.model_selection.online_lambda import (
     OnlineLambdaProposal,
 )
 from CliPP2.model_selection.proposals import adaptive_stop_certifies_global_optimum
+
+
+def test_terminal_kkt_components_use_all_four_audit_components() -> None:
+    diagnostics = KKTDiagnostics(
+        stationarity_residual=0.0,
+        edge_subgradient_residual=0.0,
+        dual_ball_residual=0.0,
+        box_residual=0.02,
+        kkt_residual=0.02,
+        backward_error_stationarity_residual=0.01,
+        backward_error_edge_subgradient_residual=0.005,
+        backward_error_dual_ball_residual=0.002,
+        backward_error_kkt_residual=0.02,
+    )
+
+    components = KKTComponents.from_diagnostics(diagnostics)
+
+    assert components.box == 0.02
+    assert components.residual == 0.02
+
+
+def test_terminal_kkt_components_fail_closed_on_nonfinite_input() -> None:
+    components = KKTComponents(
+        stationarity=float("nan"),
+        edge_subgradient=0.0,
+        dual_ball=0.0,
+        box=0.0,
+    )
+
+    assert components.residual == float("inf")
 
 
 def test_certificate_work_is_charged_once(monkeypatch) -> None:

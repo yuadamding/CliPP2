@@ -511,11 +511,32 @@ class KKTComponents:
     dual_ball: float
     box: float
 
+    @classmethod
+    def from_diagnostics(cls, diagnostics: KKTDiagnostics) -> KKTComponents:
+        """Project one terminal audit into the persisted component authority."""
+
+        return cls(
+            stationarity=float(
+                diagnostics.backward_error_stationarity_residual
+            ),
+            edge_subgradient=float(
+                diagnostics.backward_error_edge_subgradient_residual
+            ),
+            dual_ball=float(diagnostics.backward_error_dual_ball_residual),
+            box=float(diagnostics.box_residual),
+        )
+
     @property
     def residual(self) -> float:
-        return float(
-            max(self.stationarity, self.edge_subgradient, self.dual_ball, self.box)
+        values = (
+            float(self.stationarity),
+            float(self.edge_subgradient),
+            float(self.dual_ball),
+            float(self.box),
         )
+        if not all(np.isfinite(value) and value >= 0.0 for value in values):
+            return float("inf")
+        return float(max(values))
 
 
 @dataclass(frozen=True, slots=True)

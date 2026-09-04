@@ -989,6 +989,43 @@ def _raw_summary(raw_fit: RawFit | None) -> dict[str, object]:
     }
 
 
+def _terminal_box_summary(
+    raw_fit: RawFit | None,
+    model: ObservedModel,
+) -> dict[str, object]:
+    """Report the persisted box residual and its source-space maximum."""
+
+    empty = {
+        "terminal_box_residual": None,
+        "terminal_max_lower_violation": None,
+        "terminal_max_upper_violation": None,
+        "terminal_box_violation_flat_index": None,
+    }
+    if raw_fit is None:
+        return empty
+    phi = np.asarray(raw_fit.phi, dtype=np.float64)
+    lower = np.asarray(model.lower, dtype=np.float64)
+    upper = np.asarray(model.upper, dtype=np.float64)
+    if phi.shape != lower.shape or phi.shape != upper.shape:
+        raise ValueError("Terminal raw fit and reporting box have different shapes.")
+    lower_violation = np.maximum(lower - phi, 0.0)
+    upper_violation = np.maximum(phi - upper, 0.0)
+    violation = np.maximum(lower_violation, upper_violation)
+    maximum = float(np.max(violation)) if violation.size else 0.0
+    return {
+        "terminal_box_residual": float(raw_fit.certificate.components.box),
+        "terminal_max_lower_violation": (
+            float(np.max(lower_violation)) if lower_violation.size else 0.0
+        ),
+        "terminal_max_upper_violation": (
+            float(np.max(upper_violation)) if upper_violation.size else 0.0
+        ),
+        "terminal_box_violation_flat_index": (
+            None if maximum == 0.0 else int(np.argmax(violation))
+        ),
+    }
+
+
 def _search_work_summary(report: SearchReport) -> dict[str, int]:
     """Project the search's authoritative work ledger."""
 
@@ -1282,6 +1319,12 @@ def analysis_summary(
         "software_version": SOFTWARE_VERSION,
     }
     summary.update(_raw_summary(analysis.diagnostic_raw_fit))
+    summary.update(
+        _terminal_box_summary(
+            analysis.diagnostic_raw_fit,
+            analysis.prepared.model,
+        )
+    )
     summary.update(_candidate_count_summary(report))
     search_work_summary = _search_work_summary(report)
     summary.update(search_work_summary)

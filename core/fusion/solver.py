@@ -3311,9 +3311,10 @@ def _fit_from_start(
         raise AssertionError(
             "Edge-pass budget exceeded the configured cap plus terminal allowance."
         )
-    authoritative_kkt_residual = float(
-        admission_diagnostics.backward_error_kkt_residual
+    terminal_components = KKTComponents.from_diagnostics(
+        admission_diagnostics
     )
+    authoritative_kkt_residual = terminal_components.residual
     if not np.isfinite(float(authoritative_objective)):
         outer_stop_reason = "nonfinite_objective"
     final_dual = getattr(state.certificate, "dual", None)
@@ -3380,25 +3381,6 @@ def _fit_from_start(
         certificate=state.certificate,
         objective_spec_hash=str(objective_spec_hash),
     )
-    terminal_components = KKTComponents(
-        stationarity=float(
-            admission_diagnostics.backward_error_stationarity_residual
-        ),
-        edge_subgradient=float(
-            admission_diagnostics.backward_error_edge_subgradient_residual
-        ),
-        dual_ball=float(admission_diagnostics.backward_error_dual_ball_residual),
-        # Box feasibility is enforced by every primal update. The normalized
-        # stationarity component already incorporates the box normal cone.
-        box=0.0,
-    )
-    if not np.isclose(
-        terminal_components.residual,
-        authoritative_kkt_residual,
-        rtol=0.0,
-        atol=8.0 * np.finfo(np.float64).eps * (1.0 + authoritative_kkt_residual),
-    ):
-        raise AssertionError("Terminal KKT components do not reproduce the audit.")
     return RawFit(
         phi=phi_np.astype(phi_np.dtype, copy=False),
         objective=ObjectiveValue(total=float(authoritative_objective)),
