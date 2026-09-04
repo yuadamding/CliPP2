@@ -47,6 +47,13 @@ _CERTIFICATE_PLATEAU_ATOL_SCALE = 0.01
 _CERTIFICATE_PLATEAU_EPS_SCALE = 32.0
 
 
+def _authoritative_certificate_residual(diagnostics: KKTDiagnostics) -> float:
+    """Return the fail-closed residual used by raw-certificate admission."""
+
+    value = float(diagnostics.backward_error_kkt_residual)
+    return value if np.isfinite(value) and value >= 0.0 else float("inf")
+
+
 def _update_refinement_plateau(
     *,
     anchor_residual: float,
@@ -726,7 +733,10 @@ def _refine_compressed_certificate(
         work.charge(before_audit.work)
         full_kkt_audited = True
         work.charge_certificate_work(full_graph_passes=1)
-    if has_inherited_fast_path and before.kkt_residual <= 5.0 * float(atol):
+    if (
+        has_inherited_fast_path
+        and _authoritative_certificate_residual(before) <= 5.0 * float(atol)
+    ):
         # The inherited compressed state has already passed a full
         # original-graph audit.  Re-optimizing its workset cannot strengthen
         # that certificate and was the dominant CUDA cost on favorable warm
@@ -826,7 +836,10 @@ def _refine_compressed_certificate(
             work.charge(final_audit.work)
             full_kkt_audited = True
             work.charge_certificate_work(full_graph_passes=1)
-            if final_diag.kkt_residual <= 5.0 * float(atol):
+            if (
+                _authoritative_certificate_residual(final_diag)
+                <= 5.0 * float(atol)
+            ):
                 status = "certified"
                 certificate = current
                 break
@@ -1165,11 +1178,15 @@ def _refine_graph_fusion_dual_certificate_streaming_torch(
     )
     work.charge(analytic_audit.work)
     best_diag = analytic_audit.diagnostics
-    best_residual = float(analytic_audit.diagnostics.kkt_residual)
+    best_residual = _authoritative_certificate_residual(
+        analytic_audit.diagnostics
+    )
     best_source = "analytic"
     best_dual: torch.Tensor = dual.clone()
     if incoming is not None:
-        incoming_residual = float(before_audit.diagnostics.kkt_residual)
+        incoming_residual = _authoritative_certificate_residual(
+            before_audit.diagnostics
+        )
         if np.isfinite(incoming_residual) and incoming_residual <= best_residual:
             best_diag = before_audit.diagnostics
             best_residual = incoming_residual
@@ -1271,7 +1288,9 @@ def _refine_graph_fusion_dual_certificate_streaming_torch(
                 edge_work_bytes=edge_work_bytes,
             )
             work.charge(iteration_audit.work)
-            residual = float(iteration_audit.diagnostics.kkt_residual)
+            residual = _authoritative_certificate_residual(
+                iteration_audit.diagnostics
+            )
             if residual < best_residual:
                 best_residual = residual
                 best_diag = iteration_audit.diagnostics
@@ -1387,7 +1406,9 @@ def refine_graph_fusion_dual_certificate_torch(
         dual_kkt is not None
         and tuple(dual_kkt.shape) == (int(edge_u.numel()), int(phi.shape[1]))
     )
-    incoming_residual = float(before_audit.diagnostics.kkt_residual)
+    incoming_residual = _authoritative_certificate_residual(
+        before_audit.diagnostics
+    )
     if (
         incoming_valid
         and np.isfinite(incoming_residual)
@@ -1479,7 +1500,9 @@ def refine_graph_fusion_dual_certificate_torch(
     work.charge(analytic_audit.work)
     best_dual = dual.clone()
     best_diag = analytic_audit.diagnostics
-    best_residual = float(analytic_audit.diagnostics.kkt_residual)
+    best_residual = _authoritative_certificate_residual(
+        analytic_audit.diagnostics
+    )
     best_source = "analytic"
 
     # Reconstructing the analytic active-edge subgradient can improve edge
@@ -1488,7 +1511,9 @@ def refine_graph_fusion_dual_certificate_torch(
     # KKT residual, so retain the incoming actual ADMM multiplier whenever it
     # is the stronger certificate.
     if dual_kkt is not None and tuple(dual_kkt.shape) == tuple(dual.shape):
-        incoming_residual = float(before_audit.diagnostics.kkt_residual)
+        incoming_residual = _authoritative_certificate_residual(
+            before_audit.diagnostics
+        )
         if np.isfinite(incoming_residual) and incoming_residual <= best_residual:
             best_dual = dual_kkt.to(dtype=phi.dtype, device=phi.device).clone()
             best_diag = before_audit.diagnostics
@@ -1553,7 +1578,9 @@ def refine_graph_fusion_dual_certificate_torch(
                 atol=atol,
             )
             work.charge(iteration_audit.work)
-            residual = float(iteration_audit.diagnostics.kkt_residual)
+            residual = _authoritative_certificate_residual(
+                iteration_audit.diagnostics
+            )
             if residual < best_residual:
                 best_residual = residual
                 best_diag = iteration_audit.diagnostics

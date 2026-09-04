@@ -1167,9 +1167,71 @@ def _complete_graph_isotropic_box_qp_bisection(
         hi = torch.where(move_right, hi, mid)
 
     mid = 0.5 * (lo + hi)
-    return torch.minimum(
-        torch.maximum((rhs + rho_t * mid.unsqueeze(0)) / denom, lower),
-        upper,
+    approximate = torch.minimum(
+        torch.maximum((rhs + rho_t * mid.unsqueeze(0)) / denom, lower), upper
+    )
+    return _complete_graph_box_qp_active_set_polish(
+        rhs=rhs,
+        denom=denom,
+        lower=lower,
+        upper=upper,
+        rho_t=rho_t,
+        approximate=approximate,
+    )
+
+
+def _complete_graph_box_qp_active_set_polish(
+    *,
+    rhs: torch.Tensor,
+    denom: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    rho_t: torch.Tensor,
+    approximate: torch.Tensor,
+) -> torch.Tensor:
+    """Finish the complete-graph box QP on an exact active set.
+
+    Bisection identifies the scalar sum accurately but can leave a coordinate
+    infinitesimally inside a bound.  Re-solving the scalar equation for its
+    induced active set both preserves the QP objective and writes active
+    coordinates as the exact bound values required by terminal KKT geometry.
+    """
+
+    scalar_sum = torch.sum(approximate, dim=0)
+    raw = (rhs + rho_t * scalar_sum.unsqueeze(0)) / denom
+    # The bisection start is already close to the fixed point.  These bounded
+    # mask updates only resolve coordinates tied at an active-set breakpoint;
+    # keeping the count static also preserves the compiled CUDA path.
+    for _ in range(8):
+        lower_active = raw <= lower
+        upper_active = raw >= upper
+        free = ~(lower_active | upper_active)
+        fixed_sum = torch.sum(
+            torch.where(
+                lower_active,
+                lower,
+                torch.where(upper_active, upper, torch.zeros_like(raw)),
+            ),
+            dim=0,
+        )
+        free_intercept = torch.sum(
+            torch.where(free, rhs / denom, torch.zeros_like(raw)), dim=0
+        )
+        free_slope = torch.sum(
+            torch.where(free, rho_t / denom, torch.zeros_like(raw)), dim=0
+        )
+        scalar_sum = (fixed_sum + free_intercept) / torch.clamp_min(
+            1.0 - free_slope,
+            torch.finfo(rhs.dtype).tiny,
+        )
+        raw = (rhs + rho_t * scalar_sum.unsqueeze(0)) / denom
+
+    lower_active = raw <= lower
+    upper_active = raw >= upper
+    return torch.where(
+        lower_active,
+        lower,
+        torch.where(upper_active, upper, raw),
     )
 
 

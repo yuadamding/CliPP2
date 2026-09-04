@@ -52,6 +52,63 @@ def test_certificate_work_is_charged_once(monkeypatch) -> None:
     )
 
 
+def test_certificate_refinement_uses_authoritative_residual() -> None:
+    phi = torch.full((2, 1), 1e-6, dtype=torch.float64)
+    edge_u = torch.tensor([0], dtype=torch.int64)
+    edge_v = torch.tensor([1], dtype=torch.int64)
+    result = fusion_certificates.refine_graph_fusion_dual_certificate_torch(
+        phi=phi,
+        grad_smooth=torch.ones_like(phi),
+        dual_kkt=torch.zeros((1, 1), dtype=phi.dtype),
+        lower=torch.zeros_like(phi),
+        upper=torch.ones_like(phi),
+        edge_u=edge_u,
+        edge_v=edge_v,
+        edge_w=torch.ones(1, dtype=phi.dtype),
+        lambda_value=0.1,
+        atol=8e-4,
+        max_iter=2,
+    )
+
+    assert result.audit.diagnostics.kkt_residual < 4e-3
+    assert result.audit.diagnostics.backward_error_kkt_residual == 1.0
+    assert result.refinement_iterations == 2
+
+
+def test_complete_graph_box_polish_matches_exact_scalar_solution() -> None:
+    generator = torch.Generator().manual_seed(5)
+    mutations = 32
+    U = torch.rand((mutations, 1), generator=generator, dtype=torch.float64)
+    h = 0.2 + torch.rand((mutations, 1), generator=generator, dtype=torch.float64)
+    lower = torch.zeros_like(U)
+    upper = 0.2 + 0.8 * torch.rand(
+        (mutations, 1), generator=generator, dtype=torch.float64
+    )
+    q = torch.randn((mutations, 1), generator=generator, dtype=torch.float64)
+    rho = torch.tensor(0.7, dtype=torch.float64)
+
+    polished = fusion_backend._complete_graph_isotropic_box_qp_bisection(
+        U=U,
+        h=h,
+        lower=lower,
+        upper=upper,
+        rho_t=rho,
+        q=q,
+        max_iter=32,
+    )
+    exact = fusion_backend._complete_graph_scalar_box_qp_cpu(
+        U=U,
+        h=h,
+        lower=lower,
+        upper=upper,
+        rho_t=rho,
+        q=q,
+    )
+
+    assert exact is not None
+    torch.testing.assert_close(polished, exact, rtol=0.0, atol=2e-14)
+
+
 def test_lambda_no_progress_state_round_trips_and_stays_unresolved() -> None:
     config = OnlineLambdaConfig(
         guide_n_clusters=2,

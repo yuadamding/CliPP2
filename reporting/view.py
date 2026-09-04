@@ -35,7 +35,7 @@ from ..model_selection.types import (
     TumorSelectionOutcome,
 )
 
-SUMMARY_SCHEMA_VERSION = 10
+SUMMARY_SCHEMA_VERSION = 11
 OUTPUT_SCHEMA_VERSION = 2
 CCF_CLUSTER_ORDERING_METHOD = "identified_region_rms_distance_to_one_v1"
 
@@ -999,6 +999,34 @@ def _search_work_summary(report: SearchReport) -> dict[str, int]:
     }
 
 
+def _candidate_count_summary(report: SearchReport) -> dict[str, int]:
+    """Keep raw certification distinct from direct-refit eligibility."""
+
+    raw_records = tuple(record for record in report.records if record.family == "raw_fusion")
+    direct_records = tuple(
+        record for record in report.records if record.family == "direct_partition"
+    )
+    return {
+        "num_raw_candidates": len(raw_records),
+        "num_raw_solver_attempts": sum(
+            len(record.trace.raw_attempts) for record in raw_records
+        ),
+        "num_raw_objective_certified": sum(
+            bool(record.candidate.raw_objective_certified) for record in raw_records
+        ),
+        "num_raw_partition_certified": sum(
+            bool(record.candidate.partition.certified) for record in raw_records
+        ),
+        "num_direct_candidates": len(direct_records),
+        "num_direct_refit_eligible": sum(
+            bool(record.eligible_for_selection) for record in direct_records
+        ),
+        "num_selection_eligible_candidates": sum(
+            bool(record.eligible_for_selection) for record in report.records
+        ),
+    }
+
+
 def _scalar_refit_budget_summary(
     report: SearchReport,
     search_work: dict[str, int],
@@ -1038,6 +1066,7 @@ def analysis_summary(
     score = analysis.score
     raw_reference = analysis.raw_reference
     raw_fit = analysis.raw_fit
+    attempted_raw_fit = analysis.diagnostic_raw_fit
     parent_raw = analysis.partition_parent_raw
     primary = bool(analysis.primary_estimator_available)
     report = outcome.report
@@ -1205,6 +1234,32 @@ def analysis_summary(
         "selected_original_graph_hash": (
             "" if raw_fit is None else str(raw_fit.provenance.original_graph_hash)
         ),
+        "selected_raw_reference_objective_spec_hash": (
+            "" if raw_fit is None else str(raw_fit.provenance.objective_spec_hash)
+        ),
+        "selected_raw_reference_original_graph_hash": (
+            "" if raw_fit is None else str(raw_fit.provenance.original_graph_hash)
+        ),
+        "attempted_objective_spec_hash": (
+            ""
+            if attempted_raw_fit is None
+            else str(attempted_raw_fit.provenance.objective_spec_hash)
+        ),
+        "attempted_original_graph_hash": (
+            ""
+            if attempted_raw_fit is None
+            else str(attempted_raw_fit.provenance.original_graph_hash)
+        ),
+        "attempted_observed_likelihood_hash": (
+            ""
+            if attempted_raw_fit is None
+            else str(attempted_raw_fit.provenance.objective_key.base.likelihood_hash)
+        ),
+        "attempted_objective_box_hash": (
+            ""
+            if attempted_raw_fit is None
+            else str(attempted_raw_fit.provenance.objective_key.base.box_hash)
+        ),
         "selection_method": str(report.selection_method),
         "num_candidates": int(report.num_candidates),
         "num_candidates_certified": int(report.num_candidates_certified),
@@ -1227,6 +1282,7 @@ def analysis_summary(
         "software_version": SOFTWARE_VERSION,
     }
     summary.update(_raw_summary(analysis.diagnostic_raw_fit))
+    summary.update(_candidate_count_summary(report))
     search_work_summary = _search_work_summary(report)
     summary.update(search_work_summary)
     summary.update(_scalar_refit_budget_summary(report, search_work_summary))

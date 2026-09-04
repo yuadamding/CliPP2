@@ -111,7 +111,7 @@ def test_cli_checkpoint_resume_and_four_file_output(tmp_path: Path) -> None:
         input_file, resumed_dir, config_file, "--resume", str(checkpoint)
     )
 
-    assert first["summary_schema_version"] == 10
+    assert first["summary_schema_version"] == 11
     assert first["analysis_tier"] == "joint_certified"
     assert first["primary_estimator_available"] is True
     assert first["selection_score_name"] == "fixed_partition_bic"

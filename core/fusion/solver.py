@@ -3139,6 +3139,7 @@ def _fit_from_start(
         last_refined_certificate_gradient = certificate_gradient
         return refinement
 
+    residual_before_round = residual_before_probe
     for refinement_round in range(4):
         if refinement_round == 0:
             probe_iter = min(
@@ -3151,18 +3152,15 @@ def _fit_from_start(
             )
             assert final_certificate_refinement is not None
             probe_action = _certificate_probe_action(
-                residual_before=residual_before_probe,
+                residual_before=residual_before_round,
                 probe_residual=float(
                     final_certificate_refinement.diagnostics.backward_error_kkt_residual
                 ),
                 certification_tolerance=float(cert_tol),
                 recovery_stagnated=bool(recovery_stagnated),
             )
-            if probe_action == "plateau":
-                outer_stop_reason = "certificate_refinement_plateau"
-                break
             remaining_iter = int(certificate_options.max_iter) - probe_iter
-            if probe_action != "certified" and remaining_iter > 0:
+            if probe_action == "deepen" and remaining_iter > 0:
                 deepened = terminal_refinement(
                     remaining_iter,
                     mandatory=False,
@@ -3171,6 +3169,14 @@ def _fit_from_start(
                     work_budget_reached = True
                 else:
                     final_certificate_refinement = deepened
+                    probe_action = _certificate_probe_action(
+                        residual_before=residual_before_round,
+                        probe_residual=float(
+                            final_certificate_refinement.diagnostics.backward_error_kkt_residual
+                        ),
+                        certification_tolerance=float(cert_tol),
+                        recovery_stagnated=bool(recovery_stagnated),
+                    )
         else:
             next_refinement = terminal_refinement(
                 int(certificate_options.max_iter),
@@ -3182,14 +3188,29 @@ def _fit_from_start(
                 certificate_needs_final_pass = False
                 break
             final_certificate_refinement = next_refinement
+            probe_action = _certificate_probe_action(
+                residual_before=residual_before_round,
+                probe_residual=float(
+                    final_certificate_refinement.diagnostics.backward_error_kkt_residual
+                ),
+                certification_tolerance=float(cert_tol),
+                recovery_stagnated=bool(recovery_stagnated),
+            )
+        residual_before_round = float(
+            final_certificate_refinement.diagnostics.backward_error_kkt_residual
+        )
         certificate_needs_final_pass = False
         if not bool(torch.any(certificate_gradient.at_breakpoint).item()):
+            if probe_action == "plateau":
+                outer_stop_reason = "certificate_refinement_plateau"
             break
         interval_dual = getattr(state.certificate, "dual", None)
         if not torch.is_tensor(interval_dual):
             # A selected endpoint gradient is already a valid member of the
             # subgradient interval; compressed certificates simply cannot
             # improve a false negative by alternating the interval choice.
+            if probe_action == "plateau":
+                outer_stop_reason = "certificate_refinement_plateau"
             break
         remaining = _remaining_terminal_edge_pass_budget(
             work.total,
@@ -3229,6 +3250,8 @@ def _fit_from_start(
             rtol=0.0,
             atol=max(float(cert_tol) * 0.1, 1e-12),
         ):
+            if probe_action == "plateau":
+                outer_stop_reason = "certificate_refinement_plateau"
             break
         certificate_gradient = next_gradient
         certificate_needs_final_pass = True
