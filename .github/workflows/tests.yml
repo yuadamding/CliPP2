@@ -29,6 +29,10 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install '.[test]'
+      - name: Record numerical qualification environment
+        run: |
+          python -m pip freeze
+          python -c 'import platform, sys, torch; print(sys.version); print(platform.platform()); print(torch.__config__.show())'
       - name: Lint
         run: python -m ruff check .
       - name: Regressions including isolated wheel installation and CPU fit

@@ -2499,33 +2499,6 @@ def _fit_from_start(
     )
 
 
-def _validate_prepared_problem(
-    context: PreparedProblem, *, allow_deferred_graph: bool = False,
-) -> None:
-    """Validate frozen source identity without accepting a competing request."""
-    context.assert_runtime_unchanged()
-    data = context.source_data
-    if context.data_fingerprint != tumor_data_fingerprint(data):
-        raise ValueError("Prepared problem data fingerprint is inconsistent.")
-    source = compile_observed_model(data, eps=context.eps)
-    if (
-        context.source_model is None
-        or context.source_model.fingerprint != source.fingerprint
-        or context.model.source_fingerprint != source.fingerprint
-    ):
-        raise ValueError("Prepared problem likelihood or epsilon identity is inconsistent.")
-    if context.graph_spec.name == "deferred_likelihood_pilot" and not allow_deferred_graph:
-        raise ValueError("A deferred likelihood pilot is not a prepared fusion graph.")
-    if context.graph_hash != context.graph_spec.fingerprint:
-        raise ValueError("Prepared problem graph identity is inconsistent.")
-    key = make_base_objective_key(
-        source, graph_hash=context.graph_hash, eps=context.eps,
-        lower=source.lower, upper=source.upper,
-    )
-    if context.base_objective_key != key:
-        raise ValueError("Prepared problem objective identity is inconsistent.")
-
-
 def fit_prepared(
     problem: PreparedProblem,
     lambda_value: float,
@@ -2540,7 +2513,7 @@ def fit_prepared(
     Warm state and starts may change numerical effort, never the compiled
     likelihood, adaptive graph, epsilon, or float64 source authority.
     """
-    _validate_prepared_problem(problem)
+    problem.validate()
     data = problem.source_data
     _validate_solver_tolerance(solver_options.tolerance)
     _certificate_options(solver_options, problem.runtime.dtype)

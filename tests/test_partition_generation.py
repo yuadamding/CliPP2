@@ -1,6 +1,7 @@
 """Host-only Ward/CEM proposals retain the statistical and ordering contract."""
 
 from dataclasses import replace
+from itertools import product
 
 import numpy as np
 import pytest
@@ -10,7 +11,7 @@ from CliPP2.config import DIRICHLET_ALPHA, DIRICHLET_CODE_WEIGHT, resolve_fit_co
 from CliPP2.core.bic import effective_bic_mutation_region_count, fixed_partition_dirichlet_score
 from CliPP2.core.fusion import partition_starts as partitions
 from CliPP2.core.objective import compile_observed_model
-from CliPP2.core.scalar import partition_constrained_observed_refit
+from CliPP2.core.scalar import PartitionRefitResult, partition_constrained_observed_refit
 from test_integer_likelihood import EPS, integer_data
 
 
@@ -44,6 +45,52 @@ def test_empty_cluster_repair_keeps_k_and_chooses_lowest_cost_eligible_donor():
     assert len(np.unique(repaired)) == 3
 
 
+@pytest.mark.parametrize("cost_mode", ["finite", "tied", "infeasible"])
+def test_empty_cluster_repair_preserves_every_occupied_count(cost_mode):
+    # Every assignment (including all-empty-but-one and singleton donors) for
+    # N >= K must be repairable: an empty block implies a nonsingleton donor.
+    for n in range(1, 5):
+        for k in range(1, n + 1):
+            costs = np.zeros((n, k))
+            if cost_mode == "finite":
+                costs[:] = np.arange(n * k).reshape(n, k) % 7
+            elif cost_mode == "infeasible":
+                costs[:, 1:] = np.inf
+            for values in product(range(k), repeat=n):
+                labels = np.array(values)
+                repaired = partitions._repair_empty_clusters(labels, costs)
+                np.testing.assert_array_equal(np.unique(repaired), np.arange(k))
+                np.testing.assert_array_equal(labels, values)
+
+
+@pytest.mark.parametrize("k", [1, 2, 3, 4])
+def test_cem_returns_accepted_refit_with_canonical_fixed_k_labels(monkeypatch, k):
+    data = integer_data(((1,),) * 6)
+    labels = (np.arange(6) % k) * 7 + 8
+    template = _refit(data, labels)
+    refits = []
+
+    def refit(current_labels):
+        assert np.array_equal(current_labels, partitions._canonical_labels(current_labels))
+        assert np.unique(current_labels).size == k
+        loss = 200. if not refits else 100.
+        result = replace(template, labels=current_labels, loglik=-loss, fit_loss=loss,
+                         phi=template.cluster_centers[current_labels])
+        refits.append(result)
+        return result
+
+    costs = np.full((6, k), 100.)
+    costs[:, 0] = 0.
+    monkeypatch.setattr(partitions, "_loss_to_centers", lambda *args, **kwargs: costs)
+    result = partitions.refine_partition_likelihood(
+        data, labels, eps=EPS, tol=1e-6, max_iter=1, _refit_labels=refit,
+    )
+    assert isinstance(result, PartitionRefitResult)
+    assert result is refits[-1]
+    assert result.n_clusters == k
+    np.testing.assert_array_equal(np.unique(result.labels), np.arange(k))
+
+
 @pytest.mark.parametrize("proposed_loss,accepted", [(250., False), (100., True)])
 def test_cem_accepts_only_improvement_after_fixed_label_refit(monkeypatch, proposed_loss, accepted):
     data = integer_data(((1,),) * 4)
@@ -60,15 +107,30 @@ def test_cem_accepts_only_improvement_after_fixed_label_refit(monkeypatch, propo
 
     monkeypatch.setattr(partitions, "_loss_to_centers",
                         lambda *args, **kwargs: np.array([[0., 8.]] * 3 + [[8., 0.]]))
-    result = partitions.refine_partition_likelihood_with_trace(
+    result = partitions.refine_partition_likelihood(
         data, initial, eps=EPS, tol=1e-6, max_iter=3, _refit_labels=refit,
     )
     np.testing.assert_array_equal(result.labels, proposed if accepted else initial)
-    assert result.initial_k == result.final_k == 2 and result.component_death_count == 0
-    assert result.refit.fit_loss == (proposed_loss if accepted else 200.)
+    assert result.n_clusters == 2
+    assert result.fit_loss == (proposed_loss if accepted else 200.)
     assert len(calls) == 2
     np.testing.assert_array_equal(calls[0], initial)
     np.testing.assert_array_equal(calls[1], proposed)
+
+
+@pytest.mark.parametrize("proposed,current,accepted", [
+    (100., 100., False),
+    (np.nextafter(100., 0.), 100., False),
+    (100. - 1e-12, 100., False),
+    (100. - 1e-10, 100., True),
+    (101., 100., False),
+    (np.nan, 100., False),
+    (np.inf, np.inf, False),
+    (100., np.inf, True),
+    (100., np.nan, True),
+])
+def test_cem_strict_score_gate_keeps_roundoff_and_nonfinite_contract(proposed, current, accepted):
+    assert partitions._classification_score_strictly_improves(proposed, current) is accepted
 
 
 def test_missing_positive_depth_rows_do_not_enter_refit_or_score():
@@ -99,13 +161,13 @@ def test_masked_ambiguous_region_does_not_affect_host_assignment_or_cem():
     np.testing.assert_array_equal(partitions._loss_to_centers(low, centers, eps=EPS),
                                   partitions._loss_to_centers(high, centers, eps=EPS))
     labels = np.array([0, 0, 1, 1])
-    first, second = [partitions.refine_partition_likelihood_with_trace(
+    first, second = [partitions.refine_partition_likelihood(
         source, labels, eps=EPS, tol=1e-6, max_iter=3,
     ) for source in (low, high)]
     np.testing.assert_array_equal(first.labels, second.labels)
-    np.testing.assert_array_equal(first.refit.phi, second.refit.phi)
-    assert first.refit.loglik == second.refit.loglik
-    assert first.final_k == second.final_k == 2
+    np.testing.assert_array_equal(first.phi, second.phi)
+    assert first.loglik == second.loglik
+    assert first.n_clusters == second.n_clusters == 2
 
 
 def test_generator_keeps_both_families_one_refit_cache_and_ordered_dedup(monkeypatch):
@@ -125,12 +187,10 @@ def test_generator_keeps_both_families_one_refit_cache_and_ordered_dedup(monkeyp
     def cem(data, labels, **kwargs):
         assert kwargs["_model"] is source
         cem_calls.append(labels.copy())
-        return partitions.PartitionRefinementResult(
-            improved, kwargs["_refit_labels"](improved), 2, 2, 0,
-        )
+        return kwargs["_refit_labels"](improved)
 
     monkeypatch.setattr(partitions, "partition_constrained_observed_refit", refit)
-    monkeypatch.setattr(partitions, "refine_partition_likelihood_with_trace", cem)
+    monkeypatch.setattr(partitions, "refine_partition_likelihood", cem)
     # Different requested K with duplicate attained partitions must not create
     # repeated candidates or re-run the same immutable-label refit.
     candidates = partitions.generate_likelihood_partition_starts(
@@ -165,15 +225,16 @@ def test_retired_generation_modes_are_not_silently_redirected(removed):
 
 def test_retired_torch_refit_and_cem_symbols_are_absent():
     for name in ("partition_constrained_observed_refit_torch",
-                 "refine_partition_likelihood_torch_with_trace", "_loss_to_centers_torch"):
+                 "refine_partition_likelihood_torch_with_trace", "_loss_to_centers_torch",
+                 "PartitionRefinementResult", "refine_partition_likelihood_with_trace"):
         assert not hasattr(partitions, name)
 
 
 def test_torch_ward_remains_chunk_independent():
     rng = np.random.default_rng(12)
-    phi = torch.tensor(rng.uniform(.05, .95, (9, 4)))
-    curvature = torch.tensor(rng.lognormal(0, .8, (9, 4)))
-    kwargs = dict(K_grid=[1, 2, 4, 7, 9], device="cpu", dtype="float64")
+    phi = torch.tensor(rng.uniform(.05, .95, (9, 4)), dtype=torch.float64)
+    curvature = torch.tensor(rng.lognormal(0, .8, (9, 4)), dtype=torch.float64)
+    kwargs = dict(K_grid=[1, 2, 4, 7, 9])
     full = partitions.hessian_weighted_ward_label_sets_torch(phi, curvature, **kwargs)
     chunked = partitions.hessian_weighted_ward_label_sets_torch(
         phi, curvature, **kwargs, initial_pairwise_work_elements=36,

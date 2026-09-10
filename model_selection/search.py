@@ -13,7 +13,6 @@ from ..core.fusion.partition_starts import (
     observed_curvature_at_pilot_torch,
 )
 from ..core.fusion.solver import (
-    _validate_prepared_problem,
     fit_prepared,
     objective_shape_for_data,
     prepare_torch_problem_with_resource_policy,
@@ -545,7 +544,7 @@ def _partition_guided_admm_selection(
     )
     pilot_phi: StartArray = pilot_context.exact_pilot
     pilot_runtime = pilot_context.runtime
-    _validate_prepared_problem(pilot_context, allow_deferred_graph=True)
+    pilot_context.validate(allow_deferred_graph=True)
     guide_curvature = observed_curvature_at_pilot_torch(
         pilot_context.model, pilot_phi, eps=pilot_context.eps,
     )

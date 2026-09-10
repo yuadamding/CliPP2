@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 
 from CliPP2.config import resolve_fit_config
-from CliPP2.core.fusion import solver
 from CliPP2.core.fusion.torch_backend import resolve_runtime
 from CliPP2.core.fusion.partition_starts import generate_partition_initializer_pool
 from CliPP2.core.objective import compile_observed_model, model_to_torch
@@ -100,9 +99,9 @@ def test_forged_runtime_input_label_cannot_authorize_wrong_source_model():
     forged = replace(context, source_model=wrong, model=model_to_torch(wrong, runtime, eps=1e-6),
                      _tensor_snapshot=())
     with pytest.raises(ValueError, match="likelihood or epsilon"):
-        solver._validate_prepared_problem(forged)
+        forged.validate()
     with pytest.raises(ValueError, match="likelihood or epsilon"):
-        solver._validate_prepared_problem(replace(context, source_model=None))
+        replace(context, source_model=None).validate()
 
 
 def test_runtime_validation_supports_matching_nondefault_eps():

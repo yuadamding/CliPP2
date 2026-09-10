@@ -99,7 +99,7 @@ def test_hybrid_initializer_keeps_ward_cem_and_reference_settings(monkeypatch):
     result = partition_starts.generate_partition_initializer_pool(
         context=context, pilot_phi=context.exact_pilot,
         fit_options=resolve_fit_config(device="cpu"),
-        curvature="curvature",
+        curvature=context.exact_pilot,
     )
     assert result == ("candidate",)
     assert observed["k_grid"] == [*range(1, 16), 20, 25, 30, 31]

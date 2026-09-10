@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING, Literal, TypeAlias
 import numpy as np
 import torch
 
-from ...io.data import ImmutableArrayRecord, TumorData, readonly_array
+from ...io.data import ImmutableArrayRecord, TumorData, readonly_array, tumor_data_fingerprint
+from ..objective import compile_observed_model, make_base_objective_key
 from ...config import (
     DEFAULT_CERTIFICATE_MAX_ITER,
     DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
@@ -368,6 +369,30 @@ class PreparedProblem:
                 or tensor.dtype != dtype or tensor.device != device
             ):
                 raise ValueError(f"Prepared runtime tensor {name} changed; prepare a new problem.")
+
+    def validate(self, *, allow_deferred_graph: bool = False) -> None:
+        """Validate frozen source identity without accepting a competing request."""
+        self.assert_runtime_unchanged()
+        data = self.source_data
+        if self.data_fingerprint != tumor_data_fingerprint(data):
+            raise ValueError("Prepared problem data fingerprint is inconsistent.")
+        source = compile_observed_model(data, eps=self.eps)
+        if (
+            self.source_model is None
+            or self.source_model.fingerprint != source.fingerprint
+            or self.model.source_fingerprint != source.fingerprint
+        ):
+            raise ValueError("Prepared problem likelihood or epsilon identity is inconsistent.")
+        if self.graph_spec.name == "deferred_likelihood_pilot" and not allow_deferred_graph:
+            raise ValueError("A deferred likelihood pilot is not a prepared fusion graph.")
+        if self.graph_hash != self.graph_spec.fingerprint:
+            raise ValueError("Prepared problem graph identity is inconsistent.")
+        key = make_base_objective_key(
+            source, graph_hash=self.graph_hash, eps=self.eps,
+            lower=source.lower, upper=source.upper,
+        )
+        if self.base_objective_key != key:
+            raise ValueError("Prepared problem objective identity is inconsistent.")
 
 
 @dataclass(slots=True)

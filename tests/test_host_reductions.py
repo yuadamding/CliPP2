@@ -91,7 +91,7 @@ def test_center_costs_cem_and_map_match_full_derivative_route(monkeypatch, dtype
         for center in centers], axis=1)
     np.testing.assert_array_equal(cost, expected)
     labels = np.array([0, 1, 0, 1, 0, 1])
-    actual = partitions.refine_partition_likelihood_with_trace(
+    actual = partitions.refine_partition_likelihood(
         data, labels, eps=EPS, tol=1e-6, max_iter=3, refit_max_iter=32,
     )
 
@@ -99,14 +99,14 @@ def test_center_costs_cem_and_map_match_full_derivative_route(monkeypatch, dtype
         return getattr(objective.observed_terms_numpy(model, phi, eps=eps), output)
 
     monkeypatch.setattr(partitions, "_observed_reduction_numpy", full_reduction)
-    reference = partitions.refine_partition_likelihood_with_trace(
+    reference = partitions.refine_partition_likelihood(
         data, labels, eps=EPS, tol=1e-6, max_iter=3, refit_max_iter=32,
     )
     for name in ("labels", "phi", "cluster_centers"):
-        np.testing.assert_array_equal(getattr(actual.refit, name), getattr(reference.refit, name))
-    assert actual.refit.loglik == reference.refit.loglik
-    assert partitions._classification_refit_score(data, actual.labels, actual.refit) == (
-        partitions._classification_refit_score(data, reference.labels, reference.refit))
+        np.testing.assert_array_equal(getattr(actual, name), getattr(reference, name))
+    assert actual.loglik == reference.loglik
+    assert partitions._classification_refit_score(data, actual.labels, actual) == (
+        partitions._classification_refit_score(data, reference.labels, reference))
 
     phi = np.minimum(np.full(model.shape, .75), model.upper)
     posterior = objective.observed_terms_numpy(model, phi, eps=EPS).posterior

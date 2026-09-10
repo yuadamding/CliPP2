@@ -3,6 +3,114 @@
 Dated evidence for the changes below, not a claim that a moving branch or a
 new device/cohort is qualified. See [README.md](README.md) for current usage.
 
+## Portable curvature tests and final interface cleanup — 2026-09-10
+
+Reference: `932ea66aa221faebffbed785fcd3bafae6581c25`; version remains `0.5.0`.
+Final inference-source fingerprint:
+`ab0b1e861448a51c6b830a7cadd79c34d93303a181f8251cb39a64dbb448adeb`.
+Frozen reference archive SHA-256:
+`40c4d362d9295e732dfee82645155aa748edb2a04450f00018272d2c532de5bb`.
+
+### CI failure and its numerical cause
+
+The prior local result of **963 passed / 11 skipped** remains valid historical
+evidence, but did not qualify another dependency environment. The pinned
+[GitHub Actions job 102927160696](https://github.com/yuadamding/CliPP2/actions/runs/34493845322/job/102927160696)
+passed lint and failed regression with **1 failed / 962 passed / 11 skipped**.
+Its exact-equality curvature assertion stopped the combined test before its
+downstream labels, proposals and graph comparisons could execute.
+
+The original frozen test was reproduced with its CI dependency versions in a
+separate local environment. `ml1` was not modified. Both actual implementations
+were exercised with recomputed pilots: the supplied-model path and the former
+reconstruction convention using an independently constructed runtime model.
+Hooks captured the actual helper's left/center/right likelihood evaluations,
+pre-cap curvature, quantile cap and post-cap result; this was not a replacement
+implementation of the curvature arithmetic.
+
+| Environment | Python | PyTorch / NumPy | Float32 quantile cap |
+| --- | --- | --- | --- |
+| Historical/local `ml1`, CPU execution | 3.13.2 | 2.9.1+cu128 / 2.2.6 | `238.96022033691406` |
+| Original hosted CI, Ubuntu 24.04 | 3.13.15 | 2.14.0+cpu / 2.5.3 | `238.96023559570312` |
+| Isolated local CI-dependency reproduction | 3.13.2 | 2.14.0+cpu / 2.5.3 | `238.96023559570312` |
+
+The first divergence is **`torch.quantile(..., 0.995)`**, not model reuse:
+pilots, all three likelihood arrays and pre-cap curvature are bitwise equal
+across the two executed local environments. The cap differs by exactly one
+float32 ULP (`1.52587890625e-5`, relative difference about `6.39e-8`). Float64
+curvature is unchanged. Reuse/reconstruction match bitwise within **each**
+environment at every captured stage. Explicit downstream tests also establish
+unchanged Ward labels, proposal order/families, refits, scores, graph weights,
+scale and fingerprints for this fixture in both environments. These results
+localize a build-dependent quantile rounding difference; they do not establish
+universal cross-platform bitwise reproducibility or a cohort accuracy claim.
+
+The combined regression is split into independent construction-count,
+same-environment intermediate parity, pilot/source identity, portable curvature,
+Ward behavior, proposal/refit/score, and graph-identity tests. Only the portable
+curvature comparison permits **one ULP in its working dtype**, justified by
+the observed matrix. The stored goldens are unchanged. Labels, families,
+scores, CCFs and graph/source identities retain separate exact assertions, so
+a portable numerical mismatch no longer suppresses their execution. CI now
+records dependency versions, Python/platform information and Torch build
+configuration; it does not pin an older Torch merely to hide the discrepancy.
+
+### Bounded compaction and acceptance
+
+CEM returns its accepted `PartitionRefitResult` directly; the duplicate
+`PartitionRefinementResult`, copied labels and refit-derived K bookkeeping are
+removed. Exhaustive small repair cases establish that the retained empty-cluster
+repair policy preserves occupied K. Published `component_death_count` remains
+zero without independently tracking it. Leave-one-out costs, strict score
+improvement, canonicalization, cached refits, and both Ward/CEM families remain.
+
+`PreparedProblem.validate()` owns the previous validator body, with unchanged
+condition order and error messages. Fitting still rejects deferred graphs;
+pre-graph proposals explicitly opt into them while retaining every source,
+graph, objective and tensor-version check. The proposal module no longer
+imports a private optimizer validator. The normalized validation body matches
+the reference exactly after receiver renaming.
+
+Ward consumes matching float32/float64 tensors and allocates from them. Pilot
+and optional NumPy curvature normalization happens once at the proposal
+boundary. The extra runtime resolution inside each Ward call is removed.
+Cost arithmetic, chunking, heap/dense dispatch, tie-breaking and merge order
+are unchanged, including zero-curvature and near-tied fixtures.
+
+Both full CPU test environments pass **1,014 tests with 11 CUDA-only skips**;
+Ruff and `git diff --check` pass. The isolated dependency environment was
+unchanged before/after the suite. Its local Python patch version and host are
+not the hosted runner's, so this is **not a new green GitHub Actions run**.
+Fresh source-bound `ml1` captures match the pinned reference byte-for-byte:
+
+| Capture | Coverage | Matching SHA-256 |
+| --- | --- | --- |
+| Ward | 36 cases: both dtypes, one/three-region routes, full/chunked initialization, ties and every requested merge | `0b2fa4643b50281580063e1d32030fa570445cd01c1dffff66c39b23860a7e50` |
+| CEM repair | 14,463 assignment/repair cases, including tied/infeasible costs and input preservation | `1a92fff7e77749126a65f2dd5eb0c3e1a29b9d728ac0088a1187684911133754` |
+| CEM refits/proposals | 36 complete refits and six ordered proposal pools | `1500e6f28c3218fb1e6d8ca691225ccc02447182b057b6f91ff768df16ca1838` |
+| Raw/warm/hybrid | 17,994 numerical leaves, including identities, certificates, refits, scores and uncertainty | `ca13c62e829becec31422936a8e0e2f1f0d0f5f4c57cd16f582e00c4c3eac226` |
+| CNA-positive hybrid | 566 numerical leaves, public outputs and CNA-only macro/micro/weighted/per-class F1 | `52e3bf8dfcf8e1431d45dac757e890d5484ef6ddf7ed332d34d95503082dc7e4` |
+
+The CNA population remains exact `major_cn != minor_cn`, eight eligible rows
+per tiny fit. All four CNA fits preserve certified positive-lambda references,
+float64 audits and identical four-TSV contents. Some deliberately bounded raw
+fixtures remain uncertified identically; parity is not cohort success.
+
+The final reachability/ownership audit found concrete consumers for public
+exports, resource exceptions/preflights, compressed certificates, CUDA
+compiled/eager fallback and precision recovery. None is removed merely because
+it is exceptional. All production ALM warm inputs are actual multipliers or
+absent; direct low-level tests still exercise the optional scaled-input
+convention, which is retained in this bounded P1–P3 pass. No second optimizer
+rewrite or arbitrary module-count reduction is warranted by this audit.
+
+Inference source remains **34 modules**, decreasing **703,778 → 702,406 bytes**
+(1,372 bytes; 0.19%). No likelihood, graph, fusion norm, scalar reduction,
+score, candidate family, output schema, or balanced `0.004` gate changes.
+Source contraction and removed redundant work are not a measured GPU speedup.
+Hosted CI on the eventual committed patch, CUDA and representative release
+panels remain pending. No commit, push or remote run was made during this pass.
+
 ## Residual correctness and ALM consolidation — 2026-09-10
 
 Reference: `aa799344d2addb043b85034928cdb3c50e2d9b4b`; version remains `0.5.0`.

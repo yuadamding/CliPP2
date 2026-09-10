@@ -170,7 +170,7 @@ def test_preparation_preserves_nondefault_epsilon_and_float64_source():
     promoted = solver.promote_solver_context_dtype(context, dtype=torch.float64)
     assert promoted.eps == .02
     assert promoted.source_model is context.source_model
-    solver._validate_prepared_problem(promoted)
+    promoted.validate()
 
 
 @pytest.mark.parametrize("target", ["weights", "counts", "lower", "pilot", "preconditioner"])
@@ -201,9 +201,9 @@ def test_replacing_runtime_views_cannot_rebaseline_stale_identity():
 def test_runtime_precision_rebuild_is_bound_to_unchanged_host_sources():
     _, context = _prepared()
     promoted = solver.promote_solver_context_dtype(context, dtype=torch.float32)
-    solver._validate_prepared_problem(promoted)
+    promoted.validate()
     restored = solver.promote_solver_context_dtype(promoted, dtype=torch.float64)
-    solver._validate_prepared_problem(restored)
+    restored.validate()
     assert restored.source_model is context.source_model
     assert restored.graph_hash == context.graph_hash
     torch.testing.assert_close(restored.graph.weight, context.graph.weight, rtol=0, atol=0)

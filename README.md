@@ -119,7 +119,9 @@ a frozen complete residual for each simultaneous update. Host CEM costs and
 multiplicity posteriors skip derivatives without changing marginalization.
 ALM likewise has one driver with the original dense/streamed arithmetic; its
 outer caller receives only the actual edge multiplier. Curvature reuses the
-validated prepared model. Legacy and backward-error residual totals are derived
+validated prepared model, and Ward receives normalized tensors at its boundary.
+Prepared problems own validation; CEM returns its existing fixed-label refit.
+Legacy and backward-error residual totals are derived
 separately and fail closed on nonfinite or negative components; zero-radius
 edges remain in the graph and use an exact-zero-safe residual calculation.
 
@@ -228,6 +230,9 @@ and tools are excluded from the wheel. GitHub Actions runs these same CPU gates.
 Compare each revision with its explicit frozen numerical reference. Candidate
 support, scalar evidence, pilot/final proposal pools, graph identities, refits,
 scores and their uncertainties, and integer posteriors require paired validation.
+Portable numerical references use explicitly bounded dtype-aware comparisons;
+same-environment parity, labels and objective/graph identities remain separate
+exact checks. CI records dependency and build versions for attribution.
 CUDA and representative cohort/release-panel qualification remain necessary;
 passing CPU tests alone is not evidence of improved benchmark accuracy.
 

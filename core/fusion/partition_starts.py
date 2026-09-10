@@ -28,12 +28,7 @@ from ..scalar import (
     canonical_partition_labels as _canonical_labels,
     partition_constrained_observed_refit,
 )
-from .torch_backend import (
-    as_runtime_tensor,
-    dtype_name,
-    resolve_runtime,
-)
-from .solver import _validate_prepared_problem
+from .torch_backend import as_runtime_tensor
 from .types import PreparedProblem
 
 
@@ -54,15 +49,6 @@ class PartitionCandidate:
     finite_candidate_found: bool = True
     requested_k: int | None = None
     component_death_count: int = 0
-
-
-@dataclass(frozen=True)
-class PartitionRefinementResult:
-    labels: np.ndarray
-    refit: PartitionRefitResult
-    initial_k: int
-    final_k: int
-    component_death_count: int
 
 
 @torch.no_grad()
@@ -130,37 +116,22 @@ def observed_curvature_at_pilot_torch(
 
 @torch.no_grad()
 def hessian_weighted_ward_label_sets_torch(
-    exact_pilot: np.ndarray | torch.Tensor | object,
-    curvature: np.ndarray | torch.Tensor,
+    pilot_phi: torch.Tensor,
+    curvature: torch.Tensor,
     *,
     K_grid: Sequence[int],
-    device: str | torch.device | None = None,
-    dtype: str | torch.dtype | None = None,
     initial_pairwise_work_elements: int = _WARD_INITIAL_PAIRWISE_WORK_ELEMENTS,
 ) -> dict[int, np.ndarray]:
-    if torch.is_tensor(exact_pilot):
-        pilot_device = exact_pilot.device
-        pilot_dtype = exact_pilot.dtype
-    elif torch.is_tensor(curvature):
-        pilot_device = curvature.device
-        pilot_dtype = curvature.dtype
-    else:
-        pilot_device = torch.device(
-            "cuda" if device is None and torch.cuda.is_available() else "cpu"
-        )
-        pilot_dtype = torch.float64
-    runtime_device = torch.device(device) if device is not None else pilot_device
-    if dtype is None:
-        runtime_dtype = pilot_dtype
-    elif isinstance(dtype, torch.dtype):
-        runtime_dtype = dtype
-    else:
-        runtime_dtype = resolve_runtime(str(runtime_device), dtype=str(dtype)).dtype
-    runtime = resolve_runtime(str(runtime_device), dtype=dtype_name(runtime_dtype))
-    phi0 = as_runtime_tensor(exact_pilot, runtime)
-    h = as_runtime_tensor(curvature, runtime)
-    if tuple(phi0.shape) != tuple(h.shape):
-        raise ValueError("exact_pilot and curvature must have the same shape.")
+    """Run Ward on prepared tensors; proposal boundaries own normalization."""
+    if not torch.is_tensor(pilot_phi) or not torch.is_tensor(curvature):
+        raise TypeError("Ward requires pilot and curvature Tensors.")
+    if pilot_phi.ndim != 2 or pilot_phi.shape != curvature.shape:
+        raise ValueError("Ward pilot and curvature must have the same two-dimensional shape.")
+    if pilot_phi.dtype != curvature.dtype or pilot_phi.device != curvature.device:
+        raise ValueError("Ward pilot and curvature must share dtype and device.")
+    if pilot_phi.dtype not in (torch.float32, torch.float64):
+        raise ValueError("Ward requires float32 or float64 tensors.")
+    phi0, h = pilot_phi, curvature
     num_mutations = int(phi0.shape[0])
     requested = {int(k) for k in K_grid if 1 <= int(k) <= num_mutations}
     if not requested:
@@ -170,20 +141,16 @@ def hessian_weighted_ward_label_sets_torch(
     if int(initial_pairwise_work_elements) < 1:
         raise ValueError("initial_pairwise_work_elements must be positive.")
     max_nodes = max(2 * num_mutations - 1, 1)
-    H = torch.zeros(
-        (max_nodes, num_regions), dtype=runtime.dtype, device=runtime.device
-    )
+    H = phi0.new_zeros((max_nodes, num_regions))
     mu = torch.zeros_like(H)
     H[:num_mutations] = h
     mu[:num_mutations] = phi0
     mutation_cluster = torch.arange(
-        num_mutations, dtype=torch.long, device=runtime.device
+        num_mutations, dtype=torch.long, device=phi0.device
     )
 
-    finite_large = torch.finfo(runtime.dtype).max / 16.0
-    cost_matrix = torch.full(
-        (max_nodes, max_nodes), finite_large, dtype=runtime.dtype, device=runtime.device
-    )
+    finite_large = torch.finfo(phi0.dtype).max / 16.0
+    cost_matrix = phi0.new_full((max_nodes, max_nodes), finite_large)
     # Compute the exact singleton Ward costs in row blocks.  This retains the
     # same dense cost matrix and merge order while avoiding simultaneous
     # (M, M, S) denominator, weight, difference, and product tensors.  It is
@@ -198,10 +165,10 @@ def hessian_weighted_ward_label_sets_torch(
             int(initial_pairwise_work_elements) // pair_region_elements_per_row,
         ),
     )
-    all_columns = torch.arange(num_mutations, dtype=torch.long, device=runtime.device)
+    all_columns = torch.arange(num_mutations, dtype=torch.long, device=phi0.device)
     H_initial = H[:num_mutations]
     mu_initial = mu[:num_mutations]
-    tiny = torch.finfo(runtime.dtype).tiny
+    tiny = torch.finfo(phi0.dtype).tiny
     for row_start in range(0, num_mutations, initial_row_chunk):
         row_stop = min(row_start + initial_row_chunk, num_mutations)
         H_left = H_initial[row_start:row_stop].unsqueeze(1)
@@ -213,7 +180,7 @@ def hessian_weighted_ward_label_sets_torch(
         diff.square_().mul_(weight)
         initial_cost = 0.5 * torch.sum(diff, dim=2)
         row_ids = torch.arange(
-            row_start, row_stop, dtype=torch.long, device=runtime.device
+            row_start, row_stop, dtype=torch.long, device=phi0.device
         )
         upper_mask = all_columns.unsqueeze(0) > row_ids.unsqueeze(1)
         cost_matrix[row_start:row_stop, :num_mutations] = torch.where(
@@ -227,7 +194,7 @@ def hessian_weighted_ward_label_sets_torch(
     # Updating only rows whose current partner disappeared, plus rows improved
     # by the new cluster, preserves the same row-major argmin tie order. The
     # dense reduction remains faster for small multi-region CPU tensors.
-    use_row_heap = bool(runtime.device.type == "cuda" or num_regions == 1)
+    use_row_heap = bool(phi0.device.type == "cuda" or num_regions == 1)
     row_heap: list[tuple[float, int, int, int]] = []
     row_best_cost: np.ndarray | None = None
     row_best_column: np.ndarray | None = None
@@ -293,7 +260,7 @@ def hessian_weighted_ward_label_sets_torch(
         mu[new_id] = torch.where(
             H_new > 0.0,
             (H[left] * mu[left] + H[right] * mu[right])
-            / H_new.clamp_min(torch.finfo(runtime.dtype).tiny),
+            / H_new.clamp_min(torch.finfo(phi0.dtype).tiny),
             0.5 * (mu[left] + mu[right]),
         )
         mutation_cluster = torch.where(
@@ -313,14 +280,14 @@ def hessian_weighted_ward_label_sets_torch(
         cost_matrix[:, new_id] = finite_large
 
         other_ids = np.flatnonzero(active_cpu[:new_id])
-        other = torch.as_tensor(other_ids, dtype=torch.long, device=runtime.device)
+        other = torch.as_tensor(other_ids, dtype=torch.long, device=phi0.device)
         if other.numel():
             denom_vec = H[new_id].unsqueeze(0) + H[other]
             weight_vec = torch.where(
                 denom_vec > 0.0,
                 H[new_id].unsqueeze(0)
                 * H[other]
-                / denom_vec.clamp_min(torch.finfo(runtime.dtype).tiny),
+                / denom_vec.clamp_min(torch.finfo(phi0.dtype).tiny),
                 torch.zeros_like(denom_vec),
             )
             diff_vec = mu[new_id].unsqueeze(0) - mu[other]
@@ -344,7 +311,7 @@ def hessian_weighted_ward_label_sets_torch(
 
                 if invalid_rows.size:
                     invalid_tensor = torch.as_tensor(
-                        invalid_rows, dtype=torch.long, device=runtime.device
+                        invalid_rows, dtype=torch.long, device=phi0.device
                     )
                     refreshed_cost, refreshed_column = torch.min(
                         cost_matrix[invalid_tensor], dim=1
@@ -532,7 +499,7 @@ def _validated_refinement_labels(
     return _canonical_labels(labels)
 
 
-def refine_partition_likelihood_with_trace(
+def refine_partition_likelihood(
     data: TumorData,
     labels: np.ndarray,
     *,
@@ -543,10 +510,9 @@ def refine_partition_likelihood_with_trace(
     refit_max_iter: int = PARTITION_GENERATION_REFIT_MAX_ITER,
     _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
     _model: ObservedModel | None = None,
-) -> PartitionRefinementResult:
+) -> PartitionRefitResult:
     """Host CEM with fixed allocation scoring and empty-cluster repair."""
     labels = _validated_refinement_labels(data, labels)
-    initial_k = int(np.unique(labels).size)
     model = (
         compile_observed_model(data, eps=eps)
         if _model is None
@@ -591,15 +557,7 @@ def refine_partition_likelihood_with_trace(
         score = float(proposed_score)
         refit = proposed_refit
         labels = labels_next
-    final_labels = _canonical_labels(labels)
-    final_k = int(np.unique(final_labels).size)
-    return PartitionRefinementResult(
-        labels=final_labels,
-        refit=refit,
-        initial_k=int(initial_k),
-        final_k=int(final_k),
-        component_death_count=max(int(initial_k - final_k), 0),
-    )
+    return refit
 
 
 def _label_key(labels: np.ndarray) -> bytes:
@@ -645,16 +603,15 @@ def generate_likelihood_partition_starts(
     for requested_k in sorted(label_sets):
         labels0 = _canonical_labels(label_sets[int(requested_k)])
         for source in (f"hessian_ward_K{requested_k}", f"hessian_ward_cem_K{requested_k}"):
-            trace: PartitionRefinementResult | None = None
             if source.startswith("hessian_ward_cem"):
-                trace = refine_partition_likelihood_with_trace(
+                refit = refine_partition_likelihood(
                     data, labels0, eps=float(eps), tol=float(tol),
                     max_iter=int(cem_max_iter), refit_max_iter=int(refit_max_iter),
                     _refit_labels=cached_refit, _model=source_model,
                 )
-                labels_used, refit = trace.labels, trace.refit
             else:
-                refit, labels_used = cached_refit(labels0), labels0
+                refit = cached_refit(labels0)
+            labels_used = refit.labels
             key = _label_key(labels_used)
             if key in seen:
                 continue
@@ -665,7 +622,6 @@ def generate_likelihood_partition_starts(
                 bic=_classification_refit_score(data, labels_used, refit),
                 finite_candidate_found=bool(refit.finite_candidate_found),
                 requested_k=int(requested_k),
-                component_death_count=0 if trace is None else int(trace.component_death_count),
             ))
 
     by_k: dict[int, list[PartitionCandidate]] = {}
@@ -691,7 +647,7 @@ def generate_partition_initializer_pool(
     These scored proposals supply the raw guide and the independent direct
     candidate pool; final selection still refits labels under its own gate.
     """
-    _validate_prepared_problem(context, allow_deferred_graph=True)
+    context.validate(allow_deferred_graph=True)
     if float(fit_options.eps) != context.eps:
         raise ValueError("Partition options must preserve the prepared likelihood epsilon.")
     data, runtime = context.source_data, context.runtime
@@ -708,8 +664,10 @@ def generate_partition_initializer_pool(
         curvature = observed_curvature_at_pilot_torch(
             context.model, pilot_tensor, eps=context.eps,
         )
+    else:
+        curvature = as_runtime_tensor(curvature, runtime)
     label_sets = hessian_weighted_ward_label_sets_torch(
-        pilot_tensor, curvature, K_grid=k_grid, device=runtime.device, dtype=runtime.dtype,
+        pilot_tensor, curvature, K_grid=k_grid,
     )
     return tuple(generate_likelihood_partition_starts(
         data, eps=float(fit_options.eps), label_sets=label_sets,
