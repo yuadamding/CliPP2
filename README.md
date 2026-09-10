@@ -121,9 +121,29 @@ ALM likewise has one driver with the original dense/streamed arithmetic; its
 outer caller receives only the actual edge multiplier. Curvature reuses the
 validated prepared model, and Ward receives normalized tensors at its boundary.
 Prepared problems own validation; CEM returns its existing fixed-label refit.
+Terminal dense and compressed dual refinement use componentwise backward error
+for retention, stopping and plateau decisions, matching final raw admission;
+the legacy normalized residual remains diagnostic only. Full-step recovery
+requires both loss majorization and objective descent within its numerical
+allowances, increasing curvature on rejection without interpolating the primal.
 Legacy and backward-error residual totals are derived
 separately and fail closed on nonfinite or negative components; zero-radius
 edges remain in the graph and use an exact-zero-safe residual calculation.
+
+Ward reuses an `M x M` cost matrix with stable logical merge IDs and a shared
+row-minimum heap; exact ties do not depend on physical slot order. CUDA still
+uses host heap maintenance and transfers, so this is not fully device-resident.
+Proposal refits remain interval-certified scalar searches even in balanced
+mode; the final-refit policy is separate. A pool-local, bounded cluster-region
+cache reuses only identical source/membership/bounds/numerical-policy problems,
+preserving unresolved certificates and logical work diagnostics.
+
+Production proposal curvature still uses the historical working-dtype loss
+stencil. Its known float32 cancellation error is exposed by a separate strict
+expected-failure accuracy test, not hidden by relaxing the graph goldens.
+Source-float64 curvature is more accurate on the inspected smooth fixture,
+but changing this graph/proposal metric needs separate numerical qualification;
+clipping transitions also require an explicit nonsmooth convention.
 
 ## Outputs and integrity
 

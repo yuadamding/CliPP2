@@ -1,5 +1,5 @@
 """Fixed-primal dual updates and typed numerical diagnostics, CPU only."""
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import os
 
 import numpy as np
@@ -7,8 +7,165 @@ import pytest
 import torch
 
 from CliPP2.core.fusion import torch_backend as backend
+from CliPP2.core.fusion import certificates
+from CliPP2.core.fusion.graph_ops import tensorize_graph
 from CliPP2.core.fusion.solver import _backward_error_kkt_within_gate
-from CliPP2.core.fusion.types import KKTDiagnostics
+from CliPP2.core.fusion.types import (
+    CertificateOptions, CompressedEdgeCertificate, DenseEdgeCertificate,
+    KKTDiagnostics, PairwiseFusionGraph,
+)
+from CliPP2.core.objective import compile_observed_model, model_to_torch, observed_terms_torch
+from test_integer_likelihood import EPS, integer_data
+
+
+def _binomial_counterexample():
+    data = replace(
+        integer_data(((1,),) * 4, purity=1.),
+        alt_counts=np.array([[0.], [500.], [0.], [1.]]),
+        total_counts=np.array([[1500.], [500.], [3.], [1.]]),
+    )
+    model = model_to_torch(
+        compile_observed_model(data, eps=EPS),
+        backend.resolve_runtime("cpu", dtype="float64"), eps=EPS,
+    )
+    phi = torch.full((4, 1), .5, dtype=torch.float64)
+    gradient = observed_terms_torch(model, phi, eps=EPS).gradient
+    torch.testing.assert_close(
+        gradient, torch.tensor([[1000.], [-1000.], [2.], [-2.]], dtype=phi.dtype),
+        rtol=0, atol=0,
+    )
+    edge_u, edge_v = torch.triu_indices(4, 4, 1)
+    dual = torch.zeros((6, 1), dtype=phi.dtype)
+    dual[0] = -1000.
+    return dict(
+        phi=phi, grad_smooth=gradient, dual_kkt=dual,
+        lower=model.lower, upper=model.upper, edge_u=edge_u, edge_v=edge_v,
+        edge_w=torch.full((6,), 1 / 3, dtype=phi.dtype),
+        lambda_value=3000., atol=8e-4,
+    )
+
+
+def test_supported_binomial_witness_requires_authoritative_refinement():
+    kwargs = _binomial_counterexample()
+    frozen = {key: value.clone() for key, value in kwargs.items() if torch.is_tensor(value)}
+    before = backend.graph_fusion_kkt_residual_from_grad_torch(**kwargs)
+    assert before.kkt_residual == pytest.approx(.000249911, abs=1e-9)
+    assert before.kkt_residual < .004
+    assert before.backward_error_kkt_residual == 1.
+    exact = kwargs["dual_kkt"].clone()
+    exact[-1] = -2.
+    certified = backend.graph_fusion_kkt_residual_from_grad_torch(
+        **dict(kwargs, dual_kkt=exact),
+    )
+    assert certified.backward_error_kkt_residual == 0.
+    result = backend.refine_graph_fusion_dual_certificate_torch(**kwargs)
+    assert result["refinement_iterations"] > 0
+    assert result["status"] == "refined_fused_edge_dual"
+    assert result["diag"].backward_error_kkt_residual <= .004
+    for key, value in frozen.items():
+        assert torch.equal(kwargs[key], value), key
+
+
+def _counterexample_certificate_problem(*, compressed):
+    kwargs = _binomial_counterexample()
+    graph_spec = PairwiseFusionGraph(
+        edge_u=kwargs["edge_u"].numpy(), edge_v=kwargs["edge_v"].numpy(),
+        edge_w=kwargs["edge_w"].numpy(), degree_bound=3,
+    )
+    graph = tensorize_graph(
+        graph_spec, backend.resolve_runtime("cpu", dtype="float64"), num_nodes=4,
+    )
+    problem = certificates.CertificateProblem(
+        graph=graph, graph_hash=graph_spec.fingerprint,
+        lower=kwargs["lower"], upper=kwargs["upper"],
+        lambda_value=kwargs["lambda_value"], atol=kwargs["atol"],
+    )
+    gradient = certificates.CertificateGradient(
+        value=kwargs["grad_smooth"], scope="observed_objective",
+        directional_admissible=True, at_breakpoint=torch.zeros_like(kwargs["phi"], dtype=torch.bool),
+    )
+    witness_args = dict(graph_hash=problem.graph_hash, gradient_scope=gradient.scope)
+    witness = (
+        CompressedEdgeCertificate(
+            labels=torch.zeros(4, dtype=torch.long), centers=kwargs["phi"][:1].clone(),
+            internal_edge_ids=torch.arange(6), internal_dual=kwargs["dual_kkt"], **witness_args,
+        ) if compressed else DenseEdgeCertificate(dual=kwargs["dual_kkt"], **witness_args)
+    )
+    return dict(problem=problem, phi=kwargs["phi"], gradient=gradient, witness=witness)
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_certificate_wrapper_refines_legacy_passing_binomial_witness(compressed):
+    kwargs = _counterexample_certificate_problem(compressed=compressed)
+    before = certificates.certify(**kwargs, refine=False)
+    assert before.diagnostics.kkt_residual < .004
+    assert before.diagnostics.backward_error_kkt_residual == 1.
+    result = certificates.certify(**kwargs, refine=True)
+    assert result.diagnostics.backward_error_kkt_residual <= .004
+    assert result.certificate.graph_hash == kwargs["problem"].graph_hash
+    assert result.certificate.gradient_scope == "observed_objective"
+    after = certificates.certify(**dict(kwargs, witness=result.certificate), refine=False)
+    assert after.diagnostics == result.diagnostics
+
+
+def test_compressed_final_audit_rejects_legacy_only_passing_witness(monkeypatch):
+    kwargs = _counterexample_certificate_problem(compressed=True)
+
+    def unchanged_workset(**values):
+        return values["dual_start"], torch.zeros_like(values["phi"]), 0., 1
+
+    monkeypatch.setattr(certificates, "_optimize_internal_workset", unchanged_workset)
+    result = certificates.certify(
+        **kwargs, refine=True, options=CertificateOptions(refinement_rounds=0),
+    )
+    assert result.work_counters.full_certificate_audit_passes == 2
+    assert result.status == "not_certified"
+    assert result.diagnostics.kkt_residual < .004
+    assert result.diagnostics.backward_error_kkt_residual == 1.
+
+
+def test_dense_retention_and_plateau_receive_authoritative_residuals(monkeypatch):
+    kwargs = _problem(torch.float64, case="incoming_after_analytic")
+    audit_values = iter(zip([.01, .02, .003, .002, .001], [.95, .9, .8, .7, .75]))
+    traces, duals, plateaus = [], [], []
+
+    def audit(**values):
+        legacy, authoritative = next(audit_values)
+        diag = KKTDiagnostics(legacy, 0., 0., 0., authoritative, 0., 0.)
+        traces.append(diag)
+        duals.append(values["dual_kkt"].clone())
+        return diag
+
+    def plateau(**values):
+        plateaus.append(values)
+        return values["anchor_residual"], 0, False
+
+    monkeypatch.setattr(backend, "graph_fusion_kkt_residual_from_grad_torch", audit)
+    monkeypatch.setattr(backend, "_update_certificate_refinement_plateau", plateau)
+    result = backend.refine_graph_fusion_dual_certificate_torch(**kwargs, max_iter=3)
+    assert result["refinement_iterations"] == 3
+    assert result["diag"] == traces[3]
+    assert torch.equal(result["dual"], duals[3])
+    assert result["diag"].kkt_residual > traces[4].kkt_residual
+    assert [item["anchor_residual"] for item in plateaus] == [.9] * 3
+    assert [item["best_residual"] for item in plateaus] == [.8, .7, .7]
+
+
+def test_dense_target_stopping_uses_authoritative_residual(monkeypatch):
+    kwargs = _problem(torch.float64)
+    kwargs["atol"] = 8e-4
+    audits = []
+
+    def audit(**_values):
+        authoritative = [1., .9, .5, .003][len(audits)]
+        diag = KKTDiagnostics(.0001, 0., 0., 0., authoritative, 0., 0.)
+        audits.append(diag)
+        return diag
+
+    monkeypatch.setattr(backend, "graph_fusion_kkt_residual_from_grad_torch", audit)
+    result = backend.refine_graph_fusion_dual_certificate_torch(**kwargs)
+    assert result["refinement_iterations"] == 2
+    assert result["diag"].backward_error_kkt_residual == .003
 
 
 def _problem(dtype, *, case="fused"):
@@ -67,9 +224,6 @@ _PINNED = {
     "fused": (32, [.31180751631538306, .31180751631538306,
                     .26210321234714, .2323615986714042, .21212729076097853],
               .0008441646074105967),
-    "mixed": (22, [.3094601239615637, .2033664829756155,
-                    .20445049661434517, .20290922775396536, .20179518178152384],
-              .20064243691344535),
     "plateau": (8, [.21244472379441628] * 5, .21244472379441628),
     "incoming_after_analytic": (8, [.21213203435596428] + [.3343934897139791] * 4,
                                  .21213203435596428),
@@ -106,6 +260,18 @@ def test_chunking_preserves_sequences_status_and_best_witness(monkeypatch, dtype
         assert single["diag"].kkt_residual == pytest.approx(final, abs=tolerance)
         assert len(sequence) == iterations + 2
         assert single["diag"].kkt_residual == min(sequence)
+    if case == "mixed":
+        # The old legacy-residual policy ran 22 iterations and retained a
+        # lower legacy residual. All witnesses here instead have saturated
+        # authoritative error 1, so retain the analytic tie and stop at the
+        # componentwise moving-plateau limit. Edge-update arithmetic is unchanged.
+        assert single["refinement_iterations"] == 16
+        assert single["diag"].backward_error_kkt_residual == 1.
+        assert single["diag"].kkt_residual == pytest.approx(sequence[1], abs=tolerance)
+        assert sequence[:5] == pytest.approx([
+            .3094601239615637, .2033664829756155, .20445049661434517,
+            .20290922775396536, .20179518178152384,
+        ], abs=tolerance)
     if case in ("incoming", "incoming_after_analytic"):
         assert single["status"] == "input_dual_retained"
         assert not single["dual_refined"]

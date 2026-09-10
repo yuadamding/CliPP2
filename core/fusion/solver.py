@@ -1974,7 +1974,9 @@ def _fit_from_start(
                 if require_full_step_backtracking
                 else objective_tol
             )
-            if objective_gap <= recovery_armijo_rhs:
+            if objective_gap <= recovery_armijo_rhs and (
+                not audit_quadratic_majorizer or surrogate_gap <= majorization_tol
+            ):
                 accepted = True
                 accepted_full_steps += 1
                 candidate_phi = phi_trial
@@ -2012,7 +2014,8 @@ def _fit_from_start(
                     )
                 break
             if require_full_step_backtracking:
-                # A damped primal point does not share the full subproblem's
+                # A failed majorization or Armijo check requires a new full
+                # subproblem. A damped primal point does not share its
                 # dual certificate. Enlarge the persistent majorizing
                 # curvature and accept only a full proximal-MM/ADMM endpoint.
                 # If the resource limit is exhausted, leave this outer iterate

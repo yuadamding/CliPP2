@@ -184,8 +184,22 @@ def select_candidate_records(
     partition signature, compare score uncertainty intervals, choose the
     deterministic best partition, then take its least-penalized raw
     representative. Reporting rows have no authority in this function.
+
+    Boundary hits compare the selected representative lambda (not its
+    partition's support interval) with all admitted raw lambdas before
+    deduplication. Direct proposals and rejected raw fits do not extend that
+    explored range; a selected direct proposal has no lambda boundary hit.
     """
 
+    admitted_raw = [
+        record
+        for record in records
+        if isinstance(record.candidate, RawFusionCandidate)
+        and candidate_is_selection_eligible(record)
+        and record.lambda_value is not None
+        and np.isfinite(float(record.lambda_value))
+        and float(record.lambda_value) >= 0.0
+    ]
     representative_ids = candidate_representative_ids(
         records,
     )
@@ -258,15 +272,8 @@ def select_candidate_records(
     selected_lambdas = sorted(
         {
             _canonical_lambda(float(record.lambda_value))
-            for record in records
+            for record in admitted_raw
             if record.partition_signature == selected_signature
-            and isinstance(record.candidate, RawFusionCandidate)
-            and candidate_is_selection_eligible(
-                record,
-                )
-            and record.lambda_value is not None
-            and np.isfinite(float(record.lambda_value))
-            and float(record.lambda_value) >= 0.0
         }
     )
     selected_lambda_left = min(selected_lambdas) if selected_lambdas else None
@@ -274,8 +281,7 @@ def select_candidate_records(
     representative_lambda = selected.lambda_value
     evaluated_lambdas = [
         float(record.lambda_value)
-        for record in eligible
-        if record.lambda_value is not None
+        for record in admitted_raw
     ]
     lower_hit, upper_hit = _lambda_boundary_flags(
         evaluated_lambdas,

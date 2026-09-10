@@ -3,6 +3,166 @@
 Dated evidence for the changes below, not a claim that a moving branch or a
 new device/cohort is qualified. See [README.md](README.md) for current usage.
 
+## Certificate authority, recovery and phase costs — 2026-09-10
+
+Reference: `eda308d77b26bf0b4188186fb6da1ffe7438a685`; version remains `0.5.0`.
+Tested working-tree inference-source fingerprint:
+`726ca995c679f098318436e4dba5b285cf37ea871a4670edcf29f1bc7048e252`.
+Fresh reference archive SHA-256:
+`3d617774cf93cf0f18279582c037bad117261fe5fa8fdd6ebea91653a7e0b3a5`.
+
+### Correctness changes
+
+The supported four-mutation binomial example reproduces the review: at fixed
+phi `(0.5,0.5,0.5,0.5)`, gradients `(1000,-1000,2,-2)` and lambda 3000, the
+incoming witness has legacy residual `0.000249911143` but componentwise backward
+error `1.0`. The former routine returned without refining. Dense refinement now
+uses backward error for initial admission, incoming/analytic/best-witness
+ranking, target tests and plateau tracking. Compressed inherited-state and
+final full-audit gates use the same authority; legacy diagnostics remain.
+
+After 18 fixed-primal refinement iterations, backward error is
+`0.0032621643204`, passing the unchanged `0.004` gate. An explicitly constructed
+exact witness independently audits to zero. Primal, source counts, graph,
+weights, lambda and input dual are unchanged. This corrects false-negative
+certificate construction, not a demonstrated false-positive terminal audit.
+A mixed-case golden deliberately changes its plateau decision from 22 to 16
+iterations under the corrected authority; unchanged initial arithmetic and
+opposite-ranking/target/plateau cases have separate assertions.
+
+Recovery takes the stricter of the review's two proposed fixes: a full endpoint
+must satisfy checked loss majorization AND Armijo objective decrease, within
+the existing dtype-aware allowances. For the reviewed singleton likelihood,
+the trial `0.4 -> 0.08` decreases loss by `0.3145609871` but has majorization
+gap `4.6854390129`. It now triggers the existing curvature-enlargement/full-solve
+path. Budget exhaustion retains the original primal without damping. This is
+an optimizer acceptance correction, not a behavior-preserving refactor or a
+change to the statistical objective.
+
+Selection boundaries now use every eligible, admitted raw lambda before
+partition deduplication. A hit refers to the selected representative lambda,
+not the partition's separate support interval. A at 0.1, B at 1 and A again
+at 10 selects the same B/refit/score without falsely calling 1 the upper
+boundary. Rejected raw candidates and direct proposals' parent lambdas cannot
+extend the range. Tests cover reordering, redundant duplicates, a direct
+representative of a raw-supported partition, and the zero-edge singleton.
+
+### Measured behavior-preserving reductions
+
+Ward reuses `M x M` physical cost slots while retaining increasing logical
+merge IDs and exact heap ties. Shared row-minimum maintenance removes the
+unconditional full-matrix scan on every multi-region CPU merge. It remains
+quadratic storage; row refreshes, pathological ties, host heap growth and
+other solver allocations are not eliminated. CUDA still uses host transfers
+and synchronization; no fully device-resident implementation is claimed.
+
+In `ml1` (Python 3.13.2, Torch 2.9.1+cu128, NumPy 2.2.6), 848 cuts across 40
+random/tied/duplicate/zero-curvature fixtures match both the frozen parent and
+an independent full logical-matrix oracle exactly, in float32/float64. A
+read-only second review checked 24 additional 67-node/four-region near-tied,
+heterogeneous-curvature histories; every cut also matched.
+
+Three-repeat warmed, single-thread **Ward-only CPU** medians:
+
+| M | Regions | Dtype | Parent seconds | Revised seconds | Ratio |
+| --- | --- | --- | --- | --- | --- |
+| 128 | 3 | float32 | 0.01603 | 0.01515 | 1.06x |
+| 512 | 1 | float32 | 0.06678 | 0.06502 | 1.03x |
+| 512 | 3 | float32 | 0.52754 | 0.07533 | 7.00x |
+| 1024 | 3 | float32 | 4.03124 | 0.17513 | 23.0x |
+| 1024 | 6 | float32 | 4.02334 | 0.19319 | 20.8x |
+| 1024 | 6 | float64 | 4.24689 | 0.21627 | 19.6x |
+
+The M=1024 float32 persistent cost matrix decreases
+`16,760,836 -> 4,194,304` bytes (about 75%). This is NOT whole-process peak RAM,
+GPU memory, complete workflow admission sizing, or end-to-end acceleration.
+Source-bound reproduction and timing samples are retained outside Git in
+`../validation-ward-20260910-LmXDWE/benchmark_ward.py` and `observed.json`.
+
+Proposal generation owns a cluster-region LRU cache capped at 1,024 entries
+and 8 MiB of aggregate membership-key payload, without model/source-array
+retention. Keys bind source/model identity, sorted exact membership, region,
+bounds, epsilon, mode, effective coordinate tolerance, iteration/grid/local-step
+controls and breakpoint policy. Tolerance depends on K times region count:
+unchanged membership at another K cannot reuse a different-tolerance solve.
+Complete results retain exhausted/resolved status, lower bounds, uncertainty
+and logical work diagnostics. The full-partition cache and interval-certified
+proposal-refit policy remain, including in balanced mode.
+
+Two mixed-CN partitions sharing clusters need **16 -> 12** actual scalar calls;
+all refit fields are bitwise identical. A tiny real Ward/CEM pool needs
+**16 -> 14** calls with identical complete proposals. These establish avoided
+work, not robust end-to-end acceleration. Tests cover source/policy rejection,
+LRU/byte eviction, missing/zero-depth rows, exhausted results, source release
+and canonical labels. No cache survives its proposal-pool call.
+
+### Curvature: confirmed limitation, not silently changed
+
+Production retains the historical float32 stencil. Its old goldens and exact
+downstream proposal/graph tests have NOT been loosened. Independent mixture-
+Hessian and float64 autodifferentiation checks agree. At the SAME promoted
+float32 pilot, the reviewed coordinate has:
+
+| Calculation | Curvature | Relative error against analytic |
+| --- | --- | --- |
+| Production float32 loss stencil | 44.7052078247 | 15.8559% |
+| Source-float64 loss stencil | 53.1311662305 | 0.0034224% |
+| Analytic / independently autodifferentiated float64 | 53.1293479161 | reference |
+
+With the quantile cap disabled, source-float64 stencil error is below `1e-4`
+relative on every smooth coordinate in this fixture. A separate strict expected
+failure records that production float32 does not meet that accuracy target;
+it is not counted as a passing accuracy test. Other tests distinguish clipped
+plateaus, an exact kink (no ordinary Hessian), and a stencil crossing a kink.
+Float64 fixes loss-cancellation error, not the nonsmooth-stencil interpretation.
+
+Promoting this metric or replacing it by an analytic Hessian remains a separate
+behavior-changing numerical revision: Ward merges, proposals, noise scale and
+graph weights can change. This pass evaluates the alternative but does not
+switch the production estimator or claim that curvature accuracy is fixed.
+
+### Integration, CI and outstanding qualification
+
+The full final `ml1` CPU suite passes **1,094 tests**, with **12 explicit CUDA
+skips** and **one strict expected failure for the documented curvature error**.
+This includes isolated installed-wheel CPU fitting. Ruff and diff checks pass.
+
+Fresh source-bound captures run four 8-mutation CNA-positive CPU hybrid fits
+(gain and LOH, each in float32/float64) against the actual parent archive. All
+four succeed with a certified positive-lambda raw reference and float64 audit.
+Complete captures are byte-identical: labels, refitted CCFs, scores,
+graph/objective identity, numerical qualification, posteriors, all four TSVs
+and exact `major_cn != minor_cn` macro/micro/weighted/per-class F1:
+`52e3bf8dfcf8e1431d45dac757e890d5484ef6ddf7ed332d34d95503082dc7e4`.
+Each fit has eight eligible rows. Gain macro-F1 is `0.733333`, micro `0.75`;
+LOH macro-F1 is `0.873016`, micro `0.875`; weighted equals macro on these balanced
+truth classes. These tiny fixtures establish preservation, not cohort accuracy.
+Baseline/revised receipts and the harness are in
+`/storage/CliPP2/validation-eda308d-20260910-HLL87s`; both captures assert source identity at start
+and finish. No production timing claim is drawn from these executions.
+
+Hosted [CPU regression and wheel run 34498265860](https://github.com/yuadamding/CliPP2/actions/runs/34498265860/job/102942190044)
+for **parent `eda308d`** is independently verified successful:
+**1,014 passed, 11 skipped in 86.61 seconds**. This supersedes the pending-CI
+statement below; it does not qualify this new patch on the hosted runner.
+
+CUDA and representative cohorts remain unqualified. The `clipp2-run`/Seadragon
+skills require an immutable committed source and the project LSF runbook;
+`/data/CliPP2/docs/seadragon-lsf-gpu.md` is absent, and this patch is not committed.
+No remote jobs, commits or pushes were made. CUDA-only tests require explicit
+`CLIPP2_TEST_CUDA=1` inside an approved Seadragon LSF allocation.
+Follow-up must separate fixed-objective CPU64/CUDA64/CUDA32 parity from whole-
+workflow graph/proposal stability. Measure GPU compute, transfers/host heap,
+scalar counts/time, certificate effort, retries, fallbacks, end-to-end time and
+peak memory on frozen representative inputs. Include low purity, heterogeneous
+depth, missing observations, balanced/imbalanced gains, LOH and region-varying
+clonal CN; unsupported subclonal CN is an exclusion/audit test, not an
+estimation-accuracy target.
+
+Inference source remains 34 modules (`702,406 -> 705,852` bytes). The small
+net increase buys bounded exact reuse and correctness; no likelihood, fusion
+objective, graph recipe, score, output schema or balanced admission gate changes.
+
 ## Portable curvature tests and final interface cleanup — 2026-09-10
 
 Reference: `932ea66aa221faebffbed785fcd3bafae6581c25`; version remains `0.5.0`.

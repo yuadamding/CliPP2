@@ -706,7 +706,12 @@ def refine_graph_fusion_dual_certificate_torch(
     max_iter: int = 96,
     edge_work_bytes: int | None = None,
 ) -> dict[str, object]:
-    """Refine one fixed-primal witness using simultaneous bounded edge work."""
+    """Refine one fixed-primal witness against the raw-admission residual.
+
+    Legacy globally normalized diagnostics remain available in each audit,
+    but only componentwise backward error governs witness retention, target
+    stopping, and plateau detection.
+    """
     lambda_value = validate_lambda_value(lambda_value)
     num_edges, num_regions = int(edge_u.numel()), int(phi.shape[1])
     before_diag = graph_fusion_kkt_residual_from_grad_torch(
@@ -742,7 +747,7 @@ def refine_graph_fusion_dual_certificate_torch(
     incoming = (
         dual_kkt.to(dtype=phi.dtype, device=phi.device) if incoming_valid else None
     )
-    incoming_residual = before_diag.kkt_residual
+    incoming_residual = before_diag.backward_error_kkt_residual
     kkt_target = _CERTIFICATE_KKT_ATOL_SCALE * float(atol)
     if incoming_valid and np.isfinite(incoming_residual) and incoming_residual <= kkt_target:
         fused_edges, nonzero_edges = _graph_edge_activity_counts_torch(
@@ -790,7 +795,7 @@ def refine_graph_fusion_dual_certificate_torch(
     )
     best_dual = dual.clone()
     best_diag = analytic_diag
-    best_residual = analytic_diag.kkt_residual
+    best_residual = analytic_diag.backward_error_kkt_residual
     best_source = "analytic"
     # Reconstructed nonfused edges can improve feasibility while worsening
     # stationarity. Preserve an equally good or better incoming witness.
@@ -851,7 +856,7 @@ def refine_graph_fusion_dual_certificate_torch(
                 edge_w=edge_w, lambda_value=lambda_value, atol=atol,
                 edge_work_bytes=edge_work_bytes,
             )
-            residual = diag.kkt_residual
+            residual = diag.backward_error_kkt_residual
             if residual < best_residual:
                 best_residual, best_diag = residual, diag
                 if best_source == "incoming":

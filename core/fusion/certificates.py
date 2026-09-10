@@ -622,7 +622,7 @@ def _refine_compressed_certificate(
             atol=atol,
         )
         full_certificate_audit_passes += 1
-    if has_inherited_fast_path and before.kkt_residual <= 5.0 * float(atol):
+    if has_inherited_fast_path and before.backward_error_kkt_residual <= 5.0 * float(atol):
         # The inherited compressed state has already passed a full
         # original-graph audit.  Re-optimizing its workset cannot strengthen
         # that certificate and was the dominant CUDA cost on favorable warm
@@ -717,7 +717,7 @@ def _refine_compressed_certificate(
                 atol=atol,
             )
             full_certificate_audit_passes += 1
-            if final_diag.kkt_residual <= 5.0 * float(atol):
+            if final_diag.backward_error_kkt_residual <= 5.0 * float(atol):
                 status = "certified"
                 certificate = current
                 break

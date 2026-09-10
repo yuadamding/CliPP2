@@ -25,6 +25,7 @@ from ..objective import (
 from ..bic import fixed_partition_dirichlet_score
 from ..scalar import (
     PartitionRefitResult,
+    _RefitCoordinateCache,
     canonical_partition_labels as _canonical_labels,
     partition_constrained_observed_refit,
 )
@@ -150,9 +151,14 @@ def hessian_weighted_ward_label_sets_torch(
     )
 
     finite_large = torch.finfo(phi0.dtype).max / 16.0
-    cost_matrix = phi0.new_full((max_nodes, max_nodes), finite_large)
+    # Merge IDs remain immutable and increasing, but only M physical rows are
+    # needed. Reuse the left child's slot; a row stores costs only to greater
+    # logical IDs, irrespective of its physical column order.
+    cost_matrix = phi0.new_full((num_mutations, num_mutations), finite_large)
+    node_slot = np.full(max_nodes, -1, dtype=np.int64)
+    node_slot[:num_mutations] = np.arange(num_mutations)
     # Compute the exact singleton Ward costs in row blocks.  This retains the
-    # same dense cost matrix and merge order while avoiding simultaneous
+    # same cost arithmetic and merge order while avoiding simultaneous
     # (M, M, S) denominator, weight, difference, and product tensors.  It is
     # particularly important for multi-region cohorts with thousands of
     # mutations, where the former initializer could exhaust a 10-GiB GPU
@@ -189,31 +195,22 @@ def hessian_weighted_ward_label_sets_torch(
             finite_large,
         )
 
-    # Keep one exact minimum per matrix row in a lazy heap where it benchmarks
-    # faster: all CUDA inputs and the single-region CPU path used by CliPPSim.
-    # Updating only rows whose current partner disappeared, plus rows improved
-    # by the new cluster, preserves the same row-major argmin tie order. The
-    # dense reduction remains faster for small multi-region CPU tensors.
-    use_row_heap = bool(phi0.device.type == "cuda" or num_regions == 1)
-    row_heap: list[tuple[float, int, int, int]] = []
-    row_best_cost: np.ndarray | None = None
-    row_best_column: np.ndarray | None = None
-    row_version: np.ndarray | None = None
-    if use_row_heap:
-        initial_row_cost, initial_row_column = torch.min(cost_matrix, dim=1)
-        row_best_cost = (
-            initial_row_cost.detach().cpu().numpy().astype(np.float64, copy=True)
-        )
-        row_best_column = (
-            initial_row_column.detach().cpu().numpy().astype(np.int64, copy=True)
-        )
-        row_version = np.zeros((max_nodes,), dtype=np.int64)
-        row_heap = [
-            (float(row_best_cost[row]), row, int(row_best_column[row]), 0)
-            for row in range(num_mutations)
-            if float(row_best_cost[row]) < finite_large * 0.5
-        ]
-        heapq.heapify(row_heap)
+    # One exact row minimum, ranked by (cost, logical left ID, logical right
+    # ID), reproduces the original full logical-matrix row-major argmin.
+    # Share this maintenance across devices and region counts: no full-matrix
+    # scan is required on every multi-region CPU merge.
+    initial_row_cost, initial_row_column = torch.min(cost_matrix, dim=1)
+    row_best_cost = np.full(max_nodes, finite_large, dtype=np.float64)
+    row_best_column = np.zeros(max_nodes, dtype=np.int64)
+    row_best_cost[:num_mutations] = initial_row_cost.detach().cpu().numpy()
+    row_best_column[:num_mutations] = initial_row_column.detach().cpu().numpy()
+    row_version = np.zeros(max_nodes, dtype=np.int64)
+    row_heap = [
+        (float(row_best_cost[row]), row, int(row_best_column[row]), 0)
+        for row in range(num_mutations)
+        if float(row_best_cost[row]) < finite_large * 0.5
+    ]
+    heapq.heapify(row_heap)
 
     def current_labels() -> np.ndarray:
         return _canonical_labels(
@@ -229,25 +226,18 @@ def hessian_weighted_ward_label_sets_torch(
     active_cpu = np.zeros((max_nodes,), dtype=bool)
     active_cpu[:num_mutations] = True
     while active_count > 1 and requested - set(out):
-        if use_row_heap:
-            assert row_best_column is not None and row_version is not None
-            while row_heap:
-                min_cost, left, right, version = heapq.heappop(row_heap)
-                if (
-                    active_cpu[left]
-                    and active_cpu[right]
-                    and int(row_version[left]) == int(version)
-                    and int(row_best_column[left]) == int(right)
-                ):
-                    break
-            else:
-                min_cost = float("inf")
-                left = right = -1
+        while row_heap:
+            min_cost, left, right, version = heapq.heappop(row_heap)
+            if (
+                active_cpu[left]
+                and active_cpu[right]
+                and int(row_version[left]) == int(version)
+                and int(row_best_column[left]) == int(right)
+            ):
+                break
         else:
-            flat_index = int(torch.argmin(cost_matrix).item())
-            min_cost = float(cost_matrix.reshape(-1)[flat_index].item())
-            left = int(flat_index // max_nodes)
-            right = int(flat_index % max_nodes)
+            min_cost = float("inf")
+            left = right = -1
         if not np.isfinite(min_cost) or min_cost >= finite_large * 0.5:
             raise RuntimeError(
                 "Hessian-weighted Ward cost matrix exhausted before all clusters were merged."
@@ -272,12 +262,12 @@ def hessian_weighted_ward_label_sets_torch(
         active_cpu[left] = False
         active_cpu[right] = False
         active_cpu[new_id] = True
-        cost_matrix[left, :] = finite_large
-        cost_matrix[:, left] = finite_large
-        cost_matrix[right, :] = finite_large
-        cost_matrix[:, right] = finite_large
-        cost_matrix[new_id, :] = finite_large
-        cost_matrix[:, new_id] = finite_large
+        new_slot, right_slot = int(node_slot[left]), int(node_slot[right])
+        node_slot[new_id] = new_slot
+        cost_matrix[new_slot, :] = finite_large
+        cost_matrix[:, new_slot] = finite_large
+        cost_matrix[right_slot, :] = finite_large
+        cost_matrix[:, right_slot] = finite_large
 
         other_ids = np.flatnonzero(active_cpu[:new_id])
         other = torch.as_tensor(other_ids, dtype=torch.long, device=phi0.device)
@@ -292,52 +282,50 @@ def hessian_weighted_ward_label_sets_torch(
             )
             diff_vec = mu[new_id].unsqueeze(0) - mu[other]
             cost_vec = 0.5 * torch.sum(weight_vec * torch.square(diff_vec), dim=1)
-            cost_matrix[other, new_id] = cost_vec
-            if use_row_heap:
-                assert (
-                    row_best_cost is not None
-                    and row_best_column is not None
-                    and row_version is not None
+            other_slots = torch.as_tensor(node_slot[other_ids], device=phi0.device)
+            cost_matrix[other_slots, new_slot] = cost_vec
+            cost_values = cost_vec.detach().cpu().numpy()
+            invalid_best = np.isin(
+                row_best_column[other_ids],
+                np.asarray([left, right], dtype=np.int64),
+            )
+            invalid_rows = other_ids[invalid_best]
+            direct_rows = other_ids[
+                (~invalid_best) & (cost_values < row_best_cost[other_ids])
+            ]
+
+            if invalid_rows.size:
+                invalid_slots = torch.as_tensor(node_slot[invalid_rows], device=phi0.device)
+                # Slot order differs from logical ID order after reuse. Gather
+                # active columns in logical order so exact ties still select
+                # the smallest logical partner, never the smallest slot.
+                active_ids = np.append(other_ids, new_id)
+                active_slots = torch.as_tensor(node_slot[active_ids], device=phi0.device)
+                refreshed_cost, refreshed_column = torch.min(
+                    cost_matrix[invalid_slots[:, None], active_slots[None, :]], dim=1
                 )
-                cost_values = cost_vec.detach().cpu().numpy()
-                invalid_best = np.isin(
-                    row_best_column[other_ids],
-                    np.asarray([left, right], dtype=np.int64),
-                )
-                invalid_rows = other_ids[invalid_best]
-                direct_rows = other_ids[
-                    (~invalid_best) & (cost_values < row_best_cost[other_ids])
+                row_best_cost[invalid_rows] = refreshed_cost.detach().cpu().numpy()
+                row_best_column[invalid_rows] = active_ids[
+                    refreshed_column.detach().cpu().numpy()
                 ]
+            if direct_rows.size:
+                direct_positions = np.searchsorted(other_ids, direct_rows)
+                row_best_cost[direct_rows] = cost_values[direct_positions]
+                row_best_column[direct_rows] = new_id
 
-                if invalid_rows.size:
-                    invalid_tensor = torch.as_tensor(
-                        invalid_rows, dtype=torch.long, device=phi0.device
+            for row in np.concatenate((invalid_rows, direct_rows)):
+                row = int(row)
+                row_version[row] += 1
+                if float(row_best_cost[row]) < finite_large * 0.5:
+                    heapq.heappush(
+                        row_heap,
+                        (
+                            float(row_best_cost[row]),
+                            row,
+                            int(row_best_column[row]),
+                            int(row_version[row]),
+                        ),
                     )
-                    refreshed_cost, refreshed_column = torch.min(
-                        cost_matrix[invalid_tensor], dim=1
-                    )
-                    row_best_cost[invalid_rows] = refreshed_cost.detach().cpu().numpy()
-                    row_best_column[invalid_rows] = (
-                        refreshed_column.detach().cpu().numpy()
-                    )
-                if direct_rows.size:
-                    direct_positions = np.searchsorted(other_ids, direct_rows)
-                    row_best_cost[direct_rows] = cost_values[direct_positions]
-                    row_best_column[direct_rows] = new_id
-
-                for row in np.concatenate((invalid_rows, direct_rows)):
-                    row = int(row)
-                    row_version[row] += 1
-                    if float(row_best_cost[row]) < finite_large * 0.5:
-                        heapq.heappush(
-                            row_heap,
-                            (
-                                float(row_best_cost[row]),
-                                row,
-                                int(row_best_column[row]),
-                                int(row_version[row]),
-                            ),
-                        )
 
         active_count -= 1
         if active_count in requested:
@@ -587,6 +575,7 @@ def generate_likelihood_partition_starts(
     # One model, tolerance and scalar backend per call: immutable labels alone
     # identify each local refit, including repeated CEM proposals.
     refit_cache: dict[bytes, PartitionRefitResult] = {}
+    coordinate_cache = _RefitCoordinateCache()
 
     def cached_refit(labels: np.ndarray) -> PartitionRefitResult:
         labels_key = _label_key(labels)
@@ -596,6 +585,7 @@ def generate_likelihood_partition_starts(
         result = partition_constrained_observed_refit(
             data, labels, eps=float(eps), tol=float(tol),
             max_iter=max(int(refit_max_iter), 32), _model=source_model,
+            _coordinate_cache=coordinate_cache,
         )
         refit_cache[labels_key] = result
         return result

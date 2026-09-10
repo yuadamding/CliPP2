@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import heapq
 
 import numpy as np
 
 from ..config import validate_likelihood_precision
-from ..io.data import ImmutableArrayRecord, TumorData, readonly_array
+from ..io.data import ImmutableArrayRecord, TumorData, readonly_array, tumor_data_fingerprint
 from .objective import ObservedModel, candidate_terms_numpy, compile_observed_model
 
 
@@ -545,6 +546,62 @@ class _RefitCoordinateResult:
     best_second_loss_gap: float = float("inf")
 
 
+@dataclass(frozen=True, slots=True)
+class _RefitCoordinateKey:
+    source_hash: str
+    model_hash: str
+    members: bytes
+    region: int
+    lower: float
+    upper: float
+    eps: float
+    mode: str
+    tolerance: float
+    max_iter: int
+    grid_points: int
+    local_steps: int
+    include_breakpoints: bool
+
+
+class _RefitCoordinateCache:
+    """Pool-local LRU of complete scalar results, never model/source arrays.
+
+    Bound both entry overhead and the total variable-sized membership keys.
+    Budget-exhausted results are reusable only under the same exact policy;
+    their unresolved certificate and logical work counts remain unchanged.
+    """
+
+    def __init__(self, *, max_entries: int = 1024, max_membership_bytes: int = 8 * 1024**2):
+        if max_entries < 0 or max_membership_bytes < 0:
+            raise ValueError("Scalar cache limits must be nonnegative.")
+        self.max_entries = int(max_entries)
+        self.max_membership_bytes = int(max_membership_bytes)
+        self._membership_bytes = 0
+        self._entries: OrderedDict[_RefitCoordinateKey, _RefitCoordinateResult] = OrderedDict()
+
+    def get(self, key: _RefitCoordinateKey) -> _RefitCoordinateResult | None:
+        result = self._entries.get(key)
+        if result is not None:
+            self._entries.move_to_end(key)
+        return result
+
+    def put(self, key: _RefitCoordinateKey, result: _RefitCoordinateResult) -> None:
+        size = len(key.members)
+        if self.max_entries == 0 or size > self.max_membership_bytes:
+            return
+        if key in self._entries:
+            self._entries.pop(key)
+            self._membership_bytes -= size
+        self._entries[key] = result
+        self._membership_bytes += size
+        while (
+            len(self._entries) > self.max_entries
+            or self._membership_bytes > self.max_membership_bytes
+        ):
+            oldest, _ = self._entries.popitem(last=False)
+            self._membership_bytes -= len(oldest.members)
+
+
 def canonical_partition_labels(labels: np.ndarray) -> np.ndarray:
     values = np.asarray(labels, dtype=np.int64)
     if values.size == 0:
@@ -614,6 +671,7 @@ def partition_constrained_observed_refit(
     scalar_grid_points: int = 64,
     scalar_local_steps: int = 3,
     _model: ObservedModel | None = None,
+    _coordinate_cache: _RefitCoordinateCache | None = None,
 ) -> PartitionRefitResult:
     """Refit cluster centers without changing partition labels."""
 
@@ -663,27 +721,38 @@ def partition_constrained_observed_refit(
 
     for cluster in range(n_clusters):
         members = np.flatnonzero(normalized_labels == cluster)
+        # flatnonzero is sorted, fixing membership identity and summation order.
+        member_key = members.astype(np.int64, copy=False).tobytes() if _coordinate_cache is not None else b""
         for region in range(n_regions):
             lower = epsilon
             upper = float(np.min(upper_matrix[members, region]))
             if not np.isfinite(upper) or upper < lower:
                 upper = lower
-            coordinate = _fit_coordinate(
-                scalar_problem_from_model(
-                    model,
-                    members,
-                    region,
-                    lower=lower,
-                    upper=upper,
-                    eps=epsilon,
-                ),
-                mode=mode,
-                tolerance=coordinate_tolerance,
-                max_iter=max_iter,
-                grid_points=scalar_grid_points,
-                local_steps=scalar_local_steps,
-                include_breakpoints=True,
+            key = None if _coordinate_cache is None else _RefitCoordinateKey(
+                tumor_data_fingerprint(data), model.fingerprint, member_key, region,
+                lower, upper, epsilon, mode, coordinate_tolerance, int(max_iter),
+                int(scalar_grid_points), int(scalar_local_steps), True,
             )
+            coordinate = None if key is None else _coordinate_cache.get(key)
+            if coordinate is None:
+                coordinate = _fit_coordinate(
+                    scalar_problem_from_model(
+                        model,
+                        members,
+                        region,
+                        lower=lower,
+                        upper=upper,
+                        eps=epsilon,
+                    ),
+                    mode=mode,
+                    tolerance=coordinate_tolerance,
+                    max_iter=max_iter,
+                    grid_points=scalar_grid_points,
+                    local_steps=scalar_local_steps,
+                    include_breakpoints=True,
+                )
+                if key is not None:
+                    _coordinate_cache.put(key, coordinate)
             centers[cluster, region] = coordinate.beta
             coordinate_lower[cluster, region] = coordinate.global_lower_bound
             coordinate_certified[cluster, region] = coordinate.globally_certified
