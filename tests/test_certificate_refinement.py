@@ -138,7 +138,7 @@ def test_dense_retention_and_plateau_receive_authoritative_residuals(monkeypatch
 
     def plateau(**values):
         plateaus.append(values)
-        return values["anchor_residual"], 0, False
+        return values["anchor_residual"], values["anchor_merit"], 0, False
 
     monkeypatch.setattr(backend, "graph_fusion_kkt_residual_from_grad_torch", audit)
     monkeypatch.setattr(backend, "_update_certificate_refinement_plateau", plateau)
@@ -239,7 +239,7 @@ def test_chunking_preserves_sequences_status_and_best_witness(monkeypatch, dtype
     kwargs = _problem(dtype, case=case)
     phi_before = kwargs["phi"].clone()
     incoming_before = None if kwargs["dual_kkt"] is None else kwargs["dual_kkt"].clone()
-    single, sequence, _ = _capture(monkeypatch, kwargs, chunk_edges=100)
+    single, sequence, audited_duals = _capture(monkeypatch, kwargs, chunk_edges=100)
     streamed, streamed_sequence, _ = _capture(monkeypatch, kwargs, chunk_edges=2)
     tolerance = 2e-7 if dtype == torch.float32 else 1e-14
     assert streamed["status"] == single["status"]
@@ -261,13 +261,19 @@ def test_chunking_preserves_sequences_status_and_best_witness(monkeypatch, dtype
         assert len(sequence) == iterations + 2
         assert single["diag"].kkt_residual == min(sequence)
     if case == "mixed":
-        # The old legacy-residual policy ran 22 iterations and retained a
-        # lower legacy residual. All witnesses here instead have saturated
-        # authoritative error 1, so retain the analytic tie and stop at the
-        # componentwise moving-plateau limit. Edge-update arithmetic is unchanged.
-        assert single["refinement_iterations"] == 16
+        # Backward error remains saturated, but the cone violation decreases.
+        # Retain that progress within the same 32-iteration budget instead of
+        # falsely declaring a moving plateau at 16. Update arithmetic is unchanged.
+        assert single["refinement_iterations"] == 32
         assert single["diag"].backward_error_kkt_residual == 1.
-        assert single["diag"].kkt_residual == pytest.approx(sequence[1], abs=tolerance)
+        incidence = np.zeros((6, 4))
+        incidence[np.arange(6), kwargs["edge_u"].numpy()] = 1.
+        incidence[np.arange(6), kwargs["edge_v"].numpy()] = -1.
+        def merit(dual):
+            return np.linalg.norm(kwargs["grad_smooth"].numpy() + incidence.T @ dual.numpy())
+        retained = merit(single["dual"])
+        assert retained < merit(audited_duals[1])
+        assert retained == pytest.approx(min(map(merit, audited_duals[1:])), abs=tolerance)
         assert sequence[:5] == pytest.approx([
             .3094601239615637, .2033664829756155, .20445049661434517,
             .20290922775396536, .20179518178152384,

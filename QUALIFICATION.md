@@ -3,6 +3,166 @@
 Dated evidence for the changes below, not a claim that a moving branch or a
 new device/cohort is qualified. See [README.md](README.md) for current usage.
 
+## Saturated certificate progress and bounded auxiliary work — 2026-09-10
+
+Reference: `54c894c06d538b64e5f6264a7ab7d17f3163df5f`; version remains `0.5.0`.
+Tested working-tree inference-source fingerprint:
+`19a373cf5205ee796b74749fad5ef9511fcdae0e14b85bcd7a55da57dcd8be46`.
+This section supersedes the earlier claim that backward error alone suffices
+for plateau tracking. The historical observations below remain unchanged.
+
+### Reproduced false plateau and correction
+
+The review's four-node diploid binomial fixture has alternate counts
+`(24,25,24,25)`, reference counts `(75,72,75,72)`, purity one, frozen phi
+`(0.5,0.5,0.5,0.5)`, and gradients `(2,-2,2,-2)`. All six complete-graph edges
+have weight `1/3`, lambda is 12, and the incoming witness has `y01=4`, others
+zero. Its componentwise backward error is exactly one, but an explicit feasible
+witness `y01=y23=-2` independently audits to zero at the SAME primal point.
+
+The parent stops after 16 iterations and returns the original witness. Disabling
+only its plateau abort, as a diagnostic control, reaches the unchanged gate
+after 42 iterations. Backward error saturates while the unscaled box-cone
+violation decreases: normalized saturation is not evidence of genuine stagnation.
+
+Fixed-primal refinement now orders witnesses lexicographically by
+`(componentwise backward error, unscaled box-cone violation norm)`. The secondary
+quantity breaks exact primary ties; it cannot prefer a worse primary residual.
+Material improvement in either merit resets plateau patience, but dual motion
+alone cannot prevent a genuine stalled plateau. The original 8/16 patience
+rules, projected-dual updates, fixed iteration budget, exact box semantics,
+and `5*tol = 0.004` admission gate remain. Nonfinite values fail closed.
+The secondary norm reuses the same audit adjoint without a second graph
+reduction; it does not modify public diagnostics or substitute the legacy
+globally normalized residual for certification.
+
+Revised float64 CPU evidence (96 is the maximum budget, not extra patience):
+
+| Budget | Executed iterations | Backward error | Cone violation norm | Gate passed |
+| --- | --- | --- | --- | --- |
+| 8 | 8 | 1.0 | 6.666669 | no |
+| 16 | 16 | 1.0 | 4.714231 | no |
+| 24 | 24 | 1.0 | 2.828433 | no |
+| 96 | 42 | 0.003262204325 | 0.018393783 | yes |
+
+The incoming violation is `sqrt(80) = 8.944272`. Budget-limited runs now retain
+the improved witness WITHOUT claiming certification. Dense and 1/2-edge
+streamed routes pass the feasible-witness regression in float32 and float64;
+they preserve primal, counts, bounds, graph, weights, lambda and input dual.
+Other tests retain first-iteration arithmetic goldens and check conflicting
+primary/secondary/legacy rankings, nonfinite values, exact lower/upper/fixed
+coordinates, nearest-representable interior coordinates, and genuinely stalled
+cases. One mixed fixture deliberately changes from premature stop at 16 to its
+existing 32-iteration budget, while remaining correctly uncertified.
+
+### Positive-lambda recovery is tested, not merely inferred from a singleton
+
+The new four-node binomial recovery regression executes the real complete-graph
+ADMM at lambda 2 and records actual endpoints, summed likelihood majorization,
+nonzero graph penalty, and independent raw audits. In float64 its first endpoint
+lowers the penalized objective by `4.401882`, but misses loss majorization by
+`+5.033594` and is rejected. The next full endpoint has majorization gap
+`-1.850445`, decreases objective by `6.888710`, and is accepted undamped.
+Both working dtypes pass; one-attempt exhaustion retains the original primal.
+
+The accepted inner surrogate residual is `2.59694e-05`, whereas its final
+raw-objective audit remains `1.0`. The test requires this fit to remain
+uncertified, verifies the nonlinear gradient at the returned point, and
+independently repeats the float64 terminal audit on the frozen source/graph.
+Passing majorization or an inner surrogate certificate does not imply raw KKT
+admission. No production recovery or curvature rule was changed in this pass.
+
+### Memory and physical work: bounded terms, not whole-fit estimates
+
+Ward refresh gathers contain at most `max(1,000,000, active_columns)` elements
+per batch. Logical column order remains intact, so batching cannot change exact
+ties. Deterministic heap compaction discards stale records when the heap exceeds
+`max(64, 4*active_count)` after a merge. A merge can transiently add at most M
+records; the replacement list also has at most M records. Initialization block
+temporaries are released before the next block and before merging. Independent
+full logical-matrix oracles verify every requested cut under aggressive batching
+and compaction for float32/float64 random, duplicate, tied and zero-weight data.
+
+The checked-in [Ward benchmark](tools/benchmark_ward.py) binds runtime source,
+harness, environment, deterministic inputs, settings and repeated result hashes.
+It separates uninstrumented timings from a Python-allocation/phase pass; optional
+Torch profiling exposes kernel, copy and synchronization operations. CUDA use
+requires explicit LSF opt-in and a bound source fingerprint.
+
+Final-source `ml1` CPU refresh-stress fixture, M=2048, S=3, float32, one thread,
+five warmed repeats: Ward-only median **0.564955 seconds**. This is a reproducible
+observation, NOT a measured parent-to-patch or end-to-end speedup. Its largest
+refresh gather is **3,995,744 bytes**, versus the former first-refresh allocation
+of `2046*2047*4 = 16,752,648` bytes on the same fixture. Ten compactions leave a
+maximum observed heap of 5,934 entries. The persistent cost matrix itself is
+16,777,216 bytes; the largest single initialization pair-region tensor is
+15,998,976 bytes, with several such temporaries potentially live together.
+Python tracemalloc peaks at 1,370,602 bytes and excludes native tensor storage.
+These are distinct, nonadditive allocation terms—not a complete peak-memory
+bound. The source-bound receipt is
+`../validation-saturated-plateau-20260910-n5701j/ward-stress.json`.
+
+`_ScalarWorkStats` records cache hits/misses/evictions, dispatched scalar solves,
+failed solves, actual interval-bound/grid-point evaluations, and scalar seconds.
+Use `_work_stats=stats` on proposal generation; a coordinate cache shares its
+single sink. Physical counts include attempted calls that raise; shortcuts and
+hits do not invent solves/evaluations/time. Existing result counters remain
+logical and are not reinterpreted. No source tensors or output fields are added.
+The checked-in Ward/CEM fixture preserves complete returned proposals while
+reducing actual solves **16 -> 14** and interval evaluations **1328 -> 1266**, with
+**two coordinate hits**. This is exact avoided work, not a robust time estimate.
+Counter collection has small overhead and does not make scalar refits device-side.
+
+### Current checks and remaining release gates
+
+Full final `ml1` CPU regression: **1,215 passed, 16 explicit CUDA skips, one
+strict expected failure in 39.15 seconds**. Installed-wheel CPU fitting is
+included. Ruff, compilation and `git diff --check` pass. Inference source remains
+34 modules, increasing from 705,852 to 712,719 bytes. No likelihood, graph recipe,
+score, public output schema, admission threshold or production curvature changed.
+
+Fresh source-bound paired CNA smoke fits compare the revised tree with an
+archive of actual parent `54c894c` (archive SHA-256
+`eb9d2ab47804ac54a36f0cd4fe7e349acfd0145b7f85e0f5f0d35707ac6efe99`).
+All four eight-mutation cases per source succeed: gain/LOH in float32/float64.
+All **843 captured leaves** and **16 paired TSV files** are exactly equal,
+including labels, refitted CCFs, scores, source/graph/objective identities,
+qualification, posteriors, schema and CNA-only multiplicity F1. Each case has
+eight eligible `major_cn != minor_cn` rows. Gain macro/weighted-F1 is `0.733333`,
+micro-F1 `0.75`, per-class F1 `{1: 0.666667, 2: 0.8}`; LOH macro/weighted-F1
+is `0.873016`, micro-F1 `0.875`, per-class F1 `{1: 0.857143, 2: 0.888889}`.
+LOH float64 selects a direct partition; the other three select raw partitions.
+Those families and their independent raw references are preserved. These are
+tiny preservation fixtures, not representative accuracy estimates.
+
+Evidence, copied harness, frozen archive and start/end source receipts are in
+`../validation-54c894c-20260910-dkdDb3/`. The `comparison.json` SHA-256 is
+`efb1f2b63098495b3e490d32e79ca07945ae6f6cb0cd07759911d9db3dcf11e7`.
+Both source captures bind `ml1`; the revised fingerprint matches the one above.
+
+Hosted [CPU regression and wheel run 34505021464](https://github.com/yuadamding/CliPP2/actions/runs/34505021464)
+for committed **parent `54c894c`** is independently verified successful:
+**1,094 passed, 12 skipped, one expected failure in 91.69 seconds**.
+Its [CodeQL run](https://github.com/yuadamding/CliPP2/actions/runs/34505020224)
+also succeeded. These post-commit results do not qualify this uncommitted patch.
+
+Outstanding, explicitly not completed in this pass:
+
+- CUDA and representative-cohort qualification. The `clipp2-run`/Seadragon
+  workflow requires immutable committed source and the project LSF runbook;
+  `/data/CliPP2/docs/seadragon-lsf-gpu.md` is absent. No remote jobs were launched.
+  Run the opt-in tests on approved LSF GPUs after restoring that authority;
+  separate frozen-objective CPU64/CUDA64/CUDA32 parity from full-workflow
+  graph/proposal stability and measure actual full-fit time/peak memory.
+- A complete Ward-specific admission preflight. Bounded refresh/heap work and
+  measured allocation terms do not define a complete concurrent-memory model
+  or authoritative Ward budget. Existing graph/ADMM preflights must not be
+  presented as whole-workflow bounds. A rejecting Ward gate needs an explicit
+  resource budget and validated live-allocation model, not an invented threshold.
+- Production curvature accuracy. The strict expected failure is retained;
+  changing the metric, including boundary/kink policy, remains a separately
+  qualified numerical-policy change affecting proposals and graph construction.
+
 ## Certificate authority, recovery and phase costs — 2026-09-10
 
 Reference: `eda308d77b26bf0b4188186fb6da1ffe7438a685`; version remains `0.5.0`.

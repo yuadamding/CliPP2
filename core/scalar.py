@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import heapq
+from time import perf_counter
 
 import numpy as np
 
@@ -80,6 +81,26 @@ class ScalarGlobalMinimumCertificate:
     globally_certified: bool
     method: str
     intervals_evaluated: int
+
+
+@dataclass(slots=True)
+class _ScalarWorkStats:
+    """Ephemeral physical work, not the preserved logical refit counters.
+
+    Solves and evaluations count dispatched work, including a failing call.
+    Interval evaluations count lower-bound calls (not fixed-coordinate loss
+    evaluations); grid points count candidates sent to the grid loss routine.
+    The sink contains no model/source references and is not part of fit outputs.
+    """
+
+    cache_hits: int = 0
+    cache_misses: int = 0
+    cache_evictions: int = 0
+    scalar_solves: int = 0
+    scalar_failures: int = 0
+    interval_evaluations: int = 0
+    grid_points_evaluated: int = 0
+    scalar_seconds: float = 0.0
 
 
 def scalar_problem_from_model(
@@ -208,6 +229,7 @@ def approximate_scalar_minimum(
     local_steps: int,
     hint: float | None = None,
     include_breakpoints: bool = True,
+    _work_stats: _ScalarWorkStats | None = None,
 ) -> ApproximateScalarMinimum:
     """Deterministic bounded grid search with local bracket refinement."""
 
@@ -238,6 +260,8 @@ def approximate_scalar_minimum(
             dtype=np.float64,
         )
         if unique.size:
+            if _work_stats is not None:
+                _work_stats.grid_points_evaluated += int(unique.size)
             evaluated.update(
                 zip(unique.tolist(), np.asarray(scalar_loss(problem, unique)).tolist())
             )
@@ -394,6 +418,7 @@ def certify_scalar_minimum(
     tolerance: float,
     max_intervals: int,
     hint: float | None = None,
+    _work_stats: _ScalarWorkStats | None = None,
 ) -> ScalarGlobalMinimumCertificate:
     """Certify the global scalar minimum, or return a valid unresolved bound."""
 
@@ -451,9 +476,15 @@ def certify_scalar_minimum(
     heap: list[tuple[float, float, float, int]] = []
     intervals = 0
     serial = 0
+
+    def interval_bound(left: float, right: float) -> float:
+        if _work_stats is not None:
+            _work_stats.interval_evaluations += 1
+        return _interval_lower_bound(problem, left, right)
+
     for left, right in zip(points[:-1], points[1:]):
         if right > left:
-            bound = _interval_lower_bound(problem, float(left), float(right))
+            bound = interval_bound(float(left), float(right))
             heapq.heappush(heap, (bound, float(left), float(right), serial))
             intervals += 1
             serial += 1
@@ -474,7 +505,7 @@ def certify_scalar_minimum(
             continue
         consider(midpoint)
         for child_left, child_right in ((left, midpoint), (midpoint, right)):
-            child_bound = _interval_lower_bound(problem, child_left, child_right)
+            child_bound = interval_bound(child_left, child_right)
             intervals += 1
             if child_bound <= best_value:
                 heapq.heappush(
@@ -571,18 +602,25 @@ class _RefitCoordinateCache:
     their unresolved certificate and logical work counts remain unchanged.
     """
 
-    def __init__(self, *, max_entries: int = 1024, max_membership_bytes: int = 8 * 1024**2):
+    def __init__(
+        self, *, max_entries: int = 1024, max_membership_bytes: int = 8 * 1024**2,
+        work_stats: _ScalarWorkStats | None = None,
+    ):
         if max_entries < 0 or max_membership_bytes < 0:
             raise ValueError("Scalar cache limits must be nonnegative.")
         self.max_entries = int(max_entries)
         self.max_membership_bytes = int(max_membership_bytes)
         self._membership_bytes = 0
         self._entries: OrderedDict[_RefitCoordinateKey, _RefitCoordinateResult] = OrderedDict()
+        self.work = _ScalarWorkStats() if work_stats is None else work_stats
 
     def get(self, key: _RefitCoordinateKey) -> _RefitCoordinateResult | None:
         result = self._entries.get(key)
         if result is not None:
             self._entries.move_to_end(key)
+            self.work.cache_hits += 1
+        else:
+            self.work.cache_misses += 1
         return result
 
     def put(self, key: _RefitCoordinateKey, result: _RefitCoordinateResult) -> None:
@@ -600,6 +638,7 @@ class _RefitCoordinateCache:
         ):
             oldest, _ = self._entries.popitem(last=False)
             self._membership_bytes -= len(oldest.members)
+            self.work.cache_evictions += 1
 
 
 def canonical_partition_labels(labels: np.ndarray) -> np.ndarray:
@@ -622,42 +661,56 @@ def _fit_coordinate(
     grid_points: int,
     local_steps: int,
     include_breakpoints: bool,
+    _work_stats: _ScalarWorkStats | None = None,
 ) -> _RefitCoordinateResult:
-    if mode == "interval_certified":
-        result = certify_scalar_minimum(
+    started = perf_counter() if _work_stats is not None else 0.0
+    if _work_stats is not None:
+        _work_stats.scalar_solves += 1
+    try:
+        if mode == "interval_certified":
+            result = certify_scalar_minimum(
+                problem,
+                tolerance=tolerance,
+                max_intervals=max(int(max_iter) * 256, 4096),
+                _work_stats=_work_stats,
+            )
+            return _RefitCoordinateResult(
+                beta=float(result.argmin),
+                loss=float(result.attained_value),
+                global_lower_bound=float(result.global_lower_bound),
+                optimality_gap=float(result.optimality_gap),
+                finite_candidate_found=bool(np.isfinite(result.attained_value)),
+                globally_certified=bool(result.globally_certified),
+                certificate_method=str(result.method),
+                certificate_intervals=int(result.intervals_evaluated),
+            )
+        result = approximate_scalar_minimum(
             problem,
-            tolerance=tolerance,
-            max_intervals=max(int(max_iter) * 256, 4096),
+            grid_points=grid_points,
+            local_steps=local_steps,
+            include_breakpoints=include_breakpoints,
+            _work_stats=_work_stats,
         )
         return _RefitCoordinateResult(
             beta=float(result.argmin),
             loss=float(result.attained_value),
-            global_lower_bound=float(result.global_lower_bound),
-            optimality_gap=float(result.optimality_gap),
+            global_lower_bound=float("-inf"),
+            optimality_gap=float("inf"),
             finite_candidate_found=bool(np.isfinite(result.attained_value)),
-            globally_certified=bool(result.globally_certified),
+            globally_certified=False,
             certificate_method=str(result.method),
-            certificate_intervals=int(result.intervals_evaluated),
+            certificate_intervals=0,
+            grid_points=int(result.grid_points_evaluated),
+            grid_spacing=float(result.final_grid_spacing),
+            best_second_loss_gap=float(result.best_second_loss_gap),
         )
-    result = approximate_scalar_minimum(
-        problem,
-        grid_points=grid_points,
-        local_steps=local_steps,
-        include_breakpoints=include_breakpoints,
-    )
-    return _RefitCoordinateResult(
-        beta=float(result.argmin),
-        loss=float(result.attained_value),
-        global_lower_bound=float("-inf"),
-        optimality_gap=float("inf"),
-        finite_candidate_found=bool(np.isfinite(result.attained_value)),
-        globally_certified=False,
-        certificate_method=str(result.method),
-        certificate_intervals=0,
-        grid_points=int(result.grid_points_evaluated),
-        grid_spacing=float(result.final_grid_spacing),
-        best_second_loss_gap=float(result.best_second_loss_gap),
-    )
+    except Exception:
+        if _work_stats is not None:
+            _work_stats.scalar_failures += 1
+        raise
+    finally:
+        if _work_stats is not None:
+            _work_stats.scalar_seconds += perf_counter() - started
 
 
 def partition_constrained_observed_refit(
@@ -672,9 +725,14 @@ def partition_constrained_observed_refit(
     scalar_local_steps: int = 3,
     _model: ObservedModel | None = None,
     _coordinate_cache: _RefitCoordinateCache | None = None,
+    _work_stats: _ScalarWorkStats | None = None,
 ) -> PartitionRefitResult:
     """Refit cluster centers without changing partition labels."""
 
+    if _coordinate_cache is not None:
+        if _work_stats is not None and _work_stats is not _coordinate_cache.work:
+            raise ValueError("Refit and cache must share one physical-work sink.")
+        _work_stats = _coordinate_cache.work
     tolerance = float(tol)
     epsilon = float(eps)
     if not np.isfinite(tolerance) or tolerance <= 0.0:
@@ -750,6 +808,7 @@ def partition_constrained_observed_refit(
                     grid_points=scalar_grid_points,
                     local_steps=scalar_local_steps,
                     include_breakpoints=True,
+                    _work_stats=_work_stats,
                 )
                 if key is not None:
                     _coordinate_cache.put(key, coordinate)

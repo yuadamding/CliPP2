@@ -26,6 +26,7 @@ from ..bic import fixed_partition_dirichlet_score
 from ..scalar import (
     PartitionRefitResult,
     _RefitCoordinateCache,
+    _ScalarWorkStats,
     canonical_partition_labels as _canonical_labels,
     partition_constrained_observed_refit,
 )
@@ -37,6 +38,53 @@ from .types import PreparedProblem
 # unchunked broadcast has shape (M, M, S), so its memory grows by several
 # copies of M^2*S even though the persistent Ward state is only O(M^2).
 _WARD_INITIAL_PAIRWISE_WORK_ELEMENTS = 4_000_000
+# Refresh gathers need no region axis. Each temporary holds at most this
+# many elements, except that one complete active row is the minimum unit.
+_WARD_REFRESH_WORK_ELEMENTS = 1_000_000
+_WARD_HEAP_ACTIVE_MULTIPLIER = 4
+_WARD_HEAP_MIN_ENTRIES = 64
+
+
+def _ward_refresh_minima(
+    cost_matrix: torch.Tensor,
+    invalid_rows: np.ndarray,
+    active_ids: np.ndarray,
+    node_slot: np.ndarray,
+    row_best_cost: np.ndarray,
+    row_best_column: np.ndarray,
+    work_elements: int,
+) -> None:
+    """Bound each gather by max(work_elements, active columns), preserving ties."""
+    active_slots = torch.as_tensor(node_slot[active_ids], device=cost_matrix.device)
+    rows_per_chunk = max(1, int(work_elements) // int(active_ids.size))
+    for start in range(0, int(invalid_rows.size), rows_per_chunk):
+        rows = invalid_rows[start:start + rows_per_chunk]
+        slots = torch.as_tensor(node_slot[rows], device=cost_matrix.device)
+        # Slot order differs from logical ID order after reuse. The complete
+        # active-column axis stays in logical order in every batch, so min's
+        # first exact tie remains the smallest logical partner.
+        costs, columns = torch.min(
+            cost_matrix[slots[:, None], active_slots[None, :]], dim=1
+        )
+        row_best_cost[rows] = costs.detach().cpu().numpy()
+        row_best_column[rows] = active_ids[columns.detach().cpu().numpy()]
+
+
+def _ward_compact_heap(
+    row_heap: list,
+    active_cpu: np.ndarray,
+    row_best_cost: np.ndarray,
+    row_best_column: np.ndarray,
+    row_version: np.ndarray,
+    finite_large: float,
+) -> None:
+    """Discard stale entries without changing the logical lexicographic order."""
+    row_heap[:] = [
+        (float(row_best_cost[row]), int(row), int(row_best_column[row]), int(row_version[row]))
+        for row in np.flatnonzero(active_cpu)
+        if float(row_best_cost[row]) < finite_large * 0.5
+    ]
+    heapq.heapify(row_heap)
 
 
 @dataclass(frozen=True)
@@ -122,6 +170,7 @@ def hessian_weighted_ward_label_sets_torch(
     *,
     K_grid: Sequence[int],
     initial_pairwise_work_elements: int = _WARD_INITIAL_PAIRWISE_WORK_ELEMENTS,
+    refresh_work_elements: int = _WARD_REFRESH_WORK_ELEMENTS,
 ) -> dict[int, np.ndarray]:
     """Run Ward on prepared tensors; proposal boundaries own normalization."""
     if not torch.is_tensor(pilot_phi) or not torch.is_tensor(curvature):
@@ -141,6 +190,8 @@ def hessian_weighted_ward_label_sets_torch(
     num_regions = int(phi0.shape[1])
     if int(initial_pairwise_work_elements) < 1:
         raise ValueError("initial_pairwise_work_elements must be positive.")
+    if int(refresh_work_elements) < 1:
+        raise ValueError("refresh_work_elements must be positive.")
     max_nodes = max(2 * num_mutations - 1, 1)
     H = phi0.new_zeros((max_nodes, num_regions))
     mu = torch.zeros_like(H)
@@ -194,6 +245,9 @@ def hessian_weighted_ward_label_sets_torch(
             initial_cost,
             finite_large,
         )
+        # Do not retain one block while allocating the next, or keep the last
+        # block alive throughout merging alongside later refresh temporaries.
+        del denom, weight, diff, initial_cost, row_ids, upper_mask
 
     # One exact row minimum, ranked by (cost, logical left ID, logical right
     # ID), reproduces the original full logical-matrix row-major argmin.
@@ -295,19 +349,10 @@ def hessian_weighted_ward_label_sets_torch(
             ]
 
             if invalid_rows.size:
-                invalid_slots = torch.as_tensor(node_slot[invalid_rows], device=phi0.device)
-                # Slot order differs from logical ID order after reuse. Gather
-                # active columns in logical order so exact ties still select
-                # the smallest logical partner, never the smallest slot.
-                active_ids = np.append(other_ids, new_id)
-                active_slots = torch.as_tensor(node_slot[active_ids], device=phi0.device)
-                refreshed_cost, refreshed_column = torch.min(
-                    cost_matrix[invalid_slots[:, None], active_slots[None, :]], dim=1
+                _ward_refresh_minima(
+                    cost_matrix, invalid_rows, np.append(other_ids, new_id),
+                    node_slot, row_best_cost, row_best_column, int(refresh_work_elements),
                 )
-                row_best_cost[invalid_rows] = refreshed_cost.detach().cpu().numpy()
-                row_best_column[invalid_rows] = active_ids[
-                    refreshed_column.detach().cpu().numpy()
-                ]
             if direct_rows.size:
                 direct_positions = np.searchsorted(other_ids, direct_rows)
                 row_best_cost[direct_rows] = cost_values[direct_positions]
@@ -328,6 +373,16 @@ def hessian_weighted_ward_label_sets_torch(
                     )
 
         active_count -= 1
+        # At most active_count-1 rows were pushed in this merge. Rebuilding
+        # here bounds stale Python heap storage by O(M), including the temporary
+        # replacement list; it does not alter cost arithmetic or tie order.
+        if len(row_heap) > max(
+            _WARD_HEAP_MIN_ENTRIES, _WARD_HEAP_ACTIVE_MULTIPLIER * active_count
+        ):
+            _ward_compact_heap(
+                row_heap, active_cpu, row_best_cost, row_best_column,
+                row_version, finite_large,
+            )
         if active_count in requested:
             out[active_count] = current_labels()
     return out
@@ -562,6 +617,7 @@ def generate_likelihood_partition_starts(
     cem_max_iter: int = PARTITION_CEM_MAX_ITER,
     refit_max_iter: int = PARTITION_GENERATION_REFIT_MAX_ITER,
     tol: float = 1e-3,
+    _work_stats: _ScalarWorkStats | None = None,
 ) -> list[PartitionCandidate]:
     """Refit plain Ward and host-CEM proposals under one fixed score policy."""
     label_sets = {
@@ -575,7 +631,7 @@ def generate_likelihood_partition_starts(
     # One model, tolerance and scalar backend per call: immutable labels alone
     # identify each local refit, including repeated CEM proposals.
     refit_cache: dict[bytes, PartitionRefitResult] = {}
-    coordinate_cache = _RefitCoordinateCache()
+    coordinate_cache = _RefitCoordinateCache(work_stats=_work_stats)
 
     def cached_refit(labels: np.ndarray) -> PartitionRefitResult:
         labels_key = _label_key(labels)

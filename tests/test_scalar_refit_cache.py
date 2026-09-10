@@ -1,6 +1,6 @@
 """Exact cluster-region reuse without changing scalar policy or certificates."""
 
-from dataclasses import fields, replace
+from dataclasses import asdict, fields, replace
 from time import perf_counter
 import weakref
 
@@ -57,7 +57,10 @@ def coordinate_calls(monkeypatch):
 @pytest.mark.parametrize("mode", ["interval_certified", "grid_local"])
 def test_cache_reuses_exact_clusters_and_all_logical_refit_fields(mode, coordinate_calls):
     data = _data()
-    expected = [_refit(data, labels, scalar_mode=mode) for labels in (P, Q)]
+    uncached = scalar._ScalarWorkStats()
+    expected = [
+        _refit(data, labels, scalar_mode=mode, _work_stats=uncached) for labels in (P, Q)
+    ]
     assert len(coordinate_calls) == 16
     coordinate_calls.clear()
     cache = scalar._RefitCoordinateCache()
@@ -65,8 +68,17 @@ def test_cache_reuses_exact_clusters_and_all_logical_refit_fields(mode, coordina
     assert len(coordinate_calls) == 12  # Two shared clusters, in both regions.
     for left, right in zip(expected, actual):
         _assert_equal(left, right)
+    assert uncached.scalar_solves == 16 and cache.work.scalar_solves == 12
+    assert (cache.work.cache_hits, cache.work.cache_misses) == (4, 12)
+    work_field = "interval_evaluations" if mode == "interval_certified" else "grid_points_evaluated"
+    logical_field = "global_certificate_intervals" if mode == "interval_certified" else "refit_total_grid_points"
+    assert 0 < getattr(cache.work, work_field) < getattr(uncached, work_field)
+    assert getattr(uncached, work_field) == sum(getattr(item, logical_field) for item in expected)
+    before = asdict(cache.work)
     _assert_equal(_refit(data, P * 7 + 10, cache, scalar_mode=mode), expected[0])
     assert len(coordinate_calls) == 12
+    assert asdict(cache.work) == {**before, "cache_hits": 12}
+    assert uncached.scalar_seconds > 0 and cache.work.scalar_seconds > 0
 
 
 def test_different_k_changes_coordinate_tolerance_and_cannot_reuse(coordinate_calls):
@@ -120,7 +132,11 @@ def test_missing_and_zero_depth_coordinates_retain_exact_certificate_fields(coor
     expected = _refit(data)
     actual = _refit(data, cache=cache)
     _assert_equal(actual, expected)
+    before = asdict(cache.work)
     _assert_equal(_refit(data, cache=cache), expected)
+    assert asdict(cache.work) == {**before, "cache_hits": 8}
+    assert cache.work.scalar_solves == 8
+    assert cache.work.interval_evaluations == expected.global_certificate_intervals
     assert len(coordinate_calls) == 16
     assert np.all(actual.cluster_centers[2] == (1.0 + EPS) / 2.0)
     assert actual.cluster_centers[0, 1] == (1.0 + EPS) / 2.0
@@ -144,6 +160,9 @@ def test_exhausted_certificate_is_reused_without_becoming_resolved(monkeypatch, 
     assert actual.global_optimality_gap == 24.0
     assert actual.global_certificate_intervals == 8 * 4096
     assert actual.refit_total_refined_candidates == expected.refit_total_refined_candidates
+    assert (cache.work.scalar_solves, cache.work.cache_hits, cache.work.cache_misses) == (8, 8, 8)
+    # The injected certificate reports logical work, but executes no bounds.
+    assert cache.work.interval_evaluations == 0
 
 
 def test_cache_bounds_entry_overhead_and_membership_bytes_and_evicts_lru():
@@ -173,6 +192,8 @@ def test_cache_bounds_entry_overhead_and_membership_bytes_and_evicts_lru():
     empty = scalar._RefitCoordinateCache(max_entries=0)
     empty.put(*entries[0])
     assert not empty._entries
+    assert cache.work.cache_evictions == 1
+    assert bytes_only.work.cache_evictions == len(entries) - 1
 
 
 def test_cache_retains_no_source_or_compiled_model():
@@ -183,6 +204,84 @@ def test_cache_retains_no_source_or_compiled_model():
     del data, model
     assert source_ref() is None and array_ref() is None
     assert cache._entries
+    assert all(isinstance(value, (int, float)) for value in asdict(cache.work).values())
+
+
+@pytest.mark.parametrize("capacity", [0, 1])
+def test_disabled_and_evicted_cache_repeats_physical_work_without_logical_change(capacity):
+    data, cache = _data(), scalar._RefitCoordinateCache(max_entries=capacity)
+    first = _refit(data, cache=cache, scalar_mode="grid_local")
+    before = asdict(cache.work)
+    _assert_equal(_refit(data, cache=cache, scalar_mode="grid_local"), first)
+    assert cache.work.cache_hits == 0
+    for field in ("cache_misses", "scalar_solves", "grid_points_evaluated"):
+        assert getattr(cache.work, field) == 2 * before[field]
+    assert cache.work.cache_evictions == (15 if capacity else 0)
+    assert len(cache._entries) == capacity
+
+
+@pytest.mark.parametrize("mode", ["interval_certified", "grid_local"])
+def test_failed_scalar_work_is_measured_and_never_cached(mode, monkeypatch):
+    data, cache = _data(), scalar._RefitCoordinateCache()
+    calls = []
+    original = scalar._interval_lower_bound
+
+    def failing_bound(problem, left, right):
+        calls.append(1)
+        if len(calls) % 4 == 0:
+            raise RuntimeError("injected bound failure")
+        return original(problem, left, right)
+
+    def failing_grid(problem, beta):
+        calls.append(np.asarray(beta).size)
+        raise RuntimeError("injected grid failure")
+
+    clock = iter([10.0, 12.0, 20.0, 25.0])
+    monkeypatch.setattr(scalar, "perf_counter", lambda: next(clock))
+    if mode == "interval_certified":
+        monkeypatch.setattr(scalar, "_interval_lower_bound", failing_bound)
+    else:
+        monkeypatch.setattr(scalar, "scalar_loss", failing_grid)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="injected"):
+            _refit(data, cache=cache, scalar_mode=mode)
+    work = cache.work
+    assert not cache._entries
+    assert (work.cache_hits, work.cache_misses, work.scalar_solves, work.scalar_failures) == (0, 2, 2, 2)
+    assert work.scalar_seconds == 7.0
+    assert work.interval_evaluations == (sum(calls) if mode == "interval_certified" else 0)
+    assert work.grid_points_evaluated == (sum(calls) if mode == "grid_local" else 0)
+
+
+def test_scalar_shortcuts_and_unresolved_budget_count_only_dispatched_bounds():
+    data = _data()
+    model = scalar.compile_observed_model(data, eps=EPS)
+    problem = scalar.scalar_problem_from_model(
+        model, np.array([2, 3]), 0, lower=EPS, upper=1.0, eps=EPS,
+    )
+    work = scalar._ScalarWorkStats()
+    fixed = scalar.certify_scalar_minimum(
+        replace(problem, lower=0.4, upper=0.4), tolerance=1e-4, max_intervals=1,
+        _work_stats=work,
+    )
+    assert fixed.intervals_evaluated == 1 and work.interval_evaluations == 0
+    missing = scalar.certify_scalar_minimum(
+        replace(problem, observed=np.zeros(2, dtype=bool)), tolerance=1e-4,
+        max_intervals=1, _work_stats=work,
+    )
+    assert missing.intervals_evaluated == work.interval_evaluations == 0
+    unresolved = scalar.certify_scalar_minimum(
+        problem, tolerance=1e-30, max_intervals=1, _work_stats=work,
+    )
+    assert not unresolved.globally_certified
+    assert unresolved.intervals_evaluated == work.interval_evaluations == 1
+
+
+def test_conflicting_work_sinks_fail_before_work():
+    cache, other = scalar._RefitCoordinateCache(), scalar._ScalarWorkStats()
+    with pytest.raises(ValueError, match="share one physical-work sink"):
+        _refit(_data(), cache=cache, _work_stats=other)
+    assert cache.work.scalar_solves == other.scalar_solves == 0
 
 
 def test_proposal_pool_cache_preserves_proposals_and_reduces_scalar_work(
@@ -191,20 +290,26 @@ def test_proposal_pool_cache_preserves_proposals_and_reduces_scalar_work(
     data = replace(integer_data(((1, 1),) * 8), alt_counts=np.tile(
         np.array([5, 5, 10, 30, 10, 30, 35, 35], dtype=float)[:, None], (1, 2),
     ))
-    timings, counts, outputs = [], [], []
+    timings, counts, outputs, diagnostics = [], [], [], []
     for enabled in (False, True):
-        monkeypatch.setattr(starts, "_RefitCoordinateCache", lambda: scalar._RefitCoordinateCache(
-            max_entries=1024 if enabled else 0,
+        monkeypatch.setattr(starts, "_RefitCoordinateCache", lambda **kwargs: scalar._RefitCoordinateCache(
+            max_entries=1024 if enabled else 0, **kwargs,
         ))
+        work = scalar._ScalarWorkStats()
         coordinate_calls.clear()
         before = perf_counter()
         outputs.append(starts.generate_likelihood_partition_starts(
-            data, eps=EPS, label_sets={4: P}, cem_max_iter=8, tol=1e-4,
+            data, eps=EPS, label_sets={4: P}, cem_max_iter=8, tol=1e-4, _work_stats=work,
         ))
         timings.append(perf_counter() - before)
         counts.append(len(coordinate_calls))
+        diagnostics.append(work)
     assert len(outputs[0]) == len(outputs[1])
     for left, right in zip(*outputs):
         _assert_equal(left, right)
     assert counts[1] < counts[0]
+    assert [work.scalar_solves for work in diagnostics] == counts
+    assert diagnostics[1].interval_evaluations < diagnostics[0].interval_evaluations
+    assert diagnostics[0].cache_hits == 0 < diagnostics[1].cache_hits
     print(f"proposal scalar calls uncached/cached={counts}; seconds={timings}")
+    print(f"physical work uncached/cached={[asdict(work) for work in diagnostics]}")

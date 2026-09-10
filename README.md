@@ -121,9 +121,12 @@ ALM likewise has one driver with the original dense/streamed arithmetic; its
 outer caller receives only the actual edge multiplier. Curvature reuses the
 validated prepared model, and Ward receives normalized tensors at its boundary.
 Prepared problems own validation; CEM returns its existing fixed-label refit.
-Terminal dense and compressed dual refinement use componentwise backward error
-for retention, stopping and plateau decisions, matching final raw admission;
-the legacy normalized residual remains diagnostic only. Full-step recovery
+Terminal dense and compressed certification use componentwise backward error
+for admission. Fixed-primal dense/streamed refinement ranks witnesses by that
+error first, breaking exact ties by unscaled box-cone violation. Material
+progress in either quantity prevents a false plateau when backward error
+saturates at one; the fixed budget and admission gate are unchanged. The legacy
+normalized residual remains diagnostic only. Full-step recovery
 requires both loss majorization and objective descent within its numerical
 allowances, increasing curvature on rejection without interpolating the primal.
 Legacy and backward-error residual totals are derived
@@ -131,12 +134,16 @@ separately and fail closed on nonfinite or negative components; zero-radius
 edges remain in the graph and use an exact-zero-safe residual calculation.
 
 Ward reuses an `M x M` cost matrix with stable logical merge IDs and a shared
-row-minimum heap; exact ties do not depend on physical slot order. CUDA still
+row-minimum heap; exact ties do not depend on physical slot order. Refresh
+gathers are batched and stale heap entries compacted deterministically. These
+bound additional working storage, not whole-fit peak memory. CUDA still
 uses host heap maintenance and transfers, so this is not fully device-resident.
 Proposal refits remain interval-certified scalar searches even in balanced
 mode; the final-refit policy is separate. A pool-local, bounded cluster-region
 cache reuses only identical source/membership/bounds/numerical-policy problems,
-preserving unresolved certificates and logical work diagnostics.
+preserving unresolved certificates and logical work diagnostics. A private
+optional physical-work sink separately counts cache events, dispatched scalar
+solves, interval/grid evaluations and scalar time; cache hits do not invent work.
 
 Production proposal curvature still uses the historical working-dtype loss
 stencil. Its known float32 cancellation error is exposed by a separate strict
@@ -255,6 +262,18 @@ same-environment parity, labels and objective/graph identities remain separate
 exact checks. CI records dependency and build versions for attribution.
 CUDA and representative cohort/release-panel qualification remain necessary;
 passing CPU tests alone is not evidence of improved benchmark accuracy.
+
+For a reproducible **Ward-only CPU microbenchmark**, use:
+
+```bash
+conda run -n ml1 python tools/benchmark_ward.py --mutations 128 --regions 3 --repeats 5
+```
+
+Its JSON binds source, harness, environment, inputs, settings and repeated cuts.
+Uninstrumented timing is separate from heap/refresh and Python-allocation
+diagnostics; `--profile` adds Torch operation data. This is not an end-to-end
+fit or total-memory estimate. CUDA use requires an approved LSF allocation,
+explicit opt-in and the source fingerprint from its immutable receipt.
 
 Detailed dated evidence, parity captures, source measurements, and remaining
 release gates live in [QUALIFICATION.md](QUALIFICATION.md).

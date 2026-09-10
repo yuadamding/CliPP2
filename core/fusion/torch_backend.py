@@ -199,22 +199,40 @@ def _update_certificate_refinement_plateau(
     *,
     anchor_residual: float,
     best_residual: float,
+    anchor_merit: float,
+    best_merit: float,
     mapping_delta: float,
     stalled_iterations: int,
     atol: float,
     dtype: torch.dtype,
-) -> tuple[float, int, bool]:
-    """Stop only after both residual progress and dual motion have stalled."""
+) -> tuple[float, float, int, bool]:
+    """Stop after neither backward error nor cone violation improves materially.
+
+    Backward error can saturate at one while useful dual motion reduces the
+    unscaled cone violation. Mapping motion only selects the patience when
+    BOTH merits have stalled; it never overrides material merit progress.
+    """
     scale = max(1.0, abs(float(anchor_residual)))
     progress_floor = max(
         _CERTIFICATE_PLATEAU_ATOL_SCALE * float(atol),
         _CERTIFICATE_PLATEAU_EPS_SCALE * float(torch.finfo(dtype).eps) * scale,
     )
-    if np.isfinite(best_residual) and (
+    residual_improved = np.isfinite(best_residual) and (
         not np.isfinite(anchor_residual)
         or float(anchor_residual) - float(best_residual) > progress_floor
-    ):
-        return float(best_residual), 0, False
+    )
+    merit_floor = max(
+        _CERTIFICATE_PLATEAU_ATOL_SCALE * float(atol),
+        _CERTIFICATE_PLATEAU_EPS_SCALE * float(torch.finfo(dtype).eps)
+        * max(1.0, abs(float(anchor_merit))),
+    )
+    merit_improved = (
+        np.isfinite(best_residual) and best_residual <= anchor_residual
+        and np.isfinite(best_merit)
+        and (not np.isfinite(anchor_merit) or anchor_merit - best_merit > merit_floor)
+    )
+    if residual_improved or merit_improved:
+        return float(best_residual), float(best_merit), 0, False
     stalled = int(stalled_iterations) + 1
     mapping_stalled = bool(
         np.isfinite(mapping_delta) and float(mapping_delta) <= progress_floor
@@ -224,7 +242,7 @@ def _update_certificate_refinement_plateau(
         if mapping_stalled
         else _CERTIFICATE_MOVING_PLATEAU_PATIENCE
     )
-    return float(anchor_residual), stalled, stalled >= patience
+    return float(anchor_residual), float(anchor_merit), stalled, stalled >= patience
 
 
 def _box_qp_sweeps_for_atol(
@@ -581,6 +599,7 @@ def graph_fusion_kkt_residual_from_grad_torch(
     atol: float,
     dual_scale: float = 1.0,
     edge_work_bytes: int | None = None,
+    _progress_out: dict[str, float] | None = None,
 ) -> KKTDiagnostics:
     lambda_value = validate_lambda_value(lambda_value)
     dual_scale_value = float(dual_scale)
@@ -618,6 +637,15 @@ def graph_fusion_kkt_residual_from_grad_torch(
             scale=dual_scale_value,
             edge_work_bytes=edge_work_bytes,
         )
+    if _progress_out is not None:
+        # Reuse this audit's complete adjoint: secondary progress must concern
+        # the same witness, without a second full edge reduction or schema change.
+        total_grad = grad_smooth + adj
+        violation = total_grad - project_stationarity_cone_torch(
+            total_grad, phi=phi, lower=lower, upper=upper,
+        )
+        merit = float(torch.linalg.vector_norm(violation).item())
+        _progress_out["cone_violation_norm"] = merit if np.isfinite(merit) else float("inf")
     zero = torch.zeros((), dtype=phi.dtype, device=phi.device)
     max_edge_residual = zero
     max_ball_residual = zero
@@ -708,18 +736,21 @@ def refine_graph_fusion_dual_certificate_torch(
 ) -> dict[str, object]:
     """Refine one fixed-primal witness against the raw-admission residual.
 
-    Legacy globally normalized diagnostics remain available in each audit,
-    but only componentwise backward error governs witness retention, target
-    stopping, and plateau detection.
+    Backward error alone governs admission and is the primary witness order.
+    Unscaled box-cone violation breaks exact backward-error ties and tracks
+    useful progress while that error saturates. Legacy diagnostics remain inert.
     """
     lambda_value = validate_lambda_value(lambda_value)
     num_edges, num_regions = int(edge_u.numel()), int(phi.shape[1])
+    progress: dict[str, float] = {}
     before_diag = graph_fusion_kkt_residual_from_grad_torch(
         phi=phi, grad_smooth=grad_smooth, dual_kkt=dual_kkt,
         lower=lower, upper=upper, edge_u=edge_u, edge_v=edge_v,
         edge_w=edge_w, lambda_value=lambda_value, atol=atol,
         edge_work_bytes=edge_work_bytes,
+        _progress_out=progress,
     )
+    incoming_merit = progress.get("cone_violation_norm", float("inf"))
     if num_edges == 0 or lambda_value <= 0.0:
         dual = torch.zeros((num_edges, num_regions), dtype=phi.dtype, device=phi.device)
         after_diag = graph_fusion_kkt_residual_from_grad_torch(
@@ -787,22 +818,29 @@ def refine_graph_fusion_dual_certificate_torch(
             dual_chunk[fused] = project_dual_ball(incoming[edge_slice][fused], radius[fused])
     del diff, diff_norm, active, dual_chunk
 
+    progress.clear()
     analytic_diag = graph_fusion_kkt_residual_from_grad_torch(
         phi=phi, grad_smooth=grad_smooth, dual_kkt=dual,
         lower=lower, upper=upper, edge_u=edge_u, edge_v=edge_v,
         edge_w=edge_w, lambda_value=lambda_value, atol=atol,
         edge_work_bytes=edge_work_bytes,
+        _progress_out=progress,
     )
     best_dual = dual.clone()
     best_diag = analytic_diag
     best_residual = analytic_diag.backward_error_kkt_residual
+    best_merit = progress.get("cone_violation_norm", float("inf"))
     best_source = "analytic"
     # Reconstructed nonfused edges can improve feasibility while worsening
-    # stationarity. Preserve an equally good or better incoming witness.
-    if incoming is not None and np.isfinite(incoming_residual) and incoming_residual <= best_residual:
+    # stationarity. Preserve an equally good or better incoming witness under
+    # lexicographic (backward error, cone violation) order, including exact ties.
+    if incoming is not None and np.isfinite(incoming_residual) and (
+        incoming_residual, incoming_merit
+    ) <= (best_residual, best_merit):
         best_dual = incoming.clone() if single_chunk else incoming
         best_diag = before_diag
         best_residual = incoming_residual
+        best_merit = incoming_merit
         best_source = "incoming"
 
     refinement_iterations = 0
@@ -810,7 +848,7 @@ def refine_graph_fusion_dual_certificate_torch(
         num_nodes = int(phi.shape[0])
         degree = torch.bincount(torch.cat([edge_u, edge_v]), minlength=num_nodes).max()
         step = 0.25 / max(float(degree.item()), 1.0)
-        plateau_anchor, stalled_iterations = best_residual, 0
+        plateau_anchor, plateau_merit, stalled_iterations = best_residual, best_merit, 0
         for _ in range(max(int(max_iter), 1)):
             refinement_iterations += 1
             if single_chunk:
@@ -850,15 +888,19 @@ def refine_graph_fusion_dual_certificate_torch(
                     mapping_delta, float(torch.max(torch.abs(fused_after - fused_before)).item()),
                 )
                 dual[edge_slice][fused] = fused_after
+            progress.clear()
             diag = graph_fusion_kkt_residual_from_grad_torch(
                 phi=phi, grad_smooth=grad_smooth, dual_kkt=dual,
                 lower=lower, upper=upper, edge_u=edge_u, edge_v=edge_v,
                 edge_w=edge_w, lambda_value=lambda_value, atol=atol,
                 edge_work_bytes=edge_work_bytes,
+                _progress_out=progress,
             )
             residual = diag.backward_error_kkt_residual
-            if residual < best_residual:
+            merit = progress.get("cone_violation_norm", float("inf"))
+            if np.isfinite(residual) and (residual, merit) < (best_residual, best_merit):
                 best_residual, best_diag = residual, diag
+                best_merit = merit
                 if best_source == "incoming":
                     best_dual = dual.clone()
                 else:
@@ -866,8 +908,9 @@ def refine_graph_fusion_dual_certificate_torch(
                 best_source = "refined"
             if residual <= kkt_target:
                 break
-            plateau_anchor, stalled_iterations, plateaued = _update_certificate_refinement_plateau(
+            plateau_anchor, plateau_merit, stalled_iterations, plateaued = _update_certificate_refinement_plateau(
                 anchor_residual=plateau_anchor, best_residual=best_residual,
+                anchor_merit=plateau_merit, best_merit=best_merit,
                 mapping_delta=mapping_delta, stalled_iterations=stalled_iterations,
                 atol=atol, dtype=phi.dtype,
             )
