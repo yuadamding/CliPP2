@@ -1,9 +1,5 @@
 # Examples
 
-[`minimal.tsv`](minimal.tsv) is the installed wheel's two-mutation, single-region
-smoke input. Both mutations are eligible. The larger example below stays in the
-source repository and is not bundled into the wheel.
-
 ## exampleTumor1
 
 [`exampleTumor1.tsv`](exampleTumor1.tsv) is a complete canonical

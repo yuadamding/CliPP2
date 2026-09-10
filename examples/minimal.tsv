@@ -1,3 +1,0 @@
-mutation_id	sample_id	alt_count	ref_count	count_observed	purity	normal_cn	segment_id	cn_state_id	cn_state_fraction	allele_a_cn	allele_b_cn
-m1	R1	20	80	1	0.8	2	s1	clonal	1	1	1
-m2	R1	21	79	1	0.8	2	s1	clonal	1	1	1

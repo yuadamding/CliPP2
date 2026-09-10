@@ -1,4 +1,4 @@
-name: CPU regression and wheel
+name: CPU package and simulation smoke
 
 on:
   push:
@@ -8,6 +8,7 @@ permissions:
   contents: read
 
 jobs:
+  # Retain the stable job ID for existing required-check settings.
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -24,16 +25,119 @@ jobs:
           python-version: "3.13"
           cache: pip
           cache-dependency-path: pyproject.toml
-      - name: Install CPU dependencies and test tools
+      - name: Install CPU dependencies and package-check tools
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install '.[test]'
-      - name: Record numerical qualification environment
+          python -m pip install . 'ruff>=0.12'
+      - name: Record package-smoke environment
         run: |
           python -m pip freeze
           python -c 'import platform, sys, torch; print(sys.version); print(platform.platform()); print(torch.__config__.show())'
       - name: Lint
         run: python -m ruff check .
-      - name: Regressions including isolated wheel installation and CPU fit
-        run: python -m pytest -q
+      # Full numerical regressions live outside this repository and are not
+      # available to GitHub-hosted runners. These are package smoke checks only.
+      - name: Isolated wheel installation and installed CLI CPU smoke
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import venv
+          from zipfile import ZipFile
+
+          root = Path(tempfile.mkdtemp(prefix="clipp2-wheel-smoke-", dir=os.environ["RUNNER_TEMP"]))
+          source = root / "source"
+          shutil.copytree(Path.cwd(), source, ignore=shutil.ignore_patterns(
+              ".git", "__pycache__", ".pytest_cache", ".ruff_cache", "*.egg-info", "build", "dist",
+          ))
+          env = dict(os.environ)
+          env.pop("PYTHONPATH", None)
+          subprocess.run([sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation",
+                          "--wheel-dir", str(root / "dist"), str(source)],
+                         cwd=root, env=env, check=True, timeout=120)
+          wheel, = (root / "dist").glob("*.whl")
+          with ZipFile(wheel) as archive:
+              names = archive.namelist()
+              assert not any(name.startswith(("CliPP2/tests/", "CliPP2/tools/", "CliPP2/simulation/", "CliPP2/examples/")) for name in names)
+              assert "CliPP2/setup.py" not in names
+              identity = json.loads(archive.read("CliPP2/_build_source.json"))
+              digest = hashlib.sha256()
+              for name in sorted(name for name in names if name.startswith("CliPP2/") and name.endswith(".py")):
+                  digest.update(name.removeprefix("CliPP2/").encode() + b"\0")
+                  digest.update(hashlib.sha256(archive.read(name)).digest())
+              assert identity["python_source_sha256"] == digest.hexdigest()
+          environment = root / "environment"
+          # Reuse qualified numerical dependencies; install CliPP2 itself afresh.
+          venv.EnvBuilder(with_pip=True, system_site_packages=True).create(environment)
+          python = environment / "bin" / "python"
+          subprocess.run([str(python), "-m", "pip", "install", "--no-deps", "--ignore-installed", str(wheel)],
+                         cwd=root, env=env, check=True, timeout=90)
+          script = r'''
+          import csv, hashlib, json, subprocess, sys
+          from pathlib import Path
+          import CliPP2
+          from CliPP2._source import source_fingerprint
+          package = Path(CliPP2.__file__).resolve().parent
+          assert package.is_relative_to(Path(sys.prefix).resolve())
+          built = json.loads((package / "_build_source.json").read_text())
+          assert source_fingerprint(package) == built["python_source_sha256"]
+          assert not (package / "examples").exists()
+          # Disposable canonical input belongs to the isolated smoke directory,
+          # never to the source checkout or inference wheel.
+          input_file = Path("smoke.tsv")
+          with input_file.open("x", newline="") as stream:
+              writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
+              writer.writerow("mutation_id sample_id alt_count ref_count count_observed purity normal_cn segment_id cn_state_id cn_state_fraction allele_a_cn allele_b_cn".split())
+              writer.writerows((f"m{index}", "R1", alt, 100-alt, 1, .8, 2, "s1", "clonal", 1, 1, 1)
+                               for index, alt in enumerate((20, 21), start=1))
+          subprocess.run([sys.executable, "-I", "-m", "CliPP2", "fit", "--input-file",
+                          str(input_file), "--outdir", "results",
+                          "--device", "cpu", "--dtype", "float64", "--outer-max-iter", "20",
+                          "--inner-max-iter", "80"], check=True, timeout=90)
+          output = Path("results")
+          manifest = json.loads((output / "smoke_run_manifest.json").read_text())
+          assert manifest["status"] == "complete" and len(manifest["files"]) == 4
+          assert manifest["analysis"]["raw_reference"]["kkt_certified"]
+          assert manifest["analysis"]["raw_reference"]["admissible"]
+          assert manifest["source"]["python_source_sha256"] == built["python_source_sha256"]
+          assert {path.name for path in output.iterdir()} == {"smoke_run_manifest.json", *manifest["files"]}
+          for name, record in manifest["files"].items():
+              assert hashlib.sha256((output / name).read_bytes()).hexdigest() == record["sha256"]
+          print("Installed package:", CliPP2.__file__, "version:", CliPP2.__version__)
+          '''
+          subprocess.run([str(python), "-I", "-c", script], cwd=root, env=env, check=True, timeout=120)
+          PY
+      - name: Source-tree simulation CLI smoke
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+          repository = Path.cwd()
+          sys.path.insert(0, str(repository.parent))
+          import CliPP2
+          from CliPP2.io.tumor_txt import load_tumor_txt
+          from tools.simulation import validate_generated_tumor_directory
+
+          assert Path(CliPP2.__file__).resolve().parent == repository.resolve()
+          root = Path(tempfile.mkdtemp(prefix="clipp2-simulation-smoke-", dir=os.environ["RUNNER_TEMP"]))
+          subprocess.run([sys.executable, "-m", "tools.simulation", "--out-dir", str(root),
+                          "--tumor-id", "cli_smoke", "--mutation-count", "15", "--clone-count", "1",
+                          "--region-count", "1", "--seed", "8"], check=True, timeout=30,
+                         env=dict(os.environ, PYTHONPATH=str(repository.parent)))
+          bundle = root / "cli_smoke"
+          validate_generated_tumor_directory(bundle)
+          data = load_tumor_txt(bundle / "cli_smoke.clipp2.txt")
+          assert data.num_mutations == 15 and data.num_regions == 1
+          assert not data.cn_filter_report.excluded_mutation_ids
+          print("Validated source-tree generator bundle:", bundle)
+          PY
