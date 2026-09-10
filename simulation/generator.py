@@ -9,16 +9,15 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from CliPP2.config import MAX_MAJOR_CN
-from CliPP2.io.tumor_txt import CN_FILTER_POLICY_ID, write_tumor_txt
+from ..io.tumor_txt import CN_FILTER_POLICY_ID, TUMOR_TXT_SCHEMA, write_tumor_txt
 from .config import (
     TumorSimulationConfig,
     _positive_integer,
     _validate_copy_number_config,
 )
 from .evolution import (
-    _simulate_clonal_cn_evolution,
-    aggregate_cn_clone_fractions,
+    simulate_branch_cna_events,
+    simulate_joint_snv_cna_evolution,
     assign_mutations_to_segments,
     compute_mutation_sample_truth,
     simulate_genome_segments,
@@ -41,8 +40,7 @@ RNG_STREAM_NAMES = (
     "seed_mutation_counts",
     "seed_mutation_segments",
     "seed_cna_events",
-    "seed_mutation_times",
-    "seed_physical_copy_choices",
+    "seed_multiplicity",
     "seed_purity",
     "seed_depth",
     "seed_alt_counts",
@@ -178,24 +176,22 @@ def _write_patient_simulation(
         segments,
         random_state=streams["seed_mutation_segments"],
     )
-    (
-        evolution,
-        cn_clone_id,
-        unique_cn_profiles,
-        cn_generation,
-    ) = _simulate_clonal_cn_evolution(
-        cna_rng=streams["seed_cna_events"],
-        mutation_time_rng=streams["seed_mutation_times"],
-        physical_copy_rng=streams["seed_physical_copy_choices"],
+    cna_events = simulate_branch_cna_events(
+        sim_tree["parent"],
+        copy_number_config,
+        random_state=streams["seed_cna_events"],
+    )
+    evolution = simulate_joint_snv_cna_evolution(
         parent=sim_tree["parent"],
         mutation_origin_clone=cluster_id,
         mutation_segment=mutation_segment,
-        config=copy_number_config,
+        branch_cna_events=cna_events,
+        n_segments=copy_number_config.n_segments,
+        max_allele_cn=copy_number_config.max_allele_cn,
+        random_state=streams["seed_multiplicity"],
     )
-    cn_clone_fraction_samples = aggregate_cn_clone_fractions(
-        exclusive_clone_fraction_samples,
-        cn_clone_id,
-    )
+    cn_clone_id = np.zeros(K, dtype=int)
+    multiplicity = evolution.mutation_multiplicity
 
     data_dir.mkdir(parents=True, exist_ok=True)
     region_labels = tuple(f"region{j + 1}" for j in range(n_samples))
@@ -311,10 +307,8 @@ def _write_patient_simulation(
             "mutation_id": mutation_ids,
             "origin_clone_id": cluster_id,
             "segment_id": mutation_segment,
-            "origin_allele": np.where(evolution.mutation_origin_allele == 0, "A", "B"),
-            "branch_time": evolution.mutation_branch_time,
-            "cn_at_origin": evolution.mutation_cn_at_origin,
-            "physical_copy_index": evolution.mutation_origin_physical_copy,
+            "multiplicity": multiplicity,
+            "multiplicity_source": "uniform_unequal_cn_else_one",
         }
     ).to_csv(data_dir / "truth_mutation_history.tsv", sep="\t", index=False)
 
@@ -349,8 +343,7 @@ def _write_patient_simulation(
         region_id = region_labels[j]
         local_state_table = _local_cn_state_table(
             sample_id=j,
-            unique_profiles=unique_cn_profiles,
-            cn_clone_fraction=cn_clone_fraction_samples[:, j],
+            profile=evolution.clone_allele_cn[0],
             segments=segments,
         )
         local_state_table.drop(columns="sample_id").to_csv(
@@ -376,16 +369,6 @@ def _write_patient_simulation(
             )
         if np.any((truth["ccf"] > 0.0) & (truth["mutant_copy_mass"] <= 0.0)):
             raise AssertionError("A present mutation has zero mutant-copy mass.")
-        multiplicity = np.rint(truth["effective_multiplicity"])
-        major_at_mutation = np.max(unique_cn_profiles[0], axis=1)[mutation_segment]
-        if (
-            not np.all(np.isfinite(multiplicity))
-            or not np.allclose(
-                truth["effective_multiplicity"], multiplicity, atol=1e-8, rtol=0.0
-            )
-            or np.any((multiplicity < 1) | (multiplicity > major_at_mutation))
-        ):
-            raise AssertionError("Clonal CN truth must have an allowed integer dosage.")
 
         n_j = streams["seed_depth"].poisson(N_mean, size=no_mutations)
         r_j = streams["seed_alt_counts"].binomial(
@@ -422,8 +405,8 @@ def _write_patient_simulation(
                     "sample_id": np.full(no_mutations, j, dtype=int),
                     "ccf": truth["ccf"],
                     "mutant_copy_mass": truth["mutant_copy_mass"],
+                    "multiplicity": multiplicity,
                     "effective_multiplicity": truth["effective_multiplicity"],
-                    "multiplicity": multiplicity.astype(int),
                     "mean_tumor_total_cn": truth["mean_tumor_total_cn"],
                     "expected_vaf": truth["expected_vaf"],
                 }
@@ -451,14 +434,26 @@ def _write_patient_simulation(
         ["mutation_id", "sample_id"],
         sort=False,
     ).size()
-    if not bool((canonical_state_counts == 1).all()) or bool(
-        (canonical_observations["allele_a_cn"] > MAX_MAJOR_CN).any()
-    ):
+    if not canonical_state_counts.eq(1).all():
         raise AssertionError(
-            "Matched simulations require one clonal CN state with major CN <= 6."
+            "Every mutation-region must have exactly one clonal CN state."
         )
-    write_tumor_txt(data_dir / f"{directory_name}.clipp2.txt", canonical_observations)
+    write_tumor_txt(
+        data_dir / f"{directory_name}.clipp2.txt",
+        canonical_observations,
+        {
+            "schema": TUMOR_TXT_SCHEMA,
+            "tumor_id": directory_name,
+            "genome_build": "synthetic",
+            "coordinate_system": "1-based-inclusive",
+            "missing_value": ".",
+        },
+    )
     intended_factors = {
+        "cn_filter_policy_id": CN_FILTER_POLICY_ID,
+        "copy_number_mode": "clonal_trunk_gains",
+        "multiplicity_mode": "uniform_unequal_cn_else_one",
+        "multiplicity_sampling_unit": "mutation_shared_across_regions",
         "mean_depth": int(N_mean),
         "purity_mean": float(simu_purity),
         "cna_event_rate": float(copy_number_config.cna_event_rate),
@@ -483,28 +478,19 @@ def _write_patient_simulation(
         "min_clone_ccf_distance": float(min_clone_ccf_distance),
         "max_rejection_tries": int(max_rejection_tries),
         "copy_number": asdict(copy_number_config),
-        "cn_evolution_model": "clonal_trunk_gain_only_v1",
-        "mutation_time_mode": "uniform_on_origin_branch",
-        "cn_filter_policy_id": CN_FILTER_POLICY_ID,
     }
     realized_factors = {
+        "retained_mutation_count": int(no_mutations),
+        "excluded_mutation_count": 0,
         "clone_count": int(K),
         "mutation_count": int(no_mutations),
         "sample_count": int(n_samples),
-        "input_mutation_count": int(no_mutations),
-        "retained_mutation_count": int(no_mutations),
-        "excluded_mutation_count": 0,
         "sample_purity": _numeric_summary(sample_purities),
         "depth": _numeric_summary(np.concatenate(depth_arrays)),
         "cn_complexity": _realized_cn_complexity(
-            parent=parent,
-            mutation_origin_clone=cluster_id,
             mutation_segment=mutation_segment,
             evolution=evolution,
-            unique_cn_profiles=unique_cn_profiles,
-            cn_clone_fraction_samples=cn_clone_fraction_samples,
-            accepted_cna_events=cn_generation["accepted_cna_events"],
-            mutation_sample_truth=mutation_sample_truth,
+            accepted_cna_events=len(cna_events),
         ),
     }
     rejection_counts = {
@@ -538,6 +524,10 @@ def simulate_tumor(
     ):
         _positive_integer(getattr(config, name), name)
     _positive_integer(config.seed, "seed", minimum=0)
+    if config.mutation_count < config.clone_count * config.min_mutations_per_clone:
+        raise ValueError(
+            "mutation_count cannot supply min_mutations_per_clone to every clone."
+        )
 
     return _write_patient_simulation(config)
 

@@ -216,6 +216,7 @@ def simulate_clonal_tree_ccf(
                 ccf_patient_clones[c] for c in children[k]
             )
 
+        ccf_patient_clones[0] = 1.0
         _check_patient_tree_and_ccf(parent, children, ccf_patient_clones, tol=1e-8)
 
         lineage_terminals = [k for k in range(K) if lambda_k[k] > lineage_eps]
@@ -284,6 +285,7 @@ def simulate_clonal_tree_ccf(
             )
 
         ccf_samples_clones = A @ ccf_samples_lineages
+        ccf_samples_clones[0, :] = 1.0
         _check_sample_ccf_against_tree(parent, children, ccf_samples_clones, tol=1e-8)
         if _min_clone_region_ccf(ccf_samples_clones) < float(min_clone_ccf) - eps:
             continue

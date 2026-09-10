@@ -1,4 +1,4 @@
-"""Source-tree-only command-line interface for matched simulation generation."""
+"""Command-line interface for CliPP2 simulation generation."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from .config import (
     CopyNumberEvolutionConfig,
     TumorSimulationConfig,
 )
+from .generator import simulate_tumor
 
 
 def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
@@ -34,7 +35,7 @@ def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
         "--mutation-count",
         type=int,
         default=defaults.mutation_count,
-        help="Exact number of CN-eligible SNVs retained by CliPP2.",
+        help="Exact number of SNVs.",
     )
     parser.add_argument(
         "--mean-depth",
@@ -52,7 +53,7 @@ def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
         "--cna-event-rate",
         type=float,
         default=defaults.copy_number.cna_event_rate,
-        help="Trunk gain rate per genomic segment; descendant CN is unchanged.",
+        help="Trunk gain rate per genomic segment; all CN is clonal.",
     )
     parser.add_argument(
         "--region-count",
@@ -82,7 +83,7 @@ def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
         "--max-rejection-tries",
         type=int,
         default=defaults.max_rejection_tries,
-        help="Maximum attempts used to satisfy tree/CCF constraints.",
+        help="Maximum attempts used to satisfy the simulation invariants.",
     )
 
 
@@ -109,7 +110,7 @@ def tumor_simulation_config_from_args(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate one clonal-CN tumor with major CN <= 6."
+        description="Generate one canonical CliPP2 simulation tumor."
     )
     add_simulation_arguments(parser)
     return parser
@@ -118,8 +119,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    from .generator import simulate_tumor
-
     written_dir = simulate_tumor(tumor_simulation_config_from_args(args))
     print(f"Generated {written_dir}")
 

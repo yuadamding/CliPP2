@@ -12,7 +12,9 @@ Under the current whole-mutation CN filter, **199 mutations are excluded**
 because of subclonal CN; **101 mutations remain** for fitting across both
 samples. The example intentionally preserves its original mixed-CN input to
 demonstrate eligibility filtering. From a source checkout, use
-`python -m tools.simulation` for a fully retained clonal-CN benchmark.
+`python -m CliPP2.simulation` from the repository's parent directory for a
+fully retained clonal-CN benchmark with sampled integer multiplicity. See
+[the simulation guide](../simulation/README.md).
 
 Every mutation must have one unit for every sample. Repeated rows within a unit
 enumerate that sample segment's complete local copy-number state set.

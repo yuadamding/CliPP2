@@ -10,8 +10,8 @@ import numpy as np
 from CliPP2.config import MAX_MAJOR_CN
 
 DEFAULT_CNA_EVENT_RATE = 1.5
-GENERATOR_VERSION = "evolution_clonal_trunk_gain_only_v6"
-OUTPUT_SCHEMA_VERSION = "6.0"
+GENERATOR_VERSION = "tree_clonal_cn_uniform_multiplicity_v7"
+OUTPUT_SCHEMA_VERSION = "7.0"
 
 
 @dataclass(frozen=True)
