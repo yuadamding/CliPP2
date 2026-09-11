@@ -589,7 +589,7 @@ def _partition_guided_admm_selection(
     base_solver_context = prepare_torch_problem_with_resource_policy(
         data, fit_options,
         inherited_resource_fallback=pilot_context.resource_fallback,
-        # The guide initializes adaptive weights, but observed curvature and a
+        # The likelihood pilot initializes adaptive weights; curvature and a
         # mild degree correction set a finite data-derived distance floor. This
         # prevents the fixed 1e-6 floor from making the proposed blocks
         # effectively immutable while retaining the current estimator as the

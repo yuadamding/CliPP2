@@ -1039,6 +1039,7 @@ def prepare_torch_problem(
     *,
 
     eps: float,
+    multiplicity_policy: str = "independent_broad",
     tol: float,
     inner_max_iter: int,
     graph: PairwiseFusionGraph | None = None,
@@ -1068,6 +1069,7 @@ def prepare_torch_problem(
     source_model = compile_observed_model(
         data,
         eps=float(eps),
+        multiplicity_policy=multiplicity_policy,
     )
     runtime_model = model_to_torch(source_model, effective_runtime, eps=float(eps))
     data_fingerprint = tumor_data_fingerprint(data)
@@ -1241,6 +1243,7 @@ def prepare_torch_problem_with_resource_policy(
     """Prepare an immutable context under the same typed fallback policy as fits."""
     kwargs = dict(
         eps=float(options.eps),
+        multiplicity_policy=options.multiplicity_policy,
         tol=float(options.solver.tolerance),
         inner_max_iter=max(int(options.solver.inner_max_iter), 16),
         graph=options.graph.graph,
@@ -2498,6 +2501,7 @@ def _fit_from_start(
             inner_solver=str(inner_solver),
             global_optimality_basis=str(global_optimality_basis),
             scalar_pilot_certificates=problem.scalar_pilot_certificates,
+            multiplicity_policy=problem.source_model.support_policy,
         ),
     )
 

@@ -534,6 +534,8 @@ def direct_partition_source(
     cem = str(proposal.source).startswith("hessian_ward_cem")
     death = int(proposal.component_death_count) > 0
     prefix = "pilot" if stage == "pilot" else "final_phi"
+    if proposal.source in {"dosage_rescale", "dosage_split"}:
+        return f"{prefix}_{proposal.source}"
     suffix = "hessian_ward_cem" if cem else "hessian_ward"
     if cem and death:
         suffix += "_component_death"

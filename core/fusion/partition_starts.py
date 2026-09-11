@@ -144,6 +144,17 @@ def observed_curvature_at_pilot_torch(
     f_right = observed_loss_grid_torch(
         model, right, eps=eps
     )
+    if model.coupling == "joint":
+        # Preserve the existing finite-difference diagonal Ward/graph metric:
+        # perturb ONE coordinate while the other regions stay at the pilot.
+        # Simultaneous regional perturbations would include cross derivatives.
+        f0 = f0.sum(dim=1, keepdim=True).expand_as(x0)
+        f_left, f_right = torch.empty_like(x0), torch.empty_like(x0)
+        for region in range(model.shape[1]):
+            trial_left, trial_right = x0.clone(), x0.clone()
+            trial_left[:, region], trial_right[:, region] = left[:, region], right[:, region]
+            f_left[:, region] = observed_loss_grid_torch(model, trial_left, eps=eps).sum(dim=1)
+            f_right[:, region] = observed_loss_grid_torch(model, trial_right, eps=eps).sum(dim=1)
     denom = h_left * h_right * (h_left + h_right)
     curvature = (
         2.0 * (h_left * f_right - (h_left + h_right) * f0 + h_right * f_left) / denom
@@ -608,6 +619,59 @@ def _label_key(labels: np.ndarray) -> bytes:
     return labels.astype(np.int32, copy=False).tobytes()
 
 
+def _coherent_center_moves(data, model, bases, *, eps, refit_labels, budget=12):
+    """Bounded rescale/split moves, ranked and refit under the active likelihood.
+
+    Ratio choices come from admissible integer states, not a target K or
+    truth. Splits may increase K; empty proposals are allowed to disappear.
+    Only labels survive to the common immutable-label scoring gate.
+    """
+    count = int(np.sum(model.valid, axis=-1).max())
+    ratios = sorted({a / b for a in range(1, count + 1) for b in range(1, count + 1)
+                     if a != b}, key=lambda r: (abs(np.log(r)), r))[:8]
+    proposals = {}
+    for base in sorted(bases, key=lambda x: (x.bic, x.source))[:3]:
+        refit = refit_labels(base.labels)
+        centers = refit.cluster_centers
+        costs = _loss_to_centers(data, centers, eps=eps, _model=model)
+        # Largest blocks first; bounded independently of the truth/target K.
+        order = np.argsort(-np.bincount(base.labels), kind="stable")[:6]
+        for cluster in order:
+            for ratio in ratios:
+                center = np.clip(centers[cluster] * ratio, eps, 1.0)
+                if np.max(np.abs(center - centers[cluster])) < 1e-5:
+                    continue
+                cost = _loss_to_centers(data, center[None], eps=eps, _model=model)
+                for split in (False, True):
+                    if split:
+                        trial = np.column_stack((costs, cost))
+                    else:
+                        trial = costs.copy()
+                        trial[:, cluster] = cost[:, 0]
+                    labels = np.argmin(_classification_assignment_cost(trial, base.labels), axis=1)
+                    assigned_loss = float(trial[np.arange(data.num_mutations), labels].sum())
+                    labels = _canonical_labels(labels)
+                    if np.array_equal(labels, base.labels):
+                        continue
+                    score = fixed_partition_dirichlet_score(
+                        loglik=-assigned_loss, num_clusters=int(labels.max()) + 1,
+                        labels=labels, partition_signature="", data=data,
+                    ).value
+                    key = _label_key(labels)
+                    value = (score, "dosage_split" if split else "dosage_rescale", labels)
+                    if key not in proposals or value[:2] < proposals[key][:2]:
+                        proposals[key] = value
+    for _, source, labels in sorted(proposals.values(), key=lambda x: (x[0], x[1], _label_key(x[2])))[:budget]:
+        refit = refine_partition_likelihood(data, labels, eps=eps, tol=1e-3, max_iter=3,
+                                           _refit_labels=refit_labels, _model=model)
+        yield PartitionCandidate(
+            labels=refit.labels, K=refit.n_clusters, source=source,
+            phi_start=refit.phi, fit_loss=refit.fit_loss,
+            bic=_classification_refit_score(data, refit.labels, refit),
+            finite_candidate_found=refit.finite_candidate_found,
+        )
+
+
 def generate_likelihood_partition_starts(
     data: TumorData,
     *,
@@ -618,6 +682,7 @@ def generate_likelihood_partition_starts(
     refit_max_iter: int = PARTITION_GENERATION_REFIT_MAX_ITER,
     tol: float = 1e-3,
     _work_stats: _ScalarWorkStats | None = None,
+    _model: ObservedModel | None = None,
 ) -> list[PartitionCandidate]:
     """Refit plain Ward and host-CEM proposals under one fixed score policy."""
     label_sets = {
@@ -627,7 +692,7 @@ def generate_likelihood_partition_starts(
     }
     candidates: list[PartitionCandidate] = []
     seen: set[bytes] = set()
-    source_model = compile_observed_model(data, eps=float(eps))
+    source_model = compile_observed_model(data, eps=float(eps)) if _model is None else _model
     # One model, tolerance and scalar backend per call: immutable labels alone
     # identify each local refit, including repeated CEM proposals.
     refit_cache: dict[bytes, PartitionRefitResult] = {}
@@ -670,6 +735,14 @@ def generate_likelihood_partition_starts(
                 requested_k=int(requested_k),
             ))
 
+    if source_model.coupling == "joint":
+        for candidate in _coherent_center_moves(data, source_model, candidates, eps=eps,
+                                                refit_labels=cached_refit):
+            key = _label_key(candidate.labels)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+
     by_k: dict[int, list[PartitionCandidate]] = {}
     for candidate in candidates:
         by_k.setdefault(int(candidate.K), []).append(candidate)
@@ -696,6 +769,8 @@ def generate_partition_initializer_pool(
     context.validate(allow_deferred_graph=True)
     if float(fit_options.eps) != context.eps:
         raise ValueError("Partition options must preserve the prepared likelihood epsilon.")
+    if fit_options.multiplicity_policy != context.source_model.support_policy:
+        raise ValueError("Partition options must preserve the prepared multiplicity policy.")
     data, runtime = context.source_data, context.runtime
     pilot_tensor = as_runtime_tensor(pilot_phi, runtime)
     if declared_k_grid is None:
@@ -718,4 +793,5 @@ def generate_partition_initializer_pool(
     return tuple(generate_likelihood_partition_starts(
         data, eps=float(fit_options.eps), label_sets=label_sets,
         tol=float(fit_options.solver.tolerance),
+        _model=context.source_model,
     ))

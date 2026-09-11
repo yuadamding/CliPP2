@@ -658,7 +658,7 @@ def _build_tumor_data(
     )
     # This private construction owns the exact arrays used by both objects.
     # Retain the already compiled immutable model; replacements start uncached.
-    data._compiled_models[float(eps)] = model
+    data._compiled_models[(float(eps), "independent_broad")] = model
     return data
 
 

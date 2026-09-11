@@ -74,6 +74,8 @@ class PartitionRefitSummary(ImmutableArrayRecord):
     global_optimality_gap: float = float("inf")
     global_certificate_method: str = "none"
     refit_mode: str = "interval_certified"
+    multiplicity_policy: str = "independent_broad"
+    locally_converged: bool | None = None
 
     def __post_init__(self) -> None:
         if self.global_optimum_certified and (
@@ -133,6 +135,10 @@ class DirectPartition(ImmutableArrayRecord):
         "final_phi_hessian_ward",
         "final_phi_hessian_ward_cem",
         "final_phi_hessian_ward_cem_component_death",
+        "pilot_dosage_rescale",
+        "pilot_dosage_split",
+        "final_phi_dosage_rescale",
+        "final_phi_dosage_split",
     ]
     mutation_ids: tuple[str, ...]
     parent_raw_candidate_id: int | None = None

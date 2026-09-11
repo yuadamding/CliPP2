@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 
 from .config import (
+    MULTIPLICITY_POLICIES,
     DEFAULT_CERTIFICATE_COLUMN_TOL_SCALE,
     DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
     DEFAULT_DENSE_FALLBACK_POLICY,
@@ -26,6 +27,11 @@ from .config import FitConfig, resolve_fit_config
 def _add_fit_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--input-file", required=True)
     parser.add_argument("--outdir", default="clipp2_results")
+    parser.add_argument(
+        "--multiplicity-policy", choices=MULTIPLICITY_POLICIES,
+        default="independent_broad",
+        help="Shared policies require region-invariant allele-specific CN; balanced_single is simulator-specific.",
+    )
     parser.add_argument(
         "--profile",
         choices=COMPUTATION_PROFILE_NAMES,
@@ -129,6 +135,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
     return resolve_fit_config(
         lambda_value=0.0,
+        multiplicity_policy=args.multiplicity_policy,
         outer_max_iter=args.outer_max_iter,
         inner_max_iter=args.inner_max_iter,
         tol=args.tol,

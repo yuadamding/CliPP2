@@ -113,6 +113,8 @@ def scalar_problem_from_model(
     eps: float,
     respect_observed: bool = True,
 ) -> ScalarProblem:
+    if model.coupling == "joint" and model.shape[1] > 1:
+        raise ValueError("A regional ScalarProblem is not the joint observed likelihood; use a joint refit.")
     rows = np.asarray(mutation_indices, dtype=np.int64).reshape(-1)
     region = int(region_index)
     alt = model.alt[rows, region]
@@ -560,6 +562,7 @@ class PartitionRefitResult:
     global_certificate_method: str = "none"
     global_certificate_intervals: int = 0
     refit_mode: str = "interval_certified"
+    locally_converged: bool = False
 
 
 @dataclass(frozen=True)
@@ -726,6 +729,7 @@ def partition_constrained_observed_refit(
     _model: ObservedModel | None = None,
     _coordinate_cache: _RefitCoordinateCache | None = None,
     _work_stats: _ScalarWorkStats | None = None,
+    multiplicity_policy: str | None = None,
 ) -> PartitionRefitResult:
     """Refit cluster centers without changing partition labels."""
 
@@ -755,11 +759,16 @@ def partition_constrained_observed_refit(
     )
     n_regions = int(data.num_regions)
 
-    model = compile_observed_model(data, eps=epsilon)
+    policy = multiplicity_policy or ("independent_broad" if _model is None else _model.support_policy)
+    model = compile_observed_model(data, eps=epsilon, multiplicity_policy=policy)
     if _model is not None and _model.fingerprint != model.fingerprint:
         raise ValueError("The supplied scalar model does not match the tumor objective.")
     if model.shape != (int(data.num_mutations), n_regions):
         raise ValueError("The supplied scalar model does not match the tumor shape.")
+    if model.coupling == "joint":
+        from .joint import joint_partition_refit
+        return joint_partition_refit(model, normalized_labels, eps=epsilon,
+                                     tol=tolerance, max_iter=int(max_iter))
     upper_matrix = model.upper
     observed = model.observed & ((model.alt + model.nonalt) > 0.0)
     centers = np.zeros((n_clusters, n_regions), dtype=np.float64)

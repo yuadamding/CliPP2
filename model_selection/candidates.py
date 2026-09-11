@@ -138,6 +138,8 @@ def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None
             "Score uncertainty does not cover the refit certificate gap."
         )
     if isinstance(candidate, RawFusionCandidate):
+        if candidate.raw_fit.provenance.multiplicity_policy != refit.multiplicity_policy:
+            raise ValueError("Raw fit and refit multiplicity policies differ.")
         if candidate.raw_fit.provenance.source_data_hash != refit.source_data_hash:
             raise ValueError("Raw fit and fixed refit source data identities differ.")
         if candidate.raw_fit.provenance.likelihood_eps != refit.likelihood_eps:
@@ -217,6 +219,7 @@ def _selection_refit_cache_key(
     return (
         str(partition_signature),
         float(selection_options.eps),
+        selection_options.multiplicity_policy,
         float(refit.tolerance),
         int(refit.max_iter),
         # A family name does not identify counts, candidate support or priors.
@@ -250,6 +253,7 @@ def _fixed_labels_refit(
 
     kwargs = dict(
         eps=float(selection_options.eps),
+        multiplicity_policy=selection_options.multiplicity_policy,
         tol=float(refit_config.tolerance),
         max_iter=int(refit_config.max_iter),
         scalar_mode=str(refit_config.mode),
@@ -298,6 +302,7 @@ def _build_refit_summary(
     resolution: PartitionRefitCacheEntry,
     data: TumorData,
     eps: float,
+    multiplicity_policy: str,
 ) -> PartitionRefitSummary:
     return PartitionRefitSummary(
         labels=np.asarray(refit.labels, dtype=np.int64).copy(),
@@ -314,6 +319,8 @@ def _build_refit_summary(
         global_optimality_gap=float(refit.global_optimality_gap),
         global_certificate_method=str(refit.global_certificate_method),
         refit_mode=str(refit.refit_mode),
+        multiplicity_policy=multiplicity_policy,
+        locally_converged=refit.locally_converged if refit.refit_mode == "joint_multistart" else None,
     )
 
 
@@ -374,6 +381,7 @@ def evaluate_partition(
             resolution=cached_refit,
             data=data,
             eps=selection_options.eps,
+            multiplicity_policy=selection_options.multiplicity_policy,
         ),
         score=score,
     )

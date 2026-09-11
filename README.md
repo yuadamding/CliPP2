@@ -27,6 +27,30 @@ a rounded VAF-based estimate. Missing or zero-depth observations are marked
 uninformative and their call is left missing, except when the only possible
 multiplicity is structurally fixed at one.
 
+For region-invariant allele-specific CN, `--multiplicity-policy shared_broad`
+explicitly assumes one multiplicity per mutation across regions. Regional
+binomial evidence is combined **before** multiplicity is marginalized; the
+same joint likelihood drives initialization, fusion, joint center refits,
+partition scoring, and reported posteriors. Use
+`--multiplicity-policy shared_balanced_single` for the current tree simulator:
+it additionally restricts balanced-CN mutations (`major_cn == minor_cn`) to
+one copy. This is a simulator-specific assumption, not a general biological
+rule. Equal CN calls alone do not prove shared multiplicity. Both shared
+policies reject different allele-specific CN across regions; compatible CN
+history tuples require a separately specified input model. The default remains
+`independent_broad`, which permits different regional multiplicities.
+
+Shared refits use bounded, data-derived multistarts; neither they nor their
+coherent rescale/split proposals imply a global optimum. The graph construction
+rule, selection penalties, and raw KKT admission gate are unchanged. Use the
+`balanced` profile for this experimental joint-model path: `strict` still
+requires globally certified fixed-label refits and therefore fails closed
+when the joint multistart refit cannot provide that certificate. Under a shared
+policy, positive-depth evidence in another region can inform a missing region's
+multiplicity, but does not identify its CCF. Coupling and support policy are
+recorded in the objective identity and run provenance; results from different
+policies must not be pooled as one estimator.
+
 ## Fit
 
 Fit on CUDA:

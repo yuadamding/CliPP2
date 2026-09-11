@@ -15,6 +15,7 @@ CLONAL_INTEGER_MODEL_ID = "clipp2_clonal_integer_multiplicity_mixture_v1"
 CLONAL_INTEGER_GENERATOR_VERSION = "integer_1_to_major_cap6_v1"
 CLONAL_INTEGER_PRIOR_MODE = "uniform_distinct_integer_v1"
 MAX_MAJOR_CN = 6
+MULTIPLICITY_POLICIES = ("independent_broad", "shared_broad", "shared_balanced_single")
 
 DEFAULT_DEVICE: Final = "cuda"
 DEFAULT_DTYPE: Final = "float32"
@@ -339,16 +340,20 @@ class FitConfig:
     selection: SelectionConfig
     graph: GraphConfig
     computation_profile: ComputationProfile
+    multiplicity_policy: str = "independent_broad"
 
     def __post_init__(self) -> None:
         if not math.isfinite(float(self.lambda_value)) or float(self.lambda_value) < 0.0:
             raise ValueError("lambda_value must be finite and nonnegative.")
         validate_likelihood_precision(self.eps, self.runtime.dtype)
+        if self.multiplicity_policy not in MULTIPLICITY_POLICIES:
+            raise ValueError(f"multiplicity_policy must be one of {MULTIPLICITY_POLICIES}.")
 
 
 def resolve_fit_config(
     *,
     lambda_value: float = 0.0,
+    multiplicity_policy: str = "independent_broad",
     computation_profile: str = DEFAULT_COMPUTATION_PROFILE,
     outer_max_iter: int | None = None,
     inner_max_iter: int | None = None,
@@ -418,6 +423,7 @@ def resolve_fit_config(
     )
     return FitConfig(
         lambda_value=float(lambda_value),
+        multiplicity_policy=multiplicity_policy,
         eps=float(eps),
         runtime=runtime,
         solver=solver,

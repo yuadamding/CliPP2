@@ -16,10 +16,7 @@ import pandas as pd
 
 from ._version import __version__
 from ._source import source_fingerprint
-from .config import (
-    FitConfig, CLONAL_INTEGER_MODEL_ID, CLONAL_INTEGER_GENERATOR_VERSION,
-    CLONAL_INTEGER_PRIOR_MODE, MAX_MAJOR_CN,
-)
+from .config import FitConfig, MAX_MAJOR_CN
 from .core.fusion.types import RawFit
 from .core.bic import effective_bic_mutation_region_count
 from .core.objective import (
@@ -283,8 +280,9 @@ def _add_integer_multiplicity(
     data: TumorData,
     phi: np.ndarray,
     eps: float,
+    multiplicity_policy: str = "independent_broad",
 ) -> None:
-    posterior = infer_integer_multiplicity_posterior_numpy(data, phi, eps=eps)
+    posterior = infer_integer_multiplicity_posterior_numpy(data, phi, eps=eps, multiplicity_policy=multiplicity_policy)
     count = posterior.candidate_count.reshape(-1)
     table["multiplicity_candidates"] = [
         ",".join(str(candidate) for candidate in range(1, int(size) + 1))
@@ -327,6 +325,7 @@ def _mutation_region_output_table(analysis: AnalysisSerialization) -> pd.DataFra
         }
     )
     _add_integer_multiplicity(table, data=data, phi=refit_phi,
+                             multiplicity_policy=analysis.raw_fit.provenance.multiplicity_policy,
                               eps=analysis.raw_fit.provenance.likelihood_eps)
     return table
 
@@ -411,10 +410,11 @@ def _write_fit_tables(analysis: AnalysisSerialization, publication: RunPublicati
 SUMMARY_SCHEMA_VERSION = 5
 
 
-def input_model_summary(data: TumorData) -> dict[str, object]:
+def input_model_summary(data: TumorData, *, multiplicity_policy="independent_broad", eps=1e-6) -> dict[str, object]:
     """Separate eligibility provenance from the retained numerical model."""
     report = data.cn_filter_report
     records = () if report is None else report.records
+    model = compile_observed_model(data, eps=eps, multiplicity_policy=multiplicity_policy)
     return {
         "input_mutation_count": data.num_mutations if report is None else report.input_mutation_count,
         "retained_mutation_count": data.num_mutations,
@@ -426,9 +426,12 @@ def input_model_summary(data: TumorData) -> dict[str, object]:
             record.mutation_id for record in records if record.reason == "MAJOR_CN_GT_6"
         }),
         "cn_filter_policy_id": None if report is None else report.policy_id,
-        "multiplicity_model_id": CLONAL_INTEGER_MODEL_ID,
-        "multiplicity_candidate_generator_version": CLONAL_INTEGER_GENERATOR_VERSION,
-        "multiplicity_prior_mode": CLONAL_INTEGER_PRIOR_MODE,
+        "multiplicity_model_id": model.model_id,
+        "multiplicity_candidate_generator_version": model.candidate_generator_version,
+        "multiplicity_prior_mode": model.prior_mode,
+        "multiplicity_policy": model.support_policy,
+        "multiplicity_coupling": model.coupling,
+        "multiplicity_reduction_schema": 1,
     }
 
 
@@ -503,6 +506,8 @@ def _qualification(analysis: AnalysisSerialization) -> dict[str, object]:
             "parent_raw_phi_hash": (partition.parent_raw_phi_hash or None) if direct else None,
         },
         "refit": {
+            "multiplicity_policy": refit.multiplicity_policy,
+            "local_stationarity_resolved": refit.locally_converged,
             "finite_candidate_found": bool(refit.finite_candidate_found),
             "numerically_resolved": bool(refit.refit_numerically_resolved),
             "global_optimum_certified": bool(refit.global_optimum_certified),
@@ -565,9 +570,14 @@ class AnalysisSerialization:
             or (fit_config is not None and fit_config.eps != epsilon)):
             raise ValueError("Reporting eps must match the fitted likelihood provenance.")
         source_hash = tumor_data_fingerprint(data)
-        source_model = compile_observed_model(data, eps=epsilon)
+        policy = raw_fit.provenance.multiplicity_policy
+        if fit_config is not None and fit_config.multiplicity_policy != policy:
+            raise ValueError("Reporting multiplicity policy differs from the fitted objective.")
+        source_model = compile_observed_model(data, eps=epsilon, multiplicity_policy=policy)
 
         def bind(partition, refit, raw=None):
+            if refit.multiplicity_policy != policy:
+                raise ValueError("Refit and reporting multiplicity policies differ.")
             if tuple(partition.mutation_ids) != tuple(data.mutation_ids):
                 raise ValueError("Reporting data do not match the fitted mutation ordering.")
             if refit.source_data_hash != source_hash or refit.likelihood_eps != epsilon:
@@ -679,7 +689,8 @@ def analysis_summary(
         "summary_schema_version": SUMMARY_SCHEMA_VERSION,
         "tumor_id": data.tumor_id,
         "input_file": str(analysis.input_file),
-        **input_model_summary(data),
+        **input_model_summary(data, multiplicity_policy=raw_fit.provenance.multiplicity_policy,
+                              eps=raw_fit.provenance.likelihood_eps),
         "scalar_pilot_coordinate_count": len(scalar_pilots),
         "scalar_pilot_certified_coordinate_count": sum(
             item.globally_certified for item in scalar_pilots

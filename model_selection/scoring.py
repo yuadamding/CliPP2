@@ -116,6 +116,7 @@ def _assert_same_signature_consistency(records: list[CandidateRecord]) -> None:
             )
             refit_consistent = (
                 refit.partition_signature == signature
+                and refit.multiplicity_policy == reference_refit.multiplicity_policy
                 and np.array_equal(refit.labels, reference_refit.labels)
                 and np.allclose(refit.phi, reference_refit.phi, rtol=0.0, atol=1e-12)
                 and np.allclose(

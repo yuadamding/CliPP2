@@ -376,11 +376,13 @@ class PreparedProblem:
         data = self.source_data
         if self.data_fingerprint != tumor_data_fingerprint(data):
             raise ValueError("Prepared problem data fingerprint is inconsistent.")
-        source = compile_observed_model(data, eps=self.eps)
+        source = compile_observed_model(data, eps=self.eps, multiplicity_policy=self.model.support_policy)
         if (
             self.source_model is None
             or self.source_model.fingerprint != source.fingerprint
             or self.model.source_fingerprint != source.fingerprint
+            or self.model.coupling != source.coupling
+            or self.model.support_policy != source.support_policy
         ):
             raise ValueError("Prepared problem likelihood or epsilon identity is inconsistent.")
         if self.graph_spec.name == "deferred_likelihood_pilot" and not allow_deferred_graph:
@@ -481,6 +483,7 @@ class FitProvenance:
     inner_solver: str
     global_optimality_basis: str
     scalar_pilot_certificates: tuple[ScalarGlobalMinimumCertificate, ...] = ()
+    multiplicity_policy: str = "independent_broad"
 
     @property
     def likelihood_eps(self) -> float:
