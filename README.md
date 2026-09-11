@@ -17,8 +17,10 @@ The public input is one tab-delimited file per tumor. See
 
 CliPP2 excludes a mutation from **all regions** if any region has subclonal
 copy number (more than one distinct CN state after identical states are combined)
-or major CN greater than six; different clonal CN states between regions are
-allowed. For each retained mutation–region pair, fitting marginalizes integer
+or major CN greater than `--max-major-cn` (**default: 4**); different clonal CN
+states between regions are allowed. The limit is inclusive: major CN 4 is
+retained by default, while 5 and above are excluded. Use `--max-major-cn 6` for
+the previous cutoff. For each retained mutation–region pair, fitting marginalizes integer
 multiplicity candidates from **1 to major CN** with uniform priors under a
 binomial likelihood adjusted for purity, normal/tumor copy number, and CCF.
 The reported multiplicity is the highest-posterior candidate conditional on the
@@ -50,8 +52,9 @@ clipp2 fit \
 
 
 Use `--device cpu` for explicit CPU execution. CUDA is the default; unavailable
-CUDA or insufficient memory fails without silently switching devices. The only
-other fit option is `--verbose`; standard help and version options are available.
+CUDA or insufficient memory fails without silently switching devices. Set the
+positive-integer CN eligibility cutoff with `--max-major-cn` (default 4).
+`--verbose` and standard help and version options are also available.
 
 ## Fixed inference workflow
 
@@ -81,16 +84,18 @@ in the manifest. They are not user-selectable modes.
 ```python
 from CliPP2 import FitConfig, process_tumor
 
-summary = process_tumor("tumor.tsv", "results", FitConfig(device="cuda"))
+summary = process_tumor("tumor.tsv", "results", FitConfig(device="cuda", max_major_cn=4))
 ```
 
 This revision intentionally removes profile, multiplicity-policy, precision,
 graph, warm-start, solver/refit/resource tuning, fallback and output-skipping
 options from the public CLI/API. Removed arguments raise errors; they are not
-silently mapped to defaults. `FitConfig` accepts only `device` and `verbose`.
+silently mapped to defaults. `FitConfig` accepts `device`, `verbose`, and
+`max_major_cn`. `load_tumor_txt(..., max_major_cn=4)` uses the same default;
+preloaded data must use the same cutoff as the fit configuration.
 The separate public raw-fit/preparation and standalone publication entry points
-are removed. Existing flat summary keys remain; `computation_profile=balanced`
-is a fixed historical provenance label, not a selectable profile. Reproduce
+are removed. `computation_profile=balanced` is a fixed historical provenance
+label, not a selectable profile. Reproduce
 older modes using their exact historical commit.
 
 ## Outputs
@@ -112,6 +117,15 @@ overwritten: use a new directory for retries. Exclusion evidence is written
 before fitting; the manifest becomes complete only after validated publication.
 Numerical failure preserves a failed manifest and exclusion audit, not a
 mislabelled successful clustering result.
+
+The manifest records `config.max_major_cn`. Exclusions use reason
+`MAJOR_CN_ABOVE_LIMIT`, with the observed `max_major_cn` and configured
+`major_cn_limit` in the audit. Summary schema 6 replaces the old hard-coded
+`excluded_major_cn_gt6_mutation_count` key with
+`excluded_major_cn_above_limit_mutation_count` and records `max_major_cn`.
+Posterior columns run from `multiplicity_p1` through
+`multiplicity_p<max_major_cn>`; unsupported candidates have zero probability.
+Changing the cutoff changes input eligibility, not the KKT gate or solver settings.
 
 ## Simulation and checks
 

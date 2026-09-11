@@ -12,6 +12,7 @@ import pandas as pd
 from ..io.tumor_txt import CN_FILTER_POLICY_ID, TUMOR_TXT_SCHEMA, write_tumor_txt
 from .config import (
     TumorSimulationConfig,
+    MAX_SIMULATION_ALLELE_CN,
     _positive_integer,
     _validate_copy_number_config,
 )
@@ -451,6 +452,7 @@ def _write_patient_simulation(
     )
     intended_factors = {
         "cn_filter_policy_id": CN_FILTER_POLICY_ID,
+        "cn_filter_max_major_cn": MAX_SIMULATION_ALLELE_CN,
         "copy_number_mode": "clonal_trunk_gains",
         "multiplicity_mode": "uniform_unequal_cn_else_one",
         "multiplicity_sampling_unit": "mutation_shared_across_regions",

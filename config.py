@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from functools import lru_cache
 import math
+from numbers import Integral
 import struct
 from typing import TYPE_CHECKING, Final
 
@@ -13,9 +14,9 @@ if TYPE_CHECKING:
 
 # Fixed model identifiers shared by input, inference, reporting and simulation.
 CLONAL_INTEGER_MODEL_ID = "clipp2_clonal_integer_multiplicity_mixture_v1"
-CLONAL_INTEGER_GENERATOR_VERSION = "integer_1_to_major_cap6_v1"
+CLONAL_INTEGER_GENERATOR_VERSION = "integer_1_to_major_v2"
 CLONAL_INTEGER_PRIOR_MODE = "uniform_distinct_integer_v1"
-MAX_MAJOR_CN = 6
+DEFAULT_MAX_MAJOR_CN: Final = 4
 
 DEFAULT_DEVICE: Final = "cuda"
 DEFAULT_DTYPE: Final = "float32"
@@ -79,6 +80,13 @@ def _positive(name: str, value: float) -> float:
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError(f"{name} must be positive and finite.")
     return value
+
+
+def validate_max_major_cn(value: int) -> int:
+    """Require an explicit positive integer input-eligibility cutoff."""
+    if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+        raise ValueError("max_major_cn must be a positive integer.")
+    return int(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,16 +209,18 @@ class GraphConfig:
 
 @dataclass(frozen=True, slots=True)
 class FitConfig:
-    """Public execution options; the estimator and numerical policy are fixed."""
+    """Public execution and CN eligibility options; numerical policy is fixed."""
 
     device: str = DEFAULT_DEVICE
     verbose: bool = False
+    max_major_cn: int = DEFAULT_MAX_MAJOR_CN
 
     def __post_init__(self) -> None:
         if self.device not in ("cpu", "cuda"):
             raise ValueError("device must be cpu or cuda.")
         if not isinstance(self.verbose, bool):
             raise TypeError("verbose must be a boolean.")
+        object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +228,7 @@ class _FitOptions:
     """Internal resolved constants, replaceable only for bounded recovery."""
 
     runtime: RuntimeConfig
+    max_major_cn: int = DEFAULT_MAX_MAJOR_CN
     lambda_value: float = 0.0
     eps: float = 1e-6
     solver: SolverConfig = field(default_factory=lambda: SolverConfig(
@@ -231,20 +242,29 @@ class _FitOptions:
     ))
     graph: GraphConfig = field(default_factory=GraphConfig)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
+
     @property
     def multiplicity_policy(self) -> str:
         return "independent_broad"
 
 
-def resolve_fit_config(*, device: str = DEFAULT_DEVICE, verbose: bool = False) -> FitConfig:
+def resolve_fit_config(
+    *, device: str = DEFAULT_DEVICE, verbose: bool = False,
+    max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
+) -> FitConfig:
     """Construct the only public fit configuration; removed knobs raise TypeError."""
-    return FitConfig(device=device, verbose=verbose)
+    return FitConfig(device=device, verbose=verbose, max_major_cn=max_major_cn)
 
 
 def _resolve_fit_options(config: FitConfig) -> _FitOptions:
     if type(config) is not FitConfig:
-        raise TypeError("fit_config must be a FitConfig containing only device and verbose.")
-    options = _FitOptions(runtime=RuntimeConfig(device=config.device, verbose=config.verbose))
+        raise TypeError("fit_config must be a FitConfig containing device, verbose and max_major_cn.")
+    options = _FitOptions(
+        runtime=RuntimeConfig(device=config.device, verbose=config.verbose),
+        max_major_cn=config.max_major_cn,
+    )
     validate_likelihood_precision(options.eps, options.runtime.dtype)
     return options
 

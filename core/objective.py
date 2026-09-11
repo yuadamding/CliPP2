@@ -20,7 +20,6 @@ from ..config import (
     CLONAL_INTEGER_GENERATOR_VERSION,
     CLONAL_INTEGER_MODEL_ID,
     CLONAL_INTEGER_PRIOR_MODE,
-    MAX_MAJOR_CN,
     validate_likelihood_precision,
 )
 
@@ -402,8 +401,8 @@ def _compile_integer_candidates(major_cn: np.ndarray, scaling: np.ndarray) -> di
     if not np.all(np.isfinite(major)) or not np.allclose(major, np.rint(major), rtol=0.0, atol=1e-8):
         raise ValueError("Retained major_cn must contain finite integers.")
     major = np.rint(major)
-    if np.any((major < 1) | (major > MAX_MAJOR_CN)):
-        raise ValueError("Retained major_cn must lie in [1, 6]; apply CN filtering first.")
+    if np.any(major < 1):
+        raise ValueError("Retained major_cn must be positive; apply CN filtering first.")
     candidates = np.arange(1, int(major.max()) + 1, dtype=np.float64)
     valid = candidates <= major[..., None]
     return {

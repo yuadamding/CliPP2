@@ -15,7 +15,7 @@ import pandas as pd
 
 from ._version import __version__
 from ._source import source_fingerprint, git_source_identity
-from .config import _FitOptions, MAX_MAJOR_CN, ALGORITHM_ID
+from .config import _FitOptions, ALGORITHM_ID
 from .core.fusion.types import RawFit
 from .core.bic import effective_bic_mutation_region_count
 from .core.objective import (
@@ -270,6 +270,7 @@ def _add_integer_multiplicity(
     data: TumorData,
     phi: np.ndarray,
     eps: float,
+    max_major_cn: int,
 ) -> None:
     posterior = infer_integer_multiplicity_posterior_numpy(data, phi, eps=eps)
     count = posterior.candidate_count.reshape(-1)
@@ -284,7 +285,7 @@ def _add_integer_multiplicity(
     table["multiplicity_call"] = calls
     table["multiplicity_call_probability"] = posterior.map_probability.reshape(-1)
     table["multiplicity_informative"] = informative
-    for candidate in range(1, MAX_MAJOR_CN + 1):
+    for candidate in range(1, max_major_cn + 1):
         table[f"multiplicity_p{candidate}"] = (
             posterior.posterior[..., candidate - 1].reshape(-1)
             if candidate <= posterior.posterior.shape[-1]
@@ -314,7 +315,8 @@ def _mutation_region_output_table(analysis: AnalysisSerialization) -> pd.DataFra
         }
     )
     _add_integer_multiplicity(table, data=data, phi=refit_phi,
-                              eps=analysis.raw_fit.provenance.likelihood_eps)
+                              eps=analysis.raw_fit.provenance.likelihood_eps,
+                              max_major_cn=analysis.fit_config.max_major_cn)
     return table
 
 
@@ -334,10 +336,11 @@ def cn_filter_output_table(
     )
     return pd.DataFrame(
         [
-            {"tumor_id": tumor_id, **{name: getattr(record, name) for name in fields}}
+            {"tumor_id": tumor_id, **{name: getattr(record, name) for name in fields},
+             "major_cn_limit": report.max_major_cn}
             for record in (() if report is None else report.records)
         ],
-        columns=("tumor_id", *fields),
+        columns=("tumor_id", *fields, "major_cn_limit"),
     )
 
 
@@ -353,7 +356,7 @@ def _write_fit_tables(analysis: AnalysisSerialization, publication: RunPublicati
     publication.publish(tables, analysis=analysis.qualification)
 
 
-SUMMARY_SCHEMA_VERSION = 5
+SUMMARY_SCHEMA_VERSION = 6
 
 
 def input_model_summary(data: TumorData, *, eps=1e-6) -> dict[str, object]:
@@ -368,9 +371,10 @@ def input_model_summary(data: TumorData, *, eps=1e-6) -> dict[str, object]:
         "excluded_subclonal_cn_mutation_count": len({
             record.mutation_id for record in records if record.reason == "SUBCLONAL_CN_REGION"
         }),
-        "excluded_major_cn_gt6_mutation_count": len({
-            record.mutation_id for record in records if record.reason == "MAJOR_CN_GT_6"
+        "excluded_major_cn_above_limit_mutation_count": len({
+            record.mutation_id for record in records if record.reason == "MAJOR_CN_ABOVE_LIMIT"
         }),
+        "max_major_cn": None if report is None else report.max_major_cn,
         "cn_filter_policy_id": None if report is None else report.policy_id,
         "multiplicity_model_id": model.model_id,
         "multiplicity_candidate_generator_version": model.candidate_generator_version,
@@ -496,6 +500,8 @@ class AnalysisSerialization:
     ) -> None:
         if not isinstance(selection_result, BICSelectionResult) or not isinstance(fit_config, _FitOptions):
             raise TypeError("Reporting requires a completed selection and resolved configuration.")
+        if data.cn_filter_report is None or data.cn_filter_report.max_major_cn != fit_config.max_major_cn:
+            raise ValueError("Reporting max_major_cn must match the original CN filtering report.")
         model = selection_result.selected_model
         raw_fit = model.raw_reference.raw_fit
         partition, refit = model.partition_candidate.partition, model.partition_candidate.refit

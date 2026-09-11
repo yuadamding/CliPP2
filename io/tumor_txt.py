@@ -13,12 +13,12 @@ import numpy as np
 import pandas as pd
 
 from .data import CNFilterRecord, CNFilterReport, TumorData
-from ..config import MAX_MAJOR_CN
+from ..config import DEFAULT_MAX_MAJOR_CN, validate_max_major_cn
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
-CN_FILTER_POLICY_ID = "clonal_cn_major_le6_whole_mutation_v1"
+CN_FILTER_POLICY_ID = "clonal_cn_major_limit_whole_mutation_v2"
 SUBCLONAL_CN_REGION = "SUBCLONAL_CN_REGION"
-MAJOR_CN_GT_6 = "MAJOR_CN_GT_6"
+MAJOR_CN_ABOVE_LIMIT = "MAJOR_CN_ABOVE_LIMIT"
 NO_POSITIVE_PATH = "NO_POSITIVE_MUTANT_COPY_PATH"
 
 
@@ -508,8 +508,10 @@ def _validate_long_table(
 
 def _filter_snv_cn(
     validated: _ValidatedLongTable,
+    *, max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
 ) -> tuple[_ValidatedLongTable, CNFilterReport]:
     """Exclude whole SNVs using every sample's original validated CN states."""
+    max_major_cn = validate_max_major_cn(max_major_cn)
     records: list[CNFilterRecord] = []
     excluded_ids: set[str] = set()
     for (mutation_id, sample_id), rows in sorted(validated.rows_by_unit.items()):
@@ -520,8 +522,8 @@ def _filter_snv_cn(
         reasons = []
         if n_states > 1:
             reasons.append(SUBCLONAL_CN_REGION)
-        if max_major > MAX_MAJOR_CN:
-            reasons.append(MAJOR_CN_GT_6)
+        if max_major > max_major_cn:
+            reasons.append(MAJOR_CN_ABOVE_LIMIT)
         for reason in reasons:
             excluded_ids.add(mutation_id)
             records.append(CNFilterRecord(
@@ -533,6 +535,7 @@ def _filter_snv_cn(
     )
     report = CNFilterReport(
         policy_id=CN_FILTER_POLICY_ID,
+        max_major_cn=max_major_cn,
         input_mutation_count=len(validated.mutation_ids),
         retained_mutation_count=len(retained_ids),
         excluded_mutation_ids=tuple(
@@ -666,16 +669,18 @@ def load_tumor_txt(
     path: str | Path,
     *,
     eps: float = 1e-6,
+    max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
 ) -> TumorData:
-    """Validate, filter whole SNVs, and compile uniform integer multiplicities."""
+    """Filter whole SNVs above max_major_cn (default 4) or with subclonal CN."""
 
+    max_major_cn = validate_max_major_cn(max_major_cn)
     epsilon = float(eps)
     if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
         raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
     input_path = Path(path).resolve()
     metadata, table = _read_text_table(input_path)
     validated = _validate_long_table(metadata, table)
-    filtered, report = _filter_snv_cn(validated)
+    filtered, report = _filter_snv_cn(validated, max_major_cn=max_major_cn)
     return _build_tumor_data(filtered, report=report, eps=epsilon)
 
 
@@ -772,7 +777,7 @@ def write_tumor_txt(
 __all__ = [
     "CN_FILTER_POLICY_ID",
     "SCHEMA_COLUMNS",
-    "MAJOR_CN_GT_6",
+    "MAJOR_CN_ABOVE_LIMIT",
     "NoEligibleSNVsError",
     "SUBCLONAL_CN_REGION",
     "TUMOR_TXT_SCHEMA",

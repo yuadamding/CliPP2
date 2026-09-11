@@ -28,7 +28,7 @@ def process_tumor_bundle(
     input_sha256 = _file_hash(tumor_file)
     workflow = {"entrypoint": "process_tumor_bundle", "use_warm_starts": True}
     try:
-        data = load_tumor_txt(tumor_file, eps=options.eps)
+        data = load_tumor_txt(tumor_file, eps=options.eps, max_major_cn=options.max_major_cn)
     except NoEligibleSNVsError as error:
         publication = RunPublication(outdir, error.tumor_id, input_file=tumor_file,
                                      expected_input_sha256=input_sha256,

@@ -19,6 +19,7 @@ from CliPP2.io.tumor_txt import (
 from .config import (
     GENERATOR_VERSION,
     OUTPUT_SCHEMA_VERSION,
+    MAX_SIMULATION_ALLELE_CN,
 )
 from .evolution import (
     GenomeSegment,
@@ -117,7 +118,7 @@ def validate_generated_tumor_directory(tumor_dir: str | Path) -> None:
             f"Generated tumor has non-contract root files: {unexpected_root}."
         )
 
-    data = load_tumor_txt(canonical_input)
+    data = load_tumor_txt(canonical_input, max_major_cn=MAX_SIMULATION_ALLELE_CN)
     if data.tumor_id != tumor_dir.name:
         raise ValueError(
             "Canonical tumor_id must match its benchmark bundle directory: "

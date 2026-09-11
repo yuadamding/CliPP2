@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import numpy as np
-from ..config import _FitOptions, MAX_MAJOR_CN
+from ..config import _FitOptions
 from .data import TumorData
 from .tumor_txt import CN_FILTER_POLICY_ID
 
-def _validate_biological_arrays(data: TumorData) -> None:
+def _validate_biological_arrays(data: TumorData, *, max_major_cn: int) -> None:
     """Reject stale derived arrays and malformed programmatic replacements.
 
     Shape checks precede arithmetic so NumPy broadcasting cannot turn an
@@ -51,10 +51,13 @@ def _validate_biological_arrays(data: TumorData) -> None:
     if np.any(data.normal_cn < 0.0):
         raise ValueError("TumorData.normal_cn must be nonnegative.")
     if (
-        np.any((data.major_cn < 1) | (data.major_cn > MAX_MAJOR_CN))
+        np.any((data.major_cn < 1) | (data.major_cn > max_major_cn))
         or np.any(data.minor_cn > data.major_cn)
     ):
-        raise ValueError("TumorData must satisfy 0 <= minor_cn <= major_cn <= 6 and major_cn >= 1.")
+        raise ValueError(
+            f"TumorData must satisfy 0 <= minor_cn <= major_cn <= {max_major_cn} "
+            "and major_cn >= 1."
+        )
     expected_scaling = data.purity / (
         (1.0 - data.purity) * data.normal_cn
         + data.purity * (data.major_cn + data.minor_cn)
@@ -82,7 +85,9 @@ def validate_public_tumor_data(data: TumorData, config: _FitOptions) -> None:
             "load_tumor_txt, including its original-CN filtering report; "
             "legacy or unvalidated TumorData is not supported."
         )
-    _validate_biological_arrays(data)
+    if report.max_major_cn != config.max_major_cn:
+        raise ValueError("CN filtering report max_major_cn differs from fit configuration; reload the input.")
+    _validate_biological_arrays(data, max_major_cn=config.max_major_cn)
     excluded = set(report.excluded_mutation_ids)
     if (
         report.retained_mutation_count != data.num_mutations

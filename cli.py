@@ -4,7 +4,7 @@ import argparse
 import math
 from pathlib import Path
 
-from .config import DEFAULT_DEVICE, FitConfig, resolve_fit_config
+from .config import DEFAULT_DEVICE, DEFAULT_MAX_MAJOR_CN, FitConfig, resolve_fit_config, validate_max_major_cn
 from ._version import __version__
 
 
@@ -21,17 +21,27 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--input-file", required=True)
     fit.add_argument("--outdir", default="clipp2_results")
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
+    fit.add_argument(
+        "--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN,
+        help="Exclude a mutation from all regions if any region's major CN exceeds this limit.",
+    )
     fit.add_argument("--verbose", action="store_true")
     fit.add_argument("--version", action="version", version=__version__)
     return parser
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    return build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        validate_max_major_cn(args.max_major_cn)
+    except ValueError as error:
+        parser.error(str(error))
+    return args
 
 
 def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
-    return resolve_fit_config(device=args.device, verbose=args.verbose)
+    return resolve_fit_config(device=args.device, verbose=args.verbose, max_major_cn=args.max_major_cn)
 
 
 def _printable_summary(value: object) -> object:

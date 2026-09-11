@@ -9,6 +9,7 @@ import numpy as np
 from ..config import (
     CLONAL_INTEGER_GENERATOR_VERSION, CLONAL_INTEGER_MODEL_ID,
     CLONAL_INTEGER_PRIOR_MODE,
+    validate_max_major_cn,
 )
 
 
@@ -46,10 +47,14 @@ class CNFilterRecord:
 @dataclass(frozen=True, slots=True)
 class CNFilterReport:
     policy_id: str
+    max_major_cn: int
     input_mutation_count: int
     retained_mutation_count: int
     excluded_mutation_ids: tuple[str, ...]
     records: tuple[CNFilterRecord, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
 
 
 @dataclass(frozen=True)

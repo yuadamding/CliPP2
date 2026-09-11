@@ -7,8 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from CliPP2.config import MAX_MAJOR_CN
-
+MAX_SIMULATION_ALLELE_CN = 6
 DEFAULT_CNA_EVENT_RATE = 1.5
 GENERATOR_VERSION = "tree_clonal_cn_uniform_multiplicity_v7"
 OUTPUT_SCHEMA_VERSION = "7.0"
@@ -22,7 +21,7 @@ class CopyNumberEvolutionConfig:
     segment_size_bp: int = 1_000_000
     cna_event_rate: float = DEFAULT_CNA_EVENT_RATE
     mean_cna_span_segments: float = 1.0
-    max_allele_cn: int = MAX_MAJOR_CN
+    max_allele_cn: int = MAX_SIMULATION_ALLELE_CN
 
 
 @dataclass(frozen=True)
@@ -58,8 +57,8 @@ def _positive_integer(value: object, name: str, *, minimum: int = 1) -> None:
 def _validate_copy_number_config(config: CopyNumberEvolutionConfig) -> None:
     for name in ("n_segments", "segment_size_bp", "max_allele_cn"):
         _positive_integer(getattr(config, name), name)
-    if config.max_allele_cn > MAX_MAJOR_CN:
-        raise ValueError(f"max_allele_cn must not exceed {MAX_MAJOR_CN}.")
+    if config.max_allele_cn > MAX_SIMULATION_ALLELE_CN:
+        raise ValueError(f"max_allele_cn must not exceed {MAX_SIMULATION_ALLELE_CN}.")
     for name, minimum in (("cna_event_rate", 0.0), ("mean_cna_span_segments", 1.0)):
         value = getattr(config, name)
         if (

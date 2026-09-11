@@ -50,10 +50,16 @@ This is a source-only utility, not part of the installed inference wheel.
 Existing tumor directories are never overwritten. The former two-state-CN
 controls have been removed; they are not accepted compatibility switches.
 
+The generator's six-copy CN range is independent of the inference default
+`--max-major-cn 4`. Bundle validation explicitly uses a limit of six so it can
+check all generated truth. To retain the complete generated cohort during
+fitting, pass `--max-major-cn 6`; fitting with the default may exclude generated
+mutations with major CN 5 or 6. Generation and multiplicity sampling are unchanged.
+
 ## Truth and provenance
 
 - `<tumor_id>.clipp2.txt`: canonical observed input; validation requires every
-  mutation to survive CliPP2's whole-mutation CN filter.
+  mutation to survive CliPP2's whole-mutation CN filter with `max_major_cn=6`.
 - `truth.txt`: mutation-to-cluster labels.
 - `truth_clone_sample.txt`: clone CCF by sample; sample `0` means `region1`.
 - `regionN/truth_cp.txt`: per-mutation CCF in that region.
