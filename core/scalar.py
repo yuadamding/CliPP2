@@ -113,8 +113,6 @@ def scalar_problem_from_model(
     eps: float,
     respect_observed: bool = True,
 ) -> ScalarProblem:
-    if model.coupling == "joint" and model.shape[1] > 1:
-        raise ValueError("A regional ScalarProblem is not the joint observed likelihood; use a joint refit.")
     rows = np.asarray(mutation_indices, dtype=np.int64).reshape(-1)
     region = int(region_index)
     alt = model.alt[rows, region]
@@ -561,7 +559,7 @@ class PartitionRefitResult:
     global_optimum_certified: bool = False
     global_certificate_method: str = "none"
     global_certificate_intervals: int = 0
-    refit_mode: str = "interval_certified"
+    refit_mode: str = "grid_local"
     locally_converged: bool = False
 
 
@@ -658,9 +656,6 @@ def canonical_partition_labels(labels: np.ndarray) -> np.ndarray:
 def _fit_coordinate(
     problem: ScalarProblem,
     *,
-    mode: str,
-    tolerance: float,
-    max_iter: int,
     grid_points: int,
     local_steps: int,
     include_breakpoints: bool,
@@ -670,23 +665,6 @@ def _fit_coordinate(
     if _work_stats is not None:
         _work_stats.scalar_solves += 1
     try:
-        if mode == "interval_certified":
-            result = certify_scalar_minimum(
-                problem,
-                tolerance=tolerance,
-                max_intervals=max(int(max_iter) * 256, 4096),
-                _work_stats=_work_stats,
-            )
-            return _RefitCoordinateResult(
-                beta=float(result.argmin),
-                loss=float(result.attained_value),
-                global_lower_bound=float(result.global_lower_bound),
-                optimality_gap=float(result.optimality_gap),
-                finite_candidate_found=bool(np.isfinite(result.attained_value)),
-                globally_certified=bool(result.globally_certified),
-                certificate_method=str(result.method),
-                certificate_intervals=int(result.intervals_evaluated),
-            )
         result = approximate_scalar_minimum(
             problem,
             grid_points=grid_points,
@@ -723,13 +701,11 @@ def partition_constrained_observed_refit(
     eps: float,
     tol: float,
     max_iter: int,
-    scalar_mode: str = "interval_certified",
     scalar_grid_points: int = 64,
     scalar_local_steps: int = 3,
     _model: ObservedModel | None = None,
     _coordinate_cache: _RefitCoordinateCache | None = None,
     _work_stats: _ScalarWorkStats | None = None,
-    multiplicity_policy: str | None = None,
 ) -> PartitionRefitResult:
     """Refit cluster centers without changing partition labels."""
 
@@ -743,9 +719,6 @@ def partition_constrained_observed_refit(
         raise ValueError("Partition refit tolerance must be positive and finite.")
     if int(max_iter) < 1:
         raise ValueError("Partition refit interval budget must be positive.")
-    mode = str(scalar_mode).strip().lower().replace("-", "_")
-    if mode not in {"interval_certified", "grid_local"}:
-        raise ValueError("scalar_mode must be interval_certified or grid_local.")
     if int(scalar_grid_points) < 3:
         raise ValueError("scalar_grid_points must be at least three.")
     if int(scalar_local_steps) < 0:
@@ -759,21 +732,15 @@ def partition_constrained_observed_refit(
     )
     n_regions = int(data.num_regions)
 
-    policy = multiplicity_policy or ("independent_broad" if _model is None else _model.support_policy)
-    model = compile_observed_model(data, eps=epsilon, multiplicity_policy=policy)
+    model = compile_observed_model(data, eps=epsilon)
     if _model is not None and _model.fingerprint != model.fingerprint:
         raise ValueError("The supplied scalar model does not match the tumor objective.")
     if model.shape != (int(data.num_mutations), n_regions):
         raise ValueError("The supplied scalar model does not match the tumor shape.")
-    if model.coupling == "joint":
-        from .joint import joint_partition_refit
-        return joint_partition_refit(model, normalized_labels, eps=epsilon,
-                                     tol=tolerance, max_iter=int(max_iter))
     upper_matrix = model.upper
     observed = model.observed & ((model.alt + model.nonalt) > 0.0)
     centers = np.zeros((n_clusters, n_regions), dtype=np.float64)
     coordinate_lower = np.zeros((n_clusters, n_regions), dtype=np.float64)
-    coordinate_certified = np.ones((n_clusters, n_regions), dtype=bool)
     certificate_methods: set[str] = set()
     certificate_intervals = 0
     total_grid_points = 0
@@ -797,7 +764,7 @@ def partition_constrained_observed_refit(
                 upper = lower
             key = None if _coordinate_cache is None else _RefitCoordinateKey(
                 tumor_data_fingerprint(data), model.fingerprint, member_key, region,
-                lower, upper, epsilon, mode, coordinate_tolerance, int(max_iter),
+                lower, upper, epsilon, "grid_local", coordinate_tolerance, int(max_iter),
                 int(scalar_grid_points), int(scalar_local_steps), True,
             )
             coordinate = None if key is None else _coordinate_cache.get(key)
@@ -811,9 +778,6 @@ def partition_constrained_observed_refit(
                         upper=upper,
                         eps=epsilon,
                     ),
-                    mode=mode,
-                    tolerance=coordinate_tolerance,
-                    max_iter=max_iter,
                     grid_points=scalar_grid_points,
                     local_steps=scalar_local_steps,
                     include_breakpoints=True,
@@ -823,7 +787,6 @@ def partition_constrained_observed_refit(
                     _coordinate_cache.put(key, coordinate)
             centers[cluster, region] = coordinate.beta
             coordinate_lower[cluster, region] = coordinate.global_lower_bound
-            coordinate_certified[cluster, region] = coordinate.globally_certified
             certificate_intervals += coordinate.certificate_intervals
             total_grid_points += int(coordinate.grid_points)
             max_grid_spacing = max(max_grid_spacing, float(coordinate.grid_spacing))
@@ -841,28 +804,10 @@ def partition_constrained_observed_refit(
                 active_df += int(not at_boundary)
 
     selected_lower_bound = float(np.sum(coordinate_lower))
-    selected_coordinates_certified = bool(np.all(coordinate_certified))
     phi = (
         centers[normalized_labels]
         if normalized_labels.size
         else np.empty((0, n_regions))
-    )
-    global_gap = (
-        max(float(total_loss - selected_lower_bound), 0.0)
-        if mode == "interval_certified"
-        else float("inf")
-    )
-    global_certified = bool(
-        mode == "interval_certified"
-        and selected_coordinates_certified
-        and np.isfinite(total_loss)
-        and np.isfinite(selected_lower_bound)
-        and global_gap <= tolerance
-    )
-    method_suffix = (
-        "_interval_certified"
-        if mode == "interval_certified"
-        else "_grid_local_approximate"
     )
     return PartitionRefitResult(
         phi=np.clip(phi, epsilon, upper_matrix).astype(np.float64, copy=False),
@@ -880,29 +825,22 @@ def partition_constrained_observed_refit(
         refit_total_grid_points=int(total_grid_points),
         refit_max_grid_spacing=float(max_grid_spacing),
         refit_total_candidate_basins=0,
-        refit_total_refined_candidates=(
-            int(certificate_intervals)
-            if mode == "interval_certified"
-            else int(n_clusters * n_regions * int(scalar_local_steps))
-        ),
+        refit_total_refined_candidates=int(n_clusters * n_regions * int(scalar_local_steps)),
         refit_min_best_second_loss_gap=(
             float(min(best_second_loss_gaps))
             if best_second_loss_gaps
             else float("inf")
         ),
         labels=normalized_labels.copy(),
-        loglik_source=(
-            "fixed_partition_observed_refit_path"
-            + method_suffix
-        ),
+        loglik_source="fixed_partition_observed_refit_path_grid_local_approximate",
         global_lower_bound=selected_lower_bound,
-        global_optimality_gap=global_gap,
-        global_optimum_certified=global_certified,
+        global_optimality_gap=float("inf"),
+        global_optimum_certified=False,
         global_certificate_method=(
             "+".join(sorted(certificate_methods))
             if certificate_methods
             else "fixed_or_unobserved_coordinates_v1"
         ),
         global_certificate_intervals=int(certificate_intervals),
-        refit_mode=mode,
+        refit_mode="grid_local",
     )

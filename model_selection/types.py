@@ -73,7 +73,7 @@ class PartitionRefitSummary(ImmutableArrayRecord):
     global_lower_bound: float = float("-inf")
     global_optimality_gap: float = float("inf")
     global_certificate_method: str = "none"
-    refit_mode: str = "interval_certified"
+    refit_mode: str = "grid_local"
     multiplicity_policy: str = "independent_broad"
     locally_converged: bool | None = None
 

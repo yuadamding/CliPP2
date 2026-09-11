@@ -8,7 +8,7 @@ from ..core.bic import (
     _dirichlet_exact_partition_log_mass_and_uncertainty,
     fixed_partition_dirichlet_score,
 )
-from ..config import DIRICHLET_ALPHA, DIRICHLET_CODE_WEIGHT, FitConfig, SELECTION_SCORE
+from ..config import DIRICHLET_ALPHA, DIRICHLET_CODE_WEIGHT, _FitOptions, SELECTION_SCORE
 from ..core.objective import ObservedModel
 from ..core.fusion.types import RawFit
 from ..core.fusion.partition_starts import PartitionCandidate
@@ -163,7 +163,6 @@ def _candidate_ineligibility_reason(
     refit: PartitionRefitSummary,
     score: SelectionScore,
     raw_fit: RawFit | None = None,
-    require_global_refit: bool = True,
 ) -> str:
     if isinstance(partition, FusionPartition):
         if raw_fit is None:
@@ -183,13 +182,6 @@ def _candidate_ineligibility_reason(
             return "empty_partition"
     if not refit.finite_candidate_found:
         return "fixed_partition_refit_nonfinite"
-    resolved = (
-        refit.refit_numerically_resolved
-        if isinstance(partition, FusionPartition)
-        else refit.global_optimum_certified
-    )
-    if require_global_refit and not resolved:
-        return "fixed_partition_refit_numerically_unresolved"
     if not np.isfinite(score.value):
         return "fixed_partition_score_nonfinite"
     return "none"
@@ -213,7 +205,7 @@ def _selection_refit_cache_key(
     *,
     data: TumorData,
     partition_signature: str,
-    selection_options: FitConfig,
+    selection_options: _FitOptions,
 ) -> tuple[object, ...]:
     refit = selection_options.selection.refit
     return (
@@ -225,7 +217,7 @@ def _selection_refit_cache_key(
         # A family name does not identify counts, candidate support or priors.
         # Eligibility-only provenance is deliberately absent from this hash.
         tumor_data_fingerprint(data),
-        str(refit.mode),
+        "grid_local",
         int(refit.grid_points),
         int(refit.local_steps),
         "unanchored_profiled_partition_refit_v4",
@@ -237,11 +229,10 @@ def _fixed_labels_refit(
     data: TumorData,
     labels: np.ndarray,
     partition_signature: str,
-    selection_options: FitConfig,
+    selection_options: _FitOptions,
     cache: dict[object, PartitionRefitCacheEntry] | None,
     source_model: ObservedModel | None = None,
 ) -> PartitionRefitCacheEntry:
-    profile = selection_options.computation_profile
     refit_config = selection_options.selection.refit
     refit_spec_key = _selection_refit_cache_key(
         data=data,
@@ -253,10 +244,8 @@ def _fixed_labels_refit(
 
     kwargs = dict(
         eps=float(selection_options.eps),
-        multiplicity_policy=selection_options.multiplicity_policy,
         tol=float(refit_config.tolerance),
         max_iter=int(refit_config.max_iter),
-        scalar_mode=str(refit_config.mode),
         scalar_grid_points=int(refit_config.grid_points),
         scalar_local_steps=int(refit_config.local_steps),
     )
@@ -266,24 +255,12 @@ def _fixed_labels_refit(
         _model=source_model,
         **kwargs,
     )
-    loglik_delta = float(refined.global_optimality_gap)
-    loglik_tolerance = max(
-        float(refit_config.tolerance)
-        * (1.0 + abs(float(refined.loglik))),
-        1e-10,
-    )
     numerically_resolved = bool(
         refined.finite_candidate_found
         and int(refined.refit_finite_coordinate_count)
         == int(refined.refit_coordinate_count)
         and (
-            (
-                refined.global_optimum_certified
-                and np.isfinite(loglik_delta)
-                and loglik_delta <= loglik_tolerance
-            )
-            if profile.is_strict
-            else np.isfinite(float(refined.loglik))
+            (np.isfinite(float(refined.loglik)))
         )
     )
     cached = PartitionRefitCacheEntry(
@@ -302,7 +279,6 @@ def _build_refit_summary(
     resolution: PartitionRefitCacheEntry,
     data: TumorData,
     eps: float,
-    multiplicity_policy: str,
 ) -> PartitionRefitSummary:
     return PartitionRefitSummary(
         labels=np.asarray(refit.labels, dtype=np.int64).copy(),
@@ -319,8 +295,8 @@ def _build_refit_summary(
         global_optimality_gap=float(refit.global_optimality_gap),
         global_certificate_method=str(refit.global_certificate_method),
         refit_mode=str(refit.refit_mode),
-        multiplicity_policy=multiplicity_policy,
-        locally_converged=refit.locally_converged if refit.refit_mode == "joint_multistart" else None,
+        multiplicity_policy="independent_broad",
+        locally_converged=None,
     )
 
 
@@ -330,7 +306,7 @@ def _score_fixed_labels(
     labels: np.ndarray,
     partition_signature: str,
     refit_result: PartitionRefitResult,
-    selection_options: FitConfig,
+    selection_options: _FitOptions,
 ) -> SelectionScore:
     return fixed_partition_dirichlet_score(
         loglik=float(refit_result.loglik),
@@ -339,9 +315,7 @@ def _score_fixed_labels(
         partition_signature=str(partition_signature),
         labels=np.asarray(labels, dtype=np.int64),
         loglik_uncertainty=(
-            float(refit_result.global_optimality_gap)
-            if selection_options.computation_profile.is_strict
-            else 0.0
+            (0.0)
         ),
         alpha=float(selection_options.selection.dirichlet_alpha),
         code_weight=float(selection_options.selection.dirichlet_code_weight),
@@ -352,7 +326,7 @@ def evaluate_partition(
     *,
     data: TumorData,
     partition: FusionPartition | DirectPartition,
-    selection_options: FitConfig,
+    selection_options: _FitOptions,
     refit_cache: dict[object, PartitionRefitCacheEntry] | None,
     source_model: ObservedModel | None = None,
 ) -> PartitionEvaluation:
@@ -381,8 +355,7 @@ def evaluate_partition(
             resolution=cached_refit,
             data=data,
             eps=selection_options.eps,
-            multiplicity_policy=selection_options.multiplicity_policy,
-        ),
+            ),
         score=score,
     )
 
@@ -390,14 +363,13 @@ def evaluate_partition(
 def evaluate_raw_fusion_candidate(
     *,
     data: TumorData,
-    fit_options: FitConfig,
+    fit_options: _FitOptions,
     lambda_value: float,
     precomputed_fit: RawFit,
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] | None = None,
     source_model: ObservedModel | None = None,
 ) -> tuple[RawFit, RawFusionCandidate]:
     selection_options = fit_options
-    computation_profile = selection_options.computation_profile
 
     fit = precomputed_fit
     if not np.isclose(
@@ -433,7 +405,6 @@ def evaluate_raw_fusion_candidate(
         refit=refit,
         score=score,
         raw_fit=fit,
-        require_global_refit=bool(computation_profile.is_strict),
     )
     candidate = RawFusionCandidate(
         raw_fit=fit,
@@ -452,7 +423,7 @@ def evaluate_direct_partition_candidate(
     *,
     data: TumorData,
     proposal: PartitionCandidate,
-    selection_options: FitConfig,
+    selection_options: _FitOptions,
     source: str,
     parent_raw_candidate_id: int | None,
     parent_raw_lambda: float | None,
@@ -485,13 +456,11 @@ def evaluate_direct_partition_candidate(
     )
     refit = evaluation.refit
     score = evaluation.score
-    profile = selection_options.computation_profile
     reason = _candidate_ineligibility_reason(
         partition=partition,
         refit=refit,
         score=score,
         raw_fit=None,
-        require_global_refit=bool(profile.is_strict),
     )
     candidate = DirectPartitionCandidate(
         partition=partition,

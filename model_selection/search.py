@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from collections import Counter
 import numpy as np
 import torch
 
-from ..config import FitConfig, FINAL_PHI_LADDER_KMAX, FINAL_PHI_PARENT_COUNT
-from ..api import fit_fixed_objective, validate_public_tumor_data
+from ..config import _FitOptions, FINAL_PHI_LADDER_KMAX, FINAL_PHI_PARENT_COUNT
+from ..io.validation import validate_public_tumor_data
 from ..core.fusion.graph import build_complete_uniform_graph
 from ..core.fusion.partition_starts import (
     PartitionCandidate,
@@ -181,10 +182,9 @@ class NoCertifiedRawReferenceError(RuntimeError):
 
 
 def _stable_counts(values) -> tuple[tuple[str, int], ...]:
-    normalized = ["<missing>" if value is None else str(value) for value in values]
-    return tuple(
-        (value, normalized.count(value)) for value in sorted(set(normalized))
-    )
+    return tuple(sorted(Counter(
+        "<missing>" if value is None else str(value) for value in values
+    ).items()))
 
 
 def _try_promote_recovery_context(
@@ -518,11 +518,343 @@ def _assemble_selection_result(
     )
 
 
+@dataclass(slots=True)
+class _SearchState:
+    """Per-tumor search ownership, including its one cached precision twin."""
+    result_entries: list[CandidateRecord] = field(default_factory=list)
+    fit_by_lambda: dict[float, RawFit] = field(default_factory=dict)
+    partition_k_by_lambda: dict[float, int] = field(default_factory=dict)
+    recovery_fit_by_lambda: dict[float, RawFit] = field(default_factory=dict)
+    bic_refit_cache: dict[object, PartitionRefitCacheEntry] = field(default_factory=dict)
+    next_step: int = 0
+    recovery_context: PreparedProblem | None = None
+    recovery_status: str = "not_requested"
+
+
+def _solve_raw_proposal(
+    search: _SearchState, *, base_solver_context: PreparedProblem,
+    guided_initialization, raw_guide_phi: StartArray, proposal,
+    candidate_fit_options: _FitOptions, lambda_key: float,
+) -> tuple[RawFit, RawAttemptTrace, tuple[RawAttemptTrace, ...]]:
+    context = base_solver_context
+    # Certification-recovery attempts run at float64: iteration budget
+    # alone measurably plateaus above the KKT gate on widened-mixture
+    # tumors, while the float64 re-solve of the same frozen objective
+    # (identical objective_spec_hash) removes the float32 stationarity
+    # floor. Promotion is best-effort; without memory the attempt
+    # keeps the working precision and its existing failure mode.
+    recovery_promoted = False
+    recovery_promotion_status = "not_requested"
+    if proposal.phase in {
+        "solver_recovery",
+        "bootstrap_certification_anchor",
+    }:
+        if context.runtime.dtype == torch.float64:
+            recovery_promotion_status = "not_needed"
+        else:
+            if search.recovery_context is None:
+                (
+                    search.recovery_context,
+                    search.recovery_status,
+                ) = _try_promote_recovery_context(context)
+            recovery_promotion_status = str(search.recovery_status)
+            if search.recovery_context is not context:
+                context = search.recovery_context
+                recovery_promoted = True
+    initialization = guided_initialization
+    warm_fit = None
+    if proposal.warm_start_lambda is not None:
+        warm_fit = search.fit_by_lambda.get(
+            _canonical_lambda(proposal.warm_start_lambda)
+        )
+    alternate_fit = None
+    if proposal.alternate_start_lambda is not None:
+        alternate_fit = search.fit_by_lambda.get(
+            _canonical_lambda(proposal.alternate_start_lambda)
+        )
+    start_specs: list[_RawStartSpec] = []
+    seen_start_states: set[tuple[str, int | str]] = set()
+
+    def append_distinct_start(
+        source: str,
+        start_value: float,
+        state: SolverState | None,
+        phi: StartArray | None = None,
+    ) -> None:
+        # Historical endpoint caches can refer to the exact same state
+        # object (for example across a flat partition plateau).  Do
+        # not pay for duplicate solves, while retaining states with
+        # distinct dual/certificate histories even when their primal
+        # matrices happen to match.
+        identity: tuple[str, int | str]
+        if state is None:
+            if phi is None:
+                raise ValueError("A cold raw start requires an explicit Phi.")
+            identity = ("cold", _pilot_matrix_hash(phi))
+        else:
+            identity = ("state", id(state))
+        if identity in seen_start_states:
+            return
+        seen_start_states.add(identity)
+        start_specs.append((str(source), float(start_value), state, phi))
+
+    if proposal.phase == "solver_recovery":
+        best_failed_fit = search.recovery_fit_by_lambda.get(lambda_key)
+        if best_failed_fit is not None:
+            append_distinct_start(
+                "best_same_lambda_kkt_state",
+                float(best_failed_fit.provenance.lambda_value),
+                best_failed_fit.state,
+            )
+        else:
+            append_distinct_start(
+                "guided_kkt_solver_recovery",
+                float(initialization.lambda_value),
+                initialization.solver_state,
+            )
+    elif int(proposal.retry_number) > 0:
+        if (
+            int(proposal.retry_number) == 1
+            and alternate_fit is not None
+            and alternate_fit.state is not None
+        ):
+            append_distinct_start(
+                "alternate_bracket_endpoint",
+                float(proposal.alternate_start_lambda),
+                alternate_fit.state,
+            )
+        elif (
+            warm_fit is not None
+            and warm_fit.state is not None
+        ):
+            append_distinct_start(
+                "same_lambda_retry",
+                float(proposal.warm_start_lambda),
+                warm_fit.state,
+            )
+        else:
+            append_distinct_start(
+                "guided_kkt_fallback",
+                float(initialization.lambda_value),
+                initialization.solver_state,
+            )
+    else:
+        if proposal.phase == "bootstrap_certification_anchor":
+            append_distinct_start(
+                "guided_kkt_bootstrap_anchor",
+                float(initialization.lambda_value),
+                initialization.solver_state,
+            )
+            for (
+                source,
+                start_value,
+                state,
+                phi,
+            ) in _bootstrap_independent_start_specs(
+                initial_lambda=float(initialization.lambda_value),
+                raw_guide_phi=raw_guide_phi,
+                exact_pilot=context.exact_pilot,
+                pooled_start=context.pooled_start,
+                suffix="bootstrap_anchor",
+            ):
+                append_distinct_start(source, start_value, state, phi)
+        # Partition-event midpoints compete both bracket endpoints
+        # with the fixed guided/cold starts. Applying this bounded bank
+        # only at statistical event probes prevents a poor stationary
+        # basin from steering the event while preserving the fast
+        # one-start continuation path for coarse outward exploration.
+        if (
+            proposal.phase != "bootstrap_certification_anchor"
+            and warm_fit is not None
+            and warm_fit.state is not None
+        ):
+            append_distinct_start(
+                "warm_bracket_left"
+                if proposal.phase == "refine_partition_event"
+                else "warm_endpoint",
+                float(proposal.warm_start_lambda),
+                warm_fit.state,
+            )
+        if (
+            proposal.phase == "refine_partition_event"
+            and alternate_fit is not None
+            and alternate_fit.state is not None
+        ):
+            append_distinct_start(
+                "warm_bracket_right",
+                float(proposal.alternate_start_lambda),
+                alternate_fit.state,
+            )
+        if proposal.phase == "refine_partition_event":
+            append_distinct_start(
+                "guided_kkt_multistart",
+                float(initialization.lambda_value),
+                initialization.solver_state,
+            )
+            append_distinct_start(
+                "cold_partition_guide",
+                float(initialization.lambda_value),
+                None,
+                raw_guide_phi,
+            )
+            append_distinct_start(
+                "cold_zero_penalty_pilot",
+                0.0,
+                None,
+                context.exact_pilot,
+            )
+            append_distinct_start(
+                "cold_pooled_likelihood",
+                0.0,
+                None,
+                context.pooled_start,
+            )
+        elif not start_specs:
+            append_distinct_start(
+                "guided_kkt_state"
+                if proposal.phase == "initial"
+                else "guided_kkt_fallback",
+                float(initialization.lambda_value),
+                initialization.solver_state,
+            )
+
+        # A K=1 warm endpoint can trap all subsequent lower-lambda
+        # continuation probes in the pooled basin.  At that one
+        # structural transition, compete the genuinely independent
+        # guide/zero-penalty/pooled primals before steering the path.
+        warm_key = (
+            None
+            if proposal.warm_start_lambda is None
+            else _canonical_lambda(proposal.warm_start_lambda)
+        )
+        escaping_k1_basin = bool(
+            int(proposal.retry_number) == 0
+            and proposal.phase != "refine_partition_event"
+            and warm_key is not None
+            and search.partition_k_by_lambda.get(warm_key) == 1
+            and float(proposal.lambda_value) < float(proposal.warm_start_lambda)
+        )
+        if escaping_k1_basin:
+            append_distinct_start(
+                "cold_partition_guide_k1_escape",
+                float(initialization.lambda_value),
+                None,
+                raw_guide_phi,
+            )
+            append_distinct_start(
+                "cold_zero_penalty_k1_escape",
+                0.0,
+                None,
+                context.exact_pilot,
+            )
+            append_distinct_start(
+                "cold_pooled_likelihood_k1_escape",
+                0.0,
+                None,
+                context.pooled_start,
+            )
+
+    for source, start_value, state, phi in (
+        _explicit_path_default_start_specs(
+            scalar_well_starts=context.scalar_well_starts,
+            pooled_start=context.pooled_start,
+        )
+    ):
+        append_distinct_start(source, start_value, state, phi)
+
+    start_traces: list[RawAttemptTrace] = []
+    selected_attempt: _RawStartAttempt | None = None
+    selected_trace: RawAttemptTrace | None = None
+    for (
+        lambda_start_source,
+        lambda_start_value,
+        original_state,
+        explicit_phi_start,
+    ) in start_specs:
+        if recovery_promoted:
+            # A promoted attempt keeps only the primal start: working-
+            # precision dual/certificate state is not carried across
+            # the dtype boundary, and the float64 solve refines fresh
+            # duals before certification.
+            solver_state_start, changed_count = None, 0
+            cold_state = original_state
+        else:
+            solver_state_start, changed_count = _escape_emission_breakpoint_retry_state(
+                original_state,
+                start_source=lambda_start_source,
+                start_lambda=lambda_start_value,
+                target_lambda=float(proposal.lambda_value),
+                context=context,
+                tol=float(candidate_fit_options.solver.tolerance),
+            )
+            cold_state = solver_state_start
+        # A warm attempt already owns its primal. Only cold/promoted
+        # attempts need a detached copy; never build and discard a
+        # competing clone of the warm state's matrix.
+        phi_start = None if solver_state_start is not None else _clone_start(
+            cold_state.phi if cold_state is not None and cold_state.phi is not None
+            else explicit_phi_start if explicit_phi_start is not None else raw_guide_phi
+        )
+        seed_fit = fit_prepared(
+            context,
+            float(proposal.lambda_value),
+            candidate_fit_options.solver,
+            phi_start=phi_start,
+            include_default_starts=False,
+            warm_state=solver_state_start,
+        )
+        if str(seed_fit.provenance.objective_spec_hash) != str(
+            context.objective_spec_hash
+        ):
+            raise AssertionError(
+                "Raw multistart changed the fixed objective identity."
+            )
+        seed_fit = _offload_raw_fit_to_cpu(seed_fit)
+        recovery_fit = search.recovery_fit_by_lambda.get(lambda_key)
+        residual = float(seed_fit.certificate.components.residual)
+        if seed_fit.state is not None and np.isfinite(residual) and (
+            recovery_fit is None
+            or residual < float(recovery_fit.certificate.components.residual)
+        ):
+            search.recovery_fit_by_lambda[lambda_key] = seed_fit
+        mathematically_certified = bool(
+            float(seed_fit.provenance.lambda_value) > 0.0
+            and seed_fit.certificate.certified
+            and seed_fit.certificate.admissible
+        )
+        raw_attempt = _RawStartAttempt(
+            fit=seed_fit,
+            source=str(lambda_start_source),
+            start_value=float(lambda_start_value),
+            breakpoint_escape_changed_count=int(changed_count),
+            mathematically_certified=bool(mathematically_certified),
+            promotion_status=str(recovery_promotion_status),
+        )
+        trace = _raw_attempt_trace(
+            raw_attempt, search_round=int(search.next_step), search_phase=str(proposal.phase),
+            outer_max_iter=int(candidate_fit_options.solver.outer_max_iter),
+            inner_max_iter=int(candidate_fit_options.solver.inner_max_iter),
+            certificate_max_iter=int(candidate_fit_options.solver.certificate.max_iter),
+        )
+        start_traces.append(trace)
+        if selected_attempt is None or _select_raw_start_attempt(
+            [selected_attempt, raw_attempt]
+        ) is raw_attempt:
+            selected_attempt, selected_trace = raw_attempt, trace
+        del seed_fit, raw_attempt, recovery_fit
+    if selected_attempt is None or selected_trace is None:
+        raise ValueError("At least one raw start attempt is required.")
+    # Subsequent bracket proposals must warm-start from the same raw
+    # basin that was admitted to partition scoring, never from a lower
+    # objective but mathematically uncertified side attempt.
+    return selected_attempt.fit, selected_trace, tuple(start_traces)
+
+
+
 def _partition_guided_admm_selection(
     *,
     data: TumorData,
-    fit_options: FitConfig,
-    use_warm_starts: bool,
+    fit_options: _FitOptions,
 ) -> BICSelectionResult:
     """Run the certified raw path and select under one immutable contract.
 
@@ -565,30 +897,25 @@ def _partition_guided_admm_selection(
     # CUDA graph construction uploads this small M x S matrix once; the O(M^2)
     # graph itself stays device-backed and is reused by context preparation.
     guide_phi: StartArray = np.asarray(guide.phi_start)
-    if fit_options.graph.graph is None:
-        graph_builder_phi = pilot_phi
-        complete_graph_degree = float(max(int(data.num_mutations) - 1, 1))
-        likelihood_noise_degree_exponent = float(
-            PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT
+    graph_builder_phi = pilot_phi
+    complete_graph_degree = float(max(int(data.num_mutations) - 1, 1))
+    likelihood_noise_degree_exponent = float(
+        PARTITION_GUIDED_ADAPTIVE_NOISE_DEGREE_EXPONENT
+    )
+    likelihood_noise_divisor = float(
+        complete_graph_degree**likelihood_noise_degree_exponent
+    )
+    selection_graph, prebuilt_tensor_graph, _ = (
+        _build_partition_guided_graph_with_resource_policy(
+            guide_phi=graph_builder_phi,
+            guide_curvature=guide_curvature,
+            solver_context=pilot_context,
+            fit_options=fit_options,
+            noise_divisor=likelihood_noise_divisor,
         )
-        likelihood_noise_divisor = float(
-            complete_graph_degree**likelihood_noise_degree_exponent
-        )
-        selection_graph, prebuilt_tensor_graph, _ = (
-            _build_partition_guided_graph_with_resource_policy(
-                guide_phi=graph_builder_phi,
-                guide_curvature=guide_curvature,
-                solver_context=pilot_context,
-                fit_options=fit_options,
-                noise_divisor=likelihood_noise_divisor,
-            )
-        )
-    else:
-        selection_graph = fit_options.graph.graph
-        prebuilt_tensor_graph = None
+    )
     base_solver_context = prepare_torch_problem_with_resource_policy(
         data, fit_options,
-        inherited_resource_fallback=pilot_context.resource_fallback,
         # The likelihood pilot initializes adaptive weights; curvature and a
         # mild degree correction set a finite data-derived distance floor. This
         # prevents the fixed 1e-6 floor from making the proposed blocks
@@ -663,360 +990,31 @@ def _partition_guided_admm_selection(
         ),
     )
 
-    result_entries: list[CandidateRecord] = []
-    fit_by_lambda: dict[float, RawFit] = {}
-    partition_k_by_lambda: dict[float, int] = {}
-    # The same-lambda recovery consumer only ever used the stable minimum
-    # finite KKT fit with a state. Retain that exact continuation authority,
-    # not every discarded start. Historical bracket candidates stay separate.
-    recovery_fit_by_lambda: dict[float, RawFit] = {}
-    bic_refit_cache: dict[object, PartitionRefitCacheEntry] = {}
-    next_step = 0
-    # Lazily promoted float64 twin of the working context, built at most once
-    # per tumor and only when a certification-recovery attempt needs it.
-    float64_recovery_context: list = [None]
-    float64_recovery_status = ["not_requested"]
+    search = _SearchState()
     while True:
         proposal = controller.propose()
         if proposal is None:
             break
         lambda_key = _canonical_lambda(proposal.lambda_value)
-        for attempt_key in list(recovery_fit_by_lambda):
+        for attempt_key in list(search.recovery_fit_by_lambda):
             if float(attempt_key) != float(lambda_key):
-                del recovery_fit_by_lambda[attempt_key]
+                del search.recovery_fit_by_lambda[attempt_key]
         candidate_fit_options = solver_retry_fit_options(
             data, effective_fit_options, retry_number=int(proposal.retry_number),
             certification_recovery=proposal.phase in {"solver_recovery", "bootstrap_certification_anchor"},
         )
 
-        def solve_raw_path() -> tuple[
-            RawFit,
-            RawAttemptTrace,
-            tuple[RawAttemptTrace, ...],
-        ]:
-            context = base_solver_context
-            # Certification-recovery attempts run at float64: iteration budget
-            # alone measurably plateaus above the KKT gate on widened-mixture
-            # tumors, while the float64 re-solve of the same frozen objective
-            # (identical objective_spec_hash) removes the float32 stationarity
-            # floor. Promotion is best-effort; without memory the attempt
-            # keeps the working precision and its existing failure mode.
-            recovery_promoted = False
-            recovery_promotion_status = "not_requested"
-            if proposal.phase in {
-                "solver_recovery",
-                "bootstrap_certification_anchor",
-            }:
-                if context.runtime.dtype == torch.float64:
-                    recovery_promotion_status = "not_needed"
-                else:
-                    if float64_recovery_context[0] is None:
-                        (
-                            float64_recovery_context[0],
-                            float64_recovery_status[0],
-                        ) = _try_promote_recovery_context(context)
-                    recovery_promotion_status = str(float64_recovery_status[0])
-                    if float64_recovery_context[0] is not context:
-                        context = float64_recovery_context[0]
-                        recovery_promoted = True
-            initialization = guided_initialization
-            warm_fit = None
-            if proposal.warm_start_lambda is not None:
-                warm_fit = fit_by_lambda.get(
-                    _canonical_lambda(proposal.warm_start_lambda)
-                )
-            alternate_fit = None
-            if proposal.alternate_start_lambda is not None:
-                alternate_fit = fit_by_lambda.get(
-                    _canonical_lambda(proposal.alternate_start_lambda)
-                )
-            start_specs: list[_RawStartSpec] = []
-            seen_start_states: set[tuple[str, int | str]] = set()
-
-            def append_distinct_start(
-                source: str,
-                start_value: float,
-                state: SolverState | None,
-                phi: StartArray | None = None,
-            ) -> None:
-                # Historical endpoint caches can refer to the exact same state
-                # object (for example across a flat partition plateau).  Do
-                # not pay for duplicate solves, while retaining states with
-                # distinct dual/certificate histories even when their primal
-                # matrices happen to match.
-                identity: tuple[str, int | str]
-                if state is None:
-                    if phi is None:
-                        raise ValueError("A cold raw start requires an explicit Phi.")
-                    identity = ("cold", _pilot_matrix_hash(phi))
-                else:
-                    identity = ("state", id(state))
-                if identity in seen_start_states:
-                    return
-                seen_start_states.add(identity)
-                start_specs.append((str(source), float(start_value), state, phi))
-
-            if proposal.phase == "solver_recovery":
-                best_failed_fit = recovery_fit_by_lambda.get(lambda_key)
-                if best_failed_fit is not None:
-                    append_distinct_start(
-                        "best_same_lambda_kkt_state",
-                        float(best_failed_fit.provenance.lambda_value),
-                        best_failed_fit.state,
-                    )
-                else:
-                    append_distinct_start(
-                        "guided_kkt_solver_recovery",
-                        float(initialization.lambda_value),
-                        initialization.solver_state,
-                    )
-            elif int(proposal.retry_number) > 0:
-                if (
-                    use_warm_starts
-                    and int(proposal.retry_number) == 1
-                    and alternate_fit is not None
-                    and alternate_fit.state is not None
-                ):
-                    append_distinct_start(
-                        "alternate_bracket_endpoint",
-                        float(proposal.alternate_start_lambda),
-                        alternate_fit.state,
-                    )
-                elif (
-                    use_warm_starts
-                    and warm_fit is not None
-                    and warm_fit.state is not None
-                ):
-                    append_distinct_start(
-                        "same_lambda_retry",
-                        float(proposal.warm_start_lambda),
-                        warm_fit.state,
-                    )
-                else:
-                    append_distinct_start(
-                        "guided_kkt_fallback",
-                        float(initialization.lambda_value),
-                        initialization.solver_state,
-                    )
-            else:
-                if proposal.phase == "bootstrap_certification_anchor":
-                    append_distinct_start(
-                        "guided_kkt_bootstrap_anchor",
-                        float(initialization.lambda_value),
-                        initialization.solver_state,
-                    )
-                    for (
-                        source,
-                        start_value,
-                        state,
-                        phi,
-                    ) in _bootstrap_independent_start_specs(
-                        initial_lambda=float(initialization.lambda_value),
-                        raw_guide_phi=raw_guide_phi,
-                        exact_pilot=context.exact_pilot,
-                        pooled_start=context.pooled_start,
-                        suffix="bootstrap_anchor",
-                    ):
-                        append_distinct_start(source, start_value, state, phi)
-                # Partition-event midpoints compete both bracket endpoints
-                # with the fixed guided/cold starts. Applying this bounded bank
-                # only at statistical event probes prevents a poor stationary
-                # basin from steering the event while preserving the fast
-                # one-start continuation path for coarse outward exploration.
-                if (
-                    proposal.phase != "bootstrap_certification_anchor"
-                    and use_warm_starts
-                    and warm_fit is not None
-                    and warm_fit.state is not None
-                ):
-                    append_distinct_start(
-                        "warm_bracket_left"
-                        if proposal.phase == "refine_partition_event"
-                        else "warm_endpoint",
-                        float(proposal.warm_start_lambda),
-                        warm_fit.state,
-                    )
-                if (
-                    proposal.phase == "refine_partition_event"
-                    and use_warm_starts
-                    and alternate_fit is not None
-                    and alternate_fit.state is not None
-                ):
-                    append_distinct_start(
-                        "warm_bracket_right",
-                        float(proposal.alternate_start_lambda),
-                        alternate_fit.state,
-                    )
-                if proposal.phase == "refine_partition_event":
-                    append_distinct_start(
-                        "guided_kkt_multistart",
-                        float(initialization.lambda_value),
-                        initialization.solver_state,
-                    )
-                    append_distinct_start(
-                        "cold_partition_guide",
-                        float(initialization.lambda_value),
-                        None,
-                        raw_guide_phi,
-                    )
-                    append_distinct_start(
-                        "cold_zero_penalty_pilot",
-                        0.0,
-                        None,
-                        context.exact_pilot,
-                    )
-                    append_distinct_start(
-                        "cold_pooled_likelihood",
-                        0.0,
-                        None,
-                        context.pooled_start,
-                    )
-                elif not start_specs:
-                    append_distinct_start(
-                        "guided_kkt_state"
-                        if proposal.phase == "initial"
-                        else "guided_kkt_fallback",
-                        float(initialization.lambda_value),
-                        initialization.solver_state,
-                    )
-
-                # A K=1 warm endpoint can trap all subsequent lower-lambda
-                # continuation probes in the pooled basin.  At that one
-                # structural transition, compete the genuinely independent
-                # guide/zero-penalty/pooled primals before steering the path.
-                warm_key = (
-                    None
-                    if proposal.warm_start_lambda is None
-                    else _canonical_lambda(proposal.warm_start_lambda)
-                )
-                escaping_k1_basin = bool(
-                    int(proposal.retry_number) == 0
-                    and proposal.phase != "refine_partition_event"
-                    and warm_key is not None
-                    and partition_k_by_lambda.get(warm_key) == 1
-                    and float(proposal.lambda_value) < float(proposal.warm_start_lambda)
-                )
-                if escaping_k1_basin:
-                    append_distinct_start(
-                        "cold_partition_guide_k1_escape",
-                        float(initialization.lambda_value),
-                        None,
-                        raw_guide_phi,
-                    )
-                    append_distinct_start(
-                        "cold_zero_penalty_k1_escape",
-                        0.0,
-                        None,
-                        context.exact_pilot,
-                    )
-                    append_distinct_start(
-                        "cold_pooled_likelihood_k1_escape",
-                        0.0,
-                        None,
-                        context.pooled_start,
-                    )
-
-            for source, start_value, state, phi in (
-                _explicit_path_default_start_specs(
-                    scalar_well_starts=context.scalar_well_starts,
-                    pooled_start=context.pooled_start,
-                )
-            ):
-                append_distinct_start(source, start_value, state, phi)
-
-            start_traces: list[RawAttemptTrace] = []
-            selected_attempt: _RawStartAttempt | None = None
-            selected_trace: RawAttemptTrace | None = None
-            for (
-                lambda_start_source,
-                lambda_start_value,
-                original_state,
-                explicit_phi_start,
-            ) in start_specs:
-                if recovery_promoted:
-                    # A promoted attempt keeps only the primal start: working-
-                    # precision dual/certificate state is not carried across
-                    # the dtype boundary, and the float64 solve refines fresh
-                    # duals before certification.
-                    solver_state_start, changed_count = None, 0
-                    cold_state = original_state
-                else:
-                    solver_state_start, changed_count = _escape_emission_breakpoint_retry_state(
-                        original_state,
-                        start_source=lambda_start_source,
-                        start_lambda=lambda_start_value,
-                        target_lambda=float(proposal.lambda_value),
-                        context=context,
-                        tol=float(candidate_fit_options.solver.tolerance),
-                    )
-                    cold_state = solver_state_start
-                # A warm attempt already owns its primal. Only cold/promoted
-                # attempts need a detached copy; never build and discard a
-                # competing clone of the warm state's matrix.
-                phi_start = None if solver_state_start is not None else _clone_start(
-                    cold_state.phi if cold_state is not None and cold_state.phi is not None
-                    else explicit_phi_start if explicit_phi_start is not None else raw_guide_phi
-                )
-                seed_fit = fit_prepared(
-                    context,
-                    float(proposal.lambda_value),
-                    candidate_fit_options.solver,
-                    phi_start=phi_start,
-                    include_default_starts=False,
-                    warm_state=solver_state_start,
-                )
-                if str(seed_fit.provenance.objective_spec_hash) != str(
-                    context.objective_spec_hash
-                ):
-                    raise AssertionError(
-                        "Raw multistart changed the fixed objective identity."
-                    )
-                seed_fit = _offload_raw_fit_to_cpu(seed_fit)
-                recovery_fit = recovery_fit_by_lambda.get(lambda_key)
-                residual = float(seed_fit.certificate.components.residual)
-                if seed_fit.state is not None and np.isfinite(residual) and (
-                    recovery_fit is None
-                    or residual < float(recovery_fit.certificate.components.residual)
-                ):
-                    recovery_fit_by_lambda[lambda_key] = seed_fit
-                mathematically_certified = bool(
-                    float(seed_fit.provenance.lambda_value) > 0.0
-                    and seed_fit.certificate.certified
-                    and seed_fit.certificate.admissible
-                )
-                raw_attempt = _RawStartAttempt(
-                    fit=seed_fit,
-                    source=str(lambda_start_source),
-                    start_value=float(lambda_start_value),
-                    breakpoint_escape_changed_count=int(changed_count),
-                    mathematically_certified=bool(mathematically_certified),
-                    promotion_status=str(recovery_promotion_status),
-                )
-                trace = _raw_attempt_trace(
-                    raw_attempt, search_round=int(next_step), search_phase=str(proposal.phase),
-                    outer_max_iter=int(candidate_fit_options.solver.outer_max_iter),
-                    inner_max_iter=int(candidate_fit_options.solver.inner_max_iter),
-                    certificate_max_iter=int(candidate_fit_options.solver.certificate.max_iter),
-                )
-                start_traces.append(trace)
-                if selected_attempt is None or _select_raw_start_attempt(
-                    [selected_attempt, raw_attempt]
-                ) is raw_attempt:
-                    selected_attempt, selected_trace = raw_attempt, trace
-                del seed_fit, raw_attempt, recovery_fit
-            if selected_attempt is None or selected_trace is None:
-                raise ValueError("At least one raw start attempt is required.")
-            # Subsequent bracket proposals must warm-start from the same raw
-            # basin that was admitted to partition scoring, never from a lower
-            # objective but mathematically uncertified side attempt.
-            return selected_attempt.fit, selected_trace, tuple(start_traces)
-
-        selected_raw_fit, selected_start, raw_start_attempts = solve_raw_path()
+        selected_raw_fit, selected_start, raw_start_attempts = _solve_raw_proposal(
+            search, base_solver_context=base_solver_context,
+            guided_initialization=guided_initialization, raw_guide_phi=raw_guide_phi,
+            proposal=proposal, candidate_fit_options=candidate_fit_options,
+            lambda_key=lambda_key,
+        )
         fit, artifact = evaluate_raw_fusion_candidate(
             data=data,
             fit_options=effective_fit_options,
             lambda_value=float(proposal.lambda_value),
-            bic_refit_cache=bic_refit_cache,
+            bic_refit_cache=search.bic_refit_cache,
             precomputed_fit=selected_raw_fit,
             source_model=base_solver_context.source_model,
         )
@@ -1029,13 +1027,13 @@ def _partition_guided_admm_selection(
             float(selected_start.start_value),
             int(selected_start.breakpoint_escape_changed_count),
         )
-        candidate_id = int(len(result_entries))
-        result_entries.append(
+        candidate_id = int(len(search.result_entries))
+        search.result_entries.append(
             CandidateRecord(
                 candidate_id=candidate_id,
                 candidate=artifact,
                 trace=CandidateTrace(
-                    search_round=int(next_step),
+                    search_round=int(search.next_step),
                     search_phase=str(proposal.phase),
                     start_source=str(lambda_start_source),
                     start_value=float(lambda_start_value),
@@ -1046,9 +1044,9 @@ def _partition_guided_admm_selection(
                 ),
             )
         )
-        incumbent = fit_by_lambda.get(lambda_key)
+        incumbent = search.fit_by_lambda.get(lambda_key)
         if _prefer_fit_candidate(fit, incumbent):
-            fit_by_lambda[lambda_key] = (
+            search.fit_by_lambda[lambda_key] = (
                 replace(fit, state=None)
                 if (
                     fit.state is not None
@@ -1057,7 +1055,7 @@ def _partition_guided_admm_selection(
                 )
                 else fit
             )
-            partition_k_by_lambda[lambda_key] = int(artifact.partition.n_clusters)
+            search.partition_k_by_lambda[lambda_key] = int(artifact.partition.n_clusters)
 
         raw_exact_certified = bool(
             raw_candidate_has_exact_fusion_certificate(artifact)
@@ -1084,7 +1082,7 @@ def _partition_guided_admm_selection(
                 degrees_of_freedom=int(artifact.score.degrees_of_freedom),
             )
         )
-        next_step += 1
+        search.next_step += 1
 
     # The production candidate pool always includes pilot and final-Phi ladders.
     direct_proposals: list[
@@ -1100,7 +1098,7 @@ def _partition_guided_admm_selection(
     raw_parent_records = sorted(
         (
             record
-            for record in result_entries
+            for record in search.result_entries
             if isinstance(record.candidate, RawFusionCandidate)
             and raw_candidate_has_exact_fusion_certificate(record.candidate)
         ),
@@ -1146,7 +1144,7 @@ def _partition_guided_admm_selection(
             else None
         )
         source = _direct_partition_source(proposal, stage=stage)
-        candidate_id = int(len(result_entries))
+        candidate_id = int(len(search.result_entries))
         direct_candidate = evaluate_direct_partition_candidate(
             data=data,
             proposal=proposal,
@@ -1165,36 +1163,36 @@ def _partition_guided_admm_selection(
                 if parent_raw is None
                 else _pilot_matrix_hash(parent_raw.raw_fit.phi)
             ),
-            refit_cache=bic_refit_cache,
+            refit_cache=search.bic_refit_cache,
             source_model=base_solver_context.source_model,
         )
-        result_entries.append(
+        search.result_entries.append(
             CandidateRecord(
                 candidate_id=candidate_id,
                 candidate=direct_candidate,
                 trace=CandidateTrace(
-                    search_round=int(next_step),
+                    search_round=int(search.next_step),
                     search_phase=f"{stage}_direct_partition_pool",
                 ),
             )
         )
-        next_step += 1
+        search.next_step += 1
 
-    if not result_entries:
+    if not search.result_entries:
         raise RuntimeError(
             f"No guided ADMM candidates were evaluated for tumor {data.tumor_id}."
         )
     stop_reason = str(controller.stop_reason or "online_lambda_no_terminal_reason")
     return _assemble_selection_result(
         data=data,
-        result_entries=result_entries,
+        result_entries=search.result_entries,
         selection_method=selection_method,
         adaptive_search_stop_reason=stop_reason,
         ward_candidate_pool_complete=True,
     )
 
 
-def _select_single_mutation(data: TumorData, fit_config: FitConfig) -> BICSelectionResult:
+def _select_single_mutation(data: TumorData, fit_config: _FitOptions) -> BICSelectionResult:
     """Fit the separable scalar problem without a guide or lambda ladder.
 
     All pairwise penalties are identically zero. The existing no-edge solver
@@ -1210,7 +1208,8 @@ def _select_single_mutation(data: TumorData, fit_config: FitConfig) -> BICSelect
         lambda_value=0.0,
         graph=replace(fit_config.graph, graph=graph),
     )
-    fit = fit_fixed_objective(data, options)
+    context = prepare_torch_problem_with_resource_policy(data, options)
+    fit = fit_prepared(context, options.lambda_value, options.solver)
     _, candidate = evaluate_raw_fusion_candidate(
         data=data,
         fit_options=options,
@@ -1251,8 +1250,7 @@ def _select_single_mutation(data: TumorData, fit_config: FitConfig) -> BICSelect
 def select_model(
     *,
     data: TumorData,
-    fit_config: FitConfig,
-    use_warm_starts: bool,
+    fit_config: _FitOptions,
 ) -> BICSelectionResult:
     validate_public_tumor_data(data, fit_config)
     effective_objective_shape = objective_shape_for_data(
@@ -1270,7 +1268,6 @@ def select_model(
     return _partition_guided_admm_selection(
         data=data,
         fit_options=fit_config,
-        use_warm_starts=use_warm_starts,
     )
 
 

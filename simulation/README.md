@@ -13,7 +13,10 @@ claim a physical-copy amplification history for the sampled multiplicity.
   CNA events, losses, copy-neutral LOH, or whole-genome duplication.
 - For each mutation with `major_cn != minor_cn`, independently draw an integer
   uniformly from `1, ..., min(major_cn, 6)`, with both endpoints included.
-  Equal-CN mutations have multiplicity one.
+  Equal-CN mutations have multiplicity one under this simulator's sampling rule.
+  **Balanced CN means only `major_cn = minor_cn = 1`**; higher-copy equal-CN
+  states such as `2/2` are not balanced. The equal-CN sampling rule is separate
+  from that definition and from inference's `1..major_cn` candidate support.
 - Draw once per mutation, not once per region. All carrier clones and regions
   use that same multiplicity. This applies to clonal and subclonal mutations;
   removing subclonal **CN** does not remove subclonal mutation clusters.
@@ -70,5 +73,7 @@ controls have been removed; they are not accepted compatibility switches.
 The generator is `tree_clonal_cn_uniform_multiplicity_v7`, output schema `7.0`.
 These versions distinguish the changed scientific design and truth fields;
 they do not change the CliPP2 inference version. Existing cohorts are unchanged.
-For CNA-only multiplicity performance, use exact `major_cn != minor_cn` rows
-and pooled exact-class macro-F1, with eligible counts and per-class F1.
+For CNA-only multiplicity performance, use `(major_cn != 1) | (minor_cn != 1)`
+rows: exclude only `1/1`, including higher-copy equal-CN states. Report pooled
+exact-class macro-F1 with eligible counts and micro-, weighted-, and per-class
+F1. This evaluation filter does not change the multiplicity-sampling rule above.

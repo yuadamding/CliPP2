@@ -7,6 +7,26 @@ Each UTF-8 filename plus NUL is followed by its source-byte SHA-256 digest.
 from collections.abc import Iterable
 import hashlib
 from pathlib import Path, PurePath
+import subprocess
+
+
+def git_source_identity(root: str | Path) -> tuple[str | None, bool | None]:
+    """Probe only a repository rooted here, never an enclosing checkout."""
+    root = Path(root)
+    if not (root / ".git").exists():
+        return None, None
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5,
+        ).strip()
+        dirty = bool(subprocess.check_output(
+            ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5,
+        ).strip())
+        return commit, dirty
+    except (OSError, subprocess.SubprocessError):
+        return None, None
 
 
 _EXCLUDED_DIRECTORIES = frozenset({"tests", "tools", "build", "__pycache__", ".git"})

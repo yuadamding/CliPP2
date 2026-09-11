@@ -8,7 +8,6 @@ import torch
 from ...config import normalize_runtime_dtype
 from .graph_ops import (
     DETERMINISTIC_COMPLETE_ADJOINT_MAX_BYTES,
-    PDHG_PRECONDITIONER_ETA,
     graph_adjoint_edges,
     graph_forward_edges,
     project_dual_ball,
@@ -271,20 +270,18 @@ def resolve_runtime(device: str | None, *, dtype: str | None = None) -> TorchRun
     """
     requested_dtype = normalize_runtime_dtype(dtype)
     runtime_dtype = {"float32": torch.float32, "float64": torch.float64}[requested_dtype]
-    requested = "auto" if device is None else str(device).strip().lower()
-    if requested == "auto":
-        requested = "cuda" if torch.cuda.is_available() else "cpu"
+    requested = "cuda" if device is None else str(device).strip().lower()
     try:
         runtime_device = torch.device(requested)
     except (RuntimeError, ValueError) as exc:
         raise ValueError(f"Unknown runtime device: {device!r}") from exc
     if runtime_device.type not in {"cpu", "cuda"}:
-        raise ValueError("Runtime device must be cpu, cuda, or auto.")
+        raise ValueError("Runtime device must be cpu or cuda.")
     if runtime_device.type == "cuda":
         if not torch.cuda.is_available():
             raise CudaUnavailableError(
                 f"Requested Torch device {device!r}, but CUDA is not available. "
-                "Use device='cpu' or device='auto' to permit CPU execution."
+                "Use device='cpu' to request CPU execution explicitly."
             )
         device_index = (
             int(torch.cuda.current_device())
@@ -962,140 +959,6 @@ def _complete_graph_admm_stationarity_components_torch(
     return grad_smooth, float(residual.item()), float(backward_error.item())
 
 
-def solve_majorized_subproblem_pdhg_torch(
-    *,
-    runtime: TorchRuntime,
-    num_mutations: int,
-    U: torch.Tensor,
-    h: torch.Tensor,
-    lower: torch.Tensor,
-    upper: torch.Tensor,
-    lambda_value: float,
-    edge_u: torch.Tensor,
-    edge_v: torch.Tensor,
-    edge_w: torch.Tensor,
-    degree_bound: int,
-    tol: float,
-    max_iter: int,
-    phi_start: torch.Tensor,
-    dual_start: torch.Tensor | None,
-    tau_node: torch.Tensor | None = None,
-    kkt_check_every: int = DEFAULT_INNER_KKT_CHECK_EVERY,
-    use_backward_error_stopping: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, int, bool, KKTDiagnostics | None]:
-    lambda_value = validate_lambda_value(lambda_value)
-    phi = torch.minimum(
-        torch.maximum(phi_start.to(dtype=runtime.dtype, device=runtime.device), lower),
-        upper,
-    )
-    if lambda_value <= 0.0 or edge_u.numel() == 0:
-        projected = torch.minimum(torch.maximum(U, lower), upper)
-        total_grad = h * (projected - U)
-        stat = stationarity_residual_torch(
-            total_grad=total_grad, phi=projected, lower=lower, upper=upper, atol=tol
-        )
-        residual = float(
-            (torch.linalg.norm(stat) / (1.0 + torch.linalg.norm(projected))).item()
-        )
-        empty_dual = torch.zeros(
-            (0, phi.shape[1]), dtype=runtime.dtype, device=runtime.device
-        )
-        # This branch is a closed-form box projection; no PDHG iteration ran.
-        return projected, empty_dual, 0, residual <= tol, None
-
-    if dual_start is not None and tuple(dual_start.shape) == (
-        int(edge_u.numel()),
-        int(phi.shape[1]),
-    ):
-        dual = dual_start.to(dtype=runtime.dtype, device=runtime.device)
-    else:
-        dual = torch.zeros(
-            (int(edge_u.numel()), int(phi.shape[1])),
-            dtype=runtime.dtype,
-            device=runtime.device,
-        )
-    bar = phi.clone()
-    del degree_bound
-    if tau_node is None:
-        node_degree = torch.bincount(
-            torch.cat([edge_u, edge_v]),
-            minlength=int(num_mutations),
-        ).to(dtype=runtime.dtype, device=runtime.device)
-        tau_node_t = (PDHG_PRECONDITIONER_ETA / node_degree.clamp_min(1.0))[:, None]
-    else:
-        tau_node_t = tau_node.to(dtype=runtime.dtype, device=runtime.device)
-        if tau_node_t.ndim == 1:
-            tau_node_t = tau_node_t[:, None]
-        expected_shape = (int(num_mutations), 1)
-        if tuple(tau_node_t.shape) != expected_shape:
-            raise ValueError(f"tau_node must have shape {expected_shape}.")
-    sigma_edge = PDHG_PRECONDITIONER_ETA / 2.0
-    radius = float(lambda_value) * edge_w
-
-    converged = False
-    iterations = 0
-    last_residual = np.inf
-    last_diagnostics = None
-    actual_max_iter = max(int(max_iter), 10)
-    for inner_iter in range(actual_max_iter):
-        iterations = inner_iter + 1
-        edge_diff = graph_forward_edges(bar, edge_u=edge_u, edge_v=edge_v)
-        dual_trial = dual + sigma_edge * edge_diff
-        dual_new = project_dual_ball(dual_trial, radius)
-
-        adj = graph_adjoint_edges(
-            dual_new,
-            edge_u=edge_u,
-            edge_v=edge_v,
-            num_nodes=int(phi.shape[0]),
-        )
-        primal_base = phi - tau_node_t * adj
-        phi_new = (primal_base + tau_node_t * h * U) / (1.0 + tau_node_t * h)
-        phi_new = torch.minimum(torch.maximum(phi_new, lower), upper)
-        bar = phi_new + (phi_new - phi)
-
-        audit_due = (
-            iterations >= actual_max_iter
-            or iterations % max(int(kkt_check_every), 1) == 0
-        )
-        if audit_due:
-            primal_delta = float(
-                (
-                    torch.linalg.norm(phi_new - phi) / (1.0 + torch.linalg.norm(phi))
-                ).item()
-            )
-            dual_delta = float(
-                (
-                    torch.linalg.norm(dual_new - dual) / (1.0 + torch.linalg.norm(dual))
-                ).item()
-            )
-        phi = phi_new
-        dual = dual_new
-
-        if audit_due:
-            cheap_converged = bool(primal_delta <= tol and dual_delta <= tol)
-            last_diagnostics = graph_fusion_kkt_residual_from_grad_torch(
-                phi=phi,
-                dual_kkt=dual,
-                grad_smooth=h * (phi - U),
-                lower=lower,
-                upper=upper,
-                lambda_value=lambda_value,
-                edge_u=edge_u,
-                edge_v=edge_v,
-                edge_w=edge_w,
-                atol=tol,
-            )
-            last_residual = float(
-                last_diagnostics.backward_error_kkt_residual
-                if use_backward_error_stopping
-                else last_diagnostics.kkt_residual
-            )
-            if cheap_converged and last_residual <= 5.0 * tol:
-                converged = True
-                break
-
-    return phi, dual, iterations, converged, last_diagnostics
 
 
 def _complete_graph_isotropic_box_qp_torch(

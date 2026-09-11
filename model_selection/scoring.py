@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..config import FitConfig
+from ..config import _FitOptions
 from ..core.fusion.types import RawFit
 from .types import (
     CandidateRecord,
@@ -336,7 +336,7 @@ def _sorted_unique_lambdas(values: list[float] | np.ndarray) -> list[float]:
     return [float(value) for value in np.unique(np.round(np.sort(array), 12))]
 
 
-def _effective_bic_partition_tol(options: FitConfig) -> float:
+def _effective_bic_partition_tol(options: _FitOptions) -> float:
     value = options.selection.partition_tolerance
     return float(max(float(value), 1e-12))
 

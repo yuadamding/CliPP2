@@ -541,9 +541,6 @@ def compute_scalar_well_start_bank_torch(
     valid_secondary: torch.Tensor | np.ndarray | None = None,
     max_region_flips: int = 4,
 ) -> tuple[torch.Tensor, ...]:
-    if model.coupling == "joint":
-        from ..joint import coherent_start_bank_torch
-        return _deduplicate_tensor_starts([exact_pilot, *coherent_start_bank_torch(model, eps=eps)])
     dtype = model.alt.dtype
     device = model.alt.device
     lower = torch.full_like(model.upper, float(eps))
@@ -599,15 +596,6 @@ def compute_scalar_mutation_region_wells_torch(
     eps: float, tol: float, max_iter: int,
     certificates: list[ScalarGlobalMinimumCertificate] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if model.coupling == "joint":
-        from ..objective import model_to_torch
-        from ..joint import coherent_start_bank_torch
-        tm = model_to_torch(model, runtime, eps=eps)
-        starts = coherent_start_bank_torch(tm, eps=eps)
-        losses = torch.stack([observed_terms_torch(tm, start, eps=eps).loss.sum(dim=1) for start in starts])
-        choice = losses.argmin(dim=0)
-        primary = torch.stack(starts)[choice, torch.arange(model.shape[0], device=runtime.device)]
-        return primary, torch.full_like(primary, torch.nan), torch.zeros_like(primary, dtype=torch.bool)
     dtype, device = runtime.dtype, runtime.device
     primary, secondary, valid = _scalar_wells_from_model(
         model,
@@ -625,10 +613,6 @@ def compute_pooled_observed_data_start_torch(
     model: ObservedModel, runtime: TorchRuntime, *, eps: float, tol: float, max_iter: int,
     beta_hints: torch.Tensor | np.ndarray,
 ) -> torch.Tensor:
-    if model.coupling == "joint":
-        from ..joint import fit_joint_center
-        fit = fit_joint_center(model, eps=eps, tol=tol, max_iter=max_iter)
-        return torch.as_tensor(np.tile(fit.center, (model.shape[0], 1)), dtype=runtime.dtype, device=runtime.device)
     hints = beta_hints.detach().cpu().numpy() if torch.is_tensor(beta_hints) else np.asarray(beta_hints)
     pooled = _pooled_start_from_model(
         model, beta_hints=hints,

@@ -21,7 +21,6 @@ from ..config import (
     CLONAL_INTEGER_MODEL_ID,
     CLONAL_INTEGER_PRIOR_MODE,
     MAX_MAJOR_CN,
-    MULTIPLICITY_POLICIES,
     validate_likelihood_precision,
 )
 
@@ -163,8 +162,8 @@ class ObservedModel(ImmutableArrayRecord):
     log_prior: np.ndarray
     valid: np.ndarray
     model_id: str
-    coupling: str = "independent"
-    support_policy: str = "independent_broad"
+    coupling: str = field(default="independent", init=False)
+    support_policy: str = field(default="independent_broad", init=False)
     fingerprint: str = field(init=False)
     likelihood_fingerprint: str = field(init=False)
     _convexity: dict[float, bool] = field(default_factory=dict, init=False, repr=False, compare=False)
@@ -244,15 +243,6 @@ class ObservedModel(ImmutableArrayRecord):
             raise ValueError("ObservedModel.log_prior must normalize over valid candidates.")
 
         model_id = str(self.model_id).strip()
-        if self.coupling not in {"independent", "joint"}:
-            raise ValueError("ObservedModel.coupling must be independent or joint.")
-        if not str(self.support_policy).strip():
-            raise ValueError("ObservedModel.support_policy must be nonempty.")
-        if self.coupling == "joint" and (
-            not np.all(valid == valid[:, :1])
-            or not np.all(candidate_arrays["log_prior"] == candidate_arrays["log_prior"][:, :1])
-        ):
-            raise ValueError("Joint states require one aligned support and prior per mutation.")
         if not model_id:
             raise ValueError("ObservedModel.model_id must be nonempty.")
         for name, value in observation_arrays.items():
@@ -279,13 +269,11 @@ class ObservedModel(ImmutableArrayRecord):
 
     @property
     def candidate_generator_version(self) -> str:
-        return (CLONAL_INTEGER_GENERATOR_VERSION if self.coupling == "independent"
-                else f"{self.support_policy}_cap6_v1")
+        return CLONAL_INTEGER_GENERATOR_VERSION
 
     @property
     def prior_mode(self) -> str:
-        return (CLONAL_INTEGER_PRIOR_MODE if self.coupling == "independent"
-                else "uniform_mutation_state_v1")
+        return CLONAL_INTEGER_PRIOR_MODE
 
 
 def has_proven_convex_observed_loss(model: ObservedModel | None, *, eps: float) -> bool:
@@ -359,8 +347,8 @@ class TorchObservedModel:
     valid: torch.Tensor
     model_id: str
     source_fingerprint: str
-    coupling: str = "independent"
-    support_policy: str = "independent_broad"
+    coupling: str = field(default="independent", init=False)
+    support_policy: str = field(default="independent_broad", init=False)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -430,7 +418,6 @@ def compile_integer_observations(
     *, alt_counts: np.ndarray, total_counts: np.ndarray,
     count_observed: np.ndarray | None, phi_upper: np.ndarray,
     major_cn: np.ndarray, scaling: np.ndarray, eps: float,
-    minor_cn: np.ndarray | None = None, multiplicity_policy: str = "independent_broad",
 ) -> ObservedModel:
     """Compile canonical arrays before the final immutable input is constructed."""
     epsilon = _validated_epsilon(eps)
@@ -438,24 +425,7 @@ def compile_integer_observations(
     total = np.asarray(total_counts, dtype=np.float64)
     if alt.shape != total.shape:
         raise ValueError("TumorData alt_counts and total_counts must have one shape.")
-    if multiplicity_policy not in MULTIPLICITY_POLICIES:
-        raise ValueError(f"Unknown multiplicity policy: {multiplicity_policy}.")
     candidates = _compile_integer_candidates(major_cn, scaling)
-    if multiplicity_policy != "independent_broad":
-        major = np.asarray(major_cn)
-        minor = None if minor_cn is None else np.asarray(minor_cn)
-        if (minor is None or minor.shape != major.shape or not np.all(np.isfinite(minor))
-            or np.any(minor < 0) or np.any(minor > major) or np.any(minor != np.rint(minor))):
-            raise ValueError("Shared multiplicity requires valid minor_cn alongside major_cn.")
-        if not np.all(major == major[:, :1]) or not np.all(minor == minor[:, :1]):
-            raise ValueError(
-                "Shared multiplicity requires region-invariant allele-specific CN. "
-                "Different CN needs an explicit compatible-state contract; no automatic coupling is inferred."
-            )
-        cap = np.where(major == minor, 1, major) if multiplicity_policy == "shared_balanced_single" else major
-        candidates = _compile_integer_candidates(cap, scaling)
-        candidates.update(model_id="clipp2_joint_integer_multiplicity_v1",
-                          coupling="joint", support_policy=multiplicity_policy)
     return ObservedModel(
         alt=alt, nonalt=total - alt,
         observed=np.ones(alt.shape, dtype=bool) if count_observed is None else count_observed,
@@ -468,12 +438,11 @@ def compile_observed_model(
     data: "TumorData",
     *,
     eps: float,
-    multiplicity_policy: str = "independent_broad",
 ) -> ObservedModel:
     """Compile the supported uniform integer likelihood into float64 sources."""
 
     epsilon = _validated_epsilon(eps)
-    key = (epsilon, multiplicity_policy)
+    key = (epsilon, "independent_broad")
     cached = data._compiled_models.get(key)
     if cached is not None:
         return cached
@@ -481,7 +450,6 @@ def compile_observed_model(
         alt_counts=data.alt_counts, total_counts=data.total_counts,
         count_observed=data.count_observed, phi_upper=data.phi_upper,
         major_cn=data.major_cn, scaling=data.scaling, eps=epsilon,
-        minor_cn=data.minor_cn, multiplicity_policy=multiplicity_policy,
     )
     return data._compiled_models.setdefault(key, model)
 
@@ -518,8 +486,6 @@ def model_to_torch(
         valid=boolean(model.valid),
         model_id=model.model_id,
         source_fingerprint=model.fingerprint,
-        coupling=model.coupling,
-        support_policy=model.support_policy,
     )
 
 
@@ -598,8 +564,6 @@ def _validate_candidate_range(model: ObservedModel, eps: float, dtype: torch.dty
             np.log(count) + np.log(2.0) + 2.0 * log_slope
             - 2.0 * np.log(min(lower, complement)),
         )
-    if model.coupling == "joint":
-        log_bound += np.log(model.shape[1])
     if log_bound >= log_limit - np.log(2.0):
         raise ValueError(
             f"Candidate arithmetic may overflow in {dtype} for these counts, "
@@ -719,11 +683,7 @@ def _observed_reduction_numpy(
         model.alt[..., None], model.nonalt[..., None], kernel.probability, kernel.slope,
         derivative_order=2 if derivatives else 0,
     )
-    if model.coupling == "joint":
-        joint = np.sum(np.where(model.observed[..., None], log_kernel, 0.0), axis=1, keepdims=True)
-        joint = np.where(model.valid[:, :1], joint + model.log_prior[:, :1], -np.inf)
-    else:
-        joint = np.where(model.valid, log_kernel + model.log_prior, -np.inf)
+    joint = np.where(model.valid, log_kernel + model.log_prior, -np.inf)
     del log_kernel
     maximum = np.max(joint, axis=-1, keepdims=True)
     unnormalized = np.exp(joint - maximum)
@@ -731,9 +691,6 @@ def _observed_reduction_numpy(
     if output != "posterior":
         log_normalizer = np.squeeze(maximum + np.log(denominator), axis=-1)
         loss = -log_normalizer
-        if model.coupling == "joint":
-            active = model.observed & ((model.alt + model.nonalt) > 0)
-            loss = loss * active / np.maximum(active.sum(axis=1, keepdims=True), 1)
     if output == "loss":
         return np.where(model.observed, loss, 0.0)
     posterior = unnormalized / denominator
@@ -741,8 +698,7 @@ def _observed_reduction_numpy(
         gradient = -np.sum(posterior * state_gradient, axis=-1)
         hessian_upper = np.sum(posterior * state_curvature, axis=-1)
     prior = np.where(model.valid, np.exp(model.log_prior), 0.0)
-    posterior = (np.broadcast_to(posterior, model.candidate_shape) if model.coupling == "joint"
-                 else np.where(model.observed[..., None], posterior, prior))
+    posterior = ((np.where(model.observed[..., None], posterior, prior)))
     if output == "posterior":
         return posterior
     loss = np.where(model.observed, loss, 0.0)
@@ -769,62 +725,12 @@ def observed_terms_numpy(
     return cast(ObservedTerms, _observed_reduction_numpy(model, phi, eps=eps, output="terms"))
 
 
-def observed_hessian_numpy(model: ObservedModel, phi: np.ndarray, *, eps: float) -> np.ndarray:
-    """Exact smooth-piece observed Hessian, including joint cross-region covariance.
-
-    The solver's diagonal ``hessian_upper`` remains a curvature majorant, not
-    this Hessian and not an uncertainty estimate. At clipping kinks use the
-    one-sided-gradient contract instead.
-    """
-    kernel = _emission_kernel_numpy(model, phi, eps=eps)
-    _, score, curvature = candidate_terms_numpy(
-        model.alt[..., None], model.nonalt[..., None], kernel.probability, kernel.slope,
-    )
-    score = np.where(model.observed[..., None], score, 0.0)
-    curvature = np.where(model.observed[..., None], curvature, 0.0)
-    posterior = _observed_reduction_numpy(model, phi, eps=eps, output="posterior")
-    mean = np.sum(posterior * score, axis=-1)
-    diagonal = np.sum(posterior * curvature, axis=-1)
-    result = np.zeros((model.shape[0], model.shape[1], model.shape[1]))
-    index = np.arange(model.shape[1])
-    result[:, index, index] = diagonal
-    if model.coupling == "joint":
-        centered = score - mean[..., None]
-        result -= np.einsum("mh,msh,mth->mst", posterior[:, 0], centered, centered)
-    else:
-        result[:, index, index] -= np.sum(posterior * np.square(score - mean[..., None]), axis=-1)
-    return result
-
-
-def _state_logits_torch(model, log_kernel, *, respect_observed=True):
-    """Candidate axis is a shared tuple axis only when coupling is joint."""
+def _state_logits_torch(model, log_kernel):
+    """Per-region categorical log probabilities over integer multiplicities."""
     extra = (1,) * (log_kernel.ndim - 3)
     shape = (*model.shape, *extra, model.candidate_shape[-1])
     prior, valid = model.log_prior.reshape(shape), model.valid.reshape(shape)
-    if model.coupling == "joint":
-        if respect_observed:
-            log_kernel = torch.where(model.observed.reshape((*model.shape, *extra, 1)),
-                                     log_kernel, torch.zeros_like(log_kernel))
-        return (log_kernel.sum(dim=1, keepdim=True) + prior[:, :1]).masked_fill(~valid[:, :1], -torch.inf)
     return (log_kernel + prior).masked_fill(~valid, -torch.inf)
-
-
-def _distribute_joint_loss_torch(model, loss, *, respect_observed=True, include_empty=False):
-    """M x S bookkeeping whose regional sum is ONE mutation-level loss.
-
-    These entries are not independent coordinate losses. Trailing grid axes
-    describe complete regional vectors, not independent coordinate trials.
-    """
-    active = ((model.observed if respect_observed else torch.ones_like(model.observed))
-              & (model.total > 0))
-    share = active.to(dtype=loss.dtype) / active.sum(dim=1, keepdim=True).clamp(min=1)
-    if include_empty:
-        # An arbitrary frozen r contributes KL(r||prior) even if the entire
-        # mutation has no data. Store that constant once, without inventing
-        # a count observation or a gradient at the bookkeeping coordinate.
-        share = share.clone()
-        share[:, 0] = torch.where(active.any(dim=1), share[:, 0], torch.ones_like(share[:, 0]))
-    return loss * share.reshape((*model.shape, *((1,) * (loss.ndim - 2))))
 
 
 def observed_terms_torch(
@@ -846,14 +752,10 @@ def observed_terms_torch(
     log_normalizer = torch.logsumexp(joint, dim=-1)
     posterior = torch.softmax(joint, dim=-1)
     loss = -log_normalizer
-    if model.coupling == "joint":
-        loss = _distribute_joint_loss_torch(model, loss)
-        posterior = posterior.expand_as(model.slope)
     gradient = -torch.sum(posterior * state_gradient, dim=-1)
     hessian_upper = torch.sum(posterior * state_curvature, dim=-1)
     prior = torch.exp(model.log_prior).masked_fill(~model.valid, 0.0)
-    if model.coupling != "joint":
-        posterior = torch.where(model.observed.unsqueeze(-1), posterior, prior)
+    posterior = torch.where(model.observed.unsqueeze(-1), posterior, prior)
     loss = torch.where(model.observed, loss, torch.zeros_like(loss))
     gradient = torch.where(model.observed, gradient, torch.zeros_like(gradient))
     hessian_upper = torch.where(
@@ -894,11 +796,9 @@ def observed_loss_grid_torch(
         observation_view(model.alt).unsqueeze(-1), observation_view(model.nonalt).unsqueeze(-1),
         kernel.probability, kernel.slope, derivative_order=0,
     )
-    joint = _state_logits_torch(model, log_kernel, respect_observed=respect_observed)
+    joint = _state_logits_torch(model, log_kernel)
     del log_kernel
     loss = -torch.logsumexp(joint, dim=-1)
-    if model.coupling == "joint":
-        return _distribute_joint_loss_torch(model, loss, respect_observed=respect_observed)
     if not bool(respect_observed):
         return loss
     return torch.where(
@@ -940,15 +840,13 @@ def observed_em_terms_torch(
     if bool(torch.any(normalizer <= 0.0).item()):
         raise ValueError("responsibilities must assign mass to a valid candidate.")
     weights = weights / normalizer
-    if model.coupling == "joint" and not torch.equal(weights, weights[:, :1].expand_as(weights)):
-        raise ValueError("Joint responsibilities must be one shared vector per mutation.")
     kernel = _emission_kernel_torch(model, phi, eps=eps)
     log_kernel, state_gradient, state_curvature = _candidate_terms_torch(
         model.alt.unsqueeze(-1), model.nonalt.unsqueeze(-1), kernel.probability, kernel.slope,
     )
     complete_loss = torch.where(
         model.valid,
-        -(log_kernel + model.log_prior) if model.coupling == "independent" else -log_kernel,
+        (-(log_kernel + model.log_prior)),
         torch.zeros_like(log_kernel),
     )
     del log_kernel
@@ -957,20 +855,12 @@ def observed_em_terms_torch(
         weights * torch.log(torch.clamp(weights, min=torch.finfo(weights.dtype).tiny)),
         torch.zeros_like(weights),
     )
-    if model.coupling == "joint":
-        prior_cost = -weights * torch.where(model.valid, model.log_prior, torch.zeros_like(model.log_prior))
-        loss = torch.sum(weights * complete_loss, dim=-1)
-        loss = torch.where(model.observed, loss, torch.zeros_like(loss))
-        loss += _distribute_joint_loss_torch(model, torch.sum(prior_cost[:, :1] + entropy[:, :1], dim=-1), include_empty=True)
-    else:
-        loss = torch.sum(weights * complete_loss + entropy, dim=-1)
+    loss = torch.sum(weights * complete_loss + entropy, dim=-1)
     gradient = -torch.sum(weights * state_gradient, dim=-1)
     hessian_upper = torch.sum(weights * state_curvature, dim=-1)
     prior = torch.exp(model.log_prior).masked_fill(~model.valid, 0.0)
-    posterior = (weights if model.coupling == "joint"
-                 else torch.where(model.observed.unsqueeze(-1), weights, prior))
-    if model.coupling != "joint":
-        loss = torch.where(model.observed, loss, torch.zeros_like(loss))
+    posterior = ((torch.where(model.observed.unsqueeze(-1), weights, prior)))
+    loss = torch.where(model.observed, loss, torch.zeros_like(loss))
     gradient = torch.where(model.observed, gradient, torch.zeros_like(gradient))
     hessian_upper = torch.where(
         model.observed,
@@ -1079,7 +969,6 @@ def infer_integer_multiplicity_posterior_numpy(
     phi: np.ndarray,
     *,
     eps: float,
-    multiplicity_policy: str = "independent_broad",
 ) -> IntegerMultiplicityPosterior:
     """Evaluate the fitted integer mixture without replacing marginalization."""
 
@@ -1092,7 +981,7 @@ def infer_integer_multiplicity_posterior_numpy(
         )
     if not np.all(np.isfinite(phi_array)):
         raise ValueError("phi must contain only finite values.")
-    model = compile_observed_model(data, eps=eps, multiplicity_policy=multiplicity_policy)
+    model = compile_observed_model(data, eps=eps)
     if np.any((phi_array < model.lower) | (phi_array > model.upper)):
         raise ValueError("phi must lie inside the compiled CCF bounds.")
 
@@ -1111,9 +1000,7 @@ def infer_integer_multiplicity_posterior_numpy(
         multiplicity_call=map_index.astype(np.int64) + 1,
         map_probability=probability,
         candidate_count=np.sum(model.valid, axis=-1).astype(np.int64),
-        informative=(np.broadcast_to(np.any(model.observed & ((model.alt + model.nonalt) > 0.0),
-                                           axis=1, keepdims=True), model.shape)
-                     if model.coupling == "joint" else model.observed & ((model.alt + model.nonalt) > 0.0)),
+        informative=((model.observed & ((model.alt + model.nonalt) > 0.0))),
     )
 
 
@@ -1136,6 +1023,5 @@ __all__ = [
     "observed_loss_grid_torch",
     "observed_one_sided_gradients_torch",
     "observed_terms_numpy",
-    "observed_hessian_numpy",
     "observed_terms_torch",
 ]

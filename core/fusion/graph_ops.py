@@ -9,7 +9,6 @@ import torch
 
 from .types import PairwiseFusionGraph, TensorFusionGraph, TorchRuntime
 
-PDHG_PRECONDITIONER_ETA = 0.99
 COMPLETE_GRAPH_MEMORY_SAFETY_FRACTION = 0.80
 COMPLETE_GRAPH_MEMORY_LIMIT_ENV = "CLIPP2_MAX_COMPLETE_GRAPH_BYTES"
 COMPLETE_ADAPTIVE_WEIGHT_CHUNK_BYTES = 64 * 1024 * 1024
@@ -339,7 +338,6 @@ def _tensor_graph_from_edges(
         one = torch.ones_like(weight)
         degree.index_add_(0, edge_index[0], one)
         degree.index_add_(0, edge_index[1], one)
-    pdhg_tau_node = (PDHG_PRECONDITIONER_ETA / degree.clamp_min(1.0))[:, None]
     is_complete = (
         _is_canonical_complete_edge_index(edge_index, num_nodes=int(num_nodes))
         if known_complete is None
@@ -349,7 +347,6 @@ def _tensor_graph_from_edges(
         edge_index=edge_index,
         weight=weight,
         degree=degree,
-        pdhg_tau_node=pdhg_tau_node,
         num_nodes=int(num_nodes),
         is_complete=is_complete,
         name=str(name),

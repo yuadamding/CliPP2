@@ -6,7 +6,6 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from ..config import normalize_dense_fallback_policy
 from ..core.fusion.graph import build_likelihood_noise_regularized_adaptive_graph
 from ..core.fusion.graph_ops import (
     build_likelihood_noise_regularized_adaptive_tensor_graph,
@@ -16,10 +15,7 @@ from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.fusion.solver import (
     escape_emission_breakpoint_solver_state,
     objective_shape_for_data,
-    prepare_torch_problem_with_resource_policy,
-    transfer_scalar_pilot_certificates,
 )
-from ..core.fusion.torch_backend import dtype_name
 from ..core.fusion.types import (
     CompressedEdgeCertificate,
     DenseEdgeCertificate,
@@ -29,7 +25,7 @@ from ..core.fusion.types import (
     PreparedProblem,
     SolverState,
 )
-from ..config import FitConfig
+from ..config import _FitOptions
 from ..core.fusion.types import RawFit
 from ..io.data import TumorData
 from .guided_fusion import GuidedFusionInitialization, build_guided_fusion_initialization
@@ -274,11 +270,11 @@ def escape_emission_breakpoint_retry_state(
 
 def solver_retry_fit_options(
     data: TumorData,
-    fit_options: FitConfig,
+    fit_options: _FitOptions,
     *,
     retry_number: int,
     certification_recovery: bool,
-) -> FitConfig:
+) -> _FitOptions:
     """Increase solver effort without changing the fixed objective family.
 
     Integer-mixture likelihoods are generically nonconvex. Their recovery run
@@ -345,11 +341,10 @@ def build_guided_initialization_with_resource_policy(
     guide_phi: StartArray,
     guide_labels: np.ndarray | torch.Tensor,
     solver_context: PreparedProblem,
-    fit_options: FitConfig,
+    fit_options: _FitOptions,
 ) -> tuple[GuidedFusionInitialization, PreparedProblem, StartArray]:
-    """Build guided state with typed allocation failure and optional CPU retry."""
+    """Build guided state with typed allocation failure and no cross-device retry."""
 
-    fallback_policy = normalize_dense_fallback_policy(fit_options.runtime.fallback)
 
     def build(
         *,
@@ -377,63 +372,12 @@ def build_guided_initialization_with_resource_policy(
             guide_phi,
         )
     except (MemoryError, torch.OutOfMemoryError) as exc:
-        cpu_fallback_allowed = bool(
-            fallback_policy == "cpu_allowed"
-            and solver_context.runtime.device.type != "cpu"
-        )
-        if not cpu_fallback_allowed:
-            if isinstance(exc, ExactSolverResourceLimit):
-                raise
-            raise ExactSolverResourceLimit(
-                "exact_solver_resource_limit: guided initialization exhausted "
-                f"memory on {solver_context.runtime.device_name}."
-            ) from exc
-
-        try:
-
-            def cpu_start(value: StartArray) -> StartArray:
-                return (
-                    value.detach().to(device="cpu")
-                    if torch.is_tensor(value)
-                    else np.asarray(value)
-                )
-
-            cpu_guide_phi: StartArray = (
-                guide_phi.detach().to(device="cpu")
-                if torch.is_tensor(guide_phi)
-                else np.asarray(guide_phi)
-            )
-            cpu_guide_labels = (
-                guide_labels.detach().to(device="cpu")
-                if torch.is_tensor(guide_labels)
-                else np.asarray(guide_labels)
-            )
-            cpu_context = prepare_torch_problem_with_resource_policy(
-                data, fit_options,
-                dense_fallback_policy="device_only",
-                inherited_resource_fallback="dense_cpu",
-                eps=float(solver_context.eps),
-                graph=solver_context.graph_spec,
-                exact_pilot=cpu_start(solver_context.exact_pilot),
-                pooled_start=cpu_start(solver_context.pooled_start),
-                scalar_well_starts=solver_context.scalar_well_starts,
-                device="cpu",
-                dtype=dtype_name(solver_context.runtime.dtype),
-            )
-            cpu_context = transfer_scalar_pilot_certificates(solver_context, cpu_context)
-            guided = build(
-                context=cpu_context,
-                phi=cpu_guide_phi,
-                labels=cpu_guide_labels,
-            )
-        except (MemoryError, torch.OutOfMemoryError) as cpu_exc:
-            if isinstance(cpu_exc, ExactSolverResourceLimit):
-                raise cpu_exc from exc
-            raise ExactSolverResourceLimit(
-                "exact_solver_resource_limit: guided initialization exhausted "
-                "host memory during dense CPU fallback."
-            ) from cpu_exc
-        return guided, cpu_context, cpu_guide_phi
+        if isinstance(exc, ExactSolverResourceLimit):
+            raise
+        raise ExactSolverResourceLimit(
+            "exact_solver_resource_limit: guided initialization exhausted "
+            f"memory on {solver_context.runtime.device_name}."
+        ) from exc
 
 
 def build_partition_guided_graph_with_resource_policy(
@@ -441,10 +385,10 @@ def build_partition_guided_graph_with_resource_policy(
     guide_phi: StartArray,
     guide_curvature: torch.Tensor,
     solver_context: PreparedProblem,
-    fit_options: FitConfig,
+    fit_options: _FitOptions,
     noise_divisor: float,
 ):
-    """Build the adaptive graph on CUDA, with an explicitly authorized host retry."""
+    """Build the adaptive graph on the explicitly requested device."""
 
     graph_options = {
         "gamma": float(fit_options.graph.adaptive_weight_gamma),
@@ -497,22 +441,10 @@ def build_partition_guided_graph_with_resource_policy(
         )
         return tensor_graph_to_pairwise_graph(tensor_graph), tensor_graph, tau
     except (MemoryError, torch.OutOfMemoryError) as exc:
-        if (
-            normalize_dense_fallback_policy(fit_options.runtime.fallback)
-            != "cpu_allowed"
-        ):
-            raise ExactSolverResourceLimit(
-                "exact_solver_resource_limit: partition-guided graph construction "
-                f"exhausted memory on {runtime.device_name}; host retry is disabled."
-            ) from exc
-        try:
-            graph, tau = build_host_graph()
-        except (MemoryError, torch.OutOfMemoryError) as host_exc:
-            raise ExactSolverResourceLimit(
-                "exact_solver_resource_limit: partition-guided graph construction "
-                "exhausted host memory during the authorized CPU retry."
-            ) from host_exc
-        return graph, None, tau
+        raise ExactSolverResourceLimit(
+            "exact_solver_resource_limit: partition-guided graph construction "
+            f"exhausted memory on {runtime.device_name}."
+        ) from exc
 
 
 def adaptive_stop_certifies_global_optimum(stop_reason: str) -> bool:
@@ -534,8 +466,6 @@ def direct_partition_source(
     cem = str(proposal.source).startswith("hessian_ward_cem")
     death = int(proposal.component_death_count) > 0
     prefix = "pilot" if stage == "pilot" else "final_phi"
-    if proposal.source in {"dosage_rescale", "dosage_split"}:
-        return f"{prefix}_{proposal.source}"
     suffix = "hessian_ward_cem" if cem else "hessian_ward"
     if cem and death:
         suffix += "_component_death"

@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
 import tempfile
 from uuid import uuid4
 import warnings
@@ -15,15 +14,15 @@ import numpy as np
 import pandas as pd
 
 from ._version import __version__
-from ._source import source_fingerprint
-from .config import FitConfig, MAX_MAJOR_CN
+from ._source import source_fingerprint, git_source_identity
+from .config import _FitOptions, MAX_MAJOR_CN, ALGORITHM_ID
 from .core.fusion.types import RawFit
 from .core.bic import effective_bic_mutation_region_count
 from .core.objective import (
     compile_observed_model, make_base_objective_key, infer_integer_multiplicity_posterior_numpy,
 )
 from .io.data import CNFilterReport, TumorData, tumor_data_fingerprint, restore_immutable_record
-from .model_selection.candidates import validate_candidate_identity, validate_partition_identity
+from .model_selection.candidates import validate_candidate_identity
 from .model_selection.proposals import pilot_matrix_hash
 from .model_selection.types import (
     BICSelectionResult,
@@ -59,20 +58,8 @@ def _source_identity() -> dict[str, object]:
     """Hash installed Python sources; never mistake an enclosing repo for ours."""
     root = Path(__file__).resolve().parent
     source_hash = source_fingerprint(root)
-    commit = dirty = None
-    if (root / ".git").exists():
-        try:
-            commit = subprocess.check_output(
-                ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
-                text=True, stderr=subprocess.DEVNULL, timeout=5,
-            ).strip()
-            dirty = bool(subprocess.check_output(
-                ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"],
-                text=True, stderr=subprocess.DEVNULL, timeout=5,
-            ).strip())
-        except (OSError, subprocess.SubprocessError):
-            commit = dirty = None
-    else:
+    commit, dirty = git_source_identity(root)
+    if not (root / ".git").exists():
         # A wheel identity is valid only while its installed Python bytes
         # still match the package actually fingerprinted by the build hook.
         try:
@@ -101,7 +88,7 @@ class RunPublication:
     def __init__(
         self, outdir: Path, tumor_id: str, *, input_file: Path | None = None,
         expected_input_sha256: str | None = None,
-        fit_config: FitConfig | None = None, workflow: dict[str, object] | None = None,
+        fit_config: _FitOptions | None = None, workflow: dict[str, object] | None = None,
     ) -> None:
         self.outdir, self.tumor_id = Path(outdir), str(tumor_id)
         if not self.tumor_id or Path(self.tumor_id).name != self.tumor_id or self.tumor_id in {".", ".."}:
@@ -132,6 +119,7 @@ class RunPublication:
             "schema_version": 1, "run_id": uuid4().hex, "tumor_id": self.tumor_id,
             "status": "running", "started_at": datetime.now(timezone.utc).isoformat(),
             "software_version": __version__, "source": _source_identity(),
+            "algorithm_id": ALGORITHM_ID,
             "input": None if input_file is None else {
                 "path": str(input_file.resolve()), "sha256": input_sha256,
             },
@@ -168,7 +156,9 @@ class RunPublication:
         self.record["files"][path.name] = {"sha256": _file_hash(path), "size_bytes": path.stat().st_size}
 
     def write_audit(self, report: CNFilterReport | None) -> None:
-        path = write_cn_filter_output(outdir=self.outdir, tumor_id=self.tumor_id, report=report)
+        path = self.outdir / f"{self.tumor_id}_excluded_mutations.tsv"
+        with path.open("x") as stream:
+            cn_filter_output_table(self.tumor_id, report).to_csv(stream, sep="\t", index=False)
         self._remember(path)
         self._save()
 
@@ -280,9 +270,8 @@ def _add_integer_multiplicity(
     data: TumorData,
     phi: np.ndarray,
     eps: float,
-    multiplicity_policy: str = "independent_broad",
 ) -> None:
-    posterior = infer_integer_multiplicity_posterior_numpy(data, phi, eps=eps, multiplicity_policy=multiplicity_policy)
+    posterior = infer_integer_multiplicity_posterior_numpy(data, phi, eps=eps)
     count = posterior.candidate_count.reshape(-1)
     table["multiplicity_candidates"] = [
         ",".join(str(candidate) for candidate in range(1, int(size) + 1))
@@ -325,7 +314,6 @@ def _mutation_region_output_table(analysis: AnalysisSerialization) -> pd.DataFra
         }
     )
     _add_integer_multiplicity(table, data=data, phi=refit_phi,
-                             multiplicity_policy=analysis.raw_fit.provenance.multiplicity_policy,
                               eps=analysis.raw_fit.provenance.likelihood_eps)
     return table
 
@@ -353,48 +341,6 @@ def cn_filter_output_table(
     )
 
 
-def write_cn_filter_output(
-    *,
-    outdir: Path,
-    tumor_id: str,
-    report: CNFilterReport | None,
-) -> Path:
-    """Write exclusion provenance independently of a successful fit."""
-
-    outdir.mkdir(parents=True, exist_ok=True)
-    path = outdir / f"{tumor_id}_excluded_mutations.tsv"
-    with path.open("x") as stream:
-        cn_filter_output_table(tumor_id, report).to_csv(stream, sep="\t", index=False)
-    return path
-
-
-def write_fit_outputs(
-    *,
-    outdir: Path,
-    data: TumorData,
-    raw_fit: RawFit,
-    partition: SelectedPartition,
-    refit: PartitionRefitSummary,
-    eps: float | None = None,
-    publication: RunPublication | None = None,
-) -> None:
-    """Purely serialize one already selected, identity-validated model."""
-
-    own_publication = publication is None
-    if publication is None:
-        publication = RunPublication(outdir, data.tumor_id, workflow={"entrypoint": "write_fit_outputs", "eps": eps})
-    if publication.outdir.resolve() != Path(outdir).resolve() or publication.tumor_id != data.tumor_id:
-        raise ValueError("Publication does not belong to this tumor and output directory.")
-    try:
-        analysis = AnalysisSerialization(data, raw_fit=raw_fit, partition=partition,
-                                         refit=refit, eps=eps)
-        _write_fit_tables(analysis, publication)
-    except BaseException as error:
-        if own_publication:
-            publication.fail(error)
-        raise
-
-
 def _write_fit_tables(analysis: AnalysisSerialization, publication: RunPublication) -> None:
     tables = {
         "mutation_clusters": _mutation_output_table(analysis),
@@ -410,11 +356,11 @@ def _write_fit_tables(analysis: AnalysisSerialization, publication: RunPublicati
 SUMMARY_SCHEMA_VERSION = 5
 
 
-def input_model_summary(data: TumorData, *, multiplicity_policy="independent_broad", eps=1e-6) -> dict[str, object]:
+def input_model_summary(data: TumorData, *, eps=1e-6) -> dict[str, object]:
     """Separate eligibility provenance from the retained numerical model."""
     report = data.cn_filter_report
     records = () if report is None else report.records
-    model = compile_observed_model(data, eps=eps, multiplicity_policy=multiplicity_policy)
+    model = compile_observed_model(data, eps=eps)
     return {
         "input_mutation_count": data.num_mutations if report is None else report.input_mutation_count,
         "retained_mutation_count": data.num_mutations,
@@ -481,14 +427,11 @@ def _qualification(analysis: AnalysisSerialization) -> dict[str, object]:
     """Keep publication, raw admission, fixed-label refit, and search distinct."""
     raw_fit, partition, refit = analysis.raw_fit, analysis.partition, analysis.refit
     selection_result = analysis.selection_result
-    selected_raw = raw_fit if isinstance(partition, FusionPartition) else None
-    selected_score = None
-    if selection_result is not None:
-        selected = selection_result.selected_model.partition_candidate
-        selected_raw = selected.raw_fit if isinstance(selected, RawFusionCandidate) else None
-        selected_score = {**asdict(selected.score), "assignment_penalty": selected.score.assignment_penalty}
-        selected_score = {key: _finite_number(value) if isinstance(value, float) else value
-                          for key, value in selected_score.items()}
+    selected = selection_result.selected_model.partition_candidate
+    selected_raw = selected.raw_fit if isinstance(selected, RawFusionCandidate) else None
+    selected_score = {**asdict(selected.score), "assignment_penalty": selected.score.assignment_penalty}
+    selected_score = {key: _finite_number(value) if isinstance(value, float) else value
+                      for key, value in selected_score.items()}
     direct = isinstance(partition, DirectPartition)
     return {
         "raw_reference": _raw_qualification(raw_fit),
@@ -522,14 +465,13 @@ def _qualification(analysis: AnalysisSerialization) -> dict[str, object]:
             "likelihood_eps": refit.likelihood_eps,
         },
         "selection": {
-            "status": ("not_provided" if selection_result is None else
-                       "resolved" if selection_result.selection_optimum_resolved else "provisional_unresolved"),
-            "optimum_resolved": None if selection_result is None else bool(selection_result.selection_optimum_resolved),
-            "boundary_unresolved": None if selection_result is None else bool(selection_result.selection_boundary_unresolved),
-            "raw_lambda_path_resolved": None if selection_result is None else bool(selection_result.raw_lambda_path_resolved),
-            "global_hybrid_optimum_certified": None if selection_result is None else bool(selection_result.global_hybrid_optimum_certified),
-            "stop_reason": None if selection_result is None else str(selection_result.adaptive_search_stop_reason),
-            "method": None if selection_result is None else str(selection_result.selection_method),
+            "status": ("resolved" if selection_result.selection_optimum_resolved else "provisional_unresolved"),
+            "optimum_resolved": bool(selection_result.selection_optimum_resolved),
+            "boundary_unresolved": bool(selection_result.selection_boundary_unresolved),
+            "raw_lambda_path_resolved": bool(selection_result.raw_lambda_path_resolved),
+            "global_hybrid_optimum_certified": bool(selection_result.global_hybrid_optimum_certified),
+            "stop_reason": str(selection_result.adaptive_search_stop_reason),
+            "method": str(selection_result.selection_method),
             "score": selected_score,
         },
     }
@@ -540,40 +482,35 @@ class AnalysisSerialization:
     """One immutable validation boundary shared by all reporting consumers."""
 
     data: TumorData
-    input_file: Path | None = None
-    fit_config: FitConfig | None = None
-    selection_result: BICSelectionResult | None = None
+    input_file: Path
+    fit_config: _FitOptions
+    selection_result: BICSelectionResult
     raw_fit: RawFit = field(init=False)
     partition: SelectedPartition = field(init=False)
     refit: PartitionRefitSummary = field(init=False)
     _qualification_json: bytes = field(init=False, repr=False)
 
     def __init__(
-        self, data: TumorData, input_file: Path | None = None,
-        fit_config: FitConfig | None = None,
-        selection_result: BICSelectionResult | None = None, *,
-        raw_fit: RawFit | None = None, partition: SelectedPartition | None = None,
-        refit: PartitionRefitSummary | None = None, eps: float | None = None,
+        self, data: TumorData, input_file: Path,
+        fit_config: _FitOptions, selection_result: BICSelectionResult,
     ) -> None:
-        if selection_result is not None:
-            if any(value is not None for value in (raw_fit, partition, refit)):
-                raise ValueError("Supply a selection result or a standalone fit, not both.")
-            model = selection_result.selected_model
-            raw_fit = model.raw_reference.raw_fit
-            partition, refit = model.partition_candidate.partition, model.partition_candidate.refit
+        if not isinstance(selection_result, BICSelectionResult) or not isinstance(fit_config, _FitOptions):
+            raise TypeError("Reporting requires a completed selection and resolved configuration.")
+        model = selection_result.selected_model
+        raw_fit = model.raw_reference.raw_fit
+        partition, refit = model.partition_candidate.partition, model.partition_candidate.refit
         if not isinstance(raw_fit, RawFit) or not isinstance(refit, PartitionRefitSummary):
             raise TypeError("Reporting requires typed RawFit and PartitionRefitSummary evidence.")
         if not isinstance(partition, (FusionPartition, DirectPartition)):
             raise TypeError("Reporting requires a typed selected partition.")
         epsilon = raw_fit.provenance.likelihood_eps
-        if ((eps is not None and float(eps) != epsilon)
-            or (fit_config is not None and fit_config.eps != epsilon)):
+        if fit_config.eps != epsilon:
             raise ValueError("Reporting eps must match the fitted likelihood provenance.")
         source_hash = tumor_data_fingerprint(data)
         policy = raw_fit.provenance.multiplicity_policy
-        if fit_config is not None and fit_config.multiplicity_policy != policy:
+        if fit_config.multiplicity_policy != policy:
             raise ValueError("Reporting multiplicity policy differs from the fitted objective.")
-        source_model = compile_observed_model(data, eps=epsilon, multiplicity_policy=policy)
+        source_model = compile_observed_model(data, eps=epsilon)
 
         def bind(partition, refit, raw=None):
             if refit.multiplicity_policy != policy:
@@ -597,27 +534,23 @@ class AnalysisSerialization:
                 if provenance.objective_key.base != raw_fit.provenance.objective_key.base:
                     raise ValueError("Reporting candidates do not share the frozen base objective.")
 
-        if selection_result is None:
-            validate_partition_identity(partition, refit)
-            bind(partition, refit, raw_fit)
-        else:
-            candidates = (model.raw_reference, model.partition_candidate, model.partition_parent_raw)
-            seen = set()
-            for candidate in candidates:
-                if candidate is None or id(candidate) in seen:
-                    continue
-                seen.add(id(candidate))
-                validate_candidate_identity(candidate)
-                bind(candidate.partition, candidate.refit,
-                     candidate.raw_fit if isinstance(candidate, RawFusionCandidate) else None)
-                score = candidate.score
-                if (score.degrees_of_freedom != candidate.partition.n_clusters * data.num_regions
-                    or score.n_eff != effective_bic_mutation_region_count(data)):
-                    raise ValueError("Selection score dimensions do not match the reporting data.")
+        candidates = (model.raw_reference, model.partition_candidate, model.partition_parent_raw)
+        seen = set()
+        for candidate in candidates:
+            if candidate is None or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            validate_candidate_identity(candidate)
+            bind(candidate.partition, candidate.refit,
+                 candidate.raw_fit if isinstance(candidate, RawFusionCandidate) else None)
+            score = candidate.score
+            if (score.degrees_of_freedom != candidate.partition.n_clusters * data.num_regions
+                or score.n_eff != effective_bic_mutation_region_count(data)):
+                raise ValueError("Selection score dimensions do not match the reporting data.")
         if isinstance(partition, DirectPartition):
-            parent = (None if selection_result is None else model.partition_parent_raw)
+            parent = model.partition_parent_raw
             if partition.parent_raw_candidate_id is not None:
-                parent_fit = raw_fit if selection_result is None else (None if parent is None else parent.raw_fit)
+                parent_fit = None if parent is None else parent.raw_fit
                 if (parent_fit is None
                     or partition.parent_raw_lambda != parent_fit.provenance.lambda_value
                     or partition.parent_raw_phi_hash != pilot_matrix_hash(parent_fit.phi)):
@@ -637,8 +570,6 @@ class AnalysisSerialization:
     def __reduce__(self):
         inputs = dict(data=self.data, input_file=self.input_file,
                       fit_config=self.fit_config, selection_result=self.selection_result)
-        if self.selection_result is None:
-            inputs.update(raw_fit=self.raw_fit, partition=self.partition, refit=self.refit)
         # Never serialize cached qualification as authority: copy/load must
         # rebind source data, numerical evidence and selected identity.
         return restore_immutable_record, (type(self), inputs)
@@ -672,7 +603,6 @@ def analysis_summary(
 
     data = analysis.data
     fit_config = analysis.fit_config
-    profile = fit_config.computation_profile
     result = analysis.selection_result
     raw_fit = analysis.raw_fit
     parent_raw = analysis.partition_parent_raw
@@ -689,8 +619,7 @@ def analysis_summary(
         "summary_schema_version": SUMMARY_SCHEMA_VERSION,
         "tumor_id": data.tumor_id,
         "input_file": str(analysis.input_file),
-        **input_model_summary(data, multiplicity_policy=raw_fit.provenance.multiplicity_policy,
-                              eps=raw_fit.provenance.likelihood_eps),
+        **input_model_summary(data, eps=raw_fit.provenance.likelihood_eps),
         "scalar_pilot_coordinate_count": len(scalar_pilots),
         "scalar_pilot_certified_coordinate_count": sum(
             item.globally_certified for item in scalar_pilots
@@ -707,7 +636,7 @@ def analysis_summary(
             sum(item.optimality_gap for item in scalar_pilots)
             if scalar_pilots else None
         ),
-        "computation_profile": str(profile.name),
+        "computation_profile": "balanced",
         "selection_status": search_evidence["status"],
         "selection_contract_id": str(fit_config.selection.contract_id),
         "selection_optimum_resolved": search_evidence["optimum_resolved"],
@@ -721,30 +650,41 @@ def analysis_summary(
         "raw_reference_objective_certified": bool(
             raw_reference_evidence["kkt_certified"] and raw_reference_evidence["admissible"]
         ),
-        "selected_candidate_family": partition_evidence["family"],
-        "selected_partition_source": partition_evidence["source"],
-        "selected_partition_parent_lambda": partition_evidence["parent_raw_lambda"],
+        **{name: partition_evidence[key] for name, key in (
+            ("selected_candidate_family", "family"),
+            ("selected_partition_source", "source"),
+            ("selected_partition_parent_lambda", "parent_raw_lambda"),
+            ("selected_n_clusters", "n_clusters"),
+            ("selected_partition_signature", "signature"),
+            ("selected_partition_certified", "raw_partition_certified"),
+            ("selected_labels_hash", "labels_hash"),
+        )},
         "selected_partition_parent_phi_hash": partition_evidence["parent_raw_phi_hash"] or "",
         "selected_partition_parent_signature": (
             str(parent_raw.partition.signature) if parent_raw is not None else ""
         ),
-        "selected_n_clusters": partition_evidence["n_clusters"],
-        "selected_partition_signature": partition_evidence["signature"],
-        "selected_partition_certified": partition_evidence["raw_partition_certified"],
-        "selected_labels_hash": partition_evidence["labels_hash"],
         "raw_reference_phi_hash": raw_reference_evidence["phi_hash"],
-        "selected_fixed_partition_refit_centers_hash": refit_evidence["centers_hash"],
-        "selection_score_name": score_evidence["name"],
-        "selection_score": score_evidence["value"],
-        "selection_score_numerical_uncertainty": score_evidence["numerical_uncertainty"],
-        "selection_loglik": score_evidence["loglik"],
-        "selection_df": score_evidence["degrees_of_freedom"],
-        "selection_penalty": score_evidence["penalty"],
-        "selection_n_eff": score_evidence["n_eff"],
-        "selection_assignment_log_evidence": score_evidence["assignment_log_evidence"],
-        "selection_assignment_code_weight": score_evidence["assignment_code_weight"],
-        "selection_assignment_penalty": score_evidence["assignment_penalty"],
-        "selection_assignment_dirichlet_alpha": score_evidence["assignment_dirichlet_alpha"],
+        **{name: refit_evidence[key] for name, key in (
+            ("selected_fixed_partition_refit_centers_hash", "centers_hash"),
+            ("selected_refit_numerically_resolved", "numerically_resolved"),
+            ("selected_refit_global_optimum_certified", "global_optimum_certified"),
+            ("selected_refit_global_optimality_gap", "global_optimality_gap"),
+            ("selected_refit_global_lower_bound", "global_lower_bound"),
+            ("selected_refit_global_certificate_method", "certificate_method"),
+        )},
+        **{name: score_evidence[key] for name, key in (
+            ("selection_score_name", "name"),
+            ("selection_score", "value"),
+            ("selection_score_numerical_uncertainty", "numerical_uncertainty"),
+            ("selection_loglik", "loglik"),
+            ("selection_df", "degrees_of_freedom"),
+            ("selection_penalty", "penalty"),
+            ("selection_n_eff", "n_eff"),
+            ("selection_assignment_log_evidence", "assignment_log_evidence"),
+            ("selection_assignment_code_weight", "assignment_code_weight"),
+            ("selection_assignment_penalty", "assignment_penalty"),
+            ("selection_assignment_dirichlet_alpha", "assignment_dirichlet_alpha"),
+        )},
         **{
             f"{prefix}_{name}": None if evidence is None else evidence[key]
             for prefix, evidence in (("raw_reference", raw_reference_evidence),
@@ -763,11 +703,6 @@ def analysis_summary(
                               ("graph_hash", "graph_hash"),
                               ("source_data_hash", "source_data_hash"))
         },
-        "selected_refit_numerically_resolved": refit_evidence["numerically_resolved"],
-        "selected_refit_global_optimum_certified": refit_evidence["global_optimum_certified"],
-        "selected_refit_global_optimality_gap": refit_evidence["global_optimality_gap"],
-        "selected_refit_global_lower_bound": refit_evidence["global_lower_bound"],
-        "selected_refit_global_certificate_method": refit_evidence["certificate_method"],
         "configured_raw_solver_primal_tol": float(fit_config.solver.tolerance),
         "selection_method": search_evidence["method"],
         "num_candidates": int(result.num_candidates),
@@ -787,21 +722,12 @@ def write_analysis_outputs(
     analysis: AnalysisSerialization,
     *,
     outdir: Path,
-    publication: RunPublication | None = None,
+    publication: RunPublication,
 ) -> None:
     """Write the retained-mutation tables and original-CN exclusion audit."""
-    own_publication = publication is None
-    if publication is None:
-        publication = RunPublication(outdir, analysis.data.tumor_id,
-                                     input_file=analysis.input_file, fit_config=analysis.fit_config)
     if publication.outdir.resolve() != Path(outdir).resolve() or publication.tumor_id != analysis.data.tumor_id:
         raise ValueError("Publication does not belong to this tumor and output directory.")
-    try:
-        _write_fit_tables(analysis, publication)
-    except BaseException as error:
-        if own_publication:
-            publication.fail(error)
-        raise
+    _write_fit_tables(analysis, publication)
 
 
 __all__ = [
@@ -811,6 +737,4 @@ __all__ = [
     "analysis_summary",
     "write_analysis_outputs",
     "cn_filter_output_table",
-    "write_cn_filter_output",
-    "write_fit_outputs",
 ]

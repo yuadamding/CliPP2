@@ -17,7 +17,6 @@ from ...config import (
     DEFAULT_WORKSET_ADD_BATCH,
     DEFAULT_WORKSET_MAX_BYTES,
     DEFAULT_WORKSET_MAX_EXPANSIONS,
-    DenseFallbackPolicy as DenseFallbackPolicy,
 )
 
 if TYPE_CHECKING:
@@ -254,7 +253,6 @@ class TensorFusionGraph:
     edge_index: torch.Tensor
     weight: torch.Tensor
     degree: torch.Tensor
-    pdhg_tau_node: torch.Tensor
     num_nodes: int
     is_complete: bool
     name: str
@@ -281,8 +279,6 @@ class PreparedProblem:
     runtime: TorchRuntime
     data_fingerprint: str
     base_objective_key: BaseObjectiveKey
-    resource_fallback: str | None = None
-    fallback_policy: str = "cpu_allowed"
     verbose: bool = False
     adaptive_graph_options: tuple[float, float, float] | None = None
     # Float64 scalar source results, in mutation-major/region-minor order.
@@ -343,7 +339,7 @@ class PreparedProblem:
         model = self.model
         for name in ("alt", "nonalt", "observed", "lower", "upper", "slope", "log_prior", "valid"):
             yield f"model.{name}", getattr(model, name)
-        for name in ("edge_index", "weight", "degree", "pdhg_tau_node"):
+        for name in ("edge_index", "weight", "degree"):
             yield f"graph.{name}", getattr(self.graph, name)
         for name in ("exact_pilot", "pooled_start"):
             yield name, getattr(self, name)
@@ -376,7 +372,7 @@ class PreparedProblem:
         data = self.source_data
         if self.data_fingerprint != tumor_data_fingerprint(data):
             raise ValueError("Prepared problem data fingerprint is inconsistent.")
-        source = compile_observed_model(data, eps=self.eps, multiplicity_policy=self.model.support_policy)
+        source = compile_observed_model(data, eps=self.eps)
         if (
             self.source_model is None
             or self.source_model.fingerprint != source.fingerprint

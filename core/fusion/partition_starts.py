@@ -3,15 +3,16 @@ from __future__ import annotations
 import heapq
 from dataclasses import dataclass
 from collections.abc import Callable, Sequence
+from time import perf_counter
 
 import numpy as np
 import torch
 
-from ...io.data import TumorData
+from ...io.data import TumorData, tumor_data_fingerprint
 from ...config import (
     DIRICHLET_ALPHA,
     DIRICHLET_CODE_WEIGHT,
-    FitConfig,
+    _FitOptions,
     LIKELIHOOD_PARTITION_K_MAX,
     PARTITION_CEM_MAX_ITER,
     PARTITION_GENERATION_REFIT_MAX_ITER,
@@ -24,14 +25,94 @@ from ..objective import (
 )
 from ..bic import fixed_partition_dirichlet_score
 from ..scalar import (
-    PartitionRefitResult,
     _RefitCoordinateCache,
+    _RefitCoordinateKey,
+    _RefitCoordinateResult,
     _ScalarWorkStats,
     canonical_partition_labels as _canonical_labels,
-    partition_constrained_observed_refit,
+    certify_scalar_minimum,
+    scalar_problem_from_model,
 )
 from .torch_backend import as_runtime_tensor
 from .types import PreparedProblem
+
+
+@dataclass(frozen=True, slots=True)
+class _GuideCenters:
+    """Initialization evidence, never a selectable final partition refit."""
+    labels: np.ndarray
+    cluster_centers: np.ndarray
+    phi: np.ndarray
+    fit_loss: float
+    finite_candidate_found: bool
+
+    @property
+    def n_clusters(self) -> int:
+        return len(self.cluster_centers)
+
+    @property
+    def loglik(self) -> float:
+        return -self.fit_loss
+
+
+def _fit_guide_centers(
+    data: TumorData, labels: np.ndarray, *, eps: float, tol: float,
+    max_iter: int, _model: ObservedModel,
+    _coordinate_cache: _RefitCoordinateCache | None = None,
+) -> _GuideCenters:
+    """Retain the default certified Ward/CEM seed arithmetic, not a refit mode.
+
+    Balanced always used bounded scalar certification here. Replacing these
+    seeds by final grid/local refits changes initial lambda and the raw path.
+    Certificates used to find seeds do not certify a selected partition.
+    """
+    labels = _validated_refinement_labels(data, labels)
+    model = compile_observed_model(data, eps=eps)
+    if model.fingerprint != _model.fingerprint:
+        raise ValueError("The supplied guide model does not match the tumor objective.")
+    count, regions = int(labels.max()) + 1, data.num_regions
+    centers = np.zeros((count, regions), dtype=np.float64)
+    loss, finite = 0.0, True
+    tolerance = tol / max(count * regions, 1)
+    for cluster in range(count):
+        members = np.flatnonzero(labels == cluster)
+        for region in range(regions):
+            upper = max(eps, float(np.min(model.upper[members, region])))
+            key = None if _coordinate_cache is None else _RefitCoordinateKey(
+                tumor_data_fingerprint(data), model.fingerprint, members.astype(np.int64).tobytes(),
+                region, eps, upper, eps, "guide", tolerance, int(max_iter), 64, 3, True,
+            )
+            coordinate = None if key is None else _coordinate_cache.get(key)
+            if coordinate is None:
+                work = None if _coordinate_cache is None else _coordinate_cache.work
+                started = perf_counter()
+                if work is not None:
+                    work.scalar_solves += 1
+                try:
+                    result = certify_scalar_minimum(
+                        scalar_problem_from_model(model, members, region, lower=eps, upper=upper, eps=eps),
+                        tolerance=tolerance, max_intervals=max(int(max_iter) * 256, 4096),
+                        _work_stats=work,
+                    )
+                    coordinate = _RefitCoordinateResult(
+                        result.argmin, result.attained_value, result.global_lower_bound,
+                        result.optimality_gap, bool(np.isfinite(result.attained_value)),
+                        result.globally_certified, result.method, result.intervals_evaluated,
+                    )
+                except Exception:
+                    if work is not None:
+                        work.scalar_failures += 1
+                    raise
+                finally:
+                    if work is not None:
+                        work.scalar_seconds += perf_counter() - started
+                if key is not None:
+                    _coordinate_cache.put(key, coordinate)
+            centers[cluster, region] = coordinate.beta
+            loss += coordinate.loss
+            finite = finite and coordinate.finite_candidate_found
+    return _GuideCenters(labels, centers, np.clip(centers[labels], eps, model.upper),
+                         loss, bool(finite and np.isfinite(loss)))
 
 
 # Bound each temporary used to initialize the dense Ward cost matrix.  The
@@ -144,17 +225,6 @@ def observed_curvature_at_pilot_torch(
     f_right = observed_loss_grid_torch(
         model, right, eps=eps
     )
-    if model.coupling == "joint":
-        # Preserve the existing finite-difference diagonal Ward/graph metric:
-        # perturb ONE coordinate while the other regions stay at the pilot.
-        # Simultaneous regional perturbations would include cross derivatives.
-        f0 = f0.sum(dim=1, keepdim=True).expand_as(x0)
-        f_left, f_right = torch.empty_like(x0), torch.empty_like(x0)
-        for region in range(model.shape[1]):
-            trial_left, trial_right = x0.clone(), x0.clone()
-            trial_left[:, region], trial_right[:, region] = left[:, region], right[:, region]
-            f_left[:, region] = observed_loss_grid_torch(model, trial_left, eps=eps).sum(dim=1)
-            f_right[:, region] = observed_loss_grid_torch(model, trial_right, eps=eps).sum(dim=1)
     denom = h_left * h_right * (h_left + h_right)
     curvature = (
         2.0 * (h_left * f_right - (h_left + h_right) * f0 + h_right * f_left) / denom
@@ -513,7 +583,7 @@ def _classification_assignment_cost(
 def _classification_refit_score(
     data: TumorData,
     labels: np.ndarray,
-    refit: PartitionRefitResult,
+    refit: _GuideCenters,
 ) -> float:
     return fixed_partition_dirichlet_score(
         loglik=float(refit.loglik),
@@ -562,9 +632,9 @@ def refine_partition_likelihood(
     tol: float,
     max_iter: int = PARTITION_CEM_MAX_ITER,
     refit_max_iter: int = PARTITION_GENERATION_REFIT_MAX_ITER,
-    _refit_labels: Callable[[np.ndarray], PartitionRefitResult] | None = None,
+    _refit_labels: Callable[[np.ndarray], _GuideCenters] | None = None,
     _model: ObservedModel | None = None,
-) -> PartitionRefitResult:
+) -> _GuideCenters:
     """Host CEM with fixed allocation scoring and empty-cluster repair."""
     labels = _validated_refinement_labels(data, labels)
     model = (
@@ -573,10 +643,10 @@ def refine_partition_likelihood(
         else _model
     )
 
-    def refit_labels(current_labels: np.ndarray) -> PartitionRefitResult:
+    def refit_labels(current_labels: np.ndarray) -> _GuideCenters:
         if _refit_labels is not None:
             return _refit_labels(current_labels)
-        return partition_constrained_observed_refit(
+        return _fit_guide_centers(
             data,
             current_labels,
             eps=float(eps),
@@ -619,57 +689,6 @@ def _label_key(labels: np.ndarray) -> bytes:
     return labels.astype(np.int32, copy=False).tobytes()
 
 
-def _coherent_center_moves(data, model, bases, *, eps, refit_labels, budget=12):
-    """Bounded rescale/split moves, ranked and refit under the active likelihood.
-
-    Ratio choices come from admissible integer states, not a target K or
-    truth. Splits may increase K; empty proposals are allowed to disappear.
-    Only labels survive to the common immutable-label scoring gate.
-    """
-    count = int(np.sum(model.valid, axis=-1).max())
-    ratios = sorted({a / b for a in range(1, count + 1) for b in range(1, count + 1)
-                     if a != b}, key=lambda r: (abs(np.log(r)), r))[:8]
-    proposals = {}
-    for base in sorted(bases, key=lambda x: (x.bic, x.source))[:3]:
-        refit = refit_labels(base.labels)
-        centers = refit.cluster_centers
-        costs = _loss_to_centers(data, centers, eps=eps, _model=model)
-        # Largest blocks first; bounded independently of the truth/target K.
-        order = np.argsort(-np.bincount(base.labels), kind="stable")[:6]
-        for cluster in order:
-            for ratio in ratios:
-                center = np.clip(centers[cluster] * ratio, eps, 1.0)
-                if np.max(np.abs(center - centers[cluster])) < 1e-5:
-                    continue
-                cost = _loss_to_centers(data, center[None], eps=eps, _model=model)
-                for split in (False, True):
-                    if split:
-                        trial = np.column_stack((costs, cost))
-                    else:
-                        trial = costs.copy()
-                        trial[:, cluster] = cost[:, 0]
-                    labels = np.argmin(_classification_assignment_cost(trial, base.labels), axis=1)
-                    assigned_loss = float(trial[np.arange(data.num_mutations), labels].sum())
-                    labels = _canonical_labels(labels)
-                    if np.array_equal(labels, base.labels):
-                        continue
-                    score = fixed_partition_dirichlet_score(
-                        loglik=-assigned_loss, num_clusters=int(labels.max()) + 1,
-                        labels=labels, partition_signature="", data=data,
-                    ).value
-                    key = _label_key(labels)
-                    value = (score, "dosage_split" if split else "dosage_rescale", labels)
-                    if key not in proposals or value[:2] < proposals[key][:2]:
-                        proposals[key] = value
-    for _, source, labels in sorted(proposals.values(), key=lambda x: (x[0], x[1], _label_key(x[2])))[:budget]:
-        refit = refine_partition_likelihood(data, labels, eps=eps, tol=1e-3, max_iter=3,
-                                           _refit_labels=refit_labels, _model=model)
-        yield PartitionCandidate(
-            labels=refit.labels, K=refit.n_clusters, source=source,
-            phi_start=refit.phi, fit_loss=refit.fit_loss,
-            bic=_classification_refit_score(data, refit.labels, refit),
-            finite_candidate_found=refit.finite_candidate_found,
-        )
 
 
 def generate_likelihood_partition_starts(
@@ -695,15 +714,15 @@ def generate_likelihood_partition_starts(
     source_model = compile_observed_model(data, eps=float(eps)) if _model is None else _model
     # One model, tolerance and scalar backend per call: immutable labels alone
     # identify each local refit, including repeated CEM proposals.
-    refit_cache: dict[bytes, PartitionRefitResult] = {}
+    refit_cache: dict[bytes, _GuideCenters] = {}
     coordinate_cache = _RefitCoordinateCache(work_stats=_work_stats)
 
-    def cached_refit(labels: np.ndarray) -> PartitionRefitResult:
+    def cached_refit(labels: np.ndarray) -> _GuideCenters:
         labels_key = _label_key(labels)
         cached = refit_cache.get(labels_key)
         if cached is not None:
             return cached
-        result = partition_constrained_observed_refit(
+        result = _fit_guide_centers(
             data, labels, eps=float(eps), tol=float(tol),
             max_iter=max(int(refit_max_iter), 32), _model=source_model,
             _coordinate_cache=coordinate_cache,
@@ -735,13 +754,6 @@ def generate_likelihood_partition_starts(
                 requested_k=int(requested_k),
             ))
 
-    if source_model.coupling == "joint":
-        for candidate in _coherent_center_moves(data, source_model, candidates, eps=eps,
-                                                refit_labels=cached_refit):
-            key = _label_key(candidate.labels)
-            if key not in seen:
-                seen.add(key)
-                candidates.append(candidate)
 
     by_k: dict[int, list[PartitionCandidate]] = {}
     for candidate in candidates:
@@ -757,7 +769,7 @@ def generate_partition_initializer_pool(
     *,
     context: PreparedProblem,
     pilot_phi: np.ndarray | torch.Tensor,
-    fit_options: FitConfig,
+    fit_options: _FitOptions,
     curvature: np.ndarray | torch.Tensor | None = None,
     declared_k_grid: tuple[int, ...] | None = None,
 ) -> tuple[PartitionCandidate, ...]:

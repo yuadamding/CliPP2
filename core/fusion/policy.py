@@ -1,34 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from enum import Enum, auto
-from typing import Literal
+from dataclasses import replace
 
 import numpy as np
 
 from .types import CompressedEdgeCertificate, RawFit
 
-
-class NextAction(Enum):
-    ACCEPT = auto()
-    RETRY_SAME_RUNTIME = auto()
-    DENSE_CURRENT_DEVICE = auto()
-    CPU_FALLBACK = auto()
-    FLOAT64_POLISH = auto()
-    FAIL = auto()
-
-
-PolicyPhase = Literal["working", "selected", "precision_polish"]
-
-
-@dataclass(slots=True)
-class PolicyState:
-    phase: PolicyPhase
-    result: RawFit | None = None
-    resource_error: BaseException | None = None
-    runtime_device_type: str = "cpu"
-    fallback_policy: str = "error"
-    representation_retry_done: bool = False
 
 _AUDIT_COMPATIBLE_STATUSES = {
     "certified",
@@ -39,14 +16,6 @@ _AUDIT_COMPATIBLE_STATUSES = {
 }
 
 
-def _compressed_representation_incomplete(result: RawFit) -> bool:
-    terminal = result.certificate
-    if not isinstance(terminal.witness, CompressedEdgeCertificate):
-        return False
-    return terminal.status in {"resource_limit", "workset_incomplete"} or (
-        terminal.status == "not_certified"
-        and result.work.full_certificate_audit_passes == 0
-    )
 
 
 def _precision_residual_is_only_blocker(result: RawFit) -> bool:
@@ -66,37 +35,11 @@ def _precision_residual_is_only_blocker(result: RawFit) -> bool:
     )
 
 
-def decide_next_action(state: PolicyState) -> NextAction:
-    """Choose one estimator-preserving retry, fallback, or terminal action."""
-
-    if state.resource_error is not None:
-        cpu_allowed = (
-            state.fallback_policy == "cpu_allowed"
-            and state.runtime_device_type != "cpu"
-        )
-        return NextAction.CPU_FALLBACK if cpu_allowed else NextAction.FAIL
-    if state.result is None:
-        return NextAction.RETRY_SAME_RUNTIME
-    if state.phase == "working":
-        if (
-            not state.representation_retry_done
-            and _compressed_representation_incomplete(state.result)
-        ):
-            if state.fallback_policy == "error":
-                return NextAction.FAIL
-            return NextAction.DENSE_CURRENT_DEVICE
-        return NextAction.ACCEPT
-    if state.phase == "selected":
-        if (
-            state.result.provenance.dtype != "float64"
-            and not state.result.certificate.admissible
-            and _precision_residual_is_only_blocker(state.result)
-        ):
-            return NextAction.FLOAT64_POLISH
-        return NextAction.ACCEPT
-    if state.phase == "precision_polish":
-        return NextAction.ACCEPT
-    raise ValueError(f"Unknown policy phase: {state.phase}")
+def needs_precision_polish(result: RawFit) -> bool:
+    """Only a finite, otherwise admissible float32 residual miss can be polished."""
+    return bool(result.provenance.dtype != "float64"
+                and not result.certificate.admissible
+                and _precision_residual_is_only_blocker(result))
 
 
 def combine_fallback_reasons(*reasons: str) -> str:

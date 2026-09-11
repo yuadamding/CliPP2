@@ -12,6 +12,7 @@ from ...io.data import (
 )
 from ..objective import (
     TorchObservedModel,
+    TorchObservedTerms,
     compile_observed_model,
     has_proven_convex_observed_loss,
     make_base_objective_key,
@@ -24,11 +25,10 @@ from ..objective import (
 )
 from ...config import (
     CLONAL_INTEGER_MODEL_ID,
-    FitConfig,
+    _FitOptions,
     SolverConfig,
     DEFAULT_DEVICE,
     DEFAULT_DTYPE,
-    normalize_dense_fallback_policy,
 )
 from .certificates import (
     CertificateProblem,
@@ -45,9 +45,7 @@ from .graph_ops import (
     tensorize_graph,
 )
 from .policy import (
-    NextAction,
-    PolicyState,
-    decide_next_action,
+    needs_precision_polish,
     record_attempt,
 )
 from .starts import (
@@ -56,7 +54,6 @@ from .starts import (
     compute_scalar_well_start_bank_torch,
 )
 from .torch_backend import (
-    CudaUnavailableError,
     as_runtime_tensor,
     dtype_name,
     graph_adjoint_edges_in_dtype,
@@ -64,7 +61,6 @@ from .torch_backend import (
     pairwise_penalty_torch,
     resolve_runtime,
     solve_majorized_subproblem_alm_torch,
-    solve_majorized_subproblem_pdhg_torch,
     validate_lambda_value,
 )
 from .types import (
@@ -540,15 +536,10 @@ def _validate_prebuilt_tensor_graph(
         )
     if tuple(tensor_graph.degree.shape) != (int(num_nodes),):
         raise ValueError("prebuilt_tensor_graph degree has the wrong shape.")
-    if tuple(tensor_graph.pdhg_tau_node.shape) != (int(num_nodes), 1):
-        raise ValueError(
-            "prebuilt_tensor_graph PDHG preconditioner has the wrong shape."
-        )
     for value in (
         tensor_graph.edge_index,
         tensor_graph.weight,
         tensor_graph.degree,
-        tensor_graph.pdhg_tau_node,
     ):
         if value.device.type != runtime.device.type or (
             runtime.device.index is not None
@@ -746,20 +737,14 @@ def promote_solver_context_dtype(
     context: PreparedProblem,
     *,
     dtype: torch.dtype,
-    device: torch.device | None = None,
-    start_override: np.ndarray | torch.Tensor | None = None,
 ) -> PreparedProblem:
     """Rebuild one frozen objective from its immutable host sources."""
 
     context.assert_runtime_unchanged()
     if dtype not in {torch.float32, torch.float64}:
         raise ValueError("Promoted solver contexts require float32 or float64.")
-    target_device = context.runtime.device if device is None else torch.device(device)
-    if (
-        context.runtime.dtype == dtype
-        and context.runtime.device == target_device
-        and start_override is None
-    ):
+    target_device = context.runtime.device
+    if context.runtime.dtype == dtype:
         return context
     source_model = context.source_model
     if source_model is None:
@@ -776,21 +761,9 @@ def promote_solver_context_dtype(
         runtime,
         num_nodes=int(source_model.shape[0]),
     )
-    override = (
-        None
-        if start_override is None
-        else as_runtime_tensor(start_override, runtime).detach()
-    )
-    if override is None:
-        exact = context.exact_pilot.to(dtype=dtype, device=target_device)
-        pooled = context.pooled_start.to(dtype=dtype, device=target_device)
-        wells = tuple(
-            start.to(dtype=dtype, device=target_device)
-            for start in context.scalar_well_starts
-        )
-    else:
-        exact = pooled = override
-        wells = ()
+    exact = context.exact_pilot.to(dtype=dtype, device=target_device)
+    pooled = context.pooled_start.to(dtype=dtype, device=target_device)
+    wells = tuple(start.to(dtype=dtype, device=target_device) for start in context.scalar_well_starts)
     return replace(
         context,
         _tensor_snapshot=(),
@@ -799,9 +772,7 @@ def promote_solver_context_dtype(
         exact_pilot=exact,
         pooled_start=pooled,
         scalar_well_starts=wells,
-        scalar_pilot_certificates=(
-            context.scalar_pilot_certificates if override is None else ()
-        ),
+        scalar_pilot_certificates=context.scalar_pilot_certificates,
         runtime=runtime,
     )
 
@@ -830,38 +801,18 @@ def _require_dense_memory(
     raise error
 
 
-def _float64_context(
-    data: TumorData,
-    context: PreparedProblem,
-    *,
-    device: torch.device | None = None,
-    cause: BaseException | None = None,
-) -> PreparedProblem:
-    target = context.runtime.device if device is None else torch.device(device)
-    runtime = replace(
-        context.runtime,
-        dtype=torch.float64,
-        device=target,
-        device_name=str(target),
-    )
+def _float64_context(data: TumorData, context: PreparedProblem) -> PreparedProblem:
+    runtime = replace(context.runtime, dtype=torch.float64)
     if context.graph.is_complete:
-        prefix = "CPU " if target.type == "cpu" and target != context.runtime.device else ""
-        _require_dense_memory(
-            data,
-            runtime,
-            operation=f"{prefix}float64 fixed-objective precision polish",
-            limit_name="policy limit",
-            cause=cause,
-        )
-    return promote_solver_context_dtype(context, dtype=torch.float64, device=target)
+        _require_dense_memory(data, runtime, operation="float64 fixed-objective precision polish",
+                              limit_name="policy limit")
+    return promote_solver_context_dtype(context, dtype=torch.float64)
 
 
 def _finalize_precision_polish(
     polished: RawFit,
     working: RawFit,
     source_context: PreparedProblem,
-    *,
-    on_cpu: bool,
 ) -> RawFit:
     if (
         polished.provenance.objective_spec_hash != source_context.objective_spec_hash
@@ -891,15 +842,10 @@ def _finalize_precision_polish(
         )
     )
     reason = "float64_fixed_objective_precision_polish"
-    backend = None
-    if on_cpu:
-        reason += ";float64_precision_polish_cpu_after_cuda_resource_limit"
-        backend = "admm_complete_graph_cpu_precision_polish"
     polished = record_attempt(
         polished,
         attempted=working,
         reason=reason,
-        backend_name=backend,
     )
     return replace(
         polished,
@@ -1039,7 +985,6 @@ def prepare_torch_problem(
     *,
 
     eps: float,
-    multiplicity_policy: str = "independent_broad",
     tol: float,
     inner_max_iter: int,
     graph: PairwiseFusionGraph | None = None,
@@ -1069,7 +1014,6 @@ def prepare_torch_problem(
     source_model = compile_observed_model(
         data,
         eps=float(eps),
-        multiplicity_policy=multiplicity_policy,
     )
     runtime_model = model_to_torch(source_model, effective_runtime, eps=float(eps))
     data_fingerprint = tumor_data_fingerprint(data)
@@ -1234,95 +1178,33 @@ def prepare_torch_problem(
 
 
 def prepare_torch_problem_with_resource_policy(
-    data: TumorData,
-    options: FitConfig,
-    *,
-    inherited_resource_fallback: str | None = None,
-    **prepare_overrides,
+    data: TumorData, options: _FitOptions, **prepare_overrides,
 ) -> PreparedProblem:
-    """Prepare an immutable context under the same typed fallback policy as fits."""
+    """Prepare on the requested device; resource failure never changes devices."""
     kwargs = dict(
-        eps=float(options.eps),
-        multiplicity_policy=options.multiplicity_policy,
-        tol=float(options.solver.tolerance),
-        inner_max_iter=max(int(options.solver.inner_max_iter), 16),
+        eps=options.eps, tol=options.solver.tolerance,
+        inner_max_iter=max(options.solver.inner_max_iter, 16),
         graph=options.graph.graph,
-        adaptive_weight_gamma=float(options.graph.adaptive_weight_gamma),
-        adaptive_weight_floor=float(options.graph.adaptive_weight_floor),
-        adaptive_weight_baseline=float(options.graph.adaptive_weight_baseline),
-        device=options.runtime.device,
-        dtype=options.runtime.dtype,
-        dense_fallback_policy=options.runtime.fallback,
+        adaptive_weight_gamma=options.graph.adaptive_weight_gamma,
+        adaptive_weight_floor=options.graph.adaptive_weight_floor,
+        adaptive_weight_baseline=options.graph.adaptive_weight_baseline,
+        device=options.runtime.device, dtype=options.runtime.dtype,
         objective_shape=options.solver.objective_shape,
         verbose=options.runtime.verbose,
     )
     kwargs.update(prepare_overrides)
-    normalized_policy = normalize_dense_fallback_policy(kwargs.pop("dense_fallback_policy"))
-    supplied_prebuilt_tensor_graph = kwargs.pop("prebuilt_tensor_graph", None)
-    supplied_runtime = kwargs.pop("runtime", None)
-    requested_device = kwargs.pop("device")
-    requested_dtype = kwargs.pop("dtype")
-    resolved_by_cpu_fallback = False
-    requested_runtime = supplied_runtime
+    runtime = kwargs.pop("runtime", None)
+    if runtime is None:
+        runtime = resolve_runtime(kwargs["device"], dtype=kwargs["dtype"])
     try:
-        if requested_runtime is None:
-            requested_runtime = resolve_runtime(
-                requested_device, dtype=requested_dtype
-            )
-    except CudaUnavailableError:
-        if normalized_policy != "cpu_allowed":
+        return prepare_torch_problem(data, runtime=runtime, **kwargs)
+    except (MemoryError, torch.OutOfMemoryError) as exc:
+        if isinstance(exc, ExactSolverResourceLimit):
             raise
-        requested_runtime = resolve_runtime("cpu", dtype=requested_dtype)
-        resolved_by_cpu_fallback = True
-
-    def prepare_on_runtime() -> PreparedProblem:
-        reusable_tensor_graph = supplied_prebuilt_tensor_graph
-        graph_runtime = None if reusable_tensor_graph is None else (
-            reusable_tensor_graph.weight.device,
-            reusable_tensor_graph.weight.dtype,
-        )
-        if graph_runtime != (requested_runtime.device, requested_runtime.dtype):
-            reusable_tensor_graph = None
-        context = prepare_torch_problem(
-            data,
-            device=requested_runtime.device_name,
-            dtype=dtype_name(requested_runtime.dtype),
-            runtime=requested_runtime,
-            prebuilt_tensor_graph=reusable_tensor_graph,
-            **kwargs,
-        )
-        fallback = "dense_cpu" if resolved_by_cpu_fallback else inherited_resource_fallback
-        return replace(context, resource_fallback=fallback, fallback_policy=normalized_policy)
-
-    while True:
-        if resolved_by_cpu_fallback:
-            _require_dense_memory(
-                data,
-                runtime=requested_runtime,
-                operation="dense CPU fallback",
-                limit_name="host limit",
-            )
-        try:
-            return prepare_on_runtime()
-        except (MemoryError, torch.OutOfMemoryError) as exc:
-            action = decide_next_action(
-                PolicyState(
-                    phase="working",
-                    resource_error=exc,
-                    runtime_device_type=requested_runtime.device.type,
-                    fallback_policy=normalized_policy,
-                )
-            )
-            if action is not NextAction.CPU_FALLBACK:
-                raise ExactSolverResourceLimit(
-                    "exact_solver_resource_limit: exact problem or graph "
-                    f"construction exhausted memory on "
-                    f"{requested_runtime.device_name}."
-                ) from exc
-            requested_runtime = resolve_runtime(
-                "cpu", dtype=dtype_name(requested_runtime.dtype)
-            )
-            resolved_by_cpu_fallback = True
+        raise ExactSolverResourceLimit(
+            "exact_solver_resource_limit: exact problem or graph construction "
+            f"exhausted memory on {runtime.device_name}."
+        ) from exc
 
 
 def _backward_error_kkt_within_gate(
@@ -1355,7 +1237,7 @@ def _uses_backward_error_progress(
 
     Ordinary fits retain the legacy progress signal and their required float64
     terminal audit. Explicit recovery mode survives equal solve/certification
-    tolerances (for example strict) but remains disabled if float64 context
+    tolerances but remains disabled if float64 context
     promotion failed.
     """
 
@@ -1364,7 +1246,6 @@ def _uses_backward_error_progress(
 
 def _solve_inner_subproblem(
     *,
-    use_alm: bool,
     runtime,
     num_mutations: int,
     U: torch.Tensor,
@@ -1375,7 +1256,6 @@ def _solve_inner_subproblem(
     edge_u: torch.Tensor,
     edge_v: torch.Tensor,
     edge_w: torch.Tensor,
-    degree_bound: int,
     tol: float,
     inner_max_iter: int,
     phi: torch.Tensor,
@@ -1383,76 +1263,46 @@ def _solve_inner_subproblem(
     dual_start_is_actual: bool,
     spectral_rho: bool,
     use_backward_error_stopping: bool,
-    pdhg_tau_node,
     backend_name: str,
     graph_hash: str,
 ) -> InnerSolveResult:
-    """Dispatch the majorized inner subproblem to the ALM (complete-graph) or PDHG
-    solver and retain its sole actual multiplier in the outer result."""
-    if use_alm:
-        dense_fits, dense_bytes, dense_limit = dense_complete_solver_memory_preflight(
-            num_nodes=num_mutations,
-            num_regions=int(U.shape[1]),
-            runtime=runtime,
+    """Solve the complete-graph ALM subproblem and retain its actual multiplier."""
+    dense_fits, dense_bytes, dense_limit = dense_complete_solver_memory_preflight(
+        num_nodes=num_mutations,
+        num_regions=int(U.shape[1]),
+        runtime=runtime,
+    )
+    if not dense_fits:
+        raise ExactSolverResourceLimit(
+            "exact_solver_resource_limit: dense complete-graph solve needs "
+            f"approximately {dense_bytes} bytes (available policy limit: "
+            f"{dense_limit})."
         )
-        if not dense_fits:
-            raise ExactSolverResourceLimit(
-                "exact_solver_resource_limit: dense complete-graph solve needs "
-                f"approximately {dense_bytes} bytes (available policy limit: "
-                f"{dense_limit})."
-            )
-    if use_alm:
-        (
-            phi_trial,
-            dual_kkt_trial,
-            _inner_iterations,
-            inner_ok,
-            surrogate_diag,
-        ) = solve_majorized_subproblem_alm_torch(
-            runtime=runtime,
-            num_mutations=num_mutations,
-            U=U,
-            h=h,
-            lower=lower,
-            upper=upper,
-            lambda_value=lambda_value,
-            edge_u=edge_u,
-            edge_v=edge_v,
-            edge_w=edge_w,
-            tol=tol,
-            max_iter=max(inner_max_iter, 10),
-            phi_start=phi,
-            dual_start=dual,
-            dual_start_is_actual=dual_start_is_actual,
-            spectral_rho=bool(spectral_rho),
-            use_backward_error_stopping=bool(use_backward_error_stopping),
-        )
-    else:
-        (
-            phi_trial,
-            dual_kkt_trial,
-            _inner_iterations,
-            inner_ok,
-            surrogate_diag,
-        ) = solve_majorized_subproblem_pdhg_torch(
-            runtime=runtime,
-            num_mutations=num_mutations,
-            U=U,
-            h=h,
-            lower=lower,
-            upper=upper,
-            lambda_value=lambda_value,
-            edge_u=edge_u,
-            edge_v=edge_v,
-            edge_w=edge_w,
-            degree_bound=degree_bound,
-            tol=tol,
-            max_iter=max(inner_max_iter, 10),
-            phi_start=phi,
-            dual_start=dual,
-            tau_node=pdhg_tau_node,
-            use_backward_error_stopping=bool(use_backward_error_stopping),
-        )
+    (
+        phi_trial,
+        dual_kkt_trial,
+        _inner_iterations,
+        inner_ok,
+        surrogate_diag,
+    ) = solve_majorized_subproblem_alm_torch(
+        runtime=runtime,
+        num_mutations=num_mutations,
+        U=U,
+        h=h,
+        lower=lower,
+        upper=upper,
+        lambda_value=lambda_value,
+        edge_u=edge_u,
+        edge_v=edge_v,
+        edge_w=edge_w,
+        tol=tol,
+        max_iter=max(inner_max_iter, 10),
+        phi_start=phi,
+        dual_start=dual,
+        dual_start_is_actual=dual_start_is_actual,
+        spectral_rho=bool(spectral_rho),
+        use_backward_error_stopping=bool(use_backward_error_stopping),
+    )
     if surrogate_diag is None:
         surrogate_diag = graph_fusion_kkt_residual_from_grad_torch(
             phi=phi_trial,
@@ -1516,6 +1366,25 @@ def _certificate_options(options: SolverConfig, dtype: torch.dtype) -> Certifica
     )
 
 
+@dataclass(slots=True)
+class _IterateState:
+    """A primal point and only the dual/certificate state valid at that point.
+
+    Records hold existing tensors, never clone dense edge arrays. A rejected
+    proposal retains the old record; damping creates a primal-only record.
+    """
+    phi: torch.Tensor
+    dual: torch.Tensor | None
+    dual_kkt: torch.Tensor | None
+    certificate: DenseEdgeCertificate | CompressedEdgeCertificate | None
+    warm_state: DenseWarmState | PrimalOnlyWarmState
+    backend_name: str
+    dual_start_is_actual: bool
+    objective: float
+    fit_loss: float
+    terms: TorchObservedTerms
+
+
 def _fit_from_start(
     problem: PreparedProblem,
     lambda_value: float,
@@ -1523,7 +1392,7 @@ def _fit_from_start(
     attempt: _StartAttempt,
 ) -> RawFit:
     data, model, runtime = problem.source_data, problem.model, problem.runtime
-    graph, tensor_graph = problem.graph_spec, problem.graph
+    tensor_graph = problem.graph
     lower, upper = problem.lower, problem.upper
     graph_hash, objective_spec_hash = problem.graph_hash, problem.objective_spec_hash
     base_objective_key = problem.base_objective_key
@@ -1559,10 +1428,6 @@ def _fit_from_start(
         requested=bool(options.use_backward_error_progress),
         runtime_dtype=runtime.dtype,
     )
-    use_alm = bool(
-        tensor_graph.is_complete
-        and int(graph.degree_bound) == max(int(data.num_mutations) - 1, 1)
-    )
     edge_u, edge_v, edge_w = (
         tensor_graph.edge_u,
         tensor_graph.edge_v,
@@ -1570,12 +1435,8 @@ def _fit_from_start(
     )
     if lambda_value <= 0.0 or int(edge_u.numel()) == 0:
         dense_inner_solver = "closed_form_projection"
-    elif use_alm:
-        # The complete-graph ALM backend is the scaled-dual ADMM algorithm:
-        # group shrinkage, constrained phi update, then dual ascent.
-        dense_inner_solver = "admm_complete_graph"
     else:
-        dense_inner_solver = "pdhg"
+        dense_inner_solver = "admm_complete_graph"
     inner_solver = dense_inner_solver
     if (
         solver_state is not None
@@ -1624,7 +1485,7 @@ def _fit_from_start(
             else None
         )
     )
-    dual_start_is_actual = bool(use_alm and state_dual is not None)
+    dual_start_is_actual = bool(state_dual is not None)
     converged = False
     converged_outer = False
     iterations = 0
@@ -1660,20 +1521,26 @@ def _fit_from_start(
             lambda_value=lambda_value,
         )
     )
+    iterate = _IterateState(
+        phi, dual, dual_kkt, certificate, warm_state, inner_solver,
+        dual_start_is_actual, objective, fit_loss, current_mutation_region_terms,
+    )
+    del phi, dual, dual_kkt, certificate, warm_state, inner_solver
+    del dual_start_is_actual, objective, fit_loss, current_mutation_region_terms
     for outer_iter in range(max(int(outer_max_iter), 1)):
         iterations = outer_iter + 1
-        previous_phi = phi.clone()
-        previous_objective = objective
+        previous_phi = iterate.phi.clone()
+        previous_objective = iterate.objective
         if use_unimodal_objective:
-            surrogate_terms = current_mutation_region_terms
-            surrogate_fit_loss = float(fit_loss)
+            surrogate_terms = iterate.terms
+            surrogate_fit_loss = float(iterate.fit_loss)
         else:
-            responsibilities = current_mutation_region_terms.posterior
+            responsibilities = iterate.terms.posterior
             if responsibilities is None:
                 raise AssertionError("Observed terms lack candidate responsibilities.")
             surrogate_terms = observed_em_terms_torch(
                 model,
-                phi,
+                iterate.phi,
                 responsibilities=responsibilities,
                 eps=eps,
             )
@@ -1687,23 +1554,23 @@ def _fit_from_start(
         else:
             smooth_lower, smooth_upper = _clipping_smooth_interval_bounds(
                 model,
-                phi,
+                iterate.phi,
                 lower=lower,
                 upper=upper,
                 eps=float(eps),
             )
         if require_full_step_backtracking:
-            forcing_certificate = certificate
+            forcing_certificate = iterate.certificate
             if forcing_certificate is None:
                 forcing_certificate = _compressed_certificate_for_primal(
-                    phi,
+                    iterate.phi,
                     graph_hash=graph_hash,
                     gradient_scope="observed_objective",
                 )
             forcing_gradient = build_certificate_gradient(
                 model,
-                phi=phi,
-                smooth_gradient=current_mutation_region_terms.gradient,
+                phi=iterate.phi,
+                smooth_gradient=iterate.terms.gradient,
                 lower=lower,
                 upper=upper,
                 eps=eps,
@@ -1711,7 +1578,7 @@ def _fit_from_start(
             )
             forcing_diag = certify(
                 problem=certificate_problem,
-                phi=phi,
+                phi=iterate.phi,
                 gradient=forcing_gradient,
                 witness=forcing_certificate,
                 refine=False,
@@ -1733,16 +1600,7 @@ def _fit_from_start(
         scale = 1.0
         curvature_multiplier = full_step_curvature_multiplier
         accepted = False
-        candidate_phi = phi
-        candidate_dual = dual
-        candidate_dual_kkt = dual_kkt
-        candidate_certificate = certificate
-        candidate_warm_state = warm_state
-        candidate_backend_name = inner_solver
-        candidate_dual_start_is_actual = dual_start_is_actual
-        candidate_objective = objective
-        candidate_fit_loss = fit_loss
-        candidate_mutation_region_terms = current_mutation_region_terms
+        candidate = iterate
         inner_converged = False
 
         curvature_attempts = (
@@ -1757,7 +1615,7 @@ def _fit_from_start(
                 else h_base * scale
             )
             U = _safe_majorized_center(
-                phi,
+                iterate.phi,
                 surrogate_grad=surrogate_grad,
                 h=h,
                 count_observed=model.observed,
@@ -1766,7 +1624,7 @@ def _fit_from_start(
                 q_current = None
             else:
                 q_current = _inner_model_value_torch(
-                    phi,
+                    iterate.phi,
                     U=U,
                     h=h,
                     edge_u=edge_u,
@@ -1776,20 +1634,19 @@ def _fit_from_start(
                 )
             recovery_inner_model_tol = (
                 max(
-                    64.0 * float(torch.finfo(phi.dtype).eps),
+                    64.0 * float(torch.finfo(iterate.phi.dtype).eps),
                     float(tol) ** 2,
                 )
                 * (1.0 + abs(float(q_current.item())))
                 if require_full_step_backtracking
                 else 0.0
             )
-            inner_phi_start = phi
-            inner_dual_start = dual
-            inner_dual_start_is_actual = dual_start_is_actual
+            inner_phi_start = iterate.phi
+            inner_dual_start = iterate.dual
+            inner_dual_start_is_actual = iterate.dual_start_is_actual
             inner_batch_limit = 8 if require_full_step_backtracking else 1
             for _inner_batch in range(inner_batch_limit):
                 inner_result = _solve_inner_subproblem(
-                    use_alm=use_alm,
                     runtime=runtime,
                     num_mutations=data.num_mutations,
                     U=U,
@@ -1800,7 +1657,6 @@ def _fit_from_start(
                     edge_u=edge_u,
                     edge_v=edge_v,
                     edge_w=edge_w,
-                    degree_bound=int(graph.degree_bound),
                     tol=tol,
                     inner_max_iter=inner_max_iter,
                     phi=inner_phi_start,
@@ -1808,15 +1664,12 @@ def _fit_from_start(
                     dual_start_is_actual=inner_dual_start_is_actual,
                     spectral_rho=bool(require_full_step_backtracking),
                     use_backward_error_stopping=use_backward_error_progress,
-                    pdhg_tau_node=tensor_graph.pdhg_tau_node,
                     backend_name=dense_inner_solver,
                     graph_hash=graph_hash,
                 )
                 inner_solve_calls += 1
                 total_inner_iterations += int(inner_result.iterations)
                 phi_trial = inner_result.phi
-                dense_warm_state = inner_result.warm_state
-                dual_trial = getattr(dense_warm_state, "dual", None)
                 surrogate_certificate = inner_result.surrogate_certificate
                 dual_kkt_trial = getattr(surrogate_certificate, "dual", None)
                 inner_ok = bool(inner_result.converged)
@@ -1852,9 +1705,9 @@ def _fit_from_start(
                     inner_ok = True
                     break
                 inner_phi_start = phi_trial
-                inner_dual_start = dual_kkt_trial if use_alm else dual_trial
-                inner_dual_start_is_actual = bool(use_alm)
-            delta = phi_trial - phi
+                inner_dual_start = dual_kkt_trial
+                inner_dual_start_is_actual = True
+            delta = phi_trial - iterate.phi
             trial_mutation_region_terms = observed_terms_torch(
                 model, phi_trial, eps=eps
             )
@@ -1911,7 +1764,7 @@ def _fit_from_start(
                     )
                     surrogate_gap = float(trial_surrogate_loss - majorizer_rhs)
                     em_envelope_gap = float(
-                        (trial_fit_loss - fit_loss)
+                        (trial_fit_loss - iterate.fit_loss)
                         - (trial_surrogate_loss - surrogate_fit_loss)
                     )
             finite_attempt = all(
@@ -1926,7 +1779,7 @@ def _fit_from_start(
                 ]
             )
             if require_full_step_backtracking:
-                numerical_factor = 64.0 * float(torch.finfo(phi.dtype).eps)
+                numerical_factor = 64.0 * float(torch.finfo(iterate.phi.dtype).eps)
                 inner_model_tol = max(numerical_factor, float(tol) ** 2) * (
                     1.0 + abs(float(q_current.item()))
                 )
@@ -1942,7 +1795,7 @@ def _fit_from_start(
                 )
                 majorization_tol = 1e-8 * (1.0 + abs(surrogate_fit_loss))
                 objective_tol = 1e-8 * (1.0 + abs(previous_objective))
-            envelope_tol = 1e-8 * (1.0 + abs(fit_loss))
+            envelope_tol = 1e-8 * (1.0 + abs(iterate.fit_loss))
             if not finite_attempt:
                 scale *= 2.0
                 if require_full_step_backtracking:
@@ -1982,19 +1835,12 @@ def _fit_from_start(
             ):
                 accepted = True
                 accepted_full_steps += 1
-                candidate_phi = phi_trial
-                # The complete-graph ADMM backend also returns the actual KKT
-                # multiplier y=rho*u. Carry y, not the rho-dependent scaled u,
-                # across outer MM subproblems because curvature changes rho.
-                candidate_dual = dual_kkt_trial if use_alm else dual_trial
-                candidate_dual_kkt = dual_kkt_trial
-                candidate_certificate = surrogate_certificate
-                candidate_warm_state = inner_result.warm_state
-                candidate_backend_name = inner_result.backend_name
-                candidate_dual_start_is_actual = bool(use_alm)
-                candidate_objective = trial_objective
-                candidate_fit_loss = trial_fit_loss
-                candidate_mutation_region_terms = trial_mutation_region_terms
+                # ALM returns actual y=rho*u; retain it across curvature changes.
+                candidate = _IterateState(
+                    phi_trial, dual_kkt_trial, dual_kkt_trial, surrogate_certificate,
+                    inner_result.warm_state, inner_result.backend_name, True,
+                    trial_objective, trial_fit_loss, trial_mutation_region_terms,
+                )
                 inner_converged = bool(
                     (
                         np.isfinite(float(inner_residual))
@@ -2024,10 +1870,10 @@ def _fit_from_start(
                 # If the resource limit is exhausted, leave this outer iterate
                 # unchanged and uncertified rather than interpolating phi.
                 delta_square = torch.square(delta)
-                resolution = torch.finfo(phi.dtype).eps * (1.0 + torch.square(phi))
+                resolution = torch.finfo(iterate.phi.dtype).eps * (1.0 + torch.square(iterate.phi))
                 secant_remainder = (
                     trial_mutation_region_terms.loss
-                    - current_mutation_region_terms.loss
+                    - iterate.terms.loss
                     - surrogate_grad * delta
                 )
                 required_h = torch.where(
@@ -2036,7 +1882,7 @@ def _fit_from_start(
                     * torch.clamp(secant_remainder, min=0.0)
                     / torch.clamp(
                         delta_square,
-                        min=torch.finfo(phi.dtype).tiny,
+                        min=torch.finfo(iterate.phi.dtype).tiny,
                     ),
                     h,
                 )
@@ -2054,7 +1900,7 @@ def _fit_from_start(
                     torch.any(
                         proposed_multiplier
                         > curvature_multiplier
-                        * (1.0 + 64.0 * torch.finfo(phi.dtype).eps)
+                        * (1.0 + 64.0 * torch.finfo(iterate.phi.dtype).eps)
                     ).item()
                 )
                 if changed:
@@ -2078,7 +1924,7 @@ def _fit_from_start(
             theta = 0.5
             damped_accepted = False
             for _line_search_iter in range(12):
-                phi_theta = phi + theta * delta
+                phi_theta = iterate.phi + theta * delta
                 theta_mutation_region_terms = observed_terms_torch(
                     model, phi_theta, eps=eps
                 )
@@ -2099,21 +1945,14 @@ def _fit_from_start(
                     accepted = True
                     damped_accepted = True
                     accepted_damped_steps += 1
-                    candidate_phi = phi_theta
-                    (
-                        candidate_dual,
-                        candidate_dual_kkt,
-                        candidate_certificate,
-                        candidate_warm_state,
-                        candidate_dual_start_is_actual,
-                    ) = _invalidate_damped_trial_state(
-                        phi=phi_theta,
-                        trial_warm_state=inner_result.warm_state,
+                    damped_state = _invalidate_damped_trial_state(
+                        phi=phi_theta, trial_warm_state=inner_result.warm_state,
                     )
-                    candidate_backend_name = inner_result.backend_name
-                    candidate_objective = theta_objective
-                    candidate_fit_loss = theta_fit_loss
-                    candidate_mutation_region_terms = theta_mutation_region_terms
+                    candidate = _IterateState(
+                        phi_theta, *damped_state[:4], inner_result.backend_name,
+                        damped_state[4], theta_objective, theta_fit_loss,
+                        theta_mutation_region_terms,
+                    )
                     inner_converged = False
                     break
                 theta *= 0.5
@@ -2123,39 +1962,20 @@ def _fit_from_start(
 
         if not accepted:
             rejected_outer_steps += 1
-            candidate_phi = phi
-            candidate_dual = dual
-            candidate_dual_kkt = dual_kkt
-            candidate_certificate = certificate
-            candidate_warm_state = warm_state
-            candidate_backend_name = inner_solver
-            candidate_dual_start_is_actual = dual_start_is_actual
-            candidate_objective = objective
-            candidate_fit_loss = fit_loss
-            candidate_mutation_region_terms = current_mutation_region_terms
-        phi = candidate_phi
-        dual = candidate_dual
-        dual_kkt = candidate_dual_kkt
-        certificate = candidate_certificate
-        warm_state = candidate_warm_state
-        inner_solver = candidate_backend_name
-        dual_start_is_actual = candidate_dual_start_is_actual
-        objective = candidate_objective
-        fit_loss = candidate_fit_loss
-        current_mutation_region_terms = candidate_mutation_region_terms
-        penalty = objective - fit_loss
+        iterate = candidate
+        penalty = iterate.objective - iterate.fit_loss
         if verbose:
             print(
-                f"[pairwise-fusion:{runtime.device_name}] iter={iterations:02d} objective={objective:.6f} "
-                f"fit={fit_loss:.6f} penalty={penalty:.6f}"
+                f"[pairwise-fusion:{runtime.device_name}] iter={iterations:02d} objective={iterate.objective:.6f} "
+                f"fit={iterate.fit_loss:.6f} penalty={penalty:.6f}"
             )
 
-        rel_change = abs(previous_objective - objective) / (
+        rel_change = abs(previous_objective - iterate.objective) / (
             1.0 + abs(previous_objective)
         )
         step_residual = float(
             (
-                torch.linalg.norm(phi - previous_phi)
+                torch.linalg.norm(iterate.phi - previous_phi)
                 / (1.0 + torch.linalg.norm(previous_phi))
             ).item()
         )
@@ -2166,27 +1986,27 @@ def _fit_from_start(
             cheap_outer_converged
             or iterations >= max(int(outer_max_iter), 1)
             or iterations % _OUTER_KKT_CHECK_EVERY == 0
-            or not np.isfinite(objective)
+            or not np.isfinite(iterate.objective)
         )
         outer_converged = False
         if do_outer_kkt_audit:
-            outer_terms = current_mutation_region_terms
-            observed_start = certificate
-            if observed_start is None and isinstance(warm_state, PrimalOnlyWarmState):
+            outer_terms = iterate.terms
+            observed_start = iterate.certificate
+            if observed_start is None and isinstance(iterate.warm_state, PrimalOnlyWarmState):
                 observed_start = _rebase_certificate_hint(
-                    warm_state.certificate_hint,
-                    phi=phi,
+                    iterate.warm_state.certificate_hint,
+                    phi=iterate.phi,
                     graph=tensor_graph,
                     graph_hash=graph_hash,
                     lambda_value=lambda_value,
                 )
             should_refine = bool(
-                certificate is None
+                iterate.certificate is None
                 or isinstance(observed_start, CompressedEdgeCertificate)
             )
             periodic_gradient = build_certificate_gradient(
                 model,
-                phi,
+                iterate.phi,
                 smooth_gradient=outer_terms.gradient,
                 lower=lower,
                 upper=upper,
@@ -2199,7 +2019,7 @@ def _fit_from_start(
             )
             observed_refinement = certify(
                 problem=certificate_problem,
-                phi=phi,
+                phi=iterate.phi,
                 gradient=periodic_gradient,
                 witness=observed_start,
                 refine=should_refine,
@@ -2212,7 +2032,7 @@ def _fit_from_start(
             )
             if should_refine:
                 work_counters = work_counters + observed_refinement.work_counters
-            certificate = observed_refinement.certificate
+            iterate.certificate = observed_refinement.certificate
             outer_diag = observed_refinement.diagnostics
             legacy_stop_kkt_residual = float(outer_diag.kkt_residual)
             componentwise_stop_kkt_residual = float(
@@ -2243,18 +2063,18 @@ def _fit_from_start(
             )
             break
 
-    final_terms = current_mutation_region_terms
-    if certificate is None and isinstance(warm_state, PrimalOnlyWarmState):
-        certificate = _rebase_certificate_hint(
-            warm_state.certificate_hint,
-            phi=phi,
+    final_terms = iterate.terms
+    if iterate.certificate is None and isinstance(iterate.warm_state, PrimalOnlyWarmState):
+        iterate.certificate = _rebase_certificate_hint(
+            iterate.warm_state.certificate_hint,
+            phi=iterate.phi,
             graph=tensor_graph,
             graph_hash=graph_hash,
             lambda_value=lambda_value,
         )
     certificate_gradient = build_certificate_gradient(
         model,
-        phi,
+        iterate.phi,
         smooth_gradient=final_terms.gradient,
         lower=lower,
         upper=upper,
@@ -2266,23 +2086,23 @@ def _fit_from_start(
     for _ in range(4):
         final_certificate_refinement = certify(
             problem=certificate_problem,
-            phi=phi,
+            phi=iterate.phi,
             gradient=certificate_gradient,
-            witness=certificate,
+            witness=iterate.certificate,
             refine=True,
             max_iter=int(certificate_options.max_iter),
             options=(
                 certificate_options
-                if isinstance(certificate, CompressedEdgeCertificate)
+                if isinstance(iterate.certificate, CompressedEdgeCertificate)
                 else None
             ),
         )
         work_counters = work_counters + final_certificate_refinement.work_counters
-        certificate = final_certificate_refinement.certificate
+        iterate.certificate = final_certificate_refinement.certificate
         certificate_needs_final_pass = False
         if not bool(torch.any(certificate_gradient.at_breakpoint).item()):
             break
-        interval_dual = getattr(certificate, "dual", None)
+        interval_dual = getattr(iterate.certificate, "dual", None)
         if not torch.is_tensor(interval_dual):
             # A selected endpoint gradient is already a valid member of the
             # subgradient interval; compressed certificates simply cannot
@@ -2292,12 +2112,12 @@ def _fit_from_start(
             interval_dual,
             edge_u=edge_u,
             edge_v=edge_v,
-            num_nodes=int(phi.shape[0]),
+            num_nodes=int(iterate.phi.shape[0]),
         )
         del interval_dual
         next_gradient = build_certificate_gradient(
             model,
-            phi,
+            iterate.phi,
             smooth_gradient=final_terms.gradient,
             lower=lower,
             upper=upper,
@@ -2318,24 +2138,24 @@ def _fit_from_start(
     if certificate_needs_final_pass:
         final_certificate_refinement = certify(
             problem=certificate_problem,
-            phi=phi,
+            phi=iterate.phi,
             gradient=certificate_gradient,
-            witness=certificate,
+            witness=iterate.certificate,
             refine=True,
             max_iter=int(certificate_options.max_iter),
             options=(
                 certificate_options
-                if isinstance(certificate, CompressedEdgeCertificate)
+                if isinstance(iterate.certificate, CompressedEdgeCertificate)
                 else None
             ),
         )
         work_counters = work_counters + final_certificate_refinement.work_counters
-    certificate = final_certificate_refinement.certificate
+    iterate.certificate = final_certificate_refinement.certificate
     working_precision_kkt_residual = float(
         final_certificate_refinement.diagnostics.backward_error_kkt_residual
     )
     certificate_audit_dtype = dtype_name(runtime.dtype)
-    authoritative_objective = float(objective)
+    authoritative_objective = float(iterate.objective)
     gradient_scope = certificate_gradient.scope
     directional_kink_admissible = certificate_gradient.directional_admissible
     if runtime.dtype == torch.float64:
@@ -2348,8 +2168,8 @@ def _fit_from_start(
             authoritative_objective,
         ) = _terminal_backward_error_audit_float64(
             problem=problem,
-            phi=phi,
-            certificate=certificate,
+            phi=iterate.phi,
+            certificate=iterate.certificate,
             lambda_value=lambda_value,
             tol=cert_tol,
         )
@@ -2367,7 +2187,7 @@ def _fit_from_start(
     )
     if not np.isfinite(float(authoritative_objective)):
         outer_stop_reason = "nonfinite_objective"
-    final_dual = getattr(certificate, "dual", None)
+    final_dual = getattr(iterate.certificate, "dual", None)
     outer_kkt_certificate_status = str(final_certificate_refinement.status)
     converged_outer = bool(authoritative_kkt_residual <= 5.0 * cert_tol)
     valid_dual_certificate = outer_kkt_certificate_status in {
@@ -2408,26 +2228,26 @@ def _fit_from_start(
     if use_unimodal_objective and global_optimality_certified:
         converged = True
 
-    phi_np = phi.detach().cpu().numpy()
-    if isinstance(certificate, CompressedEdgeCertificate):
+    phi_np = iterate.phi.detach().cpu().numpy()
+    if isinstance(iterate.certificate, CompressedEdgeCertificate):
         terminal_warm_state = PrimalOnlyWarmState(
-            phi=phi.detach(),
-            structure_hint=certificate.labels.detach(),
-            certificate_hint=certificate,
+            phi=iterate.phi.detach(),
+            structure_hint=iterate.certificate.labels.detach(),
+            certificate_hint=iterate.certificate,
         )
     else:
         terminal_warm_state = DenseWarmState(
-            phi=phi.detach(),
+            phi=iterate.phi.detach(),
             dual=final_dual.detach() if torch.is_tensor(final_dual) else None,
             previous_lambda=float(lambda_value),
             graph_hash=str(graph_hash),
         )
     solver_state_out = SolverState(
-        phi=phi.detach(),
+        phi=iterate.phi.detach(),
         dual=final_dual.detach() if torch.is_tensor(final_dual) else None,
         previous_lambda=float(lambda_value),
         warm_state=terminal_warm_state,
-        certificate=certificate,
+        certificate=iterate.certificate,
         objective_spec_hash=str(objective_spec_hash),
     )
     terminal_components = KKTComponents(
@@ -2460,7 +2280,7 @@ def _fit_from_start(
             scope="full_original_graph",
             gradient_scope=str(gradient_scope),
             directional_admissible=bool(directional_kink_admissible),
-            witness=certificate,
+            witness=iterate.certificate,
             working_residual=float(working_precision_kkt_residual),
             working_dtype=dtype_name(runtime.dtype),
             audit_dtype=str(certificate_audit_dtype),
@@ -2498,7 +2318,7 @@ def _fit_from_start(
             source_data_hash=problem.data_fingerprint,
             device=runtime.device_name,
             dtype=dtype_name(runtime.dtype),
-            inner_solver=str(inner_solver),
+            inner_solver=str(iterate.backend_name),
             global_optimality_basis=str(global_optimality_basis),
             scalar_pilot_certificates=problem.scalar_pilot_certificates,
             multiplicity_policy=problem.source_model.support_policy,
@@ -2526,8 +2346,6 @@ def fit_prepared(
     _certificate_options(solver_options, problem.runtime.dtype)
     lambda_value = validate_lambda_value(lambda_value)
     objective_shape = objective_shape_for_data(data, solver_options.objective_shape)
-    normalized_fallback_policy = normalize_dense_fallback_policy(problem.fallback_policy)
-    context_prepared_by_cpu_fallback = problem.resource_fallback == "dense_cpu"
     effective_runtime = problem.runtime
 
     attempts: list[_StartAttempt] = []
@@ -2559,218 +2377,36 @@ def fit_prepared(
             runtime=effective_runtime, shape=tuple(problem.lower.shape), atol=0.0,
         )
 
-    cpu_fallback_context: PreparedProblem | None = None
+    if data.num_mutations > 1 and (
+        not problem.graph.is_complete
+        or problem.graph_spec.degree_bound != data.num_mutations - 1
+    ):
+        raise ValueError("Raw fitting requires the frozen complete graph.")
     best_artifacts: RawFit | None = None
-    selected_start_context: PreparedProblem | None = None
-    for start_attempt in attempts:
-        cpu_seed = start_attempt.phi
-        attempted_artifacts: RawFit | None = None
-        attempt_context = problem
-        current_attempt = start_attempt
-        fallback_reason = ""
-        fallback_backend: str | None = None
-        policy_state = PolicyState(
-            phase="working",
-            runtime_device_type=attempt_context.runtime.device.type,
-            fallback_policy=normalized_fallback_policy,
-        )
-        while True:
-            action = decide_next_action(policy_state)
-            match action:
-                case NextAction.RETRY_SAME_RUNTIME:
-                    try:
-                        artifacts = _fit_from_start(
-                            attempt_context, lambda_value, solver_options, current_attempt,
-                        )
-                    except (MemoryError, torch.OutOfMemoryError) as exc:
-                        policy_state.result = None
-                        policy_state.resource_error = exc
-                        continue
-                    policy_state.result = record_attempt(
-                        artifacts,
-                        attempted=attempted_artifacts,
-                        reason=fallback_reason,
-                        backend_name=fallback_backend,
-                    )
-                    policy_state.resource_error = None
-                case NextAction.DENSE_CURRENT_DEVICE:
-                    attempted_artifacts = policy_state.result
-                    if attempted_artifacts is None:
-                        raise AssertionError("Dense retry lacks an attempted fit.")
-                    cpu_seed = (
-                        attempted_artifacts.state.phi
-                        if attempted_artifacts.state is not None
-                        else attempted_artifacts.phi
-                    )
-                    current_attempt = _StartAttempt(cpu_seed, None, "dense_retry")
-                    fallback_reason = (
-                        "dense_current_device_after_compressed_not_certified"
-                    )
-                    fallback_backend = None
-                    policy_state.result = None
-                    policy_state.representation_retry_done = True
-                case NextAction.CPU_FALLBACK:
-                    resource_exc = policy_state.resource_error
-                    if resource_exc is None:
-                        raise AssertionError("CPU fallback lacks a resource failure.")
-                    if cpu_fallback_context is None:
-                        cpu_runtime = resolve_runtime(
-                            "cpu", dtype=dtype_name(effective_runtime.dtype)
-                        )
-                        _require_dense_memory(
-                            data,
-                            cpu_runtime,
-                            operation="dense CPU fallback",
-                            limit_name="host limit",
-                            cause=resource_exc,
-                        )
-                        try:
-                            cpu_fallback_context = promote_solver_context_dtype(
-                                problem,
-                                dtype=cpu_runtime.dtype,
-                                device=cpu_runtime.device,
-                                start_override=cpu_seed,
-                            )
-                        except (MemoryError, torch.OutOfMemoryError) as cpu_exc:
-                            raise ExactSolverResourceLimit(
-                                "exact_solver_resource_limit: exact problem or graph "
-                                "construction exhausted host memory during dense CPU "
-                                "fallback."
-                            ) from cpu_exc
-                        cpu_start = cpu_fallback_context.exact_pilot
-                    else:
-                        cpu_start = (
-                            cpu_seed.detach().cpu()
-                            if torch.is_tensor(cpu_seed)
-                            else np.asarray(cpu_seed)
-                        )
-                    attempt_context = cpu_fallback_context
-                    current_attempt = _StartAttempt(cpu_start, None, "cpu_fallback")
-                    fallback_reason = "dense_cpu_after_solver_resource_limit"
-                    fallback_backend = "admm_complete_graph_cpu_fallback"
-                    policy_state.result = None
-                    policy_state.resource_error = None
-                    policy_state.runtime_device_type = "cpu"
-                    policy_state.representation_retry_done = True
-                    # The exception traceback can own failed GPU edge states.
-                    # Once fallback construction succeeds it has no consumer.
-                    del resource_exc
-                case NextAction.ACCEPT:
-                    artifacts = policy_state.result
-                    if artifacts is None:
-                        raise AssertionError("Accepted policy state lacks a fit.")
-                    if context_prepared_by_cpu_fallback:
-                        artifacts = record_attempt(
-                            artifacts,
-                            reason="dense_cpu_after_context_resource_limit",
-                            backend_name="admm_complete_graph_cpu_fallback",
-                        )
-                    artifacts_context = attempt_context
-                    break
-                case NextAction.FAIL:
-                    if policy_state.resource_error is None:
-                        raise ExactSolverResourceLimit(
-                            "exact_solver_resource_limit: quotient/workset did not "
-                            "produce an accepted terminal observed-objective "
-                            "certificate and dense fallback is disabled by policy."
-                        )
-                    resource_exc = policy_state.resource_error
-                    if isinstance(resource_exc, ExactSolverResourceLimit):
-                        raise resource_exc
-                    raise ExactSolverResourceLimit(
-                        "exact_solver_resource_limit: exact solver allocation "
-                        f"exhausted memory on {effective_runtime.device_name}."
-                    ) from resource_exc
-                case NextAction.FLOAT64_POLISH:
-                    raise AssertionError("Working-fit policy requested polishing.")
+    for attempt in attempts:
+        try:
+            artifacts = _fit_from_start(problem, lambda_value, solver_options, attempt)
+        except (MemoryError, torch.OutOfMemoryError) as exc:
+            if isinstance(exc, ExactSolverResourceLimit):
+                raise
+            raise ExactSolverResourceLimit(
+                "exact_solver_resource_limit: exact solver allocation "
+                f"exhausted memory on {effective_runtime.device_name}."
+            ) from exc
         if best_artifacts is None or _prefer_multistart_fit(artifacts, best_artifacts):
             best_artifacts = artifacts
-            selected_start_context = artifacts_context
-        # Drop all local aliases before entering the next solve, including the
-        # policy result and dense-retry predecessor's edge states.
-        del artifacts, artifacts_context, attempted_artifacts, policy_state
-        del attempt_context, current_attempt, cpu_seed
-
-    if best_artifacts is None or selected_start_context is None:
+        del artifacts
+    if best_artifacts is None:
         raise RuntimeError("No valid start produced a fusion fit.")
-    working_artifacts = best_artifacts
-    polish_options = replace(solver_options, outer_max_iter=1)
-    precision_context: PreparedProblem | None = None
-    precision_on_cpu = False
-    policy_state = PolicyState(
-        phase="selected",
-        result=best_artifacts,
-        runtime_device_type=selected_start_context.runtime.device.type,
-        fallback_policy=normalized_fallback_policy,
+    if not needs_precision_polish(best_artifacts):
+        return best_artifacts
+    precision_context = _float64_context(data, problem)
+    polished = _fit_from_start(
+        precision_context, lambda_value, replace(solver_options, outer_max_iter=1),
+        _StartAttempt(
+            torch.tensor(best_artifacts.phi, dtype=torch.float64,
+                         device=precision_context.runtime.device),
+            best_artifacts.state, "precision_polish",
+        ),
     )
-    while True:
-        action = decide_next_action(policy_state)
-        match action:
-            case NextAction.FLOAT64_POLISH:
-                try:
-                    precision_context = _float64_context(
-                        data, selected_start_context
-                    )
-                except (MemoryError, torch.OutOfMemoryError) as polish_exc:
-                    policy_state.phase = "precision_polish"
-                    policy_state.resource_error = polish_exc
-                    continue
-                policy_state.phase = "precision_polish"
-                policy_state.result = None
-                policy_state.resource_error = None
-            case NextAction.RETRY_SAME_RUNTIME:
-                if precision_context is None:
-                    raise AssertionError("Precision retry lacks a promoted context.")
-                try:
-                    polished = _fit_from_start(
-                        precision_context, lambda_value, polish_options,
-                        _StartAttempt(
-                            torch.tensor(
-                                working_artifacts.phi,
-                                dtype=torch.float64,
-                                device=precision_context.runtime.device,
-                            ),
-                            working_artifacts.state,
-                            "precision_polish",
-                        ),
-                    )
-                except (MemoryError, torch.OutOfMemoryError) as polish_exc:
-                    policy_state.result = None
-                    policy_state.resource_error = polish_exc
-                    continue
-                polished = _finalize_precision_polish(
-                    polished,
-                    working_artifacts,
-                    selected_start_context,
-                    on_cpu=precision_on_cpu,
-                )
-                policy_state.result = polished
-                policy_state.resource_error = None
-            case NextAction.CPU_FALLBACK:
-                polish_exc = policy_state.resource_error
-                if polish_exc is None:
-                    raise AssertionError("CPU polish lacks a resource failure.")
-                cpu_device = resolve_runtime("cpu", dtype="float64").device
-                precision_context = _float64_context(
-                    data,
-                    selected_start_context,
-                    device=cpu_device,
-                    cause=polish_exc,
-                )
-                precision_on_cpu = True
-                policy_state.result = None
-                policy_state.resource_error = None
-                policy_state.runtime_device_type = "cpu"
-                del polish_exc
-            case NextAction.ACCEPT:
-                if policy_state.result is None:
-                    raise AssertionError("Accepted precision state lacks a fit.")
-                best_artifacts = policy_state.result
-                break
-            case NextAction.FAIL:
-                if policy_state.resource_error is None:
-                    raise AssertionError("Precision policy failed without a cause.")
-                raise policy_state.resource_error
-            case NextAction.DENSE_CURRENT_DEVICE:
-                raise AssertionError("Precision policy requested a dense retry.")
-    return best_artifacts
+    return _finalize_precision_polish(polished, best_artifacts, problem)
