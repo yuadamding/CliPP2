@@ -27,6 +27,7 @@ from ..core.fusion.types import (
     SolverState,
 )
 from ..io.data import TumorData
+from ..core.scalar import _RefitCoordinateCache
 
 from ..model_selection.candidates import (
     PartitionRefitCacheEntry,
@@ -526,6 +527,8 @@ class _SearchState:
     partition_k_by_lambda: dict[float, int] = field(default_factory=dict)
     recovery_fit_by_lambda: dict[float, RawFit] = field(default_factory=dict)
     bic_refit_cache: dict[object, PartitionRefitCacheEntry] = field(default_factory=dict)
+    # Shared across raw and direct partitions, bounded and owned by this tumor.
+    refit_coordinate_cache: _RefitCoordinateCache = field(default_factory=_RefitCoordinateCache)
     next_step: int = 0
     recovery_context: PreparedProblem | None = None
     recovery_status: str = "not_requested"
@@ -809,14 +812,12 @@ def _solve_raw_proposal(
             raise AssertionError(
                 "Raw multistart changed the fixed objective identity."
             )
-        seed_fit = _offload_raw_fit_to_cpu(seed_fit)
         recovery_fit = search.recovery_fit_by_lambda.get(lambda_key)
         residual = float(seed_fit.certificate.components.residual)
-        if seed_fit.state is not None and np.isfinite(residual) and (
+        retain_recovery = seed_fit.state is not None and np.isfinite(residual) and (
             recovery_fit is None
             or residual < float(recovery_fit.certificate.components.residual)
-        ):
-            search.recovery_fit_by_lambda[lambda_key] = seed_fit
+        )
         mathematically_certified = bool(
             float(seed_fit.provenance.lambda_value) > 0.0
             and seed_fit.certificate.certified
@@ -837,9 +838,19 @@ def _solve_raw_proposal(
             certificate_max_iter=int(candidate_fit_options.solver.certificate.max_iter),
         )
         start_traces.append(trace)
-        if selected_attempt is None or _select_raw_start_attempt(
+        retain_selected = selected_attempt is None or _select_raw_start_attempt(
             [selected_attempt, raw_attempt]
-        ) is raw_attempt:
+        ) is raw_attempt
+        # Ranking and traces read scalar metadata only. Discarded attempts need
+        # no host copy of their O(E*S) dual/witness. Keep both incumbents host-
+        # backed, sharing one offload when a fit wins both rankings; this does
+        # not increase the number of resident GPU states between solves.
+        if retain_selected or retain_recovery:
+            seed_fit = _offload_raw_fit_to_cpu(seed_fit)
+        if retain_recovery:
+            search.recovery_fit_by_lambda[lambda_key] = seed_fit
+        if retain_selected:
+            raw_attempt = replace(raw_attempt, fit=seed_fit)
             selected_attempt, selected_trace = raw_attempt, trace
         del seed_fit, raw_attempt, recovery_fit
     if selected_attempt is None or selected_trace is None:
@@ -1015,6 +1026,7 @@ def _partition_guided_admm_selection(
             fit_options=effective_fit_options,
             lambda_value=float(proposal.lambda_value),
             bic_refit_cache=search.bic_refit_cache,
+            coordinate_cache=search.refit_coordinate_cache,
             precomputed_fit=selected_raw_fit,
             source_model=base_solver_context.source_model,
         )
@@ -1164,6 +1176,7 @@ def _partition_guided_admm_selection(
                 else _pilot_matrix_hash(parent_raw.raw_fit.phi)
             ),
             refit_cache=search.bic_refit_cache,
+            coordinate_cache=search.refit_coordinate_cache,
             source_model=base_solver_context.source_model,
         )
         search.result_entries.append(

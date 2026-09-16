@@ -207,18 +207,17 @@ def _scalar_terms(
 def scalar_breakpoints(
     problem: ScalarProblem, *, observed_only: bool = True
 ) -> np.ndarray:
-    points = [problem.lower, problem.upper]
-    rows = np.flatnonzero(problem.observed) if observed_only else range(problem.alt.size)
-    for row in rows:
-        for candidate in np.flatnonzero(problem.valid[row]):
-            slope = float(problem.slope[row, candidate])
-            for target in (problem.eps, 1.0 - problem.eps):
-                if slope > 0.0:
-                    value = target / slope
-                    if problem.lower < value < problem.upper:
-                        points.append(value)
+    valid = problem.valid & (problem.slope > 0.0)
+    if observed_only:
+        valid &= problem.observed[:, None]
+    slopes = problem.slope[valid]
+    # Each valid path has at most two clipping breakpoints. Vectorization keeps
+    # the same float64 divisions and sorted unique values as the scalar loop.
+    values = np.array([problem.eps, 1.0 - problem.eps])[:, None] / slopes
+    interior = values[(problem.lower < values) & (values < problem.upper)]
+    points = np.concatenate(([problem.lower, problem.upper], interior))
     return np.unique(
-        np.clip(np.asarray(points, dtype=np.float64), problem.lower, problem.upper)
+        np.clip(points, problem.lower, problem.upper)
     )
 
 
@@ -750,7 +749,6 @@ def partition_constrained_observed_refit(
     finite_coordinates = 0
     boundary_count = 0
     active_df = 0
-    coordinate_tolerance = tolerance / max(n_clusters * n_regions, 1)
     boundary_tolerance = max(10.0 * tolerance, 1e-8)
 
     for cluster in range(n_clusters):
@@ -764,7 +762,12 @@ def partition_constrained_observed_refit(
                 upper = lower
             key = None if _coordinate_cache is None else _RefitCoordinateKey(
                 tumor_data_fingerprint(data), model.fingerprint, member_key, region,
-                lower, upper, epsilon, "grid_local", coordinate_tolerance, int(max_iter),
+                # Grid/local solves consume neither tol nor max_iter. In
+                # particular, K-dependent tolerance must not prevent reuse
+                # of an unchanged cluster across adjacent Ward cuts. The
+                # tolerance-dependent boundary summaries are rebuilt below;
+                # guide certificates retain their own tolerance/budget key.
+                lower, upper, epsilon, "grid_local", 0.0, 0,
                 int(scalar_grid_points), int(scalar_local_steps), True,
             )
             coordinate = None if key is None else _coordinate_cache.get(key)
