@@ -14,6 +14,12 @@ from ..io.data import ImmutableArrayRecord, TumorData, readonly_array, tumor_dat
 from .objective import ObservedModel, candidate_terms_numpy, compile_observed_model
 
 
+# Bound candidate-dependent temporaries only once their size warrants dispatch.
+# These are implementation limits, not likelihood or search configuration.
+_SCALAR_GRID_CHUNK_SIZE = 32
+_SCALAR_GRID_MIN_CELLS = 131_072
+
+
 @dataclass(frozen=True, slots=True)
 class ScalarProblem(ImmutableArrayRecord):
     """One cluster-region slice of a canonical observed model."""
@@ -213,36 +219,32 @@ def _scalar_terms(
     if not alt.size:
         loss = np.zeros(flat.size, dtype=np.float64)
         gradient = np.zeros_like(loss) if with_gradient else None
+    elif (
+        flat.size > _SCALAR_GRID_CHUNK_SIZE + 1
+        and alt.size * flat.size * candidate_slope.shape[1] >= _SCALAR_GRID_MIN_CELLS
+    ):
+        loss = np.empty(flat.size, dtype=np.float64)
+        gradient = np.empty_like(loss) if with_gradient else None
+        start = 0
+        while start < flat.size:
+            stop = min(start + _SCALAR_GRID_CHUNK_SIZE, flat.size)
+            # A singleton tail changes NumPy's mutation-axis reduction layout.
+            # Keep every multi-point block at least two columns wide instead.
+            if flat.size - stop == 1:
+                stop += 1
+            block_loss, block_gradient = _scalar_terms_block(
+                problem, flat[start:stop], alt, nonalt, candidate_slope, log_prior,
+                valid, with_gradient=with_gradient,
+            )
+            loss[start:stop] = block_loss
+            if gradient is not None:
+                gradient[start:stop] = block_gradient
+            start = stop
     else:
-        candidate = flat[None, :, None]
-        candidate_slope = candidate_slope[:, None, :]
-        mass = candidate_slope * candidate
-        probability = np.clip(mass, problem.eps, 1.0 - problem.eps)
-        valid = valid[:, None, :]
-        slope = np.where(
-            (mass > problem.eps) & (mass < 1.0 - problem.eps), candidate_slope, 0.0,
-        ) if with_gradient else None
-        log_kernel, state_score, _ = candidate_terms_numpy(
-            alt[:, None, None], nonalt[:, None, None],
-            probability, slope, derivative_order=int(with_gradient),
+        loss, gradient = _scalar_terms_block(
+            problem, flat, alt, nonalt, candidate_slope, log_prior, valid,
+            with_gradient=with_gradient,
         )
-        joint = log_kernel + log_prior[:, None, :]
-        del log_kernel
-        joint = np.where(valid, joint, -np.inf)
-        log_normalizer = np.logaddexp.reduce(joint, axis=-1)
-        loss = -np.sum(log_normalizer, axis=0, dtype=np.float64)
-        gradient = None
-        if with_gradient:
-            posterior = np.where(
-                valid,
-                np.exp(joint - log_normalizer[..., None]),
-                0.0,
-            )
-            gradient = -np.sum(
-                posterior * state_score,
-                axis=(0, 2),
-                dtype=np.float64,
-            )
     loss_out: float | np.ndarray = (
         float(loss[0]) if scalar else loss.reshape(values.shape)
     )
@@ -252,6 +254,51 @@ def _scalar_terms(
         float(gradient[0]) if scalar else gradient.reshape(values.shape)
     )
     return loss_out, gradient_out
+
+
+def _scalar_terms_block(
+    problem: ScalarProblem,
+    flat: np.ndarray,
+    alt: np.ndarray,
+    nonalt: np.ndarray,
+    candidate_slope: np.ndarray,
+    log_prior: np.ndarray,
+    valid: np.ndarray,
+    *,
+    with_gradient: bool,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Evaluate all observed rows and candidates for consecutive grid values."""
+
+    candidate = flat[None, :, None]
+    candidate_slope = candidate_slope[:, None, :]
+    mass = candidate_slope * candidate
+    probability = np.clip(mass, problem.eps, 1.0 - problem.eps)
+    valid = valid[:, None, :]
+    slope = np.where(
+        (mass > problem.eps) & (mass < 1.0 - problem.eps), candidate_slope, 0.0,
+    ) if with_gradient else None
+    log_kernel, state_score, _ = candidate_terms_numpy(
+        alt[:, None, None], nonalt[:, None, None],
+        probability, slope, derivative_order=int(with_gradient),
+    )
+    joint = log_kernel + log_prior[:, None, :]
+    del log_kernel
+    joint = np.where(valid, joint, -np.inf)
+    log_normalizer = np.logaddexp.reduce(joint, axis=-1)
+    loss = -np.sum(log_normalizer, axis=0, dtype=np.float64)
+    gradient = None
+    if with_gradient:
+        posterior = np.where(
+            valid,
+            np.exp(joint - log_normalizer[..., None]),
+            0.0,
+        )
+        gradient = -np.sum(
+            posterior * state_score,
+            axis=(0, 2),
+            dtype=np.float64,
+        )
+    return loss, gradient
 
 
 def scalar_breakpoints(
