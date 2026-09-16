@@ -63,6 +63,48 @@ class ScalarProblem(ImmutableArrayRecord):
 
 
 @dataclass(frozen=True, slots=True)
+class _PreparedScalarArrays(ImmutableArrayRecord):
+    """Solve-local observed rows; the full problem still owns every breakpoint."""
+
+    alt: np.ndarray
+    nonalt: np.ndarray
+    slope: np.ndarray
+    log_prior: np.ndarray
+    valid: np.ndarray
+    empirical: np.ndarray
+
+    def __post_init__(self) -> None:
+        for name in ("alt", "nonalt", "slope", "log_prior", "valid", "empirical"):
+            object.__setattr__(self, name, readonly_array(getattr(self, name)))
+
+
+class _ScalarPointMemo:
+    """Bounded, solve-local losses keyed by the exact float64 coordinate bits."""
+
+    __slots__ = ("_entries", "max_entries")
+
+    def __init__(self, max_entries: int = 4096) -> None:
+        self.max_entries = max(0, int(max_entries))
+        self._entries: OrderedDict[bytes, float] = OrderedDict()
+
+    def get(self, beta: float) -> float | None:
+        key = np.float64(beta).tobytes()
+        value = self._entries.get(key)
+        if value is not None:
+            self._entries.move_to_end(key)
+        return value
+
+    def put(self, beta: float, loss: float) -> None:
+        if not self.max_entries:
+            return
+        key = np.float64(beta).tobytes()
+        self._entries[key] = loss
+        self._entries.move_to_end(key)
+        if len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+
+
+@dataclass(frozen=True, slots=True)
 class ApproximateScalarMinimum:
     argmin: float
     attained_value: float
@@ -155,28 +197,36 @@ def _scalar_terms(
     beta: float | np.ndarray,
     *,
     with_gradient: bool,
+    _prepared: _PreparedScalarArrays | None = None,
 ) -> tuple[float | np.ndarray, float | np.ndarray | None]:
     values = np.asarray(beta, dtype=np.float64)
     scalar = values.ndim == 0
     flat = values.reshape(-1)
-    active = problem.observed
-    if not np.any(active):
+    alt, nonalt, candidate_slope, log_prior, valid = (
+        _active_candidate_arrays(problem)
+        if _prepared is None
+        else (
+            _prepared.alt, _prepared.nonalt, _prepared.slope,
+            _prepared.log_prior, _prepared.valid,
+        )
+    )
+    if not alt.size:
         loss = np.zeros(flat.size, dtype=np.float64)
         gradient = np.zeros_like(loss) if with_gradient else None
     else:
         candidate = flat[None, :, None]
-        candidate_slope = problem.slope[active, None, :]
+        candidate_slope = candidate_slope[:, None, :]
         mass = candidate_slope * candidate
         probability = np.clip(mass, problem.eps, 1.0 - problem.eps)
-        valid = problem.valid[active, None, :]
+        valid = valid[:, None, :]
         slope = np.where(
             (mass > problem.eps) & (mass < 1.0 - problem.eps), candidate_slope, 0.0,
         ) if with_gradient else None
         log_kernel, state_score, _ = candidate_terms_numpy(
-            problem.alt[active, None, None], problem.nonalt[active, None, None],
+            alt[:, None, None], nonalt[:, None, None],
             probability, slope, derivative_order=int(with_gradient),
         )
-        joint = log_kernel + problem.log_prior[active, None, :]
+        joint = log_kernel + log_prior[:, None, :]
         del log_kernel
         joint = np.where(valid, joint, -np.inf)
         log_normalizer = np.logaddexp.reduce(joint, axis=-1)
@@ -252,6 +302,7 @@ def approximate_scalar_minimum(
         )
     )
     evaluated: dict[float, float] = {}
+    prepared = _prepare_scalar_arrays(problem)
 
     def evaluate(candidates: np.ndarray) -> None:
         unique = np.asarray(
@@ -261,9 +312,10 @@ def approximate_scalar_minimum(
         if unique.size:
             if _work_stats is not None:
                 _work_stats.grid_points_evaluated += int(unique.size)
-            evaluated.update(
-                zip(unique.tolist(), np.asarray(scalar_loss(problem, unique)).tolist())
+            loss, _ = _scalar_terms(
+                problem, unique, with_gradient=False, _prepared=prepared
             )
+            evaluated.update(zip(unique.tolist(), np.asarray(loss).tolist()))
 
     evaluate(grid)
     final_spacing = float(problem.upper - problem.lower)
@@ -316,16 +368,8 @@ def _active_candidate_arrays(problem: ScalarProblem) -> tuple[np.ndarray, ...]:
     )
 
 
-def _interval_lower_bound(problem: ScalarProblem, left: float, right: float) -> float:
-    alt, nonalt, candidate_slope, log_prior, valid = _active_candidate_arrays(
-        problem
-    )
-    mass_left = float(left) * candidate_slope
-    mass_right = float(right) * candidate_slope
-    probability_left = np.clip(mass_left, problem.eps, 1.0 - problem.eps)
-    probability_right = np.clip(mass_right, problem.eps, 1.0 - problem.eps)
-    probability_min = np.minimum(probability_left, probability_right)
-    probability_max = np.maximum(probability_left, probability_right)
+def _prepare_scalar_arrays(problem: ScalarProblem) -> _PreparedScalarArrays:
+    alt, nonalt, slope, log_prior, valid = _active_candidate_arrays(problem)
     total = alt + nonalt
     with np.errstate(divide="ignore", invalid="ignore"):
         empirical = np.divide(
@@ -334,7 +378,28 @@ def _interval_lower_bound(problem: ScalarProblem, left: float, right: float) -> 
             out=np.full_like(alt, 0.5, dtype=np.float64),
             where=total > 0.0,
         )
-    mode = np.clip(empirical[:, None], probability_min, probability_max)
+    return _PreparedScalarArrays(alt, nonalt, slope, log_prior, valid, empirical)
+
+
+def _interval_lower_bound(
+    problem: ScalarProblem,
+    left: float,
+    right: float,
+    *,
+    _prepared: _PreparedScalarArrays | None = None,
+    _point_losses: _ScalarPointMemo | None = None,
+) -> float:
+    prepared = _prepare_scalar_arrays(problem) if _prepared is None else _prepared
+    alt, nonalt, candidate_slope, log_prior, valid = (
+        prepared.alt, prepared.nonalt, prepared.slope, prepared.log_prior, prepared.valid,
+    )
+    mass_left = float(left) * candidate_slope
+    mass_right = float(right) * candidate_slope
+    probability_left = np.clip(mass_left, problem.eps, 1.0 - problem.eps)
+    probability_right = np.clip(mass_right, problem.eps, 1.0 - problem.eps)
+    probability_min = np.minimum(probability_left, probability_right)
+    probability_max = np.maximum(probability_left, probability_right)
+    mode = np.clip(prepared.empirical[:, None], probability_min, probability_max)
     component_upper = np.where(
         valid,
         alt[:, None] * np.log(mode)
@@ -373,6 +438,13 @@ def _interval_lower_bound(problem: ScalarProblem, left: float, right: float) -> 
         + log_prior,
         -np.inf,
     )
+    # Keep the point-loss reduction, not the different posterior normalization
+    # below. The incumbent is still considered only at the original split step.
+    midpoint_loss = float(
+        -np.sum(np.logaddexp.reduce(joint, axis=-1), dtype=np.float64)
+    )
+    if _point_losses is not None:
+        _point_losses.put(midpoint, midpoint_loss)
     maximum = np.max(joint, axis=1)
     weights = np.where(valid, np.exp(joint - maximum[:, None]), 0.0)
     weights /= np.sum(weights, axis=1, keepdims=True)
@@ -404,7 +476,7 @@ def _interval_lower_bound(problem: ScalarProblem, left: float, right: float) -> 
         )
     )
     taylor_bound = (
-        float(scalar_loss(problem, midpoint))
+        midpoint_loss
         - abs(loss_gradient) * half_width
         - 0.5 * hessian_bound * half_width * half_width
     )
@@ -431,8 +503,11 @@ def certify_scalar_minimum(
         return ScalarGlobalMinimumCertificate(
             beta, 0.0, 0.0, 0.0, True, "interval_binomial_mixture_bound_v1", 0
         )
+    prepared = _prepare_scalar_arrays(problem)
     if problem.upper <= problem.lower:
-        loss = float(scalar_loss(problem, problem.lower))
+        loss = float(_scalar_terms(
+            problem, problem.lower, with_gradient=False, _prepared=prepared
+        )[0])
         return ScalarGlobalMinimumCertificate(
             problem.lower,
             loss,
@@ -458,10 +533,16 @@ def certify_scalar_minimum(
         points = points[indices]
     best_beta = float(points[0])
     best_value = float("inf")
+    point_losses = _ScalarPointMemo()
 
     def consider(beta: float) -> None:
         nonlocal best_beta, best_value
-        value = float(scalar_loss(problem, beta))
+        value = point_losses.get(beta)
+        if value is None:
+            value = float(_scalar_terms(
+                problem, beta, with_gradient=False, _prepared=prepared
+            )[0])
+            point_losses.put(beta, value)
         tie = tolerance * 0.25
         if value < best_value - tie or (
             abs(value - best_value) <= tie and beta < best_beta
@@ -479,7 +560,9 @@ def certify_scalar_minimum(
     def interval_bound(left: float, right: float) -> float:
         if _work_stats is not None:
             _work_stats.interval_evaluations += 1
-        return _interval_lower_bound(problem, left, right)
+        return _interval_lower_bound(
+            problem, left, right, _prepared=prepared, _point_losses=point_losses
+        )
 
     for left, right in zip(points[:-1], points[1:]):
         if right > left:

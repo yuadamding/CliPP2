@@ -168,6 +168,18 @@ def _ward_compact_heap(
     heapq.heapify(row_heap)
 
 
+def _ward_labels_from_parents(parent: list[int], num_mutations: int) -> np.ndarray:
+    """Materialize a requested cut, halving paths without changing merge IDs."""
+    roots = np.empty(num_mutations, dtype=np.int64)
+    for mutation in range(num_mutations):
+        root = mutation
+        while parent[root] != root:
+            parent[root] = parent[parent[root]]
+            root = parent[root]
+        roots[mutation] = root
+    return _canonical_labels(roots)
+
+
 @dataclass(frozen=True)
 class PartitionCandidate:
     labels: np.ndarray
@@ -278,9 +290,9 @@ def hessian_weighted_ward_label_sets_torch(
     mu = torch.zeros_like(H)
     H[:num_mutations] = h
     mu[:num_mutations] = phi0
-    mutation_cluster = torch.arange(
-        num_mutations, dtype=torch.long, device=phi0.device
-    )
+    # Merge selection already supplies host IDs. Keep only two parent writes
+    # per merge; mutation-wide membership work belongs to requested cuts.
+    parent = list(range(max_nodes))
 
     finite_large = torch.finfo(phi0.dtype).max / 16.0
     # Merge IDs remain immutable and increasing, but only M physical rows are
@@ -348,9 +360,7 @@ def hessian_weighted_ward_label_sets_torch(
     heapq.heapify(row_heap)
 
     def current_labels() -> np.ndarray:
-        return _canonical_labels(
-            mutation_cluster.detach().cpu().numpy().astype(np.int64, copy=False)
-        )
+        return _ward_labels_from_parents(parent, num_mutations)
 
     out: dict[int, np.ndarray] = {}
     active_count = num_mutations
@@ -388,11 +398,8 @@ def hessian_weighted_ward_label_sets_torch(
             / H_new.clamp_min(torch.finfo(phi0.dtype).tiny),
             0.5 * (mu[left] + mu[right]),
         )
-        mutation_cluster = torch.where(
-            (mutation_cluster == left) | (mutation_cluster == right),
-            torch.full_like(mutation_cluster, new_id),
-            mutation_cluster,
-        )
+        parent[left] = new_id
+        parent[right] = new_id
 
         active_cpu[left] = False
         active_cpu[right] = False
