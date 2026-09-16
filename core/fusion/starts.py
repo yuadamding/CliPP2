@@ -90,54 +90,31 @@ def _local_minimum_representatives(
     beta_sorted = candidate_array[order].astype(np.float64, copy=False)
     loss_sorted = losses[order].astype(np.float64, copy=False)
 
-    blocks: list[tuple[int, int]] = []
-    block_start = 0
-    for idx in range(1, int(beta_sorted.size)):
-        if abs(float(loss_sorted[idx]) - float(loss_sorted[idx - 1])) > loss_tol:
-            blocks.append((block_start, idx))
-            block_start = idx
-    blocks.append((block_start, int(beta_sorted.size)))
+    # Plateaus use consecutive losses, not distance from the block's first loss.
+    # Match the scalar comparisons even for nonfinite helper inputs (the caller
+    # filters them): NaNs never split a block or make it strictly worse.
+    with np.errstate(invalid="ignore", over="ignore"):
+        starts = np.r_[0, np.flatnonzero(np.abs(np.diff(loss_sorted)) > loss_tol) + 1]
+        stops = np.r_[starts[1:], beta_sorted.size]
+        block_losses = np.minimum.reduceat(loss_sorted, starts)
+        rejected = np.zeros(starts.size, dtype=bool)
+        rejected[1:] = block_losses[1:] > block_losses[:-1] + loss_tol
+        rejected[:-1] |= block_losses[:-1] > block_losses[1:] + loss_tol
 
-    block_losses = np.asarray(
-        [float(np.min(loss_sorted[start:stop])) for start, stop in blocks],
-        dtype=np.float64,
-    )
-    representatives: list[float] = []
-    representative_losses: list[float] = []
+    retained = np.flatnonzero(~rejected)
+    retained_starts = starts[retained]
+    retained_stops = stops[retained]
     projected_hint = None if hint is None or not np.isfinite(hint) else float(hint)
-
-    for block_idx, (start, stop) in enumerate(blocks):
-        current_loss = float(block_losses[block_idx])
-        left_loss = (
-            float(block_losses[block_idx - 1]) if block_idx > 0 else float("inf")
-        )
-        right_loss = (
-            float(block_losses[block_idx + 1])
-            if block_idx + 1 < len(blocks)
-            else float("inf")
-        )
-        if current_loss > left_loss + loss_tol or current_loss > right_loss + loss_tol:
-            continue
-
-        beta_block = beta_sorted[start:stop]
-        if beta_block.size == 0:
-            continue
-        if projected_hint is None:
-            representative = float(beta_block[len(beta_block) // 2])
-        else:
-            representative = float(
+    if projected_hint is None:
+        representatives = beta_sorted[(retained_starts + retained_stops) // 2]
+    else:
+        representatives = np.empty(retained.size, dtype=np.float64)
+        for index, (start, stop) in enumerate(zip(retained_starts, retained_stops)):
+            beta_block = beta_sorted[start:stop]
+            representatives[index] = float(
                 beta_block[int(np.argmin(np.abs(beta_block - projected_hint)))]
             )
-        representatives.append(representative)
-        representative_losses.append(current_loss)
-
-    if not representatives:
-        empty = np.asarray([], dtype=np.float64)
-        return empty, empty
-    return (
-        np.asarray(representatives, dtype=np.float64),
-        np.asarray(representative_losses, dtype=np.float64),
-    )
+    return representatives, block_losses[retained]
 
 
 def _best_two_candidate_wells_numpy(
