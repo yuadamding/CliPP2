@@ -14,13 +14,13 @@ from ..scalar import (
     ScalarProblem,
     certify_scalar_minimum,
     scalar_breakpoints,
-    scalar_loss,
     scalar_problem_from_model,
 )
 from .types import TorchRuntime
 
 
 _ROOT_SCAN_POINTS = 65
+_ROOT_BRACKET_BATCH_SIZE = 32
 
 
 def initialize_marginal_phi(model: ObservedModel, *, eps: float) -> np.ndarray:
@@ -207,6 +207,74 @@ def _unit_base_points_numpy(
     return np.clip(point_array[keep], lower, upper), np.clip(hard_array[hard_keep], lower, upper)
 
 
+def _refine_root_brackets_numpy(
+    evaluate,
+    brackets: list[tuple[float, float, float]],
+    *,
+    tol: float,
+    max_iter: int,
+) -> list[float]:
+    """Batch only evaluator dispatch; each bracket keeps its scalar trajectory."""
+    roots: list[float] = []
+    for offset in range(0, len(brackets), _ROOT_BRACKET_BATCH_SIZE):
+        batch = brackets[offset:offset + _ROOT_BRACKET_BATCH_SIZE]
+        if len(batch) == 1:
+            root_left, root_right, root_gradient = batch[0]
+            for _ in range(max(int(max_iter), 32)):
+                midpoint = 0.5 * (root_left + root_right)
+                _, midpoint_gradient_array = evaluate(
+                    np.asarray([midpoint], dtype=np.float64)
+                )
+                midpoint_gradient = float(midpoint_gradient_array[0])
+                if not np.isfinite(midpoint_gradient):
+                    break
+                if abs(midpoint_gradient) <= 1e-12 or root_right - root_left <= float(
+                    tol
+                ) * (1.0 + abs(midpoint)):
+                    root_left = midpoint
+                    root_right = midpoint
+                    break
+                if root_gradient * midpoint_gradient <= 0.0:
+                    root_right = midpoint
+                else:
+                    root_left = midpoint
+                    root_gradient = midpoint_gradient
+            roots.append(0.5 * (root_left + root_right))
+            continue
+
+        lefts, rights, gradients = map(list, zip(*batch))
+        active = list(range(len(batch)))
+        for _ in range(max(int(max_iter), 32)):
+            midpoints = np.asarray(
+                [0.5 * (lefts[index] + rights[index]) for index in active],
+                dtype=np.float64,
+            )
+            _, midpoint_gradients = evaluate(midpoints)
+            remaining: list[int] = []
+            for position, index in enumerate(active):
+                midpoint = float(midpoints[position])
+                midpoint_gradient = float(midpoint_gradients[position])
+                if not np.isfinite(midpoint_gradient):
+                    continue
+                if abs(midpoint_gradient) <= 1e-12 or rights[index] - lefts[index] <= float(
+                    tol
+                ) * (1.0 + abs(midpoint)):
+                    lefts[index] = midpoint
+                    rights[index] = midpoint
+                    continue
+                if gradients[index] * midpoint_gradient <= 0.0:
+                    rights[index] = midpoint
+                else:
+                    lefts[index] = midpoint
+                    gradients[index] = midpoint_gradient
+                remaining.append(index)
+            active = remaining
+            if not active:
+                break
+        roots.extend(0.5 * (left + right) for left, right in zip(lefts, rights))
+    return roots
+
+
 def _unit_best_two_betas_numpy(
     problem: ScalarProblem,
     *,
@@ -247,6 +315,7 @@ def _unit_best_two_betas_numpy(
         candidates.extend(scan[finite].tolist())
         near_zero = finite & (np.abs(gradient) <= 1e-10)
         candidates.extend(scan[near_zero].tolist())
+        brackets: list[tuple[float, float, float]] = []
         for index in range(scan.size - 1):
             if not finite[index] or not finite[index + 1]:
                 continue
@@ -256,29 +325,12 @@ def _unit_best_two_betas_numpy(
                 continue
             if left_gradient * right_gradient > 0.0:
                 continue
-            root_left = float(scan[index])
-            root_right = float(scan[index + 1])
-            root_gradient = left_gradient
-            for _ in range(max(int(max_iter), 32)):
-                midpoint = 0.5 * (root_left + root_right)
-                _, midpoint_gradient_array = evaluate(
-                    np.asarray([midpoint], dtype=np.float64)
-                )
-                midpoint_gradient = float(midpoint_gradient_array[0])
-                if not np.isfinite(midpoint_gradient):
-                    break
-                if abs(midpoint_gradient) <= 1e-12 or root_right - root_left <= float(
-                    tol
-                ) * (1.0 + abs(midpoint)):
-                    root_left = midpoint
-                    root_right = midpoint
-                    break
-                if root_gradient * midpoint_gradient <= 0.0:
-                    root_right = midpoint
-                else:
-                    root_left = midpoint
-                    root_gradient = midpoint_gradient
-            candidates.append(0.5 * (root_left + root_right))
+            # Keep scalar multiplication: same-sign subnormals can underflow
+            # to zero and are brackets under the original detection rule.
+            brackets.append((float(scan[index]), float(scan[index + 1]), left_gradient))
+        candidates.extend(_refine_root_brackets_numpy(
+            evaluate, brackets, tol=tol, max_iter=max_iter,
+        ))
 
     return _best_two_candidate_wells_numpy(
         problem,
@@ -400,8 +452,13 @@ def _pooled_start_from_model(
         )
         grid = grid[(grid >= lower - 1e-12) & (grid <= upper + 1e-12)]
 
+        prepared = scalar_backend._prepare_scalar_arrays(problem)
+
         def objective(values: np.ndarray) -> np.ndarray:
-            return np.asarray(scalar_loss(problem, values), dtype=np.float64)
+            loss, _ = scalar_backend._scalar_terms(
+                problem, values, with_gradient=False, _prepared=prepared,
+            )
+            return np.asarray(loss, dtype=np.float64)
 
         losses = objective(grid)
         finite_indices = np.flatnonzero(np.isfinite(losses))
