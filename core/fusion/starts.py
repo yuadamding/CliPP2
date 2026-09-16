@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from .. import scalar as scalar_backend
 from ..objective import (
     ObservedModel,
     TorchObservedModel,
@@ -14,7 +15,6 @@ from ..scalar import (
     certify_scalar_minimum,
     scalar_breakpoints,
     scalar_loss,
-    scalar_loss_and_gradient,
     scalar_problem_from_model,
 )
 from .types import TorchRuntime
@@ -147,6 +147,7 @@ def _best_two_candidate_wells_numpy(
     tol: float,
     hint: float | None,
     decimals: int = 12,
+    _prepared: scalar_backend._PreparedScalarArrays | None = None,
 ) -> tuple[float, float | None]:
     candidate_array = np.asarray(candidate_array, dtype=np.float64)
     candidate_array = candidate_array[np.isfinite(candidate_array)]
@@ -164,7 +165,9 @@ def _best_two_candidate_wells_numpy(
         )
         candidate_array = np.asarray([fallback], dtype=np.float64)
 
-    losses = np.asarray(scalar_loss(problem, candidate_array), dtype=np.float64)
+    losses = np.asarray(scalar_backend._scalar_terms(
+        problem, candidate_array, with_gradient=False, _prepared=_prepared,
+    )[0], dtype=np.float64)
     finite = np.isfinite(losses)
     if not np.any(finite):
         fallback = problem.lower if hint is None else float(hint)
@@ -234,6 +237,8 @@ def _unit_best_two_betas_numpy(
     tol: float,
     max_iter: int,
 ) -> tuple[float, float | None]:
+    # Keep the full problem for breakpoints; reuse observed rows for every scan.
+    prepared = scalar_backend._prepare_scalar_arrays(problem)
     base_points, hard_points = _unit_base_points_numpy(
         problem,
         hint=hint,
@@ -241,7 +246,9 @@ def _unit_best_two_betas_numpy(
     candidates: list[float] = base_points.tolist()
 
     def evaluate(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        loss, gradient = scalar_loss_and_gradient(problem, values)
+        loss, gradient = scalar_backend._scalar_terms(
+            problem, values, with_gradient=True, _prepared=prepared,
+        )
         return (
             np.asarray(loss, dtype=np.float64),
             np.asarray(gradient, dtype=np.float64),
@@ -302,6 +309,7 @@ def _unit_best_two_betas_numpy(
         tol=tol,
         hint=hint,
         decimals=14,
+        _prepared=prepared,
     )
 
 

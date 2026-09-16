@@ -404,12 +404,12 @@ def hessian_weighted_ward_label_sets_torch(
         active_cpu[left] = False
         active_cpu[right] = False
         active_cpu[new_id] = True
-        new_slot, right_slot = int(node_slot[left]), int(node_slot[right])
+        new_slot = int(node_slot[left])
         node_slot[new_id] = new_slot
+        # The new logical ID is largest, so its outgoing row has no pairs.
+        # Its incoming active entries are all overwritten below. The retired
+        # right slot never becomes active again; refresh reads only active slots.
         cost_matrix[new_slot, :] = finite_large
-        cost_matrix[:, new_slot] = finite_large
-        cost_matrix[right_slot, :] = finite_large
-        cost_matrix[:, right_slot] = finite_large
 
         other_ids = np.flatnonzero(active_cpu[:new_id])
         other = torch.as_tensor(other_ids, dtype=torch.long, device=phi0.device)
@@ -427,10 +427,8 @@ def hessian_weighted_ward_label_sets_torch(
             other_slots = torch.as_tensor(node_slot[other_ids], device=phi0.device)
             cost_matrix[other_slots, new_slot] = cost_vec
             cost_values = cost_vec.detach().cpu().numpy()
-            invalid_best = np.isin(
-                row_best_column[other_ids],
-                np.asarray([left, right], dtype=np.int64),
-            )
+            best_partner = row_best_column[other_ids]
+            invalid_best = (best_partner == left) | (best_partner == right)
             invalid_rows = other_ids[invalid_best]
             direct_rows = other_ids[
                 (~invalid_best) & (cost_values < row_best_cost[other_ids])
