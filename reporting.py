@@ -298,6 +298,13 @@ def _mutation_region_output_table(analysis: AnalysisSerialization) -> pd.DataFra
     _add_integer_multiplicity(table, data=data, phi=refit_phi,
                               eps=analysis.raw_fit.provenance.likelihood_eps,
                               max_major_cn=analysis.fit_config.max_major_cn)
+    mixed = data.cn_state_count.reshape(-1) > 1
+    if np.any(mixed):
+        # No single CN pair describes a mixture; do not publish the input
+        # compiler's per-allele maxima as though they were a clonal CN state.
+        table.loc[mixed, ["major_cn", "minor_cn"]] = np.nan
+        table["mean_total_cn"] = data.mean_total_cn.reshape(-1)
+        table["cn_state_count"] = data.cn_state_count.reshape(-1)
     return table
 
 

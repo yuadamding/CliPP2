@@ -1,7 +1,7 @@
 """Canonical source representation of CliPP2's observed-count likelihood.
 
-The supported model is a uniform mixture over clonal integer multiplicities,
-represented by clipped linear binomial emissions.
+The supported model is a uniform mixture over capped integer multiplicities,
+represented by clipped linear binomial emissions with precompiled bulk-CN scaling.
 Runtime tensors are always rebuilt from immutable float64 source arrays; a
 lower-precision runtime is never the source of a higher-precision view.
 """
@@ -20,6 +20,7 @@ from ..config import (
     CLONAL_INTEGER_GENERATOR_VERSION,
     CLONAL_INTEGER_MODEL_ID,
     CLONAL_INTEGER_PRIOR_MODE,
+    MAX_MULTIPLICITY,
     validate_likelihood_precision,
 )
 
@@ -393,7 +394,7 @@ class _TorchEmissionKernel:
 
 
 def _compile_integer_candidates(major_cn: np.ndarray, scaling: np.ndarray) -> dict[str, object]:
-    """Compile complete ordered 1..major_cn support with fixed uniform priors."""
+    """Compile ordered 1..min(4, major_cn) support with fixed uniform priors."""
     major = np.asarray(major_cn, dtype=np.float64)
     scale = np.asarray(scaling, dtype=np.float64)
     if major.ndim != 2 or 0 in major.shape or scale.shape != major.shape:
@@ -403,6 +404,7 @@ def _compile_integer_candidates(major_cn: np.ndarray, scaling: np.ndarray) -> di
     major = np.rint(major)
     if np.any(major < 1):
         raise ValueError("Retained major_cn must be positive; apply CN filtering first.")
+    major = np.minimum(major, MAX_MULTIPLICITY)
     candidates = np.arange(1, int(major.max()) + 1, dtype=np.float64)
     valid = candidates <= major[..., None]
     return {

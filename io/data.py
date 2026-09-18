@@ -59,6 +59,12 @@ class CNFilterReport:
 
 @dataclass(frozen=True)
 class TumorData(ImmutableArrayRecord):
+    """CN-compiled inputs, with no CN-population state in the optimizer.
+
+    major_cn/minor_cn are per-allele maxima; mean_total_cn is the actual
+    fraction-weighted total. Only clonal entries have a single CN pair.
+    """
+
     tumor_id: str
     mutation_ids: tuple[str, ...]
     region_ids: tuple[str, ...]
@@ -73,15 +79,22 @@ class TumorData(ImmutableArrayRecord):
     phi_init: np.ndarray
     count_observed: np.ndarray | None = None
     cn_filter_report: CNFilterReport | None = None
+    mean_total_cn: np.ndarray | None = None
+    cn_state_count: np.ndarray | None = None
     _compiled_models: dict = field(default_factory=dict, init=False, repr=False, compare=False)
     _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("mutation_ids", "region_ids"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
+        if self.mean_total_cn is None:
+            object.__setattr__(self, "mean_total_cn", np.asarray(self.major_cn) + np.asarray(self.minor_cn))
+        if self.cn_state_count is None:
+            object.__setattr__(self, "cn_state_count", np.ones_like(self.major_cn, dtype=np.int64))
         for name in (
             "alt_counts", "total_counts", "purity", "major_cn", "minor_cn",
             "normal_cn", "scaling", "phi_upper", "phi_init", "count_observed",
+            "mean_total_cn", "cn_state_count",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -113,7 +126,7 @@ def _hash_array(digest, name: str, values: np.ndarray) -> None:
 
 def _retained_data_fingerprint(data: TumorData) -> str:
     """Identify the retained numerical source, excluding eligibility-only audit."""
-    digest = hashlib.sha256(b"clipp2.retained-integer-input.v3")
+    digest = hashlib.sha256(b"clipp2.retained-integer-input.v4")
     _hash_text(digest, data.tumor_id)
     for ids in (data.mutation_ids, data.region_ids):
         digest.update(len(ids).to_bytes(8, "little"))
@@ -122,6 +135,7 @@ def _retained_data_fingerprint(data: TumorData) -> str:
     for name in (
         "alt_counts", "total_counts", "purity", "major_cn", "minor_cn",
         "normal_cn", "scaling", "phi_upper", "phi_init",
+        "mean_total_cn", "cn_state_count",
     ):
         _hash_array(digest, name, getattr(data, name))
     _hash_array(digest, "count_observed", np.ones_like(data.alt_counts, dtype=bool)

@@ -6,6 +6,7 @@ from collections.abc import Mapping
 import csv
 from dataclasses import dataclass
 import gzip
+import math
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from .data import CNFilterRecord, CNFilterReport, TumorData
-from ..config import DEFAULT_MAX_MAJOR_CN, validate_max_major_cn
+from ..config import DEFAULT_MAX_MAJOR_CN, MAX_MULTIPLICITY, validate_max_major_cn
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
 CN_FILTER_POLICY_ID = "major_limit_whole_mutation_v3"
@@ -589,6 +590,7 @@ def _build_tumor_data(
     major_cn = np.empty(shape, dtype=np.float64)
     minor_cn = np.empty(shape, dtype=np.float64)
     mean_total_cn = np.empty(shape, dtype=np.float64)
+    cn_state_count = np.empty(shape, dtype=np.int64)
 
     for unit, rows in validated.rows_by_unit.items():
         mutation_id, sample_id = unit
@@ -603,19 +605,23 @@ def _build_tumor_data(
         purity[i, j] = float(row["purity"])
         normal_cn[i, j] = float(row["normal_cn"])
         states = validated.states_by_segment[(sample_id, row["segment_id"])]
-        if len(states) != 1:
-            raise AssertionError("Subclonal CN survived mutation-level filtering.")
-        state = states[0]
-        if state.allele_a_cn < 1:
+        cn_state_count[i, j] = len(states)
+        # Compile the union of integer supports and a fixed bulk-CN denominator.
+        # These maxima are bounds, not a synthetic clonal state for mixed CN.
+        major_cn[i, j] = max(state.allele_a_cn for state in states)
+        minor_cn[i, j] = max(state.allele_b_cn for state in states)
+        if major_cn[i, j] < 1:
             raise UnsupportedTumorInputError(
                 NO_POSITIVE_PATH,
                 region_id=sample_id,
                 segment_id=row["segment_id"],
                 detail="retained (0, 0) CN has no positive integer multiplicity",
             )
-        major_cn[i, j] = float(state.allele_a_cn)
-        minor_cn[i, j] = float(state.allele_b_cn)
-        mean_total_cn[i, j] = state.allele_a_cn + state.allele_b_cn
+        mean_total_cn[i, j] = (
+            major_cn[i, j] + minor_cn[i, j] if len(states) == 1 else
+            math.fsum(state.fraction * (state.allele_a_cn + state.allele_b_cn) for state in states)
+            / math.fsum(state.fraction for state in states)
+        )
 
     alt_counts = np.where(count_observed, alt_counts, 0.0)
     total_counts = np.where(count_observed, total_counts, 0.0)
@@ -626,7 +632,7 @@ def _build_tumor_data(
             "copy-number denominator."
         )
     scaling = purity / denominator
-    max_prob_scale = scaling * major_cn
+    max_prob_scale = scaling * np.minimum(major_cn, MAX_MULTIPLICITY)
     phi_upper = np.minimum(
         1.0, (1.0 - eps) / np.clip(max_prob_scale, eps, None)
     )
@@ -654,6 +660,8 @@ def _build_tumor_data(
         phi_init=initialize_marginal_phi(model, eps=eps),
         count_observed=count_observed,
         cn_filter_report=report,
+        mean_total_cn=mean_total_cn,
+        cn_state_count=cn_state_count,
     )
     # This private construction owns the exact arrays used by both objects.
     # Retain the already compiled immutable model; replacements start uncached.

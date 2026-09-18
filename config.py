@@ -13,10 +13,11 @@ if TYPE_CHECKING:
     from .core.fusion.types import PairwiseFusionGraph
 
 # Fixed model identifiers shared by input, inference, reporting and simulation.
-CLONAL_INTEGER_MODEL_ID = "clipp2_clonal_integer_multiplicity_mixture_v1"
-CLONAL_INTEGER_GENERATOR_VERSION = "integer_1_to_major_v2"
+CLONAL_INTEGER_MODEL_ID = "clipp2_bulk_cn_integer_multiplicity_mixture_v2"
+CLONAL_INTEGER_GENERATOR_VERSION = "integer_1_to_min4_max_major_v3"
 CLONAL_INTEGER_PRIOR_MODE = "uniform_distinct_integer_v1"
 DEFAULT_MAX_MAJOR_CN: Final = 4
+MAX_MULTIPLICITY: Final = 4
 
 DEFAULT_DEVICE: Final = "cuda"
 DEFAULT_DTYPE: Final = "float32"

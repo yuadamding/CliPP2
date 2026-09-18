@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
-from ..config import _FitOptions
+from ..config import MAX_MULTIPLICITY, _FitOptions
 from .data import TumorData
 from .tumor_txt import CN_FILTER_POLICY_ID
 
@@ -22,6 +22,7 @@ def _validate_biological_arrays(data: TumorData, *, max_major_cn: int) -> None:
     for name in (
         "alt_counts", "total_counts", "purity", "major_cn", "minor_cn",
         "normal_cn", "scaling", "phi_upper", "phi_init",
+        "mean_total_cn", "cn_state_count",
     ):
         values = np.asarray(getattr(data, name))
         if (
@@ -38,7 +39,7 @@ def _validate_biological_arrays(data: TumorData, *, max_major_cn: int) -> None:
         values = np.asarray(values)
         if values.shape != shape or values.dtype.kind != "b":
             raise ValueError(f"TumorData.{name} must be a Boolean array of shape {shape}.")
-    for name in ("alt_counts", "total_counts", "major_cn", "minor_cn"):
+    for name in ("alt_counts", "total_counts", "major_cn", "minor_cn", "cn_state_count"):
         values = getattr(data, name)
         if np.any(values < 0) or np.any(values != np.rint(values)):
             raise ValueError(f"TumorData.{name} must contain nonnegative integers.")
@@ -58,9 +59,20 @@ def _validate_biological_arrays(data: TumorData, *, max_major_cn: int) -> None:
             f"TumorData must satisfy 0 <= minor_cn <= major_cn <= {max_major_cn} "
             "and major_cn >= 1."
         )
+    if (
+        np.any(data.cn_state_count < 1)
+        or np.any(data.mean_total_cn <= 0.0)
+        or np.any(data.mean_total_cn > data.major_cn + data.minor_cn + 1e-10)
+        or not np.allclose(
+            data.mean_total_cn[data.cn_state_count == 1],
+            (data.major_cn + data.minor_cn)[data.cn_state_count == 1],
+            rtol=0.0, atol=1e-10,
+        )
+    ):
+        raise ValueError("TumorData mean_total_cn/cn_state_count are inconsistent with CN bounds.")
     expected_scaling = data.purity / (
         (1.0 - data.purity) * data.normal_cn
-        + data.purity * (data.major_cn + data.minor_cn)
+        + data.purity * data.mean_total_cn
     )
     if not np.allclose(data.scaling, expected_scaling, rtol=1e-12, atol=0.0):
         raise ValueError(
@@ -81,7 +93,7 @@ def validate_public_tumor_data(data: TumorData, config: _FitOptions) -> None:
         or report.policy_id != CN_FILTER_POLICY_ID
     ):
         raise ValueError(
-            "The public fit requires clonal integer TumorData from "
+            "The public fit requires CN-validated integer-mixture TumorData from "
             "load_tumor_txt, including its original-CN filtering report; "
             "legacy or unvalidated TumorData is not supported."
         )
@@ -98,7 +110,9 @@ def validate_public_tumor_data(data: TumorData, config: _FitOptions) -> None:
         raise ValueError("CN filtering report is inconsistent with retained mutations.")
     epsilon = float(config.eps)
     expected_upper = np.clip(np.minimum(
-        1.0, (1.0 - epsilon) / np.clip(data.scaling * data.major_cn, epsilon, None)
+        1.0, (1.0 - epsilon) / np.clip(
+            data.scaling * np.minimum(data.major_cn, MAX_MULTIPLICITY), epsilon, None,
+        )
     ), epsilon, 1.0)
     if (
         not np.allclose(data.phi_upper, expected_upper, rtol=0.0, atol=1e-12)
