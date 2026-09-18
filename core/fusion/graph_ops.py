@@ -140,13 +140,26 @@ def _parse_memory_limit_bytes(value: str | None) -> int | None:
     return limit
 
 
-def _cuda_memory_limit_bytes(runtime: TorchRuntime) -> int | None:
+def _cuda_memory_limit_bytes(
+    runtime: TorchRuntime, *, required_bytes: int = 0,
+) -> int | None:
     if runtime.device.type != "cuda":
         return None
     try:
         free_bytes, _ = torch.cuda.mem_get_info(runtime.device)
     except Exception:
         return None
+    if (
+        required_bytes > COMPLETE_GRAPH_MEMORY_SAFETY_FRACTION * int(free_bytes)
+        and torch.cuda.memory_reserved(runtime.device)
+        > torch.cuda.memory_allocated(runtime.device)
+    ):
+        # Driver-free bytes exclude PyTorch's unused cache. Reclaim only unused
+        # blocks, then measure again; never count live tensors or assume every
+        # reserved byte is releasable. Keep the same safety fraction and gate.
+        with torch.cuda.device(runtime.device):
+            torch.cuda.empty_cache()
+        free_bytes, _ = torch.cuda.mem_get_info(runtime.device)
     return int(COMPLETE_GRAPH_MEMORY_SAFETY_FRACTION * int(free_bytes))
 
 
@@ -179,6 +192,7 @@ def _complete_graph_memory_limit_bytes(
     runtime: TorchRuntime,
     *,
     memory_limit_bytes: int | None,
+    required_bytes: int = 0,
 ) -> int | None:
     if memory_limit_bytes is not None:
         return int(memory_limit_bytes)
@@ -187,7 +201,7 @@ def _complete_graph_memory_limit_bytes(
     )
     if env_limit is not None:
         return env_limit
-    cuda_limit = _cuda_memory_limit_bytes(runtime)
+    cuda_limit = _cuda_memory_limit_bytes(runtime, required_bytes=required_bytes)
     if cuda_limit is not None:
         return cuda_limit
     return _cpu_memory_limit_bytes(runtime)
@@ -199,15 +213,46 @@ def dense_complete_solver_memory_preflight(
     num_regions: int,
     runtime: TorchRuntime,
     memory_limit_bytes: int | None = None,
+    resident_edges: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[bool, int, int | None]:
+    """Check additional CUDA demand, or full demand under an explicit cap.
+
+    Solver callers already own the complete graph's immutable index vectors.
+    Their storage is excluded from driver-free memory and is reused, including
+    during dtype promotion. Do not charge its allocation a second time. Keep
+    all value/state/workspace allowances; never add live or cached bytes to the
+    available-memory limit. Explicit and environment caps retain full-peak
+    semantics, and graph construction still checks the entire allocation.
+    """
     estimate = estimate_dense_complete_solver_peak_bytes(
         num_nodes,
         num_regions=num_regions,
         dtype=runtime.dtype,
     )
+    if (
+        resident_edges is not None
+        and runtime.device.type == "cuda"
+        and memory_limit_bytes is None
+        and _parse_memory_limit_bytes(os.environ.get(COMPLETE_GRAPH_MEMORY_LIMIT_ENV)) is None
+    ):
+        edges = _complete_graph_edge_count(num_nodes)
+        # Only actual, complete, same-device index tensors prove reuse. A
+        # shape hint, CPU copy, or another GPU's allocation earns no deduction.
+        if len(resident_edges) != 2 or any(
+            not torch.is_tensor(index)
+            or index.dtype != torch.long
+            or tuple(index.shape) != (edges,)
+            or index.layout != torch.strided
+            or not index.is_contiguous()
+            or not _matches_runtime_device(index.device, runtime.device)
+            for index in resident_edges
+        ):
+            raise ValueError("Resident complete-graph indices must match the CUDA runtime and shape.")
+        estimate -= 2 * edges * _dtype_nbytes(torch.long)
     limit = _complete_graph_memory_limit_bytes(
         runtime,
         memory_limit_bytes=memory_limit_bytes,
+        required_bytes=estimate,
     )
     return limit is None or estimate <= limit, estimate, limit
 
@@ -227,7 +272,7 @@ def _check_complete_tensor_graph_memory(
         adaptive=adaptive,
     )
     limit = _complete_graph_memory_limit_bytes(
-        runtime, memory_limit_bytes=memory_limit_bytes
+        runtime, memory_limit_bytes=memory_limit_bytes, required_bytes=estimate
     )
     if limit is None or estimate <= limit:
         return

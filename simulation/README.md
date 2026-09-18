@@ -1,24 +1,28 @@
 # Tree-based simulation
 
-This source-tree generator preserves a clone tree and its multi-region CCFs,
-but samples mutation multiplicity independently of CNA timing. It does not
-claim a physical-copy amplification history for the sampled multiplicity.
+This source-tree generator shares a mutation clone tree across regions, but
+generates CN profiles independently for each region. Multiplicity is sampled
+from local CN independently of CNA timing. This is a conditional observation
+model, not a jointly reconstructed CNA/physical-copy evolutionary history.
 
 ## Copy number and multiplicity
 
-- Start with diploid segments and generate gain-only CNA events on the trunk.
-  All descendant clones and all regions inherit the same segment CN profile.
+- Start each region with diploid segments and independently generate gain-only
+  CNA events using separate regional RNG streams. All clones **within a region**
+  have the same local profile; profiles are not copied between regions.
   Every mutation-region has one CN state with fraction exactly `1.0`.
+  Independent draws can coincide, particularly with zero CNA rate or saturated CN;
+  the generator does not force profiles to differ.
 - Major CN is at most six. There are no subclonal CN mixtures, descendant
   CNA events, losses, copy-neutral LOH, or whole-genome duplication.
-- For each mutation with `major_cn != minor_cn`, independently draw an integer
-  uniformly from `1, ..., min(major_cn, 6)`, with both endpoints included.
+- For each mutation-region with local `major_cn != minor_cn`, independently draw
+  an integer uniformly from `1, ..., min(major_cn, 4)`, endpoints included.
   Equal-CN mutations have multiplicity one under this simulator's sampling rule.
   **Balanced CN means only `major_cn = minor_cn = 1`**; higher-copy equal-CN
   states such as `2/2` are not balanced. The equal-CN sampling rule is separate
   from that definition and from inference's `1..major_cn` candidate support.
-- Draw once per mutation, not once per region. All carrier clones and regions
-  use that same multiplicity. This applies to clonal and subclonal mutations;
+- All carrier clones **within that region** use its sampled multiplicity.
+  Regions do not share multiplicity draws. This applies to clonal and subclonal mutations;
   removing subclonal **CN** does not remove subclonal mutation clusters.
 - Cluster `0` is nonempty and has CCF exactly `1.0` in every region.
 
@@ -34,7 +38,9 @@ ref_count = depth - alt_count
 Separate named RNG streams control topology, clone fractions, mutation counts,
 segments, CNA events, multiplicity, purity, depth, and read counts. Repeating a
 seed and configuration reproduces the bundle; changing depth does not change
-the latent mutation truth.
+the latent mutation truth. CNA and multiplicity streams have named, independently
+spawned regional children recorded in the manifest. The event-rate parameter
+applies separately in each region, not as a tumor-wide budget divided by regions.
 
 ## Run
 
@@ -54,7 +60,8 @@ The generator's six-copy CN range is independent of the inference default
 `--max-major-cn 4`. Bundle validation explicitly uses a limit of six so it can
 check all generated truth. To retain the complete generated cohort during
 fitting, pass `--max-major-cn 6`; fitting with the default may exclude generated
-mutations with major CN 5 or 6. Generation and multiplicity sampling are unchanged.
+mutations having major CN 5 or 6 in **any** region. The CN ceiling remains six;
+the independent multiplicity sampling ceiling is four.
 
 ## Truth and provenance
 
@@ -66,17 +73,22 @@ mutations with major CN 5 or 6. Generation and multiplicity sampling are unchang
 - `truth_mutation_sample.tsv`: integer `multiplicity`, CCF, mutant-copy mass,
   effective multiplicity, total CN, and expected VAF. Use `multiplicity` as the
   exact-class truth target; effective multiplicity agrees up to round-off.
-- `truth_mutation_clone_dosage.tsv`: sampled dosage for each carrier clone;
-  noncarriers have `carrier=0` and missing dosage, not multiplicity zero.
-- `truth_mutation_history.tsv`: origin clone, segment, sampled multiplicity,
-  and its sampling rule. Physical-copy indices and mutation timing are removed.
-- `truth_cna_events.tsv`: trunk gains that generated the CN profile, not an
-  explanation of sampled mutation dosage. Other tree, CN, and position truth
-  tables retain the framework's layout.
+- `truth_mutation_carriers.tsv`: shared mutation-clone membership. Combine it
+  with regional `truth_mutation_sample.tsv` for carrier dosage; noncarriers have
+  no multiplicity target. This factorization replaces the old shared-dosage table
+  without expanding to a mutation-clone-region table.
+- `truth_mutation_history.tsv`: shared origin clone and segment; no misleading
+  single multiplicity column. Physical-copy indices and mutation timing are absent.
+- `truth_cn_sample.tsv`: one CN profile row per segment and numeric sample ID,
+  replacing `truth_cn_clone_profile.tsv`. `regionN/truth_cn_states.tsv` records
+  that region's single local state per segment.
+- `truth_cna_events.tsv`: local gains, with `sample_id`; event IDs are local to
+  each sample. Clone 0 marks a local clonal state, not a common ancestral CNA
+  across regions. Events explain local CN, not sampled mutation dosage.
 - `scenario_manifest.json`: generator version, RNG streams, intended/realized
   conditions, source hash, and input/truth file hashes.
 
-The generator is `tree_clonal_cn_uniform_multiplicity_v7`, output schema `7.0`.
+The generator is `tree_regional_clonal_cn_uniform_multiplicity_v8`, schema `8.0`.
 These versions distinguish the changed scientific design and truth fields;
 they do not change the CliPP2 inference version. Existing cohorts are unchanged.
 For CNA-only multiplicity performance, use `(major_cn != 1) | (minor_cn != 1)`

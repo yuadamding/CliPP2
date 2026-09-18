@@ -646,6 +646,7 @@ def build_guided_fusion_initialization(
         num_nodes=num_mutations,
         num_regions=num_regions,
         runtime=solver_context.runtime,
+        resident_edges=(edge_u, edge_v),
     )
     if not dense_fits:
         raise ExactSolverResourceLimit(

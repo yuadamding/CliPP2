@@ -181,16 +181,19 @@ def _graph_edge_activity_counts_torch(
         dtype=phi.dtype,
         work_bytes=edge_work_bytes,
     )
-    nonzero_edges = 0
+    if num_edges == 0:
+        return 0, 0
+    nonzero_count = torch.zeros((), dtype=torch.int64, device=phi.device)
     for edge_slice in _edge_slices(num_edges, chunk_size):
         diff = graph_forward_edges(
             phi,
             edge_u=edge_u[edge_slice],
             edge_v=edge_v[edge_slice],
         )
-        nonzero_edges += int(
-            torch.sum(torch.linalg.vector_norm(diff, dim=1) > float(atol)).item()
+        nonzero_count.add_(
+            torch.sum(torch.linalg.vector_norm(diff, dim=1) > float(atol))
         )
+    nonzero_edges = int(nonzero_count.item())
     return num_edges - nonzero_edges, nonzero_edges
 
 
@@ -477,6 +480,26 @@ def _residual_maximum_torch(first: torch.Tensor, second: torch.Tensor) -> torch.
     )
 
 
+def _diagnostic_primitives_to_host(
+    values: tuple[float | torch.Tensor | None, ...], *, device: torch.device,
+) -> tuple[float | None, ...]:
+    """Extract scalar tensors together, leaving all normalization on the host."""
+    positions = [index for index, value in enumerate(values) if torch.is_tensor(value)]
+    result = [None if torch.is_tensor(value) or value is None else float(value)
+              for value in values]
+    if positions:
+        # Widen *after* the original reductions. This preserves each extracted
+        # float32/float64 value, including mixed-dtype maxima, without rounding
+        # Python scalar inputs through the working dtype.
+        packed = torch.stack([
+            values[index].detach().to(device=device, dtype=torch.float64).reshape(())
+            for index in positions
+        ])
+        for index, value in zip(positions, packed.cpu().tolist()):
+            result[index] = float(value)
+    return tuple(result)
+
+
 def graph_fusion_kkt_diagnostics_from_components_torch(
     *,
     phi: torch.Tensor,
@@ -500,69 +523,65 @@ def graph_fusion_kkt_diagnostics_from_components_torch(
         upper=upper,
         atol=atol,
     )
-    smooth_gradient_norm = float(torch.linalg.norm(grad_smooth).item())
-    fusion_adjustment_norm = float(torch.linalg.norm(adj).item())
-    projected_stationarity_norm = float(torch.linalg.norm(stat).item())
-    stationarity_normalizer = float(1.0 + smooth_gradient_norm + fusion_adjustment_norm)
-    stationarity_residual = float(
-        projected_stationarity_norm / max(stationarity_normalizer, 1e-300)
-    )
-    backward_error_stationarity_residual = float(
-        backward_error_stationarity_residual_torch(
-            grad_smooth=grad_smooth,
-            adj=adj,
-            phi=phi,
-            lower=lower,
-            upper=upper,
-        ).item()
-    )
     box_violation = torch.maximum(
         torch.clamp(lower - phi, min=0.0),
         torch.clamp(phi - upper, min=0.0),
     )
-    box_primal_violation = (
-        float(torch.max(box_violation).item()) if box_violation.numel() else 0.0
+    (
+        smooth_gradient_norm,
+        fusion_adjustment_norm,
+        projected_stationarity_norm,
+        backward_error_stationarity_residual,
+        box_primal_violation,
+        lower_max,
+        upper_max,
+        edge_max,
+        ball_max,
+        radius_max,
+        scaled_edge_max,
+        scaled_ball_max,
+    ) = _diagnostic_primitives_to_host(
+        (
+            torch.linalg.norm(grad_smooth),
+            torch.linalg.norm(adj),
+            torch.linalg.norm(stat),
+            backward_error_stationarity_residual_torch(
+                grad_smooth=grad_smooth,
+                adj=adj,
+                phi=phi,
+                lower=lower,
+                upper=upper,
+            ),
+            torch.max(box_violation) if box_violation.numel() else 0.0,
+            torch.max(torch.abs(lower)) if lower.numel() else 0.0,
+            torch.max(torch.abs(upper)) if upper.numel() else 0.0,
+            max_edge_residual,
+            max_ball_residual,
+            max_radius,
+            max_scaled_edge_residual,
+            max_scaled_ball_residual,
+        ),
+        device=phi.device,
     )
-    box_scale = 1.0 + max(
-        float(torch.max(torch.abs(lower)).item()) if lower.numel() else 0.0,
-        float(torch.max(torch.abs(upper)).item()) if upper.numel() else 0.0,
+    stationarity_normalizer = float(1.0 + smooth_gradient_norm + fusion_adjustment_norm)
+    stationarity_residual = float(
+        projected_stationarity_norm / max(stationarity_normalizer, 1e-300)
     )
+    box_scale = 1.0 + max(lower_max, upper_max)
     box_residual = box_primal_violation / max(box_scale, 1e-300)
-
-    edge_max = (
-        float(max_edge_residual.item())
-        if torch.is_tensor(max_edge_residual)
-        else float(max_edge_residual)
-    )
-    ball_max = (
-        float(max_ball_residual.item())
-        if torch.is_tensor(max_ball_residual)
-        else float(max_ball_residual)
-    )
-    radius_max = (
-        float(max_radius.item()) if torch.is_tensor(max_radius) else float(max_radius)
-    )
     valid_radius = np.isfinite(radius_max) and radius_max >= 0.0
     edge_denom = 1.0 + radius_max if valid_radius else float("nan")
     edge_subgradient_residual = edge_max / edge_denom
     dual_ball_residual = ball_max / edge_denom
     backward_error_edge_subgradient_residual = (
         edge_subgradient_residual
-        if max_scaled_edge_residual is None
-        else float(
-            max_scaled_edge_residual.item()
-            if torch.is_tensor(max_scaled_edge_residual)
-            else max_scaled_edge_residual
-        )
+        if scaled_edge_max is None
+        else scaled_edge_max
     )
     backward_error_dual_ball_residual = (
         dual_ball_residual
-        if max_scaled_ball_residual is None
-        else float(
-            max_scaled_ball_residual.item()
-            if torch.is_tensor(max_scaled_ball_residual)
-            else max_scaled_ball_residual
-        )
+        if scaled_ball_max is None
+        else scaled_ball_max
     )
     if not valid_radius:
         backward_error_edge_subgradient_residual = float("inf")

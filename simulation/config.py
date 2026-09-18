@@ -8,14 +8,15 @@ from pathlib import Path
 import numpy as np
 
 MAX_SIMULATION_ALLELE_CN = 6
+MAX_SIMULATION_MULTIPLICITY = 4
 DEFAULT_CNA_EVENT_RATE = 1.5
-GENERATOR_VERSION = "tree_clonal_cn_uniform_multiplicity_v7"
-OUTPUT_SCHEMA_VERSION = "7.0"
+GENERATOR_VERSION = "tree_regional_clonal_cn_uniform_multiplicity_v8"
+OUTPUT_SCHEMA_VERSION = "8.0"
 
 
 @dataclass(frozen=True)
 class CopyNumberEvolutionConfig:
-    """Clonal trunk gains; every descendant inherits the same bounded CN."""
+    """Independent regional gains; bounded CN is clonal within each region."""
 
     n_segments: int = 100
     segment_size_bp: int = 1_000_000

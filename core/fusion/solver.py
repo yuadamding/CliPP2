@@ -104,6 +104,27 @@ class _Float64AuditContext:
         return self.model.upper
 
 
+def _frozen_graph_in_dtype(
+    problem: PreparedProblem, runtime: TorchRuntime,
+) -> TensorFusionGraph:
+    """Share immutable topology; restore weights from the frozen host source.
+
+    Retensorizing the graph duplicates two O(E) int64 arrays and constructs
+    another complete index for validation. Dtype promotion changes neither
+    topology nor degree. Never promote rounded working weights to float64.
+    """
+    problem.assert_runtime_unchanged()
+    if runtime.device != problem.runtime.device:
+        raise ValueError("Frozen graph dtype conversion must stay on its device.")
+    return replace(
+        problem.graph,
+        weight=torch.tensor(
+            problem.graph_spec.edge_w, dtype=runtime.dtype, device=runtime.device,
+        ),
+        degree=problem.graph.degree.to(dtype=runtime.dtype),
+    )
+
+
 def _float64_audit_context(
     problem: PreparedProblem,
 ) -> _Float64AuditContext:
@@ -128,11 +149,7 @@ def _float64_audit_context(
     context = _Float64AuditContext(
         runtime=runtime,
         model=model_to_torch(source_model, runtime, eps=problem.eps),
-        graph=tensorize_graph(
-            problem.graph_spec,
-            runtime,
-            num_nodes=int(source_model.shape[0]),
-        ),
+        graph=_frozen_graph_in_dtype(problem, runtime),
     )
     problem.audit_context_cache[key] = context
     return context
@@ -755,12 +772,14 @@ def promote_solver_context_dtype(
         device=target_device,
         device_name=str(target_device),
     )
-    promoted_model = model_to_torch(source_model, runtime, eps=context.eps)
-    graph = tensorize_graph(
-        context.graph_spec,
-        runtime,
-        num_nodes=int(source_model.shape[0]),
-    )
+    if dtype == torch.float64:
+        # The terminal audit already compiled this exact source in float64.
+        # Reuse its immutable model/graph rather than retaining a third graph.
+        audit = _float64_audit_context(context)
+        promoted_model, graph = audit.model, audit.graph
+    else:
+        promoted_model = model_to_torch(source_model, runtime, eps=context.eps)
+        graph = _frozen_graph_in_dtype(context, runtime)
     exact = context.exact_pilot.to(dtype=dtype, device=target_device)
     pooled = context.pooled_start.to(dtype=dtype, device=target_device)
     wells = tuple(start.to(dtype=dtype, device=target_device) for start in context.scalar_well_starts)
@@ -783,12 +802,14 @@ def _require_dense_memory(
     *,
     operation: str,
     limit_name: str,
+    resident_edges: tuple[torch.Tensor, torch.Tensor] | None = None,
     cause: BaseException | None = None,
 ) -> None:
     fits, required, limit = dense_complete_solver_memory_preflight(
         num_nodes=data.num_mutations,
         num_regions=data.num_regions,
         runtime=runtime,
+        resident_edges=resident_edges,
     )
     if fits:
         return
@@ -805,7 +826,8 @@ def _float64_context(data: TumorData, context: PreparedProblem) -> PreparedProbl
     runtime = replace(context.runtime, dtype=torch.float64)
     if context.graph.is_complete:
         _require_dense_memory(data, runtime, operation="float64 fixed-objective precision polish",
-                              limit_name="policy limit")
+                              limit_name="policy limit",
+                              resident_edges=(context.graph.edge_u, context.graph.edge_v))
     return promote_solver_context_dtype(context, dtype=torch.float64)
 
 
@@ -1271,6 +1293,7 @@ def _solve_inner_subproblem(
         num_nodes=num_mutations,
         num_regions=int(U.shape[1]),
         runtime=runtime,
+        resident_edges=(edge_u, edge_v),
     )
     if not dense_fits:
         raise ExactSolverResourceLimit(

@@ -13,6 +13,7 @@ from ..io.tumor_txt import CN_FILTER_POLICY_ID, TUMOR_TXT_SCHEMA, write_tumor_tx
 from .config import (
     TumorSimulationConfig,
     MAX_SIMULATION_ALLELE_CN,
+    MAX_SIMULATION_MULTIPLICITY,
     _positive_integer,
     _validate_copy_number_config,
 )
@@ -25,7 +26,7 @@ from .evolution import (
 )
 from .output import (
     _canonical_observation_table,
-    _cn_clone_profile_table,
+    _cn_sample_profile_table,
     _local_cn_state_table,
     _numeric_summary,
     _realized_cn_complexity,
@@ -49,6 +50,7 @@ RNG_STREAM_NAMES = (
     "seed_calling",
 )
 _RESERVED_RNG_STREAMS = frozenset({"seed_input_noise", "seed_calling"})
+_REGIONAL_RNG_STREAMS = frozenset({"seed_cna_events", "seed_multiplicity"})
 
 
 def _json_seed_entropy(entropy: Any) -> int | list[int]:
@@ -60,7 +62,8 @@ def _json_seed_entropy(entropy: Any) -> int | list[int]:
 
 def _named_random_streams(
     seed_sequence: np.random.SeedSequence,
-) -> tuple[dict[str, np.random.Generator], dict[str, object]]:
+    n_regions: int,
+) -> tuple[dict[str, np.random.Generator | list[np.random.Generator]], dict[str, object]]:
     child_sequences = seed_sequence.spawn(len(RNG_STREAM_NAMES))
     streams = {
         name: np.random.default_rng(child)
@@ -76,6 +79,16 @@ def _named_random_streams(
         }
         for name, child in zip(RNG_STREAM_NAMES, child_sequences, strict=True)
     }
+    for name, child in zip(RNG_STREAM_NAMES, child_sequences, strict=True):
+        if name not in _REGIONAL_RNG_STREAMS:
+            continue
+        regional = child.spawn(n_regions)
+        streams[name] = [np.random.default_rng(region) for region in regional]
+        stream_metadata[name]["regions"] = [
+            {"sample_id": j, "spawn_key": list(region.spawn_key),
+             "seed_words": [int(word) for word in region.generate_state(4)]}
+            for j, region in enumerate(regional)
+        ]
     metadata = {
         "bit_generator": "PCG64",
         "root_seed_sequence": {
@@ -121,7 +134,7 @@ def _write_patient_simulation(
         raise FileExistsError(f"Refusing to overwrite existing tumor: {data_dir}")
     _validate_copy_number_config(copy_number_config)
     seed_sequence = np.random.SeedSequence(int(config.seed))
-    streams, rng_metadata = _named_random_streams(seed_sequence)
+    streams, rng_metadata = _named_random_streams(seed_sequence, n_samples)
 
     K = streams["seed_tree"].integers(K_min, K_max + 1)
     tau_vec = streams["seed_clone_fractions"].uniform(
@@ -177,23 +190,6 @@ def _write_patient_simulation(
         segments,
         random_state=streams["seed_mutation_segments"],
     )
-    cna_events = simulate_branch_cna_events(
-        sim_tree["parent"],
-        copy_number_config,
-        random_state=streams["seed_cna_events"],
-    )
-    evolution = simulate_joint_snv_cna_evolution(
-        parent=sim_tree["parent"],
-        mutation_origin_clone=cluster_id,
-        mutation_segment=mutation_segment,
-        branch_cna_events=cna_events,
-        n_segments=copy_number_config.n_segments,
-        max_allele_cn=copy_number_config.max_allele_cn,
-        random_state=streams["seed_multiplicity"],
-    )
-    cn_clone_id = np.zeros(K, dtype=int)
-    multiplicity = evolution.mutation_multiplicity
-
     data_dir.mkdir(parents=True, exist_ok=True)
     region_labels = tuple(f"region{j + 1}" for j in range(n_samples))
     for region_id in region_labels:
@@ -286,19 +282,6 @@ def _write_patient_simulation(
         }
     ).to_csv(data_dir / "truth_region_parameters.tsv", sep="\t", index=False)
 
-    truth_cn_profile = _cn_clone_profile_table(
-        evolution.clone_allele_cn,
-        segments,
-        clone_ids=np.arange(K, dtype=int),
-        cn_clone_ids=cn_clone_id,
-    )
-    truth_cn_profile.to_csv(
-        data_dir / "truth_cn_clone_profile.tsv", sep="\t", index=False
-    )
-    evolution.cna_event_history.to_csv(
-        data_dir / "truth_cna_events.tsv", sep="\t", index=False
-    )
-
     mutation_chromosome = np.asarray(
         [segments[int(segment_id)].chromosome for segment_id in mutation_segment],
         dtype=int,
@@ -308,25 +291,8 @@ def _write_patient_simulation(
             "mutation_id": mutation_ids,
             "origin_clone_id": cluster_id,
             "segment_id": mutation_segment,
-            "multiplicity": multiplicity,
-            "multiplicity_source": "uniform_unequal_cn_else_one",
         }
     ).to_csv(data_dir / "truth_mutation_history.tsv", sep="\t", index=False)
-
-    dosage_carrier = evolution.mutation_carrier.reshape(-1)
-    dosage_values = np.where(
-        dosage_carrier,
-        evolution.mutation_dosage_numeric.reshape(-1).astype(object),
-        None,
-    )
-    pd.DataFrame(
-        {
-            "mutation_id": np.repeat(mutation_ids, K),
-            "clone_id": np.tile(np.arange(K, dtype=int), no_mutations),
-            "carrier": dosage_carrier.astype(int),
-            "dosage": pd.array(dosage_values, dtype="Int64"),
-        }
-    ).to_csv(data_dir / "truth_mutation_clone_dosage.tsv", sep="\t", index=False)
 
     pd.DataFrame(
         {
@@ -340,8 +306,34 @@ def _write_patient_simulation(
     truth_mutation_sample_tables: list[pd.DataFrame] = []
     canonical_observation_tables: list[pd.DataFrame] = []
     depth_arrays: list[np.ndarray] = []
+    cn_profiles, event_tables, regional_complexity = [], [], {}
     for j in range(n_samples):
         region_id = region_labels[j]
+        cna_events = simulate_branch_cna_events(
+            parent, copy_number_config, random_state=streams["seed_cna_events"][j],
+        )
+        evolution = simulate_joint_snv_cna_evolution(
+            parent=parent, mutation_origin_clone=cluster_id,
+            mutation_segment=mutation_segment, branch_cna_events=cna_events,
+            n_segments=copy_number_config.n_segments,
+            max_allele_cn=copy_number_config.max_allele_cn,
+            random_state=streams["seed_multiplicity"][j],
+        )
+        multiplicity = evolution.mutation_multiplicity
+        cn_profiles.append(evolution.clone_allele_cn[0])
+        event_tables.append(evolution.cna_event_history.assign(sample_id=j))
+        regional_complexity[region_id] = _realized_cn_complexity(
+            mutation_segment=mutation_segment, evolution=evolution,
+            accepted_cna_events=len(cna_events),
+        )
+        if j == 0:
+            # Factorized dosage truth: shared carriers times regional multiplicity.
+            # Avoid an unnecessary mutation x clone x region output table.
+            pd.DataFrame({
+                "mutation_id": np.repeat(mutation_ids, K),
+                "clone_id": np.tile(np.arange(K, dtype=int), no_mutations),
+                "carrier": evolution.mutation_carrier.reshape(-1).astype(int),
+            }).to_csv(data_dir / "truth_mutation_carriers.tsv", sep="\t", index=False)
         local_state_table = _local_cn_state_table(
             sample_id=j,
             profile=evolution.clone_allele_cn[0],
@@ -414,6 +406,12 @@ def _write_patient_simulation(
             )
         )
 
+    _cn_sample_profile_table(np.asarray(cn_profiles), segments).to_csv(
+        data_dir / "truth_cn_sample.tsv", sep="\t", index=False,
+    )
+    pd.concat(event_tables, ignore_index=True).to_csv(
+        data_dir / "truth_cna_events.tsv", sep="\t", index=False,
+    )
     mutation_sample_truth = pd.concat(
         truth_mutation_sample_tables,
         ignore_index=True,
@@ -453,9 +451,10 @@ def _write_patient_simulation(
     intended_factors = {
         "cn_filter_policy_id": CN_FILTER_POLICY_ID,
         "cn_filter_max_major_cn": MAX_SIMULATION_ALLELE_CN,
-        "copy_number_mode": "clonal_trunk_gains",
+        "copy_number_mode": "independent_regional_clonal_gains",
         "multiplicity_mode": "uniform_unequal_cn_else_one",
-        "multiplicity_sampling_unit": "mutation_shared_across_regions",
+        "multiplicity_sampling_unit": "mutation_region",
+        "multiplicity_cap": MAX_SIMULATION_MULTIPLICITY,
         "mean_depth": int(N_mean),
         "purity_mean": float(simu_purity),
         "cna_event_rate": float(copy_number_config.cna_event_rate),
@@ -489,11 +488,7 @@ def _write_patient_simulation(
         "sample_count": int(n_samples),
         "sample_purity": _numeric_summary(sample_purities),
         "depth": _numeric_summary(np.concatenate(depth_arrays)),
-        "cn_complexity": _realized_cn_complexity(
-            mutation_segment=mutation_segment,
-            evolution=evolution,
-            accepted_cna_events=len(cna_events),
-        ),
+        "cn_complexity_by_region": regional_complexity,
     }
     rejection_counts = {
         "tree_ccf": int(sim_tree["generation_attempts"]) - 1,

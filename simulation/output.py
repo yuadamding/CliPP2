@@ -20,10 +20,12 @@ from .config import (
     GENERATOR_VERSION,
     OUTPUT_SCHEMA_VERSION,
     MAX_SIMULATION_ALLELE_CN,
+    MAX_SIMULATION_MULTIPLICITY,
 )
 from .evolution import (
     GenomeSegment,
     JointEvolutionResult,
+    _tree_order_and_ancestry,
 )
 
 
@@ -47,7 +49,7 @@ def _generator_provenance() -> tuple[str, str | None]:
                 digest.update(chunk)
         digest.update(b"\0")
     source_hash = digest.hexdigest()
-    project = source_dir.parents[1]
+    project = source_dir.parent
     if not (project / ".git").exists():
         return source_hash, None
     try:
@@ -176,13 +178,13 @@ def validate_generated_tumor_directory(tumor_dir: str | Path) -> None:
     if (
         not np.all(np.isfinite(multiplicity))
         or np.any(multiplicity != np.rint(multiplicity))
-        or np.any((multiplicity < 1) | (multiplicity > np.minimum(major, 6)))
+        or np.any((multiplicity < 1) | (multiplicity > np.minimum(major, MAX_SIMULATION_MULTIPLICITY)))
         or np.any(multiplicity[major == minor] != 1)
         or not np.all(np.isfinite(ccf))
         or np.any((ccf <= 0) | (ccf > 1 + 1e-8))
     ):
         raise ValueError(
-            "Truth requires positive CCF and integer multiplicity in 1..major CN."
+            "Truth requires positive CCF and local integer multiplicity in 1..min(major CN, 4)."
         )
     expected_vaf = (
         aligned.purity
@@ -200,18 +202,17 @@ def validate_generated_tumor_directory(tumor_dir: str | Path) -> None:
             raise ValueError(
                 f"Truth {name} disagrees with the clonal integer-CN model."
             )
-    if not aligned.groupby("mutation_id").multiplicity.nunique().eq(1).all():
-        raise ValueError("Mutation truth multiplicity must be shared across regions.")
     if not observed.cn_state_fraction.eq(1.0).all():
         raise ValueError("Clonal CN fractions must be exactly one.")
     if (
-        not observed.groupby("segment_id")[["allele_a_cn", "allele_b_cn"]]
+        not observed.groupby(["sample_id", "segment_id"])[["allele_a_cn", "allele_b_cn"]]
         .nunique()
         .eq(1)
         .all()
         .all()
     ):
-        raise ValueError("Clonal CN profiles must be identical across regions.")
+        raise ValueError("Clonal CN must be consistent within each regional segment.")
+    _validate_regional_truth(tumor_dir, observed, truth, region_numbers)
     clone_truth = pd.read_csv(tumor_dir / "truth_clone_sample.txt", sep="\t")
     linked = aligned.merge(truth, on="mutation_id", validate="many_to_one").merge(
         clone_truth,
@@ -246,26 +247,71 @@ def validate_generated_tumor_directory(tumor_dir: str | Path) -> None:
             or manifest["intended_factors"]["mutation_count"] != len(truth)
             or manifest["realized_factors"]["retained_mutation_count"] != len(truth)
             or manifest["realized_factors"]["excluded_mutation_count"] != 0
+            or manifest["intended_factors"]["copy_number_mode"] != "independent_regional_clonal_gains"
+            or manifest["intended_factors"]["multiplicity_sampling_unit"] != "mutation_region"
+            or manifest["intended_factors"]["multiplicity_cap"] != MAX_SIMULATION_MULTIPLICITY
             or manifest["input_file_hashes"] != input_hashes
             or manifest["truth_file_hashes"] != truth_hashes
         ):
             raise ValueError("Generated bundle does not match its versioned manifest.")
 
 
-def _cn_clone_profile_table(
+def _validate_regional_truth(tumor_dir, observed, truth, region_numbers):
+    """Check compact regional CN and factorized carrier truth against input/tree."""
+    profiles = pd.read_csv(tumor_dir / "truth_cn_sample.tsv", sep="\t")
+    keys = ["sample_id", "segment_id"]
+    if profiles.duplicated(keys).any() or set(profiles.sample_id) != set(region_numbers.values()):
+        raise ValueError("Regional CN truth must have one profile per sample and segment.")
+    cn = profiles[["allele_a_cn", "allele_b_cn"]].to_numpy()
+    if (not np.isfinite(cn).all() or np.any(cn != np.rint(cn))
+            or np.any((cn < 1) | (cn > MAX_SIMULATION_ALLELE_CN))
+            or not np.array_equal(profiles.major_cn, cn.max(axis=1))
+            or not np.array_equal(profiles.minor_cn, cn.min(axis=1))
+            or not np.array_equal(profiles.total_cn, cn.sum(axis=1))):
+        raise ValueError("Invalid regional CN truth profile.")
+    joined = observed.merge(profiles[keys + ["major_cn", "minor_cn"]], on=keys,
+                            how="left", validate="many_to_one")
+    if not (joined.allele_a_cn.eq(joined.major_cn) & joined.allele_b_cn.eq(joined.minor_cn)).all():
+        raise ValueError("Regional CN truth disagrees with canonical input.")
+    segment_ids = set(profiles.segment_id)
+    for region, sample_id in region_numbers.items():
+        local = profiles.loc[profiles.sample_id.eq(sample_id)].set_index("segment_id").sort_index()
+        states = pd.read_csv(tumor_dir / region / "truth_cn_states.tsv", sep="\t")
+        if (set(local.index) != segment_ids or states.segment_id.duplicated().any()
+                or set(states.segment_id) != segment_ids or not states.tumor_fraction.eq(1).all()):
+            raise ValueError("Regional CN state coverage/fractions disagree with profile.")
+        columns = ["allele_a_cn", "allele_b_cn", "major_cn", "minor_cn"]
+        if not np.array_equal(states.set_index("segment_id").sort_index()[columns], local[columns]):
+            raise ValueError("Regional CN states disagree with profile.")
+
+    tree = pd.read_csv(tumor_dir / "truth_clone_tree.tsv", sep="\t").sort_values("clone_id")
+    if not np.array_equal(tree.clone_id, np.arange(len(tree))):
+        raise ValueError("Invalid clone truth IDs.")
+    _, ancestry = _tree_order_and_ancestry(tree.parent_clone_id.to_numpy())
+    carriers = pd.read_csv(tumor_dir / "truth_mutation_carriers.tsv", sep="\t")
+    if (carriers.duplicated(["mutation_id", "clone_id"]).any()
+            or len(carriers) != len(truth) * len(tree)
+            or set(carriers.mutation_id) != set(truth.mutation_id)
+            or set(carriers.clone_id) != set(tree.clone_id)
+            or not truth.cluster_id.isin(tree.clone_id).all()):
+        raise ValueError("Invalid mutation-clone carrier coverage.")
+    matrix = carriers.pivot(index="mutation_id", columns="clone_id", values="carrier").loc[truth.mutation_id]
+    if not np.array_equal(matrix, ancestry[truth.cluster_id.to_numpy()]):
+        raise ValueError("Mutation carrier truth disagrees with the clone tree.")
+
+
+def _cn_sample_profile_table(
     profiles: np.ndarray,
     segments: list[GenomeSegment],
-    *,
-    clone_ids: np.ndarray | None = None,
-    cn_clone_ids: np.ndarray | None = None,
 ) -> pd.DataFrame:
     profiles = np.asarray(profiles, dtype=int)
     rows: list[dict[str, int]] = []
-    for profile_index, profile in enumerate(profiles):
+    for sample_id, profile in enumerate(profiles):
         for segment in segments:
             allele_a = int(profile[segment.segment_id, 0])
             allele_b = int(profile[segment.segment_id, 1])
             row = {
+                "sample_id": int(sample_id),
                 "segment_id": int(segment.segment_id),
                 "chromosome": int(segment.chromosome),
                 "start": int(segment.start),
@@ -276,14 +322,6 @@ def _cn_clone_profile_table(
                 "minor_cn": min(allele_a, allele_b),
                 "total_cn": allele_a + allele_b,
             }
-            if clone_ids is None:
-                row = {"cn_clone_id": int(profile_index), **row}
-            else:
-                row = {
-                    "clone_id": int(clone_ids[profile_index]),
-                    "cn_clone_id": int(cn_clone_ids[profile_index]),
-                    **row,
-                }
             rows.append(row)
     return pd.DataFrame(rows)
 

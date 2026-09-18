@@ -1,4 +1,4 @@
-"""Tree-inherited carriers, clonal trunk CN, and sampled integer multiplicity."""
+"""Tree-inherited carriers and local clonal CN/dosage for one region."""
 
 from __future__ import annotations
 
@@ -7,7 +7,10 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .config import CopyNumberEvolutionConfig, _validate_copy_number_config
+from .config import (
+    CopyNumberEvolutionConfig, MAX_SIMULATION_MULTIPLICITY,
+    _validate_copy_number_config,
+)
 
 
 @dataclass(frozen=True)
@@ -109,7 +112,11 @@ def simulate_branch_cna_events(
     *,
     random_state=None,
 ) -> list[CNAEvent]:
-    """Sample trunk-only gains; all clones inherit the resulting CN profile."""
+    """Sample one region's gains; all its clones have the resulting CN profile.
+
+    Clone 0 denotes the local clonal state, not a common ancestral CNA history
+    across regions. The caller supplies a separate random stream for each region.
+    """
     _validate_copy_number_config(config)
     _tree_order_and_ancestry(parent)
     rng = np.random.default_rng(random_state)
@@ -175,7 +182,7 @@ def sample_multiplicity(
     *,
     random_state=None,
 ) -> np.ndarray:
-    """One uniform integer draw per unequal-CN mutation; equal-CN dosage is one."""
+    """Local mutation-region draws capped at four; equal-CN dosage is one."""
     major = np.asarray(major_cn)
     minor = np.asarray(minor_cn)
     if (
@@ -197,7 +204,7 @@ def sample_multiplicity(
     eligible = major != minor
     multiplicity[eligible] = rng.integers(
         1,
-        np.minimum(major[eligible], 6).astype(int) + 1,
+        np.minimum(major[eligible], MAX_SIMULATION_MULTIPLICITY).astype(int) + 1,
     )
     return multiplicity
 
@@ -212,10 +219,10 @@ def simulate_joint_snv_cna_evolution(
     max_allele_cn: int = 6,
     random_state=None,
 ) -> JointEvolutionResult:
-    """Inherit clonal CN and carriers, then sample dosage independently of timing.
+    """Build one region's clonal CN and carriers, then sample local dosage.
 
-    The tree defines mutation presence, not amplification history. Each mutation
-    has the same sampled dosage in every carrier clone and therefore every region.
+    The tree defines mutation presence, not amplification history. A mutation's
+    dosage is constant across carrier clones within this region, not across regions.
     """
     _validate_copy_number_config(
         CopyNumberEvolutionConfig(

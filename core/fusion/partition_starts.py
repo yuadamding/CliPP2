@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+from collections import OrderedDict
 from dataclasses import dataclass
 from collections.abc import Callable, Sequence
 from time import perf_counter
@@ -474,6 +475,65 @@ def hessian_weighted_ward_label_sets_torch(
     return out
 
 
+@dataclass(frozen=True, slots=True)
+class _LikelihoodColumnKey:
+    model_hash: str
+    eps: bytes
+    infeasible_penalty: bytes
+    center: bytes
+    infeasibility_policy: str = "upper_plus_max_eps_1e-8_v1"
+
+    @property
+    def nbytes(self) -> int:
+        return sum(len(value) for value in (
+            self.model_hash, self.eps, self.infeasible_penalty,
+            self.center, self.infeasibility_policy,
+        ))
+
+
+class _LikelihoodColumnCache:
+    """Fit-local LRU of exact count costs, never label-dependent allocations.
+
+    Bound array/key payload bytes and entry overhead independently. The model
+    hash includes the feasible box and ordered rows; no source/model arrays are
+    retained. Counters describe physical host work and are not fit outputs.
+    """
+
+    def __init__(self, *, max_entries: int = 1024, max_bytes: int = 32 * 1024**2):
+        if max_entries < 0 or max_bytes < 0:
+            raise ValueError("Likelihood cache limits must be nonnegative.")
+        self.max_entries, self.max_bytes = int(max_entries), int(max_bytes)
+        self._entries: OrderedDict[_LikelihoodColumnKey, np.ndarray] = OrderedDict()
+        self._bytes = 0
+        self.hits = self.misses = self.evictions = self.likelihood_evaluations = 0
+
+    def get(self, key: _LikelihoodColumnKey) -> np.ndarray | None:
+        column = self._entries.get(key)
+        if column is None:
+            self.misses += 1
+        else:
+            self.hits += 1
+            self._entries.move_to_end(key)
+        return column
+
+    def put(self, key: _LikelihoodColumnKey, column: np.ndarray) -> None:
+        size = key.nbytes + column.nbytes
+        if self.max_entries == 0 or size > self.max_bytes:
+            return
+        previous = self._entries.pop(key, None)
+        if previous is not None:
+            self._bytes -= key.nbytes + previous.nbytes
+        # Independent storage protects future hits from the caller's cost matrix.
+        stored = np.array(column, dtype=np.float64, copy=True)
+        stored.flags.writeable = False
+        self._entries[key] = stored
+        self._bytes += size
+        while len(self._entries) > self.max_entries or self._bytes > self.max_bytes:
+            oldest, value = self._entries.popitem(last=False)
+            self._bytes -= oldest.nbytes + value.nbytes
+            self.evictions += 1
+
+
 def _loss_to_centers(
     data: TumorData,
     centers: np.ndarray,
@@ -482,6 +542,7 @@ def _loss_to_centers(
     eps: float,
     infeasible_penalty: float = 1e100,
     _model: ObservedModel | None = None,
+    _column_cache: _LikelihoodColumnCache | None = None,
 ) -> np.ndarray:
     centers = np.asarray(centers, dtype=np.float64)
     model = (
@@ -492,17 +553,27 @@ def _loss_to_centers(
     num_mutations = int(data.num_mutations)
     num_clusters = int(centers.shape[0])
     cost = np.zeros((num_mutations, num_clusters), dtype=np.float64)
-    infeasible = np.zeros((num_mutations, num_clusters), dtype=bool)
 
     for cluster_idx in range(num_clusters):
-        phi_for_center = np.broadcast_to(centers[cluster_idx], model.shape)
-        loss = _observed_reduction_numpy(model, phi_for_center, eps=float(eps), output="loss")
-        cost[:, cluster_idx] = np.sum(loss, axis=1)
-        infeasible[:, cluster_idx] = np.any(
-            phi_for_center > model.upper + max(float(eps), 1e-8), axis=1
+        key = None if _column_cache is None else _LikelihoodColumnKey(
+            model.fingerprint, np.float64(eps).tobytes(),
+            np.float64(infeasible_penalty).tobytes(), centers[cluster_idx].tobytes(),
         )
+        column = None if key is None else _column_cache.get(key)
+        if column is None:
+            phi_for_center = np.broadcast_to(centers[cluster_idx], model.shape)
+            if _column_cache is not None:
+                _column_cache.likelihood_evaluations += 1
+            loss = _observed_reduction_numpy(model, phi_for_center, eps=float(eps), output="loss")
+            column = np.sum(loss, axis=1)
+            infeasible = np.any(
+                phi_for_center > model.upper + max(float(eps), 1e-8), axis=1
+            )
+            column[infeasible] = float(infeasible_penalty)
+            if key is not None:
+                _column_cache.put(key, column)
+        cost[:, cluster_idx] = column
 
-    cost[infeasible] = float(infeasible_penalty)
     return cost
 
 
@@ -639,6 +710,7 @@ def refine_partition_likelihood(
     refit_max_iter: int = PARTITION_GENERATION_REFIT_MAX_ITER,
     _refit_labels: Callable[[np.ndarray], _GuideCenters] | None = None,
     _model: ObservedModel | None = None,
+    _column_cache: _LikelihoodColumnCache | None = None,
 ) -> _GuideCenters:
     """Host CEM with fixed allocation scoring and empty-cluster repair."""
     labels = _validated_refinement_labels(data, labels)
@@ -647,6 +719,7 @@ def refine_partition_likelihood(
         if _model is None
         else _model
     )
+    column_cache = _LikelihoodColumnCache() if _column_cache is None else _column_cache
 
     def refit_labels(current_labels: np.ndarray) -> _GuideCenters:
         if _refit_labels is not None:
@@ -669,6 +742,7 @@ def refine_partition_likelihood(
             refit.cluster_centers,
             eps=float(eps),
             _model=model,
+            _column_cache=column_cache,
         )
         assignment_cost = _classification_assignment_cost(count_cost, labels)
         labels_next = np.argmin(assignment_cost, axis=1).astype(np.int64, copy=False)
@@ -721,6 +795,7 @@ def generate_likelihood_partition_starts(
     # identify each local refit, including repeated CEM proposals.
     refit_cache: dict[bytes, _GuideCenters] = {}
     coordinate_cache = _RefitCoordinateCache(work_stats=_work_stats)
+    column_cache = _LikelihoodColumnCache()
 
     def cached_refit(labels: np.ndarray) -> _GuideCenters:
         labels_key = _label_key(labels)
@@ -743,6 +818,7 @@ def generate_likelihood_partition_starts(
                     data, labels0, eps=float(eps), tol=float(tol),
                     max_iter=int(cem_max_iter), refit_max_iter=int(refit_max_iter),
                     _refit_labels=cached_refit, _model=source_model,
+                    _column_cache=column_cache,
                 )
             else:
                 refit = cached_refit(labels0)

@@ -1,4 +1,4 @@
-"""Tree-based CCF simulation with clonal CN and sampled integer multiplicity."""
+"""Tree-based CCF simulation with independent regional clonal CN and dosage."""
 
 from .config import (
     CopyNumberEvolutionConfig,

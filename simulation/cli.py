@@ -53,7 +53,7 @@ def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
         "--cna-event-rate",
         type=float,
         default=defaults.copy_number.cna_event_rate,
-        help="Trunk gain rate per genomic segment; all CN is clonal.",
+        help="Gain rate per genomic segment in each independent region; CN is locally clonal.",
     )
     parser.add_argument(
         "--region-count",
