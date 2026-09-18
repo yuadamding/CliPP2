@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import tempfile
 from uuid import uuid4
-import warnings
 
 import numpy as np
 import pandas as pd
@@ -21,7 +20,10 @@ from .core.bic import effective_bic_mutation_region_count
 from .core.objective import (
     compile_observed_model, make_base_objective_key, infer_integer_multiplicity_posterior_numpy,
 )
-from .io.data import CNFilterReport, TumorData, tumor_data_fingerprint, restore_immutable_record
+from .io.data import (
+    CNFilterReport, TumorData, tumor_data_fingerprint, restore_immutable_record,
+    readonly_array,
+)
 from .model_selection.candidates import validate_candidate_identity
 from .model_selection.proposals import pilot_matrix_hash
 from .model_selection.types import (
@@ -38,7 +40,6 @@ SelectedPartition = FusionPartition | DirectPartition
 OUTPUT_SUFFIXES = (
     "mutation_clusters.tsv", "cluster_centers.tsv",
     "mutation_region_multiplicity.tsv", "excluded_mutations.tsv",
-    "run_manifest.json",
 )
 
 
@@ -79,8 +80,10 @@ def _source_identity() -> dict[str, object]:
 
 
 class RunPublication:
-    """Exclusive tumor namespace with a completion-last, hash-bound manifest.
+    """Four no-clobber TSVs with an in-memory, hash-bound completion record.
 
+    Exclusively creating the exclusion audit claims the tumor namespace before
+    any fitted tables are published. No manifest or lock sidecar is written.
     A failed or interrupted attempt must use a new output directory to retry.
     Existing files are never replaced or removed, including partial attempts.
     """
@@ -114,7 +117,6 @@ class RunPublication:
             graph = fit_config.graph.graph
             config["graph"]["graph"] = None if graph is None else {"fingerprint": graph.fingerprint}
         workflow = {} if workflow is None else workflow
-        self.path = self.outdir / f"{self.tumor_id}_run_manifest.json"
         self.record = {
             "schema_version": 1, "run_id": uuid4().hex, "tumor_id": self.tumor_id,
             "status": "running", "started_at": datetime.now(timezone.utc).isoformat(),
@@ -127,53 +129,31 @@ class RunPublication:
             "workflow": workflow, "workflow_sha256": hashlib.sha256(_json_bytes(workflow)).hexdigest(),
             "files": {}, "analysis": None,
         }
-        # The manifest is also the exclusive claim: two concurrent starts
-        # cannot both acquire the same namespace after their directory check.
-        with self.path.open("xb") as stream:
-            stream.write(_json_bytes(self.record))
-            stream.flush()
-            os.fsync(stream.fileno())
 
-    def _save(self) -> None:
-        current = json.loads(self.path.read_text())
-        if current.get("run_id") != self.record["run_id"] or current.get("status") != "running":
-            raise RuntimeError("Run manifest ownership or running status changed.")
-        with tempfile.NamedTemporaryFile(dir=self.outdir, prefix=".clipp2-manifest-", delete=False) as stream:
-            temporary = Path(stream.name)
-            try:
-                stream.write(_json_bytes(self.record))
-                stream.flush()
-                os.fsync(stream.fileno())
-            except BaseException:
-                temporary.unlink(missing_ok=True)
-                raise
-        try:
-            os.replace(temporary, self.path)
-        finally:
-            temporary.unlink(missing_ok=True)
+    def _require_running(self) -> None:
+        if self.record["status"] != "running":
+            raise RuntimeError("Publication is no longer running.")
 
     def _remember(self, path: Path) -> None:
         self.record["files"][path.name] = {"sha256": _file_hash(path), "size_bytes": path.stat().st_size}
 
     def write_audit(self, report: CNFilterReport | None) -> None:
+        self._require_running()
         path = self.outdir / f"{self.tumor_id}_excluded_mutations.tsv"
         with path.open("x") as stream:
             cn_filter_output_table(self.tumor_id, report).to_csv(stream, sep="\t", index=False)
+            stream.flush()
+            os.fsync(stream.fileno())
         self._remember(path)
-        self._save()
 
     def fail(self, error: BaseException) -> None:
+        self._require_running()
         self.record.update(status="failed", finished_at=datetime.now(timezone.utc).isoformat(),
                            error={"type": type(error).__name__, "message": str(error)})
-        try:
-            self._save()
-        except Exception as manifest_error:
-            # A disk/full permission failure must not hide the fit exception.
-            # The previous running manifest still cannot be read as complete.
-            warnings.warn(f"Could not persist failed run status: {manifest_error}", RuntimeWarning)
 
     def publish(self, tables: dict[str, pd.DataFrame], *, analysis: dict[str, object] | None = None) -> None:
-        if {f"{suffix}.tsv" for suffix in tables} != set(OUTPUT_SUFFIXES[:-1]):
+        self._require_running()
+        if {f"{suffix}.tsv" for suffix in tables} != set(OUTPUT_SUFFIXES):
             raise ValueError("Publication requires all four analysis tables.")
         # Qualification is supplied only after identity-valid table generation.
         # It describes the fit even if file publication subsequently fails.
@@ -181,7 +161,11 @@ class RunPublication:
         self.record["analysis"] = analysis
         with tempfile.TemporaryDirectory(dir=self.outdir, prefix=".clipp2-tables-") as staging:
             paths = []
-            for suffix, table in tables.items():
+            # Even standalone publication must acquire the exclusive audit
+            # claim before linking any fitted table. Concurrent losers cannot
+            # leave a mixture of two runs' outputs.
+            for suffix in ("excluded_mutations", *(name for name in tables if name != "excluded_mutations")):
+                table = tables[suffix]
                 path = Path(staging) / f"{self.tumor_id}_{suffix}.tsv"
                 table.to_csv(path, sep="\t", index=False)
                 paths.append(path)
@@ -201,7 +185,7 @@ class RunPublication:
             for name, identity in self.record["files"].items():
                 if _file_hash(self.outdir / name) != identity["sha256"]:
                     raise ValueError("Published output changed before completion.")
-            expected = {self.path.name, *self.record["files"]}
+            expected = set(self.record["files"])
             actual = {path.name for path in self.outdir.iterdir()
                       if path.name.startswith(f"{self.tumor_id}_")}
             if actual != expected:
@@ -209,8 +193,7 @@ class RunPublication:
             if self.record["input"] is not None:
                 if _file_hash(Path(self.record["input"]["path"])) != self.record["input"]["sha256"]:
                     raise ValueError("Input changed during the run.")
-            self.record.update(status="complete", finished_at=datetime.now(timezone.utc).isoformat())
-            self._save()
+        self.record.update(status="complete", finished_at=datetime.now(timezone.utc).isoformat())
 
 
 def _validated_profile(
@@ -229,13 +212,12 @@ def _validated_profile(
 
 
 def _mutation_output_table(analysis: AnalysisSerialization) -> pd.DataFrame:
-    data, partition, refit = analysis.data, analysis.partition, analysis.refit
-    labels, refit_phi = partition.labels, refit.phi
+    data, refit_phi = analysis.data, analysis.refit.phi
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, data.num_mutations),
             "mutation_id": data.mutation_ids,
-            "cluster_label": labels + 1,
+            "cluster_label": analysis.output_labels,
         }
     )
     for column, region_id in enumerate(data.region_ids):
@@ -249,12 +231,12 @@ def _mutation_output_table(analysis: AnalysisSerialization) -> pd.DataFrame:
 
 def _cluster_output_table(analysis: AnalysisSerialization) -> pd.DataFrame:
     data, partition, refit = analysis.data, analysis.partition, analysis.refit
-    labels, centers = partition.labels, refit.cluster_centers
-    sizes = np.bincount(labels, minlength=int(partition.n_clusters))
+    centers = refit.cluster_centers[analysis.output_cluster_order]
+    sizes = np.bincount(analysis.output_labels, minlength=int(partition.n_clusters))
     table = pd.DataFrame(
         {
             "tumor_id": np.repeat(data.tumor_id, partition.n_clusters),
-            "cluster_label": np.arange(1, partition.n_clusters + 1, dtype=int),
+            "cluster_label": np.arange(partition.n_clusters, dtype=int),
             "cluster_size": sizes,
         }
     )
@@ -294,8 +276,7 @@ def _add_integer_multiplicity(
 
 
 def _mutation_region_output_table(analysis: AnalysisSerialization) -> pd.DataFrame:
-    data, partition, refit = analysis.data, analysis.partition, analysis.refit
-    labels, refit_phi = partition.labels, refit.phi
+    data, refit_phi = analysis.data, analysis.refit.phi
     mutation_ids = np.repeat(
         np.asarray(data.mutation_ids, dtype=object), data.num_regions
     )
@@ -308,7 +289,7 @@ def _mutation_region_output_table(analysis: AnalysisSerialization) -> pd.DataFra
             "tumor_id": np.repeat(data.tumor_id, mutation_ids.shape[0]),
             "mutation_id": mutation_ids,
             "region_id": region_ids,
-            "cluster_label": np.repeat(labels + 1, data.num_regions),
+            "cluster_label": np.repeat(analysis.output_labels, data.num_regions),
             "phi": refit_phi.reshape(-1),
             "major_cn": data.major_cn.reshape(-1),
             "minor_cn": data.minor_cn.reshape(-1),
@@ -356,7 +337,7 @@ def _write_fit_tables(analysis: AnalysisSerialization, publication: RunPublicati
     publication.publish(tables, analysis=analysis.qualification)
 
 
-SUMMARY_SCHEMA_VERSION = 6
+SUMMARY_SCHEMA_VERSION = 7
 
 
 def input_model_summary(data: TumorData, *, eps=1e-6) -> dict[str, object]:
@@ -440,6 +421,15 @@ def _qualification(analysis: AnalysisSerialization) -> dict[str, object]:
     return {
         "raw_reference": _raw_qualification(raw_fit),
         "selected_raw_fit": None if selected_raw is None else _raw_qualification(selected_raw),
+        "output_labeling": {
+            "policy": "descending_refit_ccf_l2_v1",
+            "tie_break": "internal_cluster_label_ascending",
+            "internal_labels_in_output_order": analysis.output_cluster_order.tolist(),
+            "labels_hash": _array_fingerprint(analysis.output_labels, dtype=np.dtype(np.int64)),
+            "centers_hash": _array_fingerprint(
+                refit.cluster_centers[analysis.output_cluster_order], dtype=np.dtype(np.float64),
+            ),
+        },
         "selected_partition": {
             "family": "direct_partition" if direct else "raw_fusion",
             "source": str(partition.source), "signature": str(partition.signature),
@@ -492,6 +482,8 @@ class AnalysisSerialization:
     raw_fit: RawFit = field(init=False)
     partition: SelectedPartition = field(init=False)
     refit: PartitionRefitSummary = field(init=False)
+    output_cluster_order: np.ndarray = field(init=False, repr=False)
+    output_labels: np.ndarray = field(init=False, repr=False)
     _qualification_json: bytes = field(init=False, repr=False)
 
     def __init__(
@@ -567,6 +559,14 @@ class AnalysisSerialization:
                             ("fit_config", fit_config), ("selection_result", selection_result),
                             ("raw_fit", raw_fit), ("partition", partition), ("refit", refit)):
             object.__setattr__(self, name, value)
+        # A display-only permutation of the validated final-refit centers.
+        # Stable sorting breaks exact L2 ties by the original internal label;
+        # selected labels, refit arrays, signatures and certificates stay intact.
+        order = np.argsort(-np.linalg.norm(refit.cluster_centers, axis=1), kind="stable")
+        label_map = np.empty(partition.n_clusters, dtype=np.int64)
+        label_map[order] = np.arange(partition.n_clusters, dtype=np.int64)
+        object.__setattr__(self, "output_cluster_order", readonly_array(order, dtype=np.int64))
+        object.__setattr__(self, "output_labels", readonly_array(label_map[partition.labels]))
         object.__setattr__(self, "_qualification_json", _json_bytes(_qualification(self)))
 
     @property
@@ -602,7 +602,7 @@ def analysis_summary(
     *,
     elapsed_seconds: float,
 ) -> dict[str, object]:
-    """Serialize schema-v5 diagnostics from the manifest qualification record."""
+    """Serialize diagnostics from the validated in-memory qualification record."""
 
     if analysis.selection_result is None or analysis.fit_config is None:
         raise ValueError("An analysis summary requires the completed selection and configuration.")

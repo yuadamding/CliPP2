@@ -47,7 +47,7 @@ positive-integer CN eligibility cutoff with `--max-major-cn` (default 4).
 
 ## Outputs
 
-A successful fit writes five artifacts into `--outdir`, prefixed with the tumor id (the input
+A successful fit writes four TSV files into `--outdir`, prefixed with the tumor id (the input
 file stem unless a `##tumor_id` metadata line overrides it):
 
 | File | One row per | Main fields |
@@ -56,12 +56,4 @@ file stem unless a `##tumor_id` metadata line overrides it):
 | `{tumor_id}_cluster_centers.tsv` | selected cluster | size and final CCF per region |
 | `{tumor_id}_mutation_region_multiplicity.tsv` | mutation × region | final CCF, CN, multiplicity MAP call, and posterior probabilities |
 | `{tumor_id}_excluded_mutations.tsv` | triggering mutation–region–reason | original-CN exclusion audit; header-only when none are excluded |
-| `{tumor_id}_run_manifest.json` | run | source/input/config hashes, numerical qualification, and output hashes |
-
-CCFs use `phi_<region>` in the wide tables and `phi` in the long table.
-Publication never changes selected labels or refits CCFs. Outputs are never
-overwritten: use a new directory for retries. Exclusion evidence is written
-before fitting; the manifest becomes complete only after validated publication.
-Numerical failure preserves a failed manifest and exclusion audit, not a
-mislabelled successful clustering result.
 

@@ -50,7 +50,7 @@ def process_tumor_bundle(
         summary = analysis_summary(analysis, elapsed_seconds=perf_counter() - start_time)
         write_analysis_outputs(analysis, outdir=outdir, publication=publication)
         summary["run_id"] = publication.record["run_id"]
-        summary["run_manifest"] = str(publication.path)
+        summary["publication"] = publication.record
     except BaseException as error:
         publication.fail(error)
         raise
