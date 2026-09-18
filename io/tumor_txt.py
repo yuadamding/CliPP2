@@ -16,7 +16,7 @@ from .data import CNFilterRecord, CNFilterReport, TumorData
 from ..config import DEFAULT_MAX_MAJOR_CN, validate_max_major_cn
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
-CN_FILTER_POLICY_ID = "clonal_cn_major_limit_whole_mutation_v2"
+CN_FILTER_POLICY_ID = "major_limit_whole_mutation_v3"
 SUBCLONAL_CN_REGION = "SUBCLONAL_CN_REGION"
 MAJOR_CN_ABOVE_LIMIT = "MAJOR_CN_ABOVE_LIMIT"
 NO_POSITIVE_PATH = "NO_POSITIVE_MUTANT_COPY_PATH"
@@ -510,7 +510,7 @@ def _filter_snv_cn(
     validated: _ValidatedLongTable,
     *, max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
 ) -> tuple[_ValidatedLongTable, CNFilterReport]:
-    """Exclude whole SNVs using every sample's original validated CN states."""
+    """Exclude whole SNVs if any original CN state in any region exceeds the limit."""
     max_major_cn = validate_max_major_cn(max_major_cn)
     records: list[CNFilterRecord] = []
     excluded_ids: set[str] = set()
@@ -519,15 +519,11 @@ def _filter_snv_cn(
         states = validated.states_by_segment[(sample_id, segment_id)]
         n_states = len(states)
         max_major = max(state.allele_a_cn for state in states)
-        reasons = []
-        if n_states > 1:
-            reasons.append(SUBCLONAL_CN_REGION)
         if max_major > max_major_cn:
-            reasons.append(MAJOR_CN_ABOVE_LIMIT)
-        for reason in reasons:
             excluded_ids.add(mutation_id)
             records.append(CNFilterRecord(
-                mutation_id, sample_id, segment_id, reason, n_states, max_major
+                mutation_id, sample_id, segment_id, MAJOR_CN_ABOVE_LIMIT,
+                n_states, max_major,
             ))
     retained_ids = tuple(
         mutation_id for mutation_id in validated.mutation_ids
@@ -671,7 +667,7 @@ def load_tumor_txt(
     eps: float = 1e-6,
     max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
 ) -> TumorData:
-    """Filter whole SNVs above max_major_cn (default 4) or with subclonal CN."""
+    """Exclude whole SNVs if any CN state in any region exceeds max_major_cn."""
 
     max_major_cn = validate_max_major_cn(max_major_cn)
     epsilon = float(eps)

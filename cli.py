@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
     fit.add_argument(
         "--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN,
-        help="Exclude a mutation from all regions if any region's major CN exceeds this limit.",
+        help="Exclude a mutation from all regions if any CN state's major CN in any region exceeds this limit.",
     )
     fit.add_argument("--verbose", action="store_true")
     fit.add_argument("--version", action="version", version=__version__)

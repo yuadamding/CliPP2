@@ -15,12 +15,15 @@ pip install .
 The public input is one tab-delimited file per tumor. See
 [`examples/exampleTumor1.tsv`](examples/exampleTumor1.tsv).
 
-CliPP2 excludes a mutation from **all regions** if any region has subclonal
-copy number (more than one distinct CN state after identical states are combined)
-or major CN greater than `--max-major-cn` (**default: 4**); different clonal CN
-states between regions are allowed. The limit is inclusive: major CN 4 is
-retained by default, while 5 and above are excluded. Use `--max-major-cn 6` for
-the previous cutoff. For each retained mutation–region pair, fitting marginalizes integer
+CliPP2 excludes a mutation from **all regions** if **any CN state in any region**
+has major CN greater than `--max-major-cn` (**default: 4**). Every state is
+checked, including low-fraction subclonal states and regions with missing read
+counts; neither average CN nor the dominant state determines eligibility.
+The limit is inclusive: major CN 4 passes, while 5 and above exclude the whole
+mutation. Use `--max-major-cn 6` for the previous cutoff. Subclonal CN alone
+is no longer a filtering reason.
+
+For each retained clonal-CN mutation–region pair, fitting marginalizes integer
 multiplicity candidates from **1 to major CN** with uniform priors under a
 binomial likelihood adjusted for purity, normal/tumor copy number, and CCF.
 The reported multiplicity is the highest-posterior candidate conditional on the
