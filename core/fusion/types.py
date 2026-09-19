@@ -485,6 +485,10 @@ class CertificateResult:
     witness_search_complete: bool = False
     witness_branches_eligible: tuple[int, ...] = ()
     witness_branches_attempted: tuple[int, ...] = ()
+    # Attempted boxes covered by a fresh audit of an unchanged incumbent.
+    witness_branches_reused: tuple[int, ...] = ()
+    witness_reuse_basis: str = ""
+    witness_reuse_audit_failures: tuple[tuple[int, str], ...] = ()
     witness_branches_pruned: tuple[int, ...] = ()
     witness_branches_unresolved: tuple[int, ...] = ()
     witness_branches_separable: tuple[int, ...] = ()
@@ -531,15 +535,34 @@ class CertificateResult:
         pruned = indices("pruned", self.witness_branches_pruned)
         separable = indices("separable", self.witness_branches_separable)
         unresolved = indices("unresolved", self.witness_branches_unresolved)
+        reused = indices("reused", self.witness_branches_reused)
         if attempted & pruned or attempted & separable or pruned & separable:
             raise ValueError("Clonal search attempted/pruned/separable coverage overlaps.")
         if attempted | pruned | separable != eligible:
             raise ValueError("Clonal search coverage omits eligible rows or includes ineligible rows.")
         if not unresolved <= attempted:
             raise ValueError("Clonal search unresolved rows must be attempted rows.")
+        if not reused <= attempted - unresolved:
+            raise ValueError("Clonal search reused rows must be attempted resolved rows.")
+        if self.witness_reuse_basis != (
+            "fresh_float64_kkt_with_global_support" if reused else ""
+        ):
+            raise ValueError("Clonal search reuse lacks its pointwise global-support basis.")
+        audit_failed = indices("reuse audit failures", tuple(
+            index for index, _ in self.witness_reuse_audit_failures
+        ))
+        if not audit_failed <= attempted - reused or any(
+            not isinstance(reason, str) or not reason
+            for _, reason in self.witness_reuse_audit_failures
+        ):
+            raise ValueError("Clonal search reuse audit failure evidence contradicts attempted coverage.")
+        if audit_failed and self.witness_search_work_complete:
+            raise ValueError("An interrupted reuse audit cannot claim complete work accounting.")
         selected = indices("selected witness", (witness_index,))
         if not selected <= attempted:
             raise ValueError("Clonal search selected witness was not attempted.")
+        if selected & reused:
+            raise ValueError("Clonal search selected witness must retain its original solve.")
         if self.admissible and selected & unresolved:
             raise ValueError("An admissible clonal fit cannot select an unresolved witness.")
         if bool(self.witness_search_complete) != (not unresolved):

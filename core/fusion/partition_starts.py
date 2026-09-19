@@ -80,9 +80,13 @@ def _fit_guide_centers(
     count, regions = int(labels.max()) + 1, data.num_regions
     centers = np.zeros((count, regions), dtype=np.float64)
     block_losses = np.zeros(count, dtype=np.float64)
-    loss, finite = 0.0, True
+    loss = 0.0
+    block_finite = np.ones(count, dtype=bool)
     tolerance = tol / max(count * regions, 1)
-    for cluster in range(count):
+    # The sole occupied block is exactly fixed by the constraint. Unanchored
+    # graph/pilot guides still use their ordinary free scalar optimizer.
+    free_clusters = () if _require_clonal and count == 1 else range(count)
+    for cluster in free_clusters:
         members = np.flatnonzero(labels == cluster)
         for region in range(regions):
             upper = max(eps, float(np.min(model.upper[members, region])))
@@ -119,7 +123,7 @@ def _fit_guide_centers(
             centers[cluster, region] = coordinate.beta
             loss += coordinate.loss
             block_losses[cluster] += coordinate.loss
-            finite = finite and coordinate.finite_candidate_found
+            block_finite[cluster] &= coordinate.finite_candidate_found
     clonal_cluster_id = None
     if _require_clonal:
         eligible_rows, row_losses = (
@@ -129,8 +133,9 @@ def _fit_guide_centers(
         centers, loss, clonal_cluster_id = _profile_clonal_centers(
             labels, centers, block_losses, eligible_rows, row_losses,
         )
+        block_finite[clonal_cluster_id] = True
     return _GuideCenters(labels, centers, np.clip(centers[labels], eps, model.upper),
-                         loss, bool(finite and np.isfinite(loss)), clonal_cluster_id)
+                         loss, bool(np.all(block_finite) and np.isfinite(loss)), clonal_cluster_id)
 
 
 # Bound each temporary used to initialize the dense Ward cost matrix.  The

@@ -17,6 +17,7 @@ from ..objective import (
     TorchObservedTerms,
     compile_observed_model,
     has_proven_convex_observed_loss,
+    has_global_supporting_tangent,
     make_base_objective_key,
     make_lambda_objective_key,
     model_to_torch,
@@ -2650,6 +2651,45 @@ def _separable_zero_witness(
     return witness, phi
 
 
+def _audit_reusable_witness(
+    branch: PreparedProblem, incumbent: RawFit, *, lambda_value: float, tolerance: float,
+) -> tuple[bool, WorkCounters, str | None]:
+    """Cover a new box only by a fresh original-gate audit and global support.
+
+    Exact shared clonal membership is feasibility, not optimality. A singleton
+    supporting tangent (or the existing whole-loss convexity proof) plus the
+    original KKT certificate is sufficient for this conditional box. Mixtures
+    and failed audits still receive the full, unchanged multistart solve.
+    """
+    index = branch.optimization_box.witness_index
+    if not incumbent.certificate.admissible or not np.all(incumbent.phi[index] == 1.0):
+        return False, WorkCounters(), None
+    if not (
+        has_proven_convex_observed_loss(branch.source_model, eps=branch.eps)
+        or has_global_supporting_tangent(branch.source_model, incumbent.phi, eps=branch.eps)
+    ):
+        return False, WorkCounters(), None
+    try:
+        diagnostics, _, directional, objective = _terminal_backward_error_audit_float64(
+            problem=branch,
+            phi=torch.tensor(incumbent.phi, device=branch.runtime.device),
+            certificate=incumbent.certificate.witness,
+            lambda_value=lambda_value, tol=tolerance,
+        )
+    except (RuntimeError, MemoryError, FloatingPointError, ValueError) as error:
+        # This optional proof must not replace a working full solve with an
+        # audit-only failure. A partial audit has no complete work receipt.
+        return False, WorkCounters(), f"{type(error).__name__}: {error}"
+    # Reusing a point must not move its objective, even by a refit or projection.
+    covered = bool(
+        directional and diagnostics.box_residual == 0.0
+        and np.isfinite(diagnostics.backward_error_kkt_residual)
+        and diagnostics.backward_error_kkt_residual <= 5.0 * tolerance
+        and objective == incumbent.objective.total
+    )
+    return covered, WorkCounters(full_certificate_audit_passes=1), None
+
+
 def fit_prepared(
     problem: PreparedProblem,
     lambda_value: float,
@@ -2697,7 +2737,8 @@ def fit_prepared(
     scalar_bounds, clonal_loss = _witness_scalar_bounds(problem)
     separable = _separable_zero_witness(problem, eligible, clonal_loss) if lambda_value == 0.0 else None
     order = [separable[0]] if separable is not None else list(eligible)
-    attempted, pruned, unresolved, failures = [], [], [], []
+    attempted, pruned, unresolved, failures, reused = [], [], [], [], []
+    reuse_audit_failures = []
     incumbent = None
     failed_incumbent = None
     total_work = WorkCounters()
@@ -2720,6 +2761,21 @@ def fit_prepared(
         candidate = None
         try:
             branch = _prepare_witness_problem(problem, index)
+            if incumbent is not None:
+                # Every audit, successful or rejected, is counted once. An
+                # unsuccessful certificate never suppresses the normal solve.
+                covered, audit_work, audit_failure = _audit_reusable_witness(
+                    branch, incumbent, lambda_value=lambda_value,
+                    tolerance=(solver_options.tolerance if solver_options.certification_tolerance is None
+                               else solver_options.certification_tolerance),
+                )
+                total_work = total_work + audit_work
+                if audit_failure is not None:
+                    reuse_audit_failures.append((index, audit_failure))
+                    work_complete = False
+                if covered:
+                    reused.append(index)
+                    continue
             branch_warm = warm_state
             if branch_warm is not None and branch_warm.objective_spec_hash != branch.objective_spec_hash:
                 # A point is reusable across boxes, but its dual/KKT witness is not.
@@ -2796,6 +2852,8 @@ def fit_prepared(
         )
         error.witness_branches_eligible = eligible
         error.witness_branches_attempted = tuple(attempted)
+        error.witness_branches_reused = tuple(reused)
+        error.witness_reuse_audit_failures = tuple(reuse_audit_failures)
         error.witness_branches_pruned = tuple(pruned)
         error.witness_branches_unresolved = tuple(unresolved)
         error.witness_branches_separable = ()
@@ -2822,6 +2880,9 @@ def fit_prepared(
             witness_search_complete=complete,
             witness_branches_eligible=eligible,
             witness_branches_attempted=tuple(attempted),
+            witness_branches_reused=tuple(reused),
+            witness_reuse_basis="fresh_float64_kkt_with_global_support" if reused else "",
+            witness_reuse_audit_failures=tuple(reuse_audit_failures),
             witness_branches_pruned=tuple(pruned),
             witness_branches_unresolved=tuple(unresolved),
             witness_branches_separable=separable_covered,

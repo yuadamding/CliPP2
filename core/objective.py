@@ -359,6 +359,55 @@ def has_proven_convex_observed_loss(model: ObservedModel | None, *, eps: float) 
     return model._convexity[epsilon]
 
 
+def has_global_supporting_tangent(
+    model: ObservedModel, phi: np.ndarray, *, eps: float,
+) -> bool:
+    """Sufficient pointwise global support for singleton clipped emissions.
+
+    The unclipped binomial loss is convex, so its tangent at an interior
+    probability lies below the whole unclipped segment. Clipping adds constant
+    segments at the ends of the original box. An affine function's maximum on
+    each such segment is at an endpoint: its inner endpoint is already covered
+    by convexity, and the outer endpoint is checked here with an outward safety
+    margin. This proves support at this point, NOT convexity of the whole loss.
+    Mixtures, clipped/kink evaluation points, and uncertain comparisons decline
+    the shortcut. No objective, bounds, or likelihood arithmetic is changed.
+    """
+    point = np.asarray(phi, dtype=np.float64)
+    if point.shape != model.shape or not np.all(np.isfinite(point)):
+        return False
+    if np.any(point < model.lower) or np.any(point > model.upper):
+        return False
+    active = model.observed & ((model.alt > 0.0) | (model.nonalt > 0.0))
+    active &= model.lower < model.upper
+    if np.any(active & (np.sum(model.valid, axis=-1) != 1)):
+        return False
+    epsilon = _validated_epsilon(eps)
+    slope = np.max(np.where(model.valid, model.slope, 0.0), axis=-1)
+    probability = slope * point
+    if np.any(active & ((probability <= epsilon) | (probability >= 1.0 - epsilon))):
+        return False
+    terms = observed_terms_numpy(model, point, eps=epsilon)
+    if not np.all(np.isfinite(terms.loss)) or not np.all(np.isfinite(terms.gradient)):
+        return False
+    for endpoint, clipped in (
+        (model.lower, slope * model.lower <= epsilon),
+        (model.upper, slope * model.upper >= 1.0 - epsilon),
+    ):
+        check = active & clipped
+        if not np.any(check):
+            continue
+        endpoint_loss = observed_terms_numpy(model, endpoint, eps=epsilon).loss
+        linear_change = terms.gradient * (endpoint - point)
+        tangent = terms.loss + linear_change
+        slack = 256.0 * np.finfo(np.float64).eps * (
+            1.0 + np.abs(endpoint_loss) + np.abs(terms.loss) + np.abs(linear_change)
+        )
+        if np.any(check & (~np.isfinite(endpoint_loss) | (tangent + slack > endpoint_loss))):
+            return False
+    return True
+
+
 def _qualify_clipped_convexity(model: ObservedModel, epsilon: float) -> bool:
     active = model.observed & ((model.alt > 0.0) | (model.nonalt > 0.0))
     active &= model.lower < model.upper

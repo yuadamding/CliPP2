@@ -955,10 +955,14 @@ def partition_constrained_observed_refit(
     max_grid_spacing = 0.0
     best_second_loss_gaps: list[float] = []
     block_losses = np.zeros(n_clusters, dtype=np.float64)
-    finite_coordinates = 0
+    block_finite_coordinates = np.zeros(n_clusters, dtype=np.int64)
     boundary_tolerance = max(10.0 * tolerance, 1e-8)
 
-    for cluster in range(n_clusters):
+    # With one occupied block its complete center is fixed at one; a free
+    # grid/local solve cannot affect the answer. Do not cache this fixed
+    # center under a free-coordinate key used by other candidate partitions.
+    free_clusters = range(n_clusters) if n_clusters != 1 else ()
+    for cluster in free_clusters:
         members = np.flatnonzero(normalized_labels == cluster)
         # flatnonzero is sorted, fixing membership identity and summation order.
         member_key = members.astype(np.int64, copy=False).tobytes() if _coordinate_cache is not None else b""
@@ -1004,7 +1008,7 @@ def partition_constrained_observed_refit(
                 best_second_loss_gaps.append(float(coordinate.best_second_loss_gap))
             certificate_methods.add(coordinate.certificate_method)
             block_losses[cluster] += coordinate.loss
-            finite_coordinates += int(coordinate.finite_candidate_found)
+            block_finite_coordinates[cluster] += int(coordinate.finite_candidate_found)
 
     eligible_rows, clonal_row_losses = _clonal_profile_inputs(
         model, eps=epsilon, cache=_coordinate_cache,
@@ -1012,6 +1016,16 @@ def partition_constrained_observed_refit(
     centers, total_loss, clonal_cluster_id = _profile_clonal_centers(
         normalized_labels, centers, block_losses, eligible_rows, clonal_row_losses,
     )
+    # A failed free solve for the block replaced by the exact-one center is
+    # not a failure of the selected constrained fit. Other free coordinates
+    # retain their original finite-candidate requirements.
+    block_finite_coordinates[clonal_cluster_id] = (
+        n_regions if np.isfinite(total_loss) else 0
+    )
+    finite_coordinates = int(np.sum(block_finite_coordinates))
+    if n_clusters == 1:
+        certificate_methods.add("fixed_clonal_centers_v1")
+        coordinate_lower.fill(float("-inf"))
     # These are descriptive fitted-coordinate diagnostics, not the unchanged
     # nominal K*R center penalty used by model selection.
     boundary_count = active_df = 0
@@ -1049,7 +1063,7 @@ def partition_constrained_observed_refit(
         refit_total_grid_points=int(total_grid_points),
         refit_max_grid_spacing=float(max_grid_spacing),
         refit_total_candidate_basins=0,
-        refit_total_refined_candidates=int(n_clusters * n_regions * int(scalar_local_steps)),
+        refit_total_refined_candidates=int(len(free_clusters) * n_regions * int(scalar_local_steps)),
         refit_min_best_second_loss_gap=(
             float(min(best_second_loss_gaps))
             if best_second_loss_gaps

@@ -66,6 +66,14 @@ The raw solver searches eligible temporary witnesses using the unchanged raw
 objective, sharing the frozen graph and processing branches sequentially.
 Only valid lower bounds may prune a branch. Worst-case work can approach one
 raw fit per eligible witness per lambda; this is not a constant-cost change.
+When a retained solution already satisfies another witness, a fresh float64
+KKT audit may cover that box without another optimization, but only with a
+convexity or singleton-likelihood supporting-tangent proof. Unsupported
+mixtures and rejected audits still receive the ordinary solve. The
+`witness_branches_reused` diagnostic records these audited branches separately;
+sharing a CCF-one row alone never supplies a certificate.
+Reuse keeps the existing numerical KKT tolerance; it is not a new zero-gap
+proof or a guarantee of bitwise agreement with independently iterated fits.
 An individual witness's KKT certificate is conditional on its fixed box, not
 a global certificate over all witnesses or clusterings. Search diagnostics
 distinguish attempted, pruned and unresolved branches.
@@ -78,6 +86,9 @@ Detailed branch coverage and elapsed time remain in the returned publication
 record, not an additional output file. If a branch raises before returning its
 work counters, `witness_search_work_complete` is false: counted work is then
 partial, while the recorded witness-search elapsed time still covers the search.
+By contrast, a branch that returns a nonadmissible certificate has completed
+its recorded computation: it makes the search unresolved, not the work count
+incomplete. This distinction does not relax raw-candidate admission.
 
 Partition refits choose the feasible occupied block with the smallest increase
 in count loss when fixed at the all-one center. Other centers retain their
@@ -85,6 +96,8 @@ ordinary fixed-label estimates, and CEM may change clonal membership. The
 existing nominal `K * regions` complexity and Dirichlet allocation score are
 unchanged: for fixed labels, only fitted count loss changes. Grid/local refits
 and bounded model selection retain their existing limited optimality claims.
+For a one-cluster partition the constraint fixes its entire center, so no free
+scalar-center optimization is needed.
 
 ## Fit
 
