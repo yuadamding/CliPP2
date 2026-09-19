@@ -1,5 +1,6 @@
 """Independent small oracles and real CPU/allocated-CUDA certificate paths."""
 from dataclasses import replace
+import json
 
 import numpy as np
 import pytest
@@ -83,7 +84,9 @@ def test_witness_search_matches_independent_binomial_enumeration(tmp_path, execu
 
 
 def reusable(tmp_path, device):
-    return context(tumor(tmp_path/'reuse.tsv', ((24.,),)*4), device=device)
+    # Strictly active upper bounds: the free MLE is 1.25, not exactly 1 with
+    # zero gradient, so this fixture genuinely exercises exact-point reuse.
+    return context(tumor(tmp_path/'reuse.tsv', ((30.,),)*4), device=device)
 
 
 def test_accepted_reuse_matches_exhaustive_solves_without_inventing_globality(tmp_path, execution_device, monkeypatch):
@@ -106,8 +109,9 @@ def test_failed_new_box_audit_triggers_real_ordinary_solves(tmp_path, execution_
     original = reusable(tmp_path, execution_device)
     audit, terminal, fit_box = (solver._audit_reusable_witness,
         solver._terminal_backward_error_audit_float64, solver._fit_prepared_box)
-    called = []
+    called, audited = [], []
     def reject(**kwargs):
+        audited.append(kwargs['problem'].optimization_box.witness_index)
         diagnostics, scope, direction, objective = terminal(**kwargs)
         return replace(diagnostics, backward_error_stationarity_residual=1.), scope, direction, objective
     def audit_only(*args, **kwargs):
@@ -120,9 +124,42 @@ def test_failed_new_box_audit_triggers_real_ordinary_solves(tmp_path, execution_
     monkeypatch.setattr(solver, '_audit_reusable_witness', audit_only)
     monkeypatch.setattr(solver, '_fit_prepared_box', record)
     result = solver.fit_prepared(original, 2., options())
+    assert audited == [1, 2, 3]  # A declined precondition cannot pass vacuously.
     assert called == [0, 1, 2, 3]
     assert result.certificate.witness_branches_reused == ()
     assert result.certificate.admissible and result.certificate.witness_search_complete
+
+
+def test_zero_gradient_boundary_records_exact_reuse_conditions(tmp_path, execution_device, record_property):
+    original = context(tumor(tmp_path/'boundary.tsv', ((24.,),)*4), device=execution_device)
+    first = solver._fit_prepared_box(solver._prepare_witness_problem(original, 0), 2., options())
+    target = solver._prepare_witness_problem(original, 1)
+    diagnostics, _, direction, objective = solver._terminal_backward_error_audit_float64(
+        problem=target, phi=torch.tensor(first.phi, device=execution_device),
+        certificate=first.certificate.witness, lambda_value=2., tol=8e-4)
+    support = (solver.has_proven_convex_observed_loss(original.source_model, eps=original.eps)
+               or solver.has_global_supporting_tangent(original.source_model, first.phi, eps=original.eps))
+    covered, work, failure = solver._audit_reusable_witness(target, first, lambda_value=2., tolerance=8e-4)
+    conditions = dict(incumbent_admissible=first.certificate.admissible,
+        exact_target_clonal=bool(np.all(first.phi[1] == 1.)), global_support=bool(support),
+        directional=bool(direction), box_zero=diagnostics.box_residual == 0.,
+        kkt_pass=bool(np.isfinite(diagnostics.backward_error_kkt_residual)
+                      and diagnostics.backward_error_kkt_residual <= .004),
+        objective_unchanged=objective == first.objective.total)
+    evidence = dict(device=execution_device, phi_hex=[[float(x).hex() for x in row] for row in first.phi],
+        objective_hex=first.objective.total.hex(), audit_objective_hex=objective.hex(),
+        audit_kkt=diagnostics.backward_error_kkt_residual, audit_box=diagnostics.box_residual,
+        conditions=conditions, reused=covered, reuse_audit_passes=work.full_certificate_audit_passes,
+        failure=failure, rejected_conditions=[name for name, passed in conditions.items() if not passed])
+    record_property('clonal_boundary_diagnostics', json.dumps(evidence, sort_keys=True))
+    assert failure is None and covered == all(conditions.values())
+    assert first.certificate.admissible and first.certificate.conditional_kkt_certified
+    assert first.certificate.components.residual <= .004
+    np.testing.assert_array_equal(first.phi[0], [1.])
+    assert np.all(first.phi >= original.source_model.lower) and np.all(first.phi <= original.source_model.upper)
+    # Independent analytic optimum: all four unconstrained MLEs equal one.
+    optimum = -4*(24*np.log(.4)+36*np.log(.6))
+    assert first.objective.total == pytest.approx(optimum, abs=2e-5)
 
 
 def test_optional_audit_failure_preserves_partial_work_after_recovery(tmp_path, execution_device, monkeypatch):
