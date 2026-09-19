@@ -14,7 +14,8 @@ from CliPP2.core.clonal import (
 from CliPP2.core.fusion import partition_starts, solver
 from CliPP2.core.objective import compile_observed_model, observed_terms_numpy
 from CliPP2.model_selection.candidates import evaluate_partition
-from CliPP2.model_selection.partitions import extract_certified_fusion_partition
+from CliPP2.model_selection.partitions import _partition_signature, extract_certified_fusion_partition
+from CliPP2.model_selection.types import DirectPartition
 
 from ._fixtures import context, options, tumor, two_blocks
 
@@ -105,6 +106,49 @@ def test_same_labels_ignore_raw_witness_and_retain_original_score_penalty(tmp_pa
     assert first.score.penalty == ordinary.penalty
     assert first.score.value-ordinary.value == pytest.approx(
         2*(-first.refit.loglik-ordinary_loss), abs=1e-10)
+
+
+def test_nonzero_clonal_profile_cost_changes_only_the_count_loss_in_score(tmp_path):
+    data = tumor(tmp_path/'positive_cost.tsv', ((6., 12.), (12., 18.), (18., 9.)))
+    labels = np.array([0, 0, 1])
+    signature = _partition_signature(labels, data.mutation_ids)
+    partition = DirectPartition(labels, signature, 'pilot_hessian_ward', data.mutation_ids)
+    fitted = evaluate_partition(data=data, partition=partition,
+        selection_options=_resolve_fit_options(FitConfig(device='cpu')), refit_cache={})
+
+    # Independent count-loss oracle, including the ordinary pooled binomial MLE.
+    counts = np.array([[6., 12.], [12., 18.], [18., 9.]])
+    free_centers = np.array([[.375, .625], [.75, .375]])
+    assert np.all(free_centers < 1.)
+    def loss(centers):
+        p = .4*centers[labels]
+        return float(-np.sum(counts*np.log(p)+(60-counts)*np.log1p(-p)))
+    free_loss = loss(free_centers)
+    profiles = []
+    for fixed in range(2):
+        centers = free_centers.copy()
+        centers[fixed] = 1.
+        profiles.append((loss(centers), fixed, centers))
+    clonal_loss, clonal_id, expected = min(profiles, key=lambda row: row[0])
+    assert clonal_loss-free_loss > 1.  # Not a zero-cost wiring-only fixture.
+    assert fitted.refit.clonal_cluster_id == clonal_id
+    np.testing.assert_array_equal(fitted.refit.labels, labels)
+    np.testing.assert_allclose(fitted.refit.cluster_centers, expected, atol=2e-5, rtol=0)
+    assert -fitted.refit.loglik == pytest.approx(clonal_loss, abs=2e-7)
+    free_score = fixed_partition_dirichlet_score(loglik=-free_loss, num_clusters=2,
+        data=data, labels=labels, partition_signature=signature)
+    score = fitted.score
+    assert score.degrees_of_freedom == free_score.degrees_of_freedom == 4
+    assert score.n_eff == free_score.n_eff == 6
+    # Exact unlabeled Dirichlet mass: 2! * 1! * 2! * 1! / 4! = 1/6.
+    assert score.assignment_log_evidence == free_score.assignment_log_evidence
+    assert score.assignment_log_evidence == pytest.approx(-np.log(6.))
+    assert score.assignment_dirichlet_alpha == free_score.assignment_dirichlet_alpha == 1.
+    assert score.assignment_code_weight == free_score.assignment_code_weight == .7
+    assert score.assignment_penalty == free_score.assignment_penalty
+    assert score.penalty == free_score.penalty
+    assert score.penalty-score.assignment_penalty == pytest.approx(4*np.log(6.))
+    assert score.value-free_score.value == pytest.approx(2*(clonal_loss-free_loss), abs=4e-7)
 
 
 @pytest.mark.parametrize('guide', [False, True])
