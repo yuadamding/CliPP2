@@ -7,6 +7,11 @@ import torch
 
 from ..config import _FitOptions, FINAL_PHI_LADDER_KMAX, FINAL_PHI_PARENT_COUNT
 from ..io.validation import validate_public_tumor_data
+from ..core.clonal import (
+    CLONAL_CONSTRAINT_ID, ClonalPartitionInfeasibleError,
+    make_clonal_witness_bounds, require_clonal_eligible_rows,
+)
+from ..core.objective import compile_observed_model, make_base_objective_key
 from ..core.fusion.graph import build_complete_uniform_graph
 from ..core.fusion.partition_starts import (
     PartitionCandidate,
@@ -463,10 +468,16 @@ def _assemble_selection_result(
     final_adaptive_search_stop_reason = str(adaptive_search_stop_reason)
     adaptive_search_global_optimum_certified = _adaptive_stop_certifies_global_optimum(
         final_adaptive_search_stop_reason
+    ) and all(
+        candidate.raw_fit.certificate.global_optimum
+        and candidate.raw_fit.certificate.witness_search_complete
+        for candidate in (raw_reference, selected_candidate, partition_parent_raw)
+        if isinstance(candidate, RawFusionCandidate)
     )
     selection_optimum_resolved = bool(
         adaptive_search_global_optimum_certified
         and not decision.selection_boundary_unresolved
+        and selected_candidate.refit.global_optimum_certified
     )
     selected_lambda = selected_record.lambda_value
     selected_kkt_value = (
@@ -806,12 +817,22 @@ def _solve_raw_proposal(
             include_default_starts=False,
             warm_state=solver_state_start,
         )
-        if str(seed_fit.provenance.objective_spec_hash) != str(
-            context.objective_spec_hash
-        ):
-            raise AssertionError(
-                "Raw multistart changed the fixed objective identity."
-            )
+        provenance = seed_fit.provenance
+        witness = provenance.witness_index
+        if (provenance.constraint_policy != CLONAL_CONSTRAINT_ID
+            or witness is None
+            or not 0 <= witness < context.source_data.num_mutations
+            or provenance.witness_mutation_id != context.source_data.mutation_ids[witness]):
+            raise AssertionError("Raw multistart lacks a valid clonal witness identity.")
+        lower, upper = make_clonal_witness_bounds(
+            context.source_model.lower, context.source_model.upper, witness)
+        expected = make_base_objective_key(
+            context.source_model, graph_hash=context.graph_hash, eps=context.eps,
+            lower=lower, upper=upper)
+        if (provenance.objective_key.base != expected
+            or provenance.lambda_value != float(proposal.lambda_value)
+            or provenance.source_data_hash != context.data_fingerprint):
+            raise AssertionError("Raw multistart changed the fixed objective or witness-box identity.")
         recovery_fit = search.recovery_fit_by_lambda.get(lambda_key)
         residual = float(seed_fit.certificate.components.residual)
         retain_recovery = seed_fit.state is not None and np.isfinite(residual) and (
@@ -896,6 +917,7 @@ def _partition_guided_admm_selection(
         pilot_phi=pilot_phi,
         fit_options=fit_options,
         curvature=guide_curvature,
+        _require_clonal=False,
     )
     guide = _best_partition_candidate(list(initializer_pool))
     if guide is None:
@@ -1096,6 +1118,14 @@ def _partition_guided_admm_selection(
         )
         search.next_step += 1
 
+    # Keep the original graph/initial-lambda preparation above unanchored.
+    # Actual selectable proposals instead use the occupied-clonal profile.
+    initializer_pool = generate_partition_initializer_pool(
+        context=base_solver_context,
+        pilot_phi=pilot_phi,
+        fit_options=effective_fit_options,
+        curvature=guide_curvature,
+    )
     # The production candidate pool always includes pilot and final-Phi ladders.
     direct_proposals: list[
         tuple[
@@ -1157,28 +1187,30 @@ def _partition_guided_admm_selection(
         )
         source = _direct_partition_source(proposal, stage=stage)
         candidate_id = int(len(search.result_entries))
-        direct_candidate = evaluate_direct_partition_candidate(
-            data=data,
-            proposal=proposal,
-            selection_options=effective_fit_options,
-            source=source,
-            parent_raw_candidate_id=(
-                None if parent_record is None else int(parent_record.candidate_id)
-            ),
-            parent_raw_lambda=(
-                None
-                if parent_raw is None
-                else float(parent_raw.raw_fit.provenance.lambda_value)
-            ),
-            parent_raw_phi_hash=(
-                ""
-                if parent_raw is None
-                else _pilot_matrix_hash(parent_raw.raw_fit.phi)
-            ),
-            refit_cache=search.bic_refit_cache,
-            coordinate_cache=search.refit_coordinate_cache,
-            source_model=base_solver_context.source_model,
-        )
+        try:
+            direct_candidate = evaluate_direct_partition_candidate(
+                data=data,
+                proposal=proposal,
+                selection_options=effective_fit_options,
+                source=source,
+                parent_raw_candidate_id=(
+                    None if parent_record is None else int(parent_record.candidate_id)
+                ),
+                parent_raw_lambda=(
+                    None if parent_raw is None
+                    else float(parent_raw.raw_fit.provenance.lambda_value)
+                ),
+                parent_raw_phi_hash=(
+                    "" if parent_raw is None
+                    else _pilot_matrix_hash(parent_raw.raw_fit.phi)
+                ),
+                refit_cache=search.bic_refit_cache,
+                coordinate_cache=search.refit_coordinate_cache,
+                source_model=base_solver_context.source_model,
+            )
+        except ClonalPartitionInfeasibleError:
+            # Ineligible labels do not make the original tumor domain infeasible.
+            continue
         search.result_entries.append(
             CandidateRecord(
                 candidate_id=candidate_id,
@@ -1266,6 +1298,8 @@ def select_model(
     fit_config: _FitOptions,
 ) -> BICSelectionResult:
     validate_public_tumor_data(data, fit_config)
+    source_model = compile_observed_model(data, eps=fit_config.eps)
+    require_clonal_eligible_rows(source_model.lower, source_model.upper)
     effective_objective_shape = objective_shape_for_data(
         data, str(fit_config.solver.objective_shape)
     )

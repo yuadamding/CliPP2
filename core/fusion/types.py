@@ -9,7 +9,11 @@ import numpy as np
 import torch
 
 from ...io.data import ImmutableArrayRecord, TumorData, readonly_array, tumor_data_fingerprint
-from ..objective import compile_observed_model, make_base_objective_key
+from ..objective import (
+    OptimizationBox, compile_observed_model, make_base_objective_key,
+    optimization_box_to_torch,
+)
+from ..clonal import make_clonal_witness_bounds
 from ...config import (
     DEFAULT_CERTIFICATE_MAX_ITER,
     DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
@@ -285,7 +289,10 @@ class PreparedProblem:
     # The legacy exact_pilot tensor may be a float32 view of their argmins;
     # unresolved bounds never imply globally certified scalar minima.
     scalar_pilot_certificates: tuple[ScalarGlobalMinimumCertificate, ...] = ()
-    audit_context_cache: dict[tuple[str, str, str], object] = field(
+    optimization_box: OptimizationBox | None = None
+    optimization_lower: torch.Tensor | None = field(default=None, repr=False)
+    optimization_upper: torch.Tensor | None = field(default=None, repr=False)
+    audit_context_cache: dict[tuple[str, ...], object] = field(
         default_factory=dict,
         compare=False,
         repr=False,
@@ -300,11 +307,11 @@ class PreparedProblem:
 
     @property
     def lower(self) -> torch.Tensor:
-        return self.model.lower
+        return self.optimization_lower
 
     @property
     def upper(self) -> torch.Tensor:
-        return self.model.upper
+        return self.optimization_upper
 
     @property
     def graph_hash(self) -> str:
@@ -321,6 +328,14 @@ class PreparedProblem:
     def __post_init__(self) -> None:
         if self.base_objective_key is None:
             raise ValueError("PreparedProblem requires a typed base-objective key.")
+        if self.optimization_box is None:
+            object.__setattr__(self, "optimization_box", OptimizationBox(
+                self.source_model.lower, self.source_model.upper,
+            ))
+        if self.optimization_lower is None or self.optimization_upper is None:
+            lower, upper = optimization_box_to_torch(self.optimization_box, self.runtime)
+            object.__setattr__(self, "optimization_lower", lower)
+            object.__setattr__(self, "optimization_upper", upper)
         if self._tensor_snapshot:
             self.assert_runtime_unchanged()
             return
@@ -341,6 +356,8 @@ class PreparedProblem:
             yield f"model.{name}", getattr(model, name)
         for name in ("edge_index", "weight", "degree"):
             yield f"graph.{name}", getattr(self.graph, name)
+        yield "optimization_lower", self.optimization_lower
+        yield "optimization_upper", self.optimization_upper
         for name in ("exact_pilot", "pooled_start"):
             yield name, getattr(self, name)
         for index, tensor in enumerate(self.scalar_well_starts):
@@ -385,9 +402,25 @@ class PreparedProblem:
             raise ValueError("A deferred likelihood pilot is not a prepared fusion graph.")
         if self.graph_hash != self.graph_spec.fingerprint:
             raise ValueError("Prepared problem graph identity is inconsistent.")
+        box = self.optimization_box
+        expected_lower, expected_upper = source.lower, source.upper
+        if box.witness_index is not None:
+            expected_lower, expected_upper = make_clonal_witness_bounds(
+                source.lower, source.upper, box.witness_index,
+            )
+        if not (
+            np.array_equal(box.lower, expected_lower)
+            and np.array_equal(box.upper, expected_upper)
+        ):
+            raise ValueError("Prepared optimization box changed nonwitness source bounds.")
+        expected_bounds = optimization_box_to_torch(box, self.runtime)
+        for name, expected in zip(("lower", "upper"), expected_bounds):
+            runtime_bound = getattr(self, name)
+            if not torch.equal(runtime_bound, expected):
+                raise ValueError("Prepared optimization tensors do not match source bounds.")
         key = make_base_objective_key(
             source, graph_hash=self.graph_hash, eps=self.eps,
-            lower=source.lower, upper=source.upper,
+            lower=box.lower, upper=box.upper,
         )
         if self.base_objective_key != key:
             raise ValueError("Prepared problem objective identity is inconsistent.")
@@ -445,10 +478,80 @@ class CertificateResult:
     precision_polish_delta: float
     residual_method: str
     fallback_reason: str
+    constraint_policy: str = ""
+    witness_mutation_id: str | None = None
+    conditional_kkt_certified: bool = False
+    conditional_global_optimum: bool = False
+    witness_search_complete: bool = False
+    witness_branches_eligible: tuple[int, ...] = ()
+    witness_branches_attempted: tuple[int, ...] = ()
+    witness_branches_pruned: tuple[int, ...] = ()
+    witness_branches_unresolved: tuple[int, ...] = ()
+    witness_branches_separable: tuple[int, ...] = ()
+    witness_search_elapsed_seconds: float = 0.0
+    # Exceptions can interrupt a primitive before it returns its work record.
+    witness_search_work_complete: bool = False
+    witness_branch_failures: tuple[tuple[int, str], ...] = ()
 
     @property
     def schema_version(self) -> int:
         return 2
+
+    def validate_clonal_search(
+        self,
+        expected_eligible: tuple[int, ...],
+        *,
+        witness_index: int,
+        global_basis: str,
+    ) -> None:
+        """Validate union-search accounting without confusing it with a proof.
+
+        The coordinator owns global branch proofs. This validator rejects
+        contradictory coverage/provenance, but a winning branch's conditional
+        certificate alone is never evidence for all the other branches.
+        """
+        def indices(name: str, values: tuple[int, ...]) -> set[int]:
+            if any(
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, np.integer))
+                or value < 0
+                for value in values
+            ):
+                raise ValueError(f"Clonal search {name} must contain nonnegative integer row IDs.")
+            result = set(int(value) for value in values)
+            if len(result) != len(values):
+                raise ValueError(f"Clonal search {name} contains duplicate row IDs.")
+            return result
+
+        expected = indices("expected eligible", expected_eligible)
+        eligible = indices("eligible", self.witness_branches_eligible)
+        if not expected or eligible != expected:
+            raise ValueError("Clonal search eligible rows do not match the original source domain.")
+        attempted = indices("attempted", self.witness_branches_attempted)
+        pruned = indices("pruned", self.witness_branches_pruned)
+        separable = indices("separable", self.witness_branches_separable)
+        unresolved = indices("unresolved", self.witness_branches_unresolved)
+        if attempted & pruned or attempted & separable or pruned & separable:
+            raise ValueError("Clonal search attempted/pruned/separable coverage overlaps.")
+        if attempted | pruned | separable != eligible:
+            raise ValueError("Clonal search coverage omits eligible rows or includes ineligible rows.")
+        if not unresolved <= attempted:
+            raise ValueError("Clonal search unresolved rows must be attempted rows.")
+        selected = indices("selected witness", (witness_index,))
+        if not selected <= attempted:
+            raise ValueError("Clonal search selected witness was not attempted.")
+        if self.admissible and selected & unresolved:
+            raise ValueError("An admissible clonal fit cannot select an unresolved witness.")
+        if bool(self.witness_search_complete) != (not unresolved):
+            raise ValueError("Clonal search complete flag contradicts unresolved branches.")
+        if self.global_optimum:
+            if not (
+                self.witness_search_complete and self.admissible
+                and global_basis == "all_witness_boxes_globally_covered"
+            ):
+                raise ValueError("Clonal union global optimum lacks complete admissible coverage/provenance.")
+        elif global_basis != "not_certified":
+            raise ValueError("Uncertified clonal union cannot carry a global-optimality basis.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +583,9 @@ class FitProvenance:
     global_optimality_basis: str
     scalar_pilot_certificates: tuple[ScalarGlobalMinimumCertificate, ...] = ()
     multiplicity_policy: str = "independent_broad"
+    constraint_policy: str = ""
+    witness_mutation_id: str | None = None
+    witness_index: int | None = None
 
     @property
     def likelihood_eps(self) -> float:

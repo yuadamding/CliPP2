@@ -22,7 +22,7 @@ MAX_MULTIPLICITY: Final = 4
 DEFAULT_DEVICE: Final = "cuda"
 DEFAULT_DTYPE: Final = "float32"
 DEFAULT_OPTIMIZATION_TOLERANCE: Final = 8e-4
-ALGORITHM_ID: Final = "independent_hybrid_balanced_v1"
+ALGORITHM_ID: Final = "independent_hybrid_occupied_clonal_v1"
 
 
 DEFAULT_WORKSET_MAX_BYTES: Final = 256 * 1024 * 1024

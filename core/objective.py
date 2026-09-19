@@ -145,6 +145,64 @@ class LambdaObjectiveKey:
 
 
 @dataclass(frozen=True, slots=True)
+class OptimizationBox(ImmutableArrayRecord):
+    """Immutable float64 optimization domain, separate from likelihood data.
+
+    A clonal witness changes only the domain, never the compiled emissions or
+    graph. Runtime views must always be rebuilt from these host arrays.
+    """
+
+    lower: np.ndarray
+    upper: np.ndarray
+    witness_index: int | None = None
+    fingerprint: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        lower = _readonly_array(self.lower, dtype=np.float64)
+        upper = _readonly_array(self.upper, dtype=np.float64)
+        if (
+            lower.ndim != 2 or lower.shape != upper.shape
+            or not all(lower.shape)
+            or np.any(~np.isfinite(lower)) or np.any(~np.isfinite(upper))
+            or np.any(lower > upper)
+        ):
+            raise ValueError("OptimizationBox requires finite ordered (M, R) bounds.")
+        witness = self.witness_index
+        if witness is not None:
+            if not isinstance(witness, (int, np.integer)) or not 0 <= witness < len(lower):
+                raise ValueError("OptimizationBox witness index is out of range.")
+            if not (np.all(lower[witness] == 1.0) and np.all(upper[witness] == 1.0)):
+                raise ValueError("OptimizationBox witness must be fixed at exactly one.")
+            object.__setattr__(self, "witness_index", int(witness))
+        object.__setattr__(self, "lower", lower)
+        object.__setattr__(self, "upper", upper)
+        object.__setattr__(self, "fingerprint", _box_fingerprint(lower, upper))
+
+
+def optimization_box_to_torch(
+    box: OptimizationBox, runtime: TorchRuntime,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Represent the original domain without rounding its endpoints outward."""
+    dtype = np.float32 if runtime.dtype == torch.float32 else np.float64
+    lower = np.asarray(box.lower, dtype=dtype).copy()
+    upper = np.asarray(box.upper, dtype=dtype).copy()
+    lower = np.where(
+        lower.astype(np.float64) < box.lower,
+        np.nextafter(lower, np.asarray(np.inf, dtype=dtype)), lower,
+    )
+    upper = np.where(
+        upper.astype(np.float64) > box.upper,
+        np.nextafter(upper, np.asarray(-np.inf, dtype=dtype)), upper,
+    )
+    if np.any(lower > upper):
+        raise ValueError("Optimization domain has no representable point in runtime dtype.")
+    return (
+        torch.tensor(lower, dtype=runtime.dtype, device=runtime.device),
+        torch.tensor(upper, dtype=runtime.dtype, device=runtime.device),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ObservedModel(ImmutableArrayRecord):
     """Immutable float64 source model for observed mutation counts.
 

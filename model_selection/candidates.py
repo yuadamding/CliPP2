@@ -9,6 +9,7 @@ from ..core.bic import (
     fixed_partition_dirichlet_score,
 )
 from ..config import DIRICHLET_ALPHA, DIRICHLET_CODE_WEIGHT, _FitOptions, SELECTION_SCORE
+from ..core.clonal import CLONAL_CONSTRAINT_ID
 from ..core.objective import ObservedModel
 from ..core.fusion.types import RawFit
 from ..core.fusion.partition_starts import PartitionCandidate
@@ -57,6 +58,13 @@ def validate_partition_identity(
     expected_phi = centers[labels]
     if refit.phi.shape != expected_phi.shape or not np.allclose(refit.phi, expected_phi, rtol=0.0, atol=1e-12):
         raise AssertionError("Refit phi does not match centers indexed by labels.")
+    if refit.finite_candidate_found and (
+        refit.constraint_policy != CLONAL_CONSTRAINT_ID
+        or refit.clonal_cluster_id is None
+        or not np.any(labels == refit.clonal_cluster_id)
+        or not np.all(centers[refit.clonal_cluster_id] == 1.0)
+    ):
+        raise AssertionError("A finite partition refit must retain an occupied exact clonal center.")
 
 
 def validate_candidate_identity(candidate: SelectablePartitionCandidate) -> None:
@@ -221,7 +229,8 @@ def _selection_refit_cache_key(
         "grid_local",
         int(refit.grid_points),
         int(refit.local_steps),
-        "unanchored_profiled_partition_refit_v4",
+        "occupied_clonal_profiled_partition_refit_v1",
+        CLONAL_CONSTRAINT_ID,
     )
 
 
@@ -300,6 +309,7 @@ def _build_refit_summary(
         refit_mode=str(refit.refit_mode),
         multiplicity_policy="independent_broad",
         locally_converged=None,
+        clonal_cluster_id=refit.clonal_cluster_id,
     )
 
 

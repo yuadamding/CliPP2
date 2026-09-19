@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
+import time
 
 import numpy as np
 import torch
@@ -11,6 +12,7 @@ from ...io.data import (
     tumor_data_fingerprint,
 )
 from ..objective import (
+    OptimizationBox,
     TorchObservedModel,
     TorchObservedTerms,
     compile_observed_model,
@@ -18,10 +20,19 @@ from ..objective import (
     make_base_objective_key,
     make_lambda_objective_key,
     model_to_torch,
+    optimization_box_to_torch,
     observed_internal_breakpoints_torch,
     observed_one_sided_gradients_torch,
     observed_em_terms_torch,
     observed_terms_torch,
+    observed_terms_numpy,
+)
+from ..clonal import (
+    CLONAL_CONSTRAINT_ID,
+    ClonalConstraintInfeasibleError,
+    clonal_eligible_rows,
+    make_clonal_witness_bounds,
+    validate_clonal_feasibility,
 )
 from ...config import (
     CLONAL_INTEGER_MODEL_ID,
@@ -94,14 +105,25 @@ class _Float64AuditContext:
     runtime: TorchRuntime
     model: TorchObservedModel
     graph: TensorFusionGraph
+    lower: torch.Tensor
+    upper: torch.Tensor
+    _tensor_snapshot: tuple = field(init=False, compare=False, repr=False)
 
-    @property
-    def lower(self) -> torch.Tensor:
-        return self.model.lower
+    def __post_init__(self) -> None:
+        tensors = (
+            *(getattr(self.model, name) for name in (
+                "alt", "nonalt", "observed", "lower", "upper", "slope", "log_prior", "valid",
+            )),
+            self.graph.edge_index, self.graph.weight, self.graph.degree,
+            self.lower, self.upper,
+        )
+        object.__setattr__(self, "_tensor_snapshot", tuple(
+            (tensor, tensor._version) for tensor in tensors
+        ))
 
-    @property
-    def upper(self) -> torch.Tensor:
-        return self.model.upper
+    def assert_runtime_unchanged(self) -> None:
+        if any(tensor._version != version for tensor, version in self._tensor_snapshot):
+            raise ValueError("Float64 audit runtime changed; prepare a new problem.")
 
 
 def _frozen_graph_in_dtype(
@@ -135,22 +157,36 @@ def _float64_audit_context(
     if source_model is None:
         raise ValueError("Float64 audit requires an immutable observed-model source.")
     device = problem.runtime.device
-    key = (str(source_model.fingerprint), str(problem.graph_hash), str(device))
+    source_key = (str(source_model.fingerprint), str(problem.graph_hash), str(device))
+    key = (*source_key, problem.optimization_box.fingerprint)
     cached = problem.audit_context_cache.get(key)
     if cached is not None:
         if not isinstance(cached, _Float64AuditContext):
             raise TypeError("PreparedProblem float64 audit cache is corrupted.")
+        cached.assert_runtime_unchanged()
         return cached
     runtime = TorchRuntime(
         device=device,
         device_name=str(device),
         dtype=torch.float64,
     )
-    context = _Float64AuditContext(
-        runtime=runtime,
-        model=model_to_torch(source_model, runtime, eps=problem.eps),
-        graph=_frozen_graph_in_dtype(problem, runtime),
-    )
+    shared_key = (*source_key, "shared_observed_model_and_graph")
+    shared = problem.audit_context_cache.get(shared_key)
+    if shared is None:
+        model = model_to_torch(source_model, runtime, eps=problem.eps)
+        graph = _frozen_graph_in_dtype(problem, runtime)
+        shared = _Float64AuditContext(runtime, model, graph, model.lower, model.upper)
+        problem.audit_context_cache[shared_key] = shared
+    if not isinstance(shared, _Float64AuditContext):
+        raise TypeError("PreparedProblem float64 audit source cache is corrupted.")
+    shared.assert_runtime_unchanged()
+    lower, upper = optimization_box_to_torch(problem.optimization_box, runtime)
+    context = _Float64AuditContext(runtime, shared.model, shared.graph, lower, upper)
+    # Keep one effective-box view, not one O(MR) GPU allocation per witness.
+    # Immutable likelihood/graph tensors are shared across every branch.
+    for old_key in tuple(problem.audit_context_cache):
+        if old_key[:3] == source_key and old_key != shared_key:
+            del problem.audit_context_cache[old_key]
     problem.audit_context_cache[key] = context
     return context
 
@@ -223,6 +259,7 @@ def _terminal_backward_error_audit_float64(
         witness=certificate,
         refine=False,
     )
+    diagnostics = _with_explicit_primal_check(result.diagnostics, problem, phi64)
     _, _, objective64 = (
         _objective_value_from_mutation_region_terms_torch(
             terms64,
@@ -234,11 +271,34 @@ def _terminal_backward_error_audit_float64(
         )
     )
     return (
-        result.diagnostics,
+        diagnostics,
         gradient.scope,
         gradient.directional_admissible,
         float(objective64),
     )
+
+
+def _with_explicit_primal_check(
+    diagnostics: KKTDiagnostics, problem: PreparedProblem, phi: torch.Tensor,
+) -> KKTDiagnostics:
+    """Fail closed on source-domain or exact witness violations independently of KKT."""
+    values = phi.detach().cpu().numpy().astype(np.float64, copy=False)
+    box = problem.optimization_box
+    feasible = bool(
+        values.shape == box.lower.shape
+        and np.all(np.isfinite(values))
+        and np.all(values >= box.lower)
+        and np.all(values <= box.upper)
+    )
+    if feasible and box.witness_index is not None:
+        feasible = bool(np.all(values[box.witness_index] == 1.0))
+        try:
+            validate_clonal_feasibility(
+                values, problem.source_model.lower, problem.source_model.upper,
+            )
+        except ValueError:
+            feasible = False
+    return replace(diagnostics, box_residual=0.0 if feasible else 1.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -786,6 +846,8 @@ def promote_solver_context_dtype(
     return replace(
         context,
         _tensor_snapshot=(),
+        optimization_lower=None,
+        optimization_upper=None,
         model=promoted_model,
         graph=graph,
         exact_pilot=exact,
@@ -1037,6 +1099,11 @@ def prepare_torch_problem(
         data,
         eps=float(eps),
     )
+    if not np.any(clonal_eligible_rows(source_model.lower, source_model.upper)):
+        raise ClonalConstraintInfeasibleError(
+            "No retained mutation permits CCF = 1 in every region under "
+            "the current compiled CCF bounds."
+        )
     runtime_model = model_to_torch(source_model, effective_runtime, eps=float(eps))
     data_fingerprint = tumor_data_fingerprint(data)
 
@@ -2182,7 +2249,9 @@ def _fit_from_start(
     gradient_scope = certificate_gradient.scope
     directional_kink_admissible = certificate_gradient.directional_admissible
     if runtime.dtype == torch.float64:
-        admission_diagnostics = final_certificate_refinement.diagnostics
+        admission_diagnostics = _with_explicit_primal_check(
+            final_certificate_refinement.diagnostics, problem, iterate.phi,
+        )
     else:
         (
             admission_diagnostics,
@@ -2232,12 +2301,14 @@ def _fit_from_start(
         and valid_dual_certificate
         and mm_consistency_violations == 0
         and directional_kink_admissible
+        and admission_diagnostics.box_residual == 0.0
     )
     full_kkt_certified = bool(
         np.isfinite(authoritative_kkt_residual)
         and converged_outer
         and valid_dual_certificate
         and directional_kink_admissible
+        and admission_diagnostics.box_residual == 0.0
     )
     global_optimality_certified = bool(
         selection_eligible
@@ -2248,6 +2319,8 @@ def _fit_from_start(
         if global_optimality_certified
         else "not_certified"
     )
+    if global_optimality_certified and problem.optimization_box.witness_index is not None:
+        global_optimality_basis = "conditional_witness_box_" + global_optimality_basis
     if use_unimodal_objective and global_optimality_certified:
         converged = True
 
@@ -2279,9 +2352,7 @@ def _fit_from_start(
             admission_diagnostics.backward_error_edge_subgradient_residual
         ),
         dual_ball=float(admission_diagnostics.backward_error_dual_ball_residual),
-        # Box feasibility is enforced by every primal update. The normalized
-        # stationarity component already incorporates the box normal cone.
-        box=0.0,
+        box=float(admission_diagnostics.box_residual),
     )
     if not np.isclose(
         terminal_components.residual,
@@ -2297,7 +2368,9 @@ def _fit_from_start(
             components=terminal_components,
             certified=bool(full_kkt_certified),
             admissible=bool(selection_eligible),
-            global_optimum=bool(global_optimality_certified),
+            global_optimum=bool(
+                global_optimality_certified and problem.optimization_box.witness_index is None
+            ),
             status=str(outer_kkt_certificate_status),
             tolerance=5.0 * float(cert_tol),
             scope="full_original_graph",
@@ -2311,6 +2384,15 @@ def _fit_from_start(
             precision_polish_delta=0.0,
             residual_method="componentwise_box_cone_backward_error_v1",
             fallback_reason="",
+            constraint_policy=(
+                CLONAL_CONSTRAINT_ID if problem.optimization_box.witness_index is not None else ""
+            ),
+            witness_mutation_id=(
+                data.mutation_ids[problem.optimization_box.witness_index]
+                if problem.optimization_box.witness_index is not None else None
+            ),
+            conditional_kkt_certified=bool(full_kkt_certified),
+            conditional_global_optimum=bool(global_optimality_certified),
         ),
         convergence=ConvergenceResult(
             converged=bool(converged),
@@ -2345,11 +2427,19 @@ def _fit_from_start(
             global_optimality_basis=str(global_optimality_basis),
             scalar_pilot_certificates=problem.scalar_pilot_certificates,
             multiplicity_policy=problem.source_model.support_policy,
+            constraint_policy=(
+                CLONAL_CONSTRAINT_ID if problem.optimization_box.witness_index is not None else ""
+            ),
+            witness_mutation_id=(
+                data.mutation_ids[problem.optimization_box.witness_index]
+                if problem.optimization_box.witness_index is not None else None
+            ),
+            witness_index=problem.optimization_box.witness_index,
         ),
     )
 
 
-def fit_prepared(
+def _fit_prepared_box(
     problem: PreparedProblem,
     lambda_value: float,
     solver_options: SolverConfig,
@@ -2406,6 +2496,7 @@ def fit_prepared(
     ):
         raise ValueError("Raw fitting requires the frozen complete graph.")
     best_artifacts: RawFit | None = None
+    total_start_work = WorkCounters()
     for attempt in attempts:
         try:
             artifacts = _fit_from_start(problem, lambda_value, solver_options, attempt)
@@ -2416,11 +2507,13 @@ def fit_prepared(
                 "exact_solver_resource_limit: exact solver allocation "
                 f"exhausted memory on {effective_runtime.device_name}."
             ) from exc
+        total_start_work = total_start_work + artifacts.work
         if best_artifacts is None or _prefer_multistart_fit(artifacts, best_artifacts):
             best_artifacts = artifacts
         del artifacts
     if best_artifacts is None:
         raise RuntimeError("No valid start produced a fusion fit.")
+    best_artifacts = replace(best_artifacts, work=total_start_work)
     if not needs_precision_polish(best_artifacts):
         return best_artifacts
     precision_context = _float64_context(data, problem)
@@ -2433,3 +2526,319 @@ def fit_prepared(
         ),
     )
     return _finalize_precision_polish(polished, best_artifacts, problem)
+
+
+def _prepare_witness_problem(problem: PreparedProblem, witness_index: int) -> PreparedProblem:
+    """Make one immutable branch while sharing original observed tensors/graph."""
+    problem.validate()
+    lower, upper = make_clonal_witness_bounds(
+        problem.source_model.lower, problem.source_model.upper, witness_index,
+    )
+    box = OptimizationBox(lower, upper, witness_index=witness_index)
+    return replace(
+        problem,
+        optimization_box=box,
+        optimization_lower=None,
+        optimization_upper=None,
+        base_objective_key=make_base_objective_key(
+            problem.source_model, graph_hash=problem.graph_hash, eps=problem.eps,
+            lower=box.lower, upper=box.upper,
+        ),
+        _tensor_snapshot=(),
+    )
+
+
+def _offload_witness_fit(fit: RawFit) -> RawFit:
+    """Retain at most one incumbent on CPU; preserve aliased certificate storage."""
+    tensors = {}
+
+    def host(tensor):
+        if tensor is None:
+            return None
+        key = (
+            tensor.device, tensor.dtype, tensor.untyped_storage().data_ptr(),
+            tensor.storage_offset(), tuple(tensor.shape), tuple(tensor.stride()),
+        )
+        if key not in tensors:
+            tensors[key] = tensor.detach().cpu()
+        return tensors[key]
+
+    def certificate_host(certificate):
+        if isinstance(certificate, DenseEdgeCertificate):
+            return replace(certificate, dual=host(certificate.dual))
+        if isinstance(certificate, CompressedEdgeCertificate):
+            return replace(
+                certificate, labels=host(certificate.labels), centers=host(certificate.centers),
+                internal_edge_ids=host(certificate.internal_edge_ids),
+                internal_dual=host(certificate.internal_dual),
+            )
+        return certificate
+
+    state = fit.state
+    if state is not None:
+        warm = state.warm_state
+        if isinstance(warm, DenseWarmState):
+            warm = replace(warm, phi=host(warm.phi), dual=host(warm.dual))
+        elif isinstance(warm, PrimalOnlyWarmState):
+            warm = replace(
+                warm, phi=host(warm.phi), structure_hint=host(warm.structure_hint),
+                certificate_hint=certificate_host(warm.certificate_hint),
+            )
+        state = replace(
+            state, phi=host(state.phi), dual=host(state.dual), warm_state=warm,
+            certificate=certificate_host(state.certificate),
+        )
+    return replace(
+        fit, state=state,
+        certificate=replace(fit.certificate, witness=certificate_host(fit.certificate.witness)),
+    )
+
+
+def _witness_scalar_bounds(
+    problem: PreparedProblem,
+) -> tuple[np.ndarray | None, np.ndarray]:
+    """Certified original scalar lower bounds; never substitute attained minima."""
+    source = problem.source_model
+    clonal_loss = observed_terms_numpy(
+        source, np.ones(source.shape, dtype=np.float64), eps=problem.eps,
+    ).loss
+    certificates = problem.scalar_pilot_certificates
+    if len(certificates) != int(np.prod(source.shape)) or not all(
+        item.globally_certified
+        and np.isfinite(item.global_lower_bound)
+        and np.isfinite(item.attained_value)
+        and item.global_lower_bound <= item.attained_value
+        for item in certificates
+    ):
+        return None, clonal_loss
+    bounds = np.asarray([item.global_lower_bound for item in certificates]).reshape(source.shape)
+    return bounds, clonal_loss
+
+
+def _separable_zero_witness(
+    problem: PreparedProblem, eligible: tuple[int, ...], clonal_loss: np.ndarray,
+) -> tuple[int, np.ndarray] | None:
+    """Use separability only for exact, representable scalar minima.
+
+    A tolerance-certified (positive-gap) scalar result is not an exact minimum.
+    Such results retain exhaustive branch fitting and conservative pruning.
+    """
+    certificates = problem.scalar_pilot_certificates
+    source = problem.source_model
+    if len(certificates) != int(np.prod(source.shape)) or not all(
+        item.globally_certified and item.optimality_gap == 0.0
+        and np.isfinite(item.argmin) and np.isfinite(item.attained_value)
+        and item.global_lower_bound == item.attained_value
+        for item in certificates
+    ):
+        return None
+    phi = np.asarray([item.argmin for item in certificates], dtype=np.float64).reshape(source.shape)
+    if np.any(phi < source.lower) or np.any(phi > source.upper):
+        return None
+    if problem.runtime.dtype == torch.float32 and not np.array_equal(phi, phi.astype(np.float32)):
+        return None
+    free_loss = observed_terms_numpy(source, phi, eps=problem.eps).loss
+    attained = np.asarray([item.attained_value for item in certificates]).reshape(source.shape)
+    if not np.array_equal(free_loss, attained):
+        return None
+    deltas = np.sum(clonal_loss - free_loss, axis=1)
+    if not np.all(np.isfinite(deltas[list(eligible)])):
+        return None
+    witness = min(eligible, key=lambda index: (float(deltas[index]), index))
+    phi = phi.copy()
+    phi[witness] = 1.0
+    return witness, phi
+
+
+def fit_prepared(
+    problem: PreparedProblem,
+    lambda_value: float,
+    solver_options: SolverConfig,
+    *,
+    warm_state: SolverState | None = None,
+    phi_start: np.ndarray | torch.Tensor | None = None,
+    include_default_starts: bool = True,
+) -> RawFit:
+    """Search all eligible occupied-clonal witness boxes on one frozen graph.
+
+    Box KKT is conditional. An exhaustive nonconvex search is not a global
+    optimality proof; unresolved numerical branches are explicitly retained.
+    """
+    started = time.monotonic()
+    problem.validate()
+    lambda_value = validate_lambda_value(lambda_value)
+    _validate_solver_tolerance(solver_options.tolerance)
+    _certificate_options(solver_options, problem.runtime.dtype)
+    objective_shape_for_data(problem.source_data, solver_options.objective_shape)
+    if warm_state is None and phi_start is None and not include_default_starts:
+        raise ValueError("No start supplied: provide warm_state or phi_start, or enable default starts.")
+    supplied_starts = []
+    if warm_state is not None:
+        supplied_starts.append(_StartAttempt(warm_state.phi, warm_state, "warm"))
+    if phi_start is not None:
+        supplied_starts.append(_StartAttempt(phi_start, None, "explicit"))
+    _deduplicate_start_attempts(
+        supplied_starts, runtime=problem.runtime, shape=tuple(problem.source_model.shape),
+    )
+    if problem.source_data.num_mutations > 1 and (
+        not problem.graph.is_complete
+        or problem.graph_spec.degree_bound != problem.source_data.num_mutations - 1
+    ):
+        raise ValueError("Raw fitting requires the frozen complete graph.")
+    source = problem.source_model
+    eligible = tuple(int(index) for index in np.flatnonzero(
+        clonal_eligible_rows(source.lower, source.upper),
+    ))
+    if not eligible:
+        raise ClonalConstraintInfeasibleError(
+            "No retained mutation permits CCF = 1 in every region under "
+            "the current compiled CCF bounds."
+        )
+    scalar_bounds, clonal_loss = _witness_scalar_bounds(problem)
+    separable = _separable_zero_witness(problem, eligible, clonal_loss) if lambda_value == 0.0 else None
+    order = [separable[0]] if separable is not None else list(eligible)
+    attempted, pruned, unresolved, failures = [], [], [], []
+    incumbent = None
+    failed_incumbent = None
+    total_work = WorkCounters()
+    all_branches_global = True
+    work_complete = True
+    exception_kinds = []
+    for index in order:
+        if scalar_bounds is not None and incumbent is not None:
+            # Positive fusion costs can only increase this source-scalar bound.
+            terms = scalar_bounds.copy()
+            terms[index] = clonal_loss[index]
+            lower_bound = float(np.sum(terms, dtype=np.float64))
+            numerical_slack = 256.0 * np.finfo(np.float64).eps * (
+                1.0 + float(np.sum(np.abs(terms))) + abs(incumbent.objective.total)
+            )
+            if np.isfinite(lower_bound) and lower_bound - numerical_slack > incumbent.objective.total + numerical_slack:
+                pruned.append(index)
+                continue
+        attempted.append(index)
+        candidate = None
+        try:
+            branch = _prepare_witness_problem(problem, index)
+            branch_warm = warm_state
+            if branch_warm is not None and branch_warm.objective_spec_hash != branch.objective_spec_hash:
+                # A point is reusable across boxes, but its dual/KKT witness is not.
+                branch_warm = SolverState(
+                    phi=branch_warm.phi, dual=None, previous_lambda=branch_warm.previous_lambda,
+                    objective_spec_hash=branch.objective_spec_hash,
+                )
+            candidate = _fit_prepared_box(
+                branch, lambda_value, solver_options,
+                warm_state=None if separable is not None else branch_warm,
+                phi_start=separable[1] if separable is not None else phi_start,
+                include_default_starts=False if separable is not None else include_default_starts,
+            )
+            total_work = total_work + candidate.work
+            validate_clonal_feasibility(candidate.phi, source.lower, source.upper)
+            if not np.all(candidate.phi[index] == 1.0):
+                raise ValueError("Raw fit escaped its designated exact clonal witness.")
+            if separable is not None and (
+                not candidate.certificate.admissible
+                or not np.array_equal(candidate.phi, separable[1])
+            ):
+                # A moved or inadmissible scalar minimizer no longer supports
+                # the exact separability shortcut.
+                separable = None
+                order.extend(other for other in eligible if other != index)
+            if candidate.certificate.admissible:
+                if incumbent is None or candidate.objective.total < incumbent.objective.total:
+                    incumbent = _offload_witness_fit(candidate)
+                failed_incumbent = None
+            else:
+                if incumbent is None and (
+                    failed_incumbent is None or _prefer_multistart_fit(candidate, failed_incumbent)
+                ):
+                    failed_incumbent = _offload_witness_fit(candidate)
+                unresolved.append(index)
+                failures.append((index, (
+                    f"terminal_nonadmissible: status={candidate.certificate.status}; "
+                    f"residual={candidate.certificate.components.residual!r}; "
+                    f"mm_violations={candidate.convergence.mm_consistency_violations}"
+                )))
+            all_branches_global = bool(
+                all_branches_global and candidate.certificate.conditional_global_optimum
+            )
+        except (RuntimeError, MemoryError, FloatingPointError, ValueError) as error:
+            unresolved.append(index)
+            failures.append((index, f"{type(error).__name__}: {error}"))
+            # Store causes, never exception/traceback objects holding GPU state.
+            exception_kinds.append(
+                "resource" if isinstance(error, (MemoryError, torch.OutOfMemoryError))
+                else "numerical"
+            )
+            all_branches_global = False
+            work_complete = False
+            if separable is not None:
+                # The scalar theorem cannot replace a failed admissibility
+                # gate; other branches may still yield a certified raw fit.
+                separable = None
+                order.extend(other for other in eligible if other != index)
+        finally:
+            # In particular release a returned but primal-invalid candidate
+            # before allocating state for the next witness.
+            candidate = None
+    best = incumbent if incumbent is not None else failed_incumbent
+    if best is None:
+        detail = "; ".join(f"{index}: {message}" for index, message in failures)
+        failure_kind = (
+            "resource" if exception_kinds and set(exception_kinds) == {"resource"}
+            else "mixed" if "resource" in exception_kinds else "numerical"
+        )
+        error_type = ExactSolverResourceLimit if failure_kind == "resource" else RuntimeError
+        error = error_type(
+            f"No clonal witness branch produced a raw fit; failure_kind={failure_kind}; "
+            f"unresolved={tuple(unresolved)}. {detail}"
+        )
+        error.witness_branches_eligible = eligible
+        error.witness_branches_attempted = tuple(attempted)
+        error.witness_branches_pruned = tuple(pruned)
+        error.witness_branches_unresolved = tuple(unresolved)
+        error.witness_branches_separable = ()
+        error.witness_search_complete = False
+        error.witness_branch_failures = tuple(failures)
+        error.witness_search_elapsed_seconds = time.monotonic() - started
+        error.witness_search_work_complete = work_complete
+        error.witness_failure_kind = failure_kind
+        error.work = total_work
+        raise error
+    separable_covered = tuple(index for index in eligible if index not in attempted) if separable is not None else ()
+    complete = not unresolved and len(attempted) + len(pruned) + len(separable_covered) == len(eligible)
+    global_optimum = bool(
+        complete and best.certificate.admissible
+        and (all_branches_global or separable is not None)
+    )
+    result = replace(
+        best,
+        work=total_work,
+        certificate=replace(
+            best.certificate,
+            global_optimum=global_optimum,
+            conditional_kkt_certified=best.certificate.certified,
+            witness_search_complete=complete,
+            witness_branches_eligible=eligible,
+            witness_branches_attempted=tuple(attempted),
+            witness_branches_pruned=tuple(pruned),
+            witness_branches_unresolved=tuple(unresolved),
+            witness_branches_separable=separable_covered,
+            witness_search_elapsed_seconds=time.monotonic() - started,
+            witness_search_work_complete=work_complete,
+            witness_branch_failures=tuple(failures),
+        ),
+        provenance=replace(
+            best.provenance,
+            global_optimality_basis=(
+                "all_witness_boxes_globally_covered" if global_optimum else "not_certified"
+            ),
+        ),
+    )
+    result.certificate.validate_clonal_search(
+        eligible,
+        witness_index=result.provenance.witness_index,
+        global_basis=result.provenance.global_optimality_basis,
+    )
+    return result

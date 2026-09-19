@@ -17,6 +17,10 @@ from ._source import source_fingerprint, git_source_identity
 from .config import _FitOptions, ALGORITHM_ID
 from .core.fusion.types import RawFit
 from .core.bic import effective_bic_mutation_region_count
+from .core.clonal import (
+    CLONAL_CONSTRAINT_ID, clonal_eligible_rows, clonal_members, make_clonal_witness_bounds,
+    validate_clonal_feasibility,
+)
 from .core.objective import (
     compile_observed_model, make_base_objective_key, infer_integer_multiplicity_posterior_numpy,
 )
@@ -26,6 +30,7 @@ from .io.data import (
 )
 from .model_selection.candidates import validate_candidate_identity
 from .model_selection.proposals import pilot_matrix_hash
+from .model_selection.scoring import raw_candidate_has_exact_fusion_certificate
 from .model_selection.types import (
     BICSelectionResult,
     RawFusionCandidate,
@@ -238,6 +243,7 @@ def _cluster_output_table(analysis: AnalysisSerialization) -> pd.DataFrame:
             "tumor_id": np.repeat(data.tumor_id, partition.n_clusters),
             "cluster_label": np.arange(partition.n_clusters, dtype=int),
             "cluster_size": sizes,
+            "is_clonal": clonal_members(centers),
         }
     )
     for column, region_id in enumerate(data.region_ids):
@@ -386,11 +392,29 @@ def _finite_number(value: float) -> float | None:
     return float(value) if np.isfinite(value) else None
 
 
-def _raw_qualification(fit: RawFit) -> dict[str, object]:
+def _raw_qualification(fit: RawFit, data: TumorData) -> dict[str, object]:
     """Record the authoritative, immutable raw result's own evidence."""
     certificate, provenance = fit.certificate, fit.provenance
+    witness = provenance.witness_index
+    informative = np.asarray(data.total_counts[witness]) > 0
+    if data.count_observed is not None:
+        informative &= np.asarray(data.count_observed[witness], dtype=bool)
     return {
         "kkt_certified": bool(certificate.certified),
+        "constraint_policy": str(certificate.constraint_policy),
+        "witness_mutation_id": str(certificate.witness_mutation_id),
+        "witness_informative_regions": int(np.sum(informative)),
+        "conditional_kkt_certified": bool(certificate.conditional_kkt_certified),
+        "conditional_global_optimum_certified": bool(certificate.conditional_global_optimum),
+        "witness_search_complete": bool(certificate.witness_search_complete),
+        "witness_search_work_complete": bool(certificate.witness_search_work_complete),
+        "witness_branches_eligible": list(certificate.witness_branches_eligible),
+        "witness_branches_attempted": list(certificate.witness_branches_attempted),
+        "witness_branches_pruned": list(certificate.witness_branches_pruned),
+        "witness_branches_unresolved": list(certificate.witness_branches_unresolved),
+        "witness_branches_separable": list(certificate.witness_branches_separable),
+        "witness_branch_failures": [list(failure) for failure in certificate.witness_branch_failures],
+        "witness_search_elapsed_seconds": _finite_number(certificate.witness_search_elapsed_seconds),
         "admissible": bool(certificate.admissible),
         "global_optimum_certified": bool(certificate.global_optimum),
         "global_optimality_basis": str(provenance.global_optimality_basis),
@@ -426,8 +450,9 @@ def _qualification(analysis: AnalysisSerialization) -> dict[str, object]:
                       for key, value in selected_score.items()}
     direct = isinstance(partition, DirectPartition)
     return {
-        "raw_reference": _raw_qualification(raw_fit),
-        "selected_raw_fit": None if selected_raw is None else _raw_qualification(selected_raw),
+        "constraint_policy": CLONAL_CONSTRAINT_ID,
+        "raw_reference": _raw_qualification(raw_fit, analysis.data),
+        "selected_raw_fit": None if selected_raw is None else _raw_qualification(selected_raw, analysis.data),
         "output_labeling": {
             "policy": "descending_refit_ccf_l2_v1",
             "tie_break": "internal_cluster_label_ascending",
@@ -450,6 +475,10 @@ def _qualification(analysis: AnalysisSerialization) -> dict[str, object]:
             "parent_raw_phi_hash": (partition.parent_raw_phi_hash or None) if direct else None,
         },
         "refit": {
+            "clonal_cluster_id": int(np.flatnonzero(
+                analysis.output_cluster_order == refit.clonal_cluster_id)[0]),
+            "internal_clonal_cluster_id": int(refit.clonal_cluster_id),
+            "clonal_mutations": int(np.sum(clonal_members(refit.phi))),
             "multiplicity_policy": refit.multiplicity_policy,
             "local_stationarity_resolved": refit.locally_converged,
             "finite_candidate_found": bool(refit.finite_candidate_found),
@@ -525,6 +554,12 @@ class AnalysisSerialization:
             if refit.source_data_hash != source_hash or refit.likelihood_eps != epsilon:
                 raise ValueError("Reporting data or epsilon do not match the fixed refit source identity.")
             _validated_profile(data, refit.phi, name="refit.phi")
+            validate_clonal_feasibility(refit.phi, source_model.lower, source_model.upper)
+            if (not 0 <= refit.clonal_cluster_id < len(refit.cluster_centers)
+                or not clonal_members(refit.cluster_centers)[refit.clonal_cluster_id]
+                or not np.any(partition.labels == refit.clonal_cluster_id)
+                or not np.array_equal(refit.phi, refit.cluster_centers[partition.labels])):
+                raise ValueError("Selected refit must reconstruct an occupied exact clonal center.")
             if isinstance(partition, FusionPartition) and not partition.certified:
                 raise AssertionError("Refusing to serialize an uncertified raw partition.")
             if raw is not None:
@@ -532,12 +567,32 @@ class AnalysisSerialization:
                 provenance = raw.provenance
                 if provenance.source_data_hash != source_hash:
                     raise ValueError("Reporting data do not match the fitted source data identity.")
+                if (provenance.constraint_policy != CLONAL_CONSTRAINT_ID
+                    or provenance.witness_mutation_id not in data.mutation_ids):
+                    raise ValueError("Raw fit lacks occupied-clonal witness provenance.")
+                witness_index = tuple(data.mutation_ids).index(provenance.witness_mutation_id)
+                if provenance.witness_index != witness_index:
+                    raise ValueError("Raw witness index and mutation identity disagree.")
+                raw.certificate.validate_clonal_search(
+                    tuple(int(index) for index in np.flatnonzero(clonal_eligible_rows(
+                        source_model.lower, source_model.upper))),
+                    witness_index=witness_index,
+                    global_basis=provenance.global_optimality_basis)
+                lower, upper = make_clonal_witness_bounds(
+                    source_model.lower, source_model.upper, witness_index)
+                members = validate_clonal_feasibility(raw.phi, lower, upper)
+                if not members[witness_index]:
+                    raise ValueError("Raw witness is not fixed at CCF one.")
                 expected = make_base_objective_key(source_model,
-                    graph_hash=provenance.original_graph_hash, eps=epsilon)
+                    graph_hash=provenance.original_graph_hash, eps=epsilon,
+                    lower=lower, upper=upper)
                 if provenance.likelihood_eps != epsilon or provenance.objective_key.base != expected:
                     raise ValueError("Reporting likelihood, box or epsilon identity does not match the fit.")
-                if provenance.objective_key.base != raw_fit.provenance.objective_key.base:
-                    raise ValueError("Reporting candidates do not share the frozen base objective.")
+                reference = raw_fit.provenance.objective_key.base
+                if (expected.likelihood_hash, expected.graph_hash, expected.eps_hex) != (
+                    reference.likelihood_hash, reference.graph_hash, reference.eps_hex
+                ):
+                    raise ValueError("Witness branches changed the original likelihood or graph.")
 
         candidates = (model.raw_reference, model.partition_candidate, model.partition_parent_raw)
         seen = set()
@@ -546,12 +601,24 @@ class AnalysisSerialization:
                 continue
             seen.add(id(candidate))
             validate_candidate_identity(candidate)
+            if isinstance(candidate, RawFusionCandidate) and not raw_candidate_has_exact_fusion_certificate(candidate):
+                raise ValueError("Reporting raw admission evidence is incomplete or inconsistent.")
             bind(candidate.partition, candidate.refit,
                  candidate.raw_fit if isinstance(candidate, RawFusionCandidate) else None)
             score = candidate.score
             if (score.degrees_of_freedom != candidate.partition.n_clusters * data.num_regions
                 or score.n_eff != effective_bic_mutation_region_count(data)):
                 raise ValueError("Selection score dimensions do not match the reporting data.")
+        if (selection_result.selection_optimum_resolved
+            or selection_result.global_hybrid_optimum_certified) and not (
+            selection_result.raw_lambda_path_resolved
+            and not selection_result.selection_boundary_unresolved
+            and refit.global_optimum_certified
+            and all(candidate.raw_fit.certificate.global_optimum
+                    and candidate.raw_fit.certificate.witness_search_complete
+                    for candidate in candidates if isinstance(candidate, RawFusionCandidate))
+        ):
+            raise ValueError("Reporting global selection claim lacks certified union/refit coverage.")
         if isinstance(partition, DirectPartition):
             parent = model.partition_parent_raw
             if partition.parent_raw_candidate_id is not None:
@@ -632,6 +699,9 @@ def analysis_summary(
         "summary_schema_version": SUMMARY_SCHEMA_VERSION,
         "tumor_id": data.tumor_id,
         "input_file": str(analysis.input_file),
+        "constraint_policy": qualification["constraint_policy"],
+        "selected_clonal_cluster_id": refit_evidence["clonal_cluster_id"],
+        "selected_clonal_mutations": refit_evidence["clonal_mutations"],
         **input_model_summary(data, eps=raw_fit.provenance.likelihood_eps),
         "scalar_pilot_coordinate_count": len(scalar_pilots),
         "scalar_pilot_certified_coordinate_count": sum(
@@ -703,6 +773,11 @@ def analysis_summary(
             for prefix, evidence in (("raw_reference", raw_reference_evidence),
                                      ("selected_raw", qualification["selected_raw_fit"]))
             for name, key in (("penalized_objective", "objective"),
+                              ("witness_mutation_id", "witness_mutation_id"),
+                              ("witness_informative_regions", "witness_informative_regions"),
+                              ("conditional_kkt_certified", "conditional_kkt_certified"),
+                              ("witness_search_complete", "witness_search_complete"),
+                              ("global_optimum_certified", "global_optimum_certified"),
                               ("kkt_residual", "kkt_residual"),
                               ("kkt_tolerance", "kkt_tolerance"),
                               ("solve_tolerance", "solve_tolerance"),

@@ -25,11 +25,14 @@ from ..objective import (
     observed_loss_grid_torch,
 )
 from ..bic import fixed_partition_dirichlet_score
+from ..clonal import ClonalPartitionInfeasibleError
 from ..scalar import (
     _RefitCoordinateCache,
     _RefitCoordinateKey,
     _RefitCoordinateResult,
     _ScalarWorkStats,
+    _clonal_profile_inputs,
+    _profile_clonal_centers,
     canonical_partition_labels as _canonical_labels,
     certify_scalar_minimum,
     scalar_problem_from_model,
@@ -46,6 +49,7 @@ class _GuideCenters:
     phi: np.ndarray
     fit_loss: float
     finite_candidate_found: bool
+    clonal_cluster_id: int | None = None
 
     @property
     def n_clusters(self) -> int:
@@ -60,6 +64,8 @@ def _fit_guide_centers(
     data: TumorData, labels: np.ndarray, *, eps: float, tol: float,
     max_iter: int, _model: ObservedModel,
     _coordinate_cache: _RefitCoordinateCache | None = None,
+    _require_clonal: bool = True,
+    _clonal_inputs: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> _GuideCenters:
     """Retain the default certified Ward/CEM seed arithmetic, not a refit mode.
 
@@ -73,6 +79,7 @@ def _fit_guide_centers(
         raise ValueError("The supplied guide model does not match the tumor objective.")
     count, regions = int(labels.max()) + 1, data.num_regions
     centers = np.zeros((count, regions), dtype=np.float64)
+    block_losses = np.zeros(count, dtype=np.float64)
     loss, finite = 0.0, True
     tolerance = tol / max(count * regions, 1)
     for cluster in range(count):
@@ -111,9 +118,19 @@ def _fit_guide_centers(
                     _coordinate_cache.put(key, coordinate)
             centers[cluster, region] = coordinate.beta
             loss += coordinate.loss
+            block_losses[cluster] += coordinate.loss
             finite = finite and coordinate.finite_candidate_found
+    clonal_cluster_id = None
+    if _require_clonal:
+        eligible_rows, row_losses = (
+            _clonal_profile_inputs(model, eps=eps, cache=_coordinate_cache)
+            if _clonal_inputs is None else _clonal_inputs
+        )
+        centers, loss, clonal_cluster_id = _profile_clonal_centers(
+            labels, centers, block_losses, eligible_rows, row_losses,
+        )
     return _GuideCenters(labels, centers, np.clip(centers[labels], eps, model.upper),
-                         loss, bool(finite and np.isfinite(loss)))
+                         loss, bool(finite and np.isfinite(loss)), clonal_cluster_id)
 
 
 # Bound each temporary used to initialize the dense Ward cost matrix.  The
@@ -577,7 +594,9 @@ def _loss_to_centers(
     return cost
 
 
-def _repair_empty_clusters(labels: np.ndarray, cost: np.ndarray) -> np.ndarray:
+def _repair_empty_clusters(
+    labels: np.ndarray, cost: np.ndarray, *, _clonal_cluster_id: int | None = None,
+) -> np.ndarray:
     labels = np.asarray(labels, dtype=np.int64).copy()
     cost = np.asarray(cost)
     if np.issubdtype(cost.dtype, np.floating):
@@ -600,6 +619,11 @@ def _repair_empty_clusters(labels: np.ndarray, cost: np.ndarray) -> np.ndarray:
             gains = current_cost[finite_target] - target_cost[finite_target]
             selected = donor_indices[finite_target][int(np.argmax(gains))]
         else:
+            if cluster_idx == _clonal_cluster_id:
+                # Only the designated fixed-one column forbids this repair.
+                # Ordinary centers, including another free all-one center,
+                # can move into their donors' domains at the subsequent refit.
+                continue
             selected = donor_indices[int(np.argmax(current_cost))]
         labels[int(selected)] = int(cluster_idx)
     return labels
@@ -711,6 +735,8 @@ def refine_partition_likelihood(
     _refit_labels: Callable[[np.ndarray], _GuideCenters] | None = None,
     _model: ObservedModel | None = None,
     _column_cache: _LikelihoodColumnCache | None = None,
+    _require_clonal: bool = True,
+    _clonal_inputs: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> _GuideCenters:
     """Host CEM with fixed allocation scoring and empty-cluster repair."""
     labels = _validated_refinement_labels(data, labels)
@@ -720,6 +746,10 @@ def refine_partition_likelihood(
         else _model
     )
     column_cache = _LikelihoodColumnCache() if _column_cache is None else _column_cache
+    clonal_inputs = (
+        (_clonal_profile_inputs(model, eps=eps) if _clonal_inputs is None else _clonal_inputs)
+        if _require_clonal else None
+    )
 
     def refit_labels(current_labels: np.ndarray) -> _GuideCenters:
         if _refit_labels is not None:
@@ -731,6 +761,8 @@ def refine_partition_likelihood(
             tol=float(tol),
             max_iter=max(int(refit_max_iter), 32),
             _model=model,
+            _require_clonal=_require_clonal,
+            _clonal_inputs=clonal_inputs,
         )
 
     refit = refit_labels(labels)
@@ -744,14 +776,31 @@ def refine_partition_likelihood(
             _model=model,
             _column_cache=column_cache,
         )
+        if _require_clonal:
+            if refit.clonal_cluster_id is None:
+                raise ValueError("A clonal CEM refit must designate an occupied clonal block.")
+            eligible_rows, row_losses = clonal_inputs
+            # This exact column uses original float64 eligibility, without the
+            # ordinary near-bound assignment tolerance. All identities remain
+            # free to move; no original witness/seed is reserved.
+            count_cost[:, refit.clonal_cluster_id] = np.where(
+                eligible_rows, row_losses, np.inf,
+            )
         assignment_cost = _classification_assignment_cost(count_cost, labels)
         labels_next = np.argmin(assignment_cost, axis=1).astype(np.int64, copy=False)
-        labels_next = _repair_empty_clusters(labels_next, assignment_cost)
+        labels_next = _repair_empty_clusters(
+            labels_next, assignment_cost,
+            _clonal_cluster_id=refit.clonal_cluster_id if _require_clonal else None,
+        )
         labels_next = _canonical_labels(labels_next)
         if _label_key(labels_next) == labels_key:
             labels = labels_next
             break
-        proposed_refit = refit_labels(labels_next)
+        try:
+            proposed_refit = refit_labels(labels_next)
+        except ClonalPartitionInfeasibleError:
+            # This reassignment is ineligible, not a tumor-domain failure.
+            break
         proposed_score = _classification_refit_score(data, labels_next, proposed_refit)
         # Simultaneous reassignment is only a proposal: admit it after its
         # fixed-label refit improves the same declared score.
@@ -781,6 +830,7 @@ def generate_likelihood_partition_starts(
     tol: float = 1e-3,
     _work_stats: _ScalarWorkStats | None = None,
     _model: ObservedModel | None = None,
+    _require_clonal: bool = True,
 ) -> list[PartitionCandidate]:
     """Refit plain Ward and host-CEM proposals under one fixed score policy."""
     label_sets = {
@@ -796,6 +846,10 @@ def generate_likelihood_partition_starts(
     refit_cache: dict[bytes, _GuideCenters] = {}
     coordinate_cache = _RefitCoordinateCache(work_stats=_work_stats)
     column_cache = _LikelihoodColumnCache()
+    clonal_inputs = (
+        _clonal_profile_inputs(source_model, eps=eps, cache=coordinate_cache)
+        if _require_clonal else None
+    )
 
     def cached_refit(labels: np.ndarray) -> _GuideCenters:
         labels_key = _label_key(labels)
@@ -806,6 +860,8 @@ def generate_likelihood_partition_starts(
             data, labels, eps=float(eps), tol=float(tol),
             max_iter=max(int(refit_max_iter), 32), _model=source_model,
             _coordinate_cache=coordinate_cache,
+            _require_clonal=_require_clonal,
+            _clonal_inputs=clonal_inputs,
         )
         refit_cache[labels_key] = result
         return result
@@ -813,15 +869,19 @@ def generate_likelihood_partition_starts(
     for requested_k in sorted(label_sets):
         labels0 = _canonical_labels(label_sets[int(requested_k)])
         for source in (f"hessian_ward_K{requested_k}", f"hessian_ward_cem_K{requested_k}"):
-            if source.startswith("hessian_ward_cem"):
-                refit = refine_partition_likelihood(
-                    data, labels0, eps=float(eps), tol=float(tol),
-                    max_iter=int(cem_max_iter), refit_max_iter=int(refit_max_iter),
-                    _refit_labels=cached_refit, _model=source_model,
-                    _column_cache=column_cache,
-                )
-            else:
-                refit = cached_refit(labels0)
+            try:
+                if source.startswith("hessian_ward_cem"):
+                    refit = refine_partition_likelihood(
+                        data, labels0, eps=float(eps), tol=float(tol),
+                        max_iter=int(cem_max_iter), refit_max_iter=int(refit_max_iter),
+                        _refit_labels=cached_refit, _model=source_model,
+                        _column_cache=column_cache, _require_clonal=_require_clonal,
+                        _clonal_inputs=clonal_inputs,
+                    )
+                else:
+                    refit = cached_refit(labels0)
+            except ClonalPartitionInfeasibleError:
+                continue
             labels_used = refit.labels
             key = _label_key(labels_used)
             if key in seen:
@@ -853,11 +913,13 @@ def generate_partition_initializer_pool(
     fit_options: _FitOptions,
     curvature: np.ndarray | torch.Tensor | None = None,
     declared_k_grid: tuple[int, ...] | None = None,
+    _require_clonal: bool = True,
 ) -> tuple[PartitionCandidate, ...]:
     """Generate the deterministic pilot or final-Phi Ward/host-CEM pool.
 
-    These scored proposals supply the raw guide and the independent direct
-    candidate pool; final selection still refits labels under its own gate.
+    The private unanchored path is used only for immutable graph preparation;
+    selectable proposals use the occupied-clonal profile by default. Both
+    paths retain the certified guide optimizer, distinct from final grid/local.
     """
     context.validate(allow_deferred_graph=True)
     if float(fit_options.eps) != context.eps:
@@ -887,4 +949,5 @@ def generate_partition_initializer_pool(
         data, eps=float(fit_options.eps), label_sets=label_sets,
         tol=float(fit_options.solver.tolerance),
         _model=context.source_model,
+        _require_clonal=_require_clonal,
     ))

@@ -11,7 +11,11 @@ import numpy as np
 
 from ..config import validate_likelihood_precision
 from ..io.data import ImmutableArrayRecord, TumorData, readonly_array, tumor_data_fingerprint
-from .objective import ObservedModel, candidate_terms_numpy, compile_observed_model
+from .clonal import ClonalPartitionInfeasibleError, clonal_eligible_rows
+from .objective import (
+    ObservedModel, _observed_reduction_numpy, candidate_terms_numpy,
+    compile_observed_model,
+)
 
 
 # Bound candidate-dependent temporaries only once their size warrants dispatch.
@@ -690,6 +694,7 @@ class PartitionRefitResult:
     global_certificate_intervals: int = 0
     refit_mode: str = "grid_local"
     locally_converged: bool = False
+    clonal_cluster_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -730,6 +735,8 @@ class _RefitCoordinateCache:
     Bound both entry overhead and the total variable-sized membership keys.
     Budget-exhausted results are reusable only under the same exact policy;
     their unresolved certificate and logical work counts remain unchanged.
+    One additional O(M) eligibility/count-cost pair supports clonal profiling;
+    it is source-identified and does not retain the observed model itself.
     """
 
     def __init__(
@@ -743,6 +750,7 @@ class _RefitCoordinateCache:
         self._membership_bytes = 0
         self._entries: OrderedDict[_RefitCoordinateKey, _RefitCoordinateResult] = OrderedDict()
         self.work = _ScalarWorkStats() if work_stats is None else work_stats
+        self._clonal_profile_inputs: tuple[str, float, np.ndarray, np.ndarray] | None = None
 
     def get(self, key: _RefitCoordinateKey) -> _RefitCoordinateResult | None:
         result = self._entries.get(key)
@@ -780,6 +788,72 @@ def canonical_partition_labels(labels: np.ndarray) -> np.ndarray:
     for index, value in enumerate(values):
         remapped[index] = mapping.setdefault(int(value), len(mapping))
     return remapped
+
+
+def _clonal_profile_inputs(
+    model: ObservedModel,
+    *,
+    eps: float,
+    cache: _RefitCoordinateCache | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """One original-domain eligibility mask and CCF-one count cost per row.
+
+    A fit-local coordinate cache retains at most one source's arrays. Guide
+    certification and final grid/local refits share only this bookkeeping,
+    never their numerical optimizers or scalar certificate policies.
+    """
+    cached = None if cache is None else cache._clonal_profile_inputs
+    if cached is not None and cached[:2] == (model.fingerprint, float(eps)):
+        return cached[2], cached[3]
+    eligible = clonal_eligible_rows(model.lower, model.upper)
+    losses = _observed_reduction_numpy(
+        model, np.ones(model.shape, dtype=np.float64), eps=float(eps), output="loss",
+    ).sum(axis=1)
+    eligible = readonly_array(eligible, dtype=bool)
+    losses = readonly_array(losses, dtype=np.float64)
+    if cache is not None:
+        cache._clonal_profile_inputs = (model.fingerprint, float(eps), eligible, losses)
+    return eligible, losses
+
+
+def _profile_clonal_centers(
+    labels: np.ndarray,
+    centers: np.ndarray,
+    free_block_losses: np.ndarray,
+    eligible_rows: np.ndarray,
+    clonal_row_losses: np.ndarray,
+) -> tuple[np.ndarray, float, int]:
+    """Profile occupied feasible clonal blocks without changing any labels.
+
+    This is the union of fixed-label refits with each feasible block frozen at
+    all-region CCF one. The other centers are the supplied ordinary free fits;
+    neither a distinguished seed nor a preference for clonal size is used.
+    """
+    labels = np.asarray(labels, dtype=np.int64)
+    count = int(np.asarray(centers).shape[0])
+    feasible = np.asarray([
+        np.any(labels == cluster) and np.all(eligible_rows[labels == cluster])
+        for cluster in range(count)
+    ], dtype=bool)
+    choices = np.flatnonzero(feasible)
+    if not choices.size:
+        raise ClonalPartitionInfeasibleError(
+            "No occupied partition block permits CCF = 1 in every region "
+            "for all of its members under the original compiled bounds."
+        )
+    fixed_losses = np.bincount(labels, weights=clonal_row_losses, minlength=count)
+    free_losses = np.asarray(free_block_losses, dtype=np.float64)
+    # Sum the remaining blocks directly: this also avoids inf - inf when a
+    # failed free fit belongs to the block that will instead be fixed at one.
+    branch_losses = np.asarray([
+        fixed_losses[cluster] + np.sum(free_losses[np.arange(count) != cluster])
+        for cluster in choices
+    ])
+    branch_losses = np.where(np.isfinite(branch_losses), branch_losses, np.inf)
+    chosen = int(choices[int(np.argmin(branch_losses))])
+    profiled = np.array(centers, dtype=np.float64, copy=True)
+    profiled[chosen, :] = 1.0
+    return profiled, float(np.min(branch_losses)), chosen
 
 
 def _fit_coordinate(
@@ -836,7 +910,12 @@ def partition_constrained_observed_refit(
     _coordinate_cache: _RefitCoordinateCache | None = None,
     _work_stats: _ScalarWorkStats | None = None,
 ) -> PartitionRefitResult:
-    """Refit cluster centers without changing partition labels."""
+    """Profile one occupied clonal block without changing partition labels.
+
+    Ordinary free centers retain the existing grid/local numerical policy.
+    The only additional restriction fixes the profiled block at CCF one in
+    every region; an ineligible label set raises a partition-specific error.
+    """
 
     if _coordinate_cache is not None:
         if _work_stats is not None and _work_stats is not _coordinate_cache.work:
@@ -875,10 +954,8 @@ def partition_constrained_observed_refit(
     total_grid_points = 0
     max_grid_spacing = 0.0
     best_second_loss_gaps: list[float] = []
-    total_loss = 0.0
+    block_losses = np.zeros(n_clusters, dtype=np.float64)
     finite_coordinates = 0
-    boundary_count = 0
-    active_df = 0
     boundary_tolerance = max(10.0 * tolerance, 1e-8)
 
     for cluster in range(n_clusters):
@@ -926,16 +1003,30 @@ def partition_constrained_observed_refit(
             if np.isfinite(float(coordinate.best_second_loss_gap)):
                 best_second_loss_gaps.append(float(coordinate.best_second_loss_gap))
             certificate_methods.add(coordinate.certificate_method)
-            total_loss += coordinate.loss
+            block_losses[cluster] += coordinate.loss
             finite_coordinates += int(coordinate.finite_candidate_found)
+
+    eligible_rows, clonal_row_losses = _clonal_profile_inputs(
+        model, eps=epsilon, cache=_coordinate_cache,
+    )
+    centers, total_loss, clonal_cluster_id = _profile_clonal_centers(
+        normalized_labels, centers, block_losses, eligible_rows, clonal_row_losses,
+    )
+    # These are descriptive fitted-coordinate diagnostics, not the unchanged
+    # nominal K*R center penalty used by model selection.
+    boundary_count = active_df = 0
+    for cluster in range(n_clusters):
+        members = np.flatnonzero(normalized_labels == cluster)
+        for region in range(n_regions):
             if np.any(observed[members, region]):
+                upper = float(np.min(upper_matrix[members, region]))
                 at_boundary = bool(
-                    coordinate.beta <= lower + boundary_tolerance
-                    or coordinate.beta >= upper - boundary_tolerance
+                    cluster == clonal_cluster_id
+                    or centers[cluster, region] <= epsilon + boundary_tolerance
+                    or centers[cluster, region] >= upper - boundary_tolerance
                 )
                 boundary_count += int(at_boundary)
                 active_df += int(not at_boundary)
-
     selected_lower_bound = float(np.sum(coordinate_lower))
     phi = (
         centers[normalized_labels]
@@ -976,4 +1067,5 @@ def partition_constrained_observed_refit(
         ),
         global_certificate_intervals=int(certificate_intervals),
         refit_mode="grid_local",
+        clonal_cluster_id=clonal_cluster_id,
     )

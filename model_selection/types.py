@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from ..core.bic import SelectionScore
+from ..core.clonal import CLONAL_CONSTRAINT_ID
 from ..core.fusion.types import (
     ConvergenceResult, DenseEdgeCertificate, KKTComponents, RawFit, WorkCounters,
 )
@@ -76,8 +77,21 @@ class PartitionRefitSummary(ImmutableArrayRecord):
     refit_mode: str = "grid_local"
     multiplicity_policy: str = "independent_broad"
     locally_converged: bool | None = None
+    clonal_cluster_id: int | None = None
+    constraint_policy: str = CLONAL_CONSTRAINT_ID
 
     def __post_init__(self) -> None:
+        if self.constraint_policy != CLONAL_CONSTRAINT_ID:
+            raise ValueError("Partition refits require the occupied-clonal policy.")
+        if self.clonal_cluster_id is not None:
+            cluster = int(self.clonal_cluster_id)
+            centers = np.asarray(self.cluster_centers)
+            if (
+                cluster < 0 or centers.ndim != 2 or cluster >= centers.shape[0]
+                or not np.any(np.asarray(self.labels) == cluster)
+                or not np.all(centers[cluster] == 1.0)
+            ):
+                raise ValueError("The designated clonal cluster must be occupied and exactly one.")
         if self.global_optimum_certified and (
             not np.isfinite(float(self.global_lower_bound))
             or not np.isfinite(float(self.global_optimality_gap))

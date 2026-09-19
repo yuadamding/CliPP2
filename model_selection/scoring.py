@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..config import _FitOptions
+from ..core.clonal import CLONAL_CONSTRAINT_ID, clonal_members
 from ..core.fusion.types import RawFit
 from .types import (
     CandidateRecord,
@@ -54,10 +55,33 @@ def raw_candidate_has_exact_fusion_certificate(
     residual = _number_or_nan(certificate.components.residual)
     tolerance = _number_or_nan(certificate.tolerance)
     schema_version = _number_or_nan(certificate.schema_version)
+    witness = provenance.witness_index
+    mutation_ids = candidate.partition.mutation_ids
+    if (not isinstance(witness, (int, np.integer)) or isinstance(witness, (bool, np.bool_))
+        or not 0 <= witness < len(mutation_ids)
+        or provenance.witness_mutation_id != mutation_ids[witness]
+        or np.asarray(fit.phi).ndim != 2
+        or len(fit.phi) != len(mutation_ids)
+        or not np.all(fit.phi[witness] == 1.0)):
+        return False
+    try:
+        if any(index < 0 or index >= len(mutation_ids)
+               for index in certificate.witness_branches_eligible):
+            return False
+        certificate.validate_clonal_search(
+            certificate.witness_branches_eligible, witness_index=witness,
+            global_basis=provenance.global_optimality_basis)
+    except (ValueError, TypeError):
+        return False
     return bool(
         candidate.eligible_for_selection
         and candidate.raw_objective_certified
         and candidate.partition.certified
+        and certificate.constraint_policy == CLONAL_CONSTRAINT_ID
+        and provenance.constraint_policy == CLONAL_CONSTRAINT_ID
+        and certificate.conditional_kkt_certified
+        and certificate.witness_mutation_id == provenance.witness_mutation_id
+        and np.any(clonal_members(fit.phi))
         and schema_version == _EXACT_CERTIFICATE_SCHEMA_VERSION
         and residual_method == _EXACT_CERTIFICATE_RESIDUAL_METHOD
         and str(certificate.audit_dtype) == "float64"
@@ -117,6 +141,7 @@ def _assert_same_signature_consistency(records: list[CandidateRecord]) -> None:
             refit_consistent = (
                 refit.partition_signature == signature
                 and refit.multiplicity_policy == reference_refit.multiplicity_policy
+                and refit.clonal_cluster_id == reference_refit.clonal_cluster_id
                 and np.array_equal(refit.labels, reference_refit.labels)
                 and np.allclose(refit.phi, reference_refit.phi, rtol=0.0, atol=1e-12)
                 and np.allclose(

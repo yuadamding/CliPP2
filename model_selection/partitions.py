@@ -4,6 +4,7 @@ import hashlib
 
 import numpy as np
 
+from ..core.clonal import clonal_members
 from ..core.fusion.types import RawFit
 from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.scalar import canonical_partition_labels as _canonical_partition_labels
@@ -136,12 +137,14 @@ def _diameter_constrained_labels(
 ) -> np.ndarray:
     """Build a deterministic, merge-maximal complete-link partition.
 
-    A block is admissible exactly when its Euclidean diameter is no larger than
-    ``tolerance``.  Mutations are visited in lexicographic raw-CCF order and put
+    Exact all-region CCF-one rows form one protected occupied block. Remaining
+    rows are admissible together when their Euclidean diameter is no larger than
+    ``tolerance``. Mutations are visited in lexicographic raw-CCF order and put
     in the first block for which *every* pair remains in tolerance.  A block
     created later has a seed that failed every earlier block and block growth
-    cannot reduce that distance, so the result is pairwise merge-maximal.  The
-    Each mutation follows the identical complete-link admission rule.
+    cannot reduce that distance, so the remaining partition is pairwise
+    merge-maximal. Protection is an extraction boundary, not a separation gap:
+    subsequent likelihood-based membership refinement may change the group.
     """
 
     values = np.asarray(phi, dtype=np.float64)
@@ -149,8 +152,10 @@ def _diameter_constrained_labels(
     if num_mutations == 0:
         return np.zeros(0, dtype=np.int64)
 
-    blocks: list[list[int]] = []
-    remaining = np.arange(num_mutations, dtype=np.int64)
+    clonal = clonal_members(values)
+    blocks: list[list[int]] = [np.flatnonzero(clonal).tolist()] if np.any(clonal) else []
+    protected_count = len(blocks)
+    remaining = np.flatnonzero(~clonal)
     if remaining.size:
         # ``np.lexsort`` uses the last key as primary.  Mutation index is the
         # final tie-breaker, so equal raw CCF rows remain reproducible.
@@ -163,7 +168,7 @@ def _diameter_constrained_labels(
 
     for index in remaining:
         assigned = False
-        for block in blocks:
+        for block in blocks[protected_count:]:
             block_indices = np.asarray(block, dtype=np.int64)
             distances = np.linalg.norm(
                 values[block_indices] - values[int(index)],
@@ -191,15 +196,18 @@ def _mergeable_cross_block_pair_found(
     *,
     tolerance: float,
 ) -> bool:
-    """Return whether two reported blocks can be merged without excess diameter."""
+    """Check maximality apart from the protected exact-clonal boundary."""
 
     canonical = _canonical_partition_labels(labels)
     blocks = [
         np.flatnonzero(canonical == cluster).astype(np.int64, copy=False)
         for cluster in range(int(canonical.max()) + 1 if canonical.size else 0)
     ]
+    clonal = clonal_members(np.asarray(phi, dtype=np.float64))
     for left_index, left in enumerate(blocks):
         for right in blocks[left_index + 1 :]:
+            if np.all(clonal[left]) != np.all(clonal[right]):
+                continue
             if _maximum_cross_distance(
                 phi,
                 left,
@@ -234,7 +242,7 @@ def extract_certified_fusion_partition(
     within_ok = bool(np.all(np.isfinite(diameters)) and max_diameter <= tol)
     # ``cross_close`` retains its schema name but now has the precise complete-
     # linkage meaning: two whole blocks, rather than merely one chaining edge,
-    # can be combined while preserving the diameter contract.
+    # can be combined while preserving diameter and the exact-clonal boundary.
     cross_close = _mergeable_cross_block_pair_found(
         phi,
         labels,
