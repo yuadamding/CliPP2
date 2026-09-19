@@ -95,7 +95,7 @@ def test_accepted_reuse_matches_exhaustive_solves_without_inventing_globality(tm
     assert fast.certificate.witness_branches_reused == (1, 2, 3)
     assert fast.certificate.witness_reuse_basis == 'fresh_float64_kkt_with_global_support'
     assert fast.certificate.witness_search_complete and fast.certificate.witness_search_work_complete
-    assert fast.work.full_certificate_audit_passes >= 3
+    assert fast.work.full_certificate_audit_passes == 1  # shared across three witnesses
     monkeypatch.setattr(solver, '_audit_reusable_witness', lambda *a, **k: (False, WorkCounters(), None))
     exhaustive = solver.fit_prepared(original, 2., options())
     assert exhaustive.certificate.witness_branches_reused == ()
@@ -115,6 +115,7 @@ def test_failed_new_box_audit_triggers_real_ordinary_solves(tmp_path, execution_
         diagnostics, scope, direction, objective = terminal(**kwargs)
         return replace(diagnostics, backward_error_stationarity_residual=1.), scope, direction, objective
     def audit_only(*args, **kwargs):
+        kwargs.pop('shared_cache', None)  # exercise the independent fallback here
         with monkeypatch.context() as patch:
             patch.setattr(solver, '_terminal_backward_error_audit_float64', reject)
             return audit(*args, **kwargs)

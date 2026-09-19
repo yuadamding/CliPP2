@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
 import warnings
 
 import numpy as np
@@ -616,6 +617,7 @@ def graph_fusion_kkt_residual_from_grad_torch(
     dual_scale: float = 1.0,
     edge_work_bytes: int | None = None,
     _progress_out: dict[str, float] | None = None,
+    _adjoint_out: dict[str, torch.Tensor] | None = None,
 ) -> KKTDiagnostics:
     lambda_value = validate_lambda_value(lambda_value)
     dual_scale_value = float(dual_scale)
@@ -662,6 +664,10 @@ def graph_fusion_kkt_residual_from_grad_torch(
         )
         merit = float(torch.linalg.vector_norm(violation).item())
         _progress_out["cone_violation_norm"] = merit if np.isfinite(merit) else float("inf")
+    if _adjoint_out is not None:
+        # A shared witness audit consumes this exact reduction, not another
+        # graph scan with a potentially different floating-point order.
+        _adjoint_out["adjoint"] = adj
     zero = torch.zeros((), dtype=phi.dtype, device=phi.device)
     max_edge_residual = zero
     max_ball_residual = zero
@@ -997,7 +1003,7 @@ def _complete_graph_isotropic_box_qp_torch(
     )
     if (
         U.device.type == "cuda"
-        and U.dtype == torch.float64
+        and U.dtype in (torch.float32, torch.float64)
         and U.ndim == 2
         and int(U.shape[1]) > 1
     ):
@@ -1143,32 +1149,94 @@ def _complete_graph_isotropic_box_qp_compiled_impl(
 # Multi-region path fits invoke this bounded QP many thousands of times.  A
 # shape-specific Inductor kernel amortizes compilation there, while the common
 # one-region workflow stays eager to avoid paying its cold-start cost.
+_cuda_box_qp_compile_stats: dict[tuple, dict] = {}
+_cuda_box_qp_active_signature: ContextVar[tuple | None] = ContextVar(
+    "cuda_box_qp_active_signature", default=None,
+)
+
+
+def _cuda_box_qp_signature(args) -> tuple:
+    # Metadata only: changing rho, q, h or the bounds must not specialize their
+    # values or synchronize the device. Strides/dtypes/devices are compiler guards.
+    return (
+        tuple((value.dtype, value.device, tuple(value.shape), tuple(value.stride()),
+               value.requires_grad) for value in args[:-1]),
+        int(args[-1]), torch.is_grad_enabled(), torch.is_inference_mode_enabled(),
+        torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda"),
+    )
+
+
+def _cuda_box_qp_stats(signature: tuple) -> dict:
+    return _cuda_box_qp_compile_stats.setdefault(signature, dict(
+        calls=0, compile_attempts=0, compilations=0, recompilations=0,
+        executions=0, fallbacks=0, failed=False, failure=None,
+    ))
+
+
+def _box_qp_inductor_backend(graph, inputs):
+    # Witness backend invocation and generated-callable execution separately.
+    # Counting calls to torch.compile's wrapper alone cannot prove compilation.
+    signature = _cuda_box_qp_active_signature.get()
+    if signature is not None:
+        _cuda_box_qp_stats(signature)["compile_attempts"] += 1
+    compiled = torch._inductor.compile(graph, inputs)
+    if signature is not None:
+        stats = _cuda_box_qp_stats(signature)
+        stats["compilations"] += 1
+        stats["recompilations"] = max(0, stats["compilations"] - 1)
+
+    def execute(*values):
+        result = compiled(*values)
+        # One Dynamo graph may serve more than one metadata signature. Attribute
+        # execution to this call, not to whichever call initially compiled it.
+        active = _cuda_box_qp_active_signature.get()
+        if active is not None:
+            _cuda_box_qp_stats(active)["executions"] += 1
+        return result
+
+    return execute
+
+
 _compiled_complete_graph_isotropic_box_qp_cuda = torch.compile(
     _complete_graph_isotropic_box_qp_compiled_impl,
+    backend=_box_qp_inductor_backend,
     fullgraph=True,
     dynamic=False,
 )
-_cuda_box_qp_compile_failed = False
 
 
 def _complete_graph_isotropic_box_qp_cuda(*args) -> torch.Tensor:
-    global _cuda_box_qp_compile_failed
-    if _cuda_box_qp_compile_failed:
+    signature = _cuda_box_qp_signature(args)
+    stats = _cuda_box_qp_stats(signature)
+    stats["calls"] += 1
+    if stats["failed"]:
+        stats["fallbacks"] += 1
         return _complete_graph_isotropic_box_qp_compiled_impl(*args)
+    token = _cuda_box_qp_active_signature.set(signature)
     try:
-        return _compiled_complete_graph_isotropic_box_qp_cuda(*args)
+        before = stats["executions"]
+        result = _compiled_complete_graph_isotropic_box_qp_cuda(*args)
+        if stats["executions"] == before:
+            # E.g. compilation disabled by the process environment. Keep this
+            # observable so qualification cannot call an eager timing compiled.
+            stats["fallbacks"] += 1
+        return result
     except Exception as exc:
         exception_module = type(exc).__module__
         if not exception_module.startswith(("torch._dynamo", "torch._inductor")):
             raise
-        _cuda_box_qp_compile_failed = True
+        stats.update(failed=True, failure=f"{type(exc).__name__}: {exc}"[:3000])
+        stats["fallbacks"] += 1
         warnings.warn(
-            "CUDA box-QP compilation failed; falling back to eager Torch kernels: "
+            "CUDA box-QP compilation failed for this signature; "
+            "falling back to eager Torch kernels: "
             f"{exc}",
             RuntimeWarning,
             stacklevel=2,
         )
         return _complete_graph_isotropic_box_qp_compiled_impl(*args)
+    finally:
+        _cuda_box_qp_active_signature.reset(token)
 
 
 def _closed_form_box_fusion_result(

@@ -26,7 +26,6 @@ from ..objective import (
     observed_one_sided_gradients_torch,
     observed_em_terms_torch,
     observed_terms_torch,
-    observed_terms_numpy,
 )
 from ..clonal import (
     CLONAL_CONSTRAINT_ID,
@@ -71,6 +70,7 @@ from .torch_backend import (
     graph_adjoint_edges_in_dtype,
     graph_fusion_kkt_residual_from_grad_torch,
     pairwise_penalty_torch,
+    project_stationarity_cone_torch,
     resolve_runtime,
     solve_majorized_subproblem_alm_torch,
     validate_lambda_value,
@@ -99,6 +99,7 @@ from .types import (
     WorkCounters,
     WorksetMemoryOptions,
 )
+from .witness_bounds import witness_scalar_data, separable_zero_witness
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +201,7 @@ def _terminal_backward_error_audit_float64(
     lambda_value: float,
 
     tol: float,
+    _shared_out: dict | None = None,
 ) -> tuple[KKTDiagnostics, str, bool, float]:
     """Audit the unchanged terminal witness with float64 backward error."""
 
@@ -246,6 +248,7 @@ def _terminal_backward_error_audit_float64(
             tol=float(tol),
             fusion_adjoint=adjustment,
         )
+    adjoint_out = {} if _shared_out is not None else None
     result = certify(
         problem=CertificateProblem(
             graph=graph64,
@@ -259,6 +262,7 @@ def _terminal_backward_error_audit_float64(
         gradient=gradient,
         witness=certificate,
         refine=False,
+        _adjoint_out=adjoint_out,
     )
     diagnostics = _with_explicit_primal_check(result.diagnostics, problem, phi64)
     _, _, objective64 = (
@@ -271,6 +275,11 @@ def _terminal_backward_error_audit_float64(
             lambda_value=float(lambda_value),
         )
     )
+    if _shared_out is not None:
+        _shared_out.update(
+            phi=phi64, gradient=gradient, lower=lower64, upper=upper64,
+            adjoint=adjoint_out.get("adjoint"),
+        )
     return (
         diagnostics,
         gradient.scope,
@@ -2595,64 +2604,136 @@ def _offload_witness_fit(fit: RawFit) -> RawFit:
     )
 
 
-def _witness_scalar_bounds(
-    problem: PreparedProblem,
-) -> tuple[np.ndarray | None, np.ndarray]:
-    """Certified original scalar lower bounds; never substitute attained minima."""
-    source = problem.source_model
-    clonal_loss = observed_terms_numpy(
-        source, np.ones(source.shape, dtype=np.float64), eps=problem.eps,
-    ).loss
-    certificates = problem.scalar_pilot_certificates
-    if len(certificates) != int(np.prod(source.shape)) or not all(
-        item.globally_certified
-        and np.isfinite(item.global_lower_bound)
-        and np.isfinite(item.attained_value)
-        and item.global_lower_bound <= item.attained_value
-        for item in certificates
-    ):
-        return None, clonal_loss
-    bounds = np.asarray([item.global_lower_bound for item in certificates]).reshape(source.shape)
-    return bounds, clonal_loss
+def _leave_one_out_max(values: np.ndarray) -> np.ndarray:
+    """O(M) maxima with each designated clonal row omitted, including M=1."""
+    values = np.asarray(values)
+    prefix = np.maximum.accumulate(np.r_[0.0, values])
+    suffix = np.maximum.accumulate(np.r_[values, 0.0][::-1])[::-1]
+    return np.maximum(prefix[:-1], suffix[1:])
 
 
-def _separable_zero_witness(
-    problem: PreparedProblem, eligible: tuple[int, ...], clonal_loss: np.ndarray,
-) -> tuple[int, np.ndarray] | None:
-    """Use separability only for exact, representable scalar minima.
+@dataclass(slots=True)
+class _WitnessAuditCache:
+    """One full-graph audit per incumbent, not per clonal member.
 
-    A tolerance-certified (positive-gap) scalar result is not an exact minimum.
-    Such results retain exhaustive branch fitting and conservative pruning.
+    Edge terms and objective do not depend on which row is fixed to one.
+    Stationarity is computed in the ORIGINAL box (freeing the old witness),
+    then only the new witness row is removed. No graph-sized copy is retained.
+    The ordinary independent audit remains authoritative for other formats.
     """
-    certificates = problem.scalar_pilot_certificates
-    source = problem.source_model
-    if len(certificates) != int(np.prod(source.shape)) or not all(
-        item.globally_certified and item.optimality_gap == 0.0
-        and np.isfinite(item.argmin) and np.isfinite(item.attained_value)
-        and item.global_lower_bound == item.attained_value
-        for item in certificates
-    ):
-        return None
-    phi = np.asarray([item.argmin for item in certificates], dtype=np.float64).reshape(source.shape)
-    if np.any(phi < source.lower) or np.any(phi > source.upper):
-        return None
-    if problem.runtime.dtype == torch.float32 and not np.array_equal(phi, phi.astype(np.float32)):
-        return None
-    free_loss = observed_terms_numpy(source, phi, eps=problem.eps).loss
-    attained = np.asarray([item.attained_value for item in certificates]).reshape(source.shape)
-    if not np.array_equal(free_loss, attained):
-        return None
-    deltas = np.sum(clonal_loss - free_loss, axis=1)
-    if not np.all(np.isfinite(deltas[list(eligible)])):
-        return None
-    witness = min(eligible, key=lambda index: (float(deltas[index]), index))
-    phi = phi.copy()
-    phi[witness] = 1.0
-    return witness, phi
+
+    problem: PreparedProblem
+    _key: tuple | None = None
+    _incumbent: RawFit | None = None
+    _supported: bool = False
+    _result: tuple | None = None
+
+    def audit(self, branch, incumbent, *, lambda_value, tolerance):
+        problem = self.problem
+        problem.assert_runtime_unchanged()
+        branch.assert_runtime_unchanged()
+        if self._incumbent is not incumbent:
+            self._key = self._incumbent = self._result = None
+            self._supported = False
+        certificate = incumbent.certificate.witness
+        if (
+            problem.optimization_box.witness_index is not None
+            or branch.source_model is not problem.source_model
+            or branch.graph is not problem.graph
+            or branch.graph_spec is not problem.graph_spec
+            or branch.graph_hash != problem.graph_hash
+            or branch.runtime != problem.runtime or branch.eps != problem.eps
+            or not isinstance(certificate, DenseEdgeCertificate)
+            or certificate.graph_hash != problem.graph_hash
+            or not torch.is_tensor(certificate.dual)
+            or tuple(certificate.dual.shape) != (
+                int(problem.graph.weight.numel()), problem.source_model.shape[1],
+            )
+        ):
+            return None
+        source, box = problem.source_model, branch.optimization_box
+        index = box.witness_index
+        if index is None or any(
+            not np.array_equal(original, getattr(problem.optimization_box, name))
+            or not np.array_equal(original[:index], getattr(box, name)[:index])
+            or not np.array_equal(original[index + 1:], getattr(box, name)[index + 1:])
+            for name, original in (("lower", source.lower), ("upper", source.upper))
+        ):
+            # Only a single exact frozen row permits this leave-one-out proof.
+            # Keep arbitrary effective boxes on the independent audit route.
+            return None
+        dual = certificate.dual
+        key = (
+            id(incumbent), id(certificate), id(dual), dual._version,
+            str(dual.device), dual.dtype, tuple(dual.stride()),
+            id(problem.source_model), id(problem.graph), id(problem.graph_spec),
+            problem.source_model.fingerprint, problem.graph_hash,
+            problem.optimization_box.fingerprint, problem.eps,
+            lambda_value, tolerance, problem.runtime,
+        )
+        if key != self._key:
+            supported = bool(
+                has_proven_convex_observed_loss(problem.source_model, eps=problem.eps)
+                or has_global_supporting_tangent(
+                    problem.source_model, incumbent.phi, eps=problem.eps,
+                )
+            )
+            self._key, self._incumbent = key, incumbent
+            self._result, self._supported = None, supported
+        if not self._supported:
+            return False, WorkCounters(), None
+        work = WorkCounters()
+        if self._result is None:
+            captured = {}
+            diagnostics, _, _, objective = _terminal_backward_error_audit_float64(
+                problem=problem,
+                phi=torch.tensor(incumbent.phi, device=problem.runtime.device),
+                certificate=certificate, lambda_value=lambda_value, tol=tolerance,
+                _shared_out=captured,
+            )
+            grad = captured["gradient"]
+            adj = captured["adjoint"]
+            if adj is None or grad.directional_failures is None:
+                raise ValueError("Shared witness audit lacks original-box row evidence.")
+            total = grad.value + adj
+            violation = total - project_stationarity_cone_torch(
+                total, phi=captured["phi"], lower=captured["lower"],
+                upper=captured["upper"],
+            )
+            scale = torch.maximum(torch.ones_like(total), grad.value.abs() + adj.abs())
+            rows = (violation.abs() / scale).amax(dim=1).detach().cpu().numpy()
+            # Freezing a row cannot repair NaN/Inf arithmetic: even frozen
+            # stationarity computes total-total. Fail closed for every box.
+            if not np.all(np.isfinite(rows)):
+                rows = np.full_like(rows, np.inf)
+            stationarity = _leave_one_out_max(rows)
+            if not np.all(np.isfinite(rows)):
+                stationarity[:] = np.inf
+            directional = _leave_one_out_max(
+                grad.directional_failures.any(dim=1).detach().cpu().numpy(),
+            ) == 0.0
+            common = (
+                diagnostics.backward_error_edge_subgradient_residual,
+                diagnostics.backward_error_dual_ball_residual,
+                diagnostics.box_residual,
+            )
+            self._result = stationarity, directional, common, objective
+            work = WorkCounters(full_certificate_audit_passes=1)
+        stationarity, directional, common, objective = self._result
+        index = branch.optimization_box.witness_index
+        residuals = (*common, float(stationarity[index]))
+        covered = bool(
+            directional[index] and common[-1] == 0.0
+            and all(np.isfinite(value) and 0.0 <= value <= 5.0 * tolerance
+                    for value in residuals)
+            and objective == incumbent.objective.total
+        )
+        return covered, work, None
 
 
 def _audit_reusable_witness(
     branch: PreparedProblem, incumbent: RawFit, *, lambda_value: float, tolerance: float,
+    shared_cache: _WitnessAuditCache | None = None,
 ) -> tuple[bool, WorkCounters, str | None]:
     """Cover a new box only by a fresh original-gate audit and global support.
 
@@ -2664,6 +2745,15 @@ def _audit_reusable_witness(
     index = branch.optimization_box.witness_index
     if not incumbent.certificate.admissible or not np.all(incumbent.phi[index] == 1.0):
         return False, WorkCounters(), None
+    if shared_cache is not None:
+        try:
+            shared = shared_cache.audit(
+                branch, incumbent, lambda_value=lambda_value, tolerance=tolerance,
+            )
+            if shared is not None:
+                return shared
+        except (RuntimeError, MemoryError, FloatingPointError, ValueError) as error:
+            return False, WorkCounters(), f"{type(error).__name__}: {error}"
     if not (
         has_proven_convex_observed_loss(branch.source_model, eps=branch.eps)
         or has_global_supporting_tangent(branch.source_model, incumbent.phi, eps=branch.eps)
@@ -2726,16 +2816,14 @@ def fit_prepared(
     ):
         raise ValueError("Raw fitting requires the frozen complete graph.")
     source = problem.source_model
-    eligible = tuple(int(index) for index in np.flatnonzero(
-        clonal_eligible_rows(source.lower, source.upper),
-    ))
+    scalar_data = witness_scalar_data(problem)
+    eligible = scalar_data.eligible
     if not eligible:
         raise ClonalConstraintInfeasibleError(
             "No retained mutation permits CCF = 1 in every region under "
             "the current compiled CCF bounds."
         )
-    scalar_bounds, clonal_loss = _witness_scalar_bounds(problem)
-    separable = _separable_zero_witness(problem, eligible, clonal_loss) if lambda_value == 0.0 else None
+    separable = separable_zero_witness(problem, scalar_data) if lambda_value == 0.0 else None
     order = [separable[0]] if separable is not None else list(eligible)
     attempted, pruned, unresolved, failures, reused = [], [], [], [], []
     reuse_audit_failures = []
@@ -2745,18 +2833,11 @@ def fit_prepared(
     all_branches_global = True
     work_complete = True
     exception_kinds = []
+    shared_audit = _WitnessAuditCache(problem)
     for index in order:
-        if scalar_bounds is not None and incumbent is not None:
-            # Positive fusion costs can only increase this source-scalar bound.
-            terms = scalar_bounds.copy()
-            terms[index] = clonal_loss[index]
-            lower_bound = float(np.sum(terms, dtype=np.float64))
-            numerical_slack = 256.0 * np.finfo(np.float64).eps * (
-                1.0 + float(np.sum(np.abs(terms))) + abs(incumbent.objective.total)
-            )
-            if np.isfinite(lower_bound) and lower_bound - numerical_slack > incumbent.objective.total + numerical_slack:
-                pruned.append(index)
-                continue
+        if incumbent is not None and scalar_data.can_prune(index, incumbent.objective.total):
+            pruned.append(index)
+            continue
         attempted.append(index)
         candidate = None
         try:
@@ -2768,6 +2849,7 @@ def fit_prepared(
                     branch, incumbent, lambda_value=lambda_value,
                     tolerance=(solver_options.tolerance if solver_options.certification_tolerance is None
                                else solver_options.certification_tolerance),
+                    shared_cache=shared_audit,
                 )
                 total_work = total_work + audit_work
                 if audit_failure is not None:
@@ -2804,6 +2886,7 @@ def fit_prepared(
             if candidate.certificate.admissible:
                 if incumbent is None or candidate.objective.total < incumbent.objective.total:
                     incumbent = _offload_witness_fit(candidate)
+                    shared_audit = _WitnessAuditCache(problem)
                 failed_incumbent = None
             else:
                 if incumbent is None and (

@@ -76,6 +76,7 @@ class CertificateGradient:
     scope: SmoothGradientScope
     directional_admissible: bool
     at_breakpoint: torch.Tensor
+    directional_failures: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,16 +158,10 @@ def build_certificate_gradient(
         at_breakpoint,
         tol=float(tol),
     )
-    directional_admissible = not bool(
-        torch.any(
-            _inadmissible_downward_kink_mask(
-                downward_kink,
-                lower,
-                upper,
-                phi,
-            )
-        ).item()
+    directional_failures = _inadmissible_downward_kink_mask(
+        downward_kink, lower, upper, phi,
     )
+    directional_admissible = not bool(torch.any(directional_failures).item())
     return CertificateGradient(
         value=value,
         scope=(
@@ -176,6 +171,7 @@ def build_certificate_gradient(
         ),
         directional_admissible=directional_admissible,
         at_breakpoint=at_breakpoint,
+        directional_failures=directional_failures,
     )
 
 
@@ -962,6 +958,7 @@ def _audit_certificate(
     phi: torch.Tensor,
     grad_smooth: torch.Tensor,
     problem: CertificateProblem,
+    _adjoint_out: dict[str, torch.Tensor] | None = None,
 ) -> KKTDiagnostics:
     if isinstance(certificate, CompressedEdgeCertificate):
         return _compressed_graph_fusion_kkt(
@@ -988,6 +985,7 @@ def _audit_certificate(
         edge_w=problem.graph.weight,
         lambda_value=problem.lambda_value,
         atol=problem.atol,
+        _adjoint_out=_adjoint_out,
     )
 
 
@@ -1060,6 +1058,7 @@ def certify(
     refine: bool,
     max_iter: int = 96,
     options: CertificateOptions | None = None,
+    _adjoint_out: dict[str, torch.Tensor] | None = None,
 ) -> CertificateAttempt:
     """Refine and/or audit one full-original-graph certificate.
 
@@ -1092,6 +1091,7 @@ def certify(
         phi=phi,
         grad_smooth=gradient.value,
         problem=problem,
+        _adjoint_out=_adjoint_out,
     )
     return CertificateAttempt(
         certificate=witness,
