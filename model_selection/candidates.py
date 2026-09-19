@@ -310,6 +310,7 @@ def _build_refit_summary(
         multiplicity_policy="independent_broad",
         locally_converged=None,
         clonal_cluster_id=refit.clonal_cluster_id,
+        free_fit_failures=refit.free_fit_failures,
     )
 
 

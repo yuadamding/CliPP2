@@ -373,6 +373,11 @@ def approximate_scalar_minimum(
     for _ in range(int(local_steps)):
         ordered = np.asarray(sorted(evaluated), dtype=np.float64)
         losses = np.asarray([evaluated[float(value)] for value in ordered])
+        if np.all(np.isnan(losses)):
+            # NumPy otherwise raises a generic ValueError here. Keep genuine
+            # optimizer arithmetic failure distinct from invalid inputs so a
+            # clonal profile can replace this free block, never validation.
+            raise FloatingPointError("Scalar grid contains only NaN losses.")
         best = int(np.nanargmin(losses))
         left = float(ordered[max(best - 1, 0)])
         right = float(ordered[min(best + 1, ordered.size - 1)])
@@ -695,6 +700,7 @@ class PartitionRefitResult:
     refit_mode: str = "grid_local"
     locally_converged: bool = False
     clonal_cluster_id: int | None = None
+    free_fit_failures: tuple[tuple[int, int, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -956,6 +962,7 @@ def partition_constrained_observed_refit(
     best_second_loss_gaps: list[float] = []
     block_losses = np.zeros(n_clusters, dtype=np.float64)
     block_finite_coordinates = np.zeros(n_clusters, dtype=np.int64)
+    free_fit_failures = []
     boundary_tolerance = max(10.0 * tolerance, 1e-8)
 
     # With one occupied block its complete center is fixed at one; a free
@@ -983,20 +990,27 @@ def partition_constrained_observed_refit(
             )
             coordinate = None if key is None else _coordinate_cache.get(key)
             if coordinate is None:
-                coordinate = _fit_coordinate(
-                    scalar_problem_from_model(
-                        model,
-                        members,
-                        region,
-                        lower=lower,
-                        upper=upper,
-                        eps=epsilon,
-                    ),
-                    grid_points=scalar_grid_points,
-                    local_steps=scalar_local_steps,
-                    include_breakpoints=True,
-                    _work_stats=_work_stats,
+                problem = scalar_problem_from_model(
+                    model, members, region, lower=lower, upper=upper, eps=epsilon,
                 )
+                try:
+                    coordinate = _fit_coordinate(
+                        problem,
+                        grid_points=scalar_grid_points,
+                        local_steps=scalar_local_steps,
+                        include_breakpoints=True,
+                        _work_stats=_work_stats,
+                    )
+                except FloatingPointError as error:
+                    # Only numeric optimizer failures are replaceable. Model
+                    # construction, validation, programming and resource
+                    # errors propagate. This free block remains unavailable
+                    # unless profiling fixes THIS block in every region.
+                    free_fit_failures.append((cluster, region, f"{type(error).__name__}: {error}"))
+                    centers[cluster, region] = lower
+                    coordinate_lower[cluster, region] = float("-inf")
+                    block_losses[cluster] = float("inf")
+                    continue  # Never cache an interrupted coordinate solve.
                 if key is not None:
                     _coordinate_cache.put(key, coordinate)
             centers[cluster, region] = coordinate.beta
@@ -1082,4 +1096,5 @@ def partition_constrained_observed_refit(
         global_certificate_intervals=int(certificate_intervals),
         refit_mode="grid_local",
         clonal_cluster_id=clonal_cluster_id,
+        free_fit_failures=tuple(free_fit_failures),
     )

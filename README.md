@@ -98,6 +98,11 @@ unchanged: for fixed labels, only fitted count loss changes. Grid/local refits
 and bounded model selection retain their existing limited optimality claims.
 For a one-cluster partition the constraint fixes its entire center, so no free
 scalar-center optimization is needed.
+For multiple clusters, a recognized numerical failure in a free scalar fit
+makes that block unavailable as a free center. Profiling can recover it only
+by fixing that same block at one, with valid free fits for every other block.
+The returned qualification record retains the failed coordinates and errors;
+input, model-consistency, programming and resource errors still propagate.
 
 ## Fit
 
@@ -137,3 +142,16 @@ their schema.
 `is_clonal` marks occupied centers exactly equal to one in every region.
 Public labels remain ordered by decreasing L2 norm of final CCF, starting at
 zero; no output-time CCF reassignment or rounding creates the clonal center.
+
+## Regression tests
+
+Install the test dependencies with `pip install -e '.[test]'`, then run
+`python -m pytest -q tests`. The compact, repository-local suite checks graph
+preservation, clonal witness search and audited reuse, constrained refits,
+failure handling, unchanged scoring, and four-file output reconstruction.
+The larger development suite remains outside this repository.
+
+On an allocated CUDA worker, use
+`CLIPP2_CUDA_TESTS=1 python -m pytest -q tests` to include actual CPU/CUDA
+integration checks. Explicit CUDA qualification fails if CUDA is unavailable;
+ordinary CPU runs report CUDA skips, which are not GPU qualification.

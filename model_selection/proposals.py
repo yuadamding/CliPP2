@@ -398,6 +398,10 @@ def build_partition_guided_graph_with_resource_policy(
         "baseline": float(fit_options.graph.adaptive_weight_baseline),
         "noise_divisor": float(noise_divisor),
     }
+    # Graph noise uses the original model's runtime rounding, not inward
+    # optimization bounds or a witness-specific equality constraint.
+    graph_lower = solver_context.model.lower
+    graph_upper = solver_context.model.upper
 
     def host_array(value):
         return (
@@ -410,8 +414,8 @@ def build_partition_guided_graph_with_resource_policy(
         return build_likelihood_noise_regularized_adaptive_graph(
             host_array(guide_phi),
             host_array(guide_curvature),
-            lower=host_array(solver_context.lower),
-            upper=host_array(solver_context.upper),
+            lower=host_array(graph_lower),
+            upper=host_array(graph_upper),
             count_observed=(
                 None
                 if solver_context.model.observed is None
@@ -434,8 +438,8 @@ def build_partition_guided_graph_with_resource_policy(
             ),
             guide_curvature,
             runtime,
-            lower=solver_context.lower,
-            upper=solver_context.upper,
+            lower=graph_lower,
+            upper=graph_upper,
             count_observed=solver_context.model.observed,
             **graph_options,
         )

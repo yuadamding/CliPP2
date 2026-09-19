@@ -50,6 +50,7 @@ class _GuideCenters:
     fit_loss: float
     finite_candidate_found: bool
     clonal_cluster_id: int | None = None
+    free_fit_failures: tuple[tuple[int, int, str], ...] = ()
 
     @property
     def n_clusters(self) -> int:
@@ -82,6 +83,7 @@ def _fit_guide_centers(
     block_losses = np.zeros(count, dtype=np.float64)
     loss = 0.0
     block_finite = np.ones(count, dtype=bool)
+    free_fit_failures = []
     tolerance = tol / max(count * regions, 1)
     # The sole occupied block is exactly fixed by the constraint. Unanchored
     # graph/pilot guides still use their ordinary free scalar optimizer.
@@ -96,13 +98,16 @@ def _fit_guide_centers(
             )
             coordinate = None if key is None else _coordinate_cache.get(key)
             if coordinate is None:
+                problem = scalar_problem_from_model(
+                    model, members, region, lower=eps, upper=upper, eps=eps,
+                )
                 work = None if _coordinate_cache is None else _coordinate_cache.work
                 started = perf_counter()
                 if work is not None:
                     work.scalar_solves += 1
                 try:
                     result = certify_scalar_minimum(
-                        scalar_problem_from_model(model, members, region, lower=eps, upper=upper, eps=eps),
+                        problem,
                         tolerance=tolerance, max_intervals=max(int(max_iter) * 256, 4096),
                         _work_stats=work,
                     )
@@ -111,9 +116,15 @@ def _fit_guide_centers(
                         result.optimality_gap, bool(np.isfinite(result.attained_value)),
                         result.globally_certified, result.method, result.intervals_evaluated,
                     )
-                except Exception:
+                except Exception as error:
                     if work is not None:
                         work.scalar_failures += 1
+                    if _require_clonal and isinstance(error, FloatingPointError):
+                        free_fit_failures.append((cluster, region, f"{type(error).__name__}: {error}"))
+                        centers[cluster, region] = eps
+                        block_losses[cluster] = float("inf")
+                        block_finite[cluster] = False
+                        continue  # No interrupted result enters the scalar cache.
                     raise
                 finally:
                     if work is not None:
@@ -135,7 +146,8 @@ def _fit_guide_centers(
         )
         block_finite[clonal_cluster_id] = True
     return _GuideCenters(labels, centers, np.clip(centers[labels], eps, model.upper),
-                         loss, bool(np.all(block_finite) and np.isfinite(loss)), clonal_cluster_id)
+                         loss, bool(np.all(block_finite) and np.isfinite(loss)), clonal_cluster_id,
+                         tuple(free_fit_failures))
 
 
 # Bound each temporary used to initialize the dense Ward cost matrix.  The

@@ -496,6 +496,16 @@ def _qualification(analysis: AnalysisSerialization) -> dict[str, object]:
             "centers_hash": _array_fingerprint(refit.cluster_centers, dtype=np.dtype(np.float64)),
             "source_data_hash": refit.source_data_hash,
             "likelihood_eps": refit.likelihood_eps,
+            "free_fit_failures": [
+                {
+                    "internal_cluster_id": int(cluster),
+                    "cluster_label": int(np.flatnonzero(analysis.output_cluster_order == cluster)[0]),
+                    "region_id": str(analysis.data.region_ids[region]),
+                    "error": str(reason),
+                    "recovered_by_clonal_constraint": cluster == refit.clonal_cluster_id,
+                }
+                for cluster, region, reason in refit.free_fit_failures
+            ],
         },
         "selection": {
             "status": ("resolved" if selection_result.selection_optimum_resolved else "provisional_unresolved"),

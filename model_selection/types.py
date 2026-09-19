@@ -79,10 +79,26 @@ class PartitionRefitSummary(ImmutableArrayRecord):
     locally_converged: bool | None = None
     clonal_cluster_id: int | None = None
     constraint_policy: str = CLONAL_CONSTRAINT_ID
+    free_fit_failures: tuple[tuple[int, int, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.constraint_policy != CLONAL_CONSTRAINT_ID:
             raise ValueError("Partition refits require the occupied-clonal policy.")
+        failures = tuple(tuple(record) for record in self.free_fit_failures)
+        centers = np.asarray(self.cluster_centers)
+        for cluster, region, reason in failures:
+            if (any(isinstance(index, (bool, np.bool_)) or not isinstance(index, (int, np.integer))
+                    for index in (cluster, region))
+                    or centers.ndim != 2 or not 0 <= cluster < centers.shape[0]
+                    or not 0 <= region < centers.shape[1]
+                    or not isinstance(reason, str) or not reason):
+                raise ValueError("Free-fit failure records must identify valid coordinates.")
+            if self.finite_candidate_found and cluster != self.clonal_cluster_id:
+                raise ValueError("A failed free block can only be rescued by fixing that block clonal.")
+        if len({(cluster, region) for cluster, region, _ in failures}) != len(failures):
+            raise ValueError("Free-fit failure coordinates must be unique.")
+        failures = tuple((int(cluster), int(region), reason) for cluster, region, reason in failures)
+        object.__setattr__(self, "free_fit_failures", failures)
         if self.clonal_cluster_id is not None:
             cluster = int(self.clonal_cluster_id)
             centers = np.asarray(self.cluster_centers)
