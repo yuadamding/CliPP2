@@ -21,12 +21,10 @@ MAX_MULTIPLICITY: Final = 4
 
 DEFAULT_DEVICE: Final = "cuda"
 DEFAULT_DTYPE: Final = "float32"
-DEFAULT_OPTIMIZATION_TOLERANCE: Final = 8e-4
 ALGORITHM_ID: Final = "independent_hybrid_occupied_clonal_v1"
 
 
 DEFAULT_WORKSET_MAX_BYTES: Final = 256 * 1024 * 1024
-DEFAULT_COMPRESSED_CACHE_MAX_BYTES: Final = 256 * 1024 * 1024
 DEFAULT_WORKSET_ADD_BATCH: Final = 64
 DEFAULT_WORKSET_MAX_EXPANSIONS: Final = 16
 DEFAULT_CERTIFICATE_MAX_ITER: Final = 512
@@ -119,7 +117,6 @@ class CertificateConfig:
 @dataclass(frozen=True, slots=True)
 class ResourceConfig:
     workset_max_bytes: int = DEFAULT_WORKSET_MAX_BYTES
-    compressed_cache_max_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES
     workset_add_batch: int = DEFAULT_WORKSET_ADD_BATCH
     workset_max_expansions: int = DEFAULT_WORKSET_MAX_EXPANSIONS
 
@@ -150,14 +147,11 @@ class SolverConfig:
 @dataclass(frozen=True, slots=True)
 class RefitConfig:
     tolerance: float
-    max_iter: int
     grid_points: int
     local_steps: int
 
     def __post_init__(self) -> None:
         _positive("selection_refit_tol", self.tolerance)
-        if int(self.max_iter) < 1:
-            raise ValueError("selection_refit_max_iter must be positive.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,10 +175,6 @@ class SelectionConfig:
     @property
     def score(self) -> str:
         return SELECTION_SCORE
-
-    @property
-    def graph_pilot_source(self) -> str:
-        return "zero_penalty_pilot"
 
     @property
     def contract_id(self) -> str:
@@ -238,7 +228,7 @@ class _FitOptions:
     ))
     selection: SelectionConfig = field(default_factory=lambda: SelectionConfig(
         partition_tolerance=2e-4,
-        refit=RefitConfig(tolerance=1e-5, max_iter=64, grid_points=64, local_steps=3),
+        refit=RefitConfig(tolerance=1e-5, grid_points=64, local_steps=3),
         lambda_search=LambdaSearchConfig(8, 2, 1),
     ))
     graph: GraphConfig = field(default_factory=GraphConfig)

@@ -17,7 +17,6 @@ from ..clonal import make_clonal_witness_bounds
 from ...config import (
     DEFAULT_CERTIFICATE_MAX_ITER,
     DEFAULT_CERTIFICATE_REFINEMENT_ROUNDS,
-    DEFAULT_COMPRESSED_CACHE_MAX_BYTES,
     DEFAULT_WORKSET_ADD_BATCH,
     DEFAULT_WORKSET_MAX_BYTES,
     DEFAULT_WORKSET_MAX_EXPANSIONS,
@@ -67,13 +66,10 @@ class ExactSolverResourceLimit(MemoryError):
 @dataclass(frozen=True, slots=True)
 class WorksetMemoryOptions:
     max_workset_bytes: int = DEFAULT_WORKSET_MAX_BYTES
-    max_compressed_cache_bytes: int = DEFAULT_COMPRESSED_CACHE_MAX_BYTES
 
     def __post_init__(self) -> None:
         if int(self.max_workset_bytes) <= 0:
             raise ValueError("max_workset_bytes must be positive.")
-        if int(self.max_compressed_cache_bytes) <= 0:
-            raise ValueError("max_compressed_cache_bytes must be positive.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +144,15 @@ class DenseEdgeCertificate:
 
 
 @dataclass(frozen=True, slots=True)
+class ZeroPenaltyCertificate:
+    """Graph-bound observed certificate at lambda zero; no edge storage needed."""
+
+    graph_hash: str
+    gradient_scope: SmoothGradientScope
+    certificate_scope: CertificateScope = "full_original_graph"
+
+
+@dataclass(frozen=True, slots=True)
 class CompressedEdgeCertificate:
     labels: torch.Tensor
     centers: torch.Tensor
@@ -158,7 +163,7 @@ class CompressedEdgeCertificate:
     certificate_scope: CertificateScope = "full_original_graph"
 
 
-GraphFusionCertificate: TypeAlias = DenseEdgeCertificate | CompressedEdgeCertificate
+GraphFusionCertificate: TypeAlias = DenseEdgeCertificate | CompressedEdgeCertificate | ZeroPenaltyCertificate
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,7 +296,6 @@ class PreparedProblem:
     data_fingerprint: str
     base_objective_key: BaseObjectiveKey
     verbose: bool = False
-    adaptive_graph_options: tuple[float, float, float] | None = None
     # Float64 scalar source results, in mutation-major/region-minor order.
     # The legacy exact_pilot tensor may be a float32 view of their argmins;
     # unresolved bounds never imply globally certified scalar minima.
@@ -326,10 +330,6 @@ class PreparedProblem:
 
     @property
     def objective_spec_hash(self) -> str:
-        return self.base_objective_key.fingerprint
-
-    @property
-    def base_fusion_objective_hash(self) -> str:
         return self.base_objective_key.fingerprint
 
     def __post_init__(self) -> None:

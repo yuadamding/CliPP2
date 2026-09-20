@@ -198,10 +198,6 @@ def simulate_clonal_tree_ccf(
 
         if is_pure_chain:
             base_min = 0.2
-            if base_min * K > 1.0 + 1e-10:
-                raise ValueError(
-                    f"Cannot enforce λ_k >= 0.2 for pure chain with K={K}."
-                )
             if abs(base_min * K - 1.0) <= 1e-10:
                 lambda_k = np.full(K, base_min, dtype=float)
             else:

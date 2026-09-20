@@ -26,6 +26,7 @@ from .types import (
     KKTDiagnostics,
     SmoothGradientScope,
     TensorFusionGraph,
+    ZeroPenaltyCertificate,
 )
 
 if TYPE_CHECKING:
@@ -328,10 +329,8 @@ def _workset_storage_bytes(
 def _resource_limit_diagnostics(
     *,
     phi: torch.Tensor,
-    grad_smooth: torch.Tensor,
     lower: torch.Tensor,
     upper: torch.Tensor,
-    atol: float,
 ) -> KKTDiagnostics:
     """Fail-closed diagnostics when a certificate cannot be loaded safely."""
 
@@ -362,7 +361,7 @@ def _workset_residual(
     phi: torch.Tensor,
     lower: torch.Tensor,
     upper: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     adj = torch.zeros_like(base_grad)
     if dual.numel():
         adj.index_add_(0, edge_u, dual)
@@ -374,7 +373,7 @@ def _workset_residual(
         lower=lower,
         upper=upper,
     )
-    return total_grad - cone_projection, adj, total_grad
+    return total_grad - cone_projection
 
 
 def _optimize_internal_workset(
@@ -390,7 +389,7 @@ def _optimize_internal_workset(
     options: CertificateOptions,
 ) -> tuple[torch.Tensor, torch.Tensor, float, int]:
     if edge_ids.numel() == 0:
-        residual, _, _ = _workset_residual(
+        residual = _workset_residual(
             base_grad=base_grad,
             dual=dual_start,
             edge_u=graph.edge_u[:0],
@@ -417,12 +416,10 @@ def _optimize_internal_workset(
     # extra device-resident iterations after convergence.
     check_every = 16 if phi.device.type == "cuda" else 1
     mapping_residual = float("inf")
-    residual = torch.zeros_like(phi)
-    adj = torch.zeros_like(phi)
     iterations = 0
     for iteration in range(int(options.max_iter)):
         iterations = iteration + 1
-        residual, adj, _ = _workset_residual(
+        residual = _workset_residual(
             base_grad=base_grad,
             dual=dual,
             edge_u=edge_u,
@@ -444,7 +441,7 @@ def _optimize_internal_workset(
             )
             if mapping_residual <= float(options.mapping_tolerance):
                 break
-    residual, _, _ = _workset_residual(
+    residual = _workset_residual(
         base_grad=base_grad,
         dual=dual,
         edge_u=edge_u,
@@ -537,10 +534,8 @@ def _refine_compressed_certificate(
     ) > int(options.memory.max_workset_bytes):
         diag = _resource_limit_diagnostics(
             phi=phi,
-            grad_smooth=grad_smooth,
             lower=lower,
             upper=upper,
-            atol=atol,
         )
         return CertificateAttempt(
             certificate=certificate,
@@ -568,10 +563,8 @@ def _refine_compressed_certificate(
     ) > int(options.memory.max_workset_bytes):
         diag = _resource_limit_diagnostics(
             phi=phi,
-            grad_smooth=grad_smooth,
             lower=lower,
             upper=upper,
-            atol=atol,
         )
         return CertificateAttempt(
             certificate=certificate,
@@ -600,10 +593,8 @@ def _refine_compressed_certificate(
     has_inherited_fast_path = bool(inherited_ids.numel())
     before = _resource_limit_diagnostics(
         phi=phi,
-        grad_smooth=grad_smooth,
         lower=lower,
         upper=upper,
-        atol=atol,
     )
     if has_inherited_fast_path:
         before = _compressed_graph_fusion_kkt(
@@ -615,7 +606,6 @@ def _refine_compressed_certificate(
             lower=lower,
             upper=upper,
             lambda_value=lambda_value,
-            atol=atol,
         )
         full_certificate_audit_passes += 1
     if has_inherited_fast_path and before.backward_error_kkt_residual <= 5.0 * float(atol):
@@ -710,7 +700,6 @@ def _refine_compressed_certificate(
                 lower=lower,
                 upper=upper,
                 lambda_value=lambda_value,
-                atol=atol,
             )
             full_certificate_audit_passes += 1
             if final_diag.backward_error_kkt_residual <= 5.0 * float(atol):
@@ -845,7 +834,6 @@ def _compressed_graph_fusion_kkt(
     lower: torch.Tensor,
     upper: torch.Tensor,
     lambda_value: float,
-    atol: float,
 ) -> KKTDiagnostics:
     labels, _centers, support_ids, support_dual = _validated_compressed_tensors(
         certificate,
@@ -860,11 +848,8 @@ def _compressed_graph_fusion_kkt(
         dtype=phi.dtype,
     )
     adj = torch.zeros_like(phi)
-    max_edge_residual = 0.0
-    max_ball_residual = 0.0
-    max_radius = 0.0
-    max_scaled_edge_residual = 0.0
-    max_scaled_ball_residual = 0.0
+    # Reduce on device; the final diagnostic packer performs one host transfer.
+    maxima = phi.new_zeros(5)
     for start in range(0, num_edges, chunk_size):
         stop = min(start + chunk_size, num_edges)
         edge_u = graph.edge_u[start:stop]
@@ -876,10 +861,12 @@ def _compressed_graph_fusion_kkt(
             same = labels.index_select(0, edge_u) == labels.index_select(0, edge_v)
             diff_norm = torch.linalg.vector_norm(diff, dim=1)
             nonfused = (~same) & (diff_norm > 0.0)
-            if bool(torch.any(nonfused).item()):
-                dual_chunk[nonfused] = (
-                    radius[nonfused, None] * diff[nonfused] / diff_norm[nonfused, None]
-                )
+            safe_norm = torch.where(nonfused, diff_norm, 1.0)
+            dual_chunk = torch.where(
+                nonfused[:, None],
+                radius[:, None] * diff / safe_norm[:, None],
+                0.0,
+            )
             if support_ids.numel():
                 chunk_ids = torch.arange(start, stop, device=phi.device)
                 positions = torch.searchsorted(support_ids, chunk_ids)
@@ -887,42 +874,26 @@ def _compressed_graph_fusion_kkt(
                 included = (positions < int(support_ids.numel())) & (
                     support_ids.index_select(0, safe_positions) == chunk_ids
                 )
-                if bool(torch.any(included).item()):
-                    dual_chunk[included] = support_dual.index_select(
-                        0, safe_positions[included]
-                    )
+                dual_chunk = torch.where(
+                    included[:, None],
+                    support_dual.index_select(0, safe_positions),
+                    dual_chunk,
+                )
         adj.index_add_(0, edge_u, dual_chunk)
         adj.index_add_(0, edge_v, dual_chunk, alpha=-1.0)
 
         if num_edges > 0 and lambda_value > 0.0:
-            (
-                edge_residual,
-                ball_residual,
-                radius_max,
-                scaled_edge_residual,
-                scaled_ball_residual,
-            ) = edge_kkt_maxima_from_diff_torch(
+            chunk_maxima = torch.stack(edge_kkt_maxima_from_diff_torch(
                 diff=diff,
                 dual=dual_chunk,
                 radius=radius,
-            )
-            max_edge_residual = _residual_max(
-                max_edge_residual,
-                float(edge_residual.item()),
-            )
-            max_ball_residual = _residual_max(
-                max_ball_residual,
-                float(ball_residual.item()),
-            )
-            max_radius = _residual_max(
-                max_radius,
-                float(radius_max.item()),
-            )
-            max_scaled_edge_residual = _residual_max(
-                max_scaled_edge_residual, float(scaled_edge_residual.item())
-            )
-            max_scaled_ball_residual = _residual_max(
-                max_scaled_ball_residual, float(scaled_ball_residual.item())
+            ))
+            # Match _residual_max: invalid or negative primitives fail closed.
+            maxima = torch.maximum(
+                maxima, torch.where(
+                    torch.isfinite(chunk_maxima) & (chunk_maxima >= 0.0),
+                    chunk_maxima, float("inf"),
+                ),
             )
 
     return graph_fusion_kkt_diagnostics_from_components_torch(
@@ -931,12 +902,11 @@ def _compressed_graph_fusion_kkt(
         adj=adj,
         lower=lower,
         upper=upper,
-        atol=atol,
-        max_edge_residual=max_edge_residual,
-        max_ball_residual=max_ball_residual,
-        max_radius=max_radius,
-        max_scaled_edge_residual=max_scaled_edge_residual,
-        max_scaled_ball_residual=max_scaled_ball_residual,
+        max_edge_residual=maxima[0],
+        max_ball_residual=maxima[1],
+        max_radius=maxima[2],
+        max_scaled_edge_residual=maxima[3],
+        max_scaled_ball_residual=maxima[4],
     )
 
 
@@ -960,7 +930,7 @@ def _audit_certificate(
     problem: CertificateProblem,
     _adjoint_out: dict[str, torch.Tensor] | None = None,
 ) -> KKTDiagnostics:
-    if isinstance(certificate, CompressedEdgeCertificate):
+    if problem.lambda_value > 0.0 and isinstance(certificate, CompressedEdgeCertificate):
         return _compressed_graph_fusion_kkt(
             certificate=certificate,
             phi=phi,
@@ -970,7 +940,6 @@ def _audit_certificate(
             lower=problem.lower,
             upper=problem.upper,
             lambda_value=problem.lambda_value,
-            atol=problem.atol,
         )
     return graph_fusion_kkt_residual_from_grad_torch(
         phi=phi,
@@ -984,7 +953,6 @@ def _audit_certificate(
         edge_v=problem.graph.edge_v,
         edge_w=problem.graph.weight,
         lambda_value=problem.lambda_value,
-        atol=problem.atol,
         _adjoint_out=_adjoint_out,
     )
 
@@ -1000,7 +968,7 @@ def _refine_certificate(
     options: CertificateOptions | None = None,
 ) -> CertificateAttempt:
 
-    if isinstance(certificate, CompressedEdgeCertificate):
+    if problem.lambda_value > 0.0 and isinstance(certificate, CompressedEdgeCertificate):
         effective_options = options or CertificateOptions(
             max_iter=max(int(max_iter), 1)
         )
@@ -1034,7 +1002,8 @@ def _refine_certificate(
     )
     dual = dense["dual"]
     refined_certificate = (
-        DenseEdgeCertificate(
+        ZeroPenaltyCertificate(str(problem.graph_hash), gradient_scope)
+        if problem.lambda_value == 0.0 else DenseEdgeCertificate(
             dual=dual,
             graph_hash=str(problem.graph_hash),
             gradient_scope=gradient_scope,
@@ -1079,6 +1048,10 @@ def certify(
         raise ValueError(
             f"Certificate breakpoint mask must have shape {expected_shape}."
         )
+    if isinstance(witness, ZeroPenaltyCertificate) and (
+        problem.lambda_value != 0.0 or witness.graph_hash != problem.graph_hash
+    ):
+        raise ValueError("Zero-penalty certificate requires its original graph and lambda zero.")
     if refine:
         return _refine_certificate(
             certificate=witness,
@@ -1089,6 +1062,8 @@ def certify(
             max_iter=max_iter,
             options=options,
         )
+    if problem.lambda_value == 0.0:
+        witness = ZeroPenaltyCertificate(problem.graph_hash, gradient.scope)
     diagnostics = _audit_certificate(
         certificate=witness,
         phi=phi,

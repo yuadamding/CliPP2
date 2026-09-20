@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass
 from collections.abc import Callable, Sequence
@@ -9,7 +10,7 @@ from time import perf_counter
 import numpy as np
 import torch
 
-from ...io.data import TumorData, tumor_data_fingerprint
+from ...io.data import TumorData, readonly_array, tumor_data_fingerprint
 from ...config import (
     DIRICHLET_ALPHA,
     DIRICHLET_CODE_WEIGHT,
@@ -90,10 +91,11 @@ def _fit_guide_centers(
     free_clusters = () if _require_clonal and count == 1 else range(count)
     for cluster in free_clusters:
         members = np.flatnonzero(labels == cluster)
+        member_key = members.astype(np.int64, copy=False).tobytes() if _coordinate_cache is not None else b""
         for region in range(regions):
             upper = max(eps, float(np.min(model.upper[members, region])))
             key = None if _coordinate_cache is None else _RefitCoordinateKey(
-                tumor_data_fingerprint(data), model.fingerprint, members.astype(np.int64).tobytes(),
+                tumor_data_fingerprint(data), model.fingerprint, member_key,
                 region, eps, upper, eps, "guide", tolerance, int(max_iter), 64, 3, True,
             )
             coordinate = None if key is None else _coordinate_cache.get(key)
@@ -568,6 +570,44 @@ class _LikelihoodColumnCache:
             self.evictions += 1
 
 
+class _PartitionPoolCache:
+    """Tumor-owned bounded numerical reuse across otherwise independent pools.
+
+    Anchored/unanchored refit objects are never shared. Coordinate and column
+    entries retain their complete existing numerical keys. The sole Ward
+    entry stores immutable host labels, not pilot tensors or dense graph work.
+    """
+
+    def __init__(self, *, max_ward_bytes: int = 8 * 1024**2):
+        if max_ward_bytes < 0:
+            raise ValueError("Ward cache byte limit must be nonnegative.")
+        self.max_ward_bytes = int(max_ward_bytes)
+        self.coordinates = _RefitCoordinateCache()
+        self._default_work = self.coordinates.work
+        self.columns = _LikelihoodColumnCache()
+        self._ward_key: tuple | None = None
+        self._ward_labels: dict[int, np.ndarray] = {}
+        self.ward_hits = self.ward_builds = 0
+
+    def ward_labels(self, context, pilot, curvature, k_grid):
+        def tensor_key(value):
+            digest = hashlib.sha256(value.detach().contiguous().cpu().numpy().tobytes()).hexdigest()
+            return (tuple(value.shape), tuple(value.stride()), str(value.dtype), str(value.device), digest)
+
+        key = (tumor_data_fingerprint(context.source_data), context.source_model.fingerprint,
+               context.eps, tuple(k_grid), tensor_key(pilot), tensor_key(curvature))
+        if key == self._ward_key:
+            self.ward_hits += 1
+            return dict(self._ward_labels)
+        labels = hessian_weighted_ward_label_sets_torch(pilot, curvature, K_grid=k_grid)
+        self.ward_builds += 1
+        self._ward_key, self._ward_labels = None, {}
+        if sum(value.nbytes for value in labels.values()) <= self.max_ward_bytes:
+            self._ward_labels = {k: readonly_array(value, dtype=np.int64) for k, value in labels.items()}
+            self._ward_key = key
+        return labels
+
+
 def _loss_to_centers(
     data: TumorData,
     centers: np.ndarray,
@@ -848,6 +888,7 @@ def generate_likelihood_partition_starts(
     _work_stats: _ScalarWorkStats | None = None,
     _model: ObservedModel | None = None,
     _require_clonal: bool = True,
+    _pool_cache: _PartitionPoolCache | None = None,
 ) -> list[PartitionCandidate]:
     """Refit plain Ward and host-CEM proposals under one fixed score policy."""
     label_sets = {
@@ -861,8 +902,15 @@ def generate_likelihood_partition_starts(
     # One model, tolerance and scalar backend per call: immutable labels alone
     # identify each local refit, including repeated CEM proposals.
     refit_cache: dict[bytes, _GuideCenters] = {}
-    coordinate_cache = _RefitCoordinateCache(work_stats=_work_stats)
-    column_cache = _LikelihoodColumnCache()
+    coordinate_cache = (
+        _RefitCoordinateCache(work_stats=_work_stats) if _pool_cache is None
+        else _pool_cache.coordinates
+    )
+    if _pool_cache is not None:
+        # Observers supply a fresh sink for each sequential pool. Cached results
+        # retain logical diagnostics; only newly dispatched work hits this sink.
+        coordinate_cache.work = _pool_cache._default_work if _work_stats is None else _work_stats
+    column_cache = _LikelihoodColumnCache() if _pool_cache is None else _pool_cache.columns
     clonal_inputs = (
         _clonal_profile_inputs(source_model, eps=eps, cache=coordinate_cache)
         if _require_clonal else None
@@ -931,6 +979,7 @@ def generate_partition_initializer_pool(
     curvature: np.ndarray | torch.Tensor | None = None,
     declared_k_grid: tuple[int, ...] | None = None,
     _require_clonal: bool = True,
+    _pool_cache: _PartitionPoolCache | None = None,
 ) -> tuple[PartitionCandidate, ...]:
     """Generate the deterministic pilot or final-Phi Ward/host-CEM pool.
 
@@ -959,12 +1008,14 @@ def generate_partition_initializer_pool(
         )
     else:
         curvature = as_runtime_tensor(curvature, runtime)
-    label_sets = hessian_weighted_ward_label_sets_torch(
-        pilot_tensor, curvature, K_grid=k_grid,
+    label_sets = (
+        hessian_weighted_ward_label_sets_torch(pilot_tensor, curvature, K_grid=k_grid)
+        if _pool_cache is None else _pool_cache.ward_labels(context, pilot_tensor, curvature, k_grid)
     )
     return tuple(generate_likelihood_partition_starts(
         data, eps=float(fit_options.eps), label_sets=label_sets,
         tol=float(fit_options.solver.tolerance),
         _model=context.source_model,
         _require_clonal=_require_clonal,
+        _pool_cache=_pool_cache,
     ))

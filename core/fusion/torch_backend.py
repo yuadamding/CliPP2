@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextvars import ContextVar
+from dataclasses import dataclass, field
+from itertools import count
+from types import FunctionType
 import warnings
 
 import numpy as np
@@ -115,13 +119,13 @@ def graph_adjoint_edges_in_dtype(
     scale: float = 1.0,
     edge_work_bytes: int | None = None,
 ) -> torch.Tensor:
-    """Apply the graph adjoint with bounded cross-precision work storage."""
+    """Apply the adjoint with bounded cross-device/cross-precision work."""
 
     dual_scale = float(scale)
     if not np.isfinite(dual_scale):
         raise ValueError("dual adjoint scale must be finite.")
-    source = dual.to(device=device)
-    if source.dtype == dtype and dual_scale == 1.0:
+    source = dual
+    if source.device == device and source.dtype == dtype and dual_scale == 1.0:
         return graph_adjoint_edges(
             source,
             edge_u=edge_u,
@@ -142,7 +146,9 @@ def graph_adjoint_edges_in_dtype(
         and num_edges == complete_edge_count
         and dense_workspace_bytes <= DETERMINISTIC_COMPLETE_ADJOINT_MAX_BYTES
     ):
-        promoted = source.to(dtype=dtype)
+        # Preserve the established deterministic small-complete-graph path.
+        # Its full transfer is bounded by the dense workspace limit above.
+        promoted = source.to(device=device, dtype=dtype)
         if dual_scale != 1.0:
             promoted = dual_scale * promoted
         return graph_adjoint_edges(
@@ -158,44 +164,25 @@ def graph_adjoint_edges_in_dtype(
         work_bytes=edge_work_bytes,
     )
     adj = torch.zeros((int(num_nodes), num_regions), dtype=dtype, device=device)
-    for edge_slice in _edge_slices(num_edges, chunk_size):
-        chunk = source[edge_slice].to(dtype=dtype)
-        if dual_scale != 1.0:
-            chunk = dual_scale * chunk
-        adj.index_add_(0, edge_u[edge_slice], chunk)
-        adj.index_add_(0, edge_v[edge_slice], chunk, alpha=-1.0)
-    return adj
-
-
-def _graph_edge_activity_counts_torch(
-    *,
-    phi: torch.Tensor,
-    edge_u: torch.Tensor,
-    edge_v: torch.Tensor,
-    atol: float,
-    edge_work_bytes: int | None,
-) -> tuple[int, int]:
-    num_edges = int(edge_u.numel())
-    chunk_size = _edge_chunk_size(
-        num_edges=num_edges,
-        num_regions=int(phi.shape[1]),
-        dtype=phi.dtype,
-        work_bytes=edge_work_bytes,
+    reductions = ((edge_u, 1.0), (edge_v, -1.0))
+    # Match the resident same-dtype path's all-positive then all-negative
+    # reductions; cross-precision/scaled work keeps its interleaved chunks.
+    passes = (
+        tuple((reduction,) for reduction in reductions)
+        if source.dtype == dtype and dual_scale == 1.0
+        else (reductions,)
     )
-    if num_edges == 0:
-        return 0, 0
-    nonzero_count = torch.zeros((), dtype=torch.int64, device=phi.device)
-    for edge_slice in _edge_slices(num_edges, chunk_size):
-        diff = graph_forward_edges(
-            phi,
-            edge_u=edge_u[edge_slice],
-            edge_v=edge_v[edge_slice],
-        )
-        nonzero_count.add_(
-            torch.sum(torch.linalg.vector_norm(diff, dim=1) > float(atol))
-        )
-    nonzero_edges = int(nonzero_count.item())
-    return num_edges - nonzero_edges, nonzero_edges
+    for reduction_pass in passes:
+        for edge_slice in _edge_slices(num_edges, chunk_size):
+            # An offloaded witness stays on CPU until this slice is requested.
+            # Moving it before slicing defeats the audit's edge-work bound.
+            chunk = source[edge_slice].to(device=device, dtype=dtype)
+            if dual_scale != 1.0:
+                chunk = dual_scale * chunk
+            for edge_index, sign in reduction_pass:
+                adj.index_add_(0, edge_index[edge_slice], chunk, alpha=sign)
+            del chunk
+    return adj
 
 
 def _update_certificate_refinement_plateau(
@@ -398,9 +385,7 @@ def stationarity_residual_torch(
     phi: torch.Tensor,
     lower: torch.Tensor,
     upper: torch.Tensor,
-    atol: float,
 ) -> torch.Tensor:
-    del atol
     projected = torch.minimum(torch.maximum(phi - total_grad, lower), upper)
     return phi - projected
 
@@ -508,7 +493,6 @@ def graph_fusion_kkt_diagnostics_from_components_torch(
     adj: torch.Tensor,
     lower: torch.Tensor,
     upper: torch.Tensor,
-    atol: float,
     max_edge_residual: float | torch.Tensor,
     max_ball_residual: float | torch.Tensor,
     max_radius: float | torch.Tensor,
@@ -522,7 +506,6 @@ def graph_fusion_kkt_diagnostics_from_components_torch(
         phi=phi,
         lower=lower,
         upper=upper,
-        atol=atol,
     )
     box_violation = torch.maximum(
         torch.clamp(lower - phi, min=0.0),
@@ -613,7 +596,6 @@ def graph_fusion_kkt_residual_from_grad_torch(
     edge_v: torch.Tensor,
     edge_w: torch.Tensor,
     lambda_value: float,
-    atol: float,
     dual_scale: float = 1.0,
     edge_work_bytes: int | None = None,
     _progress_out: dict[str, float] | None = None,
@@ -630,10 +612,11 @@ def graph_fusion_kkt_residual_from_grad_torch(
     )
     dual = None
     if valid_dual:
-        # Keep a cross-precision witness in its source dtype.  Terminal
-        # float64 audits cast one bounded edge chunk at a time instead of
-        # materializing another complete E x S dual.
-        dual = dual_kkt.to(device=phi.device)
+        # Keep an offloaded/cross-precision witness at its source location.
+        # Both the adjoint and edge audit transfer directly into the audit
+        # dtype one bounded slice at a time (except the small deterministic
+        # complete-graph adjoint, whose full workspace is already bounded).
+        dual = dual_kkt
     chunk_size = _edge_chunk_size(
         num_edges=num_edges,
         num_regions=num_regions,
@@ -643,8 +626,8 @@ def graph_fusion_kkt_residual_from_grad_torch(
 
     adj = torch.zeros_like(phi)
     if num_edges > 0 and lambda_value > 0.0 and dual is not None:
-        # Same-precision CUDA follows the solver's preferred reduction;
-        # cross-precision audits cast only bounded edge chunks.
+        # Resident same-precision CUDA keeps the solver's preferred reduction;
+        # large offloaded/cross-precision audits transfer bounded edge chunks.
         adj = graph_adjoint_edges_in_dtype(
             dual,
             edge_u=edge_u,
@@ -681,7 +664,6 @@ def graph_fusion_kkt_residual_from_grad_torch(
             adj=adj,
             lower=lower,
             upper=upper,
-            atol=atol,
             max_edge_residual=max_edge_residual,
             max_ball_residual=max_ball_residual,
             max_radius=max_radius,
@@ -701,7 +683,9 @@ def graph_fusion_kkt_residual_from_grad_torch(
         )
         radius = float(lambda_value) * edge_w[edge_slice].to(dtype=phi.dtype)
         dual_chunk = (
-            None if dual is None else dual[edge_slice].to(dtype=phi.dtype)
+            None if dual is None else dual[edge_slice].to(
+                device=phi.device, dtype=phi.dtype,
+            )
         )
         if dual_chunk is not None and dual_scale_value != 1.0:
             dual_chunk = dual_scale_value * dual_chunk
@@ -716,6 +700,7 @@ def graph_fusion_kkt_residual_from_grad_torch(
             dual=dual_chunk,
             radius=radius,
         )
+        del dual_chunk
         max_edge_residual = _residual_maximum_torch(max_edge_residual, edge_max)
         max_ball_residual = _residual_maximum_torch(max_ball_residual, ball_max)
         max_radius = _residual_maximum_torch(max_radius, radius_max)
@@ -732,7 +717,6 @@ def graph_fusion_kkt_residual_from_grad_torch(
         adj=adj,
         lower=lower,
         upper=upper,
-        atol=atol,
         max_edge_residual=max_edge_residual,
         max_ball_residual=max_ball_residual,
         max_radius=max_radius,
@@ -768,27 +752,24 @@ def refine_graph_fusion_dual_certificate_torch(
     before_diag = graph_fusion_kkt_residual_from_grad_torch(
         phi=phi, grad_smooth=grad_smooth, dual_kkt=dual_kkt,
         lower=lower, upper=upper, edge_u=edge_u, edge_v=edge_v,
-        edge_w=edge_w, lambda_value=lambda_value, atol=atol,
+        edge_w=edge_w, lambda_value=lambda_value,
         edge_work_bytes=edge_work_bytes,
         _progress_out=progress,
     )
     full_certificate_audit_passes = 1
     incoming_merit = progress.get("cone_violation_norm", float("inf"))
     if num_edges == 0 or lambda_value <= 0.0:
-        dual = torch.zeros((num_edges, num_regions), dtype=phi.dtype, device=phi.device)
-        after_diag = graph_fusion_kkt_residual_from_grad_torch(
-            phi=phi, grad_smooth=grad_smooth, dual_kkt=dual,
-            lower=lower, upper=upper, edge_u=edge_u, edge_v=edge_v,
-            edge_w=edge_w, lambda_value=lambda_value, atol=atol,
-            edge_work_bytes=edge_work_bytes,
+        # At zero penalty the first audit already ignores every edge dual.
+        # Retain an empty tensor only for the positive-lambda edgeless case.
+        dual = None if lambda_value == 0.0 else torch.empty(
+            (0, num_regions), dtype=phi.dtype, device=phi.device,
         )
-        full_certificate_audit_passes += 1
         return {
-            "dual": dual, "diag": after_diag,
+            "dual": dual, "diag": before_diag,
             "status": "zero_penalty_no_dual_needed", "dual_refined": False,
             "fused_edges": 0, "nonzero_edges": 0,
             "stationarity_before": before_diag.stationarity_residual,
-            "stationarity_after": after_diag.stationarity_residual,
+            "stationarity_after": before_diag.stationarity_residual,
             "refinement_iterations": 0,
             "full_certificate_audit_passes": full_certificate_audit_passes,
         }
@@ -800,26 +781,22 @@ def refine_graph_fusion_dual_certificate_torch(
     incoming_valid = bool(
         dual_kkt is not None and tuple(dual_kkt.shape) == (num_edges, num_regions)
     )
-    incoming = (
-        dual_kkt.to(dtype=phi.dtype, device=phi.device) if incoming_valid else None
-    )
     incoming_residual = before_diag.backward_error_kkt_residual
     kkt_target = _CERTIFICATE_KKT_ATOL_SCALE * float(atol)
     if incoming_valid and np.isfinite(incoming_residual) and incoming_residual <= kkt_target:
-        fused_edges, nonzero_edges = _graph_edge_activity_counts_torch(
-            phi=phi, edge_u=edge_u, edge_v=edge_v, atol=atol,
-            edge_work_bytes=edge_work_bytes,
-        )
         return {
-            "dual": incoming, "diag": before_diag,
+            "dual": dual_kkt, "diag": before_diag,
             "status": "input_dual_retained", "dual_refined": False,
-            "fused_edges": fused_edges, "nonzero_edges": nonzero_edges,
+            "fused_edges": None, "nonzero_edges": None,
             "stationarity_before": before_diag.stationarity_residual,
             "stationarity_after": before_diag.stationarity_residual,
             "refinement_iterations": 0,
             "full_certificate_audit_passes": full_certificate_audit_passes,
         }
 
+    incoming = (
+        dual_kkt.to(dtype=phi.dtype, device=phi.device) if incoming_valid else None
+    )
     dual = torch.zeros((num_edges, num_regions), dtype=phi.dtype, device=phi.device)
     fused_edges = 0
     # Keep small-problem masks/radii once; larger problems reconstruct only
@@ -848,7 +825,7 @@ def refine_graph_fusion_dual_certificate_torch(
     analytic_diag = graph_fusion_kkt_residual_from_grad_torch(
         phi=phi, grad_smooth=grad_smooth, dual_kkt=dual,
         lower=lower, upper=upper, edge_u=edge_u, edge_v=edge_v,
-        edge_w=edge_w, lambda_value=lambda_value, atol=atol,
+        edge_w=edge_w, lambda_value=lambda_value,
         edge_work_bytes=edge_work_bytes,
         _progress_out=progress,
     )
@@ -892,7 +869,7 @@ def refine_graph_fusion_dual_certificate_torch(
             # Freeze the complete current adjoint/residual before ANY update.
             # Recomputing this between chunks would change the algorithm.
             stat = stationarity_residual_torch(
-                total_grad=grad_smooth + adj, phi=phi, lower=lower, upper=upper, atol=atol,
+                total_grad=grad_smooth + adj, phi=phi, lower=lower, upper=upper,
             )
             mapping_delta = 0.0
             for edge_slice in _edge_slices(num_edges, chunk_size):
@@ -919,7 +896,7 @@ def refine_graph_fusion_dual_certificate_torch(
             diag = graph_fusion_kkt_residual_from_grad_torch(
                 phi=phi, grad_smooth=grad_smooth, dual_kkt=dual,
                 lower=lower, upper=upper, edge_u=edge_u, edge_v=edge_v,
-                edge_w=edge_w, lambda_value=lambda_value, atol=atol,
+                edge_w=edge_w, lambda_value=lambda_value,
                 edge_work_bytes=edge_work_bytes,
                 _progress_out=progress,
             )
@@ -968,7 +945,6 @@ def _complete_graph_admm_stationarity_components_torch(
     lower: torch.Tensor,
     upper: torch.Tensor,
     adj: torch.Tensor,
-    atol: float,
 ) -> tuple[torch.Tensor, float, float]:
     grad_smooth = h * (phi - U)
     stat = stationarity_residual_torch(
@@ -976,7 +952,6 @@ def _complete_graph_admm_stationarity_components_torch(
         phi=phi,
         lower=lower,
         upper=upper,
-        atol=atol,
     )
     residual = torch.linalg.vector_norm(stat) / (
         1.0 + torch.linalg.vector_norm(grad_smooth) + torch.linalg.vector_norm(adj)
@@ -989,8 +964,58 @@ def _complete_graph_admm_stationarity_components_torch(
         upper=upper,
     )
     return grad_smooth, float(residual.item()), float(backward_error.item())
+class _BoxQPPreparation:
+    """Solve-local FP64 node workspace; never cache changing edge/node duals.
+
+    Input versions bind the converted views. Rho is first rounded by the
+    working runtime, exactly as in the uncached dispatcher; only then is it
+    promoted and used to refresh coefficients. No device values are read.
+    """
+
+    def __init__(self, U, h, lower, upper):
+        self.sources = (U, h, lower, upper)
+        self.versions = tuple(value._version for value in self.sources)
+        self.U, self.h, self.lower, self.upper = (
+            value.to(dtype=torch.float64) for value in self.sources
+        )
+        self.lo, self.hi = self.lower.mean(dim=0), self.upper.mean(dim=0)
+        self.rho_source = None
+        self.rho_version = None
+
+    def arguments(self, *, U, h, lower, upper, rho_t, q, max_iter):
+        if any(
+            actual is not original or actual._version != version
+            for actual, original, version in zip(
+                (U, h, lower, upper), self.sources, self.versions, strict=True,
+            )
+        ):
+            raise ValueError("QP preparation inputs changed; prepare a new node workspace.")
+        version = rho_t._version
+        if rho_t is not self.rho_source or version != self.rho_version:
+            self.rho = rho_t.to(dtype=torch.float64)
+            self.denom = self.h + self.rho * float(self.U.shape[0])
+            self.scaled_h = self.h / self.denom
+            self.rho_source, self.rho_version = rho_t, version
+        return (
+            U, self.U, self.lower, self.upper, self.rho, self.denom,
+            self.scaled_h, self.lo, self.hi, q, max(int(max_iter), 16),
+        )
 
 
+def _prepare_box_qp(U, h, lower, upper):
+    # The CPU scalar active-piece shortcut already avoids bisection on its
+    # common path. Inference tensors lack version counters, so do not cache
+    # them: the ordinary eager/compiled dispatch remains fully supported.
+    if torch.is_inference_mode_enabled() or (
+        U.device.type == "cpu" and U.dtype == torch.float64 and U.shape[1] == 1
+    ):
+        return None
+    try:
+        return _BoxQPPreparation(U, h, lower, upper)
+    except RuntimeError as error:
+        if "Inference tensors do not track version counter" not in str(error):
+            raise
+        return None
 
 
 def _complete_graph_isotropic_box_qp_torch(
@@ -1002,18 +1027,29 @@ def _complete_graph_isotropic_box_qp_torch(
     rho: float | torch.Tensor,
     q: torch.Tensor,
     max_iter: int,
+    _preparation: _BoxQPPreparation | None = None,
 ) -> torch.Tensor:
     rho_t = (
         rho.to(dtype=U.dtype, device=U.device)
         if torch.is_tensor(rho)
         else torch.as_tensor(float(rho), dtype=U.dtype, device=U.device)
     )
-    if (
+    compiled = (
         U.device.type == "cuda"
         and U.dtype in (torch.float32, torch.float64)
         and U.ndim == 2
-        and int(U.shape[1]) > 1
-    ):
+    )
+    if _preparation is not None:
+        args = _preparation.arguments(
+            U=U, h=h, lower=lower, upper=upper, rho_t=rho_t, q=q, max_iter=max_iter,
+        )
+        if compiled:
+            return _run_compiled_box_qp(
+                args, _compiled_prepared_box_qp_cuda,
+                _complete_graph_isotropic_box_qp_prepared_impl,
+            )
+        return _complete_graph_isotropic_box_qp_prepared_impl(*args)
+    if compiled:
         return _complete_graph_isotropic_box_qp_cuda(
             U,
             h,
@@ -1023,9 +1059,8 @@ def _complete_graph_isotropic_box_qp_torch(
             q,
             max(int(max_iter), 16),
         )
-    # The scalar breakpoint cumulative slope can cancel to zero in float32
-    # when rho*N dominates h. Use the centered, float64-workspace bisection
-    # for that dtype; retain the CPU breakpoint optimization in float64.
+    # The scalar fast path verifies its active piece using centered arithmetic;
+    # otherwise both dtypes use the same float64-workspace root equation.
     if (
         U.device.type == "cpu"
         and U.dtype == torch.float64
@@ -1062,48 +1097,42 @@ def _complete_graph_scalar_box_qp_cpu(
     rho_t: torch.Tensor,
     q: torch.Tensor,
 ) -> torch.Tensor | None:
-    """Solve the one-region complete-graph box QP by its exact breakpoints."""
+    """Accept an exact centered active-piece root, otherwise use bisection.
 
-    num_mutations = int(U.shape[0])
-    rhs = h * U + rho_t * q
-    denom = h + rho_t * float(num_mutations)
-    intercept = (rhs / denom)[:, 0]
-    slope = (rho_t / denom)[:, 0]
-    lower_scalar = lower[:, 0]
-    upper_scalar = upper[:, 0]
-    lower_break = (lower_scalar - intercept) / slope
-    upper_break = (upper_scalar - intercept) / slope
-    breakpoints = torch.cat((lower_break, upper_break))
-    delta_intercept = torch.cat(
-        (intercept - lower_scalar, upper_scalar - intercept)
-    )
-    delta_slope = torch.cat((slope, -slope))
-    order = torch.argsort(breakpoints, stable=True)
-    breakpoints = breakpoints[order]
-    piece_intercept = torch.sum(lower_scalar) + torch.cumsum(
-        delta_intercept[order], dim=0
-    )
-    piece_slope = -torch.ones((), dtype=U.dtype) + torch.cumsum(
-        delta_slope[order], dim=0
-    )
-    roots = -piece_intercept / piece_slope
-    next_breakpoints = torch.cat(
-        (
-            breakpoints[1:],
-            torch.full((1,), torch.inf, dtype=U.dtype),
-        )
-    )
-    valid = torch.isfinite(roots) & (roots >= breakpoints) & (
-        roots <= next_breakpoints
-    )
-    root_indices = torch.nonzero(valid, as_tuple=False)
-    if root_indices.numel() == 0:
-        return None
-    root = roots[root_indices[0, 0]]
-    return torch.minimum(
-        torch.maximum((rhs + rho_t * root) / denom, lower),
-        upper,
-    )
+    The slope magnitude is a sum of positive terms, never ``1-sum(slopes)``.
+    A midpoint proposes the active set; allow one corrected proposal if its
+    root changes that set. Every return verifies its piece or an exact root at
+    its boundary; unsuccessful proposals leave the bisection budget unchanged.
+    """
+    denom = h + rho_t * float(U.shape[0])
+    scaled_h, scaled_q = h / denom, rho_t * q / denom
+    mid = 0.5 * (torch.mean(lower, dim=0) + torch.mean(upper, dim=0))
+    for _ in range(2):
+        root, valid = _complete_graph_centered_piece_root(U, scaled_h, scaled_q, lower, upper, mid)
+        if bool(valid.all()):
+            displacement = scaled_h * (U - root) + scaled_q
+            return torch.minimum(torch.maximum(root + displacement, lower), upper)
+        mid = root
+    return None
+
+
+def _complete_graph_centered_piece_root(U, scaled_h, scaled_q, lower, upper, mid):
+    """Exact active-piece polish without snapping or a numerical admission gate."""
+    displacement = scaled_h * (U - mid) + scaled_q
+    at_lower, at_upper = displacement <= lower - mid, displacement >= upper - mid
+    free = ~(at_lower | at_upper)
+    bound = torch.where(at_lower, lower, upper)
+    intercept = torch.where(free, scaled_h * U + scaled_q, bound).sum(dim=0)
+    slope = torch.where(free, scaled_h, torch.ones_like(scaled_h)).sum(dim=0)
+    root = intercept / slope
+    displacement = scaled_h * (U - root) + scaled_q
+    same_piece = ((at_lower == (displacement <= lower - root))
+                  & (at_upper == (displacement >= upper - root))).all(dim=0)
+    # A root may land exactly on an adjoining piece (e.g. all rows at one).
+    # Accept that root only with an exactly zero centered residual, not an
+    # approximate coordinate-to-bound test. This preserves exact active bounds.
+    residual = torch.minimum(torch.maximum(displacement, lower - root), upper - root).sum(dim=0)
+    return root, torch.isfinite(root) & (same_piece | (residual == 0.))
 
 
 def _complete_graph_isotropic_box_qp_bisection(
@@ -1116,54 +1145,47 @@ def _complete_graph_isotropic_box_qp_bisection(
     q: torch.Tensor,
     max_iter: int,
 ) -> torch.Tensor:
-    if U.dtype == torch.float32:
-        # sum(x)-S loses the root sign when rho*N dominates h. In float64
-        # workspace solve the equivalent mean-centered equation sum(x-t)=0,
-        # t=S/N, without subtracting large nearly equal totals. Promote the
-        # original coefficients before arithmetic; do not assume sum(q)=0.
-        # Only this O(N*R) workspace changes, not raw primal/edge dtype or gates.
-        U, h, lower, upper, rho_t, q = (
-            value.to(dtype=torch.float64) for value in (U, h, lower, upper, rho_t, q)
-        )
-        denom = h + rho_t * float(U.shape[0])
-        scaled_h, scaled_q = h / denom, rho_t * q / denom
-        lo, hi = torch.mean(lower, dim=0), torch.mean(upper, dim=0)
-        for _ in range(max(int(max_iter), 16)):
-            mid = 0.5 * (lo + hi)
-            displacement = scaled_h * (U - mid.unsqueeze(0)) + scaled_q
-            residual = torch.sum(torch.minimum(
-                torch.maximum(displacement, lower - mid.unsqueeze(0)),
-                upper - mid.unsqueeze(0),
-            ), dim=0)
-            move_right = residual > 0.0
-            lo = torch.where(move_right, mid, lo)
-            hi = torch.where(move_right, hi, mid)
-        mid = 0.5 * (lo + hi)
-        displacement = scaled_h * (U - mid.unsqueeze(0)) + scaled_q
-        return torch.minimum(torch.maximum(mid.unsqueeze(0) + displacement, lower), upper).to(torch.float32)
+    # sum(x)-S and cumulative breakpoint slopes both cancel when rho*N >> h,
+    # even in float64. Solve sum(clip(a*(U-t)+b, lower-t, upper-t))=0 with t=S/N.
+    # Promote before arithmetic; sum(q) need not vanish. Only O(N*R) workspace
+    # changes, not raw primal/edge dtype, iteration budgets or admission gates.
+    output_dtype = U.dtype
+    U, h, lower, upper, rho_t, q = (
+        value.to(dtype=torch.float64) for value in (U, h, lower, upper, rho_t, q)
+    )
+    denom = h + rho_t * float(U.shape[0])
+    scaled_h, scaled_q = h / denom, rho_t * q / denom
+    lo, hi = torch.mean(lower, dim=0), torch.mean(upper, dim=0)
+    return _centered_box_qp_bisection(
+        U, lower, upper, scaled_h, scaled_q, lo, hi, max_iter, output_dtype,
+    )
 
-    num_mutations = int(U.shape[0])
-    rhs = h * U + rho_t * q
-    denom = h + rho_t * float(num_mutations)
 
-    lo = torch.sum(lower, dim=0)
-    hi = torch.sum(upper, dim=0)
-    mid = 0.5 * (lo + hi)
+def _centered_box_qp_bisection(U, lower, upper, scaled_h, scaled_q, lo, hi, max_iter, output_dtype):
     for _ in range(max(int(max_iter), 16)):
         mid = 0.5 * (lo + hi)
-        x_mid = torch.minimum(
-            torch.maximum((rhs + rho_t * mid.unsqueeze(0)) / denom, lower),
-            upper,
-        )
-        residual = torch.sum(x_mid, dim=0) - mid
+        displacement = scaled_h * (U - mid.unsqueeze(0)) + scaled_q
+        residual = torch.sum(torch.minimum(
+            torch.maximum(displacement, lower - mid.unsqueeze(0)),
+            upper - mid.unsqueeze(0),
+        ), dim=0)
         move_right = residual > 0.0
         lo = torch.where(move_right, mid, lo)
         hi = torch.where(move_right, hi, mid)
-
     mid = 0.5 * (lo + hi)
-    return torch.minimum(
-        torch.maximum((rhs + rho_t * mid.unsqueeze(0)) / denom, lower),
-        upper,
+    root, valid = _complete_graph_centered_piece_root(U, scaled_h, scaled_q, lower, upper, mid)
+    mid = torch.where(valid, root, mid)
+    displacement = scaled_h * (U - mid.unsqueeze(0)) + scaled_q
+    return torch.minimum(torch.maximum(mid.unsqueeze(0) + displacement, lower), upper).to(output_dtype)
+
+
+def _complete_graph_isotropic_box_qp_prepared_impl(
+    output_like, U, lower, upper, rho, denom, scaled_h, lo, hi, q, max_iter,
+):
+    # Preserve multiplication followed by division, including nonzero sum(q).
+    scaled_q = rho * q.to(dtype=torch.float64) / denom
+    return _centered_box_qp_bisection(
+        U, lower, upper, scaled_h, scaled_q, lo, hi, max_iter, output_like.dtype,
     )
 
 
@@ -1187,10 +1209,9 @@ def _complete_graph_isotropic_box_qp_compiled_impl(
     )
 
 
-# Multi-region path fits invoke this bounded QP many thousands of times.  A
+# Path fits invoke this bounded QP many thousands of times. A
 # dynamic-shape Inductor kernel reuses shapes instead of spending Dynamo's
-# shared recompilation budget on each tumor. The common one-region workflow
-# stays eager to avoid paying its cold-start cost.
+# shared recompilation budget on each tumor, including single-region fits.
 # Dtype, layout and execution-mode changes can still require new compilations;
 # application failure records remain specific to their exact metadata below.
 _CUDA_BOX_QP_DYNAMIC = True
@@ -1212,9 +1233,9 @@ def _cuda_box_qp_signature(args) -> tuple:
     # values or synchronize the device. Strides/dtypes/devices are compiler guards.
     return (
         tuple((value.dtype, value.device, tuple(value.shape), tuple(value.stride()),
-               value.requires_grad) for value in args[:-1]),
+               value.requires_grad, value.storage_offset()) for value in args[:-1]),
         int(args[-1]), torch.is_grad_enabled(), torch.is_inference_mode_enabled(),
-        *_cuda_autocast_metadata(),
+        *_cuda_autocast_metadata(), _box_qp_argument_aliases(args[:-1]),
     )
 
 
@@ -1249,25 +1270,97 @@ def _box_qp_inductor_backend(graph, inputs):
     return execute
 
 
-_compiled_complete_graph_isotropic_box_qp_cuda = torch.compile(
+def _box_qp_argument_aliases(tensors) -> tuple:
+    return tuple(next(j for j in range(i + 1) if tensors[j] is value)
+                 for i, value in enumerate(tensors))
+
+
+def _box_qp_guard_family(args) -> tuple:
+    """Separate static Dynamo guards without specializing ordinary N/R sizes."""
+    tensors = args[:-1]
+    metadata = []
+    for value in tensors:
+        shape, strides = tuple(value.shape), tuple(value.stride())
+        if value.is_contiguous():
+            layout = "contiguous"
+        elif value.ndim == 2 and value.T.is_contiguous():
+            layout = "transposed"
+        elif value.ndim == 2 and strides[1] > 0 and strides[0] == shape[1] * strides[1]:
+            layout = ("scaled_contiguous", strides[1])
+        else:
+            layout = ("strided", strides)
+        metadata.append((
+            value.dtype, value.device, value.requires_grad,
+            tuple(size if size <= 1 else None for size in shape), layout,
+            value.storage_offset(),
+        ))
+    # Prepared float64 inputs can alias their original tensors; Dynamo guards
+    # argument identity as well as dtype/stride. Retain only the alias pattern.
+    return (tuple(metadata), _box_qp_argument_aliases(tensors), int(args[-1]), torch.is_grad_enabled(),
+            torch.is_inference_mode_enabled(), *_cuda_autocast_metadata())
+
+
+_box_qp_owner_ids = count()
+
+
+class _BoxQPCompiledVariants:
+    """Bounded, tensor-free owners of independent Dynamo guard budgets.
+
+    One shared code object exhausted Dynamo's default eight-recompile limit
+    across valid dtype, singleton and layout variants. Each static guard family
+    now owns a distinct code object, while dynamic non-singleton N/R dimensions
+    still share compiled graphs. Eviction drops the callable, not global caches.
+    """
+
+    def __init__(self, implementation, *, max_families=32):
+        self.implementation = implementation
+        self.max_families = max_families
+        self.variants = OrderedDict()
+
+    def __call__(self, *args):
+        family = _box_qp_guard_family(args)
+        compiled = self.variants.pop(family, None)
+        if compiled is None:
+            original = self.implementation
+            name = f"{original.__name__}_guards_{next(_box_qp_owner_ids)}"
+            # A new FunctionType alone still shares Dynamo's code-object cache.
+            function = FunctionType(original.__code__.replace(co_name=name),
+                                    original.__globals__, name,
+                                    original.__defaults__, original.__closure__)
+            compiled = torch.compile(function, backend=_box_qp_inductor_backend,
+                                     fullgraph=True, dynamic=_CUDA_BOX_QP_DYNAMIC)
+        self.variants[family] = compiled
+        if len(self.variants) > self.max_families:
+            self.variants.popitem(last=False)
+        return compiled(*args)
+
+
+_compiled_complete_graph_isotropic_box_qp_cuda = _BoxQPCompiledVariants(
     _complete_graph_isotropic_box_qp_compiled_impl,
-    backend=_box_qp_inductor_backend,
-    fullgraph=True,
-    dynamic=_CUDA_BOX_QP_DYNAMIC,
+)
+_compiled_prepared_box_qp_cuda = _BoxQPCompiledVariants(
+    _complete_graph_isotropic_box_qp_prepared_impl,
 )
 
 
 def _complete_graph_isotropic_box_qp_cuda(*args) -> torch.Tensor:
+    return _run_compiled_box_qp(
+        args, _compiled_complete_graph_isotropic_box_qp_cuda,
+        _complete_graph_isotropic_box_qp_compiled_impl,
+    )
+
+
+def _run_compiled_box_qp(args, compiled, eager) -> torch.Tensor:
     signature = _cuda_box_qp_signature(args)
     stats = _cuda_box_qp_stats(signature)
     stats["calls"] += 1
     if stats["failed"]:
         stats["fallbacks"] += 1
-        return _complete_graph_isotropic_box_qp_compiled_impl(*args)
+        return eager(*args)
     token = _cuda_box_qp_active_signature.set(signature)
     try:
         before = stats["executions"]
-        result = _compiled_complete_graph_isotropic_box_qp_cuda(*args)
+        result = compiled(*args)
         if stats["executions"] == before:
             # E.g. compilation disabled by the process environment. Keep this
             # observable so qualification cannot call an eager timing compiled.
@@ -1286,7 +1379,7 @@ def _complete_graph_isotropic_box_qp_cuda(*args) -> torch.Tensor:
             RuntimeWarning,
             stacklevel=2,
         )
-        return _complete_graph_isotropic_box_qp_compiled_impl(*args)
+        return eager(*args)
     finally:
         _cuda_box_qp_active_signature.reset(token)
 
@@ -1308,7 +1401,6 @@ def _closed_form_box_fusion_result(
         adj=torch.zeros_like(projected),
         lower=lower,
         upper=upper,
-        atol=tol,
         max_edge_residual=0.0,
         max_ball_residual=0.0,
         max_radius=0.0,
@@ -1337,6 +1429,33 @@ def _initial_complete_graph_rho(
     return float(torch.clamp(median_h, min=1e-3, max=1e3).item())
 
 
+@dataclass(frozen=True, slots=True)
+class _ProjectedDualInitialization:
+    """Private proof for a freshly target-projected actual initialization only.
+
+    No ALM output inherits this proof: unfinished actual multipliers can be
+    infeasible. Tensor identity/version and the target weights/lambda must all
+    survive unchanged before a later initialization can omit its projection.
+    """
+
+    dual: torch.Tensor
+    edge_w: torch.Tensor
+    lambda_value: float
+    _versions: tuple[int, int] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_versions", (self.dual._version, self.edge_w._version))
+
+    def matches(self, dual, edge_w, lambda_value, runtime) -> bool:
+        return bool(
+            dual is self.dual and edge_w is self.edge_w
+            and float(lambda_value) == float(self.lambda_value)
+            and dual.dtype == runtime.dtype and dual.device == runtime.device
+            and edge_w.dtype == runtime.dtype and edge_w.device == runtime.device
+            and (dual._version, edge_w._version) == self._versions
+        )
+
+
 def solve_majorized_subproblem_alm_torch(
     *,
     runtime: TorchRuntime,
@@ -1361,6 +1480,7 @@ def solve_majorized_subproblem_alm_torch(
     box_max_iter: int = DEFAULT_BOX_MAX_ITER,
     edge_work_bytes: int | None = None,
     diagnostics_out: dict[str, int] | None = None,
+    _dual_start_projection: _ProjectedDualInitialization | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int, bool, KKTDiagnostics]:
     """One complete-graph ALM driver with the original full/chunked arithmetic."""
     budget = DEFAULT_EDGE_WORK_BYTES if edge_work_bytes is None else int(edge_work_bytes)
@@ -1387,6 +1507,10 @@ def solve_majorized_subproblem_alm_torch(
     )
     rho_t = torch.as_tensor(rho, dtype=runtime.dtype, device=runtime.device)
     valid_start = dual_start is not None and tuple(dual_start.shape) == (num_edges, num_regions)
+    projected_start = bool(
+        valid_start and dual_start_is_actual and _dual_start_projection is not None
+        and _dual_start_projection.matches(dual_start, edge_w, lambda_value, runtime)
+    )
     if streamed:
         scaled_dual = torch.empty((num_edges, num_regions), dtype=runtime.dtype, device=runtime.device)
         if not valid_start:
@@ -1394,7 +1518,9 @@ def solve_majorized_subproblem_alm_torch(
         else:
             for edge_slice in _edge_slices(num_edges, chunk_size):
                 initial_chunk = dual_start[edge_slice].to(dtype=runtime.dtype, device=runtime.device)
-                if dual_start_is_actual:
+                if projected_start:
+                    scaled_dual[edge_slice].copy_(initial_chunk / float(rho))
+                elif dual_start_is_actual:
                     radius = float(lambda_value) * edge_w[edge_slice]
                     norm = torch.linalg.vector_norm(initial_chunk, dim=1, keepdim=True)
                     projection_scale = torch.maximum(
@@ -1417,10 +1543,13 @@ def solve_majorized_subproblem_alm_torch(
         if valid_start:
             initial_dual = dual_start.to(dtype=runtime.dtype, device=runtime.device)
             if dual_start_is_actual:
-                initial_dual = project_dual_ball(initial_dual, radius)
+                if not projected_start:
+                    initial_dual = project_dual_ball(initial_dual, radius)
                 scaled_dual = initial_dual / rho
             else:
-                scaled_dual = initial_dual
+                # Own this workspace before in-place ALM updates: an incoming
+                # scaled warm start may alias a caller's retained tensor.
+                scaled_dual = initial_dual.clone()
             del initial_dual
         else:
             scaled_dual = torch.zeros((num_edges, num_regions), dtype=runtime.dtype, device=runtime.device)
@@ -1433,6 +1562,7 @@ def solve_majorized_subproblem_alm_torch(
     last_diagnostics = None
     actual_max_iter = max(int(max_iter), 10)
     box_iter = _box_qp_sweeps_for_atol(box_phi_atol, max_iter=box_max_iter)
+    qp_preparation = _prepare_box_qp(U, h, lower, upper)
     kkt_stop_tol = float(tol) + 0.25 * min(float(box_phi_atol), float(tol))
     kkt_audits = stationarity_checks = 0
     for inner_iter in range(actual_max_iter):
@@ -1485,6 +1615,7 @@ def solve_majorized_subproblem_alm_torch(
 
         phi_new = _complete_graph_isotropic_box_qp_torch(
             U=U, h=h, lower=lower, upper=upper, rho=rho_t, q=q, max_iter=box_iter,
+            _preparation=qp_preparation,
         )
 
         # Phase 2: finish every dual update/global residual before changing rho.
@@ -1515,7 +1646,7 @@ def solve_majorized_subproblem_alm_torch(
         else:
             edge_diff_new = graph_forward_edges(phi_new, edge_u=edge_u, edge_v=edge_v)
             primal_residual = edge_diff_new - z_new
-            scaled_dual = scaled_dual + primal_residual
+            scaled_dual.add_(primal_residual)
             if rho_update_due:
                 primal_norm = float(torch.linalg.norm(primal_residual).item())
                 z_delta = z_new - z_previous
@@ -1536,10 +1667,7 @@ def solve_majorized_subproblem_alm_torch(
                 elif dual_balance_norm > 10.0 * max(primal_norm, 1e-300):
                     next_rho = max(0.5 * float(rho), 1e-8)
             if next_rho != float(rho):
-                if streamed:
-                    scaled_dual.mul_(float(rho) / next_rho)
-                else:
-                    scaled_dual = scaled_dual * (float(rho) / next_rho)
+                scaled_dual.mul_(float(rho) / next_rho)
                 rho = float(next_rho)
                 rho_t.fill_(rho)
                 if not streamed:
@@ -1562,7 +1690,7 @@ def solve_majorized_subproblem_alm_torch(
             # the original streamed route. Dense audits use the rescaled dual.
             grad_smooth, stationarity_residual, backward_error_stationarity_residual = (
                 _complete_graph_admm_stationarity_components_torch(
-                    phi=phi, U=U, h=h, lower=lower, upper=upper, adj=audit_adjoint, atol=tol,
+                    phi=phi, U=U, h=h, lower=lower, upper=upper, adj=audit_adjoint,
                 )
             )
             progress_stationarity_residual = (
@@ -1604,7 +1732,6 @@ def solve_majorized_subproblem_alm_torch(
                 phi=phi, grad_smooth=grad_smooth, adj=audit_adjoint, lower=lower, upper=upper,
                 max_edge_residual=edge_max, max_ball_residual=ball_max, max_radius=radius_max,
                 max_scaled_edge_residual=scaled_edge_max, max_scaled_ball_residual=scaled_ball_max,
-                atol=tol,
             )
             residual = (
                 last_diagnostics.backward_error_kkt_residual if use_backward_error_stopping

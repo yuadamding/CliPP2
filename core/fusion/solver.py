@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 import time
+import weakref
 
 import numpy as np
 import torch
@@ -67,6 +68,7 @@ from .starts import (
 )
 from .torch_backend import (
     DEFAULT_EDGE_WORK_BYTES,
+    _ProjectedDualInitialization,
     as_runtime_tensor,
     dtype_name,
     graph_adjoint_edges_in_dtype,
@@ -100,6 +102,7 @@ from .types import (
     TorchRuntime,
     WorkCounters,
     WorksetMemoryOptions,
+    ZeroPenaltyCertificate,
 )
 from .witness_bounds import witness_scalar_data, separable_zero_witness
 
@@ -230,10 +233,10 @@ def _terminal_backward_error_audit_float64(
         tol=float(tol),
     )
     dense_dual = getattr(certificate, "dual", None)
-    if torch.is_tensor(dense_dual) and bool(
+    if (lambda_value == 0.0 or torch.is_tensor(dense_dual)) and bool(
         torch.any(gradient.at_breakpoint).item()
     ):
-        adjustment = graph_adjoint_edges_in_dtype(
+        adjustment = torch.zeros_like(phi64) if lambda_value == 0.0 else graph_adjoint_edges_in_dtype(
             dense_dual,
             edge_u=graph64.edge_u,
             edge_v=graph64.edge_v,
@@ -380,6 +383,41 @@ def _clipped_singleton_start_needs_pilot(
     return bool(np.any(active & (lower_escape | upper_escape)))
 
 
+class _GraphPenaltyCache:
+    """Two solve-local reductions, valid only for unchanged tensor versions.
+
+    Weak references plus versions reject allocator/object-ID reuse without
+    extending primal or graph lifetimes. Unversioned inference tensors
+    conservatively use the normal path.
+    """
+
+    def __init__(self):
+        self.entries = []
+
+    def value(self, phi, *, edge_u, edge_v, edge_w, lambda_value):
+        lambda_value = validate_lambda_value(lambda_value)
+        sources = (phi, edge_u, edge_v, edge_w)
+        try:
+            versions = tuple(value._version for value in sources)
+        except RuntimeError:
+            versions = None
+        cacheable = versions is not None and not any(v.requires_grad for v in sources)
+        if cacheable:
+            for index, (old_sources, old_versions, old_lambda, penalty) in enumerate(self.entries):
+                if (all(a is b() for a, b in zip(sources, old_sources))
+                        and versions == old_versions and lambda_value == old_lambda):
+                    self.entries.append(self.entries.pop(index))
+                    return penalty
+        penalty = pairwise_penalty_torch(
+            phi, edge_u=edge_u, edge_v=edge_v, edge_w=edge_w,
+            lambda_value=lambda_value,
+        )
+        if cacheable:
+            self.entries.append((tuple(weakref.ref(v) for v in sources), versions, lambda_value, penalty))
+            self.entries = self.entries[-2:]
+        return penalty
+
+
 def _inner_model_value_torch(
     phi: torch.Tensor,
     *,
@@ -389,9 +427,10 @@ def _inner_model_value_torch(
     edge_v: torch.Tensor,
     edge_w: torch.Tensor,
     lambda_value: float,
+    penalty_cache: _GraphPenaltyCache | None = None,
 ) -> torch.Tensor:
     quad = 0.5 * torch.sum(h * torch.square(phi - U))
-    penalty = pairwise_penalty_torch(
+    penalty = (pairwise_penalty_torch if penalty_cache is None else penalty_cache.value)(
         phi,
         edge_u=edge_u,
         edge_v=edge_v,
@@ -409,9 +448,10 @@ def _objective_value_from_mutation_region_terms_torch(
     edge_v: torch.Tensor,
     edge_w: torch.Tensor,
     lambda_value: float,
+    penalty_cache: _GraphPenaltyCache | None = None,
 ) -> tuple[float, float, float]:
     fit_loss_tensor = torch.sum(mutation_region_terms.loss)
-    penalty_tensor = pairwise_penalty_torch(
+    penalty_tensor = (pairwise_penalty_torch if penalty_cache is None else penalty_cache.value)(
         phi,
         edge_u=edge_u,
         edge_v=edge_v,
@@ -674,7 +714,7 @@ def _project_state_dual(
     num_edges: int,
     num_regions: int,
 ) -> torch.Tensor | None:
-    if state is None or state.dual is None:
+    if lambda_value <= 0.0 or state is None or state.dual is None:
         return None
     if tuple(state.dual.shape) != (int(num_edges), int(num_regions)):
         return None
@@ -709,7 +749,7 @@ def _invalidate_damped_trial_state(
     *,
     phi: torch.Tensor,
     trial_warm_state: DenseWarmState | PrimalOnlyWarmState,
-) -> tuple[None, None, None, PrimalOnlyWarmState, bool]:
+) -> tuple[None, None, PrimalOnlyWarmState, bool]:
     """Create the only state that may be promoted for a damped MM endpoint."""
 
     structure_hint = None
@@ -726,7 +766,6 @@ def _invalidate_damped_trial_state(
     else:
         certificate_hint = None
     return (
-        None,
         None,
         None,
         PrimalOnlyWarmState(
@@ -781,6 +820,8 @@ def _rebase_certificate_hint(
 
     if hint is None or hint.graph_hash != str(graph_hash):
         return None
+    if isinstance(hint, ZeroPenaltyCertificate):
+        return hint if lambda_value == 0.0 else None
     if isinstance(hint, DenseEdgeCertificate):
         return hint
     rebased = _compressed_certificate_for_primal(
@@ -989,9 +1030,9 @@ def escape_emission_breakpoint_solver_state(
     context: PreparedProblem,
     tol: float,
 ) -> tuple[SolverState | None, int]:
-    """Nudge a failed dense-certificate state off exact path breakpoints.
+    """Nudge a failed state with a known adjoint off exact path breakpoints.
 
-    The dense certificate supplies the fusion adjoint.  At each exact
+    The dense certificate supplies the adjoint (zero at zero penalty). At each exact
     breakpoint, the one-sided observed gradients plus that adjoint choose a
     retry side.  A changed primal invalidates every dual/certificate warm
     object because none remains valid at the new point.
@@ -1001,12 +1042,12 @@ def escape_emission_breakpoint_solver_state(
     model = context.model
     if (
         state is None
-
-        or not isinstance(certificate, DenseEdgeCertificate)
+        or not isinstance(certificate, (DenseEdgeCertificate, ZeroPenaltyCertificate))
         or certificate.certificate_scope != "full_original_graph"
         or certificate.gradient_scope == "mm_surrogate"
         or certificate.graph_hash != str(context.graph_hash)
-        or not torch.is_tensor(certificate.dual)
+        or (isinstance(certificate, ZeroPenaltyCertificate) and state.previous_lambda != 0.0)
+        or (isinstance(certificate, DenseEdgeCertificate) and not torch.is_tensor(certificate.dual))
     ):
         return state, 0
 
@@ -1015,18 +1056,17 @@ def escape_emission_breakpoint_solver_state(
     expected_shape = model.shape
     if tuple(phi.shape) != expected_shape or not bool(torch.all(torch.isfinite(phi))):
         return state, 0
-    dual = as_runtime_tensor(certificate.dual, context.runtime)
-    expected_dual_shape = (
-        int(context.graph.edge_u.numel()),
-        int(phi.shape[1]),
-    )
-    if tuple(dual.shape) != expected_dual_shape or not bool(
-        torch.all(torch.isfinite(dual))
-    ):
-        return state, 0
+    dual = None
+    if isinstance(certificate, DenseEdgeCertificate):
+        dual = as_runtime_tensor(certificate.dual, context.runtime)
+        expected_dual_shape = (
+            int(context.graph.edge_u.numel()), int(phi.shape[1]),
+        )
+        if tuple(dual.shape) != expected_dual_shape or not bool(torch.all(torch.isfinite(dual))):
+            return state, 0
 
     with torch.no_grad():
-        fusion_adjustment = graph_adjoint_edges(
+        fusion_adjustment = torch.zeros_like(phi) if dual is None else graph_adjoint_edges(
             dual,
             edge_u=context.graph.edge_u,
             edge_v=context.graph.edge_v,
@@ -1293,11 +1333,6 @@ def prepare_torch_problem(
         base_objective_key=base_objective_key,
         verbose=bool(verbose),
         scalar_pilot_certificates=tuple(pilot_certificates or ()),
-        adaptive_graph_options=(
-            (float(adaptive_weight_gamma), float(adaptive_weight_floor),
-             float(adaptive_weight_baseline))
-            if graph is None and not defer_graph else None
-        ),
     )
 
 
@@ -1389,6 +1424,7 @@ def _solve_inner_subproblem(
     use_backward_error_stopping: bool,
     backend_name: str,
     graph_hash: str,
+    dual_start_projection: _ProjectedDualInitialization | None = None,
 ) -> InnerSolveResult:
     """Solve the complete-graph ALM subproblem and retain its actual multiplier."""
     dense_fits, dense_bytes, dense_limit = dense_complete_solver_memory_preflight(
@@ -1427,6 +1463,7 @@ def _solve_inner_subproblem(
         dual_start_is_actual=dual_start_is_actual,
         spectral_rho=bool(spectral_rho),
         use_backward_error_stopping=bool(use_backward_error_stopping),
+        _dual_start_projection=dual_start_projection,
     )
     if surrogate_diag is None:
         surrogate_diag = graph_fusion_kkt_residual_from_grad_torch(
@@ -1439,7 +1476,6 @@ def _solve_inner_subproblem(
             edge_v=edge_v,
             edge_w=edge_w,
             lambda_value=lambda_value,
-            atol=tol,
         )
     certificate = (
         DenseEdgeCertificate(
@@ -1486,7 +1522,6 @@ def _certificate_options(options: SolverConfig, dtype: torch.dtype) -> Certifica
         ),
         memory=WorksetMemoryOptions(
             max_workset_bytes=int(resources.workset_max_bytes),
-            max_compressed_cache_bytes=int(resources.compressed_cache_max_bytes),
         ),
     )
 
@@ -1500,14 +1535,14 @@ class _IterateState:
     """
     phi: torch.Tensor
     dual: torch.Tensor | None
-    dual_kkt: torch.Tensor | None
-    certificate: DenseEdgeCertificate | CompressedEdgeCertificate | None
+    certificate: GraphFusionCertificate | None
     warm_state: DenseWarmState | PrimalOnlyWarmState
     backend_name: str
     dual_start_is_actual: bool
     objective: float
     fit_loss: float
     terms: TorchObservedTerms
+    dual_start_projection: _ProjectedDualInitialization | None = None
 
 
 def _fit_from_start(
@@ -1582,7 +1617,6 @@ def _fit_from_start(
         num_regions=int(phi.shape[1]),
     )
     dual = state_dual
-    dual_kkt = state_dual
     warm_state = (
         solver_state.warm_state
         if solver_state is not None and solver_state.warm_state is not None
@@ -1599,6 +1633,10 @@ def _fit_from_start(
             solver_state is not None
             and solver_state.certificate is not None
             and getattr(solver_state.certificate, "graph_hash", None) == graph_hash
+            and not (
+                lambda_value > 0.0
+                and isinstance(solver_state.certificate, ZeroPenaltyCertificate)
+            )
         )
         else (
             DenseEdgeCertificate(
@@ -1632,6 +1670,7 @@ def _fit_from_start(
         else "legacy_global_l2_progress_v1"
     )
     full_step_curvature_multiplier = torch.ones_like(phi)
+    penalty_cache = _GraphPenaltyCache()
 
     current_mutation_region_terms = observed_terms_torch(
         model, phi, eps=eps
@@ -1644,13 +1683,18 @@ def _fit_from_start(
             edge_v=edge_v,
             edge_w=edge_w,
             lambda_value=lambda_value,
+            penalty_cache=penalty_cache,
         )
     )
     iterate = _IterateState(
-        phi, dual, dual_kkt, certificate, warm_state, inner_solver,
+        phi, dual, certificate, warm_state, inner_solver,
         dual_start_is_actual, objective, fit_loss, current_mutation_region_terms,
+        dual_start_projection=(
+            _ProjectedDualInitialization(state_dual, edge_w, float(lambda_value))
+            if state_dual is not None else None
+        ),
     )
-    del phi, dual, dual_kkt, certificate, warm_state, inner_solver, state_dual
+    del phi, dual, certificate, warm_state, inner_solver, state_dual
     del dual_start_is_actual, objective, fit_loss, current_mutation_region_terms
     for outer_iter in range(max(int(outer_max_iter), 1)):
         iterations = outer_iter + 1
@@ -1759,6 +1803,7 @@ def _fit_from_start(
                     edge_v=edge_v,
                     edge_w=edge_w,
                     lambda_value=lambda_value,
+                    penalty_cache=penalty_cache,
                 )
             recovery_inner_model_tol = (
                 max(
@@ -1772,6 +1817,7 @@ def _fit_from_start(
             inner_phi_start = iterate.phi
             inner_dual_start = iterate.dual
             inner_dual_start_is_actual = iterate.dual_start_is_actual
+            inner_dual_start_projection = iterate.dual_start_projection
             inner_batch_limit = 8 if require_full_step_backtracking else 1
             for _inner_batch in range(inner_batch_limit):
                 inner_result = _solve_inner_subproblem(
@@ -1794,7 +1840,11 @@ def _fit_from_start(
                     use_backward_error_stopping=use_backward_error_progress,
                     backend_name=dense_inner_solver,
                     graph_hash=graph_hash,
+                    dual_start_projection=inner_dual_start_projection,
                 )
+                # An unfinished inner solve's actual dual is not guaranteed
+                # feasible; only the fresh initialization carries this proof.
+                inner_dual_start_projection = None
                 inner_solve_calls += 1
                 total_inner_iterations += int(inner_result.iterations)
                 phi_trial = inner_result.phi
@@ -1822,6 +1872,7 @@ def _fit_from_start(
                         edge_v=edge_v,
                         edge_w=edge_w,
                         lambda_value=lambda_value,
+                        penalty_cache=penalty_cache,
                     )
                     batch_inner_model_gap = float((batch_q_trial - q_current).item())
                     batch_inner_certified = bool(
@@ -1847,6 +1898,7 @@ def _fit_from_start(
                     edge_v=edge_v,
                     edge_w=edge_w,
                     lambda_value=lambda_value,
+                    penalty_cache=penalty_cache,
                 )
             )
             objective_gap = float(trial_objective - previous_objective)
@@ -1872,6 +1924,7 @@ def _fit_from_start(
                     edge_v=edge_v,
                     edge_w=edge_w,
                     lambda_value=lambda_value,
+                    penalty_cache=penalty_cache,
                 )
                 inner_model_gap = float((q_trial - q_current).item())
                 if use_unimodal_objective:
@@ -1965,7 +2018,7 @@ def _fit_from_start(
                 accepted_full_steps += 1
                 # ALM returns actual y=rho*u; retain it across curvature changes.
                 candidate = _IterateState(
-                    phi_trial, dual_kkt_trial, dual_kkt_trial, surrogate_certificate,
+                    phi_trial, dual_kkt_trial, surrogate_certificate,
                     inner_result.warm_state, inner_result.backend_name, True,
                     trial_objective, trial_fit_loss, trial_mutation_region_terms,
                 )
@@ -2064,6 +2117,7 @@ def _fit_from_start(
                         edge_v=edge_v,
                         edge_w=edge_w,
                         lambda_value=lambda_value,
+                        penalty_cache=penalty_cache,
                     )
                 )
                 if (
@@ -2077,8 +2131,8 @@ def _fit_from_start(
                         phi=phi_theta, trial_warm_state=inner_result.warm_state,
                     )
                     candidate = _IterateState(
-                        phi_theta, *damped_state[:4], inner_result.backend_name,
-                        damped_state[4], theta_objective, theta_fit_loss,
+                        phi_theta, *damped_state[:3], inner_result.backend_name,
+                        damped_state[3], theta_objective, theta_fit_loss,
                         theta_mutation_region_terms,
                     )
                     del damped_state
@@ -2122,6 +2176,7 @@ def _fit_from_start(
             or not np.isfinite(iterate.objective)
         )
         outer_converged = False
+        periodic_reuse = None
         if do_outer_kkt_audit:
             outer_terms = iterate.terms
             observed_start = iterate.certificate
@@ -2166,6 +2221,10 @@ def _fit_from_start(
             work_counters = work_counters + observed_refinement.work_counters
             iterate.certificate = observed_refinement.certificate
             outer_diag = observed_refinement.diagnostics
+            periodic_reuse = _PeriodicCertificateReuse.capture(
+                problem, certificate_problem, iterate.phi, outer_terms.gradient,
+                periodic_gradient, observed_refinement,
+            )
             del observed_start, observed_refinement
             legacy_stop_kkt_residual = float(outer_diag.kkt_residual)
             componentwise_stop_kkt_residual = float(
@@ -2196,6 +2255,11 @@ def _fit_from_start(
             )
             break
 
+        if iterations < max(int(outer_max_iter), 1):
+            # A future iteration can replace its dual. Do not pin that old
+            # graph-sized tensor merely for a terminal-only reuse opportunity.
+            periodic_reuse = None
+
     final_terms = iterate.terms
     if iterate.certificate is None and isinstance(iterate.warm_state, PrimalOnlyWarmState):
         iterate.certificate = _rebase_certificate_hint(
@@ -2205,48 +2269,62 @@ def _fit_from_start(
             graph_hash=graph_hash,
             lambda_value=lambda_value,
         )
-    certificate_gradient = build_certificate_gradient(
-        model,
-        iterate.phi,
-        smooth_gradient=final_terms.gradient,
-        lower=lower,
-        upper=upper,
-        eps=eps,
-        tol=cert_tol,
+    reused_periodic = None if periodic_reuse is None else periodic_reuse.reuse(
+        problem, certificate_problem, iterate.phi, final_terms.gradient,
+        iterate.certificate,
+    )
+    certificate_gradient = (
+        periodic_reuse.gradient if reused_periodic is not None else build_certificate_gradient(
+            model,
+            iterate.phi,
+            smooth_gradient=final_terms.gradient,
+            lower=lower,
+            upper=upper,
+            eps=eps,
+            tol=cert_tol,
+        )
     )
 
     certificate_needs_final_pass = False
     for _ in range(4):
-        final_certificate_refinement = certify(
-            problem=certificate_problem,
-            phi=iterate.phi,
-            gradient=certificate_gradient,
-            witness=iterate.certificate,
-            refine=True,
-            max_iter=int(certificate_options.max_iter),
-            options=(
-                certificate_options
-                if isinstance(iterate.certificate, CompressedEdgeCertificate)
-                else None
-            ),
-        )
+        if reused_periodic is not None:
+            final_certificate_refinement, reused_periodic = reused_periodic, None
+        else:
+            final_certificate_refinement = certify(
+                problem=certificate_problem,
+                phi=iterate.phi,
+                gradient=certificate_gradient,
+                witness=iterate.certificate,
+                refine=True,
+                max_iter=int(certificate_options.max_iter),
+                options=(
+                    certificate_options
+                    if isinstance(iterate.certificate, CompressedEdgeCertificate)
+                    else None
+                ),
+            )
         work_counters = work_counters + final_certificate_refinement.work_counters
         iterate.certificate = final_certificate_refinement.certificate
         certificate_needs_final_pass = False
         if not bool(torch.any(certificate_gradient.at_breakpoint).item()):
             break
         interval_dual = getattr(iterate.certificate, "dual", None)
-        if not torch.is_tensor(interval_dual):
+        if lambda_value == 0.0:
+            fusion_adjustment = torch.zeros_like(iterate.phi)
+        elif not torch.is_tensor(interval_dual):
             # A selected endpoint gradient is already a valid member of the
             # subgradient interval; compressed certificates simply cannot
             # improve a false negative by alternating the interval choice.
             break
-        fusion_adjustment = graph_adjoint_edges(
-            interval_dual,
-            edge_u=edge_u,
-            edge_v=edge_v,
-            num_nodes=int(iterate.phi.shape[0]),
-        )
+        else:
+            fusion_adjustment = graph_adjoint_edges_in_dtype(
+                interval_dual,
+                edge_u=edge_u,
+                edge_v=edge_v,
+                num_nodes=int(iterate.phi.shape[0]),
+                dtype=iterate.phi.dtype,
+                device=iterate.phi.device,
+            )
         del interval_dual
         next_gradient = build_certificate_gradient(
             model,
@@ -2611,6 +2689,82 @@ def _leave_one_out_max(values: np.ndarray) -> np.ndarray:
 
 
 @dataclass(slots=True)
+class _PeriodicCertificateReuse:
+    """A passing smooth dense audit, valid only for its exact retained inputs.
+
+    The ordinary dense refiner returns this input dual unchanged when its first
+    audit passes. Reusing that audit avoids repeating graph work; it neither
+    skips the float64 admission audit nor transports evidence between boxes.
+    """
+
+    problem: PreparedProblem
+    certificate_problem: CertificateProblem
+    phi: torch.Tensor
+    smooth_gradient: torch.Tensor
+    gradient: object
+    attempt: object
+    _binding: tuple
+
+    @staticmethod
+    def _key(problem, certificate_problem, phi, smooth_gradient, gradient, certificate):
+        tensors = (
+            *(tensor for _, tensor in problem._runtime_tensors()),
+            certificate_problem.lower, certificate_problem.upper,
+            phi, smooth_gradient, gradient.value, gradient.at_breakpoint,
+            gradient.directional_failures, certificate.dual,
+        )
+        return (
+            id(problem), id(certificate_problem), id(certificate),
+            problem.objective_spec_hash, problem.graph_hash, problem.eps,
+            problem.runtime, certificate_problem.lambda_value, certificate_problem.atol,
+            certificate_problem.graph_hash, id(certificate_problem.graph),
+            certificate.graph_hash, certificate.gradient_scope,
+            gradient.scope, gradient.directional_admissible,
+            tuple(None if tensor is None else (
+                id(tensor), tensor._version, tensor.dtype, tensor.device,
+                tuple(tensor.shape), tuple(tensor.stride()),
+            ) for tensor in tensors),
+        )
+
+    @classmethod
+    def capture(cls, problem, certificate_problem, phi, smooth_gradient, gradient, attempt):
+        certificate = attempt.certificate
+        if (
+            not isinstance(certificate, DenseEdgeCertificate)
+            or certificate_problem.lambda_value <= 0.0
+            or certificate_problem.graph.weight.numel() == 0
+            or certificate.graph_hash != certificate_problem.graph_hash
+            or not torch.is_tensor(certificate.dual)
+            or tuple(certificate.dual.shape) != (
+                certificate_problem.graph.weight.numel(), phi.shape[1],
+            )
+            or gradient.scope != "observed_objective"
+            or not gradient.directional_admissible
+            or not np.isfinite(attempt.diagnostics.backward_error_kkt_residual)
+            or attempt.diagnostics.backward_error_kkt_residual > 5.0 * certificate_problem.atol
+        ):
+            return None
+        return cls(problem, certificate_problem, phi, smooth_gradient, gradient, attempt,
+                   cls._key(problem, certificate_problem, phi, smooth_gradient,
+                            gradient, certificate))
+
+    def reuse(self, problem, certificate_problem, phi, smooth_gradient, certificate):
+        if (
+            certificate is not self.attempt.certificate
+            or problem is not self.problem or certificate_problem is not self.certificate_problem
+            or phi is not self.phi or smooth_gradient is not self.smooth_gradient
+            or self._key(problem, certificate_problem, phi, smooth_gradient,
+                         self.gradient, certificate) != self._binding
+        ):
+            return None
+        return replace(
+            self.attempt,
+            certificate=replace(certificate, gradient_scope=self.gradient.scope),
+            status="input_dual_retained", work_counters=WorkCounters(),
+        )
+
+
+@dataclass(slots=True)
 class _WitnessAuditCache:
     """One full-graph audit per incumbent, not per clonal member.
 
@@ -2625,8 +2779,22 @@ class _WitnessAuditCache:
     _incumbent: RawFit | None = None
     _supported: bool = False
     _result: tuple | None = None
+    _original_box: bool = field(init=False)
+    _original_box_owner: PreparedProblem = field(init=False, repr=False)
 
-    def audit(self, branch, incumbent, *, lambda_value, tolerance, _work_out=None):
+    def __post_init__(self):
+        # The private index route only represents a box made by fixing exactly
+        # one eligible source row. Arbitrary/external boxes retain full checks.
+        self._original_box_owner = self.problem
+        self._original_box = bool(
+            self.problem.optimization_box.witness_index is None
+            and all(np.array_equal(getattr(self.problem.optimization_box, name),
+                                   getattr(self.problem.source_model, name))
+                    for name in ("lower", "upper"))
+        )
+
+    def audit(self, branch, incumbent, *, lambda_value, tolerance, _work_out=None,
+              _witness_index=None):
         problem = self.problem
         problem.assert_runtime_unchanged()
         branch.assert_runtime_unchanged()
@@ -2634,6 +2802,8 @@ class _WitnessAuditCache:
             self._key = self._incumbent = self._result = None
             self._supported = False
         certificate = incumbent.certificate.witness
+        zero_penalty = isinstance(certificate, ZeroPenaltyCertificate) and lambda_value == 0.0
+        dual = getattr(certificate, "dual", None)
         if (
             problem.optimization_box.witness_index is not None
             or branch.source_model is not problem.source_model
@@ -2641,17 +2811,25 @@ class _WitnessAuditCache:
             or branch.graph_spec is not problem.graph_spec
             or branch.graph_hash != problem.graph_hash
             or branch.runtime != problem.runtime or branch.eps != problem.eps
-            or not isinstance(certificate, DenseEdgeCertificate)
+            or not (zero_penalty or isinstance(certificate, DenseEdgeCertificate))
             or certificate.graph_hash != problem.graph_hash
-            or not torch.is_tensor(certificate.dual)
-            or tuple(certificate.dual.shape) != (
+            or not zero_penalty and (not torch.is_tensor(dual) or tuple(dual.shape) != (
                 int(problem.graph.weight.numel()), problem.source_model.shape[1],
-            )
+            ))
         ):
             return None
         source, box = problem.source_model, branch.optimization_box
-        index = box.witness_index
-        if index is None or any(
+        index = box.witness_index if _witness_index is None else _witness_index
+        if _witness_index is not None:
+            if (
+                branch is not problem or problem is not self._original_box_owner
+                or not self._original_box
+                or isinstance(index, bool) or not isinstance(index, (int, np.integer))
+                or not 0 <= index < source.shape[0]
+                or not np.all((source.lower[index] <= 1.0) & (source.upper[index] >= 1.0))
+            ):
+                return None
+        elif index is None or any(
             not np.array_equal(original, getattr(problem.optimization_box, name))
             or not np.array_equal(original[:index], getattr(box, name)[:index])
             or not np.array_equal(original[index + 1:], getattr(box, name)[index + 1:])
@@ -2660,10 +2838,11 @@ class _WitnessAuditCache:
             # Only a single exact frozen row permits this leave-one-out proof.
             # Keep arbitrary effective boxes on the independent audit route.
             return None
-        dual = certificate.dual
+        dual_key = None if zero_penalty else (
+            id(dual), dual._version, str(dual.device), dual.dtype, tuple(dual.stride()),
+        )
         key = (
-            id(incumbent), id(certificate), id(dual), dual._version,
-            str(dual.device), dual.dtype, tuple(dual.stride()),
+            id(incumbent), id(certificate), dual_key,
             id(problem.source_model), id(problem.graph), id(problem.graph_spec),
             problem.source_model.fingerprint, problem.graph_hash,
             problem.optimization_box.fingerprint, problem.eps,
@@ -2720,7 +2899,6 @@ class _WitnessAuditCache:
             self._result = stationarity, directional, common, objective
             work = audit_work["work"]
         stationarity, directional, common, objective = self._result
-        index = branch.optimization_box.witness_index
         residuals = (*common, float(stationarity[index]))
         covered = bool(
             directional[index] and common[-1] == 0.0
@@ -2734,6 +2912,7 @@ class _WitnessAuditCache:
 def _audit_reusable_witness(
     branch: PreparedProblem, incumbent: RawFit, *, lambda_value: float, tolerance: float,
     shared_cache: _WitnessAuditCache | None = None,
+    _witness_index: int | None = None,
 ) -> tuple[bool, WorkCounters, str | None]:
     """Cover a new box only by a fresh original-gate audit and global support.
 
@@ -2742,7 +2921,7 @@ def _audit_reusable_witness(
     original KKT certificate is sufficient for this conditional box. Mixtures
     and failed audits still receive the full, unchanged multistart solve.
     """
-    index = branch.optimization_box.witness_index
+    index = branch.optimization_box.witness_index if _witness_index is None else _witness_index
     if not incumbent.certificate.admissible or not np.all(incumbent.phi[index] == 1.0):
         return False, WorkCounters(), None
     if shared_cache is not None:
@@ -2751,11 +2930,16 @@ def _audit_reusable_witness(
             shared = shared_cache.audit(
                 branch, incumbent, lambda_value=lambda_value, tolerance=tolerance,
                 _work_out=audit_work,
+                _witness_index=_witness_index,
             )
             if shared is not None:
                 return shared
         except (RuntimeError, MemoryError, FloatingPointError, ValueError) as error:
             return False, audit_work.get("work", WorkCounters()), f"{type(error).__name__}: {error}"
+    if _witness_index is not None:
+        # Unsupported certificate representations retain the independent,
+        # fully materialized box audit. Only successful shared proofs avoid it.
+        branch = _prepare_witness_problem(branch, _witness_index, _source_validated=True)
     if not (
         has_proven_convex_observed_loss(branch.source_model, eps=branch.eps)
         or has_global_supporting_tangent(branch.source_model, incumbent.phi, eps=branch.eps)
@@ -2845,15 +3029,15 @@ def fit_prepared(
         attempted.append(index)
         candidate = None
         try:
-            branch = _prepare_witness_problem(problem, index, _source_validated=True)
             if incumbent is not None:
                 # Every audit, successful or rejected, is counted once. An
                 # unsuccessful certificate never suppresses the normal solve.
                 covered, audit_work, audit_failure = _audit_reusable_witness(
-                    branch, incumbent, lambda_value=lambda_value,
+                    problem, incumbent, lambda_value=lambda_value,
                     tolerance=(solver_options.tolerance if solver_options.certification_tolerance is None
                                else solver_options.certification_tolerance),
                     shared_cache=shared_audit,
+                    _witness_index=index,
                 )
                 total_work = total_work + audit_work
                 if audit_failure is not None:
@@ -2862,6 +3046,7 @@ def fit_prepared(
                 if covered:
                     reused.append(index)
                     continue
+            branch = _prepare_witness_problem(problem, index, _source_validated=True)
             branch_warm = warm_state
             if branch_warm is not None and branch_warm.objective_spec_hash != branch.objective_spec_hash:
                 # A guided multiplier on this exact original objective remains

@@ -11,7 +11,7 @@ from ..core.scalar import canonical_partition_labels as _canonical_partition_lab
 from ..core.fusion.types import (
     CompressedEdgeCertificate,
     DenseEdgeCertificate,
-    PairwiseFusionGraph,
+    ZeroPenaltyCertificate,
 )
 from .types import FusionPartition
 
@@ -221,7 +221,6 @@ def _mergeable_cross_block_pair_found(
 def extract_certified_fusion_partition(
     fit: RawFit,
     *,
-    graph: PairwiseFusionGraph,
     tolerance: float,
     mutation_ids: tuple[str, ...] | list[str] | None = None,
 ) -> FusionPartition:
@@ -251,7 +250,7 @@ def extract_certified_fusion_partition(
     state = fit.state
     certificate = getattr(state, "certificate", None)
     certificate_graph_hash_matches = True
-    if isinstance(certificate, (CompressedEdgeCertificate, DenseEdgeCertificate)):
+    if isinstance(certificate, (CompressedEdgeCertificate, DenseEdgeCertificate, ZeroPenaltyCertificate)):
         expected_graph_hash = str(fit.provenance.original_graph_hash)
         certificate_graph_hash_matches = bool(
             expected_graph_hash and str(certificate.graph_hash) == expected_graph_hash

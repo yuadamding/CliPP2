@@ -15,6 +15,7 @@ from ..core.objective import compile_observed_model, make_base_objective_key
 from ..core.fusion.graph import build_complete_uniform_graph
 from ..core.fusion.partition_starts import (
     PartitionCandidate,
+    _PartitionPoolCache,
     generate_partition_initializer_pool,
     observed_curvature_at_pilot_torch,
 )
@@ -912,12 +913,14 @@ def _partition_guided_admm_selection(
     guide_curvature = observed_curvature_at_pilot_torch(
         pilot_context.model, pilot_phi, eps=pilot_context.eps,
     )
+    proposal_cache = _PartitionPoolCache()
     initializer_pool = generate_partition_initializer_pool(
         context=pilot_context,
         pilot_phi=pilot_phi,
         fit_options=fit_options,
         curvature=guide_curvature,
         _require_clonal=False,
+        _pool_cache=proposal_cache,
     )
     guide = _best_partition_candidate(list(initializer_pool))
     if guide is None:
@@ -984,7 +987,6 @@ def _partition_guided_admm_selection(
     raw_guide_phi: StartArray = guide_phi
     guided_initialization, base_solver_context, raw_guide_phi = (
         _build_guided_initialization_with_resource_policy(
-            data=data,
             guide_phi=raw_guide_phi,
             guide_labels=raw_guide_labels,
             solver_context=base_solver_context,
@@ -1007,7 +1009,6 @@ def _partition_guided_admm_selection(
         initial_lambda=float(guided_initialization.lambda_value),
         initial_reason="partition_guide_kkt_balance",
         config=OnlineLambdaConfig(
-            guide_n_clusters=int(np.unique(raw_guide_labels).size),
             num_mutations=int(data.num_mutations),
             kkt_tolerance=5.0 * float(effective_fit_options.solver.tolerance),
             max_unique_lambdas=int(
@@ -1019,7 +1020,6 @@ def _partition_guided_admm_selection(
             max_solver_retries_per_lambda=int(
                 effective_fit_options.selection.lambda_search.solver_retry_limit
             ),
-            partition_event_mode=True,
         ),
     )
 
@@ -1125,6 +1125,7 @@ def _partition_guided_admm_selection(
         pilot_phi=pilot_phi,
         fit_options=effective_fit_options,
         curvature=guide_curvature,
+        _pool_cache=proposal_cache,
     )
     # The production candidate pool always includes pilot and final-Phi ladders.
     direct_proposals: list[
@@ -1170,6 +1171,7 @@ def _partition_guided_admm_selection(
             pilot_phi=np.asarray(parent.raw_fit.phi, dtype=np.float64),
             fit_options=effective_fit_options,
             declared_k_grid=final_k_grid,
+            _pool_cache=proposal_cache,
         )
         direct_proposals.extend(
             (proposal, "final_phi", parent_record)

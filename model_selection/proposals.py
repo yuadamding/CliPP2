@@ -246,7 +246,6 @@ def solver_retry_fit_options(
 
 def build_guided_initialization_with_resource_policy(
     *,
-    data: TumorData,
     guide_phi: StartArray,
     guide_labels: np.ndarray | torch.Tensor,
     solver_context: PreparedProblem,

@@ -756,7 +756,6 @@ def build_guided_fusion_initialization(
             edge_v=edge_v,
             edge_w=edge_w,
             lambda_value=float(lambda_value),
-            atol=float(kkt_atol),
         )
 
         zero_separation_between_edge_count = _zero_separation_between_count(

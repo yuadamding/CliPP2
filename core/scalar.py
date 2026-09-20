@@ -914,7 +914,6 @@ def partition_constrained_observed_refit(
     *,
     eps: float,
     tol: float,
-    max_iter: int,
     scalar_grid_points: int = 64,
     scalar_local_steps: int = 3,
     _model: ObservedModel | None = None,
@@ -936,8 +935,6 @@ def partition_constrained_observed_refit(
     epsilon = float(eps)
     if not np.isfinite(tolerance) or tolerance <= 0.0:
         raise ValueError("Partition refit tolerance must be positive and finite.")
-    if int(max_iter) < 1:
-        raise ValueError("Partition refit interval budget must be positive.")
     if int(scalar_grid_points) < 3:
         raise ValueError("scalar_grid_points must be at least three.")
     if int(scalar_local_steps) < 0:
@@ -985,7 +982,7 @@ def partition_constrained_observed_refit(
                 upper = lower
             key = None if _coordinate_cache is None else _RefitCoordinateKey(
                 tumor_data_fingerprint(data), model.fingerprint, member_key, region,
-                # Grid/local solves consume neither tol nor max_iter. In
+                # Grid/local solves do not consume tol. In
                 # particular, K-dependent tolerance must not prevent reuse
                 # of an unchanged cluster across adjacent Ward cuts. The
                 # tolerance-dependent boundary summaries are rebuilt below;

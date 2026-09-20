@@ -103,6 +103,10 @@ def estimate_dense_complete_solver_peak_bytes(
     value_bytes = _dtype_nbytes(dtype)
     edge_value_bytes = edge_count * region_count * value_bytes
     estimate = node_count * region_count * value_bytes * 8
+    if dtype == torch.float64 and node_count:
+        # Solve-local QP preparation retains denominator/scaled_h and the
+        # regional mean bounds during edge phases, not only during the QP.
+        estimate += (2 * node_count * region_count + 2 * region_count + 1) * 8
     if dtype == torch.float32 and node_count:
         # The stable QP root promotes only node-sized work to float64. Budget
         # its eager fallback too: original caller tensors, five promoted

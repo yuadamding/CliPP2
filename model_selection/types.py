@@ -10,6 +10,7 @@ from ..core.bic import SelectionScore
 from ..core.clonal import CLONAL_CONSTRAINT_ID
 from ..core.fusion.types import (
     ConvergenceResult, DenseEdgeCertificate, KKTComponents, RawFit, WorkCounters,
+    ZeroPenaltyCertificate,
 )
 from ..io.data import ImmutableArrayRecord, readonly_array
 
@@ -22,9 +23,11 @@ def is_zero_edge_singleton(fit: RawFit) -> bool:
     return bool(
         fit.phi.shape[0] == 1
         and fit.provenance.lambda_value == 0.0
-        and isinstance(witness, DenseEdgeCertificate)
-        and torch.is_tensor(witness.dual)
-        and tuple(witness.dual.shape) == (0, fit.phi.shape[1])
+        and (isinstance(witness, ZeroPenaltyCertificate) or (
+            isinstance(witness, DenseEdgeCertificate)
+            and torch.is_tensor(witness.dual)
+            and tuple(witness.dual.shape) == (0, fit.phi.shape[1])
+        ))
         and witness.graph_hash == fit.provenance.original_graph_hash
     )
 

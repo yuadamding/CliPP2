@@ -120,8 +120,6 @@ def _write_patient_simulation(
     min_clone_ccf_distance = 0.10
     if not 0.0 < float(simu_purity) < 1.0:
         raise ValueError("simu_purity must lie strictly between zero and one.")
-    if purity_conc <= 0.0:
-        raise ValueError("purity_conc must be positive.")
     directory_name = str(config.tumor_id).strip()
     if (
         not directory_name

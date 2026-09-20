@@ -222,7 +222,6 @@ def _selection_refit_cache_key(
         float(selection_options.eps),
         selection_options.multiplicity_policy,
         float(refit.tolerance),
-        int(refit.max_iter),
         # A family name does not identify counts, candidate support or priors.
         # Eligibility-only provenance is deliberately absent from this hash.
         tumor_data_fingerprint(data),
@@ -256,7 +255,6 @@ def _fixed_labels_refit(
     kwargs = dict(
         eps=float(selection_options.eps),
         tol=float(refit_config.tolerance),
-        max_iter=int(refit_config.max_iter),
         scalar_grid_points=int(refit_config.grid_points),
         scalar_local_steps=int(refit_config.local_steps),
     )
@@ -293,10 +291,10 @@ def _build_refit_summary(
     eps: float,
 ) -> PartitionRefitSummary:
     return PartitionRefitSummary(
-        labels=np.asarray(refit.labels, dtype=np.int64).copy(),
+        labels=np.asarray(refit.labels, dtype=np.int64),
         partition_signature=str(partition_signature),
-        phi=np.asarray(refit.phi, dtype=np.float64).copy(),
-        cluster_centers=np.asarray(refit.cluster_centers, dtype=np.float64).copy(),
+        phi=np.asarray(refit.phi, dtype=np.float64),
+        cluster_centers=np.asarray(refit.cluster_centers, dtype=np.float64),
         loglik=float(refit.loglik),
         finite_candidate_found=bool(refit.finite_candidate_found),
         global_optimum_certified=bool(refit.global_optimum_certified),
@@ -403,7 +401,6 @@ def evaluate_raw_fusion_candidate(
     partition_tolerance = _effective_bic_partition_tol(selection_options)
     partition = extract_certified_fusion_partition(
         fit,
-        graph=graph,
         tolerance=partition_tolerance,
         mutation_ids=tuple(str(value) for value in data.mutation_ids),
     )
