@@ -65,6 +65,7 @@ from .starts import (
     compute_scalar_well_start_bank_torch,
 )
 from .torch_backend import (
+    DEFAULT_EDGE_WORK_BYTES,
     as_runtime_tensor,
     dtype_name,
     graph_adjoint_edges_in_dtype,
@@ -671,11 +672,29 @@ def _project_state_dual(
         return None
     if tuple(state.dual.shape) != (int(num_edges), int(num_regions)):
         return None
-    dual = state.dual.to(dtype=runtime.dtype, device=runtime.device)
     if int(num_edges) == 0:
         return torch.zeros(
             (0, int(num_regions)), dtype=runtime.dtype, device=runtime.device
         )
+    # Projection is independent for each edge.  Bound transfer and radius/norm
+    # temporaries as in streamed ALM; a full FP64 conversion plus these arrays
+    # can otherwise exhaust memory before the already-streamed solve begins.
+    element_size = torch.empty((), dtype=runtime.dtype).element_size()
+    chunk_edges = max(1, DEFAULT_EDGE_WORK_BYTES // max(int(num_regions) * element_size, 1))
+    if int(num_edges) > chunk_edges:
+        projected = torch.empty(
+            (int(num_edges), int(num_regions)), dtype=runtime.dtype, device=runtime.device,
+        )
+        for start in range(0, int(num_edges), chunk_edges):
+            edge_slice = slice(start, min(start + chunk_edges, int(num_edges)))
+            dual = state.dual[edge_slice].to(dtype=runtime.dtype, device=runtime.device)
+            radius = float(lambda_value) * edge_w[edge_slice].to(
+                dtype=runtime.dtype, device=runtime.device,
+            )
+            projected[edge_slice].copy_(project_dual_ball(dual, radius))
+            del dual, radius
+        return projected
+    dual = state.dual.to(dtype=runtime.dtype, device=runtime.device)
     radius = float(lambda_value) * edge_w.to(dtype=runtime.dtype, device=runtime.device)
     return project_dual_ball(dual, radius)
 
