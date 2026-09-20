@@ -837,10 +837,9 @@ def _profile_clonal_centers(
     """
     labels = np.asarray(labels, dtype=np.int64)
     count = int(np.asarray(centers).shape[0])
-    feasible = np.asarray([
-        np.any(labels == cluster) and np.all(eligible_rows[labels == cluster])
-        for cluster in range(count)
-    ], dtype=bool)
+    occupied = np.bincount(labels, minlength=count)
+    ineligible = np.bincount(labels[~np.asarray(eligible_rows, dtype=bool)], minlength=count)
+    feasible = (occupied > 0) & (ineligible == 0)
     choices = np.flatnonzero(feasible)
     if not choices.size:
         raise ClonalPartitionInfeasibleError(
@@ -849,12 +848,18 @@ def _profile_clonal_centers(
         )
     fixed_losses = np.bincount(labels, weights=clonal_row_losses, minlength=count)
     free_losses = np.asarray(free_block_losses, dtype=np.float64)
-    # Sum the remaining blocks directly: this also avoids inf - inf when a
-    # failed free fit belongs to the block that will instead be fixed at one.
-    branch_losses = np.asarray([
-        fixed_losses[cluster] + np.sum(free_losses[np.arange(count) != cluster])
-        for cluster in choices
-    ])
+    # Only fixing the sole failed free block can recover a finite branch.
+    # Preserve direct, ordered leave-one-out sums for finite blocks: total
+    # minus one (or prefix/suffix) sums change rounding and possibly the winner.
+    # K is normally small; avoiding that change is worth the remaining O(K^2).
+    failed = np.flatnonzero(~np.isfinite(free_losses))
+    branch_losses = np.full(choices.size, np.inf)
+    for position, cluster in enumerate(choices):
+        if failed.size and (failed.size > 1 or cluster != failed[0]):
+            continue
+        branch_losses[position] = (
+            fixed_losses[cluster] + np.sum(np.delete(free_losses, cluster))
+        )
     branch_losses = np.where(np.isfinite(branch_losses), branch_losses, np.inf)
     chosen = int(choices[int(np.argmin(branch_losses))])
     profiled = np.array(centers, dtype=np.float64, copy=True)

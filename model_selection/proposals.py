@@ -11,17 +11,14 @@ from ..core.fusion.graph_ops import (
     build_likelihood_noise_regularized_adaptive_tensor_graph,
     tensor_graph_to_pairwise_graph,
 )
+from ..core.fusion.offload import offload_raw_fit_to_cpu
 from ..core.fusion.partition_starts import PartitionCandidate
 from ..core.fusion.solver import (
     escape_emission_breakpoint_solver_state,
     objective_shape_for_data,
 )
 from ..core.fusion.types import (
-    CompressedEdgeCertificate,
-    DenseEdgeCertificate,
-    DenseWarmState,
     ExactSolverResourceLimit,
-    PrimalOnlyWarmState,
     PreparedProblem,
     SolverState,
 )
@@ -161,95 +158,6 @@ def clone_start(start: StartArray) -> StartArray:
     return np.asarray(start).copy()
 
 
-def offload_raw_fit_to_cpu(fit: RawFit) -> RawFit:
-    """Move all persistent state and certificate payloads off the accelerator.
-
-    Online model selection retains several certified and failed candidates so
-    later proposals can warm-start from either side of an observed bracket.
-    A complete-graph dual has shape E x S and can exceed a GiB for large
-    cohorts. Keeping every historical dual on CUDA makes memory scale with the
-    number of evaluated lambdas even though only one state is used at a time.
-    One tensor memo preserves aliases across state, warm hints and the separate
-    terminal witness. Host storage preserves dtype, values and evidence; solve
-    provenance still describes the actual computation device.
-    """
-
-    cpu_tensors: dict[
-        tuple[
-            torch.device,
-            torch.dtype,
-            torch.layout,
-            int,
-            int,
-            tuple[int, ...],
-            tuple[int, ...],
-        ],
-        torch.Tensor,
-    ] = {}
-
-    def to_cpu(tensor: torch.Tensor | None) -> torch.Tensor | None:
-        if tensor is None:
-            return None
-        detached = tensor.detach()
-        if detached.numel() == 0:
-            return detached.to(device="cpu")
-        alias_key = (
-            detached.device,
-            detached.dtype,
-            detached.layout,
-            int(detached.untyped_storage().data_ptr()),
-            int(detached.storage_offset()),
-            tuple(int(value) for value in detached.shape),
-            tuple(int(value) for value in detached.stride()),
-        )
-        cached = cpu_tensors.get(alias_key)
-        if cached is None:
-            cached = detached.to(device="cpu")
-            cpu_tensors[alias_key] = cached
-        return cached
-
-    def certificate_to_cpu(certificate):
-        if isinstance(certificate, DenseEdgeCertificate):
-            return replace(certificate, dual=to_cpu(certificate.dual))
-        if isinstance(certificate, CompressedEdgeCertificate):
-            return replace(
-                certificate,
-                labels=to_cpu(certificate.labels),
-                centers=to_cpu(certificate.centers),
-                internal_edge_ids=to_cpu(certificate.internal_edge_ids),
-                internal_dual=to_cpu(certificate.internal_dual),
-            )
-        return certificate
-
-    state = fit.state
-    if state is not None:
-        warm_state = state.warm_state
-        if isinstance(warm_state, DenseWarmState):
-            warm_state = replace(
-                warm_state,
-                phi=to_cpu(warm_state.phi),
-                dual=to_cpu(warm_state.dual),
-            )
-        elif isinstance(warm_state, PrimalOnlyWarmState):
-            warm_state = replace(
-                warm_state,
-                phi=to_cpu(warm_state.phi),
-                structure_hint=to_cpu(warm_state.structure_hint),
-                certificate_hint=certificate_to_cpu(warm_state.certificate_hint),
-            )
-        state = replace(
-            state,
-            phi=to_cpu(state.phi),
-            dual=to_cpu(state.dual),
-            warm_state=warm_state,
-            certificate=certificate_to_cpu(state.certificate),
-        )
-    return replace(
-        fit, state=state,
-        certificate=replace(fit.certificate, witness=certificate_to_cpu(fit.certificate.witness)),
-    )
-
-
 def escape_emission_breakpoint_retry_state(
     state: SolverState | None,
     *,
@@ -299,8 +207,9 @@ def solver_retry_fit_options(
         fit_options,
         # The large multi-region failure audit showed that 18/75 continuation
         # reduced the residual materially but stopped above the unchanged KKT
-        # gate.  Give the one terminal same-lambda continuation 36/150 or six
-        # profile-sized budgets.  Solves still stop early after certification.
+        # gate. The terminal same-lambda continuation gets at least 144 outer
+        # and 150 inner iterations (24x/6x the configured budgets). Solves still
+        # stop early after certification.
         solver=replace(
             solver,
             outer_max_iter=max(int(solver.outer_max_iter) * 24, 144),
@@ -317,8 +226,8 @@ def solver_retry_fit_options(
             # inner convergence measure plateaus far above true stationarity
             # at the profile tolerance (measured residual 0.07-0.3 against a
             # 0.004 gate), while the same solve driven to 5e-5 certifies.
-            # Per-attempt certification at the tighter tolerance is a
-            # strictly harder admission, never a weaker one.
+            # The tighter solve tolerance does not change admission: the
+            # separate certification_tolerance retains the original gate.
             tolerance=min(float(solver.tolerance), 5e-5),
             # Admission stays at the immutable contract gate even though the
             # recovery solve iterates far deeper.

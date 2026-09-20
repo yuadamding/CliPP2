@@ -772,6 +772,7 @@ def refine_graph_fusion_dual_certificate_torch(
         edge_work_bytes=edge_work_bytes,
         _progress_out=progress,
     )
+    full_certificate_audit_passes = 1
     incoming_merit = progress.get("cone_violation_norm", float("inf"))
     if num_edges == 0 or lambda_value <= 0.0:
         dual = torch.zeros((num_edges, num_regions), dtype=phi.dtype, device=phi.device)
@@ -781,6 +782,7 @@ def refine_graph_fusion_dual_certificate_torch(
             edge_w=edge_w, lambda_value=lambda_value, atol=atol,
             edge_work_bytes=edge_work_bytes,
         )
+        full_certificate_audit_passes += 1
         return {
             "dual": dual, "diag": after_diag,
             "status": "zero_penalty_no_dual_needed", "dual_refined": False,
@@ -788,6 +790,7 @@ def refine_graph_fusion_dual_certificate_torch(
             "stationarity_before": before_diag.stationarity_residual,
             "stationarity_after": after_diag.stationarity_residual,
             "refinement_iterations": 0,
+            "full_certificate_audit_passes": full_certificate_audit_passes,
         }
 
     chunk_size = _edge_chunk_size(
@@ -814,6 +817,7 @@ def refine_graph_fusion_dual_certificate_torch(
             "stationarity_before": before_diag.stationarity_residual,
             "stationarity_after": before_diag.stationarity_residual,
             "refinement_iterations": 0,
+            "full_certificate_audit_passes": full_certificate_audit_passes,
         }
 
     dual = torch.zeros((num_edges, num_regions), dtype=phi.dtype, device=phi.device)
@@ -848,6 +852,7 @@ def refine_graph_fusion_dual_certificate_torch(
         edge_work_bytes=edge_work_bytes,
         _progress_out=progress,
     )
+    full_certificate_audit_passes += 1
     best_dual = dual.clone()
     best_diag = analytic_diag
     best_residual = analytic_diag.backward_error_kkt_residual
@@ -918,6 +923,7 @@ def refine_graph_fusion_dual_certificate_torch(
                 edge_work_bytes=edge_work_bytes,
                 _progress_out=progress,
             )
+            full_certificate_audit_passes += 1
             residual = diag.backward_error_kkt_residual
             merit = progress.get("cone_violation_norm", float("inf"))
             if np.isfinite(residual) and (residual, merit) < (best_residual, best_merit):
@@ -950,6 +956,7 @@ def refine_graph_fusion_dual_certificate_torch(
         "stationarity_before": before_diag.stationarity_residual,
         "stationarity_after": best_diag.stationarity_residual,
         "refinement_iterations": refinement_iterations,
+        "full_certificate_audit_passes": full_certificate_audit_passes,
     }
 
 
@@ -1016,7 +1023,15 @@ def _complete_graph_isotropic_box_qp_torch(
             q,
             max(int(max_iter), 16),
         )
-    if U.device.type == "cpu" and U.ndim == 2 and int(U.shape[1]) == 1:
+    # The scalar breakpoint cumulative slope can cancel to zero in float32
+    # when rho*N dominates h. Use the centered, float64-workspace bisection
+    # for that dtype; retain the CPU breakpoint optimization in float64.
+    if (
+        U.device.type == "cpu"
+        and U.dtype == torch.float64
+        and U.ndim == 2
+        and int(U.shape[1]) == 1
+    ):
         exact = _complete_graph_scalar_box_qp_cpu(
             U=U,
             h=h,
@@ -1387,8 +1402,10 @@ def solve_majorized_subproblem_alm_torch(
                         norm / radius[:, None].clamp_min(torch.finfo(runtime.dtype).tiny),
                     )
                     scaled_dual[edge_slice].copy_(initial_chunk / projection_scale / float(rho))
+                    del radius, norm, projection_scale
                 else:
                     scaled_dual[edge_slice].copy_(initial_chunk)
+                del initial_chunk
         # Only the scaled dual and previous/current split remain edge-sized.
         z_state = torch.empty_like(scaled_dual)
         for edge_slice in _edge_slices(num_edges, chunk_size):
@@ -1404,6 +1421,7 @@ def solve_majorized_subproblem_alm_torch(
                 scaled_dual = initial_dual / rho
             else:
                 scaled_dual = initial_dual
+            del initial_dual
         else:
             scaled_dual = torch.zeros((num_edges, num_regions), dtype=runtime.dtype, device=runtime.device)
         shrink_radius = radius / rho
@@ -1601,6 +1619,8 @@ def solve_majorized_subproblem_alm_torch(
                 del audit_adjoint
         else:
             del primal_residual, z_new
+            if check_due and not final_iteration:
+                del actual_dual
 
     if streamed:
         # Release split storage before materializing the sole outgoing dual.

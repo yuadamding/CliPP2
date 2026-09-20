@@ -1046,6 +1046,9 @@ def _refine_certificate(
         certificate=refined_certificate,
         diagnostics=dense["diag"],
         status=str(dense["status"]),
+        work_counters=WorkCounters(
+            full_certificate_audit_passes=int(dense["full_certificate_audit_passes"]),
+        ),
     )
 
 
@@ -1097,4 +1100,5 @@ def certify(
         certificate=witness,
         diagnostics=diagnostics,
         status="audited",
+        work_counters=WorkCounters(full_certificate_audit_passes=1),
     )

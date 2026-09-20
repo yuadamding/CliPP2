@@ -47,6 +47,7 @@ from .certificates import (
     certify,
 )
 from .graph import resolve_pairwise_fusion_graph
+from .offload import offload_raw_fit_to_cpu as _offload_witness_fit
 from .graph_ops import (
     build_complete_adaptive_tensor_graph,
     dense_complete_solver_memory_preflight,
@@ -203,6 +204,7 @@ def _terminal_backward_error_audit_float64(
 
     tol: float,
     _shared_out: dict | None = None,
+    _work_out: dict[str, WorkCounters] | None = None,
 ) -> tuple[KKTDiagnostics, str, bool, float]:
     """Audit the unchanged terminal witness with float64 backward error."""
 
@@ -265,6 +267,10 @@ def _terminal_backward_error_audit_float64(
         refine=False,
         _adjoint_out=adjoint_out,
     )
+    if _work_out is not None:
+        # Record completed primitive work even if later objective/box or reuse
+        # bookkeeping fails. Partial audits never reach this point.
+        _work_out["work"] = result.work_counters
     diagnostics = _with_explicit_primal_check(result.diagnostics, problem, phi64)
     _, _, objective64 = (
         _objective_value_from_mutation_region_terms_torch(
@@ -1644,7 +1650,7 @@ def _fit_from_start(
         phi, dual, dual_kkt, certificate, warm_state, inner_solver,
         dual_start_is_actual, objective, fit_loss, current_mutation_region_terms,
     )
-    del phi, dual, dual_kkt, certificate, warm_state, inner_solver
+    del phi, dual, dual_kkt, certificate, warm_state, inner_solver, state_dual
     del dual_start_is_actual, objective, fit_loss, current_mutation_region_terms
     for outer_iter in range(max(int(outer_max_iter), 1)):
         iterations = outer_iter + 1
@@ -1695,13 +1701,16 @@ def _fit_from_start(
                 eps=eps,
                 tol=cert_tol,
             )
-            forcing_diag = certify(
+            forcing_attempt = certify(
                 problem=certificate_problem,
                 phi=iterate.phi,
                 gradient=forcing_gradient,
                 witness=forcing_certificate,
                 refine=False,
-            ).diagnostics
+            )
+            work_counters = work_counters + forcing_attempt.work_counters
+            forcing_diag = forcing_attempt.diagnostics
+            del forcing_attempt, forcing_certificate
             forcing_residual = (
                 forcing_diag.backward_error_kkt_residual
                 if use_backward_error_progress
@@ -2072,6 +2081,7 @@ def _fit_from_start(
                         damped_state[4], theta_objective, theta_fit_loss,
                         theta_mutation_region_terms,
                     )
+                    del damped_state
                     inner_converged = False
                     break
                 theta *= 0.5
@@ -2079,6 +2089,10 @@ def _fit_from_start(
                 break
             scale *= 2.0
 
+        # The accepted candidate owns its state. Drop rejected trial and start
+        # aliases before allocating periodic/terminal certificate workspaces.
+        del inner_result, surrogate_certificate, dual_kkt_trial
+        del inner_dual_start, inner_phi_start
         if not accepted:
             rejected_outer_steps += 1
         iterate = candidate
@@ -2149,10 +2163,10 @@ def _fit_from_start(
                     else None
                 ),
             )
-            if should_refine:
-                work_counters = work_counters + observed_refinement.work_counters
+            work_counters = work_counters + observed_refinement.work_counters
             iterate.certificate = observed_refinement.certificate
             outer_diag = observed_refinement.diagnostics
+            del observed_start, observed_refinement
             legacy_stop_kkt_residual = float(outer_diag.kkt_residual)
             componentwise_stop_kkt_residual = float(
                 outer_diag.backward_error_kkt_residual
@@ -2282,6 +2296,7 @@ def _fit_from_start(
             final_certificate_refinement.diagnostics, problem, iterate.phi,
         )
     else:
+        audit_work = {}
         (
             admission_diagnostics,
             audit_gradient_scope,
@@ -2293,6 +2308,7 @@ def _fit_from_start(
             certificate=iterate.certificate,
             lambda_value=lambda_value,
             tol=cert_tol,
+            _work_out=audit_work,
         )
         certificate_audit_dtype = "float64"
         gradient_scope = audit_gradient_scope
@@ -2300,9 +2316,7 @@ def _fit_from_start(
             directional_kink_admissible
             and audit_directional_admissible
         )
-        work_counters = work_counters + WorkCounters(
-            full_certificate_audit_passes=1
-        )
+        work_counters = work_counters + audit_work["work"]
     authoritative_kkt_residual = float(
         admission_diagnostics.backward_error_kkt_residual
     )
@@ -2476,13 +2490,19 @@ def _fit_prepared_box(
     warm_state: SolverState | None = None,
     phi_start: np.ndarray | torch.Tensor | None = None,
     include_default_starts: bool = True,
+    _source_validated: bool = False,
 ) -> RawFit:
     """Solve a lambda on one frozen objective; no competing data/graph/runtime.
 
     Warm state and starts may change numerical effort, never the compiled
     likelihood, adaptive graph, epsilon, or float64 source authority.
     """
-    problem.validate()
+    if _source_validated:
+        # Only fit_prepared's freshly constructed witness branches use this
+        # path. Their source was fully checked at that public boundary.
+        problem.assert_runtime_unchanged()
+    else:
+        problem.validate()
     data = problem.source_data
     _validate_solver_tolerance(solver_options.tolerance)
     _certificate_options(solver_options, problem.runtime.dtype)
@@ -2557,9 +2577,14 @@ def _fit_prepared_box(
     return _finalize_precision_polish(polished, best_artifacts, problem)
 
 
-def _prepare_witness_problem(problem: PreparedProblem, witness_index: int) -> PreparedProblem:
+def _prepare_witness_problem(
+    problem: PreparedProblem, witness_index: int, *, _source_validated: bool = False,
+) -> PreparedProblem:
     """Make one immutable branch while sharing original observed tensors/graph."""
-    problem.validate()
+    if _source_validated:
+        problem.assert_runtime_unchanged()
+    else:
+        problem.validate()
     lower, upper = make_clonal_witness_bounds(
         problem.source_model.lower, problem.source_model.upper, witness_index,
     )
@@ -2574,52 +2599,6 @@ def _prepare_witness_problem(problem: PreparedProblem, witness_index: int) -> Pr
             lower=box.lower, upper=box.upper,
         ),
         _tensor_snapshot=(),
-    )
-
-
-def _offload_witness_fit(fit: RawFit) -> RawFit:
-    """Retain at most one incumbent on CPU; preserve aliased certificate storage."""
-    tensors = {}
-
-    def host(tensor):
-        if tensor is None:
-            return None
-        key = (
-            tensor.device, tensor.dtype, tensor.untyped_storage().data_ptr(),
-            tensor.storage_offset(), tuple(tensor.shape), tuple(tensor.stride()),
-        )
-        if key not in tensors:
-            tensors[key] = tensor.detach().cpu()
-        return tensors[key]
-
-    def certificate_host(certificate):
-        if isinstance(certificate, DenseEdgeCertificate):
-            return replace(certificate, dual=host(certificate.dual))
-        if isinstance(certificate, CompressedEdgeCertificate):
-            return replace(
-                certificate, labels=host(certificate.labels), centers=host(certificate.centers),
-                internal_edge_ids=host(certificate.internal_edge_ids),
-                internal_dual=host(certificate.internal_dual),
-            )
-        return certificate
-
-    state = fit.state
-    if state is not None:
-        warm = state.warm_state
-        if isinstance(warm, DenseWarmState):
-            warm = replace(warm, phi=host(warm.phi), dual=host(warm.dual))
-        elif isinstance(warm, PrimalOnlyWarmState):
-            warm = replace(
-                warm, phi=host(warm.phi), structure_hint=host(warm.structure_hint),
-                certificate_hint=certificate_host(warm.certificate_hint),
-            )
-        state = replace(
-            state, phi=host(state.phi), dual=host(state.dual), warm_state=warm,
-            certificate=certificate_host(state.certificate),
-        )
-    return replace(
-        fit, state=state,
-        certificate=replace(fit.certificate, witness=certificate_host(fit.certificate.witness)),
     )
 
 
@@ -2647,7 +2626,7 @@ class _WitnessAuditCache:
     _supported: bool = False
     _result: tuple | None = None
 
-    def audit(self, branch, incumbent, *, lambda_value, tolerance):
+    def audit(self, branch, incumbent, *, lambda_value, tolerance, _work_out=None):
         problem = self.problem
         problem.assert_runtime_unchanged()
         branch.assert_runtime_unchanged()
@@ -2704,11 +2683,13 @@ class _WitnessAuditCache:
         work = WorkCounters()
         if self._result is None:
             captured = {}
+            audit_work = {} if _work_out is None else _work_out
             diagnostics, _, _, objective = _terminal_backward_error_audit_float64(
                 problem=problem,
                 phi=torch.tensor(incumbent.phi, device=problem.runtime.device),
                 certificate=certificate, lambda_value=lambda_value, tol=tolerance,
                 _shared_out=captured,
+                _work_out=audit_work,
             )
             grad = captured["gradient"]
             adj = captured["adjoint"]
@@ -2737,7 +2718,7 @@ class _WitnessAuditCache:
                 diagnostics.box_residual,
             )
             self._result = stationarity, directional, common, objective
-            work = WorkCounters(full_certificate_audit_passes=1)
+            work = audit_work["work"]
         stationarity, directional, common, objective = self._result
         index = branch.optimization_box.witness_index
         residuals = (*common, float(stationarity[index]))
@@ -2765,30 +2746,34 @@ def _audit_reusable_witness(
     if not incumbent.certificate.admissible or not np.all(incumbent.phi[index] == 1.0):
         return False, WorkCounters(), None
     if shared_cache is not None:
+        audit_work = {}
         try:
             shared = shared_cache.audit(
                 branch, incumbent, lambda_value=lambda_value, tolerance=tolerance,
+                _work_out=audit_work,
             )
             if shared is not None:
                 return shared
         except (RuntimeError, MemoryError, FloatingPointError, ValueError) as error:
-            return False, WorkCounters(), f"{type(error).__name__}: {error}"
+            return False, audit_work.get("work", WorkCounters()), f"{type(error).__name__}: {error}"
     if not (
         has_proven_convex_observed_loss(branch.source_model, eps=branch.eps)
         or has_global_supporting_tangent(branch.source_model, incumbent.phi, eps=branch.eps)
     ):
         return False, WorkCounters(), None
+    audit_work = {}
     try:
         diagnostics, _, directional, objective = _terminal_backward_error_audit_float64(
             problem=branch,
             phi=torch.tensor(incumbent.phi, device=branch.runtime.device),
             certificate=incumbent.certificate.witness,
             lambda_value=lambda_value, tol=tolerance,
+            _work_out=audit_work,
         )
     except (RuntimeError, MemoryError, FloatingPointError, ValueError) as error:
         # This optional proof must not replace a working full solve with an
-        # audit-only failure. A partial audit has no complete work receipt.
-        return False, WorkCounters(), f"{type(error).__name__}: {error}"
+        # audit-only failure. Keep completed audits, but not partial primitives.
+        return False, audit_work.get("work", WorkCounters()), f"{type(error).__name__}: {error}"
     # Reusing a point must not move its objective, even by a refit or projection.
     covered = bool(
         directional and diagnostics.box_residual == 0.0
@@ -2796,7 +2781,7 @@ def _audit_reusable_witness(
         and diagnostics.backward_error_kkt_residual <= 5.0 * tolerance
         and objective == incumbent.objective.total
     )
-    return covered, WorkCounters(full_certificate_audit_passes=1), None
+    return covered, audit_work["work"], None
 
 
 def fit_prepared(
@@ -2860,7 +2845,7 @@ def fit_prepared(
         attempted.append(index)
         candidate = None
         try:
-            branch = _prepare_witness_problem(problem, index)
+            branch = _prepare_witness_problem(problem, index, _source_validated=True)
             if incumbent is not None:
                 # Every audit, successful or rejected, is counted once. An
                 # unsuccessful certificate never suppresses the normal solve.
@@ -2900,6 +2885,7 @@ def fit_prepared(
                 warm_state=None if separable is not None else branch_warm,
                 phi_start=separable[1] if separable is not None else phi_start,
                 include_default_starts=False if separable is not None else include_default_starts,
+                _source_validated=True,
             )
             total_work = total_work + candidate.work
             validate_clonal_feasibility(candidate.phi, source.lower, source.upper)

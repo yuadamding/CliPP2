@@ -181,6 +181,13 @@ BackendWarmState: TypeAlias = DenseWarmState | PrimalOnlyWarmState
 
 @dataclass(frozen=True, slots=True)
 class WorkCounters:
+    """Completed observed-objective, full-original-graph certificate audits.
+
+    Count every dense/compressed audit, including unsuccessful residual tests
+    and zero-penalty audits. Exclude inner surrogate diagnostics, partial
+    workset checks, aborted primitives and cache hits that perform no audit.
+    """
+
     full_certificate_audit_passes: int = 0
 
     def __add__(self, other: "WorkCounters") -> "WorkCounters":
