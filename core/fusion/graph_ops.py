@@ -103,6 +103,12 @@ def estimate_dense_complete_solver_peak_bytes(
     value_bytes = _dtype_nbytes(dtype)
     edge_value_bytes = edge_count * region_count * value_bytes
     estimate = node_count * region_count * value_bytes * 8
+    if dtype == torch.float32 and node_count:
+        # The stable QP root promotes only node-sized work to float64. Budget
+        # its eager fallback too: original caller tensors, five promoted
+        # inputs, denominator/scales and overlapping displacement/clamp work.
+        # Compiled fusion may use less; do not rely on spare edge allowances.
+        estimate = (20 * node_count * region_count + 16 * region_count + 1) * 8
     if include_dual or include_split:
         if edge_value_bytes <= COMPLETE_ADMM_EDGE_WORK_BYTES:
             # The historical dense ALM loop can overlap the multiplier, prior

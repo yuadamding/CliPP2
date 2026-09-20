@@ -1101,6 +1101,32 @@ def _complete_graph_isotropic_box_qp_bisection(
     q: torch.Tensor,
     max_iter: int,
 ) -> torch.Tensor:
+    if U.dtype == torch.float32:
+        # sum(x)-S loses the root sign when rho*N dominates h. In float64
+        # workspace solve the equivalent mean-centered equation sum(x-t)=0,
+        # t=S/N, without subtracting large nearly equal totals. Promote the
+        # original coefficients before arithmetic; do not assume sum(q)=0.
+        # Only this O(N*R) workspace changes, not raw primal/edge dtype or gates.
+        U, h, lower, upper, rho_t, q = (
+            value.to(dtype=torch.float64) for value in (U, h, lower, upper, rho_t, q)
+        )
+        denom = h + rho_t * float(U.shape[0])
+        scaled_h, scaled_q = h / denom, rho_t * q / denom
+        lo, hi = torch.mean(lower, dim=0), torch.mean(upper, dim=0)
+        for _ in range(max(int(max_iter), 16)):
+            mid = 0.5 * (lo + hi)
+            displacement = scaled_h * (U - mid.unsqueeze(0)) + scaled_q
+            residual = torch.sum(torch.minimum(
+                torch.maximum(displacement, lower - mid.unsqueeze(0)),
+                upper - mid.unsqueeze(0),
+            ), dim=0)
+            move_right = residual > 0.0
+            lo = torch.where(move_right, mid, lo)
+            hi = torch.where(move_right, hi, mid)
+        mid = 0.5 * (lo + hi)
+        displacement = scaled_h * (U - mid.unsqueeze(0)) + scaled_q
+        return torch.minimum(torch.maximum(mid.unsqueeze(0) + displacement, lower), upper).to(torch.float32)
+
     num_mutations = int(U.shape[0])
     rhs = h * U + rho_t * q
     denom = h + rho_t * float(num_mutations)
@@ -1147,12 +1173,23 @@ def _complete_graph_isotropic_box_qp_compiled_impl(
 
 
 # Multi-region path fits invoke this bounded QP many thousands of times.  A
-# shape-specific Inductor kernel amortizes compilation there, while the common
-# one-region workflow stays eager to avoid paying its cold-start cost.
+# dynamic-shape Inductor kernel reuses shapes instead of spending Dynamo's
+# shared recompilation budget on each tumor. The common one-region workflow
+# stays eager to avoid paying its cold-start cost.
+# Dtype, layout and execution-mode changes can still require new compilations;
+# application failure records remain specific to their exact metadata below.
+_CUDA_BOX_QP_DYNAMIC = True
 _cuda_box_qp_compile_stats: dict[tuple, dict] = {}
 _cuda_box_qp_active_signature: ContextVar[tuple | None] = ContextVar(
     "cuda_box_qp_active_signature", default=None,
 )
+
+
+def _cuda_autocast_metadata() -> tuple[bool, torch.dtype]:
+    """Read CUDA autocast metadata through the supported Torch >=2.0 APIs."""
+    if hasattr(torch, "get_autocast_dtype"):
+        return torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
+    return torch.is_autocast_enabled(), torch.get_autocast_gpu_dtype()
 
 
 def _cuda_box_qp_signature(args) -> tuple:
@@ -1162,7 +1199,7 @@ def _cuda_box_qp_signature(args) -> tuple:
         tuple((value.dtype, value.device, tuple(value.shape), tuple(value.stride()),
                value.requires_grad) for value in args[:-1]),
         int(args[-1]), torch.is_grad_enabled(), torch.is_inference_mode_enabled(),
-        torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda"),
+        *_cuda_autocast_metadata(),
     )
 
 
@@ -1201,7 +1238,7 @@ _compiled_complete_graph_isotropic_box_qp_cuda = torch.compile(
     _complete_graph_isotropic_box_qp_compiled_impl,
     backend=_box_qp_inductor_backend,
     fullgraph=True,
-    dynamic=False,
+    dynamic=_CUDA_BOX_QP_DYNAMIC,
 )
 
 

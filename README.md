@@ -145,13 +145,10 @@ zero; no output-time CCF reassignment or rounding creates the clonal center.
 
 ## Regression tests
 
-Install the test dependencies with `pip install -e '.[test]'`, then run
-`python -m pytest -q tests`. The compact, repository-local suite checks graph
-preservation, clonal witness search and audited reuse, constrained refits,
-failure handling, unchanged scoring, and four-file output reconstruction.
-The larger development suite remains outside this repository.
+Regression and CUDA qualification suites are maintained outside this compact
+repository. Install their dependencies with `pip install -e '.[test]'` and run
+the separately maintained suite against the intended source revision.
 
-On an allocated CUDA worker, use
-`CLIPP2_CUDA_TESTS=1 python -m pytest -q tests` to include actual CPU/CUDA
-integration checks. Explicit CUDA qualification fails if CUDA is unavailable;
-ordinary CPU runs report CUDA skips, which are not GPU qualification.
+Run CUDA qualification on an allocated LSF GPU with `CLIPP2_CUDA_TESTS=1`.
+Explicit CUDA qualification fails if CUDA is unavailable; ordinary CPU runs
+report CUDA skips, which are not GPU qualification.
