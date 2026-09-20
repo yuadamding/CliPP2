@@ -2860,9 +2860,20 @@ def fit_prepared(
                     continue
             branch_warm = warm_state
             if branch_warm is not None and branch_warm.objective_spec_hash != branch.objective_spec_hash:
-                # A point is reusable across boxes, but its dual/KKT witness is not.
+                # A guided multiplier on this exact original objective remains
+                # a legal initialization after fixing one primal row. Edge-dual
+                # balls depend on graph/lambda, not the witness box;
+                # _fit_from_start projects it at the target lambda. This is NOT
+                # a transported certificate: discard all old certificate/warm
+                # metadata and independently audit the new box. Unknown source
+                # identities retain the existing primal-only fallback.
+                source_bound = (
+                    problem.optimization_box.witness_index is None
+                    and branch_warm.objective_spec_hash == problem.objective_spec_hash
+                )
                 branch_warm = SolverState(
-                    phi=branch_warm.phi, dual=None, previous_lambda=branch_warm.previous_lambda,
+                    phi=branch_warm.phi, dual=branch_warm.dual if source_bound else None,
+                    previous_lambda=branch_warm.previous_lambda,
                     objective_spec_hash=branch.objective_spec_hash,
                 )
             candidate = _fit_prepared_box(
