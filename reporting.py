@@ -25,7 +25,7 @@ from .core.objective import (
     compile_observed_model, make_base_objective_key, infer_integer_multiplicity_posterior_numpy,
 )
 from .io.data import (
-    CNFilterReport, TumorData, tumor_data_fingerprint, restore_immutable_record,
+    TumorData, tumor_data_fingerprint, restore_immutable_record,
     readonly_array,
 )
 from .model_selection.candidates import validate_candidate_identity
@@ -44,7 +44,7 @@ from .model_selection.types import (
 SelectedPartition = FusionPartition | DirectPartition
 OUTPUT_SUFFIXES = (
     "mutation_clusters.tsv", "cluster_centers.tsv",
-    "mutation_region_multiplicity.tsv", "excluded_mutations.tsv",
+    "mutation_region_multiplicity.tsv",
 )
 
 
@@ -85,12 +85,11 @@ def _source_identity() -> dict[str, object]:
 
 
 class RunPublication:
-    """Four no-clobber TSVs with an in-memory, hash-bound completion record.
+    """Three no-clobber TSVs with an in-memory, hash-bound completion record.
 
-    Exclusively creating the exclusion audit claims the tumor namespace before
-    any fitted tables are published. No manifest or lock sidecar is written.
-    A failed or interrupted attempt must use a new output directory to retry.
-    Existing files are never replaced or removed, including partial attempts.
+    The first final table claims the tumor namespace at publication. No manifest
+    or lock sidecar is written. Existing files are never replaced or removed,
+    so a partially published attempt must use a new output directory to retry.
     """
 
     def __init__(
@@ -142,15 +141,6 @@ class RunPublication:
     def _remember(self, path: Path) -> None:
         self.record["files"][path.name] = {"sha256": _file_hash(path), "size_bytes": path.stat().st_size}
 
-    def write_audit(self, report: CNFilterReport | None) -> None:
-        self._require_running()
-        path = self.outdir / f"{self.tumor_id}_excluded_mutations.tsv"
-        with path.open("x") as stream:
-            cn_filter_output_table(self.tumor_id, report).to_csv(stream, sep="\t", index=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        self._remember(path)
-
     def fail(self, error: BaseException) -> None:
         self._require_running()
         self.record.update(status="failed", finished_at=datetime.now(timezone.utc).isoformat(),
@@ -159,34 +149,24 @@ class RunPublication:
     def publish(self, tables: dict[str, pd.DataFrame], *, analysis: dict[str, object] | None = None) -> None:
         self._require_running()
         if {f"{suffix}.tsv" for suffix in tables} != set(OUTPUT_SUFFIXES):
-            raise ValueError("Publication requires all four analysis tables.")
+            raise ValueError("Publication requires exactly the three analysis tables.")
         # Qualification is supplied only after identity-valid table generation.
         # It describes the fit even if file publication subsequently fails.
         _json_bytes(analysis)
         self.record["analysis"] = analysis
         with tempfile.TemporaryDirectory(dir=self.outdir, prefix=".clipp2-tables-") as staging:
             paths = []
-            # Even standalone publication must acquire the exclusive audit
-            # claim before linking any fitted table. Concurrent losers cannot
-            # leave a mixture of two runs' outputs.
-            for suffix in ("excluded_mutations", *(name for name in tables if name != "excluded_mutations")):
-                table = tables[suffix]
-                path = Path(staging) / f"{self.tumor_id}_{suffix}.tsv"
+            # Fixed order makes mutation_clusters the exclusive claim regardless
+            # of caller dictionary order. A concurrent loser cannot mix tables.
+            for suffix in OUTPUT_SUFFIXES:
+                table = tables[suffix.removesuffix(".tsv")]
+                path = Path(staging) / f"{self.tumor_id}_{suffix}"
                 table.to_csv(path, sep="\t", index=False)
                 paths.append(path)
-            # Validate the early audit before publishing any fit table.
             for path in paths:
-                existing = self.record["files"].get(path.name)
-                if existing is not None and (
-                    _file_hash(path) != existing["sha256"]
-                    or _file_hash(self.outdir / path.name) != existing["sha256"]
-                ):
-                    raise ValueError("Early exclusion audit changed before publication.")
-            for path in paths:
-                if path.name not in self.record["files"]:
-                    destination = self.outdir / path.name
-                    os.link(path, destination)  # Atomic publication, never clobber.
-                    self._remember(destination)
+                destination = self.outdir / path.name
+                os.link(path, destination)  # Atomic publication, never clobber.
+                self._remember(destination)
             for name, identity in self.record["files"].items():
                 if _file_hash(self.outdir / name) != identity["sha256"]:
                     raise ValueError("Published output changed before completion.")
@@ -229,7 +209,7 @@ def _mutation_output_table(analysis: AnalysisSerialization) -> pd.DataFrame:
         region = str(region_id)
         # The selected fixed-partition refit is the authoritative reported CCF.
         # Keep the compact v0.2.1-style public name requested by downstream
-        # consumers; raw-fusion diagnostics remain in the audit tables.
+        # consumers; raw-fusion diagnostics remain in the API summary.
         table[f"phi_{region}"] = refit_phi[:, column]
     return table
 
@@ -243,42 +223,12 @@ def _cluster_output_table(analysis: AnalysisSerialization) -> pd.DataFrame:
             "tumor_id": np.repeat(data.tumor_id, partition.n_clusters),
             "cluster_label": np.arange(partition.n_clusters, dtype=int),
             "cluster_size": sizes,
-            "is_clonal": clonal_members(centers),
         }
     )
     for column, region_id in enumerate(data.region_ids):
         region = str(region_id)
         table[f"phi_{region}"] = centers[:, column]
     return table
-
-
-def _add_integer_multiplicity(
-    table: pd.DataFrame,
-    *,
-    data: TumorData,
-    phi: np.ndarray,
-    eps: float,
-    max_major_cn: int,
-) -> None:
-    posterior = infer_integer_multiplicity_posterior_numpy(data, phi, eps=eps)
-    count = posterior.candidate_count.reshape(-1)
-    table["multiplicity_candidates"] = [
-        ",".join(str(candidate) for candidate in range(1, int(size) + 1))
-        for size in count
-    ]
-    table["multiplicity_candidate_count"] = count
-    calls = pd.array(posterior.multiplicity_call.reshape(-1), dtype="Int64")
-    informative = posterior.informative.reshape(-1)
-    calls[(~informative) & (count > 1)] = pd.NA
-    table["multiplicity_call"] = calls
-    table["multiplicity_call_probability"] = posterior.map_probability.reshape(-1)
-    table["multiplicity_informative"] = informative
-    for candidate in range(1, max_major_cn + 1):
-        table[f"multiplicity_p{candidate}"] = (
-            posterior.posterior[..., candidate - 1].reshape(-1)
-            if candidate <= posterior.posterior.shape[-1]
-            else 0.0
-        )
 
 
 def _mutation_region_output_table(analysis: AnalysisSerialization) -> pd.DataFrame:
@@ -295,47 +245,24 @@ def _mutation_region_output_table(analysis: AnalysisSerialization) -> pd.DataFra
             "tumor_id": np.repeat(data.tumor_id, mutation_ids.shape[0]),
             "mutation_id": mutation_ids,
             "region_id": region_ids,
-            "cluster_label": np.repeat(analysis.output_labels, data.num_regions),
             "phi": refit_phi.reshape(-1),
             "major_cn": data.major_cn.reshape(-1),
             "minor_cn": data.minor_cn.reshape(-1),
         }
     )
-    _add_integer_multiplicity(table, data=data, phi=refit_phi,
-                              eps=analysis.raw_fit.provenance.likelihood_eps,
-                              max_major_cn=analysis.fit_config.max_major_cn)
+    posterior = infer_integer_multiplicity_posterior_numpy(
+        data, refit_phi, eps=analysis.raw_fit.provenance.likelihood_eps,
+    )
+    calls = pd.array(posterior.multiplicity_call.reshape(-1), dtype="Int64")
+    calls[(~posterior.informative.reshape(-1)) & (posterior.candidate_count.reshape(-1) > 1)] = pd.NA
+    table["multiplicity_call"] = calls
     mixed = data.cn_state_count.reshape(-1) > 1
     if np.any(mixed):
         # No single CN pair describes a mixture; do not publish the input
         # compiler's per-allele maxima as though they were a clonal CN state.
         table.loc[mixed, ["major_cn", "minor_cn"]] = np.nan
         table["mean_total_cn"] = data.mean_total_cn.reshape(-1)
-        table["cn_state_count"] = data.cn_state_count.reshape(-1)
     return table
-
-
-def cn_filter_output_table(
-    tumor_id: str,
-    report: CNFilterReport | None,
-) -> pd.DataFrame:
-    """One row per triggering mutation-region-reason, also when none remain."""
-
-    fields = (
-        "mutation_id",
-        "sample_id",
-        "segment_id",
-        "reason",
-        "n_distinct_cn_states",
-        "max_major_cn",
-    )
-    return pd.DataFrame(
-        [
-            {"tumor_id": tumor_id, **{name: getattr(record, name) for name in fields},
-             "major_cn_limit": report.max_major_cn}
-            for record in (() if report is None else report.records)
-        ],
-        columns=("tumor_id", *fields, "major_cn_limit"),
-    )
 
 
 def _write_fit_tables(analysis: AnalysisSerialization, publication: RunPublication) -> None:
@@ -343,9 +270,6 @@ def _write_fit_tables(analysis: AnalysisSerialization, publication: RunPublicati
         "mutation_clusters": _mutation_output_table(analysis),
         "cluster_centers": _cluster_output_table(analysis),
         "mutation_region_multiplicity": _mutation_region_output_table(analysis),
-        "excluded_mutations": cn_filter_output_table(
-            analysis.data.tumor_id, analysis.data.cn_filter_report
-        ),
     }
     publication.publish(tables, analysis=analysis.qualification)
 
@@ -827,7 +751,7 @@ def write_analysis_outputs(
     outdir: Path,
     publication: RunPublication,
 ) -> None:
-    """Write the retained-mutation tables and original-CN exclusion audit."""
+    """Write only the three compact tables documented in the README."""
     if publication.outdir.resolve() != Path(outdir).resolve() or publication.tumor_id != analysis.data.tumor_id:
         raise ValueError("Publication does not belong to this tumor and output directory.")
     _write_fit_tables(analysis, publication)
@@ -839,5 +763,4 @@ __all__ = [
     "SUMMARY_SCHEMA_VERSION",
     "analysis_summary",
     "write_analysis_outputs",
-    "cn_filter_output_table",
 ]

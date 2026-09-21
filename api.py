@@ -5,7 +5,7 @@ from pathlib import Path
 from time import perf_counter
 
 from .config import FitConfig, resolve_fit_config, _resolve_fit_options
-from .io.tumor_txt import NoEligibleSNVsError, load_tumor_txt
+from .io.tumor_txt import load_tumor_txt
 from .model_selection.search import select_model
 from .model_selection.types import SearchCandidate
 from .reporting import (
@@ -27,22 +27,11 @@ def process_tumor_bundle(
     options = _resolve_fit_options(resolve_fit_config() if fit_config is None else fit_config)
     input_sha256 = _file_hash(tumor_file)
     workflow = {"entrypoint": "process_tumor_bundle", "use_warm_starts": True}
-    try:
-        data = load_tumor_txt(tumor_file, eps=options.eps, max_major_cn=options.max_major_cn)
-    except NoEligibleSNVsError as error:
-        publication = RunPublication(outdir, error.tumor_id, input_file=tumor_file,
-                                     expected_input_sha256=input_sha256,
-                                     fit_config=options, workflow=workflow)
-        try:
-            publication.write_audit(error.cn_filter_report)
-        finally:
-            publication.fail(error)
-        raise
+    data = load_tumor_txt(tumor_file, eps=options.eps, max_major_cn=options.max_major_cn)
     publication = RunPublication(outdir, data.tumor_id, input_file=tumor_file,
                                  expected_input_sha256=input_sha256,
                                  fit_config=options, workflow=workflow)
     try:
-        publication.write_audit(data.cn_filter_report)
         selection_result = select_model(data=data, fit_config=options)
         # This boundary validates selected/refit/raw-parent identities once.
         analysis = AnalysisSerialization(data=data, input_file=tumor_file,

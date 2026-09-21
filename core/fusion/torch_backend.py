@@ -624,8 +624,9 @@ class _PreparedAuditAdjoint:
 def _prepare_audit_adjoint(*, phi, dual, edge_u, edge_v, edge_w, lambda_value,
                            dual_scale=1.0, edge_work_bytes=None):
     sources = (phi, dual, edge_u, edge_v, edge_w)
-    # Inference tensors have no version counter; retain the uncached audit.
-    if any(t.is_inference() for t in sources):
+    # The reduction itself becomes an inference tensor in this context, even
+    # when all source tensors were created outside it. Neither can be versioned.
+    if torch.is_inference_mode_enabled() or any(t.is_inference() for t in sources):
         return None
     snapshots = tuple(_audit_tensor_view(t) for t in sources)
     adjoint = graph_adjoint_edges_in_dtype(
@@ -1385,40 +1386,51 @@ class _BoxQPCompiledVariants:
     across valid dtype, singleton and layout variants. Each static guard family
     now owns a distinct code object, while dynamic non-singleton N/R dimensions
     still share compiled graphs. Eviction drops the callable, not global caches.
-    A failed owner keeps a tensor-free negative entry until that same bounded
-    family is evicted; detail-stat eviction alone never authorizes a retry.
+    Successful dynamic shapes share a family. Compiler failures suppress only
+    their exact metadata signature in a separate bounded negative cache;
+    detail-stat or successful-family eviction alone never authorizes a retry.
     """
 
     def __init__(self, implementation, *, max_families=32, backend=_box_qp_inductor_backend,
-                 family_key=_box_qp_guard_family):
+                 family_key=_box_qp_guard_family, failure_key=_cuda_box_qp_signature,
+                 max_failures=256):
         self.implementation = implementation
         self.backend = backend
         self.family_key = family_key
+        self.failure_key = failure_key
         self.max_families = max_families
+        self.max_failures = max_failures
         self.variants = OrderedDict()
+        self.failures = OrderedDict()
+        self.failure_cache_hits = 0
+        self.failure_cache_evictions = 0
 
     def failure(self, args):
-        family = self.family_key(args)
-        value = self.variants.get(family)
-        if isinstance(value, str):
-            self.variants.move_to_end(family)
+        if not self.failures:
+            return None
+        signature = self.failure_key(args)
+        value = self.failures.get(signature)
+        if value is not None:
+            self.failures.move_to_end(signature)
+            self.failure_cache_hits += 1
             return value
         return None
 
     def remember_failure(self, args, message):
         # Keep only text, never an exception/traceback retaining runtime tensors.
-        family = self.family_key(args)
-        self.variants.pop(family, None)
-        self.variants[family] = str(message)
-        if len(self.variants) > self.max_families:
-            self.variants.popitem(last=False)
+        signature = self.failure_key(args)
+        self.failures.pop(signature, None)
+        self.failures[signature] = str(message)[:3000]
+        if len(self.failures) > self.max_failures:
+            self.failures.popitem(last=False)
+            self.failure_cache_evictions += 1
+        # A failed trace can poison its wrapper. Release that callable, without
+        # disabling other shapes: the next healthy shape gets a fresh owner.
+        self.variants.pop(self.family_key(args), None)
 
     def __call__(self, *args):
         family = self.family_key(args)
         compiled = self.variants.pop(family, None)
-        if isinstance(compiled, str):
-            self.variants[family] = compiled
-            raise RuntimeError(f"CUDA compile family remains disabled: {compiled}")
         if compiled is None:
             original = self.implementation
             name = f"{original.__name__}_guards_{next(_box_qp_owner_ids)}"
@@ -1453,9 +1465,10 @@ def _run_compiled_box_qp(args, compiled, eager) -> torch.Tensor:
     signature = _cuda_box_qp_signature(args)
     stats = _cuda_box_qp_stats(signature)
     stats["calls"] += 1
-    failure = compiled.failure(args) if isinstance(compiled, _BoxQPCompiledVariants) else None
-    if failure is not None:
-        stats.update(failed=True, failure=failure)
+    if isinstance(compiled, _BoxQPCompiledVariants):
+        failure = compiled.failure(args)
+        # The negative cache, not evictable diagnostic detail, owns retry policy.
+        stats.update(failed=failure is not None, failure=failure)
     if stats["failed"]:
         stats["fallbacks"] += 1
         return eager(*args)
@@ -1504,9 +1517,11 @@ def _cuda_edge_phase_stats(signature):
 def _cuda_compile_accounting():
     """Tensor-free accounting, including signatures removed from bounded detail."""
     totals = {}
-    for name, store, evicted in (
-        ("box_qp", _cuda_box_qp_compile_stats, _cuda_box_qp_evicted_stats),
-        ("edge_phase", _cuda_edge_phase_compile_stats, _cuda_edge_phase_evicted_stats),
+    for name, store, evicted, owners in (
+        ("box_qp", _cuda_box_qp_compile_stats, _cuda_box_qp_evicted_stats,
+         (_compiled_complete_graph_isotropic_box_qp_cuda, _compiled_prepared_box_qp_cuda)),
+        ("edge_phase", _cuda_edge_phase_compile_stats, _cuda_edge_phase_evicted_stats,
+         (_compiled_admm_shrink_edge_cuda, _compiled_admm_dual_edge_cuda)),
     ):
         values = dict.fromkeys(("calls", "compile_attempts", "compilations", "recompilations",
                                 "executions", "fallbacks", "failed"), 0)
@@ -1517,6 +1532,9 @@ def _cuda_compile_accounting():
             for key, value in stats.items():
                 if isinstance(value, int):
                     values[key] = values.get(key, 0) + int(value)
+        values["resident_failed_signatures"] = sum(len(owner.failures) for owner in owners)
+        for key in ("failure_cache_hits", "failure_cache_evictions"):
+            values[key] = sum(getattr(owner, key) for owner in owners)
         totals[name] = values
     return totals
 
@@ -1570,9 +1588,11 @@ def _cuda_edge_phase_signature(args):
 
 _compiled_admm_shrink_edge_cuda = _BoxQPCompiledVariants(
     _admm_shrink_edge_impl, backend=_edge_phase_inductor_backend, family_key=_edge_phase_guard_family,
+    failure_key=_cuda_edge_phase_signature,
 )
 _compiled_admm_dual_edge_cuda = _BoxQPCompiledVariants(
     _admm_dual_edge_impl, backend=_edge_phase_inductor_backend, family_key=_edge_phase_guard_family,
+    failure_key=_cuda_edge_phase_signature,
 )
 
 
@@ -1585,9 +1605,9 @@ def _run_compiled_edge_phase(args, compiled, eager):
     signature = (eager.__name__, _cuda_edge_phase_signature(args))
     stats = _cuda_edge_phase_stats(signature)
     stats["calls"] += 1
-    failure = compiled.failure(args) if isinstance(compiled, _BoxQPCompiledVariants) else None
-    if failure is not None:
-        stats.update(failed=True, failure=failure)
+    if isinstance(compiled, _BoxQPCompiledVariants):
+        failure = compiled.failure(args)
+        stats.update(failed=failure is not None, failure=failure)
     if stats["failed"]:
         stats["fallbacks"] += 1
         return eager(*args)
