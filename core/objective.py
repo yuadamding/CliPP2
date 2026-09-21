@@ -916,17 +916,8 @@ def observed_loss_grid_torch(
     )
 
 
-def observed_em_terms_torch(
-    model: TorchObservedModel,
-    phi: torch.Tensor,
-    *,
-    responsibilities: torch.Tensor,
-    eps: float,
-) -> TorchObservedTerms:
-    """Evaluate one categorical EM surrogate for any observed model."""
-
-    if tuple(phi.shape) != model.shape:
-        raise ValueError(f"phi must have shape {model.shape}.")
+def _validated_em_weights(model: TorchObservedModel, responsibilities: torch.Tensor):
+    """Validate and normalize a fixed surrogate's candidate responsibilities."""
     if tuple(responsibilities.shape) != model.candidate_shape:
         raise ValueError(
             f"responsibilities must have shape {model.candidate_shape}, "
@@ -948,6 +939,69 @@ def observed_em_terms_torch(
     if bool(torch.any(normalizer <= 0.0).item()):
         raise ValueError("responsibilities must assign mass to a valid candidate.")
     weights = weights / normalizer
+    entropy = torch.where(
+        weights > 0.0,
+        weights * torch.log(torch.clamp(weights, min=torch.finfo(weights.dtype).tiny)),
+        torch.zeros_like(weights),
+    )
+    return weights, entropy
+
+
+def _em_tensor_sources(model: TorchObservedModel, responsibilities: torch.Tensor):
+    return (
+        responsibilities, model.alt, model.nonalt, model.observed,
+        model.lower, model.upper, model.slope, model.log_prior, model.valid,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedEMResponsibilities:
+    """One outer surrogate's weights, never a process- or model-wide cache."""
+
+    model: TorchObservedModel
+    sources: tuple[torch.Tensor, ...]
+    versions: tuple[int, ...]
+    weights: torch.Tensor
+    entropy: torch.Tensor
+    prepared_versions: tuple[int, int]
+
+    def validate(self, model: TorchObservedModel, responsibilities: torch.Tensor) -> None:
+        sources = _em_tensor_sources(model, responsibilities)
+        if model is not self.model or any(
+            actual is not original or actual._version != version or actual.requires_grad
+            for actual, original, version in zip(sources, self.sources, self.versions, strict=True)
+        ) or (self.weights._version, self.entropy._version) != self.prepared_versions:
+            raise ValueError("EM preparation inputs changed; prepare the new surrogate.")
+
+
+def _prepare_em_responsibilities(
+    model: TorchObservedModel, responsibilities: torch.Tensor,
+) -> _PreparedEMResponsibilities | None:
+    """Prepare once, without retaining untracked tensors or reusable autograd graphs.
+
+    The ordinary entry point remains authoritative for arbitrary callers.
+    Inference tensors have no mutation counter; let those callers use fresh
+    validated evaluation instead of trusting an immutable-looking handle.
+    """
+    sources = _em_tensor_sources(model, responsibilities)
+    if torch.is_inference_mode_enabled() or any(value.requires_grad for value in sources):
+        return None
+    try:
+        versions = tuple(value._version for value in sources)
+    except RuntimeError as error:
+        if "Inference tensors do not track version counter" not in str(error):
+            raise
+        return None
+    weights, entropy = _validated_em_weights(model, responsibilities)
+    return _PreparedEMResponsibilities(
+        model, sources, versions, weights, entropy, (weights._version, entropy._version),
+    )
+
+
+def _observed_em_terms_from_weights(
+    model: TorchObservedModel, phi: torch.Tensor, *, weights: torch.Tensor,
+    entropy: torch.Tensor, eps: float,
+) -> TorchObservedTerms:
     kernel = _emission_kernel_torch(model, phi, eps=eps)
     log_kernel, state_gradient, state_curvature = _candidate_terms_torch(
         model.alt.unsqueeze(-1), model.nonalt.unsqueeze(-1), kernel.probability, kernel.slope,
@@ -958,11 +1012,6 @@ def observed_em_terms_torch(
         torch.zeros_like(log_kernel),
     )
     del log_kernel
-    entropy = torch.where(
-        weights > 0.0,
-        weights * torch.log(torch.clamp(weights, min=torch.finfo(weights.dtype).tiny)),
-        torch.zeros_like(weights),
-    )
     loss = torch.sum(weights * complete_loss + entropy, dim=-1)
     gradient = -torch.sum(weights * state_gradient, dim=-1)
     hessian_upper = torch.sum(weights * state_curvature, dim=-1)
@@ -980,6 +1029,37 @@ def observed_em_terms_torch(
         gradient=gradient,
         hessian_upper=hessian_upper,
         posterior=posterior,
+    )
+
+
+def observed_em_terms_torch(
+    model: TorchObservedModel,
+    phi: torch.Tensor,
+    *,
+    responsibilities: torch.Tensor,
+    eps: float,
+) -> TorchObservedTerms:
+    """Evaluate one categorical EM surrogate, fully validating its weights."""
+    if tuple(phi.shape) != model.shape:
+        raise ValueError(f"phi must have shape {model.shape}.")
+    weights, entropy = _validated_em_weights(model, responsibilities)
+    return _observed_em_terms_from_weights(
+        model, phi, weights=weights, entropy=entropy, eps=eps,
+    )
+
+
+def _observed_em_terms_prepared_torch(
+    model: TorchObservedModel, phi: torch.Tensor, *, responsibilities: torch.Tensor,
+    eps: float, preparation: _PreparedEMResponsibilities | None,
+) -> TorchObservedTerms:
+    """Solver-only reuse until the frozen outer-surrogate inputs change."""
+    if preparation is None:
+        return observed_em_terms_torch(model, phi, responsibilities=responsibilities, eps=eps)
+    if tuple(phi.shape) != model.shape:
+        raise ValueError(f"phi must have shape {model.shape}.")
+    preparation.validate(model, responsibilities)
+    return _observed_em_terms_from_weights(
+        model, phi, weights=preparation.weights, entropy=preparation.entropy, eps=eps,
     )
 
 

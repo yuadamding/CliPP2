@@ -25,7 +25,8 @@ from ..objective import (
     optimization_box_to_torch,
     observed_internal_breakpoints_torch,
     observed_one_sided_gradients_torch,
-    observed_em_terms_torch,
+    _prepare_em_responsibilities,
+    _observed_em_terms_prepared_torch,
     observed_terms_torch,
 )
 from ..clonal import (
@@ -49,6 +50,7 @@ from .certificates import (
 )
 from .graph import resolve_pairwise_fusion_graph
 from .offload import offload_raw_fit_to_cpu as _offload_witness_fit
+from .offload import prepare_active_warm_state
 from .graph_ops import (
     build_complete_adaptive_tensor_graph,
     dense_complete_solver_memory_preflight,
@@ -69,6 +71,7 @@ from .starts import (
 from .torch_backend import (
     DEFAULT_EDGE_WORK_BYTES,
     _ProjectedDualInitialization,
+    _prepare_audit_adjoint,
     as_runtime_tensor,
     dtype_name,
     graph_adjoint_edges_in_dtype,
@@ -233,17 +236,27 @@ def _terminal_backward_error_audit_float64(
         tol=float(tol),
     )
     dense_dual = getattr(certificate, "dual", None)
+    prepared_adjoint = None
     if (lambda_value == 0.0 or torch.is_tensor(dense_dual)) and bool(
         torch.any(gradient.at_breakpoint).item()
     ):
-        adjustment = torch.zeros_like(phi64) if lambda_value == 0.0 else graph_adjoint_edges_in_dtype(
+        if (lambda_value > 0.0 and isinstance(certificate, DenseEdgeCertificate)
+                and certificate.graph_hash == str(graph_hash)
+                and tuple(dense_dual.shape) == (int(graph64.edge_u.numel()), int(phi64.shape[1]))):
+            prepared_adjoint = _prepare_audit_adjoint(
+                phi=phi64, dual=dense_dual, edge_u=graph64.edge_u,
+                edge_v=graph64.edge_v, edge_w=graph64.weight,
+                lambda_value=float(lambda_value),
+            )
+        adjustment = (prepared_adjoint.adjoint if prepared_adjoint is not None else
+                      torch.zeros_like(phi64) if lambda_value == 0.0 else graph_adjoint_edges_in_dtype(
             dense_dual,
             edge_u=graph64.edge_u,
             edge_v=graph64.edge_v,
             num_nodes=int(phi64.shape[0]),
             dtype=torch.float64,
             device=audit.runtime.device,
-        )
+        ))
         gradient = build_certificate_gradient(
             data64,
             phi=phi64,
@@ -269,6 +282,7 @@ def _terminal_backward_error_audit_float64(
         witness=certificate,
         refine=False,
         _adjoint_out=adjoint_out,
+        _prepared_adjoint=prepared_adjoint,
     )
     if _work_out is not None:
         # Record completed primitive work even if later objective/box or reuse
@@ -1707,11 +1721,13 @@ def _fit_from_start(
             responsibilities = iterate.terms.posterior
             if responsibilities is None:
                 raise AssertionError("Observed terms lack candidate responsibilities.")
-            surrogate_terms = observed_em_terms_torch(
+            em_preparation = _prepare_em_responsibilities(model, responsibilities)
+            surrogate_terms = _observed_em_terms_prepared_torch(
                 model,
                 iterate.phi,
                 responsibilities=responsibilities,
                 eps=eps,
+                preparation=em_preparation,
             )
             surrogate_fit_loss = float(torch.sum(surrogate_terms.loss).item())
         h_base, surrogate_grad = _safe_surrogate_curvature_and_gradient(
@@ -1934,11 +1950,12 @@ def _fit_from_start(
                     surrogate_gap = float(trial_fit_loss - majorizer_rhs)
                     em_envelope_gap = 0.0
                 else:
-                    trial_surrogate_terms = observed_em_terms_torch(
+                    trial_surrogate_terms = _observed_em_terms_prepared_torch(
                         model,
                         phi_trial,
                         responsibilities=responsibilities,
                         eps=eps,
+                        preparation=em_preparation,
                     )
                     trial_surrogate_loss = float(
                         torch.sum(trial_surrogate_terms.loss).item()
@@ -3022,6 +3039,10 @@ def fit_prepared(
     work_complete = True
     exception_kinds = []
     shared_audit = _WitnessAuditCache(problem)
+    # One call-local continuation owner, never retained by archived fits. Its
+    # extra allocation must leave room for both working and promoted solves.
+    active_warm = (prepare_active_warm_state(warm_state, problem)
+                   if lambda_value > 0.0 and len(order) > 1 else None)
     for index in order:
         if incumbent is not None and scalar_data.can_prune(index, incumbent.objective.total):
             pruned.append(index)
@@ -3047,7 +3068,7 @@ def fit_prepared(
                     reused.append(index)
                     continue
             branch = _prepare_witness_problem(problem, index, _source_validated=True)
-            branch_warm = warm_state
+            branch_warm = warm_state if active_warm is None else active_warm.resolve(warm_state, problem)
             if branch_warm is not None and branch_warm.objective_spec_hash != branch.objective_spec_hash:
                 # A guided multiplier on this exact original objective remains
                 # a legal initialization after fixing one primal row. Edge-dual

@@ -120,6 +120,14 @@ CUDA or insufficient memory fails without silently switching devices. Set the
 positive-integer CN eligibility cutoff with `--max-major-cn` (default 4).
 `--verbose` and standard help and version options are also available.
 
+CUDA execution is hybrid: scalar refits and search decisions remain on the CPU.
+The solver reuses prepared EM weights and guide structure, keeps at most one
+memory-qualified active warm-state upload, and compiles tensor-only edge work
+between the existing ADMM barriers. Ward minima stay on the GPU with logical-ID
+tie ordering. Norms, divisions and graph reductions retain their established
+arithmetic; terminal admission still uses the frozen-source float64 audit and
+unchanged KKT gate. Compilation failure uses eager CUDA, not a CPU fallback.
+
 ## Outputs
 
 A successful fit writes four TSV files into `--outdir`, prefixed with the tumor id (the input
@@ -140,8 +148,11 @@ for state-specific CN evaluation. Clonal-CN-only mutation–region tables retain
 their schema.
 
 `is_clonal` marks occupied centers exactly equal to one in every region.
-Public labels remain ordered by decreasing L2 norm of final CCF, starting at
-zero; no output-time CCF reassignment or rounding creates the clonal center.
+The cluster designated by the selected refit's clonal constraint is always
+**cluster 0**, even if another center is also exactly all-one. The remaining
+clusters are ordered by decreasing L2 norm of final CCF, with ties preserving
+internal-label order. This only relabels outputs; it does not merge clusters,
+change membership, or reassign or round CCFs.
 
 ## Regression tests
 

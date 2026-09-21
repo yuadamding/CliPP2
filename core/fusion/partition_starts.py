@@ -163,6 +163,68 @@ _WARD_HEAP_ACTIVE_MULTIPLIER = 4
 _WARD_HEAP_MIN_ENTRIES = 64
 
 
+def _ward_uses_device_minima(pilot_phi: torch.Tensor) -> bool:
+    return pilot_phi.device.type == "cuda"
+
+
+class _WardDeviceMinima:
+    """One O(N) device owner; only the next merge packet crosses to the host."""
+
+    def __init__(self, costs, columns, max_nodes, finite_large):
+        count = costs.numel()
+        self.costs = costs.new_full((max_nodes,), finite_large)
+        self.columns = columns.new_zeros(max_nodes)
+        self.costs[:count], self.columns[:count] = costs, columns
+        self.ids = torch.arange(max_nodes, device=costs.device)
+        self.slots = self.ids.clone()
+        self.active = self.ids < count
+        self.finite_large = finite_large
+
+    def next_merge(self):
+        # Logical IDs, not recycled physical slots, break exact ties. As in the
+        # heap route, nonfinite/sentinel row minima cannot enter the ranking.
+        ranked = torch.where(
+            self.active & (self.costs < self.finite_large * .5),
+            self.costs, self.finite_large,
+        )
+        cost, left = torch.min(ranked, dim=0)
+        right = self.columns.gather(0, left.reshape(1)).squeeze(0)
+        invalid = (
+            self.active & (self.ids != left) & (self.ids != right)
+            & ((self.columns == left) | (self.columns == right))
+        )
+        # nonzero would synchronize to discover its output shape. Compact into
+        # a fixed-size sorted buffer and include its length in the unavoidable
+        # next-merge transfer instead. No edge/cost vector leaves the device.
+        invalid_ids = torch.sort(torch.where(invalid, self.ids, self.ids.numel())).values
+        packet = torch.stack((cost.double(), left.double(), right.double(), invalid.sum().double()))
+        value, left_id, right_id, count = packet.detach().cpu().tolist()
+        return value, int(left_id), int(right_id), invalid_ids[:int(count)]
+
+    def merge(self, left, right, new_id):
+        self.active[left] = self.active[right] = False
+        self.active[new_id] = True
+        self.costs[left] = self.costs[right] = self.finite_large
+        self.slots[new_id] = self.slots[left]
+
+    def update(self, cost_matrix, other, cost_vec, invalid_rows, new_id, work_elements):
+        # The new ID is greatest. An equal cost must keep the older partner.
+        better = cost_vec < self.costs[other]
+        self.costs[other] = torch.where(better, cost_vec, self.costs[other])
+        self.columns[other] = torch.where(better, new_id, self.columns[other])
+        active_ids = torch.cat((other, other.new_full((1,), new_id)))
+        active_slots = self.slots[active_ids]
+        rows_per_chunk = max(1, int(work_elements) // int(active_ids.numel()))
+        for start in range(0, int(invalid_rows.numel()), rows_per_chunk):
+            rows = invalid_rows[start:start + rows_per_chunk]
+            # The complete active axis remains in ascending logical order;
+            # min's first exact tie must not depend on recycled slot order.
+            costs, columns = torch.min(
+                cost_matrix[self.slots[rows, None], active_slots[None, :]], dim=1,
+            )
+            self.costs[rows], self.columns[rows] = costs, active_ids[columns]
+
+
 def _ward_refresh_minima(
     cost_matrix: torch.Tensor,
     invalid_rows: np.ndarray,
@@ -384,17 +446,23 @@ def hessian_weighted_ward_label_sets_torch(
     # Share this maintenance across devices and region counts: no full-matrix
     # scan is required on every multi-region CPU merge.
     initial_row_cost, initial_row_column = torch.min(cost_matrix, dim=1)
-    row_best_cost = np.full(max_nodes, finite_large, dtype=np.float64)
-    row_best_column = np.zeros(max_nodes, dtype=np.int64)
-    row_best_cost[:num_mutations] = initial_row_cost.detach().cpu().numpy()
-    row_best_column[:num_mutations] = initial_row_column.detach().cpu().numpy()
-    row_version = np.zeros(max_nodes, dtype=np.int64)
-    row_heap = [
-        (float(row_best_cost[row]), row, int(row_best_column[row]), 0)
-        for row in range(num_mutations)
-        if float(row_best_cost[row]) < finite_large * 0.5
-    ]
-    heapq.heapify(row_heap)
+    device_minima = None
+    if _ward_uses_device_minima(phi0):
+        device_minima = _WardDeviceMinima(
+            initial_row_cost, initial_row_column, max_nodes, finite_large,
+        )
+    else:
+        row_best_cost = np.full(max_nodes, finite_large, dtype=np.float64)
+        row_best_column = np.zeros(max_nodes, dtype=np.int64)
+        row_best_cost[:num_mutations] = initial_row_cost.detach().cpu().numpy()
+        row_best_column[:num_mutations] = initial_row_column.detach().cpu().numpy()
+        row_version = np.zeros(max_nodes, dtype=np.int64)
+        row_heap = [
+            (float(row_best_cost[row]), row, int(row_best_column[row]), 0)
+            for row in range(num_mutations)
+            if float(row_best_cost[row]) < finite_large * 0.5
+        ]
+        heapq.heapify(row_heap)
 
     def current_labels() -> np.ndarray:
         return _ward_labels_from_parents(parent, num_mutations)
@@ -408,18 +476,21 @@ def hessian_weighted_ward_label_sets_torch(
     active_cpu = np.zeros((max_nodes,), dtype=bool)
     active_cpu[:num_mutations] = True
     while active_count > 1 and requested - set(out):
-        while row_heap:
-            min_cost, left, right, version = heapq.heappop(row_heap)
-            if (
-                active_cpu[left]
-                and active_cpu[right]
-                and int(row_version[left]) == int(version)
-                and int(row_best_column[left]) == int(right)
-            ):
-                break
+        if device_minima is not None:
+            min_cost, left, right, invalid_device_rows = device_minima.next_merge()
         else:
-            min_cost = float("inf")
-            left = right = -1
+            while row_heap:
+                min_cost, left, right, version = heapq.heappop(row_heap)
+                if (
+                    active_cpu[left]
+                    and active_cpu[right]
+                    and int(row_version[left]) == int(version)
+                    and int(row_best_column[left]) == int(right)
+                ):
+                    break
+            else:
+                min_cost = float("inf")
+                left = right = -1
         if not np.isfinite(min_cost) or min_cost >= finite_large * 0.5:
             raise RuntimeError(
                 "Hessian-weighted Ward cost matrix exhausted before all clusters were merged."
@@ -443,6 +514,8 @@ def hessian_weighted_ward_label_sets_torch(
         active_cpu[new_id] = True
         new_slot = int(node_slot[left])
         node_slot[new_id] = new_slot
+        if device_minima is not None:
+            device_minima.merge(left, right, new_id)
         # The new logical ID is largest, so its outgoing row has no pairs.
         # Its incoming active entries are all overwritten below. The retired
         # right slot never becomes active again; refresh reads only active slots.
@@ -463,43 +536,49 @@ def hessian_weighted_ward_label_sets_torch(
             cost_vec = 0.5 * torch.sum(weight_vec * torch.square(diff_vec), dim=1)
             other_slots = torch.as_tensor(node_slot[other_ids], device=phi0.device)
             cost_matrix[other_slots, new_slot] = cost_vec
-            cost_values = cost_vec.detach().cpu().numpy()
-            best_partner = row_best_column[other_ids]
-            invalid_best = (best_partner == left) | (best_partner == right)
-            invalid_rows = other_ids[invalid_best]
-            direct_rows = other_ids[
-                (~invalid_best) & (cost_values < row_best_cost[other_ids])
-            ]
-
-            if invalid_rows.size:
-                _ward_refresh_minima(
-                    cost_matrix, invalid_rows, np.append(other_ids, new_id),
-                    node_slot, row_best_cost, row_best_column, int(refresh_work_elements),
+            if device_minima is not None:
+                device_minima.update(
+                    cost_matrix, other, cost_vec, invalid_device_rows, new_id,
+                    int(refresh_work_elements),
                 )
-            if direct_rows.size:
-                direct_positions = np.searchsorted(other_ids, direct_rows)
-                row_best_cost[direct_rows] = cost_values[direct_positions]
-                row_best_column[direct_rows] = new_id
+            else:
+                cost_values = cost_vec.detach().cpu().numpy()
+                best_partner = row_best_column[other_ids]
+                invalid_best = (best_partner == left) | (best_partner == right)
+                invalid_rows = other_ids[invalid_best]
+                direct_rows = other_ids[
+                    (~invalid_best) & (cost_values < row_best_cost[other_ids])
+                ]
 
-            for row in np.concatenate((invalid_rows, direct_rows)):
-                row = int(row)
-                row_version[row] += 1
-                if float(row_best_cost[row]) < finite_large * 0.5:
-                    heapq.heappush(
-                        row_heap,
-                        (
-                            float(row_best_cost[row]),
-                            row,
-                            int(row_best_column[row]),
-                            int(row_version[row]),
-                        ),
+                if invalid_rows.size:
+                    _ward_refresh_minima(
+                        cost_matrix, invalid_rows, np.append(other_ids, new_id),
+                        node_slot, row_best_cost, row_best_column, int(refresh_work_elements),
                     )
+                if direct_rows.size:
+                    direct_positions = np.searchsorted(other_ids, direct_rows)
+                    row_best_cost[direct_rows] = cost_values[direct_positions]
+                    row_best_column[direct_rows] = new_id
+
+                for row in np.concatenate((invalid_rows, direct_rows)):
+                    row = int(row)
+                    row_version[row] += 1
+                    if float(row_best_cost[row]) < finite_large * 0.5:
+                        heapq.heappush(
+                            row_heap,
+                            (
+                                float(row_best_cost[row]),
+                                row,
+                                int(row_best_column[row]),
+                                int(row_version[row]),
+                            ),
+                        )
 
         active_count -= 1
         # At most active_count-1 rows were pushed in this merge. Rebuilding
         # here bounds stale Python heap storage by O(M), including the temporary
         # replacement list; it does not alter cost arithmetic or tie order.
-        if len(row_heap) > max(
+        if device_minima is None and len(row_heap) > max(
             _WARD_HEAP_MIN_ENTRIES, _WARD_HEAP_ACTIVE_MULTIPLIER * active_count
         ):
             _ward_compact_heap(

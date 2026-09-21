@@ -8,6 +8,7 @@ import torch
 
 from ..objective import observed_one_sided_gradients_torch
 from .torch_backend import (
+    _PreparedAuditAdjoint,
     downward_kink_mask_torch,
     edge_kkt_maxima_from_diff_torch,
     graph_fusion_kkt_diagnostics_from_components_torch,
@@ -929,8 +930,11 @@ def _audit_certificate(
     grad_smooth: torch.Tensor,
     problem: CertificateProblem,
     _adjoint_out: dict[str, torch.Tensor] | None = None,
+    _prepared_adjoint: _PreparedAuditAdjoint | None = None,
 ) -> KKTDiagnostics:
     if problem.lambda_value > 0.0 and isinstance(certificate, CompressedEdgeCertificate):
+        if _prepared_adjoint is not None:
+            raise ValueError("Prepared adjoints are restricted to dense witness audits.")
         return _compressed_graph_fusion_kkt(
             certificate=certificate,
             phi=phi,
@@ -954,6 +958,7 @@ def _audit_certificate(
         edge_w=problem.graph.weight,
         lambda_value=problem.lambda_value,
         _adjoint_out=_adjoint_out,
+        _prepared_adjoint=_prepared_adjoint,
     )
 
 
@@ -1031,6 +1036,7 @@ def certify(
     max_iter: int = 96,
     options: CertificateOptions | None = None,
     _adjoint_out: dict[str, torch.Tensor] | None = None,
+    _prepared_adjoint: _PreparedAuditAdjoint | None = None,
 ) -> CertificateAttempt:
     """Refine and/or audit one full-original-graph certificate.
 
@@ -1053,6 +1059,8 @@ def certify(
     ):
         raise ValueError("Zero-penalty certificate requires its original graph and lambda zero.")
     if refine:
+        if _prepared_adjoint is not None:
+            raise ValueError("Refinement cannot reuse a fixed-witness audit adjoint.")
         return _refine_certificate(
             certificate=witness,
             phi=phi,
@@ -1070,6 +1078,7 @@ def certify(
         grad_smooth=gradient.value,
         problem=problem,
         _adjoint_out=_adjoint_out,
+        _prepared_adjoint=_prepared_adjoint,
     )
     return CertificateAttempt(
         certificate=witness,

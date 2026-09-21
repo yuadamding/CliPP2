@@ -17,7 +17,7 @@ That is the graph used by CliPP2's default adaptive pairwise-fusion fit.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
@@ -96,6 +96,125 @@ class GuidedFusionInitialization:
     diagnostics: GuidedFusionDiagnostics
 
 
+@dataclass(frozen=True, slots=True)
+class _BoxActivity:
+    frozen: torch.Tensor
+    lower_only: torch.Tensor
+    upper_only: torch.Tensor
+    region_indices: tuple[tuple[torch.Tensor, ...], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _GuideStructure:
+    """Capacity-loop-local metadata, never an additional edge-by-region state.
+
+    Membership and bound activity do not depend on lambda or flow demand. The
+    existing edge masks are shared, not copied. Tensor versions guard reuse if
+    a private caller changes a guide or its bounds between assemblies.
+    """
+
+    sources: tuple[torch.Tensor, ...]
+    versions: tuple[int, ...] | None
+    members: tuple[torch.Tensor, ...]
+    cluster_sizes: torch.Tensor
+    activity: tuple[_BoxActivity, ...]
+    within: torch.Tensor
+    between: torch.Tensor
+    _derived_versions: tuple[int, ...] | None = field(init=False, repr=False)
+
+    def _derived_tensors(self):
+        return (
+            self.cluster_sizes, *self.members,
+            *(tensor for activity in self.activity for tensor in (
+                activity.frozen, activity.lower_only, activity.upper_only,
+                *(index for region in activity.region_indices for index in region),
+            )),
+        )
+
+    def __post_init__(self):
+        object.__setattr__(self, "_derived_versions", _tensor_versions(self._derived_tensors()))
+
+    def matches(self, *sources: torch.Tensor) -> bool:
+        return (
+            self.versions is not None
+            and len(sources) == len(self.sources)
+            and all(left is right for left, right in zip(self.sources, sources))
+            and self.versions == _tensor_versions((*sources, self.within, self.between))
+            and self._derived_versions == _tensor_versions(self._derived_tensors())
+        )
+
+
+def _tensor_versions(tensors: tuple[torch.Tensor, ...]) -> tuple[int, ...] | None:
+    try:
+        return tuple(tensor._version for tensor in tensors)
+    except RuntimeError:
+        # Inference tensors have no mutation counter: do not trust a cache.
+        return None
+
+
+def _prepare_box_activity(
+    phi: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor
+) -> _BoxActivity:
+    lower_active = phi == lower
+    upper_active = phi == upper
+    frozen = lower_active & upper_active
+    lower_only = lower_active & ~upper_active
+    upper_only = upper_active & ~lower_active
+    interior = ~(lower_active | upper_active)
+    return _BoxActivity(
+        frozen=frozen,
+        lower_only=lower_only,
+        upper_only=upper_only,
+        region_indices=tuple(
+            tuple(
+                torch.nonzero(mask[:, region], as_tuple=False).flatten()
+                for mask in (frozen, lower_only, upper_only, interior)
+            )
+            for region in range(int(phi.shape[1]))
+        ),
+    )
+
+
+def _prepare_guide_structure(
+    phi: torch.Tensor,
+    labels: torch.Tensor,
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    edge_u: torch.Tensor,
+    edge_v: torch.Tensor,
+    *,
+    members: tuple[torch.Tensor, ...] | None = None,
+    within: torch.Tensor | None = None,
+    between: torch.Tensor | None = None,
+) -> _GuideStructure:
+    if members is None:
+        members = tuple(
+            torch.nonzero(labels == cluster, as_tuple=False).flatten()
+            for cluster in range(int(torch.max(labels).item()) + 1)
+        )
+    if within is None:
+        within = labels.index_select(0, edge_u) == labels.index_select(0, edge_v)
+    if between is None:
+        between = ~within
+    sources = (phi, labels, lower, upper, edge_u, edge_v)
+    return _GuideStructure(
+        sources=sources,
+        versions=_tensor_versions((*sources, within, between)),
+        members=members,
+        cluster_sizes=torch.bincount(labels, minlength=len(members)),
+        activity=tuple(
+            _prepare_box_activity(
+                phi.index_select(0, indices),
+                lower.index_select(0, indices),
+                upper.index_select(0, indices),
+            )
+            for indices in members
+        ),
+        within=within,
+        between=between,
+    )
+
+
 def _canonical_labels(labels: GuideLabels, *, num_mutations: int) -> np.ndarray:
     if torch.is_tensor(labels):
         raw = labels.detach().cpu().numpy()
@@ -144,6 +263,7 @@ def _canonical_guide_phi(
     lower: torch.Tensor,
     upper: torch.Tensor,
     partition_tolerance: float,
+    _members: tuple[torch.Tensor, ...] | None = None,
 ) -> tuple[torch.Tensor, float, float]:
     phi_input = torch.as_tensor(guide_phi, dtype=lower.dtype, device=lower.device)
     if tuple(phi_input.shape) != tuple(lower.shape):
@@ -161,8 +281,12 @@ def _canonical_guide_phi(
     phi = torch.minimum(torch.maximum(phi_input, lower), upper).clone()
 
     max_deviation = 0.0
-    for cluster in range(int(torch.max(labels).item()) + 1):
-        members = torch.nonzero(labels == int(cluster), as_tuple=False).flatten()
+    if _members is None:
+        _members = tuple(
+            torch.nonzero(labels == cluster, as_tuple=False).flatten()
+            for cluster in range(int(torch.max(labels).item()) + 1)
+        )
+    for members in _members:
         block = phi.index_select(0, members)
         common_lower = torch.max(lower.index_select(0, members), dim=0).values
         common_upper = torch.min(upper.index_select(0, members), dim=0).values
@@ -190,6 +314,7 @@ def _box_stationarity_targets(
     phi: torch.Tensor,
     lower: torch.Tensor,
     upper: torch.Tensor,
+    _activity: _BoxActivity | None = None,
 ) -> torch.Tensor:
     """Choose block-sum-preserving stationarity targets under box constraints.
 
@@ -198,12 +323,11 @@ def _box_stationarity_targets(
     gradient. Tiny out-of-box guide errors have already been clipped above.
     """
 
-    lower_active = phi == lower
-    upper_active = phi == upper
-    frozen = lower_active & upper_active
-    lower_only = lower_active & ~upper_active
-    upper_only = upper_active & ~lower_active
-    interior = ~(lower_active | upper_active)
+    if _activity is None:
+        _activity = _prepare_box_activity(phi, lower, upper)
+    frozen = _activity.frozen
+    lower_only = _activity.lower_only
+    upper_only = _activity.upper_only
 
     target = torch.zeros_like(total_grad)
     target = torch.where(frozen, total_grad, target)
@@ -218,10 +342,7 @@ def _box_stationarity_targets(
         if delta_value == 0.0:
             continue
 
-        frozen_idx = torch.nonzero(frozen[:, region], as_tuple=False).flatten()
-        lower_idx = torch.nonzero(lower_only[:, region], as_tuple=False).flatten()
-        upper_idx = torch.nonzero(upper_only[:, region], as_tuple=False).flatten()
-        interior_idx = torch.nonzero(interior[:, region], as_tuple=False).flatten()
+        frozen_idx, lower_idx, upper_idx, interior_idx = _activity.region_indices[region]
 
         # Frozen coordinates can absorb either sign. Lower-active coordinates
         # can absorb an unlimited positive residual; upper-active coordinates
@@ -273,20 +394,29 @@ def _complete_block_flow_terms(
     labels: torch.Tensor,
     lower: torch.Tensor,
     upper: torch.Tensor,
+    _structure: _GuideStructure | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return complete-block flow demand, targets, and block sizes."""
 
     flow_demand = torch.zeros_like(adjusted_grad)
     stationarity_target = torch.zeros_like(adjusted_grad)
-    num_clusters = int(torch.max(labels).item()) + 1
-    cluster_sizes = torch.bincount(labels, minlength=num_clusters)
-    for cluster in range(num_clusters):
-        members = torch.nonzero(labels == int(cluster), as_tuple=False).flatten()
+    if _structure is None:
+        num_clusters = int(torch.max(labels).item()) + 1
+        cluster_sizes = torch.bincount(labels, minlength=num_clusters)
+        block_members = tuple(
+            torch.nonzero(labels == cluster, as_tuple=False).flatten()
+            for cluster in range(num_clusters)
+        )
+    else:
+        cluster_sizes = _structure.cluster_sizes
+        block_members = _structure.members
+    for cluster, members in enumerate(block_members):
         block_target = _box_stationarity_targets(
             adjusted_grad.index_select(0, members),
-            phi=phi.index_select(0, members),
-            lower=lower.index_select(0, members),
-            upper=upper.index_select(0, members),
+            phi=phi.index_select(0, members) if _structure is None else phi,
+            lower=lower.index_select(0, members) if _structure is None else lower,
+            upper=upper.index_select(0, members) if _structure is None else upper,
+            _activity=None if _structure is None else _structure.activity[cluster],
         )
         stationarity_target.index_copy_(0, members, block_target)
         flow_demand.index_copy_(
@@ -309,7 +439,12 @@ def _assemble_actual_dual(
     edge_v: torch.Tensor,
     edge_w: torch.Tensor,
     _work_memory_bytes: int = _GUIDED_FUSION_WORK_BYTES,
+    _structure: _GuideStructure | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if _structure is not None and not _structure.matches(
+        phi, labels, lower, upper, edge_u, edge_v
+    ):
+        _structure = _prepare_guide_structure(phi, labels, lower, upper, edge_u, edge_v)
     num_mutations, num_regions = phi.shape
     num_edges = int(edge_u.numel())
     dual = torch.zeros(
@@ -333,8 +468,11 @@ def _assemble_actual_dual(
         ),
     )
     if num_edges <= chunk_edges:
-        same_block = labels.index_select(0, edge_u) == labels.index_select(0, edge_v)
-        between = ~same_block
+        same_block = (
+            labels.index_select(0, edge_u) == labels.index_select(0, edge_v)
+            if _structure is None else _structure.within
+        )
+        between = ~same_block if _structure is None else _structure.between
 
         if bool(torch.any(between).item()) and float(lambda_value) > 0.0:
             diff = phi.index_select(0, edge_u) - phi.index_select(0, edge_v)
@@ -360,6 +498,7 @@ def _assemble_actual_dual(
             labels=labels,
             lower=lower,
             upper=upper,
+            _structure=_structure,
         )
 
         if bool(torch.any(same_block).item()):
@@ -379,7 +518,8 @@ def _assemble_actual_dual(
             chunk_u = edge_u[start:stop]
             chunk_v = edge_v[start:stop]
             between_index = torch.nonzero(
-                labels.index_select(0, chunk_u) != labels.index_select(0, chunk_v),
+                labels.index_select(0, chunk_u) != labels.index_select(0, chunk_v)
+                if _structure is None else _structure.between[start:stop],
                 as_tuple=False,
             ).flatten()
             if int(between_index.numel()) == 0:
@@ -420,6 +560,7 @@ def _assemble_actual_dual(
         labels=labels,
         lower=lower,
         upper=upper,
+        _structure=_structure,
     )
 
     for start in range(0, num_edges, chunk_edges):
@@ -427,7 +568,8 @@ def _assemble_actual_dual(
         chunk_u = edge_u[start:stop]
         chunk_v = edge_v[start:stop]
         within_index = torch.nonzero(
-            labels.index_select(0, chunk_u) == labels.index_select(0, chunk_v),
+            labels.index_select(0, chunk_u) == labels.index_select(0, chunk_v)
+            if _structure is None else _structure.within[start:stop],
             as_tuple=False,
         ).flatten()
         if int(within_index.numel()) == 0:
@@ -549,18 +691,18 @@ def _zero_separation_between_count(
         _GUIDED_FUSION_WORK_BYTES
         // max(3 * int(phi.shape[1]) * int(phi.element_size()), 1),
     )
-    count = 0
+    count = torch.zeros((), dtype=torch.int64, device=phi.device)
     for start in range(0, num_edges, chunk_edges):
         stop = min(start + chunk_edges, num_edges)
         diff = phi.index_select(0, edge_u[start:stop]) - phi.index_select(
             0, edge_v[start:stop]
         )
-        count += int(
+        count.add_(
             torch.sum(
                 between[start:stop] & (torch.linalg.vector_norm(diff, dim=1) == 0.0)
-            ).item()
+            )
         )
-    return count
+    return int(count.item())
 
 
 def build_guided_fusion_initialization(
@@ -621,12 +763,19 @@ def build_guided_fusion_initialization(
 
     labels_np = _canonical_labels(guide_labels, num_mutations=num_mutations)
     labels = torch.as_tensor(labels_np, dtype=torch.long, device=lower.device)
+    members = tuple(
+        torch.as_tensor(
+            np.flatnonzero(labels_np == cluster), dtype=torch.long, device=lower.device
+        )
+        for cluster in range(int(labels_np.max()) + 1)
+    )
     phi, guide_adjustment, max_deviation = _canonical_guide_phi(
         guide_phi,
         labels=labels,
         lower=lower,
         upper=upper,
         partition_tolerance=float(partition_tolerance),
+        _members=members,
     )
 
     terms = observed_terms_torch(
@@ -656,6 +805,10 @@ def build_guided_fusion_initialization(
         )
 
     with torch.no_grad():
+        structure = _prepare_guide_structure(
+            phi, labels, lower, upper, edge_u, edge_v,
+            members=members, within=within, between=between,
+        )
         zero_dual, _, _ = _assemble_actual_dual(
             lambda_value=0.0,
             phi=phi,
@@ -666,6 +819,7 @@ def build_guided_fusion_initialization(
             edge_u=edge_u,
             edge_v=edge_v,
             edge_w=edge_w,
+            _structure=structure,
         )
         required_without_between = _required_within_lambda(
             zero_dual, within=within, edge_w=edge_w
@@ -705,6 +859,7 @@ def build_guided_fusion_initialization(
                 edge_u=edge_u,
                 edge_v=edge_v,
                 edge_w=edge_w,
+                _structure=structure,
             )
             required = _required_within_lambda(dual, within=within, edge_w=edge_w)
             if required <= lambda_value * (1.0 + capacity_tolerance):
@@ -735,6 +890,7 @@ def build_guided_fusion_initialization(
                 edge_u=edge_u,
                 edge_v=edge_v,
                 edge_w=edge_w,
+                _structure=structure,
             )
 
         if not np.isfinite(lambda_value) or lambda_value <= 0.0:
@@ -765,11 +921,10 @@ def build_guided_fusion_initialization(
             edge_v=edge_v,
         )
         flow_balance = torch.zeros_like(phi)
-        for cluster in range(int(torch.max(labels).item()) + 1):
-            members = torch.nonzero(labels == int(cluster), as_tuple=False).flatten()
-            block_sum = torch.sum(flow_demand.index_select(0, members), dim=0)
+        for block_members in structure.members:
+            block_sum = torch.sum(flow_demand.index_select(0, block_members), dim=0)
             flow_balance.index_copy_(
-                0, members[:1], block_sum.reshape(1, int(num_regions))
+                0, block_members[:1], block_sum.reshape(1, int(num_regions))
             )
         block_flow_balance = float(torch.max(torch.abs(flow_balance)).item())
 
@@ -789,7 +944,7 @@ def build_guided_fusion_initialization(
             ),
             num_mutations=int(num_mutations),
             num_regions=int(num_regions),
-            num_clusters=int(torch.max(labels).item()) + 1,
+            num_clusters=len(structure.members),
             within_edge_count=int(torch.sum(within).item()),
             between_edge_count=int(torch.sum(between).item()),
             zero_separation_between_edge_count=int(zero_separation_between_edge_count),

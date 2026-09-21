@@ -224,6 +224,7 @@ def dense_complete_solver_memory_preflight(
     runtime: TorchRuntime,
     memory_limit_bytes: int | None = None,
     resident_edges: tuple[torch.Tensor, torch.Tensor] | None = None,
+    extra_allocation_bytes: int = 0,
 ) -> tuple[bool, int, int | None]:
     """Check additional CUDA demand, or full demand under an explicit cap.
 
@@ -233,7 +234,13 @@ def dense_complete_solver_memory_preflight(
     all value/state/workspace allowances; never add live or cached bytes to the
     available-memory limit. Explicit and environment caps retain full-peak
     semantics, and graph construction still checks the entire allocation.
+    Optional resident warm-state uploads are additional live allocations, not
+    a credit against the existing estimate or headroom policy.
     """
+    if (isinstance(extra_allocation_bytes, bool)
+        or int(extra_allocation_bytes) != extra_allocation_bytes
+        or extra_allocation_bytes < 0):
+        raise ValueError("extra_allocation_bytes must be a nonnegative integer.")
     estimate = estimate_dense_complete_solver_peak_bytes(
         num_nodes,
         num_regions=num_regions,
@@ -259,6 +266,7 @@ def dense_complete_solver_memory_preflight(
         ):
             raise ValueError("Resident complete-graph indices must match the CUDA runtime and shape.")
         estimate -= 2 * edges * _dtype_nbytes(torch.long)
+    estimate += int(extra_allocation_bytes)
     limit = _complete_graph_memory_limit_bytes(
         runtime,
         memory_limit_bytes=memory_limit_bytes,

@@ -457,7 +457,7 @@ def _qualification(analysis: AnalysisSerialization) -> dict[str, object]:
         "raw_reference": _raw_qualification(raw_fit, analysis.data),
         "selected_raw_fit": None if selected_raw is None else _raw_qualification(selected_raw, analysis.data),
         "output_labeling": {
-            "policy": "descending_refit_ccf_l2_v1",
+            "policy": "clonal_first_descending_refit_ccf_l2_v1",
             "tie_break": "internal_cluster_label_ascending",
             "internal_labels_in_output_order": analysis.output_cluster_order.tolist(),
             "labels_hash": _array_fingerprint(analysis.output_labels, dtype=np.dtype(np.int64)),
@@ -647,9 +647,11 @@ class AnalysisSerialization:
                             ("raw_fit", raw_fit), ("partition", partition), ("refit", refit)):
             object.__setattr__(self, name, value)
         # A display-only permutation of the validated final-refit centers.
-        # Stable sorting breaks exact L2 ties by the original internal label;
-        # selected labels, refit arrays, signatures and certificates stay intact.
+        # The designated constrained block is always public cluster zero, even
+        # when another center is also exactly all-one. Remaining L2 ties keep
+        # internal-label order; fitted arrays/signatures/certificates stay intact.
         order = np.argsort(-np.linalg.norm(refit.cluster_centers, axis=1), kind="stable")
+        order = np.concatenate(([refit.clonal_cluster_id], order[order != refit.clonal_cluster_id]))
         label_map = np.empty(partition.n_clusters, dtype=np.int64)
         label_map[order] = np.arange(partition.n_clusters, dtype=np.int64)
         object.__setattr__(self, "output_cluster_order", readonly_array(order, dtype=np.int64))

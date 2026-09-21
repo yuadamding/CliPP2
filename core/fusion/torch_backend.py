@@ -585,6 +585,58 @@ def graph_fusion_kkt_diagnostics_from_components_torch(
     )
 
 
+def _audit_tensor_view(tensor):
+    if tensor is None:
+        return None
+    return (tensor.untyped_storage(), tensor.storage_offset(), tuple(tensor.shape),
+            tuple(tensor.stride()), tensor.dtype, tensor.device, int(tensor._version))
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAuditAdjoint:
+    """Call-local reduction bound to the exact witness, graph and audit point.
+
+    This reuses arithmetic only, never a certification/admission decision.
+    Holding the source views prevents allocator reuse from masquerading as an
+    identity match; version checks also catch writes through an alias.
+    """
+
+    adjoint: torch.Tensor
+    sources: tuple
+    snapshots: tuple
+    lambda_value: float
+    dual_scale: float
+    edge_work_bytes: int | None
+    adjoint_version: int
+
+    def validate(self, *, phi, dual, edge_u, edge_v, edge_w, lambda_value,
+                 dual_scale, edge_work_bytes):
+        tensors = (phi, dual, edge_u, edge_v, edge_w)
+        if (float(lambda_value) != self.lambda_value or float(dual_scale) != self.dual_scale
+                or edge_work_bytes != self.edge_work_bytes
+                or tuple(_audit_tensor_view(t) for t in tensors) != self.snapshots
+                or tuple(_audit_tensor_view(t) for t in self.sources) != self.snapshots
+                or int(self.adjoint._version) != self.adjoint_version):
+            raise ValueError("Prepared audit adjoint inputs changed.")
+        return self.adjoint
+
+
+def _prepare_audit_adjoint(*, phi, dual, edge_u, edge_v, edge_w, lambda_value,
+                           dual_scale=1.0, edge_work_bytes=None):
+    sources = (phi, dual, edge_u, edge_v, edge_w)
+    # Inference tensors have no version counter; retain the uncached audit.
+    if any(t.is_inference() for t in sources):
+        return None
+    snapshots = tuple(_audit_tensor_view(t) for t in sources)
+    adjoint = graph_adjoint_edges_in_dtype(
+        dual, edge_u=edge_u, edge_v=edge_v, num_nodes=int(phi.shape[0]),
+        dtype=phi.dtype, device=phi.device, scale=float(dual_scale),
+        edge_work_bytes=edge_work_bytes,
+    )
+    return _PreparedAuditAdjoint(adjoint, sources, snapshots, float(lambda_value),
+                                 float(dual_scale), edge_work_bytes, int(adjoint._version))
+
+
 def graph_fusion_kkt_residual_from_grad_torch(
     *,
     phi: torch.Tensor,
@@ -600,6 +652,7 @@ def graph_fusion_kkt_residual_from_grad_torch(
     edge_work_bytes: int | None = None,
     _progress_out: dict[str, float] | None = None,
     _adjoint_out: dict[str, torch.Tensor] | None = None,
+    _prepared_adjoint: _PreparedAuditAdjoint | None = None,
 ) -> KKTDiagnostics:
     lambda_value = validate_lambda_value(lambda_value)
     dual_scale_value = float(dual_scale)
@@ -624,8 +677,13 @@ def graph_fusion_kkt_residual_from_grad_torch(
         work_bytes=edge_work_bytes,
     )
 
-    adj = torch.zeros_like(phi)
-    if num_edges > 0 and lambda_value > 0.0 and dual is not None:
+    adj = torch.zeros_like(phi) if _prepared_adjoint is None else _prepared_adjoint.validate(
+        phi=phi, dual=dual, edge_u=edge_u, edge_v=edge_v, edge_w=edge_w,
+        lambda_value=lambda_value, dual_scale=dual_scale_value, edge_work_bytes=edge_work_bytes,
+    )
+    if _prepared_adjoint is not None and (lambda_value <= 0.0 or dual is None):
+        raise ValueError("Prepared audit adjoint requires a positive-lambda dense witness.")
+    if _prepared_adjoint is None and num_edges > 0 and lambda_value > 0.0 and dual is not None:
         # Resident same-precision CUDA keeps the solver's preferred reduction;
         # large offloaded/cross-precision audits transfer bounded edge chunks.
         adj = graph_adjoint_edges_in_dtype(
@@ -1215,7 +1273,9 @@ def _complete_graph_isotropic_box_qp_compiled_impl(
 # Dtype, layout and execution-mode changes can still require new compilations;
 # application failure records remain specific to their exact metadata below.
 _CUDA_BOX_QP_DYNAMIC = True
+_CUDA_COMPILE_STATS_LIMIT = 256
 _cuda_box_qp_compile_stats: dict[tuple, dict] = {}
+_cuda_box_qp_evicted_stats: dict[str, int] = {}
 _cuda_box_qp_active_signature: ContextVar[tuple | None] = ContextVar(
     "cuda_box_qp_active_signature", default=None,
 )
@@ -1240,10 +1300,25 @@ def _cuda_box_qp_signature(args) -> tuple:
 
 
 def _cuda_box_qp_stats(signature: tuple) -> dict:
-    return _cuda_box_qp_compile_stats.setdefault(signature, dict(
-        calls=0, compile_attempts=0, compilations=0, recompilations=0,
-        executions=0, fallbacks=0, failed=False, failure=None,
-    ))
+    return _bounded_compile_stats(_cuda_box_qp_compile_stats, _cuda_box_qp_evicted_stats, signature)
+
+
+def _bounded_compile_stats(store: dict, evicted: dict, signature: tuple) -> dict:
+    """Bound exact-signature metadata, retaining tensor-free lifetime totals."""
+    stats = store.pop(signature, None)
+    if stats is None:
+        stats = dict(
+            calls=0, compile_attempts=0, compilations=0, recompilations=0,
+            executions=0, fallbacks=0, failed=False, failure=None,
+        )
+    store[signature] = stats
+    while len(store) > _CUDA_COMPILE_STATS_LIMIT:
+        removed = store.pop(next(iter(store)))
+        evicted["signatures"] = evicted.get("signatures", 0) + 1
+        for name, value in removed.items():
+            if isinstance(value, int):
+                evicted[name] = evicted.get(name, 0) + int(value)
+    return stats
 
 
 def _box_qp_inductor_backend(graph, inputs):
@@ -1310,16 +1385,40 @@ class _BoxQPCompiledVariants:
     across valid dtype, singleton and layout variants. Each static guard family
     now owns a distinct code object, while dynamic non-singleton N/R dimensions
     still share compiled graphs. Eviction drops the callable, not global caches.
+    A failed owner keeps a tensor-free negative entry until that same bounded
+    family is evicted; detail-stat eviction alone never authorizes a retry.
     """
 
-    def __init__(self, implementation, *, max_families=32):
+    def __init__(self, implementation, *, max_families=32, backend=_box_qp_inductor_backend,
+                 family_key=_box_qp_guard_family):
         self.implementation = implementation
+        self.backend = backend
+        self.family_key = family_key
         self.max_families = max_families
         self.variants = OrderedDict()
 
+    def failure(self, args):
+        family = self.family_key(args)
+        value = self.variants.get(family)
+        if isinstance(value, str):
+            self.variants.move_to_end(family)
+            return value
+        return None
+
+    def remember_failure(self, args, message):
+        # Keep only text, never an exception/traceback retaining runtime tensors.
+        family = self.family_key(args)
+        self.variants.pop(family, None)
+        self.variants[family] = str(message)
+        if len(self.variants) > self.max_families:
+            self.variants.popitem(last=False)
+
     def __call__(self, *args):
-        family = _box_qp_guard_family(args)
+        family = self.family_key(args)
         compiled = self.variants.pop(family, None)
+        if isinstance(compiled, str):
+            self.variants[family] = compiled
+            raise RuntimeError(f"CUDA compile family remains disabled: {compiled}")
         if compiled is None:
             original = self.implementation
             name = f"{original.__name__}_guards_{next(_box_qp_owner_ids)}"
@@ -1327,7 +1426,7 @@ class _BoxQPCompiledVariants:
             function = FunctionType(original.__code__.replace(co_name=name),
                                     original.__globals__, name,
                                     original.__defaults__, original.__closure__)
-            compiled = torch.compile(function, backend=_box_qp_inductor_backend,
+            compiled = torch.compile(function, backend=self.backend,
                                      fullgraph=True, dynamic=_CUDA_BOX_QP_DYNAMIC)
         self.variants[family] = compiled
         if len(self.variants) > self.max_families:
@@ -1354,6 +1453,9 @@ def _run_compiled_box_qp(args, compiled, eager) -> torch.Tensor:
     signature = _cuda_box_qp_signature(args)
     stats = _cuda_box_qp_stats(signature)
     stats["calls"] += 1
+    failure = compiled.failure(args) if isinstance(compiled, _BoxQPCompiledVariants) else None
+    if failure is not None:
+        stats.update(failed=True, failure=failure)
     if stats["failed"]:
         stats["fallbacks"] += 1
         return eager(*args)
@@ -1371,6 +1473,8 @@ def _run_compiled_box_qp(args, compiled, eager) -> torch.Tensor:
         if not exception_module.startswith(("torch._dynamo", "torch._inductor")):
             raise
         stats.update(failed=True, failure=f"{type(exc).__name__}: {exc}"[:3000])
+        if isinstance(compiled, _BoxQPCompiledVariants):
+            compiled.remember_failure(args, stats["failure"])
         stats["fallbacks"] += 1
         warnings.warn(
             "CUDA box-QP compilation failed for this signature; "
@@ -1382,6 +1486,132 @@ def _run_compiled_box_qp(args, compiled, eager) -> torch.Tensor:
         return eager(*args)
     finally:
         _cuda_box_qp_active_signature.reset(token)
+
+
+_cuda_edge_phase_compile_stats: dict[tuple, dict] = {}
+_cuda_edge_phase_evicted_stats: dict[str, int] = {}
+_cuda_edge_phase_active_signature: ContextVar[tuple | None] = ContextVar(
+    "cuda_edge_phase_active_signature", default=None,
+)
+
+
+def _cuda_edge_phase_stats(signature):
+    return _bounded_compile_stats(
+        _cuda_edge_phase_compile_stats, _cuda_edge_phase_evicted_stats, signature,
+    )
+
+
+def _cuda_compile_accounting():
+    """Tensor-free accounting, including signatures removed from bounded detail."""
+    totals = {}
+    for name, store, evicted in (
+        ("box_qp", _cuda_box_qp_compile_stats, _cuda_box_qp_evicted_stats),
+        ("edge_phase", _cuda_edge_phase_compile_stats, _cuda_edge_phase_evicted_stats),
+    ):
+        values = dict.fromkeys(("calls", "compile_attempts", "compilations", "recompilations",
+                                "executions", "fallbacks", "failed"), 0)
+        values.update(evicted)
+        values["evicted_signatures"] = values.pop("signatures", 0)
+        values["resident_signatures"] = len(store)
+        for stats in store.values():
+            for key, value in stats.items():
+                if isinstance(value, int):
+                    values[key] = values.get(key, 0) + int(value)
+        totals[name] = values
+    return totals
+
+
+def _edge_phase_inductor_backend(graph, inputs):
+    signature = _cuda_edge_phase_active_signature.get()
+    if signature is not None:
+        _cuda_edge_phase_stats(signature)["compile_attempts"] += 1
+    compiled = torch._inductor.compile(graph, inputs)
+    if signature is not None:
+        stats = _cuda_edge_phase_stats(signature)
+        stats["compilations"] += 1
+        stats["recompilations"] = max(0, stats["compilations"] - 1)
+
+    def execute(*values):
+        result = compiled(*values)
+        active = _cuda_edge_phase_active_signature.get()
+        if active is not None:
+            _cuda_edge_phase_stats(active)["executions"] += 1
+        return result
+
+    return execute
+
+
+def _admm_shrink_edge_impl(argument, ratio, phase):
+    # Keep norm and division outside: preserve their eager numerical routes.
+    shrink = torch.clamp(1.0 - ratio, min=0.0)
+    return shrink * argument if phase == 0 else argument * shrink
+
+
+def _admm_dual_edge_impl(phi, edge_u, edge_v, split, scaled_dual, phase):
+    diff = phi[edge_u] - phi[edge_v]
+    residual = diff - split
+    updated_dual = scaled_dual + residual
+    return (diff, residual, updated_dual) if phase == 0 else (residual, updated_dual)
+
+
+def _edge_phase_guard_family(args):
+    # Read-only chunk views may advance their storage offset every call. Their
+    # data pointers already carry that offset; it is not a kernel specialization.
+    metadata, *rest = _box_qp_guard_family(args)
+    return tuple(value[:-1] for value in metadata), *rest
+
+
+def _cuda_edge_phase_signature(args):
+    # Keep exact shapes/layouts but not harmless chunk-view storage offsets.
+    # Otherwise a many-chunk sweep could evict all diagnostic detail every pass.
+    metadata, *rest = _cuda_box_qp_signature(args)
+    return tuple(value[:-1] for value in metadata), *rest
+
+
+_compiled_admm_shrink_edge_cuda = _BoxQPCompiledVariants(
+    _admm_shrink_edge_impl, backend=_edge_phase_inductor_backend, family_key=_edge_phase_guard_family,
+)
+_compiled_admm_dual_edge_cuda = _BoxQPCompiledVariants(
+    _admm_dual_edge_impl, backend=_edge_phase_inductor_backend, family_key=_edge_phase_guard_family,
+)
+
+
+def _run_compiled_edge_phase(args, compiled, eager):
+    if args[0].device.type != "cuda" or any(value.requires_grad for value in args[:-1]):
+        return eager(*args)
+    # No copy: release view-base metadata that Dynamo otherwise duck-specializes
+    # to changing chunk offsets. Helpers are pure; autograd callers stay eager.
+    args = (*tuple(value.detach() for value in args[:-1]), args[-1])
+    signature = (eager.__name__, _cuda_edge_phase_signature(args))
+    stats = _cuda_edge_phase_stats(signature)
+    stats["calls"] += 1
+    failure = compiled.failure(args) if isinstance(compiled, _BoxQPCompiledVariants) else None
+    if failure is not None:
+        stats.update(failed=True, failure=failure)
+    if stats["failed"]:
+        stats["fallbacks"] += 1
+        return eager(*args)
+    token = _cuda_edge_phase_active_signature.set(signature)
+    try:
+        before = stats["executions"]
+        result = compiled(*args)
+        if stats["executions"] == before:
+            stats["fallbacks"] += 1
+        return result
+    except Exception as error:
+        if not type(error).__module__.startswith(("torch._dynamo", "torch._inductor")):
+            raise
+        stats.update(failed=True, failure=f"{type(error).__name__}: {error}"[:3000])
+        if isinstance(compiled, _BoxQPCompiledVariants):
+            compiled.remember_failure(args, stats["failure"])
+        stats["fallbacks"] += 1
+        warnings.warn(
+            f"CUDA ADMM edge compilation failed; using eager CUDA kernels: {error}",
+            RuntimeWarning, stacklevel=2,
+        )
+        return eager(*args)
+    finally:
+        _cuda_edge_phase_active_signature.reset(token)
 
 
 def _closed_form_box_fusion_result(
@@ -1584,10 +1814,19 @@ def solve_majorized_subproblem_alm_torch(
                 z_new.add_(scaled_dual[edge_slice])
                 z_norm = torch.linalg.vector_norm(z_new, dim=1, keepdim=True)
                 shrink_radius = float(lambda_value) * edge_w[edge_slice] / float(rho)
-                shrink = torch.clamp(
-                    1.0 - shrink_radius[:, None] / z_norm.clamp_min(1e-12), min=0.0,
-                )
-                z_new.mul_(shrink)
+                if runtime.device.type == "cuda":
+                    shrink_ratio = shrink_radius[:, None] / z_norm.clamp_min(1e-12)
+                    z_new = _run_compiled_edge_phase(
+                        (z_new, shrink_ratio, 1), _compiled_admm_shrink_edge_cuda,
+                        _admm_shrink_edge_impl,
+                    )
+                    del shrink_ratio
+                else:
+                    shrink = torch.clamp(
+                        1.0 - shrink_radius[:, None] / z_norm.clamp_min(1e-12), min=0.0,
+                    )
+                    z_new.mul_(shrink)
+                    del shrink
                 if dual_residual_node is not None:
                     z_delta = z_new - z_state[edge_slice]
                     z_delta.mul_(rho_used)
@@ -1598,20 +1837,29 @@ def solve_majorized_subproblem_alm_torch(
                 z_new.sub_(scaled_dual[edge_slice])
                 q.index_add_(0, edge_u[edge_slice], z_new)
                 q.index_add_(0, edge_v[edge_slice], z_new, alpha=-1.0)
-                del z_new, z_norm, shrink, shrink_radius
+                del z_new, z_norm, shrink_radius
         else:
             z_argument = edge_diff + scaled_dual
             z_norm = torch.linalg.norm(z_argument, dim=1, keepdim=True)
-            shrink = torch.clamp(
-                1.0 - shrink_radius[:, None] / z_norm.clamp_min(1e-12), min=0.0,
-            )
-            z_new = shrink * z_argument
+            if runtime.device.type == "cuda":
+                shrink_ratio = shrink_radius[:, None] / z_norm.clamp_min(1e-12)
+                z_new = _run_compiled_edge_phase(
+                    (z_argument, shrink_ratio, 0), _compiled_admm_shrink_edge_cuda,
+                    _admm_shrink_edge_impl,
+                )
+                del shrink_ratio
+            else:
+                shrink = torch.clamp(
+                    1.0 - shrink_radius[:, None] / z_norm.clamp_min(1e-12), min=0.0,
+                )
+                z_new = shrink * z_argument
+                del shrink
             rhs_edge = z_new - scaled_dual
             q = graph_adjoint_edges(
                 rhs_edge, edge_u=edge_u, edge_v=edge_v,
                 num_nodes=int(phi.shape[0]), prefer_cpu_bincount=True,
             )
-            del z_argument, z_norm, shrink, rhs_edge
+            del z_argument, z_norm, rhs_edge
 
         phi_new = _complete_graph_isotropic_box_qp_torch(
             U=U, h=h, lower=lower, upper=upper, rho=rho_t, q=q, max_iter=box_iter,
@@ -1624,15 +1872,26 @@ def solve_majorized_subproblem_alm_torch(
                 torch.zeros((), dtype=runtime.dtype, device=runtime.device) if rho_update_due else None
             )
             for edge_slice in _edge_slices(num_edges, chunk_size):
-                primal_residual = graph_forward_edges(
-                    phi_new, edge_u=edge_u[edge_slice], edge_v=edge_v[edge_slice],
-                )
-                primal_residual.sub_(z_state[edge_slice])
+                if runtime.device.type == "cuda":
+                    primal_residual, updated_dual = _run_compiled_edge_phase(
+                        (phi_new, edge_u[edge_slice], edge_v[edge_slice], z_state[edge_slice],
+                         scaled_dual[edge_slice], 1), _compiled_admm_dual_edge_cuda,
+                        _admm_dual_edge_impl,
+                    )
+                else:
+                    primal_residual = graph_forward_edges(
+                        phi_new, edge_u=edge_u[edge_slice], edge_v=edge_v[edge_slice],
+                    )
+                    primal_residual.sub_(z_state[edge_slice])
                 if primal_sum_squares is not None:
                     primal_sum_squares.add_(torch.dot(
                         primal_residual.reshape(-1), primal_residual.reshape(-1),
                     ))
-                scaled_dual[edge_slice].add_(primal_residual)
+                if runtime.device.type == "cuda":
+                    scaled_dual[edge_slice].copy_(updated_dual)
+                    del updated_dual
+                else:
+                    scaled_dual[edge_slice].add_(primal_residual)
                 if audit_adjoint is not None:
                     actual_dual_chunk = rho_used * scaled_dual[edge_slice]
                     audit_adjoint.index_add_(0, edge_u[edge_slice], actual_dual_chunk)
@@ -1644,9 +1903,17 @@ def solve_majorized_subproblem_alm_torch(
                 dual_norm = float(torch.linalg.vector_norm(dual_residual_node).item())
                 del primal_sum_squares, dual_residual_node
         else:
-            edge_diff_new = graph_forward_edges(phi_new, edge_u=edge_u, edge_v=edge_v)
-            primal_residual = edge_diff_new - z_new
-            scaled_dual.add_(primal_residual)
+            if runtime.device.type == "cuda":
+                edge_diff_new, primal_residual, updated_dual = _run_compiled_edge_phase(
+                    (phi_new, edge_u, edge_v, z_new, scaled_dual, 0),
+                    _compiled_admm_dual_edge_cuda, _admm_dual_edge_impl,
+                )
+                scaled_dual.copy_(updated_dual)
+                del updated_dual
+            else:
+                edge_diff_new = graph_forward_edges(phi_new, edge_u=edge_u, edge_v=edge_v)
+                primal_residual = edge_diff_new - z_new
+                scaled_dual.add_(primal_residual)
             if rho_update_due:
                 primal_norm = float(torch.linalg.norm(primal_residual).item())
                 z_delta = z_new - z_previous
