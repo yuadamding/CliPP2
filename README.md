@@ -51,8 +51,7 @@ The fitting options are:
 | `--verbose` | Disabled | Verbose execution output |
 
 Use `clipp2 fit --help` for command help and `clipp2 --version` for the package
-version. Solver tolerances, selection score, and partition policy are fixed
-internally rather than exposed as CLI controls.
+version. 
 
 ### CUDA execution
 
