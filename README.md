@@ -21,59 +21,6 @@ Every mutation–sample pair must be represented, including pairs with missing
 read counts. For a segment with multiple CN states, include every state and
 keep the repeated observation fields consistent.
 
-### CN eligibility
-
-CliPP2 excludes a mutation from **all regions** if **any original CN state in
-any region** has major CN greater than `--max-major-cn` (**default: 4**).
-The cutoff is inclusive: major CN 4 passes the default filter, whereas 5 does
-not. All states are checked, including low-fraction states and regions with
-missing read counts; average CN does not determine eligibility.
-
-**Subclonal CN alone is not an exclusion criterion.** Different CN states
-between regions are also allowed. If the filter removes every mutation,
-loading raises `NoEligibleSNVsError` and no result tables are written.
-
-### Multiplicity and the count model
-
-For each retained mutation–region pair, the likelihood marginalizes integer
-multiplicity candidates from **1 to min(4, maximum major CN)** with uniform
-priors. For mixed CN, the maximum is taken across that region's CN states.
-Increasing `--max-major-cn` changes eligibility only; multiplicity candidates
-remain capped at four.
-
-Copy number and purity determine the fixed scaling
-
-```text
-scaling = purity / ((1 - purity) * normal_cn + purity * mean_total_cn)
-```
-
-Here, `mean_total_cn` is the CN-fraction-weighted total tumor copy number.
-Each candidate's binomial probability is the clipped value of
-`scaling * multiplicity * CCF`, with probability-safe CCF bounds.
-
-For mixed CN, this is a **bulk-CN approximation**, not an explicit model of
-which CN populations carry the mutation. It does not infer CN-population
-occupancy, mutation timing, or a lineage history. The resulting CCF upper bound
-can be below one even when a mutation passes the CN filter.
-
-## Occupied clonal cluster
-
-CliPP2 requires **at least one retained mutation with CCF exactly 1 in every
-region**. Clonal membership and size are inferred. There is no additional
-attraction-to-one penalty, minimum clonal size beyond one, or separation
-constraint on the other centers.
-
-Eligibility is evaluated using the original float64 bounds. If no retained
-mutation can reach one in every region, fitting raises
-`ClonalConstraintInfeasibleError`; it does not expand bounds or substitute a
-near-one value. A mutation without informative counts can satisfy this domain
-constraint, so clonal occupancy alone is not count-based evidence of clonality.
-
-Raw fitting searches eligible witness boxes on the frozen graph. A witness-box
-KKT certificate is conditional on that box, not a global guarantee over all
-witnesses or partitions. The run summary distinguishes numerical certification
-from witness-search completion.
-
 ## Fit
 
 CUDA is the default:
