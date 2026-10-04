@@ -92,11 +92,22 @@ def verify_selected(model, result):
     if weights.shape != (q,) or not np.isfinite(weights).all() or np.any(weights <= 0) or not np.isclose(weights.sum(), 1, atol=1e-12, rtol=0):
         raise ValueError('Published components need positive normalized fitted weights')
     cuts = tuple(e for e, (i, j) in enumerate(result.tree.edges) if labels[i] != labels[j])
-    if cuts != tuple(result.selected.cuts):
-        raise ValueError('Selected tree-cut provenance disagrees with its memberships')
-    connected = partition_from_cuts(result.tree, cuts)
-    if len(cuts)+1 != q or any(len(np.unique(connected[labels == k])) != 1 for k in range(q)):
-        raise ValueError('Selected blocks must be connected in the frozen tree')
+    kind = getattr(result.selected, 'membership_kind', 'tree')
+    if kind == 'tree':
+        if cuts != tuple(result.selected.cuts):
+            raise ValueError('Selected tree-cut provenance disagrees with its memberships')
+        connected = partition_from_cuts(result.tree, cuts)
+        if len(cuts)+1 != q or any(len(np.unique(connected[labels == k])) != 1 for k in range(q)):
+            raise ValueError('Selected blocks must be connected in the frozen tree')
+    elif kind == 'general':
+        if not any(candidate is result.selected for candidate in result.candidate_bank):
+            raise ValueError('Selected general candidate is absent from the retained bank')
+        if result.selected.cuts is not None:
+            raise ValueError('General membership must not claim tree-cut provenance')
+        if list(dict.fromkeys(labels.tolist())) != list(range(q)):
+            raise ValueError('General memberships must use canonical first-occurrence labels')
+    else:
+        raise ValueError('Unknown selected membership contract')
     for k in range(q):
         if not observed[labels == k].any(axis=0).all():
             raise ValueError('Unsupported cluster-region center cannot be published')
@@ -134,6 +145,7 @@ def verify_selected(model, result):
         raise ValueError('Selected fit is not the best complete-bank score')
     validity = float(np.log(allowed @ weights).sum())
     return {'independently_verified': True, 'conditional_log_likelihood': conditional,
+            'membership_kind': kind, 'connected_on_proposal_tree': len(cuts)+1 == q,
             'hard_partition_log_likelihood': conditional,
             'mixture_log_likelihood': mixture, 'complexity_penalty': penalty, 'score': score,
             'score_definition': SCORE_DEFINITION,

@@ -13,7 +13,7 @@ from ._version import __version__
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipp2", allow_abbrev=False,
-        description="Fit the free-center regional frozen-tree multiplicity-mixture estimator.",
+        description="Fit the free-center tree-proposed joint-region multiplicity-mixture estimator.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=__version__)
@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fit.add_argument("--verbose", action="store_true")
     fit.add_argument("--max-clusters", type=int, choices=range(1, 11), default=10,
-                     help="Largest connected-tree cluster capacity (at most 10).")
+                     help="Largest occupied cluster capacity (at most 10).")
     fit.add_argument("--version", action="version", version=__version__)
     return parser
 

@@ -1,1 +1,1 @@
-"""Free-center regional frozen-tree estimator."""
+"""Free-center tree proposals and bounded joint-membership selection."""

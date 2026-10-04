@@ -2,14 +2,15 @@
 
 CliPP2 fits one joint mutation partition across tumor regions, estimates regional
 cancer-cell fractions (CCFs), and reports mutation–region multiplicity.
-The default is a **free-center frozen-tree estimator** implemented by
+The default is a **free-center, tree-proposed joint estimator** implemented by
 CliPP2's own multi-region [kernel](kernel/). CliPP2 and CliPP1.5 are independent
 repositories; the latter is a development comparison reference, not a runtime
 dependency. Algorithm ancestry is recorded in [NOTICE](NOTICE).
 It does **not** require a clonal cluster or attract centers toward one.
 
 This migration changes the estimator, not merely its implementation speed.
-The tree restricts selectable clusters to connected components; it is a
+The tree supplies connected candidates; a bounded multi-region reassignment
+stage also permits final groups disconnected on that tree. It is a
 mutation-similarity tree, **not a tumor phylogeny**. Local reference checks
 are not a claim of cohort accuracy, GPU speedup, or global optimality.
 
@@ -36,7 +37,7 @@ silent CPU fallback when CUDA is unavailable.
 | `--outdir` | `clipp2_results` | New output namespace |
 | `--device` | `cuda` | `cuda` or `cpu` |
 | `--max-major-cn` | `4` | Whole-mutation eligibility cutoff |
-| `--max-clusters` | `10` | Maximum tree-component capacity, 1–10 |
+| `--max-clusters` | `10` | Maximum occupied cluster capacity, 1–10 |
 | `--verbose` | Disabled | Retained CLI compatibility option |
 
 ## Input, filtering and multiplicity
@@ -97,12 +98,43 @@ during fitting, and called only conditional on the final refitted CCF.
 5. Fitted mixture weights score the **product of observed regional likelihoods
    inside each admissible cluster mixture**, with penalty
    `[q*R + (q-1)] * log(N)`, where N counts retained mutation vectors.
-   The winner is the minimum over the entire eligible scored candidate bank.
+6. After the complete tree search, multi-region fits add bounded fixed-K
+   joint-membership proposals. Up to four distinct starting partitions include
+   the original winner and best representatives of different occupied K values.
+   Each gets at most two rounds, with one best legal single transfer and one
+   greedy batch: at most **16 proposal callbacks and eight joint-column
+   evaluations**. Missing, duplicate, rejected and ineligible proposals consume
+   their slots without replacement. K=1 has no transfer. Single-region paths
+   do not invoke this stage.
+7. The winner is the minimum score over **all original and new eligible fitted
+   states**. The original bank is retained intact, including distinct numerical
+   states with identical memberships. This guarantees a non-worsening retained
+   score, not improved biological accuracy.
+
+Transfers use positive **unweighted joint read-likelihood gains** at current
+centers, not independent regional assignments or mixture-weight preferences.
+They cannot empty a source group or remove its last observed mutation in any
+region; destination centers must satisfy complete-vector admissibility,
+including missing-read CN bounds. Greedy batches update support after each
+transfer and move a mutation at most once. Parent centers are canonically
+aligned and passed to the unchanged conditional refitter. Zero optimized
+weights remain ineligible. No split, merge, weight floor or component deletion
+is added. Fixed K applies to each path; different starting paths can have
+different K, so the final selected K can differ from the original winner.
+
+At fixed centers and weights the mixture likelihood does not depend on hard
+labels. Reassignment is therefore **proposal generation, not EM**. Every
+proposed partition must be refitted and scored over the whole dataset. A path
+advances only when its score improves by more than
+`1e-7 + 1e-10 * max(abs(old_score), abs(new_score))`; eligible non-advancing
+states remain available for final selection. Work limits do not guarantee wall
+time. Diagnostics separate proposal counts, refits/cache reuse, scalar and
+weight work, added payload bytes, and inclusive reassignment time.
 
 The centers are conditional partition refits, **not** a joint mixture-center
 MLE. Finite continuation, residual convergence, numerical scalar search and
 global optimality are distinct claims. The independent publication audit checks
-bounds, connected memberships, joint reads/validity likelihood, fitted-weight optimality,
+bounds, declared tree/general memberships, joint reads/validity likelihood, fitted-weight optimality,
 score and complete-bank reconciliation.
 
 ### Mixed-CN assignment consistency
@@ -171,11 +203,13 @@ still takes O(N²R) distance work once. Host active-set iterations and candidate
 refits remain potential bottlenecks. Offline `topology_diagnostics`,
 `offline_truth_replay` and tiny exhaustive references quantify tree
 fragmentation and search loss; truth never enters production fitting.
-The added one-edge coverage does not exhaust higher-order partitions or remove
-the topology restriction. In particular, collectively supported mutations can
-remain disconnected within the frozen tree when their measurements do not
-overlap. Selected-fit verification reconciles the scored bank; it does not
-prove search completeness or accurate clone recovery.
+One-edge coverage does not exhaust higher-order tree partitions. The additional
+fixed-K stage expands final memberships beyond connected components, but is
+still bounded and conservative: a destination infeasible at the current center
+is not proposed even if refitting could make it feasible. Selected-fit
+verification reconciles the full bank; it does not prove search completeness,
+global optimality or accurate clone recovery. The single-region specialization
+retains its original connected-chain behavior.
 
 Large-tree proposal ranking uses a fixed 34-point regional grid, streamed in
 column blocks. The original mixed lower endpoint is included even for narrow
@@ -186,7 +220,7 @@ different observations on a fixed tree; it does not make tree construction or
 genuinely indistinguishable ties invariant to all renamings. The exchange route
 remains support-ranked. Diagnostics report the supported-edge population, exact
 evaluated one-edge fraction, ranking method and refinement work counts; timings
-include supplemental search separately. Inclusive phase times overlap refit
+include supplemental search and reassignment separately. Inclusive phase times overlap refit
 time and must not be added as independent costs.
 
 ## Outputs
