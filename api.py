@@ -22,7 +22,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     from .tree.selection import fit_tree
     from .tree.reporting import ALGORITHM, check_destination, exclusion_summary, publish
     from ._source import source_fingerprint, git_source_identity
-    from .kernel import KERNEL_VERSION
+    from .kernel import KERNEL_VERSION, SCORE_DEFINITION
 
     config = resolve_fit_config() if fit_config is None else fit_config
     if type(config) is not FitConfig:
@@ -60,7 +60,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
         'num_mutations': model.n, 'num_regions': model.r,
         'num_clusters': len(result.centers), 'region_ids': model.region_ids,
         'fit_config': asdict(config), 'model_identity': model.identity,
-        'score': result.score, 'score_definition': 'conditional_centers_joint_observed_mixture_bic_v1',
+        'score': result.score, 'score_definition': SCORE_DEFINITION,
         'clonal_constraint': False, 'cluster_zero': 'largest_final_ccf_l2_norm',
         'exclusions': exclusion_summary(model), 'diagnostics': result.diagnostics,
         'verification_publication_seconds': perf_counter()-verification_start,

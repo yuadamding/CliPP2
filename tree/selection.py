@@ -2,7 +2,8 @@
 
 The winner is reconciled against every eligible scored candidate, including
 intermediate refinement states. Exhaustive enumeration covers only connected
-coarsenings of generated seeds, not all possible trees or continuous optima.
+coarsenings of generated seeds and supported one-edge splits of small trees,
+not all possible tree partitions or continuous optima.
 """
 
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from time import perf_counter
 import numpy as np
 
 from .refinement import canonical_partition, refine_partition
+from ..kernel import ALGORITHM
 from ..kernel.topology import build_tree, partition_from_cuts
 
 
@@ -111,6 +113,120 @@ def cut_subsets(cuts):
 def _score_key(candidate):
     # Stable structural tie rule; no special clonal preference.
     return candidate.score, len(candidate.cuts), candidate.cuts
+
+
+def _supported_split_edges(model, tree, cuts=()):
+    """Rank forest splits with observations on both sides in every region.
+
+    One forest traversal costs O(NR) work/storage. Missing counts are never
+    filled in. Regional counts rank balanced support first, then block size,
+    then canonical edge ID; zero pilot/solver jumps are deliberately irrelevant.
+    Observation support is necessary, not sufficient: the ordinary conditional
+    refit still checks member-box intersections and mixture-weight eligibility.
+    """
+    removed = set(cuts)
+    adjacency = [[] for _ in range(tree.n)]
+    for edge, (a, b) in enumerate(tree.edges):
+        if edge not in removed:
+            adjacency[a].append((int(b), edge))
+            adjacency[b].append((int(a), edge))
+    parent = np.full(tree.n, -1, dtype=np.int64)
+    parent_edge = np.full(tree.n, -1, dtype=np.int64)
+    component = np.empty(tree.n, dtype=np.int64)
+    order, roots = [], []
+    for root in range(tree.n):
+        if parent[root] >= 0:
+            continue
+        roots.append(root)
+        parent[root] = root
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            order.append(node)
+            component[node] = root
+            for neighbor, edge in adjacency[node]:
+                if parent[neighbor] < 0:
+                    parent[neighbor], parent_edge[neighbor] = node, edge
+                    stack.append(neighbor)
+    counts = np.asarray(model.observed, dtype=np.int64).copy()
+    sizes = np.ones(tree.n, dtype=np.int64)
+    for node in reversed(order):
+        if parent[node] != node:
+            counts[parent[node]] += counts[node]
+            sizes[parent[node]] += sizes[node]
+    if np.any(counts[roots] == 0):
+        return []  # Splitting cannot repair a region missing from a whole block.
+    ranked = []
+    for node in order:
+        if parent[node] == node:
+            continue
+        root = component[node]
+        evidence = int(np.minimum(counts[node], counts[root] - counts[node]).min())
+        if evidence > 0:
+            balance = int(min(sizes[node], sizes[root] - sizes[node]))
+            ranked.append((-evidence, -balance, int(parent_edge[node])))
+    return [edge for _, _, edge in sorted(ranked)]
+
+
+def _add_supported_proposals(model, tree, bank, capacities, seeds):
+    """Supplement, never replace, the original continuation/refinement bank.
+
+    For N<=64, all observation-supported one-edge splits are scored when q=2
+    is requested (or repairs an unsupported higher-capacity seed). Larger
+    trees score at most 32 support-ranked splits. Up to 16 same-q exchanges
+    from at most eight unsupported native cut sets repair missed support
+    without changing the frozen tree. Each new proposal gets the same refit
+    and score; no recursive refinement is launched from these extra routes.
+    These fixed proposal counts are not elapsed-time limits or exhaustive
+    search claims. Higher-order splits and unexamined large-tree edges remain
+    possible search deficits even when every stored candidate is reconciled.
+    """
+    unsupported = {}
+    for seed in seeds:
+        cuts = tuple(sorted(map(int, seed["cuts"])))
+        reason = str(bank.ineligible.get(cuts, {}).get("reason", ""))
+        if reason.startswith(("unsupported_cluster_region", "empty_cluster_region_box")):
+            unsupported[cuts] = min(unsupported.get(cuts, 10), int(seed["requested_k"]))
+    repair_capacity = min((k for k in unsupported.values() if k >= 2), default=None)
+    requested = 2 if 2 in capacities else repair_capacity
+    small = tree.n <= 64
+    edges = _supported_split_edges(model, tree) if requested is not None else []
+    chosen = sorted(edges) if small else edges[:32]
+    for edge in chosen:
+        cuts = (edge,)
+        bank.consider(cuts, partition_from_cuts(tree, cuts), None, {
+            "route": "supported_one_edge_split", "requested_k": requested,
+            "occupied_q": 2, "zero_jumps_allowed": True,
+        })
+    exchanged, scanned = set(), 0
+    for original in sorted(unsupported)[:8]:
+        if len(original) < 2:
+            continue  # One-cut alternatives are already covered above.
+        for removed in original:
+            base = tuple(edge for edge in original if edge != removed)
+            scanned += 1
+            for edge in _supported_split_edges(model, tree, base):
+                cuts = tuple(sorted((*base, edge)))
+                if cuts == original or cuts in exchanged:
+                    continue
+                exchanged.add(cuts)
+                bank.consider(cuts, partition_from_cuts(tree, cuts), None, {
+                    "route": "supported_cut_exchange", "requested_k": unsupported[original],
+                    "occupied_q": len(cuts) + 1, "parent_cuts": original,
+                    "removed_edge": removed, "replacement_edge": edge,
+                })
+                if len(exchanged) == 16:
+                    break
+            if len(exchanged) == 16:
+                break
+        if len(exchanged) == 16:
+            break
+    return {"small_tree_node_limit": 64, "large_tree_split_limit": 32,
+            "supported_one_edge_splits": len(edges), "one_edge_proposals": len(chosen),
+            "all_supported_one_edge_splits_considered": requested is not None and len(chosen) == len(edges),
+            "exchange_parent_limit": 8, "exchange_proposal_limit": 16,
+            "exchange_proposals": len(exchanged), "exchange_forests_scanned": scanned,
+            "exhaustive_tree_partition_search": False}
 
 
 class _CandidateBank:
@@ -245,6 +361,7 @@ def fit_tree(model, max_clusters=10, capacities=None):
             if proposal is None:
                 repair_unsupported(subset, len(subset) + 1, {"route": "connected_coarsening"})
             refine_once(proposal)
+    supported_proposals = _add_supported_proposals(model, tree, bank, capacities, seeds)
     if not bank.candidates:
         reasons = sorted({entry["reason"] for entry in bank.ineligible.values()})
         raise ValueError(f"No supported finite-score tree candidate: {reasons}")
@@ -257,10 +374,11 @@ def fit_tree(model, max_clusters=10, capacities=None):
         if name in getattr(model, "telemetry", {}):
             times[name] = model.telemetry[name] - telemetry_started.get(name, 0.0)
     return TreeFit(selected, bank.candidates, tree, np.asarray(pilot), {
-        "pipeline": "frozen_tree_conditional_centers_joint_mixture_v1",
+        "pipeline": ALGORITHM,
         "tree_identity": tree.identity, "tree_kind": "mutation_similarity_not_phylogeny",
         "pilots": pilot_diagnostics, "seeds": seeds_diagnostics,
         "capacities": capacities, "enumerated_cut_subsets": subset_count,
+        "supported_proposals": supported_proposals,
         "eligible_scored_candidates": len(bank.candidates),
         "unique_eligible_partitions": len(bank.by_cuts),
         "ineligible_candidate_count": len(bank.ineligible),

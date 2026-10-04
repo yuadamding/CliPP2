@@ -64,7 +64,8 @@ four. CCF geometry is on the CCF scale; inherited cellular prevalence is
 converted by regional purity. Normal CN other than two uses an explicit
 generalized-denominator adapter.
 
-Mixed CN remains a separately versioned `mixed_cn_bulk_v1` model: uniform
+Mixed CN uses the separately versioned `mixed_cn_bulk_assignment_event_v2`
+model: uniform
 support 1…min(4, maximum major CN), the original fraction-weighted bulk
 denominator, clipping and feasible box. This is not an evolutionary
 mixed-CN model and is not claimed equivalent to the single-state inheritance.
@@ -81,17 +82,53 @@ during fitting, and called only conditional on the final refitted CCF.
    Forest QPs and actual-likelihood line searches use one shared regional cut set.
 4. Every block–region center is refitted freely. Unsupported centers make a
    candidate ineligible. Connected coarsenings and adjacent-pair boundary repairs
-   preserve earlier eligible candidates.
-5. Fitted mixture weights score the **product of regional likelihoods inside
-   each cluster mixture**, with penalty
+   preserve earlier eligible candidates. Supplemental support-aware proposals
+   include zero-jump edges: at most 64 mutations, every observation-supported
+   one-edge split is considered when two clusters are requested or repair an
+   unsupported higher-capacity seed. Larger trees consider at most 32
+   support-ranked splits; up to 16 cut exchanges from eight unsupported native
+   seeds provide additional repairs. These candidates use the same refit and
+   score, without recursively expanding the supplemental search.
+5. Fitted mixture weights score the **product of observed regional likelihoods
+   inside each admissible cluster mixture**, with penalty
    `[q*R + (q-1)] * log(N)`, where N counts retained mutation vectors.
    The winner is the minimum over the entire eligible scored candidate bank.
 
 The centers are conditional partition refits, **not** a joint mixture-center
 MLE. Finite continuation, residual convergence, numerical scalar search and
 global optimality are distinct claims. The independent publication audit checks
-bounds, connected memberships, joint likelihood, fitted-weight optimality,
+bounds, connected memberships, joint reads/validity likelihood, fitted-weight optimality,
 score and complete-bank reconciliation.
+
+### Mixed-CN assignment consistency
+
+For mutation $i$ and center $k$, let $A_{ik}=1$ exactly when the complete CCF
+vector lies inside that mutation's original closed regional bounds, and zero
+otherwise. This includes CN bounds in regions with missing counts; those regions
+contribute no read likelihood. Let $f_{ik}$ be the product of the observed
+regional multiplicity-marginalized read likelihoods. Selection uses
+
+$$
+\ell_{\mathrm{joint}}(w) = \sum_i \log\!\left(\sum_k w_k A_{ik}f_{ik}\right),
+\qquad
+\mathrm{score} = -2\ell_{\mathrm{joint}} + [qR+q-1]\log N.
+$$
+
+This is a **joint reads-plus-assignment-validity criterion**, not read likelihood
+conditioned on validity. With $Z_i=\sum_k w_k A_{ik}$,
+$\ell_{\mathrm{joint}}=\ell_{\mathrm{conditional}}+\sum_i\log Z_i$:
+the admissibility factor is deliberately retained, with no division by $Z_i$.
+Forbidden assignments therefore have zero responsibility in weight fitting,
+scoring and boundary refinement. The independent publication audit reconstructs
+the same rule from the original input. When all assignments are admissible,
+the numerical likelihood and weight optimization are unchanged.
+
+This limited consistency repair does **not** change mixed-CN emissions, support,
+clipping, original bounds or the conditional center refit. In particular, the
+original mixed-CN box can still exclude biologically possible CCF-one histories.
+It adds neither a weight floor nor a clonal, occupancy or evolutionary prior.
+The penalty is BIC-style; this joint criterion is not claimed to be a calibrated
+biological posterior or a newly validated model-selection rule.
 
 Exact single-region compatibility requires matched coordinate tie keys. The
 canonical format has no genomic-coordinate fields, so its documented default
@@ -114,6 +151,11 @@ still takes O(N²R) distance work once. Host active-set iterations and candidate
 refits remain potential bottlenecks. Offline `topology_diagnostics`,
 `offline_truth_replay` and tiny exhaustive references quantify tree
 fragmentation and search loss; truth never enters production fitting.
+The added one-edge coverage does not exhaust higher-order partitions or remove
+the topology restriction. In particular, collectively supported mutations can
+remain disconnected within the frozen tree when their measurements do not
+overlap. Selected-fit verification reconciles the scored bank; it does not
+prove search completeness or accurate clone recovery.
 
 ## Outputs
 

@@ -10,15 +10,35 @@ import numpy as np
 import pandas as pd
 from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 
+from ..kernel import ALGORITHM, SCORE_DEFINITION
 from ..kernel.topology import partition_from_cuts
 
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
-ALGORITHM = 'regional_frozen_tree_conditional_mixture_v1'
+
+def _input_domain(model, centers):
+    """Rebuild observations and closed boxes independently of runtime caches."""
+    centers = np.asarray(centers, dtype=float)
+    if (centers.ndim != 2 or not len(centers) or centers.shape[1] != model.r
+            or not np.isfinite(centers).all()):
+        raise ValueError('Centers must be finite nonempty q by R CCFs')
+    data = model.data
+    ix = np.ix_(model.active_indices, model.region_indices)
+    depth = data.total_counts[ix]
+    observed = np.isfinite(depth) & (depth > 0)
+    if data.count_observed is not None:
+        observed &= np.asarray(data.count_observed, dtype=bool)[ix]
+    mixed = data.cn_state_count[ix] > 1
+    lower, upper = np.where(mixed, 1e-6, 0.), np.where(mixed, data.phi_upper[ix], 1.)
+    allowed = ((centers[None, :, :] >= lower[:, None, :])
+               & (centers[None, :, :] <= upper[:, None, :])).all(axis=2)
+    return observed, allowed
 
 
 def independent_log_columns(model, centers):
-    """Recompute joint emissions from counts/CN, without model caches/kernels."""
+    """Recompute joint reads/validity columns without model caches or kernels."""
+    centers = np.asarray(centers, dtype=float)
+    observed_rows, allowed = _input_domain(model, centers)
     data = model.data
     ix = np.ix_(model.active_indices, model.region_indices)
     alt, depth = data.alt_counts[ix], data.total_counts[ix]
@@ -27,7 +47,9 @@ def independent_log_columns(model, centers):
     support = np.where(mixed, np.minimum(major, 4), major).astype(int)
     answer = np.zeros((model.n, len(centers)))
     for region in range(model.r):
-        observed = model.observed[:, region]
+        observed = observed_rows[:, region]
+        if not observed.any():
+            continue
         y, n = alt[observed, region], depth[observed, region]
         denominator = ((1-purity[observed, region])*normal[observed, region]
                        + purity[observed, region]*total[observed, region])
@@ -44,7 +66,7 @@ def independent_log_columns(model, centers):
             component[s < m] = -np.inf
             marginal = np.logaddexp(marginal, component)
         answer[observed] += marginal
-    return answer
+    return np.where(allowed, answer, -np.inf)
 
 
 def verify_selected(model, result):
@@ -56,8 +78,10 @@ def verify_selected(model, result):
         raise ValueError('Selected result has invalid eligibility or dimensions')
     if not np.issubdtype(labels.dtype, np.integer) or not np.array_equal(np.unique(labels), np.arange(q)):
         raise ValueError('Memberships must be occupied consecutive integer labels')
-    phi = centers[labels]
-    if not np.isfinite(phi).all() or np.any(phi < model.lower) or np.any(phi > model.upper):
+    observed, allowed = _input_domain(model, centers)
+    if not allowed.any(axis=1).all():
+        raise ValueError('A mutation has no admissible center in its original bounds')
+    if not allowed[np.arange(model.n), labels].all():
         raise ValueError('Final conditional CCFs violate their original bounds')
     if weights.shape != (q,) or not np.isfinite(weights).all() or np.any(weights <= 0) or not np.isclose(weights.sum(), 1, atol=1e-12, rtol=0):
         raise ValueError('Published components need positive normalized fitted weights')
@@ -68,10 +92,13 @@ def verify_selected(model, result):
     if len(cuts)+1 != q or any(len(np.unique(connected[labels == k])) != 1 for k in range(q)):
         raise ValueError('Selected blocks must be connected in the frozen tree')
     for k in range(q):
-        if not model.observed[labels == k].any(axis=0).all():
+        if not observed[labels == k].any(axis=0).all():
             raise ValueError('Unsupported cluster-region center cannot be published')
     columns = independent_log_columns(model, centers)
-    kernel = np.exp(columns-columns.max(axis=1)[:, None])
+    offset = columns.max(axis=1)
+    if not np.isfinite(offset).all():
+        raise ValueError('A mutation has zero read likelihood at every admissible center')
+    kernel = np.exp(columns-offset[:, None])
     mass = kernel @ weights
     if not np.all(mass > 0):
         raise ValueError('Every mutation needs positive mixture probability')
@@ -101,6 +128,9 @@ def verify_selected(model, result):
         raise ValueError('Selected fit is not the best complete-bank score')
     return {'independently_verified': True, 'conditional_log_likelihood': conditional,
             'mixture_log_likelihood': mixture, 'complexity_penalty': penalty, 'score': score,
+            'score_definition': SCORE_DEFINITION,
+            'forbidden_assignment_pairs': int((~allowed).sum()),
+            'assignment_validity_log_probability': float(np.log(allowed @ weights).sum()),
             'weight_optimality_gap': weight_gap, 'weight_active_score_gap': active_gap,
             'complete_candidate_bank_reconciled': True,
             'num_parameters': q*model.r+q-1, 'num_mutation_vectors': model.n,

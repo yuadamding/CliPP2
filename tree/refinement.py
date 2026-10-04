@@ -140,11 +140,8 @@ def refine_partition(model, tree, candidate, consider):
         fit = current.refit
         labels = fit.labels
         components = {cluster: np.flatnonzero(labels == cluster) for cluster in range(len(fit.centers))}
+        # The model columns already enforce the complete regional assignment box.
         columns = model.log_likelihood_columns(fit.centers)
-        if hasattr(model, "lower") and hasattr(model, "upper"):
-            infeasible = ((fit.centers[None, :, :] < model.lower[:, None, :])
-                          | (fit.centers[None, :, :] > model.upper[:, None, :])).any(axis=2)
-            columns = np.where(infeasible, -np.inf, columns)
         for edge in current.cuts:
             move = best_pair_boundary(tree, labels, fit.centers, columns, edge,
                                       adjacency=adjacency, components=components)

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from . import KERNEL_VERSION
+from . import ALGORITHM, KERNEL_VERSION
 from .candidates import CandidateStore
 from .initialization import pooled_cp_initialization
 from .likelihood import MultiplicityModel
@@ -91,7 +91,7 @@ def fit_scalar(model, max_clusters=10, *, coordinate_keys=None):
                                kind=str(winner.candidate_kind), diagnostics={})
     return SimpleNamespace(selected=candidate, labels=labels, centers=centers, weights=weights,
         score=fit.score, candidate_bank=records, tree=tree, pilot=pilot, diagnostics={
-            'algorithm': 'regional_frozen_tree_conditional_mixture_v1',
+            'algorithm': ALGORITHM,
             'kernel_version': KERNEL_VERSION, 'native_source_sha256': native_digest,
             'tie_policy': tie_policy, 'tree_identity': tree.identity,
             'continuation_records': continuation_records,

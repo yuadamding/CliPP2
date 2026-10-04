@@ -1,9 +1,10 @@
-"""CliPP2 regional emissions, conditional centers and observed-mixture score.
+"""CliPP2 emissions, conditional centers and joint reads/validity mixture score.
 
 CCF, not cellular prevalence, is the public fitting/geometry scale. Single-state
 diploid-normal observations use the shared scalar likelihood primitives.
 Mixed CN explicitly retains CliPP2's capped support, weighted denominator,
-clipped likelihood and original interior box (``mixed_cn_bulk_v1``).
+clipped likelihood and original interior box. Assignment validity is observed
+jointly with reads; it is not conditioned away by renormalizing mixture weights.
 CUDA is an explicit float64 likelihood/host-forest path, never a CPU fallback;
 pooled initialization, scalar refits and weight optimization run on the host.
 """
@@ -18,6 +19,7 @@ import numpy as np
 from scipy.optimize import brentq, minimize, minimize_scalar
 from scipy.special import gammaln, logsumexp, xlog1py, xlogy
 
+from . import SCORE_DEFINITION
 from .initialization import pooled_cp_initialization
 from .likelihood import MultiplicityModel
 from .refitting import refit_center
@@ -25,8 +27,8 @@ from .scoring import fit_cluster_weights
 from ..io.data import readonly_array
 
 
-# The ownership/version identity changes, not the emission or fitting math.
-MODEL_VERSION = "clipp2_regional_full_support__general_normal_v1__mixed_cn_bulk_v1"
+# Mixed-CN emissions/boxes stay fixed; their assignment mask now enters scoring.
+MODEL_VERSION = "clipp2_regional_full_support__general_normal_v1__mixed_cn_bulk_assignment_event_v2"
 MIXED_EPS = 1e-6
 ADAPTER_BLOCK_BYTES = 8 * 1024 * 1024
 ADAPTER_MAX_ITERATIONS = 500
@@ -329,19 +331,33 @@ class RegionalModel:
             self._refit_bytes += size
         return fitted
 
-    def log_likelihood_columns(self, centers):
+    def assignment_admissibility(self, centers):
+        """N-by-q closed-box assignments, including regions without reads."""
         centers = np.asarray(centers, dtype=float)
-        if centers.ndim != 2 or centers.shape[1] != self.r or not np.isfinite(centers).all():
-            raise ValueError("Centers must be finite q by R CCFs")
+        if (centers.ndim != 2 or not len(centers) or centers.shape[1] != self.r
+                or not np.isfinite(centers).all()):
+            raise ValueError("Centers must be finite nonempty q by R CCFs")
+        return ((centers[None, :, :] >= self.lower[:, None, :])
+                & (centers[None, :, :] <= self.upper[:, None, :])).all(axis=2)
+
+    def log_likelihood_columns(self, centers):
+        """Log P(reads, valid assignment | cluster); forbidden pairs are -inf.
+
+        No division by admissible prior mass: the fixed-center weight problem
+        remains the same concave mixture optimization used for all-valid inputs.
+        """
+        centers = np.asarray(centers, dtype=float)
+        allowed = self.assignment_admissibility(centers)
         columns = []
-        for center in centers:
+        for k, center in enumerate(centers):
             key = (self.identity, center.tobytes())
             column = self._columns.get(key)
             if column is not None:
                 self.telemetry["column_cache_hits"] += 1
                 self._columns.move_to_end(key)
             else:
-                column = readonly_array(-self.loss(np.broadcast_to(center, (self.n, self.r))).sum(axis=1))
+                emission = -self.loss(np.broadcast_to(center, (self.n, self.r))).sum(axis=1)
+                column = readonly_array(np.where(allowed[:, k], emission, -np.inf))
                 self.telemetry["likelihood_columns"] += 1
                 size = column.nbytes + len(key[1]) + 128
                 if size <= self._cache_bytes:
@@ -406,7 +422,7 @@ class RegionalModel:
                                      "retained_initial_centers": retained_initial,
                                      "scalar_global_optimality_certified": False,
                                      "num_parameters": q*self.r+q-1,
-                                     "score_definition": "joint_observed_mixture_at_conditional_centers_v1"})
+                                     "score_definition": SCORE_DEFINITION})
 
 
 class _WeightModel(SimpleNamespace):
@@ -493,6 +509,8 @@ def _pooled_adapter(model, rows, region, *, block_bytes=None):
     pooled initializer without a quadratic-space SLSQP over the whole grid.
     Only this separately versioned adapter uses this route; matched standard
     observations continue to call the unmodified inherited initializer.
+    Its masked grid scores reads jointly with assignment validity, without
+    normalizing over admissible grid points.
     """
     grid = np.unique(np.r_[np.linspace(0., 1., 257), model.lower[rows, region],
                            model.upper[rows, region]])
