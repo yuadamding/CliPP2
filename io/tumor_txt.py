@@ -18,7 +18,6 @@ from ..config import DEFAULT_MAX_MAJOR_CN, MAX_MULTIPLICITY, validate_max_major_
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
 CN_FILTER_POLICY_ID = "major_limit_whole_mutation_v3"
-SUBCLONAL_CN_REGION = "SUBCLONAL_CN_REGION"
 MAJOR_CN_ABOVE_LIMIT = "MAJOR_CN_ABOVE_LIMIT"
 NO_POSITIVE_PATH = "NO_POSITIVE_MUTANT_COPY_PATH"
 
@@ -637,15 +636,9 @@ def _build_tumor_data(
         1.0, (1.0 - eps) / np.clip(max_prob_scale, eps, None)
     )
     phi_upper = np.clip(phi_upper, eps, 1.0)
-    from ..core.objective import compile_integer_observations
-    from ..core.fusion.starts import initialize_marginal_phi
-
-    model = compile_integer_observations(
-        alt_counts=alt_counts, total_counts=total_counts,
-        count_observed=count_observed, phi_upper=phi_upper,
-        major_cn=major_cn, scaling=scaling, eps=eps,
-    )
-    data = TumorData(
+    phi_init = np.minimum(phi_upper, np.divide(alt_counts, total_counts * scaling,
+        out=np.zeros_like(alt_counts), where=total_counts > 0))
+    return TumorData(
         tumor_id=validated.metadata["tumor_id"],
         mutation_ids=mutation_ids,
         region_ids=sample_ids,
@@ -657,16 +650,12 @@ def _build_tumor_data(
         normal_cn=normal_cn,
         scaling=scaling,
         phi_upper=phi_upper,
-        phi_init=initialize_marginal_phi(model, eps=eps),
+        phi_init=phi_init,
         count_observed=count_observed,
         cn_filter_report=report,
         mean_total_cn=mean_total_cn,
         cn_state_count=cn_state_count,
     )
-    # This private construction owns the exact arrays used by both objects.
-    # Retain the already compiled immutable model; replacements start uncached.
-    data._compiled_models[(float(eps), "independent_broad")] = model
-    return data
 
 
 def load_tumor_txt(
@@ -674,9 +663,20 @@ def load_tumor_txt(
     *,
     eps: float = 1e-6,
     max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
+    initialize: bool = False,
 ) -> TumorData:
-    """Exclude whole SNVs if any CN state in any region exceeds max_major_cn."""
+    """Validate/filter CN and prepare immutable arrays, without numerical fits.
 
+    Any original state above max_major_cn excludes the whole mutation. The
+    retained initialize=False keyword is compatibility-only; pooled numerical
+    initialization belongs to RegionalModel.pilots(), not input preprocessing.
+    """
+
+    if initialize is not False:
+        raise ValueError(
+            "load_tumor_txt is preprocessing-only; initialize=True is no longer "
+            "supported. Use RegionalModel.pilots() for numerical initialization."
+        )
     max_major_cn = validate_max_major_cn(max_major_cn)
     epsilon = float(eps)
     if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
@@ -783,7 +783,6 @@ __all__ = [
     "SCHEMA_COLUMNS",
     "MAJOR_CN_ABOVE_LIMIT",
     "NoEligibleSNVsError",
-    "SUBCLONAL_CN_REGION",
     "TUMOR_TXT_SCHEMA",
     "TumorTxtError",
     "UnsupportedTumorInputError",

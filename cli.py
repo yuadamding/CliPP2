@@ -4,6 +4,8 @@ import argparse
 import math
 from pathlib import Path
 
+import numpy as np
+
 from .config import DEFAULT_DEVICE, DEFAULT_MAX_MAJOR_CN, FitConfig, resolve_fit_config, validate_max_major_cn
 from ._version import __version__
 
@@ -11,7 +13,7 @@ from ._version import __version__
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipp2", allow_abbrev=False,
-        description="Fit the independent integer-mixture hybrid fusion estimator.",
+        description="Fit the free-center regional frozen-tree multiplicity-mixture estimator.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=__version__)
@@ -26,6 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exclude a mutation from all regions if any CN state's major CN in any region exceeds this limit.",
     )
     fit.add_argument("--verbose", action="store_true")
+    fit.add_argument("--max-clusters", type=int, choices=range(1, 11), default=10,
+                     help="Largest connected-tree cluster capacity (at most 10).")
     fit.add_argument("--version", action="version", version=__version__)
     return parser
 
@@ -41,7 +45,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
-    return resolve_fit_config(device=args.device, verbose=args.verbose, max_major_cn=args.max_major_cn)
+    return resolve_fit_config(device=args.device, verbose=args.verbose,
+                              max_major_cn=args.max_major_cn, max_clusters=args.max_clusters)
 
 
 def _printable_summary(value: object) -> object:
@@ -52,6 +57,10 @@ def _printable_summary(value: object) -> object:
     non-finite value must never reach stdout.
     """
 
+    if isinstance(value, np.ndarray):
+        return _printable_summary(value.tolist())
+    if isinstance(value, np.generic):
+        return _printable_summary(value.item())
     if isinstance(value, dict):
         return {key: _printable_summary(entry) for key, entry in value.items()}
     if isinstance(value, (list, tuple)):

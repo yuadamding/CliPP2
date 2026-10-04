@@ -28,10 +28,9 @@ clipp2 = "CliPP2.cli:main"
 [tool.setuptools]
 packages = [
     "CliPP2",
-    "CliPP2.core",
-    "CliPP2.core.fusion",
     "CliPP2.io",
-    "CliPP2.model_selection",
+    "CliPP2.tree",
+    "CliPP2.kernel",
 ]
 package-dir = { CliPP2 = "." }
 include-package-data = false
@@ -42,6 +41,9 @@ version = { attr = "CliPP2._version.__version__" }
 [tool.setuptools.package-data]
 CliPP2 = [
     "_build_source.json",
+    "kernel/csrc/*.cpp",
+    "kernel/csrc/*.h",
+    "NOTICE",
 ]
 
 [tool.ruff]

@@ -1,4 +1,4 @@
-"""CliPP2: observed-data pairwise fusion for multi-region subclonal reconstruction."""
+"""CliPP2: free-center frozen-tree clustering of regional mutation CCF profiles."""
 
 from __future__ import annotations
 

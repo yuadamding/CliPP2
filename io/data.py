@@ -1,16 +1,11 @@
 """Immutable retained biological inputs and their CN exclusion provenance."""
 from __future__ import annotations
 
-import hashlib
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 
 import numpy as np
 
-from ..config import (
-    CLONAL_INTEGER_GENERATOR_VERSION, CLONAL_INTEGER_MODEL_ID,
-    CLONAL_INTEGER_PRIOR_MODE,
-    validate_max_major_cn,
-)
+from ..config import validate_max_major_cn
 
 
 def readonly_array(value: object, *, dtype=None) -> np.ndarray:
@@ -81,8 +76,6 @@ class TumorData(ImmutableArrayRecord):
     cn_filter_report: CNFilterReport | None = None
     mean_total_cn: np.ndarray | None = None
     cn_state_count: np.ndarray | None = None
-    _compiled_models: dict = field(default_factory=dict, init=False, repr=False, compare=False)
-    _fingerprint: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("mutation_ids", "region_ids"):
@@ -99,7 +92,6 @@ class TumorData(ImmutableArrayRecord):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, readonly_array(value))
-        object.__setattr__(self, "_fingerprint", _retained_data_fingerprint(self))
 
     @property
     def num_mutations(self) -> int:
@@ -110,45 +102,4 @@ class TumorData(ImmutableArrayRecord):
         return int(self.alt_counts.shape[1])
 
 
-def _hash_text(digest, value: str) -> None:
-    encoded = str(value).encode("utf-8")
-    digest.update(len(encoded).to_bytes(8, "little"))
-    digest.update(encoded)
-
-
-def _hash_array(digest, name: str, values: np.ndarray) -> None:
-    _hash_text(digest, name)
-    array = np.ascontiguousarray(values)
-    _hash_text(digest, str(array.dtype))
-    digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
-    digest.update(array.tobytes())
-
-
-def _retained_data_fingerprint(data: TumorData) -> str:
-    """Identify the retained numerical source, excluding eligibility-only audit."""
-    digest = hashlib.sha256(b"clipp2.retained-integer-input.v4")
-    _hash_text(digest, data.tumor_id)
-    for ids in (data.mutation_ids, data.region_ids):
-        digest.update(len(ids).to_bytes(8, "little"))
-        for value in ids:
-            _hash_text(digest, value)
-    for name in (
-        "alt_counts", "total_counts", "purity", "major_cn", "minor_cn",
-        "normal_cn", "scaling", "phi_upper", "phi_init",
-        "mean_total_cn", "cn_state_count",
-    ):
-        _hash_array(digest, name, getattr(data, name))
-    _hash_array(digest, "count_observed", np.ones_like(data.alt_counts, dtype=bool)
-                if data.count_observed is None else data.count_observed)
-    for value in (CLONAL_INTEGER_MODEL_ID, "1", CLONAL_INTEGER_GENERATOR_VERSION,
-                  CLONAL_INTEGER_PRIOR_MODE):
-        _hash_text(digest, value)
-    return digest.hexdigest()
-
-
-def tumor_data_fingerprint(data: TumorData) -> str:
-    """Return the once-computed identity of this immutable retained input."""
-    return data._fingerprint
-
-
-__all__ = ["CNFilterRecord", "CNFilterReport", "TumorData", "tumor_data_fingerprint"]
+__all__ = ["CNFilterRecord", "CNFilterReport", "TumorData"]

@@ -1,0 +1,16 @@
+CliPP2 is an independent, self-contained project licensed under AGPL-3.0;
+see LICENSE. Its kernel and interfaces are maintained in this repository.
+No CliPP1.5 installation, sibling checkout or network access is required.
+
+Algorithm/source attribution:
+The scalar binomial-multiplicity likelihood, pooled initializer, conditional
+refits, mixture-weight optimization, chain continuation and candidate-search
+algorithms were adapted from CliPP1.5 by its contributors, at commit
+9e51e30ac8b0c8c9ab1f46821b496909843bda0c (AGPL-3.0):
+https://github.com/yuadamding/CliPP1.5
+
+CliPP2 maintains its own multi-region model, vector-tree continuation, native
+N-by-R forest QP, in-memory chain ABI, selection adapters, validation and output
+contract. These adapted sources are not represented as byte-identical upstream
+files or as the complete CliPP1.5 API. Reference comparisons use the separate
+CliPP1.5 repository only in external development tests.
