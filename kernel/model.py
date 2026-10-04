@@ -262,7 +262,7 @@ class RegionalModel:
         p = np.where(self.mixed[rows, region][None, :, None],
                      np.clip(p, MIXED_EPS, 1-MIXED_EPS), np.minimum(p, 1.))
         kernel = (xlogy(self.alt[rows, region][None, :, None], p)
-                  + xlog1py((self.depth-self.alt)[rows, region][None, :, None], -p)
+                  + xlog1py((self.depth[rows, region]-self.alt[rows, region])[None, :, None], -p)
                   + self.constants[rows, region][None, :, None])
         return logsumexp(np.where(self.valid[rows, region][None, :, :], kernel, -np.inf), -1)
 
@@ -278,6 +278,29 @@ class RegionalModel:
                 pilots[rows, region], diag = _pooled_adapter(self, rows, region)
             diagnostics[self.region_ids[region]] = diag
         return pilots, diagnostics
+
+    def observation_keys(self):
+        """ID-free scientific row signatures for deterministic proposal ties."""
+        arrays = (self.observed, self.alt, self.depth, self.slope, self.support,
+                  self.mixed, self.lower, self.upper)
+        return [int.from_bytes(hashlib.sha256(b''.join(a[i].tobytes() for a in arrays)).digest(),
+                               'big') for i in range(self.n)]
+
+    def regional_profile_columns(self, region, grid):
+        """Host proposal-grid emissions with original boxes, including missing CN.
+
+        This coarse profile is only a proposal heuristic, never a fitted score.
+        Missing reads contribute zero, while their original bounds still apply.
+        """
+        grid = np.asarray(grid, dtype=float)
+        columns = np.zeros((self.n, len(grid)))
+        rows = np.flatnonzero(self.observed[:, region])
+        for first in range(0, len(rows), 256):
+            active = rows[first:first+256]
+            columns[active] = self._regional_likelihood(grid, active, region).T
+        columns[(grid[None, :] < self.lower[:, region, None])
+                | (grid[None, :] > self.upper[:, region, None])] = -np.inf
+        return columns
 
     def _fit_scalar(self, members, region):
         key = (self.identity, region, tuple(map(int, members)))

@@ -86,9 +86,14 @@ during fitting, and called only conditional on the final refitted CCF.
    include zero-jump edges: at most 64 mutations, every observation-supported
    one-edge split is considered when two clusters are requested or repair an
    unsupported higher-capacity seed. Larger trees consider at most 32
-   support-ranked splits; up to 16 cut exchanges from eight unsupported native
-   seeds provide additional repairs. These candidates use the same refit and
-   score, without recursively expanding the supplemental search.
+   likelihood-ranked splits. The coarse regional profile-grid gain incorporates
+   counts and depth, retains missing-region CN bounds, and breaks numerical
+   proxy ties by ID-free observation-multiset signatures before edge order.
+   Up to 16 cut exchanges from eight unsupported native seeds provide additional
+   support repairs. All proposals use the unchanged exact refit and score;
+   the four strongest supplemental fits share a budget of 16 boundary-refinement
+   proposal evaluations, including rejected proposals. Native refinement is
+   unchanged. These are work-count limits, not elapsed-time deadlines.
 5. Fitted mixture weights score the **product of observed regional likelihoods
    inside each admissible cluster mixture**, with penalty
    `[q*R + (q-1)] * log(N)`, where N counts retained mutation vectors.
@@ -130,6 +135,21 @@ It adds neither a weight floor nor a clonal, occupancy or evolutionary prior.
 The penalty is BIC-style; this joint criterion is not claimed to be a calibrated
 biological posterior or a newly validated model-selection rule.
 
+The API/CLI verification diagnostics distinguish four different quantities:
+
+| Field | Meaning |
+| --- | --- |
+| `hard_partition_log_likelihood` | Read log likelihood at the hard assignments; `conditional_log_likelihood` remains its backward-compatible alias |
+| `mixture_log_likelihood` | Joint reads-plus-validity mixture log likelihood used in the score |
+| `assignment_validity_log_probability` | $\sum_i\log Z_i$ |
+| `validity_conditioned_mixture_log_likelihood` | Joint mixture log likelihood minus the validity term |
+
+The last quantity is evaluated at the **same joint-fitted weights**, not
+separately optimized and not used for selection. It is the
+$\ell_{\mathrm{conditional}}$ in the decomposition above, not the historical
+hard-partition `conditional_log_likelihood` field. These diagnostic additions
+do not change the three public TSVs.
+
 Exact single-region compatibility requires matched coordinate tie keys. The
 canonical format has no genomic-coordinate fields, so its documented default
 uses mutation-ID text to break equal-pilot ties. The internal
@@ -156,6 +176,18 @@ the topology restriction. In particular, collectively supported mutations can
 remain disconnected within the frozen tree when their measurements do not
 overlap. Selected-fit verification reconciles the scored bank; it does not
 prove search completeness or accurate clone recovery.
+
+Large-tree proposal ranking uses a fixed 34-point regional grid, streamed in
+column blocks. The original mixed lower endpoint is included even for narrow
+boxes. This is an approximate profile improvement, **not** a bound on the final
+mixture score: modes between grid points and omitted edges can still matter.
+Scientific-content tie breaking avoids using mutation IDs to choose among
+different observations on a fixed tree; it does not make tree construction or
+genuinely indistinguishable ties invariant to all renamings. The exchange route
+remains support-ranked. Diagnostics report the supported-edge population, exact
+evaluated one-edge fraction, ranking method and refinement work counts; timings
+include supplemental search separately. Inclusive phase times overlap refit
+time and must not be added as independent costs.
 
 ## Outputs
 

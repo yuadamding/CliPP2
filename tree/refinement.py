@@ -119,18 +119,23 @@ def canonical_partition(labels, centers=None):
     return result, np.asarray(centers)[list(seen)].copy()
 
 
-def refine_partition(model, tree, candidate, consider):
+def refine_partition(model, tree, candidate, consider, *, max_proposals=None):
     """Yield every accepted local state; scoring is independent of acceptance.
 
     ``consider`` refits and records candidates, preserving supplied-center
     fallbacks. It must return a candidate with a ``refit`` result and ``cuts``.
     The path improves conditional likelihood, while the caller separately keeps
     the best observed-mixture score over the complete candidate bank.
+    ``max_proposals`` optionally bounds exact proposal evaluations, including
+    rejected moves. Existing native refinement uses the unlimited default.
     """
     from ..kernel.topology import partition_from_cuts
 
+    if max_proposals is not None and (type(max_proposals) is not int or max_proposals < 0):
+        raise ValueError("max_proposals must be a nonnegative integer or None")
     current = candidate
     visited = set()
+    attempted = 0
     adjacency = [[] for _ in range(tree.n)]
     for eid, (u, v) in enumerate(tree.edges):
         adjacency[u].append((int(v), eid))
@@ -154,7 +159,10 @@ def refine_partition(model, tree, candidate, consider):
                 continue
             if not np.array_equal(proposed_labels, partition_from_cuts(tree, cuts)):
                 raise ValueError("Boundary move violated connected partition identity")
+            if max_proposals is not None and attempted >= max_proposals:
+                return
             visited.add(proposal_key)
+            attempted += 1
             proposed = consider(cuts, proposed_labels, centers, {
                 "route": "boundary_refinement", "parent_cuts": current.cuts,
                 "replaced_edge": int(edge), "replacement_edge": move.edge,

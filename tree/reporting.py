@@ -70,6 +70,12 @@ def independent_log_columns(model, centers):
 
 
 def verify_selected(model, result):
+    """Audit the scored fit and distinguish its three likelihood summaries.
+
+    The historical ``conditional_log_likelihood`` is the hard-partition read
+    likelihood, not the mixture conditioned on assignment validity. The latter
+    is a diagnostic at the same fitted weights, never the selection objective.
+    """
     fit = result.selected.fit
     labels = np.asarray(fit.labels)
     centers, weights = np.asarray(fit.centers), np.asarray(fit.weights)
@@ -126,11 +132,14 @@ def verify_selected(model, result):
                     if not isinstance(candidate, dict) and candidate.fit.eligible]
     if not bank_scores or not np.isclose(min(bank_scores), score, atol=1e-7, rtol=1e-10):
         raise ValueError('Selected fit is not the best complete-bank score')
+    validity = float(np.log(allowed @ weights).sum())
     return {'independently_verified': True, 'conditional_log_likelihood': conditional,
+            'hard_partition_log_likelihood': conditional,
             'mixture_log_likelihood': mixture, 'complexity_penalty': penalty, 'score': score,
             'score_definition': SCORE_DEFINITION,
             'forbidden_assignment_pairs': int((~allowed).sum()),
-            'assignment_validity_log_probability': float(np.log(allowed @ weights).sum()),
+            'assignment_validity_log_probability': validity,
+            'validity_conditioned_mixture_log_likelihood': mixture-validity,
             'weight_optimality_gap': weight_gap, 'weight_active_score_gap': active_gap,
             'complete_candidate_bank_reconciled': True,
             'num_parameters': q*model.r+q-1, 'num_mutation_vectors': model.n,

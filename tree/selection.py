@@ -115,15 +115,7 @@ def _score_key(candidate):
     return candidate.score, len(candidate.cuts), candidate.cuts
 
 
-def _supported_split_edges(model, tree, cuts=()):
-    """Rank forest splits with observations on both sides in every region.
-
-    One forest traversal costs O(NR) work/storage. Missing counts are never
-    filled in. Regional counts rank balanced support first, then block size,
-    then canonical edge ID; zero pilot/solver jumps are deliberately irrelevant.
-    Observation support is necessary, not sufficient: the ordinary conditional
-    refit still checks member-box intersections and mixture-weight eligibility.
-    """
+def _forest_structure(tree, cuts):
     removed = set(cuts)
     adjacency = [[] for _ in range(tree.n)]
     for edge, (a, b) in enumerate(tree.edges):
@@ -148,6 +140,17 @@ def _supported_split_edges(model, tree, cuts=()):
                 if parent[neighbor] < 0:
                     parent[neighbor], parent_edge[neighbor] = node, edge
                     stack.append(neighbor)
+    return parent, parent_edge, component, order, roots
+
+
+def _supported_split_edges(model, tree, cuts=()):
+    """Exact observation-supported forest splits, initially support-ranked.
+
+    One forest traversal costs O(NR) work/storage. Support is necessary, not
+    sufficient: exact refits still check original boxes and mixture weights.
+    Large-tree shortlists are separately ranked by regional likelihood gain.
+    """
+    parent, parent_edge, component, order, roots = _forest_structure(tree, cuts)
     counts = np.asarray(model.observed, dtype=np.int64).copy()
     sizes = np.ones(tree.n, dtype=np.int64)
     for node in reversed(order):
@@ -168,15 +171,83 @@ def _supported_split_edges(model, tree, cuts=()):
     return [edge for _, _, edge in sorted(ranked)]
 
 
+def _likelihood_ranked_edges(model, tree, edges, cuts=()):
+    """Coarse regional profile gains, with ID-free content ties, not final scores.
+
+    Stream fixed-grid columns through postorder sums and impossible counts:
+    O(N R G) work and O(N) storage for fixed G, without per-edge member gathers.
+    The mixed lower endpoint ensures even a narrow original box has a grid
+    point. Resolution can still miss modes; no likelihood bound is claimed.
+    """
+    parent, parent_edge, component, order, _ = _forest_structure(tree, cuts)
+    children = {int(parent_edge[node]): node for node in order if parent[node] != node}
+    nodes = np.asarray([children[edge] for edge in edges], dtype=int)
+    if not len(nodes):
+        return [], {"method": "regional_grid_profile_gain_v1", "ranked_edges": 0}
+    grid = np.unique(np.r_[np.linspace(0., 1., 33), 1e-6])
+    # Sums, invalid counts and complement work arrays share this soft budget;
+    # one column is the minimum when N alone exceeds it.
+    width = max(1, min(8, (8*1024*1024)//(48*tree.n)))
+    gains = np.zeros(len(nodes))
+    roots = component[nodes]
+    for region in range(model.r):
+        left, right, whole = [np.full(len(nodes), -np.inf) for _ in range(3)]
+        for first in range(0, len(grid), width):
+            values = model.regional_profile_columns(region, grid[first:first+width])
+            if np.isnan(values).any() or np.isposinf(values).any():
+                raise ValueError("Proposal profiles must be finite or negative infinity")
+            invalid = np.isneginf(values).astype(np.int64)
+            values = np.where(invalid, 0., values)
+            for node in reversed(order):
+                if parent[node] != node:
+                    values[parent[node]] += values[node]
+                    invalid[parent[node]] += invalid[node]
+            left = np.maximum(left, np.where(invalid[nodes] == 0, values[nodes], -np.inf).max(axis=1))
+            right = np.maximum(right, np.where(invalid[roots]-invalid[nodes] == 0,
+                values[roots]-values[nodes], -np.inf).max(axis=1))
+            whole = np.maximum(whole, np.where(invalid[roots] == 0, values[roots], -np.inf).max(axis=1))
+        finite = np.isfinite(left) & np.isfinite(right) & np.isfinite(whole)
+        # A failed approximation never removes a supported cut from eligibility.
+        # Rank unresolved profiles first for exact evaluation, not as impossible.
+        gains += np.subtract(left+right, whole, out=np.full(len(nodes), np.inf), where=finite)
+    keys, sizes = list(model.observation_keys()), np.ones(tree.n, dtype=int)
+    modulus = 1 << 256
+    for node in reversed(order):
+        if parent[node] != node:
+            keys[parent[node]] = (keys[parent[node]]+keys[node]) % modulus
+            sizes[parent[node]] += sizes[node]
+    # Quantize only the heuristic rank to suppress reduction-roundoff tie breaks.
+    # The exact final refit/score remains untouched.
+    scale = max(1., float(np.max(np.abs(gains[np.isfinite(gains)]), initial=0.)))
+    quantum = 2. ** (int(np.floor(np.log2(scale)))-32)
+    ranks = [None if not np.isfinite(gain) else int(np.rint(gain/quantum)) for gain in gains]
+    def key(index):
+        node, root = nodes[index], roots[index]
+        content = tuple(sorted(((int(sizes[node]), keys[node]),
+                                (int(sizes[root]-sizes[node]), (keys[root]-keys[node]) % modulus))))
+        rank = ranks[index]
+        return (rank is not None, 0 if rank is None else -rank, content, edges[index])
+    ordered = sorted(range(len(edges)), key=key)
+    return [edges[i] for i in ordered], {
+        "method": "regional_grid_profile_gain_v1", "ranked_edges": len(edges),
+        "grid_points": len(grid), "grid_column_block": width,
+        "proxy_rank_quantum": quantum, "proxy_tied_edges": len(ranks)-len(set(ranks)),
+        "unresolved_profiles": sum(rank is None for rank in ranks),
+        "tie_rule": "quantized_gain_then_ID_free_observation_multisets_then_edge",
+        "maximum_profile_gain": float(np.max(gains)) if np.isfinite(gains).all() else None,
+    }
+
+
 def _add_supported_proposals(model, tree, bank, capacities, seeds):
     """Supplement, never replace, the original continuation/refinement bank.
 
     For N<=64, all observation-supported one-edge splits are scored when q=2
     is requested (or repairs an unsupported higher-capacity seed). Larger
-    trees score at most 32 support-ranked splits. Up to 16 same-q exchanges
+    trees score at most 32 likelihood-ranked splits. Up to 16 same-q exchanges
     from at most eight unsupported native cut sets repair missed support
     without changing the frozen tree. Each new proposal gets the same refit
-    and score; no recursive refinement is launched from these extra routes.
+    and score. Four strongest supplemental fits share a 16-proposal boundary
+    refinement budget; every intermediate is retained in the ordinary bank.
     These fixed proposal counts are not elapsed-time limits or exhaustive
     search claims. Higher-order splits and unexamined large-tree edges remain
     possible search deficits even when every stored candidate is reconciled.
@@ -191,10 +262,23 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
     requested = 2 if 2 in capacities else repair_capacity
     small = tree.n <= 64
     edges = _supported_split_edges(model, tree) if requested is not None else []
+    rank_diagnostic = {"method": "all_supported_small_tree_splits"}
+    if not small and edges:
+        edges, rank_diagnostic = _likelihood_ranked_edges(model, tree, edges)
     chosen = sorted(edges) if small else edges[:32]
+    supplemental = {}
+    attempted = set(getattr(bank, "by_cuts", {})) | set(bank.ineligible)
+
+    def consider(cuts, labels, centers, provenance):
+        attempted.add(tuple(cuts))
+        candidate = bank.consider(cuts, labels, centers, provenance)
+        if candidate is not None:
+            supplemental[candidate.cuts] = candidate
+        return candidate
+
     for edge in chosen:
         cuts = (edge,)
-        bank.consider(cuts, partition_from_cuts(tree, cuts), None, {
+        consider(cuts, partition_from_cuts(tree, cuts), None, {
             "route": "supported_one_edge_split", "requested_k": requested,
             "occupied_q": 2, "zero_jumps_allowed": True,
         })
@@ -210,7 +294,7 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
                 if cuts == original or cuts in exchanged:
                     continue
                 exchanged.add(cuts)
-                bank.consider(cuts, partition_from_cuts(tree, cuts), None, {
+                consider(cuts, partition_from_cuts(tree, cuts), None, {
                     "route": "supported_cut_exchange", "requested_k": unsupported[original],
                     "occupied_q": len(cuts) + 1, "parent_cuts": original,
                     "removed_edge": removed, "replacement_edge": edge,
@@ -221,11 +305,34 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
                 break
         if len(exchanged) == 16:
             break
+    # Use exact fitted scores, with proposal order retaining content-based ties.
+    # No elapsed-time deadline or extension of native refinement is introduced.
+    strongest = sorted(supplemental.values(), key=lambda c: c.score)[:4]
+    refinement_proposals = refinement_candidates = 0
+
+    def refine_consider(*args):
+        nonlocal refinement_proposals
+        refinement_proposals += 1
+        return consider(*args)
+
+    for candidate in strongest:
+        if refinement_proposals == 16:
+            break
+        refinement_candidates += 1
+        for _ in refine_partition(model, tree, candidate, refine_consider,
+                                  max_proposals=16-refinement_proposals):
+            pass
+    evaluated = sum((edge,) in attempted for edge in edges)
     return {"small_tree_node_limit": 64, "large_tree_split_limit": 32,
             "supported_one_edge_splits": len(edges), "one_edge_proposals": len(chosen),
-            "all_supported_one_edge_splits_considered": requested is not None and len(chosen) == len(edges),
+            "ranking": rank_diagnostic,
+            "evaluated_supported_one_edge_splits": evaluated,
+            "supported_one_edge_fraction": evaluated/len(edges) if edges else None,
+            "all_supported_one_edge_splits_considered": requested is not None and evaluated == len(edges),
             "exchange_parent_limit": 8, "exchange_proposal_limit": 16,
             "exchange_proposals": len(exchanged), "exchange_forests_scanned": scanned,
+            "refinement_candidate_limit": 4, "refinement_proposal_limit": 16,
+            "refinement_candidates": refinement_candidates, "refinement_proposals": refinement_proposals,
             "exhaustive_tree_partition_search": False}
 
 
@@ -361,7 +468,9 @@ def fit_tree(model, max_clusters=10, capacities=None):
             if proposal is None:
                 repair_unsupported(subset, len(subset) + 1, {"route": "connected_coarsening"})
             refine_once(proposal)
+    started = perf_counter()
     supported_proposals = _add_supported_proposals(model, tree, bank, capacities, seeds)
+    times["supplemental_search_inclusive_seconds"] = perf_counter()-started
     if not bank.candidates:
         reasons = sorted({entry["reason"] for entry in bank.ineligible.values()})
         raise ValueError(f"No supported finite-score tree candidate: {reasons}")
