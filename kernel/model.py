@@ -153,6 +153,7 @@ class RegionalModel:
         self._refit_bytes = self._column_bytes = 0
         self.telemetry = {"refit_cache_hits": 0, "scalar_refits": 0,
                           "column_cache_hits": 0, "likelihood_columns": 0,
+                          "joint_matrix_calls": 0,
                           "scalar_refit_seconds": 0.0, "weight_seconds": 0.0}
 
     def __len__(self):
@@ -368,9 +369,12 @@ class RegionalModel:
 
         No division by admissible prior mass: the fixed-center weight problem
         remains the same concave mixture optimization used for all-valid inputs.
+        Matrix-call telemetry includes proposal scans and conditional refits;
+        emission-column computations and cache hits are counted separately.
         """
         centers = np.asarray(centers, dtype=float)
         allowed = self.assignment_admissibility(centers)
+        self.telemetry["joint_matrix_calls"] += 1
         columns = []
         for k, center in enumerate(centers):
             key = (self.identity, center.tobytes())

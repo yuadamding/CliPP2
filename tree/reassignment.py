@@ -69,10 +69,17 @@ def _proposals(labels, centers, columns, observed, keys):
         raise ValueError("A reassignment parent lacks regional observation support")
     group_keys = [(tuple(sorted(keys[i] for i in np.flatnonzero(labels == k))),
                    tuple(map(float, centers[k]))) for k in range(q)]
+    # Compare the <=K full descriptors once, not during every transfer tie.
+    # Equal descriptors share a rank so stable identical-row ties are unchanged.
+    group_order = sorted(range(q), key=group_keys.__getitem__)
+    group_ranks = [0] * q
+    for previous, current in zip(group_order, group_order[1:]):
+        group_ranks[current] = (group_ranks[previous]
+                                + (group_keys[current] != group_keys[previous]))
     gains = columns - assigned[:, None]
     rows, destinations = np.nonzero(np.isfinite(gains) & (gains > 0))
     ranked = sorted(zip(rows.tolist(), destinations.tolist()), key=lambda move: (
-        -float(gains[move]), keys[move[0]], group_keys[move[1]], move[0]))
+        -float(gains[move]), keys[move[0]], group_ranks[move[1]], move[0]))
 
     def legal(row, source, current_sizes, current_counts):
         return (current_sizes[source] > 1
@@ -136,8 +143,8 @@ def expand_memberships(model, bank):
 
     The original bank is frozen for selecting <=4 starting states, including
     its exact winner. Each <=2-round path spends exactly two proposal slots
-    per joint-column evaluation (<=8 total); absent, duplicate, rejected, and
-    non-improving proposals do not earn replacement slots. K=1 has no moves.
+    per proposal-ranking joint-matrix evaluation (<=8); absent, duplicate,
+    rejected, and non-improving proposals do not earn replacement slots. K=1 has no moves.
     Eligible states are retained even when their path does not advance.
     """
     started = perf_counter()
@@ -223,12 +230,12 @@ def expand_memberships(model, bank):
             "starting_state_limit": START_LIMIT, "round_limit": ROUND_LIMIT,
             "proposal_slots_per_round": PROPOSALS_PER_ROUND,
             "proposal_callback_limit": START_LIMIT * ROUND_LIMIT * PROPOSALS_PER_ROUND,
-            "joint_column_evaluation_limit": START_LIMIT * ROUND_LIMIT,
+            "proposal_joint_column_evaluation_limit": START_LIMIT * ROUND_LIMIT,
             "score_atol": SCORE_ATOL, "score_rtol": SCORE_RTOL,
             "tie_rule": "gain_then_ID_free_row_and_destination_content_then_identical_row_index",
             "original_candidate_count": len(original), "original_winner_score": winner.score,
             "starting_states": len(starts), "proposal_slots": slots,
-            "proposal_callbacks": callbacks, "joint_column_evaluations": evaluations,
+            "proposal_callbacks": callbacks, "proposal_joint_column_evaluations": evaluations,
             "accepted_steps": accepted, "added_candidates": len(bank.candidates) - len(original),
             "scan_counts": scans,
             "paths": paths, "counter_deltas": delta, "seconds": perf_counter() - started,
