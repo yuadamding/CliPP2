@@ -13,12 +13,12 @@ namespace {
 thread_local char last_error[1024] = "";
 }
 
-extern "C" int CliPP2KernelABI() { return 1; }
+extern "C" int CliPP2KernelABI() { return 2; }
 extern "C" const char* CliPP2KernelBuildId() { return CLIPP2_KERNEL_BUILD_ID; }
 extern "C" const char* CliPP2KernelLastError() { return last_error; }
 
 extern "C" int CliPP2SolveChain(int count, const int* alt, const int* depth,
-    const int* major, const int* total, double purity, const double* pilot_cp,
+    const int* major, const int* total, const int* clonal_eligible, double purity, const double* pilot_cp,
     const int* capacities, int k_count, int* labels_out, double* cp_out,
     double* diagnostics_out, int* statuses_out, CliPP2Callback callback) {
     last_error[0]='\0';
@@ -26,7 +26,7 @@ extern "C" int CliPP2SolveChain(int count, const int* alt, const int* depth,
         if(!labels_out || !cp_out || !diagnostics_out || !statuses_out)
             throw std::invalid_argument("Non-null chain output buffers are required.");
         const auto data=clipp2kernel::prepare_chain_inputs(count,alt,depth,major,
-            total,purity,pilot_cp,capacities,k_count);
+            total,clonal_eligible,purity,pilot_cp,capacities,k_count);
         clipp2kernel::ChainEvaluator evaluate=[&](const std::vector<double>& x,
             std::vector<double>& values,std::vector<double>& gradient,
             std::vector<double>& curvature) {

@@ -29,7 +29,7 @@ class _Parent:
 
 
 def _integers(values, name, length=None):
-    # Match selection._integer_vector, including its accepted input types.
+    """Shared chain-index validation, including scalar and numeric-string input."""
     values = np.atleast_1d(np.asarray(values, dtype=float))
     if (
         values.ndim != 1

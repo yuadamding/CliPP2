@@ -103,7 +103,7 @@ def best_pair_boundary(tree, labels, centers, log_columns, edge, *, adjacency=No
                         not np.array_equal(proposed, labels))
 
 
-def canonical_partition(labels, centers=None):
+def canonical_partition(labels, centers=None, *, weights=None, clonal_cluster=None):
     """Canonicalize by the first node in each block, preserving center alignment."""
     labels = np.asarray(labels)
     if labels.ndim != 1 or not len(labels):
@@ -114,9 +114,15 @@ def canonical_partition(labels, centers=None):
         if value not in seen:
             seen[value] = len(seen)
         result[index] = seen[value]
-    if centers is None:
+    if centers is None and weights is None and clonal_cluster is None:
         return result
-    return result, np.asarray(centers)[list(seen)].copy()
+    aligned = None if centers is None else np.asarray(centers)[list(seen)].copy()
+    if weights is None and clonal_cluster is None:
+        return result, aligned
+    if clonal_cluster not in seen:
+        raise ValueError("Clonal designation must remain occupied during canonicalization")
+    return (result, aligned, None if weights is None else np.asarray(weights)[list(seen)].copy(),
+            seen[clonal_cluster])
 
 
 def refine_partition(model, tree, candidate, consider, *, max_proposals=None):
@@ -144,6 +150,10 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None):
         changed = False
         fit = current.refit
         labels = fit.labels
+        clonal = fit.clonal_cluster
+        if (not 0 <= clonal < len(fit.centers) or not np.any(labels == clonal)
+                or not np.array_equal(fit.centers[clonal], np.ones(model.r))):
+            raise ValueError("Boundary parent lost its occupied clonal center")
         components = {cluster: np.flatnonzero(labels == cluster) for cluster in range(len(fit.centers))}
         # The model columns already enforce the complete regional assignment box.
         columns = model.log_likelihood_columns(fit.centers)
@@ -152,9 +162,10 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None):
                                       adjacency=adjacency, components=components)
             if not move.changed:
                 continue
-            proposed_labels, centers = canonical_partition(move.labels, move.centers)
+            proposed_labels, centers, _, clonal = canonical_partition(
+                move.labels, move.centers, clonal_cluster=fit.clonal_cluster)
             cuts = tuple(np.flatnonzero(proposed_labels[tree.edges[:, 0]] != proposed_labels[tree.edges[:, 1]]))
-            proposal_key = (cuts, centers.tobytes())
+            proposal_key = (cuts, clonal, centers.tobytes())
             if proposal_key in visited:
                 continue
             if not np.array_equal(proposed_labels, partition_from_cuts(tree, cuts)):
@@ -166,9 +177,15 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None):
             proposed = consider(cuts, proposed_labels, centers, {
                 "route": "boundary_refinement", "parent_cuts": current.cuts,
                 "replaced_edge": int(edge), "replacement_edge": move.edge,
+                "parent_clonal_cluster": fit.clonal_cluster, "proposed_clonal_cluster": clonal,
             })
             if proposed is None:
                 continue
+            fixed = proposed.refit.clonal_cluster
+            if (not 0 <= fixed < len(proposed.refit.centers)
+                    or not np.any(proposed.refit.labels == fixed)
+                    or not np.array_equal(proposed.refit.centers[fixed], np.ones(model.r))):
+                raise ValueError("Boundary callback lost its occupied clonal center")
             old = float(fit.conditional_log_likelihood)
             new = float(proposed.refit.conditional_log_likelihood)
             # Numerical ties do not cycle; no arbitrary full-fit time ceiling.

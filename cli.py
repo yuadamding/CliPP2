@@ -13,7 +13,7 @@ from ._version import __version__
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipp2", allow_abbrev=False,
-        description="Fit the free-center tree-proposed joint-region multiplicity-mixture estimator.",
+        description="Fit the occupied-clonal tree-proposed joint-region multiplicity-mixture estimator.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=__version__)

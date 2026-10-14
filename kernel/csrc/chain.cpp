@@ -9,10 +9,10 @@
 namespace clipp2kernel {
 
 ChainData prepare_chain_inputs(int count, const int* alt, const int* depth,
-    const int* major, const int* total, double purity, const double* pilot_cp,
+    const int* major, const int* total, const int* clonal_eligible, double purity, const double* pilot_cp,
     const int* requested_k, int k_count)
 {
-    if(count <= 0 || !alt || !depth || !major || !total || !pilot_cp || !requested_k)
+    if(count <= 0 || !alt || !depth || !major || !total || !clonal_eligible || !pilot_cp || !requested_k)
         throw std::invalid_argument("Nonempty chain inputs are required.");
     if(!std::isfinite(purity) || purity <= 0.0 || purity > 1.0)
         throw std::invalid_argument("Purity must be finite and in (0,1].");
@@ -29,8 +29,13 @@ ChainData prepare_chain_inputs(int count, const int* alt, const int* depth,
     data.count=count; data.purity=purity;
     data.alt.assign(alt,alt+count); data.depth.assign(depth,depth+count);
     data.major.assign(major,major+count);
+    data.clonal_eligible.assign(clonal_eligible,clonal_eligible+count);
+    if(std::none_of(data.clonal_eligible.begin(),data.clonal_eligible.end(),[](int v){return v==1;}))
+        throw std::invalid_argument("clonal_infeasible_no_eligible_mutation");
     data.scale.resize(count); data.log_choose.resize(count); data.pilot_x.resize(count);
     for(int i=0;i<count;++i){
+        if(clonal_eligible[i]!=0 && clonal_eligible[i]!=1)
+            throw std::invalid_argument("Clonal eligibility must be binary.");
         if(alt[i]<0 || depth[i]<=0 || alt[i]>depth[i] || major[i]<1 || total[i]<major[i])
             throw std::invalid_argument("Invalid binomial counts or full-major multiplicity support.");
         if(!std::isfinite(pilot_cp[i]) || pilot_cp[i]<0.0 || pilot_cp[i]>purity*(1.0+1e-12))
@@ -140,9 +145,22 @@ std::vector<double> boxed_chain_laplacian_quadratic(const std::vector<double>& c
 
 namespace {
 double sum(const std::vector<double>& values){return std::accumulate(values.begin(),values.end(),0.0);}
+int project_anchor(const std::vector<double>& x,const std::vector<int>& eligible){
+    int witness=-1;double distance=INFINITY;
+    for(int i=0;i<int(x.size());++i)if(eligible[i]){
+        const double d=(x[i]-1.0)*(x[i]-1.0);
+        if(d<distance){witness=i;distance=d;}
+    }
+    if(witness<0)throw std::runtime_error("clonal_infeasible_no_eligible_mutation");
+    return witness;
+}
+double anchor_penalty(const std::vector<double>& x,int witness,double rho){
+    return 0.5*rho*(x[witness]-1.0)*(x[witness]-1.0);
+}
 std::vector<double> augmented_gradient(const std::vector<double>& x,const std::vector<double>& z,
-    const std::vector<double>& gradient,double rho){
-    std::vector<double> g=gradient;for(size_t i=0;i<z.size();++i){double v=rho*(x[i+1]-x[i]-z[i]);g[i]-=v;g[i+1]+=v;}return g;
+    const std::vector<double>& gradient,double rho,int witness){
+    std::vector<double> g=gradient;for(size_t i=0;i<z.size();++i){double v=rho*(x[i+1]-x[i]-z[i]);g[i]-=v;g[i+1]+=v;}
+    g[witness]+=rho*(x[witness]-1.0);return g;
 }
 double stationarity(const std::vector<double>& x,const std::vector<double>& g){
     double residual=0.0;for(size_t i=0;i<x.size();++i)residual=std::max(residual,std::fabs(x[i]-std::max(kChainLowerCCF,std::min(kChainUpperCCF,x[i]-g[i]))));return residual;
@@ -170,7 +188,7 @@ BlockScale block_scale(const std::vector<double>& x,const std::vector<double>& z
 // likelihood, a new partition, or a constrained/global-optimality certificate.
 // The caller accepts it only if it decreases the actual next-rho objective.
 void feasible_support_warm_start(const std::vector<double>& raw,const std::vector<int>& labels,
-    const ChainEvaluator& evaluate,std::vector<double>& x,std::vector<double>& values,
+    int witness,double rho,const ChainEvaluator& evaluate,std::vector<double>& x,std::vector<double>& values,
     std::vector<double>& gradient,std::vector<double>& curvature){
     const int n=int(raw.size()),q=labels.back()+1;
     std::vector<double> centers(q,0.0),sizes(q,0.0);
@@ -182,6 +200,8 @@ void feasible_support_warm_start(const std::vector<double>& raw,const std::vecto
     for(int iteration=0;iteration<50;++iteration){
         std::vector<double> g(q,0.0),h(q,0.0),direction(q);
         for(int i=0;i<n;++i){g[labels[i]]+=gradient[i];h[labels[i]]+=curvature[i];}
+        g[labels[witness]]+=rho*(centers[labels[witness]]-1.0);
+        h[labels[witness]]+=rho;
         double residual=0.0,slope=0.0;
         for(int j=0;j<q;++j){
             residual=std::max(residual,std::fabs(centers[j]-std::max(kChainLowerCCF,std::min(kChainUpperCCF,centers[j]-g[j]/sizes[j]))));
@@ -190,12 +210,13 @@ void feasible_support_warm_start(const std::vector<double>& raw,const std::vecto
         }
         if(residual<=1e-8 || !(slope<0.0)) break;
         std::vector<double> trial(n),v(n),grad(n),hessian(n);
-        const double previous=sum(values);
+        const double previous=sum(values)+anchor_penalty(x,witness,rho);
         bool accepted=false;double step=1.0;
         for(int backtrack=0;backtrack<40;++backtrack){
             for(int i=0;i<n;++i) trial[i]=centers[labels[i]]+step*direction[labels[i]];
             evaluate(trial,v,grad,hessian);
-            if(std::isfinite(sum(v)) && sum(v)<=previous+1e-4*step*slope){
+            const double objective=sum(v)+anchor_penalty(trial,witness,rho);
+            if(std::isfinite(objective) && objective<=previous+1e-4*step*slope){
                 for(int j=0;j<q;++j) centers[j]+=step*direction[j];
                 x.swap(trial);values.swap(v);gradient.swap(grad);curvature.swap(hessian);
                 accepted=true;break;
@@ -226,30 +247,33 @@ void solve_chain(const ChainData& data,const int* requested_k,int k_count,
         double rho=1.0,stat=INFINITY,violation=INFINITY;
         int total_iterations=0,level_used=0,qp_budget_hits=0,warm_starts=0;
         bool stalled=false,numerical_limit=false;
-        std::vector<int> warm_labels;
+        int witness=project_anchor(x,data.clonal_eligible),switches=0;
+        auto reproject=[&](){const int next=project_anchor(x,data.clonal_eligible);switches+=(next!=witness);witness=next;};
         std::vector<double> warm_x,warm_values,warm_gradient,warm_curvature;
         for(int level=0;level<levels;++level){
             level_used=level+1;stalled=false;
             for(int iteration=0;iteration<iterations_per_level;++iteration){
                 ++total_iterations;
                 const auto z=project_chain_jumps(x,k);
-                const auto g=augmented_gradient(x,z,gradient,rho);
+                reproject();
+                const auto g=augmented_gradient(x,z,gradient,rho,witness);
                 stat=stationarity(x,g);
                 if(stat<=stationarity_tolerance) break;
-                std::vector<double> diagonal(n),rhs(n);
+                std::vector<double> diagonal(n),rhs(n),h=curvature;
                 for(int i=0;i<n;++i){
                     const int degree=(i>0 && z[i-1]==0.0)+(i+1<n && z[i]==0.0);
                     diagonal[i]=curvature[i]+rho*degree;
                     rhs[i]=curvature[i]*x[i]-gradient[i];
                 }
+                h[witness]+=rho;rhs[witness]+=rho;diagonal[witness]+=rho;
                 bool qp_solved=false;
                 // Holding sparse values fixed adds artificial rho stiffness at
                 // retained jumps. Holding only their support instead minimizes
                 // those values analytically and gives a tighter MM upper bound.
-                const auto qp=boxed_chain_laplacian_quadratic(curvature,rhs,z,rho,
+                const auto qp=boxed_chain_laplacian_quadratic(h,rhs,z,rho,
                     &qp_solved,kChainLowerCCF,kChainUpperCCF);
                 if(!qp_solved) ++qp_budget_hits;
-                const double old_objective=sum(values)+chain_support_penalty(x,z,rho);
+                const double old_objective=sum(values)+chain_support_penalty(x,z,rho)+anchor_penalty(x,witness,rho);
                 bool accepted=false;
                 std::vector<double> trial(n),trial_values(n),trial_gradient(n),trial_curvature(n);
                 for(int fallback=0;fallback<2 && !accepted;++fallback){
@@ -267,7 +291,7 @@ void solve_chain(const ChainData& data,const int* requested_k,int k_count,
                         // distance-to-set objective above, with equality at x.
                         // Armijo descent therefore also decreases that objective,
                         // including when projection support changes or ties.
-                        const double value=sum(trial_values)+chain_support_penalty(trial,z,rho);
+                        const double value=sum(trial_values)+chain_support_penalty(trial,z,rho)+anchor_penalty(trial,witness,rho);
                         if(std::isfinite(value) && value<=old_objective+1e-4*step*slope+1e-12*std::max(1.0,std::fabs(old_objective))){
                             double displacement=0.0;
                             for(int i=0;i<n;++i) displacement=std::max(displacement,std::fabs(trial[i]-x[i]));
@@ -282,13 +306,14 @@ void solve_chain(const ChainData& data,const int* requested_k,int k_count,
                 if(stalled) break;
             }
             const auto z=project_chain_jumps(x,k);
-            stat=stationarity(x,augmented_gradient(x,z,gradient,rho));
+            reproject();
+            stat=stationarity(x,augmented_gradient(x,z,gradient,rho,witness));
             violation=std::sqrt(2.0*chain_support_penalty(x,z,1.0));
             const auto scale=block_scale(x,z,curvature);
-            if(stat<=stationarity_tolerance && violation<=constraint_tolerance && scale.range<=constraint_tolerance) break;
+            const double residual=std::max({violation,scale.range,std::fabs(x[witness]-1.0)});
+            if(stat<=stationarity_tolerance && residual<=constraint_tolerance) break;
             const double roundoff_scale=8.0*rho*std::numeric_limits<double>::epsilon();
-            if(rho>=maximum_rho || (stalled && violation<=constraint_tolerance &&
-                scale.range<=constraint_tolerance && roundoff_scale>=stationarity_tolerance)){
+            if(rho>=maximum_rho || (stalled && residual<=constraint_tolerance && roundoff_scale>=stationarity_tolerance)){
                 numerical_limit=true;break;
             }
             if(level+1<levels){
@@ -297,16 +322,14 @@ void solve_chain(const ChainData& data,const int* requested_k,int k_count,
                 // achieved feasibility; a fixed rho cap is length dependent.
                 const double gap=4.0*std::pow(std::sin(std::acos(-1.0)/(2.0*scale.longest)),2);
                 const double spectral_rho=scale.likelihood_curvature/gap;
-                const double residual_ratio=std::max(violation,scale.range)/constraint_tolerance;
+                const double residual_ratio=residual/constraint_tolerance;
                 const double factor=std::max(2.0,std::min(10.0,std::max(spectral_rho/rho,residual_ratio)));
                 const double next_rho=std::min(maximum_rho,rho*factor);
                 const auto labels=chain_labels(z);
-                if(labels!=warm_labels){
-                    feasible_support_warm_start(x,labels,evaluate,warm_x,warm_values,warm_gradient,warm_curvature);
-                    warm_labels=labels;
-                }
-                const double old_objective=sum(values)+chain_support_penalty(x,z,next_rho);
-                if(std::isfinite(sum(warm_values)) && sum(warm_values)<old_objective){
+                feasible_support_warm_start(x,labels,witness,next_rho,evaluate,warm_x,warm_values,warm_gradient,warm_curvature);
+                const double old_objective=sum(values)+chain_support_penalty(x,z,next_rho)+anchor_penalty(x,witness,next_rho);
+                const double warm_objective=sum(warm_values)+anchor_penalty(warm_x,witness,next_rho);
+                if(std::isfinite(warm_objective) && warm_objective<old_objective){
                     x=warm_x;values=warm_values;gradient=warm_gradient;curvature=warm_curvature;++warm_starts;
                 }
                 rho=next_rho;
@@ -319,14 +342,17 @@ void solve_chain(const ChainData& data,const int* requested_k,int k_count,
         for(int i=0;i<n;++i){published_cp[i]=data.purity*x[i];x[i]=published_cp[i]/data.purity;}
         evaluate(x,values,gradient,curvature);
         const auto z=project_chain_jumps(x,k);
-        stat=stationarity(x,augmented_gradient(x,z,gradient,rho));
+        reproject();
+        stat=stationarity(x,augmented_gradient(x,z,gradient,rho,witness));
         violation=std::sqrt(2.0*chain_support_penalty(x,z,1.0));
         const auto labels=chain_labels(z);
         const int actual=labels.back()+1;
-        const double objective=sum(values)+chain_support_penalty(x,z,rho);
+        const double objective=sum(values)+chain_support_penalty(x,z,rho)+anchor_penalty(x,witness,rho);
         const auto scale=block_scale(x,z,curvature);
-        const bool tolerance_met=stat<=stationarity_tolerance && violation<=constraint_tolerance && scale.range<=constraint_tolerance;
-        if(!tolerance_met && violation<=constraint_tolerance && scale.range<=constraint_tolerance &&
+        const double anchor_residual=std::fabs(x[witness]-1.0);
+        const bool feasible=std::max({violation,scale.range,anchor_residual})<=constraint_tolerance;
+        const bool tolerance_met=stat<=stationarity_tolerance && feasible;
+        if(!tolerance_met && feasible &&
             8.0*rho*std::numeric_limits<double>::epsilon()>=stationarity_tolerance) numerical_limit=true;
         statuses_out[request]=tolerance_met?0:(numerical_limit?1:(stalled?2:3));
         const auto offset=static_cast<std::size_t>(request)*n;
@@ -338,7 +364,8 @@ void solve_chain(const ChainData& data,const int* requested_k,int k_count,
             violation,data.purity*violation,stat,double(total_iterations),
             double(level_used),double(qp_budget_hits),kChainLowerCCF,kChainUpperCCF,
             scale.range,double(scale.longest),double(warm_starts),
-            8.0*rho*std::numeric_limits<double>::epsilon()
+            8.0*rho*std::numeric_limits<double>::epsilon(),
+            anchor_residual,double(witness),double(switches),double(feasible)
         };
         std::copy(diagnostics,diagnostics+kDiagnosticCount,
                   diagnostics_out+static_cast<std::size_t>(request)*kDiagnosticCount);

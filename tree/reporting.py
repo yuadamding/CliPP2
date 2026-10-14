@@ -1,6 +1,7 @@
 """Independent selected-fit checks and the compact three-table public contract."""
 from dataclasses import asdict
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -12,9 +13,11 @@ from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 
 from ..kernel import ALGORITHM, SCORE_DEFINITION
 from ..kernel.topology import partition_from_cuts
+from .selection import _TreeRefit
 
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
+OUTPUT_SCHEMA_VERSION = 11
 
 def _input_domain(model, centers):
     """Rebuild observations and closed boxes independently of runtime caches."""
@@ -28,10 +31,8 @@ def _input_domain(model, centers):
     observed = np.isfinite(depth) & (depth > 0)
     if data.count_observed is not None:
         observed &= np.asarray(data.count_observed, dtype=bool)[ix]
-    mixed = data.cn_state_count[ix] > 1
-    lower, upper = np.where(mixed, 1e-6, 0.), np.where(mixed, data.phi_upper[ix], 1.)
-    allowed = ((centers[None, :, :] >= lower[:, None, :])
-               & (centers[None, :, :] <= upper[:, None, :])).all(axis=2)
+    allowed = np.broadcast_to(((centers >= 0.) & (centers <= 1.)).all(axis=1),
+                              (model.n, len(centers)))
     return observed, allowed
 
 
@@ -42,9 +43,9 @@ def independent_log_columns(model, centers):
     data = model.data
     ix = np.ix_(model.active_indices, model.region_indices)
     alt, depth = data.alt_counts[ix], data.total_counts[ix]
-    major, total, purity = data.major_cn[ix], data.mean_total_cn[ix], data.purity[ix]
-    normal, mixed = data.normal_cn[ix], data.cn_state_count[ix] > 1
-    support = np.where(mixed, np.minimum(major, 4), major).astype(int)
+    major, total, purity = data.major_cn[ix], data.total_cn[ix], data.purity[ix]
+    normal = data.normal_cn[ix]
+    support = major.astype(int)
     answer = np.zeros((model.n, len(centers)))
     for region in range(model.r):
         observed = observed_rows[:, region]
@@ -59,8 +60,7 @@ def independent_log_columns(model, centers):
         marginal = np.full((len(y), len(centers)), -np.inf)
         for m in range(1, int(s.max())+1):
             prob = scale[:, None] * m * centers[:, region][None, :]
-            prob = np.where(mixed[observed, region, None], np.clip(prob, 1e-6, 1-1e-6),
-                            np.minimum(prob, 1.0))
+            prob = np.minimum(prob, 1.0)
             component = xlogy(y[:, None], prob) + xlog1py((n-y)[:, None], -prob)
             component += constant[:, None]
             component[s < m] = -np.inf
@@ -84,6 +84,11 @@ def verify_selected(model, result):
         raise ValueError('Selected result has invalid eligibility or dimensions')
     if not np.issubdtype(labels.dtype, np.integer) or not np.array_equal(np.unique(labels), np.arange(q)):
         raise ValueError('Memberships must be occupied consecutive integer labels')
+    clonal = fit.clonal_cluster
+    if (isinstance(clonal, (bool, np.bool_)) or not isinstance(clonal, (int, np.integer))
+            or not 0 <= clonal < q or not np.any(labels == clonal)
+            or not np.array_equal(centers[clonal], np.ones(model.r))):
+        raise ValueError('Selected fit must have an occupied exact clonal center')
     observed, allowed = _input_domain(model, centers)
     if not allowed.any(axis=1).all():
         raise ValueError('A mutation has no admissible center in its original bounds')
@@ -128,7 +133,7 @@ def verify_selected(model, result):
         raise ValueError('Independent mixture-weight optimality check failed')
     conditional = math.fsum(columns[np.arange(model.n), labels])
     mixture = float(logsumexp(columns + np.log(weights), axis=1).sum())
-    penalty = (q*model.r+q-1)*math.log(model.n)
+    penalty = (q-1)*(model.r+1)*math.log(model.n)
     score = -2*mixture+penalty
     for name, actual, expected in (
         ('conditional likelihood', conditional, fit.conditional_log_likelihood),
@@ -141,8 +146,71 @@ def verify_selected(model, result):
                    and candidate.get('publication_eligible') is True]
     bank_scores += [float(candidate.score) for candidate in result.candidate_bank
                     if not isinstance(candidate, dict) and candidate.fit.eligible]
-    if not bank_scores or not np.isclose(min(bank_scores), score, atol=1e-7, rtol=1e-10):
+    if (not bank_scores or not np.isfinite(bank_scores).all()
+            or not np.isclose(min(bank_scores), score, atol=1e-7, rtol=1e-10)):
         raise ValueError('Selected fit is not the best complete-bank score')
+    retained = any(candidate is result.selected for candidate in result.candidate_bank)
+    for candidate in result.candidate_bank:
+        if isinstance(candidate, dict):
+            if candidate.get('status') != 'scored' or candidate.get('publication_eligible') is not True:
+                continue
+            parameters = json.loads(candidate['partition_parameters'])
+            fixed = parameters['clonal_cluster']
+            record_fixed = candidate.get('clonal_cluster')
+            cp = np.asarray(parameters['centers'], dtype=float)
+            block_labels = np.asarray(parameters['block_labels'])
+            boundaries = np.asarray(parameters['cuts'], dtype=float)
+            fitted_weights = np.asarray(parameters['weights'], dtype=float)
+            if (model.r != 1 or cp.ndim != 1 or not len(cp)
+                    or isinstance(fixed, bool) or not isinstance(fixed, int) or not 0 <= fixed < len(cp)
+                    or block_labels.ndim != 1 or not np.issubdtype(block_labels.dtype, np.integer)
+                    or not np.array_equal(np.unique(block_labels), np.arange(len(cp)))
+                    or boundaries.shape != (len(block_labels)-1,)
+                    or not np.isfinite(boundaries).all() or np.any(boundaries != np.rint(boundaries))
+                    or np.any(boundaries <= 0) or np.any(boundaries >= model.n)
+                    or np.any(np.diff(boundaries) <= 0)
+                    or not np.isfinite(cp).all() or np.any(cp < 0) or np.any(cp > model.region_purities[0])
+                    or cp[fixed] != float(model.region_purities[0])
+                    or fitted_weights.shape != cp.shape or not np.isfinite(fitted_weights).all()
+                    or np.any(fitted_weights <= 0) or not np.isclose(fitted_weights.sum(), 1., atol=1e-12, rtol=0)
+                    or isinstance(record_fixed, (bool, np.bool_))
+                    or not isinstance(record_fixed, (int, np.integer)) or record_fixed != fixed):
+                raise ValueError('Scalar bank contains an invalid clonal designation')
+            # Match the exact fitted state, not just its score: hard memberships
+            # can differ while centers/weights and mixture scores are identical.
+            fitted_centers = cp[:, None]/model.region_purities[0]
+            fitted_centers[fixed] = 1.
+            if (fixed == clonal and np.array_equal(fitted_centers, centers)
+                    and np.array_equal(fitted_weights, weights)):
+                order = np.r_[result.tree.edges[:, 0], result.tree.edges[-1, 1]] if model.n > 1 else np.array([0])
+                if (result.tree.kind != 'chain' or not np.array_equal(np.sort(order), np.arange(model.n))
+                        or not np.array_equal(result.tree.edges[:, 1], order[1:])):
+                    raise ValueError('Scalar bank requires the original ordered chain')
+                retained |= np.array_equal(labels[order], block_labels[
+                    np.searchsorted(boundaries, np.arange(model.n), side='right')])
+        elif candidate.fit.eligible:
+            fitted = candidate.fit
+            fixed, count = fitted.clonal_cluster, len(fitted.centers)
+            if (isinstance(fixed, (bool, np.bool_)) or not isinstance(fixed, (int, np.integer))
+                    or not 0 <= fixed < count or np.asarray(fitted.centers).shape != (count, model.r)
+                    or not np.array_equal(fitted.centers[fixed], np.ones(model.r))):
+                raise ValueError('Candidate bank contains an invalid clonal designation')
+            if isinstance(fitted, _TreeRefit):
+                # A valid tree's distinct cuts imply occupied components without
+                # materializing one N-vector per compact candidate.
+                occupied = (fitted.tree is result.tree and candidate.cuts == fitted.cuts
+                            and len(fitted.cuts)+1 == count and len(set(fitted.cuts)) == len(fitted.cuts)
+                            and all(not isinstance(cut, (bool, np.bool_))
+                                    and isinstance(cut, (int, np.integer)) and 0 <= cut < model.n-1
+                                    for cut in fitted.cuts))
+            else:
+                member = np.asarray(fitted.labels)
+                occupied = (member.shape == (model.n,) and np.issubdtype(member.dtype, np.integer)
+                            and np.array_equal(np.unique(member), np.arange(count)))
+            if not occupied:
+                raise ValueError('Candidate bank contains an unoccupied clonal designation or invalid partition')
+    if not retained:
+        raise ValueError('Selected fitted state is absent from the complete candidate bank')
     validity = float(np.log(allowed @ weights).sum())
     return {'independently_verified': True, 'conditional_log_likelihood': conditional,
             'membership_kind': kind, 'connected_on_proposal_tree': len(cuts)+1 == q,
@@ -154,15 +222,16 @@ def verify_selected(model, result):
             'validity_conditioned_mixture_log_likelihood': mixture-validity,
             'weight_optimality_gap': weight_gap, 'weight_active_score_gap': active_gap,
             'complete_candidate_bank_reconciled': True,
-            'num_parameters': q*model.r+q-1, 'num_mutation_vectors': model.n,
+            'num_parameters': (q-1)*(model.r+1), 'num_mutation_vectors': model.n,
+            'clonal_cluster': int(clonal), 'occupied_exact_clonal_center_verified': True,
             'global_optimality_proven': False, 'joint_mixture_center_mle': False}
 
 
 def result_tables(model, result, tumor_id):
     fit = result.selected.fit
     labels, centers = fit.labels, fit.centers
-    # Cluster zero is largest norm, never an enforced clonal block.
-    order = np.argsort(-np.linalg.norm(centers, axis=1), kind='stable')
+    ranked = np.argsort(-np.linalg.norm(centers, axis=1), kind='stable')
+    order = np.r_[fit.clonal_cluster, ranked[ranked != fit.clonal_cluster]]
     mapping = np.empty(len(order), dtype=int)
     mapping[order] = np.arange(len(order))
     public = mapping[labels]
@@ -175,15 +244,12 @@ def result_tables(model, result, tumor_id):
         cluster['phi_'+region] = centers[order, j]
     ix = np.ix_(model.active_indices, model.region_indices)
     data = model.data
-    mixed = data.cn_state_count[ix] > 1
     calls = model.multiplicity(phi)
     calls = np.where(~model.observed & (model.support == 1), 1, calls)
     long = pd.DataFrame(dict(tumor_id=tumor_id,
         mutation_id=np.repeat(model.mutation_ids, model.r), region_id=np.tile(model.region_ids, model.n),
-        phi=phi.ravel(), major_cn=np.where(mixed, np.nan, data.major_cn[ix]).ravel(),
-        minor_cn=np.where(mixed, np.nan, data.minor_cn[ix]).ravel(), multiplicity_call=calls.ravel()))
-    if mixed.any():
-        long['mean_total_cn'] = data.mean_total_cn[ix].ravel()
+        phi=phi.ravel(), major_cn=data.major_cn[ix].ravel(),
+        minor_cn=data.minor_cn[ix].ravel(), multiplicity_call=calls.ravel()))
     return dict(zip(OUTPUT_SUFFIXES, (wide, cluster, long)))
 
 
@@ -211,13 +277,22 @@ def publish(model, result, outdir, tumor_id):
             parsed = pd.read_csv(staged/name, sep='\t', dtype=str, keep_default_na=False)
             if list(parsed.columns) != list(table.columns) or len(parsed) != len(table):
                 raise ValueError('Staged TSV did not round-trip its schema and row count')
+            if suffix in ('cluster_centers.tsv', 'mutation_clusters.tsv'):
+                clonal_rows = parsed['cluster_label'] == '0'
+                columns = ['phi_'+r for r in model.region_ids]
+            else:
+                clonal_ids = set(model.mutation_ids[i] for i in np.flatnonzero(result.labels == result.clonal_cluster))
+                clonal_rows = parsed['mutation_id'].isin(clonal_ids)
+                columns = ['phi']
+            if not clonal_rows.any() or not np.all(parsed.loc[clonal_rows, columns].astype(float).to_numpy() == 1.):
+                raise ValueError('Staged TSV lost its occupied exact clonal center')
             hashes[name] = hashlib.sha256((staged/name).read_bytes()).hexdigest()
         for name in hashes:
             os.link(staged/name, outdir/name)
         for name, digest in hashes.items():
             if hashlib.sha256((outdir/name).read_bytes()).hexdigest() != digest:
                 raise ValueError('Published TSV readback hash mismatch')
-    return {'status': 'complete', 'algorithm': ALGORITHM, 'output_schema_version': 9, 'files': hashes,
+    return {'status': 'complete', 'algorithm': ALGORITHM, 'output_schema_version': OUTPUT_SCHEMA_VERSION, 'files': hashes,
             'verification': verification}
 
 

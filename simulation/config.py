@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from numbers import Integral
 from pathlib import Path
 
 import numpy as np
@@ -47,10 +48,8 @@ class TumorSimulationConfig:
 def _positive_integer(value: object, name: str, *, minimum: int = 1) -> None:
     if (
         isinstance(value, (bool, np.bool_))
-        or not isinstance(value, (int, float, np.integer, np.floating))
-        or not np.isfinite(value)
+        or not isinstance(value, Integral)
         or value < minimum
-        or int(value) != value
     ):
         raise ValueError(f"{name} must be an integer >= {minimum}.")
 

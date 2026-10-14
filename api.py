@@ -1,4 +1,4 @@
-"""One free-center, joint-region workflow backed by CliPP2's own kernel."""
+"""One occupied-clonal-center joint workflow backed by CliPP2's own kernel."""
 from __future__ import annotations
 
 import hashlib
@@ -14,13 +14,14 @@ from .io.tumor_txt import load_tumor_txt
 def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     """Fit canonical input; verify and publish three minimal tables.
 
-    Conditional centers are free. Candidate-generation convergence is reported,
+    One occupied conditional center is fixed at one; all others remain free.
+    Candidate-generation convergence is reported,
     not confused with a global-optimality or biological-accuracy proof.
     """
     from .kernel.model import RegionalModel, MODEL_VERSION
     from .kernel.scalar import fit_scalar, supports_scalar
     from .tree.selection import fit_tree
-    from .tree.reporting import ALGORITHM, check_destination, exclusion_summary, publish
+    from .tree.reporting import ALGORITHM, OUTPUT_SCHEMA_VERSION, check_destination, exclusion_summary, publish
     from ._source import source_fingerprint, git_source_identity
     from .kernel import KERNEL_VERSION, SCORE_DEFINITION
 
@@ -54,14 +55,15 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     publication = publish(model, result, outdir, data.tumor_id)
     summary = {
         'tumor_id': data.tumor_id, 'algorithm': ALGORITHM, 'model_version': MODEL_VERSION,
-        'output_schema_version': 9, 'kernel_version': KERNEL_VERSION,
+        'output_schema_version': OUTPUT_SCHEMA_VERSION, 'kernel_version': KERNEL_VERSION,
         'source_commit': commit, 'source_dirty': dirty,
         'source_sha256': source_hash, 'input_sha256': input_hash,
         'num_mutations': model.n, 'num_regions': model.r,
         'num_clusters': len(result.centers), 'region_ids': model.region_ids,
         'fit_config': asdict(config), 'model_identity': model.identity,
         'score': result.score, 'score_definition': SCORE_DEFINITION,
-        'clonal_constraint': False, 'cluster_zero': 'largest_final_ccf_l2_norm',
+        'clonal_constraint': True, 'clonal_centroid_ccf': [1.]*model.r,
+        'clonal_cluster_label': 0, 'cluster_zero': 'fixed_occupied_clonal_centroid',
         'exclusions': exclusion_summary(model), 'diagnostics': result.diagnostics,
         'verification_publication_seconds': perf_counter()-verification_start,
         'elapsed_seconds': perf_counter()-started, 'publication': publication,

@@ -74,7 +74,7 @@ def fixed_center_chain_partition(log_likelihood):
     }
 
 
-def _partition_state(model, result, chain_order):
+def _partition_state(model, result, chain_order, column_evaluator=None):
     labels = np.asarray(result["labels"])
     centers = np.asarray(result["centers"], dtype=float)
     n = len(model)
@@ -90,12 +90,16 @@ def _partition_state(model, result, chain_order):
     labels = labels.astype(np.int64)
     if not np.array_equal(np.unique(labels), np.arange(len(centers))):
         raise ValueError("Every refitted center must have an occupied label")
+    clonal = result["clonal_cluster"]
+    if not 0 <= clonal < len(centers) or centers[clonal] != model.purity:
+        raise ValueError("Scalar refinement requires an occupied center fixed at purity")
     ordered = labels[chain_order]
     cuts = np.flatnonzero(np.diff(ordered)) + 1
     visits = ordered[np.r_[0, cuts]]
     if len(visits) != len(centers) or len(np.unique(visits)) != len(visits):
         raise ValueError("Each center must visit exactly one contiguous chain block")
-    kernel = np.column_stack([model.log_likelihood(cp) for cp in centers[visits]])[chain_order]
+    kernel = (column_evaluator(centers[visits]) if column_evaluator is not None else
+              np.column_stack([model.log_likelihood(cp) for cp in centers[visits]]))[chain_order]
     states = np.searchsorted(cuts, np.arange(n), side="right")
     score = math.fsum(kernel[np.arange(n), states])
     if not np.isfinite(score):
@@ -104,12 +108,14 @@ def _partition_state(model, result, chain_order):
 
 
 def polish_chain_partition(
-    model, result, chain_order, refit, max_iterations=100, mean_loglik_tolerance=1e-10
+    model, result, chain_order, refit, max_iterations=100, mean_loglik_tolerance=1e-10,
+    *, column_evaluator=None,
 ):
     """Alternate exact conditional boundaries and caller-supplied block refits.
 
-    ``refit(labels)`` receives labels in original mutation-row order and returns
-    a result dictionary containing ``labels`` and ``centers``. It may merge
+    ``refit(labels, centers)`` receives labels in original mutation-row order
+    and initial centers in chain-visit order. It returns a result dictionary
+    containing ``labels``, ``centers`` and ``clonal_cluster``. It may merge
     adjacent blocks, but cannot add or move boundaries itself. The returned
     result is the best conditional-likelihood candidate, with scalar-only
     iteration history. A finite iteration budget or a local fixed point is
@@ -133,7 +139,7 @@ def polish_chain_partition(
         raise ValueError("Frozen chain order must be a permutation of original rows")
     order = order.astype(np.int64)
     current = result
-    _, cuts, kernel, score = _partition_state(model, current, order)
+    _, cuts, kernel, score = _partition_state(model, current, order, column_evaluator)
     initial_score, initial_q = score, kernel.shape[1]
     best, best_score = current, score
     history = []
@@ -159,8 +165,9 @@ def polish_chain_partition(
         labels = np.empty(n, dtype=np.int64)
         labels[order] = proposal["labels"]
         try:
-            candidate = refit(labels)
-            _, new_cuts, new_kernel, new_score = _partition_state(model, candidate, order)
+            visits = current["labels"][order][np.r_[0, cuts]]
+            candidate = refit(labels, current["centers"][visits])
+            _, new_cuts, new_kernel, new_score = _partition_state(model, candidate, order, column_evaluator)
         except RuntimeError as error:
             entry.update(status="refit_failed", error=str(error))
             history.append(entry)

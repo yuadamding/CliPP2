@@ -19,9 +19,12 @@ DIAGNOSTIC_FIELDS = (
     'continuation_levels', 'qp_budget_hits', 'ccf_lower_bound', 'ccf_upper_bound',
     'max_block_range_CCF', 'longest_block', 'feasible_warm_starts',
     'penalty_gradient_roundoff_scale',
+    'anchor_residual_ccf', 'anchor_witness_index', 'anchor_projection_switches',
+    'raw_constraint_tolerance_met',
 )
 INTEGER_DIAGNOSTICS = frozenset(('requested_K', 'actual_blocks', 'iterations',
-    'continuation_levels', 'qp_budget_hits', 'longest_block', 'feasible_warm_starts'))
+    'continuation_levels', 'qp_budget_hits', 'longest_block', 'feasible_warm_starts',
+    'anchor_witness_index', 'anchor_projection_switches', 'raw_constraint_tolerance_met'))
 STATUSES = ('penalty_stationary_constraint_tolerance', 'penalty_numerical_limit_candidate',
             'line_search_stalled_candidate', 'finite_budget_candidate')
 
@@ -48,7 +51,7 @@ def _load_library(root, path, signature):
     library.CliPP2KernelBuildId.restype = ctypes.c_char_p
     library.CliPP2KernelLastError.argtypes = []
     library.CliPP2KernelLastError.restype = ctypes.c_char_p
-    if library.CliPP2KernelABI() != 1 or library.CliPP2KernelBuildId().decode() != digest:
+    if library.CliPP2KernelABI() != 2 or library.CliPP2KernelBuildId().decode() != digest:
         raise RuntimeError('CliPP2 kernel binary/source or ABI mismatch; rebuild before fitting')
     return library, digest
 
@@ -97,7 +100,7 @@ def _integers(values, name):
     return np.ascontiguousarray(values, dtype=np.int32)
 
 
-def solve_chain(arrays, purity, pilot_cp, capacities, *, evaluator=None):
+def solve_chain(arrays, purity, pilot_cp, capacities, *, clonal_eligible, evaluator=None):
     """Return proposals/diagnostics in memory; optionally evaluate likelihood on CUDA.
 
     Inputs and outputs follow frozen chain order. Callback failure aborts the
@@ -107,6 +110,10 @@ def solve_chain(arrays, purity, pilot_cp, capacities, *, evaluator=None):
         raise ValueError('Expected alt, depth, major and total CN vectors')
     arrays = tuple(_integers(a, name) for a, name in zip(arrays, ('alt', 'depth', 'major', 'total')))
     n = len(arrays[0])
+    eligible = np.asarray(clonal_eligible)
+    if eligible.shape != (n,) or np.any((eligible != 0) & (eligible != 1)) or not eligible.any():
+        raise ValueError('clonal_infeasible_no_eligible_mutation or malformed eligibility mask')
+    eligible = np.ascontiguousarray(eligible, dtype=np.int32)
     pilot = np.ascontiguousarray(pilot_cp, dtype=np.float64)
     capacities = _integers(capacities, 'capacities')
     if any(len(a) != n for a in arrays) or pilot.shape != (n,):
@@ -145,10 +152,10 @@ def solve_chain(arrays, purity, pilot_cp, capacities, *, evaluator=None):
     diagnostics = np.empty((k, len(DIAGNOSTIC_FIELDS)), dtype=np.float64)
     statuses = np.empty(k, dtype=np.int32)
     entry = library.CliPP2SolveChain
-    entry.argtypes = [ctypes.c_int, ints, ints, ints, ints, ctypes.c_double, doubles,
+    entry.argtypes = [ctypes.c_int, ints, ints, ints, ints, ints, ctypes.c_double, doubles,
                      ints, ctypes.c_int, ints, doubles, doubles, ints, callback_type]
     entry.restype = ctypes.c_int
-    status = entry(n, *arrays, float(purity), pilot, capacities, k,
+    status = entry(n, *arrays, eligible, float(purity), pilot, capacities, k,
                    labels, cp, diagnostics, statuses, callback_handle)
     if errors:
         raise RuntimeError('CliPP2 likelihood callback failed; no CPU fallback') from errors[0]
@@ -163,6 +170,8 @@ def solve_chain(arrays, purity, pilot_cp, capacities, *, evaluator=None):
                for name, value in zip(DIAGNOSTIC_FIELDS, diagnostics[index])}
         raw.update(status=STATUSES[statuses[index]], constrained_optimum_certified=False,
                    backend='cuda_likelihood_host_chain' if evaluator is not None else 'cpu')
+        raw.update(tree_constraint_residual_ccf=raw['constraint_residual_CCF'],
+                   raw_penalty_objective=raw['objective'], raw_stationarity_ccf=raw['stationarity_CCF'])
         proposals.append(dict(requested_k=int(capacity), labels=labels[index].copy(),
                               cp=cp[index].copy(), diagnostics=raw))
     return proposals, digest

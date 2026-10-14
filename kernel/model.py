@@ -1,9 +1,9 @@
 """CliPP2 emissions, conditional centers and joint reads/validity mixture score.
 
-CCF, not cellular prevalence, is the public fitting/geometry scale. Single-state
-diploid-normal observations use the shared scalar likelihood primitives.
-Mixed CN explicitly retains CliPP2's capped support, weighted denominator,
-clipped likelihood and original interior box. Assignment validity is observed
+CCF, not cellular prevalence, is the public fitting/geometry scale. Input CN
+states collapse to maximum major and maximum total CN before inference.
+Diploid-normal observations use the shared scalar likelihood primitives.
+Assignment validity is observed
 jointly with reads; it is not conditioned away by renormalizing mixture weights.
 CUDA is an explicit float64 likelihood/host-forest path, never a CPU fallback;
 pooled initialization, scalar refits and weight optimization run on the host.
@@ -27,9 +27,7 @@ from .scoring import fit_cluster_weights
 from ..io.data import readonly_array
 
 
-# Mixed-CN emissions/boxes stay fixed; their assignment mask now enters scoring.
-MODEL_VERSION = "clipp2_regional_full_support__general_normal_v1__mixed_cn_bulk_assignment_event_v2"
-MIXED_EPS = 1e-6
+MODEL_VERSION = "clipp2_regional_full_support__max_major_max_total_cn_v1"
 ADAPTER_BLOCK_BYTES = 8 * 1024 * 1024
 ADAPTER_MAX_ITERATIONS = 500
 ADAPTER_GRID_TOLERANCE = 1e-8
@@ -40,6 +38,7 @@ class RefittedPartition:
     labels: np.ndarray
     centers: np.ndarray
     weights: np.ndarray
+    clonal_cluster: int
     conditional_log_likelihood: float
     mixture_log_likelihood: float
     complexity_penalty: float
@@ -87,9 +86,8 @@ class RegionalModel:
             raise ValueError(f"Regions have no informative observations: {absent}")
         for name, source in (("alt", data.alt_counts), ("depth", data.total_counts),
                              ("major", data.major_cn), ("normal", data.normal_cn),
-                             ("total", data.mean_total_cn), ("purity", data.purity)):
+                             ("total", data.total_cn), ("purity", data.purity)):
             setattr(self, name, readonly_array(np.asarray(source)[ix], dtype=float))
-        self.mixed = readonly_array(np.asarray(data.cn_state_count)[ix] > 1)
         for values in (self.major, self.purity, self.total, self.normal):
             if not np.isfinite(values).all():
                 raise ValueError("CN and purity must be finite in every mutation-region")
@@ -97,9 +95,8 @@ class RegionalModel:
             raise ValueError("Major CN must be a positive integer")
         if np.any(self.normal < 0) or np.any(self.normal != np.rint(self.normal)):
             raise ValueError("Normal CN must be a nonnegative integer")
-        if np.any(self.total[~self.mixed] < self.major[~self.mixed]) or np.any(
-                self.total[~self.mixed] != np.rint(self.total[~self.mixed])):
-            raise ValueError("Single-state total CN must be an integer at least major CN")
+        if np.any(self.total < self.major) or np.any(self.total != np.rint(self.total)):
+            raise ValueError("Total CN must be an integer at least major CN")
         if np.any(self.purity <= 0) or np.any(self.purity > 1):
             raise ValueError("Purity must be in (0,1]")
         if not np.all(self.purity == self.purity[:1, :]):
@@ -116,11 +113,9 @@ class RegionalModel:
         denominator = (1 - self.purity) * self.normal + self.purity * self.total
         if np.any(denominator <= 0):
             raise ValueError("Normal-plus-tumor denominator must be positive")
-        self.support = readonly_array(np.where(self.mixed, np.minimum(self.major, 4), self.major), dtype=int)
-        self.lower = readonly_array(np.where(self.mixed, MIXED_EPS, 0.0))
-        self.upper = readonly_array(np.where(self.mixed, np.asarray(data.phi_upper)[ix], 1.0))
-        if np.any(self.upper < self.lower) or np.any(self.upper > 1) or not np.isfinite(self.upper).all():
-            raise ValueError("Invalid original mixed-CN bounds")
+        self.support = readonly_array(self.major, dtype=int)
+        self.lower = readonly_array(np.zeros_like(self.major))
+        self.upper = readonly_array(np.ones_like(self.major))
         self.scaling = readonly_array(self.purity / denominator)
         m = np.arange(1, int(self.support.max()) + 1)
         self.valid = readonly_array(m <= self.support[..., None])
@@ -130,7 +125,7 @@ class RegionalModel:
             - gammaln(self.depth - self.alt + 1) - np.log(self.support))
         digest = hashlib.sha256(MODEL_VERSION.encode())
         for values in (self.alt, self.depth, self.observed, self.slope,
-                       self.support, self.mixed, self.lower, self.upper):
+                       self.support, self.lower, self.upper):
             digest.update(values.tobytes())
         digest.update(repr((self.mutation_ids, self.region_ids)).encode())
         self.identity = digest.hexdigest()
@@ -144,7 +139,7 @@ class RegionalModel:
                 raise RuntimeError("CUDA was requested but is unavailable; no CPU fallback")
             self._torch = torch
             self._gpu = {name: torch.tensor(np.array(getattr(self, name)), device=self.device)
-                         for name in ("slope", "valid", "observed", "mixed", "alt", "depth", "constants")}
+                         for name in ("slope", "valid", "observed", "alt", "depth", "constants")}
         self.execution_backend = "cuda_likelihood_host_forest" if self._torch else "cpu"
         self._cache_bytes = int(cache_bytes)
         if self._cache_bytes < 0:
@@ -154,7 +149,27 @@ class RegionalModel:
         self.telemetry = {"refit_cache_hits": 0, "scalar_refits": 0,
                           "column_cache_hits": 0, "likelihood_columns": 0,
                           "joint_matrix_calls": 0,
-                          "scalar_refit_seconds": 0.0, "weight_seconds": 0.0}
+                          "scalar_refit_seconds": 0.0, "weight_seconds": 0.0,
+                          "free_block_refits": 0, "free_block_preparations": 0,
+                          "mixture_weight_fits": 0,
+                          "anchored_variant_evaluations": 0, "clonal_column_hits": 0}
+        self._prepare_clonal_column()
+
+    def _prepare_clonal_column(self):
+        """One immutable exact emission column, outside the evictable LRU."""
+        ones = np.ones((1, self.r))
+        allowed = self.assignment_admissibility(ones)[:, 0]
+        emission = -self.loss(np.ones((self.n, self.r))).sum(axis=1)
+        self.clonal_log_column = readonly_array(np.where(allowed, emission, -np.inf))
+        self.clonal_eligible = readonly_array(allowed & np.isfinite(emission))
+
+    def check_clonal_feasibility(self, max_clusters):
+        if not self.clonal_eligible.any():
+            raise ValueError("clonal_infeasible_no_eligible_mutation")
+        if not self.observed[self.clonal_eligible].any(axis=0).all():
+            raise ValueError("clonal_infeasible_missing_regional_support")
+        if max_clusters == 1 and not self.clonal_eligible.all():
+            raise ValueError("clonal_infeasible_single_cluster_capacity")
 
     def __len__(self):
         return self.n
@@ -166,7 +181,7 @@ class RegionalModel:
         if np.any(x[self.observed] < 0) or np.any(x[self.observed] > 1):
             raise ValueError("CCFs must be in [0,1]")
         mass = np.where(self.observed, x, 0.0)[..., None] * self.slope
-        p = np.where(self.mixed[..., None], np.clip(mass, MIXED_EPS, 1-MIXED_EPS), np.minimum(1., mass))
+        p = np.minimum(1., mass)
         if np.any(p[self.valid & self.observed[..., None]] < 0):
             raise ValueError("CCFs cannot imply negative allele probabilities")
         alt = np.where(self.observed, self.alt, 0.)[..., None]
@@ -184,7 +199,7 @@ class RegionalModel:
             raise ValueError("CCFs must be in [0,1]")
         xx = t.tensor(np.where(self.observed, x, 0.), device=self.device)
         mass = xx[..., None] * a["slope"]
-        p = t.where(a["mixed"][..., None], mass.clamp(MIXED_EPS, 1-MIXED_EPS), mass.clamp(max=1.))
+        p = mass.clamp(max=1.)
         alt = t.where(a["observed"], a["alt"], 0.)[..., None]
         ref = t.where(a["observed"], a["depth"]-a["alt"], 0.)[..., None]
         kernel = t.special.xlogy(alt, p) + t.special.xlog1py(ref, -p) + a["constants"][..., None]
@@ -194,17 +209,17 @@ class RegionalModel:
         if not derivatives:
             return loss.cpu().numpy()
         post = t.where(t.isfinite(kernel), t.exp(kernel-ll[..., None]), 0.)
-        derivative_slope = t.where(a["mixed"][..., None] & ((mass <= MIXED_EPS) | (mass >= 1-MIXED_EPS)), 0., a["slope"])
+        derivative_slope = a["slope"]
         safe_p = t.where(alt > 0, p, 1.)
         safe_q = t.where(ref > 0, 1-p, 1.)
         g = derivative_slope * (-alt/safe_p + ref/safe_q)
         h = derivative_slope.square() * (alt/safe_p.square() + ref/safe_q.square())
         g = t.where(post > 0, post*g, 0.).sum(-1)
         h = t.where(post > 0, post*h, 0.).sum(-1)
-        boundary = a["valid"] & ~a["mixed"][..., None] & (p == 1) & (ref == 1)
+        boundary = a["valid"] & (p == 1) & (ref == 1)
         correction = t.where(boundary, a["slope"] * t.exp(a["constants"][..., None] - ll[..., None]), 0.).sum(-1)
         g += correction
-        h += t.where(a["valid"] & ~a["mixed"][..., None] & (p == 1) & (ref == 2),
+        h += t.where(a["valid"] & (p == 1) & (ref == 2),
                      2*a["slope"].square()*t.exp(a["constants"][..., None]-ll[..., None]), 0.).sum(-1)
         h = t.where(boundary.any(-1), t.inf, h.clamp(min=1e-8))
         g = t.where(t.isfinite(ll), g, 0.)
@@ -223,7 +238,7 @@ class RegionalModel:
         p, mass, kernel, ll = self._numpy_kernel(x)
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
             post = np.where(np.isfinite(kernel), np.exp(kernel-ll[..., None]), 0.)
-            slope = np.where(self.mixed[..., None] & ((mass <= MIXED_EPS) | (mass >= 1-MIXED_EPS)), 0., self.slope)
+            slope = self.slope
             alt, ref = self.alt[..., None], (self.depth-self.alt)[..., None]
             g = slope * (np.divide(-alt, p, out=np.zeros_like(p), where=alt != 0)
                          + np.divide(ref, 1-p, out=np.zeros_like(p), where=ref != 0))
@@ -231,9 +246,9 @@ class RegionalModel:
                             + np.divide(ref, (1-p)**2, out=np.zeros_like(p), where=ref != 0))
             g = np.where(post > 0, post*g, 0.).sum(-1)
             h = np.where(post > 0, post*h, 0.).sum(-1)
-            boundary = self.valid & ~self.mixed[..., None] & (p == 1) & (ref == 1)
+            boundary = self.valid & (p == 1) & (ref == 1)
             g += np.where(boundary, self.slope*np.exp(self.constants[..., None]-ll[..., None]), 0.).sum(-1)
-            h += np.where(self.valid & ~self.mixed[..., None] & (p == 1) & (ref == 2),
+            h += np.where(self.valid & (p == 1) & (ref == 2),
                           2*self.slope**2*np.exp(self.constants[..., None]-ll[..., None]), 0.).sum(-1)
         h = np.where(boundary.any(-1), np.inf, np.maximum(h, 1e-8))
         g, h = np.where(np.isfinite(ll), g, 0.), np.where(np.isfinite(ll), h, 1.)
@@ -250,18 +265,17 @@ class RegionalModel:
         return np.where(self.observed, np.nan_to_num(post).argmax(-1)+1., np.nan)
 
     def _scalar_model(self, rows, region):
-        if self.mixed[rows, region].any() or np.any(self.normal[rows, region] != 2):
+        if np.any(self.normal[rows, region] != 2):
             return None
         return MultiplicityModel(self.alt[rows, region], self.depth[rows, region],
                                  self.major[rows, region], self.total[rows, region],
                                  self.region_purities[region])
 
     def _regional_likelihood(self, values, rows, region):
-        """Host scalar/grid evaluation, including legacy mixed-CN clipping."""
+        """Host scalar/grid evaluation for effective integer CN."""
         values = np.atleast_1d(values)
         p = values[:, None, None] * self.slope[rows, region][None, :, :]
-        p = np.where(self.mixed[rows, region][None, :, None],
-                     np.clip(p, MIXED_EPS, 1-MIXED_EPS), np.minimum(p, 1.))
+        p = np.minimum(p, 1.)
         kernel = (xlogy(self.alt[rows, region][None, :, None], p)
                   + xlog1py((self.depth[rows, region]-self.alt[rows, region])[None, :, None], -p)
                   + self.constants[rows, region][None, :, None])
@@ -283,7 +297,7 @@ class RegionalModel:
     def observation_keys(self):
         """ID-free scientific row signatures for deterministic proposal ties."""
         arrays = (self.observed, self.alt, self.depth, self.slope, self.support,
-                  self.mixed, self.lower, self.upper)
+                  self.lower, self.upper)
         return [int.from_bytes(hashlib.sha256(b''.join(a[i].tobytes() for a in arrays)).digest(),
                                'big') for i in range(self.n)]
 
@@ -377,6 +391,10 @@ class RegionalModel:
         self.telemetry["joint_matrix_calls"] += 1
         columns = []
         for k, center in enumerate(centers):
+            if np.array_equal(center, np.ones(self.r)):
+                self.telemetry["clonal_column_hits"] += 1
+                columns.append(self.clonal_log_column)
+                continue
             key = (self.identity, center.tobytes())
             column = self._columns.get(key)
             if column is not None:
@@ -396,21 +414,35 @@ class RegionalModel:
             columns.append(column)
         return np.column_stack(columns)
 
-    def refit(self, labels, initial_centers=None):
+    def _refit_variants(self, labels, designations, initial_centers):
         labels = np.asarray(labels)
-        if labels.shape != (self.n,) or not np.isfinite(labels).all() or np.any(labels != np.rint(labels)):
+        if (labels.shape != (self.n,) or labels.dtype.kind not in "iuf"
+                or not np.isfinite(labels).all() or np.any(labels != np.rint(labels))):
             raise ValueError("Labels must contain one finite integer per mutation")
-        _, inverse = np.unique(labels, return_inverse=True)
+        occupied, inverse = np.unique(labels, return_inverse=True)
         q = int(inverse.max())+1
         centers = np.full((q, self.r), np.nan)
         if initial_centers is not None:
             initial_centers = np.asarray(initial_centers, dtype=float)
             if initial_centers.shape != centers.shape:
                 raise ValueError("Initial centers must follow sorted occupied label order")
-        penalty = float((q*self.r+q-1)*math.log(self.n))
-        retained_initial = 0
-        try:
-            for cluster in range(q):
+        if designations is None:
+            designations = [int(k) for k in occupied if self.clonal_eligible[labels == k].all()
+                            and self.observed[labels == k].any(axis=0).all()]
+        elif any(isinstance(k, (bool, np.bool_)) or not isinstance(k, (int, np.integer))
+                 or k not in occupied for k in designations):
+            raise ValueError("clonal_cluster must designate an occupied label")
+        designations = [int(np.flatnonzero(occupied == k)[0]) for k in designations]
+        penalty = float((q-1)*(self.r+1)*math.log(self.n))
+        errors, retained = {}, np.zeros(q, dtype=int)
+        # Prepare independent free fits once, including errors. Fixing a block
+        # must not depend on its free optimizer succeeding.
+        for cluster in range(q):
+            if not any(k != cluster for k in designations):
+                continue
+            self.telemetry["free_block_preparations"] += 1
+            previous_refits = self.telemetry["scalar_refits"]
+            try:
                 members = np.flatnonzero(inverse == cluster)
                 for region in range(self.r):
                     center, ll = self._fit_scalar(members, region)
@@ -422,33 +454,69 @@ class RegionalModel:
                             old_ll = float(self._regional_likelihood([old], rows, region).sum())
                             if old_ll > ll:
                                 center, ll = float(old), old_ll
-                                retained_initial += 1
+                                retained[cluster] += 1
                     centers[cluster, region] = center
-        except (ValueError, RuntimeError) as error:
-            return RefittedPartition(inverse, centers, np.full(q, np.nan), -np.inf,
-                                     -np.inf, penalty, np.inf, False, str(error))
+            except (ValueError, RuntimeError) as error:
+                errors[cluster] = str(error)
+            finally:
+                self.telemetry["free_block_refits"] += self.telemetry["scalar_refits"] > previous_refits
+        for clonal in designations:
+            self.telemetry["anchored_variant_evaluations"] += 1
+            fixed = centers.copy()
+            fixed[clonal] = 1.
+            members = inverse == clonal
+            error = next((reason for k, reason in errors.items() if k != clonal), None)
+            if not self.clonal_eligible[members].all():
+                error = "clonal_block_inadmissible"
+            elif not self.observed[members].any(axis=0).all():
+                error = "unsupported_cluster_region:clonal"
+            if error:
+                yield self._failed_refit(inverse, fixed, clonal, penalty, error)
+                continue
+            yield self._score_refit(inverse, fixed, clonal, penalty, int(retained.sum()-retained[clonal]))
+
+    def refit(self, labels, *, clonal_cluster, initial_centers=None):
+        return next(self._refit_variants(labels, [clonal_cluster], initial_centers))
+
+    def refit_variants(self, labels, *, initial_centers=None):
+        """All admissible fixed-block choices; free-coordinate work is shared."""
+        return self._refit_variants(labels, None, initial_centers)
+
+    @staticmethod
+    def _failed_refit(labels, centers, clonal, penalty, reason, conditional=-np.inf):
+        return RefittedPartition(labels=labels, centers=centers,
+            weights=np.full(len(centers), np.nan), clonal_cluster=clonal,
+            conditional_log_likelihood=conditional, mixture_log_likelihood=-np.inf,
+            complexity_penalty=penalty, score=np.inf, eligible=False, reason=reason)
+
+    def _score_refit(self, inverse, centers, clonal, penalty, retained_initial):
+        q = len(centers)
         matrix = self.log_likelihood_columns(centers)
         conditional = math.fsum(matrix[np.arange(self.n), inverse])
+        if not np.isfinite(conditional):
+            return self._failed_refit(inverse, centers, clonal, penalty, "nonfinite_assigned_likelihood")
         start = time.perf_counter()
+        self.telemetry["mixture_weight_fits"] += 1
         try:
             mixture = fit_cluster_weights(_WeightModel(self.n), np.zeros(q),
                                           np.bincount(inverse), log_kernel=matrix,
                                           telemetry=self.telemetry)
         except (ValueError, RuntimeError) as error:
-            return RefittedPartition(inverse, centers, np.full(q, np.nan), conditional,
-                                     -np.inf, penalty, np.inf, False, f"weight_fit:{error}")
+            return self._failed_refit(inverse, centers, clonal, penalty, f"weight_fit:{error}", conditional)
         finally:
             self.telemetry["weight_seconds"] += time.perf_counter()-start
         ll = mixture["log_likelihood"]
         eligible = bool(np.all(mixture["cluster_weights"] > 0))
-        return RefittedPartition(inverse, centers, mixture["cluster_weights"], conditional,
-                                 ll, penalty, -2*ll+penalty, eligible,
-                                 None if eligible else "zero_mixture_weight", diagnostics={
+        return RefittedPartition(labels=inverse, centers=centers, weights=mixture["cluster_weights"],
+                                 clonal_cluster=clonal, conditional_log_likelihood=conditional,
+                                 mixture_log_likelihood=ll, complexity_penalty=penalty,
+                                 score=-2*ll+penalty, eligible=eligible,
+                                 reason=None if eligible else "zero_mixture_weight", diagnostics={
                                      "weight_optimality_gap": mixture["weight_optimality_gap"],
                                      "weight_active_score_gap": mixture["weight_active_score_gap"],
                                      "retained_initial_centers": retained_initial,
                                      "scalar_global_optimality_certified": False,
-                                     "num_parameters": q*self.r+q-1,
+                                     "num_parameters": (q-1)*(self.r+1),
                                      "score_definition": SCORE_DEFINITION})
 
 
@@ -466,7 +534,7 @@ class _GridOracle:
 
     The working block is at most ADAPTER_BLOCK_BYTES (or one grid row if that
     row itself exceeds the budget). Thus storage remains O(N + grid), even
-    when distinct mixed-CN upper bounds make the grid grow with N.
+    for general-normal-CN initialization.
     """
     def __init__(self, model, rows, region, grid, *, block_bytes=None):
         self.model, self.rows, self.region, self.grid = model, rows, region, grid
@@ -530,7 +598,7 @@ class _GridOracle:
 
 
 def _pooled_adapter(model, rows, region, *, block_bytes=None):
-    """Stream the explicit mixed/general-normal grid; exact concave weight gap.
+    """Stream the general-normal-CN grid; exact concave weight gap.
 
     Safeguarded SQUAREM and exact grow/shrink exchange mirror the inherited
     pooled initializer without a quadratic-space SLSQP over the whole grid.
@@ -645,7 +713,7 @@ def _pooled_adapter(model, rows, region, *, block_bytes=None):
     if gap > ADAPTER_GRID_TOLERANCE:
         raise RuntimeError("Streamed pooled-grid final duality gap changed")
     return pilot, {
-        "method": "general_normal_mixed_cn_bulk_v1_streamed_pooled_ccf_grid_v2",
+        "method": "general_normal_integer_cn_streamed_pooled_ccf_grid_v1",
         "inherited_single_state_initialization": False,
         "grid_size": len(grid), "iterations": iteration,
         "max_iterations": ADAPTER_MAX_ITERATIONS,

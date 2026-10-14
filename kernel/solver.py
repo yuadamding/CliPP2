@@ -12,6 +12,7 @@ import numpy as np
 
 from .topology import _cut_mask, partition_from_cuts, project_cuts
 from .native import forest_quadratic
+from .anchor import project_anchor, anchor_penalty, anchored_quadratic
 
 
 @dataclass(frozen=True)
@@ -117,7 +118,7 @@ def _component_scale(tree, cuts, x, curvature):
     return labels, float((maxima - minima).max()), longest, h
 
 
-def _support_warm_start(model, x, labels, lower, upper):
+def _support_warm_start(model, x, labels, lower, upper, witness, penalty):
     q, r = int(labels.max()) + 1, x.shape[1]
     sizes = np.bincount(labels)
     lo, hi = np.full((q, r), -np.inf), np.full((q, r), np.inf)
@@ -134,18 +135,20 @@ def _support_warm_start(model, x, labels, lower, upper):
         g, h = np.zeros_like(center), np.zeros_like(center)
         np.add.at(g, labels, gradient)
         np.add.at(h, labels, curvature)
+        g[labels[witness]] += penalty*(center[labels[witness]]-1.)
+        h[labels[witness]] += penalty
         direction = np.clip(center - g / np.maximum(h, 1e-8), lo, hi) - center
         residual = np.max(np.abs(center - np.clip(center - g / sizes[:, None], lo, hi)))
         slope = float(np.sum(g * direction))
         if residual <= 1e-8 or not slope < 0:
             break
-        previous = float(np.sum(values))
+        previous = float(np.sum(values)) + anchor_penalty(warm, witness, penalty)
         accepted = False
         for backtrack in range(40):
             step = 0.5 ** backtrack
             trial = (center + step * direction)[labels]
             candidate = model.node_terms(trial)
-            objective = float(np.sum(candidate[0]))
+            objective = float(np.sum(candidate[0])) + anchor_penalty(trial, witness, penalty)
             if np.isfinite(objective) and objective <= previous + 1e-4 * step * slope:
                 center += step * direction
                 warm, (values, gradient, curvature) = trial, candidate
@@ -183,6 +186,7 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None):
         raise ValueError("Distinct nonempty capacities are required")
     for k in requested:
         project_cuts(tree, pilot, k)
+    model.check_clonal_feasibility(max(requested))
     lower = np.maximum(np.asarray(model.lower, dtype=float), 1e-8)
     upper = np.minimum(np.asarray(model.upper, dtype=float), 1 - 1e-8)
     if lower.shape != pilot.shape or upper.shape != pilot.shape or np.any(lower > upper):
@@ -196,25 +200,29 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None):
         rho = 1.0
         total_iterations = qp_unqualified = warm_starts = 0
         numerical_limit = stalled = False
-        warm_labels = None
-        warm = None
+        witness, _ = project_anchor(x, model.clonal_eligible)
+        switches = 0
         accepted_steps = 0
         for level in range(policy.levels):
             stalled = False
             for _ in range(policy.iterations_per_level):
                 total_iterations += 1
                 cuts = project_cuts(tree, x, k)
+                projected_witness, anchor_residual = project_anchor(x, model.clonal_eligible)
+                switches += projected_witness != witness
+                witness = projected_witness
                 forest = tree.edges[~_cut_mask(tree, cuts)]
                 jumps = x[forest[:, 0]] - x[forest[:, 1]]
                 g = gradient + _spring_gradient(x, forest, rho)
+                g[witness] += rho*(x[witness]-1.)
                 stationarity = float(np.max(np.abs(x - np.clip(x - g, lower, upper))))
                 if stationarity <= policy.stationarity_tolerance:
                     break
-                h = np.maximum(curvature, 1e-8)
-                qp, audit = boxed_forest_quadratic(h, h * x - gradient, forest, rho, lower, upper)
+                h, rhs = anchored_quadratic(x, gradient, curvature, witness, rho)
+                qp, audit = boxed_forest_quadratic(h, rhs, forest, rho, lower, upper)
                 qp_unqualified += not audit["solved"]
                 degree = np.bincount(forest.ravel(), minlength=tree.n)[:, None]
-                old_objective = float(np.sum(values) + 0.5 * rho * np.sum(jumps * jumps))
+                old_objective = float(np.sum(values) + 0.5 * rho * np.sum(jumps * jumps)) + anchor_penalty(x, witness, rho)
                 accepted = False
                 proposals = [qp] if audit["solved"] else []
                 proposals.append(np.clip(x - g / (h + rho * degree), lower, upper))
@@ -228,7 +236,7 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None):
                         trial = np.clip(x + step * direction, lower, upper)
                         trial_terms = model.node_terms(trial)
                         delta = trial[forest[:, 0]] - trial[forest[:, 1]]
-                        objective = float(np.sum(trial_terms[0]) + 0.5 * rho * np.sum(delta * delta))
+                        objective = float(np.sum(trial_terms[0]) + 0.5 * rho * np.sum(delta * delta)) + anchor_penalty(trial, witness, rho)
                         slack = 1e-12 * max(1.0, abs(old_objective))
                         if np.isfinite(objective) and objective <= old_objective + 1e-4 * step * slope + slack:
                             stalled = bool(np.max(np.abs(trial - x)) <= 8 * np.finfo(float).eps)
@@ -243,12 +251,16 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None):
                 if stalled:
                     break
             cuts = project_cuts(tree, x, k)
+            projected_witness, anchor_residual = project_anchor(x, model.clonal_eligible)
+            switches += projected_witness != witness
+            witness = projected_witness
             forest = tree.edges[~_cut_mask(tree, cuts)]
             g = gradient + _spring_gradient(x, forest, rho)
+            g[witness] += rho*(x[witness]-1.)
             stationarity = float(np.max(np.abs(x - np.clip(x - g, lower, upper))))
             violation = float(np.linalg.norm(x[forest[:, 0]] - x[forest[:, 1]]))
             labels, block_range, longest, mean_h = _component_scale(tree, cuts, x, curvature)
-            feasible = max(violation, block_range) <= policy.constraint_tolerance
+            feasible = max(violation, block_range, anchor_residual) <= policy.constraint_tolerance
             if stationarity <= policy.stationarity_tolerance and feasible:
                 break
             roundoff = 8 * rho * np.finfo(float).eps
@@ -257,18 +269,30 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None):
                 break
             if level + 1 < policy.levels:
                 gap = 4 * np.sin(np.pi / (2 * longest)) ** 2
-                factor = max(2.0, min(10.0, max(mean_h / gap / rho, max(violation, block_range) / policy.constraint_tolerance)))
+                factor = max(2.0, min(10.0, max(mean_h / gap / rho, max(violation, block_range, anchor_residual) / policy.constraint_tolerance)))
                 next_rho = min(policy.maximum_penalty, rho * factor)
-                if warm_labels is None or not np.array_equal(labels, warm_labels):
-                    warm = _support_warm_start(model, x, labels, lower, upper)
-                    warm_labels = labels.copy()
+                warm = _support_warm_start(model, x, labels, lower, upper, witness, next_rho)
                 if warm is not None:
-                    old_objective = float(np.sum(values) + 0.5 * next_rho * violation ** 2)
-                    if np.isfinite(warm[1]).all() and float(np.sum(warm[1])) < old_objective:
+                    old_objective = float(np.sum(values) + 0.5 * next_rho * violation ** 2) + anchor_penalty(x, witness, next_rho)
+                    warm_objective = float(np.sum(warm[1])) + anchor_penalty(warm[0], witness, next_rho)
+                    if np.isfinite(warm_objective) and warm_objective < old_objective:
                         x, values, gradient, curvature = [array.copy() for array in warm]
                         warm_starts += 1
                 rho = next_rho
-        tolerance_met = stationarity <= policy.stationarity_tolerance and max(violation, block_range) <= policy.constraint_tolerance
+        # Recompute all diagnostics from the exact returned raw state.
+        cuts = project_cuts(tree, x, k)
+        projected_witness, anchor_residual = project_anchor(x, model.clonal_eligible)
+        switches += projected_witness != witness
+        witness = projected_witness
+        forest = tree.edges[~_cut_mask(tree, cuts)]
+        values, gradient, curvature = model.node_terms(x)
+        g = gradient + _spring_gradient(x, forest, rho)
+        g[witness] += rho*(x[witness]-1.)
+        stationarity = float(np.max(np.abs(x-np.clip(x-g, lower, upper))))
+        violation = float(np.linalg.norm(x[forest[:, 0]]-x[forest[:, 1]]))
+        labels, block_range, longest, _ = _component_scale(tree, cuts, x, curvature)
+        objective = float(np.sum(values)+.5*rho*violation**2) + anchor_penalty(x, witness, rho)
+        tolerance_met = stationarity <= policy.stationarity_tolerance and max(violation, block_range, anchor_residual) <= policy.constraint_tolerance
         status = ("penalty_stationary_constraint_tolerance" if tolerance_met else
                   "penalty_numerical_limit_candidate" if numerical_limit else
                   "line_search_stalled_candidate" if stalled else "finite_budget_candidate")
@@ -282,7 +306,14 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None):
                 "stationarity_CCF": stationarity, "constraint_residual_CCF": violation,
                 "max_block_range_CCF": block_range, "longest_block": longest,
                 "negative_log_likelihood": float(np.sum(values)),
-                "objective": float(np.sum(values) + 0.5 * rho * violation ** 2),
+                "objective": objective, "raw_penalty_objective": objective,
+                "tree_constraint_residual_ccf": violation,
+                "anchor_residual_ccf": anchor_residual,
+                "anchor_witness_index": witness,
+                "anchor_witness_mutation_id": model.mutation_ids[witness],
+                "anchor_projection_switches": int(switches),
+                "raw_stationarity_ccf": stationarity,
+                "raw_constraint_tolerance_met": bool(max(violation, block_range, anchor_residual) <= policy.constraint_tolerance),
                 "tolerance_met": bool(tolerance_met), "qp_unqualified": int(qp_unqualified),
                 "feasible_warm_starts": warm_starts, "accepted_steps": accepted_steps,
                 "penalty_gradient_roundoff_scale": 8 * rho * np.finfo(float).eps,

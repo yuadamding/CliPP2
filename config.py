@@ -7,9 +7,6 @@ from numbers import Integral
 from typing import Final
 
 DEFAULT_MAX_MAJOR_CN: Final = 4
-# Preserved mixed-CN input bounds use the historical four-copy support cap;
-# the tree model gives matched single-state CN its full 1..major support.
-MAX_MULTIPLICITY: Final = 4
 DEFAULT_DEVICE: Final = "cuda"
 
 

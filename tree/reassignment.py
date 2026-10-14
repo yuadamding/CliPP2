@@ -20,17 +20,18 @@ SCORE_RTOL = 1e-10
 def _partition_key(candidate):
     """Avoid materializing labels for the original compact tree bank."""
     if getattr(candidate, "membership_kind", "tree") == "tree":
-        return "tree", tuple(candidate.cuts)
+        return "tree", tuple(candidate.cuts), candidate.refit.clonal_cluster
     labels = candidate.refit.labels
     groups = {}
-    return "general", tuple(groups.setdefault(int(k), len(groups)) for k in labels)
+    canonical = tuple(groups.setdefault(int(k), len(groups)) for k in labels)
+    return "general", canonical, groups[candidate.refit.clonal_cluster]
 
 
 def _starting_states(original, winner):
     # Preserve the tree bank's ordering for exact score ties. No fitted state
     # is removed: distinct-membership selection only limits proposal starts.
     ordered = sorted(original, key=lambda c: (
-        c.score, len(c.refit.centers), tuple(c.cuts)))
+        c.score, len(c.refit.centers), _partition_key(c)))
     representatives = {}
     for candidate in ordered:
         representatives.setdefault(len(candidate.refit.centers), candidate)
@@ -132,7 +133,7 @@ def _retained_bytes(candidates, bank):
             for candidate in candidates for field in ("labels", "centers", "weights")),
         "membership_attempt_key_bytes": sum(
             len(labels) + (0 if centers is None else len(centers))
-            for labels, centers in getattr(bank, "membership_attempts", {})),
+            for labels, _, centers in getattr(bank, "membership_attempts", {})),
         "structural_key_bytes": sum(map(len, getattr(bank, "structural_rejections", {}))),
         "scope": "logical_array_and_key_payload_not_RSS_or_Python_overhead",
     }
@@ -153,7 +154,7 @@ def expand_memberships(model, bank):
         raise ValueError("Reassignment requires an eligible original candidate bank")
     winner = getattr(bank, "original_selected", None)
     if winner is None:
-        winner = min(original, key=lambda c: (c.score, len(c.refit.centers), tuple(c.cuts)))
+        winner = min(original, key=lambda c: (c.score, len(c.refit.centers), _partition_key(c)))
     if not any(candidate is winner for candidate in original):
         raise ValueError("The original winner must belong to the original bank")
     starts = _starting_states(original, winner)
@@ -174,6 +175,10 @@ def expand_memberships(model, bank):
         for round_index in range(ROUND_LIMIT):
             labels = np.asarray(state.refit.labels, dtype=np.int64)
             centers = np.asarray(state.refit.centers, dtype=float)
+            clonal = state.refit.clonal_cluster
+            if (not 0 <= clonal < q or not np.any(labels == clonal)
+                    or not np.array_equal(centers[clonal], np.ones(model.r))):
+                raise ValueError("Reassignment parent lost its occupied clonal center")
             columns = np.asarray(model.log_likelihood_columns(centers), dtype=float)
             if columns.shape != (model.n, q) or len(keys) != model.n:
                 raise ValueError("Joint likelihood columns and scientific keys must match N by K")
@@ -196,12 +201,17 @@ def expand_memberships(model, bank):
                     "requested_k": q, "occupied_q": q,
                     "starting_bank_index": path["start_bank_index"], "round": round_index,
                     "parent_score": state.score,
+                    "parent_clonal_cluster": clonal,
                     "moved_mutations": int(np.count_nonzero(proposed != labels)),
                 })
                 record["outcome"] = "ineligible" if candidate is None else "eligible"
                 if candidate is not None:
                     if len(candidate.refit.centers) != q or not np.isfinite(candidate.score):
                         raise ValueError("A reassignment callback changed K or returned a nonfinite score")
+                    fixed = candidate.refit.clonal_cluster
+                    if (not 0 <= fixed < q or not np.any(candidate.refit.labels == fixed)
+                            or not np.array_equal(candidate.refit.centers[fixed], np.ones(model.r))):
+                        raise ValueError("Reassignment callback lost its occupied clonal center")
                     record["score"] = candidate.score
                     returned.append(candidate)
             # Ties retain the first (single) proposal; both complete fitted
@@ -236,6 +246,9 @@ def expand_memberships(model, bank):
             "original_candidate_count": len(original), "original_winner_score": winner.score,
             "starting_states": len(starts), "proposal_slots": slots,
             "proposal_callbacks": callbacks, "proposal_joint_column_evaluations": evaluations,
+            "membership_proposal_callbacks": callbacks,
+            **{name: delta["model"].get(name, 0) for name in (
+                "anchored_variant_evaluations", "free_block_refits", "mixture_weight_fits")},
             "accepted_steps": accepted, "added_candidates": len(bank.candidates) - len(original),
             "scan_counts": scans,
             "paths": paths, "counter_deltas": delta, "seconds": perf_counter() - started,

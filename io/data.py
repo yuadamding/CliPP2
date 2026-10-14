@@ -56,8 +56,9 @@ class CNFilterReport:
 class TumorData(ImmutableArrayRecord):
     """CN-compiled inputs, with no CN-population state in the optimizer.
 
-    major_cn/minor_cn are per-allele maxima; mean_total_cn is the actual
-    fraction-weighted total. Only clonal entries have a single CN pair.
+    Each mutation-region has one effective integer pair: maximum major CN
+    and maximum total CN across source states, with minor = total - major.
+    The source fractions do not enter inference.
     """
 
     tumor_id: str
@@ -74,24 +75,21 @@ class TumorData(ImmutableArrayRecord):
     phi_init: np.ndarray
     count_observed: np.ndarray | None = None
     cn_filter_report: CNFilterReport | None = None
-    mean_total_cn: np.ndarray | None = None
-    cn_state_count: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         for name in ("mutation_ids", "region_ids"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
-        if self.mean_total_cn is None:
-            object.__setattr__(self, "mean_total_cn", np.asarray(self.major_cn) + np.asarray(self.minor_cn))
-        if self.cn_state_count is None:
-            object.__setattr__(self, "cn_state_count", np.ones_like(self.major_cn, dtype=np.int64))
         for name in (
             "alt_counts", "total_counts", "purity", "major_cn", "minor_cn",
             "normal_cn", "scaling", "phi_upper", "phi_init", "count_observed",
-            "mean_total_cn", "cn_state_count",
         ):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, readonly_array(value))
+
+    @property
+    def total_cn(self) -> np.ndarray:
+        return readonly_array(self.major_cn + self.minor_cn)
 
     @property
     def num_mutations(self) -> int:

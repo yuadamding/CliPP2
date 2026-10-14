@@ -1,4 +1,4 @@
-"""CliPP2: free-center frozen-tree clustering of regional mutation CCF profiles."""
+"""CliPP2: occupied-clonal frozen-tree clustering of regional mutation CCF profiles."""
 
 from __future__ import annotations
 

@@ -9,7 +9,7 @@
 namespace clipp2kernel {
 
 constexpr int kMaxClusters = 10;
-constexpr int kDiagnosticCount = 19;
+constexpr int kDiagnosticCount = 23;
 constexpr double kChainLowerCCF = 1e-8;
 constexpr double kChainUpperCCF = 1.0-1e-8;
 constexpr int kChainLevels = 20;
@@ -68,7 +68,7 @@ inline MultiplicityLikelihood multiplicity_likelihood_x(
 struct ChainData {
     int count;
     double purity;
-    std::vector<int> alt, depth, major;
+    std::vector<int> alt, depth, major, clonal_eligible;
     std::vector<double> scale, log_choose, pilot_x;
 };
 
@@ -76,7 +76,7 @@ using ChainEvaluator = std::function<void(const std::vector<double>&,
     std::vector<double>&, std::vector<double>&, std::vector<double>&)>;
 
 ChainData prepare_chain_inputs(int count, const int* alt, const int* depth,
-    const int* major, const int* total, double purity, const double* pilot_cp,
+    const int* major, const int* total, const int* clonal_eligible, double purity, const double* pilot_cp,
     const int* requested_k, int k_count);
 
 void solve_chain(const ChainData& data, const int* requested_k, int k_count,
@@ -90,7 +90,7 @@ void solve_forest(int count, int regions, int edge_count, const int* edges,
 } // namespace clipp2kernel
 
 // All output buffers are caller-owned and valid only when the return code is zero.
-// Row-major shapes: labels/CP [k_count,count], diagnostics [k_count,19], status [k_count].
+// Row-major shapes: labels/CP [k_count,count], diagnostics [k_count,23], status [k_count].
 // Status: 0 tolerance met, 1 numerical limit, 2 line-search stall, 3 finite budget.
 // The callback receives CCF and writes loss, gradient and positive curvature.
 using CliPP2Callback = int (*)(int, const double*, double*, double*, double*);
@@ -99,7 +99,7 @@ int CliPP2KernelABI();
 const char* CliPP2KernelBuildId();
 const char* CliPP2KernelLastError();
 int CliPP2SolveChain(int count, const int* alt, const int* depth, const int* major,
-    const int* total, double purity, const double* pilot_cp, const int* capacities,
+    const int* total, const int* clonal_eligible, double purity, const double* pilot_cp, const int* capacities,
     int k_count, int* labels_out, double* cp_out, double* diagnostics_out,
     int* statuses_out, CliPP2Callback callback);
 // One shared forest, row-major [count,regions] matrices and [edge_count,2] edges.

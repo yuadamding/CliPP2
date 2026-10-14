@@ -6,7 +6,6 @@ from collections.abc import Mapping
 import csv
 from dataclasses import dataclass
 import gzip
-import math
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 from .data import CNFilterRecord, CNFilterReport, TumorData
-from ..config import DEFAULT_MAX_MAJOR_CN, MAX_MULTIPLICITY, validate_max_major_cn
+from ..config import DEFAULT_MAX_MAJOR_CN, validate_max_major_cn
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
 CN_FILTER_POLICY_ID = "major_limit_whole_mutation_v3"
@@ -372,7 +371,6 @@ def _validate_long_table(
         segment_id = row["segment_id"]
         state_id = row["cn_state_id"]
         sample_purities.setdefault(sample_id, []).append(row["purity"])
-        segment_key = (sample_id, segment_id)
         triple = (mutation_id, sample_id, state_id)
         if triple in observed_triples:
             raise TumorTxtError(
@@ -574,7 +572,6 @@ def _build_tumor_data(
     validated: _ValidatedLongTable,
     *,
     report: CNFilterReport,
-    eps: float,
 ) -> TumorData:
     mutation_ids = list(validated.mutation_ids)
     sample_ids = list(validated.sample_ids)
@@ -588,8 +585,7 @@ def _build_tumor_data(
     normal_cn = np.empty(shape, dtype=np.float64)
     major_cn = np.empty(shape, dtype=np.float64)
     minor_cn = np.empty(shape, dtype=np.float64)
-    mean_total_cn = np.empty(shape, dtype=np.float64)
-    cn_state_count = np.empty(shape, dtype=np.int64)
+    total_cn = np.empty(shape, dtype=np.float64)
 
     for unit, rows in validated.rows_by_unit.items():
         mutation_id, sample_id = unit
@@ -604,11 +600,11 @@ def _build_tumor_data(
         purity[i, j] = float(row["purity"])
         normal_cn[i, j] = float(row["normal_cn"])
         states = validated.states_by_segment[(sample_id, row["segment_id"])]
-        cn_state_count[i, j] = len(states)
-        # Compile the union of integer supports and a fixed bulk-CN denominator.
-        # These maxima are bounds, not a synthetic clonal state for mixed CN.
+        # Select the two maxima independently; they may come from different
+        # states. Fractions and state multiplicity never duplicate read counts.
         major_cn[i, j] = max(state.allele_a_cn for state in states)
-        minor_cn[i, j] = max(state.allele_b_cn for state in states)
+        total_cn[i, j] = max(state.allele_a_cn + state.allele_b_cn for state in states)
+        minor_cn[i, j] = total_cn[i, j] - major_cn[i, j]
         if major_cn[i, j] < 1:
             raise UnsupportedTumorInputError(
                 NO_POSITIVE_PATH,
@@ -616,26 +612,17 @@ def _build_tumor_data(
                 segment_id=row["segment_id"],
                 detail="retained (0, 0) CN has no positive integer multiplicity",
             )
-        mean_total_cn[i, j] = (
-            major_cn[i, j] + minor_cn[i, j] if len(states) == 1 else
-            math.fsum(state.fraction * (state.allele_a_cn + state.allele_b_cn) for state in states)
-            / math.fsum(state.fraction for state in states)
-        )
 
     alt_counts = np.where(count_observed, alt_counts, 0.0)
     total_counts = np.where(count_observed, total_counts, 0.0)
-    denominator = (1.0 - purity) * normal_cn + purity * mean_total_cn
+    denominator = (1.0 - purity) * normal_cn + purity * total_cn
     if np.any(~np.isfinite(denominator)) or np.any(denominator <= 0.0):
         raise TumorTxtError(
             "Every mutation/sample unit must have a positive normal-plus-tumor "
             "copy-number denominator."
         )
     scaling = purity / denominator
-    max_prob_scale = scaling * np.minimum(major_cn, MAX_MULTIPLICITY)
-    phi_upper = np.minimum(
-        1.0, (1.0 - eps) / np.clip(max_prob_scale, eps, None)
-    )
-    phi_upper = np.clip(phi_upper, eps, 1.0)
+    phi_upper = np.ones(shape, dtype=np.float64)
     phi_init = np.minimum(phi_upper, np.divide(alt_counts, total_counts * scaling,
         out=np.zeros_like(alt_counts), where=total_counts > 0))
     return TumorData(
@@ -653,8 +640,6 @@ def _build_tumor_data(
         phi_init=phi_init,
         count_observed=count_observed,
         cn_filter_report=report,
-        mean_total_cn=mean_total_cn,
-        cn_state_count=cn_state_count,
     )
 
 
@@ -667,9 +652,11 @@ def load_tumor_txt(
 ) -> TumorData:
     """Validate/filter CN and prepare immutable arrays, without numerical fits.
 
-    Any original state above max_major_cn excludes the whole mutation. The
-    retained initialize=False keyword is compatibility-only; pooled numerical
-    initialization belongs to RegionalModel.pilots(), not input preprocessing.
+    Any original state above max_major_cn excludes the whole mutation. Remaining
+    states collapse to max major CN and max total CN, without fraction weighting.
+    The retained eps and initialize=False keywords are compatibility-only;
+    pooled numerical initialization belongs to RegionalModel.pilots(), not
+    input preprocessing.
     """
 
     if initialize is not False:
@@ -685,7 +672,7 @@ def load_tumor_txt(
     metadata, table = _read_text_table(input_path)
     validated = _validate_long_table(metadata, table)
     filtered, report = _filter_snv_cn(validated, max_major_cn=max_major_cn)
-    return _build_tumor_data(filtered, report=report, eps=epsilon)
+    return _build_tumor_data(filtered, report=report)
 
 
 def _format_number(value: float) -> str:

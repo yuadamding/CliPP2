@@ -22,8 +22,8 @@ def supports_scalar(model):
     """Single observed region with the exact scalar emission domain."""
     rows = np.asarray(model.active_indices)
     return (model.r == 1 and bool(model.observed.all())
-            and bool(np.all(model.data.cn_state_count[rows] == 1))
-            and bool(np.all(model.data.normal_cn[rows] == 2)))
+            and bool(np.all(model.data.normal_cn[rows] == 2))
+            and bool(np.all(model.lower == 0)) and bool(np.all(model.upper == 1)))
 
 
 def fit_scalar(model, max_clusters=10, *, coordinate_keys=None):
@@ -31,6 +31,7 @@ def fit_scalar(model, max_clusters=10, *, coordinate_keys=None):
         raise ValueError('Scalar kernel requires observed single-state diploid-normal input')
     if type(max_clusters) is not int or not 1 <= max_clusters <= 10:
         raise ValueError('max_clusters must be in 1..10')
+    model.check_clonal_feasibility(max_clusters)
     arrays = (model.alt[:, 0], model.depth[:, 0], model.major[:, 0], model.total[:, 0])
     purity = float(model.purity[0, 0])
     if not np.all(model.purity[:, 0] == purity):
@@ -60,11 +61,18 @@ def fit_scalar(model, max_clusters=10, *, coordinate_keys=None):
     capacities = np.arange(1, min(model.n, max_clusters)+1, dtype=np.int32)
     started = perf_counter()
     proposals, native_digest = solve_chain(tuple(a[order] for a in arrays), purity,
-        pilot_cp[order], capacities, evaluator=evaluate if cuda else None)
+        pilot_cp[order], capacities, clonal_eligible=model.clonal_eligible[order],
+        evaluator=evaluate if cuda else None)
+    for proposal in proposals:
+        raw = proposal['diagnostics']
+        index = int(order[raw['anchor_witness_index']])
+        raw['anchor_witness_canonical_index'] = index
+        raw['anchor_witness_mutation_id'] = model.mutation_ids[index]
     timings['continuation'] = perf_counter()-started
     started = perf_counter()
     with CandidateStore() as bank:
-        selected = select_chain(scalar, order, proposals, capacities, candidate_store=bank)
+        selected = select_chain(scalar, order, proposals, capacities, candidate_store=bank,
+                                clonal_eligible=model.clonal_eligible)
         records = tuple(bank.iter_rows())
         winner = selected['selection'].loc[selected['selection'].selected].iloc[0]
         record = next(f for f in selected['fits'] if f['requested_k'] == winner.requested_k
@@ -76,11 +84,14 @@ def fit_scalar(model, max_clusters=10, *, coordinate_keys=None):
         labels[order] = np.asarray(parameters['block_labels'], dtype=int)[
             np.searchsorted(parameters['cuts'], np.arange(model.n), side='right')]
         centers = np.asarray(parameters['centers'])[:, None]/purity
+        clonal = int(parameters['clonal_cluster'])
+        centers[clonal] = 1.
         weights = np.asarray(parameters['weights'])
         fit = SimpleNamespace(labels=labels, centers=centers, weights=weights,
+            clonal_cluster=clonal,
             conditional_log_likelihood=float(winner.conditional_log_likelihood),
             mixture_log_likelihood=float(winner.log_likelihood),
-            complexity_penalty=(2*len(centers)-1)*np.log(model.n), score=float(winner.bic),
+            complexity_penalty=2*(len(centers)-1)*np.log(model.n), score=float(winner.bic),
             eligible=True, reason=None,
             diagnostics={'weight_optimality_gap': float(winner.weight_optimality_gap)})
         telemetry = dict(selected['telemetry'])
@@ -90,6 +101,7 @@ def fit_scalar(model, max_clusters=10, *, coordinate_keys=None):
     candidate = SimpleNamespace(fit=fit, cuts=cuts, requested_k=int(winner.requested_k),
                                kind=str(winner.candidate_kind), diagnostics={})
     return SimpleNamespace(selected=candidate, labels=labels, centers=centers, weights=weights,
+        clonal_cluster=clonal,
         score=fit.score, candidate_bank=records, tree=tree, pilot=pilot, diagnostics={
             'algorithm': ALGORITHM,
             'kernel_version': KERNEL_VERSION, 'native_source_sha256': native_digest,

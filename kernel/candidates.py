@@ -171,6 +171,13 @@ class CandidateStore:
 
     def _values(self, record):
         payload = dict(record)
+        if record.get("status") == "scored":
+            parameters = json.loads(record.get("partition_parameters", "{}"))
+            clonal = parameters.get("clonal_cluster")
+            if (type(clonal) is not int or not 0 <= clonal < len(parameters.get("centers", []))
+                    or clonal not in parameters.get("block_labels", [])
+                    or record.get("clonal_cluster") != clonal):
+                raise ValueError("Scored scratch candidates require an occupied clonal designation")
         parameter_id = source_id = proposal_id = None
         if "partition_parameters" in payload:
             parameters = payload.pop("partition_parameters")
@@ -316,15 +323,6 @@ class CandidateStore:
             values,
         ).fetchone()[0]
 
-    def find_first(self, **filters):
-        expressions, values = self._where(filters)
-        where = " WHERE " + " AND ".join(expressions) if expressions else ""
-        query = _SELECT
-        if filters.get("proposal_partition_sha256") is not None:
-            query = query.replace("FROM candidates c", "FROM candidates c INDEXED BY candidate_proposal")
-        row = self._execute(query + where + " ORDER BY c.seq LIMIT 1", values).fetchone()
-        return None if row is None else self._decode(row)
-
     def best(self, replicate, requested_k, *, eligible=True):
         where = " WHERE c.replicate=? AND c.requested_k=? AND c.status='scored'"
         if eligible:
@@ -341,18 +339,6 @@ class CandidateStore:
         )
         self._changed()
         return cursor.rowcount == 1
-
-    def visited_contains(self, scope, key):
-        return (
-            self._execute(
-                "SELECT 1 FROM visited WHERE scope=? AND key=?", (_json(scope), _json(key))
-            ).fetchone()
-            is not None
-        )
-
-    def visited_discard(self, scope, key):
-        self._execute("DELETE FROM visited WHERE scope=? AND key=?", (_json(scope), _json(key)))
-        self._changed()
 
     def close(self, *, remove=None):
         if self._closed:
