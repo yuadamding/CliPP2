@@ -64,7 +64,8 @@ class _Moves:
         self.labels, self.centers = candidate.refit.labels, candidate.refit.centers
         self.q = len(self.centers)
         self.split_ranks, self.keys = split_ranks, keys
-        self.support = active_support(model)
+        self.support = (model.regional_support if getattr(tree, "component_count", 1) > 1
+                        else active_support(model))
         self.pilot = pilot
         self._columns = None
         self.stats = {name: {"scanned": False, "available": None, "generated": 0}
@@ -112,13 +113,15 @@ class _Moves:
                 return -sum(float(np.ptp(self.pilot[rows & self.model.observed[:, r], r]))
                             for r in range(self.model.r) if np.any(rows & self.model.observed[:, r]))
             blocks = sorted(range(self.q), key=lambda k: (variation(k), k))[:self.limit]
-            proposals, profiles, diagnostics = [], {}, []
+            proposals, diagnostics = [], []
             for block in blocks:
                 found, diagnostic = support_split_proposals(
-                    self.model, self.labels, block, self.limit, profiles=profiles)
+                    self.model, self.labels, block, self.limit, pilot=self.pilot, support=self.support)
                 diagnostics.append({"block": block, **diagnostic})
                 proposals.extend(found)
-            proposals.sort(key=lambda item: (-item[1]["profile_gap"], item[1]["split_block"],
+            proposals.sort(key=lambda item: ({"coarse": 0, "within_bin": 1, "componentwise": 2}[
+                                                 item[1]["profile_ordering"]],
+                                             -item[1]["profile_gap"], item[1]["split_block"],
                                              item[1]["ordering_region"], tuple(item[0])))
             stats.update(scanned=True, available=len(proposals),
                          ranking="observed_regional_profile_general_split", blocks=diagnostics,
@@ -212,6 +215,9 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
     maximum = max(capacities)
     support_diagnostics = support_preflight(model, maximum)
     support = active_support(model)
+    components = tree.component_count
+    if support is None and components > 1:
+        support = model.regional_support
     requested_mode = search.mode
     search = search.resolve(maximum, active_hard_zero=support is not None)
     if search.mode != "bounded":
@@ -262,7 +268,7 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
             spent[q] += 1
             anchor_reserved[q] += q
         cuts = tuple(map(int, np.flatnonzero(labels[tree.edges[:, 0]] != labels[tree.edges[:, 1]])))
-        tree_member = len(cuts) + 1 == q and not force_general
+        tree_member = len(cuts) + components == q and not force_general
         if native and (not tree_member or cuts != tuple(declared_cuts)):
             raise ValueError("Native candidate labels disagree with its frozen-tree support")
         key = ("tree", cuts) if tree_member else ("general", bank.membership_key(labels))
@@ -282,23 +288,40 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
         return variants
 
     for index, seed in enumerate(seeds):
+        if "unavailable_reason" in seed:
+            if (components <= 1
+                    or seed["unavailable_reason"] != "disconnected_observation_overlap"
+                    or set(seed) != {"requested_k", "unavailable_reason"}):
+                raise ValueError("Invalid unavailable native-capacity record")
+            seeds_diagnostics.append({"route": "native_unavailable", "seed_index": index,
+                                      **seed, "topology_component_count": components,
+                                      "support_infeasibility_claimed": False})
+            continue
         cuts = tuple(sorted(map(int, seed["cuts"])))
         requested = int(seed["requested_k"])
-        if requested not in capacities or len(cuts) >= requested:
+        occupied = len(cuts)+components
+        if requested not in capacities or occupied > requested:
             raise ValueError("Generated seed exceeds its declared capacity")
         provenance = {"route": "native", "seed_index": index, "requested_k": requested,
-                      "occupied_q": len(cuts)+1, "native_collapsed": len(cuts)+1 < requested}
+                      "occupied_q": occupied, "native_collapsed": occupied < requested}
         seeds_diagnostics.append({**provenance, "cuts": cuts, "solver": seed.get("diagnostics", {})})
         consider(seed["labels"], seed.get("centers"), provenance, native=True, declared_cuts=cuts)
     native_count = len(bank.candidates)
     native_anchor_evaluations = bank.refit_calls
+    native_reasons = {}
+    failed_anchor_cuts = {record["cuts"] for record in bank.anchor_rejections}
+    for rejection in [*(record for cuts, record in bank.ineligible.items()
+                        if cuts not in failed_anchor_cuts), *bank.anchor_rejections]:
+        reason = str(rejection["reason"])
+        native_reasons[reason] = native_reasons.get(reason, 0)+1
     # Seed work has a fixed construction bound and reserves ordinary target-q
     # slots. Reservations are released before sweeps; no new fit allowance is
     # introduced. The seeds are explicitly general, never native tree seeds.
     reserved_seed_slots = min(SEED_ATTEMPT_LIMIT, search.partition_limit_per_q) if support is not None else 0
     support_seed_records, seed_spent = [], {q: 0 for q in beams}
     if support is not None:
-        for labels, diagnostic in support_seed_proposals(model, maximum, limit=reserved_seed_slots):
+        for labels, diagnostic in support_seed_proposals(model, maximum, limit=reserved_seed_slots,
+                                                         support=support):
             record = dict(diagnostic)
             support_seed_records.append(record)
             if labels is None:
@@ -366,6 +389,12 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
     return TreeFit(selected, bank.candidates, tree, np.asarray(pilot), {
         "pipeline": ALGORITHM, "tree_identity": tree.identity,
         "tree_kind": "mutation_similarity_not_phylogeny", "pilots": pilot_diagnostics or {},
+        "topology_kind": tree.kind,
+        "observation_overlap_components": components,
+        "cross_component_distances_imputed": False,
+        "cross_component_membership_identified": False if components > 1 else None,
+        "topology_uncertainty": ("relative memberships across disconnected observation components are not identified by overlap"
+                                 if components > 1 else None),
         "seeds": seeds_diagnostics, "capacities": capacities, "enumerated_cut_subsets": 0,
         "eligible_scored_candidates": len(bank.candidates),
         "unique_eligible_partitions": len(bank.by_cuts)+len(bank.by_membership),
@@ -378,8 +407,11 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
         "support_rejection_witnesses": bank.support_rejection_witnesses,
         "support_seed_attempts": len(support_seed_records),
         "support_seeds": support_seed_records,
-        "native_support_outcome": ("tree_restriction_prevents_candidate" if support is not None and not native_count
-                                    else "eligible_native_bank" if native_count else "no_eligible_native_fit"),
+        "native_support_outcome": "eligible_native_bank" if native_count else "no_eligible_native_seed",
+        "native_rejection_reasons": native_reasons,
+        "native_rejection_counting": "structurally_rejected_partitions_and_failed_anchored_variants",
+        "native_unavailable_capacities": [record["requested_k"] for record in seeds_diagnostics
+                                          if record["route"] == "native_unavailable"],
         "native_support_scope": "evaluated_native_seed_family_only_not_all_tree_partitions",
         "structural_candidates_screened": len(ledger),
         "structural_screen_scope": "admission_callbacks; bounded neighborhood prescreens recorded in paths",

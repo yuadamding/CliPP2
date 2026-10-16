@@ -6,10 +6,12 @@ define compatibility. Construction failure is never an infeasibility proof.
 
 import numpy as np
 
+from ..io.data import readonly_array
 from .refinement import canonical_partition
 
 
 SEED_ATTEMPT_LIMIT = 2
+PROFILE_POLICY = "observed-coarse-modes-v1"
 
 
 def active_support(model):
@@ -54,7 +56,7 @@ def _compatible(positive, zero):
     return not np.any((positive > 0) & (zero > 0))
 
 
-def support_seed_proposals(model, maximum, *, limit=SEED_ATTEMPT_LIMIT):
+def support_seed_proposals(model, maximum, *, limit=SEED_ATTEMPT_LIMIT, support=None):
     """At most two deterministic constructions, with bounded K-group placement.
 
     Complete cases group by detection pattern. Partial cases reserve a supported
@@ -62,7 +64,7 @@ def support_seed_proposals(model, maximum, *, limit=SEED_ATTEMPT_LIMIT):
     two row orders are a heuristic, not a completeness guarantee. Failed starts
     are returned as diagnostics so their construction work remains visible.
     """
-    support = active_support(model)
+    support = active_support(model) if support is None else support
     if support is None or limit <= 0:
         return
     eligible = np.asarray(model.clonal_eligible) & ~support.hard_zero.any(axis=1)
@@ -141,9 +143,64 @@ def support_seed_proposals(model, maximum, *, limit=SEED_ATTEMPT_LIMIT):
             "evidence_repair_moves": repairs, "reason": reason}
 
 
-def _overlap_connected(observed):
-    """Connectivity using only genuine shared regional evidence, O(NR)."""
-    parent = np.arange(len(observed))
+def _profile_modes(model, region, grid, profiles=None, cache_limit=0):
+    """Stream columns; immutable fit-scope modes share the column-cache budget."""
+    grid = np.asarray(grid, dtype=np.float64)
+    key = (model.identity, int(region), grid.dtype.str, grid.shape,
+           grid.tobytes(), PROFILE_POLICY)
+    store = getattr(model, "_proposal_profiles", None) if profiles is None else None
+    cached = store.get(key) if store is not None else (profiles or {}).get(key)
+    if cached is not None:
+        return cached
+    best, modes = np.full(model.n, -np.inf), np.zeros(model.n)
+    width = max(1, min(8, (8*1024*1024)//(16*model.n)))
+    for first in range(0, len(grid), width):
+        block = grid[first:first+width]
+        values = model.regional_profile_columns(region, block)
+        model.telemetry["proposal_profile_columns"] += len(block)
+        if np.isnan(values).any() or np.isposinf(values).any():
+            raise ValueError("Proposal profiles must be finite or negative infinity")
+        selected = np.argmax(values, axis=1)
+        likelihood = values[np.arange(model.n), selected]
+        improve = likelihood > best
+        best[improve], modes[improve] = likelihood[improve], block[selected[improve]]
+    modes = readonly_array(modes)
+    if store is not None:
+        store.put(key, modes, modes.nbytes+grid.nbytes+512)
+    elif profiles is not None and modes.nbytes <= cache_limit:
+        while profiles and sum(value.nbytes for value in profiles.values())+modes.nbytes > cache_limit:
+            profiles.pop(next(iter(profiles)))
+        profiles[key] = modes
+    return modes
+
+
+def _within_bin_coordinates(model, rows, region, modes, pilot):
+    """Observed continuous ordering, never a fitted center or scoring change.
+
+    Single-multiplicity modes are exact. Otherwise use the observed pilot,
+    falling back to the component mode nearest the coarse profile mode. This
+    removes the coarse-grid gate without substituting a denser fixed grid.
+    """
+    ratio = model.alt[rows, region]/(model.depth[rows, region]*model.scaling[rows, region])
+    multiplicity = np.ones(len(rows))
+    np.divide(ratio, modes, out=multiplicity, where=modes > 0)
+    multiplicity = np.clip(np.rint(multiplicity), 1, model.support[rows, region])
+    component = np.clip(ratio/multiplicity, model.lower[rows, region], model.upper[rows, region])
+    values = component.copy()
+    if pilot is not None:
+        proposed = np.asarray(pilot)[rows, region]
+        use = np.isfinite(proposed) & (model.support[rows, region] > 1)
+        values[use] = proposed[use]
+    # Pilots may themselves use a coarse grid. Keep the continuous component
+    # coordinate as a secondary ordering so pilot ties cannot erase variation.
+    return values, component
+
+
+def _observation_components(rows, observed):
+    """Connected observation-overlap components, without cross-component edges."""
+    if observed[rows].all():
+        return (rows,)
+    parent = np.arange(len(rows))
 
     def root(i):
         while parent[i] != i:
@@ -152,55 +209,75 @@ def _overlap_connected(observed):
         return i
 
     for region in range(observed.shape[1]):
-        rows = np.flatnonzero(observed[:, region])
-        if len(rows):
-            target = root(int(rows[0]))
-            for row in rows[1:]:
+        local = np.flatnonzero(observed[rows, region])
+        if len(local):
+            target = root(int(local[0]))
+            for row in local[1:]:
                 parent[root(int(row))] = target
-    return len({root(i) for i in range(len(parent))}) == 1
+    groups = {}
+    for local, row in enumerate(rows):
+        groups.setdefault(root(local), []).append(row)
+    return tuple(np.asarray(group) for group in groups.values())
 
 
-def _profile_modes(model, region, grid, profiles, cache_limit):
-    """Stream coarse columns; reuse only bounded O(N) modal coordinates."""
-    if region in profiles:
-        return profiles[region]
-    best, modes = np.full(model.n, -np.inf), np.zeros(model.n)
-    width = max(1, min(8, (8*1024*1024)//(16*model.n)))
-    for first in range(0, len(grid), width):
-        block = grid[first:first+width]
-        values = model.regional_profile_columns(region, block)
-        if np.isnan(values).any() or np.isposinf(values).any():
-            raise ValueError("Proposal profiles must be finite or negative infinity")
-        selected = np.argmax(values, axis=1)
-        likelihood = values[np.arange(model.n), selected]
-        improve = likelihood > best
-        best[improve], modes[improve] = likelihood[improve], block[selected[improve]]
-    if modes.nbytes <= cache_limit:
-        while profiles and sum(value.nbytes for value in profiles.values())+modes.nbytes > cache_limit:
-            profiles.pop(next(iter(profiles)))
-        profiles[region] = modes
-    return modes
+def _component_split_sides(components, orderings, support, limit):
+    """Bounded relative-rank alignment; not cross-component identification.
+
+    One construction per attempt, never a Cartesian product of component cuts.
+    Whole-side placement handles unknown cells within a component; one relative
+    flip varies the unconstrained alignment between components.
+    """
+    for attempt in range(limit):
+        rank, variant = divmod(attempt, 4)
+        flip = 1+rank % (len(components)-1) if variant % 2 else -1
+        pieces, regions, gaps = [], [], []
+        for index, (rows, choices) in enumerate(zip(components, orderings)):
+            _, gap, region, ordered, position = choices[rank % len(choices)]
+            missing = rows[~support.observed[rows, region]]
+            left = np.r_[ordered[:position], missing if variant >= 2 else np.empty(0, dtype=int)]
+            if index == flip:
+                left = rows[~np.isin(rows, left)]
+            pieces.append(left)
+            regions.append(int(region))
+            gaps.append(-gap)
+        yield np.concatenate(pieces), {
+            "profile_gap": min(gaps), "profile_ordering": "componentwise",
+            "ordering_region": -1, "component_ordering_regions": regions,
+            "component_rank": rank, "component_relative_flip": flip,
+            "missing_rows_side": "left" if variant >= 2 else "right",
+            "component_alignment": "bounded_relative_rank_heuristic_not_identified"}
 
 
-def support_split_proposals(model, labels, block, budget, *, profiles=None):
+def support_split_proposals(model, labels, block, budget, *, profiles=None, pilot=None,
+                            support=None):
     """Rank bounded observed-profile cuts within a general-membership block.
 
     No new model or artificial missing-cell distance is constructed. Unknown
-    rows are placed wholly on either side in two explicit alternatives. Blocks
-    with disconnected regional overlap have no distance-based split route.
-    Every tested child must retain all-region evidence and compatibility.
+    rows are placed wholly on either side in two explicit alternatives. No
+    cross-component distance is inferred. Every tested child must retain
+    all-region evidence and compatibility, including in disconnected forests.
     """
-    support = active_support(model)
+    support = active_support(model) if support is None else support
     if support is None or budget <= 0:
         return [], {"screened": 0, "reason": "no_active_support"}
     rows = np.flatnonzero(labels == block)
-    if len(rows) < 2 or not _overlap_connected(support.observed[rows]):
-        return [], {"screened": 0, "reason": "disconnected_or_singleton_block"}
-    profiles = {} if profiles is None else profiles
-    cache_limit = min(8*1024*1024, getattr(getattr(model, "memory", None), "workspace_bytes", 0)//4)
+    if len(rows) < 2:
+        return [], {"screened": 0, "reason": "singleton_block"}
+    components = _observation_components(rows, support.observed)
+    disconnected = len(components) > 1
+    if disconnected and any(len(component) < 2 for component in components):
+        return [], {"screened": 0, "reason": "singleton_observation_component",
+                    "observation_components": len(components)}
+    component_of = ({int(row): index for index, group in enumerate(components) for row in group}
+                    if disconnected else {})
+    component_orders = [[] for _ in components]
+    cache_limit = (min(8*1024*1024, getattr(getattr(model, "memory", None), "workspace_bytes", 0)//4)
+                   if profiles is not None else getattr(getattr(model, "_proposal_profiles", None),
+                                                         "budget_bytes", 0))
     grid = np.linspace(0., 1., 17)
     orders = []
     screen_limit = 4*budget
+    component_constructions = 0
     for region in range(model.r):
         observed = rows[support.observed[rows, region]]
         if len(observed) < 2 or support.hard_zero[observed, region].any():
@@ -211,35 +288,80 @@ def support_split_proposals(model, labels, block, budget, *, profiles=None):
         gaps = np.diff(modes)
         # Only observed gaps rank a split; no value is assigned to missing rows.
         positions = sorted(np.flatnonzero(gaps > 0), key=lambda i: (-gaps[i], int(i)))[:budget]
+        regional = []
         for position in positions:
-            orders.append((-float(gaps[position]), region, ordered, int(position)+1))
+            regional.append((0, -float(gaps[position]), region, ordered, int(position)+1))
+        # A positive coarse gap is NOT necessary: continuous ordering inside a
+        # tied bin supplies bounded alternatives to the same refitter/scorer.
+        coordinates, secondary = _within_bin_coordinates(model, ordered, region, modes, pilot)
+        ordering = np.lexsort((ordered, secondary, coordinates, modes))
+        fine_rows, fine_modes, fine = ordered[ordering], modes[ordering], coordinates[ordering]
+        fine_gaps = np.diff(fine)
+        fine_gaps = np.where(fine_gaps == 0, np.diff(secondary[ordering]), fine_gaps)
+        positions = np.flatnonzero((np.diff(fine_modes) == 0) & (fine_gaps > 0))
+        for position in sorted(positions, key=lambda i: (-fine_gaps[i], int(i)))[:budget]:
+            regional.append((1, -float(fine_gaps[position]), region, fine_rows, int(position)+1))
         # Retain only the prefix this call can inspect. In particular, never
         # keep an N-by-grid-by-regions emission tensor or all regional orders.
-        orders.sort(key=lambda item: (item[0], item[1], item[3]))
-        del orders[screen_limit:]
-    proposals, seen, screened = [], set(), 0
-    for gap, region, ordered, position in orders:
-        missing = rows[~support.observed[rows, region]]
-        for missing_left in range(2 if len(missing) else 1):
-            if screened >= screen_limit or len(proposals) >= budget:
-                break
-            screened += 1
-            left = np.r_[ordered[:position], missing if missing_left else np.empty(0, dtype=int)]
-            proposed = labels.copy()
-            proposed[left] = int(labels.max())+1
-            proposed = canonical_partition(proposed)
-            key = proposed.tobytes()
-            if key in seen:
+        target = component_orders[component_of[int(observed[0])]] if disconnected else orders
+        component_constructions += len(regional) if disconnected else 0
+        target.extend(regional)
+        target.sort(key=lambda item: (item[0], item[1], item[2], item[4]))
+        del target[budget if disconnected else screen_limit:]
+    if disconnected:
+        for group, choices in zip(components, component_orders):
+            if choices:
                 continue
-            seen.add(key)
-            if support.check_partition(support.summarize_partition(proposed)) is None:
-                proposals.append((proposed, {"split_block": int(block), "ordering_region": region,
-                    "profile_gap": -gap, "missing_rows_side": "left" if missing_left else "right"}))
+            # A tied/zero-only component still needs one occupied side in each
+            # child when other components split. Canonical rank is explicit
+            # allocation ambiguity, not an invented measured distance.
+            counts = support.observed[group].sum(axis=0)
+            region = int(np.argmax(counts))
+            ordered = group[support.observed[group, region]]
+            positions = dict.fromkeys([len(ordered)//2, *np.linspace(
+                1, len(ordered)-1, min(budget, len(ordered)-1), dtype=int)])
+            choices.extend((2, 0., region, ordered, int(position))
+                           for position in list(positions)[:budget])
+            component_constructions += len(choices)
+    proposals, seen, screened = [], set(), 0
+    def regional_sides():
+        for tier, gap, region, ordered, position in orders:
+            missing = rows[~support.observed[rows, region]]
+            for missing_left in range(2 if len(missing) else 1):
+                yield np.r_[ordered[:position], missing if missing_left else np.empty(0, dtype=int)], {
+                    "ordering_region": region, "profile_gap": -gap,
+                    "profile_ordering": "within_bin" if tier else "coarse",
+                    "missing_rows_side": "left" if missing_left else "right"}
+    # A one-region ordering plus whole-block unknown placement cannot support
+    # BOTH children across disconnected components. Skip those provably invalid
+    # constructions so they cannot consume the component fallback's allowance.
+    sides = (_component_split_sides(components, component_orders, support, screen_limit)
+             if disconnected else regional_sides())
+    for left, details in sides:
         if screened >= screen_limit or len(proposals) >= budget:
             break
+        screened += 1
+        proposed = labels.copy()
+        proposed[left] = int(labels.max())+1
+        proposed = canonical_partition(proposed)
+        key = proposed.tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        if support.check_partition(support.summarize_partition(proposed)) is None:
+            proposals.append((proposed, {"split_block": int(block), **details}))
     return proposals, {"screened": screened, "screen_limit": screen_limit,
                        "regional_orderings": len(orders), "available": len(proposals),
                        "profile_column_block": max(1, min(8, (8*1024*1024)//(16*model.n))),
                        "profile_mode_cache_limit_bytes": cache_limit,
                        "retained_ordering_limit": screen_limit,
-                       "ranking": "observed_regional_coarse_profile_mode_gap"}
+                       "within_bin_orderings": sum(item[0] == 1 for group in [orders, *component_orders]
+                                                    for item in group),
+                       "observation_components": len(components),
+                       "component_local_orderings": sum(map(len, component_orders)),
+                       "component_local_ordering_limit": len(components)*budget,
+                       "component_local_constructions": component_constructions,
+                       "component_local_construction_limit": 2*model.r*budget+len(components)*budget,
+                       "component_alignment": "bounded_relative_rank_heuristic_not_identified" if disconnected else None,
+                       "ranking": ("componentwise_observed_regional_rank" if disconnected
+                                   else "observed_regional_coarse_then_within_bin_gap")}

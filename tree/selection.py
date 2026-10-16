@@ -6,7 +6,7 @@ coarsenings of generated seeds and supported one-edge splits of small trees,
 not all possible tree partitions or continuous optima.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import combinations
 from time import perf_counter
 
@@ -16,7 +16,7 @@ from .refinement import canonical_partition, refine_partition
 from ..config import DEFAULT_MAX_CLUSTERS, EXHAUSTIVE_MAX_CLUSTERS, SearchPolicy
 from ..kernel import ALGORITHM, MAX_CLUSTERS
 from ..kernel.model import RefittedPartition, RegionalModel
-from ..kernel.partitions import PartitionState, TreePartitionCache
+from ..kernel.partitions import TreePartitionCache
 from ..kernel.topology import build_tree
 
 
@@ -454,7 +454,8 @@ class _CandidateBank:
         key = cuts if tree else self.membership_key(labels)
         if not tree:
             state = (self.partition_cache.get_membership(*key) if self.compact_general
-                     else PartitionState.from_labels(labels, self.model))
+                     else self.partition_cache.from_labels(labels))
+            labels = state.labels
         partition = ("tree" if tree else "general", key)
         if not tree and key in self.structural_rejections:
             self.structural_cache_hits += 1
@@ -638,7 +639,19 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
     tree = build_tree(pilot, model.observed, model.mutation_ids)
     times["tree_seconds"] = perf_counter() - started
     started = perf_counter()
-    seeds = generate_candidates(model, tree, pilot, capacities)
+    if tree.component_count > 1:
+        if search.mode != "bounded":
+            if requested_mode != "auto":
+                raise ValueError("disconnected_topology_requires_bounded_search: use search_policy auto or bounded")
+            search = replace(search, mode="bounded")
+        # Observation-overlap components have disjoint regional coverage. No
+        # native component or cut can acquire evidence in every region. Keep
+        # each capacity explicit without running unusable continuation work;
+        # general memberships can instead unite pieces across components.
+        seeds = [{"requested_k": k, "unavailable_reason": "disconnected_observation_overlap"}
+                 for k in capacities]
+    else:
+        seeds = generate_candidates(model, tree, pilot, capacities)
     times["continuation_seconds"] = perf_counter() - started
     if search.mode == "bounded":
         from .search import fit_bounded

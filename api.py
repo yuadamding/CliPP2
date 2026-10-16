@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from time import perf_counter
 
@@ -52,7 +52,13 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
                           regional_zero_policy=config.regional_zero_policy)
     search = config.resolved_search(active_hard_zero=bool(model.regional_support.hard_zero.any()))
     result = (fit_scalar(model, config.max_clusters, search=search) if supports_scalar(model)
-              else fit_tree(model, config.max_clusters, search=search))
+              else fit_tree(model, config.max_clusters,
+                            search=replace(search, mode=config.search_policy)))
+    # Observation topology is known only after constructing the similarity
+    # forest. Preserve the requested policy until then and report the route
+    # actually taken, rather than the preliminary capacity-only resolution.
+    resolved = result.diagnostics.get('search_policy', {}).get('mode', search.mode)
+    search = replace(search, mode=resolved)
     if hashlib.sha256(path.read_bytes()).hexdigest() != input_hash:
         raise RuntimeError('Input changed during fitting; no successful publication')
     if source_fingerprint(source_root) != source_hash:

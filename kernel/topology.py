@@ -1,4 +1,4 @@
-"""One immutable mutation-similarity tree; never a tumor phylogeny.
+"""One immutable mutation-similarity forest; never a tumor phylogeny.
 
 The exact streamed Prim construction uses O(N²R) distance work and O(NR)
 storage. Edge IDs, rather than independently chosen regional edges, define
@@ -24,8 +24,11 @@ class FrozenTree:
         if isinstance(self.n, bool) or not isinstance(self.n, (int, np.integer)) or self.n < 1:
             raise ValueError("A tree requires a positive integer node count")
         edges = np.asarray(self.edges)
-        if edges.shape != (self.n - 1, 2) or not np.issubdtype(edges.dtype, np.integer):
-            raise ValueError("Tree edges must be an (N-1, 2) integer array")
+        forest = self.kind == "forest"
+        if (edges.ndim != 2 or edges.shape[1] != 2
+                or (len(edges) > self.n - 1 if forest else len(edges) != self.n - 1)
+                or not np.issubdtype(edges.dtype, np.integer)):
+            raise ValueError("Tree edges require N-1 rows; forest edges require at most N-1 integer pairs")
         edges = edges.astype(np.int64, copy=True)
         if np.any(edges < 0) or np.any(edges >= self.n):
             raise ValueError("Tree edge endpoint outside node range")
@@ -45,7 +48,8 @@ class FrozenTree:
             if a == b:
                 raise ValueError("Tree has a cycle, duplicate edge, or self edge")
             parent[b] = a
-        # N-1 acyclic edges imply connectivity. Bytes-backed arrays cannot be
+        # An acyclic forest has N-E components; no missing edge is imputed.
+        # Bytes-backed arrays cannot be
         # made writeable again with setflags, unlike a write-protected owner.
         object.__setattr__(self, "edges", np.frombuffer(edges.tobytes(), dtype=np.int64).reshape(-1, 2))
         object.__setattr__(self, "mutation_ids", ids)
@@ -53,6 +57,10 @@ class FrozenTree:
     @property
     def n_nodes(self):
         return self.n
+
+    @property
+    def component_count(self):
+        return self.n - len(self.edges)
 
     @property
     def identity(self):
@@ -67,7 +75,7 @@ class FrozenTree:
 
 
 def build_tree(pilot, observed=None, mutation_ids=None, chain_order=None):
-    """Freeze a deterministic exact MST, or the native ordered chain for R=1.
+    """Freeze deterministic component MSTs, or the native chain for R=1.
 
     Complete vectors use squared Euclidean CCF distance. With missingness,
     distance is the mean squared difference over jointly observed coordinates;
@@ -115,7 +123,7 @@ def build_tree(pilot, observed=None, mutation_ids=None, chain_order=None):
     safe = np.where(mask, x, 0.0)
     for step in range(n):
         selected[current] = True
-        if step:
+        if parent[current] >= 0:
             a, b = int(parent[current]), current
             edges.append((a, b) if ranks[a] < ranks[b] else (b, a))
         if step == n - 1:
@@ -132,11 +140,17 @@ def build_tree(pilot, observed=None, mutation_ids=None, chain_order=None):
         eligible = np.where(selected, np.inf, best)
         smallest = eligible.min()
         if not np.isfinite(smallest):
-            raise ValueError("Disconnected observation-overlap graph: no finite spanning tree")
+            # Restart Prim at the next canonical component root. No finite
+            # observed-overlap path joins it to an earlier component, so no
+            # cross-component edge or distance is invented.
+            current = int(canonical[~selected[canonical]][0])
+            parent[current] = -1
+            continue
         tied = np.flatnonzero(eligible == smallest)
         current = int(tied[np.argmin(best_key[tied])])
     edges.sort(key=lambda edge: (ranks[edge[0]], ranks[edge[1]]))
-    return FrozenTree(np.asarray(edges, dtype=np.int64).reshape(-1, 2), n, ids, "mst")
+    return FrozenTree(np.asarray(edges, dtype=np.int64).reshape(-1, 2), n, ids,
+                      "mst" if len(edges) == n-1 else "forest")
 
 
 def _cut_mask(tree, cuts):
@@ -173,18 +187,21 @@ def partition_from_cuts(tree, cuts):
 
 
 def project_cuts(tree, x, k):
-    """Euclidean projection support onto at most K-1 nonzero vector rows."""
+    """At most K components: cut K minus the immutable base-component count."""
     x = np.asarray(x, dtype=float)
     if x.ndim != 2 or x.shape[0] != tree.n or not np.isfinite(x).all():
         raise ValueError("Projection requires finite N by R CCF vectors")
     if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or not 1 <= k <= min(MAX_CLUSTERS, tree.n):
         raise ValueError(f"Capacity must be an integer in 1..min({MAX_CLUSTERS},N)")
+    budget = k-tree.component_count
+    if budget < 0:
+        raise ValueError("Forest-native capacity is below its observation-component count")
     # Extended accumulation preserves genuinely nonzero subnormal-sized jumps
     # instead of treating a squared-float64 underflow as an exactly fused row.
     jumps = x[tree.edges[:, 0]].astype(np.longdouble) - x[tree.edges[:, 1]]
     scores = np.einsum("ij,ij->i", jumps, jumps)
     nonzero = np.flatnonzero(scores > 0)
-    chosen = nonzero[np.argsort(-scores[nonzero], kind="stable")[: k - 1]]
+    chosen = nonzero[np.argsort(-scores[nonzero], kind="stable")[:budget]]
     return np.sort(chosen)
 
 
@@ -194,6 +211,6 @@ def topology_diagnostics(tree, truth_labels):
     if labels.shape != (tree.n,):
         raise ValueError("Truth labels must match the frozen mutation population")
     q = len(np.unique(labels))
-    q_tree = 1 + int(np.count_nonzero(labels[tree.edges[:, 0]] != labels[tree.edges[:, 1]]))
+    q_tree = tree.component_count + int(np.count_nonzero(labels[tree.edges[:, 0]] != labels[tree.edges[:, 1]]))
     return {"true_clusters": q, "tree_components": q_tree, "fragmentation": q_tree - q,
             "representable": q_tree == q, "tree_identity": tree.identity}

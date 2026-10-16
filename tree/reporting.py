@@ -138,7 +138,8 @@ def verify_selected(model, result):
         if cuts != tuple(result.selected.cuts):
             raise ValueError('Selected tree-cut provenance disagrees with its memberships')
         connected = partition_from_cuts(result.tree, cuts)
-        if len(cuts)+1 != q or any(len(np.unique(connected[labels == k])) != 1 for k in range(q)):
+        if (len(cuts)+result.tree.component_count != q
+                or any(len(np.unique(connected[labels == k])) != 1 for k in range(q))):
             raise ValueError('Selected blocks must be connected in the frozen tree')
     elif kind == 'general':
         if not any(candidate is result.selected for candidate in result.candidate_bank):
@@ -239,19 +240,21 @@ def verify_selected(model, result):
                     or not np.array_equal(fitted.centers[fixed], np.ones(model.r))):
                 raise ValueError('Candidate bank contains an invalid clonal designation')
             if isinstance(fitted, _TreeRefit):
-                # A valid tree's distinct cuts imply occupied components without
+                # An acyclic forest's distinct cuts imply occupied components without
                 # materializing one N-vector per compact candidate.
                 valid_cuts = (fitted.tree is result.tree and len(set(fitted.cuts)) == len(fitted.cuts)
                             and all(not isinstance(cut, (bool, np.bool_))
-                                    and isinstance(cut, (int, np.integer)) and 0 <= cut < model.n-1
+                                    and isinstance(cut, (int, np.integer)) and 0 <= cut < len(result.tree.edges)
                                     for cut in fitted.cuts))
                 if fitted.groups is None:
                     occupied = (valid_cuts and candidate.membership_kind == 'tree'
-                                and candidate.cuts == fitted.cuts and len(fitted.cuts)+1 == count)
+                                and candidate.cuts == fitted.cuts
+                                and len(fitted.cuts)+result.tree.component_count == count)
                 else:
                     groups = np.asarray(fitted.groups)
                     occupied = (valid_cuts and candidate.membership_kind == 'general'
-                                and candidate.cuts is None and groups.shape == (len(fitted.cuts)+1,)
+                                and candidate.cuts is None
+                                and groups.shape == (len(fitted.cuts)+result.tree.component_count,)
                                 and np.issubdtype(groups.dtype, np.integer)
                                 and np.array_equal(np.unique(groups), np.arange(count))
                                 and list(dict.fromkeys(groups.tolist())) == list(range(count)))
@@ -265,7 +268,8 @@ def verify_selected(model, result):
         raise ValueError('Selected fitted state is absent from the complete candidate bank')
     validity = float(np.log(allowed @ weights).sum())
     return {**zero_audit, 'independently_verified': True, 'conditional_log_likelihood': conditional,
-            'membership_kind': kind, 'connected_on_proposal_tree': len(cuts)+1 == q,
+            'membership_kind': kind,
+            'connected_on_proposal_tree': len(cuts)+result.tree.component_count == q,
             'hard_partition_log_likelihood': conditional,
             'mixture_log_likelihood': mixture, 'complexity_penalty': penalty, 'score': score,
             'score_definition': SCORE_DEFINITION,

@@ -37,7 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument('--vram-budget-gib', type=float, default=0.0,
                      help='Additional CUDA cache/batch workspace ceiling; opt-in, not total device memory.')
     fit.add_argument('--search-policy', choices=['auto', 'exhaustive', 'bounded'], default='auto',
-                     help='Auto uses bounded search for active strict zeros or K>10, otherwise reference search.')
+                     help='Auto uses bounded search for active strict zeros, disconnected observation overlap '
+                          'or K>10; otherwise reference search.')
     fit.add_argument('--search-width', type=int, default=16,
                      help='Active anchored states per occupied cluster count in bounded search.')
     fit.add_argument('--search-proposals', type=int, default=4,

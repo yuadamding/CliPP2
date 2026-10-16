@@ -28,6 +28,7 @@ from .scoring import fit_cluster_weights
 from .memory import ByteLRU
 from .refit_store import ExactRefitStore
 from .regional_support import RegionalSupport
+from .partitions import PartitionState, _PartitionAuthority
 from ..io.data import readonly_array
 
 
@@ -160,6 +161,11 @@ class RegionalModel:
         self._refit_bytes = self._column_bytes = 0
         self._refit_limit = memory.refit_bytes if memory else self._cache_bytes
         self._column_limit = memory.column_bytes if memory else self._cache_bytes
+        # Modal proposal vectors share the existing column allowance; they are
+        # not another persistent allocation charged to temporary workspace.
+        profile_bytes = min(8*1024*1024, self._column_limit//8)
+        self._proposal_profiles = ByteLRU(profile_bytes)
+        self._column_limit -= profile_bytes
         self._weights = ByteLRU(memory.weight_bytes if memory else 0)
         self._device_columns = ByteLRU(memory.device_column_bytes if memory else 0)
         self.telemetry = {"refit_cache_hits": 0, "scalar_refits": 0,
@@ -171,9 +177,11 @@ class RegionalModel:
                           "anchored_variant_evaluations": 0, "clonal_column_hits": 0,
                           "weight_cache_hits": 0, "refit_cache_evictions": 0,
                           "column_cache_evictions": 0, "likelihood_batches": 0,
+                          "proposal_profile_columns": 0,
                           "host_to_device_bytes": 0, "device_to_host_bytes": 0}
         self._refit_store = None
         self._prepare_clonal_column()
+        self._partition_authority = _PartitionAuthority(self)
 
     @property
     def regional_support(self):
@@ -186,7 +194,8 @@ class RegionalModel:
     def cache_diagnostics(self):
         result = dict(self.telemetry)
         result.update(refit_cache_bytes=self._refit_bytes, column_cache_bytes=self._column_bytes,
-                      completed_weights=self._weights.stats(), device_columns=self._device_columns.stats())
+                      completed_weights=self._weights.stats(), device_columns=self._device_columns.stats(),
+                      proposal_profiles=self._proposal_profiles.stats())
         if self._refit_store is not None:
             result['refit_grid'] = {**self._refit_store.diagnostics,
                                    'bytes': self._refit_store.bytes}
@@ -610,34 +619,46 @@ class RegionalModel:
             self.telemetry['device_to_host_bytes'] += host.nbytes
             return host
 
-    def _refit_variants(self, labels, designations, initial_centers, *, partition_state=None):
+    def _refit_partition_state(self, labels, state, *, audit=False):
+        if (not audit and state is not None and labels is state.labels
+                and self._partition_authority.trusts(state, self)):
+            self.telemetry['partition_state_trusted_hits'] = self.telemetry.get(
+                'partition_state_trusted_hits', 0)+1
+            return np.arange(len(state.members)), state.labels, state
         labels = np.asarray(labels)
         if (labels.shape != (self.n,) or labels.dtype.kind not in "iuf"
                 or not np.isfinite(labels).all() or np.any(labels != np.rint(labels))):
             raise ValueError("Labels must contain one finite integer per mutation")
         occupied, inverse = np.unique(labels, return_inverse=True)
-        if partition_state is not None and not np.array_equal(partition_state.labels, inverse):
+        if state is not None and not np.array_equal(state.labels, inverse):
             raise ValueError('Partition cache labels disagree with the requested refit')
-        summary = self.regional_support.summarize_partition(inverse)
-        if partition_state is not None:
-            if (partition_state.support_identity != self.regional_support.identity
-                    or len(partition_state.members) != int(inverse.max())+1
-                    or not np.array_equal(partition_state.counts, np.bincount(inverse))
-                    or any(not np.array_equal(getattr(partition_state, name), getattr(summary, name))
-                           for name in ("observed_counts", "positive_counts", "hard_zero_counts",
-                                        "forced_zero", "support_conflict"))
-                    or any(not np.array_equal(rows, np.flatnonzero(inverse == k))
-                           for k, rows in enumerate(partition_state.members))):
-                raise ValueError('Partition cache support disagrees with the requested refit')
-        q = int(inverse.max())+1
+        checked = PartitionState.from_labels(inverse, self)
+        if state is not None and (
+                state.support_identity != checked.support_identity
+                or len(state.members) != len(checked.members)
+                or any(not np.array_equal(getattr(state, name), getattr(checked, name))
+                       for name in ("counts", "observed_counts", "positive_counts", "hard_zero_counts",
+                                    "forced_zero", "support_conflict", "lower", "upper", "clonal_eligible"))
+                or any(not np.array_equal(rows, expected)
+                       for rows, expected in zip(state.members, checked.members))):
+            raise ValueError('Partition cache support disagrees with the requested refit')
+        self.telemetry['partition_state_full_checks'] = self.telemetry.get(
+            'partition_state_full_checks', 0)+1
+        return occupied, inverse, checked
+
+    def _refit_variants(self, labels, designations, initial_centers, *, partition_state=None,
+                        audit_partition_state=False):
+        occupied, inverse, summary = self._refit_partition_state(
+            labels, partition_state, audit=audit_partition_state)
+        q = len(summary.members)
         centers = np.full((q, self.r), np.nan)
         if initial_centers is not None:
             initial_centers = np.asarray(initial_centers, dtype=float)
             if initial_centers.shape != centers.shape:
                 raise ValueError("Initial centers must follow sorted occupied label order")
         if designations is None:
-            designations = [int(k) for k in occupied if self.clonal_eligible[labels == k].all()
-                            and self.observed[labels == k].any(axis=0).all()]
+            designations = [int(k) for i, k in enumerate(occupied) if summary.clonal_eligible[i]
+                            and (summary.observed_counts[i] > 0).all()]
         elif any(isinstance(k, (bool, np.bool_)) or not isinstance(k, (int, np.integer))
                  or k not in occupied for k in designations):
             raise ValueError("clonal_cluster must designate an occupied label")
@@ -673,8 +694,7 @@ class RegionalModel:
             self.telemetry["free_block_preparations"] += 1
             previous_refits = self.telemetry["scalar_refits"]
             try:
-                members = (np.flatnonzero(inverse == cluster) if partition_state is None
-                           else partition_state.members[cluster])
+                members = summary.members[cluster]
                 for region in range(self.r):
                     center, ll = self._fit_scalar(members, region)
                     if initial_centers is not None and not summary.forced_zero[cluster, region]:
@@ -712,11 +732,10 @@ class RegionalModel:
             self.telemetry["anchored_variant_evaluations"] += 1
             fixed = centers.copy()
             fixed[clonal] = 1.
-            members = inverse == clonal
             error = next((reason for k, reason in errors.items() if k != clonal), None)
-            if not self.clonal_eligible[members].all():
+            if not summary.clonal_eligible[clonal]:
                 error = "clonal_block_inadmissible"
-            elif not self.observed[members].any(axis=0).all():
+            elif not (summary.observed_counts[clonal] > 0).all():
                 error = "unsupported_cluster_region:clonal"
             if error:
                 fitted = self._failed_refit(inverse, fixed, clonal, penalty, error)

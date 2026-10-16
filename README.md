@@ -40,12 +40,14 @@ columns. See [example input](examples/exampleTumor1.tsv).
 | `segment_id`, `cn_state_id`, `cn_state_fraction` | Segment, CN state and its fraction |
 | `allele_a_cn`, `allele_b_cn` | Major and minor copy numbers, with `allele_a_cn >= allele_b_cn` |
 
-Include every mutation–region pair, including missing observations. For multiple
-CN states, repeat the same read counts across state rows; state fractions must
-sum to 1. Purity must be constant within each region.
+Include every mutation–region pair; use `count_observed=0` and `.` for missing
+counts. For multiple CN states, repeat the same read counts across state rows;
+state fractions must sum to 1. Purity must be constant within each region.
 
-`--max-major-cn` defaults to **4**. A mutation is excluded from all regions if
+`--max-major-cn` defaults to **10**. A mutation is excluded from all regions if
 any of its CN states exceeds this major-copy-number limit.
+Retained pairs use maximum major CN and maximum total CN, with minor CN equal to
+their difference; state fractions do not weight fitting.
 
 ## Output
 
@@ -57,7 +59,8 @@ The output directory contains three tables:
 | `{tumor_id}_cluster_centers.tsv` | Cluster sizes and regional CCFs |
 | `{tumor_id}_mutation_region_multiplicity.tsv` | CCF and multiplicity estimates for each mutation–region pair |
 
-Cluster 0 has the largest CCF-vector L2 norm and is not necessarily clonal.
+Cluster **0** is occupied and clonal, with CCF **exactly 1 in every region**.
+Remaining clusters are ordered by decreasing CCF-vector L2 norm.
 
 ## Contact
 
