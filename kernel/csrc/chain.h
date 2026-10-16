@@ -8,7 +8,8 @@
 
 namespace clipp2kernel {
 
-constexpr int kMaxClusters = 10;
+// Native proposal capacity is independent of the Python exhaustive-search cap.
+constexpr int kMaxClusters = 50;
 constexpr int kDiagnosticCount = 23;
 constexpr double kChainLowerCCF = 1e-8;
 constexpr double kChainUpperCCF = 1.0-1e-8;

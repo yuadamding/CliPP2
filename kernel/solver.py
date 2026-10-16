@@ -159,7 +159,7 @@ def _support_warm_start(model, x, labels, lower, upper, witness, penalty):
     return warm, values, gradient, curvature
 
 
-def generate_candidates(model, tree, pilot, capacities, *, policy=None):
+def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=True):
     """Generate one finite-continuation connected partition per requested K.
 
     Numerical stationarity, edge feasibility and component-range feasibility
@@ -167,6 +167,16 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None):
     when tolerances are unmet; final scalar refits/selection determine its use.
     """
     policy = ContinuationPolicy() if policy is None else policy
+    capacities = tuple(capacities)
+    memory = getattr(model, 'memory', None)
+    if _batch and memory is not None and getattr(model, '_torch', None) and len(capacities) > 1:
+        per_state = max(1, model.n*model.r*(192*model.valid.shape[-1]+256))
+        workers = min(8, memory.device_workspace_bytes//per_state,
+                      memory.workspace_bytes//max(1, model.n*model.r*8*64), len(capacities))
+        if workers > 1:
+            from .execution import ordered_continuations
+            model.telemetry['continuation_batch_workers'] = workers
+            return ordered_continuations(model, tree, pilot, capacities, policy, workers, generate_candidates)
     pilot = np.asarray(pilot, dtype=float).copy()
     if tree.n != model.n or pilot.shape != (model.n, model.r):
         raise ValueError("Tree, model and pilot dimensions must agree")

@@ -12,7 +12,7 @@ import itertools
 
 import numpy as np
 
-from . import MAX_CLUSTERS
+from ..config import EXHAUSTIVE_MAX_CLUSTERS
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,9 +99,9 @@ def iter_chain_proposals(seeds, chain_order, budgets):
     if (
         len(np.unique(budgets)) != len(budgets)
         or np.any(budgets < 1)
-        or np.any(budgets > min(MAX_CLUSTERS, n))
+        or np.any(budgets > min(EXHAUSTIVE_MAX_CLUSTERS, n))
     ):
-        raise ValueError(f"Expected unique K in 1..min({MAX_CLUSTERS},N)")
+        raise ValueError(f"Expected unique exhaustive K in 1..min({EXHAUSTIVE_MAX_CLUSTERS},N)")
     allowed = set(int(k) for k in budgets)
     chain_digest = hashlib.sha256(np.asarray(chain_order, dtype="<i8").tobytes())
     raw_parents = []
@@ -110,7 +110,7 @@ def iter_chain_proposals(seeds, chain_order, budgets):
         rep = int(seed.get("replicate", 1))
         if (
             source_k != seed["requested_k"]
-            or not 1 <= source_k <= min(MAX_CLUSTERS, n)
+            or not 1 <= source_k <= min(EXHAUSTIVE_MAX_CLUSTERS, n)
             or rep != seed.get("replicate", 1)
             or rep < 1
         ):

@@ -21,9 +21,12 @@ from scipy.special import gammaln, logsumexp, xlog1py, xlogy
 
 from . import SCORE_DEFINITION
 from .initialization import pooled_cp_initialization
+from .grid_oracle import GridOracle as _GridOracle
 from .likelihood import MultiplicityModel
 from .refitting import refit_center
 from .scoring import fit_cluster_weights
+from .memory import ByteLRU
+from .refit_store import ExactRefitStore
 from ..io.data import readonly_array
 
 
@@ -59,7 +62,7 @@ class RefittedPartition:
 class RegionalModel:
     """Immutable, canonically ordered informative mutation vectors."""
 
-    def __init__(self, data, device="cpu", *, cache_bytes=32 * 1024 * 1024):
+    def __init__(self, data, device="cpu", *, cache_bytes=32 * 1024 * 1024, memory=None):
         self.data = data
         ids, regions = tuple(data.mutation_ids), tuple(data.region_ids)
         if any(not isinstance(x, str) for x in ids + regions):
@@ -141,19 +144,44 @@ class RegionalModel:
             self._gpu = {name: torch.tensor(np.array(getattr(self, name)), device=self.device)
                          for name in ("slope", "valid", "observed", "alt", "depth", "constants")}
         self.execution_backend = "cuda_likelihood_host_forest" if self._torch else "cpu"
+        self.memory = memory
         self._cache_bytes = int(cache_bytes)
         if self._cache_bytes < 0:
             raise ValueError("cache_bytes must be nonnegative")
         self._refits, self._columns = OrderedDict(), OrderedDict()
         self._refit_bytes = self._column_bytes = 0
+        self._refit_limit = memory.refit_bytes if memory else self._cache_bytes
+        self._column_limit = memory.column_bytes if memory else self._cache_bytes
+        self._weights = ByteLRU(memory.weight_bytes if memory else 0)
+        self._device_columns = ByteLRU(memory.device_column_bytes if memory else 0)
         self.telemetry = {"refit_cache_hits": 0, "scalar_refits": 0,
                           "column_cache_hits": 0, "likelihood_columns": 0,
                           "joint_matrix_calls": 0,
                           "scalar_refit_seconds": 0.0, "weight_seconds": 0.0,
                           "free_block_refits": 0, "free_block_preparations": 0,
                           "mixture_weight_fits": 0,
-                          "anchored_variant_evaluations": 0, "clonal_column_hits": 0}
+                          "anchored_variant_evaluations": 0, "clonal_column_hits": 0,
+                          "weight_cache_hits": 0, "refit_cache_evictions": 0,
+                          "column_cache_evictions": 0, "likelihood_batches": 0,
+                          "host_to_device_bytes": 0, "device_to_host_bytes": 0}
+        self._refit_store = None
         self._prepare_clonal_column()
+
+    def cache_diagnostics(self):
+        result = dict(self.telemetry)
+        result.update(refit_cache_bytes=self._refit_bytes, column_cache_bytes=self._column_bytes,
+                      completed_weights=self._weights.stats(), device_columns=self._device_columns.stats())
+        if self._refit_store is not None:
+            result['refit_grid'] = {**self._refit_store.diagnostics,
+                                   'bytes': self._refit_store.bytes}
+        return result
+
+    def refit_store(self):
+        if self.memory is None or not self.memory.refit_grid_bytes:
+            return None
+        if self._refit_store is None:
+            self._refit_store = ExactRefitStore(self, self.memory.refit_grid_bytes)
+        return self._refit_store
 
     def _prepare_clonal_column(self):
         """One immutable exact emission column, outside the evictable LRU."""
@@ -231,6 +259,44 @@ class RegionalModel:
             return self._gpu_terms(x)
         return np.where(self.observed, -self._numpy_kernel(x)[-1], 0.)
 
+    def node_terms_batch(self, points):
+        """Independent N-by-R evaluations; only the leading task axis is new."""
+        points = np.asarray(points, dtype=float)
+        if points.ndim != 3 or points.shape[1:] != (self.n, self.r):
+            raise ValueError('Batched coordinates must be B by N by R')
+        if not np.isfinite(points[:, self.observed]).all() or np.any(
+                (points[:, self.observed] < 0) | (points[:, self.observed] > 1)):
+            raise ValueError('Observed CCFs must be finite in [0,1]')
+        self.telemetry['continuation_likelihood_batches'] = self.telemetry.get('continuation_likelihood_batches', 0)+1
+        if not self._torch:
+            terms = [self.node_terms(x) for x in points]
+            return tuple(np.stack([value[j] for value in terms]) for j in range(3))
+        t = self._torch
+        a = {key: value[None, ...] for key, value in self._gpu.items()}
+        with t.no_grad():
+            xx = t.tensor(np.where(self.observed[None, ...], points, 0.), device=self.device)
+            p = (xx[..., None]*a['slope']).clamp(max=1.)
+            alt, ref = a['alt'][..., None], (a['depth']-a['alt'])[..., None]
+            kernel = (t.special.xlogy(alt, p)+t.special.xlog1py(ref, -p)+a['constants'][..., None])
+            kernel = t.where(a['valid'], kernel, -t.inf)
+            ll = t.logsumexp(kernel, -1)
+            post = t.where(t.isfinite(kernel), t.exp(kernel-ll[..., None]), 0.)
+            safe_p, safe_q = t.where(alt > 0, p, 1.), t.where(ref > 0, 1-p, 1.)
+            g = a['slope']*(-alt/safe_p+ref/safe_q)
+            h = a['slope'].square()*(alt/safe_p.square()+ref/safe_q.square())
+            g = t.where(post > 0, post*g, 0.).sum(-1)
+            h = t.where(post > 0, post*h, 0.).sum(-1)
+            boundary = a['valid'] & (p == 1) & (ref == 1)
+            g += t.where(boundary, a['slope']*t.exp(a['constants'][..., None]-ll[..., None]), 0.).sum(-1)
+            h += t.where(a['valid'] & (p == 1) & (ref == 2),
+                         2*a['slope'].square()*t.exp(a['constants'][..., None]-ll[..., None]), 0.).sum(-1)
+            h = t.where(boundary.any(-1), t.inf, h.clamp(min=1e-8))
+            g, h = t.where(t.isfinite(ll), g, 0.), t.where(t.isfinite(ll), h, 1.)
+            result = tuple(t.where(a['observed'], v, 0.).cpu().numpy() for v in (-ll, g, h))
+        self.telemetry['host_to_device_bytes'] += points.nbytes
+        self.telemetry['device_to_host_bytes'] += sum(v.nbytes for v in result)
+        return result
+
     def node_terms(self, x):
         """Loss, exact gradient, positive complete-data curvature on CCF scale."""
         if self._torch:
@@ -287,7 +353,8 @@ class RegionalModel:
             rows = np.flatnonzero(self.observed[:, region])
             scalar = self._scalar_model(rows, region)
             if scalar is not None:
-                cp, diag = pooled_cp_initialization(scalar)
+                cp, diag = pooled_cp_initialization(scalar, **(
+                    {'matrix_cache_bytes': self.memory.initialization_bytes} if self.memory else {}))
                 pilots[rows, region] = cp / scalar.purity
             else:
                 pilots[rows, region], diag = _pooled_adapter(self, rows, region)
@@ -318,11 +385,15 @@ class RegionalModel:
         return columns
 
     def _fit_scalar(self, members, region):
-        key = (self.identity, region, tuple(map(int, members)))
-        if key in self._refits:
+        # Exact compact membership bytes replace Python int tuples. The per-fit
+        # model and refitter identities are explicit, not global reusable state.
+        members = np.asarray(members, dtype=np.int64)
+        key = (self.identity, members.tobytes(), refit_center)
+        entry = self._refits.get(key)
+        if entry is not None and region in entry[0]:
             self.telemetry["refit_cache_hits"] += 1
             self._refits.move_to_end(key)
-            return self._refits[key][0]
+            return entry[0][region]
         start = time.perf_counter()
         rows = members[self.observed[members, region]]
         lower, upper = self.lower[members, region].max(), self.upper[members, region].min()
@@ -331,14 +402,18 @@ class RegionalModel:
         if lower > upper:
             raise ValueError(f"empty_cluster_region_box:{self.region_ids[region]}")
         scalar = self._scalar_model(rows, region)
+        store = self.refit_store()
         if scalar is not None and lower == 0 and upper == 1:
-            cp, ll = refit_center(scalar)
+            cp, ll = refit_center(scalar, **({
+                'grid_evaluator': lambda grid: store.grid_log_likelihood(rows, region, grid, scalar=scalar)
+            } if store is not None else {}))
             fitted = (cp/scalar.purity, ll)
         else:
             modes = (self.alt[rows, region]/self.depth[rows, region])[:, None] / self.slope[rows, region]
             grid = np.unique(np.r_[np.linspace(lower, upper, 513), np.clip(modes[self.valid[rows, region]], lower, upper)])
-            values = np.concatenate([self._regional_likelihood(grid[i:i+32], rows, region).sum(axis=1)
-                                     for i in range(0, len(grid), 32)])
+            values = (store.grid_log_likelihood(rows, region, grid) if store is not None else
+                      np.concatenate([self._regional_likelihood(grid[i:i+32], rows, region).sum(axis=1)
+                                      for i in range(0, len(grid), 32)]))
             best_index = int(np.argmax(values))
             best = (float(values[best_index]), float(grid[best_index]))
             maxima = np.flatnonzero((values[1:-1] >= values[:-2]) & (values[1:-1] >= values[2:])
@@ -359,13 +434,20 @@ class RegionalModel:
             raise RuntimeError("No finite conditional scalar likelihood")
         self.telemetry["scalar_refits"] += 1
         self.telemetry["scalar_refit_seconds"] += time.perf_counter()-start
-        # Membership tuples are part of the bounded cache budget, not only values.
-        size = 256 + 36*len(members)
-        if size <= self._cache_bytes:
-            while self._refit_bytes + size > self._cache_bytes:
+        # One exact membership identity shared across regional refits. Initial
+        # center fallbacks stay outside this baseline cache.
+        values = dict(entry[0]) if entry is not None else {}
+        values[region] = fitted
+        size = 768 + members.nbytes + 160*len(values)
+        if size <= self._refit_limit:
+            old = self._refits.pop(key, None)
+            if old is not None:
+                self._refit_bytes -= old[1]
+            while self._refit_bytes + size > self._refit_limit:
                 _, (_, removed) = self._refits.popitem(last=False)
                 self._refit_bytes -= removed
-            self._refits[key] = (fitted, size)
+                self.telemetry['refit_cache_evictions'] += 1
+            self._refits[key] = (values, size)
             self._refit_bytes += size
         return fitted
 
@@ -389,37 +471,123 @@ class RegionalModel:
         centers = np.asarray(centers, dtype=float)
         allowed = self.assignment_admissibility(centers)
         self.telemetry["joint_matrix_calls"] += 1
-        columns = []
+        if self.memory is not None:
+            return self._resident_columns(centers, allowed)
+        columns = [None]*len(centers)
         for k, center in enumerate(centers):
             if np.array_equal(center, np.ones(self.r)):
                 self.telemetry["clonal_column_hits"] += 1
-                columns.append(self.clonal_log_column)
+                columns[k] = self.clonal_log_column
                 continue
             key = (self.identity, center.tobytes())
             column = self._columns.get(key)
             if column is not None:
                 self.telemetry["column_cache_hits"] += 1
                 self._columns.move_to_end(key)
+                columns[k] = column
             else:
                 emission = -self.loss(np.broadcast_to(center, (self.n, self.r))).sum(axis=1)
-                column = readonly_array(np.where(allowed[:, k], emission, -np.inf))
                 self.telemetry["likelihood_columns"] += 1
-                size = column.nbytes + len(key[1]) + 128
-                if size <= self._cache_bytes:
-                    while self._column_bytes + size > self._cache_bytes:
-                        removed_key, removed = self._columns.popitem(last=False)
-                        self._column_bytes -= removed.nbytes + len(removed_key[1]) + 128
-                    self._columns[key] = column
-                    self._column_bytes += size
-            columns.append(column)
+                self._store_joint_column(key, (k,), emission, allowed, columns)
         return np.column_stack(columns)
 
-    def _refit_variants(self, labels, designations, initial_centers):
+    def _resident_columns(self, centers, allowed):
+        """Batch independent emissions only; keep host R-sum and search order."""
+        if np.any(centers < 0) or np.any(centers > 1):
+            raise ValueError('CCFs must be in [0,1]')
+        columns, missing = [None]*len(centers), {}
+        for k, center in enumerate(centers):
+            if np.array_equal(center, np.ones(self.r)):
+                columns[k] = self.clonal_log_column
+                self.telemetry['clonal_column_hits'] += 1
+                continue
+            key = (self.identity, center.tobytes())
+            if key in self._columns:
+                self._columns.move_to_end(key)
+                columns[k] = self._columns[key]
+                self.telemetry['column_cache_hits'] += 1
+            else:
+                missing.setdefault(key, []).append(k)
+        pending = []
+        for key, positions in missing.items():
+            cached = self._device_columns.get(key) if self._torch else None
+            if cached is None:
+                pending.append((key, positions))
+            else:
+                values = cached.cpu().numpy()
+                self.telemetry['device_to_host_bytes'] += values.nbytes
+                self._store_joint_column(key, positions, -values.sum(axis=1), allowed, columns)
+        # Only the independent center axis is batched. Mutation/region and
+        # multiplicity reductions retain the original contiguous layout.
+        workspace = (self.memory.device_workspace_bytes if self._torch
+                     else self.memory.workspace_bytes)
+        per_center = max(1, self.n*self.r*(128*self.valid.shape[-1]+64))
+        width = max(1, min(64, workspace//per_center))
+        for first in range(0, len(pending), width):
+            batch = pending[first:first+width]
+            values = centers[[positions[0] for _, positions in batch]]
+            if self._torch and not self.memory.vram_bytes:
+                losses = np.stack([self._gpu_terms(np.broadcast_to(c, (self.n, self.r))) for c in values])
+            elif self._torch:
+                losses = self._batched_device_losses(values, batch)
+            else:
+                losses = self._batched_host_losses(values)
+            self.telemetry['likelihood_batches'] += 1
+            self.telemetry['likelihood_columns'] += len(batch)
+            for (key, positions), loss in zip(batch, losses):
+                self._store_joint_column(key, positions, -loss.sum(axis=1), allowed, columns)
+        return np.column_stack(columns)
+
+    def _store_joint_column(self, key, positions, emission, allowed, columns):
+        column = readonly_array(np.where(allowed[:, positions[0]], emission, -np.inf))
+        size = column.nbytes+len(key[1])+512
+        if size <= self._column_limit:
+            while self._column_bytes+size > self._column_limit:
+                old_key, old = self._columns.popitem(last=False)
+                self._column_bytes -= old.nbytes+len(old_key[1])+512
+                self.telemetry['column_cache_evictions'] += 1
+            self._columns[key] = column
+            self._column_bytes += size
+        for k in positions:
+            columns[k] = column
+
+    def _batched_host_losses(self, centers):
+        x = np.where(self.observed[None, ...], centers[:, None, :], 0.)
+        p = np.minimum(1., x[..., None]*self.slope[None, ...])
+        kernel = (xlogy(self.alt[None, ..., None], p)
+                  + xlog1py((self.depth-self.alt)[None, ..., None], -p)
+                  + self.constants[None, ..., None])
+        ll = logsumexp(np.where(self.valid[None, ...], kernel, -np.inf), axis=-1)
+        return np.where(self.observed[None, ...], -ll, 0.)
+
+    def _batched_device_losses(self, centers, keys):
+        t, a = self._torch, self._gpu
+        with t.no_grad():
+            center = t.tensor(centers, device=self.device)
+            self.telemetry['host_to_device_bytes'] += centers.nbytes
+            x = t.where(a['observed'][None, ...], center[:, None, :], 0.)
+            p = (x[..., None]*a['slope'][None, ...]).clamp(max=1.)
+            kernel = (t.special.xlogy(a['alt'][None, ..., None], p)
+                      + t.special.xlog1py((a['depth']-a['alt'])[None, ..., None], -p)
+                      + a['constants'][None, ..., None])
+            ll = t.logsumexp(t.where(a['valid'][None, ...], kernel, -t.inf), -1)
+            losses = t.where(a['observed'][None, ...], -ll, 0.)
+            for (key, _), loss in zip(keys, losses):
+                size = loss.numel()*loss.element_size()+len(key[1])+256
+                if size <= self._device_columns.budget_bytes:
+                    self._device_columns.put(key, loss.clone(), size)
+            host = losses.cpu().numpy()
+            self.telemetry['device_to_host_bytes'] += host.nbytes
+            return host
+
+    def _refit_variants(self, labels, designations, initial_centers, *, partition_state=None):
         labels = np.asarray(labels)
         if (labels.shape != (self.n,) or labels.dtype.kind not in "iuf"
                 or not np.isfinite(labels).all() or np.any(labels != np.rint(labels))):
             raise ValueError("Labels must contain one finite integer per mutation")
         occupied, inverse = np.unique(labels, return_inverse=True)
+        if partition_state is not None and not np.array_equal(partition_state.labels, inverse):
+            raise ValueError('Partition cache labels disagree with the requested refit')
         q = int(inverse.max())+1
         centers = np.full((q, self.r), np.nan)
         if initial_centers is not None:
@@ -443,7 +611,8 @@ class RegionalModel:
             self.telemetry["free_block_preparations"] += 1
             previous_refits = self.telemetry["scalar_refits"]
             try:
-                members = np.flatnonzero(inverse == cluster)
+                members = (np.flatnonzero(inverse == cluster) if partition_state is None
+                           else partition_state.members[cluster])
                 for region in range(self.r):
                     center, ll = self._fit_scalar(members, region)
                     if initial_centers is not None:
@@ -460,6 +629,23 @@ class RegionalModel:
                 errors[cluster] = str(error)
             finally:
                 self.telemetry["free_block_refits"] += self.telemetry["scalar_refits"] > previous_refits
+        # The family retains q free columns plus one immutable clonal column,
+        # not q independent N-by-q matrices. Numerical errors in a free block
+        # must still be repairable by designating that block clonal.
+        family, bounds = None, {}
+        if designations and self.memory is not None and 32*self.n*(q+1) <= self.memory.workspace_bytes:
+            from .weight_batch import AnchoredFamily
+            finite = np.isfinite(centers).all(axis=1)
+            free = np.full((self.n, q), -np.inf)
+            if finite.any():
+                free[:, finite] = self.log_likelihood_columns(centers[finite])
+            family = AnchoredFamily(free, self.clonal_log_column, designations)
+            bounds = family.fixed_center_bounds(penalty)
+            self.telemetry['clonal_families'] = self.telemetry.get('clonal_families', 0)+1
+            self.telemetry['clonal_family_emission_columns'] = self.telemetry.get('clonal_family_emission_columns', 0)+q+1
+        qualify = (family is not None and self._torch and self.memory.vram_bytes > 0
+                   and self.memory.qualify_device_weights)
+        completed, reference_results = [], {}
         for clonal in designations:
             self.telemetry["anchored_variant_evaluations"] += 1
             fixed = centers.copy()
@@ -471,9 +657,36 @@ class RegionalModel:
             elif not self.observed[members].any(axis=0).all():
                 error = "unsupported_cluster_region:clonal"
             if error:
-                yield self._failed_refit(inverse, fixed, clonal, penalty, error)
+                fitted = self._failed_refit(inverse, fixed, clonal, penalty, error)
+                if qualify:
+                    completed.append(fitted)
+                else:
+                    yield fitted
                 continue
-            yield self._score_refit(inverse, fixed, clonal, penalty, int(retained.sum()-retained[clonal]))
+            previous_hits = self._weights.hits
+            fitted = self._score_refit(inverse, fixed, clonal, penalty,
+                int(retained.sum()-retained[clonal]), **(
+                    {'matrix': family.matrix(clonal)} if family is not None else {}))
+            if family is not None:
+                fitted.diagnostics['fixed_center_bound'] = bounds[clonal]
+            if qualify:
+                completed.append(fitted)
+                if self._weights.hits == previous_hits and fitted.reason in (None, 'zero_mixture_weight'):
+                    reference_results[clonal] = dict(cluster_weights=fitted.weights,
+                        log_likelihood=fitted.mixture_log_likelihood,
+                        weight_optimality_gap=fitted.diagnostics['weight_optimality_gap'],
+                        weight_active_score_gap=fitted.diagnostics['weight_active_score_gap'])
+            else:
+                yield fitted
+        if qualify:
+            from .weight_batch import qualify_family_weights
+            diagnostics = qualify_family_weights(family, np.bincount(inverse), reference_results,
+                device=self.device, vram_budget_bytes=self.memory.device_workspace_bytes,
+                torch_module=self._torch)
+            for fitted in completed:
+                fitted.diagnostics['device_weight_qualification'] = diagnostics.get(
+                    fitted.clonal_cluster, {'applied': False, 'reason': 'cached_or_failed_reference'})
+                yield fitted
 
     def refit(self, labels, *, clonal_cluster, initial_centers=None):
         return next(self._refit_variants(labels, [clonal_cluster], initial_centers))
@@ -489,18 +702,28 @@ class RegionalModel:
             conditional_log_likelihood=conditional, mixture_log_likelihood=-np.inf,
             complexity_penalty=penalty, score=np.inf, eligible=False, reason=reason)
 
-    def _score_refit(self, inverse, centers, clonal, penalty, retained_initial):
+    def _score_refit(self, inverse, centers, clonal, penalty, retained_initial, *, matrix=None):
         q = len(centers)
-        matrix = self.log_likelihood_columns(centers)
+        if matrix is None:
+            matrix = self.log_likelihood_columns(centers)
         conditional = math.fsum(matrix[np.arange(self.n), inverse])
         if not np.isfinite(conditional):
             return self._failed_refit(inverse, centers, clonal, penalty, "nonfinite_assigned_likelihood")
         start = time.perf_counter()
-        self.telemetry["mixture_weight_fits"] += 1
+        counts = np.bincount(inverse)
+        key = (self.identity, fit_cluster_weights, centers.dtype.str,
+               centers.shape, centers.tobytes(), counts.dtype.str, counts.tobytes())
         try:
-            mixture = fit_cluster_weights(_WeightModel(self.n), np.zeros(q),
-                                          np.bincount(inverse), log_kernel=matrix,
-                                          telemetry=self.telemetry)
+            mixture = self._weights.get(key)
+            if mixture is None:
+                self.telemetry["mixture_weight_fits"] += 1
+                mixture = fit_cluster_weights(_WeightModel(self.n), np.zeros(q),
+                                              counts, log_kernel=matrix,
+                                              telemetry=self.telemetry)
+                mixture = {**mixture, 'cluster_weights': readonly_array(mixture['cluster_weights'])}
+                self._weights.put(key, mixture, 1024+centers.nbytes+counts.nbytes+mixture['cluster_weights'].nbytes)
+            else:
+                self.telemetry['weight_cache_hits'] += 1
         except (ValueError, RuntimeError) as error:
             return self._failed_refit(inverse, centers, clonal, penalty, f"weight_fit:{error}", conditional)
         finally:
@@ -529,76 +752,8 @@ class _WeightModel(SimpleNamespace):
         return self.n
 
 
-class _GridOracle:
-    """Exact regional grid likelihood in row blocks; never retain N by grid.
-
-    The working block is at most ADAPTER_BLOCK_BYTES (or one grid row if that
-    row itself exceeds the budget). Thus storage remains O(N + grid), even
-    for general-normal-CN initialization.
-    """
-    def __init__(self, model, rows, region, grid, *, block_bytes=None):
-        self.model, self.rows, self.region, self.grid = model, rows, region, grid
-        budget = ADAPTER_BLOCK_BYTES if block_bytes is None else int(block_bytes)
-        if budget < 8:
-            raise ValueError("Grid block budget must hold at least one float64")
-        self.block_rows = min(256, max(1, budget//(8*len(grid))),
-                              max(1, 1_000_000//(32*model.valid.shape[-1])))
-        self.offset = np.empty(len(rows))
-        self.evaluations = 0
-        self.peak_block_bytes = 0
-        for first in range(0, len(rows), self.block_rows):
-            stop = min(len(rows), first+self.block_rows)
-            values = self.log_block(first, stop)
-            self.offset[first:stop] = values.max(axis=1)
-        if not np.isfinite(self.offset).all():
-            raise RuntimeError("No finite supported grid likelihood for regional initialization")
-
-    def log_block(self, first, stop, positions=None):
-        grid = self.grid if positions is None else self.grid[positions]
-        rows = self.rows[first:stop]
-        values = np.empty((len(rows), len(grid)))
-        self.peak_block_bytes = max(self.peak_block_bytes, values.nbytes)
-        for begin in range(0, len(grid), 32):
-            values[:, begin:begin+32] = self.model._regional_likelihood(
-                grid[begin:begin+32], rows, self.region).T
-        values[(grid[None, :] < self.model.lower[rows, self.region, None])
-               | (grid[None, :] > self.model.upper[rows, self.region, None])] = -np.inf
-        return values
-
-    def expectation(self, weights, *, collect_pilot=False):
-        self.evaluations += 1
-        score, mass = np.zeros(len(weights)), np.empty(len(self.rows))
-        pilot = np.empty(len(self.rows)) if collect_pilot else None
-        log_likelihood = 0.
-        for first in range(0, len(self.rows), self.block_rows):
-            stop = min(len(self.rows), first+self.block_rows)
-            likelihood = self.log_block(first, stop)
-            likelihood -= self.offset[first:stop, None]
-            np.exp(likelihood, out=likelihood)
-            normalizer = likelihood @ weights
-            if np.any(normalizer <= 0) or not np.isfinite(normalizer).all():
-                return None, -np.inf, None, None
-            mass[first:stop] = normalizer
-            with np.errstate(over="ignore", invalid="ignore"):
-                score += (1/normalizer) @ likelihood
-            log_likelihood += float((np.log(normalizer)+self.offset[first:stop]).sum())
-            if collect_pilot:
-                pilot[first:stop] = likelihood @ (weights*self.grid)/normalizer
-        if not np.isfinite(score).all():
-            return None, -np.inf, None, None
-        return score/len(self.rows), log_likelihood, mass, pilot
-
-    def scaled_columns(self, positions):
-        values = np.empty((len(self.rows), len(positions)))
-        for first in range(0, len(self.rows), self.block_rows):
-            stop = min(len(self.rows), first+self.block_rows)
-            values[first:stop] = np.exp(self.log_block(first, stop, positions)
-                                        - self.offset[first:stop, None])
-        return values
-
-
-def _pooled_adapter(model, rows, region, *, block_bytes=None):
-    """Stream the general-normal-CN grid; exact concave weight gap.
+def _pooled_adapter(model, rows, region, *, block_bytes=None, matrix_cache_bytes=None):
+    """Budgeted general-normal-CN grid; exact concave weight gap.
 
     Safeguarded SQUAREM and exact grow/shrink exchange mirror the inherited
     pooled initializer without a quadratic-space SLSQP over the whole grid.
@@ -609,7 +764,12 @@ def _pooled_adapter(model, rows, region, *, block_bytes=None):
     """
     grid = np.unique(np.r_[np.linspace(0., 1., 257), model.lower[rows, region],
                            model.upper[rows, region]])
-    oracle = _GridOracle(model, rows, region, grid, block_bytes=block_bytes)
+    if matrix_cache_bytes is None:
+        memory = getattr(model, "memory", None)
+        matrix_cache_bytes = memory.initialization_bytes if memory is not None else 0
+    oracle = _GridOracle(model, rows, region, grid,
+                         block_bytes=ADAPTER_BLOCK_BYTES if block_bytes is None else block_bytes,
+                         cache_bytes=matrix_cache_bytes)
     weights = np.full(len(grid), 1/len(grid))
     score, likelihood, mass, _ = oracle.expectation(weights)
     initial_likelihood = likelihood
@@ -725,5 +885,9 @@ def _pooled_adapter(model, rows, region, *, block_bytes=None):
         "exchange_steps": exchanges, "block_rows": oracle.block_rows,
         "active_support_refits": active_refits, "max_active_refit_size": 64,
         "peak_grid_block_bytes": oracle.peak_block_bytes,
-        "dense_grid_matrix_retained": False,
+        "dense_grid_matrix_retained": oracle.cached,
+        "matrix_cache_budget_bytes": oracle.cache_bytes,
+        "matrix_cache_resident_bytes": oracle.resident_bytes,
+        "matrix_cache_hits": oracle.cache_hits,
+        "likelihood_blocks_computed": oracle.likelihood_blocks_computed,
     }

@@ -6,7 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import DEFAULT_DEVICE, DEFAULT_MAX_MAJOR_CN, FitConfig, resolve_fit_config, validate_max_major_cn
+from .config import (DEFAULT_DEVICE, DEFAULT_MAX_CLUSTERS, DEFAULT_MAX_MAJOR_CN,
+                     MAX_CLUSTERS, FitConfig, resolve_fit_config)
 from ._version import __version__
 
 
@@ -28,8 +29,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exclude a mutation from all regions if any CN state's major CN in any region exceeds this limit.",
     )
     fit.add_argument("--verbose", action="store_true")
-    fit.add_argument("--max-clusters", type=int, choices=range(1, 11), default=10,
-                     help="Largest occupied cluster capacity (at most 10).")
+    fit.add_argument('--ram-budget-gib', type=float, default=1.0,
+                     help='Additional host acceleration workspace ceiling; 0 disables resident caches.')
+    fit.add_argument('--vram-budget-gib', type=float, default=0.0,
+                     help='Additional CUDA cache/batch workspace ceiling; opt-in, not total device memory.')
+    fit.add_argument('--search-policy', choices=['auto', 'exhaustive', 'bounded'], default='auto',
+                     help='Auto retains reference search through K=10 and uses bounded search above 10.')
+    fit.add_argument('--search-width', type=int, default=16,
+                     help='Active anchored states per occupied cluster count in bounded search.')
+    fit.add_argument('--search-proposals', type=int, default=4,
+                     help='Structural proposals per active state per sweep in bounded search.')
+    fit.add_argument('--search-sweeps', type=int, default=2,
+                     help='Bounded exploration sweeps (downward then upward, alternating).')
+    fit.add_argument('--qualify-device-weights', action='store_true',
+                     help='Compare experimental batched CUDA weights with authoritative CPU fits (extra work).')
+    fit.add_argument("--max-clusters", type=int, choices=range(1, MAX_CLUSTERS + 1),
+                     default=DEFAULT_MAX_CLUSTERS,
+                     help=f"Largest occupied cluster capacity (at most {MAX_CLUSTERS}).")
     fit.add_argument("--version", action="version", version=__version__)
     return parser
 
@@ -38,7 +54,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        validate_max_major_cn(args.max_major_cn)
+        _fit_config_from_args(args)
     except ValueError as error:
         parser.error(str(error))
     return args
@@ -46,7 +62,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
     return resolve_fit_config(device=args.device, verbose=args.verbose,
-                              max_major_cn=args.max_major_cn, max_clusters=args.max_clusters)
+                              max_major_cn=args.max_major_cn, max_clusters=args.max_clusters,
+                              ram_budget_gib=args.ram_budget_gib, vram_budget_gib=args.vram_budget_gib,
+                              search_policy=args.search_policy, search_width=args.search_width,
+                              search_proposals=args.search_proposals, search_sweeps=args.search_sweeps,
+                              qualify_device_weights=args.qualify_device_weights)
 
 
 def _printable_summary(value: object) -> object:

@@ -121,7 +121,7 @@ def solve_chain(arrays, purity, pilot_cp, capacities, *, clonal_eligible, evalua
     if (n > np.iinfo(np.int32).max or len(capacities) > min(n, MAX_CLUSTERS)
             or np.any(capacities < 1) or np.any(capacities > min(n, MAX_CLUSTERS))
             or len(np.unique(capacities)) != len(capacities)):
-        raise ValueError('Expected unique capacities in 1..min(10,N)')
+        raise ValueError(f'Expected unique capacities in 1..min({MAX_CLUSTERS},N)')
     library, digest = native_library()
     ints = np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS')
     doubles = np.ctypeslib.ndpointer(dtype=np.float64, flags='C_CONTIGUOUS')

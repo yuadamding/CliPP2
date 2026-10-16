@@ -24,6 +24,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     from .tree.reporting import ALGORITHM, OUTPUT_SCHEMA_VERSION, check_destination, exclusion_summary, publish
     from ._source import source_fingerprint, git_source_identity
     from .kernel import KERNEL_VERSION, SCORE_DEFINITION
+    from .kernel.memory import MemoryPolicy, process_memory_snapshot
 
     config = resolve_fit_config() if fit_config is None else fit_config
     if type(config) is not FitConfig:
@@ -44,9 +45,12 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     input_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     data = load_tumor_txt(path, max_major_cn=config.max_major_cn, initialize=False)
     check_destination(outdir, data.tumor_id)
-    model = RegionalModel(data, device=config.device)
-    result = (fit_scalar(model, config.max_clusters) if supports_scalar(model)
-              else fit_tree(model, config.max_clusters))
+    memory = MemoryPolicy.resolve(config.ram_budget_gib, config.vram_budget_gib,
+                                  device=config.device, qualify_device_weights=config.qualify_device_weights)
+    model = RegionalModel(data, device=config.device, memory=memory)
+    search = config.resolved_search()
+    result = (fit_scalar(model, config.max_clusters, search=search) if supports_scalar(model)
+              else fit_tree(model, config.max_clusters, search=search))
     if hashlib.sha256(path.read_bytes()).hexdigest() != input_hash:
         raise RuntimeError('Input changed during fitting; no successful publication')
     if source_fingerprint(source_root) != source_hash:
@@ -61,6 +65,9 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
         'num_mutations': model.n, 'num_regions': model.r,
         'num_clusters': len(result.centers), 'region_ids': model.region_ids,
         'fit_config': asdict(config), 'model_identity': model.identity,
+        'memory_policy': memory.as_dict(), 'memory_caches': model.cache_diagnostics(),
+        'memory_usage': process_memory_snapshot(model._torch, model.device),
+        'search_policy': asdict(search),
         'score': result.score, 'score_definition': SCORE_DEFINITION,
         'clonal_constraint': True, 'clonal_centroid_ccf': [1.]*model.r,
         'clonal_cluster_label': 0, 'cluster_zero': 'fixed_occupied_clonal_centroid',

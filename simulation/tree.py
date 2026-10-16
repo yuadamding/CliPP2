@@ -119,17 +119,6 @@ def _min_pairwise_clone_distance(ccf_samples_clones: np.ndarray) -> float:
     return float(np.min(dist))
 
 
-def _min_clone_region_ccf(ccf_samples_clones: np.ndarray) -> float:
-    ccf = np.asarray(ccf_samples_clones, dtype=float)
-    return float(np.min(ccf))
-
-
-def _min_clone_l2_norm(ccf_samples_clones: np.ndarray) -> float:
-    ccf = np.asarray(ccf_samples_clones, dtype=float)
-    norms = np.linalg.norm(ccf, axis=1)
-    return float(np.min(norms))
-
-
 def simulate_clonal_tree_ccf(
     K,
     n_samples,
@@ -283,9 +272,10 @@ def simulate_clonal_tree_ccf(
         ccf_samples_clones = A @ ccf_samples_lineages
         ccf_samples_clones[0, :] = 1.0
         _check_sample_ccf_against_tree(parent, children, ccf_samples_clones, tol=1e-8)
-        if _min_clone_region_ccf(ccf_samples_clones) < float(min_clone_ccf) - eps:
+        ccf = np.asarray(ccf_samples_clones, dtype=float)
+        if float(np.min(ccf)) < float(min_clone_ccf) - eps:
             continue
-        if _min_clone_l2_norm(ccf_samples_clones) < float(min_clone_ccf_l2_norm) - eps:
+        if float(np.min(np.linalg.norm(ccf, axis=1))) < float(min_clone_ccf_l2_norm) - eps:
             continue
         if (
             _min_pairwise_clone_distance(ccf_samples_clones)

@@ -198,11 +198,20 @@ def verify_selected(model, result):
             if isinstance(fitted, _TreeRefit):
                 # A valid tree's distinct cuts imply occupied components without
                 # materializing one N-vector per compact candidate.
-                occupied = (fitted.tree is result.tree and candidate.cuts == fitted.cuts
-                            and len(fitted.cuts)+1 == count and len(set(fitted.cuts)) == len(fitted.cuts)
+                valid_cuts = (fitted.tree is result.tree and len(set(fitted.cuts)) == len(fitted.cuts)
                             and all(not isinstance(cut, (bool, np.bool_))
                                     and isinstance(cut, (int, np.integer)) and 0 <= cut < model.n-1
                                     for cut in fitted.cuts))
+                if fitted.groups is None:
+                    occupied = (valid_cuts and candidate.membership_kind == 'tree'
+                                and candidate.cuts == fitted.cuts and len(fitted.cuts)+1 == count)
+                else:
+                    groups = np.asarray(fitted.groups)
+                    occupied = (valid_cuts and candidate.membership_kind == 'general'
+                                and candidate.cuts is None and groups.shape == (len(fitted.cuts)+1,)
+                                and np.issubdtype(groups.dtype, np.integer)
+                                and np.array_equal(np.unique(groups), np.arange(count))
+                                and list(dict.fromkeys(groups.tolist())) == list(range(count)))
             else:
                 member = np.asarray(fitted.labels)
                 occupied = (member.shape == (model.n,) and np.issubdtype(member.dtype, np.integer)

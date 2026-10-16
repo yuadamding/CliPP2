@@ -5,6 +5,7 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 
 namespace clipp2kernel {
 
@@ -17,12 +18,12 @@ ChainData prepare_chain_inputs(int count, const int* alt, const int* depth,
     if(!std::isfinite(purity) || purity <= 0.0 || purity > 1.0)
         throw std::invalid_argument("Purity must be finite and in (0,1].");
     if(k_count < 1 || k_count > std::min(kMaxClusters,count))
-        throw std::invalid_argument("Require 1..min(10,N) requested K values.");
+        throw std::invalid_argument("Require 1..min("+std::to_string(kMaxClusters)+",N) requested K values.");
     std::vector<int> seen;
     for(int j=0;j<k_count;++j){
         if(requested_k[j]<1 || requested_k[j]>std::min(kMaxClusters,count) ||
             std::find(seen.begin(),seen.end(),requested_k[j])!=seen.end())
-            throw std::invalid_argument("Requested K must be distinct and in 1..min(10,N).");
+            throw std::invalid_argument("Requested K must be distinct and in 1..min("+std::to_string(kMaxClusters)+",N).");
         seen.push_back(requested_k[j]);
     }
     ChainData data;

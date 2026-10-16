@@ -23,10 +23,12 @@ import numpy as np
 import pandas as pd
 
 from .proposals import iter_chain_proposals, _integers as _integer_vector
-from . import MAX_CLUSTERS, SCORING_VERSION, CANDIDATE_SEARCH_VERSION
+from . import SCORING_VERSION, CANDIDATE_SEARCH_VERSION
+from ..config import EXHAUSTIVE_MAX_CLUSTERS
 from .refinement import polish_chain_partition
 from .refitting import refit_center
 from .scoring import fit_cluster_weights
+from .memory import ByteLRU
 
 
 def _parameters(result, order):
@@ -49,7 +51,8 @@ def _parameters(result, order):
 class _ChainRefitCache(OrderedDict):
     """One model/order's interval refits and a bounded LRU of likelihood columns."""
 
-    def __init__(self, model, chain_order, max_column_bytes=32 * 1024 * 1024, *, clonal_eligible=None):
+    def __init__(self, model, chain_order, max_column_bytes=32 * 1024 * 1024, *, clonal_eligible=None,
+                 memory=None, refit_store=None):
         super().__init__()
         self.model = model
         self.order = np.asarray(chain_order, dtype=np.int64).copy()
@@ -57,11 +60,10 @@ class _ChainRefitCache(OrderedDict):
         self.ranks[self.order] = np.arange(len(model))
         self.columns = OrderedDict()
         self.column_bytes = 0
-        self.max_column_bytes = max_column_bytes
-        self.max_intervals = 16384
-        self.weight_results = OrderedDict()
-        self.weight_bytes = 0
-        self.max_weight_bytes = 8 * 1024 * 1024
+        self.max_column_bytes = max_column_bytes if memory is None else memory.column_bytes
+        self.max_intervals = 16384 if memory is None else memory.refit_bytes//512
+        self.refit_store = refit_store
+        self.weight_results = ByteLRU(8 * 1024 * 1024 if memory is None else memory.weight_bytes)
         self.clonal_column = np.asarray(model.log_likelihood(model.purity)).copy()
         self.clonal_eligible = np.isfinite(self.clonal_column)
         if clonal_eligible is not None:
@@ -91,6 +93,8 @@ class _ChainRefitCache(OrderedDict):
         return value
 
     def __setitem__(self, key, value):
+        if not self.max_intervals:
+            return
         if key not in self and len(self) >= self.max_intervals:
             self.popitem(last=False)
         super().__setitem__(key, value)
@@ -100,12 +104,10 @@ class _ChainRefitCache(OrderedDict):
         # Ordered float64 centers AND original count initialization are required;
         # duplicate columns can otherwise change exact-zero support.
         key = (fit_cluster_weights, centers.dtype.str, centers.tobytes(), counts.dtype.str, counts.tobytes())
-        cached = self.weight_results.pop(key, None)
+        cached = self.weight_results.get(key)
         if cached is not None:
-            self.weight_results[key] = cached
             self.telemetry["weight_cache_hits"] += 1
-            value = cached[0]
-            return {**value, "cluster_weights": value["cluster_weights"].copy()}
+            return {**cached, "cluster_weights": cached["cluster_weights"].copy()}
         kernel = self.log_kernel(centers)
         start = time.perf_counter()
         self.telemetry["weight_solver_calls"] += 1
@@ -126,12 +128,7 @@ class _ChainRefitCache(OrderedDict):
             + sys.getsizeof(value["cluster_weights"])
             + 256
         )
-        if size <= self.max_weight_bytes:
-            while self.weight_bytes + size > self.max_weight_bytes:
-                _, (_, removed_size) = self.weight_results.popitem(last=False)
-                self.weight_bytes -= removed_size
-            self.weight_results[key] = ({**value, "cluster_weights": value["cluster_weights"].copy()}, size)
-            self.weight_bytes += size
+        self.weight_results.put(key, {**value, "cluster_weights": value["cluster_weights"].copy()}, size)
         return value
 
     def block_key(self, rows):
@@ -204,7 +201,10 @@ def refit_partition_variants(model, labels, cache=None, chain_order=None, *,
         if fitted is None:
             start = time.perf_counter()
             try:
-                fitted = refit_center(model.subset(rows))
+                scalar = model.subset(rows)
+                store = cache.refit_store if isinstance(cache, _ChainRefitCache) else None
+                fitted = refit_center(scalar, **({'grid_evaluator': lambda grid:
+                    store.grid_log_likelihood(rows, 0, grid, scalar=scalar)} if store is not None else {}))
             except (ValueError, RuntimeError) as error:
                 errors[index] = str(error)
                 continue
@@ -297,8 +297,8 @@ def search_chain_coarsenings(
         raise ValueError("Frozen chain order must be a permutation")
     budgets = _integer_vector(budgets, "Cluster budgets")
     if (len(np.unique(budgets)) != len(budgets) or np.any(budgets < 1)
-            or np.any(budgets > min(MAX_CLUSTERS, n))):
-        raise ValueError("Expected unique K in 1..min(10,N)")
+            or np.any(budgets > min(EXHAUSTIVE_MAX_CLUSTERS, n))):
+        raise ValueError(f"Expected unique exhaustive K in 1..min({EXHAUSTIVE_MAX_CLUSTERS},N)")
     cache = _ChainRefitCache(model, chain_order) if cache is None else cache
     winners, ranks = {}, {}
     partitions = 0
@@ -499,7 +499,8 @@ def refine_chain_search(model, search, chain_order, cache):
                       "cached_refit_blocks": len(cache), "likelihood_cache_bytes": cache.column_bytes}}
 
 
-def select_chain(model, chain_order, proposals, cluster_list, *, candidate_store, clonal_eligible=None):
+def select_chain(model, chain_order, proposals, cluster_list, *, candidate_store, clonal_eligible=None,
+                 memory=None, refit_store=None):
     """Select one full-data chain fit from in-memory native proposals.
 
     Proposals contain chain-ordered labels and unprefixed raw diagnostics.
@@ -514,9 +515,9 @@ def select_chain(model, chain_order, proposals, cluster_list, *, candidate_store
     if (
         len(np.unique(budgets)) != len(budgets)
         or np.any(budgets < 1)
-        or np.any(budgets > min(MAX_CLUSTERS, len(model)))
+        or np.any(budgets > min(EXHAUSTIVE_MAX_CLUSTERS, len(model)))
     ):
-        raise ValueError(f"Expected unique K in 1..min({MAX_CLUSTERS},N)")
+        raise ValueError(f"Expected unique exhaustive K in 1..min({EXHAUSTIVE_MAX_CLUSTERS},N)")
     if candidate_store is None:
         raise ValueError("The caller must own an explicit candidate store")
     supplied = {}
@@ -544,7 +545,8 @@ def select_chain(model, chain_order, proposals, cluster_list, *, candidate_store
         for k in budgets
     ]
     by_attempt = {(int(row["requested_k"]), row["replicate"]): row for row in records}
-    cache = _ChainRefitCache(model, chain_order, clonal_eligible=clonal_eligible)
+    cache = _ChainRefitCache(model, chain_order, clonal_eligible=clonal_eligible,
+                            memory=memory, refit_store=refit_store)
     search_records = candidate_store
     seeds, raw_diagnostics = [], {}
     for requested_k in budgets:

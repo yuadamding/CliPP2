@@ -10,6 +10,8 @@ import hashlib
 
 import numpy as np
 
+from . import MAX_CLUSTERS
+
 
 @dataclass(frozen=True)
 class FrozenTree:
@@ -175,8 +177,8 @@ def project_cuts(tree, x, k):
     x = np.asarray(x, dtype=float)
     if x.ndim != 2 or x.shape[0] != tree.n or not np.isfinite(x).all():
         raise ValueError("Projection requires finite N by R CCF vectors")
-    if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or not 1 <= k <= min(10, tree.n):
-        raise ValueError("Capacity must be an integer in 1..min(10,N)")
+    if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or not 1 <= k <= min(MAX_CLUSTERS, tree.n):
+        raise ValueError(f"Capacity must be an integer in 1..min({MAX_CLUSTERS},N)")
     # Extended accumulation preserves genuinely nonzero subnormal-sized jumps
     # instead of treating a squared-float64 underflow as an exactly fused row.
     jumps = x[tree.edges[:, 0]].astype(np.longdouble) - x[tree.edges[:, 1]]

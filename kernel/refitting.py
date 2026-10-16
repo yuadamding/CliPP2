@@ -5,7 +5,7 @@ import numpy as np
 from scipy.optimize import minimize_scalar
 
 
-def refit_center(model):
+def refit_center(model, *, grid_evaluator=None):
     """Refine bracketed modes and edge intervals, retaining physical endpoints."""
     component_modes = (model.r / model.n)[:, None] / model.scale
     grid = np.unique(
@@ -13,7 +13,7 @@ def refit_center(model):
             (np.linspace(0, model.purity, 513), np.clip(component_modes[model.valid], 0, model.purity))
         )
     )
-    values = model.grid_log_likelihood(grid)
+    values = (model.grid_log_likelihood if grid_evaluator is None else grid_evaluator)(grid)
     best_index = int(np.argmax(values))
     best = (float(values[best_index]), float(grid[best_index]))
     maxima = (

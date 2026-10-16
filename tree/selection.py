@@ -13,14 +13,16 @@ from time import perf_counter
 import numpy as np
 
 from .refinement import canonical_partition, refine_partition
-from ..kernel import ALGORITHM
-from ..kernel.model import RefittedPartition
-from ..kernel.topology import build_tree, partition_from_cuts
+from ..config import DEFAULT_MAX_CLUSTERS, EXHAUSTIVE_MAX_CLUSTERS, SearchPolicy
+from ..kernel import ALGORITHM, MAX_CLUSTERS
+from ..kernel.model import RefittedPartition, RegionalModel
+from ..kernel.partitions import TreePartitionCache
+from ..kernel.topology import build_tree
 
 
 @dataclass(frozen=True, eq=False)
 class _TreeRefit:
-    """Compact candidate record; reconstruct N labels only when requested."""
+    """Compact record; decoded arrays belong only to the shared bounded LRU."""
 
     tree: object
     cuts: tuple
@@ -34,23 +36,23 @@ class _TreeRefit:
     eligible: bool
     reason: object
     diagnostics: dict
+    partition_cache: object
+    groups: tuple | None = None
 
     @property
     def labels(self):
-        return partition_from_cuts(self.tree, self.cuts)
-
-    @property
-    def penalty(self):
-        return self.complexity_penalty
+        return (self.partition_cache.labels(self.cuts) if self.groups is None else
+                self.partition_cache.get_membership(self.cuts, self.groups).labels)
 
     @classmethod
-    def from_fit(cls, tree, cuts, fit):
+    def from_fit(cls, tree, cuts, fit, partition_cache, groups=None):
         return cls(tree=tree, cuts=cuts, centers=fit.centers, weights=fit.weights,
                    clonal_cluster=fit.clonal_cluster,
                    conditional_log_likelihood=float(fit.conditional_log_likelihood),
                    mixture_log_likelihood=float(fit.mixture_log_likelihood),
                    complexity_penalty=float(fit.complexity_penalty), score=float(fit.score),
-                   eligible=bool(fit.eligible), reason=fit.reason, diagnostics=fit.diagnostics)
+                   eligible=bool(fit.eligible), reason=fit.reason, diagnostics=fit.diagnostics,
+                   partition_cache=partition_cache, groups=groups)
 
 
 @dataclass(eq=False)
@@ -111,10 +113,10 @@ class TreeFit:
 
 
 def cut_subsets(cuts):
-    """Stream all connected coarsenings; public K<=10 means <=512 per seed."""
+    """Small-K reference family only; large capacities use bounded search."""
     cuts = tuple(sorted(set(map(int, cuts))))
-    if len(cuts) > 9:
-        raise ValueError("Exhaustive coarsening supports at most ten clusters")
+    if len(cuts) >= EXHAUSTIVE_MAX_CLUSTERS:
+        raise ValueError(f"Exhaustive coarsening supports at most {EXHAUSTIVE_MAX_CLUSTERS} clusters")
     for size in range(len(cuts) + 1):
         yield from combinations(cuts, size)
 
@@ -123,8 +125,17 @@ def _score_key(candidate):
     # Preserve the exact old tree ordering, preferring old records on an exact
     # cross-family tie. K comes from occupied centers, never crossing edges.
     tree = candidate.membership_kind == "tree"
+    if tree:
+        membership = candidate.cuts
+    elif isinstance(candidate.refit, _TreeRefit) and candidate.refit.groups is not None:
+        # Bounded-search ties use the compact component encoding; selecting the
+        # winner must not decode every historical N-vector. The small-K route
+        # retains its original dense lexicographic-label tie order.
+        membership = (1, candidate.refit.cuts, candidate.refit.groups)
+    else:
+        membership = (0, tuple(candidate.refit.labels))
     return (candidate.score, len(candidate.refit.centers), 0 if tree else 1,
-            candidate.cuts if tree else tuple(candidate.refit.labels), candidate.refit.clonal_cluster)
+            membership, candidate.refit.clonal_cluster)
 
 
 def _canonical_inputs(labels, centers, n, r):
@@ -302,7 +313,7 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
         reason = str(bank.ineligible.get(cuts, {}).get("reason", ""))
         if reason.startswith(("unsupported_cluster_region", "empty_cluster_region_box",
                               "no_eligible_clonal_block", "clonal_block_inadmissible")):
-            unsupported[cuts] = min(unsupported.get(cuts, 10), int(seed["requested_k"]))
+            unsupported[cuts] = min(unsupported.get(cuts, MAX_CLUSTERS), int(seed["requested_k"]))
     repair_capacity = min((k for k in unsupported.values() if k >= 2), default=None)
     requested = 2 if 2 in capacities else repair_capacity
     small = tree.n <= 64
@@ -324,9 +335,15 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
             supplemental[candidate.cuts] = candidate
         return candidate
 
+    def decode(cuts):
+        if hasattr(bank, "labels"):
+            return bank.labels(cuts)
+        from ..kernel.topology import partition_from_cuts
+        return partition_from_cuts(tree, cuts)
+
     for edge in chosen:
         cuts = (edge,)
-        consider(cuts, partition_from_cuts(tree, cuts), None, {
+        consider(cuts, decode(cuts), None, {
             "route": "supported_one_edge_split", "requested_k": requested,
             "occupied_q": 2, "zero_jumps_allowed": True,
         })
@@ -342,7 +359,7 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
                 if cuts == original or cuts in exchanged:
                     continue
                 exchanged.add(cuts)
-                consider(cuts, partition_from_cuts(tree, cuts), None, {
+                consider(cuts, decode(cuts), None, {
                     "route": "supported_cut_exchange", "requested_k": unsupported[original],
                     "occupied_q": len(cuts) + 1, "parent_cuts": original,
                     "removed_edge": removed, "replacement_edge": edge,
@@ -385,8 +402,11 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
 
 
 class _CandidateBank:
-    def __init__(self, model, tree):
+    def __init__(self, model, tree, *, compact_general=False):
         self.model, self.tree = model, tree
+        self.compact_general = compact_general
+        self.partition_cache = TreePartitionCache(
+            model, tree, getattr(getattr(model, "memory", None), "partition_bytes", 0))
         self.candidates = []
         self.by_cuts = {}
         self.ineligible = {}
@@ -404,6 +424,17 @@ class _CandidateBank:
         self.anchor_rejections = []
         self.attempt_cache_hits = self.structural_cache_hits = 0
 
+    def labels(self, cuts):
+        return self.partition_cache.labels(cuts)
+
+    def membership_key(self, labels):
+        if not self.compact_general:
+            return labels.tobytes()
+        cuts = tuple(map(int, np.flatnonzero(labels[self.tree.edges[:, 0]] != labels[self.tree.edges[:, 1]])))
+        pieces = self.labels(cuts)
+        _, first = np.unique(pieces, return_index=True)
+        return cuts, tuple(map(int, labels[first]))
+
     def consider_variants(self, cuts, labels, centers, provenance, *, clonal_cluster=None):
         """Retain all anchored fits; only common structural errors reject a partition."""
         original_labels = labels
@@ -413,9 +444,12 @@ class _CandidateBank:
             clonal_cluster = old_order.index(clonal_cluster)
         tree = cuts is not None
         cuts = tuple(sorted(map(int, cuts))) if tree else None
-        if tree and not np.array_equal(labels, partition_from_cuts(self.tree, cuts)):
-            raise ValueError("Candidate labels and frozen-tree cuts disagree")
-        key = cuts if tree else labels.tobytes()
+        state = self.partition_cache.get(cuts) if tree else None
+        if tree:
+            if not np.array_equal(labels, state.labels):
+                raise ValueError("Candidate labels and frozen-tree cuts disagree")
+            labels = state.labels
+        key = cuts if tree else self.membership_key(labels)
         partition = ("tree" if tree else "general", key)
         if not tree and key in self.structural_rejections:
             self.structural_cache_hits += 1
@@ -425,13 +459,18 @@ class _CandidateBank:
         q = int(labels.max())+1
         structural = None
         for k in range(q):
-            members = labels == k
-            if not self.model.observed[members].any(axis=0).all():
+            members = labels == k if state is None else state.members[k]
+            observed = (self.model.observed[members].any(axis=0) if state is None
+                        else state.observed_counts[k] > 0)
+            lower = self.model.lower[members].max(axis=0) if state is None else state.lower[k]
+            upper = self.model.upper[members].min(axis=0) if state is None else state.upper[k]
+            if not observed.all():
                 structural = "unsupported_cluster_region"
-            elif np.any(self.model.lower[members].max(axis=0) > self.model.upper[members].min(axis=0)):
+            elif np.any(lower > upper):
                 structural = "empty_cluster_region_box"
         designations = ([clonal_cluster] if clonal_cluster is not None else
-                        [k for k in range(q) if self.model.clonal_eligible[labels == k].all()])
+                        [k for k in range(q) if (self.model.clonal_eligible[labels == k].all()
+                                               if state is None else state.clonal_eligible[k])])
         rejection = {"cuts": cuts, "reason": structural or "no_eligible_clonal_block",
                      "provenance": [dict(provenance)]}
         if structural or not designations:
@@ -460,7 +499,9 @@ class _CandidateBank:
         started = perf_counter()
         # The private enumerator allows a cached subset without repeating the
         # other weight fits; all free blocks are shared within this context.
-        fits = self.model._refit_variants(labels, pending, centers)
+        refit = self.model._refit_variants
+        supports_state = getattr(refit, "__func__", None) is RegionalModel._refit_variants
+        fits = refit(labels, pending, centers, **({"partition_state": state} if supports_state else {}))
         try:
             for fitted in fits:
                 self.refit_calls += 1
@@ -501,7 +542,11 @@ class _CandidateBank:
                 identity = (partition, clonal, fit.centers.tobytes(), fit.weights.tobytes())
                 candidate = self.fitted_states.get(identity)
                 if candidate is None:
-                    compact = _TreeRefit.from_fit(self.tree, cuts, fit) if tree else fit
+                    if tree or self.compact_general:
+                        compact = _TreeRefit.from_fit(self.tree, cuts if tree else key[0], fit,
+                            self.partition_cache, groups=None if tree else key[1])
+                    else:
+                        compact = fit
                     candidate = Candidate(cuts=cuts, refit=compact, provenance=[dict(provenance)],
                                           membership_kind="tree" if tree else "general")
                     self.candidates.append(candidate)
@@ -534,7 +579,7 @@ class _CandidateBank:
                              clonal_cluster=clonal_cluster)
 
 
-def fit_tree(model, max_clusters=10, capacities=None):
+def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, search=None):
     """Fit tree proposals followed by bounded free-center joint reassignment.
 
     Truth is deliberately absent from this interface. The single-region
@@ -544,9 +589,10 @@ def fit_tree(model, max_clusters=10, capacities=None):
 
     total_started = perf_counter()
     telemetry_started = dict(getattr(model, "telemetry", {}))
-    if isinstance(max_clusters, bool) or int(max_clusters) != max_clusters or not 1 <= max_clusters <= 10:
-        raise ValueError("max_clusters must be an integer between one and ten")
+    if isinstance(max_clusters, bool) or int(max_clusters) != max_clusters or not 1 <= max_clusters <= MAX_CLUSTERS:
+        raise ValueError(f"max_clusters must be an integer in 1..{MAX_CLUSTERS}")
     max_clusters = int(max_clusters)
+    search = (SearchPolicy() if search is None else search).resolve(max_clusters)
     if capacities is None:
         capacities = tuple(range(1, min(max_clusters, model.n) + 1))
     else:
@@ -566,6 +612,10 @@ def fit_tree(model, max_clusters=10, capacities=None):
     started = perf_counter()
     seeds = generate_candidates(model, tree, pilot, capacities)
     times["continuation_seconds"] = perf_counter() - started
+    if search.mode == "bounded":
+        from .search import fit_bounded
+        return fit_bounded(model, tree, pilot, seeds, capacities, search,
+                           pilot_diagnostics=pilot_diagnostics, **times)
     bank = _CandidateBank(model, tree)
     seeds_diagnostics, refined = [], set()
     refinement_seconds, subset_count = 0.0, 0
@@ -589,7 +639,7 @@ def fit_tree(model, max_clusters=10, capacities=None):
         for reduced in cut_subsets(cuts):
             if reduced == cuts or len(reduced) + 1 in capacities:
                 continue
-            repaired = bank.consider(reduced, partition_from_cuts(tree, reduced), None, {
+            repaired = bank.consider(reduced, bank.labels(reduced), None, {
                 "route": "supported_coarsening_repair", "requested_k": requested,
                 "occupied_q": len(reduced) + 1, "parent_cuts": cuts,
                 "parent_route": parent["route"],
@@ -603,7 +653,7 @@ def fit_tree(model, max_clusters=10, capacities=None):
         if len(cuts) >= requested or requested not in capacities:
             raise ValueError("Generated seed exceeds its declared capacity")
         labels = canonical_partition(seed["labels"])
-        if not np.array_equal(labels, partition_from_cuts(tree, cuts)):
+        if not np.array_equal(labels, bank.labels(cuts)):
             raise ValueError("Native candidate labels disagree with its support")
         native = {
             "route": "native", "seed_index": index, "requested_k": requested,
@@ -618,7 +668,7 @@ def fit_tree(model, max_clusters=10, capacities=None):
             subset_count += 1
             if len(subset) + 1 not in capacities:
                 continue
-            proposal = bank.consider(subset, partition_from_cuts(tree, subset), None, {
+            proposal = bank.consider(subset, bank.labels(subset), None, {
                 "route": "connected_coarsening", "seed_index": index,
                 "seed_requested_k": requested, "requested_k": len(subset) + 1,
                 "occupied_q": len(subset) + 1, "seed_cuts": cuts,
@@ -635,7 +685,7 @@ def fit_tree(model, max_clusters=10, capacities=None):
             if capacity < 2:
                 continue
             seed = min(seeds, key=lambda s: abs(len(s["cuts"])+1-(capacity-1)))
-            base = partition_from_cuts(tree, tuple(seed["cuts"])[:capacity-2])
+            base = bank.labels(tuple(seed["cuts"])[:capacity-2])
             labels = canonical_partition(np.where(model.clonal_eligible, 0, base+1))
             rescue_proposals += 1
             bank.consider_membership(labels, None, {
@@ -658,7 +708,7 @@ def fit_tree(model, max_clusters=10, capacities=None):
     for candidate in bank.by_membership.values():
         labels = candidate.refit.labels
         cuts = tuple(np.flatnonzero(labels[tree.edges[:, 0]] != labels[tree.edges[:, 1]]))
-        if cuts not in bank.by_cuts or not np.array_equal(partition_from_cuts(tree, cuts), labels):
+        if cuts not in bank.by_cuts or not np.array_equal(bank.labels(cuts), labels):
             unique_partitions += 1
     times["refit_and_score_seconds"] = bank.refit_seconds
     # Refinement wall time includes its refits; do not add overlapping timers.
@@ -669,6 +719,8 @@ def fit_tree(model, max_clusters=10, capacities=None):
             times[name] = model.telemetry[name] - telemetry_started.get(name, 0.0)
     return TreeFit(selected, bank.candidates, tree, np.asarray(pilot), {
         "pipeline": ALGORITHM,
+        "search_policy": {"mode": "exhaustive", "exhaustive_capacity_limit": EXHAUSTIVE_MAX_CLUSTERS,
+                          "global_optimality_certified": False},
         "tree_identity": tree.identity, "tree_kind": "mutation_similarity_not_phylogeny",
         "pilots": pilot_diagnostics, "seeds": seeds_diagnostics,
         "capacities": capacities, "enumerated_cut_subsets": subset_count,
@@ -696,6 +748,7 @@ def fit_tree(model, max_clusters=10, capacities=None):
                                                else candidate.refit.labels.nbytes)
             for candidate in bank.candidates),
         "candidate_membership_storage": "compact_tree_cut_sets_plus_bounded_explicit_general_labels",
+        "partition_cache": bank.partition_cache.diagnostics(),
         "selection": "minimum_over_complete_eligible_scored_bank",
         "global_optimality_certified": False,
     })
@@ -707,7 +760,7 @@ def exhaustive_tree_reference(model, tree, *, max_nodes=8):
         raise ValueError("Exhaustive tree reference is restricted to N<=8")
     bank = _CandidateBank(model, tree)
     for cuts in cut_subsets(range(len(tree.edges))):
-        bank.consider(cuts, partition_from_cuts(tree, cuts), None, {"route": "offline_exhaustive"})
+        bank.consider(cuts, bank.labels(cuts), None, {"route": "offline_exhaustive"})
     if not bank.candidates:
         raise ValueError("No supported exhaustive tree candidate")
     return {

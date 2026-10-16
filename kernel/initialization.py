@@ -12,6 +12,7 @@ import numpy as np
 from scipy.optimize import brentq, minimize
 
 from .likelihood import MultiplicityModel
+from ..io.data import readonly_array
 
 
 GRID_SIZE = 257
@@ -67,15 +68,83 @@ def _initialization_grid(observations, purity):
     }
 
 
-def pooled_cp_initialization(model):
+class _PooledGrid:
+    """Budgeted storage without changing the historical arithmetic layout.
+
+    Below the legacy threshold, selected columns use full-grid row offsets;
+    above it they use selected-column offsets. Cache capacity must not choose
+    between those two numerical contracts. Large resident matrices therefore
+    retain log emissions and reproduce the original selected-column scaling.
+    """
+
+    def __init__(self, observations, grid, purity, cache_bytes):
+        self.observations, self.grid, self.purity = observations, grid, purity
+        self.cache_bytes = int(cache_bytes)
+        if self.cache_bytes < 0:
+            raise ValueError("matrix_cache_bytes must be nonnegative")
+        matrix_rows = max(1, MAX_MATRIX_BYTES // (8 * len(grid)))
+        support_rows = max(1, 1_000_000 // int(observations[:, 2].max()))
+        self.block_rows = min(matrix_rows, support_rows)
+        self.full_grid_offsets = len(observations) <= matrix_rows
+        block_count = (len(observations) + self.block_rows - 1) // self.block_rows
+        # Include offsets and conservative immutable-array/container overhead.
+        required = 8 * len(observations) * (len(grid) + 1) + 1024 * block_count + 256
+        self.resident_bytes = required if required <= self.cache_bytes else 0
+        self.cache = [] if self.resident_bytes else None
+        self.blocks_computed = self.points_computed = self.cache_hits = 0
+        if self.cache is not None:
+            for first, stop in self.ranges():
+                values, offset = self.calculate(first, stop, scaled=self.full_grid_offsets)
+                self.cache.append((first, stop, readonly_array(values), readonly_array(offset)))
+
+    def ranges(self):
+        for first in range(0, len(self.observations), self.block_rows):
+            yield first, min(len(self.observations), first + self.block_rows)
+
+    def calculate(self, first, stop, positions=None, *, scaled=True):
+        grid = self.grid if positions is None else self.grid[positions]
+        block = MultiplicityModel(*self.observations[first:stop].T, self.purity)
+        values = np.column_stack([block.log_likelihood(cp) for cp in grid])
+        self.blocks_computed += 1
+        self.points_computed += values.size
+        return self.scale(values) if scaled else (values, values.max(axis=1))
+
+    @staticmethod
+    def scale(values):
+        offset = values.max(axis=1)
+        if not np.isfinite(offset).all():
+            raise RuntimeError("No finite grid likelihood for CP initialization")
+        return np.exp(values - offset[:, None]), offset
+
+    def blocks(self, positions=None):
+        if self.cache is not None:
+            for first, stop, values, offset in self.cache:
+                self.cache_hits += 1
+                if self.full_grid_offsets:
+                    yield first, stop, values if positions is None else values[:, positions], offset
+                else:
+                    # column_stack in the historical streaming branch is C-order.
+                    selected = values if positions is None else np.ascontiguousarray(values[:, positions])
+                    yield first, stop, *self.scale(selected)
+        else:
+            for first, stop in self.ranges():
+                if self.full_grid_offsets:
+                    values, offset = self.calculate(first, stop)
+                    yield first, stop, values if positions is None else values[:, positions], offset
+                else:
+                    yield first, stop, *self.calculate(first, stop, positions)
+
+
+def pooled_cp_initialization(model, *, matrix_cache_bytes=MAX_MATRIX_BYTES):
     """Return posterior-mean CPs and finite-grid convex-optimization diagnostics.
 
     The base grid, resolution rule and optimization budget are data-independent.
     Narrow likelihood modes add bounded numerical proposals. Identical count/CN
     observations are collapsed in sorted order, preserving their frequencies;
     this also makes results exactly equivariant to input-row permutations.
-    Large inputs stream likelihood blocks rather than allocate an unbounded
-    N-by-grid matrix. Full 1..major CN support remains in MultiplicityModel.
+    The optional cache budget retains the likelihood matrix when it fits;
+    zero streams it. Numerical block sizes and row-offset conventions stay
+    independent of this capacity. Full 1..major CN support remains unchanged.
     """
     observations = np.column_stack((model.r, model.n, model.major, model.total))
     unique, inverse, frequencies = np.unique(observations, axis=0, return_inverse=True, return_counts=True)
@@ -84,35 +153,8 @@ def pooled_cp_initialization(model):
     grid_size = len(grid)
     frequencies = frequencies.astype(float)
     n = float(len(model))
-    # Limit both the likelihood matrix and padded multiplicity temporaries.
-    matrix_rows = max(1, MAX_MATRIX_BYTES // (8 * grid_size))
-    support_rows = max(1, 1_000_000 // int(unique[:, 2].max()))
-    block_rows = min(matrix_rows, support_rows)
-    cache = [] if unique_count <= matrix_rows else None
-
-    def calculate(first, stop, positions=None):
-        block = MultiplicityModel(*unique[first:stop].T, model.purity)
-        values = np.column_stack(
-            [block.log_likelihood(cp) for cp in (grid if positions is None else grid[positions])]
-        )
-        offset = values.max(axis=1)
-        if not np.isfinite(offset).all():
-            raise RuntimeError("No finite grid likelihood for CP initialization")
-        return np.exp(values - offset[:, None]), offset
-
-    if cache is not None:
-        for first in range(0, unique_count, block_rows):
-            stop = min(unique_count, first + block_rows)
-            cache.append((first, stop, *calculate(first, stop)))
-
-    def blocks(positions=None):
-        if cache is not None:
-            for first, stop, likelihood, offset in cache:
-                yield (first, stop, likelihood if positions is None else likelihood[:, positions], offset)
-        else:
-            for first in range(0, unique_count, block_rows):
-                stop = min(unique_count, first + block_rows)
-                yield first, stop, *calculate(first, stop, positions)
+    oracle = _PooledGrid(unique, grid, model.purity, matrix_cache_bytes)
+    blocks = oracle.blocks
 
     evaluations = 0
 
@@ -288,8 +330,15 @@ def pooled_cp_initialization(model):
         "max_active_refit_iterations": MAX_ACTIVE_REFIT_ITERATIONS,
         "initial_log_likelihood": float(initial_log_likelihood),
         "log_likelihood": float(log_likelihood),
-        "likelihood_matrix_cached": cache is not None,
+        "likelihood_matrix_cached": oracle.cache is not None,
         "max_matrix_bytes": MAX_MATRIX_BYTES,
+        "matrix_cache_budget_bytes": oracle.cache_bytes,
+        "matrix_cache_resident_bytes": oracle.resident_bytes,
+        "matrix_cache_hits": oracle.cache_hits,
+        "likelihood_blocks_computed": oracle.blocks_computed,
+        "likelihood_grid_points_computed": oracle.points_computed,
+        "numerical_block_rows": oracle.block_rows,
+        "selected_grid_offset_policy": "full_grid" if oracle.full_grid_offsets else "selected_grid",
         "constrained_optimum_certified": False,
     }
     return pilot, diagnostics
