@@ -20,7 +20,10 @@ from .topology import build_tree, partition_from_cuts
 
 
 def supports_scalar(model):
-    """Single observed region with the exact scalar emission domain."""
+    """Single observed region without unsupported native hard-zero bounds."""
+    support = getattr(model, 'regional_support', None)
+    if support is not None and support.hard_zero.any():
+        return False
     rows = np.asarray(model.active_indices)
     return (model.r == 1 and bool(model.observed.all())
             and bool(np.all(model.data.normal_cn[rows] == 2))
@@ -29,7 +32,8 @@ def supports_scalar(model):
 
 def fit_scalar(model, max_clusters=DEFAULT_MAX_CLUSTERS, *, coordinate_keys=None, search=None):
     if not supports_scalar(model):
-        raise ValueError('Scalar kernel requires observed single-state diploid-normal input')
+        raise ValueError('Scalar kernel requires observed diploid-normal input without strict '
+                         'regional zeros; use the shared support-aware fitting path')
     if type(max_clusters) is not int or not 1 <= max_clusters <= MAX_CLUSTERS:
         raise ValueError(f'max_clusters must be in 1..{MAX_CLUSTERS}')
     search = (SearchPolicy() if search is None else search).resolve(max_clusters)

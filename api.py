@@ -14,7 +14,8 @@ from .io.tumor_txt import load_tumor_txt
 def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     """Fit canonical input; verify and publish three minimal tables.
 
-    One occupied conditional center is fixed at one; all others remain free.
+    One occupied conditional center is fixed at one; other centers are free
+    except for coordinates constrained by the selected regional-zero policy.
     Candidate-generation convergence is reported,
     not confused with a global-optimality or biological-accuracy proof.
     """
@@ -47,8 +48,9 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     check_destination(outdir, data.tumor_id)
     memory = MemoryPolicy.resolve(config.ram_budget_gib, config.vram_budget_gib,
                                   device=config.device, qualify_device_weights=config.qualify_device_weights)
-    model = RegionalModel(data, device=config.device, memory=memory)
-    search = config.resolved_search()
+    model = RegionalModel(data, device=config.device, memory=memory,
+                          regional_zero_policy=config.regional_zero_policy)
+    search = config.resolved_search(active_hard_zero=bool(model.regional_support.hard_zero.any()))
     result = (fit_scalar(model, config.max_clusters, search=search) if supports_scalar(model)
               else fit_tree(model, config.max_clusters, search=search))
     if hashlib.sha256(path.read_bytes()).hexdigest() != input_hash:
@@ -57,6 +59,14 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
         raise RuntimeError('Python source changed during fitting; no successful publication')
     verification_start = perf_counter()
     publication = publish(model, result, outdir, data.tumor_id)
+    result.diagnostics.update({key: value for key, value in publication['verification'].items()
+                               if key in ('regional_zero_policy', 'observed_zero_cells', 'missing_cells',
+                                          'forced_zero_cluster_coordinates', 'assigned_zero_violations',
+                                          'regional_zero_independently_verified', 'penalty_parameter_count',
+                                          'free_center_coordinate_count', 'fixed_zero_coordinate_count')})
+    for key, default in (('support_conflicts_rejected', 0), ('support_seed_attempts', 0),
+                         ('support_lower_bound', 1), ('support_lower_bound_certified', True)):
+        result.diagnostics.setdefault(key, default)
     summary = {
         'tumor_id': data.tumor_id, 'algorithm': ALGORITHM, 'model_version': MODEL_VERSION,
         'output_schema_version': OUTPUT_SCHEMA_VERSION, 'kernel_version': KERNEL_VERSION,
@@ -68,6 +78,11 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
         'memory_policy': memory.as_dict(), 'memory_caches': model.cache_diagnostics(),
         'memory_usage': process_memory_snapshot(model._torch, model.device),
         'search_policy': asdict(search),
+        'requested_search_policy': config.search_policy,
+        'regional_zero_policy': config.regional_zero_policy,
+        'selection_policy': ('strict_regional_zero_occupied_clonal_v1'
+                             if config.regional_zero_policy == 'strict'
+                             else 'defea419_likelihood_occupied_clonal'),
         'score': result.score, 'score_definition': SCORE_DEFINITION,
         'clonal_constraint': True, 'clonal_centroid_ccf': [1.]*model.r,
         'clonal_cluster_label': 0, 'cluster_zero': 'fixed_occupied_clonal_centroid',

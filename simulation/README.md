@@ -57,10 +57,9 @@ Existing tumor directories are never overwritten. The former two-state-CN
 controls have been removed; they are not accepted compatibility switches.
 
 The generator's six-copy CN range is independent of the inference default
-`--max-major-cn 4`. Bundle validation explicitly uses a limit of six so it can
-check all generated truth. To retain the complete generated cohort during
-fitting, pass `--max-major-cn 6`; fitting with the default may exclude generated
-mutations having major CN 5 or 6 in **any** region. The CN ceiling remains six;
+`--max-major-cn 10`. Bundle validation explicitly uses a limit of six so it can
+check all generated truth. Both the inference default and an explicit
+`--max-major-cn 6` retain the generator's full CN range. The CN ceiling remains six;
 the independent multiplicity sampling ceiling is four.
 
 ## Truth and provenance

@@ -197,10 +197,16 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
     for k in requested:
         project_cuts(tree, pilot, k)
     model.check_clonal_feasibility(max(requested))
-    lower = np.maximum(np.asarray(model.lower, dtype=float), 1e-8)
-    upper = np.minimum(np.asarray(model.upper, dtype=float), 1 - 1e-8)
-    if lower.shape != pilot.shape or upper.shape != pilot.shape or np.any(lower > upper):
-        raise ValueError("No nonempty interior box for raw tree continuation")
+    support = getattr(model, 'regional_support', None)
+    if support is None:  # Standalone numerical models retain the original box.
+        lower = np.maximum(np.asarray(model.lower, dtype=float), 1e-8)
+        upper = np.minimum(np.asarray(model.upper, dtype=float), 1 - 1e-8)
+    else:
+        lower, upper = support.continuation_bounds(model.lower, model.upper)
+    if (lower.shape != pilot.shape or upper.shape != pilot.shape
+            or not np.isfinite(lower).all() or not np.isfinite(upper).all()
+            or np.any(lower > upper)):
+        raise ValueError("No feasible box for raw tree continuation")
     candidates = []
     for k in requested:
         x = np.clip(pilot, lower, upper)
@@ -290,6 +296,8 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
                         warm_starts += 1
                 rho = next_rho
         # Recompute all diagnostics from the exact returned raw state.
+        if not np.isfinite(x).all() or np.any(x < lower) or np.any(x > upper):
+            raise ArithmeticError("Raw continuation violated its coordinate bounds")
         cuts = project_cuts(tree, x, k)
         projected_witness, anchor_residual = project_anchor(x, model.clonal_eligible)
         switches += projected_witness != witness

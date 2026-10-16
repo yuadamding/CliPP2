@@ -24,6 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--input-file", required=True)
     fit.add_argument("--outdir", default="clipp2_results")
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
+    fit.add_argument('--regional-zero-policy', choices=['strict', 'likelihood'], default='strict',
+                     help='Strict: observed zero-alt positive-depth cells require exact-zero assigned CCF; '
+                          'likelihood: retain the defea419 estimator without this constraint.')
     fit.add_argument(
         "--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN,
         help="Exclude a mutation from all regions if any CN state's major CN in any region exceeds this limit.",
@@ -34,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument('--vram-budget-gib', type=float, default=0.0,
                      help='Additional CUDA cache/batch workspace ceiling; opt-in, not total device memory.')
     fit.add_argument('--search-policy', choices=['auto', 'exhaustive', 'bounded'], default='auto',
-                     help='Auto retains reference search through K=10 and uses bounded search above 10.')
+                     help='Auto uses bounded search for active strict zeros or K>10, otherwise reference search.')
     fit.add_argument('--search-width', type=int, default=16,
                      help='Active anchored states per occupied cluster count in bounded search.')
     fit.add_argument('--search-proposals', type=int, default=4,
@@ -66,7 +69,8 @@ def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
                               ram_budget_gib=args.ram_budget_gib, vram_budget_gib=args.vram_budget_gib,
                               search_policy=args.search_policy, search_width=args.search_width,
                               search_proposals=args.search_proposals, search_sweeps=args.search_sweeps,
-                              qualify_device_weights=args.qualify_device_weights)
+                              qualify_device_weights=args.qualify_device_weights,
+                              regional_zero_policy=args.regional_zero_policy)
 
 
 def _printable_summary(value: object) -> object:

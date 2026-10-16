@@ -24,37 +24,8 @@ clipp2 fit --input-file tumor.tsv --device cpu --outdir ../clipp2-cpu
 clipp2 fit --input-file tumor.tsv --device cuda --outdir ../clipp2-gpu
 ```
 
-Use a new output directory for each run. `--max-clusters` defaults to **10**
-and accepts capacities through **50**. The default `--search-policy auto`
-keeps the existing enumerated reference search through 10; above 10 it uses
-a deterministic, **nonexhaustive** split–merge search. The likelihood, occupied
-clonal constraint, conditional refits and mixture score are unchanged, but
-different search coverage can change the selected result. Explicit
-`--search-policy exhaustive` is restricted to capacities at most 10.
-
-Bounded search keeps up to `--search-width 16` anchored states per occupied
-cluster count, with `--search-proposals 4` proposals per state and
-`--search-sweeps 2` alternating downward/upward sweeps. Native proposals at
-every requested capacity are retained. Diagnostics report actual evaluated
-partitions, clonal hypotheses and unexplored moves; they do not certify global
-optimality. Increasing search width is not guaranteed to reproduce or improve
-a narrower run's candidate bank.
-
-`--ram-budget-gib 1` controls additional per-fit acceleration workspace for
-exact likelihood tables, decoded partitions, refits and completed weight fits.
-`--vram-budget-gib 0` leaves additional CUDA batching/storage disabled; a positive
-allowance opts into it. Cache limits and estimated batching allowances are
-reduced to host/container or device headroom, with temporary workspace reserved;
-they are **not** hard combined transient or total process memory limits.
-Cache capacity never changes refit grids or replaces continuous
-optimization with interpolation. Allocated-GPU qualification of these new CUDA
-paths remains required before production use.
-`--qualify-device-weights` explicitly enables the batched device weight solver
-in **qualification-only** mode (extra work; off by default):
-CPU reference weights and exact-zero eligibility remain authoritative. Its
-agreement diagnostics are not a measured production speedup. Larger scalar
-searches use the shared bounded bank; exact-equal adjacent centers can merge via
-budgeted proposals rather than the small-K scalar path's implicit merge.
+Use a new output directory for each run. `--max-clusters` defaults to **10**;
+use a smaller value to limit the search.
 
 ## Input
 
@@ -86,8 +57,7 @@ The output directory contains three tables:
 | `{tumor_id}_cluster_centers.tsv` | Cluster sizes and regional CCFs |
 | `{tumor_id}_mutation_region_multiplicity.tsv` | CCF and multiplicity estimates for each mutation–region pair |
 
-Cluster 0 is the designated occupied clonal cluster, with exact CCF 1 in every
-region. Other clusters are ordered by decreasing final-CCF-vector L2 norm.
+Cluster 0 has the largest CCF-vector L2 norm and is not necessarily clonal.
 
 ## Contact
 

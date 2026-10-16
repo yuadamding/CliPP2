@@ -613,8 +613,6 @@ def _build_tumor_data(
                 detail="retained (0, 0) CN has no positive integer multiplicity",
             )
 
-    alt_counts = np.where(count_observed, alt_counts, 0.0)
-    total_counts = np.where(count_observed, total_counts, 0.0)
     denominator = (1.0 - purity) * normal_cn + purity * total_cn
     if np.any(~np.isfinite(denominator)) or np.any(denominator <= 0.0):
         raise TumorTxtError(

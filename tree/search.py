@@ -7,11 +7,14 @@ The complete evaluated bank survives beam eviction and determines publication.
 
 from dataclasses import dataclass
 from itertools import islice
+from itertools import combinations
 from time import perf_counter
 
 import numpy as np
 
 from .refinement import best_pair_boundary, canonical_partition
+from .support_proposals import (SEED_ATTEMPT_LIMIT, active_support, support_preflight,
+                                support_seed_proposals, support_split_proposals)
 
 
 @dataclass
@@ -55,27 +58,39 @@ def _population(candidates, width, indices):
 class _Moves:
     """Lazy, bounded-neighborhood ranking; matrices shared within one parent."""
 
-    def __init__(self, model, tree, bank, candidate, limit, split_ranks, keys):
+    def __init__(self, model, tree, bank, candidate, limit, split_ranks, keys, pilot=None):
         self.model, self.tree, self.bank = model, tree, bank
         self.candidate, self.limit = candidate, limit
         self.labels, self.centers = candidate.refit.labels, candidate.refit.centers
         self.q = len(self.centers)
         self.split_ranks, self.keys = split_ranks, keys
+        self.support = active_support(model)
+        self.pilot = pilot
         self._columns = None
         self.stats = {name: {"scanned": False, "available": None, "generated": 0}
                       for name in ("merge", "split", "boundary", "reassignment")}
 
     def columns(self):
         if self._columns is None:
-            self._columns = self.model.log_likelihood_columns(self.centers)
+            self._columns = getattr(self.model, "proposal_log_likelihood_columns",
+                                    self.model.log_likelihood_columns)(self.centers)
         return self._columns
 
     def merge(self):
-        pairs = sorted({tuple(sorted(map(int, self.labels[edge]))) for edge in self.tree.edges
-                        if self.labels[edge[0]] != self.labels[edge[1]]})
+        general = self.support is not None and self.candidate.membership_kind == "general"
+        pairs = (list(combinations(range(self.q), 2)) if general else
+                 sorted({tuple(sorted(map(int, self.labels[edge]))) for edge in self.tree.edges
+                         if self.labels[edge[0]] != self.labels[edge[1]]}))
+        screened = len(pairs)
+        if self.support is not None:
+            state = self.support.summarize_partition(self.labels)
+            pairs = [(a, b) for a, b in pairs if not np.any(
+                ((state.positive_counts[a]+state.positive_counts[b]) > 0)
+                & ((state.hard_zero_counts[a]+state.hard_zero_counts[b]) > 0))]
         pairs.sort(key=lambda pair: (float(np.sum((self.centers[pair[0]]-self.centers[pair[1]])**2)), pair))
         self.stats["merge"].update(scanned=True, available=len(pairs),
-                                   ranking="adjacent_center_squared_distance")
+            support_pairs_screened=screened,
+            ranking="all_compatible_pairs_center_squared_distance" if general else "adjacent_center_squared_distance")
         for a, b in pairs:
             self.stats["merge"]["generated"] += 1
             yield _Proposal(canonical_partition(np.where(self.labels == b, a, self.labels)),
@@ -85,7 +100,32 @@ class _Moves:
         from .selection import _likelihood_ranked_edges, _supported_split_edges
         stats = self.stats["split"]
         if self.candidate.membership_kind != "tree":
-            stats.update(scanned=True, available=0, reason="disconnected_parent_not_tree_splittable")
+            if self.support is None:
+                stats.update(scanned=True, available=0, reason="disconnected_parent_not_tree_splittable")
+                return
+            # Bounded block screening uses only observed pilot variation. The
+            # actual proposals are ordered by observed regional profile gaps.
+            def variation(k):
+                rows = self.labels == k
+                if self.pilot is None:
+                    return -int(rows.sum())
+                return -sum(float(np.ptp(self.pilot[rows & self.model.observed[:, r], r]))
+                            for r in range(self.model.r) if np.any(rows & self.model.observed[:, r]))
+            blocks = sorted(range(self.q), key=lambda k: (variation(k), k))[:self.limit]
+            proposals, profiles, diagnostics = [], {}, []
+            for block in blocks:
+                found, diagnostic = support_split_proposals(
+                    self.model, self.labels, block, self.limit, profiles=profiles)
+                diagnostics.append({"block": block, **diagnostic})
+                proposals.extend(found)
+            proposals.sort(key=lambda item: (-item[1]["profile_gap"], item[1]["split_block"],
+                                             item[1]["ordering_region"], tuple(item[0])))
+            stats.update(scanned=True, available=len(proposals),
+                         ranking="observed_regional_profile_general_split", blocks=diagnostics,
+                         block_screen_limit=self.limit, structural_screen_limit=4*self.limit**2)
+            for labels, details in proposals[:self.limit]:
+                stats["generated"] += 1
+                yield _Proposal(labels, None, details)
             return
         cuts = self.candidate.cuts
         if cuts not in self.split_ranks:
@@ -139,7 +179,8 @@ class _Moves:
             stats.update(scanned=True, available=0, reason="joint_multi_group_move_only")
             return
         proposals, scans = _proposals(self.labels, self.centers, self.columns(),
-                                     self.model.observed, self.keys)
+                                     self.model.observed, self.keys,
+                                     **({"support": self.support} if self.support is not None else {}))
         stats.update(scanned=True, available=sum(p is not None for p in proposals), **scans)
         for kind, labels in zip(("single", "greedy_batch"), proposals):
             if labels is not None:
@@ -169,7 +210,10 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
         raise ValueError("Bounded search requires unique valid integer capacities")
     capacities = tuple(map(int, capacities))
     maximum = max(capacities)
-    search = search.resolve(maximum)
+    support_diagnostics = support_preflight(model, maximum)
+    support = active_support(model)
+    requested_mode = search.mode
+    search = search.resolve(maximum, active_hard_zero=support is not None)
     if search.mode != "bounded":
         raise ValueError("fit_bounded requires the bounded search policy")
     # Native proposals are outside the additional-move budget, so enforce their
@@ -201,7 +245,8 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
         for q, additions in by_q.items():
             beams[q] = _population([*beams[q], *additions], search.width, indices)
 
-    def consider(labels, centers, provenance, *, native=False, declared_cuts=None):
+    def consider(labels, centers, provenance, *, native=False, declared_cuts=None,
+                 force_general=False):
         labels, centers = canonical_partition(labels, centers) if centers is not None else (canonical_partition(labels), None)
         q = int(labels.max()) + 1
         record = {"family": provenance["route"], "occupied_q": q,
@@ -217,7 +262,7 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
             spent[q] += 1
             anchor_reserved[q] += q
         cuts = tuple(map(int, np.flatnonzero(labels[tree.edges[:, 0]] != labels[tree.edges[:, 1]])))
-        tree_member = len(cuts) + 1 == q
+        tree_member = len(cuts) + 1 == q and not force_general
         if native and (not tree_member or cuts != tuple(declared_cuts)):
             raise ValueError("Native candidate labels disagree with its frozen-tree support")
         key = ("tree", cuts) if tree_member else ("general", bank.membership_key(labels))
@@ -247,7 +292,27 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
         consider(seed["labels"], seed.get("centers"), provenance, native=True, declared_cuts=cuts)
     native_count = len(bank.candidates)
     native_anchor_evaluations = bank.refit_calls
-    if not bank.candidates and maximum >= 2:
+    # Seed work has a fixed construction bound and reserves ordinary target-q
+    # slots. Reservations are released before sweeps; no new fit allowance is
+    # introduced. The seeds are explicitly general, never native tree seeds.
+    reserved_seed_slots = min(SEED_ATTEMPT_LIMIT, search.partition_limit_per_q) if support is not None else 0
+    support_seed_records, seed_spent = [], {q: 0 for q in beams}
+    if support is not None:
+        for labels, diagnostic in support_seed_proposals(model, maximum, limit=reserved_seed_slots):
+            record = dict(diagnostic)
+            support_seed_records.append(record)
+            if labels is None:
+                record["outcome"] = "support_seed_search_exhausted"
+                continue
+            q = int(labels.max())+1
+            if seed_spent[q] >= reserved_seed_slots:
+                record["outcome"] = "reserved_seed_budget_exhausted"
+                continue
+            seed_spent[q] += 1
+            consider(labels, None, {"route": "regional_support_seed", "requested_k": q,
+                                   **diagnostic}, force_general=True)
+            record.update(occupied_q=q, outcome=ledger[-1]["outcome"], attempt_index=len(ledger)-1)
+    if not bank.candidates and maximum >= 2 and support is None:
         consider(np.where(model.clonal_eligible, 0, 1), None,
                  {"route": "eligible_set_anchor_rescue", "requested_k": maximum})
     split_ranks = {}
@@ -261,7 +326,7 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
             for candidate in tuple(beams[q]):
                 parent = indices[id(candidate)]
                 expanded.add(parent)
-                moves = _Moves(model, tree, bank, candidate, search.proposals_per_state, split_ranks, keys)
+                moves = _Moves(model, tree, bank, candidate, search.proposals_per_state, split_ranks, keys, pilot)
                 generators = {family: iter(getattr(moves, family)()) for family in families}
                 path = {"sweep": sweep, "direction": "downward" if downward else "upward",
                         "occupied_q": q, "parent_bank_index": parent, "slots": []}
@@ -290,6 +355,8 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
                     stats["unexpanded_known"] = (None if stats["available"] is None else
                                                    max(0, stats["available"]-stats["generated"]))
     if not bank.candidates:
+        if support is not None:
+            raise ValueError("support_seed_search_exhausted: bounded support-compatible search found no eligible anchored fit; global infeasibility is not established")
         raise ValueError("no_eligible_anchored_candidate: bounded proposal search exhausted")
     selected = min(bank.candidates, key=_score_key)
     if any(actual_anchors[q] > q*search.partition_limit_per_q for q in beams):
@@ -306,6 +373,20 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
         "ineligible_candidates": list(bank.ineligible.values()),
         "general_ineligible_candidates": bank.general_rejections,
         "anchor_ineligible_candidates": bank.anchor_rejections,
+        **support_diagnostics,
+        "support_conflicts_rejected": bank.support_conflicts_rejected,
+        "support_rejection_witnesses": bank.support_rejection_witnesses,
+        "support_seed_attempts": len(support_seed_records),
+        "support_seeds": support_seed_records,
+        "native_support_outcome": ("tree_restriction_prevents_candidate" if support is not None and not native_count
+                                    else "eligible_native_bank" if native_count else "no_eligible_native_fit"),
+        "native_support_scope": "evaluated_native_seed_family_only_not_all_tree_partitions",
+        "structural_candidates_screened": len(ledger),
+        "structural_screen_scope": "admission_callbacks; bounded neighborhood prescreens recorded in paths",
+        "support_seed_construction_attempts": len(support_seed_records),
+        "support_seed_construction_failures": sum(record.get("reason") is not None for record in support_seed_records),
+        "full_partition_attempts": bank.full_partition_attempts,
+        "anchored_variants_evaluated": bank.refit_calls,
         "selected_membership_kind": selected.membership_kind,
         "partition_cache": cache,
         "candidate_membership_storage": "compact_tree_cuts_and_general_component_maps_with_bounded_decoded_cache",
@@ -313,6 +394,7 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
         "global_optimality_certified": False,
         "search_policy": {
             "mode": "bounded", "exhaustive": False, "width": search.width,
+            "requested_mode": requested_mode, "resolved_mode": "bounded",
             "proposals_per_state": search.proposals_per_state, "sweeps": search.sweeps,
             "partition_limit_per_q": search.partition_limit_per_q,
             "partition_limit_total": maximum*search.partition_limit_per_q,
@@ -323,6 +405,9 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
             "initial_native_anchored_evaluations": native_anchor_evaluations,
             "additional_partition_attempts": spent, "anchored_slots_reserved": anchor_reserved,
             "additional_anchored_evaluations": actual_anchors,
+            "support_seed_reserved_slots_per_q": reserved_seed_slots,
+            "support_seed_slots_used_by_q": seed_spent,
+            "support_seed_unused_reservations_released_before_sweeps": True,
             "active_bank_indices_by_q": {q: [indices[id(c)] for c in active] for q, active in beams.items()},
             "unexpanded_evaluated_bank_indices": sorted(set(indices.values())-expanded),
             "population_rule": "round_robin_score_conditional_partition_anchor_diversity",

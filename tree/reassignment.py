@@ -46,7 +46,7 @@ def _starting_states(original, winner):
     return chosen
 
 
-def _proposals(labels, centers, columns, observed, keys):
+def _proposals(labels, centers, columns, observed, keys, *, support=None):
     """One ranked scan per proposal, with dynamic support in the greedy batch.
 
     Destination keys are scientific group multisets and center coordinates,
@@ -68,6 +68,13 @@ def _proposals(labels, centers, columns, observed, keys):
     np.add.at(counts, labels, observed)
     if np.any(counts == 0):
         raise ValueError("A reassignment parent lacks regional observation support")
+    positive = zero = None
+    if support is not None:
+        summary = support.summarize_partition(labels)
+        if support.check_partition(summary) is not None:
+            raise ValueError("A reassignment parent has incompatible regional support")
+        positive = summary.positive_counts.copy()
+        zero = summary.hard_zero_counts.copy()
     group_keys = [(tuple(sorted(keys[i] for i in np.flatnonzero(labels == k))),
                    tuple(map(float, centers[k]))) for k in range(q)]
     # Compare the <=K full descriptors once, not during every transfer tie.
@@ -82,14 +89,16 @@ def _proposals(labels, centers, columns, observed, keys):
     ranked = sorted(zip(rows.tolist(), destinations.tolist()), key=lambda move: (
         -float(gains[move]), keys[move[0]], group_ranks[move[1]], move[0]))
 
-    def legal(row, source, current_sizes, current_counts):
-        return (current_sizes[source] > 1
-                and np.all(current_counts[source] - observed[row] > 0))
+    def legal(row, source, destination):
+        return (sizes[source] > 1 and np.all(counts[source] - observed[row] > 0)
+                and (support is None or not np.any(
+                    ((positive[destination]+support.positive[row]) > 0)
+                    & ((zero[destination]+support.hard_zero[row]) > 0))))
 
     single, single_checks = None, 0
     for row, destination in ranked:
         single_checks += 1
-        if legal(row, labels[row], sizes, counts):
+        if legal(row, labels[row], destination):
             single = labels.copy()
             single[row] = destination
             break
@@ -100,13 +109,18 @@ def _proposals(labels, centers, columns, observed, keys):
             continue
         batch_checks += 1
         source = labels[row]
-        if not legal(row, source, sizes, counts):
+        if not legal(row, source, destination):
             continue
         batch[row], moved[row] = destination, True
         sizes[source] -= 1
         sizes[destination] += 1
         counts[source] -= observed[row]
         counts[destination] += observed[row]
+        if support is not None:
+            positive[source] -= support.positive[row]
+            positive[destination] += support.positive[row]
+            zero[source] -= support.hard_zero[row]
+            zero[destination] += support.hard_zero[row]
     return (single, batch if moved.any() else None), {
         "scanned_transfer_pairs": n * (q - 1),
         "positive_gain_pairs": len(ranked),
@@ -179,11 +193,14 @@ def expand_memberships(model, bank):
             if (not 0 <= clonal < q or not np.any(labels == clonal)
                     or not np.array_equal(centers[clonal], np.ones(model.r))):
                 raise ValueError("Reassignment parent lost its occupied clonal center")
-            columns = np.asarray(model.log_likelihood_columns(centers), dtype=float)
+            columns = np.asarray(getattr(model, "proposal_log_likelihood_columns",
+                                         model.log_likelihood_columns)(centers), dtype=float)
             if columns.shape != (model.n, q) or len(keys) != model.n:
                 raise ValueError("Joint likelihood columns and scientific keys must match N by K")
             evaluations += 1
-            proposals, scan = _proposals(labels, centers, columns, observed, keys)
+            support = getattr(model, "regional_support", None)
+            constraints = {"support": support} if support is not None and support.hard_zero.any() else {}
+            proposals, scan = _proposals(labels, centers, columns, observed, keys, **constraints)
             round_record = {"round": round_index, "parent_score": state.score,
                             **scan, "proposals": [], "advanced": False}
             path["rounds"].append(round_record)

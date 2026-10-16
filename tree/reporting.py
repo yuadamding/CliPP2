@@ -19,6 +19,41 @@ OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
 OUTPUT_SCHEMA_VERSION = 11
 
+
+def _regional_zero_audit(model, labels, centers, clonal, observed):
+    """Reconstruct assignment constraints from retained input, never fit caches."""
+    policy = model.regional_zero_policy
+    if policy not in ('strict', 'likelihood'):
+        raise ValueError('Unknown recorded regional-zero policy')
+    ix = np.ix_(model.active_indices, model.region_indices)
+    alt = np.asarray(model.data.alt_counts)[ix]
+    positive = observed & (alt > 0)
+    observed_zero = observed & (alt == 0)
+    zero = observed_zero if policy == 'strict' else np.zeros_like(observed)
+    forced = np.array([zero[labels == k].any(axis=0) for k in range(len(centers))])
+    conflicts = np.array([positive[labels == k].any(axis=0) for k in range(len(centers))]) & forced
+    violations = int(np.count_nonzero(centers[labels][zero] != 0.))
+    if violations:
+        raise ValueError('published_regional_zero_violation')
+    if conflicts.any():
+        raise ValueError('published_regional_zero_positive_conflict')
+    if zero[labels == clonal].any():
+        raise ValueError('published_clonal_regional_zero_conflict')
+    fixed = int(forced.sum())
+    return {
+        'regional_zero_policy': policy,
+        'observed_zero_cells': int(observed_zero.sum()),
+        'missing_cells': int((~observed).sum()),
+        'forced_zero_cluster_coordinates': fixed,
+        'fixed_zero_coordinate_count': fixed,
+        'free_center_coordinate_count': (len(centers)-1)*model.r-fixed,
+        'penalty_parameter_count': (len(centers)-1)*(model.r+1),
+        'penalty_interpretation': 'nominal_full_dimension',
+        'assigned_zero_violations': violations,
+        'regional_zero_independently_verified': True,
+    }
+
+
 def _input_domain(model, centers):
     """Rebuild observations and closed boxes independently of runtime caches."""
     centers = np.asarray(centers, dtype=float)
@@ -90,6 +125,7 @@ def verify_selected(model, result):
             or not np.array_equal(centers[clonal], np.ones(model.r))):
         raise ValueError('Selected fit must have an occupied exact clonal center')
     observed, allowed = _input_domain(model, centers)
+    zero_audit = _regional_zero_audit(model, labels, centers, clonal, observed)
     if not allowed.any(axis=1).all():
         raise ValueError('A mutation has no admissible center in its original bounds')
     if not allowed[np.arange(model.n), labels].all():
@@ -190,6 +226,13 @@ def verify_selected(model, result):
                     np.searchsorted(boundaries, np.arange(model.n), side='right')])
         elif candidate.fit.eligible:
             fitted = candidate.fit
+            if zero_audit['regional_zero_policy'] == 'strict' and zero_audit['observed_zero_cells']:
+                support = fitted.diagnostics
+                if (support.get('regional_zero_policy') != 'strict'
+                        or support.get('regional_support_identity') != model.regional_support.identity
+                        or support.get('regional_zero_assignment_verified') is not True
+                        or support.get('assigned_zero_violations') != 0):
+                    raise ValueError('Candidate bank lacks its admission-time regional-zero certificate')
             fixed, count = fitted.clonal_cluster, len(fitted.centers)
             if (isinstance(fixed, (bool, np.bool_)) or not isinstance(fixed, (int, np.integer))
                     or not 0 <= fixed < count or np.asarray(fitted.centers).shape != (count, model.r)
@@ -221,7 +264,7 @@ def verify_selected(model, result):
     if not retained:
         raise ValueError('Selected fitted state is absent from the complete candidate bank')
     validity = float(np.log(allowed @ weights).sum())
-    return {'independently_verified': True, 'conditional_log_likelihood': conditional,
+    return {**zero_audit, 'independently_verified': True, 'conditional_log_likelihood': conditional,
             'membership_kind': kind, 'connected_on_proposal_tree': len(cuts)+1 == q,
             'hard_partition_log_likelihood': conditional,
             'mixture_log_likelihood': mixture, 'complexity_penalty': penalty, 'score': score,
@@ -277,6 +320,13 @@ def publish(model, result, outdir, tumor_id):
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     tables, hashes = result_tables(model, result, tumor_id), {}
+    # Verify serialization against the selected shared centers, not against the
+    # table builder: even a valid fit must not publish mutation-specific edits.
+    fit = result.selected.fit
+    labels, centers = np.asarray(fit.labels), np.asarray(fit.centers)
+    ranked = np.argsort(-np.linalg.norm(centers, axis=1), kind='stable')
+    order = np.r_[fit.clonal_cluster, ranked[ranked != fit.clonal_cluster]]
+    phi = centers[labels]
     # Per-file no-clobber publication, not a collective transaction.
     with tempfile.TemporaryDirectory(prefix='.clipp2-publication-', dir=outdir) as temporary:
         staged = Path(temporary)
@@ -289,12 +339,16 @@ def publish(model, result, outdir, tumor_id):
             if suffix in ('cluster_centers.tsv', 'mutation_clusters.tsv'):
                 clonal_rows = parsed['cluster_label'] == '0'
                 columns = ['phi_'+r for r in model.region_ids]
+                expected = centers[order] if suffix == 'cluster_centers.tsv' else phi
             else:
                 clonal_ids = set(model.mutation_ids[i] for i in np.flatnonzero(result.labels == result.clonal_cluster))
                 clonal_rows = parsed['mutation_id'].isin(clonal_ids)
                 columns = ['phi']
+                expected = phi.reshape(-1, 1)
             if not clonal_rows.any() or not np.all(parsed.loc[clonal_rows, columns].astype(float).to_numpy() == 1.):
                 raise ValueError('Staged TSV lost its occupied exact clonal center')
+            if not np.array_equal(parsed[columns].astype(float).to_numpy(), expected):
+                raise ValueError('Staged TSV regional-zero/shared-center values disagree with the selected fit')
             hashes[name] = hashlib.sha256((staged/name).read_bytes()).hexdigest()
         for name in hashes:
             os.link(staged/name, outdir/name)

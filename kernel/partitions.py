@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from .topology import partition_from_cuts
+from .regional_support import RegionalSupport
 from ..io.data import readonly_array
 
 
@@ -21,25 +22,38 @@ class PartitionState:
     members: tuple
     counts: np.ndarray
     observed_counts: np.ndarray
+    positive_counts: np.ndarray
+    hard_zero_counts: np.ndarray
+    forced_zero: np.ndarray
+    support_conflict: np.ndarray
     lower: np.ndarray
     upper: np.ndarray
     clonal_eligible: np.ndarray
+    support_identity: str
 
     @classmethod
     def from_labels(cls, labels, model):
         labels = readonly_array(labels, dtype=np.int64)
         q = int(labels.max()) + 1
         members = tuple(readonly_array(np.flatnonzero(labels == k)) for k in range(q))
+        support = getattr(model, "regional_support", None)
+        if support is None:
+            support = RegionalSupport(model.observed, model.observed,
+                                      np.zeros_like(model.observed), "likelihood")
+        summary = support.summarize_partition(labels)
         return cls(labels, members, readonly_array([len(rows) for rows in members], dtype=np.int64),
-                   readonly_array([model.observed[rows].sum(axis=0) for rows in members]),
+                   summary.observed_counts, summary.positive_counts, summary.hard_zero_counts,
+                   summary.forced_zero, summary.support_conflict,
                    readonly_array([model.lower[rows].max(axis=0) for rows in members]),
                    readonly_array([model.upper[rows].min(axis=0) for rows in members]),
-                   readonly_array([model.clonal_eligible[rows].all() for rows in members]))
+                   readonly_array([model.clonal_eligible[rows].all() for rows in members]),
+                   support.identity)
 
     @property
     def nbytes(self):
         return sum(value.nbytes for value in (
             self.labels, *self.members, self.counts, self.observed_counts,
+            self.positive_counts, self.hard_zero_counts, self.forced_zero, self.support_conflict,
             self.lower, self.upper, self.clonal_eligible))
 
 
@@ -55,6 +69,7 @@ class TreePartitionCache:
         # RegionalModel's device tensors, likelihood caches or fitting state.
         self._metadata = SimpleNamespace(**{name: getattr(model, name) for name in (
             "observed", "lower", "upper", "clonal_eligible")})
+        self._metadata.regional_support = getattr(model, "regional_support", None)
         self.budget_bytes = int(budget_bytes)
         self._entries = OrderedDict()
         self.retained_bytes = self.peak_bytes = 0
@@ -65,7 +80,7 @@ class TreePartitionCache:
         # Charge array headers/backing bytes, tuple/key integers, dataclass and
         # ordered-dict links as well as numeric buffers. This is conservative
         # accounting, not a measurement of process RSS or allocator high water.
-        return state.nbytes + 1024 + 256 * (7 + len(state.members)) + 36 * len(cuts)
+        return state.nbytes + 1152 + 256 * (11 + len(state.members)) + 36 * len(cuts)
 
     def get(self, cuts):
         cuts = tuple(cuts)

@@ -155,8 +155,9 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None):
                 or not np.array_equal(fit.centers[clonal], np.ones(model.r))):
             raise ValueError("Boundary parent lost its occupied clonal center")
         components = {cluster: np.flatnonzero(labels == cluster) for cluster in range(len(fit.centers))}
-        # The model columns already enforce the complete regional assignment box.
-        columns = model.log_likelihood_columns(fit.centers)
+        # Proposal masks affect hard assignments only, never raw mixture scores.
+        columns = getattr(model, "proposal_log_likelihood_columns",
+                          model.log_likelihood_columns)(fit.centers)
         for edge in current.cuts:
             move = best_pair_boundary(tree, labels, fit.centers, columns, edge,
                                       adjacency=adjacency, components=components)

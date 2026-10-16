@@ -16,7 +16,7 @@ from .refinement import canonical_partition, refine_partition
 from ..config import DEFAULT_MAX_CLUSTERS, EXHAUSTIVE_MAX_CLUSTERS, SearchPolicy
 from ..kernel import ALGORITHM, MAX_CLUSTERS
 from ..kernel.model import RefittedPartition, RegionalModel
-from ..kernel.partitions import TreePartitionCache
+from ..kernel.partitions import PartitionState, TreePartitionCache
 from ..kernel.topology import build_tree
 
 
@@ -423,6 +423,8 @@ class _CandidateBank:
         self.fitted_states = {}
         self.anchor_rejections = []
         self.attempt_cache_hits = self.structural_cache_hits = 0
+        self.support_conflicts_rejected = self.full_partition_attempts = 0
+        self.support_rejection_witnesses = []
 
     def labels(self, cuts):
         return self.partition_cache.labels(cuts)
@@ -450,6 +452,9 @@ class _CandidateBank:
                 raise ValueError("Candidate labels and frozen-tree cuts disagree")
             labels = state.labels
         key = cuts if tree else self.membership_key(labels)
+        if not tree:
+            state = (self.partition_cache.get_membership(*key) if self.compact_general
+                     else PartitionState.from_labels(labels, self.model))
         partition = ("tree" if tree else "general", key)
         if not tree and key in self.structural_rejections:
             self.structural_cache_hits += 1
@@ -457,21 +462,32 @@ class _CandidateBank:
         attempts = self.tree_attempts if tree else self.membership_attempts
         center_key = None if centers is None else centers.tobytes()
         q = int(labels.max())+1
+        support = getattr(self.model, "regional_support", None)
+        strict = support is not None and support.hard_zero.any()
         structural = None
         for k in range(q):
-            members = labels == k if state is None else state.members[k]
-            observed = (self.model.observed[members].any(axis=0) if state is None
-                        else state.observed_counts[k] > 0)
-            lower = self.model.lower[members].max(axis=0) if state is None else state.lower[k]
-            upper = self.model.upper[members].min(axis=0) if state is None else state.upper[k]
-            if not observed.all():
+            if not (state.observed_counts[k] > 0).all():
                 structural = "unsupported_cluster_region"
-            elif np.any(lower > upper):
+            elif np.any(state.lower[k] > state.upper[k]):
                 structural = "empty_cluster_region_box"
+        if strict and np.any(state.observed_counts == 0):
+            structural = "unsupported_cluster_region"
+        if structural is None and state.support_conflict.any():
+            structural = "regional_zero_positive_conflict"
+            self.support_conflicts_rejected += 1
+            if len(self.support_rejection_witnesses) < 8:
+                k, region = map(int, np.argwhere(state.support_conflict)[0])
+                rows = state.members[k]
+                self.support_rejection_witnesses.append({
+                    "cluster": k, "region_index": region,
+                    "positive_mutation_indices": rows[support.positive[rows, region]][:3].tolist(),
+                    "zero_mutation_indices": rows[support.hard_zero[rows, region]][:3].tolist()})
         designations = ([clonal_cluster] if clonal_cluster is not None else
-                        [k for k in range(q) if (self.model.clonal_eligible[labels == k].all()
-                                               if state is None else state.clonal_eligible[k])])
-        rejection = {"cuts": cuts, "reason": structural or "no_eligible_clonal_block",
+                        [k for k in range(q) if state.clonal_eligible[k]])
+        if strict:
+            designations = [k for k in designations if state.clonal_eligible[k]]
+        rejection = {"cuts": cuts, "reason": structural or (
+            "no_zero_compatible_clonal_block" if strict else "no_eligible_clonal_block"),
                      "provenance": [dict(provenance)]}
         if structural or not designations:
             if tree:
@@ -497,6 +513,7 @@ class _CandidateBank:
         if not pending:
             return returned
         started = perf_counter()
+        self.full_partition_attempts += 1
         # The private enumerator allows a cached subset without repeating the
         # other weight fits; all free blocks are shared within this context.
         refit = self.model._refit_variants
@@ -539,6 +556,12 @@ class _CandidateBank:
                         or np.any(fit.weights <= 0)
                         or not np.isclose(fit.weights.sum(), 1., atol=1e-12, rtol=0)):
                     raise ValueError("Invalid occupied anchored fitted state")
+                if strict and not support.assigned_mask(labels, fit.centers).all():
+                    raise ValueError("regional_zero_positive_conflict: fitted state violates hard membership")
+                fit.diagnostics.update(
+                    support_identity=state.support_identity,
+                    support_validated_at_admission=True,
+                    forced_zero_cluster_coordinates=int(state.forced_zero.sum()))
                 identity = (partition, clonal, fit.centers.tobytes(), fit.weights.tobytes())
                 candidate = self.fitted_states.get(identity)
                 if candidate is None:
@@ -592,7 +615,11 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
     if isinstance(max_clusters, bool) or int(max_clusters) != max_clusters or not 1 <= max_clusters <= MAX_CLUSTERS:
         raise ValueError(f"max_clusters must be an integer in 1..{MAX_CLUSTERS}")
     max_clusters = int(max_clusters)
-    search = (SearchPolicy() if search is None else search).resolve(max_clusters)
+    from .support_proposals import active_support, support_preflight
+    requested_search = SearchPolicy() if search is None else search
+    requested_mode = requested_search.mode
+    strict = active_support(model) is not None
+    search = requested_search.resolve(max_clusters, active_hard_zero=strict)
     if capacities is None:
         capacities = tuple(range(1, min(max_clusters, model.n) + 1))
     else:
@@ -601,6 +628,7 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
                                  not 1 <= k <= min(max_clusters, model.n) for k in capacities):
             raise ValueError("capacities must contain valid requested cluster counts")
         capacities = tuple(sorted(set(map(int, capacities))))
+    support_preflight(model, max(capacities))
     model.check_clonal_feasibility(max(capacities))
     times = {}
     started = perf_counter()
@@ -614,8 +642,10 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
     times["continuation_seconds"] = perf_counter() - started
     if search.mode == "bounded":
         from .search import fit_bounded
-        return fit_bounded(model, tree, pilot, seeds, capacities, search,
-                           pilot_diagnostics=pilot_diagnostics, **times)
+        result = fit_bounded(model, tree, pilot, seeds, capacities, search,
+                             pilot_diagnostics=pilot_diagnostics, **times)
+        result.diagnostics["search_policy"].update(requested_mode=requested_mode, resolved_mode=search.mode)
+        return result
     bank = _CandidateBank(model, tree)
     seeds_diagnostics, refined = [], set()
     refinement_seconds, subset_count = 0.0, 0
@@ -752,92 +782,3 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
         "selection": "minimum_over_complete_eligible_scored_bank",
         "global_optimality_certified": False,
     })
-
-
-def exhaustive_tree_reference(model, tree, *, max_nodes=8):
-    """Offline tiny-N reference; continuous scalar refits remain numerical."""
-    if model.n > min(int(max_nodes), 8):
-        raise ValueError("Exhaustive tree reference is restricted to N<=8")
-    bank = _CandidateBank(model, tree)
-    for cuts in cut_subsets(range(len(tree.edges))):
-        bank.consider(cuts, bank.labels(cuts), None, {"route": "offline_exhaustive"})
-    if not bank.candidates:
-        raise ValueError("No supported exhaustive tree candidate")
-    return {
-        "selected": min(bank.candidates, key=_score_key), "candidate_bank": bank.candidates,
-        "unsupported_candidates": list(bank.ineligible.values()),
-        "continuous_global_optimality_certified": False,
-    }
-
-
-def exhaustive_unrestricted_reference(model, *, max_nodes=8):
-    """Offline Bell-family comparator for topology restriction, N<=8 only.
-
-    Restricted-growth strings enumerate every unlabeled set partition once.
-    Keep only the current winner and counters, not an exponential label bank.
-    This is not called by fitting; exhaustive discrete labels cannot certify
-    global optimality of the numerical continuous conditional refits.
-    """
-    if not 1 <= model.n <= min(int(max_nodes), 8):
-        raise ValueError("Exhaustive unrestricted reference is restricted to N<=8")
-    labels = np.zeros(model.n, dtype=np.int64)
-
-    def partitions(index, maximum):
-        if index == model.n:
-            yield labels.copy()
-            return
-        for value in range(maximum + 2):
-            labels[index] = value
-            yield from partitions(index + 1, max(maximum, value))
-
-    best, best_key = None, None
-    total, eligible, hypotheses, eligible_partitions = 0, 0, 0, 0
-    for proposal in partitions(1, 0):
-        total += 1
-        partition_eligible = False
-        for fitted in model.refit_variants(proposal):
-            hypotheses += 1
-            if not fitted.eligible:
-                continue
-            if not np.isfinite(fitted.score):
-                raise ValueError("An eligible unrestricted reference candidate has a nonfinite score")
-            eligible += 1
-            partition_eligible = True
-            key = float(fitted.score), len(fitted.centers), tuple(proposal), fitted.clonal_cluster
-            if best is None or key < best_key:
-                best, best_key = fitted, key
-        eligible_partitions += partition_eligible
-    if best is None:
-        raise ValueError("No supported unrestricted candidate")
-    return {"selected": best, "enumerated_partitions": total,
-            "eligible_partitions": eligible_partitions, "ineligible_partitions": total - eligible_partitions,
-            "enumerated_anchored_hypotheses": hypotheses, "eligible_anchored_hypotheses": eligible,
-            "continuous_global_optimality_certified": False}
-
-
-def offline_truth_replay(model, tree, truth_labels, selected_labels):
-    """Truth-only diagnostic, never called by inference or topology construction."""
-    truth, selected = map(canonical_partition, (truth_labels, selected_labels))
-    if truth.shape != (model.n,) or selected.shape != (model.n,):
-        raise ValueError("Replay labels must align with retained mutation identities")
-    q = len(np.unique(truth))
-    q_tree = 1 + int(np.count_nonzero(truth[tree.edges[:, 0]] != truth[tree.edges[:, 1]]))
-    result = {"truth_clusters": q, "tree_truth_components": q_tree,
-              "fragmentation": q_tree - q, "truth_representable": q_tree == q,
-              "tree_identity": tree.identity, "partitions": {}}
-    for name, labels in (("truth", truth), ("selected", selected)):
-        variants = list(model.refit_variants(labels))
-        fit = min(variants, key=lambda f: (not f.eligible, f.score, f.clonal_cluster), default=None)
-        if fit is None:
-            result["partitions"][name] = {"eligible": False, "reason": "no_eligible_clonal_block"}
-            continue
-        result["partitions"][name] = {
-            "eligible": fit.eligible, "reason": fit.reason,
-            "conditional_log_likelihood": float(fit.conditional_log_likelihood),
-            "mixture_log_likelihood": float(fit.mixture_log_likelihood),
-            "complexity_penalty": float(fit.complexity_penalty), "score": float(fit.score),
-        }
-    if all(value["eligible"] for value in result["partitions"].values()):
-        result["selected_minus_truth_score"] = (
-            result["partitions"]["selected"]["score"] - result["partitions"]["truth"]["score"])
-    return result

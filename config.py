@@ -7,7 +7,7 @@ import math
 from numbers import Integral
 from typing import Final
 
-DEFAULT_MAX_MAJOR_CN: Final = 4
+DEFAULT_MAX_MAJOR_CN: Final = 10
 DEFAULT_DEVICE: Final = "cuda"
 DEFAULT_MAX_CLUSTERS: Final = 10
 MAX_CLUSTERS: Final = 50
@@ -34,10 +34,14 @@ class SearchPolicy:
     def partition_limit_per_q(self):
         return self.width*self.proposals_per_state*self.sweeps
 
-    def resolve(self, max_clusters):
+    def resolve(self, max_clusters, *, active_hard_zero=False):
         mode = self.mode
+        if active_hard_zero and mode == 'exhaustive':
+            raise ValueError('Strict regional zeros require bounded search; use '
+                             '--search-policy auto/bounded or --regional-zero-policy likelihood')
         if mode == 'auto':
-            mode = 'exhaustive' if max_clusters <= EXHAUSTIVE_MAX_CLUSTERS else 'bounded'
+            mode = ('exhaustive' if max_clusters <= EXHAUSTIVE_MAX_CLUSTERS
+                    and not active_hard_zero else 'bounded')
         if mode == 'exhaustive' and max_clusters > EXHAUSTIVE_MAX_CLUSTERS:
             raise ValueError(f'Exhaustive search is restricted to max_clusters <= {EXHAUSTIVE_MAX_CLUSTERS}')
         return SearchPolicy(mode, self.width, self.proposals_per_state, self.sweeps)
@@ -71,10 +75,13 @@ class FitConfig:
     search_proposals: int = 4
     search_sweeps: int = 2
     qualify_device_weights: bool = False
+    regional_zero_policy: str = 'strict'
 
     def __post_init__(self) -> None:
         if self.device not in ("cpu", "cuda"):
             raise ValueError("device must be cpu or cuda.")
+        if self.regional_zero_policy not in ('strict', 'likelihood'):
+            raise ValueError('regional_zero_policy must be strict or likelihood')
         if not isinstance(self.verbose, bool):
             raise TypeError("verbose must be a boolean.")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
@@ -88,9 +95,10 @@ class FitConfig:
         if self.qualify_device_weights and (self.device != 'cuda' or self.vram_budget_gib == 0):
             raise ValueError('Device weight qualification requires CUDA and a positive VRAM budget')
 
-    def resolved_search(self):
+    def resolved_search(self, *, active_hard_zero=False):
         return SearchPolicy(self.search_policy, self.search_width,
-                            self.search_proposals, self.search_sweeps).resolve(self.max_clusters)
+                            self.search_proposals, self.search_sweeps).resolve(
+                                self.max_clusters, active_hard_zero=active_hard_zero)
 
 
 def resolve_fit_config(
@@ -101,13 +109,15 @@ def resolve_fit_config(
     search_policy: str = 'auto', search_width: int = 16,
     search_proposals: int = 4, search_sweeps: int = 2,
     qualify_device_weights: bool = False,
+    regional_zero_policy: str = 'strict',
 ) -> FitConfig:
     """Construct the only public fit configuration; removed knobs raise TypeError."""
     return FitConfig(device=device, verbose=verbose, max_major_cn=max_major_cn,
                      max_clusters=max_clusters, ram_budget_gib=ram_budget_gib,
                      vram_budget_gib=vram_budget_gib, search_policy=search_policy,
                      search_width=search_width, search_proposals=search_proposals,
-                     search_sweeps=search_sweeps, qualify_device_weights=qualify_device_weights)
+                     search_sweeps=search_sweeps, qualify_device_weights=qualify_device_weights,
+                     regional_zero_policy=regional_zero_policy)
 
 
 __all__ = ["FitConfig", "resolve_fit_config"]

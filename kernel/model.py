@@ -27,6 +27,7 @@ from .refitting import refit_center
 from .scoring import fit_cluster_weights
 from .memory import ByteLRU
 from .refit_store import ExactRefitStore
+from .regional_support import RegionalSupport
 from ..io.data import readonly_array
 
 
@@ -62,7 +63,8 @@ class RefittedPartition:
 class RegionalModel:
     """Immutable, canonically ordered informative mutation vectors."""
 
-    def __init__(self, data, device="cpu", *, cache_bytes=32 * 1024 * 1024, memory=None):
+    def __init__(self, data, device="cpu", *, cache_bytes=32 * 1024 * 1024, memory=None,
+                 regional_zero_policy="strict"):
         self.data = data
         ids, regions = tuple(data.mutation_ids), tuple(data.region_ids)
         if any(not isinstance(x, str) for x in ids + regions):
@@ -113,6 +115,8 @@ class RegionalModel:
             raise ValueError("Informative read counts must be finite nonnegative integers")
         self.alt = readonly_array(np.where(self.observed, self.alt, 0.))
         self.depth = readonly_array(np.where(self.observed, self.depth, 0.))
+        self._regional_support = RegionalSupport.from_counts(
+            self.alt, self.depth, self.observed, policy=regional_zero_policy)
         denominator = (1 - self.purity) * self.normal + self.purity * self.total
         if np.any(denominator <= 0):
             raise ValueError("Normal-plus-tumor denominator must be positive")
@@ -131,6 +135,10 @@ class RegionalModel:
                        self.support, self.lower, self.upper):
             digest.update(values.tobytes())
         digest.update(repr((self.mutation_ids, self.region_ids)).encode())
+        # Preserve the pinned likelihood-mode identity; strict caches occupy a
+        # separate immutable constraint namespace even when no zero is active.
+        if regional_zero_policy == "strict":
+            digest.update(self.regional_support.identity.encode())
         self.identity = digest.hexdigest()
         self.device = str(device)
         if self.device != "cpu" and not self.device.startswith("cuda"):
@@ -167,6 +175,14 @@ class RegionalModel:
         self._refit_store = None
         self._prepare_clonal_column()
 
+    @property
+    def regional_support(self):
+        return self._regional_support
+
+    @property
+    def regional_zero_policy(self):
+        return self.regional_support.policy
+
     def cache_diagnostics(self):
         result = dict(self.telemetry)
         result.update(refit_cache_bytes=self._refit_bytes, column_cache_bytes=self._column_bytes,
@@ -189,7 +205,8 @@ class RegionalModel:
         allowed = self.assignment_admissibility(ones)[:, 0]
         emission = -self.loss(np.ones((self.n, self.r))).sum(axis=1)
         self.clonal_log_column = readonly_array(np.where(allowed, emission, -np.inf))
-        self.clonal_eligible = readonly_array(allowed & np.isfinite(emission))
+        self.clonal_eligible = readonly_array(
+            allowed & np.isfinite(emission) & ~self.regional_support.hard_zero.any(axis=1))
 
     def check_clonal_feasibility(self, max_clusters):
         if not self.clonal_eligible.any():
@@ -401,14 +418,22 @@ class RegionalModel:
             raise ValueError(f"unsupported_cluster_region:{self.region_ids[region]}")
         if lower > upper:
             raise ValueError(f"empty_cluster_region_box:{self.region_ids[region]}")
-        scalar = self._scalar_model(rows, region)
-        store = self.refit_store()
-        if scalar is not None and lower == 0 and upper == 1:
+        hard_zero = self.regional_support.hard_zero[rows, region].any()
+        if hard_zero and self.regional_support.positive[rows, region].any():
+            raise ValueError(f"regional_zero_positive_conflict:{self.region_ids[region]}")
+        if hard_zero:
+            if not lower <= 0. <= upper:
+                raise ValueError(f"empty_cluster_region_box:{self.region_ids[region]}")
+            fitted = (0., float(self._regional_likelihood([0.], rows, region).sum()))
+            scalar, store = None, None
+        else:
+            scalar, store = self._scalar_model(rows, region), self.refit_store()
+        if not hard_zero and scalar is not None and lower == 0 and upper == 1:
             cp, ll = refit_center(scalar, **({
                 'grid_evaluator': lambda grid: store.grid_log_likelihood(rows, region, grid, scalar=scalar)
             } if store is not None else {}))
             fitted = (cp/scalar.purity, ll)
-        else:
+        elif not hard_zero:
             modes = (self.alt[rows, region]/self.depth[rows, region])[:, None] / self.slope[rows, region]
             grid = np.unique(np.r_[np.linspace(lower, upper, 513), np.clip(modes[self.valid[rows, region]], lower, upper)])
             values = (store.grid_log_likelihood(rows, region, grid) if store is not None else
@@ -490,6 +515,11 @@ class RegionalModel:
                 self.telemetry["likelihood_columns"] += 1
                 self._store_joint_column(key, (k,), emission, allowed, columns)
         return np.column_stack(columns)
+
+    def proposal_log_likelihood_columns(self, centers):
+        """Hard-assignment ranking only; raw cached mixture emissions stay intact."""
+        raw = self.log_likelihood_columns(centers)
+        return np.where(self.regional_support.assignment_mask(centers), raw, -np.inf)
 
     def _resident_columns(self, centers, allowed):
         """Batch independent emissions only; keep host R-sum and search order."""
@@ -588,6 +618,17 @@ class RegionalModel:
         occupied, inverse = np.unique(labels, return_inverse=True)
         if partition_state is not None and not np.array_equal(partition_state.labels, inverse):
             raise ValueError('Partition cache labels disagree with the requested refit')
+        summary = self.regional_support.summarize_partition(inverse)
+        if partition_state is not None:
+            if (partition_state.support_identity != self.regional_support.identity
+                    or len(partition_state.members) != int(inverse.max())+1
+                    or not np.array_equal(partition_state.counts, np.bincount(inverse))
+                    or any(not np.array_equal(getattr(partition_state, name), getattr(summary, name))
+                           for name in ("observed_counts", "positive_counts", "hard_zero_counts",
+                                        "forced_zero", "support_conflict"))
+                    or any(not np.array_equal(rows, np.flatnonzero(inverse == k))
+                           for k, rows in enumerate(partition_state.members))):
+                raise ValueError('Partition cache support disagrees with the requested refit')
         q = int(inverse.max())+1
         centers = np.full((q, self.r), np.nan)
         if initial_centers is not None:
@@ -602,6 +643,27 @@ class RegionalModel:
             raise ValueError("clonal_cluster must designate an occupied label")
         designations = [int(np.flatnonzero(occupied == k)[0]) for k in designations]
         penalty = float((q-1)*(self.r+1)*math.log(self.n))
+        # Keep the original likelihood route unchanged. Under active strict
+        # constraints all direct entry points reject structural conflicts before
+        # preparing a free center, resident grid, emission column or weight fit.
+        structural = (self.regional_support.check_partition(summary)
+                      if self.regional_support.hard_zero.any() else None)
+        if structural:
+            for clonal in designations:
+                self.telemetry["anchored_variant_evaluations"] += 1
+                fixed = centers.copy()
+                fixed[clonal] = 1.
+                yield self._failed_refit(inverse, fixed, clonal, penalty, structural)
+            return
+        invalid_designations = [k for k in designations if summary.forced_zero[k].any()]
+        for clonal in invalid_designations:
+            self.telemetry["anchored_variant_evaluations"] += 1
+            fixed = centers.copy()
+            fixed[clonal] = 1.
+            yield self._failed_refit(inverse, fixed, clonal, penalty, "clonal_block_inadmissible")
+        designations = [k for k in designations if k not in invalid_designations]
+        if not designations:
+            return
         errors, retained = {}, np.zeros(q, dtype=int)
         # Prepare independent free fits once, including errors. Fixing a block
         # must not depend on its free optimizer succeeding.
@@ -615,7 +677,7 @@ class RegionalModel:
                            else partition_state.members[cluster])
                 for region in range(self.r):
                     center, ll = self._fit_scalar(members, region)
-                    if initial_centers is not None:
+                    if initial_centers is not None and not summary.forced_zero[cluster, region]:
                         old = initial_centers[cluster, region]
                         if (np.isfinite(old) and self.lower[members, region].max() <= old
                                 <= self.upper[members, region].min()):
@@ -665,7 +727,7 @@ class RegionalModel:
                 continue
             previous_hits = self._weights.hits
             fitted = self._score_refit(inverse, fixed, clonal, penalty,
-                int(retained.sum()-retained[clonal]), **(
+                int(retained.sum()-retained[clonal]), support_summary=summary, **(
                     {'matrix': family.matrix(clonal)} if family is not None else {}))
             if family is not None:
                 fitted.diagnostics['fixed_center_bound'] = bounds[clonal]
@@ -702,8 +764,12 @@ class RegionalModel:
             conditional_log_likelihood=conditional, mixture_log_likelihood=-np.inf,
             complexity_penalty=penalty, score=np.inf, eligible=False, reason=reason)
 
-    def _score_refit(self, inverse, centers, clonal, penalty, retained_initial, *, matrix=None):
+    def _score_refit(self, inverse, centers, clonal, penalty, retained_initial, *, matrix=None,
+                     support_summary=None):
         q = len(centers)
+        if not self.regional_support.assigned_mask(inverse, centers).all():
+            return self._failed_refit(inverse, centers, clonal, penalty,
+                                      "regional_zero_assignment_violation")
         if matrix is None:
             matrix = self.log_likelihood_columns(centers)
         conditional = math.fsum(matrix[np.arange(self.n), inverse])
@@ -730,17 +796,29 @@ class RegionalModel:
             self.telemetry["weight_seconds"] += time.perf_counter()-start
         ll = mixture["log_likelihood"]
         eligible = bool(np.all(mixture["cluster_weights"] > 0))
+        diagnostics = {
+            "weight_optimality_gap": mixture["weight_optimality_gap"],
+            "weight_active_score_gap": mixture["weight_active_score_gap"],
+            "retained_initial_centers": retained_initial,
+            "scalar_global_optimality_certified": False,
+            "num_parameters": (q-1)*(self.r+1), "score_definition": SCORE_DEFINITION}
+        if self.regional_zero_policy == "strict":
+            summary = (self.regional_support.summarize_partition(inverse)
+                       if support_summary is None else support_summary)
+            zero_coordinates = int(summary.forced_zero.sum())
+            diagnostics.update(
+                regional_zero_policy="strict", regional_support_identity=self.regional_support.identity,
+                regional_zero_assignment_verified=True, assigned_zero_violations=0,
+                penalty_parameter_count=(q-1)*(self.r+1),
+                free_center_coordinate_count=(q-1)*self.r-zero_coordinates,
+                fixed_zero_coordinate_count=zero_coordinates,
+                forced_zero_cluster_coordinates=zero_coordinates,
+                penalty_dimension_convention="nominal_full_dimension")
         return RefittedPartition(labels=inverse, centers=centers, weights=mixture["cluster_weights"],
                                  clonal_cluster=clonal, conditional_log_likelihood=conditional,
                                  mixture_log_likelihood=ll, complexity_penalty=penalty,
                                  score=-2*ll+penalty, eligible=eligible,
-                                 reason=None if eligible else "zero_mixture_weight", diagnostics={
-                                     "weight_optimality_gap": mixture["weight_optimality_gap"],
-                                     "weight_active_score_gap": mixture["weight_active_score_gap"],
-                                     "retained_initial_centers": retained_initial,
-                                     "scalar_global_optimality_certified": False,
-                                     "num_parameters": (q-1)*(self.r+1),
-                                     "score_definition": SCORE_DEFINITION})
+                                 reason=None if eligible else "zero_mixture_weight", diagnostics=diagnostics)
 
 
 class _WeightModel(SimpleNamespace):
