@@ -13,7 +13,7 @@ namespace {
 thread_local char last_error[1024] = "";
 }
 
-extern "C" int CliPP2KernelABI() { return 2; }
+extern "C" int CliPP2KernelABI() { return 3; }
 extern "C" const char* CliPP2KernelBuildId() { return CLIPP2_KERNEL_BUILD_ID; }
 extern "C" const char* CliPP2KernelLastError() { return last_error; }
 
@@ -21,6 +21,15 @@ extern "C" int CliPP2SolveChain(int count, const int* alt, const int* depth,
     const int* major, const int* total, const int* clonal_eligible, double purity, const double* pilot_cp,
     const int* capacities, int k_count, int* labels_out, double* cp_out,
     double* diagnostics_out, int* statuses_out, CliPP2Callback callback) {
+    return CliPP2SolveChainDiagnostics(count,alt,depth,major,total,clonal_eligible,purity,
+        pilot_cp,capacities,k_count,labels_out,cp_out,diagnostics_out,statuses_out,callback,nullptr);
+}
+
+extern "C" int CliPP2SolveChainDiagnostics(int count, const int* alt, const int* depth,
+    const int* major, const int* total, const int* clonal_eligible, double purity, const double* pilot_cp,
+    const int* capacities, int k_count, int* labels_out, double* cp_out,
+    double* diagnostics_out, int* statuses_out, CliPP2Callback callback,
+    CliPP2FailureCallback failure_callback) {
     last_error[0]='\0';
     try {
         if(!labels_out || !cp_out || !diagnostics_out || !statuses_out)
@@ -42,8 +51,17 @@ extern "C" int CliPP2SolveChain(int count, const int* alt, const int* depth,
                 }
             }
         };
+        clipp2kernel::ChainFailureObserver observer;
+        if(failure_callback) observer=[&](const std::vector<double>& x,
+            const std::vector<double>& h,const std::vector<double>& b,
+            const std::vector<double>& z,const std::vector<double>& result,
+            const std::vector<int>& active,double rho,int witness,int k,int iteration,double error){
+            if(failure_callback(count,x.data(),h.data(),b.data(),z.data(),result.data(),
+                active.data(),rho,witness,k,iteration,error))
+                throw std::runtime_error("Numerical failure snapshot callback failed");
+        };
         clipp2kernel::solve_chain(data,capacities,k_count,evaluate,labels_out,cp_out,
-                                  diagnostics_out,statuses_out);
+                                  diagnostics_out,statuses_out,observer);
         return 0;
     } catch(const std::exception& error) {
         std::snprintf(last_error,sizeof(last_error),"%s",error.what());
@@ -60,6 +78,25 @@ extern "C" int CliPP2ForestQP(int count, int regions, int edge_count,
     try {
         clipp2kernel::solve_forest(count,regions,edge_count,edges,curvature,rhs,
                                  penalty,lower,upper,output,diagnostics);
+        return 0;
+    } catch(const std::exception& error) {
+        std::snprintf(last_error,sizeof(last_error),"%s",error.what());
+    } catch(...) {
+        std::snprintf(last_error,sizeof(last_error),"%s","Unknown native forest failure.");
+    }
+    return 1;
+}
+
+extern "C" int CliPP2ForestQPDiagnostics(int count, int regions, int edge_count,
+    const int* edges, const double* curvature, const double* rhs, double penalty,
+    const double* lower, const double* upper, double* output, int* diagnostics,
+    int* regional_diagnostics, double* regional_bounds, int* active_state) {
+    last_error[0]='\0';
+    try {
+        if(!regional_diagnostics || !regional_bounds || !active_state)
+            throw std::invalid_argument("Non-null forest diagnostic buffers are required");
+        clipp2kernel::solve_forest(count,regions,edge_count,edges,curvature,rhs,
+            penalty,lower,upper,output,diagnostics,regional_diagnostics,regional_bounds,active_state);
         return 0;
     } catch(const std::exception& error) {
         std::snprintf(last_error,sizeof(last_error),"%s",error.what());

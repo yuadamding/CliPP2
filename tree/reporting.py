@@ -11,13 +11,15 @@ import numpy as np
 import pandas as pd
 from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 
-from ..kernel import ALGORITHM, SCORE_DEFINITION
+from ..kernel import ALGORITHM
+from ..kernel.objectives import score_definition_for
+from ..kernel.assignment import assignment_audit
 from ..kernel.topology import partition_from_cuts
 from .selection import _TreeRefit
 
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
-OUTPUT_SCHEMA_VERSION = 11
+OUTPUT_SCHEMA_VERSION = 12
 
 
 def _regional_zero_audit(model, labels, centers, clonal, observed):
@@ -105,13 +107,13 @@ def independent_log_columns(model, centers):
 
 
 def verify_selected(model, result):
-    """Audit the scored fit and distinguish its three likelihood summaries.
-
-    The historical ``conditional_log_likelihood`` is the hard-partition read
-    likelihood, not the mixture conditioned on assignment validity. The latter
-    is a diagnostic at the same fitted weights, never the selection objective.
-    """
+    """Independently reproduce the declared objective and original memberships."""
     fit = result.selected.fit
+    objective = model.selection_objective
+    score_definition = score_definition_for(objective)
+    if (fit.selection_objective != objective
+            or fit.diagnostics.get('score_definition') != score_definition):
+        raise ValueError('Selected fit has an incompatible statistical objective identity')
     labels = np.asarray(fit.labels)
     centers, weights = np.asarray(fit.centers), np.asarray(fit.weights)
     q = len(centers)
@@ -164,18 +166,32 @@ def verify_selected(model, result):
     weight_score = (kernel / mass[:, None] / model.n).sum(axis=0)
     weight_gap = model.n * max(0.0, float(weight_score.max()-1.))
     active_gap = float(weight_score.max()-weight_score.min())
-    # Same inherited criterion, allowing only floating-reduction roundoff.
-    roundoff = 64*np.finfo(float).eps
-    if weight_gap > model.n*(1e-8+roundoff) or active_gap > 1e-8+roundoff:
-        raise ValueError('Independent mixture-weight optimality check failed')
+    counts = np.bincount(labels, minlength=q)
+    count_term = math.fsum(counts*np.log(counts/model.n))
+    if objective == 'legacy_mixture':
+        # Same inherited criterion, allowing only floating-reduction roundoff.
+        roundoff = 64*np.finfo(float).eps
+        if weight_gap > model.n*(1e-8+roundoff) or active_gap > 1e-8+roundoff:
+            raise ValueError('Independent mixture-weight optimality check failed')
+    else:
+        if not np.allclose(weights, counts/model.n, atol=1e-14, rtol=0):
+            raise ValueError('Classification proportions must equal occupied cluster counts/N')
+        weight_gap = active_gap = None
     conditional = math.fsum(columns[np.arange(model.n), labels])
     mixture = float(logsumexp(columns + np.log(weights), axis=1).sum())
     penalty = (q-1)*(model.r+1)*math.log(model.n)
-    score = -2*mixture+penalty
-    for name, actual, expected in (
+    selection_ll = (mixture if objective == 'legacy_mixture' else
+                    conditional + (count_term if objective == 'classification' else 0.))
+    score = -2*selection_ll+penalty
+    comparisons = [
         ('conditional likelihood', conditional, fit.conditional_log_likelihood),
-        ('joint mixture likelihood', mixture, fit.mixture_log_likelihood),
-        ('complexity penalty', penalty, fit.complexity_penalty), ('score', score, fit.score)):
+        ('selection likelihood', selection_ll, fit.selection_log_likelihood),
+        ('complexity penalty', penalty, fit.complexity_penalty), ('score', score, fit.score)]
+    if objective == 'legacy_mixture':
+        comparisons.append(('joint mixture likelihood', mixture, fit.mixture_log_likelihood))
+    else:
+        comparisons.append(('classification count term', count_term, fit.classification_count_term))
+    for name, actual, expected in comparisons:
         if not np.isfinite(actual) or not np.isclose(actual, expected, atol=1e-7, rtol=1e-10):
             raise ValueError(f'Independent verification disagrees on {name}: {actual} != {expected}')
     bank_scores = [float(candidate['bic']) for candidate in result.candidate_bank
@@ -192,6 +208,9 @@ def verify_selected(model, result):
             if candidate.get('status') != 'scored' or candidate.get('publication_eligible') is not True:
                 continue
             parameters = json.loads(candidate['partition_parameters'])
+            if (parameters.get('selection_objective') != objective
+                    or parameters.get('score_definition') != score_definition):
+                raise ValueError('Scalar candidate bank mixes statistical objectives')
             fixed = parameters['clonal_cluster']
             record_fixed = candidate.get('clonal_cluster')
             cp = np.asarray(parameters['centers'], dtype=float)
@@ -227,6 +246,9 @@ def verify_selected(model, result):
                     np.searchsorted(boundaries, np.arange(model.n), side='right')])
         elif candidate.fit.eligible:
             fitted = candidate.fit
+            if (fitted.selection_objective != objective
+                    or fitted.diagnostics.get('score_definition') != score_definition):
+                raise ValueError('Candidate bank mixes statistical objectives')
             if zero_audit['regional_zero_policy'] == 'strict' and zero_audit['observed_zero_cells']:
                 support = fitted.diagnostics
                 if (support.get('regional_zero_policy') != 'strict'
@@ -267,16 +289,41 @@ def verify_selected(model, result):
     if not retained:
         raise ValueError('Selected fitted state is absent from the complete candidate bank')
     validity = float(np.log(allowed @ weights).sum())
+    ix = np.ix_(model.active_indices, model.region_indices)
+    alt = np.asarray(model.data.alt_counts)[ix]
+    hard_zero = observed & (alt == 0) if model.regional_zero_policy == 'strict' else np.zeros_like(observed)
+    assignment = assignment_audit(columns, labels, centers, weights, observed,
+                                   hard_zero, observed & (alt > 0), clonal,
+                                   model.mutation_ids, objective=objective)
+    ranked = np.argsort(-np.linalg.norm(centers, axis=1), kind='stable')
+    public_order = np.r_[clonal, ranked[ranked != clonal]]
+    public_mapping = np.empty(q, dtype=int)
+    public_mapping[public_order] = np.arange(q)
+    assignment['cluster_label_domain'] = 'internal_fit_labels'
+    assignment['internal_to_public_cluster_labels'] = public_mapping.tolist()
+    anchoring = {name: fit.diagnostics.get(name) for name in (
+        'anchoring_loss', 'anchoring_loss_available', 'anchoring_loss_unavailable_reason', 'free_block_log_likelihoods',
+        'clonal_block_log_likelihoods', 'anchor_scoring')}
+    anchoring.update(cluster_label_domain='internal_fit_labels',
+                     interpretation='conditional_block_refit_diagnostic_not_a_global_optimality_certificate')
     return {**zero_audit, 'independently_verified': True, 'conditional_log_likelihood': conditional,
             'membership_kind': kind,
             'connected_on_proposal_tree': len(cuts)+result.tree.component_count == q,
             'hard_partition_log_likelihood': conditional,
             'mixture_log_likelihood': mixture, 'complexity_penalty': penalty, 'score': score,
-            'score_definition': SCORE_DEFINITION,
+            'score_definition': score_definition, 'selection_objective': objective,
+            'selection_log_likelihood': selection_ll,
+            'classification_log_likelihood': conditional+count_term,
+            'classification_count_term': count_term,
+            'proportions_definition': ('optimized_mixture_weights' if objective == 'legacy_mixture'
+                                       else 'occupied_cluster_counts_over_N'),
+            'assignment_diagnostics': assignment,
+            'selected_anchor_diagnostics': anchoring,
             'forbidden_assignment_pairs': int((~allowed).sum()),
             'assignment_validity_log_probability': validity,
             'validity_conditioned_mixture_log_likelihood': mixture-validity,
             'weight_optimality_gap': weight_gap, 'weight_active_score_gap': active_gap,
+            'mixture_weight_optimization': ('verified' if objective == 'legacy_mixture' else 'not_applicable'),
             'complete_candidate_bank_reconciled': True,
             'num_parameters': (q-1)*(model.r+1), 'num_mutation_vectors': model.n,
             'clonal_cluster': int(clonal), 'occupied_exact_clonal_center_verified': True,

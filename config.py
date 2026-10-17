@@ -19,13 +19,16 @@ class SearchPolicy:
     """Search allowances change coverage, never the statistical scoring rule."""
     mode: str = 'auto'
     width: int = 16
-    proposals_per_state: int = 4
+    proposals_per_state: int = 5
     sweeps: int = 2
+    reassignment_starts: int = 4
+    reassignment_rounds: int = 2
 
     def __post_init__(self):
         if self.mode not in ('auto', 'exhaustive', 'bounded'):
             raise ValueError('search_policy must be auto, exhaustive or bounded')
-        for name in ('width', 'proposals_per_state', 'sweeps'):
+        for name in ('width', 'proposals_per_state', 'sweeps',
+                     'reassignment_starts', 'reassignment_rounds'):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f'Search {name} must be a positive integer')
@@ -44,7 +47,8 @@ class SearchPolicy:
                     and not active_hard_zero else 'bounded')
         if mode == 'exhaustive' and max_clusters > EXHAUSTIVE_MAX_CLUSTERS:
             raise ValueError(f'Exhaustive search is restricted to max_clusters <= {EXHAUSTIVE_MAX_CLUSTERS}')
-        return SearchPolicy(mode, self.width, self.proposals_per_state, self.sweeps)
+        return SearchPolicy(mode, self.width, self.proposals_per_state, self.sweeps,
+                            self.reassignment_starts, self.reassignment_rounds)
 
 
 def validate_budget(value, name):
@@ -72,16 +76,29 @@ class FitConfig:
     vram_budget_gib: float = 0.0
     search_policy: str = 'auto'
     search_width: int = 16
-    search_proposals: int = 4
+    search_proposals: int = 5
     search_sweeps: int = 2
     qualify_device_weights: bool = False
     regional_zero_policy: str = 'strict'
+    selection_objective: str = 'classification'
+    reassignment_starts: int = 4
+    reassignment_rounds: int = 2
+    numerical_diagnostics_dir: str | None = None
+    numerical_diagnostics_max_bytes: int = 16_777_216
 
     def __post_init__(self) -> None:
         if self.device not in ("cpu", "cuda"):
             raise ValueError("device must be cpu or cuda.")
         if self.regional_zero_policy not in ('strict', 'likelihood'):
             raise ValueError('regional_zero_policy must be strict or likelihood')
+        if self.selection_objective not in ('classification', 'assigned_reads', 'legacy_mixture'):
+            raise ValueError('selection_objective must be classification, assigned_reads or legacy_mixture')
+        if (self.numerical_diagnostics_dir is not None
+                and (not isinstance(self.numerical_diagnostics_dir, str)
+                     or not self.numerical_diagnostics_dir.strip())):
+            raise ValueError('numerical_diagnostics_dir must be a nonempty path string or None')
+        if type(self.numerical_diagnostics_max_bytes) is not int or self.numerical_diagnostics_max_bytes < 1:
+            raise ValueError('numerical_diagnostics_max_bytes must be a positive integer')
         if not isinstance(self.verbose, bool):
             raise TypeError("verbose must be a boolean.")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
@@ -94,10 +111,13 @@ class FitConfig:
             raise ValueError('qualify_device_weights must be a boolean')
         if self.qualify_device_weights and (self.device != 'cuda' or self.vram_budget_gib == 0):
             raise ValueError('Device weight qualification requires CUDA and a positive VRAM budget')
+        if self.qualify_device_weights and self.selection_objective != 'legacy_mixture':
+            raise ValueError('Device mixture-weight qualification requires selection_objective=legacy_mixture')
 
     def resolved_search(self, *, active_hard_zero=False):
         return SearchPolicy(self.search_policy, self.search_width,
-                            self.search_proposals, self.search_sweeps).resolve(
+                            self.search_proposals, self.search_sweeps,
+                            self.reassignment_starts, self.reassignment_rounds).resolve(
                                 self.max_clusters, active_hard_zero=active_hard_zero)
 
 
@@ -107,9 +127,13 @@ def resolve_fit_config(
     max_clusters: int = DEFAULT_MAX_CLUSTERS,
     ram_budget_gib: float = 1.0, vram_budget_gib: float = 0.0,
     search_policy: str = 'auto', search_width: int = 16,
-    search_proposals: int = 4, search_sweeps: int = 2,
+    search_proposals: int = 5, search_sweeps: int = 2,
     qualify_device_weights: bool = False,
     regional_zero_policy: str = 'strict',
+    selection_objective: str = 'classification',
+    reassignment_starts: int = 4, reassignment_rounds: int = 2,
+    numerical_diagnostics_dir: str | None = None,
+    numerical_diagnostics_max_bytes: int = 16_777_216,
 ) -> FitConfig:
     """Construct the only public fit configuration; removed knobs raise TypeError."""
     return FitConfig(device=device, verbose=verbose, max_major_cn=max_major_cn,
@@ -117,7 +141,10 @@ def resolve_fit_config(
                      vram_budget_gib=vram_budget_gib, search_policy=search_policy,
                      search_width=search_width, search_proposals=search_proposals,
                      search_sweeps=search_sweeps, qualify_device_weights=qualify_device_weights,
-                     regional_zero_policy=regional_zero_policy)
+                     regional_zero_policy=regional_zero_policy, selection_objective=selection_objective,
+                     reassignment_starts=reassignment_starts, reassignment_rounds=reassignment_rounds,
+                     numerical_diagnostics_dir=numerical_diagnostics_dir,
+                     numerical_diagnostics_max_bytes=numerical_diagnostics_max_bytes)
 
 
 __all__ = ["FitConfig", "resolve_fit_config"]

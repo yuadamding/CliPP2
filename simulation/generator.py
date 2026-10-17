@@ -9,7 +9,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..io.tumor_txt import CN_FILTER_POLICY_ID, TUMOR_TXT_SCHEMA, write_tumor_txt
+from ..io.tumor_txt import (
+    CN_FILTER_POLICY_ID, TUMOR_TXT_SCHEMA, _safe_tumor_id, write_tumor_txt,
+)
 from .config import (
     TumorSimulationConfig,
     MAX_SIMULATION_ALLELE_CN,
@@ -120,13 +122,7 @@ def _write_patient_simulation(
     min_clone_ccf_distance = 0.10
     if not 0.0 < float(simu_purity) < 1.0:
         raise ValueError("simu_purity must lie strictly between zero and one.")
-    directory_name = str(config.tumor_id).strip()
-    if (
-        not directory_name
-        or directory_name in {".", ".."}
-        or Path(directory_name).name != directory_name
-    ):
-        raise ValueError("tumor_id must be one nonempty directory name.")
+    directory_name = _safe_tumor_id(config.tumor_id)
     data_dir = out_dir / directory_name
     if data_dir.exists():
         raise FileExistsError(f"Refusing to overwrite existing tumor: {data_dir}")
@@ -188,10 +184,15 @@ def _write_patient_simulation(
         segments,
         random_state=streams["seed_mutation_segments"],
     )
-    data_dir.mkdir(parents=True, exist_ok=True)
+    # Exclusive creation also protects a concurrent generator that won the race
+    # after the early existence check; never merge two writers' truth bundles.
+    data_dir.mkdir(parents=True, exist_ok=False)
     region_labels = tuple(f"region{j + 1}" for j in range(n_samples))
     for region_id in region_labels:
         (data_dir / region_id).mkdir(parents=True, exist_ok=True)
+
+    def write_truth(name, columns):
+        pd.DataFrame(columns).to_csv(data_dir / name, sep="\t", index=False)
 
     mutation_id_width = max(3, len(str(no_mutations)))
     mutation_ids = np.asarray(
@@ -201,105 +202,77 @@ def _write_patient_simulation(
         ],
         dtype=object,
     )
-    pd.DataFrame(
-        {
-            "mutation_id": mutation_ids,
-            "cluster_id": cluster_id,
-        }
-    ).to_csv(data_dir / "truth.txt", sep="\t", index=False)
-    pd.DataFrame(
-        {"clone_id": np.arange(K, dtype=int), "ccf": ccf_patient_clones}
-    ).to_csv(data_dir / "truth_clone_patient.txt", sep="\t", index=False)
-    pd.DataFrame(
-        {
-            "clone_id": np.arange(K, dtype=int),
-            "lambda": exclusive_clone_fraction_patient,
-        }
-    ).to_csv(data_dir / "truth_lambda.txt", sep="\t", index=False)
-    pd.DataFrame(
-        {
-            "lineage_id": np.arange(len(lineages), dtype=int),
-            "terminal_clone_id": lineage_terminals,
-            "ccf": ccf_patient_lineage,
-        }
-    ).to_csv(data_dir / "truth_lineage_patient.txt", sep="\t", index=False)
-    pd.DataFrame(
-        {
-            "mutation_id": mutation_ids,
-            "cluster_id": cluster_id,
-            "ccf": ccf_patient_clones[cluster_id],
-        }
-    ).to_csv(data_dir / "truth_cp_patient.txt", sep="\t", index=False)
+    write_truth("truth.txt", {"mutation_id": mutation_ids, "cluster_id": cluster_id})
+    write_truth("truth_clone_patient.txt", {
+        "clone_id": np.arange(K, dtype=int), "ccf": ccf_patient_clones,
+    })
+    write_truth("truth_lambda.txt", {
+        "clone_id": np.arange(K, dtype=int), "lambda": exclusive_clone_fraction_patient,
+    })
+    write_truth("truth_lineage_patient.txt", {
+        "lineage_id": np.arange(len(lineages), dtype=int),
+        "terminal_clone_id": lineage_terminals,
+        "ccf": ccf_patient_lineage,
+    })
+    write_truth("truth_cp_patient.txt", {
+        "mutation_id": mutation_ids,
+        "cluster_id": cluster_id,
+        "ccf": ccf_patient_clones[cluster_id],
+    })
     parent = np.asarray(sim_tree["parent"], dtype=int)
-    pd.DataFrame(
-        {
-            "clone_id": np.arange(K, dtype=int),
-            "parent_clone_id": parent,
-            "exclusive_fraction_patient": exclusive_clone_fraction_patient,
-            "ccf_patient": ccf_patient_clones,
-        }
-    ).to_csv(data_dir / "truth_clone_tree.tsv", sep="\t", index=False)
+    write_truth("truth_clone_tree.tsv", {
+        "clone_id": np.arange(K, dtype=int),
+        "parent_clone_id": parent,
+        "exclusive_fraction_patient": exclusive_clone_fraction_patient,
+        "ccf_patient": ccf_patient_clones,
+    })
 
     clone_ids = np.repeat(np.arange(K, dtype=int), n_samples)
     sample_ids = np.tile(np.arange(n_samples, dtype=int), K)
-    pd.DataFrame(
-        {
-            "clone_id": clone_ids,
-            "sample_id": sample_ids,
-            "ccf": ccf_samples_clones.reshape(-1),
-        }
-    ).to_csv(data_dir / "truth_clone_sample.txt", sep="\t", index=False)
-    pd.DataFrame(
-        {
-            "sample_id": sample_ids,
-            "clone_id": clone_ids,
-            "exclusive_fraction": exclusive_clone_fraction_samples.reshape(-1),
-            "cumulative_ccf": ccf_samples_clones.reshape(-1),
-        }
-    ).to_csv(data_dir / "truth_clone_fraction_sample.tsv", sep="\t", index=False)
+    write_truth("truth_clone_sample.txt", {
+        "clone_id": clone_ids,
+        "sample_id": sample_ids,
+        "ccf": ccf_samples_clones.reshape(-1),
+    })
+    write_truth("truth_clone_fraction_sample.tsv", {
+        "sample_id": sample_ids,
+        "clone_id": clone_ids,
+        "exclusive_fraction": exclusive_clone_fraction_samples.reshape(-1),
+        "cumulative_ccf": ccf_samples_clones.reshape(-1),
+    })
 
     L_count = len(lineages)
     lineage_ids = np.repeat(np.arange(L_count, dtype=int), n_samples)
     sample_ids_L = np.tile(np.arange(n_samples, dtype=int), L_count)
-    pd.DataFrame(
-        {
-            "lineage_id": lineage_ids,
-            "sample_id": sample_ids_L,
-            "ccf": ccf_samples_lineage.reshape(-1),
-        }
-    ).to_csv(data_dir / "truth_lineage_sample.txt", sep="\t", index=False)
+    write_truth("truth_lineage_sample.txt", {
+        "lineage_id": lineage_ids,
+        "sample_id": sample_ids_L,
+        "ccf": ccf_samples_lineage.reshape(-1),
+    })
 
     sample_targets = np.full(n_samples, float(simu_purity), dtype=float)
     alpha_p = sample_targets * purity_conc
     beta_p = (1.0 - sample_targets) * purity_conc
     sample_purities = streams["seed_purity"].beta(alpha_p, beta_p)
-    pd.DataFrame(
-        {
-            "sample_id": np.arange(n_samples, dtype=int),
-            "tau_lineage": tau_vec,
-        }
-    ).to_csv(data_dir / "truth_region_parameters.tsv", sep="\t", index=False)
+    write_truth("truth_region_parameters.tsv", {
+        "sample_id": np.arange(n_samples, dtype=int), "tau_lineage": tau_vec,
+    })
 
     mutation_chromosome = np.asarray(
         [segments[int(segment_id)].chromosome for segment_id in mutation_segment],
         dtype=int,
     )
-    pd.DataFrame(
-        {
-            "mutation_id": mutation_ids,
-            "origin_clone_id": cluster_id,
-            "segment_id": mutation_segment,
-        }
-    ).to_csv(data_dir / "truth_mutation_history.tsv", sep="\t", index=False)
-
-    pd.DataFrame(
-        {
-            "mutation_id": mutation_ids,
-            "segment_id": mutation_segment,
-            "chromosome": mutation_chromosome,
-            "position": mutation_position,
-        }
-    ).to_csv(data_dir / "truth_mutation_segments.tsv", sep="\t", index=False)
+    write_truth("truth_mutation_history.tsv", {
+        "mutation_id": mutation_ids,
+        "origin_clone_id": cluster_id,
+        "segment_id": mutation_segment,
+    })
+    write_truth("truth_mutation_segments.tsv", {
+        "mutation_id": mutation_ids,
+        "segment_id": mutation_segment,
+        "chromosome": mutation_chromosome,
+        "position": mutation_position,
+    })
 
     truth_mutation_sample_tables: list[pd.DataFrame] = []
     canonical_observation_tables: list[pd.DataFrame] = []
@@ -327,11 +300,11 @@ def _write_patient_simulation(
         if j == 0:
             # Factorized dosage truth: shared carriers times regional multiplicity.
             # Avoid an unnecessary mutation x clone x region output table.
-            pd.DataFrame({
+            write_truth("truth_mutation_carriers.tsv", {
                 "mutation_id": np.repeat(mutation_ids, K),
                 "clone_id": np.tile(np.arange(K, dtype=int), no_mutations),
                 "carrier": evolution.mutation_carrier.reshape(-1).astype(int),
-            }).to_csv(data_dir / "truth_mutation_carriers.tsv", sep="\t", index=False)
+            })
         local_state_table = _local_cn_state_table(
             sample_id=j,
             profile=evolution.clone_allele_cn[0],
@@ -381,14 +354,12 @@ def _write_patient_simulation(
             )
         )
 
-        pd.DataFrame(
-            {
-                "mutation_id": mutation_ids,
-                "cluster_id": cluster_id,
-                "ccf": mutation_ccf_sample_j,
-                "sample_id": j,
-            }
-        ).to_csv(data_dir / region_id / "truth_cp.txt", sep="\t", index=False)
+        write_truth(f"{region_id}/truth_cp.txt", {
+            "mutation_id": mutation_ids,
+            "cluster_id": cluster_id,
+            "ccf": mutation_ccf_sample_j,
+            "sample_id": j,
+        })
         truth_mutation_sample_tables.append(
             pd.DataFrame(
                 {

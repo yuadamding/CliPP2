@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields
 import math
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from ._version import __version__
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="clipp2", allow_abbrev=False,
-        description="Fit the occupied-clonal tree-proposed joint-region multiplicity-mixture estimator.",
+        description="Fit the occupied-clonal joint-region penalized classification estimator.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=__version__)
@@ -26,7 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
     fit.add_argument('--regional-zero-policy', choices=['strict', 'likelihood'], default='strict',
                      help='Strict: observed zero-alt positive-depth cells require exact-zero assigned CCF; '
-                          'likelihood: retain the defea419 estimator without this constraint.')
+                          'likelihood: use zero-ALT observations in the read likelihood without this constraint.')
+    fit.add_argument('--selection-objective',
+                     choices=['classification', 'assigned_reads', 'legacy_mixture'], default='classification',
+                     help='Classification: assigned reads plus occupied-count proportions and nominal penalty; '
+                          'assigned_reads omits the count term; legacy_mixture explicitly restores mixture scoring.')
     fit.add_argument(
         "--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN,
         help="Exclude a mutation from all regions if any CN state's major CN in any region exceeds this limit.",
@@ -41,10 +46,22 @@ def build_parser() -> argparse.ArgumentParser:
                           'or K>10; otherwise reference search.')
     fit.add_argument('--search-width', type=int, default=16,
                      help='Active anchored states per occupied cluster count in bounded search.')
-    fit.add_argument('--search-proposals', type=int, default=4,
-                     help='Structural proposals per active state per sweep in bounded search.')
+    fit.add_argument('--search-proposals', type=int, default=5,
+                     help='Move-family slots per active state per sweep in bounded search; '
+                          'five covers merge, split, boundary, single and greedy batch.')
     fit.add_argument('--search-sweeps', type=int, default=2,
                      help='Bounded exploration sweeps (downward then upward, alternating).')
+    fit.add_argument('--reassignment-starts', type=int, default=4,
+                     help='Starting states for exhaustive-route fixed-K polishing; bounded mode uses its sweep schedule.')
+    fit.add_argument('--reassignment-rounds', type=int, default=2,
+                     help='Maximum exhaustive-route polishing rounds per start; bounded mode uses its sweep schedule. '
+                          'Hitting a budget is not convergence.')
+    fit.add_argument('--checkpoint-path', help='JSON search checkpoint path for bounded search.')
+    fit.add_argument('--resume', action='store_true', help='Resume a source/model/input-bound bounded-search checkpoint.')
+    fit.add_argument('--numerical-diagnostics-dir',
+                     help='Opt-in directory for bounded frozen first/worst QP failure snapshots.')
+    fit.add_argument('--numerical-diagnostics-max-bytes', type=int, default=16_777_216,
+                     help='Maximum total failure-snapshot payload bytes.')
     fit.add_argument('--qualify-device-weights', action='store_true',
                      help='Compare experimental batched CUDA weights with authoritative CPU fits (extra work).')
     fit.add_argument("--max-clusters", type=int, choices=range(1, MAX_CLUSTERS + 1),
@@ -59,19 +76,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     try:
         _fit_config_from_args(args)
+        if args.resume and not args.checkpoint_path:
+            raise ValueError('--resume requires --checkpoint-path')
+        if args.checkpoint_path and args.search_policy != 'bounded':
+            raise ValueError('--checkpoint-path requires --search-policy bounded')
     except ValueError as error:
         parser.error(str(error))
     return args
 
 
 def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
-    return resolve_fit_config(device=args.device, verbose=args.verbose,
-                              max_major_cn=args.max_major_cn, max_clusters=args.max_clusters,
-                              ram_budget_gib=args.ram_budget_gib, vram_budget_gib=args.vram_budget_gib,
-                              search_policy=args.search_policy, search_width=args.search_width,
-                              search_proposals=args.search_proposals, search_sweeps=args.search_sweeps,
-                              qualify_device_weights=args.qualify_device_weights,
-                              regional_zero_policy=args.regional_zero_policy)
+    return resolve_fit_config(**{field.name: getattr(args, field.name) for field in fields(FitConfig)})
 
 
 def _printable_summary(value: object) -> object:
@@ -103,6 +118,7 @@ def main(argv: list[str] | None = None) -> None:
         tumor_file=Path(args.input_file),
         outdir=Path(args.outdir),
         fit_config=_fit_config_from_args(args),
+        checkpoint_path=args.checkpoint_path, resume=args.resume,
     )
     print(_printable_summary(summary))
 

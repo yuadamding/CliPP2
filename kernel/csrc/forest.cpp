@@ -5,6 +5,9 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <algorithm>
+#include <cstdint>
+#include <string>
 
 namespace clipp2kernel {
 namespace {
@@ -59,7 +62,8 @@ void free_forest(const std::vector<double>& curvature,const std::vector<double>&
 
 void solve_forest(int n,int regions,int edge_count,const int* edges,
     const double* curvature,const double* rhs,double penalty,
-    const double* lower,const double* upper,double* output,int* diagnostics) {
+    const double* lower,const double* upper,double* output,int* diagnostics,
+    int* regional_diagnostics,double* regional_bounds,int* active_state) {
     if(n<1 || regions<1 || edge_count<0 || edge_count>n-1)
         throw std::invalid_argument("Forest requires positive N,R and 0<=E<N");
     if(!curvature || !rhs || !lower || !upper || !output || !diagnostics || (edge_count && !edges))
@@ -97,6 +101,10 @@ void solve_forest(int n,int regions,int edge_count,const int* edges,
     std::vector<long double> gradient(n),delta(edge_count);
     const long double rho=penalty;
     for(int region=0;region<regions;++region) {
+        int region_sweeps=0,changes=0,repeated=0;
+        double encountered_violation=0.0;
+        // Bounded diagnostic ring, not an active-set admission heuristic.
+        std::vector<std::uint64_t> configurations;
         for(int i=0;i<n;++i) {
             const auto cell=static_cast<std::size_t>(i)*regions+region;
             h[i]=curvature[cell];b[i]=rhs[cell];lo[i]=lower[cell];hi[i]=upper[cell];
@@ -105,11 +113,19 @@ void solve_forest(int n,int regions,int edge_count,const int* edges,
         bool finished=false;
         for(long long sweep=0;sweep<2LL*n+64;++sweep) {
             ++sweeps;
+            ++region_sweeps;
+            std::uint64_t signature=1469598103934665603ULL;
+            for(int state:active) signature=(signature^std::uint64_t(state+2))*1099511628211ULL;
+            repeated+=std::find(configurations.begin(),configurations.end(),signature)!=configurations.end();
+            if(configurations.size()<64) configurations.push_back(signature);
+            else configurations[static_cast<std::size_t>(sweep)%64]=signature;
             free_forest(h,b,adjacency,active,x,penalty);
             bool bounded=false;
             for(int i=0;i<n;++i) {
-                if(!active[i] && x[i]<lo[i]) {x[i]=lo[i];active[i]=-1;bounded=true;}
-                else if(!active[i] && x[i]>hi[i]) {x[i]=hi[i];active[i]=1;bounded=true;}
+                if(!std::isfinite(x[i])) throw std::runtime_error("Nonfinite forest iterate at region="+std::to_string(region)+", node="+std::to_string(i));
+                encountered_violation=std::max({encountered_violation,lo[i]-x[i],x[i]-hi[i]});
+                if(!active[i] && x[i]<lo[i]) {x[i]=lo[i];active[i]=-1;bounded=true;++changes;}
+                else if(!active[i] && x[i]>hi[i]) {x[i]=hi[i];active[i]=1;bounded=true;++changes;}
             }
             if(bounded) continue;
             for(int i=0;i<n;++i) gradient[i]=static_cast<long double>(h[i])*x[i]-b[i];
@@ -129,13 +145,27 @@ void solve_forest(int n,int regions,int edge_count,const int* edges,
             }
             if(largest<=1e-9) {finished=true;break;}
             active[release]=0;
+            ++changes;
         }
         budget_hits+=!finished;
+        double preclip_violation=0.0;
         for(int i=0;i<n;++i) {
             if(!std::isfinite(x[i])) throw std::runtime_error("Nonfinite forest quadratic iterate");
+            preclip_violation=std::max({preclip_violation,lo[i]-x[i],x[i]-hi[i]});
+            if(active_state) active_state[static_cast<std::size_t>(i)*regions+region]=active[i];
             if(x[i]<lo[i]) x[i]=lo[i];
             if(x[i]>hi[i]) x[i]=hi[i];
             output[static_cast<std::size_t>(i)*regions+region]=x[i];
+        }
+        if(regional_diagnostics) {
+            regional_diagnostics[4*region]=region_sweeps;
+            regional_diagnostics[4*region+1]=changes;
+            regional_diagnostics[4*region+2]=repeated;
+            regional_diagnostics[4*region+3]=!finished;
+        }
+        if(regional_bounds) {
+            regional_bounds[2*region]=preclip_violation;
+            regional_bounds[2*region+1]=encountered_violation;
         }
     }
     if(sweeps>std::numeric_limits<int>::max())

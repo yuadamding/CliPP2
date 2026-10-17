@@ -69,18 +69,20 @@ class MultiplicityModel:
             raise ValueError("Multiplicity posterior is undefined at zero likelihood")
         return np.exp(kernel - normalizer[:, None])
 
+    def grid_columns(self, grid):
+        """Per-mutation CP-grid emissions, preserving padded support width."""
+        p = np.minimum(1.0, grid[:, None, None] * self.scale[None, :, :])
+        kernel = (
+            xlogy(self.r[None, :, None], p)
+            + xlog1py((self.n - self.r)[None, :, None], -p)
+            + self.log_constant[None, :, None]
+        )
+        return logsumexp(np.where(self.valid[None, :, :], kernel, -np.inf), axis=2)
+
     def grid_log_likelihood(self, grid):
         """Evaluate center proposals in bounded-memory batches."""
         result = np.empty(len(grid))
         batch = max(1, min(32, 1_000_000 // max(1, self.valid.size)))
         for start in range(0, len(grid), batch):
-            cp = grid[start : start + batch]
-            p = np.minimum(1.0, cp[:, None, None] * self.scale[None, :, :])
-            kernel = (
-                xlogy(self.r[None, :, None], p)
-                + xlog1py((self.n - self.r)[None, :, None], -p)
-                + self.log_constant[None, :, None]
-            )
-            kernel = np.where(self.valid[None, :, :], kernel, -np.inf)
-            result[start : start + batch] = logsumexp(kernel, axis=2).sum(axis=1)
+            result[start : start + batch] = self.grid_columns(grid[start : start + batch]).sum(axis=1)
         return result

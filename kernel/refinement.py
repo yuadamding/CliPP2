@@ -1,8 +1,11 @@
-"""Conditional likelihood refinement on one frozen chain.
+"""Read-likelihood boundary proposals on one frozen chain.
 
 Only boundaries move. Component visits follow the supplied partition, including
 nonmonotone CP sequences. No mixture weights or unconstrained MAP assignments
-enter this conditional objective; the caller retains responsibility for BIC.
+enter the dynamic-program proposal objective. Under assigned/classification
+selection, authoritative refitted scores govern path advancement; the read-DP
+is explicitly not an exact classification optimizer. Legacy paths retain their
+conditional-likelihood admission rule.
 """
 
 import math
@@ -111,15 +114,16 @@ def polish_chain_partition(
     model, result, chain_order, refit, max_iterations=100, mean_loglik_tolerance=1e-10,
     *, column_evaluator=None,
 ):
-    """Alternate exact conditional boundaries and caller-supplied block refits.
+    """Propose read-optimal conditional boundaries and refit occupied blocks.
 
     ``refit(labels, centers)`` receives labels in original mutation-row order
     and initial centers in chain-visit order. It returns a result dictionary
     containing ``labels``, ``centers`` and ``clonal_cluster``. It may merge
     adjacent blocks, but cannot add or move boundaries itself. The returned
-    result is the best conditional-likelihood candidate, with scalar-only
-    iteration history. A finite iteration budget or a local fixed point is
-    explicitly distinguished from global constrained optimality.
+    Legacy mode returns the best conditional-likelihood path candidate. New
+    objectives accept only improvements in the supplied authoritative score;
+    all evaluated variants are retained by the caller. A finite iteration budget
+    or a read-proposal fixed point is not a classification/global certificate.
     """
     if (
         not isinstance(max_iterations, (int, np.integer))
@@ -139,6 +143,12 @@ def polish_chain_partition(
         raise ValueError("Frozen chain order must be a permutation of original rows")
     order = order.astype(np.int64)
     current = result
+    objective = current.get("selection_objective", getattr(model, "selection_objective", "legacy_mixture"))
+    use_selection_score = objective != "legacy_mixture"
+    selection_score = float(current["bic"]) if use_selection_score else None
+    if use_selection_score and not np.isfinite(selection_score):
+        raise ValueError("Assigned-objective refinement requires a finite authoritative score")
+    initial_selection_score = selection_score
     _, cuts, kernel, score = _partition_state(model, current, order, column_evaluator)
     initial_score, initial_q = score, kernel.shape[1]
     best, best_score = current, score
@@ -156,11 +166,14 @@ def polish_chain_partition(
             "previous_conditional_log_likelihood": score,
             "fixed_center_conditional_log_likelihood": fixed_score,
             "boundaries_changed": not np.array_equal(proposal["cuts"], cuts),
+            "selection_objective": objective,
+            "previous_selection_score": selection_score,
         }
         if not entry["boundaries_changed"]:
             entry["status"] = "fixed_center_boundaries_stable"
             history.append(entry)
-            status = entry["status"]
+            status = ("read_proposal_boundaries_stable" if use_selection_score else entry["status"])
+            entry["status"] = status
             break
         labels = np.empty(n, dtype=np.int64)
         labels[order] = proposal["labels"]
@@ -177,27 +190,53 @@ def polish_chain_partition(
             raise ValueError("Refit may only preserve boundaries or merge adjacent blocks")
         roundoff = 64 * np.finfo(float).eps * max(1.0, abs(fixed_score), abs(new_score))
         entry.update(refit_conditional_log_likelihood=new_score, refit_num_clusters=new_kernel.shape[1])
-        if new_score < fixed_score - roundoff or new_score < score:
+        if use_selection_score:
+            if candidate.get("selection_objective") != objective:
+                raise ValueError("Boundary refit changed the declared selection objective")
+            new_selection_score = float(candidate["bic"])
+            if not np.isfinite(new_selection_score):
+                raise ValueError("Boundary refit returned a nonfinite authoritative score")
+            entry["refit_selection_score"] = new_selection_score
+            improvement = (selection_score-new_selection_score)/2.
+            tolerance = 64*np.finfo(float).eps*max(1., abs(selection_score), abs(new_selection_score))
+            if selection_score-new_selection_score <= tolerance:
+                entry["status"] = "selection_score_not_improved"
+                history.append(entry)
+                status = entry["status"]
+                break
+        elif new_score < fixed_score - roundoff or new_score < score:
             # A numerical scalar refit need not recover its supplied-center
             # witness. Keep the accepted incumbent instead of hiding a loss.
             entry["status"] = "refit_conditional_decrease"
             history.append(entry)
             status = entry["status"]
             break
-        improvement = new_score - score
-        entry.update(status="accepted", mean_loglik_improvement=improvement / n)
+        else:
+            improvement = new_score-score
+        entry["status"] = "accepted"
+        entry[("mean_selection_score_improvement_per_2_mutations" if use_selection_score
+               else "mean_loglik_improvement")] = improvement/n
         history.append(entry)
         current, cuts, kernel, score = candidate, new_cuts, new_kernel, new_score
-        if score > best_score or (score == best_score and len(current["centers"]) < len(best["centers"])):
+        if use_selection_score:
+            selection_score = new_selection_score
+            best, best_score = current, score
+        elif score > best_score or (score == best_score and len(current["centers"]) < len(best["centers"])):
             best, best_score = current, score
         if improvement / n <= mean_loglik_tolerance:
-            status = "conditional_improvement_tolerance"
+            status = "selection_improvement_tolerance" if use_selection_score else "conditional_improvement_tolerance"
             break
     return {
         "result": best,
         "history": history,
         "diagnostics": {
-            "method": "ordered_conditional_chain_boundary_refinement_v1",
+            "method": ("ordered_read_boundary_proposals_selected_score_refinement_v1" if use_selection_score
+                       else "ordered_conditional_chain_boundary_refinement_v1"),
+            "proposal_objective": "assigned_read_likelihood",
+            "path_acceptance_objective": objective if use_selection_score else "conditional_read_likelihood",
+            "classification_fixed_center_optimum_certified": False,
+            "initial_selection_score": initial_selection_score,
+            "selection_score": selection_score,
             "status": status,
             "iterations": len(history),
             "max_iterations": int(max_iterations),

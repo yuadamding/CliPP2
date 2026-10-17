@@ -16,7 +16,7 @@ from .initialization import pooled_cp_initialization
 from .likelihood import MultiplicityModel
 from .native import solve_chain
 from .selection import select_chain
-from .topology import build_tree, partition_from_cuts
+from .topology import FrozenTree, build_tree, partition_from_cuts
 
 
 def supports_scalar(model):
@@ -30,22 +30,27 @@ def supports_scalar(model):
             and bool(np.all(model.lower == 0)) and bool(np.all(model.upper == 1)))
 
 
-def fit_scalar(model, max_clusters=DEFAULT_MAX_CLUSTERS, *, coordinate_keys=None, search=None):
+def fit_scalar(model, max_clusters=DEFAULT_MAX_CLUSTERS, *, coordinate_keys=None, search=None,
+               checkpoint_path=None, resume=False, checkpoint_stop_after=None):
     if not supports_scalar(model):
         raise ValueError('Scalar kernel requires observed diploid-normal input without strict '
                          'regional zeros; use the shared support-aware fitting path')
     if type(max_clusters) is not int or not 1 <= max_clusters <= MAX_CLUSTERS:
         raise ValueError(f'max_clusters must be in 1..{MAX_CLUSTERS}')
     search = (SearchPolicy() if search is None else search).resolve(max_clusters)
+    if (checkpoint_path is not None or resume or checkpoint_stop_after is not None) and search.mode != 'bounded':
+        raise ValueError('Search checkpoints require explicit bounded search; no route is changed silently')
+    if resume and checkpoint_path is None:
+        raise ValueError('resume requires a checkpoint_path')
     model.check_clonal_feasibility(max_clusters)
     arrays = (model.alt[:, 0], model.depth[:, 0], model.major[:, 0], model.total[:, 0])
     purity = float(model.purity[0, 0])
     if not np.all(model.purity[:, 0] == purity):
         raise ValueError('Scalar kernel requires one regional purity')
     scalar = MultiplicityModel(*arrays, purity)
-    started = perf_counter()
-    pilot_cp, initialization = pooled_cp_initialization(scalar, **(
-        {'matrix_cache_bytes': model.memory.initialization_bytes} if model.memory else {}))
+    # A scientific objective must not change merely because dispatch selected
+    # the specialized one-region chain route.
+    scalar.selection_objective = model.selection_objective
     if coordinate_keys is None:
         chrom, position = np.array(model.mutation_ids), np.full(model.n, '')
         tie_policy = 'canonical_mutation_id_v1'
@@ -54,10 +59,33 @@ def fit_scalar(model, max_clusters=DEFAULT_MAX_CLUSTERS, *, coordinate_keys=None
         if chrom.shape != (model.n,) or position.shape != (model.n,):
             raise ValueError('Coordinate tie keys must follow the retained mutation order')
         tie_policy = 'chromosome_position_text_v1'
-    order = np.lexsort((position, chrom, pilot_cp))
-    pilot = (pilot_cp/purity)[:, None]
-    tree = build_tree(pilot, model.observed, model.mutation_ids, chain_order=order)
-    timings = {'initialization': perf_counter()-started}
+    saved = None
+    if resume:
+        from ..tree.checkpoint import read_checkpoint
+        saved = read_checkpoint(checkpoint_path, model)
+        context = saved.get('checkpoint_context')
+        if not context or 'scalar_pilot_cp' not in context:
+            raise ValueError('Scalar resume requires its exact native CP pilot and chain-order context')
+        pilot_cp, order = context['scalar_pilot_cp'], context['scalar_chain_order']
+        if (context['tie_policy'] != tie_policy
+                or not np.array_equal(order, np.lexsort((position, chrom, pilot_cp)))):
+            raise ValueError('Scalar checkpoint coordinate tie order changed')
+        pilot = saved['pilot']
+        tree = FrozenTree(**saved['tree'])
+        if tree.identity != build_tree(pilot, model.observed, model.mutation_ids, chain_order=order).identity:
+            raise ValueError('Scalar checkpoint chain does not match its pilot/order')
+        initialization = saved['pilot_diagnostics'][model.region_ids[0]]
+        timings = {'initialization': saved['timings']['initialization_seconds'],
+                   'continuation': saved['timings']['continuation_seconds']}
+        native_digest = context['native_source_sha256']
+    else:
+        started = perf_counter()
+        pilot_cp, initialization = pooled_cp_initialization(scalar, **(
+            {'matrix_cache_bytes': model.memory.initialization_bytes} if model.memory else {}))
+        order = np.lexsort((position, chrom, pilot_cp))
+        pilot = (pilot_cp/purity)[:, None]
+        tree = build_tree(pilot, model.observed, model.mutation_ids, chain_order=order)
+        timings = {'initialization': perf_counter()-started}
 
     def evaluate(x):
         phi = np.empty((model.n, 1))
@@ -67,22 +95,30 @@ def fit_scalar(model, max_clusters=DEFAULT_MAX_CLUSTERS, *, coordinate_keys=None
     cuda = str(model.device).startswith('cuda')
     capacities = np.arange(1, min(model.n, max_clusters)+1, dtype=np.int32)
     started = perf_counter()
-    proposals, native_digest = solve_chain(tuple(a[order] for a in arrays), purity,
-        pilot_cp[order], capacities, clonal_eligible=model.clonal_eligible[order],
-        evaluator=evaluate if cuda else None)
+    old_seeds = list(saved['seeds']) if saved is not None else []
+    old_capacities = {seed['requested_k'] for seed in old_seeds}
+    pending = np.asarray([k for k in capacities if k not in old_capacities], dtype=np.int32)
+    if len(pending):
+        proposals, native_digest = solve_chain(tuple(a[order] for a in arrays), purity,
+            pilot_cp[order], pending, clonal_eligible=model.clonal_eligible[order],
+            evaluator=evaluate if cuda else None,
+            numerical_diagnostics_dir=getattr(model, 'numerical_diagnostics_dir', None),
+            numerical_diagnostics_max_bytes=getattr(model, 'numerical_diagnostics_max_bytes', 16_777_216))
+    else:
+        proposals = []
     for proposal in proposals:
         raw = proposal['diagnostics']
         index = int(order[raw['anchor_witness_index']])
         raw['anchor_witness_canonical_index'] = index
         raw['anchor_witness_mutation_id'] = model.mutation_ids[index]
-    timings['continuation'] = perf_counter()-started
+    timings['continuation'] = timings.get('continuation', 0.)+perf_counter()-started
     if search.mode == 'bounded':
         # The high-capacity bank is deliberately nonexhaustive. Keep scalar
         # initialization/native CP continuation, but reuse the joint conditional
         # refit/scoring bank. Equal-center adjacent merges are budgeted search
         # proposals, not an implicit q-changing step inside a scored variant.
         from ..tree.search import fit_bounded
-        seeds = []
+        seeds = old_seeds
         for proposal in proposals:
             labels = np.empty(model.n, dtype=int)
             labels[order] = proposal['labels']
@@ -92,11 +128,16 @@ def fit_scalar(model, max_clusters=DEFAULT_MAX_CLUSTERS, *, coordinate_keys=None
         result = fit_bounded(model, tree, pilot, seeds, tuple(map(int, capacities)), search,
                              pilot_diagnostics={model.region_ids[0]: initialization},
                              initialization_seconds=timings['initialization'],
-                             continuation_seconds=timings['continuation'])
+                             continuation_seconds=timings['continuation'],
+                             checkpoint_path=checkpoint_path, resume=resume,
+                             checkpoint_stop_after=checkpoint_stop_after,
+                             checkpoint_context={'scalar_pilot_cp': pilot_cp,
+                                 'scalar_chain_order': order, 'tie_policy': tie_policy,
+                                 'native_source_sha256': native_digest})
         result.diagnostics.update(native_source_sha256=native_digest, tie_policy=tie_policy,
             backend='cuda_likelihood_host_chain' if cuda else 'cpu_native_chain',
             scalar_refit_policy='scalar_CP_refits_joint_bank_budgeted_equal_center_merges',
-            continuation_records=[dict(requested_k=p['requested_k'], **p['diagnostics']) for p in proposals])
+            continuation_records=[dict(requested_k=p['requested_k'], **p['diagnostics']) for p in seeds])
         return result
     started = perf_counter()
     with CandidateStore() as bank:
@@ -120,10 +161,17 @@ def fit_scalar(model, max_clusters=DEFAULT_MAX_CLUSTERS, *, coordinate_keys=None
         fit = SimpleNamespace(labels=labels, centers=centers, weights=weights,
             clonal_cluster=clonal,
             conditional_log_likelihood=float(winner.conditional_log_likelihood),
-            mixture_log_likelihood=float(winner.log_likelihood),
+            mixture_log_likelihood=float(winner.mixture_log_likelihood),
+            selection_log_likelihood=float(winner.selection_log_likelihood),
+            classification_count_term=float(winner.classification_count_term),
+            selection_objective=model.selection_objective,
             complexity_penalty=2*(len(centers)-1)*np.log(model.n), score=float(winner.bic),
             eligible=True, reason=None,
-            diagnostics={'weight_optimality_gap': float(winner.weight_optimality_gap)})
+            diagnostics={key: winner[key] for key in (
+                'weight_optimality_gap', 'weight_active_score_gap', 'selection_objective',
+                'score_definition', 'selection_log_likelihood', 'classification_count_term',
+                'anchoring_loss', 'anchoring_loss_available', 'anchoring_loss_unavailable_reason',
+                'proportions_definition', 'mixture_weight_optimization')})
         telemetry = dict(selected['telemetry'])
         continuation_records = selected['selection'].to_dict(orient='records')
     timings['refit_weights_refinement'] = perf_counter()-started

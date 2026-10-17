@@ -7,12 +7,14 @@ claim of exact fusion or constrained/global optimality.
 """
 
 from dataclasses import dataclass
+from collections import Counter
 
 import numpy as np
 
-from .topology import _cut_mask, partition_from_cuts, project_cuts
+from .topology import _cut_mask, _find_root, partition_from_cuts, project_cuts
 from .native import forest_quadratic
 from .anchor import project_anchor, anchor_penalty, anchored_quadratic
+from .numerical import FailureSnapshots, QP_TOLERANCE, likelihood_snapshot_arrays, qp_residual
 
 
 @dataclass(frozen=True)
@@ -53,7 +55,11 @@ def boxed_forest_quadratic(curvature, rhs, edges, penalty, lower, upper):
     h, b, lo, hi = [np.asarray(value, dtype=float) for value in (curvature, rhs, lower, upper)]
     if h.ndim != 2 or not all(h.shape) or any(value.shape != h.shape for value in (b, lo, hi)):
         raise ValueError("Quadratic arrays must have the same nonempty N by R shape")
-    if not all(np.isfinite(value).all() for value in (h, b, lo, hi)) or np.any(h <= 0) or np.any(lo > hi):
+    for name, value in zip(('curvature', 'rhs', 'lower', 'upper'), (h, b, lo, hi)):
+        affected = np.argwhere(~np.isfinite(value))
+        if len(affected):
+            raise ValueError(f'Nonfinite quadratic {name} at node,region={affected[0].tolist()}')
+    if np.any(h <= 0) or np.any(lo > hi):
         raise ValueError("Quadratic requires finite positive curvature and feasible finite bounds")
     if not np.isfinite(penalty) or penalty < 0:
         raise ValueError("Quadratic penalty must be finite and nonnegative")
@@ -67,37 +73,19 @@ def boxed_forest_quadratic(curvature, rhs, edges, penalty, lower, upper):
     # general sparse-Laplacian solver.
     roots = np.arange(n)
     for i, j in edges:
-        a, c = int(i), int(j)
-        while roots[a] != a:
-            roots[a] = roots[roots[a]]
-            a = roots[a]
-        while roots[c] != c:
-            roots[c] = roots[roots[c]]
-            c = roots[c]
+        a, c = _find_root(roots, int(i)), _find_root(roots, int(j))
         if a == c:
             raise ValueError("Quadratic graph must be a forest")
         roots[c] = a
-    result, sweeps, budget_hits = forest_quadratic(h, b, edges, penalty, lo, hi)
-    extended = result.astype(np.longdouble)
-    gradient = h.astype(np.longdouble) * extended - b
-    scale = 1 + np.abs(h.astype(np.longdouble) * extended) + np.abs(b)
-    delta = np.longdouble(penalty) * (extended[edges[:, 0]] - extended[edges[:, 1]])
-    np.add.at(gradient, edges[:, 0], delta)
-    np.add.at(gradient, edges[:, 1], -delta)
-    np.add.at(scale, edges[:, 0], np.abs(delta))
-    np.add.at(scale, edges[:, 1], np.abs(delta))
-    residual = np.where(result == lo, np.minimum(gradient, 0), gradient)
-    residual = np.where(result == hi, np.maximum(residual, 0), residual)
-    residual[lo == hi] = 0
-    backward_error = float(np.max(np.abs(residual) / scale))
-    bound_violation = float(max(np.max(lo - result), np.max(result - hi), 0.0))
-    return result, {
-        "solved": bool(budget_hits == 0 and backward_error <= 1e-7 and bound_violation == 0),
-        "backward_error": backward_error,
-        "bound_violation": bound_violation,
-        "active_set_sweeps": sweeps,
-        "budget_hits": int(budget_hits),
-    }
+    result, native = forest_quadratic(h, b, edges, penalty, lo, hi, return_diagnostics=True)
+    audit = qp_residual(h, b, edges, penalty, lo, hi, result)
+    audit.update(native)
+    if native['budget_hits']:
+        audit['failure_reasons'].append('active_set_budget_exhausted')
+    if max(native['regional_preclip_bound_violation']) > 0:
+        audit['failure_reasons'].append('preclip_bound_violation')
+    audit['solved'] = bool(not audit['failure_reasons'] and audit['backward_error'] <= QP_TOLERANCE)
+    return result, audit
 
 
 def _component_scale(tree, cuts, x, curvature):
@@ -168,6 +156,13 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
     """
     policy = ContinuationPolicy() if policy is None else policy
     capacities = tuple(capacities)
+    # Construct once before dispatch; worker proxies share its bounded owner.
+    if _batch and getattr(model, 'numerical_diagnostics_dir', None) is not None:
+        if getattr(model, '_numerical_failure_snapshots', None) is None:
+            model._numerical_failure_snapshots = FailureSnapshots(
+                model.numerical_diagnostics_dir,
+                getattr(model, 'numerical_diagnostics_max_bytes', 16_777_216))
+    snapshots = getattr(model, '_numerical_failure_snapshots', None)
     memory = getattr(model, 'memory', None)
     if _batch and memory is not None and getattr(model, '_torch', None) and len(capacities) > 1:
         per_state = max(1, model.n*model.r*(192*model.valid.shape[-1]+256))
@@ -219,8 +214,16 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
         witness, _ = project_anchor(x, model.clonal_eligible)
         switches = 0
         accepted_steps = 0
+        reason_counts = Counter()
+        worst_qp = None
+        last_line_search = None
+        max_backtracking = 0
+        maximum_accepted_increase = 0.0
+        precision_limited = False
         for level in range(policy.levels):
             stalled = False
+            repeated_stagnation = 0
+            previous_support = None
             for _ in range(policy.iterations_per_level):
                 total_iterations += 1
                 cuts = project_cuts(tree, x, k)
@@ -236,18 +239,36 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
                     break
                 h, rhs = anchored_quadratic(x, gradient, curvature, witness, rho)
                 qp, audit = boxed_forest_quadratic(h, rhs, forest, rho, lower, upper)
+                audit['proposed_step_max_CCF'] = float(np.max(np.abs(qp-x)))
                 qp_unqualified += not audit["solved"]
+                reason_counts.update(audit['failure_reasons'])
+                audit_public = {key: value for key, value in audit.items() if key != 'active_state'}
+                if worst_qp is None or audit['backward_error'] > worst_qp['backward_error']:
+                    worst_qp = dict(audit_public, rho=rho, iteration=total_iterations)
+                if not audit['solved'] and snapshots is not None:
+                    arrays = dict(H=h, b=rhs, L=lower, U=upper, rho=np.asarray(rho),
+                                  edges=forest, result=qp, active_state=audit['active_state'],
+                                  likelihood_gradient=gradient, likelihood_curvature=curvature,
+                                  **likelihood_snapshot_arrays(model, x))
+                    snapshots.record(arrays, dict(kind='unqualified_qp', audit=audit_public,
+                        requested_k=k, iteration=total_iterations, witness=int(witness),
+                        tree_identity=tree.identity), audit['backward_error'])
                 degree = np.bincount(forest.ravel(), minlength=tree.n)[:, None]
                 old_objective = float(np.sum(values) + 0.5 * rho * np.sum(jumps * jumps)) + anchor_penalty(x, witness, rho)
                 accepted = False
+                accepted_decrease = 0.0
                 proposals = [qp] if audit["solved"] else []
                 proposals.append(np.clip(x - g / (h + rho * degree), lower, upper))
                 for proposal in proposals:
                     direction = proposal - x
                     slope = float(np.sum(g * direction))
-                    if not slope < 0:
+                    if not np.isfinite(slope) or not slope < 0:
+                        reason_counts['no_descent_direction'] += 1
+                        last_line_search = dict(reason='no_descent_direction', slope=slope,
+                                                qp_qualified=audit['solved'], backtracks=0)
                         continue
                     for backtrack in range(40):
+                        max_backtracking = max(max_backtracking, backtrack)
                         step = 0.5 ** backtrack
                         trial = np.clip(x + step * direction, lower, upper)
                         trial_terms = model.node_terms(trial)
@@ -259,11 +280,40 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
                             x, (values, gradient, curvature) = trial, trial_terms
                             accepted = True
                             accepted_steps += 1
+                            accepted_decrease = old_objective - objective
+                            maximum_accepted_increase = max(maximum_accepted_increase, -accepted_decrease)
                             break
                     if accepted:
                         break
+                    reason_counts['line_search_rejected'] += 1
+                    last_line_search = dict(reason='line_search_rejected', slope=slope,
+                        qp_qualified=audit['solved'], backtracks=40,
+                        old_objective=old_objective, last_objective=objective,
+                        last_objective_change=objective-old_objective)
                 if not accepted:
                     stalled = True
+                    if snapshots is not None:
+                        arrays = dict(H=h, b=rhs, L=lower, U=upper, rho=np.asarray(rho),
+                                      edges=forest, result=qp, active_state=audit['active_state'],
+                                      likelihood_gradient=gradient, likelihood_curvature=curvature,
+                                      **likelihood_snapshot_arrays(model, x))
+                        snapshots.record(arrays, dict(kind='no_accepted_descent_step', audit=audit_public,
+                            line_search=last_line_search, requested_k=k, iteration=total_iterations,
+                            witness=int(witness), tree_identity=tree.identity),
+                            max(audit['backward_error'], QP_TOLERANCE))
+                support_key = (tuple(map(int, cuts)), int(witness))
+                stagnates = (not audit['solved'] and audit.get('precision_risk', False)
+                             and accepted_decrease <= 1e-12 * max(1., abs(old_objective)))
+                repeated_stagnation = (repeated_stagnation + 1 if stagnates and support_key == previous_support
+                                       else int(stagnates))
+                previous_support = support_key
+                if repeated_stagnation >= 3 or (stalled and stagnates):
+                    # No useful progress with fixed support and a demonstrated
+                    # coordinate-spacing risk. Stop this branch honestly; this
+                    # is NOT a replay-proved MPNST root-cause classification.
+                    precision_limited = numerical_limit = True
+                    reason_counts['precision_limited_stagnation'] += 1
+                    break
                 if stalled:
                     break
             cuts = project_cuts(tree, x, k)
@@ -278,6 +328,8 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
             labels, block_range, longest, mean_h = _component_scale(tree, cuts, x, curvature)
             feasible = max(violation, block_range, anchor_residual) <= policy.constraint_tolerance
             if stationarity <= policy.stationarity_tolerance and feasible:
+                break
+            if precision_limited:
                 break
             roundoff = 8 * rho * np.finfo(float).eps
             if rho >= policy.maximum_penalty or (stalled and feasible and roundoff >= policy.stationarity_tolerance):
@@ -312,6 +364,7 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
         objective = float(np.sum(values)+.5*rho*violation**2) + anchor_penalty(x, witness, rho)
         tolerance_met = stationarity <= policy.stationarity_tolerance and max(violation, block_range, anchor_residual) <= policy.constraint_tolerance
         status = ("penalty_stationary_constraint_tolerance" if tolerance_met else
+                  "precision_limited_candidate" if precision_limited else
                   "penalty_numerical_limit_candidate" if numerical_limit else
                   "line_search_stalled_candidate" if stalled else "finite_budget_candidate")
         candidates.append({
@@ -335,6 +388,13 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
                 "tolerance_met": bool(tolerance_met), "qp_unqualified": int(qp_unqualified),
                 "feasible_warm_starts": warm_starts, "accepted_steps": accepted_steps,
                 "penalty_gradient_roundoff_scale": 8 * rho * np.finfo(float).eps,
+                "failure_reason_counts": dict(reason_counts),
+                "worst_qp": worst_qp, "last_failed_line_search": last_line_search,
+                "maximum_backtracking_index": max_backtracking,
+                "maximum_accepted_objective_increase": maximum_accepted_increase,
+                "precision_limit_basis": ('stagnant fixed-support updates with coordinate-spacing risk; '
+                                           'not a replay-confirmed attribution' if precision_limited else None),
+                "failure_snapshots": snapshots.summary() if snapshots is not None else None,
             },
         })
     return candidates

@@ -10,7 +10,7 @@ namespace clipp2kernel {
 
 // Native proposal capacity is independent of the Python exhaustive-search cap.
 constexpr int kMaxClusters = 50;
-constexpr int kDiagnosticCount = 23;
+constexpr int kDiagnosticCount = 31;
 constexpr double kChainLowerCCF = 1e-8;
 constexpr double kChainUpperCCF = 1.0-1e-8;
 constexpr int kChainLevels = 20;
@@ -75,6 +75,9 @@ struct ChainData {
 
 using ChainEvaluator = std::function<void(const std::vector<double>&,
     std::vector<double>&, std::vector<double>&, std::vector<double>&)>;
+using ChainFailureObserver = std::function<void(const std::vector<double>&,
+    const std::vector<double>&, const std::vector<double>&, const std::vector<double>&,
+    const std::vector<double>&, const std::vector<int>&, double, int, int, int, double)>;
 
 ChainData prepare_chain_inputs(int count, const int* alt, const int* depth,
     const int* major, const int* total, const int* clonal_eligible, double purity, const double* pilot_cp,
@@ -82,19 +85,23 @@ ChainData prepare_chain_inputs(int count, const int* alt, const int* depth,
 
 void solve_chain(const ChainData& data, const int* requested_k, int k_count,
     const ChainEvaluator& evaluate, int* labels_out, double* cp_out,
-    double* diagnostics_out, int* statuses_out);
+    double* diagnostics_out, int* statuses_out, const ChainFailureObserver& observer={});
 
 void solve_forest(int count, int regions, int edge_count, const int* edges,
     const double* curvature, const double* rhs, double penalty,
-    const double* lower, const double* upper, double* output, int* diagnostics);
+    const double* lower, const double* upper, double* output, int* diagnostics,
+    int* regional_diagnostics=nullptr, double* regional_bounds=nullptr,
+    int* active_state=nullptr);
 
 } // namespace clipp2kernel
 
 // All output buffers are caller-owned and valid only when the return code is zero.
-// Row-major shapes: labels/CP [k_count,count], diagnostics [k_count,23], status [k_count].
+// Row-major shapes: labels/CP [k_count,count], diagnostics [k_count,31], status [k_count].
 // Status: 0 tolerance met, 1 numerical limit, 2 line-search stall, 3 finite budget.
 // The callback receives CCF and writes loss, gradient and positive curvature.
 using CliPP2Callback = int (*)(int, const double*, double*, double*, double*);
+using CliPP2FailureCallback = int (*)(int, const double*, const double*, const double*,
+    const double*, const double*, const int*, double, int, int, int, double);
 extern "C" {
 int CliPP2KernelABI();
 const char* CliPP2KernelBuildId();
@@ -103,10 +110,20 @@ int CliPP2SolveChain(int count, const int* alt, const int* depth, const int* maj
     const int* total, const int* clonal_eligible, double purity, const double* pilot_cp, const int* capacities,
     int k_count, int* labels_out, double* cp_out, double* diagnostics_out,
     int* statuses_out, CliPP2Callback callback);
+int CliPP2SolveChainDiagnostics(int count, const int* alt, const int* depth, const int* major,
+    const int* total, const int* clonal_eligible, double purity, const double* pilot_cp, const int* capacities,
+    int k_count, int* labels_out, double* cp_out, double* diagnostics_out,
+    int* statuses_out, CliPP2Callback callback, CliPP2FailureCallback failure_callback);
 // One shared forest, row-major [count,regions] matrices and [edge_count,2] edges.
 // diagnostics = [total active-set sweeps, regions exhausting their sweep budget].
 // Independent componentwise KKT admission remains the Python caller's duty.
 int CliPP2ForestQP(int count, int regions, int edge_count, const int* edges,
     const double* curvature, const double* rhs, double penalty,
     const double* lower, const double* upper, double* output, int* diagnostics);
+// ABI 3: additional R-by-4 [sweeps, changes, repeated configurations, budget hit],
+// R-by-2 [final preclip violation, maximum encountered violation], N-by-R active.
+int CliPP2ForestQPDiagnostics(int count, int regions, int edge_count, const int* edges,
+    const double* curvature, const double* rhs, double penalty,
+    const double* lower, const double* upper, double* output, int* diagnostics,
+    int* regional_diagnostics, double* regional_bounds, int* active_state);
 }

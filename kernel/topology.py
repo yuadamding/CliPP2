@@ -13,6 +13,14 @@ import numpy as np
 from . import MAX_CLUSTERS
 
 
+def _find_root(parent, node):
+    """Find a union-find root with path halving in the established order."""
+    while parent[node] != node:
+        parent[node] = parent[parent[node]]
+        node = parent[node]
+    return node
+
+
 @dataclass(frozen=True)
 class FrozenTree:
     edges: np.ndarray
@@ -37,14 +45,8 @@ class FrozenTree:
             raise ValueError("Tree mutation IDs must be unique and match the node count")
         parent = np.arange(self.n)
 
-        def root(i):
-            while parent[i] != i:
-                parent[i] = parent[parent[i]]
-                i = parent[i]
-            return i
-
         for i, j in edges:
-            a, b = root(i), root(j)
+            a, b = _find_root(parent, i), _find_root(parent, j)
             if a == b:
                 raise ValueError("Tree has a cycle, duplicate edge, or self edge")
             parent[b] = a
@@ -170,16 +172,10 @@ def partition_from_cuts(tree, cuts):
     cut = _cut_mask(tree, cuts)
     parent = np.arange(tree.n)
 
-    def root(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
     for i, j in tree.edges[~cut]:
-        a, b = root(i), root(j)
+        a, b = _find_root(parent, i), _find_root(parent, j)
         parent[b] = a
-    roots = np.array([root(i) for i in range(tree.n)])
+    roots = np.array([_find_root(parent, i) for i in range(tree.n)])
     mapping = {}
     for i in sorted(range(tree.n), key=lambda i: tree.mutation_ids[i]):
         mapping.setdefault(int(roots[i]), len(mapping))

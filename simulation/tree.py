@@ -135,16 +135,9 @@ def simulate_clonal_tree_ccf(
     max_rejection_tries=1024,
     fraction_random_state=None,
 ):
-    if isinstance(random_state, np.random.Generator):
-        topology_rng = random_state
-    else:
-        topology_rng = np.random.default_rng(random_state)
-    if fraction_random_state is None:
-        fraction_rng = topology_rng
-    elif isinstance(fraction_random_state, np.random.Generator):
-        fraction_rng = fraction_random_state
-    else:
-        fraction_rng = np.random.default_rng(fraction_random_state)
+    topology_rng = np.random.default_rng(random_state)
+    fraction_rng = (topology_rng if fraction_random_state is None
+                    else np.random.default_rng(fraction_random_state))
 
     if float(alpha_split) <= 0.0:
         raise ValueError("alpha_split must be positive.")
@@ -321,10 +314,7 @@ def sample_mutations_per_clone(
     min_mutations_per_clone=1,
     random_state=None,
 ):
-    if isinstance(random_state, np.random.Generator):
-        rng = random_state
-    else:
-        rng = np.random.default_rng(random_state)
+    rng = np.random.default_rng(random_state)
 
     ccf = np.asarray(ccf_patient_clones, dtype=float)
     K = ccf.shape[0]

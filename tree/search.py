@@ -6,15 +6,18 @@ The complete evaluated bank survives beam eviction and determines publication.
 """
 
 from dataclasses import dataclass
-from itertools import islice
-from itertools import combinations
+from itertools import combinations, islice
 from time import perf_counter
 
 import numpy as np
 
-from .refinement import best_pair_boundary, canonical_partition
+from .refinement import best_pair_boundary, canonical_partition, tree_adjacency
 from .support_proposals import (SEED_ATTEMPT_LIMIT, active_support, support_preflight,
-                                support_seed_proposals, support_split_proposals)
+                                support_seed_proposals, support_split_proposals,
+                                supported_native_repairs)
+
+
+FAMILIES = ("merge", "split", "boundary", "single_reassignment", "batch_reassignment")
 
 
 @dataclass
@@ -68,8 +71,9 @@ class _Moves:
                         else active_support(model))
         self.pilot = pilot
         self._columns = None
+        self._reassignment = None
         self.stats = {name: {"scanned": False, "available": None, "generated": 0}
-                      for name in ("merge", "split", "boundary", "reassignment")}
+                      for name in FAMILIES}
 
     def columns(self):
         if self._columns is None:
@@ -78,7 +82,7 @@ class _Moves:
         return self._columns
 
     def merge(self):
-        general = self.support is not None and self.candidate.membership_kind == "general"
+        general = self.candidate.membership_kind == "general"
         pairs = (list(combinations(range(self.q), 2)) if general else
                  sorted({tuple(sorted(map(int, self.labels[edge]))) for edge in self.tree.edges
                          if self.labels[edge[0]] != self.labels[edge[1]]}))
@@ -101,9 +105,6 @@ class _Moves:
         from .selection import _likelihood_ranked_edges, _supported_split_edges
         stats = self.stats["split"]
         if self.candidate.membership_kind != "tree":
-            if self.support is None:
-                stats.update(scanned=True, available=0, reason="disconnected_parent_not_tree_splittable")
-                return
             # Bounded block screening uses only observed pilot variation. The
             # actual proposals are ordered by observed regional profile gaps.
             def variation(k):
@@ -154,10 +155,7 @@ class _Moves:
                      prescreen="adjacent_center_squared_distance", profile_limit=self.limit)
         if not edges:
             return
-        adjacency = [[] for _ in range(self.tree.n)]
-        for edge, (a, b) in enumerate(self.tree.edges):
-            adjacency[a].append((int(b), edge))
-            adjacency[b].append((int(a), edge))
+        adjacency = tree_adjacency(self.tree)
         components = {k: np.flatnonzero(self.labels == k) for k in range(self.q)}
         proposals = []
         for edge in edges[:self.limit]:
@@ -175,25 +173,40 @@ class _Moves:
             yield _Proposal(labels, centers, {"replacement_edge": int(move.edge),
                 "ranking": "fixed_center_conditional_likelihood", "heuristic_not_pruning_bound": True})
 
-    def reassignment(self):
+    def _scan_reassignment(self):
         from .reassignment import _proposals
-        stats = self.stats["reassignment"]
-        if self.model.r == 1 or self.q == 1:
-            stats.update(scanned=True, available=0, reason="joint_multi_group_move_only")
-            return
-        proposals, scans = _proposals(self.labels, self.centers, self.columns(),
-                                     self.model.observed, self.keys,
-                                     **({"support": self.support} if self.support is not None else {}))
-        stats.update(scanned=True, available=sum(p is not None for p in proposals), **scans)
-        for kind, labels in zip(("single", "greedy_batch"), proposals):
-            if labels is not None:
-                labels, centers = canonical_partition(labels, self.centers)
-                stats["generated"] += 1
-                yield _Proposal(labels, centers, {"proposal_kind": kind})
+        if self._reassignment is None:
+            if self.q == 1:
+                self._reassignment = ((None, None), {"reason": "one_occupied_group"})
+            else:
+                self._reassignment = _proposals(self.labels, self.centers, self.columns(),
+                    self.model.observed, self.keys,
+                    objective=getattr(self.model, "selection_objective", "legacy_mixture"),
+                    **({"support": self.support} if self.support is not None else {}))
+        return self._reassignment
+
+    def _reassignment_family(self, index, family, kind):
+        proposals, scan = self._scan_reassignment()
+        labels = proposals[index]
+        stats = self.stats[family]
+        stats.update(scanned=True, available=int(labels is not None), shared_scan=scan)
+        if labels is not None:
+            labels, centers = canonical_partition(labels, self.centers)
+            stats["generated"] += 1
+            yield _Proposal(labels, centers, {"proposal_kind": kind,
+                "moved_mutations": scan["single_moves" if index == 0 else "batch_moves"]})
+
+    def single_reassignment(self):
+        yield from self._reassignment_family(0, "single_reassignment", "single")
+
+    def batch_reassignment(self):
+        yield from self._reassignment_family(1, "batch_reassignment", "greedy_batch")
 
 
 def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnostics=None,
-                initialization_seconds=0., tree_seconds=0., continuation_seconds=0.):
+                initialization_seconds=0., tree_seconds=0., continuation_seconds=0.,
+                checkpoint_path=None, resume=False, checkpoint_stop_after=None,
+                checkpoint_context=None):
     """Consume precomputed scalar-chain or joint-tree seeds without enumeration.
 
     Native proposals do not consume the extra structural budget. Every other
@@ -203,6 +216,17 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
     """
     from .selection import _CandidateBank, _score_key, TreeFit
     from ..kernel import ALGORITHM, MAX_CLUSTERS
+    from .checkpoint import (SearchPaused, identities, read_checkpoint, restore_bank,
+                             snapshot_bank, write_checkpoint)
+    from pathlib import Path
+
+    if resume and checkpoint_path is None:
+        raise ValueError("resume requires a checkpoint_path")
+    if checkpoint_stop_after is not None and (checkpoint_path is None
+            or type(checkpoint_stop_after) is not int or checkpoint_stop_after < 1):
+        raise ValueError("checkpoint_stop_after requires a path and positive integer state budget")
+    if checkpoint_path is not None and not resume and Path(checkpoint_path).exists():
+        raise FileExistsError("Search checkpoint exists; explicitly resume or use a fresh path")
 
     started = perf_counter()
     capacities = tuple(capacities)
@@ -233,7 +257,21 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
         raise ValueError("Native seeds must cover each requested capacity exactly once")
     by_capacity = dict(zip(map(int, requested), seeds))
     seeds = tuple(by_capacity[k] for k in capacities)
-    bank = _CandidateBank(model, tree, compact_general=True)
+    restored = read_checkpoint(checkpoint_path, model, tree, pilot) if resume else None
+    if restored is not None:
+        old_policy = restored["policy"]
+        if (not set(restored["capacities"]).issubset(capacities) or old_policy["width"] != search.width
+                or old_policy["proposals_per_state"] != search.proposals_per_state
+                or old_policy["sweeps"] > search.sweeps):
+            raise ValueError("Checkpoint schedule changed: retain earlier capacities, width, slots and sweep budget")
+        if (restored["capacities"] != capacities
+                and restored["state"]["schedule"]["sweep"] < old_policy["sweeps"]):
+            raise ValueError("Finish the bound schedule before extending its cluster capacity")
+        if restored["capacities"] != capacities and search.sweeps <= old_policy["sweeps"]:
+            raise ValueError("Capacity extension requires additional cumulative search sweeps")
+        checkpoint_context = restored.get("checkpoint_context")
+    bank = (restore_bank(model, tree, restored["bank"]) if restored is not None
+            else _CandidateBank(model, tree, compact_general=True))
     beams = {q: [] for q in range(1, maximum + 1)}
     indices, expanded = {}, set()
     spent = {q: 0 for q in beams}
@@ -287,25 +325,33 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
         record["returned_state_indices"] = [indices[id(c)] for c in variants]
         return variants
 
-    for index, seed in enumerate(seeds):
+    def consider_native(seed, index):
+        """Use the same validated contract for initial and resumed capacities."""
         if "unavailable_reason" in seed:
-            if (components <= 1
-                    or seed["unavailable_reason"] != "disconnected_observation_overlap"
+            if (components <= 1 or seed["unavailable_reason"] != "disconnected_observation_overlap"
                     or set(seed) != {"requested_k", "unavailable_reason"}):
                 raise ValueError("Invalid unavailable native-capacity record")
-            seeds_diagnostics.append({"route": "native_unavailable", "seed_index": index,
-                                      **seed, "topology_component_count": components,
-                                      "support_infeasibility_claimed": False})
-            continue
+            seeds_diagnostics.append({"route": "native_unavailable", "seed_index": index, **seed,
+                "topology_component_count": components, "support_infeasibility_claimed": False})
+            return None
         cuts = tuple(sorted(map(int, seed["cuts"])))
-        requested = int(seed["requested_k"])
-        occupied = len(cuts)+components
-        if requested not in capacities or occupied > requested:
+        requested, occupied = int(seed["requested_k"]), len(cuts)+components
+        if occupied > requested:
             raise ValueError("Generated seed exceeds its declared capacity")
         provenance = {"route": "native", "seed_index": index, "requested_k": requested,
                       "occupied_q": occupied, "native_collapsed": occupied < requested}
         seeds_diagnostics.append({**provenance, "cuts": cuts, "solver": seed.get("diagnostics", {})})
         consider(seed["labels"], seed.get("centers"), provenance, native=True, declared_cuts=cuts)
+        return cuts
+
+    def repair_native(seed, index):
+        for labels, details in supported_native_repairs(model, tree, seed["labels"],
+                seed["cuts"], search.proposals_per_state):
+            consider(labels, None, {"route": "native_support_transformation",
+                "seed_index": index, "requested_k": seed["requested_k"], **details})
+
+    for index, seed in enumerate(seeds if restored is None else ()):
+        consider_native(seed, index)
     native_count = len(bank.candidates)
     native_anchor_evaluations = bank.refit_calls
     native_reasons = {}
@@ -314,12 +360,16 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
                         if cuts not in failed_anchor_cuts), *bank.anchor_rejections]:
         reason = str(rejection["reason"])
         native_reasons[reason] = native_reasons.get(reason, 0)+1
+    if restored is None:
+        for index, seed in enumerate(seeds):
+            if "cuts" in seed:
+                repair_native(seed, index)
     # Seed work has a fixed construction bound and reserves ordinary target-q
     # slots. Reservations are released before sweeps; no new fit allowance is
     # introduced. The seeds are explicitly general, never native tree seeds.
     reserved_seed_slots = min(SEED_ATTEMPT_LIMIT, search.partition_limit_per_q) if support is not None else 0
     support_seed_records, seed_spent = [], {q: 0 for q in beams}
-    if support is not None:
+    if support is not None and restored is None:
         for labels, diagnostic in support_seed_proposals(model, maximum, limit=reserved_seed_slots,
                                                          support=support):
             record = dict(diagnostic)
@@ -335,27 +385,110 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
             consider(labels, None, {"route": "regional_support_seed", "requested_k": q,
                                    **diagnostic}, force_general=True)
             record.update(occupied_q=q, outcome=ledger[-1]["outcome"], attempt_index=len(ledger)-1)
-    if not bank.candidates and maximum >= 2 and support is None:
+    if restored is None and not bank.candidates and maximum >= 2 and support is None:
         consider(np.where(model.clonal_eligible, 0, 1), None,
                  {"route": "eligible_set_anchor_rescue", "requested_k": maximum})
     split_ranks = {}
-    keys = tuple(model.observation_keys()) if model.r > 1 else ()
-    for sweep in range(search.sweeps):
+    keys = tuple(model.observation_keys())
+    family_cursors, family_consumed = {}, {}
+    schedule = {"sweep": 0, "level": 0, "queue": None, "position": 0}
+    if restored is not None:
+        saved = restored["state"]
+        if "model_telemetry" in restored and hasattr(model, "telemetry"):
+            model.telemetry.update(restored["model_telemetry"])
+        beams.update({q: [bank.candidates[i] for i in values] for q, values in saved["beams"].items()})
+        indices = {id(candidate): i for i, candidate in enumerate(bank.candidates)}
+        expanded = set(saved["expanded"])
+        spent, anchor_reserved, actual_anchors = (saved[key] for key in (
+            "spent", "anchor_reserved", "actual_anchors"))
+        ledger, seeds_diagnostics, paths = (saved[key] for key in ("ledger", "seeds_diagnostics", "paths"))
+        evaluated_partitions = set(saved["evaluated_partitions"])
+        native_count, native_anchor_evaluations, native_reasons = (saved[key] for key in (
+            "native_count", "native_anchor_evaluations", "native_reasons"))
+        reserved_seed_slots, support_seed_records, seed_spent = (saved[key] for key in (
+            "reserved_seed_slots", "support_seed_records", "seed_spent"))
+        family_cursors, family_consumed, schedule = (saved[key] for key in (
+            "family_cursors", "family_consumed", "schedule"))
+        for q in beams:
+            spent.setdefault(q, 0)
+            anchor_reserved.setdefault(q, 0)
+            actual_anchors.setdefault(q, 0)
+            seed_spent.setdefault(q, 0)
+        native_cuts_seen = {tuple(seed["cuts"]) for seed in restored["seeds"] if "cuts" in seed}
+        for index, seed in enumerate(seeds):
+            requested = seed["requested_k"]
+            if requested in restored["capacities"]:
+                continue
+            before = len(bank.candidates)
+            calls = bank.refit_calls
+            rejection_count = len(bank.anchor_rejections)
+            cuts = consider_native(seed, index)
+            if cuts is None:
+                continue
+            native_count += len(bank.candidates)-before
+            native_anchor_evaluations += bank.refit_calls-calls
+            new_rejections = bank.anchor_rejections[rejection_count:]
+            if not new_rejections and cuts not in native_cuts_seen and cuts in bank.ineligible:
+                new_rejections = [bank.ineligible[cuts]]
+            for rejection in new_rejections:
+                reason = str(rejection["reason"])
+                native_reasons[reason] = native_reasons.get(reason, 0)+1
+            native_cuts_seen.add(cuts)
+            repair_native(seed, index)
+
+    checkpoint_identity = identities(model, tree, pilot) if checkpoint_path is not None else None
+    checkpoint_work = 0
+
+    def persist():
+        if checkpoint_path is None:
+            return
+        state = dict(spent=spent, anchor_reserved=anchor_reserved, actual_anchors=actual_anchors,
+            ledger=ledger, seeds_diagnostics=seeds_diagnostics, paths=paths,
+            evaluated_partitions=sorted(evaluated_partitions, key=repr),
+            native_count=native_count, native_anchor_evaluations=native_anchor_evaluations,
+            native_reasons=native_reasons, reserved_seed_slots=reserved_seed_slots,
+            support_seed_records=support_seed_records, seed_spent=seed_spent,
+            family_cursors=family_cursors, family_consumed=family_consumed, schedule=schedule,
+            expanded=sorted(expanded), beams={q: [indices[id(c)] for c in values]
+                                             for q, values in beams.items()})
+        write_checkpoint(checkpoint_path, dict(identities=checkpoint_identity,
+            policy=dict(width=search.width, proposals_per_state=search.proposals_per_state,
+                        sweeps=search.sweeps), capacities=capacities, bank=snapshot_bank(bank),
+            tree=dict(edges=tree.edges, n=tree.n, mutation_ids=tree.mutation_ids, kind=tree.kind),
+            pilot=np.asarray(pilot), pilot_diagnostics=pilot_diagnostics, seeds=seeds,
+            checkpoint_context=checkpoint_context,
+            model_telemetry=dict(getattr(model, "telemetry", {})),
+            timings=dict(initialization_seconds=initialization_seconds, tree_seconds=tree_seconds,
+                         continuation_seconds=continuation_seconds), state=state))
+
+    persist()
+    while schedule["sweep"] < search.sweeps:
+        sweep = schedule["sweep"]
         downward = sweep % 2 == 0
-        levels = range(maximum, 0, -1) if downward else range(1, maximum+1)
-        families = ("merge", "boundary", "reassignment", "split") if downward else (
-                    "split", "boundary", "reassignment", "merge")
-        for q in levels:
-            for candidate in tuple(beams[q]):
+        levels = list(range(maximum, 0, -1) if downward else range(1, maximum+1))
+        while schedule["level"] < len(levels):
+            q = levels[schedule["level"]]
+            if schedule["queue"] is None:
+                schedule["queue"] = [indices[id(candidate)] for candidate in beams[q]]
+                schedule["position"] = 0
+            while schedule["position"] < len(schedule["queue"]):
+                candidate = bank.candidates[schedule["queue"][schedule["position"]]]
                 parent = indices[id(candidate)]
                 expanded.add(parent)
-                moves = _Moves(model, tree, bank, candidate, search.proposals_per_state, split_ranks, keys, pilot)
-                generators = {family: iter(getattr(moves, family)()) for family in families}
+                moves = _Moves(model, tree, bank, candidate,
+                    search.proposals_per_state*search.sweeps, split_ranks, keys, pilot)
+                generators = {family: iter(getattr(moves, family)()) for family in FAMILIES}
+                consumed = family_consumed.setdefault(parent, dict.fromkeys(FAMILIES, 0))
+                for family, generator in generators.items():
+                    for _ in range(consumed[family]):
+                        next(generator, None)
                 path = {"sweep": sweep, "direction": "downward" if downward else "upward",
-                        "occupied_q": q, "parent_bank_index": parent, "slots": []}
+                        "occupied_q": q, "parent_bank_index": parent, "slots": [],
+                        "family_cursor_start": family_cursors.get(parent, 0),
+                        "last_accepted_improvement": None, "last_accepted_moved_mutations": 0}
                 paths.append(path)
                 for slot in range(search.proposals_per_state):
-                    family = families[slot % len(families)]
+                    family = FAMILIES[(family_cursors.get(parent, 0)+slot) % len(FAMILIES)]
                     target = q + (1 if family == "split" else -1 if family == "merge" else 0)
                     entry = {"slot": slot, "family": family, "target_q": target}
                     path["slots"].append(entry)
@@ -369,14 +502,40 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
                             entry["outcome"] = "no_ranked_proposal"
                         else:
                             before = len(ledger)
-                            consider(proposal.labels, proposal.centers, {
+                            consumed[family] += 1
+                            variants = consider(proposal.labels, proposal.centers, {
                                 "route": f"bounded_{family}", "requested_k": target,
                                 "sweep": sweep, "parent_bank_index": parent, **proposal.details})
                             entry.update(outcome=ledger[-1]["outcome"], attempt_index=before)
+                            improvement = candidate.score-min((c.score for c in variants), default=np.inf)
+                            entry["improves_parent"] = bool(improvement > 1e-7+1e-10*abs(candidate.score))
+                            if entry["improves_parent"]:
+                                entry["improvement"] = float(improvement)
+                                path["last_accepted_improvement"] = float(improvement)
+                                path["last_accepted_moved_mutations"] = proposal.details.get("moved_mutations")
+                family_cursors[parent] = (family_cursors.get(parent, 0)+search.proposals_per_state) % len(FAMILIES)
+                path["family_cursor_next"] = family_cursors[parent]
+                path["stop_reason"] = ("target_q_budget_exhausted" if any(
+                    e["outcome"] == "target_partition_budget_exhausted" for e in path["slots"])
+                    else "proposal_budget_exhausted")
                 path["neighborhood"] = moves.stats
                 for stats in moves.stats.values():
                     stats["unexpanded_known"] = (None if stats["available"] is None else
                                                    max(0, stats["available"]-stats["generated"]))
+                for family, stats in moves.stats.items():
+                    entries = [entry for entry in path["slots"] if entry["family"] == family]
+                    stats.update(admitted=sum("attempt_index" in entry for entry in entries),
+                        rejected=sum(entry["outcome"] == "ineligible" for entry in entries),
+                        accepted=sum(entry.get("improves_parent", False) for entry in entries),
+                        unconsumed=stats["unexpanded_known"])
+                schedule["position"] += 1
+                checkpoint_work += 1
+                persist()
+                if checkpoint_stop_after is not None and checkpoint_work >= checkpoint_stop_after:
+                    raise SearchPaused("Requested state budget reached; resume the committed search checkpoint")
+            schedule.update(level=schedule["level"]+1, queue=None, position=0)
+        schedule.update(sweep=sweep+1, level=0, queue=None, position=0)
+    persist()
     if not bank.candidates:
         if support is not None:
             raise ValueError("support_seed_search_exhausted: bounded support-compatible search found no eligible anchored fit; global infeasibility is not established")
@@ -428,6 +587,7 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
             "mode": "bounded", "exhaustive": False, "width": search.width,
             "requested_mode": requested_mode, "resolved_mode": "bounded",
             "proposals_per_state": search.proposals_per_state, "sweeps": search.sweeps,
+            "reassignment_starts_rounds": "not_applicable_five_family_sweep_schedule",
             "partition_limit_per_q": search.partition_limit_per_q,
             "partition_limit_total": maximum*search.partition_limit_per_q,
             "anchored_limit_total": search.partition_limit_per_q*maximum*(maximum+1)//2,
@@ -447,6 +607,13 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
             "width_is_anchored_fitted_states": True,
             "population_growth_order": "synchronous_deterministic_sweep_q_state_slot",
             "wider_search_is_guaranteed_superset": False,
+            "resumed_archive_retained": restored is not None,
+            "checkpoint_complete": checkpoint_path is not None,
+            "termination_reason": "round_budget_exhausted",
+            "stabilization_certified": False,
+            "last_accepted_improvement": next((p["last_accepted_improvement"] for p in reversed(paths)
+                                               if p["last_accepted_improvement"] is not None), None),
+            "family_cursors": family_cursors,
             "unknown_unexpanded_neighborhoods_recorded_as_null": True,
             "attempts": ledger, "paths": paths,
         },

@@ -21,6 +21,17 @@ def _finite_terms(values):
     return np.where(np.isfinite(values), values, 0.0), np.isneginf(values).astype(np.int64)
 
 
+def tree_adjacency(tree, cuts=()):
+    """Neighbors with original edge IDs, optionally excluding cut edges."""
+    removed = set(cuts)
+    adjacency = [[] for _ in range(tree.n)]
+    for edge, (a, b) in enumerate(tree.edges):
+        if edge not in removed:
+            adjacency[a].append((int(b), edge))
+            adjacency[b].append((int(a), edge))
+    return adjacency
+
+
 def best_pair_boundary(tree, labels, centers, log_columns, edge, *, adjacency=None, components=None):
     """Best replacement of one boundary, including both center orientations.
 
@@ -45,10 +56,7 @@ def best_pair_boundary(tree, labels, centers, log_columns, edge, *, adjacency=No
                else np.sort(np.r_[components[a], components[b]]))
     positions = {int(node): index for index, node in enumerate(members)}
     if adjacency is None:
-        adjacency = [[] for _ in range(tree.n)]
-        for eid, (u, v) in enumerate(edges):
-            adjacency[u].append((int(v), eid))
-            adjacency[v].append((int(u), eid))
+        adjacency = tree_adjacency(tree)
     local = {int(node): [(neighbor, eid) for neighbor, eid in adjacency[node]
                         if neighbor in positions] for node in members}
     internal = sorted({eid for neighbors in local.values() for _, eid in neighbors})
@@ -131,7 +139,7 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None):
     ``consider`` refits and records candidates, preserving supplied-center
     fallbacks. It must return a candidate with a ``refit`` result and ``cuts``.
     The path improves conditional likelihood, while the caller separately keeps
-    the best observed-mixture score over the complete candidate bank.
+    the best declared selection score over the complete candidate bank.
     ``max_proposals`` optionally bounds exact proposal evaluations, including
     rejected moves. Existing native refinement uses the unlimited default.
     """
@@ -142,10 +150,7 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None):
     current = candidate
     visited = set()
     attempted = 0
-    adjacency = [[] for _ in range(tree.n)]
-    for eid, (u, v) in enumerate(tree.edges):
-        adjacency[u].append((int(v), eid))
-        adjacency[v].append((int(u), eid))
+    adjacency = tree_adjacency(tree)
     while True:
         changed = False
         fit = current.refit

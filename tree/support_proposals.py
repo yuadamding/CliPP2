@@ -19,6 +19,85 @@ def active_support(model):
     return support if support is not None and support.hard_zero.any() else None
 
 
+def observation_support(model):
+    """Coverage constraints in either policy; never turn missing into zero."""
+    support = getattr(model, "regional_support", None)
+    if support is None:
+        from ..kernel.regional_support import RegionalSupport
+        observed = np.asarray(model.observed, dtype=bool)
+        support = RegionalSupport(observed, observed, np.zeros_like(observed), "likelihood")
+    return support
+
+
+def supported_native_repairs(model, tree, labels, cuts, budget):
+    """Named bounded transformations, distinct from the unchanged raw proposal.
+
+    Cheap regional support is checked before any emitted partition is refitted.
+    Coarsening is deterministic and greedy, not exhaustive; cut exchanges and
+    general coverage repair retain explicit native-parent provenance upstream.
+    """
+    from .selection import _supported_split_edges
+    from ..kernel.topology import partition_from_cuts
+    if budget <= 0:
+        return
+    support = observation_support(model)
+    if support.check_partition(support.summarize_partition(labels)) is None:
+        return
+    emitted, seen = 0, set()
+    current = canonical_partition(labels)
+    current_cuts = tuple(cuts)
+    # Merge unsupported neighboring blocks first; never introduce a strict
+    # positive/zero conflict just to manufacture regional coverage.
+    while len(np.unique(current)) > tree.component_count:
+        choices = []
+        for edge in current_cuts:
+            left, right = map(int, current[tree.edges[edge]])
+            merged = canonical_partition(np.where(current == right, left, current))
+            state = support.summarize_partition(merged)
+            if state.support_conflict.any():
+                continue
+            choices.append((int(np.count_nonzero(state.observed_counts == 0)), edge, merged))
+        if not choices:
+            break
+        missing, removed, current = min(choices, key=lambda item: item[:2])
+        current_cuts = tuple(edge for edge in current_cuts if edge != removed)
+        if missing == 0:
+            key = current.tobytes()
+            seen.add(key)
+            emitted += 1
+            yield current, {"transformation": "supported_coarsening", "parent_cuts": tuple(cuts),
+                            "result_cuts": current_cuts}
+            break
+    if emitted >= budget:
+        return
+    for removed in cuts:
+        base = tuple(edge for edge in cuts if edge != removed)
+        for edge in _supported_split_edges(model, tree, base)[:budget]:
+            proposed_cuts = tuple(sorted((*base, edge)))
+            proposed = partition_from_cuts(tree, proposed_cuts)
+            key = proposed.tobytes()
+            if key in seen or np.array_equal(proposed, labels):
+                continue
+            if support.check_partition(support.summarize_partition(proposed)) is not None:
+                continue
+            seen.add(key)
+            emitted += 1
+            yield proposed, {"transformation": "supported_cut_exchange", "parent_cuts": tuple(cuts),
+                             "removed_edge": int(removed), "replacement_edge": int(edge)}
+            if emitted >= budget:
+                return
+    maximum = len(cuts)+tree.component_count
+    for proposed, details in support_seed_proposals(model, maximum, support=support):
+        if proposed is None or proposed.tobytes() in seen:
+            continue
+        if support.check_partition(support.summarize_partition(proposed)) is None:
+            yield proposed, {"transformation": "general_support_repair", "parent_cuts": tuple(cuts),
+                             **details}
+            emitted += 1
+            if emitted >= budget:
+                return
+
+
 def support_preflight(model, maximum):
     """Certify only a lower bound and the necessary collective clonal support."""
     support = active_support(model)
@@ -157,7 +236,7 @@ def _profile_modes(model, region, grid, profiles=None, cache_limit=0):
     for first in range(0, len(grid), width):
         block = grid[first:first+width]
         values = model.regional_profile_columns(region, block)
-        model.telemetry["proposal_profile_columns"] += len(block)
+        model.telemetry["proposal_profile_columns"] = model.telemetry.get("proposal_profile_columns", 0)+len(block)
         if np.isnan(values).any() or np.isposinf(values).any():
             raise ValueError("Proposal profiles must be finite or negative infinity")
         selected = np.argmax(values, axis=1)
@@ -181,6 +260,10 @@ def _within_bin_coordinates(model, rows, region, modes, pilot):
     falling back to the component mode nearest the coarse profile mode. This
     removes the coarse-grid gate without substituting a denser fixed grid.
     """
+    if not all(hasattr(model, name) for name in ("alt", "depth", "scaling", "support")):
+        # Other emission models can expose pilots without binomial read fields.
+        values = modes if pilot is None else np.asarray(pilot)[rows, region]
+        return values, values
     ratio = model.alt[rows, region]/(model.depth[rows, region]*model.scaling[rows, region])
     multiplicity = np.ones(len(rows))
     np.divide(ratio, modes, out=multiplicity, where=modes > 0)
@@ -257,9 +340,9 @@ def support_split_proposals(model, labels, block, budget, *, profiles=None, pilo
     cross-component distance is inferred. Every tested child must retain
     all-region evidence and compatibility, including in disconnected forests.
     """
-    support = active_support(model) if support is None else support
-    if support is None or budget <= 0:
-        return [], {"screened": 0, "reason": "no_active_support"}
+    support = observation_support(model) if support is None else support
+    if budget <= 0:
+        return [], {"screened": 0, "reason": "proposal_budget_exhausted"}
     rows = np.flatnonzero(labels == block)
     if len(rows) < 2:
         return [], {"screened": 0, "reason": "singleton_block"}

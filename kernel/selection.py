@@ -1,15 +1,16 @@
-"""Refit distance-to-set chain partitions and select observed-likelihood BIC.
+"""Refit distance-to-set chain partitions under an explicit selection objective.
 
 Multiplicity is marginalized over 1..major_cn. Each occupied partition block
 has one fitted cellular prevalence (CP), with CCF = CP / purity. The scalar
 refit searches a dense grid and every component's binomial mode, then refines
 all bracketed maxima; this is a deterministic multimode numerical search, not
-a certificate of global optimality. BIC marginalizes both unknown cluster and
-multiplicity, fitting cluster weights at the candidate's fixed CP centers. It
-counts q-1 free centers and q-1 weights; one occupied center is fixed at purity.
+a certificate of global optimality. Classification likelihood includes the
+published labels and profiles proportions to counts/N. The explicit legacy
+route alone fits observed-mixture weights. The nominal parameter convention
+counts q-1 free centers and q-1 proportions; one occupied center is fixed at purity.
 Adjacent coarsenings and conditional boundary polishing improve the proposal
 bank on the same frozen chain. Centers use conditional block refitting;
-observed-mixture weights are fitted only for BIC. No fusion/allocation penalty enters BIC.
+All proposals are ultimately selected by the named authoritative score.
 """
 
 from collections import OrderedDict
@@ -23,12 +24,27 @@ import numpy as np
 import pandas as pd
 
 from .proposals import iter_chain_proposals, _integers as _integer_vector
-from . import SCORING_VERSION, CANDIDATE_SEARCH_VERSION
+from . import LEGACY_SCORING_VERSION, CANDIDATE_SEARCH_VERSION
 from ..config import EXHAUSTIVE_MAX_CLUSTERS
 from .refinement import polish_chain_partition
 from .refitting import refit_center
 from .scoring import fit_cluster_weights
 from .memory import ByteLRU
+from .objectives import assigned_objective, score_definition_for, validate_selection_objective
+
+
+_SCORE_FIELDS = (
+    "num_clusters", "bic", "log_likelihood", "conditional_log_likelihood",
+    "weight_optimality_gap", "weight_active_score_gap", "selection_objective",
+    "score_definition", "selection_log_likelihood", "classification_count_term",
+    "mixture_log_likelihood", "anchoring_loss", "anchoring_loss_available",
+    "anchoring_loss_unavailable_reason", "proportions_definition",
+    "mixture_weight_optimization", "bic_definition",
+)
+
+
+def _selection_objective(model):
+    return validate_selection_objective(getattr(model, "selection_objective", "classification"))
 
 
 def _parameters(result, order):
@@ -42,6 +58,8 @@ def _parameters(result, order):
             "centers": result["centers"].tolist(),
             "weights": result["cluster_weights"].tolist(),
             "clonal_cluster": result["clonal_cluster"],
+            "selection_objective": result["selection_objective"],
+            "score_definition": result["score_definition"],
         },
         separators=(",", ":"),
         allow_nan=False,
@@ -55,6 +73,7 @@ class _ChainRefitCache(OrderedDict):
                  memory=None, refit_store=None):
         super().__init__()
         self.model = model
+        self.selection_objective = _selection_objective(model)
         self.order = np.asarray(chain_order, dtype=np.int64).copy()
         self.ranks = np.empty(len(model), dtype=np.int64)
         self.ranks[self.order] = np.arange(len(model))
@@ -176,8 +195,10 @@ def refit_partition_variants(model, labels, cache=None, chain_order=None, *,
         raise ValueError("Partition labels must be one integer per mutation")
     if isinstance(cache, _ChainRefitCache) and (
         cache.model is not model or chain_order is None or not np.array_equal(cache.order, chain_order)
+        or cache.selection_objective != _selection_objective(model)
     ):
         raise ValueError("Chain refit cache belongs to a different model or order")
+    objective = _selection_objective(model)
     clusters, inverse = np.unique(labels, return_inverse=True)
     if initial_centers is not None:
         initial_centers = np.asarray(initial_centers, dtype=float)
@@ -250,20 +271,43 @@ def refit_partition_variants(model, labels, cache=None, chain_order=None, *,
         fixed = int(fitted_labels[clonal_member])
         centers = centers[order]
         counts = np.bincount(fitted_labels, minlength=len(centers))
-        try:
-            mixture = (cache.fit_weights(centers, counts) if isinstance(cache, _ChainRefitCache)
-                       else fit_cluster_weights(model, centers, counts))
-        except (ValueError, RuntimeError):
-            if isinstance(cache, _ChainRefitCache):
-                cache.telemetry["anchored_refit_failures"] += 1
-            continue
+        if objective == "legacy_mixture":
+            try:
+                scored = (cache.fit_weights(centers, counts) if isinstance(cache, _ChainRefitCache)
+                          else fit_cluster_weights(model, centers, counts))
+            except (ValueError, RuntimeError):
+                if isinstance(cache, _ChainRefitCache):
+                    cache.telemetry["anchored_refit_failures"] += 1
+                continue
+            scored.update(selection_log_likelihood=scored["log_likelihood"],
+                          mixture_log_likelihood=scored["log_likelihood"],
+                          classification_count_term=np.nan,
+                          mixture_weight_optimization="converged_at_fixed_centers",
+                          proportions_definition="legacy_observed_mixture_optimal_weights")
+        else:
+            scored = assigned_objective(conditional, counts, 1, objective)
+            scored.update(log_likelihood=scored["selection_log_likelihood"],
+                          mixture_log_likelihood=np.nan,
+                          weight_optimality_gap=None, weight_active_score_gap=None,
+                          mixture_weight_optimization="not_applicable",
+                          proportions_definition="occupied_cluster_counts_over_N")
         parameters = 2*(len(centers)-1)
+        same_anchor_members = np.array_equal(fitted_labels == fixed, inverse == clonal)
+        loss_available = clonal in free and same_anchor_members
         yield {"labels": fitted_labels, "centers": centers, "clonal_cluster": fixed,
-               **mixture, "conditional_log_likelihood": conditional,
+               **scored, "conditional_log_likelihood": conditional,
+               "selection_objective": objective, "score_definition": score_definition_for(objective),
+               "anchoring_loss": (float(free[clonal][1]-clonal_column[inverse == clonal].sum())
+                                  if loss_available else None),
+               "anchoring_loss_available": loss_available,
+               "anchoring_loss_unavailable_reason": (None if loss_available else
+                    "anchor_membership_changed_by_exact_center_merge" if not same_anchor_members else
+                    "optional_free_anchor_fit_unavailable"),
                "num_clusters": len(centers), "num_parameters": parameters,
                "num_mutations": len(model),
-               "bic": -2*mixture["log_likelihood"]+parameters*math.log(len(model)),
-               "bic_definition": SCORING_VERSION}
+               "bic": -2*scored["selection_log_likelihood"]+parameters*math.log(len(model)),
+               "bic_definition": (LEGACY_SCORING_VERSION if objective == "legacy_mixture"
+                                  else score_definition_for(objective))}
 
 
 def refit_partition(model, labels, cache=None, chain_order=None, *, clonal_cluster,
@@ -353,9 +397,7 @@ def search_chain_coarsenings(
 def _scored_record(result, order, parent, replicate):
     fields = ("requested_k", "parent_requested_k", "parent_replicate", "parent_partition_sha256")
     record = {key: parent[key] for key in fields}
-    record.update({key: result[key] for key in (
-        "num_clusters", "bic", "log_likelihood", "conditional_log_likelihood",
-        "weight_optimality_gap", "weight_active_score_gap", "clonal_cluster")})
+    record.update({key: result[key] for key in (*_SCORE_FIELDS, "clonal_cluster")})
     record.update(replicate=replicate, candidate_kind=parent["candidate_kind"], status="scored",
         partition_parameters=_parameters(result, order),
         publication_eligible=bool(np.all(result["cluster_weights"] > 0)),
@@ -373,14 +415,11 @@ def _restore_result(record, order):
     labels = np.empty(len(order), dtype=int)
     labels[order] = np.asarray(parameters["block_labels"], dtype=int)[
         np.searchsorted(parameters["cuts"], np.arange(len(order)), side="right")]
-    result = {key: record[key] for key in (
-        "num_clusters", "bic", "log_likelihood", "conditional_log_likelihood",
-        "weight_optimality_gap", "weight_active_score_gap")}
+    result = {key: record[key] for key in _SCORE_FIELDS}
     result.update(labels=labels, centers=np.asarray(parameters["centers"], dtype=float),
         cluster_weights=np.asarray(parameters["weights"], dtype=float),
         clonal_cluster=int(parameters["clonal_cluster"]),
-        num_parameters=2*(record["num_clusters"]-1), num_mutations=len(order),
-        bic_definition=SCORING_VERSION)
+        num_parameters=2*(record["num_clusters"]-1), num_mutations=len(order))
     return result
 
 
@@ -474,7 +513,9 @@ def refine_chain_search(model, search, chain_order, cache):
             eligible = [v for v in variants if np.all(v["cluster_weights"] > 0)]
             if not eligible:
                 raise RuntimeError("no_positive_weight_anchored_variant")
-            return max(eligible, key=lambda v: (v["conditional_log_likelihood"], -v["clonal_cluster"]))
+            if _selection_objective(model) == "legacy_mixture":
+                return max(eligible, key=lambda v: (v["conditional_log_likelihood"], -v["clonal_cluster"]))
+            return min(eligible, key=lambda v: (v["bic"], v["clonal_cluster"]))
         refinement = polish_chain_partition(model, fitted, chain_order, refit_all,
                                              column_evaluator=cache.log_kernel)
         consider(refinement["result"], parent, "chain_boundary_polish", refinement["diagnostics"])
@@ -577,21 +618,7 @@ def select_chain(model, chain_order, proposals, cluster_list, *, candidate_store
         record = by_attempt[(requested_k, rep)]
         result = candidate["result"]
         record["center_refit"] = "conditional"
-        record.update(
-            {
-                key: result[key]
-                for key in (
-                    "num_clusters",
-                    "num_parameters",
-                    "log_likelihood",
-                    "conditional_log_likelihood",
-                    "weight_optimality_gap",
-                    "weight_active_score_gap",
-                    "bic",
-                    "bic_definition",
-                )
-            }
-        )
+        record.update({key: result[key] for key in (*_SCORE_FIELDS, "num_parameters")})
         record.update(
             {
                 key: candidate[key]

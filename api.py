@@ -11,7 +11,8 @@ from .config import FitConfig, resolve_fit_config
 from .io.tumor_txt import load_tumor_txt
 
 
-def process_tumor_bundle(tumor_file, outdir, fit_config=None):
+def process_tumor_bundle(tumor_file, outdir, fit_config=None, *,
+                         checkpoint_path=None, resume=False, checkpoint_stop_after=None):
     """Fit canonical input; verify and publish three minimal tables.
 
     One occupied conditional center is fixed at one; other centers are free
@@ -24,12 +25,25 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     from .tree.selection import fit_tree
     from .tree.reporting import ALGORITHM, OUTPUT_SCHEMA_VERSION, check_destination, exclusion_summary, publish
     from ._source import source_fingerprint, git_source_identity
-    from .kernel import KERNEL_VERSION, SCORE_DEFINITION
+    from .kernel import KERNEL_VERSION
+    from .kernel.objectives import score_definition_for
     from .kernel.memory import MemoryPolicy, process_memory_snapshot
 
     config = resolve_fit_config() if fit_config is None else fit_config
     if type(config) is not FitConfig:
         raise TypeError('fit_config must be a FitConfig')
+    if resume and checkpoint_path is None:
+        raise ValueError('resume requires checkpoint_path')
+    if checkpoint_path is not None and config.search_policy != 'bounded':
+        raise ValueError('Checkpointing requires explicit search_policy=bounded')
+    if checkpoint_stop_after is not None and checkpoint_path is None:
+        raise ValueError('checkpoint_stop_after requires checkpoint_path')
+    if checkpoint_path is not None:
+        checkpoint = Path(checkpoint_path)
+        if not resume and checkpoint.exists():
+            raise FileExistsError('Search checkpoint exists; explicitly resume or use a fresh path')
+        if resume and not checkpoint.is_file():
+            raise FileNotFoundError(checkpoint)
     started = perf_counter()
     source_root = Path(__file__).resolve().parent
     commit, dirty = git_source_identity(source_root)
@@ -49,11 +63,18 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     memory = MemoryPolicy.resolve(config.ram_budget_gib, config.vram_budget_gib,
                                   device=config.device, qualify_device_weights=config.qualify_device_weights)
     model = RegionalModel(data, device=config.device, memory=memory,
-                          regional_zero_policy=config.regional_zero_policy)
+                          regional_zero_policy=config.regional_zero_policy,
+                          selection_objective=config.selection_objective)
+    model.numerical_diagnostics_dir = config.numerical_diagnostics_dir
+    model.numerical_diagnostics_max_bytes = config.numerical_diagnostics_max_bytes
+    model.checkpoint_identity = {'source_sha256': source_hash, 'source_commit': commit,
+                                 'input_sha256': input_hash}
     search = config.resolved_search(active_hard_zero=bool(model.regional_support.hard_zero.any()))
-    result = (fit_scalar(model, config.max_clusters, search=search) if supports_scalar(model)
+    continuation = dict(checkpoint_path=checkpoint_path, resume=resume,
+                        checkpoint_stop_after=checkpoint_stop_after)
+    result = (fit_scalar(model, config.max_clusters, search=search, **continuation) if supports_scalar(model)
               else fit_tree(model, config.max_clusters,
-                            search=replace(search, mode=config.search_policy)))
+                            search=replace(search, mode=config.search_policy), **continuation))
     # Observation topology is known only after constructing the similarity
     # forest. Preserve the requested policy until then and report the route
     # actually taken, rather than the preliminary capacity-only resolution.
@@ -86,10 +107,9 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
         'search_policy': asdict(search),
         'requested_search_policy': config.search_policy,
         'regional_zero_policy': config.regional_zero_policy,
-        'selection_policy': ('strict_regional_zero_occupied_clonal_v1'
-                             if config.regional_zero_policy == 'strict'
-                             else 'defea419_likelihood_occupied_clonal'),
-        'score': result.score, 'score_definition': SCORE_DEFINITION,
+        'selection_policy': f'{config.regional_zero_policy}_occupied_clonal_{config.selection_objective}',
+        'selection_objective': config.selection_objective,
+        'score': result.score, 'score_definition': score_definition_for(config.selection_objective),
         'clonal_constraint': True, 'clonal_centroid_ccf': [1.]*model.r,
         'clonal_cluster_label': 0, 'cluster_zero': 'fixed_occupied_clonal_centroid',
         'exclusions': exclusion_summary(model), 'diagnostics': result.diagnostics,
@@ -101,5 +121,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
 
 
 def process_tumor(tumor_file: str | Path, outdir: str | Path,
-                  fit_config: FitConfig | None = None) -> dict[str, object]:
-    return process_tumor_bundle(tumor_file, outdir, fit_config)[0]
+                  fit_config: FitConfig | None = None, *, checkpoint_path=None,
+                  resume=False, checkpoint_stop_after=None) -> dict[str, object]:
+    return process_tumor_bundle(tumor_file, outdir, fit_config, checkpoint_path=checkpoint_path,
+                                resume=resume, checkpoint_stop_after=checkpoint_stop_after)[0]

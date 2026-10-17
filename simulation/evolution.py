@@ -69,10 +69,7 @@ def assign_mutations_to_segments(
     *,
     random_state=None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if isinstance(random_state, np.random.Generator):
-        rng = random_state
-    else:
-        rng = np.random.default_rng(random_state)
+    rng = np.random.default_rng(random_state)
     if no_mutations < 0:
         raise ValueError("no_mutations must be nonnegative.")
     if not segments:

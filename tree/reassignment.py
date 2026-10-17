@@ -1,11 +1,13 @@
-"""Bounded fixed-K joint-membership proposals after the complete tree bank.
+"""Bounded fixed-K membership proposals aligned with the selected objective.
 
-Unweighted, fixed-center likelihood gains rank transfers; only the unchanged
-conditional refitter and mixture score decide path advancement. This is not
-EM, a monotone likelihood iteration, or an exhaustive partition search.
+Classification ranks exact fixed-center read-plus-count gains with dynamic
+counts/support after each greedy transfer. Legacy mixture and assigned-reads
+comparators retain read-only ranking. Conditional refits and authoritative
+scores decide path advancement; this is not EM or exhaustive optimization.
 """
 
 from time import perf_counter
+from collections import deque
 
 import numpy as np
 
@@ -27,7 +29,7 @@ def _partition_key(candidate):
     return "general", canonical, groups[candidate.refit.clonal_cluster]
 
 
-def _starting_states(original, winner):
+def _starting_states(original, winner, start_limit=START_LIMIT):
     # Preserve the tree bank's ordering for exact score ties. No fitted state
     # is removed: distinct-membership selection only limits proposal starts.
     ordered = sorted(original, key=lambda c: (
@@ -41,12 +43,13 @@ def _starting_states(original, winner):
         if key not in seen:
             chosen.append(candidate)
             seen.add(key)
-        if len(chosen) == START_LIMIT:
+        if len(chosen) == start_limit:
             break
     return chosen
 
 
-def _proposals(labels, centers, columns, observed, keys, *, support=None):
+def _proposals(labels, centers, columns, observed, keys, *, support=None,
+               objective="legacy_mixture"):
     """One ranked scan per proposal, with dynamic support in the greedy batch.
 
     Destination keys are scientific group multisets and center coordinates,
@@ -84,10 +87,18 @@ def _proposals(labels, centers, columns, observed, keys, *, support=None):
     for previous, current in zip(group_order, group_order[1:]):
         group_ranks[current] = (group_ranks[previous]
                                 + (group_keys[current] != group_keys[previous]))
-    gains = columns - assigned[:, None]
+    from ..kernel.objectives import transfer_count_gain, validate_selection_objective
+    validate_selection_objective(objective)
+    read_gains = np.asarray(columns, dtype=float)-assigned[:, None]
+
+    gains = read_gains.copy()
+    if objective == "classification":
+        gains += transfer_count_gain(sizes, np.arange(q)[:, None], np.arange(q)[None, :])[labels]
+    gains[np.arange(n), labels] = -np.inf
     rows, destinations = np.nonzero(np.isfinite(gains) & (gains > 0))
     ranked = sorted(zip(rows.tolist(), destinations.tolist()), key=lambda move: (
         -float(gains[move]), keys[move[0]], group_ranks[move[1]], move[0]))
+    initial_pairs = len(ranked)
 
     def legal(row, source, destination):
         return (sizes[source] > 1 and np.all(counts[source] - observed[row] > 0)
@@ -103,14 +114,61 @@ def _proposals(labels, centers, columns, observed, keys, *, support=None):
             single[row] = destination
             break
     batch, moved = labels.copy(), np.zeros(n, dtype=bool)
-    batch_checks = 0
-    for row, destination in ranked:
-        if moved[row]:
-            continue
-        batch_checks += 1
+    batch_checks, batch_gain, gain_updates = 0, 0., 0
+    pair_rows, cursors = {}, {}
+    if objective == "classification":
+        # All transfers sharing a source/destination pair receive the SAME
+        # count correction. Sort read gains once per pair; only its current
+        # legal head competes after each dynamic count/support update. This
+        # avoids re-sorting the full N-by-q matrix once per moved mutation.
+        for source in range(q):
+            for destination in range(q):
+                if source == destination:
+                    continue
+                rows = np.flatnonzero((labels == source) & np.isfinite(read_gains[:, destination]))
+                pair = source, destination
+                pair_rows[pair] = sorted(rows.tolist(), key=lambda row: (
+                    -float(read_gains[row, destination]), keys[row], row))
+                cursors[pair] = 0
+    else:
+        ranked = deque(ranked)
+    while ranked:
+        chosen = None
+        chosen_gain = None
+        if objective == "classification":
+            options = []
+            count_gains = transfer_count_gain(sizes, np.arange(q)[:, None], np.arange(q)[None, :])
+            for (source, destination), rows in pair_rows.items():
+                if sizes[source] <= 1:
+                    continue
+                cursor = cursors[source, destination]
+                while cursor < len(rows):
+                    row = rows[cursor]
+                    batch_checks += 1
+                    if not moved[row] and legal(row, source, destination):
+                        gain = float(read_gains[row, destination]+count_gains[source, destination])
+                        if gain > 0:
+                            options.append((-gain, keys[row], group_ranks[destination], row, destination))
+                        break
+                    cursor += 1
+                cursors[source, destination] = cursor
+            if options:
+                negative_gain, _, _, row, destination = min(options)
+                chosen, chosen_gain = (row, destination), -negative_gain
+        else:
+            while ranked:
+                row, destination = ranked.popleft()
+                if moved[row]:
+                    continue
+                batch_checks += 1
+                if legal(row, labels[row], destination):
+                    chosen, chosen_gain = (row, destination), float(gains[row, destination])
+                    break
+        if chosen is None:
+            break
+        row, destination = chosen
         source = labels[row]
-        if not legal(row, source, destination):
-            continue
+        batch_gain += chosen_gain
         batch[row], moved[row] = destination, True
         sizes[source] -= 1
         sizes[destination] += 1
@@ -121,13 +179,27 @@ def _proposals(labels, centers, columns, observed, keys, *, support=None):
             positive[destination] += support.positive[row]
             zero[source] -= support.hard_zero[row]
             zero[destination] += support.hard_zero[row]
+        # The count term changes every source/destination size preference.
+        # Re-rank all remaining pairs after EACH accepted classification move;
+        # static read-only ranks are valid only for the legacy comparator.
+        if objective == "classification":
+            # Previously inadmissible rows can become admissible when either
+            # endpoint changes support. Revisit only those affected queues.
+            for pair in cursors:
+                if source in pair or destination in pair:
+                    cursors[pair] = 0
+            gain_updates += 1
     return (single, batch if moved.any() else None), {
         "scanned_transfer_pairs": n * (q - 1),
-        "positive_gain_pairs": len(ranked),
+        "positive_gain_pairs": initial_pairs,
         "single_legal_checks": single_checks,
         "batch_legal_checks": batch_checks,
         "single_moves": int(single is not None),
         "batch_moves": int(moved.sum()),
+        "ranking_objective": objective,
+        "dynamic_count_updates": gain_updates,
+        "batch_fixed_center_objective_gain": batch_gain,
+        "stop_reason": "no_legal_positive_gain_transfer" if single is None else None,
     }
 
 
@@ -153,14 +225,12 @@ def _retained_bytes(candidates, bank):
     }
 
 
-def expand_memberships(model, bank):
-    """Append at most 16 general-membership proposal callbacks, in-place.
+def expand_memberships(model, bank, search=None):
+    """Append configured starts x rounds x two general-membership callbacks.
 
-    The original bank is frozen for selecting <=4 starting states, including
-    its exact winner. Each <=2-round path spends exactly two proposal slots
-    per proposal-ranking joint-matrix evaluation (<=8); absent, duplicate,
-    rejected, and non-improving proposals do not earn replacement slots. K=1 has no moves.
-    Eligible states are retained even when their path does not advance.
+    Every start includes the original bank's immutable winner. Absent,
+    duplicate, rejected and non-improving proposals consume their slots;
+    K=1 has no moves. Eligible states survive even without path advancement.
     """
     started = perf_counter()
     original = tuple(bank.candidates)
@@ -171,7 +241,9 @@ def expand_memberships(model, bank):
         winner = min(original, key=lambda c: (c.score, len(c.refit.centers), _partition_key(c)))
     if not any(candidate is winner for candidate in original):
         raise ValueError("The original winner must belong to the original bank")
-    starts = _starting_states(original, winner)
+    start_limit = getattr(search, "reassignment_starts", START_LIMIT)
+    round_limit = getattr(search, "reassignment_rounds", ROUND_LIMIT)
+    starts = _starting_states(original, winner, start_limit)
     keys = tuple(model.observation_keys())
     observed = np.asarray(model.observed, dtype=bool)
     before = _counter_snapshot(model, bank)
@@ -183,10 +255,12 @@ def expand_memberships(model, bank):
                 "occupied_q": q, "start_score": state.score, "rounds": [],
                 "final_score": state.score,
                 "skipped": "one_occupied_group" if q == 1 else None}
+        path.update(stop_reason="one_occupied_group" if q == 1 else "round_budget_exhausted",
+                    last_accepted_improvement=None, last_accepted_moved_mutations=0)
         paths.append(path)
         if q == 1:
             continue
-        for round_index in range(ROUND_LIMIT):
+        for round_index in range(round_limit):
             labels = np.asarray(state.refit.labels, dtype=np.int64)
             centers = np.asarray(state.refit.centers, dtype=float)
             clonal = state.refit.clonal_cluster
@@ -200,7 +274,8 @@ def expand_memberships(model, bank):
             evaluations += 1
             support = getattr(model, "regional_support", None)
             constraints = {"support": support} if support is not None and support.hard_zero.any() else {}
-            proposals, scan = _proposals(labels, centers, columns, observed, keys, **constraints)
+            proposals, scan = _proposals(labels, centers, columns, observed, keys,
+                objective=getattr(model, "selection_objective", "legacy_mixture"), **constraints)
             round_record = {"round": round_index, "parent_score": state.score,
                             **scan, "proposals": [], "advanced": False}
             path["rounds"].append(round_record)
@@ -235,11 +310,17 @@ def expand_memberships(model, bank):
             # states remain in the bank even when improvement is sub-tolerance.
             best = min(returned, key=lambda c: c.score, default=None)
             if best is None:
+                path["stop_reason"] = ("no_legal_positive_gain_transfer" if all(
+                    proposal is None for proposal in proposals) else "no_generated_improving_move")
                 break
             tolerance = SCORE_ATOL + SCORE_RTOL * max(abs(best.score), abs(state.score))
             round_record["advance_tolerance"] = tolerance
             if state.score - best.score <= tolerance:
+                path["stop_reason"] = "no_generated_improving_move"
                 break
+            path["last_accepted_improvement"] = float(state.score-best.score)
+            path["last_accepted_moved_mutations"] = int(np.count_nonzero(
+                state.refit.labels != best.refit.labels))
             state = best
             round_record["advanced"] = True
             accepted += 1
@@ -253,11 +334,12 @@ def expand_memberships(model, bank):
     scans = {key: sum(record[key] for path in paths for record in path["rounds"])
              for key in ("scanned_transfer_pairs", "positive_gain_pairs",
                          "single_legal_checks", "batch_legal_checks")}
-    return {"applied": True, "method": "bounded_fixed_k_joint_unweighted_reassignment_v1",
-            "starting_state_limit": START_LIMIT, "round_limit": ROUND_LIMIT,
+    return {"applied": True, "method": "bounded_fixed_k_objective_aligned_reassignment_v2",
+            "ranking_objective": getattr(model, "selection_objective", "legacy_mixture"),
+            "starting_state_limit": start_limit, "round_limit": round_limit,
             "proposal_slots_per_round": PROPOSALS_PER_ROUND,
-            "proposal_callback_limit": START_LIMIT * ROUND_LIMIT * PROPOSALS_PER_ROUND,
-            "proposal_joint_column_evaluation_limit": START_LIMIT * ROUND_LIMIT,
+            "proposal_callback_limit": start_limit * round_limit * PROPOSALS_PER_ROUND,
+            "proposal_joint_column_evaluation_limit": start_limit * round_limit,
             "score_atol": SCORE_ATOL, "score_rtol": SCORE_RTOL,
             "tie_rule": "gain_then_ID_free_row_and_destination_content_then_identical_row_index",
             "original_candidate_count": len(original), "original_winner_score": winner.score,

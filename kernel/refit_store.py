@@ -5,7 +5,6 @@ padded multiplicity width, so cache capacity cannot change logsumexp arithmetic.
 Off-grid continuous optimization never uses this store.
 """
 import numpy as np
-from scipy.special import logsumexp, xlog1py, xlogy
 
 from .likelihood import MultiplicityModel
 from ..io.data import readonly_array
@@ -62,15 +61,6 @@ are separate. A zero allowance invokes the original grid evaluation directly.
         self.bytes += self.column_bytes
         self._peak_bytes = max(self._peak_bytes, self.bytes)
 
-    @staticmethod
-    def _scalar_columns(scalar, grid):
-        """Same elementwise and multiplicity-reduction order as the baseline."""
-        p = np.minimum(1., grid[:, None, None]*scalar.scale[None, :, :])
-        kernel = (xlogy(scalar.r[None, :, None], p)
-                  + xlog1py((scalar.n-scalar.r)[None, :, None], -p)
-                  + scalar.log_constant[None, :, None])
-        return logsumexp(np.where(scalar.valid[None, :, :], kernel, -np.inf), axis=2)
-
     def _full_columns(self, grid, region, width):
         model = self.model
         allowed = model.observed[:, region]
@@ -91,7 +81,7 @@ are separate. A zero allowance invokes the original grid evaluation directly.
                 scalar.valid = multiplicities[None, :] <= scalar.major[:, None]
                 scalar.scale = multiplicities[None, :] / (
                     2*(1-scalar.purity) + scalar.purity*scalar.total[:, None])
-                result[:, active] = self._scalar_columns(scalar, grid)
+                result[:, active] = scalar.grid_columns(grid)
             else:
                 result[:, active] = model._regional_likelihood(grid, active, region)
         self.stats["columns"] += len(grid)
@@ -153,7 +143,7 @@ interpolation, prefix differences or regrouped component sums are introduced.
                         self._put(key, column)
             if direct:
                 values = points[direct]
-                block[direct] = (self._scalar_columns(scalar, values) if scalar is not None
+                block[direct] = (scalar.grid_columns(values) if scalar is not None
                                  else self.model._regional_likelihood(values, rows, region))
                 self.stats["uncached_columns"] += len(direct)
             result[first:first+batch] = block.sum(axis=1)

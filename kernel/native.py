@@ -21,10 +21,16 @@ DIAGNOSTIC_FIELDS = (
     'penalty_gradient_roundoff_scale',
     'anchor_residual_ccf', 'anchor_witness_index', 'anchor_projection_switches',
     'raw_constraint_tolerance_met',
+    'qp_kkt_failures', 'no_descent_direction', 'line_search_rejections',
+    'maximum_backtracking_index', 'maximum_qp_backward_error', 'accepted_steps',
+    'maximum_accepted_objective_increase',
+    'precision_limited_stagnation',
 )
 INTEGER_DIAGNOSTICS = frozenset(('requested_K', 'actual_blocks', 'iterations',
     'continuation_levels', 'qp_budget_hits', 'longest_block', 'feasible_warm_starts',
-    'anchor_witness_index', 'anchor_projection_switches', 'raw_constraint_tolerance_met'))
+    'anchor_witness_index', 'anchor_projection_switches', 'raw_constraint_tolerance_met',
+    'qp_kkt_failures', 'no_descent_direction', 'line_search_rejections',
+    'maximum_backtracking_index', 'accepted_steps', 'precision_limited_stagnation'))
 STATUSES = ('penalty_stationary_constraint_tolerance', 'penalty_numerical_limit_candidate',
             'line_search_stalled_candidate', 'finite_budget_candidate')
 
@@ -51,12 +57,12 @@ def _load_library(root, path, signature):
     library.CliPP2KernelBuildId.restype = ctypes.c_char_p
     library.CliPP2KernelLastError.argtypes = []
     library.CliPP2KernelLastError.restype = ctypes.c_char_p
-    if library.CliPP2KernelABI() != 2 or library.CliPP2KernelBuildId().decode() != digest:
+    if library.CliPP2KernelABI() != 3 or library.CliPP2KernelBuildId().decode() != digest:
         raise RuntimeError('CliPP2 kernel binary/source or ABI mismatch; rebuild before fitting')
     return library, digest
 
 
-def forest_quadratic(curvature, rhs, edges, penalty, lower, upper):
+def forest_quadratic(curvature, rhs, edges, penalty, lower, upper, *, return_diagnostics=False):
     """Solve an N-by-R box QP with one shared forest and region-specific bounds.
 
     The caller independently audits KKT residuals against the original inputs.
@@ -77,16 +83,29 @@ def forest_quadratic(curvature, rhs, edges, penalty, lower, upper):
     library, _ = native_library()
     ints = np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS')
     doubles = np.ctypeslib.ndpointer(dtype=np.float64, flags='C_CONTIGUOUS')
-    entry = library.CliPP2ForestQP
+    entry = library.CliPP2ForestQPDiagnostics
     entry.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ints, doubles, doubles,
-                     ctypes.c_double, doubles, doubles, doubles, ints]
+                     ctypes.c_double, doubles, doubles, doubles, ints, ints, doubles, ints]
     entry.restype = ctypes.c_int
     result = np.empty_like(h)
     diagnostics = np.empty(2, dtype=np.int32)
-    if entry(n, regions, len(edges), edges, h, b, float(penalty), lo, hi, result, diagnostics):
+    regional = np.empty((regions, 4), dtype=np.int32)
+    violations = np.empty((regions, 2), dtype=np.float64)
+    active = np.empty_like(h, dtype=np.int32)
+    if entry(n, regions, len(edges), edges, h, b, float(penalty), lo, hi, result, diagnostics,
+             regional, violations, active):
         raise RuntimeError('CliPP2 forest kernel failed: '+library.CliPP2KernelLastError().decode())
     if not np.isfinite(result).all():
         raise RuntimeError('CliPP2 forest kernel returned nonfinite coordinates')
+    if return_diagnostics:
+        return result, dict(active_set_sweeps=int(diagnostics[0]), budget_hits=int(diagnostics[1]),
+            regional_active_set_sweeps=regional[:, 0].tolist(),
+            regional_active_set_changes=regional[:, 1].tolist(),
+            regional_repeated_configurations=regional[:, 2].tolist(),
+            regional_budget_hits=regional[:, 3].tolist(),
+            regional_preclip_bound_violation=violations[:, 0].tolist(),
+            regional_max_encountered_bound_violation=violations[:, 1].tolist(),
+            active_state=active)
     return result, int(diagnostics[0]), int(diagnostics[1])
 
 
@@ -100,7 +119,8 @@ def _integers(values, name):
     return np.ascontiguousarray(values, dtype=np.int32)
 
 
-def solve_chain(arrays, purity, pilot_cp, capacities, *, clonal_eligible, evaluator=None):
+def solve_chain(arrays, purity, pilot_cp, capacities, *, clonal_eligible, evaluator=None,
+                numerical_diagnostics_dir=None, numerical_diagnostics_max_bytes=16_777_216):
     """Return proposals/diagnostics in memory; optionally evaluate likelihood on CUDA.
 
     Inputs and outputs follow frozen chain order. Callback failure aborts the
@@ -127,7 +147,47 @@ def solve_chain(arrays, purity, pilot_cp, capacities, *, clonal_eligible, evalua
     doubles = np.ctypeslib.ndpointer(dtype=np.float64, flags='C_CONTIGUOUS')
     ptr = ctypes.POINTER(ctypes.c_double)
     callback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ptr, ptr, ptr, ptr)
+    int_ptr = ctypes.POINTER(ctypes.c_int)
+    failure_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ptr, ptr, ptr, ptr, ptr,
+                                   int_ptr, ctypes.c_double, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_double)
     errors = []
+    snapshots = None
+    if numerical_diagnostics_dir is not None:
+        from .numerical import FailureSnapshots
+        snapshots = FailureSnapshots(numerical_diagnostics_dir, numerical_diagnostics_max_bytes)
+
+    def failure_callback(count, xp, hp, bp, zp, resultp, activep, rho, witness, capacity, iteration, error):
+        try:
+            from .numerical import qp_residual
+            def column(pointer):
+                return np.ctypeslib.as_array(pointer, shape=(count,)).copy()[:, None]
+            x, h, b, result, active = [column(p) for p in (xp, hp, bp, resultp, activep)]
+            z = np.ctypeslib.as_array(zp, shape=(max(0, count-1),)).copy()
+            index = np.flatnonzero(z == 0)
+            edges = np.column_stack((index, index+1))
+            lower, upper = np.full_like(x, 1e-8), np.full_like(x, 1-1e-8)
+            audit = qp_residual(h, b, edges, rho, lower, upper, result)
+            audit['proposed_step_max_CCF'] = float(np.max(np.abs(result-x)))
+            # Scalar input order is the frozen chain order, represented with
+            # padded IDs so standalone replay retains its exact row order.
+            frozen = dict(H=h, b=b, L=lower, U=upper, rho=np.asarray(rho), edges=edges,
+                X=x, result=result, active_state=active,
+                model_alt=arrays[0][:, None], model_depth=arrays[1][:, None],
+                model_major=arrays[2][:, None], model_total=arrays[3][:, None],
+                model_normal=np.full_like(x, 2), model_purity=np.full_like(x, purity),
+                model_observed=np.ones_like(x, dtype=bool),
+                model_mutation_ids=np.asarray([f'chain_row_{i:010d}' for i in range(count)]),
+                model_region_ids=np.asarray(['scalar_region']))
+            snapshots.record(frozen, dict(kind='scalar_unqualified_qp', audit=audit,
+                native_reported_backward_error=error, witness=witness,
+                requested_k=capacity, iteration=iteration,
+                coordinate_identity='frozen_chain_row_order_not_public_mutation_ids'),
+                max(audit['backward_error'], 1e-7))
+            return 0
+        except BaseException as error:
+            errors.append(error)
+            return 1
 
     def callback(count, xp, lp, gp, hp):
         try:
@@ -147,16 +207,17 @@ def solve_chain(arrays, purity, pilot_cp, capacities, *, clonal_eligible, evalua
             return 1
 
     callback_handle = callback_type(callback) if evaluator is not None else callback_type()
+    failure_handle = failure_type(failure_callback) if snapshots is not None else failure_type()
     k = len(capacities)
     labels, cp = np.empty((k, n), dtype=np.int32), np.empty((k, n), dtype=np.float64)
     diagnostics = np.empty((k, len(DIAGNOSTIC_FIELDS)), dtype=np.float64)
     statuses = np.empty(k, dtype=np.int32)
-    entry = library.CliPP2SolveChain
+    entry = library.CliPP2SolveChainDiagnostics
     entry.argtypes = [ctypes.c_int, ints, ints, ints, ints, ints, ctypes.c_double, doubles,
-                     ints, ctypes.c_int, ints, doubles, doubles, ints, callback_type]
+                     ints, ctypes.c_int, ints, doubles, doubles, ints, callback_type, failure_type]
     entry.restype = ctypes.c_int
     status = entry(n, *arrays, eligible, float(purity), pilot, capacities, k,
-                   labels, cp, diagnostics, statuses, callback_handle)
+                   labels, cp, diagnostics, statuses, callback_handle, failure_handle)
     if errors:
         raise RuntimeError('CliPP2 likelihood callback failed; no CPU fallback') from errors[0]
     if status:
@@ -172,6 +233,17 @@ def solve_chain(arrays, purity, pilot_cp, capacities, *, clonal_eligible, evalua
                    backend='cuda_likelihood_host_chain' if evaluator is not None else 'cpu')
         raw.update(tree_constraint_residual_ccf=raw['constraint_residual_CCF'],
                    raw_penalty_objective=raw['objective'], raw_stationarity_ccf=raw['stationarity_CCF'])
+        raw['failure_reasons'] = [name for name, value in (
+            ('kkt_backward_error_exceeded', raw['qp_kkt_failures']),
+            ('no_descent_direction', raw['no_descent_direction']),
+            ('line_search_rejected', raw['line_search_rejections'])) if value]
+        raw['qp_unqualified'] = raw['qp_budget_hits']
+        raw['native_qualification_scope'] = 'original_qp_kkt_and_actual_objective_descent'
+        raw['failure_snapshots'] = snapshots.summary() if snapshots is not None else None
+        if raw['precision_limited_stagnation']:
+            raw['status'] = 'precision_limited_candidate'
+            raw['failure_reasons'].append('precision_limited_stagnation')
+            raw['precision_limit_basis'] = 'stagnant support with coordinate-spacing risk; not replay-confirmed attribution'
         proposals.append(dict(requested_k=int(capacity), labels=labels[index].copy(),
                               cp=cp[index].copy(), diagnostics=raw))
     return proposals, digest

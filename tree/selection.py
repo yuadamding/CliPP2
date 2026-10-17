@@ -1,4 +1,4 @@
-"""Tree proposals, bounded general memberships and joint-mixture selection.
+"""Tree proposals, bounded general memberships and objective-bound selection.
 
 The winner is reconciled against every eligible scored candidate, including
 intermediate refinement states. Exhaustive enumeration covers only connected
@@ -12,7 +12,7 @@ from time import perf_counter
 
 import numpy as np
 
-from .refinement import canonical_partition, refine_partition
+from .refinement import canonical_partition, refine_partition, tree_adjacency
 from ..config import DEFAULT_MAX_CLUSTERS, EXHAUSTIVE_MAX_CLUSTERS, SearchPolicy
 from ..kernel import ALGORITHM, MAX_CLUSTERS
 from ..kernel.model import RefittedPartition, RegionalModel
@@ -38,6 +38,9 @@ class _TreeRefit:
     diagnostics: dict
     partition_cache: object
     groups: tuple | None = None
+    selection_log_likelihood: float = np.nan
+    classification_count_term: float = np.nan
+    selection_objective: str = "classification"
 
     @property
     def labels(self):
@@ -52,7 +55,10 @@ class _TreeRefit:
                    mixture_log_likelihood=float(fit.mixture_log_likelihood),
                    complexity_penalty=float(fit.complexity_penalty), score=float(fit.score),
                    eligible=bool(fit.eligible), reason=fit.reason, diagnostics=fit.diagnostics,
-                   partition_cache=partition_cache, groups=groups)
+                   partition_cache=partition_cache, groups=groups,
+                   selection_log_likelihood=getattr(fit, "selection_log_likelihood", np.nan),
+                   classification_count_term=getattr(fit, "classification_count_term", np.nan),
+                   selection_objective=getattr(fit, "selection_objective", "legacy_mixture"))
 
 
 @dataclass(eq=False)
@@ -157,12 +163,7 @@ def _canonical_inputs(labels, centers, n, r):
 
 
 def _forest_structure(tree, cuts):
-    removed = set(cuts)
-    adjacency = [[] for _ in range(tree.n)]
-    for edge, (a, b) in enumerate(tree.edges):
-        if edge not in removed:
-            adjacency[a].append((int(b), edge))
-            adjacency[b].append((int(a), edge))
+    adjacency = tree_adjacency(tree, cuts)
     parent = np.full(tree.n, -1, dtype=np.int64)
     parent_edge = np.full(tree.n, -1, dtype=np.int64)
     component = np.empty(tree.n, dtype=np.int64)
@@ -341,6 +342,22 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
         from ..kernel.topology import partition_from_cuts
         return partition_from_cuts(tree, cuts)
 
+    # The same cheap support-preserving route is used by bounded search.
+    # Raw native proposals and solver status remain in their original bank.
+    from .support_proposals import supported_native_repairs
+    shared_repairs = 0
+    for seed in seeds:
+        if shared_repairs >= 16:
+            break
+        seed_labels = seed.get("labels")
+        if seed_labels is None:
+            seed_labels = decode(tuple(seed["cuts"]))
+        for labels, details in supported_native_repairs(model, tree, seed_labels, seed["cuts"],
+                                                         16-shared_repairs):
+            shared_repairs += 1
+            bank.consider_membership(labels, None, {
+                "route": "native_support_transformation", "requested_k": seed["requested_k"], **details})
+
     for edge in chosen:
         cuts = (edge,)
         consider(cuts, decode(cuts), None, {
@@ -389,6 +406,7 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
             pass
     evaluated = sum((edge,) in attempted for edge in edges)
     return {"small_tree_node_limit": 64, "large_tree_split_limit": 32,
+            "shared_support_repair_proposals": shared_repairs,
             "supported_one_edge_splits": len(edges), "one_edge_proposals": len(chosen),
             "ranking": rank_diagnostic,
             "evaluated_supported_one_edge_splits": evaluated,
@@ -537,7 +555,10 @@ class _CandidateBank:
                         conditional_log_likelihood=fitted.conditional_log_likelihood,
                         mixture_log_likelihood=fitted.mixture_log_likelihood,
                         complexity_penalty=fitted.complexity_penalty, score=fitted.score,
-                        eligible=True, reason=fitted.reason, diagnostics=dict(fitted.diagnostics))
+                        eligible=True, reason=fitted.reason, diagnostics=dict(fitted.diagnostics),
+                        selection_log_likelihood=getattr(fitted, "selection_log_likelihood", np.nan),
+                        classification_count_term=getattr(fitted, "classification_count_term", np.nan),
+                        selection_objective=getattr(fitted, "selection_objective", "legacy_mixture"))
                 else:
                     fit = fitted
                 clonal = fit.clonal_cluster
@@ -550,8 +571,11 @@ class _CandidateBank:
                     if not tree:
                         self.general_rejections.append(rejection)
                     continue
+                authoritative_ll = (fit.mixture_log_likelihood if getattr(
+                    self.model, "selection_objective", "legacy_mixture") == "legacy_mixture"
+                    else fit.selection_log_likelihood)
                 if (not np.isfinite([fit.score, fit.conditional_log_likelihood,
-                                    fit.mixture_log_likelihood, fit.complexity_penalty]).all()
+                                    fit.complexity_penalty, authoritative_ll]).all()
                         or not np.array_equal(fit.labels, labels)
                         or not np.array_equal(fit.centers[clonal], np.ones(self.model.r))
                         or np.any(fit.weights <= 0)
@@ -593,7 +617,7 @@ class _CandidateBank:
         variants = self.consider_variants(cuts, labels, centers, provenance,
                                           clonal_cluster=clonal_cluster)
         # Every variant is stored; only boundary-path advancement uses the
-        # conditional objective rather than the final joint-mixture score.
+        # conditional objective rather than the final selection score.
         key = (lambda c: (-c.refit.conditional_log_likelihood, _score_key(c))) if (
             provenance.get("route") == "boundary_refinement") else _score_key
         return min(variants, key=key, default=None)
@@ -603,7 +627,8 @@ class _CandidateBank:
                              clonal_cluster=clonal_cluster)
 
 
-def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, search=None):
+def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, search=None,
+             checkpoint_path=None, resume=False, checkpoint_stop_after=None):
     """Fit tree proposals followed by bounded free-center joint reassignment.
 
     Truth is deliberately absent from this interface. The single-region
@@ -621,6 +646,8 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
     requested_mode = requested_search.mode
     strict = active_support(model) is not None
     search = requested_search.resolve(max_clusters, active_hard_zero=strict)
+    if (checkpoint_path is not None or resume or checkpoint_stop_after is not None) and search.mode != "bounded":
+        raise ValueError("Search checkpoints require explicit bounded search; no route is changed silently")
     if capacities is None:
         capacities = tuple(range(1, min(max_clusters, model.n) + 1))
     else:
@@ -632,13 +659,27 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
     support_preflight(model, max(capacities))
     model.check_clonal_feasibility(max(capacities))
     times = {}
+    saved = None
+    if resume:
+        if checkpoint_path is None:
+            raise ValueError("resume requires a checkpoint_path")
+        from .checkpoint import read_checkpoint
+        saved = read_checkpoint(checkpoint_path, model)
+        from ..kernel.topology import FrozenTree
+        pilot, pilot_diagnostics = saved["pilot"], saved["pilot_diagnostics"]
+        tree = FrozenTree(**saved["tree"])
+        times.update(saved["timings"])
     started = perf_counter()
-    pilot, pilot_diagnostics = model.pilots()
-    times["initialization_seconds"] = perf_counter() - started
+    if saved is None:
+        pilot, pilot_diagnostics = model.pilots()
+        times["initialization_seconds"] = perf_counter() - started
     started = perf_counter()
-    tree = build_tree(pilot, model.observed, model.mutation_ids)
-    times["tree_seconds"] = perf_counter() - started
+    if saved is None:
+        tree = build_tree(pilot, model.observed, model.mutation_ids)
+        times["tree_seconds"] = perf_counter() - started
     started = perf_counter()
+    old_seeds = list(saved["seeds"]) if saved is not None else []
+    pending_capacities = tuple(k for k in capacities if k not in {seed["requested_k"] for seed in old_seeds})
     if tree.component_count > 1:
         if search.mode != "bounded":
             if requested_mode != "auto":
@@ -648,15 +689,17 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
         # native component or cut can acquire evidence in every region. Keep
         # each capacity explicit without running unusable continuation work;
         # general memberships can instead unite pieces across components.
-        seeds = [{"requested_k": k, "unavailable_reason": "disconnected_observation_overlap"}
-                 for k in capacities]
+        seeds = old_seeds+[{"requested_k": k, "unavailable_reason": "disconnected_observation_overlap"}
+                           for k in pending_capacities]
     else:
-        seeds = generate_candidates(model, tree, pilot, capacities)
-    times["continuation_seconds"] = perf_counter() - started
+        seeds = old_seeds+(list(generate_candidates(model, tree, pilot, pending_capacities))
+                           if pending_capacities else [])
+    times["continuation_seconds"] = times.get("continuation_seconds", 0.)+perf_counter()-started
     if search.mode == "bounded":
         from .search import fit_bounded
         result = fit_bounded(model, tree, pilot, seeds, capacities, search,
-                             pilot_diagnostics=pilot_diagnostics, **times)
+                             pilot_diagnostics=pilot_diagnostics, checkpoint_path=checkpoint_path,
+                             resume=resume, checkpoint_stop_after=checkpoint_stop_after, **times)
         result.diagnostics["search_policy"].update(requested_mode=requested_mode, resolved_mode=search.mode)
         return result
     bank = _CandidateBank(model, tree)
@@ -741,7 +784,7 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
     bank.original_selected = min(bank.candidates, key=_score_key)
     original_count = len(bank.candidates)
     from .reassignment import expand_memberships
-    reassignment = (expand_memberships(model, bank) if model.r > 1 else
+    reassignment = (expand_memberships(model, bank, search) if model.r > 1 else
                     {"applied": False, "reason": "single_region_path_unchanged"})
     times["reassignment_inclusive_seconds"] = reassignment.get("seconds", 0.0)
     selected = min(bank.candidates, key=_score_key)
@@ -775,6 +818,11 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
         "reassignment": reassignment,
         "original_tree_candidate_count": original_count,
         "original_tree_selected_score": bank.original_selected.score,
+        "original_candidate_count": original_count,
+        "original_selected_score": bank.original_selected.score,
+        "original_bank_membership_counts": {kind: sum(c.membership_kind == kind
+            for c in bank.candidates[:original_count]) for kind in ("tree", "general")},
+        "legacy_original_tree_fields_scope": "deprecated aliases for the full pre-reassignment bank, including support transformations",
         "selected_membership_kind": selected.membership_kind,
         "eligible_scored_candidates": len(bank.candidates),
         "unique_eligible_partitions": unique_partitions,

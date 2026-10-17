@@ -14,6 +14,12 @@ def refit_center(model, *, grid_evaluator=None):
         )
     )
     values = (model.grid_log_likelihood if grid_evaluator is None else grid_evaluator)(grid)
+    return maximize_grid_modes(grid, values, lambda cp: float(model.log_likelihood(cp).sum()),
+                               failure="Marginal-likelihood center refit failed")
+
+
+def maximize_grid_modes(grid, values, log_likelihood, *, failure):
+    """Refine all bracketed modes and edge intervals; ties favor lower centers."""
     best_index = int(np.argmax(values))
     best = (float(values[best_index]), float(grid[best_index]))
     maxima = (
@@ -28,17 +34,18 @@ def refit_center(model, *, grid_evaluator=None):
     # every interior grid point is worse. It then has no grid-local maximum
     # to bracket. Search both edge intervals even when neither is bracketed;
     # the explicit grid candidates above still preserve exact endpoints.
-    intervals = {(float(grid[0]), float(grid[1])), (float(grid[-2]), float(grid[-1]))}
+    intervals = set() if len(grid) == 1 else {(float(grid[0]), float(grid[1])),
+                                             (float(grid[-2]), float(grid[-1]))}
     intervals.update((float(grid[index - 1]), float(grid[index + 1])) for index in maxima)
     for lower, upper in sorted(intervals):
         fit = minimize_scalar(
-            lambda cp: -float(model.log_likelihood(cp).sum()),
+            lambda center: -log_likelihood(center),
             bounds=(lower, upper),
             method="bounded",
             options={"xatol": 1e-12, "maxiter": 500},
         )
         if not fit.success or not np.isfinite(fit.fun):
-            raise RuntimeError("Marginal-likelihood center refit failed: %s" % fit.message)
+            raise RuntimeError(f"{failure}: {fit.message}")
         candidate = (-float(fit.fun), float(fit.x))
         if candidate[0] > best[0] or (candidate[0] == best[0] and candidate[1] < best[1]):
             best = candidate

@@ -88,7 +88,8 @@ double chain_support_penalty(const std::vector<double>& x,
 
 std::vector<double> boxed_chain_laplacian_quadratic(const std::vector<double>& curvature,
     const std::vector<double>& rhs,const std::vector<double>& projected,
-    double rho,bool* solved,double lower,double upper)
+    double rho,bool* solved,double lower,double upper,double* backward_error=nullptr,
+    std::vector<int>* returned_active=nullptr)
 {
     const int n=int(curvature.size());
     std::vector<double> x(n,lower);
@@ -137,10 +138,34 @@ std::vector<double> boxed_chain_laplacian_quadratic(const std::vector<double>& c
             const long double wrong=active[i]<0?-g:(active[i]>0?g:0.0L);
             if(wrong>violation){violation=wrong;release=i;}
         }
-        if(release<0){if(solved)*solved=true;return x;}
+        if(release<0){
+            // Same original-input componentwise KKT gate as the forest route.
+            // Active-set termination alone does not qualify a high-rho solve.
+            long double error=0.0L;
+            for(int i=0;i<n;++i){
+                const long double base=static_cast<long double>(curvature[i])*x[i];
+                long double g=base-rhs[i],scale=1.0L+std::fabs(base)+std::fabs(rhs[i]);
+                if(edge(i-1)){
+                    const long double delta=static_cast<long double>(rho)*(static_cast<long double>(x[i])-x[i-1]);
+                    g+=delta;scale+=std::fabs(delta);
+                }
+                if(edge(i)){
+                    const long double delta=static_cast<long double>(rho)*(static_cast<long double>(x[i])-x[i+1]);
+                    g+=delta;scale+=std::fabs(delta);
+                }
+                if(x[i]==lower) g=std::min(g,0.0L);
+                if(x[i]==upper) g=std::max(g,0.0L);
+                error=std::max(error,std::fabs(g)/scale);
+            }
+            if(backward_error) *backward_error=double(error);
+            if(solved) *solved=std::isfinite(error) && error<=1e-7L;
+            if(returned_active) *returned_active=active;
+            return x;
+        }
         active[release]=0;
     }
     for(double& value:x) value=std::max(lower,std::min(upper,value));
+    if(returned_active) *returned_active=active;
     return x;
 }
 
@@ -231,7 +256,7 @@ void feasible_support_warm_start(const std::vector<double>& raw,const std::vecto
 
 void solve_chain(const ChainData& data,const int* requested_k,int k_count,
     const ChainEvaluator& evaluate,int* labels_out,double* cp_out,
-    double* diagnostics_out,int* statuses_out)
+    double* diagnostics_out,int* statuses_out,const ChainFailureObserver& observer)
 {
     constexpr int levels=kChainLevels, iterations_per_level=kChainIterationsPerLevel;
     constexpr double stationarity_tolerance=kChainStationarityTolerance, constraint_tolerance=kChainConstraintTolerance;
@@ -247,12 +272,17 @@ void solve_chain(const ChainData& data,const int* requested_k,int k_count,
         if(!std::isfinite(sum(values)))throw std::runtime_error("Initial chain likelihood is nonfinite.");
         double rho=1.0,stat=INFINITY,violation=INFINITY;
         int total_iterations=0,level_used=0,qp_budget_hits=0,warm_starts=0;
+        int qp_kkt_failures=0,no_descent=0,line_search_rejections=0,max_backtracks=0,accepted_steps=0;
+        double max_qp_error=0.0,max_accepted_increase=0.0;
         bool stalled=false,numerical_limit=false;
+        bool precision_stagnation=false;
         int witness=project_anchor(x,data.clonal_eligible),switches=0;
         auto reproject=[&](){const int next=project_anchor(x,data.clonal_eligible);switches+=(next!=witness);witness=next;};
         std::vector<double> warm_x,warm_values,warm_gradient,warm_curvature;
         for(int level=0;level<levels;++level){
             level_used=level+1;stalled=false;
+            int repeated_stagnation=0,previous_witness=-1;
+            std::vector<int> previous_labels;
             for(int iteration=0;iteration<iterations_per_level;++iteration){
                 ++total_iterations;
                 const auto z=project_chain_jumps(x,k);
@@ -268,24 +298,33 @@ void solve_chain(const ChainData& data,const int* requested_k,int k_count,
                 }
                 h[witness]+=rho;rhs[witness]+=rho;diagonal[witness]+=rho;
                 bool qp_solved=false;
+                double qp_error=0.0;
+                std::vector<int> qp_active;
                 // Holding sparse values fixed adds artificial rho stiffness at
                 // retained jumps. Holding only their support instead minimizes
                 // those values analytically and gives a tighter MM upper bound.
                 const auto qp=boxed_chain_laplacian_quadratic(h,rhs,z,rho,
-                    &qp_solved,kChainLowerCCF,kChainUpperCCF);
+                    &qp_solved,kChainLowerCCF,kChainUpperCCF,&qp_error,observer?&qp_active:nullptr);
                 if(!qp_solved) ++qp_budget_hits;
+                qp_kkt_failures+=qp_error>1e-7;
+                max_qp_error=std::max(max_qp_error,qp_error);
+                if(!qp_solved && observer) observer(x,h,rhs,z,qp,qp_active,rho,witness,k,total_iterations,qp_error);
                 const double old_objective=sum(values)+chain_support_penalty(x,z,rho)+anchor_penalty(x,witness,rho);
                 bool accepted=false;
+                double accepted_decrease=0.0;
                 std::vector<double> trial(n),trial_values(n),trial_gradient(n),trial_curvature(n);
                 for(int fallback=0;fallback<2 && !accepted;++fallback){
+                    // An unqualified QP cannot be admitted by line search.
+                    if(!fallback && !qp_solved) continue;
                     std::vector<double> direction(n);double slope=0.0;
                     for(int i=0;i<n;++i){
                         const double candidate=fallback?std::max(kChainLowerCCF,std::min(kChainUpperCCF,x[i]-g[i]/diagonal[i])):qp[i];
                         direction[i]=candidate-x[i];slope+=g[i]*direction[i];
                     }
-                    if(slope>=0.0) continue;
+                    if(!std::isfinite(slope) || slope>=0.0){++no_descent;continue;}
                     double step=1.0;
                     for(int backtrack=0;backtrack<40;++backtrack){
+                        max_backtracks=std::max(max_backtracks,backtrack);
                         for(int i=0;i<n;++i) trial[i]=std::max(kChainLowerCCF,std::min(kChainUpperCCF,x[i]+step*direction[i]));
                         evaluate(trial,trial_values,trial_gradient,trial_curvature);
                         // This support-conditional objective bounds the exact
@@ -294,6 +333,8 @@ void solve_chain(const ChainData& data,const int* requested_k,int k_count,
                         // including when projection support changes or ties.
                         const double value=sum(trial_values)+chain_support_penalty(trial,z,rho)+anchor_penalty(trial,witness,rho);
                         if(std::isfinite(value) && value<=old_objective+1e-4*step*slope+1e-12*std::max(1.0,std::fabs(old_objective))){
+                            ++accepted_steps;max_accepted_increase=std::max(max_accepted_increase,value-old_objective);
+                            accepted_decrease=old_objective-value;
                             double displacement=0.0;
                             for(int i=0;i<n;++i) displacement=std::max(displacement,std::fabs(trial[i]-x[i]));
                             x.swap(trial);values.swap(trial_values);gradient.swap(trial_gradient);curvature.swap(trial_curvature);accepted=true;
@@ -302,8 +343,20 @@ void solve_chain(const ChainData& data,const int* requested_k,int k_count,
                         }
                         step*=0.5;
                     }
+                    if(!accepted) ++line_search_rejections;
                 }
-                if(!accepted){stalled=true;break;}
+                if(!accepted) stalled=true;
+                const auto current_labels=chain_labels(z);
+                const bool repeats=current_labels==previous_labels && witness==previous_witness;
+                const bool precision_risk=qp_error>1e-7 &&
+                    8.0*rho*std::numeric_limits<double>::epsilon()>=stationarity_tolerance;
+                const bool stagnant=!qp_solved && precision_risk &&
+                    accepted_decrease<=1e-12*std::max(1.0,std::fabs(old_objective));
+                repeated_stagnation=stagnant?(repeats?repeated_stagnation+1:1):0;
+                previous_labels=current_labels;previous_witness=witness;
+                if(repeated_stagnation>=3 || (stalled && stagnant)){
+                    precision_stagnation=numerical_limit=true;break;
+                }
                 if(stalled) break;
             }
             const auto z=project_chain_jumps(x,k);
@@ -313,6 +366,7 @@ void solve_chain(const ChainData& data,const int* requested_k,int k_count,
             const auto scale=block_scale(x,z,curvature);
             const double residual=std::max({violation,scale.range,std::fabs(x[witness]-1.0)});
             if(stat<=stationarity_tolerance && residual<=constraint_tolerance) break;
+            if(precision_stagnation) break;
             const double roundoff_scale=8.0*rho*std::numeric_limits<double>::epsilon();
             if(rho>=maximum_rho || (stalled && residual<=constraint_tolerance && roundoff_scale>=stationarity_tolerance)){
                 numerical_limit=true;break;
@@ -366,7 +420,10 @@ void solve_chain(const ChainData& data,const int* requested_k,int k_count,
             double(level_used),double(qp_budget_hits),kChainLowerCCF,kChainUpperCCF,
             scale.range,double(scale.longest),double(warm_starts),
             8.0*rho*std::numeric_limits<double>::epsilon(),
-            anchor_residual,double(witness),double(switches),double(feasible)
+            anchor_residual,double(witness),double(switches),double(feasible),
+            double(qp_kkt_failures),double(no_descent),double(line_search_rejections),
+            double(max_backtracks),max_qp_error,double(accepted_steps),max_accepted_increase,
+            double(precision_stagnation)
         };
         std::copy(diagnostics,diagnostics+kDiagnosticCount,
                   diagnostics_out+static_cast<std::size_t>(request)*kDiagnosticCount);

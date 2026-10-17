@@ -15,76 +15,26 @@ def add_simulation_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the compact, canonical single-tumor simulation interface."""
 
     defaults = TumorSimulationConfig()
-    parser.add_argument(
-        "--out-dir",
-        default=str(defaults.out_dir),
-        help="Parent directory for the generated tumor.",
-    )
-    parser.add_argument(
-        "--tumor-id",
-        default=defaults.tumor_id,
-        help="Name of the generated tumor directory.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=defaults.seed,
-        help="Deterministic master seed.",
-    )
-    parser.add_argument(
-        "--mutation-count",
-        type=int,
-        default=defaults.mutation_count,
-        help="Exact number of SNVs.",
-    )
-    parser.add_argument(
-        "--mean-depth",
-        type=int,
-        default=defaults.mean_depth,
-        help="Mean Poisson sequencing depth.",
-    )
-    parser.add_argument(
-        "--purity",
-        type=float,
-        default=defaults.purity,
-        help="Target mean tumor purity.",
-    )
-    parser.add_argument(
-        "--cna-event-rate",
-        type=float,
-        default=defaults.copy_number.cna_event_rate,
-        help="Gain rate per genomic segment in each independent region; CN is locally clonal.",
-    )
-    parser.add_argument(
-        "--region-count",
-        type=int,
-        default=defaults.region_count,
-        help="Number of regions, written as region1 through regionN.",
-    )
-    parser.add_argument(
-        "--clone-count",
-        type=int,
-        default=defaults.clone_count,
-        help="Exact evolutionary clone count.",
-    )
-    parser.add_argument(
-        "--n-segments",
-        type=int,
-        default=defaults.copy_number.n_segments,
-        help="Number of genomic copy-number intervals.",
-    )
-    parser.add_argument(
-        "--segment-size-bp",
-        type=int,
-        default=defaults.copy_number.segment_size_bp,
-        help="Length of each simulated genomic interval.",
-    )
-    parser.add_argument(
-        "--max-rejection-tries",
-        type=int,
-        default=defaults.max_rejection_tries,
-        help="Maximum attempts used to satisfy the simulation invariants.",
-    )
+    for name, kind, default, help_text in (
+        ("out-dir", str, str(defaults.out_dir), "Parent directory for the generated tumor."),
+        ("tumor-id", str, defaults.tumor_id, "Name of the generated tumor directory."),
+        ("seed", int, defaults.seed, "Deterministic master seed."),
+        ("mutation-count", int, defaults.mutation_count, "Exact number of SNVs."),
+        ("mean-depth", int, defaults.mean_depth, "Mean Poisson sequencing depth."),
+        ("purity", float, defaults.purity, "Target mean tumor purity."),
+        ("cna-event-rate", float, defaults.copy_number.cna_event_rate,
+         "Gain rate per genomic segment in each independent region; CN is locally clonal."),
+        ("region-count", int, defaults.region_count,
+         "Number of regions, written as region1 through regionN."),
+        ("clone-count", int, defaults.clone_count, "Exact evolutionary clone count."),
+        ("n-segments", int, defaults.copy_number.n_segments,
+         "Number of genomic copy-number intervals."),
+        ("segment-size-bp", int, defaults.copy_number.segment_size_bp,
+         "Length of each simulated genomic interval."),
+        ("max-rejection-tries", int, defaults.max_rejection_tries,
+         "Maximum attempts used to satisfy the simulation invariants."),
+    ):
+        parser.add_argument(f"--{name}", type=kind, default=default, help=help_text)
 
 
 def tumor_simulation_config_from_args(
