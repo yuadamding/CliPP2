@@ -85,6 +85,10 @@ class FitConfig:
     reassignment_rounds: int = 2
     numerical_diagnostics_dir: str | None = None
     numerical_diagnostics_max_bytes: int = 16_777_216
+    polish_max_visits: int = 256
+    polish_diverse_starts: int = 8
+    polish_joint_limit: int = 12
+    polish_joint_moves: bool = True
 
     def __post_init__(self) -> None:
         if self.device not in ("cpu", "cuda"):
@@ -99,6 +103,13 @@ class FitConfig:
             raise ValueError('numerical_diagnostics_dir must be a nonempty path string or None')
         if type(self.numerical_diagnostics_max_bytes) is not int or self.numerical_diagnostics_max_bytes < 1:
             raise ValueError('numerical_diagnostics_max_bytes must be a positive integer')
+        for name in ('polish_max_visits', 'polish_joint_limit'):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f'{name} must be a positive integer')
+        if type(self.polish_diverse_starts) is not int or self.polish_diverse_starts < 0:
+            raise ValueError('polish_diverse_starts must be a nonnegative integer')
+        if type(self.polish_joint_moves) is not bool:
+            raise ValueError('polish_joint_moves must be a boolean')
         if not isinstance(self.verbose, bool):
             raise TypeError("verbose must be a boolean.")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
@@ -134,6 +145,8 @@ def resolve_fit_config(
     reassignment_starts: int = 4, reassignment_rounds: int = 2,
     numerical_diagnostics_dir: str | None = None,
     numerical_diagnostics_max_bytes: int = 16_777_216,
+    polish_max_visits: int = 256, polish_diverse_starts: int = 8,
+    polish_joint_limit: int = 12, polish_joint_moves: bool = True,
 ) -> FitConfig:
     """Construct the only public fit configuration; removed knobs raise TypeError."""
     return FitConfig(device=device, verbose=verbose, max_major_cn=max_major_cn,
@@ -144,7 +157,10 @@ def resolve_fit_config(
                      regional_zero_policy=regional_zero_policy, selection_objective=selection_objective,
                      reassignment_starts=reassignment_starts, reassignment_rounds=reassignment_rounds,
                      numerical_diagnostics_dir=numerical_diagnostics_dir,
-                     numerical_diagnostics_max_bytes=numerical_diagnostics_max_bytes)
+                     numerical_diagnostics_max_bytes=numerical_diagnostics_max_bytes,
+                     polish_max_visits=polish_max_visits,
+                     polish_diverse_starts=polish_diverse_starts,
+                     polish_joint_limit=polish_joint_limit, polish_joint_moves=polish_joint_moves)
 
 
 __all__ = ["FitConfig", "resolve_fit_config"]

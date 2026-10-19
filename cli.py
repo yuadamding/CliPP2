@@ -20,8 +20,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    fit = subparsers.add_parser("fit", allow_abbrev=False,
-                               formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    for command in ('fit', 'import-and-polish'):
+        fit = subparsers.add_parser(command, allow_abbrev=False,
+                                   formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+        _add_fit_arguments(fit)
+        if command == 'import-and-polish':
+            fit.set_defaults(search_policy='bounded')
+            fit.add_argument('--source-checkpoint', required=True,
+                             help='Immutable historical candidate checkpoint; never rewritten.')
+            fit.add_argument('--import-authority', required=True,
+                             help='Versioned checksum/source/scientific-input import authority JSON.')
+    return parser
+
+
+def _add_fit_arguments(fit):
     fit.add_argument("--input-file", required=True)
     fit.add_argument("--outdir", default="clipp2_results")
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
@@ -62,13 +74,21 @@ def build_parser() -> argparse.ArgumentParser:
                      help='Opt-in directory for bounded frozen first/worst QP failure snapshots.')
     fit.add_argument('--numerical-diagnostics-max-bytes', type=int, default=16_777_216,
                      help='Maximum total failure-snapshot payload bytes.')
+    fit.add_argument('--polish-max-visits', type=int, default=256,
+                     help='Dedicated cumulative finalization visits, separate from discovery. '
+                          'Unfinished checks prevent successful publication.')
+    fit.add_argument('--polish-diverse-starts', type=int, default=8,
+                     help='Additional distinct finalists; overall and best-per-K states are mandatory.')
+    fit.add_argument('--polish-joint-limit', type=int, default=12,
+                     help='Bounded atomic anchor/swap proposal admissions per finalization visit.')
+    fit.add_argument('--polish-joint-moves', action=argparse.BooleanOptionalAction, default=True,
+                     help='Enable atomic anchor neighborhoods; disable for explicit Stage A transfer/refit comparison.')
     fit.add_argument('--qualify-device-weights', action='store_true',
                      help='Compare experimental batched CUDA weights with authoritative CPU fits (extra work).')
     fit.add_argument("--max-clusters", type=int, choices=range(1, MAX_CLUSTERS + 1),
                      default=DEFAULT_MAX_CLUSTERS,
                      help=f"Largest occupied cluster capacity (at most {MAX_CLUSTERS}).")
     fit.add_argument("--version", action="version", version=__version__)
-    return parser
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -80,6 +100,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             raise ValueError('--resume requires --checkpoint-path')
         if args.checkpoint_path and args.search_policy != 'bounded':
             raise ValueError('--checkpoint-path requires --search-policy bounded')
+        if args.command == 'import-and-polish' and not args.checkpoint_path:
+            raise ValueError('import-and-polish requires a fresh --checkpoint-path (or explicit --resume)')
     except ValueError as error:
         parser.error(str(error))
     return args
@@ -119,6 +141,8 @@ def main(argv: list[str] | None = None) -> None:
         outdir=Path(args.outdir),
         fit_config=_fit_config_from_args(args),
         checkpoint_path=args.checkpoint_path, resume=args.resume,
+        import_checkpoint=getattr(args, 'source_checkpoint', None),
+        import_authority=getattr(args, 'import_authority', None),
     )
     print(_printable_summary(summary))
 

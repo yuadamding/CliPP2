@@ -19,7 +19,7 @@ from .selection import _TreeRefit
 
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
-OUTPUT_SCHEMA_VERSION = 12
+OUTPUT_SCHEMA_VERSION = 13
 
 
 def _regional_zero_audit(model, labels, centers, clonal, observed):
@@ -194,6 +194,24 @@ def verify_selected(model, result):
     for name, actual, expected in comparisons:
         if not np.isfinite(actual) or not np.isclose(actual, expected, atol=1e-7, rtol=1e-10):
             raise ValueError(f'Independent verification disagrees on {name}: {actual} != {expected}')
+    if result.diagnostics.get('finalization_required'):
+        from .polish import state_digest
+        from ..kernel.assignment import feasible_transfer_scan
+        final = result.diagnostics.get('finalization', {})
+        check = final.get('selected_check') or {}
+        digest = state_digest(model, result.selected,
+                              result.diagnostics.get('finalization_scientific_config'))
+        if (not final.get('complete') or not check.get('complete')
+                or final.get('selected_state_digest') != digest or check.get('digest') != digest
+                or not check.get('conditional_refit_stability')
+                or not check.get('joint_neighborhood', {}).get('completed')):
+            raise ValueError('Selected finalization checks are incomplete or bound to a different state')
+        audit = feasible_transfer_scan(columns, labels, centers, observed,
+            model.regional_support.hard_zero, model.regional_support.positive, model.mutation_ids,
+            objective=objective, score_tolerance=1e-7+1e-10*max(1., abs(score)),
+            lower=model.lower, upper=model.upper)
+        if not audit['closed'] or not check.get('fixed_center_single_transfer_closure'):
+            raise ValueError('Independent publication check found an improving feasible transfer')
     bank_scores = [float(candidate['bic']) for candidate in result.candidate_bank
                    if isinstance(candidate, dict) and candidate.get('status') == 'scored'
                    and candidate.get('publication_eligible') is True]
@@ -304,6 +322,8 @@ def verify_selected(model, result):
     anchoring = {name: fit.diagnostics.get(name) for name in (
         'anchoring_loss', 'anchoring_loss_available', 'anchoring_loss_unavailable_reason', 'free_block_log_likelihoods',
         'clonal_block_log_likelihoods', 'anchor_scoring')}
+    from .anchor_moves import anchor_diagnostics
+    anchoring.update(anchor_diagnostics(model, result.selected, columns))
     anchoring.update(cluster_label_domain='internal_fit_labels',
                      interpretation='conditional_block_refit_diagnostic_not_a_global_optimality_certificate')
     return {**zero_audit, 'independently_verified': True, 'conditional_log_likelihood': conditional,
@@ -367,6 +387,9 @@ def check_destination(outdir, tumor_id):
 
 def publish(model, result, outdir, tumor_id):
     verification = verify_selected(model, result)
+    if (model.selection_objective != 'legacy_mixture'
+            and not result.diagnostics.get('finalization_required')):
+        raise ValueError('Assigned-objective publication requires mandatory finalization checks')
     check_destination(outdir, tumor_id)
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)

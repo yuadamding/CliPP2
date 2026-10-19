@@ -6,6 +6,7 @@ The complete evaluated bank survives beam eviction and determines publication.
 """
 
 from dataclasses import dataclass
+import hashlib
 from itertools import combinations, islice
 from time import perf_counter
 
@@ -25,6 +26,55 @@ class _Proposal:
     labels: np.ndarray
     centers: object
     details: dict
+
+    @property
+    def target_q(self):
+        return len(np.unique(self.labels))
+
+
+def _proposal_identity(family, proposal):
+    """Concrete proposal identity, independent of generator rank or allowance."""
+    labels, centers = (canonical_partition(proposal.labels, proposal.centers)
+                       if proposal.centers is not None else (canonical_partition(proposal.labels), None))
+    digest = hashlib.sha256(("clipp2_discovery_proposal_v1:"+family).encode())
+    digest.update(np.asarray(labels, dtype="<i8").tobytes())
+    digest.update(b"no_initial_centers" if centers is None else np.asarray(centers, dtype="<f8").tobytes())
+    return digest.hexdigest()
+
+
+def _next_unseen_proposal(generator, family, seen):
+    skipped = 0
+    for proposal in generator:
+        identity = _proposal_identity(family, proposal)
+        if identity not in seen:
+            return proposal, identity, skipped
+        skipped += 1
+    return None, None, skipped
+
+
+def _next_discovery_state(bank, beams, indices, schedule, levels, width, score_key):
+    """Refresh required starts after every visit; never freeze a level queue."""
+    visited = set(schedule["visited_in_sweep"])
+    used = schedule["visits_per_q"]
+    best = {}
+    # A beam's score ties prefer earlier insertion, whereas authoritative
+    # publication uses score_key. Required refinement follows the archive's
+    # winner even if diversity eviction removed that exact tied state.
+    candidates = bank.candidates if bank is not None else [c for active in beams.values() for c in active]
+    for candidate in candidates:
+        q = len(candidate.refit.centers)
+        if q not in best or score_key(candidate) < score_key(best[q]):
+            best[q] = candidate
+    winner = min(best.values(), key=score_key, default=None)
+    prioritized = ([] if winner is None else [(winner, "current_winner")])
+    prioritized.extend((best[q], "current_best_per_K") for q in levels if q in best)
+    prioritized.extend((candidate, "diverse_active_population")
+                       for q in levels for candidate in beams[q])
+    for candidate, priority in prioritized:
+        index, q = indices[id(candidate)], len(candidate.refit.centers)
+        if index not in visited and used.get(q, 0) < width:
+            return candidate, priority
+    return None, None
 
 
 def _membership(candidate):
@@ -132,7 +182,8 @@ class _Moves:
                 yield _Proposal(labels, None, details)
             return
         cuts = self.candidate.cuts
-        if cuts not in self.split_ranks:
+        cached = self.split_ranks.get(cuts)
+        if cached is None or len(cached[0]) < min(self.limit, cached[1]):
             supported = _supported_split_edges(self.model, self.tree, cuts)
             ranked, diagnostic = _likelihood_ranked_edges(self.model, self.tree, supported, cuts)
             self.split_ranks[cuts] = (tuple(ranked[:self.limit]), len(ranked), diagnostic)
@@ -209,10 +260,11 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
                 checkpoint_context=None):
     """Consume precomputed scalar-chain or joint-tree seeds without enumeration.
 
-    Native proposals do not consume the extra structural budget. Every other
-    family, including anchor rescue, does. Sweeps alternate downward/upward;
-    each visited q freezes at most W anchored starts and each start has d slots.
-    Incoming proposals additionally obey the separate per-target-q allowance.
+    Only the primary native proposal per requested capacity is outside the
+    structural budget. Retained native states and every other family use it.
+    Sweeps alternate q tie order, but refresh winner/best-per-K priority after
+    every visit. Each q has W source-state visits per sweep, with d slots each;
+    incoming proposals obey the separate actual-target-q allowance.
     """
     from .selection import _CandidateBank, _score_key, TreeFit
     from ..kernel import ALGORITHM, MAX_CLUSTERS
@@ -273,7 +325,7 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
     bank = (restore_bank(model, tree, restored["bank"]) if restored is not None
             else _CandidateBank(model, tree, compact_general=True))
     beams = {q: [] for q in range(1, maximum + 1)}
-    indices, expanded = {}, set()
+    indices, expanded, visited = {}, set(), set()
     spent = {q: 0 for q in beams}
     anchor_reserved = {q: 0 for q in beams}
     actual_anchors = {q: 0 for q in beams}
@@ -350,6 +402,41 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
             consider(labels, None, {"route": "native_support_transformation",
                 "seed_index": index, "requested_k": seed["requested_k"], **details})
 
+    def retain_native(seed, index):
+        retained = seed.get("retained_supported_states", ())
+        if not isinstance(retained, (tuple, list)) or len(retained) > 4:
+            raise ValueError("Retained native states must be a list of at most four proposals")
+        seen = set()
+        for ordinal, state in enumerate(retained):
+            if not isinstance(state, dict):
+                raise ValueError("Retained native state must be an explicit proposal record")
+            labels = np.asarray(state.get("labels"))
+            raw_cuts = np.asarray(state.get("cuts", ()))
+            if (raw_cuts.ndim != 1 or (raw_cuts.size and raw_cuts.dtype.kind not in "iu")
+                    or np.any(raw_cuts < 0) or np.any(raw_cuts >= len(tree.edges))):
+                raise ValueError("Retained native cuts must be integer in-range edge indices")
+            cuts = tuple(sorted(map(int, raw_cuts)))
+            raw = np.asarray(state.get("raw_phi"), dtype=float)
+            requested_k = state.get("requested_k")
+            if (isinstance(requested_k, (bool, np.bool_))
+                    or not isinstance(requested_k, (int, np.integer))
+                    or requested_k != seed["requested_k"]
+                    or labels.shape != (model.n,) or labels.dtype.kind not in "iu"
+                    or len(cuts) != len(set(cuts)) or len(cuts)+components > requested_k
+                    or raw.shape != (model.n, model.r) or not np.isfinite(raw).all()
+                    or np.any(raw < model.lower) or np.any(raw > model.upper)
+                    or not np.array_equal(labels, bank.labels(cuts))):
+                raise ValueError("Retained native labels/capacity disagree with frozen-tree support")
+            if cuts in seen:
+                raise ValueError("Retained native states must have distinct tree supports")
+            seen.add(cuts)
+            # raw_phi is proposal evidence, not conditionally fitted CCFs.
+            consider(labels, None, {"route": "native_retained_supported_state",
+                "seed_index": index, "retained_state_index": ordinal,
+                "requested_k": int(seed["requested_k"]),
+                "native_diagnostics": state.get("diagnostics", {}),
+                "native_budget_exempt": False})
+
     for index, seed in enumerate(seeds if restored is None else ()):
         consider_native(seed, index)
     native_count = len(bank.candidates)
@@ -363,6 +450,7 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
     if restored is None:
         for index, seed in enumerate(seeds):
             if "cuts" in seed:
+                retain_native(seed, index)
                 repair_native(seed, index)
     # Seed work has a fixed construction bound and reserves ordinary target-q
     # slots. Reservations are released before sweeps; no new fit allowance is
@@ -390,8 +478,9 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
                  {"route": "eligible_set_anchor_rescue", "requested_k": maximum})
     split_ranks = {}
     keys = tuple(model.observation_keys())
-    family_cursors, family_consumed = {}, {}
-    schedule = {"sweep": 0, "level": 0, "queue": None, "position": 0}
+    family_cursors, family_seen, family_exhausted = {}, {}, {}
+    schedule = {"sweep": 0, "level": 0, "queue": None, "position": 0,
+                "visited_in_sweep": [], "visits_per_q": {}}
     if restored is not None:
         saved = restored["state"]
         if "model_telemetry" in restored and hasattr(model, "telemetry"):
@@ -399,6 +488,7 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
         beams.update({q: [bank.candidates[i] for i in values] for q, values in saved["beams"].items()})
         indices = {id(candidate): i for i, candidate in enumerate(bank.candidates)}
         expanded = set(saved["expanded"])
+        visited = set(saved["visited"])
         spent, anchor_reserved, actual_anchors = (saved[key] for key in (
             "spent", "anchor_reserved", "actual_anchors"))
         ledger, seeds_diagnostics, paths = (saved[key] for key in ("ledger", "seeds_diagnostics", "paths"))
@@ -407,8 +497,8 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
             "native_count", "native_anchor_evaluations", "native_reasons"))
         reserved_seed_slots, support_seed_records, seed_spent = (saved[key] for key in (
             "reserved_seed_slots", "support_seed_records", "seed_spent"))
-        family_cursors, family_consumed, schedule = (saved[key] for key in (
-            "family_cursors", "family_consumed", "schedule"))
+        family_cursors, family_seen, family_exhausted, schedule = (saved[key] for key in (
+            "family_cursors", "family_seen", "family_exhausted", "schedule"))
         for q in beams:
             spent.setdefault(q, 0)
             anchor_reserved.setdefault(q, 0)
@@ -434,6 +524,7 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
                 reason = str(rejection["reason"])
                 native_reasons[reason] = native_reasons.get(reason, 0)+1
             native_cuts_seen.add(cuts)
+            retain_native(seed, index)
             repair_native(seed, index)
 
     checkpoint_identity = identities(model, tree, pilot) if checkpoint_path is not None else None
@@ -448,8 +539,10 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
             native_count=native_count, native_anchor_evaluations=native_anchor_evaluations,
             native_reasons=native_reasons, reserved_seed_slots=reserved_seed_slots,
             support_seed_records=support_seed_records, seed_spent=seed_spent,
-            family_cursors=family_cursors, family_consumed=family_consumed, schedule=schedule,
-            expanded=sorted(expanded), beams={q: [indices[id(c)] for c in values]
+            family_cursors=family_cursors, family_seen=family_seen,
+            family_exhausted=family_exhausted, schedule=schedule,
+            expanded=sorted(expanded), visited=sorted(visited),
+            beams={q: [indices[id(c)] for c in values]
                                              for q, values in beams.items()})
         write_checkpoint(checkpoint_path, dict(identities=checkpoint_identity,
             policy=dict(width=search.width, proposals_per_state=search.proposals_per_state,
@@ -466,81 +559,94 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
         sweep = schedule["sweep"]
         downward = sweep % 2 == 0
         levels = list(range(maximum, 0, -1) if downward else range(1, maximum+1))
-        while schedule["level"] < len(levels):
-            q = levels[schedule["level"]]
-            if schedule["queue"] is None:
-                schedule["queue"] = [indices[id(candidate)] for candidate in beams[q]]
-                schedule["position"] = 0
-            while schedule["position"] < len(schedule["queue"]):
-                candidate = bank.candidates[schedule["queue"][schedule["position"]]]
-                parent = indices[id(candidate)]
-                expanded.add(parent)
-                moves = _Moves(model, tree, bank, candidate,
-                    search.proposals_per_state*search.sweeps, split_ranks, keys, pilot)
-                generators = {family: iter(getattr(moves, family)()) for family in FAMILIES}
-                consumed = family_consumed.setdefault(parent, dict.fromkeys(FAMILIES, 0))
-                for family, generator in generators.items():
-                    for _ in range(consumed[family]):
-                        next(generator, None)
-                path = {"sweep": sweep, "direction": "downward" if downward else "upward",
-                        "occupied_q": q, "parent_bank_index": parent, "slots": [],
-                        "family_cursor_start": family_cursors.get(parent, 0),
-                        "last_accepted_improvement": None, "last_accepted_moved_mutations": 0}
-                paths.append(path)
-                for slot in range(search.proposals_per_state):
-                    family = FAMILIES[(family_cursors.get(parent, 0)+slot) % len(FAMILIES)]
-                    target = q + (1 if family == "split" else -1 if family == "merge" else 0)
-                    entry = {"slot": slot, "family": family, "target_q": target}
-                    path["slots"].append(entry)
-                    if target not in spent:
-                        entry["outcome"] = "outside_capacity"
-                    elif spent[target] >= search.partition_limit_per_q:
-                        entry["outcome"] = "target_partition_budget_exhausted"
-                    else:
-                        proposal = next(generators[family], None)
-                        if proposal is None:
-                            entry["outcome"] = "no_ranked_proposal"
-                        else:
-                            before = len(ledger)
-                            consumed[family] += 1
-                            variants = consider(proposal.labels, proposal.centers, {
-                                "route": f"bounded_{family}", "requested_k": target,
-                                "sweep": sweep, "parent_bank_index": parent, **proposal.details})
-                            entry.update(outcome=ledger[-1]["outcome"], attempt_index=before)
-                            improvement = candidate.score-min((c.score for c in variants), default=np.inf)
-                            entry["improves_parent"] = bool(improvement > 1e-7+1e-10*abs(candidate.score))
-                            if entry["improves_parent"]:
-                                entry["improvement"] = float(improvement)
-                                path["last_accepted_improvement"] = float(improvement)
-                                path["last_accepted_moved_mutations"] = proposal.details.get("moved_mutations")
-                family_cursors[parent] = (family_cursors.get(parent, 0)+search.proposals_per_state) % len(FAMILIES)
-                path["family_cursor_next"] = family_cursors[parent]
-                path["stop_reason"] = ("target_q_budget_exhausted" if any(
-                    e["outcome"] == "target_partition_budget_exhausted" for e in path["slots"])
-                    else "proposal_budget_exhausted")
-                path["neighborhood"] = moves.stats
-                for stats in moves.stats.values():
-                    stats["unexpanded_known"] = (None if stats["available"] is None else
-                                                   max(0, stats["available"]-stats["generated"]))
-                for family, stats in moves.stats.items():
-                    entries = [entry for entry in path["slots"] if entry["family"] == family]
-                    stats.update(admitted=sum("attempt_index" in entry for entry in entries),
-                        rejected=sum(entry["outcome"] == "ineligible" for entry in entries),
-                        accepted=sum(entry.get("improves_parent", False) for entry in entries),
-                        unconsumed=stats["unexpanded_known"])
-                schedule["position"] += 1
-                checkpoint_work += 1
-                persist()
-                if checkpoint_stop_after is not None and checkpoint_work >= checkpoint_stop_after:
-                    raise SearchPaused("Requested state budget reached; resume the committed search checkpoint")
-            schedule.update(level=schedule["level"]+1, queue=None, position=0)
-        schedule.update(sweep=sweep+1, level=0, queue=None, position=0)
+        while True:
+            candidate, priority = _next_discovery_state(
+                bank, beams, indices, schedule, levels, search.width, _score_key)
+            if candidate is None:
+                break
+            parent, q = indices[id(candidate)], len(candidate.refit.centers)
+            visited.add(parent)
+            moves = _Moves(model, tree, bank, candidate,
+                search.proposals_per_state*search.sweeps, split_ranks, keys, pilot)
+            generators = {family: iter(getattr(moves, family)()) for family in FAMILIES}
+            seen = family_seen.setdefault(parent, {family: [] for family in FAMILIES})
+            seen_sets = {family: set(values) for family, values in seen.items()}
+            exhausted = family_exhausted.setdefault(parent, {})
+            path = {"sweep": sweep, "direction": "downward" if downward else "upward",
+                    "occupied_q": q, "parent_bank_index": parent, "slots": [],
+                    "priority": priority, "family_cursor_start": family_cursors.get(parent, 0),
+                    "last_accepted_improvement": None, "last_accepted_moved_mutations": 0}
+            paths.append(path)
+            for slot in range(search.proposals_per_state):
+                family = FAMILIES[(family_cursors.get(parent, 0)+slot) % len(FAMILIES)]
+                entry = {"slot": slot, "family": family, "target_q": None,
+                         "previously_seen_proposals_skipped": 0}
+                path["slots"].append(entry)
+                proposal, identity, skipped = _next_unseen_proposal(
+                    generators[family], family, seen_sets[family])
+                entry["previously_seen_proposals_skipped"] = skipped
+                if proposal is None:
+                    entry["outcome"] = "no_ranked_proposal"
+                    exhausted[family] = moves.limit
+                    continue
+                target = proposal.target_q
+                entry.update(target_q=target, proposal_id=identity)
+                if target not in spent:
+                    entry["outcome"] = "outside_capacity"
+                elif spent[target] >= search.partition_limit_per_q:
+                    entry["outcome"] = "target_partition_budget_exhausted"
+                else:
+                    before = len(ledger)
+                    variants = consider(proposal.labels, proposal.centers, {
+                        "route": f"bounded_{family}", "requested_k": target,
+                        "sweep": sweep, "parent_bank_index": parent,
+                        **proposal.details, "proposal_id": identity})
+                    seen[family].append(identity)
+                    seen_sets[family].add(identity)
+                    expanded.add(parent)
+                    entry.update(outcome=ledger[-1]["outcome"], attempt_index=before)
+                    improvement = candidate.score-min((c.score for c in variants), default=np.inf)
+                    entry["improves_parent"] = bool(improvement > 1e-7+1e-10*abs(candidate.score))
+                    if entry["improves_parent"]:
+                        entry["improvement"] = float(improvement)
+                        path["last_accepted_improvement"] = float(improvement)
+                        path["last_accepted_moved_mutations"] = proposal.details.get("moved_mutations")
+            family_cursors[parent] = (family_cursors.get(parent, 0)+search.proposals_per_state) % len(FAMILIES)
+            path["family_cursor_next"] = family_cursors[parent]
+            path["stop_reason"] = ("target_q_budget_exhausted" if any(
+                e["outcome"] == "target_partition_budget_exhausted" for e in path["slots"])
+                else "proposal_budget_exhausted")
+            path["neighborhood"] = moves.stats
+            for family, stats in moves.stats.items():
+                stats["unexpanded_known"] = (None if stats["available"] is None else
+                                              max(0, stats["available"]-stats["generated"]))
+                entries = [entry for entry in path["slots"] if entry["family"] == family]
+                stats.update(admitted=sum("attempt_index" in entry for entry in entries),
+                    rejected=sum(entry["outcome"] == "ineligible" for entry in entries),
+                    accepted=sum(entry.get("improves_parent", False) for entry in entries),
+                    unconsumed=stats["unexpanded_known"],
+                    concrete_proposals_seen=len(seen[family]),
+                    declared_prefix_exhausted=exhausted.get(family, -1) >= moves.limit)
+            schedule["visited_in_sweep"].append(parent)
+            schedule["visits_per_q"][q] = schedule["visits_per_q"].get(q, 0)+1
+            schedule["position"] += 1
+            checkpoint_work += 1
+            persist()
+            if checkpoint_stop_after is not None and checkpoint_work >= checkpoint_stop_after:
+                raise SearchPaused("Requested state budget reached; resume the committed search checkpoint")
+        schedule.update(sweep=sweep+1, level=0, queue=None, position=0,
+                        visited_in_sweep=[], visits_per_q={})
     persist()
     if not bank.candidates:
         if support is not None:
             raise ValueError("support_seed_search_exhausted: bounded support-compatible search found no eligible anchored fit; global infeasibility is not established")
         raise ValueError("no_eligible_anchored_candidate: bounded proposal search exhausted")
     selected = min(bank.candidates, key=_score_key)
+    required_best = {}
+    for candidate in bank.candidates:
+        q = len(candidate.refit.centers)
+        if q not in required_best or _score_key(candidate) < _score_key(required_best[q]):
+            required_best[q] = candidate
     if any(actual_anchors[q] > q*search.partition_limit_per_q for q in beams):
         raise AssertionError("Anchored search budget exceeded")
     elapsed = perf_counter()-started
@@ -602,10 +708,24 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
             "support_seed_unused_reservations_released_before_sweeps": True,
             "active_bank_indices_by_q": {q: [indices[id(c)] for c in active] for q, active in beams.items()},
             "unexpanded_evaluated_bank_indices": sorted(set(indices.values())-expanded),
+            "visited_evaluated_bank_indices": sorted(visited),
+            "expanded_evaluated_bank_indices": sorted(expanded),
+            "expanded_means": "at_least_one_proposal_admitted_not_neighborhood_completed",
+            "declared_neighborhood_completed_bank_indices": sorted(parent
+                for parent, families in family_exhausted.items()
+                if all(families.get(family, -1) >= search.proposals_per_state*search.sweeps
+                       for family in FAMILIES)),
+            "required_refinement_unvisited_bank_indices": sorted({indices[id(candidate)]
+                for candidate in required_best.values()
+                if indices[id(candidate)] not in visited}),
+            "required_refinement_unexpanded_bank_indices": sorted({indices[id(candidate)]
+                for candidate in required_best.values() if indices[id(candidate)] not in expanded}),
             "population_rule": "round_robin_score_conditional_partition_anchor_diversity",
             "final_score_tie_rule": "score_q_tree_before_general_compact_component_encoding_clonal_index",
             "width_is_anchored_fitted_states": True,
-            "population_growth_order": "synchronous_deterministic_sweep_q_state_slot",
+            "population_growth_order": "dynamic_current_winner_best_per_K_then_diversity_with_per_q_visit_caps",
+            "frozen_level_queues_used": False,
+            "concrete_proposal_identity_resume": True,
             "wider_search_is_guaranteed_superset": False,
             "resumed_archive_retained": restored is not None,
             "checkpoint_complete": checkpoint_path is not None,
@@ -614,6 +734,7 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
             "last_accepted_improvement": next((p["last_accepted_improvement"] for p in reversed(paths)
                                                if p["last_accepted_improvement"] is not None), None),
             "family_cursors": family_cursors,
+            "family_seen_proposal_ids": family_seen,
             "unknown_unexpanded_neighborhoods_recorded_as_null": True,
             "attempts": ledger, "paths": paths,
         },
@@ -621,4 +742,4 @@ def fit_bounded(model, tree, pilot, seeds, capacities, search, *, pilot_diagnost
                     "continuation_seconds": continuation_seconds, "bounded_search_seconds": elapsed,
                     "refit_and_score_seconds": bank.refit_seconds,
                     "fit_total_seconds": initialization_seconds+tree_seconds+continuation_seconds+elapsed},
-    })
+    }, bank=bank)

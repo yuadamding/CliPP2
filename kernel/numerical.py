@@ -102,7 +102,9 @@ class FailureSnapshots:
         commit, dirty = git_source_identity(root)
         library, native_sha = native_library()
         self.identity = dict(commit=commit, dirty=dirty, python_source_sha256=source_fingerprint(root),
-                             native_source_sha256=native_sha, native_abi=library.CliPP2KernelABI())
+                             native_source_sha256=native_sha, native_abi=library.CliPP2KernelABI(),
+                             native_binary_sha256=hashlib.sha256(Path(library._name).read_bytes()).hexdigest(),
+                             longdouble_mantissa_bits=int(np.finfo(np.longdouble).nmant))
 
     def record(self, arrays, metadata, severity):
         with self.lock:
@@ -114,7 +116,10 @@ class FailureSnapshots:
             if sum(np.asarray(v).nbytes for v in arrays.values()) + 32_768 > self.max_bytes // 2:
                 self.skipped += 1
                 return
-            document = _json_safe(dict(metadata, source=self.identity, schema=1))
+            document = _json_safe(dict(metadata, source=self.identity, schema=2,
+                quadratic_definition='diag(H) + rho * forest_laplacian; linear term -b',
+                anchor_augmentation_already_in_H_and_b=True,
+                returned_coordinate_dtype=str(np.asarray(arrays['result']).dtype)))
             buffer = io.BytesIO()
             np.savez(buffer, **arrays, metadata=np.asarray(json.dumps(document, sort_keys=True)))
             payload = buffer.getvalue()

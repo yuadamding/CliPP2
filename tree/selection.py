@@ -96,6 +96,7 @@ class TreeFit:
     tree: object
     pilot: np.ndarray
     diagnostics: dict
+    bank: object = None
 
     @property
     def labels(self):
@@ -626,6 +627,59 @@ class _CandidateBank:
         return self.consider(None, labels, initial_centers, provenance,
                              clonal_cluster=clonal_cluster)
 
+    def retain_validated_fixed_fit(self, labels, centers, clonal_cluster, provenance,
+                                   *, expected_score=None):
+        """Admit an independently scored fixed state, without claiming refit.
+
+        This is for identity-checked imports and guaranteed feasible transfers
+        whose conditional refitter fails. It neither rewrites failed evidence
+        nor contaminates the conditional-refit attempt cache.
+        """
+        import math
+        original = np.asarray(labels)
+        order = list(dict.fromkeys(original.tolist()))
+        if (isinstance(clonal_cluster, (bool, np.bool_))
+                or not isinstance(clonal_cluster, (int, np.integer)) or clonal_cluster not in order):
+            raise ValueError('Fixed state must designate an occupied anchor')
+        labels, centers = _canonical_inputs(labels, centers, self.model.n, self.model.r)
+        clonal = order.index(clonal_cluster)
+        state = self.partition_cache.from_labels(labels)
+        q = len(centers)
+        if (np.any(state.observed_counts == 0) or np.any(state.lower > state.upper)
+                or state.support_conflict.any() or not state.clonal_eligible[clonal]
+                or np.any(centers < state.lower) or np.any(centers > state.upper)
+                or not np.array_equal(centers[clonal], np.ones(self.model.r))
+                or not self.model.regional_support.assigned_mask(labels, centers).all()):
+            raise ValueError('Fixed state violates occupied regional/anchor constraints')
+        from .reporting import independent_log_columns
+        columns = independent_log_columns(self.model, centers)
+        fit = self.model._score_refit(labels, centers, clonal,
+            (q-1)*(self.model.r+1)*math.log(self.model.n), 0, matrix=columns,
+            support_summary=state,
+            assigned_likelihood=float(math.fsum(columns[np.arange(self.model.n), labels])))
+        if not fit.eligible or not np.isfinite(fit.score):
+            raise ValueError(f'Fixed-state score failed independent validation: {fit.reason}')
+        if expected_score is not None and not np.isclose(fit.score, expected_score, atol=1e-7, rtol=1e-10):
+            raise ValueError('Fixed-state independently reconstructed score disagrees')
+        key = self.membership_key(labels)
+        identity = (('general', key), clonal, fit.centers.tobytes(), fit.weights.tobytes())
+        previous = self.fitted_states.get(identity)
+        if previous is not None:
+            previous.provenance.append(dict(provenance))
+            return previous
+        fit.diagnostics.update(fixed_state_independently_validated=True,
+            fixed_state_not_a_conditional_refit=True,
+            support_identity=state.support_identity, support_validated_at_admission=True)
+        compact = (_TreeRefit.from_fit(self.tree, key[0], fit, self.partition_cache, groups=key[1])
+                   if self.compact_general else fit)
+        candidate = Candidate(None, compact, [dict(provenance)], 'general')
+        self.candidates.append(candidate)
+        self.fitted_states[identity] = candidate
+        old = self.by_membership.get(key)
+        if old is None or _score_key(candidate) < _score_key(old):
+            self.by_membership[key] = candidate
+        return candidate
+
 
 def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, search=None,
              checkpoint_path=None, resume=False, checkpoint_stop_after=None):
@@ -704,6 +758,7 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
         return result
     bank = _CandidateBank(model, tree)
     seeds_diagnostics, refined = [], set()
+    retained_diagnostics = []
     refinement_seconds, subset_count = 0.0, 0
 
     def refine_once(proposal):
@@ -750,6 +805,44 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
         native_candidate = bank.consider(cuts, labels, None, native)
         if native_candidate is None:
             repair_unsupported(cuts, requested, native)
+        retained = seed.get('retained_supported_states', [])
+        if not isinstance(retained, list) or len(retained) > 4:
+            raise ValueError('At most four retained supported states are allowed per native seed')
+        retained_cuts_seen = set()
+        for retained_index, state in enumerate(retained):
+            raw_cuts, raw_labels = np.asarray(state['cuts']), np.asarray(state['labels'])
+            if (raw_cuts.ndim != 1 or (raw_cuts.size and raw_cuts.dtype.kind not in 'iu')
+                    or np.any(raw_cuts < 0) or np.any(raw_cuts >= len(tree.edges))
+                    or raw_labels.shape != (model.n,) or raw_labels.dtype.kind not in 'iu'
+                    or np.any(raw_labels < 0)):
+                raise ValueError('Retained state requires integer in-range cuts and memberships')
+            retained_cuts = tuple(sorted(map(int, raw_cuts)))
+            retained_labels = canonical_partition(raw_labels)
+            if (isinstance(state['requested_k'], (bool, np.bool_))
+                    or not isinstance(state['requested_k'], (int, np.integer))
+                    or state['requested_k'] != requested or len(retained_cuts) >= requested
+                    or len(retained_cuts) != len(set(retained_cuts))
+                    or not np.array_equal(retained_labels, bank.labels(retained_cuts))):
+                raise ValueError('Retained supported state disagrees with its declared capacity or cuts')
+            if retained_cuts in retained_cuts_seen:
+                raise ValueError('Retained supported states must have distinct cut identities')
+            retained_cuts_seen.add(retained_cuts)
+            raw_phi = np.asarray(state['raw_phi'], dtype=float)
+            if (raw_phi.shape != (model.n, model.r) or not np.isfinite(raw_phi).all()
+                    or np.any(raw_phi < model.lower) or np.any(raw_phi > model.upper)):
+                raise ValueError('Retained native coordinates violate their physical domain')
+            retained_provenance = dict(route='native_retained_supported_state', seed_index=index,
+                retained_state_index=retained_index, requested_k=requested,
+                occupied_q=len(retained_cuts)+1, cuts=retained_cuts,
+                source_solver_diagnostics=state['diagnostics'],
+                raw_coordinates_used_as_fitted_centers=False)
+            before = len(bank.candidates)
+            retained_candidate = bank.consider(retained_cuts, retained_labels, None, retained_provenance)
+            retained_diagnostics.append(dict(retained_provenance,
+                outcome='eligible' if retained_candidate is not None else 'ineligible',
+                new_scored_states=len(bank.candidates)-before,
+                reason=None if retained_candidate is not None else bank.ineligible[retained_cuts]['reason']))
+            refine_once(retained_candidate)
         for subset in cut_subsets(cuts):
             subset_count += 1
             if len(subset) + 1 not in capacities:
@@ -809,6 +902,7 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
                           "global_optimality_certified": False},
         "tree_identity": tree.identity, "tree_kind": "mutation_similarity_not_phylogeny",
         "pilots": pilot_diagnostics, "seeds": seeds_diagnostics,
+        "retained_native_supported_states": retained_diagnostics,
         "capacities": capacities, "enumerated_cut_subsets": subset_count,
         "supported_proposals": supported_proposals,
         "anchor_rescue_proposals": rescue_proposals,
@@ -842,4 +936,4 @@ def fit_tree(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, searc
         "partition_cache": bank.partition_cache.diagnostics(),
         "selection": "minimum_over_complete_eligible_scored_bank",
         "global_optimality_certified": False,
-    })
+    }, bank=bank)

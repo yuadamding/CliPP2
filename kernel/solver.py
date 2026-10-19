@@ -8,6 +8,8 @@ claim of exact fusion or constrained/global optimality.
 
 from dataclasses import dataclass
 from collections import Counter
+import hashlib
+import time
 
 import numpy as np
 
@@ -24,11 +26,15 @@ class ContinuationPolicy:
     stationarity_tolerance: float = 1e-6
     constraint_tolerance: float = 1e-6
     maximum_penalty: float = 1e12
+    max_unqualified_qps_per_seed: int = 128
+    capture_failure_then_stop: bool = False
 
     def __post_init__(self):
         if any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1
-               for value in (self.levels, self.iterations_per_level)):
+               for value in (self.levels, self.iterations_per_level, self.max_unqualified_qps_per_seed)):
             raise ValueError("Continuation budgets must be positive integers")
+        if type(self.capture_failure_then_stop) is not bool:
+            raise ValueError('capture_failure_then_stop must be boolean')
         if not all(np.isfinite(v) and v > 0 for v in (
             self.stationarity_tolerance, self.constraint_tolerance, self.maximum_penalty
         )):
@@ -52,6 +58,7 @@ def boxed_forest_quadratic(curvature, rhs, edges, penalty, lower, upper):
     require multiple sweeps. The native host kernel performs the active-set
     solve; this wrapper independently checks its original-input residual.
     """
+    started = time.perf_counter()
     h, b, lo, hi = [np.asarray(value, dtype=float) for value in (curvature, rhs, lower, upper)]
     if h.ndim != 2 or not all(h.shape) or any(value.shape != h.shape for value in (b, lo, hi)):
         raise ValueError("Quadratic arrays must have the same nonempty N by R shape")
@@ -77,8 +84,12 @@ def boxed_forest_quadratic(curvature, rhs, edges, penalty, lower, upper):
         if a == c:
             raise ValueError("Quadratic graph must be a forest")
         roots[c] = a
+    prepared = time.perf_counter()
     result, native = forest_quadratic(h, b, edges, penalty, lo, hi, return_diagnostics=True)
+    solved_at = time.perf_counter()
     audit = qp_residual(h, b, edges, penalty, lo, hi, result)
+    audit['timings_seconds'] = dict(construction=prepared-started, native_solve=solved_at-prepared,
+                                   independent_residual=time.perf_counter()-solved_at)
     audit.update(native)
     if native['budget_hits']:
         audit['failure_reasons'].append('active_set_budget_exhausted')
@@ -156,6 +167,8 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
     """
     policy = ContinuationPolicy() if policy is None else policy
     capacities = tuple(capacities)
+    if policy.capture_failure_then_stop and len(capacities) != 1:
+        raise ValueError('Controlled failure capture requires exactly one capacity')
     # Construct once before dispatch; worker proxies share its bounded owner.
     if _batch and getattr(model, 'numerical_diagnostics_dir', None) is not None:
         if getattr(model, '_numerical_failure_snapshots', None) is None:
@@ -163,6 +176,8 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
                 model.numerical_diagnostics_dir,
                 getattr(model, 'numerical_diagnostics_max_bytes', 16_777_216))
     snapshots = getattr(model, '_numerical_failure_snapshots', None)
+    if policy.capture_failure_then_stop and snapshots is None:
+        raise ValueError('Controlled failure capture requires numerical_diagnostics_dir')
     memory = getattr(model, 'memory', None)
     if _batch and memory is not None and getattr(model, '_torch', None) and len(capacities) > 1:
         per_state = max(1, model.n*model.r*(192*model.valid.shape[-1]+256))
@@ -220,12 +235,34 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
         max_backtracking = 0
         maximum_accepted_increase = 0.0
         precision_limited = False
+        rejected_budget_exhausted = capture_stopped = False
+        guard_counts, work_counts, timings = Counter(), Counter(), Counter()
+        level_records, supported_seen = [], set()
+        retained_states = []
+        def observe_partition(cuts, record):
+            key = tuple(map(int, cuts))
+            if key in record['_seen']:
+                return None, key, key in record['_supported']
+            record['_seen'].add(key)
+            labels = partition_from_cuts(tree, cuts)
+            if support is not None:
+                supported = support.check_partition(support.summarize_partition(labels)) is None
+            else:
+                counts = np.zeros((int(labels.max())+1, model.r), dtype=int)
+                np.add.at(counts, labels, observed)
+                supported = bool(np.all(counts > 0))
+            if supported:
+                record['_supported'].add(key)
+            return labels, key, supported
         for level in range(policy.levels):
             stalled = False
             repeated_stagnation = 0
             previous_support = None
+            record = dict(level=level, rho=rho, iterations=0, rejected_qps=0, accepted_steps=0,
+                          _seen=set(), _supported=set())
             for _ in range(policy.iterations_per_level):
                 total_iterations += 1
+                record['iterations'] += 1
                 cuts = project_cuts(tree, x, k)
                 projected_witness, anchor_residual = project_anchor(x, model.clonal_eligible)
                 switches += projected_witness != witness
@@ -239,27 +276,43 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
                     break
                 h, rhs = anchored_quadratic(x, gradient, curvature, witness, rho)
                 qp, audit = boxed_forest_quadratic(h, rhs, forest, rho, lower, upper)
+                work_counts['quadratic_solves'] += 1
+                work_counts['qualified_qp_proposals'] += int(audit['solved'])
+                for name, elapsed in audit.get('timings_seconds', {}).items():
+                    timings[name] += elapsed
                 audit['proposed_step_max_CCF'] = float(np.max(np.abs(qp-x)))
                 qp_unqualified += not audit["solved"]
+                record['rejected_qps'] += int(not audit['solved'])
                 reason_counts.update(audit['failure_reasons'])
-                audit_public = {key: value for key, value in audit.items() if key != 'active_state'}
+                audit_public = {key: value for key, value in audit.items()
+                                if key not in ('active_state', 'timings_seconds')}
                 if worst_qp is None or audit['backward_error'] > worst_qp['backward_error']:
                     worst_qp = dict(audit_public, rho=rho, iteration=total_iterations)
                 if not audit['solved'] and snapshots is not None:
+                    snapshot_started = time.perf_counter()
                     arrays = dict(H=h, b=rhs, L=lower, U=upper, rho=np.asarray(rho),
                                   edges=forest, result=qp, active_state=audit['active_state'],
-                                  likelihood_gradient=gradient, likelihood_curvature=curvature,
+                                  likelihood_values=values, likelihood_gradient=gradient,
+                                  likelihood_curvature=curvature,
                                   **likelihood_snapshot_arrays(model, x))
                     snapshots.record(arrays, dict(kind='unqualified_qp', audit=audit_public,
                         requested_k=k, iteration=total_iterations, witness=int(witness),
                         tree_identity=tree.identity), audit['backward_error'])
+                    timings['snapshot_writes'] += time.perf_counter()-snapshot_started
+                if not audit['solved'] and policy.capture_failure_then_stop:
+                    if not snapshots.summary()['snapshots']:
+                        raise RuntimeError('Controlled failure capture did not fit its snapshot byte budget')
+                    capture_stopped = True
+                    reason_counts['controlled_failure_capture_stop'] += 1
+                    break
                 degree = np.bincount(forest.ravel(), minlength=tree.n)[:, None]
                 old_objective = float(np.sum(values) + 0.5 * rho * np.sum(jumps * jumps)) + anchor_penalty(x, witness, rho)
                 accepted = False
                 accepted_decrease = 0.0
                 proposals = [qp] if audit["solved"] else []
                 proposals.append(np.clip(x - g / (h + rho * degree), lower, upper))
-                for proposal in proposals:
+                line_search_started = time.perf_counter()
+                for proposal_index, proposal in enumerate(proposals):
                     direction = proposal - x
                     slope = float(np.sum(g * direction))
                     if not np.isfinite(slope) or not slope < 0:
@@ -272,6 +325,7 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
                         step = 0.5 ** backtrack
                         trial = np.clip(x + step * direction, lower, upper)
                         trial_terms = model.node_terms(trial)
+                        work_counts['line_search_likelihood_evaluations'] += 1
                         delta = trial[forest[:, 0]] - trial[forest[:, 1]]
                         objective = float(np.sum(trial_terms[0]) + 0.5 * rho * np.sum(delta * delta)) + anchor_penalty(trial, witness, rho)
                         slack = 1e-12 * max(1.0, abs(old_objective))
@@ -280,6 +334,10 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
                             x, (values, gradient, curvature) = trial, trial_terms
                             accepted = True
                             accepted_steps += 1
+                            record['accepted_steps'] += 1
+                            step_kind = ('qualified_qp_steps_accepted' if audit['solved'] and proposal_index == 0
+                                         else 'safeguarded_gradient_steps_accepted')
+                            work_counts[step_kind] += 1
                             accepted_decrease = old_objective - objective
                             maximum_accepted_increase = max(maximum_accepted_increase, -accepted_decrease)
                             break
@@ -290,23 +348,35 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
                         qp_qualified=audit['solved'], backtracks=40,
                         old_objective=old_objective, last_objective=objective,
                         last_objective_change=objective-old_objective)
+                timings['line_search_inclusive_likelihood'] += time.perf_counter()-line_search_started
                 if not accepted:
                     stalled = True
                     if snapshots is not None:
                         arrays = dict(H=h, b=rhs, L=lower, U=upper, rho=np.asarray(rho),
                                       edges=forest, result=qp, active_state=audit['active_state'],
-                                      likelihood_gradient=gradient, likelihood_curvature=curvature,
+                                      likelihood_values=values, likelihood_gradient=gradient,
+                                      likelihood_curvature=curvature,
                                       **likelihood_snapshot_arrays(model, x))
                         snapshots.record(arrays, dict(kind='no_accepted_descent_step', audit=audit_public,
                             line_search=last_line_search, requested_k=k, iteration=total_iterations,
                             witness=int(witness), tree_identity=tree.identity),
                             max(audit['backward_error'], QP_TOLERANCE))
                 support_key = (tuple(map(int, cuts)), int(witness))
-                stagnates = (not audit['solved'] and audit.get('precision_risk', False)
-                             and accepted_decrease <= 1e-12 * max(1., abs(old_objective)))
+                conditions = dict(unqualified=not audit['solved'], precision_risk=audit.get('precision_risk', False),
+                    negligible_decrease=accepted_decrease <= 1e-12 * max(1., abs(old_objective)),
+                    same_support_and_witness=support_key == previous_support)
+                guard_counts['evaluated'] += 1
+                for name, value in conditions.items():
+                    guard_counts[name + ('_true' if value else '_false')] += 1
+                stagnates = all(conditions[key] for key in ('unqualified', 'precision_risk', 'negligible_decrease'))
                 repeated_stagnation = (repeated_stagnation + 1 if stagnates and support_key == previous_support
                                        else int(stagnates))
                 previous_support = support_key
+                observe_partition(cuts, record)
+                if qp_unqualified >= policy.max_unqualified_qps_per_seed:
+                    rejected_budget_exhausted = True
+                    reason_counts['unqualified_qp_count_budget_exhausted'] += 1
+                    break
                 if repeated_stagnation >= 3 or (stalled and stagnates):
                     # No useful progress with fixed support and a demonstrated
                     # coordinate-spacing risk. Stop this branch honestly; this
@@ -326,10 +396,23 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
             stationarity = float(np.max(np.abs(x - np.clip(x - g, lower, upper))))
             violation = float(np.linalg.norm(x[forest[:, 0]] - x[forest[:, 1]]))
             labels, block_range, longest, mean_h = _component_scale(tree, cuts, x, curvature)
+            _, state_key, supported = observe_partition(cuts, record)
+            record['unique_projected_partitions'] = len(record.pop('_seen'))
+            record['unique_supported_partitions'] = len(record.pop('_supported'))
+            level_records.append(record)
+            if supported and state_key not in supported_seen:
+                supported_seen.add(state_key)
+                retained_states.append(dict(labels=labels.copy(), cuts=cuts.copy(), raw_phi=x.copy(),
+                    requested_k=int(k), diagnostics=dict(status='retained_supported_finite_penalty_proposal',
+                    rho=rho, level=level, negative_log_likelihood=float(np.sum(values)),
+                    constrained_optimum_certified=False, global_optimum_certified=False)))
+                retained_states.sort(key=lambda state: (state['diagnostics']['negative_log_likelihood'],
+                                                       tuple(map(int, state['cuts']))))
+                del retained_states[4:]
             feasible = max(violation, block_range, anchor_residual) <= policy.constraint_tolerance
             if stationarity <= policy.stationarity_tolerance and feasible:
                 break
-            if precision_limited:
+            if precision_limited or rejected_budget_exhausted or capture_stopped:
                 break
             roundoff = 8 * rho * np.finfo(float).eps
             if rho >= policy.maximum_penalty or (stalled and feasible and roundoff >= policy.stationarity_tolerance):
@@ -339,7 +422,9 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
                 gap = 4 * np.sin(np.pi / (2 * longest)) ** 2
                 factor = max(2.0, min(10.0, max(mean_h / gap / rho, max(violation, block_range, anchor_residual) / policy.constraint_tolerance)))
                 next_rho = min(policy.maximum_penalty, rho * factor)
+                warm_started = time.perf_counter()
                 warm = _support_warm_start(model, x, labels, lower, upper, witness, next_rho)
+                timings['support_warm_start_inclusive_likelihood'] += time.perf_counter()-warm_started
                 if warm is not None:
                     old_objective = float(np.sum(values) + 0.5 * next_rho * violation ** 2) + anchor_penalty(x, witness, next_rho)
                     warm_objective = float(np.sum(warm[1])) + anchor_penalty(warm[0], witness, next_rho)
@@ -364,11 +449,14 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
         objective = float(np.sum(values)+.5*rho*violation**2) + anchor_penalty(x, witness, rho)
         tolerance_met = stationarity <= policy.stationarity_tolerance and max(violation, block_range, anchor_residual) <= policy.constraint_tolerance
         status = ("penalty_stationary_constraint_tolerance" if tolerance_met else
+                  "controlled_failure_capture_candidate" if capture_stopped else
+                  "unqualified_qp_budget_candidate" if rejected_budget_exhausted else
                   "precision_limited_candidate" if precision_limited else
                   "penalty_numerical_limit_candidate" if numerical_limit else
                   "line_search_stalled_candidate" if stalled else "finite_budget_candidate")
         candidates.append({
             "labels": labels, "cuts": cuts, "requested_k": int(k), "raw_phi": x.copy(),
+            "retained_supported_states": retained_states,
             "diagnostics": {
                 "status": status, "backend": "host_forest", "tree_identity": tree.identity,
                 "missing_raw_coordinates_initialized": missing_initializations,
@@ -395,6 +483,15 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, _batch=T
                 "precision_limit_basis": ('stagnant fixed-support updates with coordinate-spacing risk; '
                                            'not a replay-confirmed attribution' if precision_limited else None),
                 "failure_snapshots": snapshots.summary() if snapshots is not None else None,
+                "numerical_work_policy": dict(max_unqualified_qps_per_seed=policy.max_unqualified_qps_per_seed,
+                    capture_failure_then_stop=policy.capture_failure_then_stop,
+                    meaning='rejected-QP count bound, not a convergence criterion or elapsed-time limit'),
+                "numerical_work_counts": dict(work_counts), "numerical_timings_seconds": dict(timings),
+                "stagnation_guard_condition_counts": dict(guard_counts),
+                "penalty_level_work": level_records,
+                "supported_level_end_partitions_seen": len(supported_seen),
+                "retained_supported_state_count": len(retained_states),
+                "returned_state_sha256": hashlib.sha256(x.tobytes()+labels.tobytes()).hexdigest(),
             },
         })
     return candidates

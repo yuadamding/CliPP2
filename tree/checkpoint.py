@@ -95,12 +95,12 @@ def identities(model, tree=None, pilot=None):
     return result
 
 
-def write_checkpoint(path, state):
+def write_checkpoint(path, state, *, schema=SCHEMA):
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = encode(state)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    document = {"schema": SCHEMA, "sha256": hashlib.sha256(encoded.encode()).hexdigest(),
+    document = {"schema": schema, "sha256": hashlib.sha256(encoded.encode()).hexdigest(),
                 "payload": payload}
     descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     try:
@@ -130,6 +130,7 @@ def read_checkpoint(path, model, tree=None, pilot=None):
 
 
 def snapshot_bank(bank):
+    from .selection import _TreeRefit
     index = {id(candidate): i for i, candidate in enumerate(bank.candidates)}
     candidates = []
     for candidate in bank.candidates:
@@ -137,25 +138,36 @@ def snapshot_bank(bank):
         values = {field.name: getattr(fit, field.name) for field in fields(fit)
                   if field.name not in ("tree", "partition_cache")}
         candidates.append({"cuts": candidate.cuts, "membership_kind": candidate.membership_kind,
+                           "refit_kind": "tree" if isinstance(fit, _TreeRefit) else "dense",
                            "provenance": candidate.provenance, "refit": values})
     maps = {}
     for name in ("by_cuts", "by_membership", "membership_attempts", "tree_attempts", "fitted_states"):
         maps[name] = {key: index[id(value)] if value is not None else None
                       for key, value in getattr(bank, name).items()}
     plain = {name: value for name, value in vars(bank).items()
-             if name not in {"model", "tree", "partition_cache", "candidates", *maps}}
-    return {"candidates": candidates, "maps": maps, "plain": plain}
+             if name not in {"model", "tree", "partition_cache", "candidates", "original_selected", *maps}}
+    return {"candidates": candidates, "maps": maps, "plain": plain,
+            "original_selected_index": (index[id(bank.original_selected)]
+                                        if hasattr(bank, "original_selected") else None)}
 
 
 def restore_bank(model, tree, state):
     from .selection import Candidate, _CandidateBank, _TreeRefit
+    from ..kernel.model import RefittedPartition
     from ..io.data import readonly_array
     bank = _CandidateBank(model, tree, compact_general=True)
     for record in state["candidates"]:
         values = dict(record["refit"])
         for name in ("centers", "weights"):
             values[name] = readonly_array(values[name])
-        fitted = _TreeRefit(tree=tree, partition_cache=bank.partition_cache, **values)
+        kind = record.get("refit_kind", "tree")  # Original bounded schema is compact.
+        if kind == "tree":
+            fitted = _TreeRefit(tree=tree, partition_cache=bank.partition_cache, **values)
+        elif kind == "dense":
+            values["labels"] = readonly_array(values["labels"])
+            fitted = RefittedPartition(**values)
+        else:
+            raise ValueError("Unsupported saved refit representation")
         bank.candidates.append(Candidate(record["cuts"], fitted, record["provenance"],
                                          record["membership_kind"]))
     for name, values in state["maps"].items():
@@ -163,4 +175,6 @@ def restore_bank(model, tree, state):
                             for key, index in values.items()})
     for name, value in state["plain"].items():
         setattr(bank, name, value)
+    if state.get("original_selected_index") is not None:
+        bank.original_selected = bank.candidates[state["original_selected_index"]]
     return bank

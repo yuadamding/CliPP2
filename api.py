@@ -12,7 +12,8 @@ from .io.tumor_txt import load_tumor_txt
 
 
 def process_tumor_bundle(tumor_file, outdir, fit_config=None, *,
-                         checkpoint_path=None, resume=False, checkpoint_stop_after=None):
+                         checkpoint_path=None, resume=False, checkpoint_stop_after=None,
+                         import_checkpoint=None, import_authority=None):
     """Fit canonical input; verify and publish three minimal tables.
 
     One occupied conditional center is fixed at one; other centers are free
@@ -28,10 +29,21 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None, *,
     from .kernel import KERNEL_VERSION
     from .kernel.objectives import score_definition_for
     from .kernel.memory import MemoryPolicy, process_memory_snapshot
+    from .tree.importing import POLISH_SCHEMA, import_candidates
+    from .tree.polish_workflow import checkpoint_destination, finalize_result
 
     config = resolve_fit_config() if fit_config is None else fit_config
     if type(config) is not FitConfig:
         raise TypeError('fit_config must be a FitConfig')
+    if (import_checkpoint is None) != (import_authority is None):
+        raise ValueError('Explicit import requires both source checkpoint and import authority')
+    if import_checkpoint is not None:
+        if checkpoint_path is None or config.selection_objective == 'legacy_mixture':
+            raise ValueError('Import-and-polish requires a fresh checkpoint and an assigned objective')
+        if checkpoint_stop_after is not None:
+            raise ValueError('Import-and-polish uses polish_max_visits, not discovery stop budgets')
+        if Path(import_checkpoint).resolve() == Path(checkpoint_path).resolve():
+            raise ValueError('Import must not overwrite the original checkpoint')
     if resume and checkpoint_path is None:
         raise ValueError('resume requires checkpoint_path')
     if checkpoint_path is not None and config.search_policy != 'bounded':
@@ -44,6 +56,13 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None, *,
             raise FileExistsError('Search checkpoint exists; explicitly resume or use a fresh path')
         if resume and not checkpoint.is_file():
             raise FileNotFoundError(checkpoint)
+    polish_path = checkpoint_destination(outdir, checkpoint_path, importing=import_checkpoint is not None)
+    if resume and json.loads(Path(checkpoint_path).read_text()).get('schema') == POLISH_SCHEMA:
+        polish_path = Path(checkpoint_path)
+    if resume and polish_path.is_file() and config.selection_objective == 'legacy_mixture':
+        raise ValueError('Finalization checkpoint requires its original assigned objective')
+    if config.selection_objective != 'legacy_mixture' and polish_path.exists() and not resume:
+        raise FileExistsError('Finalization checkpoint exists; explicitly resume or use a fresh path')
     started = perf_counter()
     source_root = Path(__file__).resolve().parent
     commit, dirty = git_source_identity(source_root)
@@ -72,14 +91,21 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None, *,
     search = config.resolved_search(active_hard_zero=bool(model.regional_support.hard_zero.any()))
     continuation = dict(checkpoint_path=checkpoint_path, resume=resume,
                         checkpoint_stop_after=checkpoint_stop_after)
-    result = (fit_scalar(model, config.max_clusters, search=search, **continuation) if supports_scalar(model)
-              else fit_tree(model, config.max_clusters,
-                            search=replace(search, mode=config.search_policy), **continuation))
+    if resume and polish_path.is_file():
+        result = None  # Finalizer restores its exact source-bound bank; no new native work.
+    elif import_checkpoint is not None:
+        result = import_candidates(model, import_checkpoint, import_authority, config,
+                                   input_sha256=input_hash)
+    else:
+        result = (fit_scalar(model, config.max_clusters, search=search, **continuation) if supports_scalar(model)
+                  else fit_tree(model, config.max_clusters,
+                                search=replace(search, mode=config.search_policy), **continuation))
+    result = finalize_result(model, result, config, polish_path, resume=resume)
     # Observation topology is known only after constructing the similarity
     # forest. Preserve the requested policy until then and report the route
     # actually taken, rather than the preliminary capacity-only resolution.
     resolved = result.diagnostics.get('search_policy', {}).get('mode', search.mode)
-    search = replace(search, mode=resolved)
+    search = replace(search, mode=resolved if resolved in ('auto', 'bounded', 'exhaustive') else 'bounded')
     if hashlib.sha256(path.read_bytes()).hexdigest() != input_hash:
         raise RuntimeError('Input changed during fitting; no successful publication')
     if source_fingerprint(source_root) != source_hash:
@@ -116,12 +142,15 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None, *,
         'verification_publication_seconds': perf_counter()-verification_start,
         'elapsed_seconds': perf_counter()-started, 'publication': publication,
         'qualification_scope': 'numerical_fit_not_global_optimality_or_biological_accuracy',
+        'finalization': result.diagnostics.get('finalization'),
     }
     return summary, tuple(result.candidate_bank)
 
 
 def process_tumor(tumor_file: str | Path, outdir: str | Path,
                   fit_config: FitConfig | None = None, *, checkpoint_path=None,
-                  resume=False, checkpoint_stop_after=None) -> dict[str, object]:
+                  resume=False, checkpoint_stop_after=None,
+                  import_checkpoint=None, import_authority=None) -> dict[str, object]:
     return process_tumor_bundle(tumor_file, outdir, fit_config, checkpoint_path=checkpoint_path,
-                                resume=resume, checkpoint_stop_after=checkpoint_stop_after)[0]
+                                resume=resume, checkpoint_stop_after=checkpoint_stop_after,
+                                import_checkpoint=import_checkpoint, import_authority=import_authority)[0]

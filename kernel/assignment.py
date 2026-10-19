@@ -5,6 +5,82 @@ import numpy as np
 from scipy.special import logsumexp
 
 
+def feasible_transfer_scan(columns, labels, centers, observed, hard_zero, positive,
+                           mutation_ids, *, objective='classification', score_tolerance=0.,
+                           lower=None, upper=None):
+    """Exhaust every individual move, with an exact profiled count correction.
+
+    ``score_tolerance`` is on the *decrease* in selection score, hence the
+    operational likelihood-gain threshold is half that value. Raw positive
+    gains remain reported separately. This is not a refitted-neighbor test.
+    """
+    from .objectives import transfer_count_gain
+    if objective not in ('classification', 'assigned_reads'):
+        raise ValueError('Exact transfer closure requires an assigned objective')
+    if not np.isfinite(score_tolerance) or score_tolerance < 0:
+        raise ValueError('Score tolerance must be finite and nonnegative')
+    columns, labels, centers = np.asarray(columns), np.asarray(labels, dtype=int), np.asarray(centers)
+    observed, hard_zero, positive = (np.asarray(x, dtype=bool) for x in (observed, hard_zero, positive))
+    n, q = columns.shape
+    if (not n or not q or labels.shape != (n,) or centers.ndim != 2 or len(centers) != q
+            or observed.shape != (n, centers.shape[1]) or hard_zero.shape != observed.shape
+            or positive.shape != observed.shape or len(mutation_ids) != n
+            or not np.array_equal(np.unique(labels), np.arange(q))
+            or np.isnan(columns).any() or np.isposinf(columns).any()
+            or not np.isfinite(centers).all() or np.any(centers < 0.) or np.any(centers > 1.)):
+        raise ValueError('Transfer scan requires aligned occupied finite-domain arrays')
+    if (lower is None) != (upper is None):
+        raise ValueError('Transfer boxes require both lower and upper bounds')
+    lower = np.zeros_like(observed, dtype=float) if lower is None else np.asarray(lower, dtype=float)
+    upper = np.ones_like(observed, dtype=float) if upper is None else np.asarray(upper, dtype=float)
+    if (lower.shape != observed.shape or upper.shape != observed.shape
+            or not np.isfinite(lower).all() or not np.isfinite(upper).all()
+            or np.any(lower > upper) or np.any(centers[labels] < lower)
+            or np.any(centers[labels] > upper)):
+        raise ValueError('Transfer scan requires aligned feasible original boxes')
+    assigned = columns[np.arange(n), labels]
+    if not np.isfinite(assigned).all():
+        raise ValueError('Assigned likelihoods must be finite')
+    counts = np.bincount(labels, minlength=q)
+    regional = np.zeros((q, observed.shape[1]), dtype=np.int64)
+    np.add.at(regional, labels, observed)
+    if np.any(regional == 0):
+        raise ValueError('Every source cluster needs regional observation support')
+    gains = columns-assigned[:, None]
+    if objective == 'classification':
+        gains += transfer_count_gain(counts, np.arange(q)[:, None], np.arange(q)[None, :])[labels]
+    allowed = ((~hard_zero[:, None, :] | (centers[None, :, :] == 0.))
+               & (~positive[:, None, :] | (centers[None, :, :] > 0.))).all(axis=2)
+    allowed &= np.isfinite(columns)
+    allowed &= ((centers[None, :, :] >= lower[:, None, :])
+                & (centers[None, :, :] <= upper[:, None, :])).all(axis=2)
+    allowed &= (counts[labels] > 1)[:, None]
+    allowed &= ((regional[labels]-observed) > 0).all(axis=1)[:, None]
+    allowed[np.arange(n), labels] = False
+    gains = np.where(allowed, gains, -np.inf)
+    best = gains.max(axis=1)
+    flat = int(np.argmax(gains))
+    row, destination = np.unravel_index(flat, gains.shape)
+    maximum = float(gains[row, destination])
+    witness = (None if not np.isfinite(maximum) else {
+        'mutation_index': int(row), 'mutation_id': str(mutation_ids[row]),
+        'source': int(labels[row]), 'destination': int(destination),
+        'objective_gain': maximum, 'score_decrease': 2*maximum})
+    return {
+        'scope': 'all_feasible_fixed_center_fixed_q_single_transfers',
+        'objective': objective, 'scanned_pairs': n*(q-1),
+        'feasible_pairs': int(allowed.sum()),
+        'raw_positive_pair_count': int(np.count_nonzero(gains > 0.)),
+        'raw_positive_mutation_count': int(np.count_nonzero(best > 0.)),
+        'significant_pair_count': int(np.count_nonzero(gains > score_tolerance/2)),
+        'significant_mutation_count': int(np.count_nonzero(best > score_tolerance/2)),
+        'maximum_gain': max(0., maximum), 'witness': witness,
+        'score_tolerance': float(score_tolerance), 'gain_tolerance': float(score_tolerance/2),
+        'closed': bool(not np.any(gains > score_tolerance/2)),
+        'refitted_neighborhood_exhausted': False, 'global_optimality_certified': False,
+    }
+
+
 def assignment_audit(columns, labels, centers, weights, observed, hard_zero,
                      positive, clonal, mutation_ids, *, objective='classification', limit=30):
     """Audit original memberships and feasible fixed-center, fixed-q transfers.
