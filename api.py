@@ -18,8 +18,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     not confused with a global-optimality or biological-accuracy proof.
     """
     from .kernel.model import RegionalModel, MODEL_VERSION
-    from .kernel.scalar import fit_scalar, supports_scalar
-    from .tree.selection import fit_tree
+    from .tree.selection import fit_regions
     from .tree.reporting import ALGORITHM, check_destination, exclusion_summary, publish
     from ._source import source_fingerprint, git_source_identity
     from .kernel import KERNEL_VERSION, SCORE_DEFINITION
@@ -44,8 +43,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     data = load_tumor_txt(path, max_major_cn=config.max_major_cn, initialize=False)
     check_destination(outdir, data.tumor_id)
     model = RegionalModel(data, device=config.device)
-    result = (fit_scalar(model, config.max_clusters) if supports_scalar(model)
-              else fit_tree(model, config.max_clusters))
+    result = fit_regions(model, config.max_clusters)
     if hashlib.sha256(path.read_bytes()).hexdigest() != input_hash:
         raise RuntimeError('Input changed during fitting; no successful publication')
     if source_fingerprint(source_root) != source_hash:

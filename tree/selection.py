@@ -6,7 +6,7 @@ coarsenings of generated seeds and supported one-edge splits of small trees,
 not all possible tree partitions or continuous optima.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from itertools import combinations
 from time import perf_counter
 
@@ -14,68 +14,8 @@ import numpy as np
 
 from .refinement import canonical_partition, refine_partition
 from ..kernel import ALGORITHM
-from ..kernel.model import RefittedPartition
+from ..kernel.candidates import Candidate as Candidate, CandidateBank as _CandidateBank, score_key as _score_key
 from ..kernel.topology import build_tree, partition_from_cuts
-
-
-@dataclass(frozen=True, eq=False)
-class _TreeRefit:
-    """Compact candidate record; reconstruct N labels only when requested."""
-
-    tree: object
-    cuts: tuple
-    centers: np.ndarray
-    weights: np.ndarray
-    conditional_log_likelihood: float
-    mixture_log_likelihood: float
-    complexity_penalty: float
-    score: float
-    eligible: bool
-    reason: object
-    diagnostics: dict
-
-    @property
-    def labels(self):
-        return partition_from_cuts(self.tree, self.cuts)
-
-    @property
-    def penalty(self):
-        return self.complexity_penalty
-
-    @classmethod
-    def from_fit(cls, tree, cuts, fit):
-        return cls(tree, cuts, fit.centers, fit.weights,
-                   float(fit.conditional_log_likelihood), float(fit.mixture_log_likelihood),
-                   float(fit.complexity_penalty), float(fit.score), bool(fit.eligible),
-                   fit.reason, fit.diagnostics)
-
-
-@dataclass(eq=False)
-class Candidate:
-    cuts: tuple | None
-    refit: object
-    provenance: list = field(default_factory=list)
-    membership_kind: str = "tree"
-
-    @property
-    def score(self):
-        return float(self.refit.score)
-
-    @property
-    def fit(self):
-        return self.refit
-
-    @property
-    def requested_k(self):
-        return self.provenance[0].get("requested_k", len(self.refit.centers))
-
-    @property
-    def kind(self):
-        return self.provenance[0].get("route", "unspecified")
-
-    @property
-    def diagnostics(self):
-        return {"provenance": self.provenance, "refit": self.refit.diagnostics}
 
 
 @dataclass(eq=False)
@@ -110,32 +50,6 @@ def cut_subsets(cuts):
         raise ValueError("Exhaustive coarsening supports at most ten clusters")
     for size in range(len(cuts) + 1):
         yield from combinations(cuts, size)
-
-
-def _score_key(candidate):
-    # Preserve the exact old tree ordering, preferring old records on an exact
-    # cross-family tie. K comes from occupied centers, never crossing edges.
-    tree = candidate.membership_kind == "tree"
-    return (candidate.score, len(candidate.refit.centers), 0 if tree else 1,
-            candidate.cuts if tree else tuple(candidate.refit.labels))
-
-
-def _canonical_inputs(labels, centers, n, r):
-    """Validate occupied IDs and move center rows with first-occurrence labels."""
-    labels = np.asarray(labels)
-    if (labels.shape != (n,) or labels.dtype.kind not in "iuf"
-            or not np.isfinite(labels).all() or np.any(labels != np.rint(labels))):
-        raise ValueError("Candidate labels must be one finite integer per mutation")
-    occupied = np.unique(labels)
-    if not np.array_equal(occupied, np.arange(len(occupied))):
-        raise ValueError("Candidate labels must be occupied consecutive IDs starting at zero")
-    labels = labels.astype(np.int64)
-    if centers is None:
-        return canonical_partition(labels), None
-    centers = np.asarray(centers, dtype=float)
-    if centers.shape != (len(occupied), r) or not np.isfinite(centers).all():
-        raise ValueError("Supplied centers must be finite occupied q by R rows aligned with labels")
-    return canonical_partition(labels, centers)
 
 
 def _forest_structure(tree, cuts):
@@ -359,121 +273,11 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
             "exhaustive_tree_partition_search": False}
 
 
-class _CandidateBank:
-    def __init__(self, model, tree):
-        self.model, self.tree = model, tree
-        self.candidates = []
-        self.by_cuts = {}
-        self.ineligible = {}
-        self.duplicate_routes = 0
-        self.refit_seconds = 0.0
-        self.refit_calls = 0
-        # Only the bounded general stage stores explicit membership keys. Old
-        # tree candidates stay compact; never materialize a dense label bank.
-        self.by_membership = {}
-        self.membership_attempts = {}
-        self.structural_rejections = {}
-        self.general_rejections = []
-        self.attempt_cache_hits = self.structural_cache_hits = 0
-
-    def consider(self, cuts, labels, centers, provenance):
-        cuts = tuple(sorted(map(int, cuts)))
-        labels, centers = _canonical_inputs(labels, centers, self.model.n, self.model.r)
-        if not np.array_equal(labels, partition_from_cuts(self.tree, cuts)):
-            raise ValueError("Candidate labels and frozen-tree cuts disagree")
-        previous = self.by_cuts.get(cuts)
-        if cuts in self.ineligible and str(self.ineligible[cuts]["reason"]).startswith(
-                ("unsupported_cluster_region", "empty_cluster_region_box")):
-            self.ineligible[cuts]["provenance"].append(provenance)
-            return None
-        if previous is not None and (centers is None or np.array_equal(
-                np.asarray(centers), previous.refit.centers)):
-            previous.provenance.append(provenance)
-            self.duplicate_routes += 1
-            return previous
-        started = perf_counter()
-        self.refit_calls += 1
-        fit = self.model.refit(labels, initial_centers=centers)
-        self.refit_seconds += perf_counter() - started
-        if not fit.eligible:
-            self.ineligible[cuts] = {
-                "cuts": cuts, "reason": fit.reason, "provenance": [provenance],
-            }
-            return None
-        if not np.isfinite(fit.score):
-            raise ValueError("An eligible candidate has a nonfinite score")
-        candidate = Candidate(cuts, _TreeRefit.from_fit(self.tree, cuts, fit), [provenance])
-        self.candidates.append(candidate)
-        if previous is None or _score_key(candidate) < _score_key(previous):
-            self.by_cuts[cuts] = candidate
-        return candidate
-
-    def consider_membership(self, labels, initial_centers, provenance):
-        """Refit a general partition without collapsing distinct fitted states.
-
-        Partition identity, exact refit attempt and retained numerical state are
-        separate. Only structural failures persist across supplied-center states.
-        No tree candidates or their provenance are mutated by this new route.
-        """
-        labels, centers = _canonical_inputs(labels, initial_centers, self.model.n, self.model.r)
-        key = labels.tobytes()
-        attempt = (key, None if centers is None else centers.tobytes())
-        if key in self.structural_rejections:
-            self.structural_cache_hits += 1
-            return None
-        if attempt in self.membership_attempts:
-            self.attempt_cache_hits += 1
-            candidate = self.membership_attempts[attempt]
-            if candidate is not None:
-                candidate.provenance.append(dict(provenance))
-            return candidate
-        self.refit_calls += 1
-        started = perf_counter()
-        try:
-            fitted = self.model.refit(labels, initial_centers=centers)
-        finally:
-            self.refit_seconds += perf_counter()-started
-        self.membership_attempts[attempt] = None
-        if not fitted.eligible:
-            rejection = {"labels": labels.tolist(), "reason": fitted.reason,
-                         "provenance": [dict(provenance)]}
-            self.general_rejections.append(rejection)
-            if str(fitted.reason).startswith(("unsupported_cluster_region", "empty_cluster_region_box")):
-                self.structural_rejections[key] = rejection
-            return None
-        if not np.isfinite(fitted.score):
-            raise ValueError("An eligible general candidate has a nonfinite score")
-        # The fitter labels index its center/weight rows. Reorder all three
-        # together, then verify that it did not change the proposed partition.
-        canonical, aligned = _canonical_inputs(fitted.labels, fitted.centers, self.model.n, self.model.r)
-        if not np.array_equal(canonical, labels):
-            raise ValueError("Conditional refit changed the proposed membership")
-        order = list(dict.fromkeys(np.asarray(fitted.labels, dtype=int).tolist()))
-        weights = np.asarray(fitted.weights)
-        if (weights.shape != (len(order),) or not np.isfinite(weights).all()
-                or np.any(weights <= 0) or not np.isclose(weights.sum(), 1., atol=1e-12, rtol=0)):
-            raise ValueError("Eligible fitted weights must be positive normalized occupied rows")
-        if not np.isfinite([fitted.conditional_log_likelihood, fitted.mixture_log_likelihood,
-                            fitted.complexity_penalty]).all():
-            raise ValueError("Eligible fitted likelihoods and penalty must be finite")
-        fit = RefittedPartition(canonical, aligned, weights[order],
-            float(fitted.conditional_log_likelihood), float(fitted.mixture_log_likelihood),
-            float(fitted.complexity_penalty), float(fitted.score), True,
-            fitted.reason, dict(fitted.diagnostics))
-        candidate = Candidate(None, fit, [dict(provenance)], "general")
-        self.candidates.append(candidate)
-        self.membership_attempts[attempt] = candidate
-        previous = self.by_membership.get(key)
-        if previous is None or _score_key(candidate) < _score_key(previous):
-            self.by_membership[key] = candidate
-        return candidate
-
-
-def fit_tree(model, max_clusters=10, capacities=None):
+def fit_regions(model, max_clusters=10, capacities=None):
     """Fit tree proposals followed by bounded free-center joint reassignment.
 
-    Truth is deliberately absent from this interface. The single-region
-    kernel specialization lives in the public dispatcher, not this tree search.
+    Truth is deliberately absent. Every R>=1 uses this same forest continuation,
+    conditional refitter, candidate registry and bounded membership expansion.
     """
     from ..kernel.solver import generate_candidates
 
@@ -570,8 +374,7 @@ def fit_tree(model, max_clusters=10, capacities=None):
     bank.original_selected = min(bank.candidates, key=_score_key)
     original_count = len(bank.candidates)
     from .reassignment import expand_memberships
-    reassignment = (expand_memberships(model, bank) if model.r > 1 else
-                    {"applied": False, "reason": "single_region_path_unchanged"})
+    reassignment = expand_memberships(model, bank)
     times["reassignment_inclusive_seconds"] = reassignment.get("seconds", 0.0)
     selected = min(bank.candidates, key=_score_key)
     if selected.score > bank.original_selected.score:
@@ -615,8 +418,13 @@ def fit_tree(model, max_clusters=10, capacities=None):
             for candidate in bank.candidates),
         "candidate_membership_storage": "compact_tree_cut_sets_plus_bounded_explicit_general_labels",
         "selection": "minimum_over_complete_eligible_scored_bank",
+        "candidate_evidence": bank.evidence(selected),
         "global_optimality_certified": False,
     })
+
+
+# Historical import name, not an alternative estimator.
+fit_tree = fit_regions
 
 
 def exhaustive_tree_reference(model, tree, *, max_nodes=8):

@@ -1,7 +1,7 @@
 """CliPP2 emissions, conditional centers and joint reads/validity mixture score.
 
-CCF, not cellular prevalence, is the public fitting/geometry scale. Single-state
-diploid-normal observations use the shared scalar likelihood primitives.
+CCF, not cellular prevalence, is the fitting/geometry scale for every region.
+One shared emission primitive serves arrays, pilot grids and coordinate views.
 Mixed CN explicitly retains CliPP2's capped support, weighted denominator,
 clipped likelihood and original interior box. Assignment validity is observed
 jointly with reads; it is not conditioned away by renormalizing mixture weights.
@@ -13,26 +13,20 @@ from dataclasses import dataclass, field
 import hashlib
 import math
 import time
-from types import SimpleNamespace
 
 import numpy as np
-from scipy.optimize import brentq, minimize, minimize_scalar
-from scipy.special import gammaln, logsumexp, xlog1py, xlogy
+from scipy.special import gammaln
 
 from . import SCORE_DEFINITION
-from .initialization import pooled_cp_initialization
-from .likelihood import MultiplicityModel
+from .initialization import pooled_ccf_initialization
+from .likelihood import MIXED_EPS, RegionalView, emission_terms
 from .refitting import refit_center
-from .scoring import fit_cluster_weights
+from .scoring import fit_mixture_weights
 from ..io.data import readonly_array
 
 
 # Mixed-CN emissions/boxes stay fixed; their assignment mask now enters scoring.
 MODEL_VERSION = "clipp2_regional_full_support__general_normal_v1__mixed_cn_bulk_assignment_event_v2"
-MIXED_EPS = 1e-6
-ADAPTER_BLOCK_BYTES = 8 * 1024 * 1024
-ADAPTER_MAX_ITERATIONS = 500
-ADAPTER_GRID_TOLERANCE = 1e-8
 
 
 @dataclass(frozen=True)
@@ -165,15 +159,9 @@ class RegionalModel:
             raise ValueError("CCFs must match N by R and be finite where observed")
         if np.any(x[self.observed] < 0) or np.any(x[self.observed] > 1):
             raise ValueError("CCFs must be in [0,1]")
-        mass = np.where(self.observed, x, 0.0)[..., None] * self.slope
-        p = np.where(self.mixed[..., None], np.clip(mass, MIXED_EPS, 1-MIXED_EPS), np.minimum(1., mass))
-        if np.any(p[self.valid & self.observed[..., None]] < 0):
-            raise ValueError("CCFs cannot imply negative allele probabilities")
-        alt = np.where(self.observed, self.alt, 0.)[..., None]
-        ref = np.where(self.observed, self.depth - self.alt, 0.)[..., None]
-        kernel = xlogy(alt, p) + xlog1py(ref, -p) + self.constants[..., None]
-        kernel = np.where(self.valid, kernel, -np.inf)
-        return p, mass, kernel, logsumexp(kernel, axis=-1)
+        return emission_terms(np.where(self.observed, x, 0.), **{
+            name: getattr(self, name) for name in
+            ("slope", "valid", "mixed", "alt", "depth", "constants")})
 
     def _gpu_terms(self, x, derivatives=False):
         t, a = self._torch, self._gpu
@@ -249,34 +237,18 @@ class RegionalModel:
         post = self.posterior(x)
         return np.where(self.observed, np.nan_to_num(post).argmax(-1)+1., np.nan)
 
-    def _scalar_model(self, rows, region):
-        if self.mixed[rows, region].any() or np.any(self.normal[rows, region] != 2):
-            return None
-        return MultiplicityModel(self.alt[rows, region], self.depth[rows, region],
-                                 self.major[rows, region], self.total[rows, region],
-                                 self.region_purities[region])
+    def view(self, region, rows=None):
+        return RegionalView(self, region, np.arange(self.n) if rows is None else rows)
 
     def _regional_likelihood(self, values, rows, region):
-        """Host scalar/grid evaluation, including legacy mixed-CN clipping."""
-        values = np.atleast_1d(values)
-        p = values[:, None, None] * self.slope[rows, region][None, :, :]
-        p = np.where(self.mixed[rows, region][None, :, None],
-                     np.clip(p, MIXED_EPS, 1-MIXED_EPS), np.minimum(p, 1.))
-        kernel = (xlogy(self.alt[rows, region][None, :, None], p)
-                  + xlog1py((self.depth[rows, region]-self.alt[rows, region])[None, :, None], -p)
-                  + self.constants[rows, region][None, :, None])
-        return logsumexp(np.where(self.valid[rows, region][None, :, :], kernel, -np.inf), -1)
+        """Host grid view of the same emissions used by the joint model."""
+        return self.view(region, rows).log_likelihood_columns(np.atleast_1d(values)).T
 
     def pilots(self):
         pilots, diagnostics = np.full((self.n, self.r), np.nan), {}
         for region in range(self.r):
             rows = np.flatnonzero(self.observed[:, region])
-            scalar = self._scalar_model(rows, region)
-            if scalar is not None:
-                cp, diag = pooled_cp_initialization(scalar)
-                pilots[rows, region] = cp / scalar.purity
-            else:
-                pilots[rows, region], diag = _pooled_adapter(self, rows, region)
+            pilots[rows, region], diag = pooled_ccf_initialization(self.view(region, rows))
             diagnostics[self.region_ids[region]] = diag
         return pilots, diagnostics
 
@@ -316,31 +288,7 @@ class RegionalModel:
             raise ValueError(f"unsupported_cluster_region:{self.region_ids[region]}")
         if lower > upper:
             raise ValueError(f"empty_cluster_region_box:{self.region_ids[region]}")
-        scalar = self._scalar_model(rows, region)
-        if scalar is not None and lower == 0 and upper == 1:
-            cp, ll = refit_center(scalar)
-            fitted = (cp/scalar.purity, ll)
-        else:
-            modes = (self.alt[rows, region]/self.depth[rows, region])[:, None] / self.slope[rows, region]
-            grid = np.unique(np.r_[np.linspace(lower, upper, 513), np.clip(modes[self.valid[rows, region]], lower, upper)])
-            values = np.concatenate([self._regional_likelihood(grid[i:i+32], rows, region).sum(axis=1)
-                                     for i in range(0, len(grid), 32)])
-            best_index = int(np.argmax(values))
-            best = (float(values[best_index]), float(grid[best_index]))
-            maxima = np.flatnonzero((values[1:-1] >= values[:-2]) & (values[1:-1] >= values[2:])
-                                    & ((values[1:-1] > values[:-2]) | (values[1:-1] > values[2:])))+1
-            intervals = set() if len(grid) == 1 else {(grid[0], grid[1]), (grid[-2], grid[-1])}
-            intervals.update((grid[j-1], grid[j+1]) for j in maxima)
-            for lo, hi in sorted(intervals):
-                result = minimize_scalar(lambda x: -self._regional_likelihood([x], rows, region).sum(),
-                                         bounds=(lo, hi), method="bounded",
-                                         options={"xatol": 1e-12, "maxiter": 500})
-                if not result.success or not np.isfinite(result.fun):
-                    raise RuntimeError("Regional scalar refit failed")
-                candidate = (-float(result.fun), float(result.x))
-                if candidate[0] > best[0] or (candidate[0] == best[0] and candidate[1] < best[1]):
-                    best = candidate
-            fitted = (best[1], best[0])
+        fitted = refit_center(self.view(region, rows), (lower, upper))
         if not math.isfinite(fitted[1]):
             raise RuntimeError("No finite conditional scalar likelihood")
         self.telemetry["scalar_refits"] += 1
@@ -431,8 +379,7 @@ class RegionalModel:
         conditional = math.fsum(matrix[np.arange(self.n), inverse])
         start = time.perf_counter()
         try:
-            mixture = fit_cluster_weights(_WeightModel(self.n), np.zeros(q),
-                                          np.bincount(inverse), log_kernel=matrix,
+            mixture = fit_mixture_weights(matrix, np.bincount(inverse),
                                           telemetry=self.telemetry)
         except (ValueError, RuntimeError) as error:
             return RefittedPartition(inverse, centers, np.full(q, np.nan), conditional,
@@ -450,212 +397,3 @@ class RegionalModel:
                                      "scalar_global_optimality_certified": False,
                                      "num_parameters": q*self.r+q-1,
                                      "score_definition": SCORE_DEFINITION})
-
-
-class _WeightModel(SimpleNamespace):
-    """Only cardinality/domain are used when inherited scorer gets log_kernel."""
-    def __init__(self, n):
-        super().__init__(n=n, purity=1.)
-
-    def __len__(self):
-        return self.n
-
-
-class _GridOracle:
-    """Exact regional grid likelihood in row blocks; never retain N by grid.
-
-    The working block is at most ADAPTER_BLOCK_BYTES (or one grid row if that
-    row itself exceeds the budget). Thus storage remains O(N + grid), even
-    when distinct mixed-CN upper bounds make the grid grow with N.
-    """
-    def __init__(self, model, rows, region, grid, *, block_bytes=None):
-        self.model, self.rows, self.region, self.grid = model, rows, region, grid
-        budget = ADAPTER_BLOCK_BYTES if block_bytes is None else int(block_bytes)
-        if budget < 8:
-            raise ValueError("Grid block budget must hold at least one float64")
-        self.block_rows = min(256, max(1, budget//(8*len(grid))),
-                              max(1, 1_000_000//(32*model.valid.shape[-1])))
-        self.offset = np.empty(len(rows))
-        self.evaluations = 0
-        self.peak_block_bytes = 0
-        for first in range(0, len(rows), self.block_rows):
-            stop = min(len(rows), first+self.block_rows)
-            values = self.log_block(first, stop)
-            self.offset[first:stop] = values.max(axis=1)
-        if not np.isfinite(self.offset).all():
-            raise RuntimeError("No finite supported grid likelihood for regional initialization")
-
-    def log_block(self, first, stop, positions=None):
-        grid = self.grid if positions is None else self.grid[positions]
-        rows = self.rows[first:stop]
-        values = np.empty((len(rows), len(grid)))
-        self.peak_block_bytes = max(self.peak_block_bytes, values.nbytes)
-        for begin in range(0, len(grid), 32):
-            values[:, begin:begin+32] = self.model._regional_likelihood(
-                grid[begin:begin+32], rows, self.region).T
-        values[(grid[None, :] < self.model.lower[rows, self.region, None])
-               | (grid[None, :] > self.model.upper[rows, self.region, None])] = -np.inf
-        return values
-
-    def expectation(self, weights, *, collect_pilot=False):
-        self.evaluations += 1
-        score, mass = np.zeros(len(weights)), np.empty(len(self.rows))
-        pilot = np.empty(len(self.rows)) if collect_pilot else None
-        log_likelihood = 0.
-        for first in range(0, len(self.rows), self.block_rows):
-            stop = min(len(self.rows), first+self.block_rows)
-            likelihood = self.log_block(first, stop)
-            likelihood -= self.offset[first:stop, None]
-            np.exp(likelihood, out=likelihood)
-            normalizer = likelihood @ weights
-            if np.any(normalizer <= 0) or not np.isfinite(normalizer).all():
-                return None, -np.inf, None, None
-            mass[first:stop] = normalizer
-            with np.errstate(over="ignore", invalid="ignore"):
-                score += (1/normalizer) @ likelihood
-            log_likelihood += float((np.log(normalizer)+self.offset[first:stop]).sum())
-            if collect_pilot:
-                pilot[first:stop] = likelihood @ (weights*self.grid)/normalizer
-        if not np.isfinite(score).all():
-            return None, -np.inf, None, None
-        return score/len(self.rows), log_likelihood, mass, pilot
-
-    def scaled_columns(self, positions):
-        values = np.empty((len(self.rows), len(positions)))
-        for first in range(0, len(self.rows), self.block_rows):
-            stop = min(len(self.rows), first+self.block_rows)
-            values[first:stop] = np.exp(self.log_block(first, stop, positions)
-                                        - self.offset[first:stop, None])
-        return values
-
-
-def _pooled_adapter(model, rows, region, *, block_bytes=None):
-    """Stream the explicit mixed/general-normal grid; exact concave weight gap.
-
-    Safeguarded SQUAREM and exact grow/shrink exchange mirror the inherited
-    pooled initializer without a quadratic-space SLSQP over the whole grid.
-    Only this separately versioned adapter uses this route; matched standard
-    observations continue to call the unmodified inherited initializer.
-    Its masked grid scores reads jointly with assignment validity, without
-    normalizing over admissible grid points.
-    """
-    grid = np.unique(np.r_[np.linspace(0., 1., 257), model.lower[rows, region],
-                           model.upper[rows, region]])
-    oracle = _GridOracle(model, rows, region, grid, block_bytes=block_bytes)
-    weights = np.full(len(grid), 1/len(grid))
-    score, likelihood, mass, _ = oracle.expectation(weights)
-    initial_likelihood = likelihood
-    accelerated = exchanges = active_refits = 0
-    step_limit = 1.
-
-    def normalize(values):
-        values = np.maximum(values, 0.)
-        return values/values.sum()
-
-    for iteration in range(ADAPTER_MAX_ITERATIONS+1):
-        if score is None:
-            raise RuntimeError("Nonfinite streamed pooled-grid likelihood or gradient")
-        gap = max(0., float(score.max()-1))
-        if gap <= ADAPTER_GRID_TOLERANCE:
-            break
-        if iteration == ADAPTER_MAX_ITERATIONS:
-            raise RuntimeError(f"Streamed pooled-grid weights did not converge: mean gap {gap:.6g}")
-        previous_likelihood = likelihood
-        first = normalize(weights*score)
-        first_score, _, _, _ = oracle.expectation(first)
-        if first_score is None:
-            raise RuntimeError("Nonfinite streamed pooled-grid EM step")
-        second = normalize(first*first_score)
-        second_score, second_likelihood, second_mass, _ = oracle.expectation(second)
-        if second_score is None:
-            raise RuntimeError("Nonfinite streamed pooled-grid second EM step")
-        residual, curvature = first-weights, second-2*first+weights
-        step = max(1., min(float(np.sqrt((residual@residual)/max(
-            curvature@curvature, np.finfo(float).tiny))), step_limit))
-        candidate = normalize(weights+2*step*residual+step*step*curvature)
-        candidate_score, candidate_likelihood, candidate_mass, _ = oracle.expectation(candidate)
-        while candidate_likelihood < second_likelihood and step > 1.01:
-            step = (step+1)/2
-            candidate = normalize(weights+2*step*residual+step*step*curvature)
-            candidate_score, candidate_likelihood, candidate_mass, _ = oracle.expectation(candidate)
-        if candidate_likelihood >= second_likelihood:
-            weights, score, likelihood, mass = candidate, candidate_score, candidate_likelihood, candidate_mass
-            accelerated += int(step > 1)
-        else:
-            weights, score, likelihood, mass = second, second_score, second_likelihood, second_mass
-        if step >= .99*step_limit:
-            step_limit = min(step_limit*4, 1e100)
-        grow = int(np.argmax(score))
-        positive = np.flatnonzero(weights > 0)
-        shrink = int(positive[np.argmin(score[positive])])
-        if grow != shrink:
-            columns = oracle.scaled_columns([grow, shrink])
-            direction = weights[shrink]*(columns[:, 0]-columns[:, 1])
-
-            def derivative(fraction):
-                return float(np.mean(direction/np.maximum(mass+fraction*direction, np.finfo(float).tiny)))
-
-            if derivative(0.) > 0:
-                fraction = 1. if derivative(1.) >= 0 else brentq(derivative, 0., 1., xtol=1e-14)
-                candidate = weights.copy()
-                transfer = fraction*weights[shrink]
-                candidate[grow] += transfer
-                candidate[shrink] = 0. if fraction == 1. else weights[shrink]-transfer
-                candidate = normalize(candidate)
-                candidate_score, candidate_likelihood, candidate_mass, _ = oracle.expectation(candidate)
-                if candidate_likelihood >= likelihood:
-                    weights, score, likelihood, mass = candidate, candidate_score, candidate_likelihood, candidate_mass
-                    exchanges += 1
-        # Inherited acceleration: at most 64 currently positive coordinates,
-        # never a quadratic-space SLSQP over the full O(N)-sized grid. Global
-        # scores/exchanges still allow every zero-weight grid point to reenter.
-        active = np.flatnonzero(weights > 0)
-        if (iteration+1) % 10 == 0 and len(active) <= 64:
-            previous, objective_value, objective_gradient = None, None, None
-
-            def active_objective(candidate):
-                nonlocal previous, objective_value, objective_gradient
-                if previous is None or not np.array_equal(previous, candidate):
-                    full = np.zeros(len(grid))
-                    full[active] = candidate
-                    gradient, value, _, _ = oracle.expectation(full)
-                    previous = candidate.copy()
-                    objective_value = -value/len(rows)
-                    objective_gradient = -gradient[active] if gradient is not None else np.zeros(len(active))
-                return objective_value, objective_gradient
-
-            optimized = minimize(active_objective, weights[active], jac=True, method="SLSQP",
-                                 bounds=[(0., 1.)]*len(active),
-                                 constraints={"type": "eq", "fun": lambda w: w.sum()-1,
-                                              "jac": lambda w: np.ones(len(w))},
-                                 options={"ftol": 1e-13, "maxiter": 200})
-            active_refits += 1
-            if np.isfinite(optimized.x).all() and np.maximum(optimized.x, 0.).sum() > 0:
-                candidate = np.zeros(len(grid))
-                candidate[active] = normalize(optimized.x)
-                candidate_score, candidate_likelihood, candidate_mass, _ = oracle.expectation(candidate)
-                if candidate_likelihood >= likelihood:
-                    weights, score, likelihood, mass = candidate, candidate_score, candidate_likelihood, candidate_mass
-        if likelihood < previous_likelihood-1e-10*max(1., abs(previous_likelihood)):
-            raise RuntimeError("Streamed pooled-grid likelihood decreased")
-    score, likelihood, _, pilot = oracle.expectation(weights, collect_pilot=True)
-    if score is None:
-        raise RuntimeError("Nonfinite final streamed pooled-grid evaluation")
-    gap = max(0., float(score.max()-1))
-    if gap > ADAPTER_GRID_TOLERANCE:
-        raise RuntimeError("Streamed pooled-grid final duality gap changed")
-    return pilot, {
-        "method": "general_normal_mixed_cn_bulk_v1_streamed_pooled_ccf_grid_v2",
-        "inherited_single_state_initialization": False,
-        "grid_size": len(grid), "iterations": iteration,
-        "max_iterations": ADAPTER_MAX_ITERATIONS,
-        "grid_optimality_tolerance": ADAPTER_GRID_TOLERANCE,
-        "grid_score_excess": gap, "weight_optimality_gap": len(rows)*gap,
-        "grid_weight_optimum_certified": True,
-        "initial_log_likelihood": initial_likelihood, "log_likelihood": likelihood,
-        "likelihood_evaluations": oracle.evaluations, "accelerated_steps": accelerated,
-        "exchange_steps": exchanges, "block_rows": oracle.block_rows,
-        "active_support_refits": active_refits, "max_active_refit_size": 64,
-        "peak_grid_block_bytes": oracle.peak_block_bytes,
-        "dense_grid_matrix_retained": False,
-    }

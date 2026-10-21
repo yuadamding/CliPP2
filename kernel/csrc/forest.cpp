@@ -1,10 +1,12 @@
 // CliPP2-owned shared-forest, multi-region quadratic solver; AGPL-3.0.
 // Positive-message elimination generalizes the inherited scalar chain method.
 // See the project NOTICE. Numerical qualification is separate from sweep completion.
-#include "chain.h"
+#include "forest.h"
+#include <cmath>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <vector>
 
 namespace clipp2kernel {
 namespace {

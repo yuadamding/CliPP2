@@ -3,16 +3,17 @@
 
 import numpy as np
 from scipy.optimize import brentq, minimize
+from scipy.special import logsumexp
 
 
-def fit_cluster_weights(model, centers, initial_weights=None, *, log_kernel=None, telemetry=None):
-    """Maximize the observed likelihood over the simplex at fixed CP centers.
+def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
+    """Maximize the joint observed likelihood of an N-by-q log-emission matrix.
 
     This is a concave weight problem. The reported Frank-Wolfe gap bounds the
     remaining log-likelihood improvement at these centers, even with duplicate
     centers or boundary weights. Zero weights are returned for explicit repair
     by the caller; this optimizer does not change partition memberships.
-    Center fitting itself remains conditional on the frozen chain partition;
+    Center fitting itself remains conditional on the supplied hard partition;
     this function does not claim a joint mixture-center maximum.
     """
 
@@ -21,29 +22,20 @@ def fit_cluster_weights(model, centers, initial_weights=None, *, log_kernel=None
             telemetry[name] = telemetry.get(name, 0) + amount
 
     record("weight_problem_calls")
-    centers = np.atleast_1d(np.asarray(centers, dtype=float))
-    if (
-        centers.ndim != 1
-        or not centers.size
-        or np.any(~np.isfinite(centers))
-        or np.any(centers < 0)
-        or np.any(centers > model.purity)
-    ):
-        raise ValueError("Expected finite cluster centers in [0, purity]")
-    if log_kernel is None:
-        log_kernel = np.column_stack([model.log_likelihood(cp) for cp in centers])
-    else:
-        log_kernel = np.asarray(log_kernel, dtype=float)
-        if (
-            log_kernel.shape != (len(model), len(centers))
-            or np.any(np.isnan(log_kernel))
-            or np.any(np.isposinf(log_kernel))
-        ):
-            raise ValueError("Invalid cached center likelihoods")
+    log_kernel = np.asarray(log_columns, dtype=float)
+    if (log_kernel.ndim != 2 or not all(log_kernel.shape)
+            or np.isnan(log_kernel).any() or np.isposinf(log_kernel).any()):
+        raise ValueError("Expected a nonempty N-by-q matrix of finite or -inf log emissions")
+    n, k = log_kernel.shape
     offset = np.max(log_kernel, axis=1)
     if np.any(~np.isfinite(offset)):
         raise ValueError("Every mutation needs finite likelihood in some cluster")
-    k = len(centers)
+    weights = np.ones(k) / k if initial_weights is None else np.asarray(initial_weights, dtype=float)
+    if (weights.shape != (k,) or not np.isfinite(weights).all()
+            or np.any(weights < 0) or not weights.max() > 0):
+        raise ValueError("Initial cluster weights must be nonnegative, finite and nonzero")
+    weights = weights / weights.max()
+    weights /= weights.sum()
     if k == 1:
         return {
             "cluster_weights": np.ones(1),
@@ -51,35 +43,49 @@ def fit_cluster_weights(model, centers, initial_weights=None, *, log_kernel=None
             "weight_optimality_gap": 0.0,
             "weight_active_score_gap": 0.0,
         }
-    kernel = np.exp(log_kernel - offset[:, None])
-    weights = np.ones(k) / k if initial_weights is None else np.asarray(initial_weights, dtype=float)
-    if weights.shape != (k,) or np.any(~np.isfinite(weights)) or np.any(weights <= 0):
-        raise ValueError("Initial cluster weights must be positive and finite")
-    weights = weights / weights.sum()
-
+    shifted = log_kernel - offset[:, None]
+    kernel = np.exp(shifted)
     mass_key, mass_value = None, None
 
-    def mixture_mass(w):
-        # SLSQP often asks for objective and gradient at the identical iterate.
-        # Keep one exact-key matvec, never a rounded or approximate iterate.
-        # Bytes also detect in-place changes during pairwise mass transfers.
+    def log_mass(w):
+        # Keep the inexpensive matrix product on ordinary iterates, but recover
+        # underflowed active support from the ORIGINAL finite log emissions.
         nonlocal mass_key, mass_value
-        key = (w.dtype.str, w.shape, w.tobytes())
+        key = w.tobytes()
         if key != mass_key:
-            mass_value = kernel @ w
-            mass_key = key
+            mass = kernel @ w
+            with np.errstate(divide="ignore"):
+                value = np.log(mass)
+                log_weights = np.log(w)
+            underflow = mass < np.finfo(float).tiny
+            if underflow.any():
+                value[underflow] = logsumexp(shifted[underflow] + log_weights, axis=1)
+                record("weight_log_domain_fallback_rows", int(underflow.sum()))
+            mass_key, mass_value = key, value
             record("weight_matvec_calls")
         else:
             record("weight_matvec_cache_hits")
         return mass_value
 
     def objective(w):
-        mass = mixture_mass(w)
-        return -float(np.log(mass).mean()) if np.all(mass > 0) else np.inf
+        return -float(log_mass(w).mean())
 
     def gradient(w):
-        mass = np.maximum(mixture_mass(w), np.finfo(float).tiny)
-        return -(kernel / mass[:, None] / len(model)).sum(axis=0)
+        # A boundary derivative can exceed float64 even when its log mixture
+        # is finite. Saturation preserves the entering direction, never marks
+        # that finite support impossible, and cannot pass the stationarity gate.
+        ratios = shifted - log_mass(w)[:, None]
+        return -np.exp(np.minimum(ratios, 345.)).mean(axis=0)
+
+    # An impossible supplied boundary is an optimizer start, not an extra
+    # constraint. Uniform weights are feasible because every row has support.
+    if not np.isfinite(objective(weights)):
+        weights = np.ones(k)/k
+    # Huge boundary derivatives are unsuitable for SLSQP's quadratic step;
+    # retain the better boundary as a candidate, but begin from the interior.
+    boundary = weights.copy()
+    if np.max(-gradient(weights)) > 1e100:
+        weights = np.ones(k)/k
 
     tolerance = 1e-8
     record("weight_slsqp_calls")
@@ -99,6 +105,8 @@ def fit_cluster_weights(model, centers, initial_weights=None, *, log_kernel=None
             candidate /= candidate.sum()
             if objective(candidate) <= objective(weights):
                 weights = candidate
+    if objective(boundary) < objective(weights):
+        weights = boundary
     # SLSQP's success flag is not an optimality check. EM can stall indefinitely
     # between nearly identical columns; instead transfer mass between the most
     # and least favorable coordinates. The 1-D log likelihood is concave, so
@@ -118,12 +126,23 @@ def fit_cluster_weights(model, centers, initial_weights=None, *, log_kernel=None
         if grow == shrink:
             break
         record("weight_transfer_steps")
-        mass = mixture_mass(weights)
-        direction = weights[shrink] * (kernel[:, grow] - kernel[:, shrink])
+        # Exact one-dimensional mass transfer, evaluated in the log domain
+        # at endpoints too; no tiny-mass replacement changes its objective.
+        amount = weights[shrink]
+        high = np.maximum(shifted[:, grow], shifted[:, shrink])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            delta = np.abs(shifted[:, grow]-shifted[:, shrink])
+            numerator = np.log(amount) + high + np.log(-np.expm1(-delta))
+            sign = np.sign(shifted[:, grow]-shifted[:, shrink])
+        numerator = np.where(shifted[:, grow] == shifted[:, shrink], -np.inf, numerator)
+        sign = np.where(np.isneginf(high), 0., sign)
 
         def derivative(fraction):
-            normalizer = np.maximum(mass + fraction * direction, np.finfo(float).tiny)
-            return float(np.sum(direction / normalizer / len(model)))
+            trial = weights.copy()
+            trial[grow] += fraction*amount
+            trial[shrink] = amount*(1.-fraction)
+            log_ratio = numerator-log_mass(trial)
+            return float(np.mean(sign*np.exp(np.minimum(log_ratio, 345.))))
 
         fraction = 1.0 if derivative(1.0) >= 0 else brentq(derivative, 0.0, 1.0, xtol=1e-14)
         transfer = fraction * weights[shrink]
@@ -131,16 +150,16 @@ def fit_cluster_weights(model, centers, initial_weights=None, *, log_kernel=None
         weights[shrink] = 0.0 if fraction == 1.0 else weights[shrink] - transfer
         weights /= weights.sum()
     score = -gradient(weights)
-    optimality_gap = len(model) * max(0.0, float(score.max() - 1.0))
+    optimality_gap = n * max(0.0, float(score.max() - 1.0))
     active_gap = float(score.max() - score[weights > 0].min())
     if (
         not np.isfinite(objective(weights))
-        or optimality_gap > len(model) * tolerance
+        or optimality_gap > n * tolerance
         or active_gap > tolerance
     ):
         record("weight_convergence_failures")
         raise RuntimeError("Cluster-weight likelihood optimization did not converge")
-    likelihood = float(np.sum(offset + np.log(mixture_mass(weights))))
+    likelihood = float(np.sum(offset + log_mass(weights)))
     return {
         "cluster_weights": weights,
         "log_likelihood": likelihood,

@@ -30,14 +30,14 @@ class BuildPy(build_py):
 
 
 root = Path(__file__).resolve().parent
-native_sources = ["kernel/csrc/chain.cpp", "kernel/csrc/forest.cpp", "kernel/csrc/bindings.cpp"]
-native_inputs = native_sources + ["kernel/csrc/chain.h"]
+native_sources = ["kernel/csrc/forest.cpp", "kernel/csrc/bindings.cpp"]
+native_inputs = native_sources + ["kernel/csrc/forest.h"]
 native_identity = hashlib.sha256(b"".join(
     name.encode() + b"\0" + (root / name).read_bytes() for name in native_inputs
 )).hexdigest()
 setup(cmdclass={"build_py": BuildPy}, ext_modules=[Extension(
     "CliPP2.kernel._native", sources=native_sources,
-    depends=["kernel/csrc/chain.h"], language="c++",
+    depends=["kernel/csrc/forest.h"], language="c++",
     define_macros=[("CLIPP2_KERNEL_BUILD_ID", '"' + native_identity + '"')],
     extra_compile_args=["-O3", "-std=c++17"],
 )])

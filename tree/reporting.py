@@ -12,6 +12,8 @@ from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 
 from ..kernel import ALGORITHM, SCORE_DEFINITION
 from ..kernel.topology import partition_from_cuts
+from ..kernel.candidates import candidate_evidence, replay_candidate_evidence
+from .allocations import allocation_diagnostics
 
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
@@ -69,6 +71,24 @@ def independent_log_columns(model, centers):
     return np.where(allowed, answer, -np.inf)
 
 
+def _verify_retained_bank(model, result, score):
+    """Bind publication to every retained fitted state and replayable evidence."""
+    if not any(candidate is result.selected for candidate in result.candidate_bank):
+        raise ValueError('Selected fitted state is absent from the complete candidate bank')
+    evidence = candidate_evidence(result.tree, result.candidate_bank, result.selected)
+    retained, _ = replay_candidate_evidence(evidence)
+    if not np.isclose(retained.score, score, atol=1e-7, rtol=1e-10):
+        raise ValueError('Selected fit is not the best complete-bank score')
+    saved = result.diagnostics.get('candidate_evidence')
+    if saved is not None:
+        # The search ledger must describe the CURRENT bank, not only a winner
+        # with a matching scalar score. Attempts are additional search evidence.
+        if any(saved.get(key) != evidence[key] for key in
+               ('version', 'tree', 'selected_state_index', 'states')):
+            raise ValueError('Persisted candidate evidence disagrees with the retained bank')
+        replay_candidate_evidence(saved)
+
+
 def verify_selected(model, result):
     """Audit the scored fit and distinguish its three likelihood summaries.
 
@@ -115,11 +135,12 @@ def verify_selected(model, result):
     offset = columns.max(axis=1)
     if not np.isfinite(offset).all():
         raise ValueError('A mutation has zero read likelihood at every admissible center')
-    kernel = np.exp(columns-offset[:, None])
-    mass = kernel @ weights
-    if not np.all(mass > 0):
-        raise ValueError('Every mutation needs positive mixture probability')
-    weight_score = (kernel / mass[:, None] / model.n).sum(axis=0)
+    log_mass = logsumexp(columns + np.log(weights), axis=1)
+    if not np.isfinite(log_mass).all():
+        raise ValueError('Every mutation needs finite mixture probability')
+    # Log-space ratios also cover finite support whose active components would
+    # underflow after row-max scaling. All published weights are positive.
+    weight_score = np.exp(columns-log_mass[:, None]).mean(axis=0)
     weight_gap = model.n * max(0.0, float(weight_score.max()-1.))
     active_gap = float(weight_score.max()-weight_score.min())
     # Same inherited criterion, allowing only floating-reduction roundoff.
@@ -136,13 +157,9 @@ def verify_selected(model, result):
         ('complexity penalty', penalty, fit.complexity_penalty), ('score', score, fit.score)):
         if not np.isfinite(actual) or not np.isclose(actual, expected, atol=1e-7, rtol=1e-10):
             raise ValueError(f'Independent verification disagrees on {name}: {actual} != {expected}')
-    bank_scores = [float(candidate['bic']) for candidate in result.candidate_bank
-                   if isinstance(candidate, dict) and candidate.get('status') == 'scored'
-                   and candidate.get('publication_eligible') is True]
-    bank_scores += [float(candidate.score) for candidate in result.candidate_bank
-                    if not isinstance(candidate, dict) and candidate.fit.eligible]
-    if not bank_scores or not np.isclose(min(bank_scores), score, atol=1e-7, rtol=1e-10):
-        raise ValueError('Selected fit is not the best complete-bank score')
+    _verify_retained_bank(model, result, score)
+    allocations = allocation_diagnostics(columns, labels, centers, weights,
+                                         model.mutation_ids, model.region_ids)
     validity = float(np.log(allowed @ weights).sum())
     return {'independently_verified': True, 'conditional_log_likelihood': conditional,
             'membership_kind': kind, 'connected_on_proposal_tree': len(cuts)+1 == q,
@@ -154,6 +171,7 @@ def verify_selected(model, result):
             'validity_conditioned_mixture_log_likelihood': mixture-validity,
             'weight_optimality_gap': weight_gap, 'weight_active_score_gap': active_gap,
             'complete_candidate_bank_reconciled': True,
+            'selected_fitted_state_retained': True, 'allocation_diagnostics': allocations,
             'num_parameters': q*model.r+q-1, 'num_mutation_vectors': model.n,
             'global_optimality_proven': False, 'joint_mixture_center_mle': False}
 

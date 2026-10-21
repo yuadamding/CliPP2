@@ -3,6 +3,11 @@
 CliPP2 clusters mutations jointly across one or more tumor regions and estimates
 regional cancer cell fractions (CCFs) and mutation multiplicities.
 
+Every region count uses the same regional likelihood, forest solver, candidate
+search and reporting path. A single region is an N-by-1 dataset with a sorted
+chain topology; it no longer selects a separate scalar estimator. Single-region
+results may therefore differ from earlier versions.
+
 ## Install
 
 Requires Python 3.10+ and a C++17 compiler. Run from the repository root.
@@ -40,9 +45,9 @@ columns. See [example input](examples/exampleTumor1.tsv).
 | `segment_id`, `cn_state_id`, `cn_state_fraction` | Segment, CN state and its fraction |
 | `allele_a_cn`, `allele_b_cn` | Major and minor copy numbers, with `allele_a_cn >= allele_b_cn` |
 
-Include every mutation–region pair, including missing observations. For multiple
-CN states, repeat the same read counts across state rows; state fractions must
-sum to 1. Purity must be constant within each region.
+Include every mutation–region pair; use `count_observed=0` and `.` for missing
+counts. For multiple CN states, repeat the same read counts across state rows;
+state fractions must sum to 1. Purity must be constant within each region.
 
 `--max-major-cn` defaults to **4**. A mutation is excluded from all regions if
 any of its CN states exceeds this major-copy-number limit.
@@ -58,6 +63,11 @@ The output directory contains three tables:
 | `{tumor_id}_mutation_region_multiplicity.tsv` | CCF and multiplicity estimates for each mutation–region pair |
 
 Cluster 0 has the largest CCF-vector L2 norm and is not necessarily clonal.
+
+The returned summary includes `publication.verification.allocation_diagnostics`:
+hard cluster counts, posterior expected and MAP counts, and assignment
+disagreement. These diagnostics preserve the reported assignments and mixture
+scoring; they do not add output files.
 
 ## Contact
 

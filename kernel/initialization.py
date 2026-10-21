@@ -1,8 +1,8 @@
-"""CliPP2 pooled CP pilots for frozen chain or regional-tree construction.
+"""Pooled CCF pilots through the common regional-view emission interface.
 
 Independent mutation maxima cannot resolve multiplicity aliases: a mutation
 with multiplicity one in a major-CN-four region can be placed near one quarter
-of its true CP. Pooling the *same* marginal likelihood across the tumor provides
+of its true CCF. Pooling the same marginal likelihood across a region provides
 an unsupervised initialization. This grid mixture is neither the fitted model
 nor a new penalty, and its weights never enter the native objective or BIC.
 """
@@ -10,9 +10,6 @@ nor a new penalty, and its weights never enter the native objective or BIC.
 
 import numpy as np
 from scipy.optimize import brentq, minimize
-
-from .likelihood import MultiplicityModel
-
 
 GRID_SIZE = 257
 MAX_ADDITIONAL_GRID_POINTS = 2048
@@ -23,31 +20,32 @@ MAX_ACTIVE_REFIT_SIZE = 64
 ACTIVE_REFIT_INTERVAL = 10
 MAX_ACTIVE_REFIT_ITERATIONS = 200
 MAX_MATRIX_BYTES = 64 * 1024 * 1024
+ADAPTER_BLOCK_BYTES = 8 * 1024 * 1024
+ADAPTER_MAX_ITERATIONS = 500
+ADAPTER_GRID_TOLERANCE = 1e-8
 
 
-def _initialization_grid(observations, purity):
-    """Resolve narrow binomial modes without growing the ordinary-depth grid.
+def _initialization_grid(view):
+    """Standard normal-CN-two grid policy, expressed entirely as CCFs.
 
-    A component needs an extra proposal when its binomial-mode CP standard
+    A component needs an extra proposal when its binomial-mode CCF standard
     error is smaller than one quarter of the base grid spacing. This numerical
     resolution criterion uses observed counts/CN only, never truth or K. A
     half-count floor handles variance estimates at binomial endpoints. Modes
-    at CP=0 or purity are already included. If the proposal budget is exceeded,
+    at CCF=0 or one are already included. If the proposal budget is exceeded,
     take evenly spaced ranks through sorted observations and multiplicities;
     report this deterministic compression rather than claim full resolution.
     """
-    grid = np.linspace(0.0, purity, GRID_SIZE)
-    threshold = purity / (4 * (GRID_SIZE - 1))
-    if threshold == 0.0:
-        return grid, {"narrow_component_modes": 0, "mode_grid_compressed": False, "added_grid_points": 0}
-    r, n, major, total = observations.T
+    grid = np.linspace(0.0, 1.0, GRID_SIZE)
+    threshold = 1 / (4 * (GRID_SIZE - 1))
+    r, n, major = (view.array(name) for name in ("alt", "depth", "major"))
     vaf = r / n
-    denominator = 2 * (1 - purity) + purity * total
-    mode_numerator = vaf * denominator
-    se_numerator = denominator * np.maximum(np.sqrt(vaf * (1 - vaf) / n), 0.5 / n)
-    # CP mode and its standard error both divide their numerator by m.
+    scaling = view.array("scaling")
+    mode_numerator = vaf / scaling
+    se_numerator = np.maximum(np.sqrt(vaf * (1 - vaf) / n), 0.5 / n) / scaling
+    # CCF mode and its standard error both divide their numerator by m.
     # Compute eligible m ranges analytically; do not materialize N*major modes.
-    bound = np.maximum(mode_numerator / purity, se_numerator / threshold)
+    bound = np.maximum(mode_numerator, se_numerator / threshold)
     first = np.minimum(major + 1, np.floor(bound) + 1).astype(np.int64)
     counts = np.maximum(0, major.astype(np.int64) - first + 1)
     counts[r == 0] = 0
@@ -67,23 +65,37 @@ def _initialization_grid(observations, purity):
     }
 
 
-def pooled_cp_initialization(model):
-    """Return posterior-mean CPs and finite-grid convex-optimization diagnostics.
+def pooled_ccf_initialization(view):
+    """Use the source-scoped grid/convergence policy on shared CCF emissions.
+
+    Standard single-state normal-CN-two observations retain the bounded narrow-
+    mode grid and reported iteration-budget behavior. Mixed/general-normal
+    observations retain the bound-enriched grid and mandatory finite-grid gap.
+    These numerical policies are explicit, not separate statistical models.
+    """
+    if not view.array("observed").all():
+        raise ValueError("Pilot views must contain informative observations only")
+    return _pooled_standard(view) if view.standard else _pooled_adapter(view)
+
+
+def _pooled_standard(view):
+    """Return posterior-mean CCFs and finite-grid optimization diagnostics.
 
     The base grid, resolution rule and optimization budget are data-independent.
     Narrow likelihood modes add bounded numerical proposals. Identical count/CN
     observations are collapsed in sorted order, preserving their frequencies;
     this also makes results exactly equivariant to input-row permutations.
     Large inputs stream likelihood blocks rather than allocate an unbounded
-    N-by-grid matrix. Full 1..major CN support remains in MultiplicityModel.
+    N-by-grid matrix. Full 1..major support remains in the regional model.
     """
-    observations = np.column_stack((model.r, model.n, model.major, model.total))
-    unique, inverse, frequencies = np.unique(observations, axis=0, return_inverse=True, return_counts=True)
+    observations = np.column_stack([view.array(name) for name in ("alt", "depth", "major", "total")])
+    unique, indices, inverse, frequencies = np.unique(
+        observations, axis=0, return_index=True, return_inverse=True, return_counts=True)
     unique_count = len(unique)
-    grid, grid_diagnostics = _initialization_grid(unique, model.purity)
+    grid, grid_diagnostics = _initialization_grid(view.subset(indices))
     grid_size = len(grid)
     frequencies = frequencies.astype(float)
-    n = float(len(model))
+    n = float(len(view))
     # Limit both the likelihood matrix and padded multiplicity temporaries.
     matrix_rows = max(1, MAX_MATRIX_BYTES // (8 * grid_size))
     support_rows = max(1, 1_000_000 // int(unique[:, 2].max()))
@@ -91,13 +103,11 @@ def pooled_cp_initialization(model):
     cache = [] if unique_count <= matrix_rows else None
 
     def calculate(first, stop, positions=None):
-        block = MultiplicityModel(*unique[first:stop].T, model.purity)
-        values = np.column_stack(
-            [block.log_likelihood(cp) for cp in (grid if positions is None else grid[positions])]
-        )
+        block = view.subset(indices[first:stop])
+        values = block.log_likelihood_columns(grid if positions is None else grid[positions])
         offset = values.max(axis=1)
         if not np.isfinite(offset).all():
-            raise RuntimeError("No finite grid likelihood for CP initialization")
+            raise RuntimeError("No finite grid likelihood for CCF initialization")
         return np.exp(values - offset[:, None]), offset
 
     if cache is not None:
@@ -167,7 +177,7 @@ def pooled_cp_initialization(model):
 
     def correct_active_support(weights):
         # Solve only a small *existing* support. This is an acceleration, not
-        # pruning: global grid scores and exchange steps still admit every CP.
+        # pruning: global grid scores and exchange steps still admit every CCF.
         active = np.flatnonzero(weights > 0)
         previous, value, gradient = None, None, None
 
@@ -197,7 +207,7 @@ def pooled_cp_initialization(model):
     weights = np.full(grid_size, 1.0 / grid_size)
     score, log_likelihood, _ = expectation(weights)
     if score is None:
-        raise RuntimeError("Nonfinite pooled CP initialization likelihood")
+        raise RuntimeError("Nonfinite pooled CCF initialization likelihood")
     initial_log_likelihood = log_likelihood
     improvement = 0.0
     accelerated_steps = exchange_steps = active_refits = iteration = 0
@@ -251,22 +261,22 @@ def pooled_cp_initialization(model):
                 weights, score, log_likelihood = candidate, candidate_score, candidate_likelihood
         improvement = (log_likelihood - previous_log_likelihood) / n
         if improvement < -1e-10 * max(1.0, abs(previous_log_likelihood) / n):
-            raise RuntimeError("Pooled CP initialization likelihood decreased")
+            raise RuntimeError("Pooled CCF initialization likelihood decreased")
     score, log_likelihood, pilot = expectation(weights, collect_pilot=True)
     # Concavity bounds the missing mean log likelihood by max(score)-1:
     # the weighted mean score equals one for every feasible mixture.
     gap = float(max(0.0, score.max() - 1.0))
     converged = gap <= GRID_OPTIMALITY_TOLERANCE
-    pilot = np.clip(pilot[inverse], 0.0, model.purity)
+    pilot = np.clip(pilot[inverse], 0.0, 1.0)
     diagnostics = {
-        "method": "pooled_uniform_multiplicity_grid_accelerated_simplex_v2",
+        "method": "regional_standard_ccf_grid_accelerated_simplex_v3",
         "role": "initialization_only_frozen_before_all_K",
         "grid_size": grid_size,
         "base_grid_size": GRID_SIZE,
         "max_additional_grid_points": MAX_ADDITIONAL_GRID_POINTS,
         **grid_diagnostics,
-        "cp_bounds": [0.0, float(model.purity)],
-        "num_mutations": len(model),
+        "ccf_bounds": [0.0, 1.0],
+        "num_mutations": len(view),
         "num_unique_observations": unique_count,
         "iterations": iteration,
         "max_iterations": MAX_ITERATIONS,
@@ -293,3 +303,203 @@ def pooled_cp_initialization(model):
         "constrained_optimum_certified": False,
     }
     return pilot, diagnostics
+
+
+class _GridOracle:
+    """Exact regional grid likelihood in row blocks; never retain N by grid.
+
+    The working block is at most ADAPTER_BLOCK_BYTES (or one grid row if that
+    row itself exceeds the budget). Thus storage remains O(N + grid), even
+    when distinct mixed-CN upper bounds make the grid grow with N.
+    """
+    def __init__(self, view, grid, *, block_bytes=None):
+        self.view, self.grid = view, grid
+        budget = ADAPTER_BLOCK_BYTES if block_bytes is None else int(block_bytes)
+        if budget < 8:
+            raise ValueError("Grid block budget must hold at least one float64")
+        self.block_rows = min(256, max(1, budget//(8*len(grid))),
+                              max(1, 1_000_000//(32*view.array("valid").shape[-1])))
+        self.offset = np.empty(len(view))
+        self.evaluations = 0
+        self.peak_block_bytes = 0
+        for first in range(0, len(view), self.block_rows):
+            stop = min(len(view), first+self.block_rows)
+            values = self.log_block(first, stop)
+            self.offset[first:stop] = values.max(axis=1)
+        if not np.isfinite(self.offset).all():
+            raise RuntimeError("No finite supported grid likelihood for regional initialization")
+
+    def log_block(self, first, stop, positions=None):
+        grid = self.grid if positions is None else self.grid[positions]
+        view = self.view.subset(np.arange(first, stop))
+        values = np.empty((len(view), len(grid)))
+        self.peak_block_bytes = max(self.peak_block_bytes, values.nbytes)
+        for begin in range(0, len(grid), 32):
+            values[:, begin:begin+32] = view.log_likelihood_columns(grid[begin:begin+32])
+        lower, upper = view.bounds()
+        values[(grid[None, :] < lower[:, None])
+               | (grid[None, :] > upper[:, None])] = -np.inf
+        return values
+
+    def expectation(self, weights, *, collect_pilot=False):
+        self.evaluations += 1
+        score, mass = np.zeros(len(weights)), np.empty(len(self.view))
+        pilot = np.empty(len(self.view)) if collect_pilot else None
+        log_likelihood = 0.
+        for first in range(0, len(self.view), self.block_rows):
+            stop = min(len(self.view), first+self.block_rows)
+            likelihood = self.log_block(first, stop)
+            likelihood -= self.offset[first:stop, None]
+            np.exp(likelihood, out=likelihood)
+            normalizer = likelihood @ weights
+            if np.any(normalizer <= 0) or not np.isfinite(normalizer).all():
+                return None, -np.inf, None, None
+            mass[first:stop] = normalizer
+            with np.errstate(over="ignore", invalid="ignore"):
+                score += (1/normalizer) @ likelihood
+            log_likelihood += float((np.log(normalizer)+self.offset[first:stop]).sum())
+            if collect_pilot:
+                pilot[first:stop] = likelihood @ (weights*self.grid)/normalizer
+        if not np.isfinite(score).all():
+            return None, -np.inf, None, None
+        return score/len(self.view), log_likelihood, mass, pilot
+
+    def scaled_columns(self, positions):
+        values = np.empty((len(self.view), len(positions)))
+        for first in range(0, len(self.view), self.block_rows):
+            stop = min(len(self.view), first+self.block_rows)
+            values[first:stop] = np.exp(self.log_block(first, stop, positions)
+                                        - self.offset[first:stop, None])
+        return values
+
+
+def _pooled_adapter(view, *, block_bytes=None):
+    """Stream the explicit mixed/general-normal grid; exact concave weight gap.
+
+    Safeguarded SQUAREM and exact grow/shrink exchange mirror the inherited
+    pooled initializer without a quadratic-space SLSQP over the whole grid.
+    Only this explicit numerical policy uses this route; standard observations
+    retain their narrow-mode grid and declared iteration-budget behavior.
+    Its masked grid scores reads jointly with assignment validity, without
+    normalizing over admissible grid points.
+    """
+    lower, upper = view.bounds()
+    grid = np.unique(np.r_[np.linspace(0., 1., 257), lower, upper])
+    oracle = _GridOracle(view, grid, block_bytes=block_bytes)
+    weights = np.full(len(grid), 1/len(grid))
+    score, likelihood, mass, _ = oracle.expectation(weights)
+    initial_likelihood = likelihood
+    accelerated = exchanges = active_refits = 0
+    step_limit = 1.
+
+    def normalize(values):
+        values = np.maximum(values, 0.)
+        return values/values.sum()
+
+    for iteration in range(ADAPTER_MAX_ITERATIONS+1):
+        if score is None:
+            raise RuntimeError("Nonfinite streamed pooled-grid likelihood or gradient")
+        gap = max(0., float(score.max()-1))
+        if gap <= ADAPTER_GRID_TOLERANCE:
+            break
+        if iteration == ADAPTER_MAX_ITERATIONS:
+            raise RuntimeError(f"Streamed pooled-grid weights did not converge: mean gap {gap:.6g}")
+        previous_likelihood = likelihood
+        first = normalize(weights*score)
+        first_score, _, _, _ = oracle.expectation(first)
+        if first_score is None:
+            raise RuntimeError("Nonfinite streamed pooled-grid EM step")
+        second = normalize(first*first_score)
+        second_score, second_likelihood, second_mass, _ = oracle.expectation(second)
+        if second_score is None:
+            raise RuntimeError("Nonfinite streamed pooled-grid second EM step")
+        residual, curvature = first-weights, second-2*first+weights
+        step = max(1., min(float(np.sqrt((residual@residual)/max(
+            curvature@curvature, np.finfo(float).tiny))), step_limit))
+        candidate = normalize(weights+2*step*residual+step*step*curvature)
+        candidate_score, candidate_likelihood, candidate_mass, _ = oracle.expectation(candidate)
+        while candidate_likelihood < second_likelihood and step > 1.01:
+            step = (step+1)/2
+            candidate = normalize(weights+2*step*residual+step*step*curvature)
+            candidate_score, candidate_likelihood, candidate_mass, _ = oracle.expectation(candidate)
+        if candidate_likelihood >= second_likelihood:
+            weights, score, likelihood, mass = candidate, candidate_score, candidate_likelihood, candidate_mass
+            accelerated += int(step > 1)
+        else:
+            weights, score, likelihood, mass = second, second_score, second_likelihood, second_mass
+        if step >= .99*step_limit:
+            step_limit = min(step_limit*4, 1e100)
+        grow = int(np.argmax(score))
+        positive = np.flatnonzero(weights > 0)
+        shrink = int(positive[np.argmin(score[positive])])
+        if grow != shrink:
+            columns = oracle.scaled_columns([grow, shrink])
+            direction = weights[shrink]*(columns[:, 0]-columns[:, 1])
+
+            def derivative(fraction):
+                return float(np.mean(direction/np.maximum(mass+fraction*direction, np.finfo(float).tiny)))
+
+            if derivative(0.) > 0:
+                fraction = 1. if derivative(1.) >= 0 else brentq(derivative, 0., 1., xtol=1e-14)
+                candidate = weights.copy()
+                transfer = fraction*weights[shrink]
+                candidate[grow] += transfer
+                candidate[shrink] = 0. if fraction == 1. else weights[shrink]-transfer
+                candidate = normalize(candidate)
+                candidate_score, candidate_likelihood, candidate_mass, _ = oracle.expectation(candidate)
+                if candidate_likelihood >= likelihood:
+                    weights, score, likelihood, mass = candidate, candidate_score, candidate_likelihood, candidate_mass
+                    exchanges += 1
+        # Inherited acceleration: at most 64 currently positive coordinates,
+        # never a quadratic-space SLSQP over the full O(N)-sized grid. Global
+        # scores/exchanges still allow every zero-weight grid point to reenter.
+        active = np.flatnonzero(weights > 0)
+        if (iteration+1) % 10 == 0 and len(active) <= 64:
+            previous, objective_value, objective_gradient = None, None, None
+
+            def active_objective(candidate):
+                nonlocal previous, objective_value, objective_gradient
+                if previous is None or not np.array_equal(previous, candidate):
+                    full = np.zeros(len(grid))
+                    full[active] = candidate
+                    gradient, value, _, _ = oracle.expectation(full)
+                    previous = candidate.copy()
+                    objective_value = -value/len(view)
+                    objective_gradient = -gradient[active] if gradient is not None else np.zeros(len(active))
+                return objective_value, objective_gradient
+
+            optimized = minimize(active_objective, weights[active], jac=True, method="SLSQP",
+                                 bounds=[(0., 1.)]*len(active),
+                                 constraints={"type": "eq", "fun": lambda w: w.sum()-1,
+                                              "jac": lambda w: np.ones(len(w))},
+                                 options={"ftol": 1e-13, "maxiter": 200})
+            active_refits += 1
+            if np.isfinite(optimized.x).all() and np.maximum(optimized.x, 0.).sum() > 0:
+                candidate = np.zeros(len(grid))
+                candidate[active] = normalize(optimized.x)
+                candidate_score, candidate_likelihood, candidate_mass, _ = oracle.expectation(candidate)
+                if candidate_likelihood >= likelihood:
+                    weights, score, likelihood, mass = candidate, candidate_score, candidate_likelihood, candidate_mass
+        if likelihood < previous_likelihood-1e-10*max(1., abs(previous_likelihood)):
+            raise RuntimeError("Streamed pooled-grid likelihood decreased")
+    score, likelihood, _, pilot = oracle.expectation(weights, collect_pilot=True)
+    if score is None:
+        raise RuntimeError("Nonfinite final streamed pooled-grid evaluation")
+    gap = max(0., float(score.max()-1))
+    if gap > ADAPTER_GRID_TOLERANCE:
+        raise RuntimeError("Streamed pooled-grid final duality gap changed")
+    return pilot, {
+        "method": "general_normal_mixed_cn_bulk_v1_streamed_pooled_ccf_grid_v2",
+        "inherited_single_state_initialization": False,
+        "grid_size": len(grid), "iterations": iteration,
+        "max_iterations": ADAPTER_MAX_ITERATIONS,
+        "grid_optimality_tolerance": ADAPTER_GRID_TOLERANCE,
+        "grid_score_excess": gap, "weight_optimality_gap": len(view)*gap,
+        "grid_weight_optimum_certified": True,
+        "initial_log_likelihood": initial_likelihood, "log_likelihood": likelihood,
+        "likelihood_evaluations": oracle.evaluations, "accelerated_steps": accelerated,
+        "exchange_steps": exchanges, "block_rows": oracle.block_rows,
+        "active_support_refits": active_refits, "max_active_refit_size": 64,
+        "peak_grid_block_bytes": oracle.peak_block_bytes,
+        "dense_grid_matrix_retained": False,
+    }
