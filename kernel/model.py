@@ -277,18 +277,15 @@ class RegionalModel:
             raise RuntimeError("No finite conditional scalar likelihood")
         self.telemetry["scalar_refits"] += 1
         self.telemetry["scalar_refit_seconds"] += time.perf_counter()-start
-        self._remember_refit(key, fitted, len(members))
-        return fitted
-
-    def _remember_refit(self, key, fitted, count):
         # Membership tuples are part of the bounded cache budget, not only values.
-        size = 256 + 36*count
+        size = 256 + 36*len(members)
         if size <= self._cache_bytes:
             while self._refit_bytes + size > self._cache_bytes:
                 _, (_, removed) = self._refits.popitem(last=False)
                 self._refit_bytes -= removed
             self._refits[key] = (fitted, size)
             self._refit_bytes += size
+        return fitted
 
     def assignment_admissibility(self, centers):
         """N-by-q closed-box assignments, including regions without reads."""
@@ -367,8 +364,7 @@ class RegionalModel:
             for cluster in range(q):
                 members = memberships[cluster]
                 for region in range(self.r):
-                    # Do not dispatch the experimental device-batched refitter:
-                    # grid, Brent and incumbent tie decisions need one arithmetic.
+                    # Grid, Brent and incumbent tie decisions use one arithmetic.
                     center, ll = self._fit_scalar(members, region)
                     if initial_centers is not None:
                         old = initial_centers[cluster, region]

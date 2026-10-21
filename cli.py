@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .config import DEFAULT_DEVICE, DEFAULT_MAX_MAJOR_CN, FitConfig, resolve_fit_config, validate_max_major_cn
+from .config import DEFAULT_DEVICE, DEFAULT_MAX_MAJOR_CN, FitConfig, resolve_fit_config
 from ._version import __version__
 
 
@@ -44,7 +44,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        validate_max_major_cn(args.max_major_cn)
         _fit_config_from_args(args)
     except ValueError as error:
         parser.error(str(error))

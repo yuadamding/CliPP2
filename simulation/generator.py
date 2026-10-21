@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..io.tumor_txt import CN_FILTER_POLICY_ID, TUMOR_TXT_SCHEMA, write_tumor_txt
+from ..io.tumor_txt import CN_FILTER_POLICY_ID, TUMOR_TXT_SCHEMA, _safe_tumor_id, write_tumor_txt
 from .config import (
     TumorSimulationConfig,
     MAX_SIMULATION_ALLELE_CN,
@@ -120,13 +120,7 @@ def _write_patient_simulation(
     min_clone_ccf_distance = 0.10
     if not 0.0 < float(simu_purity) < 1.0:
         raise ValueError("simu_purity must lie strictly between zero and one.")
-    directory_name = str(config.tumor_id).strip()
-    if (
-        not directory_name
-        or directory_name in {".", ".."}
-        or Path(directory_name).name != directory_name
-    ):
-        raise ValueError("tumor_id must be one nonempty directory name.")
+    directory_name = _safe_tumor_id(config.tumor_id)
     data_dir = out_dir / directory_name
     if data_dir.exists():
         raise FileExistsError(f"Refusing to overwrite existing tumor: {data_dir}")
@@ -188,10 +182,11 @@ def _write_patient_simulation(
         segments,
         random_state=streams["seed_mutation_segments"],
     )
-    data_dir.mkdir(parents=True, exist_ok=True)
+    # Claim the directory exclusively; the earlier existence check can race.
+    data_dir.mkdir(parents=True)
     region_labels = tuple(f"region{j + 1}" for j in range(n_samples))
     for region_id in region_labels:
-        (data_dir / region_id).mkdir(parents=True, exist_ok=True)
+        (data_dir / region_id).mkdir()
 
     mutation_id_width = max(3, len(str(no_mutations)))
     mutation_ids = np.asarray(
