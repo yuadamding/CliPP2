@@ -42,7 +42,10 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     input_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     data = load_tumor_txt(path, max_major_cn=config.max_major_cn, initialize=False)
     check_destination(outdir, data.tumor_id)
-    model = RegionalModel(data, device=config.device)
+    model = RegionalModel(data, device=config.device,
+                          grid_cache_bytes=config.grid_cache_mb * 1024**2,
+                          device_cache_bytes=config.device_cache_mb * 1024**2,
+                          workspace_bytes=config.workspace_mb * 1024**2)
     result = fit_regions(model, config.max_clusters)
     if hashlib.sha256(path.read_bytes()).hexdigest() != input_hash:
         raise RuntimeError('Input changed during fitting; no successful publication')
@@ -61,6 +64,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
         'score': result.score, 'score_definition': SCORE_DEFINITION,
         'clonal_constraint': False, 'cluster_zero': 'largest_final_ccf_l2_norm',
         'exclusions': exclusion_summary(model), 'diagnostics': result.diagnostics,
+        'execution': model.execution_diagnostics(),
         'verification_publication_seconds': perf_counter()-verification_start,
         'elapsed_seconds': perf_counter()-started, 'publication': publication,
         'qualification_scope': 'numerical_fit_not_global_optimality_or_biological_accuracy',

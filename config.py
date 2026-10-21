@@ -28,6 +28,9 @@ class FitConfig:
     verbose: bool = False
     max_major_cn: int = DEFAULT_MAX_MAJOR_CN
     max_clusters: int = 10
+    grid_cache_mb: int = 64
+    device_cache_mb: int = 256
+    workspace_mb: int = 64
 
     def __post_init__(self) -> None:
         if self.device not in ("cpu", "cuda"):
@@ -37,16 +40,22 @@ class FitConfig:
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
         if type(self.max_clusters) is not int or not 1 <= self.max_clusters <= 10:
             raise ValueError("max_clusters must be an integer in 1..10.")
+        for name in ("grid_cache_mb", "device_cache_mb", "workspace_mb"):
+            value = getattr(self, name)
+            if type(value) is not int or value < (1 if name == "workspace_mb" else 0):
+                raise ValueError(f"{name} must be a nonnegative integer (workspace_mb must be positive).")
 
 
 def resolve_fit_config(
     *, device: str = DEFAULT_DEVICE, verbose: bool = False,
     max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
     max_clusters: int = 10,
+    grid_cache_mb: int = 64, device_cache_mb: int = 256, workspace_mb: int = 64,
 ) -> FitConfig:
     """Construct the only public fit configuration; removed knobs raise TypeError."""
     return FitConfig(device=device, verbose=verbose, max_major_cn=max_major_cn,
-                     max_clusters=max_clusters)
+                     max_clusters=max_clusters, grid_cache_mb=grid_cache_mb,
+                     device_cache_mb=device_cache_mb, workspace_mb=workspace_mb)
 
 
 __all__ = ["FitConfig", "resolve_fit_config"]

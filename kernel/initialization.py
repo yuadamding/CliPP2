@@ -8,6 +8,10 @@ nor a new penalty, and its weights never enter the native objective or BIC.
 """
 # Adapted from CliPP1.5; see ../NOTICE.
 
+import operator
+import sys
+import hashlib
+
 import numpy as np
 from scipy.optimize import brentq, minimize
 
@@ -23,6 +27,179 @@ MAX_MATRIX_BYTES = 64 * 1024 * 1024
 ADAPTER_BLOCK_BYTES = 8 * 1024 * 1024
 ADAPTER_MAX_ITERATIONS = 500
 ADAPTER_GRID_TOLERANCE = 1e-8
+
+
+class _GridCache:
+    """A byte-bounded, immutable prefix of scaled grid blocks; no LRU churn.
+
+    Account for owned arrays, offsets and tuple metadata, not just matrix
+    payload. The empty cache is free; streaming working arrays are separate.
+    Block boundaries never depend on this retention budget.
+    """
+
+    def __init__(self, cache_bytes):
+        self.budget = MAX_MATRIX_BYTES if cache_bytes is None else operator.index(cache_bytes)
+        if self.budget < 0:
+            raise ValueError("cache_bytes must be nonnegative")
+        self._blocks = ()
+        self._payload_bytes = 0
+        self.retained_bytes = self.hits = self.misses = 0
+        self._sealed = self.budget == 0
+
+    def get(self, index):
+        if index < len(self._blocks):
+            self.hits += 1
+            return self._blocks[index]
+        self.misses += 1
+        return None
+
+    def put(self, index, likelihood, offset):
+        if self._sealed or index != len(self._blocks):
+            return
+        # Own each stored array so mutable work buffers and offset views cannot
+        # change a previously cached likelihood block.
+        offset = np.array(offset, copy=True)
+        if not likelihood.flags.owndata:
+            likelihood = likelihood.copy()
+        record = (likelihood, offset)
+        payload = sys.getsizeof(record) + sys.getsizeof(likelihood) + sys.getsizeof(offset)
+        updated = self._blocks + (record,)
+        size = sys.getsizeof(updated) + self._payload_bytes + payload
+        if size > self.budget:
+            self._sealed = True
+            return
+        likelihood.setflags(write=False)
+        offset.setflags(write=False)
+        self._blocks = updated
+        self._payload_bytes += payload
+        self.retained_bytes = size
+
+    def diagnostics(self, total_blocks):
+        return {"budget_bytes": self.budget, "retained_bytes": self.retained_bytes,
+                "cached_blocks": len(self._blocks), "total_blocks": total_blocks,
+                "hits": self.hits, "misses": self.misses}
+
+
+class _GridExecution:
+    """Optional device reductions with one workspace-owned grid cache.
+
+    Device retention is a deterministic block prefix inside the workspace's
+    shared budget. No tensor reference is pinned here outside that owner.
+    Evicted entries reload from the host cache or recompute from the model.
+    SciPy control and optimization policy remain on the host.
+    """
+
+    def __init__(self, view, grid, block_rows):
+        self.workspace = getattr(view.model, "workspace", None)
+        self.grid = grid
+        self.device_bytes = 0
+        self.device_blocks = 0
+        self.device_sealed = False
+        self.device_hits = self.device_misses = 0
+        if self.workspace is not None:
+            # Grid emission blocks also cache compact observation tiles. Leave
+            # room for this view's rows so streamed tail blocks do not evict the
+            # admitted grid prefix on every sweep. Other phases still share the
+            # workspace LRU; any external eviction has an exact host fallback.
+            observation_bytes = len(view) * len(self.workspace._FIELDS) * 8
+            self.device_budget = max(0, self.workspace.device_cache_bytes - observation_bytes)
+            digest = hashlib.sha256(view.model.identity.encode())
+            digest.update(view.rows.tobytes())
+            digest.update(grid.tobytes())
+            self.key = ("pooled-grid", view.region, block_rows, digest.hexdigest())
+
+    def block(self, index, cache, calculate):
+        ws = self.workspace
+        if ws is None:
+            entry = cache.get(index)
+            if entry is None:
+                entry = calculate()
+                cache.put(index, *entry)
+            return entry
+        key = (*self.key, index)
+        packed = ws.cache_get(key)
+        if packed is not None:
+            self.device_hits += 1
+            if index == self.device_blocks:
+                self.device_blocks += 1
+                self.device_bytes += packed.untyped_storage().nbytes()
+            return packed[:, :-1], packed[:, -1]
+        self.device_misses += 1
+        entry = cache.get(index)
+        if entry is None:
+            entry = calculate()
+            if not cache._sealed:
+                cache.put(index, *ws.to_host(entry))
+        likelihood, offset = (ws.upload(part) for part in entry)
+        size = (likelihood.numel() + offset.numel()) * likelihood.element_size()
+        if (index < self.device_blocks or not self.device_sealed
+                and index == self.device_blocks
+                and self.device_bytes + size <= self.device_budget):
+            packed = ws.torch.cat((likelihood, offset[:, None]), dim=1)
+            ws.cache_put(key, packed)
+            if index == self.device_blocks:
+                self.device_bytes += size
+                self.device_blocks += 1
+            return packed[:, :-1], packed[:, -1]
+        self.device_sealed = True
+        return likelihood, offset
+
+    def calculate(self, view, grid, *, mask_bounds=False, offset=None):
+        ws = self.workspace
+        if ws is None:
+            values = view.log_likelihood_columns(grid)
+            if mask_bounds:
+                lower, upper = view.bounds()
+                values[(grid[None, :] < lower[:, None]) | (grid[None, :] > upper[:, None])] = -np.inf
+            offset = values.max(axis=1) if offset is None else offset
+            if not np.isfinite(offset).all():
+                raise RuntimeError("No finite grid likelihood for CCF initialization")
+            return np.exp(values - offset[:, None]), offset
+        values = ws.regional_grid_device(view.region, view.rows, grid)
+        if mask_bounds:
+            lower, upper = (ws.upload(part) for part in view.bounds())
+            points = ws.upload(grid)
+            values = values.masked_fill((points[None, :] < lower[:, None])
+                                        | (points[None, :] > upper[:, None]), -ws.torch.inf)
+        offset = values.max(dim=1).values if offset is None else ws.upload(offset)
+        if not ws._valid_scalar(ws.torch.isfinite(offset).all()):
+            raise RuntimeError("No finite grid likelihood for CCF initialization")
+        return (values - offset[:, None]).exp(), offset
+
+    def expectation(self, blocks, weights, count, *, frequencies=None, positions=None,
+                    collect_pilot=False, collect_mass=True):
+        ws, grid = self.workspace, self.grid
+        t = ws.torch
+        weights = ws.upload(weights)
+        score = t.zeros_like(weights)
+        log_likelihood = t.zeros((), dtype=weights.dtype, device=weights.device)
+        mass = np.empty(count) if collect_mass else None
+        pilot = np.empty(count) if collect_pilot else None
+        index = ws.upload(positions, dtype=t.long) if positions is not None else None
+        moment = weights * ws.upload(grid) if collect_pilot else None
+        for first, stop, likelihood, offset in blocks:
+            if index is not None:
+                likelihood = likelihood[:, index]
+            normalizer = likelihood @ weights
+            if ws._valid_scalar(((normalizer <= 0) | ~t.isfinite(normalizer)).any()):
+                return None, -np.inf, None, None
+            frequency = (t.ones_like(normalizer) if frequencies is None
+                         else ws.upload(frequencies[first:stop]))
+            score += (frequency / normalizer) @ likelihood
+            log_likelihood += (frequency * (normalizer.log() + offset)).sum()
+            if collect_mass:
+                mass[first:stop] = ws.to_host(normalizer)
+            if collect_pilot:
+                pilot[first:stop] = ws.to_host(likelihood @ moment / normalizer)
+        if not ws._valid_scalar(t.isfinite(score).all()):
+            return None, -np.inf, None, None
+        return ws.to_host(score), float(ws.to_host(log_likelihood)), mass, pilot
+
+    def diagnostics(self):
+        return {"backend": "cpu" if self.workspace is None else self.workspace.device.type,
+                "device_grid_hits": self.device_hits, "device_grid_misses": self.device_misses,
+                "device_grid_prefix_bytes": self.device_bytes,
+                "device_grid_budget_bytes": 0 if self.workspace is None else self.device_budget}
 
 
 def _initialization_grid(view):
@@ -65,7 +242,7 @@ def _initialization_grid(view):
     }
 
 
-def pooled_ccf_initialization(view):
+def pooled_ccf_initialization(view, *, cache_bytes=None):
     """Use the source-scoped grid/convergence policy on shared CCF emissions.
 
     Standard single-state normal-CN-two observations retain the bounded narrow-
@@ -75,10 +252,11 @@ def pooled_ccf_initialization(view):
     """
     if not view.array("observed").all():
         raise ValueError("Pilot views must contain informative observations only")
-    return _pooled_standard(view) if view.standard else _pooled_adapter(view)
+    return (_pooled_standard(view, cache_bytes=cache_bytes) if view.standard
+            else _pooled_adapter(view, cache_bytes=cache_bytes))
 
 
-def _pooled_standard(view):
+def _pooled_standard(view, *, cache_bytes=None):
     """Return posterior-mean CCFs and finite-grid optimization diagnostics.
 
     The base grid, resolution rule and optimization budget are data-independent.
@@ -100,39 +278,47 @@ def _pooled_standard(view):
     matrix_rows = max(1, MAX_MATRIX_BYTES // (8 * grid_size))
     support_rows = max(1, 1_000_000 // int(unique[:, 2].max()))
     block_rows = min(matrix_rows, support_rows)
-    cache = [] if unique_count <= matrix_rows else None
+    cache = _GridCache(cache_bytes)
+    execution = _GridExecution(view.subset(indices), grid, block_rows)
+    block_count = (unique_count + block_rows - 1) // block_rows
+    grid_block_evaluations = 0
 
     def calculate(first, stop, positions=None):
+        nonlocal grid_block_evaluations
+        grid_block_evaluations += 1
         block = view.subset(indices[first:stop])
-        values = block.log_likelihood_columns(grid if positions is None else grid[positions])
-        offset = values.max(axis=1)
-        if not np.isfinite(offset).all():
-            raise RuntimeError("No finite grid likelihood for CCF initialization")
-        return np.exp(values - offset[:, None]), offset
-
-    if cache is not None:
-        for first in range(0, unique_count, block_rows):
-            stop = min(unique_count, first + block_rows)
-            cache.append((first, stop, *calculate(first, stop)))
+        return execution.calculate(block, grid if positions is None else grid[positions])
 
     def blocks(positions=None):
-        if cache is not None:
-            for first, stop, likelihood, offset in cache:
-                yield (first, stop, likelihood if positions is None else likelihood[:, positions], offset)
-        else:
-            for first in range(0, unique_count, block_rows):
-                stop = min(unique_count, first + block_rows)
-                yield first, stop, *calculate(first, stop, positions)
+        for index, first in enumerate(range(0, unique_count, block_rows)):
+            stop = min(unique_count, first + block_rows)
+            # The original large-grid streaming path rescales active-support
+            # trials locally. Preserve that rule (including underflow behavior)
+            # regardless of the new retention budget; these trials are not
+            # interchangeable with slices of a full-grid-scaled cache block.
+            entry = (calculate(first, stop, positions) if positions is not None else
+                     execution.block(index, cache, lambda: calculate(first, stop)))
+            likelihood, offset = entry
+            yield first, stop, likelihood, offset
 
     evaluations = 0
 
     def expectation(weights, collect_pilot=False, positions=None):
         nonlocal evaluations
         evaluations += 1
+        streamed_active = positions is not None and unique_count > matrix_rows
+        if execution.workspace is not None:
+            score, likelihood, _, pilot = execution.expectation(
+                blocks(positions if streamed_active else None), weights, unique_count,
+                frequencies=frequencies, positions=None if streamed_active else positions,
+                collect_pilot=collect_pilot, collect_mass=False)
+            return None if score is None else score / n, likelihood, pilot
         score = np.zeros(len(weights))
         log_likelihood = 0.0
         pilot = np.empty(unique_count) if collect_pilot else None
-        for first, stop, likelihood, offset in blocks(positions):
+        for first, stop, likelihood, offset in blocks(positions if streamed_active else None):
+            if positions is not None and not streamed_active:
+                likelihood = likelihood[:, positions]
             normalizer = likelihood @ weights
             if np.any(normalizer <= 0) or not np.isfinite(normalizer).all():
                 return None, -np.inf, None
@@ -158,9 +344,15 @@ def _pooled_standard(view):
         if grow == shrink:
             return weights
         mass, direction = np.empty(unique_count), np.empty(unique_count)
+        ws = execution.workspace
+        device_weights = ws.upload(weights) if ws is not None else None
         for first, stop, likelihood, _ in blocks():
-            mass[first:stop] = likelihood @ weights
-            direction[first:stop] = weights[shrink] * (likelihood[:, grow] - likelihood[:, shrink])
+            if ws is None:
+                mass[first:stop] = likelihood @ weights
+                direction[first:stop] = weights[shrink] * (likelihood[:, grow] - likelihood[:, shrink])
+            else:
+                mass[first:stop] = ws.to_host(likelihood @ device_weights)
+                direction[first:stop] = ws.to_host(weights[shrink] * (likelihood[:, grow] - likelihood[:, shrink]))
 
         def derivative(fraction):
             denominator = np.maximum(mass + fraction * direction, np.finfo(float).tiny)
@@ -298,21 +490,24 @@ def _pooled_standard(view):
         "max_active_refit_iterations": MAX_ACTIVE_REFIT_ITERATIONS,
         "initial_log_likelihood": float(initial_log_likelihood),
         "log_likelihood": float(log_likelihood),
-        "likelihood_matrix_cached": cache is not None,
+        "likelihood_matrix_cached": len(cache._blocks) == block_count,
         "max_matrix_bytes": MAX_MATRIX_BYTES,
         "constrained_optimum_certified": False,
+        "grid_cache": {**cache.diagnostics(block_count),
+                       "grid_block_evaluations": grid_block_evaluations,
+                       **execution.diagnostics()},
     }
     return pilot, diagnostics
 
 
 class _GridOracle:
-    """Exact regional grid likelihood in row blocks; never retain N by grid.
+    """Exact regional grid likelihood with byte-bounded immutable block reuse.
 
     The working block is at most ADAPTER_BLOCK_BYTES (or one grid row if that
-    row itself exceeds the budget). Thus storage remains O(N + grid), even
-    when distinct mixed-CN upper bounds make the grid grow with N.
+    row itself exceeds the budget). Cached blocks have a separate explicit
+    byte limit; zero restores streaming even for bound-enriched mixed CN.
     """
-    def __init__(self, view, grid, *, block_bytes=None):
+    def __init__(self, view, grid, *, block_bytes=None, cache_bytes=None):
         self.view, self.grid = view, grid
         budget = ADAPTER_BLOCK_BYTES if block_bytes is None else int(block_bytes)
         if budget < 8:
@@ -320,16 +515,29 @@ class _GridOracle:
         self.block_rows = min(256, max(1, budget//(8*len(grid))),
                               max(1, 1_000_000//(32*view.array("valid").shape[-1])))
         self.offset = np.empty(len(view))
+        self.cache = _GridCache(cache_bytes)
+        self.execution = _GridExecution(view, grid, self.block_rows)
+        self.block_count = (len(view) + self.block_rows - 1) // self.block_rows
         self.evaluations = 0
+        self.grid_block_evaluations = 0
         self.peak_block_bytes = 0
         for first in range(0, len(view), self.block_rows):
             stop = min(len(view), first+self.block_rows)
+            if self.execution.workspace is not None:
+                _, offset = self.execution.block(first // self.block_rows, self.cache,
+                                                 lambda: self.device_block(first, stop))
+                self.offset[first:stop] = self.execution.workspace.to_host(offset)
+                continue
             values = self.log_block(first, stop)
             self.offset[first:stop] = values.max(axis=1)
+            values -= self.offset[first:stop, None]
+            np.exp(values, out=values)
+            self.cache.put(first // self.block_rows, values, self.offset[first:stop])
         if not np.isfinite(self.offset).all():
             raise RuntimeError("No finite supported grid likelihood for regional initialization")
 
     def log_block(self, first, stop, positions=None):
+        self.grid_block_evaluations += 1
         grid = self.grid if positions is None else self.grid[positions]
         view = self.view.subset(np.arange(first, stop))
         values = np.empty((len(view), len(grid)))
@@ -341,16 +549,46 @@ class _GridOracle:
                | (grid[None, :] > upper[:, None])] = -np.inf
         return values
 
+    def device_block(self, first, stop):
+        self.grid_block_evaluations += 1
+        self.peak_block_bytes = max(self.peak_block_bytes, (stop-first)*len(self.grid)*8)
+        return self.execution.calculate(self.view.subset(np.arange(first, stop)),
+                                        self.grid, mask_bounds=True)
+
+    def scaled_block(self, first, stop, positions=None):
+        if self.execution.workspace is not None:
+            likelihood, _ = self.execution.block(first // self.block_rows, self.cache,
+                                                lambda: self.device_block(first, stop))
+            if positions is not None:
+                index = self.execution.workspace.upload(positions, dtype=self.execution.workspace.torch.long)
+                likelihood = likelihood[:, index]
+            return likelihood
+        entry = self.cache.get(first // self.block_rows)
+        if entry is not None:
+            return entry[0] if positions is None else entry[0][:, positions]
+        likelihood = self.log_block(first, stop, positions)
+        likelihood -= self.offset[first:stop, None]
+        np.exp(likelihood, out=likelihood)
+        return likelihood
+
     def expectation(self, weights, *, collect_pilot=False):
         self.evaluations += 1
+        if self.execution.workspace is not None:
+            def blocks():
+                for first in range(0, len(self.view), self.block_rows):
+                    stop = min(len(self.view), first+self.block_rows)
+                    likelihood, offset = self.execution.block(first // self.block_rows, self.cache,
+                                                              lambda: self.device_block(first, stop))
+                    yield first, stop, likelihood, offset
+            score, likelihood, mass, pilot = self.execution.expectation(
+                blocks(), weights, len(self.view), collect_pilot=collect_pilot)
+            return None if score is None else score / len(self.view), likelihood, mass, pilot
         score, mass = np.zeros(len(weights)), np.empty(len(self.view))
         pilot = np.empty(len(self.view)) if collect_pilot else None
         log_likelihood = 0.
         for first in range(0, len(self.view), self.block_rows):
             stop = min(len(self.view), first+self.block_rows)
-            likelihood = self.log_block(first, stop)
-            likelihood -= self.offset[first:stop, None]
-            np.exp(likelihood, out=likelihood)
+            likelihood = self.scaled_block(first, stop)
             normalizer = likelihood @ weights
             if np.any(normalizer <= 0) or not np.isfinite(normalizer).all():
                 return None, -np.inf, None, None
@@ -368,12 +606,14 @@ class _GridOracle:
         values = np.empty((len(self.view), len(positions)))
         for first in range(0, len(self.view), self.block_rows):
             stop = min(len(self.view), first+self.block_rows)
-            values[first:stop] = np.exp(self.log_block(first, stop, positions)
-                                        - self.offset[first:stop, None])
+            block = self.scaled_block(first, stop, positions)
+            if self.execution.workspace is not None:
+                block = self.execution.workspace.to_host(block)
+            values[first:stop] = block
         return values
 
 
-def _pooled_adapter(view, *, block_bytes=None):
+def _pooled_adapter(view, *, block_bytes=None, cache_bytes=None):
     """Stream the explicit mixed/general-normal grid; exact concave weight gap.
 
     Safeguarded SQUAREM and exact grow/shrink exchange mirror the inherited
@@ -385,7 +625,7 @@ def _pooled_adapter(view, *, block_bytes=None):
     """
     lower, upper = view.bounds()
     grid = np.unique(np.r_[np.linspace(0., 1., 257), lower, upper])
-    oracle = _GridOracle(view, grid, block_bytes=block_bytes)
+    oracle = _GridOracle(view, grid, block_bytes=block_bytes, cache_bytes=cache_bytes)
     weights = np.full(len(grid), 1/len(grid))
     score, likelihood, mass, _ = oracle.expectation(weights)
     initial_likelihood = likelihood
@@ -501,5 +741,8 @@ def _pooled_adapter(view, *, block_bytes=None):
         "exchange_steps": exchanges, "block_rows": oracle.block_rows,
         "active_support_refits": active_refits, "max_active_refit_size": 64,
         "peak_grid_block_bytes": oracle.peak_block_bytes,
-        "dense_grid_matrix_retained": False,
+        "dense_grid_matrix_retained": len(oracle.cache._blocks) == oracle.block_count,
+        "grid_cache": {**oracle.cache.diagnostics(oracle.block_count),
+                       "grid_block_evaluations": oracle.grid_block_evaluations,
+                       **oracle.execution.diagnostics()},
     }

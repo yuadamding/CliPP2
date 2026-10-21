@@ -30,6 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--verbose", action="store_true")
     fit.add_argument("--max-clusters", type=int, choices=range(1, 11), default=10,
                      help="Largest occupied cluster capacity (at most 10).")
+    fit.add_argument("--grid-cache-mb", type=int, default=64,
+                     help="Host initialization-grid cache budget in MiB; 0 streams without caching.")
+    fit.add_argument("--device-cache-mb", type=int, default=256,
+                     help="Reusable CUDA likelihood cache budget in MiB; 0 disables caching.")
+    fit.add_argument("--workspace-mb", type=int, default=64,
+                     help="Estimated CUDA emission-tile workspace budget in MiB (positive; not total VRAM).")
     fit.add_argument("--version", action="version", version=__version__)
     return parser
 
@@ -39,6 +45,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     try:
         validate_max_major_cn(args.max_major_cn)
+        _fit_config_from_args(args)
     except ValueError as error:
         parser.error(str(error))
     return args
@@ -46,7 +53,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
     return resolve_fit_config(device=args.device, verbose=args.verbose,
-                              max_major_cn=args.max_major_cn, max_clusters=args.max_clusters)
+                              max_major_cn=args.max_major_cn, max_clusters=args.max_clusters,
+                              grid_cache_mb=args.grid_cache_mb, device_cache_mb=args.device_cache_mb,
+                              workspace_mb=args.workspace_mb)
 
 
 def _printable_summary(value: object) -> object:

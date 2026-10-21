@@ -6,7 +6,9 @@ Mixed CN explicitly retains CliPP2's capped support, weighted denominator,
 clipped likelihood and original interior box. Assignment validity is observed
 jointly with reads; it is not conditioned away by renormalizing mixture weights.
 CUDA is an explicit float64 likelihood/host-forest path, never a CPU fallback;
-pooled initialization, scalar refits and weight optimization run on the host.
+initialization emissions are batched on device. Conditional-center decisions
+retain the reference NumPy/SciPy arithmetic on every device: roundoff-equivalent
+conditional optima can have different joint-mixture scores.
 """
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -54,7 +56,9 @@ class RefittedPartition:
 class RegionalModel:
     """Immutable, canonically ordered informative mutation vectors."""
 
-    def __init__(self, data, device="cpu", *, cache_bytes=32 * 1024 * 1024):
+    def __init__(self, data, device="cpu", *, cache_bytes=32 * 1024 * 1024,
+                 grid_cache_bytes=None, device_cache_bytes=256 * 1024**2,
+                 workspace_bytes=64 * 1024**2):
         self.data = data
         ids, regions = tuple(data.mutation_ids), tuple(data.region_ids)
         if any(not isinstance(x, str) for x in ids + regions):
@@ -131,15 +135,15 @@ class RegionalModel:
         self.device = str(device)
         if self.device != "cpu" and not self.device.startswith("cuda"):
             raise ValueError("Regional likelihood device must be cpu or cuda")
-        self._torch = None
+        self.workspace = None
+        self.grid_cache_bytes = grid_cache_bytes
+        if grid_cache_bytes is not None and (type(grid_cache_bytes) is not int or grid_cache_bytes < 0):
+            raise ValueError("grid_cache_bytes must be a nonnegative integer")
         if self.device.startswith("cuda"):
-            import torch
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA was requested but is unavailable; no CPU fallback")
-            self._torch = torch
-            self._gpu = {name: torch.tensor(np.array(getattr(self, name)), device=self.device)
-                         for name in ("slope", "valid", "observed", "mixed", "alt", "depth", "constants")}
-        self.execution_backend = "cuda_likelihood_host_forest" if self._torch else "cpu"
+            from .device import DeviceWorkspace
+            self.workspace = DeviceWorkspace(self, device_cache_bytes=device_cache_bytes,
+                                             workspace_bytes=workspace_bytes)
+        self.execution_backend = "cuda_likelihood_host_forest" if self.workspace else "cpu"
         self._cache_bytes = int(cache_bytes)
         if self._cache_bytes < 0:
             raise ValueError("cache_bytes must be nonnegative")
@@ -153,6 +157,12 @@ class RegionalModel:
     def __len__(self):
         return self.n
 
+    def execution_diagnostics(self):
+        """Execution-only accounting; never included in model or candidate identity."""
+        return {"backend": self.execution_backend, "grid_cache_bytes": self.grid_cache_bytes,
+                "conditional_refit_backend": "cpu_reference",
+                "device": dict(self.workspace.telemetry) if self.workspace else None}
+
     def _numpy_kernel(self, x):
         x = np.asarray(x, dtype=float)
         if x.shape != (self.n, self.r) or np.any(~np.isfinite(x[self.observed])):
@@ -164,49 +174,19 @@ class RegionalModel:
             ("slope", "valid", "mixed", "alt", "depth", "constants")})
 
     def _gpu_terms(self, x, derivatives=False):
-        t, a = self._torch, self._gpu
-        x = np.asarray(x, dtype=float)
-        if x.shape != (self.n, self.r) or np.any(~np.isfinite(x[self.observed])):
-            raise ValueError("CCFs must match N by R and be finite where observed")
-        if np.any(x[self.observed] < 0) or np.any(x[self.observed] > 1):
-            raise ValueError("CCFs must be in [0,1]")
-        xx = t.tensor(np.where(self.observed, x, 0.), device=self.device)
-        mass = xx[..., None] * a["slope"]
-        p = t.where(a["mixed"][..., None], mass.clamp(MIXED_EPS, 1-MIXED_EPS), mass.clamp(max=1.))
-        alt = t.where(a["observed"], a["alt"], 0.)[..., None]
-        ref = t.where(a["observed"], a["depth"]-a["alt"], 0.)[..., None]
-        kernel = t.special.xlogy(alt, p) + t.special.xlog1py(ref, -p) + a["constants"][..., None]
-        kernel = t.where(a["valid"], kernel, -t.inf)
-        ll = t.logsumexp(kernel, -1)
-        loss = t.where(a["observed"], -ll, 0.)
-        if not derivatives:
-            return loss.cpu().numpy()
-        post = t.where(t.isfinite(kernel), t.exp(kernel-ll[..., None]), 0.)
-        derivative_slope = t.where(a["mixed"][..., None] & ((mass <= MIXED_EPS) | (mass >= 1-MIXED_EPS)), 0., a["slope"])
-        safe_p = t.where(alt > 0, p, 1.)
-        safe_q = t.where(ref > 0, 1-p, 1.)
-        g = derivative_slope * (-alt/safe_p + ref/safe_q)
-        h = derivative_slope.square() * (alt/safe_p.square() + ref/safe_q.square())
-        g = t.where(post > 0, post*g, 0.).sum(-1)
-        h = t.where(post > 0, post*h, 0.).sum(-1)
-        boundary = a["valid"] & ~a["mixed"][..., None] & (p == 1) & (ref == 1)
-        correction = t.where(boundary, a["slope"] * t.exp(a["constants"][..., None] - ll[..., None]), 0.).sum(-1)
-        g += correction
-        h += t.where(a["valid"] & ~a["mixed"][..., None] & (p == 1) & (ref == 2),
-                     2*a["slope"].square()*t.exp(a["constants"][..., None]-ll[..., None]), 0.).sum(-1)
-        h = t.where(boundary.any(-1), t.inf, h.clamp(min=1e-8))
-        g = t.where(t.isfinite(ll), g, 0.)
-        h = t.where(t.isfinite(ll), h, 1.)
-        return tuple(t.where(a["observed"], v, 0.).cpu().numpy() for v in (loss, g, h))
+        result = self.workspace.node_terms_device(x, derivatives=derivatives)
+        if derivatives:
+            return tuple(self.workspace.to_host(value) for value in result)
+        return self.workspace.to_host(result)
 
     def loss(self, x):
-        if self._torch:
+        if self.workspace:
             return self._gpu_terms(x)
         return np.where(self.observed, -self._numpy_kernel(x)[-1], 0.)
 
     def node_terms(self, x):
         """Loss, exact gradient, positive complete-data curvature on CCF scale."""
-        if self._torch:
+        if self.workspace:
             return self._gpu_terms(x, True)
         p, mass, kernel, ll = self._numpy_kernel(x)
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
@@ -241,14 +221,18 @@ class RegionalModel:
         return RegionalView(self, region, np.arange(self.n) if rows is None else rows)
 
     def _regional_likelihood(self, values, rows, region):
-        """Host grid view of the same emissions used by the joint model."""
+        """Grid view of the same emissions used by the joint model."""
+        if self.workspace:
+            return self.workspace.to_host(self.workspace.regional_grid_device(
+                region, rows, np.atleast_1d(values))).T
         return self.view(region, rows).log_likelihood_columns(np.atleast_1d(values)).T
 
     def pilots(self):
         pilots, diagnostics = np.full((self.n, self.r), np.nan), {}
         for region in range(self.r):
             rows = np.flatnonzero(self.observed[:, region])
-            pilots[rows, region], diag = pooled_ccf_initialization(self.view(region, rows))
+            pilots[rows, region], diag = pooled_ccf_initialization(
+                self.view(region, rows), cache_bytes=self.grid_cache_bytes)
             diagnostics[self.region_ids[region]] = diag
         return pilots, diagnostics
 
@@ -293,15 +277,18 @@ class RegionalModel:
             raise RuntimeError("No finite conditional scalar likelihood")
         self.telemetry["scalar_refits"] += 1
         self.telemetry["scalar_refit_seconds"] += time.perf_counter()-start
+        self._remember_refit(key, fitted, len(members))
+        return fitted
+
+    def _remember_refit(self, key, fitted, count):
         # Membership tuples are part of the bounded cache budget, not only values.
-        size = 256 + 36*len(members)
+        size = 256 + 36*count
         if size <= self._cache_bytes:
             while self._refit_bytes + size > self._cache_bytes:
                 _, (_, removed) = self._refits.popitem(last=False)
                 self._refit_bytes -= removed
             self._refits[key] = (fitted, size)
             self._refit_bytes += size
-        return fitted
 
     def assignment_admissibility(self, centers):
         """N-by-q closed-box assignments, including regions without reads."""
@@ -323,16 +310,34 @@ class RegionalModel:
         centers = np.asarray(centers, dtype=float)
         allowed = self.assignment_admissibility(centers)
         self.telemetry["joint_matrix_calls"] += 1
+        # Compute uncached centers together. Public return values remain NumPy;
+        # device consumers can retain workspace.joint_columns_device directly.
+        fresh, retained = {}, {}
+        if self.workspace:
+            retained = {center.tobytes(): self._columns[self.identity, center.tobytes()]
+                        for center in centers if (self.identity, center.tobytes()) in self._columns}
+            missing = {center.tobytes(): center for center in centers
+                       if center.tobytes() not in retained}
+            if missing:
+                matrix = self.workspace.to_host(self.workspace.joint_columns_device(
+                    np.array(list(missing.values()))))
+                fresh = dict(zip(missing, matrix.T))
         columns = []
         for k, center in enumerate(centers):
             key = (self.identity, center.tobytes())
             column = self._columns.get(key)
+            if column is None:
+                column = retained.get(key[1])
             if column is not None:
                 self.telemetry["column_cache_hits"] += 1
-                self._columns.move_to_end(key)
+                if key in self._columns:
+                    self._columns.move_to_end(key)
             else:
-                emission = -self.loss(np.broadcast_to(center, (self.n, self.r))).sum(axis=1)
-                column = readonly_array(np.where(allowed[:, k], emission, -np.inf))
+                if self.workspace:
+                    column = readonly_array(fresh[key[1]])
+                else:
+                    emission = -self.loss(np.broadcast_to(center, (self.n, self.r))).sum(axis=1)
+                    column = readonly_array(np.where(allowed[:, k], emission, -np.inf))
                 self.telemetry["likelihood_columns"] += 1
                 size = column.nbytes + len(key[1]) + 128
                 if size <= self._cache_bytes:
@@ -358,16 +363,19 @@ class RegionalModel:
         penalty = float((q*self.r+q-1)*math.log(self.n))
         retained_initial = 0
         try:
+            memberships = [np.flatnonzero(inverse == cluster) for cluster in range(q)]
             for cluster in range(q):
-                members = np.flatnonzero(inverse == cluster)
+                members = memberships[cluster]
                 for region in range(self.r):
+                    # Do not dispatch the experimental device-batched refitter:
+                    # grid, Brent and incumbent tie decisions need one arithmetic.
                     center, ll = self._fit_scalar(members, region)
                     if initial_centers is not None:
                         old = initial_centers[cluster, region]
                         if (np.isfinite(old) and self.lower[members, region].max() <= old
                                 <= self.upper[members, region].min()):
                             rows = members[self.observed[members, region]]
-                            old_ll = float(self._regional_likelihood([old], rows, region).sum())
+                            old_ll = float(self.view(region, rows).log_likelihood_columns([old]).T.sum())
                             if old_ll > ll:
                                 center, ll = float(old), old_ll
                                 retained_initial += 1
