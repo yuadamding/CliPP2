@@ -1,5 +1,5 @@
 """Conditional CCF-coordinate refits shared by every regional cluster."""
-# Adapted from CliPP1.5; see ../NOTICE.
+# Adapted from CliPP1.5.
 
 import numpy as np
 from scipy.optimize import minimize_scalar

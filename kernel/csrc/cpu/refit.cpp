@@ -1,0 +1,97 @@
+#include "../common/backend.h"
+#include "../common/emission_math.h"
+#include "../common/refit_validation.h"
+#include "../common/scalar_search.h"
+#include <vector>
+
+namespace clipp2 {
+namespace {
+struct Emissions {
+    const ObservationSoA& model;
+    const std::int64_t* rows;
+    std::int64_t region;
+    double center;
+    double operator()(std::int64_t member) const {
+        return -evaluate_observation<EmitMode::LossOnly>(
+            observation(model, region * model.mutations + rows[member]), center).loss;
+    }
+};
+struct Objective {
+    const ObservationSoA& model;
+    const std::int64_t* rows;
+    std::int64_t count, region;
+    double operator()(double center) const {
+        return pairwise_sum(Emissions{model, rows, region, center}, 0, count);
+    }
+    void store_grid(double* destination, double value) const { *destination = value; }
+    void finish_grid() const {}
+};
+
+}
+
+void refit_centers(const ObservationSoA& model, const RefitBatch& batch, RefitResult* output) {
+    validate_refit_batch(model, batch, output);
+    // Allocate once before the worker team: allocation failure reaches the C
+    // boundary, and no task allocates from an OpenMP worker or objective loop.
+    std::vector<std::int64_t> observed(batch.members), offsets(batch.tasks + 1);
+    std::vector<double> values(batch.grid_points);
+    std::int64_t used = 0;
+    for (std::int64_t task = 0; task < batch.tasks; ++task) {
+        offsets[task] = used;
+        const auto region = batch.regions[task];
+        for (auto index = batch.member_offsets[task]; index < batch.member_offsets[task + 1]; ++index) {
+            const auto row = batch.member_rows[index];
+            if (model.flags[region * model.mutations + row] & observed_flag) observed[used++] = row;
+        }
+    }
+    offsets[batch.tasks] = used;
+    // Independent tasks share no mutable state. The serial path is complete;
+    // builds may enable one optional OpenMP team, never nested reductions.
+    CLIPP_PARALLEL_FOR
+    for (std::int64_t task = 0; task < batch.tasks; ++task) {
+        const auto region = batch.regions[task];
+        const auto count = offsets[task + 1] - offsets[task];
+        if (!count) {
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            output[task] = {nan, nan, nan, nan, 0, static_cast<std::int32_t>(RefitStatus::Unsupported)};
+            continue;
+        }
+        output[task] = refit_search(batch, task, values.data() + batch.grid_offsets[task],
+            Objective{model, observed.data() + offsets[task], count, region});
+    }
+}
+
+void conditional_values(const ObservationSoA& model, const ConditionalBatch& batch,
+                         double* output, std::uint8_t* status) {
+    validate_conditional_batch(model, batch, output, status);
+    std::vector<std::int64_t> observed(batch.members), offsets(batch.tasks + 1);
+    std::int64_t used = 0;
+    for (std::int64_t task = 0; task < batch.tasks; ++task) {
+        offsets[task] = used;
+        const auto region = batch.regions[task];
+        auto state = EmitStatus::Ok;
+        const double center = batch.centers[task];
+        if (!std::isfinite(center) || center < 0 || center > 1) state = EmitStatus::InvalidInput;
+        for (auto index = batch.member_offsets[task]; index < batch.member_offsets[task + 1]; ++index) {
+            const auto row = batch.member_rows[index], cell = region * model.mutations + row;
+            if (model.flags[cell] & observed_flag) observed[used++] = row;
+            if (state == EmitStatus::Ok && (center < model.lower[cell] || center > model.upper[cell]))
+                state = EmitStatus::ZeroLikelihood;
+        }
+        if (used == offsets[task]) state = EmitStatus::InvalidInput;
+        status[task] = static_cast<std::uint8_t>(state);
+    }
+    offsets[batch.tasks] = used;
+    CLIPP_PARALLEL_FOR
+    for (std::int64_t task = 0; task < batch.tasks; ++task) {
+        output[task] = -std::numeric_limits<double>::infinity();
+        if (status[task]) continue;
+        output[task] = Objective{model, observed.data() + offsets[task],
+                                offsets[task + 1] - offsets[task], batch.regions[task]}(batch.centers[task]);
+        if (output[task] == -std::numeric_limits<double>::infinity())
+            status[task] = static_cast<std::uint8_t>(EmitStatus::ZeroLikelihood);
+        else if (!std::isfinite(output[task]))
+            status[task] = static_cast<std::uint8_t>(EmitStatus::NumericalFailure);
+    }
+}
+}

@@ -46,6 +46,11 @@ class RegionalView:
         return len(self.rows)
 
     def array(self, name):
+        if name in ("slope", "valid"):
+            support = np.arange(1, int(self.model.support.max())+1)
+            if name == "slope":
+                return self.model.scaling[self.rows, self.region, None] * support
+            return support <= self.model.support[self.rows, self.region, None]
         return getattr(self.model, name)[self.rows, self.region]
 
     @property
@@ -75,36 +80,31 @@ class RegionalView:
 
     def log_likelihood(self, ccf):
         ccf = np.broadcast_to(np.asarray(ccf, dtype=float), (len(self),))
-        return np.where(self.array("observed"), self._terms(ccf)[-1], 0.)
+        return self.model.backend.cells(self.region, self.rows, ccf)
 
     def log_likelihood_columns(self, grid):
         """N-by-grid read emissions; assignment bounds are applied by callers."""
         grid = np.asarray(grid, dtype=float)
         if grid.ndim != 1:
             raise ValueError("Regional proposal grid must be one-dimensional")
-        values = np.empty((len(self), len(grid)))
-        batch = max(1, min(32, 1_000_000 // max(1, self.array("valid").size)))
-        for first in range(0, len(grid), batch):
-            values[:, first:first+batch] = self._terms(grid[first:first+batch, None])[-1].T
-        return np.where(self.array("observed")[:, None], values, 0.)
+        # Keep the established row-major BLAS reduction layout, including
+        # recomputed suffixes of partially retained initialization blocks.
+        return np.ascontiguousarray(self.model.backend.regional_grid(self.region, self.rows, grid))
 
     def grid_log_likelihood(self, grid):
         grid = np.asarray(grid, dtype=float)
         if grid.ndim != 1:
             raise ValueError("Regional proposal grid must be one-dimensional")
-        result = np.empty(len(grid))
-        batch = max(1, min(32, 1_000_000 // max(1, self.array("valid").size)))
-        for first in range(0, len(grid), batch):
-            ll = self._terms(grid[first:first+batch, None])[-1]
-            result[first:first+batch] = np.where(self.array("observed"), ll, 0.).sum(axis=1)
-        return result
+        return np.ascontiguousarray(self.model.backend.regional_grid(self.region, self.rows, grid).T).sum(axis=1)
 
     def component_modes(self):
         observed = self.array("observed")
         vaf = np.divide(self.array("alt"), self.array("depth"),
                         out=np.zeros(len(self)), where=observed)
-        return (vaf[:, None] / self.array("slope"))[
-            self.array("valid") & observed[:, None]]
+        scaling = self.array("scaling")
+        modes = [vaf[index] / (scaling[index] * np.arange(1, int(size)+1))
+                 for index, size in enumerate(self.array("support")) if observed[index]]
+        return np.concatenate(modes) if modes else np.empty(0)
 
     def posterior(self, ccf):
         ccf = np.broadcast_to(np.asarray(ccf, dtype=float), (len(self),))

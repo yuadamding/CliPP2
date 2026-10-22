@@ -38,8 +38,8 @@ class FitConfig:
         if not isinstance(self.verbose, bool):
             raise TypeError("verbose must be a boolean.")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
-        if type(self.max_clusters) is not int or not 1 <= self.max_clusters <= 10:
-            raise ValueError("max_clusters must be an integer in 1..10.")
+        if type(self.max_clusters) is not int or self.max_clusters < 1:
+            raise ValueError("max_clusters must be a positive integer.")
         for name in ("grid_cache_mb", "device_cache_mb", "workspace_mb"):
             value = getattr(self, name)
             if type(value) is not int or value < (1 if name == "workspace_mb" else 0):

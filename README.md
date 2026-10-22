@@ -11,8 +11,14 @@ Requires Python 3.10+ and a C++17 compiler. Run from the repository root.
 python -m pip install .
 ```
 
-GPU execution also requires an NVIDIA GPU, a compatible driver and CUDA-enabled
-PyTorch.
+For GPU execution, build the optional CUDA backend with an NVIDIA CUDA toolkit
+(`nvcc`); execution requires a compatible NVIDIA GPU and driver:
+
+```bash
+CLIPP2_BUILD_CUDA=1 python -m pip install .
+```
+
+CPU builds do not require CUDA or PyTorch.
 
 ## Run
 
@@ -24,8 +30,7 @@ clipp2 fit --input-file tumor.tsv --device cpu --outdir ../clipp2-cpu
 clipp2 fit --input-file tumor.tsv --device cuda --outdir ../clipp2-gpu
 ```
 
-Use a new output directory for each run. `--max-clusters` defaults to **10**;
-use a smaller value to limit the search.
+Use a new output directory for each run. `--max-clusters` defaults to **10**; larger values can greatly increase the exhaustive search.
 
 ## Input
 
@@ -58,7 +63,6 @@ The output directory contains three tables:
 | `{tumor_id}_mutation_region_multiplicity.tsv` | CCF and multiplicity estimates for each mutation–region pair |
 
 Cluster 0 has the largest CCF-vector L2 norm and is not necessarily clonal.
-
 
 ## Contact
 

@@ -12,10 +12,10 @@ dependencies = [
     "numpy>=1.21",
     "pandas>=1.5",
     "scipy>=1.10",
-    "torch>=2.0",
 ]
 
 [project.optional-dependencies]
+interop = ["torch>=2.0"]
 test = [
     "build>=1.2",
     "pytest>=8",
@@ -41,9 +41,13 @@ version = { attr = "CliPP2._version.__version__" }
 [tool.setuptools.package-data]
 CliPP2 = [
     "_build_source.json",
+    "NOTICE",
     "kernel/csrc/*.cpp",
     "kernel/csrc/*.h",
-    "NOTICE",
+    "kernel/csrc/common/*.h",
+    "kernel/csrc/cpu/*.cpp",
+    "kernel/csrc/cuda/*.cu",
+    "CMakeLists.txt",
 ]
 
 [tool.ruff]

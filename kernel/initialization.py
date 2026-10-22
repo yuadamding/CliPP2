@@ -6,7 +6,7 @@ of its true CCF. Pooling the same marginal likelihood across a region provides
 an unsupervised initialization. This grid mixture is neither the fitted model
 nor a new penalty, and its weights never enter the native objective or BIC.
 """
-# Adapted from CliPP1.5; see ../NOTICE.
+# Adapted from CliPP1.5.
 
 import operator
 import sys
@@ -542,7 +542,7 @@ class _GridOracle:
         if budget < 8:
             raise ValueError("Grid block budget must hold at least one float64")
         self.block_rows = min(256, max(1, budget//(8*len(grid))),
-                              max(1, 1_000_000//(32*view.array("valid").shape[-1])))
+                              max(1, 1_000_000//(32*int(view.model.support.max()))))
         self.offset = np.empty(len(view))
         self.cache = _GridCache(cache_bytes)
         self.execution = _GridExecution(view, grid, self.block_rows)

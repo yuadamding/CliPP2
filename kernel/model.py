@@ -6,9 +6,8 @@ Mixed CN explicitly retains CliPP2's capped support, weighted denominator,
 clipped likelihood and original interior box. Assignment validity is observed
 jointly with reads; it is not conditioned away by renormalizing mixture weights.
 CUDA is an explicit float64 likelihood/host-forest path, never a CPU fallback;
-initialization emissions are batched on device. Conditional-center decisions
-retain the reference NumPy/SciPy arithmetic on every device: roundoff-equivalent
-conditional optima can have different joint-mixture scores.
+emissions and conditional centers share a native float64 numerical policy.
+Forest continuation, candidate selection and mixture-weight fitting stay on host.
 """
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -20,9 +19,9 @@ import numpy as np
 from scipy.special import gammaln
 
 from . import SCORE_DEFINITION
+from .backend import NativeBackend
 from .initialization import pooled_ccf_initialization
 from .likelihood import MIXED_EPS, RegionalView, emission_terms
-from .refitting import refit_center
 from .scoring import fit_mixture_weights
 from ..io.data import readonly_array
 
@@ -120,15 +119,18 @@ class RegionalModel:
         if np.any(self.upper < self.lower) or np.any(self.upper > 1) or not np.isfinite(self.upper).all():
             raise ValueError("Invalid original mixed-CN bounds")
         self.scaling = readonly_array(self.purity / denominator)
-        m = np.arange(1, int(self.support.max()) + 1)
-        self.valid = readonly_array(m <= self.support[..., None])
-        self.slope = readonly_array(self.scaling[..., None] * m)
         self.constants = readonly_array(
             gammaln(self.depth + 1) - gammaln(self.alt + 1)
             - gammaln(self.depth - self.alt + 1) - np.log(self.support))
         digest = hashlib.sha256(MODEL_VERSION.encode())
-        for values in (self.alt, self.depth, self.observed, self.slope,
-                       self.support, self.mixed, self.lower, self.upper):
+        for values in (self.alt, self.depth, self.observed):
+            digest.update(values.tobytes())
+        # Preserve the established scientific identity without retaining padded
+        # N-by-R-by-M arrays. Execution layout and workspace limits are inert.
+        multiplicities = np.arange(1, int(self.support.max())+1)
+        for row in self.scaling:
+            digest.update((row[:, None] * multiplicities).tobytes())
+        for values in (self.support, self.mixed, self.lower, self.upper):
             digest.update(values.tobytes())
         digest.update(repr((self.mutation_ids, self.region_ids)).encode())
         self.identity = digest.hexdigest()
@@ -139,11 +141,12 @@ class RegionalModel:
         self.grid_cache_bytes = grid_cache_bytes
         if grid_cache_bytes is not None and (type(grid_cache_bytes) is not int or grid_cache_bytes < 0):
             raise ValueError("grid_cache_bytes must be a nonnegative integer")
-        if self.device.startswith("cuda"):
-            from .device import DeviceWorkspace
-            self.workspace = DeviceWorkspace(self, device_cache_bytes=device_cache_bytes,
-                                             workspace_bytes=workspace_bytes)
-        self.execution_backend = "cuda_likelihood_host_forest" if self.workspace else "cpu"
+        if type(device_cache_bytes) is not int or device_cache_bytes < 0:
+            raise ValueError("device_cache_bytes must be a nonnegative integer")
+        if type(workspace_bytes) is not int or workspace_bytes < 0:
+            raise ValueError("workspace_bytes must be a nonnegative integer")
+        self.backend = NativeBackend(self, workspace_bytes)
+        self.execution_backend = f"native_{self.backend.kind}_likelihood_host_forest"
         self._cache_bytes = int(cache_bytes)
         if self._cache_bytes < 0:
             raise ValueError("cache_bytes must be nonnegative")
@@ -159,10 +162,20 @@ class RegionalModel:
     def __len__(self):
         return self.n
 
+    @property
+    def slope(self):
+        """On-demand padded reference view; never retained by production fits."""
+        return self.scaling[..., None] * np.arange(1, int(self.support.max())+1)
+
+    @property
+    def valid(self):
+        return np.arange(1, int(self.support.max())+1) <= self.support[..., None]
+
     def execution_diagnostics(self):
         """Execution-only accounting; never included in model or candidate identity."""
         return {"backend": self.execution_backend, "grid_cache_bytes": self.grid_cache_bytes,
-                "conditional_refit_backend": "cpu_reference",
+                "conditional_refit_backend": f"native_{self.backend.kind}",
+                "native": self.backend.diagnostics(),
                 "device": dict(self.workspace.telemetry) if self.workspace else None}
 
     def _numpy_kernel(self, x):
@@ -184,30 +197,13 @@ class RegionalModel:
     def loss(self, x):
         if self.workspace:
             return self._gpu_terms(x)
-        return np.where(self.observed, -self._numpy_kernel(x)[-1], 0.)
+        return self.backend.node_terms(x, False)
 
     def node_terms(self, x):
         """Loss, exact gradient, positive complete-data curvature on CCF scale."""
         if self.workspace:
             return self._gpu_terms(x, True)
-        p, mass, kernel, ll = self._numpy_kernel(x)
-        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-            post = np.where(np.isfinite(kernel), np.exp(kernel-ll[..., None]), 0.)
-            slope = np.where(self.mixed[..., None] & ((mass <= MIXED_EPS) | (mass >= 1-MIXED_EPS)), 0., self.slope)
-            alt, ref = self.alt[..., None], (self.depth-self.alt)[..., None]
-            g = slope * (np.divide(-alt, p, out=np.zeros_like(p), where=alt != 0)
-                         + np.divide(ref, 1-p, out=np.zeros_like(p), where=ref != 0))
-            h = slope**2 * (np.divide(alt, p*p, out=np.zeros_like(p), where=alt != 0)
-                            + np.divide(ref, (1-p)**2, out=np.zeros_like(p), where=ref != 0))
-            g = np.where(post > 0, post*g, 0.).sum(-1)
-            h = np.where(post > 0, post*h, 0.).sum(-1)
-            boundary = self.valid & ~self.mixed[..., None] & (p == 1) & (ref == 1)
-            g += np.where(boundary, self.slope*np.exp(self.constants[..., None]-ll[..., None]), 0.).sum(-1)
-            h += np.where(self.valid & ~self.mixed[..., None] & (p == 1) & (ref == 2),
-                          2*self.slope**2*np.exp(self.constants[..., None]-ll[..., None]), 0.).sum(-1)
-        h = np.where(boundary.any(-1), np.inf, np.maximum(h, 1e-8))
-        g, h = np.where(np.isfinite(ll), g, 0.), np.where(np.isfinite(ll), h, 1.)
-        return tuple(np.where(self.observed, v, 0.) for v in (-ll, g, h))
+        return self.backend.node_terms(x)
 
     def posterior(self, x):
         _, _, kernel, ll = self._numpy_kernel(x)
@@ -216,8 +212,7 @@ class RegionalModel:
         return np.where(self.observed[..., None], np.exp(kernel-ll[..., None]), np.nan)
 
     def multiplicity(self, x):
-        post = self.posterior(x)
-        return np.where(self.observed, np.nan_to_num(post).argmax(-1)+1., np.nan)
+        return self.backend.multiplicity(x)
 
     def view(self, region, rows=None):
         return RegionalView(self, region, np.arange(self.n) if rows is None else rows)
@@ -240,10 +235,14 @@ class RegionalModel:
 
     def observation_keys(self):
         """ID-free scientific row signatures for deterministic proposal ties."""
-        arrays = (self.observed, self.alt, self.depth, self.slope, self.support,
-                  self.mixed, self.lower, self.upper)
-        return [int.from_bytes(hashlib.sha256(b''.join(a[i].tobytes() for a in arrays)).digest(),
-                               'big') for i in range(self.n)]
+        result = []
+        support = np.arange(1, int(self.support.max())+1)
+        for i in range(self.n):
+            arrays = (self.observed[i], self.alt[i], self.depth[i],
+                      self.scaling[i, :, None]*support, self.support[i],
+                      self.mixed[i], self.lower[i], self.upper[i])
+            result.append(int.from_bytes(hashlib.sha256(b''.join(a.tobytes() for a in arrays)).digest(), 'big'))
+        return result
 
     def regional_profile_columns(self, region, grid):
         """Host proposal-grid emissions with original boxes, including missing CN.
@@ -262,23 +261,32 @@ class RegionalModel:
         return columns
 
     def _fit_scalar(self, members, region):
-        key = (self.identity, region, tuple(map(int, members)))
-        if key in self._refits:
-            self.telemetry["refit_cache_hits"] += 1
-            self._refits.move_to_end(key)
-            return self._refits[key][0]
-        start = time.perf_counter()
-        rows = members[self.observed[members, region]]
-        lower, upper = self.lower[members, region].max(), self.upper[members, region].min()
-        if not len(rows):
-            raise ValueError(f"unsupported_cluster_region:{self.region_ids[region]}")
-        if lower > upper:
-            raise ValueError(f"empty_cluster_region_box:{self.region_ids[region]}")
-        fitted = refit_center(self.view(region, rows), (lower, upper))
-        if not math.isfinite(fitted[1]):
-            raise RuntimeError("No finite conditional scalar likelihood")
-        self.telemetry["scalar_refits"] += 1
-        self.telemetry["scalar_refit_seconds"] += time.perf_counter()-start
+        return self._fit_coordinates([(members, region)])[0]
+
+    def _fit_coordinates(self, tasks):
+        results, missing = [None]*len(tasks), []
+        for index, (members, region) in enumerate(tasks):
+            key = (self.identity, self.backend.policy, self.backend.identity,
+                   region, tuple(map(int, members)))
+            if key in self._refits:
+                self.telemetry["refit_cache_hits"] += 1
+                self._refits.move_to_end(key)
+                results[index] = self._refits[key][0]
+            else:
+                missing.append((index, key, members, region))
+        if missing:
+            start = time.perf_counter()
+            fitted = self.backend.refit(self, [(members, region) for _, _, members, region in missing])
+            self.telemetry["scalar_refit_seconds"] += time.perf_counter()-start
+            for (index, key, members, _), value in zip(missing, fitted):
+                if value.status:
+                    raise RuntimeError(f"Marginal-likelihood center refit failed: native status {value.status}")
+                results[index] = (value.base_center, value.base_log_likelihood)
+                self.telemetry["scalar_refits"] += 1
+                self._cache_refit(key, members, results[index])
+        return results
+
+    def _cache_refit(self, key, members, fitted):
         # Membership tuples are part of the bounded cache budget, not only values.
         size = 256 + 36*len(members)
         if size <= self._cache_bytes:
@@ -287,7 +295,6 @@ class RegionalModel:
                 self._refit_bytes -= removed
             self._refits[key] = (fitted, size)
             self._refit_bytes += size
-        return fitted
 
     def assignment_admissibility(self, centers):
         """N-by-q closed-box assignments, including regions without reads."""
@@ -314,25 +321,27 @@ class RegionalModel:
         cached columns, so it overlaps these disjoint counters; do not add it.
         """
         centers = np.asarray(centers, dtype=float)
-        allowed = self.assignment_admissibility(centers)
+        self.assignment_admissibility(centers)
         self.telemetry["joint_matrix_calls"] += 1
         self.telemetry["likelihood_column_requests"] += len(centers)
         # Compute uncached centers together. Public return values remain NumPy;
         # device consumers can retain workspace.joint_columns_device directly.
         fresh, retained = {}, {}
         evaluated = set()
-        if self.workspace:
+        batched = self.workspace is not None or self.backend.kind == "cuda"
+        if batched:
             retained = {center.tobytes(): self._columns[self.identity, center.tobytes()]
                         for center in centers if (self.identity, center.tobytes()) in self._columns}
             missing = {center.tobytes(): center for center in centers
                        if center.tobytes() not in retained}
             if missing:
-                matrix = self.workspace.to_host(self.workspace.joint_columns_device(
-                    np.array(list(missing.values()))))
+                values = np.array(list(missing.values()))
+                matrix = (self.workspace.to_host(self.workspace.joint_columns_device(values))
+                          if self.workspace else self.backend.joint_columns(values))
                 fresh = dict(zip(missing, matrix.T))
                 self.telemetry["likelihood_columns"] += len(missing)
         columns = []
-        for k, center in enumerate(centers):
+        for center in centers:
             key = (self.identity, center.tobytes())
             column = self._columns.get(key)
             if column is None:
@@ -344,13 +353,12 @@ class RegionalModel:
                 if key in self._columns:
                     self._columns.move_to_end(key)
             else:
-                if self.workspace:
+                if batched:
                     column = readonly_array(fresh[key[1]])
                     if key[1] in evaluated:
                         self.telemetry["column_batch_reuses"] += 1
                 else:
-                    emission = -self.loss(np.broadcast_to(center, (self.n, self.r))).sum(axis=1)
-                    column = readonly_array(np.where(allowed[:, k], emission, -np.inf))
+                    column = readonly_array(self.backend.joint_columns([center])[:, 0])
                     self.telemetry["likelihood_columns"] += 1
                 evaluated.add(key[1])
                 size = column.nbytes + len(key[1]) + 128
@@ -378,21 +386,20 @@ class RegionalModel:
         retained_initial = 0
         try:
             memberships = [np.flatnonzero(inverse == cluster) for cluster in range(q)]
-            for cluster in range(q):
-                members = memberships[cluster]
-                for region in range(self.r):
-                    # Grid, Brent and incumbent tie decisions use one arithmetic.
-                    center, ll = self._fit_scalar(members, region)
-                    if initial_centers is not None:
-                        old = initial_centers[cluster, region]
-                        if (np.isfinite(old) and self.lower[members, region].max() <= old
-                                <= self.upper[members, region].min()):
-                            rows = members[self.observed[members, region]]
-                            old_ll = float(self.view(region, rows).log_likelihood_columns([old]).T.sum())
-                            if old_ll > ll:
-                                center, ll = float(old), old_ll
-                                retained_initial += 1
-                    centers[cluster, region] = center
+            tasks = [(members, region) for members in memberships for region in range(self.r)]
+            fitted = self._fit_coordinates(tasks)
+            if initial_centers is not None:
+                initial = initial_centers.ravel()
+                valid = [index for index, (members, region) in enumerate(tasks)
+                         if np.isfinite(initial[index])
+                         and self.lower[members, region].max() <= initial[index]
+                         <= self.upper[members, region].min()]
+                values = self.backend.conditional_values([tasks[index] for index in valid], initial[valid])
+                for index, value in zip(valid, values):
+                    if value > fitted[index][1]:
+                        fitted[index] = (float(initial[index]), float(value))
+                        retained_initial += 1
+            centers[:] = np.array([center for center, _ in fitted]).reshape(q, self.r)
         except (ValueError, RuntimeError) as error:
             return RefittedPartition(inverse, centers, np.full(q, np.nan), -np.inf,
                                      -np.inf, penalty, np.inf, False, str(error))

@@ -44,10 +44,8 @@ class TreeFit:
 
 
 def cut_subsets(cuts):
-    """Stream all connected coarsenings; public K<=10 means <=512 per seed."""
+    """Stream all connected coarsenings: up to 2**(K-1) per seed."""
     cuts = tuple(sorted(set(map(int, cuts))))
-    if len(cuts) > 9:
-        raise ValueError("Exhaustive coarsening supports at most ten clusters")
     for size in range(len(cuts) + 1):
         yield from combinations(cuts, size)
 
@@ -194,7 +192,8 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
         cuts = tuple(sorted(map(int, seed["cuts"])))
         reason = str(bank.ineligible.get(cuts, {}).get("reason", ""))
         if reason.startswith(("unsupported_cluster_region", "empty_cluster_region_box")):
-            unsupported[cuts] = min(unsupported.get(cuts, 10), int(seed["requested_k"]))
+            requested_k = int(seed["requested_k"])
+            unsupported[cuts] = min(unsupported.get(cuts, requested_k), requested_k)
     repair_capacity = min((k for k in unsupported.values() if k >= 2), default=None)
     requested = 2 if 2 in capacities else repair_capacity
     small = tree.n <= 64
@@ -283,8 +282,8 @@ def fit_regions(model, max_clusters=10, capacities=None):
 
     total_started = perf_counter()
     telemetry_started = dict(getattr(model, "telemetry", {}))
-    if isinstance(max_clusters, bool) or int(max_clusters) != max_clusters or not 1 <= max_clusters <= 10:
-        raise ValueError("max_clusters must be an integer between one and ten")
+    if isinstance(max_clusters, bool) or not isinstance(max_clusters, (int, np.integer)) or max_clusters < 1:
+        raise ValueError("max_clusters must be a positive integer")
     max_clusters = int(max_clusters)
     if capacities is None:
         capacities = tuple(range(1, min(max_clusters, model.n) + 1))

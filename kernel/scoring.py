@@ -1,5 +1,5 @@
 """CliPP2 observed-mixture weights at fixed conditionally fitted centers."""
-# Adapted from CliPP1.5; see ../NOTICE.
+# Adapted from CliPP1.5.
 
 import numpy as np
 from scipy.optimize import brentq, minimize

@@ -28,8 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exclude a mutation from all regions if any CN state's major CN in any region exceeds this limit.",
     )
     fit.add_argument("--verbose", action="store_true")
-    fit.add_argument("--max-clusters", type=int, choices=range(1, 11), default=10,
-                     help="Largest occupied cluster capacity (at most 10).")
+    fit.add_argument("--max-clusters", type=int, default=10,
+                     help="Largest occupied cluster capacity (positive integer; no fixed upper limit).")
     fit.add_argument("--grid-cache-mb", type=int, default=64,
                      help="Host initialization-grid cache budget in MiB; 0 streams without caching.")
     fit.add_argument("--device-cache-mb", type=int, default=256,
