@@ -6,6 +6,10 @@ from scipy.optimize import brentq, minimize
 from scipy.special import logsumexp
 
 
+class WeightConvergenceError(RuntimeError):
+    """Finite weight iterates failed the existing fixed-budget stationarity gate."""
+
+
 def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
     """Maximize the joint observed likelihood of an N-by-q log-emission matrix.
 
@@ -152,13 +156,11 @@ def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
     score = -gradient(weights)
     optimality_gap = n * max(0.0, float(score.max() - 1.0))
     active_gap = float(score.max() - score[weights > 0].min())
-    if (
-        not np.isfinite(objective(weights))
-        or optimality_gap > n * tolerance
-        or active_gap > tolerance
-    ):
+    if not np.isfinite([objective(weights), optimality_gap, active_gap]).all():
+        raise FloatingPointError("Cluster-weight likelihood optimization produced invalid arithmetic")
+    if optimality_gap > n * tolerance or active_gap > tolerance:
         record("weight_convergence_failures")
-        raise RuntimeError("Cluster-weight likelihood optimization did not converge")
+        raise WeightConvergenceError("Cluster-weight likelihood optimization did not converge")
     likelihood = float(np.sum(offset + log_mass(weights)))
     return {
         "cluster_weights": weights,

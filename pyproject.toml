@@ -46,6 +46,7 @@ CliPP2 = [
     "kernel/csrc/*.h",
     "kernel/csrc/common/*.h",
     "kernel/csrc/cpu/*.cpp",
+    "kernel/csrc/cpu/*.h",
     "kernel/csrc/cuda/*.cu",
     "CMakeLists.txt",
 ]

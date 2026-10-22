@@ -155,7 +155,8 @@ CLIPP_HD double pairwise_block_sum(const Values& values, std::int64_t offset,
         return pairwise_block_sum<Depth - 1>(values, offset, split)
              + pairwise_block_sum<Depth - 1>(values, offset + split, count - split);
     }
-    // Only called with at most 8192 values and six static bisection levels.
+    // Seven levels cover every <=8192-value chunk: eight-aligned splits can
+    // leave 135 values after six levels (for example, an 8191-value chunk).
     return quiet_nan;
 }
 
@@ -168,7 +169,7 @@ CLIPP_HD double pairwise_sum(const Values& values, std::int64_t offset,
     double result = -0.0;
     for (std::int64_t first = 0; first < count; first += 8192) {
         const auto remaining = count - first;
-        result += pairwise_block_sum<6>(values, offset + first, remaining < 8192 ? remaining : 8192);
+        result += pairwise_block_sum<7>(values, offset + first, remaining < 8192 ? remaining : 8192);
     }
     return result;
 }

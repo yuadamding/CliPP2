@@ -685,10 +685,6 @@ def load_tumor_txt(
     return _build_tumor_data(filtered, report=report, eps=epsilon)
 
 
-def _format_number(value: float) -> str:
-    return f"{float(value):.17g}"
-
-
 def _canonical_text_value(value: object) -> str:
     if value is None or (
         isinstance(value, (float, np.floating)) and bool(np.isnan(value))
@@ -701,7 +697,7 @@ def _canonical_text_value(value: object) -> str:
     if isinstance(value, (float, np.floating)):
         if not np.isfinite(value):
             raise TumorTxtError("Long tumor tables may not contain infinite values.")
-        return _format_number(float(value))
+        return f"{float(value):.17g}"
     text = str(value)
     if "\r" in text or "\n" in text:
         raise TumorTxtError("Long tumor table values may not contain newlines.")
@@ -752,9 +748,8 @@ def write_tumor_txt(
         raise TumorTxtError(
             f"Long tumor table is missing required columns: {missing_columns}."
         )
-    schema_columns = [column for column in SCHEMA_COLUMNS if column in frame.columns]
     extra_columns = [column for column in frame.columns if column not in SCHEMA_COLUMNS]
-    ordered_columns = [*schema_columns, *extra_columns]
+    ordered_columns = [*SCHEMA_COLUMNS, *extra_columns]
     frame = frame.loc[:, ordered_columns].apply(
         lambda column: column.map(_canonical_text_value)
     )

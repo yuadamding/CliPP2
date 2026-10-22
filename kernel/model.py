@@ -19,15 +19,19 @@ import numpy as np
 from scipy.special import gammaln
 
 from . import SCORE_DEFINITION
-from .backend import NativeBackend
+from .backend import CoordinateTask, NativeBackend, NativeExecutionError, ScientificCandidateRejection
 from .initialization import pooled_ccf_initialization
 from .likelihood import MIXED_EPS, RegionalView, emission_terms
-from .scoring import fit_mixture_weights
+from .scoring import WeightConvergenceError, fit_mixture_weights
 from ..io.data import readonly_array
 
 
 # Mixed-CN emissions/boxes stay fixed; their assignment mask now enters scoring.
 MODEL_VERSION = "clipp2_regional_full_support__general_normal_v1__mixed_cn_bulk_assignment_event_v2"
+# Conservative retained Python-object/dictionary reservations, separate from
+# array/key payload bytes. Shared immutable owners may be charged more than once.
+_CACHE_ENTRY_BYTES = 1280
+_MODE_ENTRY_BYTES = 768
 
 
 @dataclass(frozen=True)
@@ -152,11 +156,17 @@ class RegionalModel:
             raise ValueError("cache_bytes must be nonnegative")
         self._refits, self._columns = OrderedDict(), OrderedDict()
         self._refit_bytes = self._column_bytes = 0
+        # Group metadata, exact component modes and coordinate grids share one
+        # bounded host preparation cache. Active caller-owned tasks are scratch.
+        self._preparations, self._preparation_bytes = OrderedDict(), 0
         self.telemetry = {"refit_cache_hits": 0, "scalar_refits": 0,
                           "column_cache_hits": 0, "likelihood_columns": 0,
                           "likelihood_column_requests": 0,
                           "column_host_cache_hits": 0, "column_batch_reuses": 0,
                           "joint_matrix_calls": 0,
+                          "group_cache_hits": 0, "coordinate_grid_cache_hits": 0,
+                          "component_mode_cache_hits": 0, "coordinate_grids": 0,
+                          "incumbent_equal_base_reuses": 0, "fused_incumbents": 0,
                           "scalar_refit_seconds": 0.0, "weight_seconds": 0.0}
 
     def __len__(self):
@@ -176,6 +186,10 @@ class RegionalModel:
         return {"backend": self.execution_backend, "grid_cache_bytes": self.grid_cache_bytes,
                 "conditional_refit_backend": f"native_{self.backend.kind}",
                 "native": self.backend.diagnostics(),
+                "continuation": getattr(self, "_continuation_execution", None),
+                "host_cache_bytes": {"preparation": self._preparation_bytes,
+                                     "refit": self._refit_bytes, "column": self._column_bytes,
+                                     "limit_per_category": self._cache_bytes},
                 "device": dict(self.workspace.telemetry) if self.workspace else None}
 
     def _numpy_kernel(self, x):
@@ -261,35 +275,139 @@ class RegionalModel:
         return columns
 
     def _fit_scalar(self, members, region):
-        return self._fit_coordinates([(members, region)])[0]
+        return self._fit_coordinates([(members, region)])[0][0]
 
-    def _fit_coordinates(self, tasks):
+    def _prepared(self, key, make, counter):
+        """Bound all retained owners, conservatively including shared payloads."""
+        cached = self._preparations.get(key)
+        if cached is not None:
+            self._preparations.move_to_end(key)
+            self.telemetry[counter] += 1
+            return cached[0]
+        value, size = make()
+        if size <= self._cache_bytes:
+            while self._preparation_bytes + size > self._cache_bytes:
+                _, (_, removed) = self._preparations.popitem(last=False)
+                self._preparation_bytes -= removed
+            self._preparations[key] = (value, size)
+            self._preparation_bytes += size
+        return value
+
+    def _coordinate_task(self, members, region):
+        members = self.backend._rows(region, members)
+        if not len(members):
+            raise ValueError("A coordinate task requires nonempty membership")
+        group_key = ("group", members.tobytes())
+
+        def prepare_group():
+            tasks = []
+            size = _CACHE_ENTRY_BYTES + len(group_key[1])
+            for coordinate in range(self.r):
+                rows = readonly_array(members[self.observed[members, coordinate]], dtype=np.int64)
+                lower = float(self.lower[members, coordinate].max())
+                upper = float(self.upper[members, coordinate].min())
+                standard = (not self.mixed[rows, coordinate].any()
+                            and np.all(self.normal[rows, coordinate] == 2))
+                xatol = (1e-12 / float(self.region_purities[coordinate])
+                          if standard and lower == 0 and upper == 1 else 1e-12)
+                key = (self.identity, self.backend.policy, self.backend.identity, coordinate,
+                       rows.tobytes(), np.asarray([lower, upper, xatol]).tobytes())
+                tasks.append(CoordinateTask(coordinate, rows, lower, upper, xatol, key))
+                size += _CACHE_ENTRY_BYTES + rows.nbytes + len(key[4]) + len(key[5])
+            return tuple(tasks), size
+
+        task = self._prepared(group_key, prepare_group, "group_cache_hits")[region]
+        if not len(task.rows):
+            raise ScientificCandidateRejection(f"unsupported_cluster_region:{self.region_ids[region]}")
+        if task.lower > task.upper:
+            raise ScientificCandidateRejection(f"empty_cluster_region_box:{self.region_ids[region]}")
+        return task
+
+    def _coordinate_grid(self, task):
+        def prepare_grid():
+            modes = []
+            for row in task.rows:
+                def prepare_modes():
+                    support = np.arange(1, int(self.support[row, task.region])+1)
+                    values = readonly_array((self.alt[row, task.region] / self.depth[row, task.region])
+                                            / (self.scaling[row, task.region] * support))
+                    return values, _MODE_ENTRY_BYTES + values.nbytes
+                modes.append(self._prepared(("modes", task.region, int(row)), prepare_modes,
+                                            "component_mode_cache_hits"))
+            grid = readonly_array(np.unique(np.r_[np.linspace(task.lower, task.upper, 513),
+                np.clip(np.concatenate(modes), task.lower, task.upper)]))
+            self.telemetry["coordinate_grids"] += 1
+            return grid, _CACHE_ENTRY_BYTES + len(task.key[4]) + grid.nbytes
+        return self._prepared(("grid", task.key), prepare_grid, "coordinate_grid_cache_hits")
+
+    def _fit_coordinates(self, tasks, incumbents=None):
+        tasks = [self._coordinate_task(*task) for task in tasks]
+        initial = np.full(len(tasks), np.nan) if incumbents is None else np.asarray(incumbents, dtype=float)
+        if initial.shape != (len(tasks),):
+            raise ValueError("Refitting needs one incumbent per coordinate task")
         results, missing = [None]*len(tasks), []
-        for index, (members, region) in enumerate(tasks):
-            key = (self.identity, self.backend.policy, self.backend.identity,
-                   region, tuple(map(int, members)))
+        hits, retained_initial = [], 0
+        for index, task in enumerate(tasks):
+            key = task.key
             if key in self._refits:
                 self.telemetry["refit_cache_hits"] += 1
                 self._refits.move_to_end(key)
                 results[index] = self._refits[key][0]
+                if np.isfinite(initial[index]) and task.lower <= initial[index] <= task.upper:
+                    if initial[index] == results[index][0]:
+                        self.telemetry["incumbent_equal_base_reuses"] += 1
+                    else:
+                        hits.append(index)
             else:
-                missing.append((index, key, members, region))
+                missing.append((index, task))
         if missing:
             start = time.perf_counter()
-            fitted = self.backend.refit(self, [(members, region) for _, _, members, region in missing])
+            pending = [task for _, task in missing]
+            starts = initial[[index for index, _ in missing]]
+            fitted = (self.backend.refit(self, pending) if incumbents is None
+                      else self.backend.refit(self, pending, starts))
             self.telemetry["scalar_refit_seconds"] += time.perf_counter()-start
-            for (index, key, members, _), value in zip(missing, fitted):
+            if len(fitted) != len(missing):
+                raise NativeExecutionError("Native center refit returned an incomplete task batch")
+            # Input support/boxes were checked before native execution. A native
+            # failure is not scientific evidence against this partition. In
+            # particular, interval status 1 conflates failed arithmetic and
+            # unsuccessful search, so cannot safely justify candidate pruning.
+            for (_, task), value in zip(missing, fitted):
                 if value.status:
-                    raise RuntimeError(f"Marginal-likelihood center refit failed: native status {value.status}")
-                results[index] = (value.base_center, value.base_log_likelihood)
+                    raise NativeExecutionError(
+                        f"Marginal-likelihood center refit failed: native status {value.status}; "
+                        f"region {self.region_ids[task.region]}, members {len(task.rows)}")
+                if (not np.isfinite([value.base_center, value.base_log_likelihood,
+                                     value.center, value.log_likelihood]).all()
+                        or not task.lower <= value.base_center <= task.upper
+                        or not task.lower <= value.center <= task.upper
+                        or value.log_likelihood < value.base_log_likelihood):
+                    raise NativeExecutionError("Native center refit returned invalid successful output")
+            for (index, task), value in zip(missing, fitted):
+                base = (value.base_center, value.base_log_likelihood)
+                results[index] = (value.center, value.log_likelihood)
+                retained_initial += int(value.log_likelihood > value.base_log_likelihood)
+                self.telemetry["fused_incumbents"] += int(
+                    np.isfinite(initial[index]) and task.lower <= initial[index] <= task.upper)
                 self.telemetry["scalar_refits"] += 1
-                self._cache_refit(key, members, results[index])
-        return results
+                self._cache_refit(task.key, base)
+        if hits:
+            values = self.backend.conditional_values([(tasks[i].rows, tasks[i].region) for i in hits],
+                                                     initial[hits])
+            for index, value in zip(hits, values):
+                if value > results[index][1]:
+                    results[index] = (float(initial[index]), float(value))
+                    retained_initial += 1
+        return results, retained_initial
 
-    def _cache_refit(self, key, members, fitted):
-        # Membership tuples are part of the bounded cache budget, not only values.
-        size = 256 + 36*len(members)
+    def _cache_refit(self, key, fitted):
+        # Exact observed membership and bound bytes belong to the cache budget.
+        size = _CACHE_ENTRY_BYTES + len(key[4]) + len(key[5])
         if size <= self._cache_bytes:
+            old = self._refits.pop(key, None)
+            if old is not None:
+                self._refit_bytes -= old[1]
             while self._refit_bytes + size > self._cache_bytes:
                 _, (_, removed) = self._refits.popitem(last=False)
                 self._refit_bytes -= removed
@@ -311,13 +429,13 @@ class RegionalModel:
         No division by admissible prior mass: the fixed-center weight problem
         remains the same concave mixture optimization used for all-valid inputs.
         Matrix-call telemetry includes proposal scans and conditional refits;
-        likelihood_columns counts actual evaluations (unique missing centers in
-        a device batch; each uncached CPU evaluation). For successful calls,
+        likelihood_columns counts unique missing centers evaluated in a batch
+        on either CPU or CUDA. For successful calls,
         likelihood_column_requests = likelihood_columns + column_host_cache_hits
         + column_batch_reuses. Host hits reuse pre-call columns, including any
         call-retained copies; batch reuse serves another request from a column
-        evaluated in this call. CPU recomputation after eviction is an evaluation,
-        not reuse. The legacy column_cache_hits also includes hits on newly
+        evaluated in this call, even if the bounded host cache evicts it.
+        The legacy column_cache_hits also includes hits on newly
         cached columns, so it overlaps these disjoint counters; do not add it.
         """
         centers = np.asarray(centers, dtype=float)
@@ -326,20 +444,18 @@ class RegionalModel:
         self.telemetry["likelihood_column_requests"] += len(centers)
         # Compute uncached centers together. Public return values remain NumPy;
         # device consumers can retain workspace.joint_columns_device directly.
-        fresh, retained = {}, {}
+        fresh = {}
         evaluated = set()
-        batched = self.workspace is not None or self.backend.kind == "cuda"
-        if batched:
-            retained = {center.tobytes(): self._columns[self.identity, center.tobytes()]
-                        for center in centers if (self.identity, center.tobytes()) in self._columns}
-            missing = {center.tobytes(): center for center in centers
-                       if center.tobytes() not in retained}
-            if missing:
-                values = np.array(list(missing.values()))
-                matrix = (self.workspace.to_host(self.workspace.joint_columns_device(values))
-                          if self.workspace else self.backend.joint_columns(values))
-                fresh = dict(zip(missing, matrix.T))
-                self.telemetry["likelihood_columns"] += len(missing)
+        retained = {center.tobytes(): self._columns[self.identity, center.tobytes()]
+                    for center in centers if (self.identity, center.tobytes()) in self._columns}
+        missing = {center.tobytes(): center for center in centers
+                   if center.tobytes() not in retained}
+        if missing:
+            values = np.array(list(missing.values()))
+            matrix = (self.workspace.to_host(self.workspace.joint_columns_device(values))
+                      if self.workspace else self.backend.joint_columns(values))
+            fresh = dict(zip(missing, matrix.T))
+            self.telemetry["likelihood_columns"] += len(missing)
         columns = []
         for center in centers:
             key = (self.identity, center.tobytes())
@@ -353,19 +469,15 @@ class RegionalModel:
                 if key in self._columns:
                     self._columns.move_to_end(key)
             else:
-                if batched:
-                    column = readonly_array(fresh[key[1]])
-                    if key[1] in evaluated:
-                        self.telemetry["column_batch_reuses"] += 1
-                else:
-                    column = readonly_array(self.backend.joint_columns([center])[:, 0])
-                    self.telemetry["likelihood_columns"] += 1
+                column = readonly_array(fresh[key[1]])
+                if key[1] in evaluated:
+                    self.telemetry["column_batch_reuses"] += 1
                 evaluated.add(key[1])
-                size = column.nbytes + len(key[1]) + 128
+                size = column.nbytes + len(key[1]) + _CACHE_ENTRY_BYTES
                 if size <= self._cache_bytes:
                     while self._column_bytes + size > self._cache_bytes:
                         removed_key, removed = self._columns.popitem(last=False)
-                        self._column_bytes -= removed.nbytes + len(removed_key[1]) + 128
+                        self._column_bytes -= removed.nbytes + len(removed_key[1]) + _CACHE_ENTRY_BYTES
                     self._columns[key] = column
                     self._column_bytes += size
             columns.append(column)
@@ -387,31 +499,23 @@ class RegionalModel:
         try:
             memberships = [np.flatnonzero(inverse == cluster) for cluster in range(q)]
             tasks = [(members, region) for members in memberships for region in range(self.r)]
-            fitted = self._fit_coordinates(tasks)
-            if initial_centers is not None:
-                initial = initial_centers.ravel()
-                valid = [index for index, (members, region) in enumerate(tasks)
-                         if np.isfinite(initial[index])
-                         and self.lower[members, region].max() <= initial[index]
-                         <= self.upper[members, region].min()]
-                values = self.backend.conditional_values([tasks[index] for index in valid], initial[valid])
-                for index, value in zip(valid, values):
-                    if value > fitted[index][1]:
-                        fitted[index] = (float(initial[index]), float(value))
-                        retained_initial += 1
+            fitted, retained_initial = self._fit_coordinates(
+                tasks, None if initial_centers is None else initial_centers.ravel())
             centers[:] = np.array([center for center, _ in fitted]).reshape(q, self.r)
-        except (ValueError, RuntimeError) as error:
+        except ScientificCandidateRejection as error:
             return RefittedPartition(inverse, centers, np.full(q, np.nan), -np.inf,
-                                     -np.inf, penalty, np.inf, False, str(error))
+                                     -np.inf, penalty, np.inf, False, str(error),
+                                     diagnostics={"rejection_kind": "scientific"})
         matrix = self.log_likelihood_columns(centers)
         conditional = math.fsum(matrix[np.arange(self.n), inverse])
         start = time.perf_counter()
         try:
             mixture = fit_mixture_weights(matrix, np.bincount(inverse),
                                           telemetry=self.telemetry)
-        except (ValueError, RuntimeError) as error:
+        except WeightConvergenceError as error:
             return RefittedPartition(inverse, centers, np.full(q, np.nan), conditional,
-                                     -np.inf, penalty, np.inf, False, f"weight_fit:{error}")
+                                     -np.inf, penalty, np.inf, False, f"weight_fit:{error}",
+                                     diagnostics={"rejection_kind": "weight_convergence"})
         finally:
             self.telemetry["weight_seconds"] += time.perf_counter()-start
         ll = mixture["log_likelihood"]

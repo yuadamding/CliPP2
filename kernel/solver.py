@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .topology import _cut_mask, partition_from_cuts, project_cuts
-from .native import forest_quadratic
+from .native import continue_cpu, forest_quadratic
 
 
 @dataclass(frozen=True)
@@ -156,7 +156,7 @@ def _support_warm_start(model, x, labels, lower, upper):
     return warm, values, gradient, curvature
 
 
-def generate_candidates(model, tree, pilot, capacities, *, policy=None):
+def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=True):
     """Generate one finite-continuation connected partition per requested K.
 
     Numerical stationarity, edge feasibility and component-range feasibility
@@ -187,6 +187,12 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None):
     upper = np.minimum(np.asarray(model.upper, dtype=float), 1 - 1e-8)
     if lower.shape != pilot.shape or upper.shape != pilot.shape or np.any(lower > upper):
         raise ValueError("No nonempty interior box for raw tree continuation")
+    # Custom scientific/test models retain their own node_terms implementation.
+    # CUDA retains the host controller: this optimization is CPU-only.
+    from .model import RegionalModel
+    if (native and type(model) is RegionalModel and model.backend.kind == "cpu"
+            and model.workspace is None and "node_terms" not in vars(model)):
+        return continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing_initializations)
     candidates = []
     for k in requested:
         x = np.clip(pilot, lower, upper)

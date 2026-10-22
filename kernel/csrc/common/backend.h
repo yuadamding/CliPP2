@@ -44,6 +44,8 @@ int CliPP2EvaluateConditionalValues(void*, const clipp2::ConditionalBatch*,
 
 namespace clipp2 {
 // CPU implementation supplied by cpu/refit.cpp. CUDA has its own batch driver.
-void refit_centers(const ObservationSoA&, const RefitBatch&, RefitResult*);
-void conditional_values(const ObservationSoA&, const ConditionalBatch&, double*, std::uint8_t*);
+struct ProbabilityWork;
+void refit_centers(const ObservationSoA&, const RefitBatch&, RefitResult*, std::int64_t, ProbabilityWork&);
+void conditional_values(const ObservationSoA&, const ConditionalBatch&, double*, std::uint8_t*,
+                        std::int64_t, ProbabilityWork&);
 }

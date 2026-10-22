@@ -1,6 +1,5 @@
 """Embed honest source identity in wheels without importing the inference stack."""
 import json
-import hashlib
 import os
 from pathlib import Path
 from runpy import run_path
@@ -66,16 +65,13 @@ root = Path(__file__).resolve().parent
 build_helpers = run_path(str(root / "kernel/build_identity.py"))
 backend_identity = build_helpers["backend_identity"]
 backend_sources = build_helpers["backend_sources"]
-native_sources = ["kernel/csrc/forest.cpp", "kernel/csrc/bindings.cpp"]
-native_inputs = native_sources + ["kernel/csrc/forest.h"]
-native_identity = hashlib.sha256(b"".join(
-    name.encode() + b"\0" + (root / name).read_bytes() for name in native_inputs
-)).hexdigest()
+native_inputs = list(build_helpers["NATIVE_SOURCES"])
 extensions = [Extension(
-    "CliPP2.kernel._native", sources=native_sources,
-    depends=["kernel/csrc/forest.h"], language="c++",
-    define_macros=[("CLIPP2_KERNEL_BUILD_ID", '"' + native_identity + '"')],
-    extra_compile_args=["-O3", "-std=c++17"],
+    "CliPP2.kernel._native", sources=[name for name in native_inputs if name.endswith(".cpp")],
+    depends=native_inputs, language="c++",
+    define_macros=[("CLIPP2_KERNEL_BUILD_ID", '"' + build_helpers["native_identity"]() + '"')],
+    extra_compile_args=["-O3", "-std=c++17", "-fno-fast-math", "-ffp-contract=off", "-pthread"],
+    extra_link_args=["-pthread"],
 )]
 openmp = ["-fopenmp"] if os.environ.get("CLIPP2_OPENMP") == "1" else []
 extensions.append(Extension(

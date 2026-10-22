@@ -1,5 +1,6 @@
 """Source-bound CPU/CUDA emission and batched-refit ABI (host boundary only)."""
 import ctypes as ct
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,26 @@ from .build_identity import backend_identity
 _D = ct.POINTER(ct.c_double)
 _I = ct.POINTER(ct.c_int64)
 _B = ct.POINTER(ct.c_uint8)
+
+
+class NativeExecutionError(RuntimeError):
+    """Backend, resource or arithmetic failure; never a candidate rejection."""
+
+
+class ScientificCandidateRejection(ValueError):
+    """A proposed cluster lacks regional support or a common admissible box."""
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class CoordinateTask:
+    """Exact observed sequence with the enclosing group's all-member box."""
+
+    region: int
+    rows: np.ndarray
+    lower: float
+    upper: float
+    xatol: float
+    key: tuple
 
 
 class _Observations(ct.Structure):
@@ -59,7 +80,7 @@ class NativeBackend:
         kind = "cuda" if model.device.startswith("cuda") else "cpu"
         paths = sorted(Path(__file__).parent.glob(f"_native_{kind}*.so"))
         if len(paths) != 1:
-            raise RuntimeError(f"Build CliPP2's native {kind} library before fitting")
+            raise NativeExecutionError(f"Build CliPP2's native {kind} library before fitting")
         lib = self.lib = ct.CDLL(str(paths[0]))
         signatures = {
             "ABI": ([], ct.c_int), "BuildId": ([], ct.c_char_p),
@@ -86,10 +107,13 @@ class NativeBackend:
         lib.CliPP2EvaluateConditionalValues.restype = ct.c_int
         lib.CliPP2MultiplicityMAP.argtypes = [ct.c_void_p, _D, _D, _B]
         lib.CliPP2MultiplicityMAP.restype = ct.c_int
+        if kind == "cpu" and hasattr(lib, "CliPP2ProbabilityReuseDiagnostics"):
+            lib.CliPP2ProbabilityReuseDiagnostics.argtypes = [ct.c_void_p, _I]
+            lib.CliPP2ProbabilityReuseDiagnostics.restype = ct.c_int
         self.identity = lib.CliPP2BackendBuildId().decode()
         self.policy = lib.CliPP2BackendNumericalPolicy().decode()
         if lib.CliPP2BackendABI() != 1 or self.identity != backend_identity(kind):
-            raise RuntimeError(f"Stale or incompatible native {kind} library; rebuild CliPP2")
+            raise NativeExecutionError(f"Stale or incompatible native {kind} library; rebuild CliPP2")
         if type(workspace_bytes) is not int or not 0 <= workspace_bytes <= np.iinfo(np.int64).max:
             raise ValueError("workspace_bytes must be a nonnegative int64")
         self.kind, self.n, self.r = kind, model.n, model.r
@@ -112,15 +136,24 @@ class NativeBackend:
 
     def _check(self, code, status=None):
         if code:
-            raise RuntimeError(self.lib.CliPP2BackendLastError().decode())
-        if status is not None and np.any(status > 1):
-            raise ValueError("Native likelihood received invalid CCFs or produced invalid arithmetic")
+            raise NativeExecutionError(self.lib.CliPP2BackendLastError().decode())
+        if status is not None:
+            if np.any(status > 2):
+                raise NativeExecutionError("Native likelihood produced invalid arithmetic or an unknown status")
+            if np.any(status == 2):
+                raise ValueError("Native likelihood received invalid CCFs")
 
     def diagnostics(self):
         result = _Diagnostics()
         self._check(self.lib.CliPP2BackendGetDiagnostics(self.context, ct.byref(result)))
-        return {"kind": self.kind, "build_id": self.identity, "numerical_policy": self.policy,
-                **{name: getattr(result, name) for name, _ in result._fields_}}
+        diagnostics = {"kind": self.kind, "build_id": self.identity, "numerical_policy": self.policy,
+                       **{name: getattr(result, name) for name, _ in result._fields_}}
+        if self.kind == "cpu" and hasattr(self.lib, "CliPP2ProbabilityReuseDiagnostics"):
+            counters = np.empty(5, dtype=np.int64)
+            self._check(self.lib.CliPP2ProbabilityReuseDiagnostics(self.context, _ptr(counters)))
+            diagnostics["probability_reuse"] = dict(zip(("plans", "basis_components", "shape_evaluations",
+                "ordered_row_references", "peak_optional_plan_reservation"), map(int, counters)))
+        return diagnostics
 
     def _tile_count(self, count, per_cell, fixed=16):
         """Bound native temporary storage; requested host results are separate."""
@@ -128,7 +161,7 @@ class NativeBackend:
             return count
         size = min(count, (self.workspace_bytes - fixed) // per_cell)
         if size < 1:
-            raise ValueError("CUDA workspace cannot hold one observation and its result")
+            raise NativeExecutionError("CUDA workspace cannot hold one observation and its result")
         return size
 
     def _rows(self, region, rows):
@@ -192,7 +225,7 @@ class NativeBackend:
             row_step = self._tile_count(len(rows), 17, fixed=40)
             grid_step = min(len(grid), (self.workspace_bytes - 8*row_step - 32) // (9*row_step+8))
             if grid_step < 1:
-                raise ValueError("CUDA workspace cannot hold one regional grid point")
+                raise NativeExecutionError("CUDA workspace cannot hold one regional grid point")
         for row_first in range(0, len(rows), row_step):
             selected_rows = rows[row_first:row_first+row_step]
             for grid_first in range(0, len(grid), grid_step):
@@ -226,26 +259,23 @@ class NativeBackend:
             raise ValueError("Multiplicity posterior is undefined at zero likelihood")
         return np.ascontiguousarray(result.T)
 
-    def refit(self, model, tasks):
-        """Batch (members, region) tasks; bounds include every missing member."""
+    def refit(self, model, tasks, incumbents=None):
+        """Batch exact prepared tasks, retaining base fits separately from incumbents."""
         if not tasks:
             return []
+        tasks = [task if isinstance(task, CoordinateTask) else model._coordinate_task(*task)
+                 for task in tasks]
+        incumbents = (np.full(len(tasks), np.nan) if incumbents is None else _array(incumbents))
+        if incumbents.shape != (len(tasks),):
+            raise ValueError("Refitting needs one incumbent per coordinate task")
         regions, members, grids, lowers, uppers, tolerances = [], [], [], [], [], []
-        for rows, region in tasks:
-            lower, upper = model.lower[rows, region].max(), model.upper[rows, region].min()
-            observed = rows[model.observed[rows, region]]
-            if not len(observed):
-                raise ValueError(f"unsupported_cluster_region:{model.region_ids[region]}")
-            if lower > upper:
-                raise ValueError(f"empty_cluster_region_box:{model.region_ids[region]}")
-            view = model.view(region, observed)
-            regions.append(region)
-            members.append(rows)
-            grids.append(np.unique(np.r_[np.linspace(lower, upper, 513),
-                                          np.clip(view.component_modes(), lower, upper)]))
-            lowers.append(lower)
-            uppers.append(upper)
-            tolerances.append(1e-12/view.purity if view.standard and lower == 0 and upper == 1 else 1e-12)
+        for task in tasks:
+            regions.append(task.region)
+            members.append(task.rows)
+            grids.append(model._coordinate_grid(task))
+            lowers.append(task.lower)
+            uppers.append(task.upper)
+            tolerances.append(task.xatol)
         costs = ([8*(len(rows)+len(grid)+1) for rows, grid in zip(members, grids)]
                  if self.kind == "cpu" else
                  [112+24*len(rows)+16*len(grid) for rows, grid in zip(members, grids)])
@@ -257,7 +287,7 @@ class NativeBackend:
                       _array(np.concatenate(members[selected]), np.int64),
                       _array(np.r_[0, np.cumsum([len(x) for x in grids[selected]])], np.int64),
                       _array(np.concatenate(grids[selected])), _array(lowers[selected]), _array(uppers[selected]),
-                      _array(tolerances[selected]), np.full(count, np.nan)]
+                      _array(tolerances[selected]), _array(incumbents[selected])]
             batch = _RefitBatch(count, len(fields[2]), len(fields[4]), *map(_ptr, fields))
             fitted = (_RefitResult * count)()
             self._check(self.lib.CliPP2RefitCentersBatch(self.context, ct.byref(batch), fitted))
@@ -269,7 +299,9 @@ class NativeBackend:
         first, used = 0, fixed
         for index, cost in enumerate(costs):
             if cost + fixed > self.workspace_bytes:
-                raise RuntimeError("Native conditional task exceeds workspace budget")
+                raise NativeExecutionError(
+                    f"Native conditional task {index} requires {cost + fixed} workspace bytes; "
+                    f"budget is {self.workspace_bytes}. Increase workspace_bytes.")
             if used + cost > self.workspace_bytes:
                 yield slice(first, index)
                 first, used = index, fixed

@@ -2,6 +2,7 @@
 #include "../common/emission_math.h"
 #include "../common/validation.h"
 #include "../common/refit_validation.h"
+#include "probability_plan.h"
 #include <algorithm>
 #include <cstdio>
 #include <exception>
@@ -36,6 +37,7 @@ struct Context {
     std::vector<std::uint8_t> flags;
     clipp2::ObservationSoA view{};
     CliPP2BackendDiagnostics diagnostics{};
+    clipp2::ProbabilityWork probability_work{};
 
     Context(const clipp2::ObservationSoA& input, std::int64_t budget) {
         const auto cells = clipp2::validate_observations(input, budget);
@@ -59,6 +61,11 @@ void record_evaluations(Context& ctx, std::int64_t count) {
             <= std::numeric_limits<std::int64_t>::max() - count,
             "Cell evaluation counter overflow");
     ctx.diagnostics.cell_evaluations += count;
+}
+void record_probability_work(Context& ctx, const clipp2::ProbabilityWork& work) {
+    ctx.probability_work.plans += work.plans;
+    ctx.probability_work.add(work.components, work.shapes, work.rows, 1);
+    ctx.probability_work.reserved = std::max(ctx.probability_work.reserved, work.reserved);
 }
 void validate_outputs(std::int64_t count, const double* phi, int mode,
                       double* loss, double* gradient, double* curvature, std::uint8_t* status) {
@@ -103,6 +110,23 @@ extern "C" int CliPP2BackendCreate(const clipp2::ObservationSoA* input, std::int
 extern "C" void CliPP2BackendDestroy(void* ctx) { delete static_cast<Context*>(ctx); }
 extern "C" int CliPP2BackendGetDiagnostics(void* value, CliPP2BackendDiagnostics* output) {
     return guarded([&] { require(output, "Null diagnostics output"); *output = context(value).diagnostics; });
+}
+// Borrowed immutable view, valid only while this CPU context remains alive.
+// Continuation owns its mutable states but need not copy the prepared 57NR bytes.
+extern "C" int CliPP2BackendObservationView(void* value, clipp2::ObservationSoA* output) {
+    return guarded([&] {
+        require(output, "Null observation view output");
+        *output = context(value).view;
+    });
+}
+// Optional CPU telemetry; the shared backend ABI and numerical policy are unchanged.
+extern "C" int CliPP2ProbabilityReuseDiagnostics(void* value, std::int64_t* output) {
+    return guarded([&] {
+        require(output, "Null probability diagnostics output");
+        const auto& work = context(value).probability_work;
+        output[0] = work.plans; output[1] = work.components; output[2] = work.shapes;
+        output[3] = work.rows; output[4] = work.reserved;
+    });
 }
 extern "C" int CliPP2EvaluateNodes(void* value, std::int64_t batches, const double* phi,
                                     int mode, double* loss, double* gradient,
@@ -160,14 +184,26 @@ extern "C" int CliPP2EvaluateRegionalGrid(void* value, std::int64_t region,
         require(!count || (grid && output && status), "Null grid argument");
         for (std::int64_t row = 0; row < row_count; ++row)
             require(rows[row] >= 0 && rows[row] < ctx.view.mutations, "Grid row index out of range");
-        CLIPP_PARALLEL_FOR
-        for (std::int64_t point = 0; point < grid_count; ++point)
+        clipp2::ProbabilityTasks plans(ctx.view, region, 1, rows, row_count, grid_count,
+                                      ctx.diagnostics.workspace_limit);
+        const auto workers = plans.workers;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(workers)
+#else
+        (void)workers;
+#endif
+        for (std::int64_t point = 0; point < grid_count; ++point) {
+            const auto worker = clipp2::ProbabilityTasks::worker();
+            const bool planned = plans.evaluate(worker, 0, grid[point]);
             for (std::int64_t row = 0; row < row_count; ++row) {
-                const auto terms = clipp2::evaluate_observation<EmitMode::LossOnly>(
+                const auto terms = planned ? plans.term(worker, 0, row) : clipp2::evaluate_observation<EmitMode::LossOnly>(
                     clipp2::observation(ctx.view, region * ctx.view.mutations + rows[row]), grid[point]);
                 output[point * row_count + row] = -terms.loss;
                 status[point * row_count + row] = static_cast<std::uint8_t>(terms.status);
             }
+        }
+        const auto work = plans.work(); record_probability_work(ctx, work);
+        ctx.diagnostics.workspace_bytes = std::max(ctx.diagnostics.workspace_bytes, work.reserved);
         ++ctx.diagnostics.calls; ctx.diagnostics.cell_evaluations += count;
     });
 }
@@ -178,8 +214,20 @@ extern "C" int CliPP2EvaluateJointColumns(void* value, std::int64_t count,
         auto& ctx = context(value);
         const auto cells = product(count, ctx.view.mutations); product(count, ctx.view.regions);
         require(!cells || (centers && output && status), "Null joint column argument");
-        CLIPP_PARALLEL_FOR
+        clipp2::ProbabilityTasks plans(ctx.view, 0, ctx.view.regions, nullptr, ctx.view.mutations,
+                                      count, ctx.diagnostics.workspace_limit);
+        const auto workers = plans.workers;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) num_threads(workers)
+#else
+        (void)workers;
+#endif
         for (std::int64_t cluster = 0; cluster < count; ++cluster) {
+            const auto worker = clipp2::ProbabilityTasks::worker();
+            // Evaluate each regional plan once, then keep the original row and
+            // region traversal, bound checks and ordered joint additions.
+            for (std::int64_t region = 0; region < ctx.view.regions; ++region)
+                plans.evaluate(worker, region, centers[cluster * ctx.view.regions + region]);
             for (std::int64_t row = 0; row < ctx.view.mutations; ++row) {
                 double ll = 0;
                 auto state = clipp2::EmitStatus::Ok;
@@ -194,8 +242,8 @@ extern "C" int CliPP2EvaluateJointColumns(void* value, std::int64_t count,
                         state = clipp2::EmitStatus::ZeroLikelihood;
                         ll = -std::numeric_limits<double>::infinity(); break;
                     }
-                    const auto terms = clipp2::evaluate_observation<EmitMode::LossOnly>(
-                        clipp2::observation(ctx.view, cell), phi);
+                    const auto terms = plans.available(worker, region) ? plans.term(worker, region, row) :
+                        clipp2::evaluate_observation<EmitMode::LossOnly>(clipp2::observation(ctx.view, cell), phi);
                     ll -= terms.loss;
                     state = static_cast<clipp2::EmitStatus>(std::max(static_cast<int>(state), static_cast<int>(terms.status)));
                 }
@@ -203,6 +251,8 @@ extern "C" int CliPP2EvaluateJointColumns(void* value, std::int64_t count,
                 status[cluster * ctx.view.mutations + row] = static_cast<std::uint8_t>(state);
             }
         }
+        const auto work = plans.work(); record_probability_work(ctx, work);
+        ctx.diagnostics.workspace_bytes = std::max(ctx.diagnostics.workspace_bytes, work.reserved);
         ++ctx.diagnostics.calls; ctx.diagnostics.cell_evaluations += product(cells, ctx.view.regions);
     });
 }
@@ -217,7 +267,10 @@ extern "C" int CliPP2RefitCentersBatch(void* value, const clipp2::RefitBatch* ta
             static_cast<std::uint64_t>(product(tasks->tasks, 8)) + 8;
         require(scratch <= static_cast<std::uint64_t>(ctx.diagnostics.workspace_limit),
                 "Conditional-refit scratch exceeds workspace budget");
-        clipp2::refit_centers(ctx.view, *tasks, output);
+        clipp2::ProbabilityWork probability_work;
+        clipp2::refit_centers(ctx.view, *tasks, output,
+                            ctx.diagnostics.workspace_limit - scratch, probability_work);
+        record_probability_work(ctx, probability_work);
         for (std::int64_t task = 0; task < tasks->tasks; ++task) {
             std::int64_t observed = 0;
             const auto region = tasks->regions[task];
@@ -229,7 +282,7 @@ extern "C" int CliPP2RefitCentersBatch(void* value, const clipp2::RefitBatch* ta
             record_evaluations(ctx, product(observed, output[task].evaluations));
         }
         ctx.diagnostics.workspace_bytes = std::max(ctx.diagnostics.workspace_bytes,
-                                                   static_cast<std::int64_t>(scratch));
+                                                   static_cast<std::int64_t>(scratch) + probability_work.reserved);
         ++ctx.diagnostics.calls;
     });
 }
@@ -243,7 +296,10 @@ extern "C" int CliPP2EvaluateConditionalValues(void* value, const clipp2::Condit
             static_cast<std::uint64_t>(product(tasks->tasks, 8)) + 8;
         require(scratch <= static_cast<std::uint64_t>(ctx.diagnostics.workspace_limit),
                 "Conditional-value scratch exceeds workspace budget");
-        clipp2::conditional_values(ctx.view, *tasks, output, status);
+        clipp2::ProbabilityWork probability_work;
+        clipp2::conditional_values(ctx.view, *tasks, output, status,
+                                 ctx.diagnostics.workspace_limit - scratch, probability_work);
+        record_probability_work(ctx, probability_work);
         for (std::int64_t task = 0; task < tasks->tasks; ++task) {
             const double center = tasks->centers[task];
             bool evaluated = std::isfinite(center) && center >= 0 && center <= 1;
@@ -256,7 +312,7 @@ extern "C" int CliPP2EvaluateConditionalValues(void* value, const clipp2::Condit
             if (evaluated) record_evaluations(ctx, observed);
         }
         ctx.diagnostics.workspace_bytes = std::max(ctx.diagnostics.workspace_bytes,
-                                                   static_cast<std::int64_t>(scratch));
+                                                   static_cast<std::int64_t>(scratch) + probability_work.reserved);
         ++ctx.diagnostics.calls;
     });
 }

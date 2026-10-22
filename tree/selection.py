@@ -323,6 +323,8 @@ def fit_regions(model, max_clusters=10, capacities=None):
         # budget even when that lower q was not separately requested. When
         # capacities are the default 1..K, ordinary enumeration covers every
         # reduction and this adds no fits or changes their order.
+        if all(q in capacities for q in range(1, len(cuts) + 1)):
+            return
         for reduced in cut_subsets(cuts):
             if reduced == cuts or len(reduced) + 1 in capacities:
                 continue

@@ -2,6 +2,7 @@
 #pragma once
 
 namespace clipp2kernel {
+void reset_forest_workspace();
 void solve_forest(int count, int regions, int edge_count, const int* edges,
     const double* curvature, const double* rhs, double penalty,
     const double* lower, const double* upper, double* output, int* diagnostics);

@@ -33,9 +33,9 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--grid-cache-mb", type=int, default=64,
                      help="Host initialization-grid cache budget in MiB; 0 streams without caching.")
     fit.add_argument("--device-cache-mb", type=int, default=256,
-                     help="Reusable CUDA likelihood cache budget in MiB; 0 disables caching.")
+                     help="Compatibility option; the native backend does not retain a device cache.")
     fit.add_argument("--workspace-mb", type=int, default=64,
-                     help="Estimated CUDA emission-tile workspace budget in MiB (positive; not total VRAM).")
+                     help="Native CPU/CUDA scratch budget in MiB (positive; not total memory).")
     fit.add_argument("--version", action="version", version=__version__)
     return parser
 
