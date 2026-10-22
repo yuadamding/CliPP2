@@ -30,7 +30,7 @@ clipp2 fit --input-file tumor.tsv --device cpu --outdir ../clipp2-cpu
 clipp2 fit --input-file tumor.tsv --device cuda --outdir ../clipp2-gpu
 ```
 
-Use a new output directory for each run. `--max-clusters` defaults to **10**; larger values can greatly increase the exhaustive search.
+Use a new output directory for each run. `--max-clusters` defaults to **20**; larger values can greatly increase the exhaustive search.
 
 ## Input
 
@@ -49,7 +49,7 @@ Include every mutation–region pair; use `count_observed=0` and `.` for missing
 counts. For multiple CN states, repeat the same read counts across state rows;
 state fractions must sum to 1. Purity must be constant within each region.
 
-`--max-major-cn` defaults to **4**. A mutation is excluded from all regions if
+`--max-major-cn` defaults to **10**. A mutation is excluded from all regions if
 any of its CN states exceeds this major-copy-number limit.
 
 ## Output

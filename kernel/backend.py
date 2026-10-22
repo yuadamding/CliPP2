@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from .build_identity import backend_identity
+from .execution import resolve_cpu_threads, resolve_memory_budget
 
 
 _D = ct.POINTER(ct.c_double)
@@ -64,6 +65,20 @@ class _ConditionalBatch(ct.Structure):
     ] + [("centers", _D)]
 
 
+class _ResidentRequest(ct.Structure):
+    _fields_ = [("plan", ct.c_uint64), ("incumbents", _D)]
+
+
+@dataclass(frozen=True, slots=True)
+class ResidentHandle:
+    """Backend-scoped generation handle; no borrowed caller array survives preparation."""
+
+    owner: object
+    value: int
+    kind: str
+    count: int
+
+
 def _ptr(array):
     return array.ctypes.data_as({np.dtype("float64"): _D, np.dtype("int64"): _I,
                                 np.dtype("uint8"): _B}[array.dtype])
@@ -76,7 +91,8 @@ def _array(value, dtype=np.float64):
 class NativeBackend:
     """Owns prepared SoA fields; never silently substitutes a CPU backend."""
 
-    def __init__(self, model, workspace_bytes):
+    def __init__(self, model, workspace_bytes, *, native_host_memory_bytes=None,
+                 device_memory_bytes=None, cpu_threads=None):
         kind = "cuda" if model.device.startswith("cuda") else "cpu"
         paths = sorted(Path(__file__).parent.glob(f"_native_{kind}*.so"))
         if len(paths) != 1:
@@ -118,6 +134,25 @@ class NativeBackend:
             raise ValueError("workspace_bytes must be a nonnegative int64")
         self.kind, self.n, self.r = kind, model.n, model.r
         self.workspace_bytes = workspace_bytes
+        self.cpu_threads = resolve_cpu_threads(cpu_threads)
+        self.native_host_memory_bytes = resolve_memory_budget(native_host_memory_bytes)
+        self.device_memory_bytes = device_memory_bytes
+        required = model.n * model.r * 57
+        if kind == "cpu" and required > self.native_host_memory_bytes:
+            raise NativeExecutionError(f"Prepared observations require {required} native host bytes; "
+                                       f"budget is {self.native_host_memory_bytes}")
+        if kind == "cuda":
+            lib.CliPP2DeviceMemoryInfo.argtypes = [ct.c_int, _I, _I]
+            lib.CliPP2DeviceMemoryInfo.restype = ct.c_int
+            free, total = ct.c_int64(), ct.c_int64()
+            device_index = int(model.device.split(":", 1)[1]) if ":" in model.device else 0
+            self._check(lib.CliPP2DeviceMemoryInfo(device_index, ct.byref(free), ct.byref(total)))
+            self.device_memory_bytes = resolve_memory_budget(device_memory_bytes, free=free.value, device=True)
+            if required > self.device_memory_bytes:
+                raise NativeExecutionError(f"Prepared observations require {required} device bytes; "
+                                           f"budget is {self.device_memory_bytes}")
+            workspace_bytes = min(workspace_bytes, self.device_memory_bytes - required)
+            self.workspace_bytes = workspace_bytes
         fields = [_array(value.T) for value in (
             model.alt, model.depth-model.alt, model.scaling, model.constants, model.lower, model.upper)]
         fields += [_array(model.support.T, np.int64),
@@ -127,8 +162,74 @@ class NativeBackend:
         device_index = (int(model.device.split(":", 1)[1]) if ":" in model.device else 0) if kind == "cuda" else -1
         self._check(lib.CliPP2BackendCreate(ct.byref(observations), workspace_bytes,
                                           device_index, ct.byref(self.context)))
+        if kind == "cpu":
+            lib.CliPP2ConfigureCPUExecution.argtypes = [ct.c_void_p, ct.c_int64, ct.c_int]
+            self._check(lib.CliPP2ConfigureCPUExecution(
+                self.context, self.native_host_memory_bytes, self.cpu_threads))
+            configured = _Diagnostics()
+            self._check(lib.CliPP2BackendGetDiagnostics(self.context, ct.byref(configured)))
+            self.workspace_bytes = configured.workspace_limit
+            lib.CliPP2ProbabilityCacheDiagnostics.argtypes = [ct.c_void_p, _I]
+            lib.CliPP2ProbabilityCacheDiagnostics.restype = ct.c_int
+            lib.CliPP2ReleaseProbabilityCache.argtypes = [ct.c_void_p]
+            lib.CliPP2ReleaseProbabilityCache.restype = ct.c_int
+        else:
+            self.host_staging_bytes_limit = min(self.native_host_memory_bytes, self.workspace_bytes)
+            lib.CliPP2ConfigureCUDAExecution.argtypes = [ct.c_void_p, ct.c_int64]
+            lib.CliPP2ConfigureCUDAExecution.restype = ct.c_int
+            self._check(lib.CliPP2ConfigureCUDAExecution(self.context, self.host_staging_bytes_limit))
+        self._initialize_resident()
+
+    def _initialize_resident(self):
+        signatures = {
+            "ResidentABI": ([], ct.c_int), "ResidentLastError": ([], ct.c_char_p),
+            "ResidentCreate": ([ct.c_void_p, ct.c_int64, ct.c_int64, ct.c_int64, ct.POINTER(ct.c_void_p)], ct.c_int),
+            "ResidentDestroy": ([ct.c_void_p], None),
+            "ResidentBytes": ([ct.c_void_p, _I], ct.c_int),
+            "PrepareCoordinates": ([ct.c_void_p, ct.POINTER(_RefitBatch), ct.POINTER(ct.c_uint64)], ct.c_int),
+            "SubmitRefits": ([ct.c_void_p, ct.POINTER(_ResidentRequest), ct.c_int64, ct.POINTER(ct.c_uint64)], ct.c_int),
+            "CollectRefits": ([ct.c_void_p, ct.c_uint64, ct.c_int64, ct.POINTER(_RefitResult)], ct.c_int),
+            "ReleaseHandle": ([ct.c_void_p, ct.c_uint64], ct.c_int),
+            "CreateJointColumns": ([ct.c_void_p, ct.c_int64, _D, ct.POINTER(ct.c_uint64)], ct.c_int),
+            "CollectJointColumns": ([ct.c_void_p, ct.c_uint64, ct.c_int64, _D, _B], ct.c_int),
+        }
+        for name, (args, result) in signatures.items():
+            function = getattr(self.lib, "CliPP2" + name)
+            function.argtypes, function.restype = args, result
+        if self.lib.CliPP2ResidentABI() != 1:
+            raise NativeExecutionError("Incompatible resident ABI")
+        # Reserve the existing backend's maximum scratch/cache allowance before
+        # admitting retained objects. Host result arrays remain caller-owned.
+        reserved = (self.n*self.r*57 + self.workspace_bytes*3//2 if self.kind == "cpu"
+                    else self.host_staging_bytes_limit)
+        self.resident = ct.c_void_p()
+        self._resident_check(self.lib.CliPP2ResidentCreate(
+            self.context, self.n, self.r, max(0, self.native_host_memory_bytes-reserved), ct.byref(self.resident)))
+
+    def _resident_check(self, code):
+        if code:
+            raise NativeExecutionError(self.lib.CliPP2ResidentLastError().decode())
+
+    @property
+    def native_host_bytes(self):
+        result = _Diagnostics()
+        self._check(self.lib.CliPP2BackendGetDiagnostics(self.context, ct.byref(result)))
+        retained = ct.c_int64()
+        if getattr(self, "resident", None):
+            self._resident_check(self.lib.CliPP2ResidentBytes(self.resident, ct.byref(retained)))
+        return retained.value + (result.prepared_bytes + result.cache_bytes if self.kind == "cpu" else 0)
+
+    def release_optional_cache(self):
+        """Give mandatory continuation state priority over rebuildable read plans."""
+        if self.kind == "cpu":
+            self._check(self.lib.CliPP2ReleaseProbabilityCache(self.context))
+        return self.native_host_bytes
 
     def __del__(self):
+        resident = getattr(self, "resident", None)
+        if resident:
+            self.lib.CliPP2ResidentDestroy(resident)
+            self.resident = None
         context = getattr(self, "context", None)
         if context:
             self.lib.CliPP2BackendDestroy(context)
@@ -153,6 +254,15 @@ class NativeBackend:
             self._check(self.lib.CliPP2ProbabilityReuseDiagnostics(self.context, _ptr(counters)))
             diagnostics["probability_reuse"] = dict(zip(("plans", "basis_components", "shape_evaluations",
                 "ordered_row_references", "peak_optional_plan_reservation"), map(int, counters)))
+            cache = np.empty(4, dtype=np.int64)
+            self._check(self.lib.CliPP2ProbabilityCacheDiagnostics(self.context, _ptr(cache)))
+            diagnostics["probability_cache"] = dict(zip(("hits", "misses", "bytes", "model_identity_bytes"), map(int, cache)))
+        diagnostics.update(native_host_memory_bytes=self.native_host_memory_bytes,
+                           device_memory_bytes=self.device_memory_bytes,
+                           cpu_threads=self.cpu_threads, native_host_bytes=self.native_host_bytes,
+                           resident_api=1, resident_scheduler="synchronous_host_results")
+        if self.kind == "cuda":
+            diagnostics["host_staging_bytes_limit"] = self.host_staging_bytes_limit
         return diagnostics
 
     def _tile_count(self, count, per_cell, fixed=16):
@@ -259,6 +369,71 @@ class NativeBackend:
             raise ValueError("Multiplicity posterior is undefined at zero likelihood")
         return np.ascontiguousarray(result.T)
 
+    def _handle(self, handle, kind):
+        if not isinstance(handle, ResidentHandle) or handle.owner is not self or handle.kind != kind:
+            raise ValueError("Resident handle has the wrong owner or type")
+        return handle.value
+
+    def release(self, handle):
+        """Release caller ownership. Jobs keep their plans alive until released."""
+        if not isinstance(handle, ResidentHandle) or handle.owner is not self:
+            raise ValueError("Resident handle belongs to another backend")
+        self._resident_check(self.lib.CliPP2ReleaseHandle(self.resident, handle.value))
+
+    def prepare_coordinates(self, model, tasks):
+        """Copy ordered reads, all-member bounds and exact grids into a native plan."""
+        tasks = tuple(task if isinstance(task, CoordinateTask) else model._coordinate_task(*task)
+                      for task in tasks)
+        if not tasks:
+            raise ValueError("Resident preparation needs at least one coordinate")
+        grids = [model._coordinate_grid(task) for task in tasks]
+        fields = [_array([task.region for task in tasks], np.int64),
+                  _array(np.r_[0, np.cumsum([len(task.rows) for task in tasks])], np.int64),
+                  _array(np.concatenate([task.rows for task in tasks]), np.int64),
+                  _array(np.r_[0, np.cumsum([len(grid) for grid in grids])], np.int64),
+                  _array(np.concatenate(grids)), _array([task.lower for task in tasks]),
+                  _array([task.upper for task in tasks]), _array([task.xatol for task in tasks])]
+        batch = _RefitBatch(len(tasks), len(fields[2]), len(fields[4]), *map(_ptr, fields), None)
+        handle = ct.c_uint64()
+        self._resident_check(self.lib.CliPP2PrepareCoordinates(self.resident, ct.byref(batch), ct.byref(handle)))
+        return ResidentHandle(self, handle.value, "plan", len(tasks))
+
+    def submit_refits(self, plan, incumbents=None):
+        """Execute in order; v1 completes native/CUDA work before returning."""
+        value = self._handle(plan, "plan")
+        values = np.full(plan.count, np.nan) if incumbents is None else _array(incumbents)
+        if values.shape != (plan.count,):
+            raise ValueError("Refitting needs one incumbent per coordinate task")
+        request = _ResidentRequest(value, _ptr(values))
+        job = ct.c_uint64()
+        self._resident_check(self.lib.CliPP2SubmitRefits(self.resident, ct.byref(request), 1, ct.byref(job)))
+        return ResidentHandle(self, job.value, "job", plan.count)
+
+    def collect_refits(self, job):
+        value = self._handle(job, "job")
+        output = (_RefitResult * job.count)()
+        self._resident_check(self.lib.CliPP2CollectRefits(self.resident, value, job.count, output))
+        return list(output)
+
+    def create_joint_columns(self, centers):
+        """Retain checked host columns. Device-resident scoring is a later revision."""
+        centers = _array(centers)
+        if centers.ndim != 2 or centers.shape[1] != self.r or not len(centers):
+            raise ValueError("Centers must match nonempty clusters by regions")
+        handle = ct.c_uint64()
+        self._resident_check(self.lib.CliPP2CreateJointColumns(
+            self.resident, len(centers), _ptr(centers), ct.byref(handle)))
+        return ResidentHandle(self, handle.value, "columns", len(centers))
+
+    def collect_columns(self, columns):
+        value = self._handle(columns, "columns")
+        output = np.empty((columns.count, self.n))
+        status = np.empty(output.shape, dtype=np.uint8)
+        self._resident_check(self.lib.CliPP2CollectJointColumns(
+            self.resident, value, output.size, _ptr(output), _ptr(status)))
+        self._check(0, status)
+        return output.T
+
     def refit(self, model, tasks, incumbents=None):
         """Batch exact prepared tasks, retaining base fits separately from incumbents."""
         if not tasks:
@@ -296,13 +471,17 @@ class NativeBackend:
 
     def _task_slices(self, costs, fixed):
         """Tile whole independent tasks; never alter their reductions or grids."""
+        task_limit = self.host_staging_bytes_limit // 8 if self.kind == "cuda" else len(costs)
+        if costs and task_limit < 1:
+            raise NativeExecutionError("CUDA conditional execution requires 8 native host staging bytes per task; "
+                                       f"budget is {self.host_staging_bytes_limit}")
         first, used = 0, fixed
         for index, cost in enumerate(costs):
             if cost + fixed > self.workspace_bytes:
                 raise NativeExecutionError(
                     f"Native conditional task {index} requires {cost + fixed} workspace bytes; "
                     f"budget is {self.workspace_bytes}. Increase workspace_bytes.")
-            if used + cost > self.workspace_bytes:
+            if used + cost > self.workspace_bytes or index-first >= task_limit:
                 yield slice(first, index)
                 first, used = index, fixed
             used += cost

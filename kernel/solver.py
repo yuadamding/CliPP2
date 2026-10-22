@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .topology import _cut_mask, partition_from_cuts, project_cuts
-from .native import continue_cpu, forest_quadratic
+from .native import continue_cpu, forest_quadratic, PreparedForest
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,8 @@ def _spring_gradient(x, edges, penalty):
     return result
 
 
-def boxed_forest_quadratic(curvature, rhs, edges, penalty, lower, upper):
+def boxed_forest_quadratic(curvature, rhs, edges, penalty, lower, upper, *, native_host_memory_bytes=None,
+                           prepared=None):
     """Solve positive diagonal plus forest Laplacian box QPs by active sets.
 
     Return (X, diagnostics). ``solved`` requires an independently reconstructed
@@ -76,7 +77,9 @@ def boxed_forest_quadratic(curvature, rhs, edges, penalty, lower, upper):
         if a == c:
             raise ValueError("Quadratic graph must be a forest")
         roots[c] = a
-    result, sweeps, budget_hits = forest_quadratic(h, b, edges, penalty, lo, hi)
+    result, sweeps, budget_hits = forest_quadratic(h, b, edges, penalty, lo, hi,
+                                                native_host_memory_bytes=native_host_memory_bytes,
+                                                prepared=prepared)
     extended = result.astype(np.longdouble)
     gradient = h.astype(np.longdouble) * extended - b
     scale = 1 + np.abs(h.astype(np.longdouble) * extended) + np.abs(b)
@@ -156,7 +159,7 @@ def _support_warm_start(model, x, labels, lower, upper):
     return warm, values, gradient, curvature
 
 
-def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=True):
+def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=True, keep_raw_phi=True):
     """Generate one finite-continuation connected partition per requested K.
 
     Numerical stationarity, edge feasibility and component-range feasibility
@@ -164,6 +167,8 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
     when tolerances are unmet; final scalar refits/selection determine its use.
     """
     policy = ContinuationPolicy() if policy is None else policy
+    if type(keep_raw_phi) is not bool:
+        raise TypeError("keep_raw_phi must be a boolean")
     pilot = np.asarray(pilot, dtype=float).copy()
     if tree.n != model.n or pilot.shape != (model.n, model.r):
         raise ValueError("Tree, model and pilot dimensions must agree")
@@ -181,8 +186,11 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
     requested = list(capacities)
     if not requested or len(set(requested)) != len(requested):
         raise ValueError("Distinct nonempty capacities are required")
+    if not np.isfinite(pilot).all():
+        raise ValueError("Projection requires finite N by R CCF vectors")
     for k in requested:
-        project_cuts(tree, pilot, k)
+        if isinstance(k, bool) or not isinstance(k, (int, np.integer)) or not 1 <= k <= tree.n:
+            raise ValueError("Capacity must be an integer in 1..N")
     lower = np.maximum(np.asarray(model.lower, dtype=float), 1e-8)
     upper = np.minimum(np.asarray(model.upper, dtype=float), 1 - 1e-8)
     if lower.shape != pilot.shape or upper.shape != pilot.shape or np.any(lower > upper):
@@ -192,8 +200,19 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
     from .model import RegionalModel
     if (native and type(model) is RegionalModel and model.backend.kind == "cpu"
             and model.workspace is None and "node_terms" not in vars(model)):
-        return continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing_initializations)
+        return continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing_initializations,
+                            keep_raw_phi=keep_raw_phi)
+    with PreparedForest(model.n, model.r) as prepared:
+        return _generate_host_candidates(model, tree, pilot, requested, lower, upper, policy,
+                                         missing_initializations, keep_raw_phi, prepared)
+
+
+def _generate_host_candidates(model, tree, pilot, requested, lower, upper, policy,
+                              missing_initializations, keep_raw_phi, prepared):
     candidates = []
+    if keep_raw_phi:
+        from .execution import preflight_host_export
+        preflight_host_export(len(requested)*model.n*model.r*8)
     for k in requested:
         x = np.clip(pilot, lower, upper)
         values, gradient, curvature = model.node_terms(x)
@@ -217,7 +236,16 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
                 if stationarity <= policy.stationarity_tolerance:
                     break
                 h = np.maximum(curvature, 1e-8)
-                qp, audit = boxed_forest_quadratic(h, h * x - gradient, forest, rho, lower, upper)
+                backend = getattr(model, "backend", None)
+                native_budget = None if backend is None else backend.native_host_memory_bytes-backend.native_host_bytes
+                if native_budget is not None and native_budget < prepared.required(model.n, len(forest)):
+                    backend.release_optional_cache()
+                    native_budget = backend.native_host_memory_bytes-backend.native_host_bytes
+                if native_budget is not None and native_budget <= 0:
+                    from .backend import NativeExecutionError
+                    raise NativeExecutionError("No remaining native host bytes for the forest solve")
+                qp, audit = boxed_forest_quadratic(h, h * x - gradient, forest, rho, lower, upper,
+                                                 native_host_memory_bytes=native_budget, prepared=prepared)
                 qp_unqualified += not audit["solved"]
                 degree = np.bincount(forest.ravel(), minlength=tree.n)[:, None]
                 old_objective = float(np.sum(values) + 0.5 * rho * np.sum(jumps * jumps))
@@ -279,7 +307,8 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
                   "penalty_numerical_limit_candidate" if numerical_limit else
                   "line_search_stalled_candidate" if stalled else "finite_budget_candidate")
         candidates.append({
-            "labels": labels, "cuts": cuts, "requested_k": int(k), "raw_phi": x.copy(),
+            "labels": labels, "cuts": cuts, "requested_k": int(k),
+            **({"raw_phi": x.copy()} if keep_raw_phi else {}),
             "diagnostics": {
                 "status": status, "backend": "host_forest", "tree_identity": tree.identity,
                 "missing_raw_coordinates_initialized": missing_initializations,

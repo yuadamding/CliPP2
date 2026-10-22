@@ -1,6 +1,7 @@
 """Shared registry of compact memberships, refit attempts and immutable states."""
 
 from dataclasses import dataclass, field
+from collections import OrderedDict
 from time import perf_counter
 from types import MappingProxyType
 
@@ -8,7 +9,7 @@ import numpy as np
 
 from ..io.data import readonly_array
 from ..tree.refinement import canonical_partition
-from .topology import FrozenTree, partition_from_cuts
+from .topology import FrozenTree, PreparedPartition, partition_from_cuts
 
 
 def _freeze(value):
@@ -45,9 +46,10 @@ class FittedState:
     eligible: bool
     reason: str | None
     diagnostics: object
+    coordinate_fits: np.ndarray | None = None
 
     def __post_init__(self):
-        for name in ("centers", "weights", "explicit_labels"):
+        for name in ("centers", "weights", "explicit_labels", "coordinate_fits"):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, readonly_array(value))
@@ -69,6 +71,7 @@ class Candidate:
     refit: object
     provenance: list = field(default_factory=list)
     membership_kind: str = "tree"
+    state_index: int | None = None
 
     @property
     def score(self):
@@ -128,8 +131,58 @@ class CandidateBank:
         self.duplicate_routes = self.refit_calls = 0
         self.attempt_cache_hits = self.structural_cache_hits = 0
         self.refit_seconds = 0.0
+        self._tree_identity = tree.identity
 
-    def consider(self, cuts, labels, centers, provenance):
+    def prepare(self, cuts, labels=None, *, parent=None, fitted=None, columns=None):
+        """Prepare one active expansion, retaining unchanged group handles.
+
+        This internal entry point accepts canonical labels. Public consider()
+        remains the validating boundary. Partitions are not retained by the
+        candidate bank: inactive tree states continue to store only cut IDs.
+        """
+        if labels is None:
+            labels = partition_from_cuts(self.tree, cuts)
+        groups, coordinate_fits = (), ()
+        if hasattr(self.model, "prepare_group"):
+            counts = np.bincount(labels)
+            reusable = {}
+            if parent is not None:
+                for index, group in enumerate(parent.groups):
+                    target = int(labels[group.members[0]])
+                    if counts[target] == len(group.members) and np.all(labels[group.members] == target):
+                        reusable[target] = (group, parent.coordinate_fits[index]
+                                            if parent.coordinate_fits else None)
+            prepared, reused = [], []
+            for cluster in range(int(np.max(labels)) + 1):
+                group, previous = reusable.get(cluster, (None, None))
+                prepared.append(self.model.prepare_group(np.flatnonzero(labels == cluster))
+                                if group is None else group)
+                reused.append(previous)
+            groups = tuple(prepared)
+            coordinate_fits = tuple(reused)
+        if fitted is not None and getattr(fitted, "coordinate_fits", None) is not None:
+            coordinate_fits = tuple(tuple(tuple(value) for value in group)
+                                    for group in fitted.coordinate_fits)
+        return PreparedPartition(getattr(self.model, "identity", ""), self._tree_identity,
+                                 cuts, labels, groups, coordinate_fits,
+                                 columns if parent is None else parent.columns)
+
+    def consider_cuts(self, cuts, centers, provenance):
+        """Trusted canonical cuts: exact cache lookup precedes labels/groups."""
+        membership = ("tree", cuts)
+        found, candidate = self._cached(membership, centers, provenance)
+        if found:
+            return candidate
+        return self._consider(self.prepare(cuts), centers, provenance)
+
+    def consider_prepared(self, partition, centers, provenance):
+        if (partition.tree_identity != self._tree_identity
+                or partition.model_identity != getattr(self.model, "identity", "")):
+            raise ValueError("Prepared partition belongs to another model/tree")
+        found, candidate = self._cached(partition.membership, centers, provenance)
+        return candidate if found else self._consider(partition, centers, provenance)
+
+    def consider(self, cuts, labels, centers, provenance, *, parent=None):
         raw = np.asarray(cuts)
         if raw.ndim != 1 or not np.isfinite(raw).all() or np.any(raw != np.rint(raw)):
             raise ValueError("Tree cuts must be finite integer edge IDs")
@@ -139,20 +192,25 @@ class CandidateBank:
         labels, centers = _canonical_inputs(labels, centers, self.model.n, self.model.r)
         if not np.array_equal(labels, partition_from_cuts(self.tree, cuts)):
             raise ValueError("Candidate labels and frozen-tree cuts disagree")
-        return self._consider(("tree", cuts), cuts, labels, centers, provenance)
+        found, candidate = self._cached(("tree", cuts), centers, provenance)
+        if found:
+            return candidate
+        return self._consider(self.prepare(cuts, labels, parent=parent), centers, provenance)
 
-    def consider_membership(self, labels, initial_centers, provenance):
+    def consider_membership(self, labels, initial_centers, provenance, *, parent=None):
         labels, centers = _canonical_inputs(labels, initial_centers, self.model.n, self.model.r)
-        candidate = self._consider(("general", labels.tobytes()), None, labels, centers, provenance)
+        found, candidate = self._cached(("general", labels.tobytes()), centers, provenance)
+        if not found:
+            candidate = self._consider(self.prepare(None, labels, parent=parent), centers, provenance)
         self.membership_attempts[(labels.tobytes(), None if centers is None else centers.tobytes())] = candidate
         return candidate
 
-    def _consider(self, membership, cuts, labels, centers, provenance):
+    def _cached(self, membership, centers, provenance):
         provenance = _plain(provenance)
         if membership in self._structural:
             self.structural_cache_hits += 1
             self._structural[membership]["provenance"].append(provenance)
-            return None
+            return True, None
         attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
         if attempt in self._attempts:
             self.attempt_cache_hits += 1
@@ -160,11 +218,19 @@ class CandidateBank:
             if candidate is not None:
                 candidate.provenance.append(provenance)
                 self.duplicate_routes += 1
-            return candidate
+            return True, candidate
+        return False, None
+
+    def _consider(self, partition, centers, provenance):
+        membership, cuts, labels = partition.membership, partition.cuts, partition.labels
+        provenance = _plain(provenance)
+        attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
         started = perf_counter()
         self.refit_calls += 1
         try:
-            fitted = self.model.refit(labels, initial_centers=centers)
+            fitted = (self.model.refit_prepared(partition, initial_centers=centers)
+                      if hasattr(self.model, "refit_prepared")
+                      else self.model.refit(labels, initial_centers=centers))
         finally:
             self.refit_seconds += perf_counter()-started
         record = {"membership_kind": membership[0],
@@ -201,11 +267,14 @@ class CandidateBank:
         state_key = membership, aligned.tobytes(), weights.tobytes()
         candidate = self._states.get(state_key)
         if candidate is None:
+            coordinate_fits = getattr(fitted, "coordinate_fits", None)
+            if coordinate_fits is not None:
+                coordinate_fits = np.asarray(coordinate_fits)[order]
             state = FittedState(self.tree, cuts, labels if cuts is None else None, aligned, weights,
                                 float(fitted.conditional_log_likelihood), float(fitted.mixture_log_likelihood),
                                 float(fitted.complexity_penalty), float(fitted.score), True,
-                                fitted.reason, fitted.diagnostics)
-            candidate = Candidate(cuts, state, [provenance], membership[0])
+                                fitted.reason, fitted.diagnostics, coordinate_fits)
+            candidate = Candidate(cuts, state, [provenance], membership[0], len(self.candidates))
             self.candidates.append(candidate)
             self._states[state_key] = candidate
         else:
@@ -215,7 +284,7 @@ class CandidateBank:
             candidate.provenance.append(provenance)
             self.duplicate_routes += 1
         self._attempts[attempt] = candidate
-        record["state_index"] = next(i for i, item in enumerate(self.candidates) if item is candidate)
+        record["state_index"] = candidate.state_index
         index, key = (self.by_cuts, cuts) if cuts is not None else (self.by_membership, labels.tobytes())
         previous = index.get(key)
         if previous is None or score_key(candidate) < score_key(previous):
@@ -267,6 +336,25 @@ def replay_candidate_evidence(evidence):
     if tree.identity != record["identity"]:
         raise ValueError("Candidate evidence tree identity mismatch")
     candidates, region_count = [], None
+    # Replay-local and independent of fitted caches. Many state/attempt records
+    # share a compact cut set; reconstruct each membership at most once.
+    partitions, partition_bytes = OrderedDict(), 0
+
+    def replay_partition(cuts):
+        nonlocal partition_bytes
+        if cuts in partitions:
+            partitions.move_to_end(cuts)
+            return partitions[cuts]
+        labels = partition_from_cuts(tree, cuts)
+        # Evidence can describe an enormous bank. Replay caching is bounded
+        # execution work, not permanent expansion of every compact cut state.
+        if labels.nbytes <= 8*1024**2:
+            while partition_bytes + labels.nbytes > 8*1024**2:
+                _, removed = partitions.popitem(last=False)
+                partition_bytes -= removed.nbytes
+            partitions[cuts] = labels
+            partition_bytes += labels.nbytes
+        return labels
     for item in evidence["states"]:
         kind = item["membership_kind"]
         cuts = tuple(item["cuts"]) if kind == "tree" else None
@@ -275,7 +363,7 @@ def replay_candidate_evidence(evidence):
         if cuts is not None and (any(type(edge) is not int or not 0 <= edge < len(tree.edges)
                                     for edge in cuts) or tuple(sorted(set(cuts))) != cuts):
             raise ValueError("Candidate evidence has invalid tree cuts")
-        labels = partition_from_cuts(tree, cuts) if cuts is not None else np.asarray(item["labels"])
+        labels = replay_partition(cuts) if cuts is not None else np.asarray(item["labels"])
         centers = np.asarray(item["centers_ccf"], dtype=float)
         if (centers.ndim != 2 or not all(centers.shape)
                 or not np.isfinite(centers).all()
@@ -320,7 +408,7 @@ def replay_candidate_evidence(evidence):
             if (any(type(edge) is not int or not 0 <= edge < len(tree.edges) for edge in cuts)
                     or tuple(sorted(set(cuts))) != cuts):
                 raise ValueError("Refit attempt has invalid tree cuts")
-            labels = partition_from_cuts(tree, cuts)
+            labels = replay_partition(cuts)
         elif kind == "general":
             cuts, labels = None, np.asarray(attempt["labels"])
             canonical, _ = _canonical_inputs(labels, None, tree.n, region_count)
@@ -340,7 +428,7 @@ def replay_candidate_evidence(evidence):
             raise ValueError("An eligible refit attempt is missing its retained fitted state")
         candidate = candidates[index]
         if (kind != candidate.membership_kind or cuts != candidate.cuts
-                or not np.array_equal(labels, candidate.refit.labels)):
+                or (cuts is None and not np.array_equal(labels, candidate.refit.labels))):
             raise ValueError("Refit attempt and retained fitted-state memberships disagree")
         retained.add(index)
     if attempts and retained != set(range(len(candidates))):

@@ -20,10 +20,15 @@ using CliPP2Norm = double (*)(const double*, long long);
 using CliPP2CutScores = int (*)(const long double*, long long, int, long double*);
 extern "C" {
 const char* CliPP2ContinuationLastError();
+// Conservative requested vector-capacity bytes, excluding caller buffers,
+// allocator bookkeeping and thread stacks. Uses this platform's type sizes.
+int CliPP2ContinuationMemory(int n,int regions,int workers,int tasks,
+    long long* shared,long long* state,long long* per_thread);
 int CliPP2ContinueCPU(const clipp2::ObservationSoA*, const int* edges,
     const int* canonical_order, const double* initial, const double* lower,
     const double* upper, int tasks, const int* capacities,
     const CliPP2ContinuationPolicy*, const double* gaps, CliPP2Norm norm, CliPP2CutScores scores,
-    int workers, long long workspace_bytes, double* coordinates, int* labels,
+    int workers, long long workspace_bytes, long long host_budget_bytes,
+    int output_flags, double* coordinates, int* labels,
     unsigned char* cuts, CliPP2ContinuationReport* reports, int* actual_workers);
 }

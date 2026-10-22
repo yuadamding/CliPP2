@@ -37,7 +37,7 @@ struct Objective {
 }
 
 void refit_centers(const ObservationSoA& model, const RefitBatch& batch, RefitResult* output,
-                   std::int64_t budget, ProbabilityWork& work) {
+                   std::int64_t budget, ProbabilityWork& work, ProbabilityCache* cache) {
     validate_refit_batch(model, batch, output);
     // Allocate once before the worker team: allocation failure reaches the C
     // boundary, and no task allocates from an OpenMP worker or objective loop.
@@ -53,7 +53,7 @@ void refit_centers(const ObservationSoA& model, const RefitBatch& batch, RefitRe
         }
     }
     offsets[batch.tasks] = used;
-    std::vector<ProbabilityPlan> plans;
+    std::vector<std::shared_ptr<const ProbabilityPlan>> plans;
     std::vector<ProbabilityPlan::Workspace> scratch;
     const auto objects = checked_product(batch.tasks, sizeof(ProbabilityPlan) + sizeof(ProbabilityPlan::Workspace));
     const bool planned = objects <= budget;
@@ -63,10 +63,14 @@ void refit_centers(const ObservationSoA& model, const RefitBatch& batch, RefitRe
         plans.reserve(batch.tasks); scratch.reserve(batch.tasks);
     }
     for (std::int64_t task = 0; planned && task < batch.tasks; ++task) {
-        plans.emplace_back(model, batch.regions[task], observed.data() + offsets[task],
-                           offsets[task + 1] - offsets[task], budget - work.reserved);
-        work.reserved += plans.back().bytes(); work.plans += plans.back().enabled();
-        scratch.emplace_back(plans.back());
+        auto plan = cache ? cache->get(model, batch.regions[task], observed.data() + offsets[task],
+                                      offsets[task + 1] - offsets[task], budget - work.reserved)
+                          : std::make_shared<ProbabilityPlan>(model, batch.regions[task], observed.data() + offsets[task],
+                                      offsets[task + 1] - offsets[task], budget - work.reserved);
+        if (!plan || !plan->enabled()) plan.reset();
+        work.reserved += plan ? (cache ? plan->scratch_bytes() : plan->bytes()) : 0;
+        work.plans += bool(plan); plans.push_back(plan);
+        scratch.emplace_back(plan ? *plan : direct);
     }
     // Independent tasks share no mutable state. The serial path is complete;
     // builds may enable one optional OpenMP team, never nested reductions.
@@ -81,15 +85,16 @@ void refit_centers(const ObservationSoA& model, const RefitBatch& batch, RefitRe
         }
         output[task] = refit_search(batch, task, values.data() + batch.grid_offsets[task],
             Objective{model, observed.data() + offsets[task], count, region,
-                      planned ? plans[task] : direct, planned ? scratch[task] : direct_scratch});
+                      planned && plans[task] ? *plans[task] : direct, planned ? scratch[task] : direct_scratch});
     }
     for (std::int64_t task = 0; planned && task < batch.tasks; ++task)
-        if (plans[task].enabled()) work.add(plans[task].components(), plans[task].shapes(),
+        if (plans[task]) work.add(plans[task]->components(), plans[task]->shapes(),
             offsets[task + 1] - offsets[task], output[task].evaluations);
 }
 
 void conditional_values(const ObservationSoA& model, const ConditionalBatch& batch,
-                         double* output, std::uint8_t* status, std::int64_t budget, ProbabilityWork& work) {
+                         double* output, std::uint8_t* status, std::int64_t budget, ProbabilityWork& work,
+                         ProbabilityCache* cache) {
     validate_conditional_batch(model, batch, output, status);
     std::vector<std::int64_t> observed(batch.members), offsets(batch.tasks + 1);
     std::int64_t used = 0;
@@ -109,7 +114,7 @@ void conditional_values(const ObservationSoA& model, const ConditionalBatch& bat
         status[task] = static_cast<std::uint8_t>(state);
     }
     offsets[batch.tasks] = used;
-    std::vector<ProbabilityPlan> plans;
+    std::vector<std::shared_ptr<const ProbabilityPlan>> plans;
     std::vector<ProbabilityPlan::Workspace> scratch;
     const auto objects = checked_product(batch.tasks, sizeof(ProbabilityPlan) + sizeof(ProbabilityPlan::Workspace));
     const bool planned = objects <= budget;
@@ -119,10 +124,15 @@ void conditional_values(const ObservationSoA& model, const ConditionalBatch& bat
         plans.reserve(batch.tasks); scratch.reserve(batch.tasks);
     }
     for (std::int64_t task = 0; planned && task < batch.tasks; ++task) {
-        plans.emplace_back(model, batch.regions[task], observed.data() + offsets[task],
-                           status[task] ? 0 : offsets[task + 1] - offsets[task], budget - work.reserved);
-        work.reserved += plans.back().bytes(); work.plans += plans.back().enabled();
-        scratch.emplace_back(plans.back());
+        const auto count = status[task] ? 0 : offsets[task + 1] - offsets[task];
+        auto plan = cache ? cache->get(model, batch.regions[task], observed.data() + offsets[task],
+                                      count, budget - work.reserved)
+                          : std::make_shared<ProbabilityPlan>(model, batch.regions[task], observed.data() + offsets[task],
+                                      count, budget - work.reserved);
+        if (!plan || !plan->enabled()) plan.reset();
+        work.reserved += plan ? (cache ? plan->scratch_bytes() : plan->bytes()) : 0;
+        work.plans += bool(plan); plans.push_back(plan);
+        scratch.emplace_back(plan ? *plan : direct);
     }
     CLIPP_PARALLEL_FOR
     for (std::int64_t task = 0; task < batch.tasks; ++task) {
@@ -130,7 +140,7 @@ void conditional_values(const ObservationSoA& model, const ConditionalBatch& bat
         if (status[task]) continue;
         output[task] = Objective{model, observed.data() + offsets[task],
                                 offsets[task + 1] - offsets[task], batch.regions[task],
-                                planned ? plans[task] : direct,
+                                planned && plans[task] ? *plans[task] : direct,
                                 planned ? scratch[task] : direct_scratch}(batch.centers[task]);
         if (output[task] == -std::numeric_limits<double>::infinity())
             status[task] = static_cast<std::uint8_t>(EmitStatus::ZeroLikelihood);
@@ -138,7 +148,7 @@ void conditional_values(const ObservationSoA& model, const ConditionalBatch& bat
             status[task] = static_cast<std::uint8_t>(EmitStatus::NumericalFailure);
     }
     for (std::int64_t task = 0; planned && task < batch.tasks; ++task)
-        if (plans[task].enabled()) work.add(plans[task].components(), plans[task].shapes(),
+        if (plans[task]) work.add(plans[task]->components(), plans[task]->shapes(),
             offsets[task + 1] - offsets[task], 1);
 }
 }

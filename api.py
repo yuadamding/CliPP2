@@ -45,7 +45,12 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     model = RegionalModel(data, device=config.device,
                           grid_cache_bytes=config.grid_cache_mb * 1024**2,
                           device_cache_bytes=config.device_cache_mb * 1024**2,
-                          workspace_bytes=config.workspace_mb * 1024**2)
+                          workspace_bytes=config.workspace_mb * 1024**2,
+                          native_host_memory_bytes=(None if config.native_host_memory_mb is None
+                                                    else config.native_host_memory_mb * 1024**2),
+                          device_memory_bytes=(None if config.device_memory_mb is None
+                                               else config.device_memory_mb * 1024**2),
+                          cpu_threads=config.cpu_threads)
     result = fit_regions(model, config.max_clusters)
     if hashlib.sha256(path.read_bytes()).hexdigest() != input_hash:
         raise RuntimeError('Input changed during fitting; no successful publication')

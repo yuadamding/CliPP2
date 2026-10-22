@@ -34,6 +34,43 @@ _CACHE_ENTRY_BYTES = 1280
 _MODE_ENTRY_BYTES = 768
 
 
+@dataclass(frozen=True, eq=False)
+class PreparedGroup:
+    """Immutable ordered membership and read/box metadata for every region."""
+
+    model_identity: str
+    members: np.ndarray
+    tasks: tuple
+
+    @property
+    def observed_members(self):
+        return tuple(task.rows for task in self.tasks)
+
+    @property
+    def support_counts(self):
+        return tuple(len(task.rows) for task in self.tasks)
+
+
+@dataclass(frozen=True)
+class JointColumnSet:
+    """Call-owned immutable column handles; cache eviction cannot invalidate them.
+
+    The unchanged host weight optimizer still consumes one dense matrix. This
+    storage interface does not claim resident CUDA scoring or new reductions.
+    """
+
+    columns: tuple
+    center_keys: tuple
+    model_identity: str
+    numerical_identity: tuple
+
+    def materialize(self):
+        matrix = np.empty((len(self.columns[0]), len(self.columns)))
+        for index, column in enumerate(self.columns):
+            matrix[:, index] = column
+        return matrix
+
+
 @dataclass(frozen=True)
 class RefittedPartition:
     labels: np.ndarray
@@ -46,10 +83,13 @@ class RefittedPartition:
     eligible: bool
     reason: str | None = None
     diagnostics: dict = field(default_factory=dict)
+    coordinate_fits: np.ndarray | None = None
 
     def __post_init__(self):
         for name in ("labels", "centers", "weights"):
             object.__setattr__(self, name, readonly_array(getattr(self, name)))
+        if self.coordinate_fits is not None:
+            object.__setattr__(self, "coordinate_fits", readonly_array(self.coordinate_fits))
 
     @property
     def penalty(self):
@@ -61,7 +101,8 @@ class RegionalModel:
 
     def __init__(self, data, device="cpu", *, cache_bytes=32 * 1024 * 1024,
                  grid_cache_bytes=None, device_cache_bytes=256 * 1024**2,
-                 workspace_bytes=64 * 1024**2):
+                 workspace_bytes=64 * 1024**2, native_host_memory_bytes=None,
+                 device_memory_bytes=None, cpu_threads=None):
         self.data = data
         ids, regions = tuple(data.mutation_ids), tuple(data.region_ids)
         if any(not isinstance(x, str) for x in ids + regions):
@@ -149,7 +190,10 @@ class RegionalModel:
             raise ValueError("device_cache_bytes must be a nonnegative integer")
         if type(workspace_bytes) is not int or workspace_bytes < 0:
             raise ValueError("workspace_bytes must be a nonnegative integer")
-        self.backend = NativeBackend(self, workspace_bytes)
+        self.backend = NativeBackend(self, workspace_bytes,
+                                     native_host_memory_bytes=native_host_memory_bytes,
+                                     device_memory_bytes=device_memory_bytes,
+                                     cpu_threads=cpu_threads)
         self.execution_backend = f"native_{self.backend.kind}_likelihood_host_forest"
         self._cache_bytes = int(cache_bytes)
         if self._cache_bytes < 0:
@@ -167,6 +211,7 @@ class RegionalModel:
                           "group_cache_hits": 0, "coordinate_grid_cache_hits": 0,
                           "component_mode_cache_hits": 0, "coordinate_grids": 0,
                           "incumbent_equal_base_reuses": 0, "fused_incumbents": 0,
+                          "unchanged_coordinate_reuses": 0,
                           "scalar_refit_seconds": 0.0, "weight_seconds": 0.0}
 
     def __len__(self):
@@ -293,15 +338,16 @@ class RegionalModel:
             self._preparation_bytes += size
         return value
 
-    def _coordinate_task(self, members, region):
-        members = self.backend._rows(region, members)
+    def prepare_group(self, members):
+        """Intern structural metadata; eviction changes cost, never eligibility."""
+        members = self.backend._rows(0, members)
         if not len(members):
             raise ValueError("A coordinate task requires nonempty membership")
         group_key = ("group", members.tobytes())
 
         def prepare_group():
             tasks = []
-            size = _CACHE_ENTRY_BYTES + len(group_key[1])
+            size = _CACHE_ENTRY_BYTES + 2 * len(group_key[1])
             for coordinate in range(self.r):
                 rows = readonly_array(members[self.observed[members, coordinate]], dtype=np.int64)
                 lower = float(self.lower[members, coordinate].max())
@@ -314,9 +360,17 @@ class RegionalModel:
                        rows.tobytes(), np.asarray([lower, upper, xatol]).tobytes())
                 tasks.append(CoordinateTask(coordinate, rows, lower, upper, xatol, key))
                 size += _CACHE_ENTRY_BYTES + rows.nbytes + len(key[4]) + len(key[5])
-            return tuple(tasks), size
+            return PreparedGroup(self.identity, readonly_array(members), tuple(tasks)), size
 
-        task = self._prepared(group_key, prepare_group, "group_cache_hits")[region]
+        return self._prepared(group_key, prepare_group, "group_cache_hits")
+
+    def _coordinate_task(self, members, region):
+        group = members if isinstance(members, PreparedGroup) else self.prepare_group(members)
+        if group.model_identity != self.identity:
+            raise ValueError("Prepared group belongs to another regional model")
+        task = group.tasks[region]
+        if task.key[:3] != (self.identity, self.backend.policy, self.backend.identity):
+            raise ValueError("Prepared group belongs to another numerical backend")
         if not len(task.rows):
             raise ScientificCandidateRejection(f"unsupported_cluster_region:{self.region_ids[region]}")
         if task.lower > task.upper:
@@ -340,14 +394,23 @@ class RegionalModel:
             return grid, _CACHE_ENTRY_BYTES + len(task.key[4]) + grid.nbytes
         return self._prepared(("grid", task.key), prepare_grid, "coordinate_grid_cache_hits")
 
-    def _fit_coordinates(self, tasks, incumbents=None):
+    def _fit_coordinates(self, tasks, incumbents=None, prepared_results=None, *, return_details=False):
         tasks = [self._coordinate_task(*task) for task in tasks]
         initial = np.full(len(tasks), np.nan) if incumbents is None else np.asarray(incumbents, dtype=float)
         if initial.shape != (len(tasks),):
             raise ValueError("Refitting needs one incumbent per coordinate task")
         results, missing = [None]*len(tasks), []
+        retained_flags = np.zeros(len(tasks), dtype=bool)
         hits, retained_initial = [], 0
         for index, task in enumerate(tasks):
+            prior = None if prepared_results is None else prepared_results[index]
+            if (prior is not None
+                    and np.float64(initial[index]).tobytes() == np.float64(prior[0]).tobytes()):
+                results[index] = tuple(prior[:2])
+                retained_flags[index] = bool(prior[2])
+                retained_initial += int(retained_flags[index])
+                self.telemetry["unchanged_coordinate_reuses"] += 1
+                continue
             key = task.key
             if key in self._refits:
                 self.telemetry["refit_cache_hits"] += 1
@@ -387,7 +450,8 @@ class RegionalModel:
             for (index, task), value in zip(missing, fitted):
                 base = (value.base_center, value.base_log_likelihood)
                 results[index] = (value.center, value.log_likelihood)
-                retained_initial += int(value.log_likelihood > value.base_log_likelihood)
+                retained_flags[index] = value.log_likelihood > value.base_log_likelihood
+                retained_initial += int(retained_flags[index])
                 self.telemetry["fused_incumbents"] += int(
                     np.isfinite(initial[index]) and task.lower <= initial[index] <= task.upper)
                 self.telemetry["scalar_refits"] += 1
@@ -398,8 +462,10 @@ class RegionalModel:
             for index, value in zip(hits, values):
                 if value > results[index][1]:
                     results[index] = (float(initial[index]), float(value))
+                    retained_flags[index] = True
                     retained_initial += 1
-        return results, retained_initial
+        return ((results, retained_initial, retained_flags) if return_details
+                else (results, retained_initial))
 
     def _cache_refit(self, key, fitted):
         # Exact observed membership and bound bytes belong to the cache budget.
@@ -424,6 +490,9 @@ class RegionalModel:
                 & (centers[None, :, :] <= self.upper[:, None, :])).all(axis=2)
 
     def log_likelihood_columns(self, centers):
+        return self.joint_column_set(centers).materialize()
+
+    def joint_column_set(self, centers, *, retained_columns=None):
         """Log P(reads, valid assignment | cluster); forbidden pairs are -inf.
 
         No division by admissible prior mass: the fixed-center weight problem
@@ -448,6 +517,11 @@ class RegionalModel:
         evaluated = set()
         retained = {center.tobytes(): self._columns[self.identity, center.tobytes()]
                     for center in centers if (self.identity, center.tobytes()) in self._columns}
+        if retained_columns is not None:
+            if (retained_columns.model_identity != self.identity
+                    or retained_columns.numerical_identity != (self.backend.policy, self.backend.identity)):
+                raise ValueError("Retained columns belong to another regional model")
+            retained.update(zip(retained_columns.center_keys, retained_columns.columns))
         missing = {center.tobytes(): center for center in centers
                    if center.tobytes() not in retained}
         if missing:
@@ -481,13 +555,26 @@ class RegionalModel:
                     self._columns[key] = column
                     self._column_bytes += size
             columns.append(column)
-        return np.column_stack(columns)
+        return JointColumnSet(tuple(columns), tuple(center.tobytes() for center in centers), self.identity,
+                              (self.backend.policy, self.backend.identity))
 
     def refit(self, labels, initial_centers=None):
         labels = np.asarray(labels)
         if labels.shape != (self.n,) or not np.isfinite(labels).all() or np.any(labels != np.rint(labels)):
             raise ValueError("Labels must contain one finite integer per mutation")
         _, inverse = np.unique(labels, return_inverse=True)
+        groups = tuple(self.prepare_group(np.flatnonzero(inverse == cluster))
+                       for cluster in range(int(inverse.max()) + 1))
+        return self._refit_groups(inverse, groups, initial_centers)
+
+    def refit_prepared(self, partition, initial_centers=None):
+        """Internal path: prepared memberships avoid all-group reconstruction."""
+        if partition.model_identity != self.identity:
+            raise ValueError("Prepared partition belongs to another regional model")
+        return self._refit_groups(partition.labels, partition.groups, initial_centers,
+                                  partition.coordinate_fits, partition.columns)
+
+    def _refit_groups(self, inverse, groups, initial_centers, prior=(), prior_columns=None):
         q = int(inverse.max())+1
         centers = np.full((q, self.r), np.nan)
         if initial_centers is not None:
@@ -497,16 +584,19 @@ class RegionalModel:
         penalty = float((q*self.r+q-1)*math.log(self.n))
         retained_initial = 0
         try:
-            memberships = [np.flatnonzero(inverse == cluster) for cluster in range(q)]
-            tasks = [(members, region) for members in memberships for region in range(self.r)]
-            fitted, retained_initial = self._fit_coordinates(
-                tasks, None if initial_centers is None else initial_centers.ravel())
+            tasks = [(group, region) for group in groups for region in range(self.r)]
+            fitted, retained_initial, retained_flags = self._fit_coordinates(
+                tasks, None if initial_centers is None else initial_centers.ravel(),
+                None if not prior else [value for group in prior for value in
+                                        ([None] * self.r if group is None else group)],
+                return_details=True)
             centers[:] = np.array([center for center, _ in fitted]).reshape(q, self.r)
         except ScientificCandidateRejection as error:
             return RefittedPartition(inverse, centers, np.full(q, np.nan), -np.inf,
                                      -np.inf, penalty, np.inf, False, str(error),
                                      diagnostics={"rejection_kind": "scientific"})
-        matrix = self.log_likelihood_columns(centers)
+        columns = self.joint_column_set(centers, retained_columns=prior_columns)
+        matrix = columns.materialize()
         conditional = math.fsum(matrix[np.arange(self.n), inverse])
         start = time.perf_counter()
         try:
@@ -528,4 +618,5 @@ class RegionalModel:
                                      "retained_initial_centers": retained_initial,
                                      "scalar_global_optimality_certified": False,
                                      "num_parameters": q*self.r+q-1,
-                                     "score_definition": SCORE_DEFINITION})
+                                     "score_definition": SCORE_DEFINITION},
+                                 coordinate_fits=np.column_stack((fitted, retained_flags)).reshape(q, self.r, 3))

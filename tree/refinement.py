@@ -119,7 +119,7 @@ def canonical_partition(labels, centers=None):
     return result, np.asarray(centers)[list(seen)].copy()
 
 
-def refine_partition(model, tree, candidate, consider, *, max_proposals=None):
+def refine_partition(model, tree, candidate, consider, *, max_proposals=None, prepare=None):
     """Yield every accepted local state; scoring is independent of acceptance.
 
     ``consider`` refits and records candidates, preserving supplied-center
@@ -144,9 +144,16 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None):
         changed = False
         fit = current.refit
         labels = fit.labels
-        components = {cluster: np.flatnonzero(labels == cluster) for cluster in range(len(fit.centers))}
+        handles = (model.joint_column_set(fit.centers)
+                   if prepare is not None and hasattr(model, "joint_column_set") else None)
+        prepared = (None if prepare is None else
+                    prepare(current.cuts, labels, fitted=fit, columns=handles))
+        components = ({cluster: group.members for cluster, group in enumerate(prepared.groups)}
+                      if prepared is not None and prepared.groups else
+                      {cluster: np.flatnonzero(labels == cluster) for cluster in range(len(fit.centers))})
         # The model columns already enforce the complete regional assignment box.
-        columns = model.log_likelihood_columns(fit.centers)
+        columns = (model.log_likelihood_columns(fit.centers) if handles is None
+                   else handles.materialize())
         for edge in current.cuts:
             move = best_pair_boundary(tree, labels, fit.centers, columns, edge,
                                       adjacency=adjacency, components=components)
@@ -163,10 +170,11 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None):
                 return
             visited.add(proposal_key)
             attempted += 1
+            options = {} if prepared is None else {"parent": prepared}
             proposed = consider(cuts, proposed_labels, centers, {
                 "route": "boundary_refinement", "parent_cuts": current.cuts,
                 "replaced_edge": int(edge), "replacement_edge": move.edge,
-            })
+            }, **options)
             if proposed is None:
                 continue
             old = float(fit.conditional_log_likelihood)

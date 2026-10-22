@@ -18,6 +18,9 @@ from .allocations import allocation_diagnostics
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
 
+_VERIFY_ROWS = 4096
+_VERIFY_CENTERS = 32
+
 def _input_domain(model, centers):
     """Rebuild observations and closed boxes independently of runtime caches."""
     centers = np.asarray(centers, dtype=float)
@@ -32,8 +35,17 @@ def _input_domain(model, centers):
         observed &= np.asarray(data.count_observed, dtype=bool)[ix]
     mixed = data.cn_state_count[ix] > 1
     lower, upper = np.where(mixed, 1e-6, 0.), np.where(mixed, data.phi_upper[ix], 1.)
-    allowed = ((centers[None, :, :] >= lower[:, None, :])
-               & (centers[None, :, :] <= upper[:, None, :])).all(axis=2)
+    allowed = np.ones((model.n, len(centers)), dtype=bool)
+    # Keep validity independent of fitting caches without an N-by-q-by-R
+    # temporary. Missing observations still impose their original bounds.
+    for region in range(model.r):
+        for start in range(0, model.n, _VERIFY_ROWS):
+            rows = slice(start, start+_VERIFY_ROWS)
+            for first in range(0, len(centers), _VERIFY_CENTERS):
+                cols = slice(first, first+_VERIFY_CENTERS)
+                values = centers[cols, region][None, :]
+                allowed[rows, cols] &= ((values >= lower[rows, region, None])
+                                        & (values <= upper[rows, region, None]))
     return observed, allowed
 
 
@@ -58,16 +70,26 @@ def independent_log_columns(model, centers):
         scale = purity[observed, region] / denominator
         s = support[observed, region]
         constant = gammaln(n+1)-gammaln(y+1)-gammaln(n-y+1)-np.log(s)
-        marginal = np.full((len(y), len(centers)), -np.inf)
-        for m in range(1, int(s.max())+1):
-            prob = scale[:, None] * m * centers[:, region][None, :]
-            prob = np.where(mixed[observed, region, None], np.clip(prob, 1e-6, 1-1e-6),
-                            np.minimum(prob, 1.0))
-            component = xlogy(y[:, None], prob) + xlog1py((n-y)[:, None], -prob)
-            component += constant[:, None]
-            component[s < m] = -np.inf
-            marginal = np.logaddexp(marginal, component)
-        answer[observed] += marginal
+        original_rows = np.flatnonzero(observed)
+        for size in np.unique(s):
+            bucket = np.flatnonzero(s == size)
+            for start in range(0, len(bucket), _VERIFY_ROWS):
+                rows = bucket[start:start+_VERIFY_ROWS]
+                source = original_rows[rows]
+                for first in range(0, len(centers), _VERIFY_CENTERS):
+                    cols = slice(first, first+_VERIFY_CENTERS)
+                    marginal = np.full((len(rows), len(centers[cols])), -np.inf)
+                    # Preserve increasing multiplicity and regional summation
+                    # order for every row; never evaluate its unsupported m's.
+                    for m in range(1, int(size)+1):
+                        prob = scale[rows, None] * m * centers[cols, region][None, :]
+                        prob = np.where(mixed[source, region, None],
+                                        np.clip(prob, 1e-6, 1-1e-6), np.minimum(prob, 1.0))
+                        component = (xlogy(y[rows, None], prob)
+                                     + xlog1py((n-y)[rows, None], -prob))
+                        component += constant[rows, None]
+                        marginal = np.logaddexp(marginal, component)
+                    answer[source, cols] += marginal
     return np.where(allowed, answer, -np.inf)
 
 

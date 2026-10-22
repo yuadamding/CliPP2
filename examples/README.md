@@ -9,7 +9,7 @@ units and 998 data rows because 398 units
 (66.3%) contain two local CN states. Every unit has at least one non-diploid
 local state.
 
-Under the default whole-mutation CN filter (`--max-major-cn 4`), **all 300
+Under the default whole-mutation CN filter (`--max-major-cn 10`), **all 300
 mutations are retained and none are excluded**: the largest major CN is two.
 The 199 mutations with mixed CN in at least one sample remain eligible;
 subclonal CN alone is not an exclusion reason. A mutation is excluded from

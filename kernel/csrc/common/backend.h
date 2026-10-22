@@ -19,6 +19,7 @@ int CliPP2BackendCreate(const clipp2::ObservationSoA*, std::int64_t workspace_by
                        int device_index, void** context);
 void CliPP2BackendDestroy(void* context);
 int CliPP2BackendGetDiagnostics(void* context, CliPP2BackendDiagnostics* output);
+int CliPP2BackendDimensions(void* context, std::int64_t* mutations, std::int64_t* regions);
 // phi and node results: [batch, region, mutation]. Status is one byte per cell.
 int CliPP2EvaluateNodes(void*, std::int64_t batches, const double* phi, int mode,
                        double* loss, double* gradient, double* curvature,
@@ -45,7 +46,8 @@ int CliPP2EvaluateConditionalValues(void*, const clipp2::ConditionalBatch*,
 namespace clipp2 {
 // CPU implementation supplied by cpu/refit.cpp. CUDA has its own batch driver.
 struct ProbabilityWork;
-void refit_centers(const ObservationSoA&, const RefitBatch&, RefitResult*, std::int64_t, ProbabilityWork&);
+class ProbabilityCache;
+void refit_centers(const ObservationSoA&, const RefitBatch&, RefitResult*, std::int64_t, ProbabilityWork&, ProbabilityCache* = nullptr);
 void conditional_values(const ObservationSoA&, const ConditionalBatch&, double*, std::uint8_t*,
-                        std::int64_t, ProbabilityWork&);
+                        std::int64_t, ProbabilityWork&, ProbabilityCache* = nullptr);
 }

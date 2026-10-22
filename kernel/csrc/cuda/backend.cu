@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -66,6 +67,7 @@ struct Context {
     cudaStream_t stream = nullptr;
     unsigned char *prepared = nullptr, *workspace = nullptr;
     CliPP2BackendDiagnostics diagnostics{};
+    i64 host_staging_limit = 0;
     ~Context() {
         // Destruction cannot report errors through the C ABI. Normal operations
         // synchronize and report failures before reaching this cleanup path.
@@ -115,6 +117,22 @@ struct Context {
         cuda_check(cudaStreamSynchronize(stream), "complete native CUDA phase");
         ++diagnostics.synchronizations;
         ++diagnostics.calls;
+    }
+};
+
+struct HostCounts {
+    Context& context;
+    std::vector<i64> values;
+    HostCounts(Context& owner,i64 count):context(owner) {
+        const auto bytes=multiply(count,sizeof(i64));
+        require(bytes<=owner.host_staging_limit,"CUDA host staging exceeds native host budget");
+        values.resize(static_cast<std::size_t>(count));
+        context.diagnostics.staging_bytes=bytes;
+    }
+    ~HostCounts() {
+        // Failed transfers must stop referencing the host buffer before release.
+        if(std::uncaught_exceptions()) cudaStreamSynchronize(context.stream);
+        context.diagnostics.staging_bytes=0;
     }
 };
 
@@ -358,6 +376,25 @@ extern "C" const char* CliPP2BackendNumericalPolicy() {
 }
 extern "C" const char* CliPP2BackendLastError() { return last_error; }
 
+// Native-only headroom probe: no Python framework/runtime import is required.
+// Preserve the caller's current device, including after cudaMemGetInfo failure.
+extern "C" int CliPP2DeviceMemoryInfo(int device, i64* free_bytes, i64* total_bytes) {
+    return guarded([&] {
+        require(device>=0 && free_bytes && total_bytes,"Invalid device-memory query");
+        int previous=0;
+        cuda_check(cudaGetDevice(&previous),"query current CUDA device");
+        cuda_check(cudaSetDevice(device),"select CUDA memory-query device");
+        std::size_t available=0,total=0;
+        const auto status=cudaMemGetInfo(&available,&total);
+        const auto restored=cudaSetDevice(previous);
+        cuda_check(status,"query available CUDA memory");
+        cuda_check(restored,"restore CUDA memory-query device");
+        require(available<=static_cast<std::uint64_t>(INT64_MAX) &&
+                total<=static_cast<std::uint64_t>(INT64_MAX),"CUDA byte count overflow");
+        *free_bytes=static_cast<i64>(available); *total_bytes=static_cast<i64>(total);
+    });
+}
+
 extern "C" int CliPP2BackendCreate(const ObservationSoA* input, i64 workspace_bytes,
                                     int device_index, void** result) {
     return guarded([&] {
@@ -371,6 +408,7 @@ extern "C" int CliPP2BackendCreate(const ObservationSoA* input, i64 workspace_by
         cuda_check(cudaSetDevice(device_index), "select CUDA backend device");
         cuda_check(cudaStreamCreateWithFlags(&c->stream, cudaStreamNonBlocking), "create CUDA stream");
         c->diagnostics.workspace_limit = workspace_bytes;
+        c->host_staging_limit = workspace_bytes;
         Layout layout;
         const i64 alt = layout.take<double>(count), ref = layout.take<double>(count),
                   scaling = layout.take<double>(count), constant = layout.take<double>(count),
@@ -392,8 +430,20 @@ extern "C" int CliPP2BackendCreate(const ObservationSoA* input, i64 workspace_by
     });
 }
 extern "C" void CliPP2BackendDestroy(void* value) { delete static_cast<Context*>(value); }
+extern "C" int CliPP2BackendDimensions(void* value, std::int64_t* n, std::int64_t* r) {
+    return guarded([&] { require(n && r,"Null dimensions output");
+        const auto& view=context(value).data; *n=view.mutations; *r=view.regions; });
+}
 extern "C" int CliPP2BackendGetDiagnostics(void* value, CliPP2BackendDiagnostics* output) {
     return guarded([&] { require(output, "Missing CUDA diagnostic destination"); *output = context(value).diagnostics; });
+}
+extern "C" int CliPP2ConfigureCUDAExecution(void* value, i64 host_staging_limit) {
+    return guarded([&] {
+        require(host_staging_limit>=0,"CUDA host staging limit must be nonnegative");
+        auto& c=context(value);
+        require(c.diagnostics.calls==0,"CUDA execution budgets are fixed before first use");
+        c.host_staging_limit=host_staging_limit;
+    });
 }
 extern "C" int CliPP2EvaluateNodes(void* value, i64 batches, const double* phi, int mode,
         double* loss, double* gradient, double* curvature, std::uint8_t* status) {
@@ -527,6 +577,7 @@ extern "C" int CliPP2RefitCentersBatch(void* value, const RefitBatch* batch, Ref
         require(batch, "Missing CUDA refit batch");
         validate_refit_batch(c.data, *batch, output, false);
         if (!batch->tasks) return;
+        HostCounts observed_counts(c,batch->tasks);
         Layout layout;
         const i64 regions = layout.take<i64>(batch->tasks),
                   offsets = layout.take<i64>(add(batch->tasks, 1)),
@@ -560,15 +611,12 @@ extern "C" int CliPP2RefitCentersBatch(void* value, const RefitBatch* batch, Ref
             c.pointer<i64>(compacted), c.pointer<i64>(counts), c.pointer<double>(member_values),
             c.pointer<double>(grid_values), c.pointer<RefitResult>(results));
         c.launched();
-        std::vector<i64> observed_counts(static_cast<std::size_t>(batch->tasks));
-        c.diagnostics.staging_bytes = multiply(batch->tasks, sizeof(i64));
         c.download(output, c.pointer<RefitResult>(results), batch->tasks);
-        c.download(observed_counts.data(), c.pointer<i64>(counts), batch->tasks);
+        c.download(observed_counts.values.data(), c.pointer<i64>(counts), batch->tasks);
         c.finish();
         for (i64 task = 0; task < batch->tasks; ++task)
             c.diagnostics.cell_evaluations = add(c.diagnostics.cell_evaluations,
-                multiply(observed_counts[task], output[task].evaluations));
-        c.diagnostics.staging_bytes = 0;
+                multiply(observed_counts.values[task], output[task].evaluations));
     });
 }
 
@@ -579,6 +627,7 @@ extern "C" int CliPP2EvaluateConditionalValues(void* value, const ConditionalBat
         require(batch, "Missing CUDA conditional batch");
         validate_conditional_batch(c.data, *batch, output, status);
         if (!batch->tasks) return;
+        HostCounts observed_counts(c,batch->tasks);
         Layout layout;
         const i64 regions = layout.take<i64>(batch->tasks),
                   offsets = layout.take<i64>(add(batch->tasks, 1)),
@@ -598,14 +647,13 @@ extern "C" int CliPP2EvaluateConditionalValues(void* value, const ConditionalBat
             c.pointer<i64>(compacted), c.pointer<i64>(counts), c.pointer<double>(member_values),
             c.pointer<double>(results), c.pointer<std::uint8_t>(states));
         c.launched();
-        std::vector<i64> observed_counts(static_cast<std::size_t>(batch->tasks));
-        c.diagnostics.staging_bytes = multiply(batch->tasks, sizeof(i64));
         c.download(output, c.pointer<double>(results), batch->tasks);
         c.download(status, c.pointer<std::uint8_t>(states), batch->tasks);
-        c.download(observed_counts.data(), c.pointer<i64>(counts), batch->tasks);
+        c.download(observed_counts.values.data(), c.pointer<i64>(counts), batch->tasks);
         c.finish();
-        for (const auto count : observed_counts)
+        for (const auto count : observed_counts.values)
             c.diagnostics.cell_evaluations = add(c.diagnostics.cell_evaluations, count);
-        c.diagnostics.staging_bytes = 0;
     });
 }
+#include "../common/refit_validation.h"
+#include "../common/resident.h"

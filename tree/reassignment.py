@@ -174,7 +174,11 @@ def expand_memberships(model, bank):
         for round_index in range(ROUND_LIMIT):
             labels = np.asarray(state.refit.labels, dtype=np.int64)
             centers = np.asarray(state.refit.centers, dtype=float)
-            columns = np.asarray(model.log_likelihood_columns(centers), dtype=float)
+            handles = model.joint_column_set(centers) if hasattr(model, "joint_column_set") else None
+            prepared = (bank.prepare(state.cuts, labels, fitted=state.refit, columns=handles)
+                        if hasattr(bank, "prepare") else None)
+            columns = (np.asarray(model.log_likelihood_columns(centers), dtype=float)
+                       if handles is None else handles.materialize())
             if columns.shape != (model.n, q) or len(keys) != model.n:
                 raise ValueError("Joint likelihood columns and scientific keys must match N by K")
             evaluations += 1
@@ -191,13 +195,14 @@ def expand_memberships(model, bank):
                     record["outcome"] = "no_legal_positive_gain_transfer"
                     continue
                 callbacks += 1
+                options = {} if prepared is None else {"parent": prepared}
                 candidate = bank.consider_membership(proposed, centers, {
                     "route": "fixed_k_joint_reassignment", "proposal_kind": kind,
                     "requested_k": q, "occupied_q": q,
                     "starting_bank_index": path["start_bank_index"], "round": round_index,
                     "parent_score": state.score,
                     "moved_mutations": int(np.count_nonzero(proposed != labels)),
-                })
+                }, **options)
                 record["outcome"] = "ineligible" if candidate is None else "eligible"
                 if candidate is not None:
                     if len(candidate.refit.centers) != q or not np.isfinite(candidate.score):

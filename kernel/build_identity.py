@@ -4,6 +4,8 @@ from pathlib import Path
 
 
 NATIVE_SOURCES = ('kernel/csrc/forest.cpp', 'kernel/csrc/bindings.cpp',
+                  'kernel/csrc/executor.cpp', 'kernel/csrc/executor.h',
+                  'kernel/csrc/prepared_tree.h',
                   'kernel/csrc/continuation.cpp', 'kernel/csrc/forest.h',
                   'kernel/csrc/continuation.h', *tuple(
                       path.relative_to(Path(__file__).resolve().parent.parent).as_posix()

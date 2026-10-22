@@ -13,6 +13,7 @@ from time import perf_counter
 import numpy as np
 
 from .refinement import canonical_partition, refine_partition
+from ..config import DEFAULT_MAX_CLUSTERS
 from ..kernel import ALGORITHM
 from ..kernel.candidates import Candidate as Candidate, CandidateBank as _CandidateBank, score_key as _score_key
 from ..kernel.topology import build_tree, partition_from_cuts
@@ -43,10 +44,12 @@ class TreeFit:
         return self.selected.score
 
 
-def cut_subsets(cuts):
+def cut_subsets(cuts, capacities=None):
     """Stream all connected coarsenings: up to 2**(K-1) per seed."""
     cuts = tuple(sorted(set(map(int, cuts))))
-    for size in range(len(cuts) + 1):
+    sizes = (range(len(cuts) + 1) if capacities is None else
+             sorted({int(q)-1 for q in capacities if 1 <= q <= len(cuts)+1}))
+    for size in sizes:
         yield from combinations(cuts, size)
 
 
@@ -205,9 +208,9 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
     supplemental = {}
     attempted = set(getattr(bank, "by_cuts", {})) | set(bank.ineligible)
 
-    def consider(cuts, labels, centers, provenance):
+    def consider(cuts, labels, centers, provenance, *, parent=None):
         attempted.add(tuple(cuts))
-        candidate = bank.consider(cuts, labels, centers, provenance)
+        candidate = bank.consider(cuts, labels, centers, provenance, parent=parent)
         if candidate is not None:
             supplemental[candidate.cuts] = candidate
         return candidate
@@ -246,17 +249,17 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
     strongest = sorted(supplemental.values(), key=lambda c: c.score)[:4]
     refinement_proposals = refinement_candidates = 0
 
-    def refine_consider(*args):
+    def refine_consider(*args, **kwargs):
         nonlocal refinement_proposals
         refinement_proposals += 1
-        return consider(*args)
+        return consider(*args, **kwargs)
 
     for candidate in strongest:
         if refinement_proposals == 16:
             break
         refinement_candidates += 1
         for _ in refine_partition(model, tree, candidate, refine_consider,
-                                  max_proposals=16-refinement_proposals):
+                                  max_proposals=16-refinement_proposals, prepare=bank.prepare):
             pass
     evaluated = sum((edge,) in attempted for edge in edges)
     return {"small_tree_node_limit": 64, "large_tree_split_limit": 32,
@@ -272,7 +275,7 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
             "exhaustive_tree_partition_search": False}
 
 
-def fit_regions(model, max_clusters=10, capacities=None):
+def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None):
     """Fit tree proposals followed by bounded free-center joint reassignment.
 
     Truth is deliberately absent. Every R>=1 uses this same forest continuation,
@@ -301,11 +304,11 @@ def fit_regions(model, max_clusters=10, capacities=None):
     tree = build_tree(pilot, model.observed, model.mutation_ids)
     times["tree_seconds"] = perf_counter() - started
     started = perf_counter()
-    seeds = generate_candidates(model, tree, pilot, capacities)
+    seeds = generate_candidates(model, tree, pilot, capacities, keep_raw_phi=False)
     times["continuation_seconds"] = perf_counter() - started
     bank = _CandidateBank(model, tree)
     seeds_diagnostics, refined = [], set()
-    refinement_seconds, subset_count = 0.0, 0
+    refinement_seconds, subset_count, subset_visits = 0.0, 0, 0
 
     def refine_once(proposal):
         nonlocal refinement_seconds
@@ -313,7 +316,7 @@ def fit_regions(model, max_clusters=10, capacities=None):
             return
         refined.add(proposal.cuts)
         started = perf_counter()
-        for intermediate in refine_partition(model, tree, proposal, bank.consider):
+        for intermediate in refine_partition(model, tree, proposal, bank.consider, prepare=bank.prepare):
             refined.add(intermediate.cuts)
         refinement_seconds += perf_counter() - started
 
@@ -328,7 +331,7 @@ def fit_regions(model, max_clusters=10, capacities=None):
         for reduced in cut_subsets(cuts):
             if reduced == cuts or len(reduced) + 1 in capacities:
                 continue
-            repaired = bank.consider(reduced, partition_from_cuts(tree, reduced), None, {
+            repaired = bank.consider_cuts(reduced, None, {
                 "route": "supported_coarsening_repair", "requested_k": requested,
                 "occupied_q": len(reduced) + 1, "parent_cuts": cuts,
                 "parent_route": parent["route"],
@@ -353,11 +356,10 @@ def fit_regions(model, max_clusters=10, capacities=None):
         native_candidate = bank.consider(cuts, labels, None, native)
         if native_candidate is None:
             repair_unsupported(cuts, requested, native)
-        for subset in cut_subsets(cuts):
-            subset_count += 1
-            if len(subset) + 1 not in capacities:
-                continue
-            proposal = bank.consider(subset, partition_from_cuts(tree, subset), None, {
+        subset_count += 1 << len(cuts)
+        for subset in cut_subsets(cuts, capacities):
+            subset_visits += 1
+            proposal = bank.consider_cuts(subset, None, {
                 "route": "connected_coarsening", "seed_index": index,
                 "seed_requested_k": requested, "requested_k": len(subset) + 1,
                 "occupied_q": len(subset) + 1, "seed_cuts": cuts,
@@ -398,6 +400,7 @@ def fit_regions(model, max_clusters=10, capacities=None):
         "tree_identity": tree.identity, "tree_kind": "mutation_similarity_not_phylogeny",
         "pilots": pilot_diagnostics, "seeds": seeds_diagnostics,
         "capacities": capacities, "enumerated_cut_subsets": subset_count,
+        "visited_cut_subsets": subset_visits,
         "supported_proposals": supported_proposals,
         "reassignment": reassignment,
         "original_tree_candidate_count": original_count,
@@ -414,7 +417,9 @@ def fit_regions(model, max_clusters=10, capacities=None):
                                    if str(entry["reason"]).startswith("unsupported_cluster_region")],
         "duplicate_routes": bank.duplicate_routes, "timings": times,
         "candidate_numeric_payload_bytes": sum(candidate.refit.centers.nbytes
-            + candidate.refit.weights.nbytes + (8 * len(candidate.cuts) if candidate.membership_kind == "tree"
+            + candidate.refit.weights.nbytes
+            + (0 if candidate.refit.coordinate_fits is None else candidate.refit.coordinate_fits.nbytes)
+            + (8 * len(candidate.cuts) if candidate.membership_kind == "tree"
                                                else candidate.refit.labels.nbytes)
             for candidate in bank.candidates),
         "candidate_membership_storage": "compact_tree_cut_sets_plus_bounded_explicit_general_labels",

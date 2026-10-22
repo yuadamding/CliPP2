@@ -10,6 +10,29 @@ import hashlib
 
 import numpy as np
 
+from ..io.data import readonly_array
+
+
+@dataclass(frozen=True, eq=False)
+class PreparedPartition:
+    """Short-lived expansion metadata; candidate banks retain compact cuts."""
+
+    model_identity: str
+    tree_identity: str
+    cuts: tuple | None
+    labels: np.ndarray
+    groups: tuple
+    coordinate_fits: tuple = ()
+    columns: object = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "labels", readonly_array(self.labels, dtype=np.int64))
+
+    @property
+    def membership(self):
+        return (("tree", self.cuts) if self.cuts is not None
+                else ("general", self.labels.tobytes()))
+
 
 @dataclass(frozen=True)
 class FrozenTree:
