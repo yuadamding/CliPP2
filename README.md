@@ -3,11 +3,6 @@
 CliPP2 clusters mutations jointly across one or more tumor regions and estimates
 regional cancer cell fractions (CCFs) and mutation multiplicities.
 
-Every region count uses the same regional likelihood, forest solver, candidate
-search and reporting path. A single region is an N-by-1 dataset with a sorted
-chain topology; it no longer selects a separate scalar estimator. Single-region
-results may therefore differ from earlier versions.
-
 ## Install
 
 Requires Python 3.10+ and a C++17 compiler. Run from the repository root.
@@ -41,7 +36,7 @@ columns. See [example input](examples/exampleTumor1.tsv).
 | --- | --- |
 | `mutation_id`, `sample_id` | Mutation and region identifiers |
 | `alt_count`, `ref_count`, `count_observed` | Read counts and observation flag: 1 for observed, 0 for missing |
-| `purity`, `normal_cn` | Tumor purity in `(0, 1]` and normal copy number |
+| `purity`, `normal_cn` | Tumor purity in `(0, 1]` and nonnegative integer normal CN |
 | `segment_id`, `cn_state_id`, `cn_state_fraction` | Segment, CN state and its fraction |
 | `allele_a_cn`, `allele_b_cn` | Major and minor copy numbers, with `allele_a_cn >= allele_b_cn` |
 
@@ -64,10 +59,6 @@ The output directory contains three tables:
 
 Cluster 0 has the largest CCF-vector L2 norm and is not necessarily clonal.
 
-The returned summary includes `publication.verification.allocation_diagnostics`:
-hard cluster counts, posterior expected and MAP counts, and assignment
-disagreement. These diagnostics preserve the reported assignments and mixture
-scoring; they do not add output files.
 
 ## Contact
 

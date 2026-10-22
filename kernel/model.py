@@ -151,6 +151,8 @@ class RegionalModel:
         self._refit_bytes = self._column_bytes = 0
         self.telemetry = {"refit_cache_hits": 0, "scalar_refits": 0,
                           "column_cache_hits": 0, "likelihood_columns": 0,
+                          "likelihood_column_requests": 0,
+                          "column_host_cache_hits": 0, "column_batch_reuses": 0,
                           "joint_matrix_calls": 0,
                           "scalar_refit_seconds": 0.0, "weight_seconds": 0.0}
 
@@ -302,14 +304,23 @@ class RegionalModel:
         No division by admissible prior mass: the fixed-center weight problem
         remains the same concave mixture optimization used for all-valid inputs.
         Matrix-call telemetry includes proposal scans and conditional refits;
-        emission-column computations and cache hits are counted separately.
+        likelihood_columns counts actual evaluations (unique missing centers in
+        a device batch; each uncached CPU evaluation). For successful calls,
+        likelihood_column_requests = likelihood_columns + column_host_cache_hits
+        + column_batch_reuses. Host hits reuse pre-call columns, including any
+        call-retained copies; batch reuse serves another request from a column
+        evaluated in this call. CPU recomputation after eviction is an evaluation,
+        not reuse. The legacy column_cache_hits also includes hits on newly
+        cached columns, so it overlaps these disjoint counters; do not add it.
         """
         centers = np.asarray(centers, dtype=float)
         allowed = self.assignment_admissibility(centers)
         self.telemetry["joint_matrix_calls"] += 1
+        self.telemetry["likelihood_column_requests"] += len(centers)
         # Compute uncached centers together. Public return values remain NumPy;
         # device consumers can retain workspace.joint_columns_device directly.
         fresh, retained = {}, {}
+        evaluated = set()
         if self.workspace:
             retained = {center.tobytes(): self._columns[self.identity, center.tobytes()]
                         for center in centers if (self.identity, center.tobytes()) in self._columns}
@@ -319,6 +330,7 @@ class RegionalModel:
                 matrix = self.workspace.to_host(self.workspace.joint_columns_device(
                     np.array(list(missing.values()))))
                 fresh = dict(zip(missing, matrix.T))
+                self.telemetry["likelihood_columns"] += len(missing)
         columns = []
         for k, center in enumerate(centers):
             key = (self.identity, center.tobytes())
@@ -327,15 +339,20 @@ class RegionalModel:
                 column = retained.get(key[1])
             if column is not None:
                 self.telemetry["column_cache_hits"] += 1
+                counter = "column_batch_reuses" if key[1] in evaluated else "column_host_cache_hits"
+                self.telemetry[counter] += 1
                 if key in self._columns:
                     self._columns.move_to_end(key)
             else:
                 if self.workspace:
                     column = readonly_array(fresh[key[1]])
+                    if key[1] in evaluated:
+                        self.telemetry["column_batch_reuses"] += 1
                 else:
                     emission = -self.loss(np.broadcast_to(center, (self.n, self.r))).sum(axis=1)
                     column = readonly_array(np.where(allowed[:, k], emission, -np.inf))
-                self.telemetry["likelihood_columns"] += 1
+                    self.telemetry["likelihood_columns"] += 1
+                evaluated.add(key[1])
                 size = column.nbytes + len(key[1]) + 128
                 if size <= self._cache_bytes:
                     while self._column_bytes + size > self._cache_bytes:

@@ -47,10 +47,8 @@ class TumorSimulationConfig:
 def _positive_integer(value: object, name: str, *, minimum: int = 1) -> None:
     if (
         isinstance(value, (bool, np.bool_))
-        or not isinstance(value, (int, float, np.integer, np.floating))
-        or not np.isfinite(value)
+        or not isinstance(value, (int, np.integer))
         or value < minimum
-        or int(value) != value
     ):
         raise ValueError(f"{name} must be an integer >= {minimum}.")
 

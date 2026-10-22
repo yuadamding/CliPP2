@@ -53,8 +53,8 @@ conda run -n ml1 python -m CliPP2.simulation \
 ```
 
 This is a source-only utility, not part of the installed inference wheel.
-Existing tumor directories are never overwritten. The former two-state-CN
-controls have been removed; they are not accepted compatibility switches.
+Counts and seeds require integers; existing tumor directories are never overwritten.
+Former two-state-CN controls are unsupported.
 
 The generator's six-copy CN range is independent of the inference default
 `--max-major-cn 4`. Bundle validation explicitly uses a limit of six so it can

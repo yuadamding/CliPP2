@@ -300,8 +300,8 @@ def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, A
     if not 0.0 < purity <= 1.0:
         raise TumorTxtError(f"{context} purity must lie in (0, 1].")
     normal_cn = _finite_float(row["normal_cn"], name=f"{context} normal_cn")
-    if normal_cn < 0.0:
-        raise TumorTxtError(f"{context} normal_cn must be nonnegative.")
+    if normal_cn < 0.0 or normal_cn != np.rint(normal_cn):
+        raise TumorTxtError(f"{context} normal_cn must be a nonnegative integer.")
     fraction = _finite_float(
         row["cn_state_fraction"],
         name=f"{context} cn_state_fraction",
@@ -372,7 +372,6 @@ def _validate_long_table(
         segment_id = row["segment_id"]
         state_id = row["cn_state_id"]
         sample_purities.setdefault(sample_id, []).append(row["purity"])
-        segment_key = (sample_id, segment_id)
         triple = (mutation_id, sample_id, state_id)
         if triple in observed_triples:
             raise TumorTxtError(
@@ -622,8 +621,6 @@ def _build_tumor_data(
             / math.fsum(state.fraction for state in states)
         )
 
-    alt_counts = np.where(count_observed, alt_counts, 0.0)
-    total_counts = np.where(count_observed, total_counts, 0.0)
     denominator = (1.0 - purity) * normal_cn + purity * mean_total_cn
     if np.any(~np.isfinite(denominator)) or np.any(denominator <= 0.0):
         raise TumorTxtError(

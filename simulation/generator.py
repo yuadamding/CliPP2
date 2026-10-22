@@ -109,7 +109,7 @@ def _write_patient_simulation(
     simu_purity = float(config.purity)
     n_samples = int(config.region_count)
     K_min = K_max = int(config.clone_count)
-    lambda_mut = mutation_count = int(config.mutation_count)
+    mutation_count = int(config.mutation_count)
     min_mutations_per_clone = int(config.min_mutations_per_clone)
     max_rejection_tries = int(config.max_rejection_tries)
     copy_number_config = config.copy_number
@@ -167,7 +167,6 @@ def _write_patient_simulation(
 
     cluster_id, _cluster_size, no_mutations = sample_mutations_per_clone(
         ccf_patient_clones=ccf_patient_clones,
-        lambda_mut=lambda_mut,
         mutation_count=mutation_count,
         alpha_mut=alpha_mut,
         min_mutations_per_clone=min_mutations_per_clone,

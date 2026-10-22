@@ -148,7 +148,7 @@ def verify_selected(model, result):
     if weight_gap > model.n*(1e-8+roundoff) or active_gap > 1e-8+roundoff:
         raise ValueError('Independent mixture-weight optimality check failed')
     conditional = math.fsum(columns[np.arange(model.n), labels])
-    mixture = float(logsumexp(columns + np.log(weights), axis=1).sum())
+    mixture = float(log_mass.sum())
     penalty = (q*model.r+q-1)*math.log(model.n)
     score = -2*mixture+penalty
     for name, actual, expected in (

@@ -122,7 +122,7 @@ class DeviceWorkspace:
                 or rows.ndim != 1 or not np.issubdtype(rows.dtype, np.integer)
                 or np.any(rows < 0) or np.any(rows >= self.model.n)):
             raise ValueError("Invalid region or mutation row indices")
-        return rows
+        return np.ascontiguousarray(rows, dtype=np.int64)
 
     def _observed_rows(self, region, rows):
         rows = self._validate_rows(region, rows)
@@ -210,11 +210,9 @@ class DeviceWorkspace:
         curvature = t.where(t.isfinite(ll), curvature, 1.)
         return tuple(t.where(observed[None, :], value, 0.) for value in (loss, gradient, curvature))
 
-    def _validate_ccf(self, ccf, observed=None):
+    def _validate_ccf(self, ccf):
         t = self.torch
         valid = t.isfinite(ccf) & (ccf >= 0) & (ccf <= 1)
-        if observed is not None:
-            valid |= ~observed
         # Explicit validation is a boundary synchronization, not a numerical
         # fallback; it preserves the existing finite/domain error contract.
         if not self._valid_scalar(t.all(valid)):
