@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
-
-import numpy as np
 
 from .config import DEFAULT_DEVICE, DEFAULT_MAX_CLUSTERS, DEFAULT_MAX_MAJOR_CN, FitConfig, resolve_fit_config
 from ._version import __version__
@@ -65,37 +62,15 @@ def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
                               device_memory_mb=args.device_memory_mb, cpu_threads=args.cpu_threads)
 
 
-def _printable_summary(value: object) -> object:
-    """Return the summary with non-finite floats replaced by None.
-
-    The printed representation is consumed by launch wrappers as a Python
-    literal; bare nan/inf tokens are name nodes, not literals, so a
-    non-finite value must never reach stdout.
-    """
-
-    if isinstance(value, np.ndarray):
-        return _printable_summary(value.tolist())
-    if isinstance(value, np.generic):
-        return _printable_summary(value.item())
-    if isinstance(value, dict):
-        return {key: _printable_summary(entry) for key, entry in value.items()}
-    if isinstance(value, (list, tuple)):
-        return type(value)(_printable_summary(entry) for entry in value)
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
-
-
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     from .api import process_tumor
 
-    summary = process_tumor(
+    process_tumor(
         tumor_file=Path(args.input_file),
         outdir=Path(args.outdir),
         fit_config=_fit_config_from_args(args),
     )
-    print(_printable_summary(summary))
 
 
 __all__ = ["build_parser", "main", "parse_args"]

@@ -16,6 +16,7 @@ from ..tree.candidates import candidate_evidence, replay_candidate_evidence
 
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
+OUTPUT_SCHEMA_VERSION = 12
 
 _VERIFY_ROWS = 4096
 _VERIFY_CENTERS = 32
@@ -212,17 +213,11 @@ def result_tables(model, result, tumor_id):
     for j, region in enumerate(model.region_ids):
         wide['phi_'+region] = phi[:, j]
         cluster['phi_'+region] = centers[order, j]
-    ix = np.ix_(model.active_indices, model.region_indices)
-    data = model.data
-    mixed = data.cn_state_count[ix] > 1
     calls = model.multiplicity(phi)
     calls = np.where(~model.observed & (model.support == 1), 1, calls)
     long = pd.DataFrame(dict(tumor_id=tumor_id,
         mutation_id=np.repeat(model.mutation_ids, model.r), region_id=np.tile(model.region_ids, model.n),
-        phi=phi.ravel(), major_cn=np.where(mixed, np.nan, data.major_cn[ix]).ravel(),
-        minor_cn=np.where(mixed, np.nan, data.minor_cn[ix]).ravel(), multiplicity_call=calls.ravel()))
-    if mixed.any():
-        long['mean_total_cn'] = data.mean_total_cn[ix].ravel()
+        phi=phi.ravel(), multiplicity_call=calls.ravel()))
     return dict(zip(OUTPUT_SUFFIXES, (wide, cluster, long)))
 
 
@@ -256,7 +251,8 @@ def publish(model, result, outdir, tumor_id):
         for name, digest in hashes.items():
             if hashlib.sha256((outdir/name).read_bytes()).hexdigest() != digest:
                 raise ValueError('Published TSV readback hash mismatch')
-    return {'status': 'complete', 'algorithm': ALGORITHM, 'output_schema_version': 9, 'files': hashes,
+    return {'status': 'complete', 'algorithm': ALGORITHM,
+            'output_schema_version': OUTPUT_SCHEMA_VERSION, 'files': hashes,
             'verification': verification}
 
 

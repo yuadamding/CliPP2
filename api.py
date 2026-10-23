@@ -12,14 +12,14 @@ from .io.tumor_txt import load_tumor_txt
 
 
 def process_tumor_bundle(tumor_file, outdir, fit_config=None):
-    """Fit canonical input; verify and publish three minimal tables.
+    """Publish three tables and explicitly retain in-memory research evidence.
 
-    Conditional centers are free. Candidate-generation convergence is reported,
-    not confused with a global-optimality or biological-accuracy proof.
+    Unlike ``process_tumor``, this diagnostic API returns the complete search
+    ledger and candidate bank. Neither API writes these as extra output files.
     """
     from .kernel.model import RegionalModel, MODEL_VERSION
     from .tree.selection import fit_regions
-    from .io.reporting import ALGORITHM, check_destination, exclusion_summary, publish
+    from .io.reporting import ALGORITHM, OUTPUT_SCHEMA_VERSION, check_destination, exclusion_summary, publish
     from ._source import source_fingerprint, git_source_identity
     from .kernel import KERNEL_VERSION, SCORE_DEFINITION
 
@@ -60,7 +60,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
         publication = publish(model, result, outdir, data.tumor_id)
         summary = {
             'tumor_id': data.tumor_id, 'algorithm': ALGORITHM, 'model_version': MODEL_VERSION,
-            'output_schema_version': 9, 'kernel_version': KERNEL_VERSION,
+            'output_schema_version': OUTPUT_SCHEMA_VERSION, 'kernel_version': KERNEL_VERSION,
             'source_commit': commit, 'source_dirty': dirty,
             'source_sha256': source_hash, 'input_sha256': input_hash,
             'num_mutations': model.n, 'num_regions': model.r,
@@ -81,4 +81,11 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
 
 def process_tumor(tumor_file: str | Path, outdir: str | Path,
                   fit_config: FitConfig | None = None) -> dict[str, object]:
-    return process_tumor_bundle(tumor_file, outdir, fit_config)[0]
+    """Publish the README's three tables; return compact operational metadata.
+
+    Full search diagnostics are used for verification but not returned here,
+    preventing routine callers from serializing the potentially large ledger.
+    """
+    summary, _ = process_tumor_bundle(tumor_file, outdir, fit_config)
+    del summary['diagnostics']
+    return summary
