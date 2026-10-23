@@ -3,7 +3,6 @@
 #include "../common/validation.h"
 #include "../common/refit_validation.h"
 #include "probability_plan.h"
-#include "../common/resident.h"
 #include <algorithm>
 #include <cstdio>
 #include <exception>
@@ -115,10 +114,6 @@ extern "C" int CliPP2BackendCreate(const clipp2::ObservationSoA* input, std::int
     });
 }
 extern "C" void CliPP2BackendDestroy(void* ctx) { delete static_cast<Context*>(ctx); }
-extern "C" int CliPP2BackendDimensions(void* value, std::int64_t* n, std::int64_t* r) {
-    return guarded([&] { require(n && r,"Null dimensions output");
-        const auto& view=context(value).view; *n=view.mutations; *r=view.regions; });
-}
 extern "C" int CliPP2BackendGetDiagnostics(void* value, CliPP2BackendDiagnostics* output) {
     return guarded([&] {
         require(output, "Null diagnostics output"); auto& ctx = context(value);

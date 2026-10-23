@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .topology import _cut_mask, partition_from_cuts, project_cuts
-from .native import continue_cpu, forest_quadratic, PreparedForest
+from .backend import continue_cpu, forest_quadratic, PreparedForest
 
 
 @dataclass(frozen=True)
@@ -199,10 +199,12 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
     # CUDA retains the host controller: this optimization is CPU-only.
     from .model import RegionalModel
     if (native and type(model) is RegionalModel and model.backend.kind == "cpu"
-            and model.workspace is None and "node_terms" not in vars(model)):
+            and "node_terms" not in vars(model)):
         return continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing_initializations,
                             keep_raw_phi=keep_raw_phi)
-    with PreparedForest(model.n, model.r) as prepared:
+    backend = getattr(model, "backend", None)
+    with PreparedForest(model.n, model.r, native_host_memory_bytes=(
+            None if backend is None else backend.native_host_memory_bytes)) as prepared:
         return _generate_host_candidates(model, tree, pilot, requested, lower, upper, policy,
                                          missing_initializations, keep_raw_phi, prepared)
 

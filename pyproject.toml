@@ -15,7 +15,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-interop = ["torch>=2.0"]
 test = [
     "build>=1.2",
     "pytest>=8",

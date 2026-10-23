@@ -19,7 +19,6 @@ int CliPP2BackendCreate(const clipp2::ObservationSoA*, std::int64_t workspace_by
                        int device_index, void** context);
 void CliPP2BackendDestroy(void* context);
 int CliPP2BackendGetDiagnostics(void* context, CliPP2BackendDiagnostics* output);
-int CliPP2BackendDimensions(void* context, std::int64_t* mutations, std::int64_t* regions);
 // phi and node results: [batch, region, mutation]. Status is one byte per cell.
 int CliPP2EvaluateNodes(void*, std::int64_t batches, const double* phi, int mode,
                        double* loss, double* gradient, double* curvature,

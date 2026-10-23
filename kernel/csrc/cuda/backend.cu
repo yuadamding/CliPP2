@@ -430,10 +430,6 @@ extern "C" int CliPP2BackendCreate(const ObservationSoA* input, i64 workspace_by
     });
 }
 extern "C" void CliPP2BackendDestroy(void* value) { delete static_cast<Context*>(value); }
-extern "C" int CliPP2BackendDimensions(void* value, std::int64_t* n, std::int64_t* r) {
-    return guarded([&] { require(n && r,"Null dimensions output");
-        const auto& view=context(value).data; *n=view.mutations; *r=view.regions; });
-}
 extern "C" int CliPP2BackendGetDiagnostics(void* value, CliPP2BackendDiagnostics* output) {
     return guarded([&] { require(output, "Missing CUDA diagnostic destination"); *output = context(value).diagnostics; });
 }
@@ -656,4 +652,3 @@ extern "C" int CliPP2EvaluateConditionalValues(void* value, const ConditionalBat
     });
 }
 #include "../common/refit_validation.h"
-#include "../common/resident.h"

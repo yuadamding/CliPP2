@@ -12,11 +12,11 @@ from time import perf_counter
 
 import numpy as np
 
-from .refinement import canonical_partition, refine_partition
+from .proposals import refine_partition
 from ..config import DEFAULT_MAX_CLUSTERS
 from ..kernel import ALGORITHM
-from ..kernel.candidates import Candidate as Candidate, CandidateBank as _CandidateBank, score_key as _score_key
-from ..kernel.topology import build_tree, partition_from_cuts
+from .candidates import Candidate as Candidate, CandidateBank as _CandidateBank, score_key as _score_key
+from ..kernel.topology import build_tree, canonical_partition, partition_from_cuts
 
 
 @dataclass(eq=False)
@@ -29,15 +29,15 @@ class TreeFit:
 
     @property
     def labels(self):
-        return self.selected.refit.labels
+        return self.selected.fit.labels
 
     @property
     def centers(self):
-        return self.selected.refit.centers
+        return self.selected.fit.centers
 
     @property
     def weights(self):
-        return self.selected.refit.weights
+        return self.selected.fit.weights
 
     @property
     def score(self):
@@ -376,7 +376,7 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None):
     # Finish the entire original bank before broadening the membership family.
     bank.original_selected = min(bank.candidates, key=_score_key)
     original_count = len(bank.candidates)
-    from .reassignment import expand_memberships
+    from .proposals import expand_memberships
     reassignment = expand_memberships(model, bank)
     times["reassignment_inclusive_seconds"] = reassignment.get("seconds", 0.0)
     selected = min(bank.candidates, key=_score_key)
@@ -384,7 +384,7 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None):
         raise AssertionError("Reassignment lost the original selected score")
     unique_partitions = len(bank.by_cuts)
     for candidate in bank.by_membership.values():
-        labels = candidate.refit.labels
+        labels = candidate.fit.labels
         cuts = tuple(np.flatnonzero(labels[tree.edges[:, 0]] != labels[tree.edges[:, 1]]))
         if cuts not in bank.by_cuts or not np.array_equal(partition_from_cuts(tree, cuts), labels):
             unique_partitions += 1
@@ -416,11 +416,11 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None):
         "unsupported_candidates": [entry for entry in bank.ineligible.values()
                                    if str(entry["reason"]).startswith("unsupported_cluster_region")],
         "duplicate_routes": bank.duplicate_routes, "timings": times,
-        "candidate_numeric_payload_bytes": sum(candidate.refit.centers.nbytes
-            + candidate.refit.weights.nbytes
-            + (0 if candidate.refit.coordinate_fits is None else candidate.refit.coordinate_fits.nbytes)
+        "candidate_numeric_payload_bytes": sum(candidate.fit.centers.nbytes
+            + candidate.fit.weights.nbytes
+            + (0 if candidate.fit.coordinate_fits is None else candidate.fit.coordinate_fits.nbytes)
             + (8 * len(candidate.cuts) if candidate.membership_kind == "tree"
-                                               else candidate.refit.labels.nbytes)
+                                               else candidate.fit.labels.nbytes)
             for candidate in bank.candidates),
         "candidate_membership_storage": "compact_tree_cut_sets_plus_bounded_explicit_general_labels",
         "selection": "minimum_over_complete_eligible_scored_bank",

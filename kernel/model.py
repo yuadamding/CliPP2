@@ -10,7 +10,9 @@ emissions and conditional centers share a native float64 numerical policy.
 Forest continuation, candidate selection and mixture-weight fitting stay on host.
 """
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 import hashlib
 import math
 import time
@@ -19,10 +21,11 @@ import numpy as np
 from scipy.special import gammaln
 
 from . import SCORE_DEFINITION
-from .backend import CoordinateTask, NativeBackend, NativeExecutionError, ScientificCandidateRejection
+from .backend import NativeBackend, NativeExecutionError, ScientificCandidateRejection
 from .initialization import pooled_ccf_initialization
-from .likelihood import MIXED_EPS, RegionalView, emission_terms
+from .likelihood import MIXED_EPS, RegionalView
 from .scoring import WeightConvergenceError, fit_mixture_weights
+from .topology import Membership
 from ..io.data import readonly_array
 
 
@@ -32,6 +35,33 @@ MODEL_VERSION = "clipp2_regional_full_support__general_normal_v1__mixed_cn_bulk_
 # array/key payload bytes. Shared immutable owners may be charged more than once.
 _CACHE_ENTRY_BYTES = 1280
 _MODE_ENTRY_BYTES = 768
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class CoordinateTask:
+    """Exact observed sequence with the enclosing group's all-member box."""
+
+    region: int
+    rows: np.ndarray
+    lower: float
+    upper: float
+    xatol: float
+    key: tuple
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class PreparedRefitBatch:
+    """Model-owned ordered reads, grids, boxes and incumbent coordinates."""
+
+    regions: np.ndarray
+    member_offsets: np.ndarray
+    member_rows: np.ndarray
+    grid_offsets: np.ndarray
+    grid: np.ndarray
+    lower: np.ndarray
+    upper: np.ndarray
+    xatol: np.ndarray
+    incumbent: np.ndarray
 
 
 @dataclass(frozen=True, eq=False)
@@ -71,9 +101,19 @@ class JointColumnSet:
         return matrix
 
 
-@dataclass(frozen=True)
-class RefittedPartition:
-    labels: np.ndarray
+def _freeze(value):
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(map(_freeze, value))
+    return readonly_array(value) if isinstance(value, np.ndarray) else value
+
+
+@dataclass(frozen=True, eq=False)
+class FitResult:
+    """One immutable numerical result; search provenance belongs to Candidate."""
+
+    membership: Membership
     centers: np.ndarray
     weights: np.ndarray
     conditional_log_likelihood: float
@@ -82,25 +122,29 @@ class RefittedPartition:
     score: float
     eligible: bool
     reason: str | None = None
-    diagnostics: dict = field(default_factory=dict)
+    diagnostics: Mapping = field(default_factory=dict)
     coordinate_fits: np.ndarray | None = None
 
     def __post_init__(self):
-        for name in ("labels", "centers", "weights"):
-            object.__setattr__(self, name, readonly_array(getattr(self, name)))
-        if self.coordinate_fits is not None:
-            object.__setattr__(self, "coordinate_fits", readonly_array(self.coordinate_fits))
+        for name in ("centers", "weights", "coordinate_fits"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, readonly_array(value))
+        object.__setattr__(self, "diagnostics", _freeze(self.diagnostics))
+
+    @property
+    def labels(self):
+        return self.membership.labels
 
     @property
     def penalty(self):
         return self.complexity_penalty
 
-
 class RegionalModel:
     """Immutable, canonically ordered informative mutation vectors."""
 
     def __init__(self, data, device="cpu", *, cache_bytes=32 * 1024 * 1024,
-                 grid_cache_bytes=None, device_cache_bytes=256 * 1024**2,
+                 grid_cache_bytes=None,
                  workspace_bytes=64 * 1024**2, native_host_memory_bytes=None,
                  device_memory_bytes=None, cpu_threads=None):
         self.data = data
@@ -182,12 +226,9 @@ class RegionalModel:
         self.device = str(device)
         if self.device != "cpu" and not self.device.startswith("cuda"):
             raise ValueError("Regional likelihood device must be cpu or cuda")
-        self.workspace = None
         self.grid_cache_bytes = grid_cache_bytes
         if grid_cache_bytes is not None and (type(grid_cache_bytes) is not int or grid_cache_bytes < 0):
             raise ValueError("grid_cache_bytes must be a nonnegative integer")
-        if type(device_cache_bytes) is not int or device_cache_bytes < 0:
-            raise ValueError("device_cache_bytes must be a nonnegative integer")
         if type(workspace_bytes) is not int or workspace_bytes < 0:
             raise ValueError("workspace_bytes must be a nonnegative integer")
         self.backend = NativeBackend(self, workspace_bytes,
@@ -217,15 +258,6 @@ class RegionalModel:
     def __len__(self):
         return self.n
 
-    @property
-    def slope(self):
-        """On-demand padded reference view; never retained by production fits."""
-        return self.scaling[..., None] * np.arange(1, int(self.support.max())+1)
-
-    @property
-    def valid(self):
-        return np.arange(1, int(self.support.max())+1) <= self.support[..., None]
-
     def execution_diagnostics(self):
         """Execution-only accounting; never included in model or candidate identity."""
         return {"backend": self.execution_backend, "grid_cache_bytes": self.grid_cache_bytes,
@@ -235,40 +267,14 @@ class RegionalModel:
                 "host_cache_bytes": {"preparation": self._preparation_bytes,
                                      "refit": self._refit_bytes, "column": self._column_bytes,
                                      "limit_per_category": self._cache_bytes},
-                "device": dict(self.workspace.telemetry) if self.workspace else None}
-
-    def _numpy_kernel(self, x):
-        x = np.asarray(x, dtype=float)
-        if x.shape != (self.n, self.r) or np.any(~np.isfinite(x[self.observed])):
-            raise ValueError("CCFs must match N by R and be finite where observed")
-        if np.any(x[self.observed] < 0) or np.any(x[self.observed] > 1):
-            raise ValueError("CCFs must be in [0,1]")
-        return emission_terms(np.where(self.observed, x, 0.), **{
-            name: getattr(self, name) for name in
-            ("slope", "valid", "mixed", "alt", "depth", "constants")})
-
-    def _gpu_terms(self, x, derivatives=False):
-        result = self.workspace.node_terms_device(x, derivatives=derivatives)
-        if derivatives:
-            return tuple(self.workspace.to_host(value) for value in result)
-        return self.workspace.to_host(result)
+                "device": None}
 
     def loss(self, x):
-        if self.workspace:
-            return self._gpu_terms(x)
         return self.backend.node_terms(x, False)
 
     def node_terms(self, x):
         """Loss, exact gradient, positive complete-data curvature on CCF scale."""
-        if self.workspace:
-            return self._gpu_terms(x, True)
         return self.backend.node_terms(x)
-
-    def posterior(self, x):
-        _, _, kernel, ll = self._numpy_kernel(x)
-        if not np.isfinite(ll[self.observed]).all():
-            raise ValueError("Multiplicity posterior is undefined at zero likelihood")
-        return np.where(self.observed[..., None], np.exp(kernel-ll[..., None]), np.nan)
 
     def multiplicity(self, x):
         return self.backend.multiplicity(x)
@@ -278,9 +284,6 @@ class RegionalModel:
 
     def _regional_likelihood(self, values, rows, region):
         """Grid view of the same emissions used by the joint model."""
-        if self.workspace:
-            return self.workspace.to_host(self.workspace.regional_grid_device(
-                region, rows, np.atleast_1d(values))).T
         return self.view(region, rows).log_likelihood_columns(np.atleast_1d(values)).T
 
     def pilots(self):
@@ -394,6 +397,23 @@ class RegionalModel:
             return grid, _CACHE_ENTRY_BYTES + len(task.key[4]) + grid.nbytes
         return self._prepared(("grid", task.key), prepare_grid, "coordinate_grid_cache_hits")
 
+    def prepare_refit_batch(self, tasks, incumbents=None):
+        """Prepare scientific inputs once; the backend only tiles their execution."""
+        tasks = tuple(task if isinstance(task, CoordinateTask) else self._coordinate_task(*task)
+                      for task in tasks)
+        initial = np.full(len(tasks), np.nan) if incumbents is None else np.asarray(incumbents, dtype=float)
+        if initial.shape != (len(tasks),):
+            raise ValueError("Refitting needs one incumbent per coordinate task")
+        grids = [self._coordinate_grid(task) for task in tasks]
+        integers = ([task.region for task in tasks],
+                    np.r_[0, np.cumsum([len(task.rows) for task in tasks])],
+                    np.concatenate([task.rows for task in tasks]) if tasks else [],
+                    np.r_[0, np.cumsum([len(grid) for grid in grids])])
+        floating = (np.concatenate(grids) if grids else [], [task.lower for task in tasks],
+                    [task.upper for task in tasks], [task.xatol for task in tasks], initial)
+        return PreparedRefitBatch(*(readonly_array(value, dtype=np.int64) for value in integers),
+                                  *(readonly_array(value, dtype=float) for value in floating))
+
     def _fit_coordinates(self, tasks, incumbents=None, prepared_results=None, *, return_details=False):
         tasks = [self._coordinate_task(*task) for task in tasks]
         initial = np.full(len(tasks), np.nan) if incumbents is None else np.asarray(incumbents, dtype=float)
@@ -427,8 +447,8 @@ class RegionalModel:
             start = time.perf_counter()
             pending = [task for _, task in missing]
             starts = initial[[index for index, _ in missing]]
-            fitted = (self.backend.refit(self, pending) if incumbents is None
-                      else self.backend.refit(self, pending, starts))
+            fitted = self.backend.refit(self.prepare_refit_batch(
+                pending, None if incumbents is None else starts))
             self.telemetry["scalar_refit_seconds"] += time.perf_counter()-start
             if len(fitted) != len(missing):
                 raise NativeExecutionError("Native center refit returned an incomplete task batch")
@@ -511,8 +531,7 @@ class RegionalModel:
         self.assignment_admissibility(centers)
         self.telemetry["joint_matrix_calls"] += 1
         self.telemetry["likelihood_column_requests"] += len(centers)
-        # Compute uncached centers together. Public return values remain NumPy;
-        # device consumers can retain workspace.joint_columns_device directly.
+        # Compute uncached centers together; exported columns remain NumPy.
         fresh = {}
         evaluated = set()
         retained = {center.tobytes(): self._columns[self.identity, center.tobytes()]
@@ -526,8 +545,7 @@ class RegionalModel:
                    if center.tobytes() not in retained}
         if missing:
             values = np.array(list(missing.values()))
-            matrix = (self.workspace.to_host(self.workspace.joint_columns_device(values))
-                      if self.workspace else self.backend.joint_columns(values))
+            matrix = self.backend.joint_columns(values)
             fresh = dict(zip(missing, matrix.T))
             self.telemetry["likelihood_columns"] += len(missing)
         columns = []
@@ -565,16 +583,18 @@ class RegionalModel:
         _, inverse = np.unique(labels, return_inverse=True)
         groups = tuple(self.prepare_group(np.flatnonzero(inverse == cluster))
                        for cluster in range(int(inverse.max()) + 1))
-        return self._refit_groups(inverse, groups, initial_centers)
+        return self._refit_groups(inverse, groups, initial_centers,
+                                  membership=Membership(explicit_labels=inverse))
 
     def refit_prepared(self, partition, initial_centers=None):
         """Internal path: prepared memberships avoid all-group reconstruction."""
         if partition.model_identity != self.identity:
             raise ValueError("Prepared partition belongs to another regional model")
         return self._refit_groups(partition.labels, partition.groups, initial_centers,
-                                  partition.coordinate_fits, partition.columns)
+                                  partition.coordinate_fits, partition.columns, partition.membership)
 
-    def _refit_groups(self, inverse, groups, initial_centers, prior=(), prior_columns=None):
+    def _refit_groups(self, inverse, groups, initial_centers, prior=(), prior_columns=None,
+                      membership=None):
         q = int(inverse.max())+1
         centers = np.full((q, self.r), np.nan)
         if initial_centers is not None:
@@ -592,7 +612,7 @@ class RegionalModel:
                 return_details=True)
             centers[:] = np.array([center for center, _ in fitted]).reshape(q, self.r)
         except ScientificCandidateRejection as error:
-            return RefittedPartition(inverse, centers, np.full(q, np.nan), -np.inf,
+            return FitResult(membership, centers, np.full(q, np.nan), -np.inf,
                                      -np.inf, penalty, np.inf, False, str(error),
                                      diagnostics={"rejection_kind": "scientific"})
         columns = self.joint_column_set(centers, retained_columns=prior_columns)
@@ -603,14 +623,14 @@ class RegionalModel:
             mixture = fit_mixture_weights(matrix, np.bincount(inverse),
                                           telemetry=self.telemetry)
         except WeightConvergenceError as error:
-            return RefittedPartition(inverse, centers, np.full(q, np.nan), conditional,
+            return FitResult(membership, centers, np.full(q, np.nan), conditional,
                                      -np.inf, penalty, np.inf, False, f"weight_fit:{error}",
                                      diagnostics={"rejection_kind": "weight_convergence"})
         finally:
             self.telemetry["weight_seconds"] += time.perf_counter()-start
         ll = mixture["log_likelihood"]
         eligible = bool(np.all(mixture["cluster_weights"] > 0))
-        return RefittedPartition(inverse, centers, mixture["cluster_weights"], conditional,
+        return FitResult(membership, centers, mixture["cluster_weights"], conditional,
                                  ll, penalty, -2*ll+penalty, eligible,
                                  None if eligible else "zero_mixture_weight", diagnostics={
                                      "weight_optimality_gap": mixture["weight_optimality_gap"],

@@ -7,17 +7,8 @@ from types import MappingProxyType
 
 import numpy as np
 
-from ..io.data import readonly_array
-from ..tree.refinement import canonical_partition
-from .topology import FrozenTree, PreparedPartition, partition_from_cuts
-
-
-def _freeze(value):
-    if isinstance(value, dict):
-        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(map(_freeze, value))
-    return readonly_array(value) if isinstance(value, np.ndarray) else value
+from ..kernel.model import FitResult
+from ..kernel.topology import FrozenTree, Membership, PreparedPartition, canonical_partition, partition_from_cuts
 
 
 def _plain(value):
@@ -30,60 +21,27 @@ def _plain(value):
     return value.item() if isinstance(value, np.generic) else value
 
 
-@dataclass(frozen=True, eq=False)
-class FittedState:
-    """One region-axis-preserving state for either membership representation."""
-
-    tree: object
-    cuts: tuple | None
-    explicit_labels: np.ndarray | None
-    centers: np.ndarray
-    weights: np.ndarray
-    conditional_log_likelihood: float
-    mixture_log_likelihood: float
-    complexity_penalty: float
-    score: float
-    eligible: bool
-    reason: str | None
-    diagnostics: object
-    coordinate_fits: np.ndarray | None = None
-
-    def __post_init__(self):
-        for name in ("centers", "weights", "explicit_labels", "coordinate_fits"):
-            value = getattr(self, name)
-            if value is not None:
-                object.__setattr__(self, name, readonly_array(value))
-        object.__setattr__(self, "diagnostics", _freeze(dict(self.diagnostics)))
-
-    @property
-    def labels(self):
-        return (readonly_array(partition_from_cuts(self.tree, self.cuts))
-                if self.cuts is not None else self.explicit_labels)
-
-    @property
-    def penalty(self):
-        return self.complexity_penalty
-
-
 @dataclass(eq=False)
 class Candidate:
-    cuts: tuple | None
-    refit: object
+    fit: FitResult
     provenance: list = field(default_factory=list)
-    membership_kind: str = "tree"
     state_index: int | None = None
 
     @property
     def score(self):
-        return float(self.refit.score)
+        return float(self.fit.score)
 
     @property
-    def fit(self):
-        return self.refit
+    def cuts(self):
+        return self.fit.membership.cuts
+
+    @property
+    def membership_kind(self):
+        return self.fit.membership.kind
 
     @property
     def requested_k(self):
-        return self.provenance[0].get("requested_k", len(self.refit.centers))
+        return self.provenance[0].get("requested_k", len(self.fit.centers))
 
     @property
     def kind(self):
@@ -91,13 +49,13 @@ class Candidate:
 
     @property
     def diagnostics(self):
-        return {"provenance": _plain(self.provenance), "refit": _plain(self.refit.diagnostics)}
+        return {"provenance": _plain(self.provenance), "refit": _plain(self.fit.diagnostics)}
 
 
 def score_key(candidate):
     tree = candidate.membership_kind == "tree"
-    return (candidate.score, len(candidate.refit.centers), 0 if tree else 1,
-            candidate.cuts if tree else tuple(candidate.refit.labels))
+    return (candidate.score, len(candidate.fit.centers), 0 if tree else 1,
+            candidate.cuts if tree else tuple(candidate.fit.labels))
 
 
 def _canonical_inputs(labels, centers, n, r):
@@ -164,7 +122,8 @@ class CandidateBank:
             coordinate_fits = tuple(tuple(tuple(value) for value in group)
                                     for group in fitted.coordinate_fits)
         return PreparedPartition(getattr(self.model, "identity", ""), self._tree_identity,
-                                 cuts, labels, groups, coordinate_fits,
+                                 Membership(self.tree, cuts) if cuts is not None else Membership(explicit_labels=labels),
+                                 labels, groups, coordinate_fits,
                                  columns if parent is None else parent.columns)
 
     def consider_cuts(self, cuts, centers, provenance):
@@ -179,7 +138,7 @@ class CandidateBank:
         if (partition.tree_identity != self._tree_identity
                 or partition.model_identity != getattr(self.model, "identity", "")):
             raise ValueError("Prepared partition belongs to another model/tree")
-        found, candidate = self._cached(partition.membership, centers, provenance)
+        found, candidate = self._cached(partition.membership.key, centers, provenance)
         return candidate if found else self._consider(partition, centers, provenance)
 
     def consider(self, cuts, labels, centers, provenance, *, parent=None):
@@ -222,7 +181,7 @@ class CandidateBank:
         return False, None
 
     def _consider(self, partition, centers, provenance):
-        membership, cuts, labels = partition.membership, partition.cuts, partition.labels
+        membership, cuts, labels = partition.membership.key, partition.cuts, partition.labels
         provenance = _plain(provenance)
         attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
         started = perf_counter()
@@ -252,10 +211,14 @@ class CandidateBank:
                 if cuts is None:
                     self.structural_rejections[labels.tobytes()] = rejection
             return None
-        canonical, aligned = _canonical_inputs(fitted.labels, fitted.centers, self.model.n, self.model.r)
+        # Prepared results share this exact membership; reuse its active labels
+        # instead of expanding the same retained tree cuts again for validation.
+        fitted_labels = (labels if isinstance(fitted, FitResult)
+                         and fitted.membership is partition.membership else fitted.labels)
+        canonical, aligned = _canonical_inputs(fitted_labels, fitted.centers, self.model.n, self.model.r)
         if not np.array_equal(canonical, labels):
             raise ValueError("Conditional refit changed the proposed membership")
-        order = list(dict.fromkeys(np.asarray(fitted.labels, dtype=int).tolist()))
+        order = list(dict.fromkeys(np.asarray(fitted_labels, dtype=int).tolist()))
         weights = np.asarray(fitted.weights, dtype=float)
         if (weights.shape != (len(order),) or not np.isfinite(weights).all()
                 or np.any(weights <= 0) or not np.isclose(weights.sum(), 1., atol=1e-12, rtol=0)):
@@ -270,15 +233,20 @@ class CandidateBank:
             coordinate_fits = getattr(fitted, "coordinate_fits", None)
             if coordinate_fits is not None:
                 coordinate_fits = np.asarray(coordinate_fits)[order]
-            state = FittedState(self.tree, cuts, labels if cuts is None else None, aligned, weights,
-                                float(fitted.conditional_log_likelihood), float(fitted.mixture_log_likelihood),
-                                float(fitted.complexity_penalty), float(fitted.score), True,
-                                fitted.reason, fitted.diagnostics, coordinate_fits)
-            candidate = Candidate(cuts, state, [provenance], membership[0], len(self.candidates))
+            # Production prepared refits already own the exact compact membership.
+            # Keep validating generic/public refits before aligning their row order.
+            state = fitted
+            if (not isinstance(fitted, FitResult) or fitted.membership is not partition.membership
+                    or order != list(range(len(order)))):
+                state = FitResult(partition.membership, aligned, weights,
+                                  float(fitted.conditional_log_likelihood), float(fitted.mixture_log_likelihood),
+                                  float(fitted.complexity_penalty), float(fitted.score), True,
+                                  fitted.reason, fitted.diagnostics, coordinate_fits)
+            candidate = Candidate(state, [provenance], len(self.candidates))
             self.candidates.append(candidate)
             self._states[state_key] = candidate
         else:
-            if any(getattr(candidate.refit, name) != getattr(fitted, name) for name in (
+            if any(getattr(candidate.fit, name) != getattr(fitted, name) for name in (
                     "conditional_log_likelihood", "mixture_log_likelihood", "complexity_penalty", "score")):
                 raise ValueError("Identical fitted parameters produced inconsistent candidate scores")
             candidate.provenance.append(provenance)
@@ -299,7 +267,7 @@ def candidate_evidence(tree, candidates, selected, attempts=()):
     """JSON-ready replay payload; connected memberships never store N labels."""
     states = []
     for candidate in candidates:
-        fit = candidate.refit
+        fit = candidate.fit
         states.append({
             "membership_kind": candidate.membership_kind,
             "cuts" if candidate.cuts is not None else "labels":
@@ -388,11 +356,12 @@ def replay_candidate_evidence(evidence):
                 or not np.isclose(penalty, item["complexity_penalty"], atol=1e-7, rtol=1e-10)
                 or not np.isclose(score, item["score"], atol=1e-7, rtol=1e-10)):
             raise ValueError("Candidate evidence score arithmetic is inconsistent")
-        fit = FittedState(tree, cuts, labels if cuts is None else None, centers, weights,
+        membership = (Membership(tree, cuts) if cuts is not None else Membership(explicit_labels=labels))
+        fit = FitResult(membership, centers, weights,
                           item["conditional_log_likelihood"], item["mixture_log_likelihood"],
                           item["complexity_penalty"], item["score"], True,
                           item["reason"], item["diagnostics"])
-        candidates.append(Candidate(cuts, fit, item["provenance"], kind))
+        candidates.append(Candidate(fit, item["provenance"]))
     # Arithmetic-only callers may omit attempts. A saved search ledger that
     # includes them must account for every retained eligible fitted state.
     attempts = evidence.get("refit_attempts", ())
@@ -428,7 +397,7 @@ def replay_candidate_evidence(evidence):
             raise ValueError("An eligible refit attempt is missing its retained fitted state")
         candidate = candidates[index]
         if (kind != candidate.membership_kind or cuts != candidate.cuts
-                or (cuts is None and not np.array_equal(labels, candidate.refit.labels))):
+                or (cuts is None and not np.array_equal(labels, candidate.fit.labels))):
             raise ValueError("Refit attempt and retained fitted-state memberships disagree")
         retained.add(index)
     if attempts and retained != set(range(len(candidates))):

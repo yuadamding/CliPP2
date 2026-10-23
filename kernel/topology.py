@@ -14,12 +14,52 @@ from ..io.data import readonly_array
 
 
 @dataclass(frozen=True, eq=False)
+class Membership:
+    """Retained membership: compact tree cuts or immutable explicit labels."""
+
+    tree: object = None
+    cuts: tuple | None = None
+    explicit_labels: np.ndarray | None = None
+
+    def __post_init__(self):
+        if self.cuts is None:
+            labels = np.asarray(self.explicit_labels)
+            if self.tree is not None or labels.ndim != 1 or not len(labels):
+                raise ValueError("Explicit membership needs labels and no tree")
+            if (labels.dtype.kind not in "iu" or
+                    not np.array_equal(np.unique(labels), np.arange(len(np.unique(labels))))):
+                raise ValueError("Membership labels must be occupied consecutive integer IDs")
+            object.__setattr__(self, "explicit_labels", readonly_array(labels, dtype=np.int64))
+        else:
+            cuts = tuple(self.cuts)
+            if (not isinstance(self.tree, FrozenTree) or self.explicit_labels is not None
+                    or any(not isinstance(edge, (int, np.integer)) or isinstance(edge, bool)
+                           or not 0 <= edge < len(self.tree.edges) for edge in cuts)
+                    or cuts != tuple(sorted(set(cuts)))):
+                raise ValueError("Tree membership needs sorted distinct cuts and no explicit labels")
+            object.__setattr__(self, "cuts", tuple(map(int, cuts)))
+
+    @property
+    def labels(self):
+        return (readonly_array(partition_from_cuts(self.tree, self.cuts))
+                if self.cuts is not None else self.explicit_labels)
+
+    @property
+    def kind(self):
+        return "tree" if self.cuts is not None else "general"
+
+    @property
+    def key(self):
+        return (self.kind, self.cuts if self.cuts is not None else self.explicit_labels.tobytes())
+
+
+@dataclass(frozen=True, eq=False)
 class PreparedPartition:
     """Short-lived expansion metadata; candidate banks retain compact cuts."""
 
     model_identity: str
     tree_identity: str
-    cuts: tuple | None
+    membership: Membership
     labels: np.ndarray
     groups: tuple
     coordinate_fits: tuple = ()
@@ -29,9 +69,8 @@ class PreparedPartition:
         object.__setattr__(self, "labels", readonly_array(self.labels, dtype=np.int64))
 
     @property
-    def membership(self):
-        return (("tree", self.cuts) if self.cuts is not None
-                else ("general", self.labels.tobytes()))
+    def cuts(self):
+        return self.membership.cuts
 
 
 @dataclass(frozen=True)
@@ -191,6 +230,22 @@ def partition_from_cuts(tree, cuts):
     for i in sorted(range(tree.n), key=lambda i: tree.mutation_ids[i]):
         mapping.setdefault(int(roots[i]), len(mapping))
     return np.array([mapping[int(root)] for root in roots], dtype=np.int64)
+
+
+def canonical_partition(labels, centers=None):
+    """Canonicalize by the first node in each block, preserving center alignment."""
+    labels = np.asarray(labels)
+    if labels.ndim != 1 or not len(labels):
+        raise ValueError("A partition must be a nonempty label vector")
+    seen = {}
+    result = np.empty(len(labels), dtype=np.int64)
+    for index, value in enumerate(labels.tolist()):
+        if value not in seen:
+            seen[value] = len(seen)
+        result[index] = seen[value]
+    if centers is None:
+        return result
+    return result, np.asarray(centers)[list(seen)].copy()
 
 
 def project_cuts(tree, x, k):
