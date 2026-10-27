@@ -26,8 +26,10 @@ __device__ bool ordered_tree_node(i64 count, int depth, int index,
 // eight-aligned split can leave a 135-value child).
 __device__ double ordered_block_sum(const double* values, i64 count,
                                      double* partials, double* total) {
-    if (!threadIdx.x) *total = -0.0;
+    // Publish this call's inputs and wait for every warp to consume the prior
+    // return value before reusing total. A barrier after the reset is too late.
     __syncthreads();
+    if (!threadIdx.x) *total = -0.0;
     if (count <= 128) {
         if (!threadIdx.x) *total = pairwise_sum(OrderedArrayValues{values}, 0, count);
         __syncthreads();

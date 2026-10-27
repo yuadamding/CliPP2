@@ -203,18 +203,23 @@ void refit_cuda(Context& c, const RefitBatch& batch, RefitResult* output) {
         c.download(observed_counts.values.data(), c.pointer<i64>(b.counts), tasks);
         c.finish();
         for (i64 task = 0; task < tasks; ++task) {
-            i64 reused_points = 0;
-            if (!cached.tables.empty() && cached.tables[task]
+            i64 regular_points = 0;
+            if (batch.lower[first + task] == 0 && batch.upper[first + task] == 1
                     && output[first + task].status != static_cast<int>(RefitStatus::InvalidBox)
                     && output[first + task].status != static_cast<int>(RefitStatus::Unsupported)) {
                 for (i64 point = batch.grid_offsets[first + task];
                      point < batch.grid_offsets[first + task + 1]; ++point)
-                    reused_points += regular_grid_index(batch.grid[point]) >= 0;
+                    regular_points += regular_grid_index(batch.grid[point]) >= 0;
             }
+            const i64 reused_points = !cached.tables.empty() && cached.tables[task] ? regular_points : 0;
             const i64 reused = multiply(observed_counts.values[task], reused_points);
+            if (output[first + task].status == static_cast<int>(RefitStatus::Ok))
+                record_grid_demand(c, batch.regions[first + task],
+                    multiply(observed_counts.values[task], regular_points - reused_points));
             c.grid_reused_cells = add(c.grid_reused_cells, reused);
             const i64 logical = multiply(observed_counts.values[task], output[first + task].evaluations);
             c.grid_fresh_cells = add(c.grid_fresh_cells, logical - reused);
+            c.grid_direct_cells = add(c.grid_direct_cells, logical - reused);
             c.diagnostics.cell_evaluations = add(c.diagnostics.cell_evaluations,
                 logical);
         }

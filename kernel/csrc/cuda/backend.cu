@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -63,8 +64,10 @@ struct Layout {
 };
 
 struct Context;
+bool evict_optional_grid_cache(Context&);
 void release_optional_grid_cache(Context&);
 void destroy_grid_cache(Context&) noexcept;
+bool evict_optional_scoring_cache(Context&);
 void release_optional_scoring_cache(Context&);
 void destroy_scoring_state(Context&) noexcept;
 i64 scoring_host_bytes(Context&) noexcept;
@@ -78,9 +81,12 @@ struct Context {
     CliPP2BackendDiagnostics diagnostics{};
     i64 host_staging_limit = 0;
     i64 resident_limit = 0, resident_bytes = 0, resident_peak_bytes = 0;
-    i64 optional_cache_limit = 0, optional_cache_bytes = 0, grid_cache_host_bytes = 0;
+    i64 optional_cache_limit = 0, optional_cache_bytes = 0, grid_cache_host_bytes = 0,
+        grid_retained_bytes = 0;
+    i64 cache_clock = 0;
     i64 grid_cache_hits = 0, grid_cache_misses = 0, grid_reused_cells = 0,
         grid_fresh_cells = 0;
+    i64 grid_build_cells = 0, grid_direct_cells = 0, grid_admission_bypasses = 0, grid_evictions = 0;
     cudaError_t resident_release_error = cudaSuccess;
     void* grid_state = nullptr;
     void* scoring_state = nullptr;
@@ -97,10 +103,8 @@ struct Context {
     }
     unsigned char* allocate_resident(i64 bytes) {
         require(bytes >= 0, "Negative resident CUDA allocation");
-        if (bytes > resident_limit - resident_bytes) {
-            release_optional_grid_cache(*this);
-            release_optional_scoring_cache(*this);
-        }
+        while (bytes > resident_limit - resident_bytes &&
+               (evict_optional_scoring_cache(*this) || evict_optional_grid_cache(*this))) {}
         cuda_check(resident_release_error, "release resident CUDA storage");
         require(bytes <= resident_limit - resident_bytes,
                 "Resident CUDA storage exceeds device budget");
@@ -122,11 +126,12 @@ struct Context {
         diagnostics.cache_bytes = resident_bytes;
     }
     bool retain_optional(i64 bytes) {
-        if (bytes < 0 || bytes > optional_cache_limit) return false;
-        if (bytes > optional_cache_limit - optional_cache_bytes) {
-            release_optional_grid_cache(*this);
-            release_optional_scoring_cache(*this);
-        }
+        if (bytes < 0 || bytes > optional_cache_limit - grid_retained_bytes) return false;
+        // An optional column/arena may replace cold scoring entries, not an
+        // expensive grid. Keep an admitted regional subset when all tables do
+        // not fit; cycling those tables would repeat 513*N evaluations.
+        while (bytes > optional_cache_limit - optional_cache_bytes &&
+               evict_optional_scoring_cache(*this)) {}
         if (bytes > optional_cache_limit - optional_cache_bytes) return false;
         optional_cache_bytes += bytes;
         return true;
@@ -181,10 +186,8 @@ struct HostCounts {
     std::vector<i64> values;
     HostCounts(Context& owner,i64 count):context(owner) {
         const auto bytes=multiply(count,sizeof(i64));
-        if (bytes > owner.host_staging_limit - owner.grid_cache_host_bytes - scoring_host_bytes(owner)) {
-            release_optional_grid_cache(owner);
-            release_optional_scoring_cache(owner);
-        }
+        while (bytes > owner.host_staging_limit - owner.grid_cache_host_bytes - scoring_host_bytes(owner)
+               && (evict_optional_scoring_cache(owner) || evict_optional_grid_cache(owner))) {}
         require(bytes<=owner.host_staging_limit-owner.grid_cache_host_bytes-scoring_host_bytes(owner),
                 "CUDA host staging exceeds native host budget");
         values.resize(static_cast<std::size_t>(count));
@@ -476,6 +479,15 @@ extern "C" int CliPP2CUDAReuseDiagnostics(void* value, i64* output) {
             c.grid_cache_misses, c.grid_reused_cells, c.grid_fresh_cells, c.grid_cache_host_bytes,
             scoring_persistent_host_bytes(c)};
         std::copy(values, values + 11, output);
+    });
+}
+extern "C" int CliPP2CUDAGridAdmissionDiagnostics(void* value, i64* output) {
+    return guarded([&] {
+        require(output, "Missing CUDA grid-admission diagnostic destination");
+        auto& c = context(value);
+        const i64 values[] = {c.grid_build_cells, c.grid_direct_cells,
+            c.grid_admission_bypasses, c.grid_evictions};
+        std::copy(values, values + 4, output);
     });
 }
 extern "C" int CliPP2ReleaseCUDAOptionalCache(void* value) {

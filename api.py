@@ -48,7 +48,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
                                                     else config.native_host_memory_mb * 1024**2),
                           device_memory_bytes=(None if config.device_memory_mb is None
                                                else config.device_memory_mb * 1024**2),
-                          cpu_threads=config.cpu_threads)
+                          cpu_threads=config.cpu_threads, score_capacity=config.max_clusters)
     try:
         result = fit_regions(model, config.max_clusters)
         if input_fingerprint(path) != input_hash:

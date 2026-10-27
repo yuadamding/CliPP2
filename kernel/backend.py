@@ -10,6 +10,7 @@ import numpy as np
 
 from .build_identity import NATIVE_SOURCES, backend_identity, native_identity as _native_identity
 from .execution import resolve_cpu_threads, resolve_memory_budget
+from ..config import DEFAULT_MAX_CLUSTERS
 
 
 _D = ct.POINTER(ct.c_double)
@@ -63,6 +64,7 @@ class DeviceMixtureProblem:
     def __init__(self, backend, columns):
         self._owner = weakref.ref(backend)
         self.handle = 0
+        self._transfer_endpoint = None
         handles = backend._column_handles(columns)
         result = ct.c_int64()
         backend._check(backend.lib.CliPP2CreateMixtureProblem(
@@ -95,18 +97,23 @@ class DeviceMixtureProblem:
         return weights
 
     def prepare_transfer(self, weights, grow, shrink):
+        self._transfer_endpoint = None
         owner = self.backend()
         weights = self._weights(weights)
         if not (0 <= grow < self.shape[1] and 0 <= shrink < self.shape[1]
                 and grow != shrink and weights[shrink] > 0):
             raise ValueError("Invalid pairwise mixture transfer")
-        owner._check(owner.lib.CliPP2PrepareMixtureTransfer(
-            owner.context, self.handle, _ptr(weights), grow, shrink))
+        endpoint = ct.c_double()
+        owner._check(owner.lib.CliPP2PrepareMixtureTransferEndpoint(
+            owner.context, self.handle, _ptr(weights), grow, shrink, ct.byref(endpoint)))
+        self._transfer_endpoint = endpoint.value
 
     def transfer_derivative(self, fraction):
         owner = self.backend()
         if not np.isfinite(fraction) or not 0 <= fraction <= 1:
             raise ValueError("Mixture transfer fraction must be in [0,1]")
+        if fraction == 1 and self._transfer_endpoint is not None:
+            return self._transfer_endpoint
         result = ct.c_double()
         owner._check(owner.lib.CliPP2MixtureTransferDerivative(
             owner.context, self.handle, fraction, ct.byref(result)))
@@ -172,11 +179,44 @@ def _array(value, dtype=np.float64):
     return np.ascontiguousarray(value, dtype=dtype)
 
 
+def _cuda_memory_plan(n, r, q, device_bytes, workspace_bytes, mixture_bytes):
+    """Reserve scoring before preferred scratch, without changing candidate K.
+
+    The resident minimum includes one candidate and one retained parent column
+    set. Other concurrent leases still use native admission; this is not a
+    guarantee that arbitrarily many live candidates fit. The 64-byte scratch
+    floor covers the smallest tiled primitives, not a whole refit task.
+    """
+    observations = 57*n*r
+    columns = 8*n*q
+    header = 8*q*(r+1)+4
+    resident_minimum = 2*columns + mixture_bytes + header
+    minimum_workspace = 64
+    minimum = observations + resident_minimum + minimum_workspace
+    if device_bytes < minimum or workspace_bytes < minimum_workspace:
+        raise NativeExecutionError(
+            f"CUDA memory plan for N={n}, R={r}, q={q} requires {minimum} device bytes "
+            f"(observations={observations}, scoring_arena={mixture_bytes}, "
+            f"columns={columns}, retained_parent_columns={columns}, "
+            f"column_header={header}, minimum_tiled_workspace={minimum_workspace}); "
+            f"device budget={device_bytes}, requested workspace={workspace_bytes}")
+    resolved_workspace = min(workspace_bytes, device_bytes-observations-resident_minimum)
+    return {"score_capacity_hint": q, "prepared_bytes": observations,
+            "scoring_arena_bytes": mixture_bytes, "column_bytes": columns,
+            "retained_parent_column_bytes": columns, "column_header_bytes": header,
+            "minimum_tiled_workspace_bytes": minimum_workspace,
+            "minimum_resident_bytes": resident_minimum, "minimum_device_bytes": minimum,
+            "requested_workspace_bytes": workspace_bytes,
+            "workspace_bytes": resolved_workspace,
+            "resident_limit": device_bytes-observations-resolved_workspace}
+
+
 class NativeBackend:
     """Owns prepared SoA fields; never silently substitutes a CPU backend."""
 
     def __init__(self, model, workspace_bytes, *, native_host_memory_bytes=None,
-                 device_memory_bytes=None, cpu_threads=None, device_cache_bytes=256*1024**2):
+                 device_memory_bytes=None, cpu_threads=None, device_cache_bytes=256*1024**2,
+                 score_capacity=DEFAULT_MAX_CLUSTERS):
         self.context = None
         kind = "cuda" if model.device.startswith("cuda") else "cpu"
         paths = sorted(Path(__file__).parent.glob(f"_native_{kind}*.so"))
@@ -233,11 +273,24 @@ class NativeBackend:
             device_index = int(model.device.split(":", 1)[1]) if ":" in model.device else 0
             self._check(lib.CliPP2DeviceMemoryInfo(device_index, ct.byref(free), ct.byref(total)))
             self.device_memory_bytes = resolve_memory_budget(device_memory_bytes, free=free.value, device=True)
-            if required > self.device_memory_bytes:
-                raise NativeExecutionError(f"Prepared observations require {required} device bytes; "
-                                           f"budget is {self.device_memory_bytes}")
-            workspace_bytes = min(workspace_bytes, self.device_memory_bytes - required)
-            self.workspace_bytes = workspace_bytes
+            if type(score_capacity) is not int or score_capacity < 1:
+                raise ValueError("score_capacity must be a positive integer allocation hint")
+            score_capacity = min(model.n, score_capacity)
+            query = lib.CliPP2CUDAMixtureRequiredBytes
+            query.argtypes, query.restype = [ct.c_int64, ct.c_int64, _I], ct.c_int
+            mixture_bytes = ct.c_int64()
+            self._check(query(model.n, score_capacity, ct.byref(mixture_bytes)))
+            self.device_memory_plan = _cuda_memory_plan(
+                model.n, model.r, score_capacity, self.device_memory_bytes,
+                workspace_bytes, mixture_bytes.value)
+            # An upper bound, not a feasibility gate: duplicate/clipped mode
+            # knots can make actual grids much smaller. Native refit admission
+            # checks the exact current task before allocating any scratch.
+            self.device_memory_plan["full_region_refit_workspace_upper_bound"] = max(
+                24*int(model.observed[:, region].sum()) + 16*(513 + sum(
+                    map(int, model.support[model.observed[:, region], region]))) + 136
+                for region in range(model.r))
+            workspace_bytes = self.workspace_bytes = self.device_memory_plan["workspace_bytes"]
         fields = [_array(value.T) for value in (
             model.alt, model.depth-model.alt, model.scaling, model.constants, model.lower, model.upper)]
         fields += [_array(model.support.T, np.int64),
@@ -279,15 +332,18 @@ class NativeBackend:
                 "ReleaseMixtureProblem": [ct.c_void_p, ct.c_int64],
                 "EvaluateMixture": [ct.c_void_p, ct.c_int64, _D, _D, _D, _D],
                 "PrepareMixtureTransfer": [ct.c_void_p, ct.c_int64, _D, ct.c_int64, ct.c_int64],
+                "PrepareMixtureTransferEndpoint": [ct.c_void_p, ct.c_int64, _D, ct.c_int64, ct.c_int64, _D],
                 "MixtureTransferDerivative": [ct.c_void_p, ct.c_int64, ct.c_double, _D],
                 "CUDAScoringDiagnostics": [ct.c_void_p, _I],
+                "CUDAScoringArenaDiagnostics": [ct.c_void_p, _I],
+                "CUDAGridAdmissionDiagnostics": [ct.c_void_p, _I],
                 "CUDAReuseDiagnostics": [ct.c_void_p, _I],
                 "ReleaseCUDAOptionalCache": [ct.c_void_p],
             }
             for name, args in signatures.items():
                 function = getattr(lib, "CliPP2" + name)
                 function.argtypes, function.restype = args, ct.c_int
-            resident_limit = max(0, self.device_memory_bytes-required-self.workspace_bytes)
+            resident_limit = self.device_memory_plan["resident_limit"]
             self._check(lib.CliPP2ConfigureCUDAReuse(
                 self.context, resident_limit, min(device_cache_bytes, resident_limit)))
 
@@ -378,6 +434,7 @@ class NativeBackend:
                            cpu_threads=self.cpu_threads, native_host_bytes=self.native_host_bytes)
         if self.kind == "cuda":
             diagnostics["host_staging_bytes_limit"] = self.host_staging_bytes_limit
+            diagnostics["device_memory_plan"] = dict(self.device_memory_plan)
         return diagnostics
 
     def _tile_count(self, count, per_cell, fixed=16):
@@ -498,6 +555,23 @@ class NativeBackend:
         return dict(zip(("column_evaluations", "column_cache_hits", "column_exports",
                          "column_gathers", "weight_evaluations", "transfer_preparations",
                          "transfer_trials", "live_column_handles", "live_mixture_problems"),
+                        map(int, counters)))
+
+    def scoring_arena_diagnostics(self):
+        self._require_open()
+        if self.kind != "cuda":
+            raise ValueError("Resident scoring diagnostics require CUDA")
+        counters = np.empty(3, dtype=np.int64)
+        self._check(self.lib.CliPP2CUDAScoringArenaDiagnostics(self.context, _ptr(counters)))
+        return dict(zip(("allocations", "reuses", "idle_bytes"), map(int, counters)))
+
+    def grid_admission_diagnostics(self):
+        self._require_open()
+        if self.kind != "cuda":
+            raise ValueError("Grid admission diagnostics require CUDA")
+        counters = np.empty(4, dtype=np.int64)
+        self._check(self.lib.CliPP2CUDAGridAdmissionDiagnostics(self.context, _ptr(counters)))
+        return dict(zip(("build_cells", "direct_cells", "admission_bypasses", "evictions"),
                         map(int, counters)))
 
     def import_joint_columns(self, log_columns):

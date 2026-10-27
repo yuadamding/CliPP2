@@ -58,17 +58,23 @@ int CliPP2GatherJointColumns(void*, std::int64_t count, const std::int64_t* hand
                             const std::int64_t* labels, double* assigned);
 int CliPP2CreateMixtureProblem(void*, std::int64_t count, const std::int64_t* handles,
                               std::int64_t* problem);
+int CliPP2CUDAMixtureRequiredBytes(std::int64_t mutations, std::int64_t columns,
+                                  std::int64_t* bytes);
 int CliPP2ReleaseMixtureProblem(void*, std::int64_t problem);
 int CliPP2EvaluateMixture(void*, std::int64_t problem, const double* weights,
                          double* objective, double* gradient, double* log_likelihood);
 int CliPP2PrepareMixtureTransfer(void*, std::int64_t problem, const double* weights,
                                std::int64_t grow, std::int64_t shrink);
+int CliPP2PrepareMixtureTransferEndpoint(void*, std::int64_t problem, const double* weights,
+                                       std::int64_t grow, std::int64_t shrink, double* derivative);
 int CliPP2MixtureTransferDerivative(void*, std::int64_t problem, double fraction,
                                    double* derivative);
 // Fixed-length counter vectors; do not change the shared diagnostic struct.
 int CliPP2CUDAReuseDiagnostics(void*, std::int64_t* counters11);
+int CliPP2CUDAGridAdmissionDiagnostics(void*, std::int64_t* counters4);
 int CliPP2ReleaseCUDAOptionalCache(void*);
 int CliPP2CUDAScoringDiagnostics(void*, std::int64_t* counters9);
+int CliPP2CUDAScoringArenaDiagnostics(void*, std::int64_t* counters3);
 }
 
 namespace clipp2 {

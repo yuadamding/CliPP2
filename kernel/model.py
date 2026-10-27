@@ -28,6 +28,7 @@ from .likelihood import MIXED_EPS, RegionalView
 from .scoring import WeightConvergenceError, fit_mixture_weights
 from .topology import Membership
 from ..io.data import readonly_array
+from ..config import DEFAULT_MAX_CLUSTERS
 
 
 # Mixed-CN emissions/boxes stay fixed; their assignment mask now enters scoring.
@@ -154,7 +155,8 @@ class RegionalModel:
     def __init__(self, data, device="cpu", *, cache_bytes=32 * 1024 * 1024,
                  grid_cache_bytes=None,
                  workspace_bytes=64 * 1024**2, native_host_memory_bytes=None,
-                 device_memory_bytes=None, cpu_threads=None, device_cache_bytes=256*1024**2):
+                 device_memory_bytes=None, cpu_threads=None, device_cache_bytes=256*1024**2,
+                 score_capacity=DEFAULT_MAX_CLUSTERS):
         self.data = data
         ids, regions = tuple(data.mutation_ids), tuple(data.region_ids)
         if any(not isinstance(x, str) for x in ids + regions):
@@ -242,7 +244,8 @@ class RegionalModel:
         self.backend = NativeBackend(self, workspace_bytes,
                                      native_host_memory_bytes=native_host_memory_bytes,
                                      device_memory_bytes=device_memory_bytes,
-                                     cpu_threads=cpu_threads, device_cache_bytes=device_cache_bytes)
+                                     cpu_threads=cpu_threads, device_cache_bytes=device_cache_bytes,
+                                     score_capacity=score_capacity)
         self.execution_backend = f"native_{self.backend.kind}_likelihood_host_forest"
         self._cache_bytes = int(cache_bytes)
         if self._cache_bytes < 0:
@@ -509,12 +512,17 @@ class RegionalModel:
             self._refits[key] = (fitted, size)
             self._refit_bytes += size
 
-    def assignment_admissibility(self, centers):
-        """N-by-q closed-box assignments, including regions without reads."""
+    def _validate_centers(self, centers):
+        """Validate only q-by-R metadata; do not construct an N-by-q mask."""
         centers = np.asarray(centers, dtype=float)
         if (centers.ndim != 2 or not len(centers) or centers.shape[1] != self.r
                 or not np.isfinite(centers).all()):
             raise ValueError("Centers must be finite nonempty q by R CCFs")
+        return centers
+
+    def assignment_admissibility(self, centers):
+        """N-by-q closed-box assignments, including regions without reads."""
+        centers = self._validate_centers(centers)
         return ((centers[None, :, :] >= self.lower[:, None, :])
                 & (centers[None, :, :] <= self.upper[:, None, :])).all(axis=2)
 
@@ -537,8 +545,7 @@ class RegionalModel:
         The legacy column_cache_hits also includes hits on newly
         cached columns, so it overlaps these disjoint counters; do not add it.
         """
-        centers = np.asarray(centers, dtype=float)
-        self.assignment_admissibility(centers)
+        centers = self._validate_centers(centers)
         self.telemetry["joint_matrix_calls"] += 1
         self.telemetry["likelihood_column_requests"] += len(centers)
         # Native CUDA owns its optional shared cache separately from active

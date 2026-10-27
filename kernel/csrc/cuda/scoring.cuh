@@ -33,16 +33,31 @@ struct ResidentColumn {
     ResidentColumn(Context& context):values(context,multiply(context.data.mutations,8)) {}
     double* data() { return values.at<double>(); }
 };
-struct MixtureProblem {
+struct MixtureLayout {
+    i64 n,q,chunks,bytes=0,pointers=0,weights=0,log_weights=0,offset=0,kernel=0,terms=0,partials=0,sums=0;
+    i64 other=0,grow_log=0,shrink_log=0,numerator=0,sign=0,invalid=0;
+    MixtureLayout(i64 rows,i64 count):n(rows),q(count),chunks(rows/8192+(rows%8192!=0)) {
+        if(n<=0 || q<=0) throw std::domain_error("CUDA mixture dimensions must be positive");
+        Layout layout;
+        pointers=layout.take<const double*>(q); weights=layout.take<double>(q);
+        log_weights=layout.take<double>(q);
+        offset=layout.take<double>(n); kernel=layout.take<double>(multiply(n,q));
+        terms=layout.take<double>(multiply(n,add(q,2)));
+        partials=layout.take<double>(multiply(chunks,add(q,2)));
+        sums=layout.take<double>(add(q,2)); other=layout.take<double>(n);
+        grow_log=layout.take<double>(n); shrink_log=layout.take<double>(n);
+        numerator=layout.take<double>(n); sign=layout.take<double>(n);
+        invalid=layout.take<int>(1); bytes=layout.bytes;
+    }
+};
+struct MixtureProblem:MixtureLayout {
     Context& context;
     std::vector<std::shared_ptr<ResidentColumn>> columns;
     std::unique_ptr<ScoringAllocation> allocation;
-    i64 n=0,q=0,chunks=0,pointers=0,weights=0,offset=0,kernel=0,terms=0,partials=0,sums=0;
-    i64 other=0,grow_log=0,shrink_log=0,numerator=0,sign=0,invalid=0;
     double grow_weight=0,amount=0;
     bool pair_ready=false;
     i64 host_charge=0;
-    explicit MixtureProblem(Context& owner):context(owner) {}
+    MixtureProblem(Context& owner,i64 count):MixtureLayout(owner.data.mutations,count),context(owner) {}
     template<class T> T* at(i64 position) { return allocation->at<T>(position); }
 };
 struct ScoringCacheEntry {
@@ -56,6 +71,9 @@ struct ScoringState {
     std::map<i64,std::unique_ptr<MixtureProblem>> problems;
     std::map<std::string,ScoringCacheEntry> cache;
     std::list<std::string> order;
+    // Only idle scratch is retained. Live problems always own distinct arenas.
+    std::unique_ptr<ScoringAllocation> arena_cache;
+    i64 arena_allocations=0,arena_reuses=0;
     i64 host_bytes=0,staging_bytes=0;
     // evaluations, cache hits, exports, gathers, weight evaluations,
     // transfer preparations, O(N) trials, live handles, live problems.
@@ -70,8 +88,8 @@ struct ScoringState {
 ScoringState& scoring_state(Context& c) {
     if(!c.scoring_state) {
         const i64 charge=add(sizeof(ScoringState),128);
-        if(charge>c.host_staging_limit-add(c.grid_cache_host_bytes,c.diagnostics.staging_bytes))
-            release_optional_grid_cache(c);
+        while(charge>c.host_staging_limit-add(c.grid_cache_host_bytes,c.diagnostics.staging_bytes)
+                && evict_optional_grid_cache(c)) {}
         require(charge<=c.host_staging_limit-add(c.grid_cache_host_bytes,c.diagnostics.staging_bytes),
                 "CUDA scoring registry exceeds native host budget");
         auto state=std::make_unique<ScoringState>(); state->host_bytes=charge;
@@ -88,13 +106,26 @@ i64 scoring_persistent_host_bytes(Context& c) noexcept {
     if(!c.scoring_state) return 0;
     return static_cast<ScoringState*>(c.scoring_state)->host_bytes;
 }
-void release_optional_scoring_cache(Context& c) {
-    if(!c.scoring_state) return;
+bool evict_optional_scoring_cache(Context& c) {
+    if(!c.scoring_state) return false;
     auto& s=*static_cast<ScoringState*>(c.scoring_state);
-    for(const auto& entry:s.cache) {
-        c.drop_optional(entry.second.charge); s.host_bytes-=entry.second.host_charge;
+    // Reusing an arena saves allocation, whereas a column saves computation.
+    // Give the latter priority; mandatory live leases are never invalidated.
+    if(s.arena_cache) {
+        c.drop_optional(s.arena_cache->bytes);
+        s.arena_cache.reset();
+        return true;
     }
-    s.cache.clear(); s.order.clear();
+    if(s.order.empty()) return false;
+    const auto cold=s.cache.find(s.order.front());
+    c.drop_optional(cold->second.charge);
+    s.host_bytes-=cold->second.host_charge;
+    s.cache.erase(cold);
+    s.order.pop_front();
+    return true;
+}
+void release_optional_scoring_cache(Context& c) {
+    while(evict_optional_scoring_cache(c)) {}
 }
 void destroy_scoring_state(Context& c) noexcept {
     if(!c.scoring_state) return;
@@ -127,8 +158,8 @@ template<class Function> int scoring_guarded(Function function) {
 }
 void check_scoring_host(Context& c,i64 extra) {
     auto used=add(scoring_host_bytes(c),add(c.grid_cache_host_bytes,c.diagnostics.staging_bytes));
-    if(extra>c.host_staging_limit-used) {
-        release_optional_grid_cache(c); release_optional_scoring_cache(c);
+    while(extra>c.host_staging_limit-used &&
+            (evict_optional_scoring_cache(c) || evict_optional_grid_cache(c))) {
         used=add(scoring_host_bytes(c),add(c.grid_cache_host_bytes,c.diagnostics.staging_bytes));
     }
     require(extra<=c.host_staging_limit-used,"CUDA scoring host metadata/staging exceeds native host budget");
@@ -276,8 +307,12 @@ void reduce_mixture(MixtureProblem& p,i64 planes) {
         p.at<double>(p.partials),p.chunks,planes,p.at<double>(p.sums));
     c.launched();
 }
+__global__ void mixture_log_weights_kernel(const double* weights,i64 q,double* logs) {
+    for(i64 k=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;k<q;
+        k+=static_cast<i64>(gridDim.x)*blockDim.x) logs[k]=log(weights[k]);
+}
 __global__ void mixture_pair_kernel(const double* const* columns,const double* offsets,
-        const double* weights,i64 n,i64 q,i64 grow,i64 shrink,double* other,
+        const double* log_weights,i64 n,i64 q,i64 grow,i64 shrink,double* other,
         double* grow_log,double* shrink_log,double* numerator,double* sign) {
     for(i64 row=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;row<n;
         row+=static_cast<i64>(gridDim.x)*blockDim.x) {
@@ -287,21 +322,21 @@ __global__ void mixture_pair_kernel(const double* const* columns,const double* o
         // complement is constructed once from the original finite log support.
         double maximum=-positive_infinity;
         for(i64 k=0;k<q;++k) if(k!=grow && k!=shrink) {
-            const double value=columns[k][row]-offset+log(weights[k]);
+            const double value=columns[k][row]-offset+log_weights[k];
             if(value>maximum) maximum=value;
         }
         double complement=maximum;
         if(maximum!=-positive_infinity) {
             double sum=0.;
             for(i64 k=0;k<q;++k) if(k!=grow && k!=shrink)
-                sum+=exp(columns[k][row]-offset+log(weights[k])-maximum);
+                sum+=exp(columns[k][row]-offset+log_weights[k]-maximum);
             complement=maximum+log(sum);
         }
         other[row]=complement;
         if(a==b) { numerator[row]=-positive_infinity; sign[row]=0.; }
         else {
             const double high=a>b?a:b,delta=fabs(a-b);
-            numerator[row]=log(weights[shrink])+high+log(-expm1(-delta));
+            numerator[row]=log_weights[shrink]+high+log(-expm1(-delta));
             sign[row]=a>b?1.:-1.;
         }
     }
@@ -330,6 +365,30 @@ void validate_scoring_weights(const double* weights,i64 q) {
         positive=positive||weights[k]>0.;
     }
     if(!positive) throw std::domain_error("CUDA mixture weights must be nonzero");
+}
+void prepare_mixture_transfer(MixtureProblem& p,const double* weights,i64 grow,i64 shrink) {
+    auto& c=p.context;
+    p.pair_ready=false;
+    validate_scoring_weights(weights,p.q);
+    if(grow<0||grow>=p.q||shrink<0||shrink>=p.q||grow==shrink||weights[shrink]<=0.)
+        throw std::domain_error("Invalid CUDA pairwise mixture transfer");
+    p.grow_weight=weights[grow]; p.amount=weights[shrink];
+    c.upload(p.at<double>(p.weights),weights,p.q);
+    mixture_log_weights_kernel<<<blocks(p.q),threads,0,c.stream>>>(
+        p.at<double>(p.weights),p.q,p.at<double>(p.log_weights));
+    c.launched();
+    mixture_pair_kernel<<<blocks(p.n),threads,0,c.stream>>>(p.at<const double*>(p.pointers),
+        p.at<double>(p.offset),p.at<double>(p.log_weights),p.n,p.q,grow,shrink,p.at<double>(p.other),
+        p.at<double>(p.grow_log),p.at<double>(p.shrink_log),p.at<double>(p.numerator),p.at<double>(p.sign));
+    c.launched();
+}
+void mixture_transfer_derivative(MixtureProblem& p,double fraction,double* output) {
+    auto& c=p.context;
+    mixture_trial_kernel<<<blocks(p.n),threads,0,c.stream>>>(p.n,p.at<double>(p.other),
+        p.at<double>(p.grow_log),p.at<double>(p.shrink_log),p.at<double>(p.numerator),
+        p.at<double>(p.sign),p.grow_weight,p.amount,fraction,p.at<double>(p.terms));
+    c.launched(); reduce_mixture(p,1); c.download(output,p.at<double>(p.sums),1); c.finish();
+    *output/=p.n; ++scoring_state(c).counters[6];
 }
 } // namespace
 
@@ -483,21 +542,17 @@ extern "C" int CliPP2CreateMixtureProblem(void* value,i64 count,const i64* handl
     return scoring_guarded([&] {
         auto& c=context(value); if(!output) throw std::domain_error("Missing CUDA mixture handle destination");
         *output=0;
-        auto p=std::make_unique<MixtureProblem>(c);
+        auto p=std::make_unique<MixtureProblem>(c,count);
         p->host_charge=add(1024,multiply(count,64)); check_scoring_host(c,p->host_charge);
         ScoringHostScope staging(c,p->host_charge);
-        p->columns=get_columns(c,count,handles); p->n=c.data.mutations; p->q=count;
-        p->chunks=p->n/8192+(p->n%8192!=0);
-        Layout layout;
-        p->pointers=layout.take<const double*>(count); p->weights=layout.take<double>(count);
-        p->offset=layout.take<double>(p->n); p->kernel=layout.take<double>(multiply(p->n,count));
-        p->terms=layout.take<double>(multiply(p->n,add(count,2)));
-        p->partials=layout.take<double>(multiply(p->chunks,add(count,2)));
-        p->sums=layout.take<double>(add(count,2)); p->other=layout.take<double>(p->n);
-        p->grow_log=layout.take<double>(p->n); p->shrink_log=layout.take<double>(p->n);
-        p->numerator=layout.take<double>(p->n); p->sign=layout.take<double>(p->n);
-        p->invalid=layout.take<int>(1);
-        p->allocation=std::make_unique<ScoringAllocation>(c,layout.bytes);
+        p->columns=get_columns(c,count,handles);
+        auto& s=scoring_state(c);
+        if(s.arena_cache && s.arena_cache->bytes>=p->bytes) {
+            c.drop_optional(s.arena_cache->bytes);
+            p->allocation=std::move(s.arena_cache); ++s.arena_reuses;
+        } else {
+            p->allocation=std::make_unique<ScoringAllocation>(c,p->bytes); ++s.arena_allocations;
+        }
         std::vector<const double*> pointers;
         for(const auto& column:p->columns) pointers.push_back(column->data());
         int invalid=0;
@@ -508,15 +563,32 @@ extern "C" int CliPP2CreateMixtureProblem(void* value,i64 count,const i64* handl
             p->n,p->q,p->at<double>(p->offset),p->at<double>(p->kernel),p->at<int>(p->invalid));
         c.launched(); c.download(&invalid,p->at<int>(p->invalid),1); c.finish();
         if(invalid) throw std::domain_error("Every mutation needs finite likelihood in some cluster");
-        auto& s=scoring_state(c); const i64 id=s.id(),host_charge=p->host_charge;
+        const i64 id=s.id(),host_charge=p->host_charge;
         s.problems.emplace(id,std::move(p)); staging.release();
         s.host_bytes=add(s.host_bytes,host_charge); *output=id;
     });
 }
 extern "C" int CliPP2ReleaseMixtureProblem(void* value,i64 handle) {
     return scoring_guarded([&] {
-        auto& c=context(value); const auto charge=scoring_problem(c,handle).host_charge;
-        auto& s=scoring_state(c); s.problems.erase(handle); s.host_bytes-=charge;
+        auto& c=context(value); auto& p=scoring_problem(c,handle);
+        const auto charge=p.host_charge;
+        auto& s=scoring_state(c);
+        // Idle scratch is lower-priority than computed columns and grids. It
+        // may replace an older arena, but must not evict useful emissions.
+        const i64 free_optional=c.optional_cache_limit-c.optional_cache_bytes+
+            (s.arena_cache?s.arena_cache->bytes:0);
+        if(p.allocation->bytes<=free_optional &&
+                (!s.arena_cache || s.arena_cache->bytes<p.allocation->bytes)) {
+            if(s.arena_cache) { c.drop_optional(s.arena_cache->bytes); s.arena_cache.reset(); }
+            if(c.retain_optional(p.allocation->bytes)) s.arena_cache=std::move(p.allocation);
+        }
+        s.problems.erase(handle); s.host_bytes-=charge;
+    });
+}
+extern "C" int CliPP2CUDAMixtureRequiredBytes(i64 n,i64 q,i64* output) {
+    return scoring_guarded([&] {
+        if(!output) throw std::domain_error("Missing CUDA mixture memory result");
+        *output=MixtureLayout(n,q).bytes;
     });
 }
 extern "C" int CliPP2EvaluateMixture(void* value,i64 handle,const double* weights,
@@ -544,16 +616,20 @@ extern "C" int CliPP2EvaluateMixture(void* value,i64 handle,const double* weight
 extern "C" int CliPP2PrepareMixtureTransfer(void* value,i64 handle,const double* weights,i64 grow,i64 shrink) {
     return scoring_guarded([&] {
         auto& c=context(value); auto& p=scoring_problem(c,handle);
-        validate_scoring_weights(weights,p.q);
-        if(grow<0||grow>=p.q||shrink<0||shrink>=p.q||grow==shrink||weights[shrink]<=0.)
-            throw std::domain_error("Invalid CUDA pairwise mixture transfer");
         ScoringStreamFence fence(c);
-        p.grow_weight=weights[grow]; p.amount=weights[shrink]; p.pair_ready=false;
-        c.upload(p.at<double>(p.weights),weights,p.q);
-        mixture_pair_kernel<<<blocks(p.n),threads,0,c.stream>>>(p.at<const double*>(p.pointers),
-            p.at<double>(p.offset),p.at<double>(p.weights),p.n,p.q,grow,shrink,p.at<double>(p.other),
-            p.at<double>(p.grow_log),p.at<double>(p.shrink_log),p.at<double>(p.numerator),p.at<double>(p.sign));
-        c.launched(); c.finish(); p.pair_ready=true; ++scoring_state(c).counters[5];
+        prepare_mixture_transfer(p,weights,grow,shrink);
+        c.finish(); p.pair_ready=true; ++scoring_state(c).counters[5];
+    });
+}
+extern "C" int CliPP2PrepareMixtureTransferEndpoint(void* value,i64 handle,const double* weights,
+        i64 grow,i64 shrink,double* output) {
+    return scoring_guarded([&] {
+        auto& c=context(value); auto& p=scoring_problem(c,handle);
+        if(!output) throw std::domain_error("Missing CUDA transfer endpoint result");
+        ScoringStreamFence fence(c);
+        prepare_mixture_transfer(p,weights,grow,shrink);
+        mixture_transfer_derivative(p,1.,output);
+        p.pair_ready=true; ++scoring_state(c).counters[5];
     });
 }
 extern "C" int CliPP2MixtureTransferDerivative(void* value,i64 handle,double fraction,double* output) {
@@ -562,11 +638,16 @@ extern "C" int CliPP2MixtureTransferDerivative(void* value,i64 handle,double fra
         if(!p.pair_ready||!output||!std::isfinite(fraction)||fraction<0.||fraction>1.)
             throw std::domain_error("CUDA mixture transfer is unprepared or invalid");
         ScoringStreamFence fence(c);
-        mixture_trial_kernel<<<blocks(p.n),threads,0,c.stream>>>(p.n,p.at<double>(p.other),
-            p.at<double>(p.grow_log),p.at<double>(p.shrink_log),p.at<double>(p.numerator),
-            p.at<double>(p.sign),p.grow_weight,p.amount,fraction,p.at<double>(p.terms));
-        c.launched(); reduce_mixture(p,1); c.download(output,p.at<double>(p.sums),1); c.finish();
-        *output/=p.n; ++scoring_state(c).counters[6];
+        mixture_transfer_derivative(p,fraction,output);
+    });
+}
+extern "C" int CliPP2CUDAScoringArenaDiagnostics(void* value,i64* output) {
+    return scoring_guarded([&] {
+        auto& c=context(value); require(output,"Missing CUDA arena diagnostics");
+        if(!c.scoring_state) { std::fill(output,output+3,0); return; }
+        auto& s=scoring_state(c);
+        output[0]=s.arena_allocations; output[1]=s.arena_reuses;
+        output[2]=s.arena_cache?s.arena_cache->bytes:0;
     });
 }
 extern "C" int CliPP2CUDAScoringDiagnostics(void* value,i64* output) {
