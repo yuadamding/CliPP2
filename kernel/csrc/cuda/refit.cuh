@@ -4,8 +4,8 @@
 struct RefitLayout {
     Layout layout;
     i64 regions, offsets, rows, grid_offsets, grid, lower, upper, xatol,
-        incumbent, compacted, counts, grid_values, results;
-    RefitLayout(i64 tasks, i64 members, i64 points, bool has_incumbent) {
+        incumbent, compacted, counts, grid_values, results, grid_tables;
+    RefitLayout(i64 tasks, i64 members, i64 points, bool has_incumbent, bool cache = false) {
         regions = layout.take<i64>(tasks);
         offsets = layout.take<i64>(add(tasks, 1));
         rows = layout.take<i64>(members);
@@ -19,6 +19,7 @@ struct RefitLayout {
         counts = layout.take<i64>(tasks);
         grid_values = layout.take<double>(points);
         results = layout.take<RefitResult>(tasks);
+        grid_tables = layout.take<i64>(cache ? tasks : 0);
     }
 };
 
@@ -26,7 +27,8 @@ struct RefitPlan {
     i64 last, members, points, max_rows, wave, scratch, bytes;
 };
 
-RefitPlan plan_refit_slice(const RefitBatch& batch, i64 first, i64 budget, i64 host_limit) {
+RefitPlan plan_refit_slice(const RefitBatch& batch, i64 first, i64 budget, i64 host_limit,
+                           bool cache = false) {
     const i64 task_limit = host_limit / sizeof(i64);
     require(task_limit > 0, "CUDA refit host staging requires eight bytes per task");
     RefitPlan plan{first, 0, 0, 1, 0, 0, 0};
@@ -36,7 +38,7 @@ RefitPlan plan_refit_slice(const RefitBatch& batch, i64 first, i64 budget, i64 h
         const i64 points = batch.grid_offsets[end] - batch.grid_offsets[first];
         const i64 maximum = std::max(plan.max_rows,
             batch.member_offsets[end] - batch.member_offsets[plan.last]);
-        RefitLayout buffers(end - first, members, points, batch.incumbent != nullptr);
+        RefitLayout buffers(end - first, members, points, batch.incumbent != nullptr, cache);
         const i64 fixed = buffers.layout.bytes;
         // One arena is reused: grid-wave row values, then all adaptive tasks'
         // row values. Never reserve/grow after installing the slice pointers.
@@ -81,8 +83,10 @@ __global__ void prepare_refit_kernel(ObservationSoA data, RefitBatch batch,
 
 __global__ void refit_grid_kernel(ObservationSoA data, RefitBatch batch,
         const i64* observed_rows, const i64* observed_counts, const RefitResult* state,
-        i64 first, i64 jobs, i64 row_stride, double* scratch, double* grid_values) {
+        i64 first, i64 jobs, i64 row_stride, double* scratch, double* grid_values,
+        const i64* grid_tables) {
     __shared__ double total;
+    __shared__ double partials[128];
     const i64 job = blockIdx.x;
     if (job >= jobs) return;
     const i64 point = first + job, absolute = point + batch.grid_offsets[0];
@@ -95,8 +99,18 @@ __global__ void refit_grid_kernel(ObservationSoA data, RefitBatch batch,
     const i64 task = lo;
     if (state[task].status) return;  // Block-uniform; no skipped barrier participant.
     const i64 begin = batch.member_offsets[task] - batch.member_offsets[0];
-    const double value = RefitObjective{data, observed_rows + begin, observed_counts[task],
-        batch.regions[task], scratch + job * row_stride, &total}(batch.grid[point]);
+    double* values = scratch + job * row_stride;
+    const int grid_index = regular_grid_index(batch.grid[point]);
+    const double* table = grid_tables ? reinterpret_cast<const double*>(grid_tables[task]) : nullptr;
+    double value;
+    if (table && grid_index >= 0) {
+        for (i64 i = threadIdx.x; i < observed_counts[task]; i += blockDim.x)
+            values[i] = table[static_cast<i64>(grid_index) * data.mutations + observed_rows[begin + i]];
+        value = ordered_block_sum(values, observed_counts[task], partials, &total);
+    } else {
+        value = RefitObjective{data, observed_rows + begin, observed_counts[task],
+            batch.regions[task], values, partials, &total}(batch.grid[point]);
+    }
     if (!threadIdx.x) grid_values[point] = value;
 }
 
@@ -104,6 +118,7 @@ __global__ void finish_refit_kernel(ObservationSoA data, RefitBatch batch,
         const i64* observed_rows, const i64* observed_counts, double* scratch,
         const double* grid_values, RefitResult* output) {
     __shared__ double total;
+    __shared__ double partials[128];
     __shared__ int initial_status;
     for (i64 task = blockIdx.x; task < batch.tasks; task += gridDim.x) {
         if (!threadIdx.x) initial_status = output[task].status;
@@ -122,7 +137,7 @@ __global__ void finish_refit_kernel(ObservationSoA data, RefitBatch batch,
             local.incumbent = batch.incumbent ? batch.incumbent + task : nullptr;
             const auto result = refit_search_from_grid(local, 0, grid_values + point,
                 RefitObjective{data, observed_rows + begin, observed_counts[task],
-                    batch.regions[task], scratch + begin, &total});
+                    batch.regions[task], scratch + begin, partials, &total});
             if (!threadIdx.x) output[task] = result;
         }
         __syncthreads();
@@ -131,11 +146,29 @@ __global__ void finish_refit_kernel(ObservationSoA data, RefitBatch batch,
 
 void refit_cuda(Context& c, const RefitBatch& batch, RefitResult* output) {
     for (i64 first = 0; first < batch.tasks;) {
-        const auto plan = plan_refit_slice(batch, first, c.diagnostics.workspace_limit, c.host_staging_limit);
+        const i64 first_members = batch.member_offsets[first + 1] - batch.member_offsets[first];
+        const i64 first_points = batch.grid_offsets[first + 1] - batch.grid_offsets[first];
+        const RefitLayout first_cached(1, first_members, first_points, batch.incumbent != nullptr, true);
+        const bool cache = c.optional_cache_limit >= multiply(multiply(c.data.mutations, 513), sizeof(double))
+            && first_cached.layout.bytes <= c.diagnostics.workspace_limit
+            && multiply(std::max<i64>(1, first_members), sizeof(double))
+                <= c.diagnostics.workspace_limit - first_cached.layout.bytes;
+        const auto plan = plan_refit_slice(batch, first, c.diagnostics.workspace_limit, c.host_staging_limit, cache);
         const i64 tasks = plan.last - first;
         HostCounts observed_counts(c, tasks);
-        const RefitLayout b(tasks, plan.members, plan.points, batch.incumbent != nullptr);
+        GridLeases cached(c, tasks);
+        const RefitLayout b(tasks, plan.members, plan.points, batch.incumbent != nullptr, cache);
         c.reserve(plan.bytes);
+        if (cache) {
+            for (i64 task = 0; task < tasks; ++task) {
+                const i64 source = first + task;
+                if (!cached.tables.empty() && batch.lower[source] == 0 && batch.upper[source] == 1)
+                    cached.tables[task] = cached.get(batch.regions[source]);
+                observed_counts.values[task] = cached.tables.empty() || !cached.tables[task] ? 0
+                    : reinterpret_cast<i64>(cached.tables[task]->values);
+            }
+            c.upload(c.pointer<i64>(b.grid_tables), observed_counts.values.data(), tasks);
+        }
         RefitBatch device{tasks, plan.members, plan.points,
             c.pointer<i64>(b.regions), c.pointer<i64>(b.offsets), c.pointer<i64>(b.rows),
             c.pointer<i64>(b.grid_offsets), c.pointer<double>(b.grid), c.pointer<double>(b.lower),
@@ -157,7 +190,8 @@ void refit_cuda(Context& c, const RefitBatch& batch, RefitResult* output) {
             const i64 jobs = std::min(plan.wave, plan.points - point);
             refit_grid_kernel<<<static_cast<unsigned>(jobs), threads, 0, c.stream>>>(c.data, device,
                 c.pointer<i64>(b.compacted), c.pointer<i64>(b.counts), c.pointer<RefitResult>(b.results),
-                point, jobs, plan.max_rows, c.pointer<double>(plan.scratch), c.pointer<double>(b.grid_values));
+                point, jobs, plan.max_rows, c.pointer<double>(plan.scratch), c.pointer<double>(b.grid_values),
+                cache ? c.pointer<i64>(b.grid_tables) : nullptr);
             c.launched(); point += jobs;
         }
         const unsigned task_blocks = static_cast<unsigned>(std::min<i64>(65535, tasks));
@@ -168,9 +202,22 @@ void refit_cuda(Context& c, const RefitBatch& batch, RefitResult* output) {
         c.download(output + first, c.pointer<RefitResult>(b.results), tasks);
         c.download(observed_counts.values.data(), c.pointer<i64>(b.counts), tasks);
         c.finish();
-        for (i64 task = 0; task < tasks; ++task)
+        for (i64 task = 0; task < tasks; ++task) {
+            i64 reused_points = 0;
+            if (!cached.tables.empty() && cached.tables[task]
+                    && output[first + task].status != static_cast<int>(RefitStatus::InvalidBox)
+                    && output[first + task].status != static_cast<int>(RefitStatus::Unsupported)) {
+                for (i64 point = batch.grid_offsets[first + task];
+                     point < batch.grid_offsets[first + task + 1]; ++point)
+                    reused_points += regular_grid_index(batch.grid[point]) >= 0;
+            }
+            const i64 reused = multiply(observed_counts.values[task], reused_points);
+            c.grid_reused_cells = add(c.grid_reused_cells, reused);
+            const i64 logical = multiply(observed_counts.values[task], output[first + task].evaluations);
+            c.grid_fresh_cells = add(c.grid_fresh_cells, logical - reused);
             c.diagnostics.cell_evaluations = add(c.diagnostics.cell_evaluations,
-                multiply(observed_counts.values[task], output[first + task].evaluations));
+                logical);
+        }
         first = plan.last;
     }
 }

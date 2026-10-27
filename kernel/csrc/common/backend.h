@@ -2,8 +2,9 @@
 #include "views.h"
 
 // Each backend library exports this same ABI. The context owns compact prepared
-// fields; input/output arguments below are host pointers. A call completes its
-// requested result transfer before returning. No implicit CPU CUDA fallback.
+// fields; input/output arguments below are host pointers unless represented by
+// an explicit CUDA handle. A call completes its requested result transfer
+// before returning. No implicit CPU CUDA fallback.
 struct CliPP2BackendDiagnostics {
     std::int64_t prepared_bytes, workspace_bytes, calls, cell_evaluations;
     std::int64_t cache_bytes, staging_bytes, workspace_limit;
@@ -40,6 +41,34 @@ int CliPP2EvaluateJointColumns(void*, std::int64_t count, const double* centers,
 int CliPP2RefitCentersBatch(void*, const clipp2::RefitBatch*, clipp2::RefitResult*);
 int CliPP2EvaluateConditionalValues(void*, const clipp2::ConditionalBatch*,
                                     double* log_likelihood, std::uint8_t* status);
+// CUDA-only resident execution. Context-local handles own immutable columns;
+// dropping an optional cache entry never invalidates a live handle. A zero
+// optional-cache limit disables retention, not device-side scoring.
+int CliPP2ConfigureCUDAReuse(void*, std::int64_t resident_limit, std::int64_t cache_limit);
+int CliPP2CreateJointColumns(void*, std::int64_t count, const double* centers,
+                            std::int64_t* handles);
+// Explicit host import is also useful for independent numerical qualification.
+// Layout is [cluster, mutation], retaining finite and negative-infinite logs.
+int CliPP2ImportJointColumns(void*, std::int64_t count, const double* log_columns,
+                            std::int64_t* handles);
+int CliPP2ReleaseJointColumns(void*, std::int64_t count, const std::int64_t* handles);
+int CliPP2ExportJointColumns(void*, std::int64_t count, const std::int64_t* handles,
+                            double* log_columns);
+int CliPP2GatherJointColumns(void*, std::int64_t count, const std::int64_t* handles,
+                            const std::int64_t* labels, double* assigned);
+int CliPP2CreateMixtureProblem(void*, std::int64_t count, const std::int64_t* handles,
+                              std::int64_t* problem);
+int CliPP2ReleaseMixtureProblem(void*, std::int64_t problem);
+int CliPP2EvaluateMixture(void*, std::int64_t problem, const double* weights,
+                         double* objective, double* gradient, double* log_likelihood);
+int CliPP2PrepareMixtureTransfer(void*, std::int64_t problem, const double* weights,
+                               std::int64_t grow, std::int64_t shrink);
+int CliPP2MixtureTransferDerivative(void*, std::int64_t problem, double fraction,
+                                   double* derivative);
+// Fixed-length counter vectors; do not change the shared diagnostic struct.
+int CliPP2CUDAReuseDiagnostics(void*, std::int64_t* counters11);
+int CliPP2ReleaseCUDAOptionalCache(void*);
+int CliPP2CUDAScoringDiagnostics(void*, std::int64_t* counters9);
 }
 
 namespace clipp2 {

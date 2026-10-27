@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--grid-cache-mb", type=int, default=64,
                      help="Host initialization-grid cache budget in MiB; 0 streams without caching.")
     fit.add_argument("--device-cache-mb", type=int, default=256,
-                     help="Compatibility option; the native backend does not retain a device cache.")
+                     help="Optional retained CUDA grid/column cache in MiB; 0 disables retention, not GPU scoring.")
     fit.add_argument("--workspace-mb", type=int, default=64,
                      help="Native CPU/CUDA scratch budget in MiB (positive; not total memory).")
     fit.add_argument("--native-host-memory-mb", type=int, default=None,

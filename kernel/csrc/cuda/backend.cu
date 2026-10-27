@@ -11,6 +11,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -61,6 +62,14 @@ struct Layout {
     }
 };
 
+struct Context;
+void release_optional_grid_cache(Context&);
+void destroy_grid_cache(Context&) noexcept;
+void release_optional_scoring_cache(Context&);
+void destroy_scoring_state(Context&) noexcept;
+i64 scoring_host_bytes(Context&) noexcept;
+i64 scoring_persistent_host_bytes(Context&) noexcept;
+
 struct Context {
     ObservationSoA data{};
     int device = 0;
@@ -68,15 +77,61 @@ struct Context {
     unsigned char *prepared = nullptr, *workspace = nullptr;
     CliPP2BackendDiagnostics diagnostics{};
     i64 host_staging_limit = 0;
+    i64 resident_limit = 0, resident_bytes = 0, resident_peak_bytes = 0;
+    i64 optional_cache_limit = 0, optional_cache_bytes = 0, grid_cache_host_bytes = 0;
+    i64 grid_cache_hits = 0, grid_cache_misses = 0, grid_reused_cells = 0,
+        grid_fresh_cells = 0;
+    cudaError_t resident_release_error = cudaSuccess;
+    void* grid_state = nullptr;
+    void* scoring_state = nullptr;
     ~Context() {
         // Destruction cannot report errors through the C ABI. Normal operations
         // synchronize and report failures before reaching this cleanup path.
         cudaSetDevice(device);
         if (stream) cudaStreamSynchronize(stream);
+        destroy_grid_cache(*this);
+        destroy_scoring_state(*this);
         if (workspace) cudaFree(workspace);
         if (prepared) cudaFree(prepared);
         if (stream) cudaStreamDestroy(stream);
     }
+    unsigned char* allocate_resident(i64 bytes) {
+        require(bytes >= 0, "Negative resident CUDA allocation");
+        if (bytes > resident_limit - resident_bytes) {
+            release_optional_grid_cache(*this);
+            release_optional_scoring_cache(*this);
+        }
+        cuda_check(resident_release_error, "release resident CUDA storage");
+        require(bytes <= resident_limit - resident_bytes,
+                "Resident CUDA storage exceeds device budget");
+        unsigned char* result = nullptr;
+        if (bytes) cuda_check(cudaMalloc(reinterpret_cast<void**>(&result), bytes),
+                              "allocate resident CUDA storage");
+        resident_bytes = add(resident_bytes, bytes);
+        resident_peak_bytes = std::max(resident_peak_bytes, resident_bytes);
+        diagnostics.cache_bytes = resident_bytes;
+        return result;
+    }
+    void release_resident(void* pointer, i64 bytes) noexcept {
+        const auto status = pointer ? cudaFree(pointer) : cudaSuccess;
+        if (status != cudaSuccess) {
+            if (resident_release_error == cudaSuccess) resident_release_error = status;
+            return;  // Do not falsely report unsuccessful reclamation as free.
+        }
+        resident_bytes -= bytes;
+        diagnostics.cache_bytes = resident_bytes;
+    }
+    bool retain_optional(i64 bytes) {
+        if (bytes < 0 || bytes > optional_cache_limit) return false;
+        if (bytes > optional_cache_limit - optional_cache_bytes) {
+            release_optional_grid_cache(*this);
+            release_optional_scoring_cache(*this);
+        }
+        if (bytes > optional_cache_limit - optional_cache_bytes) return false;
+        optional_cache_bytes += bytes;
+        return true;
+    }
+    void drop_optional(i64 bytes) noexcept { optional_cache_bytes -= bytes; }
     void reserve(i64 bytes) {
         require(bytes <= diagnostics.workspace_limit,
                 "Native CUDA call exceeds workspace budget; reduce its batch");
@@ -114,6 +169,7 @@ struct Context {
         ++diagnostics.kernel_launches;
     }
     void finish() {
+        cuda_check(resident_release_error, "release resident CUDA storage");
         cuda_check(cudaStreamSynchronize(stream), "complete native CUDA phase");
         ++diagnostics.synchronizations;
         ++diagnostics.calls;
@@ -125,7 +181,12 @@ struct HostCounts {
     std::vector<i64> values;
     HostCounts(Context& owner,i64 count):context(owner) {
         const auto bytes=multiply(count,sizeof(i64));
-        require(bytes<=owner.host_staging_limit,"CUDA host staging exceeds native host budget");
+        if (bytes > owner.host_staging_limit - owner.grid_cache_host_bytes - scoring_host_bytes(owner)) {
+            release_optional_grid_cache(owner);
+            release_optional_scoring_cache(owner);
+        }
+        require(bytes<=owner.host_staging_limit-owner.grid_cache_host_bytes-scoring_host_bytes(owner),
+                "CUDA host staging exceeds native host budget");
         values.resize(static_cast<std::size_t>(count));
         context.diagnostics.staging_bytes=bytes;
     }
@@ -140,6 +201,7 @@ Context& context(void* value) {
     require(value != nullptr, "Null native CUDA context");
     auto& result = *static_cast<Context*>(value);
     cuda_check(cudaSetDevice(result.device), "select CUDA context device");
+    cuda_check(result.resident_release_error, "release resident CUDA storage");
     return result;
 }
 unsigned blocks(i64 count) {
@@ -226,25 +288,20 @@ __global__ void joint_kernel(ObservationSoA data, i64 first_row, i64 rows, i64 c
     }
 }
 
-struct ArrayValues {
-    const double* values;
-    __device__ double operator()(i64 index) const { return values[index]; }
-};
+#include "ordered_reduce.cuh"
+
 struct RefitObjective {
     ObservationSoA data;
     const i64* rows;
     i64 count, region;
-    double *values, *total;
+    double *values, *partials, *total;
     __device__ double operator()(double center) const {
         for (i64 i = threadIdx.x; i < count; i += blockDim.x)
             values[i] = -evaluate_observation<EmitMode::LossOnly>(
                 observation(data, region * data.mutations + rows[i]), center).loss;
-        __syncthreads();
         // The exact logical reduction topology is shared with CPU; it does not
         // depend on block size, scheduling, cache budgets, or atomic order.
-        if (!threadIdx.x) *total = pairwise_sum(ArrayValues{values}, 0, count);
-        __syncthreads();
-        return *total;
+        return ordered_block_sum(values, count, partials, total);
     }
     __device__ void store_grid(double* destination, double value) const {
         if (!threadIdx.x) *destination = value;
@@ -252,6 +309,7 @@ struct RefitObjective {
     __device__ void finish_grid() const { __syncthreads(); }
 };
 
+#include "device_reuse.cuh"
 #include "refit.cuh"
 
 __global__ void conditional_kernel(ObservationSoA data, ConditionalBatch batch,
@@ -260,6 +318,7 @@ __global__ void conditional_kernel(ObservationSoA data, ConditionalBatch batch,
     __shared__ i64 observed_count;
     __shared__ int state;
     __shared__ double total;
+    __shared__ double partials[128];
     for (i64 task = blockIdx.x; task < batch.tasks; task += gridDim.x) {
         const i64 begin = batch.member_offsets[task], end = batch.member_offsets[task + 1];
         const i64 region = batch.regions[task];
@@ -282,7 +341,7 @@ __global__ void conditional_kernel(ObservationSoA data, ConditionalBatch batch,
         __syncthreads();
         if (!state) {
             const double value = RefitObjective{data, observed_rows + begin, observed_count,
-                                               region, member_values + begin, &total}(center);
+                                               region, member_values + begin, partials, &total}(center);
             if (!threadIdx.x) {
                 output[task] = value;
                 status[task] = static_cast<std::uint8_t>(finite_number(value) ? EmitStatus::Ok
@@ -395,6 +454,38 @@ extern "C" int CliPP2ConfigureCUDAExecution(void* value, i64 host_staging_limit)
         auto& c=context(value);
         require(c.diagnostics.calls==0,"CUDA execution budgets are fixed before first use");
         c.host_staging_limit=host_staging_limit;
+    });
+}
+extern "C" int CliPP2ConfigureCUDAReuse(void* value, i64 resident_limit, i64 cache_limit) {
+    return guarded([&] {
+        auto& c = context(value);
+        require(resident_limit >= 0 && cache_limit >= 0 && cache_limit <= resident_limit,
+                "Invalid CUDA resident/cache budgets");
+        require(c.diagnostics.calls == 0 && c.resident_bytes == 0,
+                "CUDA reuse budgets are fixed before first use");
+        c.resident_limit = resident_limit;
+        c.optional_cache_limit = cache_limit;
+    });
+}
+extern "C" int CliPP2CUDAReuseDiagnostics(void* value, i64* output) {
+    return guarded([&] {
+        require(output, "Missing CUDA reuse diagnostic destination");
+        auto& c = context(value);
+        const i64 values[] = {c.resident_limit, c.resident_bytes, c.resident_peak_bytes,
+            c.optional_cache_limit, c.optional_cache_bytes, c.grid_cache_hits,
+            c.grid_cache_misses, c.grid_reused_cells, c.grid_fresh_cells, c.grid_cache_host_bytes,
+            scoring_persistent_host_bytes(c)};
+        std::copy(values, values + 11, output);
+    });
+}
+extern "C" int CliPP2ReleaseCUDAOptionalCache(void* value) {
+    return guarded([&] {
+        auto& c = context(value);
+        // Public calls complete before returning. The maps hold optional
+        // references only: live column/problem leases remain valid and charged.
+        release_optional_grid_cache(c);
+        release_optional_scoring_cache(c);
+        cuda_check(c.resident_release_error, "release optional CUDA storage");
     });
 }
 extern "C" int CliPP2EvaluateNodes(void* value, i64 batches, const double* phi, int mode,
@@ -568,4 +659,4 @@ extern "C" int CliPP2EvaluateConditionalValues(void* value, const ConditionalBat
             c.diagnostics.cell_evaluations = add(c.diagnostics.cell_evaluations, count);
     });
 }
-#include "../common/refit_validation.h"
+#include "scoring.cuh"

@@ -42,6 +42,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     check_destination(outdir, data.tumor_id)
     model = RegionalModel(data, device=config.device,
                           grid_cache_bytes=config.grid_cache_mb * 1024**2,
+                          device_cache_bytes=config.device_cache_mb * 1024**2,
                           workspace_bytes=config.workspace_mb * 1024**2,
                           native_host_memory_bytes=(None if config.native_host_memory_mb is None
                                                     else config.native_host_memory_mb * 1024**2),

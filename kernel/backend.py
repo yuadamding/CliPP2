@@ -1,6 +1,7 @@
-"""Source-bound CPU/CUDA emission and batched-refit ABI (host boundary only)."""
+"""Source-bound emissions/refits and explicitly owned CUDA column/score leases."""
 import ctypes as ct
 import threading
+import weakref
 from functools import lru_cache
 from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
@@ -22,6 +23,113 @@ class NativeExecutionError(RuntimeError):
 
 class ScientificCandidateRejection(ValueError):
     """A proposed cluster lacks regional support or a common admissible box."""
+
+
+class DeviceColumn:
+    """One immutable context-bound lease; optional cache eviction is harmless."""
+
+    def __init__(self, backend, handle):
+        self._owner = weakref.ref(backend)
+        self.handle = int(handle)
+        self.n = backend.n
+
+    def backend(self):
+        owner = self._owner()
+        if owner is None or not self.handle:
+            raise NativeExecutionError("Device column lease is closed")
+        owner._require_open()
+        return owner
+
+    def __len__(self):
+        return self.n
+
+    def close(self):
+        handle, self.handle = self.handle, 0
+        owner = self._owner()
+        if handle and owner is not None and owner.context:
+            handles = _array([handle], np.int64)
+            owner._check(owner.lib.CliPP2ReleaseJointColumns(owner.context, 1, _ptr(handles)))
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class DeviceMixtureProblem:
+    """Resident numerical oracle for the unchanged host simplex controller."""
+
+    def __init__(self, backend, columns):
+        self._owner = weakref.ref(backend)
+        self.handle = 0
+        handles = backend._column_handles(columns)
+        result = ct.c_int64()
+        backend._check(backend.lib.CliPP2CreateMixtureProblem(
+            backend.context, len(handles), _ptr(handles), ct.byref(result)))
+        self.handle = result.value
+        self.shape = backend.n, len(handles)
+
+    def backend(self):
+        owner = self._owner()
+        if owner is None or not self.handle:
+            raise NativeExecutionError("Device mixture problem is closed")
+        owner._require_open()
+        return owner
+
+    def evaluate_weights(self, weights):
+        owner = self.backend()
+        weights = self._weights(weights)
+        objective, likelihood = ct.c_double(), ct.c_double()
+        gradient = np.empty(self.shape[1])
+        owner._check(owner.lib.CliPP2EvaluateMixture(
+            owner.context, self.handle, _ptr(weights), ct.byref(objective),
+            _ptr(gradient), ct.byref(likelihood)))
+        return objective.value, gradient, likelihood.value
+
+    def _weights(self, weights):
+        weights = _array(weights)
+        if (weights.shape != (self.shape[1],) or not np.isfinite(weights).all()
+                or np.any(weights < 0) or not weights.max() > 0):
+            raise ValueError("Mixture weights must be nonnegative finite and nonzero")
+        return weights
+
+    def prepare_transfer(self, weights, grow, shrink):
+        owner = self.backend()
+        weights = self._weights(weights)
+        if not (0 <= grow < self.shape[1] and 0 <= shrink < self.shape[1]
+                and grow != shrink and weights[shrink] > 0):
+            raise ValueError("Invalid pairwise mixture transfer")
+        owner._check(owner.lib.CliPP2PrepareMixtureTransfer(
+            owner.context, self.handle, _ptr(weights), grow, shrink))
+
+    def transfer_derivative(self, fraction):
+        owner = self.backend()
+        if not np.isfinite(fraction) or not 0 <= fraction <= 1:
+            raise ValueError("Mixture transfer fraction must be in [0,1]")
+        result = ct.c_double()
+        owner._check(owner.lib.CliPP2MixtureTransferDerivative(
+            owner.context, self.handle, fraction, ct.byref(result)))
+        return result.value
+
+    def close(self):
+        handle, self.handle = self.handle, 0
+        owner = self._owner()
+        if handle and owner is not None and owner.context:
+            owner._check(owner.lib.CliPP2ReleaseMixtureProblem(owner.context, handle))
+
+    def __enter__(self):
+        self.backend()
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class _Observations(ct.Structure):
@@ -68,7 +176,7 @@ class NativeBackend:
     """Owns prepared SoA fields; never silently substitutes a CPU backend."""
 
     def __init__(self, model, workspace_bytes, *, native_host_memory_bytes=None,
-                 device_memory_bytes=None, cpu_threads=None):
+                 device_memory_bytes=None, cpu_threads=None, device_cache_bytes=256*1024**2):
         self.context = None
         kind = "cuda" if model.device.startswith("cuda") else "cpu"
         paths = sorted(Path(__file__).parent.glob(f"_native_{kind}*.so"))
@@ -105,7 +213,7 @@ class NativeBackend:
             lib.CliPP2ProbabilityReuseDiagnostics.restype = ct.c_int
         self.identity = lib.CliPP2BackendBuildId().decode()
         self.policy = lib.CliPP2BackendNumericalPolicy().decode()
-        if lib.CliPP2BackendABI() != 1 or self.identity != backend_identity(kind):
+        if lib.CliPP2BackendABI() != 2 or self.identity != backend_identity(kind):
             raise NativeExecutionError(f"Stale or incompatible native {kind} library; rebuild CliPP2")
         if type(workspace_bytes) is not int or not 0 <= workspace_bytes <= np.iinfo(np.int64).max:
             raise ValueError("workspace_bytes must be a nonnegative int64")
@@ -151,24 +259,57 @@ class NativeBackend:
             lib.CliPP2ReleaseProbabilityCache.argtypes = [ct.c_void_p]
             lib.CliPP2ReleaseProbabilityCache.restype = ct.c_int
         else:
-            self.host_staging_bytes_limit = min(self.native_host_memory_bytes, self.workspace_bytes)
+            # Host metadata and device scratch are independently bounded pools.
+            # A small tiled device workspace must not become an implicit host
+            # memory cap for resident immutable column handles.
+            self.host_staging_bytes_limit = self.native_host_memory_bytes
             lib.CliPP2ConfigureCUDAExecution.argtypes = [ct.c_void_p, ct.c_int64]
             lib.CliPP2ConfigureCUDAExecution.restype = ct.c_int
             self._check(lib.CliPP2ConfigureCUDAExecution(self.context, self.host_staging_bytes_limit))
+            if type(device_cache_bytes) is not int or not 0 <= device_cache_bytes <= np.iinfo(np.int64).max:
+                raise ValueError("device_cache_bytes must be a nonnegative int64")
+            signatures = {
+                "ConfigureCUDAReuse": [ct.c_void_p, ct.c_int64, ct.c_int64],
+                "CreateJointColumns": [ct.c_void_p, ct.c_int64, _D, _I],
+                "ImportJointColumns": [ct.c_void_p, ct.c_int64, _D, _I],
+                "ReleaseJointColumns": [ct.c_void_p, ct.c_int64, _I],
+                "ExportJointColumns": [ct.c_void_p, ct.c_int64, _I, _D],
+                "GatherJointColumns": [ct.c_void_p, ct.c_int64, _I, _I, _D],
+                "CreateMixtureProblem": [ct.c_void_p, ct.c_int64, _I, _I],
+                "ReleaseMixtureProblem": [ct.c_void_p, ct.c_int64],
+                "EvaluateMixture": [ct.c_void_p, ct.c_int64, _D, _D, _D, _D],
+                "PrepareMixtureTransfer": [ct.c_void_p, ct.c_int64, _D, ct.c_int64, ct.c_int64],
+                "MixtureTransferDerivative": [ct.c_void_p, ct.c_int64, ct.c_double, _D],
+                "CUDAScoringDiagnostics": [ct.c_void_p, _I],
+                "CUDAReuseDiagnostics": [ct.c_void_p, _I],
+                "ReleaseCUDAOptionalCache": [ct.c_void_p],
+            }
+            for name, args in signatures.items():
+                function = getattr(lib, "CliPP2" + name)
+                function.argtypes, function.restype = args, ct.c_int
+            resident_limit = max(0, self.device_memory_bytes-required-self.workspace_bytes)
+            self._check(lib.CliPP2ConfigureCUDAReuse(
+                self.context, resident_limit, min(device_cache_bytes, resident_limit)))
 
     @property
     def native_host_bytes(self):
         """Retained native host storage; caller arrays and transient scratch are separate."""
         self._require_open()
+        if self.kind == "cuda":
+            reuse = np.empty(11, dtype=np.int64)
+            self._check(self.lib.CliPP2CUDAReuseDiagnostics(self.context, _ptr(reuse)))
+            return int(reuse[9]) + int(reuse[10])
         result = _Diagnostics()
         self._check(self.lib.CliPP2BackendGetDiagnostics(self.context, ct.byref(result)))
-        return result.prepared_bytes + result.cache_bytes if self.kind == "cpu" else 0
+        return result.prepared_bytes + result.cache_bytes
 
     def release_optional_cache(self):
         """Give mandatory continuation state priority over rebuildable read plans."""
         self._require_open()
         if self.kind == "cpu":
             self._check(self.lib.CliPP2ReleaseProbabilityCache(self.context))
+        else:
+            self._check(self.lib.CliPP2ReleaseCUDAOptionalCache(self.context))
         return self.native_host_bytes
 
     def _require_open(self):
@@ -201,6 +342,8 @@ class NativeBackend:
 
     def _check(self, code, status=None):
         if code:
+            if code == 2:
+                raise ValueError(self.lib.CliPP2BackendLastError().decode())
             raise NativeExecutionError(self.lib.CliPP2BackendLastError().decode())
         if status is not None:
             if np.any(status > 2):
@@ -214,6 +357,14 @@ class NativeBackend:
         self._check(self.lib.CliPP2BackendGetDiagnostics(self.context, ct.byref(result)))
         diagnostics = {"kind": self.kind, "build_id": self.identity, "numerical_policy": self.policy,
                        **{name: getattr(result, name) for name, _ in result._fields_}}
+        if self.kind == "cuda":
+            diagnostics["scoring"] = self.scoring_diagnostics()
+            reuse = np.empty(11, dtype=np.int64)
+            self._check(self.lib.CliPP2CUDAReuseDiagnostics(self.context, _ptr(reuse)))
+            diagnostics["reuse"] = dict(zip(("resident_limit", "resident_bytes", "resident_peak_bytes",
+                "optional_cache_limit", "optional_cache_bytes", "grid_hits", "grid_misses",
+                "grid_reused_cells", "refit_physical_emission_cells", "grid_cache_host_bytes",
+                "scoring_host_bytes"), map(int, reuse)))
         if self.kind == "cpu" and hasattr(self.lib, "CliPP2ProbabilityReuseDiagnostics"):
             counters = np.empty(5, dtype=np.int64)
             self._check(self.lib.CliPP2ProbabilityReuseDiagnostics(self.context, _ptr(counters)))
@@ -325,6 +476,72 @@ class NativeBackend:
         self._check(self.lib.CliPP2EvaluateJointColumns(self.context, len(centers), _ptr(centers),
                                                       _ptr(result), _ptr(status)), status)
         return result.T
+
+    def resident_joint_columns(self, centers):
+        """Evaluate/cache exact centers without exporting their N-sized columns."""
+        self._require_open()
+        centers = _array(centers)
+        if (self.kind != "cuda" or centers.ndim != 2 or not len(centers)
+                or centers.shape[1] != self.r or not np.isfinite(centers).all()):
+            raise ValueError("Resident centers require a CUDA backend and finite q by R CCFs")
+        handles = np.empty(len(centers), dtype=np.int64)
+        self._check(self.lib.CliPP2CreateJointColumns(
+            self.context, len(centers), _ptr(centers), _ptr(handles)))
+        return tuple(DeviceColumn(self, handle) for handle in handles)
+
+    def scoring_diagnostics(self):
+        self._require_open()
+        if self.kind != "cuda":
+            raise ValueError("Resident scoring diagnostics require CUDA")
+        counters = np.empty(9, dtype=np.int64)
+        self._check(self.lib.CliPP2CUDAScoringDiagnostics(self.context, _ptr(counters)))
+        return dict(zip(("column_evaluations", "column_cache_hits", "column_exports",
+                         "column_gathers", "weight_evaluations", "transfer_preparations",
+                         "transfer_trials", "live_column_handles", "live_mixture_problems"),
+                        map(int, counters)))
+
+    def import_joint_columns(self, log_columns):
+        """Explicit host-to-device boundary for independent numerical checks."""
+        self._require_open()
+        columns = np.asarray(log_columns, dtype=float)
+        if (self.kind != "cuda" or columns.ndim != 2 or columns.shape[0] != self.n
+                or not columns.shape[1] or np.isnan(columns).any() or np.isposinf(columns).any()):
+            raise ValueError("Expected nonempty N-by-q finite or -inf CUDA log columns")
+        columns = _array(columns.T)
+        handles = np.empty(len(columns), dtype=np.int64)
+        self._check(self.lib.CliPP2ImportJointColumns(
+            self.context, len(columns), _ptr(columns), _ptr(handles)))
+        return tuple(DeviceColumn(self, handle) for handle in handles)
+
+    def _column_handles(self, columns):
+        self._require_open()
+        if self.kind != "cuda" or not len(columns):
+            raise ValueError("Expected nonempty resident CUDA columns")
+        if any(not isinstance(column, DeviceColumn) or column.backend() is not self
+               for column in columns):
+            raise ValueError("Device columns belong to another backend context")
+        return _array([column.handle for column in columns], np.int64)
+
+    def export_joint_columns(self, columns):
+        handles = self._column_handles(columns)
+        result = np.empty((len(handles), self.n))
+        self._check(self.lib.CliPP2ExportJointColumns(
+            self.context, len(handles), _ptr(handles), _ptr(result)))
+        return result.T
+
+    def gather_joint_columns(self, columns, labels):
+        handles = self._column_handles(columns)
+        labels = np.asarray(labels)
+        if (labels.shape != (self.n,) or labels.dtype.kind not in "iu"
+                or np.any(labels < 0) or np.any(labels >= len(handles))):
+            raise ValueError("Assigned column labels must be N valid integer column indices")
+        labels, result = _array(labels, np.int64), np.empty(self.n)
+        self._check(self.lib.CliPP2GatherJointColumns(
+            self.context, len(handles), _ptr(handles), _ptr(labels), _ptr(result)))
+        return result
+
+    def mixture_problem(self, columns):
+        return DeviceMixtureProblem(self, columns)
 
     def multiplicity(self, x):
         self._require_open()
