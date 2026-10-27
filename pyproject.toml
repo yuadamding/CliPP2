@@ -40,13 +40,13 @@ version = { attr = "CliPP2._version.__version__" }
 [tool.setuptools.package-data]
 CliPP2 = [
     "_build_source.json",
-    "NOTICE",
     "kernel/csrc/*.cpp",
     "kernel/csrc/*.h",
     "kernel/csrc/common/*.h",
     "kernel/csrc/cpu/*.cpp",
     "kernel/csrc/cpu/*.h",
     "kernel/csrc/cuda/*.cu",
+    "kernel/csrc/cuda/*.cuh",
     "CMakeLists.txt",
 ]
 

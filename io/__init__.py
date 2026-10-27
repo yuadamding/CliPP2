@@ -1,1 +1,1 @@
-"""Canonical tumor data structures and long-TSV input/output."""
+"""Tumor data, canonical TSV and regional-directory input/output."""

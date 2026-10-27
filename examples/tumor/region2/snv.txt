@@ -1,0 +1,6 @@
+chromosome_index	position	alt_count	ref_count
+1	100	12	88
+1	200	14	86
+1	400	28	72
+1	500	32	68
+1	600	36	64

@@ -10,6 +10,15 @@ from pathlib import Path, PurePath
 import subprocess
 
 
+def file_sha256(path: str | Path) -> str:
+    """Hash file bytes with bounded memory; callers define manifest framing."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def git_source_identity(root: str | Path) -> tuple[str | None, bool | None]:
     """Probe only a repository rooted here, never an enclosing checkout."""
     root = Path(root)

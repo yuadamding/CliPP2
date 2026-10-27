@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .._source import file_sha256
 from CliPP2.io.tumor_txt import (
     SCHEMA_COLUMNS as TUMOR_TXT_COLUMNS,
     TUMOR_TXT_SCHEMA,
@@ -27,14 +28,6 @@ from .evolution import (
     JointEvolutionResult,
     _tree_order_and_ancestry,
 )
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 @lru_cache(maxsize=1)
@@ -82,7 +75,7 @@ def _canonical_input_path(data_dir: Path) -> Path:
 def _output_file_hashes(data_dir: Path) -> tuple[dict[str, str], dict[str, str]]:
     canonical_input = _canonical_input_path(data_dir)
     input_hashes = {
-        canonical_input.relative_to(data_dir).as_posix(): _sha256_file(canonical_input)
+        canonical_input.relative_to(data_dir).as_posix(): file_sha256(canonical_input)
     }
     truth_hashes: dict[str, str] = {}
     for path in sorted(data_dir.rglob("*")):
@@ -98,7 +91,7 @@ def _output_file_hashes(data_dir: Path) -> tuple[dict[str, str], dict[str, str]]
                 "Generated bundles may contain only the canonical input, "
                 f"truth files, and scenario_manifest.json; found {relative_path!r}."
             )
-        truth_hashes[relative_path] = _sha256_file(path)
+        truth_hashes[relative_path] = file_sha256(path)
     return input_hashes, truth_hashes
 
 
@@ -139,9 +132,9 @@ def validate_generated_tumor_directory(tumor_dir: str | Path) -> None:
             raise ValueError(f"{region_id} has non-truth files: {unexpected_region}.")
 
     report = data.cn_filter_report
-    if report is None or report.excluded_mutation_ids:
+    if report is None or report.records:
         raise ValueError(
-            "Generated tumor must retain every mutation after CN filtering."
+            "Generated tumor must retain every mutation-region pair after CN filtering."
         )
     truth = pd.read_csv(tumor_dir / "truth.txt", sep="\t")
     if truth.mutation_id.duplicated().any() or set(truth.mutation_id) != set(

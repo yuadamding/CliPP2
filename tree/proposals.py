@@ -48,11 +48,12 @@ def best_pair_boundary(tree, labels, centers, log_columns, edge, *, adjacency=No
                else np.sort(np.r_[components[a], components[b]]))
     positions = {int(node): index for index, node in enumerate(members)}
     if adjacency is None:
-        adjacency = [[] for _ in range(tree.n)]
-        for eid, (u, v) in enumerate(edges):
-            adjacency[u].append((int(v), eid))
-            adjacency[v].append((int(u), eid))
-    local = {int(node): [(neighbor, eid) for neighbor, eid in adjacency[node]
+        def adjacent(node):
+            start, stop = tree.adjacency_offsets[node:node+2]
+            return zip(tree.adjacent_nodes[start:stop], tree.adjacent_edge_ids[start:stop])
+    else:
+        adjacent = adjacency.__getitem__
+    local = {int(node): [(neighbor, eid) for neighbor, eid in adjacent(node)
                         if neighbor in positions] for node in members}
     internal = sorted({eid for neighbors in local.values() for _, eid in neighbors})
     # Two connected components joined by one tree edge form a subtree.
@@ -121,10 +122,6 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None, pr
     current = candidate
     visited = set()
     attempted = 0
-    adjacency = [[] for _ in range(tree.n)]
-    for eid, (u, v) in enumerate(tree.edges):
-        adjacency[u].append((int(v), eid))
-        adjacency[v].append((int(u), eid))
     while True:
         changed = False
         fit = current.fit
@@ -141,7 +138,7 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None, pr
                    else handles.materialize())
         for edge in current.cuts:
             move = best_pair_boundary(tree, labels, fit.centers, columns, edge,
-                                      adjacency=adjacency, components=components)
+                                      components=components)
             if not move.changed:
                 continue
             proposed_labels, centers = canonical_partition(move.labels, move.centers)

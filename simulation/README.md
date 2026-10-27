@@ -58,14 +58,14 @@ Former two-state-CN controls are unsupported.
 
 The inference default `--max-major-cn 10` retains the generator's full six-copy
 CN range. Bundle validation explicitly uses a limit of six to check all generated
-truth. A lower fitting cutoff can exclude whole mutations if any region exceeds
-it. The generator's CN ceiling remains six; its multiplicity sampling ceiling
-remains four.
+truth. A lower fitting cutoff excludes only the mutation-region pairs exceeding
+it; valid observations elsewhere remain. The generator's CN ceiling remains six;
+its multiplicity sampling ceiling remains four.
 
 ## Truth and provenance
 
 - `<tumor_id>.clipp2.txt`: canonical observed input; validation requires every
-  mutation to survive CliPP2's whole-mutation CN filter with `max_major_cn=6`.
+  mutation-region pair to survive CliPP2's CN filter with `max_major_cn=6`.
 - `truth.txt`: mutation-to-cluster labels.
 - `truth_clone_sample.txt`: clone CCF by sample; sample `0` means `region1`.
 - `regionN/truth_cp.txt`: per-mutation CCF in that region.

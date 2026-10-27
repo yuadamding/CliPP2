@@ -17,12 +17,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     fit = subparsers.add_parser("fit", allow_abbrev=False,
                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    fit.add_argument("--input-file", required=True)
+    inputs = fit.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--input-file", help="Canonical tumor TSV (optionally gzip-compressed).")
+    inputs.add_argument("--input-dir", dest="input_file", metavar="INPUT_DIR",
+                        help="Tumor directory with regional snv.txt/cna.txt/purity.txt bundles.")
     fit.add_argument("--outdir", default="clipp2_results")
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
     fit.add_argument(
         "--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN,
-        help="Exclude a mutation from all regions if any CN state's major CN in any region exceeds this limit.",
+        help="Exclude a mutation only from regions where any CN state's major CN exceeds this limit.",
     )
     fit.add_argument("--verbose", action="store_true")
     fit.add_argument("--max-clusters", type=int, default=DEFAULT_MAX_CLUSTERS,

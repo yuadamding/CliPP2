@@ -41,7 +41,7 @@ class BuildExt(build_ext):
             raise RuntimeError("CLIPP2_BUILD_CUDA=1 requires nvcc; CPU builds do not need CUDA")
         output = Path(self.get_ext_fullpath(extension.name))
         output.parent.mkdir(parents=True, exist_ok=True)
-        architectures = os.environ.get("CLIPP2_CUDA_ARCHITECTURES", "80,89,90").split(",")
+        architectures = os.environ.get("CLIPP2_CUDA_ARCHITECTURES", "80,86,89,90").split(",")
         if not architectures or any(not value.isdigit() for value in architectures):
             raise ValueError("CLIPP2_CUDA_ARCHITECTURES must contain comma-separated SM numbers")
         command = [compiler, "-std=c++17", "-O3", "--fmad=false", "-shared",

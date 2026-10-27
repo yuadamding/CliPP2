@@ -1,6 +1,5 @@
 """Independent selected-fit checks and the compact three-table public contract."""
 from dataclasses import asdict
-import hashlib
 import math
 import os
 from pathlib import Path
@@ -10,13 +9,14 @@ import numpy as np
 import pandas as pd
 from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 
+from .._source import file_sha256
 from ..kernel import ALGORITHM, SCORE_DEFINITION
 from ..kernel.topology import partition_from_cuts
 from ..tree.candidates import candidate_evidence, replay_candidate_evidence
 
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
-OUTPUT_SCHEMA_VERSION = 12
+OUTPUT_SCHEMA_VERSION = 13
 
 _VERIFY_ROWS = 4096
 _VERIFY_CENTERS = 32
@@ -98,9 +98,6 @@ def _verify_retained_bank(model, result, score):
     if not any(candidate is result.selected for candidate in result.candidate_bank):
         raise ValueError('Selected fitted state is absent from the complete candidate bank')
     evidence = candidate_evidence(result.tree, result.candidate_bank, result.selected)
-    retained, _ = replay_candidate_evidence(evidence)
-    if not np.isclose(retained.score, score, atol=1e-7, rtol=1e-10):
-        raise ValueError('Selected fit is not the best complete-bank score')
     saved = result.diagnostics.get('candidate_evidence')
     if saved is not None:
         # The search ledger must describe the CURRENT bank, not only a winner
@@ -108,7 +105,10 @@ def _verify_retained_bank(model, result, score):
         if any(saved.get(key) != evidence[key] for key in
                ('version', 'tree', 'selected_state_index', 'states')):
             raise ValueError('Persisted candidate evidence disagrees with the retained bank')
-        replay_candidate_evidence(saved)
+        evidence = saved  # Retain the saved ledger's additional attempt-link checks.
+    retained, _ = replay_candidate_evidence(evidence)
+    if not np.isclose(retained.score, score, atol=1e-7, rtol=1e-10):
+        raise ValueError('Selected fit is not the best complete-bank score')
 
 
 def verify_selected(model, result):
@@ -210,11 +210,19 @@ def result_tables(model, result, tumor_id):
     wide = pd.DataFrame(dict(tumor_id=tumor_id, mutation_id=model.mutation_ids, cluster_label=public))
     cluster = pd.DataFrame(dict(tumor_id=tumor_id, cluster_label=np.arange(len(order)),
                                 cluster_size=np.bincount(public)))
+    calls = model.multiplicity(phi)
+    calls = np.where(~model.observed & (model.support == 1), 1, calls)
+    report = getattr(getattr(model, 'data', None), 'cn_filter_report', None)
+    if report is not None and report.records:
+        mutations = {name: i for i, name in enumerate(model.mutation_ids)}
+        regions = {name: j for j, name in enumerate(model.region_ids)}
+        for record in report.records:
+            i, j = mutations.get(record.mutation_id), regions.get(record.sample_id)
+            if i is not None and j is not None:
+                phi[i, j] = calls[i, j] = np.nan
     for j, region in enumerate(model.region_ids):
         wide['phi_'+region] = phi[:, j]
         cluster['phi_'+region] = centers[order, j]
-    calls = model.multiplicity(phi)
-    calls = np.where(~model.observed & (model.support == 1), 1, calls)
     long = pd.DataFrame(dict(tumor_id=tumor_id,
         mutation_id=np.repeat(model.mutation_ids, model.r), region_id=np.tile(model.region_ids, model.n),
         phi=phi.ravel(), multiplicity_call=calls.ravel()))
@@ -245,11 +253,11 @@ def publish(model, result, outdir, tumor_id):
             parsed = pd.read_csv(staged/name, sep='\t', dtype=str, keep_default_na=False)
             if list(parsed.columns) != list(table.columns) or len(parsed) != len(table):
                 raise ValueError('Staged TSV did not round-trip its schema and row count')
-            hashes[name] = hashlib.sha256((staged/name).read_bytes()).hexdigest()
+            hashes[name] = file_sha256(staged/name)
         for name in hashes:
             os.link(staged/name, outdir/name)
         for name, digest in hashes.items():
-            if hashlib.sha256((outdir/name).read_bytes()).hexdigest() != digest:
+            if file_sha256(outdir/name) != digest:
                 raise ValueError('Published TSV readback hash mismatch')
     return {'status': 'complete', 'algorithm': ALGORITHM,
             'output_schema_version': OUTPUT_SCHEMA_VERSION, 'files': hashes,

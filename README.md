@@ -5,37 +5,54 @@ regional cancer cell fractions (CCFs) and mutation multiplicities.
 
 ## Install
 
-Requires Python 3.10+ and a C++17 compiler. Run from the repository root.
+Requires Python 3.10+ and a C++17 compiler. From the repository root:
 
 ```bash
-python -m pip install .
+python -m pip install .                       # CPU
+CLIPP2_BUILD_CUDA=1 python -m pip install .     # CPU + CUDA
 ```
 
-For GPU execution, build the optional CUDA backend with an NVIDIA CUDA toolkit
-(`nvcc`); execution requires a compatible NVIDIA GPU and driver:
-
-```bash
-CLIPP2_BUILD_CUDA=1 python -m pip install .
-```
-
-CPU builds do not require CUDA or PyTorch.
+CUDA builds require `nvcc`; GPU execution requires a compatible NVIDIA GPU and
+driver. CPU builds require neither CUDA nor PyTorch.
 
 ## Run
 
 ```bash
-# CPU
-clipp2 fit --input-file tumor.tsv --device cpu --outdir ../clipp2-cpu
-
-# GPU
-clipp2 fit --input-file tumor.tsv --device cuda --outdir ../clipp2-gpu
+clipp2 fit --input-dir tumor/ --device cpu --outdir results/
 ```
 
-Use a new output directory for each run. `--max-clusters` defaults to **20**; larger values can greatly increase the exhaustive search.
+Use `--device cuda` for GPU execution and a new output directory for each run.
+`--max-clusters` defaults to **20**; larger values can greatly increase search cost.
 
 ## Input
 
-Provide one tab-separated file per tumor, optionally gzip-compressed, with these
-columns. See [example input](examples/exampleTumor1.tsv).
+### Directory
+
+One directory represents one tumor; its region subfolders are fitted jointly:
+
+```text
+tumor/
+├── region1/
+│   ├── snv.txt
+│   ├── cna.txt
+│   └── purity.txt
+└── region2/          # same three files
+```
+
+Folder names define tumor/region IDs. See the [runnable example](examples/README.md).
+Each region requires:
+
+
+| File | Required contents |
+| --- | --- |
+| `snv.txt` | `chromosome_index`, `position`, `ref_count`, `alt_count`; optional unique `mutation_id` |
+| `cna.txt` | `chromosome_index`, `start_position`, `end_position`, `major_cn`, `minor_cn`, `total_cn` |
+| `purity.txt` | One number in `(0, 1]`, without a header |
+
+### TSV alternative
+
+Use `--input-file tumor.tsv` instead of `--input-dir` for a single table combining
+all regions; gzip is supported. See [example](examples/exampleTumor1.tsv).
 
 | Columns | Contents |
 | --- | --- |
@@ -49,8 +66,10 @@ Include every mutation–region pair; use `count_observed=0` and `.` for missing
 counts. For multiple CN states, repeat the same read counts across state rows;
 state fractions must sum to 1. Purity must be constant within each region.
 
-`--max-major-cn` defaults to **10**. A mutation is excluded from all regions if
-any of its CN states exceeds this major-copy-number limit.
+For both input formats, `--max-major-cn` defaults to **10**. A mutation is excluded
+only from regions where any of its CN states exceeds this limit; valid observations
+in other regions remain. Mutations with no usable observations are dropped.
+Regions with no usable observations cause an error rather than being removed.
 
 ## Output
 
@@ -63,7 +82,9 @@ The output directory contains three tables:
 | `{tumor_id}_mutation_region_multiplicity.tsv` | CCF and multiplicity estimates for each mutation–region pair |
 
 Cluster 0 has the largest CCF-vector L2 norm and is not necessarily clonal.
+CN-filtered mutation-region pairs retain rows with `NA` CCF and multiplicity
+estimates; their regional CCF entries in the mutation-clusters table are also `NA`.
 
 ## Contact
 
-For questions or concerns, please submit an issue or email yding4@mdanderson.org.
+Submit an issue or email yding4@mdanderson.org.

@@ -252,51 +252,7 @@ struct RefitObjective {
     __device__ void finish_grid() const { __syncthreads(); }
 };
 
-__global__ void refit_kernel(ObservationSoA data, RefitBatch batch,
-        i64* observed_rows, i64* observed_counts, double* member_values,
-        double* grid_values, RefitResult* output) {
-    __shared__ i64 observed_count;
-    __shared__ int initial_status;
-    __shared__ double total;
-    for (i64 task = blockIdx.x; task < batch.tasks; task += gridDim.x) {
-        const i64 begin = batch.member_offsets[task], end = batch.member_offsets[task + 1];
-        const i64 region = batch.regions[task];
-        if (!threadIdx.x) {
-            observed_count = 0;
-            initial_status = 0;
-            double lower = 0, upper = 1;
-            // Compact once, keeping the original membership order. Missing
-            // cells do not enter the reduction but still constrain the box.
-            for (i64 member = begin; member < end; ++member) {
-                const i64 row = batch.member_rows[member], cell = region * data.mutations + row;
-                if (data.lower[cell] > lower) lower = data.lower[cell];
-                if (data.upper[cell] < upper) upper = data.upper[cell];
-                if (data.flags[cell] & observed_flag)
-                    observed_rows[begin + observed_count++] = row;
-            }
-            if (batch.lower[task] < lower || batch.upper[task] > upper)
-                initial_status = static_cast<int>(RefitStatus::InvalidBox);
-            else if (!observed_count)
-                initial_status = static_cast<int>(RefitStatus::Unsupported);
-            observed_counts[task] = observed_count;
-        }
-        __syncthreads();
-        if (initial_status) {
-            if (!threadIdx.x) {
-                constexpr double nan = quiet_nan;
-                output[task] = {nan, nan, nan, nan, 0, initial_status};
-            }
-        } else {
-            // Search state is thread-local device state, identical in every
-            // block participant. There is no per-evaluation host round trip.
-            const auto result = refit_search(batch, task, grid_values + batch.grid_offsets[task],
-                RefitObjective{data, observed_rows + begin, observed_count, region,
-                               member_values + begin, &total});
-            if (!threadIdx.x) output[task] = result;
-        }
-        __syncthreads();
-    }
-}
+#include "refit.cuh"
 
 __global__ void conditional_kernel(ObservationSoA data, ConditionalBatch batch,
         i64* observed_rows, i64* observed_counts, double* member_values,
@@ -573,46 +529,7 @@ extern "C" int CliPP2RefitCentersBatch(void* value, const RefitBatch* batch, Ref
         require(batch, "Missing CUDA refit batch");
         validate_refit_batch(c.data, *batch, output, false);
         if (!batch->tasks) return;
-        HostCounts observed_counts(c,batch->tasks);
-        Layout layout;
-        const i64 regions = layout.take<i64>(batch->tasks),
-                  offsets = layout.take<i64>(add(batch->tasks, 1)),
-                  rows = layout.take<i64>(batch->members),
-                  grid_offsets = layout.take<i64>(add(batch->tasks, 1)),
-                  grid = layout.take<double>(batch->grid_points),
-                  lower = layout.take<double>(batch->tasks), upper = layout.take<double>(batch->tasks),
-                  xatol = layout.take<double>(batch->tasks),
-                  incumbent = layout.take<double>(batch->incumbent ? batch->tasks : 0),
-                  compacted = layout.take<i64>(batch->members), counts = layout.take<i64>(batch->tasks),
-                  member_values = layout.take<double>(batch->members),
-                  grid_values = layout.take<double>(batch->grid_points),
-                  results = layout.take<RefitResult>(batch->tasks);
-        c.reserve(layout.bytes);
-        RefitBatch device_batch{batch->tasks, batch->members, batch->grid_points,
-            c.pointer<i64>(regions), c.pointer<i64>(offsets), c.pointer<i64>(rows),
-            c.pointer<i64>(grid_offsets), c.pointer<double>(grid), c.pointer<double>(lower),
-            c.pointer<double>(upper), c.pointer<double>(xatol),
-            batch->incumbent ? c.pointer<double>(incumbent) : nullptr};
-        c.upload(c.pointer<i64>(regions), batch->regions, batch->tasks);
-        c.upload(c.pointer<i64>(offsets), batch->member_offsets, add(batch->tasks, 1));
-        c.upload(c.pointer<i64>(rows), batch->member_rows, batch->members);
-        c.upload(c.pointer<i64>(grid_offsets), batch->grid_offsets, add(batch->tasks, 1));
-        c.upload(c.pointer<double>(grid), batch->grid, batch->grid_points);
-        c.upload(c.pointer<double>(lower), batch->lower, batch->tasks);
-        c.upload(c.pointer<double>(upper), batch->upper, batch->tasks);
-        c.upload(c.pointer<double>(xatol), batch->xatol, batch->tasks);
-        if (batch->incumbent) c.upload(c.pointer<double>(incumbent), batch->incumbent, batch->tasks);
-        const unsigned task_blocks = static_cast<unsigned>(std::min<i64>(65535, batch->tasks));
-        refit_kernel<<<task_blocks, threads, 0, c.stream>>>(c.data, device_batch,
-            c.pointer<i64>(compacted), c.pointer<i64>(counts), c.pointer<double>(member_values),
-            c.pointer<double>(grid_values), c.pointer<RefitResult>(results));
-        c.launched();
-        c.download(output, c.pointer<RefitResult>(results), batch->tasks);
-        c.download(observed_counts.values.data(), c.pointer<i64>(counts), batch->tasks);
-        c.finish();
-        for (i64 task = 0; task < batch->tasks; ++task)
-            c.diagnostics.cell_evaluations = add(c.diagnostics.cell_evaluations,
-                multiply(observed_counts.values[task], output[task].evaluations));
+        refit_cuda(c, *batch, output);
     });
 }
 

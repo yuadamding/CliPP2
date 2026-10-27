@@ -360,11 +360,17 @@ class NativeBackend:
             raise ValueError("Prepared refit arrays require consistent one-dimensional CSR fields")
         if not count:
             return []
+        if self.kind == "cuda":
+            # The native planner owns task slices and parallel-grid waves.
+            # Python's former serial-grid estimate cannot bound that scratch.
+            batch = _RefitBatch(count, len(members), len(grids), *map(_ptr, arrays))
+            fitted = (_RefitResult * count)()
+            self._check(self.lib.CliPP2RefitCentersBatch(self.context, ct.byref(batch), fitted))
+            return list(fitted)
         sizes = zip(map(int, np.diff(member_offsets)), map(int, np.diff(grid_offsets)))
-        costs = ([8*(rows+grid+1) for rows, grid in sizes] if self.kind == "cpu" else
-                 [112+24*rows+16*grid for rows, grid in sizes])
+        costs = [8*(rows+grid+1) for rows, grid in sizes]
         results = []
-        for selected in self._task_slices(costs, 8 if self.kind == "cpu" else 128):
+        for selected in self._task_slices(costs, 8):
             count = selected.stop - selected.start
             offsets = slice(selected.start, selected.stop+1)
             first_member, last_member = member_offsets[[selected.start, selected.stop]]

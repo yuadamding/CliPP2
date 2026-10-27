@@ -1,4 +1,4 @@
-"""Read and write CliPP2's single-file long tumor format."""
+"""Validate canonical tumor data, including regional SNV/CNA directory inputs."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from .data import CNFilterRecord, CNFilterReport, TumorData
 from ..config import DEFAULT_MAX_MAJOR_CN, MAX_MULTIPLICITY, validate_max_major_cn
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
-CN_FILTER_POLICY_ID = "major_limit_whole_mutation_v3"
+CN_FILTER_POLICY_ID = "major_limit_mutation_region_v4"
 MAJOR_CN_ABOVE_LIMIT = "MAJOR_CN_ABOVE_LIMIT"
 NO_POSITIVE_PATH = "NO_POSITIVE_MUTANT_COPY_PATH"
 
@@ -148,7 +148,9 @@ def _validate_metadata(metadata: dict[str, str], *, path: Path) -> dict[str, str
     return validated
 
 
-def _read_text_table(path: Path) -> tuple[dict[str, str], pd.DataFrame]:
+def _read_text_table(
+    path: Path, *, columns: tuple[str, ...] = SCHEMA_COLUMNS, canonical: bool = True,
+) -> tuple[dict[str, str], pd.DataFrame]:
     if not path.is_file():
         raise FileNotFoundError(f"Tumor input file does not exist: {path}")
 
@@ -211,14 +213,17 @@ def _read_text_table(path: Path) -> tuple[dict[str, str], pd.DataFrame]:
         raise TumorTxtError(f"{path} does not contain a table header.")
     if not rows:
         raise TumorTxtError(f"{path} does not contain any tumor rows.")
-    metadata = _validate_metadata(metadata, path=path)
-    missing_columns = sorted(set(SCHEMA_COLUMNS).difference(header))
+    if canonical:
+        metadata = _validate_metadata(metadata, path=path)
+    elif metadata:
+        raise TumorTxtError(f"{path}: metadata is supported only in canonical TSV inputs.")
+    missing_columns = sorted(set(columns).difference(header))
     if missing_columns:
         raise TumorTxtError(f"{path} is missing required columns: {missing_columns}.")
     # Extra columns are accepted as provenance but never enter normalization,
     # likelihood construction, or the objective identity.
     table = pd.DataFrame(rows, columns=header, dtype=object)
-    return metadata, table.loc[:, SCHEMA_COLUMNS]
+    return metadata, table.loc[:, columns] if canonical else table
 
 
 def _identifier(value: object, *, name: str) -> str:
@@ -509,25 +514,27 @@ def _filter_snv_cn(
     validated: _ValidatedLongTable,
     *, max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
 ) -> tuple[_ValidatedLongTable, CNFilterReport]:
-    """Exclude whole SNVs if any original CN state in any region exceeds the limit."""
+    """Exclude only pairs with a CN state above the limit; retain other regions."""
     max_major_cn = validate_max_major_cn(max_major_cn)
     records: list[CNFilterRecord] = []
-    excluded_ids: set[str] = set()
+    excluded_pairs: set[tuple[str, str]] = set()
     for (mutation_id, sample_id), rows in sorted(validated.rows_by_unit.items()):
         segment_id = rows[0]["segment_id"]
         states = validated.states_by_segment[(sample_id, segment_id)]
         n_states = len(states)
         max_major = max(state.allele_a_cn for state in states)
         if max_major > max_major_cn:
-            excluded_ids.add(mutation_id)
+            excluded_pairs.add((mutation_id, sample_id))
             records.append(CNFilterRecord(
                 mutation_id, sample_id, segment_id, MAJOR_CN_ABOVE_LIMIT,
                 n_states, max_major,
             ))
     retained_ids = tuple(
         mutation_id for mutation_id in validated.mutation_ids
-        if mutation_id not in excluded_ids
+        if any((mutation_id, sample_id) not in excluded_pairs
+               for sample_id in validated.sample_ids)
     )
+    excluded_ids = set(validated.mutation_ids).difference(retained_ids)
     report = CNFilterReport(
         policy_id=CN_FILTER_POLICY_ID,
         max_major_cn=max_major_cn,
@@ -546,11 +553,14 @@ def _filter_snv_cn(
         if unit[0] not in excluded_ids
     }
     retained_purity: dict[str, float] = {}
-    for (_, sample_id), rows in retained_rows.items():
+    for unit, rows in retained_rows.items():
+        if unit in excluded_pairs:
+            continue
+        _, sample_id = unit
         value = min(row["_source_purity"] for row in rows)
         retained_purity[sample_id] = min(retained_purity.get(sample_id, value), value)
     retained_rows = {
-        unit: tuple(dict(row, purity=retained_purity[unit[1]]) for row in rows)
+        unit: tuple(dict(row, purity=retained_purity.get(unit[1], row["purity"])) for row in rows)
         for unit, rows in retained_rows.items()
     }
     used_segments = {
@@ -584,23 +594,28 @@ def _build_tumor_data(
     total_counts = np.zeros(shape, dtype=np.float64)
     count_observed = np.zeros(shape, dtype=bool)
     purity = np.empty(shape, dtype=np.float64)
-    normal_cn = np.empty(shape, dtype=np.float64)
-    major_cn = np.empty(shape, dtype=np.float64)
-    minor_cn = np.empty(shape, dtype=np.float64)
-    mean_total_cn = np.empty(shape, dtype=np.float64)
-    cn_state_count = np.empty(shape, dtype=np.int64)
+    # Excluded pairs use non-biological placeholders, never their original CN:
+    # no read evidence, multiplicity-support cost, or mixed-CN domain restriction.
+    normal_cn = np.full(shape, 2.0)
+    major_cn = np.ones(shape, dtype=np.float64)
+    minor_cn = np.ones(shape, dtype=np.float64)
+    mean_total_cn = np.full(shape, 2.0)
+    cn_state_count = np.ones(shape, dtype=np.int64)
+    excluded_pairs = {(record.mutation_id, record.sample_id) for record in report.records}
 
     for unit, rows in validated.rows_by_unit.items():
         mutation_id, sample_id = unit
         i = mutation_index[mutation_id]
         j = sample_index[sample_id]
         row = rows[0]
+        purity[i, j] = float(row["purity"])
+        if unit in excluded_pairs:
+            continue
         count_observed[i, j] = bool(row["count_observed"])
         if row["count_observed"]:
             assert row["alt_count"] is not None and row["ref_count"] is not None
             alt_counts[i, j] = float(row["alt_count"])
             total_counts[i, j] = float(row["alt_count"] + row["ref_count"])
-        purity[i, j] = float(row["purity"])
         normal_cn[i, j] = float(row["normal_cn"])
         states = validated.states_by_segment[(sample_id, row["segment_id"])]
         cn_state_count[i, j] = len(states)
@@ -662,9 +677,11 @@ def load_tumor_txt(
     max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
     initialize: bool = False,
 ) -> TumorData:
-    """Validate/filter CN and prepare immutable arrays, without numerical fits.
+    """Load a canonical TSV or a single/joint regional directory, without fits.
 
-    Any original state above max_major_cn excludes the whole mutation. The
+    A state above max_major_cn masks only its mutation-region pair. Mutations
+    excluded in every region are removed; pair exclusions remain in the report.
+    Masked counts/CN are neutral internal placeholders, not imputations. The
     retained initialize=False keyword is compatibility-only; pooled numerical
     initialization belongs to RegionalModel.pilots(), not input preprocessing.
     """
@@ -679,7 +696,12 @@ def load_tumor_txt(
     if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
         raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
     input_path = Path(path).resolve()
-    metadata, table = _read_text_table(input_path)
+    if input_path.is_dir():
+        from .region_files import read_region_directory
+
+        metadata, table = read_region_directory(input_path)
+    else:
+        metadata, table = _read_text_table(input_path)
     validated = _validate_long_table(metadata, table)
     filtered, report = _filter_snv_cn(validated, max_major_cn=max_major_cn)
     return _build_tumor_data(filtered, report=report, eps=epsilon)

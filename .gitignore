@@ -13,3 +13,4 @@ dist/
 uv.lock
 *_results/
 clipp2_results/
+/results/

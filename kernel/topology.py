@@ -5,12 +5,12 @@ storage. Edge IDs, rather than independently chosen regional edges, define
 the shared cluster support. No imputation creates missing-overlap edges.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 
 import numpy as np
 
-from ..io.data import readonly_array
+from ..io.data import ImmutableArrayRecord, readonly_array
 
 
 @dataclass(frozen=True, eq=False)
@@ -74,11 +74,15 @@ class PreparedPartition:
 
 
 @dataclass(frozen=True)
-class FrozenTree:
+class FrozenTree(ImmutableArrayRecord):
     edges: np.ndarray
     n: int
     mutation_ids: tuple = ()
     kind: str = "tree"
+    canonical_node_order: np.ndarray = field(init=False, repr=False, compare=False)
+    adjacency_offsets: np.ndarray = field(init=False, repr=False, compare=False)
+    adjacent_nodes: np.ndarray = field(init=False, repr=False, compare=False)
+    adjacent_edge_ids: np.ndarray = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
         if isinstance(self.n, bool) or not isinstance(self.n, (int, np.integer)) or self.n < 1:
@@ -109,6 +113,19 @@ class FrozenTree:
         # made writeable again with setflags, unlike a write-protected owner.
         object.__setattr__(self, "edges", np.frombuffer(edges.tobytes(), dtype=np.int64).reshape(-1, 2))
         object.__setattr__(self, "mutation_ids", ids)
+        # Execution metadata only: preserve Python string ordering (including
+        # embedded NULs) and the original edge-insertion order at every node.
+        order = sorted(range(self.n), key=lambda i: ids[i])
+        offsets = np.r_[0, np.cumsum(np.bincount(edges.ravel(), minlength=self.n))]
+        neighbors, edge_ids = np.empty(2*len(edges), dtype=np.int64), np.empty(2*len(edges), dtype=np.int64)
+        cursor = offsets[:-1].copy()
+        for eid, (a, b) in enumerate(edges):
+            for node, neighbor in ((a, b), (b, a)):
+                neighbors[cursor[node]], edge_ids[cursor[node]] = neighbor, eid
+                cursor[node] += 1
+        for name, value in (("canonical_node_order", order), ("adjacency_offsets", offsets),
+                            ("adjacent_nodes", neighbors), ("adjacent_edge_ids", edge_ids)):
+            object.__setattr__(self, name, readonly_array(value, dtype=np.int64))
 
     @property
     def n_nodes(self):
@@ -227,7 +244,7 @@ def partition_from_cuts(tree, cuts):
         parent[b] = a
     roots = np.array([root(i) for i in range(tree.n)])
     mapping = {}
-    for i in sorted(range(tree.n), key=lambda i: tree.mutation_ids[i]):
+    for i in tree.canonical_node_order:
         mapping.setdefault(int(roots[i]), len(mapping))
     return np.array([mapping[int(root)] for root in roots], dtype=np.int64)
 

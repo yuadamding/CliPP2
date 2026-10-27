@@ -201,12 +201,11 @@ CLIPP_HD bool refit_interval(double lower, double upper, double xatol,
     return true;
 }
 
-// Objective is a host callable or a collective CUDA-block callable: every
-// participant receives the same total. store_grid writes once; finish_grid
-// publishes those values before every participant follows the same decisions.
+// Supplied values belong to this task's grid slice. Physical grid evaluation
+// may run independently, but winner scans and adaptive work keep their order.
 template<class Objective>
-CLIPP_HD RefitResult refit_search(const RefitBatch& batch, std::int64_t task,
-                                  double* grid_values, const Objective& objective) {
+CLIPP_HD RefitResult refit_search_from_grid(const RefitBatch& batch, std::int64_t task,
+                                           const double* grid_values, const Objective& objective) {
     constexpr double nan = quiet_nan;
     RefitResult result{nan, nan, nan, nan, 0, 0};
     const double lower = batch.lower[task], upper = batch.upper[task];
@@ -219,14 +218,12 @@ CLIPP_HD RefitResult refit_search(const RefitBatch& batch, std::int64_t task,
     const std::int64_t count = batch.grid_offsets[task + 1] - first;
     const double* grid = batch.grid + first;
     for (std::int64_t i = 0; i < count; ++i) {
-        const double value = objective(grid[i]);
-        objective.store_grid(grid_values + i, value);
+        const double value = grid_values[i];
         if (!i || value > result.base_log_likelihood) {
             result.base_center = grid[i]; result.base_log_likelihood = value;
         }
     }
     result.evaluations = count;
-    objective.finish_grid();
     if (count > 1) {
         if (!refit_interval(grid[0], grid[1], batch.xatol[task], objective, result))
             return result;
@@ -255,5 +252,22 @@ CLIPP_HD RefitResult refit_search(const RefitBatch& batch, std::int64_t task,
         }
     }
     return result;
+}
+
+// CPU-compatible producer. Collective CUDA objectives must publish the grid
+// before all participants consume it; invalid boxes still perform no work.
+template<class Objective>
+CLIPP_HD RefitResult refit_search(const RefitBatch& batch, std::int64_t task,
+                                  double* grid_values, const Objective& objective) {
+    const double lower = batch.lower[task], upper = batch.upper[task];
+    if (!(std::isfinite(lower) && std::isfinite(upper) && 0 <= lower
+          && lower <= upper && upper <= 1.0))
+        return refit_search_from_grid(batch, task, grid_values, objective);
+    const std::int64_t first = batch.grid_offsets[task];
+    const std::int64_t count = batch.grid_offsets[task + 1] - first;
+    for (std::int64_t i = 0; i < count; ++i)
+        objective.store_grid(grid_values + i, objective(batch.grid[first + i]));
+    objective.finish_grid();
+    return refit_search_from_grid(batch, task, grid_values, objective);
 }
 }

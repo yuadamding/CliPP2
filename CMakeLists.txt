@@ -36,7 +36,7 @@ endif()
 
 if(CLIPP2_BUILD_CUDA)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 80 89 90)
+        set(CMAKE_CUDA_ARCHITECTURES 80 86 89 90)
     endif()
     enable_language(CUDA)
     clipp2_backend(cuda)

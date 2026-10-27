@@ -1,7 +1,6 @@
 """One free-center, joint-region workflow backed by CliPP2's own kernel."""
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -9,6 +8,7 @@ from time import perf_counter
 
 from .config import FitConfig, resolve_fit_config
 from .io.tumor_txt import load_tumor_txt
+from .io.region_files import input_fingerprint
 
 
 def process_tumor_bundle(tumor_file, outdir, fit_config=None):
@@ -37,9 +37,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
             raise RuntimeError('Installed Python source disagrees with its build record')
         commit, dirty = built.get('commit'), built.get('dirty')
     path = Path(tumor_file)
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    input_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    input_hash = input_fingerprint(path)
     data = load_tumor_txt(path, max_major_cn=config.max_major_cn, initialize=False)
     check_destination(outdir, data.tumor_id)
     model = RegionalModel(data, device=config.device,
@@ -52,7 +50,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
                           cpu_threads=config.cpu_threads)
     try:
         result = fit_regions(model, config.max_clusters)
-        if hashlib.sha256(path.read_bytes()).hexdigest() != input_hash:
+        if input_fingerprint(path) != input_hash:
             raise RuntimeError('Input changed during fitting; no successful publication')
         if source_fingerprint(source_root) != source_hash:
             raise RuntimeError('Python source changed during fitting; no successful publication')

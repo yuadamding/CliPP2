@@ -41,6 +41,8 @@ class CNFilterRecord:
 
 @dataclass(frozen=True, slots=True)
 class CNFilterReport:
+    """Pair-level exclusions; excluded_mutation_ids failed in every region."""
+
     policy_id: str
     max_major_cn: int
     input_mutation_count: int
@@ -58,6 +60,8 @@ class TumorData(ImmutableArrayRecord):
 
     major_cn/minor_cn are per-allele maxima; mean_total_cn is the actual
     fraction-weighted total. Only clonal entries have a single CN pair.
+    Entries identified by cn_filter_report.records are masked placeholders,
+    not biological CN observations or multiplicity evaluation targets.
     """
 
     tumor_id: str
