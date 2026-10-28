@@ -10,9 +10,12 @@ nor a new penalty, and its weights never enter the native objective or BIC.
 
 import operator
 import sys
+from contextlib import ExitStack
 
 import numpy as np
 from scipy.optimize import brentq, minimize
+
+from .initialization_cuda import optional_oracle
 
 GRID_SIZE = 257
 MAX_ADDITIONAL_GRID_POINTS = 2048
@@ -177,6 +180,11 @@ def pooled_ccf_initialization(view, *, cache_bytes=None):
 
 
 def _pooled_standard(view, *, cache_bytes=None):
+    with ExitStack() as resources:
+        return _pooled_standard_fit(view, cache_bytes, resources)
+
+
+def _pooled_standard_fit(view, cache_bytes, resources):
     """Return posterior-mean CCFs and finite-grid optimization diagnostics.
 
     The base grid, resolution rule and optimization budget are data-independent.
@@ -200,6 +208,10 @@ def _pooled_standard(view, *, cache_bytes=None):
     block_rows = min(matrix_rows, support_rows)
     cache = _GridCache(cache_bytes)
     execution = _GridExecution()
+    resident = optional_oracle(view.subset(indices), grid, frequencies, block_rows,
+        cache.budget, standard=True, mask_bounds=False)
+    if resident is not None:
+        resources.callback(resident.close)
     block_count = (unique_count + block_rows - 1) // block_rows
     grid_block_evaluations = 0
     grid_cell_evaluations = 0
@@ -230,6 +242,9 @@ def _pooled_standard(view, *, cache_bytes=None):
         nonlocal evaluations
         evaluations += 1
         streamed_active = positions is not None and unique_count > matrix_rows
+        if resident is not None:
+            return resident.expectation(weights, collect_pilot=collect_pilot,
+                                        positions=positions, rescale=streamed_active)
         score = np.zeros(len(weights))
         log_likelihood = 0.0
         pilot = np.empty(unique_count) if collect_pilot else None
@@ -260,14 +275,18 @@ def _pooled_standard(view, *, cache_bytes=None):
         shrink = int(positive[np.argmin(score[positive])])
         if grow == shrink:
             return weights
-        mass, direction = np.empty(unique_count), np.empty(unique_count)
-        for first, stop, likelihood, _ in blocks():
-            mass[first:stop] = likelihood @ weights
-            direction[first:stop] = weights[shrink] * (likelihood[:, grow] - likelihood[:, shrink])
+        if resident is not None:
+            resident.prepare_transfer(weights, grow, shrink)
+            derivative = resident.derivative
+        else:
+            mass, direction = np.empty(unique_count), np.empty(unique_count)
+            for first, stop, likelihood, _ in blocks():
+                mass[first:stop] = likelihood @ weights
+                direction[first:stop] = weights[shrink] * (likelihood[:, grow] - likelihood[:, shrink])
 
-        def derivative(fraction):
-            denominator = np.maximum(mass + fraction * direction, np.finfo(float).tiny)
-            return float((frequencies / n * direction / denominator).sum())
+            def derivative(fraction):
+                denominator = np.maximum(mass + fraction * direction, np.finfo(float).tiny)
+                return float((frequencies / n * direction / denominator).sum())
 
         if derivative(0.0) <= 0.0:
             return weights
@@ -407,7 +426,7 @@ def _pooled_standard(view, *, cache_bytes=None):
         "grid_cache": {**cache.diagnostics(block_count),
                        "grid_block_evaluations": grid_block_evaluations,
                        "grid_cell_evaluations": grid_cell_evaluations,
-                       **execution.diagnostics()},
+                       **(resident.diagnostics() if resident is not None else execution.diagnostics())},
     }
     return pilot, diagnostics
 
@@ -434,6 +453,11 @@ class _GridOracle:
         self.grid_block_evaluations = 0
         self.grid_cell_evaluations = 0
         self.peak_block_bytes = 0
+        self.resident = optional_oracle(view, grid, np.ones(len(view)), self.block_rows,
+            self.cache.budget, standard=False, mask_bounds=True)
+        if self.resident is not None:
+            self.execution = self.resident
+            return
         for first in range(0, len(view), self.block_rows):
             stop = min(len(view), first+self.block_rows)
             values = self.log_block(first, stop)
@@ -473,6 +497,9 @@ class _GridOracle:
 
     def expectation(self, weights, *, collect_pilot=False):
         self.evaluations += 1
+        if self.resident is not None:
+            score, likelihood, pilot = self.resident.expectation(weights, collect_pilot=collect_pilot)
+            return score, likelihood, None, pilot
         score, mass = np.zeros(len(weights)), np.empty(len(self.view))
         pilot = np.empty(len(self.view)) if collect_pilot else None
         log_likelihood = 0.
@@ -493,6 +520,8 @@ class _GridOracle:
         return score/len(self.view), log_likelihood, mass, pilot
 
     def scaled_columns(self, positions):
+        if self.resident is not None:
+            raise RuntimeError("Resident initializer columns stay on device; use its transfer oracle")
         values = np.empty((len(self.view), len(positions)))
         for first in range(0, len(self.view), self.block_rows):
             stop = min(len(self.view), first+self.block_rows)
@@ -500,8 +529,17 @@ class _GridOracle:
             values[first:stop] = block
         return values
 
+    def close(self):
+        if self.resident is not None:
+            self.resident.close()
+
 
 def _pooled_adapter(view, *, block_bytes=None, cache_bytes=None):
+    with ExitStack() as resources:
+        return _pooled_adapter_fit(view, block_bytes, cache_bytes, resources)
+
+
+def _pooled_adapter_fit(view, block_bytes, cache_bytes, resources):
     """Stream the explicit mixed/general-normal grid; exact concave weight gap.
 
     Safeguarded SQUAREM and exact grow/shrink exchange mirror the inherited
@@ -514,6 +552,7 @@ def _pooled_adapter(view, *, block_bytes=None, cache_bytes=None):
     lower, upper = view.bounds()
     grid = np.unique(np.r_[np.linspace(0., 1., 257), lower, upper])
     oracle = _GridOracle(view, grid, block_bytes=block_bytes, cache_bytes=cache_bytes)
+    resources.callback(oracle.close)
     weights = np.full(len(grid), 1/len(grid))
     score, likelihood, mass, _ = oracle.expectation(weights)
     initial_likelihood = likelihood
@@ -561,11 +600,15 @@ def _pooled_adapter(view, *, block_bytes=None, cache_bytes=None):
         positive = np.flatnonzero(weights > 0)
         shrink = int(positive[np.argmin(score[positive])])
         if grow != shrink:
-            columns = oracle.scaled_columns([grow, shrink])
-            direction = weights[shrink]*(columns[:, 0]-columns[:, 1])
+            if oracle.resident is not None:
+                oracle.resident.prepare_transfer(weights, grow, shrink)
+                derivative = oracle.resident.derivative
+            else:
+                columns = oracle.scaled_columns([grow, shrink])
+                direction = weights[shrink]*(columns[:, 0]-columns[:, 1])
 
-            def derivative(fraction):
-                return float(np.mean(direction/np.maximum(mass+fraction*direction, np.finfo(float).tiny)))
+                def derivative(fraction):
+                    return float(np.mean(direction/np.maximum(mass+fraction*direction, np.finfo(float).tiny)))
 
             if derivative(0.) > 0:
                 fraction = 1. if derivative(1.) >= 0 else brentq(derivative, 0., 1., xtol=1e-14)

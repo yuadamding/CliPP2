@@ -7,6 +7,7 @@ not all possible tree partitions or continuous optima.
 """
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 from itertools import combinations
 from time import perf_counter
 
@@ -215,12 +216,22 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
             supplemental[candidate.cuts] = candidate
         return candidate
 
-    for edge in chosen:
-        cuts = (edge,)
-        consider(cuts, partition_from_cuts(tree, cuts), None, {
+    if getattr(bank, "weight_batch_size", 1) > 1:
+        proposals = (((edge,), partition_from_cuts(tree, (edge,)), None, {
             "route": "supported_one_edge_split", "requested_k": requested,
-            "occupied_q": 2, "zero_jumps_allowed": True,
-        })
+            "occupied_q": 2, "zero_jumps_allowed": True}, None) for edge in chosen)
+        candidates = bank.consider_independent(proposals)
+        for edge, candidate in zip(chosen, candidates):
+            attempted.add((edge,))
+            if candidate is not None:
+                supplemental[candidate.cuts] = candidate
+    else:
+        for edge in chosen:
+            cuts = (edge,)
+            consider(cuts, partition_from_cuts(tree, cuts), None, {
+                "route": "supported_one_edge_split", "requested_k": requested,
+                "occupied_q": 2, "zero_jumps_allowed": True,
+            })
     exchanged, scanned = set(), 0
     for original in sorted(unsupported)[:8]:
         if len(original) < 2:
@@ -259,7 +270,8 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
             break
         refinement_candidates += 1
         for _ in refine_partition(model, tree, candidate, refine_consider,
-                                  max_proposals=16-refinement_proposals, prepare=bank.prepare):
+                                  max_proposals=16-refinement_proposals, prepare=bank.prepare,
+                                  **({"device_proposals": True} if getattr(bank, "device_proposals", False) else {})):
             pass
     evaluated = sum((edge,) in attempted for edge in edges)
     return {"small_tree_node_limit": 64, "large_tree_split_limit": 32,
@@ -275,7 +287,9 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
             "exhaustive_tree_partition_search": False}
 
 
-def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, progress_callback=None):
+def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, progress_callback=None,
+                weight_batch_size=1, weight_batch_state_bytes=8*1024**2, device_proposals=False,
+                continuation_batch_size=1, coarsening_batch_size=1):
     """Fit tree proposals followed by bounded free-center joint reassignment.
 
     Truth is deliberately absent. Every R>=1 uses this same forest continuation,
@@ -284,6 +298,16 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     from ..kernel.solver import generate_candidates
     from .progress import ProgressReporter
 
+    if type(weight_batch_size) is not int or weight_batch_size < 1:
+        raise ValueError("weight_batch_size must be a positive integer")
+    if type(weight_batch_state_bytes) is not int or weight_batch_state_bytes < 0:
+        raise ValueError("weight_batch_state_bytes must be a nonnegative integer")
+    if type(device_proposals) is not bool:
+        raise TypeError("device_proposals must be a boolean")
+    if type(continuation_batch_size) is not int or continuation_batch_size < 1:
+        raise ValueError("continuation_batch_size must be a positive integer")
+    if type(coarsening_batch_size) is not int or coarsening_batch_size < 1:
+        raise ValueError("coarsening_batch_size must be a positive integer")
     progress = None if progress_callback is None else ProgressReporter(model, progress_callback)
 
     total_started = perf_counter()
@@ -315,17 +339,23 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
         progress.emit(complete=True)
         progress.start_phase("continuation")
     started = perf_counter()
-    seeds = (generate_candidates(model, tree, pilot, capacities, keep_raw_phi=False)
+    continuation = {} if continuation_batch_size == 1 else {"native_batch_size": continuation_batch_size}
+    seeds = (generate_candidates(model, tree, pilot, capacities, keep_raw_phi=False, **continuation)
              if progress is None else generate_candidates(
                  model, tree, pilot, capacities, keep_raw_phi=False,
-                 progress_callback=lambda operation: progress.completed_operation(None, None, operation)))
+                 progress_callback=lambda operation: progress.completed_operation(None, None, operation),
+                 **continuation))
     times["continuation_seconds"] = perf_counter() - started
     if progress is not None:
         progress.emit(complete=True)
         progress.start_phase("candidate_search")
-    bank = (_CandidateBank(model, tree) if progress is None else
+    bank_options = {} if (weight_batch_size == 1 and weight_batch_state_bytes == 8*1024**2
+                          and not device_proposals) else {
+        "weight_batch_size": weight_batch_size, "weight_batch_state_bytes": weight_batch_state_bytes,
+        "device_proposals": device_proposals}
+    bank = (_CandidateBank(model, tree, **bank_options) if progress is None else
             _CandidateBank(model, tree, progress=progress.completed_candidate,
-                           request_progress=progress.completed_operation))
+                           request_progress=progress.completed_operation, **bank_options))
     seeds_diagnostics, refined = [], set()
     refinement_seconds, subset_count, subset_visits = 0.0, 0, 0
 
@@ -335,7 +365,8 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
             return
         refined.add(proposal.cuts)
         started = perf_counter()
-        for intermediate in refine_partition(model, tree, proposal, bank.consider, prepare=bank.prepare):
+        for intermediate in refine_partition(model, tree, proposal, bank.consider, prepare=bank.prepare,
+                                             **({"device_proposals": True} if device_proposals else {})):
             refined.add(intermediate.cuts)
         refinement_seconds += perf_counter() - started
 
@@ -378,18 +409,33 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
         if native_candidate is None:
             repair_unsupported(cuts, requested, native)
         subset_count += 1 << len(cuts)
-        for subset in cut_subsets(cuts, capacities):
-            subset_visits += 1
-            if progress is not None:
-                progress.subset_visits = subset_visits
-            proposal = bank.consider_cuts(subset, None, {
-                "route": "connected_coarsening", "seed_index": index,
-                "seed_requested_k": requested, "requested_k": len(subset) + 1,
-                "occupied_q": len(subset) + 1, "seed_cuts": cuts,
-            })
-            if proposal is None:
-                repair_unsupported(subset, len(subset) + 1, {"route": "connected_coarsening"})
-            refine_once(proposal)
+        subsets = cut_subsets(cuts, capacities)
+        from ..kernel.model import RegionalModel
+        batched = (coarsening_batch_size > 1 and type(model) is RegionalModel
+                   and model.backend.kind == "cuda" and not any(name in vars(model) for name in
+                       ("refit", "refit_prepared", "_refit_groups", "_refit_steps", "_weight_result")))
+        if batched:
+            from ..kernel.coarsening_batch import CoarseningBatch
+            owner = CoarseningBatch(bank, subsets, max_active=coarsening_batch_size)
+        else:
+            owner = nullcontext(None)
+        with owner as stream:
+            for subset in subsets if stream is None else stream:
+                subset_visits += 1
+                if progress is not None:
+                    progress.subset_visits = subset_visits
+                provenance = {
+                    "route": "connected_coarsening", "seed_index": index,
+                    "seed_requested_k": requested, "requested_k": len(subset) + 1,
+                    "occupied_q": len(subset) + 1, "seed_cuts": cuts,
+                }
+                proposal = (bank.consider_cuts(subset, None, provenance) if stream is None
+                            else stream.consider(provenance))
+                if proposal is None:
+                    if stream is not None and not all(q in capacities for q in range(1, len(subset)+1)):
+                        stream.expire('repair')
+                    repair_unsupported(subset, len(subset) + 1, {"route": "connected_coarsening"})
+                refine_once(proposal)
     started = perf_counter()
     if progress is not None:
         progress.emit(bank, complete=True)

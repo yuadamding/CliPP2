@@ -6,6 +6,8 @@
 #include <atomic>
 
 namespace {
+#include "scoring_reduce.cuh"
+
 struct ScoringAllocation {
     Context& context;
     unsigned char* data = nullptr;
@@ -34,15 +36,18 @@ struct ResidentColumn {
     double* data() { return values.at<double>(); }
 };
 struct MixtureLayout {
-    i64 n,q,chunks,bytes=0,pointers=0,weights=0,log_weights=0,offset=0,kernel=0,terms=0,partials=0,sums=0;
+    i64 n,q,chunks,bytes=0,pointers=0,weights=0,log_weights=0,offset=0,kernel=0;
+    i64 leaf_metadata=0,leaf_partials=0,partials=0,sums=0;
     i64 other=0,grow_log=0,shrink_log=0,numerator=0,sign=0,invalid=0;
-    MixtureLayout(i64 rows,i64 count):n(rows),q(count),chunks(rows/8192+(rows%8192!=0)) {
+    ScoringReductionPlan reduction;
+    MixtureLayout(i64 rows,i64 count):n(rows),q(count),chunks(rows/8192+(rows%8192!=0)),reduction(rows) {
         if(n<=0 || q<=0) throw std::domain_error("CUDA mixture dimensions must be positive");
         Layout layout;
         pointers=layout.take<const double*>(q); weights=layout.take<double>(q);
         log_weights=layout.take<double>(q);
         offset=layout.take<double>(n); kernel=layout.take<double>(multiply(n,q));
-        terms=layout.take<double>(multiply(n,add(q,2)));
+        leaf_metadata=layout.take<ScoringLeaf>(reduction.tail_count);
+        leaf_partials=layout.take<double>(multiply(reduction.leaf_count,add(q,2)));
         partials=layout.take<double>(multiply(chunks,add(q,2)));
         sums=layout.take<double>(add(q,2)); other=layout.take<double>(n);
         grow_log=layout.take<double>(n); shrink_log=layout.take<double>(n);
@@ -66,6 +71,14 @@ struct ScoringCacheEntry {
     i64 charge=0;
     i64 host_charge=0;
 };
+struct ScoringRequestStorage {
+    i64 capacity,host_charge,optional_charge;
+    std::unique_ptr<const double*[]> pointers;
+    std::unique_ptr<ScoringAllocation> header;
+    static i64 host_bytes(i64 count) { return add(256,multiply(count,sizeof(const double*))); }
+    explicit ScoringRequestStorage(i64 count):capacity(count),host_charge(host_bytes(count)),
+            optional_charge(host_charge),pointers(std::make_unique<const double*[]>(count)) {}
+};
 struct ScoringState {
     std::map<i64,std::shared_ptr<ResidentColumn>> handles;
     std::map<i64,std::unique_ptr<MixtureProblem>> problems;
@@ -73,11 +86,15 @@ struct ScoringState {
     std::list<std::string> order;
     // Only idle scratch is retained. Live problems always own distinct arenas.
     std::unique_ptr<ScoringAllocation> arena_cache;
+    std::unique_ptr<ScoringRequestStorage> request_cache;
     i64 arena_allocations=0,arena_reuses=0;
+    i64 request_allocations=0,request_reuses=0,request_header_allocations=0;
+    i64 request_live_objects=0,request_live_host_bytes=0,request_live_device_bytes=0;
     i64 host_bytes=0,staging_bytes=0;
     // evaluations, cache hits, exports, gathers, weight evaluations,
     // transfer preparations, O(N) trials, live handles, live problems.
     i64 counters[9]{};
+    i64 proposal_counters[4]{};
     i64 id() {
         static std::atomic<i64> next{1};
         const i64 result=next.fetch_add(1);
@@ -88,9 +105,9 @@ struct ScoringState {
 ScoringState& scoring_state(Context& c) {
     if(!c.scoring_state) {
         const i64 charge=add(sizeof(ScoringState),128);
-        while(charge>c.host_staging_limit-add(c.grid_cache_host_bytes,c.diagnostics.staging_bytes)
-                && evict_optional_grid_cache(c)) {}
-        require(charge<=c.host_staging_limit-add(c.grid_cache_host_bytes,c.diagnostics.staging_bytes),
+        while(charge>c.host_staging_limit-add(add(c.grid_cache_host_bytes,c.probability_host_bytes),c.diagnostics.staging_bytes)
+                && (evict_optional_grid_cache(c)||evict_optional_probability_cache(c))) {}
+        require(charge<=c.host_staging_limit-add(add(c.grid_cache_host_bytes,c.probability_host_bytes),c.diagnostics.staging_bytes),
                 "CUDA scoring registry exceeds native host budget");
         auto state=std::make_unique<ScoringState>(); state->host_bytes=charge;
         c.scoring_state=state.release();
@@ -106,9 +123,17 @@ i64 scoring_persistent_host_bytes(Context& c) noexcept {
     if(!c.scoring_state) return 0;
     return static_cast<ScoringState*>(c.scoring_state)->host_bytes;
 }
+void release_request_cache(Context& c,ScoringState& s) noexcept {
+    if(!s.request_cache) return;
+    c.drop_optional(s.request_cache->optional_charge);
+    s.host_bytes-=s.request_cache->host_charge;
+    s.request_cache.reset();
+}
 bool evict_optional_scoring_cache(Context& c) {
     if(!c.scoring_state) return false;
     auto& s=*static_cast<ScoringState*>(c.scoring_state);
+    // Request storage saves allocation only; computed columns/grids have priority.
+    if(s.request_cache) { release_request_cache(c,s); return true; }
     // Reusing an arena saves allocation, whereas a column saves computation.
     // Give the latter priority; mandatory live leases are never invalidated.
     if(s.arena_cache) {
@@ -157,10 +182,10 @@ template<class Function> int scoring_guarded(Function function) {
     return 1;
 }
 void check_scoring_host(Context& c,i64 extra) {
-    auto used=add(scoring_host_bytes(c),add(c.grid_cache_host_bytes,c.diagnostics.staging_bytes));
+    auto used=add(scoring_host_bytes(c),add(add(c.grid_cache_host_bytes,c.probability_host_bytes),c.diagnostics.staging_bytes));
     while(extra>c.host_staging_limit-used &&
-            (evict_optional_scoring_cache(c) || evict_optional_grid_cache(c))) {
-        used=add(scoring_host_bytes(c),add(c.grid_cache_host_bytes,c.diagnostics.staging_bytes));
+            (evict_optional_scoring_cache(c) || evict_optional_grid_cache(c) || evict_optional_probability_cache(c))) {
+        used=add(scoring_host_bytes(c),add(add(c.grid_cache_host_bytes,c.probability_host_bytes),c.diagnostics.staging_bytes));
     }
     require(extra<=c.host_staging_limit-used,"CUDA scoring host metadata/staging exceeds native host budget");
 }
@@ -174,6 +199,63 @@ struct ScoringHostScope {
         if(bytes) { static_cast<ScoringState*>(context.scoring_state)->staging_bytes-=bytes; bytes=0; }
     }
     ~ScoringHostScope() { release(); }
+};
+struct ScoringRequestLease {
+    Context& context;
+    std::unique_ptr<ScoringRequestStorage> storage;
+    bool complete=false;
+    int exceptions=std::uncaught_exceptions();
+    ScoringRequestLease(Context& c,i64 count,bool device_header):context(c) {
+        if(count<=0) throw std::domain_error("CUDA request storage must be nonempty");
+        auto& s=scoring_state(c);
+        try {
+            if(s.request_cache && s.request_cache->capacity>=count) {
+                c.drop_optional(s.request_cache->optional_charge);
+                storage=std::move(s.request_cache); ++s.request_reuses;
+            } else {
+                release_request_cache(c,s);
+                check_scoring_host(c,ScoringRequestStorage::host_bytes(count));
+                storage=std::make_unique<ScoringRequestStorage>(count);
+                s.host_bytes=add(s.host_bytes,storage->host_charge); ++s.request_allocations;
+            }
+            if(device_header && !storage->header) {
+                storage->header=std::make_unique<ScoringAllocation>(c,
+                    multiply(storage->capacity,sizeof(const double*)));
+                storage->optional_charge=add(storage->host_charge,storage->header->bytes);
+                ++s.request_header_allocations;
+            }
+        } catch(...) {
+            if(storage) { s.host_bytes-=storage->host_charge; storage.reset(); }
+            throw;
+        }
+        ++s.request_live_objects;
+        s.request_live_host_bytes+=storage->host_charge;
+        s.request_live_device_bytes+=storage->header?storage->header->bytes:0;
+    }
+    const double** pointers() { return storage->pointers.get(); }
+    const double** device_pointers() { return storage->header->at<const double*>(); }
+    ~ScoringRequestLease() noexcept {
+        auto& s=*static_cast<ScoringState*>(context.scoring_state);
+        const bool succeeded=complete && std::uncaught_exceptions()==exceptions;
+        // Unsuccessful requests cannot leave queued transfers pointing into
+        // recycled host/device storage. Preserve the originating error.
+        if(!succeeded) cudaStreamSynchronize(context.stream);
+        --s.request_live_objects;
+        s.request_live_host_bytes-=storage->host_charge;
+        s.request_live_device_bytes-=storage->header?storage->header->bytes:0;
+        const auto old=s.request_cache.get();
+        const i64 free_optional=context.optional_cache_limit-context.optional_cache_bytes+
+            (old?old->optional_charge:0);
+        // Only unused optional capacity may retain scratch. Never evict a
+        // computed column/grid merely to retain this completed request.
+        if(succeeded && storage->optional_charge<=free_optional &&
+                (!old || old->capacity<storage->capacity ||
+                 (old->capacity==storage->capacity && !old->header && storage->header))) {
+            release_request_cache(context,s);
+            if(context.retain_optional(storage->optional_charge)) s.request_cache=std::move(storage);
+        }
+        if(storage) s.host_bytes-=storage->host_charge;
+    }
 };
 __global__ void resident_joint_kernel(ObservationSoA data,i64 count,const double* centers,
         double* const* columns,int* maximum) {
@@ -200,7 +282,7 @@ void retain_scoring_column(Context& c,const std::string& key,const std::shared_p
     // Both the ordered key and map key own their binary center bytes.
     const i64 host_charge=add(256,multiply(static_cast<i64>(key.size()),2));
     const i64 charge=add(column->values.bytes,host_charge);
-    if(add(scoring_host_bytes(c),add(c.grid_cache_host_bytes,add(c.diagnostics.staging_bytes,host_charge)))
+    if(add(scoring_host_bytes(c),add(add(c.grid_cache_host_bytes,c.probability_host_bytes),add(c.diagnostics.staging_bytes,host_charge)))
             >c.host_staging_limit) return;
     if(c.retain_optional(charge)) {
         bool ordered=false;
@@ -250,8 +332,8 @@ __global__ void mixture_offset_kernel(const double* const* columns,i64 n,i64 q,
     }
 }
 // Both dispatches use exactly the same per-row arithmetic and component order.
-__device__ void mixture_evaluate_row(const double* const* columns,const double* offsets,
-        const double* kernel,const double* weights,i64 n,i64 q,i64 row,double* terms) {
+__device__ double mixture_row_log_mass(const double* const* columns,const double* offsets,
+        const double* kernel,const double* weights,i64 n,i64 q,i64 row) {
     const double offset=offsets[row];
     double mass=0.;
     for(i64 k=0;k<q;++k) mass+=kernel[k*n+row]*weights[k];
@@ -271,16 +353,15 @@ __device__ void mixture_evaluate_row(const double* const* columns,const double* 
             log_mass=maximum+log(sum);
         }
     }
-    terms[row]=log_mass;
-    terms[n+row]=offset+log_mass;
-    for(i64 k=0;k<q;++k)
-        terms[(k+2)*n+row]=scoring_capped_exp(columns[k][row]-offset-log_mass);
+    return log_mass;
 }
-__global__ void mixture_evaluate_kernel(const double* const* columns,const double* offsets,const double* kernel,
-        const double* weights,i64 n,i64 q,double* terms) {
-    for(i64 row=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;row<n;
-        row+=static_cast<i64>(gridDim.x)*blockDim.x)
-        mixture_evaluate_row(columns,offsets,kernel,weights,n,q,row,terms);
+__device__ void mixture_evaluate_row(const double* const* columns,const double* offsets,
+        const double* kernel,const double* weights,i64 n,i64 q,i64 row,double* terms) {
+    const double log_mass=mixture_row_log_mass(columns,offsets,kernel,weights,n,q,row);
+    terms[row]=log_mass;
+    terms[n+row]=offsets[row]+log_mass;
+    for(i64 k=0;k<q;++k)
+        terms[(k+2)*n+row]=scoring_capped_exp(columns[k][row]-offsets[row]-log_mass);
 }
 constexpr i64 small_mixture_rows=128,small_mixture_columns=20;
 bool small_mixture(const MixtureProblem& p) {
@@ -311,19 +392,6 @@ __global__ void small_mixture_evaluate_kernel(const double* const* columns,const
     __syncthreads();  // All 128 participants publish, including inactive rows.
     if(row<q+2) sums[row]=small_mixture_sum(terms+row*n,n);
 }
-// Each block evaluates one logical 8192-value subtree. Final large chunks are
-// folded sequentially, retaining common/scalar_search.h's reduction topology.
-__global__ void mixture_reduce_kernel(const double* values,i64 n,i64 planes,i64 chunks,
-        double* partials) {
-    __shared__ double shared[128],total;
-    for(i64 job=blockIdx.x;job<planes*chunks;job+=gridDim.x) {
-        const i64 plane=job/chunks,first=(job%chunks)*8192;
-        const i64 count=n-first<8192?n-first:8192;
-        const double value=ordered_block_sum(values+plane*n+first,count,shared,&total);
-        if(!threadIdx.x) partials[job]=value;
-        __syncthreads();
-    }
-}
 __global__ void mixture_finish_reduction(const double* partials,i64 chunks,i64 planes,double* sums) {
     for(i64 plane=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;plane<planes;
         plane+=static_cast<i64>(gridDim.x)*blockDim.x) {
@@ -334,8 +402,10 @@ __global__ void mixture_finish_reduction(const double* partials,i64 chunks,i64 p
 }
 void reduce_mixture(MixtureProblem& p,i64 planes) {
     auto& c=p.context;
-    mixture_reduce_kernel<<<static_cast<unsigned>(std::min<i64>(65535,multiply(planes,p.chunks))),threads,0,c.stream>>>(
-        p.at<double>(p.terms),p.n,planes,p.chunks,p.at<double>(p.partials));
+    mixture_combine_leaves_kernel<<<static_cast<unsigned>(std::min<i64>(65535,multiply(planes,p.chunks))),threads,0,c.stream>>>(
+        p.at<double>(p.leaf_partials),p.n,planes,p.chunks,p.reduction.full_chunks,
+        p.at<ScoringLeaf>(p.leaf_metadata),p.reduction.tail_count,p.reduction.leaf_count,
+        p.at<double>(p.partials));
     c.launched();
     mixture_finish_reduction<<<blocks(planes),threads,0,c.stream>>>(
         p.at<double>(p.partials),p.chunks,planes,p.at<double>(p.sums));
@@ -384,14 +454,6 @@ __device__ double mixture_trial_row(i64 row,const double* other,const double* gr
         const double* shrink,const double* numerator,const double* sign,double a,double b) {
     const double mass=scoring_logadd(other[row],scoring_logadd(grow[row]+a,shrink[row]+b));
     return sign[row]==0.?0.:sign[row]*scoring_capped_exp(numerator[row]-mass);
-}
-__global__ void mixture_trial_kernel(i64 n,const double* other,const double* grow,
-        const double* shrink,const double* numerator,const double* sign,
-        double grow_weight,double amount,double fraction,double* terms) {
-    const double a=log(grow_weight+fraction*amount),b=log(amount*(1.-fraction));
-    for(i64 row=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;row<n;
-        row+=static_cast<i64>(gridDim.x)*blockDim.x)
-        terms[row]=mixture_trial_row(row,other,grow,shrink,numerator,sign,a,b);
 }
 __global__ void small_mixture_trial_kernel(i64 n,const double* other,const double* grow,
         const double* shrink,const double* numerator,const double* sign,
@@ -479,14 +541,40 @@ void mixture_transfer_derivative(MixtureProblem& p,double fraction,double* outpu
             p.at<double>(p.sign),p.grow_weight,p.amount,fraction,p.at<double>(p.sums));
         c.launched();
     } else {
-        mixture_trial_kernel<<<blocks(p.n),threads,0,c.stream>>>(p.n,p.at<double>(p.other),
+        mixture_leaf_trial_kernel<<<static_cast<unsigned>(std::min<i64>(65535,p.reduction.leaf_count)),threads,0,c.stream>>>(
+            p.n,p.reduction.full_chunks,p.at<ScoringLeaf>(p.leaf_metadata),p.reduction.leaf_count,p.at<double>(p.other),
             p.at<double>(p.grow_log),p.at<double>(p.shrink_log),p.at<double>(p.numerator),
-            p.at<double>(p.sign),p.grow_weight,p.amount,fraction,p.at<double>(p.terms));
+            p.at<double>(p.sign),p.grow_weight,p.amount,fraction,p.at<double>(p.leaf_partials));
         c.launched(); reduce_mixture(p,1);
     }
     finish_mixture_transfer(p,output);
 }
+#include "batch_scoring.cuh"
+#include "proposal_scoring.cuh"
 } // namespace
+
+extern "C" int CliPP2GatherColumnRows(void* value,i64 q,const i64* handles,i64 count,
+                                      const i64* rows,double* output) {
+    return scoring_guarded([&] { gather_column_rows(context(value),q,handles,count,rows,output); });
+}
+extern "C" int CliPP2PositiveTransferChunk(void* value,i64 q,const i64* handles,i64 first,i64 count,
+        const i64* labels,i64 capacity,i64* indices,double* gains,i64* returned) {
+    return scoring_guarded([&] { positive_transfer_chunk(context(value),q,handles,first,count,labels,
+                                                        capacity,indices,gains,returned); });
+}
+extern "C" int CliPP2CUDAProposalDiagnostics(void* value,i64* output) {
+    return scoring_guarded([&] {
+        auto& c=context(value); require(output,"Missing CUDA proposal diagnostics");
+        if(!c.scoring_state) { std::fill(output,output+4,0); return; }
+        const auto& s=scoring_state(c); std::copy(s.proposal_counters,s.proposal_counters+4,output);
+    });
+}
+
+extern "C" int CliPP2EvaluateWeightBatch(void* value,i64 count,const void* requests,
+                                         i64 output_size,double* output) {
+    return scoring_guarded([&] { evaluate_weight_batch(context(value),count,
+        static_cast<const WeightBatchRequest*>(requests),output_size,output); });
+}
 
 extern "C" int CliPP2CreateJointColumns(void* value,i64 count,const double* centers,i64* output) {
     return scoring_guarded([&] {
@@ -610,16 +698,14 @@ extern "C" int CliPP2GatherJointColumns(void* value,i64 count,const i64* handles
         const i64* labels,double* output) {
     return scoring_guarded([&] {
         auto& c=context(value); const auto columns=get_columns(c,count,handles);
-        ScoringHostScope staging(c,multiply(count,64));
+        ScoringHostScope staging(c,multiply(count,32));
         if(!labels||!output) throw std::domain_error("Missing CUDA assigned-column fields");
         for(i64 row=0;row<c.data.mutations;++row)
             if(labels[row]<0||labels[row]>=count) throw std::domain_error("CUDA assigned column out of range");
-        check_scoring_host(c,multiply(count,64));
-        std::vector<const double*> pointers;
-        for(const auto& column:columns) pointers.push_back(column->data());
-        ScoringAllocation header(c,multiply(count,sizeof(const double*)));
+        ScoringRequestLease request(c,count,true);
+        for(i64 k=0;k<count;++k) request.pointers()[k]=columns[k]->data();
         ScoringStreamFence fence(c);
-        c.upload(header.at<const double*>(),pointers.data(),count);
+        c.upload(request.device_pointers(),request.pointers(),count);
         const i64 tile=std::min(c.data.mutations,c.diagnostics.workspace_limit/16);
         require(tile>0,"CUDA assigned-value workspace cannot hold one row");
         Layout layout; const auto dl=layout.take<i64>(tile),dv=layout.take<double>(tile);
@@ -627,11 +713,12 @@ extern "C" int CliPP2GatherJointColumns(void* value,i64 count,const i64* handles
         for(i64 first=0;first<c.data.mutations;first+=tile) {
             const i64 rows=std::min(tile,c.data.mutations-first);
             c.upload(c.pointer<i64>(dl),labels+first,rows);
-            gather_columns_kernel<<<blocks(rows),threads,0,c.stream>>>(header.at<const double*>(),
+            gather_columns_kernel<<<blocks(rows),threads,0,c.stream>>>(request.device_pointers(),
                 c.pointer<i64>(dl),first,rows,c.pointer<double>(dv));
             c.launched(); c.download(output+first,c.pointer<double>(dv),rows); c.finish();
         }
         ++scoring_state(c).counters[3];
+        request.complete=true;
     });
 }
 extern "C" int CliPP2CreateMixtureProblem(void* value,i64 count,const i64* handles,i64* output) {
@@ -639,7 +726,7 @@ extern "C" int CliPP2CreateMixtureProblem(void* value,i64 count,const i64* handl
         auto& c=context(value); if(!output) throw std::domain_error("Missing CUDA mixture handle destination");
         *output=0;
         auto p=std::make_unique<MixtureProblem>(c,count);
-        p->host_charge=add(1024,multiply(count,64)); check_scoring_host(c,p->host_charge);
+        p->host_charge=add(sizeof(MixtureProblem)+256,multiply(count,64)); check_scoring_host(c,p->host_charge);
         ScoringHostScope staging(c,p->host_charge);
         p->columns=get_columns(c,count,handles);
         auto& s=scoring_state(c);
@@ -649,11 +736,13 @@ extern "C" int CliPP2CreateMixtureProblem(void* value,i64 count,const i64* handl
         } else {
             p->allocation=std::make_unique<ScoringAllocation>(c,p->bytes); ++s.arena_allocations;
         }
-        std::vector<const double*> pointers;
-        for(const auto& column:p->columns) pointers.push_back(column->data());
+        ScoringRequestLease request(c,count,false);
+        for(i64 k=0;k<count;++k) request.pointers()[k]=p->columns[k]->data();
         int invalid=0;
         ScoringStreamFence fence(c);
-        c.upload(p->at<const double*>(p->pointers),pointers.data(),count);
+        c.upload(p->at<const double*>(p->pointers),request.pointers(),count);
+        if(p->reduction.tail_count)
+            c.upload(p->at<ScoringLeaf>(p->leaf_metadata),p->reduction.tail,p->reduction.tail_count);
         cuda_check(cudaMemsetAsync(p->at<int>(p->invalid),0,sizeof(int),c.stream),"clear mixture status");
         mixture_offset_kernel<<<blocks(p->n),threads,0,c.stream>>>(p->at<const double*>(p->pointers),
             p->n,p->q,p->at<double>(p->offset),p->at<double>(p->kernel),p->at<int>(p->invalid));
@@ -662,6 +751,7 @@ extern "C" int CliPP2CreateMixtureProblem(void* value,i64 count,const i64* handl
         const i64 id=s.id(),host_charge=p->host_charge;
         s.problems.emplace(id,std::move(p)); staging.release();
         s.host_bytes=add(s.host_bytes,host_charge); *output=id;
+        request.complete=true;
     });
 }
 extern "C" int CliPP2ReleaseMixtureProblem(void* value,i64 handle) {
@@ -687,6 +777,21 @@ extern "C" int CliPP2CUDAMixtureRequiredBytes(i64 n,i64 q,i64* output) {
         *output=MixtureLayout(n,q).bytes;
     });
 }
+extern "C" int CliPP2CUDAMixtureAdmission(void* value,i64 q,i64* output) {
+    return scoring_guarded([&] {
+        auto& c=context(value);
+        if(q<=0||!output) throw std::domain_error("Invalid CUDA mixture admission query");
+        const MixtureLayout layout(c.data.mutations,q);
+        const i64 packed=add(sizeof(WeightBatchItem),multiply(add(multiply(q,2),2),8));
+        output[0]=add(layout.bytes,packed);
+        output[1]=c.resident_limit-c.resident_bytes;
+        output[2]=add(add(sizeof(MixtureProblem)+256,multiply(q,64)),
+                      ScoringRequestStorage::host_bytes(add(packed,7)/8));
+        if(!c.scoring_state) output[2]=add(output[2],sizeof(ScoringState)+128);
+        output[3]=c.host_staging_limit-scoring_host_bytes(c)-c.grid_cache_host_bytes
+                  -c.probability_host_bytes-c.diagnostics.staging_bytes;
+    });
+}
 extern "C" int CliPP2EvaluateMixture(void* value,i64 handle,const double* weights,
         double* objective,double* gradient,double* likelihood) {
     return scoring_guarded([&] {
@@ -705,8 +810,10 @@ extern "C" int CliPP2EvaluateMixture(void* value,i64 handle,const double* weight
             objective_sum=small_sums[0]; *likelihood=small_sums[1];
             std::copy(small_sums+2,small_sums+2+p.q,gradient);
         } else {
-            mixture_evaluate_kernel<<<blocks(p.n),threads,0,c.stream>>>(p.at<const double*>(p.pointers),
-                p.at<double>(p.offset),p.at<double>(p.kernel),p.at<double>(p.weights),p.n,p.q,p.at<double>(p.terms));
+            mixture_leaf_evaluate_kernel<<<static_cast<unsigned>(std::min<i64>(65535,p.reduction.leaf_count)),threads,0,c.stream>>>(
+                p.at<const double*>(p.pointers),p.at<double>(p.offset),p.at<double>(p.kernel),
+                p.at<double>(p.weights),p.n,p.q,p.reduction.full_chunks,p.at<ScoringLeaf>(p.leaf_metadata),
+                p.reduction.leaf_count,p.at<double>(p.leaf_partials));
             c.launched(); reduce_mixture(p,add(p.q,2));
             c.download(&objective_sum,p.at<double>(p.sums),1);
             c.download(likelihood,p.at<double>(p.sums)+1,1);
@@ -753,6 +860,18 @@ extern "C" int CliPP2CUDAScoringArenaDiagnostics(void* value,i64* output) {
         auto& s=scoring_state(c);
         output[0]=s.arena_allocations; output[1]=s.arena_reuses;
         output[2]=s.arena_cache?s.arena_cache->bytes:0;
+    });
+}
+extern "C" int CliPP2CUDAScoringRequestDiagnostics(void* value,i64* output) {
+    return scoring_guarded([&] {
+        auto& c=context(value); require(output,"Missing CUDA request-storage diagnostics");
+        if(!c.scoring_state) { std::fill(output,output+8,0); return; }
+        auto& s=scoring_state(c);
+        output[0]=s.request_allocations; output[1]=s.request_reuses;
+        output[2]=s.request_header_allocations; output[3]=s.request_live_objects;
+        output[4]=s.request_live_host_bytes; output[5]=s.request_live_device_bytes;
+        output[6]=s.request_cache?s.request_cache->host_charge:0;
+        output[7]=s.request_cache&&s.request_cache->header?s.request_cache->header->bytes:0;
     });
 }
 extern "C" int CliPP2CUDAScoringDiagnostics(void* value,i64* output) {

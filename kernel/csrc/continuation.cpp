@@ -9,14 +9,17 @@
 #include "common/validation.h"
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <thread>
+#include <pthread.h>
 #include <vector>
 
 namespace {
@@ -71,9 +74,18 @@ struct Engine {
     const clipp2kernel::PreparedTree& tree;
     clipp2kernel::Executor* team;
     Arena& arena;
+    // Optional reverse-communication hooks. The ordinary CPU path leaves both
+    // null and retains its original emitter and execution policy.
+    void* request_owner=nullptr;
+    void (*request_terms)(void*,const double*,double*,double*,double*,std::size_t)=nullptr;
+    void (*request_progress)(void*,int,int,std::int64_t)=nullptr;
 
     void evaluate(const Vector& x,Terms& out) const {
         ++evaluations;
+        if(request_terms) {
+            request_terms(request_owner,x.data(),out.value.data(),out.gradient.data(),out.curvature.data(),cells);
+            return;
+        }
         auto cell_terms=[&](int i) {for(int region=0;region<r;++region) {
             const auto cell=static_cast<std::size_t>(i)*r+region;
             const auto observation=clipp2::observation(data, static_cast<std::int64_t>(region)*n+i);
@@ -292,7 +304,10 @@ struct Engine {
                 const auto& delta=jumps(current.x,graph,arena.delta);
                 const auto& gradient=penalized_gradient(current,graph,rho);
                 stationarity_value=stationarity(current.x,gradient);
-                if(stationarity_value<=policy.stationarity) break;
+                if(stationarity_value<=policy.stationarity) {
+                    if(request_progress)request_progress(request_owner,1,level+1,iterations);
+                    break;
+                }
                 auto& h=arena.h;auto& rhs=arena.rhs;auto& qp=arena.qp;auto& diagonal=arena.diagonal;
                 for(std::size_t i=0;i<cells;++i) {h[i]=std::max(current.terms.curvature[i],1e-8);rhs[i]=h[i]*current.x[i]-current.terms.gradient[i];}
                 const bool solved=quadratic(h,rhs,graph,rho,qp);qp_unqualified+=!solved;++qp_calls;
@@ -328,6 +343,7 @@ struct Engine {
                     if(accepted)break;
                 }
                 if(!accepted)stalled=true;
+                if(request_progress)request_progress(request_owner,1,level+1,iterations);
                 if(stalled)break;
             }
             project(current.x,capacity);const auto& graph=forest(cuts);
@@ -338,6 +354,7 @@ struct Engine {
             components(graph);double mean_h;
             component_scale(current,labels,block_range,longest,mean_h);
             const bool feasible=std::max(violation,block_range)<=policy.constraint;
+            if(request_progress)request_progress(request_owner,2,level+1,iterations);
             if(stationarity_value<=policy.stationarity && feasible)break;
             if(rho>=policy.maximum_penalty || (stalled && feasible && 8*rho*epsilon>=policy.stationarity)) {numerical_limit=true;break;}
             if(level+1<policy.levels) {
@@ -359,6 +376,7 @@ struct Engine {
         report={rho,stationarity_value,violation,block_range,nll,nll+0.5*rho*(violation*violation),
                 iterations,evaluations,qp_calls,qp_unqualified,warm_starts,accepted_steps,std::min(level+1,policy.levels),longest,
                 tolerance?0:(numerical_limit?1:(stalled?2:3))};
+        if(request_progress)request_progress(request_owner,3,std::min(level+1,policy.levels),iterations);
     }
 };
 }
@@ -455,4 +473,266 @@ extern "C" int CliPP2ContinueCPU(const clipp2::ObservationSoA* data,const int* e
     } catch(const std::exception& error) {std::snprintf(error_message,sizeof(error_message),"%s",error.what());}
       catch(...) {std::snprintf(error_message,sizeof(error_message),"%s","Unknown native continuation failure");}
     return 1;
+}
+
+namespace {
+// Stackful reverse communication reuses the qualified Engine state machine.
+// Each worker holds the one CPU-work mutex except while awaiting an owner reply.
+// The owner alone may launch CUDA work; no CUDA context is used by these threads.
+struct ContinuationOwner;
+struct ContinuationState {
+    ContinuationOwner& owner;
+    int capacity;
+    Arena arena;
+    Vector output;
+    std::vector<int> labels;
+    std::vector<unsigned char> cuts;
+    CliPP2ContinuationReport report{};
+    CliPP2ContinuationRequest request{};
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::unique_lock<std::mutex>* cpu_lock=nullptr;
+    double *value_reply=nullptr,*gradient_reply=nullptr,*curvature_reply=nullptr;
+    std::string error;
+    bool cancelled=false,started=false;
+    pthread_t thread{};
+
+    ContinuationState(ContinuationOwner& group,int n,int r,int k,bool raw):
+        owner(group),capacity(k),arena(n,r),output(raw?static_cast<std::size_t>(n)*r:0),
+        labels(n),cuts(n-1) {}
+    void suspend(int kind,int boundary,int level,std::int64_t iterations,const double* x);
+    static void terms(void*,const double*,double*,double*,double*,std::size_t);
+    static void progress(void*,int,int,std::int64_t);
+    static void* work(void*);
+};
+
+struct ContinuationOwner {
+    int n,r;
+    bool raw;
+    std::size_t cells;
+    std::vector<int> edges,canonical;
+    Vector lower,upper,gaps;
+    Point initial;
+    CliPP2ContinuationPolicy policy;
+    CliPP2Norm norm;
+    CliPP2CutScores scores;
+    clipp2kernel::PreparedTree tree;
+    std::mutex cpu_work;
+    std::vector<std::unique_ptr<ContinuationState>> states;
+
+    ContinuationOwner(int nodes,int regions,const int* graph,const int* order,
+        const double* x,const double* values,const double* gradient,const double* curvature,
+        const double* lo,const double* hi,const double* gap,const CliPP2ContinuationPolicy& rules,
+        CliPP2Norm reduce_norm,CliPP2CutScores reduce_scores,bool keep_raw):
+        n(nodes),r(regions),raw(keep_raw),cells(static_cast<std::size_t>(n)*r),
+        canonical(order,order+n),lower(lo,lo+cells),upper(hi,hi+cells),gaps(gap,gap+n+1),
+        policy(rules),norm(reduce_norm),scores(reduce_scores),tree(n,n-1,graph) {
+        if(n>1)edges.assign(graph,graph+2*static_cast<std::size_t>(n-1));
+        initial.x.assign(x,x+cells);
+        initial.terms.value.assign(values,values+cells);
+        initial.terms.gradient.assign(gradient,gradient+cells);
+        initial.terms.curvature.assign(curvature,curvature+cells);
+    }
+    ~ContinuationOwner() {
+        for(auto& state:states) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->cancelled=true;state->changed.notify_all();
+        }
+        for(auto& state:states)if(state->started)pthread_join(state->thread,nullptr);
+    }
+    ContinuationState& state(int index) {
+        if(index<0 || static_cast<std::size_t>(index)>=states.size())
+            throw std::invalid_argument("Continuation task index outside owner");
+        return *states[index];
+    }
+};
+
+void ContinuationState::suspend(int kind,int boundary,int level,std::int64_t iterations,const double* x) {
+    std::unique_lock<std::mutex> lock(mutex);
+    if(cancelled)throw std::runtime_error("Continuation owner cancelled");
+    ++request.sequence;request.kind=kind;request.boundary=boundary;
+    request.level=level;request.iterations=iterations;request.coordinates=x;
+    cpu_lock->unlock();changed.notify_all();
+    changed.wait(lock,[&]{return cancelled || request.kind==0;});
+    const bool stopped=cancelled;
+    lock.unlock();cpu_lock->lock();
+    if(stopped)throw std::runtime_error("Continuation owner cancelled");
+}
+void ContinuationState::terms(void* opaque,const double* x,double* values,double* gradient,double* curvature,std::size_t) {
+    auto& state=*static_cast<ContinuationState*>(opaque);
+    state.value_reply=values;state.gradient_reply=gradient;state.curvature_reply=curvature;
+    state.suspend(1,0,0,0,x);
+}
+void ContinuationState::progress(void* opaque,int boundary,int level,std::int64_t iterations) {
+    static_cast<ContinuationState*>(opaque)->suspend(2,boundary,level,iterations,nullptr);
+}
+void* ContinuationState::work(void* opaque) {
+    auto& state=*static_cast<ContinuationState*>(opaque);
+    auto& group=state.owner;
+    try {
+        std::unique_lock<std::mutex> cpu(group.cpu_work);
+        state.cpu_lock=&cpu;
+        {std::lock_guard<std::mutex> lock(state.mutex);
+         if(state.cancelled)throw std::runtime_error("Continuation owner cancelled");}
+        clipp2kernel::prepare_forest_workspace(group.n,group.n-1);
+        struct Release {~Release(){clipp2kernel::reset_forest_workspace();}} release;
+        // Metadata only. The nonnull terms hook prevents any observation access.
+        const clipp2::ObservationSoA metadata{group.n,group.r,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr};
+        Engine engine{metadata,group.n,group.r,group.n-1,group.cells,group.edges.data(),
+            group.canonical.data(),group.lower.data(),group.upper.data(),group.gaps.data(),group.policy,
+            group.norm,group.scores,group.tree,nullptr,state.arena,&state,terms,progress};
+        engine.run(group.initial,state.capacity,group.raw?state.output.data():nullptr,
+            state.labels.data(),state.cuts.data(),state.report);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.request.kind=3;state.request.coordinates=nullptr;state.changed.notify_all();
+    } catch(const std::exception& error) {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.error=error.what();state.request.kind=4;state.request.coordinates=nullptr;state.changed.notify_all();
+    } catch(...) {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.error="Unknown continuation worker failure";state.request.kind=4;state.request.coordinates=nullptr;state.changed.notify_all();
+    }
+    state.cpu_lock=nullptr;
+    return nullptr;
+}
+
+void owner_error(const std::exception& error) {
+    std::snprintf(error_message,sizeof(error_message),"%s",error.what());
+}
+}
+
+extern "C" int CliPP2ContinuationOwnerMemory(int n,int r,int tasks,long long stack_bytes,
+    int output_flags,long long* shared,long long* state,long long* stack) {
+    if(n<1||r<1||tasks<1||stack_bytes<PTHREAD_STACK_MIN||!shared||!state||!stack
+       ||(output_flags!=0&&output_flags!=1))return 1;
+    pthread_attr_t attr;
+    if(pthread_attr_init(&attr))return 1;
+    std::size_t guard=0,actual=0;
+    const bool invalid=static_cast<unsigned long long>(stack_bytes)>std::numeric_limits<std::size_t>::max()
+        ||pthread_attr_setstacksize(&attr,static_cast<std::size_t>(stack_bytes))
+        ||pthread_attr_getstacksize(&attr,&actual)||pthread_attr_getguardsize(&attr,&guard);
+    pthread_attr_destroy(&attr);
+    if(invalid)return 1;
+    long long cpu_shared=0,cpu_state=0,cpu_thread=0;
+    if(CliPP2ContinuationMemory(n,r,1,tasks,&cpu_shared,&cpu_state,&cpu_thread))return 1;
+    const long double cells=static_cast<long double>(n)*r;
+    const long double a=6*sizeof(double)*cells+(24.0L*sizeof(int)+sizeof(double))*n+8192;
+    const long double b=static_cast<long double>(cpu_state)+cpu_thread+
+        output_flags*sizeof(double)*cells+5.0L*n+8192;
+    const long double c=static_cast<long double>(actual)+guard;
+    if(std::max({a,b,c,a+tasks*(b+c)})>std::numeric_limits<long long>::max())return 1;
+    *shared=static_cast<long long>(a);*state=static_cast<long long>(b);*stack=static_cast<long long>(c);
+    return 0;
+}
+
+extern "C" int CliPP2ContinuationOwnerCreate(int n,int r,const int* edges,const int* canonical,
+    const double* initial,const double* values,const double* gradient,const double* curvature,
+    const double* lower,const double* upper,const double* gaps,int tasks,const int* capacities,
+    const CliPP2ContinuationPolicy* policy,CliPP2Norm norm,CliPP2CutScores scores,
+    long long host_budget_bytes,long long stack_bytes,int output_flags,void** owner) {
+    error_message[0]='\0';if(owner)*owner=nullptr;
+    try {
+        long long shared=0,state=0,stack=0;
+        if(!owner||!canonical||!initial||!values||!gradient||!curvature||!lower||!upper||!gaps
+            ||!capacities||!policy||!norm||!scores||(n>1&&!edges)||host_budget_bytes<0
+            ||CliPP2ContinuationOwnerMemory(n,r,tasks,stack_bytes,output_flags,&shared,&state,&stack))
+            throw std::invalid_argument("Invalid continuation owner dimensions or buffers");
+        if(shared+static_cast<long double>(tasks)*(state+stack)>host_budget_bytes)
+            throw std::runtime_error("Continuation owner state and stack exceed host budget");
+        if(policy->levels<1||policy->iterations<1||!std::isfinite(policy->stationarity)||policy->stationarity<=0
+            ||!std::isfinite(policy->constraint)||policy->constraint<=0
+            ||!std::isfinite(policy->maximum_penalty)||policy->maximum_penalty<=0)
+            throw std::invalid_argument("Invalid continuation owner policy");
+        std::vector<unsigned char> seen(n,0);
+        for(int i=0;i<n;++i) {
+            if(canonical[i]<0||canonical[i]>=n||seen[canonical[i]]++)
+                throw std::invalid_argument("Invalid continuation canonical order");
+            if(!std::isfinite(gaps[i+1])||gaps[i+1]<=0)
+                throw std::invalid_argument("Invalid continuation spectral gap");
+        }
+        for(int i=0;i<tasks;++i) {
+            if(capacities[i]<1||capacities[i]>n)
+                throw std::invalid_argument("Invalid continuation capacity");
+            for(int j=0;j<i;++j)if(capacities[j]==capacities[i])
+                throw std::invalid_argument("Duplicate continuation capacities");
+        }
+        const auto cells=static_cast<std::size_t>(n)*r;
+        for(std::size_t i=0;i<cells;++i) {
+            if(!std::isfinite(initial[i])||!std::isfinite(lower[i])||!std::isfinite(upper[i])
+                ||lower[i]<0||upper[i]>1||lower[i]>upper[i]||initial[i]<lower[i]||initial[i]>upper[i]
+                ||!std::isfinite(values[i])||!std::isfinite(gradient[i])||!std::isfinite(curvature[i]))
+                throw std::invalid_argument("Invalid continuation initial state");
+        }
+        auto group=std::make_unique<ContinuationOwner>(n,r,edges,canonical,initial,values,gradient,curvature,
+            lower,upper,gaps,*policy,norm,scores,output_flags);
+        group->states.reserve(tasks);
+        for(int i=0;i<tasks;++i)
+            group->states.emplace_back(std::make_unique<ContinuationState>(*group,n,r,capacities[i],output_flags));
+        pthread_attr_t attr;
+        if(pthread_attr_init(&attr))throw std::runtime_error("Cannot initialize continuation thread attributes");
+        struct ReleaseAttr {pthread_attr_t* p;~ReleaseAttr(){pthread_attr_destroy(p);}} release{&attr};
+        if(pthread_attr_setstacksize(&attr,static_cast<std::size_t>(stack_bytes)))
+            throw std::runtime_error("Cannot reserve continuation worker stack");
+        for(auto& work:group->states) {
+            const int error=pthread_create(&work->thread,&attr,ContinuationState::work,work.get());
+            if(error)throw std::runtime_error("Cannot create continuation worker: "+std::to_string(error));
+            work->started=true;
+        }
+        *owner=group.release();return 0;
+    } catch(const std::exception& error) {owner_error(error);}
+      catch(...) {std::snprintf(error_message,sizeof(error_message),"Unknown continuation owner setup error");}
+    return 1;
+}
+extern "C" int CliPP2ContinuationOwnerPoll(void* owner,int task,int wait,CliPP2ContinuationRequest* request) {
+    try {
+        if(!owner||!request||(wait!=0&&wait!=1))throw std::invalid_argument("Invalid continuation poll");
+        auto& state=static_cast<ContinuationOwner*>(owner)->state(task);
+        std::unique_lock<std::mutex> lock(state.mutex);
+        if(wait)state.changed.wait(lock,[&]{return state.request.kind!=0||state.cancelled;});
+        *request=state.request;return 0;
+    } catch(const std::exception& error) {owner_error(error);return 1;}
+}
+extern "C" int CliPP2ContinuationOwnerReply(void* owner,int task,std::uint64_t sequence,
+    const double* values,const double* gradient,const double* curvature) {
+    try {
+        if(!owner)throw std::invalid_argument("Missing continuation reply owner");
+        auto& group=*static_cast<ContinuationOwner*>(owner);auto& state=group.state(task);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if(state.cancelled||state.request.sequence!=sequence||(state.request.kind!=1&&state.request.kind!=2))
+            throw std::invalid_argument("Stale or unexpected continuation reply");
+        if(state.request.kind==1) {
+            if(!values||!gradient||!curvature)throw std::invalid_argument("Missing continuation terms reply");
+            for(std::size_t i=0;i<group.cells;++i)
+                if(!std::isfinite(values[i])||!std::isfinite(gradient[i])||!std::isfinite(curvature[i]))
+                    throw std::runtime_error("Nonfinite continuation terms reply");
+            std::copy(values,values+group.cells,state.value_reply);
+            std::copy(gradient,gradient+group.cells,state.gradient_reply);
+            std::copy(curvature,curvature+group.cells,state.curvature_reply);
+        } else if(values||gradient||curvature)throw std::invalid_argument("Unexpected continuation progress payload");
+        state.request.kind=0;state.request.coordinates=nullptr;state.changed.notify_all();return 0;
+    } catch(const std::exception& error) {owner_error(error);return 1;}
+}
+extern "C" int CliPP2ContinuationOwnerResult(void* owner,int task,double* coordinates,int* labels,
+    unsigned char* cuts,CliPP2ContinuationReport* report) {
+    try {
+        if(!owner||!labels||!report)throw std::invalid_argument("Missing continuation result buffer");
+        auto& group=*static_cast<ContinuationOwner*>(owner);auto& state=group.state(task);
+        std::lock_guard<std::mutex> lock(state.mutex);
+        if(state.request.kind!=3||(group.raw&&!coordinates)||(group.n>1&&!cuts))
+            throw std::invalid_argument("Continuation result is unavailable");
+        if(group.raw)std::copy(state.output.begin(),state.output.end(),coordinates);
+        std::copy(state.labels.begin(),state.labels.end(),labels);
+        std::copy(state.cuts.begin(),state.cuts.end(),cuts);
+        *report=state.report;return 0;
+    } catch(const std::exception& error) {owner_error(error);return 1;}
+}
+extern "C" const char* CliPP2ContinuationOwnerError(void* owner,int task) {
+    try {
+        if(!owner)throw std::invalid_argument("Missing continuation error owner");
+        auto& state=static_cast<ContinuationOwner*>(owner)->state(task);
+        std::lock_guard<std::mutex> lock(state.mutex);return state.error.c_str();
+    } catch(const std::exception& error) {owner_error(error);return error_message;}
+}
+extern "C" void CliPP2ContinuationOwnerDestroy(void* owner) {
+    delete static_cast<ContinuationOwner*>(owner);
 }

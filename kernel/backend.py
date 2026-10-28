@@ -170,6 +170,11 @@ class _ConditionalBatch(ct.Structure):
     ] + [("centers", _D)]
 
 
+class _WeightBatchRequest(ct.Structure):
+    _fields_ = [(name, ct.c_int64) for name in ("handle", "operation", "grow", "shrink")
+               ] + [("fraction", ct.c_double), ("weights", _D)]
+
+
 def _ptr(array):
     return array.ctypes.data_as({np.dtype("float64"): _D, np.dtype("int64"): _I,
                                 np.dtype("uint8"): _B}[array.dtype])
@@ -216,8 +221,14 @@ class NativeBackend:
 
     def __init__(self, model, workspace_bytes, *, native_host_memory_bytes=None,
                  device_memory_bytes=None, cpu_threads=None, device_cache_bytes=256*1024**2,
-                 score_capacity=DEFAULT_MAX_CLUSTERS):
+                 score_capacity=DEFAULT_MAX_CLUSTERS, probability_reuse=False,
+                 resident_initialization=False):
         self.context = None
+        if type(probability_reuse) is not bool:
+            raise TypeError("probability_reuse must be a boolean")
+        if type(resident_initialization) is not bool:
+            raise TypeError("resident_initialization must be a boolean")
+        self.resident_initialization = resident_initialization
         kind = "cuda" if model.device.startswith("cuda") else "cpu"
         paths = sorted(Path(__file__).parent.glob(f"_native_{kind}*.so"))
         if len(paths) != 1:
@@ -323,19 +334,30 @@ class NativeBackend:
                 raise ValueError("device_cache_bytes must be a nonnegative int64")
             signatures = {
                 "ConfigureCUDAReuse": [ct.c_void_p, ct.c_int64, ct.c_int64],
+                "ConfigureCUDAProbabilityReuse": [ct.c_void_p, ct.POINTER(_Observations), ct.c_int],
+                "CUDAProbabilityDiagnostics": [ct.c_void_p, _I],
+                "CUDAProbabilityRefitDiagnostics": [ct.c_void_p, _I],
                 "CreateJointColumns": [ct.c_void_p, ct.c_int64, _D, _I],
                 "ImportJointColumns": [ct.c_void_p, ct.c_int64, _D, _I],
                 "ReleaseJointColumns": [ct.c_void_p, ct.c_int64, _I],
                 "ExportJointColumns": [ct.c_void_p, ct.c_int64, _I, _D],
                 "GatherJointColumns": [ct.c_void_p, ct.c_int64, _I, _I, _D],
+                "GatherColumnRows": [ct.c_void_p, ct.c_int64, _I, ct.c_int64, _I, _D],
+                "PositiveTransferChunk": [ct.c_void_p, ct.c_int64, _I, ct.c_int64, ct.c_int64,
+                                          _I, ct.c_int64, _I, _D, _I],
+                "CUDAProposalDiagnostics": [ct.c_void_p, _I],
                 "CreateMixtureProblem": [ct.c_void_p, ct.c_int64, _I, _I],
                 "ReleaseMixtureProblem": [ct.c_void_p, ct.c_int64],
                 "EvaluateMixture": [ct.c_void_p, ct.c_int64, _D, _D, _D, _D],
                 "PrepareMixtureTransfer": [ct.c_void_p, ct.c_int64, _D, ct.c_int64, ct.c_int64],
                 "PrepareMixtureTransferEndpoint": [ct.c_void_p, ct.c_int64, _D, ct.c_int64, ct.c_int64, _D],
                 "MixtureTransferDerivative": [ct.c_void_p, ct.c_int64, ct.c_double, _D],
+                "EvaluateWeightBatch": [ct.c_void_p, ct.c_int64,
+                                        ct.POINTER(_WeightBatchRequest), ct.c_int64, _D],
+                "CUDAMixtureAdmission": [ct.c_void_p, ct.c_int64, _I],
                 "CUDAScoringDiagnostics": [ct.c_void_p, _I],
                 "CUDAScoringArenaDiagnostics": [ct.c_void_p, _I],
+                "CUDAScoringRequestDiagnostics": [ct.c_void_p, _I],
                 "CUDAGridAdmissionDiagnostics": [ct.c_void_p, _I],
                 "CUDAReuseDiagnostics": [ct.c_void_p, _I],
                 "ReleaseCUDAOptionalCache": [ct.c_void_p],
@@ -346,6 +368,8 @@ class NativeBackend:
             resident_limit = self.device_memory_plan["resident_limit"]
             self._check(lib.CliPP2ConfigureCUDAReuse(
                 self.context, resident_limit, min(device_cache_bytes, resident_limit)))
+            self._check(lib.CliPP2ConfigureCUDAProbabilityReuse(
+                self.context, ct.byref(observations), int(probability_reuse)))
 
     @property
     def native_host_bytes(self):
@@ -354,7 +378,7 @@ class NativeBackend:
         if self.kind == "cuda":
             reuse = np.empty(11, dtype=np.int64)
             self._check(self.lib.CliPP2CUDAReuseDiagnostics(self.context, _ptr(reuse)))
-            return int(reuse[9]) + int(reuse[10])
+            return int(reuse[9]) + int(reuse[10]) + self.probability_reuse_diagnostics()["host_bytes"]
         result = _Diagnostics()
         self._check(self.lib.CliPP2BackendGetDiagnostics(self.context, ct.byref(result)))
         return result.prepared_bytes + result.cache_bytes
@@ -416,21 +440,22 @@ class NativeBackend:
         if self.kind == "cuda":
             diagnostics["scoring"] = self.scoring_diagnostics()
             diagnostics["scoring_arena"] = self.scoring_arena_diagnostics()
+            diagnostics["scoring_requests"] = self.scoring_request_diagnostics()
+            diagnostics["probability_reuse"] = self.probability_reuse_diagnostics()
+            diagnostics["proposal_scans"] = self._counter_diagnostics("CliPP2CUDAProposalDiagnostics",
+                ("chunks", "positive_pairs", "subset_gathers", "subset_values"))
             diagnostics["grid_admission"] = self.grid_admission_diagnostics()
-            reuse = np.empty(11, dtype=np.int64)
-            self._check(self.lib.CliPP2CUDAReuseDiagnostics(self.context, _ptr(reuse)))
-            diagnostics["reuse"] = dict(zip(("resident_limit", "resident_bytes", "resident_peak_bytes",
+            diagnostics["reuse"] = self._counter_diagnostics("CliPP2CUDAReuseDiagnostics",
+                ("resident_limit", "resident_bytes", "resident_peak_bytes",
                 "optional_cache_limit", "optional_cache_bytes", "grid_hits", "grid_misses",
                 "grid_reused_cells", "refit_physical_emission_cells", "grid_cache_host_bytes",
-                "scoring_host_bytes"), map(int, reuse)))
+                "scoring_host_bytes"))
         if self.kind == "cpu" and hasattr(self.lib, "CliPP2ProbabilityReuseDiagnostics"):
-            counters = np.empty(5, dtype=np.int64)
-            self._check(self.lib.CliPP2ProbabilityReuseDiagnostics(self.context, _ptr(counters)))
-            diagnostics["probability_reuse"] = dict(zip(("plans", "basis_components", "shape_evaluations",
-                "ordered_row_references", "peak_optional_plan_reservation"), map(int, counters)))
-            cache = np.empty(4, dtype=np.int64)
-            self._check(self.lib.CliPP2ProbabilityCacheDiagnostics(self.context, _ptr(cache)))
-            diagnostics["probability_cache"] = dict(zip(("hits", "misses", "bytes", "model_identity_bytes"), map(int, cache)))
+            diagnostics["probability_reuse"] = self._counter_diagnostics("CliPP2ProbabilityReuseDiagnostics",
+                ("plans", "basis_components", "shape_evaluations",
+                 "ordered_row_references", "peak_optional_plan_reservation"))
+            diagnostics["probability_cache"] = self._counter_diagnostics("CliPP2ProbabilityCacheDiagnostics",
+                ("hits", "misses", "bytes", "model_identity_bytes"))
         diagnostics.update(native_host_memory_bytes=self.native_host_memory_bytes,
                            device_memory_bytes=self.device_memory_bytes,
                            cpu_threads=self.cpu_threads, native_host_bytes=self.native_host_bytes)
@@ -461,13 +486,20 @@ class NativeBackend:
         x = _array(np.asarray(x).T)
         if x.shape != (self.r, self.n):
             raise ValueError("CCFs must match N by R")
+        result = self._evaluate_node_terms(x, derivatives, 1)
+        # Host continuation reduces these N-by-R arrays in the established
+        # row-major order. A transposed view would silently change that order.
+        return tuple(np.ascontiguousarray(value.T) for value in result) if derivatives else np.ascontiguousarray(result[0].T)
+
+    def _evaluate_node_terms(self, x, derivatives, batches):
+        """Evaluate already validated region-major states; wrappers own layout/admission."""
         result = [np.empty_like(x) for _ in range(3 if derivatives else 1)]
         count = x.size
         direct_bytes = count * (33 if derivatives else 17) + 8
         if self.kind == "cpu" or direct_bytes <= self.workspace_bytes:
             status = np.empty(x.shape, dtype=np.uint8)
             pointers = [_ptr(value) for value in result] + [None] * (3-len(result))
-            self._check(self.lib.CliPP2EvaluateNodes(self.context, 1, _ptr(x), int(derivatives),
+            self._check(self.lib.CliPP2EvaluateNodes(self.context, batches, _ptr(x), int(derivatives),
                                                     *pointers, _ptr(status)), status)
         else:
             # Indexed tiles keep the same region-major observation mapping;
@@ -476,13 +508,37 @@ class NativeBackend:
             for first in range(0, count, step):
                 last = min(count, first+step)
                 indices = np.arange(first, last, dtype=np.int64)
+                if x.ndim == 3:
+                    indices %= self.n*self.r
                 status = np.empty(last-first, dtype=np.uint8)
                 pointers = [_ptr(value.ravel()[first:last]) for value in result] + [None] * (3-len(result))
                 self._check(self.lib.CliPP2EvaluateCells(self.context, len(indices), _ptr(indices),
                     _ptr(x.ravel()[first:last]), int(derivatives), *pointers, _ptr(status)), status)
-        # Host continuation reduces these N-by-R arrays in the established
-        # row-major order. A transposed view would silently change that order.
-        return tuple(np.ascontiguousarray(value.T) for value in result) if derivatives else np.ascontiguousarray(result[0].T)
+        return result
+
+    def node_terms_batch(self, coordinates, derivatives=True):
+        """Evaluate independent B-by-N-by-R states in caller order.
+
+        Uses the existing native batched-emission ABI. Oversized requests use
+        bounded indexed tiles, never CPU likelihood fallback. Each returned
+        state is contiguous N-by-R, preserving continuation's reduction order.
+        """
+        from .execution import preflight_host_export
+        self._require_open()
+        coordinates = np.asarray(coordinates)
+        if coordinates.ndim != 3 or coordinates.shape[1:] != (self.n, self.r):
+            raise ValueError("Batched CCFs must match B by N by R")
+        batches = len(coordinates)
+        if not batches:
+            return []
+        planes = 3 if derivatives else 1
+        count = coordinates.size
+        preflight_host_export(count*(8 + 16*planes + 9))
+        x = _array(coordinates.transpose(0, 2, 1))
+        result = self._evaluate_node_terms(x, derivatives, batches)
+        ordered = [np.ascontiguousarray(value.transpose(0, 2, 1)) for value in result]
+        return ([tuple(value[index] for value in ordered) for index in range(batches)]
+                if derivatives else list(ordered[0]))
 
     def cells(self, region, rows, values):
         self._require_open()
@@ -548,33 +604,54 @@ class NativeBackend:
             self.context, len(centers), _ptr(centers), _ptr(handles)))
         return tuple(DeviceColumn(self, handle) for handle in handles)
 
+    def _counter_diagnostics(self, symbol, names):
+        counters = np.empty(len(names), dtype=np.int64)
+        self._check(getattr(self.lib, symbol)(self.context, _ptr(counters)))
+        return dict(zip(names, map(int, counters)))
+
     def scoring_diagnostics(self):
         self._require_open()
         if self.kind != "cuda":
             raise ValueError("Resident scoring diagnostics require CUDA")
-        counters = np.empty(9, dtype=np.int64)
-        self._check(self.lib.CliPP2CUDAScoringDiagnostics(self.context, _ptr(counters)))
-        return dict(zip(("column_evaluations", "column_cache_hits", "column_exports",
+        return self._counter_diagnostics("CliPP2CUDAScoringDiagnostics",
+                        ("column_evaluations", "column_cache_hits", "column_exports",
                          "column_gathers", "weight_evaluations", "transfer_preparations",
-                         "transfer_trials", "live_column_handles", "live_mixture_problems"),
-                        map(int, counters)))
+                         "transfer_trials", "live_column_handles", "live_mixture_problems"))
 
     def scoring_arena_diagnostics(self):
         self._require_open()
         if self.kind != "cuda":
             raise ValueError("Resident scoring diagnostics require CUDA")
-        counters = np.empty(3, dtype=np.int64)
-        self._check(self.lib.CliPP2CUDAScoringArenaDiagnostics(self.context, _ptr(counters)))
-        return dict(zip(("allocations", "reuses", "idle_bytes"), map(int, counters)))
+        return self._counter_diagnostics("CliPP2CUDAScoringArenaDiagnostics",
+                                        ("allocations", "reuses", "idle_bytes"))
+
+    def scoring_request_diagnostics(self):
+        self._require_open()
+        if self.kind != "cuda":
+            raise ValueError("Resident request diagnostics require CUDA")
+        return self._counter_diagnostics("CliPP2CUDAScoringRequestDiagnostics",
+                        ("allocations", "reuses", "header_allocations", "live_objects",
+                         "live_host_bytes", "live_device_bytes", "idle_host_bytes",
+                         "idle_device_bytes"))
 
     def grid_admission_diagnostics(self):
         self._require_open()
         if self.kind != "cuda":
             raise ValueError("Grid admission diagnostics require CUDA")
-        counters = np.empty(4, dtype=np.int64)
-        self._check(self.lib.CliPP2CUDAGridAdmissionDiagnostics(self.context, _ptr(counters)))
-        return dict(zip(("build_cells", "direct_cells", "admission_bypasses", "evictions"),
-                        map(int, counters)))
+        return self._counter_diagnostics("CliPP2CUDAGridAdmissionDiagnostics",
+                        ("build_cells", "direct_cells", "admission_bypasses", "evictions"))
+
+    def probability_reuse_diagnostics(self):
+        self._require_open()
+        if self.kind != "cuda":
+            raise ValueError("Device probability reuse requires CUDA")
+        result = self._counter_diagnostics("CliPP2CUDAProbabilityDiagnostics",
+                        ("host_bytes", "device_bytes", "model_plans_built", "reused_grid_requests",
+                         "direct_grid_requests", "basis_components_evaluated", "shapes_evaluated",
+                         "ordered_rows_gathered", "metadata_evictions", "setup_bypasses"))
+        result["refits"] = self._counter_diagnostics("CliPP2CUDAProbabilityRefitDiagnostics",
+                        ("reused_tasks", "reused_objective_calls", "basis_components", "row_evaluations"))
+        return result
 
     def import_joint_columns(self, log_columns):
         """Explicit host-to-device boundary for independent numerical checks."""
@@ -616,8 +693,172 @@ class NativeBackend:
             self.context, len(handles), _ptr(handles), _ptr(labels), _ptr(result)))
         return result
 
+    def gather_column_rows(self, columns, rows):
+        """Gather only requested rows/centers, preserving caller order and bits."""
+        from .execution import preflight_host_export
+        handles = self._column_handles(columns)
+        rows = np.asarray(rows)
+        if rows.ndim != 1 or rows.dtype.kind not in 'iu' or np.any(rows < 0) or np.any(rows >= self.n):
+            raise ValueError("Column subset rows must be valid mutation indices")
+        rows = _array(rows, np.int64)
+        preflight_host_export(8*len(rows)*len(handles)+self.workspace_bytes)
+        result = np.empty((len(rows), len(handles)))
+        width = max(1, min(len(handles), self.workspace_bytes//8))
+        for first_column in range(0, len(handles), width):
+            selected = handles[first_column:first_column+width]
+            height = max(1, self.workspace_bytes//(8*len(selected)))
+            for first in range(0, len(rows), height):
+                chosen = rows[first:first+height]
+                values = np.empty((len(chosen), len(selected)))
+                self._check(self.lib.CliPP2GatherColumnRows(self.context, len(selected), _ptr(selected),
+                    len(chosen), _ptr(chosen), _ptr(values)))
+                result[first:first+len(chosen), first_column:first_column+len(selected)] = values
+        return result
+
+    def positive_transfers(self, columns, labels):
+        """Resident subtraction and stable positive-gain compaction, no full export.
+
+        Return row-major (mutation, destination, gain) vectors. The host retains
+        original support legality, scientific keys, sorting and greedy order.
+        Every parent assignment is validated, including rows without proposals.
+        """
+        from .execution import preflight_host_export
+        handles = self._column_handles(columns)
+        q = len(handles)
+        labels = np.asarray(labels)
+        if (labels.shape != (self.n,) or labels.dtype.kind not in 'iu'
+                or np.any(labels < 0) or np.any(labels >= q)):
+            raise ValueError("Proposal labels must contain N valid column indices")
+        labels = _array(labels, np.int64)
+        height = min(self.n, 8192, (self.workspace_bytes-16)//(16*q+8))
+        if height < 1:
+            raise NativeExecutionError("CUDA proposal workspace cannot hold one row; increase workspace budget")
+        # Packed parts, concatenation and final row/destination vectors coexist.
+        # Include per-tile ndarray/list owners and the retained input conversion.
+        tiles = (self.n+height-1)//height
+        preflight_host_export(48*self.n*q+16*height*q+8*self.n+512*tiles)
+        index_parts, gain_parts = [], []
+        for first in range(0, self.n, height):
+            rows = min(height, self.n-first)
+            indices, gains = np.empty(rows*q, np.int64), np.empty(rows*q)
+            returned = ct.c_int64()
+            self._check(self.lib.CliPP2PositiveTransferChunk(self.context, q, _ptr(handles), first, rows,
+                _ptr(labels[first:first+rows]), len(indices), _ptr(indices), _ptr(gains), ct.byref(returned)))
+            count = returned.value
+            if count:
+                index_parts.append(indices[:count].copy())
+                gain_parts.append(gains[:count].copy())
+        indices = np.concatenate(index_parts) if index_parts else np.empty(0, np.int64)
+        gains = np.concatenate(gain_parts) if gain_parts else np.empty(0)
+        index_parts.clear()
+        gain_parts.clear()
+        return indices//q, indices%q, gains
+
     def mixture_problem(self, columns):
         return DeviceMixtureProblem(self, columns)
+
+    def mixture_admission(self, q):
+        """Read-only conservative space for one arena plus packed requests.
+
+        Availability excludes reclaimable optional storage: this query does not
+        evict useful grids/columns. The caller may flush a partial batch before
+        preparing another candidate; native mandatory allocation remains the
+        definitive admission and can evict optional storage when necessary.
+        New likelihood columns and controller states are additional owners.
+        """
+        self._require_open()
+        if self.kind != "cuda" or type(q) is not int or not 0 < q < 2**63:
+            raise ValueError("CUDA mixture admission requires a positive int64 q")
+        values = np.empty(4, dtype=np.int64)
+        self._check(self.lib.CliPP2CUDAMixtureAdmission(self.context, q, _ptr(values)))
+        return dict(zip(("device_required", "device_available", "host_required", "host_available"),
+                        map(int, values)))
+
+    def resident_weight_admission(self, sizes):
+        """Read-only extra optimizer/graph reservation, excluding live mixtures."""
+        from .execution import preflight_host_export
+        self._require_open()
+        sizes = tuple(sizes)
+        if (self.kind != "cuda" or not sizes
+                or any(type(q) is not int or not 0 < q < 2**63 for q in sizes)):
+            raise ValueError("Resident admission requires CUDA and positive int64 dimensions")
+        try:
+            query = self.lib.CliPP2ExperimentalResidentAdmission
+        except AttributeError as error:
+            raise NativeExecutionError("The loaded backend has no resident admission ABI") from error
+        query.argtypes = [ct.c_void_p, ct.c_int64] + [ct.POINTER(ct.c_int64)]*2
+        query.restype = ct.c_int
+        preflight_host_export(8*len(sizes)+32)
+        sizes = np.asarray(sizes, dtype=np.int64)
+        values = np.empty(4, dtype=np.int64)
+        self._check(query(self.context, len(sizes), _ptr(sizes), _ptr(values)))
+        return dict(zip(("device_required", "device_available", "host_required", "host_available"),
+                        map(int, values)))
+
+    def evaluate_weight_requests(self, requests):
+        """Submit independent ready operations with one packed transfer/finish.
+
+        Experimental controller boundary, not a production search policy. All
+        validation precedes mutation; endpoint hits retain scalar-oracle behavior.
+        Caller owns mixture leases; the native owner bounds reusable scratch.
+        """
+        self._require_open()
+        if self.kind != "cuda":
+            raise ValueError("Batched device weight requests require CUDA")
+        requests = tuple(requests)
+        packed, owners, starts, replies, handles = [], [], [], [None]*len(requests), set()
+        output_size = 0
+        operations = {"evaluate": 0, "prepare_transfer": 1, "transfer_derivative": 2}
+        for index, (problem, request) in enumerate(requests):
+            if not isinstance(problem, DeviceMixtureProblem) or problem.backend() is not self:
+                raise ValueError("Batched weight problems must belong to this backend")
+            if problem.handle in handles:
+                raise ValueError("Independent requests cannot share a mutable mixture state")
+            handles.add(problem.handle)
+            if request.operation not in operations:
+                raise ValueError("Unknown batched weight operation")
+            operation = operations[request.operation]
+            weights, grow, shrink, fraction = None, 0, 0, 0.
+            if operation != 2:
+                weights = problem._weights(request.weights)
+                starts.append(weights)  # Keep every ctypes input alive through finish.
+            if operation == 1:
+                grow, shrink = request.grow, request.shrink
+                if (not isinstance(grow, (int, np.integer)) or
+                        not isinstance(shrink, (int, np.integer)) or
+                        not 0 <= grow < problem.shape[1] or not 0 <= shrink < problem.shape[1]
+                        or grow == shrink or weights[shrink] <= 0):
+                    raise ValueError("Invalid pairwise mixture transfer")
+                fraction = 1.
+            if operation == 2:
+                fraction = request.fraction
+                if not np.isfinite(fraction) or not 0 <= fraction <= 1:
+                    raise ValueError("Mixture transfer fraction must be in [0,1]")
+                if fraction == 1 and problem._transfer_endpoint is not None:
+                    replies[index] = problem._transfer_endpoint
+                    continue
+            packed.append(_WeightBatchRequest(problem.handle, operation, grow, shrink,
+                                               fraction, _D() if weights is None else _ptr(weights)))
+            owners.append((index, problem, operation, output_size))
+            output_size += problem.shape[1]+2 if operation == 0 else 1
+        if packed:
+            for _, problem, operation, _ in owners:
+                if operation == 1:
+                    problem._transfer_endpoint = None
+            native = (_WeightBatchRequest * len(packed))(*packed)
+            result = np.empty(output_size)
+            self._check(self.lib.CliPP2EvaluateWeightBatch(
+                self.context, len(packed), native, output_size, _ptr(result)))
+            for index, problem, operation, offset in owners:
+                if operation == 0:
+                    replies[index] = (float(result[offset]),
+                                      result[offset+2:offset+2+problem.shape[1]],
+                                      float(result[offset+1]))
+                elif operation == 1:
+                    problem._transfer_endpoint = float(result[offset])
+                else:
+                    replies[index] = float(result[offset])
+        return tuple(replies)
 
     def multiplicity(self, x):
         self._require_open()
@@ -864,6 +1105,23 @@ class _ContinuationReport(ct.Structure):
         (name, ct.c_int) for name in ("levels", "longest", "status")]
 
 
+_CONTINUATION_STATUSES = ("penalty_stationary_constraint_tolerance", "penalty_numerical_limit_candidate",
+                        "line_search_stalled_candidate", "finite_budget_candidate")
+
+
+def _continuation_diagnostics(report, tree, missing):
+    return {"status": _CONTINUATION_STATUSES[report.status], "backend": "host_forest",
+            "tree_identity": tree.identity, "missing_raw_coordinates_initialized": missing,
+            "constrained_optimum_certified": False, "global_optimum_certified": False,
+            "rho": report.rho, "iterations": report.iterations, "continuation_levels": report.levels,
+            "stationarity_CCF": report.stationarity, "constraint_residual_CCF": report.violation,
+            "max_block_range_CCF": report.block_range, "longest_block": report.longest,
+            "negative_log_likelihood": report.likelihood, "objective": report.objective,
+            "tolerance_met": report.status == 0, "qp_unqualified": report.qp_unqualified,
+            "feasible_warm_starts": report.warm_starts, "accepted_steps": report.accepted_steps,
+            "penalty_gradient_roundoff_scale": 8*report.rho*np.finfo(float).eps}
+
+
 def continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing, *, keep_raw_phi=True):
     """One source-bound native batch; capacities retain independent state.
 
@@ -972,8 +1230,6 @@ def continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing, *
         raise NativeExecutionError(lib.CliPP2ContinuationLastError().decode())
     if output is not None and not np.isfinite(output).all():
         raise NativeExecutionError("CPU continuation returned nonfinite coordinates")
-    statuses = ("penalty_stationary_constraint_tolerance", "penalty_numerical_limit_candidate",
-                "line_search_stalled_candidate", "finite_budget_candidate")
     execution = {"continuation": "native_cpu", "build_id": identity,
         "workers": actual.value, "capacities": len(requested), "initial_evaluations": 1,
         "node_evaluations": 1+sum(report.evaluations for report in reports),
@@ -990,20 +1246,11 @@ def continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing, *
     execution["cell_evaluations"] = execution["node_evaluations"]*model.n*model.r
     result = []
     for index, (capacity, report) in enumerate(zip(requested, reports)):
-        if not 0 <= report.status < len(statuses):
+        if not 0 <= report.status < len(_CONTINUATION_STATUSES):
             raise NativeExecutionError("CPU continuation returned an unknown status")
         result.append({"labels": labels[index].astype(np.int64), "cuts": np.flatnonzero(cuts[index]),
-            "requested_k": int(capacity), **({"raw_phi": output[index]} if keep_raw_phi else {}), "diagnostics": {
-                "status": statuses[report.status], "backend": "host_forest", "tree_identity": tree.identity,
-                "missing_raw_coordinates_initialized": missing,
-                "constrained_optimum_certified": False, "global_optimum_certified": False,
-                "rho": report.rho, "iterations": report.iterations, "continuation_levels": report.levels,
-                "stationarity_CCF": report.stationarity, "constraint_residual_CCF": report.violation,
-                "max_block_range_CCF": report.block_range, "longest_block": report.longest,
-                "negative_log_likelihood": report.likelihood, "objective": report.objective,
-                "tolerance_met": report.status == 0, "qp_unqualified": report.qp_unqualified,
-                "feasible_warm_starts": report.warm_starts, "accepted_steps": report.accepted_steps,
-                "penalty_gradient_roundoff_scale": 8*report.rho*np.finfo(float).eps},
+            "requested_k": int(capacity), **({"raw_phi": output[index]} if keep_raw_phi else {}),
+            "diagnostics": _continuation_diagnostics(report, tree, missing),
             "execution": {**execution, "capacity_node_evaluations": report.evaluations,
                 "capacity_qp_calls": report.qp_calls}})
     model._continuation_execution = execution

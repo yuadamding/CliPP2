@@ -79,8 +79,17 @@ class CandidateBank:
     """Retain eligible states before advancement; cache only exact attempts."""
 
     numerical_policy = "regional_conditional_refit_v1"
+    normalize_provenance = staticmethod(_plain)
 
-    def __init__(self, model, tree, *, progress=None, request_progress=None):
+    def __init__(self, model, tree, *, progress=None, request_progress=None,
+                 weight_batch_size=1, weight_batch_state_bytes=8*1024**2,
+                 device_proposals=False):
+        if type(weight_batch_size) is not int or weight_batch_size < 1:
+            raise ValueError("weight_batch_size must be a positive integer")
+        if type(weight_batch_state_bytes) is not int or weight_batch_state_bytes < 0:
+            raise ValueError("weight_batch_state_bytes must be a nonnegative integer")
+        if type(device_proposals) is not bool:
+            raise TypeError("device_proposals must be a boolean")
         self.model, self.tree = model, tree
         self.progress = progress
         self.request_progress = request_progress
@@ -92,6 +101,9 @@ class CandidateBank:
         self.attempt_cache_hits = self.structural_cache_hits = 0
         self.refit_seconds = 0.0
         self._tree_identity = tree.identity
+        self.weight_batch_size = weight_batch_size
+        self.weight_batch_state_bytes = weight_batch_state_bytes
+        self.device_proposals = device_proposals
 
     def prepare(self, cuts, labels=None, *, parent=None, fitted=None, columns=None):
         """Prepare one active expansion, retaining unchanged group handles.
@@ -193,9 +205,8 @@ class CandidateBank:
         return False, None
 
     def _consider(self, partition, centers, provenance):
-        membership, cuts, labels = partition.membership.key, partition.cuts, partition.labels
+        labels = partition.labels
         provenance = _plain(provenance)
-        attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
         started = perf_counter()
         self.refit_calls += 1
         try:
@@ -209,6 +220,13 @@ class CandidateBank:
                           else self.model.refit(labels, initial_centers=centers))
         finally:
             self.refit_seconds += perf_counter()-started
+        return self._commit(partition, centers, provenance, fitted)
+
+    def _commit(self, partition, centers, provenance, fitted):
+        """Publish exactly one completed fit, always in original request order."""
+        membership, cuts, labels = partition.membership.key, partition.cuts, partition.labels
+        provenance = _plain(provenance)
+        attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
         record = {"membership_kind": membership[0],
                   "cuts" if cuts is not None else "labels": list(cuts) if cuts is not None else labels.tolist(),
                   "initial_centers_ccf": None if centers is None else centers.tolist(),
@@ -275,6 +293,96 @@ class CandidateBank:
         if previous is None or score_key(candidate) < score_key(previous):
             index[key] = candidate
         return candidate
+
+    def consider_independent(self, requests):
+        """Optional bounded batching; dependencies must remain outside this call.
+
+        Each request is ``(cuts_or_None, labels, centers, provenance, parent)``.
+        Duplicate memberships and existing attempt/structural hits are ordering
+        barriers. Custom models/overrides retain ordinary serial consideration.
+        """
+        def serial(item):
+            cuts, labels, centers, provenance, parent = item
+            return (self.consider_membership(labels, centers, provenance, parent=parent) if cuts is None
+                    else self.consider(cuts, labels, centers, provenance, parent=parent))
+
+        model = self.model
+        enabled = (self.weight_batch_size > 1 and type(model) is RegionalModel
+                   and model.backend.kind == "cuda" and not any(name in vars(model) for name in
+                       ("refit", "refit_prepared", "_refit_groups", "_refit_steps", "_weight_result")))
+        if not enabled:
+            return [serial(item) for item in requests]
+        results, pending, memberships = [], [], set()
+        reserved = 0
+
+        def flush():
+            nonlocal reserved
+            if not pending:
+                return
+            started = perf_counter()
+            began = set()
+
+            def begin(index):
+                if index not in began:
+                    self.refit_calls += 1
+                    began.add(index)
+
+            def observe(index, event):
+                begin(index)
+                self.request_progress(self, pending[index][2], event)
+
+            def commit(index, fitted):
+                begin(index)
+                partition, centers, provenance, output_index = pending[index]
+                result = self._commit(partition, centers, provenance, fitted)
+                if partition.cuts is None:
+                    self.membership_attempts[(partition.labels.tobytes(),
+                        None if centers is None else centers.tobytes())] = result
+                results[output_index] = result
+                if self.progress is not None:
+                    self.progress(self, provenance)
+
+            work = [(partition, centers, None if self.request_progress is None else
+                     lambda event, index=index: observe(index, event))
+                    for index, (partition, centers, _, _) in enumerate(pending)]
+            try:
+                model.refit_prepared_batch(work, max_active=self.weight_batch_size,
+                    state_budget_bytes=self.weight_batch_state_bytes, on_result=commit)
+            finally:
+                self.refit_seconds += perf_counter()-started
+            pending.clear()
+            memberships.clear()
+            reserved = 0
+
+        for output_index, item in enumerate(requests):
+            results.append(None)
+            cuts, labels, centers, provenance, parent = item
+            labels, centers = _canonical_inputs(labels, centers, model.n, model.r)
+            if cuts is not None:
+                raw = np.asarray(cuts)
+                if raw.ndim != 1 or not np.isfinite(raw).all() or np.any(raw != np.rint(raw)):
+                    raise ValueError("Tree cuts must be finite integer edge IDs")
+                cuts = tuple(sorted(map(int, cuts)))
+                if (len(set(cuts)) != len(cuts) or any(not 0 <= edge < len(self.tree.edges) for edge in cuts)
+                        or not np.array_equal(labels, partition_from_cuts(self.tree, cuts))):
+                    raise ValueError("Candidate labels and frozen-tree cuts disagree")
+            membership = ("tree", cuts) if cuts is not None else ("general", labels.tobytes())
+            attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
+            charge = model.refit_batch_reservation(int(labels.max())+1, progress=self.request_progress is not None)
+            if pending and (membership in memberships or len(pending) >= self.weight_batch_size
+                            or reserved+charge > self.weight_batch_state_bytes
+                            or membership in self._structural or attempt in self._attempts):
+                flush()
+            if membership in self._structural or attempt in self._attempts:
+                results[output_index] = serial(item)
+                continue
+            if charge > self.weight_batch_state_bytes:
+                raise MemoryError("One prepared candidate exceeds the live-state budget")
+            pending.append((self.prepare(cuts, labels, parent=parent), centers, _plain(provenance), output_index))
+            memberships.add(membership)
+            reserved += charge
+        flush()
+        return results
 
     def evidence(self, selected):
         return candidate_evidence(self.tree, self.candidates, selected, self.attempt_records)

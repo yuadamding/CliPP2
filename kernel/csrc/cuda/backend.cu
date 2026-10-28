@@ -16,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #ifndef CLIPP2_BACKEND_BUILD_ID
@@ -72,6 +73,9 @@ void release_optional_scoring_cache(Context&);
 void destroy_scoring_state(Context&) noexcept;
 i64 scoring_host_bytes(Context&) noexcept;
 i64 scoring_persistent_host_bytes(Context&) noexcept;
+bool evict_optional_probability_cache(Context&);
+void destroy_probability_cache(Context&) noexcept;
+void destroy_initialization_state(Context&) noexcept;
 
 struct Context {
     ObservationSoA data{};
@@ -90,13 +94,20 @@ struct Context {
     cudaError_t resident_release_error = cudaSuccess;
     void* grid_state = nullptr;
     void* scoring_state = nullptr;
+    void* probability_state = nullptr;
+    void* initialization_state = nullptr;
+    i64 probability_host_bytes = 0, probability_counters[8]{};
+    i64 probability_refit_counters[4]{};
+    bool probability_configured = false;
     ~Context() {
         // Destruction cannot report errors through the C ABI. Normal operations
         // synchronize and report failures before reaching this cleanup path.
         cudaSetDevice(device);
         if (stream) cudaStreamSynchronize(stream);
         destroy_grid_cache(*this);
+        destroy_initialization_state(*this);
         destroy_scoring_state(*this);
+        destroy_probability_cache(*this);
         if (workspace) cudaFree(workspace);
         if (prepared) cudaFree(prepared);
         if (stream) cudaStreamDestroy(stream);
@@ -104,7 +115,8 @@ struct Context {
     unsigned char* allocate_resident(i64 bytes) {
         require(bytes >= 0, "Negative resident CUDA allocation");
         while (bytes > resident_limit - resident_bytes &&
-               (evict_optional_scoring_cache(*this) || evict_optional_grid_cache(*this))) {}
+               (evict_optional_scoring_cache(*this) || evict_optional_grid_cache(*this) ||
+                evict_optional_probability_cache(*this))) {}
         cuda_check(resident_release_error, "release resident CUDA storage");
         require(bytes <= resident_limit - resident_bytes,
                 "Resident CUDA storage exceeds device budget");
@@ -186,9 +198,12 @@ struct HostCounts {
     std::vector<i64> values;
     HostCounts(Context& owner,i64 count):context(owner) {
         const auto bytes=multiply(count,sizeof(i64));
-        while (bytes > owner.host_staging_limit - owner.grid_cache_host_bytes - scoring_host_bytes(owner)
-               && (evict_optional_scoring_cache(owner) || evict_optional_grid_cache(owner))) {}
-        require(bytes<=owner.host_staging_limit-owner.grid_cache_host_bytes-scoring_host_bytes(owner),
+        while (bytes > owner.host_staging_limit - owner.grid_cache_host_bytes
+                - owner.probability_host_bytes - scoring_host_bytes(owner)
+               && (evict_optional_scoring_cache(owner) || evict_optional_grid_cache(owner) ||
+                   evict_optional_probability_cache(owner))) {}
+        require(bytes<=owner.host_staging_limit-owner.grid_cache_host_bytes
+                -owner.probability_host_bytes-scoring_host_bytes(owner),
                 "CUDA host staging exceeds native host budget");
         values.resize(static_cast<std::size_t>(count));
         context.diagnostics.staging_bytes=bytes;
@@ -291,6 +306,7 @@ __global__ void joint_kernel(ObservationSoA data, i64 first_row, i64 rows, i64 c
     }
 }
 
+#include "probability_reuse.cuh"
 #include "ordered_reduce.cuh"
 
 struct RefitObjective {
@@ -298,10 +314,28 @@ struct RefitObjective {
     const i64* rows;
     i64 count, region;
     double *values, *partials, *total;
+    CUDAProbabilityView probability{};
+    double* basis=nullptr;
     __device__ double operator()(double center) const {
-        for (i64 i = threadIdx.x; i < count; i += blockDim.x)
-            values[i] = -evaluate_observation<EmitMode::LossOnly>(
-                observation(data, region * data.mutations + rows[i]), center).loss;
+        if(basis) {
+            const auto plan=probability.regions[region];
+            if(finite_number(center) && center>=0 && center<=1)
+                for(i64 component=threadIdx.x;component<plan.components;component+=blockDim.x)
+                    probability_basis_component(data,probability.families,plan,component,center,
+                                                basis,basis+plan.components);
+            __syncthreads();
+            for(i64 i=threadIdx.x;i<count;i+=blockDim.x) {
+                const auto cell=region*data.mutations+rows[i];
+                const auto shape=probability.shapes[probability.row_shapes[cell]];
+                const auto offset=shape.offset-plan.component_begin;
+                values[i]=-probability_shape_terms(observation(data,cell),center,
+                    basis+offset,basis+plan.components+offset).loss;
+            }
+        } else {
+            for (i64 i = threadIdx.x; i < count; i += blockDim.x)
+                values[i] = -evaluate_observation<EmitMode::LossOnly>(
+                    observation(data, region * data.mutations + rows[i]), center).loss;
+        }
         // The exact logical reduction topology is shared with CPU; it does not
         // depend on block size, scheduling, cache budgets, or atomic order.
         return ordered_block_sum(values, count, partials, total);
@@ -455,7 +489,8 @@ extern "C" int CliPP2ConfigureCUDAExecution(void* value, i64 host_staging_limit)
     return guarded([&] {
         require(host_staging_limit>=0,"CUDA host staging limit must be nonnegative");
         auto& c=context(value);
-        require(c.diagnostics.calls==0,"CUDA execution budgets are fixed before first use");
+        require(c.diagnostics.calls==0 && !c.probability_configured,
+                "CUDA execution budgets are fixed before first use");
         c.host_staging_limit=host_staging_limit;
     });
 }
@@ -464,7 +499,7 @@ extern "C" int CliPP2ConfigureCUDAReuse(void* value, i64 resident_limit, i64 cac
         auto& c = context(value);
         require(resident_limit >= 0 && cache_limit >= 0 && cache_limit <= resident_limit,
                 "Invalid CUDA resident/cache budgets");
-        require(c.diagnostics.calls == 0 && c.resident_bytes == 0,
+        require(c.diagnostics.calls == 0 && c.resident_bytes == 0 && !c.probability_configured,
                 "CUDA reuse budgets are fixed before first use");
         c.resident_limit = resident_limit;
         c.optional_cache_limit = cache_limit;
@@ -479,6 +514,31 @@ extern "C" int CliPP2CUDAReuseDiagnostics(void* value, i64* output) {
             c.grid_cache_misses, c.grid_reused_cells, c.grid_fresh_cells, c.grid_cache_host_bytes,
             scoring_persistent_host_bytes(c)};
         std::copy(values, values + 11, output);
+    });
+}
+extern "C" int CliPP2ConfigureCUDAProbabilityReuse(void* value,const ObservationSoA* input,int enabled) {
+    return guarded([&] {
+        require(input,"Missing CUDA probability metadata observations");
+        require(enabled==0 || enabled==1,"Invalid CUDA probability reuse switch");
+        auto& c=context(value);
+        clipp2::validate_observations(*input,c.diagnostics.workspace_limit);
+        configure_probability_reuse(c,*input,enabled!=0);
+    });
+}
+extern "C" int CliPP2CUDAProbabilityDiagnostics(void* value,i64* output) {
+    return guarded([&] {
+        require(output,"Missing CUDA probability diagnostic destination");
+        auto& c=context(value);
+        const auto* state=static_cast<CUDAProbabilityState*>(c.probability_state);
+        output[0]=c.probability_host_bytes; output[1]=state?state->device_bytes:0;
+        std::copy(c.probability_counters,c.probability_counters+8,output+2);
+    });
+}
+extern "C" int CliPP2CUDAProbabilityRefitDiagnostics(void* value,i64* output) {
+    return guarded([&] {
+        require(output,"Missing CUDA probability-refit diagnostic destination");
+        auto& c=context(value);
+        std::copy(c.probability_refit_counters,c.probability_refit_counters+4,output);
     });
 }
 extern "C" int CliPP2CUDAGridAdmissionDiagnostics(void* value, i64* output) {
@@ -497,6 +557,7 @@ extern "C" int CliPP2ReleaseCUDAOptionalCache(void* value) {
         // references only: live column/problem leases remain valid and charged.
         release_optional_grid_cache(c);
         release_optional_scoring_cache(c);
+        evict_optional_probability_cache(c);
         cuda_check(c.resident_release_error, "release optional CUDA storage");
     });
 }
@@ -570,6 +631,8 @@ extern "C" int CliPP2EvaluateRegionalGrid(void* value, i64 region, i64 row_count
         if (!count) return;
         for (i64 i = 0; i < row_count; ++i)
             require(rows[i] >= 0 && rows[i] < c.data.mutations, "CUDA grid row out of range");
+        if(probability_grid(c,region,row_count,rows,grid_count,grid,ll,status)) return;
+        ++c.probability_counters[2];
         Layout layout;
         const auto dr = layout.take<i64>(row_count), dg = layout.take<double>(grid_count),
                    dl = layout.take<double>(count), ds = layout.take<std::uint8_t>(count);
@@ -672,3 +735,5 @@ extern "C" int CliPP2EvaluateConditionalValues(void* value, const ConditionalBat
     });
 }
 #include "scoring.cuh"
+#include "initialization.cuh"
+#include "resident_api.cuh"

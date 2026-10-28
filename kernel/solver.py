@@ -160,7 +160,7 @@ def _support_warm_start(model, x, labels, lower, upper):
 
 
 def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=True, keep_raw_phi=True,
-                        progress_callback=None):
+                        progress_callback=None, native_batch_size=1):
     """Generate one finite-continuation connected partition per requested K.
 
     Numerical stationarity, edge feasibility and component-range feasibility
@@ -172,6 +172,8 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
     policy = ContinuationPolicy() if policy is None else policy
     if type(keep_raw_phi) is not bool:
         raise TypeError("keep_raw_phi must be a boolean")
+    if type(native_batch_size) is not int or native_batch_size < 1:
+        raise ValueError("native_batch_size must be a positive integer")
     pilot = np.asarray(pilot, dtype=float).copy()
     if tree.n != model.n or pilot.shape != (model.n, model.r):
         raise ValueError("Tree, model and pilot dimensions must agree")
@@ -199,8 +201,29 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
     if lower.shape != pilot.shape or upper.shape != pilot.shape or np.any(lower > upper):
         raise ValueError("No nonempty interior box for raw tree continuation")
     # Custom scientific/test models retain their own node_terms implementation.
-    # CUDA retains the host controller: this optimization is CPU-only.
+    # The optional CUDA request owner preserves this same native controller,
+    # with device emissions and original-order publication. Default stays host.
     from .model import RegionalModel
+    if native_batch_size > 1:
+        if (not native or type(model) is not RegionalModel or model.backend.kind != "cuda"
+                or "node_terms" in vars(model)):
+            raise ValueError("Native CUDA capacity batching requires the built-in regional model")
+        from .continuation_requests import continue_requests
+        from .backend import NativeExecutionError
+        available = model.backend.native_host_memory_bytes-model.backend.native_host_bytes
+        if available <= 0:
+            raise NativeExecutionError("No remaining native host bytes for CUDA continuation")
+        execution = {"continuation": "native_owner_cuda_emissions", "workers": 1,
+                     "capacities": len(requested), "cpu_thread_budget": 1,
+                     "host_array_results_retained": True,
+                     "native_host_available_for_continuation": available}
+        candidates = continue_requests(model, tree, np.clip(pilot, lower, upper),
+            requested, lower, upper, policy, missing_initializations,
+            host_budget_bytes=available, max_active=native_batch_size,
+            keep_raw_phi=keep_raw_phi, progress_callback=progress_callback,
+            telemetry=execution)
+        model._continuation_execution = execution
+        return candidates
     if (native and type(model) is RegionalModel and model.backend.kind == "cpu"
             and "node_terms" not in vars(model)):
         candidates = continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing_initializations,
@@ -224,6 +247,15 @@ def _generate_host_candidates(model, tree, pilot, requested, lower, upper, polic
     if keep_raw_phi:
         from .execution import preflight_host_export
         preflight_host_export(len(requested)*model.n*model.r*8)
+    # All capacities start at the same clipped pilot. Reuse only the built-in
+    # CUDA model's pure evaluation; scientific/test model overrides retain their
+    # original call sequence. Each capacity owns detached working arrays.
+    from .model import RegionalModel
+    initial_state = None
+    if (type(model) is RegionalModel and model.backend.kind == "cuda"
+            and "node_terms" not in vars(model)):
+        initial = np.clip(pilot, lower, upper)
+        initial_state = (initial, *(array.copy() for array in model.node_terms(initial)))
     for capacity_index, k in enumerate(requested):
         def completed(boundary):
             progress_callback({"operation": "continuation", "boundary": boundary,
@@ -232,8 +264,11 @@ def _generate_host_candidates(model, tree, pilot, requested, lower, upper, polic
                                "iterations": total_iterations,
                                "completed_capacities": capacity_index + (boundary == "capacity_complete")})
 
-        x = np.clip(pilot, lower, upper)
-        values, gradient, curvature = model.node_terms(x)
+        if initial_state is None:
+            x = np.clip(pilot, lower, upper)
+            values, gradient, curvature = model.node_terms(x)
+        else:
+            x, values, gradient, curvature = (array.copy() for array in initial_state)
         if not np.isfinite(values).all():
             raise ArithmeticError("Initial tree likelihood is nonfinite")
         rho = 1.0

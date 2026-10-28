@@ -24,7 +24,8 @@ def _finite_terms(values):
     return np.where(np.isfinite(values), values, 0.0), np.isneginf(values).astype(np.int64)
 
 
-def best_pair_boundary(tree, labels, centers, log_columns, edge, *, adjacency=None, components=None):
+def best_pair_boundary(tree, labels, centers, log_columns, edge, *, adjacency=None, components=None,
+                       column_rows=None):
     """Best replacement of one boundary, including both center orientations.
 
     Finite likelihood sums and impossible-assignment counts are accumulated
@@ -34,9 +35,10 @@ def best_pair_boundary(tree, labels, centers, log_columns, edge, *, adjacency=No
     """
     labels = np.asarray(labels, dtype=np.int64)
     centers = np.asarray(centers, dtype=float)
-    columns = np.asarray(log_columns, dtype=float)
+    columns = None if column_rows is not None else np.asarray(log_columns, dtype=float)
     edges = np.asarray(tree.edges, dtype=np.int64)
-    if labels.shape != (tree.n,) or columns.shape != (tree.n, len(centers)):
+    if (labels.shape != (tree.n,) or (columns is not None and columns.shape != (tree.n, len(centers)))
+            or (column_rows is not None and not callable(column_rows))):
         raise ValueError("Boundary likelihoods and memberships must match the tree")
     edge = int(edge)
     if not 0 <= edge < len(edges):
@@ -71,7 +73,11 @@ def best_pair_boundary(tree, labels, centers, log_columns, edge, *, adjacency=No
     if len(order) != len(members):
         raise ValueError("Adjacent component union is disconnected")
 
-    finite, impossible = _finite_terms(columns[np.ix_(members, [a, b])])
+    pair_columns = (columns[np.ix_(members, [a, b])] if column_rows is None
+                    else np.asarray(column_rows(members, [a, b]), dtype=float))
+    if pair_columns.shape != (len(members), 2):
+        raise ValueError("Boundary gather must return component-union rows and two columns")
+    finite, impossible = _finite_terms(pair_columns)
     sums, counts = finite.copy(), impossible.copy()
     child_for_edge = {}
     for node in reversed(order[1:]):
@@ -79,7 +85,7 @@ def best_pair_boundary(tree, labels, centers, log_columns, edge, *, adjacency=No
         sums[positions[ancestor]] += sums[positions[node]]
         counts[positions[ancestor]] += counts[positions[node]]
         child_for_edge[eid] = node
-    current = columns[members, labels[members]]
+    current = pair_columns[np.arange(len(members)), (labels[members] == b).astype(int)]
     best = float(current.sum())
     selected_edge, selected_orientation = edge, None
     for eid in sorted(internal):
@@ -107,7 +113,8 @@ def best_pair_boundary(tree, labels, centers, log_columns, edge, *, adjacency=No
                         not np.array_equal(proposed, labels))
 
 
-def refine_partition(model, tree, candidate, consider, *, max_proposals=None, prepare=None):
+def refine_partition(model, tree, candidate, consider, *, max_proposals=None, prepare=None,
+                     device_proposals=False):
     """Yield every accepted local state; scoring is independent of acceptance.
 
     ``consider`` refits and records candidates, preserving supplied-center
@@ -134,11 +141,13 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None, pr
                       if prepared is not None and prepared.groups else
                       {cluster: np.flatnonzero(labels == cluster) for cluster in range(len(fit.centers))})
         # The model columns already enforce the complete regional assignment box.
-        columns = (model.log_likelihood_columns(fit.centers) if handles is None
-                   else handles.materialize())
+        gather = (handles.subset_values if device_proposals and handles is not None
+                  and getattr(getattr(model, "backend", None), "kind", None) == "cuda" else None)
+        columns = (None if gather is not None else model.log_likelihood_columns(fit.centers)
+                   if handles is None else handles.materialize())
         for edge in current.cuts:
             move = best_pair_boundary(tree, labels, fit.centers, columns, edge,
-                                      components=components)
+                                      components=components, column_rows=gather)
             if not move.changed:
                 continue
             proposed_labels, centers = canonical_partition(move.labels, move.centers)
@@ -206,7 +215,7 @@ def _starting_states(original, winner):
     return chosen
 
 
-def _proposals(labels, centers, columns, observed, keys):
+def _proposals(labels, centers, columns, observed, keys, *, positive=None):
     """One ranked scan per proposal, with dynamic support in the greedy batch.
 
     Destination keys are scientific group multisets and center coordinates,
@@ -214,15 +223,16 @@ def _proposals(labels, centers, columns, observed, keys):
     ties. A legal positive-gain transfer leaves occupied K and all regional
     source support intact. Missing-read CN boxes are already in ``columns``.
     """
-    n, q = columns.shape
+    n, q = (len(labels), len(centers)) if columns is None else columns.shape
     if (labels.shape != (n,) or observed.shape != (n, centers.shape[1])
             or not np.array_equal(np.unique(labels), np.arange(q))):
         raise ValueError("Reassignment requires occupied aligned canonical labels")
-    if np.isnan(columns).any() or np.isposinf(columns).any():
-        raise ValueError("Reassignment likelihood columns must be finite or -inf")
-    assigned = columns[np.arange(n), labels]
-    if not np.isfinite(assigned).all():
-        raise ValueError("A reassignment parent has inadmissible assigned centers")
+    if positive is None:
+        if np.isnan(columns).any() or np.isposinf(columns).any():
+            raise ValueError("Reassignment likelihood columns must be finite or -inf")
+        assigned = columns[np.arange(n), labels]
+        if not np.isfinite(assigned).all():
+            raise ValueError("A reassignment parent has inadmissible assigned centers")
     sizes = np.bincount(labels, minlength=q)
     counts = np.zeros((q, observed.shape[1]), dtype=np.int64)
     np.add.at(counts, labels, observed)
@@ -237,10 +247,22 @@ def _proposals(labels, centers, columns, observed, keys):
     for previous, current in zip(group_order, group_order[1:]):
         group_ranks[current] = (group_ranks[previous]
                                 + (group_keys[current] != group_keys[previous]))
-    gains = columns - assigned[:, None]
-    rows, destinations = np.nonzero(np.isfinite(gains) & (gains > 0))
-    ranked = sorted(zip(rows.tolist(), destinations.tolist()), key=lambda move: (
-        -float(gains[move]), keys[move[0]], group_ranks[move[1]], move[0]))
+    if positive is None:
+        gains = columns - assigned[:, None]
+        rows, destinations = np.nonzero(np.isfinite(gains) & (gains > 0))
+        positive_gains = gains[rows, destinations]
+    else:
+        rows, destinations, positive_gains = map(np.asarray, positive)
+        if (rows.ndim != 1 or destinations.shape != rows.shape or positive_gains.shape != rows.shape
+                or rows.dtype.kind not in "iu" or destinations.dtype.kind not in "iu"
+                or np.any(rows < 0) or np.any(rows >= n) or np.any(destinations < 0)
+                or np.any(destinations >= q) or not np.isfinite(positive_gains).all()
+                or np.any(positive_gains <= 0) or np.any(rows[1:] < rows[:-1])
+                or np.any((rows[1:] == rows[:-1]) & (destinations[1:] <= destinations[:-1]))):
+            raise ValueError("Positive transfer vectors must be valid, unique and row-major")
+    order = sorted(range(len(rows)), key=lambda index: (
+        -float(positive_gains[index]), keys[rows[index]], group_ranks[destinations[index]], rows[index]))
+    ranked = [(int(rows[index]), int(destinations[index])) for index in order]
 
     def legal(row, source, current_sizes, current_counts):
         return (current_sizes[source] > 1
@@ -338,16 +360,30 @@ def expand_memberships(model, bank):
             handles = model.joint_column_set(centers) if hasattr(model, "joint_column_set") else None
             prepared = (bank.prepare(state.cuts, labels, fitted=state.fit, columns=handles)
                         if hasattr(bank, "prepare") else None)
-            columns = (np.asarray(model.log_likelihood_columns(centers), dtype=float)
+            use_device = (getattr(bank, "device_proposals", False) and handles is not None
+                          and getattr(getattr(model, "backend", None), "kind", None) == "cuda")
+            positive = handles.positive_transfers(labels) if use_device else None
+            columns = (None if use_device else np.asarray(model.log_likelihood_columns(centers), dtype=float)
                        if handles is None else handles.materialize())
-            if columns.shape != (model.n, q) or len(keys) != model.n:
+            if (columns is not None and columns.shape != (model.n, q)) or len(keys) != model.n:
                 raise ValueError("Joint likelihood columns and scientific keys must match N by K")
             evaluations += 1
-            proposals, scan = _proposals(labels, centers, columns, observed, keys)
+            proposals, scan = (_proposals(labels, centers, columns, observed, keys) if positive is None
+                               else _proposals(labels, centers, columns, observed, keys, positive=positive))
             round_record = {"round": round_index, "parent_score": state.score,
                             **scan, "proposals": [], "advanced": False}
             path["rounds"].append(round_record)
             returned = []
+            independent = [] if getattr(bank, "weight_batch_size", 1) > 1 else None
+
+            def record_result(record, candidate):
+                record["outcome"] = "ineligible" if candidate is None else "eligible"
+                if candidate is not None:
+                    if len(candidate.fit.centers) != q or not np.isfinite(candidate.score):
+                        raise ValueError("A reassignment callback changed K or returned a nonfinite score")
+                    record["score"] = candidate.score
+                    returned.append(candidate)
+
             for kind, proposed in zip(("single", "greedy_batch"), proposals):
                 slots += 1
                 record = {"kind": kind, "callback": proposed is not None}
@@ -357,19 +393,21 @@ def expand_memberships(model, bank):
                     continue
                 callbacks += 1
                 options = {} if prepared is None else {"parent": prepared}
-                candidate = bank.consider_membership(proposed, centers, {
+                provenance = {
                     "route": "fixed_k_joint_reassignment", "proposal_kind": kind,
                     "requested_k": q, "occupied_q": q,
                     "starting_bank_index": path["start_bank_index"], "round": round_index,
                     "parent_score": state.score,
                     "moved_mutations": int(np.count_nonzero(proposed != labels)),
-                }, **options)
-                record["outcome"] = "ineligible" if candidate is None else "eligible"
-                if candidate is not None:
-                    if len(candidate.fit.centers) != q or not np.isfinite(candidate.score):
-                        raise ValueError("A reassignment callback changed K or returned a nonfinite score")
-                    record["score"] = candidate.score
-                    returned.append(candidate)
+                }
+                if independent is not None:
+                    independent.append((record, (None, proposed, centers, provenance, prepared)))
+                else:
+                    record_result(record, bank.consider_membership(proposed, centers, provenance, **options))
+            if independent:
+                fitted = bank.consider_independent([request for _, request in independent])
+                for (record, _), candidate in zip(independent, fitted):
+                    record_result(record, candidate)
             # Ties retain the first (single) proposal; both complete fitted
             # states remain in the bank even when improvement is sub-tolerance.
             best = min(returned, key=lambda c: c.score, default=None)

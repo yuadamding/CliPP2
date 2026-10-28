@@ -1,9 +1,17 @@
 """CliPP2 observed-mixture weights at fixed conditionally fitted centers."""
 # Adapted from CliPP1.5.
 
+import hashlib
+from pathlib import Path
+
 import numpy as np
 from scipy.optimize import brentq, minimize
 from scipy.special import logsumexp
+
+
+# Native build identities do not cover this host optimizer and its settings.
+# Computed once; completed-fit caches are process/model-local, never persisted.
+WEIGHT_CONTROLLER_ID = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 class WeightConvergenceError(RuntimeError):

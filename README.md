@@ -44,10 +44,9 @@ tumor/
 Folder names define tumor/region IDs. See the [runnable example](examples/README.md).
 Each region requires:
 
-
 | File | Required contents |
 | --- | --- |
-| `snv.txt` | `chromosome_index`, `position`, `ref_count`, `alt_count`; optional unique `mutation_id` |
+| `snv.txt` | `chromosome_index`, `position`, `ref_count`, `alt_count` |
 | `cna.txt` | `chromosome_index`, `start_position`, `end_position`, `major_cn`, `minor_cn`, `total_cn` |
 | `purity.txt` | One number in `(0, 1]`, without a header |
 

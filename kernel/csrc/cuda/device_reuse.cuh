@@ -96,7 +96,7 @@ std::shared_ptr<RegularGridTable> regular_grid(Context& c, i64 region) {
     const i64 state_charge = add(grid_state_host_charge, multiply(c.data.regions, sizeof(i64)));
     const i64 host_bytes = grid_entry_host_charge + (c.grid_state ? 0 : state_charge);
     if (host_bytes > c.host_staging_limit - c.diagnostics.staging_bytes - c.grid_cache_host_bytes
-            - scoring_host_bytes(c))
+            - c.probability_host_bytes - scoring_host_bytes(c))
         return {};
     if (!c.grid_state) {
         c.grid_state = new GridCacheState(c.data.regions);
@@ -120,7 +120,7 @@ std::shared_ptr<RegularGridTable> regular_grid(Context& c, i64 region) {
     }
     const i64 retained_host = grid_entry_host_charge;
     if (retained_host > c.host_staging_limit - c.diagnostics.staging_bytes - c.grid_cache_host_bytes
-            - scoring_host_bytes(c)) {
+            - c.probability_host_bytes - scoring_host_bytes(c)) {
         c.drop_optional(bytes);
         return {};
     }
@@ -155,7 +155,8 @@ struct GridLeases {
     GridLeases(Context& c, i64 tasks) : owner(c) {
         const i64 bytes = multiply(tasks, sizeof(std::shared_ptr<RegularGridTable>));
         if (!c.optional_cache_limit || bytes > c.host_staging_limit
-                - c.diagnostics.staging_bytes - c.grid_cache_host_bytes - scoring_host_bytes(c)) return;
+                - c.diagnostics.staging_bytes - c.grid_cache_host_bytes
+                - c.probability_host_bytes - scoring_host_bytes(c)) return;
         tables.resize(static_cast<std::size_t>(tasks));
         host_bytes = bytes;
         c.diagnostics.staging_bytes += bytes;
