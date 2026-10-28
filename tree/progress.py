@@ -4,7 +4,7 @@ from time import perf_counter
 
 
 class ProgressReporter:
-    """Observe completed operations, at most once per five seconds or phase.
+    """Observe phase starts/completions and throttled completed operations.
 
     Snapshots contain no live fitting objects. Callback failures propagate;
     observation is never a reason to alter search or numerical policy.
@@ -22,9 +22,17 @@ class ProgressReporter:
     def completed_candidate(self, bank, provenance):
         self.emit(bank, provenance=provenance)
 
-    def emit(self, bank=None, *, provenance=None, complete=False):
+    def start_phase(self, phase, bank=None):
+        self.phase = phase
+        self.seed_index = self.requested_k = self.occupied_q = None
+        self.emit(bank, started=True)
+
+    def completed_operation(self, bank, provenance, operation):
+        self.emit(bank, provenance=provenance, operation=operation)
+
+    def emit(self, bank=None, *, provenance=None, operation=None, complete=False, started=False):
         now = perf_counter()
-        if not complete and now-self.last < 5.0:
+        if not (complete or started) and now-self.last < 5.0:
             return
         self.last = now
         provenance = {} if provenance is None else provenance
@@ -33,9 +41,13 @@ class ProgressReporter:
         if provenance.get("route") == "boundary_refinement":
             occupied = len(provenance["parent_cuts"])+1
             requested = None  # The refinement provenance carries no capacity.
+        if operation is not None:
+            occupied = operation.get("occupied_q", occupied)
+            requested = operation.get("requested_k", requested)
         record = {
             "event": "clipp2_progress", "phase": self.phase,
-            "phase_complete": complete, "elapsed_seconds": now-self.started,
+            "phase_started": started, "phase_complete": complete,
+            "elapsed_seconds": now-self.started, "operation": operation,
             "seed_index": provenance.get("seed_index", self.seed_index),
             "requested_k": requested,
             "occupied_q": occupied,

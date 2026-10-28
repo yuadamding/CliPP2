@@ -300,26 +300,32 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
             raise ValueError("capacities must contain valid requested cluster counts")
         capacities = tuple(sorted(set(map(int, capacities))))
     times = {}
+    if progress is not None:
+        progress.start_phase("initialization")
     started = perf_counter()
     pilot, pilot_diagnostics = model.pilots()
     times["initialization_seconds"] = perf_counter() - started
     if progress is not None:
         progress.emit(complete=True)
-        progress.phase = "tree"
+        progress.start_phase("tree")
     started = perf_counter()
     tree = build_tree(pilot, model.observed, model.mutation_ids)
     times["tree_seconds"] = perf_counter() - started
     if progress is not None:
         progress.emit(complete=True)
-        progress.phase = "continuation"
+        progress.start_phase("continuation")
     started = perf_counter()
-    seeds = generate_candidates(model, tree, pilot, capacities, keep_raw_phi=False)
+    seeds = (generate_candidates(model, tree, pilot, capacities, keep_raw_phi=False)
+             if progress is None else generate_candidates(
+                 model, tree, pilot, capacities, keep_raw_phi=False,
+                 progress_callback=lambda operation: progress.completed_operation(None, None, operation)))
     times["continuation_seconds"] = perf_counter() - started
     if progress is not None:
         progress.emit(complete=True)
-        progress.phase = "candidate_search"
+        progress.start_phase("candidate_search")
     bank = (_CandidateBank(model, tree) if progress is None else
-            _CandidateBank(model, tree, progress=progress.completed_candidate))
+            _CandidateBank(model, tree, progress=progress.completed_candidate,
+                           request_progress=progress.completed_operation))
     seeds_diagnostics, refined = [], set()
     refinement_seconds, subset_count, subset_visits = 0.0, 0, 0
 
@@ -387,13 +393,12 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     started = perf_counter()
     if progress is not None:
         progress.emit(bank, complete=True)
-        progress.phase = "supplemental_search"
-        progress.seed_index = progress.requested_k = progress.occupied_q = None
+        progress.start_phase("supplemental_search", bank)
     supported_proposals = _add_supported_proposals(model, tree, bank, capacities, seeds)
     times["supplemental_search_inclusive_seconds"] = perf_counter()-started
     if progress is not None:
         progress.emit(bank, complete=True)
-        progress.phase = "reassignment"
+        progress.start_phase("reassignment", bank)
     if not bank.candidates:
         reasons = sorted({entry["reason"] for entry in bank.ineligible.values()})
         raise ValueError(f"No supported finite-score tree candidate: {reasons}")
@@ -405,7 +410,7 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     times["reassignment_inclusive_seconds"] = reassignment.get("seconds", 0.0)
     if progress is not None:
         progress.emit(bank, complete=True)
-        progress.phase = "selection"
+        progress.start_phase("selection", bank)
     selected = min(bank.candidates, key=_score_key)
     if selected.score > bank.original_selected.score:
         raise AssertionError("Reassignment lost the original selected score")

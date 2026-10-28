@@ -609,7 +609,7 @@ class RegionalModel:
         return JointColumnSet(tuple(columns), tuple(center.tobytes() for center in centers), self.identity,
                               (self.backend.policy, self.backend.identity))
 
-    def refit(self, labels, initial_centers=None):
+    def refit(self, labels, initial_centers=None, *, progress_callback=None):
         labels = np.asarray(labels)
         if labels.shape != (self.n,) or not np.isfinite(labels).all() or np.any(labels != np.rint(labels)):
             raise ValueError("Labels must contain one finite integer per mutation")
@@ -617,17 +617,33 @@ class RegionalModel:
         groups = tuple(self.prepare_group(np.flatnonzero(inverse == cluster))
                        for cluster in range(int(inverse.max()) + 1))
         return self._refit_groups(inverse, groups, initial_centers,
-                                  membership=Membership(explicit_labels=inverse))
+                                  membership=Membership(explicit_labels=inverse),
+                                  progress_callback=progress_callback)
 
-    def refit_prepared(self, partition, initial_centers=None):
+    def refit_prepared(self, partition, initial_centers=None, *, progress_callback=None):
         """Internal path: prepared memberships avoid all-group reconstruction."""
         if partition.model_identity != self.identity:
             raise ValueError("Prepared partition belongs to another regional model")
         return self._refit_groups(partition.labels, partition.groups, initial_centers,
-                                  partition.coordinate_fits, partition.columns, partition.membership)
+                                  partition.coordinate_fits, partition.columns, partition.membership,
+                                  progress_callback=progress_callback)
 
     def _refit_groups(self, inverse, groups, initial_centers, prior=(), prior_columns=None,
-                      membership=None):
+                      membership=None, *, progress_callback=None):
+        if progress_callback is not None and not callable(progress_callback):
+            raise TypeError("progress_callback must be callable or None")
+        callback_error = None
+
+        def notify(operation):
+            nonlocal callback_error
+            try:
+                progress_callback(operation)
+            except BaseException as error:
+                # A user callback can raise the same class as a scientific
+                # rejection; preserve its identity instead of rejecting a fit.
+                callback_error = error
+                raise
+
         q = int(inverse.max())+1
         centers = np.full((q, self.r), np.nan)
         if initial_centers is not None:
@@ -653,15 +669,18 @@ class RegionalModel:
         conditional = math.fsum(matrix[np.arange(self.n), inverse] if matrix is not None
                                 else columns.assigned_values(inverse))
         start = time.perf_counter()
+        observer = {} if progress_callback is None else {"progress_callback": notify}
         try:
             if matrix is None:
                 with self.backend.mixture_problem(columns.columns) as problem:
                     mixture = fit_mixture_weights(problem, np.bincount(inverse),
-                                                  telemetry=self.telemetry)
+                                                  telemetry=self.telemetry, **observer)
             else:
                 mixture = fit_mixture_weights(matrix, np.bincount(inverse),
-                                              telemetry=self.telemetry)
+                                              telemetry=self.telemetry, **observer)
         except WeightConvergenceError as error:
+            if error is callback_error:
+                raise
             return FitResult(membership, centers, np.full(q, np.nan), conditional,
                                      -np.inf, penalty, np.inf, False, f"weight_fit:{error}",
                                      diagnostics={"rejection_kind": "weight_convergence"})

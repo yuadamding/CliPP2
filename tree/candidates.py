@@ -7,7 +7,7 @@ from types import MappingProxyType
 
 import numpy as np
 
-from ..kernel.model import FitResult
+from ..kernel.model import FitResult, RegionalModel
 from ..kernel.topology import FrozenTree, Membership, PreparedPartition, canonical_partition, partition_from_cuts
 
 
@@ -80,9 +80,10 @@ class CandidateBank:
 
     numerical_policy = "regional_conditional_refit_v1"
 
-    def __init__(self, model, tree, *, progress=None):
+    def __init__(self, model, tree, *, progress=None, request_progress=None):
         self.model, self.tree = model, tree
         self.progress = progress
+        self.request_progress = request_progress
         self.candidates, self.general_rejections, self.attempt_records = [], [], []
         self.by_cuts, self.by_membership, self.ineligible = {}, {}, {}
         self.membership_attempts, self.structural_rejections = {}, {}
@@ -198,9 +199,14 @@ class CandidateBank:
         started = perf_counter()
         self.refit_calls += 1
         try:
-            fitted = (self.model.refit_prepared(partition, initial_centers=centers)
-                      if hasattr(self.model, "refit_prepared")
-                      else self.model.refit(labels, initial_centers=centers))
+            if self.request_progress is not None and type(self.model) is RegionalModel:
+                fitted = self.model.refit_prepared(
+                    partition, initial_centers=centers,
+                    progress_callback=lambda operation: self.request_progress(self, provenance, operation))
+            else:
+                fitted = (self.model.refit_prepared(partition, initial_centers=centers)
+                          if hasattr(self.model, "refit_prepared")
+                          else self.model.refit(labels, initial_centers=centers))
         finally:
             self.refit_seconds += perf_counter()-started
         record = {"membership_kind": membership[0],

@@ -10,7 +10,7 @@ class WeightConvergenceError(RuntimeError):
     """Finite weight iterates failed the existing fixed-budget stationarity gate."""
 
 
-def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
+def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None, progress_callback=None):
     """Maximize the joint observed likelihood of an N-by-q log-emission matrix.
 
     This is a concave weight problem. The reported Frank-Wolfe gap bounds the
@@ -20,6 +20,17 @@ def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
     Center fitting itself remains conditional on the supplied hard partition;
     this function does not claim a joint mixture-center maximum.
     """
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable or None")
+
+    completed_requests = 0
+
+    def completed(request):
+        nonlocal completed_requests
+        completed_requests += 1
+        progress_callback({"operation": "weight_fit", "boundary": "request_complete",
+                           "request": request, "completed_requests": completed_requests,
+                           "occupied_q": int(k)})
 
     def record(name, amount=1):
         if telemetry is not None:
@@ -48,13 +59,16 @@ def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
     weights = weights / weights.max()
     weights /= weights.sum()
     if k == 1:
-        return {
+        result = {
             "cluster_weights": np.ones(1),
             "log_likelihood": (float(offset.sum()) if device_oracle is None else
                                device_oracle.evaluate_weights(np.ones(1))[2]),
             "weight_optimality_gap": 0.0,
             "weight_active_score_gap": 0.0,
         }
+        if progress_callback is not None:
+            completed("single_column" if device_oracle is None else "evaluate")
+        return result
     if device_oracle is None:
         shifted = log_kernel - offset[:, None]
         kernel = np.exp(shifted)
@@ -81,14 +95,20 @@ def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
         return mass_value
 
     def objective(w):
-        return -float(log_mass(w).mean())
+        value = -float(log_mass(w).mean())
+        if progress_callback is not None:
+            completed("objective")
+        return value
 
     def gradient(w):
         # A boundary derivative can exceed float64 even when its log mixture
         # is finite. Saturation preserves the entering direction, never marks
         # that finite support impossible, and cannot pass the stationarity gate.
         ratios = shifted - log_mass(w)[:, None]
-        return -np.exp(np.minimum(ratios, 345.)).mean(axis=0)
+        value = -np.exp(np.minimum(ratios, 345.)).mean(axis=0)
+        if progress_callback is not None:
+            completed("gradient")
+        return value
 
     if device_oracle is not None:
         evaluation_key, evaluation = None, None
@@ -100,6 +120,8 @@ def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
                 evaluation = device_oracle.evaluate_weights(w)
                 evaluation_key = key
                 record("weight_device_evaluations")
+                if progress_callback is not None:
+                    completed("evaluate")
             else:
                 record("weight_device_evaluation_cache_hits")
             return evaluation
@@ -176,14 +198,24 @@ def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
                 trial[grow] += fraction*amount
                 trial[shrink] = amount*(1.-fraction)
                 log_ratio = numerator-log_mass(trial)
-                return float(np.mean(sign*np.exp(np.minimum(log_ratio, 345.))))
+                value = float(np.mean(sign*np.exp(np.minimum(log_ratio, 345.))))
+                if progress_callback is not None:
+                    completed("transfer_derivative")
+                return value
         else:
             device_oracle.prepare_transfer(weights, grow, shrink)
             record("weight_device_transfer_preparations")
+            if progress_callback is not None:
+                completed("prepare_transfer")
 
             def derivative(fraction):
                 record("weight_device_transfer_trials")
-                return device_oracle.transfer_derivative(fraction)
+                value = device_oracle.transfer_derivative(fraction)
+                # The endpoint was computed by prepare_transfer; only interior
+                # and zero-endpoint trials submit another numerical request.
+                if progress_callback is not None and fraction != 1.0:
+                    completed("transfer_derivative")
+                return value
 
         fraction = 1.0 if derivative(1.0) >= 0 else brentq(derivative, 0.0, 1.0, xtol=1e-14)
         transfer = fraction * weights[shrink]
