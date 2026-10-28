@@ -31,7 +31,13 @@ __device__ double ordered_block_sum(const double* values, i64 count,
     __syncthreads();
     if (!threadIdx.x) *total = -0.0;
     if (count <= 128) {
-        if (!threadIdx.x) *total = pairwise_sum(OrderedArrayValues{values}, 0, count);
+        if (!threadIdx.x) {
+            // This guard fits one leaf; keep pairwise_sum's outer -0 fold
+            // without instantiating its unreachable recursive tree.
+            double sum = -0.0;
+            sum += pairwise_block_sum<0>(OrderedArrayValues{values}, 0, count);
+            *total = sum;
+        }
         __syncthreads();
         return *total;
     }

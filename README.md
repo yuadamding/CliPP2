@@ -23,6 +23,7 @@ clipp2 fit --input-dir tumor/ --device cpu --outdir results/
 
 Use `--device cuda` for GPU execution and a new output directory for each run.
 `--max-clusters` defaults to **20**; larger values can greatly increase search cost.
+Use `--verbose` for progress on stderr; no extra output files are written.
 
 ## Input
 

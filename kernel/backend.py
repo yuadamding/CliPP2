@@ -415,6 +415,8 @@ class NativeBackend:
                        **{name: getattr(result, name) for name, _ in result._fields_}}
         if self.kind == "cuda":
             diagnostics["scoring"] = self.scoring_diagnostics()
+            diagnostics["scoring_arena"] = self.scoring_arena_diagnostics()
+            diagnostics["grid_admission"] = self.grid_admission_diagnostics()
             reuse = np.empty(11, dtype=np.int64)
             self._check(self.lib.CliPP2CUDAReuseDiagnostics(self.context, _ptr(reuse)))
             diagnostics["reuse"] = dict(zip(("resident_limit", "resident_bytes", "resident_peak_bytes",

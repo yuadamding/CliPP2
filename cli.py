@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN,
         help="Exclude a mutation only from regions where any CN state's major CN exceeds this limit.",
     )
-    fit.add_argument("--verbose", action="store_true")
+    fit.add_argument("--verbose", action="store_true", help="Emit periodic JSON progress to stderr.")
     fit.add_argument("--max-clusters", type=int, default=DEFAULT_MAX_CLUSTERS,
                      help="Largest occupied cluster capacity (positive integer; no fixed upper limit).")
     fit.add_argument("--grid-cache-mb", type=int, default=64,

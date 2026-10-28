@@ -249,33 +249,67 @@ __global__ void mixture_offset_kernel(const double* const* columns,i64 n,i64 q,
         for(i64 k=0;k<q;++k) kernel[k*n+row]=exp(columns[k][row]-maximum);
     }
 }
+// Both dispatches use exactly the same per-row arithmetic and component order.
+__device__ void mixture_evaluate_row(const double* const* columns,const double* offsets,
+        const double* kernel,const double* weights,i64 n,i64 q,i64 row,double* terms) {
+    const double offset=offsets[row];
+    double mass=0.;
+    for(i64 k=0;k<q;++k) mass+=kernel[k*n+row]*weights[k];
+    double log_mass=log(mass);
+    if(mass<DBL_MIN) {
+        double maximum=-positive_infinity;
+        for(i64 k=0;k<q;++k) {
+            const double value=columns[k][row]-offset+log(weights[k]);
+            if(value>maximum) maximum=value;
+        }
+        if(maximum==-positive_infinity) log_mass=maximum;
+        else {
+            double sum=0.;
+            for(i64 k=0;k<q;++k) {
+                sum+=exp(columns[k][row]-offset+log(weights[k])-maximum);
+            }
+            log_mass=maximum+log(sum);
+        }
+    }
+    terms[row]=log_mass;
+    terms[n+row]=offset+log_mass;
+    for(i64 k=0;k<q;++k)
+        terms[(k+2)*n+row]=scoring_capped_exp(columns[k][row]-offset-log_mass);
+}
 __global__ void mixture_evaluate_kernel(const double* const* columns,const double* offsets,const double* kernel,
         const double* weights,i64 n,i64 q,double* terms) {
     for(i64 row=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;row<n;
-        row+=static_cast<i64>(gridDim.x)*blockDim.x) {
-        const double offset=offsets[row];
-        double mass=0.;
-        for(i64 k=0;k<q;++k) mass+=kernel[k*n+row]*weights[k];
-        double log_mass=log(mass);
-        if(mass<DBL_MIN) {
-            double maximum=-positive_infinity;
-            for(i64 k=0;k<q;++k) {
-                const double value=columns[k][row]-offset+log(weights[k]);
-                if(value>maximum) maximum=value;
-            }
-            if(maximum==-positive_infinity) log_mass=maximum;
-            else {
-                double sum=0.;
-                for(i64 k=0;k<q;++k)
-                    sum+=exp(columns[k][row]-offset+log(weights[k])-maximum);
-                log_mass=maximum+log(sum);
-            }
-        }
-        terms[row]=log_mass;
-        terms[n+row]=offset+log_mass;
-        for(i64 k=0;k<q;++k)
-            terms[(k+2)*n+row]=scoring_capped_exp(columns[k][row]-offset-log_mass);
-    }
+        row+=static_cast<i64>(gridDim.x)*blockDim.x)
+        mixture_evaluate_row(columns,offsets,kernel,weights,n,q,row,terms);
+}
+constexpr i64 small_mixture_rows=128,small_mixture_columns=20;
+bool small_mixture(const MixtureProblem& p) {
+#ifdef CLIPP2_CUDA_FORCE_GENERAL_SCORING
+    // Qualification-only build: bind this flag and the binary hash separately.
+    return false;
+#else
+    return p.n<=small_mixture_rows && p.q<=small_mixture_columns;
+#endif
+}
+__device__ double small_mixture_sum(const double* values,i64 n) {
+    // ordered_block_sum's small branch already folds into -0. The separate
+    // finish kernel folds that result once more; preserve both signed-zero ops.
+    // Dispatch guarantees a single <=128-value leaf. Do not instantiate the
+    // unused recursive tree here: its dynamic branches inflate kernel registers.
+    static_assert(small_mixture_rows<=128,"Small scoring must fit one reduction leaf");
+    double partial=-0.;
+    partial+=pairwise_block_sum<0>(OrderedArrayValues{values},0,n);
+    double sum=-0.;
+    sum+=partial;
+    return sum;
+}
+__global__ void small_mixture_evaluate_kernel(const double* const* columns,const double* offsets,
+        const double* kernel,const double* weights,i64 n,i64 q,double* sums) {
+    __shared__ double terms[small_mixture_rows*(small_mixture_columns+2)];
+    const i64 row=threadIdx.x;
+    if(row<n) mixture_evaluate_row(columns,offsets,kernel,weights,n,q,row,terms);
+    __syncthreads();  // All 128 participants publish, including inactive rows.
+    if(row<q+2) sums[row]=small_mixture_sum(terms+row*n,n);
 }
 // Each block evaluates one logical 8192-value subtree. Final large chunks are
 // folded sequentially, retaining common/scalar_search.h's reduction topology.
@@ -311,44 +345,84 @@ __global__ void mixture_log_weights_kernel(const double* weights,i64 q,double* l
     for(i64 k=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;k<q;
         k+=static_cast<i64>(gridDim.x)*blockDim.x) logs[k]=log(weights[k]);
 }
+__device__ void mixture_pair_row(const double* const* columns,const double* offsets,
+        const double* log_weights,i64 q,i64 row,i64 grow,i64 shrink,double* other,
+        double* grow_log,double* shrink_log,double* numerator,double* sign) {
+    const double offset=offsets[row],a=columns[grow][row]-offset,b=columns[shrink][row]-offset;
+    grow_log[row]=a; shrink_log[row]=b;
+    // Do not subtract two large masses from a total. The unchanged
+    // complement is constructed once from the original finite log support.
+    double maximum=-positive_infinity;
+    for(i64 k=0;k<q;++k) if(k!=grow && k!=shrink) {
+        const double value=columns[k][row]-offset+log_weights[k];
+        if(value>maximum) maximum=value;
+    }
+    double complement=maximum;
+    if(maximum!=-positive_infinity) {
+        double sum=0.;
+        for(i64 k=0;k<q;++k) if(k!=grow && k!=shrink)
+            sum+=exp(columns[k][row]-offset+log_weights[k]-maximum);
+        complement=maximum+log(sum);
+    }
+    other[row]=complement;
+    if(a==b) { numerator[row]=-positive_infinity; sign[row]=0.; }
+    else {
+        const double high=a>b?a:b,delta=fabs(a-b);
+        numerator[row]=log_weights[shrink]+high+log(-expm1(-delta));
+        sign[row]=a>b?1.:-1.;
+    }
+}
 __global__ void mixture_pair_kernel(const double* const* columns,const double* offsets,
         const double* log_weights,i64 n,i64 q,i64 grow,i64 shrink,double* other,
         double* grow_log,double* shrink_log,double* numerator,double* sign) {
     for(i64 row=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;row<n;
-        row+=static_cast<i64>(gridDim.x)*blockDim.x) {
-        const double offset=offsets[row],a=columns[grow][row]-offset,b=columns[shrink][row]-offset;
-        grow_log[row]=a; shrink_log[row]=b;
-        // Do not subtract two large masses from a total. The unchanged
-        // complement is constructed once from the original finite log support.
-        double maximum=-positive_infinity;
-        for(i64 k=0;k<q;++k) if(k!=grow && k!=shrink) {
-            const double value=columns[k][row]-offset+log_weights[k];
-            if(value>maximum) maximum=value;
-        }
-        double complement=maximum;
-        if(maximum!=-positive_infinity) {
-            double sum=0.;
-            for(i64 k=0;k<q;++k) if(k!=grow && k!=shrink)
-                sum+=exp(columns[k][row]-offset+log_weights[k]-maximum);
-            complement=maximum+log(sum);
-        }
-        other[row]=complement;
-        if(a==b) { numerator[row]=-positive_infinity; sign[row]=0.; }
-        else {
-            const double high=a>b?a:b,delta=fabs(a-b);
-            numerator[row]=log_weights[shrink]+high+log(-expm1(-delta));
-            sign[row]=a>b?1.:-1.;
-        }
-    }
+        row+=static_cast<i64>(gridDim.x)*blockDim.x)
+        mixture_pair_row(columns,offsets,log_weights,q,row,grow,shrink,
+                         other,grow_log,shrink_log,numerator,sign);
+}
+__device__ double mixture_trial_row(i64 row,const double* other,const double* grow,
+        const double* shrink,const double* numerator,const double* sign,double a,double b) {
+    const double mass=scoring_logadd(other[row],scoring_logadd(grow[row]+a,shrink[row]+b));
+    return sign[row]==0.?0.:sign[row]*scoring_capped_exp(numerator[row]-mass);
 }
 __global__ void mixture_trial_kernel(i64 n,const double* other,const double* grow,
         const double* shrink,const double* numerator,const double* sign,
         double grow_weight,double amount,double fraction,double* terms) {
     const double a=log(grow_weight+fraction*amount),b=log(amount*(1.-fraction));
     for(i64 row=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;row<n;
-        row+=static_cast<i64>(gridDim.x)*blockDim.x) {
-        const double mass=scoring_logadd(other[row],scoring_logadd(grow[row]+a,shrink[row]+b));
-        terms[row]=sign[row]==0.?0.:sign[row]*scoring_capped_exp(numerator[row]-mass);
+        row+=static_cast<i64>(gridDim.x)*blockDim.x)
+        terms[row]=mixture_trial_row(row,other,grow,shrink,numerator,sign,a,b);
+}
+__global__ void small_mixture_trial_kernel(i64 n,const double* other,const double* grow,
+        const double* shrink,const double* numerator,const double* sign,
+        double grow_weight,double amount,double fraction,double* sums) {
+    __shared__ double terms[small_mixture_rows];
+    const double a=log(grow_weight+fraction*amount),b=log(amount*(1.-fraction));
+    const i64 row=threadIdx.x;
+    if(row<n) terms[row]=mixture_trial_row(row,other,grow,shrink,numerator,sign,a,b);
+    __syncthreads();
+    if(!row) sums[0]=small_mixture_sum(terms,n);
+}
+template<bool Endpoint>
+__global__ void small_mixture_prepare_kernel(const double* const* columns,const double* offsets,
+        const double* weights,double* log_weights,i64 n,i64 q,i64 grow,i64 shrink,
+        double* other,double* grow_log,double* shrink_log,double* numerator,double* sign,
+        double grow_weight,double amount,double* sums) {
+    __shared__ double terms[small_mixture_rows];
+    const i64 row=threadIdx.x;
+    if(row<q) log_weights[row]=log(weights[row]);
+    __syncthreads();
+    if(row<n) {
+        mixture_pair_row(columns,offsets,log_weights,q,row,grow,shrink,
+                         other,grow_log,shrink_log,numerator,sign);
+        if constexpr (Endpoint) {
+            const double a=log(grow_weight+1.*amount),b=log(amount*(1.-1.));
+            terms[row]=mixture_trial_row(row,other,grow_log,shrink_log,numerator,sign,a,b);
+        }
+    }
+    if constexpr (Endpoint) {
+        __syncthreads();
+        if(!row) sums[0]=small_mixture_sum(terms,n);
     }
 }
 __global__ void gather_columns_kernel(const double* const* columns,const i64* labels,
@@ -366,6 +440,7 @@ void validate_scoring_weights(const double* weights,i64 q) {
     }
     if(!positive) throw std::domain_error("CUDA mixture weights must be nonzero");
 }
+template<bool Endpoint=false>
 void prepare_mixture_transfer(MixtureProblem& p,const double* weights,i64 grow,i64 shrink) {
     auto& c=p.context;
     p.pair_ready=false;
@@ -374,21 +449,42 @@ void prepare_mixture_transfer(MixtureProblem& p,const double* weights,i64 grow,i
         throw std::domain_error("Invalid CUDA pairwise mixture transfer");
     p.grow_weight=weights[grow]; p.amount=weights[shrink];
     c.upload(p.at<double>(p.weights),weights,p.q);
-    mixture_log_weights_kernel<<<blocks(p.q),threads,0,c.stream>>>(
-        p.at<double>(p.weights),p.q,p.at<double>(p.log_weights));
-    c.launched();
-    mixture_pair_kernel<<<blocks(p.n),threads,0,c.stream>>>(p.at<const double*>(p.pointers),
-        p.at<double>(p.offset),p.at<double>(p.log_weights),p.n,p.q,grow,shrink,p.at<double>(p.other),
-        p.at<double>(p.grow_log),p.at<double>(p.shrink_log),p.at<double>(p.numerator),p.at<double>(p.sign));
-    c.launched();
+    if(small_mixture(p)) {
+        small_mixture_prepare_kernel<Endpoint><<<1,threads,0,c.stream>>>(
+            p.at<const double*>(p.pointers),p.at<double>(p.offset),p.at<double>(p.weights),
+            p.at<double>(p.log_weights),p.n,p.q,grow,shrink,p.at<double>(p.other),
+            p.at<double>(p.grow_log),p.at<double>(p.shrink_log),p.at<double>(p.numerator),
+            p.at<double>(p.sign),p.grow_weight,p.amount,p.at<double>(p.sums));
+        c.launched();
+    } else {
+        mixture_log_weights_kernel<<<blocks(p.q),threads,0,c.stream>>>(
+            p.at<double>(p.weights),p.q,p.at<double>(p.log_weights));
+        c.launched();
+        mixture_pair_kernel<<<blocks(p.n),threads,0,c.stream>>>(p.at<const double*>(p.pointers),
+            p.at<double>(p.offset),p.at<double>(p.log_weights),p.n,p.q,grow,shrink,p.at<double>(p.other),
+            p.at<double>(p.grow_log),p.at<double>(p.shrink_log),p.at<double>(p.numerator),p.at<double>(p.sign));
+        c.launched();
+    }
+}
+void finish_mixture_transfer(MixtureProblem& p,double* output) {
+    auto& c=p.context;
+    c.download(output,p.at<double>(p.sums),1); c.finish();
+    *output/=p.n; ++scoring_state(c).counters[6];
 }
 void mixture_transfer_derivative(MixtureProblem& p,double fraction,double* output) {
     auto& c=p.context;
-    mixture_trial_kernel<<<blocks(p.n),threads,0,c.stream>>>(p.n,p.at<double>(p.other),
-        p.at<double>(p.grow_log),p.at<double>(p.shrink_log),p.at<double>(p.numerator),
-        p.at<double>(p.sign),p.grow_weight,p.amount,fraction,p.at<double>(p.terms));
-    c.launched(); reduce_mixture(p,1); c.download(output,p.at<double>(p.sums),1); c.finish();
-    *output/=p.n; ++scoring_state(c).counters[6];
+    if(small_mixture(p)) {
+        small_mixture_trial_kernel<<<1,threads,0,c.stream>>>(p.n,p.at<double>(p.other),
+            p.at<double>(p.grow_log),p.at<double>(p.shrink_log),p.at<double>(p.numerator),
+            p.at<double>(p.sign),p.grow_weight,p.amount,fraction,p.at<double>(p.sums));
+        c.launched();
+    } else {
+        mixture_trial_kernel<<<blocks(p.n),threads,0,c.stream>>>(p.n,p.at<double>(p.other),
+            p.at<double>(p.grow_log),p.at<double>(p.shrink_log),p.at<double>(p.numerator),
+            p.at<double>(p.sign),p.grow_weight,p.amount,fraction,p.at<double>(p.terms));
+        c.launched(); reduce_mixture(p,1);
+    }
+    finish_mixture_transfer(p,output);
 }
 } // namespace
 
@@ -599,15 +695,23 @@ extern "C" int CliPP2EvaluateMixture(void* value,i64 handle,const double* weight
         validate_scoring_weights(weights,p.q);
         // The result temporary precedes the fence, so a partial asynchronous
         // download cannot outlive its stack storage on an error path.
-        double objective_sum=0.;
+        double objective_sum=0.,small_sums[small_mixture_columns+2];
         ScoringStreamFence fence(c);
         c.upload(p.at<double>(p.weights),weights,p.q);
-        mixture_evaluate_kernel<<<blocks(p.n),threads,0,c.stream>>>(p.at<const double*>(p.pointers),
-            p.at<double>(p.offset),p.at<double>(p.kernel),p.at<double>(p.weights),p.n,p.q,p.at<double>(p.terms));
-        c.launched(); reduce_mixture(p,add(p.q,2));
-        c.download(&objective_sum,p.at<double>(p.sums),1);
-        c.download(likelihood,p.at<double>(p.sums)+1,1);
-        c.download(gradient,p.at<double>(p.sums)+2,p.q); c.finish();
+        if(small_mixture(p)) {
+            small_mixture_evaluate_kernel<<<1,threads,0,c.stream>>>(p.at<const double*>(p.pointers),
+                p.at<double>(p.offset),p.at<double>(p.kernel),p.at<double>(p.weights),p.n,p.q,p.at<double>(p.sums));
+            c.launched(); c.download(small_sums,p.at<double>(p.sums),add(p.q,2)); c.finish();
+            objective_sum=small_sums[0]; *likelihood=small_sums[1];
+            std::copy(small_sums+2,small_sums+2+p.q,gradient);
+        } else {
+            mixture_evaluate_kernel<<<blocks(p.n),threads,0,c.stream>>>(p.at<const double*>(p.pointers),
+                p.at<double>(p.offset),p.at<double>(p.kernel),p.at<double>(p.weights),p.n,p.q,p.at<double>(p.terms));
+            c.launched(); reduce_mixture(p,add(p.q,2));
+            c.download(&objective_sum,p.at<double>(p.sums),1);
+            c.download(likelihood,p.at<double>(p.sums)+1,1);
+            c.download(gradient,p.at<double>(p.sums)+2,p.q); c.finish();
+        }
         *objective=-objective_sum/p.n;
         for(i64 k=0;k<p.q;++k) gradient[k]=-gradient[k]/p.n;
         ++scoring_state(c).counters[4];
@@ -627,8 +731,9 @@ extern "C" int CliPP2PrepareMixtureTransferEndpoint(void* value,i64 handle,const
         auto& c=context(value); auto& p=scoring_problem(c,handle);
         if(!output) throw std::domain_error("Missing CUDA transfer endpoint result");
         ScoringStreamFence fence(c);
-        prepare_mixture_transfer(p,weights,grow,shrink);
-        mixture_transfer_derivative(p,1.,output);
+        prepare_mixture_transfer<true>(p,weights,grow,shrink);
+        if(small_mixture(p)) finish_mixture_transfer(p,output);
+        else mixture_transfer_derivative(p,1.,output);
         p.pair_ready=true; ++scoring_state(c).counters[5];
     });
 }

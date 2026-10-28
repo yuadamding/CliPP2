@@ -80,8 +80,9 @@ class CandidateBank:
 
     numerical_policy = "regional_conditional_refit_v1"
 
-    def __init__(self, model, tree):
+    def __init__(self, model, tree, *, progress=None):
         self.model, self.tree = model, tree
+        self.progress = progress
         self.candidates, self.general_rejections, self.attempt_records = [], [], []
         self.by_cuts, self.by_membership, self.ineligible = {}, {}, {}
         self.membership_attempts, self.structural_rejections = {}, {}
@@ -130,16 +131,22 @@ class CandidateBank:
         """Trusted canonical cuts: exact cache lookup precedes labels/groups."""
         membership = ("tree", cuts)
         found, candidate = self._cached(membership, centers, provenance)
-        if found:
-            return candidate
-        return self._consider(self.prepare(cuts), centers, provenance)
+        if not found:
+            candidate = self._consider(self.prepare(cuts), centers, provenance)
+        if self.progress is not None:
+            self.progress(self, provenance)
+        return candidate
 
     def consider_prepared(self, partition, centers, provenance):
         if (partition.tree_identity != self._tree_identity
                 or partition.model_identity != getattr(self.model, "identity", "")):
             raise ValueError("Prepared partition belongs to another model/tree")
         found, candidate = self._cached(partition.membership.key, centers, provenance)
-        return candidate if found else self._consider(partition, centers, provenance)
+        if not found:
+            candidate = self._consider(partition, centers, provenance)
+        if self.progress is not None:
+            self.progress(self, provenance)
+        return candidate
 
     def consider(self, cuts, labels, centers, provenance, *, parent=None):
         raw = np.asarray(cuts)
@@ -152,9 +159,11 @@ class CandidateBank:
         if not np.array_equal(labels, partition_from_cuts(self.tree, cuts)):
             raise ValueError("Candidate labels and frozen-tree cuts disagree")
         found, candidate = self._cached(("tree", cuts), centers, provenance)
-        if found:
-            return candidate
-        return self._consider(self.prepare(cuts, labels, parent=parent), centers, provenance)
+        if not found:
+            candidate = self._consider(self.prepare(cuts, labels, parent=parent), centers, provenance)
+        if self.progress is not None:
+            self.progress(self, provenance)
+        return candidate
 
     def consider_membership(self, labels, initial_centers, provenance, *, parent=None):
         labels, centers = _canonical_inputs(labels, initial_centers, self.model.n, self.model.r)
@@ -162,6 +171,8 @@ class CandidateBank:
         if not found:
             candidate = self._consider(self.prepare(None, labels, parent=parent), centers, provenance)
         self.membership_attempts[(labels.tobytes(), None if centers is None else centers.tobytes())] = candidate
+        if self.progress is not None:
+            self.progress(self, provenance)
         return candidate
 
     def _cached(self, membership, centers, provenance):

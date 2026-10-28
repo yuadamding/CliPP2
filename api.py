@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from time import perf_counter
@@ -11,11 +12,13 @@ from .io.tumor_txt import load_tumor_txt
 from .io.region_files import input_fingerprint
 
 
-def process_tumor_bundle(tumor_file, outdir, fit_config=None):
+def process_tumor_bundle(tumor_file, outdir, fit_config=None, *, progress_callback=None):
     """Publish three tables and explicitly retain in-memory research evidence.
 
     Unlike ``process_tumor``, this diagnostic API returns the complete search
     ledger and candidate bank. Neither API writes these as extra output files.
+    An optional progress callback receives detached completed-operation records;
+    verbose mode otherwise prints them to stderr, never into the output folder.
     """
     from .kernel.model import RegionalModel, MODEL_VERSION
     from .tree.selection import fit_regions
@@ -26,6 +29,11 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
     config = resolve_fit_config() if fit_config is None else fit_config
     if type(config) is not FitConfig:
         raise TypeError('fit_config must be a FitConfig')
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError('progress_callback must be callable or None')
+    if progress_callback is None and config.verbose:
+        def progress_callback(record):
+            print(json.dumps(record, allow_nan=False), file=sys.stderr, flush=True)
     started = perf_counter()
     source_root = Path(__file__).resolve().parent
     commit, dirty = git_source_identity(source_root)
@@ -50,7 +58,8 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
                                                else config.device_memory_mb * 1024**2),
                           cpu_threads=config.cpu_threads, score_capacity=config.max_clusters)
     try:
-        result = fit_regions(model, config.max_clusters)
+        result = (fit_regions(model, config.max_clusters) if progress_callback is None else
+                  fit_regions(model, config.max_clusters, progress_callback=progress_callback))
         if input_fingerprint(path) != input_hash:
             raise RuntimeError('Input changed during fitting; no successful publication')
         if source_fingerprint(source_root) != source_hash:
@@ -79,12 +88,13 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None):
 
 
 def process_tumor(tumor_file: str | Path, outdir: str | Path,
-                  fit_config: FitConfig | None = None) -> dict[str, object]:
+                  fit_config: FitConfig | None = None, *, progress_callback=None) -> dict[str, object]:
     """Publish the README's three tables; return compact operational metadata.
 
     Full search diagnostics are used for verification but not returned here,
     preventing routine callers from serializing the potentially large ledger.
     """
-    summary, _ = process_tumor_bundle(tumor_file, outdir, fit_config)
+    summary, _ = (process_tumor_bundle(tumor_file, outdir, fit_config) if progress_callback is None else
+                  process_tumor_bundle(tumor_file, outdir, fit_config, progress_callback=progress_callback))
     del summary['diagnostics']
     return summary

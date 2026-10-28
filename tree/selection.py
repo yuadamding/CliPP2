@@ -275,13 +275,16 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
             "exhaustive_tree_partition_search": False}
 
 
-def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None):
+def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, progress_callback=None):
     """Fit tree proposals followed by bounded free-center joint reassignment.
 
     Truth is deliberately absent. Every R>=1 uses this same forest continuation,
     conditional refitter, candidate registry and bounded membership expansion.
     """
     from ..kernel.solver import generate_candidates
+    from .progress import ProgressReporter
+
+    progress = None if progress_callback is None else ProgressReporter(model, progress_callback)
 
     total_started = perf_counter()
     telemetry_started = dict(getattr(model, "telemetry", {}))
@@ -300,13 +303,23 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None):
     started = perf_counter()
     pilot, pilot_diagnostics = model.pilots()
     times["initialization_seconds"] = perf_counter() - started
+    if progress is not None:
+        progress.emit(complete=True)
+        progress.phase = "tree"
     started = perf_counter()
     tree = build_tree(pilot, model.observed, model.mutation_ids)
     times["tree_seconds"] = perf_counter() - started
+    if progress is not None:
+        progress.emit(complete=True)
+        progress.phase = "continuation"
     started = perf_counter()
     seeds = generate_candidates(model, tree, pilot, capacities, keep_raw_phi=False)
     times["continuation_seconds"] = perf_counter() - started
-    bank = _CandidateBank(model, tree)
+    if progress is not None:
+        progress.emit(complete=True)
+        progress.phase = "candidate_search"
+    bank = (_CandidateBank(model, tree) if progress is None else
+            _CandidateBank(model, tree, progress=progress.completed_candidate))
     seeds_diagnostics, refined = [], set()
     refinement_seconds, subset_count, subset_visits = 0.0, 0, 0
 
@@ -342,6 +355,8 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None):
     for index, seed in enumerate(seeds):
         cuts = tuple(sorted(map(int, seed["cuts"])))
         requested = int(seed["requested_k"])
+        if progress is not None:
+            progress.seed_index, progress.requested_k, progress.occupied_q = index, requested, len(cuts)+1
         if len(cuts) >= requested or requested not in capacities:
             raise ValueError("Generated seed exceeds its declared capacity")
         labels = canonical_partition(seed["labels"])
@@ -359,6 +374,8 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None):
         subset_count += 1 << len(cuts)
         for subset in cut_subsets(cuts, capacities):
             subset_visits += 1
+            if progress is not None:
+                progress.subset_visits = subset_visits
             proposal = bank.consider_cuts(subset, None, {
                 "route": "connected_coarsening", "seed_index": index,
                 "seed_requested_k": requested, "requested_k": len(subset) + 1,
@@ -368,8 +385,15 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None):
                 repair_unsupported(subset, len(subset) + 1, {"route": "connected_coarsening"})
             refine_once(proposal)
     started = perf_counter()
+    if progress is not None:
+        progress.emit(bank, complete=True)
+        progress.phase = "supplemental_search"
+        progress.seed_index = progress.requested_k = progress.occupied_q = None
     supported_proposals = _add_supported_proposals(model, tree, bank, capacities, seeds)
     times["supplemental_search_inclusive_seconds"] = perf_counter()-started
+    if progress is not None:
+        progress.emit(bank, complete=True)
+        progress.phase = "reassignment"
     if not bank.candidates:
         reasons = sorted({entry["reason"] for entry in bank.ineligible.values()})
         raise ValueError(f"No supported finite-score tree candidate: {reasons}")
@@ -379,6 +403,9 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None):
     from .proposals import expand_memberships
     reassignment = expand_memberships(model, bank)
     times["reassignment_inclusive_seconds"] = reassignment.get("seconds", 0.0)
+    if progress is not None:
+        progress.emit(bank, complete=True)
+        progress.phase = "selection"
     selected = min(bank.candidates, key=_score_key)
     if selected.score > bank.original_selected.score:
         raise AssertionError("Reassignment lost the original selected score")
@@ -395,6 +422,9 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None):
     for name in ("scalar_refit_seconds", "weight_seconds"):
         if name in getattr(model, "telemetry", {}):
             times[name] = model.telemetry[name] - telemetry_started.get(name, 0.0)
+    if progress is not None:
+        progress.requested_k, progress.occupied_q = max_clusters, len(selected.fit.centers)
+        progress.emit(bank, complete=True)
     return TreeFit(selected, bank.candidates, tree, np.asarray(pilot), {
         "pipeline": ALGORITHM,
         "tree_identity": tree.identity, "tree_kind": "mutation_similarity_not_phylogeny",
