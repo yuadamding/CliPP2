@@ -71,5 +71,3 @@ The output directory contains three tables:
 ## Contact
 
 Submit an issue or email yding4@mdanderson.org.
-
-The synthetic-data generator is maintained separately in the `CliPP2-simulation` companion.
