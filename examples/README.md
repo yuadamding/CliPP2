@@ -8,11 +8,6 @@ tumor/
 └── region2/    # snv.txt, cna.txt, purity.txt
 ```
 
-The regions have independent CN profiles and purities of 0.6 and 0.8.
-Locus `1:300` is absent from region2's SNV table but covered by its CNA table;
-it is treated as missing, not zero reads. Normal CN is 2. These are illustrative
-inputs, not a biological accuracy benchmark.
-
 From the repository root:
 
 ```bash
