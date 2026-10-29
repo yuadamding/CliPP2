@@ -13,7 +13,6 @@ def build_parser() -> argparse.ArgumentParser:
         description="Fit the free-center tree-proposed joint-region multiplicity-mixture estimator.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version=__version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     fit = subparsers.add_parser("fit", allow_abbrev=False,
                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -23,27 +22,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Tumor directory with regional snv.txt/cna.txt/purity.txt bundles.")
     fit.add_argument("--output-dir", default="clipp2_results")
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
-    fit.add_argument("--execution-policy", choices=["auto", "reference", "candidate"], default="auto",
-                     help="auto uses reference unless the exact GPU policy is qualified; candidate is explicit CUDA research.")
     fit.add_argument(
         "--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN,
         help="Exclude a mutation only from regions where any CN state's major CN exceeds this limit.",
     )
-    fit.add_argument("--verbose", action="store_true", help="Emit periodic JSON progress to stderr.")
     fit.add_argument("--max-clusters", type=int, default=DEFAULT_MAX_CLUSTERS,
                      help="Largest occupied cluster capacity (positive integer; no fixed upper limit).")
-    fit.add_argument("--grid-cache-mb", type=int, default=64,
-                     help="Host initialization-grid cache budget in MiB; 0 streams without caching.")
-    fit.add_argument("--device-cache-mb", type=int, default=256,
-                     help="Optional retained CUDA grid/column cache in MiB; 0 disables retention, not GPU scoring.")
-    fit.add_argument("--workspace-mb", type=int, default=64,
-                     help="Native CPU/CUDA scratch budget in MiB (positive; not total memory).")
-    fit.add_argument("--native-host-memory-mb", type=int, default=None,
-                     help="Tracked native host memory cap in MiB; auto uses 75%% of available headroom.")
-    fit.add_argument("--device-memory-mb", type=int, default=None,
-                     help="Tracked device memory cap in MiB; auto uses 80%% of free device headroom.")
     fit.add_argument("--cpu-threads", type=int, default=None,
-                     help="CPU execution budget; fallback CLIPP2_CPU_THREADS, OMP_NUM_THREADS, then affinity/quota.")
+                     help="CPU threads; fallback CLIPP2_CPU_THREADS, OMP_NUM_THREADS, then affinity/quota.")
     fit.add_argument("--version", action="version", version=__version__)
     return parser
 
@@ -59,13 +45,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
-    return resolve_fit_config(device=args.device, verbose=args.verbose,
+    return resolve_fit_config(device=args.device,
                               max_major_cn=args.max_major_cn, max_clusters=args.max_clusters,
-                              grid_cache_mb=args.grid_cache_mb, device_cache_mb=args.device_cache_mb,
-                              workspace_mb=args.workspace_mb,
-                              native_host_memory_mb=args.native_host_memory_mb,
-                              device_memory_mb=args.device_memory_mb, cpu_threads=args.cpu_threads,
-                              execution_policy=args.execution_policy)
+                              cpu_threads=args.cpu_threads)
 
 
 def main(argv: list[str] | None = None) -> None:

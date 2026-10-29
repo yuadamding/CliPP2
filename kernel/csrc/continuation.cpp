@@ -8,7 +8,6 @@
 #include "common/scalar_search.h"
 #include "common/validation.h"
 #include <algorithm>
-#include <atomic>
 #include <condition_variable>
 #include <cmath>
 #include <cstdio>
@@ -18,7 +17,6 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
-#include <thread>
 #include <pthread.h>
 #include <vector>
 
@@ -382,21 +380,10 @@ struct Engine {
 }
 
 extern "C" const char* CliPP2ContinuationLastError() {return error_message;}
-extern "C" int CliPP2ContinuationMemory(int n,int r,int workers,int tasks,
-    long long* shared,long long* state,long long* per_thread) {
-    if(n<1||r<1||workers<1||tasks<1||!shared||!state||!per_thread)return 1;
-    const long double cells=static_cast<long double>(n)*r;
-    const long double a=4*sizeof(double)*cells+12.0L*sizeof(int)*n+4096;
-    const long double b=(33*sizeof(double)+4*sizeof(long double))*cells+
-        (sizeof(long double)+10*sizeof(int)+1)*static_cast<long double>(n)+8.0L*r+4096;
-    const long double c=(5*sizeof(double)+4*sizeof(long double)+5*sizeof(int)+1)*static_cast<long double>(n)+4096;
-    if(std::max({a,b,c})>std::numeric_limits<long long>::max())return 1;
-    *shared=static_cast<long long>(a);*state=static_cast<long long>(b);*per_thread=static_cast<long long>(c);return 0;
-}
 extern "C" int CliPP2ContinueCPU(const clipp2::ObservationSoA* data,const int* edges,
     const int* canonical,const double* initial,const double* lower,const double* upper,
     int tasks,const int* capacities,const CliPP2ContinuationPolicy* policy,const double* gaps,
-    CliPP2Norm norm,CliPP2CutScores cut_scores,int workers,long long workspace_bytes,long long host_budget_bytes,
+    CliPP2Norm norm,CliPP2CutScores cut_scores,int workers,
     int output_flags,double* output,int* labels,
     unsigned char* cuts,CliPP2ContinuationReport* reports,int* actual_workers) {
     error_message[0]='\0';
@@ -404,26 +391,14 @@ extern "C" int CliPP2ContinueCPU(const clipp2::ObservationSoA* data,const int* e
         if(!data || data->mutations<1 || data->regions<1 || data->mutations>std::numeric_limits<int>::max()
             || data->regions>std::numeric_limits<int>::max() || !canonical || !initial || !lower || !upper
             || !policy || !gaps || !norm || !cut_scores || (output_flags && !output) || !labels || !cuts || !reports || !actual_workers
-            || !capacities || tasks<1 || workers<1 || workspace_bytes<0 || host_budget_bytes<0
+            || !capacities || tasks<1 || workers<1
             || (output_flags!=0 && output_flags!=1) || (data->mutations>1 && !edges))
             throw std::invalid_argument("Invalid native continuation dimensions or buffers");
         const auto n=static_cast<int>(data->mutations),r=static_cast<int>(data->regions),e=n-1;
         if(static_cast<std::size_t>(n)>std::numeric_limits<std::size_t>::max()/r)
             throw std::invalid_argument("Native continuation dimensions overflow");
         const auto cells=static_cast<std::size_t>(n)*r;
-        long long shared=0,state_bytes=0,thread_bytes=0;
-        if(CliPP2ContinuationMemory(n,r,workers,tasks,&shared,&state_bytes,&thread_bytes))
-            throw std::invalid_argument("Native continuation allocation sizes overflow");
-        const auto required=[&](int team){return static_cast<long double>(shared)+
-            state_bytes*(tasks>=team?team:1.0L)+static_cast<long double>(thread_bytes)*team;};
-        const auto minimum=required(1);
-        if(minimum>host_budget_bytes) {
-            char reason[256];std::snprintf(reason,sizeof(reason),
-                "CPU continuation requires %.0Lf tracked native host bytes; available %lld bytes",minimum,host_budget_bytes);
-            throw std::runtime_error(reason);
-        }
-        while(workers>1 && required(workers)>host_budget_bytes)--workers;
-        clipp2::validate_observations(*data,workspace_bytes);
+        clipp2::validate_observations(*data);
         if(policy->levels<1 || policy->iterations<1 || !std::isfinite(policy->stationarity)
             || policy->stationarity<=0 || !std::isfinite(policy->constraint) || policy->constraint<=0
             || !std::isfinite(policy->maximum_penalty) || policy->maximum_penalty<=0)
@@ -442,7 +417,7 @@ extern "C" int CliPP2ContinueCPU(const clipp2::ObservationSoA* data,const int* e
             || initial[i]<lower[i] || initial[i]>upper[i])
             throw std::invalid_argument("Native continuation has invalid coordinates or box");
         // A caller may previously have solved a much larger QP on this thread.
-        // Release that unrelated cache before admitting this batch's scratch.
+        // Release that unrelated cache before preparing this batch's scratch.
         clipp2kernel::reset_forest_workspace();
         struct ReleaseForest {~ReleaseForest(){clipp2kernel::reset_forest_workspace();}} release_forest;
         const clipp2kernel::PreparedTree tree(n,e,edges);
@@ -602,45 +577,19 @@ void owner_error(const std::exception& error) {
 }
 }
 
-extern "C" int CliPP2ContinuationOwnerMemory(int n,int r,int tasks,long long stack_bytes,
-    int output_flags,long long* shared,long long* state,long long* stack) {
-    if(n<1||r<1||tasks<1||stack_bytes<PTHREAD_STACK_MIN||!shared||!state||!stack
-       ||(output_flags!=0&&output_flags!=1))return 1;
-    pthread_attr_t attr;
-    if(pthread_attr_init(&attr))return 1;
-    std::size_t guard=0,actual=0;
-    const bool invalid=static_cast<unsigned long long>(stack_bytes)>std::numeric_limits<std::size_t>::max()
-        ||pthread_attr_setstacksize(&attr,static_cast<std::size_t>(stack_bytes))
-        ||pthread_attr_getstacksize(&attr,&actual)||pthread_attr_getguardsize(&attr,&guard);
-    pthread_attr_destroy(&attr);
-    if(invalid)return 1;
-    long long cpu_shared=0,cpu_state=0,cpu_thread=0;
-    if(CliPP2ContinuationMemory(n,r,1,tasks,&cpu_shared,&cpu_state,&cpu_thread))return 1;
-    const long double cells=static_cast<long double>(n)*r;
-    const long double a=6*sizeof(double)*cells+(24.0L*sizeof(int)+sizeof(double))*n+8192;
-    const long double b=static_cast<long double>(cpu_state)+cpu_thread+
-        output_flags*sizeof(double)*cells+5.0L*n+8192;
-    const long double c=static_cast<long double>(actual)+guard;
-    if(std::max({a,b,c,a+tasks*(b+c)})>std::numeric_limits<long long>::max())return 1;
-    *shared=static_cast<long long>(a);*state=static_cast<long long>(b);*stack=static_cast<long long>(c);
-    return 0;
-}
-
 extern "C" int CliPP2ContinuationOwnerCreate(int n,int r,const int* edges,const int* canonical,
     const double* initial,const double* values,const double* gradient,const double* curvature,
     const double* lower,const double* upper,const double* gaps,int tasks,const int* capacities,
     const CliPP2ContinuationPolicy* policy,CliPP2Norm norm,CliPP2CutScores scores,
-    long long host_budget_bytes,long long stack_bytes,int output_flags,int boundary_requests,void** owner) {
+    int output_flags,int boundary_requests,void** owner) {
     error_message[0]='\0';if(owner)*owner=nullptr;
     try {
-        long long shared=0,state=0,stack=0;
         if(!owner||!canonical||!initial||!values||!gradient||!curvature||!lower||!upper||!gaps
-            ||!capacities||!policy||!norm||!scores||(n>1&&!edges)||host_budget_bytes<0
+            ||!capacities||!policy||!norm||!scores||n<1||r<1||tasks<1||(n>1&&!edges)
             ||(boundary_requests!=0&&boundary_requests!=1)
-            ||CliPP2ContinuationOwnerMemory(n,r,tasks,stack_bytes,output_flags,&shared,&state,&stack))
+            ||(output_flags!=0&&output_flags!=1))
             throw std::invalid_argument("Invalid continuation owner dimensions or buffers");
-        if(shared+static_cast<long double>(tasks)*(state+stack)>host_budget_bytes)
-            throw std::runtime_error("Continuation owner state and stack exceed host budget");
+        const auto cells=static_cast<std::size_t>(clipp2::checked_product(n,r,sizeof(long double)));
         if(policy->levels<1||policy->iterations<1||!std::isfinite(policy->stationarity)||policy->stationarity<=0
             ||!std::isfinite(policy->constraint)||policy->constraint<=0
             ||!std::isfinite(policy->maximum_penalty)||policy->maximum_penalty<=0)
@@ -658,7 +607,6 @@ extern "C" int CliPP2ContinuationOwnerCreate(int n,int r,const int* edges,const 
             for(int j=0;j<i;++j)if(capacities[j]==capacities[i])
                 throw std::invalid_argument("Duplicate continuation capacities");
         }
-        const auto cells=static_cast<std::size_t>(n)*r;
         for(std::size_t i=0;i<cells;++i) {
             if(!std::isfinite(initial[i])||!std::isfinite(lower[i])||!std::isfinite(upper[i])
                 ||lower[i]<0||upper[i]>1||lower[i]>upper[i]||initial[i]<lower[i]||initial[i]>upper[i]
@@ -670,13 +618,8 @@ extern "C" int CliPP2ContinuationOwnerCreate(int n,int r,const int* edges,const 
         group->states.reserve(tasks);
         for(int i=0;i<tasks;++i)
             group->states.emplace_back(std::make_unique<ContinuationState>(*group,n,r,capacities[i],output_flags));
-        pthread_attr_t attr;
-        if(pthread_attr_init(&attr))throw std::runtime_error("Cannot initialize continuation thread attributes");
-        struct ReleaseAttr {pthread_attr_t* p;~ReleaseAttr(){pthread_attr_destroy(p);}} release{&attr};
-        if(pthread_attr_setstacksize(&attr,static_cast<std::size_t>(stack_bytes)))
-            throw std::runtime_error("Cannot reserve continuation worker stack");
         for(auto& work:group->states) {
-            const int error=pthread_create(&work->thread,&attr,ContinuationState::work,work.get());
+            const int error=pthread_create(&work->thread,nullptr,ContinuationState::work,work.get());
             if(error)throw std::runtime_error("Cannot create continuation worker: "+std::to_string(error));
             work->started=true;
         }

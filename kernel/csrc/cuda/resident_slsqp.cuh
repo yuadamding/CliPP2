@@ -1,4 +1,4 @@
-// Experimental device-capable SLSQP/NNLS control core; opt-in only.
+// Device-capable SLSQP/NNLS control core.
 // Adapted without algorithm changes from SciPy 1.18.0, commit
 // 54ef5423f2e4376230ec3bfda6912a07a50958e3, optimize/src/slsqp.c and nnls.c.
 // Source acquisition/hashes and host-reference qualification live outside the

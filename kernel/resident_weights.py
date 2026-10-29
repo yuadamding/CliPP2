@@ -1,6 +1,6 @@
-"""Explicit experimental resident optimizer boundary; never default dispatch.
+"""Device-resident CUDA optimizer boundary.
 
-Requires the source-bound experimental resident ABI. It has no host numerical
+Requires the source-bound resident ABI. It has no host numerical
 fallback and cannot reproduce per-request progress callbacks from inside a
 resident GPU solve. Cancellation is observed only before/after its synchronous
 native call; it never promises mid-kernel cancellation.
@@ -11,7 +11,6 @@ from types import MappingProxyType
 import numpy as np
 
 from .backend import DeviceMixtureProblem, NativeExecutionError, WeightBatchCancelled, WeightOutcome, _ptr
-from .execution import preflight_host_export
 from .scoring import WeightConvergenceError, completed_weight
 from ..io.data import readonly_array
 
@@ -34,13 +33,12 @@ def fit_resident_weights(backend, problems, initial_weights=None, *,
     cached transfer endpoint is invalidated on both success and failure.
 
     Existing fixed numerical gates remain 1e-8 (scaled by N for optimality).
-    Resident arithmetic is separately qualified, not presumed bit-identical to
-    SciPy/OpenBLAS. The q20/q64 performance regression keeps this route opt-in.
+    Resident arithmetic is not presumed bit-identical to SciPy/OpenBLAS.
     ``progress_callback(index, record)`` receives detached completed outcomes
     only after the submission owner is released, never inner optimizer events.
     """
     return _fit_resident_weights(backend, problems, initial_weights,
-        'CliPP2ExperimentalResidentWeights', progress_callback, cancelled, telemetry)
+        'CliPP2ResidentWeights', progress_callback, cancelled, telemetry)
 
 
 def _qualify_resident_graph_weights(backend, problems, initial_weights=None, *,
@@ -84,13 +82,12 @@ def _fit_resident_weights(backend, problems, initial_weights, symbol,
     try:
         function = getattr(backend.lib, symbol)
     except AttributeError as error:
-        raise NativeExecutionError('The loaded backend has no qualified experimental resident ABI') from error
+        raise NativeExecutionError('The loaded backend has no compatible resident ABI') from error
     function.argtypes = ([ct.c_void_p, ct.c_int64, ct.POINTER(ct.c_int64)]
                          + [ct.POINTER(ct.c_double)]*5
                          + [ct.POINTER(ct.c_int32), ct.POINTER(ct.c_int64)])
     function.restype = ct.c_int
     count, total_q = len(problems), sum(sizes)
-    preflight_host_export(64*total_q+256*count)
     handles = np.asarray(handles, dtype=np.int64)
     starts = np.concatenate(starts)
     weights = np.full(total_q, np.nan)

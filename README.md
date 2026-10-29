@@ -21,6 +21,8 @@ driver. CPU builds require neither CUDA nor PyTorch.
 clipp2 fit --input-dir tumor/ --device cpu --output-dir results/
 ```
 
+Use `--device cuda` for GPU execution; the device selects the execution path.
+
 ## Input
 
 ### Directory

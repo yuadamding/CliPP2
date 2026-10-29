@@ -1,5 +1,5 @@
-// Experimental strict-FP64 device linear algebra for bounded-simplex SLSQP.
-// Not integrated or qualified. LAPACK routines translated from OpenBLAS 0.3.30
+// Strict-FP64 device linear algebra for bounded-simplex SLSQP.
+// LAPACK routines translated from OpenBLAS 0.3.30
 // commit 993fad6aebbce34a97d3f8c34d6d79d35b64cc48, lapack-netlib/SRC/*.f.
 // The bundled generated *.c files are not equivalent to those Fortran sources.
 // This serial policy runs on the resident controller's owner thread; reductions

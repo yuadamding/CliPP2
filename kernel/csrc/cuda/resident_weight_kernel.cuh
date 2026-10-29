@@ -1,6 +1,5 @@
-// Experimental one-CTA-per-small-problem resident optimizer.
-// Include at global scope after scoring.cuh. The optional native entry point
-// keeps default dispatch disabled pending whole-fit qualification.
+// One-CTA-per-small-problem resident optimizer.
+// Include at global scope after scoring.cuh.
 #pragma once
 #include "resident_weights.cuh"
 
@@ -9,8 +8,15 @@ using ResidentWeightState=clipp2::resident_slsqp::WeightState<>;
 using ResidentWeightOperation=clipp2::resident_slsqp::WeightOperation;
 using ResidentWeightError=clipp2::resident_slsqp::WeightError;
 
+struct ResidentMixtureView {
+    const double* const* columns;
+    const double *offsets,*kernel;
+    double *logs,*other,*grow_log,*shrink_log,*numerator,*sign;
+    i64 n,q;
+};
+
 struct ResidentWeightItem {
-    WeightBatchItem problem;
+    ResidentMixtureView problem;
     ResidentWeightState* state;
     double* arena;
     int* indices;

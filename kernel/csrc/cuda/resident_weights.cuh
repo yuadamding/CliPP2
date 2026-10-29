@@ -1,7 +1,7 @@
-// Experimental device-resident weight-controller state machine; opt-in only.
-// SLSQP/Brent orchestration follows kernel/weight_controller.py and its pinned
-// SciPy 1.18.0 sources. See resident_slsqp.cuh for the retained BSD-3-Clause
-// copyright, conditions and disclaimer governing this adaptation.
+// Device-resident weight-controller state machine for CUDA fitting.
+// SLSQP/Brent orchestration follows SciPy 1.18.0's optimize/_slsqp_py.py
+// and optimize/Zeros/brentq.c (Charles Harris). See resident_slsqp.cuh for
+// the retained Enthought/SciPy BSD-3-Clause copyright, conditions and disclaimer.
 // One owner advances control; an evaluator services requests without requiring
 // host access to intermediate objective, gradient, weights, or optimizer state.
 #pragma once
@@ -29,7 +29,7 @@ enum class WeightPhase : int {
 };
 
 template<class Blas=DeviceBlas> struct WeightState {
-    // All pointed storage belongs to one caller-owned, budgeted problem arena.
+    // All pointed storage belongs to one caller-owned problem arena.
     // doubles(q) returns the exact count, excluding this struct and evaluator.
     int n=0,q=0,repair_steps=0,grow=0,shrink=0,brent_iteration=0;
     WeightPhase phase=WeightPhase::Start;

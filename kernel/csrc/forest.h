@@ -21,9 +21,7 @@ extern "C" {
 int CliPP2KernelABI();
 const char* CliPP2KernelBuildId();
 const char* CliPP2KernelLastError();
-long long CliPP2ForestRequiredBytes(int count,int edge_count);
 int CliPP2ForestQP(int count, int regions, int edge_count, const int* edges,
     const double* curvature, const double* rhs, double penalty,
-    const double* lower, const double* upper, double* output, int* diagnostics,
-    long long host_budget_bytes);
+    const double* lower, const double* upper, double* output, int* diagnostics);
 }

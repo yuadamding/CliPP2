@@ -1,13 +1,12 @@
 // Internal staged refit; included by the single CUDA translation unit.
-// Slices retain absolute CSR offsets, rebased only in device views. This avoids
-// host packing arrays; optional shape reuse charges its extra maps and staging.
+// Batches retain absolute CSR offsets, rebased only in device views. This avoids
+// host packing arrays; exact shape reuse keeps its maps in the same arena.
 struct RefitLayout {
     Layout layout;
     i64 regions, offsets, rows, grid_offsets, grid, lower, upper, xatol,
         incumbent, compacted, counts, grid_values, results, grid_tables, probability_flags,
         shape_counts, shape_ids, row_shapes, shape_hash_keys, shape_hash_values;
-    RefitLayout(i64 tasks, i64 members, i64 points, bool has_incumbent, bool cache = false,
-                bool probability = false,bool shape_reuse = false) {
+    RefitLayout(i64 tasks, i64 members, i64 points, bool has_incumbent, bool probability) {
         regions = layout.take<i64>(tasks);
         offsets = layout.take<i64>(add(tasks, 1));
         rows = layout.take<i64>(members);
@@ -21,52 +20,37 @@ struct RefitLayout {
         counts = layout.take<i64>(tasks);
         grid_values = layout.take<double>(points);
         results = layout.take<RefitResult>(tasks);
-        grid_tables = layout.take<i64>(cache ? tasks : 0);
+        grid_tables = layout.take<i64>(tasks);
         probability_flags = layout.take<i64>(probability ? tasks : 0);
-        shape_counts = layout.take<i64>(shape_reuse ? tasks : 0);
-        shape_ids = layout.take<i64>(shape_reuse ? members : 0);
-        row_shapes = layout.take<i64>(shape_reuse ? members : 0);
+        shape_counts = layout.take<i64>(probability ? tasks : 0);
+        shape_ids = layout.take<i64>(probability ? members : 0);
+        row_shapes = layout.take<i64>(probability ? members : 0);
         // Each task owns a power-of-two table below four times its members.
         // Fixed 4*member CSR spans avoid extra host offsets or allocations.
-        shape_hash_keys = layout.take<i64>(shape_reuse ? multiply(members,4) : 0);
-        shape_hash_values = layout.take<i64>(shape_reuse ? multiply(members,4) : 0);
+        shape_hash_keys = layout.take<i64>(probability ? multiply(members,4) : 0);
+        shape_hash_values = layout.take<i64>(probability ? multiply(members,4) : 0);
     }
 };
 
 struct RefitPlan {
-    i64 last, members, points, max_rows, stride, wave, scratch, bytes;
+    i64 members, points, max_rows, stride, wave, scratch, bytes;
 };
 
-RefitPlan plan_refit_slice(const RefitBatch& batch, i64 first, i64 budget, i64 host_limit,
-                           bool cache = false, i64 probability_components = 0,
-                           bool shape_reuse = false) {
+RefitPlan plan_refit_batch(const RefitBatch& batch, i64 wave_size, i64 probability_components) {
     const bool probability=probability_components>0;
-    const i64 task_limit = host_limit / (sizeof(i64)*(probability?(shape_reuse?3:2):1));
-    require(task_limit > 0, "CUDA refit host staging requires eight bytes per task");
-    RefitPlan plan{first, 0, 0, 1, 1, 0, 0, 0};
-    while (plan.last < batch.tasks && plan.last - first < task_limit) {
-        const i64 end = plan.last + 1;
-        const i64 members = batch.member_offsets[end] - batch.member_offsets[first];
-        const i64 points = batch.grid_offsets[end] - batch.grid_offsets[first];
-        const i64 maximum = std::max(plan.max_rows,
-            batch.member_offsets[end] - batch.member_offsets[plan.last]);
-        RefitLayout buffers(end - first, members, points, batch.incumbent != nullptr,
-                            cache, probability,shape_reuse);
-        const i64 fixed = buffers.layout.bytes;
-        // One arena is reused: grid-wave row values, then all adaptive tasks'
-        // row values. Never reserve/grow after installing the slice pointers.
-        const i64 stride=add(multiply(maximum,shape_reuse?2:1),multiply(probability_components,2));
-        const i64 adaptive=probability?multiply(end-first,stride):members;
-        const i64 minimum = multiply(std::max(adaptive, stride), sizeof(double));
-        if (fixed > budget || minimum > budget - fixed) break;
-        const i64 wave = std::min<i64>({points, 65535,
-            (budget - fixed) / multiply(stride, sizeof(double))});
-        const i64 scratch = buffers.layout.take<double>(std::max(adaptive, multiply(wave, stride)));
-        plan = {end, members, points, maximum, stride, wave, scratch, buffers.layout.bytes};
-    }
-    require(plan.last > first,
-            "Native CUDA refit workspace cannot hold one task and one grid evaluation");
-    return plan;
+    i64 maximum=1;
+    for(i64 task=0;task<batch.tasks;++task)
+        maximum=std::max(maximum,batch.member_offsets[task+1]-batch.member_offsets[task]);
+    const i64 members=batch.member_offsets[batch.tasks]-batch.member_offsets[0];
+    const i64 points=batch.grid_offsets[batch.tasks]-batch.grid_offsets[0];
+    RefitLayout buffers(batch.tasks,members,points,batch.incumbent!=nullptr,probability);
+    // Grid points are independent blocks. Wave width follows hardware block
+    // concurrency, not a byte ceiling; adaptive objectives reuse this arena.
+    const i64 stride=add(multiply(maximum,probability?2:1),multiply(probability_components,2));
+    const i64 adaptive=probability?multiply(batch.tasks,stride):members;
+    const i64 wave=std::min<i64>({points,65535,wave_size});
+    const i64 scratch=buffers.layout.take<double>(std::max(adaptive,multiply(wave,stride)));
+    return {members,points,maximum,stride,wave,scratch,buffers.layout.bytes};
 }
 
 __global__ void prepare_refit_kernel(ObservationSoA data, RefitBatch batch,
@@ -196,143 +180,114 @@ __global__ void finish_refit_kernel(ObservationSoA data, RefitBatch batch,
 }
 
 void refit_cuda(Context& c, const RefitBatch& batch, RefitResult* output) {
-    for (i64 first = 0; first < batch.tasks;) {
-        const i64 first_members = batch.member_offsets[first + 1] - batch.member_offsets[first];
-        const i64 first_points = batch.grid_offsets[first + 1] - batch.grid_offsets[first];
-        const RefitLayout first_cached(1, first_members, first_points, batch.incumbent != nullptr, true);
-        const bool cache = c.optional_cache_limit >= multiply(multiply(c.data.mutations, 513), sizeof(double))
-            && first_cached.layout.bytes <= c.diagnostics.workspace_limit
-            && multiply(std::max<i64>(1, first_members), sizeof(double))
-                <= c.diagnostics.workspace_limit - first_cached.layout.bytes;
-        i64 probability_components=0;
-        if(c.probability_state) {
-            const auto& state=*static_cast<CUDAProbabilityState*>(c.probability_state);
-            for(const auto& region:state.regions)
-                probability_components=std::max(probability_components,region.components);
-            const RefitLayout first_probability(1,first_members,first_points,
-                batch.incumbent!=nullptr,cache,true);
-            const auto stride=add(std::max<i64>(1,first_members),multiply(probability_components,2));
-            if(first_probability.layout.bytes>c.diagnostics.workspace_limit ||
-                    multiply(stride,sizeof(double))>c.diagnostics.workspace_limit-first_probability.layout.bytes)
-                probability_components=0;
-        }
-        const bool probability=probability_components>0;
-        bool shape_reuse=false;
-        if(probability && c.host_staging_limit>=3*static_cast<i64>(sizeof(i64))) {
-            const RefitLayout first_shapes(1,first_members,first_points,
-                batch.incumbent!=nullptr,cache,true,true);
-            const auto stride=add(multiply(std::max<i64>(1,first_members),2),
-                                  multiply(probability_components,2));
-            shape_reuse=first_shapes.layout.bytes<=c.diagnostics.workspace_limit &&
-                multiply(stride,sizeof(double))<=c.diagnostics.workspace_limit-first_shapes.layout.bytes;
-        }
-        const auto plan = plan_refit_slice(batch, first, c.diagnostics.workspace_limit,
-            c.host_staging_limit, cache,probability_components,shape_reuse);
-        const i64 tasks = plan.last - first;
-        HostCounts observed_counts(c, multiply(tasks,probability?(shape_reuse?3:2):1));
-        // Host admission may have evicted the optional catalog. Pin only after
-        // that admission, before any grid-table/resident allocation or launch.
-        CUDAProbabilityLease probability_lease(c,probability);
-        const auto probability_view=probability_lease.view();
-        GridLeases cached(c, tasks);
-        const RefitLayout b(tasks, plan.members, plan.points, batch.incumbent != nullptr,
-                            cache,probability,shape_reuse);
-        c.reserve(plan.bytes);
-        if (cache) {
-            for (i64 task = 0; task < tasks; ++task) {
-                const i64 source = first + task;
-                if (!cached.tables.empty() && batch.lower[source] == 0 && batch.upper[source] == 1)
-                    cached.tables[task] = cached.get(batch.regions[source]);
-                observed_counts.values[task] = cached.tables.empty() || !cached.tables[task] ? 0
-                    : reinterpret_cast<i64>(cached.tables[task]->values);
-            }
-            c.upload(c.pointer<i64>(b.grid_tables), observed_counts.values.data(), tasks);
-        }
-        RefitBatch device{tasks, plan.members, plan.points,
-            c.pointer<i64>(b.regions), c.pointer<i64>(b.offsets), c.pointer<i64>(b.rows),
-            c.pointer<i64>(b.grid_offsets), c.pointer<double>(b.grid), c.pointer<double>(b.lower),
-            c.pointer<double>(b.upper), c.pointer<double>(b.xatol),
-            batch.incumbent ? c.pointer<double>(b.incumbent) : nullptr};
-        c.upload(c.pointer<i64>(b.regions), batch.regions + first, tasks);
-        c.upload(c.pointer<i64>(b.offsets), batch.member_offsets + first, add(tasks, 1));
-        c.upload(c.pointer<i64>(b.rows), batch.member_rows + batch.member_offsets[first], plan.members);
-        c.upload(c.pointer<i64>(b.grid_offsets), batch.grid_offsets + first, add(tasks, 1));
-        c.upload(c.pointer<double>(b.grid), batch.grid + batch.grid_offsets[first], plan.points);
-        c.upload(c.pointer<double>(b.lower), batch.lower + first, tasks);
-        c.upload(c.pointer<double>(b.upper), batch.upper + first, tasks);
-        c.upload(c.pointer<double>(b.xatol), batch.xatol + first, tasks);
-        if (batch.incumbent) c.upload(c.pointer<double>(b.incumbent), batch.incumbent + first, tasks);
-        prepare_refit_kernel<<<blocks(tasks), threads, 0, c.stream>>>(c.data, device,
+    i64 probability_components=0;
+    if(c.probability_state) {
+        const auto& state=*static_cast<CUDAProbabilityState*>(c.probability_state);
+        for(const auto& region:state.regions)
+            probability_components=std::max(probability_components,region.components);
+    }
+    const bool probability=probability_components>0;
+    int multiprocessors=0;
+    cuda_check(cudaDeviceGetAttribute(&multiprocessors,cudaDevAttrMultiProcessorCount,c.device),
+               "query refit block concurrency");
+    const auto plan=plan_refit_batch(batch,multiply(std::max(1,multiprocessors),2),probability_components);
+    const i64 tasks = batch.tasks;
+    HostCounts observed_counts(c, multiply(tasks,probability?3:1));
+    CUDAProbabilityLease probability_lease(c,probability);
+    const auto probability_view=probability_lease.view();
+    GridLeases cached(c, tasks);
+    const RefitLayout b(tasks, plan.members, plan.points, batch.incumbent != nullptr,probability);
+    c.reserve(plan.bytes);
+    for (i64 task = 0; task < tasks; ++task) {
+        if (batch.lower[task] == 0 && batch.upper[task] == 1)
+            cached.tables[task] = cached.get(batch.regions[task]);
+        observed_counts.values[task] = !cached.tables[task] ? 0
+            : reinterpret_cast<i64>(cached.tables[task]->values);
+    }
+    c.upload(c.pointer<i64>(b.grid_tables), observed_counts.values.data(), tasks);
+    RefitBatch device{tasks, plan.members, plan.points,
+        c.pointer<i64>(b.regions), c.pointer<i64>(b.offsets), c.pointer<i64>(b.rows),
+        c.pointer<i64>(b.grid_offsets), c.pointer<double>(b.grid), c.pointer<double>(b.lower),
+        c.pointer<double>(b.upper), c.pointer<double>(b.xatol),
+        batch.incumbent ? c.pointer<double>(b.incumbent) : nullptr};
+    c.upload(c.pointer<i64>(b.regions), batch.regions, tasks);
+    c.upload(c.pointer<i64>(b.offsets), batch.member_offsets, add(tasks, 1));
+    c.upload(c.pointer<i64>(b.rows), batch.member_rows + batch.member_offsets[0], plan.members);
+    c.upload(c.pointer<i64>(b.grid_offsets), batch.grid_offsets, add(tasks, 1));
+    c.upload(c.pointer<double>(b.grid), batch.grid + batch.grid_offsets[0], plan.points);
+    c.upload(c.pointer<double>(b.lower), batch.lower, tasks);
+    c.upload(c.pointer<double>(b.upper), batch.upper, tasks);
+    c.upload(c.pointer<double>(b.xatol), batch.xatol, tasks);
+    if (batch.incumbent) c.upload(c.pointer<double>(b.incumbent), batch.incumbent, tasks);
+    prepare_refit_kernel<<<blocks(tasks), threads, 0, c.stream>>>(c.data, device,
+        c.pointer<i64>(b.compacted), c.pointer<i64>(b.counts), c.pointer<RefitResult>(b.results),
+        probability_view,probability?c.pointer<i64>(b.probability_flags):nullptr,
+        probability?c.pointer<i64>(b.shape_counts):nullptr,
+        probability?c.pointer<i64>(b.shape_ids):nullptr,
+        probability?c.pointer<i64>(b.row_shapes):nullptr,
+        probability?c.pointer<i64>(b.shape_hash_keys):nullptr,
+        probability?c.pointer<i64>(b.shape_hash_values):nullptr);
+    c.launched();
+    for (i64 point = 0; point < plan.points;) {
+        const i64 jobs = std::min(plan.wave, plan.points - point);
+        refit_grid_kernel<<<static_cast<unsigned>(jobs), threads, 0, c.stream>>>(c.data, device,
             c.pointer<i64>(b.compacted), c.pointer<i64>(b.counts), c.pointer<RefitResult>(b.results),
-            probability_view,probability?c.pointer<i64>(b.probability_flags):nullptr,
-            shape_reuse?c.pointer<i64>(b.shape_counts):nullptr,
-            shape_reuse?c.pointer<i64>(b.shape_ids):nullptr,
-            shape_reuse?c.pointer<i64>(b.row_shapes):nullptr,
-            shape_reuse?c.pointer<i64>(b.shape_hash_keys):nullptr,
-            shape_reuse?c.pointer<i64>(b.shape_hash_values):nullptr);
-        c.launched();
-        for (i64 point = 0; point < plan.points;) {
-            const i64 jobs = std::min(plan.wave, plan.points - point);
-            refit_grid_kernel<<<static_cast<unsigned>(jobs), threads, 0, c.stream>>>(c.data, device,
-                c.pointer<i64>(b.compacted), c.pointer<i64>(b.counts), c.pointer<RefitResult>(b.results),
-                point, jobs, plan.stride,plan.max_rows,c.pointer<double>(plan.scratch), c.pointer<double>(b.grid_values),
-                cache ? c.pointer<i64>(b.grid_tables) : nullptr,probability_view,
-                probability?c.pointer<i64>(b.probability_flags):nullptr,
-                shape_reuse?c.pointer<i64>(b.shape_counts):nullptr,
-                shape_reuse?c.pointer<i64>(b.shape_ids):nullptr,
-                shape_reuse?c.pointer<i64>(b.row_shapes):nullptr);
-            c.launched(); point += jobs;
+            point, jobs, plan.stride,plan.max_rows,c.pointer<double>(plan.scratch), c.pointer<double>(b.grid_values),
+            c.pointer<i64>(b.grid_tables),probability_view,
+            probability?c.pointer<i64>(b.probability_flags):nullptr,
+            probability?c.pointer<i64>(b.shape_counts):nullptr,
+            probability?c.pointer<i64>(b.shape_ids):nullptr,
+            probability?c.pointer<i64>(b.row_shapes):nullptr);
+        c.launched(); point += jobs;
+    }
+    const unsigned task_blocks = static_cast<unsigned>(std::min<i64>(65535, tasks));
+    finish_refit_kernel<<<task_blocks, threads, 0, c.stream>>>(c.data, device,
+        c.pointer<i64>(b.compacted), c.pointer<i64>(b.counts), c.pointer<double>(plan.scratch),
+        c.pointer<double>(b.grid_values), c.pointer<RefitResult>(b.results),plan.stride,plan.max_rows,
+        probability_view,probability?c.pointer<i64>(b.probability_flags):nullptr,
+        probability?c.pointer<i64>(b.shape_counts):nullptr,
+        probability?c.pointer<i64>(b.shape_ids):nullptr,
+        probability?c.pointer<i64>(b.row_shapes):nullptr);
+    c.launched();
+    c.download(output, c.pointer<RefitResult>(b.results), tasks);
+    c.download(observed_counts.values.data(), c.pointer<i64>(b.counts), tasks);
+    if(probability) c.download(observed_counts.values.data()+tasks,c.pointer<i64>(b.probability_flags),tasks);
+    if(probability) c.download(observed_counts.values.data()+2*tasks,c.pointer<i64>(b.shape_counts),tasks);
+    c.finish();
+    for (i64 task = 0; task < tasks; ++task) {
+        i64 regular_points = 0;
+        if (batch.lower[task] == 0 && batch.upper[task] == 1
+                && output[task].status != static_cast<int>(RefitStatus::InvalidBox)
+                && output[task].status != static_cast<int>(RefitStatus::Unsupported)) {
+            for (i64 point = batch.grid_offsets[task];
+                 point < batch.grid_offsets[task + 1]; ++point)
+                regular_points += regular_grid_index(batch.grid[point]) >= 0;
         }
-        const unsigned task_blocks = static_cast<unsigned>(std::min<i64>(65535, tasks));
-        finish_refit_kernel<<<task_blocks, threads, 0, c.stream>>>(c.data, device,
-            c.pointer<i64>(b.compacted), c.pointer<i64>(b.counts), c.pointer<double>(plan.scratch),
-            c.pointer<double>(b.grid_values), c.pointer<RefitResult>(b.results),plan.stride,plan.max_rows,
-            probability_view,probability?c.pointer<i64>(b.probability_flags):nullptr,
-            shape_reuse?c.pointer<i64>(b.shape_counts):nullptr,
-            shape_reuse?c.pointer<i64>(b.shape_ids):nullptr,
-            shape_reuse?c.pointer<i64>(b.row_shapes):nullptr);
-        c.launched();
-        c.download(output + first, c.pointer<RefitResult>(b.results), tasks);
-        c.download(observed_counts.values.data(), c.pointer<i64>(b.counts), tasks);
-        if(probability) c.download(observed_counts.values.data()+tasks,c.pointer<i64>(b.probability_flags),tasks);
-        if(shape_reuse) c.download(observed_counts.values.data()+2*tasks,c.pointer<i64>(b.shape_counts),tasks);
-        c.finish();
-        for (i64 task = 0; task < tasks; ++task) {
-            i64 regular_points = 0;
-            if (batch.lower[first + task] == 0 && batch.upper[first + task] == 1
-                    && output[first + task].status != static_cast<int>(RefitStatus::InvalidBox)
-                    && output[first + task].status != static_cast<int>(RefitStatus::Unsupported)) {
-                for (i64 point = batch.grid_offsets[first + task];
-                     point < batch.grid_offsets[first + task + 1]; ++point)
-                    regular_points += regular_grid_index(batch.grid[point]) >= 0;
+        const i64 reused_points = cached.tables[task] ? regular_points : 0;
+        const i64 reused = multiply(observed_counts.values[task], reused_points);
+        if (output[task].status == static_cast<int>(RefitStatus::Ok))
+            record_grid_demand(c, batch.regions[task],
+                multiply(observed_counts.values[task], regular_points - reused_points));
+        c.grid_reused_cells = add(c.grid_reused_cells, reused);
+        const i64 logical = multiply(observed_counts.values[task], output[task].evaluations);
+        if(probability && observed_counts.values[tasks+task]) {
+            const auto evaluations=output[task].evaluations-reused_points;
+            const auto components=probability_lease.state->regions[batch.regions[task]].components;
+            ++c.probability_refit_counters[0];
+            c.probability_refit_counters[1]=add(c.probability_refit_counters[1],evaluations);
+            c.probability_refit_counters[2]=add(c.probability_refit_counters[2],multiply(components,evaluations));
+            c.probability_refit_counters[3]=add(c.probability_refit_counters[3],logical-reused);
+            if(observed_counts.values[2*tasks+task]>0) {
+                ++c.probability_shape_refit_counters[0];
+                c.probability_shape_refit_counters[1]=add(c.probability_shape_refit_counters[1],evaluations);
+                c.probability_shape_refit_counters[2]=add(c.probability_shape_refit_counters[2],
+                    multiply(observed_counts.values[2*tasks+task],evaluations));
+                c.probability_shape_refit_counters[3]=add(c.probability_shape_refit_counters[3],logical-reused);
             }
-            const i64 reused_points = !cached.tables.empty() && cached.tables[task] ? regular_points : 0;
-            const i64 reused = multiply(observed_counts.values[task], reused_points);
-            if (output[first + task].status == static_cast<int>(RefitStatus::Ok))
-                record_grid_demand(c, batch.regions[first + task],
-                    multiply(observed_counts.values[task], regular_points - reused_points));
-            c.grid_reused_cells = add(c.grid_reused_cells, reused);
-            const i64 logical = multiply(observed_counts.values[task], output[first + task].evaluations);
-            if(probability && observed_counts.values[tasks+task]) {
-                const auto evaluations=output[first+task].evaluations-reused_points;
-                const auto components=probability_lease.state->regions[batch.regions[first+task]].components;
-                ++c.probability_refit_counters[0];
-                c.probability_refit_counters[1]=add(c.probability_refit_counters[1],evaluations);
-                c.probability_refit_counters[2]=add(c.probability_refit_counters[2],multiply(components,evaluations));
-                c.probability_refit_counters[3]=add(c.probability_refit_counters[3],logical-reused);
-                if(shape_reuse && observed_counts.values[2*tasks+task]>0) {
-                    ++c.probability_shape_refit_counters[0];
-                    c.probability_shape_refit_counters[1]=add(c.probability_shape_refit_counters[1],evaluations);
-                    c.probability_shape_refit_counters[2]=add(c.probability_shape_refit_counters[2],
-                        multiply(observed_counts.values[2*tasks+task],evaluations));
-                    c.probability_shape_refit_counters[3]=add(c.probability_shape_refit_counters[3],logical-reused);
-                }
-            }
-            c.grid_fresh_cells = add(c.grid_fresh_cells, logical - reused);
-            c.grid_direct_cells = add(c.grid_direct_cells, logical - reused);
-            c.diagnostics.cell_evaluations = add(c.diagnostics.cell_evaluations,
-                logical);
         }
-        first = plan.last;
+        c.grid_fresh_cells = add(c.grid_fresh_cells, logical - reused);
+        c.grid_direct_cells = add(c.grid_direct_cells, logical - reused);
+        c.diagnostics.cell_evaluations = add(c.diagnostics.cell_evaluations,
+            logical);
     }
 }

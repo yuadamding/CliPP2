@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from dataclasses import asdict
 from pathlib import Path
 from time import perf_counter
@@ -19,7 +18,6 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None, *, progress_callba
     ledger and candidate bank. Neither API writes these as extra output files.
     An optional progress callback receives detached phase/candidate/batch snapshots;
     schema 2 does not promise an internal optimizer-request event sequence.
-    Verbose mode otherwise prints them to stderr, never into the output folder.
     """
     return _process_tumor(tumor_file, outdir, fit_config,
                           progress_callback=progress_callback, retain_evidence=True)
@@ -32,16 +30,12 @@ def _process_tumor(tumor_file, outdir, fit_config=None, *, progress_callback=Non
     from .io.reporting import ALGORITHM, OUTPUT_SCHEMA_VERSION, check_destination, exclusion_summary, publish
     from ._source import source_fingerprint, git_source_identity
     from .kernel import KERNEL_VERSION, SCORE_DEFINITION
-    from .kernel.policy import resolve_execution_policy
 
     config = resolve_fit_config() if fit_config is None else fit_config
     if type(config) is not FitConfig:
         raise TypeError('fit_config must be a FitConfig')
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError('progress_callback must be callable or None')
-    if progress_callback is None and config.verbose:
-        def progress_callback(record):
-            print(json.dumps(record, allow_nan=False), file=sys.stderr, flush=True)
     started = perf_counter()
     source_root = Path(__file__).resolve().parent
     commit, dirty = git_source_identity(source_root)
@@ -56,28 +50,14 @@ def _process_tumor(tumor_file, outdir, fit_config=None, *, progress_callback=Non
     input_hash = input_fingerprint(path)
     data = load_tumor_txt(path, max_major_cn=config.max_major_cn, initialize=False)
     check_destination(outdir, data.tumor_id)
-    execution_policy = resolve_execution_policy(config, data, source_root, source_hash)
-    model = RegionalModel(data, device=config.device,
-                          grid_cache_bytes=config.grid_cache_mb * 1024**2,
-                          device_cache_bytes=config.device_cache_mb * 1024**2,
-                          workspace_bytes=config.workspace_mb * 1024**2,
-                          native_host_memory_bytes=(None if config.native_host_memory_mb is None
-                                                    else config.native_host_memory_mb * 1024**2),
-                          device_memory_bytes=(None if config.device_memory_mb is None
-                                               else config.device_memory_mb * 1024**2),
-                          cpu_threads=config.cpu_threads, score_capacity=config.max_clusters,
-                          **execution_policy.model_options)
+    model = RegionalModel(data, device=config.device, cpu_threads=config.cpu_threads)
     try:
-        result = (fit_regions(model, config.max_clusters, retain_evidence=retain_evidence,
-                              **execution_policy.search_options)
-                  if progress_callback is None else fit_regions(model, config.max_clusters,
-                      progress_callback=progress_callback, retain_evidence=retain_evidence,
-                      **execution_policy.search_options))
+        result = fit_regions(model, config.max_clusters, progress_callback=progress_callback,
+                             retain_evidence=retain_evidence)
         if input_fingerprint(path) != input_hash:
             raise RuntimeError('Input changed during fitting; no successful publication')
         if source_fingerprint(source_root) != source_hash:
             raise RuntimeError('Python source changed during fitting; no successful publication')
-        execution_policy.verify_attestation(source_root)
         verification_start = perf_counter()
         publication = publish(model, result, outdir, data.tumor_id)
         summary = {
@@ -93,7 +73,6 @@ def _process_tumor(tumor_file, outdir, fit_config=None, *, progress_callback=Non
             'clonal_constraint': False, 'cluster_zero': 'largest_final_ccf_l2_norm',
             'exclusions': exclusion_summary(model), 'diagnostics': result.diagnostics,
             'execution': model.execution_diagnostics(),
-            'execution_policy': execution_policy.record(config, model.backend.policy, model),
             'verification_publication_seconds': perf_counter()-verification_start,
             'elapsed_seconds': perf_counter()-started, 'publication': publication,
             'qualification_scope': 'numerical_fit_not_global_optimality_or_biological_accuracy',

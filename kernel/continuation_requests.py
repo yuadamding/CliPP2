@@ -1,9 +1,9 @@
-"""Optional native continuation owner; not production dispatch yet.
+"""Native continuation owner for batched CUDA capacity search.
 
 One owner services ordered node-term requests for independent capacity states.
 Only the supplied evaluator performs likelihood arithmetic; native workers do
-not fall back to CPU emissions. Worker CPU work is serialized, with explicit
-per-worker stack and state reservations. This module does not import CUDA.
+not fall back to CPU emissions. Worker CPU work is serialized. This module
+does not import CUDA.
 """
 import ctypes as ct
 
@@ -11,7 +11,6 @@ import numpy as np
 
 from .backend import (_ContinuationPolicy, _ContinuationReport, _array, _continuation_diagnostics,
                       NativeExecutionError, native_library)
-from .execution import preflight_host_export
 
 
 class ContinuationCancelled(RuntimeError):
@@ -36,11 +35,9 @@ def _ptr(array):
 def _api():
     library, identity = native_library()
     declarations = {
-        'Memory': ([ct.c_int]*3 + [ct.c_longlong, ct.c_int] +
-                   [ct.POINTER(ct.c_longlong)]*3, ct.c_int),
         'Create': ([ct.c_int]*2 + [ct.c_void_p]*9 + [ct.c_int, ct.c_void_p,
-                   ct.POINTER(_ContinuationPolicy), _Norm, _Scores, ct.c_longlong,
-                   ct.c_longlong, ct.c_int, ct.c_int, ct.POINTER(ct.c_void_p)], ct.c_int),
+                   ct.POINTER(_ContinuationPolicy), _Norm, _Scores,
+                   ct.c_int, ct.c_int, ct.POINTER(ct.c_void_p)], ct.c_int),
         'Poll': ([ct.c_void_p, ct.c_int, ct.c_int, ct.POINTER(_Request)], ct.c_int),
         'Reply': ([ct.c_void_p, ct.c_int, ct.c_uint64] + [ct.c_void_p]*3, ct.c_int),
         'Result': ([ct.c_void_p, ct.c_int] + [ct.c_void_p]*3 +
@@ -63,7 +60,7 @@ def _positive_int(value, name):
 
 
 def continue_requests(model, tree, initial, capacities, lower, upper, policy, missing=0, *,
-                      host_budget_bytes, max_active=8, stack_bytes=1024*1024,
+                      max_active=8,
                       keep_raw_phi=True, evaluate_requests=None, progress_callback=None,
                       cancelled=None, telemetry=None):
     """Run the native controller with caller-owned numerical evaluation.
@@ -74,9 +71,6 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
     A future CUDA batch owner may implement the same protocol. No dispatcher
     selects this experimental path automatically.
 
-    Caller budgets cover native shared/state storage, explicitly reserved
-    pthread stacks and owned request buffers. They do
-    not represent RSS, device allocations or caller-retained result arrays.
     Only one native worker does CPU work at a time; other workers suspend.
     Boundary handshakes are installed only for cancellation; observers receive
     ordered completed-capacity snapshots without an internal event queue.
@@ -88,9 +82,7 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
             raise TypeError(f'{name} must be callable or None')
     if type(keep_raw_phi) is not bool:
         raise TypeError('keep_raw_phi must be a boolean')
-    budget = _positive_int(host_budget_bytes, 'host_budget_bytes')
     max_active = _positive_int(max_active, 'max_active')
-    stack_bytes = _positive_int(stack_bytes, 'stack_bytes')
     capacities = list(capacities)
     if (not capacities or len(capacities) != len(set(capacities)) or any(
             isinstance(k, (bool, np.bool_)) or not isinstance(k, (int, np.integer))
@@ -107,23 +99,12 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
         raise ValueError('Continuation needs a finite feasible initial box')
     library, identity = _api()
     active = min(max_active, len(capacities))
-    shared, state, stack = (ct.c_longlong() for _ in range(3))
 
     def check(code):
         if code:
             raise NativeExecutionError(library.CliPP2ContinuationLastError().decode())
 
-    if library.CliPP2ContinuationOwnerMemory(model.n, model.r, active, stack_bytes,
-            int(keep_raw_phi), ct.byref(shared), ct.byref(state), ct.byref(stack)):
-        raise ValueError('Invalid continuation state/stack reservation')
-    # Owned request coordinates plus reply conversions.
-    request_bytes = 10*model.n*model.r*8
     boundary_requests = cancelled is not None
-    per_state = state.value+stack.value+request_bytes
-    active = min(active, max(0, (budget-shared.value)//per_state))
-    if active < 1:
-        raise NativeExecutionError('Continuation state, stack and request buffers exceed host budget')
-    preflight_host_export(len(capacities)*(model.n*model.r*8*int(keep_raw_phi)+model.n*16))
     if cancelled is not None and cancelled():
         raise ContinuationCancelled('Continuation cancelled before numerical evaluation')
     terms = tuple(_array(value) for value in model.node_terms(initial))
@@ -159,11 +140,7 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
 
     stats = {} if telemetry is None else telemetry
     stats.update(native_continuation_build_id=identity, native_continuation_cpu_workers=1,
-                 native_continuation_active_limit=active, native_continuation_shared_bytes=shared.value,
-                 native_continuation_state_bytes=state.value, native_continuation_stack_bytes=stack.value,
-                 native_continuation_request_bytes=request_bytes,
-                 native_continuation_progress_bytes=0,
-                 native_continuation_reserved_bytes=shared.value+active*per_state,
+                 native_continuation_active_limit=active,
                  native_continuation_owner_submissions=0, native_continuation_terms_requests=1,
                  native_continuation_batch_max=0, native_continuation_initial_evaluations=1,
                  native_continuation_boundary_requests=boundary_requests,
@@ -175,11 +152,10 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
         next_progress = 0
         completed = set()
         results = [None]*len(chosen)
-        native_budget = budget-len(chosen)*request_bytes
         try:
             check(library.CliPP2ContinuationOwnerCreate(model.n, model.r, _ptr(edges), _ptr(canonical),
                 _ptr(initial), *map(_ptr, terms), _ptr(lower), _ptr(upper), _ptr(gaps), len(chosen),
-                _ptr(chosen), ct.byref(native_policy), norm, scores, native_budget, stack_bytes,
+                _ptr(chosen), ct.byref(native_policy), norm, scores,
                 int(keep_raw_phi), int(boundary_requests), ct.byref(owner)))
             while len(completed) < len(chosen):
                 if reduction_errors:

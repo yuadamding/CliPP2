@@ -1,7 +1,7 @@
 """Private compact weight completions for ordered coarsening search.
 
 Physical preparation may advance lower caches, never candidate publication or
-completed-weight LRU state. Completed records retain no prepared partitions,
+completed-weight cache state. Completed records retain no prepared partitions,
 generators, device leases or exception frames. Every logical turn revalidates
 the ordinary bank, conditional preparation and exact weight/cache identity.
 """
@@ -9,7 +9,6 @@ from collections import deque
 from collections.abc import Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
-import sys
 from time import perf_counter
 
 import numpy as np
@@ -20,20 +19,20 @@ from .scoring import WeightConvergenceError, completed_weight
 _KNOWN_INELIGIBLE = object()
 
 
-def _retained_size(value):
-    """Conservatively charge only compact immutable, pointer-free payloads."""
+def _validate_completion(value):
+    """Retained completions may contain data, never live execution owners."""
     if isinstance(value, Mapping):
-        return 256+64*len(value)+sum(_retained_size(key)+_retained_size(item)
-                                    for key, item in value.items())
-    if isinstance(value, tuple):
-        return sys.getsizeof(value)+sum(map(_retained_size, value))
-    if isinstance(value, np.ndarray):
+        for key, item in value.items():
+            _validate_completion(key)
+            _validate_completion(item)
+    elif isinstance(value, tuple):
+        for item in value:
+            _validate_completion(item)
+    elif isinstance(value, np.ndarray):
         if value.ndim > 1 or value.dtype.hasobject:
             raise TypeError('Speculative completion arrays must be compact numeric vectors')
-        return 256+value.nbytes
-    if value is None or isinstance(value, (str, bytes, bool, int, float, np.generic)):
-        return 64+sys.getsizeof(value)
-    raise TypeError('Speculative completions may not retain live or opaque objects')
+    elif value is not None and not isinstance(value, (str, bytes, bool, int, float, np.generic)):
+        raise TypeError('Speculative completions may not retain live or opaque objects')
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +40,6 @@ class _Completion:
     key: tuple
     result: object
     error_message: str | None
-    size: int
 
 
 @dataclass
@@ -75,21 +73,14 @@ class CoarseningBatch:
         if type(max_active) is not int or max_active < 1:
             raise ValueError('max_active must be a positive integer')
         self.bank, self.model = bank, bank.model
-        minimum = self.model.refit_batch_reservation(1)
         self.subsets = iter(subsets)
-        self.limit = min(max_active, max(1, bank.weight_batch_state_bytes//minimum))
+        self.limit = max_active
         self.queue, self.current = deque(), None
         self.exhausted = False
-        self.private_bytes = 0
-        self._peak('private_limit_bytes', bank.weight_batch_state_bytes)
 
     def _count(self, name, amount=1):
         key = 'coarsening_speculation_'+name
         self.model.telemetry[key] = self.model.telemetry.get(key, 0)+amount
-
-    def _peak(self, name, amount):
-        key = 'coarsening_speculation_'+name
-        self.model.telemetry[key] = max(self.model.telemetry.get(key, 0), amount)
 
     def _known(self, cuts):
         membership = ('tree', cuts)
@@ -104,18 +95,6 @@ class CoarseningBatch:
                 self.bank._attempts.get((membership, None, self.bank.numerical_policy),
                                        _KNOWN_INELIGIBLE) is None)
 
-    def _make_room(self, required):
-        """Evict farthest future completions, never their logical cut descriptors."""
-        budget = self.bank.weight_batch_state_bytes
-        for item in reversed(self.queue):
-            if self.private_bytes+required <= budget:
-                break
-            if isinstance(item[1], _Completion):
-                self.private_bytes -= item[1].size
-                item[1] = None
-                self._count('budget_evictions')
-        return self.private_bytes+required <= budget
-
     def _detach(self, ticket):
         outcome = ticket.outcome
         if outcome.operation == 'error':
@@ -126,9 +105,8 @@ class CoarseningBatch:
             result, error = _freeze(outcome.result), None
         else:
             raise RuntimeError('Speculative weight solver returned a nonterminal outcome')
-        key = ticket.key
-        size = 512+_retained_size((key, result, error))
-        return _Completion(key, result, error, size)
+        _validate_completion((ticket.key, result, error))
+        return _Completion(ticket.key, result, error)
 
     def _fill(self):
         # Consume every computed completion before refilling. Unprepared cut
@@ -143,8 +121,7 @@ class CoarseningBatch:
                 self.queue.append([tuple(next(self.subsets)), None])
             except StopIteration:
                 self.exhausted = True
-        pending, reserved = [], 0
-        budget = self.bank.weight_batch_state_bytes
+        pending = []
         started = perf_counter()
         try:
             with ExitStack() as leases:
@@ -156,22 +133,9 @@ class CoarseningBatch:
                             self._count('known_ineligible_crossings')
                             continue
                         break
-                    q = len(cuts)+1
-                    charge = self.model.refit_batch_reservation(q)
-                    if charge > budget:
-                        self._count('serial_budget_fallbacks')
-                        break
-                    admission = self.model._weight_admission(q, [len(ticket.request[1]) for _, ticket in pending
-                                                                if ticket.request is not None])
-                    column_bytes = 8*self.model.n*q+8*q*(self.model.r+1)+4
-                    if reserved+charge > budget or (pending and (
-                            admission['device_required']+column_bytes > admission['device_available'] or
-                            admission['host_required']+64*q > admission['host_available'])):
-                        break
                     partition = self.bank.prepare(cuts)
                     ticket = _Ticket(partition)
                     pending.append((item, ticket))
-                    reserved += charge
                     ticket.steps = self.model._refit_steps(partition.labels, partition.groups, None,
                         partition.coordinate_fits, partition.columns, partition.membership,
                         record_weight_time=False)
@@ -195,7 +159,7 @@ class CoarseningBatch:
                     try:
                         outcomes = self.model._solve_weight_problems([ticket.problem for ticket in active],
                             [ticket.request[1] for ticket in active], max_active=self.limit,
-                            state_budget_bytes=budget, telemetry=physical)
+                            telemetry=physical)
                     finally:
                         elapsed = perf_counter()-before
                         self.model.telemetry['weight_seconds'] += elapsed
@@ -216,13 +180,8 @@ class CoarseningBatch:
                 completion = self._detach(ticket) if ticket.outcome is not None else None
                 ticket.close()
                 if completion is not None:
-                    if self.private_bytes+completion.size <= budget:
-                        item[1] = completion
-                        self.private_bytes += completion.size
-                        self._count('retained_completions')
-                        self._peak('private_bytes_peak', self.private_bytes)
-                    else:
-                        self._count('budget_evictions')
+                    item[1] = completion
+                    self._count('retained_completions')
         except BaseException:
             self.close()
             raise
@@ -244,8 +203,6 @@ class CoarseningBatch:
         if not self.queue:
             raise StopIteration
         self.current = self.queue.popleft()
-        if isinstance(self.current[1], _Completion):
-            self.private_bytes -= self.current[1].size
         return self.current[0]
 
     def _refit_current(self, cuts, completion, provenance):
@@ -277,7 +234,7 @@ class CoarseningBatch:
                 if completion.error_message is not None:
                     fitted = model._finish_refit_steps(steps, error=WeightConvergenceError(completion.error_message))
                     return bank._commit(partition, None, provenance, fitted)
-                mixture = model._cache_weight_result(key, columns, counts, completion.result)
+                mixture = model._cache_weight_result(key, completion.result)
             else:
                 if completion is not None:
                     self._count('stale_key_discards')
@@ -317,13 +274,6 @@ class CoarseningBatch:
         if found:
             self._count('discarded_bank_hit')
         else:
-            charge = self.model.refit_batch_reservation(len(cuts)+1)
-            if not self._make_room(charge+completion.size):
-                # Drop this reference before entering the ordinary refit; an
-                # outer frame must not invisibly keep an evicted record live.
-                completion = None
-                self._count('budget_evictions')
-                self._make_room(charge)
             candidate = self._refit_current(cuts, completion, provenance)
             self._count('published')
         if candidate is not None:
@@ -336,7 +286,6 @@ class CoarseningBatch:
         """Barriers release no resources: only exact compact completions remain."""
         if reason == 'close':
             self.queue.clear()
-            self.private_bytes = 0
         else:
             self._count('retained_'+reason, sum(isinstance(item[1], _Completion) for item in self.queue))
 

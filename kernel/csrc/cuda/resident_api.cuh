@@ -1,4 +1,4 @@
-// Explicit experimental complete-weight ABI; production dispatch stays off.
+// Complete device-resident weight-fitting ABI.
 // Include at global scope after scoring.cuh. Uses ordinary fixed CUDA graphs,
 // not conditional nodes. There is no host numerical or CPU fallback.
 #pragma once
@@ -9,11 +9,11 @@ namespace {
 struct ResidentWeightPlan {
     Layout layout;
     i64 descriptor_offset,state_offset,initial_offset,flags_offset,arena_start;
-    i64 total_q=0,max_q=0,host_charge,graph_charge;
+    i64 total_q=0,max_q=0,host_charge;
     bool graph;
     template<class Sizes>
     ResidentWeightPlan(i64 n,i64 count,Sizes size,bool force_graph=false):graph(force_graph||n>small_mixture_rows) {
-        if(count<1)throw std::domain_error("Resident admission requires a nonempty batch");
+        if(count<1)throw std::domain_error("Resident execution requires a nonempty batch");
         if(graph&&count>65535)throw std::domain_error("Resident batch exceeds CUDA grid.y capacity");
         for(i64 index=0;index<count;++index) {
             const i64 q=size(index);
@@ -23,10 +23,8 @@ struct ResidentWeightPlan {
             max_q=std::max(max_q,q);total_q=add(total_q,q);
         }
         if(graph&&count>65535)throw std::domain_error("Resident batch exceeds CUDA grid.y capacity");
-        // Native vector owners/capacities and fixed frame overhead are charged
-        // conservatively; graph internals are a separate labelled reservation.
+        // Track native vector storage separately from device allocations.
         host_charge=add(2048,multiply(count,add(sizeof(ResidentWeightItem)+sizeof(ResidentWeightState),112)));
-        graph_charge=graph?add(65536,multiply(resident_chunk_nodes,4096)):0;
         descriptor_offset=layout.take<ResidentWeightItem>(count);
         state_offset=layout.take<ResidentWeightState>(count);
         initial_offset=layout.take<double>(total_q);
@@ -56,7 +54,7 @@ struct ResidentGraphOwner {
 struct ResidentExecutionWorkspace {
     Context& context;
     ResidentWeightPlan plan;
-    i64 n,count,host_charge=0,graph_reservation=0,optional_charge=0,retention_charge=0;
+    i64 n,count,host_charge=0,optional_charge=0,retention_charge=0;
     std::vector<i64> sizes;
     std::vector<ResidentWeightItem> items;
     std::vector<ResidentWeightState> completed;
@@ -70,31 +68,13 @@ struct ResidentExecutionWorkspace {
         items(static_cast<std::size_t>(tasks)),completed(static_cast<std::size_t>(tasks)),
         terminal_flags(static_cast<std::size_t>(plan.graph?tasks:0)),allocation(c,plan.layout.bytes) {
         for(i64 index=0;index<count;++index)sizes[index]=size(index);
-        // Opaque graph storage is a labelled admission reservation, not an
-        // assertion about physical CUDA allocation size. Charge it in both
-        // native host and tracked device budgets; qualification measures peaks.
-        while(plan.graph_charge>c.resident_limit-c.resident_bytes &&
-              (evict_optional_scoring_cache(c)||evict_optional_grid_cache(c)||evict_optional_probability_cache(c))) {}
-        cuda_check(c.resident_release_error,"release storage before resident graph reservation");
-        require(plan.graph_charge<=c.resident_limit-c.resident_bytes,
-                "Resident graph reservation exceeds device budget");
-        graph_reservation=plan.graph_charge;
-        c.resident_bytes=add(c.resident_bytes,graph_reservation);
-        c.resident_peak_bytes=std::max(c.resident_peak_bytes,c.resident_bytes);
-        c.diagnostics.cache_bytes=c.resident_bytes;
     }
     ~ResidentExecutionWorkspace() {
-        bool released=true;
         try { graph.close(); }
         catch(...) {
-            released=false;
             if(context.resident_release_error==cudaSuccess)context.resident_release_error=cudaErrorUnknown;
         }
         // The graph is destroyed before any referenced arena is freed.
-        if(released) {
-            context.resident_bytes-=graph_reservation;
-            context.diagnostics.cache_bytes=context.resident_bytes;
-        }
         if(host_charge)static_cast<ScoringState*>(context.scoring_state)->host_bytes-=host_charge;
     }
     template<class Sizes>
@@ -133,10 +113,10 @@ struct ResidentExecutionLease {
                 if(plan.graph)++state.resident_execution_counters[3];
             } else {
                 release_resident_execution_cache(c,state);
-                const i64 host_bytes=add(plan.host_charge,plan.graph_charge);
+                const i64 host_bytes=plan.host_charge;
                 ScoringHostScope host(c,host_bytes);
                 workspace=std::make_shared<ResidentExecutionWorkspace>(c,plan,c.data.mutations,count,size);
-                workspace->retention_charge=add(add(workspace->allocation.bytes,workspace->graph_reservation),host_bytes);
+                workspace->retention_charge=add(workspace->allocation.bytes,host_bytes);
                 const i64 persistent=add(state.host_bytes,host_bytes);
                 workspace->host_charge=host_bytes;
                 state.host_bytes=persistent;
@@ -151,11 +131,9 @@ struct ResidentExecutionLease {
     ~ResidentExecutionLease() noexcept {
         auto& state=*static_cast<ScoringState*>(context.scoring_state);
         if(!complete)++state.resident_execution_counters[6];
-        // Completed scratch has lower retention priority than computed data.
-        // Do not evict columns or grids merely to preserve graph setup work.
         const i64 charge=workspace->retention_charge;
-        if(complete && charge<=context.optional_cache_limit-context.optional_cache_bytes &&
-                context.retain_optional(charge)) {
+        if(complete) {
+            context.optional_cache_bytes=add(context.optional_cache_bytes,charge);
             workspace->optional_charge=charge;
             state.resident_execution_cache=std::move(workspace);
         }
@@ -164,7 +142,7 @@ struct ResidentExecutionLease {
     }
 };
 
-int experimental_resident_weights(void* value,i64 count,const i64* handles,
+int resident_weights(void* value,i64 count,const i64* handles,
         const double* starts,double* weights,double* likelihood,double* optimality,
         double* active,int* statuses,i64* counters,bool force_graph) {
     return scoring_guarded([&] {
@@ -281,48 +259,29 @@ int experimental_resident_weights(void* value,i64 count,const i64* handles,
 
 } // namespace
 
-// Read-only extra-storage query for the auto route. Existing mixture leases,
-// columns and caller-owned exports are separate. No cache is evicted or created.
-extern "C" int CliPP2ExperimentalResidentAdmission(void* value,i64 count,const i64* sizes,i64* output) {
-    return scoring_guarded([&] {
-        auto& c=context(value);
-        if(!sizes||!output)throw std::domain_error("Missing resident admission fields");
-        const ResidentWeightPlan plan(c.data.mutations,count,[&](i64 index) { return sizes[index]; });
-        output[0]=add(plan.layout.bytes,plan.graph_charge);
-        // This query is read-only. The execution lease will either reuse or
-        // discard its own idle workspace before requesting replacement storage.
-        const auto cached=c.scoring_state?static_cast<ScoringState*>(c.scoring_state)->resident_execution_cache:nullptr;
-        output[1]=add(c.resident_limit-c.resident_bytes,cached?add(cached->allocation.bytes,cached->graph_reservation):0);
-        output[2]=add(plan.host_charge,plan.graph_charge);
-        output[3]=c.host_staging_limit-scoring_host_bytes(c)-c.grid_cache_host_bytes
-                  -c.probability_host_bytes-c.diagnostics.staging_bytes+(cached?cached->host_charge:0);
-    });
-}
-
 extern "C" int CliPP2ResidentExecutionDiagnostics(void* value,i64* output) {
     return scoring_guarded([&] {
         auto& c=context(value);
         if(!output)throw std::domain_error("Missing resident execution diagnostic fields");
-        if(!c.scoring_state) { std::fill(output,output+13,0);return; }
+        if(!c.scoring_state) { std::fill(output,output+12,0);return; }
         const auto& state=*static_cast<ScoringState*>(c.scoring_state);
         std::copy(state.resident_execution_counters,state.resident_execution_counters+9,output);
         const auto& cached=state.resident_execution_cache;
         output[9]=cached?cached->allocation.bytes:0;
         output[10]=cached?cached->host_charge:0;
-        output[11]=cached?cached->graph_reservation:0;
-        output[12]=state.resident_execution_busy?1:0;
+        output[11]=state.resident_execution_busy?1:0;
     });
 }
 
-extern "C" int CliPP2ExperimentalResidentWeights(void* value,i64 count,const i64* handles,
+extern "C" int CliPP2ResidentWeights(void* value,i64 count,const i64* handles,
         const double* starts,double* weights,double* likelihood,double* optimality,
         double* active,int* statuses,i64* counters) {
-    return experimental_resident_weights(value,count,handles,starts,weights,likelihood,optimality,active,statuses,counters,false);
+    return resident_weights(value,count,handles,starts,weights,likelihood,optimality,active,statuses,counters,false);
 }
 // Private qualification hook: compare schedules on identical small inputs.
 // Ordinary fitting has one automatic dimension-based schedule and no override.
 extern "C" int CliPP2QualifyResidentGraphWeights(void* value,i64 count,const i64* handles,
         const double* starts,double* weights,double* likelihood,double* optimality,
         double* active,int* statuses,i64* counters) {
-    return experimental_resident_weights(value,count,handles,starts,weights,likelihood,optimality,active,statuses,counters,true);
+    return resident_weights(value,count,handles,starts,weights,likelihood,optimality,active,statuses,counters,true);
 }

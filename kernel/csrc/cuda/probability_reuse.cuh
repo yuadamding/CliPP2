@@ -138,15 +138,14 @@ struct CUDAProbabilityLease {
         }
     }
 };
-bool evict_optional_probability_cache(Context& c) {
+void release_probability_cache(Context& c) {
     auto* state=static_cast<CUDAProbabilityState*>(c.probability_state);
-    if(!state || state->live) return false;
+    if(!state || state->live) return;
     c.drop_optional(state->charge); c.probability_host_bytes-=state->host_bytes;
     delete state; c.probability_state=nullptr; ++c.probability_counters[6];
-    return true;
 }
 void destroy_probability_cache(Context& c) noexcept {
-    evict_optional_probability_cache(c);
+    release_probability_cache(c);
 }
 void configure_probability_reuse(Context& c,const ObservationSoA& input,bool enabled) {
     require(!c.probability_configured && c.diagnostics.calls==0,
@@ -154,28 +153,16 @@ void configure_probability_reuse(Context& c,const ObservationSoA& input,bool ena
     require(input.mutations==c.data.mutations && input.regions==c.data.regions,
             "CUDA probability metadata dimensions differ from prepared observations");
     c.probability_configured=true;
-    const auto cells=multiply(input.mutations,input.regions);
-    // Includes map nodes, maximum vector capacities and transfer-time overlap.
-    // No optional metadata construction is attempted outside the host budget.
-    const auto build_charge=add(1024,add(multiply(cells,512),
-        multiply(input.regions,sizeof(CUDAProbabilityRegion))));
-    if(!enabled || !c.optional_cache_limit || build_charge>c.host_staging_limit
-            -c.diagnostics.staging_bytes-c.grid_cache_host_bytes-scoring_host_bytes(c)) {
+    if(!enabled) {
         ++c.probability_counters[7]; return;
     }
-    struct BuildScope {
-        Context& owner; i64 bytes;
-        BuildScope(Context& c,i64 charge):owner(c),bytes(charge) {
-            owner.diagnostics.staging_bytes+=bytes;
-        }
-        ~BuildScope() { owner.diagnostics.staging_bytes-=bytes; }
-    } build_scope(c,build_charge);
+    const auto cells=multiply(input.mutations,input.regions);
     CUDAProbabilityCatalog catalog(input);
     if(!catalog.valid) { ++c.probability_counters[7]; return; }
     bool useful=false;
     for(i64 region=0;region<input.regions;++region) {
         const auto& p=catalog.regions[region];
-        if(p.components>c.diagnostics.workspace_limit/16 || p.shape_components>INT64_MAX/4) {
+        if(p.shape_components>INT64_MAX/4) {
             ++c.probability_counters[7]; return;
         }
         i64 direct=0;
@@ -195,11 +182,6 @@ void configure_probability_reuse(Context& c,const ObservationSoA& input,bool ena
         add(multiply(catalog.regions.capacity(),sizeof(CUDAProbabilityRegion)),
             multiply(catalog.supports.capacity(),sizeof(i64))));
     const auto charge=add(host,layout.bytes);
-    if(charge>c.optional_cache_limit-c.optional_cache_bytes ||
-            layout.bytes>c.resident_limit-c.resident_bytes ||
-            host>c.host_staging_limit-c.grid_cache_host_bytes-scoring_host_bytes(c)) {
-        ++c.probability_counters[7]; return;
-    }
     auto state=std::make_unique<CUDAProbabilityState>(c);
     state->regions=std::move(catalog.regions); state->supports=std::move(catalog.supports);
     state->device_bytes=layout.bytes; state->host_bytes=host; state->charge=charge;
@@ -321,7 +303,6 @@ bool probability_grid(Context& c,i64 region,i64 row_count,const i64* rows,
         dp=layout.take<double>(components), dq=layout.take<double>(components),
         dl=layout.take<double>(shapes), ds=layout.take<std::uint8_t>(shapes),
         out=layout.take<double>(count), os=layout.take<std::uint8_t>(count);
-    if(layout.bytes>c.diagnostics.workspace_limit) return false;
     CUDAProbabilityLease lease(c);
     try {
         c.reserve(layout.bytes); c.upload(c.pointer<i64>(dr),rows,row_count);

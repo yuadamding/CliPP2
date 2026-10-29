@@ -40,7 +40,6 @@ version = { attr = "CliPP2._version.__version__" }
 [tool.setuptools.package-data]
 CliPP2 = [
     "_build_source.json",
-    "_gpu_policy.json",
     "kernel/csrc/*.cpp",
     "kernel/csrc/*.h",
     "kernel/csrc/common/*.h",

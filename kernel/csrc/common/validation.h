@@ -18,9 +18,8 @@ inline std::int64_t checked_product(std::int64_t a, std::int64_t b,
             "Backend array byte count overflow");
     return count;
 }
-inline std::int64_t validate_observations(const ObservationSoA& input, std::int64_t budget) {
+inline std::int64_t validate_observations(const ObservationSoA& input) {
     require(input.mutations > 0 && input.regions > 0, "Model dimensions must be positive");
-    require(budget >= 0, "Workspace budget must be nonnegative");
     const auto cells = checked_product(input.mutations, input.regions);
     require(input.alt && input.ref && input.scaling && input.log_constant &&
             input.lower && input.upper && input.support && input.flags, "Null model field");

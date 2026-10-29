@@ -1,7 +1,6 @@
 """Shared registry of compact memberships, refit attempts and immutable states."""
 
 from dataclasses import dataclass, field
-from collections import OrderedDict
 from time import perf_counter
 from types import MappingProxyType
 
@@ -82,12 +81,9 @@ class CandidateBank:
     normalize_provenance = staticmethod(_plain)
 
     def __init__(self, model, tree, *, progress=None, request_progress=None,
-                 weight_batch_size=1, weight_batch_state_bytes=8*1024**2,
-                 device_proposals=False, retain_evidence=True):
+                 weight_batch_size=1, device_proposals=False, retain_evidence=True):
         if type(weight_batch_size) is not int or weight_batch_size < 1:
             raise ValueError("weight_batch_size must be a positive integer")
-        if type(weight_batch_state_bytes) is not int or weight_batch_state_bytes < 0:
-            raise ValueError("weight_batch_state_bytes must be a nonnegative integer")
         if type(device_proposals) is not bool:
             raise TypeError("device_proposals must be a boolean")
         if type(retain_evidence) is not bool:
@@ -105,7 +101,6 @@ class CandidateBank:
         self.refit_seconds = 0.0
         self._tree_identity = tree.identity
         self.weight_batch_size = weight_batch_size
-        self.weight_batch_state_bytes = weight_batch_state_bytes
         self.device_proposals = device_proposals
 
     def prepare(self, cuts, labels=None, *, parent=None, fitted=None, columns=None):
@@ -319,10 +314,7 @@ class CandidateBank:
         if not enabled:
             return [serial(item) for item in requests]
         results, pending, memberships = [], [], set()
-        reserved = 0
-
         def flush():
-            nonlocal reserved
             if not pending:
                 return
             started = perf_counter()
@@ -352,13 +344,11 @@ class CandidateBank:
                      lambda event, index=index: observe(index, event))
                     for index, (partition, centers, _, _) in enumerate(pending)]
             try:
-                model.refit_prepared_batch(work, max_active=self.weight_batch_size,
-                    state_budget_bytes=self.weight_batch_state_bytes, on_result=commit)
+                model.refit_prepared_batch(work, max_active=self.weight_batch_size, on_result=commit)
             finally:
                 self.refit_seconds += perf_counter()-started
             pending.clear()
             memberships.clear()
-            reserved = 0
 
         for output_index, item in enumerate(requests):
             results.append(None)
@@ -374,19 +364,14 @@ class CandidateBank:
                     raise ValueError("Candidate labels and frozen-tree cuts disagree")
             membership = ("tree", cuts) if cuts is not None else ("general", labels.tobytes())
             attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
-            charge = model.refit_batch_reservation(int(labels.max())+1)
             if pending and (membership in memberships or len(pending) >= self.weight_batch_size
-                            or reserved+charge > self.weight_batch_state_bytes
                             or membership in self._structural or attempt in self._attempts):
                 flush()
             if membership in self._structural or attempt in self._attempts:
                 results[output_index] = serial(item)
                 continue
-            if charge > self.weight_batch_state_bytes:
-                raise MemoryError("One prepared candidate exceeds the live-state budget")
             pending.append((self.prepare(cuts, labels, parent=parent), centers, _plain(provenance), output_index))
             memberships.add(membership)
-            reserved += charge
         flush()
         return results
 
@@ -547,24 +532,17 @@ def replay_candidate_evidence(evidence):
     if tree.identity != record["identity"]:
         raise ValueError("Candidate evidence tree identity mismatch")
     candidates = []
-    # Only explicit decoding expands tree memberships. Bound repeated expansion
-    # to the existing eight-MiB replay-local cache.
-    partitions, partition_bytes = OrderedDict(), 0
+    # Only explicit decoding expands tree memberships; reuse them within replay.
+    partitions = {}
     for index, item in enumerate(evidence["states"]):
         membership = _evidence_membership(tree, item)
         if membership.cuts is None:
             labels = membership.labels
         elif membership.cuts in partitions:
-            partitions.move_to_end(membership.cuts)
             labels = partitions[membership.cuts]
         else:
             labels = partition_from_cuts(tree, membership.cuts)
-            if labels.nbytes <= 8*1024**2:
-                while partition_bytes+labels.nbytes > 8*1024**2:
-                    _, removed = partitions.popitem(last=False)
-                    partition_bytes -= removed.nbytes
-                partitions[membership.cuts] = labels
-                partition_bytes += labels.nbytes
+            partitions[membership.cuts] = labels
         centers = np.asarray(item["centers_ccf"], dtype=float)
         if centers.ndim != 2 or not all(centers.shape):
             raise ValueError("Candidate evidence needs nonempty q-by-R centers")

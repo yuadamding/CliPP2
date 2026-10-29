@@ -40,8 +40,7 @@ def _spring_gradient(x, edges, penalty):
     return result
 
 
-def boxed_forest_quadratic(curvature, rhs, edges, penalty, lower, upper, *, native_host_memory_bytes=None,
-                           prepared=None):
+def boxed_forest_quadratic(curvature, rhs, edges, penalty, lower, upper, *, prepared=None):
     """Solve positive diagonal plus forest Laplacian box QPs by active sets.
 
     Return (X, diagnostics). ``solved`` requires an independently reconstructed
@@ -78,7 +77,6 @@ def boxed_forest_quadratic(curvature, rhs, edges, penalty, lower, upper, *, nati
             raise ValueError("Quadratic graph must be a forest")
         roots[c] = a
     result, sweeps, budget_hits = forest_quadratic(h, b, edges, penalty, lo, hi,
-                                                native_host_memory_bytes=native_host_memory_bytes,
                                                 prepared=prepared)
     extended = result.astype(np.longdouble)
     gradient = h.astype(np.longdouble) * extended - b
@@ -209,17 +207,12 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
                 or "node_terms" in vars(model)):
             raise ValueError("Native CUDA capacity batching requires the built-in regional model")
         from .continuation_requests import continue_requests
-        from .backend import NativeExecutionError
-        available = model.backend.native_host_memory_bytes-model.backend.native_host_bytes
-        if available <= 0:
-            raise NativeExecutionError("No remaining native host bytes for CUDA continuation")
         execution = {"continuation": "native_owner_cuda_emissions", "workers": 1,
-                     "capacities": len(requested), "cpu_thread_budget": 1,
-                     "host_array_results_retained": True,
-                     "native_host_available_for_continuation": available}
+                     "capacities": len(requested), "cpu_threads": 1,
+                     "host_array_results_retained": True}
         candidates = continue_requests(model, tree, np.clip(pilot, lower, upper),
             requested, lower, upper, policy, missing_initializations,
-            host_budget_bytes=available, max_active=native_batch_size,
+            max_active=native_batch_size,
             keep_raw_phi=keep_raw_phi, progress_callback=progress_callback,
             telemetry=execution)
         model._continuation_execution = execution
@@ -234,9 +227,7 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
             progress_callback({"operation": "continuation", "boundary": "batch_complete",
                                "capacity_count": len(requested), "completed_capacities": len(requested)})
         return candidates
-    backend = getattr(model, "backend", None)
-    with PreparedForest(model.n, model.r, native_host_memory_bytes=(
-            None if backend is None else backend.native_host_memory_bytes)) as prepared:
+    with PreparedForest(model.n, model.r) as prepared:
         return _generate_host_candidates(model, tree, pilot, requested, lower, upper, policy,
                                          missing_initializations, keep_raw_phi, prepared, progress_callback)
 
@@ -244,9 +235,6 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
 def _generate_host_candidates(model, tree, pilot, requested, lower, upper, policy,
                               missing_initializations, keep_raw_phi, prepared, progress_callback=None):
     candidates = []
-    if keep_raw_phi:
-        from .execution import preflight_host_export
-        preflight_host_export(len(requested)*model.n*model.r*8)
     # All capacities start at the same clipped pilot. Reuse only the built-in
     # CUDA model's pure evaluation; scientific/test model overrides retain their
     # original call sequence. Each capacity owns detached working arrays.
@@ -289,16 +277,8 @@ def _generate_host_candidates(model, tree, pilot, requested, lower, upper, polic
                 if stationarity <= policy.stationarity_tolerance:
                     break
                 h = np.maximum(curvature, 1e-8)
-                backend = getattr(model, "backend", None)
-                native_budget = None if backend is None else backend.native_host_memory_bytes-backend.native_host_bytes
-                if native_budget is not None and native_budget < prepared.required(model.n, len(forest)):
-                    backend.release_optional_cache()
-                    native_budget = backend.native_host_memory_bytes-backend.native_host_bytes
-                if native_budget is not None and native_budget <= 0:
-                    from .backend import NativeExecutionError
-                    raise NativeExecutionError("No remaining native host bytes for the forest solve")
                 qp, audit = boxed_forest_quadratic(h, h * x - gradient, forest, rho, lower, upper,
-                                                 native_host_memory_bytes=native_budget, prepared=prepared)
+                                                 prepared=prepared)
                 qp_unqualified += not audit["solved"]
                 degree = np.bincount(forest.ravel(), minlength=tree.n)[:, None]
                 old_objective = float(np.sum(values) + 0.5 * rho * np.sum(jumps * jumps))

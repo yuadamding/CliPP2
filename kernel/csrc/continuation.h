@@ -29,24 +29,18 @@ using CliPP2Norm = double (*)(const double*, long long);
 using CliPP2CutScores = int (*)(const long double*, long long, int, long double*);
 extern "C" {
 const char* CliPP2ContinuationLastError();
-// Conservative requested vector-capacity bytes, excluding caller buffers,
-// allocator bookkeeping and thread stacks. Uses this platform's type sizes.
-int CliPP2ContinuationMemory(int n,int regions,int workers,int tasks,
-    long long* shared,long long* state,long long* per_thread);
 int CliPP2ContinueCPU(const clipp2::ObservationSoA*, const int* edges,
     const int* canonical_order, const double* initial, const double* lower,
     const double* upper, int tasks, const int* capacities,
     const CliPP2ContinuationPolicy*, const double* gaps, CliPP2Norm norm, CliPP2CutScores scores,
-    int workers, long long workspace_bytes, long long host_budget_bytes,
+    int workers,
     int output_flags, double* coordinates, int* labels,
     unsigned char* cuts, CliPP2ContinuationReport* reports, int* actual_workers);
-int CliPP2ContinuationOwnerMemory(int n,int regions,int tasks,long long stack_bytes,
-    int output_flags,long long* shared,long long* state,long long* stack);
 int CliPP2ContinuationOwnerCreate(int n,int regions,const int* edges,const int* canonical,
     const double* initial,const double* values,const double* gradient,const double* curvature,
     const double* lower,const double* upper,const double* gaps,int tasks,const int* capacities,
-    const CliPP2ContinuationPolicy*,CliPP2Norm,CliPP2CutScores,long long host_budget_bytes,
-    long long stack_bytes,int output_flags,int boundary_requests,void** owner);
+    const CliPP2ContinuationPolicy*,CliPP2Norm,CliPP2CutScores,
+    int output_flags,int boundary_requests,void** owner);
 int CliPP2ContinuationOwnerPoll(void* owner,int task,int wait,CliPP2ContinuationRequest* request);
 int CliPP2ContinuationOwnerReply(void* owner,int task,std::uint64_t sequence,
     const double* values,const double* gradient,const double* curvature);

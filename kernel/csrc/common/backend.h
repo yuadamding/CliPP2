@@ -7,7 +7,7 @@
 // before returning. No implicit CPU CUDA fallback.
 struct CliPP2BackendDiagnostics {
     std::int64_t prepared_bytes, workspace_bytes, calls, cell_evaluations;
-    std::int64_t cache_bytes, staging_bytes, workspace_limit;
+    std::int64_t cache_bytes, staging_bytes;
     std::int64_t host_to_device_bytes, device_to_host_bytes, kernel_launches, synchronizations;
 };
 
@@ -16,8 +16,7 @@ int CliPP2BackendABI();
 const char* CliPP2BackendBuildId();
 const char* CliPP2BackendNumericalPolicy();
 const char* CliPP2BackendLastError();
-int CliPP2BackendCreate(const clipp2::ObservationSoA*, std::int64_t workspace_bytes,
-                       int device_index, void** context);
+int CliPP2BackendCreate(const clipp2::ObservationSoA*, int device_index, void** context);
 void CliPP2BackendDestroy(void* context);
 int CliPP2BackendGetDiagnostics(void* context, CliPP2BackendDiagnostics* output);
 // phi and node results: [batch, region, mutation]. Status is one byte per cell.
@@ -42,9 +41,7 @@ int CliPP2RefitCentersBatch(void*, const clipp2::RefitBatch*, clipp2::RefitResul
 int CliPP2EvaluateConditionalValues(void*, const clipp2::ConditionalBatch*,
                                     double* log_likelihood, std::uint8_t* status);
 // CUDA-only resident execution. Context-local handles own immutable columns;
-// dropping an optional cache entry never invalidates a live handle. A zero
-// optional-cache limit disables retention, not device-side scoring.
-int CliPP2ConfigureCUDAReuse(void*, std::int64_t resident_limit, std::int64_t cache_limit);
+// clearing cached entries never invalidates a live handle.
 int CliPP2CreateJointColumns(void*, std::int64_t count, const double* centers,
                             std::int64_t* handles);
 // Explicit host import is also useful for independent numerical qualification.
@@ -58,8 +55,6 @@ int CliPP2GatherJointColumns(void*, std::int64_t count, const std::int64_t* hand
                             const std::int64_t* labels, double* assigned);
 int CliPP2CreateMixtureProblem(void*, std::int64_t count, const std::int64_t* handles,
                               std::int64_t* problem);
-int CliPP2CUDAMixtureRequiredBytes(std::int64_t mutations, std::int64_t columns,
-                                  std::int64_t* bytes);
 int CliPP2ReleaseMixtureProblem(void*, std::int64_t problem);
 int CliPP2EvaluateMixture(void*, std::int64_t problem, const double* weights,
                          double* objective, double* gradient, double* log_likelihood);
@@ -68,8 +63,8 @@ int CliPP2PrepareMixtureTransferEndpoint(void*, std::int64_t problem, const doub
 int CliPP2MixtureTransferDerivative(void*, std::int64_t problem, double fraction,
                                    double* derivative);
 // Fixed-length counter vectors; do not change the shared diagnostic struct.
-int CliPP2CUDAReuseDiagnostics(void*, std::int64_t* counters11);
-int CliPP2CUDAGridAdmissionDiagnostics(void*, std::int64_t* counters4);
+int CliPP2CUDAReuseDiagnostics(void*, std::int64_t* counters9);
+int CliPP2CUDAGridDiagnostics(void*, std::int64_t* counters3);
 int CliPP2ReleaseCUDAOptionalCache(void*);
 int CliPP2CUDAScoringDiagnostics(void*, std::int64_t* counters9);
 int CliPP2CUDAScoringArenaDiagnostics(void*, std::int64_t* counters3);
@@ -79,7 +74,7 @@ namespace clipp2 {
 // CPU implementation supplied by cpu/refit.cpp. CUDA has its own batch driver.
 struct ProbabilityWork;
 class ProbabilityCache;
-void refit_centers(const ObservationSoA&, const RefitBatch&, RefitResult*, std::int64_t, ProbabilityWork&, ProbabilityCache* = nullptr);
+void refit_centers(const ObservationSoA&, const RefitBatch&, RefitResult*, ProbabilityWork&, ProbabilityCache&);
 void conditional_values(const ObservationSoA&, const ConditionalBatch&, double*, std::uint8_t*,
-                        std::int64_t, ProbabilityWork&, ProbabilityCache* = nullptr);
+                        ProbabilityWork&, ProbabilityCache&);
 }

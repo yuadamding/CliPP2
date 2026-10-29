@@ -11,14 +11,13 @@ from pathlib import Path
 import numpy as np
 
 from .build_identity import NATIVE_SOURCES, backend_identity, native_identity as _native_identity
-from .execution import resolve_cpu_threads, resolve_memory_budget
-from ..config import DEFAULT_MAX_CLUSTERS
+from .execution import resolve_cpu_threads
 
 
 _D = ct.POINTER(ct.c_double)
 _I = ct.POINTER(ct.c_int64)
 _B = ct.POINTER(ct.c_uint8)
-BACKEND_ABI = 3
+BACKEND_ABI = 5
 
 
 class NativeExecutionError(RuntimeError):
@@ -42,21 +41,8 @@ class WeightOutcome:
     error: BaseException | None = None
 
 
-def slsqp_workspace_size(q):
-    """Qualified LP64 array footprint, without importing a Python optimizer."""
-    if type(q) is not int or q < 1:
-        raise ValueError("q must be a positive integer")
-    buffer = q*(q+1)//2 + 10*q*q + 35*q + 30
-    return 8*(buffer + 7*q + 4) + 4*(2*q + 3)
-
-
-def controller_reservation(q):
-    """Conservative host-state charge shared by both CUDA weight routes."""
-    return (slsqp_workspace_size(q) if q > 1 else 0) + 16*1024 + 1024*q
-
-
 class DeviceColumn:
-    """One immutable context-bound lease; optional cache eviction is harmless."""
+    """One immutable context-bound lease; cache clearing is harmless."""
 
     def __init__(self, backend, handle):
         self._owner = weakref.ref(backend)
@@ -177,7 +163,7 @@ class _Observations(ct.Structure):
 class _Diagnostics(ct.Structure):
     _fields_ = [(name, ct.c_int64) for name in (
         "prepared_bytes", "workspace_bytes", "calls", "cell_evaluations", "cache_bytes",
-        "staging_bytes", "workspace_limit", "host_to_device_bytes", "device_to_host_bytes",
+        "staging_bytes", "host_to_device_bytes", "device_to_host_bytes",
         "kernel_launches", "synchronizations")]
 
 
@@ -199,11 +185,6 @@ class _ConditionalBatch(ct.Structure):
     ] + [("centers", _D)]
 
 
-class _WeightBatchRequest(ct.Structure):
-    _fields_ = [(name, ct.c_int64) for name in ("handle", "operation", "grow", "shrink")
-               ] + [("fraction", ct.c_double), ("weights", _D)]
-
-
 def _ptr(array):
     return array.ctypes.data_as({np.dtype("float64"): _D, np.dtype("int64"): _I,
                                 np.dtype("uint8"): _B}[array.dtype])
@@ -213,48 +194,12 @@ def _array(value, dtype=np.float64):
     return np.ascontiguousarray(value, dtype=dtype)
 
 
-def _cuda_memory_plan(n, r, q, device_bytes, workspace_bytes, mixture_bytes):
-    """Reserve scoring before preferred scratch, without changing candidate K.
-
-    The resident minimum includes one candidate and one retained parent column
-    set. Other concurrent leases still use native admission; this is not a
-    guarantee that arbitrarily many live candidates fit. The 64-byte scratch
-    floor covers the smallest tiled primitives, not a whole refit task.
-    """
-    observations = 57*n*r
-    columns = 8*n*q
-    header = 8*q*(r+1)+4
-    resident_minimum = 2*columns + mixture_bytes + header
-    minimum_workspace = 64
-    minimum = observations + resident_minimum + minimum_workspace
-    if device_bytes < minimum or workspace_bytes < minimum_workspace:
-        raise NativeExecutionError(
-            f"CUDA memory plan for N={n}, R={r}, q={q} requires {minimum} device bytes "
-            f"(observations={observations}, scoring_arena={mixture_bytes}, "
-            f"columns={columns}, retained_parent_columns={columns}, "
-            f"column_header={header}, minimum_tiled_workspace={minimum_workspace}); "
-            f"device budget={device_bytes}, requested workspace={workspace_bytes}")
-    resolved_workspace = min(workspace_bytes, device_bytes-observations-resident_minimum)
-    return {"score_capacity_hint": q, "prepared_bytes": observations,
-            "scoring_arena_bytes": mixture_bytes, "column_bytes": columns,
-            "retained_parent_column_bytes": columns, "column_header_bytes": header,
-            "minimum_tiled_workspace_bytes": minimum_workspace,
-            "minimum_resident_bytes": resident_minimum, "minimum_device_bytes": minimum,
-            "requested_workspace_bytes": workspace_bytes,
-            "workspace_bytes": resolved_workspace,
-            "resident_limit": device_bytes-observations-resolved_workspace}
-
-
 class NativeBackend:
     """Owns prepared SoA fields; never silently substitutes a CPU backend."""
 
-    def __init__(self, model, workspace_bytes, *, native_host_memory_bytes=None,
-                 device_memory_bytes=None, cpu_threads=None, device_cache_bytes=256*1024**2,
-                 score_capacity=DEFAULT_MAX_CLUSTERS, probability_reuse=False):
+    def __init__(self, model, *, cpu_threads=None):
         self.context = None
         self._weight_submission_lock = threading.Lock()
-        if type(probability_reuse) is not bool:
-            raise TypeError("probability_reuse must be a boolean")
         kind = "cuda" if model.device.startswith("cuda") else "cpu"
         paths = sorted(Path(__file__).parent.glob(f"_native_{kind}*.so"))
         if len(paths) != 1:
@@ -263,7 +208,7 @@ class NativeBackend:
         signatures = {
             "ABI": ([], ct.c_int), "BuildId": ([], ct.c_char_p),
             "NumericalPolicy": ([], ct.c_char_p), "LastError": ([], ct.c_char_p),
-            "Create": ([ct.POINTER(_Observations), ct.c_int64, ct.c_int, ct.POINTER(ct.c_void_p)], ct.c_int),
+            "Create": ([ct.POINTER(_Observations), ct.c_int, ct.POINTER(ct.c_void_p)], ct.c_int),
             "Destroy": ([ct.c_void_p], None),
             "GetDiagnostics": ([ct.c_void_p, ct.POINTER(_Diagnostics)], ct.c_int),
         }
@@ -292,42 +237,8 @@ class NativeBackend:
         self.policy = lib.CliPP2BackendNumericalPolicy().decode()
         if lib.CliPP2BackendABI() != BACKEND_ABI or self.identity != backend_identity(kind):
             raise NativeExecutionError(f"Stale or incompatible native {kind} library; rebuild CliPP2")
-        if type(workspace_bytes) is not int or not 0 <= workspace_bytes <= np.iinfo(np.int64).max:
-            raise ValueError("workspace_bytes must be a nonnegative int64")
         self.kind, self.n, self.r = kind, model.n, model.r
-        self.workspace_bytes = workspace_bytes
         self.cpu_threads = resolve_cpu_threads(cpu_threads)
-        self.native_host_memory_bytes = resolve_memory_budget(native_host_memory_bytes)
-        self.device_memory_bytes = device_memory_bytes
-        required = model.n * model.r * 57
-        if kind == "cpu" and required > self.native_host_memory_bytes:
-            raise NativeExecutionError(f"Prepared observations require {required} native host bytes; "
-                                       f"budget is {self.native_host_memory_bytes}")
-        if kind == "cuda":
-            lib.CliPP2DeviceMemoryInfo.argtypes = [ct.c_int, _I, _I]
-            lib.CliPP2DeviceMemoryInfo.restype = ct.c_int
-            free, total = ct.c_int64(), ct.c_int64()
-            device_index = int(model.device.split(":", 1)[1]) if ":" in model.device else 0
-            self._check(lib.CliPP2DeviceMemoryInfo(device_index, ct.byref(free), ct.byref(total)))
-            self.device_memory_bytes = resolve_memory_budget(device_memory_bytes, free=free.value, device=True)
-            if type(score_capacity) is not int or score_capacity < 1:
-                raise ValueError("score_capacity must be a positive integer allocation hint")
-            score_capacity = min(model.n, score_capacity)
-            query = lib.CliPP2CUDAMixtureRequiredBytes
-            query.argtypes, query.restype = [ct.c_int64, ct.c_int64, _I], ct.c_int
-            mixture_bytes = ct.c_int64()
-            self._check(query(model.n, score_capacity, ct.byref(mixture_bytes)))
-            self.device_memory_plan = _cuda_memory_plan(
-                model.n, model.r, score_capacity, self.device_memory_bytes,
-                workspace_bytes, mixture_bytes.value)
-            # An upper bound, not a feasibility gate: duplicate/clipped mode
-            # knots can make actual grids much smaller. Native refit admission
-            # checks the exact current task before allocating any scratch.
-            self.device_memory_plan["full_region_refit_workspace_upper_bound"] = max(
-                24*int(model.observed[:, region].sum()) + 16*(513 + sum(
-                    map(int, model.support[model.observed[:, region], region]))) + 136
-                for region in range(model.r))
-            workspace_bytes = self.workspace_bytes = self.device_memory_plan["workspace_bytes"]
         fields = [_array(value.T) for value in (
             model.alt, model.depth-model.alt, model.scaling, model.constants, model.lower, model.upper)]
         fields += [_array(model.support.T, np.int64),
@@ -335,31 +246,17 @@ class NativeBackend:
         observations = _Observations(model.n, model.r, *map(_ptr, fields))
         self.context = ct.c_void_p()
         device_index = (int(model.device.split(":", 1)[1]) if ":" in model.device else 0) if kind == "cuda" else -1
-        self._check(lib.CliPP2BackendCreate(ct.byref(observations), workspace_bytes,
-                                          device_index, ct.byref(self.context)))
+        self._check(lib.CliPP2BackendCreate(ct.byref(observations), device_index, ct.byref(self.context)))
         if kind == "cpu":
-            lib.CliPP2ConfigureCPUExecution.argtypes = [ct.c_void_p, ct.c_int64, ct.c_int]
+            lib.CliPP2ConfigureCPUExecution.argtypes = [ct.c_void_p, ct.c_int]
             self._check(lib.CliPP2ConfigureCPUExecution(
-                self.context, self.native_host_memory_bytes, self.cpu_threads))
-            configured = _Diagnostics()
-            self._check(lib.CliPP2BackendGetDiagnostics(self.context, ct.byref(configured)))
-            self.workspace_bytes = configured.workspace_limit
+                self.context, self.cpu_threads))
             lib.CliPP2ProbabilityCacheDiagnostics.argtypes = [ct.c_void_p, _I]
             lib.CliPP2ProbabilityCacheDiagnostics.restype = ct.c_int
             lib.CliPP2ReleaseProbabilityCache.argtypes = [ct.c_void_p]
             lib.CliPP2ReleaseProbabilityCache.restype = ct.c_int
         else:
-            # Host metadata and device scratch are independently bounded pools.
-            # A small tiled device workspace must not become an implicit host
-            # memory cap for resident immutable column handles.
-            self.host_staging_bytes_limit = self.native_host_memory_bytes
-            lib.CliPP2ConfigureCUDAExecution.argtypes = [ct.c_void_p, ct.c_int64]
-            lib.CliPP2ConfigureCUDAExecution.restype = ct.c_int
-            self._check(lib.CliPP2ConfigureCUDAExecution(self.context, self.host_staging_bytes_limit))
-            if type(device_cache_bytes) is not int or not 0 <= device_cache_bytes <= np.iinfo(np.int64).max:
-                raise ValueError("device_cache_bytes must be a nonnegative int64")
             signatures = {
-                "ConfigureCUDAReuse": [ct.c_void_p, ct.c_int64, ct.c_int64],
                 "ConfigureCUDAProbabilityReuse": [ct.c_void_p, ct.POINTER(_Observations), ct.c_int],
                 "CUDAProbabilityDiagnostics": [ct.c_void_p, _I],
                 "CUDAProbabilityRefitDiagnostics": [ct.c_void_p, _I],
@@ -378,39 +275,33 @@ class NativeBackend:
                 "EvaluateMixture": [ct.c_void_p, ct.c_int64, _D, _D, _D, _D],
                 "PrepareMixtureTransferEndpoint": [ct.c_void_p, ct.c_int64, _D, ct.c_int64, ct.c_int64, _D],
                 "MixtureTransferDerivative": [ct.c_void_p, ct.c_int64, ct.c_double, _D],
-                "EvaluateWeightBatch": [ct.c_void_p, ct.c_int64,
-                                        ct.POINTER(_WeightBatchRequest), ct.c_int64, _D],
-                "CUDAMixtureAdmission": [ct.c_void_p, ct.c_int64, _I],
                 "CUDAScoringDiagnostics": [ct.c_void_p, _I],
                 "CUDAScoringArenaDiagnostics": [ct.c_void_p, _I],
                 "CUDAScoringRequestDiagnostics": [ct.c_void_p, _I],
-                "CUDAGridAdmissionDiagnostics": [ct.c_void_p, _I],
+                "CUDAGridDiagnostics": [ct.c_void_p, _I],
                 "CUDAReuseDiagnostics": [ct.c_void_p, _I],
                 "ReleaseCUDAOptionalCache": [ct.c_void_p],
             }
             for name, args in signatures.items():
                 function = getattr(lib, "CliPP2" + name)
                 function.argtypes, function.restype = args, ct.c_int
-            resident_limit = self.device_memory_plan["resident_limit"]
-            self._check(lib.CliPP2ConfigureCUDAReuse(
-                self.context, resident_limit, min(device_cache_bytes, resident_limit)))
             self._check(lib.CliPP2ConfigureCUDAProbabilityReuse(
-                self.context, ct.byref(observations), int(probability_reuse)))
+                self.context, ct.byref(observations), 1))
 
     @property
     def native_host_bytes(self):
         """Retained native host storage; caller arrays and transient scratch are separate."""
         self._require_open()
         if self.kind == "cuda":
-            reuse = np.empty(11, dtype=np.int64)
+            reuse = np.empty(9, dtype=np.int64)
             self._check(self.lib.CliPP2CUDAReuseDiagnostics(self.context, _ptr(reuse)))
-            return int(reuse[9]) + int(reuse[10]) + self.probability_reuse_diagnostics()["host_bytes"]
+            return int(reuse[7]) + int(reuse[8]) + self.probability_reuse_diagnostics()["host_bytes"]
         result = _Diagnostics()
         self._check(self.lib.CliPP2BackendGetDiagnostics(self.context, ct.byref(result)))
         return result.prepared_bytes + result.cache_bytes
 
     def release_optional_cache(self):
-        """Give mandatory continuation state priority over rebuildable read plans."""
+        """Explicitly release reusable read plans without invalidating live leases."""
         self._require_open()
         if self.kind == "cpu":
             self._check(self.lib.CliPP2ReleaseProbabilityCache(self.context))
@@ -493,10 +384,9 @@ class NativeBackend:
             diagnostics["probability_reuse"] = self.probability_reuse_diagnostics()
             diagnostics["proposal_scans"] = self._counter_diagnostics("CliPP2CUDAProposalDiagnostics",
                 ("chunks", "positive_pairs", "subset_gathers", "subset_values"))
-            diagnostics["grid_admission"] = self.grid_admission_diagnostics()
+            diagnostics["grid"] = self.grid_diagnostics()
             diagnostics["reuse"] = self._counter_diagnostics("CliPP2CUDAReuseDiagnostics",
-                ("resident_limit", "resident_bytes", "resident_peak_bytes",
-                "optional_cache_limit", "optional_cache_bytes", "grid_hits", "grid_misses",
+                ("resident_bytes", "resident_peak_bytes", "optional_cache_bytes", "grid_hits", "grid_misses",
                 "grid_reused_cells", "refit_physical_emission_cells", "grid_cache_host_bytes",
                 "scoring_host_bytes"))
         if self.kind == "cpu" and hasattr(self.lib, "CliPP2ProbabilityReuseDiagnostics"):
@@ -505,22 +395,8 @@ class NativeBackend:
                  "ordered_row_references", "peak_optional_plan_reservation"))
             diagnostics["probability_cache"] = self._counter_diagnostics("CliPP2ProbabilityCacheDiagnostics",
                 ("hits", "misses", "bytes", "model_identity_bytes"))
-        diagnostics.update(native_host_memory_bytes=self.native_host_memory_bytes,
-                           device_memory_bytes=self.device_memory_bytes,
-                           cpu_threads=self.cpu_threads, native_host_bytes=self.native_host_bytes)
-        if self.kind == "cuda":
-            diagnostics["host_staging_bytes_limit"] = self.host_staging_bytes_limit
-            diagnostics["device_memory_plan"] = dict(self.device_memory_plan)
+        diagnostics.update(cpu_threads=self.cpu_threads, native_host_bytes=self.native_host_bytes)
         return diagnostics
-
-    def _tile_count(self, count, per_cell, fixed=16):
-        """Bound native temporary storage; requested host results are separate."""
-        if self.kind == "cpu" or not count:
-            return count
-        size = min(count, (self.workspace_bytes - fixed) // per_cell)
-        if size < 1:
-            raise NativeExecutionError("CUDA workspace cannot hold one observation and its result")
-        return size
 
     def _rows(self, region, rows):
         raw = np.asarray(rows)
@@ -541,38 +417,20 @@ class NativeBackend:
         return tuple(np.ascontiguousarray(value.T) for value in result) if derivatives else np.ascontiguousarray(result[0].T)
 
     def _evaluate_node_terms(self, x, derivatives, batches):
-        """Evaluate already validated region-major states; wrappers own layout/admission."""
+        """Evaluate already validated region-major states."""
         result = [np.empty_like(x) for _ in range(3 if derivatives else 1)]
-        count = x.size
-        direct_bytes = count * (33 if derivatives else 17) + 8
-        if self.kind == "cpu" or direct_bytes <= self.workspace_bytes:
-            status = np.empty(x.shape, dtype=np.uint8)
-            pointers = [_ptr(value) for value in result] + [None] * (3-len(result))
-            self._check(self.lib.CliPP2EvaluateNodes(self.context, batches, _ptr(x), int(derivatives),
-                                                    *pointers, _ptr(status)), status)
-        else:
-            # Indexed tiles keep the same region-major observation mapping;
-            # their extra int64 index vector is included in the budget.
-            step = self._tile_count(count, 41 if derivatives else 25)
-            for first in range(0, count, step):
-                last = min(count, first+step)
-                indices = np.arange(first, last, dtype=np.int64)
-                if x.ndim == 3:
-                    indices %= self.n*self.r
-                status = np.empty(last-first, dtype=np.uint8)
-                pointers = [_ptr(value.ravel()[first:last]) for value in result] + [None] * (3-len(result))
-                self._check(self.lib.CliPP2EvaluateCells(self.context, len(indices), _ptr(indices),
-                    _ptr(x.ravel()[first:last]), int(derivatives), *pointers, _ptr(status)), status)
+        status = np.empty(x.shape, dtype=np.uint8)
+        pointers = [_ptr(value) for value in result] + [None] * (3-len(result))
+        self._check(self.lib.CliPP2EvaluateNodes(self.context, batches, _ptr(x), int(derivatives),
+                                                *pointers, _ptr(status)), status)
         return result
 
     def node_terms_batch(self, coordinates, derivatives=True):
         """Evaluate independent B-by-N-by-R states in caller order.
 
-        Uses the existing native batched-emission ABI. Oversized requests use
-        bounded indexed tiles, never CPU likelihood fallback. Each returned
+        Uses the native batched-emission ABI, never CPU likelihood fallback. Each returned
         state is contiguous N-by-R, preserving continuation's reduction order.
         """
-        from .execution import preflight_host_export
         self._require_open()
         coordinates = np.asarray(coordinates)
         if coordinates.ndim != 3 or coordinates.shape[1:] != (self.n, self.r):
@@ -580,9 +438,6 @@ class NativeBackend:
         batches = len(coordinates)
         if not batches:
             return []
-        planes = 3 if derivatives else 1
-        count = coordinates.size
-        preflight_host_export(count*(8 + 16*planes + 9))
         x = _array(coordinates.transpose(0, 2, 1))
         result = self._evaluate_node_terms(x, derivatives, batches)
         ordered = [np.ascontiguousarray(value.transpose(0, 2, 1)) for value in result]
@@ -595,12 +450,9 @@ class NativeBackend:
         cells = _array(region*self.n + rows, np.int64)
         x = _array(np.broadcast_to(values, cells.shape))
         result = np.empty_like(x)
-        step = self._tile_count(len(x), 25)
-        for first in range(0, len(x), step or 1):
-            last = min(len(x), first+step)
-            status = np.empty(last-first, dtype=np.uint8)
-            self._check(self.lib.CliPP2EvaluateCells(self.context, last-first, _ptr(cells[first:last]),
-                _ptr(x[first:last]), 0, _ptr(result[first:last]), None, None, _ptr(status)), status)
+        status = np.empty(x.shape, dtype=np.uint8)
+        self._check(self.lib.CliPP2EvaluateCells(self.context, len(x), _ptr(cells),
+            _ptr(x), 0, _ptr(result), None, None, _ptr(status)), status)
         return -result
 
     def regional_grid(self, region, rows, grid):
@@ -611,23 +463,9 @@ class NativeBackend:
         result = np.empty((len(grid), len(rows)))
         if not result.size:
             return result.T
-        if self.kind == "cpu":
-            row_step, grid_step = len(rows), len(grid)
-        else:
-            row_step = self._tile_count(len(rows), 17, fixed=40)
-            grid_step = min(len(grid), (self.workspace_bytes - 8*row_step - 32) // (9*row_step+8))
-            if grid_step < 1:
-                raise NativeExecutionError("CUDA workspace cannot hold one regional grid point")
-        for row_first in range(0, len(rows), row_step):
-            selected_rows = rows[row_first:row_first+row_step]
-            for grid_first in range(0, len(grid), grid_step):
-                selected_grid = grid[grid_first:grid_first+grid_step]
-                values = np.empty((len(selected_grid), len(selected_rows)))
-                status = np.empty(values.shape, dtype=np.uint8)
-                self._check(self.lib.CliPP2EvaluateRegionalGrid(self.context, region,
-                    len(selected_rows), _ptr(selected_rows), len(selected_grid), _ptr(selected_grid),
-                    _ptr(values), _ptr(status)), status)
-                result[grid_first:grid_first+len(selected_grid), row_first:row_first+len(selected_rows)] = values
+        status = np.empty(result.shape, dtype=np.uint8)
+        self._check(self.lib.CliPP2EvaluateRegionalGrid(self.context, region,
+            len(rows), _ptr(rows), len(grid), _ptr(grid), _ptr(result), _ptr(status)), status)
         return result.T
 
     def joint_columns(self, centers):
@@ -692,16 +530,15 @@ class NativeBackend:
         function.argtypes, function.restype = [ct.c_void_p, _I], ct.c_int
         return self._counter_diagnostics("CliPP2ResidentExecutionDiagnostics",
             ("arena_allocations", "arena_reuses", "graph_instantiations", "graph_reuses",
-             "graph_launches", "idle_evictions", "failed_leases", "workspace_resets",
-             "graph_setup_nanoseconds", "idle_device_bytes", "idle_host_bytes",
-             "idle_graph_device_reservation", "live_owner"))
+             "graph_launches", "workspace_releases", "failed_leases", "workspace_resets",
+             "graph_setup_nanoseconds", "idle_device_bytes", "idle_host_bytes", "live_owner"))
 
-    def grid_admission_diagnostics(self):
+    def grid_diagnostics(self):
         self._require_open()
         if self.kind != "cuda":
-            raise ValueError("Grid admission diagnostics require CUDA")
-        return self._counter_diagnostics("CliPP2CUDAGridAdmissionDiagnostics",
-                        ("build_cells", "direct_cells", "admission_bypasses", "evictions"))
+            raise ValueError("Grid diagnostics require CUDA")
+        return self._counter_diagnostics("CliPP2CUDAGridDiagnostics",
+                        ("build_cells", "direct_cells", "demand_bypasses"))
 
     def probability_reuse_diagnostics(self):
         self._require_open()
@@ -710,7 +547,7 @@ class NativeBackend:
         result = self._counter_diagnostics("CliPP2CUDAProbabilityDiagnostics",
                         ("host_bytes", "device_bytes", "model_plans_built", "reused_grid_requests",
                          "direct_grid_requests", "basis_components_evaluated", "shapes_evaluated",
-                         "ordered_rows_gathered", "metadata_evictions", "setup_bypasses"))
+                         "ordered_rows_gathered", "metadata_releases", "setup_bypasses"))
         result["refits"] = self._counter_diagnostics("CliPP2CUDAProbabilityRefitDiagnostics",
                         ("reused_tasks", "reused_objective_calls", "basis_components", "row_evaluations"))
         return result
@@ -764,24 +601,14 @@ class NativeBackend:
 
     def gather_column_rows(self, columns, rows):
         """Gather only requested rows/centers, preserving caller order and bits."""
-        from .execution import preflight_host_export
         handles = self._column_handles(columns)
         rows = np.asarray(rows)
         if rows.ndim != 1 or rows.dtype.kind not in 'iu' or np.any(rows < 0) or np.any(rows >= self.n):
             raise ValueError("Column subset rows must be valid mutation indices")
         rows = _array(rows, np.int64)
-        preflight_host_export(8*len(rows)*len(handles)+self.workspace_bytes)
         result = np.empty((len(rows), len(handles)))
-        width = max(1, min(len(handles), self.workspace_bytes//8))
-        for first_column in range(0, len(handles), width):
-            selected = handles[first_column:first_column+width]
-            height = max(1, self.workspace_bytes//(8*len(selected)))
-            for first in range(0, len(rows), height):
-                chosen = rows[first:first+height]
-                values = np.empty((len(chosen), len(selected)))
-                self._check(self.lib.CliPP2GatherColumnRows(self.context, len(selected), _ptr(selected),
-                    len(chosen), _ptr(chosen), _ptr(values)))
-                result[first:first+len(chosen), first_column:first_column+len(selected)] = values
+        self._check(self.lib.CliPP2GatherColumnRows(self.context, len(handles), _ptr(handles),
+            len(rows), _ptr(rows), _ptr(result)))
         return result
 
     def positive_transfers(self, columns, labels):
@@ -791,7 +618,6 @@ class NativeBackend:
         original support legality, scientific keys, sorting and greedy order.
         Every parent assignment is validated, including rows without proposals.
         """
-        from .execution import preflight_host_export
         handles = self._column_handles(columns)
         q = len(handles)
         labels = np.asarray(labels)
@@ -799,13 +625,7 @@ class NativeBackend:
                 or np.any(labels < 0) or np.any(labels >= q)):
             raise ValueError("Proposal labels must contain N valid column indices")
         labels = _array(labels, np.int64)
-        height = min(self.n, 8192, (self.workspace_bytes-16)//(16*q+8))
-        if height < 1:
-            raise NativeExecutionError("CUDA proposal workspace cannot hold one row; increase workspace budget")
-        # Packed parts, concatenation and final row/destination vectors coexist.
-        # Include per-tile ndarray/list owners and the retained input conversion.
-        tiles = (self.n+height-1)//height
-        preflight_host_export(48*self.n*q+16*height*q+8*self.n+512*tiles)
+        height = min(self.n, 8192)
         index_parts, gain_parts = [], []
         for first in range(0, self.n, height):
             rows = min(height, self.n-first)
@@ -825,109 +645,6 @@ class NativeBackend:
 
     def mixture_problem(self, columns):
         return DeviceMixtureProblem(self, columns)
-
-    def mixture_admission(self, q):
-        """Read-only conservative space for one arena plus packed requests.
-
-        Availability excludes reclaimable optional storage: this query does not
-        evict useful grids/columns. The caller may flush a partial batch before
-        preparing another candidate; native mandatory allocation remains the
-        definitive admission and can evict optional storage when necessary.
-        New likelihood columns and controller states are additional owners.
-        """
-        self._require_open()
-        if self.kind != "cuda" or type(q) is not int or not 0 < q < 2**63:
-            raise ValueError("CUDA mixture admission requires a positive int64 q")
-        values = np.empty(4, dtype=np.int64)
-        self._check(self.lib.CliPP2CUDAMixtureAdmission(self.context, q, _ptr(values)))
-        return dict(zip(("device_required", "device_available", "host_required", "host_available"),
-                        map(int, values)))
-
-    def resident_weight_admission(self, sizes):
-        """Read-only extra optimizer/graph reservation, excluding live mixtures."""
-        from .execution import preflight_host_export
-        self._require_open()
-        sizes = tuple(sizes)
-        if (self.kind != "cuda" or not sizes
-                or any(type(q) is not int or not 0 < q < 2**63 for q in sizes)):
-            raise ValueError("Resident admission requires CUDA and positive int64 dimensions")
-        try:
-            query = self.lib.CliPP2ExperimentalResidentAdmission
-        except AttributeError as error:
-            raise NativeExecutionError("The loaded backend has no resident admission ABI") from error
-        query.argtypes = [ct.c_void_p, ct.c_int64] + [ct.POINTER(ct.c_int64)]*2
-        query.restype = ct.c_int
-        preflight_host_export(8*len(sizes)+32)
-        sizes = np.asarray(sizes, dtype=np.int64)
-        values = np.empty(4, dtype=np.int64)
-        self._check(query(self.context, len(sizes), _ptr(sizes), _ptr(values)))
-        return dict(zip(("device_required", "device_available", "host_required", "host_available"),
-                        map(int, values)))
-
-    def evaluate_weight_requests(self, requests):
-        """Submit independent ready operations with one packed transfer/finish.
-
-        Experimental controller boundary, not a production search policy. All
-        validation precedes mutation; endpoint hits retain scalar-oracle behavior.
-        Caller owns mixture leases; the native owner bounds reusable scratch.
-        """
-        self._require_open()
-        if self.kind != "cuda":
-            raise ValueError("Batched device weight requests require CUDA")
-        requests = tuple(requests)
-        packed, owners, starts, replies, handles = [], [], [], [None]*len(requests), set()
-        output_size = 0
-        operations = {"evaluate": 0, "prepare_transfer": 1, "transfer_derivative": 2}
-        for index, (problem, request) in enumerate(requests):
-            if not isinstance(problem, DeviceMixtureProblem) or problem.backend() is not self:
-                raise ValueError("Batched weight problems must belong to this backend")
-            if problem.handle in handles:
-                raise ValueError("Independent requests cannot share a mutable mixture state")
-            handles.add(problem.handle)
-            if request.operation not in operations:
-                raise ValueError("Unknown batched weight operation")
-            operation = operations[request.operation]
-            weights, grow, shrink, fraction = None, 0, 0, 0.
-            if operation != 2:
-                weights = problem._weights(request.weights)
-                starts.append(weights)  # Keep every ctypes input alive through finish.
-            if operation == 1:
-                grow, shrink = request.grow, request.shrink
-                if (not isinstance(grow, (int, np.integer)) or
-                        not isinstance(shrink, (int, np.integer)) or
-                        not 0 <= grow < problem.shape[1] or not 0 <= shrink < problem.shape[1]
-                        or grow == shrink or weights[shrink] <= 0):
-                    raise ValueError("Invalid pairwise mixture transfer")
-                fraction = 1.
-            if operation == 2:
-                fraction = request.fraction
-                if not np.isfinite(fraction) or not 0 <= fraction <= 1:
-                    raise ValueError("Mixture transfer fraction must be in [0,1]")
-                if fraction == 1 and problem._transfer_endpoint is not None:
-                    replies[index] = problem._transfer_endpoint
-                    continue
-            packed.append(_WeightBatchRequest(problem.handle, operation, grow, shrink,
-                                               fraction, _D() if weights is None else _ptr(weights)))
-            owners.append((index, problem, operation, output_size))
-            output_size += problem.shape[1]+2 if operation == 0 else 1
-        if packed:
-            for _, problem, operation, _ in owners:
-                if operation == 1:
-                    problem._transfer_endpoint = None
-            native = (_WeightBatchRequest * len(packed))(*packed)
-            result = np.empty(output_size)
-            self._check(self.lib.CliPP2EvaluateWeightBatch(
-                self.context, len(packed), native, output_size, _ptr(result)))
-            for index, problem, operation, offset in owners:
-                if operation == 0:
-                    replies[index] = (float(result[offset]),
-                                      result[offset+2:offset+2+problem.shape[1]],
-                                      float(result[offset+1]))
-                elif operation == 1:
-                    problem._transfer_endpoint = float(result[offset])
-                else:
-                    replies[index] = float(result[offset])
-        return tuple(replies)
 
     def multiplicity(self, x):
         self._require_open()
@@ -963,51 +680,10 @@ class NativeBackend:
             raise ValueError("Prepared refit arrays require consistent one-dimensional CSR fields")
         if not count:
             return []
-        if self.kind == "cuda":
-            # The native planner owns task slices and parallel-grid waves.
-            # Python's former serial-grid estimate cannot bound that scratch.
-            batch = _RefitBatch(count, len(members), len(grids), *map(_ptr, arrays))
-            fitted = (_RefitResult * count)()
-            self._check(self.lib.CliPP2RefitCentersBatch(self.context, ct.byref(batch), fitted))
-            return list(fitted)
-        sizes = zip(map(int, np.diff(member_offsets)), map(int, np.diff(grid_offsets)))
-        costs = [8*(rows+grid+1) for rows, grid in sizes]
-        results = []
-        for selected in self._task_slices(costs, 8):
-            count = selected.stop - selected.start
-            offsets = slice(selected.start, selected.stop+1)
-            first_member, last_member = member_offsets[[selected.start, selected.stop]]
-            first_grid, last_grid = grid_offsets[[selected.start, selected.stop]]
-            fields = [_array(regions[selected], np.int64),
-                      _array(member_offsets[offsets]-first_member, np.int64),
-                      _array(members[first_member:last_member], np.int64),
-                      _array(grid_offsets[offsets]-first_grid, np.int64),
-                      _array(grids[first_grid:last_grid]), _array(lowers[selected]), _array(uppers[selected]),
-                      _array(tolerances[selected]), _array(incumbents[selected])]
-            batch = _RefitBatch(count, len(fields[2]), len(fields[4]), *map(_ptr, fields))
-            fitted = (_RefitResult * count)()
-            self._check(self.lib.CliPP2RefitCentersBatch(self.context, ct.byref(batch), fitted))
-            results.extend(fitted)
-        return results
-
-    def _task_slices(self, costs, fixed):
-        """Tile whole independent tasks; never alter their reductions or grids."""
-        task_limit = self.host_staging_bytes_limit // 8 if self.kind == "cuda" else len(costs)
-        if costs and task_limit < 1:
-            raise NativeExecutionError("CUDA conditional execution requires 8 native host staging bytes per task; "
-                                       f"budget is {self.host_staging_bytes_limit}")
-        first, used = 0, fixed
-        for index, cost in enumerate(costs):
-            if cost + fixed > self.workspace_bytes:
-                raise NativeExecutionError(
-                    f"Native conditional task {index} requires {cost + fixed} workspace bytes; "
-                    f"budget is {self.workspace_bytes}. Increase workspace_bytes.")
-            if used + cost > self.workspace_bytes or index-first >= task_limit:
-                yield slice(first, index)
-                first, used = index, fixed
-            used += cost
-        if first < len(costs):
-            yield slice(first, len(costs))
+        batch = _RefitBatch(count, len(members), len(grids), *map(_ptr, arrays))
+        fitted = (_RefitResult * count)()
+        self._check(self.lib.CliPP2RefitCentersBatch(self.context, ct.byref(batch), fitted))
+        return list(fitted)
 
     def conditional_values(self, tasks, centers):
         """Evaluate supplied incumbents natively; transfer only task totals."""
@@ -1017,23 +693,19 @@ class NativeBackend:
         centers = _array(centers)
         if centers.shape != (len(tasks),):
             raise ValueError("Conditional values need one center per task")
-        costs = ([8*(len(rows)+1) for rows, _ in tasks] if self.kind == "cpu" else
-                 [41+24*len(rows) for rows, _ in tasks])
         values = np.empty(len(tasks))
-        for selected in self._task_slices(costs, 8 if self.kind == "cpu" else 128):
-            chosen, count = tasks[selected], selected.stop-selected.start
-            regions = _array([region for _, region in chosen], np.int64)
-            offsets = _array(np.r_[0, np.cumsum([len(rows) for rows, _ in chosen])], np.int64)
-            members = _array(np.concatenate([rows for rows, _ in chosen]), np.int64)
-            batch = _ConditionalBatch(count, len(members),
-                                       *map(_ptr, (regions, offsets, members, centers[selected])))
-            status = np.empty(count, dtype=np.uint8)
-            self._check(self.lib.CliPP2EvaluateConditionalValues(
-                self.context, ct.byref(batch), _ptr(values[selected]), _ptr(status)), status)
+        regions = _array([region for _, region in tasks], np.int64)
+        offsets = _array(np.r_[0, np.cumsum([len(rows) for rows, _ in tasks])], np.int64)
+        members = _array(np.concatenate([rows for rows, _ in tasks]), np.int64)
+        batch = _ConditionalBatch(len(tasks), len(members),
+                                   *map(_ptr, (regions, offsets, members, centers)))
+        status = np.empty(len(tasks), dtype=np.uint8)
+        self._check(self.lib.CliPP2EvaluateConditionalValues(
+            self.context, ct.byref(batch), _ptr(values), _ptr(status)), status)
         return values
 
 
-NATIVE_ABI = 5
+NATIVE_ABI = 6
 
 def native_library():
     root = Path(__file__).resolve().parent.parent
@@ -1061,16 +733,6 @@ def _load_library(root, path, signature):
     return library, digest
 
 
-def _forest_memory_query(library):
-    query = library.CliPP2ForestRequiredBytes
-    query.argtypes, query.restype = [ct.c_int, ct.c_int], ct.c_longlong
-    return query
-
-
-def forest_required_bytes(n, edges):
-    return _forest_memory_query(native_library()[0])(n, edges)
-
-
 class PreparedForest:
     """Source-bound host-controller buffers, borrowed until the next solve.
 
@@ -1078,11 +740,9 @@ class PreparedForest:
     every call. Only the caller-owned output and verified binding are retained.
     Source identity is rechecked before leaving the continuation batch.
     """
-    def __init__(self, n, regions, *, native_host_memory_bytes=None):
+    def __init__(self, n, regions):
         self.shape = n, regions
         self.library, self.identity = native_library()
-        self.native_host_memory_bytes = resolve_memory_budget(native_host_memory_bytes)
-        self.required = _forest_memory_query(self.library)
         self.result = self.diagnostics = None
         self.closed = False
 
@@ -1106,15 +766,12 @@ class PreparedForest:
         if self.closed:
             raise NativeExecutionError('Prepared forest context is closed')
         if self.result is None:
-            from .execution import preflight_host_export
-            preflight_host_export(self.shape[0]*self.shape[1]*8 + 8)
             self.result = np.empty(self.shape)
             self.diagnostics = np.empty(2, dtype=np.int32)
         return self.result, self.diagnostics
 
 
-def forest_quadratic(curvature, rhs, edges, penalty, lower, upper, *, native_host_memory_bytes=None,
-                     prepared=None):
+def forest_quadratic(curvature, rhs, edges, penalty, lower, upper, *, prepared=None):
     """Solve an N-by-R box QP with one shared forest and region-specific bounds.
 
     The caller independently audits KKT residuals against the original inputs.
@@ -1137,24 +794,17 @@ def forest_quadratic(curvature, rhs, edges, penalty, lower, upper, *, native_hos
     if prepared is not None and prepared.closed:
         raise NativeExecutionError('Prepared forest context is closed')
     library = native_library()[0] if prepared is None else prepared.library
-    from .execution import preflight_host_export, resolve_memory_budget
-    budget = (prepared.native_host_memory_bytes if prepared is not None and native_host_memory_bytes is None
-              else resolve_memory_budget(native_host_memory_bytes))
-    needed = _forest_memory_query(library)(n, len(edges))
-    if needed < 0 or needed > budget:
-        raise NativeExecutionError(f"Native forest requires {needed} tracked host bytes; available {budget} bytes")
     ints = np.ctypeslib.ndpointer(dtype=np.int32, flags='C_CONTIGUOUS')
     doubles = np.ctypeslib.ndpointer(dtype=np.float64, flags='C_CONTIGUOUS')
     entry = library.CliPP2ForestQP
     entry.argtypes = [ct.c_int, ct.c_int, ct.c_int, ints, doubles, doubles,
-                     ct.c_double, doubles, doubles, doubles, ints, ct.c_longlong]
+                     ct.c_double, doubles, doubles, doubles, ints]
     entry.restype = ct.c_int
     if prepared is None:
-        preflight_host_export(h.nbytes + 8)
         result, diagnostics = np.empty_like(h), np.empty(2, dtype=np.int32)
     else:
         result, diagnostics = prepared.buffers()
-    if entry(n, regions, len(edges), edges, h, b, float(penalty), lo, hi, result, diagnostics, budget):
+    if entry(n, regions, len(edges), edges, h, b, float(penalty), lo, hi, result, diagnostics):
         raise NativeExecutionError('CliPP2 forest kernel failed: '+library.CliPP2KernelLastError().decode())
     if not np.isfinite(result).all():
         raise NativeExecutionError('CliPP2 forest kernel returned nonfinite coordinates')
@@ -1194,37 +844,15 @@ def _continuation_diagnostics(report, tree, missing):
 def continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing, *, keep_raw_phi=True):
     """One source-bound native batch; capacities retain independent state.
 
-    A finite host admission cap owns mandatory state, separately from temporary
-    tile scratch. NumPy norm, cut-score einsum and scalar sine retain the
+    NumPy norm, cut-score einsum and scalar sine retain the
     reference's platform-specific arithmetic. Exported arrays are caller-owned.
     """
-    from .execution import preflight_host_export
-
     model.backend._require_open()
     requested_workers = model.backend.cpu_threads
     workers = min(requested_workers, max(model.n, model.r, len(requested)))
     if max(model.n, model.r, len(requested), policy.levels, policy.iterations_per_level) > np.iinfo(np.int32).max:
         raise ValueError("CPU continuation dimensions and budgets must fit int32")
     lib, identity = native_library()
-    memory = lib.CliPP2ContinuationMemory
-    memory.argtypes = [ct.c_int]*4 + [ct.POINTER(ct.c_longlong)]*3
-    memory.restype = ct.c_int
-    shared, state, per_thread = (ct.c_longlong() for _ in range(3))
-    if memory(model.n, model.r, workers, len(requested), ct.byref(shared),
-              ct.byref(state), ct.byref(per_thread)):
-        raise NativeExecutionError("Continuation memory dimensions overflow")
-    available = model.backend.native_host_memory_bytes - model.backend.native_host_bytes
-    minimum = shared.value + state.value + per_thread.value
-    requested_bytes = shared.value + state.value*(workers if len(requested) >= workers else 1) + per_thread.value*workers
-    if requested_bytes > available:
-        # Optional plans must not crowd out mandatory state or its worker team.
-        model.backend.release_optional_cache()
-        available = model.backend.native_host_memory_bytes - model.backend.native_host_bytes
-    if minimum > available:
-        raise NativeExecutionError(f"CPU continuation requires {minimum} tracked native host bytes; available {available} bytes")
-    export_bytes = len(requested)*(model.n*model.r*8*int(keep_raw_phi) + model.n*12
-                                  + (model.n-1)*9 + ct.sizeof(_ContinuationReport))
-    preflight_host_export(export_bytes)
     observations = _Observations()
     view = model.backend.lib.CliPP2BackendObservationView
     view.argtypes = [ct.c_void_p, ct.POINTER(_Observations)]
@@ -1283,7 +911,7 @@ def continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing, *
     entry = lib.CliPP2ContinueCPU
     entry.argtypes = [ct.POINTER(_Observations), ints, ints, doubles, doubles, doubles,
         ct.c_int, ints, ct.POINTER(_ContinuationPolicy), doubles, norm_type, scores_type,
-        ct.c_int, ct.c_longlong, ct.c_longlong, ct.c_int, ct.c_void_p, ints, bytes_,
+        ct.c_int, ct.c_int, ct.c_void_p, ints, bytes_,
         ct.POINTER(_ContinuationReport), ct.POINTER(ct.c_int)]
     entry.restype = ct.c_int
     lib.CliPP2ContinuationLastError.argtypes = []
@@ -1291,7 +919,7 @@ def continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing, *
     actual = ct.c_int()
     code = entry(ct.byref(observations), edges, canonical, initial, lower, upper,
         len(requested), capacities, ct.byref(native_policy), gaps, norm, cut_scores, workers,
-        model.backend.workspace_bytes, available, int(keep_raw_phi),
+        int(keep_raw_phi),
         None if output is None else output.ctypes.data, labels, cuts, reports, ct.byref(actual))
     if reduction_errors:
         raise NativeExecutionError("CPU continuation compatibility reduction failed") from reduction_errors[0]
@@ -1303,15 +931,10 @@ def continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing, *
         "workers": actual.value, "capacities": len(requested), "initial_evaluations": 1,
         "node_evaluations": 1+sum(report.evaluations for report in reports),
         "qp_calls": sum(report.qp_calls for report in reports),
-        "workspace_limit": model.backend.workspace_bytes,
-        "native_host_memory_limit": model.backend.native_host_memory_bytes,
-        "native_host_available_for_continuation": available,
-        "caller_export_bytes": export_bytes, "raw_coordinates_exported": keep_raw_phi,
+        "raw_coordinates_exported": keep_raw_phi,
         "cpu_thread_budget": requested_workers,
         "parallel_axis": "capacities" if len(requested) >= actual.value else "cells_and_regions",
-        "compatibility_reductions": ["numpy_longdouble_einsum", "numpy_blas_norm"],
-        "tracked_native_reserved_bound_bytes": shared.value + per_thread.value*actual.value + state.value*(
-            actual.value if len(requested) >= actual.value else 1)}
+        "compatibility_reductions": ["numpy_longdouble_einsum", "numpy_blas_norm"]}
     execution["cell_evaluations"] = execution["node_evaluations"]*model.n*model.r
     result = []
     for index, (capacity, report) in enumerate(zip(requested, reports)):

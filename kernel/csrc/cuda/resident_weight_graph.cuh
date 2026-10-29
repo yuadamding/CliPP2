@@ -1,7 +1,7 @@
-// Experimental fixed-chunk resident optimizer. Ordinary CUDA graphs execute
+// Fixed-chunk resident optimizer. Ordinary CUDA graphs execute
 // 32 ordered request waves; the host reads only terminal flags between chunks.
 // No objective, gradient, weight, or SLSQP state is delivered before completion.
-// Include globally after scoring.cuh. Production dispatch remains opt-in.
+// Include globally after scoring.cuh.
 #pragma once
 #include "resident_weight_kernel.cuh"
 

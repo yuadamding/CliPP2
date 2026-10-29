@@ -125,9 +125,7 @@ def _likelihood_ranked_edges(model, tree, edges, cuts=()):
     if not len(nodes):
         return [], {"method": "regional_grid_profile_gain_v1", "ranked_edges": 0}
     grid = np.unique(np.r_[np.linspace(0., 1., 33), 1e-6])
-    # Sums, invalid counts and complement work arrays share this soft budget;
-    # one column is the minimum when N alone exceeds it.
-    width = max(1, min(8, (8*1024*1024)//(48*tree.n)))
+    width = 8
     gains = np.zeros(len(nodes))
     roots = component[nodes]
     for region in range(model.r):
@@ -289,8 +287,7 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
 
 
 def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, progress_callback=None,
-                weight_batch_size=1, weight_batch_state_bytes=8*1024**2, device_proposals=False,
-                continuation_batch_size=1, coarsening_batch_size=1, retain_evidence=False):
+                retain_evidence=False):
     """Fit tree proposals followed by bounded free-center joint reassignment.
 
     Truth is deliberately absent. Every R>=1 uses this same forest continuation,
@@ -300,16 +297,9 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     from ..kernel.solver import generate_candidates
     from .progress import ProgressReporter
 
-    if type(weight_batch_size) is not int or weight_batch_size < 1:
-        raise ValueError("weight_batch_size must be a positive integer")
-    if type(weight_batch_state_bytes) is not int or weight_batch_state_bytes < 0:
-        raise ValueError("weight_batch_state_bytes must be a nonnegative integer")
-    if type(device_proposals) is not bool:
-        raise TypeError("device_proposals must be a boolean")
-    if type(continuation_batch_size) is not int or continuation_batch_size < 1:
-        raise ValueError("continuation_batch_size must be a positive integer")
-    if type(coarsening_batch_size) is not int or coarsening_batch_size < 1:
-        raise ValueError("coarsening_batch_size must be a positive integer")
+    device_proposals = getattr(getattr(model, "backend", None), "kind", None) == "cuda"
+    weight_batch_size = coarsening_batch_size = 32 if device_proposals else 1
+    continuation_batch_size = 4 if device_proposals else 1
     if type(retain_evidence) is not bool:
         raise TypeError("retain_evidence must be a boolean")
     progress = None if progress_callback is None else ProgressReporter(model, progress_callback)
@@ -353,10 +343,8 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     if progress is not None:
         progress.emit(complete=True)
         progress.start_phase("candidate_search")
-    bank_options = {} if (weight_batch_size == 1 and weight_batch_state_bytes == 8*1024**2
-                          and not device_proposals) else {
-        "weight_batch_size": weight_batch_size, "weight_batch_state_bytes": weight_batch_state_bytes,
-        "device_proposals": device_proposals}
+    bank_options = {} if weight_batch_size == 1 and not device_proposals else {
+        "weight_batch_size": weight_batch_size, "device_proposals": device_proposals}
     bank_options["retain_evidence"] = retain_evidence
     bank = (_CandidateBank(model, tree, **bank_options) if progress is None else
             _CandidateBank(model, tree, progress=progress.completed_candidate,
