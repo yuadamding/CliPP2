@@ -51,6 +51,29 @@ class Candidate:
         return {"provenance": _plain(self.provenance), "refit": _plain(self.fit.diagnostics)}
 
 
+@dataclass(frozen=True, slots=True)
+class RefitAttempt:
+    """Exact refit identity and outcome, including unresolved cached failures."""
+
+    key: tuple
+    outcome: str
+    reason: str | None
+    state_index: int | None
+    fit: FitResult | None = None
+
+
+def _outcome_kind(fitted):
+    if fitted.eligible:
+        return "eligible"
+    if str(fitted.reason).startswith(("unsupported_cluster_region:", "empty_cluster_region_box:")):
+        return "structural_exclusion"
+    if (fitted.reason == "zero_mixture_weight"
+            and fitted.diagnostics.get("rejection_kind") != "weight_convergence"):
+        return "completed_ineligible"
+    # An unfamiliar rejection cannot certify a required numerical evaluation.
+    return "unresolved_numerical"
+
+
 def score_key(candidate):
     tree = candidate.membership_kind == "tree"
     return (candidate.score, len(candidate.fit.centers), 0 if tree else 1,
@@ -94,8 +117,9 @@ class CandidateBank:
         self.request_progress = request_progress
         self.candidates, self.general_rejections, self.attempt_records = [], [], []
         self.by_cuts, self.by_membership, self.ineligible = {}, {}, {}
-        self.membership_attempts, self.structural_rejections = {}, {}
+        self.membership_attempts = {}
         self._attempts, self._states, self._structural = {}, {}, {}
+        self._outcomes, self._outcome_records = {}, []
         self.duplicate_routes = self.refit_calls = 0
         self.attempt_cache_hits = self.structural_cache_hits = 0
         self.refit_seconds = 0.0
@@ -225,13 +249,17 @@ class CandidateBank:
         membership, cuts, labels = partition.membership.key, partition.cuts, partition.labels
         provenance = _plain(provenance)
         attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
+        outcome = _outcome_kind(fitted)
         record = None
         if self.retain_evidence:
             record = {"membership_kind": membership[0],
                       "cuts" if cuts is not None else "labels": list(cuts) if cuts is not None else labels.tolist(),
                       "initial_centers_ccf": None if centers is None else centers.tolist(),
                       "numerical_policy": self.numerical_policy, "provenance": provenance,
-                      "eligible": bool(fitted.eligible), "reason": fitted.reason}
+                      "eligible": bool(fitted.eligible), "reason": fitted.reason,
+                      "outcome": outcome}
+            if outcome == "completed_ineligible":
+                record["completed_fit"] = candidate_record(Candidate(fitted))
             self.attempt_records.append(record)
         self._attempts[attempt] = None
         if not fitted.eligible:
@@ -241,10 +269,10 @@ class CandidateBank:
                 self.general_rejections.append(rejection)
             else:
                 self.ineligible[cuts] = rejection
-            if str(fitted.reason).startswith(("unsupported_cluster_region", "empty_cluster_region_box")):
+            if outcome == "structural_exclusion":
                 self._structural[membership] = rejection
-                if cuts is None:
-                    self.structural_rejections[labels.tobytes()] = rejection
+            self._store_outcome(attempt, outcome, fitted.reason, None,
+                                fitted if outcome == "completed_ineligible" else None)
             return None
         # Prepared results share this exact membership; reuse its active labels
         # instead of expanding the same retained tree cuts again for validation.
@@ -287,6 +315,7 @@ class CandidateBank:
             candidate.provenance.append(provenance)
             self.duplicate_routes += 1
         self._attempts[attempt] = candidate
+        self._store_outcome(attempt, outcome, fitted.reason, candidate.state_index)
         if record is not None:
             record["state_index"] = candidate.state_index
         index, key = (self.by_cuts, cuts) if cuts is not None else (self.by_membership, labels.tobytes())
@@ -294,6 +323,20 @@ class CandidateBank:
         if previous is None or score_key(candidate) < score_key(previous):
             index[key] = candidate
         return candidate
+
+    def _store_outcome(self, key, outcome, reason, state_index, fitted=None):
+        if key in self._outcomes:
+            raise ValueError("An exact refit attempt was committed twice")
+        self._outcomes[key] = len(self._outcome_records)
+        self._outcome_records.append(RefitAttempt(key, outcome, reason, state_index, fitted))
+
+    def refit_attempt_index(self, labels, initial_centers):
+        labels, centers = _canonical_inputs(labels, initial_centers, self.model.n, self.model.r)
+        key = (("general", labels.tobytes()),
+               None if centers is None else centers.tobytes(), self.numerical_policy)
+        if key not in self._outcomes:
+            raise ValueError("Required membership refit has no exact outcome record")
+        return self._outcomes[key]
 
     def consider_independent(self, requests):
         """Optional bounded batching; dependencies must remain outside this call.

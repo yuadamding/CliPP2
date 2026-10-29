@@ -1,9 +1,10 @@
-"""Tree proposals, bounded general memberships and joint-mixture selection.
+"""Tree proposals, complete terminal single moves and joint-mixture selection.
 
 The winner is reconciled against every eligible scored candidate, including
 intermediate refinement states. Exhaustive enumeration covers only connected
 coarsenings of generated seeds and supported one-edge splits of small trees,
-not all possible tree partitions or continuous optima.
+not all possible tree partitions or continuous optima. Every represented q's
+final winner must pass a complete single-mutation neighborhood audit.
 """
 
 from dataclasses import dataclass
@@ -28,6 +29,8 @@ class TreeFit:
     pilot: np.ndarray
     diagnostics: dict
     attempt_links: tuple | None = None
+    attempt_outcomes: tuple | None = None
+    membership_audits: tuple | None = None
 
     @property
     def labels(self):
@@ -288,10 +291,10 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
 
 def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, progress_callback=None,
                 retain_evidence=False):
-    """Fit tree proposals followed by bounded free-center joint reassignment.
+    """Fit initial proposals, then certify every represented fixed-q winner.
 
     Truth is deliberately absent. Every R>=1 uses this same forest continuation,
-    conditional refitter, candidate registry and bounded membership expansion.
+    conditional refitter, candidate registry and complete single-move final audit.
     JSON replay evidence is an explicit research export, not routine fitting.
     """
     from ..kernel.solver import generate_candidates
@@ -449,6 +452,13 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     times["reassignment_inclusive_seconds"] = reassignment.get("seconds", 0.0)
     if progress is not None:
         progress.emit(bank, complete=True)
+        progress.start_phase("membership_audit", bank)
+    from .membership_audit import refine_memberships
+    started = perf_counter()
+    terminal_audits, audit_passes = refine_memberships(model, bank)
+    times["membership_audit_inclusive_seconds"] = perf_counter()-started
+    if progress is not None:
+        progress.emit(bank, complete=True)
         progress.start_phase("selection", bank)
     selected = min(bank.candidates, key=_score_key)
     if selected.score > bank.original_selected.score:
@@ -478,6 +488,7 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
         "visited_cut_subsets": subset_visits,
         "supported_proposals": supported_proposals,
         "reassignment": reassignment,
+        "membership_audit_passes": audit_passes,
         "original_tree_candidate_count": original_count,
         "original_tree_selected_score": bank.original_selected.score,
         "selected_membership_kind": selected.membership_kind,
@@ -497,14 +508,14 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
             + (8 * len(candidate.cuts) if candidate.membership_kind == "tree"
                                                else candidate.fit.labels.nbytes)
             for candidate in bank.candidates),
-        "candidate_membership_storage": "compact_tree_cut_sets_plus_bounded_explicit_general_labels",
+        "candidate_membership_storage": "compact_tree_cut_sets_plus_explicit_general_labels",
         "selection": "minimum_over_complete_eligible_scored_bank",
         "global_optimality_certified": False,
     }
     if retain_evidence:
         diagnostics["candidate_evidence"] = bank.evidence(selected)
     return TreeFit(selected, bank.candidates, tree, np.asarray(pilot), diagnostics,
-                   bank.compact_attempt_links())
+                   bank.compact_attempt_links(), tuple(bank._outcome_records), terminal_audits)
 
 
 # Historical import name, not an alternative estimator.

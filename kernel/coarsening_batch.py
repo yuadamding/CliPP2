@@ -148,6 +148,13 @@ class CoarseningBatch:
                     else:
                         columns, counts, _, _ = ticket.request
                         ticket.key = self.model._weight_key(columns, counts)
+                        if ticket.key in self.model._weight_results:
+                            # Only the logical turn may consume/account for a
+                            # cached success. Finish earlier work, then let the
+                            # ordinary path recheck this hit without a native solve.
+                            ticket.close()
+                            self._count('prepared')
+                            break
                         ticket.problem = leases.enter_context(self.model.backend.mixture_problem(columns.columns))
                     self._count('prepared')
                 active = [ticket for _, ticket in pending if ticket.request is not None]

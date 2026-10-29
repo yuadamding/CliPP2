@@ -1,1 +1,1 @@
-"""Free-center tree proposals and bounded joint-membership selection."""
+"""Free-center tree proposals and audited joint-membership selection."""

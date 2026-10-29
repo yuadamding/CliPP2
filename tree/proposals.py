@@ -316,7 +316,8 @@ def _retained_bytes(candidates, bank):
         "membership_attempt_key_bytes": sum(
             len(labels) + (0 if centers is None else len(centers))
             for labels, centers in getattr(bank, "membership_attempts", {})),
-        "structural_key_bytes": sum(map(len, getattr(bank, "structural_rejections", {}))),
+        "structural_key_bytes": sum(len(key) for kind, key in getattr(bank, "_structural", {})
+                                    if kind == "general"),
         "scope": "logical_array_and_key_payload_not_RSS_or_Python_overhead",
     }
 

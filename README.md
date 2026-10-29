@@ -61,14 +61,11 @@ all regions; gzip is supported. See [example](examples/exampleTumor1.tsv).
 | `allele_a_cn`, `allele_b_cn` | Major and minor copy numbers, with `allele_a_cn >= allele_b_cn` |
 
 ## Output
-
-The output directory contains three tables:
-
-| File | Contents |
+| File | Columns |
 | --- | --- |
-| `{tumor_id}_mutation_clusters.tsv` | Mutation cluster assignments and regional CCFs |
-| `{tumor_id}_cluster_centers.tsv` | Cluster sizes and regional CCFs |
-| `{tumor_id}_mutation_region_multiplicity.tsv` | CCF and multiplicity estimates for each mutation–region pair |
+| `{tumor_id}_mutation_clusters.tsv` | `tumor_id`, `mutation_id`, `cluster_label`, `phi_<region>` for each region |
+| `{tumor_id}_cluster_centers.tsv` | `tumor_id`, `cluster_label`, `cluster_size`, `phi_<region>` for each region |
+| `{tumor_id}_mutation_region_multiplicity.tsv` | `tumor_id`, `mutation_id`, `region_id`, `phi`, `multiplicity_call` |
 
 ## Contact
 
