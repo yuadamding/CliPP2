@@ -1,5 +1,5 @@
 // CliPP2-owned regional forest interface, derived from CliPP1.5 9e51e30ac8b0c8c9ab1f46821b496909843bda0c.
-// AGPL-3.0; original attribution and local changes are recorded in the project NOTICE.
+// AGPL-3.0; see LICENSE. Local adaptation history is recorded in Git.
 #include "forest.h"
 #include <cstdio>
 #include <exception>
@@ -14,7 +14,7 @@ namespace {
 thread_local char last_error[1024] = "";
 }
 
-extern "C" int CliPP2KernelABI() { return 4; }
+extern "C" int CliPP2KernelABI() { return 5; }
 extern "C" const char* CliPP2KernelBuildId() { return CLIPP2_KERNEL_BUILD_ID; }
 extern "C" const char* CliPP2KernelLastError() { return last_error; }
 extern "C" long long CliPP2ForestRequiredBytes(int n,int edges) {

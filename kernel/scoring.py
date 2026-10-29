@@ -2,6 +2,7 @@
 # Adapted from CliPP1.5.
 
 import hashlib
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -18,7 +19,27 @@ class WeightConvergenceError(RuntimeError):
     """Finite weight iterates failed the existing fixed-budget stationarity gate."""
 
 
+def completed_weight(callback, q, *, cached=False, failed=False):
+    """One detached completed-solve snapshot, never an optimizer-request tape."""
+    if callback is not None:
+        callback(dict(operation="weight_fit", occupied_q=int(q),
+                      boundary="cache_hit" if cached else "solve_failed" if failed else "solve_complete"))
+
+
 def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None, progress_callback=None):
+    """Fit fixed-center weights; report once after context-owned execution."""
+    if progress_callback is not None and not callable(progress_callback):
+        raise TypeError("progress_callback must be callable or None")
+    from .backend import DeviceMixtureProblem
+    owner = (log_columns.backend().weight_submission()
+             if isinstance(log_columns, DeviceMixtureProblem) else nullcontext())
+    with owner:
+        result = _fit_mixture_weights(log_columns, initial_weights, telemetry=telemetry)
+    completed_weight(progress_callback, len(result["cluster_weights"]))
+    return result
+
+
+def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
     """Maximize the joint observed likelihood of an N-by-q log-emission matrix.
 
     This is a concave weight problem. The reported Frank-Wolfe gap bounds the
@@ -28,18 +49,6 @@ def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None, pr
     Center fitting itself remains conditional on the supplied hard partition;
     this function does not claim a joint mixture-center maximum.
     """
-    if progress_callback is not None and not callable(progress_callback):
-        raise TypeError("progress_callback must be callable or None")
-
-    completed_requests = 0
-
-    def completed(request):
-        nonlocal completed_requests
-        completed_requests += 1
-        progress_callback({"operation": "weight_fit", "boundary": "request_complete",
-                           "request": request, "completed_requests": completed_requests,
-                           "occupied_q": int(k)})
-
     def record(name, amount=1):
         if telemetry is not None:
             telemetry[name] = telemetry.get(name, 0) + amount
@@ -74,8 +83,6 @@ def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None, pr
             "weight_optimality_gap": 0.0,
             "weight_active_score_gap": 0.0,
         }
-        if progress_callback is not None:
-            completed("single_column" if device_oracle is None else "evaluate")
         return result
     if device_oracle is None:
         shifted = log_kernel - offset[:, None]
@@ -103,20 +110,14 @@ def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None, pr
         return mass_value
 
     def objective(w):
-        value = -float(log_mass(w).mean())
-        if progress_callback is not None:
-            completed("objective")
-        return value
+        return -float(log_mass(w).mean())
 
     def gradient(w):
         # A boundary derivative can exceed float64 even when its log mixture
         # is finite. Saturation preserves the entering direction, never marks
         # that finite support impossible, and cannot pass the stationarity gate.
         ratios = shifted - log_mass(w)[:, None]
-        value = -np.exp(np.minimum(ratios, 345.)).mean(axis=0)
-        if progress_callback is not None:
-            completed("gradient")
-        return value
+        return -np.exp(np.minimum(ratios, 345.)).mean(axis=0)
 
     if device_oracle is not None:
         evaluation_key, evaluation = None, None
@@ -128,8 +129,6 @@ def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None, pr
                 evaluation = device_oracle.evaluate_weights(w)
                 evaluation_key = key
                 record("weight_device_evaluations")
-                if progress_callback is not None:
-                    completed("evaluate")
             else:
                 record("weight_device_evaluation_cache_hits")
             return evaluation
@@ -207,22 +206,14 @@ def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None, pr
                 trial[shrink] = amount*(1.-fraction)
                 log_ratio = numerator-log_mass(trial)
                 value = float(np.mean(sign*np.exp(np.minimum(log_ratio, 345.))))
-                if progress_callback is not None:
-                    completed("transfer_derivative")
                 return value
         else:
             device_oracle.prepare_transfer(weights, grow, shrink)
             record("weight_device_transfer_preparations")
-            if progress_callback is not None:
-                completed("prepare_transfer")
 
             def derivative(fraction):
                 record("weight_device_transfer_trials")
                 value = device_oracle.transfer_derivative(fraction)
-                # The endpoint was computed by prepare_transfer; only interior
-                # and zero-endpoint trials submit another numerical request.
-                if progress_callback is not None and fraction != 1.0:
-                    completed("transfer_derivative")
                 return value
 
         fraction = 1.0 if derivative(1.0) >= 0 else brentq(derivative, 0.0, 1.0, xtol=1e-14)
@@ -240,9 +231,10 @@ def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None, pr
         raise WeightConvergenceError("Cluster-weight likelihood optimization did not converge")
     likelihood = (float(np.sum(offset + log_mass(weights))) if device_oracle is None
                   else evaluate(weights)[2])
-    return {
+    result = {
         "cluster_weights": weights,
         "log_likelihood": likelihood,
         "weight_optimality_gap": optimality_gap,
         "weight_active_score_gap": active_gap,
     }
+    return result

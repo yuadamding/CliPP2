@@ -27,6 +27,7 @@ class TreeFit:
     tree: object
     pilot: np.ndarray
     diagnostics: dict
+    attempt_links: tuple | None = None
 
     @property
     def labels(self):
@@ -289,11 +290,12 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds):
 
 def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, progress_callback=None,
                 weight_batch_size=1, weight_batch_state_bytes=8*1024**2, device_proposals=False,
-                continuation_batch_size=1, coarsening_batch_size=1):
+                continuation_batch_size=1, coarsening_batch_size=1, retain_evidence=False):
     """Fit tree proposals followed by bounded free-center joint reassignment.
 
     Truth is deliberately absent. Every R>=1 uses this same forest continuation,
     conditional refitter, candidate registry and bounded membership expansion.
+    JSON replay evidence is an explicit research export, not routine fitting.
     """
     from ..kernel.solver import generate_candidates
     from .progress import ProgressReporter
@@ -308,6 +310,8 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
         raise ValueError("continuation_batch_size must be a positive integer")
     if type(coarsening_batch_size) is not int or coarsening_batch_size < 1:
         raise ValueError("coarsening_batch_size must be a positive integer")
+    if type(retain_evidence) is not bool:
+        raise TypeError("retain_evidence must be a boolean")
     progress = None if progress_callback is None else ProgressReporter(model, progress_callback)
 
     total_started = perf_counter()
@@ -353,6 +357,7 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
                           and not device_proposals) else {
         "weight_batch_size": weight_batch_size, "weight_batch_state_bytes": weight_batch_state_bytes,
         "device_proposals": device_proposals}
+    bank_options["retain_evidence"] = retain_evidence
     bank = (_CandidateBank(model, tree, **bank_options) if progress is None else
             _CandidateBank(model, tree, progress=progress.completed_candidate,
                            request_progress=progress.completed_operation, **bank_options))
@@ -476,7 +481,8 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     if progress is not None:
         progress.requested_k, progress.occupied_q = max_clusters, len(selected.fit.centers)
         progress.emit(bank, complete=True)
-    return TreeFit(selected, bank.candidates, tree, np.asarray(pilot), {
+    diagnostics = {
+        "diagnostics_schema_version": 2,
         "pipeline": ALGORITHM,
         "tree_identity": tree.identity, "tree_kind": "mutation_similarity_not_phylogeny",
         "pilots": pilot_diagnostics, "seeds": seeds_diagnostics,
@@ -505,9 +511,12 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
             for candidate in bank.candidates),
         "candidate_membership_storage": "compact_tree_cut_sets_plus_bounded_explicit_general_labels",
         "selection": "minimum_over_complete_eligible_scored_bank",
-        "candidate_evidence": bank.evidence(selected),
         "global_optimality_certified": False,
-    })
+    }
+    if retain_evidence:
+        diagnostics["candidate_evidence"] = bank.evidence(selected)
+    return TreeFit(selected, bank.candidates, tree, np.asarray(pilot), diagnostics,
+                   bank.compact_attempt_links())
 
 
 # Historical import name, not an alternative estimator.

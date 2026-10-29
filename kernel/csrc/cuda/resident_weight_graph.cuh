@@ -19,7 +19,7 @@ __global__ void resident_graph_initialize(ResidentWeightItem* items) {
     else {
         state.bind(static_cast<int>(p.n),static_cast<int>(p.q),item.arena,item.indices);
         ResidentWeightState::copy(state.weights,item.initial,static_cast<int>(p.q));
-        resident_advance(state);
+        state.advance();
     }
 }
 __global__ void resident_graph_logs(ResidentWeightItem* items) {
@@ -53,34 +53,17 @@ __global__ void resident_graph_leaves(ResidentWeightItem* items) {
         fraction=operation==ResidentWeightOperation::Prepare?1.:state.fraction;
     }
     __syncthreads();
-    const i64 row=threadIdx.x;
     if(active) {
     const double a=evaluation?0.:log(item->grow_weight+fraction*item->amount);
     const double b=evaluation?0.:log(item->amount*(1.-fraction));
     for(i64 leaf=blockIdx.x;leaf<item->leaf_count;leaf+=gridDim.x) {
         const auto range=scoring_leaf(leaf,item->full_chunks,item->tail);
         if(evaluation) {
-            if(row<range.count)masses[row]=mixture_row_log_mass(p.columns,p.offsets,p.kernel,
-                state.request_weights,p.n,p.q,range.first+row);
-            __syncthreads();
-            for(i64 first=0;first<p.q+2;first+=scoring_plane_tile) {
-                const i64 count=p.q+2-first<scoring_plane_tile?p.q+2-first:scoring_plane_tile;
-                if(row<range.count) {
-                    const i64 source=range.first+row;const double offset=p.offsets[source],mass=masses[row];
-                    for(i64 plane=0;plane<count;++plane) {
-                        const i64 k=first+plane;
-                        values[plane*128+row]=k==0?mass:(k==1?offset+mass:
-                            scoring_capped_exp(p.columns[k-2][source]-offset-mass));
-                    }
-                }
-                __syncthreads();
-                scoring_leaf_reduce(values,range.count,first,count,leaf,item->leaf_count,chains,item->leaf_partials);
-            }
+            scoring_evaluate_leaf(p.columns,p.offsets,p.kernel,state.request_weights,p.n,p.q,range,
+                                  leaf,item->leaf_count,item->leaf_partials,values,chains,masses);
         } else {
-            if(row<range.count)values[row]=mixture_trial_row(range.first+row,p.other,p.grow_log,
-                p.shrink_log,p.numerator,p.sign,a,b);
-            __syncthreads();
-            scoring_leaf_reduce(values,range.count,0,1,leaf,item->leaf_count,chains,item->leaf_partials);
+            scoring_trial_leaf(range,leaf,item->leaf_count,p.other,p.grow_log,p.shrink_log,
+                p.numerator,p.sign,a,b,item->leaf_partials,values,chains);
         }
     }
     }
@@ -101,29 +84,8 @@ __global__ void resident_graph_combine(ResidentWeightItem* items) {
     __syncthreads();
     if(active) {
     for(i64 job=blockIdx.x;job<planes*item->chunks;job+=gridDim.x) {
-        const i64 plane=job/item->chunks,chunk=job%item->chunks;
-        const bool full=chunk<item->full_chunks;
-        const i64 count=full?8192:p.n%8192,first=chunk*64;
-        if(threadIdx.x<(full?64:item->tail_count)) {
-            const i64 slot=full?2*threadIdx.x:item->tail[threadIdx.x].slot;
-            values[slot]=item->leaf_partials[plane*item->leaf_count+first+threadIdx.x];
-        }
-        __syncthreads();
-        int deepest=0;
-        for(i64 maximum=count;maximum>128;++deepest) { i64 split=maximum/2;split-=split%8;maximum-=split; }
-        for(int depth=deepest-1;depth>=0;--depth) {
-            const int nodes=1<<depth;
-            for(int node=threadIdx.x;node<nodes;node+=blockDim.x) {
-                i64 offset,size;
-                if(ordered_tree_node(count,depth,node,offset,size)&&size>128) {
-                    const int left=node<<(7-depth),right=left+(1<<(6-depth));
-                    values[left]=values[left]+values[right];
-                }
-            }
-            __syncthreads();
-        }
-        if(!threadIdx.x) { double sum=-0.;sum+=values[0];item->chunk_partials[job]=sum; }
-        __syncthreads();
+        scoring_combine_chunk(item->leaf_partials,p.n,item->chunks,item->full_chunks,item->tail,
+                              item->tail_count,item->leaf_count,job,item->chunk_partials,values);
     }
     }
     __syncthreads();
@@ -139,7 +101,7 @@ __global__ void resident_graph_reply(ResidentWeightItem* items) {
     const i64 planes=state.operation==ResidentWeightOperation::Evaluate?p.q+2:1;
     for(i64 plane=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;plane<planes;
         plane+=static_cast<i64>(gridDim.x)*blockDim.x) {
-        double result=-0.;for(i64 chunk=0;chunk<item->chunks;++chunk)result+=item->chunk_partials[plane*item->chunks+chunk];
+        const double result=scoring_finish_plane(item->chunk_partials,item->chunks,plane);
         if(state.operation==ResidentWeightOperation::Evaluate) {
             if(plane==0)state.cache_objective=-result/p.n;
             else if(plane==1)state.cache_likelihood=result;
@@ -152,7 +114,7 @@ __global__ void resident_graph_reply(ResidentWeightItem* items) {
 __global__ void resident_graph_advance(ResidentWeightItem* items) {
     if(threadIdx.x)return;
     auto& state=*items[blockIdx.x].state;
-    if(!resident_terminal(state))resident_advance(state);
+    if(!resident_terminal(state))state.advance();
 }
 __global__ void resident_graph_terminal_flags(const ResidentWeightItem* items,i64 count,int* flags) {
     for(i64 index=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;index<count;

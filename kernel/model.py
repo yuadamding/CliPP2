@@ -24,13 +24,14 @@ import numpy as np
 from scipy.special import gammaln
 
 from . import SCORE_DEFINITION
-from .backend import DeviceColumn, NativeBackend, NativeExecutionError, ScientificCandidateRejection
+from .backend import (DeviceColumn, NativeBackend, NativeExecutionError, ScientificCandidateRejection,
+                      controller_reservation)
 from .initialization import pooled_ccf_initialization
 from .likelihood import MIXED_EPS, RegionalView
-from .scoring import WEIGHT_CONTROLLER_ID, WeightConvergenceError, fit_mixture_weights
+from .scoring import WEIGHT_CONTROLLER_ID, WeightConvergenceError, completed_weight, fit_mixture_weights
 from .topology import Membership
 from ..io.data import readonly_array
-from ..config import DEFAULT_MAX_CLUSTERS
+from ..config import DEFAULT_MAX_CLUSTERS, MAX_MULTIPLICITY
 
 
 # Mixed-CN emissions/boxes stay fixed; their assignment mask now enters scoring.
@@ -144,16 +145,6 @@ class JointColumnSet:
         return rows, destinations, gains[rows, destinations]
 
 
-def _replay_weight_progress(events, names, counts, notify):
-    for completed, kind in enumerate(events, 1):
-        event = {"operation": "weight_fit",
-                 "boundary": "resident_complete" if kind == 3 else "request_complete",
-                 "request": names[kind], "occupied_q": len(counts)}
-        if kind != 3:
-            event["completed_requests"] = completed
-        notify(event)
-
-
 def _freeze(value):
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
@@ -203,7 +194,7 @@ class RegionalModel:
                  workspace_bytes=64 * 1024**2, native_host_memory_bytes=None,
                  device_memory_bytes=None, cpu_threads=None, device_cache_bytes=256*1024**2,
                  score_capacity=DEFAULT_MAX_CLUSTERS, probability_reuse=False,
-                 resident_initialization=False, resident_weights=False):
+                 resident_weights=False):
         self.data = data
         ids, regions = tuple(data.mutation_ids), tuple(data.region_ids)
         if any(not isinstance(x, str) for x in ids + regions):
@@ -259,7 +250,8 @@ class RegionalModel:
         denominator = (1 - self.purity) * self.normal + self.purity * self.total
         if np.any(denominator <= 0):
             raise ValueError("Normal-plus-tumor denominator must be positive")
-        self.support = readonly_array(np.where(self.mixed, np.minimum(self.major, 4), self.major), dtype=int)
+        self.support = readonly_array(
+            np.where(self.mixed, np.minimum(self.major, MAX_MULTIPLICITY), self.major), dtype=int)
         self.lower = readonly_array(np.where(self.mixed, MIXED_EPS, 0.0))
         self.upper = readonly_array(np.where(self.mixed, np.asarray(data.phi_upper)[ix], 1.0))
         if np.any(self.upper < self.lower) or np.any(self.upper > 1) or not np.isfinite(self.upper).all():
@@ -297,7 +289,7 @@ class RegionalModel:
             raise ValueError("weight_cache_bytes must be a nonnegative integer")
         self._weight_cache_bytes = weight_cache_bytes
         if any(type(flag) is not bool for flag in
-               (probability_reuse, resident_initialization, resident_weights)):
+               (probability_reuse, resident_weights)):
             raise TypeError("Experimental CUDA execution flags must be booleans")
         if resident_weights and self.device == "cpu":
             raise ValueError("Resident weight fitting requires explicit CUDA execution")
@@ -305,8 +297,6 @@ class RegionalModel:
         execution_flags = {}
         if probability_reuse:
             execution_flags["probability_reuse"] = True
-        if resident_initialization:
-            execution_flags["resident_initialization"] = True
         self.backend = NativeBackend(self, workspace_bytes,
                                      native_host_memory_bytes=native_host_memory_bytes,
                                      device_memory_bytes=device_memory_bytes,
@@ -700,7 +690,10 @@ class RegionalModel:
         cached = self._cached_weight_result(key, columns, progress_callback)
         if cached is not None:
             return cached
-        observer = {} if progress_callback is None else {"progress_callback": progress_callback}
+        return self._uncached_weight_result(key, columns, counts, matrix, progress_callback)
+
+    def _uncached_weight_result(self, key, columns, counts, matrix=None, progress_callback=None):
+        """Solve after the caller's ordinary cache miss, without a second touch."""
         if self.backend.kind == "cuda":
             with self.backend.mixture_problem(columns.columns) as problem:
                 self.telemetry["weight_solves"] += 1
@@ -708,13 +701,9 @@ class RegionalModel:
                     from .resident_weights import fit_resident_weights
                     outcome, = fit_resident_weights(self.backend, [problem], [counts], telemetry=self.telemetry)
                 else:
-                    result = fit_mixture_weights(problem, counts, telemetry=self.telemetry, **observer)
+                    result = fit_mixture_weights(problem, counts, telemetry=self.telemetry)
             if self._resident_weights:
-                # Coarse observation only, after the numerical lease closes;
-                # never invent the reference controller's inner-loop events.
-                if progress_callback is not None:
-                    progress_callback(dict(operation="weight_fit", boundary="resident_complete",
-                                           request="resident_fit", occupied_q=len(counts)))
+                completed_weight(progress_callback, len(counts), failed=outcome.operation == "error")
                 if outcome.operation == "error":
                     raise outcome.error
                 result = outcome.result
@@ -722,7 +711,9 @@ class RegionalModel:
             if matrix is None:
                 matrix = columns.materialize()
             self.telemetry["weight_solves"] += 1
-            result = fit_mixture_weights(matrix, counts, telemetry=self.telemetry, **observer)
+            result = fit_mixture_weights(matrix, counts, telemetry=self.telemetry)
+        if not self._resident_weights:
+            completed_weight(progress_callback, len(counts))
         return self._cache_weight_result(key, columns, counts, result)
 
     def _weight_key(self, columns, counts):
@@ -738,10 +729,10 @@ class RegionalModel:
     def _solve_weight_problems(self, problems, counts, *, max_active, state_budget_bytes,
                                telemetry=None, progress_callback=None):
         """One bounded submission route; resident mode has coarse events only."""
-        from .weight_batch import controller_reservation, fit_weight_batch
         if progress_callback is not None and not callable(progress_callback):
             raise TypeError("progress_callback must be callable or None")
         if not self._resident_weights:
+            from .weight_batch import fit_weight_batch
             return fit_weight_batch(self.backend, problems, counts, max_active=max_active,
                 state_budget_bytes=state_budget_bytes, telemetry=telemetry,
                 progress_callback=progress_callback)
@@ -782,8 +773,8 @@ class RegionalModel:
             results.extend(outcomes)
             if progress_callback is not None:
                 for index in range(first, last):
-                    progress_callback(index, dict(operation="weight_fit", boundary="resident_complete",
-                        request="resident_fit", occupied_q=problems[index].shape[1]))
+                    completed_weight(lambda record: progress_callback(index, record),
+                                     problems[index].shape[1], failed=results[index].operation == "error")
             first = last
         return tuple(results)
 
@@ -802,8 +793,7 @@ class RegionalModel:
         cached = self._weight_results.get(key)
         if cached is not None:
             if progress_callback is not None:
-                progress_callback({"operation": "weight_fit", "boundary": "cache_hit",
-                                   "occupied_q": len(columns.columns)})
+                completed_weight(progress_callback, len(columns.columns), cached=True)
             self._weight_results.move_to_end(key)
             self.telemetry["weight_cache_hits"] += 1
             return cached[0]
@@ -845,19 +835,14 @@ class RegionalModel:
                                   partition.coordinate_fits, partition.columns, partition.membership,
                                   progress_callback=progress_callback)
 
-    def refit_batch_reservation(self, q, *, progress=False):
+    def refit_batch_reservation(self, q):
         """Conservative additional host state, excluding caller-owned outputs."""
-        from .weight_batch import controller_reservation
-        # Compact one-byte request kinds cover the fixed 2000 SLSQP iterations
-        # and 10000 pair-repair/100-step Brent budgets. Capacity is checked while
-        # recording; callback dictionaries are reconstructed only at publication.
-        events = 2*1024**2+2*q if progress else 0
         # Each observed task retains both its int64 rows and independent key
         # bytes (16*N*R), even with the preparation cache disabled. Membership,
         # group rows, validation copies and general-partition keys need their
         # own allowance. Charge shared objects again rather than assuming reuse.
         prepared = (64+16*self.r)*self.n+(2*_CACHE_ENTRY_BYTES+256)*q*self.r
-        return controller_reservation(q)+prepared+4096+events
+        return controller_reservation(q)+prepared+4096
 
     def refit_prepared_batch(self, requests, *, max_active=8, state_budget_bytes=8*1024**2,
                              on_result=None):
@@ -897,21 +882,11 @@ class RegionalModel:
             if not pending:
                 return
             batch = pending[:]
-            names = ("evaluate", "prepare_transfer", "transfer_derivative", "resident_fit")
-
-            def record(index, event):
-                item = batch[index]
-                if item["request"][3] is not None:
-                    if len(item["events"]) >= 1200000+len(item["request"][1]):
-                        raise MemoryError("Ordered weight progress exceeds its reserved capacity")
-                    item["events"].append(names.index(event["request"]))
-
             solve_started = time.perf_counter()
             try:
                 outcomes = self._solve_weight_problems([item["problem"] for item in batch],
                     [item["request"][1] for item in batch], max_active=max_active,
-                    state_budget_bytes=state_budget_bytes, telemetry=self.telemetry,
-                    progress_callback=record if any(item["request"][3] is not None for item in batch) else None)
+                    state_budget_bytes=state_budget_bytes, telemetry=self.telemetry)
             finally:
                 self.telemetry["weight_seconds"] += time.perf_counter()-solve_started
                 # Completed cache entries must never retain live device problems.
@@ -921,8 +896,7 @@ class RegionalModel:
                 columns, counts, _, notify = item["request"]
                 mixture = self._cached_weight_result(item["key"], columns, notify)
                 if mixture is None:
-                    if notify is not None:
-                        _replay_weight_progress(item["events"], names, counts, notify)
+                    completed_weight(notify, len(counts), failed=outcome.operation == "error")
                     if outcome.operation == "error":
                         fitted = self._finish_refit_steps(item["steps"], error=outcome.error)
                     else:
@@ -941,7 +915,7 @@ class RegionalModel:
                 if partition.model_identity != self.identity:
                     raise ValueError("Prepared partition belongs to another regional model")
                 q = int(partition.labels.max())+1
-                charge = self.refit_batch_reservation(q, progress=callback is not None)
+                charge = self.refit_batch_reservation(q)
                 admission = self._weight_admission(q, [item["problem"].shape[1] for item in pending])
                 # Assume every candidate column is new; exact reuse can only
                 # reduce the physical reservation. Parent handles remain live.
@@ -982,7 +956,7 @@ class RegionalModel:
                 problem = leases.enter_context(self.backend.mixture_problem(columns.columns))
                 self.telemetry["weight_solves"] += 1
                 pending.append({"index": index, "steps": steps, "request": request,
-                                "key": key, "problem": problem, "events": bytearray()})
+                                "key": key, "problem": problem})
                 # Only pending owns these leases now. Keeping loop locals alive
                 # across flush() would retain the last completed column set
                 # while the next conditional preparation allocates new columns.

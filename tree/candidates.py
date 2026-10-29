@@ -83,13 +83,16 @@ class CandidateBank:
 
     def __init__(self, model, tree, *, progress=None, request_progress=None,
                  weight_batch_size=1, weight_batch_state_bytes=8*1024**2,
-                 device_proposals=False):
+                 device_proposals=False, retain_evidence=True):
         if type(weight_batch_size) is not int or weight_batch_size < 1:
             raise ValueError("weight_batch_size must be a positive integer")
         if type(weight_batch_state_bytes) is not int or weight_batch_state_bytes < 0:
             raise ValueError("weight_batch_state_bytes must be a nonnegative integer")
         if type(device_proposals) is not bool:
             raise TypeError("device_proposals must be a boolean")
+        if type(retain_evidence) is not bool:
+            raise TypeError("retain_evidence must be a boolean")
+        self.retain_evidence = retain_evidence
         self.model, self.tree = model, tree
         self.progress = progress
         self.request_progress = request_progress
@@ -227,15 +230,17 @@ class CandidateBank:
         membership, cuts, labels = partition.membership.key, partition.cuts, partition.labels
         provenance = _plain(provenance)
         attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
-        record = {"membership_kind": membership[0],
-                  "cuts" if cuts is not None else "labels": list(cuts) if cuts is not None else labels.tolist(),
-                  "initial_centers_ccf": None if centers is None else centers.tolist(),
-                  "numerical_policy": self.numerical_policy, "provenance": provenance,
-                  "eligible": bool(fitted.eligible), "reason": fitted.reason}
-        self.attempt_records.append(record)
+        record = None
+        if self.retain_evidence:
+            record = {"membership_kind": membership[0],
+                      "cuts" if cuts is not None else "labels": list(cuts) if cuts is not None else labels.tolist(),
+                      "initial_centers_ccf": None if centers is None else centers.tolist(),
+                      "numerical_policy": self.numerical_policy, "provenance": provenance,
+                      "eligible": bool(fitted.eligible), "reason": fitted.reason}
+            self.attempt_records.append(record)
         self._attempts[attempt] = None
         if not fitted.eligible:
-            rejection = {"cuts" if cuts is not None else "labels": record.get("cuts", record.get("labels")),
+            rejection = {"cuts" if cuts is not None else "labels": list(cuts) if cuts is not None else labels.tolist(),
                          "reason": fitted.reason, "provenance": [provenance]}
             if cuts is None:
                 self.general_rejections.append(rejection)
@@ -287,7 +292,8 @@ class CandidateBank:
             candidate.provenance.append(provenance)
             self.duplicate_routes += 1
         self._attempts[attempt] = candidate
-        record["state_index"] = candidate.state_index
+        if record is not None:
+            record["state_index"] = candidate.state_index
         index, key = (self.by_cuts, cuts) if cuts is not None else (self.by_membership, labels.tobytes())
         previous = index.get(key)
         if previous is None or score_key(candidate) < score_key(previous):
@@ -368,7 +374,7 @@ class CandidateBank:
                     raise ValueError("Candidate labels and frozen-tree cuts disagree")
             membership = ("tree", cuts) if cuts is not None else ("general", labels.tobytes())
             attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
-            charge = model.refit_batch_reservation(int(labels.max())+1, progress=self.request_progress is not None)
+            charge = model.refit_batch_reservation(int(labels.max())+1)
             if pending and (membership in memberships or len(pending) >= self.weight_batch_size
                             or reserved+charge > self.weight_batch_state_bytes
                             or membership in self._structural or attempt in self._attempts):
@@ -385,25 +391,36 @@ class CandidateBank:
         return results
 
     def evidence(self, selected):
+        if not self.retain_evidence:
+            raise ValueError("Research evidence was not retained for this candidate bank")
         return candidate_evidence(self.tree, self.candidates, selected, self.attempt_records)
+
+    def compact_attempt_links(self):
+        """Share immutable membership keys, without retaining research records."""
+        return tuple((key[0], candidate is not None,
+                      None if candidate is None else candidate.state_index)
+                     for key, candidate in self._attempts.items())
+
+
+def candidate_record(candidate):
+    """One explicit research-export record, never a numerical execution step."""
+    fit = candidate.fit
+    return {
+        "membership_kind": candidate.membership_kind,
+        "cuts" if candidate.cuts is not None else "labels":
+            list(candidate.cuts) if candidate.cuts is not None else fit.labels.tolist(),
+        "centers_ccf": fit.centers.tolist(), "weights": fit.weights.tolist(),
+        "conditional_log_likelihood": float(fit.conditional_log_likelihood),
+        "mixture_log_likelihood": float(fit.mixture_log_likelihood),
+        "complexity_penalty": float(fit.complexity_penalty), "score": float(fit.score),
+        "eligible": bool(fit.eligible), "reason": fit.reason,
+        "diagnostics": _plain(fit.diagnostics), "provenance": _plain(candidate.provenance),
+    }
 
 
 def candidate_evidence(tree, candidates, selected, attempts=()):
     """JSON-ready replay payload; connected memberships never store N labels."""
-    states = []
-    for candidate in candidates:
-        fit = candidate.fit
-        states.append({
-            "membership_kind": candidate.membership_kind,
-            "cuts" if candidate.cuts is not None else "labels":
-                list(candidate.cuts) if candidate.cuts is not None else fit.labels.tolist(),
-            "centers_ccf": fit.centers.tolist(), "weights": fit.weights.tolist(),
-            "conditional_log_likelihood": float(fit.conditional_log_likelihood),
-            "mixture_log_likelihood": float(fit.mixture_log_likelihood),
-            "complexity_penalty": float(fit.complexity_penalty), "score": float(fit.score),
-            "eligible": bool(fit.eligible), "reason": fit.reason,
-            "diagnostics": _plain(fit.diagnostics), "provenance": _plain(candidate.provenance),
-        })
+    states = [candidate_record(candidate) for candidate in candidates]
     selected_index = next((i for i, candidate in enumerate(candidates) if candidate is selected), None)
     if selected_index is None:
         raise ValueError("Selected fitted state is absent from the candidate bank")
@@ -414,12 +431,113 @@ def candidate_evidence(tree, candidates, selected, attempts=()):
             "refit_attempts": _plain(attempts)}
 
 
-def replay_candidate_evidence(evidence):
-    """Reconstruct memberships and replay score selection, not refit numerics.
+def _membership_size(tree, key):
+    kind, value = key
+    if kind == "tree":
+        if (not isinstance(value, tuple) or any(type(edge) is not int or
+                not 0 <= edge < len(tree.edges) for edge in value)
+                or tuple(sorted(set(value))) != value):
+            raise ValueError("Candidate bank has invalid tree cuts")
+        return len(value)+1
+    if kind != "general" or not isinstance(value, bytes) or len(value) != 8*tree.n:
+        raise ValueError("Candidate bank has invalid general membership")
+    labels = np.frombuffer(value, dtype=np.int64)
+    q = len(np.unique(labels))
+    if list(dict.fromkeys(labels.tolist())) != list(range(q)):
+        raise ValueError("Candidate bank must retain canonical occupied memberships")
+    return q
 
-    The persisted centers and weights permit a separate likelihood replay with
-    original inputs. This check alone does not verify those inputs/emissions.
-    """
+
+def validate_candidate_bank(tree, candidates, selected, attempt_links=None):
+    """Audit retained objects directly; no export, decoding or refit execution."""
+    if not isinstance(tree, FrozenTree):
+        raise ValueError("Candidate bank requires a validated immutable FrozenTree")
+    if not candidates or not any(candidate is selected for candidate in candidates):
+        raise ValueError("Selected fitted state is absent from the complete candidate bank")
+    memberships, region_count = [], None
+    for index, candidate in enumerate(candidates):
+        fit, membership = candidate.fit, candidate.fit.membership
+        if (not isinstance(membership, Membership) or
+                (membership.tree is not None and membership.tree is not tree
+                 and membership.tree.identity != tree.identity)):
+            raise ValueError("Candidate belongs to a different frozen tree")
+        key = membership.key
+        q = _membership_size(tree, key)
+        centers, weights = np.asarray(fit.centers), np.asarray(fit.weights)
+        if (centers.ndim != 2 or centers.shape[0] != q or not centers.shape[1]
+                or not np.isfinite(centers).all() or np.any(centers < 0) or np.any(centers > 1)):
+            raise ValueError("Candidate bank needs finite q-by-R CCF centers in [0,1]")
+        if region_count is None:
+            region_count = centers.shape[1]
+        elif centers.shape[1] != region_count:
+            raise ValueError("Candidate bank mixes different region counts")
+        if (weights.shape != (q,) or not np.isfinite(weights).all() or np.any(weights <= 0)
+                or not np.isclose(weights.sum(), 1., rtol=0., atol=1e-12)):
+            raise ValueError("Candidate bank has invalid occupied weights")
+        penalty = float((q*region_count+q-1)*np.log(tree.n))
+        score = -2*float(fit.mixture_log_likelihood)+penalty
+        if (fit.eligible is not True or not np.isfinite(score)
+                or not np.isfinite(fit.conditional_log_likelihood)
+                or not np.isclose(penalty, fit.complexity_penalty, atol=1e-7, rtol=1e-10)
+                or not np.isclose(score, fit.score, atol=1e-7, rtol=1e-10)):
+            raise ValueError("Candidate bank score arithmetic is inconsistent")
+        if candidate.state_index is not None and (type(candidate.state_index) is not int
+                                                  or candidate.state_index != index):
+            raise ValueError("Retained fitted-state index disagrees with candidate order")
+        memberships.append(key)
+    if attempt_links is not None:
+        retained = set()
+        for key, eligible, index in attempt_links:
+            _membership_size(tree, key)
+            if type(eligible) is not bool:
+                raise ValueError("Refit attempt eligibility must be explicit")
+            if not eligible:
+                if index is not None:
+                    raise ValueError("A rejected refit attempt cannot reference an eligible state")
+                continue
+            if type(index) is not int or not 0 <= index < len(candidates):
+                raise ValueError("An eligible refit attempt is missing its retained fitted state")
+            if key != memberships[index]:
+                raise ValueError("Refit attempt and retained fitted-state memberships disagree")
+            retained.add(index)
+        if retained != set(range(len(candidates))):
+            raise ValueError("Candidate bank contains fitted states without an eligible refit attempt")
+    if selected is not min(candidates, key=score_key):
+        raise ValueError("Selected fit is not the best complete-bank score and tie-break")
+    return selected
+
+
+def evidence_attempt_links(tree, attempts, region_count):
+    """Decode optional research records into the same compact audit links."""
+    if not isinstance(attempts, (list, tuple)):
+        raise ValueError("Candidate evidence refit attempts must be a sequence")
+    links = []
+    for attempt in attempts:
+        key = _evidence_membership(tree, attempt).key
+        q = _membership_size(tree, key)
+        initial = attempt.get("initial_centers_ccf")
+        if initial is not None:
+            initial = np.asarray(initial, dtype=float)
+            if initial.shape != (q, region_count) or not np.isfinite(initial).all():
+                raise ValueError("Refit attempt has invalid initial centers")
+        if not attempt.get("eligible", False) and "state_index" in attempt:
+            raise ValueError("A rejected refit attempt cannot reference an eligible state")
+        links.append((key, attempt.get("eligible"), attempt.get("state_index")))
+    return tuple(links)
+
+
+def _evidence_membership(tree, item):
+    if item["membership_kind"] == "tree":
+        cuts = tuple(item["cuts"])
+        _membership_size(tree, ("tree", cuts))
+        return Membership(tree, cuts)
+    if item["membership_kind"] != "general":
+        raise ValueError("Unknown candidate membership kind")
+    return Membership(explicit_labels=np.asarray(item["labels"]))
+
+
+def replay_candidate_evidence(evidence):
+    """Explicit research decode followed by the ordinary retained-object audit."""
     if evidence.get("version") != 1:
         raise ValueError("Unknown candidate-evidence version")
     record = evidence["tree"]
@@ -428,109 +546,40 @@ def replay_candidate_evidence(evidence):
     tree = FrozenTree(edges, record["n"], tuple(record["mutation_ids"]), record["kind"])
     if tree.identity != record["identity"]:
         raise ValueError("Candidate evidence tree identity mismatch")
-    candidates, region_count = [], None
-    # Replay-local and independent of fitted caches. Many state/attempt records
-    # share a compact cut set; reconstruct each membership at most once.
+    candidates = []
+    # Only explicit decoding expands tree memberships. Bound repeated expansion
+    # to the existing eight-MiB replay-local cache.
     partitions, partition_bytes = OrderedDict(), 0
-
-    def replay_partition(cuts):
-        nonlocal partition_bytes
-        if cuts in partitions:
-            partitions.move_to_end(cuts)
-            return partitions[cuts]
-        labels = partition_from_cuts(tree, cuts)
-        # Evidence can describe an enormous bank. Replay caching is bounded
-        # execution work, not permanent expansion of every compact cut state.
-        if labels.nbytes <= 8*1024**2:
-            while partition_bytes + labels.nbytes > 8*1024**2:
-                _, removed = partitions.popitem(last=False)
-                partition_bytes -= removed.nbytes
-            partitions[cuts] = labels
-            partition_bytes += labels.nbytes
-        return labels
-    for item in evidence["states"]:
-        kind = item["membership_kind"]
-        cuts = tuple(item["cuts"]) if kind == "tree" else None
-        if kind not in ("tree", "general"):
-            raise ValueError("Unknown candidate membership kind")
-        if cuts is not None and (any(type(edge) is not int or not 0 <= edge < len(tree.edges)
-                                    for edge in cuts) or tuple(sorted(set(cuts))) != cuts):
-            raise ValueError("Candidate evidence has invalid tree cuts")
-        labels = replay_partition(cuts) if cuts is not None else np.asarray(item["labels"])
+    for index, item in enumerate(evidence["states"]):
+        membership = _evidence_membership(tree, item)
+        if membership.cuts is None:
+            labels = membership.labels
+        elif membership.cuts in partitions:
+            partitions.move_to_end(membership.cuts)
+            labels = partitions[membership.cuts]
+        else:
+            labels = partition_from_cuts(tree, membership.cuts)
+            if labels.nbytes <= 8*1024**2:
+                while partition_bytes+labels.nbytes > 8*1024**2:
+                    _, removed = partitions.popitem(last=False)
+                    partition_bytes -= removed.nbytes
+                partitions[membership.cuts] = labels
+                partition_bytes += labels.nbytes
         centers = np.asarray(item["centers_ccf"], dtype=float)
-        if (centers.ndim != 2 or not all(centers.shape)
-                or not np.isfinite(centers).all()
-                or np.any(centers < 0) or np.any(centers > 1)):
-            raise ValueError("Candidate evidence needs finite q-by-R CCF centers in [0,1]")
-        if region_count is None:
-            region_count = centers.shape[1]
-        elif centers.shape[1] != region_count:
-            raise ValueError("Candidate evidence mixes different region counts")
+        if centers.ndim != 2 or not all(centers.shape):
+            raise ValueError("Candidate evidence needs nonempty q-by-R centers")
         canonical, aligned = _canonical_inputs(labels, centers, tree.n, centers.shape[1])
         if not np.array_equal(canonical, labels) or not np.array_equal(aligned, centers):
             raise ValueError("Candidate evidence must retain canonical aligned memberships")
-        weights = np.asarray(item["weights"], dtype=float)
-        if (weights.shape != (len(centers),) or not np.isfinite(weights).all()
-                or np.any(weights <= 0) or not np.isclose(weights.sum(), 1., rtol=0., atol=1e-12)):
-            raise ValueError("Candidate evidence has invalid occupied weights")
-        q, r = centers.shape
-        penalty = float((q*r+q-1)*np.log(tree.n))
-        score = -2*float(item["mixture_log_likelihood"])+penalty
-        if (item["eligible"] is not True or not np.isfinite(score)
-                or not np.isfinite(item["conditional_log_likelihood"])
-                or not np.isclose(penalty, item["complexity_penalty"], atol=1e-7, rtol=1e-10)
-                or not np.isclose(score, item["score"], atol=1e-7, rtol=1e-10)):
-            raise ValueError("Candidate evidence score arithmetic is inconsistent")
-        membership = (Membership(tree, cuts) if cuts is not None else Membership(explicit_labels=labels))
-        fit = FitResult(membership, centers, weights,
-                          item["conditional_log_likelihood"], item["mixture_log_likelihood"],
-                          item["complexity_penalty"], item["score"], True,
-                          item["reason"], item["diagnostics"])
-        candidates.append(Candidate(fit, item["provenance"]))
-    # Arithmetic-only callers may omit attempts. A saved search ledger that
-    # includes them must account for every retained eligible fitted state.
-    attempts = evidence.get("refit_attempts", ())
-    if not isinstance(attempts, (list, tuple)):
-        raise ValueError("Candidate evidence refit attempts must be a sequence")
-    retained = set()
-    for attempt in attempts:
-        if type(attempt.get("eligible")) is not bool:
-            raise ValueError("Refit attempt eligibility must be explicit")
-        kind = attempt.get("membership_kind")
-        if kind == "tree":
-            cuts = tuple(attempt["cuts"])
-            if (any(type(edge) is not int or not 0 <= edge < len(tree.edges) for edge in cuts)
-                    or tuple(sorted(set(cuts))) != cuts):
-                raise ValueError("Refit attempt has invalid tree cuts")
-            labels = replay_partition(cuts)
-        elif kind == "general":
-            cuts, labels = None, np.asarray(attempt["labels"])
-            canonical, _ = _canonical_inputs(labels, None, tree.n, region_count)
-            if not np.array_equal(canonical, labels):
-                raise ValueError("Refit attempt must retain canonical memberships")
-        else:
-            raise ValueError("Unknown refit-attempt membership kind")
-        initial = attempt.get("initial_centers_ccf")
-        if initial is not None:
-            _canonical_inputs(labels, initial, tree.n, region_count)
-        if not attempt["eligible"]:
-            if "state_index" in attempt:
-                raise ValueError("A rejected refit attempt cannot reference an eligible state")
-            continue
-        index = attempt.get("state_index")
-        if type(index) is not int or not 0 <= index < len(candidates):
-            raise ValueError("An eligible refit attempt is missing its retained fitted state")
-        candidate = candidates[index]
-        if (kind != candidate.membership_kind or cuts != candidate.cuts
-                or (cuts is None and not np.array_equal(labels, candidate.fit.labels))):
-            raise ValueError("Refit attempt and retained fitted-state memberships disagree")
-        retained.add(index)
-    if attempts and retained != set(range(len(candidates))):
-        raise ValueError("Candidate evidence contains fitted states without an eligible refit attempt")
+        fit = FitResult(membership, centers, np.asarray(item["weights"], dtype=float),
+                        item["conditional_log_likelihood"], item["mixture_log_likelihood"],
+                        item["complexity_penalty"], item["score"], item["eligible"],
+                        item["reason"], item["diagnostics"])
+        candidates.append(Candidate(fit, item["provenance"], index))
     selected_index = evidence["selected_state_index"]
     if type(selected_index) is not int or not 0 <= selected_index < len(candidates):
         raise ValueError("Candidate evidence has no selected state")
-    selected = candidates[selected_index]
-    if selected is not min(candidates, key=score_key):
-        raise ValueError("Candidate evidence selection is not the complete-bank minimum")
+    attempts = evidence.get("refit_attempts", ())
+    links = evidence_attempt_links(tree, attempts, candidates[0].fit.centers.shape[1])
+    selected = validate_candidate_bank(tree, candidates, candidates[selected_index], links if attempts else None)
     return selected, tuple(candidates)

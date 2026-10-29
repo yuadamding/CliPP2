@@ -44,7 +44,8 @@ from scipy.linalg.lapack import HAS_ILP64
 from scipy.optimize import _slsqp_py
 
 from ..io.data import readonly_array
-from .scoring import WeightConvergenceError
+from .scoring import WeightConvergenceError, completed_weight
+from .backend import slsqp_workspace_size
 
 
 _WRAPPER_SHA256 = "9e97132bfb5773096675f03b0adb6f5ed67510666f7f2c5da22d0e9669c2e338"
@@ -78,14 +79,6 @@ class WeightRequest:
     fraction: float | None = None
     result: object = None
     error: BaseException | None = None
-
-
-def slsqp_workspace_size(q):
-    """Owned native arrays, excluding Python state and evaluator storage."""
-    if type(q) is not int or q < 1:
-        raise ValueError("q must be a positive integer")
-    buffer = q*(q+1)//2 + 10*q*q + 35*q + 30
-    return 8*(buffer + 7*q + 4) + 4*(2*q + 3)
 
 
 def _slsqp(initial, objective, gradient, trace=None):
@@ -221,7 +214,6 @@ class WeightController:
         self.shape, self.telemetry = tuple(shape), telemetry
         self.callback, self.trace = progress_callback, slsqp_trace
         self.callback_error = self.scientific_error = None
-        self.completed_requests = 0
         self._started = self._terminal = False
         initial = None if initial_weights is None else np.array(initial_weights, copy=True)
         self._generator = self._run(initial)
@@ -238,6 +230,11 @@ class WeightController:
             return self._generator.send(reply)
         except StopIteration as complete:
             self._terminal = True
+            try:
+                completed_weight(self.callback, self.shape[1])
+            except BaseException as error:
+                self.callback_error = error
+                return WeightRequest("error", error=error)
             return WeightRequest("complete", result=complete.value)
         except BaseException as error:
             self._terminal = True
@@ -260,17 +257,6 @@ class WeightController:
         if self.telemetry is not None:
             self.telemetry[name] = self.telemetry.get(name, 0) + amount
 
-    def _completed(self, request):
-        if self.callback is not None:
-            self.completed_requests += 1
-            try:
-                self.callback({"operation": "weight_fit", "boundary": "request_complete",
-                               "request": request, "completed_requests": self.completed_requests,
-                               "occupied_q": self.shape[1]})
-            except BaseException as error:
-                self.callback_error = error
-                raise
-
     def _run(self, initial):
         n, q = self.shape
         self._record("weight_problem_calls")
@@ -282,7 +268,6 @@ class WeightController:
         weights /= weights.sum()
         if q == 1:
             result = yield WeightRequest("evaluate", readonly_array(np.ones(1)))
-            self._completed("evaluate")
             return self._result(np.ones(1), result[2], 0., 0.)
         evaluation_key, evaluation = None, None
 
@@ -294,7 +279,6 @@ class WeightController:
                 evaluation = (raw[0], readonly_array(raw[1]), raw[2])
                 evaluation_key = key
                 self._record("weight_device_evaluations")
-                self._completed("evaluate")
             else:
                 self._record("weight_device_evaluation_cache_hits")
             return evaluation
@@ -335,13 +319,10 @@ class WeightController:
             self._record("weight_transfer_steps")
             yield WeightRequest("prepare_transfer", readonly_array(weights), grow, shrink)
             self._record("weight_device_transfer_preparations")
-            self._completed("prepare_transfer")
 
             def derivative(fraction):
                 self._record("weight_device_transfer_trials")
                 value = yield WeightRequest("transfer_derivative", fraction=float(fraction))
-                if fraction != 1.:
-                    self._completed("transfer_derivative")
                 return value
 
             fraction = 1. if (yield from derivative(1.)) >= 0 else (yield from _brent(derivative))

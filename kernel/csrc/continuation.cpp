@@ -508,7 +508,7 @@ struct ContinuationState {
 
 struct ContinuationOwner {
     int n,r;
-    bool raw;
+    bool raw,boundaries;
     std::size_t cells;
     std::vector<int> edges,canonical;
     Vector lower,upper,gaps;
@@ -523,8 +523,8 @@ struct ContinuationOwner {
     ContinuationOwner(int nodes,int regions,const int* graph,const int* order,
         const double* x,const double* values,const double* gradient,const double* curvature,
         const double* lo,const double* hi,const double* gap,const CliPP2ContinuationPolicy& rules,
-        CliPP2Norm reduce_norm,CliPP2CutScores reduce_scores,bool keep_raw):
-        n(nodes),r(regions),raw(keep_raw),cells(static_cast<std::size_t>(n)*r),
+        CliPP2Norm reduce_norm,CliPP2CutScores reduce_scores,bool keep_raw,bool boundary_requests):
+        n(nodes),r(regions),raw(keep_raw),boundaries(boundary_requests),cells(static_cast<std::size_t>(n)*r),
         canonical(order,order+n),lower(lo,lo+cells),upper(hi,hi+cells),gaps(gap,gap+n+1),
         policy(rules),norm(reduce_norm),scores(reduce_scores),tree(n,n-1,graph) {
         if(n>1)edges.assign(graph,graph+2*static_cast<std::size_t>(n-1));
@@ -580,7 +580,8 @@ void* ContinuationState::work(void* opaque) {
         const clipp2::ObservationSoA metadata{group.n,group.r,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr};
         Engine engine{metadata,group.n,group.r,group.n-1,group.cells,group.edges.data(),
             group.canonical.data(),group.lower.data(),group.upper.data(),group.gaps.data(),group.policy,
-            group.norm,group.scores,group.tree,nullptr,state.arena,&state,terms,progress};
+            group.norm,group.scores,group.tree,nullptr,state.arena,&state,terms,
+            group.boundaries?progress:nullptr};
         engine.run(group.initial,state.capacity,group.raw?state.output.data():nullptr,
             state.labels.data(),state.cuts.data(),state.report);
         std::lock_guard<std::mutex> lock(state.mutex);
@@ -629,12 +630,13 @@ extern "C" int CliPP2ContinuationOwnerCreate(int n,int r,const int* edges,const 
     const double* initial,const double* values,const double* gradient,const double* curvature,
     const double* lower,const double* upper,const double* gaps,int tasks,const int* capacities,
     const CliPP2ContinuationPolicy* policy,CliPP2Norm norm,CliPP2CutScores scores,
-    long long host_budget_bytes,long long stack_bytes,int output_flags,void** owner) {
+    long long host_budget_bytes,long long stack_bytes,int output_flags,int boundary_requests,void** owner) {
     error_message[0]='\0';if(owner)*owner=nullptr;
     try {
         long long shared=0,state=0,stack=0;
         if(!owner||!canonical||!initial||!values||!gradient||!curvature||!lower||!upper||!gaps
             ||!capacities||!policy||!norm||!scores||(n>1&&!edges)||host_budget_bytes<0
+            ||(boundary_requests!=0&&boundary_requests!=1)
             ||CliPP2ContinuationOwnerMemory(n,r,tasks,stack_bytes,output_flags,&shared,&state,&stack))
             throw std::invalid_argument("Invalid continuation owner dimensions or buffers");
         if(shared+static_cast<long double>(tasks)*(state+stack)>host_budget_bytes)
@@ -664,7 +666,7 @@ extern "C" int CliPP2ContinuationOwnerCreate(int n,int r,const int* edges,const 
                 throw std::invalid_argument("Invalid continuation initial state");
         }
         auto group=std::make_unique<ContinuationOwner>(n,r,edges,canonical,initial,values,gradient,curvature,
-            lower,upper,gaps,*policy,norm,scores,output_flags);
+            lower,upper,gaps,*policy,norm,scores,output_flags,boundary_requests);
         group->states.reserve(tasks);
         for(int i=0;i<tasks;++i)
             group->states.emplace_back(std::make_unique<ContinuationState>(*group,n,r,capacities[i],output_flags));

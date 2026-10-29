@@ -21,13 +21,6 @@ struct ResidentWeightItem {
     double endpoint=0.,grow_weight=0.,amount=0.;
 };
 
-__device__ void resident_advance(ResidentWeightState& state) {
-    const auto start=clock64();
-    state.advance();
-    state.controller_cycles+=clock64()-start;
-    ++state.controller_calls;
-}
-
 __global__ void resident_weight_small_kernel(const ResidentWeightItem* items,i64 count) {
     __shared__ double terms[small_mixture_rows*(small_mixture_columns+2)];
     __shared__ double endpoint,grow_weight,amount;
@@ -42,7 +35,7 @@ __global__ void resident_weight_small_kernel(const ResidentWeightItem* items,i64
             } else {
                 state.bind(static_cast<int>(p.n),static_cast<int>(p.q),item.arena,item.indices);
                 ResidentWeightState::copy(state.weights,item.initial,static_cast<int>(p.q));
-                resident_advance(state);
+                state.advance();
             }
         }
         __syncthreads();
@@ -77,7 +70,7 @@ __global__ void resident_weight_small_kernel(const ResidentWeightItem* items,i64
                 }
             }
             __syncthreads();
-            if(!row)resident_advance(state);
+            if(!row)state.advance();
             __syncthreads();
         }
         __syncthreads();

@@ -35,10 +35,15 @@ class FitConfig:
     native_host_memory_mb: int | None = None
     device_memory_mb: int | None = None
     cpu_threads: int | None = None
+    execution_policy: str = "auto"
 
     def __post_init__(self) -> None:
         if self.device not in ("cpu", "cuda"):
             raise ValueError("device must be cpu or cuda.")
+        if self.execution_policy not in ("auto", "reference", "candidate"):
+            raise ValueError("execution_policy must be auto, reference or candidate.")
+        if self.execution_policy == "candidate" and self.device != "cuda":
+            raise ValueError("The candidate execution policy requires device=cuda.")
         if not isinstance(self.verbose, bool):
             raise TypeError("verbose must be a boolean.")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
@@ -61,13 +66,15 @@ def resolve_fit_config(
     grid_cache_mb: int = 64, device_cache_mb: int = 256, workspace_mb: int = 64,
     native_host_memory_mb: int | None = None, device_memory_mb: int | None = None,
     cpu_threads: int | None = None,
+    execution_policy: str = "auto",
 ) -> FitConfig:
     """Construct the only public fit configuration; removed knobs raise TypeError."""
     return FitConfig(device=device, verbose=verbose, max_major_cn=max_major_cn,
                      max_clusters=max_clusters, grid_cache_mb=grid_cache_mb,
                      device_cache_mb=device_cache_mb, workspace_mb=workspace_mb,
                      native_host_memory_mb=native_host_memory_mb,
-                     device_memory_mb=device_memory_mb, cpu_threads=cpu_threads)
+                     device_memory_mb=device_memory_mb, cpu_threads=cpu_threads,
+                     execution_policy=execution_policy)
 
 
 __all__ = ["FitConfig", "resolve_fit_config"]

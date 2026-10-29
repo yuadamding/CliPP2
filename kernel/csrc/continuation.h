@@ -46,7 +46,7 @@ int CliPP2ContinuationOwnerCreate(int n,int regions,const int* edges,const int* 
     const double* initial,const double* values,const double* gradient,const double* curvature,
     const double* lower,const double* upper,const double* gaps,int tasks,const int* capacities,
     const CliPP2ContinuationPolicy*,CliPP2Norm,CliPP2CutScores,long long host_budget_bytes,
-    long long stack_bytes,int output_flags,void** owner);
+    long long stack_bytes,int output_flags,int boundary_requests,void** owner);
 int CliPP2ContinuationOwnerPoll(void* owner,int task,int wait,CliPP2ContinuationRequest* request);
 int CliPP2ContinuationOwnerReply(void* owner,int task,std::uint64_t sequence,
     const double* values,const double* gradient,const double* curvature);

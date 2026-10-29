@@ -1,4 +1,4 @@
-// CliPP2-owned shared-forest interface; AGPL-3.0. See the project NOTICE.
+// CliPP2-owned shared-forest interface; AGPL-3.0. See LICENSE and bindings.cpp.
 #pragma once
 
 namespace clipp2kernel {

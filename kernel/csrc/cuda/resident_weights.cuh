@@ -45,10 +45,6 @@ template<class Blas=DeviceBlas> struct WeightState {
     double fraction=0.,derivative=0.,xpre=0.,xcur=0.,xblk=0.,fpre=0.,fcur=0.,fblk=0.,spre=0.,scur=0.;
     bool cache_valid=false,waiting=false,scalar_f_valid=false,scalar_g_valid=false;
     int64_t evaluations=0,cache_hits=0,preparations=0,trials=0;
-    // Experimental diagnostics only: no stopping or numerical decision uses
-    // these device-clock counts. They are elapsed owner-thread cycles, not
-    // FLOP counts or an assumed fixed-frequency wall clock.
-    uint64_t controller_cycles=0,slsqp_cycles=0,controller_calls=0;
 
     CLIPP2_WEIGHT_SIZE_FN static int64_t buffer_count(int count) {
         return int64_t(count)*(count+1)/2+10*int64_t(count)*count+35*int64_t(count)+30;
@@ -177,14 +173,8 @@ template<class Blas=DeviceBlas> struct WeightState {
             for(int i=0;i<q;++i)if(!isfinite(candidate[i])||lower[i]!=0.||upper[i]!=1.) {
                 fail(WeightError::Contract);return;
             }
-#ifdef __CUDA_ARCH__
-            const auto slsqp_start=clock64();
-#endif
             Core<Blas>::step(&slsqp,&fx,gradient,normals,&constraint,candidate,
                             multipliers,lower,upper,buffer,indices);
-#ifdef __CUDA_ARCH__
-            slsqp_cycles+=clock64()-slsqp_start;
-#endif
             if(slsqp.mode==1||slsqp.mode==-1) {
                 for(int i=0;i<q;++i) {
                     if(candidate[i]<0.)candidate[i]=0.;else if(candidate[i]>1.)candidate[i]=1.;

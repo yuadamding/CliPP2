@@ -16,7 +16,7 @@ inputs, not a biological accuracy benchmark.
 From the repository root:
 
 ```bash
-clipp2 fit --input-dir examples/tumor --device cpu --max-clusters 3 --outdir results/
+clipp2 fit --input-dir examples/tumor --device cpu --max-clusters 3 --output-dir results/
 ```
 
 Use `--device cuda` for GPU execution and a new output directory for each run.

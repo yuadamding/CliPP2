@@ -64,6 +64,40 @@ struct CUDAProbabilityCatalog {
 };
 // Host catalog end.
 
+// Task shape-map begin. Exact integer keys, first-occurrence dense IDs, and
+// preallocated open-addressing storage; no floating point or row aggregation.
+__host__ __device__ inline i64 probability_shape_slots(i64 members) {
+    if(members<1 || members>INT64_MAX/4) return 0;
+    i64 slots=1;
+    while(slots<2*members) slots*=2;
+    return slots;
+}
+__host__ __device__ inline std::uint64_t probability_shape_hash(i64 shape) {
+    auto key=static_cast<std::uint64_t>(shape);
+    key^=key>>30; key*=0xbf58476d1ce4e5b9ULL;
+    key^=key>>27; key*=0x94d049bb133111ebULL;
+    return key^(key>>31);
+}
+__host__ __device__ inline i64 probability_task_shapes(i64 rows,i64 slots,
+        i64* row_shapes,i64* shapes,i64* table_keys,i64* table_values) {
+    if(rows<0 || rows>INT64_MAX/2 || slots<2*rows || !slots || (slots&(slots-1))) return -1;
+    for(i64 slot=0;slot<slots;++slot) table_keys[slot]=-1;
+    i64 unique=0;
+    for(i64 row=0;row<rows;++row) {
+        const auto shape=row_shapes[row];
+        if(shape<0) return -1;
+        i64 slot=probability_shape_hash(shape)&static_cast<std::uint64_t>(slots-1);
+        while(table_keys[slot]>=0 && table_keys[slot]!=shape) slot=(slot+1)&(slots-1);
+        if(table_keys[slot]<0) {
+            table_keys[slot]=shape; table_values[slot]=unique;
+            shapes[unique++]=shape;
+        }
+        row_shapes[row]=table_values[slot];
+    }
+    return unique;
+}
+// Task shape-map end.
+
 struct CUDAProbabilityState {
     Context& owner;
     std::vector<CUDAProbabilityRegion> regions;

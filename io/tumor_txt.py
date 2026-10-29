@@ -150,6 +150,7 @@ def _validate_metadata(metadata: dict[str, str], *, path: Path) -> dict[str, str
 
 def _read_text_table(
     path: Path, *, columns: tuple[str, ...] = SCHEMA_COLUMNS, canonical: bool = True,
+    allow_empty: bool = False,
 ) -> tuple[dict[str, str], pd.DataFrame]:
     if not path.is_file():
         raise FileNotFoundError(f"Tumor input file does not exist: {path}")
@@ -211,7 +212,7 @@ def _read_text_table(
 
     if header is None:
         raise TumorTxtError(f"{path} does not contain a table header.")
-    if not rows:
+    if not rows and not allow_empty:
         raise TumorTxtError(f"{path} does not contain any tumor rows.")
     if canonical:
         metadata = _validate_metadata(metadata, path=path)
@@ -740,13 +741,16 @@ def write_tumor_txt(
         if (
             not key
             or key != key.strip()
+            or "=" in key
             or not value
             or any(character in key + value for character in "\t\r\n")
         ):
             raise TumorTxtError(
                 "Metadata keys and values must be nonempty and may not contain "
-                "tabs or newlines."
+                "tabs or newlines; keys may not contain '='."
             )
+        if key in normalized_metadata:
+            raise TumorTxtError("Metadata keys must be unique after string conversion.")
         normalized_metadata[key] = value
     destination = Path(path).resolve()
     validated_metadata = _validate_metadata(normalized_metadata, path=destination)

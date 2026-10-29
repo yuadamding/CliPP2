@@ -21,8 +21,10 @@ def build_parser() -> argparse.ArgumentParser:
     inputs.add_argument("--input-file", help="Canonical tumor TSV (optionally gzip-compressed).")
     inputs.add_argument("--input-dir", dest="input_file", metavar="INPUT_DIR",
                         help="Tumor directory with regional snv.txt/cna.txt/purity.txt bundles.")
-    fit.add_argument("--outdir", default="clipp2_results")
+    fit.add_argument("--output-dir", default="clipp2_results")
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
+    fit.add_argument("--execution-policy", choices=["auto", "reference", "candidate"], default="auto",
+                     help="auto uses reference unless the exact GPU policy is qualified; candidate is explicit CUDA research.")
     fit.add_argument(
         "--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN,
         help="Exclude a mutation only from regions where any CN state's major CN exceeds this limit.",
@@ -50,7 +52,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        _fit_config_from_args(args)
+        args._fit_config = _fit_config_from_args(args)
     except ValueError as error:
         parser.error(str(error))
     return args
@@ -62,7 +64,8 @@ def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
                               grid_cache_mb=args.grid_cache_mb, device_cache_mb=args.device_cache_mb,
                               workspace_mb=args.workspace_mb,
                               native_host_memory_mb=args.native_host_memory_mb,
-                              device_memory_mb=args.device_memory_mb, cpu_threads=args.cpu_threads)
+                              device_memory_mb=args.device_memory_mb, cpu_threads=args.cpu_threads,
+                              execution_policy=args.execution_policy)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -71,8 +74,8 @@ def main(argv: list[str] | None = None) -> None:
 
     process_tumor(
         tumor_file=Path(args.input_file),
-        outdir=Path(args.outdir),
-        fit_config=_fit_config_from_args(args),
+        outdir=Path(args.output_dir),
+        fit_config=args._fit_config,
     )
 
 

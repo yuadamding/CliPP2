@@ -40,6 +40,7 @@ version = { attr = "CliPP2._version.__version__" }
 [tool.setuptools.package-data]
 CliPP2 = [
     "_build_source.json",
+    "_gpu_policy.json",
     "kernel/csrc/*.cpp",
     "kernel/csrc/*.h",
     "kernel/csrc/common/*.h",
@@ -47,7 +48,6 @@ CliPP2 = [
     "kernel/csrc/cpu/*.h",
     "kernel/csrc/cuda/*.cu",
     "kernel/csrc/cuda/*.cuh",
-    "CMakeLists.txt",
 ]
 
 [tool.ruff]

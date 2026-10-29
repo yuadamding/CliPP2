@@ -18,13 +18,17 @@ driver. CPU builds require neither CUDA nor PyTorch.
 ## Run
 
 ```bash
-clipp2 fit --input-dir tumor/ --device cpu --outdir results/
+clipp2 fit --input-dir tumor/ --device cpu --output-dir results/
 ```
 
 Use `--device cuda` for GPU execution and a new output directory for each run.
 `--max-clusters` defaults to **20**; larger values can greatly increase search cost.
-Use `--verbose` for phase starts and throttled progress on stderr (not a heartbeat);
-no extra output files are written.
+Use `--verbose` for phase starts and throttled completed-operation snapshots on
+stderr, not a heartbeat or an optimizer-request trace. No extra files are written.
+
+`--execution-policy auto` keeps the reference path unless a source-, runtime- and
+hardware-matched GPU qualification is installed. `reference` forces that path;
+`candidate` explicitly tests the unpromoted CUDA batching/resident policy.
 
 ## Input
 
@@ -49,6 +53,10 @@ Each region requires:
 | `snv.txt` | `chromosome_index`, `position`, `ref_count`, `alt_count` |
 | `cna.txt` | `chromosome_index`, `start_position`, `end_position`, `major_cn`, `minor_cn`, `total_cn` |
 | `purity.txt` | One number in `(0, 1]`, without a header |
+
+Loci not covered by a region's CNA segments default to `major_cn = minor_cn = 1`
+(total and normal CN 2). A header-only `cna.txt` applies this default to all loci;
+the file is still required. Missing read observations remain missing.
 
 ### TSV alternative
 
@@ -89,3 +97,5 @@ estimates; their regional CCF entries in the mutation-clusters table are also `N
 ## Contact
 
 Submit an issue or email yding4@mdanderson.org.
+
+The synthetic-data generator is maintained separately in the `CliPP2-simulation` companion.

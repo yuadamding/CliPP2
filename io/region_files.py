@@ -79,7 +79,8 @@ def _read_region(path: Path):
         observations[locus] = tuple(
             _integer(row[name], name=f"{path} {name}") for name in ("alt_count", "ref_count")
         )
-    _, table = _read_text_table(path / "cna.txt", columns=_CNA_COLUMNS, canonical=False)
+    _, table = _read_text_table(path / "cna.txt", columns=_CNA_COLUMNS,
+                                canonical=False, allow_empty=True)
     intervals = {}
     for row in table.to_dict(orient="records"):
         chrom = _identifier(row["chromosome_index"], name=f"{path} chromosome_index")
@@ -115,11 +116,10 @@ def read_region_directory(path: str | Path) -> tuple[dict[str, str], pd.DataFram
             starts, segments = intervals.get(chrom, ([], []))
             index = bisect_right(starts, position) - 1
             if index < 0 or position > segments[index][1]:
-                raise TumorTxtError(
-                    f"{path}/{sample}: no CNA interval covers {chrom}:{position}; "
-                    "coverage is required even for missing regional SNVs."
-                )
-            start, end, major, minor, normal = segments[index]
+                # Uncovered loci are diploid; missing reads remain missing.
+                start, end, major, minor, normal = position, position, 1, 1, 2
+            else:
+                start, end, major, minor, normal = segments[index]
             observed = (chrom, position) in observations
             alt, ref = observations.get((chrom, position), (".", "."))
             rows.append((f"{chrom}:{position}", sample, alt, ref, int(observed), purity,

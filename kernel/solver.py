@@ -257,12 +257,12 @@ def _generate_host_candidates(model, tree, pilot, requested, lower, upper, polic
         initial = np.clip(pilot, lower, upper)
         initial_state = (initial, *(array.copy() for array in model.node_terms(initial)))
     for capacity_index, k in enumerate(requested):
-        def completed(boundary):
-            progress_callback({"operation": "continuation", "boundary": boundary,
+        def completed():
+            progress_callback({"operation": "continuation", "boundary": "capacity_complete",
                                "requested_k": int(k), "capacity_index": capacity_index,
                                "capacity_count": len(requested), "level": level + 1,
                                "iterations": total_iterations,
-                               "completed_capacities": capacity_index + (boundary == "capacity_complete")})
+                               "completed_capacities": capacity_index + 1})
 
         if initial_state is None:
             x = np.clip(pilot, lower, upper)
@@ -287,8 +287,6 @@ def _generate_host_candidates(model, tree, pilot, requested, lower, upper, polic
                 g = gradient + _spring_gradient(x, forest, rho)
                 stationarity = float(np.max(np.abs(x - np.clip(x - g, lower, upper))))
                 if stationarity <= policy.stationarity_tolerance:
-                    if progress_callback is not None:
-                        completed("iteration_complete")
                     break
                 h = np.maximum(curvature, 1e-8)
                 backend = getattr(model, "backend", None)
@@ -329,8 +327,6 @@ def _generate_host_candidates(model, tree, pilot, requested, lower, upper, polic
                         break
                 if not accepted:
                     stalled = True
-                if progress_callback is not None:
-                    completed("iteration_complete")
                 if stalled:
                     break
             cuts = project_cuts(tree, x, k)
@@ -340,8 +336,6 @@ def _generate_host_candidates(model, tree, pilot, requested, lower, upper, polic
             violation = float(np.linalg.norm(x[forest[:, 0]] - x[forest[:, 1]]))
             labels, block_range, longest, mean_h = _component_scale(tree, cuts, x, curvature)
             feasible = max(violation, block_range) <= policy.constraint_tolerance
-            if progress_callback is not None:
-                completed("level_complete")
             if stationarity <= policy.stationarity_tolerance and feasible:
                 break
             roundoff = 8 * rho * np.finfo(float).eps
@@ -383,5 +377,5 @@ def _generate_host_candidates(model, tree, pilot, requested, lower, upper, polic
             },
         })
         if progress_callback is not None:
-            completed("capacity_complete")
+            completed()
     return candidates

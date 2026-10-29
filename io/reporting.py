@@ -12,11 +12,12 @@ from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 from .._source import file_sha256
 from ..kernel import ALGORITHM, SCORE_DEFINITION
 from ..kernel.topology import partition_from_cuts
-from ..tree.candidates import candidate_evidence, replay_candidate_evidence
+from ..tree.candidates import candidate_record, evidence_attempt_links, validate_candidate_bank
 
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
 OUTPUT_SCHEMA_VERSION = 13
+VERIFICATION_SCHEMA_VERSION = 2
 
 _VERIFY_ROWS = 4096
 _VERIFY_CENTERS = 32
@@ -94,19 +95,32 @@ def independent_log_columns(model, centers):
 
 
 def _verify_retained_bank(model, result, score):
-    """Bind publication to every retained fitted state and replayable evidence."""
-    if not any(candidate is result.selected for candidate in result.candidate_bank):
-        raise ValueError('Selected fitted state is absent from the complete candidate bank')
-    evidence = candidate_evidence(result.tree, result.candidate_bank, result.selected)
+    """Audit actual retained states; the optional research codec is not required."""
+    links = getattr(result, 'attempt_links', None)
+    if result.diagnostics.get('diagnostics_schema_version') == 2 and links is None:
+        raise ValueError('Candidate bank is missing its compact refit-attempt links')
     saved = result.diagnostics.get('candidate_evidence')
     if saved is not None:
-        # The search ledger must describe the CURRENT bank, not only a winner
-        # with a matching scalar score. Attempts are additional search evidence.
-        if any(saved.get(key) != evidence[key] for key in
-               ('version', 'tree', 'selected_state_index', 'states')):
+        # An explicitly requested research export must still describe the current
+        # objects. Compare one record at a time, never rebuild a second bank.
+        tree = result.tree
+        expected_tree = {'identity': tree.identity, 'n': tree.n, 'edges': tree.edges.tolist(),
+                         'kind': tree.kind, 'mutation_ids': list(tree.mutation_ids)}
+        selected_index = next((i for i, value in enumerate(result.candidate_bank)
+                               if value is result.selected), None)
+        if (saved.get('version') != 1 or saved.get('tree') != expected_tree
+                or saved.get('selected_state_index') != selected_index
+                or len(saved.get('states', ())) != len(result.candidate_bank)
+                or any(record != candidate_record(candidate)
+                       for record, candidate in zip(saved['states'], result.candidate_bank))):
             raise ValueError('Persisted candidate evidence disagrees with the retained bank')
-        evidence = saved  # Retain the saved ledger's additional attempt-link checks.
-    retained, _ = replay_candidate_evidence(evidence)
+        attempts = saved.get('refit_attempts', ())
+        exported_links = evidence_attempt_links(tree, attempts, result.selected.fit.centers.shape[1])
+        if links is not None and links != exported_links:
+            raise ValueError('Persisted candidate evidence disagrees with retained attempt links')
+        if links is None and attempts:
+            links = exported_links
+    retained = validate_candidate_bank(result.tree, result.candidate_bank, result.selected, links)
     if not np.isclose(retained.score, score, atol=1e-7, rtol=1e-10):
         raise ValueError('Selected fit is not the best complete-bank score')
 
@@ -180,10 +194,9 @@ def verify_selected(model, result):
         if not np.isfinite(actual) or not np.isclose(actual, expected, atol=1e-7, rtol=1e-10):
             raise ValueError(f'Independent verification disagrees on {name}: {actual} != {expected}')
     _verify_retained_bank(model, result, score)
-    allocations = allocation_diagnostics(columns, labels, centers, weights,
-                                         model.mutation_ids, model.region_ids)
     validity = float(np.log(allowed @ weights).sum())
-    return {'independently_verified': True, 'conditional_log_likelihood': conditional,
+    return {'verification_schema_version': VERIFICATION_SCHEMA_VERSION,
+            'independently_verified': True, 'conditional_log_likelihood': conditional,
             'membership_kind': kind, 'connected_on_proposal_tree': len(cuts)+1 == q,
             'hard_partition_log_likelihood': conditional,
             'mixture_log_likelihood': mixture, 'complexity_penalty': penalty, 'score': score,
@@ -193,7 +206,7 @@ def verify_selected(model, result):
             'validity_conditioned_mixture_log_likelihood': mixture-validity,
             'weight_optimality_gap': weight_gap, 'weight_active_score_gap': active_gap,
             'complete_candidate_bank_reconciled': True,
-            'selected_fitted_state_retained': True, 'allocation_diagnostics': allocations,
+            'selected_fitted_state_retained': True,
             'num_parameters': q*model.r+q-1, 'num_mutation_vectors': model.n,
             'global_optimality_proven': False, 'joint_mixture_center_mle': False}
 

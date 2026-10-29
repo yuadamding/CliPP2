@@ -79,6 +79,9 @@ struct ScoringRequestStorage {
     explicit ScoringRequestStorage(i64 count):capacity(count),host_charge(host_bytes(count)),
             optional_charge(host_charge),pointers(std::make_unique<const double*[]>(count)) {}
 };
+struct ResidentExecutionWorkspace;
+struct ScoringState;
+bool release_resident_execution_cache(Context&,ScoringState&) noexcept;
 struct ScoringState {
     std::map<i64,std::shared_ptr<ResidentColumn>> handles;
     std::map<i64,std::unique_ptr<MixtureProblem>> problems;
@@ -87,6 +90,11 @@ struct ScoringState {
     // Only idle scratch is retained. Live problems always own distinct arenas.
     std::unique_ptr<ScoringAllocation> arena_cache;
     std::unique_ptr<ScoringRequestStorage> request_cache;
+    // Complete resident solves lease this cache exclusively. Idle workspaces
+    // are optional; active arena/graph state is never visible to eviction.
+    std::shared_ptr<ResidentExecutionWorkspace> resident_execution_cache;
+    std::atomic<bool> resident_execution_busy{false};
+    i64 resident_execution_counters[9]{};
     i64 arena_allocations=0,arena_reuses=0;
     i64 request_allocations=0,request_reuses=0,request_header_allocations=0;
     i64 request_live_objects=0,request_live_host_bytes=0,request_live_device_bytes=0;
@@ -141,6 +149,7 @@ bool evict_optional_scoring_cache(Context& c) {
         s.arena_cache.reset();
         return true;
     }
+    if(release_resident_execution_cache(c,s)) return true;
     if(s.order.empty()) return false;
     const auto cold=s.cache.find(s.order.front());
     c.drop_optional(cold->second.charge);
@@ -395,9 +404,7 @@ __global__ void small_mixture_evaluate_kernel(const double* const* columns,const
 __global__ void mixture_finish_reduction(const double* partials,i64 chunks,i64 planes,double* sums) {
     for(i64 plane=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;plane<planes;
         plane+=static_cast<i64>(gridDim.x)*blockDim.x) {
-        double sum=-0.;
-        for(i64 chunk=0;chunk<chunks;++chunk) sum+=partials[plane*chunks+chunk];
-        sums[plane]=sum;
+        sums[plane]=scoring_finish_plane(partials,chunks,plane);
     }
 }
 void reduce_mixture(MixtureProblem& p,i64 planes) {
@@ -822,14 +829,6 @@ extern "C" int CliPP2EvaluateMixture(void* value,i64 handle,const double* weight
         *objective=-objective_sum/p.n;
         for(i64 k=0;k<p.q;++k) gradient[k]=-gradient[k]/p.n;
         ++scoring_state(c).counters[4];
-    });
-}
-extern "C" int CliPP2PrepareMixtureTransfer(void* value,i64 handle,const double* weights,i64 grow,i64 shrink) {
-    return scoring_guarded([&] {
-        auto& c=context(value); auto& p=scoring_problem(c,handle);
-        ScoringStreamFence fence(c);
-        prepare_mixture_transfer(p,weights,grow,shrink);
-        c.finish(); p.pair_ready=true; ++scoring_state(c).counters[5];
     });
 }
 extern "C" int CliPP2PrepareMixtureTransferEndpoint(void* value,i64 handle,const double* weights,

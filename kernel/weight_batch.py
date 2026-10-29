@@ -5,30 +5,13 @@ problems (normally in an ExitStack) and admits their device memory separately.
 This scheduler owns bounded host controller states, never closes caller problems,
 and returns terminal outcomes in original input order, not completion order.
 """
-from threading import Lock
 from time import perf_counter
-from weakref import WeakSet
 
 import numpy as np
 
-from .weight_controller import WeightController, slsqp_workspace_size
-
-
-_OWNERS = WeakSet()
-_OWNER_LOCK = Lock()
-
-
-class WeightBatchCancelled(RuntimeError):
-    """Cancellation observed at a safe host request-batch boundary."""
-
-
-def controller_reservation(q):
-    """Conservative live-state charge, not process RSS or device storage.
-
-    Cover native SLSQP arrays plus Python generator/dictionary and vector owners.
-    Queued initial arrays and returned outcomes are reported/owned separately.
-    """
-    return (slsqp_workspace_size(q) if q > 1 else 0) + 16*1024 + 1024*q
+from .weight_controller import WeightController
+from .scoring import completed_weight
+from .backend import WeightBatchCancelled, WeightOutcome, controller_reservation
 
 
 def fit_weight_batch(backend, problems, initial_weights=None, *, max_active=8,
@@ -39,7 +22,7 @@ def fit_weight_batch(backend, problems, initial_weights=None, *, max_active=8,
     ``backend.evaluate_weight_requests([(problem, request), ...])`` must return
     exactly one reply per request in that order. It may compute in any order,
     but owns validation and dispatch; this function has no numerical fallback.
-    ``progress_callback(index, event)`` receives each problem's unchanged event.
+    ``progress_callback(index, event)`` receives one completed-solve snapshot.
     A callback/evaluator/resource failure aborts the batch and propagates the
     original exception. Genuine final weight-gate failures remain ordered error
     outcomes so the caller can register ordinary scientific rejection.
@@ -108,65 +91,61 @@ def fit_weight_batch(backend, problems, initial_weights=None, *, max_active=8,
             return
         if event.operation == "error" and event.error is not controller.scientific_error:
             raise event.error
-        outcomes[index] = event
+        outcomes[index] = WeightOutcome(event.operation, result=event.result, error=event.error)
         count("weight_batch_completed")
         if event.operation == "error":
             count("weight_batch_scientific_failures")
         controller.close()
         del active[index]
         live_bytes -= sizes[index]
+        completed_weight(None if progress_callback is None else
+                         lambda record: progress_callback(index, record),
+                         problems[index].shape[1], failed=event.operation == "error")
 
-    with _OWNER_LOCK:
-        if backend in _OWNERS:
-            raise RuntimeError("A weight-batch submission owner is already active")
-        _OWNERS.add(backend)
-    try:
-        while next_index < len(problems) or active:
-            check_cancelled()
-            while next_index < len(problems) and len(active) < max_active:
-                index, size = next_index, sizes[next_index]
-                if live_bytes + size > state_budget_bytes:
-                    break
-                callback = (None if progress_callback is None else
-                            lambda event, i=index: progress_callback(i, event))
-                controller = WeightController(tuple(problems[index].shape), starts[index],
-                                              telemetry=stats, progress_callback=callback)
-                # Register before advancing: callbacks or native interface errors
-                # still leave every created controller owned by the finally path.
-                active[index] = [controller, None, perf_counter()]
-                live_bytes += size
-                starts[index] = None
-                next_index += 1
-                peak("weight_batch_live_peak", len(active))
-                peak("weight_batch_state_bytes_peak", live_bytes)
-                active[index][1] = controller.advance()
-                retire(index)
-            if not active:
-                continue
-            check_cancelled()
-            ready = tuple(active)
-            submitted_at = perf_counter()
-            requests = []
-            for index in ready:
-                _, request, ready_at = active[index]
-                requests.append((problems[index], request))
-                count("weight_batch_queue_seconds", submitted_at-ready_at)
-            count("weight_batch_submissions")
-            count("weight_batch_logical_requests", len(requests))
-            if len(requests) < max_active:
-                count("weight_batch_partial_submissions")
-            peak("weight_batch_size_max", len(requests))
-            replies = tuple(backend.evaluate_weight_requests(requests))
-            if len(replies) != len(requests):
-                raise RuntimeError("Batch evaluator returned an incomplete ordered reply set")
-            check_cancelled()
-            for index, reply in zip(ready, replies):
-                active[index][1] = active[index][0].advance(reply)
-                active[index][2] = perf_counter()
-                retire(index)
-        return tuple(outcomes)
-    finally:
-        for controller, _, _ in active.values():
-            controller.close()
-        with _OWNER_LOCK:
-            _OWNERS.discard(backend)
+    with backend.weight_submission():
+        try:
+            while next_index < len(problems) or active:
+                check_cancelled()
+                while next_index < len(problems) and len(active) < max_active:
+                    index, size = next_index, sizes[next_index]
+                    if live_bytes + size > state_budget_bytes:
+                        break
+                    controller = WeightController(tuple(problems[index].shape), starts[index],
+                                                  telemetry=stats)
+                    # Register before advancing: callbacks or native interface errors
+                    # still leave every created controller owned by the finally path.
+                    active[index] = [controller, None, perf_counter()]
+                    live_bytes += size
+                    starts[index] = None
+                    next_index += 1
+                    peak("weight_batch_live_peak", len(active))
+                    peak("weight_batch_state_bytes_peak", live_bytes)
+                    active[index][1] = controller.advance()
+                    retire(index)
+                if not active:
+                    continue
+                check_cancelled()
+                ready = tuple(active)
+                submitted_at = perf_counter()
+                requests = []
+                for index in ready:
+                    _, request, ready_at = active[index]
+                    requests.append((problems[index], request))
+                    count("weight_batch_queue_seconds", submitted_at-ready_at)
+                count("weight_batch_submissions")
+                count("weight_batch_logical_requests", len(requests))
+                if len(requests) < max_active:
+                    count("weight_batch_partial_submissions")
+                peak("weight_batch_size_max", len(requests))
+                replies = tuple(backend.evaluate_weight_requests(requests))
+                if len(replies) != len(requests):
+                    raise RuntimeError("Batch evaluator returned an incomplete ordered reply set")
+                check_cancelled()
+                for index, reply in zip(ready, replies):
+                    active[index][1] = active[index][0].advance(reply)
+                    active[index][2] = perf_counter()
+                    retire(index)
+            return tuple(outcomes)
+        finally:
+            for controller, _, _ in active.values():
+                controller.close()

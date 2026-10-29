@@ -63,8 +63,6 @@ int CliPP2CUDAMixtureRequiredBytes(std::int64_t mutations, std::int64_t columns,
 int CliPP2ReleaseMixtureProblem(void*, std::int64_t problem);
 int CliPP2EvaluateMixture(void*, std::int64_t problem, const double* weights,
                          double* objective, double* gradient, double* log_likelihood);
-int CliPP2PrepareMixtureTransfer(void*, std::int64_t problem, const double* weights,
-                               std::int64_t grow, std::int64_t shrink);
 int CliPP2PrepareMixtureTransferEndpoint(void*, std::int64_t problem, const double* weights,
                                        std::int64_t grow, std::int64_t shrink, double* derivative);
 int CliPP2MixtureTransferDerivative(void*, std::int64_t problem, double fraction,

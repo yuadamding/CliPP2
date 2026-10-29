@@ -75,7 +75,6 @@ i64 scoring_host_bytes(Context&) noexcept;
 i64 scoring_persistent_host_bytes(Context&) noexcept;
 bool evict_optional_probability_cache(Context&);
 void destroy_probability_cache(Context&) noexcept;
-void destroy_initialization_state(Context&) noexcept;
 
 struct Context {
     ObservationSoA data{};
@@ -95,9 +94,8 @@ struct Context {
     void* grid_state = nullptr;
     void* scoring_state = nullptr;
     void* probability_state = nullptr;
-    void* initialization_state = nullptr;
     i64 probability_host_bytes = 0, probability_counters[8]{};
-    i64 probability_refit_counters[4]{};
+    i64 probability_refit_counters[4]{}, probability_shape_refit_counters[4]{};
     bool probability_configured = false;
     ~Context() {
         // Destruction cannot report errors through the C ABI. Normal operations
@@ -105,7 +103,6 @@ struct Context {
         cudaSetDevice(device);
         if (stream) cudaStreamSynchronize(stream);
         destroy_grid_cache(*this);
-        destroy_initialization_state(*this);
         destroy_scoring_state(*this);
         destroy_probability_cache(*this);
         if (workspace) cudaFree(workspace);
@@ -316,6 +313,9 @@ struct RefitObjective {
     double *values, *partials, *total;
     CUDAProbabilityView probability{};
     double* basis=nullptr;
+    const i64 *shape_ids=nullptr,*row_shapes=nullptr;
+    i64 shape_count=0;
+    double* shape_values=nullptr;
     __device__ double operator()(double center) const {
         if(basis) {
             const auto plan=probability.regions[region];
@@ -324,12 +324,24 @@ struct RefitObjective {
                     probability_basis_component(data,probability.families,plan,component,center,
                                                 basis,basis+plan.components);
             __syncthreads();
-            for(i64 i=threadIdx.x;i<count;i+=blockDim.x) {
-                const auto cell=region*data.mutations+rows[i];
-                const auto shape=probability.shapes[probability.row_shapes[cell]];
-                const auto offset=shape.offset-plan.component_begin;
-                values[i]=-probability_shape_terms(observation(data,cell),center,
-                    basis+offset,basis+plan.components+offset).loss;
+            if(shape_count) {
+                for(i64 i=threadIdx.x;i<shape_count;i+=blockDim.x) {
+                    const auto shape=probability.shapes[shape_ids[i]];
+                    const auto offset=shape.offset-plan.component_begin;
+                    shape_values[i]=-probability_shape_terms(observation(data,shape.cell),center,
+                        basis+offset,basis+plan.components+offset).loss;
+                }
+                __syncthreads();
+                for(i64 i=threadIdx.x;i<count;i+=blockDim.x)
+                    values[i]=shape_values[row_shapes[i]];
+            } else {
+                for(i64 i=threadIdx.x;i<count;i+=blockDim.x) {
+                    const auto cell=region*data.mutations+rows[i];
+                    const auto shape=probability.shapes[probability.row_shapes[cell]];
+                    const auto offset=shape.offset-plan.component_begin;
+                    values[i]=-probability_shape_terms(observation(data,cell),center,
+                        basis+offset,basis+plan.components+offset).loss;
+                }
             }
         } else {
             for (i64 i = threadIdx.x; i < count; i += blockDim.x)
@@ -541,6 +553,13 @@ extern "C" int CliPP2CUDAProbabilityRefitDiagnostics(void* value,i64* output) {
         std::copy(c.probability_refit_counters,c.probability_refit_counters+4,output);
     });
 }
+extern "C" int CliPP2CUDAProbabilityShapeRefitDiagnostics(void* value,i64* output) {
+    return guarded([&] {
+        require(output,"Missing CUDA probability-shape-refit diagnostic destination");
+        auto& c=context(value);
+        std::copy(c.probability_shape_refit_counters,c.probability_shape_refit_counters+4,output);
+    });
+}
 extern "C" int CliPP2CUDAGridAdmissionDiagnostics(void* value, i64* output) {
     return guarded([&] {
         require(output, "Missing CUDA grid-admission diagnostic destination");
@@ -735,5 +754,4 @@ extern "C" int CliPP2EvaluateConditionalValues(void* value, const ConditionalBat
     });
 }
 #include "scoring.cuh"
-#include "initialization.cuh"
 #include "resident_api.cuh"

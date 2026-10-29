@@ -1,5 +1,7 @@
 """Source-bound emissions/refits and explicitly owned CUDA column/score leases."""
 import ctypes as ct
+from contextlib import contextmanager
+from dataclasses import dataclass
 import threading
 import weakref
 from functools import lru_cache
@@ -16,6 +18,7 @@ from ..config import DEFAULT_MAX_CLUSTERS
 _D = ct.POINTER(ct.c_double)
 _I = ct.POINTER(ct.c_int64)
 _B = ct.POINTER(ct.c_uint8)
+BACKEND_ABI = 3
 
 
 class NativeExecutionError(RuntimeError):
@@ -24,6 +27,32 @@ class NativeExecutionError(RuntimeError):
 
 class ScientificCandidateRejection(ValueError):
     """A proposed cluster lacks regional support or a common admissible box."""
+
+
+class WeightBatchCancelled(RuntimeError):
+    """Cancellation observed at a supported weight-execution boundary."""
+
+
+@dataclass(frozen=True, slots=True)
+class WeightOutcome:
+    """Detached terminal outcome, independent of optimizer request scheduling."""
+
+    operation: str
+    result: object = None
+    error: BaseException | None = None
+
+
+def slsqp_workspace_size(q):
+    """Qualified LP64 array footprint, without importing a Python optimizer."""
+    if type(q) is not int or q < 1:
+        raise ValueError("q must be a positive integer")
+    buffer = q*(q+1)//2 + 10*q*q + 35*q + 30
+    return 8*(buffer + 7*q + 4) + 4*(2*q + 3)
+
+
+def controller_reservation(q):
+    """Conservative host-state charge shared by both CUDA weight routes."""
+    return (slsqp_workspace_size(q) if q > 1 else 0) + 16*1024 + 1024*q
 
 
 class DeviceColumn:
@@ -221,14 +250,11 @@ class NativeBackend:
 
     def __init__(self, model, workspace_bytes, *, native_host_memory_bytes=None,
                  device_memory_bytes=None, cpu_threads=None, device_cache_bytes=256*1024**2,
-                 score_capacity=DEFAULT_MAX_CLUSTERS, probability_reuse=False,
-                 resident_initialization=False):
+                 score_capacity=DEFAULT_MAX_CLUSTERS, probability_reuse=False):
         self.context = None
+        self._weight_submission_lock = threading.Lock()
         if type(probability_reuse) is not bool:
             raise TypeError("probability_reuse must be a boolean")
-        if type(resident_initialization) is not bool:
-            raise TypeError("resident_initialization must be a boolean")
-        self.resident_initialization = resident_initialization
         kind = "cuda" if model.device.startswith("cuda") else "cpu"
         paths = sorted(Path(__file__).parent.glob(f"_native_{kind}*.so"))
         if len(paths) != 1:
@@ -264,7 +290,7 @@ class NativeBackend:
             lib.CliPP2ProbabilityReuseDiagnostics.restype = ct.c_int
         self.identity = lib.CliPP2BackendBuildId().decode()
         self.policy = lib.CliPP2BackendNumericalPolicy().decode()
-        if lib.CliPP2BackendABI() != 2 or self.identity != backend_identity(kind):
+        if lib.CliPP2BackendABI() != BACKEND_ABI or self.identity != backend_identity(kind):
             raise NativeExecutionError(f"Stale or incompatible native {kind} library; rebuild CliPP2")
         if type(workspace_bytes) is not int or not 0 <= workspace_bytes <= np.iinfo(np.int64).max:
             raise ValueError("workspace_bytes must be a nonnegative int64")
@@ -337,6 +363,7 @@ class NativeBackend:
                 "ConfigureCUDAProbabilityReuse": [ct.c_void_p, ct.POINTER(_Observations), ct.c_int],
                 "CUDAProbabilityDiagnostics": [ct.c_void_p, _I],
                 "CUDAProbabilityRefitDiagnostics": [ct.c_void_p, _I],
+                "CUDAProbabilityShapeRefitDiagnostics": [ct.c_void_p, _I],
                 "CreateJointColumns": [ct.c_void_p, ct.c_int64, _D, _I],
                 "ImportJointColumns": [ct.c_void_p, ct.c_int64, _D, _I],
                 "ReleaseJointColumns": [ct.c_void_p, ct.c_int64, _I],
@@ -349,7 +376,6 @@ class NativeBackend:
                 "CreateMixtureProblem": [ct.c_void_p, ct.c_int64, _I, _I],
                 "ReleaseMixtureProblem": [ct.c_void_p, ct.c_int64],
                 "EvaluateMixture": [ct.c_void_p, ct.c_int64, _D, _D, _D, _D],
-                "PrepareMixtureTransfer": [ct.c_void_p, ct.c_int64, _D, ct.c_int64, ct.c_int64],
                 "PrepareMixtureTransferEndpoint": [ct.c_void_p, ct.c_int64, _D, ct.c_int64, ct.c_int64, _D],
                 "MixtureTransferDerivative": [ct.c_void_p, ct.c_int64, ct.c_double, _D],
                 "EvaluateWeightBatch": [ct.c_void_p, ct.c_int64,
@@ -396,12 +422,33 @@ class NativeBackend:
         if not getattr(self, "context", None):
             raise NativeExecutionError("Native backend context is closed")
 
+    @contextmanager
+    def weight_submission(self):
+        """One live weight submission owns this context, on either adapter."""
+        self._require_open()
+        if not self._weight_submission_lock.acquire(blocking=False):
+            raise RuntimeError("A weight-batch submission owner is already active")
+        try:
+            self._require_open()
+            yield
+        finally:
+            self._weight_submission_lock.release()
+
     def close(self):
         """Release the native context exactly once, including partial initialization."""
         context = getattr(self, "context", None)
         if context:
-            self.context = None
-            self.lib.CliPP2BackendDestroy(context)
+            lock = getattr(self, "_weight_submission_lock", None)
+            if lock is not None and not lock.acquire(blocking=False):
+                raise NativeExecutionError("Cannot close a backend with an active weight submission")
+            try:
+                context = getattr(self, "context", None)
+                if context:
+                    self.context = None
+                    self.lib.CliPP2BackendDestroy(context)
+            finally:
+                if lock is not None:
+                    lock.release()
 
     def __enter__(self):
         self._require_open()
@@ -441,6 +488,8 @@ class NativeBackend:
             diagnostics["scoring"] = self.scoring_diagnostics()
             diagnostics["scoring_arena"] = self.scoring_arena_diagnostics()
             diagnostics["scoring_requests"] = self.scoring_request_diagnostics()
+            if hasattr(self.lib, "CliPP2ResidentExecutionDiagnostics"):
+                diagnostics["resident_execution"] = self.resident_execution_diagnostics()
             diagnostics["probability_reuse"] = self.probability_reuse_diagnostics()
             diagnostics["proposal_scans"] = self._counter_diagnostics("CliPP2CUDAProposalDiagnostics",
                 ("chunks", "positive_pairs", "subset_gathers", "subset_values"))
@@ -634,6 +683,19 @@ class NativeBackend:
                          "live_host_bytes", "live_device_bytes", "idle_host_bytes",
                          "idle_device_bytes"))
 
+    def resident_execution_diagnostics(self):
+        """Tracked resident workspace/graph reuse, distinct from physical peaks."""
+        self._require_open()
+        if self.kind != "cuda":
+            raise ValueError("Resident execution diagnostics require CUDA")
+        function = self.lib.CliPP2ResidentExecutionDiagnostics
+        function.argtypes, function.restype = [ct.c_void_p, _I], ct.c_int
+        return self._counter_diagnostics("CliPP2ResidentExecutionDiagnostics",
+            ("arena_allocations", "arena_reuses", "graph_instantiations", "graph_reuses",
+             "graph_launches", "idle_evictions", "failed_leases", "workspace_resets",
+             "graph_setup_nanoseconds", "idle_device_bytes", "idle_host_bytes",
+             "idle_graph_device_reservation", "live_owner"))
+
     def grid_admission_diagnostics(self):
         self._require_open()
         if self.kind != "cuda":
@@ -652,6 +714,13 @@ class NativeBackend:
         result["refits"] = self._counter_diagnostics("CliPP2CUDAProbabilityRefitDiagnostics",
                         ("reused_tasks", "reused_objective_calls", "basis_components", "row_evaluations"))
         return result
+
+    def probability_shape_reuse_diagnostics(self):
+        self._require_open()
+        if self.kind != "cuda":
+            raise ValueError("Device probability shape reuse requires CUDA")
+        return self._counter_diagnostics("CliPP2CUDAProbabilityShapeRefitDiagnostics",
+                        ("reused_tasks", "reused_objective_calls", "shapes_evaluated", "ordered_rows_gathered"))
 
     def import_joint_columns(self, log_columns):
         """Explicit host-to-device boundary for independent numerical checks."""
@@ -964,7 +1033,7 @@ class NativeBackend:
         return values
 
 
-NATIVE_ABI = 4
+NATIVE_ABI = 5
 
 def native_library():
     root = Path(__file__).resolve().parent.parent

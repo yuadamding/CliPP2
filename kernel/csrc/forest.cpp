@@ -1,6 +1,6 @@
 // CliPP2-owned shared-forest, multi-region quadratic solver; AGPL-3.0.
 // Positive-message elimination generalizes the inherited scalar chain method.
-// See the project NOTICE. Numerical qualification is separate from sweep completion.
+// See bindings.cpp for provenance. Numerical qualification is separate from sweep completion.
 #include "forest.h"
 #include "prepared_tree.h"
 #include <algorithm>

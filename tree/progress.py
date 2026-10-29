@@ -2,6 +2,8 @@
 from copy import deepcopy
 from time import perf_counter
 
+PROGRESS_SCHEMA_VERSION = 2
+
 
 class ProgressReporter:
     """Observe phase starts/completions and throttled completed operations.
@@ -45,7 +47,8 @@ class ProgressReporter:
             occupied = operation.get("occupied_q", occupied)
             requested = operation.get("requested_k", requested)
         record = {
-            "event": "clipp2_progress", "phase": self.phase,
+            "event": "clipp2_progress", "progress_schema_version": PROGRESS_SCHEMA_VERSION,
+            "phase": self.phase,
             "phase_started": started, "phase_complete": complete,
             "elapsed_seconds": now-self.started, "operation": operation,
             "seed_index": provenance.get("seed_index", self.seed_index),

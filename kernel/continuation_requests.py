@@ -5,7 +5,6 @@ Only the supplied evaluator performs likelihood arithmetic; native workers do
 not fall back to CPU emissions. Worker CPU work is serialized, with explicit
 per-worker stack and state reservations. This module does not import CUDA.
 """
-from collections import deque
 import ctypes as ct
 
 import numpy as np
@@ -41,7 +40,7 @@ def _api():
                    [ct.POINTER(ct.c_longlong)]*3, ct.c_int),
         'Create': ([ct.c_int]*2 + [ct.c_void_p]*9 + [ct.c_int, ct.c_void_p,
                    ct.POINTER(_ContinuationPolicy), _Norm, _Scores, ct.c_longlong,
-                   ct.c_longlong, ct.c_int, ct.POINTER(ct.c_void_p)], ct.c_int),
+                   ct.c_longlong, ct.c_int, ct.c_int, ct.POINTER(ct.c_void_p)], ct.c_int),
         'Poll': ([ct.c_void_p, ct.c_int, ct.c_int, ct.POINTER(_Request)], ct.c_int),
         'Reply': ([ct.c_void_p, ct.c_int, ct.c_uint64] + [ct.c_void_p]*3, ct.c_int),
         'Result': ([ct.c_void_p, ct.c_int] + [ct.c_void_p]*3 +
@@ -76,9 +75,12 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
     selects this experimental path automatically.
 
     Caller budgets cover native shared/state storage, explicitly reserved
-    pthread stacks, owned request buffers and bounded progress queues. They do
+    pthread stacks and owned request buffers. They do
     not represent RSS, device allocations or caller-retained result arrays.
     Only one native worker does CPU work at a time; other workers suspend.
+    Boundary handshakes are installed only for cancellation; observers receive
+    ordered completed-capacity snapshots without an internal event queue.
+    numerical requests and their original per-capacity order are unchanged.
     """
     for value, name in ((evaluate_requests, 'evaluate_requests'),
                         (progress_callback, 'progress_callback'), (cancelled, 'cancelled')):
@@ -114,12 +116,10 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
     if library.CliPP2ContinuationOwnerMemory(model.n, model.r, active, stack_bytes,
             int(keep_raw_phi), ct.byref(shared), ct.byref(state), ct.byref(stack)):
         raise ValueError('Invalid continuation state/stack reservation')
-    # Owned request coordinates plus reply conversions. Progress queues contain
-    # bounded tuples, not callback-created dictionaries or caller-owned events.
+    # Owned request coordinates plus reply conversions.
     request_bytes = 10*model.n*model.r*8
-    progress_bytes = (256*(policy.levels*(policy.iterations_per_level+1)+1)
-                      if progress_callback is not None else 0)
-    per_state = state.value+stack.value+request_bytes+progress_bytes
+    boundary_requests = cancelled is not None
+    per_state = state.value+stack.value+request_bytes
     active = min(active, max(0, (budget-shared.value)//per_state))
     if active < 1:
         raise NativeExecutionError('Continuation state, stack and request buffers exceed host budget')
@@ -162,24 +162,25 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
                  native_continuation_active_limit=active, native_continuation_shared_bytes=shared.value,
                  native_continuation_state_bytes=state.value, native_continuation_stack_bytes=stack.value,
                  native_continuation_request_bytes=request_bytes,
-                 native_continuation_progress_bytes=progress_bytes,
+                 native_continuation_progress_bytes=0,
                  native_continuation_reserved_bytes=shared.value+active*per_state,
                  native_continuation_owner_submissions=0, native_continuation_terms_requests=1,
-                 native_continuation_batch_max=0, native_continuation_initial_evaluations=1)
+                 native_continuation_batch_max=0, native_continuation_initial_evaluations=1,
+                 native_continuation_boundary_requests=boundary_requests,
+                 native_continuation_boundary_handshakes=0)
     outputs = []
     for first in range(0, len(capacities), active):
         chosen = _array(capacities[first:first+active], np.int32)
         owner = ct.c_void_p()
-        pending_events = [deque() for _ in chosen]
         next_progress = 0
         completed = set()
         results = [None]*len(chosen)
-        native_budget = budget-len(chosen)*(request_bytes+progress_bytes)
+        native_budget = budget-len(chosen)*request_bytes
         try:
             check(library.CliPP2ContinuationOwnerCreate(model.n, model.r, _ptr(edges), _ptr(canonical),
                 _ptr(initial), *map(_ptr, terms), _ptr(lower), _ptr(upper), _ptr(gaps), len(chosen),
                 _ptr(chosen), ct.byref(native_policy), norm, scores, native_budget, stack_bytes,
-                int(keep_raw_phi), ct.byref(owner)))
+                int(keep_raw_phi), int(boundary_requests), ct.byref(owner)))
             while len(completed) < len(chosen):
                 if reduction_errors:
                     raise reduction_errors[0]
@@ -204,23 +205,20 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
                         numerical.append((first+task, x))
                         requests.append((task, request.sequence))
                     elif request.kind == 2:
-                        if progress_callback is not None:
-                            pending_events[task].append((request.boundary, request.level, request.iterations))
-                            while next_progress < len(chosen) and pending_events[next_progress]:
-                                boundary, level, iterations = pending_events[next_progress].popleft()
-                                event = {'operation': 'continuation',
-                                    'boundary': ('iteration_complete', 'level_complete', 'capacity_complete')[boundary-1],
-                                    'requested_k': int(chosen[next_progress]), 'capacity_index': first+next_progress,
-                                    'capacity_count': len(capacities), 'level': level, 'iterations': iterations,
-                                    'completed_capacities': first+next_progress+(boundary == 3)}
-                                progress_callback(event)
-                                if boundary == 3:
-                                    next_progress += 1
+                        stats['native_continuation_boundary_handshakes'] += 1
                         check(library.CliPP2ContinuationOwnerReply(owner, task, request.sequence, None, None, None))
                     elif request.kind == 3:
                         results[task] = _result(library, owner, task, int(chosen[task]), tree, model.r,
                                                 missing, keep_raw_phi, check)
                         completed.add(task)
+                        while next_progress in completed:
+                            diagnostics = results[next_progress]['diagnostics']
+                            if progress_callback is not None:
+                                progress_callback(dict(operation='continuation', boundary='capacity_complete',
+                                    requested_k=int(chosen[next_progress]), capacity_index=first+next_progress,
+                                    capacity_count=len(capacities), completed_capacities=first+next_progress+1,
+                                    level=diagnostics['continuation_levels'], iterations=diagnostics['iterations']))
+                            next_progress += 1
                     else:
                         raise NativeExecutionError('Unknown native continuation request kind')
                 if numerical:
