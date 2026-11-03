@@ -12,6 +12,13 @@ DEFAULT_MAX_CLUSTERS: Final = 20
 # the tree model gives matched single-state CN its full 1..major support.
 MAX_MULTIPLICITY: Final = 4
 DEFAULT_DEVICE: Final = "cuda"
+DEFAULT_AUDIT_SCOPE: Final = "selected"
+
+
+def validate_audit_scope(value):
+    if value not in ("selected", "all"):
+        raise ValueError("audit_scope must be selected or all.")
+    return value
 
 
 def validate_max_major_cn(value: int) -> int:
@@ -29,8 +36,10 @@ class FitConfig:
     max_major_cn: int = DEFAULT_MAX_MAJOR_CN
     max_clusters: int = DEFAULT_MAX_CLUSTERS
     cpu_threads: int | None = None
+    audit_scope: str = DEFAULT_AUDIT_SCOPE
 
     def __post_init__(self) -> None:
+        validate_audit_scope(self.audit_scope)
         if self.device not in ("cpu", "cuda"):
             raise ValueError("device must be cpu or cuda.")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
@@ -46,10 +55,11 @@ def resolve_fit_config(
     max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
     max_clusters: int = DEFAULT_MAX_CLUSTERS,
     cpu_threads: int | None = None,
+    audit_scope: str = DEFAULT_AUDIT_SCOPE,
 ) -> FitConfig:
     """Construct the only public fit configuration; removed knobs raise TypeError."""
     return FitConfig(device=device, max_major_cn=max_major_cn,
-                     max_clusters=max_clusters, cpu_threads=cpu_threads)
+                     max_clusters=max_clusters, cpu_threads=cpu_threads, audit_scope=audit_scope)
 
 
 __all__ = ["FitConfig", "resolve_fit_config"]

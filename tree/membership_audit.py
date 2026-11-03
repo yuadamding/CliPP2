@@ -7,14 +7,14 @@ No conditional-gain pruning or iteration limit can close this neighborhood.
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+from time import perf_counter
 
 import numpy as np
 
-from .candidates import score_key
 from .proposals import SCORE_ATOL, SCORE_RTOL
+from ..config import validate_audit_scope
 from ..io.data import readonly_array
 from ..kernel.backend import ScientificCandidateRejection
-from ..kernel.topology import canonical_partition
 
 AUDIT_POLICY = "single_mutation_existing_conditional_refit_v1"
 
@@ -87,7 +87,7 @@ def _structural_reason(model, prepared):
     return None
 
 
-def audit_single_moves(model, bank, parent, *, batch_size=1):
+def audit_single_moves(model, bank, parent, *, batch_size=1, pass_number=1, audit_scope="all"):
     """Evaluate every feasible neighbor from one immutable parent, row-major.
 
     Frozen-pass batching changes execution only. Logical publication and cache
@@ -103,56 +103,67 @@ def audit_single_moves(model, bank, parent, *, batch_size=1):
     q = len(centers)
     fingerprint = fitted_state_fingerprint(model, bank.tree, parent, bank.numerical_policy)
     moves, pending = [], []
+    started, before_refits = perf_counter(), bank.refit_calls
+    exclusions = resolved = unresolved = 0
+
+    def observe(*, started_pass=False, complete=False):
+        if bank.audit_progress is not None:
+            bank.audit_progress(bank, {"audit_scope": audit_scope, "occupied_q": q,
+                "pass_number": pass_number, "parent_state_index": parent.state_index,
+                "parent_state_fingerprint": fingerprint, "examined_pairs": len(moves),
+                "total_pairs": model.n*(q-1), "structural_exclusions": exclusions,
+                "resolved_evaluations": resolved, "unresolved_evaluations": unresolved,
+                "pending_evaluations": len(pending), "refits": bank.refit_calls-before_refits,
+                "pass_elapsed_seconds": perf_counter()-started},
+                started=started_pass, complete=complete)
     prepared = None
     if q > 1:
         columns = model.joint_column_set(centers)
         prepared = bank.prepare(parent.cuts, labels, fitted=parent.fit, columns=columns)
-    sizes = np.bincount(labels, minlength=q)
 
     def flush():
+        nonlocal resolved, unresolved
         if not pending:
             return
+        observe()  # Pending coverage must be visible during a long batch solve.
         requests = [request for _, request in pending]
-        if batch_size == 1:
-            _, proposed, initial, provenance, parent_partition = requests[0]
-            results = [bank.consider_membership(proposed, initial, provenance, parent=parent_partition)]
-        else:
-            results = bank.consider_independent(requests)
+        results = bank.consider_prepared_independent(requests)
         for (index, request), candidate in zip(pending, results, strict=True):
-            _, proposed, initial, _, _ = request
-            attempt_index = bank.refit_attempt_index(proposed, initial)
+            partition, initial, _ = request
+            key = (partition.membership.key, initial.tobytes(), bank.numerical_policy)
+            attempt_index = bank._outcomes[key]
             attempt = bank._outcome_records[attempt_index]
             if (attempt.outcome == "eligible") != (candidate is not None):
                 raise ValueError("Membership audit and candidate outcome disagree")
             move = moves[index]
             moves[index] = SingleMove(move.row, move.destination, attempt.outcome,
                                       attempt.reason, attempt_index)
+            unresolved += int(attempt.outcome == "unresolved_numerical")
+            resolved += int(attempt.outcome != "unresolved_numerical")
         pending.clear()
+        observe()
 
+    observe(started_pass=True)
     for row in range(model.n):
         source = int(labels[row])
         for destination in range(q):
             if destination == source:
                 continue
-            if sizes[source] == 1:
-                flush()
-                moves.append(SingleMove(row, destination, "structural_exclusion", "empty_source_cluster"))
-                continue
-            proposed = labels.copy()
-            proposed[row] = destination
-            canonical, aligned = canonical_partition(proposed, centers)
-            neighbor = bank.prepare(None, canonical, parent=prepared)
-            reason = _structural_reason(model, neighbor)
+            neighbor, aligned, reason = bank.prepare_single_move(prepared, row, destination, centers)
+            if reason is None and not prepared.groups:
+                reason = _structural_reason(model, neighbor)
             if reason is not None:
                 flush()
                 moves.append(SingleMove(row, destination, "structural_exclusion", reason))
+                exclusions += 1
+                observe()
                 continue
             index = len(moves)
             moves.append(SingleMove(row, destination, "unresolved_numerical"))
             provenance = {"route": AUDIT_POLICY, "parent_state_index": parent.state_index,
                           "parent_state_fingerprint": fingerprint, "occupied_q": q,
                           "mutation_index": row, "destination": destination}
-            pending.append((index, (None, canonical, aligned, provenance, prepared)))
+            pending.append((index, (neighbor, aligned, provenance)))
             if len(pending) >= batch_size:
                 flush()
     flush()
@@ -161,26 +172,30 @@ def audit_single_moves(model, bank, parent, *, batch_size=1):
     if fitted_state_fingerprint(model, bank.tree, parent, bank.numerical_policy) != fingerprint:
         raise ValueError("Membership audit parent changed during evaluation")
     complete = all(move.outcome != "unresolved_numerical" for move in moves)
+    observe(complete=True)
     return MembershipAudit(parent.state_index, fingerprint, model.identity,
                            (model.backend.policy, model.backend.identity), bank.numerical_policy,
                            q, model.n, tuple(moves), complete)
 
 
-def refine_memberships(model, bank, *, batch_size=1):
-    """Audit the exact best retained state at every represented occupied q.
+def refine_memberships(model, bank, *, batch_size=1, audit_scope="all"):
+    """Audit the selected exact state, or each represented fixed-q winner.
 
     Even a sub-tolerance or tie-rule winner change requires another full pass.
     An unresolved earlier pass can advance, but never certify a terminal state.
     No later stage may add candidates without invalidating these certificates.
     """
+    validate_audit_scope(audit_scope)
     terminal, passes = [], []
-    represented = sorted({len(candidate.fit.centers) for candidate in bank.candidates})
+    represented = sorted(bank.best_by_q) if audit_scope == "all" else [None]
     for q in represented:
         while True:
-            parent = min((c for c in bank.candidates if len(c.fit.centers) == q), key=score_key)
-            audit = audit_single_moves(model, bank, parent, batch_size=batch_size)
-            current = min((c for c in bank.candidates if len(c.fit.centers) == q), key=score_key)
-            record = {"parent_state_index": parent.state_index, "occupied_q": q,
+            parent = bank.best_overall if q is None else bank.best_by_q[q]
+            audit = audit_single_moves(model, bank, parent, batch_size=batch_size,
+                                       pass_number=len(passes)+1, audit_scope=audit_scope)
+            current = bank.best_overall if q is None else bank.best_by_q[q]
+            record = {"parent_state_index": parent.state_index, "occupied_q": len(parent.fit.centers),
+                      "audit_scope": audit_scope,
                       "examined_pairs": len(audit.moves),
                       "unresolved_evaluations": audit.unresolved_evaluations,
                       "winning_state_index": current.state_index,
@@ -190,6 +205,7 @@ def refine_memberships(model, bank, *, batch_size=1):
             if bank.retain_evidence:
                 record["audit"] = asdict(audit)
             passes.append(record)
+            bank.compact_payloads()
             if current.state_index != parent.state_index:
                 continue
             if not audit.complete:

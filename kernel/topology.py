@@ -13,6 +13,98 @@ import numpy as np
 from ..io.data import ImmutableArrayRecord, readonly_array
 
 
+def _restore_label_key(base, row, destination, order):
+    return LabelKey(readonly_array(base, dtype=np.int64), row, destination, order)
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class LabelKey:
+    """Exact general membership, optionally one edit of a shared frozen parent.
+
+    Hashes only accelerate lookup: collisions always compare complete labels.
+    The hash matches the legacy int64 bytes key, allowing independent replay to
+    compare an edit with a separately reconstructed membership. No trial keeps
+    its own length-N label vector after its numerical evaluation finishes.
+    """
+
+    base: np.ndarray
+    row: int | None = None
+    destination: int | None = None
+    order: tuple = ()
+    _hash: int = field(init=False, repr=False)
+
+    def __post_init__(self):
+        if (not isinstance(self.base, np.ndarray) or self.base.ndim != 1 or not len(self.base)
+                or self.base.dtype != np.dtype('int64') or self.base.flags.writeable
+                or np.any(self.base < 0)):
+            raise ValueError("Membership edits require immutable parent labels")
+        owner = self.base
+        while isinstance(owner, np.ndarray):
+            owner = owner.base
+        if not isinstance(owner, bytes):
+            object.__setattr__(self, 'base', readonly_array(self.base))
+        q = int(self.base.max())+1
+        if not np.bincount(self.base, minlength=q).all():
+            raise ValueError("Membership labels must be occupied consecutive IDs")
+        if self.row is None:
+            if self.destination is not None or self.order:
+                raise ValueError("Explicit membership has no edit or reordering")
+        elif (type(self.row) is not int or not 0 <= self.row < len(self.base)
+              or type(self.destination) is not int or not 0 <= self.destination < q
+              or not isinstance(self.order, tuple) or sorted(self.order) != list(range(q))):
+            raise ValueError("Invalid compact membership edit")
+        if self.row is not None:
+            labels = self.labels
+            _, first = np.unique(labels, return_index=True)
+            if len(first) != q or not np.all(np.diff(first) > 0):
+                raise ValueError("Membership edit must preserve occupied canonical groups")
+        object.__setattr__(self, "_hash", hash(self.labels.tobytes()))
+
+    @property
+    def labels(self):
+        if self.row is None:
+            return self.base
+        mapping = np.empty(len(self.order), dtype=np.int64)
+        mapping[list(self.order)] = np.arange(len(self.order))
+        labels = mapping[self.base]
+        labels[self.row] = mapping[self.destination]
+        return readonly_array(labels)
+
+    def __hash__(self):
+        return self._hash
+
+    def __reduce__(self):
+        # Byte hashes are process-local; never persist the derived hash.
+        return _restore_label_key, (self.base, self.row, self.destination, self.order)
+
+    def __len__(self):
+        return 8*len(self.base)
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if isinstance(other, LabelKey):
+            return self._hash == other._hash and np.array_equal(self.labels, other.labels)
+        if isinstance(other, bytes):
+            return self._hash == hash(other) and self.labels.tobytes() == other
+        return NotImplemented
+
+
+class LabelOrder:
+    """Materialize a canonical membership only on a score/q/kind tie."""
+
+    def __init__(self, membership):
+        self.membership = membership
+
+    def __eq__(self, other):
+        return self.membership.key == other.membership.key
+
+    def __lt__(self, other):
+        left, right = self.membership.labels, other.membership.labels
+        different = np.flatnonzero(left != right)
+        return bool(len(different) and left[different[0]] < right[different[0]])
+
+
 @dataclass(frozen=True, eq=False)
 class Membership:
     """Retained membership: compact tree cuts or immutable explicit labels."""
@@ -20,19 +112,26 @@ class Membership:
     tree: object = None
     cuts: tuple | None = None
     explicit_labels: np.ndarray | None = None
+    label_key: LabelKey | None = field(default=None, repr=False)
 
     def __post_init__(self):
         if self.cuts is None:
+            if self.label_key is not None:
+                if self.tree is not None or self.explicit_labels is not None or not isinstance(self.label_key, LabelKey):
+                    raise ValueError("An edited membership needs only its exact label key")
+                return
             labels = np.asarray(self.explicit_labels)
             if self.tree is not None or labels.ndim != 1 or not len(labels):
                 raise ValueError("Explicit membership needs labels and no tree")
             if (labels.dtype.kind not in "iu" or
                     not np.array_equal(np.unique(labels), np.arange(len(np.unique(labels))))):
                 raise ValueError("Membership labels must be occupied consecutive integer IDs")
-            object.__setattr__(self, "explicit_labels", readonly_array(labels, dtype=np.int64))
+            labels = readonly_array(labels, dtype=np.int64)
+            object.__setattr__(self, "explicit_labels", labels)
+            object.__setattr__(self, "label_key", LabelKey(labels))
         else:
             cuts = tuple(self.cuts)
-            if (not isinstance(self.tree, FrozenTree) or self.explicit_labels is not None
+            if (not isinstance(self.tree, FrozenTree) or self.explicit_labels is not None or self.label_key is not None
                     or any(not isinstance(edge, (int, np.integer)) or isinstance(edge, bool)
                            or not 0 <= edge < len(self.tree.edges) for edge in cuts)
                     or cuts != tuple(sorted(set(cuts)))):
@@ -42,7 +141,7 @@ class Membership:
     @property
     def labels(self):
         return (readonly_array(partition_from_cuts(self.tree, self.cuts))
-                if self.cuts is not None else self.explicit_labels)
+                if self.cuts is not None else self.label_key.labels)
 
     @property
     def kind(self):
@@ -50,7 +149,7 @@ class Membership:
 
     @property
     def key(self):
-        return (self.kind, self.cuts if self.cuts is not None else self.explicit_labels.tobytes())
+        return (self.kind, self.cuts if self.cuts is not None else self.label_key)
 
 
 @dataclass(frozen=True, eq=False)

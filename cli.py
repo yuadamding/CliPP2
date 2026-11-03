@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .config import DEFAULT_DEVICE, DEFAULT_MAX_CLUSTERS, DEFAULT_MAX_MAJOR_CN, FitConfig, resolve_fit_config
+from .config import (DEFAULT_AUDIT_SCOPE, DEFAULT_DEVICE, DEFAULT_MAX_CLUSTERS,
+                     DEFAULT_MAX_MAJOR_CN, FitConfig, resolve_fit_config)
 from ._version import __version__
 
 
@@ -28,6 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fit.add_argument("--max-clusters", type=int, default=DEFAULT_MAX_CLUSTERS,
                      help="Largest occupied cluster capacity (positive integer; no fixed upper limit).")
+    fit.add_argument("--audit-scope", choices=("selected", "all"), default=DEFAULT_AUDIT_SCOPE,
+                     help="Certify the selected count, or every represented count, by complete single-mutation passes.")
     fit.add_argument("--cpu-threads", type=int, default=None,
                      help="CPU threads; fallback CLIPP2_CPU_THREADS, OMP_NUM_THREADS, then affinity/quota.")
     fit.add_argument("--version", action="version", version=__version__)
@@ -47,7 +50,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
     return resolve_fit_config(device=args.device,
                               max_major_cn=args.max_major_cn, max_clusters=args.max_clusters,
-                              cpu_threads=args.cpu_threads)
+                              cpu_threads=args.cpu_threads, audit_scope=args.audit_scope)
 
 
 def main(argv: list[str] | None = None) -> None:

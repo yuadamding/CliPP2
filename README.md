@@ -22,6 +22,10 @@ clipp2 fit --input-dir tumor/ --device cpu --output-dir results/
 ```
 
 Use `--device cuda` for GPU execution; the device selects the execution path.
+`--max-clusters` defaults to 20; `--max-major-cn` to 10. Search uses bounded
+proposals, then checks every feasible single-mutation move at the selected
+cluster count. Use `--audit-scope all` to refine every represented count; it
+can select a different count and costs more. Neither scope proves a global optimum.
 
 ## Input
 
@@ -61,6 +65,7 @@ all regions; gzip is supported. See [example](examples/exampleTumor1.tsv).
 | `allele_a_cn`, `allele_b_cn` | Major and minor copy numbers, with `allele_a_cn >= allele_b_cn` |
 
 ## Output
+
 | File | Columns |
 | --- | --- |
 | `{tumor_id}_mutation_clusters.tsv` | `tumor_id`, `mutation_id`, `cluster_label`, `phi_<region>` for each region |

@@ -6,6 +6,8 @@ from time import perf_counter
 import numpy as np
 
 from ..kernel.topology import canonical_partition, partition_from_cuts
+from .candidates import score_key
+from .policy import POLICY
 
 
 @dataclass(frozen=True)
@@ -113,30 +115,35 @@ def best_pair_boundary(tree, labels, centers, log_columns, edge, *, adjacency=No
                         not np.array_equal(proposed, labels))
 
 
-def refine_partition(model, tree, candidate, consider, *, max_proposals=None, prepare=None,
-                     device_proposals=False):
-    """Yield every accepted local state; scoring is independent of acceptance.
+def refine_partition(model, tree, candidate, consider, *, max_proposals=POLICY.boundary_slots, prepare=None,
+                     device_proposals=False, consume_slot=None):
+    """Explore a bounded local queue; yield only final-score improvements.
 
     ``consider`` refits and records candidates, preserving supplied-center
     fallbacks. It must return a candidate with a ``fit`` result and ``cuts``.
-    The path improves conditional likelihood, while the caller separately keeps
-    the best observed-mixture score over the complete candidate bank.
-    ``max_proposals`` optionally bounds exact proposal evaluations, including
-    rejected moves. Existing native refinement uses the unlimited default.
+    Conditional gain ranks proposals; only the final penalized mixture score
+    advances the incumbent. Nonadvancing eligible states can still seed an
+    exploratory branch within the same fixed budget: a temporarily worse score
+    is not a proof that its descendants are unhelpful. Absent, duplicate and
+    rejected proposals consume slots, never replacement work.
     """
-    if max_proposals is not None and (type(max_proposals) is not int or max_proposals < 0):
-        raise ValueError("max_proposals must be a nonnegative integer or None")
+    if type(max_proposals) is not int or max_proposals < 0:
+        raise ValueError("max_proposals must be a nonnegative integer")
     current = candidate
-    visited = set()
+    if candidate.cuts is None:
+        raise ValueError("General memberships cannot enter tree-boundary refinement")
+    visited, queued = set(), {candidate.state_index}
+    frontier = [candidate]
     attempted = 0
-    while True:
-        changed = False
-        fit = current.fit
+    while frontier and attempted < max_proposals:
+        parent = min(frontier, key=score_key)
+        frontier.remove(parent)
+        fit = parent.fit
         labels = fit.labels
         handles = (model.joint_column_set(fit.centers)
                    if prepare is not None and hasattr(model, "joint_column_set") else None)
         prepared = (None if prepare is None else
-                    prepare(current.cuts, labels, fitted=fit, columns=handles))
+                    prepare(parent.cuts, labels, fitted=fit, columns=handles))
         components = ({cluster: group.members for cluster, group in enumerate(prepared.groups)}
                       if prepared is not None and prepared.groups else
                       {cluster: np.flatnonzero(labels == cluster) for cluster in range(len(fit.centers))})
@@ -145,7 +152,12 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None, pr
                   and getattr(getattr(model, "backend", None), "kind", None) == "cuda" else None)
         columns = (None if gather is not None else model.log_likelihood_columns(fit.centers)
                    if handles is None else handles.materialize())
-        for edge in current.cuts:
+        for edge in parent.cuts:
+            if attempted >= max_proposals:
+                return
+            attempted += 1
+            if consume_slot is not None:
+                consume_slot()
             move = best_pair_boundary(tree, labels, fit.centers, columns, edge,
                                       components=components, column_rows=gather)
             if not move.changed:
@@ -157,31 +169,27 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=None, pr
                 continue
             if not np.array_equal(proposed_labels, partition_from_cuts(tree, cuts)):
                 raise ValueError("Boundary move violated connected partition identity")
-            if max_proposals is not None and attempted >= max_proposals:
-                return
             visited.add(proposal_key)
-            attempted += 1
             options = {} if prepared is None else {"parent": prepared}
             proposed = consider(cuts, proposed_labels, centers, {
-                "route": "boundary_refinement", "parent_cuts": current.cuts,
+                "route": "boundary_refinement", "parent_cuts": parent.cuts,
+                "parent_state_index": parent.state_index,
                 "replaced_edge": int(edge), "replacement_edge": move.edge,
             }, **options)
             if proposed is None:
                 continue
-            old = float(fit.conditional_log_likelihood)
-            new = float(proposed.fit.conditional_log_likelihood)
-            # Numerical ties do not cycle; no arbitrary full-fit time ceiling.
-            tolerance = 32 * np.finfo(float).eps * max(1.0, abs(old), abs(new))
-            if new > old + tolerance:
-                current, changed = proposed, True
+            if proposed.state_index not in queued:
+                frontier.append(proposed)
+                queued.add(proposed.state_index)
+            old, new = current.score, proposed.score
+            tolerance = SCORE_ATOL + SCORE_RTOL*max(abs(old), abs(new))
+            if old-new > tolerance:
+                current = proposed
                 yield proposed
-                break
-        if not changed:
-            return
 
 
-START_LIMIT = 4
-ROUND_LIMIT = 2
+START_LIMIT = POLICY.polish_starts_per_q
+ROUND_LIMIT = POLICY.polish_rounds
 PROPOSALS_PER_ROUND = 2
 SCORE_ATOL = 1e-7
 SCORE_RTOL = 1e-10
@@ -197,21 +205,16 @@ def _partition_key(candidate):
 
 
 def _starting_states(original, winner):
-    # Preserve the tree bank's ordering for exact score ties. No fitted state
-    # is removed: distinct-membership selection only limits proposal starts.
-    ordered = sorted(original, key=lambda c: (
-        c.score, len(c.fit.centers), tuple(c.cuts)))
-    representatives = {}
+    # Freeze the source collection: discoveries cannot enqueue extra starts.
+    ordered = sorted(original, key=score_key)
+    chosen, seen, counts = [], set(), {}
     for candidate in ordered:
-        representatives.setdefault(len(candidate.fit.centers), candidate)
-    chosen, seen = [], set()
-    for candidate in (winner, *representatives.values(), *ordered):
+        q = len(candidate.fit.centers)
         key = _partition_key(candidate)
-        if key not in seen:
+        if counts.get(q, 0) < START_LIMIT and key not in seen:
             chosen.append(candidate)
             seen.add(key)
-        if len(chosen) == START_LIMIT:
-            break
+            counts[q] = counts.get(q, 0)+1
     return chosen
 
 
@@ -322,12 +325,11 @@ def _retained_bytes(candidates, bank):
     }
 
 
-def expand_memberships(model, bank):
-    """Append at most 16 general-membership proposal callbacks, in-place.
+def expand_memberships(model, bank, *, work=None):
+    """Append at most eight general proposal slots per represented q.
 
-    The original bank is frozen for selecting <=4 starting states, including
-    its exact winner. Each <=2-round path spends exactly two proposal slots
-    per proposal-ranking joint-matrix evaluation (<=8); absent, duplicate,
+    The original bank is frozen for selecting <=2 starts per count. Each
+    <=2-round path spends two slots per ranking evaluation; absent, duplicate,
     rejected, and non-improving proposals do not earn replacement slots. K=1 has no moves.
     Eligible states are retained even when their path does not advance.
     """
@@ -337,7 +339,7 @@ def expand_memberships(model, bank):
         raise ValueError("Reassignment requires an eligible original candidate bank")
     winner = getattr(bank, "original_selected", None)
     if winner is None:
-        winner = min(original, key=lambda c: (c.score, len(c.fit.centers), tuple(c.cuts)))
+        winner = min(original, key=score_key)
     if not any(candidate is winner for candidate in original):
         raise ValueError("The original winner must belong to the original bank")
     starts = _starting_states(original, winner)
@@ -387,6 +389,8 @@ def expand_memberships(model, bank):
 
             for kind, proposed in zip(("single", "greedy_batch"), proposals):
                 slots += 1
+                if work is not None:
+                    work.spend("polishing")
                 record = {"kind": kind, "callback": proposed is not None}
                 round_record["proposals"].append(record)
                 if proposed is None:
@@ -431,11 +435,12 @@ def expand_memberships(model, bank):
     scans = {key: sum(record[key] for path in paths for record in path["rounds"])
              for key in ("scanned_transfer_pairs", "positive_gain_pairs",
                          "single_legal_checks", "batch_legal_checks")}
-    return {"applied": True, "method": "bounded_fixed_k_joint_unweighted_reassignment_v1",
-            "starting_state_limit": START_LIMIT, "round_limit": ROUND_LIMIT,
+    represented = len({len(c.fit.centers) for c in original})
+    return {"applied": True, "method": "bounded_per_q_joint_reassignment_v2",
+            "starting_state_limit_per_q": START_LIMIT, "round_limit": ROUND_LIMIT,
             "proposal_slots_per_round": PROPOSALS_PER_ROUND,
-            "proposal_callback_limit": START_LIMIT * ROUND_LIMIT * PROPOSALS_PER_ROUND,
-            "proposal_joint_column_evaluation_limit": START_LIMIT * ROUND_LIMIT,
+            "proposal_callback_limit": represented * START_LIMIT * ROUND_LIMIT * PROPOSALS_PER_ROUND,
+            "proposal_joint_column_evaluation_limit": represented * START_LIMIT * ROUND_LIMIT,
             "score_atol": SCORE_ATOL, "score_rtol": SCORE_RTOL,
             "tie_rule": "gain_then_ID_free_row_and_destination_content_then_identical_row_index",
             "original_candidate_count": len(original), "original_winner_score": winner.score,

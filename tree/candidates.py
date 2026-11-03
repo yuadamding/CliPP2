@@ -1,16 +1,20 @@
 """Shared registry of compact memberships, refit attempts and immutable states."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from time import perf_counter
 from types import MappingProxyType
 
 import numpy as np
 
 from ..kernel.model import FitResult, RegionalModel
-from ..kernel.topology import FrozenTree, Membership, PreparedPartition, canonical_partition, partition_from_cuts
+from ..kernel.topology import (FrozenTree, LabelKey, LabelOrder, Membership, PreparedPartition,
+                               canonical_partition, partition_from_cuts)
+from ..kernel.backend import ScientificCandidateRejection
 
 
 def _plain(value):
+    if isinstance(value, LabelKey):
+        return value.labels.tolist()
     if isinstance(value, (dict, MappingProxyType)):
         return {key: _plain(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -77,7 +81,7 @@ def _outcome_kind(fitted):
 def score_key(candidate):
     tree = candidate.membership_kind == "tree"
     return (candidate.score, len(candidate.fit.centers), 0 if tree else 1,
-            candidate.cuts if tree else tuple(candidate.fit.labels))
+            candidate.cuts if tree else LabelOrder(candidate.fit.membership))
 
 
 def _canonical_inputs(labels, centers, n, r):
@@ -104,7 +108,7 @@ class CandidateBank:
     normalize_provenance = staticmethod(_plain)
 
     def __init__(self, model, tree, *, progress=None, request_progress=None,
-                 weight_batch_size=1, device_proposals=False, retain_evidence=True):
+                 weight_batch_size=1, device_proposals=False, retain_evidence=True, audit_progress=None):
         if type(weight_batch_size) is not int or weight_batch_size < 1:
             raise ValueError("weight_batch_size must be a positive integer")
         if type(device_proposals) is not bool:
@@ -115,17 +119,69 @@ class CandidateBank:
         self.model, self.tree = model, tree
         self.progress = progress
         self.request_progress = request_progress
+        self.audit_progress = audit_progress
         self.candidates, self.general_rejections, self.attempt_records = [], [], []
         self.by_cuts, self.by_membership, self.ineligible = {}, {}, {}
+        self.best_by_q, self.tree_by_q, self.best_overall = {}, {}, None
         self.membership_attempts = {}
         self._attempts, self._states, self._structural = {}, {}, {}
         self._outcomes, self._outcome_records = {}, []
         self.duplicate_routes = self.refit_calls = 0
         self.attempt_cache_hits = self.structural_cache_hits = 0
         self.refit_seconds = 0.0
+        self.preparation_seconds = self.registration_seconds = 0.0
+        self.prepared_moves = 0
         self._tree_identity = tree.identity
         self.weight_batch_size = weight_batch_size
         self.device_proposals = device_proposals
+
+    def prepare_single_move(self, parent, row, destination, centers):
+        """Prepare only the changed groups, once, from a frozen eligible parent."""
+        if (parent.model_identity != getattr(self.model, "identity", "")
+                or parent.tree_identity != self._tree_identity):
+            raise ValueError("Single move parent belongs to another model/tree")
+        started = perf_counter()
+        self.prepared_moves += 1
+        try:
+            labels, groups = parent.labels, list(parent.groups)
+            q = len(centers)
+            if not 0 <= row < self.model.n or not 0 <= destination < q:
+                raise ValueError("Invalid single-mutation move")
+            source = int(labels[row])
+            if source == destination:
+                raise ValueError("A single move must change the assigned group")
+            members = (groups[source].members if groups else np.flatnonzero(labels == source))
+            if len(members) == 1:
+                return None, None, "empty_source_cluster"
+            if not groups:
+                proposed = labels.copy()
+                proposed[row] = destination
+                canonical, initial = canonical_partition(proposed, centers)
+                return self.prepare(None, canonical, parent=parent), initial, None
+            groups[source] = self.model.prepare_group(members[members != row])
+            members = groups[destination].members
+            groups[destination] = self.model.prepare_group(np.insert(members, np.searchsorted(members, row), row))
+            order = tuple(sorted(range(q), key=lambda k: int(groups[k].members[0])))
+            # Other groups were valid in the immutable eligible parent. Keep
+            # canonical group/region rejection order, including missing boxes.
+            for group in order:
+                if group in (source, destination):
+                    for region in range(self.model.r):
+                        try:
+                            self.model._coordinate_task(groups[group], region)
+                        except ScientificCandidateRejection as error:
+                            if not str(error).startswith(("unsupported_cluster_region:", "empty_cluster_region_box:")):
+                                raise
+                            return None, None, str(error)
+            key = LabelKey(labels, int(row), int(destination), order)
+            membership = Membership(label_key=key)
+            prior = tuple(None if k in (source, destination) or not parent.coordinate_fits
+                          else parent.coordinate_fits[k] for k in order)
+            partition = PreparedPartition(parent.model_identity, parent.tree_identity, membership,
+                                          key.labels, tuple(groups[k] for k in order), prior, parent.columns)
+            return partition, np.asarray(centers)[list(order)].copy(), None
+        finally:
+            self.preparation_seconds += perf_counter()-started
 
     def prepare(self, cuts, labels=None, *, parent=None, fitted=None, columns=None):
         """Prepare one active expansion, retaining unchanged group handles.
@@ -205,7 +261,8 @@ class CandidateBank:
         found, candidate = self._cached(("general", labels.tobytes()), centers, provenance)
         if not found:
             candidate = self._consider(self.prepare(None, labels, parent=parent), centers, provenance)
-        self.membership_attempts[(labels.tobytes(), None if centers is None else centers.tobytes())] = candidate
+        key = candidate.fit.membership.key[1] if candidate is not None else Membership(explicit_labels=labels).key[1]
+        self.membership_attempts[(key, None if centers is None else centers.tobytes())] = candidate
         if self.progress is not None:
             self.progress(self, provenance)
         return candidate
@@ -245,6 +302,13 @@ class CandidateBank:
         return self._commit(partition, centers, provenance, fitted)
 
     def _commit(self, partition, centers, provenance, fitted):
+        started = perf_counter()
+        try:
+            return self._commit_result(partition, centers, provenance, fitted)
+        finally:
+            self.registration_seconds += perf_counter()-started
+
+    def _commit_result(self, partition, centers, provenance, fitted):
         """Publish exactly one completed fit, always in original request order."""
         membership, cuts, labels = partition.membership.key, partition.cuts, partition.labels
         provenance = _plain(provenance)
@@ -263,7 +327,7 @@ class CandidateBank:
             self.attempt_records.append(record)
         self._attempts[attempt] = None
         if not fitted.eligible:
-            rejection = {"cuts" if cuts is not None else "labels": list(cuts) if cuts is not None else labels.tolist(),
+            rejection = {"cuts" if cuts is not None else "membership": list(cuts) if cuts is not None else membership,
                          "reason": fitted.reason, "provenance": [provenance]}
             if cuts is None:
                 self.general_rejections.append(rejection)
@@ -318,11 +382,31 @@ class CandidateBank:
         self._store_outcome(attempt, outcome, fitted.reason, candidate.state_index)
         if record is not None:
             record["state_index"] = candidate.state_index
-        index, key = (self.by_cuts, cuts) if cuts is not None else (self.by_membership, labels.tobytes())
+        index, key = (self.by_cuts, cuts) if cuts is not None else (self.by_membership, membership[1])
         previous = index.get(key)
         if previous is None or score_key(candidate) < score_key(previous):
             index[key] = candidate
+        q = len(candidate.fit.centers)
+        previous = self.best_by_q.get(q)
+        if previous is None or score_key(candidate) < score_key(previous):
+            self.best_by_q[q] = candidate
+        if self.best_overall is None or score_key(candidate) < score_key(self.best_overall):
+            self.best_overall = candidate
+        if cuts is not None:
+            self.tree_by_q.setdefault(q, {})[cuts] = self.by_cuts[cuts]
         return candidate
+
+    def compact_payloads(self):
+        """After expansion, only indexed winners can become audit parents.
+
+        Preserve every state's exact centers, weights, score and membership for
+        independent verification. Release nonwinner coordinate-reuse payloads,
+        never evidence needed to select or certify a state.
+        """
+        keep = {c.state_index for c in self.best_by_q.values()}
+        for candidate in self.candidates:
+            if candidate.state_index not in keep and candidate.fit.coordinate_fits is not None:
+                candidate.fit = replace(candidate.fit, coordinate_fits=None)
 
     def _store_outcome(self, key, outcome, reason, state_index, fitted=None):
         if key in self._outcomes:
@@ -345,17 +429,30 @@ class CandidateBank:
         Duplicate memberships and existing attempt/structural hits are ordering
         barriers. Custom models/overrides retain ordinary serial consideration.
         """
-        def serial(item):
-            cuts, labels, centers, provenance, parent = item
-            return (self.consider_membership(labels, centers, provenance, parent=parent) if cuts is None
-                    else self.consider(cuts, labels, centers, provenance, parent=parent))
+        def prepared():
+            for cuts, labels, centers, provenance, parent in requests:
+                labels, centers = _canonical_inputs(labels, centers, self.model.n, self.model.r)
+                if cuts is not None:
+                    raw = np.asarray(cuts)
+                    if raw.ndim != 1 or not np.isfinite(raw).all() or np.any(raw != np.rint(raw)):
+                        raise ValueError("Tree cuts must be finite integer edge IDs")
+                    cuts = tuple(sorted(map(int, cuts)))
+                    if (len(set(cuts)) != len(cuts) or any(not 0 <= edge < len(self.tree.edges) for edge in cuts)
+                            or not np.array_equal(labels, partition_from_cuts(self.tree, cuts))):
+                        raise ValueError("Candidate labels and frozen-tree cuts disagree")
+                yield self.prepare(cuts, labels, parent=parent), centers, provenance
+        return self.consider_prepared_independent(prepared())
+
+    def consider_prepared_independent(self, requests):
+        """One prepared numerical path, with exact-cache logical order barriers."""
 
         model = self.model
         enabled = (self.weight_batch_size > 1 and type(model) is RegionalModel
                    and model.backend.kind == "cuda" and not any(name in vars(model) for name in
                        ("refit", "refit_prepared", "_refit_groups", "_refit_steps", "_weight_result")))
         if not enabled:
-            return [serial(item) for item in requests]
+            return [self.consider_prepared(partition, centers, provenance)
+                    for partition, centers, provenance in requests]
         results, pending, memberships = [], [], set()
         def flush():
             if not pending:
@@ -377,7 +474,7 @@ class CandidateBank:
                 partition, centers, provenance, output_index = pending[index]
                 result = self._commit(partition, centers, provenance, fitted)
                 if partition.cuts is None:
-                    self.membership_attempts[(partition.labels.tobytes(),
+                    self.membership_attempts[(partition.membership.key[1],
                         None if centers is None else centers.tobytes())] = result
                 results[output_index] = result
                 if self.progress is not None:
@@ -395,25 +492,19 @@ class CandidateBank:
 
         for output_index, item in enumerate(requests):
             results.append(None)
-            cuts, labels, centers, provenance, parent = item
-            labels, centers = _canonical_inputs(labels, centers, model.n, model.r)
-            if cuts is not None:
-                raw = np.asarray(cuts)
-                if raw.ndim != 1 or not np.isfinite(raw).all() or np.any(raw != np.rint(raw)):
-                    raise ValueError("Tree cuts must be finite integer edge IDs")
-                cuts = tuple(sorted(map(int, cuts)))
-                if (len(set(cuts)) != len(cuts) or any(not 0 <= edge < len(self.tree.edges) for edge in cuts)
-                        or not np.array_equal(labels, partition_from_cuts(self.tree, cuts))):
-                    raise ValueError("Candidate labels and frozen-tree cuts disagree")
-            membership = ("tree", cuts) if cuts is not None else ("general", labels.tobytes())
+            partition, centers, provenance = item
+            if (partition.tree_identity != self._tree_identity
+                    or partition.model_identity != getattr(model, "identity", "")):
+                raise ValueError("Prepared partition belongs to another model/tree")
+            membership = partition.membership.key
             attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
             if pending and (membership in memberships or len(pending) >= self.weight_batch_size
                             or membership in self._structural or attempt in self._attempts):
                 flush()
             if membership in self._structural or attempt in self._attempts:
-                results[output_index] = serial(item)
+                results[output_index] = self.consider_prepared(partition, centers, provenance)
                 continue
-            pending.append((self.prepare(cuts, labels, parent=parent), centers, _plain(provenance), output_index))
+            pending.append((partition, centers, _plain(provenance), output_index))
             memberships.add(membership)
         flush()
         return results
@@ -467,9 +558,9 @@ def _membership_size(tree, key):
                 or tuple(sorted(set(value))) != value):
             raise ValueError("Candidate bank has invalid tree cuts")
         return len(value)+1
-    if kind != "general" or not isinstance(value, bytes) or len(value) != 8*tree.n:
+    if kind != "general" or not isinstance(value, (bytes, LabelKey)) or len(value) != 8*tree.n:
         raise ValueError("Candidate bank has invalid general membership")
-    labels = np.frombuffer(value, dtype=np.int64)
+    labels = value.labels if isinstance(value, LabelKey) else np.frombuffer(value, dtype=np.int64)
     q = len(np.unique(labels))
     if list(dict.fromkeys(labels.tolist())) != list(range(q)):
         raise ValueError("Candidate bank must retain canonical occupied memberships")

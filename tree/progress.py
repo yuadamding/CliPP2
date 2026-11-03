@@ -2,7 +2,7 @@
 from copy import deepcopy
 from time import perf_counter
 
-PROGRESS_SCHEMA_VERSION = 2
+PROGRESS_SCHEMA_VERSION = 3
 
 
 class ProgressReporter:
@@ -17,8 +17,9 @@ class ProgressReporter:
             raise TypeError("progress_callback must be callable or None")
         self.model, self.callback = model, callback
         self.started = self.last = perf_counter()
+        self.phase_clock = self.started
         self.phase = "initialization"
-        self.subset_visits = 0
+        self.audit = None
         self.seed_index = self.requested_k = self.occupied_q = None
 
     def completed_candidate(self, bank, provenance):
@@ -26,15 +27,22 @@ class ProgressReporter:
 
     def start_phase(self, phase, bank=None):
         self.phase = phase
+        self.phase_clock = perf_counter()
+        self.audit = None
         self.seed_index = self.requested_k = self.occupied_q = None
         self.emit(bank, started=True)
 
     def completed_operation(self, bank, provenance, operation):
         self.emit(bank, provenance=provenance, operation=operation)
 
-    def emit(self, bank=None, *, provenance=None, operation=None, complete=False, started=False):
+    def membership_audit(self, bank, snapshot, *, started=False, complete=False):
+        self.audit = dict(snapshot, pass_started=started, pass_complete=complete)
+        self.occupied_q = snapshot['occupied_q']
+        self.emit(bank, force=started or complete)
+
+    def emit(self, bank=None, *, provenance=None, operation=None, complete=False, started=False, force=False):
         now = perf_counter()
-        if not (complete or started) and now-self.last < 5.0:
+        if not (complete or started or force) and now-self.last < 5.0:
             return
         self.last = now
         provenance = {} if provenance is None else provenance
@@ -51,10 +59,11 @@ class ProgressReporter:
             "phase": self.phase,
             "phase_started": started, "phase_complete": complete,
             "elapsed_seconds": now-self.started, "operation": operation,
+            "phase_elapsed_seconds": now-self.phase_clock,
             "seed_index": provenance.get("seed_index", self.seed_index),
             "requested_k": requested,
             "occupied_q": occupied,
-            "route": provenance.get("route"), "visited_cut_subsets": self.subset_visits,
+            "route": provenance.get("route"), "membership_audit": self.audit,
             "telemetry": dict(getattr(self.model, "telemetry", {})),
         }
         if bank is not None:

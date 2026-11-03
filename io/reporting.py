@@ -4,12 +4,14 @@ import math
 import os
 from pathlib import Path
 import tempfile
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
 from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 
 from .._source import file_sha256
+from ..config import validate_audit_scope
 from ..kernel import ALGORITHM, SCORE_DEFINITION
 from ..kernel.model import FitResult
 from ..kernel.topology import canonical_partition, partition_from_cuts
@@ -22,7 +24,7 @@ from ..tree.proposals import SCORE_ATOL, SCORE_RTOL
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
 OUTPUT_SCHEMA_VERSION = 13
-VERIFICATION_SCHEMA_VERSION = 3
+VERIFICATION_SCHEMA_VERSION = 4
 
 _VERIFY_ROWS = 4096
 _VERIFY_CENTERS = 32
@@ -107,7 +109,7 @@ def independent_log_columns(model, centers):
 def _verify_retained_bank(model, result, score):
     """Audit actual retained states; the optional research codec is not required."""
     links = getattr(result, 'attempt_links', None)
-    if result.diagnostics.get('diagnostics_schema_version') == 2 and links is None:
+    if result.diagnostics.get('diagnostics_schema_version', 0) >= 2 and links is None:
         raise ValueError('Candidate bank is missing its compact refit-attempt links')
     saved = result.diagnostics.get('candidate_evidence')
     if saved is not None:
@@ -135,7 +137,18 @@ def _verify_retained_bank(model, result, score):
         raise ValueError('Selected fit is not the best complete-bank score')
 
 
-def _verify_fitted_numerics(model, fit, *, eligible=True):
+def _independent_columns(model, centers, cache):
+    """Reuse only verifier-owned columns; exact center bytes, local to one check."""
+    keys = [np.asarray(center, dtype=float).tobytes() for center in centers]
+    missing = dict((key, center) for key, center in zip(keys, centers) if key not in cache)
+    if missing:
+        computed = independent_log_columns(model, np.asarray(list(missing.values())))
+        for index, key in enumerate(missing):
+            cache[key] = computed[:, index].copy()
+    return np.column_stack([cache[key] for key in keys])
+
+
+def _verify_fitted_numerics(model, fit, *, eligible=True, column_cache=None):
     """Independent read/box/weight/score checks for one exact completed state."""
     labels = np.asarray(fit.labels)
     centers, weights = np.asarray(fit.centers), np.asarray(fit.weights)
@@ -158,7 +171,8 @@ def _verify_fitted_numerics(model, fit, *, eligible=True):
     for k in range(q):
         if not observed[labels == k].any(axis=0).all():
             raise ValueError('Unsupported cluster-region center cannot be published')
-    columns = independent_log_columns(model, centers)
+    columns = (independent_log_columns(model, centers) if column_cache is None else
+               _independent_columns(model, centers, column_cache))
     offset = columns.max(axis=1)
     if not np.isfinite(offset).all():
         raise ValueError('A mutation has zero read likelihood at every admissible center')
@@ -220,7 +234,7 @@ def _neighbor_exclusion(model, labels, observed, lower, upper):
     return None
 
 
-def _verify_membership_audits(model, result, selected_numerics):
+def _verify_membership_audits(model, result, selected_numerics, column_cache):
     """Verify complete terminal neighborhoods, exact attempt starts and scores."""
     audits = getattr(result, 'membership_audits', None)
     attempts = getattr(result, 'attempt_outcomes', None)
@@ -242,8 +256,13 @@ def _verify_membership_audits(model, result, selected_numerics):
         q = len(candidate.fit.centers)
         if q not in best or score_key(candidate) < score_key(best[q]):
             best[q] = candidate
-    if len(audits) != len(best):
-        raise ValueError('Terminal membership audits do not cover every represented q')
+    scope = result.audit_scope
+    validate_audit_scope(scope)
+    if result.diagnostics.get('audit_scope', scope) != scope:
+        raise ValueError('Membership audit scope disagrees with search diagnostics')
+    required = set(best) if scope == 'all' else {len(result.selected.fit.centers)}
+    if len(audits) != len(required):
+        raise ValueError('Terminal membership audits do not cover the requested scope')
     numerical_policy = CandidateBank.numerical_policy
     numerical_identity = (model.backend.policy, model.backend.identity)
     verified = {fitted_state_fingerprint(model, result.tree, result.selected, numerical_policy):
@@ -252,7 +271,7 @@ def _verify_membership_audits(model, result, selected_numerics):
     seen, counts = set(), []
     for audit in audits:
         if (not isinstance(audit, MembershipAudit) or audit.complete is not True
-                or type(audit.occupied_q) is not int or audit.occupied_q not in best
+                or type(audit.occupied_q) is not int or audit.occupied_q not in required
                 or audit.occupied_q in seen or type(audit.mutation_count) is not int
                 or audit.mutation_count != model.n or not isinstance(audit.moves, tuple)):
             raise ValueError('Invalid or incomplete terminal membership audit')
@@ -265,7 +284,7 @@ def _verify_membership_audits(model, result, selected_numerics):
                 or audit.numerical_identity != numerical_identity):
             raise ValueError('Terminal membership audit has stale fitted-state or numerical identity')
         if fingerprint not in verified:
-            verified[fingerprint] = _verify_fitted_numerics(model, parent.fit)
+            verified[fingerprint] = _verify_fitted_numerics(model, parent.fit, column_cache=column_cache)
         parent_score = verified[fingerprint]['score']
         labels, centers = parent.fit.labels, parent.fit.centers
         sizes = np.bincount(labels, minlength=q)
@@ -314,7 +333,7 @@ def _verify_membership_audits(model, result, selected_numerics):
                     neighbor = bank[index]
                     key = fitted_state_fingerprint(model, result.tree, neighbor, numerical_policy)
                     if key not in verified:
-                        verified[key] = _verify_fitted_numerics(model, neighbor.fit)
+                        verified[key] = _verify_fitted_numerics(model, neighbor.fit, column_cache=column_cache)
                     neighbor_score = verified[key]['score']
                     tolerance = SCORE_ATOL+SCORE_RTOL*max(abs(parent_score), abs(neighbor_score))
                     if parent_score-neighbor_score > tolerance:
@@ -328,7 +347,7 @@ def _verify_membership_audits(model, result, selected_numerics):
                     # Multiple ordered moves may share one canonical refit.
                     key = ('ineligible', move.attempt_index)
                     if key not in verified:
-                        verified[key] = _verify_fitted_numerics(model, fit, eligible=False)
+                        verified[key] = _verify_fitted_numerics(model, fit, eligible=False, column_cache=column_cache)
                     row_counts['completed_ineligible_neighbors'] += 1
                 else:
                     raise ValueError('Feasible membership neighbor has unresolved numerical evaluation')
@@ -336,13 +355,14 @@ def _verify_membership_audits(model, result, selected_numerics):
         counts.append(row_counts)
     counts.sort(key=lambda row: row['occupied_q'])
     selected = next(row for row in counts if row['state_index'] == result.selected.state_index)
-    return {'complete': True, 'scope': AUDIT_POLICY, **selected,
+    return {'complete': True, 'scope': scope, 'policy': AUDIT_POLICY, **selected,
+            'selected_count_certified': True, 'all_represented_counts_certified': seen == set(best),
             'score_atol': SCORE_ATOL, 'score_rtol': SCORE_RTOL,
             'represented_cluster_counts': sorted(best), 'per_q': counts}
 
 
 def verify_selected(model, result):
-    """Independently verify bank selection and every terminal fixed-q neighborhood.
+    """Independently verify bank selection and the requested terminal neighborhoods.
 
     The hard-partition likelihood and assignment-validity diagnostic do not
     replace the joint mixture score. Local closure is not global optimality.
@@ -350,7 +370,8 @@ def verify_selected(model, result):
     selected = result.selected
     fit, labels = selected.fit, selected.fit.labels
     q = len(fit.centers)
-    verified = _verify_fitted_numerics(model, fit)
+    column_cache = {}
+    verified = _verify_fitted_numerics(model, fit, column_cache=column_cache)
     _verify_retained_bank(model, result, verified['score'])
     cuts = tuple(e for e, (i, j) in enumerate(result.tree.edges) if labels[i] != labels[j])
     kind = selected.membership_kind
@@ -361,12 +382,12 @@ def verify_selected(model, result):
             raise ValueError('Selected blocks must be connected in the frozen tree')
     elif kind != 'general' or list(dict.fromkeys(labels.tolist())) != list(range(q)):
         raise ValueError('Selected general membership must use canonical first-occurrence labels')
-    audit = _verify_membership_audits(model, result, verified)
+    audit = _verify_membership_audits(model, result, verified, column_cache)
     return {'verification_schema_version': VERIFICATION_SCHEMA_VERSION,
             'independently_verified': True, **verified, 'membership_kind': kind,
             'connected_on_proposal_tree': len(cuts)+1 == q,
             'complete_candidate_bank_reconciled': True, 'selected_fitted_state_retained': True,
-            'membership_audit': audit}
+            'independent_cached_columns': len(column_cache), 'membership_audit': audit}
 
 
 def result_tables(model, result, tumor_id):
@@ -409,8 +430,16 @@ def check_destination(outdir, tumor_id):
         raise FileExistsError('Tumor output namespace already exists; choose a new directory')
 
 
-def publish(model, result, outdir, tumor_id):
+def publish(model, result, outdir, tumor_id, *, progress=None):
+    if progress is not None:
+        progress.start_phase('verification')
+    started = perf_counter()
     verification = verify_selected(model, result)
+    verification_seconds = perf_counter()-started
+    if progress is not None:
+        progress.emit(complete=True)
+        progress.start_phase('output')
+    started = perf_counter()
     check_destination(outdir, tumor_id)
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -430,8 +459,12 @@ def publish(model, result, outdir, tumor_id):
         for name, digest in hashes.items():
             if file_sha256(outdir/name) != digest:
                 raise ValueError('Published TSV readback hash mismatch')
+    output_seconds = perf_counter()-started
+    if progress is not None:
+        progress.emit(complete=True)
     return {'status': 'complete', 'algorithm': ALGORITHM,
             'output_schema_version': OUTPUT_SCHEMA_VERSION, 'files': hashes,
+            'verification_seconds': verification_seconds, 'output_seconds': output_seconds,
             'verification': verification}
 
 

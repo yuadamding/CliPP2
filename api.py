@@ -17,7 +17,7 @@ def process_tumor_bundle(tumor_file, outdir, fit_config=None, *, progress_callba
     Unlike ``process_tumor``, this diagnostic API returns the complete search
     ledger and candidate bank. Neither API writes these as extra output files.
     An optional progress callback receives detached phase/candidate/batch snapshots;
-    schema 2 does not promise an internal optimizer-request event sequence.
+    Schema 3 also reports audit-pass coverage and verification/output phases.
     """
     return _process_tumor(tumor_file, outdir, fit_config,
                           progress_callback=progress_callback, retain_evidence=True)
@@ -30,6 +30,7 @@ def _process_tumor(tumor_file, outdir, fit_config=None, *, progress_callback=Non
     from .io.reporting import ALGORITHM, OUTPUT_SCHEMA_VERSION, check_destination, exclusion_summary, publish
     from ._source import source_fingerprint, git_source_identity
     from .kernel import KERNEL_VERSION, SCORE_DEFINITION
+    from .tree.progress import ProgressReporter
 
     config = resolve_fit_config() if fit_config is None else fit_config
     if type(config) is not FitConfig:
@@ -37,6 +38,9 @@ def _process_tumor(tumor_file, outdir, fit_config=None, *, progress_callback=Non
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError('progress_callback must be callable or None')
     started = perf_counter()
+    progress = None if progress_callback is None else ProgressReporter(None, progress_callback)
+    if progress is not None:
+        progress.start_phase('input')
     source_root = Path(__file__).resolve().parent
     commit, dirty = git_source_identity(source_root)
     source_hash = source_fingerprint(source_root)
@@ -51,18 +55,25 @@ def _process_tumor(tumor_file, outdir, fit_config=None, *, progress_callback=Non
     data = load_tumor_txt(path, max_major_cn=config.max_major_cn, initialize=False)
     check_destination(outdir, data.tumor_id)
     model = RegionalModel(data, device=config.device, cpu_threads=config.cpu_threads)
+    input_seconds = perf_counter()-started
+    if progress is not None:
+        progress.model = model
+        progress.emit(complete=True)
     try:
-        result = fit_regions(model, config.max_clusters, progress_callback=progress_callback,
-                             retain_evidence=retain_evidence)
+        fit_offset = perf_counter()-started
+        fit_callback = (None if progress_callback is None else lambda record:
+                        progress_callback(dict(record, elapsed_seconds=record['elapsed_seconds']+fit_offset)))
+        result = fit_regions(model, config.max_clusters, progress_callback=fit_callback,
+                             retain_evidence=retain_evidence, audit_scope=config.audit_scope)
         if input_fingerprint(path) != input_hash:
             raise RuntimeError('Input changed during fitting; no successful publication')
         if source_fingerprint(source_root) != source_hash:
             raise RuntimeError('Python source changed during fitting; no successful publication')
         verification_start = perf_counter()
-        publication = publish(model, result, outdir, data.tumor_id)
+        publication = publish(model, result, outdir, data.tumor_id, progress=progress)
         summary = {
             'tumor_id': data.tumor_id, 'algorithm': ALGORITHM, 'model_version': MODEL_VERSION,
-            'output_schema_version': OUTPUT_SCHEMA_VERSION, 'diagnostics_schema_version': 2,
+            'output_schema_version': OUTPUT_SCHEMA_VERSION, 'diagnostics_schema_version': 3,
             'kernel_version': KERNEL_VERSION,
             'source_commit': commit, 'source_dirty': dirty,
             'source_sha256': source_hash, 'input_sha256': input_hash,
@@ -73,6 +84,19 @@ def _process_tumor(tumor_file, outdir, fit_config=None, *, progress_callback=Non
             'clonal_constraint': False, 'cluster_zero': 'largest_final_ccf_l2_norm',
             'exclusions': exclusion_summary(model), 'diagnostics': result.diagnostics,
             'execution': model.execution_diagnostics(),
+            'search_status': {'policy': result.diagnostics['search_policy'],
+                'audit_scope': config.audit_scope,
+                'selected_q': len(result.centers), 'selected_state_id': result.selected.state_index,
+                'unresolved_terminal_evaluations': publication['verification']['membership_audit'][
+                    'unresolved_evaluations'],
+                'selected_count_certified': publication['verification']['membership_audit'][
+                    'selected_count_certified'],
+                'all_represented_counts_certified': publication['verification']['membership_audit'][
+                    'all_represented_counts_certified'],
+                'represented_cluster_counts': publication['verification']['membership_audit'][
+                    'represented_cluster_counts'],
+                'search_work': result.diagnostics['search_work'], 'global_optimality_certified': False},
+            'input_seconds': input_seconds,
             'verification_publication_seconds': perf_counter()-verification_start,
             'elapsed_seconds': perf_counter()-started, 'publication': publication,
             'qualification_scope': 'numerical_fit_not_global_optimality_or_biological_accuracy',
@@ -87,7 +111,7 @@ def process_tumor(tumor_file: str | Path, outdir: str | Path,
     """Publish the README's three tables; return compact operational metadata.
 
     Verification uses retained objects and compact attempt links, not a JSON
-    research ledger. Progress callbacks receive schema-2 coarse snapshots.
+    research ledger. Progress callbacks receive schema-3 detached snapshots.
     """
     summary, _ = _process_tumor(tumor_file, outdir, fit_config, progress_callback=progress_callback)
     del summary['diagnostics']
