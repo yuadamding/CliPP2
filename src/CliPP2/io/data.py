@@ -1,9 +1,11 @@
 """Immutable retained biological inputs and their CN exclusion provenance."""
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields
 import hashlib
 import json
+from types import MappingProxyType
 
 import numpy as np
 
@@ -14,6 +16,35 @@ def readonly_array(value: object, *, dtype=None) -> np.ndarray:
     """Copy into an immutable bytes-backed array, not a reversible write flag."""
     array = np.asarray(value, dtype=dtype, order="C")
     return np.frombuffer(array.tobytes(), dtype=array.dtype).reshape(array.shape)
+
+
+def freeze_record(value):
+    """Detach nested scientific records from their caller's mutable containers."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: freeze_record(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(map(freeze_record, value))
+    return readonly_array(value) if isinstance(value, np.ndarray) else value
+
+
+def json_value(value):
+    """Encode scientific nonfinite values explicitly, never as bare JSON NaN."""
+    if isinstance(value, np.ndarray):
+        return json_value(value.tolist())
+    if isinstance(value, Mapping):
+        return {str(key): json_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return list(map(json_value, value))
+    if isinstance(value, np.generic):
+        return json_value(value.item())
+    if isinstance(value, float) and not np.isfinite(value):
+        return "NaN" if np.isnan(value) else "Infinity" if value > 0 else "-Infinity"
+    return value
+
+
+def content_hash(value):
+    return hashlib.sha256(json.dumps(json_value(value), sort_keys=True,
+                                    separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
 def restore_immutable_record(cls, inputs):
@@ -129,6 +160,7 @@ class MultiplicityBounds(ImmutableArrayRecord):
     lower: np.ndarray
     upper: np.ndarray
     policy_id: str = "explicit"
+    _content_hash: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
         for name in ("mutation_ids", "region_ids"):
@@ -150,15 +182,19 @@ class MultiplicityBounds(ImmutableArrayRecord):
             object.__setattr__(self, name, readonly_array(values, dtype=np.int64))
         if np.any(self.lower > self.upper):
             raise ValueError("Multiplicity lower endpoints may not exceed upper endpoints")
+        object.__setattr__(self, "_content_hash", self._fingerprint())
 
-    @property
-    def content_hash(self):
+    def _fingerprint(self):
         digest = hashlib.sha256(b"clipp2.multiplicity-bounds.v1\0")
         digest.update(json.dumps([self.mutation_ids, self.region_ids, self.policy_id],
                                  ensure_ascii=False, separators=(",", ":")).encode())
         digest.update(self.lower.astype("<i8", copy=False).tobytes())
         digest.update(self.upper.astype("<i8", copy=False).tobytes())
         return digest.hexdigest()
+
+    @property
+    def content_hash(self):
+        return self._content_hash
 
     def subset(self, mutation_ids, region_ids=None):
         mutations, rows = _indices(mutation_ids, self.mutation_ids, "mutation")
@@ -248,11 +284,11 @@ class OriginalCatalog(ImmutableArrayRecord):
     source_rows: tuple
     provenance: tuple
     metadata: tuple
-    input_identity: str
     max_major_cn: int = 10
+    _content_hash: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
-        from .tumor_txt import _identifier, _safe_tumor_id
+        from .tumor_txt import _identifier, _mapping_provenance, _safe_tumor_id
 
         object.__setattr__(self, "tumor_id", _safe_tumor_id(self.tumor_id))
         for name in ("mutation_ids", "region_ids"):
@@ -297,9 +333,10 @@ class OriginalCatalog(ImmutableArrayRecord):
             source_keys.add((source["mutation_id"], source["sample_id"]))
         if source_keys != {(mutation, region) for mutation in self.mutation_ids for region in self.region_ids}:
             raise ValueError("Catalog source rows do not cover exactly the original keys")
-        if (not isinstance(self.input_identity, str) or len(self.input_identity) != 64
-                or any(char not in "0123456789abcdef" for char in self.input_identity)):
-            raise ValueError("Catalog input identity must be a SHA-256 hex digest")
+        source_mapping = _mapping_provenance([dict(row) for row in self.source_rows])
+        if any(self.mapping_genuine[i, j] != source_mapping[mutation, region]
+               for i, mutation in enumerate(self.mutation_ids) for j, region in enumerate(self.region_ids)):
+            raise ValueError("Catalog genuine-mapping flags disagree with original provenance")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
         if not np.isfinite(self.purity).all() or np.any(self.purity <= 0) or np.any(self.purity > 1):
             raise ValueError("Catalog purity must lie in (0,1]")
@@ -342,28 +379,29 @@ class OriginalCatalog(ImmutableArrayRecord):
                         or not np.isclose(self.mean_total_cn[i, j], total, atol=1e-12, rtol=1e-12)
                         or self.eligible[i, j] != (maximum <= self.max_major_cn)):
                     raise ValueError("Catalog biology or eligibility disagrees with original CN states")
+        object.__setattr__(self, "_content_hash", hashlib.sha256(json.dumps(self._payload(), sort_keys=True,
+            ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).hexdigest())
 
     def _payload(self):
-        payload = {"schema": "clipp2.original-catalog.v1", "tumor_id": self.tumor_id,
+        payload = {"schema": "clipp2.original-catalog.v2", "tumor_id": self.tumor_id,
                    "mutation_ids": list(self.mutation_ids), "region_ids": list(self.region_ids),
-                   "input_identity": self.input_identity, "max_major_cn": self.max_major_cn}
+                   "max_major_cn": self.max_major_cn}
         payload.update((name, getattr(self, name).tolist()) for name in _CATALOG_ARRAYS)
         payload.update((name, getattr(self, name)) for name in ("cn_states", "source_rows", "provenance", "metadata"))
         return payload
 
     @property
     def content_hash(self):
-        return hashlib.sha256(json.dumps(self._payload(), sort_keys=True, ensure_ascii=False,
-                                         separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+        return self._content_hash
 
     def to_dict(self):
         return dict(self._payload(), content_hash=self.content_hash)
 
     @classmethod
     def from_dict(cls, payload):
-        if payload.get("schema") != "clipp2.original-catalog.v1":
+        if payload.get("schema") != "clipp2.original-catalog.v2":
             raise ValueError("Unsupported original-catalog schema")
-        value = cls(**{item.name: payload[item.name] for item in fields(cls)})
+        value = cls(**{item.name: payload[item.name] for item in fields(cls) if item.init})
         if payload.get("content_hash") != value.content_hash:
             raise ValueError("Original-catalog content hash mismatch")
         return value
@@ -385,7 +423,7 @@ class OriginalCatalog(ImmutableArrayRecord):
         mutation_set, region_set = set(mutations), set(regions)
         selected = [(row, extra) for row, extra in zip(self.source_rows, self.provenance)
                     if dict(row)["mutation_id"] in mutation_set and dict(row)["sample_id"] in region_set]
-        values = {item.name: getattr(self, item.name) for item in fields(self)}
+        values = {item.name: getattr(self, item.name) for item in fields(self) if item.init}
         values.update((name, getattr(self, name)[ix]) for name in _CATALOG_ARRAYS)
         values.update(mutation_ids=mutations, region_ids=regions,
                       source_rows=tuple(row for row, _ in selected), provenance=tuple(extra for _, extra in selected),
@@ -397,4 +435,26 @@ class OriginalCatalog(ImmutableArrayRecord):
         return MultiplicityBounds(self.mutation_ids, self.region_ids, np.ones_like(upper), upper, "original")
 
 
-__all__ = ["CNFilterRecord", "CNFilterReport", "TumorData", "OriginalCatalog", "MultiplicityBounds"]
+def validate_workflow_mapping(catalog, mutation_ids=None):
+    """Require genuine single-state CN wherever a strict workflow uses evidence.
+
+    Unobserved single-state cells have no likelihood or restricted CCF domain;
+    fully excluded/uninformative rows can remain for original-population accounting.
+    Mixed cells in otherwise informative rows impose CCF bounds even without reads.
+    """
+    if not isinstance(catalog, OriginalCatalog):
+        raise TypeError("Strict workflow mapping requires an OriginalCatalog")
+    ids, rows = _indices(catalog.mutation_ids if mutation_ids is None else mutation_ids,
+                        catalog.mutation_ids, "mutation")
+    eligible = catalog.eligible[rows]
+    observed = eligible & catalog.count_observed[rows] & (catalog.total_counts[rows] > 0)
+    nongenuine = observed & ~catalog.mapping_genuine[rows]
+    mixed = eligible & observed.any(axis=1)[:, None] & (catalog.cn_state_count[rows] > 1)
+    if np.any(nongenuine | mixed):
+        examples = [(ids[i], catalog.region_ids[j]) for i, j in np.argwhere(nongenuine | mixed)[:5]]
+        raise ValueError("Strict workflow evidence requires genuine, unambiguous single-state CN; "
+                         f"invalid mutation-region mappings: {examples}")
+
+
+__all__ = ["CNFilterRecord", "CNFilterReport", "TumorData", "OriginalCatalog", "MultiplicityBounds",
+           "freeze_record", "json_value", "content_hash", "validate_workflow_mapping"]

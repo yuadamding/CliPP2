@@ -11,7 +11,78 @@ import hashlib
 import numpy as np
 from scipy.special import gammaln
 
-from ..io.data import ImmutableArrayRecord, OriginalCatalog, MultiplicityBounds, TumorData, readonly_array
+from .likelihood import MIXED_EPS
+from ..config import MAX_MULTIPLICITY
+from ..io.data import (ImmutableArrayRecord, OriginalCatalog, MultiplicityBounds, TumorData,
+                       freeze_record, readonly_array)
+
+
+def observed_mask(data):
+    """The shared positive-depth observation mask; population rules stay outside."""
+    depth = np.asarray(data.total_counts)
+    shape = len(data.mutation_ids), len(data.region_ids)
+    observed = np.ones(shape, dtype=bool) if data.count_observed is None else np.asarray(data.count_observed, dtype=bool)
+    if depth.shape != shape or observed.shape != shape:
+        raise ValueError("Read counts and masks must align with mutation-region keys")
+    return observed & np.isfinite(depth) & (depth > 0)
+
+
+def prepare_observations(data, multiplicity_support=None, *, rows=None, regions=None):
+    """One production preparation of biological arrays, domains and emissions.
+
+    Callers choose the population: fitting excludes uninformative rows and requires
+    regional coverage; prediction preserves requested rows, including empty inputs.
+    """
+    rows = np.arange(len(data.mutation_ids)) if rows is None else rows
+    regions = np.arange(len(data.region_ids)) if regions is None else regions
+    ix = np.ix_(rows, regions)
+    observed = observed_mask(data)[ix]
+    arrays = {name: np.asarray(source, dtype=float)[ix] for name, source in (
+        ("alt", data.alt_counts), ("depth", data.total_counts), ("major", data.major_cn),
+        ("normal", data.normal_cn), ("total", data.mean_total_cn), ("purity", data.purity))}
+    alt, depth, major, normal, total, purity = (arrays[name] for name in arrays)
+    mixed = np.asarray(data.cn_state_count)[ix] > 1
+    if any(not np.isfinite(value).all() for value in (major, normal, total, purity)):
+        raise ValueError("CN and purity must be finite in every mutation-region")
+    if np.any(major < 1) or np.any(major != np.rint(major)):
+        raise ValueError("Major CN must be a positive integer")
+    if np.any(normal < 0) or np.any(normal != np.rint(normal)):
+        raise ValueError("Normal CN must be a nonnegative integer")
+    if np.any(total[~mixed] < major[~mixed]) or np.any(total[~mixed] != np.rint(total[~mixed])):
+        raise ValueError("Single-state total CN must be an integer at least major CN")
+    if np.any(purity <= 0) or np.any(purity > 1) or not np.all(purity == purity[:1]):
+        raise ValueError("Purity must be constant within each region and in (0,1]")
+    if (not np.isfinite(alt[observed]).all() or np.any(alt[observed] < 0)
+            or np.any(alt[observed] > depth[observed]) or np.any(alt[observed] != np.rint(alt[observed]))
+            or np.any(depth[observed] != np.rint(depth[observed]))):
+        raise ValueError("Informative read counts must be finite nonnegative integers")
+    alt, depth = np.where(observed, alt, 0.), np.where(observed, depth, 0.)
+    denominator = (1-purity)*normal + purity*total
+    if not np.isfinite(denominator).all() or np.any(denominator <= 0):
+        raise ValueError("Normal-plus-tumor denominator must be finite and positive")
+    default_maximum = np.where(mixed, np.minimum(major, MAX_MULTIPLICITY), major)
+    if multiplicity_support is None:
+        minimum, maximum = np.ones_like(default_maximum), default_maximum
+    else:
+        if not isinstance(multiplicity_support, MultiplicityBounds):
+            raise TypeError("multiplicity_support must be immutable MultiplicityBounds or None")
+        minimum, maximum = (values[ix] for values in multiplicity_support.for_data(data))
+    if (np.any(minimum < 1) or np.any(minimum > maximum) or np.any(maximum > default_maximum)
+            or np.any(maximum >= 2**63)):
+        raise ValueError("Multiplicity intervals must satisfy 1 <= lower <= upper <= original support")
+    changed = (minimum != 1) | (maximum != default_maximum)
+    if np.any(changed & mixed):
+        raise ValueError("Multiplicity overrides are unsupported for mixed-CN observations")
+    minimum, maximum = minimum.astype(np.int64), maximum.astype(np.int64)
+    support = maximum-minimum+1
+    lower, upper = np.where(mixed, MIXED_EPS, 0.), np.where(mixed, np.asarray(data.phi_upper)[ix], 1.)
+    if np.any(upper < lower) or np.any(upper > 1) or not np.isfinite(upper).all():
+        raise ValueError("Invalid original mixed-CN bounds")
+    arrays.update(alt=alt, depth=depth, observed=observed, mixed=mixed, multiplicity_min=minimum,
+        multiplicity_max=maximum, support=support, multiplicity_restricted=bool(changed.any()),
+        lower=lower, upper=upper, scaling=purity/denominator,
+        constants=gammaln(depth+1)-gammaln(alt+1)-gammaln(depth-alt+1)-np.log(support))
+    return freeze_record(arrays)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,22 +145,8 @@ def prepare_prediction(catalog: OriginalCatalog, targets, bounds: MultiplicityBo
     bounds = catalog.default_bounds() if bounds is None else bounds
     if not isinstance(bounds, MultiplicityBounds):
         raise TypeError("Prediction bounds must be MultiplicityBounds")
-    lower_m, upper_m = bounds.for_data(data)
     selected_bounds = bounds.subset(data.mutation_ids, data.region_ids)
-    width = upper_m-lower_m+1
-    observed = np.asarray(data.count_observed, dtype=bool) & (data.total_counts > 0)
-    alt = np.where(observed, data.alt_counts, 0.)
-    depth = np.where(observed, data.total_counts, 0.)
-    if (not np.isfinite(alt).all() or not np.isfinite(depth).all()
-            or np.any(alt < 0) or np.any(alt > depth)
-            or np.any(alt != np.rint(alt)) or np.any(depth != np.rint(depth))):
-        raise ValueError("Informative prediction counts must be finite nonnegative integers")
-    mixed = data.cn_state_count > 1
-    denominator = (1-data.purity)*data.normal_cn + data.purity*data.mean_total_cn
-    if not np.isfinite(denominator).all() or np.any(denominator <= 0):
-        raise ValueError("Prediction requires positive biological denominators")
-    scaling = data.purity/denominator
-    constants = gammaln(depth+1)-gammaln(alt+1)-gammaln(depth-alt+1)-np.log(width)
+    numerical = prepare_observations(data, selected_bounds)
     row_lookup = {value: index for index, value in enumerate(catalog.mutation_ids)}
     rows = np.asarray([row_lookup[value] for value in data.mutation_ids], dtype=int)
     eligible = catalog.eligible[rows]
@@ -97,9 +154,9 @@ def prepare_prediction(catalog: OriginalCatalog, targets, bounds: MultiplicityBo
     digest.update(catalog.content_hash.encode())
     digest.update(selected_bounds.content_hash.encode())
     return PreparedObservations(data, data.mutation_ids, data.region_ids, device,
-        alt, depth, observed, mixed, eligible, data.major_cn, data.normal_cn, data.mean_total_cn,
-        data.purity, scaling, constants, np.where(mixed, 1e-6, 0.),
-        np.where(mixed, data.phi_upper, 1.), lower_m, width, digest.hexdigest(), selected_bounds)
+        eligible=eligible, identity=digest.hexdigest(), bounds=selected_bounds,
+        **{name: value for name, value in numerical.items()
+           if name not in ("multiplicity_max", "multiplicity_restricted")})
 
 
-__all__ = ["PreparedObservations", "prepare_prediction"]
+__all__ = ["PreparedObservations", "prepare_prediction", "prepare_observations", "observed_mask"]

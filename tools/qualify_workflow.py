@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Small deterministic CPU support-sensitivity experiment, not calibration approval.
+"""CPU workflow contracts and support-sensitivity checks, not calibration approval.
 
 Both fits use the same frozen simulated remainder. Paired assignments share one
 reference built from the capped fit; their imposed floor is a deliberate stress
 policy, not a claim that a complete workflow inferred that floor from donors.
 The separate nonidentifiability case exposes latent CCF/multiplicity aliases.
+Run against one installed wheel or editable package; no checkout import is
+injected. Workflow/publication contract fixtures use their own frozen cutoffs.
 """
 from __future__ import annotations
 
@@ -12,35 +14,19 @@ import argparse
 from dataclasses import asdict
 import json
 from pathlib import Path
-import sys
 import tempfile
 
 import numpy as np
-import pandas as pd
 from scipy.optimize import linear_sum_assignment
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from CliPP2.assignment import AssignmentBundle, AssignmentReference, assign_mutations
+from CliPP2.config import AssignmentThresholds, DescriptiveScreen
+from CliPP2.io.data import MultiplicityBounds
+from CliPP2.io.reporting import verify_selected
+from CliPP2.kernel.model import RegionalModel
+from CliPP2.tree.selection import fit_regions
 
-from CliPP2._source import file_sha256, git_source_identity, source_fingerprint  # noqa: E402
-from CliPP2.assignment import AssignmentBundle, AssignmentReference, assign_mutations  # noqa: E402
-from CliPP2.config import AssignmentThresholds  # noqa: E402
-from CliPP2.io.data import MultiplicityBounds  # noqa: E402
-from CliPP2.io.reporting import verify_selected  # noqa: E402
-from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt  # noqa: E402
-from CliPP2.kernel.model import RegionalModel  # noqa: E402
-from CliPP2.tree.selection import fit_regions  # noqa: E402
-
-
-def write_catalog(path, alt, depth, major, *, purity=None):
-    alt, depth, major = np.broadcast_arrays(np.atleast_2d(alt), np.atleast_2d(depth), np.atleast_2d(major))
-    purity = np.ones(alt.shape[1]) if purity is None else np.asarray(purity)
-    records = [dict(mutation_id=f"m{i:03}", sample_id=f"r{r+1}",
-        alt_count=int(alt[i, r]), ref_count=int(depth[i, r]-alt[i, r]), count_observed=1,
-        purity=float(purity[r]), normal_cn=2, segment_id="shared_segment",
-        cn_state_id="0", cn_state_fraction=1., allele_a_cn=int(major[i, r]), allele_b_cn=0)
-        for i in range(alt.shape[0]) for r in range(alt.shape[1])]
-    write_tumor_txt(path, pd.DataFrame(records))
-    return load_original_catalog(path)
+from check_workflow import run_checks, write_catalog
 
 
 def matched_groups(truth, labels):
@@ -198,27 +184,29 @@ def main(argv=None):
     parser.add_argument("--replicates", type=int, default=3)
     parser.add_argument("--posterior-min", type=float, required=True)
     parser.add_argument("--mean-deviance-max", type=float, required=True)
+    parser.add_argument("--pair-deviance-max", type=float, required=True)
+    parser.add_argument("--outlier-fraction-max", type=float, required=True)
     parser.add_argument("--tie-atol", type=float, required=True)
+    parser.add_argument("--multiplicity-tie-atol", type=float, required=True)
+    parser.add_argument("--probability-sensitivity-atol", type=float, required=True)
     args = parser.parse_args(argv)
     if args.replicates < 1:
         parser.error("replicates must be positive")
-    thresholds = AssignmentThresholds(args.posterior_min, args.mean_deviance_max, args.tie_atol)
+    thresholds = AssignmentThresholds(args.posterior_min,
+        DescriptiveScreen(args.pair_deviance_max, args.mean_deviance_max, args.outlier_fraction_max),
+        args.tie_atol, args.multiplicity_tie_atol, args.probability_sensitivity_atol)
     if args.output.exists():
         raise FileExistsError("Qualification output already exists; use a new output path")
-    repository = Path(__file__).resolve().parents[1]
-    commit, dirty = git_source_identity(repository)
     with tempfile.TemporaryDirectory(prefix="clipp2-qualification-") as temporary:
         directory = Path(temporary)
-        report = dict(schema="clipp2.synthetic-qualification.v1", seed=args.seed,
-            source_commit=commit, source_dirty=dirty,
-            source_sha256=source_fingerprint(repository / "src/CliPP2"),
-            qualification_script_sha256=file_sha256(__file__),
+        report = dict(schema="clipp2.synthetic-qualification.v2", seed=args.seed,
             device="cpu", thresholds=asdict(thresholds),
             calibration_approved=False,
             limitations=["Small synthetic experiment, not an empirical biological calibration study",
                 "Imposed stress bounds are not inferred from simulated donor qualification",
                 "Fixed-reference target read counts also contributed to the capped fit",
                 "No CUDA execution; no guarantee across real tumor distributions"],
+            workflow_contracts=run_checks(directory / "contracts"),
             cases=[simulated_case(directory, args.seed+i, thresholds) for i in range(args.replicates)],
             nonidentifiability=nonidentifiability_case(directory, thresholds))
     args.output.parent.mkdir(parents=True, exist_ok=True)

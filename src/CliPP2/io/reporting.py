@@ -10,7 +10,6 @@ import numpy as np
 import pandas as pd
 from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 
-from .._source import file_sha256
 from ..config import validate_audit_scope
 from ..kernel import ALGORITHM, SCORE_DEFINITION
 from ..kernel.model import FitResult
@@ -410,14 +409,19 @@ def verify_selected(model, result):
             'independent_cached_columns': len(column_cache), 'membership_audit': audit}
 
 
+def public_label_order(fit):
+    """The single public-label convention used by tables and replay receipts."""
+    # Cluster zero is largest norm, never an enforced clonal block.
+    order = np.argsort(-np.linalg.norm(fit.centers, axis=1), kind='stable')
+    mapping = np.empty(len(order), dtype=int)
+    mapping[order] = np.arange(len(order))
+    return order, mapping[fit.labels]
+
+
 def result_tables(model, result, tumor_id):
     fit = result.selected.fit
     labels, centers = fit.labels, fit.centers
-    # Cluster zero is largest norm, never an enforced clonal block.
-    order = np.argsort(-np.linalg.norm(centers, axis=1), kind='stable')
-    mapping = np.empty(len(order), dtype=int)
-    mapping[order] = np.arange(len(order))
-    public = mapping[labels]
+    order, public = public_label_order(fit)
     phi = centers[labels]
     wide = pd.DataFrame(dict(tumor_id=tumor_id, mutation_id=model.mutation_ids, cluster_label=public))
     cluster = pd.DataFrame(dict(tumor_id=tumor_id, cluster_label=np.arange(len(order)),
@@ -463,7 +467,7 @@ def publish(model, result, outdir, tumor_id, *, progress=None):
     check_destination(outdir, tumor_id)
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    tables, hashes = result_tables(model, result, tumor_id), {}
+    tables, files = result_tables(model, result, tumor_id), []
     # Per-file no-clobber publication, not a collective transaction.
     with tempfile.TemporaryDirectory(prefix='.clipp2-publication-', dir=outdir) as temporary:
         staged = Path(temporary)
@@ -473,17 +477,14 @@ def publish(model, result, outdir, tumor_id, *, progress=None):
             parsed = pd.read_csv(staged/name, sep='\t', dtype=str, keep_default_na=False)
             if list(parsed.columns) != list(table.columns) or len(parsed) != len(table):
                 raise ValueError('Staged TSV did not round-trip its schema and row count')
-            hashes[name] = file_sha256(staged/name)
-        for name in hashes:
+            files.append(name)
+        for name in files:
             os.link(staged/name, outdir/name)
-        for name, digest in hashes.items():
-            if file_sha256(outdir/name) != digest:
-                raise ValueError('Published TSV readback hash mismatch')
     output_seconds = perf_counter()-started
     if progress is not None:
         progress.emit(complete=True)
     return {'status': 'complete', 'algorithm': ALGORITHM,
-            'output_schema_version': OUTPUT_SCHEMA_VERSION, 'files': hashes,
+            'output_schema_version': OUTPUT_SCHEMA_VERSION, 'files': files,
             'verification_seconds': verification_seconds, 'output_seconds': output_seconds,
             'verification': verification}
 

@@ -1,5 +1,4 @@
-"""Embed honest source identity in wheels without importing the inference stack."""
-import json
+"""Build native extensions without importing the inference stack."""
 import os
 from pathlib import Path
 from runpy import run_path
@@ -7,26 +6,11 @@ import shutil
 import subprocess
 
 from setuptools import Extension, setup
-from setuptools.command.build_py import build_py
 from setuptools.command.build_ext import build_ext
 
 
 root = Path(__file__).resolve().parent
 package_source = Path("src/CliPP2")
-# Loading this stdlib-only file directly must not import the inference stack.
-source_helpers = run_path(str(root / package_source / "_source.py"))
-source_fingerprint = source_helpers["source_fingerprint"]
-git_source_identity = source_helpers["git_source_identity"]
-
-
-class BuildPy(build_py):
-    def run(self):
-        commit, dirty = git_source_identity(root)
-        super().run()
-        package = Path(self.build_lib) / "CliPP2"
-        record = {"schema_version": 1, "commit": commit, "dirty": dirty,
-                  "python_source_sha256": source_fingerprint(package)}
-        (package / "_build_source.json").write_text(json.dumps(record, sort_keys=True) + "\n")
 
 
 class BuildExt(build_ext):
@@ -82,4 +66,4 @@ if os.environ.get("CLIPP2_BUILD_CUDA") == "1":
     extensions.append(Extension(
         "CliPP2.kernel._native_cuda", sources=[str(package_source / "kernel/csrc/cuda/backend.cu")],
         depends=[str(path.relative_to(root)) for path in backend_sources("cuda")], language="c++"))
-setup(cmdclass={"build_py": BuildPy, "build_ext": BuildExt}, ext_modules=extensions)
+setup(cmdclass={"build_ext": BuildExt}, ext_modules=extensions)

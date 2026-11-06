@@ -2,13 +2,10 @@
 from __future__ import annotations
 
 from bisect import bisect_right
-import hashlib
-import json
 from pathlib import Path
 
 import pandas as pd
 
-from .._source import file_sha256
 from .tumor_txt import (
     SCHEMA_COLUMNS, TumorTxtError, _finite_float, _identifier,
     _read_text_table, _safe_tumor_id, _validate_metadata,
@@ -41,18 +38,6 @@ def _regions(path: Path) -> tuple[Path, ...]:
             raise TumorTxtError(f"{region}: missing regional input files: {missing}.")
         _identifier(region.name, name="sample_id")
     return regions
-
-
-def input_fingerprint(path: str | Path) -> str:
-    """Bind consumed names and bytes; preserve the canonical file's SHA-256."""
-    path = Path(path).resolve()
-    if path.is_file():
-        return file_sha256(path)
-    files = [(str((region / name).relative_to(path)), file_sha256(region / name))
-             for region in _regions(path) for name in _FILES]
-    # The root name determines tumor ID (and sample ID for a single bundle).
-    payload = ["clipp2.regional-files.v1", path.name, sorted(files)]
-    return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
 
 
 def _integer(value: str, *, name: str, minimum: int = 0) -> int:
@@ -110,8 +95,8 @@ def _read_region(path: Path, *, preserve_provenance=False):
     return (*result, observation_rows, interval_rows) if preserve_provenance else result
 
 
-def read_region_directory(path: str | Path, *, preserve_provenance=False) -> tuple[dict[str, str], pd.DataFrame]:
-    """Join inclusive CN intervals to the union of regional SNVs; truth is inert."""
+def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tuple[dict[str, str], pd.DataFrame]:
+    """Join inclusive CN intervals, retaining genuine-mapping evidence by default."""
     path = Path(path).resolve()
     regions = {region.name: _read_region(region, preserve_provenance=preserve_provenance) for region in _regions(path)}
     loci = sorted({locus for value in regions.values() for locus in value[1]})

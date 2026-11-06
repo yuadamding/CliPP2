@@ -15,23 +15,21 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, field, fields, is_dataclass
-from types import MappingProxyType
 import hashlib
 import math
 import sys
 import time
 
 import numpy as np
-from scipy.special import gammaln
 
 from . import SCORE_DEFINITION
 from .backend import DeviceColumn, NativeBackend, NativeExecutionError, ScientificCandidateRejection
 from .initialization import pooled_ccf_initialization
-from .likelihood import MIXED_EPS, RegionalView
-from .scoring import WEIGHT_CONTROLLER_ID, WeightConvergenceError, completed_weight, fit_mixture_weights
+from .likelihood import RegionalView
+from .observations import observed_mask, prepare_observations
+from .scoring import WeightConvergenceError, completed_weight, fit_mixture_weights
 from .topology import Membership
-from ..io.data import readonly_array
-from ..config import MAX_MULTIPLICITY
+from ..io.data import freeze_record, readonly_array
 
 
 # Mixed-CN emissions/boxes stay fixed; their assignment mask now enters scoring.
@@ -199,14 +197,6 @@ class JointColumnSet:
         return rows, destinations, gains[rows, destinations]
 
 
-def _freeze(value):
-    if isinstance(value, Mapping):
-        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(map(_freeze, value))
-    return readonly_array(value) if isinstance(value, np.ndarray) else value
-
-
 @dataclass(frozen=True, eq=False)
 class FitResult:
     """One immutable numerical result; search provenance belongs to Candidate."""
@@ -228,7 +218,7 @@ class FitResult:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, readonly_array(value))
-        object.__setattr__(self, "diagnostics", _freeze(self.diagnostics))
+        object.__setattr__(self, "diagnostics", freeze_record(self.diagnostics))
 
     @property
     def labels(self):
@@ -249,9 +239,7 @@ class RegionalModel:
         if len(set(ids)) != len(ids) or len(set(regions)) != len(regions):
             raise ValueError("Mutation and region identities must be unique")
         self.region_indices = readonly_array(sorted(range(len(regions)), key=regions.__getitem__), dtype=int)
-        counts = np.asarray(data.total_counts)
-        observed = np.ones_like(counts, dtype=bool) if data.count_observed is None else np.asarray(data.count_observed, dtype=bool)
-        observed = observed & np.isfinite(counts) & (counts > 0)
+        observed = observed_mask(data)
         active = np.flatnonzero(observed.any(axis=1))
         if not len(active):
             raise ValueError("No informative positive-depth mutation remains")
@@ -260,75 +248,16 @@ class RegionalModel:
         self.region_ids = tuple(regions[i] for i in self.region_indices)
         self.exclusions = tuple({"mutation_id": ids[i], "reason": "no_informative_observations"}
                                 for i in np.flatnonzero(~observed.any(axis=1)))
-        ix = np.ix_(self.active_indices, self.region_indices)
-        self.observed = readonly_array(observed[ix], dtype=bool)
+        for name, value in prepare_observations(data, multiplicity_support,
+                rows=self.active_indices, regions=self.region_indices).items():
+            setattr(self, name, value)
         self.n, self.r = self.observed.shape
         if not self.observed.any(axis=0).all():
             absent = [self.region_ids[j] for j in range(self.r) if not self.observed[:, j].any()]
             raise ValueError(f"Regions have no informative observations: {absent}")
-        for name, source in (("alt", data.alt_counts), ("depth", data.total_counts),
-                             ("major", data.major_cn), ("normal", data.normal_cn),
-                             ("total", data.mean_total_cn), ("purity", data.purity)):
-            setattr(self, name, readonly_array(np.asarray(source)[ix], dtype=float))
-        self.mixed = readonly_array(np.asarray(data.cn_state_count)[ix] > 1)
-        for values in (self.major, self.purity, self.total, self.normal):
-            if not np.isfinite(values).all():
-                raise ValueError("CN and purity must be finite in every mutation-region")
-        if np.any(self.major < 1) or np.any(self.major != np.rint(self.major)):
-            raise ValueError("Major CN must be a positive integer")
-        if np.any(self.normal < 0) or np.any(self.normal != np.rint(self.normal)):
-            raise ValueError("Normal CN must be a nonnegative integer")
-        if np.any(self.total[~self.mixed] < self.major[~self.mixed]) or np.any(
-                self.total[~self.mixed] != np.rint(self.total[~self.mixed])):
-            raise ValueError("Single-state total CN must be an integer at least major CN")
-        if np.any(self.purity <= 0) or np.any(self.purity > 1):
-            raise ValueError("Purity must be in (0,1]")
-        if not np.all(self.purity == self.purity[:1, :]):
-            raise ValueError("Purity must be constant within each biological region")
         self.region_purities = readonly_array(self.purity[0])
-        if (np.any(~np.isfinite(self.alt[self.observed]))
-                or np.any(self.alt[self.observed] < 0)
-                or np.any(self.alt[self.observed] > self.depth[self.observed])
-                or np.any(self.alt[self.observed] != np.rint(self.alt[self.observed]))
-                or np.any(self.depth[self.observed] != np.rint(self.depth[self.observed]))):
-            raise ValueError("Informative read counts must be finite nonnegative integers")
-        self.alt = readonly_array(np.where(self.observed, self.alt, 0.))
-        self.depth = readonly_array(np.where(self.observed, self.depth, 0.))
-        denominator = (1 - self.purity) * self.normal + self.purity * self.total
-        if np.any(denominator <= 0):
-            raise ValueError("Normal-plus-tumor denominator must be positive")
-        default_maximum = np.where(self.mixed, np.minimum(self.major, MAX_MULTIPLICITY), self.major)
         self.multiplicity_support = multiplicity_support
-        if multiplicity_support is None:
-            minimum, maximum = np.ones_like(default_maximum), default_maximum
-        else:
-            from ..io.data import MultiplicityBounds
-            if not isinstance(multiplicity_support, MultiplicityBounds):
-                raise TypeError("multiplicity_support must be immutable MultiplicityBounds or None")
-            original_minimum, original_maximum = multiplicity_support.for_data(data)
-            minimum, maximum = np.asarray(original_minimum)[ix], np.asarray(original_maximum)[ix]
-        if (minimum.shape != self.major.shape or maximum.shape != self.major.shape
-                or not np.isfinite(minimum).all() or not np.isfinite(maximum).all()
-                or np.any(minimum != np.rint(minimum)) or np.any(maximum != np.rint(maximum))
-                or np.any(minimum < 1) or np.any(minimum > maximum)
-                or np.any(maximum > default_maximum)):
-            raise ValueError("Multiplicity intervals must satisfy 1 <= lower <= upper <= original support")
-        changed = (minimum != 1) | (maximum != default_maximum)
-        if np.any(changed & self.mixed):
-            raise ValueError("Multiplicity overrides are unsupported for mixed-CN observations")
-        self.multiplicity_min = readonly_array(minimum, dtype=np.int64)
-        self.multiplicity_max = readonly_array(maximum, dtype=np.int64)
-        self.support = readonly_array(self.multiplicity_max-self.multiplicity_min+1, dtype=np.int64)
-        self.multiplicity_restricted = bool(changed.any())
         self.model_version = INTERVAL_MODEL_VERSION if self.multiplicity_restricted else MODEL_VERSION
-        self.lower = readonly_array(np.where(self.mixed, MIXED_EPS, 0.0))
-        self.upper = readonly_array(np.where(self.mixed, np.asarray(data.phi_upper)[ix], 1.0))
-        if np.any(self.upper < self.lower) or np.any(self.upper > 1) or not np.isfinite(self.upper).all():
-            raise ValueError("Invalid original mixed-CN bounds")
-        self.scaling = readonly_array(self.purity / denominator)
-        self.constants = readonly_array(
-            gammaln(self.depth + 1) - gammaln(self.alt + 1)
-            - gammaln(self.depth - self.alt + 1) - np.log(self.support))
         digest = hashlib.sha256(self.model_version.encode())
         for values in (self.alt, self.depth, self.observed):
             digest.update(values.tobytes())
@@ -731,10 +660,9 @@ class RegionalModel:
         if (columns.model_identity != self.identity or columns.numerical_identity !=
                 (self.backend.policy, self.backend.identity)):
             raise ValueError("Weight columns belong to another regional model or numerical backend")
-        controller = ((WEIGHT_CONTROLLER_ID, "resident_portable_blas_v1") if self.backend.kind == "cuda"
-                      else WEIGHT_CONTROLLER_ID)
+        # This model-local cache uses one weight solver for its fixed backend.
         return (columns.model_identity, self.backend.kind, columns.numerical_identity,
-                controller, columns.center_keys,
+                columns.center_keys,
                 counts.dtype.str, counts.shape, counts.tobytes())
 
     def _solve_weight_problems(self, problems, counts, *, max_active,
@@ -776,7 +704,7 @@ class RegionalModel:
     def _cache_weight_result(self, key, result):
         # Only successful returns are retained, after CUDA resources close.
         # The immutable payload contains no membership/conditional diagnostics.
-        result = _freeze(result)
+        result = freeze_record(result)
         self._weight_results[key] = result
         return result
 

@@ -76,9 +76,9 @@ def main(argv: list[str] | None = None) -> None:
         from .workflow import run_workflow
         plan_path = Path(args.plan).resolve()
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        if plan.get("schema", "clipp2.workflow.plan.v1") != "clipp2.workflow.plan.v1":
-            raise ValueError("Unsupported workflow plan schema")
-        extra = set(plan) - {"schema", "input_path", "workflow_config", "accepted_stage_one"}
+        if plan.get("schema") != "clipp2.workflow.plan.v2":
+            raise ValueError("Workflow requires plan.v2 with explicit mean/outlier screens and tie thresholds")
+        extra = set(plan) - {"schema", "input_path", "workflow_config", "accepted_stage_one", "accepted_stage_two"}
         if extra:
             raise ValueError(f"Unknown workflow plan fields: {sorted(extra)}")
         def relative(value):
@@ -86,7 +86,8 @@ def main(argv: list[str] | None = None) -> None:
             return path if path.is_absolute() else plan_path.parent / path
         receipt = run_workflow(relative(plan["input_path"]), args.output_dir,
             WorkflowConfig.from_dict(plan["workflow_config"]),
-            accepted_stage_one=relative(plan["accepted_stage_one"]) if plan.get("accepted_stage_one") else None)
+            accepted_stage_one=relative(plan["accepted_stage_one"]) if plan.get("accepted_stage_one") else None,
+            accepted_stage_two=relative(plan["accepted_stage_two"]) if plan.get("accepted_stage_two") else None)
         if receipt["status"] == "blocked":
             raise SystemExit("Workflow blocked: " + str(receipt.get("unsupported_regions", [])))
         return

@@ -682,7 +682,7 @@ def load_tumor_txt(
 
     A state above max_major_cn masks only its mutation-region pair. Mutations
     excluded in every region are removed; pair exclusions remain in the report.
-    The attached original_catalog retains every original key and provenance row.
+    Full raw provenance is retained only by the explicit load_original_catalog API.
     Masked counts/CN are neutral internal placeholders, not imputations. The
     retained initialize=False keyword is compatibility-only; pooled numerical
     initialization belongs to RegionalModel.pilots(), not input preprocessing.
@@ -705,27 +705,51 @@ def load_original_catalog(path: str | Path, *, max_major_cn: int = DEFAULT_MAX_M
 
 
 def _load_input(path, *, max_major_cn, eps=None):
-    """Read once; attach the original catalog to optional numerical fit data."""
-    from .region_files import input_fingerprint, read_region_directory
+    """Read once; retain raw workflow provenance only when explicitly requested."""
+    from .region_files import read_region_directory
 
     max_major_cn = validate_max_major_cn(max_major_cn)
     input_path = Path(path).resolve()
-    input_identity = input_fingerprint(input_path)
     directory = input_path.is_dir()
-    metadata, table = (read_region_directory(input_path, preserve_provenance=True) if directory
+    metadata, table = (read_region_directory(input_path, preserve_provenance=eps is None) if directory
                        else _read_text_table(input_path, preserve_extra=True))
     validated = _validate_long_table(metadata, table)
+    mapping = _mapping_provenance(table.to_dict(orient="records"))
     if eps is not None:
         filtered, report = _filter_snv_cn(validated, max_major_cn=max_major_cn)
-        data = _build_tumor_data(filtered, report=report, eps=eps)
-    catalog = _catalog_from_validated(metadata, table, validated, max_major_cn=max_major_cn,
-                                     input_identity=input_identity, directory=directory)
-    if input_fingerprint(input_path) != input_identity:
-        raise RuntimeError("Original inputs changed while constructing the frozen catalog")
-    return catalog if eps is None else replace(data, original_catalog=catalog)
+        return _build_tumor_data(filtered, report=report, eps=eps)
+    return _catalog_from_validated(metadata, table, validated, max_major_cn=max_major_cn, mapping=mapping)
 
 
-def _catalog_from_validated(metadata, table, validated, *, max_major_cn, input_identity, directory):
+def _mapping_provenance(rows):
+    """Honor public and historical provenance columns without truthy-string casts.
+
+    Explicit flags use 0/1 (or in-memory booleans). Absent markers mean the TSV's
+    explicit segment mapping is asserted genuine; repeated CN-state rows must agree.
+    """
+    mapping = {}
+    for row in rows:
+        values = []
+        for name in ("mapping_genuine", "_mapping_genuine"):
+            if name not in row:
+                continue
+            value = row[name]
+            if isinstance(value, (bool, np.bool_)):
+                values.append(bool(value))
+            elif str(value) in ("0", "1"):
+                values.append(str(value) == "1")
+            else:
+                raise TumorTxtError(f"{name} must be an explicit 0 or 1.")
+        if values and any(value != values[0] for value in values):
+            raise TumorTxtError("Genuine-mapping provenance columns disagree.")
+        genuine = values[0] if values else True
+        unit = str(row["mutation_id"]), str(row["sample_id"])
+        if mapping.setdefault(unit, genuine) != genuine:
+            raise TumorTxtError(f"Genuine-mapping provenance disagrees within unit {unit!r}.")
+    return mapping
+
+
+def _catalog_from_validated(metadata, table, validated, *, max_major_cn, mapping):
     """Freeze the pre-filter source already read by either public loader."""
     shape = (len(validated.mutation_ids), len(validated.sample_ids))
     numeric = {name: np.zeros(shape) for name in ("alt_counts", "total_counts", "major_cn", "minor_cn",
@@ -735,8 +759,6 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn, input_i
     segments = np.empty(shape, dtype=object)
     genuine = np.ones(shape, dtype=bool)
     original_rows = table.to_dict(orient="records")
-    mapping = {(str(row["mutation_id"]), str(row["sample_id"])): row.get("_mapping_genuine", True)
-               for row in original_rows}
     all_states = []
     # Match the ordinary loader's full-input, post-CN-filter canonical purity.
     canonical_purity = {}
@@ -766,7 +788,7 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn, input_i
             eligible[i, j] = numeric["major_cn"][i, j] <= max_major_cn
             state_count[i, j] = len(states)
             segments[i, j] = row["segment_id"]
-            genuine[i, j] = bool(mapping[mutation, region]) if directory else True
+            genuine[i, j] = mapping[mutation, region]
             regional_states.append(tuple((s.fraction, s.allele_a_cn, s.allele_b_cn) for s in states))
         all_states.append(tuple(regional_states))
     source_rows = tuple(tuple((str(key), _canonical_text_value(value)) for key, value in row.items())
@@ -777,7 +799,7 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn, input_i
         count_observed=observed, eligible=eligible, cn_state_count=state_count,
         segment_ids=segments, mapping_genuine=genuine, cn_states=tuple(all_states),
         source_rows=source_rows, provenance=provenance, metadata=tuple(metadata.items()),
-        input_identity=input_identity, max_major_cn=max_major_cn, **numeric)
+        max_major_cn=max_major_cn, **numeric)
 
 
 def _catalog_data(catalog: OriginalCatalog, mutation_ids, *, prediction: bool) -> TumorData:
@@ -918,6 +940,7 @@ def write_tumor_txt(
     if bool((frame == "").to_numpy().any()):
         raise TumorTxtError("Missing values must be represented by '.'.")
     _validate_long_table(validated_metadata, frame.loc[:, SCHEMA_COLUMNS])
+    _mapping_provenance(frame.to_dict(orient="records"))
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     metadata_order = sorted(normalized_metadata)
