@@ -39,8 +39,8 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
         raise TypeError('fit_config must be a FitConfig')
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError('progress_callback must be callable or None')
-    from .provenance import validate_run_manifest_id
-    validate_run_manifest_id(run_manifest_id)
+    from .provenance import resolve_current_run_manifest_id, validate_fit_execution_receipt
+    run_manifest_id = resolve_current_run_manifest_id(run_manifest_id)
     if run_manifest is not None and run_manifest.get('run_manifest_id') != run_manifest_id:
         raise ValueError('Fit producer and retained run manifest links must agree')
     started = perf_counter() if started is None else started
@@ -64,10 +64,7 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
         result = fit_regions(model, config.max_clusters, progress_callback=callback,
                              retain_evidence=retain_evidence, audit_scope=config.audit_scope)
         execution_record = model.execution_diagnostics()
-        continuation = execution_record.get('continuation')
-        if build is not None and continuation and continuation.get('build_id') is not None:
-            if build['artifact']['native_build_id'] != continuation['build_id']:
-                raise ValueError('External build record differs from the executing native continuation')
+        validate_fit_execution_receipt(asdict(config), execution_record, build=build)
         verification_start = perf_counter()
         publication = publish(model, result, outdir, data.tumor_id, progress=progress)
         audit = publication['verification']['membership_audit']

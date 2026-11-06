@@ -101,6 +101,7 @@ def _capped_target_and_replay(directory):
             assert not clone.centers.flags.writeable and not clone.multiplicities.flags.writeable
             expect_value_error(lambda: clone.centers.setflags(write=True))
         _manifest_tampering(catalog, accepted)
+        _execution_tampering(catalog, accepted)
         missing_origin = accepted.to_dict()
         missing_origin.pop("tumor_id")
         with patch("CliPP2.fit_execution.fit_prepared", side_effect=AssertionError("legacy evidence refitted")):
@@ -153,6 +154,64 @@ def _manifest_tampering(catalog, accepted):
         changed = replace(changed, acceptance_evidence=dict(changed.acceptance_evidence,
                                                            accepted_state_hash=changed.state_fingerprint))
         with patch("CliPP2.kernel.model.RegionalModel", side_effect=AssertionError("invalid provenance reached numerics")):
+            expect_value_error(lambda: changed.validate(catalog))
+
+
+def _execution_tampering(catalog, accepted):
+    """Recomputed fingerprints cannot hide incomplete producer execution."""
+    from CliPP2.provenance import validate_fit_execution_receipt
+    original = accepted.to_dict()["producer_receipt"]
+    config, execution = original["fit_config"], original["execution"]
+    validate_fit_execution_receipt(config, execution)
+    # Both emitted continuation routes and explicit absence are valid without an
+    # external record; wrong-key and missing evidence must never reach replay.
+    for kind, route, key in (("cpu", "native_cpu", "build_id"),
+                             ("cuda", "native_owner_cuda_emissions", "native_continuation_build_id")):
+        record = dict(execution, device=kind, backend=f"native_{kind}_likelihood_host_forest",
+            conditional_refit_backend=f"native_{kind}", weight_execution="cpu" if kind == "cpu" else "cuda_resident",
+            native=dict(execution["native"], kind=kind), continuation={"continuation": route, key: "fixture_native"})
+        validate_fit_execution_receipt(dict(config, device=kind), record)
+        validate_fit_execution_receipt(dict(config, device=kind), dict(record, continuation=None))
+        bad = copy.deepcopy(record)
+        bad["continuation"].pop(key)
+        expect_value_error(lambda: validate_fit_execution_receipt(dict(config, device=kind), bad))
+        bad["continuation"][key] = None
+        expect_value_error(lambda: validate_fit_execution_receipt(dict(config, device=kind), bad))
+    variants = []
+    for key in config:
+        changed = copy.deepcopy(original)
+        changed["fit_config"].pop(key)
+        variants.append(changed)
+        if key != "cpu_threads":
+            changed = copy.deepcopy(original)
+            changed["fit_config"][key] = None
+            variants.append(changed)
+    for key in ("build_id", "numerical_policy", "kind"):
+        changed = copy.deepcopy(original)
+        changed["execution"]["native"][key] = None
+        variants.append(changed)
+    for key, value in (("device", "cuda"), ("backend", "wrong_route"),
+                       ("weight_execution", None), ("conditional_refit_backend", None),
+                       ("continuation", {}), ("continuation", {"continuation": "native_cpu", "build_id": None})):
+        changed = copy.deepcopy(original)
+        changed["execution"][key] = value
+        variants.append(changed)
+    changed = copy.deepcopy(original)
+    changed["execution"].pop("continuation")
+    variants.append(changed)
+    changed = copy.deepcopy(original)
+    changed["execution"] = {}
+    variants.append(changed)
+    for producer in variants:
+        # No optional external record can mask the structural rejection.
+        manifest = producer["run_manifest"]
+        manifest["build"] = None
+        manifest["manifest_identity"] = content_hash({key: manifest[key]
+            for key in ("run_manifest_id", "build", "input_identity")})
+        changed = replace(accepted, producer_receipt=producer)
+        changed = replace(changed, acceptance_evidence=dict(changed.acceptance_evidence,
+                                                           accepted_state_hash=changed.state_fingerprint))
+        with patch("CliPP2.kernel.model.RegionalModel", side_effect=AssertionError("invalid execution reached numerics")):
             expect_value_error(lambda: changed.validate(catalog))
 
 

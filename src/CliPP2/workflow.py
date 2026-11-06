@@ -157,8 +157,8 @@ class AcceptedFit(ImmutableArrayRecord):
         from .kernel.topology import Membership
         if self.tumor_id != catalog.tumor_id:
             raise ValueError("Accepted fit belongs to a different originating tumor")
-        from .provenance import validate_run_manifest_id
-        validate_run_manifest_id(run_manifest_id)
+        from .provenance import resolve_current_run_manifest_id, validate_fit_execution_receipt
+        run_manifest_id = resolve_current_run_manifest_id(run_manifest_id)
         if (not isinstance(self.biological_identity, Mapping)
                 or content_hash(self.biological_identity) != content_hash(catalog.biological_identity)):
             raise ValueError("Historical tumor, regional mapping, mutation convention, or reference build differs")
@@ -178,18 +178,12 @@ class AcceptedFit(ImmutableArrayRecord):
         if producer.get("run_manifest_id") != producer["run_manifest"]["run_manifest_id"]:
             raise ValueError("Original producer run manifest link differs from its input binding")
         build = producer["run_manifest"].get("build")
+        validate_fit_execution_receipt(producer["fit_config"], producer["execution"], build=build)
         if build is not None:
             artifact = build["artifact"]
-            native_execution = producer["execution"].get("native", {})
             if (artifact["protocol_version"] != producer["protocol_version"]
-                    or artifact["implementation_version"] != producer["implementation_version"]
-                    or native_execution.get("kind") not in ("cpu", "cuda")
-                    or artifact.get(native_execution.get("kind", "") + "_build_id") != native_execution.get("build_id")):
+                    or artifact["implementation_version"] != producer["implementation_version"]):
                 raise ValueError("Original run/build manifest disagrees with producer execution identity")
-            continuation = producer["execution"].get("continuation")
-            if isinstance(continuation, Mapping) and continuation.get("build_id") is not None:
-                if artifact["native_build_id"] != continuation["build_id"]:
-                    raise ValueError("Original run/build manifest disagrees with native continuation identity")
         if producer["run_manifest"]["input_identity"].get("original_catalog_identity") != content_hash(catalog.to_dict()):
             raise ValueError("Historical run manifest belongs to different original input content")
         if self.biological_hash != _biological_hash(catalog, self.mutation_ids):

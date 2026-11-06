@@ -18,6 +18,61 @@ def validate_run_manifest_id(value):
     return value
 
 
+def resolve_current_run_manifest_id(value=None):
+    """Resolve this execution's link without borrowing historical provenance."""
+    return validate_run_manifest_id(value if value is not None else os.environ.get("CLIPP2_RUN_MANIFEST_ID"))
+
+
+def validate_fit_execution_receipt(config_record, execution, *, build=None):
+    """Validate original producer structure before any replay backend is opened.
+
+    Optional external build evidence strengthens these checks; its absence never
+    permits missing native execution evidence or defaulted historical settings.
+    """
+    from .config import FitConfig
+    required = {"device", "max_major_cn", "max_clusters", "cpu_threads", "audit_scope"}
+    if not isinstance(config_record, Mapping) or set(config_record) != required:
+        raise ValueError("Original fit configuration must explicitly contain every FitConfig field")
+    try:
+        config = FitConfig(**config_record)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Original fit configuration is invalid") from error
+    if not isinstance(execution, Mapping) or "continuation" not in execution:
+        raise ValueError("Original execution must explicitly record its continuation")
+    native = execution.get("native")
+    if (not isinstance(native, Mapping) or native.get("kind") not in ("cpu", "cuda")
+            or any(not isinstance(native.get(key), str) or not native[key].strip()
+                   for key in ("build_id", "numerical_policy"))):
+        raise ValueError("Original execution lacks native kind, build identity, or numerical policy")
+    kind = native["kind"]
+    routes = dict(device=kind, backend=f"native_{kind}_likelihood_host_forest",
+                  conditional_refit_backend=f"native_{kind}",
+                  weight_execution="cuda_resident" if kind == "cuda" else "cpu")
+    if config.device != kind or any(execution.get(key) != value for key, value in routes.items()):
+        raise ValueError("Original execution routes disagree with its configured device")
+    continuation = execution["continuation"]
+    continuation_id = None
+    if continuation is not None:
+        if not isinstance(continuation, Mapping):
+            raise ValueError("Original continuation must be an explicit record or None")
+        route = continuation.get("continuation")
+        expected_route, identity_key = (("native_cpu", "build_id") if kind == "cpu" else
+                                       ("native_owner_cuda_emissions", "native_continuation_build_id"))
+        if route != expected_route:
+            raise ValueError("Original continuation route disagrees with its configured device")
+        continuation_id = continuation.get(identity_key)
+        if not isinstance(continuation_id, str) or not continuation_id.strip():
+            raise ValueError("Original continuation lacks its native build identity")
+    if build is not None:
+        _validate_build_record(build)
+        artifact = build["artifact"]
+        if artifact[kind + "_build_id"] != native["build_id"]:
+            raise ValueError("External build record disagrees with the native backend identity")
+        if continuation_id is not None and artifact["native_build_id"] != continuation_id:
+            raise ValueError("External build record disagrees with the native continuation identity")
+    return config
+
+
 def _validate_build_record(record):
     if (not isinstance(record, Mapping) or record.get("schema") != "clipp2.run-build.v1"
             or not isinstance(record.get("run_build_id"), str) or not record["run_build_id"]
@@ -44,7 +99,7 @@ def prepare_run_manifest(catalog, output=None, supplied=None, *, run_manifest_id
         supplied = os.environ.get("CLIPP2_RUN_BUILD_MANIFEST")
     if isinstance(supplied, (str, Path)):
         supplied = json.loads(Path(supplied).read_text())
-    identifier = run_manifest_id if run_manifest_id is not None else os.environ.get("CLIPP2_RUN_MANIFEST_ID")
+    identifier = resolve_current_run_manifest_id(run_manifest_id)
     if supplied is not None:
         supplied = json_value(supplied)
         _validate_build_record(supplied)

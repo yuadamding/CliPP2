@@ -275,7 +275,7 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
                     arm.update(frozen)
                     current = "assignment"
                     assignment = operation("assignment", name + "3", lambda: assign_mutations(bundle,
-                        progress_callback=progress_callback))
+                        progress_callback=progress_callback, run_manifest_id=resolved_manifest_id))
                     if assignment.target_ids != bundle.target_ids:
                         raise AssertionError("Assignment changed the frozen paired targets")
                     current = "reconciliation"

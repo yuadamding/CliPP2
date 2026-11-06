@@ -516,8 +516,8 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
     if type(bundle) is not AssignmentBundle:
         raise TypeError("assign_mutations requires a validated AssignmentBundle")
     bundle.validated_payload()
-    from .provenance import validate_run_manifest_id
-    execution_manifest_id = validate_run_manifest_id(bundle.run_manifest_id if run_manifest_id is None else run_manifest_id)
+    from .provenance import resolve_current_run_manifest_id
+    execution_manifest_id = resolve_current_run_manifest_id(run_manifest_id)
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable")
     evaluation = _score_reference(bundle, progress_callback)

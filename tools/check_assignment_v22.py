@@ -5,9 +5,11 @@ from __future__ import annotations
 import copy
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import pickle
 import tempfile
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -192,6 +194,20 @@ def run_checks(directory):
     assert combined_result.run_manifest_id == combined_result.summary["evaluation_receipt"]["run_manifest_id"] == "external-current"
     assert combined_result.summary["bundle_run_manifest_id"] == "external-original"
     assert combined_request.validated_payload()["run_manifest_id"] == "external-original"
+    with patch.dict(os.environ, {}, clear=True):
+        current = assign_mutations(combined_request, outdir=root / "unbound_execution")
+        assert current.run_manifest_id is None
+        assert current.summary["evaluation_receipt"]["run_manifest_id"] is None
+        assert current.summary["bundle_run_manifest_id"] == "external-original"
+    with patch.dict(os.environ, {"CLIPP2_RUN_MANIFEST_ID": "environment-current"}):
+        current = assign_mutations(combined_request, outdir=root / "environment_execution")
+        assert current.run_manifest_id == "environment-current"
+        assert AssignmentResult.from_dict(current.to_dict()).run_manifest_id == "environment-current"
+        assert assign_mutations(combined_request, run_manifest_id="explicit-current").run_manifest_id == "explicit-current"
+    with patch.dict(os.environ, {"CLIPP2_RUN_MANIFEST_ID": " malformed "}):
+        _reject(lambda: assign_mutations(combined_request))
+        assert assign_mutations(combined_request, run_manifest_id="explicit-current").run_manifest_id == "explicit-current"
+    _reject(lambda: assign_mutations(combined_request, run_manifest_id=" malformed "))
     assert combined_request.to_dict()["schema"] == "clipp2.assignment.bundle.v3"
     assert combined_result.to_dict()["schema"] == "clipp2.assignment.result.v3"
     assert combined_result.summary["support_policy"] == "original_full_1_to_major_cn"
