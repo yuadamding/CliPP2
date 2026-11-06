@@ -10,6 +10,10 @@ span all 12 families: 600 main histories and 120 development histories, each wit
 1,500 mutations, 50 segments, and regions `R1`–`R4`. Main histories have four
 acquisitions; development histories have A1 and A4: 2,640 datasets in total.
 
+The earlier [Version 1.1 Word study plan](https://github.com/yuadamding/CliPP2/blob/7ce47841fbd5402ed85faeda382371af7a0fe93a/CliPP2_biological_simulation_plan.docx)
+is retained in Git history. Current execution and evaluation are documented here
+and in [simulation evaluation](simulation_evaluation.md).
+
 Qualification is separate from a completed native study. A successful replay or
 bounded pilot does not establish that the full cohort has finished. Use the
 execution records and reports to distinguish completed, failed, and unexecuted
