@@ -395,16 +395,21 @@ def _optional_execution_report_check(root):
 
 
 def _record_schema_report_check(root):
-    """Package version and explicitly frozen evaluation schema are independent."""
+    """Missing records keep the full frozen definition; reevaluation is explicit."""
     from contextlib import ExitStack
     from CliPP2.io.data import content_hash
     from CliPP2.simulation.evaluation import evaluation_definition, legacy_evaluation_definition
-    cases = (("explicit_v3", "1.1.0", "v3", True),
-             ("historical_v2", "1.2.2", "v2", False),
-             ("historical_v1", "1.1.0", "v1", False))
-    for name, version, suffix, explicit in cases:
+    cases = (("historical_v1_mixed", "1.1.0", "v1", False, 1, True, False),
+             ("historical_v1_all_missing", "1.1.0", "v1", False, 0, True, False),
+             ("historical_v1_no_roster", "1.1.0", "v1", False, 0, False, False),
+             ("historical_v2", "1.2.2", "v2", False, 1, True, False),
+             ("explicit_v3", "1.1.0", "v3", True, 1, True, False),
+             ("explicit_reevaluation_empty", "1.1.0", "v1", False, 0, False, True),
+             ("incompatible_v1", "1.1.0", "v1", False, 2, True, False))
+    for name, version, suffix, explicit, cached_count, has_roster, derive in cases:
         directory = root / name
-        contract = make_contract(mutations=12, segments=2, regions=4, workers=1)
+        contract = make_contract(mutations=12, segments=2, regions=4, workers=1,
+                                 reference_match_atol=.05)
         assert contract["evaluation"]["record_schema"] == "clipp2.simulation.evaluation.v3"
         contract.update(implementation_version=version, families=["S01"])
         if not explicit:
@@ -413,18 +418,27 @@ def _record_schema_report_check(root):
                      phase="main", acquisition=dict(id="A1", purity=.8, depth=100)) for i in range(2)]
         save_json(directory / "study_contract.json", contract)
         save_json(directory / "allocation.json", dict(planned_main_datasets=2))
-        payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"], jobs=jobs)
-        save_json(directory / "main_roster.json", dict(payload, roster_id=content_hash(payload)))
-        definition = legacy_evaluation_definition(2, {}) if suffix == "v2" else evaluation_definition()
-        success = dict(schema="clipp2.simulation.evaluation."+suffix, evaluation_definition=definition,
-            evaluation_definition_id=content_hash(definition), **jobs[0], acquisition_id="A1",
-            truth_qualification="verified_history_binding", status="complete", original_evaluable_count=10,
-            metrics=[dict(name="binary_correct_per_original_evaluable", arm="C3", view="", stratum="all",
-                value=1., numerator=10, denominator=10, status="available", truth_required=True)])
-        for index, job in enumerate(jobs):
+        if has_roster:
+            payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"], jobs=jobs)
+            save_json(directory / "main_roster.json", dict(payload, roster_id=content_hash(payload)))
+        config = dict(reference_match_atol=.025 if derive else .05, reference_distance="l2")
+        definition = (evaluation_definition(config) if derive or suffix == "v3" else
+                      legacy_evaluation_definition(suffix, config))
+        saved = []
+        for index, job in enumerate(jobs if has_roster else []):
             relative = Path("cells") / job["cell_id"] / "attempt-001/evaluation-1.json"
-            if index == 0:
+            if index < cached_count:
+                success = dict(schema="clipp2.simulation.evaluation."+suffix, **job, acquisition_id="A1",
+                    truth_qualification="verified_history_binding", status="complete", original_evaluable_count=10,
+                    metrics=[dict(name="binary_correct_per_original_evaluable", arm="C3", view="", stratum="all",
+                        value=1., numerator=10, denominator=10, status="available", truth_required=True)])
+                if suffix == "v1":
+                    # Real v1 records kept tolerance at top level, without a definition object.
+                    success["reference_match_atol"] = .06 if index else .05
+                else:
+                    success.update(evaluation_definition=definition, evaluation_definition_id=content_hash(definition))
                 save_json(directory / relative, success)
+                saved.append((relative, success))
             save_json(directory / "cells" / job["cell_id"] / "completion.json", dict(job=job,
                 status="complete", attempt=str(relative.parent), evaluations=[str(relative)], cost_ledgers=[],
                 elapsed_seconds=0., peak_resident_bytes=0, output_bytes=0))
@@ -432,18 +446,46 @@ def _record_schema_report_check(root):
         with ExitStack() as stack:
             for target in ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
                            "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.study._history",
-                           "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.select_thresholds"):
-                stack.enter_context(patch(target, side_effect=AssertionError("Report attempted inference")))
+                           "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.select_thresholds",
+                           "CliPP2.simulation.reporting.reevaluate_cell"):
+                stack.enter_context(patch(target, side_effect=AssertionError("Report attempted inference or nonempty reevaluation")))
             stack.enter_context(patch("CliPP2.simulation.figures.make_figures",
                 side_effect=lambda records, *args: captured.extend(records) or []))
-            result = report(directory)
-        assert len(captured) == 2
-        assert {record["schema"] for record in captured} == {"clipp2.simulation.evaluation."+suffix}
-        if suffix != "v1":
-            assert len({record["evaluation_definition_id"] for record in captured}) == 1
+            if name == "incompatible_v1":
+                try:
+                    report(directory)
+                except ValueError as error:
+                    assert "Incompatible evaluation definitions" in str(error)
+                else:
+                    raise AssertionError("Different retained v1 tolerances were combined")
+                continue
+            result = report(directory, evaluation_config=config if derive else None)
+        expected_suffix = "v3" if derive else suffix
+        assert len(captured) == (2 if has_roster else 0)
+        assert all(record["schema"] == "clipp2.simulation.evaluation."+expected_suffix for record in captured)
+        for record in captured[cached_count:]:
+            assert record["evaluation_definition"] == definition
+            assert record["evaluation_definition_id"] == content_hash(definition)
+            assert record["reference_match_atol"] == .05
+            assert record["reference_distance"] == record["evaluation_config"]["reference_distance"] == definition["reference_distance"]
+            assert all(row["value"] is None for row in record["metrics"]
+                       if row["name"] == "binary_correct_per_original_evaluable")
+        summary = result["summary"]
+        assert summary["evaluation_definition"] == definition
+        assert summary["evaluation_definition_id"] == content_hash(definition)
+        assert summary["report_mode"] == ("offline_reevaluation" if derive else "cached_metrics")
+        assert summary["roster_complete"] == has_roster
+        assert summary["roster_status"] == ("frozen_roster" if has_roster else "unavailable_complete_frozen_roster")
+        assert all(row["planned_population_estimate"] is None for row in summary["metrics"]
+                   if row["name"] == "binary_correct_per_original_evaluable")
+        assert summary["retained_planned_cells"] == (2 if has_roster else 0)
+        assert summary["planned_main_cells"] == 2
+        assert all(read_json(directory / relative) == original for relative, original in saved)
         assert Path(result["report"]).is_file()
-    return dict(status="passed", explicit_schema_independent_of_package_version=True,
-                historical_version_fallback_preserved=True, fit_count=0, assignment_pass_count=0)
+    return dict(status="passed", cases=len(cases), frozen_legacy_tolerance_and_geometry_preserved=True,
+        empty_reports_preserve_definition=True, explicit_reevaluation_uses_current_definition=True,
+        incompatible_definitions_rejected=True, explicit_schema_independent_of_package_version=True,
+        historical_version_fallback_preserved=True, fit_count=0, assignment_pass_count=0)
 
 
 def _partial_evidence_report_checks(root):
@@ -830,8 +872,8 @@ def run_checks(directory, cohort_settings):
     _offline_report_check(root / "native_failure", history, job)
     _partial_objective_check(root / "partial_objective", contract, history, frame, job)
     _planned_report_check(root / "unexecuted_report", contract)
-    optional_execution = _optional_execution_report_check(root / "optional_execution_reports")
     record_schema = _record_schema_report_check(root / "record_schema_reports")
+    optional_execution = _optional_execution_report_check(root / "optional_execution_reports")
     partial_reports = _partial_evidence_report_checks(root / "partial_evidence_reports")
     result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4,
         lifecycle=lifecycle, resume=resume, partial_evidence_reports=partial_reports, record_schema=record_schema,

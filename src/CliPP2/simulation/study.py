@@ -760,7 +760,7 @@ def run_optional_panels(root, contract, selected, workers, *, retry_failed=False
 
 def report(root, *, evaluation_config=None, report_dir=None):
     """Render cached metrics or explicitly reevaluate preserved inference evidence."""
-    from .evaluation import aggregate, normalize_evaluation_config, evaluation_definition
+    from .evaluation import aggregate, normalize_evaluation_config, evaluation_definition, legacy_evaluation_definition
     from .figures import make_figures
     from .runtime import recorded_costs, qualification_costs
     from .reporting import planned_roster, reevaluate_cell, placeholder_for_cell
@@ -771,6 +771,25 @@ def report(root, *, evaluation_config=None, report_dir=None):
         if isinstance(evaluation_config, (str, Path)):
             evaluation_config = read_json(evaluation_config)
         evaluation_config = normalize_evaluation_config(evaluation_config)
+        schema = "clipp2.simulation.evaluation.v3"
+    else:
+        frozen_evaluation = contract.get("evaluation", {})
+        schema = frozen_evaluation.get("record_schema")
+        if schema is None:
+            version = tuple(int(part) for part in contract.get("implementation_version", "0.0.0").split(".")[:3])
+            schema = "clipp2.simulation.evaluation." + (
+                "v3" if version >= (1, 2, 3) else "v2" if version >= (1, 2, 2) else "v1")
+        if schema not in ("clipp2.simulation.evaluation.v1", "clipp2.simulation.evaluation.v2",
+                          "clipp2.simulation.evaluation.v3"):
+            raise ValueError("Frozen study declares an unsupported evaluation record schema")
+        evaluation_config = {key: frozen_evaluation[key]
+            for key in ("reference_match_atol", "reference_distance") if key in frozen_evaluation}
+        if schema.endswith(".v1"):
+            evaluation_config["reference_distance"] = "linf"
+        evaluation_config = normalize_evaluation_config(evaluation_config)
+    definition = (evaluation_definition(evaluation_config) if schema.endswith(".v3") else
+                  legacy_evaluation_definition(schema, evaluation_config))
+    definition_id = content_hash(definition)
     cells = [value for directory in sorted((root / "cells").glob("*")) if directory.is_dir()
              for value in [_latest_completion(directory)] if value is not None]
     main = [cell for cell in cells if cell["job"]["phase"] == "main"]
@@ -780,10 +799,6 @@ def report(root, *, evaluation_config=None, report_dir=None):
     completed = {cell["job"]["cell_id"]: cell for cell in main}
     main = [completed.get(job["cell_id"], dict(job=job, status="not_executed", evaluations=[], cost_ledgers=[],
                 elapsed_seconds=0., peak_resident_bytes=0, output_bytes=0)) for job in roster["jobs"]]
-    frozen_evaluation = contract.get("evaluation", {})
-    if not derive:
-        evaluation_config = normalize_evaluation_config({key: frozen_evaluation[key]
-            for key in ("reference_match_atol", "reference_distance") if key in frozen_evaluation})
     evaluations = []
     for cell in main:
         if derive:
@@ -795,25 +810,15 @@ def report(root, *, evaluation_config=None, report_dir=None):
                 value = placeholder_for_cell(root, cell, evaluation_config)
                 # Missing cached records retain the frozen study's definition.
                 # Historical files are never relabeled as newly evaluated v3.
-                schema = frozen_evaluation.get("record_schema")
-                if schema is None:
-                    version = tuple(int(part) for part in contract.get("implementation_version", "0.0.0").split(".")[:3])
-                    schema = "clipp2.simulation.evaluation." + (
-                        "v3" if version >= (1, 2, 3) else "v2" if version >= (1, 2, 2) else "v1")
-                if schema not in ("clipp2.simulation.evaluation.v1", "clipp2.simulation.evaluation.v2",
-                                   "clipp2.simulation.evaluation.v3"):
-                    raise ValueError("Frozen study declares an unsupported evaluation record schema")
-                value["schema"] = schema
-                if schema.endswith(".v2"):
-                    from .evaluation import legacy_evaluation_definition
-                    definition = legacy_evaluation_definition(2, evaluation_config)
-                    value.update(evaluation_definition=definition, evaluation_definition_id=content_hash(definition))
+                value.update(schema=schema, evaluation_config=evaluation_config,
+                    evaluation_definition=definition, evaluation_definition_id=definition_id,
+                    reference_match_atol=definition["reference_match_atol"],
+                    reference_distance=definition["reference_distance"])
         evaluations.append(value)
     summary = aggregate(evaluations, planned_roster=roster["jobs"], roster_complete=roster["complete"],
                         families=contract["families"])
     if not evaluations:
-        definition = evaluation_definition(evaluation_config)
-        summary.update(evaluation_definition=definition, evaluation_definition_id=content_hash(definition))
+        summary.update(evaluation_definition=definition, evaluation_definition_id=definition_id)
     summary.update(roster_status=roster["status"], roster_id=roster["roster_id"],
                    retained_planned_cells=len(roster["jobs"]))
     costs = recorded_costs(root)

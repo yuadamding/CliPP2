@@ -186,6 +186,16 @@ and paired results, including archived results. Missing or ambiguous evidence is
 reported as unavailable. Truth and counts are not regenerated from a changed
 source path. Frozen development selection and original outputs stay intact.
 Without a new evaluation configuration, cached-report behavior is retained.
+Cached reports resolve the complete frozen definition before reading cells.
+Missing records remain unknown under that definition, including historical v1
+L∞ geometry, its top-level matching tolerance, and its original matching policy.
+Even an empty report with no recoverable complete roster retains the historical
+definition and unavailable planned estimates. An explicit new evaluation
+configuration requests v3 derivation, including when usable records are absent.
+
+Cached operational values remain historical. To apply corrected stage-specific
+accounting, derive a report into a new directory from retained execution evidence;
+the source evaluations and reports are preserved.
 
 Evaluation, definition and aggregate v3 records contain the endpoint, population
 scope, missing-evidence treatment, truth-qualification policy, metric, tolerance,

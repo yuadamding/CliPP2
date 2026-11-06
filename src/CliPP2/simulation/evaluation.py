@@ -1281,11 +1281,7 @@ def aggregate(evaluations, *, planned_roster=None, roster_complete=False,
             if definition.get("schema") != expected:
                 raise ValueError("Evaluation schema and definition version differ")
         elif schema == "clipp2.simulation.evaluation.v1":
-            definition = dict(schema="clipp2.simulation.evaluation-definition.legacy-v1",
-                binary_endpoint="accepted_designated_clonal_status_equals_physical_truth_clonality",
-                reference_distance="linf", reference_match_atol=record.get("reference_match_atol"),
-                matching_policy="legacy_forced_pairs_influence_valid_edge_cost",
-                detailed_endpoint="legacy_multiclass_unmapped_treated_as_incorrect")
+            definition = legacy_evaluation_definition(1, {"reference_match_atol": record.get("reference_match_atol")})
             identity = content_hash(definition)
         else:
             raise ValueError("Aggregation requires versioned evaluation records")
