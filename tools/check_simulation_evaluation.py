@@ -133,7 +133,10 @@ def _planned_population_checks():
         return dict(schema='clipp2.simulation.evaluation.v3', evaluation_definition=definition,
             evaluation_definition_id=content_hash(definition), truth_qualification=truth,
             cell_id=job['cell_id'], family=job['family'], history_id=job['history_id'], acquisition_id=job['acquisition']['id'],
-            original_evaluable_count=denominator, status='execution_failed' if failure else 'complete', metrics=metrics)
+            original_evaluable_count=denominator, status='execution_failed' if failure else 'complete', metrics=metrics,
+            applicability=[dict(arm=arm, status='failed', decision_population=dict(
+                scope='whole_original_evaluable', coverage='complete', evaluable_count=denominator,
+                accepted_count=0, evidence='failure_before_stage_one')) for arm in ('B3', 'C3')] if failure else [])
 
     def summary(records, planned=roster, complete=True, families=('S01',)):
         return aggregate(records, planned_roster=planned, roster_complete=complete,
@@ -202,11 +205,154 @@ def _planned_population_checks():
     assert endpoint(summary([success, no_count]))['planned_population_estimate'] is None
     unjustified_zero = deepcopy(failed)
     unjustified_zero['status'] = 'complete'
+    for state in unjustified_zero['applicability']:
+        state['status'] = 'complete'
     assert endpoint(summary([success, unjustified_zero]))['planned_population_estimate'] is None
+    old_tag = deepcopy(failed)
+    for state in old_tag['applicability']:
+        state.pop('decision_population')
+    for qualification in ('missing_truth_evidence', 'verified_history_binding'):
+        old_tag['truth_qualification'] = qualification
+        assert endpoint(summary([success, old_tag]))['planned_population_estimate'] is None
     return dict(success_plus_known_failure_retains_half_weight=True, unknown_evidence_not_zero=True,
         missing_acquisition_history_family_explicit=True, partial_arms_preserved=True,
         unavailable_current_definition_preserved=True, incomplete_legacy_roster_not_invented=True,
         verified_primary_excludes_unbound_legacy=True)
+
+
+def _partial_failure_checks():
+    """Real retained catalog/manifest; declared memberships; zero inference calls."""
+    from contextlib import ExitStack
+    import tempfile
+    from unittest.mock import patch
+    import pandas as pd
+    from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
+    from CliPP2.provenance import prepare_run_manifest
+    from CliPP2.simulation.reporting import placeholder_for_cell
+
+    def metric(record, name='correct_per_original_evaluable', arm='C3'):
+        return next(row for row in record['metrics'] if row['name'] == name and row['arm'] == arm)
+
+    with tempfile.TemporaryDirectory(prefix='clipp2-partial-failure-') as temporary, ExitStack() as stack:
+        for name in ('CliPP2.fit_execution.fit_prepared', 'CliPP2.kernel.model.RegionalModel',
+                     'CliPP2.assignment.assign_mutations'):
+            stack.enter_context(patch(name, side_effect=AssertionError('Fallback evaluation invoked inference')))
+        root = Path(temporary)
+        h, data, paired = _membership_fixture()
+        job = dict(cell_id='declared-partial-failure', family='S01', history_id='h0',
+                   acquisition=dict(id='A1'), phase='main')
+        attempt = root / 'cells' / job['cell_id'] / 'attempt-001'
+        configuration = attempt / 'configuration-1'
+        configuration.mkdir(parents=True)
+        frame = pd.DataFrame([dict(mutation_id=mutation, sample_id=region,
+            alt_count=int(round(50*h.phi[i, j])) if data.count_observed[i, j] else '.',
+            ref_count=100-int(round(50*h.phi[i, j])) if data.count_observed[i, j] else '.',
+            count_observed=int(data.count_observed[i, j]), purity=1., normal_cn=2, normal_cn_supplied=1,
+            segment_id='s', mapping_genuine=1, cn_state_id='0', cn_state_fraction=1.,
+            allele_a_cn=1, allele_b_cn=1)
+            for i, mutation in enumerate(h.mutation_ids) for j, region in enumerate(h.region_ids)])
+        write_tumor_txt(attempt / 'input_catalog.tsv', frame,
+                        dict(tumor_id=job['cell_id'], fixture='declared_memberships_not_native_inference'))
+        catalog = load_original_catalog(attempt / 'input_catalog.tsv')
+        order = [h.mutation_ids.index(mutation) for mutation in catalog.mutation_ids]
+        truth = SimpleNamespace(**vars(h))
+        truth.mutation_ids = catalog.mutation_ids
+        for name in ('phi', 'multiplicity', 'major_cn', 'minor_cn', 'segment_ids'):
+            setattr(truth, name, getattr(h, name)[order])
+        truth.observable_truth_ids = tuple(h.observable_truth_ids[i] for i in order)
+        paired['arms'] = {name: deepcopy(value) for name, value in paired['arms'].items()}
+        paired.update(status='partial_failure', run_manifest=prepare_run_manifest(catalog),
+                      original_mutation_ids=catalog.mutation_ids, region_ids=catalog.region_ids)
+        original = deepcopy(paired)
+        paired['arms']['C'].update(status='failed', assignment_status='failed', failed_stage='assignment', assignment=None)
+        (attempt / 'job.json').write_text(json.dumps(job))
+        (attempt / 'acquisition.json').write_text(json.dumps(dict(biological_truth_available=np.ones_like(truth.phi, bool).tolist())))
+        cell = dict(job=job, attempt=str(attempt.relative_to(root)), status='execution_failed',
+                    original_evaluable_count=14, execution_failures=[dict(arm='C', failed_stage='assignment')])
+        paired_path = configuration / 'paired_result.json'
+
+        def fallback(value):
+            paired_path.write_text(json.dumps(value))
+            return placeholder_for_cell(root, cell, None)
+
+        def planned(value):
+            return aggregate([value], planned_roster=[job], roster_complete=True, families=('S01',), bootstrap_replicates=0)
+
+        # 1. Full evidence keeps unchanged F's exact contribution after assignment failure.
+        full = evaluate(truth, catalog, paired, truth_qualification='verified_history_binding')
+        assert metric(full)['value'] == 8/14 and metric(full)['numerator'] == 8
+        # 2. Removing truth cannot turn that retained contribution into an exact zero.
+        missing = fallback(paired)
+        assert metric(missing)['value'] is None and metric(missing)['truth_required'] is True
+        assert metric(planned(missing))['planned_population_estimate'] is None
+        assert metric(planned(missing))['planned_population_status'] == 'incomplete_evidence'
+        evidence = next(row for row in missing['applicability'] if row['arm'] == 'C3')['decision_population']
+        assert evidence['accepted_count'] == evidence['unchanged_count'] == 8 and evidence['accepted_target_count'] == 0
+        # 3. Explicitly empty F and no returned target decisions still establish zero.
+        empty = deepcopy(paired)
+        empty['arms']['C'].update(non_targets=[], targets=list(empty['arms']['C']['combined_labels']),
+                                 combined_labels={mutation: 0 for mutation in empty['arms']['C']['combined_labels']})
+        zero = fallback(empty)
+        assert metric(zero)['value'] == 0 and metric(zero)['status'] == 'known_no_decisions'
+        assert metric(planned(zero))['planned_population_estimate'] == 0
+        # Returned all-unresolved decisions also prove emptiness without an execution failure.
+        withheld = deepcopy(empty)
+        withheld['arms']['C'].update(status='complete', assignment_status='complete', failed_stage=None,
+            assignment=dict(assignments=[dict(mutation_id=mutation, accepted_label=None)
+                                         for mutation in withheld['arms']['C']['targets']]))
+        assert metric(fallback(withheld))['value'] == 0
+        # One retained accepted target prevents a whole-population zero even with empty F.
+        withheld['arms']['C']['assignment']['assignments'][0]['accepted_label'] = 0
+        assert metric(fallback(withheld))['value'] is None
+        # 4. Missing F evidence or a missing paired result keeps the claim unknown.
+        absent = deepcopy(paired)
+        absent['arms']['C'].pop('non_targets')
+        assert metric(fallback(absent))['value'] is None
+        paired_path.unlink()
+        assert metric(placeholder_for_cell(root, cell, None))['value'] is None
+        # Early total failure can establish N later from retained catalog/acquisition.
+        early = dict(cell, execution_failures=[dict(arm=None, failed_stage='stage_one')])
+        early.pop('original_evaluable_count')
+        recovered_denominator = placeholder_for_cell(root, early, None)
+        assert recovered_denominator['original_evaluable_count'] == 14
+        assert metric(recovered_denominator)['value'] == 0
+        # Malformed returned target evidence cannot claim C3 analysis availability.
+        for malformed in ({}, dict(assignments=[])):
+            invalid = deepcopy(paired)
+            invalid['arms']['C']['assignment'] = malformed
+            record = fallback(invalid)
+            assert metric(record, 'analysis_available', 'C3')['value'] is None
+            assert metric(record, 'analysis_available', 'C')['value'] == 1
+        publication_failure = deepcopy(paired)
+        publication_failure['arms']['C'].update(assignment=original['arms']['C']['assignment'],
+                                                failed_stage='assignment_publication', assignment_status='scored')
+        assert metric(fallback(publication_failure), 'analysis_available', 'C3')['value'] == 1
+        # 5. Downstream C3 failure does not erase completed B/B3 or C evidence.
+        preserved = fallback(paired)
+        for arm in ('B', 'B3', 'C'):
+            assert metric(preserved, 'analysis_available', arm)['value'] == 1
+            assert metric(preserved, 'execution_failure', arm)['value'] == 0
+        assert metric(preserved, 'analysis_available', 'C3')['value'] == 0
+        assert metric(preserved, 'execution_failure', 'C3')['value'] == 1
+        baseline = evaluate(truth, catalog, original, truth_qualification='verified_history_binding')
+        for arm in ('B', 'B3', 'C'):
+            assert metric(full, arm=arm)['value'] == metric(baseline, arm=arm)['value']
+        # 6. Equal-weight successful and established empty populations retain mean .5.
+        success = deepcopy(zero)
+        other_job = dict(job, cell_id='declared-success', history_id='h1')
+        success.update(cell_id=other_job['cell_id'], history_id='h1', truth_qualification='verified_history_binding')
+        for row in success['metrics']:
+            if row['arm'] == 'C3' and row['name'] in ('correct_per_original_evaluable', 'binary_correct_per_original_evaluable'):
+                row.update(value=1., numerator=14, truth_required=True, status='available')
+        combined = aggregate([zero, success], planned_roster=[job, other_job], roster_complete=True,
+                             families=('S01',), bootstrap_replicates=0)
+        assert metric(combined)['planned_population_estimate'] == .5
+        return dict(partial_failure_full_evidence_correct=8/14, retained_unchanged_count=8,
+            missing_truth_whole_population_unknown=True, empty_F_no_target_decisions_zero=True,
+            missing_F_evidence_unknown=True, completed_upstream_availability_retained=True,
+            success_plus_total_failure_mean=.5, all_unresolved_empty_population_zero=True,
+            retained_accepted_targets_prevent_zero=True, recovered_denominator_preserves_total_failure_zero=True,
+            malformed_assignment_availability_unknown=True, retained_scored_payload_available=True, no_inference_calls=True)
 
 
 def run_checks():
@@ -366,7 +512,8 @@ def run_checks():
                   exhaustive_matching_objective_cases=120, binary_objective_unchanged=True,
                   Mc_Mw_U_and_unchanged_F=True, target_specific_availability_nulls_and_quality=True,
                   full_vector_l2_and_explicit_legacy_linf=True, incompatible_definition_aggregation_rejected=True)
-    report.update(_planned_population_checks(), detailed_four_state_transitions_by_origin=True)
+    report.update(_planned_population_checks(), detailed_four_state_transitions_by_origin=True,
+                  partial_failure_accounting=_partial_failure_checks())
     json.dumps(json_safe(report), allow_nan=False)
     return json_safe(report)
 

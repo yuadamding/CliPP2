@@ -44,11 +44,22 @@ def metric_truth_independent(record, row):
     arm_state = next((item for item in record.get("applicability", ()) if item.get("arm") == row.get("arm")), {})
     state = arm_state.get("status", record.get("execution_state", record.get("status")))
     established_failure = state in ("failed", "execution_failed", "blocked", "no_eligible_clonal_reference")
-    return bool(row["name"] in no_decision_names and row.get("truth_required") is False
+    population = arm_state.get("decision_population")
+    scoped_empty = (isinstance(population, Mapping)
+        and population.get("scope") == "whole_original_evaluable" and population.get("coverage") == "complete"
+        and type(population.get("accepted_count")) is int and population["accepted_count"] == 0
+        and type(population.get("evaluable_count")) is int and population["evaluable_count"] == denominator
+        and population.get("evidence") in ("failure_before_stage_one", "failure_before_combined_memberships",
+            "retained_combined_memberships", "retained_stage_three_memberships",
+            "scientific_rejection_before_combined_memberships")
+        and (population.get("evidence") != "retained_stage_three_memberships"
+             or population.get("unchanged_count") == population.get("accepted_target_count") == 0))
+    return bool(scoped_empty and row["name"] in no_decision_names and row.get("truth_required") is False
         and row.get("status") == "known_no_decisions" and row.get("value") == 0 and row.get("numerator") == 0
         and isinstance(denominator, (int, float)) and not isinstance(denominator, bool)
         and np.isfinite(denominator) and denominator > 0 and denominator == record.get("original_evaluable_count")
-        and (established_failure or arm_state.get("scientific_rejection") is True))
+        and (established_failure or arm_state.get("scientific_rejection") is True
+             or population.get("evidence") == "retained_stage_three_memberships"))
 
 
 def json_safe(value):
@@ -1269,6 +1280,8 @@ def aggregate(evaluations, *, planned_roster=None, roster_complete=False,
         if value is None:
             return None, row.get("status", "unknown_value")
         independent = metric_truth_independent(records[cell_id], row)
+        if row.get("status") == "known_no_decisions" and not independent:
+            return None, "unestablished_empty_decision_population"
         if not independent:
             state = records[cell_id].get("truth_qualification", "missing_truth_evidence")
             allowed = "legacy_consistent_unbound" if legacy else "verified_history_binding"

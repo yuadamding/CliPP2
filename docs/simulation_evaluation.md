@@ -32,6 +32,24 @@ cases. Its interval is never shown as an interval for the planned cohort.
 Conditional endpoints, including mapped selective error and geometric acceptance
 within the selected target population, report their available-case population.
 
+Whole-original Stage 3 correctness includes both reassessed targets `T` and
+unchanged members `F`: `(correct_F + correct_accepted_T) / original_evaluable`.
+Failure before target decisions establishes `correct_accepted_T = 0`; it does
+not erase retained F memberships. With valid truth their exact contribution
+remains. With missing truth their correctness is unknown, so the whole-population
+score stays null. Completed B/C combined results remain available independently
+of a later B3/C3 assignment failure.
+
+A truth-independent zero now carries explicit `decision_population` evidence:
+whole-original-evaluable scope, complete coverage, the established denominator,
+and zero accepted decisions. Retained Stage 3 evidence separately accounts for
+unchanged and accepted-target memberships. Bare historical `known_no_decisions`
+tags, missing F evidence, and assignment exceptions alone cannot establish this
+claim. Re-evaluation must reconstruct it from retained memberships or an explicit
+failure before any endpoint decisions. Complete all-unresolved target output with
+an explicitly empty F also proves zero; malformed or incomplete returned output
+does not establish completed Stage 3 analysis availability.
+
 Records retain missingness by family, history, acquisition and arm, together with
 planned, executed, scientifically applicable, evaluated and unavailable-derived
 counts. Partial arm failures preserve the other arm's results. Entirely unavailable
