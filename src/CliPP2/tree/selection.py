@@ -105,8 +105,8 @@ def _likelihood_ranked_edges(model, tree, edges, cuts=()):
 
     Stream fixed-grid columns through postorder sums and impossible counts:
     O(N R G) work and O(N) storage for fixed G, without per-edge member gathers.
-    The mixed lower endpoint ensures even a narrow original box has a grid
-    point. Resolution can still miss modes; no likelihood bound is claimed.
+    The historical near-zero grid point is retained for stable proposal ties.
+    Resolution can still miss modes; no likelihood bound is claimed.
     """
     parent, parent_edge, component, order, _ = _forest_structure(tree, cuts)
     children = {int(parent_edge[node]): node for node in order if parent[node] != node}

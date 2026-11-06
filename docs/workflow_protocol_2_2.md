@@ -58,10 +58,15 @@ fixed-reference requests use `not_applicable`; their `baseline_changed` remains
 available for accepted assignments. Errors during cap qualification, construction,
 or publication belong to Stage 2 and preserve Stage 1 acceptance.
 
-Strict workflow evidence requires genuine, unambiguous single-state CN. Missing
-or excluded observations contribute no read evidence. Normal CN must be supplied,
-or the plan must explicitly select `"normal_cn_policy": "diploid"` for assumed
-normal CN equal to two. The catalog records whether normal CN was supplied.
+All fitting and assignment entry points require one integer tumor CN state per
+mutation-region observation and consistent CN within each region-segment.
+Mixed states and fractional state weights are rejected, including when inputs
+are constructed programmatically. Scientific observations require genuine mapping;
+missing or excluded observations contribute no read evidence. Normal CN must be
+supplied, or the plan/API must explicitly select `normal_cn_policy="diploid"`
+for assumed normal CN equal to two. The standalone CLI exposes
+`--normal-cn-policy diploid`. The catalog retains supplied-versus-assumed provenance.
+Normal CN 0, 1, and 2 are supported when the biological denominator is valid.
 
 ## Runnable example
 
@@ -89,16 +94,18 @@ applicable; schema names alone do not establish compatibility:
 
 | Record | Schema |
 |---|---|
-| Accepted biological input | `clipp2.accepted-biological-input.v2` |
+| Accepted biological input | `clipp2.accepted-biological-input.v3` |
 | Accepted state / fit | `clipp2.accepted-state.v3` / `clipp2.accepted-fit.v3` |
 | Producer / replay compatibility | `clipp2.fit-producer.v2` / `clipp2.fit-compatibility.v2` |
 | Assignment bundle / result | `clipp2.assignment.bundle.v3` / `clipp2.assignment.result.v4` |
 | Workflow plan / receipt | `clipp2.workflow.plan.v3` / `clipp2.workflow.v3` |
 
-Original catalogs retain their v3 schema. Paired or missing-origin records are
-rejected, not relabeled or implicitly refitted. Rebuild derived references and
-bundles from valid reusable source fits, or rerun original inputs. Frozen 2.1
-installations remain necessary for interpreting their earlier outputs.
+Original catalogs use `clipp2.original-catalog.v4`, with total tumor CN derived
+from major plus minor CN. The model identity explicitly records the single-state
+input domain; the native kernel/backend ABI versions are 8/7. Rebuild native
+extensions for this revision. Earlier catalogs and incompatible accepted fits
+require their pinned installation; they are not relabeled or implicitly refitted.
+Historical cached evaluation definitions remain readable by the reporting tools.
 
 `AcceptedFit.tumor_id` is required and keyword-only. Replay binds the original
 tumor, full region mapping, mutation-key convention, declared reference build,
@@ -106,7 +113,7 @@ and numerical evidence. It retains the originating producer and appends current
 compatibility evidence. A missing original identity is never filled from the
 destination. Copies and serialization reconstruct immutable arrays and identities.
 
-Version 1.2.3 uses one scientific replay policy for ordinary and paired workflows.
+Ordinary and paired workflows use one scientific replay policy.
 Search capacity, maximum eligible major CN, and the normal-CN assumption must
 match the original fit. Retained per-count audit evidence must cover the requested
 scope; an `all` request cannot infer audits that were not performed. Original

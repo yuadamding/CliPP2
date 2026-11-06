@@ -37,8 +37,8 @@ def _input_boxes(model):
     observed = np.isfinite(depth) & (depth > 0)
     if data.count_observed is not None:
         observed &= np.asarray(data.count_observed, dtype=bool)[ix]
-    mixed = data.cn_state_count[ix] > 1
-    return observed, np.where(mixed, 1e-6, 0.), np.where(mixed, data.phi_upper[ix], 1.)
+    observed &= ~data.input_excluded[ix]
+    return observed, np.zeros(observed.shape), np.ones(observed.shape)
 
 
 def _input_domain(model, centers):
@@ -69,12 +69,12 @@ def independent_log_columns(model, centers):
     data = model.data
     ix = np.ix_(model.active_indices, model.region_indices)
     alt, depth = data.alt_counts[ix], data.total_counts[ix]
-    major, total, purity = data.major_cn[ix], data.mean_total_cn[ix], data.purity[ix]
-    normal, mixed = data.normal_cn[ix], data.cn_state_count[ix] > 1
+    major, total, purity = data.major_cn[ix], data.total_cn[ix], data.purity[ix]
+    normal = data.normal_cn[ix]
     bounds = getattr(model, 'multiplicity_support', None)
     if bounds is None:
         minimum = np.ones_like(major, dtype=np.int64)
-        maximum = np.where(mixed, np.minimum(major, 4), major).astype(np.int64)
+        maximum = major.astype(np.int64)
     else:
         minimum, maximum = bounds.for_data(data)
         minimum, maximum = np.asarray(minimum)[ix], np.asarray(maximum)[ix]
@@ -104,8 +104,7 @@ def independent_log_columns(model, centers):
                     for offset in range(int(size)):
                         m = minimum[source, region, None]+offset
                         prob = scale[rows, None] * m * centers[cols, region][None, :]
-                        prob = np.where(mixed[source, region, None],
-                                        np.clip(prob, 1e-6, 1-1e-6), np.minimum(prob, 1.0))
+                        prob = np.minimum(prob, 1.0)
                         component = (xlogy(y[rows, None], prob)
                                      + xlog1py((n-y)[rows, None], -prob))
                         component += constant[rows, None]

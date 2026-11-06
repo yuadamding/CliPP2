@@ -25,16 +25,15 @@ inline std::int64_t validate_observations(const ObservationSoA& input) {
             input.lower && input.upper && input.minimum && input.support && input.flags, "Null model field");
     checked_product(cells, 65, 1);
     for (std::int64_t cell = 0; cell < cells; ++cell) {
-        require((input.flags[cell] & ~3u) == 0, "Unknown observation flags");
+        require((input.flags[cell] & ~observed_flag) == 0, "Only single-state observations are supported");
         require(input.support[cell] > 0, "Multiplicity support must be positive");
         require(input.minimum[cell] > 0 && input.minimum[cell] <=
                 std::numeric_limits<std::int64_t>::max() - (input.support[cell] - 1),
                 "Multiplicity interval must have positive endpoints without overflow");
         require(std::isfinite(input.scaling[cell]) && input.scaling[cell] > 0,
                 "Scaling must be finite and positive");
-        require(std::isfinite(input.lower[cell]) && std::isfinite(input.upper[cell]) &&
-                input.lower[cell] >= 0 && input.upper[cell] <= 1 &&
-                input.lower[cell] <= input.upper[cell], "Invalid assignment box");
+        require(input.lower[cell] == 0 && input.upper[cell] == 1,
+                "Single-state CCF bounds must be [0,1]");
         if (input.flags[cell] & observed_flag)
             require(std::isfinite(input.alt[cell]) && input.alt[cell] >= 0 &&
                     input.alt[cell] == std::floor(input.alt[cell]) &&

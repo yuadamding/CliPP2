@@ -122,7 +122,7 @@ def pooled_ccf_initialization(view):
     """Use the source-scoped grid/convergence policy on shared CCF emissions.
 
     Standard single-state normal-CN-two observations retain the bounded narrow-
-    mode grid and reported iteration-budget behavior. Mixed/general-normal
+    mode grid and reported iteration-budget behavior. General-normal
     observations retain the bound-enriched grid and mandatory finite-grid gap.
     These numerical policies are explicit, not separate statistical models.
     """
@@ -430,7 +430,7 @@ class _GridOracle:
         return values
 
 def _pooled_adapter(view):
-    """Stream the explicit mixed/general-normal grid; exact concave weight gap.
+    """Stream the explicit general-normal grid; exact concave weight gap.
 
     Safeguarded SQUAREM and exact grow/shrink exchange mirror the inherited
     pooled initializer without a quadratic-space SLSQP over the whole grid.
@@ -547,7 +547,7 @@ def _pooled_adapter(view):
     if gap > ADAPTER_GRID_TOLERANCE:
         raise RuntimeError("Streamed pooled-grid final duality gap changed")
     return pilot, {
-        "method": "general_normal_mixed_cn_bulk_v1_streamed_pooled_ccf_grid_v2",
+        "method": "general_normal_v1_streamed_pooled_ccf_grid_v2",
         "inherited_single_state_initialization": False,
         "grid_size": len(grid), "iterations": iteration,
         "max_iterations": ADAPTER_MAX_ITERATIONS,

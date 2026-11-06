@@ -10,7 +10,7 @@ from .io.tumor_txt import load_tumor_txt
 
 def process_tumor(tumor_file: str | Path, outdir: str | Path,
                   fit_config: FitConfig | None = None, *, multiplicity_support=None,
-                  progress_callback=None, run_manifest_id=None) -> dict[str, object]:
+                  progress_callback=None, run_manifest_id=None, normal_cn_policy=None) -> dict[str, object]:
     """Publish the three fitted tables and return compact operational metadata.
 
     Verification uses retained objects and compact attempt links. Progress
@@ -30,12 +30,12 @@ def process_tumor(tumor_file: str | Path, outdir: str | Path,
         progress.start_phase('input')
     path = Path(tumor_file)
     if multiplicity_support is None:
-        data = load_tumor_txt(path, max_major_cn=config.max_major_cn)
+        data = load_tumor_txt(path, max_major_cn=config.max_major_cn, normal_cn_policy=normal_cn_policy)
     else:
         from .io.tumor_txt import load_original_catalog, load_multiplicity_bounds
         from .io.data import MultiplicityBounds
         catalog = load_original_catalog(path, max_major_cn=config.max_major_cn)
-        data = catalog.fit_data()
+        data = catalog.fit_data(normal_cn_policy=normal_cn_policy)
         if isinstance(multiplicity_support, (str, Path)):
             multiplicity_support = load_multiplicity_bounds(multiplicity_support, catalog)
         elif type(multiplicity_support) is not MultiplicityBounds:

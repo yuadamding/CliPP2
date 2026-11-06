@@ -24,10 +24,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Tumor directory with regional snv.txt/cna.txt/purity.txt bundles.")
     fit.add_argument("--output-dir", default="clipp2_results")
     fit.add_argument("--multiplicity-support", help="Complete keyed TSV of multiplicity_lower/multiplicity_upper.")
+    fit.add_argument("--normal-cn-policy", choices=["diploid"], default=None,
+                     help="Explicitly assume diploid normal CN only where it was not supplied.")
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
     fit.add_argument(
         "--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN,
-        help="Exclude a mutation only from regions where any CN state's major CN exceeds this limit.",
+        help="Exclude a mutation only from regions where major CN exceeds this limit.",
     )
     fit.add_argument("--max-clusters", type=int, default=DEFAULT_MAX_CLUSTERS,
                      help="Largest occupied cluster capacity (positive integer; no fixed upper limit).")
@@ -103,6 +105,7 @@ def main(argv: list[str] | None = None) -> None:
         outdir=Path(args.output_dir),
         fit_config=args._fit_config,
         multiplicity_support=args.multiplicity_support,
+        normal_cn_policy=args.normal_cn_policy,
         run_manifest_id=args.run_manifest_id,
     )
 

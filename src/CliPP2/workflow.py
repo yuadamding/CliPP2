@@ -43,11 +43,11 @@ ORIGINAL_COMPARISON_COLUMNS = ("mutation_id", "original_eligible", "original_inp
 def _biological_hash(catalog, mutation_ids):
     positions = {mutation: i for i, mutation in enumerate(catalog.mutation_ids)}
     rows = [positions[mutation] for mutation in mutation_ids]
-    payload = dict(schema="clipp2.accepted-biological-input.v2", tumor_id=catalog.tumor_id, biological_identity=catalog.biological_identity,
+    payload = dict(schema="clipp2.accepted-biological-input.v3", tumor_id=catalog.tumor_id, biological_identity=catalog.biological_identity,
         mutation_ids=mutation_ids, region_ids=catalog.region_ids,
         **{key: getattr(catalog, key)[rows] for key in ("alt_counts", "total_counts", "count_observed",
-           "eligible", "major_cn", "minor_cn", "normal_cn", "mean_total_cn", "purity",
-           "cn_state_count", "segment_ids", "mapping_genuine", "normal_cn_supplied")})
+           "eligible", "major_cn", "minor_cn", "normal_cn", "total_cn", "purity",
+           "segment_ids", "mapping_genuine", "normal_cn_supplied")})
     if catalog.input_excluded[rows].any():
         payload["input_excluded"] = catalog.input_excluded[rows]
     return content_hash(payload)
@@ -207,7 +207,7 @@ class AcceptedFit(ImmutableArrayRecord):
         if expected_ids is not None and set(self.mutation_ids) != set(expected_ids):
             raise ValueError("Historical fit population differs from the requested stage")
         if expected_support is not None:
-            data = catalog.fit_data(self.mutation_ids)
+            data = catalog.fit_data(self.mutation_ids, normal_cn_policy=producer["normal_cn_policy"])
             numerical, accepted_support = expected_support.for_data(data), self.support.for_data(data)
             if any(not np.array_equal(actual, expected) for actual, expected in zip(accepted_support, numerical)):
                 raise ValueError("Historical fit has different actual multiplicity support")
@@ -224,7 +224,7 @@ class AcceptedFit(ImmutableArrayRecord):
             raise ValueError("Historical acceptance evidence disagrees with its original producer receipt")
         if evidence.get("accepted_state_hash") != self.state_fingerprint:
             raise ValueError("Historical acceptance evidence is not bound to this exact fitted state")
-        model = RegionalModel(catalog.fit_data(self.mutation_ids), device=device,
+        model = RegionalModel(catalog.fit_data(self.mutation_ids, normal_cn_policy=producer["normal_cn_policy"]), device=device,
                               cpu_threads=cpu_threads, multiplicity_support=self.support)
         try:
             if (model.mutation_ids != self.mutation_ids or model.identity != self.model_identity
@@ -264,7 +264,7 @@ def _fit_accepted(catalog, ids, bounds, outdir, stage, config, progress_callback
     if run_manifest["input_identity"].get("original_catalog_identity") != content_hash(catalog.to_dict()):
         raise ValueError("Run manifest does not identify this original input")
     callback = None if progress_callback is None else lambda record: progress_callback(dict(record, stage=stage))
-    execution = fit_prepared(catalog.fit_data(ids), outdir, config, multiplicity_support=bounds,
+    execution = fit_prepared(catalog.fit_data(ids, normal_cn_policy=normal_cn_policy), outdir, config, multiplicity_support=bounds,
         progress_callback=callback, run_manifest=run_manifest, run_manifest_id=run_manifest_id)
     fit, order = execution.fit, execution.public_order
     accepted = AcceptedFit(stage, execution.mutation_ids, execution.region_ids, execution.public_labels,
@@ -281,7 +281,7 @@ def _fit_accepted(catalog, ids, bounds, outdir, stage, config, progress_callback
 def _diagnostics_many(catalog, ids, coordinates, bounds, config, calls=None):
     """Reuse prepared observations and one backend for all coordinate screens."""
     observation = prepare_prediction(catalog, ids, bounds, device=config.fit.device,
-                                     cpu_threads=config.fit.cpu_threads)
+                                     cpu_threads=config.fit.cpu_threads, normal_cn_policy=config.normal_cn_policy)
     from .screening import profile_deviance_from_diagnostics
     diagnostics = []
     with NativeBackend(observation, cpu_threads=config.fit.cpu_threads) as backend:
@@ -337,8 +337,8 @@ def qualify_contributors(catalog, fit, config, *, mutation_ids=None):
                 raise ArithmeticError("Original-support accepted-call confidence exceeds native confidence")
             if not catalog.mapping_genuine[rows[i], j]:
                 reason = "nongenuine_mapping"
-            elif not catalog.eligible[rows[i], j] or catalog.cn_state_count[rows[i], j] != 1:
-                reason = "originally_ineligible_or_mixed"
+            elif not catalog.eligible[rows[i], j]:
+                reason = "originally_ineligible"
             elif not observation.observed[i, j]:
                 reason = "no_information"
             elif not phi > 0:

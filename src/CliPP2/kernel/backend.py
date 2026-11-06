@@ -17,7 +17,7 @@ from .execution import resolve_cpu_threads
 _D = ct.POINTER(ct.c_double)
 _I = ct.POINTER(ct.c_int64)
 _B = ct.POINTER(ct.c_uint8)
-BACKEND_ABI = 6
+BACKEND_ABI = 7
 
 
 class NativeExecutionError(RuntimeError):
@@ -266,7 +266,7 @@ class NativeBackend:
                 or minimum.dtype.kind not in "iu" or support.dtype.kind not in "iu"):
             raise ValueError("Multiplicity minimum and width must be integer N by R arrays")
         fields += [_array(minimum.T, np.int64), _array(support.T, np.int64),
-                   _array((model.observed.astype(np.uint8) + 2*model.mixed).T, np.uint8)]
+                   _array(model.observed.T, np.uint8)]
         observations = _Observations(model.n, model.r, *map(_ptr, fields))
         self.context = ct.c_void_p()
         device_index = (int(model.device.split(":", 1)[1]) if ":" in model.device else 0) if kind == "cuda" else -1
@@ -728,7 +728,7 @@ class NativeBackend:
         return values
 
 
-NATIVE_ABI = 7
+NATIVE_ABI = 8
 
 def native_library():
     root = Path(__file__).resolve().parent.parent

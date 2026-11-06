@@ -15,7 +15,7 @@ namespace clipp2 {
 inline std::uint64_t probability_bits(double value) {
     std::uint64_t result; std::memcpy(&result, &value, sizeof(result)); return result;
 }
-using ProbabilityFamilyKey = std::tuple<std::uint64_t, std::uint8_t, std::int64_t>;
+using ProbabilityFamilyKey = std::tuple<std::uint64_t, std::int64_t>;
 using ProbabilityShapeKey = std::tuple<std::int64_t, std::int64_t, std::uint64_t,
                                        std::uint64_t, std::uint64_t>;
 // Model-scoped exact identities. Payloads remain authoritative in ObservationSoA;
@@ -31,8 +31,7 @@ struct ProbabilityMetadata {
         for (std::size_t cell=0; cell<families.size(); ++cell) {
             const auto o=observation(model,cell);
             if (!(o.flags & observed_flag)) continue;
-            const ProbabilityFamilyKey key{probability_bits(o.scaling),
-                static_cast<std::uint8_t>(o.flags & mixed_flag), o.minimum};
+            const ProbabilityFamilyKey key{probability_bits(o.scaling), o.minimum};
             const auto family=family_ids.emplace(key,family_ids.size()).first->second;
             const ProbabilityShapeKey shape{family,o.support,probability_bits(o.alt),
                                             probability_bits(o.ref),probability_bits(o.log_constant)};

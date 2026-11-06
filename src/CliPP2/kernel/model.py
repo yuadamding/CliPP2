@@ -32,8 +32,8 @@ from .topology import Membership
 from ..io.data import freeze_record, readonly_array
 
 
-# Mixed-CN emissions/boxes stay fixed; their assignment mask now enters scoring.
-MODEL_VERSION = "clipp2_regional_full_support__general_normal_v1__mixed_cn_bulk_assignment_event_v2"
+# The retained biological contract has one integer tumor-CN state per pair.
+MODEL_VERSION = "clipp2_regional_full_support__general_normal_v1__single_state_cn_v1"
 INTERVAL_MODEL_VERSION = MODEL_VERSION + "__multiplicity_intervals_v1"
 
 # Exact caches accelerate repeated work, but exhaustive neighborhoods contain
@@ -253,8 +253,8 @@ class RegionalModel:
         digest = hashlib.sha256(self.model_version.encode())
         for values in (self.alt, self.depth, self.observed):
             digest.update(values.tobytes())
-        # Preserve the established scientific identity without retaining padded
-        # N-by-R-by-M arrays. Execution layout is inert.
+        # Stream the identity inputs without retaining padded N-by-R-by-M arrays.
+        # Execution layout is inert; model_version declares the input contract.
         if self.multiplicity_restricted:
             for values in (self.scaling, self.multiplicity_min, self.multiplicity_max):
                 digest.update(values.tobytes())
@@ -262,7 +262,7 @@ class RegionalModel:
             multiplicities = np.arange(1, int(self.support.max())+1)
             for row in self.scaling:
                 digest.update((row[:, None] * multiplicities).tobytes())
-        for values in (self.support, self.mixed, self.lower, self.upper):
+        for values in (self.support, self.lower, self.upper):
             digest.update(values.tobytes())
         digest.update(repr((self.mutation_ids, self.region_ids)).encode())
         self.identity = digest.hexdigest()
@@ -331,16 +331,19 @@ class RegionalModel:
         """ID-free scientific row signatures for deterministic proposal ties."""
         result = []
         support = None if self.multiplicity_restricted else np.arange(1, int(self.support.max())+1)
+        # Preserve the original single-state proposal tie signatures. This
+        # legacy all-false discriminator is not retained numerical model state.
+        single_state = np.zeros(self.r, dtype=bool)
         for i in range(self.n):
             if self.multiplicity_restricted:
                 arrays = (self.observed[i], self.alt[i], self.depth[i], self.scaling[i],
                           self.multiplicity_min[i], self.multiplicity_max[i], self.support[i],
-                          self.mixed[i], self.lower[i], self.upper[i])
+                          single_state, self.lower[i], self.upper[i])
                 prefix = b"clipp2_observation_multiplicity_intervals_v1\0"
             else:
                 arrays = (self.observed[i], self.alt[i], self.depth[i],
                           self.scaling[i, :, None]*support, self.support[i],
-                          self.mixed[i], self.lower[i], self.upper[i])
+                          single_state, self.lower[i], self.upper[i])
                 prefix = b""
             result.append(int.from_bytes(hashlib.sha256(prefix+b''.join(a.tobytes() for a in arrays)).digest(), 'big'))
         return result
@@ -384,8 +387,7 @@ class RegionalModel:
                 rows = readonly_array(members[self.observed[members, coordinate]], dtype=np.int64)
                 lower = float(self.lower[members, coordinate].max())
                 upper = float(self.upper[members, coordinate].min())
-                standard = (not self.mixed[rows, coordinate].any()
-                            and np.all(self.normal[rows, coordinate] == 2))
+                standard = np.all(self.normal[rows, coordinate] == 2)
                 xatol = (1e-12 / float(self.region_purities[coordinate])
                           if standard and lower == 0 and upper == 1 else 1e-12)
                 key = (self.identity, self.backend.policy, self.backend.identity, coordinate,

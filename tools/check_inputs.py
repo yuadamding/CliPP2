@@ -21,18 +21,15 @@ from CliPP2.workflow import _fit_accepted, classify_groups
 from check_workflow import expect_value_error, workflow_config
 
 
-def _mixed_catalog(directory):
+def _excluded_catalog(directory):
     rows = []
     for i, counts in enumerate(((50, 50), (49, 50), (50, 49), (12, 18), (13, 17), (12, 18))):
         for j, alt in enumerate(counts):
-            mixed = (i, j) == (0, 1)
-            for state in range(2 if mixed else 1):
-                rows.append(dict(mutation_id=f"m{i}", sample_id=f"r{j+1}", alt_count=alt,
-                    ref_count=100-alt, count_observed=1, purity=1, normal_cn=2,
-                    segment_id=f"s{i}_{j}", cn_state_id=str(state),
-                    cn_state_fraction=.5 if mixed else 1,
-                    allele_a_cn=11+state if mixed else 1, allele_b_cn=1))
-    path = directory / "excluded_mixed.tsv"
+            rows.append(dict(mutation_id=f"m{i}", sample_id=f"r{j+1}", alt_count=alt,
+                ref_count=100-alt, count_observed=1, purity=1, normal_cn=2,
+                segment_id=f"s{i}_{j}", cn_state_id="0", cn_state_fraction=1,
+                allele_a_cn=12 if (i, j) == (0, 1) else 1, allele_b_cn=1))
+    path = directory / "excluded_single_state.tsv"
     write_tumor_txt(path, pd.DataFrame(rows))
     return path, load_original_catalog(path)
 
@@ -50,6 +47,8 @@ def _normal_provenance(directory, catalog):
     write_tumor_txt(path, frame, metadata)
     assumed = load_original_catalog(path)
     assert not assumed.normal_cn_supplied.any()
+    expect_value_error(lambda: load_tumor_txt(source))
+    load_tumor_txt(source, normal_cn_policy="diploid")
     expect_value_error(lambda: validate_workflow_mapping(assumed))
     validate_workflow_mapping(assumed, normal_cn_policy="diploid")
     write_tumor_txt(directory / "different_assumption.tsv", frame.assign(normal_cn=1), metadata)
@@ -64,14 +63,13 @@ def _normal_provenance(directory, catalog):
             expect_value_error(lambda: load_original_catalog(directory / "bad_flag.tsv"))
     conflict = frame.assign(normal_cn_supplied="1", _normal_cn_supplied="0")
     expect_value_error(lambda: write_tumor_txt(directory / "conflicting_flags.tsv", conflict, metadata))
-    # Repeated CN-state rows cannot disagree about whether one normal CN was supplied.
-    states = pd.DataFrame([dict(row) for row in catalog.source_rows])
-    states["normal_cn_supplied"] = "1"
-    states.loc[states["cn_state_id"] == "1", "normal_cn_supplied"] = "0"
-    expect_value_error(lambda: write_tumor_txt(directory / "state_flags.tsv", states))
     # A directory flag cannot claim supplied CN when its optional column is absent.
     (source / "cna.txt").write_text(header + "\tnormal_cn_supplied\n1\t1\t200\t1\t1\t2\t1\n")
     expect_value_error(lambda: load_original_catalog(source))
+    # A declared nongenuine mapping cannot be promoted by the directory adapter.
+    (source / "cna.txt").write_text(header + "\tnormal_cn\tmapping_genuine\n1\t1\t200\t1\t1\t2\t2\t0\n")
+    assert not load_original_catalog(source).mapping_genuine.any()
+    expect_value_error(lambda: load_tumor_txt(source))
     return dict(compact_conversion_preserves_assumption=True, strict_flags=True,
                 explicit_policy_matches_assumption=True)
 
@@ -80,25 +78,20 @@ def run_input_checks(directory):
     """Exercise admitted masked inputs through fitting and accepted-state replay."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    path, catalog = _mixed_catalog(directory)
+    path, catalog = _excluded_catalog(directory)
     validate_workflow_mapping(catalog)
     original = catalog.default_bounds()
     lower, upper = original.for_data(catalog.prediction_data(catalog.mutation_ids))
-    assert catalog.major_cn[0, 1] == 12 and original.upper[0, 1] == 4 and upper[0, 1] == 1
+    assert catalog.major_cn[0, 1] == 12 and original.upper[0, 1] == 12 and upper[0, 1] == 1
     sanitized = MultiplicityBounds(catalog.mutation_ids, catalog.region_ids, lower, upper)
     observation = prepare_prediction(catalog, catalog.mutation_ids, sanitized)
     assert not observation.observed[0, 1] and observation.support[0, 1] == 1
     eligible = load_original_catalog(path, max_major_cn=20)
     eligible.default_bounds().for_data(eligible)
-    missing_path = directory / "eligible_mixed_without_reads.tsv"
-    write_tumor_txt(missing_path, pd.DataFrame([dict(row) for row in eligible.source_rows]).assign(count_observed=0))
-    eligible_missing = load_original_catalog(missing_path, max_major_cn=20)
-    for bounds in (sanitized, replace(original, upper=np.where(catalog.cn_state_count > 1, 3, original.upper)),
-                   replace(original, lower=np.where(catalog.cn_state_count > 1, 2, original.lower))):
-        inert_lower, inert_upper = bounds.for_data(catalog)
-        assert inert_lower[0, 1] == inert_upper[0, 1] == 1
-        expect_value_error(lambda bounds=bounds: bounds.for_data(eligible))
-        expect_value_error(lambda bounds=bounds: bounds.for_data(eligible_missing))
+    restricted = replace(original, upper=np.minimum(original.upper, 3))
+    assert restricted.for_data(eligible)[1][0, 1] == 3
+    assert restricted.for_data(catalog)[1][0, 1] == 1
+    expect_value_error(lambda: replace(original, upper=original.upper+1).for_data(catalog))
 
     config = workflow_config()
     accepted = _fit_accepted(catalog, catalog.mutation_ids, None, directory / "fit", "stage_one",
@@ -108,7 +101,7 @@ def run_input_checks(directory):
     restored = load_accepted_fit(receipt)
     assert restored.support.lower[0, 1] == restored.support.upper[0, 1] == 1
     assert np.isnan(restored.multiplicities[0, 1])
-    assert catalog.cn_state_count[0, 1] == 2 and catalog.major_cn[0, 1] == 12
+    assert catalog.major_cn[0, 1] == 12 and catalog.total_cn[0, 1] == 13
     np.testing.assert_array_equal(restored.support.for_data(catalog)[1], restored.support.upper)
     with NativeBackend(prepare_prediction(catalog, restored.mutation_ids, restored.support), cpu_threads=1) as backend:
         diagnostic = backend.component_diagnostics(restored.centers[restored.labels], restored.multiplicities)
@@ -135,10 +128,67 @@ def run_input_checks(directory):
     for clone in (copy.deepcopy(sanitized), pickle.loads(pickle.dumps(sanitized))):
         assert clone.content_hash == sanitized.content_hash and not clone.upper.flags.writeable
         expect_value_error(lambda: clone.upper.setflags(write=True))
-    return dict(excluded_mixed_fit_screen_replay=True, eligible_mixed_override_rejected=True,
+    return dict(excluded_single_state_fit_screen_replay=True, single_state_contract=_single_state_contract(directory, catalog),
                 biological_namespace_checked_before_model=True, immutable_catalog_and_support=True,
                 normal_cn_provenance=_normal_provenance(directory, catalog),
                 explicit_input_exclusion=check_input_exclusion(directory))
+
+
+def _single_state_contract(directory, catalog):
+    from CliPP2.io.data import TumorData
+    from check_workflow import bundle, fixture_reference
+    frame = pd.DataFrame([dict(row) for row in catalog.source_rows])
+    for name, invalid in (("two_states", pd.concat([frame, frame.assign(cn_state_id="1")])),
+                          ("mixed_fraction", frame.assign(cn_state_fraction=.5)),
+                          ("fractional_cn", frame.assign(allele_a_cn=1.5))):
+        path = directory / (name + ".tsv")
+        invalid.to_csv(path, sep="\t", index=False)
+        expect_value_error(lambda path=path: load_original_catalog(path))
+        expect_value_error(lambda path=path: load_tumor_txt(path))
+        expect_value_error(lambda path=path, invalid=invalid: write_tumor_txt(path, invalid))
+    data = catalog.fit_data()
+    for field, values in (("major_cn", data.major_cn+.5), ("minor_cn", data.major_cn+1),
+                          ("normal_cn", data.normal_cn+.5), ("mapping_genuine", np.zeros_like(data.count_observed)),
+                          ("normal_cn_supplied", np.zeros_like(data.count_observed))):
+        expect_value_error(lambda field=field, values=values: replace(data, **{field: values}))
+    assumed = replace(data, normal_cn_supplied=np.zeros_like(data.count_observed), normal_cn_policy="diploid")
+    assert assumed.normal_cn_policy == "diploid"
+    for normal in (0, 1, 2):
+        direct = TumorData("programmatic", ("m",), ("r",), np.array([[0.]]), np.array([[3.]]),
+            np.array([[.8]]), np.array([[8.]]), np.array([[1.]]), np.array([[normal]]))
+        bounds = MultiplicityBounds(direct.mutation_ids, direct.region_ids, [[1]], [[8]])
+        assert bounds.for_data(direct)[1][0, 0] == 8
+        expect_value_error(lambda: replace(bounds, upper=[[9]]).for_data(direct))
+    for field, values in (("major_cn", catalog.major_cn+.5), ("minor_cn", catalog.major_cn+1),
+                          ("normal_cn", catalog.normal_cn+.5), ("eligible", ~catalog.eligible),
+                          ("purity", catalog.purity*.5)):
+        expect_value_error(lambda field=field, values=values: replace(catalog, **{field: values}))
+    altered = tuple(tuple(dict(row, cn_state_fraction="0.5").items()) for row in catalog.source_rows)
+    expect_value_error(lambda: replace(catalog, source_rows=altered))
+    expect_value_error(lambda: replace(catalog, source_rows=catalog.source_rows+catalog.source_rows[:1],
+                                       provenance=catalog.provenance+catalog.provenance[:1]))
+    stale = catalog.to_dict()
+    stale["schema"] = "clipp2.original-catalog.v3"
+    expect_value_error(lambda: OriginalCatalog.from_dict(stale))
+    reference = fixture_reference((0,), catalog.region_ids, [[1.]*len(catalog.region_ids)])
+    request = bundle(catalog, reference)
+    expect_value_error(lambda: replace(request, native_upper=catalog.major_cn+1))
+    # Parsed evidence provenance reaches generic loading, fitting, prediction, and assignment.
+    for field in ("mapping_genuine", "normal_cn_supplied"):
+        path = directory / (field + ".tsv")
+        write_tumor_txt(path, frame.assign(**{field: 0}))
+        retained = load_original_catalog(path)
+        expect_value_error(lambda: load_tumor_txt(path))
+        expect_value_error(lambda: retained.fit_data())
+        expect_value_error(lambda: retained.prediction_data(retained.mutation_ids))
+        expect_value_error(lambda: replace(request, catalog=retained))
+        if field == "normal_cn_supplied":
+            assert load_tumor_txt(path, normal_cn_policy="diploid").num_mutations == data.num_mutations
+            retained.fit_data(normal_cn_policy="diploid")
+            replace(request, catalog=retained, normal_cn_policy="diploid")
+    return dict(parsed_and_programmatic_single_state=True, original_bounds_enforced=True,
+                normal_cn_0_1_2=True, high_support_preserved=True, explicit_provenance_policy=True,
+                old_catalog_schema_rejected=True)
 
 
 def check_input_exclusion(directory):
@@ -163,7 +213,7 @@ def check_input_exclusion(directory):
     np.testing.assert_array_equal(catalog.eligible, ~mask)
     assert catalog.count_observed.all() and np.all(catalog.total_counts == 100)
     assert np.all(catalog.major_cn == 1) and np.all(catalog.minor_cn == 1)
-    assert catalog.alt_counts[0, 2] == 80 and catalog.mean_total_cn[0, 2] == 2
+    assert catalog.alt_counts[0, 2] == 80 and catalog.total_cn[0, 2] == 2
     for data in (load_tumor_txt(path), catalog.fit_data(), catalog.prediction_data(catalog.mutation_ids)):
         assert data.input_excluded[0, 2] and not data.count_observed[0, 2]
         assert data.total_counts[0, 2] == 0

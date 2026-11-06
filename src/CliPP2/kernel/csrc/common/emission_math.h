@@ -10,9 +10,6 @@ CLIPP_HD inline bool finite_number(double value) {
 CLIPP_HD inline double component_probability(const Observation& o, double phi,
                                               std::int64_t multiplicity) {
     const double mass = (o.scaling * static_cast<double>(multiplicity)) * phi;
-    if (o.flags & mixed_flag)
-        return mass < mixed_epsilon ? mixed_epsilon :
-               (mass > 1 - mixed_epsilon ? 1 - mixed_epsilon : mass);
     return mass > 1 ? 1 : mass;
 }
 
@@ -50,16 +47,13 @@ CLIPP_HD inline CellTerms evaluate_supported(const Observation& o, double phi) {
     bool infinite_curvature = false;
     for (std::int64_t index = 0; index < support; ++index) {
         const double slope = o.scaling * static_cast<double>(o.minimum + index);
-        const double mass = slope * phi;
         const double p = component_probability(o, phi, o.minimum + index);
         const double k = component_log_mass(o, p);
         const double posterior = finite_number(k) ? ::exp(k - ll) : 0;
         if (posterior > 0) {
-            const double derivative = (o.flags & mixed_flag) &&
-                (mass <= mixed_epsilon || mass >= 1 - mixed_epsilon) ? 0 : slope;
-            const double g = derivative * ((o.alt == 0 ? 0 : -o.alt / p) +
+            const double g = slope * ((o.alt == 0 ? 0 : -o.alt / p) +
                                             (o.ref == 0 ? 0 : o.ref / (1 - p)));
-            const double h = derivative * derivative *
+            const double h = slope * slope *
                 ((o.alt == 0 ? 0 : o.alt / (p * p)) +
                  (o.ref == 0 ? 0 : o.ref / ((1 - p) * (1 - p))));
             gradient += posterior * g;
@@ -67,7 +61,7 @@ CLIPP_HD inline CellTerms evaluate_supported(const Observation& o, double phi) {
         }
         // A zero-probability endpoint component can have a finite limiting
         // derivative. Preserve these terms even when its posterior is zero.
-        if (!(o.flags & mixed_flag) && p == 1) {
+        if (p == 1) {
             if (o.ref == 1) {
                 endpoint_gradient += slope * ::exp(o.log_constant - ll);
                 infinite_curvature = true;

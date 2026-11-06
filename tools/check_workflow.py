@@ -116,7 +116,7 @@ def check_provenance(directory):
     write_tumor_txt(converted, frame, metadata)
     repeated = load_original_catalog(converted)
     np.testing.assert_array_equal(original.mapping_genuine, repeated.mapping_genuine)
-    assert load_tumor_txt(source).original_catalog is None
+    expect_value_error(lambda: load_tumor_txt(source))
     for name, path in (("directory", source), ("tsv", converted)):
         expect_value_error(lambda: run_workflow(path, directory / (name+"_blocked"), workflow_config()))
     frame["_mapping_genuine"] = "false"

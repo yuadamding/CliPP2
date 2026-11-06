@@ -11,19 +11,25 @@ import hashlib
 import numpy as np
 from scipy.special import gammaln
 
-from .likelihood import MIXED_EPS
-from ..config import MAX_MULTIPLICITY
 from ..io.data import (ImmutableArrayRecord, OriginalCatalog, MultiplicityBounds, TumorData,
                        freeze_record, readonly_array)
 
 
 def observed_mask(data):
     """The shared positive-depth observation mask; population rules stay outside."""
+    if not isinstance(data, TumorData):
+        raise TypeError("Numerical preparation requires validated TumorData")
     depth = np.asarray(data.total_counts)
     shape = len(data.mutation_ids), len(data.region_ids)
     observed = np.ones(shape, dtype=bool) if data.count_observed is None else np.asarray(data.count_observed, dtype=bool)
     if depth.shape != shape or observed.shape != shape:
         raise ValueError("Read counts and masks must align with mutation-region keys")
+    excluded = getattr(data, "input_excluded", None)
+    if excluded is not None:
+        excluded = np.asarray(excluded, dtype=bool)
+        if excluded.shape != shape:
+            raise ValueError("Input exclusions must align with mutation-region keys")
+        observed = observed & ~excluded
     return observed & np.isfinite(depth) & (depth > 0)
 
 
@@ -39,17 +45,18 @@ def prepare_observations(data, multiplicity_support=None, *, rows=None, regions=
     observed = observed_mask(data)[ix]
     arrays = {name: np.asarray(source, dtype=float)[ix] for name, source in (
         ("alt", data.alt_counts), ("depth", data.total_counts), ("major", data.major_cn),
-        ("normal", data.normal_cn), ("total", data.mean_total_cn), ("purity", data.purity))}
+        ("normal", data.normal_cn), ("total", data.total_cn), ("purity", data.purity))}
     alt, depth, major, normal, total, purity = (arrays[name] for name in arrays)
-    mixed = np.asarray(data.cn_state_count)[ix] > 1
+    minor = np.asarray(data.minor_cn, dtype=float)[ix]
     if any(not np.isfinite(value).all() for value in (major, normal, total, purity)):
         raise ValueError("CN and purity must be finite in every mutation-region")
     if np.any(major < 1) or np.any(major != np.rint(major)):
         raise ValueError("Major CN must be a positive integer")
     if np.any(normal < 0) or np.any(normal != np.rint(normal)):
         raise ValueError("Normal CN must be a nonnegative integer")
-    if np.any(total[~mixed] < major[~mixed]) or np.any(total[~mixed] != np.rint(total[~mixed])):
-        raise ValueError("Single-state total CN must be an integer at least major CN")
+    if (not np.isfinite(minor).all() or np.any(minor < 0) or np.any(minor > major)
+            or np.any(minor != np.rint(minor)) or not np.array_equal(total, major + minor)):
+        raise ValueError("Single-state CN needs integer major >= minor >= 0 and total = major + minor")
     if np.any(purity <= 0) or np.any(purity > 1) or not np.all(purity == purity[:1]):
         raise ValueError("Purity must be constant within each region and in (0,1]")
     if (not np.isfinite(alt[observed]).all() or np.any(alt[observed] < 0)
@@ -60,7 +67,7 @@ def prepare_observations(data, multiplicity_support=None, *, rows=None, regions=
     denominator = (1-purity)*normal + purity*total
     if not np.isfinite(denominator).all() or np.any(denominator <= 0):
         raise ValueError("Normal-plus-tumor denominator must be finite and positive")
-    default_maximum = np.where(mixed, np.minimum(major, MAX_MULTIPLICITY), major)
+    default_maximum = major
     if multiplicity_support is None:
         minimum, maximum = np.ones_like(default_maximum), default_maximum
     else:
@@ -71,14 +78,10 @@ def prepare_observations(data, multiplicity_support=None, *, rows=None, regions=
             or np.any(maximum >= 2**63)):
         raise ValueError("Multiplicity intervals must satisfy 1 <= lower <= upper <= original support")
     changed = (minimum != 1) | (maximum != default_maximum)
-    if np.any(changed & mixed):
-        raise ValueError("Multiplicity overrides are unsupported for mixed-CN observations")
     minimum, maximum = minimum.astype(np.int64), maximum.astype(np.int64)
     support = maximum-minimum+1
-    lower, upper = np.where(mixed, MIXED_EPS, 0.), np.where(mixed, np.asarray(data.phi_upper)[ix], 1.)
-    if np.any(upper < lower) or np.any(upper > 1) or not np.isfinite(upper).all():
-        raise ValueError("Invalid original mixed-CN bounds")
-    arrays.update(alt=alt, depth=depth, observed=observed, mixed=mixed, multiplicity_min=minimum,
+    lower, upper = np.zeros_like(major), np.ones_like(major)
+    arrays.update(alt=alt, depth=depth, observed=observed, multiplicity_min=minimum,
         multiplicity_max=maximum, support=support, multiplicity_restricted=bool(changed.any()),
         lower=lower, upper=upper, scaling=purity/denominator,
         constants=gammaln(depth+1)-gammaln(alt+1)-gammaln(depth-alt+1)-np.log(support))
@@ -94,7 +97,6 @@ class PreparedObservations(ImmutableArrayRecord):
     alt: np.ndarray
     depth: np.ndarray
     observed: np.ndarray
-    mixed: np.ndarray
     eligible: np.ndarray
     major: np.ndarray
     normal: np.ndarray
@@ -129,7 +131,7 @@ class PreparedObservations(ImmutableArrayRecord):
 
 
 def prepare_prediction(catalog: OriginalCatalog, targets, bounds: MultiplicityBounds | None = None,
-                       *, device="cpu", cpu_threads=None) -> PreparedObservations:
+                       *, device="cpu", cpu_threads=None, normal_cn_policy=None) -> PreparedObservations:
     """Prepare every target in requested order, including excluded/missing rows.
 
     ``cpu_threads`` is accepted for a uniform caller interface; execution owners
@@ -141,7 +143,7 @@ def prepare_prediction(catalog: OriginalCatalog, targets, bounds: MultiplicityBo
         raise ValueError("Prediction device must be cpu or cuda")
     if cpu_threads is not None and (type(cpu_threads) is not int or not 1 <= cpu_threads <= 2**31-1):
         raise ValueError("cpu_threads must be a positive int32 or None")
-    data = catalog.prediction_data(tuple(targets))
+    data = catalog.prediction_data(tuple(targets), normal_cn_policy=normal_cn_policy)
     bounds = catalog.default_bounds() if bounds is None else bounds
     if not isinstance(bounds, MultiplicityBounds):
         raise TypeError("Prediction bounds must be MultiplicityBounds")

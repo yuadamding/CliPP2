@@ -3,8 +3,6 @@ import numpy as np
 
 from ..io.data import readonly_array
 
-MIXED_EPS = 1e-6
-
 
 class RegionalView:
     """One model coordinate and selected mutation rows, always on CCF scale."""
@@ -29,7 +27,7 @@ class RegionalView:
     @property
     def standard(self):
         """Numerical pilot policy, not a different emission model."""
-        return not self.array("mixed").any() and np.all(self.array("normal") == 2)
+        return np.all(self.array("normal") == 2)
 
     def subset(self, indices):
         return RegionalView(self.model, self.region, self.rows[indices])

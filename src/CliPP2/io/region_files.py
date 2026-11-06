@@ -89,7 +89,8 @@ def _read_region(path: Path, *, preserve_provenance=False):
                                            "Normal-CN", default="normal_cn" in row)
         if normal_supplied and "normal_cn" not in row:
             raise TumorTxtError(f"{path}: normal CN cannot be marked supplied without normal_cn.")
-        intervals.setdefault(chrom, []).append((start, end, major, minor, normal, normal_supplied))
+        genuine = _provenance_flag(row, ("mapping_genuine", "_mapping_genuine"), "Genuine-mapping")
+        intervals.setdefault(chrom, []).append((start, end, major, minor, normal, normal_supplied, genuine))
         interval_rows[chrom, start, end] = row
     indexed = {}
     for chrom, segments in intervals.items():
@@ -118,7 +119,7 @@ def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tupl
                 # Uncovered loci are diploid; missing reads remain missing.
                 start, end, major, minor, normal, normal_supplied = position, position, 1, 1, 2, False
             else:
-                start, end, major, minor, normal, normal_supplied = segments[index]
+                start, end, major, minor, normal, normal_supplied, genuine = segments[index]
             observed = (chrom, position) in observations
             alt, ref, excluded = observations.get((chrom, position), (".", ".", False))
             row = dict(zip(SCHEMA_COLUMNS, (f"{chrom}:{position}", sample, alt, ref, int(observed), purity,

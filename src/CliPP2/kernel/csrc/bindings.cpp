@@ -12,7 +12,7 @@ namespace {
 thread_local char last_error[1024] = "";
 }
 
-extern "C" int CliPP2KernelABI() { return 7; }
+extern "C" int CliPP2KernelABI() { return 8; }
 extern "C" const char* CliPP2KernelBuildId() { return CLIPP2_KERNEL_BUILD_ID; }
 extern "C" const char* CliPP2KernelLastError() { return last_error; }
 

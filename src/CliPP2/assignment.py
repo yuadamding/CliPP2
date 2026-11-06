@@ -135,7 +135,7 @@ class AssignmentBundle(ImmutableArrayRecord):
         if self.cpu_threads is not None and (type(self.cpu_threads) is not int or not 0 < self.cpu_threads < 2**31):
             raise ValueError("cpu_threads must be a positive int32")
         shape = len(targets), len(self.reference.region_ids)
-        data = self.catalog.prediction_data(targets)
+        data = self.catalog.prediction_data(targets, normal_cn_policy=self.normal_cn_policy)
         support = self.catalog.default_bounds().subset(targets, self.reference.region_ids)
         support.for_data(data)
         positions = {mutation: i for i, mutation in enumerate(self.catalog.mutation_ids)}
@@ -380,7 +380,7 @@ def _conditional_probabilities(catalog, source, region, phi, lower, upper, nativ
     candidates = np.arange(lower, upper + 1, dtype=np.int64)
     purity = catalog.purity[source, region]
     denominator = ((1 - purity) * catalog.normal_cn[source, region]
-                   + purity * catalog.mean_total_cn[source, region])
+                   + purity * catalog.total_cn[source, region])
     p = np.minimum((purity / denominator * candidates) * phi, 1.)
     alt, depth = catalog.alt_counts[source, region], catalog.total_counts[source, region]
     logs = xlogy(alt, p) + xlog1py(depth - alt, -p)
@@ -463,7 +463,7 @@ class _ReferenceEvaluation:
 
 def _score_reference(bundle, progress_callback):
     observation = prepare_prediction(bundle.catalog, bundle.target_ids, bundle.bounds,
-                                     device=bundle.device, cpu_threads=bundle.cpu_threads)
+                                     device=bundle.device, cpu_threads=bundle.cpu_threads, normal_cn_policy=bundle.normal_cn_policy)
     n, r, k = observation.n, observation.r, len(bundle.reference.labels)
     observed = np.asarray(observation.observed, bool)
     coverage = observed.sum(axis=1)
@@ -578,7 +578,7 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
                 ref_count=float(catalog.total_counts[source, j] - catalog.alt_counts[source, j]),
                 total_depth=float(catalog.total_counts[source, j]), purity=float(catalog.purity[source, j]),
                 original_major_cn=float(catalog.major_cn[source, j]), original_minor_cn=float(catalog.minor_cn[source, j]),
-                original_normal_cn=float(catalog.normal_cn[source, j]), original_total_cn=float(catalog.mean_total_cn[source, j]),
+                original_normal_cn=float(catalog.normal_cn[source, j]), original_total_cn=float(catalog.total_cn[source, j]),
                 normal_cn_supplied=bool(catalog.normal_cn_supplied[source, j]),
                 segment_id=str(catalog.segment_ids[source, j]), mapping_genuine=bool(catalog.mapping_genuine[source, j]),
                 count_observed=bool(catalog.count_observed[source, j]), positive_depth=bool(catalog.total_counts[source, j] > 0),

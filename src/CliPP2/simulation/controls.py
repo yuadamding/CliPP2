@@ -225,7 +225,7 @@ def run_reference_audit(history, catalog, paired_result, config, outdir, second_
                 or second_catalog.region_ids != catalog.region_ids):
             raise ValueError("Independent reads must retain tumor and region identities")
         for key in ("major_cn", "minor_cn", "normal_cn", "purity", "segment_ids", "eligible",
-                    "mapping_genuine", "normal_cn_supplied", "cn_state_count", "mean_total_cn"):
+                    "mapping_genuine", "normal_cn_supplied", "total_cn"):
             if not np.array_equal(getattr(second_catalog, key), getattr(catalog, key)):
                 raise ValueError("Independent reads changed frozen biological inputs")
     informative = catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)

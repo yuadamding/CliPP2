@@ -94,7 +94,8 @@ def contributor_density_diagnostics(history, frame, config, *, densities=(0, 1, 
         catalog = load_original_catalog(path, max_major_cn=config.fit.max_major_cn)
     if not pool:
         return dict(status='not_applicable_no_declared_source_pool', target_ids=targets, records=[])
-    data = prepare_prediction(catalog, pool, device=config.fit.device, cpu_threads=config.fit.cpu_threads)
+    data = prepare_prediction(catalog, pool, device=config.fit.device, cpu_threads=config.fit.cpu_threads,
+                              normal_cn_policy=config.normal_cn_policy)
     phi = history.phi[positions]
     with NativeBackend(data, cpu_threads=config.fit.cpu_threads) as backend:
         diagnostic = backend.component_diagnostics(phi)
@@ -104,7 +105,7 @@ def contributor_density_diagnostics(history, frame, config, *, densities=(0, 1, 
     confidence = confidence_passes(diagnostic['map_log_probability'], config.contributor_probability_min,
         diagnostic['has_second'] & np.isfinite(diagnostic['top_two_gap']))
     qualified = (data.observed & catalog.mapping_genuine[positions] & catalog.eligible[positions]
-                 & (catalog.cn_state_count[positions] == 1) & (phi > 0) & (diagnostic['status'] == 0) & confidence
+                 & (phi > 0) & (diagnostic['status'] == 0) & confidence
                  & (diagnostic['top_two_gap'] > config.contributor_tie_atol)
                  & np.isfinite(residual) & (residual <= config.contributor_deviance_max))
     source_lookup = {mutation: i for i, mutation in enumerate(pool)}
