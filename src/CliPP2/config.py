@@ -13,7 +13,7 @@ DEFAULT_STAGE_ONE_MAX_CLUSTERS: Final = 10
 # Preserved mixed-CN input bounds use the historical four-copy support cap;
 # the tree model gives matched single-state CN its full 1..major support.
 MAX_MULTIPLICITY: Final = 4
-DEFAULT_DEVICE: Final = "cuda"
+DEFAULT_DEVICE: Final = "cpu"
 DEFAULT_AUDIT_SCOPE: Final = "selected"
 PROTOCOL_VERSION: Final = "2.2"
 

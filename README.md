@@ -1,76 +1,91 @@
 # CliPP2
 
-CliPP2 clusters mutations jointly across one or more tumor regions and estimates
-regional cancer cell fractions (CCFs) and mutation multiplicities.
+CliPP2 implements a three-stage research method for joint mutation clustering
+across tumor regions. It estimates cancer cell fractions (CCFs) and integer
+multiplicities under **one allele-specific tumor copy-number state per
+mutation–region observation**. Mixed tumor copy-number states are unsupported.
 
-## Install
+Stage 1 fits all eligible mutations. Stage 2 fits the remainder with
+contributor-derived multiplicity caps. Stage 3 restores original multiplicity
+support and reassigns selected mutations against frozen references. Cluster
+limits default to **10 for Stage 1 and 20 for Stage 2**; near-clonal routing uses
+strict, unnormalized L2 distance to the all-one vector **less than 0.05**.
 
-Requires Python 3.10+ and a C++17 compiler. From the repository root:
+## Install and run
 
-```bash
-python -m pip install .                       # CPU
-CLIPP2_BUILD_CUDA=1 python -m pip install .     # CPU + CUDA
+Fitting requires Python 3.10+ and a C++17 compiler. CPU is the default backend:
+
+```sh
+python -m pip install .
+clipp2 workflow --plan examples/workflow_protocol22.plan.json --output-dir results/workflow22
 ```
 
-CUDA builds require `nvcc`; GPU execution requires a compatible NVIDIA GPU and
-driver. CPU builds require neither CUDA nor PyTorch.
+The plan's confidence and residual thresholds are **fixture settings, not
+calibrated biological recommendations**. Outputs include accepted Stage 1/2 fits,
+segment caps, reference vectors, assignment evidence, and
+`all_original_mutations.tsv`, which retains unresolved and unchanged mutations.
+Use a new output directory for each run.
 
-## Run
-
-```bash
-clipp2 fit --input-dir tumor/ --device cpu --output-dir results/
-```
-
-Use `--device cuda` for GPU execution; the device selects the execution path.
-`--max-clusters` defaults to 20; `--max-major-cn` to 10. Search uses bounded
-proposals, then checks every feasible single-mutation move at the selected
-cluster count. Use `--audit-scope all` to refine every represented count; it
-can select a different count and costs more. Neither scope proves a global optimum.
-
-## Input
-
-### Directory
-
-One directory represents one tumor; its region subfolders are fitted jointly:
-
-```text
-tumor/
-├── region1/
-│   ├── snv.txt
-│   ├── cna.txt
-│   └── purity.txt
-└── region2/          # same three files
-```
-
-Folder names define tumor/region IDs. See the [runnable example](examples/README.md).
-Each region requires:
-
-| File | Required contents |
+| Operation | Command |
 | --- | --- |
-| `snv.txt` | `chromosome_index`, `position`, `ref_count`, `alt_count` |
-| `cna.txt` | `chromosome_index`, `start_position`, `end_position`, `major_cn`, `minor_cn`, `total_cn` |
-| `purity.txt` | One number in `(0, 1]`, without a header |
+| Three-stage method | `clipp2 workflow --plan PLAN.json --output-dir OUTPUT` |
+| Standalone native fit | `clipp2 fit --input-file INPUT.tsv --output-dir OUTPUT` |
+| Frozen-reference reassignment | `clipp2 assign --bundle BUNDLE.json --output-dir OUTPUT` |
+| Biological study | `clipp2-simulate run --cohort-settings SETTINGS.json --outdir OUTPUT` |
 
-### TSV alternative
+CUDA requires an explicit build and device selection:
 
-Use `--input-file tumor.tsv` instead of `--input-dir` for a single table combining
-all regions; gzip is supported. See [example](examples/exampleTumor1.tsv).
+```sh
+CLIPP2_BUILD_CUDA=1 python -m pip install .
+clipp2 workflow --help
+```
 
-| Columns | Contents |
+Set the workflow plan's fit device to `cuda`, or use `clipp2 fit --device cuda`.
+CUDA builds require `nvcc`; execution requires a compatible NVIDIA GPU and driver.
+CPU execution requires neither CUDA nor PyTorch.
+
+## Inputs and outputs
+
+Use a canonical TSV (`--input-file`, gzip supported) or a tumor directory
+(`--input-dir`) with `snv.txt`, `cna.txt`, and `purity.txt` in each region folder.
+See the [runnable examples](examples/README.md).
+
+| Canonical TSV fields | Meaning |
 | --- | --- |
 | `mutation_id`, `sample_id` | Mutation and region identifiers |
-| `alt_count`, `ref_count`, `count_observed` | Read counts and observation flag: 1 for observed, 0 for missing |
-| `purity`, `normal_cn` | Tumor purity in `(0, 1]` and nonnegative integer normal CN |
-| `segment_id`, `cn_state_id`, `cn_state_fraction` | Segment, CN state and its fraction |
-| `allele_a_cn`, `allele_b_cn` | Major and minor copy numbers, with `allele_a_cn >= allele_b_cn` |
+| `alt_count`, `ref_count`, `count_observed` | Counts and explicit observation status |
+| `purity`, `normal_cn` | Purity in `(0, 1]` and nonnegative integer normal CN |
+| `segment_id`, `cn_state_id`, `cn_state_fraction` | Genuine segment mapping and one state with fraction 1 |
+| `allele_a_cn`, `allele_b_cn` | Integer major/minor CN, with major ≥ minor |
 
-## Output
+CN and normal-CN provenance must be explicit. Regional files may supply
+`normal_cn` in their CNA table; an omitted normal CN requires an explicit
+`--normal-cn-policy diploid` for fitting, or `normal_cn_policy` in the workflow
+plan. Non-diploid normal CN remains supported. Missing observations, zero ALT,
+zero depth, and input exclusion retain different meanings.
 
-| File | Columns |
-| --- | --- |
-| `{tumor_id}_mutation_clusters.tsv` | `tumor_id`, `mutation_id`, `cluster_label`, `phi_<region>` for each region |
-| `{tumor_id}_cluster_centers.tsv` | `tumor_id`, `cluster_label`, `cluster_size`, `phi_<region>` for each region |
-| `{tumor_id}_mutation_region_multiplicity.tsv` | `tumor_id`, `mutation_id`, `region_id`, `phi`, `multiplicity_call` |
+Standalone fitting publishes mutation clusters, cluster centers, and regional
+multiplicity calls. Fitting uses the original CN denominator even when
+multiplicity support is restricted. Stage 3 restores that original support.
+
+## Simulation and checks
+
+The exact supplied cohort requires **Python 3.11+ and NumPy 2.3.5**:
+
+```sh
+python -m pip install '.[simulation]'
+clipp2-simulate run --cohort-settings CliPP2_phylogeny_cohort_settings.json --workers 10 --outdir results/cohort
+python tools/check_research.py --groups workflow biology evaluation study publication
+```
+
+The full design has 60 cases, 720 physical histories, and 2,640 datasets.
+Development and main replicate counts are declared before execution; worker
+count does not change the experiment. The deterministic checks above are
+separate from calibration and full-cohort execution.
+
+- [Workflow Protocol 2.2](docs/workflow_protocol_2_2.md)
+- [Simulation design and execution](docs/simulation.md)
+- [Evaluation definitions](docs/simulation_evaluation.md)
 
 ## Contact
 
