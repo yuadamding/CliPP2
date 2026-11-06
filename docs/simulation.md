@@ -74,18 +74,39 @@ new command-line settings do not replace them. Completed cells are reused.
 `--retry-failed` reruns execution failures as new attempts, retaining old
 attempts, completion records, and costs. It does not reopen a frozen development
 selection or reinterpret scientific rejection as a worker failure. Package
-version 1.2.2 uses simulation contract v4. It binds the entire parsed cohort
+version 1.2.3 keeps simulation contract v4. It binds the entire parsed cohort
 settings to a `cohort_content_id` in contracts, jobs, physical histories,
 acquisitions, and qualification receipts. Formatting and object-key order do not
 affect this identity; values and list order do. Resume verifies the frozen
-settings before reusing any work. Semantic random seeds remain unchanged.
+settings at coordinator execution boundaries before reusing work. Each worker
+then reuses its validated immutable snapshot; a new process loads and verifies
+it again. Semantic random seeds remain unchanged.
 
-Existing 1.2.1 studies retain their original frozen installation and outputs.
+Existing 1.2.1 and 1.2.2 studies retain their original frozen installations and outputs.
 They are not migrated or given retrospective cohort identity. A new execution
-under 1.2.2 requires a new directory. Qualification has separate numbered
+under 1.2.3 requires a new directory. Qualification has separate numbered
 mechanism/cohort attempts; validated published summaries can complete an
 interrupted wrapper without rerunning controls. Interrupted costs without a
 summary remain explicitly unknown. Reports use new directories.
+
+New studies save `main_roster.json` when allocation is frozen, before submitting
+main jobs. Evaluation v3 uses its family/history/acquisition weights. A known
+failure with an established denominator receives zero correct-decision credit;
+missing or conflicting evidence produces an unknown score. An incomplete planned
+estimate is null, with available-case summaries labeled separately. Legacy studies
+without an explicit complete frozen roster cannot establish the planned estimate
+from a total cell count alone.
+
+New history manifests, acquisitions, and input catalogs share an exact semantic
+`history_content_id`. Offline evaluation also reconstructs biological read
+probabilities from true purity, CN, multiplicity, and carrier fraction. Perturbed
+supplied inputs and biased read probabilities remain separate. Consistent legacy
+evidence without an exact retained link is labeled `legacy_consistent_unbound`;
+its conditional diagnostics do not enter the verified primary aggregate.
+
+`--retry-failed` also reaches timing pilots and technical-sensitivity jobs.
+External-reference audits record the selected source attempt, reuse only matching
+completed audits, and preserve older audits when a newer source attempt is used.
 
 To apply new evaluation definitions to saved inference, create an explicit JSON
 configuration and a new report destination:

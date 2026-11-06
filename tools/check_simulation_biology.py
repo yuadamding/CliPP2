@@ -10,19 +10,20 @@ import json
 from pathlib import Path
 import tempfile
 import time
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
-from CliPP2.simulation.acquisition import acquire
-from CliPP2.simulation.biology import FAMILIES, History, generate_history
+from CliPP2.simulation.acquisition import acquire, validate_history_acquisition_link
+from CliPP2.simulation.biology import FAMILIES, History, generate_history, history_content_id
 
 
 def run_cohort_identity_checks(directory, settings_path):
     """Content binding tests without native fitting or changing semantic seeds."""
     from CliPP2.simulation.cohort import cohort_content_id, cohort_history, load_cohort, semantic_seed
-    from CliPP2.simulation.study import _cohort
+    from CliPP2.simulation.study import _cohort, _verify_cohort_snapshot
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     original = json.loads(Path(settings_path).read_text())
@@ -30,7 +31,17 @@ def run_cohort_identity_checks(directory, settings_path):
     path = directory / "settings.json"
     path.write_text(json.dumps(original, sort_keys=True, indent=1))
     base = load_cohort(path, expected_content_id=identity)
-    assert base.content_id == identity and _cohort(path, identity).content_id == identity
+    with patch('CliPP2.simulation.cohort.load_cohort', wraps=load_cohort) as loader:
+        worker_snapshot = _verify_cohort_snapshot(path, identity)
+        assert all(_cohort(path, identity) is worker_snapshot for _ in range(4))
+        assert loader.call_count == 1
+    assert base.content_id == identity and worker_snapshot.content_id == identity
+    try:
+        worker_snapshot.settings['acquisitions']['A1']['mean_depth'] += 1
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('Verified cohort settings are mutable')
     changed = deepcopy(original)
     source = next(row for row in changed["histories"]
                   if not np.array_equal(np.asarray(row["tip_fractions"])[:, 0], np.asarray(row["tip_fractions"])[:, 1]))
@@ -41,12 +52,13 @@ def run_cohort_identity_checks(directory, settings_path):
     path.write_text(json.dumps(changed))
     altered = _cohort(path, altered_id)
     assert altered.content_id == altered_id and altered is not base
+    assert _cohort(path, identity) is worker_snapshot
     try:
-        _cohort(path, identity)
+        _verify_cohort_snapshot(path, identity)
     except ValueError:
         pass
     else:
-        raise AssertionError("Same-path cache returned stale biological truth")
+        raise AssertionError("Fresh execution boundary accepted changed biological truth")
     one = cohort_history(base, source["history_id"])
     two = cohort_history(altered, source["history_id"])
     np.testing.assert_array_equal(two.phi, one.phi[:, [1, 0, 2, 3]])
@@ -64,6 +76,7 @@ def run_cohort_identity_checks(directory, settings_path):
         assert cohort_content_id(mutation) != identity
     return dict(status="passed", formatting_and_key_order_stable=True, coherent_fraction_ccf_change_detected=True,
                 event_acquisition_mask_and_list_changes_detected=True, same_path_cache_safe=True,
+                worker_snapshot_immutable=True, fresh_boundary_detects_changed_content=True,
                 semantic_seeds_unchanged=True, native_fit_count=0)
 
 
@@ -85,6 +98,9 @@ def run_biology_checks(directory):
             path = directory / f'{family}_{seed}.tsv'
             write_tumor_txt(path, acquisition, acquisition.attrs['metadata'])
             catalog = load_original_catalog(path)
+            binding = validate_history_acquisition_link(history, acquisition.attrs['acquisition'], catalog,
+                history_manifest=dict(history_content_id=history_content_id(history)))
+            assert binding['status'] == 'verified_history_binding', binding
             np.testing.assert_array_equal(catalog.major_cn, history.major_cn)
             np.testing.assert_array_equal(catalog.minor_cn, history.minor_cn)
             np.testing.assert_array_equal(catalog.count_observed, acquisition.attrs['acquisition']['count_observed'])
@@ -179,11 +195,16 @@ def run_biology_checks(directory):
         pass
     else:
         raise AssertionError('Corrupted derived multiplicity was accepted')
+    if __package__:
+        from .check_simulation_truth import run_truth_link_checks
+    else:
+        from check_simulation_truth import run_truth_link_checks
+    truth_binding = run_truth_link_checks(directory / 'truth_binding')
     return dict(status='passed', family_histories=tested, physical_event_replay=True,
         integer_single_state_reduction=True, valid_cap_and_clonal_counterexample=True,
         exact_broken_and_masked_aliases=True, mutation_loss_separate_from_input_loss=True,
         region_prefix_pairing=True, input_perturbations_reuse_reads=True,
-        canonical_roundtrips=True, elapsed_seconds=time.perf_counter()-started)
+        canonical_roundtrips=True, truth_binding=truth_binding, elapsed_seconds=time.perf_counter()-started)
 
 
 def main():

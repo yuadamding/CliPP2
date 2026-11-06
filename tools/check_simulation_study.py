@@ -25,6 +25,7 @@ from CliPP2.simulation.study import (_decision, _execute, _paired_result, _prepa
 
 
 def _fixture():
+    from CliPP2.simulation.acquisition import acquire
     history = generate_history("S01", 300, n_mutations=8, n_segments=2, n_regions=2)
     values = [[50, 50]]*4 + [[20, 15]]*4
     frame = pd.DataFrame([dict(mutation_id=mutation, sample_id=region,
@@ -32,12 +33,25 @@ def _fixture():
         purity=1., normal_cn=2, normal_cn_supplied=1, segment_id="s0", mapping_genuine=1,
         cn_state_id="0", cn_state_fraction=1., allele_a_cn=1, allele_b_cn=1)
         for i, mutation in enumerate(history.mutation_ids) for j, region in enumerate(history.region_ids)])
-    frame.attrs["metadata"] = dict(tumor_id="orchestration_regression")
-    frame.attrs["acquisition"] = dict(count_observed=np.ones((8, 2), bool))
+    generated = acquire(history, 400, purity=1., depth=100)
+    frame.attrs = deepcopy(generated.attrs)
+    frame.attrs["acquisition"].update(alt_counts=np.asarray(values), depth=np.full((8, 2), 100),
+        total_counts=np.full((8, 2), 100), count_observed=np.ones((8, 2), bool),
+        supplied_segment_ids=np.full((8, 2), "s0"))
     job = dict(cell_id="main-S01-orchestration", phase="main", family="S01",
         history_id="main-S01-orchestration", history_seed=300, acquisition_seed=400,
         acquisition=dict(id="A4", purity=1., depth=100), dimensions=dict(mutations=8, segments=2, regions=2))
     return history, frame, job
+
+
+def _prepare_fixture(root, history, job):
+    from CliPP2.simulation.biology import history_content_id
+    directory = Path(root) / "histories" / job["history_id"]
+    if not (directory / "history_manifest.json").exists():
+        history.write_truth(directory)
+        save_json(directory / "history_manifest.json", dict(
+            {key: job[key] for key in ("history_id", "family", "history_seed", "dimensions")},
+            history_content_id=history_content_id(history)))
 
 
 def _fixed_information(*args, **kwargs):
@@ -144,6 +158,7 @@ def _selection_check(root, contract, history, frame, job):
 
 
 def _native_failure_check(root, history, frame, job, contract):
+    _prepare_fixture(root, history, job)
     save_json(root / "study_contract.json", contract)
     config = asdict(workflow_config(.99, .90))
     config["assignment"]["screen"]["pair_deviance_max"] = 11.
@@ -273,6 +288,7 @@ def _native_failure_check(root, history, frame, job, contract):
 
 def _partial_objective_check(root, contract, history, frame, job):
     job = dict(job, phase="development", cell_id="partial-development", history_id="partial-development")
+    _prepare_fixture(root, history, job)
     values = [asdict(workflow_config(c, .8)) for c in (.9, .95, .99)]
     objective = [dict(cell_id=job["cell_id"], history_id=job["history_id"], family="S01", acquisition="A4",
         contributor=.9, posterior=p, configuration_id=f"c0.90-p{p:.2f}", fixed_evaluable=6,
@@ -305,9 +321,11 @@ def _planned_report_check(root, contract):
     contract["requested_histories_per_family"] = dict(main=1, development=1)
     save_json(root / "study_contract.json", contract)
     save_json(root / "allocation.json", allocate(contract, [1.], [1]))
+    from CliPP2.simulation.study import _freeze_main_roster
+    _freeze_main_roster(root, contract, read_json(root / "allocation.json"))
     captured = []
 
-    def aggregate(values):
+    def aggregate(values, **kwargs):
         captured.extend(values)
         return dict(metrics=[], planned_datasets=len(values))
 
@@ -321,7 +339,9 @@ def _planned_report_check(root, contract):
     assert len({".".join(row["history_id"].split(".")[1:3]) for row in captured}) == 60
     assert all(all(not state["available"] and state["status"] == "not_executed"
                    for state in row["applicability"]) for row in captured)
-    assert all(metric["value"] == 0 for row in captured for metric in row["metrics"])
+    assert all(row["schema"] == "clipp2.simulation.evaluation.v3" for row in captured)
+    assert all(metric["value"] is None for row in captured for metric in row["metrics"]
+               if metric["name"] == "binary_correct_per_original_evaluable")
 
 
 def _offline_report_check(root, history, job):
@@ -329,10 +349,7 @@ def _offline_report_check(root, history, job):
     from contextlib import ExitStack
     from CliPP2.simulation.reporting import reevaluate_cell
     from CliPP2.simulation.study import _latest_completion
-    history_dir = root / "histories" / job["history_id"]
-    history.write_truth(history_dir)
-    save_json(history_dir / "history_manifest.json", {key: job[key]
-        for key in ("history_id", "family", "history_seed", "dimensions")})
+    _prepare_fixture(root, history, job)
     save_json(root / "job_manifests/batch-001.json", [job])
     frozen = dict(selected=dict(contributor=.99, posterior=.90), frozen_before_main_generation=True)
     save_json(root / "threshold_development.json", frozen)
@@ -415,6 +432,7 @@ def _structured_failure_checks(root):
                 arm["status"] = current["status"]
         task = dict(root=str(directory), job=dict(job, phase="development"),
                     execution_configs=[asdict(workflow_config(.95, .8))])
+        _prepare_fixture(directory, history, task["job"])
         def infer(_input, output, config, **kwargs):
             save_json(Path(output) / "paired_result.json", current)
             return deepcopy(current)
@@ -528,7 +546,7 @@ def run_lifecycle_checks(root, settings):
     contract = _design_check(root, settings)
     job = next(jobs(contract, "development", 1))
     histories = root / "history_reuse"
-    writer = SimpleNamespace(write_truth=lambda p: save_json(p / "history.json", dict(fixture=True)))
+    writer = _fixture()[0]
     with patch("CliPP2.simulation.study._history", return_value=writer) as create:
         _prepare_histories(histories, [job])
         _prepare_histories(histories, [job])
@@ -571,6 +589,8 @@ def run_checks(directory, cohort_settings):
     root.mkdir(parents=True, exist_ok=True)
     contract = _design_check(root, cohort_settings)
     lifecycle = run_lifecycle_checks(root / "lifecycle", cohort_settings)
+    from check_simulation_resume import run_checks as check_resume
+    resume = check_resume(root / "resume")
     for protocol, schema in (("2.1", "clipp2.simulation-contract.v1"), ("2.2", "clipp2.simulation-contract.v2"), ("2.2", "clipp2.simulation-contract.v3")):
         old = dict(contract, protocol_version=protocol, schema=schema)
         with patch("CliPP2.simulation.study.read_json", side_effect=AssertionError("old contract reached resume IO")):
@@ -594,7 +614,7 @@ def run_checks(directory, cohort_settings):
     _offline_report_check(root / "native_failure", history, job)
     _partial_objective_check(root / "partial_objective", contract, history, frame, job)
     _planned_report_check(root / "unexecuted_report", contract)
-    result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4, lifecycle=lifecycle,
+    result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4, lifecycle=lifecycle, resume=resume,
         checks=["exact_60_variant_720_history_2640_cell_design", "full_10_20_strict_point05_contract",
                 "source_protocol21_execution22_and_cross_protocol_resume_rejection",
                 "threshold_reuse_preserves_reference_quality_and_finite_rival_certainty",

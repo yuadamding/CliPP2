@@ -76,17 +76,22 @@ def _paired_result(attempt, index=1):
 
 
 @lru_cache(maxsize=2)
-def _cached_cohort(path, expected_content_id):
+def _cached_cohort(path, expected_content_id, process_id):
     from .cohort import load_cohort
     return load_cohort(path, expected_content_id=expected_content_id)
 
 
 def _cohort(path, expected_content_id):
-    from .cohort import cohort_content_id
     path = str(Path(path).resolve())
-    if not expected_content_id or cohort_content_id(read_json(path)) != expected_content_id:
-        raise ValueError("Authoritative cohort content differs from its declared identity")
-    return _cached_cohort(path, expected_content_id)
+    if not expected_content_id:
+        raise ValueError("Authoritative cohort requires an expected content identity")
+    return _cached_cohort(path, expected_content_id, os.getpid())
+
+
+def _verify_cohort_snapshot(path, expected_content_id):
+    """A coordinator execution boundary rereads content; worker use stays immutable."""
+    _cached_cohort.cache_clear()
+    return _cohort(path, expected_content_id)
 
 
 def _history(job):
@@ -334,6 +339,9 @@ def _prepare_histories(root, job_list):
 
 def run_jobs(root, job_list, *, workers, selected=None, contract=None, retry_failed=False):
     job_list = list(job_list)
+    for path, identity in {(job["cohort_settings"], job["cohort_content_id"])
+                           for job in job_list if job.get("cohort_settings")}:
+        _verify_cohort_snapshot(path, identity)
     manifests = root / "job_manifests"
     manifests.mkdir(exist_ok=True)
     manifest = manifests / f"batch-{len(list(manifests.glob('batch-*.json')))+1:03d}.json"
@@ -539,7 +547,6 @@ def _freeze_main_roster(root, contract, allocation):
     return record["jobs"]
 
 
-
 def _execute(root, contract, *, resume=False, retry_failed=False):
     root = Path(root).resolve()
     if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v4"
@@ -550,7 +557,7 @@ def _execute(root, contract, *, resume=False, retry_failed=False):
         if frozen != contract:
             raise ValueError("Resume requires the exact frozen study contract")
         if contract.get("cohort"):
-            _cohort(root / "cohort_settings.json", contract["cohort"]["content_id"])
+            _verify_cohort_snapshot(root / "cohort_settings.json", contract["cohort"]["content_id"])
             if Path(contract["cohort"]["path"]).resolve() != (root / "cohort_settings.json").resolve():
                 raise ValueError("Resume must use the verified frozen cohort snapshot")
     else:
@@ -563,6 +570,7 @@ def _execute(root, contract, *, resume=False, retry_failed=False):
             frozen_cohort = root / "cohort_settings.json"
             save_json(frozen_cohort, validated.settings)
             contract["cohort"]["path"] = str(frozen_cohort)
+            _verify_cohort_snapshot(frozen_cohort, contract["cohort"]["content_id"])
         save_json(root / "study_contract.json", contract)
     qualification_path = root / "qualification.json"
     if qualification_path.exists():
@@ -626,7 +634,8 @@ def _execute(root, contract, *, resume=False, retry_failed=False):
                     history_seed=seed_for(contract["master_seed"], "pilot", family, 0),
                     acquisition_seed=seed_for(contract["master_seed"], "pilot", family, 0, 4),
                     acquisition=contract["acquisitions"][-1], dimensions=contract["dimensions"]))
-        cells = run_jobs(root, pilot, workers=workers, selected=dict(contributor=.95, posterior=.95), contract=contract)
+        cells = run_jobs(root, pilot, workers=workers, selected=dict(contributor=.95, posterior=.95),
+                         contract=contract, retry_failed=retry_failed)
         if any(cell["status"] != "complete" for cell in cells):
             raise RuntimeError("Timing pilot execution failed; inspect immutable cell failure records")
         projected = [cell["elapsed_seconds"]*3/max(1, cell["cost_ledgers"][0]["fit_count"]) for cell in cells]
@@ -664,11 +673,25 @@ def _execute(root, contract, *, resume=False, retry_failed=False):
             frozen_before_main_generation=True))
     run_jobs(root, main_jobs,
              workers=workers, selected=development["selected"], contract=contract, retry_failed=retry_failed)
-    run_optional_panels(root, contract, development["selected"], workers)
+    run_optional_panels(root, contract, development["selected"], workers, retry_failed=retry_failed)
     return report(root)
 
 
-def run_optional_panels(root, contract, selected, workers):
+def _reference_audit_destination(output, family, source):
+    """Reuse only an audit bound to this source attempt; preserve older audits."""
+    root = output / "reference_audits" / family
+    for directory in [root, *sorted(root.glob("attempt-*"))]:
+        binding = directory / "source_attempt.json"
+        if binding.exists() and read_json(binding) == source and (directory / "reference_audit.json").exists():
+            return directory, True
+    root.mkdir(parents=True, exist_ok=True)
+    directory = root / f"attempt-{len(list(root.glob('attempt-*')))+1:03d}"
+    directory.mkdir()
+    save_json(directory / "source_attempt.json", source)
+    return directory, False
+
+
+def run_optional_panels(root, contract, selected, workers, *, retry_failed=False):
     from .acquisition import acquire
     from .controls import run_reference_audit
     from .panels import contributor_density_diagnostics, run_scaling, sensitivity_jobs
@@ -680,19 +703,23 @@ def run_optional_panels(root, contract, selected, workers):
     output.mkdir(exist_ok=True)
     if options.get("technical_sensitivity"):
         run_jobs(root, sensitivity_jobs(contract, extended=options.get("extended_sensitivity", False)),
-                 workers=workers, selected=selected, contract=contract)
+                 workers=workers, selected=selected, contract=contract, retry_failed=retry_failed)
     if options.get("external_reference"):
         for family in ("S03", "S04", "S05", "S11", "S12"):
-            directory = output / "reference_audits" / family
-            if (directory / "reference_audit.json").exists():
-                continue
             if contract.get("cohort"):
                 candidate = next(job for job in jobs(contract, "main", 1)
                                  if job["family"] == family and job["acquisition"]["id"] == "A4")
                 cell_id = candidate["cell_id"]
             else:
                 cell_id = f"main-{family}-H001-A4"
-            completion = read_json(root / "cells" / cell_id / "completion.json")
+            completion = _latest_completion(root / "cells" / cell_id)
+            if completion is None:
+                continue
+            source = dict(cell_id=cell_id, selected_attempt=completion["attempt"],
+                          completion_identity=content_hash(completion))
+            directory, reused = _reference_audit_destination(output, family, source)
+            if reused:
+                continue
             job = completion["job"]
             history = _history(job)
             attempt = root / completion["attempt"]
@@ -709,7 +736,9 @@ def run_optional_panels(root, contract, selected, workers):
                 if not second_path.exists():
                     write_tumor_txt(second_path, second, dict(second.attrs["metadata"], tumor_id=catalog.tumor_id))
                 second_catalog = load_original_catalog(second_path)
-            run_reference_audit(history, catalog, paired, config, directory, second_catalog=second_catalog)
+            run_reference_audit(history, catalog, paired, config, directory / "output", second_catalog=second_catalog)
+            save_json(directory / "reference_audit.json", dict(source_attempt=source,
+                result=read_json(directory / "output" / "reference_audit.json")))
     density_path = output / "contributor_density.json"
     if options.get("contributor_density") and not density_path.exists():
         from .biology import generate_history
