@@ -89,7 +89,7 @@ def make_contract(*, master_seed=None, workers=10, budget_minutes=60.,
             content_id=loaded.content_id,
             source_protocol_version=payload["workflow_protocol"],
             variant_ids=[v["id"] for v in payload["variants"]],
-            region_ids=payload["region_order"], numpy_version=payload["numpy_version"],
+            region_ids=list(payload["region_order"]), numpy_version=payload["numpy_version"],
             history_count=len(payload["histories"]),
             variants_per_family=5, main_replicates_per_variant=10, development_replicates_per_variant=2,
             input_authority="Physical event logs and recorded realized tip fractions; original IDs and counts retained")

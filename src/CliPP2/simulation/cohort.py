@@ -1,7 +1,7 @@
 """Authoritative Version 1.2 cohort replay and prescribed semantic RNG streams.
 
-SHA256 is used only to map declared semantic keys to random seeds. No file bytes
-are hashed. Realized tip fractions are consumed exactly, never resampled.
+Semantic hashes bind parsed scientific content and map declared RNG keys to
+seeds. Realized tip fractions are consumed exactly, never resampled.
 """
 from __future__ import annotations
 
@@ -11,23 +11,31 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 import pandas as pd
 
-from .biology import History, _Copies
-from CliPP2.io.data import content_hash
+from .biology import History, _Copies, history_content_id
+from CliPP2.io.data import content_hash, freeze_record
 
 
-@dataclass
+@dataclass(frozen=True)
 class Cohort:
     settings: dict
-    trees: dict
-    variants: dict
-    histories: dict
     path: str
     content_id: str
+    trees: dict = field(init=False)
+    variants: dict = field(init=False)
+    histories: dict = field(init=False)
     _physical_cache: dict = field(default_factory=dict, repr=False)
+
+    def __post_init__(self):
+        settings = freeze_record(self.settings)
+        object.__setattr__(self, 'settings', settings)
+        object.__setattr__(self, 'trees', settings['trees'])
+        object.__setattr__(self, 'variants', MappingProxyType({row['id']: row for row in settings['variants']}))
+        object.__setattr__(self, 'histories', MappingProxyType({row['history_id']: row for row in settings['histories']}))
 
     @property
     def region_ids(self):
@@ -95,7 +103,7 @@ def load_cohort(path, *, expected_content_id=None):
         np.testing.assert_allclose(fractions.sum(axis=0), 1., atol=1e-12, rtol=0)
         if not set(history['acquisition_ids']) <= set(settings['acquisitions']):
             raise ValueError('Unknown prescribed acquisition')
-    return Cohort(settings, settings['trees'], variants, histories, str(path), identity)
+    return Cohort(settings, str(path), identity)
 
 
 def _physical_variant(cohort, variant_id):
@@ -379,13 +387,16 @@ def acquire_cohort(history, cohort, acquisition_id, *, read_replicate_id=1, matc
         for j, region in enumerate(history.region_ids)]
     frame = pd.DataFrame(records)
     eligible = (history.major_cn <= 10) & ~excluded
+    identity = history_content_id(history)
     frame.attrs['metadata'] = dict(tumor_id=f'{history.history_id}.{acquisition_id}.read{read_replicate_id}',
+        history_id=history.history_id, history_content_id=identity,
         cohort_content_id=cohort.content_id,
         source_cohort_protocol_version=cohort.settings['workflow_protocol'],
         genome_build='synthetic_1Mb_segments', coordinate_system='1-based-inclusive',
         mutation_key_convention='segment.batch.within_batch_3digit')
     frame.attrs['acquisition'] = dict(schema='clipp2.simulation.cohort-acquisition.v1', study_version='1.2',
-        cohort_content_id=cohort.content_id,
+        cohort_content_id=cohort.content_id, history_content_id=identity,
+        mutation_ids=history.mutation_ids, region_ids=history.region_ids,
         history_id=history.history_id, variant_id=metadata['variant_id'], split=metadata['split'],
         replicate=metadata['replicate'], acquisition_id=acquisition_id, read_replicate_id=read_replicate_id,
         seed_derivation=cohort.settings['seed_derivation'], numpy_version=np.__version__,

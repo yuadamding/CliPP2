@@ -13,6 +13,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from CliPP2.io.data import content_hash
+
 FAMILIES = {
     'S01': 'diploid_single_copy', 'S02': 'shared_gain_valid_cap',
     'S03': 'mixed_clonal_timing', 'S04': 'parallel_gain_false_clonality',
@@ -35,6 +37,11 @@ def _plain(value):
     if isinstance(value, float) and not np.isfinite(value):
         return None
     return value
+
+
+def history_content_id(history):
+    """Identify exact retained biological content without modifying the history."""
+    return content_hash({'schema': 'clipp2.history-content.v1', 'history': history.to_dict()})
 
 
 @dataclass(frozen=True)

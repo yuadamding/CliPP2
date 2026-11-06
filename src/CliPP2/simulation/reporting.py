@@ -1,8 +1,8 @@
 """Offline evaluation of preserved study evidence, with no inference execution."""
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
+import json
 from pathlib import Path
 import zipfile
 
@@ -63,7 +63,6 @@ def planned_roster(root, contract, allocation, cells):
     return dict(jobs=list(known.values()), complete=False, status="unavailable_complete_frozen_roster", roster_id=None)
 
 
-
 def _configuration(attempt, index=1):
     """Read a retained paired result, including interrupted archive publication."""
     directory = attempt / f"configuration-{index}"
@@ -83,6 +82,7 @@ def _configuration(attempt, index=1):
 
 def _load_evidence(root, cell):
     from .biology import History
+    from .acquisition import validate_history_acquisition_link
     job = cell["job"]
     attempt = _within(root, cell["attempt"])
     if attempt.parent != root.resolve() / "cells" / job["cell_id"]:
@@ -90,11 +90,13 @@ def _load_evidence(root, cell):
     if _read(attempt / "job.json") != job:
         raise ValueError("Attempt job differs from the selected completion")
     directory = _within(root, "histories/" + job["history_id"])
-    manifest = _read(directory / "history_manifest.json")
+    history_manifest = _read(directory / "history_manifest.json")
+    if not isinstance(history_manifest, Mapping):
+        raise TypeError("Preserved history manifest must be a JSON object")
     required = ("history_id", "family", "history_seed", "dimensions")
-    if any(manifest.get(key) != job[key] for key in required):
+    if any(history_manifest.get(key) != job[key] for key in required):
         raise ValueError("Preserved physical history manifest differs from the selected job")
-    if job.get("cohort_content_id") is not None and manifest.get("cohort_content_id") != job["cohort_content_id"]:
+    if job.get("cohort_content_id") is not None and history_manifest.get("cohort_content_id") != job["cohort_content_id"]:
         raise ValueError("Preserved physical history belongs to a different cohort content")
     history = History.from_dict(_read(directory / "history.json"))
     if job.get("cohort_content_id") is not None and history.metadata.get("cohort_content_id") != job["cohort_content_id"]:
@@ -108,11 +110,13 @@ def _load_evidence(root, cell):
             dims["mutations"], dims["regions"], dims["segments"]):
         raise ValueError("Preserved history dimensions differ from the job")
     catalog = load_original_catalog(attempt / "input_catalog.tsv")
-    if job.get("cohort_content_id") is not None and catalog.metadata.get("cohort_content_id") != job["cohort_content_id"]:
+    if job.get("cohort_content_id") is not None and dict(catalog.metadata).get("cohort_content_id") != job["cohort_content_id"]:
         raise ValueError("Preserved input catalog belongs to a different cohort content")
     if catalog.tumor_id != job["cell_id"]:
         raise ValueError("Preserved input catalog belongs to another cell")
     acquisition = _read(attempt / "acquisition.json")
+    if not isinstance(acquisition, Mapping):
+        raise TypeError("Preserved acquisition must be a JSON object")
     if acquisition.get("id", acquisition.get("acquisition_id")) != job["acquisition"]["id"]:
         raise ValueError("Preserved acquisition differs from the selected job")
     if "history_id" in acquisition and acquisition["history_id"] != history.history_id:
@@ -128,13 +132,16 @@ def _load_evidence(root, cell):
         if key in acquisition and not np.array_equal(np.asarray(acquisition[key]), getattr(catalog, attribute)):
             raise ValueError("Preserved acquisition and input catalog disagree on " + key)
     paired = _configuration(attempt)
+    if not isinstance(paired, Mapping):
+        raise TypeError("Preserved paired inference must be a JSON object")
     if tuple(paired.get("original_mutation_ids", ())) != catalog.mutation_ids or tuple(paired.get("region_ids", ())) != catalog.region_ids:
         raise ValueError("Preserved paired inference has different original axes")
     manifest = paired.get("run_manifest")
     validate_run_manifest(manifest, tumor_id=catalog.tumor_id, biological_identity=catalog.biological_identity)
     if manifest["input_identity"].get("original_catalog_identity") != content_hash(catalog.to_dict()):
         raise ValueError("Preserved paired inference belongs to a different input catalog")
-    return history, catalog, paired, acquisition
+    truth_link = validate_history_acquisition_link(history, acquisition, catalog, history_manifest=history_manifest)
+    return history, catalog, paired, acquisition, truth_link
 
 
 def unavailable_evaluation(job, status, *, evaluation_config, error=None,
@@ -241,21 +248,32 @@ def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missi
         original_evaluable_count=count, error=error)
 
 
-
 def reevaluate_cell(root, cell, evaluation_config):
     """Derive a new record solely from the selected attempt's saved evidence."""
     from .evaluation import evaluate
     root = Path(root).resolve()
     job = cell["job"]
+    truth_link = None
     try:
-        history, catalog, paired, acquisition = _load_evidence(root, cell)
-        value = evaluate(history, catalog, paired, acquisition=acquisition, evaluation_config=evaluation_config)
-        value.update(cell_id=job["cell_id"], history_id=job["history_id"], family=job["family"],
-            acquisition_id=job["acquisition"]["id"], acquisition=job["acquisition"], phase=job["phase"], job=job,
-            status="derived_from_preserved_evidence")
+        history, catalog, paired, acquisition, truth_link = _load_evidence(root, cell)
+        qualification = truth_link["status"]
+        if qualification in ("conflicting_truth", "missing_truth_evidence"):
+            value = placeholder_for_cell(root, cell, evaluation_config, evidence_state=qualification,
+                error=dict(type="TruthEvidenceError", message=truth_link["reason"]))
+        else:
+            value = evaluate(history, catalog, paired, acquisition=acquisition, evaluation_config=evaluation_config,
+                             truth_qualification=qualification)
+            value.update(cell_id=job["cell_id"], history_id=job["history_id"], family=job["family"],
+                acquisition_id=job["acquisition"]["id"], acquisition=job["acquisition"], phase=job["phase"], job=job,
+                status="derived_from_preserved_evidence")
     except (OSError, ValueError, KeyError, TypeError, AssertionError, zipfile.BadZipFile) as error:
-        value = unavailable_evaluation(job, "unavailable_derived_evidence", evaluation_config=evaluation_config,
-                                       error=dict(type=type(error).__name__, message=str(error)))
+        qualification = ("conflicting_truth" if isinstance(error, (ValueError, AssertionError))
+                         else "missing_truth_evidence")
+        value = placeholder_for_cell(root, cell, evaluation_config, evidence_state=qualification,
+                                     error=dict(type=type(error).__name__, message=str(error)))
+    value["truth_qualification"] = qualification
+    if truth_link is not None:
+        value["truth_link"] = truth_link
     value["derivation"] = dict(implementation_version=__version__, source_study=str(root),
         selected_attempt=cell.get("attempt"), source_implementation_version=cell.get("implementation_version"),
         source_protocol_version=cell.get("protocol_version"), inference_decisions_preserved=True,

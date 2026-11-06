@@ -213,8 +213,15 @@ def _run_cell(task):
     started = time.perf_counter()
     save_json(attempt / "job.json", job)
     objectives, results, costs, execution_failures = [], [], [], []
+    original_evaluable_count, execution_phase = None, "history"
     try:
+        from .biology import history_content_id
+        from .acquisition import validate_history_acquisition_link
         history = _history(job)
+        history_manifest = read_json(root / "histories" / job["history_id"] / "history_manifest.json")
+        if history_manifest.get("history_content_id") != history_content_id(history):
+            raise ValueError("Generated history differs from its prepared history manifest")
+        execution_phase = "acquisition"
         acquisition = job["acquisition"]
         frame = _acquire(job, history)
         frame.attrs["acquisition"].update(id=acquisition["id"], panel=job["phase"])
@@ -223,6 +230,13 @@ def _run_cell(task):
         write_tumor_txt(input_path, frame, metadata)
         save_json(attempt / "acquisition.json", frame.attrs.get("acquisition", {}))
         catalog = load_original_catalog(input_path)
+        truth_link = validate_history_acquisition_link(history, frame.attrs["acquisition"], catalog,
+                                                       history_manifest=history_manifest)
+        if truth_link["status"] != "verified_history_binding":
+            raise ValueError("Live history/acquisition linkage is not verified: " + str(truth_link))
+        original_evaluable_count = int((np.isfinite(history.phi).all(axis=1)
+            & (catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)).any(axis=1)).sum())
+        execution_phase = "before_inference"
         from CliPP2.config import WorkflowConfig
         configurations = task.get("execution_configs") or [asdict(workflow_config(c, p)) for c, p in
             ([(c, .80) for c in CONTRIBUTOR_GRID] if job["phase"] == "development"
@@ -237,6 +251,7 @@ def _run_cell(task):
                 temporary = attempt / ".progress.json.tmp"
                 temporary.write_text(json.dumps(json_value(payload), allow_nan=False))
                 os.replace(temporary, attempt / "progress.json")
+            execution_phase = "paired_inference"
             experiment = run_paired_experiment(input_path, attempt / f"configuration-{index+1}", config,
                 accepted_stage_one=first, accepted_uncapped_stage_two=second, progress_callback=progress,
                 run_manifest_id=task.get("run_manifest_id"))
@@ -245,8 +260,9 @@ def _run_cell(task):
             save_json(attempt / f"cost-ledger-{index+1}.json", experiment["cost_ledger"])
             first = first or experiment.get("stage_one")
             second = second or experiment.get("arms", {}).get("B", {}).get("stage_two")
+            execution_phase = "evaluation"
             evaluation = evaluate(history, catalog, experiment, acquisition=frame.attrs.get("acquisition"),
-                                  evaluation_config=evaluation_config)
+                                  evaluation_config=evaluation_config, truth_qualification=truth_link["status"])
             evaluation.update(cell_id=job["cell_id"], history_id=job["history_id"], family=job["family"],
                               acquisition_id=acquisition["id"], acquisition=acquisition, phase=job["phase"], job=job)
             save_json(attempt / f"evaluation-{index+1}.json", evaluation)
@@ -275,6 +291,8 @@ def _run_cell(task):
         execution_failures.append(dict(configuration_index=None, arm=None, failed_stage="worker",
             error_type=type(exc).__name__, error=str(exc)))
     value["execution_failures"] = execution_failures
+    value["original_evaluable_count"] = original_evaluable_count
+    value["execution_phase"] = execution_phase
     value["execution_configs"] = task.get("execution_configs")
     value["evaluation_config"] = evaluation_config
     value["protocol_version"] = PROTOCOL_VERSION
@@ -289,6 +307,7 @@ def _run_cell(task):
 
 
 def _prepare_histories(root, job_list):
+    from .biology import History, history_content_id
     seen = set()
     for job in job_list:
         if job["history_id"] in seen:
@@ -301,10 +320,13 @@ def _prepare_histories(root, job_list):
             expected["cohort_content_id"] = job["cohort_content_id"]
         if (directory / "history_manifest.json").exists():
             existing = read_json(directory / "history_manifest.json")
+            preserved = History.from_dict(read_json(directory / "history.json"))
+            expected["history_content_id"] = history_content_id(preserved)
             if existing != expected:
                 raise ValueError("Resume physical history differs")
             continue
         history = _history(job)
+        expected["history_content_id"] = history_content_id(history)
         directory.mkdir(parents=True, exist_ok=True)
         history.write_truth(directory)
         save_json(directory / "history_manifest.json", expected)

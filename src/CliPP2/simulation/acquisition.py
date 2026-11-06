@@ -1,10 +1,109 @@
 """Paired sequencing acquisitions with biological truth separate from supplied inputs."""
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import numpy as np
 import pandas as pd
 
-from .biology import History
+from .biology import History, history_content_id
+
+TRUTH_PROBABILITY_ATOL = 1e-12
+
+
+def validate_history_acquisition_link(history, acquisition, catalog, *, history_manifest=None):
+    """Check biological truth separately from deliberately perturbed fit inputs.
+
+    Legacy probability consistency cannot distinguish multiplicity/CCF aliases.
+    Only retained, matching history links in the acquisition and inference input
+    qualify exact binding; a supplied history manifest must carry that link too.
+    """
+    identity = history_content_id(history)
+    catalog_metadata = dict(catalog.metadata)
+    links = dict(acquisition=acquisition.get('history_content_id') if isinstance(acquisition, Mapping) else None,
+                 catalog=catalog_metadata.get('history_content_id'))
+    if history_manifest is not None:
+        links['history_manifest'] = (history_manifest.get('history_content_id')
+                                     if isinstance(history_manifest, Mapping) else None)
+
+    def result(status, reason):
+        return dict(status=status, history_content_id=identity, retained_links=links,
+                    primary_aggregate_eligible=status == 'verified_history_binding',
+                    probability_atol=TRUTH_PROBABILITY_ATOL, probability_rtol=0., reason=reason)
+
+    if not isinstance(acquisition, Mapping):
+        return result('missing_truth_evidence', 'Acquisition truth must be a JSON object')
+    if history_manifest is not None and not isinstance(history_manifest, Mapping):
+        return result('missing_truth_evidence', 'History manifest must be a JSON object')
+    try:
+        history.validate()
+        if history.mutation_ids != catalog.mutation_ids or history.region_ids != catalog.region_ids:
+            return result('conflicting_truth', 'History and inference input axes differ')
+        for name, expected in (('mutation_ids', history.mutation_ids), ('region_ids', history.region_ids)):
+            if name in acquisition and tuple(acquisition[name]) != expected:
+                return result('conflicting_truth', 'Acquisition ' + name + ' differ from history')
+        for record in (acquisition, catalog_metadata):
+            if record.get('history_id') is not None and record['history_id'] != history.history_id:
+                return result('conflicting_truth', 'Retained acquisition/input history identity differs')
+        if any(value is not None and (not isinstance(value, str) or value != identity)
+               for value in links.values()):
+            return result('conflicting_truth', 'Retained history content identity differs')
+        if acquisition.get('schema') not in ('clipp2.simulation.acquisition.v1',
+                                             'clipp2.simulation.cohort-acquisition.v1'):
+            return result('missing_truth_evidence', 'Missing or unsupported acquisition truth schema')
+        required = ('true_purity', 'normal_cn', 'true_probability', 'positive_carrier',
+                    'biological_truth_available')
+        if any(name not in acquisition for name in required):
+            return result('missing_truth_evidence', 'Acquisition lacks required biological truth fields')
+        shape = history.phi.shape
+
+        def array(name, dtype=float):
+            value = np.asarray(acquisition[name], dtype=dtype)
+            if value.shape != shape:
+                raise ValueError('Acquisition truth field ' + name + ' has different axes')
+            return value
+
+        rho, normal, probability = (array(name) for name in ('true_purity', 'normal_cn', 'true_probability'))
+        if (not np.isfinite(rho).all() or np.any((rho <= 0) | (rho > 1))
+                or not np.isfinite(normal).all() or np.any(normal < 0)
+                or not np.isfinite(probability).all() or np.any((probability < 0) | (probability > 1))):
+            return result('conflicting_truth', 'Invalid true purity, normal CN, or biological probability')
+        for name in ('positive_carrier', 'biological_truth_available'):
+            value = array(name)
+            if not np.isin(value, (0, 1)).all():
+                return result('conflicting_truth', 'Invalid biological truth mask ' + name)
+        if not array('biological_truth_available', bool).all():
+            return result('missing_truth_evidence', 'Acquisition does not establish biological truth for every pair')
+        positive = history.phi > 0
+        if not np.array_equal(array('positive_carrier', bool), positive):
+            return result('conflicting_truth', 'Acquisition positive-carrier truth differs')
+        multiplicity = history.multiplicity
+        if (not np.isfinite(multiplicity[positive]).all()
+                or np.any(multiplicity[positive] < 1)
+                or np.any(multiplicity[positive] != np.floor(multiplicity[positive]))):
+            return result('conflicting_truth', 'Positive carriers require finite integer multiplicity')
+        for name, expected in (('true_phi', history.phi), ('true_multiplicity', multiplicity),
+                ('true_major_cn', history.major_cn), ('true_minor_cn', history.minor_cn),
+                ('true_normal_cn', normal)):
+            if name in acquisition and not np.allclose(array(name), expected, atol=TRUTH_PROBABILITY_ATOL,
+                                                       rtol=0, equal_nan=True):
+                return result('conflicting_truth', 'Acquisition biological field differs: ' + name)
+        denominator = (1-rho)*normal + rho*(history.major_cn+history.minor_cn)
+        if np.any(denominator <= 0):
+            return result('conflicting_truth', 'Biological probability has a nonpositive denominator')
+        burden = np.zeros(shape)
+        burden[positive] = multiplicity[positive]*history.phi[positive]
+        reconstructed = rho*burden/denominator
+        if not np.allclose(reconstructed, probability, atol=TRUTH_PROBABILITY_ATOL, rtol=0):
+            return result('conflicting_truth', 'Saved physical history disagrees with acquisition true_probability')
+    except (TypeError, ValueError, KeyError, AssertionError) as error:
+        return result('conflicting_truth', str(error))
+    if all(value == identity for value in links.values()):
+        return result('verified_history_binding', 'Exact retained history links and biological probability agree')
+    if any(value is not None for value in links.values()):
+        return result('missing_truth_evidence', 'History link is present in only part of the retained evidence')
+    return result('legacy_consistent_unbound',
+                  'Biological probability agrees; multiplicity/CCF aliases prevent proof of exact historical association')
 
 
 def _regional(value, regions, name):
@@ -120,7 +219,10 @@ def acquire(history: History, seed, purity=.8, depth=100, *, missing_rate=0., ze
         for i, mutation in enumerate(history.mutation_ids) for j, region in enumerate(history.region_ids)]
     frame = pd.DataFrame(records)
     eligible = major <= max_major_cn
+    identity = history_content_id(history)
     attrs = dict(schema='clipp2.simulation.acquisition.v1', seed=int(seed),
+        history_id=history.history_id, history_content_id=identity,
+        mutation_ids=history.mutation_ids, region_ids=history.region_ids,
         true_purity=np.broadcast_to(rho, (n, r)).copy(), normal_cn=normal,
         true_probability=biological_probability, read_mean_probability=mean_probability,
         sampled_probability=sampled_probability, supplied_purity=np.broadcast_to(supplied_purity, (n, r)).copy(),
@@ -134,6 +236,7 @@ def acquire(history: History, seed, purity=.8, depth=100, *, missing_rate=0., ze
         settings=dict(purity=rho.tolist(), depth=mean_depth.tolist(), missing_rate=missing_rate,
                       zero_depth_rate=zero_depth_rate, perturbation=options))
     frame.attrs['acquisition'] = attrs
-    frame.attrs['metadata'] = dict(tumor_id=history.history_id, genome_build='synthetic_atomic_intervals',
+    frame.attrs['metadata'] = dict(tumor_id=history.history_id, history_id=history.history_id,
+        history_content_id=identity, genome_build='synthetic_atomic_intervals',
         coordinate_system='1-based-inclusive', mutation_key_convention='simulation_somatic_snv_id')
     return frame
