@@ -500,6 +500,24 @@ def execute(root, contract, *, resume=False, retry_failed=False):
         return _execute(root, contract, resume=resume, retry_failed=retry_failed)
 
 
+def _freeze_main_roster(root, contract, allocation):
+    """Freeze exact main-cell weights before development or main submission."""
+    count = allocation.get("main_replicates_per_variant") or allocation["main_histories_per_family"]
+    payload = dict(schema="clipp2.simulation-roster.v1", families=contract["families"],
+                   jobs=list(jobs(contract, "main", count)))
+    if len(payload["jobs"]) != allocation["planned_main_datasets"]:
+        raise ValueError("Main roster size differs from frozen allocation")
+    record = dict(payload, roster_id=content_hash(payload))
+    path = root / "main_roster.json"
+    if path.exists():
+        if read_json(path) != record:
+            raise ValueError("Main roster differs from frozen allocation")
+    else:
+        save_json(path, record)
+    return record["jobs"]
+
+
+
 def _execute(root, contract, *, resume=False, retry_failed=False):
     root = Path(root).resolve()
     if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v4"
@@ -597,6 +615,7 @@ def _execute(root, contract, *, resume=False, retry_failed=False):
         allocation["timing_projection"] = "Scale each pilot to three fits when a valid branch skipped fits; then apply the frozen safety factor"
         save_json(allocation_path, allocation)
         print(json.dumps(dict(event="allocation_frozen", allocation=allocation)), flush=True)
+    main_jobs = _freeze_main_roster(root, contract, allocation)
     development_path = root / "threshold_development.json"
     if development_path.exists():
         development = read_json(development_path)
@@ -621,8 +640,7 @@ def _execute(root, contract, *, resume=False, retry_failed=False):
             workflow_config=asdict(resolve_config(contract, development["selected"]["contributor"],
                                                  development["selected"]["posterior"])),
             frozen_before_main_generation=True))
-    main_count = allocation.get("main_replicates_per_variant") or allocation["main_histories_per_family"]
-    run_jobs(root, jobs(contract, "main", main_count),
+    run_jobs(root, main_jobs,
              workers=workers, selected=development["selected"], contract=contract, retry_failed=retry_failed)
     run_optional_panels(root, contract, development["selected"], workers)
     return report(root)
@@ -683,10 +701,10 @@ def run_optional_panels(root, contract, selected, workers):
 
 def report(root, *, evaluation_config=None, report_dir=None):
     """Render cached metrics or explicitly reevaluate preserved inference evidence."""
-    from .evaluation import aggregate, normalize_evaluation_config
+    from .evaluation import aggregate, normalize_evaluation_config, evaluation_definition
     from .figures import make_figures
     from .runtime import recorded_costs, qualification_costs
-    from .reporting import preserved_jobs, reevaluate_cell, unavailable_evaluation
+    from .reporting import planned_roster, reevaluate_cell, placeholder_for_cell
     root = Path(root).resolve()
     contract = read_json(root / "study_contract.json")
     derive = evaluation_config is not None
@@ -699,44 +717,41 @@ def report(root, *, evaluation_config=None, report_dir=None):
     main = [cell for cell in cells if cell["job"]["phase"] == "main"]
     allocation_path = root / "allocation.json"
     allocation = read_json(allocation_path) if allocation_path.exists() else {}
-    completed_ids = {cell["job"]["cell_id"] for cell in main}
-    submitted = preserved_jobs(root)
-    # Cached reports for a current, bound contract retain the preexisting
-    # planned-population behavior. Offline derivation never reopens a cohort.
-    if not derive and allocation and (not contract.get("cohort") or contract["cohort"].get("content_id")):
-        count = allocation.get("main_replicates_per_variant") or allocation["main_histories_per_family"]
-        submitted = list(jobs(contract, "main", count))
-    for job in submitted:
-        if job["phase"] == "main" and job["cell_id"] not in completed_ids:
-            main.append(dict(job=job, status="not_executed", evaluations=[], cost_ledgers=[],
-                             elapsed_seconds=0., peak_resident_bytes=0, output_bytes=0))
+    roster = planned_roster(root, contract, allocation, cells)
+    completed = {cell["job"]["cell_id"]: cell for cell in main}
+    main = [completed.get(job["cell_id"], dict(job=job, status="not_executed", evaluations=[], cost_ledgers=[],
+                elapsed_seconds=0., peak_resident_bytes=0, output_bytes=0)) for job in roster["jobs"]]
+    frozen_evaluation = contract.get("evaluation", {})
+    if not derive:
+        evaluation_config = normalize_evaluation_config({key: frozen_evaluation[key]
+            for key in ("reference_match_atol", "reference_distance") if key in frozen_evaluation})
     evaluations = []
-    cached = {cell["job"]["cell_id"]: read_json(root / cell["evaluations"][0])
-              for cell in main if cell.get("evaluations")} if not derive else {}
-    cached_v2 = next((value for value in cached.values() if value.get("schema") == "clipp2.simulation.evaluation.v2"), None)
     for cell in main:
         if derive:
-            evaluations.append(reevaluate_cell(root, cell, evaluation_config))
-        elif cell["job"]["cell_id"] in cached:
-            evaluations.append(cached[cell["job"]["cell_id"]])
-        elif cached_v2 is not None:
-            evaluations.append(unavailable_evaluation(cell["job"], cell["status"],
-                evaluation_config=cached_v2["evaluation_config"]))
+            value = reevaluate_cell(root, cell, evaluation_config)
         else:
-            job = cell["job"]
-            evaluations.append(dict(schema="clipp2.simulation.evaluation.v1", cell_id=job["cell_id"],
-                history_id=job["history_id"], family=job["family"], acquisition_id=job["acquisition"]["id"],
-                acquisition=job["acquisition"], phase="main", applicability=[dict(arm=a, available=False,
-                    status=cell["status"], planned=True) for a in ("A", "B", "C", "B3", "C3")],
-                metrics=[dict(name=name, arm=a, view="all_planned_cells", stratum="all", value=value,
-                    numerator=value, denominator=1, status="available")
-                    for a in ("A", "B", "C", "B3", "C3")
-                    for name, value in (("analysis_failure", int(cell["status"] != "not_executed")), ("analysis_available", 0))]
-                    +[dict(name="correct_per_original_evaluable", arm=a, view="", stratum="all", value=0.,
-                           numerator=0, denominator=None, status="unavailable_no_correct_decision_credit")
-                      for a in ("B", "C", "B3", "C3")],
-                mutations=[], calibration=[], cap_audit=[], stage_three_containment=[], information=[]))
-    summary = aggregate(evaluations)
+            try:
+                value = read_json(root / cell["evaluations"][0])
+            except (OSError, ValueError, IndexError, KeyError):
+                value = placeholder_for_cell(root, cell, evaluation_config)
+                # Missing cached records retain the frozen study's definition.
+                # Historical files are never relabeled as newly evaluated v3.
+                version = tuple(int(part) for part in contract.get("implementation_version", "0.0.0").split(".")[:3])
+                if version < (1, 2, 3):
+                    schema = "clipp2.simulation.evaluation.v2" if version >= (1, 2, 2) else "clipp2.simulation.evaluation.v1"
+                    value["schema"] = schema
+                    if schema.endswith(".v2"):
+                        from .evaluation import legacy_evaluation_definition
+                        definition = legacy_evaluation_definition(2, evaluation_config)
+                        value.update(evaluation_definition=definition, evaluation_definition_id=content_hash(definition))
+        evaluations.append(value)
+    summary = aggregate(evaluations, planned_roster=roster["jobs"], roster_complete=roster["complete"],
+                        families=contract["families"])
+    if not evaluations:
+        definition = evaluation_definition(evaluation_config)
+        summary.update(evaluation_definition=definition, evaluation_definition_id=content_hash(definition))
+    summary.update(roster_status=roster["status"], roster_id=roster["roster_id"],
+                   retained_planned_cells=len(roster["jobs"]))
     costs = recorded_costs(root)
     planned = allocation.get("planned_main_datasets", len(main))
     summary.update(planned_main_cells=planned, worker_failures=sum(cell["status"] == "execution_failed" for cell in main),
@@ -746,6 +761,14 @@ def report(root, *, evaluation_config=None, report_dir=None):
                    operation_costs=costs, qualification_costs=qualification_costs(root),
                    report_mode="offline_reevaluation" if derive else "cached_metrics",
                    derived_evidence_unavailable=sum(e.get("status") == "unavailable_derived_evidence" for e in evaluations))
+    summary["population_counts"] = [dict(arm=arm, planned=planned,
+        executed=sum(cell["status"] != "not_executed" for cell in main),
+        scientifically_applicable=sum(row.get("scientifically_applicable") == 1
+            for row in summary.get("availability", []) if row["arm"] == arm),
+        evaluated=sum(row.get("evaluation_available") == 1
+            for row in summary.get("availability", []) if row["arm"] == arm),
+        unavailable_derived=sum(e.get("status") == "unavailable_derived_evidence" for e in evaluations))
+        for arm in ("A", "B", "C", "B3", "C3")]
     report_dir = (Path(report_dir).resolve() if report_dir is not None else
                   root / "reports" / f"report-{len(list((root / 'reports').glob('report-*')))+1:03d}")
     if report_dir == root or (report_dir.is_relative_to(root) and report_dir.relative_to(root).parts[0] != "reports"):
@@ -772,6 +795,10 @@ def report(root, *, evaluation_config=None, report_dir=None):
     audits = [dict(cell_id=e["cell_id"], **row) for e in evaluations for row in e.get("cap_audit", ())]
     pd.DataFrame(audits, columns=None if audits else ["cell_id", "mutation_id", "region_id"]).to_csv(
         report_dir / "bound_audit.tsv", sep="\t", index=False, na_rep="NA")
+    transitions = [dict(cell_id=e["cell_id"], arm=arm, origin=origin, **row) for e in evaluations
+        for arm, strata in e.get("detailed_membership_transitions", {}).items()
+        for origin, rows in strata.items() for row in rows]
+    pd.DataFrame(transitions).to_csv(report_dir / "detailed_transitions.tsv", sep="\t", index=False, na_rep="NA")
     pd.DataFrame([dict(cell_id=c["job"]["cell_id"], phase=c["job"]["phase"], family=c["job"]["family"],
                        status=c["status"], elapsed_seconds=c["elapsed_seconds"],
                        peak_resident_bytes=c["peak_resident_bytes"], output_bytes=c["output_bytes"])
@@ -798,14 +825,33 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
         "<p>The allocation below was frozen from the timing and disk pilot before final generation. Repeated acquisitions share physical histories; uncertainty resamples histories and carries all paired arms together. A reduced cohort does not establish rare-event safety or noninferiority.</p>",
         "<h2>Frozen allocation and settings</h2><pre>"+html.escape(json.dumps(dict(allocation=allocation, selected=selected), indent=2))+"</pre>",
         "<h2>Applicability and scientific results</h2><p>Unknown and unavailable estimates remain explicit. Exact aliases and absent candidate explanations cannot be resolved by restoring integer support. Descriptive screens are not calibrated tests.</p>"]
-    selected_metrics = {"correct_per_original_evaluable", "acceptance_coverage", "correct_resolution",
-        "wrong_per_evaluable", "selective_error", "false_merge_nonclonal_rate", "stage2_truth_exclusion",
-        "declared_source_truth_cap_exclusion", "ccf_rmse", "analysis_available", "analysis_failure"}
+    text.append("<h2>Evaluation definition and population</h2><pre>"+html.escape(json.dumps(dict(
+        definition=summary.get("evaluation_definition"), report_mode=summary["report_mode"],
+        roster_status=summary["roster_status"]), indent=2))+"</pre>")
+    text.append(pd.DataFrame(summary["population_counts"]).to_html(index=False, na_rep="NA"))
+    selected_metrics = {"binary_correct_per_original_evaluable", "binary_correct_resolution", "binary_selective_error",
+        "mapped_correct_resolution", "mapped_selective_error", "unmapped_acceptance_fraction",
+        "geometric_correct_reference_resolution", "analysis_available", "analysis_failure", "evaluation_available"}
     rows = [dict(endpoint=row["name"], arm=row["arm"], view=row["view"], stratum=row["stratum"],
-                 mean=row["equal_family_mean"], lower_95=row["lower_95"], upper_95=row["upper_95"],
+                 scope=row.get("population_scope"), planned=row.get("planned_population_estimate"),
+                 planned_status=row.get("planned_population_status"),
+                 available_case=row.get("available_case_estimate"),
+                 planned_lower_95=row.get("planned_lower_95"), planned_upper_95=row.get("planned_upper_95"),
+                 available_case_lower_95=row.get("available_case_lower_95"), available_case_upper_95=row.get("available_case_upper_95"),
                  available_cells=row["available_cells"], status=row["status"])
             for row in summary.get("metrics", ()) if row["name"] in selected_metrics]
     text.append(pd.DataFrame(rows).to_html(index=False, na_rep="NA", float_format=lambda x: f"{x:.4g}"))
+    transitions = [dict(arm=arm, origin=origin, **row) for e in evaluations
+        for arm, origins in e.get("detailed_membership_transitions", {}).items()
+        for origin, rows in origins.items() for row in rows if row["count"]]
+    text.append("<h2>Detailed membership transitions by target origin</h2>"
+        "<p>Mc: mapped correct; Mw: mapped wrong; U: accepted but unmapped; unresolved: no accepted label. "
+        "Counts below describe retained evaluated evidence; they do not fill missing planned cells.</p>")
+    if transitions:
+        grouped = pd.DataFrame(transitions).groupby(["arm", "origin", "baseline_state", "final_state"])["count"].sum().reset_index()
+        text.append(grouped.to_html(index=False))
+    else:
+        text.append("<p>Detailed transitions are unavailable.</p>")
     for figure in figures:
         filename = Path(figure).name
         if Path(filename).suffix.lower() == ".png":

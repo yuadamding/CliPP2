@@ -1,7 +1,8 @@
 # Simulation evaluation definitions
 
-Implementation 1.2.2 keeps scientific Protocol 2.2 and the frozen development
-objective. Evaluation v2 adds separate detailed-membership and geometric endpoints.
+Implementation 1.2.3 keeps scientific Protocol 2.2 and the frozen development
+objective. Evaluation v3 preserves planned populations, requires qualified truth
+for primary science, and uses consistent detailed membership transitions.
 It does not refit, reassign, select thresholds, or change historical caps.
 
 The existing `correct_resolution` and `selective_error` fields remain binary
@@ -9,6 +10,38 @@ clonality endpoints, with explicit `binary_*` aliases. An accepted wrong subclon
 can have the correct clonal/nonclonal status. The development constraint of
 empirical error at most `.05` is neither a population error guarantee nor a
 bound on detailed subclone errors.
+
+## Planned populations and missing evidence
+
+The frozen roster supplies family, physical-history, and acquisition identities.
+Each planned cell keeps weight `1 / (families × histories_in_family ×
+acquisitions_in_history)`. Missing acquisitions or histories cannot disappear from
+this denominator. A total planned-cell count alone cannot reconstruct the weights.
+
+For binary correct decisions over the original evaluable mutation population,
+`planned_population_estimate` uses every frozen weight. A known inference failure
+or scientific rejection earns zero only when retained evidence establishes no
+decisions and a positive original evaluable denominator. One equally weighted
+success scoring one and one such failure therefore average to `.5`.
+
+Missing or conflicting evaluation evidence is unknown, not a zero or an inferred
+execution failure. An unknown planned cell makes the planned estimate null with
+`incomplete_evidence`; an unestablished roster gives `incomplete_planned_roster`.
+A separate `available_case_estimate` explicitly averages the qualified surviving
+cases. Its interval is never shown as an interval for the planned cohort.
+Conditional endpoints, including mapped selective error and geometric acceptance
+within the selected target population, report their available-case population.
+
+Records retain missingness by family, history, acquisition and arm, together with
+planned, executed, scientifically applicable, evaluated and unavailable-derived
+counts. Partial arm failures preserve the other arm's results. Entirely unavailable
+current studies still use their frozen current evaluation definition.
+
+Primary truth-dependent estimates require `verified_history_binding`. Reconciled
+but unbound historical truth is `legacy_consistent_unbound`, reported only as
+`legacy_consistent_available_case_estimate`. Conflicting or missing truth remains
+unavailable. Operational execution/evaluation counts do not require biological
+truth. An arbitrary `truth_required: false` cannot bypass scientific qualification.
 
 ## Detailed membership
 
@@ -31,6 +64,14 @@ For evaluable population size `P` and accepted count `A`:
 Partition agreement, pair precision/recall, center errors, multiplicity errors,
 and coverage remain available. The unchanged-F view makes errors outside the
 reassessment population visible.
+
+Baseline and final membership use the same four-state classifier. Per-mutation
+records contain `baseline_detailed_membership_status`,
+`detailed_membership_status`, and `detailed_membership_transition`. A 4×4 cross-tab
+is retained separately for each target origin. `Mw->U` is unmapped acceptance,
+not a persisted mapped error; `U->Mc` is newly mapped-correct without proof that
+the baseline was wrong. Binary transitions are unchanged. The old diagnostic is
+explicitly named `legacy_multiclass_transition_fraction_unmapped_as_error`.
 
 ## Geometry and availability
 
@@ -81,7 +122,7 @@ by availability and target origin. The binary recovery ceiling remains
 
 ```sh
 clipp2-simulate report OLD_STUDY \
-  --evaluation-config evaluation-v2.json \
+  --evaluation-config evaluation-v3.json \
   --report-dir NEW_REPORT_DIRECTORY
 ```
 
@@ -91,7 +132,9 @@ reported as unavailable. Truth and counts are not regenerated from a changed
 source path. Frozen development selection and original outputs stay intact.
 Without a new evaluation configuration, cached-report behavior is retained.
 
-Evaluation and aggregate v2 records contain the complete endpoint definition,
-metric, tolerance, matching policy, and a semantic definition identity. Aggregation
+Evaluation, definition and aggregate v3 records contain the endpoint, population
+scope, missing-evidence treatment, truth-qualification policy, metric, tolerance,
+matching policy, and semantic definition identity. Distance configuration remains
+v1; old v1/v2 evaluation files keep their original definitions. Aggregation
 rejects incompatible definitions rather than silently mixing L2, L∞, different
 tolerances, or legacy and revised endpoint interpretations.

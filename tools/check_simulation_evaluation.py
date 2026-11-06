@@ -69,8 +69,9 @@ def _membership_fixture():
 
 def _new_endpoint_checks():
     h, catalog, paired = _membership_fixture()
-    report = evaluate(h, catalog, paired, evaluation_config=dict(reference_match_atol=.02))
-    assert report['schema'] == 'clipp2.simulation.evaluation.v2'
+    report = evaluate(h, catalog, paired, evaluation_config=dict(reference_match_atol=.02),
+                      truth_qualification='verified_history_binding')
+    assert report['schema'] == 'clipp2.simulation.evaluation.v3'
     assert report['run_manifest_id'] == paired['run_manifest_id']
     values = {row['name']: row['value'] for row in report['metrics']
               if row['arm'] == 'C3' and row['view'] == '' and row['stratum'] == 'all'}
@@ -88,6 +89,15 @@ def _new_endpoint_checks():
     assert rows['t_wrong']['binary_clonality_correct'] is True
     assert rows['t_wrong']['detailed_membership_status'] == 'Mw'
     assert rows['t_unmapped']['detailed_membership_correct'] is None
+    assert rows['t_unmapped']['baseline_detailed_membership_status'] == 'Mw'
+    assert rows['t_unmapped']['detailed_membership_transition'] == 'Mw->U'
+    transitions = report['detailed_membership_transitions']['C3']
+    origin1 = {(row['baseline_state'], row['final_state']): row['count'] for row in transitions['stage1_clonal_recheck']}
+    origin2 = {(row['baseline_state'], row['final_state']): row['count'] for row in transitions['stage2_near_clonal_recheck']}
+    assert origin1['Mw', 'U'] == 1 and origin1['Mw', 'Mw'] == 1
+    assert origin2['Mw', 'Mw'] == 1
+    assert not any(row['name'] == 'multiclass_transition_fraction' for row in report['metrics'])
+    assert any(row['name'] == 'legacy_multiclass_transition_fraction_unmapped_as_error' for row in report['metrics'])
     assert rows['t_correct']['geometric_reference_available'] is True
     assert rows['t_correct']['usable_reference_available'] is True  # Failed region unobserved.
     assert rows['t_correct']['geometric_correct_reference_acceptance'] is True
@@ -102,6 +112,101 @@ def _new_endpoint_checks():
     assert all(row['geometric_reference_available'] is None for row in null['mutations'])
     assert all(row['usable_availability_status'] == 'unassessed_no_declared_tolerance' for row in null['mutations'])
     return report
+
+
+def _planned_population_checks():
+    definition = evaluation_definition()
+    roster = [dict(cell_id=f'h{i}-A1', family='S01', history_id=f'h{i}', acquisition=dict(id='A1')) for i in range(2)]
+
+    def cell(job, score, *, failure=False, evaluated=True, truth='verified_history_binding', denominator=10):
+        metrics = []
+        for arm in ('B3', 'C3'):
+            metrics.append(dict(name='binary_correct_per_original_evaluable', arm=arm, view='', stratum='all',
+                value=score, numerator=None if score is None else score*denominator if denominator else 0,
+                denominator=denominator, truth_required=not failure,
+                status='known_no_decisions' if failure else 'unknown_evidence' if score is None else 'available'))
+            for name, value in (('analysis_available', int(not failure)), ('analysis_failure', int(failure)),
+                    ('execution_available', 1), ('execution_failure', int(failure)),
+                    ('evaluation_available', int(evaluated)), ('scientifically_applicable', int(not failure))):
+                metrics.append(dict(name=name, arm=arm, view='all_planned_cells', stratum='all', value=value,
+                                    numerator=value, denominator=1, truth_required=False))
+        return dict(schema='clipp2.simulation.evaluation.v3', evaluation_definition=definition,
+            evaluation_definition_id=content_hash(definition), truth_qualification=truth,
+            cell_id=job['cell_id'], family=job['family'], history_id=job['history_id'], acquisition_id=job['acquisition']['id'],
+            original_evaluable_count=denominator, status='execution_failed' if failure else 'complete', metrics=metrics)
+
+    def summary(records, planned=roster, complete=True, families=('S01',)):
+        return aggregate(records, planned_roster=planned, roster_complete=complete,
+                         families=families, bootstrap_replicates=20, seed=4)
+
+    def endpoint(report, name='binary_correct_per_original_evaluable', arm='C3'):
+        return next(row for row in report['metrics'] if row['name'] == name and row['arm'] == arm)
+
+    success = cell(roster[0], 1.)
+    failed = cell(roster[1], 0., failure=True, evaluated=False, truth='missing_truth_evidence')
+    combined = summary([success, failed])
+    assert endpoint(combined)['planned_population_estimate'] == .5
+    assert endpoint(combined, 'analysis_available')['planned_population_estimate'] == .5
+    assert endpoint(combined, 'execution_failure')['planned_population_estimate'] == .5
+    assert endpoint(combined, 'evaluation_available')['planned_population_estimate'] == .5
+    assert sum(row['weight'] for row in combined['planned_weights']) == 1
+    unknown = cell(roster[1], None, evaluated=False)
+    missing = summary([success, unknown])
+    result = endpoint(missing)
+    assert result['planned_population_estimate'] is None and result['equal_family_mean'] is None
+    assert result['planned_population_status'] == 'incomplete_evidence' and result['available_case_estimate'] == 1
+    assert result['lower_95'] is None and result['upper_95'] is None
+    assert result['missingness'][0]['history_id'] == 'h1' and result['missingness'][0]['planned_weight'] == .5
+    # A known failure without a real original denominator cannot define a rate.
+    no_denominator = cell(roster[1], None, failure=True, evaluated=False, denominator=None)
+    assert endpoint(summary([success, no_denominator]))['planned_population_estimate'] is None
+    assert endpoint(summary([success]))['planned_population_status'] == 'incomplete_evidence'
+    acquisition_roster = [roster[0], dict(roster[0], cell_id='h0-A2', acquisition=dict(id='A2')), roster[1]]
+    missing_acquisition = summary([success, failed], planned=acquisition_roster)
+    assert endpoint(missing_acquisition)['planned_population_estimate'] is None
+    assert [row['weight'] for row in missing_acquisition['planned_weights']] == [.25, .25, .5]
+    acquisition_failure = cell(acquisition_roster[1], 0., failure=True, evaluated=False)
+    assert endpoint(summary([success, acquisition_failure, failed], planned=acquisition_roster))['planned_population_estimate'] == .25
+    other_family = dict(roster[1], family='S02')
+    missing_family = summary([success], planned=[roster[0], other_family], families=('S01', 'S02'))
+    assert endpoint(missing_family)['planned_population_estimate'] is None
+    assert endpoint(missing_family)['available_case_estimate'] == 1
+    assert endpoint(missing_family)['unavailable_families'] == ['S02']
+    partial = deepcopy(failed)
+    for row in partial['metrics']:
+        if row['arm'] == 'B3':
+            source = next(item for item in success['metrics'] if item['name'] == row['name'] and item['arm'] == 'B3')
+            row.update(source)
+    partial['truth_qualification'] = 'verified_history_binding'
+    partial_summary = summary([success, partial])
+    assert endpoint(partial_summary, arm='B3')['planned_population_estimate'] == 1
+    assert endpoint(partial_summary, arm='C3')['planned_population_estimate'] == .5
+    unavailable = summary([cell(job, None, evaluated=False, truth='missing_truth_evidence') for job in roster])
+    assert unavailable['schema'] == 'clipp2.simulation.aggregate.v3'
+    assert endpoint(unavailable)['planned_population_estimate'] is None
+    assert endpoint(unavailable, 'evaluation_available')['planned_population_estimate'] == 0
+    incomplete = summary([success, failed], complete=False)
+    assert endpoint(incomplete)['planned_population_status'] == 'incomplete_planned_roster'
+    assert endpoint(incomplete)['available_case_estimate'] == .5
+    legacy = cell(roster[1], 1., truth='legacy_consistent_unbound')
+    qualified = endpoint(summary([success, legacy]))
+    assert qualified['planned_population_estimate'] is None and qualified['available_case_estimate'] == 1
+    assert qualified['legacy_consistent_available_case_estimate'] == 1
+    assert qualified['missingness'][0]['reason'] == 'legacy_consistent_unbound'
+    spoofed = deepcopy(legacy)
+    for row in spoofed['metrics']:
+        row['truth_required'] = False
+    assert endpoint(summary([success, spoofed]))['planned_population_estimate'] is None
+    no_count = deepcopy(failed)
+    no_count['original_evaluable_count'] = None
+    assert endpoint(summary([success, no_count]))['planned_population_estimate'] is None
+    unjustified_zero = deepcopy(failed)
+    unjustified_zero['status'] = 'complete'
+    assert endpoint(summary([success, unjustified_zero]))['planned_population_estimate'] is None
+    return dict(success_plus_known_failure_retains_half_weight=True, unknown_evidence_not_zero=True,
+        missing_acquisition_history_family_explicit=True, partial_arms_preserved=True,
+        unavailable_current_definition_preserved=True, incomplete_legacy_roster_not_invented=True,
+        verified_primary_excludes_unbound_legacy=True)
 
 
 def run_checks():
@@ -223,18 +328,19 @@ def run_checks():
     for family, histories in (('S01', [(0, [0., 0.]), (1, [1.])]), ('S02', [(0, [1.]), (1, [1.])])):
         for history, values in histories:
             for acquisition, value in enumerate(values):
-                cells.append(dict(schema='clipp2.simulation.evaluation.v2',
+                cells.append(dict(schema='clipp2.simulation.evaluation.v3', truth_qualification='verified_history_binding',
                     evaluation_definition=evaluation_definition(), evaluation_definition_id=content_hash(evaluation_definition()),
                     family=family, history_id=str(history), acquisition_id=str(acquisition),
                     metrics=[dict(name='score', arm='B', value=value), dict(name='score', arm='C', value=value+.1)]))
     summary = aggregate(cells, bootstrap_replicates=100, seed=1, families=('S01', 'S02'))
-    b = next(row for row in summary['metrics'] if row['arm'] == 'B')
-    paired = next(row for row in summary['metrics'] if row['arm'] == 'C_minus_B')
+    b = next(row for row in summary['metrics'] if row['arm'] == 'B' and row['name'] == 'score')
+    paired = next(row for row in summary['metrics'] if row['arm'] == 'C_minus_B' and row['name'] == 'score')
     assert b['equal_family_mean'] == .75
     np.testing.assert_allclose([paired['equal_family_mean'], paired['lower_95'], paired['upper_95']], .1)
     incomplete = aggregate(cells, bootstrap_replicates=0)
-    assert all(row['equal_family_mean'] is None for row in incomplete['metrics'])
-    assert summary['schema'] == 'clipp2.simulation.aggregate.v2'
+    assert all(row['planned_population_estimate'] is None for row in incomplete['metrics'])
+    assert incomplete['roster_complete'] is False
+    assert summary['schema'] == 'clipp2.simulation.aggregate.v3'
     altered = deepcopy(cells[0])
     altered['evaluation_definition'] = evaluation_definition(dict(reference_match_atol=.1))
     altered['evaluation_definition_id'] = content_hash(altered['evaluation_definition'])
@@ -250,7 +356,7 @@ def run_checks():
     historical = aggregate([old], bootstrap_replicates=0, families=('S01',))
     assert historical['evaluation_definition']['reference_distance'] == 'linf'
     assert endpoint_report['recovery_reach']['recovery_ceiling'] == {'numerator': 0, 'denominator': 0}
-    report = dict(schema='clipp2.simulation.evaluation-checks.v2', full_emission=full, capped_emission=cap,
+    report = dict(schema='clipp2.simulation.evaluation-checks.v3', full_emission=full, capped_emission=cap,
         conditional_map=3, conditional_probability=probabilities[2], marginalization_reverses_profile=True,
         aliases_respect_observed_regions=True, fixed_contributor_identity=True, cap_counterexample=True,
         no_probability_renormalization=True, absent_truth_log_loss='Infinity', recovery_ceiling=True,
@@ -260,6 +366,7 @@ def run_checks():
                   exhaustive_matching_objective_cases=120, binary_objective_unchanged=True,
                   Mc_Mw_U_and_unchanged_F=True, target_specific_availability_nulls_and_quality=True,
                   full_vector_l2_and_explicit_legacy_linf=True, incompatible_definition_aggregation_rejected=True)
+    report.update(_planned_population_checks(), detailed_four_state_transitions_by_origin=True)
     json.dumps(json_safe(report), allow_nan=False)
     return json_safe(report)
 

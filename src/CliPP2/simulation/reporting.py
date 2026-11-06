@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 import zipfile
 
@@ -33,6 +34,34 @@ def preserved_jobs(root):
             if previous != job:
                 raise ValueError("Preserved job manifests disagree on a cell's identity")
     return list(result.values())
+
+
+def planned_roster(root, contract, allocation, cells):
+    """Use a frozen roster; submitted legacy jobs are only a known subset."""
+    path = Path(root) / "main_roster.json"
+    if path.exists():
+        record = _read(path)
+        payload = {key: record.get(key) for key in ("schema", "families", "jobs")}
+        jobs = record.get("jobs", [])
+        if (record.get("schema") != "clipp2.simulation-roster.v1"
+                or record.get("roster_id") != content_hash(payload)
+                or record.get("families") != contract["families"]
+                or len(jobs) != allocation.get("planned_main_datasets")
+                or len({job["cell_id"] for job in jobs}) != len(jobs)
+                or any(job["phase"] != "main" for job in jobs)):
+            raise ValueError("Frozen main roster differs from its identity or allocation")
+        lookup = {job["cell_id"]: job for job in jobs}
+        for cell in cells:
+            if cell["job"]["phase"] == "main" and lookup.get(cell["job"]["cell_id"]) != cell["job"]:
+                raise ValueError("Completed main cell differs from the frozen roster")
+        return dict(jobs=jobs, complete=True, status="frozen_roster", roster_id=record["roster_id"])
+    known = {job["cell_id"]: job for job in preserved_jobs(root) if job["phase"] == "main"}
+    for cell in cells:
+        job = cell["job"]
+        if job["phase"] == "main" and known.setdefault(job["cell_id"], job) != job:
+            raise ValueError("Completion differs from retained submitted job")
+    return dict(jobs=list(known.values()), complete=False, status="unavailable_complete_frozen_roster", roster_id=None)
+
 
 
 def _configuration(attempt, index=1):
@@ -108,19 +137,109 @@ def _load_evidence(root, cell):
     return history, catalog, paired, acquisition
 
 
-def unavailable_evaluation(job, status, *, evaluation_config, error=None):
+def unavailable_evaluation(job, status, *, evaluation_config, error=None,
+                           execution_state=None, evidence_state="missing_truth_evidence",
+                           arm_applicability=None, original_evaluable_count=None):
     """Unavailable derived evidence receives no invented scientific decisions."""
-    from .evaluation import evaluation_definition
+    from .evaluation import evaluation_definition, normalize_evaluation_config
     definition = evaluation_definition(evaluation_config)
-    # The definition helper is also used by the live evaluator; unavailable rows
-    # must participate in the same explicit aggregation definition.
-    return dict(schema="clipp2.simulation.evaluation.v2", evaluation_definition=definition,
+    arms = ({row["arm"]: row for row in arm_applicability} if isinstance(arm_applicability, (list, tuple))
+            else dict(arm_applicability or {}))
+    if original_evaluable_count is not None and (type(original_evaluable_count) is not int or original_evaluable_count < 0):
+        raise ValueError("An established original evaluable count must be a nonnegative integer")
+    metrics, applicability = [], []
+    for arm in ("A", "B", "C", "B3", "C3"):
+        state = arms.get(arm, {})
+        arm_status = state.get("status", None if execution_state == "execution_failed" else execution_state)
+        failed = arm_status in ("failed", "execution_failed")
+        executed = None if arm_status is None else arm_status != "not_executed"
+        scientifically_applicable = state.get("scientifically_applicable")
+        available = state.get("available")
+        if available is None and (failed or arm_status == "not_executed"):
+            available = False
+        for name, value in (("execution_available", executed), ("execution_failure", None if arm_status is None else failed),
+                            ("analysis_available", available), ("analysis_failure", None if arm_status is None else failed),
+                            ("evaluation_available", False), ("scientifically_applicable", scientifically_applicable)):
+            metrics.append(dict(name=name, arm=arm, view="all_planned_cells", stratum="all",
+                value=None if value is None else float(value), numerator=None if value is None else int(value),
+                denominator=1, status="available" if value is not None else "unknown_execution_evidence",
+                population_scope="planned_population", truth_required=False))
+        zero = bool(state.get("no_decisions") and original_evaluable_count and (
+            failed or state.get("scientific_rejection")))
+        if arm != "A":
+            for name in ("correct_per_original_evaluable", "binary_correct_per_original_evaluable"):
+                metrics.append(dict(name=name, arm=arm, view="", stratum="all", value=0. if zero else None,
+                    numerator=0 if zero else None, denominator=original_evaluable_count,
+                    status="known_no_decisions" if zero else "unknown_scientific_evidence",
+                    population_scope="planned_population", truth_required=not zero))
+        applicability.append(dict(arm=arm, available=available, status=arm_status or status, planned=True,
+                                  scientifically_applicable=scientifically_applicable))
+    return dict(schema="clipp2.simulation.evaluation.v3", evaluation_definition=definition,
+        evaluation_config=normalize_evaluation_config(evaluation_config), truth_qualification=evidence_state,
         evaluation_definition_id=content_hash(definition), cell_id=job["cell_id"], history_id=job["history_id"],
         family=job["family"], acquisition_id=job["acquisition"]["id"], acquisition=job["acquisition"],
-        phase=job["phase"], job=job, status=status, error=error, metrics=[], mutations=[],
+        phase=job["phase"], job=job, status=status, execution_state=execution_state,
+        original_evaluable_count=original_evaluable_count, error=error, metrics=metrics, mutations=[],
         calibration=[], cap_audit=[], stage_three_containment=[], information=[],
-        applicability=[dict(arm=arm, available=False, status=status, planned=True)
-                       for arm in ("A", "B", "C", "B3", "C3")])
+        applicability=applicability)
+
+
+def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missing_truth_evidence", error=None):
+    """Recover operational evidence without assigning unknown scientific outcomes."""
+    root, job = Path(root), cell["job"]
+    count = cell.get("original_evaluable_count")
+    arms = {}
+    # A worker exception may follow successful inference. Only explicit phases
+    # preceding accepted decisions establish arm-specific no-decision credit.
+    for failure in cell.get("execution_failures", ()):
+        arm, stage = failure.get("arm"), failure.get("failed_stage")
+        if arm is None and (stage == "stage_one" or
+                stage == "worker" and cell.get("execution_phase") == "before_inference"):
+            affected = ("A", "B", "C", "B3", "C3")
+        elif arm in ("B", "C") and stage == "stage_two":
+            affected = (arm, arm+"3")
+        elif arm in ("B", "C") and stage == "assignment":
+            affected = (arm+"3",)
+        else:
+            affected = ()
+        arms.update({name: dict(status="failed", available=False, no_decisions=True) for name in affected})
+    try:
+        attempt = _within(root, cell["attempt"])
+        if _read(attempt / "job.json") != job:
+            raise ValueError("Selected attempt job differs")
+        catalog = load_original_catalog(attempt / "input_catalog.tsv")
+        if catalog.tumor_id != job["cell_id"]:
+            raise ValueError("Original population belongs to another cell")
+        acquisition = _read(attempt / "acquisition.json")
+        if not isinstance(acquisition, Mapping):
+            raise TypeError("Preserved acquisition must be a JSON object")
+        known = np.asarray(acquisition.get("biological_truth_available"), bool)
+        if known.shape == catalog.alt_counts.shape:
+            count = int((known.all(axis=1) & (catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)).any(axis=1)).sum())
+        paired = _configuration(attempt)
+        if not isinstance(paired, Mapping):
+            raise TypeError("Preserved paired inference must be a JSON object")
+        validate_run_manifest(paired.get("run_manifest"), tumor_id=catalog.tumor_id,
+                              biological_identity=catalog.biological_identity)
+        if paired["run_manifest"]["input_identity"].get("original_catalog_identity") != content_hash(catalog.to_dict()):
+            raise ValueError("Paired evidence belongs to a different catalog")
+        root_failed = paired.get("status") == "failed" and paired.get("stage_one") is None
+        rejection = paired.get("status") in ("no_eligible_clonal_reference", "blocked")
+        arms["A"] = dict(status="failed" if root_failed else "complete", available=paired.get("stage_one") is not None,
+                         scientifically_applicable=True, no_decisions=root_failed)
+        for name in ("B", "C"):
+            arm = paired.get("arms", {}).get(name, {})
+            state = "failed" if root_failed else arm.get("status", paired.get("status"))
+            for label, decisions in ((name, arm.get("combined_labels")), (name+"3", arm.get("assignment"))):
+                arms[label] = dict(status=state, available=bool(decisions) and state in ("complete", "empty_remainder"),
+                    no_decisions=not decisions, scientific_rejection=rejection or state in ("blocked", "no_eligible_clonal_reference"),
+                    scientifically_applicable=False if rejection else None)
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile):
+        pass  # A cell-level exception alone does not prove inference failed before decisions.
+    return unavailable_evaluation(job, "unavailable_derived_evidence", evaluation_config=evaluation_config,
+        execution_state=cell.get("status"), evidence_state=evidence_state, arm_applicability=arms,
+        original_evaluable_count=count, error=error)
+
 
 
 def reevaluate_cell(root, cell, evaluation_config):

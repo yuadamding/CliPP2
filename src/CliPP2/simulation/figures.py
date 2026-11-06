@@ -1,4 +1,4 @@
-"""Six data-driven scientific figure groups for the biological simulation study."""
+"""Data-driven scientific and population-accounting simulation figures."""
 from __future__ import annotations
 
 from collections import defaultdict
@@ -9,7 +9,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .evaluation import FAMILIES, TRANSITIONS
+from .evaluation import FAMILIES, TRANSITIONS, DETAILED_STATES, metric_truth_independent
 
 
 def _unavailable(ax, message="Unavailable for the executed study cells"):
@@ -24,7 +24,10 @@ def _values(evaluations, name, arm, *, view="", stratum="all"):
         matches = [row for row in evaluation["metrics"] if row["name"] == name and row["arm"] == arm
                    and row.get("view", "") == view and row.get("stratum", "all") == stratum]
         if matches and isinstance(matches[0]["value"], (int, float)):
-            rows.append((evaluation, float(matches[0]["value"])))
+            qualified = (evaluation.get("truth_qualification") == "verified_history_binding"
+                         or metric_truth_independent(evaluation, matches[0]))
+            if qualified:
+                rows.append((evaluation, float(matches[0]["value"])))
     return rows
 
 
@@ -124,7 +127,7 @@ def _paired(evaluations, aggregate_report, output, paths):
         if summaries and isinstance(summaries[0]["equal_family_mean"], (float, int)):
             row = summaries[0]
             interval = f" [{row['lower_95']:.3g}, {row['upper_95']:.3g}]" if row['lower_95'] is not None else ""
-            ax.text(.02, .02, f"Equal-family Δ {row['equal_family_mean']:.3g}{interval}", transform=ax.transAxes, fontsize=8)
+            ax.text(.02, .02, f"{row.get('population_scope', 'legacy')} Δ {row['equal_family_mean']:.3g}{interval}", transform=ax.transAxes, fontsize=8)
     figure.suptitle("3 · Paired cells: fitting, merging, and reassessment", y=1.01)
     _save(figure, output, "03_paired_effects", paths)
 
@@ -139,7 +142,8 @@ def _decisions(evaluations, aggregate_report, output, paths):
         if keys:
             axes[0].scatter([coverage[key] for key in keys], [error[key] for key in keys], label=arm, color=color, alpha=.6, s=18)
         for evaluation in evaluations:
-            curve = [row for row in evaluation.get("error_coverage_curves", ()) if row["arm"] == arm
+            curve = [row for row in evaluation.get("error_coverage_curves", ())
+                     if evaluation.get("truth_qualification") == "verified_history_binding" and row["arm"] == arm
                      and row["acceptance_coverage"] is not None and row["selective_error"] is not None]
             if curve:
                 axes[0].plot([row["acceptance_coverage"] for row in curve], [row["selective_error"] for row in curve],
@@ -208,6 +212,7 @@ def _decisions(evaluations, aggregate_report, output, paths):
 
 
 def _weighted_reliability(evaluations, arm, stratum):
+    evaluations = [e for e in evaluations if e.get("truth_qualification") == "verified_history_binding"]
     histories, acquisitions = defaultdict(set), defaultdict(set)
     for e in evaluations:
         histories[e["family"]].add(e["history_id"])
@@ -277,8 +282,60 @@ def _sensitivities(evaluations, output, paths):
     _save(figure, output, "06_sensitivities", paths)
 
 
+def _population_accounting(evaluations, summary, output, paths):
+    figure, axes = plt.subplots(2, 2, figsize=(14, 10))
+    arms = ("B", "C", "B3", "C3")
+    ax = axes[0, 0]
+    for i, arm in enumerate(arms):
+        row = next((row for row in summary.get("metrics", ())
+                    if row["name"] == "binary_correct_per_original_evaluable" and row["arm"] == arm), {})
+        for field, offset, marker, color, label in (
+                ("planned_population_estimate", -.12, "o", "#1565a8", "Frozen planned population"),
+                ("available_case_estimate", .12, "x", "#ca6b26", "Qualified available cases")):
+            value = row.get(field)
+            if value is not None:
+                ax.scatter(i+offset, value, marker=marker, color=color, s=45, label=label if i == 0 else None)
+        if row.get("planned_population_estimate") is None:
+            ax.text(i, .04, "planned\nunknown", ha="center", fontsize=8)
+    ax.set(xticks=range(4), xticklabels=arms, ylim=(-.02, 1.05),
+           ylabel="Binary correct / original evaluable", title="Planned and available-case estimates differ")
+    if ax.collections:
+        ax.legend(fontsize=8)
+    ax = axes[0, 1]
+    availability = summary.get("availability", ())
+    definitions = (("execution_available", "Executed"), ("scientifically_applicable", "Applicable"),
+                   ("evaluation_available", "Evaluated"))
+    for offset, (field, label) in enumerate(definitions):
+        counts = [sum(row.get(field) == 1 for row in availability if row["arm"] == arm) for arm in arms]
+        ax.bar(np.arange(4)+(offset-1)*.23, counts, width=.23, label=label)
+    ax.set(xticks=range(4), xticklabels=arms, ylabel="Retained cells with known state",
+           title="Execution, applicability and evaluation counts")
+    ax.legend(fontsize=8)
+    for ax, origin in zip(axes[1], ("stage1_clonal_recheck", "stage2_near_clonal_recheck")):
+        matrix = np.zeros((4, 4), int)
+        observed = False
+        for evaluation in evaluations:
+            if evaluation.get("truth_qualification") != "verified_history_binding":
+                continue
+            for row in evaluation.get("detailed_membership_transitions", {}).get("C3", {}).get(origin, ()):
+                if row.get("count") is not None:
+                    observed = True
+                    matrix[DETAILED_STATES.index(row["baseline_state"]), DETAILED_STATES.index(row["final_state"])] += row["count"]
+        if observed:
+            ax.imshow(matrix, cmap="Blues")
+            for i in range(4):
+                for j in range(4):
+                    ax.text(j, i, str(matrix[i, j]), ha="center", va="center", color="black")
+            ax.set(xticks=range(4), yticks=range(4), xticklabels=DETAILED_STATES, yticklabels=DETAILED_STATES)
+        else:
+            _unavailable(ax, "No qualified detailed transition evidence")
+        ax.set(title="C3 "+origin+": target counts", xlabel="Final detailed state", ylabel="Baseline detailed state")
+    figure.suptitle("7 · Population accounting and detailed transitions; roster "+summary.get("roster_status", "unavailable"), y=1.02)
+    _save(figure, output, "07_population_accounting", paths)
+
+
 def make_figures(evaluations, aggregate_report, output_dir, *, histories=()):
-    """Produce all six required groups, with neutral panels when data are absent."""
+    """Produce scientific and accounting groups, with explicit absent evidence."""
     evaluations, histories = list(evaluations), list(histories)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -289,4 +346,5 @@ def make_figures(evaluations, aggregate_report, output_dir, *, histories=()):
     _decisions(evaluations, aggregate_report, output, paths)
     _reliability(evaluations, output, paths)
     _sensitivities(evaluations, output, paths)
+    _population_accounting(evaluations, aggregate_report, output, paths)
     return paths

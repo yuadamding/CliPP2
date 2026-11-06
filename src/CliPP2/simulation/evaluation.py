@@ -20,6 +20,35 @@ FAMILIES = tuple(f"S{i:02}" for i in range(1, 13))
 TRANSITIONS = ("correct_retained", "error_corrected", "error_persisted", "error_introduced",
                "correct_resolution_lost", "error_withheld")
 UNMAPPED = "__unmapped__"
+DETAILED_STATES = ("Mc", "Mw", "U", "unresolved")
+TRUTH_QUALIFICATIONS = frozenset(("verified_history_binding", "legacy_consistent_unbound",
+                                "conflicting_truth", "missing_truth_evidence"))
+TRUTH_INDEPENDENT_METRICS = frozenset(("analysis_available", "analysis_failure", "execution_available",
+    "execution_failure", "evaluation_available", "scientifically_applicable"))
+PLANNED_METRIC_NAMES = TRUTH_INDEPENDENT_METRICS | {
+    "correct_per_original_evaluable", "binary_correct_per_original_evaluable"}
+
+
+def metric_population_scope(name, view=""):
+    """Only explicitly declared end-to-end/operational endpoints use fixed weights."""
+    return "planned_population" if name in PLANNED_METRIC_NAMES else "conditional_available_cases"
+
+
+
+def metric_truth_independent(record, row):
+    """Operational evidence or a justified zero is independent of truth labels."""
+    if row["name"] in TRUTH_INDEPENDENT_METRICS:
+        return True
+    denominator = row.get("denominator")
+    no_decision_names = {"correct_per_original_evaluable", "binary_correct_per_original_evaluable"}
+    arm_state = next((item for item in record.get("applicability", ()) if item.get("arm") == row.get("arm")), {})
+    state = arm_state.get("status", record.get("execution_state", record.get("status")))
+    established_failure = state in ("failed", "execution_failed", "blocked", "no_eligible_clonal_reference")
+    return bool(row["name"] in no_decision_names and row.get("truth_required") is False
+        and row.get("status") == "known_no_decisions" and row.get("value") == 0 and row.get("numerator") == 0
+        and isinstance(denominator, (int, float)) and not isinstance(denominator, bool)
+        and np.isfinite(denominator) and denominator > 0 and denominator == record.get("original_evaluable_count")
+        and (established_failure or arm_state.get("scientific_rejection") is True))
 
 
 def json_safe(value):
@@ -113,9 +142,16 @@ def normalize_evaluation_config(config=None):
 
 def evaluation_definition(config=None):
     config = normalize_evaluation_config(config)
-    return dict(schema="clipp2.simulation.evaluation-definition.v2", config=config,
+    return dict(schema="clipp2.simulation.evaluation-definition.v3", config=config,
         binary_endpoint="accepted_designated_clonal_status_equals_physical_truth_clonality",
         binary_objective="unchanged_original_population_equal_family_history_acquisition",
+        population_scopes={"planned_population": sorted(PLANNED_METRIC_NAMES),
+                           "other_metrics": "conditional_available_cases"},
+        planned_weights="frozen_roster_equal_family_then_equal_history_then_equal_acquisition",
+        missing_evidence="unknown_planned_cell_makes_estimate_null_never_renormalize_survivors",
+        zero_credit="known_no_decisions_with_established_original_evaluable_denominator_only",
+        truth_qualification_policy="verified_history_binding_primary_legacy_consistent_unbound_separate_conditional",
+        detailed_transition="same_Mc_Mw_U_unresolved_state_for_baseline_and_final_by_target_origin",
         detailed_endpoint="frozen_source_member_purity_observable_truth_class",
         source_member_purity_min=.8, unmapped_acceptance="separate_Mc_Mw_U_not_automatic_error",
         geometric_endpoint="accepted_center_matches_truth_and_quality_passes_informative_regions",
@@ -125,6 +161,25 @@ def evaluation_definition(config=None):
         matching_ambiguity="alternative_equal_cardinality_exact_binary_rational_distance_sum_optima",
         availability_quality_regions="original_eligible_observed_positive_depth",
         uncertainty_bounds="mapping_error_lower_Mw_over_A_upper_Mw_plus_U_over_A_not_confidence_intervals")
+
+
+def legacy_evaluation_definition(version, config=None):
+    """Recreate historical definitions without attaching new scientific meaning."""
+    config = normalize_evaluation_config(config)
+    if version in (1, "v1", "clipp2.simulation.evaluation.v1"):
+        return dict(schema="clipp2.simulation.evaluation-definition.legacy-v1",
+            binary_endpoint="accepted_designated_clonal_status_equals_physical_truth_clonality",
+            reference_distance="linf", reference_match_atol=config["reference_match_atol"],
+            matching_policy="legacy_forced_pairs_influence_valid_edge_cost",
+            detailed_endpoint="legacy_multiclass_unmapped_treated_as_incorrect")
+    if version not in (2, "v2", "clipp2.simulation.evaluation.v2"):
+        raise ValueError("Only evaluation v1 and v2 are legacy definitions")
+    definition = evaluation_definition(config)
+    definition["schema"] = "clipp2.simulation.evaluation-definition.v2"
+    for key in ("population_scopes", "planned_weights", "missing_evidence", "zero_credit",
+                "truth_qualification_policy", "detailed_transition"):
+        del definition[key]
+    return definition
 
 
 def _integer_assignment(cost):
@@ -464,7 +519,8 @@ def _truth_clonal(history):
     return np.all(np.isclose(history.phi, 1., rtol=0, atol=1e-12), axis=1)
 
 
-def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol=None, evaluation_config=None):
+def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol=None, evaluation_config=None,
+             truth_qualification="missing_truth_evidence"):
     """Evaluate one paired A/B/C/B3/C3 cell; return only JSON-safe data.
 
     ``result`` is the serializable paired payload from ``experiments.run_paired``.
@@ -474,6 +530,8 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     """
     if tuple(history.mutation_ids) != tuple(catalog.mutation_ids) or tuple(history.region_ids) != tuple(catalog.region_ids):
         raise ValueError("Evaluation requires the complete aligned original universe")
+    if truth_qualification not in TRUTH_QUALIFICATIONS:
+        raise ValueError("Unknown truth qualification state")
     config_input = dict(evaluation_config or {})
     if reference_match_atol is not None:
         if "reference_match_atol" in config_input and config_input["reference_match_atol"] != reference_match_atol:
@@ -506,7 +564,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     evaluable = known & observed.any(axis=1)
     original_n = int(evaluable.sum())
     metrics, mutation_rows, correspondence, calibration_rows, applicability, containment = [], [], [], [], [], []
-    reference_geometry, detailed_membership = {}, {}
+    reference_geometry, detailed_membership, detailed_transitions = {}, {}, {}
     truth_centers = {truth_ids[m]: history.phi[index[m]] for m in ids if evaluable[index[m]]}
 
     def metric(name, arm, numerator=None, denominator=None, *, value=None, view="", stratum="all", reason=None):
@@ -515,6 +573,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         elif denominator is not None:
             value = _ratio(numerator, denominator)
         metrics.append(dict(name=name, arm=arm, view=view, stratum=stratum, value=value,
+            population_scope=metric_population_scope(name, view), truth_required=name not in TRUTH_INDEPENDENT_METRICS,
             numerator=numerator, denominator=denominator,
             status=reason or ("available" if value is not None else "not_applicable_zero_denominator")))
 
@@ -730,7 +789,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
             mutation_rows.append(dict(arm=stage, mutation_id=mutation, evaluable=is_eval, truth_clonal=clonal[mutation],
                 truth_class=truth_ids[mutation], role="target", baseline_reference_label=combined.get(mutation),
                 baseline_correct=baseline_correct.get(mutation), accepted_label=accepted, correct=correct,
-                multiclass_correct=multi_correct, status=record.get("status") if record else "unavailable_analysis",
+                legacy_multiclass_correct_unmapped_as_error=multi_correct, status=record.get("status") if record else "unavailable_analysis",
                 transition=transition(baseline_correct[mutation], correct) if is_eval and assignment_available else None,
                 source_stage=record.get("source_stage") if record else None,
                 target_reason=record.get("target_reason") if record else
@@ -745,7 +804,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                 truth_clonal=clonal[mutation], truth_class=truth_ids[mutation], role="unchanged_non_target",
                 baseline_reference_label=combined[mutation], final_assignment_label=final[mutation],
                 accepted_label=final[mutation], baseline_correct=baseline_correct[mutation],
-                correct=baseline_correct[mutation], multiclass_correct=baseline_multi[mutation],
+                correct=baseline_correct[mutation], legacy_multiclass_correct_unmapped_as_error=baseline_multi[mutation],
                 status="unchanged_non_target", probability_available=False))
         for mutation in sorted(set(ids)-set(combined)):
             mutation_rows.append(dict(arm=stage, mutation_id=mutation, evaluable=bool(evaluable[index[mutation]]),
@@ -756,8 +815,13 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         for row in arm_rows:
             mutation = row["mutation_id"]
             row["binary_clonality_correct"] = row.get("correct")
+            row["baseline_detailed_membership_status"] = detailed_membership_status(
+                row["baseline_reference_label"], truth_ids[mutation], mapping)
             row["detailed_membership_status"] = detailed_membership_status(
                 row["accepted_label"], truth_ids[mutation], mapping)
+            row["detailed_membership_transition"] = (
+                row["baseline_detailed_membership_status"]+"->"+row["detailed_membership_status"]
+                if row["role"] != "target" or assignment_available else None)
             row["detailed_membership_correct"] = {"Mc": True, "Mw": False}.get(row["detailed_membership_status"])
             row.update(target_reference_availability(history.phi[index[mutation]], observed[index[mutation]],
                 reference, match_atol=reference_match_atol, distance=reference_distance,
@@ -770,6 +834,19 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
             "whole_original": arm_rows,
             **{origin: [row for row in arm_rows if row.get("target_reason") == origin]
                for origin in ("stage1_clonal_recheck", "stage2_near_clonal_recheck")}}
+        detailed_transitions[stage] = {}
+        for origin in ("stage1_clonal_recheck", "stage2_near_clonal_recheck"):
+            selected = [row for row in populations[origin] if row["evaluable"]]
+            counts = Counter(row["detailed_membership_transition"] for row in selected)
+            detailed_transitions[stage][origin] = [dict(baseline_state=before, final_state=after,
+                count=counts[before+"->"+after] if assignment_available else None,
+                denominator=len(selected), fraction=_ratio(counts[before+"->"+after], len(selected)) if assignment_available else None,
+                status="available" if assignment_available else "unavailable_analysis")
+                for before in DETAILED_STATES for after in DETAILED_STATES]
+            for row in detailed_transitions[stage][origin]:
+                metric("detailed_membership_transition_fraction", stage, value=row["fraction"],
+                    stratum=origin+":"+row["baseline_state"]+"->"+row["final_state"],
+                    reason=None if assignment_available else "unavailable_analysis")
         detailed_membership[stage] = {}
         for population_name, rows in populations.items():
             summary = detailed_membership_summary(rows)
@@ -824,7 +901,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         for name in TRANSITIONS:
             metric("transition_fraction", stage, transitions[name] if assignment_available else None,
                    neval if assignment_available else None, stratum=name, reason=reason)
-            metric("multiclass_transition_fraction", stage, multi_transitions[name] if assignment_available else None,
+            metric("legacy_multiclass_transition_fraction_unmapped_as_error", stage, multi_transitions[name] if assignment_available else None,
                    neval if assignment_available else None, stratum=name, reason=reason)
         wrong_baseline = sum(not baseline_correct[m] for m in target_evaluable)
         correct_baseline = neval-wrong_baseline
@@ -970,6 +1047,12 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         metric("analysis_available", item["arm"], int(item["available"]), 1, view="all_planned_cells")
         failed = any(word in item["status"].lower() for word in ("fail", "error", "timeout"))
         metric("analysis_failure", item["arm"], int(failed), 1, view="all_planned_cells")
+        # This evaluator has retained numerical input/truth and derived every arm,
+        # including scientific rejections. Execution failure is a separate state.
+        metric("execution_available", item["arm"], 1, 1, view="all_planned_cells")
+        metric("execution_failure", item["arm"], int(failed), 1, view="all_planned_cells")
+        metric("evaluation_available", item["arm"], 1, 1, view="all_planned_cells")
+        metric("scientifically_applicable", item["arm"], int(item["available"]), 1, view="all_planned_cells")
     curves = []
     for arm in ("B3", "C3"):
         state = arm_states[arm[0]]
@@ -994,7 +1077,8 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         if row["name"] in binary_names:
             row["endpoint"] = "binary_clonality"
             metrics.append(dict(row, name="binary_"+row["name"]))
-    return json_safe(dict(schema="clipp2.simulation.evaluation.v2", **identity,
+    return json_safe(dict(schema="clipp2.simulation.evaluation.v3", **identity,
+        truth_qualification=truth_qualification,
         evaluation_config=evaluation_config, evaluation_definition=definition,
         evaluation_definition_id=content_hash(definition), original_mutation_count=len(ids),
         original_evaluable_count=original_n, region_count=len(regions), metrics=metrics, mutations=mutation_rows,
@@ -1002,7 +1086,8 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         applicability=applicability, cap_audit=audit, declared_source_audit=declared,
         candidate_correspondence=correspondence, reference_center_geometry=reference_geometry,
         reference_match_atol=reference_match_atol, reference_distance=reference_distance,
-        detailed_membership=detailed_membership, stage_three_containment=containment,
+        detailed_membership=detailed_membership, detailed_membership_transitions=detailed_transitions,
+        stage_three_containment=containment,
         calibration=calibration_rows, information=information, recovery_reach=reach,
         error_coverage_curves=curves,
         reliability={arm: reliability([row["clonal_probability"] for row in calibration_rows if row["arm"] == arm],
@@ -1088,24 +1173,28 @@ def _numeric(value):
     return value
 
 
-def aggregate(evaluations, *, bootstrap_replicates=1000, seed=20261106, families=FAMILIES):
-    """Equal-family means and paired history bootstrap carrying all acquisitions.
+def aggregate(evaluations, *, planned_roster=None, roster_complete=False,
+              bootstrap_replicates=1000, seed=20261106, families=FAMILIES):
+    """Keep frozen planned weights; report conditional available cases separately.
 
-    Metrics conditional on successful analyses report their available cell counts;
-    failure/availability endpoints use every planned cell. Missing families never
-    disappear into a more favorable macro-average.
+    Unknown scientific values are never replaced with zero or dropped from a
+    planned estimate. Only verified truth contributes to primary science; an
+    explicit, justified no-decision zero can be independent of truth identity.
     """
-    evaluations = list(evaluations)
+    evaluations, families = list(evaluations), tuple(families)
+    if bootstrap_replicates < 0 or len(set(families)) != len(families) or not families:
+        raise ValueError("Aggregation requires distinct families and nonnegative bootstrap replicates")
     definitions = {}
     for record in evaluations:
         schema = record.get("schema")
-        if schema == "clipp2.simulation.evaluation.v2":
-            definition = record.get("evaluation_definition")
-            identity = record.get("evaluation_definition_id")
+        if schema in ("clipp2.simulation.evaluation.v2", "clipp2.simulation.evaluation.v3"):
+            definition, identity = record.get("evaluation_definition"), record.get("evaluation_definition_id")
             if not isinstance(definition, dict) or identity != content_hash(definition):
                 raise ValueError("Evaluation definition identity is missing or invalid")
+            expected = "clipp2.simulation.evaluation-definition."+schema.rsplit(".", 1)[1]
+            if definition.get("schema") != expected:
+                raise ValueError("Evaluation schema and definition version differ")
         elif schema == "clipp2.simulation.evaluation.v1":
-            # Label historical records; never silently recalculate old geometry.
             definition = dict(schema="clipp2.simulation.evaluation-definition.legacy-v1",
                 binary_endpoint="accepted_designated_clonal_status_equals_physical_truth_clonality",
                 reference_distance="linf", reference_match_atol=record.get("reference_match_atol"),
@@ -1117,62 +1206,176 @@ def aggregate(evaluations, *, bootstrap_replicates=1000, seed=20261106, families
         definitions[identity] = definition
     if len(definitions) > 1:
         raise ValueError("Incompatible evaluation definitions require separate aggregates or explicit re-evaluation")
-    if definitions:
-        definition_id, definition = next(iter(definitions.items()))
-    else:
-        definition = evaluation_definition()
-        definition_id = content_hash(definition)
-    if bootstrap_replicates < 0:
-        raise ValueError("Bootstrap replicate count must be nonnegative")
-    rng = np.random.default_rng(seed)
-    groups = defaultdict(list)
-    for evaluation in evaluations:
-        for row in evaluation["metrics"]:
+    definition = next(iter(definitions.values())) if definitions else evaluation_definition()
+    definition_id = content_hash(definition)
+
+    def coordinates(record):
+        acquisition = record.get("acquisition_id", record.get("acquisition", {}).get("id"))
+        values = (record.get("family"), record.get("history_id"), acquisition)
+        if any(value is None for value in values):
+            raise ValueError("Planned and evaluated cells require family, history, and acquisition identity")
+        return tuple(map(str, values))
+
+    roster, triples = {}, {}
+    supplied_roster = planned_roster is not None
+    for job in list(planned_roster) if supplied_roster else evaluations:
+        family, history, acquisition = coordinates(job)
+        cell_id = str(job.get("cell_id", "|".join((family, history, acquisition))))
+        if cell_id in roster or (family, history, acquisition) in triples:
+            raise ValueError("The planned roster has duplicate cells or ambiguous acquisition coordinates")
+        if family not in families:
+            raise ValueError("The planned roster contains an undeclared family")
+        roster[cell_id] = dict(cell_id=cell_id, family=family, history_id=history, acquisition_id=acquisition)
+        triples[family, history, acquisition] = cell_id
+    records = {}
+    for record in evaluations:
+        coordinate = coordinates(record)
+        cell_id = str(record.get("cell_id", triples.get(coordinate, "|".join(coordinate))))
+        if cell_id not in roster or coordinates(roster[cell_id]) != coordinate:
+            raise ValueError("Evaluation is outside or conflicts with the planned roster")
+        if cell_id in records:
+            raise ValueError("Multiple evaluations claim the same planned cell")
+        records[cell_id] = record
+    structure = {family: defaultdict(list) for family in families}
+    for cell_id, coordinate in roster.items():
+        structure[coordinate["family"]][coordinate["history_id"]].append(cell_id)
+    missing_families = [family for family in families if not structure[family]]
+    complete_roster = bool(supplied_roster and roster_complete and roster and not missing_families)
+    weights = {cell_id: 1/(len(families)*len(structure[row["family"]])*
+                          len(structure[row["family"]][row["history_id"]]))
+               if complete_roster else None for cell_id, row in roster.items()}
+    groups = defaultdict(dict)
+    for cell_id, record in records.items():
+        for row in record["metrics"]:
             key = (row["name"], row["arm"], row.get("view", ""), row.get("stratum", "all"))
-            groups[key].append((evaluation["family"], str(evaluation["history_id"]),
-                                str(evaluation["acquisition_id"]), _numeric(row["value"])))
-    # Paired differences are first formed inside the same history/acquisition.
+            if cell_id in groups[key]:
+                raise ValueError("Evaluation contains duplicate metric keys")
+            groups[key][cell_id] = row
+    # Even an entirely missing current cohort has explicit planned endpoints.
+    for name in sorted(PLANNED_METRIC_NAMES):
+        arms = ("A", "B", "C", "B3", "C3") if name in TRUTH_INDEPENDENT_METRICS else ("B", "C", "B3", "C3")
+        for arm in arms:
+            groups[name, arm, "all_planned_cells" if name in TRUTH_INDEPENDENT_METRICS else "", "all"]
+
+    def value_for(cell_id, row, *, legacy=False):
+        if row is None:
+            return None, "missing_metric" if cell_id in records else "missing_evaluation_record"
+        if "paired_components" in row:
+            parts = [value_for(cell_id, part, legacy=legacy) for part in row["paired_components"]]
+            if any(value is None or not np.isfinite(value) for value, _ in parts):
+                return None, "unavailable_paired_components"
+            return parts[0][0]-parts[1][0], "available"
+        value = _numeric(row.get("value"))
+        if value is None:
+            return None, row.get("status", "unknown_value")
+        independent = metric_truth_independent(records[cell_id], row)
+        if not independent:
+            state = records[cell_id].get("truth_qualification", "missing_truth_evidence")
+            allowed = "legacy_consistent_unbound" if legacy else "verified_history_binding"
+            if state != allowed:
+                return None, state
+        return float(value), "available"
+
     for left, right in (("C", "B"), ("B3", "B"), ("C3", "C"), ("C3", "B3")):
-        keys = list(groups)
-        for name, arm, view, stratum in keys:
-            if arm != right or (name, left, view, stratum) not in groups:
-                continue
-            a = {(f, h, acq): value for f, h, acq, value in groups[name, left, view, stratum]}
-            b = {(f, h, acq): value for f, h, acq, value in groups[name, right, view, stratum]}
-            paired = []
-            for key in a.keys() & b.keys():
-                x, y = a[key], b[key]
-                value = x-y if x is not None and y is not None and np.isfinite(x) and np.isfinite(y) else None
-                paired.append((*key, value))
-            groups[name, left+"_minus_"+right, view, stratum] = paired
+        for name, arm, view, stratum in list(groups):
+            if arm == right and (name, left, view, stratum) in groups:
+                a, b = groups[name, left, view, stratum], groups[name, right, view, stratum]
+                groups[name, left+"_minus_"+right, view, stratum] = {
+                    cell_id: dict(paired_components=(a.get(cell_id), b.get(cell_id))) for cell_id in roster}
+
+    rng = np.random.default_rng(seed)
+
+    def estimates(values, *, fixed):
+        family_means, history_values, history_counts = {}, {}, {}
+        for family in families:
+            histories = []
+            for members in structure[family].values():
+                present = [values[cell_id] for cell_id in members if values[cell_id] is not None]
+                histories.append(float(np.mean(present)) if present and (not fixed or len(present) == len(members)) else None)
+            known = [value for value in histories if value is not None]
+            family_means[family] = (float(np.mean(known)) if known and (not fixed or len(known) == len(histories)) else None)
+            history_values[family], history_counts[family] = known, len(known)
+        present_families = [family for family in families if family_means[family] is not None]
+        mean = (float(np.mean([family_means[family] for family in present_families]))
+                if present_families and (not fixed or len(present_families) == len(families)) else None)
+        return mean, family_means, history_values, history_counts
+
+    def interval(mean, history_values):
+        selected = [values for values in history_values.values() if values]
+        if mean is None or not np.isfinite(mean) or not selected or any(len(values) < 2 for values in selected):
+            return None, None
+        draws = [np.mean([rng.choice(values, len(values), replace=True).mean() for values in selected])
+                 for _ in range(bootstrap_replicates)]
+        return tuple(np.quantile(draws, [.025, .975]).tolist()) if draws else (None, None)
+
+    def operational_count(name, arm, desired):
+        count = 0
+        for cell_id in roster:
+            components = [value_for(cell_id, groups.get((name, part, "all_planned_cells", "all"), {}).get(cell_id))[0]
+                          for part in arm.split("_minus_")]
+            value = None if any(value is None for value in components) else int(all(value == 1 for value in components))
+            count += value == desired
+        return count
+
     summaries = []
     for key, rows in sorted(groups.items()):
-        by_family = defaultdict(lambda: defaultdict(list))
-        for family, history, acquisition, value in rows:
-            if value is not None:
-                by_family[family][history].append(float(value))
-        family_means, history_means, family_counts = {}, {}, {}
-        for family in families:
-            values = [float(np.mean(acquisitions)) for acquisitions in by_family[family].values()]
-            history_means[family] = np.asarray(values)
-            family_means[family] = float(np.mean(values)) if values else None
-            family_counts[family] = len(values)
-        complete = all(family_means[family] is not None for family in families)
-        mean = float(np.mean(list(family_means.values()))) if complete else None
-        intervals = []
-        sufficient = all(family_counts[f] >= 2 for f in families)
-        if complete and sufficient and mean is not None and np.isfinite(mean):
-            for _ in range(bootstrap_replicates):
-                intervals.append(np.mean([rng.choice(history_means[f], len(history_means[f]), replace=True).mean()
-                                          for f in families]))
-        low, high = np.quantile(intervals, [.025, .975]).tolist() if intervals else (None, None)
-        summaries.append(dict(name=key[0], arm=key[1], view=key[2], stratum=key[3], equal_family_mean=mean,
-            lower_95=low, upper_95=high, status="available" if complete else "unavailable_families",
-            uncertainty_status="available" if intervals else "insufficient_histories_or_unavailable_finite_estimand",
-            family_means=family_means, family_history_counts=family_counts, planned_cells=len(evaluations),
-            available_cells=sum(value is not None for *_, value in rows),
-            unavailable_families=[f for f in families if family_means[f] is None]))
-    return json_safe(dict(schema="clipp2.simulation.aggregate.v2", evaluation_definition=definition,
-        evaluation_definition_id=definition_id, weighting="equal_family_then_equal_history_then_equal_acquisition",
-        uncertainty="paired_history_bootstrap_all_acquisitions_together", bootstrap_replicates=bootstrap_replicates,
-        bootstrap_seed=seed, families=list(families), planned_datasets=len(evaluations), metrics=summaries))
+        values_and_reasons = {cell_id: value_for(cell_id, rows.get(cell_id)) for cell_id in roster}
+        values = {cell_id: value for cell_id, (value, _) in values_and_reasons.items()}
+        available, available_families, available_histories, counts = estimates(values, fixed=False)
+        planned, planned_families, planned_histories, _ = estimates(values, fixed=True)
+        scope = metric_population_scope(key[0], key[2])
+        unknown = [cell_id for cell_id, value in values.items() if value is None]
+        if not complete_roster or unknown:
+            planned = None
+        planned_status = ("not_a_planned_population_endpoint" if scope != "planned_population" else
+            "incomplete_planned_roster" if not complete_roster else "incomplete_evidence" if unknown else "available")
+        if scope != "planned_population":
+            planned = None
+        legacy_values = {cell_id: value_for(cell_id, rows.get(cell_id), legacy=True)[0]
+            if records.get(cell_id, {}).get("truth_qualification") == "legacy_consistent_unbound" else None
+            for cell_id in roster}
+        legacy = estimates(legacy_values, fixed=False)[0]
+        planned_low, planned_high = interval(planned, planned_histories)
+        available_low, available_high = interval(available, available_histories)
+        primary = planned if scope == "planned_population" else available
+        primary_low, primary_high = ((planned_low, planned_high) if scope == "planned_population"
+                                     else (available_low, available_high))
+        missing = [dict(roster[cell_id], arm=key[1], reason=values_and_reasons[cell_id][1],
+                        planned_weight=weights[cell_id]) for cell_id in unknown]
+        summaries.append(dict(name=key[0], arm=key[1], view=key[2], stratum=key[3], population_scope=scope,
+            equal_family_mean=primary, planned_population_estimate=planned, planned_population_status=planned_status,
+            available_case_estimate=available, available_case_status="available" if available is not None else "no_qualified_available_cases",
+            legacy_consistent_available_case_estimate=legacy,
+            lower_95=primary_low, upper_95=primary_high, planned_lower_95=planned_low, planned_upper_95=planned_high,
+            available_case_lower_95=available_low, available_case_upper_95=available_high,
+            status=planned_status if scope == "planned_population" else "conditional_available_cases" if available is not None else "unavailable_conditional_cases",
+            uncertainty_status="available" if primary_low is not None else "insufficient_histories_or_incomplete_estimand",
+            interval_population=scope, family_means=planned_families if scope == "planned_population" else available_families,
+            available_case_family_means=available_families, family_history_counts=counts,
+            planned_cells=len(roster), available_cells=len(roster)-len(unknown), unknown_cells=len(unknown),
+            recorded_cells=sum(cell_id in records for cell_id in roster),
+            executed_cells=operational_count("execution_available", key[1], 1),
+            evaluated_cells=operational_count("evaluation_available", key[1], 1),
+            scientifically_applicable_cells=operational_count("scientifically_applicable", key[1], 1),
+            unavailable_derived_cells=operational_count("evaluation_available", key[1], 0),
+            unknown_evaluation_cells=operational_count("evaluation_available", key[1], None),
+            missing_cell_ids=unknown, missingness=missing if scope == "planned_population" else [],
+            unavailable_families=[family for family in families if available_families[family] is None]))
+    availability = []
+    for cell_id, coordinate in roster.items():
+        record = records.get(cell_id, {})
+        for arm in ("A", "B", "C", "B3", "C3"):
+            statuses = {name: value_for(cell_id, groups[name, arm, "all_planned_cells", "all"].get(cell_id))[0]
+                        for name in TRUTH_INDEPENDENT_METRICS}
+            availability.append(dict(coordinate, arm=arm, **statuses,
+                truth_qualification=record.get("truth_qualification", "missing_truth_evidence"),
+                record_status=record.get("status", "missing_evaluation_record"), planned_weight=weights[cell_id]))
+    return json_safe(dict(schema="clipp2.simulation.aggregate.v3", evaluation_definition=definition,
+        evaluation_definition_id=definition_id, weighting="frozen_roster_equal_family_then_equal_history_then_equal_acquisition",
+        available_case_weighting="available_families_then_available_histories_then_available_acquisitions",
+        uncertainty="paired_history_bootstrap_all_acquisitions_together_separate_planned_and_available_case",
+        bootstrap_replicates=bootstrap_replicates, bootstrap_seed=seed, families=list(families),
+        roster_complete=complete_roster, roster_status="complete" if complete_roster else "unavailable_or_incomplete",
+        roster_missing_families=missing_families, planned_datasets=len(roster), observed_evaluation_records=len(records),
+        planned_weights=[dict(row, weight=weights[cell_id]) for cell_id, row in roster.items()],
+        availability=availability, metrics=summaries))
