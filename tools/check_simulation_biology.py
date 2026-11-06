@@ -85,6 +85,108 @@ def _rows(history, group):
     return [index[mutation] for mutation in history.metadata['mutation_classes'].get(group, ())]
 
 
+def run_sensitivity_layout_checks(directory):
+    """Prepare every small extended layout and stop workers before inference."""
+    from collections import defaultdict
+    from CliPP2.io.data import content_hash
+    from CliPP2.simulation.design import jobs, make_contract, seed_for
+    from CliPP2.simulation.panels import sensitivity_jobs
+    from CliPP2.simulation.study import _history, _prepare_histories, _run_cell
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    contract = make_contract(mutations=24, segments=3, regions=4)
+    original_contract = deepcopy(contract)
+    main_before = list(jobs(contract, 'main', 1))
+    planned = sensitivity_jobs(contract, extended=True)
+    grouped = defaultdict(list)
+    for job in planned:
+        base = f"sensitivity-{job['family']}-H001"
+        name, regions = job['acquisition']['id'], job['dimensions']['regions']
+        assert job['cell_id'] == f'{base}-{name}'
+        assert job['history_seed'] == seed_for(contract['master_seed'], 'sensitivity', job['family'], 0)
+        assert job['acquisition_seed'] == seed_for(contract['master_seed'], 'sensitivity', job['family'], 0, 4)
+        expected = base if regions == contract['dimensions']['regions'] else f'{base}-regions{regions}'
+        assert job['history_id'] == expected
+        if name.startswith('regions'):
+            assert job['acquisition']['depth'] == (500 if name.endswith('per_region') else 2000/regions)
+        grouped[job['history_id']].append(job)
+    assert len(planned) == 120 and len(grouped) == 16
+    assert contract == original_contract and list(jobs(contract, 'main', 1)) == main_before
+    for job in main_before:
+        assert job['history_id'] == f"main-{job['family']}-H001"
+        assert job['cell_id'] == f"{job['history_id']}-{job['acquisition']['id']}"
+        assert job['history_seed'] == seed_for(contract['master_seed'], 'main', job['family'], 0)
+    # The base identity rule also applies when the contract's base is not R=4.
+    two_region = sensitivity_jobs(dict(contract, dimensions=dict(contract['dimensions'], regions=2)), extended=True)
+    assert all(job['history_id'] == f"sensitivity-{job['family']}-H001" for job in two_region
+               if job['dimensions']['regions'] == 2)
+    with patch('CliPP2.fit_execution.fit_regions', side_effect=AssertionError('layout check invoked fitting')) as fit, \
+            patch('CliPP2.assignment.assign_mutations', side_effect=AssertionError('layout check invoked assignment')) as assign, \
+            patch('CliPP2.kernel.backend.NativeBackend', side_effect=AssertionError('layout check opened native backend')) as backend:
+        _prepare_histories(directory, planned)
+        prepared = {}
+        for history_id, members in grouped.items():
+            assert len({content_hash({key: job[key] for key in ('family', 'history_seed', 'dimensions')})
+                        for job in members}) == 1
+            generated = _history(members[0])
+            saved = directory / 'histories' / history_id
+            manifest = json.loads((saved / 'history_manifest.json').read_text())
+            restored = History.from_dict(json.loads((saved / 'history.json').read_text()))
+            assert manifest['history_content_id'] == history_content_id(generated) == history_content_id(restored)
+            prepared[history_id] = generated
+            modes = [job for job in members if job['acquisition']['id'].startswith('regions')]
+            assert len(modes) == 2 and len({job['history_id'] for job in modes}) == 1
+            assert history_content_id(_history(modes[0])) == history_content_id(_history(modes[1]))
+        assert len({history_content_id(history) for history in prepared.values()}) == 16
+        for family in ('S02', 'S04', 'S06', 'S12'):
+            base = f'sensitivity-{family}-H001'
+            large = prepared[base+'-regions8']
+            for regions in (1, 2, 4):
+                small = prepared[base if regions == 4 else f'{base}-regions{regions}']
+                assert small.events == large.events
+                np.testing.assert_array_equal(small.clone_fractions, large.clone_fractions[:, :regions])
+                np.testing.assert_array_equal(small.phi, large.phi[:, :regions])
+        # Exercise live manifest/acquisition/input linkage for every layout; the
+        # deliberate sentinel is reached before any paired inference can run.
+        with patch('CliPP2.simulation.experiment.run_paired_experiment', side_effect=RuntimeError('layout_preinference_stop')) as boundary:
+            for members in grouped.values():
+                completion = _run_cell(dict(root=str(directory), job=members[0], selected=dict(contributor=.95, posterior=.95)))
+                assert completion['execution_phase'] == 'paired_inference'
+                assert completion['error'] == 'layout_preinference_stop'
+            assert boundary.call_count == 16
+        original_manifests = {key: (directory / 'histories' / key / 'history_manifest.json').read_bytes() for key in grouped}
+        _prepare_histories(directory, reversed(planned))
+        assert all((directory / 'histories' / key / 'history_manifest.json').read_bytes() == value
+                   for key, value in original_manifests.items())
+        base = planned[0]
+        changes = [dict(family='S01'), dict(history_seed=base['history_seed']+1),
+                   dict(dimensions=dict(base['dimensions'], regions=1)),
+                   dict(cohort_settings='unused_source.json', cohort_content_id='different_cohort'),
+                   dict(source_history_id='different_source')]
+        incompatible = [(base, dict(base, **change)) for change in changes]
+        cohort = dict(base, cohort_settings='unused_source.json', cohort_content_id='cohort_one', source_history_id='source_one')
+        incompatible += [(cohort, dict(cohort, cohort_content_id='cohort_two')),
+                         (cohort, dict(cohort, source_history_id='source_two'))]
+        for index, pair in enumerate(incompatible):
+            destination = directory / f'incompatible-{index}'
+            with patch('CliPP2.simulation.study._history', side_effect=AssertionError('collision generated history')), \
+                    patch('CliPP2.simulation.study._cohort', side_effect=AssertionError('collision loaded cohort')):
+                try:
+                    _prepare_histories(destination, pair)
+                except ValueError as error:
+                    assert 'incompatible biological layout or source identity' in str(error)
+                else:
+                    raise AssertionError('Incompatible repeated history identity was skipped')
+            assert not destination.exists()
+        assert fit.call_count == assign.call_count == backend.call_count == 0
+    return dict(status='passed', jobs=120, compatible_layout_histories=16,
+        generated_prepared_content_matches=True, worker_linkage_reaches_preinference=16,
+        shared_depth_mode_history=True, base_ids_cells_seeds_and_depths_unchanged=True,
+        physical_events_and_region_prefix_preserved=True, conflicting_ids_rejected_before_generation=True,
+        main_roster_unchanged=True, native_fit_count=0, assignment_pass_count=0)
+
+
 def run_biology_checks(directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -200,11 +302,13 @@ def run_biology_checks(directory):
     else:
         from check_simulation_truth import run_truth_link_checks
     truth_binding = run_truth_link_checks(directory / 'truth_binding')
+    sensitivity_layouts = run_sensitivity_layout_checks(directory / 'sensitivity_layouts')
     return dict(status='passed', family_histories=tested, physical_event_replay=True,
         integer_single_state_reduction=True, valid_cap_and_clonal_counterexample=True,
         exact_broken_and_masked_aliases=True, mutation_loss_separate_from_input_loss=True,
         region_prefix_pairing=True, input_perturbations_reuse_reads=True,
-        canonical_roundtrips=True, truth_binding=truth_binding, elapsed_seconds=time.perf_counter()-started)
+        canonical_roundtrips=True, truth_binding=truth_binding, sensitivity_layouts=sensitivity_layouts,
+        elapsed_seconds=time.perf_counter()-started)
 
 
 def main():

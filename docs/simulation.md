@@ -74,7 +74,7 @@ new command-line settings do not replace them. Completed cells are reused.
 `--retry-failed` reruns execution failures as new attempts, retaining old
 attempts, completion records, and costs. It does not reopen a frozen development
 selection or reinterpret scientific rejection as a worker failure. Package
-version 1.2.3 keeps simulation contract v4. It binds the entire parsed cohort
+version 1.1.0 keeps simulation contract v4. It binds the entire parsed cohort
 settings to a `cohort_content_id` in contracts, jobs, physical histories,
 acquisitions, and qualification receipts. Formatting and object-key order do not
 affect this identity; values and list order do. Resume verifies the frozen
@@ -82,16 +82,18 @@ settings at coordinator execution boundaries before reusing work. Each worker
 then reuses its validated immutable snapshot; a new process loads and verifies
 it again. Semantic random seeds remain unchanged.
 
-Existing 1.2.1 and 1.2.2 studies retain their original frozen installations and outputs.
-They are not migrated or given retrospective cohort identity. A new execution
-under 1.2.3 requires a new directory. Qualification has separate numbered
+Existing 1.2.1, 1.2.2, and 1.2.3 studies retain their original frozen installations and outputs.
+They are not migrated, and missing historical identity is not retrofitted. A new execution
+under 1.1.0 requires a new directory. Qualification has separate numbered
 mechanism/cohort attempts; validated published summaries can complete an
 interrupted wrapper without rerunning controls. Interrupted costs without a
 summary remain explicitly unknown. Reports use new directories.
 
 New studies save `main_roster.json` when allocation is frozen, before submitting
 main jobs. Evaluation v3 uses its family/history/acquisition weights. A known
-failure with an established denominator receives zero correct-decision credit;
+failure receives zero correct-decision credit only when a positive original
+denominator is established and no accepted decisions remain anywhere in that
+endpoint, including unchanged members outside the Stage 3 target pool;
 missing or conflicting evidence produces an unknown score. An incomplete planned
 estimate is null, with available-case summaries labeled separately. Legacy studies
 without an explicit complete frozen roster cannot establish the planned estimate
@@ -107,6 +109,18 @@ its conditional diagnostics do not enter the verified primary aggregate.
 `--retry-failed` also reaches timing pilots and technical-sensitivity jobs.
 External-reference audits record the selected source attempt, reuse only matching
 completed audits, and preserve older audits when a newer source attempt is used.
+
+Extended region-count sensitivity panels retain separate exact histories for
+each sampled-region layout. The contract's base layout keeps its history ID;
+alternate layouts add `-regions1`, `-regions2`, `-regions4`, or `-regions8` as
+appropriate. Both depth modes within a layout share that saved history. Cell IDs,
+history and acquisition seeds, physical copy events, and the existing regional
+mixture prefix stay unchanged. Per-region depth remains 500; fixed-total depth
+remains `2000 / region_count` per region. Preparation rejects a repeated history
+ID with incompatible family, seed, dimensions, or cohort/source identity.
+Different layout IDs do not create independent biological replicates: comparisons
+remain paired by their common family and history seed, with depth modes paired
+within each layout. Main-cohort roster identities are unchanged.
 
 To apply new evaluation definitions to saved inference, create an explicit JSON
 configuration and a new report destination:

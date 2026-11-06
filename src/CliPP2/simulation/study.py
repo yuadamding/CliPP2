@@ -313,16 +313,24 @@ def _run_cell(task):
 
 def _prepare_histories(root, job_list):
     from .biology import History, history_content_id
-    seen = set()
+    planned = {}
     for job in job_list:
-        if job["history_id"] in seen:
-            continue
-        seen.add(job["history_id"])
-        directory = root / "histories" / job["history_id"]
         expected = {k: job[k] for k in ("history_id", "family", "history_seed", "dimensions")}
         if job.get("cohort_settings"):
-            _cohort(job["cohort_settings"], job["cohort_content_id"])
             expected["cohort_content_id"] = job["cohort_content_id"]
+        source_id = job.get("source_history_id", job["history_id"])
+        if source_id != job["history_id"]:
+            expected["source_history_id"] = source_id
+        previous = planned.get(job["history_id"])
+        if previous is not None:
+            if previous[1] != expected:
+                raise ValueError("Repeated history ID has incompatible biological layout or source identity")
+            continue
+        planned[job["history_id"]] = job, expected
+    for job, expected in planned.values():
+        directory = root / "histories" / job["history_id"]
+        if job.get("cohort_settings"):
+            _cohort(job["cohort_settings"], job["cohort_content_id"])
         if (directory / "history_manifest.json").exists():
             existing = read_json(directory / "history_manifest.json")
             preserved = History.from_dict(read_json(directory / "history.json"))

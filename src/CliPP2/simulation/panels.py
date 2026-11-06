@@ -55,9 +55,11 @@ def sensitivity_jobs(contract, *, extended=False):
         if not extended:
             continue
         for regions in (1, 2, 4, 8):
+            layout_history_id = (base['history_id'] if regions == base['dimensions']['regions']
+                                 else f"{base['history_id']}-regions{regions}")
             for mode, depth in (('per_region', 500), ('fixed_total', 2000/regions)):
                 name = f'regions{regions}_{mode}'
-                jobs.append(dict(base, cell_id=f'{history_id}-{name}',
+                jobs.append(dict(base, history_id=layout_history_id, cell_id=f'{history_id}-{name}',
                     dimensions=dict(contract['dimensions'], regions=regions),
                     acquisition=dict(id=name, purity=.8, depth=depth), perturbation={},
                     pairing='same physical copy tree and existing-mixture prefix; acquisition seeds paired'))
