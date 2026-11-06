@@ -14,6 +14,7 @@ import numpy as np
 from scipy.special import logsumexp, xlogy, xlog1py
 from scipy.optimize import linear_sum_assignment
 from CliPP2.assignment import posterior_passes
+from CliPP2.io.data import content_hash
 
 FAMILIES = tuple(f"S{i:02}" for i in range(1, 13))
 TRANSITIONS = ("correct_retained", "error_corrected", "error_persisted", "error_introduced",
@@ -84,22 +85,129 @@ def candidate_correspondence(labels, clonal_label, source_members, truth_ids, cl
         mapping[label] = mapped
         audit.append(dict(candidate_label=label, truth_class=mapped, source_count=len(members),
                           source_truth_count=sum(counts.values()), source_purity=purity,
-                          mapping_purpose="calibration_label_only_not_center_recovery",
+                          mapping_purpose="frozen_source_member_purity_detailed_membership_not_center_recovery",
+                          mapping_status="mapped" if mapped is not None else "unmapped_or_ambiguous",
                           designated_clonal=label == clonal_label, mapping_threshold=purity_min))
     return mapping, audit
 
 
-def reference_center_diagnostics(labels, centers, truth_centers, *, match_atol=None):
-    """Continuous geometry plus optional one-to-one, per-coordinate qualification.
+def normalize_evaluation_config(config=None):
+    """Validate reporting choices without changing any fitted decision or threshold."""
+    config = dict(config or {})
+    allowed = {"schema", "reference_match_atol", "reference_distance"}
+    if set(config) - allowed:
+        raise ValueError(f"Unknown evaluation configuration fields: {sorted(set(config)-allowed)}")
+    if config.get("schema", "clipp2.simulation.evaluation-config.v1") != "clipp2.simulation.evaluation-config.v1":
+        raise ValueError("Unsupported evaluation configuration schema")
+    tolerance = config.get("reference_match_atol")
+    if tolerance is not None:
+        if isinstance(tolerance, (bool, str)) or not np.isfinite(tolerance) or tolerance < 0:
+            raise ValueError("Reference match tolerance must be finite and nonnegative or None")
+        tolerance = float(tolerance)
+    distance = config.get("reference_distance", "l2")
+    if distance not in ("l2", "linf"):
+        raise ValueError("Reference distance must be l2 or explicit legacy linf")
+    return dict(schema="clipp2.simulation.evaluation-config.v1", reference_match_atol=tolerance,
+                reference_distance=distance)
 
-    Source membership never enters this comparison. Binary recovery is unassessed
-    unless the caller declares a tolerance; a single candidate cannot recover
-    multiple true groups. The threshold matching maximizes qualified cardinality,
-    while continuous matching minimizes total Euclidean center error.
+
+def evaluation_definition(config=None):
+    config = normalize_evaluation_config(config)
+    return dict(schema="clipp2.simulation.evaluation-definition.v2", config=config,
+        binary_endpoint="accepted_designated_clonal_status_equals_physical_truth_clonality",
+        binary_objective="unchanged_original_population_equal_family_history_acquisition",
+        detailed_endpoint="frozen_source_member_purity_observable_truth_class",
+        source_member_purity_min=.8, unmapped_acceptance="separate_Mc_Mw_U_not_automatic_error",
+        geometric_endpoint="accepted_center_matches_truth_and_quality_passes_informative_regions",
+        reference_distance=config["reference_distance"], reference_vector="full_requested_regions_unnormalized",
+        reference_match_atol=config["reference_match_atol"],
+        matching_policy="maximum_valid_cardinality_then_minimum_valid_distance_then_lexicographic_truth_reference",
+        matching_ambiguity="alternative_equal_cardinality_exact_binary_rational_distance_sum_optima",
+        availability_quality_regions="original_eligible_observed_positive_depth",
+        uncertainty_bounds="mapping_error_lower_Mw_over_A_upper_Mw_plus_U_over_A_not_confidence_intervals")
+
+
+def _integer_assignment(cost):
+    """Rectangular Hungarian algorithm with exact Python-integer potentials."""
+    n, k = len(cost), len(cost[0]) if cost else 0
+    u, v, owner = [0]*(n+1), [0]*(k+1), [0]*(k+1)
+    for row in range(1, n+1):
+        owner[0], column = row, 0
+        minima, previous, used = [None]*(k+1), [0]*(k+1), [False]*(k+1)
+        while True:
+            used[column] = True
+            current, delta, next_column = owner[column], None, None
+            for j in range(1, k+1):
+                if not used[j]:
+                    value = cost[current-1][j-1]-u[current]-v[j]
+                    if minima[j] is None or value < minima[j]:
+                        minima[j], previous[j] = value, column
+                    if delta is None or minima[j] < delta:
+                        delta, next_column = minima[j], j
+            for j in range(k+1):
+                if used[j]:
+                    u[owner[j]] += delta
+                    v[j] -= delta
+                elif minima[j] is not None:
+                    minima[j] -= delta
+            column = next_column
+            if owner[column] == 0:
+                break
+        while column:
+            before = previous[column]
+            owner[column] = owner[before]
+            column = before
+    return [(owner[j]-1, j-1) for j in range(1, k+1) if owner[j]]
+
+
+def _qualified_matching(distance, valid):
+    """Maximize cardinality, minimize exact distance sum, then break ties lexically.
+
+    Represented float distances are binary rationals. Common-denominator integer
+    costs avoid rounded Hungarian subproblems or an arbitrary tie tolerance.
+    Unmatched dummy columns ensure invalid edges never influence valid costs.
     """
-    if match_atol is not None and (not np.isfinite(match_atol) or match_atol < 0):
-        raise ValueError("Reference match tolerance must be finite and nonnegative or None")
-    labels, truth_ids = tuple(labels), tuple(sorted(truth_centers))
+    n, k = distance.shape
+    if not n or not k or not valid.any():
+        return [], []
+    ratios = {tuple(pair): float(distance[tuple(pair)]).as_integer_ratio() for pair in np.argwhere(valid)}
+    denominator = max(den for _, den in ratios.values())
+    weights = {pair: numerator*(denominator//den) for pair, (numerator, den) in ratios.items()}
+    base, lexical_scale = k+1, (k+1)**n
+    # The whole secondary objective is strictly smaller than one unmatched cost.
+    unmatched = (n*max(weights.values())+1)*lexical_scale
+    forbidden = (n+1)*unmatched
+    costs = []
+    for i in range(n):
+        place = base**(n-1-i)
+        costs.append([weights[i, j]*lexical_scale+j*place if (i, j) in weights else forbidden
+                      for j in range(k)] + [unmatched+k*place]*n)
+
+    def solve(blocked=None):
+        current = [row[:] for row in costs] if blocked is not None else costs
+        if blocked is not None:
+            current[blocked[0]][blocked[1]] = forbidden
+        pairs = sorted((i, j) for i, j in _integer_assignment(current) if j < k)
+        objective = (len(pairs), sum(weights[i, j] for i, j in pairs))
+        return pairs, objective
+
+    pairs, objective = solve()
+    ambiguity = []
+    for i, j in pairs:
+        alternative, value = solve((i, j))
+        if value == objective:
+            ambiguity.append(dict(truth_index=i, alternative_reference_indices=[j, dict(alternative).get(i)]))
+    return pairs, ambiguity
+
+
+def reference_center_diagnostics(labels, centers, truth_centers, *, match_atol=None, distance="l2"):
+    """Continuous center errors and declared full-vector one-to-one recovery.
+
+    New assessments use unnormalized L2. Explicit ``distance='linf'`` identifies
+    legacy geometry; cached v1 results keep their original matching definition.
+    """
+    config = normalize_evaluation_config(dict(reference_match_atol=match_atol, reference_distance=distance))
+    labels, truth_ids = tuple(labels), tuple(sorted(truth_centers, key=str))
     centers = np.asarray(centers, float)
     truth = np.asarray([truth_centers[key] for key in truth_ids], float)
     if len(labels) != len(centers) or len(set(labels)) != len(labels):
@@ -108,25 +216,33 @@ def reference_center_diagnostics(labels, centers, truth_centers, *, match_atol=N
             or truth.size and (truth.ndim != 2 or not np.isfinite(truth).all())
             or centers.size and truth.size and centers.shape[1] != truth.shape[1]):
         raise ValueError("Reference and truth centers require finite aligned regional vectors")
-    paired, nearest, qualified = [], [], []
+    order = sorted(range(len(labels)), key=lambda i: (type(labels[i]).__name__, str(labels[i])))
+    labels = tuple(labels[i] for i in order)
+    centers = centers[order]
+    paired, nearest, qualified, ambiguity = [], [], [], []
     if labels and truth_ids:
-        delta = centers[:, None, :] - truth[None, :, :]
+        delta = truth[:, None, :] - centers[None, :, :]
         l2, linf = np.linalg.norm(delta, axis=2), np.max(np.abs(delta), axis=2)
+
+        def pair(i, j):
+            return dict(reference_label=labels[j], truth_class=truth_ids[i], l2_error=float(l2[i, j]),
+                        max_absolute_error=float(linf[i, j]))
+
         rows, columns = linear_sum_assignment(l2)
-        paired = [dict(reference_label=labels[i], truth_class=truth_ids[j], l2_error=float(l2[i, j]),
-                       max_absolute_error=float(linf[i, j])) for i, j in zip(rows, columns)]
-        nearest = [dict(truth_class=truth_ids[j], reference_label=labels[i],
-                        l2_error=float(l2[i, j]), max_absolute_error=float(linf[i, j]))
-                   for j, i in ((j, int(np.argmin(l2[:, j]))) for j in range(len(truth_ids)))]
+        paired = [pair(i, j) for i, j in zip(rows, columns)]
+        nearest = [pair(i, int(np.argmin(l2[i]))) for i in range(len(truth_ids))]
         if match_atol is not None:
-            within = linf <= match_atol
-            cost = (~within)*(min(len(labels), len(truth_ids))+1) + l2 / max(1., float(l2.max()))
-            rows, columns = linear_sum_assignment(cost)
-            qualified = [dict(reference_label=labels[i], truth_class=truth_ids[j],
-                              max_absolute_error=float(linf[i, j]), l2_error=float(l2[i, j]))
-                         for i, j in zip(rows, columns) if within[i, j]]
+            distances = l2 if distance == "l2" else linf
+            matches, alternatives = _qualified_matching(distances, distances <= match_atol)
+            qualified = [pair(i, j) for i, j in matches]
+            ambiguity = [dict(truth_class=truth_ids[row["truth_index"]],
+                alternative_reference_labels=[labels[j] if j is not None else None
+                                              for j in row["alternative_reference_indices"]]) for row in alternatives]
     return dict(status="assessed" if match_atol is not None else "unassessed_no_declared_tolerance",
-        reference_match_atol=match_atol, tolerance_metric="maximum_absolute_regional_error",
+        reference_match_atol=config["reference_match_atol"], reference_distance=distance,
+        tolerance_metric="full_vector_unnormalized_l2" if distance == "l2" else "maximum_absolute_regional_error",
+        matching_policy=evaluation_definition(config)["matching_policy"],
+        matching_ambiguous=bool(ambiguity) if match_atol is not None else None, matching_ambiguity=ambiguity,
         reference_count=len(labels), truth_group_count=len(truth_ids),
         one_to_one_pairs=paired, nearest_reference_by_truth=nearest,
         mean_one_to_one_l2_error=float(np.mean([row["l2_error"] for row in paired])) if paired else None,
@@ -134,6 +250,65 @@ def reference_center_diagnostics(labels, centers, truth_centers, *, match_atol=N
         recovered_count=len(qualified) if match_atol is not None else None,
         reference_recall=_ratio(len(qualified), len(truth_ids)) if match_atol is not None else None,
         qualified_pairs=qualified if match_atol is not None else None)
+
+
+def target_reference_availability(true_center, observed, reference, *, match_atol=None, distance="l2", accepted_label=None):
+    """Full-vector geometry; only quality is restricted by target information."""
+    result = dict(geometric_reference_available=None, usable_reference_available=None,
+        geometric_correct_reference_acceptance=None, geometric_matching_labels=None, usable_matching_labels=None)
+    if match_atol is None:
+        return dict(result, geometric_availability_status="unassessed_no_declared_tolerance",
+                    usable_availability_status="unassessed_no_declared_tolerance")
+    if not reference:
+        return dict(result, geometric_availability_status="unavailable_reference",
+                    usable_availability_status="unavailable_reference")
+    true_center, observed = np.asarray(true_center, float), np.asarray(observed, bool)
+    labels = tuple(reference["labels"])
+    centers = np.asarray(reference["centers"], float).reshape(len(labels), len(true_center))
+    if not np.isfinite(true_center).all():
+        return dict(result, geometric_availability_status="unavailable_truth",
+                    usable_availability_status="unavailable_truth")
+    delta = centers - true_center
+    distances = np.linalg.norm(delta, axis=1) if distance == "l2" else np.max(np.abs(delta), axis=1)
+    matches = distances <= match_atol
+    result.update(geometric_reference_available=bool(matches.any()),
+        geometric_matching_labels=[label for label, keep in zip(labels, matches) if keep],
+        geometric_availability_status="assessed")
+    if not observed.any():
+        return dict(result, usable_availability_status="not_evaluable_no_informative_observation")
+    quality = reference.get("regional_quality")
+    if quality is None:
+        return dict(result, usable_availability_status="unavailable_reference_quality")
+    quality = np.asarray(quality)
+    if quality.shape != centers.shape or quality.dtype.kind != "b":
+        raise ValueError("Reference quality must be explicit boolean candidate-by-region flags")
+    usable = matches & quality[:, observed].all(axis=1)
+    result.update(usable_reference_available=bool(usable.any()),
+        usable_matching_labels=[label for label, keep in zip(labels, usable) if keep],
+        usable_availability_status="assessed",
+        geometric_correct_reference_acceptance=bool(accepted_label in {label for label, keep in zip(labels, usable) if keep}))
+    return result
+
+
+def detailed_membership_status(accepted_label, truth_class, mapping):
+    if accepted_label is None:
+        return "unresolved"
+    mapped = mapping.get(accepted_label)
+    return "U" if mapped is None else "Mc" if mapped == truth_class else "Mw"
+
+
+def detailed_membership_summary(rows):
+    """Mapped error bounds describe unresolved mapping, not confidence intervals."""
+    rows = [row for row in rows if row["evaluable"]]
+    counts = Counter(row["detailed_membership_status"] for row in rows)
+    correct, wrong, unmapped = (counts[key] for key in ("Mc", "Mw", "U"))
+    accepted, population = correct+wrong+unmapped, len(rows)
+    return dict(population=population, accepted=accepted, Mc=correct, Mw=wrong, U=unmapped,
+        unresolved=counts["unresolved"], mapped_correct_resolution=_ratio(correct, population),
+        mapped_wrong_resolution=_ratio(wrong, population), mapped_selective_error=_ratio(wrong, correct+wrong),
+        unmapped_acceptance_fraction=_ratio(unmapped, accepted), unmapped_resolution=_ratio(unmapped, population),
+        detailed_selective_error_lower_bound=_ratio(wrong, accepted),
+        detailed_selective_error_upper_bound=_ratio(wrong+unmapped, accepted))
 
 
 def mapped_probabilities(probabilities, labels, mapping, truth_classes):
@@ -289,7 +464,7 @@ def _truth_clonal(history):
     return np.all(np.isclose(history.phi, 1., rtol=0, atol=1e-12), axis=1)
 
 
-def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol=None):
+def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol=None, evaluation_config=None):
     """Evaluate one paired A/B/C/B3/C3 cell; return only JSON-safe data.
 
     ``result`` is the serializable paired payload from ``experiments.run_paired``.
@@ -299,10 +474,20 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     """
     if tuple(history.mutation_ids) != tuple(catalog.mutation_ids) or tuple(history.region_ids) != tuple(catalog.region_ids):
         raise ValueError("Evaluation requires the complete aligned original universe")
+    config_input = dict(evaluation_config or {})
+    if reference_match_atol is not None:
+        if "reference_match_atol" in config_input and config_input["reference_match_atol"] != reference_match_atol:
+            raise ValueError("Conflicting reference match tolerances")
+        config_input["reference_match_atol"] = reference_match_atol
+    evaluation_config = normalize_evaluation_config(config_input)
+    definition = evaluation_definition(evaluation_config)
+    reference_match_atol = evaluation_config["reference_match_atol"]
+    reference_distance = evaluation_config["reference_distance"]
     acquisition = dict(acquisition or {})
     metadata = dict(history.metadata)
     identity = dict(family=metadata.get("family", getattr(history, "family", "unknown")),
                     protocol_version=result.get("protocol_version"),
+                    run_manifest_id=result.get("run_manifest_id"),
                     source_cohort_protocol_version=result.get("source_cohort_protocol_version"),
                     history_id=metadata.get("history_id", getattr(history, "history_id", "unknown")),
                     acquisition_id=acquisition.get("id", acquisition.get("acquisition_id", "unspecified")),
@@ -321,11 +506,11 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     evaluable = known & observed.any(axis=1)
     original_n = int(evaluable.sum())
     metrics, mutation_rows, correspondence, calibration_rows, applicability, containment = [], [], [], [], [], []
-    reference_geometry = {}
+    reference_geometry, detailed_membership = {}, {}
     truth_centers = {truth_ids[m]: history.phi[index[m]] for m in ids if evaluable[index[m]]}
 
     def metric(name, arm, numerator=None, denominator=None, *, value=None, view="", stratum="all", reason=None):
-        if reason == "unavailable_analysis":
+        if reason in ("unavailable_analysis", "unavailable_geometric_acceptance"):
             value = None
         elif denominator is not None:
             value = _ratio(numerator, denominator)
@@ -420,11 +605,14 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         reference = payload.get("reference") or {}
         labels = tuple(reference.get("labels", ()))
         centers = np.asarray(reference.get("centers", []), float)
-        geometry = reference_center_diagnostics(labels, centers, truth_centers, match_atol=reference_match_atol)
+        geometry = reference_center_diagnostics(labels, centers, truth_centers,
+            match_atol=reference_match_atol, distance=reference_distance)
+        if not reference:
+            geometry.update(status="unavailable_reference", recovered_count=None, reference_recall=None)
         reference_geometry[arm] = geometry
         for name in ("mean_one_to_one_l2_error", "mean_nearest_l2_error", "reference_recall"):
             metric(name, arm, value=geometry[name], view="reference_center_geometry",
-                   reason=geometry["status"] if name == "reference_recall" and reference_match_atol is None else None)
+                   reason=geometry["status"] if name == "reference_recall" and geometry["status"] != "assessed" else None)
         center_lookup = dict(zip(labels, centers))
         clonal_label = reference.get("clonal_label", 0)
         targets, non_targets = set(payload.get("targets", ())), set(payload.get("non_targets", ()))
@@ -479,6 +667,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
             status=payload.get("assignment_status", "complete" if assignment_available else status), planned=True))
         if assignment_available and set(records) != targets:
             raise ValueError("Assignment targets differ from the frozen target population")
+        arm_mutation_start = len(mutation_rows)
         for row in payload.get("original_rows", ()):
             if row["mutation_id"] in non_targets and row.get("final_assignment_label") != combined[row["mutation_id"]]:
                 raise ValueError("Reported Stage 3 output changed an unchanged non-target membership")
@@ -563,6 +752,64 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                 truth_clonal=clonal[mutation], truth_class=truth_ids[mutation], role="outside_combined",
                 baseline_reference_label=None, final_assignment_label=None, accepted_label=None, baseline_correct=None, correct=None,
                 status="not_in_accepted_combined_population", probability_available=False))
+        arm_rows = mutation_rows[arm_mutation_start:]
+        for row in arm_rows:
+            mutation = row["mutation_id"]
+            row["binary_clonality_correct"] = row.get("correct")
+            row["detailed_membership_status"] = detailed_membership_status(
+                row["accepted_label"], truth_ids[mutation], mapping)
+            row["detailed_membership_correct"] = {"Mc": True, "Mw": False}.get(row["detailed_membership_status"])
+            row.update(target_reference_availability(history.phi[index[mutation]], observed[index[mutation]],
+                reference, match_atol=reference_match_atol, distance=reference_distance,
+                accepted_label=row["accepted_label"]))
+            if row["role"] == "target" and not assignment_available:
+                row["geometric_correct_reference_acceptance"] = None
+        populations = {
+            "targets": [row for row in arm_rows if row["role"] == "target"],
+            "unchanged_F": [row for row in arm_rows if row["role"] == "unchanged_non_target"],
+            "whole_original": arm_rows,
+            **{origin: [row for row in arm_rows if row.get("target_reason") == origin]
+               for origin in ("stage1_clonal_recheck", "stage2_near_clonal_recheck")}}
+        detailed_membership[stage] = {}
+        for population_name, rows in populations.items():
+            summary = detailed_membership_summary(rows)
+            summary["status"] = ("unavailable_analysis" if population_name != "unchanged_F"
+                and not assignment_available else "available")
+            detailed_membership[stage][population_name] = summary
+            view = "" if population_name == "targets" else population_name
+            for name in ("mapped_correct_resolution", "mapped_wrong_resolution", "mapped_selective_error",
+                    "unmapped_acceptance_fraction", "unmapped_resolution", "detailed_selective_error_lower_bound",
+                    "detailed_selective_error_upper_bound"):
+                metric(name, stage, value=summary[name], view=view,
+                    reason="unavailable_analysis" if summary["status"] == "unavailable_analysis" else None)
+            evaluable_rows = [row for row in rows if row["evaluable"]]
+            for kind in ("geometric", "usable"):
+                field = kind+"_reference_available"
+                assessed = [row for row in evaluable_rows if row[field] is not None]
+                unavailable_statuses = sorted({row[kind+"_availability_status"] for row in evaluable_rows})
+                metric(field, stage, sum(row[field] for row in assessed), len(assessed), view=view,
+                    reason=None if assessed else unavailable_statuses[0] if len(unavailable_statuses) == 1
+                    else "not_evaluable_empty_population" if not evaluable_rows else "unavailable_mixed_reasons")
+                metric(kind+"_availability_assessment_coverage", stage, len(assessed), len(evaluable_rows), view=view)
+            geometric = [row for row in evaluable_rows if row["geometric_correct_reference_acceptance"] is not None]
+            metric("geometric_correct_reference_resolution", stage,
+                sum(row["geometric_correct_reference_acceptance"] for row in geometric), len(evaluable_rows), view=view,
+                reason=None if len(geometric) == len(evaluable_rows) else "unavailable_geometric_acceptance")
+        # Availability strata use both origins and F, never alter binary recovery reach.
+        for origin in ("stage1_clonal_recheck", "stage2_near_clonal_recheck", "unchanged_F"):
+            rows = [row for row in populations[origin] if row["evaluable"]]
+            for kind in ("geometric", "usable"):
+                for value in (True, False, None):
+                    selected = [row for row in rows if row[kind+"_reference_available"] is value]
+                    stratum = f"{origin}:{kind}:{'available' if value is True else 'absent' if value is False else 'unassessed'}"
+                    counts = Counter(row["detailed_membership_status"] for row in selected)
+                    for name, count in (("accepted", sum(row["accepted_label"] is not None for row in selected)),
+                            ("binary_correct", sum(row["binary_clonality_correct"] is True for row in selected)),
+                            ("binary_wrong", sum(row["binary_clonality_correct"] is False for row in selected)),
+                            *((key, counts[key]) for key in ("Mc", "Mw", "U", "unresolved"))):
+                        metric("availability_stratified_"+name, stage, count, len(selected),
+                            view="availability", stratum=stratum,
+                            reason="unavailable_analysis" if origin != "unchanged_F" and not assignment_available else None)
         neval = len(target_evaluable)
         reason = None if assignment_available else "unavailable_analysis"
         for name, num, den in (("acceptance_coverage", accepted_count, neval), ("correct_resolution", correct_count, neval),
@@ -739,12 +986,23 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     input_error = ((catalog.major_cn != history.major_cn) | (catalog.minor_cn != history.minor_cn)
                    | (catalog.purity != np.broadcast_to(true_purity, history.phi.shape))
                    | (catalog.segment_ids != history.segment_ids) | ~catalog.mapping_genuine)
-    return json_safe(dict(schema="clipp2.simulation.evaluation.v1", **identity, original_mutation_count=len(ids),
+    # Original names stay available for frozen selection/report consumers. Explicit
+    # aliases distinguish the unchanged binary endpoint from detailed membership.
+    binary_names = {"correct_resolution", "selective_error", "wrong_per_evaluable", "correct_per_original_evaluable",
+                    "whole_workflow_wrong_acceptance", "baseline_error_recovery", "unchanged_population_membership_error"}
+    for row in list(metrics):
+        if row["name"] in binary_names:
+            row["endpoint"] = "binary_clonality"
+            metrics.append(dict(row, name="binary_"+row["name"]))
+    return json_safe(dict(schema="clipp2.simulation.evaluation.v2", **identity,
+        evaluation_config=evaluation_config, evaluation_definition=definition,
+        evaluation_definition_id=content_hash(definition), original_mutation_count=len(ids),
         original_evaluable_count=original_n, region_count=len(regions), metrics=metrics, mutations=mutation_rows,
         input_error_fraction=float(input_error.mean()),
         applicability=applicability, cap_audit=audit, declared_source_audit=declared,
         candidate_correspondence=correspondence, reference_center_geometry=reference_geometry,
-        reference_match_atol=reference_match_atol, stage_three_containment=containment,
+        reference_match_atol=reference_match_atol, reference_distance=reference_distance,
+        detailed_membership=detailed_membership, stage_three_containment=containment,
         calibration=calibration_rows, information=information, recovery_reach=reach,
         error_coverage_curves=curves,
         reliability={arm: reliability([row["clonal_probability"] for row in calibration_rows if row["arm"] == arm],
@@ -838,6 +1096,32 @@ def aggregate(evaluations, *, bootstrap_replicates=1000, seed=20261106, families
     disappear into a more favorable macro-average.
     """
     evaluations = list(evaluations)
+    definitions = {}
+    for record in evaluations:
+        schema = record.get("schema")
+        if schema == "clipp2.simulation.evaluation.v2":
+            definition = record.get("evaluation_definition")
+            identity = record.get("evaluation_definition_id")
+            if not isinstance(definition, dict) or identity != content_hash(definition):
+                raise ValueError("Evaluation definition identity is missing or invalid")
+        elif schema == "clipp2.simulation.evaluation.v1":
+            # Label historical records; never silently recalculate old geometry.
+            definition = dict(schema="clipp2.simulation.evaluation-definition.legacy-v1",
+                binary_endpoint="accepted_designated_clonal_status_equals_physical_truth_clonality",
+                reference_distance="linf", reference_match_atol=record.get("reference_match_atol"),
+                matching_policy="legacy_forced_pairs_influence_valid_edge_cost",
+                detailed_endpoint="legacy_multiclass_unmapped_treated_as_incorrect")
+            identity = content_hash(definition)
+        else:
+            raise ValueError("Aggregation requires versioned evaluation records")
+        definitions[identity] = definition
+    if len(definitions) > 1:
+        raise ValueError("Incompatible evaluation definitions require separate aggregates or explicit re-evaluation")
+    if definitions:
+        definition_id, definition = next(iter(definitions.items()))
+    else:
+        definition = evaluation_definition()
+        definition_id = content_hash(definition)
     if bootstrap_replicates < 0:
         raise ValueError("Bootstrap replicate count must be nonnegative")
     rng = np.random.default_rng(seed)
@@ -888,6 +1172,7 @@ def aggregate(evaluations, *, bootstrap_replicates=1000, seed=20261106, families
             family_means=family_means, family_history_counts=family_counts, planned_cells=len(evaluations),
             available_cells=sum(value is not None for *_, value in rows),
             unavailable_families=[f for f in families if family_means[f] is None]))
-    return json_safe(dict(schema="clipp2.simulation.aggregate.v1", weighting="equal_family_then_equal_history_then_equal_acquisition",
+    return json_safe(dict(schema="clipp2.simulation.aggregate.v2", evaluation_definition=definition,
+        evaluation_definition_id=definition_id, weighting="equal_family_then_equal_history_then_equal_acquisition",
         uncertainty="paired_history_bootstrap_all_acquisitions_together", bootstrap_replicates=bootstrap_replicates,
         bootstrap_seed=seed, families=list(families), planned_datasets=len(evaluations), metrics=summaries))

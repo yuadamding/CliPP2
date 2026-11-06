@@ -232,6 +232,19 @@ def _native_failure_check(root, history, frame, job, contract):
     with zipfile.ZipFile(zipped) as archive:
         archive.extractall(overlap)
     assert recorded_costs(root) == costs
+    assert _paired_result(retry) == restored
+    # Partial directory cleanup must fall back to the already verified archive.
+    (overlap / "execution.jsonl").unlink()
+    (overlap / "paired_result.json").unlink()
+    assert recorded_costs(root) == costs
+    assert _paired_result(retry) == restored
+    (overlap / "paired_result.json").write_text(json.dumps(dict(restored, status="conflicting")))
+    try:
+        _paired_result(retry)
+    except ValueError as error:
+        assert "disagree" in str(error)
+    else:
+        raise AssertionError("Conflicting directory and archive evidence was reused")
     shutil.rmtree(overlap)
     before = {str(p.relative_to(root)): (p.stat().st_size, p.stat().st_mtime_ns)
               for p in root.rglob("*") if p.is_file()}
@@ -309,6 +322,70 @@ def _planned_report_check(root, contract):
     assert all(all(not state["available"] and state["status"] == "not_executed"
                    for state in row["applicability"]) for row in captured)
     assert all(metric["value"] == 0 for row in captured for metric in row["metrics"])
+
+
+def _offline_report_check(root, history, job):
+    """A legacy archived result can acquire new metrics without inference IO."""
+    from contextlib import ExitStack
+    from CliPP2.simulation.reporting import reevaluate_cell
+    from CliPP2.simulation.study import _latest_completion
+    history_dir = root / "histories" / job["history_id"]
+    history.write_truth(history_dir)
+    save_json(history_dir / "history_manifest.json", {key: job[key]
+        for key in ("history_id", "family", "history_seed", "dimensions")})
+    save_json(root / "job_manifests/batch-001.json", [job])
+    frozen = dict(selected=dict(contributor=.99, posterior=.90), frozen_before_main_generation=True)
+    save_json(root / "threshold_development.json", frozen)
+    # Model a preserved 1.2.1 contract whose original cohort source is gone. The
+    # derived report must depend only on the retained selected attempt and truth.
+    contract = read_json(root / "study_contract.json")
+    contract.update(schema="clipp2.simulation-contract.v3", implementation_version="1.2.1")
+    contract["cohort"].pop("content_id", None)
+    contract["cohort"]["path"] = str(root / "not_present_original_cohort.json")
+    (root / "study_contract.json").write_text(json.dumps(contract))
+    before = {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    destination = root.parent / "offline_report"
+    config = dict(reference_match_atol=.025, reference_distance="l2")
+    forbidden = ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
+        "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.study._history", "CliPP2.simulation.study._acquire",
+        "CliPP2.simulation.study.select_thresholds", "CliPP2.simulation.cohort.load_cohort")
+    with ExitStack() as stack:
+        for name in forbidden:
+            stack.enter_context(patch(name, side_effect=AssertionError("Offline report executed " + name)))
+        stack.enter_context(patch("CliPP2.simulation.figures.make_figures", return_value=[]))
+        result = report(root, evaluation_config=config, report_dir=destination)
+    assert result["summary"]["report_mode"] == "offline_reevaluation"
+    assert result["summary"]["derived_evidence_unavailable"] == 0
+    derived = read_json(destination / "evaluations/evaluation-00001.json")
+    assert derived["status"] == "derived_from_preserved_evidence"
+    assert derived["evaluation_definition"]["reference_distance"] == "l2"
+    assert derived["derivation"]["fit_count"] == derived["derivation"]["assignment_pass_count"] == 0
+    manifest = read_json(destination / "derivation_manifest.json")
+    assert manifest["frozen_threshold_development"] == frozen and not manifest["historical_cohort_identity_backfilled"]
+    assert before == {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    cell = _latest_completion(root / "cells" / job["cell_id"])
+    fixture = root.parent / "offline_invalid_evidence"
+    shutil.copytree(root, fixture)
+    attempt = fixture / cell["attempt"]
+    (attempt / "configuration-1").mkdir()
+    assert reevaluate_cell(fixture, cell, config)["status"] == "derived_from_preserved_evidence"
+    # Directory and archive copies must agree if both survived publication.
+    with zipfile.ZipFile(attempt / "configuration-1.zip") as archive:
+        archive.extractall(attempt / "configuration-1")
+    assert reevaluate_cell(fixture, cell, config)["status"] == "derived_from_preserved_evidence"
+    paired_path = attempt / "configuration-1/paired_result.json"
+    changed = read_json(paired_path)
+    changed["status"] = "different_retained_evidence"
+    paired_path.write_text(json.dumps(changed))
+    assert reevaluate_cell(fixture, cell, config)["status"] == "unavailable_derived_evidence"
+    shutil.rmtree(attempt / "configuration-1")
+    altered_job = dict(job, acquisition=dict(job["acquisition"], id="A1"))
+    (attempt / "job.json").write_text(json.dumps(altered_job))
+    assert reevaluate_cell(fixture, cell, config)["status"] == "unavailable_derived_evidence"
+    (attempt / "job.json").write_text(json.dumps(job))
+    (fixture / "histories" / job["history_id"] / "history.json").unlink()
+    with patch("CliPP2.simulation.study._history", side_effect=AssertionError("missing truth regenerated")):
+        assert reevaluate_cell(fixture, cell, config)["status"] == "unavailable_derived_evidence"
 
 
 def _structured_failure_checks(root):
@@ -505,6 +582,7 @@ def run_checks(directory, cohort_settings):
     selection_root.mkdir()
     _selection_check(selection_root, contract, history, frame, job)
     _native_failure_check(root / "native_failure", history, frame, job, contract)
+    _offline_report_check(root / "native_failure", history, job)
     _partial_objective_check(root / "partial_objective", contract, history, frame, job)
     _planned_report_check(root / "unexecuted_report", contract)
     result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4, lifecycle=lifecycle,
@@ -519,7 +597,9 @@ def run_checks(directory, cohort_settings):
                 "successful_retry_archives_complete_numerical_receipts", "archive_roundtrip_preserves_paired_state_and_costs",
                 "full_truth_evaluator_accepts_protocol22_assignment_and_final_membership",
                 "runtime_counts_archived_failed_and_interrupted_work_once", "runtime_status_does_not_modify_outputs",
-                "frozen_configuration_reaches_real_runner", "unexecuted_main_cells_remain_in_planned_denominator"])
+                "frozen_configuration_reaches_real_runner", "unexecuted_main_cells_remain_in_planned_denominator",
+                "offline_archived_legacy_evaluation_preserves_sources_and_frozen_thresholds",
+                "offline_missing_or_ambiguous_evidence_unavailable_without_regeneration"])
     save_json(root / "study_checks.json", result)
     return result
 

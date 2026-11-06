@@ -130,7 +130,8 @@ def _paired(evaluations, aggregate_report, output, paths):
 
 
 def _decisions(evaluations, aggregate_report, output, paths):
-    figure, axes = plt.subplots(1, 2, figsize=(13, 5))
+    figure, grid = plt.subplots(2, 3, figsize=(16, 9))
+    axes = grid.ravel()
     for arm, color in (("B3", "#1565a8"), ("C3", "#ca6b26")):
         coverage = {(e["family"], e["history_id"], e["acquisition_id"]): value for e, value in _values(evaluations, "acceptance_coverage", arm)}
         error = {(e["family"], e["history_id"], e["acquisition_id"]): value for e, value in _values(evaluations, "selective_error", arm)}
@@ -157,15 +158,52 @@ def _decisions(evaluations, aggregate_report, output, paths):
         _unavailable(axes[0])
     else:
         axes[0].legend()
-    axes[0].set(xlabel="Accepted / evaluable targets", ylabel="Wrong / accepted targets",
-                title="Fixed-reference threshold curves and executed decisions", xlim=(-.02, 1.02), ylim=(-.02, 1.02))
+    axes[0].set(xlabel="Accepted / evaluable targets", ylabel="Binary wrong / accepted targets",
+                title="Binary clonality: executed decisions and threshold curves", xlim=(-.02, 1.02), ylim=(-.02, 1.02))
     axes[1].set(xticks=np.arange(6), xticklabels=[name.replace("_", "\n") for name in TRANSITIONS],
-                ylabel="Fraction of evaluable targets", title="Combined-baseline transitions")
+                ylabel="Fraction of evaluable targets", title="Binary clonality: combined-baseline transitions")
     if axes[1].collections:
         axes[1].legend()
     else:
         _unavailable(axes[1])
-    figure.suptitle("4 · Decisions and abstention must be reported together", y=1.02)
+    definitions = ((axes[2], "", "Detailed membership: targets"),
+                   (axes[3], "unchanged_F", "Detailed membership: unchanged F"))
+    for ax, view, title in definitions:
+        for arm, offset, color in (("B3", -.16, "#1565a8"), ("C3", .16, "#ca6b26")):
+            for position, name in enumerate(("mapped_correct_resolution", "mapped_wrong_resolution", "unmapped_resolution")):
+                values = [value for _, value in _values(evaluations, name, arm, view=view)]
+                if values:
+                    ax.scatter(position+offset+np.linspace(-.06, .06, len(values)), values, color=color,
+                               s=12, alpha=.5, label=arm if position == 0 else None)
+        if ax.collections:
+            ax.legend()
+        else:
+            _unavailable(ax, "Detailed endpoints unavailable in these evaluation records")
+        ax.set(title=title, xticks=[0, 1, 2], xticklabels=["Mc / P", "Mw / P", "U / P"],
+               ylabel="Fraction of evaluable population", ylim=(-.02, 1.02))
+    for arm, color in (("B3", "#1565a8"), ("C3", "#ca6b26")):
+        geom = {(e["history_id"], e["acquisition_id"]): value
+                for e, value in _values(evaluations, "geometric_reference_available", arm)}
+        usable = {(e["history_id"], e["acquisition_id"]): value
+                  for e, value in _values(evaluations, "usable_reference_available", arm)}
+        keys = geom.keys() & usable.keys()
+        if keys:
+            axes[4].scatter([geom[key] for key in keys], [usable[key] for key in keys],
+                            color=color, label=arm, s=15, alpha=.6)
+        values = [value for _, value in _values(evaluations, "geometric_correct_reference_resolution", arm)]
+        if values:
+            position = 0 if arm == "B3" else 1
+            axes[5].scatter(position+np.linspace(-.1, .1, len(values)), values, color=color, s=15, alpha=.6)
+    for ax in axes[4:]:
+        if not ax.collections:
+            _unavailable(ax, "No assessed geometric endpoint; declare a tolerance to evaluate")
+    if axes[4].collections:
+        axes[4].legend()
+    axes[4].set(title="Correct reference availability: targets", xlabel="Geometric availability",
+                ylabel="Usable availability", xlim=(-.02, 1.02), ylim=(-.02, 1.02))
+    axes[5].set(title="Geometric correct-reference acceptance", xticks=[0, 1], xticklabels=["B3", "C3"],
+                ylabel="Correct and usable accepted center / P", ylim=(-.02, 1.02))
+    figure.suptitle("4 · Binary decisions, detailed membership and reference availability", y=1.02)
     _save(figure, output, "04_decisions_transitions", paths)
 
 

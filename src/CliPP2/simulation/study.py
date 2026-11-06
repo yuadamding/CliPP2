@@ -71,11 +71,8 @@ def _archive_completed(directory):
 
 
 def _paired_result(attempt, index=1):
-    source = Path(attempt) / f"configuration-{index}"
-    if source.is_dir():
-        return read_json(source / "paired_result.json")
-    with zipfile.ZipFile(source.with_suffix(".zip")) as archive:
-        return json.loads(archive.read("paired_result.json"))
+    from .reporting import _configuration
+    return _configuration(Path(attempt), index)
 
 
 @lru_cache(maxsize=2)
@@ -192,7 +189,8 @@ def _run_cell(task):
     from .evaluation import evaluate
     from .experiment import run_paired_experiment
     root, job, selected = Path(task["root"]), task["job"], task.get("selected")
-    evaluation_config = dict(reference_match_atol=task.get("reference_match_atol"))
+    evaluation_config = dict(reference_match_atol=task.get("reference_match_atol"),
+                             reference_distance=task.get("reference_distance", "l2"))
     directory = root / "cells" / job["cell_id"]
     if job.get("cohort_settings"):
         _cohort(job["cohort_settings"], job["cohort_content_id"])
@@ -248,7 +246,7 @@ def _run_cell(task):
             first = first or experiment.get("stage_one")
             second = second or experiment.get("arms", {}).get("B", {}).get("stage_two")
             evaluation = evaluate(history, catalog, experiment, acquisition=frame.attrs.get("acquisition"),
-                                  reference_match_atol=task.get("reference_match_atol"))
+                                  evaluation_config=evaluation_config)
             evaluation.update(cell_id=job["cell_id"], history_id=job["history_id"], family=job["family"],
                               acquisition_id=acquisition["id"], acquisition=acquisition, phase=job["phase"], job=job)
             save_json(attempt / f"evaluation-{index+1}.json", evaluation)
@@ -334,6 +332,7 @@ def run_jobs(root, job_list, *, workers, selected=None, contract=None, retry_fai
                           retry_failed=retry_failed,
                           archive_completed=contract["resource_limits"].get("archive_completed_outputs", False) if contract else False,
                           reference_match_atol=contract.get("evaluation", {}).get("reference_match_atol") if contract else None,
+                          reference_distance=contract.get("evaluation", {}).get("reference_distance", "l2") if contract else "l2",
                           run_manifest_id=contract.get("run_manifest_id") if contract else None,
                           fixed_families=settings.get("fixed_population_families", ["S01", "S02", "S07"])))
     values = []
@@ -402,6 +401,8 @@ def select_thresholds(root, cells, contract):
     selected = min(qualified, key=lambda row: (-row["objective"], row["target_wrong_acceptance"],
         -row["posterior"], -row["contributor"], row["configuration_id"])) if qualified else None
     return dict(schema="clipp2.simulation-development.v1", selected=selected,
+                endpoint="binary_clonality", constraint_scope="empirical_development_not_population_error_guarantee",
+                selective_error_definition="wrong_accepted_binary_clonality_over_accepted_targets",
                 configurations=candidates, cell_objectives=rows, tuning_target="C3", B3_separately_optimized=False)
 
 
@@ -680,28 +681,47 @@ def run_optional_panels(root, contract, selected, workers):
         run_scaling(output / "scaling", config)
 
 
-def report(root):
-    from .evaluation import aggregate
+def report(root, *, evaluation_config=None, report_dir=None):
+    """Render cached metrics or explicitly reevaluate preserved inference evidence."""
+    from .evaluation import aggregate, normalize_evaluation_config
     from .figures import make_figures
-    from .runtime import recorded_costs
-    root = Path(root)
+    from .runtime import recorded_costs, qualification_costs
+    from .reporting import preserved_jobs, reevaluate_cell, unavailable_evaluation
+    root = Path(root).resolve()
     contract = read_json(root / "study_contract.json")
+    derive = evaluation_config is not None
+    if derive:
+        if isinstance(evaluation_config, (str, Path)):
+            evaluation_config = read_json(evaluation_config)
+        evaluation_config = normalize_evaluation_config(evaluation_config)
     cells = [value for directory in sorted((root / "cells").glob("*")) if directory.is_dir()
              for value in [_latest_completion(directory)] if value is not None]
     main = [cell for cell in cells if cell["job"]["phase"] == "main"]
     allocation_path = root / "allocation.json"
-    if allocation_path.exists():
-        allocation = read_json(allocation_path)
+    allocation = read_json(allocation_path) if allocation_path.exists() else {}
+    completed_ids = {cell["job"]["cell_id"] for cell in main}
+    submitted = preserved_jobs(root)
+    # Cached reports for a current, bound contract retain the preexisting
+    # planned-population behavior. Offline derivation never reopens a cohort.
+    if not derive and allocation and (not contract.get("cohort") or contract["cohort"].get("content_id")):
         count = allocation.get("main_replicates_per_variant") or allocation["main_histories_per_family"]
-        completed_ids = {cell["job"]["cell_id"] for cell in main}
-        for job in jobs(contract, "main", count):
-            if job["cell_id"] not in completed_ids:
-                main.append(dict(job=job, status="not_executed", evaluations=[], cost_ledgers=[],
-                                 elapsed_seconds=0., peak_resident_bytes=0, output_bytes=0))
+        submitted = list(jobs(contract, "main", count))
+    for job in submitted:
+        if job["phase"] == "main" and job["cell_id"] not in completed_ids:
+            main.append(dict(job=job, status="not_executed", evaluations=[], cost_ledgers=[],
+                             elapsed_seconds=0., peak_resident_bytes=0, output_bytes=0))
     evaluations = []
+    cached = {cell["job"]["cell_id"]: read_json(root / cell["evaluations"][0])
+              for cell in main if cell.get("evaluations")} if not derive else {}
+    cached_v2 = next((value for value in cached.values() if value.get("schema") == "clipp2.simulation.evaluation.v2"), None)
     for cell in main:
-        if cell.get("evaluations"):
-            evaluations.append(read_json(root / cell["evaluations"][0]))
+        if derive:
+            evaluations.append(reevaluate_cell(root, cell, evaluation_config))
+        elif cell["job"]["cell_id"] in cached:
+            evaluations.append(cached[cell["job"]["cell_id"]])
+        elif cached_v2 is not None:
+            evaluations.append(unavailable_evaluation(cell["job"], cell["status"],
+                evaluation_config=cached_v2["evaluation_config"]))
         else:
             job = cell["job"]
             evaluations.append(dict(schema="clipp2.simulation.evaluation.v1", cell_id=job["cell_id"],
@@ -718,13 +738,32 @@ def report(root):
                 mutations=[], calibration=[], cap_audit=[], stage_three_containment=[], information=[]))
     summary = aggregate(evaluations)
     costs = recorded_costs(root)
-    summary.update(planned_main_cells=len(main), worker_failures=sum(cell["status"] == "execution_failed" for cell in main),
-                   unexecuted_main_cells=sum(cell["status"] == "not_executed" for cell in main),
+    planned = allocation.get("planned_main_datasets", len(main))
+    summary.update(planned_main_cells=planned, worker_failures=sum(cell["status"] == "execution_failed" for cell in main),
+                   unexecuted_main_cells=max(0, planned-sum(cell["status"] != "not_executed" for cell in main)),
                    all_cell_count=len(cells), peak_resident_bytes=max((c["peak_resident_bytes"] for c in cells), default=0),
                    fit_count=costs.get("fit_attempts", 0), assignment_pass_count=costs.get("assignment_attempts", 0),
-                   operation_costs=costs)
-    report_dir = root / "reports" / f"report-{len(list((root / 'reports').glob('report-*')))+1:03d}"
+                   operation_costs=costs, qualification_costs=qualification_costs(root),
+                   report_mode="offline_reevaluation" if derive else "cached_metrics",
+                   derived_evidence_unavailable=sum(e.get("status") == "unavailable_derived_evidence" for e in evaluations))
+    report_dir = (Path(report_dir).resolve() if report_dir is not None else
+                  root / "reports" / f"report-{len(list((root / 'reports').glob('report-*')))+1:03d}")
+    if report_dir == root or (report_dir.is_relative_to(root) and report_dir.relative_to(root).parts[0] != "reports"):
+        raise ValueError("A report inside the source study must use a new directory under reports")
     report_dir.mkdir(parents=True)
+    if derive:
+        save_json(report_dir / "evaluation_config.json", evaluation_config)
+        selection = root / "threshold_development.json"
+        save_json(report_dir / "derivation_manifest.json", dict(schema="clipp2.simulation.report-derivation.v1",
+            source_study=str(root), source_contract_schema=contract.get("schema"),
+            source_implementation_version=contract.get("implementation_version"),
+            source_cohort_content_id=contract.get("cohort", {}).get("content_id") if contract.get("cohort") else None,
+            historical_cohort_identity_backfilled=False,
+            frozen_threshold_development=read_json(selection) if selection.exists() else None,
+            evaluation_config=evaluation_config, implementation_version=__version__,
+            fit_count=0, assignment_pass_count=0, threshold_selection_count=0))
+        for index, evaluation in enumerate(evaluations, 1):
+            save_json(report_dir / "evaluations" / f"evaluation-{index:05d}.json", evaluation)
     save_json(report_dir / "aggregate.json", summary)
     figures = make_figures(evaluations, summary, report_dir)
     metrics = [dict(cell_id=e["cell_id"], history_id=e["history_id"], family=e["family"],
@@ -748,9 +787,9 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
     allocation = read_json(root / "allocation.json") if (root / "allocation.json").exists() else {}
     development = read_json(root / "threshold_development.json") if (root / "threshold_development.json").exists() else {}
     selected = development.get("selected")
-    text = ["<!doctype html><meta charset='utf-8'><title>CliPP2 biological simulation 1.1</title>",
+    text = ["<!doctype html><meta charset='utf-8'><title>CliPP2 biological simulation 1.2</title>",
         "<style>body{font:16px system-ui;max-width:1100px;margin:40px auto;line-height:1.5}img{max-width:100%}pre{white-space:pre-wrap}td,th{padding:6px;border:1px solid #ddd}table{border-collapse:collapse}</style>",
-        "<h1>CliPP2 biological simulation 1.1</h1>",
+        "<h1>CliPP2 biological simulation 1.2</h1>",
         f"<p>Execution Protocol {html.escape(contract['protocol_version'])}; source cohort Protocol {html.escape(str(contract.get('source_cohort_protocol_version') or 'not specified'))}; source revision {html.escape(contract['source_identity'].get('git_commit') or 'unavailable')}. Source evidence is supplied externally; no source-directory scan is performed. CPU execution; CUDA is not qualified by this study.</p>",
         f"<p>Completed main datasets: {sum(c['status']=='complete' for c in cells if c['job']['phase']=='main')}. Planned main datasets: {allocation.get('planned_main_datasets', 0)}. "
         f"Native fits executed across all phases: {summary['fit_count']}; full-support assignment passes: {summary['assignment_pass_count']}.</p>",

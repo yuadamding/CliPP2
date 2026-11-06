@@ -27,6 +27,7 @@ from CliPP2.io.reporting import verify_selected
 from CliPP2.kernel.model import RegionalModel
 from CliPP2.tree.selection import fit_regions
 from CliPP2.workflow import classify_groups
+from CliPP2.simulation.evaluation import reference_center_diagnostics
 
 from check_workflow import fixture_reference, run_checks, write_catalog, workflow_config
 
@@ -43,35 +44,29 @@ def partition_matching(truth, labels):
 
 
 def reference_errors(truth_centers, reference_centers, atol=None):
-    """Continuous errors plus optional one-to-one, within-tolerance recovery."""
+    """Use the study's declared full-vector L2 matching, independent of overlap."""
     truth = np.asarray(truth_centers, float)
     reference = np.asarray(reference_centers, float).reshape(-1, truth.shape[1])
-    if atol is not None and (not np.isfinite(atol) or atol < 0):
-        raise ValueError("reference_match_atol must be finite and nonnegative")
+    evidence = reference_center_diagnostics(tuple(range(len(reference))), reference,
+        dict(enumerate(truth)), match_atol=atol)
+    matching = [dict(truth_label=row["truth_class"], reference_index=row["reference_label"],
+        l2=row["l2_error"], max_coordinate_error=row["max_absolute_error"])
+        for row in evidence["one_to_one_pairs"]]
+    recovered = None if atol is None else [False]*len(truth)
+    for row in evidence["qualified_pairs"] or ():
+        recovered[row["truth_class"]] = True
     delta = truth[:, None, :] - reference[None, :, :]
     distance, maximum = np.linalg.norm(delta, axis=2), np.max(np.abs(delta), axis=2)
-    rows, cols = linear_sum_assignment(distance)
-    matching = [dict(truth_label=int(i), reference_index=int(j), l2=float(distance[i, j]),
-                     max_coordinate_error=float(maximum[i, j])) for i, j in zip(rows, cols, strict=True)]
-    recovered = None
-    if atol is not None:
-        valid = maximum <= atol
-        scaled = distance/(1+float(distance.max(initial=0)))
-        # Maximize valid matches before minimizing center distance: one candidate
-        # cannot recover two truth groups, even if both fall within tolerance.
-        rows, cols = linear_sum_assignment((~valid)*(len(truth)+len(reference)+1)+scaled)
-        recovered = [False]*len(truth)
-        for i, j in zip(rows, cols, strict=True):
-            recovered[int(i)] = bool(valid[i, j])
     return dict(alignment="one_to_one_minimum_regional_L2_not_member_overlap", matching=matching,
         true_group_count=len(truth), candidate_count=len(reference), reference_match_atol=atol,
-        tolerance_metric="maximum_absolute_coordinate_error",
+        tolerance_metric=evidence["tolerance_metric"], matching_policy=evidence["matching_policy"],
+        matching_ambiguous=evidence["matching_ambiguous"], matching_ambiguity=evidence["matching_ambiguity"],
+        qualified_pairs=evidence["qualified_pairs"],
         nearest_l2=[float(row.min()) if len(row) else None for row in distance],
         nearest_max_coordinate_error=[float(row.min()) if len(row) else None for row in maximum],
-        one_to_one_mean_l2=float(np.mean([row["l2"] for row in matching])) if matching else None,
+        one_to_one_mean_l2=evidence["mean_one_to_one_l2_error"],
         recovery_status="unassessed_no_declared_tolerance" if atol is None else "assessed_with_declared_tolerance",
-        recovered_by_truth=recovered,
-        reference_recall=None if recovered is None else float(np.mean(recovered)))
+        recovered_by_truth=recovered, reference_recall=evidence["reference_recall"])
 
 
 def fit_policy(catalog, support, truth_labels, truth_multiplicities, truth_centers, reference_match_atol=None):

@@ -16,28 +16,22 @@ def recorded_costs(root):
         completed_attempts = {json.loads(path.read_text())["attempt"] for path in attempt.parent.glob("completion*.json")}
         if str(attempt.relative_to(root)) not in completed_attempts:
             counts["unfinished_attempts"] += 1
-        configurations = {}
-        for path in attempt.glob("configuration-*"):
-            if path.is_dir() or path.suffix == ".zip":
-                key = path.stem if path.suffix == ".zip" else path.name
-                if path.is_dir() or key not in configurations:
-                    configurations[key] = path
+        configurations = {path.stem if path.suffix == ".zip" else path.name
+                          for path in attempt.glob("configuration-*")
+                          if path.is_dir() or path.suffix == ".zip"}
         # A process may stop after linking the verified archive but before
         # removing its source directory; that is one operation, not two.
-        for config in configurations.values():
+        for name in configurations:
             try:
-                if config.is_dir():
-                    journal = config / "execution.jsonl"
-                    if not journal.exists():
-                        continue
-                    lines = journal.read_text().splitlines()
-                elif config.suffix == ".zip":
-                    with zipfile.ZipFile(config) as archive:
+                lines = (attempt / name / "execution.jsonl").read_text().splitlines()
+            except OSError:
+                # Directory cleanup can remove the journal before removing its
+                # parent. The complete archive remains authoritative evidence.
+                try:
+                    with zipfile.ZipFile(attempt / (name + ".zip")) as archive:
                         lines = archive.read("execution.jsonl").decode().splitlines()
-                else:
+                except (OSError, KeyError, zipfile.BadZipFile):
                     continue
-            except (OSError, KeyError, zipfile.BadZipFile):
-                continue
             latest = {}
             for line in lines:
                 try:

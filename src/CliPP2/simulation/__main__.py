@@ -38,6 +38,9 @@ def main(argv=None):
     materialize.add_argument("--outdir", type=Path, required=True)
     render = sub.add_parser("report", help="Rebuild reports from immutable completed cells")
     render.add_argument("outdir", type=Path)
+    render.add_argument("--evaluation-config", type=Path,
+        help="Derive new evaluation metrics from preserved evidence without rerunning inference")
+    render.add_argument("--report-dir", type=Path, help="New report destination; existing paths are never overwritten")
     progress = sub.add_parser("status", help="Inspect completed cells and in-flight native operations")
     progress.add_argument("outdir", type=Path)
     args = parser.parse_args(argv)
@@ -53,7 +56,7 @@ def main(argv=None):
         from .qualification import materialize_cohort
         result = materialize_cohort(args.cohort_settings, args.outdir)
     elif args.command == "report":
-        result = report(args.outdir)
+        result = report(args.outdir, evaluation_config=args.evaluation_config, report_dir=args.report_dir)
     else:
         contract = (read_json(args.outdir / "study_contract.json") if args.resume else
             make_contract(workers=args.workers, budget_minutes=args.budget_minutes,
