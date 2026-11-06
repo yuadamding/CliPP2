@@ -17,7 +17,7 @@ import pandas as pd
 
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
 from CliPP2.simulation.biology import generate_history
-from CliPP2.simulation.design import allocate, jobs, make_contract, workflow_config
+from CliPP2.simulation.design import jobs, roster_counts, make_contract, workflow_config
 from CliPP2.simulation.runtime import qualification_costs, recorded_costs, status
 from CliPP2.simulation.study import (_decision, _execute, _paired_result, _prepare_histories, _qualification_step,
                                     _run_cell, development_scores, read_json, report,
@@ -62,12 +62,12 @@ def _fixed_information(*args, **kwargs):
 def _design_check(root, settings):
     snapshot = root / "cohort_settings.json"
     shutil.copyfile(settings, snapshot)
-    contract = make_contract(profile="full", cohort_settings=snapshot)
+    contract = make_contract(cohort_settings=snapshot)
     assert contract["protocol_version"] == "2.2" and contract["source_cohort_protocol_version"] == "2.1"
-    assert contract["schema"] == "clipp2.simulation-contract.v4"
+    assert contract["schema"] == "clipp2.simulation-contract.v5"
     assert contract["evaluation"]["reference_match_atol"] is None
     assert json.loads(snapshot.read_text())["workflow_protocol"] == "2.1"
-    main, development = list(jobs(contract, "main", 10)), list(jobs(contract, "development", 2))
+    main, development = list(jobs(contract, "main")), list(jobs(contract, "development"))
     assert len(main) == 2400 and len(development) == 240
     assert len({row["cell_id"] for row in main + development}) == 2640
     main_histories = {row["history_id"] for row in main}
@@ -82,7 +82,30 @@ def _design_check(root, settings):
             assert len({row["history_seed"] for row in entries}) == 1
             assert all(row["acquisition"] == dict(id="A4", purity=.8, depth=500)
                        for row in entries if row["acquisition"]["id"] == "A4")
-    allocation = allocate(contract, [1.], [1])
+    other_workers = deepcopy(contract)
+    other_workers["resource_limits"]["workers"] = 1
+    assert list(jobs(other_workers, "main")) == main
+    assert list(jobs(other_workers, "development")) == development
+    assert not contract["replicate_roster"]["development_extension"]
+    reduced = make_contract(cohort_settings=snapshot, main_replicates=1, development_replicates=1)
+    assert reduced["replicate_roster"]["development"] == [1]
+    assert reduced["replicate_roster"]["development_extension"] == [2]
+    assert len(list(jobs(reduced, "development", extension=True))) == 120
+    from CliPP2.simulation.reporting import roster_identity
+    payload = dict(schema="clipp2.simulation-roster.v1", families=contract["families"],
+                   identity_policy="semantic_jobs_without_cohort_path", jobs=main)
+    relocated = deepcopy(payload)
+    for job in relocated["jobs"]:
+        job["cohort_settings"] = "/relocated/cohort_settings.json"
+    assert roster_identity(payload) == roster_identity(relocated)
+    relocated["jobs"][0]["history_seed"] += 1
+    assert roster_identity(payload) != roster_identity(relocated)
+    worker_payload = dict(payload, jobs=list(jobs(other_workers, "main")))
+    assert roster_identity(worker_payload) == roster_identity(payload)
+    legacy = {key: payload[key] for key in ("schema", "families", "jobs")}
+    from CliPP2.io.data import content_hash
+    assert roster_identity(legacy) == content_hash(legacy)
+    allocation = roster_counts(contract)
     assert allocation["planned_main_datasets"] + allocation["planned_development_datasets"] == 2640
     assert allocation["planned_core_max_fits"] == 7920 and allocation["planned_core_max_assignment_passes"] == 5280
     config = contract["base_workflow_config"]
@@ -317,12 +340,10 @@ def _partial_objective_check(root, contract, history, frame, job):
 
 def _planned_report_check(root, contract):
     contract = deepcopy(contract)
-    contract["profile"] = "balanced"
-    contract["requested_histories_per_family"] = dict(main=1, development=1)
+    contract["replicate_roster"].update(main=[1], development=[1], development_extension=[2])
     save_json(root / "study_contract.json", contract)
-    save_json(root / "allocation.json", allocate(contract, [1.], [1]))
     from CliPP2.simulation.study import _freeze_main_roster
-    _freeze_main_roster(root, contract, read_json(root / "allocation.json"))
+    _freeze_main_roster(root, contract)
     captured = []
 
     def aggregate(values, **kwargs):
@@ -373,6 +394,7 @@ def _optional_execution_report_check(root):
         for name, enabled, cells, expected in cases:
             directory = root / name
             contract = make_contract(mutations=12, segments=2, regions=4, workers=1)
+            contract.pop("replicate_roster")
             contract["optional_panels"].update(technical_sensitivity=enabled, extended_sensitivity=enabled)
             save_json(directory / "study_contract.json", contract)
             summary = dict(fit_count=0, assignment_pass_count=0, report_mode="cached_metrics",
@@ -413,6 +435,7 @@ def _record_schema_report_check(root):
         directory = root / name
         contract = make_contract(mutations=12, segments=2, regions=4, workers=1,
                                  reference_match_atol=.05)
+        contract.pop("replicate_roster")
         assert contract["evaluation"]["record_schema"] == "clipp2.simulation.evaluation.v3"
         contract.update(implementation_version=version, families=["S01"])
         if not explicit:
@@ -512,6 +535,7 @@ def _report_integrity_check(root):
     from CliPP2.simulation.evaluation import evaluation_definition
     definition = evaluation_definition()
     contract = make_contract(mutations=12, segments=2, regions=4, workers=1)
+    contract.pop("replicate_roster")
     contract.update(families=["S01"], profile="full")
     jobs = [dict(cell_id=f"integrity-{i}", history_id=f"integrity-h{i}", family="S01",
                  phase="main", acquisition=dict(id="A1", purity=.8, depth=100)) for i in range(4)]
@@ -609,6 +633,7 @@ def _partial_evidence_report_checks(root):
 
     def publish_case(directory, evaluations):
         contract = make_contract(mutations=12, segments=2, regions=4, workers=1)
+        contract.pop("replicate_roster")
         contract["families"] = ["S01"]
         roster = [job(index) for index in range(len(evaluations))]
         save_json(directory / "study_contract.json", contract)
@@ -713,6 +738,7 @@ def _offline_report_check(root, history, job):
     # derived report must depend only on the retained selected attempt and truth.
     contract = read_json(root / "study_contract.json")
     contract.update(schema="clipp2.simulation-contract.v3", implementation_version="1.2.1")
+    contract.pop("replicate_roster", None)
     contract["cohort"].pop("content_id", None)
     contract["cohort"]["path"] = str(root / "not_present_original_cohort.json")
     (root / "study_contract.json").write_text(json.dumps(contract))
@@ -886,7 +912,7 @@ def _qualification_lifecycle_checks(root, contract):
     with patch("CliPP2.simulation.biology.generate_history", return_value=SimpleNamespace(validate=lambda: None)), \
             patch("CliPP2.simulation.controls.run_controls", side_effect=AssertionError("mechanisms reran")), \
             patch("CliPP2.simulation.controls.run_cohort_controls", side_effect=AssertionError("cohort reran")), \
-            patch("CliPP2.simulation.study.allocate", side_effect=RuntimeError("stop after qualification")):
+            patch("CliPP2.simulation.study.run_jobs", side_effect=RuntimeError("stop after qualification")):
         try:
             _execute(aggregate_root, frozen, resume=True)
         except RuntimeError as error:
@@ -900,7 +926,7 @@ def run_lifecycle_checks(root, settings):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     contract = _design_check(root, settings)
-    job = next(jobs(contract, "development", 1))
+    job = next(jobs(contract, "development"))
     histories = root / "history_reuse"
     writer = _fixture()[0]
     with patch("CliPP2.simulation.study._history", return_value=writer) as create:
@@ -947,7 +973,7 @@ def run_checks(directory, cohort_settings):
     lifecycle = run_lifecycle_checks(root / "lifecycle", cohort_settings)
     from check_simulation_resume import run_checks as check_resume
     resume = check_resume(root / "resume")
-    for protocol, schema in (("2.1", "clipp2.simulation-contract.v1"), ("2.2", "clipp2.simulation-contract.v2"), ("2.2", "clipp2.simulation-contract.v3")):
+    for protocol, schema in (("2.1", "clipp2.simulation-contract.v1"), ("2.2", "clipp2.simulation-contract.v2"), ("2.2", "clipp2.simulation-contract.v3"), ("2.2", "clipp2.simulation-contract.v4")):
         old = dict(contract, protocol_version=protocol, schema=schema)
         with patch("CliPP2.simulation.study.read_json", side_effect=AssertionError("old contract reached resume IO")):
             try:

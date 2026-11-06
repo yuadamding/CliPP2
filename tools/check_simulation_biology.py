@@ -90,14 +90,18 @@ def run_sensitivity_layout_checks(directory):
     from collections import defaultdict
     from CliPP2.io.data import content_hash
     from CliPP2.simulation.design import jobs, make_contract, seed_for
+    # Import consumers before patching provider symbols: module-level aliases
+    # must never retain a mock after this check returns to the shared runner.
+    from CliPP2.simulation import experiment
     from CliPP2.simulation.panels import sensitivity_jobs
     from CliPP2.simulation.study import _history, _prepare_histories, _run_cell
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    contract = make_contract(mutations=24, segments=3, regions=4)
+    contract = make_contract(mutations=24, segments=3, regions=4,
+                             main_replicates=1, development_replicates=1)
     original_contract = deepcopy(contract)
-    main_before = list(jobs(contract, 'main', 1))
+    main_before = list(jobs(contract, 'main'))
     planned = sensitivity_jobs(contract, extended=True)
     grouped = defaultdict(list)
     for job in planned:
@@ -112,7 +116,7 @@ def run_sensitivity_layout_checks(directory):
             assert job['acquisition']['depth'] == (500 if name.endswith('per_region') else 2000/regions)
         grouped[job['history_id']].append(job)
     assert len(planned) == 120 and len(grouped) == 16
-    assert contract == original_contract and list(jobs(contract, 'main', 1)) == main_before
+    assert contract == original_contract and list(jobs(contract, 'main')) == main_before
     for job in main_before:
         assert job['history_id'] == f"main-{job['family']}-H001"
         assert job['cell_id'] == f"{job['history_id']}-{job['acquisition']['id']}"
@@ -149,7 +153,7 @@ def run_sensitivity_layout_checks(directory):
                 np.testing.assert_array_equal(small.phi, large.phi[:, :regions])
         # Exercise live manifest/acquisition/input linkage for every layout; the
         # deliberate sentinel is reached before any paired inference can run.
-        with patch('CliPP2.simulation.experiment.run_paired_experiment', side_effect=RuntimeError('layout_preinference_stop')) as boundary:
+        with patch.object(experiment, 'run_paired_experiment', side_effect=RuntimeError('layout_preinference_stop')) as boundary:
             for members in grouped.values():
                 completion = _run_cell(dict(root=str(directory), job=members[0], selected=dict(contributor=.95, posterior=.95)))
                 assert completion['execution_phase'] == 'paired_inference'
@@ -180,6 +184,10 @@ def run_sensitivity_layout_checks(directory):
                     raise AssertionError('Incompatible repeated history identity was skipped')
             assert not destination.exists()
         assert fit.call_count == assign.call_count == backend.call_count == 0
+    from CliPP2 import assignment, workflow
+    from CliPP2.kernel.backend import NativeBackend
+    assert workflow.NativeBackend is NativeBackend
+    assert experiment.assign_mutations is assignment.assign_mutations
     return dict(status='passed', jobs=120, compatible_layout_histories=16,
         generated_prepared_content_matches=True, worker_linkage_reaches_preinference=16,
         shared_depth_mode_history=True, base_ids_cells_seeds_and_depths_unchanged=True,

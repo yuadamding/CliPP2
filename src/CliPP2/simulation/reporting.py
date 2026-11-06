@@ -63,15 +63,27 @@ def preserved_jobs(root):
     return list(result.values())
 
 
+def roster_identity(record):
+    """Keep historical hashes; new rosters omit only the local cohort snapshot path."""
+    payload = {key: record.get(key) for key in ("schema", "families", "jobs")}
+    policy = record.get("identity_policy")
+    if policy is not None:
+        if policy != "semantic_jobs_without_cohort_path":
+            raise ValueError("Unsupported roster identity policy")
+        payload["identity_policy"] = policy
+        payload["jobs"] = [{key: value for key, value in job.items() if key != "cohort_settings"}
+                           for job in payload["jobs"]]
+    return content_hash(payload)
+
+
 def planned_roster(root, contract, allocation, cells):
     """Use a frozen roster; submitted legacy jobs are only a known subset."""
     path = Path(root) / "main_roster.json"
     if path.exists():
         record = _read(path)
-        payload = {key: record.get(key) for key in ("schema", "families", "jobs")}
         jobs = record.get("jobs", [])
         if (record.get("schema") != "clipp2.simulation-roster.v1"
-                or record.get("roster_id") != content_hash(payload)
+                or record.get("roster_id") != roster_identity(record)
                 or record.get("families") != contract["families"]
                 or len(jobs) != allocation.get("planned_main_datasets")
                 or len({job["cell_id"] for job in jobs}) != len(jobs)

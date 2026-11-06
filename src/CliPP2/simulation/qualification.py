@@ -305,7 +305,7 @@ def qualify_cohort(settings_path, outdir, *, native_pilot=True, timeout_seconds=
     if sys.flags.optimize:
         raise RuntimeError("Qualification requires Python assertions enabled for physical replay validation")
     root, began = _new_directory(outdir), time.perf_counter()
-    contract = make_contract(cohort_settings=cohort.path, profile="full", workers=workers,
+    contract = make_contract(cohort_settings=cohort.path, workers=workers,
                              reference_match_atol=reference_match_atol)
     if contract["cohort"]["content_id"] != cohort.content_id:
         raise ValueError("Authoritative cohort changed while preparing qualification")
@@ -326,8 +326,8 @@ def qualify_cohort(settings_path, outdir, *, native_pilot=True, timeout_seconds=
         and validation["acquisitions_passed"] == planned_roundtrips)
     pilots = []
     if native_pilot and valid:
-        selected = [job for job in jobs(contract, "development", 1)
-                    if job["variant_id"] in PILOT_VARIANTS and job["acquisition"]["id"] == "A4"]
+        selected = [job for job in jobs(contract, "development")
+                    if job["history_index"] == 0 and job["variant_id"] in PILOT_VARIANTS and job["acquisition"]["id"] == "A4"]
         if len(selected) != len(PILOT_VARIANTS):
             raise ValueError("Exact prescribed native pilot cells are missing or duplicated")
         tasks = [dict(root=str(root / "native_pilots"), job=job,

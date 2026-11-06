@@ -12,19 +12,16 @@ from .study import execute, read_json, report
 def main(argv=None):
     parser = argparse.ArgumentParser(description="CliPP2 physical-copy biological simulation study")
     sub = parser.add_subparsers(dest="command", required=True)
-    run = sub.add_parser("run", help="Qualify, time, develop thresholds, freeze and execute a balanced cohort")
+    run = sub.add_parser("run", help="Qualify, develop thresholds and execute a declared frozen cohort")
     run.add_argument("--outdir", type=Path, required=True)
     run.add_argument("--resume", action="store_true", help="Use the immutable contract already in outdir")
     run.add_argument("--retry-failed", action="store_true", help="Retry worker failures as new retained attempts; frozen development settings remain frozen")
-    run.add_argument("--profile", choices=("balanced", "full"), default="balanced")
     run.add_argument("--workers", type=int, default=10)
-    run.add_argument("--budget-minutes", type=float, default=60.)
-    run.add_argument("--disk-budget-gib", type=float, default=8.)
     run.add_argument("--cohort-settings", type=Path, default=Path("CliPP2_phylogeny_cohort_settings.json"))
     run.add_argument("--source-record", type=Path, help="Recorded source identity for an isolated installed build")
     run.add_argument("--run-manifest-id", help="External execution record link; defaults to CLIPP2_RUN_MANIFEST_ID")
-    run.add_argument("--main-replicates", type=int, help="Replicates per each of the60 subcases; full design is10")
-    run.add_argument("--development-replicates", type=int, help="Replicates per subcase; full design is2")
+    run.add_argument("--main-replicates", type=int, help="Main replicates per each of the 60 subcases; default 10")
+    run.add_argument("--development-replicates", type=int, help="Initial development replicates per subcase; default 2. A reduced run predeclares the remaining second block.")
     qualify = sub.add_parser("qualify", help="Validate the complete supplied cohort and run bounded native pilots")
     qualify.add_argument("--cohort-settings", type=Path, default=Path("CliPP2_phylogeny_cohort_settings.json"))
     qualify.add_argument("--outdir", type=Path, required=True)
@@ -59,9 +56,8 @@ def main(argv=None):
         result = report(args.outdir, evaluation_config=args.evaluation_config, report_dir=args.report_dir)
     else:
         contract = (read_json(args.outdir / "study_contract.json") if args.resume else
-            make_contract(workers=args.workers, budget_minutes=args.budget_minutes,
-                disk_budget_gib=args.disk_budget_gib, profile=args.profile,
-                main_histories=args.main_replicates, development_histories=args.development_replicates,
+            make_contract(workers=args.workers, main_replicates=args.main_replicates,
+                development_replicates=args.development_replicates,
                 cohort_settings=args.cohort_settings, run_manifest_id=args.run_manifest_id))
         if args.source_record and not args.resume:
             contract["source_identity"] = read_json(args.source_record)

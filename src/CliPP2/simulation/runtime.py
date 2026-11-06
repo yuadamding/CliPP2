@@ -73,9 +73,14 @@ def status(outdir):
     from .study import _latest_completion, read_json
     root = Path(outdir).resolve()
     contract = read_json(root / "study_contract.json")
-    allocation = read_json(root / "allocation.json") if (root / "allocation.json").exists() else {}
+    from .design import roster_counts
+    allocation = (roster_counts(contract) if "replicate_roster" in contract else
+                  read_json(root / "allocation.json") if (root / "allocation.json").exists() else {})
+    development = read_json(root / "threshold_development.json") if (root / "threshold_development.json").exists() else None
     cells = [value for directory in (root / "cells").glob("*") if directory.is_dir()
              for value in [_latest_completion(directory)] if value is not None]
+    from .reporting import planned_roster
+    roster = planned_roster(root, contract, allocation, cells)
     counts = Counter((cell["job"]["phase"], cell["status"]) for cell in cells)
     active = []
     for path in (root / "cells").glob("*/attempt-*/configuration-*/execution.jsonl"):
@@ -103,13 +108,15 @@ def status(outdir):
         protocol_version=contract.get("protocol_version"),
         implementation_version=contract.get("implementation_version"), run_manifest_id=contract.get("run_manifest_id"),
         source_cohort_protocol_version=contract.get("source_cohort_protocol_version"),
-        profile=contract["profile"], workers=contract["resource_limits"]["workers"],
+        population_policy="explicit_replicates" if "replicate_roster" in contract else contract.get("profile"),
+        workers=contract["resource_limits"]["workers"],
         planned_development_cells=allocation.get("planned_development_datasets"),
-        planned_main_cells=allocation.get("planned_main_datasets"),
+        planned_main_cells=len(roster["jobs"]) if roster["complete"] else allocation.get("planned_main_datasets"),
+        conditional_development_extension_cells=allocation.get("conditional_development_extension_datasets", 0),
         processed_cells=[dict(phase=phase, status=state, count=count) for (phase, state), count in sorted(counts.items())],
         operation_costs=costs,
         qualification_costs=qualification_costs(root),
         recorded_execution_failures=sum(len(cell.get("execution_failures", [])) for cell in cells),
-        active=active, thresholds_frozen=(root / "study_plan.json").exists(),
+        active=active, thresholds_frozen=development is not None and development.get("selected") is not None,
         report=str(reports[-1]) if reports else None,
         cost_note="Durable operation journals include completed, failed and unfinished attempts; scientific applicability is in the report")

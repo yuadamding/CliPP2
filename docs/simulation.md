@@ -42,7 +42,8 @@ python -m CliPP2.simulation qualify \
 
 python -m CliPP2.simulation run \
   --cohort-settings CliPP2_phylogeny_cohort_settings.json \
-  --profile full --workers 10 --outdir results/cohort-full-protocol2.2
+  --main-replicates 10 --development-replicates 2 \
+  --workers 10 --outdir results/cohort-full-protocol2.2
 ```
 
 `qualify` replays all 720 histories, checks canonical input roundtrips, and runs
@@ -50,12 +51,18 @@ bounded native pilots. `--skip-native` limits it to the non-fitting checks.
 Separate controlled cohort diagnostics include 11 fixed-reference assignment
 passes; these are not optimizer fits or independent main histories.
 
-The full profile retains the entire supplied cohort and can take many hours or
-days. It does not impose the default balanced profile's timing-based allocation
-reduction or a one-hour run deadline. Ten workers use one native CPU thread
-each. `--budget-minutes` and `--disk-budget-gib` inform balanced allocation;
-they do not make the full profile a smaller study. Optional panels remain
-disabled as specified in the source JSON.
+The default roster retains the entire supplied cohort and can take many hours
+or days. `--main-replicates` and `--development-replicates` explicitly declare
+replicates per variant, defaulting to 10 and 2. Worker count affects execution,
+not scientific population membership; ten workers use one native CPU thread
+each. Automatic timing/disk allocation and its `--profile`, `--budget-minutes`,
+and `--disk-budget-gib` switches have been removed. Bounded qualification pilots
+remain separate from cohort sizing. Optional panels remain disabled by default.
+
+A reduced declaration with one development replicate predeclares the second
+replicate as a conditional extension block. That block runs only if the first
+block has no qualifying setting. Main execution still requires a qualified,
+frozen development choice; thresholds and empirical error constraints are unchanged.
 
 For a long run, keep the installed environment unchanged. A non-editable wheel
 in a dedicated environment isolates worker imports from later repository edits.
@@ -73,12 +80,12 @@ python -m CliPP2.simulation report results/cohort-full
 ```
 
 `status` reads progress and in-flight operation journals without changing the
-study. Resume uses the existing contract, allocation, and selected thresholds;
+study. Resume uses the existing contract, frozen roster, and selected thresholds;
 new command-line settings do not replace them. Completed cells are reused.
 `--retry-failed` reruns execution failures as new attempts, retaining old
 attempts, completion records, and costs. It does not reopen a frozen development
 selection or reinterpret scientific rejection as a worker failure. Package
-version 1.1.0 keeps simulation contract v4. It binds the entire parsed cohort
+version 1.1.0 now uses simulation contract v5 with explicit replicate blocks. It binds the entire parsed cohort
 settings to a `cohort_content_id` in contracts, jobs, physical histories,
 acquisitions, and qualification receipts. Formatting and object-key order do not
 affect this identity; values and list order do. Resume verifies the frozen
@@ -86,15 +93,18 @@ settings at coordinator execution boundaries before reusing work. Each worker
 then reuses its validated immutable snapshot; a new process loads and verifies
 it again. Semantic random seeds remain unchanged.
 
-Existing 1.2.1, 1.2.2, and 1.2.3 studies retain their original frozen installations and outputs.
+Existing v1–v4 study contracts retain their original frozen installations and outputs.
 They are not migrated, and missing historical identity is not retrofitted. A new execution
 under 1.1.0 requires a new directory. Qualification has separate numbered
 mechanism/cohort attempts; validated published summaries can complete an
 interrupted wrapper without rerunning controls. Interrupted costs without a
 summary remain explicitly unknown. Reports use new directories.
 
-New studies save `main_roster.json` when allocation is frozen, before submitting
-main jobs. Evaluation v3 uses its family/history/acquisition weights. A known
+New studies save `main_roster.json` before qualification and development. Its
+identity is independent of worker count. The contract also declares the development
+blocks. `threshold_development.json` binds the selected setting, resolved workflow
+configuration, study contract, and main roster; status reads that authoritative
+receipt. No redundant `study_plan.json` is written. Evaluation v3 uses its family/history/acquisition weights. A known
 failure receives zero correct-decision credit only when a positive original
 denominator is established and no accepted decisions remain anywhere in that
 endpoint, including unchanged members outside the Stage 3 target pool;
@@ -110,7 +120,7 @@ supplied inputs and biased read probabilities remain separate. Consistent legacy
 evidence without an exact retained link is labeled `legacy_consistent_unbound`;
 its conditional diagnostics do not enter the verified primary aggregate.
 
-`--retry-failed` also reaches timing pilots and technical-sensitivity jobs.
+`--retry-failed` also reaches technical-sensitivity jobs.
 External-reference audits record the selected source attempt, reuse only matching
 completed audits, and preserve older audits when a newer source attempt is used.
 
@@ -239,8 +249,9 @@ a separately declared research revision, not an automatic relaxation.
 
 ## Retained outputs and Python API
 
-The output root retains `study_contract.json`, `cohort_settings.json`, allocation,
-development selection, the frozen study plan, truth histories, and job manifests.
+The output root retains `study_contract.json`, `cohort_settings.json`,
+`main_roster.json`, `threshold_development.json`, truth histories, and job manifests.
+Planned population counts come from the frozen roster and declared replicate blocks.
 Each cell retains input counts, acquisition metadata, evaluations, cost ledgers,
 and operation/failure records. Completed configuration directories containing
 verified native fits, frozen references, and assignment outputs are compressed

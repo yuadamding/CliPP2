@@ -22,7 +22,7 @@ from CliPP2._version import __version__
 from CliPP2.io.data import content_hash, json_value
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
 
-from .design import (CONTRIBUTOR_GRID, POSTERIOR_GRID, allocate, jobs, resolve_config,
+from .design import (CONTRIBUTOR_GRID, POSTERIOR_GRID, jobs, roster_counts, resolve_config,
                      seed_for, workflow_config)
 
 
@@ -538,26 +538,24 @@ def execute(root, contract, *, resume=False, retry_failed=False):
         return _execute(root, contract, resume=resume, retry_failed=retry_failed)
 
 
-def _freeze_main_roster(root, contract, allocation):
+def _freeze_main_roster(root, contract):
     """Freeze exact main-cell weights before development or main submission."""
-    count = allocation.get("main_replicates_per_variant") or allocation["main_histories_per_family"]
+    from .reporting import roster_identity
     payload = dict(schema="clipp2.simulation-roster.v1", families=contract["families"],
-                   jobs=list(jobs(contract, "main", count)))
-    if len(payload["jobs"]) != allocation["planned_main_datasets"]:
-        raise ValueError("Main roster size differs from frozen allocation")
-    record = dict(payload, roster_id=content_hash(payload))
+                   identity_policy="semantic_jobs_without_cohort_path", jobs=list(jobs(contract, "main")))
+    record = dict(payload, roster_id=roster_identity(payload))
     path = root / "main_roster.json"
     if path.exists():
         if read_json(path) != record:
-            raise ValueError("Main roster differs from frozen allocation")
+            raise ValueError("Main roster differs from the frozen replicate declaration")
     else:
         save_json(path, record)
-    return record["jobs"]
+    return record
 
 
 def _execute(root, contract, *, resume=False, retry_failed=False):
     root = Path(root).resolve()
-    if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v4"
+    if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v5"
             or contract.get("implementation_version") != __version__):
         raise ValueError(f"Execution requires a Protocol {PROTOCOL_VERSION} simulation contract; earlier studies require their original installed environment")
     if resume:
@@ -580,6 +578,7 @@ def _execute(root, contract, *, resume=False, retry_failed=False):
             contract["cohort"]["path"] = str(frozen_cohort)
             _verify_cohort_snapshot(frozen_cohort, contract["cohort"]["content_id"])
         save_json(root / "study_contract.json", contract)
+    main_roster = _freeze_main_roster(root, contract)
     qualification_path = root / "qualification.json"
     if qualification_path.exists():
         existing = read_json(qualification_path)
@@ -617,70 +616,33 @@ def _execute(root, contract, *, resume=False, retry_failed=False):
             protocol_version=PROTOCOL_VERSION, source_cohort_protocol_version=contract.get("source_cohort_protocol_version"),
             numerical_policy=f"Every native fit and assignment retains the independent Protocol {PROTOCOL_VERSION} verification receipt"))
     workers = contract["resource_limits"]["workers"]
-    allocation_path = root / "allocation.json"
-    if allocation_path.exists():
-        allocation = read_json(allocation_path)
-    elif contract["profile"] == "full":
-        allocation = allocate(contract, [1.], [1])
-        allocation.update(timing_seconds_per_dataset=None, measured_seconds=[], measured_bytes=[],
-            dataset_capacity=None, resource_reduction_applied=False,
-            reason="Entire supplied cohort explicitly requested; fixed allocation, no timing-based reduction",
-            pilot_policy="Bounded resource qualification is separate; no extra optimizer fits for allocation")
-        save_json(allocation_path, allocation)
-    else:
-        pilot = []
-        if contract.get("cohort"):
-            wanted = {"S01.01", "S02.05", "S04.01", "S06.05", "S09.05"}
-            for job in jobs(contract, "development", 1):
-                if job["variant_id"] in wanted and job["acquisition"]["id"] == "A4":
-                    pilot.append(dict(job, phase="pilot", cell_id="pilot."+job["cell_id"],
-                                      source_history_id=job["history_id"]))
-        else:
-            for family in ("S01", "S02", "S04", "S06", "S09"):
-                pilot.append(dict(cell_id=f"pilot-{family}", phase="pilot", family=family,
-                    history_id=f"pilot-{family}", history_index=0,
-                    history_seed=seed_for(contract["master_seed"], "pilot", family, 0),
-                    acquisition_seed=seed_for(contract["master_seed"], "pilot", family, 0, 4),
-                    acquisition=contract["acquisitions"][-1], dimensions=contract["dimensions"]))
-        cells = run_jobs(root, pilot, workers=workers, selected=dict(contributor=.95, posterior=.95),
-                         contract=contract, retry_failed=retry_failed)
-        if any(cell["status"] != "complete" for cell in cells):
-            raise RuntimeError("Timing pilot execution failed; inspect immutable cell failure records")
-        projected = [cell["elapsed_seconds"]*3/max(1, cell["cost_ledgers"][0]["fit_count"]) for cell in cells]
-        allocation = allocate(contract, projected,
-                              [cell["output_bytes"] for cell in cells])
-        allocation["pilot_raw_elapsed_seconds"] = [cell["elapsed_seconds"] for cell in cells]
-        allocation["pilot_cost_ledgers"] = [cell["cost_ledgers"] for cell in cells]
-        allocation["timing_projection"] = "Scale each pilot to three fits when a valid branch skipped fits; then apply the frozen safety factor"
-        save_json(allocation_path, allocation)
-        print(json.dumps(dict(event="allocation_frozen", allocation=allocation)), flush=True)
-    main_jobs = _freeze_main_roster(root, contract, allocation)
     development_path = root / "threshold_development.json"
     if development_path.exists():
         development = read_json(development_path)
     else:
-        count = allocation.get("development_replicates_per_variant") or allocation["development_histories_per_family"]
-        development_cells = run_jobs(root, jobs(contract, "development", count), workers=workers, contract=contract,
+        development_cells = run_jobs(root, jobs(contract, "development"), workers=workers, contract=contract,
                                      retry_failed=retry_failed)
         development = select_thresholds(root, development_cells, contract)
-        if development["selected"] is None and (not contract.get("cohort") or count < 2):
+        if development["selected"] is None and contract["replicate_roster"]["development_extension"]:
             print(json.dumps(dict(event="development_extension", reason="No threshold met the frozen criterion")), flush=True)
-            development_cells += run_jobs(root, jobs(contract, "development", count, start=count), workers=workers, contract=contract,
+            development_cells += run_jobs(root, jobs(contract, "development", extension=True), workers=workers, contract=contract,
                                           retry_failed=retry_failed)
             development = select_thresholds(root, development_cells, contract)
+        development.update(study_contract_id=content_hash(contract), main_roster_id=main_roster["roster_id"],
+            selected_workflow_config=(None if development["selected"] is None else
+                asdict(resolve_config(contract, development["selected"]["contributor"], development["selected"]["posterior"]))))
         save_json(development_path, development)
+    expected_config = (None if development["selected"] is None else
+        asdict(resolve_config(contract, development["selected"]["contributor"], development["selected"]["posterior"])))
+    if (development.get("study_contract_id") != content_hash(contract)
+            or development.get("main_roster_id") != main_roster["roster_id"]
+            or development.get("selected_workflow_config") != expected_config):
+        raise ValueError("Threshold development receipt differs from the frozen study or selected configuration")
     if development["selected"] is None:
         report(root)
         raise RuntimeError("No development setting qualified after the prespecified extension; final cohort not generated")
-    plan_path = root / "study_plan.json"
-    if not plan_path.exists():
-        save_json(plan_path, dict(contract=contract, allocation=allocation,
-            selected_thresholds=development["selected"],
-            workflow_config=asdict(resolve_config(contract, development["selected"]["contributor"],
-                                                 development["selected"]["posterior"])),
-            frozen_before_main_generation=True))
-    run_jobs(root, main_jobs,
-             workers=workers, selected=development["selected"], contract=contract, retry_failed=retry_failed)
+    run_jobs(root, main_roster["jobs"], workers=workers, selected=development["selected"],
+             contract=contract, retry_failed=retry_failed)
     run_optional_panels(root, contract, development["selected"], workers, retry_failed=retry_failed)
     return report(root)
 
@@ -715,7 +677,7 @@ def run_optional_panels(root, contract, selected, workers, *, retry_failed=False
     if options.get("external_reference"):
         for family in ("S03", "S04", "S05", "S11", "S12"):
             if contract.get("cohort"):
-                candidate = next(job for job in jobs(contract, "main", 1)
+                candidate = next(job for job in jobs(contract, "main")
                                  if job["family"] == family and job["acquisition"]["id"] == "A4")
                 cell_id = candidate["cell_id"]
             else:
@@ -794,7 +756,8 @@ def report(root, *, evaluation_config=None, report_dir=None):
              for value in [_latest_completion(directory)] if value is not None]
     main = [cell for cell in cells if cell["job"]["phase"] == "main"]
     allocation_path = root / "allocation.json"
-    allocation = read_json(allocation_path) if allocation_path.exists() else {}
+    allocation = (roster_counts(contract) if "replicate_roster" in contract else
+                  read_json(allocation_path) if allocation_path.exists() else {})
     roster = planned_roster(root, contract, allocation, cells)
     completed = {cell["job"]["cell_id"]: cell for cell in main}
     main = [completed.get(job["cell_id"], dict(job=job, status="not_executed", evaluations=[], cost_ledgers=[],
@@ -823,7 +786,7 @@ def report(root, *, evaluation_config=None, report_dir=None):
     summary.update(roster_status=roster["status"], roster_id=roster["roster_id"],
                    retained_planned_cells=len(roster["jobs"]))
     costs = recorded_costs(root)
-    planned = allocation.get("planned_main_datasets", len(main))
+    planned = len(roster["jobs"]) if roster["complete"] else allocation.get("planned_main_datasets", len(main))
     summary.update(planned_main_cells=planned, worker_failures=sum(cell["status"] == "execution_failed" for cell in main),
                    unexecuted_main_cells=max(0, planned-sum(cell["status"] != "not_executed" for cell in main)),
                    all_cell_count=len(cells), peak_resident_bytes=max((c["peak_resident_bytes"] for c in cells), default=0),
@@ -881,10 +844,13 @@ def report(root, *, evaluation_config=None, report_dir=None):
 def _write_report(root, directory, cells, evaluations, summary, figures):
     import html
     contract = read_json(root / "study_contract.json")
-    allocation = read_json(root / "allocation.json") if (root / "allocation.json").exists() else {}
+    allocation = (roster_counts(contract) if "replicate_roster" in contract else
+                  read_json(root / "allocation.json") if (root / "allocation.json").exists() else {})
     development = read_json(root / "threshold_development.json") if (root / "threshold_development.json").exists() else {}
     selected = development.get("selected")
-    if allocation.get("resource_reduction_applied") is False or contract.get("profile") == "full":
+    if "replicate_roster" in contract:
+        allocation_description = "The population was declared by explicit frozen replicate blocks; timing and disk measurements did not select its membership."
+    elif allocation.get("resource_reduction_applied") is False or contract.get("profile") == "full":
         allocation_description = "The explicit full-cohort allocation did not use timing or disk measurements to select its population."
     elif allocation.get("measured_seconds"):
         allocation_description = "The balanced allocation was frozen from timing and disk measurements before main generation."
@@ -899,7 +865,7 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
         f"<p>Executed scale: {contract['dimensions']['mutations']} mutations, {contract['dimensions']['segments']} segments, {contract['dimensions']['regions']} regions; "
         f"{allocation.get('main_histories_per_family', 0)} independent main histories per family. The proposed full scale is 1,500 mutations, 50 segments, 50 main and 10 development histories per family.</p>",
         f"<p>{allocation_description} Repeated acquisitions share physical histories; uncertainty resamples histories and carries all paired arms together. A reduced cohort does not establish rare-event safety or noninferiority.</p>",
-        "<h2>Frozen allocation and settings</h2><pre>"+html.escape(json.dumps(dict(allocation=allocation, selected=selected), indent=2))+"</pre>",
+        "<h2>Frozen population and settings</h2><pre>"+html.escape(json.dumps(dict(replicate_roster=contract.get("replicate_roster"), counts=allocation, selected=selected), indent=2))+"</pre>",
         "<h2>Applicability and scientific results</h2><p>Unknown and unavailable estimates remain explicit. Exact aliases and absent candidate explanations cannot be resolved by restoring integer support. Descriptive screens are not calibrated tests.</p>"]
     text.append("<h2>Evaluation definition and population</h2><pre>"+html.escape(json.dumps(dict(
         definition=summary.get("evaluation_definition"), report_mode=summary["report_mode"],
