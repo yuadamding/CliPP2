@@ -473,10 +473,8 @@ def _score_reference(bundle, progress_callback):
                            dict(status="skipped_empty_targets", device=bundle.device))
     with NativeBackend(observation, cpu_threads=bundle.cpu_threads) as backend:
         for index, center in enumerate(bundle.reference.centers):
-            diagnostic = backend.component_diagnostics(np.broadcast_to(center, (n, r)))
-            if np.any(np.isin(diagnostic["status"], [2, 3])):
-                raise NativeExecutionError("Assignment diagnostic execution failed")
-            scores[:, index] = np.where(observed, diagnostic["log_emission"], 0.).sum(axis=1) - np.log(k)
+            loss = backend.node_terms(np.broadcast_to(center, (n, r)), derivatives=False)
+            scores[:, index] = np.where(observed, -loss, 0.).sum(axis=1) - np.log(k)
             scores[coverage == 0, index] = -np.inf
             if progress_callback:
                 progress_callback(dict(operation="assignment", protocol_version=PROTOCOL_VERSION,

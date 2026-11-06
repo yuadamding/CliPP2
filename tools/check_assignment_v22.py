@@ -164,12 +164,58 @@ def _effective_support_checks(root):
     return dict(excluded_placeholders_reused=True, eligible_caps_recomputed=True)
 
 
+def _loss_only_checks(root):
+    """Compare native loss-only candidate scores against the former diagnostic path."""
+    from CliPP2.kernel.backend import NativeBackend
+    from CliPP2.io.data import content_hash
+    node_terms, diagnostics = NativeBackend.node_terms, NativeBackend.component_diagnostics
+    cases = (("tie", [[1, 1]], 3, 2, True, [[.6, .6], [.6, .6]]),
+             ("missing", [[1, 0]], 3, 2, [[True, False]], [[1., 0.], [.6, 1.]]),
+             ("impossible", [[1]], 2, 1, True, [[0.], [1.]]),
+             ("high_support", [[4]], 10, 8, True, [[1.], [.5]]),
+             ("uninformative", [[1, 1]], 3, 2, False, [[1., 1.], [.5, .5]]))
+    for name, alt, depth, major, observed, centers in cases:
+        catalog = _catalog(root, "loss_only_"+name, alt, depth, major, observed=observed)
+        bundle = _bundle(catalog, _reference(catalog, centers))
+        calls = dict(loss=0, diagnostics=0)
+
+        def loss_only(self, coordinates, derivatives=True):
+            assert derivatives is False
+            calls["loss"] += 1
+            return node_terms(self, coordinates, derivatives=False)
+
+        def selected(self, *args, **kwargs):
+            calls["diagnostics"] += 1
+            return diagnostics(self, *args, **kwargs)
+
+        with patch.object(NativeBackend, "node_terms", loss_only), patch.object(NativeBackend, "component_diagnostics", selected):
+            current = assign_mutations(bundle)
+        assert calls == dict(loss=len(centers), diagnostics=1)
+
+        def old_candidate(self, coordinates, derivatives=False):
+            assert derivatives is False
+            result = diagnostics(self, coordinates)
+            return np.where(result["status"] == 4, 0., -result["log_emission"])
+
+        with patch.object(NativeBackend, "node_terms", old_candidate):
+            previous = assign_mutations(bundle)
+        for before, after in zip(previous.assignments, current.assignments):
+            np.testing.assert_array_equal(before["log_scores"], after["log_scores"])
+            np.testing.assert_array_equal(before["probabilities"], after["probabilities"])
+            for field in ("status", "accepted_label", "best_label", "cluster_tie", "reference_quality_pass"):
+                assert before[field] == after[field]
+        assert content_hash(previous.to_dict()["multiplicities"]) == content_hash(current.to_dict()["multiplicities"])
+    return dict(cases=len(cases), candidate_scores_exact=True, decisions_exact=True,
+                selected_diagnostics_once=True)
+
+
 def run_checks(directory):
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     assert PROTOCOL_VERSION == "2.2"
     numerical_screen = _numerical_screen_checks(root)
     effective_support = _effective_support_checks(root)
+    loss_only = _loss_only_checks(root)
     exact = _catalog(root, "exact", 2, 3, 4)
     request = _bundle(exact, _reference(exact, [[1.]]))
     result = assign_mutations(request, outdir=root / "exact_output")
@@ -367,7 +413,8 @@ def run_checks(directory):
         explicit_conditional_and_assigned_multiplicity=True, stable_competitor_confidence=True,
         immutable_quality_roundtrip=True, byte_identical_bundle_replay=True, independent_publication_checks=True,
         combined_publication_once=True, original_and_current_manifest_links=True, exact_schema_migration=True,
-        generic_and_workflow_outcomes=True, numerical_screen=numerical_screen, effective_support=effective_support)
+        generic_and_workflow_outcomes=True, numerical_screen=numerical_screen, effective_support=effective_support,
+        loss_only_scoring=loss_only)
 
 
 if __name__ == "__main__":
