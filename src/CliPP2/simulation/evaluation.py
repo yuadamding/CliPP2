@@ -269,6 +269,21 @@ def legacy_evaluation_definition(version, config=None):
     return definition
 
 
+def record_evaluation_definition(record):
+    """Resolve a retained record's scientific definition without relabeling it."""
+    schema = record.get("schema")
+    if schema == "clipp2.simulation.evaluation.v1":
+        return legacy_evaluation_definition(1, {"reference_match_atol": record.get("reference_match_atol")})
+    if schema not in ("clipp2.simulation.evaluation.v2", "clipp2.simulation.evaluation.v3"):
+        raise ValueError("Aggregation requires versioned evaluation records")
+    definition = record.get("evaluation_definition")
+    if not isinstance(definition, dict) or record.get("evaluation_definition_id") != content_hash(definition):
+        raise ValueError("Evaluation definition identity is missing or invalid")
+    if definition.get("schema") != "clipp2.simulation.evaluation-definition."+schema.rsplit(".", 1)[1]:
+        raise ValueError("Evaluation schema and definition version differ")
+    return definition
+
+
 def _integer_assignment(cost):
     """Rectangular Hungarian algorithm with exact Python-integer potentials."""
     n, k = len(cost), len(cost[0]) if cost else 0
@@ -1259,34 +1274,30 @@ def _numeric(value):
     return value
 
 
-def aggregate(evaluations, *, planned_roster=None, roster_complete=False,
+def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expected_definition=None,
               bootstrap_replicates=1000, seed=20261106, families=FAMILIES):
     """Keep frozen planned weights; report conditional available cases separately.
 
     Unknown scientific values are never replaced with zero or dropped from a
     planned estimate. Only verified truth contributes to primary science; an
     explicit, justified no-decision zero can be independent of truth identity.
+    A declared definition also binds fully cached and empty reports.
     """
     evaluations, families = list(evaluations), tuple(families)
     if bootstrap_replicates < 0 or len(set(families)) != len(families) or not families:
         raise ValueError("Aggregation requires distinct families and nonnegative bootstrap replicates")
     definitions = {}
+    if expected_definition is not None:
+        if not isinstance(expected_definition, dict):
+            raise ValueError("Expected evaluation definition must be a definition object")
+        definitions[content_hash(expected_definition)] = expected_definition
     for record in evaluations:
-        schema = record.get("schema")
-        if schema in ("clipp2.simulation.evaluation.v2", "clipp2.simulation.evaluation.v3"):
-            definition, identity = record.get("evaluation_definition"), record.get("evaluation_definition_id")
-            if not isinstance(definition, dict) or identity != content_hash(definition):
-                raise ValueError("Evaluation definition identity is missing or invalid")
-            expected = "clipp2.simulation.evaluation-definition."+schema.rsplit(".", 1)[1]
-            if definition.get("schema") != expected:
-                raise ValueError("Evaluation schema and definition version differ")
-        elif schema == "clipp2.simulation.evaluation.v1":
-            definition = legacy_evaluation_definition(1, {"reference_match_atol": record.get("reference_match_atol")})
-            identity = content_hash(definition)
-        else:
-            raise ValueError("Aggregation requires versioned evaluation records")
-        definitions[identity] = definition
+        definition = record_evaluation_definition(record)
+        definitions[content_hash(definition)] = definition
     if len(definitions) > 1:
+        if expected_definition is not None:
+            raise ValueError("Incompatible evaluation definitions conflict with the declared study/report definition; "
+                             "use explicit re-evaluation (--evaluation-config) instead of combining cached metrics")
         raise ValueError("Incompatible evaluation definitions require separate aggregates or explicit re-evaluation")
     definition = next(iter(definitions.values())) if definitions else evaluation_definition()
     definition_id = content_hash(definition)

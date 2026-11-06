@@ -187,6 +187,8 @@ reported as unavailable. Truth and counts are not regenerated from a changed
 source path. Frozen development selection and original outputs stay intact.
 Without a new evaluation configuration, cached-report behavior is retained.
 Cached reports resolve the complete frozen definition before reading cells.
+Every cached record must match that definition, even when all records are present
+and agree with each other. A conflicting cache requires explicit reevaluation.
 Missing records remain unknown under that definition, including historical v1
 L∞ geometry, its top-level matching tolerance, and its original matching policy.
 Even an empty report with no recoverable complete roster retains the historical

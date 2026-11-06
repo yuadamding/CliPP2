@@ -816,9 +816,7 @@ def report(root, *, evaluation_config=None, report_dir=None):
                     reference_distance=definition["reference_distance"])
         evaluations.append(value)
     summary = aggregate(evaluations, planned_roster=roster["jobs"], roster_complete=roster["complete"],
-                        families=contract["families"])
-    if not evaluations:
-        summary.update(evaluation_definition=definition, evaluation_definition_id=definition_id)
+                        expected_definition=definition, families=contract["families"])
     summary.update(roster_status=roster["status"], roster_id=roster["roster_id"],
                    retained_planned_cells=len(roster["jobs"]))
     costs = recorded_costs(root)
@@ -831,7 +829,8 @@ def report(root, *, evaluation_config=None, report_dir=None):
                    report_mode="offline_reevaluation" if derive else "cached_metrics",
                    derived_evidence_unavailable=sum(e.get("status") == "unavailable_derived_evidence" for e in evaluations))
     summary["population_counts"] = [dict(arm=arm, planned=planned,
-        executed=sum(cell["status"] != "not_executed" for cell in main),
+        executed=sum(row.get("execution_available") == 1
+            for row in summary.get("availability", []) if row["arm"] == arm),
         scientifically_applicable=sum(row.get("scientifically_applicable") == 1
             for row in summary.get("availability", []) if row["arm"] == arm),
         evaluated=sum(row.get("evaluation_available") == 1

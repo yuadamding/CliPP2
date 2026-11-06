@@ -395,7 +395,7 @@ def _optional_execution_report_check(root):
 
 
 def _record_schema_report_check(root):
-    """Missing records keep the full frozen definition; reevaluation is explicit."""
+    """Cached and missing records obey the frozen definition; reevaluation is explicit."""
     from contextlib import ExitStack
     from CliPP2.io.data import content_hash
     from CliPP2.simulation.evaluation import evaluation_definition, legacy_evaluation_definition
@@ -405,7 +405,10 @@ def _record_schema_report_check(root):
              ("historical_v2", "1.2.2", "v2", False, 1, True, False),
              ("explicit_v3", "1.1.0", "v3", True, 1, True, False),
              ("explicit_reevaluation_empty", "1.1.0", "v1", False, 0, False, True),
-             ("incompatible_v1", "1.1.0", "v1", False, 2, True, False))
+             ("incompatible_v1", "1.1.0", "v1", False, 2, True, False),
+             ("incompatible_v3_tolerance", "1.2.3", "v3", True, 2, True, False),
+             ("incompatible_v3_distance", "1.2.3", "v3", True, 2, True, False),
+             ("incompatible_v3_schema", "1.2.3", "v3", True, 2, True, False))
     for name, version, suffix, explicit, cached_count, has_roster, derive in cases:
         directory = root / name
         contract = make_contract(mutations=12, segments=2, regions=4, workers=1,
@@ -424,19 +427,29 @@ def _record_schema_report_check(root):
         config = dict(reference_match_atol=.025 if derive else .05, reference_distance="l2")
         definition = (evaluation_definition(config) if derive or suffix == "v3" else
                       legacy_evaluation_definition(suffix, config))
+        cached_config, cached_suffix = dict(config), suffix
+        if name == "incompatible_v3_tolerance":
+            cached_config["reference_match_atol"] = .06
+        elif name == "incompatible_v3_distance":
+            cached_config["reference_distance"] = "linf"
+        elif name == "incompatible_v3_schema":
+            cached_suffix = "v2"
+        cached_definition = (evaluation_definition(cached_config) if cached_suffix == "v3" else
+                             legacy_evaluation_definition(cached_suffix, cached_config))
         saved = []
         for index, job in enumerate(jobs if has_roster else []):
             relative = Path("cells") / job["cell_id"] / "attempt-001/evaluation-1.json"
             if index < cached_count:
-                success = dict(schema="clipp2.simulation.evaluation."+suffix, **job, acquisition_id="A1",
+                success = dict(schema="clipp2.simulation.evaluation."+cached_suffix, **job, acquisition_id="A1",
                     truth_qualification="verified_history_binding", status="complete", original_evaluable_count=10,
                     metrics=[dict(name="binary_correct_per_original_evaluable", arm="C3", view="", stratum="all",
                         value=1., numerator=10, denominator=10, status="available", truth_required=True)])
-                if suffix == "v1":
+                if cached_suffix == "v1":
                     # Real v1 records kept tolerance at top level, without a definition object.
                     success["reference_match_atol"] = .06 if index else .05
                 else:
-                    success.update(evaluation_definition=definition, evaluation_definition_id=content_hash(definition))
+                    success.update(evaluation_definition=cached_definition,
+                                   evaluation_definition_id=content_hash(cached_definition))
                 save_json(directory / relative, success)
                 saved.append((relative, success))
             save_json(directory / "cells" / job["cell_id"] / "completion.json", dict(job=job,
@@ -451,13 +464,16 @@ def _record_schema_report_check(root):
                 stack.enter_context(patch(target, side_effect=AssertionError("Report attempted inference or nonempty reevaluation")))
             stack.enter_context(patch("CliPP2.simulation.figures.make_figures",
                 side_effect=lambda records, *args: captured.extend(records) or []))
-            if name == "incompatible_v1":
+            if name.startswith("incompatible_"):
                 try:
                     report(directory)
                 except ValueError as error:
                     assert "Incompatible evaluation definitions" in str(error)
+                    assert "--evaluation-config" in str(error)
                 else:
-                    raise AssertionError("Different retained v1 tolerances were combined")
+                    raise AssertionError("Cached records overrode the frozen evaluation definition")
+                assert not list((directory / "reports").glob("report-*"))
+                assert all(read_json(directory / relative) == original for relative, original in saved)
                 continue
             result = report(directory, evaluation_config=config if derive else None)
         expected_suffix = "v3" if derive else suffix
@@ -484,7 +500,8 @@ def _record_schema_report_check(root):
         assert Path(result["report"]).is_file()
     return dict(status="passed", cases=len(cases), frozen_legacy_tolerance_and_geometry_preserved=True,
         empty_reports_preserve_definition=True, explicit_reevaluation_uses_current_definition=True,
-        incompatible_definitions_rejected=True, explicit_schema_independent_of_package_version=True,
+        incompatible_definitions_rejected=True, fully_cached_definition_conflicts_rejected=True,
+        explicit_schema_independent_of_package_version=True,
         historical_version_fallback_preserved=True, fit_count=0, assignment_pass_count=0)
 
 
@@ -493,7 +510,7 @@ def _partial_evidence_report_checks(root):
     from contextlib import ExitStack
     from CliPP2.io.data import content_hash
     from CliPP2.simulation import figures
-    from CliPP2.simulation.evaluation import evaluation_definition
+    from CliPP2.simulation.evaluation import evaluation_definition, _operational_states
     from CliPP2.simulation.reporting import unavailable_evaluation
     definition = evaluation_definition()
 
@@ -534,6 +551,7 @@ def _partial_evidence_report_checks(root):
                 status="execution_failed" if evaluation["status"] == "execution_failed" else "complete",
                 attempt=str(attempt), evaluations=[str(relative)], cost_ledgers=[], elapsed_seconds=0.,
                 peak_resident_bytes=0, output_bytes=0))
+        originals = {path: path.read_bytes() for path in directory.rglob("*") if path.is_file()}
         matrices = []
         save_figure = figures._save
 
@@ -549,6 +567,10 @@ def _partial_evidence_report_checks(root):
                 stack.enter_context(patch(name, side_effect=AssertionError("Report attempted inference: " + name)))
             stack.enter_context(patch("CliPP2.simulation.figures._save", side_effect=capture))
             result = report(directory)
+        assert all(path.read_bytes() == contents for path, contents in originals.items())
+        assert all(row["executed"] == sum(state.get("execution_available") == 1
+                   for state in result["summary"]["availability"] if state["arm"] == row["arm"])
+                   for row in result["summary"]["population_counts"])
         output = Path(result["report"]).parent
         required = ("aggregate.json", "tumor_metrics.tsv", "detailed_transitions.tsv", "bound_audit.tsv",
                     "execution_ledger.tsv", "comparison_report.html")
@@ -557,17 +579,20 @@ def _partial_evidence_report_checks(root):
         assert result["summary"]["fit_count"] == result["summary"]["assignment_pass_count"] == 0
         return result, output, matrices
 
+    failure_states = _operational_states(dict(status="failed", failed_stage="stage_one"), {})
+    failure_states["C3"]["decision_population"] = dict(scope="whole_original_evaluable", coverage="complete",
+        evaluable_count=10, accepted_count=0, evidence="failure_before_stage_one")
     failure = unavailable_evaluation(job(1), "execution_failed", evaluation_config={},
         execution_state="execution_failed", original_evaluable_count=10,
-        arm_applicability={"C3": dict(status="failed", no_decisions=True, decision_population=dict(
-            scope="whole_original_evaluable", coverage="complete", evaluable_count=10, accepted_count=0,
-            evidence="failure_before_stage_one"))})
+        arm_applicability=failure_states)
     assert "region_count" not in failure
     failure.pop("calibration", None)
     failure.pop("cap_audit", None)
     zero = next(row for row in failure["metrics"] if row["name"] == "correct_per_original_evaluable" and row["arm"] == "C3")
     assert zero["value"] == 0 and zero["status"] == "known_no_decisions"
     result, output, _ = publish_case(root / "known_zero", [successful(0), failure])
+    assert {row["arm"]: row["executed"] for row in result["summary"]["population_counts"]} == {
+        "A": 1, "B": 0, "C": 0, "B3": 0, "C3": 1}
     metric = next(row for row in result["summary"]["metrics"]
                   if row["name"] == "binary_correct_per_original_evaluable" and row["arm"] == "C3")
     assert metric["planned_population_estimate"] == .5 and metric["planned_population_status"] == "available"
@@ -598,6 +623,7 @@ def _partial_evidence_report_checks(root):
     assert "verified history bindings only" in section
     assert "<td>3</td>" in section and "<td>37</td>" not in section and "<td>40</td>" not in section
     return dict(status="passed", known_zero_preserves_planned_weight=True,
+        upstream_failure_preserves_per_arm_execution_counts=True, source_inputs_unchanged=True,
         optional_covariates_do_not_block_publication=True, primary_html_and_heatmap_verified_only=True,
         raw_exports_preserve_qualified_legacy_rows=True, fit_count=0, assignment_pass_count=0)
 
