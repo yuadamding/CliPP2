@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .config import (DEFAULT_AUDIT_SCOPE, DEFAULT_DEVICE, DEFAULT_MAX_CLUSTERS,
-                     DEFAULT_MAX_MAJOR_CN, FitConfig, resolve_fit_config)
+                     DEFAULT_MAX_MAJOR_CN, PROTOCOL_VERSION, FitConfig, resolve_fit_config)
 from ._version import __version__
 
 
@@ -35,13 +35,15 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Certify the selected count, or every represented count, by complete single-mutation passes.")
     fit.add_argument("--cpu-threads", type=int, default=None,
                      help="CPU threads; fallback CLIPP2_CPU_THREADS, OMP_NUM_THREADS, then affinity/quota.")
+    fit.add_argument("--run-manifest-id", help="External execution record identifier; no source scan is performed.")
     fit.add_argument("--version", action="version", version=__version__)
     workflow = subparsers.add_parser("workflow", allow_abbrev=False,
-                                    help="Run the three-stage workflow from an explicit JSON plan.")
+                                    help="Run Protocol 2.2 from an explicit v3 JSON plan.")
     workflow.add_argument("--plan", required=True)
     workflow.add_argument("--output-dir", required=True)
     assign = subparsers.add_parser("assign", allow_abbrev=False,
-                                  help="Evaluate both policies from a frozen assignment bundle.")
+                                  help="Reassess frozen targets once under full original support.")
+    assign.add_argument("--run-manifest-id", help="External identifier for this assignment execution.")
     assign.add_argument("--bundle", required=True)
     assign.add_argument("--output-dir", required=True)
     return parser
@@ -69,16 +71,17 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "assign":
         from .assignment import assign_mutations
         from .io.assignment import load_assignment_bundle
-        assign_mutations(load_assignment_bundle(args.bundle), outdir=args.output_dir)
+        assign_mutations(load_assignment_bundle(args.bundle), outdir=args.output_dir, run_manifest_id=args.run_manifest_id)
         return
     if args.command == "workflow":
         from .config import WorkflowConfig
         from .workflow import run_workflow
         plan_path = Path(args.plan).resolve()
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        if plan.get("schema") != "clipp2.workflow.plan.v2":
-            raise ValueError("Workflow requires plan.v2 with explicit mean/outlier screens and tie thresholds")
-        extra = set(plan) - {"schema", "input_path", "workflow_config", "accepted_stage_one", "accepted_stage_two"}
+        if (plan.get("schema") != "clipp2.workflow.plan.v3"
+                or plan.get("protocol_version") != PROTOCOL_VERSION):
+            raise ValueError("Workflow requires plan.v3 with protocol_version='2.2'; earlier contracts require a new run")
+        extra = set(plan) - {"schema", "protocol_version", "input_path", "workflow_config", "accepted_stage_one", "accepted_stage_two", "run_build_manifest", "run_manifest_id"}
         if extra:
             raise ValueError(f"Unknown workflow plan fields: {sorted(extra)}")
         def relative(value):
@@ -87,7 +90,9 @@ def main(argv: list[str] | None = None) -> None:
         receipt = run_workflow(relative(plan["input_path"]), args.output_dir,
             WorkflowConfig.from_dict(plan["workflow_config"]),
             accepted_stage_one=relative(plan["accepted_stage_one"]) if plan.get("accepted_stage_one") else None,
-            accepted_stage_two=relative(plan["accepted_stage_two"]) if plan.get("accepted_stage_two") else None)
+            accepted_stage_two=relative(plan["accepted_stage_two"]) if plan.get("accepted_stage_two") else None,
+            run_build_manifest=relative(plan["run_build_manifest"]) if plan.get("run_build_manifest") else None,
+            run_manifest_id=plan.get("run_manifest_id"))
         if receipt["status"] == "blocked":
             raise SystemExit("Workflow blocked: " + str(receipt.get("unsupported_regions", [])))
         return
@@ -98,6 +103,7 @@ def main(argv: list[str] | None = None) -> None:
         outdir=Path(args.output_dir),
         fit_config=args._fit_config,
         multiplicity_support=args.multiplicity_support,
+        run_manifest_id=args.run_manifest_id,
     )
 
 

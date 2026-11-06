@@ -27,6 +27,18 @@ def freeze_record(value):
     return readonly_array(value) if isinstance(value, np.ndarray) else value
 
 
+def thaw_record(value, *, arrays_as_lists=False):
+    """Detach frozen mappings recursively before constructor reconstruction."""
+    if isinstance(value, Mapping):
+        return {key: thaw_record(item, arrays_as_lists=arrays_as_lists) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        items = [thaw_record(item, arrays_as_lists=arrays_as_lists) for item in value]
+        return tuple(items) if isinstance(value, tuple) and not arrays_as_lists else items
+    if isinstance(value, np.ndarray):
+        return value.tolist() if arrays_as_lists else value.copy()
+    return value.item() if isinstance(value, np.generic) else value
+
+
 def json_value(value):
     """Encode scientific nonfinite values explicitly, never as bare JSON NaN."""
     if isinstance(value, np.ndarray):
@@ -58,7 +70,7 @@ class ImmutableArrayRecord:
 
     def __reduce__(self):
         return restore_immutable_record, (type(self), {
-            item.name: getattr(self, item.name) for item in fields(self) if item.init
+            item.name: thaw_record(getattr(self, item.name)) for item in fields(self) if item.init
         })
 
 
@@ -114,10 +126,20 @@ class TumorData(ImmutableArrayRecord):
     mean_total_cn: np.ndarray | None = None
     cn_state_count: np.ndarray | None = None
     original_catalog: OriginalCatalog | None = None
+    normal_cn_supplied: np.ndarray | None = None
+    input_excluded: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         for name in ("mutation_ids", "region_ids"):
             object.__setattr__(self, name, tuple(getattr(self, name)))
+        if self.normal_cn_supplied is not None:
+            supplied = np.asarray(self.normal_cn_supplied)
+            if supplied.shape != (len(self.mutation_ids), len(self.region_ids)) or supplied.dtype.kind != "b":
+                raise ValueError("normal_cn_supplied must be aligned boolean provenance flags")
+        if self.input_excluded is not None:
+            excluded = np.asarray(self.input_excluded)
+            if excluded.shape != np.asarray(self.alt_counts).shape or excluded.dtype.kind != "b":
+                raise ValueError("input_excluded must be aligned boolean input masks")
         if self.mean_total_cn is None:
             object.__setattr__(self, "mean_total_cn", np.asarray(self.major_cn) + np.asarray(self.minor_cn))
         if self.cn_state_count is None:
@@ -125,7 +147,7 @@ class TumorData(ImmutableArrayRecord):
         for name in (
             "alt_counts", "total_counts", "purity", "major_cn", "minor_cn",
             "normal_cn", "scaling", "phi_upper", "phi_init", "count_observed",
-            "mean_total_cn", "cn_state_count",
+            "mean_total_cn", "cn_state_count", "normal_cn_supplied", "input_excluded",
         ):
             value = getattr(self, name)
             if value is not None:
@@ -226,7 +248,8 @@ class MultiplicityBounds(ImmutableArrayRecord):
         if np.any(aligned.upper > major):
             raise ValueError("Multiplicity upper endpoints exceed original major CN")
         default_upper = np.where(mixed, np.minimum(major, MAX_MULTIPLICITY), major)
-        if np.any(mixed & ((aligned.lower != 1) | (aligned.upper != default_upper))):
+        changed_mixed = eligible & mixed & ((aligned.lower != 1) | (aligned.upper != default_upper))
+        if np.any(changed_mixed):
             raise ValueError("Nondefault multiplicity bounds on mixed-CN pairs are unsupported")
         return (readonly_array(np.where(eligible, aligned.lower, 1), dtype=np.int64),
                 readonly_array(np.where(eligible, aligned.upper, 1), dtype=np.int64))
@@ -249,7 +272,7 @@ class MultiplicityBounds(ImmutableArrayRecord):
 
 _CATALOG_ARRAYS = ("alt_counts", "total_counts", "count_observed", "eligible", "major_cn",
                    "minor_cn", "normal_cn", "mean_total_cn", "cn_state_count", "purity",
-                   "segment_ids", "mapping_genuine")
+                   "segment_ids", "mapping_genuine", "normal_cn_supplied", "input_excluded")
 
 
 def _tuples(value):
@@ -280,15 +303,18 @@ class OriginalCatalog(ImmutableArrayRecord):
     purity: np.ndarray
     segment_ids: np.ndarray
     mapping_genuine: np.ndarray
+    normal_cn_supplied: np.ndarray
     cn_states: tuple
     source_rows: tuple
     provenance: tuple
     metadata: tuple
     max_major_cn: int = 10
+    input_excluded: np.ndarray | None = None
     _content_hash: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
-        from .tumor_txt import _identifier, _mapping_provenance, _safe_tumor_id
+        from .tumor_txt import (_identifier, _mapping_provenance, _normal_cn_provenance,
+                                _input_exclusion_provenance, _safe_tumor_id)
 
         object.__setattr__(self, "tumor_id", _safe_tumor_id(self.tumor_id))
         for name in ("mutation_ids", "region_ids"):
@@ -299,8 +325,10 @@ class OriginalCatalog(ImmutableArrayRecord):
                 _identifier(value, name=name)
             object.__setattr__(self, name, values)
         shape = (len(self.mutation_ids), len(self.region_ids))
+        if self.input_excluded is None:
+            object.__setattr__(self, "input_excluded", np.zeros(shape, dtype=bool))
         for name in _CATALOG_ARRAYS:
-            dtype = (bool if name in ("count_observed", "eligible", "mapping_genuine") else
+            dtype = (bool if name in ("count_observed", "eligible", "mapping_genuine", "normal_cn_supplied", "input_excluded") else
                      str if name == "segment_ids" else np.int64 if name == "cn_state_count" else float)
             values = np.asarray(getattr(self, name))
             if not values.size:
@@ -337,6 +365,14 @@ class OriginalCatalog(ImmutableArrayRecord):
         if any(self.mapping_genuine[i, j] != source_mapping[mutation, region]
                for i, mutation in enumerate(self.mutation_ids) for j, region in enumerate(self.region_ids)):
             raise ValueError("Catalog genuine-mapping flags disagree with original provenance")
+        normal_supplied = _normal_cn_provenance([dict(row) for row in self.source_rows])
+        if any(self.normal_cn_supplied[i, j] != normal_supplied[mutation, region]
+               for i, mutation in enumerate(self.mutation_ids) for j, region in enumerate(self.region_ids)):
+            raise ValueError("Catalog normal-CN flags disagree with original provenance")
+        input_excluded = _input_exclusion_provenance([dict(row) for row in self.source_rows])
+        if any(self.input_excluded[i, j] != input_excluded[mutation, region]
+               for i, mutation in enumerate(self.mutation_ids) for j, region in enumerate(self.region_ids)):
+            raise ValueError("Catalog input-exclusion masks disagree with original provenance")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
         if not np.isfinite(self.purity).all() or np.any(self.purity <= 0) or np.any(self.purity > 1):
             raise ValueError("Catalog purity must lie in (0,1]")
@@ -377,16 +413,19 @@ class OriginalCatalog(ImmutableArrayRecord):
                 if (self.major_cn[i, j] != maximum or self.minor_cn[i, j] != minor.max()
                         or self.cn_state_count[i, j] != len(states)
                         or not np.isclose(self.mean_total_cn[i, j], total, atol=1e-12, rtol=1e-12)
-                        or self.eligible[i, j] != (maximum <= self.max_major_cn)):
+                        or self.eligible[i, j] != (maximum <= self.max_major_cn and not self.input_excluded[i, j])):
                     raise ValueError("Catalog biology or eligibility disagrees with original CN states")
         object.__setattr__(self, "_content_hash", hashlib.sha256(json.dumps(self._payload(), sort_keys=True,
             ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).hexdigest())
 
     def _payload(self):
-        payload = {"schema": "clipp2.original-catalog.v2", "tumor_id": self.tumor_id,
+        payload = {"schema": "clipp2.original-catalog.v3", "tumor_id": self.tumor_id,
                    "mutation_ids": list(self.mutation_ids), "region_ids": list(self.region_ids),
                    "max_major_cn": self.max_major_cn}
         payload.update((name, getattr(self, name).tolist()) for name in _CATALOG_ARRAYS)
+        # The additive all-false default preserves existing v3 payload identities.
+        if not self.input_excluded.any():
+            payload.pop("input_excluded")
         payload.update((name, getattr(self, name)) for name in ("cn_states", "source_rows", "provenance", "metadata"))
         return payload
 
@@ -394,14 +433,28 @@ class OriginalCatalog(ImmutableArrayRecord):
     def content_hash(self):
         return self._content_hash
 
+    @property
+    def biological_identity(self):
+        """Declared biological namespace, independent of file bytes and numerical fit."""
+        metadata = dict(self.metadata)
+        identity = dict(schema="clipp2.biological-identity.v1", tumor_id=self.tumor_id,
+            region_mapping=[dict(region_id=region, source_sample_id=region) for region in self.region_ids],
+            mutation_key_convention=metadata.get("mutation_key_convention", "opaque_mutation_id"),
+            genome_build=metadata.get("genome_build", "unknown"),
+            coordinate_system=metadata.get("coordinate_system", "1-based-inclusive"))
+        for name in ("reference_build", "region_mapping"):
+            if name in metadata:
+                identity["declared_" + name] = metadata[name]
+        return identity
+
     def to_dict(self):
         return dict(self._payload(), content_hash=self.content_hash)
 
     @classmethod
     def from_dict(cls, payload):
-        if payload.get("schema") != "clipp2.original-catalog.v2":
+        if payload.get("schema") != "clipp2.original-catalog.v3":
             raise ValueError("Unsupported original-catalog schema")
-        value = cls(**{item.name: payload[item.name] for item in fields(cls) if item.init})
+        value = cls(**{item.name: payload[item.name] for item in fields(cls) if item.init and item.name in payload})
         if payload.get("content_hash") != value.content_hash:
             raise ValueError("Original-catalog content hash mismatch")
         return value
@@ -435,7 +488,7 @@ class OriginalCatalog(ImmutableArrayRecord):
         return MultiplicityBounds(self.mutation_ids, self.region_ids, np.ones_like(upper), upper, "original")
 
 
-def validate_workflow_mapping(catalog, mutation_ids=None):
+def validate_workflow_mapping(catalog, mutation_ids=None, *, normal_cn_policy=None):
     """Require genuine single-state CN wherever a strict workflow uses evidence.
 
     Unobserved single-state cells have no likelihood or restricted CCF domain;
@@ -444,6 +497,8 @@ def validate_workflow_mapping(catalog, mutation_ids=None):
     """
     if not isinstance(catalog, OriginalCatalog):
         raise TypeError("Strict workflow mapping requires an OriginalCatalog")
+    if normal_cn_policy not in (None, "diploid"):
+        raise ValueError("normal_cn_policy must be None or 'diploid'")
     ids, rows = _indices(catalog.mutation_ids if mutation_ids is None else mutation_ids,
                         catalog.mutation_ids, "mutation")
     eligible = catalog.eligible[rows]
@@ -454,7 +509,13 @@ def validate_workflow_mapping(catalog, mutation_ids=None):
         examples = [(ids[i], catalog.region_ids[j]) for i, j in np.argwhere(nongenuine | mixed)[:5]]
         raise ValueError("Strict workflow evidence requires genuine, unambiguous single-state CN; "
                          f"invalid mutation-region mappings: {examples}")
+    assumed = observed & ~catalog.normal_cn_supplied[rows]
+    invalid_normal = assumed if normal_cn_policy is None else assumed & (catalog.normal_cn[rows] != 2)
+    if np.any(invalid_normal):
+        examples = [(ids[i], catalog.region_ids[j]) for i, j in np.argwhere(invalid_normal)[:5]]
+        raise ValueError("Strict workflow evidence requires supplied normal CN or an explicit matching "
+                         f"normal_cn_policy='diploid'; invalid mutation-region mappings: {examples}")
 
 
 __all__ = ["CNFilterRecord", "CNFilterReport", "TumorData", "OriginalCatalog", "MultiplicityBounds",
-           "freeze_record", "json_value", "content_hash", "validate_workflow_mapping"]
+           "freeze_record", "thaw_record", "json_value", "content_hash", "validate_workflow_mapping"]

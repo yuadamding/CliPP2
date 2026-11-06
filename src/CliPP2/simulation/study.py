@@ -1,0 +1,640 @@
+"""Resumable study execution with history-level pairing and frozen development."""
+from __future__ import annotations
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict
+import json
+import os
+from pathlib import Path
+import resource
+import sys
+import time
+import traceback
+import zipfile
+from functools import lru_cache
+
+import numpy as np
+import pandas as pd
+
+from CliPP2.assignment import posterior_passes
+from CliPP2.config import PROTOCOL_VERSION
+from CliPP2._version import __version__
+from CliPP2.io.data import json_value
+from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
+
+from .design import (CONTRIBUTOR_GRID, POSTERIOR_GRID, allocate, jobs, resolve_config,
+                     seed_for, workflow_config)
+
+
+def save_json(path, payload):
+    """New-file publication: interrupted work never masquerades as completion."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + f".partial-{os.getpid()}")
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(json_value(payload), stream, allow_nan=False, separators=(",", ":"))
+            stream.write("\n")
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _latest_completion(directory):
+    paths = list(Path(directory).glob("completion*.json"))
+    values = [read_json(path) for path in paths]
+    return max(values, key=lambda value: value["attempt"]) if values else None
+
+
+def _archive_completed(directory):
+    """Compress only verified, generated outputs; preserve their entire contents."""
+    import shutil
+    for source in sorted(directory.glob("configuration-*")):
+        if not source.is_dir():
+            continue
+        destination = source.with_suffix(".zip")
+        temporary = destination.with_suffix(".zip.partial")
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+            for path in sorted(source.rglob("*")):
+                if path.is_file():
+                    archive.write(path, str(path.relative_to(source)))
+        with zipfile.ZipFile(temporary) as archive:
+            if archive.testzip() is not None:
+                raise IOError("Generated output archive failed its integrity check")
+        os.link(temporary, destination)
+        temporary.unlink()
+        shutil.rmtree(source)
+
+
+def _paired_result(attempt, index=1):
+    source = Path(attempt) / f"configuration-{index}"
+    if source.is_dir():
+        return read_json(source / "paired_result.json")
+    with zipfile.ZipFile(source.with_suffix(".zip")) as archive:
+        return json.loads(archive.read("paired_result.json"))
+
+
+@lru_cache(maxsize=2)
+def _cohort(path):
+    from .cohort import load_cohort
+    return load_cohort(path)
+
+
+def _history(job):
+    if job.get("cohort_settings"):
+        from .cohort import cohort_history
+        return cohort_history(_cohort(job["cohort_settings"]), job.get("source_history_id", job["history_id"]))
+    from .biology import generate_history
+    dims = job["dimensions"]
+    history = generate_history(job["family"], job["history_seed"],
+        n_mutations=dims["mutations"], n_segments=dims["segments"], n_regions=dims["regions"])
+    return history
+
+
+def _acquire(job, history):
+    if job.get("cohort_settings"):
+        from .cohort import acquire_cohort
+        return acquire_cohort(history, _cohort(job["cohort_settings"]), job["acquisition"]["id"])
+    from .acquisition import acquire
+    return acquire(history, job["acquisition_seed"], job["acquisition"]["purity"], job["acquisition"]["depth"],
+                   perturbation=job.get("perturbation"))
+
+
+def _peak_bytes():
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return int(value if sys.platform == "darwin" else value*1024)
+
+
+def _decision(row, posterior):
+    if row is None or row.get("best_label") is None or not row.get("informative_regions"):
+        return None
+    if row.get("cluster_tie"):
+        return None
+    if not posterior_passes(float(row["log_competitor_ratio"]), posterior,
+                             row["has_finite_alternative"]):
+        return None
+    if not row.get("reference_quality_pass", False) or row.get("fit_screen_status") != "pass":
+        return None
+    return int(row["best_label"])
+
+
+def development_scores(history, catalog, experiment, evaluation, job, contributor, *, posterior_grid=POSTERIOR_GRID,
+                       fixed_families=("S01", "S02", "S07")):
+    """Fixed original population; failed selection/fits receive zero credit."""
+    from .evaluation import information_diagnostics
+    observed = catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)
+    # Biological truth, not perturbed supplied inputs, defines the tuning stratum.
+    acquisition = job["acquisition"]
+    info = information_diagnostics(history.phi, history.multiplicity,
+        history.major_cn, history.minor_cn, np.broadcast_to(acquisition["purity"], history.phi.shape),
+        np.full(history.phi.shape, 2.), catalog.total_counts, observed,
+        history.observable_truth_ids)
+    fixed = observed.any(axis=1) & np.array([row["information_stratum"] in
+        ("separated", "not_applicable_no_competing_truth") for row in info])
+    fixed &= job["family"] in fixed_families
+    truth_clonal = np.all(np.isclose(history.phi, 1., atol=1e-12, rtol=0), axis=1)
+    arm = experiment.get("arms", {}).get("C", {})
+    if arm.get("status") not in ("complete", "empty_remainder"):
+        arm = {}  # An unavailable analysis receives zero credit on the fixed population.
+    membership = arm.get("combined_labels", {})
+    targets, unchanged = set(arm.get("targets", ())), set(arm.get("non_targets", ()))
+    records = {row["mutation_id"]: row for row in (arm.get("assignment") or {}).get("assignments", ())}
+    rows = []
+    for posterior in posterior_grid:
+        correct_f = correct_t = wrong_t = accepted = evaluable_targets = 0
+        for i, mutation in enumerate(history.mutation_ids):
+            if not fixed[i]:
+                continue
+            if mutation in unchanged and mutation in membership:
+                correct_f += int((membership[mutation] == 0) == truth_clonal[i])
+            if mutation in targets:
+                evaluable_targets += 1
+                selected = _decision(records.get(mutation), posterior)
+                if selected is not None:
+                    accepted += 1
+                    correct = (selected == 0) == truth_clonal[i]
+                    correct_t += int(correct)
+                    wrong_t += int(not correct)
+        rows.append(dict(cell_id=job["cell_id"], history_id=job["history_id"], family=job["family"],
+            acquisition=acquisition["id"], contributor=contributor, posterior=posterior,
+            configuration_id=f"c{contributor:.2f}-p{posterior:.2f}", fixed_evaluable=int(fixed.sum()),
+            correct_unchanged=correct_f, correct_targets=correct_t, accepted_targets=accepted,
+            wrong_targets=wrong_t, evaluable_targets=evaluable_targets,
+            experiment_status=experiment.get("status"), arm_status=arm.get("status")))
+    return rows
+
+
+def _run_cell(task):
+    from .evaluation import evaluate
+    from .experiment import run_paired_experiment
+    root, job, selected = Path(task["root"]), task["job"], task.get("selected")
+    evaluation_config = dict(reference_match_atol=task.get("reference_match_atol"))
+    directory = root / "cells" / job["cell_id"]
+    prior = _latest_completion(directory)
+    if prior is not None:
+        value = prior
+        if (value.get("protocol_version") != PROTOCOL_VERSION
+                or value.get("implementation_version") != __version__):
+            raise ValueError("Cell replay requires the current execution protocol and implementation; earlier results remain historical")
+        if (value["job"] != job or value.get("execution_configs") != task.get("execution_configs")
+                or value.get("evaluation_config") != evaluation_config):
+            raise ValueError("Resume cell identity/configuration differs from the frozen job")
+        if value["status"] != "execution_failed" or not task.get("retry_failed", False):
+            return value
+    directory.mkdir(parents=True, exist_ok=True)
+    attempts = sorted(directory.glob("attempt-*"))
+    attempt = directory / f"attempt-{len(attempts)+1:03d}"
+    completion = directory / ("completion.json" if not attempts else f"completion.{len(attempts)+1:03d}.json")
+    attempt.mkdir()
+    started = time.perf_counter()
+    save_json(attempt / "job.json", job)
+    objectives, results, costs = [], [], []
+    try:
+        history = _history(job)
+        acquisition = job["acquisition"]
+        frame = _acquire(job, history)
+        frame.attrs["acquisition"].update(id=acquisition["id"], panel=job["phase"])
+        metadata = dict(frame.attrs.get("metadata", {}), tumor_id=job["cell_id"])
+        input_path = attempt / "input_catalog.tsv"
+        write_tumor_txt(input_path, frame, metadata)
+        save_json(attempt / "acquisition.json", frame.attrs.get("acquisition", {}))
+        catalog = load_original_catalog(input_path)
+        from CliPP2.config import WorkflowConfig
+        configurations = task.get("execution_configs") or [asdict(workflow_config(c, p)) for c, p in
+            ([(c, .80) for c in CONTRIBUTOR_GRID] if job["phase"] == "development"
+             else [(selected["contributor"], selected["posterior"])])]
+        first = second = None
+        for index, values in enumerate(configurations):
+            config = WorkflowConfig.from_dict(values)
+            contributor = config.contributor_probability_min
+            def progress(event):
+                fields = ("phase", "stage", "elapsed_seconds", "phase_elapsed_seconds", "occupied_q", "membership_audit", "operation")
+                payload = dict(configuration=index+1, **{key: event[key] for key in fields if key in event})
+                temporary = attempt / ".progress.json.tmp"
+                temporary.write_text(json.dumps(json_value(payload), allow_nan=False))
+                os.replace(temporary, attempt / "progress.json")
+            experiment = run_paired_experiment(input_path, attempt / f"configuration-{index+1}", config,
+                accepted_stage_one=first, accepted_uncapped_stage_two=second, progress_callback=progress,
+                run_manifest_id=task.get("run_manifest_id"))
+            costs.append(experiment["cost_ledger"])
+            save_json(attempt / f"cost-ledger-{index+1}.json", experiment["cost_ledger"])
+            first = first or experiment.get("stage_one")
+            second = second or experiment.get("arms", {}).get("B", {}).get("stage_two")
+            evaluation = evaluate(history, catalog, experiment, acquisition=frame.attrs.get("acquisition"),
+                                  reference_match_atol=task.get("reference_match_atol"))
+            evaluation.update(cell_id=job["cell_id"], history_id=job["history_id"], family=job["family"],
+                              acquisition_id=acquisition["id"], acquisition=acquisition, phase=job["phase"], job=job)
+            save_json(attempt / f"evaluation-{index+1}.json", evaluation)
+            results.append(str((attempt / f"evaluation-{index+1}.json").relative_to(root)))
+            if job["phase"] == "development":
+                objectives.extend(development_scores(history, catalog, experiment, evaluation, job, contributor,
+                    posterior_grid=task.get("posterior_grid", POSTERIOR_GRID),
+                    fixed_families=task.get("fixed_families", ("S01", "S02", "S07"))))
+                save_json(attempt / f"threshold-objectives-{index+1}.json", objectives)
+        if objectives:
+            save_json(attempt / "threshold_objectives.json", objectives)
+        if task.get("archive_completed", False):
+            _archive_completed(attempt)
+        value = dict(job=job, status="complete", evaluations=results, cost_ledgers=costs,
+            objective_path=str((attempt / "threshold_objectives.json").relative_to(root)) if objectives else None,
+            attempt=str(attempt.relative_to(root)), elapsed_seconds=time.perf_counter()-started,
+            peak_resident_bytes=_peak_bytes())
+    except Exception as exc:
+        if objectives and not (attempt / "threshold_objectives.json").exists():
+            save_json(attempt / "threshold_objectives.json", objectives)
+        value = dict(job=job, status="execution_failed", error_type=type(exc).__name__, error=str(exc),
+            traceback=traceback.format_exc(), evaluations=results, cost_ledgers=costs,
+            objective_path=str((attempt / "threshold_objectives.json").relative_to(root)) if objectives else None,
+            attempt=str(attempt.relative_to(root)), elapsed_seconds=time.perf_counter()-started,
+            peak_resident_bytes=_peak_bytes())
+        save_json(attempt / "failure.json", value)
+    value["execution_configs"] = task.get("execution_configs")
+    value["evaluation_config"] = evaluation_config
+    value["protocol_version"] = PROTOCOL_VERSION
+    value["implementation_version"] = __version__
+    value["prior_cost_ledgers"] = ((prior.get("prior_cost_ledgers", [])+prior.get("cost_ledgers", []))
+                                  if prior else [])
+    value["output_bytes"] = sum(p.stat().st_size for p in attempt.rglob("*") if p.is_file())
+    save_json(completion, value)
+    return value
+
+
+def _prepare_histories(root, job_list):
+    seen = set()
+    for job in job_list:
+        if job["history_id"] in seen:
+            continue
+        seen.add(job["history_id"])
+        directory = root / "histories" / job["history_id"]
+        if (directory / "history_manifest.json").exists():
+            existing = read_json(directory / "history_manifest.json")
+            if existing != {k: job[k] for k in ("history_id", "family", "history_seed", "dimensions")}:
+                raise ValueError("Resume physical history differs")
+            continue
+        history = _history(job)
+        directory.mkdir(parents=True, exist_ok=True)
+        history.write_truth(directory)
+        save_json(directory / "history_manifest.json",
+                  {k: job[k] for k in ("history_id", "family", "history_seed", "dimensions")})
+
+
+def run_jobs(root, job_list, *, workers, selected=None, contract=None, retry_failed=False):
+    job_list = list(job_list)
+    manifests = root / "job_manifests"
+    manifests.mkdir(exist_ok=True)
+    manifest = manifests / f"batch-{len(list(manifests.glob('batch-*.json')))+1:03d}.json"
+    save_json(manifest, job_list)
+    _prepare_histories(root, job_list)
+    tasks = []
+    for job in job_list:
+        settings = contract["threshold_development"] if contract else {}
+        grid = settings.get("contributor_grid", CONTRIBUTOR_GRID)
+        posterior_grid = settings.get("posterior_grid", POSTERIOR_GRID)
+        values = [(c, min(posterior_grid)) for c in grid] if job["phase"] == "development" else [(selected["contributor"], selected["posterior"])]
+        resolved = []
+        for contributor, posterior in values:
+            resolved.append(asdict(resolve_config(contract, contributor, posterior)) if contract else
+                            asdict(workflow_config(contributor, posterior)))
+        tasks.append(dict(root=str(root), job=job, selected=selected, execution_configs=resolved,
+                          posterior_grid=list(posterior_grid),
+                          retry_failed=retry_failed,
+                          archive_completed=contract["resource_limits"].get("archive_completed_outputs", False) if contract else False,
+                          reference_match_atol=contract.get("evaluation", {}).get("reference_match_atol") if contract else None,
+                          run_manifest_id=contract.get("run_manifest_id") if contract else None,
+                          fixed_families=settings.get("fixed_population_families", ["S01", "S02", "S07"])))
+    values = []
+    # Prevent BLAS oversubscription; each native fit has an explicit single thread.
+    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[name] = "1"
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_run_cell, task): task["job"] for task in tasks}
+        for future in as_completed(futures):
+            value = future.result()
+            values.append(value)
+            print(json.dumps(dict(event="cell_complete", cell=value["job"]["cell_id"],
+                status=value["status"], completed=len(values), planned=len(tasks),
+                elapsed_seconds=round(value["elapsed_seconds"], 2))), flush=True)
+    return sorted(values, key=lambda row: row["job"]["cell_id"])
+
+
+def select_thresholds(root, cells, contract):
+    settings = contract["threshold_development"]
+    rows = [row for cell in cells if cell.get("objective_path")
+            for row in read_json(root / cell["objective_path"])]
+    # A failed worker still belongs to its original prespecified population.
+    # Recover that denominator from the untouched biological input and give zero
+    # credit for all thresholds, rather than dropping its history or family.
+    expected = {(c, p) for c in settings["contributor_grid"] for p in settings["posterior_grid"]}
+    for cell in cells:
+        available = {(row["contributor"], row["posterior"]) for row in rows if row["cell_id"] == cell["job"]["cell_id"]}
+        missing = expected-available
+        if not missing:
+            continue
+        job = cell["job"]
+        h = _history(job)
+        frame = _acquire(job, h)
+        temporary = root / cell["attempt"] / "failed_population.tsv"
+        if not temporary.exists():
+            write_tumor_txt(temporary, frame, frame.attrs.get("metadata"))
+        catalog = load_original_catalog(temporary)
+        for contributor in settings["contributor_grid"]:
+            rows.extend(row for row in development_scores(h, catalog, {}, {}, job, contributor,
+                posterior_grid=settings["posterior_grid"], fixed_families=settings["fixed_population_families"])
+                if (row["contributor"], row["posterior"]) in missing)
+    frame = pd.DataFrame(rows)
+    candidates = []
+    for configuration, group in frame.groupby("configuration_id"):
+        usable = group[group.fixed_evaluable > 0].copy()
+        for field in ("correct_unchanged", "correct_targets", "accepted_targets", "wrong_targets"):
+            usable[field + "_rate"] = usable[field] / usable.fixed_evaluable
+        rates = [key + "_rate" for key in ("correct_unchanged", "correct_targets", "accepted_targets", "wrong_targets")]
+        per_history = usable.groupby(["family", "history_id"])[rates].mean()
+        per_family = per_history.groupby("family").mean()
+        means = per_family.mean()
+        acceptance = float(means.get("accepted_targets_rate", 0.))
+        error = float(means.get("wrong_targets_rate", 0.)) / acceptance if acceptance else None
+        first = group.iloc[0]
+        candidates.append(dict(configuration_id=configuration, contributor=float(first.contributor),
+            posterior=float(first.posterior), objective=float(means.get("correct_unchanged_rate", 0.)+
+                                                            means.get("correct_targets_rate", 0.)),
+            correct_unchanged_rate=float(means.get("correct_unchanged_rate", 0.)),
+            correct_target_rate=float(means.get("correct_targets_rate", 0.)),
+            target_wrong_acceptance=float(means.get("wrong_targets_rate", 0.)),
+            target_acceptance=acceptance, selective_error=error,
+            qualifying=bool(acceptance > 0 and error <= settings["selective_error_limit"]
+                            and set(per_family.index) == set(settings["fixed_population_families"])),
+            represented_families=list(per_family.index), fixed_evaluable=int(group.fixed_evaluable.sum())))
+    qualified = [row for row in candidates if row["qualifying"]]
+    selected = min(qualified, key=lambda row: (-row["objective"], row["target_wrong_acceptance"],
+        -row["posterior"], -row["contributor"], row["configuration_id"])) if qualified else None
+    return dict(schema="clipp2.simulation-development.v1", selected=selected,
+                configurations=candidates, cell_objectives=rows, tuning_target="C3", B3_separately_optimized=False)
+
+
+def execute(root, contract, *, resume=False, retry_failed=False):
+    import fcntl
+    root = Path(root).resolve()
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with (root.parent / ("."+root.name+".lock")).open("a") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("This study is already running; use the status command") from exc
+        return _execute(root, contract, resume=resume, retry_failed=retry_failed)
+
+
+def _execute(root, contract, *, resume=False, retry_failed=False):
+    root = Path(root).resolve()
+    if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v3"
+            or contract.get("implementation_version") != __version__):
+        raise ValueError(f"Execution requires a Protocol {PROTOCOL_VERSION} simulation contract; earlier studies require their original installed environment")
+    if resume:
+        frozen = read_json(root / "study_contract.json")
+        if frozen != contract:
+            raise ValueError("Resume requires the exact frozen study contract")
+    else:
+        if root.exists() and any(root.iterdir()):
+            raise FileExistsError("Study outputs must be new or empty; use --resume for this study")
+        root.mkdir(parents=True, exist_ok=True)
+        if contract.get("cohort"):
+            import shutil
+            frozen_cohort = root / "cohort_settings.json"
+            shutil.copyfile(contract["cohort"]["path"], frozen_cohort)
+            contract["cohort"]["path"] = str(frozen_cohort)
+        save_json(root / "study_contract.json", contract)
+    qualification_path = root / "qualification.json"
+    if not qualification_path.exists():
+        from .biology import generate_history
+        from .controls import run_controls
+        for family in contract["families"]:
+            for variant in range(3):
+                generate_history(family, variant+100, n_mutations=60, n_segments=6, n_regions=4).validate()
+        controls = run_controls(root / "source_snapshots" / "mechanisms")
+        if contract.get("cohort"):
+            from .controls import run_cohort_controls
+            controls["cohort"] = run_cohort_controls(_cohort(contract["cohort"]["path"]),
+                                                     root / "source_snapshots" / "cohort")
+        save_json(qualification_path, dict(physical_histories_validated=36, controls=controls,
+            protocol_version=PROTOCOL_VERSION, source_cohort_protocol_version=contract.get("source_cohort_protocol_version"),
+            numerical_policy=f"Every native fit and assignment retains the independent Protocol {PROTOCOL_VERSION} verification receipt"))
+    workers = contract["resource_limits"]["workers"]
+    allocation_path = root / "allocation.json"
+    if allocation_path.exists():
+        allocation = read_json(allocation_path)
+    elif contract["profile"] == "full":
+        allocation = allocate(contract, [1.], [1])
+        allocation.update(timing_seconds_per_dataset=None, measured_seconds=[], measured_bytes=[],
+            dataset_capacity=None, resource_reduction_applied=False,
+            reason="Entire supplied cohort explicitly requested; fixed allocation, no timing-based reduction",
+            pilot_policy="Bounded resource qualification is separate; no extra optimizer fits for allocation")
+        save_json(allocation_path, allocation)
+    else:
+        pilot = []
+        if contract.get("cohort"):
+            wanted = {"S01.01", "S02.05", "S04.01", "S06.05", "S09.05"}
+            for job in jobs(contract, "development", 1):
+                if job["variant_id"] in wanted and job["acquisition"]["id"] == "A4":
+                    pilot.append(dict(job, phase="pilot", cell_id="pilot."+job["cell_id"],
+                                      source_history_id=job["history_id"]))
+        else:
+            for family in ("S01", "S02", "S04", "S06", "S09"):
+                pilot.append(dict(cell_id=f"pilot-{family}", phase="pilot", family=family,
+                    history_id=f"pilot-{family}", history_index=0,
+                    history_seed=seed_for(contract["master_seed"], "pilot", family, 0),
+                    acquisition_seed=seed_for(contract["master_seed"], "pilot", family, 0, 4),
+                    acquisition=contract["acquisitions"][-1], dimensions=contract["dimensions"]))
+        cells = run_jobs(root, pilot, workers=workers, selected=dict(contributor=.95, posterior=.95), contract=contract)
+        if any(cell["status"] != "complete" for cell in cells):
+            raise RuntimeError("Timing pilot execution failed; inspect immutable cell failure records")
+        projected = [cell["elapsed_seconds"]*3/max(1, cell["cost_ledgers"][0]["fit_count"]) for cell in cells]
+        allocation = allocate(contract, projected,
+                              [cell["output_bytes"] for cell in cells])
+        allocation["pilot_raw_elapsed_seconds"] = [cell["elapsed_seconds"] for cell in cells]
+        allocation["pilot_cost_ledgers"] = [cell["cost_ledgers"] for cell in cells]
+        allocation["timing_projection"] = "Scale each pilot to three fits when a valid branch skipped fits; then apply the frozen safety factor"
+        save_json(allocation_path, allocation)
+        print(json.dumps(dict(event="allocation_frozen", allocation=allocation)), flush=True)
+    development_path = root / "threshold_development.json"
+    if development_path.exists():
+        development = read_json(development_path)
+    else:
+        count = allocation.get("development_replicates_per_variant") or allocation["development_histories_per_family"]
+        development_cells = run_jobs(root, jobs(contract, "development", count), workers=workers, contract=contract,
+                                     retry_failed=retry_failed)
+        development = select_thresholds(root, development_cells, contract)
+        if development["selected"] is None and (not contract.get("cohort") or count < 2):
+            print(json.dumps(dict(event="development_extension", reason="No threshold met the frozen criterion")), flush=True)
+            development_cells += run_jobs(root, jobs(contract, "development", count, start=count), workers=workers, contract=contract,
+                                          retry_failed=retry_failed)
+            development = select_thresholds(root, development_cells, contract)
+        save_json(development_path, development)
+    if development["selected"] is None:
+        report(root)
+        raise RuntimeError("No development setting qualified after the prespecified extension; final cohort not generated")
+    plan_path = root / "study_plan.json"
+    if not plan_path.exists():
+        save_json(plan_path, dict(contract=contract, allocation=allocation,
+            selected_thresholds=development["selected"],
+            workflow_config=asdict(resolve_config(contract, development["selected"]["contributor"],
+                                                 development["selected"]["posterior"])),
+            frozen_before_main_generation=True))
+    main_count = allocation.get("main_replicates_per_variant") or allocation["main_histories_per_family"]
+    run_jobs(root, jobs(contract, "main", main_count),
+             workers=workers, selected=development["selected"], contract=contract, retry_failed=retry_failed)
+    run_optional_panels(root, contract, development["selected"], workers)
+    return report(root)
+
+
+def run_optional_panels(root, contract, selected, workers):
+    from .acquisition import acquire
+    from .controls import run_reference_audit
+    from .panels import contributor_density_diagnostics, run_scaling, sensitivity_jobs
+    options = contract["optional_panels"]
+    if not any(options.get(key) for key in ("external_reference", "technical_sensitivity", "assignment_scaling", "contributor_density")):
+        return
+    config = resolve_config(contract, selected["contributor"], selected["posterior"])
+    output = root / "optional_panels"
+    output.mkdir(exist_ok=True)
+    if options.get("technical_sensitivity"):
+        run_jobs(root, sensitivity_jobs(contract, extended=options.get("extended_sensitivity", False)),
+                 workers=workers, selected=selected, contract=contract)
+    if options.get("external_reference"):
+        for family in ("S03", "S04", "S05", "S11", "S12"):
+            directory = output / "reference_audits" / family
+            if (directory / "reference_audit.json").exists():
+                continue
+            if contract.get("cohort"):
+                candidate = next(job for job in jobs(contract, "main", 1)
+                                 if job["family"] == family and job["acquisition"]["id"] == "A4")
+                cell_id = candidate["cell_id"]
+            else:
+                cell_id = f"main-{family}-H001-A4"
+            completion = read_json(root / "cells" / cell_id / "completion.json")
+            job = completion["job"]
+            history = _history(job)
+            attempt = root / completion["attempt"]
+            catalog = load_original_catalog(attempt / "input_catalog.tsv")
+            paired = _paired_result(attempt) if completion.get("cost_ledgers") else {}
+            second_catalog = None
+            if options.get("independent_counts"):
+                if contract.get("cohort"):
+                    from .cohort import acquire_cohort
+                    second = acquire_cohort(history, _cohort(contract["cohort"]["path"]), "A4", read_replicate_id=2)
+                else:
+                    second = acquire(history, seed_for(contract["master_seed"], "main", family, 0, 104), .8, 500)
+                second_path = output / f"{family}_independent_counts.tsv"
+                if not second_path.exists():
+                    write_tumor_txt(second_path, second, dict(second.attrs["metadata"], tumor_id=catalog.tumor_id))
+                second_catalog = load_original_catalog(second_path)
+            run_reference_audit(history, catalog, paired, config, directory, second_catalog=second_catalog)
+    density_path = output / "contributor_density.json"
+    if options.get("contributor_density") and not density_path.exists():
+        from .biology import generate_history
+        history = generate_history("S09", seed_for(contract["master_seed"], "controls", "S09", 0),
+                                   n_mutations=1500, n_segments=3, n_regions=4)
+        frame = acquire(history, seed_for(contract["master_seed"], "controls", "S09", 0, 4), .8, 500)
+        save_json(density_path, contributor_density_diagnostics(history, frame, config))
+    if options.get("assignment_scaling") and not (output / "scaling" / "scaling_summary.json").exists():
+        run_scaling(output / "scaling", config)
+
+
+def report(root):
+    from .evaluation import aggregate
+    from .figures import make_figures
+    from .runtime import recorded_costs
+    root = Path(root)
+    contract = read_json(root / "study_contract.json")
+    cells = [value for directory in sorted((root / "cells").glob("*")) if directory.is_dir()
+             for value in [_latest_completion(directory)] if value is not None]
+    main = [cell for cell in cells if cell["job"]["phase"] == "main"]
+    allocation_path = root / "allocation.json"
+    if allocation_path.exists():
+        allocation = read_json(allocation_path)
+        count = allocation.get("main_replicates_per_variant") or allocation["main_histories_per_family"]
+        completed_ids = {cell["job"]["cell_id"] for cell in main}
+        for job in jobs(contract, "main", count):
+            if job["cell_id"] not in completed_ids:
+                main.append(dict(job=job, status="not_executed", evaluations=[], cost_ledgers=[],
+                                 elapsed_seconds=0., peak_resident_bytes=0, output_bytes=0))
+    evaluations = []
+    for cell in main:
+        if cell.get("evaluations"):
+            evaluations.append(read_json(root / cell["evaluations"][0]))
+        else:
+            job = cell["job"]
+            evaluations.append(dict(schema="clipp2.simulation.evaluation.v1", cell_id=job["cell_id"],
+                history_id=job["history_id"], family=job["family"], acquisition_id=job["acquisition"]["id"],
+                acquisition=job["acquisition"], phase="main", applicability=[dict(arm=a, available=False,
+                    status=cell["status"], planned=True) for a in ("A", "B", "C", "B3", "C3")],
+                metrics=[dict(name=name, arm=a, view="all_planned_cells", stratum="all", value=value,
+                    numerator=value, denominator=1, status="available")
+                    for a in ("A", "B", "C", "B3", "C3")
+                    for name, value in (("analysis_failure", int(cell["status"] != "not_executed")), ("analysis_available", 0))]
+                    +[dict(name="correct_per_original_evaluable", arm=a, view="", stratum="all", value=0.,
+                           numerator=0, denominator=None, status="unavailable_no_correct_decision_credit")
+                      for a in ("B", "C", "B3", "C3")],
+                mutations=[], calibration=[], cap_audit=[], stage_three_containment=[], information=[]))
+    summary = aggregate(evaluations)
+    costs = recorded_costs(root)
+    summary.update(planned_main_cells=len(main), worker_failures=sum(cell["status"] == "execution_failed" for cell in main),
+                   unexecuted_main_cells=sum(cell["status"] == "not_executed" for cell in main),
+                   all_cell_count=len(cells), peak_resident_bytes=max((c["peak_resident_bytes"] for c in cells), default=0),
+                   fit_count=costs.get("fit_attempts", 0), assignment_pass_count=costs.get("assignment_attempts", 0),
+                   operation_costs=costs)
+    report_dir = root / "reports" / f"report-{len(list((root / 'reports').glob('report-*')))+1:03d}"
+    report_dir.mkdir(parents=True)
+    save_json(report_dir / "aggregate.json", summary)
+    figures = make_figures(evaluations, summary, report_dir)
+    metrics = [dict(cell_id=e["cell_id"], history_id=e["history_id"], family=e["family"],
+                    acquisition=e["acquisition_id"], **row) for e in evaluations for row in e["metrics"]]
+    pd.DataFrame(metrics).to_csv(report_dir / "tumor_metrics.tsv", sep="\t", index=False, na_rep="NA")
+    audits = [dict(cell_id=e["cell_id"], **row) for e in evaluations for row in e.get("cap_audit", ())]
+    pd.DataFrame(audits, columns=None if audits else ["cell_id", "mutation_id", "region_id"]).to_csv(
+        report_dir / "bound_audit.tsv", sep="\t", index=False, na_rep="NA")
+    pd.DataFrame([dict(cell_id=c["job"]["cell_id"], phase=c["job"]["phase"], family=c["job"]["family"],
+                       status=c["status"], elapsed_seconds=c["elapsed_seconds"],
+                       peak_resident_bytes=c["peak_resident_bytes"], output_bytes=c["output_bytes"])
+                  for c in cells], columns=["cell_id", "phase", "family", "status", "elapsed_seconds", "peak_resident_bytes", "output_bytes"]).to_csv(report_dir / "execution_ledger.tsv", sep="\t", index=False)
+    _write_report(root, report_dir, cells, evaluations, summary, figures)
+    print(json.dumps(dict(event="report_complete", path=str(report_dir / "comparison_report.html"))), flush=True)
+    return dict(output_dir=str(root), report=str(report_dir / "comparison_report.html"), summary=summary)
+
+
+def _write_report(root, directory, cells, evaluations, summary, figures):
+    import html
+    contract = read_json(root / "study_contract.json")
+    allocation = read_json(root / "allocation.json") if (root / "allocation.json").exists() else {}
+    development = read_json(root / "threshold_development.json") if (root / "threshold_development.json").exists() else {}
+    selected = development.get("selected")
+    text = ["<!doctype html><meta charset='utf-8'><title>CliPP2 biological simulation 1.1</title>",
+        "<style>body{font:16px system-ui;max-width:1100px;margin:40px auto;line-height:1.5}img{max-width:100%}pre{white-space:pre-wrap}td,th{padding:6px;border:1px solid #ddd}table{border-collapse:collapse}</style>",
+        "<h1>CliPP2 biological simulation 1.1</h1>",
+        f"<p>Execution Protocol {html.escape(contract['protocol_version'])}; source cohort Protocol {html.escape(str(contract.get('source_cohort_protocol_version') or 'not specified'))}; source revision {html.escape(contract['source_identity'].get('git_commit') or 'unavailable')}. Source evidence is supplied externally; no source-directory scan is performed. CPU execution; CUDA is not qualified by this study.</p>",
+        f"<p>Completed main datasets: {sum(c['status']=='complete' for c in cells if c['job']['phase']=='main')}. Planned main datasets: {allocation.get('planned_main_datasets', 0)}. "
+        f"Native fits executed across all phases: {summary['fit_count']}; full-support assignment passes: {summary['assignment_pass_count']}.</p>",
+        f"<p>Executed scale: {contract['dimensions']['mutations']} mutations, {contract['dimensions']['segments']} segments, {contract['dimensions']['regions']} regions; "
+        f"{allocation.get('main_histories_per_family', 0)} independent main histories per family. The proposed full scale is 1,500 mutations, 50 segments, 50 main and 10 development histories per family.</p>",
+        "<p>The allocation below was frozen from the timing and disk pilot before final generation. Repeated acquisitions share physical histories; uncertainty resamples histories and carries all paired arms together. A reduced cohort does not establish rare-event safety or noninferiority.</p>",
+        "<h2>Frozen allocation and settings</h2><pre>"+html.escape(json.dumps(dict(allocation=allocation, selected=selected), indent=2))+"</pre>",
+        "<h2>Applicability and scientific results</h2><p>Unknown and unavailable estimates remain explicit. Exact aliases and absent candidate explanations cannot be resolved by restoring integer support. Descriptive screens are not calibrated tests.</p>"]
+    selected_metrics = {"correct_per_original_evaluable", "acceptance_coverage", "correct_resolution",
+        "wrong_per_evaluable", "selective_error", "false_merge_nonclonal_rate", "stage2_truth_exclusion",
+        "declared_source_truth_cap_exclusion", "ccf_rmse", "analysis_available", "analysis_failure"}
+    rows = [dict(endpoint=row["name"], arm=row["arm"], view=row["view"], stratum=row["stratum"],
+                 mean=row["equal_family_mean"], lower_95=row["lower_95"], upper_95=row["upper_95"],
+                 available_cells=row["available_cells"], status=row["status"])
+            for row in summary.get("metrics", ()) if row["name"] in selected_metrics]
+    text.append(pd.DataFrame(rows).to_html(index=False, na_rep="NA", float_format=lambda x: f"{x:.4g}"))
+    for figure in figures:
+        filename = Path(figure).name
+        if Path(filename).suffix.lower() == ".png":
+            text.append(f"<figure><img src='{html.escape(filename)}'><figcaption>{html.escape(filename)}</figcaption></figure>")
+    text.extend(["<h2>Reproducibility and limits</h2>",
+        "<p>Per-cell outputs preserve native A/B/C fits, frozen combined references, B3/C3 assignments, exact cap and contributor records, and every original mutation's status. Physical histories and truth are stored separately from inference inputs. Source snapshots and native numerical receipts are retained; file-byte checksums are intentionally absent.</p>",
+        "<p>Core results do not imply a global clustering optimum or patient-population frequencies. Optional fixed-total-depth refitting, corrected-cap refitting, BAM simulation, and unavailable historical generators were not executed.</p>",
+        "<p>Machine-readable results: <a href='aggregate.json'>aggregate.json</a>; <a href='tumor_metrics.tsv'>tumor metrics</a>; <a href='bound_audit.tsv'>cap audit</a>; <a href='execution_ledger.tsv'>execution ledger</a>.</p>"])
+    (directory / "comparison_report.html").write_text("\n".join(text), encoding="utf-8")

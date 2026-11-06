@@ -8,7 +8,7 @@ import pandas as pd
 
 from .tumor_txt import (
     SCHEMA_COLUMNS, TumorTxtError, _finite_float, _identifier,
-    _read_text_table, _safe_tumor_id, _validate_metadata,
+    _read_text_table, _safe_tumor_id, _validate_metadata, _provenance_flag,
 )
 
 _FILES = ("snv.txt", "cna.txt", "purity.txt")
@@ -62,9 +62,11 @@ def _read_region(path: Path, *, preserve_provenance=False):
         locus = (chrom, position)
         if locus in observations:
             raise TumorTxtError(f"{path}: duplicate SNV locus {locus!r}.")
-        observations[locus] = tuple(
+        counts = tuple(
             _integer(row[name], name=f"{path} {name}") for name in ("alt_count", "ref_count")
         )
+        observations[locus] = (*counts, _provenance_flag(row, ("input_excluded",),
+                                                        "Input exclusion", default=False))
         observation_rows[locus] = row
     _, table = _read_text_table(path / "cna.txt", columns=_CNA_COLUMNS,
                                 canonical=False, allow_empty=True)
@@ -83,7 +85,11 @@ def _read_region(path: Path, *, preserve_provenance=False):
                 f"{path}: invalid CNA interval {chrom}:{start}-{end}; require "
                 "start <= end, major_cn >= minor_cn and total_cn = major_cn + minor_cn."
             )
-        intervals.setdefault(chrom, []).append((start, end, major, minor, normal))
+        normal_supplied = _provenance_flag(row, ("normal_cn_supplied", "_normal_cn_supplied"),
+                                           "Normal-CN", default="normal_cn" in row)
+        if normal_supplied and "normal_cn" not in row:
+            raise TumorTxtError(f"{path}: normal CN cannot be marked supplied without normal_cn.")
+        intervals.setdefault(chrom, []).append((start, end, major, minor, normal, normal_supplied))
         interval_rows[chrom, start, end] = row
     indexed = {}
     for chrom, segments in intervals.items():
@@ -100,6 +106,7 @@ def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tupl
     path = Path(path).resolve()
     regions = {region.name: _read_region(region, preserve_provenance=preserve_provenance) for region in _regions(path)}
     loci = sorted({locus for value in regions.values() for locus in value[1]})
+    has_exclusions = any(observation[2] for value in regions.values() for observation in value[1].values())
     rows = []
     for sample, value in regions.items():
         purity, observations, intervals = value[:3]
@@ -109,19 +116,24 @@ def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tupl
             genuine = index >= 0 and position <= segments[index][1]
             if not genuine:
                 # Uncovered loci are diploid; missing reads remain missing.
-                start, end, major, minor, normal = position, position, 1, 1, 2
+                start, end, major, minor, normal, normal_supplied = position, position, 1, 1, 2, False
             else:
-                start, end, major, minor, normal = segments[index]
+                start, end, major, minor, normal, normal_supplied = segments[index]
             observed = (chrom, position) in observations
-            alt, ref = observations.get((chrom, position), (".", "."))
+            alt, ref, excluded = observations.get((chrom, position), (".", ".", False))
             row = dict(zip(SCHEMA_COLUMNS, (f"{chrom}:{position}", sample, alt, ref, int(observed), purity,
                          normal, f"{chrom}:{start}-{end}", "0", 1, major, minor)))
+            row.update(_mapping_genuine=genuine, _normal_cn_supplied=normal_supplied)
+            if has_exclusions:
+                row["input_excluded"] = int(excluded)
             if preserve_provenance:
-                row.update(_mapping_genuine=genuine, chromosome_index=chrom, position=position,
+                row.update(chromosome_index=chrom, position=position,
                            start_position=start, end_position=end)
                 row.update(("snv_"+key, cell) for key, cell in value[3].get((chrom, position), {}).items())
                 row.update(("cna_"+key, cell) for key, cell in value[4].get((chrom, start, end), {}).items())
             rows.append(row)
-    metadata = _validate_metadata({"tumor_id": _safe_tumor_id(path.name)}, path=path)
+    metadata = _validate_metadata({"tumor_id": _safe_tumor_id(path.name),
+                                  "mutation_key_convention": "chromosome_index:position"}, path=path)
     table = pd.DataFrame(rows).fillna(".")
-    return metadata, table if preserve_provenance else table.loc[:, SCHEMA_COLUMNS]
+    return metadata, table if preserve_provenance else table.loc[:, [*SCHEMA_COLUMNS,
+        "_mapping_genuine", "_normal_cn_supplied", *(["input_excluded"] if has_exclusions else [])]]

@@ -1,8 +1,12 @@
-"""One prepared-data fit, mandatory verification, and publication path."""
+"""One verified fit path with biological/numerical and native-build identity.
+
+File-byte and Python-source checksums are intentionally not recorded.
+"""
 from dataclasses import asdict, dataclass
 from time import perf_counter
 
-from .config import FitConfig
+from .config import FitConfig, PROTOCOL_VERSION
+from ._version import __version__
 from .io.data import MultiplicityBounds, readonly_array
 from .io.reporting import (ALGORITHM, OUTPUT_SCHEMA_VERSION, check_destination,
                            exclusion_summary, public_label_order, publish)
@@ -28,12 +32,17 @@ class FitExecution:
 
 
 def fit_prepared(data, outdir, config, *, multiplicity_support=None,
-                 progress_callback=None, retain_evidence=False, started=None, progress=None):
+                 progress_callback=None, retain_evidence=False, started=None, progress=None,
+                 run_manifest=None, run_manifest_id=None):
     """Fit, independently verify, and publish prepared ordinary/workflow data."""
     if type(config) is not FitConfig:
         raise TypeError('fit_config must be a FitConfig')
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError('progress_callback must be callable or None')
+    from .provenance import validate_run_manifest_id
+    validate_run_manifest_id(run_manifest_id)
+    if run_manifest is not None and run_manifest.get('run_manifest_id') != run_manifest_id:
+        raise ValueError('Fit producer and retained run manifest links must agree')
     started = perf_counter() if started is None else started
     if progress is None and progress_callback is not None:
         progress = ProgressReporter(None, progress_callback)
@@ -43,6 +52,9 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
                           multiplicity_support=multiplicity_support)
     input_seconds = perf_counter()-started
     try:
+        build = None if run_manifest is None else run_manifest.get('build')
+        if build is not None and build['artifact'][model.backend.kind + '_build_id'] != model.backend.identity:
+            raise ValueError('External build record differs from the executing native backend')
         if progress is not None:
             progress.model = model
             progress.emit(complete=True)
@@ -51,11 +63,21 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
                     progress_callback(dict(record, elapsed_seconds=record['elapsed_seconds']+fit_offset)))
         result = fit_regions(model, config.max_clusters, progress_callback=callback,
                              retain_evidence=retain_evidence, audit_scope=config.audit_scope)
+        execution_record = model.execution_diagnostics()
+        continuation = execution_record.get('continuation')
+        if build is not None and continuation and continuation.get('build_id') is not None:
+            if build['artifact']['native_build_id'] != continuation['build_id']:
+                raise ValueError('External build record differs from the executing native continuation')
         verification_start = perf_counter()
         publication = publish(model, result, outdir, data.tumor_id, progress=progress)
         audit = publication['verification']['membership_audit']
         summary = {
             'tumor_id': data.tumor_id, 'algorithm': ALGORITHM, 'model_version': model.model_version,
+            'protocol_version': PROTOCOL_VERSION, 'implementation_version': __version__,
+            'run_manifest_id': run_manifest_id,
+            'provenance_policy': 'biological_and_numerical_identity_no_file_checksums',
+            'biological_identity': (None if data.original_catalog is None else
+                                    data.original_catalog.biological_identity),
             'output_schema_version': OUTPUT_SCHEMA_VERSION, 'diagnostics_schema_version': 3,
             'kernel_version': KERNEL_VERSION,
             'num_mutations': model.n, 'num_regions': model.r,
@@ -79,8 +101,9 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
             'elapsed_seconds': perf_counter()-started, 'publication': publication,
             'qualification_scope': 'numerical_fit_not_global_optimality_or_biological_accuracy',
         }
-        receipt = dict(schema='clipp2.fit-producer.v1', **{key: summary[key] for key in (
-            'algorithm', 'model_version', 'kernel_version', 'fit_config', 'model_identity',
+        receipt = dict(schema='clipp2.fit-producer.v2', run_manifest=run_manifest, **{key: summary[key] for key in (
+            'tumor_id', 'protocol_version', 'implementation_version', 'provenance_policy',
+            'run_manifest_id', 'biological_identity', 'algorithm', 'model_version', 'kernel_version', 'fit_config', 'model_identity',
             'multiplicity_support', 'execution', 'publication', 'qualification_scope')})
         fit = result.selected.fit
         order, labels = public_label_order(fit)

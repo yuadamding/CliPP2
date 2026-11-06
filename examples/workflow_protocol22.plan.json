@@ -1,0 +1,35 @@
+{
+  "schema": "clipp2.workflow.plan.v3",
+  "protocol_version": "2.2",
+  "input_path": "workflow_protocol22.tsv",
+  "workflow_config": {
+    "fit": {
+      "device": "cpu",
+      "max_clusters": 10,
+      "cpu_threads": 1
+    },
+    "stage_two_max_clusters": 20,
+    "clonal_distance_max": 0.05,
+    "normal_cn_policy": null,
+    "contributor_probability_min": 0.95,
+    "contributor_deviance_max": 10.0,
+    "contributor_tie_atol": 1e-10,
+    "group_screen": {
+      "pair_deviance_max": 10.0,
+      "mean_deviance_max": 5.0,
+      "outlier_fraction_max": 0.02
+    },
+    "assignment": {
+      "posterior_min": 0.9,
+      "screen": {
+        "pair_deviance_max": 10.0,
+        "mean_deviance_max": 5.0,
+        "outlier_fraction_max": 0.05
+      },
+      "tie_atol": 1e-10,
+      "multiplicity_tie_atol": 1e-10,
+      "multiplicity_probability_min": 0.95,
+      "fit_assessment": "descriptive"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+##purpose=six_mutation_two_region_orchestration_fixture_not_biological_validation
+##tumor_id=workflow_protocol22
+mutation_id	sample_id	alt_count	ref_count	count_observed	purity	normal_cn	segment_id	cn_state_id	cn_state_fraction	allele_a_cn	allele_b_cn	mapping_genuine	normal_cn_supplied
+m001	r1	50	50	1	1	2	shared_segment	0	1	1	1	1	1
+m001	r2	50	50	1	1	2	shared_segment	0	1	1	1	1	1
+m002	r1	49	51	1	1	2	shared_segment	0	1	1	1	1	1
+m002	r2	50	50	1	1	2	shared_segment	0	1	1	1	1	1
+m003	r1	50	50	1	1	2	shared_segment	0	1	1	1	1	1
+m003	r2	49	51	1	1	2	shared_segment	0	1	1	1	1	1
+m004	r1	12	88	1	1	2	shared_segment	0	1	1	1	1	1
+m004	r2	18	82	1	1	2	shared_segment	0	1	1	1	1	1
+m005	r1	13	87	1	1	2	shared_segment	0	1	1	1	1	1
+m005	r2	17	83	1	1	2	shared_segment	0	1	1	1	1	1
+m006	r1	12	88	1	1	2	shared_segment	0	1	1	1	1	1
+m006	r2	18	82	1	1	2	shared_segment	0	1	1	1	1	1

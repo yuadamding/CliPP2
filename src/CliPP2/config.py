@@ -15,6 +15,7 @@ DEFAULT_STAGE_ONE_MAX_CLUSTERS: Final = 10
 MAX_MULTIPLICITY: Final = 4
 DEFAULT_DEVICE: Final = "cuda"
 DEFAULT_AUDIT_SCOPE: Final = "selected"
+PROTOCOL_VERSION: Final = "2.2"
 
 
 def validate_audit_scope(value):
@@ -86,7 +87,7 @@ class DescriptiveScreen:
 
 @dataclass(frozen=True, slots=True)
 class AssignmentThresholds:
-    """Explicit probability, descriptive-fit, tie and sensitivity policies.
+    """Explicit membership, multiplicity concentration and descriptive policies.
 
     A log-score gap at or below tie_atol remains ambiguous. Residual gates
     bound both mean profile deviance and the outlier fraction over a target's
@@ -98,18 +99,21 @@ class AssignmentThresholds:
     screen: DescriptiveScreen
     tie_atol: float
     multiplicity_tie_atol: float
-    probability_sensitivity_atol: float
+    multiplicity_probability_min: float
+    fit_assessment: str = "descriptive"
 
     def __post_init__(self):
+        if self.fit_assessment != "descriptive":
+            raise ValueError("Only descriptive fit assessment is implemented; calibrated/bootstrap tests are unsupported")
         if type(self.screen) is not DescriptiveScreen:
             raise TypeError("Assignment requires a DescriptiveScreen")
-        for name in ("posterior_min", "tie_atol", "multiplicity_tie_atol", "probability_sensitivity_atol"):
+        for name in ("posterior_min", "tie_atol", "multiplicity_tie_atol", "multiplicity_probability_min"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError(f"{name} must be finite")
         if (not 0 < self.posterior_min <= 1 or min(self.tie_atol, self.multiplicity_tie_atol) < 0
-                or not 0 <= self.probability_sensitivity_atol <= 1):
-            raise ValueError("Invalid assignment confidence, tie, or sensitivity threshold")
+                or not 0 < self.multiplicity_probability_min <= 1):
+            raise ValueError("Invalid assignment confidence, tie, or multiplicity concentration threshold")
 
     @classmethod
     def from_dict(cls, values):
@@ -139,8 +143,11 @@ class WorkflowConfig:
     min_informative_per_region: int = 1
     min_depth_per_region: int = 1
     stage_two_max_clusters: int = DEFAULT_MAX_CLUSTERS
+    normal_cn_policy: str | None = None
 
     def __post_init__(self):
+        if self.normal_cn_policy not in (None, "diploid"):
+            raise ValueError("normal_cn_policy must be None or the explicit 'diploid' assumption")
         if (type(self.assignment) is not AssignmentThresholds or type(self.fit) is not FitConfig
                 or type(self.group_screen) is not DescriptiveScreen):
             raise TypeError("Workflow requires validated assignment, group-screen and fit records")

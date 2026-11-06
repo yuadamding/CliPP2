@@ -148,7 +148,16 @@ CLIPP_HD inline ComponentDiagnostics component_diagnostics(
     // for the residual screen while keeping the marginalized emission intact.
     result.max_component_log_mass = maximum + ::log(static_cast<double>(o.support));
     result.map_multiplicity = static_cast<double>(best);
-    result.map_log_probability = maximum - result.log_emission;
+    // Summing only competitors keeps a tiny finite alternative from disappearing
+    // in 1 + total, or in the subtraction of nearly equal log likelihoods.
+    double competitors = 0;
+    for (std::int64_t index = 0; index < o.support; ++index) {
+        const auto multiplicity = o.minimum + index;
+        if (multiplicity != best)
+            competitors += ::exp(component_log_mass(
+                o, component_probability(o, phi, multiplicity)) - maximum);
+    }
+    result.map_log_probability = -::log1p(competitors);
     result.top_two_gap = result.has_second ? maximum - second : positive_infinity;
     if (accepted_call == accepted_call) {
         result.accepted_log_probability = -positive_infinity;
@@ -158,8 +167,9 @@ CLIPP_HD inline ComponentDiagnostics component_diagnostics(
                 accepted_call < 9223372036854775808.0 && ::floor(accepted_call) == accepted_call) {
             const auto accepted = static_cast<std::int64_t>(accepted_call);
             if (accepted >= o.minimum && accepted - o.minimum < o.support)
-                result.accepted_log_probability = component_log_mass(
-                    o, component_probability(o, phi, accepted)) - result.log_emission;
+                result.accepted_log_probability = (component_log_mass(
+                    o, component_probability(o, phi, accepted)) - maximum)
+                    + result.map_log_probability;
         }
     }
     return result;

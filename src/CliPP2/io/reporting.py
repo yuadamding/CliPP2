@@ -22,7 +22,8 @@ from ..tree.proposals import SCORE_ATOL, SCORE_RTOL
 
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
-OUTPUT_SCHEMA_VERSION = 13
+OUTPUT_SCHEMA_VERSION = 14
+MANIFEST_SCHEMA = 'clipp2.file-list.v1'
 VERIFICATION_SCHEMA_VERSION = 4
 
 _VERIFY_ROWS = 4096
@@ -484,7 +485,8 @@ def publish(model, result, outdir, tumor_id, *, progress=None):
     if progress is not None:
         progress.emit(complete=True)
     return {'status': 'complete', 'algorithm': ALGORITHM,
-            'output_schema_version': OUTPUT_SCHEMA_VERSION, 'files': files,
+            'output_schema_version': OUTPUT_SCHEMA_VERSION,
+            'manifest_schema': MANIFEST_SCHEMA, 'files': files,
             'verification_seconds': verification_seconds, 'output_seconds': output_seconds,
             'verification': verification}
 
