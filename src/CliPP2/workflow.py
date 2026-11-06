@@ -157,7 +157,10 @@ class AcceptedFit(ImmutableArrayRecord):
         from .kernel.topology import Membership
         if self.tumor_id != catalog.tumor_id:
             raise ValueError("Accepted fit belongs to a different originating tumor")
-        from .provenance import resolve_current_run_manifest_id, validate_fit_execution_receipt
+        from .provenance import (resolve_current_run_manifest_id, validate_fit_execution_receipt,
+                                 validate_inherited_audit)
+        from .kernel import ALGORITHM, KERNEL_VERSION
+        from .kernel.model import MODEL_VERSION, INTERVAL_MODEL_VERSION
         run_manifest_id = resolve_current_run_manifest_id(run_manifest_id)
         if (not isinstance(self.biological_identity, Mapping)
                 or content_hash(self.biological_identity) != content_hash(catalog.biological_identity)):
@@ -166,7 +169,11 @@ class AcceptedFit(ImmutableArrayRecord):
         if (not isinstance(producer, Mapping) or producer.get("schema") != "clipp2.fit-producer.v2"
                 or producer.get("protocol_version") != PROTOCOL_VERSION
                 or producer.get("tumor_id") != self.tumor_id
-                or not producer.get("implementation_version")
+                or any(not isinstance(producer.get(key), str) or not producer[key]
+                       or producer[key] != producer[key].strip()
+                       for key in ("implementation_version", "algorithm", "model_version", "kernel_version", "model_identity"))
+                or producer.get("algorithm") != ALGORITHM or producer.get("kernel_version") != KERNEL_VERSION
+                or producer.get("model_version") not in (MODEL_VERSION, INTERVAL_MODEL_VERSION)
                 or content_hash(producer.get("biological_identity")) != content_hash(self.biological_identity)
                 or not isinstance(producer.get("fit_config"), Mapping)
                 or not isinstance(producer.get("execution"), Mapping)
@@ -178,7 +185,14 @@ class AcceptedFit(ImmutableArrayRecord):
         if producer.get("run_manifest_id") != producer["run_manifest"]["run_manifest_id"]:
             raise ValueError("Original producer run manifest link differs from its input binding")
         build = producer["run_manifest"].get("build")
-        validate_fit_execution_receipt(producer["fit_config"], producer["execution"], build=build)
+        original_config = validate_fit_execution_receipt(producer["fit_config"], producer["execution"], build=build)
+        if original_config.max_major_cn != catalog.max_major_cn:
+            raise ValueError("Original fit configuration disagrees with its input CN eligibility policy")
+        if "normal_cn_policy" not in producer or producer["normal_cn_policy"] not in (None, "diploid"):
+            raise ValueError("Original fit lacks its explicit normal-CN assumption")
+        if len(self.centers) > original_config.max_clusters:
+            raise ValueError("Accepted occupied count exceeds the original search capacity")
+        validate_inherited_audit(self, original_config)
         if build is not None:
             artifact = build["artifact"]
             if (artifact["protocol_version"] != producer["protocol_version"]
@@ -193,8 +207,9 @@ class AcceptedFit(ImmutableArrayRecord):
         if expected_ids is not None and set(self.mutation_ids) != set(expected_ids):
             raise ValueError("Historical fit population differs from the requested stage")
         if expected_support is not None:
-            numerical = expected_support.for_data(catalog.fit_data(self.mutation_ids))
-            if not np.array_equal(numerical[0], self.support.lower) or not np.array_equal(numerical[1], self.support.upper):
+            data = catalog.fit_data(self.mutation_ids)
+            numerical, accepted_support = expected_support.for_data(data), self.support.for_data(data)
+            if any(not np.array_equal(actual, expected) for actual, expected in zip(accepted_support, numerical)):
                 raise ValueError("Historical fit has different actual multiplicity support")
         evidence = self.acceptance_evidence
         audit = evidence.get("membership_audit", {}) if isinstance(evidence, Mapping) else {}
@@ -212,7 +227,8 @@ class AcceptedFit(ImmutableArrayRecord):
         model = RegionalModel(catalog.fit_data(self.mutation_ids), device=device,
                               cpu_threads=cpu_threads, multiplicity_support=self.support)
         try:
-            if model.mutation_ids != self.mutation_ids or model.identity != self.model_identity:
+            if (model.mutation_ids != self.mutation_ids or model.identity != self.model_identity
+                    or model.model_version != producer["model_version"]):
                 raise ValueError("Historical model identity or canonical population order differs")
             fit = FitResult(Membership(explicit_labels=self.labels), self.centers, self.weights,
                 self.conditional_log_likelihood, self.mixture_log_likelihood, self.complexity_penalty,
@@ -539,12 +555,16 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
     _publish_json(output / "run_manifest.json", run_manifest)
     run_manifest_id = run_manifest["run_manifest_id"]
     common_receipt.update(run_manifest=run_manifest, run_manifest_id=run_manifest_id)
-    def replay(value, ids, bounds, stage):
+    def replay_policy(value, stage, settings):
+        from .provenance import validate_replay_policy
         accepted = value if isinstance(value, AcceptedFit) else load_accepted_fit(value)
         if accepted.source_id != stage:
             raise ValueError("Accepted receipt source stage does not match requested replay stage")
+        validate_replay_policy(accepted, settings, normal_cn_policy=config.normal_cn_policy)
+        return accepted
+    def replay(accepted, ids, bounds, settings):
         return accepted.validate(catalog, expected_ids=ids, expected_support=bounds,
-                                 device=config.fit.device, cpu_threads=config.fit.cpu_threads, run_manifest_id=run_manifest_id)
+                                 device=settings.device, cpu_threads=settings.cpu_threads, run_manifest_id=run_manifest_id)
     informative = catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)
     population = tuple(m for m, keep in zip(catalog.mutation_ids, informative.any(axis=1)) if keep)
     full = catalog.default_bounds()
@@ -569,11 +589,26 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         write_supporting_table(output / "all_original_mutations.tsv", rows, columns=ORIGINAL_COMPARISON_COLUMNS)
         receipt["final_accounting"] = accounting
     try:
+        stage_two_config = replace(config.fit, max_clusters=config.stage_two_max_clusters)
+        # A supplied replay must not silently start a different search in either
+        # stage before its historical scientific policy has been checked.
+        for stage, value, settings in (("stage_one", accepted_stage_one, config.fit),
+                                        ("stage_two", accepted_stage_two, stage_two_config)):
+            if value is not None:
+                current_stage = stage
+                receipt["current_phase"] = stage + "_replay_policy"
+                accepted = replay_policy(value, stage, settings)
+                if stage == "stage_one":
+                    accepted_stage_one = accepted
+                else:
+                    accepted_stage_two = accepted
+        current_stage = "stage_one"
+        receipt["current_phase"] = "stage_one_fit"
         if accepted_stage_one is None:
             stage_one = _fit_accepted(catalog, population, full, output / "stage_one", "stage_one", config.fit, progress_callback,
                                       normal_cn_policy=config.normal_cn_policy, run_manifest=run_manifest, run_manifest_id=run_manifest_id)
         else:
-            stage_one = replay(accepted_stage_one, population, full, "stage_one")
+            stage_one = replay(accepted_stage_one, population, full, config.fit)
         if set(stage_one.mutation_ids) != set(population):
             raise AssertionError("Accepted Stage 1 population differs from the numerical candidate population")
         receipt["counts"]["N1"] = len(stage_one.mutation_ids)
@@ -624,13 +659,12 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
                 publish_workflow_receipt(output, receipt)
                 return receipt
             receipt["current_phase"] = "stage_two_fit"
-            stage_two_config = replace(config.fit, max_clusters=config.stage_two_max_clusters)
             if accepted_stage_two is None:
                 stage_two = _fit_accepted(catalog, remainder, caps.subset(remainder), output / "stage_two",
                     "stage_two", stage_two_config, progress_callback, normal_cn_policy=config.normal_cn_policy,
                     run_manifest=run_manifest, run_manifest_id=run_manifest_id)
             else:
-                stage_two = replay(accepted_stage_two, remainder, caps.subset(remainder), "stage_two")
+                stage_two = replay(accepted_stage_two, remainder, caps.subset(remainder), stage_two_config)
             if set(stage_two.mutation_ids) != set(remainder):
                 raise AssertionError("Accepted Stage 2 population differs from its numerical candidate population")
             receipt["counts"].update(N2=len(stage_two.mutation_ids), Q2=len(stage_two.centers))

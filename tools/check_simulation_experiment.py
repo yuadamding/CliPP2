@@ -81,6 +81,7 @@ def run_checks(directory):
         assert fit["producer_receipt"]["run_manifest_id"] == "simulation_check_origin"
         assert fit["compatibility_receipts"][-1]["run_manifest_id"] == "simulation_check_current_replay"
     checks.append("original_producer_and_current_execution_links_remain_separate")
+    checks.extend(_replay_policy_regressions(directory, paired, config))
     checks.extend(_accepted_stage_failure(directory, paired, config))
     _input(directory / "other_tumor.tsv", [[50, 50]]*4 + [[20, 15]]*4, tumor="other_tumor")
     rejected = run_paired_experiment(directory / "other_tumor.tsv", directory / "rejected", config,
@@ -102,6 +103,40 @@ def run_checks(directory):
     checks.extend(_control_regressions(directory / "control_regressions"))
     return dict(status="passed", checks=checks, directory=str(directory),
                 default_max_clusters=[config.fit.max_clusters, config.stage_two_max_clusters])
+
+
+def _replay_policy_regressions(directory, paired, config):
+    from CliPP2.workflow import AcceptedFit
+    from CliPP2.provenance import validate_replay_policy
+    first = AcceptedFit.from_dict(paired["stage_one"])
+    second = AcceptedFit.from_dict(paired["arms"]["B"]["stage_two"])
+    first_identity, second_identity = first.state_fingerprint, second.state_fingerprint
+    variants = dict(stage_one_capacity=replace(config, fit=replace(config.fit, max_clusters=1)),
+        larger_capacity=replace(config, fit=replace(config.fit, max_clusters=11)),
+        stage_two_capacity=replace(config, stage_two_max_clusters=1),
+        all_audit=replace(config, fit=replace(config.fit, audit_scope="all")),
+        cn_eligibility=replace(config, fit=replace(config.fit, max_major_cn=11)),
+        normal_assumption=replace(config, normal_cn_policy="diploid"))
+    for name, settings in variants.items():
+        with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("paired policy rejection optimized")) as fitter:
+            failed = run_paired_experiment(directory / "input.tsv", directory / ("policy_"+name), settings,
+                accepted_stage_one=first, accepted_uncapped_stage_two=second)
+            assert failed["status"] == "failed" and failed["cost_ledger"]["fit_count"] == 0 and fitter.call_count == 0
+            assert failed["failed_stage"] == ("stage_two" if name == "stage_two_capacity" else "stage_one")
+    with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("B policy started fresh A optimizer")) as fitter:
+        failed = run_paired_experiment(directory / "input.tsv", directory / "policy_before_fresh_A",
+            variants["stage_two_capacity"], accepted_uncapped_stage_two=second)
+        assert failed["status"] == "failed" and fitter.call_count == 0
+    settings = replace(config, fit=replace(config.fit, cpu_threads=2))
+    replay = run_paired_experiment(directory / "input.tsv", directory / "policy_thread_override", settings,
+        accepted_stage_one=first, accepted_uncapped_stage_two=second)
+    assert replay["status"] == "complete"
+    assert replay["cost_ledger"]["fit_count"] == 1 and replay["cost_ledger"]["reused_fit_count"] == 2
+    assert replay["stage_one"]["producer_receipt"]["fit_config"]["cpu_threads"] == config.fit.cpu_threads
+    validate_replay_policy(first, replace(config.fit, device="cuda", cpu_threads=2), normal_cn_policy=config.normal_cn_policy)
+    assert (first.state_fingerprint, second.state_fingerprint) == (first_identity, second_identity)
+    return ["shared_scientific_replay_policy_rejects_without_optimization",
+            "stage_two_policy_preflight_precedes_fresh_stage_one", "replay_execution_overrides_preserve_producer_policy"]
 
 
 def _routing_regressions(directory, paired, config):

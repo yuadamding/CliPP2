@@ -117,6 +117,7 @@ def _capped_target_and_replay(directory):
     assert all(value.producer_receipt["run_manifest_id"] == "contract-external-build" for value in reused)
     _derived_failures(directory, path, config, first, second)
     _stage_two_preparation_failures(directory, path, config, first, second)
+    policy_checks = _replay_policy_checks(directory, path, catalog, config, first, second)
     other_path = directory / "other_tumor.tsv"
     other = write_catalog(other_path, alt, 100, 4, metadata=dict(metadata, tumor_id="tumor_B"))
     np.testing.assert_array_equal(catalog.alt_counts, other.alt_counts)
@@ -130,7 +131,61 @@ def _capped_target_and_replay(directory):
                 non_target_centers_preserved=True, counts=counts, accepted_copy_immutable=True,
                 repeated_replay_rejects_other_tumor_before_numerics=True,
                 originating_manifest_tampering_rejected=True, accepted_stages_survive_derived_failures=True,
-                current_and_originating_execution_links_separate=True)
+                current_and_originating_execution_links_separate=True, replay_policy=policy_checks)
+
+
+def _replay_policy_checks(directory, path, catalog, config, first, second):
+    from CliPP2.provenance import validate_replay_policy
+    assert len(first.centers) > 1
+    assert not first.acceptance_evidence["membership_audit"]["all_represented_counts_certified"]
+    original_fingerprints = first.state_fingerprint, second.state_fingerprint
+    cases = dict(stage_one_capacity=replace(config, fit=replace(config.fit, max_clusters=1)),
+        stage_one_larger_capacity=replace(config, fit=replace(config.fit, max_clusters=config.fit.max_clusters+1)),
+        stage_two_capacity=replace(config, stage_two_max_clusters=config.stage_two_max_clusters+1),
+        broader_audit=replace(config, fit=replace(config.fit, audit_scope="all")),
+        cn_eligibility=replace(config, fit=replace(config.fit, max_major_cn=config.fit.max_major_cn+1)),
+        normal_assumption=replace(config, normal_cn_policy="diploid"))
+    for name, settings in cases.items():
+        destination = directory / ("replay_policy_"+name)
+        with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("policy rejection invoked optimizer")) as fitter:
+            expect_value_error(lambda: run_workflow(path, destination, settings,
+                accepted_stage_one=first, accepted_stage_two=second))
+            assert fitter.call_count == 0
+        receipt = json.loads((destination / "workflow_receipt.json").read_text())
+        assert receipt["failed_stage"] == ("stage_two" if name == "stage_two_capacity" else "stage_one")
+    with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("Stage 2 policy started Stage 1 fit")) as fitter:
+        expect_value_error(lambda: run_workflow(path, directory / "replay_policy_before_stage_one",
+            cases["stage_two_capacity"], accepted_stage_two=second))
+        assert fitter.call_count == 0
+    overridden = replace(config, fit=replace(config.fit, cpu_threads=2))
+    with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("compatible replay refitted")) as fitter:
+        replay = run_workflow(path, directory / "replay_thread_override", overridden,
+                              accepted_stage_one=first, accepted_stage_two=second)
+        assert replay["status"] == "complete" and fitter.call_count == 0
+    # CUDA policy compatibility is checked without claiming a CUDA runtime here.
+    validate_replay_policy(first, replace(config.fit, device="cuda", cpu_threads=2), normal_cn_policy=config.normal_cn_policy)
+    assert (first.state_fingerprint, second.state_fingerprint) == original_fingerprints
+    for audit_scope in ("selected", "all"):
+        small = write_catalog(directory / ("replay_audit_"+audit_scope+".tsv"), [[50]], 100, 1, minor=1)
+        settings = FitConfig(device="cpu", max_clusters=1, cpu_threads=1, audit_scope=audit_scope)
+        accepted = _fit_accepted(small, small.mutation_ids, small.default_bounds(),
+            directory / ("replay_audit_fit_"+audit_scope), "stage_one", settings, None)
+        # With one represented count, selected certification really covers all.
+        assert accepted.acceptance_evidence["membership_audit"]["all_represented_counts_certified"]
+        for request in ("selected", "all"):
+            validate_replay_policy(accepted, replace(settings, audit_scope=request), normal_cn_policy=None)
+        accepted.validate(small, cpu_threads=2)
+    audited_catalog = write_catalog(directory / "replay_multi_count_audit.tsv",
+        [[50, 50]]*4 + [[20, 15]]*4, 100, 1, minor=1)
+    settings = FitConfig(device="cpu", max_clusters=3, cpu_threads=1, audit_scope="all")
+    audited = _fit_accepted(audited_catalog, audited_catalog.mutation_ids, audited_catalog.default_bounds(),
+        directory / "replay_multi_count_audit_fit", "stage_one", settings, None)
+    assert len(audited.acceptance_evidence["membership_audit"]["per_q"]) > 1
+    validate_replay_policy(audited, replace(settings, audit_scope="selected", cpu_threads=2), normal_cn_policy=None)
+    audited.validate(audited_catalog, cpu_threads=2)
+    return dict(scientific_mismatches_rejected_without_optimizer=True, stage_two_specific_capacity=True,
+        actual_audit_coverage=True, thread_override_numerically_replayed=True, device_override_policy_only=True,
+        original_receipts_unchanged=True)
 
 
 def _manifest_tampering(catalog, accepted):
@@ -203,6 +258,25 @@ def _execution_tampering(catalog, accepted):
     changed = copy.deepcopy(original)
     changed["execution"] = {}
     variants.append(changed)
+    for field in ("algorithm", "kernel_version", "model_version", "model_identity", "implementation_version"):
+        for value in (None, 1, "", " "):
+            changed = copy.deepcopy(original)
+            changed[field] = value
+            variants.append(changed)
+        if field in ("algorithm", "kernel_version", "model_version"):
+            changed = copy.deepcopy(original)
+            changed[field] = "contradictory_"+original[field]
+            variants.append(changed)
+    if len(accepted.centers) > 1:
+        changed = copy.deepcopy(original)
+        changed["fit_config"]["max_clusters"] = len(accepted.centers)-1
+        variants.append(changed)
+    changed = copy.deepcopy(original)
+    changed["fit_config"]["audit_scope"] = "all"
+    variants.append(changed)
+    changed = copy.deepcopy(original)
+    changed.pop("normal_cn_policy")
+    variants.append(changed)
     for producer in variants:
         # No optional external record can mask the structural rejection.
         manifest = producer["run_manifest"]
@@ -214,6 +288,35 @@ def _execution_tampering(catalog, accepted):
                                                            accepted_state_hash=changed.state_fingerprint))
         with patch("CliPP2.kernel.model.RegionalModel", side_effect=AssertionError("invalid execution reached numerics")):
             expect_value_error(lambda: changed.validate(catalog))
+    # Audit claims must agree with retained per-count records, even after all
+    # ordinary content fingerprints and producer-publication links are refreshed.
+    audit_changes = (lambda audit: audit.update(all_represented_counts_certified=True),
+                    lambda audit: audit.update(per_q=[]),
+                    lambda audit: audit["per_q"][0].update(examined_pairs=0),
+                    lambda audit: audit["per_q"][0].update(unresolved_evaluations=1))
+    for change in audit_changes:
+        evidence = accepted.to_dict()["acceptance_evidence"]
+        change(evidence["membership_audit"])
+        if evidence == accepted.to_dict()["acceptance_evidence"]:
+            continue
+        producer = copy.deepcopy(original)
+        producer["publication"]["verification"] = {key: value for key, value in evidence.items() if key != "accepted_state_hash"}
+        changed = replace(accepted, producer_receipt=producer, acceptance_evidence=evidence)
+        changed = replace(changed, acceptance_evidence=dict(changed.acceptance_evidence,
+                                                           accepted_state_hash=changed.state_fingerprint))
+        with patch("CliPP2.kernel.model.RegionalModel", side_effect=AssertionError("invalid audit reached numerics")):
+            expect_value_error(lambda: changed.validate(catalog))
+    # A recognized but contradictory model version needs the reconstructed
+    # model comparison; numerical replay still cannot invoke an optimizer.
+    from CliPP2.kernel.model import MODEL_VERSION, INTERVAL_MODEL_VERSION
+    producer = copy.deepcopy(original)
+    producer["model_version"] = INTERVAL_MODEL_VERSION if original["model_version"] == MODEL_VERSION else MODEL_VERSION
+    changed = replace(accepted, producer_receipt=producer)
+    changed = replace(changed, acceptance_evidence=dict(changed.acceptance_evidence,
+                                                       accepted_state_hash=changed.state_fingerprint))
+    with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("inconsistent model was refitted")) as fitter:
+        expect_value_error(lambda: changed.validate(catalog))
+        assert fitter.call_count == 0
 
 
 def _derived_failures(directory, path, config, first, second):

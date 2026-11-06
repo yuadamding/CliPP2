@@ -24,7 +24,7 @@ from CliPP2.io.assignment import (load_accepted_fit, reserve_output, save_accept
                                  write_supporting_table)
 from CliPP2.io.data import json_value, validate_workflow_mapping
 from CliPP2.io.tumor_txt import load_original_catalog
-from CliPP2.provenance import prepare_run_manifest
+from CliPP2.provenance import prepare_run_manifest, validate_replay_policy
 from CliPP2.workflow import (AcceptedFit, CONTRIBUTOR_COLUMNS, GROUP_COLUMNS,
                              SEGMENT_POLICY_COLUMNS, _fit_accepted, _stage_two_caps,
                              _build_stage_three_inputs, _reconcile_final_memberships,
@@ -105,7 +105,7 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
     """Execute A/B/C/B3/C3 without accessing simulator or evaluator truth.
 
     Reuse accepts a complete AcceptedFit, its serialized payload, or its published
-    receipt path. Every reuse validates biological identity, exact fit settings,
+    receipt path. Every reuse validates biological identity, scientific fit settings,
     actual support, audited evidence and native numerics; it never triggers a fit.
     Failures remain explicit records rather than disappearing from study cells.
     The default WorkflowConfig limits are ten Stage 1 and twenty Stage 2 groups.
@@ -170,12 +170,7 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
                 run_manifest=run_manifest, run_manifest_id=resolved_manifest_id))
         else:
             def replay():
-                fit = (value if isinstance(value, AcceptedFit) else AcceptedFit.from_dict(value)
-                       if isinstance(value, Mapping) else load_accepted_fit(value))
-                if (fit.source_id != stage or json_value(fit.producer_receipt["fit_config"]) != asdict(settings)
-                        or fit.producer_receipt.get("normal_cn_policy") != config.normal_cn_policy):
-                    raise ValueError("Paired replay requires identical source stage and fitting configuration")
-                return fit.validate(catalog, expected_ids=ids, expected_support=bounds,
+                return value.validate(catalog, expected_ids=ids, expected_support=bounds,
                                     device=settings.device, cpu_threads=settings.cpu_threads, run_manifest_id=resolved_manifest_id)
             accepted = operation("reuse", arm, replay)
         if set(accepted.mutation_ids) != set(ids):
@@ -210,6 +205,20 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
         full = catalog.default_bounds()
         result.update(original_mutation_ids=catalog.mutation_ids, region_ids=catalog.region_ids,
                       biological_identity=catalog.biological_identity, stage_one_candidate_count=len(population))
+        settings = replace(config.fit, max_clusters=config.stage_two_max_clusters)
+        for stage, value, requested in (("stage_one", accepted_stage_one, config.fit),
+                                        ("stage_two", accepted_uncapped_stage_two, settings)):
+            if value is not None:
+                current = stage + "_replay_policy"
+                accepted = (value if isinstance(value, AcceptedFit) else AcceptedFit.from_dict(value)
+                            if isinstance(value, Mapping) else load_accepted_fit(value))
+                if accepted.source_id != stage:
+                    raise ValueError("Accepted receipt source stage does not match requested paired replay stage")
+                validate_replay_policy(accepted, requested, normal_cn_policy=config.normal_cn_policy)
+                if stage == "stage_one":
+                    accepted_stage_one = accepted
+                else:
+                    accepted_uncapped_stage_two = accepted
         current = "stage_one"
         first = fit_or_reuse(accepted_stage_one, population, full, "A", "stage_one", config.fit)
         result["stage_one"] = first.to_dict()
@@ -247,7 +256,6 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
             positions = {m: i for i, m in enumerate(catalog.mutation_ids)}
             unsupported = ([] if not remainder else [region for region, keep in zip(catalog.region_ids,
                 informative[[positions[m] for m in remainder]].any(axis=0)) if not keep])
-            settings = replace(config.fit, max_clusters=config.stage_two_max_clusters)
             for name, bounds, reuse in (("B", full, accepted_uncapped_stage_two), ("C", caps, None)):
                 arm = result["arms"][name]
                 current = "stage_two"
@@ -303,12 +311,15 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
             result["status"] = ("complete" if all(s == "complete" for s in statuses) else
                                 "blocked" if all(s == "blocked" for s in statuses) else "partial_failure")
     except Exception as error:
-        result.update(_error(error, current))
-        if current == "stage_one" and result["stage_one_status"] != "accepted":
+        stage = current.removesuffix("_replay_policy")
+        result.update(_error(error, stage))
+        if stage != current:
+            result["failed_phase"] = current
+        if stage == "stage_one" and result["stage_one_status"] != "accepted":
             result["stage_one_status"] = "failed"
         for arm in result["arms"].values():
             if arm["status"] == "not_applicable":
-                arm.update(status="unavailable_upstream", unavailable_stage=current)
+                arm.update(status="unavailable_upstream", unavailable_stage=stage)
     if catalog is not None:
         for name, arm in result["arms"].items():
             if not arm["original_rows"]:

@@ -106,6 +106,15 @@ and numerical evidence. It retains the originating producer and appends current
 compatibility evidence. A missing original identity is never filled from the
 destination. Copies and serialization reconstruct immutable arrays and identities.
 
+Version 1.2.3 uses one scientific replay policy for ordinary and paired workflows.
+Search capacity, maximum eligible major CN, and the normal-CN assumption must
+match the original fit. Retained per-count audit evidence must cover the requested
+scope; an `all` request cannot infer audits that were not performed. Original
+occupied groups must fit within the recorded capacity, and producer model/kernel
+identifiers must agree with the reconstructed model. Current device and CPU-thread
+overrides are permitted under numerical replay validation. Incompatible replay
+fails without running an optimizer.
+
 External execution provenance is optional and explicit: set plan/API
 `run_manifest_id` or `CLIPP2_RUN_MANIFEST_ID`. A supplied `run_build_manifest`
 retains the external build record. Originating and current replay/assignment
