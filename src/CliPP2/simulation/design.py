@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-import json
 import math
 import os
 from pathlib import Path
@@ -77,16 +76,17 @@ def make_contract(*, master_seed=None, workers=10, budget_minutes=60.,
         raise ValueError("Reference matching tolerance must be finite and nonnegative, or None")
     cohort = None
     if cohort_settings is not None:
+        from .cohort import load_cohort
         path = Path(cohort_settings).resolve()
-        payload = json.loads(path.read_text())
-        if payload.get("schema_version") != "clipp2.phylogeny.v1" or payload.get("workflow_protocol") != "2.1":
-            raise ValueError("Unsupported phylogeny cohort settings")
+        loaded = load_cohort(path)
+        payload = loaded.settings
         if (mutations, segments, regions) != (1500, 50, 4):
             raise ValueError("The supplied core cohort requires exactly 1500 mutations, 50 segments and four regions")
         if master_seed is not None and master_seed != payload["master_seed"]:
             raise ValueError("The supplied cohort fixes its master seed; alternative seeds are a separate study")
         master_seed = payload["master_seed"]
         cohort = dict(path=str(path), schema=payload["schema_version"], version=payload["simulation_plan_version"],
+            content_id=loaded.content_id,
             source_protocol_version=payload["workflow_protocol"],
             variant_ids=[v["id"] for v in payload["variants"]],
             region_ids=payload["region_order"], numpy_version=payload["numpy_version"],
@@ -94,7 +94,7 @@ def make_contract(*, master_seed=None, workers=10, budget_minutes=60.,
             variants_per_family=5, main_replicates_per_variant=10, development_replicates_per_variant=2,
             input_authority="Physical event logs and recorded realized tip fractions; original IDs and counts retained")
     master_seed = 20261105 if master_seed is None else master_seed
-    return dict(schema="clipp2.simulation-contract.v3", study_version=STUDY_VERSION,
+    return dict(schema="clipp2.simulation-contract.v4", study_version=STUDY_VERSION,
         implementation_version=__version__,
         run_manifest_id=validate_run_manifest_id(run_manifest_id if run_manifest_id is not None
                                                else os.environ.get("CLIPP2_RUN_MANIFEST_ID")),
@@ -183,7 +183,8 @@ def allocate(contract, timings, byte_counts):
 
 def jobs(contract, phase, histories_per_family, *, start=0):
     if contract.get("cohort"):
-        payload = json.loads(Path(contract["cohort"]["path"]).read_text())
+        from .cohort import load_cohort
+        payload = load_cohort(contract["cohort"]["path"], expected_content_id=contract["cohort"]["content_id"]).settings
         for row in payload["histories"]:
             if row["split"] != phase or not start < row["replicate"] <= start+histories_per_family:
                 continue
@@ -194,6 +195,7 @@ def jobs(contract, phase, histories_per_family, *, start=0):
                     family=row["variant_id"][:3], variant_id=row["variant_id"], history_id=row["history_id"],
                     history_index=row["replicate"]-1, history_seed=int(row["seed128"]),
                     acquisition_seed=None, cohort_settings=contract["cohort"]["path"],
+                    cohort_content_id=contract["cohort"]["content_id"],
                     prescribed_fit_seeds=dict(stage1=str(semantic_seed(payload, row["split"], row["variant_id"],
                         row["replicate"], "fits", acquisition_id, 1, "stage1", 1)),
                         stage2_common=str(semantic_seed(payload, row["split"], row["variant_id"], row["replicate"],

@@ -5,6 +5,7 @@ Run from the repository with python -m tools.check_simulation_biology.
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 from pathlib import Path
 import tempfile
@@ -16,6 +17,54 @@ import pandas as pd
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
 from CliPP2.simulation.acquisition import acquire
 from CliPP2.simulation.biology import FAMILIES, History, generate_history
+
+
+def run_cohort_identity_checks(directory, settings_path):
+    """Content binding tests without native fitting or changing semantic seeds."""
+    from CliPP2.simulation.cohort import cohort_content_id, cohort_history, load_cohort, semantic_seed
+    from CliPP2.simulation.study import _cohort
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    original = json.loads(Path(settings_path).read_text())
+    identity = cohort_content_id(original)
+    path = directory / "settings.json"
+    path.write_text(json.dumps(original, sort_keys=True, indent=1))
+    base = load_cohort(path, expected_content_id=identity)
+    assert base.content_id == identity and _cohort(path, identity).content_id == identity
+    changed = deepcopy(original)
+    source = next(row for row in changed["histories"]
+                  if not np.array_equal(np.asarray(row["tip_fractions"])[:, 0], np.asarray(row["tip_fractions"])[:, 1]))
+    source["tip_fractions"] = np.asarray(source["tip_fractions"])[:, [1, 0, 2, 3]].tolist()
+    source["true_ccfs"] = {key: np.asarray(values)[[1, 0, 2, 3]].tolist() for key, values in source["true_ccfs"].items()}
+    altered_id = cohort_content_id(changed)
+    assert altered_id != identity
+    path.write_text(json.dumps(changed))
+    altered = _cohort(path, altered_id)
+    assert altered.content_id == altered_id and altered is not base
+    try:
+        _cohort(path, identity)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Same-path cache returned stale biological truth")
+    one = cohort_history(base, source["history_id"])
+    two = cohort_history(altered, source["history_id"])
+    np.testing.assert_array_equal(two.phi, one.phi[:, [1, 0, 2, 3]])
+    assert semantic_seed(base, "identity_test", 1) == semantic_seed(altered, "identity_test", 1)
+    for kind in ("event", "acquisition", "mask", "list_order"):
+        mutation = deepcopy(original)
+        if kind == "event":
+            mutation["variants"][0]["event_logs"][0]["identity_test_change"] = True
+        elif kind == "acquisition":
+            mutation["acquisitions"]["A1"]["mean_depth"] += 1
+        elif kind == "mask":
+            mutation["variants"][0]["observation_policy"] = "changed_mask"
+        else:
+            mutation["region_order"].reverse()
+        assert cohort_content_id(mutation) != identity
+    return dict(status="passed", formatting_and_key_order_stable=True, coherent_fraction_ccf_change_detected=True,
+                event_acquisition_mask_and_list_changes_detected=True, same_path_cache_safe=True,
+                semantic_seeds_unchanged=True, native_fit_count=0)
 
 
 def _rows(history, group):
@@ -140,12 +189,15 @@ def run_biology_checks(directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--cohort-settings', type=Path, default=Path('CliPP2_phylogeny_cohort_settings.json'))
     args = parser.parse_args()
     if args.output is None:
         with tempfile.TemporaryDirectory() as directory:
             result = run_biology_checks(directory)
+            result['cohort_identity'] = run_cohort_identity_checks(Path(directory) / 'identity', args.cohort_settings)
     else:
         result = run_biology_checks(args.output)
+        result['cohort_identity'] = run_cohort_identity_checks(args.output / 'identity', args.cohort_settings)
     print(json.dumps(result, indent=2))
 
 

@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from .biology import History, _Copies
+from CliPP2.io.data import content_hash
 
 
 @dataclass
@@ -25,6 +26,7 @@ class Cohort:
     variants: dict
     histories: dict
     path: str
+    content_id: str
     _physical_cache: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -53,11 +55,19 @@ def _check_numpy(cohort, enforce):
                            f'current runtime is {np.__version__}. Use the pinned study environment.')
 
 
-def load_cohort(path):
+def cohort_content_id(settings):
+    """Bind all parsed biological settings; formatting and object order are inert."""
+    return content_hash({"schema": "clipp2.cohort-content.v1", "settings": settings})
+
+
+def load_cohort(path, *, expected_content_id=None):
     """Load and index the supplied settings without modifying its contents."""
     path = Path(path).resolve()
     with path.open(encoding='utf-8') as stream:
         settings = json.load(stream)
+    identity = cohort_content_id(settings)
+    if expected_content_id is not None and identity != expected_content_id:
+        raise ValueError("Authoritative cohort content differs from its declared identity")
     if (settings.get('schema_version') != 'clipp2.phylogeny.v1'
             or settings.get('simulation_plan_version') != '1.2'
             or settings.get('workflow_protocol') != '2.1'
@@ -85,7 +95,7 @@ def load_cohort(path):
         np.testing.assert_allclose(fractions.sum(axis=0), 1., atol=1e-12, rtol=0)
         if not set(history['acquisition_ids']) <= set(settings['acquisitions']):
             raise ValueError('Unknown prescribed acquisition')
-    return Cohort(settings, settings['trees'], variants, histories, str(path))
+    return Cohort(settings, settings['trees'], variants, histories, str(path), identity)
 
 
 def _physical_variant(cohort, variant_id):
@@ -273,6 +283,7 @@ def cohort_history(cohort, history_id, *, enforce_numpy_version=True):
                if reference == 'T_low_only' else batches.get('T_G', ()) if reference == 'T_G_only' else ())
     source_set = set(sources)
     metadata = dict(schema='clipp2.simulation.authoritative-history.v1', study_version='1.2',
+        cohort_content_id=cohort.content_id,
         cohort_schema=cohort.settings['schema_version'], history_id=history_id, family=variant['family'],
         variant_id=variant['id'], split=realized['split'], replicate=realized['replicate'],
         seed=int(realized['seed128']), master_seed=cohort.master_seed, tree_id=variant['tree_id'],
@@ -308,6 +319,8 @@ def acquire_cohort(history, cohort, acquisition_id, *, read_replicate_id=1, matc
     """Generate every pair from its prescribed fresh PCG64 semantic seed."""
     _check_numpy(cohort, enforce_numpy_version)
     metadata = history.metadata
+    if metadata.get('cohort_content_id') != cohort.content_id:
+        raise ValueError('Physical history and acquisition cohort content identities differ')
     realized = cohort.histories[history.history_id]
     if acquisition_id not in realized['acquisition_ids']:
         raise ValueError('Acquisition is not prescribed for this history split')
@@ -367,10 +380,12 @@ def acquire_cohort(history, cohort, acquisition_id, *, read_replicate_id=1, matc
     frame = pd.DataFrame(records)
     eligible = (history.major_cn <= 10) & ~excluded
     frame.attrs['metadata'] = dict(tumor_id=f'{history.history_id}.{acquisition_id}.read{read_replicate_id}',
+        cohort_content_id=cohort.content_id,
         source_cohort_protocol_version=cohort.settings['workflow_protocol'],
         genome_build='synthetic_1Mb_segments', coordinate_system='1-based-inclusive',
         mutation_key_convention='segment.batch.within_batch_3digit')
     frame.attrs['acquisition'] = dict(schema='clipp2.simulation.cohort-acquisition.v1', study_version='1.2',
+        cohort_content_id=cohort.content_id,
         history_id=history.history_id, variant_id=metadata['variant_id'], split=metadata['split'],
         replicate=metadata['replicate'], acquisition_id=acquisition_id, read_replicate_id=read_replicate_id,
         seed_derivation=cohort.settings['seed_derivation'], numpy_version=np.__version__,

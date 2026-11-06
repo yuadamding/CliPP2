@@ -90,6 +90,7 @@ def _validate_cohort(cohort, root, *, materialize):
     with tempfile.TemporaryDirectory(prefix=".roundtrip-", dir=root) as scratch:
         for index, (history_id, setting) in enumerate(sorted(cohort.histories.items()), 1):
             record = dict(history_id=history_id, variant_id=setting["variant_id"],
+                          cohort_content_id=cohort.content_id,
                           split=setting["split"], replicate=setting["replicate"])
             try:
                 # Construction calls History.validate(), including chronological
@@ -107,6 +108,7 @@ def _validate_cohort(cohort, root, *, materialize):
                             and setting["replicate"] == 1 else ())
                 for acquisition_id in selected:
                     cell = dict(history_id=history_id, variant_id=setting["variant_id"],
+                                cohort_content_id=cohort.content_id,
                                 split=setting["split"], acquisition_id=acquisition_id)
                     try:
                         frame = acquire_cohort(history, cohort, acquisition_id)
@@ -305,6 +307,8 @@ def qualify_cohort(settings_path, outdir, *, native_pilot=True, timeout_seconds=
     root, began = _new_directory(outdir), time.perf_counter()
     contract = make_contract(cohort_settings=cohort.path, profile="full", workers=workers,
                              reference_match_atol=reference_match_atol)
+    if contract["cohort"]["content_id"] != cohort.content_id:
+        raise ValueError("Authoritative cohort changed while preparing qualification")
     save_json(root / "qualification_contract.json", dict(contract=contract,
         native_pilot_variants=list(PILOT_VARIANTS) if native_pilot else [],
         native_timeout_seconds=timeout_seconds, materialize=materialize,
@@ -345,6 +349,7 @@ def qualify_cohort(settings_path, outdir, *, native_pilot=True, timeout_seconds=
             roundtrips_passed=sum(row["status"] == "passed" for row in a),
             native_pilot_status=p["status"] if p else "not_run"))
     summary = dict(schema="clipp2.cohort-qualification.v2", study_version="1.2", protocol_version=PROTOCOL_VERSION,
+        cohort_content_id=cohort.content_id,
         source_cohort_protocol_version=cohort.settings["workflow_protocol"],
         status="validation_passed" if valid else "validation_failed", settings_path=cohort.path,
         numpy_version=np.__version__, required_numpy_version=cohort.settings["numpy_version"],

@@ -6,6 +6,7 @@ from copy import deepcopy
 from dataclasses import asdict
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import shutil
 import tempfile
 from unittest.mock import patch
@@ -17,8 +18,9 @@ import pandas as pd
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
 from CliPP2.simulation.biology import generate_history
 from CliPP2.simulation.design import allocate, jobs, make_contract, workflow_config
-from CliPP2.simulation.runtime import recorded_costs, status
-from CliPP2.simulation.study import (_decision, _execute, _paired_result, _run_cell, development_scores, read_json, report,
+from CliPP2.simulation.runtime import qualification_costs, recorded_costs, status
+from CliPP2.simulation.study import (_decision, _execute, _paired_result, _prepare_histories, _qualification_step,
+                                    _run_cell, development_scores, read_json, report,
                                     save_json, select_thresholds)
 
 
@@ -48,7 +50,7 @@ def _design_check(root, settings):
     shutil.copyfile(settings, snapshot)
     contract = make_contract(profile="full", cohort_settings=snapshot)
     assert contract["protocol_version"] == "2.2" and contract["source_cohort_protocol_version"] == "2.1"
-    assert contract["schema"] == "clipp2.simulation-contract.v3"
+    assert contract["schema"] == "clipp2.simulation-contract.v4"
     assert contract["evaluation"]["reference_match_atol"] is None
     assert json.loads(snapshot.read_text())["workflow_protocol"] == "2.1"
     main, development = list(jobs(contract, "main", 10)), list(jobs(contract, "development", 2))
@@ -58,6 +60,7 @@ def _design_check(root, settings):
     dev_histories = {row["history_id"] for row in development}
     assert len(main_histories) == 600 and len(dev_histories) == 120 and main_histories.isdisjoint(dev_histories)
     assert len({row["variant_id"] for row in main}) == len({row["variant_id"] for row in development}) == 60
+    assert all(row["cohort_content_id"] == contract["cohort"]["content_id"] for row in main+development)
     for population, expected in ((main, {"A1", "A2", "A3", "A4"}), (development, {"A1", "A4"})):
         for history_id in {row["history_id"] for row in population}:
             entries = [row for row in population if row["history_id"] == history_id]
@@ -308,11 +311,181 @@ def _planned_report_check(root, contract):
     assert all(metric["value"] == 0 for row in captured for metric in row["metrics"])
 
 
+def _structured_failure_checks(root):
+    history, frame, job = _fixture()
+    for case in ("stage_one", "capped_stage_two", "assignment", "no_reference", "blocked", "empty"):
+        directory = root / case
+        current = dict(status="complete", stage_one=None,
+            arms={"B": dict(status="complete", retained_source_evidence="B"), "C": dict(status="complete")},
+            cost_ledger=dict(fit_count=1, assignment_pass_count=0))
+        if case == "stage_one":
+            current.update(status="failed", failed_stage="stage_one", error_type="RuntimeError", error="injected")
+        elif case in ("capped_stage_two", "assignment"):
+            current["status"] = "partial_failure"
+            current["arms"]["C"].update(status="failed", failed_stage=case, error_type="RuntimeError", error="injected")
+        elif case in ("no_reference", "blocked"):
+            current["status"] = "no_eligible_clonal_reference" if case == "no_reference" else "blocked"
+            for arm in current["arms"].values():
+                arm["status"] = current["status"]
+        task = dict(root=str(directory), job=dict(job, phase="development"),
+                    execution_configs=[asdict(workflow_config(.95, .8))])
+        def infer(_input, output, config, **kwargs):
+            save_json(Path(output) / "paired_result.json", current)
+            return deepcopy(current)
+        with patch("CliPP2.simulation.study._history", return_value=history), \
+                patch("CliPP2.simulation.study._acquire", return_value=frame), \
+                patch("CliPP2.simulation.experiment.run_paired_experiment", side_effect=infer) as runner, \
+                patch("CliPP2.simulation.evaluation.evaluate", side_effect=lambda h, c, e, **k: dict(metrics=[], arms=e["arms"])), \
+                patch("CliPP2.simulation.study.development_scores", return_value=[dict(fixed_evaluable=8, correct_targets=0)]):
+            first = _run_cell(task)
+            failed = case in ("stage_one", "capped_stage_two", "assignment")
+            assert (first["status"] == "execution_failed") == failed
+            assert first["cost_ledgers"] == [current["cost_ledger"]]
+            assert read_json(directory / first["objective_path"])[0]["fixed_evaluable"] == 8
+            assert read_json(directory / first["evaluations"][0])["arms"]["B"] == current["arms"]["B"]
+            completion = directory / "cells" / job["cell_id"] / "completion.json"
+            prior = completion.read_bytes()
+            assert _run_cell(task) == first and runner.call_count == 1
+            if failed:
+                current.update(status="complete")
+                current["arms"]["C"] = dict(status="complete")
+                second = _run_cell(dict(task, retry_failed=True))
+                assert second["attempt"].endswith("attempt-002") and second["status"] == "complete"
+                assert second["prior_cost_ledgers"] == first["cost_ledgers"] and runner.call_count == 2
+            else:
+                assert _run_cell(dict(task, retry_failed=True)) == first and runner.call_count == 1
+            assert completion.read_bytes() == prior
+
+
+def _qualification_lifecycle_checks(root, contract):
+    def passed(output, summary="controls_summary.json"):
+        save_json(output / "evidence.json", dict(checked=True))
+        save_json(output / summary, dict(status="passed", paths=["evidence.json"],
+            cost_ledger=dict(fit_count=0, assignment_pass_count=0, events=[])))
+    def interrupted(output):
+        save_json(output / "partial.json", dict(started=True))
+        raise KeyboardInterrupt("fixture interruption")
+    for name in ("mechanisms", "cohort"):
+        directory = root / (name + "_interruption")
+        kwargs = dict(summary_name="controls_summary.json", identity=dict(cohort_content_id="fixture"))
+        try:
+            _qualification_step(directory, name, interrupted, **kwargs)
+        except KeyboardInterrupt:
+            pass
+        completed = _qualification_step(directory, name, passed, **kwargs)
+        assert completed["attempt"] == "attempt-002"
+        assert qualification_costs(directory)["unknown_cost_attempts"] == 1
+        recovered_root = root / (name + "_published")
+        def published_then_interrupted(output):
+            passed(output)
+            raise KeyboardInterrupt("summary published")
+        try:
+            _qualification_step(recovered_root, name, published_then_interrupted, **kwargs)
+        except KeyboardInterrupt:
+            pass
+        with patch("builtins.print"):
+            recovered = _qualification_step(recovered_root, name,
+                lambda p: (_ for _ in ()).throw(AssertionError("completed controls reran")), **kwargs)
+        assert recovered["recovered_from_summary"] and recovered["attempt"] == "attempt-001"
+        assert qualification_costs(recovered_root)["unknown_cost_attempts"] == 0
+        (recovered_root / "qualification_steps" / name / "attempt-001" / "output" / "evidence.json").unlink()
+        try:
+            _qualification_step(recovered_root, name, passed, **kwargs)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("Completed qualification reused missing outputs")
+    failed_root = root / "recorded_failure"
+    kwargs = dict(summary_name="controls_summary.json", identity=dict(cohort_content_id="fixture"))
+    try:
+        _qualification_step(failed_root, "mechanisms", lambda p: (_ for _ in ()).throw(ValueError("failed")), **kwargs)
+    except ValueError:
+        pass
+    try:
+        _qualification_step(failed_root, "mechanisms", passed, **kwargs)
+    except RuntimeError as error:
+        assert "--retry-failed" in str(error)
+    else:
+        raise AssertionError("Recorded qualification failure retried implicitly")
+    assert _qualification_step(failed_root, "mechanisms", passed, retry_failed=True, **kwargs)["attempt"] == "attempt-002"
+    aggregate_root = root / "before_aggregate"
+    frozen = deepcopy(contract)
+    original_save = save_json
+    def interrupt_aggregate(path, payload):
+        if Path(path).name == "qualification.json":
+            raise KeyboardInterrupt("before aggregate publication")
+        return original_save(path, payload)
+    with patch("CliPP2.simulation.biology.generate_history", return_value=SimpleNamespace(validate=lambda: None)), \
+            patch("CliPP2.simulation.controls.run_controls", side_effect=passed), \
+            patch("CliPP2.simulation.controls.run_cohort_controls", side_effect=lambda c, p: passed(p, "cohort_controls_summary.json")), \
+            patch("CliPP2.simulation.study.save_json", side_effect=interrupt_aggregate):
+        try:
+            _execute(aggregate_root, frozen)
+        except KeyboardInterrupt:
+            pass
+    with patch("CliPP2.simulation.biology.generate_history", return_value=SimpleNamespace(validate=lambda: None)), \
+            patch("CliPP2.simulation.controls.run_controls", side_effect=AssertionError("mechanisms reran")), \
+            patch("CliPP2.simulation.controls.run_cohort_controls", side_effect=AssertionError("cohort reran")), \
+            patch("CliPP2.simulation.study.allocate", side_effect=RuntimeError("stop after qualification")):
+        try:
+            _execute(aggregate_root, frozen, resume=True)
+        except RuntimeError as error:
+            assert str(error) == "stop after qualification"
+    receipt = read_json(aggregate_root / "qualification.json")
+    assert receipt["cohort_content_id"] == contract["cohort"]["content_id"]
+    assert all(value["status"] == "passed" for value in receipt["controls"].values())
+
+
+def run_lifecycle_checks(root, settings):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    contract = _design_check(root, settings)
+    job = next(jobs(contract, "development", 1))
+    histories = root / "history_reuse"
+    writer = SimpleNamespace(write_truth=lambda p: save_json(p / "history.json", dict(fixture=True)))
+    with patch("CliPP2.simulation.study._history", return_value=writer) as create:
+        _prepare_histories(histories, [job])
+        _prepare_histories(histories, [job])
+        assert create.call_count == 1
+    manifest = histories / "histories" / job["history_id"] / "history_manifest.json"
+    value = read_json(manifest)
+    assert value["cohort_content_id"] == contract["cohort"]["content_id"]
+    value["cohort_content_id"] = "different"
+    manifest.write_text(json.dumps(value))
+    try:
+        _prepare_histories(histories, [job])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Mismatched historical content identity reused")
+    _structured_failure_checks(root / "structured")
+    _qualification_lifecycle_checks(root / "qualification", contract)
+    frozen_root = root / "qualification" / "before_aggregate"
+    frozen = read_json(frozen_root / "study_contract.json")
+    content = read_json(frozen_root / "cohort_settings.json")
+    content["acquisitions"]["A1"]["mean_depth"] += 1
+    (frozen_root / "cohort_settings.json").write_text(json.dumps(content))
+    with patch("CliPP2.simulation.study._qualification_step", side_effect=AssertionError("changed source reached qualification")):
+        try:
+            _execute(frozen_root, frozen, resume=True)
+        except ValueError as error:
+            assert "content" in str(error)
+        else:
+            raise AssertionError("Changed frozen cohort resumed")
+    return dict(status="passed", native_fit_count=0, assignment_pass_count=0,
+        checks=["cohort_job_and_history_identity", "matching_history_reuse_and_changed_manifest_rejection",
+                "frozen_content_verified_before_resume_reuse", "caught_stage1_stage2_assignment_failures_retryable",
+                "partial_arm_objective_cost_evidence_retained", "scientific_rejections_not_retried",
+                "qualification_interruptions_and_published_summary_recovery", "recorded_qualification_failure_requires_explicit_retry",
+                "before_aggregate_interruption_reuses_both_steps", "interrupted_qualification_cost_unknown"])
+
+
 def run_checks(directory, cohort_settings):
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     contract = _design_check(root, cohort_settings)
-    for protocol, schema in (("2.1", "clipp2.simulation-contract.v1"), ("2.2", "clipp2.simulation-contract.v2")):
+    lifecycle = run_lifecycle_checks(root / "lifecycle", cohort_settings)
+    for protocol, schema in (("2.1", "clipp2.simulation-contract.v1"), ("2.2", "clipp2.simulation-contract.v2"), ("2.2", "clipp2.simulation-contract.v3")):
         old = dict(contract, protocol_version=protocol, schema=schema)
         with patch("CliPP2.simulation.study.read_json", side_effect=AssertionError("old contract reached resume IO")):
             try:
@@ -334,7 +507,7 @@ def run_checks(directory, cohort_settings):
     _native_failure_check(root / "native_failure", history, frame, job, contract)
     _partial_objective_check(root / "partial_objective", contract, history, frame, job)
     _planned_report_check(root / "unexecuted_report", contract)
-    result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4,
+    result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4, lifecycle=lifecycle,
         checks=["exact_60_variant_720_history_2640_cell_design", "full_10_20_strict_point05_contract",
                 "source_protocol21_execution22_and_cross_protocol_resume_rejection",
                 "threshold_reuse_preserves_reference_quality_and_finite_rival_certainty",

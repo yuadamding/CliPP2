@@ -19,7 +19,7 @@ import pandas as pd
 from CliPP2.assignment import posterior_passes
 from CliPP2.config import PROTOCOL_VERSION
 from CliPP2._version import __version__
-from CliPP2.io.data import json_value
+from CliPP2.io.data import content_hash, json_value
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
 
 from .design import (CONTRIBUTOR_GRID, POSTERIOR_GRID, allocate, jobs, resolve_config,
@@ -79,15 +79,23 @@ def _paired_result(attempt, index=1):
 
 
 @lru_cache(maxsize=2)
-def _cohort(path):
+def _cached_cohort(path, expected_content_id):
     from .cohort import load_cohort
-    return load_cohort(path)
+    return load_cohort(path, expected_content_id=expected_content_id)
+
+
+def _cohort(path, expected_content_id):
+    from .cohort import cohort_content_id
+    path = str(Path(path).resolve())
+    if not expected_content_id or cohort_content_id(read_json(path)) != expected_content_id:
+        raise ValueError("Authoritative cohort content differs from its declared identity")
+    return _cached_cohort(path, expected_content_id)
 
 
 def _history(job):
     if job.get("cohort_settings"):
         from .cohort import cohort_history
-        return cohort_history(_cohort(job["cohort_settings"]), job.get("source_history_id", job["history_id"]))
+        return cohort_history(_cohort(job["cohort_settings"], job["cohort_content_id"]), job.get("source_history_id", job["history_id"]))
     from .biology import generate_history
     dims = job["dimensions"]
     history = generate_history(job["family"], job["history_seed"],
@@ -98,7 +106,7 @@ def _history(job):
 def _acquire(job, history):
     if job.get("cohort_settings"):
         from .cohort import acquire_cohort
-        return acquire_cohort(history, _cohort(job["cohort_settings"]), job["acquisition"]["id"])
+        return acquire_cohort(history, _cohort(job["cohort_settings"], job["cohort_content_id"]), job["acquisition"]["id"])
     from .acquisition import acquire
     return acquire(history, job["acquisition_seed"], job["acquisition"]["purity"], job["acquisition"]["depth"],
                    perturbation=job.get("perturbation"))
@@ -168,12 +176,26 @@ def development_scores(history, catalog, experiment, evaluation, job, contributo
     return rows
 
 
+def _experiment_execution_failures(experiment, configuration_index):
+    """Distinguish caught execution errors from completed scientific rejection."""
+    failures = []
+    for arm, record in ((None, experiment), *experiment.get("arms", {}).items()):
+        if record.get("status") not in ("failed", "execution_failed"):
+            continue
+        failures.append(dict(configuration_index=configuration_index, arm=arm,
+            failed_stage=record.get("failed_stage"), failed_phase=record.get("failed_phase"),
+            error_type=record.get("error_type"), error=record.get("error")))
+    return failures
+
+
 def _run_cell(task):
     from .evaluation import evaluate
     from .experiment import run_paired_experiment
     root, job, selected = Path(task["root"]), task["job"], task.get("selected")
     evaluation_config = dict(reference_match_atol=task.get("reference_match_atol"))
     directory = root / "cells" / job["cell_id"]
+    if job.get("cohort_settings"):
+        _cohort(job["cohort_settings"], job["cohort_content_id"])
     prior = _latest_completion(directory)
     if prior is not None:
         value = prior
@@ -192,7 +214,7 @@ def _run_cell(task):
     attempt.mkdir()
     started = time.perf_counter()
     save_json(attempt / "job.json", job)
-    objectives, results, costs = [], [], []
+    objectives, results, costs, execution_failures = [], [], [], []
     try:
         history = _history(job)
         acquisition = job["acquisition"]
@@ -221,6 +243,7 @@ def _run_cell(task):
                 accepted_stage_one=first, accepted_uncapped_stage_two=second, progress_callback=progress,
                 run_manifest_id=task.get("run_manifest_id"))
             costs.append(experiment["cost_ledger"])
+            execution_failures.extend(_experiment_execution_failures(experiment, index+1))
             save_json(attempt / f"cost-ledger-{index+1}.json", experiment["cost_ledger"])
             first = first or experiment.get("stage_one")
             second = second or experiment.get("arms", {}).get("B", {}).get("stage_two")
@@ -239,7 +262,7 @@ def _run_cell(task):
             save_json(attempt / "threshold_objectives.json", objectives)
         if task.get("archive_completed", False):
             _archive_completed(attempt)
-        value = dict(job=job, status="complete", evaluations=results, cost_ledgers=costs,
+        value = dict(job=job, status="execution_failed" if execution_failures else "complete", evaluations=results, cost_ledgers=costs,
             objective_path=str((attempt / "threshold_objectives.json").relative_to(root)) if objectives else None,
             attempt=str(attempt.relative_to(root)), elapsed_seconds=time.perf_counter()-started,
             peak_resident_bytes=_peak_bytes())
@@ -251,7 +274,9 @@ def _run_cell(task):
             objective_path=str((attempt / "threshold_objectives.json").relative_to(root)) if objectives else None,
             attempt=str(attempt.relative_to(root)), elapsed_seconds=time.perf_counter()-started,
             peak_resident_bytes=_peak_bytes())
-        save_json(attempt / "failure.json", value)
+        execution_failures.append(dict(configuration_index=None, arm=None, failed_stage="worker",
+            error_type=type(exc).__name__, error=str(exc)))
+    value["execution_failures"] = execution_failures
     value["execution_configs"] = task.get("execution_configs")
     value["evaluation_config"] = evaluation_config
     value["protocol_version"] = PROTOCOL_VERSION
@@ -259,6 +284,8 @@ def _run_cell(task):
     value["prior_cost_ledgers"] = ((prior.get("prior_cost_ledgers", [])+prior.get("cost_ledgers", []))
                                   if prior else [])
     value["output_bytes"] = sum(p.stat().st_size for p in attempt.rglob("*") if p.is_file())
+    if value["status"] == "execution_failed":
+        save_json(attempt / "failure.json", value)
     save_json(completion, value)
     return value
 
@@ -270,16 +297,19 @@ def _prepare_histories(root, job_list):
             continue
         seen.add(job["history_id"])
         directory = root / "histories" / job["history_id"]
+        expected = {k: job[k] for k in ("history_id", "family", "history_seed", "dimensions")}
+        if job.get("cohort_settings"):
+            _cohort(job["cohort_settings"], job["cohort_content_id"])
+            expected["cohort_content_id"] = job["cohort_content_id"]
         if (directory / "history_manifest.json").exists():
             existing = read_json(directory / "history_manifest.json")
-            if existing != {k: job[k] for k in ("history_id", "family", "history_seed", "dimensions")}:
+            if existing != expected:
                 raise ValueError("Resume physical history differs")
             continue
         history = _history(job)
         directory.mkdir(parents=True, exist_ok=True)
         history.write_truth(directory)
-        save_json(directory / "history_manifest.json",
-                  {k: job[k] for k in ("history_id", "family", "history_seed", "dimensions")})
+        save_json(directory / "history_manifest.json", expected)
 
 
 def run_jobs(root, job_list, *, workers, selected=None, contract=None, retry_failed=False):
@@ -375,6 +405,88 @@ def select_thresholds(root, cells, contract):
                 configurations=candidates, cell_objectives=rows, tuning_target="C3", B3_separately_optimized=False)
 
 
+def _qualification_summary(output, summary_name):
+    """Validate a passed control summary and its published output inventory."""
+    output = Path(output)
+    summary = read_json(output / summary_name)
+    ledger = summary.get("cost_ledger", {})
+    passes = ledger.get("assignment_pass_count")
+    if (summary.get("status") != "passed" or ledger.get("fit_count") != 0
+            or type(passes) is not int or passes < 0
+            or any(event.get("status") != "complete" for event in ledger.get("events", []))):
+        raise ValueError("Qualification summary is not a completed zero-fit control result")
+    receipts = list(output.rglob("*assignment_summary.json"))
+    if len(receipts) != passes:
+        raise ValueError("Qualification assignment publications do not match its cost summary")
+    for receipt in receipts:
+        record = read_json(receipt)
+        if record.get("manifest_schema") != "clipp2.file-list.v1" or not record.get("files"):
+            raise ValueError("Qualification publication lacks an output inventory")
+        for name in record["files"]:
+            path = (receipt.parent / name).resolve()
+            if not path.is_relative_to(output.resolve()) or not path.is_file():
+                raise ValueError("Qualification publication output is missing or outside its step")
+    for name in summary.get("paths", []):
+        path = (output / name).resolve()
+        if not path.is_relative_to(output.resolve()) or not path.is_file():
+            raise ValueError("Qualification summary output is missing or outside its step")
+    return summary
+
+
+def _qualification_step(root, name, runner, *, summary_name, identity, retry_failed=False):
+    """Retain numbered control attempts and recover published success without rerun."""
+    directory = Path(root) / "qualification_steps" / name
+    directory.mkdir(parents=True, exist_ok=True)
+    binding = dict(step=name, protocol_version=PROTOCOL_VERSION, implementation_version=__version__, **identity)
+    attempts = sorted(directory.glob("attempt-*"))
+
+    def completed(attempt, summary, recovered=False):
+        receipt = dict(schema="clipp2.qualification-step.v1", status="passed", identity=binding,
+            attempt=attempt.name, summary_name=summary_name, summary_content_id=content_hash(summary),
+            recovered_from_summary=recovered, cost_status="known", cost_ledger=summary["cost_ledger"])
+        save_json(attempt / "completion.json", receipt)
+        return receipt
+
+    if attempts and (attempts[-1] / "started.json").exists():
+        prior = attempts[-1]
+        started = read_json(prior / "started.json")
+        if started.get("identity") != binding:
+            raise ValueError("Qualification step identity differs from its original attempt")
+        completion = prior / "completion.json"
+        if completion.exists():
+            receipt = read_json(completion)
+            if receipt.get("identity") != binding:
+                raise ValueError("Qualification completion identity differs")
+            if receipt["status"] == "passed":
+                summary = _qualification_summary(prior / "output", summary_name)
+                if receipt["summary_content_id"] != content_hash(summary):
+                    raise ValueError("Completed qualification summary content changed")
+                return receipt
+            if not retry_failed:
+                raise RuntimeError(f"Qualification step {name} failed; use --retry-failed for a retained new attempt")
+        elif (prior / "output" / summary_name).exists():
+            try:
+                summary = _qualification_summary(prior / "output", summary_name)
+            except (ValueError, OSError):
+                pass  # Incomplete outputs are retained; a new attempt gets a fresh directory.
+            else:
+                return completed(prior, summary, recovered=True)
+        # An incomplete attempt without a cost summary remains unknown-cost evidence.
+    attempt = directory / f"attempt-{len(attempts)+1:03d}"
+    attempt.mkdir()
+    save_json(attempt / "started.json", dict(schema="clipp2.qualification-step.v1", status="started",
+        identity=binding, attempt=attempt.name, summary_name=summary_name, cost_status="unknown"))
+    try:
+        runner(attempt / "output")
+        summary = _qualification_summary(attempt / "output", summary_name)
+        return completed(attempt, summary)
+    except Exception as error:
+        save_json(attempt / "completion.json", dict(schema="clipp2.qualification-step.v1", status="failed",
+            identity=binding, attempt=attempt.name, summary_name=summary_name,
+            error_type=type(error).__name__, error=str(error), cost_status="unknown", cost_ledger=None))
+        raise
+
+
 def execute(root, contract, *, resume=False, retry_failed=False):
     import fcntl
     root = Path(root).resolve()
@@ -389,36 +501,62 @@ def execute(root, contract, *, resume=False, retry_failed=False):
 
 def _execute(root, contract, *, resume=False, retry_failed=False):
     root = Path(root).resolve()
-    if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v3"
+    if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v4"
             or contract.get("implementation_version") != __version__):
         raise ValueError(f"Execution requires a Protocol {PROTOCOL_VERSION} simulation contract; earlier studies require their original installed environment")
     if resume:
         frozen = read_json(root / "study_contract.json")
         if frozen != contract:
             raise ValueError("Resume requires the exact frozen study contract")
+        if contract.get("cohort"):
+            _cohort(root / "cohort_settings.json", contract["cohort"]["content_id"])
+            if Path(contract["cohort"]["path"]).resolve() != (root / "cohort_settings.json").resolve():
+                raise ValueError("Resume must use the verified frozen cohort snapshot")
     else:
         if root.exists() and any(root.iterdir()):
             raise FileExistsError("Study outputs must be new or empty; use --resume for this study")
         root.mkdir(parents=True, exist_ok=True)
         if contract.get("cohort"):
-            import shutil
+            from .cohort import load_cohort
+            validated = load_cohort(contract["cohort"]["path"], expected_content_id=contract["cohort"]["content_id"])
             frozen_cohort = root / "cohort_settings.json"
-            shutil.copyfile(contract["cohort"]["path"], frozen_cohort)
+            save_json(frozen_cohort, validated.settings)
             contract["cohort"]["path"] = str(frozen_cohort)
         save_json(root / "study_contract.json", contract)
     qualification_path = root / "qualification.json"
+    if qualification_path.exists():
+        existing = read_json(qualification_path)
+        cohort_id = contract["cohort"]["content_id"] if contract.get("cohort") else None
+        expected_steps = {"mechanisms", "cohort"} if contract.get("cohort") else {"mechanisms"}
+        if (existing.get("cohort_content_id") != cohort_id
+                or existing.get("protocol_version") != PROTOCOL_VERSION
+                or set(existing.get("controls", {})) != expected_steps):
+            raise ValueError("Qualification aggregate differs from the frozen study identity")
+        for name, receipt in existing["controls"].items():
+            expected = dict(step=name, protocol_version=PROTOCOL_VERSION,
+                            implementation_version=__version__, cohort_content_id=cohort_id)
+            attempt = root / "qualification_steps" / name / receipt["attempt"]
+            if (receipt.get("identity") != expected or receipt.get("status") != "passed"
+                    or read_json(attempt / "completion.json") != receipt
+                    or content_hash(_qualification_summary(attempt / "output", receipt["summary_name"]))
+                    != receipt["summary_content_id"]):
+                raise ValueError("Qualification aggregate is not backed by matching completed steps")
     if not qualification_path.exists():
         from .biology import generate_history
         from .controls import run_controls
         for family in contract["families"]:
             for variant in range(3):
                 generate_history(family, variant+100, n_mutations=60, n_segments=6, n_regions=4).validate()
-        controls = run_controls(root / "source_snapshots" / "mechanisms")
+        binding = dict(cohort_content_id=contract["cohort"]["content_id"] if contract.get("cohort") else None)
+        controls = dict(mechanisms=_qualification_step(root, "mechanisms", run_controls,
+            summary_name="controls_summary.json", identity=binding, retry_failed=retry_failed))
         if contract.get("cohort"):
             from .controls import run_cohort_controls
-            controls["cohort"] = run_cohort_controls(_cohort(contract["cohort"]["path"]),
-                                                     root / "source_snapshots" / "cohort")
+            controls["cohort"] = _qualification_step(root, "cohort", lambda output: run_cohort_controls(
+                _cohort(contract["cohort"]["path"], contract["cohort"]["content_id"]), output),
+                summary_name="cohort_controls_summary.json", identity=binding, retry_failed=retry_failed)
         save_json(qualification_path, dict(physical_histories_validated=36, controls=controls,
+            cohort_content_id=binding["cohort_content_id"],
             protocol_version=PROTOCOL_VERSION, source_cohort_protocol_version=contract.get("source_cohort_protocol_version"),
             numerical_policy=f"Every native fit and assignment retains the independent Protocol {PROTOCOL_VERSION} verification receipt"))
     workers = contract["resource_limits"]["workers"]
@@ -523,7 +661,7 @@ def run_optional_panels(root, contract, selected, workers):
             if options.get("independent_counts"):
                 if contract.get("cohort"):
                     from .cohort import acquire_cohort
-                    second = acquire_cohort(history, _cohort(contract["cohort"]["path"]), "A4", read_replicate_id=2)
+                    second = acquire_cohort(history, _cohort(contract["cohort"]["path"], contract["cohort"]["content_id"]), "A4", read_replicate_id=2)
                 else:
                     second = acquire(history, seed_for(contract["master_seed"], "main", family, 0, 104), .8, 500)
                 second_path = output / f"{family}_independent_counts.tsv"

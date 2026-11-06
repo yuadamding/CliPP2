@@ -54,6 +54,27 @@ def recorded_costs(root):
     return dict(counts)
 
 
+def qualification_costs(root):
+    """Keep interrupted control costs unknown rather than silently counting zero."""
+    attempts, known = [], Counter()
+    for attempt in sorted((Path(root) / "qualification_steps").glob("*/attempt-*")):
+        completion = attempt / "completion.json"
+        if completion.exists():
+            receipt = json.loads(completion.read_text())
+            ledger = receipt.get("cost_ledger")
+            state = receipt["status"]
+        else:
+            ledger, state = None, "interrupted_or_running"
+        if ledger is not None:
+            for key in ("fit_count", "assignment_pass_count"):
+                known[key] += ledger.get(key, 0)
+        attempts.append(dict(step=attempt.parent.name, attempt=attempt.name, status=state,
+                             cost_status="known" if ledger is not None else "unknown"))
+    return dict(attempts=attempts, known_costs=dict(known),
+                unknown_cost_attempts=sum(row["cost_status"] == "unknown" for row in attempts),
+                total_cost_status="unknown" if any(row["cost_status"] == "unknown" for row in attempts) else "known")
+
+
 def status(outdir):
     from .study import _latest_completion, read_json
     root = Path(outdir).resolve()
@@ -93,6 +114,8 @@ def status(outdir):
         planned_main_cells=allocation.get("planned_main_datasets"),
         processed_cells=[dict(phase=phase, status=state, count=count) for (phase, state), count in sorted(counts.items())],
         operation_costs=costs,
+        qualification_costs=qualification_costs(root),
+        recorded_execution_failures=sum(len(cell.get("execution_failures", [])) for cell in cells),
         active=active, thresholds_frozen=(root / "study_plan.json").exists(),
         report=str(reports[-1]) if reports else None,
         cost_note="Durable operation journals include completed, failed and unfinished attempts; scientific applicability is in the report")
