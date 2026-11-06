@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+from decimal import Decimal, localcontext
 import json
 import os
 from pathlib import Path
 import pickle
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -20,14 +22,16 @@ from CliPP2.config import AssignmentThresholds, DescriptiveScreen, PROTOCOL_VERS
 from CliPP2.io.assignment import (load_assignment_bundle, publish_assignment, save_assignment_bundle,
                                   validate_assignment_result)
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
+from CliPP2.screening import binomial_profile_deviance, profile_deviance_from_diagnostics
 
 
-def _catalog(root, name, alt, depth, major, *, minor=0, observed=True):
-    alt, depth, major, minor, observed = np.broadcast_arrays(
+def _catalog(root, name, alt, depth, major, *, minor=0, observed=True, input_excluded=False):
+    alt, depth, major, minor, observed, input_excluded = np.broadcast_arrays(
         np.atleast_2d(alt), np.atleast_2d(depth), np.atleast_2d(major),
-        np.atleast_2d(minor), np.atleast_2d(observed))
+        np.atleast_2d(minor), np.atleast_2d(observed), np.atleast_2d(input_excluded))
     rows = [dict(mutation_id=f"m{i}", sample_id=f"r{j}", alt_count=int(alt[i, j]),
-        ref_count=int(depth[i, j]-alt[i, j]), count_observed=int(observed[i, j]), purity=1., normal_cn=2,
+        ref_count=int(depth[i, j]-alt[i, j]), count_observed=int(observed[i, j]),
+        input_excluded=int(input_excluded[i, j]), purity=1., normal_cn=2,
         segment_id="s", cn_state_id="0", cn_state_fraction=1., allele_a_cn=int(major[i, j]),
         allele_b_cn=int(minor[i, j])) for i in range(alt.shape[0]) for j in range(alt.shape[1])]
     path = write_tumor_txt(root / (name + ".tsv"), pd.DataFrame(rows))
@@ -65,10 +69,107 @@ def _reject(operation, exception=ValueError):
     raise AssertionError("Invalid assignment evidence was accepted")
 
 
+def _numerical_screen_checks(root):
+    from CliPP2.io.assignment import _independent_deviance
+
+    def oracle(alt, depth, probability):
+        if probability == alt/depth:
+            return 0.
+        if probability in (0., 1.):
+            return np.inf
+        with localcontext() as context:
+            context.prec = 400
+            q, p = Decimal.from_float(float(alt/depth)), Decimal.from_float(float(probability))
+            terms = (q*(q/p).ln() if q else Decimal(0))
+            terms += ((1-q)*((1-q)/(1-p)).ln() if q != 1 else Decimal(0))
+            return float(2*Decimal(int(depth))*terms)
+
+    cases = [(50, 100), (1, 3), (1, 10), (9, 10), (1, 10**12), (10**12-1, 10**12), (0, 100), (100, 100)]
+    for alt, depth in cases:
+        q = alt/depth
+        for probability in (q, np.nextafter(q, 0.), np.nextafter(q, 1.), .2, .8,
+                            np.nextafter(0., 1.), np.nextafter(1., 0.)):
+            expected = oracle(alt, depth, probability)
+            actual = float(binomial_profile_deviance(alt, depth, probability))
+            independent = _independent_deviance(alt, depth, probability)
+            np.testing.assert_allclose(actual, expected, rtol=5e-14, atol=0.)
+            np.testing.assert_allclose(independent, expected, rtol=5e-14, atol=0.)
+            if np.isfinite(expected) and probability != q:
+                assert actual > 0 and independent > 0
+    assert binomial_profile_deviance(50, 100, .5) == 0
+    adjacent = float(binomial_profile_deviance(50, 100, np.nextafter(.5, 1.)))
+    np.testing.assert_allclose(adjacent, 4.930380657631324e-30, rtol=1e-15, atol=0.)
+    assert np.isposinf(binomial_profile_deviance(50, 100, np.nan))
+    assert np.isnan(binomial_profile_deviance(50, 100, .5, False))
+    assert np.isnan(binomial_profile_deviance(0, 0, .5))
+    observation = SimpleNamespace(alt=np.array([[50., 1.]]), depth=np.array([[100., 10.]]),
+        scaling=np.array([[.25, 1.]]), observed=np.ones((1, 2), bool))
+    diagnostic = {"map_multiplicity": np.array([[2., np.nan]])}
+    np.testing.assert_array_equal(profile_deviance_from_diagnostics(observation, 1., diagnostic), [[0., np.inf]])
+    # A zero screen must separate exact saturation from one representable step.
+    catalog = _catalog(root, "deviance_boundary", 50, 100, 1)
+    thresholds = AssignmentThresholds(1., DescriptiveScreen(0., 0., 0.), 0., 0., 1.)
+    for name, center, status in (("exact", .5, "assigned_relative"),
+                                 ("adjacent", np.nextafter(.5, 1.), "unresolved_fit")):
+        request = replace(_bundle(catalog, _reference(catalog, [[center]])), thresholds=thresholds)
+        result = assign_mutations(request, outdir=root / ("screen_" + name))
+        assert result.assignments[0]["status"] == status
+        assert result.multiplicities[0]["profile_deviance"] == (0. if name == "exact" else adjacent)
+        changed = result.to_dict()
+        changed["multiplicities"][0]["profile_deviance"] = adjacent if name == "exact" else 0.
+        _reject(lambda: validate_assignment_result(request, AssignmentResult.from_dict(changed)))
+    impossible = _catalog(root, "impossible_screen", 1, 100, 1)
+    request = _bundle(impossible, _reference(impossible, [[0.]]))
+    result = assign_mutations(request, outdir=root / "impossible_screen_output")
+    assert result.assignments[0]["status"] == "incompatible"
+    assert np.isposinf(result.multiplicities[0]["profile_deviance"])
+    # Independent stable formulas may round differently at a nonzero cutoff.
+    # Verification proves the value; gate validation retains the scoring value.
+    boundary_catalog = _catalog(root, "nonzero_screen_boundary", 1, 10, 1)
+    cutoff = float(binomial_profile_deviance(1, 10, .07))
+    for name, limit, status in (("equal", cutoff, "assigned_relative"),
+                                ("below", np.nextafter(cutoff, 0.), "unresolved_fit")):
+        request = replace(_bundle(boundary_catalog, _reference(boundary_catalog, [[.07]])),
+            thresholds=AssignmentThresholds(1., DescriptiveScreen(limit, limit, 0.), 0., 0., 1.))
+        # Pin the allowed verifier rounding variation across platform libm builds.
+        with patch("CliPP2.io.assignment._independent_deviance", return_value=np.nextafter(cutoff, np.inf)):
+            result = assign_mutations(request, outdir=root / ("nonzero_screen_" + name))
+        assert result.assignments[0]["status"] == status
+    return dict(high_precision_oracle=True, exact_saturation=True, adjacent_positive=True,
+                endpoints_and_masks=True, independent_publication=True, nonzero_exact_cutoff=True)
+
+
+def _effective_support_checks(root):
+    from CliPP2.config import WorkflowConfig, FitConfig
+    from CliPP2.io.data import MultiplicityBounds
+    from CliPP2 import workflow
+
+    catalog = _catalog(root, "effective_support", [[50, 50]], 100, 2, input_excluded=[[False, True]])
+    thresholds = AssignmentThresholds(.9, DescriptiveScreen(10., 5., .05), 1e-10, 1e-10, .95)
+    config = WorkflowConfig(thresholds, .9, 10., DescriptiveScreen(10., 5., .05), 1e-10,
+                            fit=FitConfig(device="cpu", cpu_threads=1))
+    def fixture(high):
+        bounds = MultiplicityBounds(catalog.mutation_ids, catalog.region_ids, [[1, 1]], [high], "fixture")
+        return SimpleNamespace(mutation_ids=catalog.mutation_ids, region_ids=catalog.region_ids,
+            support=bounds, multiplicities=np.array([[1., np.nan]]), centers=np.array([[1., 1.]]),
+            labels=np.array([0]), phi=np.array([[1., 1.]]), source_id="stage_one")
+    for high, expected in (([2, 1], 1), ([1, 1], 2)):
+        fit = fixture(high)
+        with patch("CliPP2.workflow._diagnostics", wraps=workflow._diagnostics) as diagnostics:
+            workflow.qualify_contributors(catalog, fit, config)
+            assert diagnostics.call_count == expected
+        with patch("CliPP2.workflow._diagnostics_many", wraps=workflow._diagnostics_many) as diagnostics:
+            workflow.classify_groups(catalog, fit, config)
+            assert diagnostics.call_count == expected
+    return dict(excluded_placeholders_reused=True, eligible_caps_recomputed=True)
+
+
 def run_checks(directory):
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     assert PROTOCOL_VERSION == "2.2"
+    numerical_screen = _numerical_screen_checks(root)
+    effective_support = _effective_support_checks(root)
     exact = _catalog(root, "exact", 2, 3, 4)
     request = _bundle(exact, _reference(exact, [[1.]]))
     result = assign_mutations(request, outdir=root / "exact_output")
@@ -266,7 +367,7 @@ def run_checks(directory):
         explicit_conditional_and_assigned_multiplicity=True, stable_competitor_confidence=True,
         immutable_quality_roundtrip=True, byte_identical_bundle_replay=True, independent_publication_checks=True,
         combined_publication_once=True, original_and_current_manifest_links=True, exact_schema_migration=True,
-        generic_and_workflow_outcomes=True)
+        generic_and_workflow_outcomes=True, numerical_screen=numerical_screen, effective_support=effective_support)
 
 
 if __name__ == "__main__":

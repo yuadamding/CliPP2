@@ -293,7 +293,7 @@ def main(argv=None):
     parser.add_argument("--replicates", type=int, default=3)
     parser.add_argument("--device", choices=("cpu",), default="cpu")
     parser.add_argument("--reference-match-atol", type=float, default=None,
-                        help="Optional maximum per-coordinate error for one-to-one reference recovery")
+                        help="Optional maximum full-vector L2 distance for one-to-one reference recovery")
     parser.add_argument("--compare-stage-two-support", action="store_true",
                         help="Add an offline full/capped-support comparison; never changes the production workflow")
     parser.add_argument("--posterior-min", type=float, required=True)

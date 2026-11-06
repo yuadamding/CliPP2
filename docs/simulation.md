@@ -71,13 +71,40 @@ python -m CliPP2.simulation report results/cohort-full
 `status` reads progress and in-flight operation journals without changing the
 study. Resume uses the existing contract, allocation, and selected thresholds;
 new command-line settings do not replace them. Completed cells are reused.
-`--retry-failed` reruns eligible worker failures as new attempts, retaining old
+`--retry-failed` reruns execution failures as new attempts, retaining old
 attempts, completion records, and costs. It does not reopen a frozen development
 selection or reinterpret scientific rejection as a worker failure. Package
-version 1.2.1 uses simulation contract v3 and rejects earlier contracts, including
-the prior Protocol 2.2/v2 contract. Preserve older outputs and use a fresh
-directory for the new execution. Reports are
-written to a new numbered report directory.
+version 1.2.2 uses simulation contract v4. It binds the entire parsed cohort
+settings to a `cohort_content_id` in contracts, jobs, physical histories,
+acquisitions, and qualification receipts. Formatting and object-key order do not
+affect this identity; values and list order do. Resume verifies the frozen
+settings before reusing any work. Semantic random seeds remain unchanged.
+
+Existing 1.2.1 studies retain their original frozen installation and outputs.
+They are not migrated or given retrospective cohort identity. A new execution
+under 1.2.2 requires a new directory. Qualification has separate numbered
+mechanism/cohort attempts; validated published summaries can complete an
+interrupted wrapper without rerunning controls. Interrupted costs without a
+summary remain explicitly unknown. Reports use new directories.
+
+To apply new evaluation definitions to saved inference, create an explicit JSON
+configuration and a new report destination:
+
+```json
+{"schema":"clipp2.simulation.evaluation-config.v1","reference_distance":"l2","reference_match_atol":0.025}
+```
+
+```sh
+clipp2-simulate report results/old-study \
+  --evaluation-config evaluation.json --report-dir results/new-evaluation-report
+```
+
+The tolerance above is an example reporting choice. Offline evaluation reads
+preserved truth, input catalogs, acquisition records, selected attempts, and
+paired results, including archives. Missing or conflicting evidence produces an
+unavailable derived record. It performs no fitting, assignment, generation, or
+threshold selection; frozen development choices and old inference decisions
+remain intact. Without `--evaluation-config`, reports use cached evaluations.
 
 Generate every truth history and prescribed input catalog without fitting:
 
@@ -156,9 +183,11 @@ accounting. Accepted native counts remain recorded if a later derived phase fail
 Reference-center assessment is separate from source-member overlap used for
 calibration labels. Continuous Euclidean and maximum regional errors are retained.
 Binary reference recovery is unassessed by default. The qualification-only
-`qualify --reference-match-atol VALUE` declares a maximum per-region absolute
-error; recall uses one-to-one matching, so one candidate cannot recover several
-true groups. This reporting tolerance never changes fitting, routing or assignment.
+`qualify --reference-match-atol VALUE` declares an unnormalized full-vector L2
+error bound for new evaluations; recall uses one-to-one matching, so one candidate
+cannot recover several true groups. Cached historical L∞ results keep their
+original definition. See [evaluation definitions](simulation_evaluation.md) for
+detailed membership, target-specific availability, and offline re-evaluation. This reporting tolerance never changes fitting, routing or assignment.
 
 Threshold selection uses a fixed original evaluable population in S01, S02,
 and S07, with complete-truth separation under original support greater than two

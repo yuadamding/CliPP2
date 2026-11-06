@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 
 import numpy as np
-from scipy.special import gammaln, logsumexp, xlogy, xlog1py
+from scipy.special import logsumexp, xlogy, xlog1py
 
 from .config import AssignmentThresholds, PROTOCOL_VERSION
 from ._version import __version__
@@ -13,7 +13,7 @@ from .io.data import (ImmutableArrayRecord, MultiplicityBounds, OriginalCatalog,
                       json_value as _json_value, freeze_record as _freeze, content_hash)
 from .kernel.backend import NativeBackend, NativeExecutionError
 from .kernel.observations import prepare_prediction
-from .screening import summarize_profile_deviance
+from .screening import profile_deviance_from_diagnostics, summarize_profile_deviance
 
 SUPPORT_POLICY = "original_full_1_to_major_cn"
 
@@ -298,12 +298,6 @@ class AssignmentResult(ImmutableArrayRecord):
         return cls(**values)
 
 
-def saturated_log_mass(alt, depth):
-    alt, depth = np.asarray(alt, float), np.asarray(depth, float)
-    p = np.divide(alt, depth, out=np.zeros_like(alt), where=depth > 0)
-    return gammaln(depth + 1) - gammaln(alt + 1) - gammaln(depth - alt + 1) + xlogy(alt, p) + xlog1py(depth - alt, -p)
-
-
 POLICY_FIELDS = ("status", "best_label", "second_best_label", "accepted_label", "posterior",
     "best_log_probability", "second_best_probability", "entropy", "log_score_margin", "cluster_tie",
     "log_competitor_ratio", "comparison_scope", "posterior_pass", "has_finite_alternative",
@@ -477,7 +471,6 @@ def _score_reference(bundle, progress_callback):
     if not n:
         return _ReferenceEvaluation((), np.empty(0, dtype=int), {}, observed,
                            dict(status="skipped_empty_targets", device=bundle.device))
-    sat = saturated_log_mass(observation.alt, observation.depth)
     with NativeBackend(observation, cpu_threads=bundle.cpu_threads) as backend:
         for index, center in enumerate(bundle.reference.centers):
             diagnostic = backend.component_diagnostics(np.broadcast_to(center, (n, r)))
@@ -495,7 +488,8 @@ def _score_reference(bundle, progress_callback):
         if np.any(np.isin(best_diagnostics["status"], [2, 3])):
             raise NativeExecutionError("Assignment multiplicity diagnostic execution failed")
         execution = dict(status="evaluated", **backend.diagnostics())
-    residuals = np.maximum(0., 2 * (sat - best_diagnostics["max_component_log_mass"]))
+    residuals = profile_deviance_from_diagnostics(observation, bundle.reference.centers[best], best_diagnostics)
+    best_diagnostics["profile_deviance"] = residuals
     selected_screen = summarize_profile_deviance(residuals, observed, bundle.thresholds.screen, axis=1)
     records = []
     screen = bundle.thresholds.screen
@@ -554,14 +548,14 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
             has_second = bool(diagnostic["has_second"][i, j]) if defined else None
             gap = float(diagnostic["top_two_gap"][i, j]) if defined and has_second else float("nan")
             candidates, conditional = (), ()
-            log_probability, profile_deviance = float("nan"), float("nan")
+            log_probability = float("nan")
+            profile_deviance = (float(diagnostic["profile_deviance"][i, j]) if defined
+                                else float("inf") if informative else float("nan"))
             finite_alternative = False
             if defined:
                 candidates, conditional, log_probability, finite_alternative = _conditional_probabilities(
                     catalog, source, j, phi, int(support.lower[i, j]), int(support.upper[i, j]),
                     diagnostic["map_multiplicity"][i, j])
-                profile_deviance = max(0., float(2 * (saturated_log_mass(catalog.alt_counts[source, j],
-                    catalog.total_counts[source, j]) - diagnostic["max_component_log_mass"][i, j])))
             tied = bool(has_second and gap <= bundle.thresholds.multiplicity_tie_atol) if defined else None
             concentrated = confidence_passes(log_probability, bundle.thresholds.multiplicity_probability_min,
                                               finite_alternative) if defined else None

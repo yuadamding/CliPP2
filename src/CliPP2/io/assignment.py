@@ -116,10 +116,43 @@ def _require_fields(record, expected, context, *, atol=1e-12):
             raise ValueError(f"{context}: inconsistent {name}")
 
 
+def _independent_deviance(alt, depth, probability):
+    """Verify deviance using log1p remainders, independently of screen code.
+
+    For d=p-q, KL=q*(d/q-log1p(d/q)) +
+    (1-q)*(-d/(1-q)-log1p(-d/(1-q))). The cancelled linear terms
+    never enter the floating calculation. A power series evaluates each small
+    remainder; this is distinct from the production symmetric-ratio series.
+    """
+    q, p = float(alt/depth), float(probability)
+    if not np.isfinite(p):
+        return np.inf
+    if p == q:
+        return 0.
+    if p <= 0 or p >= 1:
+        return np.inf
+    if q == 0:
+        return float(-2*depth*np.log1p(-p))
+    if q == 1:
+        return float(-2*depth*np.log(p))
+    def remainder(z):
+        power, total = z*z, z*z/2
+        for exponent in range(3, 101):
+            power *= -z
+            updated = total + power/exponent
+            if updated == total:
+                break
+            total = updated
+        return total
+    difference = p-q
+    if abs(difference) >= .1*min(q, 1-q):
+        return float(2*depth*(q*(np.log(q)-np.log(p))
+                             + (1-q)*(np.log1p(-q)-np.log1p(-p))))
+    return float(2*depth*(q*remainder(difference/q) + (1-q)*remainder(-difference/(1-q))))
+
+
 def _conditional_evidence(catalog, source, region, phi, low, high, call, native_call):
     """Independently rebuild the selected pair's binomial terms for publication."""
-    from ..assignment import saturated_log_mass
-
     if not np.isfinite(call):
         raise ValueError("A defined conditional distribution requires a finite MAP")
     candidates = np.arange(low, high + 1)
@@ -140,7 +173,7 @@ def _conditional_evidence(catalog, source, region, phi, low, high, call, native_
     gap = float(maximum-np.partition(logs, -2)[-2]) if len(logs) > 1 else np.nan
     native_lp = (float(logs[int(native_call)-low]-logs[chosen]+log_probability)
                  if np.isfinite(native_call) and low <= native_call <= high else -np.inf)
-    deviance = max(0., float(2*(saturated_log_mass(alt, depth)-maximum)))
+    deviance = _independent_deviance(alt, depth, p[chosen])
     return candidates, probabilities, log_probability, bool(np.isfinite(others).any()), gap, native_lp, deviance
 
 
@@ -258,9 +291,9 @@ def validate_assignment_result(bundle, result):
             if pair_defined:
                 candidates, conditional, log_probability, finite_alternative, gap, native_lp, deviance = _conditional_evidence(
                     catalog, original, j, phi, low, high, row["conditional_map"], bundle.native_calls[i, j])
-                _require_fields(row, dict(top_two_gap=gap, native_call_log_probability=native_lp,
-                    profile_deviance=deviance), "Independent conditional evidence",
+                _require_fields(row, dict(top_two_gap=gap, native_call_log_probability=native_lp), "Independent conditional evidence",
                     atol=max(1e-12, 16*np.finfo(float).eps*catalog.total_counts[original, j]))
+                _require_fields(row, dict(profile_deviance=deviance), "Independent profile deviance", atol=0.)
                 actual_probabilities = np.asarray(row["conditional_probabilities"], float)
                 if (actual_probabilities.shape != conditional.shape or not np.isfinite(actual_probabilities).all()
                         or np.any(actual_probabilities < 0) or not np.isclose(actual_probabilities.sum(), 1., rtol=0, atol=1e-12)):
@@ -285,14 +318,20 @@ def validate_assignment_result(bundle, result):
                     assigned_multiplicity=np.nan,
                     call_log_probability=np.nan, top_two_gap=np.nan, has_second_component=None,
                     multiplicity_tie=None, conditional_concentrated=None, multiplicity_status=expected_status,
-                    native_call_log_probability=np.nan, profile_deviance=np.nan), "Undefined multiplicity")
+                    native_call_log_probability=np.nan, profile_deviance=np.inf if informative[j] else np.nan), "Undefined multiplicity")
+                deviance = np.inf if informative[j] else np.nan
+            # The independently verified published value is the scoring value.
+            # Distinct stable formulas can differ by one bit at an exact cutoff;
+            # apply the strict gate to this canonical value, without widening
+            # the scientific threshold. atol=0 above still distinguishes zero
+            # from an adjacent positive discrepancy.
             residuals.append(float(row["profile_deviance"]))
         fit_pass = False
         if defined:
             screen = summarize_profile_deviance(np.asarray(residuals), informative, bundle.thresholds.screen, axis=0)
             fit_pass = bool(screen["descriptive_pass"])
-            _require_fields(record, dict(mean_profile_deviance=screen["mean_profile_deviance"],
-                outlier_count=int(screen["outlier_count"]), outlier_fraction=screen["outlier_fraction"],
+            _require_fields(record, dict(mean_profile_deviance=screen["mean_profile_deviance"]), "Mean profile deviance", atol=0.)
+            _require_fields(record, dict(outlier_count=int(screen["outlier_count"]), outlier_fraction=screen["outlier_fraction"],
                 mean_gate_pass=bool(screen["mean_profile_deviance"] <= bundle.thresholds.screen.mean_deviance_max),
                 outlier_gate_pass=bool(screen["outlier_fraction"] <= bundle.thresholds.screen.outlier_fraction_max)), "Descriptive screen")
         status = assignment_decision(expected, bool(catalog.eligible[original].any()), count, fit_pass,

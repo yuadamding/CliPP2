@@ -18,7 +18,8 @@ import traceback
 
 import numpy as np
 
-from CliPP2.assignment import AssignmentBundle, assign_mutations, confidence_passes, saturated_log_mass
+from CliPP2.assignment import AssignmentBundle, assign_mutations, confidence_passes
+from CliPP2.screening import profile_deviance_from_diagnostics
 from CliPP2.config import WorkflowConfig
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
 from CliPP2.kernel.backend import NativeBackend
@@ -97,7 +98,7 @@ def contributor_density_diagnostics(history, frame, config, *, densities=(0, 1, 
         diagnostic = backend.component_diagnostics(phi)
     if np.isin(diagnostic['status'], (2, 3)).any():
         raise ArithmeticError('Native source diagnostics failed')
-    residual = np.maximum(0., 2*(saturated_log_mass(data.alt, data.depth)-diagnostic['max_component_log_mass']))
+    residual = profile_deviance_from_diagnostics(data, phi, diagnostic)
     confidence = confidence_passes(diagnostic['map_log_probability'], config.contributor_probability_min,
         diagnostic['has_second'] & np.isfinite(diagnostic['top_two_gap']))
     qualified = (data.observed & catalog.mapping_genuine[positions] & catalog.eligible[positions]

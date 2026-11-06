@@ -167,7 +167,7 @@ def check_assignment_decisions(directory):
     assert row["status"] == "unresolved_fit" and row["posterior"] == 1.
     assert row["mean_profile_deviance"] < 5. and row["outlier_fraction"] == .1
     assert row["second_best_label"] is None and pd.isna(row["log_score_margin"]) and row["entropy"] == 0.
-    assert row["fit_status"] == "not_tested" and row["reassessment_status"] == "unresolved"
+    assert row["fit_status"] == "not_tested" and row["reassessment_status"] == "not_applicable"
     exact = write_catalog(directory / "ties.tsv", [[25]], 100, 1, minor=1)
     for labels in ((5, 0), (0, 5)):
         tied = fixture_reference(labels, exact.region_ids, [[.5], [.5]], clonal_label=None)

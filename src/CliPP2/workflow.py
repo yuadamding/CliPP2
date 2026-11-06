@@ -11,7 +11,7 @@ from collections.abc import Mapping
 import numpy as np
 
 from .assignment import (AssignmentBundle, AssignmentReference,
-                         assign_mutations, confidence_passes, saturated_log_mass)
+                         assign_mutations, confidence_passes)
 from .config import PROTOCOL_VERSION, WorkflowConfig
 from ._version import __version__
 from .io.data import (ImmutableArrayRecord, MultiplicityBounds, content_hash, freeze_record as _freeze,
@@ -266,15 +266,14 @@ def _diagnostics_many(catalog, ids, coordinates, bounds, config, calls=None):
     """Reuse prepared observations and one backend for all coordinate screens."""
     observation = prepare_prediction(catalog, ids, bounds, device=config.fit.device,
                                      cpu_threads=config.fit.cpu_threads)
-    sat = saturated_log_mass(observation.alt, observation.depth)
+    from .screening import profile_deviance_from_diagnostics
     diagnostics = []
     with NativeBackend(observation, cpu_threads=config.fit.cpu_threads) as backend:
         for phi in coordinates:
             diagnostic = backend.component_diagnostics(phi, accepted_calls=calls)
             if np.any((diagnostic["status"] == 2) | (diagnostic["status"] == 3)):
                 raise NativeExecutionError("Workflow component diagnostics failed")
-            diagnostic["profile_deviance"] = np.where(observation.observed,
-                np.maximum(0., 2 * (sat - diagnostic["max_component_log_mass"])), np.nan)
+            diagnostic["profile_deviance"] = profile_deviance_from_diagnostics(observation, phi, diagnostic)
             diagnostics.append(diagnostic)
     return diagnostics, observation
 
@@ -297,8 +296,9 @@ def qualify_contributors(catalog, fit, config, *, mutation_ids=None):
     calls, native_phi = fit.multiplicities[selected], fit.centers[fit.labels[selected]]
     native, observation = _diagnostics(catalog, ids, native_phi, support, config, calls)
     original_bounds = catalog.default_bounds().subset(ids, catalog.region_ids)
-    same_support = (np.array_equal(support.lower, original_bounds.lower)
-                    and np.array_equal(support.upper, original_bounds.upper))
+    original_lower, original_upper = original_bounds.for_data(observation.data)
+    same_support = (np.array_equal(observation.multiplicity_min, original_lower)
+                    and np.array_equal(observation.multiplicity_max, original_upper))
     original = native if same_support else _diagnostics(catalog, ids, native_phi,
                                                        original_bounds, config, calls)[0]
     positions = {mutation: i for i, mutation in enumerate(catalog.mutation_ids)}
@@ -360,8 +360,9 @@ def classify_groups(catalog, fit, config):
     coordinates = (native_phi, np.ones_like(native_phi))
     native, observation = _diagnostics_many(catalog, fit.mutation_ids, coordinates, fit.support, config)
     original_bounds = catalog.default_bounds().subset(fit.mutation_ids, catalog.region_ids)
-    same_support = (np.array_equal(fit.support.lower, original_bounds.lower)
-                    and np.array_equal(fit.support.upper, original_bounds.upper))
+    original_lower, original_upper = original_bounds.for_data(observation.data)
+    same_support = (np.array_equal(observation.multiplicity_min, original_lower)
+                    and np.array_equal(observation.multiplicity_max, original_upper))
     original = native if same_support else _diagnostics_many(catalog, fit.mutation_ids,
         coordinates, original_bounds, config)[0]
     diagnostics = dict(native=native[0], all_one=native[1],

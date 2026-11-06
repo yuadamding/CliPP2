@@ -32,7 +32,7 @@ def main(argv=None):
     qualify.add_argument("--native-timeout", type=float, default=180.)
     qualify.add_argument("--skip-native", action="store_true")
     qualify.add_argument("--reference-match-atol", type=float, default=None,
-        help="Qualification only: optional per-region center tolerance for one-to-one reference recall; default unassessed")
+        help="Qualification only: optional full-vector L2 tolerance for one-to-one reference recall; default unassessed")
     materialize = sub.add_parser("materialize", help="Generate all physical truth and prescribed input catalogs without fitting")
     materialize.add_argument("--cohort-settings", type=Path, default=Path("CliPP2_phylogeny_cohort_settings.json"))
     materialize.add_argument("--outdir", type=Path, required=True)

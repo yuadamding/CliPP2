@@ -68,6 +68,8 @@ def _load_evidence(root, cell):
     if job.get("cohort_content_id") is not None and manifest.get("cohort_content_id") != job["cohort_content_id"]:
         raise ValueError("Preserved physical history belongs to a different cohort content")
     history = History.from_dict(_read(directory / "history.json"))
+    if job.get("cohort_content_id") is not None and history.metadata.get("cohort_content_id") != job["cohort_content_id"]:
+        raise ValueError("Preserved truth belongs to a different cohort content")
     if history.family != job["family"] or history.metadata.get("seed") != job["history_seed"]:
         raise ValueError("Preserved truth does not match the job's family and physical history seed")
     if job.get("cohort_settings") and history.history_id != job.get("source_history_id", job["history_id"]):
@@ -77,6 +79,8 @@ def _load_evidence(root, cell):
             dims["mutations"], dims["regions"], dims["segments"]):
         raise ValueError("Preserved history dimensions differ from the job")
     catalog = load_original_catalog(attempt / "input_catalog.tsv")
+    if job.get("cohort_content_id") is not None and catalog.metadata.get("cohort_content_id") != job["cohort_content_id"]:
+        raise ValueError("Preserved input catalog belongs to a different cohort content")
     if catalog.tumor_id != job["cell_id"]:
         raise ValueError("Preserved input catalog belongs to another cell")
     acquisition = _read(attempt / "acquisition.json")

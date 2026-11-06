@@ -386,6 +386,15 @@ def _offline_report_check(root, history, job):
     (fixture / "histories" / job["history_id"] / "history.json").unlink()
     with patch("CliPP2.simulation.study._history", side_effect=AssertionError("missing truth regenerated")):
         assert reevaluate_cell(fixture, cell, config)["status"] == "unavailable_derived_evidence"
+    history.write_truth(fixture / "histories" / job["history_id"])
+    bound_cell = deepcopy(cell)
+    bound_cell["job"]["cohort_content_id"] = "expected_cohort"
+    (attempt / "job.json").write_text(json.dumps(bound_cell["job"]))
+    manifest_path = fixture / "histories" / job["history_id"] / "history_manifest.json"
+    bound_manifest = dict(read_json(manifest_path), cohort_content_id="expected_cohort")
+    manifest_path.write_text(json.dumps(bound_manifest))
+    invalid = reevaluate_cell(fixture, bound_cell, config)
+    assert invalid["status"] == "unavailable_derived_evidence" and "truth belongs" in invalid["error"]["message"]
 
 
 def _structured_failure_checks(root):

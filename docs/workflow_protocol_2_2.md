@@ -44,6 +44,20 @@ A confidence threshold of one rejects any finite competing likelihood, even when
 the displayed probability rounds to one. Native fits retain mandatory membership
 audits and independent numerical verification; these do not certify global optimality.
 
+Version 1.2.2 computes profile deviance directly at the native conditional MAP
+probability with a stable binomial deviance formula. Exactly saturated components
+have zero deviance; adjacent representable probabilities retain positive loss.
+No small-value threshold is applied. This can change contributor or screen
+decisions at zero cutoffs; offline evaluation of old results preserves their
+original inference decisions. Diagnostic reuse compares effective numerical
+support after excluded pairs have been projected to inert endpoints.
+
+The three reassessment outcomes (`retained_clonal`, `reassigned`, `unresolved`)
+apply to workflow Stage 1/2 targets with a designated clonal baseline. Generic
+fixed-reference requests use `not_applicable`; their `baseline_changed` remains
+available for accepted assignments. Errors during cap qualification, construction,
+or publication belong to Stage 2 and preserve Stage 1 acceptance.
+
 Strict workflow evidence requires genuine, unambiguous single-state CN. Missing
 or excluded observations contribute no read evidence. Normal CN must be supplied,
 or the plan must explicitly select `"normal_cn_policy": "diploid"` for assumed
@@ -78,7 +92,7 @@ applicable; schema names alone do not establish compatibility:
 | Accepted biological input | `clipp2.accepted-biological-input.v2` |
 | Accepted state / fit | `clipp2.accepted-state.v3` / `clipp2.accepted-fit.v3` |
 | Producer / replay compatibility | `clipp2.fit-producer.v2` / `clipp2.fit-compatibility.v2` |
-| Assignment bundle / result | `clipp2.assignment.bundle.v3` / `clipp2.assignment.result.v3` |
+| Assignment bundle / result | `clipp2.assignment.bundle.v3` / `clipp2.assignment.result.v4` |
 | Workflow plan / receipt | `clipp2.workflow.plan.v3` / `clipp2.workflow.v3` |
 
 Original catalogs retain their v3 schema. Paired or missing-origin records are
@@ -96,6 +110,10 @@ External execution provenance is optional and explicit: set plan/API
 `run_manifest_id` or `CLIPP2_RUN_MANIFEST_ID`. A supplied `run_build_manifest`
 retains the external build record. Originating and current replay/assignment
 links remain distinct; absent external provenance is explicitly unbound.
+Current links resolve from an explicit argument, then the current environment,
+then null; assignment never adopts a bundle's historical link. Producer replay
+requires every original fit configuration field and structurally valid native
+and continuation routes even when external build provenance is absent.
 Inference does not scan or snapshot source directories or gather an environment
 manifest. File-byte checksums are absent; biological/content identities and
 native build compatibility checks remain.
@@ -163,8 +181,8 @@ unchanged `F`, whole-population membership errors, and routing coverage.
 Continuous reference-center L2 and maximum-coordinate errors are always reported.
 
 `--reference-match-atol` defaults to `None`: binary reference recovery/availability
-is then null and explicitly unassessed. A supplied tolerance uses maximum absolute
-coordinate error and one-to-one matching, so one candidate cannot recover several
+is then null and explicitly unassessed. A supplied tolerance uses unnormalized full-vector L2
+error and one-to-one matching, so one candidate cannot recover several
 true groups. Member overlap measures partition agreement, not center recovery.
 `--compare-stage-two-support` adds a separate offline capped/full-support comparison;
 it never adds a production fit. Small synthetic qualification does not establish
