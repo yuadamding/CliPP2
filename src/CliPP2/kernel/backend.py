@@ -324,15 +324,6 @@ class NativeBackend:
         self._check(self.lib.CliPP2BackendGetDiagnostics(self.context, ct.byref(result)))
         return result.prepared_bytes + result.cache_bytes
 
-    def release_optional_cache(self):
-        """Explicitly release reusable read plans without invalidating live leases."""
-        self._require_open()
-        if self.kind == "cpu":
-            self._check(self.lib.CliPP2ReleaseProbabilityCache(self.context))
-        else:
-            self._check(self.lib.CliPP2ReleaseCUDAOptionalCache(self.context))
-        return self.native_host_bytes
-
     def _require_open(self):
         if not getattr(self, "context", None):
             raise NativeExecutionError("Native backend context is closed")
@@ -603,26 +594,6 @@ class NativeBackend:
         result["refits"] = self._counter_diagnostics("CliPP2CUDAProbabilityRefitDiagnostics",
                         ("reused_tasks", "reused_objective_calls", "basis_components", "row_evaluations"))
         return result
-
-    def probability_shape_reuse_diagnostics(self):
-        self._require_open()
-        if self.kind != "cuda":
-            raise ValueError("Device probability shape reuse requires CUDA")
-        return self._counter_diagnostics("CliPP2CUDAProbabilityShapeRefitDiagnostics",
-                        ("reused_tasks", "reused_objective_calls", "shapes_evaluated", "ordered_rows_gathered"))
-
-    def import_joint_columns(self, log_columns):
-        """Explicit host-to-device boundary for independent numerical checks."""
-        self._require_open()
-        columns = np.asarray(log_columns, dtype=float)
-        if (self.kind != "cuda" or columns.ndim != 2 or columns.shape[0] != self.n
-                or not columns.shape[1] or np.isnan(columns).any() or np.isposinf(columns).any()):
-            raise ValueError("Expected nonempty N-by-q finite or -inf CUDA log columns")
-        columns = _array(columns.T)
-        handles = np.empty(len(columns), dtype=np.int64)
-        self._check(self.lib.CliPP2ImportJointColumns(
-            self.context, len(columns), _ptr(columns), _ptr(handles)))
-        return tuple(DeviceColumn(self, handle) for handle in handles)
 
     def _column_handles(self, columns):
         self._require_open()

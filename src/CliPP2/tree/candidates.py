@@ -108,19 +108,16 @@ class CandidateBank:
     normalize_provenance = staticmethod(_plain)
 
     def __init__(self, model, tree, *, progress=None, request_progress=None,
-                 weight_batch_size=1, device_proposals=False, retain_evidence=True, audit_progress=None):
+                 weight_batch_size=1, device_proposals=False, audit_progress=None):
         if type(weight_batch_size) is not int or weight_batch_size < 1:
             raise ValueError("weight_batch_size must be a positive integer")
         if type(device_proposals) is not bool:
             raise TypeError("device_proposals must be a boolean")
-        if type(retain_evidence) is not bool:
-            raise TypeError("retain_evidence must be a boolean")
-        self.retain_evidence = retain_evidence
         self.model, self.tree = model, tree
         self.progress = progress
         self.request_progress = request_progress
         self.audit_progress = audit_progress
-        self.candidates, self.general_rejections, self.attempt_records = [], [], []
+        self.candidates, self.general_rejections = [], []
         self.by_cuts, self.by_membership, self.ineligible = {}, {}, {}
         self.best_by_q, self.tree_by_q, self.best_overall = {}, {}, None
         self.membership_attempts = {}
@@ -314,17 +311,6 @@ class CandidateBank:
         provenance = _plain(provenance)
         attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
         outcome = _outcome_kind(fitted)
-        record = None
-        if self.retain_evidence:
-            record = {"membership_kind": membership[0],
-                      "cuts" if cuts is not None else "labels": list(cuts) if cuts is not None else labels.tolist(),
-                      "initial_centers_ccf": None if centers is None else centers.tolist(),
-                      "numerical_policy": self.numerical_policy, "provenance": provenance,
-                      "eligible": bool(fitted.eligible), "reason": fitted.reason,
-                      "outcome": outcome}
-            if outcome == "completed_ineligible":
-                record["completed_fit"] = candidate_record(Candidate(fitted))
-            self.attempt_records.append(record)
         self._attempts[attempt] = None
         if not fitted.eligible:
             rejection = {"cuts" if cuts is not None else "membership": list(cuts) if cuts is not None else membership,
@@ -380,8 +366,6 @@ class CandidateBank:
             self.duplicate_routes += 1
         self._attempts[attempt] = candidate
         self._store_outcome(attempt, outcome, fitted.reason, candidate.state_index)
-        if record is not None:
-            record["state_index"] = candidate.state_index
         index, key = (self.by_cuts, cuts) if cuts is not None else (self.by_membership, membership[1])
         previous = index.get(key)
         if previous is None or score_key(candidate) < score_key(previous):
@@ -413,14 +397,6 @@ class CandidateBank:
             raise ValueError("An exact refit attempt was committed twice")
         self._outcomes[key] = len(self._outcome_records)
         self._outcome_records.append(RefitAttempt(key, outcome, reason, state_index, fitted))
-
-    def refit_attempt_index(self, labels, initial_centers):
-        labels, centers = _canonical_inputs(labels, initial_centers, self.model.n, self.model.r)
-        key = (("general", labels.tobytes()),
-               None if centers is None else centers.tobytes(), self.numerical_policy)
-        if key not in self._outcomes:
-            raise ValueError("Required membership refit has no exact outcome record")
-        return self._outcomes[key]
 
     def consider_independent(self, requests):
         """Optional bounded batching; dependencies must remain outside this call.
@@ -509,45 +485,11 @@ class CandidateBank:
         flush()
         return results
 
-    def evidence(self, selected):
-        if not self.retain_evidence:
-            raise ValueError("Research evidence was not retained for this candidate bank")
-        return candidate_evidence(self.tree, self.candidates, selected, self.attempt_records)
-
     def compact_attempt_links(self):
-        """Share immutable membership keys, without retaining research records."""
+        """Bind every refit attempt to its retained state using immutable keys."""
         return tuple((key[0], candidate is not None,
                       None if candidate is None else candidate.state_index)
                      for key, candidate in self._attempts.items())
-
-
-def candidate_record(candidate):
-    """One explicit research-export record, never a numerical execution step."""
-    fit = candidate.fit
-    return {
-        "membership_kind": candidate.membership_kind,
-        "cuts" if candidate.cuts is not None else "labels":
-            list(candidate.cuts) if candidate.cuts is not None else fit.labels.tolist(),
-        "centers_ccf": fit.centers.tolist(), "weights": fit.weights.tolist(),
-        "conditional_log_likelihood": float(fit.conditional_log_likelihood),
-        "mixture_log_likelihood": float(fit.mixture_log_likelihood),
-        "complexity_penalty": float(fit.complexity_penalty), "score": float(fit.score),
-        "eligible": bool(fit.eligible), "reason": fit.reason,
-        "diagnostics": _plain(fit.diagnostics), "provenance": _plain(candidate.provenance),
-    }
-
-
-def candidate_evidence(tree, candidates, selected, attempts=()):
-    """JSON-ready replay payload; connected memberships never store N labels."""
-    states = [candidate_record(candidate) for candidate in candidates]
-    selected_index = next((i for i, candidate in enumerate(candidates) if candidate is selected), None)
-    if selected_index is None:
-        raise ValueError("Selected fitted state is absent from the candidate bank")
-    return {"version": 1, "tree": {"identity": tree.identity, "n": tree.n,
-            "edges": tree.edges.tolist(), "kind": tree.kind,
-            "mutation_ids": list(tree.mutation_ids)},
-            "selected_state_index": selected_index, "states": states,
-            "refit_attempts": _plain(attempts)}
 
 
 def _membership_size(tree, key):
@@ -624,74 +566,3 @@ def validate_candidate_bank(tree, candidates, selected, attempt_links=None):
     if selected is not min(candidates, key=score_key):
         raise ValueError("Selected fit is not the best complete-bank score and tie-break")
     return selected
-
-
-def evidence_attempt_links(tree, attempts, region_count):
-    """Decode optional research records into the same compact audit links."""
-    if not isinstance(attempts, (list, tuple)):
-        raise ValueError("Candidate evidence refit attempts must be a sequence")
-    links = []
-    for attempt in attempts:
-        key = _evidence_membership(tree, attempt).key
-        q = _membership_size(tree, key)
-        initial = attempt.get("initial_centers_ccf")
-        if initial is not None:
-            initial = np.asarray(initial, dtype=float)
-            if initial.shape != (q, region_count) or not np.isfinite(initial).all():
-                raise ValueError("Refit attempt has invalid initial centers")
-        if not attempt.get("eligible", False) and "state_index" in attempt:
-            raise ValueError("A rejected refit attempt cannot reference an eligible state")
-        links.append((key, attempt.get("eligible"), attempt.get("state_index")))
-    return tuple(links)
-
-
-def _evidence_membership(tree, item):
-    if item["membership_kind"] == "tree":
-        cuts = tuple(item["cuts"])
-        _membership_size(tree, ("tree", cuts))
-        return Membership(tree, cuts)
-    if item["membership_kind"] != "general":
-        raise ValueError("Unknown candidate membership kind")
-    return Membership(explicit_labels=np.asarray(item["labels"]))
-
-
-def replay_candidate_evidence(evidence):
-    """Explicit research decode followed by the ordinary retained-object audit."""
-    if evidence.get("version") != 1:
-        raise ValueError("Unknown candidate-evidence version")
-    record = evidence["tree"]
-    edges = (np.empty((0, 2), dtype=np.int64) if record["n"] == 1 and record["edges"] == []
-             else np.asarray(record["edges"]))
-    tree = FrozenTree(edges, record["n"], tuple(record["mutation_ids"]), record["kind"])
-    if tree.identity != record["identity"]:
-        raise ValueError("Candidate evidence tree identity mismatch")
-    candidates = []
-    # Only explicit decoding expands tree memberships; reuse them within replay.
-    partitions = {}
-    for index, item in enumerate(evidence["states"]):
-        membership = _evidence_membership(tree, item)
-        if membership.cuts is None:
-            labels = membership.labels
-        elif membership.cuts in partitions:
-            labels = partitions[membership.cuts]
-        else:
-            labels = partition_from_cuts(tree, membership.cuts)
-            partitions[membership.cuts] = labels
-        centers = np.asarray(item["centers_ccf"], dtype=float)
-        if centers.ndim != 2 or not all(centers.shape):
-            raise ValueError("Candidate evidence needs nonempty q-by-R centers")
-        canonical, aligned = _canonical_inputs(labels, centers, tree.n, centers.shape[1])
-        if not np.array_equal(canonical, labels) or not np.array_equal(aligned, centers):
-            raise ValueError("Candidate evidence must retain canonical aligned memberships")
-        fit = FitResult(membership, centers, np.asarray(item["weights"], dtype=float),
-                        item["conditional_log_likelihood"], item["mixture_log_likelihood"],
-                        item["complexity_penalty"], item["score"], item["eligible"],
-                        item["reason"], item["diagnostics"])
-        candidates.append(Candidate(fit, item["provenance"], index))
-    selected_index = evidence["selected_state_index"]
-    if type(selected_index) is not int or not 0 <= selected_index < len(candidates):
-        raise ValueError("Candidate evidence has no selected state")
-    attempts = evidence.get("refit_attempts", ())
-    links = evidence_attempt_links(tree, attempts, candidates[0].fit.centers.shape[1])
-    selected = validate_candidate_bank(tree, candidates, candidates[selected_index], links if attempts else None)
-    return selected, tuple(candidates)

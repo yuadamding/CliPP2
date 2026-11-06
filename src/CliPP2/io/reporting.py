@@ -14,8 +14,7 @@ from ..config import validate_audit_scope
 from ..kernel import ALGORITHM, SCORE_DEFINITION
 from ..kernel.model import FitResult
 from ..kernel.topology import canonical_partition, partition_from_cuts
-from ..tree.candidates import (CandidateBank, RefitAttempt, candidate_record, evidence_attempt_links,
-                               score_key, validate_candidate_bank)
+from ..tree.candidates import CandidateBank, RefitAttempt, score_key, validate_candidate_bank
 from ..tree.membership_audit import (AUDIT_POLICY, MembershipAudit, SingleMove,
                                      fitted_state_fingerprint)
 from ..tree.proposals import SCORE_ATOL, SCORE_RTOL
@@ -116,31 +115,10 @@ def independent_log_columns(model, centers):
 
 
 def _verify_retained_bank(model, result, score):
-    """Audit actual retained states; the optional research codec is not required."""
+    """Audit the retained states and their compact refit-attempt links."""
     links = getattr(result, 'attempt_links', None)
     if result.diagnostics.get('diagnostics_schema_version', 0) >= 2 and links is None:
         raise ValueError('Candidate bank is missing its compact refit-attempt links')
-    saved = result.diagnostics.get('candidate_evidence')
-    if saved is not None:
-        # An explicitly requested research export must still describe the current
-        # objects. Compare one record at a time, never rebuild a second bank.
-        tree = result.tree
-        expected_tree = {'identity': tree.identity, 'n': tree.n, 'edges': tree.edges.tolist(),
-                         'kind': tree.kind, 'mutation_ids': list(tree.mutation_ids)}
-        selected_index = next((i for i, value in enumerate(result.candidate_bank)
-                               if value is result.selected), None)
-        if (saved.get('version') != 1 or saved.get('tree') != expected_tree
-                or saved.get('selected_state_index') != selected_index
-                or len(saved.get('states', ())) != len(result.candidate_bank)
-                or any(record != candidate_record(candidate)
-                       for record, candidate in zip(saved['states'], result.candidate_bank))):
-            raise ValueError('Persisted candidate evidence disagrees with the retained bank')
-        attempts = saved.get('refit_attempts', ())
-        exported_links = evidence_attempt_links(tree, attempts, result.selected.fit.centers.shape[1])
-        if links is not None and links != exported_links:
-            raise ValueError('Persisted candidate evidence disagrees with retained attempt links')
-        if links is None and attempts:
-            links = exported_links
     retained = validate_candidate_bank(result.tree, result.candidate_bank, result.selected, links)
     if not np.isclose(retained.score, score, atol=1e-7, rtol=1e-10):
         raise ValueError('Selected fit is not the best complete-bank score')

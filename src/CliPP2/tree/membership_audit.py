@@ -4,7 +4,7 @@ The certificate belongs to an exact fitted state, not just a partition or score.
 No conditional-gain pruning or iteration limit can close this neighborhood.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import hashlib
 import json
 from time import perf_counter
@@ -202,8 +202,6 @@ def refine_memberships(model, bank, *, batch_size=1, audit_scope="all"):
                       "score_improvement": parent.score-current.score,
                       "meaningful_improvement": parent.score-current.score >
                           SCORE_ATOL+SCORE_RTOL*max(abs(parent.score), abs(current.score))}
-            if bank.retain_evidence:
-                record["audit"] = asdict(audit)
             passes.append(record)
             bank.compact_payloads()
             if current.state_index != parent.state_index:

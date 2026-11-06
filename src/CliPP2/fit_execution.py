@@ -18,7 +18,7 @@ from .tree.selection import fit_regions
 
 @dataclass(frozen=True)
 class FitExecution:
-    """Selected native state only; research candidates are explicitly opt-in."""
+    """Selected native state, published results, and their producer receipt."""
     fit: object
     mutation_ids: tuple
     region_ids: tuple
@@ -28,11 +28,10 @@ class FitExecution:
     support: MultiplicityBounds
     summary: dict
     producer_receipt: dict
-    candidates: tuple = ()
 
 
 def fit_prepared(data, outdir, config, *, multiplicity_support=None,
-                 progress_callback=None, retain_evidence=False, started=None, progress=None,
+                 progress_callback=None, started=None, progress=None,
                  run_manifest=None, run_manifest_id=None):
     """Fit, independently verify, and publish prepared ordinary/workflow data."""
     if type(config) is not FitConfig:
@@ -62,7 +61,7 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
         callback = (None if progress_callback is None else lambda record:
                     progress_callback(dict(record, elapsed_seconds=record['elapsed_seconds']+fit_offset)))
         result = fit_regions(model, config.max_clusters, progress_callback=callback,
-                             retain_evidence=retain_evidence, audit_scope=config.audit_scope)
+                             audit_scope=config.audit_scope)
         execution_record = model.execution_diagnostics()
         validate_fit_execution_receipt(asdict(config), execution_record, build=build)
         verification_start = perf_counter()
@@ -109,6 +108,6 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
             'original_support' if multiplicity_support is None else multiplicity_support.policy_id)
         return FitExecution(fit, model.mutation_ids, model.region_ids, readonly_array(order),
             readonly_array(labels), readonly_array(model.multiplicity(fit.centers[fit.labels])),
-            support, summary, receipt, tuple(result.candidate_bank) if retain_evidence else ())
+            support, summary, receipt)
     finally:
         model.backend.close()

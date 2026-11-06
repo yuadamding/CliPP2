@@ -129,14 +129,6 @@ class PreparedGroup:
     members: np.ndarray
     tasks: tuple
 
-    @property
-    def observed_members(self):
-        return tuple(task.rows for task in self.tasks)
-
-    @property
-    def support_counts(self):
-        return tuple(len(task.rows) for task in self.tasks)
-
 
 @dataclass(frozen=True)
 class JointColumnSet:
@@ -369,9 +361,6 @@ class RegionalModel:
                 | (grid[None, :] > self.upper[:, region, None])] = -np.inf
         return columns
 
-    def _fit_scalar(self, members, region):
-        return self._fit_coordinates([(members, region)])[0][0]
-
     def _prepared(self, key, make, counter):
         """Reuse immutable model-scoped preparation by its exact key."""
         cached = self._preparations.get(key)
@@ -537,12 +526,6 @@ class RegionalModel:
             raise ValueError("Centers must be finite nonempty q by R CCFs")
         return centers
 
-    def assignment_admissibility(self, centers):
-        """N-by-q closed-box assignments, including regions without reads."""
-        centers = self._validate_centers(centers)
-        return ((centers[None, :, :] >= self.lower[:, None, :])
-                & (centers[None, :, :] <= self.upper[:, None, :])).all(axis=2)
-
     def log_likelihood_columns(self, centers):
         return self.joint_column_set(centers).materialize()
 
@@ -616,10 +599,6 @@ class RegionalModel:
             columns.append(column)
         return JointColumnSet(tuple(columns), tuple(center.tobytes() for center in centers), self.identity,
                               (self.backend.policy, self.backend.identity))
-
-    def clear_weight_cache(self):
-        """Release only completed weight fits; keep lower caches and counters."""
-        self._weight_results.clear()
 
     def _weight_result(self, columns, initial_counts, matrix=None, progress_callback=None):
         """Reuse an exact ordered problem, never a partition or device handle.

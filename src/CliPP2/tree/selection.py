@@ -326,12 +326,11 @@ def _tree_frontier(candidates):
 
 
 def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, progress_callback=None,
-                retain_evidence=False, audit_scope=DEFAULT_AUDIT_SCOPE):
+                audit_scope=DEFAULT_AUDIT_SCOPE):
     """Bound tree exploration, then certify the requested exact-state winners.
 
     Truth is deliberately absent. Every R>=1 uses this same forest continuation,
     conditional refitter, candidate registry and complete single-move final audit.
-    JSON replay evidence is an explicit research export, not routine fitting.
     """
     from ..kernel.solver import generate_candidates
     from .progress import ProgressReporter
@@ -340,8 +339,6 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     validate_audit_scope(audit_scope)
     weight_batch_size = 32 if device_proposals else 1
     continuation_batch_size = 4 if device_proposals else 1
-    if type(retain_evidence) is not bool:
-        raise TypeError("retain_evidence must be a boolean")
     progress = None if progress_callback is None else ProgressReporter(model, progress_callback)
 
     total_started = perf_counter()
@@ -386,7 +383,6 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
         progress.start_phase("candidate_search")
     bank_options = {} if weight_batch_size == 1 and not device_proposals else {
         "weight_batch_size": weight_batch_size, "device_proposals": device_proposals}
-    bank_options["retain_evidence"] = retain_evidence
     bank = (_CandidateBank(model, tree, **bank_options) if progress is None else
             _CandidateBank(model, tree, progress=progress.completed_candidate,
                            request_progress=progress.completed_operation,
@@ -539,11 +535,5 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
         "selection": "minimum_over_complete_eligible_scored_bank",
         "global_optimality_certified": False,
     }
-    if retain_evidence:
-        diagnostics["candidate_evidence"] = bank.evidence(selected)
     return TreeFit(selected, bank.candidates, tree, np.asarray(pilot), diagnostics,
                    bank.compact_attempt_links(), tuple(bank._outcome_records), terminal_audits, audit_scope)
-
-
-# Historical import name, not an alternative estimator.
-fit_tree = fit_regions

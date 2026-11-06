@@ -227,10 +227,6 @@ class FrozenTree(ImmutableArrayRecord):
             object.__setattr__(self, name, readonly_array(value, dtype=np.int64))
 
     @property
-    def n_nodes(self):
-        return self.n
-
-    @property
     def identity(self):
         digest = hashlib.sha256()
         digest.update(self.kind.encode())
@@ -378,14 +374,3 @@ def project_cuts(tree, x, k):
     nonzero = np.flatnonzero(scores > 0)
     chosen = nonzero[np.argsort(-scores[nonzero], kind="stable")[: k - 1]]
     return np.sort(chosen)
-
-
-def topology_diagnostics(tree, truth_labels):
-    """Offline truth-only fragmentation audit; never used to fit the tree."""
-    labels = np.asarray(truth_labels)
-    if labels.shape != (tree.n,):
-        raise ValueError("Truth labels must match the frozen mutation population")
-    q = len(np.unique(labels))
-    q_tree = 1 + int(np.count_nonzero(labels[tree.edges[:, 0]] != labels[tree.edges[:, 1]]))
-    return {"true_clusters": q, "tree_components": q_tree, "fragmentation": q_tree - q,
-            "representable": q_tree == q, "tree_identity": tree.identity}

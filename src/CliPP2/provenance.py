@@ -154,11 +154,10 @@ def _validate_build_record(record):
         raise ValueError("Run/build record lacks original protocol, implementation, or native build identity")
 
 
-def prepare_run_manifest(catalog, output=None, supplied=None, *, run_manifest_id=None):
+def prepare_run_manifest(catalog, *, supplied=None, run_manifest_id=None):
     """Retain an external record/link and bind this input without gathering code.
 
-    ``output`` is retained as a compatibility argument; this function writes no
-    files. None records explicitly unbound execution, rather than inventing a
+    This function writes no files. None records explicitly unbound execution, rather than inventing a
     source/build identity. Launchers may supply CLIPP2_RUN_BUILD_MANIFEST and
     CLIPP2_RUN_MANIFEST_ID once for a cohort. Native library compatibility remains
     the responsibility of the ordinary backend checks.

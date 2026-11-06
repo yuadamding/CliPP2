@@ -41,13 +41,6 @@ def fit_resident_weights(backend, problems, initial_weights=None, *,
         'CliPP2ResidentWeights', progress_callback, cancelled, telemetry)
 
 
-def _qualify_resident_graph_weights(backend, problems, initial_weights=None, *,
-                                    progress_callback=None, cancelled=None, telemetry=None):
-    """Private same-input schedule comparison; never used by fitting dispatch."""
-    return _fit_resident_weights(backend, problems, initial_weights,
-        'CliPP2QualifyResidentGraphWeights', progress_callback, cancelled, telemetry)
-
-
 def _fit_resident_weights(backend, problems, initial_weights, symbol,
                           progress_callback, cancelled, telemetry):
     if backend.kind != 'cuda':

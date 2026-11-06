@@ -31,7 +31,7 @@ class LocalCopyNumberState:
     allele_b_cn: int
 
 
-# The complete model-defining schema is the header of exampleTumor1.tsv.
+# The canonical input schema is documented in README.md.
 # Writers emit these first, followed by any inert provenance columns.
 SCHEMA_COLUMNS = (
     "mutation_id",
@@ -681,7 +681,6 @@ def load_tumor_txt(
     *,
     eps: float = 1e-6,
     max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
-    initialize: bool = False,
 ) -> TumorData:
     """Load a canonical TSV or a single/joint regional directory, without fits.
 
@@ -689,15 +688,9 @@ def load_tumor_txt(
     excluded in every region are removed; pair exclusions remain in the report.
     Full raw provenance is retained only by the explicit load_original_catalog API.
     Masked counts/CN are neutral internal placeholders, not imputations. The
-    retained initialize=False keyword is compatibility-only; pooled numerical
-    initialization belongs to RegionalModel.pilots(), not input preprocessing.
+    numerical initialization belongs to RegionalModel.pilots(), not input preprocessing.
     """
 
-    if initialize is not False:
-        raise ValueError(
-            "load_tumor_txt is preprocessing-only; initialize=True is no longer "
-            "supported. Use RegionalModel.pilots() for numerical initialization."
-        )
     epsilon = float(eps)
     if not np.isfinite(epsilon) or not 0.0 < epsilon < 0.5:
         raise ValueError("eps must be finite and lie strictly in (0, 0.5).")
