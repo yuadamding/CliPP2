@@ -15,11 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = [
-    "build>=1.2",
-    "pytest>=8",
-    "ruff>=0.12",
-]
+dev = ["ruff>=0.12"]
 
 [project.scripts]
 clipp2 = "CliPP2.cli:main"
@@ -31,7 +27,7 @@ packages = [
     "CliPP2.tree",
     "CliPP2.kernel",
 ]
-package-dir = { CliPP2 = "." }
+package-dir = { "" = "src" }
 include-package-data = false
 
 [tool.setuptools.dynamic]

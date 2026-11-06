@@ -11,20 +11,17 @@ from setuptools.command.build_py import build_py
 from setuptools.command.build_ext import build_ext
 
 
-# Loading this stdlib-only file directly must not import CliPP2 or Torch.
-source_helpers = run_path(str(Path(__file__).with_name("_source.py")))
+root = Path(__file__).resolve().parent
+package_source = Path("src/CliPP2")
+# Loading this stdlib-only file directly must not import the inference stack.
+source_helpers = run_path(str(root / package_source / "_source.py"))
 source_fingerprint = source_helpers["source_fingerprint"]
 git_source_identity = source_helpers["git_source_identity"]
 
 
 class BuildPy(build_py):
-    def find_package_modules(self, package, package_dir):
-        return [module for module in super().find_package_modules(package, package_dir)
-                if module[1] != "setup"]
-
     def run(self):
-        source = Path(__file__).resolve().parent
-        commit, dirty = git_source_identity(source)
+        commit, dirty = git_source_identity(root)
         super().run()
         package = Path(self.build_lib) / "CliPP2"
         record = {"schema_version": 1, "commit": commit, "dirty": dirty,
@@ -61,11 +58,10 @@ class BuildExt(build_ext):
         subprocess.run(command, check=True)
 
 
-root = Path(__file__).resolve().parent
-build_helpers = run_path(str(root / "kernel/build_identity.py"))
+build_helpers = run_path(str(root / package_source / "kernel/build_identity.py"))
 backend_identity = build_helpers["backend_identity"]
 backend_sources = build_helpers["backend_sources"]
-native_inputs = list(build_helpers["NATIVE_SOURCES"])
+native_inputs = [str(package_source / name) for name in build_helpers["NATIVE_SOURCES"]]
 extensions = [Extension(
     "CliPP2.kernel._native", sources=[name for name in native_inputs if name.endswith(".cpp")],
     depends=native_inputs, language="c++",
@@ -75,7 +71,8 @@ extensions = [Extension(
 )]
 openmp = ["-fopenmp"] if os.environ.get("CLIPP2_OPENMP") == "1" else []
 extensions.append(Extension(
-    "CliPP2.kernel._native_cpu", sources=["kernel/csrc/cpu/backend.cpp", "kernel/csrc/cpu/refit.cpp"],
+    "CliPP2.kernel._native_cpu", sources=[str(package_source / "kernel/csrc/cpu" / name)
+                                        for name in ("backend.cpp", "refit.cpp")],
     depends=[str(path.relative_to(root)) for path in backend_sources("cpu")], language="c++",
     define_macros=[("CLIPP2_BACKEND_BUILD_ID", '"' + backend_identity("cpu") + '"')],
     extra_compile_args=["-O3", "-std=c++17", "-fno-fast-math", "-ffp-contract=off", *openmp],
@@ -83,6 +80,6 @@ extensions.append(Extension(
 ))
 if os.environ.get("CLIPP2_BUILD_CUDA") == "1":
     extensions.append(Extension(
-        "CliPP2.kernel._native_cuda", sources=["kernel/csrc/cuda/backend.cu"],
+        "CliPP2.kernel._native_cuda", sources=[str(package_source / "kernel/csrc/cuda/backend.cu")],
         depends=[str(path.relative_to(root)) for path in backend_sources("cuda")], language="c++"))
 setup(cmdclass={"build_py": BuildPy, "build_ext": BuildExt}, ext_modules=extensions)
