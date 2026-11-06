@@ -19,7 +19,7 @@ from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
 from CliPP2.workflow import (AcceptedFit, _reconcile_final_memberships, _biological_hash, _fit_accepted,
                             _build_stage_three_inputs, classify_groups, qualify_contributors)
 
-from check_workflow import bundle, expect_value_error, external_build_record, thresholds, workflow_config, write_catalog
+from check_support import bundle, expect_value_error, external_build_record, thresholds, workflow_config, write_catalog
 
 
 def _blocked_count(directory):

@@ -18,7 +18,7 @@ from CliPP2.kernel.backend import NativeBackend
 from CliPP2.kernel.observations import prepare_prediction
 from CliPP2.workflow import _fit_accepted, classify_groups
 
-from check_workflow import expect_value_error, workflow_config
+from check_support import expect_value_error, workflow_config
 
 
 def _excluded_catalog(directory):
@@ -136,7 +136,7 @@ def run_input_checks(directory):
 
 def _single_state_contract(directory, catalog):
     from CliPP2.io.data import TumorData
-    from check_workflow import bundle, fixture_reference
+    from check_support import bundle, fixture_reference
     frame = pd.DataFrame([dict(row) for row in catalog.source_rows])
     for name, invalid in (("two_states", pd.concat([frame, frame.assign(cn_state_id="1")])),
                           ("mixed_fraction", frame.assign(cn_state_fraction=.5)),
@@ -197,7 +197,7 @@ def check_input_exclusion(directory):
     from CliPP2.io.assignment import load_assignment_bundle, save_assignment_bundle
     from CliPP2.kernel.backend import NativeBackend
     from CliPP2.workflow import _biological_hash
-    from check_workflow import bundle, fixture_reference
+    from check_support import bundle, fixture_reference
 
     directory = Path(directory)
     rows = [dict(mutation_id=f"e{i}", sample_id=f"r{j+1}", alt_count=80 if j == 2 else 25,

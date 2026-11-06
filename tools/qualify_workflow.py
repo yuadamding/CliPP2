@@ -29,7 +29,7 @@ from CliPP2.tree.selection import fit_regions
 from CliPP2.workflow import classify_groups
 from CliPP2.simulation.evaluation import reference_center_diagnostics
 
-from check_workflow import fixture_reference, run_checks, write_catalog, workflow_config
+from check_support import fixture_reference, write_catalog, workflow_config
 
 
 def partition_matching(truth, labels):
@@ -287,6 +287,7 @@ def end_to_end_case(directory, seed, thresholds, reference_match_atol=None):
 
 
 def main(argv=None):
+    from check_workflow import run_checks
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--seed", type=int, default=20261105)

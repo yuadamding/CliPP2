@@ -10,7 +10,7 @@ from CliPP2.io.data import MultiplicityBounds
 from CliPP2.kernel.backend import NativeBackend
 from CliPP2.kernel.observations import prepare_prediction
 
-from check_workflow import write_catalog
+from check_support import write_catalog
 
 
 def _single_state_contract_checks(directory):

@@ -28,16 +28,8 @@ from .design import (CONTRIBUTOR_GRID, POSTERIOR_GRID, jobs, roster_counts, reso
 
 def save_json(path, payload):
     """New-file publication: interrupted work never masquerades as completion."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + f".partial-{os.getpid()}")
-    try:
-        with temporary.open("x", encoding="utf-8") as stream:
-            json.dump(json_value(payload), stream, allow_nan=False, separators=(",", ":"))
-            stream.write("\n")
-        os.link(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    from CliPP2.io.publication import publish_json
+    return publish_json(path, json.dumps(json_value(payload), allow_nan=False, separators=(",", ":"))+"\n")
 
 
 def read_json(path):

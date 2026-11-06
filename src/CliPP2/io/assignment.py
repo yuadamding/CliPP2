@@ -16,6 +16,7 @@ from ..assignment import (AssignmentBundle, AssignmentResult, POLICY_FIELDS,
                           REGIONAL_BASE_FIELDS, REGIONAL_POLICY_FIELDS, REASSESSMENT_OUTCOMES)
 from .data import json_value as _json_value, content_hash
 from .reporting import MANIFEST_SCHEMA
+from .publication import publish_json
 from ..config import PROTOCOL_VERSION
 from ..screening import summarize_profile_deviance
 
@@ -29,15 +30,7 @@ def reserve_output(outdir):
 
 
 def _publish_json(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".clipp2-json-", dir=path.parent) as temporary:
-        staged = Path(temporary) / path.name
-        staged.write_text(json.dumps(_json_value(value), indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
-        # Parse before publication, then link without overwriting any previous attempt.
-        json.loads(staged.read_text(encoding="utf-8"))
-        os.link(staged, path)
-    return path
+    return publish_json(path, json.dumps(_json_value(value), indent=2, sort_keys=True, allow_nan=False) + "\n")
 
 
 def save_assignment_bundle(bundle, path):

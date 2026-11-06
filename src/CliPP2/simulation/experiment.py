@@ -10,8 +10,6 @@ from collections.abc import Mapping
 from dataclasses import asdict, replace
 import json
 import os
-from pathlib import Path
-import tempfile
 from time import perf_counter
 
 import numpy as np
@@ -23,6 +21,7 @@ from CliPP2.io.assignment import (load_accepted_fit, reserve_output, save_accept
                                  save_assignment_bundle, save_original_catalog, publish_assignment,
                                  write_supporting_table)
 from CliPP2.io.data import json_value, validate_workflow_mapping
+from CliPP2.io.publication import publish_json
 from CliPP2.io.tumor_txt import load_original_catalog
 from CliPP2.provenance import prepare_run_manifest, validate_replay_policy
 from CliPP2.workflow import (AcceptedFit, CONTRIBUTOR_COLUMNS, GROUP_COLUMNS,
@@ -33,13 +32,7 @@ from CliPP2.workflow import (AcceptedFit, CONTRIBUTOR_COLUMNS, GROUP_COLUMNS,
 
 def _save_json(path, payload):
     """Publish a new, compact scientific payload without overwriting prior work."""
-    path = Path(path)
-    with tempfile.TemporaryDirectory(prefix=".paired-json-", dir=path.parent) as temporary:
-        staged = Path(temporary) / path.name
-        staged.write_text(json.dumps(json_value(payload), separators=(",", ":"),
-                                    allow_nan=False) + "\n", encoding="utf-8")
-        json.loads(staged.read_text(encoding="utf-8"))
-        os.link(staged, path)
+    return publish_json(path, json.dumps(json_value(payload), separators=(",", ":"), allow_nan=False) + "\n")
 
 
 def _error(error, stage):
