@@ -928,8 +928,29 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
         filename = Path(figure).name
         if Path(filename).suffix.lower() == ".png":
             text.append(f"<figure><img src='{html.escape(filename)}'><figcaption>{html.escape(filename)}</figcaption></figure>")
+    fixed_total = []
+    for cell in cells:
+        job = cell.get("job", {})
+        condition = job.get("acquisition", {}).get("id", "")
+        if (job.get("phase") == "sensitivity" and condition.startswith("regions")
+                and condition.endswith("_fixed_total")
+                and condition[len("regions"):-len("_fixed_total")].isdigit()):
+            fixed_total.append(dict(cell_id=job["cell_id"], family=job["family"], condition=condition,
+                outcome={"complete": "completed", "execution_failed": "failed"}.get(cell.get("status"), "unknown")))
+    text.append("<h2>Optional execution evidence</h2>")
+    if fixed_total:
+        counts = {state: sum(row["outcome"] == state for row in fixed_total)
+                  for state in ("completed", "failed", "unknown")}
+        text.append(f"<p>Optional fixed-total-depth condition outcomes: {counts['completed']} completed, "
+            f"{counts['failed']} failed, {counts['unknown']} unknown retained cell records. "
+            "Cells without retained completion evidence have unknown execution state. "
+            "These descriptions do not aggregate optional-panel scientific results.</p>")
+        text.append(pd.DataFrame(fixed_total).to_html(index=False))
+    else:
+        text.append("<p>No retained completion evidence for optional fixed-total-depth conditions; "
+                    "their execution is unknown. Configuration flags alone do not establish execution.</p>")
     text.extend(["<h2>Reproducibility and limits</h2>",
         "<p>Per-cell outputs preserve native A/B/C fits, frozen combined references, B3/C3 assignments, exact cap and contributor records, and every original mutation's status. Physical histories and truth are stored separately from inference inputs. Source snapshots and native numerical receipts are retained; file-byte checksums are intentionally absent.</p>",
-        "<p>Core results do not imply a global clustering optimum or patient-population frequencies. Optional fixed-total-depth refitting, corrected-cap refitting, BAM simulation, and unavailable historical generators were not executed.</p>",
+        "<p>Core results do not imply a global clustering optimum or patient-population frequencies. Corrected-cap refitting, BAM simulation, and unavailable historical generators were not executed.</p>",
         "<p>Machine-readable results: <a href='aggregate.json'>aggregate.json</a>; <a href='tumor_metrics.tsv'>tumor metrics</a>; <a href='detailed_transitions.tsv'>detailed transitions</a>; <a href='bound_audit.tsv'>cap audit</a>; <a href='execution_ledger.tsv'>execution ledger</a>.</p>"])
     (directory / "comparison_report.html").write_text("\n".join(text), encoding="utf-8")

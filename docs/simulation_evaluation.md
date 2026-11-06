@@ -64,6 +64,40 @@ but unbound historical truth is `legacy_consistent_unbound`, reported only as
 unavailable. Operational execution/evaluation counts do not require biological
 truth. An arbitrary `truth_required: false` cannot bypass scientific qualification.
 
+## Operational accounting
+
+Full evaluation and fallback evaluation use the same retained execution facts.
+Removing biological truth can make correctness unknown; it does not change the
+established operational state of A, B/C, or B3/C3. These fields are separate:
+
+- `scientifically_applicable`: the analysis's scientific prerequisites are
+  established. An explicit scientific rejection sets this to zero.
+- `analysis_available`: a usable numerical result is retained. B/C availability
+  concerns the combined memberships and reference; B3/C3 availability requires
+  a complete returned target-decision axis.
+- `execution_failure`: an execution operation belonging to that analysis failed.
+  `analysis_failure` is an alias of this indicator, not the complement of
+  availability.
+- `execution_available`: retained evidence establishes that the analysis was
+  reached or its scientific applicability was assessed. An explicitly unexecuted
+  analysis, including one prevented by an upstream exception, has value zero.
+- `evaluation_available`: the scientific evaluation was derived. This can differ
+  between full evaluation and a placeholder with unavailable truth.
+
+| Retained C/C3 evidence | C available | C failure | C3 available | C3 failure | C3 applicable |
+|---|---:|---:|---:|---:|---:|
+| C complete; assignment fails | 1 | 0 | 0 | 1 | 1 |
+| C complete; assignment scored; publication fails | 1 | 0 | 1 | 1 | 1 |
+| Explicit rejection before Stage 3, without an exception | As established | 0 | 0 | 0 | 0 |
+
+Stage 2 fitting, accepted-fit publication, classification and reference freezing
+belong to B/C. Assignment, reconciliation and assignment publication belong to
+B3/C3. Missing execution facts or an unrecognized failure phase leave the affected
+quantities null; a retained output alone does not identify an unknown exception.
+An upstream exception does not become a downstream execution failure. Its explicit
+pre-decision evidence can still establish a whole-original empty decision population
+under the scoped-zero rules above.
+
 ## Detailed membership
 
 Frozen source-member purity still maps candidates to observable truth classes

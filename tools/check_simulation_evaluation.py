@@ -278,11 +278,31 @@ def _partial_failure_checks():
         def planned(value):
             return aggregate([value], planned_roster=[job], roster_complete=True, families=('S01',), bootstrap_replicates=0)
 
+        operational_cases = []
+
+        def compare_operations(value, label):
+            complete = evaluate(truth, catalog, value, truth_qualification='verified_history_binding')
+            incomplete = fallback(value)
+            for arm in ('A', 'B', 'C', 'B3', 'C3'):
+                for name in ('analysis_available', 'analysis_failure', 'execution_available',
+                             'execution_failure', 'scientifically_applicable'):
+                    assert metric(complete, name, arm) == metric(incomplete, name, arm), (label, name, arm)
+                assert metric(complete, 'evaluation_available', arm)['value'] == 1
+                assert metric(incomplete, 'evaluation_available', arm)['value'] == 0
+            operational_cases.append(label)
+            return complete, incomplete
+
         # 1. Full evidence keeps unchanged F's exact contribution after assignment failure.
         full = evaluate(truth, catalog, paired, truth_qualification='verified_history_binding')
         assert metric(full)['value'] == 8/14 and metric(full)['numerator'] == 8
         # 2. Removing truth cannot turn that retained contribution into an exact zero.
         missing = fallback(paired)
+        compare_operations(paired, 'assignment_failure')
+        for record in (full, missing):
+            assert metric(record, 'analysis_available', 'C')['value'] == 1
+            assert metric(record, 'analysis_failure', 'C')['value'] == 0
+            assert metric(record, 'execution_failure', 'C')['value'] == 0
+            assert metric(record, 'scientifically_applicable', 'C3')['value'] == 1
         assert metric(missing)['value'] is None and metric(missing)['truth_required'] is True
         assert metric(planned(missing))['planned_population_estimate'] is None
         assert metric(planned(missing))['planned_population_status'] == 'incomplete_evidence'
@@ -309,13 +329,31 @@ def _partial_failure_checks():
         absent['arms']['C'].pop('non_targets')
         assert metric(fallback(absent))['value'] is None
         paired_path.unlink()
-        assert metric(placeholder_for_cell(root, cell, None))['value'] is None
+        missing_payload = placeholder_for_cell(root, cell, None)
+        assert metric(missing_payload)['value'] is None
+        assert metric(missing_payload, 'analysis_available', 'C3')['value'] == 0
+        assert metric(missing_payload, 'execution_failure', 'C3')['value'] == 1
+        assert metric(missing_payload, 'execution_failure', 'C')['value'] == 0
+        for phase in ('assignment_publication', 'reconciliation'):
+            failed_without_payload = dict(cell, execution_failures=[dict(arm='C', failed_stage=phase)])
+            record = placeholder_for_cell(root, failed_without_payload, None)
+            assert metric(record, 'analysis_available', 'C3')['value'] is None
+            assert metric(record, 'execution_failure', 'C3')['value'] == 1
+        unexecuted = placeholder_for_cell(root, dict(job=job, status='not_executed'), None)
+        for arm in ('A', 'B', 'C', 'B3', 'C3'):
+            for name in ('analysis_available', 'execution_available', 'execution_failure'):
+                assert metric(unexecuted, name, arm)['value'] == 0
+        operational_cases.append('explicit_not_executed_and_assignment_failure_without_payload')
         # Early total failure can establish N later from retained catalog/acquisition.
         early = dict(cell, execution_failures=[dict(arm=None, failed_stage='stage_one')])
         early.pop('original_evaluable_count')
         recovered_denominator = placeholder_for_cell(root, early, None)
         assert recovered_denominator['original_evaluable_count'] == 14
         assert metric(recovered_denominator)['value'] == 0
+        assert metric(recovered_denominator, 'execution_failure', 'A')['value'] == 1
+        for arm in ('B', 'C', 'B3', 'C3'):
+            assert metric(recovered_denominator, 'execution_failure', arm)['value'] == 0
+            assert metric(recovered_denominator, 'execution_available', arm)['value'] == 0
         # Malformed returned target evidence cannot claim C3 analysis availability.
         for malformed in ({}, dict(assignments=[])):
             invalid = deepcopy(paired)
@@ -326,7 +364,59 @@ def _partial_failure_checks():
         publication_failure = deepcopy(paired)
         publication_failure['arms']['C'].update(assignment=original['arms']['C']['assignment'],
                                                 failed_stage='assignment_publication', assignment_status='scored')
-        assert metric(fallback(publication_failure), 'analysis_available', 'C3')['value'] == 1
+        for record in compare_operations(publication_failure, 'publication_failure_after_scoring'):
+            assert metric(record, 'analysis_available', 'C3')['value'] == 1
+            assert metric(record, 'execution_failure', 'C3')['value'] == 1
+            assert metric(record, 'execution_failure', 'C')['value'] == 0
+            assert metric(record, 'scientifically_applicable', 'C3')['value'] == 1
+        # Scientific rejection is inapplicable, without an execution exception.
+        rejected = deepcopy(original)
+        rejected.update(status='no_eligible_clonal_reference', g0_ids=[])
+        for arm in rejected['arms'].values():
+            arm.update(status='no_eligible_clonal_reference', combined_labels={}, reference=None,
+                       stage_two=None, targets=[], non_targets=[], assignment=None)
+        for record in compare_operations(rejected, 'scientific_rejection'):
+            for arm in ('B', 'C', 'B3', 'C3'):
+                assert metric(record, 'scientifically_applicable', arm)['value'] == 0
+                assert metric(record, 'execution_failure', arm)['value'] == 0
+        failed_before_stage_one = deepcopy(rejected)
+        failed_before_stage_one.update(status='failed', failed_stage='stage_one', stage_one=None)
+        for arm in failed_before_stage_one['arms'].values():
+            arm['status'] = 'unavailable_upstream'
+        for record in compare_operations(failed_before_stage_one, 'retained_upstream_failure'):
+            assert metric(record)['value'] == 0
+            for arm in ('B', 'C', 'B3', 'C3'):
+                assert metric(record, 'execution_failure', arm)['value'] == 0
+                assert metric(record, 'execution_available', arm)['value'] == 0
+        missing_root_status = deepcopy(original)
+        missing_root_status.pop('status')
+        missing_root_status['stage_one_status'] = 'accepted'
+        for record in compare_operations(missing_root_status, 'accepted_stage_one_unknown_later_operations'):
+            assert metric(record, 'analysis_available', 'A')['value'] == 1
+            assert metric(record, 'execution_failure', 'A')['value'] is None
+        # Retained output does not identify the phase of an otherwise unknown error.
+        unknown_phase = deepcopy(publication_failure)
+        unknown_phase['arms']['C']['failed_stage'] = 'unrecognized_operation'
+        for record in compare_operations(unknown_phase, 'unknown_failure_attribution'):
+            for arm in ('C', 'C3'):
+                assert metric(record, 'analysis_available', arm)['value'] == 1
+                assert metric(record, 'execution_failure', arm)['value'] is None
+        # Absent execution facts remain unknown in both derivations.
+        missing_state = deepcopy(original)
+        missing_state['arms']['C'] = {}
+        for record in compare_operations(missing_state, 'missing_execution_facts'):
+            for arm in ('C', 'C3'):
+                for name in ('analysis_available', 'execution_available', 'execution_failure'):
+                    assert metric(record, name, arm)['value'] is None
+        # Earlier B/C operations are distinct from the downstream assignment pass.
+        for phase in ('stage_two', 'stage_two_accepted_publication', 'classification', 'freeze_reference'):
+            stage_two_failure = deepcopy(original)
+            stage_two_failure['arms']['C'].update(status='failed', failed_stage=phase,
+                combined_labels={}, reference=None, targets=[], non_targets=[], assignment=None)
+            for record in compare_operations(stage_two_failure, phase):
+                assert metric(record, 'execution_failure', 'C')['value'] == 1
+                assert metric(record, 'execution_failure', 'C3')['value'] == 0
+                assert metric(record, 'execution_available', 'C3')['value'] == 0
         # 5. Downstream C3 failure does not erase completed B/B3 or C evidence.
         preserved = fallback(paired)
         for arm in ('B', 'B3', 'C'):
@@ -352,7 +442,8 @@ def _partial_failure_checks():
             missing_F_evidence_unknown=True, completed_upstream_availability_retained=True,
             success_plus_total_failure_mean=.5, all_unresolved_empty_population_zero=True,
             retained_accepted_targets_prevent_zero=True, recovered_denominator_preserves_total_failure_zero=True,
-            malformed_assignment_availability_unknown=True, retained_scored_payload_available=True, no_inference_calls=True)
+            malformed_assignment_availability_unknown=True, retained_scored_payload_available=True,
+            operational_truth_invariance_cases=operational_cases, no_inference_calls=True)
 
 
 def run_checks():

@@ -158,14 +158,14 @@ def unavailable_evaluation(job, status, *, evaluation_config, error=None,
     for arm in ("A", "B", "C", "B3", "C3"):
         state = arms.get(arm, {})
         arm_status = state.get("status", None if execution_state == "execution_failed" else execution_state)
-        failed = arm_status in ("failed", "execution_failed")
-        executed = None if arm_status is None else arm_status != "not_executed"
+        failed = state.get("execution_failure", None if arm_status is None else arm_status in ("failed", "execution_failed"))
+        executed = state.get("execution_available", None if arm_status is None else arm_status != "not_executed")
         scientifically_applicable = state.get("scientifically_applicable")
         available = state.get("available")
         if "available" not in state and (failed or arm_status == "not_executed"):
             available = False
-        for name, value in (("execution_available", executed), ("execution_failure", None if arm_status is None else failed),
-                            ("analysis_available", available), ("analysis_failure", None if arm_status is None else failed),
+        for name, value in (("execution_available", executed), ("execution_failure", failed),
+                            ("analysis_available", available), ("analysis_failure", failed),
                             ("evaluation_available", False), ("scientifically_applicable", scientifically_applicable)):
             metrics.append(dict(name=name, arm=arm, view="all_planned_cells", stratum="all",
                 value=None if value is None else float(value), numerator=None if value is None else int(value),
@@ -182,8 +182,10 @@ def unavailable_evaluation(job, status, *, evaluation_config, error=None,
                     status="known_no_decisions" if zero else "unknown_scientific_evidence",
                     population_scope="planned_population", truth_required=not zero))
         applicability.append(dict(arm=arm, available=available, status=arm_status or status, planned=True,
+                                  execution_available=executed, execution_failure=failed,
                                   scientifically_applicable=scientifically_applicable,
                                   scientific_rejection=bool(state.get("scientific_rejection")),
+                                  upstream_failure=bool(state.get("upstream_failure")),
                                   decision_population=state.get("decision_population")))
     return dict(schema="clipp2.simulation.evaluation.v3", evaluation_definition=definition,
         evaluation_config=normalize_evaluation_config(evaluation_config), truth_qualification=evidence_state,
@@ -245,9 +247,12 @@ def _retained_memberships(arm, original_ids):
 
 def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missing_truth_evidence", error=None):
     """Recover scoped decision evidence without inventing missing correctness."""
+    from .evaluation import _operational_states
     root, job = Path(root), cell["job"]
     count, evaluable, region_count = cell.get("original_evaluable_count"), None, None
-    arms, predecision_sources = {}, {}
+    arms, predecision_sources, execution = {}, {}, {"arms": {}}
+    if cell.get("status") == "not_executed":
+        execution["status"] = "not_executed"
     # An assignment exception only establishes missing target output. Unchanged
     # memberships may already exist; their whole-population contribution survives.
     for failure in cell.get("execution_failures", ()):
@@ -255,17 +260,22 @@ def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missi
         if arm is None and (stage == "stage_one" or
                 stage == "worker" and cell.get("execution_phase") == "before_inference"):
             affected, source = ("A", "B", "C", "B3", "C3"), "failure_before_stage_one"
+            execution.update(status="failed", failed_stage=stage)
         elif arm in ("B", "C") and stage == "stage_two":
             affected, source = (arm, arm+"3"), "failure_before_combined_memberships"
-        elif arm in ("B", "C") and stage == "assignment":
+        elif arm in ("B", "C") and stage in ("assignment", "reconciliation", "assignment_publication"):
             affected, source = (arm+"3",), None
         else:
             affected, source = (), None
+        if arm in ("B", "C"):
+            execution["arms"][arm] = dict(status="failed", failed_stage=stage)
         for name in affected:
             if source:
                 predecision_sources[name] = source
-            arms[name] = dict(status="failed", available=False,
+            arms[name] = dict(status="failed", available=False if source or stage == "assignment" else None,
                 decision_population=_decision_population(set(), count, None, source) if source else None)
+    for name, state in _operational_states(execution, arms).items():
+        arms[name] = dict(arms.get(name, {}), **state)
     try:
         attempt = _within(root, cell["attempt"])
         if _read(attempt / "job.json") != job:
@@ -293,9 +303,10 @@ def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missi
             raise ValueError("Paired evidence belongs to a different catalog")
         root_failed = paired.get("status") == "failed" and paired.get("stage_one") is None
         rejection = paired.get("status") in ("no_eligible_clonal_reference", "blocked")
-        arms["A"] = dict(status="failed" if root_failed else "complete", available=paired.get("stage_one") is not None,
-                         scientifically_applicable=True)
+        retained = {"A": dict(available=bool(paired.get("stage_one")) if "stage_one" in paired else None)}
         original_ids = set(catalog.mutation_ids)
+        if not isinstance(paired.get("arms", {}), Mapping):
+            raise TypeError("Preserved paired arms must be a JSON object")
         for name in ("B", "C"):
             arm = paired.get("arms", {}).get(name, {})
             if not isinstance(arm, Mapping):
@@ -317,11 +328,10 @@ def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missi
                 combined_population = _decision_population(set(), count, evaluable,
                     "failure_before_stage_one" if root_failed else "scientific_rejection_before_combined_memberships"
                     if rejected else "failure_before_combined_memberships")
-            # A frozen combined map remains a completed B/C result after C3 fails.
-            arms[name] = dict(status="complete" if combined_known and combined else state,
-                available=bool(combined) if combined_known else False if before_combined else None,
-                decision_population=combined_population, scientific_rejection=rejected,
-                scientifically_applicable=False if rejected else bool(combined) if combined_known else None)
+            reference = arm.get("reference")
+            retained[name] = dict(available=True if combined and reference else False if combined_known and not combined else None,
+                                 reference_available=bool(reference) if "reference" in arm else None)
+            arms[name] = dict(decision_population=combined_population)
             stage_three_population = None
             if fixed is not None and accepted_targets is not None:
                 stage_three_population = _decision_population(fixed | accepted_targets, count, evaluable,
@@ -330,11 +340,11 @@ def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missi
                 stage_three_population = combined_population
             returned = arm.get("assignment") is not None
             assignment_available = (True if returned and fixed is not None and accepted_targets is not None
-                else None if returned else False if before_combined or arm.get("assignment_status") == "failed"
-                or arm.get("failed_stage") == "assignment" else None)
-            arms[name+"3"] = dict(status=state, available=assignment_available,
-                decision_population=stage_three_population, scientific_rejection=rejected,
-                scientifically_applicable=False if rejected else bool(combined) if combined_known else None)
+                                    else None if returned or "assignment" not in arm else False)
+            retained[name+"3"] = dict(available=assignment_available)
+            arms[name+"3"] = dict(decision_population=stage_three_population)
+        for name, state in _operational_states(paired, retained).items():
+            arms[name] = dict(arms.get(name, {}), **state)
     except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile):
         pass  # Missing or inconsistent evidence cannot prove an empty population.
     value = unavailable_evaluation(job, "unavailable_derived_evidence", evaluation_config=evaluation_config,

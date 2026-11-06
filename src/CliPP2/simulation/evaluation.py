@@ -34,6 +34,80 @@ def metric_population_scope(name, view=""):
     return "planned_population" if name in PLANNED_METRIC_NAMES else "conditional_available_cases"
 
 
+def _operational_states(result, retained):
+    """Interpret validated retained results independently of biological truth.
+
+    ``retained`` supplies tri-state availability for A, B/C and B3/C3, plus
+    ``reference_available`` for B/C. Missing facts never imply a failed operation.
+    """
+    failures = {"failed", "execution_failed"}
+    rejections = {"blocked", "no_eligible_clonal_reference"}
+    combined_phases = {"stage_two", "stage_two_accepted_publication", "classification", "freeze_reference"}
+    assignment_phases = {"assignment", "reconciliation", "assignment_publication"}
+    root_status = result.get("status")
+    upstream_failed = root_status in failures
+    not_executed = root_status == "not_executed"
+    first_available = retained.get("A", {}).get("available")
+    if first_available is None and not_executed:
+        first_available = False
+    first_failed = True if upstream_failed else False if root_status in rejections | {"complete", "partial_failure", "not_executed"} else None
+    states = {}
+
+    def state(name, available, failed, applicable, status, *, upstream=False, rejected=False, executed=None):
+        if executed is None and (available is True or failed is True or rejected):
+            executed = True
+        states[name] = dict(arm=name, planned=True, available=available, status=status,
+            execution_available=executed, execution_failure=failed, scientifically_applicable=applicable,
+            scientific_rejection=rejected, upstream_failure=upstream)
+
+    first_executed = (True if first_available or upstream_failed or root_status in rejections | {"complete", "partial_failure"}
+                      else False if not_executed else None)
+    state("A", first_available, first_failed, True if first_executed else None,
+          "failed" if upstream_failed else "complete" if first_available else "not_executed" if not_executed else None,
+          executed=first_executed)
+    for name in ("B", "C"):
+        arm = result.get("arms", {}).get(name, {})
+        if not isinstance(arm, Mapping):
+            arm = {}
+        status, phase = arm.get("status"), arm.get("failed_stage")
+        rejected = root_status in rejections or status in rejections
+        available = retained.get(name, {}).get("available")
+        assigned = retained.get(name+"3", {}).get("available")
+        reference = retained.get(name, {}).get("reference_available")
+        own_failure = status in failures
+        assignment_failed = arm.get("assignment_status") == "failed"
+        if own_failure and phase in combined_phases:
+            combined_failure, final_failure = True, False
+        elif own_failure and phase in assignment_phases or assignment_failed:
+            combined_failure, final_failure = False, True
+        elif own_failure:
+            combined_failure = final_failure = None
+        elif rejected or status == "complete" or upstream_failed or not_executed:
+            combined_failure = final_failure = False
+        else:
+            combined_failure = final_failure = None
+        before_combined = upstream_failed or rejected or not_executed or (own_failure and phase in combined_phases)
+        if available is None and before_combined:
+            available = False
+        if assigned is None and before_combined:
+            assigned = False
+        combined_applicable = (False if rejected else True if available or result.get("g0_ids")
+                               or phase in combined_phases | assignment_phases else None)
+        final_applicable = (False if rejected else True if reference and available
+                            or phase in assignment_phases else None)
+        combined_executed = (True if available or own_failure or rejected or status == "complete"
+                             else False if upstream_failed or not_executed else None)
+        final_executed = (True if assigned or phase in assignment_phases or assignment_failed or rejected or status == "complete"
+                          else False if before_combined else None)
+        combined_status = ("failed" if combined_failure else "complete" if available else "not_executed" if not_executed else status)
+        final_status = ("failed" if final_failure else "complete" if assigned else "not_executed" if not_executed else status)
+        state(name, available, combined_failure, combined_applicable, combined_status,
+              upstream=upstream_failed, rejected=rejected, executed=combined_executed)
+        state(name+"3", assigned, final_failure, final_applicable, final_status,
+              upstream=upstream_failed or combined_failure is True, rejected=rejected, executed=final_executed)
+    return states
+
+
 
 def metric_truth_independent(record, row):
     """Operational evidence or a justified zero is independent of truth labels."""
@@ -59,6 +133,8 @@ def metric_truth_independent(record, row):
         and isinstance(denominator, (int, float)) and not isinstance(denominator, bool)
         and np.isfinite(denominator) and denominator > 0 and denominator == record.get("original_evaluable_count")
         and (established_failure or arm_state.get("scientific_rejection") is True
+             or arm_state.get("upstream_failure") is True and population.get("evidence") in
+                ("failure_before_stage_one", "failure_before_combined_memberships", "retained_combined_memberships")
              or population.get("evidence") == "retained_stage_three_memberships"))
 
 
@@ -661,9 +737,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     partition("A", first_labels, ids, "native")
     ccf("A", first_centers, "native_source")
     multiplicity("A", first_calls, "native_source", qualified)
-    stage_one_available = bool(result.get("stage_one"))
-    applicability.append(dict(arm="A", available=stage_one_available, status=result.get("status", "complete")
-                             if not stage_one_available else "complete", planned=True))
+    retained = {"A": dict(available=bool(result.get("stage_one")) if "stage_one" in result else None)}
     arms = result.get("arms", {})
     native_views, combined_views, final_views, arm_states = {}, {}, {}, {}
     for arm in ("B", "C"):
@@ -692,7 +766,8 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         available = bool(reference) and bool(combined)
         if status == "complete" and not reference:
             raise ValueError("Complete arm has no frozen reference")
-        applicability.append(dict(arm=arm, available=available, status=status, planned=True))
+        retained[arm] = dict(available=True if available else False if "combined_labels" in payload and not combined else None,
+                            reference_available=bool(reference) if "reference" in payload else None)
         partition(arm, second_labels, result.get("remainder_ids", ()), "native_remainder")
         partition(arm, combined, ids, "combined")
         native_centers = {m: np.asarray(value, float) for m, value in payload.get("native_centers", {}).items()}
@@ -733,10 +808,9 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         records = {row["mutation_id"]: row for row in assignment.get("assignments", ())} if assignment else {}
         stage = arm+"3"
         assignment_available = assignment is not None
-        applicability.append(dict(arm=stage, available=assignment_available,
-            status=payload.get("assignment_status", "complete" if assignment_available else status), planned=True))
         if assignment_available and set(records) != targets:
             raise ValueError("Assignment targets differ from the frozen target population")
+        retained[stage] = dict(available=assignment_available if "assignment" in payload else None)
         arm_mutation_start = len(mutation_rows)
         for row in payload.get("original_rows", ()):
             if row["mutation_id"] in non_targets and row.get("final_assignment_label") != combined[row["mutation_id"]]:
@@ -1054,16 +1128,17 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                    expected_kl=information_lookup[row["mutation_id"]]["expected_kl"],
                    target=row["role"] == "target", unchanged_F=row["role"] == "unchanged_non_target",
                    unavailable=row["status"] == "unavailable_analysis" or not arms.get(row["arm"][0], {}).get("reference"))
+    operational = _operational_states(result, retained)
+    applicability = [operational[arm] for arm in ("A", "B", "C", "B3", "C3")]
     for item in applicability:
-        metric("analysis_available", item["arm"], int(item["available"]), 1, view="all_planned_cells")
-        failed = any(word in item["status"].lower() for word in ("fail", "error", "timeout"))
-        metric("analysis_failure", item["arm"], int(failed), 1, view="all_planned_cells")
-        # This evaluator has retained numerical input/truth and derived every arm,
-        # including scientific rejections. Execution failure is a separate state.
-        metric("execution_available", item["arm"], 1, 1, view="all_planned_cells")
-        metric("execution_failure", item["arm"], int(failed), 1, view="all_planned_cells")
-        metric("evaluation_available", item["arm"], 1, 1, view="all_planned_cells")
-        metric("scientifically_applicable", item["arm"], int(item["available"]), 1, view="all_planned_cells")
+        for name, value in (("analysis_available", item["available"]), ("analysis_failure", item["execution_failure"]),
+                ("execution_available", item["execution_available"]), ("execution_failure", item["execution_failure"]),
+                ("evaluation_available", True), ("scientifically_applicable", item["scientifically_applicable"])):
+            if value is None:
+                metric(name, item["arm"], view="all_planned_cells", reason="unknown_execution_evidence")
+                metrics[-1]["denominator"] = 1
+            else:
+                metric(name, item["arm"], int(value), 1, view="all_planned_cells")
     curves = []
     for arm in ("B3", "C3"):
         state = arm_states[arm[0]]

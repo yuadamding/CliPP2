@@ -344,6 +344,56 @@ def _planned_report_check(root, contract):
                if metric["name"] == "binary_correct_per_original_evaluable")
 
 
+def _optional_execution_report_check(root):
+    """Describe retained optional outcomes without treating flags as execution."""
+    from contextlib import ExitStack
+    from CliPP2.simulation.study import _write_report
+
+    def cell(name, status, *, phase="sensitivity"):
+        return dict(status=status, job=dict(cell_id=f"{phase}-S02-{name}", family="S02",
+            phase=phase, acquisition=dict(id=name)))
+
+    cases = (
+        ("completed", False, [cell("regions2_fixed_total", "complete")], "1 completed, 0 failed, 0 unknown"),
+        ("failed", False, [cell("regions4_fixed_total", "execution_failed")], "0 completed, 1 failed, 0 unknown"),
+        ("unknown", True, [cell("regions8_fixed_total", "interrupted")], "0 completed, 0 failed, 1 unknown"),
+        ("no_evidence_enabled", True, [], "No retained completion evidence"),
+        ("no_evidence_disabled", False, [], "No retained completion evidence"),
+        ("unrelated_conditions", True, [cell("regions4_per_region", "complete"),
+            cell("regions4_fixed_total", "complete", phase="main")], "No retained completion evidence"),
+        ("mixed", False, [cell("regions1_fixed_total", "complete"),
+            cell("regions2_fixed_total", "execution_failed"), cell("regions8_fixed_total", None)],
+            "1 completed, 1 failed, 1 unknown"),
+    )
+    with ExitStack() as stack:
+        for target in ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
+                       "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.study._history",
+                       "CliPP2.simulation.study._acquire"):
+            stack.enter_context(patch(target, side_effect=AssertionError("Report attempted inference")))
+        for name, enabled, cells, expected in cases:
+            directory = root / name
+            contract = make_contract(mutations=12, segments=2, regions=4, workers=1)
+            contract["optional_panels"].update(technical_sensitivity=enabled, extended_sensitivity=enabled)
+            save_json(directory / "study_contract.json", contract)
+            summary = dict(fit_count=0, assignment_pass_count=0, report_mode="cached_metrics",
+                           roster_status="incomplete", population_counts=[], metrics=[])
+            _write_report(directory, directory, cells, [], summary, [])
+            text = (directory / "comparison_report.html").read_text()
+            section = text.split("<h2>Optional execution evidence</h2>")[1].split("<h2>")[0]
+            assert expected in section
+            assert "Optional fixed-total-depth refitting" not in text
+            if "No retained" in expected:
+                assert "their execution is unknown" in section
+            else:
+                assert "Cells without retained completion evidence have unknown execution state" in section
+                assert "do not aggregate optional-panel scientific results" in section
+                for value in cells:
+                    assert value["job"]["cell_id"] in section
+    return dict(status="passed", cases=len(cases), retained_outcomes_only=True,
+                configuration_flags_do_not_establish_execution=True,
+                fit_count=0, assignment_pass_count=0)
+
+
 def _record_schema_report_check(root):
     """Package version and explicitly frozen evaluation schema are independent."""
     from contextlib import ExitStack
@@ -780,10 +830,12 @@ def run_checks(directory, cohort_settings):
     _offline_report_check(root / "native_failure", history, job)
     _partial_objective_check(root / "partial_objective", contract, history, frame, job)
     _planned_report_check(root / "unexecuted_report", contract)
+    optional_execution = _optional_execution_report_check(root / "optional_execution_reports")
     record_schema = _record_schema_report_check(root / "record_schema_reports")
     partial_reports = _partial_evidence_report_checks(root / "partial_evidence_reports")
     result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4,
         lifecycle=lifecycle, resume=resume, partial_evidence_reports=partial_reports, record_schema=record_schema,
+        optional_execution_reports=optional_execution,
         checks=["exact_60_variant_720_history_2640_cell_design", "full_10_20_strict_point05_contract",
                 "source_protocol21_execution22_and_cross_protocol_resume_rejection",
                 "threshold_reuse_preserves_reference_quality_and_finite_rival_certainty",
