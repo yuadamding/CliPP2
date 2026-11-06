@@ -116,6 +116,7 @@ def _capped_target_and_replay(directory):
     assert all(value.compatibility_receipts[-1]["run_manifest_id"] == "contract-current-replay" for value in reused)
     assert all(value.producer_receipt["run_manifest_id"] == "contract-external-build" for value in reused)
     _derived_failures(directory, path, config, first, second)
+    _stage_two_preparation_failures(directory, path, config, first, second)
     other_path = directory / "other_tumor.tsv"
     other = write_catalog(other_path, alt, 100, 4, metadata=dict(metadata, tumor_id="tumor_B"))
     np.testing.assert_array_equal(catalog.alt_counts, other.alt_counts)
@@ -248,6 +249,47 @@ def _derived_failures(directory, path, config, first, second):
         if failed != "stage_one_diagnostics":
             assert receipt["stage_two"] == "accepted" and receipt["counts"]["N2"] == len(second.mutation_ids)
             assert load_accepted_fit(output / "stage_two_accepted.json").state_fingerprint == second.state_fingerprint
+
+
+def _stage_two_preparation_failures(directory, path, config, first, second):
+    """Stage 2 owns qualification/cap/publication errors before its native fit."""
+    from CliPP2.io.assignment import write_supporting_table
+    from CliPP2.workflow import _stage_two_caps
+    for operation in ("qualification", "caps", "publication"):
+        output = directory / ("failure_stage_two_preparation_" + operation)
+
+        def qualify(*args, **kwargs):
+            if operation == "qualification":
+                raise RuntimeError("injected preparation failure")
+            return qualify_contributors(*args, **kwargs)
+
+        def caps(*args, **kwargs):
+            if operation == "caps":
+                raise RuntimeError("injected preparation failure")
+            return _stage_two_caps(*args, **kwargs)
+
+        def publish(destination, *args, **kwargs):
+            if operation == "publication" and Path(destination).name == "stage2_segment_multiplicity_bounds.tsv":
+                raise RuntimeError("injected preparation failure")
+            return write_supporting_table(destination, *args, **kwargs)
+
+        with patch.object(AcceptedFit, "validate", lambda self, *args, **kwargs: self), \
+                patch("CliPP2.workflow.qualify_contributors", side_effect=qualify), \
+                patch("CliPP2.workflow._stage_two_caps", side_effect=caps), \
+                patch("CliPP2.io.assignment.write_supporting_table", side_effect=publish), \
+                patch("CliPP2.fit_execution.fit_prepared", side_effect=AssertionError("preparation regression refitted")):
+            try:
+                run_workflow(path, output, config, accepted_stage_one=first, accepted_stage_two=second)
+            except RuntimeError as error:
+                assert str(error) == "injected preparation failure"
+            else:
+                raise AssertionError("Preparation failure was not injected")
+        receipt = json.loads((output / "workflow_receipt.json").read_text())
+        assert receipt["stage_one"] == "accepted" and receipt["stage_two"] == "failed"
+        assert receipt["failed_stage"] == "stage_two" and receipt["failed_phase"] == "stage_two_cap_construction"
+        assert receipt["stage_two_candidate_count"] == len(second.mutation_ids)
+        assert receipt["counts"]["N1"] == len(first.mutation_ids)
+        assert receipt["counts"]["N2"] == receipt["counts"]["Q2"] == 0
 
 
 def _declared_fit(catalog, stage, ids, labels, centers, support, calls):

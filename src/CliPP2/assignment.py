@@ -181,6 +181,8 @@ class AssignmentBundle(ImmutableArrayRecord):
             if name == "baseline_labels" and not set(values) <= set(self.reference.labels):
                 raise ValueError("Pre-assignment baseline labels must belong to the frozen reference")
             object.__setattr__(self, name, values)
+        for stage, baseline in zip(self.source_stages, self.baseline_labels):
+            assignment_outcome(stage, baseline, None, self.reference.clonal_label)
         object.__setattr__(self, "target_ids", targets)
         object.__setattr__(self, "non_target_ids", others)
         object.__setattr__(self, "provenance", _freeze(self.provenance))
@@ -279,7 +281,7 @@ class AssignmentResult(ImmutableArrayRecord):
     def to_dict(self):
         # Keep numeric NaN/inf in this plain copy payload; JSON publishers apply
         # the shared scientific-value codec at the actual serialization boundary.
-        return thaw_record(dict(schema="clipp2.assignment.result.v3", protocol_version=PROTOCOL_VERSION,
+        return thaw_record(dict(schema="clipp2.assignment.result.v4", protocol_version=PROTOCOL_VERSION,
             support_policy=SUPPORT_POLICY,
             bundle_hash=self.bundle_hash, target_ids=self.target_ids, reference=self.reference.to_dict(),
             assignments=self.assignments, multiplicities=self.multiplicities, summary=self.summary,
@@ -288,7 +290,7 @@ class AssignmentResult(ImmutableArrayRecord):
     @classmethod
     def from_dict(cls, value):
         values = dict(value)
-        if (values.pop("schema", None) != "clipp2.assignment.result.v3"
+        if (values.pop("schema", None) != "clipp2.assignment.result.v4"
                 or values.pop("protocol_version", None) != PROTOCOL_VERSION
                 or values.pop("support_policy", None) != SUPPORT_POLICY):
             raise ValueError("Assignment requires a protocol 2.2 result with schema v3")
@@ -348,6 +350,22 @@ def target_reason(source_stage):
     return {"stage_one": "stage1_clonal_recheck", "stage1": "stage1_clonal_recheck",
             "stage_two": "stage2_near_clonal_recheck", "stage2": "stage2_near_clonal_recheck"}.get(
                 source_stage, "fixed_reference_recheck")
+
+
+REASSESSMENT_OUTCOMES = ("retained_clonal", "reassigned", "unresolved", "not_applicable")
+
+
+def assignment_outcome(source_stage, baseline_label, accepted_label, clonal_label):
+    """Separate workflow clonal rechecks from generic baseline comparisons."""
+    if target_reason(source_stage) == "fixed_reference_recheck":
+        status = "not_applicable"
+    else:
+        if clonal_label is None or baseline_label != clonal_label:
+            raise ValueError("Workflow reassessment requires a designated clonal reference and clonal baseline")
+        status = ("unresolved" if accepted_label is None else "retained_clonal"
+                  if accepted_label == clonal_label else "reassigned")
+    return dict(reassessment_status=status,
+                baseline_changed=None if accepted_label is None else accepted_label != baseline_label)
 
 
 def reference_quality(reference, best_index, informative):
@@ -491,8 +509,6 @@ def _score_reference(bundle, progress_callback):
         decision = assignment_decision(summary, bool(observation.eligible[i].any()), int(coverage[i]), fit_pass,
                                        reference_pass=reference_pass)
         accepted = summary["best_label"] if decision == "assigned_relative" else None
-        reassessment = ("unresolved" if accepted is None else "retained_clonal"
-                        if accepted == bundle.reference.clonal_label else "reassigned")
         records.append(dict(mutation_id=mutation, status=decision, accepted_label=accepted,
             **{key: value for key, value in summary.items() if key not in ("best_index", "second_index")},
             reference_quality_pass=reference_pass, reference_quality_failed_regions=failed_regions,
@@ -504,10 +520,11 @@ def _score_reference(bundle, progress_callback):
             fit_screen_status=("pass" if fit_pass else "fail") if finite else "not_evaluated",
             fit_status="not_tested", log_scores=scores[i], reference_labels=bundle.reference.labels,
             source_stage=bundle.source_stages[i], source_label=bundle.source_labels[i],
-            baseline_label=bundle.baseline_labels[i], reassessment_status=reassessment,
+            baseline_label=bundle.baseline_labels[i],
             baseline_reference_label=bundle.baseline_labels[i], final_assignment_label=accepted,
             target_reason=target_reason(bundle.source_stages[i]),
-            baseline_changed=bool(accepted != bundle.baseline_labels[i]) if accepted is not None else None))
+            **assignment_outcome(bundle.source_stages[i], bundle.baseline_labels[i], accepted,
+                                 bundle.reference.clonal_label)))
     return _ReferenceEvaluation(tuple(records), best, best_diagnostics, observed, execution)
 
 
@@ -600,7 +617,7 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
                 membership_status=record["status"], multiplicity_status=multiplicity_status,
                 multiplicity_candidates=candidates, conditional_probabilities=conditional,
                 profile_deviance=profile_deviance))
-    summary = dict(schema="clipp2.assignment.result.v3", protocol_version=PROTOCOL_VERSION,
+    summary = dict(schema="clipp2.assignment.result.v4", protocol_version=PROTOCOL_VERSION,
         implementation_version=__version__, tumor_id=catalog.tumor_id,
         bundle_hash=bundle.content_hash, reference=bundle.reference.to_dict(), thresholds=asdict(bundle.thresholds),
         bounds_hash=support.content_hash, support_policy=SUPPORT_POLICY, normal_cn_policy=bundle.normal_cn_policy,
@@ -612,7 +629,7 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
         status_counts={status: sum(row["status"] == status for row in evaluation.records)
                        for status in sorted({row["status"] for row in evaluation.records})},
         reassessment_counts={status: sum(row["reassessment_status"] == status for row in evaluation.records)
-                             for status in ("retained_clonal", "reassigned", "unresolved")},
+                             for status in REASSESSMENT_OUTCOMES},
         evaluation_receipt=dict(device=bundle.device, cpu_threads=bundle.cpu_threads,
             run_manifest_id=execution_manifest_id, bundle_run_manifest_id=bundle.run_manifest_id,
             configuration=asdict(bundle.thresholds), execution=evaluation.execution),

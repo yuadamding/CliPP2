@@ -45,7 +45,9 @@ def _reference(catalog, centers, quality=None):
                              for i in range(len(centers))))
 
 
-def _bundle(catalog, reference, *, source_stage="stage_one", posterior=.9):
+def _bundle(catalog, reference, *, source_stage=None, posterior=.9):
+    if source_stage is None:
+        source_stage = "stage_one" if reference.clonal_label is not None else "fixture"
     bounds = catalog.default_bounds()
     informative = catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)
     thresholds = AssignmentThresholds(posterior, DescriptiveScreen(10., 5., .05), 1e-10, 1e-10, .95)
@@ -209,7 +211,7 @@ def run_checks(directory):
         assert assign_mutations(combined_request, run_manifest_id="explicit-current").run_manifest_id == "explicit-current"
     _reject(lambda: assign_mutations(combined_request, run_manifest_id=" malformed "))
     assert combined_request.to_dict()["schema"] == "clipp2.assignment.bundle.v3"
-    assert combined_result.to_dict()["schema"] == "clipp2.assignment.result.v3"
+    assert combined_result.to_dict()["schema"] == "clipp2.assignment.result.v4"
     assert combined_result.summary["support_policy"] == "original_full_1_to_major_cn"
     assert all("fit_screen_status" in row and "descriptive_fit_status" not in row for row in combined_result.assignments)
     accounting = dict(status="complete", unchanged_map={complete.target_ids[2]: 1}, population_count=3,
@@ -232,14 +234,39 @@ def run_checks(directory):
     stale["run_manifest_id"] = "different-current"
     _reject(lambda: validate_assignment_result(combined_request, AssignmentResult.from_dict(stale)))
     stale = combined_result.to_dict()
-    stale["schema"] = "clipp2.assignment.result.v4"
+    stale["schema"] = "clipp2.assignment.result.v3"
     _reject(lambda: AssignmentResult.from_dict(stale))
+    for baseline, changed in ((1, False), (0, True)):
+        generic = replace(_bundle(recover, reference, source_stage="generic"), baseline_labels=(baseline,))
+        generic_result = assign_mutations(generic, outdir=root / f"generic_{baseline}")
+        assert generic_result.assignments[0]["reassessment_status"] == "not_applicable"
+        assert generic_result.assignments[0]["baseline_changed"] is changed
+        assert generic_result.summary["reassessment_counts"]["not_applicable"] == 1
+        tampered = generic_result.to_dict()
+        tampered["summary"]["reassessment_counts"]["not_applicable"] = 0
+        _reject(lambda: validate_assignment_result(generic, AssignmentResult.from_dict(tampered)))
+        _reject(lambda: publish_assignment(generic, generic_result, root / "generic_workflow", workflow_accounting={}))
+    generic_unresolved = replace(failed, source_stages=("generic",))
+    row = assign_mutations(generic_unresolved, outdir=root / "generic_unresolved").assignments[0]
+    assert row["reassessment_status"] == "not_applicable" and row["baseline_changed"] is None
+    no_clonal = _bundle(recover, _reference(recover, [[.4]]))
+    assert assign_mutations(no_clonal, outdir=root / "no_clonal").assignments[0]["reassessment_status"] == "not_applicable"
+    for stage in ("stage_one", "stage_two", "stage1", "stage2"):
+        _reject(lambda stage=stage: replace(no_clonal, source_stages=(stage,)))
+        _reject(lambda stage=stage: replace(_bundle(recover, reference), source_stages=(stage,), baseline_labels=(1,)))
+    empty = replace(no_clonal, target_ids=(), non_target_ids=no_clonal.target_ids,
+        native_centers=no_clonal.native_centers[:0], native_calls=no_clonal.native_calls[:0],
+        native_lower=no_clonal.native_lower[:0], native_upper=no_clonal.native_upper[:0],
+        source_stages=(), source_labels=(), baseline_labels=())
+    empty_result = assign_mutations(empty, outdir=root / "empty_targets")
+    assert sum(empty_result.summary["reassessment_counts"].values()) == 0
     return dict(protocol_version=PROTOCOL_VERSION, absolute_marginal_mass=True,
         both_target_origins_identical=True, recovery_and_clonal_controls=True, alias_unresolved=True,
         quality_preserves_posteriors=True, quality_uses_common_observed_mask=True,
         explicit_conditional_and_assigned_multiplicity=True, stable_competitor_confidence=True,
         immutable_quality_roundtrip=True, byte_identical_bundle_replay=True, independent_publication_checks=True,
-        combined_publication_once=True, original_and_current_manifest_links=True, exact_schema_migration=True)
+        combined_publication_once=True, original_and_current_manifest_links=True, exact_schema_migration=True,
+        generic_and_workflow_outcomes=True)
 
 
 if __name__ == "__main__":

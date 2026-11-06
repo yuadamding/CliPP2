@@ -595,17 +595,18 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         g0 = tuple(m for m, label in zip(stage_one.mutation_ids, stage_one.labels) if label == selected["source_label"])
         receipt["reference"] = dict(source_id=stage_one.source_id, source_label=selected["source_label"], mutation_ids=g0)
         receipt["counts"]["N0"] = len(g0)
-        receipt["current_phase"] = "stage_two_cap_construction"
-        reference_audit = qualify_contributors(catalog, stage_one, config, mutation_ids=g0)
-        write_supporting_table(output / "stage2_reference_call_qualification.tsv", reference_audit, columns=CONTRIBUTOR_COLUMNS)
-        caps, cap_rows = _stage_two_caps(catalog, reference_audit)
-        write_supporting_table(output / "stage2_segment_multiplicity_bounds.tsv", cap_rows, columns=SEGMENT_POLICY_COLUMNS)
         reference_members = set(g0)
         remainder = tuple(m for m in population if m not in reference_members)
         if reference_members & set(remainder):
             raise AssertionError("Reference membership overlaps the stage-two remainder")
         receipt["stage_two_candidate_count"] = len(remainder)
         current_stage = "stage_two"
+        receipt["stage_two"] = "preparing"
+        receipt["current_phase"] = "stage_two_cap_construction"
+        reference_audit = qualify_contributors(catalog, stage_one, config, mutation_ids=g0)
+        write_supporting_table(output / "stage2_reference_call_qualification.tsv", reference_audit, columns=CONTRIBUTOR_COLUMNS)
+        caps, cap_rows = _stage_two_caps(catalog, reference_audit)
+        write_supporting_table(output / "stage2_segment_multiplicity_bounds.tsv", cap_rows, columns=SEGMENT_POLICY_COLUMNS)
         receipt["current_phase"] = "stage_two_feasibility"
         stage_two, group_two = None, []
         if not remainder:

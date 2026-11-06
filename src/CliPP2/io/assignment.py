@@ -13,7 +13,7 @@ import pandas as pd
 from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 
 from ..assignment import (AssignmentBundle, AssignmentResult, POLICY_FIELDS,
-                          REGIONAL_BASE_FIELDS, REGIONAL_POLICY_FIELDS)
+                          REGIONAL_BASE_FIELDS, REGIONAL_POLICY_FIELDS, REASSESSMENT_OUTCOMES)
 from .data import json_value as _json_value, content_hash
 from .reporting import MANIFEST_SCHEMA
 from ..config import PROTOCOL_VERSION
@@ -167,7 +167,7 @@ def _independent_scores(catalog, source, reference, informative):
 
 def validate_assignment_result(bundle, result):
     """Check derived evidence and decision gates without fitting or native scoring."""
-    from ..assignment import (score_summary, assignment_decision, confidence_passes,
+    from ..assignment import (score_summary, assignment_decision, assignment_outcome, confidence_passes,
                               reference_quality, target_reason)
 
     if type(bundle) is not AssignmentBundle or type(result) is not AssignmentResult:
@@ -298,18 +298,17 @@ def validate_assignment_result(bundle, result):
         status = assignment_decision(expected, bool(catalog.eligible[original].any()), count, fit_pass,
                                      reference_pass=reference_pass)
         accepted = record["best_label"] if status == "assigned_relative" else None
-        reassessment = ("unresolved" if accepted is None else "retained_clonal"
-                        if accepted == bundle.reference.clonal_label else "reassigned")
         _require_fields(record, dict(mutation_id=mutation, status=status, accepted_label=accepted,
-            informative_regions=count, baseline_label=bundle.baseline_labels[i], reassessment_status=reassessment,
+            informative_regions=count, baseline_label=bundle.baseline_labels[i],
             baseline_reference_label=bundle.baseline_labels[i], final_assignment_label=accepted,
             target_reason=target_reason(bundle.source_stages[i]),
-            baseline_changed=None if accepted is None else accepted != bundle.baseline_labels[i],
+            **assignment_outcome(bundle.source_stages[i], bundle.baseline_labels[i], accepted,
+                                 bundle.reference.clonal_label),
             fit_screen_status=("pass" if fit_pass else "fail") if defined else "not_evaluated",
             fit_status="not_tested", pair_deviance_max=bundle.thresholds.screen.pair_deviance_max,
             mean_deviance_max=bundle.thresholds.screen.mean_deviance_max,
             outlier_fraction_max=bundle.thresholds.screen.outlier_fraction_max), "Assignment decision")
-    _require_fields(result.summary, dict(schema="clipp2.assignment.result.v3", protocol_version=PROTOCOL_VERSION,
+    _require_fields(result.summary, dict(schema="clipp2.assignment.result.v4", protocol_version=PROTOCOL_VERSION,
         target_count=len(bundle.target_ids), unchanged_non_target_count=len(bundle.non_target_ids),
         region_count=len(bundle.reference.region_ids), candidate_count=len(labels), support_policy="original_full_1_to_major_cn",
         bounds_hash=bundle.bounds.content_hash, fit_status="not_tested", tumor_id=catalog.tumor_id,
@@ -325,7 +324,7 @@ def validate_assignment_result(bundle, result):
         status_counts={status: sum(row["status"] == status for row in result.assignments)
                        for status in {row["status"] for row in result.assignments}},
         reassessment_counts={status: sum(row["reassessment_status"] == status for row in result.assignments)
-                             for status in ("retained_clonal", "reassigned", "unresolved")})
+                             for status in REASSESSMENT_OUTCOMES})
     for name, expected in aggregates.items():
         if dict(result.summary.get(name, {})) != expected:
             raise ValueError("Assignment aggregate counts do not reconcile its derived records")
@@ -333,6 +332,9 @@ def validate_assignment_result(bundle, result):
 
 def _validated_workflow_accounting(bundle, result, accounting):
     """Reconcile the unchanged map with accepted and unresolved target records."""
+    from ..assignment import target_reason
+    if any(target_reason(stage) == "fixed_reference_recheck" for stage in bundle.source_stages):
+        raise ValueError("Two-origin workflow accounting cannot include generic assignment targets")
     if not isinstance(accounting, Mapping) or not isinstance(accounting.get("unchanged_map"), Mapping):
         raise ValueError("Workflow accounting requires an explicit unchanged mutation-to-reference map")
     labels, unchanged = bundle.reference.labels, dict(accounting["unchanged_map"])
@@ -402,7 +404,7 @@ def publish_assignment(bundle, result, outdir, *, workflow_accounting=None):
         "targets": sum(s == stage for s in bundle.source_stages),
         **{status: sum(s == stage and row["reassessment_status"] == status
                        for s, row in zip(bundle.source_stages, result.assignments))
-           for status in ("retained_clonal", "reassigned", "unresolved")}}
+           for status in REASSESSMENT_OUTCOMES}}
         for stage in sorted(set(bundle.source_stages))}
     _publish_json(output / (prefix + "assignment_summary.json"), summary)
     return summary
