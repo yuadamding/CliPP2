@@ -787,14 +787,19 @@ def report(root, *, evaluation_config=None, report_dir=None):
                 value = placeholder_for_cell(root, cell, evaluation_config)
                 # Missing cached records retain the frozen study's definition.
                 # Historical files are never relabeled as newly evaluated v3.
-                version = tuple(int(part) for part in contract.get("implementation_version", "0.0.0").split(".")[:3])
-                if version < (1, 2, 3):
-                    schema = "clipp2.simulation.evaluation.v2" if version >= (1, 2, 2) else "clipp2.simulation.evaluation.v1"
-                    value["schema"] = schema
-                    if schema.endswith(".v2"):
-                        from .evaluation import legacy_evaluation_definition
-                        definition = legacy_evaluation_definition(2, evaluation_config)
-                        value.update(evaluation_definition=definition, evaluation_definition_id=content_hash(definition))
+                schema = frozen_evaluation.get("record_schema")
+                if schema is None:
+                    version = tuple(int(part) for part in contract.get("implementation_version", "0.0.0").split(".")[:3])
+                    schema = "clipp2.simulation.evaluation." + (
+                        "v3" if version >= (1, 2, 3) else "v2" if version >= (1, 2, 2) else "v1")
+                if schema not in ("clipp2.simulation.evaluation.v1", "clipp2.simulation.evaluation.v2",
+                                   "clipp2.simulation.evaluation.v3"):
+                    raise ValueError("Frozen study declares an unsupported evaluation record schema")
+                value["schema"] = schema
+                if schema.endswith(".v2"):
+                    from .evaluation import legacy_evaluation_definition
+                    definition = legacy_evaluation_definition(2, evaluation_config)
+                    value.update(evaluation_definition=definition, evaluation_definition_id=content_hash(definition))
         evaluations.append(value)
     summary = aggregate(evaluations, planned_roster=roster["jobs"], roster_complete=roster["complete"],
                         families=contract["families"])
@@ -841,15 +846,21 @@ def report(root, *, evaluation_config=None, report_dir=None):
     save_json(report_dir / "aggregate.json", summary)
     figures = make_figures(evaluations, summary, report_dir)
     metrics = [dict(cell_id=e["cell_id"], history_id=e["history_id"], family=e["family"],
-                    acquisition=e["acquisition_id"], **row) for e in evaluations for row in e["metrics"]]
-    pd.DataFrame(metrics).to_csv(report_dir / "tumor_metrics.tsv", sep="\t", index=False, na_rep="NA")
+                    acquisition=e["acquisition_id"], truth_qualification=e.get("truth_qualification"), **row)
+               for e in evaluations for row in e["metrics"]]
+    pd.DataFrame(metrics, columns=None if metrics else ["cell_id", "history_id", "family", "acquisition",
+        "truth_qualification", "name", "arm", "view", "stratum", "value"]).to_csv(
+            report_dir / "tumor_metrics.tsv", sep="\t", index=False, na_rep="NA")
     audits = [dict(cell_id=e["cell_id"], **row) for e in evaluations for row in e.get("cap_audit", ())]
     pd.DataFrame(audits, columns=None if audits else ["cell_id", "mutation_id", "region_id"]).to_csv(
         report_dir / "bound_audit.tsv", sep="\t", index=False, na_rep="NA")
-    transitions = [dict(cell_id=e["cell_id"], arm=arm, origin=origin, **row) for e in evaluations
+    transitions = [dict(cell_id=e["cell_id"], truth_qualification=e.get("truth_qualification"),
+                        arm=arm, origin=origin, **row) for e in evaluations
         for arm, strata in e.get("detailed_membership_transitions", {}).items()
         for origin, rows in strata.items() for row in rows]
-    pd.DataFrame(transitions).to_csv(report_dir / "detailed_transitions.tsv", sep="\t", index=False, na_rep="NA")
+    pd.DataFrame(transitions, columns=None if transitions else ["cell_id", "truth_qualification", "arm", "origin",
+        "baseline_state", "final_state", "count"]).to_csv(
+            report_dir / "detailed_transitions.tsv", sep="\t", index=False, na_rep="NA")
     pd.DataFrame([dict(cell_id=c["job"]["cell_id"], phase=c["job"]["phase"], family=c["job"]["family"],
                        status=c["status"], elapsed_seconds=c["elapsed_seconds"],
                        peak_resident_bytes=c["peak_resident_bytes"], output_bytes=c["output_bytes"])
@@ -893,11 +904,13 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
             for row in summary.get("metrics", ()) if row["name"] in selected_metrics]
     text.append(pd.DataFrame(rows).to_html(index=False, na_rep="NA", float_format=lambda x: f"{x:.4g}"))
     transitions = [dict(arm=arm, origin=origin, **row) for e in evaluations
+        if e.get("truth_qualification") == "verified_history_binding"
         for arm, origins in e.get("detailed_membership_transitions", {}).items()
         for origin, rows in origins.items() for row in rows if row["count"]]
     text.append("<h2>Detailed membership transitions by target origin</h2>"
         "<p>Mc: mapped correct; Mw: mapped wrong; U: accepted but unmapped; unresolved: no accepted label. "
-        "Counts below describe retained evaluated evidence; they do not fill missing planned cells.</p>")
+        "Counts below use verified history bindings only; they do not fill missing planned cells. "
+        "Raw TSV exports retain historical diagnostics with their truth qualification.</p>")
     if transitions:
         grouped = pd.DataFrame(transitions).groupby(["arm", "origin", "baseline_state", "final_state"])["count"].sum().reset_index()
         text.append(grouped.to_html(index=False))
@@ -910,5 +923,5 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
     text.extend(["<h2>Reproducibility and limits</h2>",
         "<p>Per-cell outputs preserve native A/B/C fits, frozen combined references, B3/C3 assignments, exact cap and contributor records, and every original mutation's status. Physical histories and truth are stored separately from inference inputs. Source snapshots and native numerical receipts are retained; file-byte checksums are intentionally absent.</p>",
         "<p>Core results do not imply a global clustering optimum or patient-population frequencies. Optional fixed-total-depth refitting, corrected-cap refitting, BAM simulation, and unavailable historical generators were not executed.</p>",
-        "<p>Machine-readable results: <a href='aggregate.json'>aggregate.json</a>; <a href='tumor_metrics.tsv'>tumor metrics</a>; <a href='bound_audit.tsv'>cap audit</a>; <a href='execution_ledger.tsv'>execution ledger</a>.</p>"])
+        "<p>Machine-readable results: <a href='aggregate.json'>aggregate.json</a>; <a href='tumor_metrics.tsv'>tumor metrics</a>; <a href='detailed_transitions.tsv'>detailed transitions</a>; <a href='bound_audit.tsv'>cap audit</a>; <a href='execution_ledger.tsv'>execution ledger</a>.</p>"])
     (directory / "comparison_report.html").write_text("\n".join(text), encoding="utf-8")

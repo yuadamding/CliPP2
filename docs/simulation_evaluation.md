@@ -1,9 +1,12 @@
 # Simulation evaluation definitions
 
-Implementation 1.2.3 keeps scientific Protocol 2.2 and the frozen development
+Implementation 1.1.0 keeps scientific Protocol 2.2 and the frozen development
 objective. Evaluation v3 preserves planned populations, requires qualified truth
 for primary science, and uses consistent detailed membership transitions.
 It does not refit, reassign, select thresholds, or change historical caps.
+New contracts declare `evaluation.record_schema` explicitly, so the package
+version does not determine the evaluation schema. Historical contracts without
+that field retain their original version-based interpretation.
 
 The existing `correct_resolution` and `selective_error` fields remain binary
 clonality endpoints, with explicit `binary_*` aliases. An accepted wrong subclone

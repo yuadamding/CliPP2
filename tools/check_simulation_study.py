@@ -344,6 +344,172 @@ def _planned_report_check(root, contract):
                if metric["name"] == "binary_correct_per_original_evaluable")
 
 
+def _record_schema_report_check(root):
+    """Package version and explicitly frozen evaluation schema are independent."""
+    from contextlib import ExitStack
+    from CliPP2.io.data import content_hash
+    from CliPP2.simulation.evaluation import evaluation_definition, legacy_evaluation_definition
+    cases = (("explicit_v3", "1.1.0", "v3", True),
+             ("historical_v2", "1.2.2", "v2", False),
+             ("historical_v1", "1.1.0", "v1", False))
+    for name, version, suffix, explicit in cases:
+        directory = root / name
+        contract = make_contract(mutations=12, segments=2, regions=4, workers=1)
+        assert contract["evaluation"]["record_schema"] == "clipp2.simulation.evaluation.v3"
+        contract.update(implementation_version=version, families=["S01"])
+        if not explicit:
+            contract["evaluation"].pop("record_schema")
+        jobs = [dict(cell_id=f"schema-h{i}-A1", history_id=f"schema-h{i}", family="S01",
+                     phase="main", acquisition=dict(id="A1", purity=.8, depth=100)) for i in range(2)]
+        save_json(directory / "study_contract.json", contract)
+        save_json(directory / "allocation.json", dict(planned_main_datasets=2))
+        payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"], jobs=jobs)
+        save_json(directory / "main_roster.json", dict(payload, roster_id=content_hash(payload)))
+        definition = legacy_evaluation_definition(2, {}) if suffix == "v2" else evaluation_definition()
+        success = dict(schema="clipp2.simulation.evaluation."+suffix, evaluation_definition=definition,
+            evaluation_definition_id=content_hash(definition), **jobs[0], acquisition_id="A1",
+            truth_qualification="verified_history_binding", status="complete", original_evaluable_count=10,
+            metrics=[dict(name="binary_correct_per_original_evaluable", arm="C3", view="", stratum="all",
+                value=1., numerator=10, denominator=10, status="available", truth_required=True)])
+        for index, job in enumerate(jobs):
+            relative = Path("cells") / job["cell_id"] / "attempt-001/evaluation-1.json"
+            if index == 0:
+                save_json(directory / relative, success)
+            save_json(directory / "cells" / job["cell_id"] / "completion.json", dict(job=job,
+                status="complete", attempt=str(relative.parent), evaluations=[str(relative)], cost_ledgers=[],
+                elapsed_seconds=0., peak_resident_bytes=0, output_bytes=0))
+        captured = []
+        with ExitStack() as stack:
+            for target in ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
+                           "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.study._history",
+                           "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.select_thresholds"):
+                stack.enter_context(patch(target, side_effect=AssertionError("Report attempted inference")))
+            stack.enter_context(patch("CliPP2.simulation.figures.make_figures",
+                side_effect=lambda records, *args: captured.extend(records) or []))
+            result = report(directory)
+        assert len(captured) == 2
+        assert {record["schema"] for record in captured} == {"clipp2.simulation.evaluation."+suffix}
+        if suffix != "v1":
+            assert len({record["evaluation_definition_id"] for record in captured}) == 1
+        assert Path(result["report"]).is_file()
+    return dict(status="passed", explicit_schema_independent_of_package_version=True,
+                historical_version_fallback_preserved=True, fit_count=0, assignment_pass_count=0)
+
+
+def _partial_evidence_report_checks(root):
+    """Exercise real public report publication without fitting or assigning."""
+    from contextlib import ExitStack
+    from CliPP2.io.data import content_hash
+    from CliPP2.simulation import figures
+    from CliPP2.simulation.evaluation import evaluation_definition
+    from CliPP2.simulation.reporting import unavailable_evaluation
+    definition = evaluation_definition()
+
+    def job(index):
+        return dict(cell_id=f"report-h{index}-A1", history_id=f"report-h{index}", family="S01",
+                    phase="main", acquisition=dict(id="A1", purity=.8, depth=100))
+
+    def successful(index, *, truth="verified_history_binding", transitions=3):
+        record = job(index)
+        metrics = [dict(name=name, arm="C3", view="", stratum="all", value=1.,
+            numerator=10, denominator=10, status="available", truth_required=True)
+            for name in ("correct_per_original_evaluable", "binary_correct_per_original_evaluable")]
+        metrics += [dict(name=name, arm="C3", view="all_planned_cells", stratum="all", value=value,
+            numerator=value, denominator=1, status="available", truth_required=False)
+            for name, value in (("analysis_available", 1), ("analysis_failure", 0),
+                               ("execution_available", 1), ("execution_failure", 0),
+                               ("evaluation_available", 1), ("scientifically_applicable", 1))]
+        return dict(schema="clipp2.simulation.evaluation.v3", evaluation_definition=definition,
+            evaluation_definition_id=content_hash(definition), truth_qualification=truth,
+            **record, acquisition_id="A1", original_evaluable_count=10, region_count=4,
+            status="complete", metrics=metrics, calibration=[], cap_audit=[],
+            detailed_membership_transitions={"C3": {"stage1_clonal_recheck": [dict(
+                baseline_state="Mc", final_state="Mw", count=transitions)]}})
+
+    def publish_case(directory, evaluations):
+        contract = make_contract(mutations=12, segments=2, regions=4, workers=1)
+        contract["families"] = ["S01"]
+        roster = [job(index) for index in range(len(evaluations))]
+        save_json(directory / "study_contract.json", contract)
+        save_json(directory / "allocation.json", dict(planned_main_datasets=len(roster), main_histories_per_family=len(roster)))
+        payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"], jobs=roster)
+        save_json(directory / "main_roster.json", dict(payload, roster_id=content_hash(payload)))
+        for record, evaluation in zip(roster, evaluations):
+            attempt = Path("cells") / record["cell_id"] / "attempt-001"
+            relative = attempt / "evaluation-1.json"
+            save_json(directory / relative, evaluation)
+            save_json(directory / "cells" / record["cell_id"] / "completion.json", dict(job=record,
+                status="execution_failed" if evaluation["status"] == "execution_failed" else "complete",
+                attempt=str(attempt), evaluations=[str(relative)], cost_ledgers=[], elapsed_seconds=0.,
+                peak_resident_bytes=0, output_bytes=0))
+        matrices = []
+        save_figure = figures._save
+
+        def capture(figure, output, name, paths):
+            if name == "07_population_accounting":
+                matrices.extend(np.array(axis.images[0].get_array()) for axis in figure.axes[2:] if axis.images)
+            return save_figure(figure, output, name, paths)
+
+        with ExitStack() as stack:
+            for name in ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
+                         "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.study._history",
+                         "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.select_thresholds"):
+                stack.enter_context(patch(name, side_effect=AssertionError("Report attempted inference: " + name)))
+            stack.enter_context(patch("CliPP2.simulation.figures._save", side_effect=capture))
+            result = report(directory)
+        output = Path(result["report"]).parent
+        required = ("aggregate.json", "tumor_metrics.tsv", "detailed_transitions.tsv", "bound_audit.tsv",
+                    "execution_ledger.tsv", "comparison_report.html")
+        assert all((output / name).is_file() for name in required)
+        assert len(list(output.glob("*.png"))) == len(list(output.glob("*.pdf"))) == 7
+        assert result["summary"]["fit_count"] == result["summary"]["assignment_pass_count"] == 0
+        return result, output, matrices
+
+    failure = unavailable_evaluation(job(1), "execution_failed", evaluation_config={},
+        execution_state="execution_failed", original_evaluable_count=10,
+        arm_applicability={"C3": dict(status="failed", no_decisions=True, decision_population=dict(
+            scope="whole_original_evaluable", coverage="complete", evaluable_count=10, accepted_count=0,
+            evidence="failure_before_stage_one"))})
+    assert "region_count" not in failure
+    failure.pop("calibration", None)
+    failure.pop("cap_audit", None)
+    zero = next(row for row in failure["metrics"] if row["name"] == "correct_per_original_evaluable" and row["arm"] == "C3")
+    assert zero["value"] == 0 and zero["status"] == "known_no_decisions"
+    result, output, _ = publish_case(root / "known_zero", [successful(0), failure])
+    metric = next(row for row in result["summary"]["metrics"]
+                  if row["name"] == "binary_correct_per_original_evaluable" and row["arm"] == "C3")
+    assert metric["planned_population_estimate"] == .5 and metric["planned_population_status"] == "available"
+    assert len(result["summary"]["planned_weights"]) == 2
+    exported = pd.read_csv(output / "tumor_metrics.tsv", sep="\t")
+    assert set(exported.truth_qualification) == {"verified_history_binding", "missing_truth_evidence"}
+    for value in (None, True, "4", [4], {}, float("nan"), float("inf"), 0, -1, 1.5):
+        assert figures._sensitivity_covariate(dict(failure, region_count=value), "region_count") is None
+    assert figures._sensitivity_covariate(dict(failure, region_count=4), "region_count") == 4
+    assert figures._values([failure], "correct_per_original_evaluable", "C3")[0][1] == 0
+    unsupported = deepcopy(failure)
+    unsupported["truth_qualification"] = "verified_history_binding"
+    for arm in unsupported["applicability"]:
+        arm.pop("decision_population", None)
+    assert figures._values([unsupported], "correct_per_original_evaluable", "C3") == []
+    result, output, matrices = publish_case(root / "truth_qualified", [successful(0),
+        successful(1, truth="legacy_consistent_unbound", transitions=37)])
+    transitions = pd.read_csv(output / "detailed_transitions.tsv", sep="\t")
+    assert transitions.set_index("truth_qualification")["count"].to_dict() == {
+        "verified_history_binding": 3, "legacy_consistent_unbound": 37}
+    metrics = pd.read_csv(output / "tumor_metrics.tsv", sep="\t")
+    assert set(metrics.truth_qualification) == {"verified_history_binding", "legacy_consistent_unbound"}
+    assert metrics.groupby("truth_qualification").size().to_dict() == {
+        "verified_history_binding": 8, "legacy_consistent_unbound": 8}
+    assert len(matrices) == 1 and matrices[0].sum() == matrices[0][0, 1] == 3
+    html = (output / "comparison_report.html").read_text()
+    section = html.split("<h2>Detailed membership transitions by target origin</h2>")[1].split("<h2>")[0]
+    assert "verified history bindings only" in section
+    assert "<td>3</td>" in section and "<td>37</td>" not in section and "<td>40</td>" not in section
+    return dict(status="passed", known_zero_preserves_planned_weight=True,
+        optional_covariates_do_not_block_publication=True, primary_html_and_heatmap_verified_only=True,
+        raw_exports_preserve_qualified_legacy_rows=True, fit_count=0, assignment_pass_count=0)
+
+
 def _offline_report_check(root, history, job):
     """A legacy archived result can acquire new metrics without inference IO."""
     from contextlib import ExitStack
@@ -614,7 +780,10 @@ def run_checks(directory, cohort_settings):
     _offline_report_check(root / "native_failure", history, job)
     _partial_objective_check(root / "partial_objective", contract, history, frame, job)
     _planned_report_check(root / "unexecuted_report", contract)
-    result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4, lifecycle=lifecycle, resume=resume,
+    record_schema = _record_schema_report_check(root / "record_schema_reports")
+    partial_reports = _partial_evidence_report_checks(root / "partial_evidence_reports")
+    result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4,
+        lifecycle=lifecycle, resume=resume, partial_evidence_reports=partial_reports, record_schema=record_schema,
         checks=["exact_60_variant_720_history_2640_cell_design", "full_10_20_strict_point05_contract",
                 "source_protocol21_execution22_and_cross_protocol_resume_rejection",
                 "threshold_reuse_preserves_reference_quality_and_finite_rival_certainty",

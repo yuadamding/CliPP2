@@ -1,6 +1,7 @@
 """Data-driven scientific and population-accounting simulation figures."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from collections import defaultdict
 from pathlib import Path
 
@@ -24,8 +25,11 @@ def _values(evaluations, name, arm, *, view="", stratum="all"):
         matches = [row for row in evaluation["metrics"] if row["name"] == name and row["arm"] == arm
                    and row.get("view", "") == view and row.get("stratum", "all") == stratum]
         if matches and isinstance(matches[0]["value"], (int, float)):
+            independent = metric_truth_independent(evaluation, matches[0])
+            if matches[0].get("status") == "known_no_decisions" and not independent:
+                continue  # A historical zero tag does not establish endpoint-wide emptiness.
             qualified = (evaluation.get("truth_qualification") == "verified_history_binding"
-                         or metric_truth_independent(evaluation, matches[0]))
+                         or independent)
             if qualified:
                 rows.append((evaluation, float(matches[0]["value"])))
     return rows
@@ -251,6 +255,36 @@ def _reliability(evaluations, output, paths):
     _save(figure, output, "05_probability_reliability", paths)
 
 
+def _sensitivity_covariate(evaluation, key):
+    """Optional plotting evidence never changes endpoint eligibility or weight."""
+    mean = False
+    if key == "region_count":
+        raw = evaluation.get(key)
+    elif key in ("mean_depth", "major_cn", "contributors"):
+        records = evaluation.get("cap_audit" if key == "contributors" else "calibration") or ()
+        field = "contributor_count" if key == "contributors" else key
+        raw = [record.get(field) if isinstance(record, Mapping) else None for record in records]
+        mean = True
+    elif key == "purity":
+        acquisition = evaluation.get("acquisition")
+        raw = acquisition.get("purity") if isinstance(acquisition, Mapping) else None
+        mean = True
+    else:
+        raw = evaluation.get("input_error_fraction")
+    try:
+        values = np.asarray(raw)
+        if not values.size or values.dtype.kind not in "iuf" or not np.isfinite(values).all():
+            return None
+        if not mean and values.ndim != 0:
+            return None
+        value = float(values.mean() if mean else values)
+    except (TypeError, ValueError):
+        return None
+    if key == "region_count" and (value < 1 or not value.is_integer()):
+        return None
+    return value
+
+
 def _sensitivities(evaluations, output, paths):
     figure, axes = plt.subplots(2, 3, figsize=(13, 8))
     definitions = (("mean_depth", "Mean observed depth"), ("region_count", "Requested regions"),
@@ -259,19 +293,8 @@ def _sensitivities(evaluations, output, paths):
     for ax, (key, label) in zip(axes.flat, definitions):
         points = []
         for e, value in _values(evaluations, "correct_per_original_evaluable", "C3"):
-            calibration = e["calibration"]
-            if key == "region_count":
-                x = e["region_count"]
-            elif key in ("mean_depth", "major_cn"):
-                x = np.mean([r[key] for r in calibration]) if calibration else None
-            elif key == "purity":
-                raw = e.get("acquisition", {}).get("purity")
-                x = np.asarray(raw).mean() if raw is not None else None
-            elif key == "contributors":
-                x = np.mean([r["contributor_count"] for r in e["cap_audit"]]) if e["cap_audit"] else None
-            else:
-                x = e.get("input_error_fraction")
-            if x is not None and np.isfinite(x):
+            x = _sensitivity_covariate(e, key)
+            if x is not None:
                 points.append((x, value))
         if points and len(set(x for x, _ in points)) > 1:
             ax.scatter(*np.asarray(points).T, s=20, alpha=.5, color="#1565a8")
@@ -294,7 +317,8 @@ def _population_accounting(evaluations, summary, output, paths):
                 ("available_case_estimate", .12, "x", "#ca6b26", "Qualified available cases")):
             value = row.get(field)
             if value is not None:
-                ax.scatter(i+offset, value, marker=marker, color=color, s=45, label=label if i == 0 else None)
+                ax.scatter(i+offset, value, marker=marker, color=color, s=45,
+                           label=label if label not in ax.get_legend_handles_labels()[1] else None)
         if row.get("planned_population_estimate") is None:
             ax.text(i, .04, "planned\nunknown", ha="center", fontsize=8)
     ax.set(xticks=range(4), xticklabels=arms, ylim=(-.02, 1.05),
