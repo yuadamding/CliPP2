@@ -189,6 +189,10 @@ Without a new evaluation configuration, cached-report behavior is retained.
 Cached reports resolve the complete frozen definition before reading cells.
 Every cached record must match that definition, even when all records are present
 and agree with each other. A conflicting cache requires explicit reevaluation.
+Syntactically valid caches must be objects with the expected cell identity,
+versioned definition, and a list of metric objects. Structural or identity errors
+raise an integrity error naming the cell and file; scientific-definition conflicts
+remain fatal. Missing or truncated files retain explicit unavailable placeholders.
 Missing records remain unknown under that definition, including historical v1
 L∞ geometry, its top-level matching tolerance, and its original matching policy.
 Even an empty report with no recoverable complete roster retains the historical
@@ -205,3 +209,16 @@ matching policy, and semantic definition identity. Distance configuration remain
 v1; old v1/v2 evaluation files keep their original definitions. Aggregation
 rejects incompatible definitions rather than silently mixing L2, L∞, different
 tolerances, or legacy and revised endpoint interpretations.
+
+## Consistent operational accounting
+
+The aggregate owns one per-arm accounting table for execution, scientific
+applicability, and evaluation availability. Each indicator separately counts
+true, false, and unknown; those counts sum to the retained roster size. The HTML
+population table and population figure consume that same table. Unknown
+execution remains distinct from an explicitly unexecuted analysis.
+
+Per-arm unavailable evaluation means `evaluation_available == 0`. The count of
+whole records labeled `unavailable_derived_evidence` is a separate study-level
+quantity. Execution still means an analysis was reached or its applicability
+was assessed; native fit and assignment costs come from the operation ledger.

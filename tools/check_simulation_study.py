@@ -505,6 +505,78 @@ def _record_schema_report_check(root):
         historical_version_fallback_preserved=True, fit_count=0, assignment_pass_count=0)
 
 
+def _report_integrity_check(root):
+    """Per-arm ternary counts and contextual cache errors require no inference."""
+    from contextlib import ExitStack
+    from CliPP2.io.data import content_hash
+    from CliPP2.simulation.evaluation import evaluation_definition
+    definition = evaluation_definition()
+    contract = make_contract(mutations=12, segments=2, regions=4, workers=1)
+    contract.update(families=["S01"], profile="full")
+    jobs = [dict(cell_id=f"integrity-{i}", history_id=f"integrity-h{i}", family="S01",
+                 phase="main", acquisition=dict(id="A1", purity=.8, depth=100)) for i in range(4)]
+    records = []
+    for job, states in zip(jobs, ((0, 0, None), (0, None, None), (None, None, None), (1, 1, 1))):
+        records.append(dict(schema="clipp2.simulation.evaluation.v3", **job, acquisition_id="A1",
+            status="execution_failed" if states == (0, 0, None) else "complete",
+            evaluation_definition=definition, evaluation_definition_id=content_hash(definition),
+            metrics=[dict(name=name, arm=arm, view="all_planned_cells", stratum="all", value=value,
+                truth_required=False) for arm in ("A", "B", "C", "B3", "C3")
+                for name, value in zip(("execution_available", "evaluation_available", "scientifically_applicable"), states)]))
+
+    def prepare(directory, values):
+        save_json(directory / "study_contract.json", contract)
+        save_json(directory / "allocation.json", dict(planned_main_datasets=len(values), resource_reduction_applied=False))
+        payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"], jobs=jobs[:len(values)])
+        save_json(directory / "main_roster.json", dict(payload, roster_id=content_hash(payload)))
+        paths = []
+        for job, value in zip(jobs, values):
+            path = Path("cells") / job["cell_id"] / "attempt-001/evaluation-1.json"
+            save_json(directory / path, value)
+            save_json(directory / "cells" / job["cell_id"] / "completion.json", dict(job=job,
+                status="complete", attempt=str(path.parent), evaluations=[str(path)], cost_ledgers=[],
+                elapsed_seconds=0., peak_resident_bytes=0, output_bytes=0))
+            paths.append(directory / path)
+        return paths
+
+    with ExitStack() as stack:
+        for target in ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
+                       "CliPP2.simulation.study._history", "CliPP2.simulation.study._acquire"):
+            stack.enter_context(patch(target, side_effect=AssertionError("Report attempted inference")))
+        stack.enter_context(patch("CliPP2.simulation.figures.make_figures", return_value=[]))
+        directory = root / "accounting"
+        prepare(directory, records)
+        output = report(directory)
+        for row in output["summary"]["population_counts"]:
+            assert (row["executed"], row["not_executed"], row["execution_unknown"]) == (1, 2, 1)
+            assert (row["evaluated"], row["unavailable_derived"], row["evaluation_unknown"]) == (1, 1, 2)
+            assert row["retained_roster"] == 4
+            metric = next(x for x in output["summary"]["metrics"] if x["arm"] == row["arm"]
+                          and x["name"] == "evaluation_available")
+            assert metric["unavailable_derived_cells"] == row["unavailable_derived"]
+            assert metric["unknown_evaluation_cells"] == row["evaluation_unknown"]
+        assert "did not use timing or disk measurements" in Path(output["report"]).read_text()
+        bad = [None, [], dict(records[0], metrics=None), dict(records[0], metrics=[None]),
+               dict(records[0], cell_id="other"), dict(records[0], evaluation_definition_id="invalid")]
+        for index, value in enumerate(bad):
+            directory = root / f"invalid-{index}"
+            path = prepare(directory, [value])[0]
+            before = path.read_bytes()
+            try:
+                report(directory)
+            except ValueError as error:
+                assert str(path) in str(error) and jobs[0]["cell_id"] in str(error)
+            else:
+                raise AssertionError("Structurally invalid cache was accepted")
+            assert path.read_bytes() == before and not (directory / "reports").exists()
+        directory = root / "truncated"
+        path = prepare(directory, [records[0]])[0]
+        path.write_text("{truncated")
+        assert report(directory)["summary"]["derived_evidence_unavailable"] == 1
+    return dict(status="passed", per_arm_ternary_accounting=True, contextual_cache_errors=len(bad),
+                truncated_cache_remains_unavailable=True, fit_count=0, assignment_pass_count=0)
+
+
 def _partial_evidence_report_checks(root):
     """Exercise real public report publication without fitting or assigning."""
     from contextlib import ExitStack
@@ -898,11 +970,13 @@ def run_checks(directory, cohort_settings):
     _offline_report_check(root / "native_failure", history, job)
     _partial_objective_check(root / "partial_objective", contract, history, frame, job)
     _planned_report_check(root / "unexecuted_report", contract)
+    report_integrity = _report_integrity_check(root / "report_integrity")
     record_schema = _record_schema_report_check(root / "record_schema_reports")
     optional_execution = _optional_execution_report_check(root / "optional_execution_reports")
     partial_reports = _partial_evidence_report_checks(root / "partial_evidence_reports")
     result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4,
         lifecycle=lifecycle, resume=resume, partial_evidence_reports=partial_reports, record_schema=record_schema,
+        report_integrity=report_integrity,
         optional_execution_reports=optional_execution,
         checks=["exact_60_variant_720_history_2640_cell_design", "full_10_20_strict_point05_contract",
                 "source_protocol21_execution22_and_cross_protocol_resume_rejection",

@@ -1274,6 +1274,27 @@ def _numeric(value):
     return value
 
 
+def population_accounting(availability):
+    """Count retained arm states without conflating false and unknown evidence."""
+    indicators = {
+        "execution_available": ("executed", "not_executed", "execution_unknown"),
+        "evaluation_available": ("evaluated", "unavailable_derived", "evaluation_unknown"),
+        "scientifically_applicable": ("scientifically_applicable", "scientifically_inapplicable", "applicability_unknown"),
+    }
+    result = []
+    for arm in ("A", "B", "C", "B3", "C3"):
+        rows = [row for row in availability if row["arm"] == arm]
+        counts = dict(arm=arm, retained_roster=len(rows))
+        for indicator, names in indicators.items():
+            values = [row.get(indicator) for row in rows]
+            if any(value is not None and value not in (0, 1) for value in values):
+                raise ValueError(f"Invalid retained operational indicator {indicator} for {arm}")
+            counts.update(zip(names, (sum(value == state for value in values) for state in (1, 0, None))))
+            assert sum(counts[name] for name in names) == len(rows)
+        result.append(counts)
+    return result
+
+
 def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expected_definition=None,
               bootstrap_replicates=1000, seed=20261106, families=FAMILIES):
     """Keep frozen planned weights; report conditional available cases separately.
@@ -1473,4 +1494,4 @@ def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expect
         roster_complete=complete_roster, roster_status="complete" if complete_roster else "unavailable_or_incomplete",
         roster_missing_families=missing_families, planned_datasets=len(roster), observed_evaluation_records=len(records),
         planned_weights=[dict(row, weight=weights[cell_id]) for cell_id, row in roster.items()],
-        availability=availability, metrics=summaries))
+        availability=availability, population_counts=population_accounting(availability), metrics=summaries))

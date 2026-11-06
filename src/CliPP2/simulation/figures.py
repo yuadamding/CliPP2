@@ -326,14 +326,19 @@ def _population_accounting(evaluations, summary, output, paths):
     if ax.collections:
         ax.legend(fontsize=8)
     ax = axes[0, 1]
-    availability = summary.get("availability", ())
-    definitions = (("execution_available", "Executed"), ("scientifically_applicable", "Applicable"),
-                   ("evaluation_available", "Evaluated"))
-    for offset, (field, label) in enumerate(definitions):
-        counts = [sum(row.get(field) == 1 for row in availability if row["arm"] == arm) for arm in arms]
-        ax.bar(np.arange(4)+(offset-1)*.23, counts, width=.23, label=label)
-    ax.set(xticks=range(4), xticklabels=arms, ylabel="Retained cells with known state",
-           title="Execution, applicability and evaluation counts")
+    accounting = {row["arm"]: row for row in summary.get("population_counts", ())}
+    definitions = (("execution", ("executed", "not_executed", "execution_unknown")),
+                   ("applicability", ("scientifically_applicable", "scientifically_inapplicable", "applicability_unknown")),
+                   ("evaluation", ("evaluated", "unavailable_derived", "evaluation_unknown")))
+    coordinates = [(arm, label, fields) for arm in arms for label, fields in definitions]
+    bottom = np.zeros(len(coordinates))
+    for index, (label, color) in enumerate((("True", "#246a9a"), ("False", "#d18b47"), ("Unknown", "#b9b9b9"))):
+        counts = [accounting.get(arm, {}).get(fields[index], 0) for arm, _, fields in coordinates]
+        ax.bar(np.arange(len(coordinates)), counts, bottom=bottom, label=label, color=color)
+        bottom += counts
+    ax.set(xticks=range(len(coordinates)), xticklabels=[arm+"\n"+label for arm, label, _ in coordinates],
+           ylabel="Retained roster cells", title="Execution, applicability and evaluation states")
+    ax.tick_params(axis="x", labelsize=7)
     ax.legend(fontsize=8)
     for ax, origin in zip(axes[1], ("stage1_clonal_recheck", "stage2_near_clonal_recheck")):
         matrix = np.zeros((4, 4), int)

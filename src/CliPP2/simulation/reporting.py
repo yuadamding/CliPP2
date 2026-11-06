@@ -25,6 +25,33 @@ def _within(root, relative):
     return path
 
 
+def validate_cached_evaluation(record, job, path):
+    """Reject decoded but structurally invalid caches with their retained context."""
+    from .evaluation import record_evaluation_definition
+    prefix = f"Invalid cached evaluation for cell {job['cell_id']} at {path}: "
+    try:
+        if not isinstance(record, Mapping):
+            raise ValueError("expected a JSON object")
+        for field in ("cell_id", "history_id", "family"):
+            if record.get(field) != job[field]:
+                raise ValueError(f"{field} is missing or differs from the frozen cell")
+        if record.get("acquisition_id") != job["acquisition"]["id"]:
+            raise ValueError("acquisition_id is missing or differs from the frozen cell")
+        metrics = record.get("metrics")
+        if not isinstance(metrics, list) or any(not isinstance(row, Mapping) for row in metrics):
+            raise ValueError("metrics must be a list of metric objects")
+        for row in metrics:
+            if any(not isinstance(row.get(field), str) or not row[field] for field in ("name", "arm")):
+                raise ValueError("each metric requires a name and arm")
+            if "value" not in row or not (row["value"] is None or isinstance(row["value"], (int, float))
+                    or row["value"] in ("Infinity", "-Infinity")):
+                raise ValueError("each metric requires a numeric or missing value")
+        record_evaluation_definition(record)
+    except (ValueError, TypeError) as error:
+        raise ValueError(prefix + str(error)) from error
+    return record
+
+
 def preserved_jobs(root):
     """Read submitted jobs without reopening or regenerating an old cohort."""
     result = {}

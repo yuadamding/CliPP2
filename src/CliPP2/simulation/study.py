@@ -763,7 +763,7 @@ def report(root, *, evaluation_config=None, report_dir=None):
     from .evaluation import aggregate, normalize_evaluation_config, evaluation_definition, legacy_evaluation_definition
     from .figures import make_figures
     from .runtime import recorded_costs, qualification_costs
-    from .reporting import planned_roster, reevaluate_cell, placeholder_for_cell
+    from .reporting import planned_roster, reevaluate_cell, placeholder_for_cell, validate_cached_evaluation
     root = Path(root).resolve()
     contract = read_json(root / "study_contract.json")
     derive = evaluation_config is not None
@@ -805,7 +805,8 @@ def report(root, *, evaluation_config=None, report_dir=None):
             value = reevaluate_cell(root, cell, evaluation_config)
         else:
             try:
-                value = read_json(root / cell["evaluations"][0])
+                cached_path = root / cell["evaluations"][0]
+                value = read_json(cached_path)
             except (OSError, ValueError, IndexError, KeyError):
                 value = placeholder_for_cell(root, cell, evaluation_config)
                 # Missing cached records retain the frozen study's definition.
@@ -814,6 +815,8 @@ def report(root, *, evaluation_config=None, report_dir=None):
                     evaluation_definition=definition, evaluation_definition_id=definition_id,
                     reference_match_atol=definition["reference_match_atol"],
                     reference_distance=definition["reference_distance"])
+            else:
+                validate_cached_evaluation(value, cell["job"], cached_path)
         evaluations.append(value)
     summary = aggregate(evaluations, planned_roster=roster["jobs"], roster_complete=roster["complete"],
                         expected_definition=definition, families=contract["families"])
@@ -828,15 +831,8 @@ def report(root, *, evaluation_config=None, report_dir=None):
                    operation_costs=costs, qualification_costs=qualification_costs(root),
                    report_mode="offline_reevaluation" if derive else "cached_metrics",
                    derived_evidence_unavailable=sum(e.get("status") == "unavailable_derived_evidence" for e in evaluations))
-    summary["population_counts"] = [dict(arm=arm, planned=planned,
-        executed=sum(row.get("execution_available") == 1
-            for row in summary.get("availability", []) if row["arm"] == arm),
-        scientifically_applicable=sum(row.get("scientifically_applicable") == 1
-            for row in summary.get("availability", []) if row["arm"] == arm),
-        evaluated=sum(row.get("evaluation_available") == 1
-            for row in summary.get("availability", []) if row["arm"] == arm),
-        unavailable_derived=sum(e.get("status") == "unavailable_derived_evidence" for e in evaluations))
-        for arm in ("A", "B", "C", "B3", "C3")]
+    for counts in summary.get("population_counts", []):
+        counts["planned"] = planned
     report_dir = (Path(report_dir).resolve() if report_dir is not None else
                   root / "reports" / f"report-{len(list((root / 'reports').glob('report-*')))+1:03d}")
     if report_dir == root or (report_dir.is_relative_to(root) and report_dir.relative_to(root).parts[0] != "reports"):
@@ -888,6 +884,12 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
     allocation = read_json(root / "allocation.json") if (root / "allocation.json").exists() else {}
     development = read_json(root / "threshold_development.json") if (root / "threshold_development.json").exists() else {}
     selected = development.get("selected")
+    if allocation.get("resource_reduction_applied") is False or contract.get("profile") == "full":
+        allocation_description = "The explicit full-cohort allocation did not use timing or disk measurements to select its population."
+    elif allocation.get("measured_seconds"):
+        allocation_description = "The balanced allocation was frozen from timing and disk measurements before main generation."
+    else:
+        allocation_description = "The retained evidence does not establish a timing-based allocation procedure."
     text = ["<!doctype html><meta charset='utf-8'><title>CliPP2 biological simulation 1.2</title>",
         "<style>body{font:16px system-ui;max-width:1100px;margin:40px auto;line-height:1.5}img{max-width:100%}pre{white-space:pre-wrap}td,th{padding:6px;border:1px solid #ddd}table{border-collapse:collapse}</style>",
         "<h1>CliPP2 biological simulation 1.2</h1>",
@@ -896,7 +898,7 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
         f"Native fits executed across all phases: {summary['fit_count']}; full-support assignment passes: {summary['assignment_pass_count']}.</p>",
         f"<p>Executed scale: {contract['dimensions']['mutations']} mutations, {contract['dimensions']['segments']} segments, {contract['dimensions']['regions']} regions; "
         f"{allocation.get('main_histories_per_family', 0)} independent main histories per family. The proposed full scale is 1,500 mutations, 50 segments, 50 main and 10 development histories per family.</p>",
-        "<p>The allocation below was frozen from the timing and disk pilot before final generation. Repeated acquisitions share physical histories; uncertainty resamples histories and carries all paired arms together. A reduced cohort does not establish rare-event safety or noninferiority.</p>",
+        f"<p>{allocation_description} Repeated acquisitions share physical histories; uncertainty resamples histories and carries all paired arms together. A reduced cohort does not establish rare-event safety or noninferiority.</p>",
         "<h2>Frozen allocation and settings</h2><pre>"+html.escape(json.dumps(dict(allocation=allocation, selected=selected), indent=2))+"</pre>",
         "<h2>Applicability and scientific results</h2><p>Unknown and unavailable estimates remain explicit. Exact aliases and absent candidate explanations cannot be resolved by restoring integer support. Descriptive screens are not calibrated tests.</p>"]
     text.append("<h2>Evaluation definition and population</h2><pre>"+html.escape(json.dumps(dict(
