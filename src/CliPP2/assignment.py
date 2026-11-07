@@ -379,8 +379,9 @@ def _conditional_probabilities(catalog, source, region, phi, lower, upper, nativ
     """
     candidates = np.arange(lower, upper + 1, dtype=np.int64)
     purity = catalog.purity[source, region]
+    total_cn = catalog.major_cn[source, region] + catalog.minor_cn[source, region]
     denominator = ((1 - purity) * catalog.normal_cn[source, region]
-                   + purity * catalog.total_cn[source, region])
+                   + purity * total_cn)
     p = np.minimum((purity / denominator * candidates) * phi, 1.)
     alt, depth = catalog.alt_counts[source, region], catalog.total_counts[source, region]
     logs = xlogy(alt, p) + xlog1py(depth - alt, -p)
@@ -578,7 +579,8 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
                 ref_count=float(catalog.total_counts[source, j] - catalog.alt_counts[source, j]),
                 total_depth=float(catalog.total_counts[source, j]), purity=float(catalog.purity[source, j]),
                 original_major_cn=float(catalog.major_cn[source, j]), original_minor_cn=float(catalog.minor_cn[source, j]),
-                original_normal_cn=float(catalog.normal_cn[source, j]), original_total_cn=float(catalog.total_cn[source, j]),
+                original_normal_cn=float(catalog.normal_cn[source, j]),
+                original_total_cn=float(catalog.major_cn[source, j] + catalog.minor_cn[source, j]),
                 normal_cn_supplied=bool(catalog.normal_cn_supplied[source, j]),
                 segment_id=str(catalog.segment_ids[source, j]), mapping_genuine=bool(catalog.mapping_genuine[source, j]),
                 count_observed=bool(catalog.count_observed[source, j]), positive_depth=bool(catalog.total_counts[source, j] > 0),

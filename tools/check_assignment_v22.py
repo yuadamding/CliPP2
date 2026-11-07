@@ -209,6 +209,19 @@ def _loss_only_checks(root):
                 selected_diagnostics_once=True)
 
 
+def _scalar_cn_checks(root):
+    catalog = _catalog(root, "scalar_cn", [[20, 20], [8, 8], [20, 20], [8, 8]], 100, 4, minor=1)
+    request = _bundle(catalog, _reference(catalog, [[1., 1.], [.4, .4]]))
+
+    def forbidden(self):
+        raise AssertionError("Scalar assignment/publication built a whole-catalog total-CN array")
+
+    with patch.object(type(catalog), "total_cn", property(forbidden)):
+        result = assign_mutations(request, outdir=root / "scalar_cn_output")
+    assert all(row["original_total_cn"] == 5. for row in result.multiplicities)
+    return dict(whole_catalog_sums=0, assignment_and_independent_publication=True)
+
+
 def run_checks(directory):
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
@@ -216,6 +229,7 @@ def run_checks(directory):
     numerical_screen = _numerical_screen_checks(root)
     effective_support = _effective_support_checks(root)
     loss_only = _loss_only_checks(root)
+    scalar_cn = _scalar_cn_checks(root)
     exact = _catalog(root, "exact", 2, 3, 4)
     request = _bundle(exact, _reference(exact, [[1.]]))
     result = assign_mutations(request, outdir=root / "exact_output")
@@ -414,7 +428,7 @@ def run_checks(directory):
         immutable_quality_roundtrip=True, byte_identical_bundle_replay=True, independent_publication_checks=True,
         combined_publication_once=True, original_and_current_manifest_links=True, exact_schema_migration=True,
         generic_and_workflow_outcomes=True, numerical_screen=numerical_screen, effective_support=effective_support,
-        loss_only_scoring=loss_only)
+        loss_only_scoring=loss_only, scalar_cn=scalar_cn)
 
 
 if __name__ == "__main__":

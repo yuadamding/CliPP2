@@ -150,7 +150,8 @@ def _conditional_evidence(catalog, source, region, phi, low, high, call, native_
         raise ValueError("A defined conditional distribution requires a finite MAP")
     candidates = np.arange(low, high + 1)
     purity = catalog.purity[source, region]
-    denominator = (1-purity)*catalog.normal_cn[source, region] + purity*catalog.total_cn[source, region]
+    total_cn = catalog.major_cn[source, region] + catalog.minor_cn[source, region]
+    denominator = (1-purity)*catalog.normal_cn[source, region] + purity*total_cn
     p = np.minimum((purity/denominator*candidates)*phi, 1.)
     alt, depth = catalog.alt_counts[source, region], catalog.total_counts[source, region]
     logs = gammaln(depth+1)-gammaln(alt+1)-gammaln(depth-alt+1) + xlogy(alt, p) + xlog1py(depth-alt, -p)
@@ -180,8 +181,9 @@ def _independent_scores(catalog, source, reference, informative):
         width = int(catalog.major_cn[source, region])
         candidates = np.arange(1, width + 1)
         purity = catalog.purity[source, region]
+        total_cn = catalog.major_cn[source, region] + catalog.minor_cn[source, region]
         denominator = ((1-purity)*catalog.normal_cn[source, region]
-                       + purity*catalog.total_cn[source, region])
+                       + purity*total_cn)
         probabilities = np.minimum((purity/denominator*candidates)[None, :]
                                    * reference.centers[:, region, None], 1.)
         alt, depth = catalog.alt_counts[source, region], catalog.total_counts[source, region]
@@ -253,7 +255,8 @@ def validate_assignment_result(bundle, result):
             low, high = int(bundle.bounds.lower[i, j]), int(bundle.bounds.upper[i, j])
             actual = dict(original_lower=low, original_upper=high,
                 original_major_cn=catalog.major_cn[original, j], original_minor_cn=catalog.minor_cn[original, j],
-                original_normal_cn=catalog.normal_cn[original, j], original_total_cn=catalog.total_cn[original, j],
+                original_normal_cn=catalog.normal_cn[original, j],
+                original_total_cn=catalog.major_cn[original, j] + catalog.minor_cn[original, j],
                 alt_count=catalog.alt_counts[original, j], total_depth=catalog.total_counts[original, j],
                 ref_count=catalog.total_counts[original, j]-catalog.alt_counts[original, j], purity=catalog.purity[original, j],
                 normal_cn_supplied=bool(catalog.normal_cn_supplied[original, j]),
