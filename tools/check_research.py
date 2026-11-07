@@ -12,9 +12,13 @@ import tempfile
 
 
 GROUPS = ("workflow", "biology", "evaluation", "study", "publication")
+OPTIONAL_GROUPS = ("cuda-preflight", "cuda")
 
 
 def run_group(group, root, cohort_settings):
+    if group in OPTIONAL_GROUPS:
+        from check_native_diagnostics import run_cuda_qualification
+        return run_cuda_qualification(root, execute=group == "cuda")
     if group == "workflow":
         from check_workflow import run_checks
         return run_checks(root)
@@ -35,7 +39,8 @@ def run_group(group, root, cohort_settings):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--groups", nargs="+", choices=GROUPS, default=list(GROUPS))
+    parser.add_argument("--groups", nargs="+", choices=GROUPS+OPTIONAL_GROUPS, default=list(GROUPS),
+                        help="Default: five CPU research groups; cuda-preflight and cuda are opt-in")
     parser.add_argument("--outdir", type=Path)
     parser.add_argument("--cohort-settings", type=Path, default=Path("CliPP2_phylogeny_cohort_settings.json.gz"))
     args = parser.parse_args(argv)

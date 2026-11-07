@@ -208,3 +208,25 @@ true groups. Member overlap measures partition agreement, not center recovery.
 it never adds a production fit. Small synthetic qualification does not establish
 population-level biological improvement. CUDA requires its own built artifact and
 execution; these commands exercise CPU.
+
+CUDA weight qualification is opt-in and excluded from the default five research
+check groups:
+
+```sh
+python tools/check_research.py --groups cuda-preflight --outdir results/cuda-preflight
+python tools/check_research.py --groups cuda --outdir results/cuda-qualification
+```
+
+Preflight validates the controlled fixtures, CPU log-sum-exp objective and
+stationarity checks, and mocked import boundaries; it always records
+`gpu_arithmetic_qualified=false`. The `cuda` group requires a matching CUDA build
+and an accessible GPU. It exercises both resident schedules at N=128/129 and
+q=20/21, the private same-input graph hook, mixed-size batches, lease reuse,
+duplicate columns, boundary weights, and finite-underflow/structural-zero cases.
+Nonunique weights are compared through objectives and convergence conditions.
+Each `cuda_qualification.json` retains fixture identities, starts, results,
+execution diagnostics, source revision, native build identities, compiler and
+GPU details. Missing CUDA support or a failed check exits nonzero with retained
+failure evidence; there is no CPU fallback. These checks qualify only fixed-center
+weight fitting. Native CUDA cleanup remains deferred until a real GPU baseline
+passes; CPU preflight alone does not qualify GPU arithmetic.

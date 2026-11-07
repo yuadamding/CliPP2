@@ -339,3 +339,355 @@ def run_native_diagnostic_checks(directory):
                 stable_finite_gap_log_probability=True, underflow_cannot_imply_certainty=True,
                 impossible_alternative_and_singleton_certainty=True,
                 tied_and_nonmap_sources_rejected=True, absolute_emission_unchanged=True)
+
+
+def _cuda_weight_fixtures():
+    """Controlled columns independent of biological fitting or GPU availability."""
+    fixtures = []
+    for n, q in ((128, 20), (129, 20), (128, 21), (129, 21), (8, 1)):
+        columns = -.01*np.arange(n)[:, None] - 4.*(np.arange(q)[None, :] != (np.arange(n) % q)[:, None])
+        fixtures.append(dict(name=f"boundary_{n}_{q}", columns=columns, start=np.eye(1, q)[0]))
+    columns = fixtures[0]["columns"][:, :10]
+    fixtures.append(dict(name="duplicate_columns", columns=np.repeat(columns, 2, axis=1), start=np.arange(1., 21.)))
+    fixtures.append(dict(name="boundary_optimum", columns=-.01*np.arange(129)[:, None]-np.arange(21)[None, :],
+                         start=np.eye(21)[-1]))
+    columns = np.full((129, 21), -11000.)
+    columns[np.arange(129), np.arange(129) % 3] = -10000.
+    fixtures.append(dict(name="finite_underflow", columns=columns, start=np.eye(21)[-1]))
+    columns = np.full((129, 3), -np.inf)
+    columns[np.arange(129), np.arange(129) % 3] = 0.
+    fixtures.append(dict(name="structural_support_zero_start", columns=columns, start=np.array([0., 1., 0.])))
+    from CliPP2.io.data import content_hash
+    for item in fixtures:
+        item["fixture_id"] = content_hash(dict(schema="clipp2.cuda-weight-fixture.v1", name=item["name"],
+            columns=item["columns"], initial_weights=item["start"]))
+    return fixtures
+
+
+def _cuda_weight_oracle(columns, weights):
+    """Independent logsumexp objective and simplex derivatives, without clipping."""
+    from scipy.special import logsumexp
+    weights = np.asarray(weights, dtype=float)
+    assert weights.shape == (columns.shape[1],) and np.isfinite(weights).all() and np.all(weights >= 0)
+    np.testing.assert_allclose(weights.sum(), 1., rtol=0, atol=1e-12)
+    offsets = columns.max(axis=1)
+    assert np.isfinite(offsets).all()
+    shifted = columns-offsets[:, None]
+    with np.errstate(divide="ignore"):
+        mass = logsumexp(shifted+np.log(weights), axis=1)
+    assert np.isfinite(mass).all()
+    scores = np.exp(logsumexp(shifted-mass[:, None], axis=0)-np.log(len(columns)))
+    np.testing.assert_allclose(weights@scores, 1., rtol=0, atol=2e-12)
+    return dict(log_likelihood=float(np.sum(offsets+mass)), centered_log_likelihood=float(mass.sum()),
+        weight_optimality_gap=len(columns)*max(0., float(scores.max()-1.)),
+        weight_active_score_gap=float(scores.max()-scores[weights > 0].min()),
+        weighted_score_sum=float(weights@scores))
+
+
+def _cuda_check_result(fixture, result, reference):
+    """Compare objectives and unchanged gates, allowing nonunique optimal weights."""
+    n = len(fixture["columns"])
+    oracle = _cuda_weight_oracle(fixture["columns"], result["cluster_weights"])
+    for checked in (result, oracle):
+        assert 0 <= checked["weight_optimality_gap"] <= n*1e-8
+        assert 0 <= checked["weight_active_score_gap"] <= 1e-8
+    np.testing.assert_allclose(result["log_likelihood"], oracle["log_likelihood"], rtol=0, atol=1e-7)
+    np.testing.assert_allclose(oracle["centered_log_likelihood"], reference["centered_log_likelihood"],
+                               rtol=0, atol=max(1e-7, 2*n*1e-8))
+    return oracle
+
+
+def _cuda_graph_weights(backend, problems, starts):
+    """Private hook retained solely for same-input small/graph qualification."""
+    import ctypes as ct
+    from CliPP2.kernel.backend import _ptr
+    function = backend.lib.CliPP2QualifyResidentGraphWeights
+    function.argtypes = ([ct.c_void_p, ct.c_int64, ct.POINTER(ct.c_int64)]
+        + [ct.POINTER(ct.c_double)]*5 + [ct.POINTER(ct.c_int32), ct.POINTER(ct.c_int64)])
+    function.restype = ct.c_int
+    count, total = len(problems), sum(problem.shape[1] for problem in problems)
+    handles = np.asarray([problem.handle for problem in problems], dtype=np.int64)
+    initial = np.concatenate(starts)
+    weights = np.full(total, np.nan)
+    likelihood, optimality, active = (np.full(count, np.nan) for _ in range(3))
+    statuses, counters = np.full(count, -1, np.int32), np.full((count, 6), -1, np.int64)
+    with backend.weight_submission():
+        backend._check(function(backend.context, count, _ptr(handles), _ptr(initial), _ptr(weights),
+            _ptr(likelihood), _ptr(optimality), _ptr(active), statuses.ctypes.data_as(ct.POINTER(ct.c_int32)), _ptr(counters)))
+    records, cursor = [], 0
+    for i, problem in enumerate(problems):
+        q = problem.shape[1]
+        records.append(dict(native_status=int(statuses[i]), cluster_weights=weights[cursor:cursor+q].copy(),
+            log_likelihood=float(likelihood[i]), weight_optimality_gap=float(optimality[i]),
+            weight_active_score_gap=float(active[i]), counters=counters[i].tolist()))
+        cursor += q
+    return records
+
+
+def _cuda_backend(n):
+    from types import SimpleNamespace
+    from CliPP2.io.data import TumorData
+    from CliPP2.kernel.observations import prepare_observations
+    shape = n, 1
+    data = TumorData("cuda_qualification", tuple(f"m{i}" for i in range(n)), ("r",),
+        np.zeros(shape), np.ones(shape), np.ones(shape), np.ones(shape), np.ones(shape), np.full(shape, 2))
+    return NativeBackend(SimpleNamespace(n=n, r=1, device="cuda", **prepare_observations(data)), cpu_threads=1)
+
+
+def _cuda_import(backend, columns):
+    import ctypes as ct
+    from CliPP2.kernel.backend import DeviceColumn, _array, _ptr
+    handles = np.zeros(columns.shape[1], dtype=np.int64)
+    values = _array(columns.T)
+    function = backend.lib.CliPP2ImportJointColumns
+    function.argtypes = [ct.c_void_p, ct.c_int64, ct.POINTER(ct.c_double), ct.POINTER(ct.c_int64)]
+    function.restype = ct.c_int
+    backend._check(function(backend.context, len(handles), _ptr(values), _ptr(handles)))
+    return tuple(DeviceColumn(backend, handle) for handle in handles)
+
+
+def _cuda_boundary_preflight():
+    """Check qualification adapter payloads without loading a CUDA binary."""
+    import ctypes as ct
+    import sys
+    from types import SimpleNamespace
+    from unittest.mock import Mock, patch
+    with patch.object(sys.modules[__name__], "NativeBackend") as constructor:
+        _cuda_backend(3)
+        model = constructor.call_args.args[0]
+        assert (model.n, model.r, model.device) == (3, 1, "cuda")
+        assert constructor.call_args.kwargs == {"cpu_threads": 1}
+        for field, expected in (("alt", 0), ("depth", 1), ("scaling", .5),
+                                ("support", 1), ("multiplicity_min", 1), ("observed", True)):
+            np.testing.assert_array_equal(getattr(model, field), np.full((3, 1), expected))
+    class Owner:
+        n, context, status = 3, ct.c_void_p(77), 0
+        def _check(self, code):
+            if code:
+                raise ValueError("controlled import rejection")
+    owner = Owner()
+    expected = np.array([[0., -np.inf], [-1., -2.], [-3., -4.]])
+    def imported(context, count, values, output):
+        assert context is owner.context and count == 2
+        np.testing.assert_array_equal(np.ctypeslib.as_array(values, shape=(6,)).reshape(2, 3).T, expected)
+        output[0], output[1] = 101, 102
+        return owner.status
+    owner.lib = SimpleNamespace(CliPP2ImportJointColumns=Mock(side_effect=imported),
+                                CliPP2ReleaseJointColumns=Mock(return_value=0))
+    columns = _cuda_import(owner, expected)
+    assert [column.handle for column in columns] == [101, 102]
+    assert owner.lib.CliPP2ImportJointColumns.restype is ct.c_int
+    for column in columns:
+        column.close()
+    assert owner.lib.CliPP2ReleaseJointColumns.call_count == 2
+    owner.status = 2
+    try:
+        _cuda_import(owner, expected)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Import error was ignored")
+    return dict(validated_observation_payload=True, explicit_ctypes_import=True,
+                column_major_transfer=True, native_status_propagated=True, gpu_execution=False)
+
+
+def _cuda_execute(fixtures, references, report):
+    from contextlib import ExitStack
+    from CliPP2.kernel.backend import NativeExecutionError, WeightBatchCancelled
+    from CliPP2.kernel.resident_weights import fit_resident_weights
+    by_name = {item["name"]: item for item in fixtures}
+    for n in sorted({len(item["columns"]) for item in fixtures}):
+        report["active_request"] = dict(stage="backend_create", mutations=n)
+        with _cuda_backend(n) as backend, ExitStack() as leases:
+            report["loaded_backends"].append(dict(mutations=n, kind=backend.kind,
+                build_id=backend.identity, numerical_policy=backend.policy))
+            selected = [item for item in fixtures if len(item["columns"]) == n]
+            problems = {}
+            for item in selected:
+                report["active_request"] = dict(stage="column_import", name=item["name"], fixture_id=item["fixture_id"])
+                columns = _cuda_import(backend, item["columns"])
+                try:
+                    np.testing.assert_array_equal(backend.export_joint_columns(columns), item["columns"])
+                    problems[item["name"]] = leases.enter_context(backend.mixture_problem(columns))
+                finally:
+                    for column in columns:
+                        column.close()
+            assert backend.scoring_diagnostics()["live_column_handles"] == 0
+
+            def execute(names, label, *, graph=False, repeat=False, replace_geometry=False):
+                report["active_request"] = dict(stage="resident_weights", names=names, batch=label, force_graph=graph)
+                before = backend.resident_execution_diagnostics()
+                request = [problems[name] for name in names]
+                starts = [by_name[name]["start"] for name in names]
+                callbacks = []
+                if graph:
+                    results = _cuda_graph_weights(backend, request, starts)
+                else:
+                    def completed(index, record):
+                        with backend.weight_submission():
+                            callbacks.append((index, record["boundary"]))
+                    outcomes = fit_resident_weights(backend, request, starts, progress_callback=completed)
+                    results = [dict(native_status=0, **outcome.result) if outcome.operation == "complete" else
+                        dict(native_status=3, error=str(outcome.error)) for outcome in outcomes]
+                    assert callbacks == [(i, "solve_complete" if result["native_status"] == 0 else "solve_failed")
+                                         for i, result in enumerate(results)]
+                after = backend.resident_execution_diagnostics()
+                expected_graph = graph or n > 128 or max(problem.shape[1] for problem in request) > 20
+                assert (after["graph_launches"] > before["graph_launches"]) == expected_graph
+                assert after["workspace_resets"] == before["workspace_resets"]+1 and after["live_owner"] == 0
+                if repeat:
+                    assert after["arena_reuses"] > before["arena_reuses"]
+                    if expected_graph:
+                        assert after["graph_reuses"] > before["graph_reuses"]
+                if replace_geometry:
+                    assert after["arena_allocations"] > before["arena_allocations"]
+                    assert after["workspace_releases"] > before["workspace_releases"]
+                for name, result in zip(names, results):
+                    item = by_name[name]
+                    record = dict(name=name, fixture_id=item["fixture_id"], batch=label, force_graph=graph,
+                        schedule="graph" if expected_graph else "small", dimensions=list(item["columns"].shape),
+                        initial_weights=item["start"], result=result, diagnostics_before=before, diagnostics_after=after,
+                        execution_status={0: "complete", 3: "scientific_nonconvergence"}.get(
+                            result["native_status"], "execution_error"),
+                        qualification_status="pending")
+                    report["cases"].append(record)
+                    try:
+                        assert result["native_status"] == 0, f"{name}: unexpected resident nonconvergence"
+                        record["oracle"] = _cuda_check_result(item, result, references[name])
+                        record["qualification_status"] = "passed"
+                    except Exception:
+                        record["qualification_status"] = "failed"
+                        raise
+            for item in selected:
+                execute([item["name"]], "single")
+                execute([item["name"]], "repeat", repeat=True)
+                if item["name"] == "boundary_128_20":
+                    execute([item["name"]], "forced_graph", graph=True)
+                    execute([item["name"]], "forced_graph_repeat", graph=True, repeat=True)
+            names = [item["name"] for item in selected]
+            if len(names) > 1:
+                execute(names, "mixed_q", replace_geometry=True)
+                execute(names, "mixed_q_repeat", repeat=True)
+                sizes = [problems[name].shape[1] for name in names]
+                execute(names[::-1], "reordered_mixed_q", repeat=sizes == sizes[::-1],
+                        replace_geometry=sizes != sizes[::-1])
+                execute(names[::-1], "reordered_mixed_q_repeat", repeat=True)
+            first = problems[names[0]]
+            report["active_request"] = dict(stage="ownership_and_error_boundaries", mutations=n)
+            before = backend.resident_execution_diagnostics()["workspace_resets"]
+            for request, starts, cancelled, error_type in (
+                    ([first, first], None, None, ValueError), ([first], [np.zeros(first.shape[1])], None, ValueError),
+                    ([first], None, lambda: True, WeightBatchCancelled)):
+                try:
+                    fit_resident_weights(backend, request, starts, cancelled=cancelled)
+                except error_type:
+                    pass
+                else:
+                    raise AssertionError("Invalid/cancelled resident request was accepted")
+            assert backend.resident_execution_diagnostics()["workspace_resets"] == before
+            cancellation = iter([False, True])
+            try:
+                fit_resident_weights(backend, [first], cancelled=lambda: next(cancellation))
+            except WeightBatchCancelled:
+                pass
+            else:
+                raise AssertionError("Post-call cancellation was ignored")
+            execute([names[0]], "after_cancellation")
+            report["active_request"] = dict(stage="ownership_and_error_boundaries", mutations=n)
+            with _cuda_backend(n) as other:
+                try:
+                    fit_resident_weights(other, [first])
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("A cross-context lease was accepted")
+            impossible = np.zeros((n, 2))
+            impossible[0] = -np.inf
+            columns = _cuda_import(backend, impossible)
+            try:
+                try:
+                    with backend.mixture_problem(columns):
+                        raise AssertionError("A mutation without finite support was accepted")
+                except ValueError:
+                    pass
+            finally:
+                for column in columns:
+                    column.close()
+            execute([names[0]], "after_rejected_input")
+            first.close()
+            try:
+                fit_resident_weights(backend, [first])
+            except NativeExecutionError:
+                pass
+            else:
+                raise AssertionError("A closed lease was accepted")
+            leases.close()
+            final = backend.scoring_diagnostics()
+            assert final["live_column_handles"] == final["live_mixture_problems"] == 0
+            assert backend.resident_execution_diagnostics()["live_owner"] == 0
+            report["ownership"].append(dict(mutations=n, status="passed", columns_released_before_solve=True,
+                invalid_and_cancelled_requests=True, no_support_rejected=True, diagnostics=backend.diagnostics()))
+    report.pop("active_request", None)
+
+
+def run_cuda_qualification(directory, *, execute=False):
+    """Opt-in real GPU qualification; CPU preflight cannot qualify GPU arithmetic."""
+    import json
+    import os
+    import subprocess
+    import sys
+    from CliPP2.io.data import json_value
+    from CliPP2.kernel.build_identity import backend_identity, native_identity
+    from CliPP2.kernel.scoring import fit_mixture_weights
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    output = directory / "cuda_qualification.json"
+    if output.exists():
+        raise FileExistsError(output)
+    def command(args):
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=10, check=False)
+            return dict(returncode=result.returncode, stdout=result.stdout.strip(), stderr=result.stderr.strip())
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return dict(status="unavailable", error=str(error))
+    repository = Path(__file__).resolve().parents[1]
+    report = dict(schema="clipp2.cuda-weight-qualification.v1", mode="cuda" if execute else "cpu_preflight",
+        status="running", gpu_arithmetic_qualified=False, source_files_modified_by_qualification=False,
+        source_revision=command(["git", "-C", str(repository), "rev-parse", "HEAD"]),
+        source_worktree=command(["git", "-C", str(repository), "status", "--porcelain"]),
+        native_builds=dict(controller=native_identity(), cpu=backend_identity("cpu"), cuda=backend_identity("cuda")),
+        environment=dict(python=sys.version, numpy=np.__version__, cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES")),
+        numerical_gates=dict(mean_optimality_gap=1e-8, active_score_gap=1e-8,
+            weight_sum_atol=1e-12, native_log_likelihood_atol=1e-7,
+            centered_objective_atol="max(1e-7, 2*N*1e-8), bounds combined solver optimality gaps"),
+        cpu_cases=[], cases=[], ownership=[], loaded_backends=[])
+    error = None
+    try:
+        if not __debug__:
+            raise RuntimeError("CUDA qualification requires Python assertions enabled")
+        report["boundary_preflight"] = _cuda_boundary_preflight()
+        fixtures, references = _cuda_weight_fixtures(), {}
+        for item in fixtures:
+            result = fit_mixture_weights(item["columns"], item["start"])
+            oracle = _cuda_weight_oracle(item["columns"], result["cluster_weights"])
+            _cuda_check_result(item, result, oracle)
+            references[item["name"]] = oracle
+            report["cpu_cases"].append(dict(name=item["name"], fixture_id=item["fixture_id"],
+                dimensions=list(item["columns"].shape), initial_weights=item["start"], result=result, oracle=oracle))
+        if execute:
+            report["environment"].update(nvcc=command(["nvcc", "--version"]),
+                gpu=command(["nvidia-smi", "--query-gpu=index,uuid,name,driver_version", "--format=csv,noheader"]))
+            _cuda_execute(fixtures, references, report)
+            report.update(status="passed", gpu_arithmetic_qualified=True)
+        else:
+            report["status"] = "passed_cpu_preflight"
+    except Exception as caught:
+        error = caught
+        report.update(status="failed", error=dict(type=type(caught).__name__, message=str(caught)))
+    with output.open("x", encoding="utf-8") as stream:
+        json.dump(json_value(report), stream, indent=2, allow_nan=False)
+        stream.write("\n")
+    if error is not None:
+        raise RuntimeError(f"CUDA qualification {report['status']}; evidence: {output}") from error
+    return json_value(report)
