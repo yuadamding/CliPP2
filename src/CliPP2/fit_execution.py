@@ -71,6 +71,7 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
             'tumor_id': data.tumor_id, 'algorithm': ALGORITHM, 'model_version': model.model_version,
             'protocol_version': PROTOCOL_VERSION, 'implementation_version': __version__,
             'run_manifest_id': run_manifest_id,
+            'normal_cn_policy': data.normal_cn_policy,
             'provenance_policy': 'biological_and_numerical_identity_no_file_checksums',
             'biological_identity': (None if data.original_catalog is None else
                                     data.original_catalog.biological_identity),
@@ -99,7 +100,7 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
         }
         receipt = dict(schema='clipp2.fit-producer.v2', run_manifest=run_manifest, **{key: summary[key] for key in (
             'tumor_id', 'protocol_version', 'implementation_version', 'provenance_policy',
-            'run_manifest_id', 'biological_identity', 'algorithm', 'model_version', 'kernel_version', 'fit_config', 'model_identity',
+            'run_manifest_id', 'normal_cn_policy', 'biological_identity', 'algorithm', 'model_version', 'kernel_version', 'fit_config', 'model_identity',
             'multiplicity_support', 'execution', 'publication', 'qualification_scope')})
         fit = result.selected.fit
         order, labels = public_label_order(fit)

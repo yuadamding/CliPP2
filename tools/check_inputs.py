@@ -74,6 +74,63 @@ def _normal_provenance(directory, catalog):
                 explicit_policy_matches_assumption=True)
 
 
+def check_normal_cn_fit_metadata(directory):
+    """Assumption provenance differs; identical numeric observations do not."""
+    from CliPP2.api import process_tumor
+    from CliPP2.fit_execution import fit_prepared
+    from CliPP2.io.data import json_value
+    from check_support import write_catalog
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    supplied_path = directory / "supplied.tsv"
+    supplied = write_catalog(supplied_path, [[30, 32], [29, 31], [12, 15], [11, 14]], 100,
+        2, minor=1, purity=[.65, .8], metadata={"tumor_id": "normal_policy"})
+    assumed_path = directory / "assumed.tsv"
+    frame = pd.DataFrame([dict(row) for row in supplied.source_rows])
+    write_tumor_txt(assumed_path, frame.assign(normal_cn_supplied=0),
+                    dict(supplied.metadata))
+    assumed = load_original_catalog(assumed_path)
+    assert supplied.normal_cn_supplied.all() and not assumed.normal_cn_supplied.any()
+    config = replace(workflow_config().fit, max_clusters=2)
+    with patch("CliPP2.fit_execution.fit_prepared", side_effect=AssertionError("Missing policy reached fitting")):
+        expect_value_error(lambda: process_tumor(assumed_path, directory / "unauthorized", config))
+        expect_value_error(lambda: _fit_accepted(assumed, assumed.mutation_ids, None,
+            directory / "unauthorized_workflow", "stage_one", config, None))
+    executions, tables = [], []
+    for name, path, catalog, policy in (("supplied", supplied_path, supplied, None),
+            ("assumed", assumed_path, assumed, "diploid"),
+            ("supplied_explicit", supplied_path, supplied, "diploid")):
+        def capture(*args, **kwargs):
+            execution = fit_prepared(*args, **kwargs)
+            executions.append(execution)
+            return execution
+        ordinary = directory / name
+        with patch("CliPP2.fit_execution.fit_prepared", side_effect=capture):
+            summary = process_tumor(path, ordinary, config, normal_cn_policy=policy)
+            accepted = _fit_accepted(catalog, catalog.mutation_ids, None,
+                directory / (name + "_workflow"), "stage_one", config, None, normal_cn_policy=policy)
+        assert summary["normal_cn_policy"] == policy
+        assert all(execution.producer_receipt["normal_cn_policy"] == policy for execution in executions[-2:])
+        assert json_value(accepted.producer_receipt) == json_value(executions[-1].producer_receipt)
+        assert accepted.validate(catalog, device="cpu", cpu_threads=1).producer_receipt == accepted.producer_receipt
+        tables.append({filename: (ordinary / filename).read_bytes() for filename in summary["publication"]["files"]})
+        assert tables[-1] == {filename: (directory / (name + "_workflow") / filename).read_bytes()
+                             for filename in summary["publication"]["files"]}
+    baseline = executions[0]
+    for execution in executions[1:]:
+        assert execution.summary["model_identity"] == baseline.summary["model_identity"]
+        assert execution.fit.score == baseline.fit.score
+        for field in ("centers", "weights"):
+            np.testing.assert_array_equal(getattr(execution.fit, field), getattr(baseline.fit, field))
+        for field in ("public_labels", "multiplicities"):
+            np.testing.assert_array_equal(getattr(execution, field), getattr(baseline, field))
+    assert tables[0] == tables[1] == tables[2]
+    return dict(supplied_none=True, assumed_diploid=True, supplied_explicit_diploid=True,
+                unauthorized_missing_normal_rejected=True, common_and_workflow_receipts_agree=True,
+                numerical_identity_and_results_unchanged=True, published_tables_identical=True)
+
+
 def run_input_checks(directory):
     """Exercise admitted masked inputs through fitting and accepted-state replay."""
     directory = Path(directory)
@@ -131,6 +188,7 @@ def run_input_checks(directory):
     return dict(excluded_single_state_fit_screen_replay=True, single_state_contract=_single_state_contract(directory, catalog),
                 biological_namespace_checked_before_model=True, immutable_catalog_and_support=True,
                 normal_cn_provenance=_normal_provenance(directory, catalog),
+                normal_cn_fit_metadata=check_normal_cn_fit_metadata(directory / "normal_fit_metadata"),
                 explicit_input_exclusion=check_input_exclusion(directory))
 
 

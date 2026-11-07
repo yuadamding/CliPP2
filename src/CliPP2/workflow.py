@@ -272,7 +272,7 @@ def _fit_accepted(catalog, ids, bounds, outdir, stage, config, progress_callback
         _biological_hash(catalog, execution.mutation_ids), execution.summary["model_identity"], fit.score,
         fit.conditional_log_likelihood, fit.mixture_log_likelihood, fit.complexity_penalty,
         execution.summary["publication"]["verification"],
-        producer_receipt=dict(execution.producer_receipt, normal_cn_policy=normal_cn_policy),
+        producer_receipt=execution.producer_receipt,
         biological_identity=catalog.biological_identity, tumor_id=catalog.tumor_id)
     return replace(accepted, acceptance_evidence=dict(accepted.acceptance_evidence,
                                                      accepted_state_hash=accepted.state_fingerprint))
