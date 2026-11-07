@@ -354,6 +354,11 @@ def _partial_failure_checks():
         for arm in ('B', 'C', 'B3', 'C3'):
             assert metric(recovered_denominator, 'execution_failure', arm)['value'] == 0
             assert metric(recovered_denominator, 'execution_available', arm)['value'] == 0
+        # Present malformed evidence is not equivalent to absent publication.
+        paired_path.write_text('null')
+        malformed_payload = placeholder_for_cell(root, early, None)
+        assert malformed_payload['original_evaluable_count'] is None
+        assert metric(malformed_payload)['value'] is None
         # Malformed returned target evidence cannot claim C3 analysis availability.
         for malformed in ({}, dict(assignments=[])):
             invalid = deepcopy(paired)
@@ -442,6 +447,7 @@ def _partial_failure_checks():
             missing_F_evidence_unknown=True, completed_upstream_availability_retained=True,
             success_plus_total_failure_mean=.5, all_unresolved_empty_population_zero=True,
             retained_accepted_targets_prevent_zero=True, recovered_denominator_preserves_total_failure_zero=True,
+            present_null_does_not_recover_denominator=True,
             malformed_assignment_availability_unknown=True, retained_scored_payload_available=True,
             operational_truth_invariance_cases=operational_cases, no_inference_calls=True)
 

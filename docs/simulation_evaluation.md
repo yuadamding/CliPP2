@@ -185,6 +185,25 @@ This reads retained truth, input counts, acquisition evidence, selected attempts
 and paired results, including archived results. Missing or ambiguous evidence is
 reported as unavailable. Truth and counts are not regenerated from a changed
 source path. Frozen development selection and original outputs stay intact.
+Verified single-state `original-catalog.v3` evidence from `f2d1fa1` can be
+reevaluated read-only. The retained catalog payload is checked against its original
+manifest and its original content-hash encoding before conversion. Its current
+working representation must then agree with the preserved input's scientific
+arrays, mutation/region keys, masks, source rows, metadata and provenance.
+Derived records state both `source_catalog_schema` and `working_catalog_schema`;
+neither original catalogs nor manifests are rewritten. Directory and archived
+configuration copies must agree when both remain.
+
+Present but unsupported formats receive `unsupported_artifact_format` and pinned
+producer guidance, not `conflicting_truth`. This includes older mixed-state
+catalogs, multiple historical CN rows for one observation, and historical
+near-one source fractions that the current exact single-state contract cannot
+represent unchanged. Such evidence is excluded from primary truth-dependent
+estimates. Altered counts, CN, keys, masks, provenance or identity bindings remain
+conflicts. Missing required evidence remains missing. Current-format evidence
+without a redundant catalog copy is usable only if the preserved input exactly
+matches the original manifest identity.
+
 Without a new evaluation configuration, cached-report behavior is retained.
 Cached reports resolve the complete frozen definition before reading cells.
 Every cached record must match that definition, even when all records are present

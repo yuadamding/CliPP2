@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
 import json
 from pathlib import Path
 import zipfile
@@ -9,7 +10,7 @@ import zipfile
 import numpy as np
 
 from CliPP2._version import __version__
-from CliPP2.io.data import content_hash
+from CliPP2.io.data import OriginalCatalog, content_hash
 from CliPP2.io.tumor_txt import load_original_catalog
 from CliPP2.provenance import validate_run_manifest
 
@@ -102,21 +103,121 @@ def planned_roster(root, contract, allocation, cells):
     return dict(jobs=list(known.values()), complete=False, status="unavailable_complete_frozen_roster", roster_id=None)
 
 
-def _configuration(attempt, index=1):
-    """Read a retained paired result, including interrupted archive publication."""
+class UnsupportedArtifactFormat(ValueError):
+    """Present historical evidence requires its producing implementation."""
+
+    def __init__(self, schema, reason, *, revision=None):
+        self.schema, self.revision = schema, revision or "the original producing revision"
+        super().__init__(f"Unsupported retained artifact {schema!r}: {reason}; use {self.revision} in its pinned environment")
+
+
+def _configuration_payload(attempt, name, index=1):
+    """Read selected configuration evidence without extracting or rewriting it."""
     directory = attempt / f"configuration-{index}"
     payloads = []
-    if (directory / "paired_result.json").is_file():
-        payloads.append(_read(directory / "paired_result.json"))
+    if (directory / name).is_file():
+        payloads.append(_read(directory / name))
     archive_path = directory.with_suffix(".zip")
     if archive_path.exists():
         with zipfile.ZipFile(archive_path) as archive:
-            payloads.append(json.loads(archive.read("paired_result.json")))
+            if name in archive.namelist():
+                payloads.append(json.loads(archive.read(name)))
     if not payloads:
-        raise FileNotFoundError("No preserved paired result for the selected attempt")
+        raise FileNotFoundError(f"No preserved {name} for the selected attempt")
     if any(content_hash(value) != content_hash(payloads[0]) for value in payloads[1:]):
-        raise ValueError("Directory and archived paired evidence disagree")
+        raise ValueError(f"Directory and archived {name} evidence disagree")
     return payloads[0]
+
+
+def _configuration(attempt, index=1):
+    return _configuration_payload(attempt, "paired_result.json", index)
+
+
+def _catalog_payload_hash(payload):
+    # Catalog v3/v4 identity retains Unicode; the enclosing manifest uses the
+    # separately defined io.data.content_hash encoding on the complete record.
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False,
+        separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def _catalog_evidence(attempt, paired):
+    """Validate the original representation before read-only working conversion."""
+    manifest = paired.get("run_manifest")
+    if not isinstance(manifest, Mapping) or not isinstance(manifest.get("input_identity"), Mapping):
+        raise ValueError("Missing original run manifest input binding")
+    if manifest.get("schema") != "clipp2.run-manifest.v2":
+        raise UnsupportedArtifactFormat(manifest.get("schema"), "run manifest format is not supported")
+    identity = manifest["input_identity"]
+    validate_run_manifest(manifest, tumor_id=identity.get("tumor_id"),
+                          biological_identity=identity.get("biological_identity"))
+    try:
+        published_manifest = _configuration_payload(attempt, "run_manifest.json")
+    except FileNotFoundError:
+        pass
+    else:
+        if content_hash(published_manifest) != content_hash(manifest):
+            raise ValueError("Paired and separately published original run manifests disagree")
+    try:
+        retained = _configuration_payload(attempt, "original_catalog.json")
+    except FileNotFoundError:
+        # Earlier minimal evidence can still prove an exact current representation.
+        catalog = load_original_catalog(attempt / "input_catalog.tsv")
+        if identity.get("original_catalog_identity") != content_hash(catalog.to_dict()):
+            raise FileNotFoundError("Original catalog representation is required to verify the manifest; "
+                                    "restore original_catalog.json or use the pinned producing revision") from None
+        retained = catalog.to_dict()
+    if not isinstance(retained, Mapping):
+        raise TypeError("Preserved original catalog must be a JSON object")
+    if identity.get("original_catalog_identity") != content_hash(retained):
+        raise ValueError("Original catalog payload differs from its retained manifest identity")
+    schema = retained.get("schema")
+    if schema not in ("clipp2.original-catalog.v3", "clipp2.original-catalog.v4"):
+        raise UnsupportedArtifactFormat(schema, "catalog serialization is not supported")
+    payload = {key: value for key, value in retained.items() if key != "content_hash"}
+    if retained.get("content_hash") != _catalog_payload_hash(payload):
+        raise ValueError("Original catalog payload content hash is invalid")
+    working = dict(payload)
+    if schema.endswith(".v3"):
+        counts = np.asarray(payload["cn_state_count"])
+        major, minor = np.asarray(payload["major_cn"]), np.asarray(payload["minor_cn"])
+        if (counts.shape != major.shape or counts.dtype.kind not in "iuf"
+                or not np.isfinite(counts).all() or np.any(counts < 1) or np.any(counts != np.rint(counts))):
+            raise ValueError("Historical catalog CN-state counts are invalid")
+        if np.any(counts != 1):
+            raise UnsupportedArtifactFormat(schema, "only verified single-state catalogs can be converted", revision="f2d1fa1")
+        source_rows = [dict(row) for row in payload["source_rows"]]
+        source_keys = [(row["mutation_id"], row["sample_id"]) for row in source_rows]
+        if len(source_keys) != len(set(source_keys)):
+            raise UnsupportedArtifactFormat(schema, "multiple original CN rows per observation require the historical loader",
+                                            revision="f2d1fa1")
+        fractions = np.asarray([float(row["cn_state_fraction"]) for row in source_rows])
+        if not np.allclose(fractions, 1., atol=1e-8, rtol=0):
+            raise ValueError("Historical single-state source fractions are invalid")
+        if np.any(fractions != 1.):
+            raise UnsupportedArtifactFormat(schema, "non-unit historical source fractions require the historical loader",
+                                            revision="f2d1fa1")
+        states = np.asarray(payload["cn_states"], dtype=float)
+        if (states.shape != (*major.shape, 1, 3)
+                or not np.allclose(states[..., 0, 0], 1., atol=1e-8, rtol=0)
+                or not np.array_equal(states[..., 0, 1], major)
+                or not np.array_equal(states[..., 0, 2], minor)
+                or not np.array_equal(np.asarray(payload["mean_total_cn"]), major+minor)):
+            raise ValueError("Historical single-state catalog CN definitions disagree with its biological arrays")
+        for key in ("cn_state_count", "cn_states", "mean_total_cn"):
+            del working[key]
+        working["schema"] = "clipp2.original-catalog.v4"
+    working["content_hash"] = _catalog_payload_hash(working)
+    catalog = OriginalCatalog.from_dict(working)
+    parsed = load_original_catalog(attempt / "input_catalog.tsv", max_major_cn=catalog.max_major_cn)
+    if content_hash(parsed.to_dict()) != content_hash(catalog.to_dict()):
+        raise ValueError("Retained catalog science, keys, masks or provenance differ from the preserved input")
+    validate_run_manifest(manifest, tumor_id=catalog.tumor_id, biological_identity=catalog.biological_identity)
+    compatibility = dict(source_catalog_schema=schema, working_catalog_schema=catalog.to_dict()["schema"],
+        source_catalog_identity=identity["original_catalog_identity"],
+        working_catalog_identity=content_hash(catalog.to_dict()),
+        conversion="verified_single_state_v3_to_v4" if schema.endswith(".v3") else "none",
+        original_manifest_preserved=True)
+    return catalog, compatibility
 
 
 def _load_evidence(root, cell):
@@ -137,7 +238,10 @@ def _load_evidence(root, cell):
         raise ValueError("Preserved physical history manifest differs from the selected job")
     if job.get("cohort_content_id") is not None and history_manifest.get("cohort_content_id") != job["cohort_content_id"]:
         raise ValueError("Preserved physical history belongs to a different cohort content")
-    history = History.from_dict(_read(directory / "history.json"))
+    history_payload = _read(directory / "history.json")
+    if isinstance(history_payload, Mapping) and history_payload.get("schema") != "clipp2.simulation.history.v1":
+        raise UnsupportedArtifactFormat(history_payload.get("schema"), "physical history format is not supported")
+    history = History.from_dict(history_payload)
     if job.get("cohort_content_id") is not None and history.metadata.get("cohort_content_id") != job["cohort_content_id"]:
         raise ValueError("Preserved truth belongs to a different cohort content")
     if history.family != job["family"] or history.metadata.get("seed") != job["history_seed"]:
@@ -148,7 +252,12 @@ def _load_evidence(root, cell):
     if (len(history.mutation_ids), len(history.region_ids), len(history.segment_keys)) != (
             dims["mutations"], dims["regions"], dims["segments"]):
         raise ValueError("Preserved history dimensions differ from the job")
-    catalog = load_original_catalog(attempt / "input_catalog.tsv")
+    paired = _configuration(attempt)
+    if not isinstance(paired, Mapping):
+        raise TypeError("Preserved paired inference must be a JSON object")
+    if paired.get("schema", "clipp2.paired-experiment.v3") != "clipp2.paired-experiment.v3":
+        raise UnsupportedArtifactFormat(paired.get("schema"), "paired inference format is not supported")
+    catalog, compatibility = _catalog_evidence(attempt, paired)
     if job.get("cohort_content_id") is not None and dict(catalog.metadata).get("cohort_content_id") != job["cohort_content_id"]:
         raise ValueError("Preserved input catalog belongs to a different cohort content")
     if catalog.tumor_id != job["cell_id"]:
@@ -170,16 +279,10 @@ def _load_evidence(root, cell):
                            ("supplied_segment_ids", "segment_ids"), ("input_excluded", "input_excluded")):
         if key in acquisition and not np.array_equal(np.asarray(acquisition[key]), getattr(catalog, attribute)):
             raise ValueError("Preserved acquisition and input catalog disagree on " + key)
-    paired = _configuration(attempt)
-    if not isinstance(paired, Mapping):
-        raise TypeError("Preserved paired inference must be a JSON object")
     if tuple(paired.get("original_mutation_ids", ())) != catalog.mutation_ids or tuple(paired.get("region_ids", ())) != catalog.region_ids:
         raise ValueError("Preserved paired inference has different original axes")
-    manifest = paired.get("run_manifest")
-    validate_run_manifest(manifest, tumor_id=catalog.tumor_id, biological_identity=catalog.biological_identity)
-    if manifest["input_identity"].get("original_catalog_identity") != content_hash(catalog.to_dict()):
-        raise ValueError("Preserved paired inference belongs to a different input catalog")
     truth_link = validate_history_acquisition_link(history, acquisition, catalog, history_manifest=history_manifest)
+    truth_link["catalog_compatibility"] = compatibility
     return history, catalog, paired, acquisition, truth_link
 
 
@@ -319,7 +422,17 @@ def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missi
         attempt = _within(root, cell["attempt"])
         if _read(attempt / "job.json") != job:
             raise ValueError("Selected attempt job differs")
-        catalog = load_original_catalog(attempt / "input_catalog.tsv")
+        try:
+            paired = _configuration(attempt)
+        except FileNotFoundError:
+            paired = None
+            # An early failure may precede paired publication. Retained input and
+            # acquisition can still establish its denominator, but not memberships.
+            catalog = load_original_catalog(attempt / "input_catalog.tsv")
+        else:
+            if not isinstance(paired, Mapping):
+                raise TypeError("Preserved paired inference must be a JSON object")
+            catalog, _ = _catalog_evidence(attempt, paired)
         if catalog.tumor_id != job["cell_id"]:
             raise ValueError("Original population belongs to another cell")
         region_count = len(catalog.region_ids)
@@ -333,13 +446,8 @@ def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missi
             count = len(evaluable)
         for name, source in predecision_sources.items():
             arms[name]["decision_population"] = _decision_population(set(), count, evaluable, source)
-        paired = _configuration(attempt)
-        if not isinstance(paired, Mapping):
-            raise TypeError("Preserved paired inference must be a JSON object")
-        validate_run_manifest(paired.get("run_manifest"), tumor_id=catalog.tumor_id,
-                              biological_identity=catalog.biological_identity)
-        if paired["run_manifest"]["input_identity"].get("original_catalog_identity") != content_hash(catalog.to_dict()):
-            raise ValueError("Paired evidence belongs to a different catalog")
+        if paired is None:
+            raise FileNotFoundError("No preserved paired result for membership recovery")
         root_failed = paired.get("status") == "failed" and paired.get("stage_one") is None
         rejection = paired.get("status") in ("no_eligible_clonal_reference", "blocked")
         retained = {"A": dict(available=bool(paired.get("stage_one")) if "stage_one" in paired else None)}
@@ -413,15 +521,22 @@ def reevaluate_cell(root, cell, evaluation_config):
                 acquisition_id=job["acquisition"]["id"], acquisition=job["acquisition"], phase=job["phase"], job=job,
                 status="derived_from_preserved_evidence")
     except (OSError, ValueError, KeyError, TypeError, AssertionError, zipfile.BadZipFile) as error:
-        qualification = ("conflicting_truth" if isinstance(error, (ValueError, AssertionError))
-                         else "missing_truth_evidence")
+        qualification = ("unsupported_artifact_format" if isinstance(error, UnsupportedArtifactFormat) else
+                         "conflicting_truth" if isinstance(error, (ValueError, AssertionError)) else "missing_truth_evidence")
         value = placeholder_for_cell(root, cell, evaluation_config, evidence_state=qualification,
                                      error=dict(type=type(error).__name__, message=str(error)))
+        if isinstance(error, UnsupportedArtifactFormat):
+            value["artifact_compatibility"] = dict(status=qualification, source_schema=error.schema,
+                                                  required_pinned_revision=error.revision)
     value["truth_qualification"] = qualification
     if truth_link is not None:
         value["truth_link"] = truth_link
+        value["catalog_compatibility"] = truth_link["catalog_compatibility"]
     value["derivation"] = dict(implementation_version=__version__, source_study=str(root),
         selected_attempt=cell.get("attempt"), source_implementation_version=cell.get("implementation_version"),
         source_protocol_version=cell.get("protocol_version"), inference_decisions_preserved=True,
         fit_count=0, assignment_pass_count=0, threshold_selection_count=0)
+    if truth_link is not None:
+        value["derivation"].update({key: truth_link["catalog_compatibility"][key]
+            for key in ("source_catalog_schema", "working_catalog_schema")})
     return value

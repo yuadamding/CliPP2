@@ -796,6 +796,129 @@ def _offline_report_check(root, history, job):
     assert invalid["status"] == "unavailable_derived_evidence" and "truth belongs" in invalid["error"]["message"]
 
 
+def _historical_catalog_report_check(root):
+    """Reevaluate real f2d1fa1 artifacts without changing their representation."""
+    from contextlib import ExitStack
+    import csv
+    from CliPP2.io.data import content_hash
+    from CliPP2.simulation.reporting import (_catalog_evidence, _catalog_payload_hash,
+        UnsupportedArtifactFormat, reevaluate_cell)
+    fixture_dir = Path(__file__).parent / "fixtures"
+    source = root / "source"
+    with zipfile.ZipFile(fixture_dir / "f2d1fa1_single_state_evidence.zip") as archive:
+        archive.extractall(source)
+    origin = read_json(source / "fixture_origin.json")
+    assert origin["producer_revision"] == "f2d1fa1b09dee8b363078f8cc7ab22a6a5263522"
+    assert origin["native_optimizer_calls"] == origin["assignment_passes"] == 0
+    cell = read_json(source / "cells/main-S01-H001-A4/completion.json")
+    config = dict(reference_match_atol=.05, reference_distance="l2")
+    before = {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+
+    def unpack(name, *, retain_zip=False):
+        directory = root / name
+        shutil.copytree(source, directory)
+        attempt = directory / cell["attempt"]
+        with zipfile.ZipFile(attempt / "configuration-1.zip") as archive:
+            archive.extractall(attempt / "configuration-1")
+        if not retain_zip:
+            (attempt / "configuration-1.zip").unlink()
+        return directory, attempt
+
+    def write(path, value):
+        path.write_text(json.dumps(value, allow_nan=False))
+
+    def rebind(attempt, payload):
+        configuration = attempt / "configuration-1"
+        payload["content_hash"] = _catalog_payload_hash({k: v for k, v in payload.items() if k != "content_hash"})
+        paired = read_json(configuration / "paired_result.json")
+        manifest = paired["run_manifest"]
+        manifest["input_identity"]["original_catalog_identity"] = content_hash(payload)
+        manifest["manifest_identity"] = content_hash({k: manifest[k] for k in ("run_manifest_id", "build", "input_identity")})
+        write(configuration / "original_catalog.json", payload)
+        write(configuration / "paired_result.json", paired)
+        write(configuration / "run_manifest.json", manifest)
+
+    with ExitStack() as stack:
+        for target in ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
+                       "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.study._history",
+                       "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.select_thresholds"):
+            stack.enter_context(patch(target, side_effect=AssertionError("Historical report attempted inference")))
+        stack.enter_context(patch("CliPP2.simulation.figures.make_figures", return_value=[]))
+        cached = report(source, report_dir=root / "cached_report")
+        assert cached["summary"]["report_mode"] == "cached_metrics"
+        assert all(row["truth_qualification"] == "verified_history_binding" for row in cached["summary"]["availability"])
+        output = report(source, evaluation_config=config, report_dir=root / "derived_report")
+        derived = read_json(Path(output["report"]).parent / "evaluations/evaluation-00001.json")
+        assert derived["status"] == "derived_from_preserved_evidence"
+        assert derived["truth_qualification"] == "verified_history_binding"
+        assert derived["catalog_compatibility"]["source_catalog_schema"] == "clipp2.original-catalog.v3"
+        assert derived["catalog_compatibility"]["working_catalog_schema"] == "clipp2.original-catalog.v4"
+        assert derived["derivation"]["fit_count"] == derived["derivation"]["assignment_pass_count"] == 0
+        directory, attempt = unpack("directory")
+        assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "verified_history_binding"
+        directory, attempt = unpack("archive_overlap", retain_zip=True)
+        assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "verified_history_binding"
+        payload_path = attempt / "configuration-1/original_catalog.json"
+        payload = read_json(payload_path)
+        payload["alt_counts"][0][0] += 1
+        write(payload_path, payload)
+        assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "conflicting_truth"
+        for field in ("alt_count", "allele_a_cn", "count_observed", "normal_cn_supplied"):
+            directory, attempt = unpack("input_" + field)
+            path = attempt / "input_catalog.tsv"
+            lines = path.read_text().splitlines()
+            header = next(i for i, line in enumerate(lines) if not line.startswith("#"))
+            rows = list(csv.reader(lines[header:], delimiter="\t"))
+            position = rows[0].index(field)
+            old = float(rows[1][position])
+            rows[1][position] = str(int(not old) if field in ("count_observed", "normal_cn_supplied") else int(old)+1)
+            path.write_text("\n".join(lines[:header] + ["\t".join(row) for row in rows])+"\n")
+            assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "conflicting_truth"
+        directory, attempt = unpack("catalog_tampering")
+        payload_path = attempt / "configuration-1/original_catalog.json"
+        payload = read_json(payload_path)
+        payload["major_cn"][0][0] += 1
+        write(payload_path, payload)
+        assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "conflicting_truth"
+        directory, attempt = unpack("unsupported")
+        payload = read_json(attempt / "configuration-1/original_catalog.json")
+        payload["schema"] = "clipp2.original-catalog.v999"
+        rebind(attempt, payload)
+        unsupported = reevaluate_cell(directory, cell, config)
+        assert unsupported["status"] == "unavailable_derived_evidence"
+        assert unsupported["truth_qualification"] == "unsupported_artifact_format"
+        assert unsupported["error"]["type"] == "UnsupportedArtifactFormat"
+        assert "pinned environment" in unsupported["error"]["message"]
+        assert unsupported["artifact_compatibility"]["required_pinned_revision"]
+        # An exact current identity can be proved even without a redundant catalog copy.
+        directory, attempt = unpack("current_no_catalog")
+        current = load_original_catalog(attempt / "input_catalog.tsv")
+        rebind(attempt, current.to_dict())
+        (attempt / "configuration-1/original_catalog.json").unlink()
+        assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "verified_history_binding"
+        probes = root / "format_probes"
+        with zipfile.ZipFile(fixture_dir / "f2d1fa1_catalog_format_probes.zip") as archive:
+            archive.extractall(probes)
+        for name in ("unicode", "collapsed_states", "near_one_fraction"):
+            attempt = probes / name
+            paired = read_json(attempt / "configuration-1/paired_result.json")
+            if name == "unicode":
+                _, compatibility = _catalog_evidence(attempt, paired)
+                assert compatibility["conversion"] == "verified_single_state_v3_to_v4"
+            else:
+                try:
+                    _catalog_evidence(attempt, paired)
+                except UnsupportedArtifactFormat as error:
+                    assert error.revision == "f2d1fa1"
+                else:
+                    raise AssertionError("Unsupported historical source representation was reinterpreted")
+    assert before == {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    return dict(status="passed", producer_revision=origin["producer_revision"], cached_and_explicit_reports=True,
+        directory_and_archive_supported=True, unicode_identity_preserved=True, altered_input_and_catalog_rejected=True,
+        unsupported_formats_distinct_from_truth_conflicts=True, source_files_unchanged=True,
+        fit_count=0, assignment_pass_count=0)
+
+
 def _structured_failure_checks(root):
     history, frame, job = _fixture()
     for case in ("stage_one", "capped_stage_two", "assignment", "no_reference", "blocked", "empty"):
@@ -997,12 +1120,13 @@ def run_checks(directory, cohort_settings):
     _partial_objective_check(root / "partial_objective", contract, history, frame, job)
     _planned_report_check(root / "unexecuted_report", contract)
     report_integrity = _report_integrity_check(root / "report_integrity")
+    historical_catalog = _historical_catalog_report_check(root / "historical_catalog")
     record_schema = _record_schema_report_check(root / "record_schema_reports")
     optional_execution = _optional_execution_report_check(root / "optional_execution_reports")
     partial_reports = _partial_evidence_report_checks(root / "partial_evidence_reports")
     result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4,
         lifecycle=lifecycle, resume=resume, partial_evidence_reports=partial_reports, record_schema=record_schema,
-        report_integrity=report_integrity,
+        report_integrity=report_integrity, historical_catalog=historical_catalog,
         optional_execution_reports=optional_execution,
         checks=["exact_60_variant_720_history_2640_cell_design", "full_10_20_strict_point05_contract",
                 "source_protocol21_execution22_and_cross_protocol_resume_rejection",
