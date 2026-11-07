@@ -405,6 +405,7 @@ def _declared_fit(catalog, stage, ids, labels, centers, support, calls):
 
 
 def _geometric_routing(directory):
+    from CliPP2.screening import summarize_profile_deviance
     catalog = write_catalog(directory / "geometric.tsv",
         [[250, 250], [300, 300], [250, 0], [300, 300], [237, 250], [237, 250]], 1000, 4,
         observed=[[1, 1], [1, 1], [1, 0], [1, 1], [1, 1], [1, 1]])
@@ -417,8 +418,13 @@ def _geometric_routing(directory):
     centers = [[1., 1.], [1., 1.], [.4, .4], [.95, 1.], [np.nextafter(.95, 1.), 1.]]
     second = _declared_fit(catalog, "stage_two", ids, np.arange(5), centers, caps,
         np.where(catalog.count_observed[1:], 1., np.nan))
-    selected = classify_groups(catalog, first, config)[0]
-    groups = classify_groups(catalog, second, config)
+    with patch("CliPP2.screening.summarize_profile_deviance", wraps=summarize_profile_deviance) as summarize:
+        first_groups = classify_groups(catalog, first, config)
+        assert summarize.call_count == 2 * len(first_groups)
+    selected = first_groups[0]
+    with patch("CliPP2.screening.summarize_profile_deviance", wraps=summarize_profile_deviance) as summarize:
+        groups = classify_groups(catalog, second, config)
+        assert summarize.call_count == 4 * len(groups)
     assert selected["classification"] == "clonal_merge_eligible"
     assert groups[0]["near_clonal"] and not groups[0]["native_fit_pass"] and not groups[0]["all_one_fit_pass"]
     assert groups[1]["near_clonal"] and not groups[1]["coverage_pass"]

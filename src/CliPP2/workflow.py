@@ -381,8 +381,9 @@ def classify_groups(catalog, fit, config):
                     and np.array_equal(observation.multiplicity_max, original_upper))
     original = native if same_support else _diagnostics_many(catalog, fit.mutation_ids,
         coordinates, original_bounds, config)[0]
-    diagnostics = dict(native=native[0], all_one=native[1],
-                       original_native=original[0], original_all_one=original[1])
+    diagnostics = dict(native=native[0], all_one=native[1])
+    if not same_support:
+        diagnostics.update(original_native=original[0], original_all_one=original[1])
     groups = []
     for label, center in enumerate(fit.centers):
         members = fit.labels == label
@@ -391,6 +392,8 @@ def classify_groups(catalog, fit, config):
         depths = np.where(mask, observation.depth[members], 0).sum(axis=0)
         screens = {name: summarize_profile_deviance(diagnostic["profile_deviance"][members],
                     mask, config.group_screen, axis=0) for name, diagnostic in diagnostics.items()}
+        if same_support:
+            screens.update(original_native=screens["native"], original_all_one=screens["all_one"])
         distance = float(np.linalg.norm(center - 1))
         coverage_ok = bool(np.all(coverage >= config.min_informative_per_region)
                            and np.all(depths >= config.min_depth_per_region))
