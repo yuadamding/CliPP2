@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import pickle
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -24,7 +25,7 @@ from CliPP2.cli import main as cli_main
 from CliPP2.config import PROTOCOL_VERSION
 from CliPP2.io.assignment import (load_accepted_fit, load_assignment_bundle, publish_assignment,
                                  save_assignment_bundle)
-from CliPP2.io.data import MultiplicityBounds, content_hash
+from CliPP2.io.data import MultiplicityBounds, OriginalCatalog, content_hash
 from CliPP2.io.region_files import read_region_directory
 from CliPP2.io.tumor_txt import load_original_catalog, load_tumor_txt, write_tumor_txt
 from CliPP2.kernel.backend import NativeBackend
@@ -40,6 +41,82 @@ from check_support import (write_catalog, fixture_reference, workflow_config,
 
 
 
+
+
+def check_purity_consistency(directory):
+    """Mean-tolerant source values retain one canonical input across every route."""
+    low, high = .799999999925, .800000000075
+    frame = pd.DataFrame([dict(mutation_id=f"m{i}", sample_id="r1", alt_count=20,
+        ref_count=80, count_observed=1, purity=purity, normal_cn=2, segment_id="s",
+        cn_state_id="0", cn_state_fraction=1, allele_a_cn=1, allele_b_cn=1)
+        for i, purity in enumerate((low, high))])
+    path = write_tumor_txt(directory / "purity.tsv", frame)
+    ordinary, catalog = load_tumor_txt(path), load_original_catalog(path)
+    np.testing.assert_array_equal(ordinary.purity, np.full((2, 1), low))
+    np.testing.assert_array_equal(catalog.purity, ordinary.purity)
+    np.testing.assert_array_equal(catalog.fit_data().purity, ordinary.purity)
+    assert [float(dict(row)["purity"]) for row in catalog.source_rows] == [low, high]
+    restored = OriginalCatalog.from_dict(catalog.to_dict())
+    assert restored.content_hash == catalog.content_hash
+    roundtrip = write_tumor_txt(directory / "purity_roundtrip.tsv",
+        pd.DataFrame([dict(row) for row in catalog.source_rows]), dict(catalog.metadata))
+    roundtrip_catalog = load_original_catalog(roundtrip)
+    assert roundtrip_catalog.source_rows == catalog.source_rows
+    assert dict(roundtrip_catalog.metadata) == dict(catalog.metadata)
+    np.testing.assert_array_equal(roundtrip_catalog.purity, catalog.purity)
+    subset = catalog.subset(("m1",))
+    assert subset.purity[0, 0] == subset.fit_data().purity[0, 0] == low
+    assert float(dict(subset.source_rows[0])["purity"]) == high
+    assert catalog.fit_data(("m1",)).purity[0, 0] == low
+    # A subset's source mean need not obey the parent's original admission test.
+    balanced = pd.concat([frame.assign(mutation_id=f"b{i}", purity=value)
+                         .iloc[:1] for i, value in enumerate((low, low, low, high, high, high))])
+    parent = load_original_catalog(write_tumor_txt(directory / "balanced.tsv", balanced))
+    child = parent.subset(("b0", "b1", "b2", "b3"))
+    np.testing.assert_array_equal(child.purity, np.full((4, 1), low))
+    # Canonicalization after exclusion also stays identical in the two loaders.
+    excluded = frame.copy()
+    excluded.loc[0, ["allele_a_cn", "segment_id"]] = [11, "excluded"]
+    excluded_path = write_tumor_txt(directory / "purity_excluded.tsv", excluded)
+    excluded_catalog = load_original_catalog(excluded_path)
+    np.testing.assert_array_equal(excluded_catalog.fit_data().purity, load_tumor_txt(excluded_path).purity)
+    assert excluded_catalog.purity[0, 0] == excluded_catalog.purity[1, 0] == high
+    assert float(dict(excluded_catalog.source_rows[0])["purity"]) == low
+    invalid = frame.assign(purity=[.79, .81])
+    invalid_path = directory / "invalid_purity.tsv"
+    invalid.to_csv(invalid_path, sep="\t", index=False)
+    expect_value_error(lambda: load_tumor_txt(invalid_path))
+    expect_value_error(lambda: load_original_catalog(invalid_path))
+    expect_value_error(lambda: write_tumor_txt(directory / "invalid_writer.tsv", invalid))
+    expect_value_error(lambda: replace(catalog, purity=np.full((2, 1), .7)))
+    changed_source = tuple(tuple(dict(row, purity="0.7").items()) for row in catalog.source_rows)
+    expect_value_error(lambda: replace(catalog, source_rows=changed_source))
+    # Public API routing with no support, an object, and a TSV must admit the same data.
+    bounds = catalog.default_bounds()
+    support_path = directory / "support.tsv"
+    pd.DataFrame([dict(mutation_id=mutation, sample_id="r1", multiplicity_lower=1,
+                       multiplicity_upper=1) for mutation in catalog.mutation_ids]).to_csv(
+                           support_path, sep="\t", index=False)
+    captured = []
+
+    def capture(data, *args, **kwargs):
+        captured.append(data)
+        if kwargs.get("multiplicity_support") is not None:
+            kwargs["multiplicity_support"].for_data(data)
+        return SimpleNamespace(summary={"diagnostics": {}, "fixture": "input_route_only"})
+
+    config = FitConfig(device="cpu", max_clusters=1, cpu_threads=1)
+    with patch("CliPP2.fit_execution.fit_prepared", side_effect=capture):
+        for name, support in (("ordinary", None), ("explicit_object", bounds), ("explicit_file", support_path)):
+            process_tumor(path, directory / name, config, multiplicity_support=support)
+    assert len(captured) == 3
+    for data in captured:
+        np.testing.assert_array_equal(data.purity, ordinary.purity)
+        assert data.mutation_ids == ordinary.mutation_ids
+    return dict(mean_tolerance_preserved=True, canonical_minimum=low, source_values_preserved=True,
+                writer_catalog_roundtrip=True, parent_subset_canonical_preserved=True,
+                exclusions_preserve_common_canonical=True, material_disagreement_rejected=True,
+                public_api_support_routes_equivalent=True, native_fit_calls=0)
 
 
 def check_provenance(directory):
@@ -341,7 +418,7 @@ def run_checks(directory, device="cpu"):
     from check_native_diagnostics import run_native_diagnostic_checks
     from check_assignment_v22 import run_checks as run_assignment_v22_checks
     from check_workflow_edges import run_workflow_edge_checks
-    checks = (run_native_diagnostic_checks, run_assignment_v22_checks, run_input_checks, run_workflow_edge_checks, check_provenance, check_full_support_numerics, check_assignment_decisions,
+    checks = (run_native_diagnostic_checks, run_assignment_v22_checks, run_input_checks, run_workflow_edge_checks, check_purity_consistency, check_provenance, check_full_support_numerics, check_assignment_decisions,
               check_copy_and_publication, check_conditional_information, check_complete_workflow, check_group_outlier_and_fit,
               check_segment_provenance, check_qualification_metrics)
     records = {}

@@ -11,6 +11,12 @@ import numpy as np
 
 from ..config import validate_max_major_cn
 
+# Source purities are admitted within tau of their regional mean, then compiled
+# to a canonical minimum. Each source is therefore within 2*tau of that value.
+# Subsets keep the parent's canonical value rather than recomputing a minimum.
+PURITY_MEAN_ATOL = 1e-10
+PURITY_SOURCE_CANONICAL_ATOL = 2 * PURITY_MEAN_ATOL
+
 
 def readonly_array(value: object, *, dtype=None) -> np.ndarray:
     """Copy into an immutable bytes-backed array, not a reversible write flag."""
@@ -385,7 +391,7 @@ class OriginalCatalog(ImmutableArrayRecord):
             raise ValueError("Single-state tumor CN requires integer 1 <= major and 0 <= minor <= major")
         if not np.array_equal(self.eligible, (self.major_cn <= self.max_major_cn) & ~self.input_excluded):
             raise ValueError("Catalog eligibility disagrees with original CN or explicit exclusion")
-        from .tumor_txt import _normalize_row, _NUMERIC_TOL
+        from .tumor_txt import _normalize_row
         positions = {(mutation, region): (i, j) for i, mutation in enumerate(self.mutation_ids)
                      for j, region in enumerate(self.region_ids)}
         segments, seen = {}, set()
@@ -402,7 +408,7 @@ class OriginalCatalog(ImmutableArrayRecord):
                 raise ValueError("Catalog region-segment CN pairs must agree across mutations")
             if (pair != (self.major_cn[i, j], self.minor_cn[i, j])
                     or row["normal_cn"] != self.normal_cn[i, j]
-                    or abs(row["purity"] - self.purity[i, j]) > _NUMERIC_TOL
+                    or abs(row["purity"] - self.purity[i, j]) > PURITY_SOURCE_CANONICAL_ATOL
                     or row["segment_id"] != self.segment_ids[i, j]
                     or row["count_observed"] != self.count_observed[i, j]
                     or (row["alt_count"] or 0) != self.alt_counts[i, j]

@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .data import CNFilterRecord, CNFilterReport, TumorData, OriginalCatalog, MultiplicityBounds, _indices
+from .data import CNFilterRecord, CNFilterReport, TumorData, OriginalCatalog, MultiplicityBounds, _indices, PURITY_MEAN_ATOL
 from ..config import DEFAULT_MAX_MAJOR_CN, validate_max_major_cn
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
@@ -39,7 +39,7 @@ SCHEMA_COLUMNS = (
     "allele_a_cn",
     "allele_b_cn",
 )
-_NUMERIC_TOL = 1e-10
+_NUMERIC_TOL = PURITY_MEAN_ATOL
 
 
 class TumorTxtError(ValueError):
