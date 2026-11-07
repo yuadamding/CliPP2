@@ -963,6 +963,81 @@ def _historical_catalog_report_check(root):
         fit_count=0, assignment_pass_count=0)
 
 
+def _historical_successful_report_check(root):
+    """A real successful old-native run retains science through both report routes."""
+    from contextlib import ExitStack
+    source = root / "source"
+    with zipfile.ZipFile(Path(__file__).parent / "fixtures/f2d1fa1_successful_evidence.zip") as archive:
+        archive.extractall(source)
+    origin = read_json(source / "fixture_origin.json")
+    assert origin["producer_revision"] == "f2d1fa1b09dee8b363078f8cc7ab22a6a5263522"
+    assert origin["package_source_files_byte_equal_to_revision_archive"] == 84
+    assert (origin["native_fit_count"], origin["assignment_passes"]) == (3, 2)
+    cell = read_json(source / "cells/main-S01-H001-A2/completion.json")
+    cached = read_json(source / cell["evaluations"][0])
+    paired = _paired_result(source / cell["attempt"], 1)
+    assert cell["status"] == paired["status"] == "complete"
+    assert cell["execution_configs"] == [origin["workflow_config"]]
+    assert cached["evaluation_definition"] == origin["expected_evaluation_definition"]
+    for fit in (paired["stage_one"], *(arm["stage_two"] for arm in paired["arms"].values())):
+        assert fit["acceptance_evidence"]["independently_verified"]
+        assert fit["acceptance_evidence"]["membership_audit"]["complete"]
+        assert fit["producer_receipt"]["execution"]["native"]["calls"] > 0
+    for arm in paired["arms"].values():
+        assert {key: arm["counts"][key] for key in origin["expected_population_per_arm"]} == origin["expected_population_per_arm"]
+        assert all(row["reassessment_status"] == "unchanged_non_target"
+                   for row in arm["original_rows"] if row["mutation_id"] in arm["non_targets"])
+        assert all(row["accepted_label"] == 0 and row["status"] == "assigned_relative"
+                   for row in arm["assignment"]["assignments"])
+        assert all(.95 < row["posterior"] < 1. for row in arm["assignment"]["assignments"])
+    before = {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    with ExitStack() as stack:
+        for target in ("CliPP2.fit_execution.fit_prepared", "CliPP2.workflow._fit_accepted",
+                       "CliPP2.simulation.experiment._fit_accepted", "CliPP2.assignment.assign_mutations",
+                       "CliPP2.simulation.experiment.assign_mutations", "CliPP2.kernel.model.RegionalModel",
+                       "CliPP2.simulation.study._history", "CliPP2.simulation.study._acquire",
+                       "CliPP2.simulation.study.select_thresholds", "CliPP2.simulation.cohort.load_cohort"):
+            stack.enter_context(patch(target, side_effect=AssertionError("Historical success report attempted inference")))
+        stack.enter_context(patch("CliPP2.simulation.figures.make_figures", return_value=[]))
+        original_report = report(source, report_dir=root / "cached_report")
+        current_report = report(source, evaluation_config=origin["evaluation_config"], report_dir=root / "derived_report")
+    assert original_report["summary"]["report_mode"] == "cached_metrics"
+    assert current_report["summary"]["report_mode"] == "offline_reevaluation"
+    derived = read_json(root / "derived_report/evaluations/evaluation-00001.json")
+    assert derived["status"] == "derived_from_preserved_evidence"
+    assert derived["truth_qualification"] == cached["truth_qualification"] == "verified_history_binding"
+    assert derived["evaluation_definition"] == cached["evaluation_definition"]
+    assert derived["evaluation_definition_id"] == cached["evaluation_definition_id"]
+    assert derived["catalog_compatibility"]["conversion"] == "verified_single_state_v3_to_v4"
+    assert derived["derivation"]["fit_count"] == derived["derivation"]["assignment_pass_count"] == 0
+    # The definition is identical: all historical metrics and denominators apply.
+    assert len(derived["metrics"]) == len(cached["metrics"]) == 853
+    for expected, actual in zip(cached["metrics"], derived["metrics"]):
+        assert expected.keys() == actual.keys()
+        for key, value in expected.items():
+            if isinstance(value, float):
+                np.testing.assert_allclose(actual[key], value, rtol=1e-12, atol=1e-15)
+            else:
+                assert actual[key] == value
+    for expected in origin["expected_metrics"]:
+        assert expected in cached["metrics"]
+        if expected["name"] in ("binary_brier", "binary_log_loss"):
+            assert expected["value"] > 0
+    assert derived["detailed_membership"] == cached["detailed_membership"]
+    assert derived["detailed_membership_transitions"] == cached["detailed_membership_transitions"]
+    for output in (original_report, current_report):
+        for arm in ("B3", "C3"):
+            metric = next(row for row in output["summary"]["metrics"]
+                if row["name"] == "binary_correct_per_original_evaluable" and row["arm"] == arm)
+            assert metric["planned_population_estimate"] == 1. and metric["available_cells"] == 1
+    assert before == {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    return dict(status="passed", producer_revision=origin["producer_revision"],
+        producer_native_fits=3, producer_assignment_passes=2, compared_metrics=853,
+        unchanged_members_per_arm=7, accepted_targets_per_arm=5, nonzero_calibration=True,
+        same_declared_definition=True, cached_and_explicit_reports=True, source_files_unchanged=True,
+        fit_count=0, assignment_pass_count=0)
+
+
 def _structured_failure_checks(root):
     history, frame, job = _fixture()
     for case in ("stage_one", "capped_stage_two", "assignment", "no_reference", "blocked", "empty"):
@@ -1165,12 +1240,13 @@ def run_checks(directory, cohort_settings):
     _planned_report_check(root / "unexecuted_report", contract)
     report_integrity = _report_integrity_check(root / "report_integrity")
     historical_catalog = _historical_catalog_report_check(root / "historical_catalog")
+    historical_success = _historical_successful_report_check(root / "historical_success")
     record_schema = _record_schema_report_check(root / "record_schema_reports")
     optional_execution = _optional_execution_report_check(root / "optional_execution_reports")
     partial_reports = _partial_evidence_report_checks(root / "partial_evidence_reports")
     result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4,
         lifecycle=lifecycle, resume=resume, partial_evidence_reports=partial_reports, record_schema=record_schema,
-        report_integrity=report_integrity, historical_catalog=historical_catalog,
+        report_integrity=report_integrity, historical_catalog=historical_catalog, historical_success=historical_success,
         optional_execution_reports=optional_execution,
         checks=["exact_60_variant_720_history_2640_cell_design", "full_10_20_strict_point05_contract",
                 "source_protocol21_execution22_and_cross_protocol_resume_rejection",

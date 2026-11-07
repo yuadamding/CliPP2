@@ -206,6 +206,15 @@ malformed bindings remain conflicts. Current-format evidence
 without a redundant catalog copy is usable only if the preserved input exactly
 matches the original manifest identity.
 
+The compact `f2d1fa1_successful_evidence.zip` regression fixture preserves an
+actual 12-mutation, two-region historical run with three native fits and two
+assignment passes. Each arm has seven unchanged members, five accepted targets,
+and nonzero calibration losses. Its archived origin receipt and reproducer record
+the producing revision, environment, configuration and expected results. Cached
+reporting and current reevaluation compare all 853 metrics under the same declared
+evaluation definition, without inference or source changes. The separate failure
+fixture retains coverage of pre-fit failure accounting.
+
 Without a new evaluation configuration, cached-report behavior is retained.
 Cached reports resolve the complete frozen definition before reading cells.
 Every cached record must match that definition, even when all records are present
