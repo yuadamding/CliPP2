@@ -37,7 +37,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--groups", nargs="+", choices=GROUPS, default=list(GROUPS))
     parser.add_argument("--outdir", type=Path)
-    parser.add_argument("--cohort-settings", type=Path, default=Path("CliPP2_phylogeny_cohort_settings.json"))
+    parser.add_argument("--cohort-settings", type=Path, default=Path("CliPP2_phylogeny_cohort_settings.json.gz"))
     args = parser.parse_args(argv)
     if len(set(args.groups)) != len(args.groups):
         parser.error("Each check group may be requested once")

@@ -60,8 +60,9 @@ def _fixed_information(*args, **kwargs):
 
 
 def _design_check(root, settings):
+    from CliPP2.simulation.cohort import load_cohort
     snapshot = root / "cohort_settings.json"
-    shutil.copyfile(settings, snapshot)
+    save_json(snapshot, load_cohort(settings).settings)
     contract = make_contract(cohort_settings=snapshot)
     assert contract["protocol_version"] == "2.2" and contract["source_cohort_protocol_version"] == "2.1"
     assert contract["schema"] == "clipp2.simulation-contract.v5"
@@ -1269,6 +1270,6 @@ def run_checks(directory, cohort_settings):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--outdir", type=Path)
-    parser.add_argument("--cohort-settings", type=Path, default=Path("CliPP2_phylogeny_cohort_settings.json"))
+    parser.add_argument("--cohort-settings", type=Path, default=Path("CliPP2_phylogeny_cohort_settings.json.gz"))
     args = parser.parse_args()
     print(json.dumps(run_checks(args.outdir or tempfile.mkdtemp(prefix="clipp2-study-check-"), args.cohort_settings), indent=2))

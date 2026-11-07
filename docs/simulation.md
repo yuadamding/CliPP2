@@ -5,10 +5,14 @@ Protocol 2.2 paired experiment. The authoritative biological input still declare
 Protocol 2.1 and is preserved unchanged. New contracts record
 `source_cohort_protocol_version: "2.1"` and execution `protocol_version: "2.2"`.
 The authoritative input is
-`CliPP2_phylogeny_cohort_settings.json` in the repository root. Its 60 variants
+`CliPP2_phylogeny_cohort_settings.json.gz` in the repository root. Its 60 variants
 span all 12 families: 600 main histories and 120 development histories, each with
 1,500 mutations, 50 segments, and regions `R1`–`R4`. Main histories have four
 acquisitions; development histories have A1 and A4: 2,640 datasets in total.
+The repository asset uses deterministic gzip compression; its decompressed JSON
+bytes are unchanged. `load_cohort` accepts both `.json` and `.json.gz`. Study
+directories retain a plain `cohort_settings.json` snapshot, and content identities
+and semantic seeds depend on parsed settings rather than compression or paths.
 
 The earlier [Version 1.1 Word study plan](https://github.com/yuadamding/CliPP2/blob/7ce47841fbd5402ed85faeda382371af7a0fe93a/CliPP2_biological_simulation_plan.docx)
 is retained in Git history. Current execution and evaluation are documented here
@@ -37,11 +41,11 @@ output directories for qualification, materialization, and study execution.
 
 ```sh
 python -m CliPP2.simulation qualify \
-  --cohort-settings CliPP2_phylogeny_cohort_settings.json \
+  --cohort-settings CliPP2_phylogeny_cohort_settings.json.gz \
   --outdir results/cohort-qualification --workers 3 --native-timeout 180
 
 python -m CliPP2.simulation run \
-  --cohort-settings CliPP2_phylogeny_cohort_settings.json \
+  --cohort-settings CliPP2_phylogeny_cohort_settings.json.gz \
   --main-replicates 10 --development-replicates 2 \
   --workers 10 --outdir results/cohort-full-protocol2.2
 ```
@@ -159,7 +163,7 @@ Generate every truth history and prescribed input catalog without fitting:
 
 ```sh
 python -m CliPP2.simulation materialize \
-  --cohort-settings CliPP2_phylogeny_cohort_settings.json \
+  --cohort-settings CliPP2_phylogeny_cohort_settings.json.gz \
   --outdir results/cohort-materialized
 ```
 
@@ -270,7 +274,7 @@ not claim acceptance as learned native reference groups.
 from CliPP2.simulation.cohort import load_cohort, cohort_history, acquire_cohort
 from CliPP2.io.tumor_txt import write_tumor_txt
 
-cohort = load_cohort("CliPP2_phylogeny_cohort_settings.json")
+cohort = load_cohort("CliPP2_phylogeny_cohort_settings.json.gz")
 history = cohort_history(cohort, "development.S03.02.01")
 frame = acquire_cohort(history, cohort, "A1", read_replicate_id=1)
 history.write_truth("results/example-truth")

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+import gzip
 import json
 from pathlib import Path
 import tempfile
@@ -23,14 +24,45 @@ from CliPP2.simulation.biology import FAMILIES, History, generate_history, histo
 def run_cohort_identity_checks(directory, settings_path):
     """Content binding tests without native fitting or changing semantic seeds."""
     from CliPP2.simulation.cohort import cohort_content_id, cohort_history, load_cohort, semantic_seed
+    from CliPP2.simulation.design import jobs, make_contract
     from CliPP2.simulation.study import _cohort, _verify_cohort_snapshot
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    original = json.loads(Path(settings_path).read_text())
+    settings_path = Path(settings_path)
+    original_bytes = settings_path.read_bytes()
+    if settings_path.suffix == '.gz':
+        original_bytes = gzip.decompress(original_bytes)
+    original = json.loads(original_bytes)
     identity = cohort_content_id(original)
     path = directory / "settings.json"
     path.write_text(json.dumps(original, sort_keys=True, indent=1))
     base = load_cohort(path, expected_content_id=identity)
+    compressed_path = directory / 'settings.json.gz'
+    with compressed_path.open('wb') as stream:
+        with gzip.GzipFile(filename='', mode='wb', fileobj=stream, mtime=0) as compressed:
+            compressed.write(original_bytes)
+    assert gzip.decompress(compressed_path.read_bytes()) == original_bytes
+    compressed_cohort = load_cohort(compressed_path, expected_content_id=identity)
+    assert compressed_cohort.settings == base.settings
+    plain_contract = make_contract(cohort_settings=path)
+    compressed_contract = make_contract(cohort_settings=compressed_path)
+    job_count = 0
+    for phase in ('main', 'development'):
+        plain_jobs = list(jobs(plain_contract, phase))
+        compressed_jobs = list(jobs(compressed_contract, phase))
+        for job in plain_jobs + compressed_jobs:
+            job.pop('cohort_settings')
+        assert plain_jobs == compressed_jobs
+        job_count += len(plain_jobs)
+    assert job_count == 2640
+    corrupt_path = directory / 'corrupt.json.gz'
+    corrupt_path.write_bytes(compressed_path.read_bytes()[:-8])
+    try:
+        load_cohort(corrupt_path)
+    except (EOFError, gzip.BadGzipFile):
+        pass
+    else:
+        raise AssertionError('Truncated gzip cohort was accepted')
     with patch('CliPP2.simulation.cohort.load_cohort', wraps=load_cohort) as loader:
         worker_snapshot = _verify_cohort_snapshot(path, identity)
         assert all(_cohort(path, identity) is worker_snapshot for _ in range(4))
@@ -74,9 +106,19 @@ def run_cohort_identity_checks(directory, settings_path):
         else:
             mutation["region_order"].reverse()
         assert cohort_content_id(mutation) != identity
+        with gzip.open(corrupt_path, 'wt', encoding='utf-8') as stream:
+            json.dump(mutation, stream)
+        try:
+            load_cohort(corrupt_path, expected_content_id=identity)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('Compressed cohort bypassed expected content identity')
     return dict(status="passed", formatting_and_key_order_stable=True, coherent_fraction_ccf_change_detected=True,
                 event_acquisition_mask_and_list_changes_detected=True, same_path_cache_safe=True,
                 worker_snapshot_immutable=True, fresh_boundary_detects_changed_content=True,
+                plain_and_gzip_identical=True, gzip_byte_roundtrip=True,
+                corrupt_gzip_and_changed_content_rejected=True, identical_planned_jobs=job_count,
                 semantic_seeds_unchanged=True, native_fit_count=0)
 
 
@@ -322,7 +364,7 @@ def run_biology_checks(directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path)
-    parser.add_argument('--cohort-settings', type=Path, default=Path('CliPP2_phylogeny_cohort_settings.json'))
+    parser.add_argument('--cohort-settings', type=Path, default=Path('CliPP2_phylogeny_cohort_settings.json.gz'))
     args = parser.parse_args()
     if args.output is None:
         with tempfile.TemporaryDirectory() as directory:

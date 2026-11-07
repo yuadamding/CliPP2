@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -69,9 +70,10 @@ def cohort_content_id(settings):
 
 
 def load_cohort(path, *, expected_content_id=None):
-    """Load and index the supplied settings without modifying its contents."""
+    """Load plain or gzip JSON; identity depends only on parsed settings."""
     path = Path(path).resolve()
-    with path.open(encoding='utf-8') as stream:
+    opener = gzip.open if path.suffix == '.gz' else open
+    with opener(path, 'rt', encoding='utf-8') as stream:
         settings = json.load(stream)
     identity = cohort_content_id(settings)
     if expected_content_id is not None and identity != expected_content_id:

@@ -74,7 +74,7 @@ The exact supplied cohort requires **Python 3.11+ and NumPy 2.3.5**:
 
 ```sh
 python -m pip install '.[simulation]'
-clipp2-simulate run --cohort-settings CliPP2_phylogeny_cohort_settings.json --workers 10 --outdir results/cohort
+clipp2-simulate run --cohort-settings CliPP2_phylogeny_cohort_settings.json.gz --workers 10 --outdir results/cohort
 python tools/check_research.py --groups workflow biology evaluation study publication
 ```
 
