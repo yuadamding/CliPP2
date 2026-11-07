@@ -120,8 +120,11 @@ def _configuration_payload(attempt, name, index=1):
     archive_path = directory.with_suffix(".zip")
     if archive_path.exists():
         with zipfile.ZipFile(archive_path) as archive:
-            if name in archive.namelist():
-                payloads.append(json.loads(archive.read(name)))
+            members = [member for member in archive.infolist() if member.filename == name]
+            if len(members) > 1:
+                raise ValueError(f"Duplicate archived {name} evidence")
+            if members:
+                payloads.append(json.loads(archive.read(members[0])))
     if not payloads:
         raise FileNotFoundError(f"No preserved {name} for the selected attempt")
     if any(content_hash(value) != content_hash(payloads[0]) for value in payloads[1:]):
@@ -142,11 +145,19 @@ def _catalog_payload_hash(payload):
 
 def _catalog_evidence(attempt, paired):
     """Validate the original representation before read-only working conversion."""
-    manifest = paired.get("run_manifest")
-    if not isinstance(manifest, Mapping) or not isinstance(manifest.get("input_identity"), Mapping):
-        raise ValueError("Missing original run manifest input binding")
-    if manifest.get("schema") != "clipp2.run-manifest.v2":
-        raise UnsupportedArtifactFormat(manifest.get("schema"), "run manifest format is not supported")
+    if "run_manifest" not in paired:
+        raise FileNotFoundError("Missing original run manifest")
+    manifest = paired["run_manifest"]
+    if not isinstance(manifest, Mapping):
+        raise ValueError("Original run manifest must be a JSON object")
+    if not isinstance(manifest.get("schema"), str):
+        raise ValueError("Original run manifest must declare its schema")
+    if manifest["schema"] != "clipp2.run-manifest.v2":
+        raise UnsupportedArtifactFormat(manifest["schema"], "run manifest format is not supported")
+    if "input_identity" not in manifest:
+        raise FileNotFoundError("Missing original run manifest input binding")
+    if not isinstance(manifest["input_identity"], Mapping):
+        raise ValueError("Original run manifest input binding must be a JSON object")
     identity = manifest["input_identity"]
     validate_run_manifest(manifest, tumor_id=identity.get("tumor_id"),
                           biological_identity=identity.get("biological_identity"))

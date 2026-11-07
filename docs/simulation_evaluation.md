@@ -192,7 +192,8 @@ working representation must then agree with the preserved input's scientific
 arrays, mutation/region keys, masks, source rows, metadata and provenance.
 Derived records state both `source_catalog_schema` and `working_catalog_schema`;
 neither original catalogs nor manifests are rewritten. Directory and archived
-configuration copies must agree when both remain.
+configuration copies must agree when both remain. Each required filename may
+occur only once within an archive; even identical duplicate members are rejected.
 
 Present but unsupported formats receive `unsupported_artifact_format` and pinned
 producer guidance, not `conflicting_truth`. This includes older mixed-state
@@ -200,7 +201,8 @@ catalogs, multiple historical CN rows for one observation, and historical
 near-one source fractions that the current exact single-state contract cannot
 represent unchanged. Such evidence is excluded from primary truth-dependent
 estimates. Altered counts, CN, keys, masks, provenance or identity bindings remain
-conflicts. Missing required evidence remains missing. Current-format evidence
+conflicts. Absent manifest or input-binding keys are missing evidence; present
+malformed bindings remain conflicts. Current-format evidence
 without a redundant catalog copy is usable only if the preserved input exactly
 matches the original manifest identity.
 

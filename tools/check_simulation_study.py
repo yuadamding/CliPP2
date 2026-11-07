@@ -800,6 +800,7 @@ def _historical_catalog_report_check(root):
     """Reevaluate real f2d1fa1 artifacts without changing their representation."""
     from contextlib import ExitStack
     import csv
+    import warnings
     from CliPP2.io.data import content_hash
     from CliPP2.simulation.reporting import (_catalog_evidence, _catalog_payload_hash,
         UnsupportedArtifactFormat, reevaluate_cell)
@@ -858,6 +859,48 @@ def _historical_catalog_report_check(root):
         assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "verified_history_binding"
         directory, attempt = unpack("archive_overlap", retain_zip=True)
         assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "verified_history_binding"
+        for name in ("original_catalog.json", "paired_result.json", "run_manifest.json"):
+            for conflicting in (False, True):
+                directory, attempt = unpack(f"duplicate_{name}_{conflicting}", retain_zip=True)
+                archive_path = attempt / "configuration-1.zip"
+                with zipfile.ZipFile(archive_path) as archive:
+                    members = [(info.filename, archive.read(info)) for info in archive.infolist()]
+                original = next(data for filename, data in members if filename == name)
+                duplicate = json.loads(original)
+                if conflicting:
+                    duplicate["schema"] = "conflicting_duplicate"
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+                        archive.writestr(name, json.dumps(duplicate))
+                        for filename, data in members:
+                            archive.writestr(filename, data)
+                prior = {str(p.relative_to(directory)): p.read_bytes() for p in directory.rglob("*") if p.is_file()}
+                rejected = reevaluate_cell(directory, cell, config)
+                assert rejected["truth_qualification"] == "conflicting_truth"
+                assert "Duplicate archived " + name in rejected["error"]["message"]
+                assert prior == {str(p.relative_to(directory)): p.read_bytes() for p in directory.rglob("*") if p.is_file()}
+        for field in ("run_manifest", "input_identity"):
+            for value in ("absent", None, [], "invalid", {}):
+                directory, attempt = unpack(f"binding_{field}_{value!r}")
+                path = attempt / "configuration-1/paired_result.json"
+                paired = read_json(path)
+                owner = paired if field == "run_manifest" else paired["run_manifest"]
+                if value == "absent":
+                    owner.pop(field)
+                else:
+                    owner[field] = value
+                write(path, paired)
+                rejected = reevaluate_cell(directory, cell, config)
+                expected = "missing_truth_evidence" if value == "absent" else "conflicting_truth"
+                assert rejected["truth_qualification"] == expected, rejected
+        directory, attempt = unpack("altered_manifest_identity")
+        path = attempt / "configuration-1/paired_result.json"
+        paired = read_json(path)
+        paired["run_manifest"]["manifest_identity"] = "altered"
+        write(path, paired)
+        assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "conflicting_truth"
+        directory, attempt = unpack("archive_overlap_altered", retain_zip=True)
         payload_path = attempt / "configuration-1/original_catalog.json"
         payload = read_json(payload_path)
         payload["alt_counts"][0][0] += 1
@@ -915,6 +958,7 @@ def _historical_catalog_report_check(root):
     assert before == {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
     return dict(status="passed", producer_revision=origin["producer_revision"], cached_and_explicit_reports=True,
         directory_and_archive_supported=True, unicode_identity_preserved=True, altered_input_and_catalog_rejected=True,
+        duplicate_required_members_rejected=True, absent_and_malformed_bindings_distinguished=True,
         unsupported_formats_distinct_from_truth_conflicts=True, source_files_unchanged=True,
         fit_count=0, assignment_pass_count=0)
 
