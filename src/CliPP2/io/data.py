@@ -318,8 +318,7 @@ class OriginalCatalog(ImmutableArrayRecord):
     _content_hash: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
-        from .tumor_txt import (_identifier, _mapping_provenance, _normal_cn_provenance,
-                                _input_exclusion_provenance, _safe_tumor_id)
+        from .tumor_txt import _identifier, _safe_tumor_id
 
         object.__setattr__(self, "tumor_id", _safe_tumor_id(self.tumor_id))
         for name in ("mutation_ids", "region_ids"):
@@ -362,18 +361,6 @@ class OriginalCatalog(ImmutableArrayRecord):
             source_keys.add((source["mutation_id"], source["sample_id"]))
         if source_keys != {(mutation, region) for mutation in self.mutation_ids for region in self.region_ids}:
             raise ValueError("Catalog source rows do not cover exactly the original keys")
-        source_mapping = _mapping_provenance([dict(row) for row in self.source_rows])
-        if any(self.mapping_genuine[i, j] != source_mapping[mutation, region]
-               for i, mutation in enumerate(self.mutation_ids) for j, region in enumerate(self.region_ids)):
-            raise ValueError("Catalog genuine-mapping flags disagree with original provenance")
-        normal_supplied = _normal_cn_provenance([dict(row) for row in self.source_rows])
-        if any(self.normal_cn_supplied[i, j] != normal_supplied[mutation, region]
-               for i, mutation in enumerate(self.mutation_ids) for j, region in enumerate(self.region_ids)):
-            raise ValueError("Catalog normal-CN flags disagree with original provenance")
-        input_excluded = _input_exclusion_provenance([dict(row) for row in self.source_rows])
-        if any(self.input_excluded[i, j] != input_excluded[mutation, region]
-               for i, mutation in enumerate(self.mutation_ids) for j, region in enumerate(self.region_ids)):
-            raise ValueError("Catalog input-exclusion masks disagree with original provenance")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
         if not np.isfinite(self.purity).all() or np.any(self.purity <= 0) or np.any(self.purity > 1):
             raise ValueError("Catalog purity must lie in (0,1]")
@@ -402,6 +389,9 @@ class OriginalCatalog(ImmutableArrayRecord):
                 raise ValueError("Catalog requires one canonical observation per mutation-region pair")
             seen.add(unit)
             i, j = positions[unit]
+            for name in ("mapping_genuine", "normal_cn_supplied", "input_excluded"):
+                if getattr(self, name)[i, j] != row[name]:
+                    raise ValueError(f"Catalog {name} flags disagree with original provenance")
             pair = row["allele_a_cn"], row["allele_b_cn"]
             segment = (j, row["segment_id"])
             if segments.setdefault(segment, pair) != pair:

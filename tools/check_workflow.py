@@ -68,6 +68,11 @@ def check_purity_consistency(directory):
     assert subset.purity[0, 0] == subset.fit_data().purity[0, 0] == low
     assert float(dict(subset.source_rows[0])["purity"]) == high
     assert catalog.fit_data(("m1",)).purity[0, 0] == low
+    subset_json = OriginalCatalog.from_dict(subset.to_dict())
+    assert subset_json.content_hash == subset.content_hash and subset_json.purity[0, 0] == low
+    fresh_subset = write_tumor_txt(directory / "fresh_subset.tsv",
+        pd.DataFrame([dict(row) for row in subset.source_rows]), dict(subset.metadata))
+    assert load_original_catalog(fresh_subset).purity[0, 0] == high
     # A subset's source mean need not obey the parent's original admission test.
     balanced = pd.concat([frame.assign(mutation_id=f"b{i}", purity=value)
                          .iloc[:1] for i, value in enumerate((low, low, low, high, high, high))])
@@ -115,11 +120,48 @@ def check_purity_consistency(directory):
         assert data.mutation_ids == ordinary.mutation_ids
     return dict(mean_tolerance_preserved=True, canonical_minimum=low, source_values_preserved=True,
                 writer_catalog_roundtrip=True, parent_subset_canonical_preserved=True,
+                subset_json_preserves_parent_fresh_tsv_recanonicalizes=True,
                 exclusions_preserve_common_canonical=True, material_disagreement_rejected=True,
                 public_api_support_routes_equivalent=True, native_fit_calls=0)
 
 
 def check_provenance(directory):
+    catalog = write_catalog(directory / "provenance_flags.tsv", [[10]], 20, 1, minor=1)
+    base = pd.DataFrame([dict(row) for row in catalog.source_rows])
+    accepted_flags = 0
+    for field, aliases in (("mapping_genuine", ("mapping_genuine", "_mapping_genuine")),
+                           ("normal_cn_supplied", ("normal_cn_supplied", "_normal_cn_supplied")),
+                           ("input_excluded", ("input_excluded",))):
+        for flag in (0, 1):
+            for names in ([(alias,) for alias in aliases] + ([aliases] if len(aliases) > 1 else [])):
+                table = base.assign(**{name: flag for name in names})
+                path = write_tumor_txt(directory / f"flags_{accepted_flags}.tsv", table)
+                retained = load_original_catalog(path)
+                assert bool(getattr(retained, field)[0, 0]) == bool(flag)
+                assert all(dict(retained.source_rows[0])[name] == str(flag) for name in names)
+                changes = {field: ~getattr(retained, field)}
+                if field == "input_excluded":
+                    changes["eligible"] = ~retained.eligible
+                expect_value_error(lambda: replace(retained, **changes))
+                accepted_flags += 1
+        for name in aliases:
+            for invalid in ("false", "True", "2", ".", " 0"):
+                table = base.assign(**{name: invalid})
+                path = directory / "invalid_provenance.tsv"
+                expect_value_error(lambda: write_tumor_txt(path, table))
+                table.to_csv(path, sep="\t", index=False)
+                expect_value_error(lambda: load_original_catalog(path))
+                source = tuple(tuple(dict(row, **{name: invalid}).items()) for row in catalog.source_rows)
+                expect_value_error(lambda: replace(catalog, source_rows=source))
+        if len(aliases) == 2:
+            table = base.assign(**dict(zip(aliases, (0, 1))))
+            path = directory / "conflicting_provenance.tsv"
+            expect_value_error(lambda: write_tumor_txt(path, table))
+            table.to_csv(path, sep="\t", index=False)
+            expect_value_error(lambda: load_original_catalog(path))
+            source = tuple(tuple(dict(row, **dict(zip(aliases, ("0", "1")))).items())
+                           for row in catalog.source_rows)
+            expect_value_error(lambda: replace(catalog, source_rows=source))
     source = directory / "uncovered"
     source.mkdir()
     (source / "snv.txt").write_text("chromosome_index\tposition\talt_count\tref_count\n1\t100\t10\t10\n")
@@ -147,7 +189,9 @@ def check_provenance(directory):
     metadata, frame = read_region_directory(source)
     write_tumor_txt(directory / "assumed_normal.tsv", frame, metadata)
     assert not load_original_catalog(directory / "assumed_normal.tsv").normal_cn_supplied.any()
-    return dict(mapping_round_trip=True, normal_cn_policy_explicit=True)
+    return dict(mapping_round_trip=True, normal_cn_policy_explicit=True,
+                normalized_provenance_flag_cases=accepted_flags, malformed_and_conflicting_aliases_rejected=True,
+                programmatic_flag_array_mismatch_rejected=True)
 
 
 def check_full_support_numerics(directory):

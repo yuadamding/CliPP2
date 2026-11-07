@@ -38,7 +38,6 @@ SCHEMA_COLUMNS = (
     "allele_a_cn",
     "allele_b_cn",
 )
-_NUMERIC_TOL = PURITY_MEAN_ATOL
 
 
 class TumorTxtError(ValueError):
@@ -335,7 +334,7 @@ def _validate_long_table(metadata, table):
         rows[unit] = row
     canonical = {}
     for region, values in purities.items():
-        if not np.allclose(values, float(np.mean(values)), rtol=0., atol=_NUMERIC_TOL):
+        if not np.allclose(values, float(np.mean(values)), rtol=0., atol=PURITY_MEAN_ATOL):
             raise TumorTxtError(f"purity must be constant across sample {region!r}.")
         canonical[region] = min(values)
     for (_, region), row in rows.items():
@@ -454,38 +453,7 @@ def _load_input(path, *, max_major_cn, numerical=False, normal_cn_policy=None):
     if numerical:
         filtered, report = _filter_snv_cn(validated, max_major_cn=max_major_cn)
         return _build_tumor_data(filtered, report=report, normal_cn_policy=normal_cn_policy)
-    rows = table.to_dict(orient="records")
-    return _catalog_from_validated(metadata, table, validated, max_major_cn=max_major_cn,
-                                  mapping=_mapping_provenance(rows), normal_supplied=_normal_cn_provenance(rows))
-
-
-def _mapping_provenance(rows):
-    """Honor public and historical provenance columns without truthy-string casts.
-
-    Explicit flags use 0/1 (or in-memory booleans). Absent markers mean the TSV's
-    explicit segment mapping is asserted genuine.
-    """
-    return _boolean_provenance(rows, ("mapping_genuine", "_mapping_genuine"), "Genuine-mapping")
-
-
-def _normal_cn_provenance(rows):
-    """An explicit canonical normal_cn is supplied unless provenance says assumed."""
-    return _boolean_provenance(rows, ("normal_cn_supplied", "_normal_cn_supplied"), "Normal-CN")
-
-
-def _input_exclusion_provenance(rows):
-    """A pair may be explicitly excluded while its counts and CN stay observed."""
-    return _boolean_provenance(rows, ("input_excluded",), "Input exclusion", default=False)
-
-
-def _boolean_provenance(rows, names, description, *, default=True):
-    mapping = {}
-    for row in rows:
-        genuine = _provenance_flag(row, names, description, default=default)
-        unit = str(row["mutation_id"]), str(row["sample_id"])
-        if mapping.setdefault(unit, genuine) != genuine:
-            raise TumorTxtError(f"{description} provenance disagrees within unit {unit!r}.")
-    return mapping
+    return _catalog_from_validated(metadata, table, validated, max_major_cn=max_major_cn)
 
 
 def _provenance_flag(row, names, description, *, default=True):
@@ -505,14 +473,15 @@ def _provenance_flag(row, names, description, *, default=True):
     return values[0] if values else default
 
 
-def _catalog_from_validated(metadata, table, validated, *, max_major_cn, mapping, normal_supplied):
+def _catalog_from_validated(metadata, table, validated, *, max_major_cn):
     """Freeze the pre-filter source already read by either public loader."""
     shape = (len(validated.mutation_ids), len(validated.sample_ids))
     numeric = {name: np.zeros(shape) for name in ("alt_counts", "total_counts", "major_cn", "minor_cn",
                "normal_cn", "purity")}
     observed, eligible = np.zeros(shape, dtype=bool), np.zeros(shape, dtype=bool)
     segments = np.empty(shape, dtype=object)
-    genuine = np.ones(shape, dtype=bool)
+    flags = {name: np.empty(shape, dtype=bool) for name in
+             ("mapping_genuine", "normal_cn_supplied", "input_excluded")}
     original_rows = table.to_dict(orient="records")
     # Match the ordinary loader's full-input, post-CN-filter canonical purity.
     canonical_purity = {}
@@ -534,19 +503,16 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn, mapping
             numeric["purity"][i, j] = canonical_purity.get(region, row["purity"])
             eligible[i, j] = numeric["major_cn"][i, j] <= max_major_cn and not row["input_excluded"]
             segments[i, j] = row["segment_id"]
-            genuine[i, j] = mapping[mutation, region]
+            for name, values in flags.items():
+                values[i, j] = row[name]
     source_rows = tuple(tuple((str(key), _canonical_text_value(value)) for key, value in row.items())
                         for row in original_rows)
     provenance = tuple(tuple((key, value) for key, value in row if key not in SCHEMA_COLUMNS)
                        for row in source_rows)
     return OriginalCatalog(metadata["tumor_id"], validated.mutation_ids, validated.sample_ids,
         count_observed=observed, eligible=eligible,
-        segment_ids=segments, mapping_genuine=genuine,
-        normal_cn_supplied=np.asarray([[normal_supplied[m, r] for r in validated.sample_ids]
-                                     for m in validated.mutation_ids], dtype=bool),
+        segment_ids=segments, **flags,
         source_rows=source_rows, provenance=provenance, metadata=tuple(metadata.items()),
-        input_excluded=np.asarray([[validated.rows_by_unit[m, r]["input_excluded"] for r in validated.sample_ids]
-                                   for m in validated.mutation_ids], dtype=bool),
         max_major_cn=max_major_cn, **numeric)
 
 
@@ -684,8 +650,6 @@ def write_tumor_txt(
     if bool((frame == "").to_numpy().any()):
         raise TumorTxtError("Missing values must be represented by '.'.")
     _validate_long_table(validated_metadata, frame)
-    _mapping_provenance(frame.to_dict(orient="records"))
-    _normal_cn_provenance(frame.to_dict(orient="records"))
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     metadata_order = sorted(normalized_metadata)

@@ -68,6 +68,10 @@ for assumed normal CN equal to two. The standalone CLI exposes
 `--normal-cn-policy diploid`. The catalog retains supplied-versus-assumed provenance.
 Normal CN 0, 1, and 2 are supported when the biological denominator is valid.
 
+Catalog JSON preserves a retained subset's inherited canonical values. Exporting
+only that subset's raw source rows as a fresh TSV creates a new input population
+and can recanonicalize purity.
+
 ## Runnable example
 
 The [six-mutation, two-region table](../examples/workflow_protocol22.tsv) and
