@@ -74,12 +74,11 @@ class DeviceColumn:
 
 
 class DeviceMixtureProblem:
-    """Resident numerical oracle for the unchanged host simplex controller."""
+    """Owned native mixture handle used by the resident CUDA optimizer."""
 
     def __init__(self, backend, columns):
         self._owner = weakref.ref(backend)
         self.handle = 0
-        self._transfer_endpoint = None
         handles = backend._column_handles(columns)
         result = ct.c_int64()
         backend._check(backend.lib.CliPP2CreateMixtureProblem(
@@ -93,46 +92,6 @@ class DeviceMixtureProblem:
             raise NativeExecutionError("Device mixture problem is closed")
         owner._require_open()
         return owner
-
-    def evaluate_weights(self, weights):
-        owner = self.backend()
-        weights = self._weights(weights)
-        objective, likelihood = ct.c_double(), ct.c_double()
-        gradient = np.empty(self.shape[1])
-        owner._check(owner.lib.CliPP2EvaluateMixture(
-            owner.context, self.handle, _ptr(weights), ct.byref(objective),
-            _ptr(gradient), ct.byref(likelihood)))
-        return objective.value, gradient, likelihood.value
-
-    def _weights(self, weights):
-        weights = _array(weights)
-        if (weights.shape != (self.shape[1],) or not np.isfinite(weights).all()
-                or np.any(weights < 0) or not weights.max() > 0):
-            raise ValueError("Mixture weights must be nonnegative finite and nonzero")
-        return weights
-
-    def prepare_transfer(self, weights, grow, shrink):
-        self._transfer_endpoint = None
-        owner = self.backend()
-        weights = self._weights(weights)
-        if not (0 <= grow < self.shape[1] and 0 <= shrink < self.shape[1]
-                and grow != shrink and weights[shrink] > 0):
-            raise ValueError("Invalid pairwise mixture transfer")
-        endpoint = ct.c_double()
-        owner._check(owner.lib.CliPP2PrepareMixtureTransferEndpoint(
-            owner.context, self.handle, _ptr(weights), grow, shrink, ct.byref(endpoint)))
-        self._transfer_endpoint = endpoint.value
-
-    def transfer_derivative(self, fraction):
-        owner = self.backend()
-        if not np.isfinite(fraction) or not 0 <= fraction <= 1:
-            raise ValueError("Mixture transfer fraction must be in [0,1]")
-        if fraction == 1 and self._transfer_endpoint is not None:
-            return self._transfer_endpoint
-        result = ct.c_double()
-        owner._check(owner.lib.CliPP2MixtureTransferDerivative(
-            owner.context, self.handle, fraction, ct.byref(result)))
-        return result.value
 
     def close(self):
         handle, self.handle = self.handle, 0

@@ -29,20 +29,13 @@ def fit_resident_weights(backend, problems, initial_weights=None, *,
     Status 3 alone denotes genuine final weight nonconvergence. Backend,
     nonterminal/unknown status and invalid claimed-success outputs raise an
     execution error before any partial outcome is returned. Input validation
-    precedes mutation. Once the native call is attempted, every problem's
-    cached transfer endpoint is invalidated on both success and failure.
+    precedes the synchronous native call; submitted leases remain caller-owned.
 
     Existing fixed numerical gates remain 1e-8 (scaled by N for optimality).
     Resident arithmetic is not presumed bit-identical to SciPy/OpenBLAS.
     ``progress_callback(index, record)`` receives detached completed outcomes
     only after the submission owner is released, never inner optimizer events.
     """
-    return _fit_resident_weights(backend, problems, initial_weights,
-        'CliPP2ResidentWeights', progress_callback, cancelled, telemetry)
-
-
-def _fit_resident_weights(backend, problems, initial_weights, symbol,
-                          progress_callback, cancelled, telemetry):
     if backend.kind != 'cuda':
         raise ValueError('Resident weight fitting requires an explicit CUDA backend')
     backend._require_open()
@@ -73,7 +66,7 @@ def _fit_resident_weights(backend, problems, initial_weights, symbol,
     if not problems:
         return ()
     try:
-        function = getattr(backend.lib, symbol)
+        function = backend.lib.CliPP2ResidentWeights
     except AttributeError as error:
         raise NativeExecutionError('The loaded backend has no compatible resident ABI') from error
     function.argtypes = ([ct.c_void_p, ct.c_int64, ct.POINTER(ct.c_int64)]
@@ -91,58 +84,49 @@ def _fit_resident_weights(backend, problems, initial_weights, symbol,
         if cancelled is not None and cancelled():
             raise WeightBatchCancelled('Resident fitting cancelled at a synchronous call boundary')
 
-    attempted = False
     with backend.weight_submission():
+        check_cancelled()
+        code = function(backend.context, count, _ptr(handles), _ptr(starts), _ptr(weights),
+                        _ptr(likelihood), _ptr(optimality), _ptr(active),
+                        statuses.ctypes.data_as(ct.POINTER(ct.c_int32)), _ptr(counters))
         try:
-            check_cancelled()
-            for problem in problems:
-                problem._transfer_endpoint = None
-            attempted = True
-            code = function(backend.context, count, _ptr(handles), _ptr(starts), _ptr(weights),
-                            _ptr(likelihood), _ptr(optimality), _ptr(active),
-                            statuses.ctypes.data_as(ct.POINTER(ct.c_int32)), _ptr(counters))
-            try:
-                backend._check(code)
-            except ValueError as error:
-                raise NativeExecutionError('Resident backend rejected its validated execution request') from error
-            check_cancelled()
-            if np.any((statuses != 0) & (statuses != 3)):
-                raise NativeExecutionError(f'Resident optimizer returned nonterminal/unknown status: {statuses.tolist()}')
-            if (not np.isfinite(weights).all() or np.any(weights < 0)
-                    or not np.isfinite([likelihood, optimality, active]).all()
-                    or np.any(optimality < 0) or np.any(active < 0) or np.any(counters < 0)):
-                raise NativeExecutionError('Resident optimizer returned invalid numerical outputs')
-            cursor = 0
-            for index, q in enumerate(sizes):
-                if not np.isclose(weights[cursor:cursor+q].sum(), 1., atol=1e-12, rtol=0):
-                    raise NativeExecutionError('Resident optimizer returned non-normalized weights')
-                if statuses[index] == 0 and (optimality[index] > rows[index]*1e-8 or active[index] > 1e-8):
-                    raise NativeExecutionError('Resident success does not satisfy the unchanged numerical gates')
-                cursor += q
-            result, cursor = [], 0
-            for index, q in enumerate(sizes):
-                if statuses[index] == 3:
-                    result.append(WeightOutcome('error', error=WeightConvergenceError(
-                        'Cluster-weight likelihood optimization did not converge')))
-                else:
-                    result.append(WeightOutcome('complete', result=MappingProxyType({
-                        'cluster_weights': readonly_array(weights[cursor:cursor+q]),
-                        'log_likelihood': float(likelihood[index]),
-                        'weight_optimality_gap': float(optimality[index]),
-                        'weight_active_score_gap': float(active[index])})))
-                cursor += q
-            if telemetry is not None:
-                changes = dict(resident_weight_batches=1, resident_weight_cases=count,
-                               resident_weight_convergence_failures=int(np.count_nonzero(statuses == 3)))
-                changes.update(zip(('resident_weight_evaluations', 'resident_weight_cache_hits',
-                    'resident_weight_preparations', 'resident_weight_trials', 'resident_weight_slsqp_iterations',
-                    'resident_weight_repair_steps'), map(int, counters.sum(axis=0))))
-                for key, value in changes.items():
-                    telemetry[key] = telemetry.get(key, 0)+value
-        finally:
-            if attempted:
-                for problem in problems:
-                    problem._transfer_endpoint = None
+            backend._check(code)
+        except ValueError as error:
+            raise NativeExecutionError('Resident backend rejected its validated execution request') from error
+        check_cancelled()
+        if np.any((statuses != 0) & (statuses != 3)):
+            raise NativeExecutionError(f'Resident optimizer returned nonterminal/unknown status: {statuses.tolist()}')
+        if (not np.isfinite(weights).all() or np.any(weights < 0)
+                or not np.isfinite([likelihood, optimality, active]).all()
+                or np.any(optimality < 0) or np.any(active < 0) or np.any(counters < 0)):
+            raise NativeExecutionError('Resident optimizer returned invalid numerical outputs')
+        cursor = 0
+        for index, q in enumerate(sizes):
+            if not np.isclose(weights[cursor:cursor+q].sum(), 1., atol=1e-12, rtol=0):
+                raise NativeExecutionError('Resident optimizer returned non-normalized weights')
+            if statuses[index] == 0 and (optimality[index] > rows[index]*1e-8 or active[index] > 1e-8):
+                raise NativeExecutionError('Resident success does not satisfy the unchanged numerical gates')
+            cursor += q
+        result, cursor = [], 0
+        for index, q in enumerate(sizes):
+            if statuses[index] == 3:
+                result.append(WeightOutcome('error', error=WeightConvergenceError(
+                    'Cluster-weight likelihood optimization did not converge')))
+            else:
+                result.append(WeightOutcome('complete', result=MappingProxyType({
+                    'cluster_weights': readonly_array(weights[cursor:cursor+q]),
+                    'log_likelihood': float(likelihood[index]),
+                    'weight_optimality_gap': float(optimality[index]),
+                    'weight_active_score_gap': float(active[index])})))
+            cursor += q
+        if telemetry is not None:
+            changes = dict(resident_weight_batches=1, resident_weight_cases=count,
+                           resident_weight_convergence_failures=int(np.count_nonzero(statuses == 3)))
+            changes.update(zip(('resident_weight_evaluations', 'resident_weight_cache_hits',
+                'resident_weight_preparations', 'resident_weight_trials', 'resident_weight_slsqp_iterations',
+                'resident_weight_repair_steps'), map(int, counters.sum(axis=0))))
+            for key, value in changes.items():
+                telemetry[key] = telemetry.get(key, 0)+value
     outcomes = tuple(result)
     for index, outcome in enumerate(outcomes):
         completed_weight(None if progress_callback is None else

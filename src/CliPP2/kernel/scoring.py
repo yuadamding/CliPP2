@@ -1,8 +1,6 @@
 """CliPP2 observed-mixture weights at fixed conditionally fitted centers."""
 # Adapted from CliPP1.5.
 
-from contextlib import nullcontext
-
 import numpy as np
 from scipy.optimize import brentq, minimize
 from scipy.special import logsumexp
@@ -20,14 +18,10 @@ def completed_weight(callback, q, *, cached=False, failed=False):
 
 
 def fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None, progress_callback=None):
-    """Fit fixed-center weights; report once after context-owned execution."""
+    """Fit CPU log-emission columns and report one completed-solve snapshot."""
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable or None")
-    from .backend import DeviceMixtureProblem
-    owner = (log_columns.backend().weight_submission()
-             if isinstance(log_columns, DeviceMixtureProblem) else nullcontext())
-    with owner:
-        result = _fit_mixture_weights(log_columns, initial_weights, telemetry=telemetry)
+    result = _fit_mixture_weights(log_columns, initial_weights, telemetry=telemetry)
     completed_weight(progress_callback, len(result["cluster_weights"]))
     return result
 
@@ -47,21 +41,14 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
             telemetry[name] = telemetry.get(name, 0) + amount
 
     record("weight_problem_calls")
-    # A native CUDA oracle owns its original log columns and all N-sized
-    # numerical buffers. The small SciPy/Brent controller below is shared;
-    # ordinary ndarray callers retain the historical CPU arithmetic exactly.
-    device_oracle = log_columns if hasattr(log_columns, "evaluate_weights") else None
-    if device_oracle is None:
-        log_kernel = np.asarray(log_columns, dtype=float)
-        if (log_kernel.ndim != 2 or not all(log_kernel.shape)
-                or np.isnan(log_kernel).any() or np.isposinf(log_kernel).any()):
-            raise ValueError("Expected a nonempty N-by-q matrix of finite or -inf log emissions")
-        n, k = log_kernel.shape
-        offset = np.max(log_kernel, axis=1)
-        if np.any(~np.isfinite(offset)):
-            raise ValueError("Every mutation needs finite likelihood in some cluster")
-    else:
-        n, k = device_oracle.shape
+    log_kernel = np.asarray(log_columns, dtype=float)
+    if (log_kernel.ndim != 2 or not all(log_kernel.shape)
+            or np.isnan(log_kernel).any() or np.isposinf(log_kernel).any()):
+        raise ValueError("Expected a nonempty N-by-q matrix of finite or -inf log emissions")
+    n, k = log_kernel.shape
+    offset = np.max(log_kernel, axis=1)
+    if np.any(~np.isfinite(offset)):
+        raise ValueError("Every mutation needs finite likelihood in some cluster")
     weights = np.ones(k) / k if initial_weights is None else np.asarray(initial_weights, dtype=float)
     if (weights.shape != (k,) or not np.isfinite(weights).all()
             or np.any(weights < 0) or not weights.max() > 0):
@@ -71,15 +58,13 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
     if k == 1:
         result = {
             "cluster_weights": np.ones(1),
-            "log_likelihood": (float(offset.sum()) if device_oracle is None else
-                               device_oracle.evaluate_weights(np.ones(1))[2]),
+            "log_likelihood": float(offset.sum()),
             "weight_optimality_gap": 0.0,
             "weight_active_score_gap": 0.0,
         }
         return result
-    if device_oracle is None:
-        shifted = log_kernel - offset[:, None]
-        kernel = np.exp(shifted)
+    shifted = log_kernel - offset[:, None]
+    kernel = np.exp(shifted)
     mass_key, mass_value = None, None
 
     def log_mass(w):
@@ -111,26 +96,6 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
         # that finite support impossible, and cannot pass the stationarity gate.
         ratios = shifted - log_mass(w)[:, None]
         return -np.exp(np.minimum(ratios, 345.)).mean(axis=0)
-
-    if device_oracle is not None:
-        evaluation_key, evaluation = None, None
-
-        def evaluate(w):
-            nonlocal evaluation_key, evaluation
-            key = w.tobytes()
-            if key != evaluation_key:
-                evaluation = device_oracle.evaluate_weights(w)
-                evaluation_key = key
-                record("weight_device_evaluations")
-            else:
-                record("weight_device_evaluation_cache_hits")
-            return evaluation
-
-        def objective(w):
-            return evaluate(w)[0]
-
-        def gradient(w):
-            return evaluate(w)[1]
 
     # An impossible supplied boundary is an optimizer start, not an extra
     # constraint. Uniform weights are feasible because every row has support.
@@ -184,30 +149,21 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
         # Exact one-dimensional mass transfer, evaluated in the log domain
         # at endpoints too; no tiny-mass replacement changes its objective.
         amount = weights[shrink]
-        if device_oracle is None:
-            high = np.maximum(shifted[:, grow], shifted[:, shrink])
-            with np.errstate(divide="ignore", invalid="ignore"):
-                delta = np.abs(shifted[:, grow]-shifted[:, shrink])
-                numerator = np.log(amount) + high + np.log(-np.expm1(-delta))
-                sign = np.sign(shifted[:, grow]-shifted[:, shrink])
-            numerator = np.where(shifted[:, grow] == shifted[:, shrink], -np.inf, numerator)
-            sign = np.where(np.isneginf(high), 0., sign)
+        high = np.maximum(shifted[:, grow], shifted[:, shrink])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            delta = np.abs(shifted[:, grow]-shifted[:, shrink])
+            numerator = np.log(amount) + high + np.log(-np.expm1(-delta))
+            sign = np.sign(shifted[:, grow]-shifted[:, shrink])
+        numerator = np.where(shifted[:, grow] == shifted[:, shrink], -np.inf, numerator)
+        sign = np.where(np.isneginf(high), 0., sign)
 
-            def derivative(fraction):
-                trial = weights.copy()
-                trial[grow] += fraction*amount
-                trial[shrink] = amount*(1.-fraction)
-                log_ratio = numerator-log_mass(trial)
-                value = float(np.mean(sign*np.exp(np.minimum(log_ratio, 345.))))
-                return value
-        else:
-            device_oracle.prepare_transfer(weights, grow, shrink)
-            record("weight_device_transfer_preparations")
-
-            def derivative(fraction):
-                record("weight_device_transfer_trials")
-                value = device_oracle.transfer_derivative(fraction)
-                return value
+        def derivative(fraction):
+            trial = weights.copy()
+            trial[grow] += fraction*amount
+            trial[shrink] = amount*(1.-fraction)
+            log_ratio = numerator-log_mass(trial)
+            value = float(np.mean(sign*np.exp(np.minimum(log_ratio, 345.))))
+            return value
 
         fraction = 1.0 if derivative(1.0) >= 0 else brentq(derivative, 0.0, 1.0, xtol=1e-14)
         transfer = fraction * weights[shrink]
@@ -222,8 +178,7 @@ def _fit_mixture_weights(log_columns, initial_weights=None, *, telemetry=None):
     if optimality_gap > n * tolerance or active_gap > tolerance:
         record("weight_convergence_failures")
         raise WeightConvergenceError("Cluster-weight likelihood optimization did not converge")
-    likelihood = (float(np.sum(offset + log_mass(weights))) if device_oracle is None
-                  else evaluate(weights)[2])
+    likelihood = float(np.sum(offset + log_mass(weights)))
     result = {
         "cluster_weights": weights,
         "log_likelihood": likelihood,

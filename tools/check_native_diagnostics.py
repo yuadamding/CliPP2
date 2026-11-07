@@ -1,4 +1,4 @@
-"""Native conditional-confidence regressions, including rounded certainty."""
+"""Native emissions, CPU weights, and mocked resident-boundary regressions."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -125,6 +125,166 @@ def _passes(row, threshold):
     return confidence_passes(row["accepted_log_probability"], threshold, finite_rival)
 
 
+def _cpu_weight_checks():
+    """Independent objectives plus exact boundary/underflow solver regressions."""
+    from scipy.special import logsumexp
+    from CliPP2.kernel.scoring import fit_mixture_weights
+
+    cases = {
+        "singleton": (np.array([[-1000.], [-100.], [0.]]), [1e300]),
+        "duplicates": (np.log([[.9, .9, .1], [.1, .1, .9]]), [8., 1., 1.]),
+        "boundary": (np.log([[.9, .1], [.8, .2], [.7, .3]]), [0., 1.]),
+        "underflow": (np.array([[0., -1000.], [-1000., 0.]]), [1., 0.]),
+        "extreme_finite": (np.array([[-1e6, -1e6-1000.], [-1e6-1200., -1e6],
+                                      [-1e6, -1e6-900.]]), [1., 0.]),
+        "repair": (-np.random.default_rng(0).exponential(5., (12, 4)), [1., 0., 0., 0.]),
+    }
+    records = {}
+    for name, (columns, start) in cases.items():
+        before, initial = columns.copy(), np.array(start, dtype=float)
+        events, telemetry = [], {}
+        result = fit_mixture_weights(columns, initial, telemetry=telemetry, progress_callback=events.append)
+        weights = result["cluster_weights"]
+        with np.errstate(divide="ignore"):
+            masses = logsumexp(columns + np.log(weights), axis=1)
+        np.testing.assert_allclose(result["log_likelihood"], masses.sum(), rtol=1e-14, atol=1e-12)
+        scores = np.exp(columns-masses[:, None]).mean(axis=0)
+        assert max(0., float(scores.max()-1.)) <= 1.01e-8
+        assert float(scores.max()-scores[weights > 0].min()) <= 1.01e-8
+        assert result["weight_optimality_gap"] <= len(columns)*1e-8
+        assert result["weight_active_score_gap"] <= 1e-8
+        np.testing.assert_array_equal(columns, before)
+        np.testing.assert_array_equal(initial, start)
+        assert events == [dict(operation="weight_fit", occupied_q=len(weights), boundary="solve_complete")]
+        records[name] = dict(result={key: value.tolist() if isinstance(value, np.ndarray) else value
+                                   for key, value in result.items()}, telemetry=telemetry, events=events)
+    np.testing.assert_allclose(records["duplicates"]["result"]["cluster_weights"][2], .5, atol=1e-8, rtol=0)
+    np.testing.assert_array_equal(records["boundary"]["result"]["cluster_weights"], [1., 0.])
+    np.testing.assert_allclose(records["underflow"]["result"]["cluster_weights"], [.5, .5], atol=1e-8, rtol=0)
+    np.testing.assert_allclose(records["extreme_finite"]["result"]["cluster_weights"], [2/3, 1/3], atol=1e-8, rtol=0)
+    assert records["underflow"]["telemetry"]["weight_log_domain_fallback_rows"] > 0
+    assert records["repair"]["telemetry"]["weight_transfer_steps"] > 0
+    for columns, start in (([[-np.inf, -np.inf]], None), ([[0., np.nan]], None),
+                           ([[0., np.inf]], None), ([[0., 0.]], [0., 0.])):
+        events = []
+        try:
+            fit_mixture_weights(columns, start, progress_callback=events.append)
+        except ValueError:
+            assert not events
+        else:
+            raise AssertionError("Invalid CPU weight problem was accepted")
+    return records
+
+
+def _resident_lease_checks():
+    """Mock the native call only: qualify Python ownership/routing, not CUDA math."""
+    import ctypes as ct
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from CliPP2.kernel.backend import DeviceMixtureProblem, NativeExecutionError, WeightBatchCancelled
+    from CliPP2.kernel.resident_weights import fit_resident_weights
+    from CliPP2.kernel.scoring import WeightConvergenceError
+
+    class Owner:
+        kind, n = "cuda", 4
+        def __init__(self):
+            self.context, self.locked, self.mode, self.calls = object(), False, "success", 0
+            self.sizes, self.released = {}, []
+            self.lib = SimpleNamespace(CliPP2CreateMixtureProblem=Mock(side_effect=self.create),
+                CliPP2ReleaseMixtureProblem=Mock(side_effect=self.release),
+                CliPP2ResidentWeights=Mock(side_effect=self.solve))
+        def _require_open(self):
+            if self.context is None:
+                raise NativeExecutionError("closed owner")
+        def _column_handles(self, columns):
+            return np.asarray(columns, dtype=np.int64)
+        def _check(self, code):
+            if code:
+                raise ValueError("native rejected input")
+        @contextmanager
+        def weight_submission(self):
+            assert not self.locked
+            self.locked = True
+            try:
+                yield
+            finally:
+                self.locked = False
+        def create(self, context, q, columns, output):
+            handle = len(self.sizes)+1
+            self.sizes[handle] = q
+            ct.cast(output, ct.POINTER(ct.c_int64))[0] = handle
+            return 0
+        def release(self, context, handle):
+            self.released.append(handle)
+            return 0
+        def solve(self, context, count, handles, starts, weights, likelihood, optimality, active, statuses, counters):
+            assert self.locked
+            self.calls += 1
+            if self.mode == "native_error":
+                return 2
+            cursor = 0
+            for i in range(count):
+                q = self.sizes[handles[i]]
+                values = np.asarray([starts[cursor+j] for j in range(q)])
+                values /= values.sum()
+                for j, value in enumerate(values):
+                    weights[cursor+j] = value
+                likelihood[i], optimality[i], active[i] = -1., 0., 0.
+                statuses[i] = 3 if self.mode == "nonconverged" else 1 if self.mode == "unknown" else 0
+                if self.mode == "false_success":
+                    active[i] = 1.
+                for j in range(6):
+                    counters[6*i+j] = 0
+                cursor += q
+            return 0
+
+    owner, events = Owner(), []
+    def progress(index, record):
+        assert not owner.locked
+        events.append((index, record["boundary"]))
+    def fails(error_type, operation):
+        calls = len(events)
+        try:
+            operation()
+        except error_type:
+            assert not owner.locked and len(events) == calls
+        else:
+            raise AssertionError("Invalid resident operation was accepted")
+    with DeviceMixtureProblem(owner, [11, 12]) as first, DeviceMixtureProblem(owner, [13]) as second:
+        for _ in range(2):
+            outcomes = fit_resident_weights(owner, [first, second], [[2., 1.], [1.]], progress_callback=progress)
+            assert [outcome.operation for outcome in outcomes] == ["complete", "complete"]
+            np.testing.assert_array_equal(outcomes[0].result["cluster_weights"], [2/3, 1/3])
+            assert not outcomes[0].result["cluster_weights"].flags.writeable
+        assert events == [(0, "solve_complete"), (1, "solve_complete")]*2 and not owner.released
+        before = owner.calls
+        fails(ValueError, lambda: fit_resident_weights(owner, [first, first]))
+        fails(ValueError, lambda: fit_resident_weights(owner, [first], [[0., 0.]]))
+        fails(WeightBatchCancelled, lambda: fit_resident_weights(owner, [first], cancelled=lambda: True))
+        assert owner.calls == before
+        cancellation = iter([False, True])
+        fails(WeightBatchCancelled, lambda: fit_resident_weights(owner, [first],
+            cancelled=lambda: next(cancellation), progress_callback=progress))
+        assert owner.calls == before+1
+        for mode in ("native_error", "unknown", "false_success"):
+            owner.mode = mode
+            fails(NativeExecutionError, lambda: fit_resident_weights(owner, [first], progress_callback=progress))
+        owner.mode = "nonconverged"
+        outcome, = fit_resident_weights(owner, [first], progress_callback=progress)
+        assert outcome.operation == "error" and isinstance(outcome.error, WeightConvergenceError)
+        assert events[-1] == (0, "solve_failed") and not owner.released
+    assert owner.released == [2, 1]
+    first.close()
+    second.close()
+    assert owner.released == [2, 1]
+    fails(NativeExecutionError, first.backend)
+    assert not owner.locked
+    return dict(repeated_owned_leases=True, ordered_detached_callbacks=True,
+        validation_before_submission=True, cancellation_boundaries=True,
+        execution_errors_and_scientific_nonconvergence_separate=True, gpu_arithmetic_qualified=False)
+
+
 def run_native_diagnostic_checks(directory):
     """Exercise the shared C++ diagnostic path through the public CPU wrapper."""
     directory = Path(directory)
@@ -173,7 +333,9 @@ def run_native_diagnostic_checks(directory):
     np.testing.assert_allclose(np.exp(full["log_emission"]), 15/64, rtol=1e-14)
     np.testing.assert_allclose(full["map_log_probability"], np.log(.45), rtol=1e-14)
     np.testing.assert_allclose(full["accepted_log_probability"], np.log(.4), rtol=1e-14)
-    return dict(single_state_contract=_single_state_contract_checks(directory),
+    return dict(cpu_weight_edges={name: True for name in _cpu_weight_checks()},
+                resident_python_lifecycle=_resident_lease_checks(),
+                single_state_contract=_single_state_contract_checks(directory),
                 stable_finite_gap_log_probability=True, underflow_cannot_imply_certainty=True,
                 impossible_alternative_and_singleton_certainty=True,
                 tied_and_nonmap_sources_rejected=True, absolute_emission_unchanged=True)
