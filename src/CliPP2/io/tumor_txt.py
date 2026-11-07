@@ -20,7 +20,6 @@ CN_FILTER_POLICY_ID = "major_limit_mutation_region_v4"
 MAJOR_CN_ABOVE_LIMIT = "MAJOR_CN_ABOVE_LIMIT"
 INPUT_EXCLUDED = "INPUT_EXCLUDED"
 INPUT_MASK_POLICY_ID = "major_limit_and_input_mask_mutation_region_v1"
-NO_POSITIVE_PATH = "NO_POSITIVE_MUTANT_COPY_PATH"
 
 
 # The canonical input schema is documented in README.md.
@@ -46,26 +45,6 @@ class TumorTxtError(ValueError):
     """Raised when a long tumor file violates its public input contract."""
 
 
-class UnsupportedTumorInputError(ValueError):
-    """Raised when retained CN has no supported positive multiplicity."""
-
-    def __init__(
-        self,
-        reason: str,
-        *,
-        region_id: str,
-        segment_id: str,
-        detail: str,
-    ) -> None:
-        self.reason = str(reason)
-        self.region_id = str(region_id)
-        self.segment_id = str(segment_id)
-        self.detail = str(detail)
-        super().__init__(
-            f"{self.reason}: {self.region_id}, segment {self.segment_id}: {self.detail}"
-        )
-
-
 class NoEligibleSNVsError(ValueError):
     """All input mutations were excluded before likelihood construction."""
 
@@ -83,7 +62,7 @@ class _ValidatedLongTable:
     metadata: dict[str, str]
     mutation_ids: tuple[str, ...]
     sample_ids: tuple[str, ...]
-    rows_by_unit: dict[tuple[str, str], tuple[dict[str, Any], ...]]
+    rows_by_unit: dict[tuple[str, str], dict[str, Any]]
 
 
 def _open_text(path: Path, mode: str):
@@ -274,10 +253,6 @@ def _nonnegative_integer(
     return int(round(numeric))
 
 
-def _same_float(left: float, right: float) -> bool:
-    return bool(np.isclose(left, right, rtol=0.0, atol=_NUMERIC_TOL))
-
-
 def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, Any]:
     context = f"row {row_number}"
     mutation_id = _identifier(row["mutation_id"], name=f"{context} mutation_id")
@@ -357,13 +332,13 @@ def _validate_long_table(metadata, table):
         if segments.setdefault(segment, pair) != pair:
             raise TumorTxtError(f"CN pair is inconsistent within region/segment {segment!r}.")
         purities.setdefault(row["sample_id"], []).append(row["purity"])
-        rows[unit] = (row,)
+        rows[unit] = row
     canonical = {}
     for region, values in purities.items():
         if not np.allclose(values, float(np.mean(values)), rtol=0., atol=_NUMERIC_TOL):
             raise TumorTxtError(f"purity must be constant across sample {region!r}.")
         canonical[region] = min(values)
-    for (mutation, region), (row,) in rows.items():
+    for (_, region), row in rows.items():
         row["_source_purity"] = row["purity"]
         row["purity"] = canonical[region]
     mutations = tuple(sorted({mutation for mutation, _ in rows}))
@@ -382,13 +357,13 @@ def _filter_snv_cn(
     max_major_cn = validate_max_major_cn(max_major_cn)
     records: list[CNFilterRecord] = []
     excluded_pairs: set[tuple[str, str]] = set()
-    for (mutation_id, sample_id), rows in sorted(validated.rows_by_unit.items()):
-        segment_id = rows[0]["segment_id"]
-        max_major = rows[0]["allele_a_cn"]
-        if rows[0]["input_excluded"] or max_major > max_major_cn:
+    for (mutation_id, sample_id), row in sorted(validated.rows_by_unit.items()):
+        segment_id = row["segment_id"]
+        max_major = row["allele_a_cn"]
+        if row["input_excluded"] or max_major > max_major_cn:
             excluded_pairs.add((mutation_id, sample_id))
             records.append(CNFilterRecord(
-                mutation_id, sample_id, segment_id, INPUT_EXCLUDED if rows[0]["input_excluded"] else MAJOR_CN_ABOVE_LIMIT,
+                mutation_id, sample_id, segment_id, INPUT_EXCLUDED if row["input_excluded"] else MAJOR_CN_ABOVE_LIMIT,
                 max_major,
             ))
     retained_ids = tuple(
@@ -411,19 +386,19 @@ def _filter_snv_cn(
     if not retained_ids:
         raise NoEligibleSNVsError(report, tumor_id=validated.metadata["tumor_id"])
     retained_rows = {
-        unit: rows for unit, rows in validated.rows_by_unit.items()
+        unit: row for unit, row in validated.rows_by_unit.items()
         if unit[0] not in excluded_ids
     }
     retained_purity: dict[str, float] = {}
-    for unit, rows in retained_rows.items():
+    for unit, row in retained_rows.items():
         if unit in excluded_pairs:
             continue
         _, sample_id = unit
-        value = min(row["_source_purity"] for row in rows)
+        value = row["_source_purity"]
         retained_purity[sample_id] = min(retained_purity.get(sample_id, value), value)
     retained_rows = {
-        unit: tuple(dict(row, purity=retained_purity.get(unit[1], row["purity"])) for row in rows)
-        for unit, rows in retained_rows.items()
+        unit: dict(row, purity=retained_purity.get(unit[1], row["purity"]))
+        for unit, row in retained_rows.items()
     }
     return _ValidatedLongTable(validated.metadata, retained_ids, validated.sample_ids, retained_rows), report
 
@@ -438,7 +413,7 @@ def _build_tumor_data(validated, *, report, normal_cn_policy=None):
     excluded = {(row.mutation_id, row.sample_id) for row in report.records}
     for i, mutation in enumerate(validated.mutation_ids):
         for j, region in enumerate(validated.sample_ids):
-            row = validated.rows_by_unit[mutation, region][0]
+            row = validated.rows_by_unit[mutation, region]
             arrays["purity"][i, j] = row["purity"]
             for name in flags:
                 flags[name][i, j] = row[name]
@@ -488,7 +463,7 @@ def _mapping_provenance(rows):
     """Honor public and historical provenance columns without truthy-string casts.
 
     Explicit flags use 0/1 (or in-memory booleans). Absent markers mean the TSV's
-    explicit segment mapping is asserted genuine; repeated CN-state rows must agree.
+    explicit segment mapping is asserted genuine.
     """
     return _boolean_provenance(rows, ("mapping_genuine", "_mapping_genuine"), "Genuine-mapping")
 
@@ -541,14 +516,13 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn, mapping
     original_rows = table.to_dict(orient="records")
     # Match the ordinary loader's full-input, post-CN-filter canonical purity.
     canonical_purity = {}
-    for (_, region), rows in validated.rows_by_unit.items():
-        if rows[0]["allele_a_cn"] <= max_major_cn and not rows[0]["input_excluded"]:
-            value = min(row["_source_purity"] for row in rows)
+    for (_, region), row in validated.rows_by_unit.items():
+        if row["allele_a_cn"] <= max_major_cn and not row["input_excluded"]:
+            value = row["_source_purity"]
             canonical_purity[region] = min(canonical_purity.get(region, value), value)
     for i, mutation in enumerate(validated.mutation_ids):
         for j, region in enumerate(validated.sample_ids):
-            rows = validated.rows_by_unit[mutation, region]
-            row = rows[0]
+            row = validated.rows_by_unit[mutation, region]
             observed[i, j] = row["count_observed"]
             # Preserve provided counts even when count_observed=0; the mask,
             # rather than destructive normalization, defines numerical use.
@@ -571,7 +545,7 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn, mapping
         normal_cn_supplied=np.asarray([[normal_supplied[m, r] for r in validated.sample_ids]
                                      for m in validated.mutation_ids], dtype=bool),
         source_rows=source_rows, provenance=provenance, metadata=tuple(metadata.items()),
-        input_excluded=np.asarray([[validated.rows_by_unit[m, r][0]["input_excluded"] for r in validated.sample_ids]
+        input_excluded=np.asarray([[validated.rows_by_unit[m, r]["input_excluded"] for r in validated.sample_ids]
                                    for m in validated.mutation_ids], dtype=bool),
         max_major_cn=max_major_cn, **numeric)
 
@@ -731,7 +705,6 @@ __all__ = [
     "NoEligibleSNVsError",
     "TUMOR_TXT_SCHEMA",
     "TumorTxtError",
-    "UnsupportedTumorInputError",
     "load_tumor_txt",
     "load_original_catalog",
     "load_multiplicity_bounds",
