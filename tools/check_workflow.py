@@ -264,6 +264,8 @@ def check_conditional_information(directory):
         assert row["multiplicity_status"] == "uninformative_zero_ccf"
     catalog = write_catalog(directory / "observation_flags.tsv", [[0, 0, 0, 0]],
         [[100, 0, 100, 100]], [[3, 3, 3, 11]], minor=1, observed=[[1, 1, 0, 1]])
+    # Exercise an explicitly restricted historical population, not the new default.
+    catalog = load_original_catalog(directory / "observation_flags.tsv", max_major_cn=10)
     reference = fixture_reference((0,), catalog.region_ids, np.ones((1, 4)))
     result = assign_mutations(bundle(catalog, reference), outdir=directory / "observation_flags")
     assert [row["informative"] for row in result.multiplicities] == [True, False, False, False]
@@ -271,6 +273,8 @@ def check_conditional_information(directory):
     for name, depth, major, center, expected in (("missing", 0, 3, 1., "prior_only"),
             ("excluded", 100, 11, 1., "excluded"), ("impossible", 100, 3, 0., "model_incompatible")):
         catalog = write_catalog(directory / f"{name}.tsv", [[0 if not depth else 1]], depth, major)
+        if name == "excluded":
+            catalog = load_original_catalog(directory / f"{name}.tsv", max_major_cn=10)
         reference = fixture_reference((0,), catalog.region_ids, [[center]], clonal_label=None)
         result = assign_mutations(bundle(catalog, reference), outdir=directory / name)
         assert result.assignments[0]["status"] == expected
