@@ -38,16 +38,10 @@ def _catalog(history, directory, *, seed, depth=1000, mask_last=False):
 
 
 def _controlled_reference(labels, regions, centers, lineage=(), *, clonal_label=0):
-    """Explicitly qualify declared fixed coordinates, without a native-fit claim.
-
-    These controls intervene on the reference itself. Source-group screening is
-    applicable to learned references, which retain their recorded flags instead.
-    """
+    """Declare controlled coordinates; absent source diagnostics remain missing."""
     return AssignmentReference(tuple(labels), tuple(regions), np.asarray(centers), tuple(lineage),
-        clonal_label=clonal_label, regional_quality=np.ones((len(labels), len(regions)), bool),
-        regional_quality_reasons=tuple(tuple(() for _ in regions) for _ in labels),
-        center_sources=tuple(dict(kind="declared_fixed_reference_control_not_native_fit",
-            qualification="coordinates explicitly supplied by the controlled intervention",
+        clonal_label=clonal_label,
+        center_sources=tuple(dict(center_source="declared_fixed_reference_control_not_native_fit",
             reference_label=label) for label in labels))
 
 
@@ -124,7 +118,7 @@ def _snapshot_bundle(history, catalog, reference, targets, config, *, sources=No
             if "snapshot_not_native_fit" in stage:
                 calls[i] = evaluated[i]
     calls[~observed] = np.nan
-    return AssignmentBundle(catalog, reference, targets, tuple(non_targets), config.assignment,
+    return AssignmentBundle(catalog, reference, targets, tuple(non_targets),
         phi, calls, lower, upper, tuple(stages), tuple(labels), (0,) * len(targets),
         device=config.fit.device, cpu_threads=config.fit.cpu_threads,
         normal_cn_policy=config.normal_cn_policy,
@@ -166,11 +160,11 @@ def _calibration(history, catalog, result, members, *, reference_match_atol=None
     for row in result.assignments:
         probabilities = np.asarray(row["probabilities"], float)
         mutation = row["mutation_id"]
-        record = dict(mutation_id=mutation, status=row["status"], accepted_label=row["accepted_label"],
+        record = dict(mutation_id=mutation, status=row["status"], final_assignment_label=row["final_assignment_label"], evidence_status=row["evidence_status"],
             truth_class=truth[mutation], true_clonal=clonal[mutation],
             absent_true_class=truth[mutation] not in set(mapping.values()),
             K=len(result.reference.labels), probability_available=bool(np.isfinite(probabilities).all()),
-            accepted=row["accepted_label"] is not None)
+            data_supported=row["evidence_status"] == "observed")
         if record["probability_available"]:
             values = mapped_probabilities(probabilities, result.reference.labels, mapping, classes)
             designated = float(probabilities[result.reference.labels.index(result.reference.clonal_label)])
@@ -194,8 +188,8 @@ def _calibration(history, catalog, result, members, *, reference_match_atol=None
         rows.append(record)
     available = [row for row in rows if row["probability_available"]]
     summary = dict(target_count=len(rows), probability_count=len(available),
-        acceptance_count=sum(row["accepted"] for row in rows),
-        acceptance_coverage=sum(row["accepted"] for row in rows) / len(rows) if rows else None,
+        data_supported_map_count=sum(row["data_supported"] for row in rows),
+        data_supported_map_coverage=sum(row["data_supported"] for row in rows) / len(rows) if rows else None,
         absent_true_class_count=sum(row["absent_true_class"] for row in rows),
         K=len(result.reference.labels), single_candidate=len(result.reference.labels) == 1)
     for key in ("binary_brier", "binary_log_loss", "mapped_clonal_brier", "mapped_clonal_log_loss",
@@ -231,7 +225,7 @@ def run_reference_audit(history, catalog, paired_result, config, outdir, second_
     informative = catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)
     common = tuple(m for m, keep in zip(catalog.mutation_ids, informative.any(axis=1)) if keep)
     ledger = dict(fit_count=0, assignment_pass_count=0, events=[])
-    result = dict(schema="clipp2.fixed-reference-audit.v2", protocol_version=PROTOCOL_VERSION,
+    result = dict(schema="clipp2.fixed-reference-audit.v3", protocol_version=PROTOCOL_VERSION,
                   source_cohort_protocol_version=paired_result.get("source_cohort_protocol_version"),
                   status="complete", common_target_ids=common,
                   cost_ledger=ledger, panels={}, truth_access="evaluation_side_declared_reference_intervention")
@@ -460,7 +454,7 @@ def run_cohort_controls(cohort, outdir):
         assigned = _score(_snapshot_bundle(history, catalog, reference, history.mutation_ids, config),
             output / "S11.03" / mode, ledger, "S11_" + mode)
         panels["S11_" + mode] = dict(status="complete", **_calibration(history, catalog, assigned, source_members))
-    result = dict(schema="clipp2.cohort-controls.v2", simulation_plan_version="1.2", status="passed",
+    result = dict(schema="clipp2.cohort-controls.v3", simulation_plan_version="1.2", status="passed",
         protocol_version=PROTOCOL_VERSION, source_cohort_protocol_version=cohort.settings["workflow_protocol"],
         structural_variant_count=len(records), structural_records=records, panels=panels,
         cost_ledger=ledger, assignment_pass_count=ledger["assignment_pass_count"],
@@ -520,7 +514,7 @@ def run_controls(outdir):
         panels["S04_" + name] = _calibration(history, catalog, assigned, source_members)
         if name == "K1":
             assert all(row["probabilities"] == (1.,) for row in assigned.assignments)
-            assert any(row["accepted_label"] == 0 for row in assigned.assignments)
+            assert any(row["final_assignment_label"] == 0 for row in assigned.assignments)
             record("S04_K1_probability_one_does_not_establish_true_clonality", targets=len(targets))
         else:
             assert len(reference.labels) > 1 and all(row["probabilities"][0] < 1 for row in assigned.assignments)
@@ -564,7 +558,7 @@ def run_controls(outdir):
         panels["S12_" + name] = _calibration(history, catalog, assigned, members)
         if masked:
             assert not catalog.count_observed[:, -1].any()
-            assert all(row["multiplicity_status"] == "no_information"
+            assert all(row["multiplicity_status"] == "missing_observation"
                        for row in assigned.multiplicities if row["region_id"] == history.region_ids[-1])
     record("S12_missing_distinguishing_region_restores_exact_component_alias")
 
@@ -575,7 +569,7 @@ def run_controls(outdir):
     duplicated = _score(_snapshot_bundle(history, catalog, duplicate, targets, config),
                         output / "reference_perturbation" / "duplicate", ledger, "duplicate_candidate")
     assert all(row["log_scores"][1] == row["log_scores"][2] for row in duplicated.assignments)
-    assert any(row["status"] == "ambiguous_tie" for row in duplicated.assignments)
+    assert any(row["evidence_status"] == "observed" and not row["map_unique"] for row in duplicated.assignments)
     record("duplicate_candidates_preserve_labels_equal_priors_and_ties", K=3)
     distorted = replace(reference, centers=np.array([np.ones(4), np.maximum(0, history.phi[index] - .2)]))
     changed = _score(_snapshot_bundle(history, catalog, distorted, targets, config),
@@ -585,7 +579,7 @@ def run_controls(outdir):
     assert any(not np.array_equal(a["log_scores"], b["log_scores"])
                for a, b in zip(changed.assignments, unperturbed.assignments))
     record("reference_centroid_perturbation_changes_fixed_target_scores")
-    result = dict(schema="clipp2.simulation-controls.v2", protocol_version=PROTOCOL_VERSION, status="passed", checks=checks,
+    result = dict(schema="clipp2.simulation-controls.v3", protocol_version=PROTOCOL_VERSION, status="passed", checks=checks,
         panels=panels, cost_ledger=ledger, assignment_pass_count=ledger["assignment_pass_count"],
         paths=sorted(str(p.relative_to(output)) for p in output.rglob("*") if p.is_file()),
         interpretation="declared physical/source/reference interventions; no native clustering frequency claim")

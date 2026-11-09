@@ -1,4 +1,4 @@
-"""Truth-blind paired execution for biological plan 1.2 and Protocol 2.2.
+"""Truth-blind paired execution for biological plan 1.2 and Protocol 2.3.
 
 Only the observed input and an explicit workflow configuration enter inference.
 There is one shared Stage 1, at most two Stage 2 fits, and at most two full-support
@@ -27,7 +27,7 @@ from CliPP2.provenance import prepare_run_manifest, validate_replay_policy
 from CliPP2.workflow import (AcceptedFit, CONTRIBUTOR_COLUMNS, GROUP_COLUMNS,
                              SEGMENT_POLICY_COLUMNS, _fit_accepted, _stage_two_caps,
                              _build_stage_three_inputs, _reconcile_final_memberships,
-                             classify_groups, qualify_contributors)
+                             classify_groups, collect_cap_contributors, select_reference_source)
 
 
 def _save_json(path, payload):
@@ -55,7 +55,7 @@ def _freeze_arm(catalog, first, selected_group, second, groups, g0, config, arm_
     merged_count = 1 + q2 - len(centers)
     native_centers = {m: fit.centers[fit.labels[i]].tolist() for m, (fit, i) in sources.items()}
     selected = [sources[m] for m in targets]
-    bundle = AssignmentBundle(catalog, reference, targets, non_targets, config.assignment,
+    bundle = AssignmentBundle(catalog, reference, targets, non_targets,
         np.asarray([fit.centers[fit.labels[i]] for fit, i in selected]),
         np.asarray([fit.multiplicities[i] for fit, i in selected]),
         np.asarray([fit.support.lower[i] for fit, i in selected]),
@@ -112,7 +112,7 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
     arm_root.mkdir()
     start = perf_counter()
     ledger = dict(fit_count=0, assignment_pass_count=0, reused_fit_count=0, events=[])
-    result = dict(schema="clipp2.paired-experiment.v3", study_plan_version="1.2",
+    result = dict(schema="clipp2.paired-experiment.v4", study_plan_version="1.2",
         protocol_version=PROTOCOL_VERSION, implementation_version=__version__, status="running",
         config=asdict(config), stage_one=None, stage_one_status="not_started", stage_one_groups=[], g0_label=None,
         g0_ids=[], remainder_ids=[], contributors=[], cap_bounds=None, cap_records=[],
@@ -215,94 +215,90 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
         current = "stage_one"
         first = fit_or_reuse(accepted_stage_one, population, full, "A", "stage_one", config.fit)
         result["stage_one"] = first.to_dict()
-        current = "stage_one_classification"
+        current = "stage_one_measurement"
         groups = operation("classification", "A", lambda: classify_groups(catalog, first, config))
         result["stage_one_groups"] = groups
-        write_supporting_table(arm_root / "A" / "group_classification.tsv", groups, columns=GROUP_COLUMNS)
-        possible = [g for g in groups if g["classification"] == "clonal_merge_eligible"]
+        write_supporting_table(arm_root / "A" / "group_diagnostics.tsv", groups, columns=GROUP_COLUMNS)
         for arm in result["arms"].values():
             arm["counts"]["N1"] = len(first.mutation_ids)
-        if not possible:
-            result["status"] = "no_eligible_clonal_reference"
-            for arm in result["arms"].values():
-                arm["status"] = "no_eligible_clonal_reference"
-        else:
-            selected = min(possible, key=lambda g: (g["distance_to_one"], -g["minimum_regional_depth"], g["source_label"]))
-            g0 = tuple(m for m, label in zip(first.mutation_ids, first.labels) if label == selected["source_label"])
-            g0_set = set(g0)
-            remainder = tuple(m for m in population if m not in g0_set)
-            result.update(g0_label=selected["source_label"], g0_ids=g0, remainder_ids=remainder,
-                          stage_two_candidate_count=len(remainder))
-            for arm in result["arms"].values():
-                arm["counts"]["N0"] = len(g0)
-                arm["stage_two_candidate_count"] = len(remainder)
-            current = "contributors"
-            contributors = operation("contributor_qualification", "A", lambda:
-                qualify_contributors(catalog, first, config, mutation_ids=g0))
-            result["contributors"] = contributors
-            caps, cap_rows = _stage_two_caps(catalog, contributors)
-            result.update(cap_bounds=caps.to_dict(), cap_records=cap_rows)
-            write_supporting_table(output / "stage2_reference_call_qualification.tsv", contributors,
-                                   columns=CONTRIBUTOR_COLUMNS)
-            write_supporting_table(output / "stage2_segment_multiplicity_bounds.tsv", cap_rows,
-                                   columns=SEGMENT_POLICY_COLUMNS)
-            positions = {m: i for i, m in enumerate(catalog.mutation_ids)}
-            unsupported = ([] if not remainder else [region for region, keep in zip(catalog.region_ids,
-                informative[[positions[m] for m in remainder]].any(axis=0)) if not keep])
-            for name, bounds, reuse in (("B", full, accepted_uncapped_stage_two), ("C", caps, None)):
-                arm = result["arms"][name]
-                current = "stage_two"
-                try:
-                    if unsupported:
-                        arm.update(status="blocked", stage_two_status="unsupported_requested_regions",
-                                   unsupported_regions=unsupported)
-                        continue
-                    if remainder:
-                        second = fit_or_reuse(reuse, remainder, bounds.subset(remainder), name, "stage_two", settings)
-                        arm.update(stage_two=second.to_dict(), stage_two_status="accepted")
-                        arm["counts"].update(N2=len(second.mutation_ids), Q2=len(second.centers))
-                        current = "classification"
-                        arm["group_records"] = operation("classification", name, lambda: classify_groups(catalog, second, config))
-                    else:
-                        if reuse is not None:
-                            raise ValueError("Stage 2 replay is inapplicable to an empty remainder")
-                        second = None
-                        (arm_root / name).mkdir()
-                        arm["stage_two_status"] = "skipped_no_eligible_informative_remainder"
-                    write_supporting_table(arm_root / name / "group_classification.tsv", arm["group_records"], columns=GROUP_COLUMNS)
-                    current = "freeze_reference"
-                    bundle, frozen = _freeze_arm(catalog, first, selected, second, arm["group_records"], g0,
-                                                 config, name, arm_root / name, run_manifest=run_manifest)
-                    arm.update(frozen)
-                    current = "assignment"
-                    assignment = operation("assignment", name + "3", lambda: assign_mutations(bundle,
-                        progress_callback=progress_callback, run_manifest_id=resolved_manifest_id))
-                    if assignment.target_ids != bundle.target_ids:
-                        raise AssertionError("Assignment changed the frozen paired targets")
-                    current = "reconciliation"
-                    rows, accounting = _reconcile_final_memberships(catalog, first, second,
-                        arm["source_map"], arm["unchanged_map"], assignment, contributors=contributors)
-                    arm.update(assignment=assignment.to_dict(), assignment_status="scored",
-                               original_rows=rows, workflow_accounting=accounting)
-                    write_supporting_table(arm_root / name / "stage3_vs_two_stage.tsv", rows)
-                    current = "assignment_publication"
-                    operation("publication", name + "3", lambda: publish_assignment(bundle, assignment,
-                        arm_root / (name + "3"), workflow_accounting=accounting))
-                    arm.update(assignment_status="complete", status="complete")
-                    outcomes = {status: sum(row["reassessment_status"] == status for row in assignment.assignments)
-                                for status in ("retained_clonal", "reassigned", "unresolved")}
-                    if sum(outcomes.values()) != len(bundle.target_ids):
-                        raise AssertionError("Assignment outcomes do not reconcile all paired targets")
-                    arm["counts"].update(outcomes, unchanged_non_target=len(bundle.non_target_ids))
-                except Exception as error:
-                    arm.update(_error(error, current))
-                    if current == "assignment":
-                        arm["assignment_status"] = "failed"
-                    elif current == "stage_two" and arm["stage_two_status"] != "accepted":
-                        arm["stage_two_status"] = "failed"
-            statuses = [arm["status"] for arm in result["arms"].values()]
-            result["status"] = ("complete" if all(s == "complete" for s in statuses) else
-                                "blocked" if all(s == "blocked" for s in statuses) else "partial_failure")
+        selected = select_reference_source(groups)
+        result["reference_source"] = {key: selected[key] for key in (
+            "source_label", "native_center", "distance_to_one", "reference_source_role", "selection_rule")}
+        g0 = tuple(m for m, label in zip(first.mutation_ids, first.labels) if label == selected["source_label"])
+        g0_set = set(g0)
+        remainder = tuple(m for m in population if m not in g0_set)
+        result.update(g0_label=selected["source_label"], g0_ids=g0, remainder_ids=remainder,
+                      stage_two_candidate_count=len(remainder))
+        for arm in result["arms"].values():
+            arm["counts"]["N0"] = len(g0)
+            arm["stage_two_candidate_count"] = len(remainder)
+        current = "contributors"
+        contributors = operation("contributor_collection", "A", lambda:
+            collect_cap_contributors(catalog, first, config, mutation_ids=g0))
+        result["contributors"] = contributors
+        caps, cap_rows = _stage_two_caps(catalog, contributors)
+        result.update(cap_bounds=caps.to_dict(), cap_records=cap_rows)
+        write_supporting_table(output / "stage2_cap_contributors.tsv", contributors,
+                               columns=CONTRIBUTOR_COLUMNS)
+        write_supporting_table(output / "stage2_segment_multiplicity_bounds.tsv", cap_rows,
+                               columns=SEGMENT_POLICY_COLUMNS)
+        positions = {m: i for i, m in enumerate(catalog.mutation_ids)}
+        unsupported = ([] if not remainder else [region for region, keep in zip(catalog.region_ids,
+            informative[[positions[m] for m in remainder]].any(axis=0)) if not keep])
+        for name, bounds, reuse in (("B", full, accepted_uncapped_stage_two), ("C", caps, None)):
+            arm = result["arms"][name]
+            current = "stage_two"
+            try:
+                if unsupported:
+                    arm.update(status="blocked", stage_two_status="unsupported_requested_regions",
+                               unsupported_regions=unsupported)
+                    continue
+                if remainder:
+                    second = fit_or_reuse(reuse, remainder, bounds.subset(remainder), name, "stage_two", settings)
+                    arm.update(stage_two=second.to_dict(), stage_two_status="accepted")
+                    arm["counts"].update(N2=len(second.mutation_ids), Q2=len(second.centers))
+                    current = "classification"
+                    arm["group_records"] = operation("classification", name, lambda: classify_groups(catalog, second, config))
+                else:
+                    if reuse is not None:
+                        raise ValueError("Stage 2 replay is inapplicable to an empty remainder")
+                    second = None
+                    (arm_root / name).mkdir()
+                    arm["stage_two_status"] = "skipped_no_eligible_informative_remainder"
+                write_supporting_table(arm_root / name / "group_diagnostics.tsv", arm["group_records"], columns=GROUP_COLUMNS)
+                current = "freeze_reference"
+                bundle, frozen = _freeze_arm(catalog, first, selected, second, arm["group_records"], g0,
+                                             config, name, arm_root / name, run_manifest=run_manifest)
+                arm.update(frozen)
+                current = "assignment"
+                assignment = operation("assignment", name + "3", lambda: assign_mutations(bundle,
+                    progress_callback=progress_callback, run_manifest_id=resolved_manifest_id))
+                if assignment.target_ids != bundle.target_ids:
+                    raise AssertionError("Assignment changed the frozen paired targets")
+                current = "reconciliation"
+                rows, accounting = _reconcile_final_memberships(catalog, first, second,
+                    arm["source_map"], arm["unchanged_map"], assignment, contributors=contributors)
+                arm.update(assignment=assignment.to_dict(), assignment_status="scored",
+                           original_rows=rows, workflow_accounting=accounting)
+                write_supporting_table(arm_root / name / "stage3_vs_two_stage.tsv", rows)
+                current = "assignment_publication"
+                operation("publication", name + "3", lambda: publish_assignment(bundle, assignment,
+                    arm_root / (name + "3"), workflow_accounting=accounting))
+                arm.update(assignment_status="complete", status="complete")
+                outcomes = {status: sum(row["reassessment_status"] == status for row in assignment.assignments)
+                            for status in ("retained_clonal", "reassigned", "unresolved")}
+                if sum(outcomes.values()) != len(bundle.target_ids):
+                    raise AssertionError("Assignment outcomes do not reconcile all paired targets")
+                arm["counts"].update(outcomes, unchanged_non_target=len(bundle.non_target_ids))
+            except Exception as error:
+                arm.update(_error(error, current))
+                if current == "assignment":
+                    arm["assignment_status"] = "failed"
+                elif current == "stage_two" and arm["stage_two_status"] != "accepted":
+                    arm["stage_two_status"] = "failed"
+        statuses = [arm["status"] for arm in result["arms"].values()]
+        result["status"] = ("complete" if all(s == "complete" for s in statuses) else
+                            "blocked" if all(s == "blocked" for s in statuses) else "partial_failure")
     except Exception as error:
         stage = current.removesuffix("_replay_policy")
         result.update(_error(error, stage))

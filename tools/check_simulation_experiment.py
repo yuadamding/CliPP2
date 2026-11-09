@@ -43,7 +43,7 @@ def run_checks(directory):
     ledger = paired["cost_ledger"]
     assert (ledger["fit_count"], ledger["assignment_pass_count"]) == (3, 2)
     assert [event["arm"] for event in ledger["events"] if event["operation"] == "fit"] == ["A", "B", "C"]
-    assert paired["protocol_version"] == "2.2"
+    assert paired["protocol_version"] == "2.3"
     assert all(fit["producer_receipt"]["run_manifest"] == paired["run_manifest"] for fit in
                [paired["stage_one"], *(arm["stage_two"] for arm in paired["arms"].values())])
     for arm in paired["arms"].values():
@@ -70,7 +70,7 @@ def run_checks(directory):
               "one_external_run_manifest_link_shared_by_A_B_C", "publish_once_after_combined_reconciliation"]
     checks.extend(_routing_regressions(directory, paired, config))
     replay = run_paired_experiment(directory / "input.tsv", directory / "replay",
-        replace(config, contributor_probability_min=.9), accepted_stage_one=paired["stage_one"],
+        config, accepted_stage_one=paired["stage_one"],
         accepted_uncapped_stage_two=directory / "paired/arm_outputs/B/accepted_fit.json",
         run_manifest_id="simulation_check_current_replay")
     assert replay["status"] == "complete", replay.get("error")
@@ -97,7 +97,9 @@ def run_checks(directory):
             assert result["status"] == "complete" and result["cost_ledger"]["assignment_pass_count"] == 2
             assert all(arm["counts"]["K"] == 1 and arm["counts"]["N2"] == 0 for arm in result["arms"].values())
         else:
-            assert result["status"] == "no_eligible_clonal_reference" and result["cost_ledger"]["assignment_pass_count"] == 0
+            assert result["status"] == "complete" and result["cost_ledger"]["assignment_pass_count"] == 2
+            assert result["reference_source"]["distance_to_one"] > .05
+            assert result["reference_source"]["reference_source_role"] == "provisional_reference_source"
         assert all(len(arm["original_rows"]) == 8 for arm in result["arms"].values())
         checks.append(name + "_preserves_applicability_and_original_population")
     checks.extend(_control_regressions(directory / "control_regressions"))
@@ -149,13 +151,13 @@ def _routing_regressions(directory, paired, config):
     second = replace(native, labels=np.array([0, 0, 1, 1]), centers=np.array([[.98, .98], [.4, .3]]),
                      weights=np.array([.5, .5]))
     selected = next(row for row in paired["stage_one_groups"] if row["source_label"] == paired["g0_label"])
-    # A geometrically near-clonal group remains a target despite failed screens.
-    groups = [dict(source_label=0, near_clonal=True, classification="unresolved",
-                   informative_counts=[0, 0], informative_depths=[0., 0.],
-                   regional_coverage_pass=[False, False], native_descriptive_pass=[False, False]),
-              dict(source_label=1, near_clonal=False, classification="unresolved",
-                   informative_counts=[2, 2], informative_depths=[200., 200.],
-                   regional_coverage_pass=[True, True], native_descriptive_pass=[False, True])]
+    # Geometry still routes missing-coverage groups; raw diagnostics do not veto MAP.
+    groups = [dict(source_label=0, near_clonal=True, informative_counts=[0, 0], informative_depths=[0., 0.],
+                   native_mean_profile_deviance=[float("nan")]*2, native_maximum_profile_deviance=[float("nan")]*2,
+                   diagnostic_status="complete"),
+              dict(source_label=1, near_clonal=False, informative_counts=[2, 2], informative_depths=[200., 200.],
+                   native_mean_profile_deviance=[100., 0.], native_maximum_profile_deviance=[200., 0.],
+                   diagnostic_status="complete")]
     catalog = load_original_catalog(directory / "input.tsv")
     path = directory / "routing_fixture"
     path.mkdir()
@@ -164,28 +166,28 @@ def _routing_regressions(directory, paired, config):
     assert set(bundle.target_ids) == set(paired["g0_ids"]) | newly_routed
     assert frozen["counts"]["K"] == 2 and frozen["counts"]["F"] == 2
     np.testing.assert_array_equal(bundle.reference.centers[1], second.centers[1])
-    np.testing.assert_array_equal(bundle.reference.regional_quality, [[True, True], [False, True]])
+    np.testing.assert_array_equal(bundle.reference.source_mean_profile_deviance[1], [100., 0.])
     scored = assign_mutations(bundle, outdir=directory / "routing_assignment")
     for row in scored.assignments:
         if row["mutation_id"] in newly_routed:
-            assert row["best_label"] == 1 and row["status"] == "unresolved_reference"
-            assert row["accepted_label"] is None and row["target_reason"] == "stage2_near_clonal_recheck"
+            assert row["best_label"] == 1 and row["evidence_status"] == "observed"
+            assert row["final_assignment_label"] == 1 and row["target_reason"] == "stage2_near_clonal_recheck"
             assert len(row["probabilities"]) == 2
     rows, accounting = _reconcile_final_memberships(catalog, first, second,
         frozen["source_map"], frozen["unchanged_map"], scored, contributors=paired["contributors"])
     assert sum(accounting["final_occupancy"].values()) + accounting["unresolved_targets"] == 8
-    assert all(row["final_assignment_label"] is None for row in rows if row["mutation_id"] in newly_routed)
+    assert all(row["final_assignment_label"] == 1 for row in rows if row["mutation_id"] in newly_routed)
     assert all(row["final_assignment_label"] == 1 for row in rows if row["mutation_id"] in bundle.non_target_ids)
     # Historical contributor reassessment is an annotation, never a cap update.
     contributor = paired["g0_ids"][0]
-    fake_rows = [dict(row, **(dict(accepted_label=1, status="assigned_relative",
+    fake_rows = [dict(row, **(dict(final_assignment_label=1, map_cluster_label=1, status="observed", evidence_status="observed",
         reassessment_status="reassigned", baseline_changed=True) if row["mutation_id"] == contributor else {}))
         for row in scored.assignments]
     fake = SimpleNamespace(target_ids=scored.target_ids, assignments=fake_rows, reference=scored.reference)
     annotated, _ = _reconcile_final_memberships(catalog, first, second,
-        frozen["source_map"], frozen["unchanged_map"], fake, contributors=[dict(mutation_id=contributor, usable=True)])
+        frozen["source_map"], frozen["unchanged_map"], fake, contributors=[dict(mutation_id=contributor, contributes_to_cap=True)])
     assert next(row for row in annotated if row["mutation_id"] == contributor)["historical_cap_contributor_reassigned"]
-    return ["near_clonal_failed_screens_route_to_reassessment", "native_reference_quality_keeps_scores_blocks_winner",
+    return ["near_clonal_failed_screens_route_to_reassessment", "native_reference_diagnostics_do_not_veto_winner",
             "authoritative_final_labels_and_historical_contributor_annotation"]
 
 
@@ -228,7 +230,7 @@ def _control_regressions(directory):
     scored = assign_mutations(bundle, outdir=directory / "independent_assignment")
     assert len(scored.assignments) == 1
     fake = SimpleNamespace(reference=reference, assignments=[dict(mutation_id=mutation,
-        status="assigned_relative", accepted_label=1,
+        status="observed", evidence_status="observed", final_assignment_label=1,
         probabilities=(0., 1., *([0.]*(len(reference.labels)-2))),
         log_scores=(-1000., 0., *([-2000.]*(len(reference.labels)-2))))])
     row = _calibration(history, catalog, fake, members)["mutations"][0]

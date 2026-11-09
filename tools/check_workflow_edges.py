@@ -1,4 +1,4 @@
-"""Protocol 2.2 workflow boundary regressions; fixture cutoffs are not calibration."""
+"""Protocol 2.3 workflow boundaries and preserved native-replay evidence."""
 from __future__ import annotations
 
 import copy
@@ -11,15 +11,15 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from CliPP2 import DescriptiveScreen, FitConfig, run_workflow
+from CliPP2 import FitConfig, run_workflow
 from CliPP2.assignment import assign_mutations
 from CliPP2.io.assignment import load_accepted_fit, load_assignment_bundle
 from CliPP2.io.data import MultiplicityBounds, content_hash
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
-from CliPP2.workflow import (AcceptedFit, _reconcile_final_memberships, _biological_hash, _fit_accepted,
-                            _build_stage_three_inputs, classify_groups, qualify_contributors)
+from CliPP2.workflow import (AcceptedFit, _biological_hash, _fit_accepted,
+                            _build_stage_three_inputs, classify_groups, collect_cap_contributors, select_reference_source)
 
-from check_support import bundle, expect_value_error, external_build_record, thresholds, workflow_config, write_catalog
+from check_support import bundle, expect_value_error, external_build_record, workflow_config, write_catalog
 
 
 def _blocked_count(directory):
@@ -43,24 +43,29 @@ def _blocked_count(directory):
     return dict(candidate_count=1, accepted_stage_two_count=0, optimizer_stub=True)
 
 
-def _contributor_certainty(directory):
-    config = workflow_config(contributor_probability_min=1.,
-                             fit=FitConfig(device="cpu", max_clusters=1, cpu_threads=1))
-    catalog = write_catalog(directory / "confidence_one.tsv", [[100]], 100, 2)
-    fit = _fit_accepted(catalog, catalog.mutation_ids, catalog.default_bounds(),
-                        directory / "confidence_fit", "stage_one", config.fit, None)
-    row, = qualify_contributors(catalog, fit, config)
-    assert row["native_call_probability"] == 1. and np.isfinite(row["native_gap"])
-    assert not row["native_confidence_pass"] and row["reason"] == "native_low_confidence"
-    relaxed, = qualify_contributors(catalog, fit, replace(config, contributor_probability_min=.95))
-    assert relaxed["usable"]
-    singleton = write_catalog(directory / "confidence_singleton.tsv", [[50]], 100, 1, minor=1)
-    fit = _fit_accepted(singleton, singleton.mutation_ids, singleton.default_bounds(),
-                        directory / "singleton_fit", "stage_one", config.fit, None)
-    certain, = qualify_contributors(singleton, fit, config)
-    assert certain["usable"] and certain["native_confidence_pass"]
-    return dict(display_probability=row["native_call_probability"], finite_alternative_rejected=True,
-                singleton_certainty_accepted=True)
+def _available_contributors(directory):
+    from CliPP2.workflow import _stage_two_caps
+    cases = (("weak", 0, 1, 1.), ("residual", 40, 100, .2),
+             ("tie", 0, 1, np.nextafter(0., 1.)), ("zero", 0, 100, 0.), ("missing", 0, 0, 1.))
+    results = {}
+    for name, alt, depth, phi in cases:
+        catalog = write_catalog(directory / (name+"_cap.tsv"), [[alt]], depth, 4)
+        source = _declared_fit(catalog, "stage_one", catalog.mutation_ids, [0], [[phi]], catalog.default_bounds(), [[2.]])
+        row, = collect_cap_contributors(catalog, source, workflow_config())
+        caps, policies = _stage_two_caps(catalog, [row])
+        results[name] = row
+        assert row["native_source_call"] == 2.
+        if name in ("zero", "missing"):
+            assert not row["contributes_to_cap"] and caps.upper.item() == 4 and policies[0]["fallback"]
+        else:
+            assert row["contributes_to_cap"] and caps.upper.item() == row["cap_source_map_call"]
+            assert caps.policy_id == "minimum_available_native_map"
+    assert results["weak"]["map_probability"] < .95 and results["weak"]["cap_source_map_call"] == 1
+    assert results["residual"]["profile_deviance"] > 10.
+    assert not results["tie"]["map_unique"] and results["tie"]["cap_source_map_call"] == 1
+    assert tuple(results["tie"]["map_tied_values"]) == (1, 2)
+    return dict(weak_call_lowers_cap=True, large_residual_contributes=True, exact_tie_smallest_integer=True,
+                missing_and_zero_ccf_fallback=True, historical_call_preserved=True)
 
 
 def _capped_target_and_replay(directory):
@@ -72,7 +77,7 @@ def _capped_target_and_replay(directory):
     config = workflow_config(fit=FitConfig(device="cpu", max_clusters=3, cpu_threads=1),
                              stage_two_max_clusters=3)
     output = directory / "capped_workflow"
-    with patch("CliPP2.workflow.qualify_contributors", wraps=qualify_contributors) as qualify:
+    with patch("CliPP2.workflow.collect_cap_contributors", wraps=collect_cap_contributors) as qualify:
         receipt = run_workflow(path, output, config, run_build_manifest=external_build_record())
     assert receipt["status"] == "complete" and qualify.call_count == 1
     assert qualify.call_args.args[1].source_id == "stage_one"
@@ -106,6 +111,11 @@ def _capped_target_and_replay(directory):
         missing_origin.pop("tumor_id")
         with patch("CliPP2.fit_execution.fit_prepared", side_effect=AssertionError("legacy evidence refitted")):
             expect_value_error(lambda: AcceptedFit.from_dict(missing_origin))
+    changed_caps = MultiplicityBounds(second.mutation_ids, catalog.region_ids, second.support.lower,
+        np.full_like(second.support.upper, 2), "different_cap_endpoints")
+    with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("incompatible replay optimized")):
+        expect_value_error(lambda: second.validate(catalog, expected_support=changed_caps))
+        expect_value_error(lambda: second.validate(catalog, expected_ids=first.mutation_ids))
     replay_dir = directory / "same_tumor_replay"
     with patch("CliPP2.fit_execution.fit_prepared", side_effect=AssertionError("replay refitted")):
         replay = run_workflow(path, replay_dir, config, accepted_stage_one=first, accepted_stage_two=second,
@@ -364,7 +374,7 @@ def _stage_two_preparation_failures(directory, path, config, first, second):
         def qualify(*args, **kwargs):
             if operation == "qualification":
                 raise RuntimeError("injected preparation failure")
-            return qualify_contributors(*args, **kwargs)
+            return collect_cap_contributors(*args, **kwargs)
 
         def caps(*args, **kwargs):
             if operation == "caps":
@@ -377,7 +387,7 @@ def _stage_two_preparation_failures(directory, path, config, first, second):
             return write_supporting_table(destination, *args, **kwargs)
 
         with patch.object(AcceptedFit, "validate", lambda self, *args, **kwargs: self), \
-                patch("CliPP2.workflow.qualify_contributors", side_effect=qualify), \
+                patch("CliPP2.workflow.collect_cap_contributors", side_effect=qualify), \
                 patch("CliPP2.workflow._stage_two_caps", side_effect=caps), \
                 patch("CliPP2.io.assignment.write_supporting_table", side_effect=publish), \
                 patch("CliPP2.fit_execution.fit_prepared", side_effect=AssertionError("preparation regression refitted")):
@@ -425,33 +435,32 @@ def _geometric_routing(directory):
     with patch("CliPP2.screening.summarize_profile_deviance", wraps=summarize_profile_deviance) as summarize:
         groups = classify_groups(catalog, second, config)
         assert summarize.call_count == 4 * len(groups)
-    assert selected["classification"] == "clonal_merge_eligible"
-    assert groups[0]["near_clonal"] and not groups[0]["native_fit_pass"] and not groups[0]["all_one_fit_pass"]
-    assert groups[1]["near_clonal"] and not groups[1]["coverage_pass"]
-    assert not groups[2]["native_fit_pass"] and all(groups[2]["original_native_descriptive_pass"])
+    assert selected["distance_to_one"] == 0.
+    assert groups[0]["near_clonal"] and max(groups[0]["native_mean_profile_deviance"]) > 10.
+    assert groups[1]["near_clonal"] and min(groups[1]["informative_counts"]) == 0
+    assert max(groups[2]["native_mean_profile_deviance"]) > max(groups[2]["original_native_mean_profile_deviance"])
     assert not groups[3]["near_clonal"] and groups[4]["near_clonal"]
     boundary = groups[3]["distance_to_one"]
-    assert not classify_groups(catalog, second, replace(config, clonal_distance_max=boundary))[3]["near_clonal"]
+    assert not classify_groups(catalog, second, replace(config, stage_two_near_clonal_distance_max=boundary))[3]["near_clonal"]
     assert classify_groups(catalog, second,
-        replace(config, clonal_distance_max=np.nextafter(boundary, np.inf)))[3]["near_clonal"]
+        replace(config, stage_two_near_clonal_distance_max=np.nextafter(boundary, np.inf)))[3]["near_clonal"]
     reference, targets, unchanged, mapping = _build_stage_three_inputs(catalog, first, second, selected, groups, config)
     assert set(targets) == {catalog.mutation_ids[i] for i in (0, 1, 2, 5)} and reference.labels == (0, 1, 2)
     assert set(unchanged) == {catalog.mutation_ids[i] for i in (3, 4)}
     np.testing.assert_array_equal(reference.centers, [[1., 1.], [.4, .4], [.95, 1.]])
-    assert not reference.regional_quality[1].any()
-    assert all("native_center_descriptive_screen" in reasons for reasons in reference.regional_quality_reasons[1])
+    assert max(reference.source_mean_profile_deviance[1]) > 10.
     assert [row["baseline_reference_label"] for row in mapping] == [0, 0, 0, 1, 2, 0]
     request = bundle(catalog, reference, target_ids=(ids[0],), native_upper=[[1, 1]])
-    gated = assign_mutations(request).assignments[0]
-    permissive = replace(reference, regional_quality=np.ones((3, 2), bool),
-                         regional_quality_reasons=(((), ()),)*3)
-    accepted = assign_mutations(replace(request, reference=permissive)).assignments[0]
-    assert gated["status"] == "unresolved_reference" and gated["best_label"] == 1
-    assert gated["accepted_label"] is None and accepted["accepted_label"] == 1
-    np.testing.assert_array_equal(gated["probabilities"], accepted["probabilities"])
-    np.testing.assert_array_equal(gated["log_scores"], accepted["log_scores"])
-    return dict(controlled_estimates_not_discovery=True, failed_screens_and_coverage_routed=True,
-                strict_boundary=True, frozen_inventory=3, native_capped_reference_quality_gates_acceptance=True)
+    measured = assign_mutations(request).assignments[0]
+    missing = replace(reference, source_mean_profile_deviance=None, source_maximum_profile_deviance=None,
+                      diagnostic_availability=None)
+    alternative = assign_mutations(replace(request, reference=missing)).assignments[0]
+    assert measured["evidence_status"] == "observed" and measured["final_assignment_label"] == 1
+    assert alternative["final_assignment_label"] == 1
+    np.testing.assert_array_equal(measured["probabilities"], alternative["probabilities"])
+    np.testing.assert_array_equal(measured["log_scores"], alternative["log_scores"])
+    return dict(controlled_estimates_not_discovery=True, poor_diagnostics_and_missing_coverage_routed=True,
+                strict_boundary=True, frozen_inventory=3, raw_diagnostics_do_not_veto_map=True)
 
 
 def _historical_recovery(directory):
@@ -463,7 +472,7 @@ def _historical_recovery(directory):
     catalog = load_original_catalog(path)
     # Explicitly permissive group/contributor screens allow the planted native
     # G0 estimate; the target reassessment retains its stricter ordinary screen.
-    config = workflow_config(group_screen=DescriptiveScreen(20., 20., .05), contributor_deviance_max=20.)
+    config = workflow_config()
     fits, assignments = [], []
 
     def fixture_fit(original, ids, support, outdir, stage, *args, **kwargs):
@@ -487,10 +496,10 @@ def _historical_recovery(directory):
     assert fitting.call_count == 2 and assigning.call_count == 1 and receipt["status"] == "complete"
     result, = assignments
     one, two = result.assignments
-    assert one["target_reason"] == "stage1_clonal_recheck" and two["target_reason"] == "stage2_near_clonal_recheck"
+    assert one["target_reason"] == "stage1_reference_recheck" and two["target_reason"] == "stage2_near_clonal_recheck"
     np.testing.assert_array_equal(one["log_scores"], two["log_scores"])
     np.testing.assert_array_equal(one["probabilities"], two["probabilities"])
-    assert one["accepted_label"] == two["accepted_label"] == 1
+    assert one["final_assignment_label"] == two["final_assignment_label"] == 1
     np.testing.assert_allclose(one["posterior"], .998343610029, rtol=1e-10)
     final = receipt["final_accounting"]
     assert final["final_occupancy"] == {"0": 0, "1": 3} and final["unresolved_targets"] == 0
@@ -499,34 +508,76 @@ def _historical_recovery(directory):
     assert request.reference.labels == (0, 1) and np.all(request.bounds.upper == 4)
     policies = pd.read_csv(output / "stage2_segment_multiplicity_bounds.tsv", sep="\t")
     assert policies.loc[policies.segment_id == "affected", "multiplicity_endpoint"].item() == 1
-    contributors = pd.read_csv(output / "stage2_reference_call_qualification.tsv", sep="\t")
-    assert len(contributors) == 1 and contributors.usable.item() and contributors.native_call.item() == 1
+    contributors = pd.read_csv(output / "stage2_cap_contributors.tsv", sep="\t")
+    assert len(contributors) == 1 and contributors.contributes_to_cap.item() and contributors.cap_source_map_call.item() == 1
     whole = pd.read_csv(output / "all_original_mutations.tsv", sep="\t")
     assert whole.final_assignment_label.tolist() == [1, 1, 1]
     assert whole.baseline_reference_label.tolist() == [0, 0, 1]
-    # An unresolved target must never inherit its provisional clonal label.
-    bad_reference = replace(request.reference, regional_quality=np.array([[True], [False]]),
-                            regional_quality_reasons=(((),), (("declared_quality_failure",),)))
-    unresolved = assign_mutations(replace(request, reference=bad_reference))
-    rows = pd.read_csv(output / "source_to_reference.tsv", sep="\t").to_dict("records")
-    unchanged = {row.mutation_id: int(row.baseline_reference_label)
-                 for row in whole.itertuples() if row.role == "non_target"}
-    original_rows, accounting = _reconcile_final_memberships(catalog, *fits, rows, unchanged, unresolved,
-                                                            contributors=contributors.to_dict("records"))
-    assert accounting["final_occupancy"] == {"0": 0, "1": 1} and accounting["unresolved_targets"] == 2
-    unresolved_rows = pd.DataFrame(original_rows)
-    assert unresolved_rows.loc[unresolved_rows.role == "target", "final_assignment_label"].isna().all()
-    expect_value_error(lambda: replace(thresholds(), fit_assessment="bootstrap"))
     return dict(controlled_estimates_not_discovery=True, identical_origin_scores=True,
-                zero_clonal_occupancy=True, historical_contributor_moves_without_cap_recomputation=True,
-                unresolved_has_no_baseline_fallback=True, bootstrap_rejected_before_execution=True)
+                zero_clonal_occupancy=True, historical_contributor_moves_without_cap_recomputation=True)
+
+
+def _provisional_source_loss(directory):
+    catalog = write_catalog(directory / "subclonal_source.tsv", [[20], [10]], 100, 1, minor=1)
+    config = workflow_config()
+    first = _declared_fit(catalog, "stage_one", catalog.mutation_ids, [0, 1], [[.4], [.2]], catalog.default_bounds(), [[1], [1]])
+    groups = classify_groups(catalog, first, config)
+    selected = select_reference_source(groups)
+    assert selected["source_label"] == 0 and selected["reference_source_role"] == "provisional_reference_source"
+    assert selected["native_center"] == [.4] and selected["distance_to_one"] == .6
+    ids = catalog.mutation_ids[1:]
+    second = _declared_fit(catalog, "stage_two", ids, [0], [[.2]], catalog.default_bounds().subset(ids), [[1]])
+    reference, targets, unchanged, _ = _build_stage_three_inputs(catalog, first, second, selected,
+        classify_groups(catalog, second, config), config)
+    np.testing.assert_array_equal(reference.centers, [[1.], [.2]])
+    assert targets == catalog.mutation_ids[:1] and set(unchanged) == set(ids)
+    nearest = float(np.min(np.linalg.norm(reference.centers-[.4], axis=1)))
+    assert nearest == .2
+    with patch("CliPP2.workflow._diagnostics_many", side_effect=ValueError("reporting diagnostic failed")):
+        failed = classify_groups(catalog, first, config)
+    assert all(group["diagnostic_status"] == "failed" for group in failed)
+    assert select_reference_source(failed)["source_label"] == 0
+    with patch("CliPP2.screening.profile_deviance_from_diagnostics", return_value=np.full((2, 1), np.nan)):
+        invalid = classify_groups(catalog, first, config)
+    assert all(group["diagnostic_status"] == "failed" for group in invalid)
+    assert select_reference_source(invalid)["source_label"] == 0
+    tied = [dict(group, distance_to_one=.6) for group in groups]
+    assert select_reference_source(tied)["source_label"] == 0
+    tied[1]["minimum_regional_depth"] += 1
+    assert select_reference_source(tied)["source_label"] == 1
+    return dict(provisional_subclonal_source=.4, true_distance=.6, useful_reference_lost=True,
+                nearest_retained_reference_error=nearest, diagnostic_failure_does_not_veto=True)
+
+
+def _historical_native_replay(directory):
+    import zipfile
+    baseline = directory / "historical22"
+    with zipfile.ZipFile(Path(__file__).parent / "fixtures/protocol22_baseline.zip") as archive:
+        archive.extractall(baseline)
+    fits = [load_accepted_fit(baseline / f"stage_{stage}_accepted.json") for stage in ("one", "two")]
+    original = [fit.to_dict() for fit in fits]
+    assert all(fit.protocol_version == "2.2" for fit in fits)
+    source = Path(__file__).resolve().parents[1] / "examples/workflow_protocol22.tsv"
+    output = directory / "historical22_replayed23"
+    with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("compatible old fit optimized")) as optimizer:
+        receipt = run_workflow(source, output, workflow_config(), accepted_stage_one=fits[0], accepted_stage_two=fits[1])
+    assert receipt["status"] == "complete" and receipt["protocol_version"] == "2.3" and optimizer.call_count == 0
+    for before, stage in zip(original, ("one", "two")):
+        replay = load_accepted_fit(output / f"stage_{stage}_accepted.json")
+        assert replay.protocol_version == "2.2" and replay.to_dict()["producer_receipt"] == before["producer_receipt"]
+        assert replay.state_fingerprint == before["acceptance_evidence"]["accepted_state_hash"]
+        assert replay.compatibility_receipts[-1]["originating_native_fit_protocol"] == "2.2"
+        assert replay.compatibility_receipts[-1]["current_workflow_protocol"] == "2.3"
+    return dict(old_native_protocol_and_hash_preserved=True, current_interpretation_appended=True, optimizer_calls=0)
 
 
 def run_workflow_edge_checks(directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    return dict(blocked_stage_two=_blocked_count(directory),
-                contributor_certainty=_contributor_certainty(directory),
+    return dict(historical_native_replay=_historical_native_replay(directory),
+                blocked_stage_two=_blocked_count(directory),
+                available_contributors=_available_contributors(directory),
+                provisional_reference_loss=_provisional_source_loss(directory),
                 capped_target_and_replay=_capped_target_and_replay(directory),
                 geometric_routing=_geometric_routing(directory),
                 historical_recovery=_historical_recovery(directory))

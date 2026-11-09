@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic Protocol 2.2 CPU contracts against one imported installation.
+"""Deterministic Protocol 2.3 CPU contracts against one imported installation.
 
 Fixture cutoffs exercise decisions; they are not biological calibration advice.
 All inputs and outputs are temporary. No checkout import path is injected.
@@ -224,34 +224,27 @@ def check_assignment_decisions(directory):
     catalog = write_catalog(directory / "target_outlier.tsv", [[20]+[50]*9], 100, 1, minor=1)
     reference = fixture_reference((0,), catalog.region_ids, np.ones((1, 10)))
     row = assign_mutations(bundle(catalog, reference)).assignments[0]
-    assert row["status"] == "unresolved_fit" and row["posterior"] == 1.
-    assert row["mean_profile_deviance"] < 5. and row["outlier_fraction"] == .1
+    assert row["evidence_status"] == "observed" and row["posterior"] == 1. and row["final_assignment_label"] == 0
+    assert row["maximum_profile_deviance"] > 10. and row["mean_profile_deviance"] < 5.
     assert row["second_best_label"] is None and pd.isna(row["log_score_margin"]) and row["entropy"] == 0.
-    assert row["fit_status"] == "not_tested" and row["reassessment_status"] == "not_applicable"
     exact = write_catalog(directory / "ties.tsv", [[25]], 100, 1, minor=1)
     for labels in ((5, 0), (0, 5)):
         tied = fixture_reference(labels, exact.region_ids, [[.5], [.5]], clonal_label=None)
         decision = assign_mutations(bundle(exact, tied)).assignments[0]
-        assert decision["best_label"] == 0 and decision["status"] == "ambiguous_tie"
+        assert decision["final_assignment_label"] == 0 and tuple(decision["map_tied_labels"]) == (0, 5)
+        assert not decision["map_unique"] and decision["evidence_status"] == "observed"
     near = write_catalog(directory / "near_tie.tsv", [[26]], 100, 1, minor=1)
     request = bundle(near, fixture_reference((0, 5), near.region_ids, [[.5], [.50001]], clonal_label=None))
-    decision = assign_mutations(replace(request, thresholds=replace(request.thresholds, tie_atol=.001))).assignments[0]
-    assert decision["best_label"] == 5 and decision["status"] == "ambiguous_tie"
+    decision = assign_mutations(request).assignments[0]
+    assert decision["final_assignment_label"] == 5 and decision["map_unique"] and decision["posterior"] < .9
     for depth in (100, 10000):
         zero = write_catalog(directory / f"certainty_{depth}.tsv", [[0]], depth, 1, minor=1)
         request = bundle(zero, fixture_reference((0, 1), zero.region_ids, [[1.], [.01]]))
-        result = assign_mutations(replace(request, thresholds=replace(request.thresholds, posterior_min=1.)))
-        assert result.assignments[0]["status"] == "low_confidence"
-    reference = fixture_reference((5, 0), exact.region_ids, [[0.], [1.]])
-    decision = assign_mutations(bundle(exact, reference)).assignments[0]
-    assert np.isposinf(decision["log_score_margin"])
-    empty = bundle(exact, reference, target_ids=())
-    with patch("CliPP2.assignment.NativeBackend", side_effect=AssertionError("empty request scored")):
-        result = assign_mutations(empty, outdir=directory / "empty")
-    assert not result.assignments and not result.multiplicities
-    assert "status" in pd.read_csv(directory / "empty/ties_mutation_assignments.tsv", sep="\t")
-    assert "conditional_call" in pd.read_csv(directory / "empty/ties_assignment_multiplicity.tsv", sep="\t")
-    return dict(outlier_gate=True, exact_and_near_ties=True, threshold_one_rejected=True, empty_headers=True)
+        row = assign_mutations(request).assignments[0]
+        assert row["evidence_status"] == "observed" and row["final_assignment_label"] == 1
+        assert np.isfinite(row["log_scores"]).all()
+    return dict(poor_singleton_fit_measured_not_vetoed=True, exact_and_near_ties=True,
+                weak_evidence_map_returned=True, finite_log_evidence_retained=True)
 
 
 def check_conditional_information(directory):
@@ -271,21 +264,24 @@ def check_conditional_information(directory):
     reference = fixture_reference((0,), catalog.region_ids, np.ones((1, 4)))
     result = assign_mutations(bundle(catalog, reference), outdir=directory / "observation_flags")
     assert [row["informative"] for row in result.multiplicities] == [True, False, False, False]
-    assert [row["multiplicity_status"] for row in result.multiplicities][1:] == ["no_information", "no_information", "excluded"]
-    for name, depth, major, center, expected in (("missing", 0, 3, 1., "no_information"),
-            ("excluded", 100, 11, 1., "filtered"), ("impossible", 100, 3, 0., "incompatible")):
+    assert [row["multiplicity_status"] for row in result.multiplicities][1:] == ["missing_observation", "missing_observation", "excluded"]
+    for name, depth, major, center, expected in (("missing", 0, 3, 1., "prior_only"),
+            ("excluded", 100, 11, 1., "excluded"), ("impossible", 100, 3, 0., "model_incompatible")):
         catalog = write_catalog(directory / f"{name}.tsv", [[0 if not depth else 1]], depth, major)
         reference = fixture_reference((0,), catalog.region_ids, [[center]], clonal_label=None)
         result = assign_mutations(bundle(catalog, reference), outdir=directory / name)
         assert result.assignments[0]["status"] == expected
-        assert np.isnan(result.assignments[0]["probabilities"]).all()
+        if expected == "prior_only":
+            np.testing.assert_array_equal(result.assignments[0]["probabilities"], [1.])
+            assert result.assignments[0]["final_assignment_label"] is None
+        else:
+            assert np.isnan(result.assignments[0]["probabilities"]).all()
         assert not result.multiplicities[0]["conditional_distribution_defined"]
     certain = write_catalog(directory / "conditional_certainty.tsv", [[100]], 100, 2)
     request = bundle(certain, fixture_reference((0,), certain.region_ids, [[1.]]))
-    request = replace(request, thresholds=replace(request.thresholds, multiplicity_probability_min=1.))
     row = assign_mutations(request).multiplicities[0]
     assert row["call_probability"] == 1. and row["call_log_probability"] < 0
-    assert row["conditional_concentrated"] is False
+    assert row["assigned_multiplicity"] == 2 and row["map_unique"]
     return dict(zero_ccf_uniform=True, singleton_structural=True, zero_alt_informative=True,
                 missing_excluded_incompatible_distinct=True)
 
@@ -312,7 +308,7 @@ def check_copy_and_publication(directory):
     assert load_assignment_bundle(path).content_hash == request.content_hash
     variants = []
     for changes in ({"probabilities": [-.1, 1.1]}, {"probabilities": [.9]},
-                    {"reference_labels": (9,)}, {"accepted_label": None}, {"status": "low_confidence"}):
+                    {"reference_labels": (9,)}, {"final_assignment_label": None}, {"evidence_status": "prior_only"}):
         rows = [dict(row) for row in result.assignments]
         rows[0].update(changes)
         variants.append(lambda rows=rows: replace(result, assignments=tuple(rows)))
@@ -339,7 +335,7 @@ def check_copy_and_publication(directory):
             assignments[0]["mean_profile_deviance"] = 0.
         invalid = replace(result, multiplicities=tuple(records), assignments=tuple(assignments))
         expect_value_error(lambda: publish_assignment(request, invalid, directory / f"tampered_evidence_{i}"))
-    for i, changes in enumerate(({"thresholds": {}}, {"tumor_id": "other"},
+    for i, changes in enumerate(({"protocol_version": "2.2"}, {"tumor_id": "other"},
             {"normal_cn_policy": "invented"}, {"reference": {}})):
         invalid = replace(result, summary=dict(result.summary, **changes))
         expect_value_error(lambda: publish_assignment(request, invalid, directory / f"tampered_metadata_{i}"))
@@ -354,7 +350,7 @@ def check_complete_workflow(directory):
     plan_config = asdict(config)
     plan_config["fit"].pop("max_clusters")
     plan_config.pop("stage_two_max_clusters")
-    plan = dict(schema="clipp2.workflow.plan.v3", protocol_version=PROTOCOL_VERSION,
+    plan = dict(schema="clipp2.workflow.plan.v4", protocol_version=PROTOCOL_VERSION,
                 input_path=path.name, workflow_config=plan_config)
     plan_path = directory / "plan.json"
     plan_path.write_text(json.dumps(plan))
@@ -409,15 +405,15 @@ def check_group_outlier_and_fit(directory):
     output = directory / "group_outlier"
     receipt = run_workflow(path, output, config)
     group = pd.read_csv(output / "stage_one_groups.tsv", sep="\t").iloc[0]
-    assert receipt["status"] == "no_eligible_clonal_reference" and group["classification"] == "unresolved"
+    assert receipt["status"] == "complete" and receipt["reference"]["reference_source_role"] == "provisional_reference_source"
     assert json.loads(group["native_mean_profile_deviance"])[0] < 5.
-    assert json.loads(group["native_outlier_fraction"]) == [.05]
+    assert json.loads(group["native_maximum_profile_deviance"])[0] > 10.
     ordinary = directory / "ordinary_group_fit"
     summary = process_tumor(path, ordinary, config.fit)
     assert_published_files(summary["publication"], ordinary)
     for name in summary["publication"]["files"]:
         assert (ordinary / name).read_bytes() == (output / "stage_one" / name).read_bytes()
-    return dict(group_outlier_rejected=True, ordinary_and_workflow_tables_identical=True)
+    return dict(group_outlier_measured_without_veto=True, ordinary_and_workflow_tables_identical=True)
 
 
 def check_segment_provenance(directory):
@@ -425,7 +421,7 @@ def check_segment_provenance(directory):
     measurements = []
     for size in (100, 200):
         catalog = write_catalog(directory / f"segment_{size}.tsv", np.full((size, 1), 25), 100, 3, minor=1)
-        audits = [dict(mutation_id=mutation, region_id="r1", segment_id="shared_segment", native_call=1, usable=True)
+        audits = [dict(mutation_id=mutation, region_id="r1", segment_id="shared_segment", cap_source_map_call=1, contributes_to_cap=True)
                   for mutation in catalog.mutation_ids]
         bounds, policies = _stage_two_caps(catalog, audits)
         assert len(policies) == 1 and policies[0]["contributor_count"] == size
@@ -460,9 +456,9 @@ def run_checks(directory, device="cpu"):
     directory.mkdir(parents=True, exist_ok=True)
     from check_inputs import run_input_checks
     from check_native_diagnostics import run_native_diagnostic_checks
-    from check_assignment_v22 import run_checks as run_assignment_v22_checks
+    from check_assignment import run_checks as run_assignment_checks
     from check_workflow_edges import run_workflow_edge_checks
-    checks = (run_native_diagnostic_checks, run_assignment_v22_checks, run_input_checks, run_workflow_edge_checks, check_purity_consistency, check_provenance, check_full_support_numerics, check_assignment_decisions,
+    checks = (run_native_diagnostic_checks, run_assignment_checks, run_input_checks, run_workflow_edge_checks, check_purity_consistency, check_provenance, check_full_support_numerics, check_assignment_decisions,
               check_copy_and_publication, check_conditional_information, check_complete_workflow, check_group_outlier_and_fit,
               check_segment_provenance, check_qualification_metrics)
     records = {}
@@ -470,7 +466,7 @@ def run_checks(directory, device="cpu"):
         child = directory / check.__name__
         child.mkdir()
         records[check.__name__] = check(child)
-    return dict(schema="clipp2.workflow-contract-checks.v3", protocol_version=PROTOCOL_VERSION,
+    return dict(schema="clipp2.workflow-contract-checks.v4", protocol_version=PROTOCOL_VERSION,
                 device="cpu", fixture_config=asdict(workflow_config()), calibrated=False,
                 checks=records)
 
