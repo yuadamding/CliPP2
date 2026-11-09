@@ -310,7 +310,11 @@ def run_biology_checks(directory):
     assert np.any(lost.major_cn == 11)
     edge = acquire(lost, 30, 1., 100)
     audit = edge.attrs['acquisition']
-    assert (~audit['original_eligible']).any() and not audit['count_observed'][0].any()
+    assert audit['original_eligible'].all() and not audit['count_observed'][0].any()
+    restricted = acquire(lost, 30, 1., 100, max_major_cn=10).attrs['acquisition']
+    assert (~restricted['original_eligible']).any()
+    np.testing.assert_array_equal(restricted['latent_alt_counts'], audit['latent_alt_counts'])
+    np.testing.assert_array_equal(restricted['latent_depth'], audit['latent_depth'])
     assert audit['latent_depth'][1, 0] == 0 and np.all(audit['latent_alt_counts'][loss_rows] == 0)
     assert audit['biological_truth_available'].all() and audit['input_loss'].any()
     incomplete = generate_history('S11', 300, 120, 6)

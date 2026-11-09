@@ -116,8 +116,8 @@ def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tupl
             index = bisect_right(starts, position) - 1
             genuine = index >= 0 and position <= segments[index][1]
             if not genuine:
-                # Uncovered loci are diploid; missing reads remain missing.
-                start, end, major, minor, normal, normal_supplied = position, position, 1, 1, 2, False
+                raise TumorTxtError(f"{path}: input_missing CN segment for mutation {chrom}:{position} "
+                                    f"in sample {sample!r}; run the input audit to inspect profile and segment mapping.")
             else:
                 start, end, major, minor, normal, normal_supplied, genuine = segments[index]
             observed = (chrom, position) in observations
@@ -138,3 +138,43 @@ def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tupl
     table = pd.DataFrame(rows).fillna(".")
     return metadata, table if preserve_provenance else table.loc[:, [*SCHEMA_COLUMNS,
         "_mapping_genuine", "_normal_cn_supplied", *(["input_excluded"] if has_exclusions else [])]]
+
+
+def audit_region_directory(path):
+    """Inspect requested profiles and segment joins without filling missing CN."""
+    path = Path(path).resolve()
+    direct = any((path / name).exists() for name in _FILES)
+    children = tuple(sorted(child for child in path.iterdir() if child.is_dir()
+                            and any((child / name).exists() for name in _FILES)))
+    issues = []
+    if direct and children:
+        return [dict(status="input_invalid", code="ambiguous_region_layout", source=str(path),
+                     cause="tumor_region_mapping", message="Root and regional bundles are both present")]
+    regions = (path,) if direct or not children else children
+    parsed = {}
+    for region in regions:
+        missing = [name for name in _FILES if not (region / name).is_file()]
+        for name in missing:
+            issues.append(dict(status="input_missing", code="missing_profile", source=str(region / name),
+                sample_id=region.name, field=name, cause="profile_unavailable_or_unmapped",
+                message="Recover the source profile or correct the tumor/region path; no values were inferred"))
+        if missing:
+            continue
+        try:
+            parsed[region.name] = _read_region(region)
+        except (OSError, ValueError) as error:
+            issues.append(dict(status="input_invalid", code="invalid_profile", source=str(region),
+                               sample_id=region.name, cause="profile_content", message=str(error)))
+    loci = sorted({locus for value in parsed.values() for locus in value[1]})
+    for sample, (_, _, intervals) in parsed.items():
+        for chrom, position in loci:
+            starts, segments = intervals.get(chrom, ([], []))
+            index = bisect_right(starts, position) - 1
+            if index >= 0 and position <= segments[index][1]:
+                continue
+            equivalent = [key for key in intervals if key.removeprefix("chr") == chrom.removeprefix("chr")]
+            issues.append(dict(status="input_missing", code="missing_cn_segment", sample_id=sample,
+                mutation_id=f"{chrom}:{position}", source=str(path), field="tumor_cn",
+                cause="chromosome_naming" if equivalent else "segment_join",
+                message="No supplied CN interval covers this mutation-region; no diploid CN was inferred"))
+    return issues

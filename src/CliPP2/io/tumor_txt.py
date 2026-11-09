@@ -20,6 +20,13 @@ CN_FILTER_POLICY_ID = "major_limit_mutation_region_v4"
 MAJOR_CN_ABOVE_LIMIT = "MAJOR_CN_ABOVE_LIMIT"
 INPUT_EXCLUDED = "INPUT_EXCLUDED"
 INPUT_MASK_POLICY_ID = "major_limit_and_input_mask_mutation_region_v1"
+UNRESTRICTED_CN_POLICY_ID = "unrestricted_valid_cn_mutation_region_v1"
+
+
+def _filter_policy(max_major_cn, records):
+    if max_major_cn is None:
+        return UNRESTRICTED_CN_POLICY_ID
+    return INPUT_MASK_POLICY_ID if any(row.reason == INPUT_EXCLUDED for row in records) else CN_FILTER_POLICY_ID
 
 
 # The canonical input schema is documented in README.md.
@@ -291,8 +298,8 @@ def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, A
         name=f"{context} allele_b_cn",
     )
     assert allele_a is not None and allele_b is not None
-    if allele_a < 1 or allele_a < allele_b:
-        raise TumorTxtError(f"{context} requires integer allele_a_cn >= 1 and allele_a_cn >= allele_b_cn.")
+    if allele_a < 1 or allele_a >= 2**63 or allele_a < allele_b:
+        raise TumorTxtError(f"{context} requires representable integer 1 <= allele_a_cn < 2**63 and allele_a_cn >= allele_b_cn.")
     return {
         "mutation_id": mutation_id,
         "sample_id": sample_id,
@@ -350,7 +357,7 @@ def _validate_long_table(metadata, table):
 
 def _filter_snv_cn(
     validated: _ValidatedLongTable,
-    *, max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
+    *, max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN,
 ) -> tuple[_ValidatedLongTable, CNFilterReport]:
     """Exclude declared pairs or CN above the limit, retaining other regions."""
     max_major_cn = validate_max_major_cn(max_major_cn)
@@ -359,7 +366,7 @@ def _filter_snv_cn(
     for (mutation_id, sample_id), row in sorted(validated.rows_by_unit.items()):
         segment_id = row["segment_id"]
         max_major = row["allele_a_cn"]
-        if row["input_excluded"] or max_major > max_major_cn:
+        if row["input_excluded"] or (max_major_cn is not None and max_major > max_major_cn):
             excluded_pairs.add((mutation_id, sample_id))
             records.append(CNFilterRecord(
                 mutation_id, sample_id, segment_id, INPUT_EXCLUDED if row["input_excluded"] else MAJOR_CN_ABOVE_LIMIT,
@@ -372,7 +379,7 @@ def _filter_snv_cn(
     )
     excluded_ids = set(validated.mutation_ids).difference(retained_ids)
     report = CNFilterReport(
-        policy_id=INPUT_MASK_POLICY_ID if any(row.reason == INPUT_EXCLUDED for row in records) else CN_FILTER_POLICY_ID,
+        policy_id=_filter_policy(max_major_cn, records),
         max_major_cn=max_major_cn,
         input_mutation_count=len(validated.mutation_ids),
         retained_mutation_count=len(retained_ids),
@@ -428,7 +435,7 @@ def _build_tumor_data(validated, *, report, normal_cn_policy=None):
                      **arrays, **flags, cn_filter_report=report, normal_cn_policy=normal_cn_policy)
 
 
-def load_tumor_txt(path: str | Path, *, max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
+def load_tumor_txt(path: str | Path, *, max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN,
                    normal_cn_policy=None) -> TumorData:
     """Load single-state scientific inputs, masking excluded pairs before fitting.
 
@@ -438,9 +445,96 @@ def load_tumor_txt(path: str | Path, *, max_major_cn: int = DEFAULT_MAX_MAJOR_CN
     return _load_input(path, max_major_cn=max_major_cn, numerical=True, normal_cn_policy=normal_cn_policy)
 
 
-def load_original_catalog(path: str | Path, *, max_major_cn: int = DEFAULT_MAX_MAJOR_CN) -> OriginalCatalog:
+def load_original_catalog(path: str | Path, *, max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN) -> OriginalCatalog:
     """Preserve every canonical source key and provenance column before exclusions."""
     return _load_input(path, max_major_cn=max_major_cn)
+
+
+def audit_input(path: str | Path, *, max_major_cn=None, normal_cn_policy=None):
+    """Report input readiness and missing-source causes without inventing biology.
+
+    An absent profile cannot prove whether the source is unavailable or misnamed;
+    the audit states that uncertainty and preserves the requested analysis scope.
+    No fit, reduced-region analysis, or automatic profile repair is performed.
+    """
+    from .data import validate_workflow_mapping
+    from .region_files import audit_region_directory, read_region_directory
+    cutoff = validate_max_major_cn(max_major_cn)
+    if normal_cn_policy not in (None, "diploid"):
+        raise ValueError("normal_cn_policy must be None or 'diploid'")
+    source = Path(path).resolve()
+    result = dict(schema="clipp2.input-audit.v1", source=str(source),
+        analysis_scope="complete_requested_input", max_major_cn=cutoff,
+        eligibility_policy="unrestricted_valid_cn" if cutoff is None else "major_cn_cutoff",
+        normal_cn_policy=normal_cn_policy, issues=[])
+    issues = result["issues"]
+    if not source.exists():
+        issues.append(dict(status="input_missing", code="missing_input_path", source=str(source),
+                           cause="input_path", message="Requested input path does not exist"))
+    try:
+        if source.is_dir():
+            issues.extend(audit_region_directory(source))
+            metadata, table = read_region_directory(source) if not issues else ({}, None)
+        elif source.exists():
+            metadata, table = _read_text_table(source, columns=(), preserve_extra=True)
+        else:
+            metadata, table = {}, None
+        if table is not None:
+            result["tumor_id"] = metadata["tumor_id"]
+            result["source_row_count"] = len(table)
+            missing = sorted(set(SCHEMA_COLUMNS) - set(table.columns))
+            if missing:
+                issues.append(dict(status="input_missing", code="missing_input_columns", fields=missing,
+                    cause="input_schema", message="Required source columns are absent"))
+            else:
+                keys = set()
+                for number, row in enumerate(table.to_dict(orient="records"), 1):
+                    location = dict(row_number=number, mutation_id=row["mutation_id"], sample_id=row["sample_id"])
+                    missing = [name for name in ("purity", "normal_cn", "allele_a_cn", "allele_b_cn", "segment_id")
+                               if str(row[name]) in (".", "")]
+                    if missing:
+                        issues.append(dict(status="input_missing", code="missing_biological_inputs", **location,
+                            fields=missing, cause="profile_unavailable_or_unmapped", message="Required CN/purity/mapping is missing"))
+                        continue
+                    try:
+                        normalized = _normalize_row(row, row_number=number)
+                    except (ValueError, TypeError) as error:
+                        issues.append(dict(status="input_invalid", code="invalid_observation", **location,
+                                           cause="model_domain", message=str(error)))
+                        continue
+                    keys.add((normalized["mutation_id"], normalized["sample_id"]))
+                    informative = (normalized["count_observed"] and normalized["alt_count"] + normalized["ref_count"] > 0
+                        and not normalized["input_excluded"]
+                        and (cutoff is None or normalized["allele_a_cn"] <= cutoff))
+                    if informative and not normalized["mapping_genuine"]:
+                        issues.append(dict(status="input_missing", code="unverified_cn_mapping", **location,
+                            cause="segment_join", message="CN mapping is explicitly marked nongenuine"))
+                    if informative and not normalized["normal_cn_supplied"] and (
+                            normal_cn_policy != "diploid" or normalized["normal_cn"] != 2):
+                        issues.append(dict(status="input_missing", code="normal_cn_not_supplied", **location,
+                            cause="normal_cn_policy", message="Supply normal CN or explicitly declare a matching diploid assumption"))
+                regions = sorted({region for _, region in keys})
+                mutations = sorted({mutation for mutation, _ in keys})
+                result.update(region_ids=regions, mutation_count=len(mutations))
+                if not issues:
+                    absent = [(mutation, region) for mutation in mutations for region in regions if (mutation, region) not in keys]
+                    issues.extend(dict(status="input_missing", code="missing_mutation_region", mutation_id=mutation,
+                        sample_id=region, cause="tumor_region_mapping", message="Requested mutation-region observation is absent")
+                        for mutation, region in absent)
+                if not issues:
+                    validated = _validate_long_table(metadata, table)
+                    catalog = _catalog_from_validated(metadata, table, validated, max_major_cn=cutoff)
+                    validate_workflow_mapping(catalog, normal_cn_policy=normal_cn_policy)
+                    result.update(eligible_pairs=int(catalog.eligible.sum()),
+                        informative_pairs=int((catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)).sum()),
+                        explicitly_excluded_pairs=int(catalog.input_excluded.sum()),
+                        cn_cutoff_excluded_pairs=int((~catalog.cn_population_mask & ~catalog.input_excluded).sum()))
+    except (OSError, ValueError, TypeError) as error:
+        issues.append(dict(status="input_invalid", code="invalid_input", source=str(source),
+                           cause="input_contract", message=str(error)))
+    result["status"] = ("input_invalid" if any(issue["status"] == "input_invalid" for issue in issues)
+                        else "input_missing" if issues else "ready")
+    return result
 
 
 def _load_input(path, *, max_major_cn, numerical=False, normal_cn_policy=None):
@@ -486,7 +580,7 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn):
     # Match the ordinary loader's full-input, post-CN-filter canonical purity.
     canonical_purity = {}
     for (_, region), row in validated.rows_by_unit.items():
-        if row["allele_a_cn"] <= max_major_cn and not row["input_excluded"]:
+        if (max_major_cn is None or row["allele_a_cn"] <= max_major_cn) and not row["input_excluded"]:
             value = row["_source_purity"]
             canonical_purity[region] = min(canonical_purity.get(region, value), value)
     for i, mutation in enumerate(validated.mutation_ids):
@@ -501,7 +595,7 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn):
             numeric["minor_cn"][i, j] = row["allele_b_cn"]
             numeric["normal_cn"][i, j] = row["normal_cn"]
             numeric["purity"][i, j] = canonical_purity.get(region, row["purity"])
-            eligible[i, j] = numeric["major_cn"][i, j] <= max_major_cn and not row["input_excluded"]
+            eligible[i, j] = (max_major_cn is None or numeric["major_cn"][i, j] <= max_major_cn) and not row["input_excluded"]
             segments[i, j] = row["segment_id"]
             for name, values in flags.items():
                 values[i, j] = row[name]
@@ -530,7 +624,7 @@ def _catalog_data(catalog, mutation_ids, *, prediction, normal_cn_policy=None):
     if not prediction:
         mutations = tuple(m for m, keep in zip(mutations, eligible_rows) if keep)
         rows = rows[eligible_rows]
-    policy = INPUT_MASK_POLICY_ID if any(row.reason == INPUT_EXCLUDED for row in records) else CN_FILTER_POLICY_ID
+    policy = _filter_policy(catalog.max_major_cn, records)
     report = CNFilterReport(policy, catalog.max_major_cn, input_count, int(eligible_rows.sum()), excluded, records)
     if not prediction and not mutations:
         raise NoEligibleSNVsError(report, tumor_id=catalog.tumor_id)
@@ -671,6 +765,7 @@ __all__ = [
     "TumorTxtError",
     "load_tumor_txt",
     "load_original_catalog",
+    "audit_input",
     "load_multiplicity_bounds",
     "write_tumor_txt",
 ]

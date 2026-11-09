@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import math
 from numbers import Integral
 from typing import Final
 
-DEFAULT_MAX_MAJOR_CN: Final = 10
+DEFAULT_MAX_MAJOR_CN: Final = None
 DEFAULT_MAX_CLUSTERS: Final = 20
 DEFAULT_STAGE_ONE_MAX_CLUSTERS: Final = 10
 DEFAULT_DEVICE: Final = "cpu"
@@ -22,10 +21,12 @@ def validate_audit_scope(value):
     return value
 
 
-def validate_max_major_cn(value: int) -> int:
-    """Require an explicit positive integer input-eligibility cutoff."""
+def validate_max_major_cn(value: int | None) -> int | None:
+    """None keeps all valid CN; a positive integer declares a population cutoff."""
+    if value is None:
+        return None
     if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
-        raise ValueError("max_major_cn must be a positive integer.")
+        raise ValueError("max_major_cn must be None (unrestricted) or a positive integer.")
     return int(value)
 
 
@@ -34,7 +35,7 @@ class FitConfig:
     """Public execution and CN eligibility options; numerical policy is fixed."""
 
     device: str = DEFAULT_DEVICE
-    max_major_cn: int = DEFAULT_MAX_MAJOR_CN
+    max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN
     max_clusters: int = DEFAULT_MAX_CLUSTERS
     cpu_threads: int | None = None
     audit_scope: str = DEFAULT_AUDIT_SCOPE
@@ -53,7 +54,7 @@ class FitConfig:
 
 def resolve_fit_config(
     *, device: str = DEFAULT_DEVICE,
-    max_major_cn: int = DEFAULT_MAX_MAJOR_CN,
+    max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN,
     max_clusters: int = DEFAULT_MAX_CLUSTERS,
     cpu_threads: int | None = None,
     audit_scope: str = DEFAULT_AUDIT_SCOPE,
@@ -73,7 +74,6 @@ class WorkflowConfig:
     fit: FitConfig = field(default_factory=lambda: FitConfig(
         device="cpu", max_clusters=DEFAULT_STAGE_ONE_MAX_CLUSTERS))
     stage_two_max_clusters: int = DEFAULT_MAX_CLUSTERS
-    stage_two_near_clonal_distance_max: float = 0.05
     normal_cn_policy: str | None = None
 
     def __post_init__(self):
@@ -81,9 +81,6 @@ class WorkflowConfig:
             raise TypeError("Workflow requires a validated FitConfig")
         if self.normal_cn_policy not in (None, "diploid"):
             raise ValueError("normal_cn_policy must be None or the explicit 'diploid' assumption")
-        value = self.stage_two_near_clonal_distance_max
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-            raise ValueError("stage_two_near_clonal_distance_max must be positive and finite")
         if type(self.stage_two_max_clusters) is not int or self.stage_two_max_clusters < 1:
             raise ValueError("stage_two_max_clusters must be a positive integer")
 

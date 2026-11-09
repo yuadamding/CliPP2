@@ -13,7 +13,7 @@ import numpy as np
 from CliPP2.io.assignment import load_accepted_fit, save_accepted_fit
 from CliPP2.io.data import MultiplicityBounds, OriginalCatalog, validate_workflow_mapping
 from CliPP2.io.region_files import read_region_directory
-from CliPP2.io.tumor_txt import load_original_catalog, load_tumor_txt, write_tumor_txt
+from CliPP2.io.tumor_txt import SCHEMA_COLUMNS, audit_input, load_original_catalog, load_tumor_txt, write_tumor_txt
 from CliPP2.kernel.backend import NativeBackend
 from CliPP2.kernel.observations import prepare_prediction
 from CliPP2.workflow import _fit_accepted, classify_groups
@@ -31,7 +31,7 @@ def _excluded_catalog(directory):
                 allele_a_cn=12 if (i, j) == (0, 1) else 1, allele_b_cn=1))
     path = directory / "excluded_single_state.tsv"
     write_tumor_txt(path, pd.DataFrame(rows))
-    return path, load_original_catalog(path)
+    return path, load_original_catalog(path, max_major_cn=10)
 
 
 def _normal_provenance(directory, catalog):
@@ -151,6 +151,7 @@ def run_input_checks(directory):
     expect_value_error(lambda: replace(original, upper=original.upper+1).for_data(catalog))
 
     config = workflow_config()
+    config = replace(config, fit=replace(config.fit, max_major_cn=10))
     accepted = _fit_accepted(catalog, catalog.mutation_ids, None, directory / "fit", "stage_one",
                              replace(config.fit, max_clusters=2), None)
     receipt = directory / "accepted.json"
@@ -186,10 +187,122 @@ def run_input_checks(directory):
         assert clone.content_hash == sanitized.content_hash and not clone.upper.flags.writeable
         expect_value_error(lambda: clone.upper.setflags(write=True))
     return dict(excluded_single_state_fit_screen_replay=True, single_state_contract=_single_state_contract(directory, catalog),
+                unrestricted_cn=check_unrestricted_cn(directory / "unrestricted_cn"),
                 biological_namespace_checked_before_model=True, immutable_catalog_and_support=True,
                 normal_cn_provenance=_normal_provenance(directory, catalog),
                 normal_cn_fit_metadata=check_normal_cn_fit_metadata(directory / "normal_fit_metadata"),
                 explicit_input_exclusion=check_input_exclusion(directory))
+
+
+def check_unrestricted_cn(directory):
+    """Population expansion is explicit and cannot reuse a restricted saved input."""
+    from CliPP2.config import FitConfig, WorkflowConfig
+    from CliPP2.io.data import content_hash
+    from CliPP2.kernel.backend import NativeExecutionError
+    from scipy.special import logsumexp
+    from scipy.stats import binom
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    assert FitConfig().max_major_cn is None
+    assert "stage_two_near_clonal_distance_max" not in WorkflowConfig.__dataclass_fields__
+    for invalid in (0, -1, 1.5, True, "10"):
+        expect_value_error(lambda invalid=invalid: FitConfig(max_major_cn=invalid))
+    path, restricted = _excluded_catalog(directory)
+    expanded = load_original_catalog(path)
+    assert expanded.eligible.all() and not restricted.eligible[0, 1]
+    assert expanded.max_major_cn is None and expanded.to_dict()["eligibility_policy"] == "unrestricted_valid_cn"
+    assert load_tumor_txt(path).major_cn[0, 1] == 12
+    expect_value_error(lambda: expanded.compatible_source_identities(10))
+    # V4 remains a real identity-preserving reader, never an implicit upgrade.
+    old = replace(restricted, _schema_version=4)
+    payload = old.to_dict()
+    for value in (OriginalCatalog.from_dict(payload), copy.deepcopy(old), pickle.loads(pickle.dumps(old))):
+        assert value.to_dict() == payload and value.content_hash == old.content_hash
+    assert content_hash(payload) in restricted.compatible_source_identities(10)
+    subset = expanded.subset(expanded.mutation_ids[1:])
+    old_subset = replace(subset, max_major_cn=10, _schema_version=4)
+    assert content_hash(old_subset.to_dict()) in subset.compatible_source_identities(10)
+    tampered = old_subset.to_dict()
+    tampered["total_counts"][0][0] += 1
+    expect_value_error(lambda: OriginalCatalog.from_dict(tampered))
+    # Historical source placeholders remain evidence, but new directory joins
+    # cannot invent diploid values even for unobserved mutation-region cells.
+    source_rows = tuple(tuple(dict(row, mapping_genuine="0").items()) for row in old.source_rows)
+    legacy_mapping = replace(old, mapping_genuine=np.zeros(old.major_cn.shape, bool), source_rows=source_rows,
+        provenance=tuple(tuple((k, v) for k, v in row if k not in SCHEMA_COLUMNS) for row in source_rows))
+    assert OriginalCatalog.from_dict(legacy_mapping.to_dict()).to_dict() == legacy_mapping.to_dict()
+
+    rows = [dict(mutation_id=f"m{i}", sample_id="r", alt_count=7, ref_count=33,
+        count_observed=1, purity=.7, normal_cn=i, segment_id=f"s{i}", cn_state_id="0",
+        cn_state_fraction=1, allele_a_cn=major, allele_b_cn=1)
+        for i, major in enumerate((11, 64, 257))]
+    high_path = directory / "high_cn.tsv"
+    write_tumor_txt(high_path, pd.DataFrame(rows))
+    high = load_original_catalog(high_path)
+    assert high.eligible.all()
+    for bounds in (high.default_bounds(), MultiplicityBounds(high.mutation_ids, high.region_ids,
+                   np.full((3, 1), 2), high.major_cn-1)):
+        prepared = prepare_prediction(high, high.mutation_ids, bounds)
+        phi = np.full((3, 1), .63)
+        with NativeBackend(prepared, cpu_threads=1) as backend:
+            diagnostic = backend.component_diagnostics(phi)
+            grid = backend.regional_grid(0, np.arange(3), [.63])[:, 0]
+        for i in range(3):
+            candidates = np.arange(bounds.lower[i, 0], bounds.upper[i, 0]+1)
+            probability = (prepared.scaling[i, 0]*candidates)*phi[i, 0]
+            expected = logsumexp(binom.logpmf(7, 40, probability))-np.log(len(candidates))
+            np.testing.assert_allclose([diagnostic["log_emission"][i, 0], grid[i]], expected, rtol=1e-12, atol=1e-12)
+    # This hits checked scratch-size arithmetic, not an actual enormous allocation.
+    huge = pd.DataFrame([dict(rows[0], allele_a_cn=2**60)])
+    huge_path = directory / "resource_bound.tsv"
+    write_tumor_txt(huge_path, huge)
+    huge_catalog = load_original_catalog(huge_path)
+    prepared = prepare_prediction(huge_catalog, huge_catalog.mutation_ids)
+    assert prepared.support[0, 0] == 2**60
+    with NativeBackend(prepared, cpu_threads=1) as backend:
+        try:
+            backend.regional_grid(0, np.array([0]), [.5])
+        except NativeExecutionError as error:
+            assert "overflow" in str(error).lower()
+        else:
+            raise AssertionError("Unrepresentable scratch storage was silently accepted")
+
+    ready = audit_input(high_path)
+    assert ready["status"] == "ready" and ready["eligible_pairs"] == 3
+    missing = pd.DataFrame(rows).assign(purity=".")
+    missing.to_csv(directory / "missing.tsv", sep="\t", index=False)
+    audit = audit_input(directory / "missing.tsv")
+    assert audit["status"] == "input_missing" and len(audit["issues"]) == 3
+    assert all("purity" in issue["fields"] for issue in audit["issues"])
+    profiles = directory / "profiles"
+    profiles.mkdir()
+    (profiles / "snv.txt").write_text("chromosome_index\tposition\talt_count\tref_count\n1\t100\t3\t7\n")
+    audit = audit_input(profiles)
+    assert audit["status"] == "input_missing"
+    assert {issue["field"] for issue in audit["issues"]} == {"cna.txt", "purity.txt"}
+    (profiles / "purity.txt").write_text(".7\n")
+    (profiles / "cna.txt").write_text("chromosome_index\tstart_position\tend_position\tmajor_cn\tminor_cn\ttotal_cn\tnormal_cn\nchr1\t1\t200\t1\t1\t2\t2\n")
+    audit = audit_input(profiles)
+    assert audit["status"] == "input_missing" and audit["issues"][0]["cause"] == "chromosome_naming"
+    assert not any("major_cn" in issue for issue in audit["issues"])
+    expect_value_error(lambda: load_original_catalog(profiles))
+    expect_value_error(lambda: read_region_directory(profiles))
+    missing_reads = directory / "missing_reads_and_cn"
+    for sample, position, start, end in (("r1", 100, 1, 150), ("r2", 200, 151, 250)):
+        region = missing_reads / sample
+        region.mkdir(parents=True)
+        (region / "snv.txt").write_text(f"chromosome_index\tposition\talt_count\tref_count\n1\t{position}\t3\t7\n")
+        (region / "purity.txt").write_text(".7\n")
+        (region / "cna.txt").write_text("chromosome_index\tstart_position\tend_position\tmajor_cn\tminor_cn\ttotal_cn\tnormal_cn\n"
+            f"1\t{start}\t{end}\t1\t1\t2\t2\n")
+    audit = audit_input(missing_reads)
+    assert audit["status"] == "input_missing" and len(audit["issues"]) == 2
+    assert {(row["mutation_id"], row["sample_id"]) for row in audit["issues"]} == {("1:200", "r1"), ("1:100", "r2")}
+    expect_value_error(lambda: load_original_catalog(missing_reads))
+    return dict(default_unrestricted=True, explicit_cutoff_preserved=True, historical_catalog_identity_preserved=True,
+        changed_population_rejected=True, higher_cn_oracles=[11, 64, 257], native_resource_overflow_explicit=True,
+        input_audit_missing_profiles_and_mapping=True)
 
 
 def _single_state_contract(directory, catalog):
@@ -235,7 +348,7 @@ def _single_state_contract(directory, catalog):
     for field in ("mapping_genuine", "normal_cn_supplied"):
         path = directory / (field + ".tsv")
         write_tumor_txt(path, frame.assign(**{field: 0}))
-        retained = load_original_catalog(path)
+        retained = load_original_catalog(path, max_major_cn=catalog.max_major_cn)
         expect_value_error(lambda: load_tumor_txt(path))
         expect_value_error(lambda: retained.fit_data())
         expect_value_error(lambda: retained.prediction_data(retained.mutation_ids))
@@ -309,10 +422,10 @@ def check_input_exclusion(directory):
     # An explicit reason stays identity-bearing even if CN independently excludes the same pair.
     cn_frame = frame.assign(allele_a_cn=11, segment_id="high_cn")
     write_tumor_txt(directory / "excluded_reason.tsv", cn_frame)
-    with_reason = load_original_catalog(directory / "excluded_reason.tsv")
+    with_reason = load_original_catalog(directory / "excluded_reason.tsv", max_major_cn=10)
     write_tumor_txt(directory / "excluded_reason_absent.tsv", cn_frame.assign(input_excluded=0),
                     dict(with_reason.metadata))
-    without_reason = load_original_catalog(directory / "excluded_reason_absent.tsv")
+    without_reason = load_original_catalog(directory / "excluded_reason_absent.tsv", max_major_cn=10)
     np.testing.assert_array_equal(with_reason.eligible, without_reason.eligible)
     assert _biological_hash(with_reason, with_reason.mutation_ids) != _biological_hash(without_reason, without_reason.mutation_ids)
     for flag in ("false", "True", "2", ".", " 0"):

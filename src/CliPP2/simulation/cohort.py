@@ -325,7 +325,7 @@ def cohort_history(cohort, history_id, *, enforce_numpy_version=True):
 
 
 def acquire_cohort(history, cohort, acquisition_id, *, read_replicate_id=1, matched_R4_mask=False,
-                   enforce_numpy_version=True):
+                   enforce_numpy_version=True, max_major_cn=None):
     """Generate every pair from its prescribed fresh PCG64 semantic seed."""
     _check_numpy(cohort, enforce_numpy_version)
     metadata = history.metadata
@@ -388,7 +388,10 @@ def acquire_cohort(history, cohort, acquisition_id, *, read_replicate_id=1, matc
         for i in np.argsort(rank) for mutation in (history.mutation_ids[i],)
         for j, region in enumerate(history.region_ids)]
     frame = pd.DataFrame(records)
-    eligible = (history.major_cn <= 10) & ~excluded
+    from ..config import validate_max_major_cn
+    max_major_cn = validate_max_major_cn(max_major_cn)
+    cn_population = np.ones(history.major_cn.shape, dtype=bool) if max_major_cn is None else history.major_cn <= max_major_cn
+    eligible = cn_population & ~excluded
     identity = history_content_id(history)
     frame.attrs['metadata'] = dict(tumor_id=f'{history.history_id}.{acquisition_id}.read{read_replicate_id}',
         history_id=history.history_id, history_content_id=identity,
@@ -397,6 +400,7 @@ def acquire_cohort(history, cohort, acquisition_id, *, read_replicate_id=1, matc
         genome_build='synthetic_1Mb_segments', coordinate_system='1-based-inclusive',
         mutation_key_convention='segment.batch.within_batch_3digit')
     frame.attrs['acquisition'] = dict(schema='clipp2.simulation.cohort-acquisition.v1', study_version='1.2',
+        max_major_cn=max_major_cn,
         cohort_content_id=cohort.content_id, history_content_id=identity,
         mutation_ids=history.mutation_ids, region_ids=history.region_ids,
         history_id=history.history_id, variant_id=metadata['variant_id'], split=metadata['split'],

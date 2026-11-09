@@ -114,7 +114,7 @@ def _regional(value, regions, name):
 
 
 def acquire(history: History, seed, purity=.8, depth=100, *, missing_rate=0., zero_depth_rate=0.,
-            perturbation=None, max_major_cn=10):
+            perturbation=None, max_major_cn=None):
     """Return one canonical long table and an explicit acquisition audit in attrs.
 
     Supported perturbations: purity_offset; cn_error_fraction (one copy in a
@@ -218,7 +218,9 @@ def acquire(history: History, seed, purity=.8, depth=100, *, missing_rate=0., ze
         mapping_genuine=int(genuine[i, j]), normal_cn_supplied=1)
         for i, mutation in enumerate(history.mutation_ids) for j, region in enumerate(history.region_ids)]
     frame = pd.DataFrame(records)
-    eligible = major <= max_major_cn
+    from ..config import validate_max_major_cn
+    max_major_cn = validate_max_major_cn(max_major_cn)
+    eligible = np.ones(major.shape, dtype=bool) if max_major_cn is None else major <= max_major_cn
     identity = history_content_id(history)
     attrs = dict(schema='clipp2.simulation.acquisition.v1', seed=int(seed),
         history_id=history.history_id, history_content_id=identity,
@@ -233,7 +235,7 @@ def acquire(history: History, seed, purity=.8, depth=100, *, missing_rate=0., ze
         input_loss=(~observed)|(depths == 0)|(~eligible), biological_truth_available=np.ones((n, r), bool),
         positive_carrier=history.phi > 0, cn_error=cn_changed, segment_mapping_error=mapping_changed,
         inherited_support_exclusion=(history.phi > 0) & (history.multiplicity > major),
-        settings=dict(purity=rho.tolist(), depth=mean_depth.tolist(), missing_rate=missing_rate,
+        settings=dict(max_major_cn=max_major_cn, purity=rho.tolist(), depth=mean_depth.tolist(), missing_rate=missing_rate,
                       zero_depth_rate=zero_depth_rate, perturbation=options))
     frame.attrs['acquisition'] = attrs
     frame.attrs['metadata'] = dict(tumor_id=history.history_id, history_id=history.history_id,

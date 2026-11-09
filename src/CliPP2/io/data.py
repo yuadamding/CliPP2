@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 import hashlib
 import json
 from types import MappingProxyType
@@ -94,7 +94,7 @@ class CNFilterReport:
     """Pair-level exclusions; excluded_mutation_ids failed in every region."""
 
     policy_id: str
-    max_major_cn: int
+    max_major_cn: int | None
     input_mutation_count: int
     retained_mutation_count: int
     excluded_mutation_ids: tuple[str, ...]
@@ -313,8 +313,9 @@ class OriginalCatalog(ImmutableArrayRecord):
     source_rows: tuple
     provenance: tuple
     metadata: tuple
-    max_major_cn: int = 10
+    max_major_cn: int | None = None
     input_excluded: np.ndarray | None = None
+    _schema_version: int = field(default=5, kw_only=True, repr=False)
     _content_hash: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
@@ -362,6 +363,9 @@ class OriginalCatalog(ImmutableArrayRecord):
         if source_keys != {(mutation, region) for mutation in self.mutation_ids for region in self.region_ids}:
             raise ValueError("Catalog source rows do not cover exactly the original keys")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
+        if (type(self._schema_version) is not int or self._schema_version not in (4, 5)
+                or (self._schema_version == 4 and self.max_major_cn is None)):
+            raise ValueError("Catalog v4 requires its original explicit CN cutoff; current catalogs use v5")
         if not np.isfinite(self.purity).all() or np.any(self.purity <= 0) or np.any(self.purity > 1):
             raise ValueError("Catalog purity must lie in (0,1]")
         if len(self.mutation_ids) and not np.all(self.purity == self.purity[:1]):
@@ -376,7 +380,7 @@ class OriginalCatalog(ImmutableArrayRecord):
             raise ValueError("Catalog alternate counts exceed total counts")
         if np.any(self.major_cn < 1) or np.any(self.major_cn >= 2**63) or np.any(self.minor_cn > self.major_cn):
             raise ValueError("Single-state tumor CN requires integer 1 <= major and 0 <= minor <= major")
-        if not np.array_equal(self.eligible, (self.major_cn <= self.max_major_cn) & ~self.input_excluded):
+        if not np.array_equal(self.eligible, self.cn_population_mask & ~self.input_excluded):
             raise ValueError("Catalog eligibility disagrees with original CN or explicit exclusion")
         from .tumor_txt import _normalize_row
         positions = {(mutation, region): (i, j) for i, mutation in enumerate(self.mutation_ids)
@@ -408,9 +412,11 @@ class OriginalCatalog(ImmutableArrayRecord):
             ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).hexdigest())
 
     def _payload(self):
-        payload = {"schema": "clipp2.original-catalog.v4", "tumor_id": self.tumor_id,
+        payload = {"schema": f"clipp2.original-catalog.v{self._schema_version}", "tumor_id": self.tumor_id,
                    "mutation_ids": list(self.mutation_ids), "region_ids": list(self.region_ids),
                    "max_major_cn": self.max_major_cn}
+        if self._schema_version == 5:
+            payload["eligibility_policy"] = self.eligibility_policy
         payload.update((name, getattr(self, name).tolist()) for name in _CATALOG_ARRAYS)
         # Omit the redundant all-false mask from the canonical payload.
         if not self.input_excluded.any():
@@ -421,6 +427,14 @@ class OriginalCatalog(ImmutableArrayRecord):
     @property
     def content_hash(self):
         return self._content_hash
+
+    @property
+    def eligibility_policy(self):
+        return "unrestricted_valid_cn" if self.max_major_cn is None else "major_cn_cutoff"
+
+    @property
+    def cn_population_mask(self):
+        return np.ones(self.major_cn.shape, dtype=bool) if self.max_major_cn is None else self.major_cn <= self.max_major_cn
 
     @property
     def biological_identity(self):
@@ -439,11 +453,35 @@ class OriginalCatalog(ImmutableArrayRecord):
     def to_dict(self):
         return dict(self._payload(), content_hash=self.content_hash)
 
+    def compatible_source_identities(self, original_max_major_cn):
+        """Recognize equivalent catalog encodings without expanding a saved fit.
+
+        The original cutoff must select exactly the current pair population.
+        Only schema and policy spelling may differ; all source observations,
+        biological arrays, exclusions and provenance remain authoritative.
+        """
+        cutoff = validate_max_major_cn(original_max_major_cn)
+        old_mask = np.ones(self.major_cn.shape, dtype=bool) if cutoff is None else self.major_cn <= cutoff
+        if not np.array_equal(self.eligible, old_mask & ~self.input_excluded):
+            raise ValueError("Replay CN population differs from the original fitting population")
+        versions = (5,) if cutoff is None else (4, 5)
+        return frozenset([content_hash(self.to_dict()), *(
+            content_hash(replace(self, max_major_cn=cutoff, _schema_version=version).to_dict())
+            for version in versions)])
+
     @classmethod
     def from_dict(cls, payload):
-        if payload.get("schema") != "clipp2.original-catalog.v4":
-            raise ValueError("Expected single-state original-catalog.v4; historical catalog schemas require their pinned revision")
-        value = cls(**{item.name: payload[item.name] for item in fields(cls) if item.init and item.name in payload})
+        schemas = {"clipp2.original-catalog.v4": 4, "clipp2.original-catalog.v5": 5}
+        version = schemas.get(payload.get("schema"))
+        if version is None:
+            raise ValueError("Expected single-state original-catalog.v4 or v5; earlier schemas require a versioned historical reader")
+        values = {item.name: payload[item.name] for item in fields(cls)
+                  if item.init and item.name in payload and not item.name.startswith("_")}
+        if "max_major_cn" not in values:
+            raise ValueError("Original catalogs must record their CN population policy explicitly")
+        value = cls(**values, _schema_version=version)
+        if version == 5 and payload.get("eligibility_policy") != value.eligibility_policy:
+            raise ValueError("Original-catalog CN population policy mismatch")
         if payload.get("content_hash") != value.content_hash:
             raise ValueError("Original-catalog content hash mismatch")
         return value

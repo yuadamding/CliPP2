@@ -132,9 +132,11 @@ def validate_replay_policy(accepted, requested_fit_config, *, normal_cn_policy):
     if ("normal_cn_policy" not in producer or producer["normal_cn_policy"] not in (None, "diploid")
             or normal_cn_policy not in (None, "diploid") or producer["normal_cn_policy"] != normal_cn_policy):
         raise ValueError("Replay normal-CN assumption differs from the original fitting policy")
-    if any(getattr(original, field) != getattr(requested_fit_config, field)
-           for field in ("max_clusters", "max_major_cn")):
-        raise ValueError("Replay search capacity or CN eligibility differs from the original fitting policy")
+    if original.max_clusters != requested_fit_config.max_clusters:
+        raise ValueError("Replay search capacity differs from the original fitting policy")
+    # A different declared CN cutoff can leave the actual observations unchanged.
+    # AcceptedFit.validate must still verify the exact requested population,
+    # numerical inputs, masks and effective support before any reuse is allowed.
     if len(accepted.centers) > original.max_clusters:
         raise ValueError("Accepted occupied count exceeds the original search capacity")
     validate_inherited_audit(accepted, original, requested_scope=requested_fit_config.audit_scope)
