@@ -370,7 +370,7 @@ def collect_cap_contributors(catalog, fit, config, *, mutation_ids=None):
 
 
 def classify_groups(catalog, fit, config):
-    """Measure groups without acceptance decisions; near_clonal is routing only."""
+    """Measure native groups without acceptance or geometric routing decisions."""
     from .screening import summarize_profile_deviance
     observation = prepare_prediction(catalog, fit.mutation_ids, fit.support, device=config.fit.device,
         cpu_threads=config.fit.cpu_threads, normal_cn_policy=config.normal_cn_policy)

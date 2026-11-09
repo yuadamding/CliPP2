@@ -282,7 +282,26 @@ def check_unrestricted_cn(directory):
     assert audit["status"] == "input_missing"
     assert {issue["field"] for issue in audit["issues"]} == {"cna.txt", "purity.txt"}
     (profiles / "purity.txt").write_text(".7\n")
-    (profiles / "cna.txt").write_text("chromosome_index\tstart_position\tend_position\tmajor_cn\tminor_cn\ttotal_cn\tnormal_cn\nchr1\t1\t200\t1\t1\t2\t2\n")
+    cn_header = "chromosome_index\tstart_position\tend_position\tmajor_cn\tminor_cn\ttotal_cn\tnormal_cn\n"
+    cn_values = ["1", "1", "200", "1", "1", "2", "2"]
+    (profiles / "cna.txt").write_text(cn_header + "\t".join(cn_values) + "\n")
+    for value, status in ((".", "input_missing"), ("", "input_missing"), ("not_a_number", "input_invalid"),
+                          ("NaN", "input_invalid"), ("0", "input_invalid"), ("1.1", "input_invalid")):
+        (profiles / "purity.txt").write_text(value + "\n")
+        audit = audit_input(profiles)
+        assert audit["status"] == status and audit["issues"][0]["status"] == status
+        expect_value_error(lambda: load_original_catalog(profiles))
+    (profiles / "purity.txt").write_text(".7\n")
+    for index in (3, 4, 5, 6):
+        for value, status in ((".", "input_missing"), ("invalid", "input_invalid"),
+                              ("1.5", "input_invalid"), ("-1", "input_invalid")):
+            cells = list(cn_values)
+            cells[index] = value
+            (profiles / "cna.txt").write_text(cn_header + "\t".join(cells) + "\n")
+            audit = audit_input(profiles)
+            assert audit["status"] == status and audit["issues"][0]["status"] == status
+            expect_value_error(lambda: load_original_catalog(profiles))
+    (profiles / "cna.txt").write_text(cn_header + "chr1\t1\t200\t1\t1\t2\t2\n")
     audit = audit_input(profiles)
     assert audit["status"] == "input_missing" and audit["issues"][0]["cause"] == "chromosome_naming"
     assert not any("major_cn" in issue for issue in audit["issues"])

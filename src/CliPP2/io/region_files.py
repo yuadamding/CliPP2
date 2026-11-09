@@ -17,6 +17,10 @@ _CNA_COLUMNS = ("chromosome_index", "start_position", "end_position",
                 "major_cn", "minor_cn", "total_cn")
 
 
+class _MissingProfileValue(TumorTxtError):
+    """A required regional value is absent, rather than outside its model domain."""
+
+
 def _regions(path: Path) -> tuple[Path, ...]:
     """One complete root bundle or immediate regional bundles; never recurse."""
     if not path.is_dir():
@@ -41,6 +45,8 @@ def _regions(path: Path) -> tuple[Path, ...]:
 
 
 def _integer(value: str, *, name: str, minimum: int = 0) -> int:
+    if value == ".":
+        raise _MissingProfileValue(f"{name} may not be missing.")
     if not value.isascii() or not value.isdecimal() or int(value) < minimum:
         raise TumorTxtError(f"{name} must be an integer >= {minimum}.")
     return int(value)
@@ -48,6 +54,8 @@ def _integer(value: str, *, name: str, minimum: int = 0) -> int:
 
 def _read_region(path: Path, *, preserve_provenance=False):
     tokens = (path / "purity.txt").read_text(encoding="utf-8").split()
+    if not tokens or tokens == ["."]:
+        raise _MissingProfileValue(f"{path}/purity.txt purity may not be missing.")
     if len(tokens) != 1:
         raise TumorTxtError(f"{path}/purity.txt must contain exactly one number.")
     purity = _finite_float(tokens[0], name=f"{path} purity")
@@ -163,7 +171,9 @@ def audit_region_directory(path):
         try:
             parsed[region.name] = _read_region(region)
         except (OSError, ValueError) as error:
-            issues.append(dict(status="input_invalid", code="invalid_profile", source=str(region),
+            missing = isinstance(error, _MissingProfileValue)
+            issues.append(dict(status="input_missing" if missing else "input_invalid",
+                               code="missing_profile_value" if missing else "invalid_profile", source=str(region),
                                sample_id=region.name, cause="profile_content", message=str(error)))
     loci = sorted({locus for value in parsed.values() for locus in value[1]})
     for sample, (_, _, intervals) in parsed.items():
