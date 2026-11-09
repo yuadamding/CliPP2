@@ -83,8 +83,8 @@ def check_purity_consistency(directory):
     excluded = frame.copy()
     excluded.loc[0, ["allele_a_cn", "segment_id"]] = [11, "excluded"]
     excluded_path = write_tumor_txt(directory / "purity_excluded.tsv", excluded)
-    excluded_catalog = load_original_catalog(excluded_path)
-    np.testing.assert_array_equal(excluded_catalog.fit_data().purity, load_tumor_txt(excluded_path).purity)
+    excluded_catalog = load_original_catalog(excluded_path, max_major_cn=10)
+    np.testing.assert_array_equal(excluded_catalog.fit_data().purity, load_tumor_txt(excluded_path, max_major_cn=10).purity)
     assert excluded_catalog.purity[0, 0] == excluded_catalog.purity[1, 0] == high
     assert float(dict(excluded_catalog.source_rows[0])["purity"]) == low
     invalid = frame.assign(purity=[.79, .81])
@@ -167,18 +167,21 @@ def check_provenance(directory):
     (source / "snv.txt").write_text("chromosome_index\tposition\talt_count\tref_count\n1\t100\t10\t10\n")
     (source / "cna.txt").write_text("chromosome_index\tstart_position\tend_position\tmajor_cn\tminor_cn\ttotal_cn\n1\t200\t300\t1\t1\t2\n")
     (source / "purity.txt").write_text("1\n")
-    original = load_original_catalog(source)
-    assert not original.mapping_genuine.any()
-    metadata, frame = read_region_directory(source)
-    converted = directory / "converted.tsv"
-    write_tumor_txt(converted, frame, metadata)
-    repeated = load_original_catalog(converted)
-    np.testing.assert_array_equal(original.mapping_genuine, repeated.mapping_genuine)
+    from CliPP2.io.tumor_txt import audit_input
+    expect_value_error(lambda: load_original_catalog(source))
+    expect_value_error(lambda: read_region_directory(source))
     expect_value_error(lambda: load_tumor_txt(source))
-    for name, path in (("directory", source), ("tsv", converted)):
-        expect_value_error(lambda: run_workflow(path, directory / (name+"_blocked"), workflow_config()))
-    frame["_mapping_genuine"] = "false"
-    expect_value_error(lambda: write_tumor_txt(directory / "invalid_marker.tsv", frame, metadata))
+    audit = audit_input(source)
+    assert audit["status"] == "input_missing"
+    expect_value_error(lambda: run_workflow(source, directory / "directory_blocked", workflow_config()))
+    audit_path = directory / "input_audit.json"
+    try:
+        cli_main(["audit-input", "--input-dir", str(source), "--output", str(audit_path)])
+    except SystemExit as error:
+        assert error.code == 1
+    else:
+        raise AssertionError("Missing CN audit reported success")
+    assert json.loads(audit_path.read_text())["status"] == "input_missing"
     # Covered CN with omitted normal CN is usable only under an explicit policy.
     (source / "cna.txt").write_text("chromosome_index\tstart_position\tend_position\tmajor_cn\tminor_cn\ttotal_cn\n1\t1\t300\t1\t1\t2\n")
     assumed = load_original_catalog(source)
@@ -350,7 +353,7 @@ def check_complete_workflow(directory):
     plan_config = asdict(config)
     plan_config["fit"].pop("max_clusters")
     plan_config.pop("stage_two_max_clusters")
-    plan = dict(schema="clipp2.workflow.plan.v4", protocol_version=PROTOCOL_VERSION,
+    plan = dict(schema="clipp2.workflow.plan.v5", protocol_version=PROTOCOL_VERSION,
                 input_path=path.name, workflow_config=plan_config)
     plan_path = directory / "plan.json"
     plan_path.write_text(json.dumps(plan))
@@ -383,12 +386,13 @@ def check_complete_workflow(directory):
         reused = load_accepted_fit(directory / f"reused/stage_{stage}_accepted.json")
         assert reused.producer_receipt == original.producer_receipt and reused.compatibility_receipts
     request = load_assignment_bundle(output / "assignment_bundle.json")
-    assert request.non_target_ids and len(request.non_target_ids) == 3
+    assert not request.non_target_ids and len(request.target_ids) == 6
     cli_main(["assign", "--bundle", str(output / "assignment_bundle.json"), "--output-dir", str(directory / "replayed_assignment")])
     for name in ("workflow_mutation_assignments.tsv", "workflow_assignment_multiplicity.tsv"):
         assert (output / "assignment" / name).read_bytes() == (directory / "replayed_assignment" / name).read_bytes()
     whole = pd.read_csv(output / "all_original_mutations.tsv", sep="\t")
-    assert set(whole["reassessment_status"]) == {"retained_clonal", "unchanged_non_target"}
+    assert set(whole["reassessment_status"]) <= {"retained", "reassigned"}
+    assert (whole["role"] == "target").all() and whole["posterior_defined"].all()
     catalog = load_original_catalog(path)
     renamed = replace(catalog, tumor_id="another_tumor",
                       metadata=tuple(dict(catalog.metadata, tumor_id="another_tumor").items()))
@@ -421,7 +425,7 @@ def check_segment_provenance(directory):
     measurements = []
     for size in (100, 200):
         catalog = write_catalog(directory / f"segment_{size}.tsv", np.full((size, 1), 25), 100, 3, minor=1)
-        audits = [dict(mutation_id=mutation, region_id="r1", segment_id="shared_segment", cap_source_map_call=1, contributes_to_cap=True)
+        audits = [dict(mutation_id=mutation, region_id="r1", segment_id="shared_segment", cap_source_map_upper=1, contributes_to_cap=True)
                   for mutation in catalog.mutation_ids]
         bounds, policies = _stage_two_caps(catalog, audits)
         assert len(policies) == 1 and policies[0]["contributor_count"] == size

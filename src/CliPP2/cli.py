@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
     fit.add_argument(
         "--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN,
-        help="Exclude a mutation only from regions where major CN exceeds this limit.",
+        help="Explicit restricted-population CN ceiling; default retains all valid integer CN.",
     )
     fit.add_argument("--max-clusters", type=int, default=DEFAULT_MAX_CLUSTERS,
                      help="Largest occupied cluster capacity (positive integer; no fixed upper limit).")
@@ -40,14 +40,24 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--run-manifest-id", help="External execution record identifier; no source scan is performed.")
     fit.add_argument("--version", action="version", version=__version__)
     workflow = subparsers.add_parser("workflow", allow_abbrev=False,
-                                    help="Run Protocol 2.3 from an explicit v4 JSON plan.")
+                                    help="Run reference-preserving Protocol 2.3 from an explicit v5 JSON plan.")
     workflow.add_argument("--plan", required=True)
     workflow.add_argument("--output-dir", required=True)
     assign = subparsers.add_parser("assign", allow_abbrev=False,
                                   help="Reassess frozen targets once under full original support.")
     assign.add_argument("--run-manifest-id", help="External identifier for this assignment execution.")
     assign.add_argument("--bundle", required=True)
+    assign.add_argument("--derive-current", action="store_true",
+                        help="Explicitly derive a current-policy result from a frozen historical bundle.")
     assign.add_argument("--output-dir", required=True)
+    audit = subparsers.add_parser("audit-input", allow_abbrev=False,
+                                 help="Report missing/invalid biological input without fitting or filling values.")
+    inputs = audit.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--input-file", dest="input_path")
+    inputs.add_argument("--input-dir", dest="input_path")
+    audit.add_argument("--output", required=True)
+    audit.add_argument("--normal-cn-policy", choices=["diploid"])
+    audit.add_argument("--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN)
     return parser
 
 
@@ -70,19 +80,32 @@ def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    if args.command == "audit-input":
+        from .io.tumor_txt import audit_input
+        from .io.publication import publish_json
+        result = audit_input(args.input_path, max_major_cn=args.max_major_cn, normal_cn_policy=args.normal_cn_policy)
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        publish_json(output, json.dumps(result, indent=2, allow_nan=False) + "\n")
+        if result["status"] != "ready":
+            raise SystemExit(1)
+        return
     if args.command == "assign":
-        from .assignment import assign_mutations
+        from .assignment import assign_mutations, derive_current_bundle
         from .io.assignment import load_assignment_bundle
-        assign_mutations(load_assignment_bundle(args.bundle), outdir=args.output_dir, run_manifest_id=args.run_manifest_id)
+        request = load_assignment_bundle(args.bundle)
+        if args.derive_current:
+            request = derive_current_bundle(request)
+        assign_mutations(request, outdir=args.output_dir, run_manifest_id=args.run_manifest_id)
         return
     if args.command == "workflow":
         from .config import WorkflowConfig
         from .workflow import run_workflow
         plan_path = Path(args.plan).resolve()
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        if (plan.get("schema") != "clipp2.workflow.plan.v4"
+        if (plan.get("schema") != "clipp2.workflow.plan.v5"
                 or plan.get("protocol_version") != PROTOCOL_VERSION):
-            raise ValueError("Workflow requires plan.v4 with protocol_version='2.3'; earlier contracts require a new run")
+            raise ValueError("Workflow requires plan.v5 with protocol_version='2.3'; historical plans retain their original contracts")
         extra = set(plan) - {"schema", "protocol_version", "input_path", "workflow_config", "accepted_stage_one", "accepted_stage_two", "run_build_manifest", "run_manifest_id"}
         if extra:
             raise ValueError(f"Unknown workflow plan fields: {sorted(extra)}")
