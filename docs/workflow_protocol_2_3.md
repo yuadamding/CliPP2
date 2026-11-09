@@ -47,6 +47,14 @@ without filling them or running inference.
    reassessment rule. Baseline labels identify each mutation's native source
    center after exact consolidation, not an assumed all-one membership.
 
+Input and CN-population exclusions take precedence over Stage 2 cap-source
+support checks and contributor classification. An excluded pair may have inert
+numerical support `[1,1]` even when its retained catalog bounds are wider; this
+is not a restriction of biological evidence. It remains marked `excluded`, is
+not scored for a cap, and supplies no endpoint. Eligible pairs must still match
+their full original support, including eligible pairs with missing reads.
+Original CN, masks and exclusion provenance remain unchanged.
+
 A nonempty fitting population with an entirely unsupported requested region
 remains explicitly unidentifiable. Removing an acceptance rule does not identify
 an absent coordinate. An empty Stage 2 remainder is valid: reassess the source

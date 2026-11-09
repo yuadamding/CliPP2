@@ -313,7 +313,7 @@ def _diagnostics(catalog, ids, phi, bounds, config, calls=None):
 
 
 def collect_cap_contributors(catalog, fit, config, *, mutation_ids=None):
-    """Collect full-support native MAP sets, preserving historical point calls."""
+    """Collect eligible full-support MAP sets, preserving historical point calls."""
     wanted = set(fit.mutation_ids if mutation_ids is None else mutation_ids)
     if not wanted.issubset(fit.mutation_ids):
         raise ValueError("Requested contributors must belong to the source fit")
@@ -323,22 +323,25 @@ def collect_cap_contributors(catalog, fit, config, *, mutation_ids=None):
     ids = tuple(fit.mutation_ids[i] for i in selected)
     support = fit.support.subset(ids, catalog.region_ids)
     original_support = catalog.default_bounds().subset(ids, catalog.region_ids)
-    if not (np.array_equal(support.lower, original_support.lower)
-            and np.array_equal(support.upper, original_support.upper)):
+    positions = {mutation: i for i, mutation in enumerate(catalog.mutation_ids)}
+    eligible = catalog.eligible[[positions[mutation] for mutation in ids]]
+    # Excluded cells use inert [1,1] numerical support, not their catalog CN.
+    # They cannot supply caps; require original support only on eligible pairs.
+    if not (np.array_equal(support.lower[eligible], original_support.lower[eligible])
+            and np.array_equal(support.upper[eligible], original_support.upper[eligible])):
         raise ValueError("Cap source requires the original full multiplicity support")
     observation = prepare_prediction(catalog, ids, support, device=config.fit.device,
         cpu_threads=config.fit.cpu_threads, normal_cn_policy=config.normal_cn_policy)
-    positions = {mutation: i for i, mutation in enumerate(catalog.mutation_ids)}
     records = []
     for i, mutation in enumerate(ids):
         source, original = selected[i], positions[mutation]
         for j, region in enumerate(catalog.region_ids):
             phi = float(fit.centers[fit.labels[source], j])
             evidence = None
-            if not catalog.mapping_genuine[original, j]:
-                reason = "nongenuine_mapping"
-            elif not catalog.eligible[original, j]:
+            if not catalog.eligible[original, j]:
                 reason = "excluded"
+            elif not catalog.mapping_genuine[original, j]:
+                reason = "nongenuine_mapping"
             elif not observation.observed[i, j]:
                 reason = "missing_observation"
             else:
