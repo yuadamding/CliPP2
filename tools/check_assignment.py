@@ -19,7 +19,8 @@ import numpy as np
 import pandas as pd
 
 from CliPP2.assignment import (AssignmentBundle, AssignmentReference, AssignmentResult,
-                               assign_mutations, score_summary)
+                               HistoricalAssignmentArtifact, EVIDENCE_STATUSES,
+                               assign_mutations, derive_current_bundle, score_summary)
 from CliPP2.config import PROTOCOL_VERSION
 from CliPP2.io.assignment import (load_assignment_bundle, publish_assignment, save_assignment_bundle,
                                   validate_assignment_result)
@@ -191,15 +192,11 @@ def _fixed_reference_baseline(root):
         assert content_hash(historical["payload"]) == historical["content_hash"]
         payload = copy.deepcopy(historical["payload"])
         assert payload["protocol_version"] == "2.2"
-        payload.update(schema="clipp2.assignment.bundle.v4", protocol_version="2.3")
-        payload.pop("thresholds")
-        reference = payload["reference"]
-        reference.pop("regional_quality")
-        reference.pop("regional_quality_reasons")
-        for name in ("source_informative_count", "source_informative_depth", "source_mean_profile_deviance",
-                     "source_maximum_profile_deviance", "diagnostic_availability"):
-            reference[name] = None
-        request = AssignmentBundle.from_dict(payload)
+        (root / "historical_bundle.json").write_text(json.dumps(historical))
+        assert load_assignment_bundle(root / "historical_bundle.json").to_dict() == payload
+        frozen = AssignmentBundle.from_dict(payload)
+        assert type(frozen) is HistoricalAssignmentArtifact and frozen.to_dict() == payload
+        request = derive_current_bundle(frozen)
         previous = pd.read_csv(io.BytesIO(archive.read("assignment/workflow_protocol22_mutation_assignments.tsv")),
                                sep="\t", float_precision="round_trip").set_index("mutation_id")
         previous_pairs = pd.read_csv(io.BytesIO(archive.read("assignment/workflow_protocol22_assignment_multiplicity.tsv")),
@@ -216,8 +213,28 @@ def _fixed_reference_baseline(root):
         before = previous_pairs.loc[row["mutation_id"], row["region_id"]]
         for key in ("conditional_map", "call_probability", "profile_deviance"):
             np.testing.assert_allclose(row[key], before[key], rtol=1e-12, atol=0.)
+    assert request.provenance["historical_derivation"]["content_hash"] == frozen.content_hash
+    assert frozen.to_dict() == payload
+    _reject(lambda: assign_mutations(frozen), TypeError)
+    altered = copy.deepcopy(payload)
+    altered["thresholds"]["posterior_min"] = 1.
+    altered["reference"]["regional_quality"] = [[False]*len(request.reference.region_ids)]*len(request.reference.labels)
+    altered["reference"]["regional_quality_reasons"] = [[["historical_quality_fixture"]]*len(request.reference.region_ids)]*len(request.reference.labels)
+    alternative = assign_mutations(derive_current_bundle(AssignmentBundle.from_dict(altered)))
+    for one, two in zip(current.assignments, alternative.assignments):
+        np.testing.assert_array_equal(one["log_scores"], two["log_scores"])
+        np.testing.assert_array_equal(one["probabilities"], two["probabilities"])
+        assert one["map_label"] == two["map_label"]
+    previous23 = request.to_dict()
+    previous23["schema"] = "clipp2.assignment.bundle.v4"
+    old23 = AssignmentBundle.from_dict(previous23)
+    new23 = derive_current_bundle(old23)
+    assert old23.to_dict() == previous23 and old23.content_hash != new23.content_hash
+    assert new23.catalog.content_hash == request.catalog.content_hash
+    assert new23.reference.to_dict() == request.reference.to_dict()
     return dict(targets=len(current.target_ids), scores_exact=True, probabilities_exact=True,
-                diagnostic_measurements_preserved=True, separately_identified_derivative=True)
+                diagnostic_measurements_preserved=True, separately_identified_derivative=True,
+                historical_quality_and_thresholds_inert=True, protocol22_and_early23_readers=True)
 
 
 def _accounting_checks(root):
@@ -231,9 +248,9 @@ def _accounting_checks(root):
     assert [row["evidence_status"] for row in result.assignments] == ["observed", "prior_only"]
     accounting = dict(status="complete", unchanged_map={full.target_ids[2]: 1}, population_count=3,
         final_occupancy={"0": 0, "1": 2, "2": 0}, unchanged_non_target_occupancy={"0": 0, "1": 1, "2": 0},
-        unresolved_targets=1, evidence_status_counts=dict(observed=1, prior_only=1, model_incompatible=0, excluded=0),
-        outcomes_by_origin={"stage1_reference_recheck": dict(retained_clonal=0, reassigned=1, unresolved=0),
-                            "stage2_near_clonal_recheck": dict(retained_clonal=0, reassigned=0, unresolved=1)},
+        unresolved_targets=1, evidence_status_counts={key: int(key in ("observed", "prior_only")) for key in EVIDENCE_STATUSES},
+        outcomes_by_origin={"stage1_reference_recheck": dict(retained=0, reassigned=1, unresolved=0),
+                            "stage2_recheck": dict(retained=0, reassigned=0, unresolved=1)},
         historical_caps_recomputed=False)
     for wrong in (dict(accounting, population_count=4), dict(accounting, unchanged_map={}),
                   dict(accounting, final_occupancy={"0": 1, "1": 2, "2": 0}),
@@ -243,8 +260,18 @@ def _accounting_checks(root):
     published = publish_assignment(request, result, root / "combined_output", workflow_accounting=accounting)
     assert published["workflow_accounting"] == accounting and published["population_scope"] == "workflow_combined"
     assert result.reference.labels == (0, 1, 2) and result.summary["population_scope"] == "targets_only"
+    _reject(lambda: publish_assignment(request, result, root / "invalid_all_target",
+        workflow_accounting=dict(accounting, reassessment_policy="all_combined_fitted_mutations")))
+    all_targets = replace(full, source_stages=("stage_one", "stage_two", "stage_two"), baseline_labels=(0, 1, 1))
+    complete = assign_mutations(all_targets)
+    assert [row["reassessment_status"] for row in complete.assignments] == ["reassigned", "unresolved", "retained"]
+    all_accounting = dict(status="complete", reassessment_policy="all_combined_fitted_mutations",
+        unchanged_map={}, population_count=3, final_occupancy={"0": 0, "1": 2, "2": 0},
+        unchanged_non_target_occupancy={"0": 0, "1": 0, "2": 0}, unresolved_targets=1)
+    publish_assignment(all_targets, complete, root / "all_target_output", workflow_accounting=all_accounting)
     return dict(unchanged_plus_observed_map=True, prior_only_not_counted_as_map=True,
-                zero_occupancy_reference_retained=True, tampered_counts_rejected=True)
+                zero_occupancy_reference_retained=True, tampered_counts_rejected=True,
+                all_target_policy_empty_F=True, actual_native_baseline_retention=True)
 
 
 def _reference_measurement_roundoff_checks():
@@ -323,6 +350,7 @@ def run_checks(directory):
             ([0., np.nextafter(0., 1.)], (0, 1), 1, (1,)), ([0., -1000.], (0, 1), 0, (0,))):
         summary = score_summary(scores, labels)
         assert summary["map_cluster_label"] == call and summary["map_tied_labels"] == ties
+        assert summary["map_label"] == call and summary["map_set"] == ties and summary["posterior_defined"]
         assert summary["map_unique"] == (len(ties) == 1)
     assert score_summary([0., -1000.], (0, 1))["has_finite_alternative"]
     assert score_summary([0., -1000.], (0, 1))["log_competitor_ratio"] == -1000
@@ -330,11 +358,12 @@ def run_checks(directory):
     assert tied.assignments[0]["map_tied_labels"] == (0, 1)
     assert tied.assignments[0]["final_assignment_label"] == 0
     tied_request = _bundle(marginal, _reference(marginal, [[.6], [.6]]))
-    for values in ([0., 1.], [0, 1.00000000005], [False, 1]):
-        changed = tied.to_dict()
-        changed["assignments"][0]["map_tied_labels"] = values
-        _reject(lambda: validate_assignment_result(tied_request, AssignmentResult.from_dict(changed)))
-    for field in ("map_cluster_label", "best_label", "final_assignment_label", "baseline_reference_label"):
+    for field in ("map_set", "map_tied_labels"):
+        for values in ([0., 1.], [0, 1.00000000005], [False, 1], [1, 0], [0]):
+            changed = tied.to_dict()
+            changed["assignments"][0][field] = values
+            _reject(lambda: validate_assignment_result(tied_request, AssignmentResult.from_dict(changed)))
+    for field in ("map_label", "map_cluster_label", "best_label", "final_assignment_label", "baseline_reference_label"):
         for value in (0., False):
             changed = tied.to_dict()
             changed["assignments"][0][field] = value
@@ -376,6 +405,8 @@ def run_checks(directory):
         empty_request = _bundle(catalog, _reference(catalog, centers))
         values = assign_mutations(empty_request, outdir=root / (name+"_output")).assignments[0]
         assert values["evidence_status"] == state and values["final_assignment_label"] is None
+        assert values["posterior_defined"] == (state == "prior_only")
+        assert values["map_set"] == values["map_tied_labels"] and values["map_label"] == values["map_cluster_label"]
         if state == "prior_only":
             np.testing.assert_array_equal(values["log_scores"], np.full(len(centers), -np.log(len(centers))))
             np.testing.assert_array_equal(values["probabilities"], np.full(len(centers), 1/len(centers)))
@@ -483,6 +514,23 @@ def run_checks(directory):
     for clone in (copy.copy(result), copy.deepcopy(result), pickle.loads(pickle.dumps(result))):
         validate_assignment_result(request, clone)
         assert not clone.assignments[0]["probabilities"].flags.writeable
+    historical_result = result.to_dict()
+    historical_result["schema"] = historical_result["summary"]["schema"] = "clipp2.assignment.result.v5"
+    for row in historical_result["assignments"]:
+        for field in ("map_label", "map_set", "posterior_defined"):
+            row.pop(field)
+        row["target_reason"] = "stage2_near_clonal_recheck"
+        row["reassessment_status"] = "retained_clonal"
+    frozen = AssignmentResult.from_dict(historical_result)
+    assert type(frozen) is HistoricalAssignmentArtifact
+    for clone in (copy.copy(frozen), copy.deepcopy(frozen), pickle.loads(pickle.dumps(frozen))):
+        assert content_hash(clone.to_dict()) == content_hash(historical_result)
+        assert clone.payload["assignments"][0]["target_reason"] == "stage2_near_clonal_recheck"
+        assert clone.payload["assignments"][0]["reassessment_status"] == "retained_clonal"
+        _reject(lambda: validate_assignment_result(request, clone))
+    changed = result.to_dict()
+    changed["assignments"][0]["posterior_defined"] = False
+    _reject(lambda: AssignmentResult.from_dict(changed))
     with patch.dict(os.environ, {"CLIPP2_RUN_MANIFEST_ID": "current"}):
         current = assign_mutations(replace(request, run_manifest_id="original"))
         assert current.run_manifest_id == "current" and current.summary["bundle_run_manifest_id"] == "original"
@@ -500,6 +548,7 @@ def run_checks(directory):
         conditional_map_without_concentration_gate=True, diagnostic_failure_preserves_scoring=True,
         computational_failure_explicit=True, origin_order_batch_invariance=True,
         immutable_roundtrip_and_tampering=True, byte_identical_replay=True,
+        historical_artifacts_read_only=True, authoritative_map_fields=True,
         numerical_deviance=numerical, loss_only_scoring=loss_only, scalar_cn=scalar_cn,
         whole_population_accounting=accounting, reference_measurement_roundoff=measurement_roundoff)
 

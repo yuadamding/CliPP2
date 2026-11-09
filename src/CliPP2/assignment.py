@@ -16,7 +16,9 @@ from .kernel.observations import prepare_prediction
 from .screening import binomial_profile_deviance, summarize_profile_deviance
 
 SUPPORT_POLICY = "original_full_1_to_major_cn"
-EVIDENCE_STATUSES = ("observed", "prior_only", "model_incompatible", "excluded")
+EVIDENCE_STATUSES = ("observed", "prior_only", "model_incompatible", "computation_failed", "input_missing", "excluded")
+_HISTORICAL_SCHEMAS = {"clipp2.assignment.bundle.v3": "2.2", "clipp2.assignment.result.v4": "2.2",
+                       "clipp2.assignment.bundle.v4": "2.3", "clipp2.assignment.result.v5": "2.3"}
 
 
 def _integer_tuple(values, name):
@@ -24,6 +26,54 @@ def _integer_tuple(values, name):
     if any(isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) for value in values):
         raise ValueError(f"{name} requires exact integers")
     return values
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalAssignmentArtifact(ImmutableArrayRecord):
+    """Read-only historical evidence; never an executable current request/result."""
+    payload: object
+
+    def __post_init__(self):
+        if (self.payload.get("schema") not in _HISTORICAL_SCHEMAS
+                or self.payload.get("protocol_version") != _HISTORICAL_SCHEMAS[self.payload["schema"]]
+                or self.payload.get("support_policy") != SUPPORT_POLICY):
+            raise ValueError("Unsupported historical assignment artifact")
+        object.__setattr__(self, "payload", _freeze(self.payload))
+
+    def to_dict(self):
+        return thaw_record(self.payload, arrays_as_lists=True)
+
+    @property
+    def content_hash(self):
+        return content_hash(self.to_dict())
+
+
+def derive_current_bundle(historical):
+    """Explicit fixed-reference derivative; preserve the historical target population.
+
+    This does not rebuild a current workflow's references or its all-target routing.
+    The original artifact remains unchanged and its identity is retained in provenance.
+    """
+    if (type(historical) is not HistoricalAssignmentArtifact
+            or historical.payload["schema"] not in ("clipp2.assignment.bundle.v3", "clipp2.assignment.bundle.v4")):
+        raise TypeError("An intact historical v3/v4 assignment bundle is required")
+    payload = historical.to_dict()
+    provenance = payload.get("provenance", {})
+    payload["provenance"] = dict(provenance) if isinstance(provenance, Mapping) else {"original_provenance": provenance}
+    derivation = dict(schema=payload["schema"], protocol_version=payload["protocol_version"],
+        content_hash=historical.content_hash, scope="fixed_reference_original_targets")
+    if payload["schema"] == "clipp2.assignment.bundle.v3":
+        reference = payload["reference"]
+        derivation["legacy_decision_metadata"] = dict(thresholds=payload.pop("thresholds"),
+            regional_quality=reference.pop("regional_quality"),
+            regional_quality_reasons=reference.pop("regional_quality_reasons"))
+        for name in ("source_informative_count", "source_informative_depth", "source_mean_profile_deviance",
+                     "source_maximum_profile_deviance", "diagnostic_availability"):
+            reference[name] = None
+    payload["provenance"]["historical_derivation"] = derivation
+    payload["schema"] = "clipp2.assignment.bundle.v5"
+    payload["protocol_version"] = PROTOCOL_VERSION
+    return AssignmentBundle.from_dict(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,7 +267,7 @@ class AssignmentBundle(ImmutableArrayRecord):
         values = {name: getattr(self, name) for name in ("target_ids", "non_target_ids", "native_centers",
             "native_calls", "native_lower", "native_upper", "source_stages", "source_labels", "baseline_labels",
             "device", "cpu_threads", "normal_cn_policy", "provenance", "run_manifest_id")}
-        return _json_value(dict(schema="clipp2.assignment.bundle.v4", protocol_version=PROTOCOL_VERSION,
+        return _json_value(dict(schema="clipp2.assignment.bundle.v5", protocol_version=PROTOCOL_VERSION,
             support_policy=SUPPORT_POLICY, **values,
             catalog=self.catalog.to_dict(), reference=self.reference.to_dict(),
             bounds=self.bounds.to_dict()))
@@ -241,11 +291,13 @@ class AssignmentBundle(ImmutableArrayRecord):
 
     @classmethod
     def from_dict(cls, value):
+        if value.get("schema") in ("clipp2.assignment.bundle.v3", "clipp2.assignment.bundle.v4"):
+            return HistoricalAssignmentArtifact(value)
         values = dict(value)
-        if (values.pop("schema", None) != "clipp2.assignment.bundle.v4"
+        if (values.pop("schema", None) != "clipp2.assignment.bundle.v5"
                 or values.pop("protocol_version", None) != PROTOCOL_VERSION
                 or values.pop("support_policy", None) != SUPPORT_POLICY):
-            raise ValueError("Assignment requires a protocol 2.3 bundle with schema v4")
+            raise ValueError("Assignment requires a protocol 2.3 bundle with schema v5")
         bounds = MultiplicityBounds.from_dict(values.pop("bounds"))
         values["catalog"] = OriginalCatalog.from_dict(values["catalog"])
         values["reference"] = AssignmentReference.from_dict(values["reference"])
@@ -275,7 +327,7 @@ class AssignmentResult(ImmutableArrayRecord):
         records = []
         for row in self.assignments:
             row = dict(row)
-            for name in ("best_label", "second_best_label", "map_cluster_label", "baseline_label",
+            for name in ("best_label", "second_best_label", "map_label", "map_cluster_label", "baseline_label",
                          "baseline_reference_label", "final_assignment_label", "source_label"):
                 value = row.get(name)
                 if value is not None:
@@ -299,8 +351,13 @@ class AssignmentResult(ImmutableArrayRecord):
             ties = _integer_tuple(row.get("map_tied_labels", ()), "map_tied_labels")
             expected_ties = (tuple(sorted(label for label, score in zip(self.reference.labels, scores)
                                           if score == np.max(scores))) if np.isfinite(scores).any() else ())
-            if ties != expected_ties or row.get("map_cluster_label") != (ties[0] if ties else None):
+            if (ties != expected_ties or _integer_tuple(row.get("map_set", ()), "map_set") != ties
+                    or row.get("map_label") != (ties[0] if ties else None)
+                    or row.get("map_cluster_label") != row.get("map_label")):
                 raise ValueError("Exact maximizing ties and their smallest public representative must agree")
+            if (type(row.get("posterior_defined")) not in (bool, np.bool_)
+                    or row["posterior_defined"] != bool(ties)):
+                raise ValueError("Posterior availability must describe the actual normalized score vector")
             unique = row.get("map_unique")
             if (ties and (not isinstance(unique, (bool, np.bool_)) or unique != (len(ties) == 1))
                     or not ties and unique is not None):
@@ -325,7 +382,7 @@ class AssignmentResult(ImmutableArrayRecord):
     def to_dict(self):
         # Keep numeric NaN/inf in this plain copy payload; JSON publishers apply
         # the shared scientific-value codec at the actual serialization boundary.
-        return thaw_record(dict(schema="clipp2.assignment.result.v5", protocol_version=PROTOCOL_VERSION,
+        return thaw_record(dict(schema="clipp2.assignment.result.v6", protocol_version=PROTOCOL_VERSION,
             support_policy=SUPPORT_POLICY,
             bundle_hash=self.bundle_hash, target_ids=self.target_ids, reference=self.reference.to_dict(),
             assignments=self.assignments, multiplicities=self.multiplicities, summary=self.summary,
@@ -333,16 +390,19 @@ class AssignmentResult(ImmutableArrayRecord):
 
     @classmethod
     def from_dict(cls, value):
+        if value.get("schema") in ("clipp2.assignment.result.v4", "clipp2.assignment.result.v5"):
+            return HistoricalAssignmentArtifact(value)
         values = dict(value)
-        if (values.pop("schema", None) != "clipp2.assignment.result.v5"
+        if (values.pop("schema", None) != "clipp2.assignment.result.v6"
                 or values.pop("protocol_version", None) != PROTOCOL_VERSION
                 or values.pop("support_policy", None) != SUPPORT_POLICY):
-            raise ValueError("Assignment requires a protocol 2.3 result with schema v5")
+            raise ValueError("Assignment requires a protocol 2.3 result with schema v6")
         values["reference"] = AssignmentReference.from_dict(values["reference"])
         return cls(**values)
 
 
 POLICY_FIELDS = ("status", "evidence_status", "best_label", "second_best_label", "posterior",
+    "map_label", "map_set", "posterior_defined",
     "map_cluster_label", "map_tied_labels", "map_unique", "best_log_probability", "second_best_probability",
     "entropy", "log_score_margin", "log_competitor_ratio", "comparison_scope", "has_finite_alternative",
     "mean_profile_deviance", "maximum_profile_deviance", "diagnostic_status", "diagnostic_error",
@@ -363,22 +423,20 @@ REGIONAL_POLICY_FIELDS = ("best_label", "phi", "conditional_map", "conditional_c
 
 def target_reason(source_stage):
     return {"stage_one": "stage1_reference_recheck", "stage1": "stage1_reference_recheck",
-            "stage_two": "stage2_near_clonal_recheck", "stage2": "stage2_near_clonal_recheck"}.get(
+            "stage_two": "stage2_recheck", "stage2": "stage2_recheck"}.get(
                 source_stage, "fixed_reference_recheck")
 
 
-REASSESSMENT_OUTCOMES = ("retained_clonal", "reassigned", "unresolved", "not_applicable")
+REASSESSMENT_OUTCOMES = ("retained", "reassigned", "unresolved", "not_applicable")
 
 
 def assignment_outcome(source_stage, baseline_label, final_label, clonal_label):
-    """Separate workflow clonal rechecks from generic baseline comparisons."""
+    """Compare the MAP with the actual source's frozen reference label."""
     if target_reason(source_stage) == "fixed_reference_recheck":
         status = "not_applicable"
     else:
-        if clonal_label is None or baseline_label != clonal_label:
-            raise ValueError("Workflow reassessment requires a designated clonal reference and clonal baseline")
-        status = ("unresolved" if final_label is None else "retained_clonal"
-                  if final_label == clonal_label else "reassigned")
+        status = ("unresolved" if final_label is None else "retained"
+                  if final_label == baseline_label else "reassigned")
     return dict(reassessment_status=status,
                 baseline_changed=None if final_label is None else final_label != baseline_label)
 
@@ -458,6 +516,7 @@ def score_summary(scores, labels):
         unique = len(ties) == 1
     return dict(best_index=best, second_index=second, best_label=labels[best] if best is not None else None,
         second_best_label=labels[second] if second is not None else None, probabilities=probabilities,
+        map_label=labels[best] if best is not None else None, map_set=ties, posterior_defined=best is not None,
         map_cluster_label=labels[best] if best is not None else None, map_tied_labels=ties, map_unique=unique,
         posterior=probability, best_log_probability=log_probability, second_best_probability=second_probability,
         entropy=entropy, log_score_margin=margin, has_finite_alternative=finite_alternative,
@@ -515,7 +574,7 @@ def _score_reference(bundle, progress_callback):
     for i, mutation in enumerate(bundle.target_ids):
         summary = summaries[i]
         status = assignment_decision(summary, bool(observation.eligible[i].any()), int(coverage[i]))
-        final = summary["map_cluster_label"] if status == "observed" else None
+        final = summary["map_label"] if status == "observed" else None
         records.append(dict(mutation_id=mutation, status=status, evidence_status=status,
             **{key: value for key, value in summary.items() if key not in ("best_index", "second_index")},
             informative_regions=int(coverage[i]), log_scores=scores[i], reference_labels=bundle.reference.labels,
@@ -629,7 +688,7 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
             maximum_profile_deviance=float(measured["maximum_profile_deviance"]),
             diagnostic_status="failed" if errors else "available" if diagnostic_mask.any() else "not_applicable",
             diagnostic_error="; ".join(errors) if errors else None)
-    summary = dict(schema="clipp2.assignment.result.v5", protocol_version=PROTOCOL_VERSION,
+    summary = dict(schema="clipp2.assignment.result.v6", protocol_version=PROTOCOL_VERSION,
         implementation_version=__version__, tumor_id=catalog.tumor_id,
         bundle_hash=bundle.content_hash, reference=bundle.reference.to_dict(),
         bounds_hash=support.content_hash, support_policy=SUPPORT_POLICY, normal_cn_policy=bundle.normal_cn_policy,

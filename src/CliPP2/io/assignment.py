@@ -236,7 +236,7 @@ def validate_assignment_result(bundle, result):
         scores = np.asarray(record["log_scores"], float)
         if scores.shape != (len(labels),) or np.isnan(scores).any() or np.isposinf(scores).any():
             raise ValueError("Assignment scores have an invalid shape or value")
-        for name in ("best_label", "second_best_label", "map_cluster_label", "baseline_label",
+        for name in ("best_label", "second_best_label", "map_label", "map_cluster_label", "baseline_label",
                      "baseline_reference_label", "final_assignment_label", "source_label"):
             value = record.get(name)
             if value is not None and (isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))):
@@ -244,11 +244,12 @@ def validate_assignment_result(bundle, result):
         _require_fields(record, {"log_scores": _independent_scores(catalog, original, bundle.reference, informative)},
             "Independent assignment emissions", atol=max(1e-12, 32*np.finfo(float).eps*catalog.total_counts[original, informative].sum()))
         expected = score_summary(scores, labels)
+        _require_integer_sequence(record.get("map_set", ()), expected["map_set"], "Authoritative exact MAP set")
         _require_integer_sequence(record.get("map_tied_labels", ()), expected["map_tied_labels"], "Exact MAP tie set")
         _require_fields(record, {key: value for key, value in expected.items()
                                 if key not in ("best_index", "second_index")}, "Assignment probabilities and exact MAP")
         status = assignment_decision(expected, bool(catalog.eligible[original].any()), count)
-        final = expected["map_cluster_label"] if status == "observed" else None
+        final = expected["map_label"] if status == "observed" else None
         _require_fields(record, dict(mutation_id=mutation, status=status, evidence_status=status,
             informative_regions=count, baseline_label=bundle.baseline_labels[i],
             baseline_reference_label=bundle.baseline_labels[i], final_assignment_label=final,
@@ -335,7 +336,7 @@ def validate_assignment_result(bundle, result):
             maximum_profile_deviance=measured["maximum_profile_deviance"],
             diagnostic_status="failed" if errors else "available" if diagnostic_mask.any() else "not_applicable",
             diagnostic_error="; ".join(errors) if errors else None), "Diagnostic summary", atol=0.)
-    _require_fields(result.summary, dict(schema="clipp2.assignment.result.v5", protocol_version=PROTOCOL_VERSION,
+    _require_fields(result.summary, dict(schema="clipp2.assignment.result.v6", protocol_version=PROTOCOL_VERSION,
         target_count=len(bundle.target_ids), unchanged_non_target_count=len(bundle.non_target_ids),
         region_count=len(bundle.reference.region_ids), candidate_count=len(labels), support_policy="original_full_1_to_major_cn",
         bounds_hash=bundle.bounds.content_hash, tumor_id=catalog.tumor_id,
@@ -364,6 +365,9 @@ def _validated_workflow_accounting(bundle, result, accounting):
     if not isinstance(accounting, Mapping) or not isinstance(accounting.get("unchanged_map"), Mapping):
         raise ValueError("Workflow accounting requires an explicit unchanged mutation-to-reference map")
     labels, unchanged = bundle.reference.labels, dict(accounting["unchanged_map"])
+    if (accounting.get("reassessment_policy") == "all_combined_fitted_mutations"
+            and (unchanged or bundle.non_target_ids)):
+        raise ValueError("All-population reassessment cannot retain unchanged non-target members")
     if set(unchanged) != set(bundle.non_target_ids):
         raise ValueError("Workflow unchanged membership differs from the frozen non-target population")
     if any(isinstance(label, (bool, np.bool_)) or not isinstance(label, (int, np.integer)) or label not in labels
@@ -397,8 +401,8 @@ def _validated_workflow_accounting(bundle, result, accounting):
         raise ValueError("Reassessment must preserve historical caps")
     if "outcomes_by_origin" in accounting:
         origins = {origin: {outcome: sum(row["target_reason"] == origin and row["reassessment_status"] == outcome
-            for row in result.assignments) for outcome in ("retained_clonal", "reassigned", "unresolved")}
-            for origin in ("stage1_reference_recheck", "stage2_near_clonal_recheck")}
+            for row in result.assignments) for outcome in ("retained", "reassigned", "unresolved")}
+            for origin in ("stage1_reference_recheck", "stage2_recheck")}
         if not check_counts(accounting["outcomes_by_origin"], origins):
             raise ValueError("Workflow target-origin outcomes do not reconcile target decisions")
     return _json_value(accounting)
