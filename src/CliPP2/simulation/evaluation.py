@@ -736,7 +736,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     known = np.isfinite(history.phi).all(axis=1)
     evaluable = known & observed.any(axis=1)
     original_n = int(evaluable.sum())
-    metrics, mutation_rows, correspondence, calibration_rows, applicability, containment = [], [], [], [], [], []
+    metrics, mutation_rows, correspondence, calibration_rows, containment = [], [], [], [], []
     reference_geometry, detailed_membership, detailed_transitions = {}, {}, {}
     truth_centers = {truth_ids[m]: history.phi[index[m]] for m in ids if evaluable[index[m]]}
 
@@ -794,8 +794,8 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     contributors = result.get("contributors", ())
     qualified = {(row["mutation_id"], row["region_id"]) for row in contributors if row.get("contributes_to_cap" if map_policy else "usable", False)}
     metric("original_evaluable", "all", value=original_n)
-    metric("true_clonal_availability", "A", value=int(any(clonal[m] and evaluable[index[m]] for m in ids)))
     available_clonal = any(clonal[m] and evaluable[index[m]] for m in ids)
+    metric("true_clonal_availability", "A", value=int(available_clonal))
     metric("available_reference_not_recognized", "A", value=int(available_clonal and not g0)
            if result.get("stage_one") else None, reason=None if result.get("stage_one") else "unavailable_analysis")
     metric("appropriate_no_reference", "A", value=int(not available_clonal and not g0)
@@ -825,7 +825,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     multiplicity("A", first_calls, "native_source", qualified)
     retained = {"A": dict(available=bool(result.get("stage_one")) if "stage_one" in result else None)}
     arms = result.get("arms", {})
-    native_views, combined_views, final_views, arm_states = {}, {}, {}, {}
+    native_views, combined_views, arm_states = {}, {}, {}
     for arm in ("B", "C"):
         payload = arms.get(arm, {})
         second_labels, second_centers, second_calls = _fit_view(payload.get("stage_two"))
@@ -904,7 +904,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         final = {m: label for m, label in combined.items() if m in non_targets}
         accepted_estimates, conditional_calls, assigned_calls = {}, {}, {}
         finite_probability_count, accepted_count, correct_count, wrong_count = 0, 0, 0, 0
-        mapped_correct, mapped_accepted, unmapped_accepted, absent_accepted = 0, 0, 0, 0
+        mapped_correct, unmapped_accepted, absent_accepted = 0, 0, 0
         transitions, multi_transitions = Counter(), Counter()
         target_evaluable = {m for m in targets if evaluable[index[m]]}
         for mutation in sorted(targets):
@@ -934,7 +934,6 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                 wrong_count += correct is False
                 transitions[transition(baseline_correct[mutation], correct)] += 1
                 multi_transitions[transition(baseline_multi[mutation], multi_correct)] += 1
-                mapped_accepted += accepted is not None
                 mapped_correct += multi_correct is True
                 unmapped_accepted += accepted is not None and mapping.get(accepted) is None
                 absent_accepted += accepted is not None and truth_ids[mutation] not in set(mapping.values())
@@ -1074,10 +1073,10 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         for name, num, den in (("acceptance_coverage", accepted_count, neval), ("correct_resolution", correct_count, neval),
                 ("wrong_per_evaluable", wrong_count, neval), ("selective_error", wrong_count, accepted_count),
                 ("unresolved_fraction", neval-accepted_count, neval), ("probability_availability", finite_probability_count, neval),
-                ("multiclass_correct_resolution", mapped_correct, neval), ("unmapped_accepted_fraction", unmapped_accepted, mapped_accepted),
+                ("multiclass_correct_resolution", mapped_correct, neval), ("unmapped_accepted_fraction", unmapped_accepted, accepted_count),
                 ("absent_class_false_acceptance", absent_accepted, neval),
-                ("multiclass_accuracy_lower", mapped_correct, mapped_accepted),
-                ("multiclass_accuracy_upper", mapped_correct+unmapped_accepted, mapped_accepted)):
+                ("multiclass_accuracy_lower", mapped_correct, accepted_count),
+                ("multiclass_accuracy_upper", mapped_correct+unmapped_accepted, accepted_count)):
             metric(name, stage, num if assignment_available else None, den if assignment_available else None,
                    value=None, reason=reason)
         for name in TRANSITIONS:
@@ -1150,10 +1149,9 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                     inherited_input_exclusion=bool(history.multiplicity[i, j] > catalog.major_cn[i, j]) if positive else None))
             multiplicity(stage, conditional_calls, "displayed_best_candidate")
             multiplicity(stage, assigned_calls, "assigned_call")
-        arm_states[arm] = dict(baseline=baseline_correct, baseline_multiclass=baseline_multi, final=final_correct,
-                              final_labels=final, targets=targets, non_targets=non_targets, available=available,
+        arm_states[arm] = dict(baseline=baseline_correct, final=final_correct,
+                              targets=targets, non_targets=non_targets, available=available,
                               assignment_available=assignment_available, evaluable_target_count=neval)
-        final_views[stage] = final
     common = set(first_labels) & set(native_views.get("B", {})) & set(native_views.get("C", {}))
     for arm, labels in (("A", first_labels), *native_views.items()):
         partition(arm, labels, sorted(common), "common_native_remainder")

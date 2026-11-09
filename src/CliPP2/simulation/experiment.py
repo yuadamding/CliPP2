@@ -214,13 +214,10 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
                     accepted_uncapped_stage_two = accepted
         current = "stage_one"
         first = fit_or_reuse(accepted_stage_one, population, full, "A", "stage_one", config.fit)
-        result["stage_one"] = first.to_dict()
         current = "stage_one_measurement"
         groups = operation("classification", "A", lambda: classify_groups(catalog, first, config))
         result["stage_one_groups"] = groups
         write_supporting_table(arm_root / "A" / "group_diagnostics.tsv", groups, columns=GROUP_COLUMNS)
-        for arm in result["arms"].values():
-            arm["counts"]["N1"] = len(first.mutation_ids)
         selected = select_reference_source(groups)
         result["reference_source"] = {key: selected[key] for key in (
             "source_label", "native_center", "distance_to_one", "reference_source_role", "selection_rule")}
@@ -255,8 +252,6 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
                     continue
                 if remainder:
                     second = fit_or_reuse(reuse, remainder, bounds.subset(remainder), name, "stage_two", settings)
-                    arm.update(stage_two=second.to_dict(), stage_two_status="accepted")
-                    arm["counts"].update(N2=len(second.mutation_ids), Q2=len(second.centers))
                     current = "classification"
                     arm["group_records"] = operation("classification", name, lambda: classify_groups(catalog, second, config))
                 else:

@@ -21,7 +21,7 @@ from CliPP2.simulation.biology import generate_history
 from CliPP2.simulation import controls
 from CliPP2.simulation.design import jobs, roster_counts, make_contract, workflow_config
 from CliPP2.simulation.runtime import qualification_costs, recorded_costs, status
-from CliPP2.simulation.study import (_decision, _execute, _paired_result, _prepare_histories, _qualification_step,
+from CliPP2.simulation.study import (_execute, _paired_result, _prepare_histories, _qualification_step,
                                     _run_cell, read_json, report, save_json)
 
 
@@ -940,11 +940,16 @@ def _historical_successful_report_check(root):
 
 def _structured_failure_checks(root):
     history, frame, job = _fixture()
-    for case in ("stage_one", "capped_stage_two", "assignment", "no_reference", "blocked", "empty"):
+    for case in ("stage_one", "capped_stage_two", "assignment", "no_reference", "blocked", "empty", "authoritative_assignments"):
         directory = root / case
         current = dict(status="complete", stage_one=None,
             arms={"B": dict(status="complete", retained_source_evidence="B"), "C": dict(status="complete")},
             cost_ledger=dict(fit_count=1, assignment_pass_count=0))
+        if case == "authoritative_assignments":
+            current["arms"]["B"]["assignment"] = dict(assignments=[
+                dict(evidence_status="observed", final_assignment_label=1, map_cluster_label=1,
+                     posterior=.51, diagnostic_status="failed"),
+                dict(evidence_status="prior_only", final_assignment_label=None, map_cluster_label=0)])
         if case == "stage_one":
             current.update(status="failed", failed_stage="stage_one", error_type="RuntimeError", error="injected")
         elif case in ("capped_stage_two", "assignment"):
@@ -1123,12 +1128,6 @@ def run_checks(directory, cohort_settings):
                 assert "original installed environment" in str(error)
             else:
                 raise AssertionError("An older contract resumed under the revised implementation")
-    record = dict(map_cluster_label=1, final_assignment_label=1, evidence_status="observed",
-                  posterior=.01, entropy=10., diagnostic_status="failed")
-    assert _decision(record) == 1
-    for evidence in ("prior_only", "model_incompatible", "excluded"):
-        assert _decision(dict(record, evidence_status=evidence, final_assignment_label=None)) is None
-    assert _decision(None) is None
     history, frame, job = _fixture()
     _native_failure_check(root / "native_failure", history, frame, job, contract)
     _offline_report_check(root / "native_failure", history, job)

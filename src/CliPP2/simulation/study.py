@@ -109,21 +109,13 @@ def _peak_bytes():
     return int(value if sys.platform == "darwin" else value*1024)
 
 
-def _decision(row):
-    """Read the producer's data-supported estimate; never recreate decision gates."""
-    if row is None or row.get("evidence_status") != "observed":
-        return None
-    label = row.get("final_assignment_label")
-    return None if label is None else int(label)
-
-
-def _experiment_execution_failures(experiment, configuration_index):
+def _experiment_execution_failures(experiment):
     """Distinguish caught execution errors from completed scientific rejection."""
     failures = []
     for arm, record in ((None, experiment), *experiment.get("arms", {}).items()):
         if record.get("status") not in ("failed", "execution_failed"):
             continue
-        failures.append(dict(configuration_index=configuration_index, arm=arm,
+        failures.append(dict(configuration_index=1, arm=arm,
             failed_stage=record.get("failed_stage"), failed_phase=record.get("failed_phase"),
             error_type=record.get("error_type"), error=record.get("error")))
     return failures
@@ -185,40 +177,37 @@ def _run_cell(task):
         configurations = task.get("execution_configs") or [asdict(workflow_config())]
         if len(configurations) != 1:
             raise ValueError("Protocol 2.3 executes exactly one declared workflow configuration")
-        for index, values in enumerate(configurations):
-            config = WorkflowConfig.from_dict(values)
-            def progress(event):
-                fields = ("phase", "stage", "elapsed_seconds", "phase_elapsed_seconds", "occupied_q", "membership_audit", "operation")
-                payload = dict(configuration=index+1, **{key: event[key] for key in fields if key in event})
-                temporary = attempt / ".progress.json.tmp"
-                temporary.write_text(json.dumps(json_value(payload), allow_nan=False))
-                os.replace(temporary, attempt / "progress.json")
-            execution_phase = "paired_inference"
-            experiment = run_paired_experiment(input_path, attempt / f"configuration-{index+1}", config,
-                progress_callback=progress,
-                run_manifest_id=task.get("run_manifest_id"))
-            costs.append(experiment["cost_ledger"])
-            execution_failures.extend(_experiment_execution_failures(experiment, index+1))
-            save_json(attempt / f"cost-ledger-{index+1}.json", experiment["cost_ledger"])
-            execution_phase = "evaluation"
-            evaluation = evaluate(history, catalog, experiment, acquisition=frame.attrs.get("acquisition"),
-                                  evaluation_config=evaluation_config, truth_qualification=truth_link["status"])
-            evaluation.update(cell_id=job["cell_id"], history_id=job["history_id"], family=job["family"],
-                              acquisition_id=acquisition["id"], acquisition=acquisition, phase=job["phase"], job=job)
-            save_json(attempt / f"evaluation-{index+1}.json", evaluation)
-            results.append(str((attempt / f"evaluation-{index+1}.json").relative_to(root)))
+        config = WorkflowConfig.from_dict(configurations[0])
+        def progress(event):
+            fields = ("phase", "stage", "elapsed_seconds", "phase_elapsed_seconds", "occupied_q", "membership_audit", "operation")
+            payload = dict(configuration=1, **{key: event[key] for key in fields if key in event})
+            temporary = attempt / ".progress.json.tmp"
+            temporary.write_text(json.dumps(json_value(payload), allow_nan=False))
+            os.replace(temporary, attempt / "progress.json")
+        execution_phase = "paired_inference"
+        experiment = run_paired_experiment(input_path, attempt / "configuration-1", config,
+            progress_callback=progress,
+            run_manifest_id=task.get("run_manifest_id"))
+        costs.append(experiment["cost_ledger"])
+        execution_failures.extend(_experiment_execution_failures(experiment))
+        save_json(attempt / "cost-ledger-1.json", experiment["cost_ledger"])
+        execution_phase = "evaluation"
+        evaluation = evaluate(history, catalog, experiment, acquisition=frame.attrs.get("acquisition"),
+                              evaluation_config=evaluation_config, truth_qualification=truth_link["status"])
+        evaluation.update(cell_id=job["cell_id"], history_id=job["history_id"], family=job["family"],
+                          acquisition_id=acquisition["id"], acquisition=acquisition, phase=job["phase"], job=job)
+        save_json(attempt / "evaluation-1.json", evaluation)
+        results.append(str((attempt / "evaluation-1.json").relative_to(root)))
         if task.get("archive_completed", False):
             _archive_completed(attempt)
-        value = dict(job=job, status="execution_failed" if execution_failures else "complete", evaluations=results, cost_ledgers=costs,
-            attempt=str(attempt.relative_to(root)), elapsed_seconds=time.perf_counter()-started,
-            peak_resident_bytes=_peak_bytes())
+        value = dict(status="execution_failed" if execution_failures else "complete")
     except Exception as exc:
-        value = dict(job=job, status="execution_failed", error_type=type(exc).__name__, error=str(exc),
-            traceback=traceback.format_exc(), evaluations=results, cost_ledgers=costs,
-            attempt=str(attempt.relative_to(root)), elapsed_seconds=time.perf_counter()-started,
-            peak_resident_bytes=_peak_bytes())
+        value = dict(status="execution_failed", error_type=type(exc).__name__, error=str(exc),
+                     traceback=traceback.format_exc())
         execution_failures.append(dict(configuration_index=None, arm=None, failed_stage="worker",
             error_type=type(exc).__name__, error=str(exc)))
+    value.update(job=job, evaluations=results, cost_ledgers=costs, attempt=str(attempt.relative_to(root)),
+                 elapsed_seconds=time.perf_counter()-started, peak_resident_bytes=_peak_bytes())
     value["execution_failures"] = execution_failures
     value["original_evaluable_count"] = original_evaluable_count
     value["execution_phase"] = execution_phase
