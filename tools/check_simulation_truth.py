@@ -141,7 +141,7 @@ def _offline_truth_checks(root, history, frame, collision):
     config = dict(reference_match_atol=.025, reference_distance='l2')
     forbidden = ('CliPP2.fit_execution.fit_prepared', 'CliPP2.assignment.assign_mutations',
         'CliPP2.kernel.model.RegionalModel', 'CliPP2.simulation.study._history',
-        'CliPP2.simulation.study._acquire', 'CliPP2.simulation.study.select_thresholds')
+        'CliPP2.simulation.study._acquire', 'CliPP2.simulation.study.assess_development')
     with ExitStack() as stack:
         for name in forbidden:
             stack.enter_context(patch(name, side_effect=AssertionError('Offline truth check executed ' + name)))

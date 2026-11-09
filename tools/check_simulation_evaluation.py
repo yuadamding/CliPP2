@@ -16,7 +16,7 @@ from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 from CliPP2.simulation.evaluation import (aggregate, candidate_correspondence, cap_audit,
     information_diagnostics, mapped_probabilities, partition_scores, probability_scores,
     recovery_reach, reference_center_diagnostics, transition, json_safe, evaluate,
-    evaluation_definition, target_reference_availability, _qualified_matching)
+    evaluation_definition, legacy_evaluation_definition, target_reference_availability, _qualified_matching)
 from CliPP2.io.data import content_hash
 from CliPP2.simulation.evaluation import log_probability_mass
 
@@ -67,6 +67,132 @@ def _membership_fixture():
     return history, catalog, result
 
 
+def _protocol23_map_checks():
+    """Authoritative MAP labels, explicit evidence states, and fixed denominators."""
+    h, catalog, paired = _membership_fixture()
+    paired.update(protocol_version="2.3", schema="clipp2.paired-experiment.v4",
+                  config=dict(stage_two_near_clonal_distance_max=.05))
+    for arm in paired["arms"].values():
+        arm["combined_labels"]["no_info"] = 0
+        arm["targets"] = tuple(arm["targets"]) + ("no_info",)
+        # Shared fixture arms are intentionally identical; update each once.
+        if arm["assignment"].get("protocol_version") == "2.3":
+            arm["targets"] = tuple(dict.fromkeys(arm["targets"]))
+            continue
+        arm["assignment"].update(protocol_version="2.3", schema="clipp2.assignment.result.v5")
+        arm["reference"].update(source_informative_count=[[0, 1]]*4,
+            source_informative_depth=[[0, 100]]*4,
+            source_mean_profile_deviance=[[None, np.inf]]*4,
+            source_maximum_profile_deviance=[[None, np.inf]]*4,
+            diagnostic_availability=[["not_applicable", "available"]]*4)
+        for row in arm["assignment"]["assignments"]:
+            label = row.pop("accepted_label")
+            label = 1 if label is None else label
+            probabilities = np.full(4, .2)
+            probabilities[label] = .4
+            row.update(final_assignment_label=label, map_cluster_label=label, map_tied_labels=[label], map_unique=True,
+                evidence_status="observed", status="observed", probabilities=probabilities.tolist(),
+                log_scores=np.log(probabilities).tolist(), best_log_probability=float(np.log(.4)),
+                log_competitor_ratio=float(np.log(1.5)), has_finite_alternative=True,
+                diagnostic_status="failed", diagnostic_error="reporting-only fixture failure")
+            row["target_reason"] = row["target_reason"].replace("stage1_clonal", "stage1_reference")
+        arm["assignment"]["assignments"].append(dict(mutation_id="no_info", final_assignment_label=None,
+            map_cluster_label=0, map_tied_labels=[0, 1, 2, 3], map_unique=False, evidence_status="prior_only",
+            status="prior_only", probabilities=[.25]*4, log_scores=[-np.log(4)]*4,
+            target_reason="stage1_reference_recheck"))
+    report = evaluate(h, catalog, paired, evaluation_config=dict(reference_match_atol=.02),
+                      truth_qualification="verified_history_binding")
+    assert report["schema"] == "clipp2.simulation.evaluation.v4"
+    assert report["evaluation_definition"] == evaluation_definition(dict(reference_match_atol=.02))
+    def metric(value, name, view=""):
+        return next(row for row in value["metrics"] if row["arm"] == "C3" and row["name"] == name
+                    and row["view"] == view and row["stratum"] == "all")
+    assert metric(report, "data_supported_map_coverage")["value"] == 1
+    assert metric(report, "binary_map_error")["denominator"] == 6
+    assert metric(report, "binary_map_error")["value"] == 0
+    assert metric(report, "detailed_map_error")["value"] == 2/6
+    assert metric(report, "prior_only_fraction")["value"] == 1/7
+    assert metric(report, "binary_map_correct_per_original_evaluable")["denominator"] == 14
+    assert metric(report, "binary_map_error", "unchanged_F")["denominator"] == 8
+    assert metric(report, "binary_map_error", "stage2_near_clonal_recheck")["denominator"] == 1
+    assert metric(report, "map_ccf_rmse")["value"] > 0
+    assert not report["error_coverage_curves"]
+    assert not any("selective" in row["name"] or "acceptance" in row["name"] for row in report["metrics"])
+    rows = {row["mutation_id"]: row for row in report["mutations"] if row["arm"] == "C3"}
+    assert rows["t_unresolved"]["geometric_correct_map"] is True
+    assert rows["t_unresolved"]["diagnostic_status"] == "failed"
+    assert rows["t_unresolved"]["reference_source_diagnostics"]["source_mean_profile_deviance"] == [None, "Infinity"]
+    assert rows["t_unresolved"]["reference_coverage_stratum"] == "zero_in_observed_region"
+    assert any(row["view"] == "diagnostic_strata" and row["stratum"] == "reference_coverage_stratum:zero_in_observed_region"
+               and row["name"] == "data_supported_map_coverage" and row["value"] == 1 for row in report["metrics"])
+    assert rows["no_info"]["map_cluster_label"] == 0 and rows["no_info"]["final_assignment_label"] is None
+    assert all("accepted_label" not in row and "reference_quality_pass" not in row for row in rows.values())
+    # Displayed probabilities can round to a tie although absolute scores have a
+    # unique MAP. Calibration correctness follows the retained MAP, not argmax(p).
+    rounded = deepcopy(paired)
+    for arm in rounded["arms"].values():
+        row = arm["assignment"]["assignments"][1]
+        row.update(probabilities=[0., .5, .5, 0.],
+                   log_scores=[-np.inf, -1., np.nextafter(-1., 0.), -np.inf])
+    rounded_report = evaluate(h, catalog, rounded, truth_qualification="verified_history_binding")
+    calibration = next(row for row in rounded_report["calibration"]
+                       if row["arm"] == "C3" and row["mutation_id"] == "t_wrong")
+    assert calibration["confidence_correct"] is False
+    assert not any(":usable:" in row["stratum"] for row in report["metrics"])
+    incompatible = deepcopy(paired)
+    for arm in incompatible["arms"].values():
+        row = arm["assignment"]["assignments"][3]
+        row.update(final_assignment_label=None, map_cluster_label=None, evidence_status="model_incompatible",
+                   status="model_incompatible", probabilities=None)
+    value = evaluate(h, catalog, incompatible, truth_qualification="verified_history_binding")
+    assert metric(value, "data_supported_map_coverage")["value"] == 5/6
+    assert metric(value, "model_incompatible_fraction")["value"] == 1/7
+    failed = deepcopy(paired)
+    for arm in failed["arms"].values():
+        arm.update(assignment=None, assignment_status="failed", status="failed", failed_stage="assignment")
+    value = evaluate(h, catalog, failed, truth_qualification="verified_history_binding")
+    assert metric(value, "computation_failure_count")["value"] == 7
+    assert metric(value, "binary_map_correct_per_original_evaluable")["value"] == 8/14
+    assert metric(value, "data_supported_map_coverage", "whole_original")["value"] == 8/14
+    return dict(status="passed", observed_MAP_ignores_diagnostics=True, fixed_error_denominators=True,
+                prior_only_incompatible_failure_distinct=True, both_origins_and_unchanged_F=True)
+
+
+def _frozen_historical_checks():
+    """Old cached science and decisions survive the new default definition."""
+    from contextlib import ExitStack
+    import tempfile
+    from unittest.mock import patch
+    import zipfile
+    from CliPP2.simulation.reporting import reevaluate_cell
+    assert content_hash(legacy_evaluation_definition(2)) == "728032ef78442bb44387f97d58e409e5415831d2065615d3956757a83e92922e"
+    assert content_hash(legacy_evaluation_definition(3)) == "be475aebc3de6b83c9345b11f6f3aac2673efa15f1b4fcb279f69ed4bf0d5440"
+    changed = legacy_evaluation_definition(3)
+    changed["population_scopes"]["planned_population"].clear()
+    assert legacy_evaluation_definition(3)["population_scopes"]["planned_population"]
+    with tempfile.TemporaryDirectory(prefix="clipp2-protocol23-history-") as tmp:
+        root = Path(tmp)
+        with zipfile.ZipFile(Path(__file__).parent / "fixtures/f2d1fa1_successful_evidence.zip") as archive:
+            archive.extractall(root)
+        cell = json.loads((root / "cells/main-S01-H001-A2/completion.json").read_text())
+        cached = json.loads((root / cell["evaluations"][0]).read_text())
+        before = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        with ExitStack() as stack:
+            for target in ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
+                           "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.biology.generate_history",
+                           "CliPP2.simulation.acquisition.acquire"):
+                stack.enter_context(patch(target, side_effect=AssertionError("Historical report attempted inference")))
+            derived = reevaluate_cell(root, cell, dict(reference_match_atol=.05, reference_distance="l2"))
+        assert derived["status"] == "derived_from_preserved_evidence", derived.get("error")
+        assert derived["schema"] == "clipp2.simulation.evaluation.v3"
+        assert derived["evaluation_definition"] == cached["evaluation_definition"]
+        assert len(derived["metrics"]) == 853 and derived["metrics"] == cached["metrics"]
+        assert derived["mutations"] == cached["mutations"]
+        assert before == {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+    return dict(frozen_v2_v3_identities=True, old_853_metrics_and_decisions_preserved=True,
+                no_inference_or_source_changes=True)
+
+
 def _new_endpoint_checks():
     h, catalog, paired = _membership_fixture()
     report = evaluate(h, catalog, paired, evaluation_config=dict(reference_match_atol=.02),
@@ -115,7 +241,7 @@ def _new_endpoint_checks():
 
 
 def _planned_population_checks():
-    definition = evaluation_definition()
+    definition = legacy_evaluation_definition(3)
     roster = [dict(cell_id=f'h{i}-A1', family='S01', history_id=f'h{i}', acquisition=dict(id='A1')) for i in range(2)]
 
     def cell(job, score, *, failure=False, evaluated=True, truth='verified_history_binding', denominator=10):
@@ -572,7 +698,7 @@ def run_checks():
         for history, values in histories:
             for acquisition, value in enumerate(values):
                 cells.append(dict(schema='clipp2.simulation.evaluation.v3', truth_qualification='verified_history_binding',
-                    evaluation_definition=evaluation_definition(), evaluation_definition_id=content_hash(evaluation_definition()),
+                    evaluation_definition=legacy_evaluation_definition(3), evaluation_definition_id=content_hash(legacy_evaluation_definition(3)),
                     family=family, history_id=str(history), acquisition_id=str(acquisition),
                     metrics=[dict(name='score', arm='B', value=value), dict(name='score', arm='C', value=value+.1)]))
     summary = aggregate(cells, bootstrap_replicates=100, seed=1, families=('S01', 'S02'))
@@ -585,7 +711,7 @@ def run_checks():
     assert incomplete['roster_complete'] is False
     assert summary['schema'] == 'clipp2.simulation.aggregate.v3'
     altered = deepcopy(cells[0])
-    altered['evaluation_definition'] = evaluation_definition(dict(reference_match_atol=.1))
+    altered['evaluation_definition'] = legacy_evaluation_definition(3, dict(reference_match_atol=.1))
     altered['evaluation_definition_id'] = content_hash(altered['evaluation_definition'])
     for invalid in ([cells[0], altered], [dict(cells[0], evaluation_definition_id='tampered')],
                     [cells[0], dict(cells[0], schema='clipp2.simulation.evaluation.v1')]):
@@ -610,7 +736,8 @@ def run_checks():
                   Mc_Mw_U_and_unchanged_F=True, target_specific_availability_nulls_and_quality=True,
                   full_vector_l2_and_explicit_legacy_linf=True, incompatible_definition_aggregation_rejected=True)
     report.update(_planned_population_checks(), detailed_four_state_transitions_by_origin=True,
-                  partial_failure_accounting=_partial_failure_checks())
+                  partial_failure_accounting=_partial_failure_checks(), protocol23_MAP=_protocol23_map_checks(),
+                  historical_definitions=_frozen_historical_checks())
     json.dumps(json_safe(report), allow_nan=False)
     return json_safe(report)
 

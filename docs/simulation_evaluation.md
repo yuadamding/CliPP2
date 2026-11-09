@@ -1,18 +1,68 @@
 # Simulation evaluation definitions
 
-Implementation 1.1.0 keeps scientific Protocol 2.2 and the frozen development
-objective. Evaluation v3 preserves planned populations, requires qualified truth
-for primary science, and uses consistent detailed membership transitions.
-It does not refit, reassign, select thresholds, or change historical caps.
-New contracts declare `evaluation.record_schema` explicitly, so the package
-version does not determine the evaluation schema. Historical contracts without
-that field retain their original version-based interpretation.
+Implementation 2.0.0 uses scientific Protocol 2.3 and evaluation/definition v4.
+The evaluator consumes retained final labels; it does not fit, reassign, apply
+confidence or residual cutoffs, or select a development threshold. New contracts
+declare `evaluation.record_schema` explicitly. Package version is not a substitute
+for that scientific identity.
 
-The existing `correct_resolution` and `selective_error` fields remain binary
-clonality endpoints, with explicit `binary_*` aliases. An accepted wrong subclone
-can have the correct clonal/nonclonal status. The development constraint of
-empirical error at most `.05` is neither a population error guarantee nor a
-bound on detailed subclone errors.
+## Protocol 2.3 MAP endpoints
+
+An informative target with a defined posterior has
+`final_assignment_label = map_cluster_label`. Exact ties retain their complete tie
+set and use the lowest public label as representative. Diagnostics do not veto
+this result. An eligible target with no informative reads is `prior_only`: its
+uniform prior and deterministic MAP representative are available, but its final
+label is missing. `model_incompatible`, `excluded`, and computational failure are
+separate states, with no fabricated final label.
+
+The new metrics have explicit populations:
+
+| Metric | Numerator or measurement | Denominator |
+|---|---|---|
+| `data_supported_map_coverage` | Data-supported final memberships | Original informative members in the selected view |
+| `binary_map_error` | Wrong clonal/nonclonal final memberships | All original informative members in the view |
+| `detailed_map_error` | Wrong mapped subclone memberships (`Mw`) | All original informative members in the view |
+| `detailed_map_correct` / `detailed_map_unmapped` | `Mc` / `U` | All original informative members in the view |
+| `map_ccf_rmse` | Full requested-region CCF error at the final reference | Returned labels with known truth |
+| `prior_only_fraction` / `model_incompatible_fraction` / `excluded_fraction` | Explicit evidence-state counts | All members in the view, including no-read members |
+| `computation_failure_count` / `diagnostic_failure_count` | Recorded failures | Counts, not error rates |
+| `binary_map_correct_per_original_evaluable` | Correct unchanged F plus correct observed MAP targets | Original informative population |
+
+Views include targets (`view=""`), `whole_original`, `unchanged_F`,
+`stage1_reference_recheck`, and `stage2_near_clonal_recheck`. Unchanged F contributes
+its native hard memberships; those counts are not Stage 3 posterior estimates.
+Missing labels do not shrink the error denominators. Coverage and evidence-state
+counts expose the absence of an estimate, rather than counting it as correct.
+Binary correctness does not imply the correct subclone: a wrong nonclonal
+subclone can still have the right clonal/nonclonal status. Unmapped candidate
+correspondence remains `U`, separately reported rather than assumed incorrect.
+
+`geometric_correct_map` and `geometric_correct_map_resolution` use the declared
+center-distance definition without reference-quality predicates. Continuous
+center errors and suitable-reference availability remain separate from routing
+and selected-center correctness. Missing or failed diagnostics never become zero
+residuals or passing flags. Calibration uses observed targets with defined
+probabilities; prior-only rows do not become read-supported calibration evidence.
+Raw source coverage/depth/residuals and target mean/maximum residuals remain in
+mutation records. Descriptive strata distinguish zero versus positive source
+coverage and finite/infinite/unavailable target residuals without applying a
+cutoff. No selective-error threshold curves are constructed for Protocol 2.3.
+
+The provisional Stage 1 source can be subclonal. Evaluation retains its native
+centers, source purity, the learned reference geometry, cap exclusion and
+whole-original performance. Available native MAP contributors can lower the cap;
+truth replacement audits use the exact contributing IDs without requalification.
+
+## Historical Protocol 2.2 endpoints
+
+Historical evaluation v2/v3 definitions are frozen independently of v4. Their
+`correct_resolution` and `selective_error` fields remain binary clonality
+endpoints, with their original `binary_*` aliases and accepted-only selective
+error denominator. Historical quality predicates and threshold curves retain
+their original meaning. They are not applied to new MAP inference. The detailed
+historical conventions described below remain necessary to interpret cached
+records and old-decision offline derivatives.
 
 ## Planned populations and missing evidence
 
@@ -32,8 +82,8 @@ execution failure. An unknown planned cell makes the planned estimate null with
 `incomplete_evidence`; an unestablished roster gives `incomplete_planned_roster`.
 A separate `available_case_estimate` explicitly averages the qualified surviving
 cases. Its interval is never shown as an interval for the planned cohort.
-Conditional endpoints, including mapped selective error and geometric acceptance
-within the selected target population, report their available-case population.
+Conditional endpoints report their available-case population. Historical selective
+error and new MAP error have distinct definitions and are never pooled.
 
 Whole-original Stage 3 correctness includes both reassessed targets `T` and
 unchanged members `F`: `(correct_F + correct_accepted_T) / original_evaluable`.
@@ -98,7 +148,7 @@ An upstream exception does not become a downstream execution failure. Its explic
 pre-decision evidence can still establish a whole-original empty decision population
 under the scoped-zero rules above.
 
-## Detailed membership
+## Detailed membership and historical selective endpoints
 
 Frozen source-member purity still maps candidates to observable truth classes
 at the existing `.8` threshold, with the designated clonal reference mapped to
@@ -108,7 +158,7 @@ unmapped or ambiguous `U`; unresolved targets are separate. Evaluation records
 retain these counts for targets, both target origins, unchanged `F`, and the
 whole original population.
 
-For evaluable population size `P` and accepted count `A`:
+Historical v2/v3 records use evaluable population size `P` and accepted count `A`:
 
 - Mapped correct and wrong resolutions are `Mc/P` and `Mw/P`.
 - Mapped selective error is `Mw/(Mc+Mw)`.
@@ -128,7 +178,7 @@ not a persisted mapped error; `U->Mc` is newly mapped-correct without proof that
 the baseline was wrong. Binary transitions are unchanged. The old diagnostic is
 explicitly named `legacy_multiclass_transition_fraction_unmapped_as_error`.
 
-## Geometry and availability
+## Geometry and historical quality availability
 
 New declared assessments use full requested-region, unnormalized L2 distance
 `||truth-center - candidate-center||2 <= tolerance`. Production near-clonal routing
@@ -155,8 +205,8 @@ alternative optimal choices are retained as ambiguity evidence. Continuous L2
 and maximum-coordinate errors remain available without a tolerance. The workflow
 qualification tool uses the same declared matcher.
 
-Each target and unchanged-F row reports whether any geometrically matching
-reference exists, and whether at least one such reference passes quality in all
+In historical v2/v3 records, each target and unchanged-F row reports whether any
+geometrically matching reference exists, and whether at least one passes quality in all
 of that mutation's original informative regions. Distance always uses the full
 region vector; only the quality requirement follows the observation mask.
 Quality failure in an unobserved region does not make a candidate unusable.
@@ -168,7 +218,7 @@ reference without a matching center gives false; matching centers that fail
 required quality give geometric true and usable false. Missing historical quality
 evidence gives null usable availability rather than invented passing flags.
 
-`geometric_correct_reference_resolution` counts accepted matching centers that
+The historical `geometric_correct_reference_resolution` counts accepted matching centers that
 pass required quality over the evaluable population. Outcomes are also stratified
 by availability and target origin. The binary recovery ceiling remains
 `|H intersect T_C|/|H|`; geometric availability never multiplies that binary ceiling.
@@ -177,7 +227,7 @@ by availability and target origin. The binary recovery ceiling remains
 
 ```sh
 clipp2-simulate report OLD_STUDY \
-  --evaluation-config evaluation-v3.json \
+  --evaluation-config evaluation.json \
   --report-dir NEW_REPORT_DIRECTORY
 ```
 
@@ -227,13 +277,15 @@ Missing records remain unknown under that definition, including historical v1
 L∞ geometry, its top-level matching tolerance, and its original matching policy.
 Even an empty report with no recoverable complete roster retains the historical
 definition and unavailable planned estimates. An explicit new evaluation
-configuration requests v3 derivation, including when usable records are absent.
+configuration derives v3 for retained Protocol 2.2 inference and v4 for Protocol 2.3,
+including when usable records are absent. Changing inference policy requires a
+separate assignment derivative; offline reporting never changes old decisions.
 
 Cached operational values remain historical. To apply corrected stage-specific
 accounting, derive a report into a new directory from retained execution evidence;
 the source evaluations and reports are preserved.
 
-Evaluation, definition and aggregate v3 records contain the endpoint, population
+Versioned evaluation, definition and aggregate records contain the endpoint, population
 scope, missing-evidence treatment, truth-qualification policy, metric, tolerance,
 matching policy, and semantic definition identity. Distance configuration remains
 v1; old v1/v2 evaluation files keep their original definitions. Aggregation

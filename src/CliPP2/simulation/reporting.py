@@ -266,7 +266,7 @@ def _load_evidence(root, cell):
     paired = _configuration(attempt)
     if not isinstance(paired, Mapping):
         raise TypeError("Preserved paired inference must be a JSON object")
-    if paired.get("schema", "clipp2.paired-experiment.v3") != "clipp2.paired-experiment.v3":
+    if paired.get("schema", "clipp2.paired-experiment.v3") not in ("clipp2.paired-experiment.v3", "clipp2.paired-experiment.v4"):
         raise UnsupportedArtifactFormat(paired.get("schema"), "paired inference format is not supported")
     catalog, compatibility = _catalog_evidence(attempt, paired)
     if job.get("cohort_content_id") is not None and dict(catalog.metadata).get("cohort_content_id") != job["cohort_content_id"]:
@@ -299,10 +299,14 @@ def _load_evidence(root, cell):
 
 def unavailable_evaluation(job, status, *, evaluation_config, error=None,
                            execution_state=None, evidence_state="missing_truth_evidence",
-                           arm_applicability=None, original_evaluable_count=None):
+                           arm_applicability=None, original_evaluable_count=None,
+                           evaluation_schema="clipp2.simulation.evaluation.v4"):
     """Unavailable derived evidence receives no invented scientific decisions."""
-    from .evaluation import evaluation_definition, normalize_evaluation_config, metric_truth_independent
-    definition = evaluation_definition(evaluation_config)
+    from .evaluation import evaluation_definition, legacy_evaluation_definition, normalize_evaluation_config, metric_truth_independent
+    if evaluation_schema not in ("clipp2.simulation.evaluation.v3", "clipp2.simulation.evaluation.v4"):
+        raise ValueError("Unavailable evidence requires a supported evaluation interpretation")
+    definition = (evaluation_definition(evaluation_config) if evaluation_schema.endswith(".v4")
+                  else legacy_evaluation_definition(3, evaluation_config))
     arms = ({row["arm"]: row for row in arm_applicability} if isinstance(arm_applicability, (list, tuple))
             else dict(arm_applicability or {}))
     if original_evaluable_count is not None and (type(original_evaluable_count) is not int or original_evaluable_count < 0):
@@ -340,7 +344,12 @@ def unavailable_evaluation(job, status, *, evaluation_config, error=None,
                                   scientific_rejection=bool(state.get("scientific_rejection")),
                                   upstream_failure=bool(state.get("upstream_failure")),
                                   decision_population=state.get("decision_population")))
-    return dict(schema="clipp2.simulation.evaluation.v3", evaluation_definition=definition,
+    if evaluation_schema.endswith(".v4"):
+        metrics = [row for row in metrics if row["name"] != "correct_per_original_evaluable"]
+        for row in metrics:
+            if row["name"] == "binary_correct_per_original_evaluable":
+                row["name"] = "binary_map_correct_per_original_evaluable"
+    return dict(schema=evaluation_schema, evaluation_definition=definition,
         evaluation_config=normalize_evaluation_config(evaluation_config), truth_qualification=evidence_state,
         evaluation_definition_id=content_hash(definition), cell_id=job["cell_id"], history_id=job["history_id"],
         family=job["family"], acquisition_id=job["acquisition"]["id"], acquisition=job["acquisition"],
@@ -390,15 +399,18 @@ def _retained_memberships(arm, original_ids):
     if not isinstance(assignment, Mapping) or not isinstance(assignment.get("assignments"), (list, tuple)):
         return combined, fixed, None
     rows = assignment["assignments"]
-    if (any(not isinstance(row, Mapping) or "mutation_id" not in row or "accepted_label" not in row for row in rows)
+    label_key = ("final_assignment_label" if assignment.get("protocol_version") == "2.3"
+                 or assignment.get("schema") == "clipp2.assignment.result.v5" else "accepted_label")
+    if (any(not isinstance(row, Mapping) or "mutation_id" not in row or label_key not in row for row in rows)
             or len(rows) != len(selected) or {row["mutation_id"] for row in rows} != selected
-            or any(row["accepted_label"] is not None and (type(row["accepted_label"]) is not int
-                or row["accepted_label"] < 0) for row in rows)):
+            or any(row[label_key] is not None and (type(row[label_key]) is not int
+                or row[label_key] < 0) for row in rows)):
         return combined, fixed, None
-    return combined, fixed, {row["mutation_id"] for row in rows if row["accepted_label"] is not None}
+    return combined, fixed, {row["mutation_id"] for row in rows if row[label_key] is not None}
 
 
-def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missing_truth_evidence", error=None):
+def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missing_truth_evidence", error=None,
+                         evaluation_schema=None):
     """Recover scoped decision evidence without inventing missing correctness."""
     from .evaluation import _operational_states
     root, job = Path(root), cell["job"]
@@ -507,13 +519,14 @@ def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missi
         pass  # Missing or inconsistent evidence cannot prove an empty population.
     value = unavailable_evaluation(job, "unavailable_derived_evidence", evaluation_config=evaluation_config,
         execution_state=cell.get("status"), evidence_state=evidence_state, arm_applicability=arms,
-        original_evaluable_count=count, error=error)
+        original_evaluable_count=count, error=error, evaluation_schema=evaluation_schema or
+        ("clipp2.simulation.evaluation.v4" if cell.get("protocol_version") == "2.3" else "clipp2.simulation.evaluation.v3"))
     if region_count is not None:
         value["region_count"] = region_count
     return value
 
 
-def reevaluate_cell(root, cell, evaluation_config):
+def reevaluate_cell(root, cell, evaluation_config, *, evaluation_schema=None):
     """Derive a new record solely from the selected attempt's saved evidence."""
     from .evaluation import evaluate
     root = Path(root).resolve()
@@ -524,7 +537,7 @@ def reevaluate_cell(root, cell, evaluation_config):
         qualification = truth_link["status"]
         if qualification in ("conflicting_truth", "missing_truth_evidence"):
             value = placeholder_for_cell(root, cell, evaluation_config, evidence_state=qualification,
-                error=dict(type="TruthEvidenceError", message=truth_link["reason"]))
+                error=dict(type="TruthEvidenceError", message=truth_link["reason"]), evaluation_schema=evaluation_schema)
         else:
             value = evaluate(history, catalog, paired, acquisition=acquisition, evaluation_config=evaluation_config,
                              truth_qualification=qualification)
@@ -535,7 +548,7 @@ def reevaluate_cell(root, cell, evaluation_config):
         qualification = ("unsupported_artifact_format" if isinstance(error, UnsupportedArtifactFormat) else
                          "conflicting_truth" if isinstance(error, (ValueError, AssertionError)) else "missing_truth_evidence")
         value = placeholder_for_cell(root, cell, evaluation_config, evidence_state=qualification,
-                                     error=dict(type=type(error).__name__, message=str(error)))
+                                     error=dict(type=type(error).__name__, message=str(error)), evaluation_schema=evaluation_schema)
         if isinstance(error, UnsupportedArtifactFormat):
             value["artifact_compatibility"] = dict(status=qualification, source_schema=error.schema,
                                                   required_pinned_revision=error.revision)
