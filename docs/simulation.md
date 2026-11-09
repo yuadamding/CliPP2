@@ -90,7 +90,7 @@ new command-line settings do not replace them. Completed cells are reused.
 `--retry-failed` reruns execution failures as new attempts, retaining old
 attempts, completion records, and costs. Development retries append revised assessment receipts while preserving earlier
 receipts. There is no scientific-performance selection to reopen. Package
-version 2.0.0 uses simulation contract v6 with explicit replicate blocks. It binds the entire parsed cohort
+version 2.0.0 uses simulation contract v7 with explicit replicate blocks. It binds the entire parsed cohort
 settings to a `cohort_content_id` in contracts, jobs, physical histories,
 acquisitions, and qualification receipts. Formatting and object-key order do not
 affect this identity; values and list order do. Resume verifies the frozen
@@ -98,7 +98,7 @@ settings at coordinator execution boundaries before reusing work. Each worker
 then reuses its validated immutable snapshot; a new process loads and verifies
 it again. Semantic random seeds remain unchanged.
 
-Existing v1–v5 study contracts retain their original frozen installations and outputs.
+Existing v1–v6 study contracts retain their original frozen installations and outputs.
 They are not migrated, and missing historical identity is not retrofitted. A new execution
 under 2.0.0 requires a new directory. Qualification has separate numbered
 mechanism/cohort attempts; validated published summaries can complete an
@@ -112,10 +112,10 @@ study contract, main roster, every planned development cell, its retained evalua
 paths and execution status. Explicit retries append numbered assessments. No
 `threshold_development.json` or redundant `study_plan.json` is created. Historical
 threshold-selection receipts remain readable without changing old decisions.
-Evaluation v4 uses family/history/acquisition weights. A known
+Evaluation v5 uses family/history/acquisition weights. A known
 failure receives zero correct-decision credit only when a positive original
 denominator is established and no data-supported final decisions remain anywhere in that
-endpoint, including unchanged members outside the Stage 3 target pool;
+endpoint (including native unchanged members only in historical records);
 missing or conflicting evidence produces an unknown score. An incomplete planned
 estimate is null, with available-case summaries labeled separately. Legacy studies
 without an explicit complete frozen roster cannot establish the planned estimate
@@ -206,40 +206,39 @@ B3 and C3 each perform one frozen-reference assignment with fresh full original
 support. The one-configuration core maxima are **7,920 fits and 5,280 assignment
 passes**. Blocked or inapplicable branches may execute fewer operations.
 
-Stage 1 selects the occupied group closest to all ones as a **provisional reference
-source**, retaining its actual native center and distance. Coverage, residuals, and
-proximity do not qualify that selection; it can be genuinely subclonal. All available
-informative positive-CCF native MAP multiplicity calls contribute to Stage 2 caps,
-including uncertain or tied integer representatives. The cap is their minimum,
-with original-support fallback when no informative call is available. This policy
-can lower caps and remove useful references; the evaluation measures those effects.
+Stage 1 chooses the occupied group nearest all ones as a **provisional source**;
+its actual native center remains a reference. Source residuals, coverage and
+distance do not veto continuation. Each defined observed source multiplicity
+likelihood contributes the largest integer in its exact MAP set. Stage 2 caps are
+the minimum of those endpoints, with original-support fallback. A flat likelihood
+supplies the original upper endpoint; undefined all-zero likelihoods supply none.
+Historical native point calls remain separate. The cap is a discovery heuristic,
+not a biological upper-bound certificate.
 
-In each Stage 2 arm, strict full-vector L2 distance below `.05` routes near-clonal
-groups to reassessment. Other groups retain native centers. Stage 3 uses the imposed
-all-one hypothesis and unchanged Stage 2 references with full original support,
-equal priors, and common observation masks. Every informative compatible target
-receives a deterministic MAP representative and the complete posterior. Reference
-coverage, ties, uncertainty, and residuals remain diagnostics without vetoing it.
-Eligible targets without informative reads retain an equal prior vector and no
-data-supported final label. All-impossible targets remain model-incompatible;
-they do not receive a fabricated uniform posterior.
+For each arm, Stage 3 consolidates exactly equal vectors from the canonical
+all-one hypothesis, the source native center and every Stage 2 center. All source
+provenance remains. Equal priors are assigned after consolidation; near-identical
+centers remain distinct. Every combined fitted mutation is reassessed under full
+original support: **T is the entire fitted population and F is empty**. Baseline
+labels refer to the actual source center after consolidation. There is no distance
+routing parameter. Cluster defaults remain 10/20, and valid major CN has no default
+upper eligibility ceiling. Deliberate exclusions and numerical verification remain.
 
-Cluster limits remain 10 in Stage 1 and 20 in Stage 2. The `.05` parameter defines
-Stage 2 routing only. Development has no contributor/posterior grid, score-reuse
-selection loop, selective-error constraint, or performance-triggered extension.
-Native computational verification remains mandatory. The core maxima above
-exclude separate qualification, optional panels, and retry attempts.
+Authoritative outputs contain `map_label`, `map_set`, `posterior_defined`,
+`evidence_status` and `final_assignment_label`. Prior-only, incompatible, excluded
+and failed observations remain distinct. Whole-original tables retain explicit
+outcomes for mutations outside the fitted population. All reference labels remain,
+including zero occupancy. Target origins are `stage1_reference_recheck` and
+`stage2_recheck`; historical cap contributors retain their discovery contribution
+when reassigned. Both arms use production construction/reconciliation helpers.
+Native results remain retained if a later derived phase fails.
 
-`source_to_reference.tsv` records the construction mapping. Authoritative final
-rows distinguish `baseline_reference_label` from `final_assignment_label`:
-observed targets receive `map_cluster_label`, while prior-only, incompatible,
-excluded, or failed targets have no data-supported final label. Non-targets retain
-their native labels with `membership_origin = stage2_unchanged`. All reference labels remain, including zero
-occupancy. Target origins and historical cap contributors that later reassign are
-reported separately; historical caps are never recomputed from reassessment.
-Both arms use the production transition and final-membership helpers. Scoring is
-followed by reconciliation and one publication with combined target/non-target
-accounting. Accepted native counts remain recorded if a later derived phase fails.
+Development has no threshold grid or performance-based stop. Reference-preserving
+outputs use paired v5, assignment bundle/result v5/v6 and evaluation/definition v5.
+Earlier routed Protocol 2.3 records retain v4 semantics; Protocol 2.2 records retain
+their frozen definitions. The numerical protocol string alone does not select the
+evaluation contract. Native/cap comparisons and high-CN population expansion are
+reported separately; the full-support B arm is a prespecified comparator.
 
 Reference-center assessment is separate from source-member overlap used for
 calibration labels. Continuous Euclidean and maximum regional errors are retained.

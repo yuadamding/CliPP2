@@ -151,6 +151,11 @@ def _run_cell(task):
     results, costs, execution_failures = [], [], []
     original_evaluable_count, execution_phase = None, "history"
     try:
+        from CliPP2.config import WorkflowConfig
+        configurations = task.get("execution_configs") or [asdict(workflow_config())]
+        if len(configurations) != 1:
+            raise ValueError("Protocol 2.3 executes exactly one declared workflow configuration")
+        config = WorkflowConfig.from_dict(configurations[0])
         from .biology import history_content_id
         from .acquisition import validate_history_acquisition_link
         history = _history(job)
@@ -165,7 +170,7 @@ def _run_cell(task):
         input_path = attempt / "input_catalog.tsv"
         write_tumor_txt(input_path, frame, metadata)
         save_json(attempt / "acquisition.json", frame.attrs.get("acquisition", {}))
-        catalog = load_original_catalog(input_path)
+        catalog = load_original_catalog(input_path, max_major_cn=config.fit.max_major_cn)
         truth_link = validate_history_acquisition_link(history, frame.attrs["acquisition"], catalog,
                                                        history_manifest=history_manifest)
         if truth_link["status"] != "verified_history_binding":
@@ -173,11 +178,6 @@ def _run_cell(task):
         original_evaluable_count = int((np.isfinite(history.phi).all(axis=1)
             & (catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)).any(axis=1)).sum())
         execution_phase = "before_inference"
-        from CliPP2.config import WorkflowConfig
-        configurations = task.get("execution_configs") or [asdict(workflow_config())]
-        if len(configurations) != 1:
-            raise ValueError("Protocol 2.3 executes exactly one declared workflow configuration")
-        config = WorkflowConfig.from_dict(configurations[0])
         def progress(event):
             fields = ("phase", "stage", "elapsed_seconds", "phase_elapsed_seconds", "occupied_q", "membership_audit", "operation")
             payload = dict(configuration=1, **{key: event[key] for key in fields if key in event})
@@ -213,6 +213,7 @@ def _run_cell(task):
     value["execution_phase"] = execution_phase
     value["execution_configs"] = task.get("execution_configs")
     value["evaluation_config"] = evaluation_config
+    value["evaluation_schema"] = "clipp2.simulation.evaluation.v5"
     value["protocol_version"] = PROTOCOL_VERSION
     value["implementation_version"] = __version__
     value["prior_cost_ledgers"] = ((prior.get("prior_cost_ledgers", [])+prior.get("cost_ledgers", []))
@@ -449,7 +450,7 @@ def _freeze_main_roster(root, contract):
 
 def _execute(root, contract, *, resume=False, retry_failed=False):
     root = Path(root).resolve()
-    if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v6"
+    if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v7"
             or contract.get("implementation_version") != __version__):
         raise ValueError(f"Execution requires a Protocol {PROTOCOL_VERSION} simulation contract; earlier studies require their original installed environment")
     if resume:
@@ -565,7 +566,7 @@ def run_optional_panels(root, contract, workers, *, retry_failed=False):
             job = completion["job"]
             history = _history(job)
             attempt = root / completion["attempt"]
-            catalog = load_original_catalog(attempt / "input_catalog.tsv")
+            catalog = load_original_catalog(attempt / "input_catalog.tsv", max_major_cn=config.fit.max_major_cn)
             paired = _paired_result(attempt) if completion.get("cost_ledgers") else {}
             second_catalog = None
             if options.get("independent_counts"):
@@ -577,7 +578,7 @@ def run_optional_panels(root, contract, workers, *, retry_failed=False):
                 second_path = output / f"{family}_independent_counts.tsv"
                 if not second_path.exists():
                     write_tumor_txt(second_path, second, dict(second.attrs["metadata"], tumor_id=catalog.tumor_id))
-                second_catalog = load_original_catalog(second_path)
+                second_catalog = load_original_catalog(second_path, max_major_cn=config.fit.max_major_cn)
             run_reference_audit(history, catalog, paired, config, directory / "output", second_catalog=second_catalog)
             save_json(directory / "reference_audit.json", dict(source_attempt=source,
                 result=read_json(directory / "output" / "reference_audit.json")))
@@ -605,7 +606,8 @@ def report(root, *, evaluation_config=None, report_dir=None):
         if isinstance(evaluation_config, (str, Path)):
             evaluation_config = read_json(evaluation_config)
         evaluation_config = normalize_evaluation_config(evaluation_config)
-        schema = "clipp2.simulation.evaluation.v4" if contract.get("protocol_version") == "2.3" else "clipp2.simulation.evaluation.v3"
+        schema = ("clipp2.simulation.evaluation.v5" if contract.get("schema") == "clipp2.simulation-contract.v7" and contract.get("protocol_version") == "2.3" else
+                  "clipp2.simulation.evaluation.v4" if contract.get("protocol_version") == "2.3" else "clipp2.simulation.evaluation.v3")
     else:
         frozen_evaluation = contract.get("evaluation", {})
         schema = frozen_evaluation.get("record_schema")
@@ -614,14 +616,14 @@ def report(root, *, evaluation_config=None, report_dir=None):
             schema = "clipp2.simulation.evaluation." + (
                 "v3" if version >= (1, 2, 3) else "v2" if version >= (1, 2, 2) else "v1")
         if schema not in ("clipp2.simulation.evaluation.v1", "clipp2.simulation.evaluation.v2",
-                          "clipp2.simulation.evaluation.v3", "clipp2.simulation.evaluation.v4"):
+                          "clipp2.simulation.evaluation.v3", "clipp2.simulation.evaluation.v4", "clipp2.simulation.evaluation.v5"):
             raise ValueError("Frozen study declares an unsupported evaluation record schema")
         evaluation_config = {key: frozen_evaluation[key]
             for key in ("reference_match_atol", "reference_distance") if key in frozen_evaluation}
         if schema.endswith(".v1"):
             evaluation_config["reference_distance"] = "linf"
         evaluation_config = normalize_evaluation_config(evaluation_config)
-    definition = (evaluation_definition(evaluation_config) if schema.endswith(".v4") else
+    definition = (evaluation_definition(evaluation_config) if schema.endswith(".v5") else
                   legacy_evaluation_definition(schema, evaluation_config))
     definition_id = content_hash(definition)
     cells = [value for directory in sorted((root / "cells").glob("*")) if directory.is_dir()
@@ -644,7 +646,7 @@ def report(root, *, evaluation_config=None, report_dir=None):
                 value = read_json(cached_path)
             except (OSError, ValueError, IndexError, KeyError):
                 value = placeholder_for_cell(root, cell, evaluation_config, evaluation_schema=(
-                    "clipp2.simulation.evaluation.v4" if schema.endswith(".v4") else "clipp2.simulation.evaluation.v3"))
+                    schema if schema.endswith((".v4", ".v5")) else "clipp2.simulation.evaluation.v3"))
                 # Missing cached records retain the frozen study's definition.
                 # Historical files retain their original inference interpretation.
                 value.update(schema=schema, evaluation_config=evaluation_config,

@@ -260,12 +260,12 @@ def end_to_end_case(directory, seed, reference_match_atol=None):
     target = whole.role == "target"
     unchanged = whole.role == "non_target"
     origins = {origin: outcomes(whole.target_reason == origin)
-               for origin in ("stage1_reference_recheck", "stage2_near_clonal_recheck")}
+               for origin in ("stage1_reference_recheck", "stage2_recheck")}
     stage_two_path = output/"stage_two_accepted.json"
     second = load_accepted_fit(stage_two_path) if stage_two_path.exists() else None
     positions = {mutation: i for i, mutation in enumerate(catalog.mutation_ids)}
     second_rows = [] if second is None else [positions[m] for m in second.mutation_ids]
-    routed = np.asarray(whole.target_reason == "stage2_near_clonal_recheck")
+    routed = np.asarray(whole.target_reason == "stage2_recheck")
     excluded = (np.zeros((0, 2), bool) if second is None else
                 (calls[second_rows] < second.support.lower) | (calls[second_rows] > second.support.upper))
     excluded_rows = excluded.any(axis=1)
@@ -284,7 +284,7 @@ def end_to_end_case(directory, seed, reference_match_atol=None):
         whole_population=outcomes(np.ones(len(whole), bool)), reference_availability_and_error=errors,
         final_map_center_mean_l2=float(np.mean(final_error)) if final_error else None,
         routing=dict(stage_two_population=len(second_rows), stage_two_routed=int(routed.sum()),
-            geometric_group_count=None if groups is None else int(groups["near_clonal"].sum()),
+            native_group_count=None if groups is None else len(groups),
             nonclonal_truth_stage_two=int(np.sum(truth_labels[second_rows] != 0)),
             nonclonal_truth_stage_two_routed=int(np.sum(routed & (truth_labels != 0))),
             true_multiplicity_excluded_mutations=int(excluded_rows.sum()),
@@ -316,7 +316,7 @@ def main(argv=None):
         raise FileExistsError("Qualification output already exists; use a new output path")
     with tempfile.TemporaryDirectory(prefix="clipp2-qualification-") as temporary:
         directory = Path(temporary)
-        report = dict(schema="clipp2.synthetic-qualification.v6", protocol_version=PROTOCOL_VERSION, seed=args.seed,
+        report = dict(schema="clipp2.synthetic-qualification.v7", protocol_version=PROTOCOL_VERSION, seed=args.seed,
             device="cpu", workflow_config=asdict(workflow_config()),
             reference_match_atol=args.reference_match_atol,
             offline_support_comparison_requested=args.compare_stage_two_support,

@@ -5,8 +5,8 @@ import argparse
 from dataclasses import replace
 import json
 from pathlib import Path
-import tempfile
 from types import SimpleNamespace
+import tempfile
 from unittest.mock import patch
 
 import numpy as np
@@ -53,10 +53,10 @@ def run_checks(directory):
         assert arm["counts"]["Ncombined"] == arm["counts"]["N0"] + arm["counts"]["N2"] == 8
         assert set(arm["targets"]).isdisjoint(arm["non_targets"])
         assert set(arm["targets"] + arm["non_targets"]) == set(arm["combined_labels"])
-        assert arm["counts"]["K"] == 1 + arm["counts"]["Q2"] - arm["counts"]["merged_groups"]
+        assert arm["counts"]["K"] == 2 + arm["counts"]["Q2"] - arm["counts"]["exact_consolidated_centers"]
         assert len(arm["assignment"]["multiplicities"]) == 2*len(arm["targets"])
-        assert all(row["reassessment_status"] == "unchanged_non_target" for row in arm["original_rows"]
-                   if row["mutation_id"] in arm["non_targets"])
+        assert not arm["non_targets"] and arm["counts"]["F"] == 0
+        assert all(row["role"] == "target" for row in arm["original_rows"])
         assert all(row["original_lower"] == row["original_upper"] == 1
                    for row in arm["assignment"]["multiplicities"])
         native = arm["stage_two"]
@@ -66,7 +66,7 @@ def run_checks(directory):
                            paired["arms"]["C"]["assignment"]["assignments"]):
         np.testing.assert_array_equal(left["probabilities"], right["probabilities"])
     checks = ["shared_A_same_remainder_3fits_2passes", "native_audits_and_population_reconciliation",
-              "single_copy_B_C_equivalence", "full_support_and_unchanged_native_non_targets",
+              "single_copy_B_C_equivalence", "full_support_all_target_reassessment_preserves_native_baselines",
               "one_external_run_manifest_link_shared_by_A_B_C", "publish_once_after_combined_reconciliation"]
     checks.extend(_routing_regressions(directory, paired, config))
     replay = run_paired_experiment(directory / "input.tsv", directory / "replay",
@@ -87,8 +87,13 @@ def run_checks(directory):
     rejected = run_paired_experiment(directory / "other_tumor.tsv", directory / "rejected", config,
                                      accepted_stage_one=paired["stage_one"])
     assert rejected["status"] == "failed" and rejected["cost_ledger"]["fit_count"] == 0
-    assert "tumor" in rejected["error"]
-    checks.append("cross_tumor_replay_rejected_without_refitting")
+    assert "biological input identities" in rejected["error"]
+    with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("incompatible B started fresh A")) as fitter:
+        rejected_b = run_paired_experiment(directory / "other_tumor.tsv", directory / "rejected_stage_two", config,
+            accepted_uncapped_stage_two=paired["arms"]["B"]["stage_two"])
+    assert rejected_b["status"] == "failed" and rejected_b["failed_stage"] == "stage_two"
+    assert rejected_b["cost_ledger"]["fit_count"] == fitter.call_count == 0
+    checks.append("cross_tumor_A_or_B_replay_rejected_before_any_refitting")
     for name, values in (("empty_remainder", [[50, 50]]*8), ("no_reference", [[20, 15]]*8)):
         _input(directory / (name + ".tsv"), values)
         result = run_paired_experiment(directory / (name + ".tsv"), directory / name, config)
@@ -117,7 +122,6 @@ def _replay_policy_regressions(directory, paired, config):
         larger_capacity=replace(config, fit=replace(config.fit, max_clusters=11)),
         stage_two_capacity=replace(config, stage_two_max_clusters=1),
         all_audit=replace(config, fit=replace(config.fit, audit_scope="all")),
-        cn_eligibility=replace(config, fit=replace(config.fit, max_major_cn=11)),
         normal_assumption=replace(config, normal_cn_policy="diploid"))
     for name, settings in variants.items():
         with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("paired policy rejection optimized")) as fitter:
@@ -129,7 +133,7 @@ def _replay_policy_regressions(directory, paired, config):
         failed = run_paired_experiment(directory / "input.tsv", directory / "policy_before_fresh_A",
             variants["stage_two_capacity"], accepted_uncapped_stage_two=second)
         assert failed["status"] == "failed" and fitter.call_count == 0
-    settings = replace(config, fit=replace(config.fit, cpu_threads=2))
+    settings = replace(config, fit=replace(config.fit, cpu_threads=2, max_major_cn=11))
     replay = run_paired_experiment(directory / "input.tsv", directory / "policy_thread_override", settings,
         accepted_stage_one=first, accepted_uncapped_stage_two=second)
     assert replay["status"] == "complete"
@@ -138,11 +142,11 @@ def _replay_policy_regressions(directory, paired, config):
     validate_replay_policy(first, replace(config.fit, device="cuda", cpu_threads=2), normal_cn_policy=config.normal_cn_policy)
     assert (first.state_fingerprint, second.state_fingerprint) == (first_identity, second_identity)
     return ["shared_scientific_replay_policy_rejects_without_optimization",
-            "stage_two_policy_preflight_precedes_fresh_stage_one", "replay_execution_overrides_preserve_producer_policy"]
+            "stage_two_policy_preflight_precedes_fresh_stage_one", "replay_execution_overrides_preserve_producer_policy", "unchanged_population_allows_explicit_cutoff_policy_change"]
 
 
 def _routing_regressions(directory, paired, config):
-    """Coordinator fixture isolates routing; altered centers are not accepted fits."""
+    """Frozen coordinator inputs preserve near-one and nonclonal alternatives."""
     from CliPP2.io.tumor_txt import load_original_catalog
     from CliPP2.simulation.experiment import _freeze_arm
     from CliPP2.workflow import AcceptedFit, _reconcile_final_memberships
@@ -151,44 +155,31 @@ def _routing_regressions(directory, paired, config):
     second = replace(native, labels=np.array([0, 0, 1, 1]), centers=np.array([[.98, .98], [.4, .3]]),
                      weights=np.array([.5, .5]))
     selected = next(row for row in paired["stage_one_groups"] if row["source_label"] == paired["g0_label"])
-    # Geometry still routes missing-coverage groups; raw diagnostics do not veto MAP.
-    groups = [dict(source_label=0, near_clonal=True, informative_counts=[0, 0], informative_depths=[0., 0.],
+    groups = [dict(source_label=0, native_center=second.centers[0].tolist(), informative_counts=[0, 0], informative_depths=[0., 0.],
                    native_mean_profile_deviance=[float("nan")]*2, native_maximum_profile_deviance=[float("nan")]*2,
                    diagnostic_status="complete"),
-              dict(source_label=1, near_clonal=False, informative_counts=[2, 2], informative_depths=[200., 200.],
+              dict(source_label=1, native_center=second.centers[1].tolist(), informative_counts=[2, 2], informative_depths=[200., 200.],
                    native_mean_profile_deviance=[100., 0.], native_maximum_profile_deviance=[200., 0.],
                    diagnostic_status="complete")]
     catalog = load_original_catalog(directory / "input.tsv")
     path = directory / "routing_fixture"
     path.mkdir()
     bundle, frozen = _freeze_arm(catalog, first, selected, second, groups, paired["g0_ids"], config, "C", path)
-    newly_routed = set(native.mutation_ids[:2])
-    assert set(bundle.target_ids) == set(paired["g0_ids"]) | newly_routed
-    assert frozen["counts"]["K"] == 2 and frozen["counts"]["F"] == 2
-    np.testing.assert_array_equal(bundle.reference.centers[1], second.centers[1])
-    np.testing.assert_array_equal(bundle.reference.source_mean_profile_deviance[1], [100., 0.])
+    assert set(bundle.target_ids) == set(first.mutation_ids) and not bundle.non_target_ids
+    assert frozen["counts"]["F"] == 0 and frozen["counts"]["K"] == 3
+    assert any(np.array_equal(center, [.98, .98]) for center in bundle.reference.centers)
+    assert any(np.array_equal(center, [.4, .3]) for center in bundle.reference.centers)
+    for mutation, baseline in zip(bundle.target_ids, bundle.baseline_labels):
+        np.testing.assert_array_equal(bundle.reference.centers[baseline], frozen["native_centers"][mutation])
     scored = assign_mutations(bundle, outdir=directory / "routing_assignment")
-    for row in scored.assignments:
-        if row["mutation_id"] in newly_routed:
-            assert row["best_label"] == 1 and row["evidence_status"] == "observed"
-            assert row["final_assignment_label"] == 1 and row["target_reason"] == "stage2_near_clonal_recheck"
-            assert len(row["probabilities"]) == 2
+    assert all(row["target_reason"] == "stage2_recheck" for row in scored.assignments
+               if row["mutation_id"] in native.mutation_ids)
     rows, accounting = _reconcile_final_memberships(catalog, first, second,
         frozen["source_map"], frozen["unchanged_map"], scored, contributors=paired["contributors"])
     assert sum(accounting["final_occupancy"].values()) + accounting["unresolved_targets"] == 8
-    assert all(row["final_assignment_label"] == 1 for row in rows if row["mutation_id"] in newly_routed)
-    assert all(row["final_assignment_label"] == 1 for row in rows if row["mutation_id"] in bundle.non_target_ids)
-    # Historical contributor reassessment is an annotation, never a cap update.
-    contributor = paired["g0_ids"][0]
-    fake_rows = [dict(row, **(dict(final_assignment_label=1, map_cluster_label=1, status="observed", evidence_status="observed",
-        reassessment_status="reassigned", baseline_changed=True) if row["mutation_id"] == contributor else {}))
-        for row in scored.assignments]
-    fake = SimpleNamespace(target_ids=scored.target_ids, assignments=fake_rows, reference=scored.reference)
-    annotated, _ = _reconcile_final_memberships(catalog, first, second,
-        frozen["source_map"], frozen["unchanged_map"], fake, contributors=[dict(mutation_id=contributor, contributes_to_cap=True)])
-    assert next(row for row in annotated if row["mutation_id"] == contributor)["historical_cap_contributor_reassigned"]
-    return ["near_clonal_failed_screens_route_to_reassessment", "native_reference_diagnostics_do_not_veto_winner",
-            "authoritative_final_labels_and_historical_contributor_annotation"]
+    assert all(row["role"] == "target" for row in rows)
+    return ["all_native_references_and_all_fitted_targets_preserved", "native_baselines_use_exact_reference_lineage",
+            "near_one_center_not_geometrically_merged", "all_target_population_reconciles"]
 
 
 def _accepted_stage_failure(directory, paired, config):

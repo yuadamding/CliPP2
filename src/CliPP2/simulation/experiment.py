@@ -22,7 +22,7 @@ from CliPP2.io.assignment import (load_accepted_fit, reserve_output, save_accept
                                  write_supporting_table)
 from CliPP2.io.data import json_value, validate_workflow_mapping
 from CliPP2.io.publication import publish_json
-from CliPP2.io.tumor_txt import load_original_catalog
+from CliPP2.io.tumor_txt import audit_input, load_original_catalog
 from CliPP2.provenance import prepare_run_manifest, validate_replay_policy
 from CliPP2.workflow import (AcceptedFit, CONTRIBUTOR_COLUMNS, GROUP_COLUMNS,
                              SEGMENT_POLICY_COLUMNS, _fit_accepted, _stage_two_caps,
@@ -36,23 +36,26 @@ def _save_json(path, payload):
 
 
 def _error(error, stage):
-    return dict(status="failed", failed_stage=stage,
+    return dict(status="failed", evidence_status="computation_failed", failed_stage=stage,
                 error_type=type(error).__name__, error=str(error))
 
 
 def _freeze_arm(catalog, first, selected_group, second, groups, g0, config, arm_name, arm_path, *, run_manifest=None):
-    """Construct membership-only merging; preserve each native source center."""
+    """Preserve exact native alternatives and reassess the entire fitted population."""
     reference, targets, unchanged, lineage = _build_stage_three_inputs(
         catalog, first, second, selected_group, groups, config)
     g0_set = set(g0)
     centers = reference.centers
     non_targets = tuple(sorted(unchanged))
-    labels = {**unchanged, **{mutation: reference.clonal_label for mutation in targets}}
     sources = {m: (first, i) for i, m in enumerate(first.mutation_ids) if m in g0_set}
     if second is not None:
         sources.update((m, (second, i)) for i, m in enumerate(second.mutation_ids))
     q2, n2 = (0, 0) if second is None else (len(second.centers), len(second.mutation_ids))
-    merged_count = 1 + q2 - len(centers)
+    label_map = {(row["source_stage"], row["source_label"]): row["baseline_reference_label"] for row in lineage}
+    labels = {m: label_map[fit.source_id, int(fit.labels[i])] for m, (fit, i) in sources.items()}
+    if unchanged or set(targets) != set(labels):
+        raise AssertionError("Paired Stage 3 requires all fitted mutations and no unchanged subset")
+    consolidated_count = 2 + q2 - len(centers)
     native_centers = {m: fit.centers[fit.labels[i]].tolist() for m, (fit, i) in sources.items()}
     selected = [sources[m] for m in targets]
     bundle = AssignmentBundle(catalog, reference, targets, non_targets,
@@ -61,7 +64,7 @@ def _freeze_arm(catalog, first, selected_group, second, groups, g0, config, arm_
         np.asarray([fit.support.lower[i] for fit, i in selected]),
         np.asarray([fit.support.upper[i] for fit, i in selected]),
         tuple(fit.source_id for fit, _ in selected),
-        tuple(int(fit.labels[i]) for fit, i in selected), (0,) * len(targets),
+        tuple(int(fit.labels[i]) for fit, i in selected), tuple(labels[m] for m in targets),
         device=config.fit.device, cpu_threads=config.fit.cpu_threads,
         normal_cn_policy=config.normal_cn_policy,
         run_manifest_id=None if run_manifest is None else run_manifest["run_manifest_id"],
@@ -79,7 +82,7 @@ def _freeze_arm(catalog, first, selected_group, second, groups, g0, config, arm_
         source_members={str(label): [m for m, value in labels.items() if value == label]
                         for label in reference.labels},
         counts=dict(N1=len(first.mutation_ids), N0=len(g0), N2=n2, Q2=q2,
-                    merged_groups=merged_count, Ncombined=len(labels), combined_mutations=len(labels),
+                    exact_consolidated_centers=consolidated_count, Ncombined=len(labels), combined_mutations=len(labels),
                     K=len(centers), T=len(targets), F=len(non_targets),
                     targets=len(targets), non_targets=len(non_targets)))
     # The baseline and exact scoring request exist on disk before any assignment.
@@ -112,7 +115,7 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
     arm_root.mkdir()
     start = perf_counter()
     ledger = dict(fit_count=0, assignment_pass_count=0, reused_fit_count=0, events=[])
-    result = dict(schema="clipp2.paired-experiment.v4", study_plan_version="1.2",
+    result = dict(schema="clipp2.paired-experiment.v5", study_plan_version="1.2",
         protocol_version=PROTOCOL_VERSION, implementation_version=__version__, status="running",
         config=asdict(config), stage_one=None, stage_one_status="not_started", stage_one_groups=[], g0_label=None,
         g0_ids=[], remainder_ids=[], contributors=[], cap_bounds=None, cap_records=[],
@@ -124,7 +127,7 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
             assignment_status="not_applicable", stage_two=None, group_records=[],
             combined_labels={}, native_centers={}, reference=None, source_members={}, targets=[],
             non_targets=[], assignment=None, original_rows=[], stage_two_candidate_count=0,
-            counts=dict(N1=0, N0=0, N2=0, Q2=0, merged_groups=0, Ncombined=0,
+            counts=dict(N1=0, N0=0, N2=0, Q2=0, exact_consolidated_centers=0, Ncombined=0,
                         combined_mutations=0, K=0, T=0, F=0, targets=0, non_targets=0))
 
     def journal(event):
@@ -207,7 +210,8 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
                             if isinstance(value, Mapping) else load_accepted_fit(value))
                 if accepted.source_id != stage:
                     raise ValueError("Accepted receipt source stage does not match requested paired replay stage")
-                validate_replay_policy(accepted, requested, normal_cn_policy=config.normal_cn_policy)
+                original = validate_replay_policy(accepted, requested, normal_cn_policy=config.normal_cn_policy)
+                accepted.validate_input_identity(catalog, original)
                 if stage == "stage_one":
                     accepted_stage_one = accepted
                 else:
@@ -281,7 +285,7 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
                     arm_root / (name + "3"), workflow_accounting=accounting))
                 arm.update(assignment_status="complete", status="complete")
                 outcomes = {status: sum(row["reassessment_status"] == status for row in assignment.assignments)
-                            for status in ("retained_clonal", "reassigned", "unresolved")}
+                            for status in ("retained", "reassigned", "unresolved")}
                 if sum(outcomes.values()) != len(bundle.target_ids):
                     raise AssertionError("Assignment outcomes do not reconcile all paired targets")
                 arm["counts"].update(outcomes, unchanged_non_target=len(bundle.non_target_ids))
@@ -297,6 +301,12 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
     except Exception as error:
         stage = current.removesuffix("_replay_policy")
         result.update(_error(error, stage))
+        if stage == "input":
+            audit = audit_input(input_path, max_major_cn=config.fit.max_major_cn, normal_cn_policy=config.normal_cn_policy)
+            result["input_audit"] = audit
+            if audit["status"] != "ready":
+                result["evidence_status"] = audit["status"]
+            _save_json(output / "input_audit.json", audit)
         if stage != current:
             result["failed_phase"] = current
         if stage == "stage_one" and result["stage_one_status"] != "accepted":

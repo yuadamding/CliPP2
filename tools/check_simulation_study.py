@@ -61,7 +61,7 @@ def _design_check(root, settings):
     save_json(snapshot, load_cohort(settings).settings)
     contract = make_contract(cohort_settings=snapshot)
     assert contract["protocol_version"] == "2.3" and contract["source_cohort_protocol_version"] == "2.1"
-    assert contract["schema"] == "clipp2.simulation-contract.v6"
+    assert contract["schema"] == "clipp2.simulation-contract.v7"
     assert contract["evaluation"]["reference_match_atol"] is None
     assert json.loads(snapshot.read_text())["workflow_protocol"] == "2.1"
     main, development = list(jobs(contract, "main")), list(jobs(contract, "development"))
@@ -107,7 +107,8 @@ def _design_check(root, settings):
     assert allocation["planned_main_datasets"] + allocation["planned_development_datasets"] == 2640
     assert allocation["planned_core_max_fits"] == 7920 and allocation["planned_core_max_assignment_passes"] == 5280
     config = contract["base_workflow_config"]
-    assert (config["fit"]["max_clusters"], config["stage_two_max_clusters"], config["stage_two_near_clonal_distance_max"]) == (10, 20, .05)
+    assert (config["fit"]["max_clusters"], config["stage_two_max_clusters"], config["fit"]["max_major_cn"]) == (10, 20, None)
+    assert "stage_two_near_clonal_distance_max" not in config
     return contract
 
 
@@ -135,7 +136,7 @@ def _native_failure_check(root, history, frame, job, contract):
     assert resumed == failure and (attempt / "failure.json").read_bytes() == saved
     assert len(list((root / "cells" / job["cell_id"]).glob("attempt-*"))) == 1
     changed = deepcopy(task)
-    changed["execution_configs"][0]["stage_two_near_clonal_distance_max"] = .04
+    changed["execution_configs"][0]["stage_two_max_clusters"] = 19
     try:
         _run_cell(changed)
     except ValueError as error:
@@ -261,7 +262,7 @@ def _planned_report_check(root, contract):
     assert len({".".join(row["history_id"].split(".")[1:3]) for row in captured}) == 60
     assert all(all(not state["available"] and state["status"] == "not_executed"
                    for state in row["applicability"]) for row in captured)
-    assert all(row["schema"] == "clipp2.simulation.evaluation.v4" for row in captured)
+    assert all(row["schema"] == "clipp2.simulation.evaluation.v5" for row in captured)
     assert all(metric["value"] is None for row in captured for metric in row["metrics"]
                if metric["name"] == "binary_correct_per_original_evaluable")
 
@@ -327,6 +328,7 @@ def _record_schema_report_check(root):
              ("historical_v1_no_roster", "1.1.0", "v1", False, 0, False, False),
              ("historical_v2", "1.2.2", "v2", False, 1, True, False),
              ("explicit_v3", "1.1.0", "v3", True, 1, True, False),
+             ("explicit_v4", "2.0.0", "v4", True, 1, True, False),
              ("explicit_reevaluation_empty", "1.1.0", "v1", False, 0, False, True),
              ("incompatible_v1", "1.1.0", "v1", False, 2, True, False),
              ("incompatible_v3_tolerance", "1.2.3", "v3", True, 2, True, False),
@@ -337,8 +339,9 @@ def _record_schema_report_check(root):
         contract = make_contract(mutations=12, segments=2, regions=4, workers=1,
                                  reference_match_atol=.05)
         contract.pop("replicate_roster")
-        assert contract["evaluation"]["record_schema"] == "clipp2.simulation.evaluation.v4"
-        contract.update(implementation_version=version, protocol_version="2.2", families=["S01"])
+        assert contract["evaluation"]["record_schema"] == "clipp2.simulation.evaluation.v5"
+        contract.update(implementation_version=version, protocol_version="2.3" if suffix == "v4" else "2.2",
+                        schema="clipp2.simulation-contract.v6" if suffix == "v4" else "clipp2.simulation-contract.v5", families=["S01"])
         contract["evaluation"]["record_schema"] = "clipp2.simulation.evaluation." + suffix
         if not explicit:
             contract["evaluation"].pop("record_schema")
@@ -441,7 +444,7 @@ def _report_integrity_check(root):
                  phase="main", acquisition=dict(id="A1", purity=.8, depth=100)) for i in range(4)]
     records = []
     for job, states in zip(jobs, ((0, 0, None), (0, None, None), (None, None, None), (1, 1, 1))):
-        records.append(dict(schema="clipp2.simulation.evaluation.v4", **job, acquisition_id="A1",
+        records.append(dict(schema="clipp2.simulation.evaluation.v5", **job, acquisition_id="A1",
             status="execution_failed" if states == (0, 0, None) else "complete",
             evaluation_definition=definition, evaluation_definition_id=content_hash(definition),
             metrics=[dict(name=name, arm=arm, view="all_planned_cells", stratum="all", value=value,
@@ -524,7 +527,7 @@ def _partial_evidence_report_checks(root):
             for name, value in (("analysis_available", 1), ("analysis_failure", 0),
                                ("execution_available", 1), ("execution_failure", 0),
                                ("evaluation_available", 1), ("scientifically_applicable", 1))]
-        return dict(schema="clipp2.simulation.evaluation.v4", evaluation_definition=definition,
+        return dict(schema="clipp2.simulation.evaluation.v5", evaluation_definition=definition,
             evaluation_definition_id=content_hash(definition), truth_qualification=truth,
             **record, acquisition_id="A1", original_evaluable_count=10, region_count=4,
             status="complete", metrics=metrics, calibration=[], cap_audit=[],
@@ -626,7 +629,7 @@ def _partial_evidence_report_checks(root):
 
 
 def _offline_report_check(root, history, job):
-    """A legacy archived result can acquire new metrics without inference IO."""
+    """An archived result can acquire new metrics without inference or source IO."""
     from contextlib import ExitStack
     from CliPP2.simulation.reporting import reevaluate_cell
     from CliPP2.simulation.study import _latest_completion
@@ -634,10 +637,9 @@ def _offline_report_check(root, history, job):
     save_json(root / "job_manifests/batch-001.json", [job])
     frozen = dict(selected=dict(contributor=.99, posterior=.90), frozen_before_main_generation=True)
     save_json(root / "threshold_development.json", frozen)
-    # Model a preserved 1.2.1 contract whose original cohort source is gone. The
-    # derived report must depend only on the retained selected attempt and truth.
+    # Remove access to the cohort source without relabeling the retained current
+    # producer as a historical method. Genuine old fixtures are checked separately.
     contract = read_json(root / "study_contract.json")
-    contract.update(schema="clipp2.simulation-contract.v3", implementation_version="1.2.1")
     contract.pop("replicate_roster", None)
     contract["cohort"].pop("content_id", None)
     contract["cohort"]["path"] = str(root / "not_present_original_cohort.json")
@@ -1149,7 +1151,7 @@ def run_checks(directory, cohort_settings):
         lifecycle=lifecycle, resume=resume, partial_evidence_reports=partial_reports, record_schema=record_schema,
         report_integrity=report_integrity, historical_catalog=historical_catalog, historical_success=historical_success,
         optional_execution_reports=optional_execution,
-        checks=["exact_60_variant_720_history_2640_cell_design", "full_10_20_strict_point05_contract",
+        checks=["exact_60_variant_720_history_2640_cell_design", "full_10_20_unrestricted_all_target_contract",
                 "source_protocol21_execution23_and_cross_protocol_resume_rejection",
                 "authoritative_observed_MAP_ignores_reporting_diagnostics",
                 "poor_finite_development_does_not_block_main", "development_failures_remain_accounted", "post_evaluator_failure_retains_native_costs",

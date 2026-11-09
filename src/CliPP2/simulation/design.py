@@ -32,7 +32,7 @@ def seed_for(master, phase, family, history, acquisition=0):
 def workflow_config(*, device="cpu", threads=1):
     """One declared workflow; scientific performance does not select settings."""
     return WorkflowConfig(fit=FitConfig(device=device, cpu_threads=threads, max_clusters=10),
-        stage_two_max_clusters=20, stage_two_near_clonal_distance_max=.05)
+        stage_two_max_clusters=20)
 
 
 def resolve_config(contract):
@@ -87,7 +87,7 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
         raise ValueError("Declared replicates exceed the supplied study design")
     replicate_roster = dict(unit="variant" if cohort else "family", main=list(range(1, main+1)),
         development=list(range(1, development+1)))
-    return dict(schema="clipp2.simulation-contract.v6", study_version=STUDY_VERSION,
+    return dict(schema="clipp2.simulation-contract.v7", study_version=STUDY_VERSION,
         implementation_version=__version__,
         run_manifest_id=validate_run_manifest_id(run_manifest_id if run_manifest_id is not None
                                                else os.environ.get("CLIPP2_RUN_MANIFEST_ID")),
@@ -103,7 +103,7 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
             population="all declared development histories and acquisitions",
             failures="retained in planned-population accounting; no fabricated estimates"),
         base_workflow_config=asdict(workflow_config()),
-        evaluation=dict(record_schema="clipp2.simulation.evaluation.v4",
+        evaluation=dict(record_schema="clipp2.simulation.evaluation.v5",
             primary="data-supported MAP sampled-region clonality, detailed membership and CCF error",
             reference_match_atol=reference_match_atol, reference_distance="l2",
             reference_matching="full-vector unnormalized L2 at declared tolerance; maximum valid cardinality then minimum valid distance then lexical tie break",
@@ -121,7 +121,7 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
 
 def _replicates(contract):
     roster = contract["replicate_roster"]
-    if contract.get("schema") == "clipp2.simulation-contract.v6" and set(roster) != {"unit", "main", "development"}:
+    if contract.get("schema") == "clipp2.simulation-contract.v7" and set(roster) != {"unit", "main", "development"}:
         raise ValueError("Protocol 2.3 requires one main and one development replicate block")
     maximums = (10, 2) if contract.get("cohort") else (50, 10)
     if roster.get("unit") != ("variant" if contract.get("cohort") else "family"):

@@ -348,7 +348,7 @@ def qualify_cohort(settings_path, outdir, *, native_pilot=True, timeout_seconds=
                 if row["variant_id"] == variant and (materialize or row["split"] == "development" and row["replicate"] == 1)),
             roundtrips_passed=sum(row["status"] == "passed" for row in a),
             native_pilot_status=p["status"] if p else "not_run"))
-    summary = dict(schema="clipp2.cohort-qualification.v3", study_version="1.2", protocol_version=PROTOCOL_VERSION,
+    summary = dict(schema="clipp2.cohort-qualification.v4", study_version="1.2", protocol_version=PROTOCOL_VERSION,
         cohort_content_id=cohort.content_id,
         source_cohort_protocol_version=cohort.settings["workflow_protocol"],
         status="validation_passed" if valid else "validation_failed", settings_path=cohort.path,
