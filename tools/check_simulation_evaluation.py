@@ -67,8 +67,8 @@ def _membership_fixture():
     return history, catalog, result
 
 
-def _protocol23_map_checks():
-    """Authoritative MAP labels, explicit evidence states, and fixed denominators."""
+def _routed_map_fixture():
+    """Frozen preceding Protocol 2.3 policy; no changed reference construction."""
     h, catalog, paired = _membership_fixture()
     paired.update(protocol_version="2.3", schema="clipp2.paired-experiment.v4",
                   config=dict(stage_two_near_clonal_distance_max=.05))
@@ -100,10 +100,17 @@ def _protocol23_map_checks():
             map_cluster_label=0, map_tied_labels=[0, 1, 2, 3], map_unique=False, evidence_status="prior_only",
             status="prior_only", probabilities=[.25]*4, log_scores=[-np.log(4)]*4,
             target_reason="stage1_reference_recheck"))
+    return h, catalog, paired
+
+
+def _protocol23_map_checks():
+    """Historical routed MAP labels and population denominators stay frozen."""
+    h, catalog, paired = _routed_map_fixture()
     report = evaluate(h, catalog, paired, evaluation_config=dict(reference_match_atol=.02),
                       truth_qualification="verified_history_binding")
     assert report["schema"] == "clipp2.simulation.evaluation.v4"
-    assert report["evaluation_definition"] == evaluation_definition(dict(reference_match_atol=.02))
+    assert content_hash(report) == "39b02730a48ecd93e1dce30a8ce53ee5f2bb62457ab02fd5078e97ec8546f98e"
+    assert report["evaluation_definition"] == legacy_evaluation_definition(4, dict(reference_match_atol=.02))
     def metric(value, name, view=""):
         return next(row for row in value["metrics"] if row["arm"] == "C3" and row["name"] == name
                     and row["view"] == view and row["stratum"] == "all")
@@ -158,6 +165,52 @@ def _protocol23_map_checks():
                 prior_only_incompatible_failure_distinct=True, both_origins_and_unchanged_F=True)
 
 
+def _all_target_checks():
+    """Current schema reassigns every fitted member, without historical routing."""
+    h, catalog, paired = _routed_map_fixture()
+    paired.update(schema="clipp2.paired-experiment.v5", config=dict(fit=dict(max_major_cn=None)))
+    catalog.max_major_cn = None
+    for arm in paired["arms"].values():
+        if arm["assignment"]["schema"] == "clipp2.assignment.result.v6":
+            continue
+        prototype = deepcopy(arm["assignment"]["assignments"][0])
+        for mutation in arm["non_targets"]:
+            label = arm["combined_labels"][mutation]
+            probabilities = np.full(4, .2)
+            probabilities[label] = .4
+            arm["assignment"]["assignments"].append(dict(prototype, mutation_id=mutation,
+                final_assignment_label=label, map_cluster_label=label, map_tied_labels=[label],
+                probabilities=probabilities.tolist(), log_scores=np.log(probabilities).tolist(),
+                target_reason="stage2_recheck"))
+        arm.update(targets=tuple(arm["combined_labels"]), non_targets=())
+        arm["assignment"]["schema"] = "clipp2.assignment.result.v6"
+        for row in arm["assignment"]["assignments"]:
+            row.update(map_label=row["map_cluster_label"], map_set=row["map_tied_labels"], posterior_defined=True,
+                target_reason=row["target_reason"].replace("stage2_near_clonal_recheck", "stage2_recheck"))
+    value = evaluate(h, catalog, paired, truth_qualification="verified_history_binding")
+    assert value["schema"] == "clipp2.simulation.evaluation.v5"
+    assert value["evaluation_definition"] == evaluation_definition()
+    metrics = {(r["name"], r["view"]): r for r in value["metrics"] if r["arm"] == "C3" and r["stratum"] == "all"}
+    assert metrics["data_supported_map_coverage", ""]["denominator"] == 14
+    assert metrics["data_supported_map_coverage", ""]["value"] == 1
+    assert metrics["data_supported_map_coverage", "unchanged_F"]["denominator"] == 0
+    assert metrics["data_supported_map_coverage", "stage2_recheck"]["denominator"] == 9
+    assert not any("near_clonal" in r["name"] or "false_merge" in r["name"] for r in value["metrics"])
+    rows = [r for r in value["mutations"] if r["arm"] == "C3"]
+    assert all(r["role"] == "target" for r in rows)
+    assert all(r["posterior_defined"] and r["map_label"] in r["map_set"] for r in rows)
+    invalid = deepcopy(paired)
+    invalid["arms"]["C"]["non_targets"] = ("t_correct",)
+    try:
+        evaluate(h, catalog, invalid)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Current all-target schema accepted an unchanged population")
+    return dict(status="passed", F_empty=True, every_fitted_member_reassessed=True,
+                unrestricted_catalog_supported=True, explicit_MAP_fields=True)
+
+
 def _frozen_historical_checks():
     """Old cached science and decisions survive the new default definition."""
     from contextlib import ExitStack
@@ -167,6 +220,7 @@ def _frozen_historical_checks():
     from CliPP2.simulation.reporting import reevaluate_cell
     assert content_hash(legacy_evaluation_definition(2)) == "728032ef78442bb44387f97d58e409e5415831d2065615d3956757a83e92922e"
     assert content_hash(legacy_evaluation_definition(3)) == "be475aebc3de6b83c9345b11f6f3aac2673efa15f1b4fcb279f69ed4bf0d5440"
+    assert content_hash(legacy_evaluation_definition(4)) == "a15483be43fd5fa024331e6711f22b63f6b13e0e0cc6594374e151af1d44eb6a"
     changed = legacy_evaluation_definition(3)
     changed["population_scopes"]["planned_population"].clear()
     assert legacy_evaluation_definition(3)["population_scopes"]["planned_population"]
@@ -737,7 +791,7 @@ def run_checks():
                   full_vector_l2_and_explicit_legacy_linf=True, incompatible_definition_aggregation_rejected=True)
     report.update(_planned_population_checks(), detailed_four_state_transitions_by_origin=True,
                   partial_failure_accounting=_partial_failure_checks(), protocol23_MAP=_protocol23_map_checks(),
-                  historical_definitions=_frozen_historical_checks())
+                  historical_definitions=_frozen_historical_checks(), all_target_MAP=_all_target_checks())
     json.dumps(json_safe(report), allow_nan=False)
     return json_safe(report)
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -173,6 +174,14 @@ def _catalog_evidence(attempt, paired):
     except FileNotFoundError:
         # Earlier minimal evidence can still prove an exact current representation.
         catalog = load_original_catalog(attempt / "input_catalog.tsv")
+        if (identity.get("original_catalog_identity") != content_hash(catalog.to_dict())
+                and paired.get("schema") != "clipp2.paired-experiment.v5"):
+            # The preceding formats had an explicit/default cutoff of ten. This
+            # is only a candidate historical representation; its full original
+            # identity must match, so no population policy is silently changed.
+            cutoff = paired.get("config", {}).get("fit", {}).get("max_major_cn", 10)
+            if cutoff is not None:
+                catalog = replace(load_original_catalog(attempt / "input_catalog.tsv", max_major_cn=cutoff), _schema_version=4)
         if identity.get("original_catalog_identity") != content_hash(catalog.to_dict()):
             raise FileNotFoundError("Original catalog representation is required to verify the manifest; "
                                     "restore original_catalog.json or use the pinned producing revision") from None
@@ -182,7 +191,7 @@ def _catalog_evidence(attempt, paired):
     if identity.get("original_catalog_identity") != content_hash(retained):
         raise ValueError("Original catalog payload differs from its retained manifest identity")
     schema = retained.get("schema")
-    if schema not in ("clipp2.original-catalog.v3", "clipp2.original-catalog.v4"):
+    if schema not in ("clipp2.original-catalog.v3", "clipp2.original-catalog.v4", "clipp2.original-catalog.v5"):
         raise UnsupportedArtifactFormat(schema, "catalog serialization is not supported")
     payload = {key: value for key, value in retained.items() if key != "content_hash"}
     if retained.get("content_hash") != _catalog_payload_hash(payload):
@@ -220,6 +229,8 @@ def _catalog_evidence(attempt, paired):
     working["content_hash"] = _catalog_payload_hash(working)
     catalog = OriginalCatalog.from_dict(working)
     parsed = load_original_catalog(attempt / "input_catalog.tsv", max_major_cn=catalog.max_major_cn)
+    if catalog.to_dict()["schema"] == "clipp2.original-catalog.v4":
+        parsed = replace(parsed, _schema_version=4)
     if content_hash(parsed.to_dict()) != content_hash(catalog.to_dict()):
         raise ValueError("Retained catalog science, keys, masks or provenance differ from the preserved input")
     validate_run_manifest(manifest, tumor_id=catalog.tumor_id, biological_identity=catalog.biological_identity)
@@ -266,7 +277,7 @@ def _load_evidence(root, cell):
     paired = _configuration(attempt)
     if not isinstance(paired, Mapping):
         raise TypeError("Preserved paired inference must be a JSON object")
-    if paired.get("schema", "clipp2.paired-experiment.v3") not in ("clipp2.paired-experiment.v3", "clipp2.paired-experiment.v4"):
+    if paired.get("schema", "clipp2.paired-experiment.v3") not in ("clipp2.paired-experiment.v3", "clipp2.paired-experiment.v4", "clipp2.paired-experiment.v5"):
         raise UnsupportedArtifactFormat(paired.get("schema"), "paired inference format is not supported")
     catalog, compatibility = _catalog_evidence(attempt, paired)
     if job.get("cohort_content_id") is not None and dict(catalog.metadata).get("cohort_content_id") != job["cohort_content_id"]:
@@ -300,13 +311,13 @@ def _load_evidence(root, cell):
 def unavailable_evaluation(job, status, *, evaluation_config, error=None,
                            execution_state=None, evidence_state="missing_truth_evidence",
                            arm_applicability=None, original_evaluable_count=None,
-                           evaluation_schema="clipp2.simulation.evaluation.v4"):
+                           evaluation_schema="clipp2.simulation.evaluation.v5"):
     """Unavailable derived evidence receives no invented scientific decisions."""
     from .evaluation import evaluation_definition, legacy_evaluation_definition, normalize_evaluation_config, metric_truth_independent
-    if evaluation_schema not in ("clipp2.simulation.evaluation.v3", "clipp2.simulation.evaluation.v4"):
+    if evaluation_schema not in ("clipp2.simulation.evaluation.v3", "clipp2.simulation.evaluation.v4", "clipp2.simulation.evaluation.v5"):
         raise ValueError("Unavailable evidence requires a supported evaluation interpretation")
-    definition = (evaluation_definition(evaluation_config) if evaluation_schema.endswith(".v4")
-                  else legacy_evaluation_definition(3, evaluation_config))
+    definition = (evaluation_definition(evaluation_config) if evaluation_schema.endswith(".v5")
+                  else legacy_evaluation_definition(evaluation_schema, evaluation_config))
     arms = ({row["arm"]: row for row in arm_applicability} if isinstance(arm_applicability, (list, tuple))
             else dict(arm_applicability or {}))
     if original_evaluable_count is not None and (type(original_evaluable_count) is not int or original_evaluable_count < 0):
@@ -344,7 +355,7 @@ def unavailable_evaluation(job, status, *, evaluation_config, error=None,
                                   scientific_rejection=bool(state.get("scientific_rejection")),
                                   upstream_failure=bool(state.get("upstream_failure")),
                                   decision_population=state.get("decision_population")))
-    if evaluation_schema.endswith(".v4"):
+    if evaluation_schema.endswith((".v4", ".v5")):
         metrics = [row for row in metrics if row["name"] != "correct_per_original_evaluable"]
         for row in metrics:
             if row["name"] == "binary_correct_per_original_evaluable":
@@ -400,7 +411,7 @@ def _retained_memberships(arm, original_ids):
         return combined, fixed, None
     rows = assignment["assignments"]
     label_key = ("final_assignment_label" if assignment.get("protocol_version") == "2.3"
-                 or assignment.get("schema") == "clipp2.assignment.result.v5" else "accepted_label")
+                 or assignment.get("schema") in ("clipp2.assignment.result.v5", "clipp2.assignment.result.v6") else "accepted_label")
     if (any(not isinstance(row, Mapping) or "mutation_id" not in row or label_key not in row for row in rows)
             or len(rows) != len(selected) or {row["mutation_id"] for row in rows} != selected
             or any(row[label_key] is not None and (type(row[label_key]) is not int
@@ -519,7 +530,7 @@ def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missi
         pass  # Missing or inconsistent evidence cannot prove an empty population.
     value = unavailable_evaluation(job, "unavailable_derived_evidence", evaluation_config=evaluation_config,
         execution_state=cell.get("status"), evidence_state=evidence_state, arm_applicability=arms,
-        original_evaluable_count=count, error=error, evaluation_schema=evaluation_schema or
+        original_evaluable_count=count, error=error, evaluation_schema=evaluation_schema or cell.get("evaluation_schema") or
         ("clipp2.simulation.evaluation.v4" if cell.get("protocol_version") == "2.3" else "clipp2.simulation.evaluation.v3"))
     if region_count is not None:
         value["region_count"] = region_count

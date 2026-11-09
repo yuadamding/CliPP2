@@ -1,6 +1,6 @@
 # Simulation evaluation definitions
 
-Implementation 2.0.0 uses scientific Protocol 2.3 and evaluation/definition v4.
+Implementation 2.0.0 uses scientific Protocol 2.3 and evaluation/definition v5.
 The evaluator consumes retained final labels; it does not fit, reassign, apply
 confidence or residual cutoffs, or select a development threshold. New contracts
 declare `evaluation.record_schema` explicitly. Package version is not a substitute
@@ -9,7 +9,7 @@ for that scientific identity.
 ## Protocol 2.3 MAP endpoints
 
 An informative target with a defined posterior has
-`final_assignment_label = map_cluster_label`. Exact ties retain their complete tie
+`final_assignment_label = map_label`. Exact ties retain their complete tie
 set and use the lowest public label as representative. Diagnostics do not veto
 this result. An eligible target with no informative reads is `prior_only`: its
 uniform prior and deterministic MAP representative are available, but its final
@@ -27,11 +27,13 @@ The new metrics have explicit populations:
 | `map_ccf_rmse` | Full requested-region CCF error at the final reference | Returned labels with known truth |
 | `prior_only_fraction` / `model_incompatible_fraction` / `excluded_fraction` | Explicit evidence-state counts | All members in the view, including no-read members |
 | `computation_failure_count` / `diagnostic_failure_count` | Recorded failures | Counts, not error rates |
-| `binary_map_correct_per_original_evaluable` | Correct unchanged F plus correct observed MAP targets | Original informative population |
+| `binary_map_correct_per_original_evaluable` | Correct observed MAP targets (all fitted members) | Original informative population |
 
-Views include targets (`view=""`), `whole_original`, `unchanged_F`,
-`stage1_reference_recheck`, and `stage2_near_clonal_recheck`. Unchanged F contributes
-its native hard memberships; those counts are not Stage 3 posterior estimates.
+Current views include targets (`view=""`), `whole_original`,
+`stage1_reference_recheck` and `stage2_recheck`. Every fitted mutation is a target;
+`unchanged_F` is explicitly empty. Historical routed evaluations retain their
+nonempty F and original `stage2_near_clonal_recheck` origin. Their native hard
+memberships are not retroactively interpreted as Stage 3 posterior estimates.
 Missing labels do not shrink the error denominators. Coverage and evidence-state
 counts expose the absence of an estimate, rather than counting it as correct.
 Binary correctness does not imply the correct subclone: a wrong nonclonal
@@ -51,12 +53,16 @@ cutoff. No selective-error threshold curves are constructed for Protocol 2.3.
 
 The provisional Stage 1 source can be subclonal. Evaluation retains its native
 centers, source purity, the learned reference geometry, cap exclusion and
-whole-original performance. Available native MAP contributors can lower the cap;
+whole-original performance. Upper endpoints of available native MAP sets can lower the cap;
 truth replacement audits use the exact contributing IDs without requalification.
 
 ## Historical Protocol 2.2 endpoints
 
-Historical evaluation v2/v3 definitions are frozen independently of v4. Their
+Historical evaluation v2/v3 definitions and routed Protocol 2.3 evaluation v4
+are frozen independently of current v5. The latter preserves its original
+reference inventory, target scope, metrics and decisions. Current v5 records
+`analysis_population`, including the actual CN policy, eligibility and admitted
+high-CN observations, separately from biological truth. Their
 `correct_resolution` and `selective_error` fields remain binary clonality
 endpoints, with their original `binary_*` aliases and accepted-only selective
 error denominator. Historical quality predicates and threshold curves retain
@@ -181,8 +187,8 @@ explicitly named `legacy_multiclass_transition_fraction_unmapped_as_error`.
 ## Geometry and historical quality availability
 
 New declared assessments use full requested-region, unnormalized L2 distance
-`||truth-center - candidate-center||2 <= tolerance`. Production near-clonal routing
-retains its separate strict L2 rule. No reporting tolerance is implied by routing.
+`||truth-center - candidate-center||2 <= tolerance`. The current production workflow has no geometric routing cutoff. This optional
+reporting tolerance changes neither reference inventory nor assignment.
 A new evaluation configuration is:
 
 ```json
@@ -277,7 +283,8 @@ Missing records remain unknown under that definition, including historical v1
 L∞ geometry, its top-level matching tolerance, and its original matching policy.
 Even an empty report with no recoverable complete roster retains the historical
 definition and unavailable planned estimates. An explicit new evaluation
-configuration derives v3 for retained Protocol 2.2 inference and v4 for Protocol 2.3,
+configuration derives v3 for retained Protocol 2.2 inference, v4 for routed
+Protocol 2.3 paired-v4 inference, and v5 for reference-preserving paired-v5 inference,
 including when usable records are absent. Changing inference policy requires a
 separate assignment derivative; offline reporting never changes old decisions.
 

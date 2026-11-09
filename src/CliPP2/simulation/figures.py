@@ -109,9 +109,11 @@ def _heatmaps(evaluations, output, paths):
 
 def _paired(evaluations, aggregate_report, output, paths):
     correctness = ("binary_map_correct_per_original_evaluable" if
-        aggregate_report.get("evaluation_definition", {}).get("schema", "").endswith(".v4") else "correct_per_original_evaluable")
+        aggregate_report.get("evaluation_definition", {}).get("schema", "").endswith((".v4", ".v5")) else "correct_per_original_evaluable")
+    all_targets = aggregate_report.get("evaluation_definition", {}).get("schema", "").endswith(".v5")
     settings = (("ari", "common_native_remainder", "B", "C", "Native partition ARI"),
-                ("false_merge_fraction", "", "B", "C", "False clonal merges"),
+                ("reference_consolidation_count" if all_targets else "false_merge_fraction", "", "B", "C",
+                 "Exact duplicate reference consolidation" if all_targets else "False clonal merges"),
                 ("ccf_rmse", "constructed_reference", "B", "C", "Constructed-reference CCF RMSE"),
                 (correctness, "", "B", "B3", "Uncapped reassessment"),
                 (correctness, "", "C", "C3", "Capped reassessment"),
@@ -139,7 +141,7 @@ def _paired(evaluations, aggregate_report, output, paths):
 
 
 def _decisions(evaluations, aggregate_report, output, paths):
-    if aggregate_report.get("evaluation_definition", {}).get("schema", "").endswith(".v4"):
+    if aggregate_report.get("evaluation_definition", {}).get("schema", "").endswith((".v4", ".v5")):
         return _map_decisions(evaluations, output, paths)
     figure, grid = plt.subplots(2, 3, figsize=(16, 9))
     axes = grid.ravel()
@@ -222,10 +224,12 @@ def _decisions(evaluations, aggregate_report, output, paths):
 def _map_decisions(evaluations, output, paths):
     """MAP performance and evidence states, without selective-acceptance curves."""
     figure, axes = plt.subplots(2, 3, figsize=(16, 9))
+    all_targets = any(e.get("schema") == "clipp2.simulation.evaluation.v5" for e in evaluations)
     panels = (("data_supported_map_coverage", "", "Targets with data-supported MAP / informative targets"),
               ("binary_map_error", "whole_original", "Binary MAP errors / original informative population"),
               ("detailed_map_error", "whole_original", "Wrong mapped subclones / original informative population"),
-              ("map_ccf_rmse", "unchanged_F", "Unchanged F: native hard-label CCF RMSE"),
+              ("map_ccf_rmse", "whole_original" if all_targets else "unchanged_F",
+               "Whole fitted population: MAP CCF RMSE" if all_targets else "Unchanged F: native hard-label CCF RMSE"),
               ("prior_only_fraction", "", "Prior-only / all targets"),
               ("model_incompatible_fraction", "", "Model-incompatible / all targets"))
     for ax, (name, view, title) in zip(axes.flat, panels):
@@ -236,7 +240,8 @@ def _map_decisions(evaluations, output, paths):
         if not ax.collections:
             _unavailable(ax)
         ax.set(title=title, xticks=[0, 1], xticklabels=["B3", "C3"])
-    figure.suptitle("4 · MAP estimates, unchanged native memberships and explicit evidence states", y=1.02)
+    figure.suptitle("4 · MAP estimates for every fitted mutation and explicit evidence states" if all_targets else
+                   "4 · MAP estimates, unchanged native memberships and explicit evidence states", y=1.02)
     _save(figure, output, "04_decisions_transitions", paths)
 
 
@@ -311,7 +316,7 @@ def _sensitivity_covariate(evaluation, key):
 
 
 def _sensitivities(evaluations, output, paths):
-    map_policy = any(e.get("schema") == "clipp2.simulation.evaluation.v4" for e in evaluations)
+    map_policy = any(e.get("schema") in ("clipp2.simulation.evaluation.v4", "clipp2.simulation.evaluation.v5") for e in evaluations)
     correctness = "binary_map_correct_per_original_evaluable" if map_policy else "correct_per_original_evaluable"
     figure, axes = plt.subplots(2, 3, figsize=(13, 8))
     definitions = (("mean_depth", "Mean observed depth"), ("region_count", "Requested regions"),
@@ -334,7 +339,7 @@ def _sensitivities(evaluations, output, paths):
 
 
 def _population_accounting(evaluations, summary, output, paths):
-    map_policy = summary.get("evaluation_definition", {}).get("schema", "").endswith(".v4")
+    map_policy = summary.get("evaluation_definition", {}).get("schema", "").endswith((".v4", ".v5"))
     correctness = "binary_map_correct_per_original_evaluable" if map_policy else "binary_correct_per_original_evaluable"
     figure, axes = plt.subplots(2, 2, figsize=(14, 10))
     arms = ("B", "C", "B3", "C3")
@@ -371,7 +376,8 @@ def _population_accounting(evaluations, summary, output, paths):
     ax.tick_params(axis="x", labelsize=7)
     ax.legend(fontsize=8)
     source_origin = "stage1_reference_recheck" if map_policy else "stage1_clonal_recheck"
-    for ax, origin in zip(axes[1], (source_origin, "stage2_near_clonal_recheck")):
+    second_origin = "stage2_recheck" if summary.get("evaluation_definition", {}).get("schema", "").endswith(".v5") else "stage2_near_clonal_recheck"
+    for ax, origin in zip(axes[1], (source_origin, second_origin)):
         matrix = np.zeros((4, 4), int)
         observed = False
         for evaluation in evaluations:
