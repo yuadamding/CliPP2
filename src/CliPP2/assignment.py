@@ -75,11 +75,18 @@ class AssignmentReference(ImmutableArrayRecord):
         available = availability == "available"
         count, depth = self.source_informative_count, self.source_informative_depth
         mean, maximum = self.source_mean_profile_deviance, self.source_maximum_profile_deviance
+        # n-1 additions and one division have relative error at most gamma_n.
+        # Missing counts (or n*u >= 1) supply no usable accumulation bound.
+        # Raw measurements are retained, including a legitimately rounded mean > max.
+        nu = np.where(np.isfinite(count) & (count > 0), count*np.finfo(float).eps/2, 0.)
+        gamma = np.divide(nu, 1-nu, out=np.zeros_like(nu), where=(nu > 0) & (nu < 1))
+        gamma = np.where(gamma > 0, np.nextafter(gamma, np.inf), 0.)
+        exceeds_maximum = (mean > maximum) & ~np.isclose(mean, maximum, rtol=gamma, atol=0.)
         if (np.any(available & (np.isnan(count) | np.isnan(depth)))
                 or np.any(available & (count > 0) & (np.isnan(mean) | np.isnan(maximum)))
                 or np.any(available & (count == 0) & (~np.isnan(mean) | ~np.isnan(maximum)))
                 or np.any(np.isfinite(count) & np.isfinite(depth) & (depth < count))
-                or np.any(~np.isnan(mean) & ~np.isnan(maximum) & (mean > maximum))):
+                or np.any(exceeds_maximum)):
             raise ValueError("Available source diagnostics must preserve counts and empty-domain measurements")
         sources = tuple(self.center_sources)
         if len(sources) != len(labels) or any(not isinstance(source, Mapping) or not source for source in sources):

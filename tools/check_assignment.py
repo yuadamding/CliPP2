@@ -247,12 +247,56 @@ def _accounting_checks(root):
                 zero_occupancy_reference_retained=True, tampered_counts_rejected=True)
 
 
+def _reference_measurement_roundoff_checks():
+    from CliPP2.screening import summarize_profile_deviance
+
+    def reference(mean, maximum, count=8):
+        mean, maximum = np.atleast_2d(mean), np.atleast_2d(maximum)
+        shape = mean.shape
+        counts = np.full(shape, np.nan if count is None else count)
+        return AssignmentReference((0,), tuple(f"r{i}" for i in range(shape[1])), np.ones(shape),
+            source_informative_count=counts, source_informative_depth=10*counts,
+            source_mean_profile_deviance=mean, source_maximum_profile_deviance=maximum,
+            diagnostic_availability=np.full(shape, "missing" if count is None else "available"),
+            center_sources=({"center_source": "fixture"},))
+
+    cases = ((54.08761855079091, 54.08761855079089),
+             (4.768301621978633e-15, 4.768301621978632e-15), (0., 0.), (np.inf, np.inf))
+    for mean, maximum in cases:
+        original = reference(mean, maximum)
+        restored = AssignmentReference.from_dict(original.to_dict())
+        np.testing.assert_array_equal(restored.source_mean_profile_deviance, [[mean]])
+        np.testing.assert_array_equal(restored.source_maximum_profile_deviance, [[maximum]])
+        assert restored.to_dict() == original.to_dict()
+    for count in (8, 1500, 10000):
+        for maximum in (54.08761855079089, 4.768301621978632e-15):
+            values = np.full((count, 4), maximum)
+            measured = summarize_profile_deviance(values, np.ones(values.shape, bool), axis=0)
+            original = reference(measured["mean_profile_deviance"], measured["maximum_profile_deviance"], count)
+            restored = AssignmentReference.from_dict(original.to_dict())
+            np.testing.assert_array_equal(restored.source_mean_profile_deviance[0], measured["mean_profile_deviance"])
+            np.testing.assert_array_equal(restored.source_maximum_profile_deviance[0], measured["maximum_profile_deviance"])
+            nu = count*np.finfo(float).eps/2
+            gamma = nu/(1-nu)
+            reference(maximum*(1+gamma/2), maximum, count)
+            _reject(lambda: reference(maximum*(1+2*gamma), maximum, count))
+            _reject(lambda: reference(maximum*1.001, maximum, count))
+    reference(54., 54., None)
+    _reject(lambda: reference(np.nextafter(54., np.inf), 54., None))
+    _reject(lambda: reference(np.nextafter(0., 1.), 0.))
+    _reject(lambda: reference(np.inf, 54.))
+    return dict(ordinary_and_tiny_roundoff_admitted=True, raw_measurements_preserved=True,
+                actual_summaries_at_counts=[8, 1500, 10000], missing_count_has_no_roundoff_budget=True,
+                zero_and_infinite_boundaries=True, material_inconsistency_rejected=True)
+
+
 def run_checks(directory):
     from CliPP2.kernel.backend import NativeBackend
     from CliPP2.io.data import content_hash
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     assert PROTOCOL_VERSION == "2.3"
+    measurement_roundoff = _reference_measurement_roundoff_checks()
     numerical = _numerical_screen_checks(root)
     loss_only = _loss_only_checks(root)
     scalar_cn = _scalar_cn_checks(root)
@@ -457,7 +501,7 @@ def run_checks(directory):
         computational_failure_explicit=True, origin_order_batch_invariance=True,
         immutable_roundtrip_and_tampering=True, byte_identical_replay=True,
         numerical_deviance=numerical, loss_only_scoring=loss_only, scalar_cn=scalar_cn,
-        whole_population_accounting=accounting)
+        whole_population_accounting=accounting, reference_measurement_roundoff=measurement_roundoff)
 
 
 if __name__ == "__main__":
