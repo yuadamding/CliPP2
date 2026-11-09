@@ -4,7 +4,8 @@ Protocol 2.3 reports statistical estimates whenever they are computable. Confide
 fit discrepancy, coverage and exact ties are measurements, not assignment vetoes.
 The existing binomial likelihood, integer multiplicity model, free-center fitting,
 candidate search, BIC and numerical verification remain unchanged. Package and
-scientific protocol versions are separate identities.
+scientific protocol versions are separate identities: this release is package
+`2.0.0` and scientific protocol `2.3`.
 
 ## Scientific specification
 
@@ -113,3 +114,20 @@ Historical v2/v3 evaluation definitions and inference decisions remain frozen.
 The Protocol 2.2 document is historical. Native membership audits and independent
 numerical verification remain mandatory; neither establishes global optimality or
 biological accuracy. CUDA qualification and native cleanup remain deferred.
+
+## Run and verify
+
+Install one wheel or editable package and choose new output directories:
+
+```sh
+clipp2 workflow --plan examples/workflow_protocol23.plan.json --output-dir results/workflow23
+clipp2 assign --bundle results/workflow23/assignment_bundle.json --output-dir results/workflow23-replay
+python tools/check_research.py --groups workflow biology evaluation study publication --outdir results/protocol23-checks
+python tools/qualify_workflow.py --device cpu --replicates 3 --output results/protocol23-qualification.json
+```
+
+The qualification command reports performance without threshold selection. Its
+optional `--reference-match-atol` defines offline binary reference correspondence;
+continuous center error is reported without it. `--compare-stage-two-support`
+adds a separate bounded full/capped-support experiment, never a production fit.
+Native CUDA changes remain deferred; opt-in CUDA preflight is not GPU execution.

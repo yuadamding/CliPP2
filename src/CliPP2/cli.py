@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--run-manifest-id", help="External execution record identifier; no source scan is performed.")
     fit.add_argument("--version", action="version", version=__version__)
     workflow = subparsers.add_parser("workflow", allow_abbrev=False,
-                                    help="Run Protocol 2.2 from an explicit v3 JSON plan.")
+                                    help="Run Protocol 2.3 from an explicit v4 JSON plan.")
     workflow.add_argument("--plan", required=True)
     workflow.add_argument("--output-dir", required=True)
     assign = subparsers.add_parser("assign", allow_abbrev=False,
@@ -80,9 +80,9 @@ def main(argv: list[str] | None = None) -> None:
         from .workflow import run_workflow
         plan_path = Path(args.plan).resolve()
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        if (plan.get("schema") != "clipp2.workflow.plan.v3"
+        if (plan.get("schema") != "clipp2.workflow.plan.v4"
                 or plan.get("protocol_version") != PROTOCOL_VERSION):
-            raise ValueError("Workflow requires plan.v3 with protocol_version='2.2'; earlier contracts require a new run")
+            raise ValueError("Workflow requires plan.v4 with protocol_version='2.3'; earlier contracts require a new run")
         extra = set(plan) - {"schema", "protocol_version", "input_path", "workflow_config", "accepted_stage_one", "accepted_stage_two", "run_build_manifest", "run_manifest_id"}
         if extra:
             raise ValueError(f"Unknown workflow plan fields: {sorted(extra)}")

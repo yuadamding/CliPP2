@@ -5,11 +5,18 @@ across tumor regions. It estimates cancer cell fractions (CCFs) and integer
 multiplicities under **one allele-specific tumor copy-number state per
 mutation–region observation**. Mixed tumor copy-number states are unsupported.
 
-Stage 1 fits all eligible mutations. Stage 2 fits the remainder with
-contributor-derived multiplicity caps. Stage 3 restores original multiplicity
-support and reassigns selected mutations against frozen references. Cluster
-limits default to **10 for Stage 1 and 20 for Stage 2**; near-clonal routing uses
-strict, unnormalized L2 distance to the all-one vector **less than 0.05**.
+Protocol **2.3** selects the Stage 1 group nearest all ones as a provisional
+reference source. Stage 2 fits the remainder with segment caps from the minimum
+available informative MAP multiplicity call. Stage 3 restores original support
+and returns probabilities and deterministic MAP labels against frozen references.
+Confidence, exact ties, coverage and fit discrepancy are diagnostics, not vetoes.
+
+Cluster limits default to **10 for Stage 1 and 20 for Stage 2**. Strict,
+unnormalized L2 distance to all ones **less than 0.05** defines Stage 2 near-clonal
+routing only. Stage 1 source selection has no proximity gate: the selected source
+can be subclonal, and excluding it can remove a useful reference. The broader set
+of cap contributors can lower Stage 2 caps. These consequences are measured by
+evaluation. Package version **2.0.0** and protocol version **2.3** are separate.
 
 ## Install and run
 
@@ -17,14 +24,16 @@ Fitting requires Python 3.10+ and a C++17 compiler. CPU is the default backend:
 
 ```sh
 python -m pip install .
-clipp2 workflow --plan examples/workflow_protocol22.plan.json --output-dir results/workflow22
+clipp2 workflow --plan examples/workflow_protocol23.plan.json --output-dir results/workflow23
 ```
 
-The plan's confidence and residual thresholds are **fixture settings, not
-calibrated biological recommendations**. Outputs include accepted Stage 1/2 fits,
-segment caps, reference vectors, assignment evidence, and
-`all_original_mutations.tsv`, which retains unresolved and unchanged mutations.
-Use a new output directory for each run.
+The example plan declares one workflow configuration without acceptance thresholds.
+Outputs include native Stage 1/2 fits, provisional-source provenance, segment caps,
+reference vectors, complete probability vectors, MAP tie sets and raw diagnostics.
+`all_original_mutations.tsv` retains final membership and unchanged or unassigned
+mutations. Eligible targets without informative reads have a `prior_only` vector
+and no data-supported final label; all-impossible candidates instead yield
+`model_incompatible` with no posterior. Use a new output directory for each run.
 
 | Operation | Command |
 | --- | --- |
@@ -80,10 +89,13 @@ python tools/check_research.py --groups workflow biology evaluation study public
 
 The full design has 60 cases, 720 physical histories, and 2,640 datasets.
 Development and main replicate counts are declared before execution; worker
-count does not change the experiment. The deterministic checks above are
-separate from calibration and full-cohort execution.
+count does not change the experiment. One fixed configuration runs throughout;
+development is descriptive and poor finite performance does not block the main
+study. Numerical verification remains mandatory. The deterministic checks above
+are separate from biological performance assessment and full-cohort execution.
 
-- [Workflow Protocol 2.2](docs/workflow_protocol_2_2.md)
+- [Workflow Protocol 2.3](docs/workflow_protocol_2_3.md)
+- [Historical Protocol 2.2](docs/workflow_protocol_2_2.md)
 - [Simulation design and execution](docs/simulation.md)
 - [Evaluation definitions](docs/simulation_evaluation.md)
 
