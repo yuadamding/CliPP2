@@ -331,7 +331,7 @@ def qualify_cohort(settings_path, outdir, *, native_pilot=True, timeout_seconds=
         if len(selected) != len(PILOT_VARIANTS):
             raise ValueError("Exact prescribed native pilot cells are missing or duplicated")
         tasks = [dict(root=str(root / "native_pilots"), job=job,
-            execution_configs=[asdict(workflow_config())], posterior_grid=[.95],
+            execution_configs=[asdict(workflow_config())],
             reference_match_atol=reference_match_atol) for job in selected]
         with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as executor:
             pilots = list(executor.map(lambda task: _pilot(task, timeout_seconds), tasks))
@@ -348,7 +348,7 @@ def qualify_cohort(settings_path, outdir, *, native_pilot=True, timeout_seconds=
                 if row["variant_id"] == variant and (materialize or row["split"] == "development" and row["replicate"] == 1)),
             roundtrips_passed=sum(row["status"] == "passed" for row in a),
             native_pilot_status=p["status"] if p else "not_run"))
-    summary = dict(schema="clipp2.cohort-qualification.v2", study_version="1.2", protocol_version=PROTOCOL_VERSION,
+    summary = dict(schema="clipp2.cohort-qualification.v3", study_version="1.2", protocol_version=PROTOCOL_VERSION,
         cohort_content_id=cohort.content_id,
         source_cohort_protocol_version=cohort.settings["workflow_protocol"],
         status="validation_passed" if valid else "validation_failed", settings_path=cohort.path,
@@ -370,7 +370,7 @@ def qualify_cohort(settings_path, outdir, *, native_pilot=True, timeout_seconds=
         limitations=["Generator qualification does not establish fitted biological accuracy.",
             "Native pilot timeouts are resource limitations, not scientific abstentions.",
             "The 600 main histories and their 2400 acquisitions have not been fitted by this command.",
-            "The pilot uses fixed illustrative research screens; thresholds are not calibrated here."])
+            "The pilot uses one declared Protocol 2.3 workflow; scientific performance is descriptive."])
     save_json(root / "qualification_summary.json", summary)
     (root / "qualification.html").write_text(_html(summary), encoding="utf-8")
     if materialize:

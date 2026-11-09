@@ -1,9 +1,9 @@
 # Exact phylogeny cohort simulation
 
 The `CliPP2.simulation` module implements the supplied Version 1.2 cohort and
-Protocol 2.2 paired experiment. The authoritative biological input still declares
+Protocol 2.3 paired experiment. The authoritative biological input still declares
 Protocol 2.1 and is preserved unchanged. New contracts record
-`source_cohort_protocol_version: "2.1"` and execution `protocol_version: "2.2"`.
+`source_cohort_protocol_version: "2.1"` and execution `protocol_version: "2.3"`.
 The authoritative input is
 `CliPP2_phylogeny_cohort_settings.json.gz` in the repository root. Its 60 variants
 span all 12 families: 600 main histories and 120 development histories, each with
@@ -47,7 +47,7 @@ python -m CliPP2.simulation qualify \
 python -m CliPP2.simulation run \
   --cohort-settings CliPP2_phylogeny_cohort_settings.json.gz \
   --main-replicates 10 --development-replicates 2 \
-  --workers 10 --outdir results/cohort-full-protocol2.2
+  --workers 10 --outdir results/cohort-protocol23
 ```
 
 `qualify` replays all 720 histories, checks canonical input roundtrips, and runs
@@ -63,10 +63,11 @@ each. Automatic timing/disk allocation and its `--profile`, `--budget-minutes`,
 and `--disk-budget-gib` switches have been removed. Bounded qualification pilots
 remain separate from cohort sizing. Optional panels remain disabled by default.
 
-A reduced declaration with one development replicate predeclares the second
-replicate as a conditional extension block. That block runs only if the first
-block has no qualifying setting. Main execution still requires a qualified,
-frozen development choice; thresholds and empirical error constraints are unchanged.
+Development uses the same single declared workflow configuration as main execution.
+A reduced declaration runs only its declared replicate block. Poor finite scientific
+performance does not select a different configuration, trigger an extension, or
+prevent main execution. Computational failures remain explicit in the planned
+population and can be retried as new attempts.
 
 For a long run, keep the installed environment unchanged. A non-editable wheel
 in a dedicated environment isolates worker imports from later repository edits.
@@ -84,12 +85,12 @@ python -m CliPP2.simulation report results/cohort-full
 ```
 
 `status` reads progress and in-flight operation journals without changing the
-study. Resume uses the existing contract, frozen roster, and selected thresholds;
+study. Resume uses the existing contract, frozen roster, and declared workflow configuration;
 new command-line settings do not replace them. Completed cells are reused.
 `--retry-failed` reruns execution failures as new attempts, retaining old
-attempts, completion records, and costs. It does not reopen a frozen development
-selection or reinterpret scientific rejection as a worker failure. Package
-version 1.1.0 now uses simulation contract v5 with explicit replicate blocks. It binds the entire parsed cohort
+attempts, completion records, and costs. Development retries append revised assessment receipts while preserving earlier
+receipts. There is no scientific-performance selection to reopen. Package
+version 2.0.0 uses simulation contract v6 with explicit replicate blocks. It binds the entire parsed cohort
 settings to a `cohort_content_id` in contracts, jobs, physical histories,
 acquisitions, and qualification receipts. Formatting and object-key order do not
 affect this identity; values and list order do. Resume verifies the frozen
@@ -97,20 +98,23 @@ settings at coordinator execution boundaries before reusing work. Each worker
 then reuses its validated immutable snapshot; a new process loads and verifies
 it again. Semantic random seeds remain unchanged.
 
-Existing v1–v4 study contracts retain their original frozen installations and outputs.
+Existing v1–v5 study contracts retain their original frozen installations and outputs.
 They are not migrated, and missing historical identity is not retrofitted. A new execution
-under 1.1.0 requires a new directory. Qualification has separate numbered
+under 2.0.0 requires a new directory. Qualification has separate numbered
 mechanism/cohort attempts; validated published summaries can complete an
 interrupted wrapper without rerunning controls. Interrupted costs without a
 summary remain explicitly unknown. Reports use new directories.
 
 New studies save `main_roster.json` before qualification and development. Its
 identity is independent of worker count. The contract also declares the development
-blocks. `threshold_development.json` binds the selected setting, resolved workflow
-configuration, study contract, and main roster; status reads that authoritative
-receipt. No redundant `study_plan.json` is written. Evaluation v3 uses its family/history/acquisition weights. A known
+population. `development_assessment.json` binds the fixed workflow configuration,
+study contract, main roster, every planned development cell, its retained evaluation
+paths and execution status. Explicit retries append numbered assessments. No
+`threshold_development.json` or redundant `study_plan.json` is created. Historical
+threshold-selection receipts remain readable without changing old decisions.
+Evaluation v4 uses family/history/acquisition weights. A known
 failure receives zero correct-decision credit only when a positive original
-denominator is established and no accepted decisions remain anywhere in that
+denominator is established and no data-supported final decisions remain anywhere in that
 endpoint, including unchanged members outside the Stage 3 target pool;
 missing or conflicting evidence produces an unknown score. An incomplete planned
 estimate is null, with available-case summaries labeled separately. Legacy studies
@@ -156,7 +160,7 @@ The tolerance above is an example reporting choice. Offline evaluation reads
 preserved truth, input catalogs, acquisition records, selected attempts, and
 paired results, including archives. Missing or conflicting evidence produces an
 unavailable derived record. It performs no fitting, assignment, generation, or
-threshold selection; frozen development choices and old inference decisions
+policy selection; historical development choices and old inference decisions
 remain intact. Without `--evaluation-config`, reports use cached evaluations.
 
 Generate every truth history and prescribed input catalog without fitting:
@@ -202,31 +206,35 @@ B3 and C3 each perform one frozen-reference assignment with fresh full original
 support. The one-configuration core maxima are **7,920 fits and 5,280 assignment
 passes**. Blocked or inapplicable branches may execute fewer operations.
 
-Stage 1 still requires strict clonal geometry, coverage and descriptive screens.
-In each Stage 2 arm, geometry alone routes every near-clonal group to reassessment,
-even when capped or full-support companion diagnostics fail. Other groups retain
-their native accepted centers. Reference quality records regional source coverage
-and native descriptive screening under that arm's accepted support. A target whose
-winning reference fails quality in an informative region is `unresolved_reference`;
-its full scores remain available, with no runner-up substitution or renormalization.
+Stage 1 selects the occupied group closest to all ones as a **provisional reference
+source**, retaining its actual native center and distance. Coverage, residuals, and
+proximity do not qualify that selection; it can be genuinely subclonal. All available
+informative positive-CCF native MAP multiplicity calls contribute to Stage 2 caps,
+including uncertain or tied integer representatives. The cap is their minimum,
+with original-support fallback when no informative call is available. This policy
+can lower caps and remove useful references; the evaluation measures those effects.
 
-Development evaluates contributor thresholds `.90, .95, .99` and posterior
-thresholds `.80, .90, .95, .99`. Posterior alternatives reuse computed probabilities;
-they do not trigger new native scoring and retain the same reference-quality gate.
-Validated A/B fits are reused across
-contributor settings: up to five fits per development dataset with successful
-reuse, or nine when reusable fits are unavailable. Development-grid overhead,
-qualification, and retry attempts have separate costs from the core maxima.
+In each Stage 2 arm, strict full-vector L2 distance below `.05` routes near-clonal
+groups to reassessment. Other groups retain native centers. Stage 3 uses the imposed
+all-one hypothesis and unchanged Stage 2 references with full original support,
+equal priors, and common observation masks. Every informative compatible target
+receives a deterministic MAP representative and the complete posterior. Reference
+coverage, ties, uncertainty, and residuals remain diagnostics without vetoing it.
+Eligible targets without informative reads retain an equal prior vector and no
+data-supported final label. All-impossible targets remain model-incompatible;
+they do not receive a fabricated uniform posterior.
 
-Clonal proximity is fixed at strict unnormalized `||phi - 1||₂ < .05`; cluster
-limits are 10 in Stage 1 and 20 in Stage 2. Descriptive research screens use
-pair deviance 9, mean deviance 4, and outlier fraction `.25`. They are not
-calibrated statistical tests or clinically validated cutoffs.
+Cluster limits remain 10 in Stage 1 and 20 in Stage 2. The `.05` parameter defines
+Stage 2 routing only. Development has no contributor/posterior grid, score-reuse
+selection loop, selective-error constraint, or performance-triggered extension.
+Native computational verification remains mandatory. The core maxima above
+exclude separate qualification, optional panels, and retry attempts.
 
 `source_to_reference.tsv` records the construction mapping. Authoritative final
 rows distinguish `baseline_reference_label` from `final_assignment_label`:
-accepted targets receive the accepted label, unresolved targets have no final
-label, and non-targets retain theirs. All reference labels remain, including zero
+observed targets receive `map_cluster_label`, while prior-only, incompatible,
+excluded, or failed targets have no data-supported final label. Non-targets retain
+their native labels with `membership_origin = stage2_unchanged`. All reference labels remain, including zero
 occupancy. Target origins and historical cap contributors that later reassign are
 reported separately; historical caps are never recomputed from reassessment.
 Both arms use the production transition and final-membership helpers. Scoring is
@@ -242,19 +250,16 @@ cannot recover several true groups. Cached historical L∞ results keep their
 original definition. See [evaluation definitions](simulation_evaluation.md) for
 detailed membership, target-specific availability, and offline re-evaluation. This reporting tolerance never changes fitting, routing or assignment.
 
-Threshold selection uses a fixed original evaluable population in S01, S02,
-and S07, with complete-truth separation under original support greater than two
-natural-log units. Missing fits and decisions retain their denominator and earn
-zero correct-decision credit. Families receive equal weight; all 12 families
-remain in the reporting population. A qualifying setting needs positive target
-acceptance and selective error at most `.05`. If none qualifies after the allowed
-development extension, execution stops before main fitting; continuing requires
-a separately declared research revision, not an automatic relaxation.
+All 12 families remain in the reporting population. Scientific performance is
+reported descriptively under the declared configuration. Failure and missingness
+accounting retain the frozen planned denominators; unknown results are not
+silently converted into successful or zero-error estimates.
 
 ## Retained outputs and Python API
 
 The output root retains `study_contract.json`, `cohort_settings.json`,
-`main_roster.json`, `threshold_development.json`, truth histories, and job manifests.
+`main_roster.json`, `development_assessment.json` and any numbered retry
+assessments, truth histories, and job manifests.
 Planned population counts come from the frozen roster and declared replicate blocks.
 Each cell retains input counts, acquisition metadata, evaluations, cost ledgers,
 and operation/failure records. Completed configuration directories containing
@@ -267,7 +272,7 @@ biological/numerical input identity. Optional supplied build metadata is retaine
 through `CLIPP2_RUN_BUILD_MANIFEST`; source directories are not inspected. Replay
 preserves the original producer link and adds the current execution link separately.
 No file-byte checksum is used. Declared truth/reference
-controls explicitly identify their fixed-coordinate quality intervention; they do
+controls explicitly identify their fixed-coordinate source intervention; they do
 not claim acceptance as learned native reference groups.
 
 ```python

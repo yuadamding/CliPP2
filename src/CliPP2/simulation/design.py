@@ -9,7 +9,7 @@ import platform
 
 import numpy as np
 
-from CliPP2.config import PROTOCOL_VERSION, AssignmentThresholds, DescriptiveScreen, FitConfig, WorkflowConfig
+from CliPP2.config import PROTOCOL_VERSION, FitConfig, WorkflowConfig
 from CliPP2._version import __version__
 from CliPP2.provenance import validate_run_manifest_id
 
@@ -21,8 +21,6 @@ ACQUISITIONS = (
     dict(id="A3", purity=.80, depth=100), dict(id="A4", purity=.80, depth=500),
 )
 PHASES = dict(pilot=1, development=2, main=3, controls=4, sensitivity=5)
-CONTRIBUTOR_GRID = (.90, .95, .99)
-POSTERIOR_GRID = (.80, .90, .95, .99)
 
 
 def seed_for(master, phase, family, history, acquisition=0):
@@ -31,26 +29,14 @@ def seed_for(master, phase, family, history, acquisition=0):
                                       int(history), int(acquisition)]).generate_state(1)[0])
 
 
-def workflow_config(contributor=.95, posterior=.95, *, device="cpu", threads=1):
-    # Research screens are deliberately explicit, descriptive, and not p-values.
-    # Numerical tolerance is fixed by qualification, never optimized on truth.
-    return WorkflowConfig(
-        assignment=AssignmentThresholds(posterior_min=posterior,
-            screen=DescriptiveScreen(9., 4., .25), tie_atol=1e-10,
-            multiplicity_tie_atol=1e-10, multiplicity_probability_min=.95),
-        contributor_probability_min=contributor, contributor_deviance_max=9.,
-        group_screen=DescriptiveScreen(9., 4., .25), contributor_tie_atol=1e-10,
-        fit=FitConfig(device=device, cpu_threads=threads, max_clusters=10),
-        stage_two_max_clusters=20, clonal_distance_max=.05,
-        min_informative_per_region=1, min_depth_per_region=1)
+def workflow_config(*, device="cpu", threads=1):
+    """One declared workflow; scientific performance does not select settings."""
+    return WorkflowConfig(fit=FitConfig(device=device, cpu_threads=threads, max_clusters=10),
+        stage_two_max_clusters=20, stage_two_near_clonal_distance_max=.05)
 
 
-def resolve_config(contract, contributor, posterior):
-    from copy import deepcopy
-    values = deepcopy(contract["base_workflow_config"])
-    values["contributor_probability_min"] = contributor
-    values["assignment"]["posterior_min"] = posterior
-    return WorkflowConfig.from_dict(values)
+def resolve_config(contract):
+    return WorkflowConfig.from_dict(contract["base_workflow_config"])
 
 
 def source_identity():
@@ -100,10 +86,8 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
     if main > main_max or development > development_max:
         raise ValueError("Declared replicates exceed the supplied study design")
     replicate_roster = dict(unit="variant" if cohort else "family", main=list(range(1, main+1)),
-        development=list(range(1, development+1)),
-        development_extension=list(range(development+1, min(2*development, development_max)+1)),
-        extension_rule="Execute the predeclared second block only if no initial development setting qualifies")
-    return dict(schema="clipp2.simulation-contract.v5", study_version=STUDY_VERSION,
+        development=list(range(1, development+1)))
+    return dict(schema="clipp2.simulation-contract.v6", study_version=STUDY_VERSION,
         implementation_version=__version__,
         run_manifest_id=validate_run_manifest_id(run_manifest_id if run_manifest_id is not None
                                                else os.environ.get("CLIPP2_RUN_MANIFEST_ID")),
@@ -114,31 +98,20 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
         replicate_roster=replicate_roster,
         resource_limits=dict(workers=min(workers, os.cpu_count() or 1), cpu_threads_per_fit=1,
             archive_completed_outputs=True, cpu_device="cpu"),
-        threshold_development=dict(contributor_grid=list(CONTRIBUTOR_GRID),
-            posterior_grid=list(POSTERIOR_GRID), clonal_distance_grid=[.05],
-            clonal_rule="strict unnormalized L2 < 0.05, fixed by the user's specification",
-            fixed_population_families=["S01", "S02", "S07"],
-            fixed_population_information="complete-truth/original-support separation > 2 natural-log units",
-            objective="Correct end-to-end clonal decisions per fixed original evaluable mutation; equal family weights",
-            endpoint="binary_clonality", constraint_scope="empirical_development_not_population_error_guarantee",
-            selective_error_limit=.05, reject_zero_acceptance=True,
-            missing_outcomes_correct_credit=0,
-            tie_breaks=["lower target wrong acceptance", "higher assignment threshold",
-                        "higher contributor threshold", "smaller clonal tolerance", "configuration ID"],
-            maximum_development_rounds=2,
-            revision_if_no_setting_qualifies="Add independent development histories once; retain all first-round cases. If still unqualified, publish development failure and do not claim a qualified main study."),
+        development_assessment=dict(policy="descriptive_fixed_configuration",
+            selection_performed=False, performance_controls_main_execution=False,
+            population="all declared development histories and acquisitions",
+            failures="retained in planned-population accounting; no fabricated estimates"),
         base_workflow_config=asdict(workflow_config()),
-        evaluation=dict(record_schema="clipp2.simulation.evaluation.v3",
-            primary="exact sampled-region biological clonal membership and CCF error",
+        evaluation=dict(record_schema="clipp2.simulation.evaluation.v4",
+            primary="data-supported MAP sampled-region clonality, detailed membership and CCF error",
             reference_match_atol=reference_match_atol, reference_distance="l2",
             reference_matching="full-vector unnormalized L2 at declared tolerance; maximum valid cardinality then minimum valid distance then lexical tie break",
             candidate_mapping_min_purity=.80, alias_probability_atol=1e-12,
             weak_information_max_nats=2., bootstrap_replicates=1000,
             sampling_unit="independent physical history, retaining all acquisitions and arms",
             family_weighting="equal", support_containment_tolerance=0,
-            source_call_containment_tolerance=0,
-            noninferiority_margins=dict(wrong_acceptance=.01, false_clonal_merge=.01,
-                                       additional_multiplicity_exclusion=.005)),
+            source_call_containment_tolerance=0),
         optional_panels=dict(external_reference=False, independent_counts=False, technical_sensitivity=False,
             assignment_scaling=False, extended_sensitivity=False,
             fixed_total_depth_refitting=False, corrected_cap_refitting=False,
@@ -148,18 +121,17 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
 
 def _replicates(contract):
     roster = contract["replicate_roster"]
+    if contract.get("schema") == "clipp2.simulation-contract.v6" and set(roster) != {"unit", "main", "development"}:
+        raise ValueError("Protocol 2.3 requires one main and one development replicate block")
     maximums = (10, 2) if contract.get("cohort") else (50, 10)
     if roster.get("unit") != ("variant" if contract.get("cohort") else "family"):
         raise ValueError("Replicate roster unit differs from the study design")
-    for name, maximum in zip(("main", "development", "development_extension"),
-                             (maximums[0], maximums[1], maximums[1])):
+    for name, maximum in zip(("main", "development"), maximums):
         values = roster.get(name)
-        if (not isinstance(values, list) or (not values and name != "development_extension")
+        if (not isinstance(values, list) or not values
                 or any(type(value) is not int or not 1 <= value <= maximum for value in values)
                 or values != sorted(set(values))):
             raise ValueError(f"Invalid explicit replicate block: {name}")
-    if set(roster["development"]) & set(roster["development_extension"]):
-        raise ValueError("Development blocks must retain disjoint physical histories")
     return roster
 
 
@@ -170,21 +142,18 @@ def roster_counts(contract):
     factor = blocks // len(contract["families"])
     main = blocks*len(roster["main"])*len(contract["acquisitions"])
     development = blocks*len(roster["development"])*len(contract["development_acquisitions"])
-    extension = blocks*len(roster["development_extension"])*len(contract["development_acquisitions"])
+    extension = blocks*len(roster.get("development_extension", ()))*len(contract["development_acquisitions"])
     return dict(planned_main_datasets=main, planned_development_datasets=development,
         conditional_development_extension_datasets=extension,
         main_histories_per_family=factor*len(roster["main"]),
         development_histories_per_family=factor*len(roster["development"]),
-        planned_core_max_fits=3*(main+development), planned_core_max_assignment_passes=2*(main+development),
-        development_grid_additional_fits_with_successful_reuse=2*development,
-        development_grid_unconditional_max_fits=9*development,
-        development_grid_additional_max_assignment_passes=4*development)
+        planned_core_max_fits=3*(main+development), planned_core_max_assignment_passes=2*(main+development))
 
 
-def jobs(contract, phase, *, extension=False):
-    if phase not in ("main", "development") or extension and phase != "development":
-        raise ValueError("Core jobs require main or development and an optional development extension")
-    replicates = _replicates(contract)["development_extension" if extension else phase]
+def jobs(contract, phase):
+    if phase not in ("main", "development"):
+        raise ValueError("Core jobs require main or development")
+    replicates = _replicates(contract)[phase]
     if contract.get("cohort"):
         from .cohort import load_cohort
         payload = load_cohort(contract["cohort"]["path"], expected_content_id=contract["cohort"]["content_id"]).settings

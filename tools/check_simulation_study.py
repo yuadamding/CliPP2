@@ -15,13 +15,12 @@ import zipfile
 import numpy as np
 import pandas as pd
 
-from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
+from CliPP2.io.tumor_txt import load_original_catalog
 from CliPP2.simulation.biology import generate_history
 from CliPP2.simulation.design import jobs, roster_counts, make_contract, workflow_config
 from CliPP2.simulation.runtime import qualification_costs, recorded_costs, status
 from CliPP2.simulation.study import (_decision, _execute, _paired_result, _prepare_histories, _qualification_step,
-                                    _run_cell, development_scores, read_json, report,
-                                    save_json, select_thresholds)
+                                    _run_cell, read_json, report, save_json)
 
 
 def _fixture():
@@ -54,18 +53,13 @@ def _prepare_fixture(root, history, job):
             history_content_id=history_content_id(history)))
 
 
-def _fixed_information(*args, **kwargs):
-    return [dict(information_stratum=value) for value in
-            ["not_applicable_no_competing_truth", *(["separated"]*5), "exact_alias", "exact_alias"]]
-
-
 def _design_check(root, settings):
     from CliPP2.simulation.cohort import load_cohort
     snapshot = root / "cohort_settings.json"
     save_json(snapshot, load_cohort(settings).settings)
     contract = make_contract(cohort_settings=snapshot)
-    assert contract["protocol_version"] == "2.2" and contract["source_cohort_protocol_version"] == "2.1"
-    assert contract["schema"] == "clipp2.simulation-contract.v5"
+    assert contract["protocol_version"] == "2.3" and contract["source_cohort_protocol_version"] == "2.1"
+    assert contract["schema"] == "clipp2.simulation-contract.v6"
     assert contract["evaluation"]["reference_match_atol"] is None
     assert json.loads(snapshot.read_text())["workflow_protocol"] == "2.1"
     main, development = list(jobs(contract, "main")), list(jobs(contract, "development"))
@@ -87,11 +81,12 @@ def _design_check(root, settings):
     other_workers["resource_limits"]["workers"] = 1
     assert list(jobs(other_workers, "main")) == main
     assert list(jobs(other_workers, "development")) == development
-    assert not contract["replicate_roster"]["development_extension"]
+    assert "development_extension" not in contract["replicate_roster"]
+    assert "threshold_development" not in contract
     reduced = make_contract(cohort_settings=snapshot, main_replicates=1, development_replicates=1)
     assert reduced["replicate_roster"]["development"] == [1]
-    assert reduced["replicate_roster"]["development_extension"] == [2]
-    assert len(list(jobs(reduced, "development", extension=True))) == 120
+    assert "development_extension" not in reduced["replicate_roster"]
+    assert len(list(jobs(reduced, "development"))) == 120
     from CliPP2.simulation.reporting import roster_identity
     payload = dict(schema="clipp2.simulation-roster.v1", families=contract["families"],
                    identity_policy="semantic_jobs_without_cohort_path", jobs=main)
@@ -110,83 +105,15 @@ def _design_check(root, settings):
     assert allocation["planned_main_datasets"] + allocation["planned_development_datasets"] == 2640
     assert allocation["planned_core_max_fits"] == 7920 and allocation["planned_core_max_assignment_passes"] == 5280
     config = contract["base_workflow_config"]
-    assert (config["fit"]["max_clusters"], config["stage_two_max_clusters"], config["clonal_distance_max"]) == (10, 20, .05)
+    assert (config["fit"]["max_clusters"], config["stage_two_max_clusters"], config["stage_two_near_clonal_distance_max"]) == (10, 20, .05)
     return contract
-
-
-def _failed_credit_check(root, history, frame, job):
-    path = root / "fixture.tsv"
-    write_tumor_txt(path, frame, frame.attrs["metadata"])
-    catalog = load_original_catalog(path)
-    non_targets = [m for m, phi in zip(history.mutation_ids, history.phi) if not np.all(phi == 1)]
-    frozen = dict(combined_labels={m: 1 for m in non_targets},
-                  targets=[], non_targets=non_targets, assignment=None)
-    with patch("CliPP2.simulation.evaluation.information_diagnostics", side_effect=_fixed_information):
-        success = development_scores(history, catalog, dict(arms={"C": dict(frozen, status="complete")}),
-                                     {}, job, .95, posterior_grid=[.8, .99])
-        failure = development_scores(history, catalog, dict(status="partial_failure",
-            arms={"C": dict(frozen, status="failed")}), {}, job, .95, posterior_grid=[.8, .99])
-        unavailable = development_scores(history, catalog, {}, {}, job, .95, posterior_grid=[.8, .99])
-    assert all(row["fixed_evaluable"] == 6 for row in success + failure + unavailable)
-    expected_correct = sum(m in non_targets for m in history.mutation_ids[:6])
-    assert expected_correct > 0 and all(row["correct_unchanged"] == expected_correct for row in success)
-    assert all(row["correct_unchanged"] == row["correct_targets"] == row["accepted_targets"] == 0
-               for row in failure + unavailable)
-
-
-def _selection_check(root, contract, history, frame, job):
-    cells = []
-    policies = [(.90, .80, "pooled_favorite"), (.95, .90, "balanced"), (.95, .99, "balanced"),
-                (.99, .99, "balanced"), (.90, .99, "too_many_errors"), (.95, .95, "no_acceptance")]
-    for family in ("S01", "S02", "S07"):
-        population = 1000 if family == "S01" else 10
-        rows = []
-        configured = {(c, p): policy for c, p, policy in policies}
-        grid = contract["threshold_development"]
-        for contributor, posterior in ((c, p) for c in grid["contributor_grid"] for p in grid["posterior_grid"]):
-            policy = configured.get((contributor, posterior), "unavailable")
-            if policy == "pooled_favorite":
-                correct, wrong, accepted, unchanged = (population if family == "S01" else 0), 0, (population if family == "S01" else 0), 0
-            elif policy == "balanced":
-                correct, wrong, accepted, unchanged = int(.6*population), 0, int(.6*population), 0
-            elif policy == "too_many_errors":
-                correct, wrong, accepted, unchanged = int(.9*population), int(.1*population), population, 0
-            elif policy == "no_acceptance":
-                correct, wrong, accepted, unchanged = 0, 0, 0, int(.9*population)
-            else:
-                correct = wrong = accepted = unchanged = 0
-            rows.append(dict(cell_id=family+"-good", history_id=family+"-good", family=family,
-                acquisition="A4", contributor=contributor, posterior=posterior,
-                configuration_id=f"c{contributor:.2f}-p{posterior:.2f}", fixed_evaluable=population,
-                correct_unchanged=unchanged, correct_targets=correct, accepted_targets=accepted,
-                wrong_targets=wrong, evaluable_targets=population, experiment_status="complete", arm_status="complete"))
-        path = root / (family + "_objectives.json")
-        save_json(path, rows)
-        cells.append(dict(objective_path=path.name, job=dict(job, phase="development", family=family,
-                          cell_id=family+"-good", history_id=family+"-good"), attempt=family+"_attempt"))
-    failure_job = dict(job, phase="development", cell_id="S01-failed", history_id="S01-failed")
-    (root / "failed_attempt").mkdir()
-    cells.append(dict(job=failure_job, objective_path=None, attempt="failed_attempt", status="execution_failed"))
-    with patch("CliPP2.simulation.study._history", return_value=history), \
-            patch("CliPP2.simulation.study._acquire", return_value=frame), \
-            patch("CliPP2.simulation.evaluation.information_diagnostics", side_effect=_fixed_information):
-        selection = select_thresholds(root, cells, contract)
-    assert selection["selected"]["configuration_id"] == "c0.99-p0.99"
-    assert np.isclose(selection["selected"]["objective"], .5)
-    candidates = {row["configuration_id"]: row for row in selection["configurations"]}
-    assert np.isclose(candidates["c0.90-p0.80"]["objective"], 1/6)
-    assert not candidates["c0.90-p0.99"]["qualifying"] and not candidates["c0.95-p0.95"]["qualifying"]
-    failures = [row for row in selection["cell_objectives"] if row["cell_id"] == "S01-failed"]
-    assert len(failures) == 12 and all(row["fixed_evaluable"] == 6 for row in failures)
-    save_json(root / "selection_check.json", selection)
 
 
 def _native_failure_check(root, history, frame, job, contract):
     _prepare_fixture(root, history, job)
     save_json(root / "study_contract.json", contract)
-    config = asdict(workflow_config(.99, .90))
-    config["assignment"]["screen"]["pair_deviance_max"] = 11.
-    task = dict(root=str(root), job=job, selected=dict(contributor=.99, posterior=.90), execution_configs=[config])
+    config = asdict(workflow_config())
+    task = dict(root=str(root), job=job, execution_configs=[config])
     with patch("CliPP2.simulation.study._history", return_value=history), \
             patch("CliPP2.simulation.study._acquire", return_value=frame), \
             patch("CliPP2.simulation.evaluation.evaluate", side_effect=RuntimeError("regression_evaluator_failure_after_native_work")):
@@ -206,13 +133,13 @@ def _native_failure_check(root, history, frame, job, contract):
     assert resumed == failure and (attempt / "failure.json").read_bytes() == saved
     assert len(list((root / "cells" / job["cell_id"]).glob("attempt-*"))) == 1
     changed = deepcopy(task)
-    changed["execution_configs"][0]["assignment"]["posterior_min"] = .99
+    changed["execution_configs"][0]["stage_two_near_clonal_distance_max"] = .04
     try:
         _run_cell(changed)
     except ValueError as error:
         assert "configuration" in str(error)
     else:
-        raise AssertionError("Resume silently reused results with changed frozen thresholds")
+        raise AssertionError("Resume silently reused results with changed frozen configuration")
     try:
         _run_cell(dict(task, reference_match_atol=.05))
     except ValueError as error:
@@ -236,7 +163,7 @@ def _native_failure_check(root, history, frame, job, contract):
     def evaluator(_history, _catalog, experiment, **kwargs):
         captured.append(deepcopy(experiment))
         evaluated = real_evaluator(_history, _catalog, experiment, **kwargs)
-        assert evaluated["protocol_version"] == "2.2" and evaluated["metrics"]
+        assert evaluated["protocol_version"] == "2.3" and evaluated["metrics"]
         return evaluated
 
     with patch("CliPP2.simulation.study._history", return_value=history), \
@@ -310,38 +237,9 @@ def _native_failure_check(root, history, frame, job, contract):
     assert recorded_costs(root) == interrupted_costs
 
 
-def _partial_objective_check(root, contract, history, frame, job):
-    job = dict(job, phase="development", cell_id="partial-development", history_id="partial-development")
-    _prepare_fixture(root, history, job)
-    values = [asdict(workflow_config(c, .8)) for c in (.9, .95, .99)]
-    objective = [dict(cell_id=job["cell_id"], history_id=job["history_id"], family="S01", acquisition="A4",
-        contributor=.9, posterior=p, configuration_id=f"c0.90-p{p:.2f}", fixed_evaluable=6,
-        correct_unchanged=0, correct_targets=3, accepted_targets=3, wrong_targets=0,
-        evaluable_targets=6, experiment_status="complete", arm_status="complete")
-        for p in contract["threshold_development"]["posterior_grid"]]
-    mock_experiment = dict(stage_one=None, arms={}, cost_ledger=dict(fit_count=0, assignment_pass_count=0))
-    task = dict(root=str(root), job=job, execution_configs=values)
-    with patch("CliPP2.simulation.study._history", return_value=history), \
-            patch("CliPP2.simulation.study._acquire", return_value=frame), \
-            patch("CliPP2.simulation.experiment.run_paired_experiment", return_value=mock_experiment), \
-            patch("CliPP2.simulation.evaluation.evaluate", side_effect=[dict(metrics=[]), RuntimeError("second_evaluation_failed")]), \
-            patch("CliPP2.simulation.study.development_scores", return_value=objective):
-        failure = _run_cell(task)
-    assert failure["status"] == "execution_failed" and len(failure["evaluations"]) == 1
-    assert read_json(root / failure["objective_path"]) == objective
-    with patch("CliPP2.simulation.study._history", return_value=history), \
-            patch("CliPP2.simulation.study._acquire", return_value=frame), \
-            patch("CliPP2.simulation.evaluation.information_diagnostics", side_effect=_fixed_information):
-        selection = select_thresholds(root, [failure], contract)
-    rows = selection["cell_objectives"]
-    assert len(rows) == 12 and len({row["configuration_id"] for row in rows}) == 12
-    assert all(row["fixed_evaluable"] == 6 for row in rows)
-    assert all(row["correct_targets"] == (3 if row["contributor"] == .9 else 0) for row in rows)
-
-
 def _planned_report_check(root, contract):
     contract = deepcopy(contract)
-    contract["replicate_roster"].update(main=[1], development=[1], development_extension=[2])
+    contract["replicate_roster"].update(main=[1], development=[1])
     save_json(root / "study_contract.json", contract)
     from CliPP2.simulation.study import _freeze_main_roster
     _freeze_main_roster(root, contract)
@@ -361,7 +259,7 @@ def _planned_report_check(root, contract):
     assert len({".".join(row["history_id"].split(".")[1:3]) for row in captured}) == 60
     assert all(all(not state["available"] and state["status"] == "not_executed"
                    for state in row["applicability"]) for row in captured)
-    assert all(row["schema"] == "clipp2.simulation.evaluation.v3" for row in captured)
+    assert all(row["schema"] == "clipp2.simulation.evaluation.v4" for row in captured)
     assert all(metric["value"] is None for row in captured for metric in row["metrics"]
                if metric["name"] == "binary_correct_per_original_evaluable")
 
@@ -421,7 +319,7 @@ def _record_schema_report_check(root):
     """Cached and missing records obey the frozen definition; reevaluation is explicit."""
     from contextlib import ExitStack
     from CliPP2.io.data import content_hash
-    from CliPP2.simulation.evaluation import evaluation_definition, legacy_evaluation_definition
+    from CliPP2.simulation.evaluation import legacy_evaluation_definition
     cases = (("historical_v1_mixed", "1.1.0", "v1", False, 1, True, False),
              ("historical_v1_all_missing", "1.1.0", "v1", False, 0, True, False),
              ("historical_v1_no_roster", "1.1.0", "v1", False, 0, False, False),
@@ -437,8 +335,9 @@ def _record_schema_report_check(root):
         contract = make_contract(mutations=12, segments=2, regions=4, workers=1,
                                  reference_match_atol=.05)
         contract.pop("replicate_roster")
-        assert contract["evaluation"]["record_schema"] == "clipp2.simulation.evaluation.v3"
-        contract.update(implementation_version=version, families=["S01"])
+        assert contract["evaluation"]["record_schema"] == "clipp2.simulation.evaluation.v4"
+        contract.update(implementation_version=version, protocol_version="2.2", families=["S01"])
+        contract["evaluation"]["record_schema"] = "clipp2.simulation.evaluation." + suffix
         if not explicit:
             contract["evaluation"].pop("record_schema")
         jobs = [dict(cell_id=f"schema-h{i}-A1", history_id=f"schema-h{i}", family="S01",
@@ -449,8 +348,7 @@ def _record_schema_report_check(root):
             payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"], jobs=jobs)
             save_json(directory / "main_roster.json", dict(payload, roster_id=content_hash(payload)))
         config = dict(reference_match_atol=.025 if derive else .05, reference_distance="l2")
-        definition = (evaluation_definition(config) if derive or suffix == "v3" else
-                      legacy_evaluation_definition(suffix, config))
+        definition = legacy_evaluation_definition("v3" if derive else suffix, config)
         cached_config, cached_suffix = dict(config), suffix
         if name == "incompatible_v3_tolerance":
             cached_config["reference_match_atol"] = .06
@@ -458,8 +356,7 @@ def _record_schema_report_check(root):
             cached_config["reference_distance"] = "linf"
         elif name == "incompatible_v3_schema":
             cached_suffix = "v2"
-        cached_definition = (evaluation_definition(cached_config) if cached_suffix == "v3" else
-                             legacy_evaluation_definition(cached_suffix, cached_config))
+        cached_definition = legacy_evaluation_definition(cached_suffix, cached_config)
         saved = []
         for index, job in enumerate(jobs if has_roster else []):
             relative = Path("cells") / job["cell_id"] / "attempt-001/evaluation-1.json"
@@ -483,7 +380,7 @@ def _record_schema_report_check(root):
         with ExitStack() as stack:
             for target in ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
                            "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.study._history",
-                           "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.select_thresholds",
+                           "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.assess_development",
                            "CliPP2.simulation.reporting.reevaluate_cell"):
                 stack.enter_context(patch(target, side_effect=AssertionError("Report attempted inference or nonempty reevaluation")))
             stack.enter_context(patch("CliPP2.simulation.figures.make_figures",
@@ -542,7 +439,7 @@ def _report_integrity_check(root):
                  phase="main", acquisition=dict(id="A1", purity=.8, depth=100)) for i in range(4)]
     records = []
     for job, states in zip(jobs, ((0, 0, None), (0, None, None), (None, None, None), (1, 1, 1))):
-        records.append(dict(schema="clipp2.simulation.evaluation.v3", **job, acquisition_id="A1",
+        records.append(dict(schema="clipp2.simulation.evaluation.v4", **job, acquisition_id="A1",
             status="execution_failed" if states == (0, 0, None) else "complete",
             evaluation_definition=definition, evaluation_definition_id=content_hash(definition),
             metrics=[dict(name=name, arm=arm, view="all_planned_cells", stratum="all", value=value,
@@ -619,17 +516,17 @@ def _partial_evidence_report_checks(root):
         record = job(index)
         metrics = [dict(name=name, arm="C3", view="", stratum="all", value=1.,
             numerator=10, denominator=10, status="available", truth_required=True)
-            for name in ("correct_per_original_evaluable", "binary_correct_per_original_evaluable")]
+            for name in ("binary_map_correct_per_original_evaluable",)]
         metrics += [dict(name=name, arm="C3", view="all_planned_cells", stratum="all", value=value,
             numerator=value, denominator=1, status="available", truth_required=False)
             for name, value in (("analysis_available", 1), ("analysis_failure", 0),
                                ("execution_available", 1), ("execution_failure", 0),
                                ("evaluation_available", 1), ("scientifically_applicable", 1))]
-        return dict(schema="clipp2.simulation.evaluation.v3", evaluation_definition=definition,
+        return dict(schema="clipp2.simulation.evaluation.v4", evaluation_definition=definition,
             evaluation_definition_id=content_hash(definition), truth_qualification=truth,
             **record, acquisition_id="A1", original_evaluable_count=10, region_count=4,
             status="complete", metrics=metrics, calibration=[], cap_audit=[],
-            detailed_membership_transitions={"C3": {"stage1_clonal_recheck": [dict(
+            detailed_membership_transitions={"C3": {"stage1_reference_recheck": [dict(
                 baseline_state="Mc", final_state="Mw", count=transitions)]}})
 
     def publish_case(directory, evaluations):
@@ -661,7 +558,7 @@ def _partial_evidence_report_checks(root):
         with ExitStack() as stack:
             for name in ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
                          "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.study._history",
-                         "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.select_thresholds"):
+                         "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.assess_development"):
                 stack.enter_context(patch(name, side_effect=AssertionError("Report attempted inference: " + name)))
             stack.enter_context(patch("CliPP2.simulation.figures._save", side_effect=capture))
             result = report(directory)
@@ -686,13 +583,13 @@ def _partial_evidence_report_checks(root):
     assert "region_count" not in failure
     failure.pop("calibration", None)
     failure.pop("cap_audit", None)
-    zero = next(row for row in failure["metrics"] if row["name"] == "correct_per_original_evaluable" and row["arm"] == "C3")
+    zero = next(row for row in failure["metrics"] if row["name"] == "binary_map_correct_per_original_evaluable" and row["arm"] == "C3")
     assert zero["value"] == 0 and zero["status"] == "known_no_decisions"
     result, output, _ = publish_case(root / "known_zero", [successful(0), failure])
     assert {row["arm"]: row["executed"] for row in result["summary"]["population_counts"]} == {
         "A": 1, "B": 0, "C": 0, "B3": 0, "C3": 1}
     metric = next(row for row in result["summary"]["metrics"]
-                  if row["name"] == "binary_correct_per_original_evaluable" and row["arm"] == "C3")
+                  if row["name"] == "binary_map_correct_per_original_evaluable" and row["arm"] == "C3")
     assert metric["planned_population_estimate"] == .5 and metric["planned_population_status"] == "available"
     assert len(result["summary"]["planned_weights"]) == 2
     exported = pd.read_csv(output / "tumor_metrics.tsv", sep="\t")
@@ -700,12 +597,12 @@ def _partial_evidence_report_checks(root):
     for value in (None, True, "4", [4], {}, float("nan"), float("inf"), 0, -1, 1.5):
         assert figures._sensitivity_covariate(dict(failure, region_count=value), "region_count") is None
     assert figures._sensitivity_covariate(dict(failure, region_count=4), "region_count") == 4
-    assert figures._values([failure], "correct_per_original_evaluable", "C3")[0][1] == 0
+    assert figures._values([failure], "binary_map_correct_per_original_evaluable", "C3")[0][1] == 0
     unsupported = deepcopy(failure)
     unsupported["truth_qualification"] = "verified_history_binding"
     for arm in unsupported["applicability"]:
         arm.pop("decision_population", None)
-    assert figures._values([unsupported], "correct_per_original_evaluable", "C3") == []
+    assert figures._values([unsupported], "binary_map_correct_per_original_evaluable", "C3") == []
     result, output, matrices = publish_case(root / "truth_qualified", [successful(0),
         successful(1, truth="legacy_consistent_unbound", transitions=37)])
     transitions = pd.read_csv(output / "detailed_transitions.tsv", sep="\t")
@@ -714,7 +611,7 @@ def _partial_evidence_report_checks(root):
     metrics = pd.read_csv(output / "tumor_metrics.tsv", sep="\t")
     assert set(metrics.truth_qualification) == {"verified_history_binding", "legacy_consistent_unbound"}
     assert metrics.groupby("truth_qualification").size().to_dict() == {
-        "verified_history_binding": 8, "legacy_consistent_unbound": 8}
+        "verified_history_binding": 7, "legacy_consistent_unbound": 7}
     assert len(matrices) == 1 and matrices[0].sum() == matrices[0][0, 1] == 3
     html = (output / "comparison_report.html").read_text()
     section = html.split("<h2>Detailed membership transitions by target origin</h2>")[1].split("<h2>")[0]
@@ -748,7 +645,7 @@ def _offline_report_check(root, history, job):
     config = dict(reference_match_atol=.025, reference_distance="l2")
     forbidden = ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
         "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.study._history", "CliPP2.simulation.study._acquire",
-        "CliPP2.simulation.study.select_thresholds", "CliPP2.simulation.cohort.load_cohort")
+        "CliPP2.simulation.study.assess_development", "CliPP2.simulation.cohort.load_cohort")
     with ExitStack() as stack:
         for name in forbidden:
             stack.enter_context(patch(name, side_effect=AssertionError("Offline report executed " + name)))
@@ -843,7 +740,7 @@ def _historical_catalog_report_check(root):
     with ExitStack() as stack:
         for target in ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
                        "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.study._history",
-                       "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.select_thresholds"):
+                       "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.assess_development"):
             stack.enter_context(patch(target, side_effect=AssertionError("Historical report attempted inference")))
         stack.enter_context(patch("CliPP2.simulation.figures.make_figures", return_value=[]))
         cached = report(source, report_dir=root / "cached_report")
@@ -997,7 +894,7 @@ def _historical_successful_report_check(root):
                        "CliPP2.simulation.experiment._fit_accepted", "CliPP2.assignment.assign_mutations",
                        "CliPP2.simulation.experiment.assign_mutations", "CliPP2.kernel.model.RegionalModel",
                        "CliPP2.simulation.study._history", "CliPP2.simulation.study._acquire",
-                       "CliPP2.simulation.study.select_thresholds", "CliPP2.simulation.cohort.load_cohort"):
+                       "CliPP2.simulation.study.assess_development", "CliPP2.simulation.cohort.load_cohort"):
             stack.enter_context(patch(target, side_effect=AssertionError("Historical success report attempted inference")))
         stack.enter_context(patch("CliPP2.simulation.figures.make_figures", return_value=[]))
         original_report = report(source, report_dir=root / "cached_report")
@@ -1056,7 +953,7 @@ def _structured_failure_checks(root):
             for arm in current["arms"].values():
                 arm["status"] = current["status"]
         task = dict(root=str(directory), job=dict(job, phase="development"),
-                    execution_configs=[asdict(workflow_config(.95, .8))])
+                    execution_configs=[asdict(workflow_config())])
         _prepare_fixture(directory, history, task["job"])
         def infer(_input, output, config, **kwargs):
             save_json(Path(output) / "paired_result.json", current)
@@ -1064,13 +961,12 @@ def _structured_failure_checks(root):
         with patch("CliPP2.simulation.study._history", return_value=history), \
                 patch("CliPP2.simulation.study._acquire", return_value=frame), \
                 patch("CliPP2.simulation.experiment.run_paired_experiment", side_effect=infer) as runner, \
-                patch("CliPP2.simulation.evaluation.evaluate", side_effect=lambda h, c, e, **k: dict(metrics=[], arms=e["arms"])), \
-                patch("CliPP2.simulation.study.development_scores", return_value=[dict(fixed_evaluable=8, correct_targets=0)]):
+                patch("CliPP2.simulation.evaluation.evaluate", side_effect=lambda h, c, e, **k: dict(metrics=[], arms=e["arms"])):
             first = _run_cell(task)
             failed = case in ("stage_one", "capped_stage_two", "assignment")
             assert (first["status"] == "execution_failed") == failed
             assert first["cost_ledgers"] == [current["cost_ledger"]]
-            assert read_json(directory / first["objective_path"])[0]["fixed_evaluable"] == 8
+            assert "objective_path" not in first
             assert read_json(directory / first["evaluations"][0])["arms"]["B"] == current["arms"]["B"]
             completion = directory / "cells" / job["cell_id"] / "completion.json"
             prior = completion.read_bytes()
@@ -1204,7 +1100,7 @@ def run_lifecycle_checks(root, settings):
     return dict(status="passed", native_fit_count=0, assignment_pass_count=0,
         checks=["cohort_job_and_history_identity", "matching_history_reuse_and_changed_manifest_rejection",
                 "frozen_content_verified_before_resume_reuse", "caught_stage1_stage2_assignment_failures_retryable",
-                "partial_arm_objective_cost_evidence_retained", "scientific_rejections_not_retried",
+                "partial_arm_evaluation_cost_evidence_retained", "scientific_rejections_not_retried",
                 "qualification_interruptions_and_published_summary_recovery", "recorded_qualification_failure_requires_explicit_retry",
                 "before_aggregate_interruption_reuses_both_steps", "interrupted_qualification_cost_unknown"])
 
@@ -1225,19 +1121,15 @@ def run_checks(directory, cohort_settings):
                 assert "original installed environment" in str(error)
             else:
                 raise AssertionError("An older contract resumed under the revised implementation")
-    record = dict(best_label=1, informative_regions=2, cluster_tie=False, fit_screen_status="pass",
-                  log_competitor_ratio=-1000., has_finite_alternative=True, reference_quality_pass=False)
-    assert _decision(record, .8) is None and _decision(record, .99) is None
-    record["reference_quality_pass"] = True
-    assert _decision(record, .99) == 1 and _decision(record, 1.) is None
+    record = dict(map_cluster_label=1, final_assignment_label=1, evidence_status="observed",
+                  posterior=.01, entropy=10., diagnostic_status="failed")
+    assert _decision(record) == 1
+    for evidence in ("prior_only", "model_incompatible", "excluded"):
+        assert _decision(dict(record, evidence_status=evidence, final_assignment_label=None)) is None
+    assert _decision(None) is None
     history, frame, job = _fixture()
-    _failed_credit_check(root, history, frame, job)
-    selection_root = root / "selection"
-    selection_root.mkdir()
-    _selection_check(selection_root, contract, history, frame, job)
     _native_failure_check(root / "native_failure", history, frame, job, contract)
     _offline_report_check(root / "native_failure", history, job)
-    _partial_objective_check(root / "partial_objective", contract, history, frame, job)
     _planned_report_check(root / "unexecuted_report", contract)
     report_integrity = _report_integrity_check(root / "report_integrity")
     historical_catalog = _historical_catalog_report_check(root / "historical_catalog")
@@ -1245,20 +1137,26 @@ def run_checks(directory, cohort_settings):
     record_schema = _record_schema_report_check(root / "record_schema_reports")
     optional_execution = _optional_execution_report_check(root / "optional_execution_reports")
     partial_reports = _partial_evidence_report_checks(root / "partial_evidence_reports")
-    result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4,
+    from CliPP2.simulation.controls import run_controls
+    mechanisms = run_controls(root / "actual_mechanism_controls")
+    assert mechanisms["status"] == "passed" and mechanisms["cost_ledger"]["fit_count"] == 0
+    mechanism_checks = dict(status=mechanisms["status"], schema=mechanisms["schema"],
+        checks=mechanisms["checks"], native_fit_count=0,
+        assignment_pass_count=mechanisms["assignment_pass_count"])
+    result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4+mechanisms["assignment_pass_count"],
+        mechanism_checks=mechanism_checks,
         lifecycle=lifecycle, resume=resume, partial_evidence_reports=partial_reports, record_schema=record_schema,
         report_integrity=report_integrity, historical_catalog=historical_catalog, historical_success=historical_success,
         optional_execution_reports=optional_execution,
         checks=["exact_60_variant_720_history_2640_cell_design", "full_10_20_strict_point05_contract",
-                "source_protocol21_execution22_and_cross_protocol_resume_rejection",
-                "threshold_reuse_preserves_reference_quality_and_finite_rival_certainty",
-                "failed_C_preserves_fixed_denominator_zero_credit", "equal_family_selection_includes_failed_histories",
-                "zero_acceptance_and_excess_error_rejected_threshold_ties_frozen", "post_evaluator_failure_retains_native_costs",
+                "source_protocol21_execution23_and_cross_protocol_resume_rejection",
+                "authoritative_observed_MAP_ignores_reporting_diagnostics",
+                "poor_finite_development_does_not_block_main", "development_failures_remain_accounted", "post_evaluator_failure_retains_native_costs",
                 "default_resume_terminal_failure_immutable", "changed_execution_config_rejected",
                 "changed_reference_evaluation_tolerance_rejected",
-                "explicit_retry_appends_attempt_and_preserves_prior_costs", "partial_objectives_preserved_missing_configurations_zero_filled",
+                "explicit_retry_appends_attempt_and_preserves_prior_costs", "exactly_one_declared_configuration",
                 "successful_retry_archives_complete_numerical_receipts", "archive_roundtrip_preserves_paired_state_and_costs",
-                "full_truth_evaluator_accepts_protocol22_assignment_and_final_membership",
+                "full_truth_evaluator_accepts_protocol23_MAP_and_final_membership",
                 "runtime_counts_archived_failed_and_interrupted_work_once", "runtime_status_does_not_modify_outputs",
                 "frozen_configuration_reaches_real_runner", "unexecuted_main_cells_remain_in_planned_denominator",
                 "offline_archived_legacy_evaluation_preserves_sources_and_frozen_thresholds",

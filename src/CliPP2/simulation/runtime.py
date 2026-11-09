@@ -77,6 +77,7 @@ def status(outdir):
     allocation = (roster_counts(contract) if "replicate_roster" in contract else
                   read_json(root / "allocation.json") if (root / "allocation.json").exists() else {})
     development = read_json(root / "threshold_development.json") if (root / "threshold_development.json").exists() else None
+    assessment_paths = list(root.glob("development_assessment*.json"))
     cells = [value for directory in (root / "cells").glob("*") if directory.is_dir()
              for value in [_latest_completion(directory)] if value is not None]
     from .reporting import planned_roster
@@ -117,6 +118,7 @@ def status(outdir):
         operation_costs=costs,
         qualification_costs=qualification_costs(root),
         recorded_execution_failures=sum(len(cell.get("execution_failures", [])) for cell in cells),
-        active=active, thresholds_frozen=development is not None and development.get("selected") is not None,
+        active=active, development_assessed=bool(assessment_paths),
+        historical_thresholds_frozen=development is not None and development.get("selected") is not None,
         report=str(reports[-1]) if reports else None,
         cost_note="Durable operation journals include completed, failed and unfinished attempts; scientific applicability is in the report")

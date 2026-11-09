@@ -18,7 +18,7 @@ import traceback
 
 import numpy as np
 
-from CliPP2.assignment import AssignmentBundle, assign_mutations, confidence_passes
+from CliPP2.assignment import AssignmentBundle, assign_mutations
 from CliPP2.screening import profile_deviance_from_diagnostics
 from CliPP2.config import WorkflowConfig
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
@@ -78,7 +78,7 @@ def sensitivity_jobs(contract, *, extended=False):
 def contributor_density_diagnostics(history, frame, config, *, densities=(0, 1, 5, 20, 100)):
     """Fixed target set and deterministic nested source subsets, with no fits.
 
-    Selection uses only declared source identities. Qualification evaluates noisy
+    Selection uses only declared source identities. Evidence collection evaluates noisy
     calls at true source CCFs. A requested density above the available physical
     source count is labeled limited, never filled with duplicated contributors.
     """
@@ -102,12 +102,11 @@ def contributor_density_diagnostics(history, frame, config, *, densities=(0, 1, 
     if np.isin(diagnostic['status'], (2, 3)).any():
         raise ArithmeticError('Native source diagnostics failed')
     residual = profile_deviance_from_diagnostics(data, phi, diagnostic)
-    confidence = confidence_passes(diagnostic['map_log_probability'], config.contributor_probability_min,
-        diagnostic['has_second'] & np.isfinite(diagnostic['top_two_gap']))
-    qualified = (data.observed & catalog.mapping_genuine[positions] & catalog.eligible[positions]
-                 & (phi > 0) & (diagnostic['status'] == 0) & confidence
-                 & (diagnostic['top_two_gap'] > config.contributor_tie_atol)
-                 & np.isfinite(residual) & (residual <= config.contributor_deviance_max))
+    calls = diagnostic['map_multiplicity']
+    contributes = (data.observed & catalog.mapping_genuine[positions] & catalog.eligible[positions]
+                   & (phi > 0) & (diagnostic['status'] == 0) & np.isfinite(calls)
+                   & (calls == np.floor(calls)) & (calls >= data.multiplicity_min)
+                   & (calls < data.multiplicity_min + data.support))
     source_lookup = {mutation: i for i, mutation in enumerate(pool)}
     source_sets = {segment: tuple(m for m in pool if history.segment_ids[index[m], 0] == segment)
                    for segment in history.segment_keys}
@@ -116,14 +115,14 @@ def contributor_density_diagnostics(history, frame, config, *, densities=(0, 1, 
         selected = {segment: ids[:density] for segment, ids in source_sets.items()}
         audits = []
         totals = dict(evaluable_pairs=0, estimated_exclusions=0, structural_exclusions=0,
-                      same_qualified_truth_exclusions=0, same_qualified_truth_unavailable=0,
+                      same_contributing_truth_exclusions=0, same_contributing_truth_unavailable=0,
                       structural_truth_unavailable=0, inherited_support_exclusions=0,
-                      additional_cap_exclusions=0, qualified_calls=0, correct_qualified_calls=0)
+                      additional_cap_exclusions=0, contributing_calls=0, correct_contributing_calls=0)
         for segment in history.segment_keys:
             selected_ids = selected[segment]
             local_targets = [index[m] for m in targets if history.segment_ids[index[m], 0] == segment]
             for r, region in enumerate(history.region_ids):
-                ids = [m for m in selected_ids if qualified[source_lookup[m], r]]
+                ids = [m for m in selected_ids if contributes[source_lookup[m], r]]
                 calls = [diagnostic['map_multiplicity'][source_lookup[m], r] for m in ids]
                 truth = [history.multiplicity[index[m], r] for m in ids]
                 selected_truth = [history.multiplicity[index[m], r] for m in selected_ids]
@@ -132,8 +131,8 @@ def contributor_density_diagnostics(history, frame, config, *, densities=(0, 1, 
                 estimated_cap = min(calls) if calls else None
                 replacement_cap = min(truth) if truth and truth_known else None
                 structural_cap = min(selected_truth) if selected_truth and structural_known else None
-                totals['qualified_calls'] += len(calls)
-                totals['correct_qualified_calls'] += sum(call == truth for call, truth in zip(calls, truth))
+                totals['contributing_calls'] += len(calls)
+                totals['correct_contributing_calls'] += sum(call == truth for call, truth in zip(calls, truth))
                 for i in local_targets:
                     if not catalog.eligible[i, r] or history.phi[i, r] <= 0:
                         continue
@@ -147,19 +146,23 @@ def contributor_density_diagnostics(history, frame, config, *, densities=(0, 1, 
                     else:
                         totals['structural_truth_unavailable'] += 1
                     if not truth_known:
-                        totals['same_qualified_truth_unavailable'] += 1
+                        totals['same_contributing_truth_unavailable'] += 1
                     else:
-                        totals['same_qualified_truth_exclusions'] += int(m > (upper if replacement_cap is None else replacement_cap))
+                        totals['same_contributing_truth_exclusions'] += int(m > (upper if replacement_cap is None else replacement_cap))
                 audits.append(dict(segment_id=segment, region_id=region, requested_count=density,
                     available_count=len(source_sets[segment]), selected_count=len(selected_ids),
-                    qualified_count=len(ids), qualified_ids=ids, estimated_cap=estimated_cap,
-                    structural_cap=structural_cap, same_qualified_ids_truth_cap=replacement_cap,
-                    same_qualified_ids_truth_evaluable=truth_known, original_upper_fallback=not calls))
+                    contributing_count=len(ids), contributing_ids=ids, estimated_cap=estimated_cap,
+                    structural_cap=structural_cap, same_contributing_ids_truth_cap=replacement_cap,
+                    same_contributing_ids_truth_evaluable=truth_known, original_upper_fallback=not calls))
         records.append(dict(requested_density=density,
             availability='limited_by_source_availability' if any(len(ids) < density for ids in source_sets.values()) else 'complete',
             selected_source_ids=[m for ids in selected.values() for m in ids], **totals, segment_audit=audits))
-    return _plain(dict(status='complete', scope='controlled_true_center_call_qualification_not_a_native_fit',
+    return _plain(dict(status='complete', scope='controlled_true_center_available_calls_not_a_native_fit',
         target_ids=targets, source_pool_ids=pool, records=records,
+        contributor_diagnostics=[dict(mutation_id=m, region_id=region,
+            contributes_to_cap=bool(contributes[i, r]), map_probability=float(np.exp(diagnostic["map_log_probability"][i, r])),
+            map_score_gap=float(diagnostic["top_two_gap"][i, r]), profile_deviance=float(residual[i, r]))
+            for i, m in enumerate(pool) for r, region in enumerate(history.region_ids)],
         notes='The target population is fixed across all densities; missing positive-carrier truth is not substituted.'))
 
 
@@ -184,7 +187,7 @@ def _scaling_case(path, config_values, mutations, regions, band, seed):
         reference = _controlled_reference(tuple(range(len(order))), history.region_ids, np.array([centers[key] for key in order]))
         support = catalog.default_bounds()
         observed = catalog.count_observed & (catalog.total_counts > 0) & catalog.eligible
-        bundle = AssignmentBundle(catalog, reference, history.mutation_ids, (), config.assignment,
+        bundle = AssignmentBundle(catalog, reference, history.mutation_ids, (),
             history.phi, np.where(observed, history.multiplicity, np.nan), support.lower, support.upper,
             ('controlled_truth_reference',)*mutations, labels, labels, config.fit.device, config.fit.cpu_threads,
             run_manifest_id=os.environ.get("CLIPP2_RUN_MANIFEST_ID"),
@@ -231,7 +234,7 @@ def run_scaling(outdir, config, *, sizes=(1000, 5000, 20000), region_counts=(2, 
                     path.write_text(json.dumps(dict(status='failed', mutations=mutations, regions=regions,
                         cn_band=band, error_type='WorkerFailure', error='timeout or process exit', exitcode=process.exitcode))+'\n')
                 records.append(json.loads(path.read_text()))
-    report = dict(schema='clipp2.simulation-scaling.v1', status='complete' if all(row['status'] == 'complete' for row in records) else 'partial_failure',
+    report = dict(schema='clipp2.simulation-scaling.v2', status='complete' if all(row['status'] == 'complete' for row in records) else 'partial_failure',
         records=records, fits=0, assignment_passes=sum(row['status'] == 'complete' for row in records),
         memory_measurement='fresh-worker process peak RSS; includes preparation, Python results and native allocations')
     (outdir / 'scaling_summary.json').write_text(json.dumps(report, allow_nan=False)+'\n')

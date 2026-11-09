@@ -1,4 +1,4 @@
-"""Resumable study execution with history-level pairing and frozen development."""
+"""Resumable study execution with history-level pairing and fixed configuration."""
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -16,14 +16,12 @@ from functools import lru_cache
 import numpy as np
 import pandas as pd
 
-from CliPP2.assignment import posterior_passes
 from CliPP2.config import PROTOCOL_VERSION
 from CliPP2._version import __version__
 from CliPP2.io.data import content_hash, json_value
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
 
-from .design import (CONTRIBUTOR_GRID, POSTERIOR_GRID, jobs, roster_counts, resolve_config,
-                     seed_for, workflow_config)
+from .design import jobs, roster_counts, resolve_config, seed_for, workflow_config
 
 
 def save_json(path, payload):
@@ -111,63 +109,12 @@ def _peak_bytes():
     return int(value if sys.platform == "darwin" else value*1024)
 
 
-def _decision(row, posterior):
-    if row is None or row.get("best_label") is None or not row.get("informative_regions"):
+def _decision(row):
+    """Read the producer's data-supported estimate; never recreate decision gates."""
+    if row is None or row.get("evidence_status") != "observed":
         return None
-    if row.get("cluster_tie"):
-        return None
-    if not posterior_passes(float(row["log_competitor_ratio"]), posterior,
-                             row["has_finite_alternative"]):
-        return None
-    if not row.get("reference_quality_pass", False) or row.get("fit_screen_status") != "pass":
-        return None
-    return int(row["best_label"])
-
-
-def development_scores(history, catalog, experiment, evaluation, job, contributor, *, posterior_grid=POSTERIOR_GRID,
-                       fixed_families=("S01", "S02", "S07")):
-    """Fixed original population; failed selection/fits receive zero credit."""
-    from .evaluation import information_diagnostics
-    observed = catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)
-    # Biological truth, not perturbed supplied inputs, defines the tuning stratum.
-    acquisition = job["acquisition"]
-    info = information_diagnostics(history.phi, history.multiplicity,
-        history.major_cn, history.minor_cn, np.broadcast_to(acquisition["purity"], history.phi.shape),
-        np.full(history.phi.shape, 2.), catalog.total_counts, observed,
-        history.observable_truth_ids)
-    fixed = observed.any(axis=1) & np.array([row["information_stratum"] in
-        ("separated", "not_applicable_no_competing_truth") for row in info])
-    fixed &= job["family"] in fixed_families
-    truth_clonal = np.all(np.isclose(history.phi, 1., atol=1e-12, rtol=0), axis=1)
-    arm = experiment.get("arms", {}).get("C", {})
-    if arm.get("status") not in ("complete", "empty_remainder"):
-        arm = {}  # An unavailable analysis receives zero credit on the fixed population.
-    membership = arm.get("combined_labels", {})
-    targets, unchanged = set(arm.get("targets", ())), set(arm.get("non_targets", ()))
-    records = {row["mutation_id"]: row for row in (arm.get("assignment") or {}).get("assignments", ())}
-    rows = []
-    for posterior in posterior_grid:
-        correct_f = correct_t = wrong_t = accepted = evaluable_targets = 0
-        for i, mutation in enumerate(history.mutation_ids):
-            if not fixed[i]:
-                continue
-            if mutation in unchanged and mutation in membership:
-                correct_f += int((membership[mutation] == 0) == truth_clonal[i])
-            if mutation in targets:
-                evaluable_targets += 1
-                selected = _decision(records.get(mutation), posterior)
-                if selected is not None:
-                    accepted += 1
-                    correct = (selected == 0) == truth_clonal[i]
-                    correct_t += int(correct)
-                    wrong_t += int(not correct)
-        rows.append(dict(cell_id=job["cell_id"], history_id=job["history_id"], family=job["family"],
-            acquisition=acquisition["id"], contributor=contributor, posterior=posterior,
-            configuration_id=f"c{contributor:.2f}-p{posterior:.2f}", fixed_evaluable=int(fixed.sum()),
-            correct_unchanged=correct_f, correct_targets=correct_t, accepted_targets=accepted,
-            wrong_targets=wrong_t, evaluable_targets=evaluable_targets,
-            experiment_status=experiment.get("status"), arm_status=arm.get("status")))
-    return rows
+    label = row.get("final_assignment_label")
+    return None if label is None else int(label)
 
 
 def _experiment_execution_failures(experiment, configuration_index):
@@ -185,7 +132,7 @@ def _experiment_execution_failures(experiment, configuration_index):
 def _run_cell(task):
     from .evaluation import evaluate
     from .experiment import run_paired_experiment
-    root, job, selected = Path(task["root"]), task["job"], task.get("selected")
+    root, job = Path(task["root"]), task["job"]
     evaluation_config = dict(reference_match_atol=task.get("reference_match_atol"),
                              reference_distance=task.get("reference_distance", "l2"))
     directory = root / "cells" / job["cell_id"]
@@ -209,7 +156,7 @@ def _run_cell(task):
     attempt.mkdir()
     started = time.perf_counter()
     save_json(attempt / "job.json", job)
-    objectives, results, costs, execution_failures = [], [], [], []
+    results, costs, execution_failures = [], [], []
     original_evaluable_count, execution_phase = None, "history"
     try:
         from .biology import history_content_id
@@ -235,13 +182,11 @@ def _run_cell(task):
             & (catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)).any(axis=1)).sum())
         execution_phase = "before_inference"
         from CliPP2.config import WorkflowConfig
-        configurations = task.get("execution_configs") or [asdict(workflow_config(c, p)) for c, p in
-            ([(c, .80) for c in CONTRIBUTOR_GRID] if job["phase"] == "development"
-             else [(selected["contributor"], selected["posterior"])])]
-        first = second = None
+        configurations = task.get("execution_configs") or [asdict(workflow_config())]
+        if len(configurations) != 1:
+            raise ValueError("Protocol 2.3 executes exactly one declared workflow configuration")
         for index, values in enumerate(configurations):
             config = WorkflowConfig.from_dict(values)
-            contributor = config.contributor_probability_min
             def progress(event):
                 fields = ("phase", "stage", "elapsed_seconds", "phase_elapsed_seconds", "occupied_q", "membership_audit", "operation")
                 payload = dict(configuration=index+1, **{key: event[key] for key in fields if key in event})
@@ -250,13 +195,11 @@ def _run_cell(task):
                 os.replace(temporary, attempt / "progress.json")
             execution_phase = "paired_inference"
             experiment = run_paired_experiment(input_path, attempt / f"configuration-{index+1}", config,
-                accepted_stage_one=first, accepted_uncapped_stage_two=second, progress_callback=progress,
+                progress_callback=progress,
                 run_manifest_id=task.get("run_manifest_id"))
             costs.append(experiment["cost_ledger"])
             execution_failures.extend(_experiment_execution_failures(experiment, index+1))
             save_json(attempt / f"cost-ledger-{index+1}.json", experiment["cost_ledger"])
-            first = first or experiment.get("stage_one")
-            second = second or experiment.get("arms", {}).get("B", {}).get("stage_two")
             execution_phase = "evaluation"
             evaluation = evaluate(history, catalog, experiment, acquisition=frame.attrs.get("acquisition"),
                                   evaluation_config=evaluation_config, truth_qualification=truth_link["status"])
@@ -264,25 +207,14 @@ def _run_cell(task):
                               acquisition_id=acquisition["id"], acquisition=acquisition, phase=job["phase"], job=job)
             save_json(attempt / f"evaluation-{index+1}.json", evaluation)
             results.append(str((attempt / f"evaluation-{index+1}.json").relative_to(root)))
-            if job["phase"] == "development":
-                objectives.extend(development_scores(history, catalog, experiment, evaluation, job, contributor,
-                    posterior_grid=task.get("posterior_grid", POSTERIOR_GRID),
-                    fixed_families=task.get("fixed_families", ("S01", "S02", "S07"))))
-                save_json(attempt / f"threshold-objectives-{index+1}.json", objectives)
-        if objectives:
-            save_json(attempt / "threshold_objectives.json", objectives)
         if task.get("archive_completed", False):
             _archive_completed(attempt)
         value = dict(job=job, status="execution_failed" if execution_failures else "complete", evaluations=results, cost_ledgers=costs,
-            objective_path=str((attempt / "threshold_objectives.json").relative_to(root)) if objectives else None,
             attempt=str(attempt.relative_to(root)), elapsed_seconds=time.perf_counter()-started,
             peak_resident_bytes=_peak_bytes())
     except Exception as exc:
-        if objectives and not (attempt / "threshold_objectives.json").exists():
-            save_json(attempt / "threshold_objectives.json", objectives)
         value = dict(job=job, status="execution_failed", error_type=type(exc).__name__, error=str(exc),
             traceback=traceback.format_exc(), evaluations=results, cost_ledgers=costs,
-            objective_path=str((attempt / "threshold_objectives.json").relative_to(root)) if objectives else None,
             attempt=str(attempt.relative_to(root)), elapsed_seconds=time.perf_counter()-started,
             peak_resident_bytes=_peak_bytes())
         execution_failures.append(dict(configuration_index=None, arm=None, failed_stage="worker",
@@ -337,7 +269,7 @@ def _prepare_histories(root, job_list):
         save_json(directory / "history_manifest.json", expected)
 
 
-def run_jobs(root, job_list, *, workers, selected=None, contract=None, retry_failed=False):
+def run_jobs(root, job_list, *, workers, contract=None, retry_failed=False):
     job_list = list(job_list)
     for path, identity in {(job["cohort_settings"], job["cohort_content_id"])
                            for job in job_list if job.get("cohort_settings")}:
@@ -349,22 +281,13 @@ def run_jobs(root, job_list, *, workers, selected=None, contract=None, retry_fai
     _prepare_histories(root, job_list)
     tasks = []
     for job in job_list:
-        settings = contract["threshold_development"] if contract else {}
-        grid = settings.get("contributor_grid", CONTRIBUTOR_GRID)
-        posterior_grid = settings.get("posterior_grid", POSTERIOR_GRID)
-        values = [(c, min(posterior_grid)) for c in grid] if job["phase"] == "development" else [(selected["contributor"], selected["posterior"])]
-        resolved = []
-        for contributor, posterior in values:
-            resolved.append(asdict(resolve_config(contract, contributor, posterior)) if contract else
-                            asdict(workflow_config(contributor, posterior)))
-        tasks.append(dict(root=str(root), job=job, selected=selected, execution_configs=resolved,
-                          posterior_grid=list(posterior_grid),
+        config = resolve_config(contract) if contract else workflow_config()
+        tasks.append(dict(root=str(root), job=job, execution_configs=[asdict(config)],
                           retry_failed=retry_failed,
                           archive_completed=contract["resource_limits"].get("archive_completed_outputs", False) if contract else False,
                           reference_match_atol=contract.get("evaluation", {}).get("reference_match_atol") if contract else None,
                           reference_distance=contract.get("evaluation", {}).get("reference_distance", "l2") if contract else "l2",
-                          run_manifest_id=contract.get("run_manifest_id") if contract else None,
-                          fixed_families=settings.get("fixed_population_families", ["S01", "S02", "S07"])))
+                          run_manifest_id=contract.get("run_manifest_id") if contract else None))
     values = []
     # Prevent BLAS oversubscription; each native fit has an explicit single thread.
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
@@ -380,60 +303,50 @@ def run_jobs(root, job_list, *, workers, selected=None, contract=None, retry_fai
     return sorted(values, key=lambda row: row["job"]["cell_id"])
 
 
-def select_thresholds(root, cells, contract):
-    settings = contract["threshold_development"]
-    rows = [row for cell in cells if cell.get("objective_path")
-            for row in read_json(root / cell["objective_path"])]
-    # A failed worker still belongs to its original prespecified population.
-    # Recover that denominator from the untouched biological input and give zero
-    # credit for all thresholds, rather than dropping its history or family.
-    expected = {(c, p) for c in settings["contributor_grid"] for p in settings["posterior_grid"]}
-    for cell in cells:
-        available = {(row["contributor"], row["posterior"]) for row in rows if row["cell_id"] == cell["job"]["cell_id"]}
-        missing = expected-available
-        if not missing:
-            continue
-        job = cell["job"]
-        h = _history(job)
-        frame = _acquire(job, h)
-        temporary = root / cell["attempt"] / "failed_population.tsv"
-        if not temporary.exists():
-            write_tumor_txt(temporary, frame, frame.attrs.get("metadata"))
-        catalog = load_original_catalog(temporary)
-        for contributor in settings["contributor_grid"]:
-            rows.extend(row for row in development_scores(h, catalog, {}, {}, job, contributor,
-                posterior_grid=settings["posterior_grid"], fixed_families=settings["fixed_population_families"])
-                if (row["contributor"], row["posterior"]) in missing)
-    frame = pd.DataFrame(rows)
-    candidates = []
-    for configuration, group in frame.groupby("configuration_id"):
-        usable = group[group.fixed_evaluable > 0].copy()
-        for field in ("correct_unchanged", "correct_targets", "accepted_targets", "wrong_targets"):
-            usable[field + "_rate"] = usable[field] / usable.fixed_evaluable
-        rates = [key + "_rate" for key in ("correct_unchanged", "correct_targets", "accepted_targets", "wrong_targets")]
-        per_history = usable.groupby(["family", "history_id"])[rates].mean()
-        per_family = per_history.groupby("family").mean()
-        means = per_family.mean()
-        acceptance = float(means.get("accepted_targets_rate", 0.))
-        error = float(means.get("wrong_targets_rate", 0.)) / acceptance if acceptance else None
-        first = group.iloc[0]
-        candidates.append(dict(configuration_id=configuration, contributor=float(first.contributor),
-            posterior=float(first.posterior), objective=float(means.get("correct_unchanged_rate", 0.)+
-                                                            means.get("correct_targets_rate", 0.)),
-            correct_unchanged_rate=float(means.get("correct_unchanged_rate", 0.)),
-            correct_target_rate=float(means.get("correct_targets_rate", 0.)),
-            target_wrong_acceptance=float(means.get("wrong_targets_rate", 0.)),
-            target_acceptance=acceptance, selective_error=error,
-            qualifying=bool(acceptance > 0 and error <= settings["selective_error_limit"]
-                            and set(per_family.index) == set(settings["fixed_population_families"])),
-            represented_families=list(per_family.index), fixed_evaluable=int(group.fixed_evaluable.sum())))
-    qualified = [row for row in candidates if row["qualifying"]]
-    selected = min(qualified, key=lambda row: (-row["objective"], row["target_wrong_acceptance"],
-        -row["posterior"], -row["contributor"], row["configuration_id"])) if qualified else None
-    return dict(schema="clipp2.simulation-development.v1", selected=selected,
-                endpoint="binary_clonality", constraint_scope="empirical_development_not_population_error_guarantee",
-                selective_error_definition="wrong_accepted_binary_clonality_over_accepted_targets",
-                configurations=candidates, cell_objectives=rows, tuning_target="C3", B3_separately_optimized=False)
+def assess_development(root, cells, contract, main_roster):
+    """Describe every planned development cell under the fixed configuration.
+
+    Numerical failures remain visible. This receipt never chooses a policy or
+    prevents main execution because of scientific performance.
+    """
+    planned = list(jobs(contract, "development"))
+    completed = {cell["job"]["cell_id"]: cell for cell in cells}
+    if len(completed) != len(cells) or set(completed) - {job["cell_id"] for job in planned}:
+        raise ValueError("Development completions differ from the declared population")
+    records = []
+    for job in planned:
+        cell = completed.get(job["cell_id"])
+        if cell is not None and cell["job"] != job:
+            raise ValueError("Development completion job differs from the declared population")
+        records.append(dict(cell_id=job["cell_id"], history_id=job["history_id"], family=job["family"],
+            acquisition=job["acquisition"]["id"], status=cell["status"] if cell else "not_executed",
+            selected_attempt=cell.get("attempt") if cell else None,
+            completion_identity=content_hash(cell) if cell else None,
+            evaluations=list(cell.get("evaluations", ())) if cell else [],
+            execution_failures=list(cell.get("execution_failures", ())) if cell else []))
+    return dict(schema="clipp2.simulation-development-assessment.v1", protocol_version=PROTOCOL_VERSION,
+        study_contract_id=content_hash(contract), main_roster_id=main_roster["roster_id"],
+        workflow_config=asdict(resolve_config(contract)), policy="descriptive_fixed_configuration",
+        selection_performed=False, performance_controls_main_execution=False,
+        planned_cells=len(planned), completed_cells=sum(row["status"] == "complete" for row in records),
+        execution_failed_cells=sum(row["status"] == "execution_failed" for row in records),
+        not_executed_cells=sum(row["status"] == "not_executed" for row in records), cells=records)
+
+
+def _publish_development_assessment(root, assessment):
+    """Append revised attempt evidence on retry; preserve all prior assessments."""
+    paths = list(root.glob("development_assessment*.json"))
+    for path in paths:
+        previous = read_json(path)
+        if any(previous.get(key) != assessment[key] for key in ("schema", "protocol_version",
+                "study_contract_id", "main_roster_id", "workflow_config")):
+            raise ValueError("Development assessment differs from the frozen study configuration")
+        if previous == assessment:
+            return path
+    name = "development_assessment.json" if not paths else f"development_assessment.{len(paths)+1:03d}.json"
+    path = root / name
+    save_json(path, assessment)
+    return path
 
 
 def _qualification_summary(output, summary_name):
@@ -547,7 +460,7 @@ def _freeze_main_roster(root, contract):
 
 def _execute(root, contract, *, resume=False, retry_failed=False):
     root = Path(root).resolve()
-    if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v5"
+    if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v6"
             or contract.get("implementation_version") != __version__):
         raise ValueError(f"Execution requires a Protocol {PROTOCOL_VERSION} simulation contract; earlier studies require their original installed environment")
     if resume:
@@ -608,34 +521,12 @@ def _execute(root, contract, *, resume=False, retry_failed=False):
             protocol_version=PROTOCOL_VERSION, source_cohort_protocol_version=contract.get("source_cohort_protocol_version"),
             numerical_policy=f"Every native fit and assignment retains the independent Protocol {PROTOCOL_VERSION} verification receipt"))
     workers = contract["resource_limits"]["workers"]
-    development_path = root / "threshold_development.json"
-    if development_path.exists():
-        development = read_json(development_path)
-    else:
-        development_cells = run_jobs(root, jobs(contract, "development"), workers=workers, contract=contract,
-                                     retry_failed=retry_failed)
-        development = select_thresholds(root, development_cells, contract)
-        if development["selected"] is None and contract["replicate_roster"]["development_extension"]:
-            print(json.dumps(dict(event="development_extension", reason="No threshold met the frozen criterion")), flush=True)
-            development_cells += run_jobs(root, jobs(contract, "development", extension=True), workers=workers, contract=contract,
-                                          retry_failed=retry_failed)
-            development = select_thresholds(root, development_cells, contract)
-        development.update(study_contract_id=content_hash(contract), main_roster_id=main_roster["roster_id"],
-            selected_workflow_config=(None if development["selected"] is None else
-                asdict(resolve_config(contract, development["selected"]["contributor"], development["selected"]["posterior"]))))
-        save_json(development_path, development)
-    expected_config = (None if development["selected"] is None else
-        asdict(resolve_config(contract, development["selected"]["contributor"], development["selected"]["posterior"])))
-    if (development.get("study_contract_id") != content_hash(contract)
-            or development.get("main_roster_id") != main_roster["roster_id"]
-            or development.get("selected_workflow_config") != expected_config):
-        raise ValueError("Threshold development receipt differs from the frozen study or selected configuration")
-    if development["selected"] is None:
-        report(root)
-        raise RuntimeError("No development setting qualified after the prespecified extension; final cohort not generated")
-    run_jobs(root, main_roster["jobs"], workers=workers, selected=development["selected"],
-             contract=contract, retry_failed=retry_failed)
-    run_optional_panels(root, contract, development["selected"], workers, retry_failed=retry_failed)
+    development_cells = run_jobs(root, jobs(contract, "development"), workers=workers, contract=contract,
+                                 retry_failed=retry_failed)
+    assessment = assess_development(root, development_cells, contract, main_roster)
+    _publish_development_assessment(root, assessment)
+    run_jobs(root, main_roster["jobs"], workers=workers, contract=contract, retry_failed=retry_failed)
+    run_optional_panels(root, contract, workers, retry_failed=retry_failed)
     return report(root)
 
 
@@ -653,19 +544,19 @@ def _reference_audit_destination(output, family, source):
     return directory, False
 
 
-def run_optional_panels(root, contract, selected, workers, *, retry_failed=False):
+def run_optional_panels(root, contract, workers, *, retry_failed=False):
     from .acquisition import acquire
     from .controls import run_reference_audit
     from .panels import contributor_density_diagnostics, run_scaling, sensitivity_jobs
     options = contract["optional_panels"]
     if not any(options.get(key) for key in ("external_reference", "technical_sensitivity", "assignment_scaling", "contributor_density")):
         return
-    config = resolve_config(contract, selected["contributor"], selected["posterior"])
+    config = resolve_config(contract)
     output = root / "optional_panels"
     output.mkdir(exist_ok=True)
     if options.get("technical_sensitivity"):
         run_jobs(root, sensitivity_jobs(contract, extended=options.get("extended_sensitivity", False)),
-                 workers=workers, selected=selected, contract=contract, retry_failed=retry_failed)
+                 workers=workers, contract=contract, retry_failed=retry_failed)
     if options.get("external_reference"):
         for family in ("S03", "S04", "S05", "S11", "S12"):
             if contract.get("cohort"):
@@ -725,7 +616,7 @@ def report(root, *, evaluation_config=None, report_dir=None):
         if isinstance(evaluation_config, (str, Path)):
             evaluation_config = read_json(evaluation_config)
         evaluation_config = normalize_evaluation_config(evaluation_config)
-        schema = "clipp2.simulation.evaluation.v3"
+        schema = "clipp2.simulation.evaluation.v4" if contract.get("protocol_version") == "2.3" else "clipp2.simulation.evaluation.v3"
     else:
         frozen_evaluation = contract.get("evaluation", {})
         schema = frozen_evaluation.get("record_schema")
@@ -734,14 +625,14 @@ def report(root, *, evaluation_config=None, report_dir=None):
             schema = "clipp2.simulation.evaluation." + (
                 "v3" if version >= (1, 2, 3) else "v2" if version >= (1, 2, 2) else "v1")
         if schema not in ("clipp2.simulation.evaluation.v1", "clipp2.simulation.evaluation.v2",
-                          "clipp2.simulation.evaluation.v3"):
+                          "clipp2.simulation.evaluation.v3", "clipp2.simulation.evaluation.v4"):
             raise ValueError("Frozen study declares an unsupported evaluation record schema")
         evaluation_config = {key: frozen_evaluation[key]
             for key in ("reference_match_atol", "reference_distance") if key in frozen_evaluation}
         if schema.endswith(".v1"):
             evaluation_config["reference_distance"] = "linf"
         evaluation_config = normalize_evaluation_config(evaluation_config)
-    definition = (evaluation_definition(evaluation_config) if schema.endswith(".v3") else
+    definition = (evaluation_definition(evaluation_config) if schema.endswith(".v4") else
                   legacy_evaluation_definition(schema, evaluation_config))
     definition_id = content_hash(definition)
     cells = [value for directory in sorted((root / "cells").glob("*")) if directory.is_dir()
@@ -757,15 +648,16 @@ def report(root, *, evaluation_config=None, report_dir=None):
     evaluations = []
     for cell in main:
         if derive:
-            value = reevaluate_cell(root, cell, evaluation_config)
+            value = reevaluate_cell(root, cell, evaluation_config, evaluation_schema=schema)
         else:
             try:
                 cached_path = root / cell["evaluations"][0]
                 value = read_json(cached_path)
             except (OSError, ValueError, IndexError, KeyError):
-                value = placeholder_for_cell(root, cell, evaluation_config)
+                value = placeholder_for_cell(root, cell, evaluation_config, evaluation_schema=(
+                    "clipp2.simulation.evaluation.v4" if schema.endswith(".v4") else "clipp2.simulation.evaluation.v3"))
                 # Missing cached records retain the frozen study's definition.
-                # Historical files are never relabeled as newly evaluated v3.
+                # Historical files retain their original inference interpretation.
                 value.update(schema=schema, evaluation_config=evaluation_config,
                     evaluation_definition=definition, evaluation_definition_id=definition_id,
                     reference_match_atol=definition["reference_match_atol"],
@@ -802,6 +694,7 @@ def report(root, *, evaluation_config=None, report_dir=None):
             source_cohort_content_id=contract.get("cohort", {}).get("content_id") if contract.get("cohort") else None,
             historical_cohort_identity_backfilled=False,
             frozen_threshold_development=read_json(selection) if selection.exists() else None,
+            development_assessments=[read_json(path) for path in sorted(root.glob("development_assessment*.json"))],
             evaluation_config=evaluation_config, implementation_version=__version__,
             fit_count=0, assignment_pass_count=0, threshold_selection_count=0))
         for index, evaluation in enumerate(evaluations, 1):
@@ -840,6 +733,7 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
                   read_json(root / "allocation.json") if (root / "allocation.json").exists() else {})
     development = read_json(root / "threshold_development.json") if (root / "threshold_development.json").exists() else {}
     selected = development.get("selected")
+    assessments = [read_json(path) for path in sorted(root.glob("development_assessment*.json"))]
     if "replicate_roster" in contract:
         allocation_description = "The population was declared by explicit frozen replicate blocks; timing and disk measurements did not select its membership."
     elif allocation.get("resource_reduction_applied") is False or contract.get("profile") == "full":
@@ -857,15 +751,18 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
         f"<p>Executed scale: {contract['dimensions']['mutations']} mutations, {contract['dimensions']['segments']} segments, {contract['dimensions']['regions']} regions; "
         f"{allocation.get('main_histories_per_family', 0)} independent main histories per family. The proposed full scale is 1,500 mutations, 50 segments, 50 main and 10 development histories per family.</p>",
         f"<p>{allocation_description} Repeated acquisitions share physical histories; uncertainty resamples histories and carries all paired arms together. A reduced cohort does not establish rare-event safety or noninferiority.</p>",
-        "<h2>Frozen population and settings</h2><pre>"+html.escape(json.dumps(dict(replicate_roster=contract.get("replicate_roster"), counts=allocation, selected=selected), indent=2))+"</pre>",
-        "<h2>Applicability and scientific results</h2><p>Unknown and unavailable estimates remain explicit. Exact aliases and absent candidate explanations cannot be resolved by restoring integer support. Descriptive screens are not calibrated tests.</p>"]
+        "<h2>Frozen population and settings</h2><pre>"+html.escape(json.dumps(dict(replicate_roster=contract.get("replicate_roster"), counts=allocation, historical_selected=selected,
+            workflow_config=contract.get("base_workflow_config"), development_assessments=assessments), indent=2))+"</pre>",
+        "<h2>Applicability and scientific results</h2><p>Unknown and unavailable estimates remain explicit. Exact aliases and absent candidate explanations cannot be resolved by restoring integer support. Diagnostics are measurements; Protocol 2.3 returns observed MAP estimates without statistical acceptance screens.</p>"]
     text.append("<h2>Evaluation definition and population</h2><pre>"+html.escape(json.dumps(dict(
         definition=summary.get("evaluation_definition"), report_mode=summary["report_mode"],
         roster_status=summary["roster_status"]), indent=2))+"</pre>")
     text.append(pd.DataFrame(summary["population_counts"]).to_html(index=False, na_rep="NA"))
     selected_metrics = {"binary_correct_per_original_evaluable", "binary_correct_resolution", "binary_selective_error",
         "mapped_correct_resolution", "mapped_selective_error", "unmapped_acceptance_fraction",
-        "geometric_correct_reference_resolution", "analysis_available", "analysis_failure", "evaluation_available"}
+        "geometric_correct_reference_resolution", "analysis_available", "analysis_failure", "evaluation_available",
+        "data_supported_map_coverage", "binary_map_error", "detailed_map_error", "map_ccf_rmse",
+        "binary_map_correct_per_original_evaluable", "prior_only_fraction", "model_incompatible_fraction", "computation_failure_count"}
     rows = [dict(endpoint=row["name"], arm=row["arm"], view=row["view"], stratum=row["stratum"],
                  scope=row.get("population_scope"), planned=row.get("planned_population_estimate"),
                  planned_status=row.get("planned_population_status"),
@@ -880,7 +777,7 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
         for arm, origins in e.get("detailed_membership_transitions", {}).items()
         for origin, rows in origins.items() for row in rows if row["count"]]
     text.append("<h2>Detailed membership transitions by target origin</h2>"
-        "<p>Mc: mapped correct; Mw: mapped wrong; U: accepted but unmapped; unresolved: no accepted label. "
+        "<p>Mc: mapped correct; Mw: mapped wrong; U: selected but unmapped; unresolved: no data-supported final label. "
         "Counts below use verified history bindings only; they do not fill missing planned cells. "
         "Raw TSV exports retain historical diagnostics with their truth qualification.</p>")
     if transitions:
