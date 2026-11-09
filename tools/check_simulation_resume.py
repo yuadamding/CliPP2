@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+# Import before history-generator mocks: controls binds biology helpers at import time.
+from CliPP2.simulation import controls
 from CliPP2.simulation.design import make_contract
 from CliPP2.simulation.study import (_execute, _latest_completion, read_json, run_optional_panels,
                                     save_json)
@@ -46,7 +48,7 @@ def _roster_retry(root):
         return rows
 
     with patch("CliPP2.simulation.biology.generate_history", return_value=SimpleNamespace(validate=lambda: True)), \
-            patch("CliPP2.simulation.controls.run_controls", side_effect=_controls), \
+            patch.object(controls, "run_controls", side_effect=_controls), \
             patch("CliPP2.simulation.study.run_jobs", side_effect=run_jobs), \
             patch("CliPP2.simulation.study.run_optional_panels"), \
             patch("CliPP2.simulation.study.report", return_value=dict(status="complete")):
@@ -98,7 +100,7 @@ def _fixed_development(root):
             cells.append(dict(job=job, status="complete", evaluations=[str(path)]))
         return cells
     with patch("CliPP2.simulation.biology.generate_history", return_value=SimpleNamespace(validate=lambda: True)), \
-            patch("CliPP2.simulation.controls.run_controls", side_effect=_controls), \
+            patch.object(controls, "run_controls", side_effect=_controls), \
             patch("CliPP2.simulation.study.run_jobs", side_effect=run_jobs), \
             patch("CliPP2.simulation.study.run_optional_panels"), \
             patch("CliPP2.simulation.study.report", return_value=dict(status="complete")):
@@ -138,7 +140,7 @@ def _optional_retries(root):
     with patch('CliPP2.simulation.study._history', return_value=object()), \
             patch('CliPP2.simulation.study.load_original_catalog', return_value=object()), \
             patch('CliPP2.simulation.study._paired_result', side_effect=lambda p: dict(selected_attempt=p.name)), \
-            patch('CliPP2.simulation.controls.run_reference_audit', side_effect=audit):
+            patch.object(controls, 'run_reference_audit', side_effect=audit):
         run_optional_panels(root, contract, 1)
         audit_root = root / 'optional_panels/reference_audits/S03'
         original = {str(path.relative_to(root)): path.read_bytes() for path in audit_root.rglob('*.json')}

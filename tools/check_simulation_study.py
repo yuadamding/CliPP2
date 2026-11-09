@@ -17,6 +17,8 @@ import pandas as pd
 
 from CliPP2.io.tumor_txt import load_original_catalog
 from CliPP2.simulation.biology import generate_history
+# Import before history-generator mocks: controls binds biology helpers at import time.
+from CliPP2.simulation import controls
 from CliPP2.simulation.design import jobs, roster_counts, make_contract, workflow_config
 from CliPP2.simulation.runtime import qualification_costs, recorded_costs, status
 from CliPP2.simulation.study import (_decision, _execute, _paired_result, _prepare_histories, _qualification_step,
@@ -1041,16 +1043,16 @@ def _qualification_lifecycle_checks(root, contract):
             raise KeyboardInterrupt("before aggregate publication")
         return original_save(path, payload)
     with patch("CliPP2.simulation.biology.generate_history", return_value=SimpleNamespace(validate=lambda: None)), \
-            patch("CliPP2.simulation.controls.run_controls", side_effect=passed), \
-            patch("CliPP2.simulation.controls.run_cohort_controls", side_effect=lambda c, p: passed(p, "cohort_controls_summary.json")), \
+            patch.object(controls, "run_controls", side_effect=passed), \
+            patch.object(controls, "run_cohort_controls", side_effect=lambda c, p: passed(p, "cohort_controls_summary.json")), \
             patch("CliPP2.simulation.study.save_json", side_effect=interrupt_aggregate):
         try:
             _execute(aggregate_root, frozen)
         except KeyboardInterrupt:
             pass
     with patch("CliPP2.simulation.biology.generate_history", return_value=SimpleNamespace(validate=lambda: None)), \
-            patch("CliPP2.simulation.controls.run_controls", side_effect=AssertionError("mechanisms reran")), \
-            patch("CliPP2.simulation.controls.run_cohort_controls", side_effect=AssertionError("cohort reran")), \
+            patch.object(controls, "run_controls", side_effect=AssertionError("mechanisms reran")), \
+            patch.object(controls, "run_cohort_controls", side_effect=AssertionError("cohort reran")), \
             patch("CliPP2.simulation.study.run_jobs", side_effect=RuntimeError("stop after qualification")):
         try:
             _execute(aggregate_root, frozen, resume=True)
@@ -1137,8 +1139,8 @@ def run_checks(directory, cohort_settings):
     record_schema = _record_schema_report_check(root / "record_schema_reports")
     optional_execution = _optional_execution_report_check(root / "optional_execution_reports")
     partial_reports = _partial_evidence_report_checks(root / "partial_evidence_reports")
-    from CliPP2.simulation.controls import run_controls
-    mechanisms = run_controls(root / "actual_mechanism_controls")
+    assert controls.generate_history is generate_history, "History mock leaked into real controls"
+    mechanisms = controls.run_controls(root / "actual_mechanism_controls")
     assert mechanisms["status"] == "passed" and mechanisms["cost_ledger"]["fit_count"] == 0
     mechanism_checks = dict(status=mechanisms["status"], schema=mechanisms["schema"],
         checks=mechanisms["checks"], native_fit_count=0,
