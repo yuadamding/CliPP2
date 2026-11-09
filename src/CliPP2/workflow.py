@@ -10,7 +10,7 @@ from collections.abc import Mapping
 
 import numpy as np
 
-from .assignment import (AssignmentBundle, AssignmentReference,
+from .assignment import (AssignmentBundle, AssignmentReference, EVIDENCE_STATUSES,
                          assign_mutations, conditional_multiplicity)
 from .config import PROTOCOL_VERSION, COMPATIBLE_NATIVE_FIT_PROTOCOLS, WorkflowConfig
 from ._version import __version__
@@ -21,11 +21,11 @@ from .kernel.backend import NativeBackend, NativeExecutionError
 from .kernel.observations import prepare_prediction
 
 CONTRIBUTOR_COLUMNS = ("mutation_id", "region_id", "segment_id", "source_stage", "source_label",
-    "native_phi", "native_source_call", "cap_source_map_call", "native_lower", "native_upper",
-    "map_probability", "map_unique", "map_tied_values", "map_score_gap", "profile_deviance",
+    "native_phi", "native_source_call", "cap_source_map_call", "cap_source_map_upper", "native_lower", "native_upper",
+    "map_probability", "map_unique", "map_tied_values", "map_score_gap", "profile_deviance", "multiplicity_read_informative",
     "contributes_to_cap", "availability_reason", "diagnostic_status", "diagnostic_error")
 GROUP_COLUMNS = ("source_stage", "source_label", "size", "native_center", "distance_to_one", "informative_counts",
-    "informative_depths", "minimum_regional_depth", "near_clonal", "diagnostic_status", "diagnostic_error") + tuple(
+    "informative_depths", "minimum_regional_depth", "diagnostic_status", "diagnostic_error") + tuple(
         prefix + "_" + field for prefix in ("native", "all_one", "original_native", "original_all_one")
         for field in ("informative_count", "mean_profile_deviance", "maximum_profile_deviance"))
 SEGMENT_POLICY_COLUMNS = ("region_id", "segment_id", "multiplicity_endpoint", "contributor_count",
@@ -33,7 +33,8 @@ SEGMENT_POLICY_COLUMNS = ("region_id", "segment_id", "multiplicity_endpoint", "c
 ORIGINAL_COMPARISON_COLUMNS = ("mutation_id", "original_eligible", "original_input_status",
     "stage_one_label", "stage_two_label", "baseline_reference_label", "final_assignment_label", "role", "target_reason", "membership_origin",
     "stage_one_native_phi", "stage_one_native_calls", "stage_two_native_phi", "stage_two_native_calls",
-    "assignment_status", "evidence_status", "map_cluster_label", "reassessment_status", "baseline_changed",
+    "assignment_status", "evidence_status", "map_cluster_label", "map_label", "map_set", "posterior_defined",
+    "reference_labels", "probabilities", "reassessment_status", "baseline_changed",
     "historical_cap_contributor_reassigned")
 
 
@@ -143,6 +144,21 @@ class AcceptedFit(ImmutableArrayRecord):
         values["support"] = MultiplicityBounds.from_dict(values["support"])
         return cls(**values)
 
+    def validate_input_identity(self, catalog, original_config=None):
+        """Reject changed input content before any new search or numerical reuse."""
+        from .provenance import validate_fit_execution_receipt, validate_run_manifest
+        producer = self.producer_receipt
+        if original_config is None:
+            original_config = validate_fit_execution_receipt(producer.get("fit_config"), producer.get("execution"))
+        if self.tumor_id != catalog.tumor_id or content_hash(self.biological_identity) != content_hash(catalog.biological_identity):
+            raise ValueError("Historical fit belongs to different biological input identities")
+        manifest = producer.get("run_manifest")
+        validate_run_manifest(manifest, tumor_id=catalog.tumor_id, biological_identity=self.biological_identity)
+        if manifest["input_identity"].get("original_catalog_identity") not in catalog.compatible_source_identities(original_config.max_major_cn):
+            raise ValueError("Historical run manifest belongs to different original input content")
+        if self.biological_hash != _biological_hash(catalog, self.mutation_ids):
+            raise ValueError("Historical denominators, masks, mapping, or observations differ")
+
     def validate(self, catalog, *, expected_ids=None, expected_support=None, device="cpu", cpu_threads=None, run_manifest_id=None):
         """Return a v2 replay receipt with a separate current compatibility check.
 
@@ -183,8 +199,6 @@ class AcceptedFit(ImmutableArrayRecord):
             raise ValueError("Original producer run manifest link differs from its input binding")
         build = producer["run_manifest"].get("build")
         original_config = validate_fit_execution_receipt(producer["fit_config"], producer["execution"], build=build)
-        if original_config.max_major_cn != catalog.max_major_cn:
-            raise ValueError("Original fit configuration disagrees with its input CN eligibility policy")
         if "normal_cn_policy" not in producer or producer["normal_cn_policy"] not in (None, "diploid"):
             raise ValueError("Original fit lacks its explicit normal-CN assumption")
         if len(self.centers) > original_config.max_clusters:
@@ -195,10 +209,7 @@ class AcceptedFit(ImmutableArrayRecord):
             if (artifact["protocol_version"] != producer["protocol_version"]
                     or artifact["implementation_version"] != producer["implementation_version"]):
                 raise ValueError("Original run/build manifest disagrees with producer execution identity")
-        if producer["run_manifest"]["input_identity"].get("original_catalog_identity") != content_hash(catalog.to_dict()):
-            raise ValueError("Historical run manifest belongs to different original input content")
-        if self.biological_hash != _biological_hash(catalog, self.mutation_ids):
-            raise ValueError("Historical denominators, masks, mapping, or observations differ")
+        self.validate_input_identity(catalog, original_config)
         if tuple(self.region_ids) != tuple(catalog.region_ids):
             raise ValueError("Historical fit has different requested regions")
         if expected_ids is not None and set(self.mutation_ids) != set(expected_ids):
@@ -302,7 +313,7 @@ def _diagnostics(catalog, ids, phi, bounds, config, calls=None):
 
 
 def collect_cap_contributors(catalog, fit, config, *, mutation_ids=None):
-    """Collect available native-support MAP calls; uncertainty never vetoes a call."""
+    """Collect full-support native MAP sets, preserving historical point calls."""
     wanted = set(fit.mutation_ids if mutation_ids is None else mutation_ids)
     if not wanted.issubset(fit.mutation_ids):
         raise ValueError("Requested contributors must belong to the source fit")
@@ -311,6 +322,10 @@ def collect_cap_contributors(catalog, fit, config, *, mutation_ids=None):
         return []
     ids = tuple(fit.mutation_ids[i] for i in selected)
     support = fit.support.subset(ids, catalog.region_ids)
+    original_support = catalog.default_bounds().subset(ids, catalog.region_ids)
+    if not (np.array_equal(support.lower, original_support.lower)
+            and np.array_equal(support.upper, original_support.upper)):
+        raise ValueError("Cap source requires the original full multiplicity support")
     observation = prepare_prediction(catalog, ids, support, device=config.fit.device,
         cpu_threads=config.fit.cpu_threads, normal_cn_policy=config.normal_cn_policy)
     positions = {mutation: i for i, mutation in enumerate(catalog.mutation_ids)}
@@ -326,27 +341,28 @@ def collect_cap_contributors(catalog, fit, config, *, mutation_ids=None):
                 reason = "excluded"
             elif not observation.observed[i, j]:
                 reason = "missing_observation"
-            elif phi == 0:
-                reason = "uninformative_zero_ccf"
             else:
                 evidence = conditional_multiplicity(catalog, original, j, phi,
                     int(support.lower[i, j]), int(support.upper[i, j]))
-                reason = "available" if evidence["defined"] else "model_incompatible"
+                reason = ("flat_native_likelihood" if len(evidence["map_tied_values"]) == len(evidence["candidates"])
+                          else "available") if evidence["defined"] else "model_incompatible"
                 if evidence["defined"] and not (support.lower[i, j] <= evidence["map_call"] <= support.upper[i, j]
                         and evidence["map_call"] == int(evidence["map_call"])):
                     raise ArithmeticError("Conditional MAP call lies outside the native support")
-            available = reason == "available"
+            available = reason in ("available", "flat_native_likelihood")
             records.append(dict(mutation_id=mutation, region_id=region,
                 segment_id=str(catalog.segment_ids[original, j]), source_stage=fit.source_id,
                 source_label=int(fit.labels[source]), native_phi=phi,
                 native_source_call=float(fit.multiplicities[source, j]),
                 cap_source_map_call=evidence["map_call"] if available else None,
+                cap_source_map_upper=max(evidence["map_tied_values"]) if available else None,
                 native_lower=int(support.lower[i, j]), native_upper=int(support.upper[i, j]),
                 map_probability=evidence["map_probability"] if available else None,
                 map_unique=evidence["map_unique"] if available else None,
                 map_tied_values=evidence["map_tied_values"] if available else (),
                 map_score_gap=evidence["map_score_gap"] if available else None,
                 profile_deviance=evidence["profile_deviance"] if evidence is not None else None,
+                multiplicity_read_informative=available and phi > 0,
                 contributes_to_cap=available, availability_reason=reason,
                 diagnostic_status=evidence["diagnostic_status"] if evidence is not None else "not_applicable",
                 diagnostic_error=evidence["diagnostic_error"] if evidence is not None else None))
@@ -380,7 +396,6 @@ def classify_groups(catalog, fit, config):
             native_center=center.tolist(), distance_to_one=distance,
             informative_counts=coverage.tolist(), informative_depths=depths.tolist(),
             minimum_regional_depth=float(depths.min()),
-            near_clonal=distance < config.stage_two_near_clonal_distance_max,
             diagnostic_status="failed" if error else "complete", diagnostic_error=error)
         for name in (("native", "all_one") if same else ("native", "all_one", "original_native", "original_all_one")):
             summary = (summarize_profile_deviance(diagnostics[name]["profile_deviance"][members], mask, axis=0)
@@ -404,71 +419,99 @@ def select_reference_source(groups):
 
 
 def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, group_two, config):
-    """Freeze geometric routing and raw source diagnostics without acceptance gates."""
-    selected, groups_two = selected_group, group_two
+    """Consolidate exactly equal hypotheses and reassess every fitted mutation."""
+    selected = selected_group
     label = selected["source_label"]
     if label not in range(len(stage_one.centers)) or not np.any(stage_one.labels == label):
         raise ValueError("The provisional source must be an occupied Stage 1 group")
+    if not np.array_equal(selected["native_center"], stage_one.centers[label]):
+        raise ValueError("Provisional source diagnostics describe a different native center")
     expected = set() if stage_two is None else set(range(len(stage_two.centers)))
-    if len(groups_two) != len(expected) or {group["source_label"] for group in groups_two} != expected:
+    if len(group_two) != len(expected) or {group["source_label"] for group in group_two} != expected:
         raise ValueError("Stage 2 group diagnostics must cover exactly the accepted native groups")
-    groups_two = sorted(groups_two, key=lambda group: group["source_label"])
-    merged = {k for k in expected if np.linalg.norm(stage_two.centers[k] - 1) < config.stage_two_near_clonal_distance_max}
     r = len(catalog.region_ids)
-    centers, measurements = [np.ones(r)], [(selected, "all_one")]
-    sources = [dict(center_source="fixed_all_ones", source_stage=stage_one.source_id, source_label=label,
-        native_center=stage_one.centers[label].tolist(), distance_to_one=selected["distance_to_one"],
-        reference_source_role="provisional_reference_source", selection_rule="nearest_to_one")]
-    source_map = [dict(source_stage=stage_one.source_id, source_label=label, baseline_reference_label=0,
-        reference_source_role="provisional_reference_source", selection_rule="nearest_to_one",
-        native_center=stage_one.centers[label].tolist(), distance_to_one=selected["distance_to_one"], near_clonal=None)]
-    for group in groups_two:
-        label = group["source_label"]
-        baseline = 0 if label in merged else len(centers)
-        if label not in merged:
-            centers.append(stage_two.centers[label])
-            measurements.append((group, "native"))
-            sources.append(dict(center_source="accepted_stage_two_native", source_stage=stage_two.source_id,
-                source_label=label, accepted_state_hash=stage_two.state_fingerprint,
-                support_hash=stage_two.support.content_hash, native_center=stage_two.centers[label].tolist()))
-        source_map.append(dict(source_stage=stage_two.source_id, source_label=label,
-            baseline_reference_label=baseline, near_clonal=label in merged))
-    if len(centers) != 1 + len(groups_two) - len(merged):
-        raise AssertionError("Frozen reference inventory does not reconcile geometric routing")
+    centers, source_map = [np.ones(r)], []
+    sources = [[dict(center_source="fixed_all_ones", interpretation="imposed_hypothesis")]]
+    measurements = [[]]
+    inventory = {tuple(centers[0]): 0}
+    for fit, groups in ((stage_one, [selected]), (stage_two, sorted(group_two, key=lambda g: g["source_label"]))):
+        for group in groups:
+            source_label = group["source_label"]
+            center = fit.centers[source_label]
+            if (not np.array_equal(group["native_center"], center)
+                    or group.get("source_stage", fit.source_id) != fit.source_id):
+                raise ValueError("Group diagnostics describe a different accepted native source")
+            key = tuple(center)
+            if key not in inventory:
+                inventory[key] = len(centers)
+                centers.append(center)
+                sources.append([])
+                measurements.append([])
+            baseline = inventory[key]
+            role = "provisional_reference_source" if fit is stage_one else "native_discovery_group"
+            lineage = dict(source_stage=fit.source_id, source_label=source_label,
+                baseline_reference_label=baseline, reference_source_role=role,
+                native_center=center.tolist(), distance_to_one=float(np.linalg.norm(center - 1)))
+            if fit is stage_one:
+                lineage["selection_rule"] = "nearest_to_one"
+            source_map.append(lineage)
+            sources[baseline].append(dict(lineage,
+                center_source="accepted_stage_one_native" if fit is stage_one else "accepted_stage_two_native",
+                accepted_state_hash=fit.state_fingerprint, support_hash=fit.support.content_hash,
+                source_measurements={name: group[name] for name in (
+                    "informative_counts", "informative_depths", "native_mean_profile_deviance",
+                    "native_maximum_profile_deviance", "diagnostic_status")},
+                diagnostic_error=group.get("diagnostic_error")))
+            measurements[baseline].append((group, "native"))
+    # A fixed all-one hypothesis has no fitted source when no native center is
+    # exactly one. Its discrepancy still describes the provisional source reads.
+    if not measurements[0]:
+        measurements[0] = [(selected, "all_one")]
+        sources[0][0]["diagnostic_source"] = dict(source_stage=stage_one.source_id,
+            source_label=selected["source_label"], interpretation="provisional_source_reads_at_fixed_all_ones")
+    counts, depths, means, maxima, availability = [], [], [], [], []
+    for records in measurements:
+        count = np.asarray([g["informative_counts"] for g, _ in records], float)
+        depth = np.asarray([g["informative_depths"] for g, _ in records], float)
+        mean = np.asarray([g[p+"_mean_profile_deviance"] for g, p in records], float)
+        maximum = np.asarray([g[p+"_maximum_profile_deviance"] for g, p in records], float)
+        total, regional_mean, regional_maximum = count.sum(axis=0), np.full(r, np.nan), np.full(r, np.nan)
+        state = []
+        for j in range(r):
+            active = count[:, j] > 0
+            failed = any(g["diagnostic_status"] == "failed" for (g, _), use in zip(records, active) if use)
+            missing = np.isnan(mean[active, j]).any() or np.isnan(maximum[active, j]).any()
+            state.append("failed" if failed else "missing" if not active.any() or missing else "available")
+            if state[-1] == "available":
+                regional_mean[j] = np.sum(mean[active, j] * (count[active, j] / total[j]))
+                regional_maximum[j] = maximum[active, j].max()
+        counts.append(total)
+        depths.append(depth.sum(axis=0))
+        means.append(regional_mean)
+        maxima.append(regional_maximum)
+        availability.append(state)
     reference = AssignmentReference(tuple(range(len(centers))), catalog.region_ids, np.asarray(centers), tuple(source_map),
-        source_informative_count=np.asarray([g["informative_counts"] for g, _ in measurements]),
-        source_informative_depth=np.asarray([g["informative_depths"] for g, _ in measurements]),
-        source_mean_profile_deviance=np.asarray([g[p+"_mean_profile_deviance"] for g, p in measurements]),
-        source_maximum_profile_deviance=np.asarray([g[p+"_maximum_profile_deviance"] for g, p in measurements]),
-        diagnostic_availability=[["failed" if g["diagnostic_status"] == "failed" else
-            "available" if count else "missing" for count in g["informative_counts"]] for g, _ in measurements],
-        center_sources=tuple(sources))
+        source_informative_count=np.asarray(counts), source_informative_depth=np.asarray(depths),
+        source_mean_profile_deviance=np.asarray(means), source_maximum_profile_deviance=np.asarray(maxima),
+        diagnostic_availability=availability,
+        center_sources=tuple(dict(center_source="exact_consolidation", sources=entries,
+            diagnostic_aggregation="disjoint_native_source_members_or_declared_fixed_hypothesis_source") for entries in sources))
     g0 = tuple(mutation for mutation, label in zip(stage_one.mutation_ids, stage_one.labels)
                if label == selected["source_label"])
-    if not g0:
-        raise ValueError("Selected Stage 1 provisional source must be occupied")
     second_ids = () if stage_two is None else stage_two.mutation_ids
-    if set(g0) & set(second_ids) or set(g0) | set(second_ids) != set(stage_one.mutation_ids):
+    if not g0 or set(g0) & set(second_ids) or set(g0) | set(second_ids) != set(stage_one.mutation_ids):
         raise ValueError("Accepted Stage 2 and provisional source must partition Stage 1")
-    merged_ids = () if stage_two is None else tuple(mutation for mutation, label in
-        zip(stage_two.mutation_ids, stage_two.labels) if label in merged)
-    targets = tuple(sorted(g0 + merged_ids))
-    source_labels = {(row["source_stage"], row["source_label"]): row["baseline_reference_label"] for row in source_map}
-    unchanged = {} if stage_two is None else {mutation: source_labels[(stage_two.source_id, int(label))]
-        for mutation, label in zip(stage_two.mutation_ids, stage_two.labels) if label not in merged}
-    if set(targets) & set(unchanged) or set(targets) | set(unchanged) != set(stage_one.mutation_ids):
-        raise AssertionError("Stage 3 target and unchanged populations must partition the accepted baseline")
-    return reference, targets, unchanged, source_map
+    return reference, tuple(sorted(g0 + second_ids)), {}, source_map
 
 
 def _stage_two_caps(catalog, audits):
-    """Minimum available native MAP call; no contributor retains original support."""
+    """Minimum upper endpoint of available exact native MAP sets."""
     original = catalog.default_bounds()
     upper = np.array(original.upper)
     contributors = {}
     for record in audits:
         if record["contributes_to_cap"]:
-            key, call = (record["region_id"], record["segment_id"]), int(record["cap_source_map_call"])
+            key, call = (record["region_id"], record["segment_id"]), int(record["cap_source_map_upper"])
             previous, count = contributors.get(key, (call, 0))
             contributors[key] = min(previous, call), count + 1
     policies = {}
@@ -480,13 +523,13 @@ def _stage_two_caps(catalog, audits):
                 policies[key] = dict(region_id=region, segment_id=key[1],
                     multiplicity_endpoint=endpoint, contributor_count=count,
                     fallback=count == 0, fallback_policy="original_upper",
-                    applies_to="originally_eligible_genuine_pairs", policy="minimum_available_native_map")
+                    applies_to="originally_eligible_genuine_pairs", policy="minimum_native_map_set_upper")
             if count and catalog.mapping_genuine[i, j] and catalog.eligible[i, j]:
                 upper[i, j] = endpoint
             if original.lower[i, j] > upper[i, j] or upper[i, j] > original.upper[i, j]:
                 raise ValueError("Segment-derived cap exceeds the original biological support")
     return MultiplicityBounds(catalog.mutation_ids, catalog.region_ids,
-        original.lower, upper, "minimum_available_native_map"), list(policies.values())
+        original.lower, upper, "minimum_native_map_set_upper"), list(policies.values())
 
 
 def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
@@ -504,21 +547,30 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable")
     config, output = workflow_config, reserve_output(outdir)
-    common_receipt = dict(schema="clipp2.workflow.v4", protocol_version=PROTOCOL_VERSION,
+    common_receipt = dict(schema="clipp2.workflow.v5", protocol_version=PROTOCOL_VERSION,
         implementation_version=__version__, config=asdict(config),
+        source_policy="nearest_to_one", cap_policy="minimum_native_map_set_upper",
+        reference_policy="exact_unique_all_one_source_and_all_stage_two",
+        reassessment_policy="all_combined_fitted_mutations",
         provenance_policy="biological_and_numerical_identity_no_file_checksums")
     try:
         catalog = load_original_catalog(input_path, max_major_cn=config.fit.max_major_cn)
     except Exception as error:
+        from .io.tumor_txt import audit_input
+        audit = audit_input(input_path, max_major_cn=config.fit.max_major_cn, normal_cn_policy=config.normal_cn_policy)
         publish_workflow_receipt(output, dict(common_receipt, status="failed", failed_stage="input",
-            error_type=type(error).__name__, error=str(error)))
+            evidence_status=audit["status"] if audit["status"] != "ready" else "computation_failed",
+            input_audit=audit, error_type=type(error).__name__, error=str(error)))
         raise
     save_original_catalog(catalog, output / "original_catalog.json")
     from .io.data import validate_workflow_mapping
     try:
         validate_workflow_mapping(catalog, normal_cn_policy=config.normal_cn_policy)
     except ValueError as error:
+        from .io.tumor_txt import audit_input
+        audit = audit_input(input_path, max_major_cn=config.fit.max_major_cn, normal_cn_policy=config.normal_cn_policy)
         publish_workflow_receipt(output, dict(common_receipt, status="failed", failed_stage="input",
+            evidence_status=audit["status"] if audit["status"] != "ready" else "input_invalid", input_audit=audit,
             reason="unsupported_biological_mapping", error=str(error),
             biological_identity=catalog.biological_identity))
         raise
@@ -537,7 +589,8 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         accepted = value if isinstance(value, AcceptedFit) else load_accepted_fit(value)
         if accepted.source_id != stage:
             raise ValueError("Accepted receipt source stage does not match requested replay stage")
-        validate_replay_policy(accepted, settings, normal_cn_policy=config.normal_cn_policy)
+        original = validate_replay_policy(accepted, settings, normal_cn_policy=config.normal_cn_policy)
+        accepted.validate_input_identity(catalog, original)
         return accepted
     def replay(accepted, ids, bounds, settings):
         return accepted.validate(catalog, expected_ids=ids, expected_support=bounds,
@@ -651,24 +704,27 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         reference, targets, unchanged_map, source_map = _build_stage_three_inputs(
             catalog, stage_one, stage_two, selected, group_two, config)
         centers = reference.centers
-        merged_members = set(targets) - reference_members
+        stage_two_members = set(targets) - reference_members
         non_targets = tuple(unchanged_map)
+        if non_targets or set(targets) != set(stage_one.mutation_ids):
+            raise AssertionError("Protocol 2.3 must reassess the entire combined fitted population")
         combined = set(targets) | set(non_targets)
         q2 = 0 if stage_two is None else len(stage_two.centers)
-        merged_count = 1 + q2 - len(centers)
-        receipt["counts"].update(merged_groups=merged_count, combined_mutations=len(combined), K=len(centers),
+        receipt["counts"].update(merged_groups=0, exact_duplicate_centers=2 + q2 - len(centers),
+            combined_mutations=len(combined), K=len(centers),
             targets=len(targets), non_targets=len(non_targets), unchanged_non_target=len(non_targets))
         write_supporting_table(output / "source_to_reference.tsv", source_map)
         write_supporting_table(output / "reference_vectors.tsv", [dict(reference_label=label,
             prior=1 / len(centers), **{"phi_" + region: float(center[j]) for j, region in enumerate(catalog.region_ids)})
             for label, center in enumerate(centers)])
         baselines = {}
-        for fit, members in ((stage_one, reference_members), (stage_two, merged_members)):
+        for fit, members in ((stage_one, reference_members), (stage_two, stage_two_members)):
             if fit is not None:
                 for i, mutation in enumerate(fit.mutation_ids):
                     if mutation in members:
                         baselines[mutation] = (fit, i)
         baseline_rows = [baselines[mutation] for mutation in targets]
+        source_labels = {(row["source_stage"], row["source_label"]): row["baseline_reference_label"] for row in source_map}
         bundle = AssignmentBundle(catalog, reference, targets, non_targets,
             np.asarray([fit.centers[fit.labels[i]] for fit, i in baseline_rows]),
             np.asarray([fit.multiplicities[i] for fit, i in baseline_rows]),
@@ -676,7 +732,8 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
             np.asarray([fit.support.upper[i] for fit, i in baseline_rows]),
             tuple(fit.source_id for fit, _ in baseline_rows),
             tuple(int(fit.labels[i]) for fit, i in baseline_rows),
-            (0,)*len(targets), device=config.fit.device, cpu_threads=config.fit.cpu_threads,
+            tuple(source_labels[(fit.source_id, int(fit.labels[i]))] for fit, i in baseline_rows),
+            device=config.fit.device, cpu_threads=config.fit.cpu_threads,
             normal_cn_policy=config.normal_cn_policy, run_manifest_id=run_manifest_id,
             provenance=dict(stage_two_caps_hash=caps.content_hash,
                  reference_contributors=reference_audit, native_stage_two_centers_preserved=True,
@@ -694,13 +751,14 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         if assignment.target_ids != targets:
             raise AssertionError("Stage 3 result population differs from the frozen targets")
         reassessment = {status: sum(row["reassessment_status"] == status for row in assignment.assignments)
-                        for status in ("retained_clonal", "reassigned", "unresolved")}
+                        for status in ("retained", "reassigned", "unresolved")}
         if sum(reassessment.values()) != len(targets):
             raise AssertionError("Stage 3 reassessments do not reconcile the frozen targets")
         receipt["current_phase"] = "final_reconciliation"
         original_rows, final_accounting = _reconcile_final_memberships(
             catalog, stage_one, stage_two, source_map, unchanged_map, assignment, contributors=reference_audit)
-        receipt.update(final_accounting=final_accounting, bundle_hash=bundle.content_hash, membership_merge_is_refit=False)
+        receipt.update(final_accounting=final_accounting, bundle_hash=bundle.content_hash,
+                       exact_reference_consolidation_is_refit=False)
         receipt["counts"].update(reassessment)
         receipt["current_phase"] = "whole_original_publication"
         write_supporting_table(output / "all_original_mutations.tsv", original_rows, columns=ORIGINAL_COMPARISON_COLUMNS)
@@ -711,7 +769,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         receipt["current_phase"] = "complete"
         return receipt
     except Exception as error:
-        receipt.update(status="failed", failed_stage=current_stage, failed_phase=receipt["current_phase"],
+        receipt.update(status="failed", evidence_status="computation_failed", failed_stage=current_stage, failed_phase=receipt["current_phase"],
                        error_type=type(error).__name__, error=str(error))
         if receipt[current_stage] not in ("accepted", "scored", "assigned"):
             receipt[current_stage] = "failed"
@@ -722,6 +780,8 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
 def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unchanged_map, result,
                                  *, contributors=()):
     """Construct whole-original final labels and combined accounting exactly once."""
+    if unchanged_map:
+        raise ValueError("The current workflow reassesses every combined fitted mutation")
     first, second, assignment = stage_one, stage_two, result
     mapping = {(row["source_stage"], row["source_label"]): row["baseline_reference_label"] for row in source_map}
     positions = [{} if fit is None else {m: i for i, m in enumerate(fit.mutation_ids)} for fit in (first, second)]
@@ -735,7 +795,7 @@ def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unch
         record = assignments.get(mutation)
         non_target = mutation in unchanged_map
         target = baseline is not None and not non_target
-        reason = ("stage2_near_clonal_recheck" if two is not None else "stage1_reference_recheck") if target else None
+        reason = ("stage2_recheck" if two is not None else "stage1_reference_recheck") if target else None
         if non_target and (two is None or unchanged_map[mutation] != baseline):
             raise ValueError("Unchanged population does not match accepted Stage 2 source construction")
         row = dict(mutation_id=mutation, original_eligible=bool(catalog.eligible[i].any()),
@@ -746,7 +806,10 @@ def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unch
             membership_origin="stage2_unchanged" if non_target else reason,
             historical_cap_contributor_reassigned=False,
             role="non_target" if non_target else "target" if target else "not_in_combined_baseline",
-            assignment_status=None, evidence_status=None, map_cluster_label=None,
+            assignment_status=None,
+            evidence_status="excluded" if not catalog.eligible[i].any() else "computation_failed",
+            map_cluster_label=None, map_label=None, map_set=(), posterior_defined=False,
+            reference_labels=() if assignment is None else assignment.reference.labels, probabilities=None,
             reassessment_status="unchanged_non_target" if non_target else "unavailable" if target else None,
             baseline_changed=False if non_target else None)
         for name, fit, lookup in (("stage_one", first, positions[0]), ("stage_two", second, positions[1])):
@@ -757,10 +820,18 @@ def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unch
             if not target or record["baseline_label"] != baseline or record["target_reason"] != reason:
                 raise ValueError("Target reassessment does not match its native source and baseline")
             row.update(assignment_status=record["status"], evidence_status=record["evidence_status"], map_cluster_label=record["map_cluster_label"],
+                map_label=record["map_label"], map_set=record["map_set"], posterior_defined=record["posterior_defined"],
+                probabilities=record["probabilities"],
                 final_assignment_label=record["final_assignment_label"], reassessment_status=record["reassessment_status"],
                 baseline_changed=record["baseline_changed"],
                 historical_cap_contributor_reassigned=bool(mutation in historical and record["final_assignment_label"] is not None
-                    and record["final_assignment_label"] != assignment.reference.clonal_label))
+                    and record["final_assignment_label"] != baseline))
+        elif row["original_input_status"] == "no_information":
+            row["evidence_status"] = "prior_only"
+            if assignment is not None:
+                row.update(posterior_defined=True, probabilities=assignment.reference.priors,
+                    map_label=min(assignment.reference.labels), map_cluster_label=min(assignment.reference.labels),
+                    map_set=tuple(sorted(assignment.reference.labels)))
         rows.append(row)
     if assignment is None:
         return rows, dict(status="unavailable", population_count=0, unchanged_map=dict(unchanged_map))
@@ -779,12 +850,15 @@ def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unch
         if counts[str(label)] != unchanged[str(label)] + sum(row["final_assignment_label"] == label for row in assignment.assignments):
             raise AssertionError("Final occupancy differs from unchanged members plus observed MAP targets")
     origins = {reason: {outcome: sum(row["target_reason"] == reason and row["reassessment_status"] == outcome for row in rows)
-                       for outcome in ("retained_clonal", "reassigned", "unresolved")}
-               for reason in ("stage1_reference_recheck", "stage2_near_clonal_recheck")}
-    return rows, dict(status="complete", population_count=population, final_occupancy=counts,
+                       for outcome in ("retained", "reassigned", "unresolved")}
+               for reason in ("stage1_reference_recheck", "stage2_recheck")}
+    return rows, dict(status="complete", reassessment_policy="all_combined_fitted_mutations",
+        population_count=population, final_occupancy=counts,
         unchanged_map=dict(unchanged_map), unchanged_non_target_occupancy=unchanged, unresolved_targets=unresolved,
         outcomes_by_origin=origins,
         evidence_status_counts={status: sum(row["evidence_status"] == status for row in assignment.assignments)
-            for status in ("observed", "prior_only", "model_incompatible", "excluded")},
+            for status in EVIDENCE_STATUSES},
+        original_evidence_status_counts={status: sum(row["evidence_status"] == status for row in rows)
+            for status in EVIDENCE_STATUSES},
         historical_cap_contributors_reassigned=sum(row["historical_cap_contributor_reassigned"] for row in rows),
         historical_caps_recomputed=False)

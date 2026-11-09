@@ -46,7 +46,8 @@ def _blocked_count(directory):
 def _available_contributors(directory):
     from CliPP2.workflow import _stage_two_caps
     cases = (("weak", 0, 1, 1.), ("residual", 40, 100, .2),
-             ("tie", 0, 1, np.nextafter(0., 1.)), ("zero", 0, 100, 0.), ("missing", 0, 0, 1.))
+             ("tie", 0, 1, np.nextafter(0., 1.)), ("zero", 0, 100, 0.),
+             ("missing", 0, 0, 1.), ("incompatible", 1, 100, 0.))
     results = {}
     for name, alt, depth, phi in cases:
         catalog = write_catalog(directory / (name+"_cap.tsv"), [[alt]], depth, 4)
@@ -55,17 +56,22 @@ def _available_contributors(directory):
         caps, policies = _stage_two_caps(catalog, [row])
         results[name] = row
         assert row["native_source_call"] == 2.
-        if name in ("zero", "missing"):
+        if name in ("missing", "incompatible"):
             assert not row["contributes_to_cap"] and caps.upper.item() == 4 and policies[0]["fallback"]
         else:
-            assert row["contributes_to_cap"] and caps.upper.item() == row["cap_source_map_call"]
-            assert caps.policy_id == "minimum_available_native_map"
+            assert row["contributes_to_cap"] and caps.upper.item() == row["cap_source_map_upper"]
+            assert caps.policy_id == "minimum_native_map_set_upper"
     assert results["weak"]["map_probability"] < .95 and results["weak"]["cap_source_map_call"] == 1
     assert results["residual"]["profile_deviance"] > 10.
     assert not results["tie"]["map_unique"] and results["tie"]["cap_source_map_call"] == 1
     assert tuple(results["tie"]["map_tied_values"]) == (1, 2)
-    return dict(weak_call_lowers_cap=True, large_residual_contributes=True, exact_tie_smallest_integer=True,
-                missing_and_zero_ccf_fallback=True, historical_call_preserved=True)
+    assert results["tie"]["cap_source_map_upper"] == 2
+    assert results["zero"]["cap_source_map_upper"] == 4 and not results["zero"]["multiplicity_read_informative"]
+    assert results["zero"]["availability_reason"] == "flat_native_likelihood"
+    assert results["incompatible"]["availability_reason"] == "model_incompatible"
+    return dict(weak_call_lowers_cap=True, large_residual_contributes=True, exact_tie_upper_endpoint=True,
+                zero_ccf_flat_distribution_unrestrictive=True, undefined_distribution_not_uniform=True,
+                missing_fallback=True, historical_call_preserved=True)
 
 
 def _capped_target_and_replay(directory):
@@ -85,7 +91,8 @@ def _capped_target_and_replay(directory):
     second = load_accepted_fit(output / "stage_two_accepted.json")
     request = load_assignment_bundle(output / "assignment_bundle.json")
     capped_targets = np.array([stage == "stage_two" for stage in request.source_stages])
-    assert capped_targets.any() and request.non_target_ids
+    assert capped_targets.any() and not request.non_target_ids
+    assert set(request.target_ids) == set(first.mutation_ids)
     assert np.all(request.native_upper[capped_targets] == 1)
     assert np.all(request.bounds.lower == 1) and np.all(request.bounds.upper == 4)
     for source in request.reference.lineage:
@@ -95,9 +102,9 @@ def _capped_target_and_replay(directory):
     counts = receipt["counts"]
     assert counts["N1"] == counts["N0"] + counts["N2"] == counts["combined_mutations"]
     assert counts["targets"] + counts["non_targets"] == counts["combined_mutations"]
-    assert sum(counts[key] for key in ("retained_clonal", "reassigned", "unresolved")) == counts["targets"]
+    assert sum(counts[key] for key in ("retained", "reassigned", "unresolved")) == counts["targets"]
     whole = pd.read_csv(output / "all_original_mutations.tsv", sep="\t")
-    assert (whole.loc[whole.role == "non_target", "reassessment_status"] == "unchanged_non_target").all()
+    assert (whole.role == "target").all() and counts["non_targets"] == 0
     assert not (output / "donor_contributors.tsv").exists()
     assert not (output / "stage_three_bounds.tsv").exists()
     for accepted in (first, second):
@@ -138,7 +145,7 @@ def _capped_target_and_replay(directory):
             expect_value_error(lambda: run_workflow(other_path, directory / f"wrong_tumor_replay_{index}",
                 config, accepted_stage_one=pair[0], accepted_stage_two=pair[1]))
     return dict(stage_two_targets=int(capped_targets.sum()), native_upper=1, stage_three_upper=4,
-                non_target_centers_preserved=True, counts=counts, accepted_copy_immutable=True,
+                every_native_center_preserved=True, counts=counts, accepted_copy_immutable=True,
                 repeated_replay_rejects_other_tumor_before_numerics=True,
                 originating_manifest_tampering_rejected=True, accepted_stages_survive_derived_failures=True,
                 current_and_originating_execution_links_separate=True, replay_policy=policy_checks)
@@ -153,7 +160,7 @@ def _replay_policy_checks(directory, path, catalog, config, first, second):
         stage_one_larger_capacity=replace(config, fit=replace(config.fit, max_clusters=config.fit.max_clusters+1)),
         stage_two_capacity=replace(config, stage_two_max_clusters=config.stage_two_max_clusters+1),
         broader_audit=replace(config, fit=replace(config.fit, audit_scope="all")),
-        cn_eligibility=replace(config, fit=replace(config.fit, max_major_cn=config.fit.max_major_cn+1)),
+        cn_eligibility=replace(config, fit=replace(config.fit, max_major_cn=3)),
         normal_assumption=replace(config, normal_cn_policy="diploid"))
     for name, settings in cases.items():
         destination = directory / ("replay_policy_"+name)
@@ -167,9 +174,18 @@ def _replay_policy_checks(directory, path, catalog, config, first, second):
         expect_value_error(lambda: run_workflow(path, directory / "replay_policy_before_stage_one",
             cases["stage_two_capacity"], accepted_stage_two=second))
         assert fitter.call_count == 0
+    with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("Changed population started Stage 1 fit")) as fitter:
+        expect_value_error(lambda: run_workflow(path, directory / "replay_population_before_stage_one",
+            cases["cn_eligibility"], accepted_stage_two=second))
+        assert fitter.call_count == 0
     overridden = replace(config, fit=replace(config.fit, cpu_threads=2))
     with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("compatible replay refitted")) as fitter:
         replay = run_workflow(path, directory / "replay_thread_override", overridden,
+                              accepted_stage_one=first, accepted_stage_two=second)
+        assert replay["status"] == "complete" and fitter.call_count == 0
+    equivalent = replace(config, fit=replace(config.fit, max_major_cn=10))
+    with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("Equivalent population refitted")) as fitter:
+        replay = run_workflow(path, directory / "replay_equivalent_explicit_cutoff", equivalent,
                               accepted_stage_one=first, accepted_stage_two=second)
         assert replay["status"] == "complete" and fitter.call_count == 0
     # CUDA policy compatibility is checked without claiming a CUDA runtime here.
@@ -195,7 +211,8 @@ def _replay_policy_checks(directory, path, catalog, config, first, second):
     audited.validate(audited_catalog, cpu_threads=2)
     return dict(scientific_mismatches_rejected_without_optimizer=True, stage_two_specific_capacity=True,
         actual_audit_coverage=True, thread_override_numerically_replayed=True, device_override_policy_only=True,
-        original_receipts_unchanged=True)
+        original_receipts_unchanged=True, equivalent_population_cutoff_reused=True,
+        changed_population_rejected_before_any_optimizer=True)
 
 
 def _manifest_tampering(catalog, accepted):
@@ -248,10 +265,13 @@ def _execution_tampering(catalog, accepted):
         changed = copy.deepcopy(original)
         changed["fit_config"].pop(key)
         variants.append(changed)
-        if key != "cpu_threads":
+        if key not in ("cpu_threads", "max_major_cn"):
             changed = copy.deepcopy(original)
             changed["fit_config"][key] = None
             variants.append(changed)
+    changed = copy.deepcopy(original)
+    changed["fit_config"]["max_major_cn"] = 0
+    variants.append(changed)
     for key in ("build_id", "numerical_policy", "kind"):
         changed = copy.deepcopy(original)
         changed["execution"]["native"][key] = None
@@ -414,7 +434,7 @@ def _declared_fit(catalog, stage, ids, labels, centers, support, calls):
         biological_identity=catalog.biological_identity, tumor_id=catalog.tumor_id)
 
 
-def _geometric_routing(directory):
+def _reference_preservation(directory):
     from CliPP2.screening import summarize_profile_deviance
     catalog = write_catalog(directory / "geometric.tsv",
         [[250, 250], [300, 300], [250, 0], [300, 300], [237, 250], [237, 250]], 1000, 4,
@@ -436,20 +456,27 @@ def _geometric_routing(directory):
         groups = classify_groups(catalog, second, config)
         assert summarize.call_count == 4 * len(groups)
     assert selected["distance_to_one"] == 0.
-    assert groups[0]["near_clonal"] and max(groups[0]["native_mean_profile_deviance"]) > 10.
-    assert groups[1]["near_clonal"] and min(groups[1]["informative_counts"]) == 0
+    assert all("near_clonal" not in group for group in groups)
+    assert max(groups[0]["native_mean_profile_deviance"]) > 10.
+    assert min(groups[1]["informative_counts"]) == 0
     assert max(groups[2]["native_mean_profile_deviance"]) > max(groups[2]["original_native_mean_profile_deviance"])
-    assert not groups[3]["near_clonal"] and groups[4]["near_clonal"]
-    boundary = groups[3]["distance_to_one"]
-    assert not classify_groups(catalog, second, replace(config, stage_two_near_clonal_distance_max=boundary))[3]["near_clonal"]
-    assert classify_groups(catalog, second,
-        replace(config, stage_two_near_clonal_distance_max=np.nextafter(boundary, np.inf)))[3]["near_clonal"]
     reference, targets, unchanged, mapping = _build_stage_three_inputs(catalog, first, second, selected, groups, config)
-    assert set(targets) == {catalog.mutation_ids[i] for i in (0, 1, 2, 5)} and reference.labels == (0, 1, 2)
-    assert set(unchanged) == {catalog.mutation_ids[i] for i in (3, 4)}
-    np.testing.assert_array_equal(reference.centers, [[1., 1.], [.4, .4], [.95, 1.]])
+    assert set(targets) == set(catalog.mutation_ids) and reference.labels == (0, 1, 2, 3)
+    assert not unchanged
+    np.testing.assert_array_equal(reference.centers, [[1., 1.], [.4, .4], [.95, 1.], [np.nextafter(.95, 1.), 1.]])
+    np.testing.assert_array_equal(reference.priors, np.full(4, .25))
+    sources = reference.center_sources[0]["sources"]
+    assert len(sources) == 4 and sources[0]["center_source"] == "fixed_all_ones"
+    assert [(source["source_stage"], source["source_label"]) for source in sources[1:]] == [
+        ("stage_one", 0), ("stage_two", 0), ("stage_two", 1)]
+    np.testing.assert_array_equal(reference.source_informative_count[0], [3, 2])
+    assert sources[-1]["source_measurements"]["informative_counts"] == (1, 0)
     assert max(reference.source_mean_profile_deviance[1]) > 10.
-    assert [row["baseline_reference_label"] for row in mapping] == [0, 0, 0, 1, 2, 0]
+    assert [row["baseline_reference_label"] for row in mapping] == [0, 0, 0, 1, 2, 3]
+    for key, value in (("native_center", [.39, .4]), ("source_stage", "stage_one")):
+        changed = copy.deepcopy(groups)
+        changed[2][key] = value
+        expect_value_error(lambda: _build_stage_three_inputs(catalog, first, second, selected, changed, config))
     request = bundle(catalog, reference, target_ids=(ids[0],), native_upper=[[1, 1]])
     measured = assign_mutations(request).assignments[0]
     missing = replace(reference, source_mean_profile_deviance=None, source_maximum_profile_deviance=None,
@@ -459,8 +486,10 @@ def _geometric_routing(directory):
     assert alternative["final_assignment_label"] == 1
     np.testing.assert_array_equal(measured["probabilities"], alternative["probabilities"])
     np.testing.assert_array_equal(measured["log_scores"], alternative["log_scores"])
-    return dict(controlled_estimates_not_discovery=True, poor_diagnostics_and_missing_coverage_routed=True,
-                strict_boundary=True, frozen_inventory=3, raw_diagnostics_do_not_veto_map=True)
+    return dict(controlled_estimates_not_discovery=True, all_combined_targets=True,
+                exact_duplicates_consolidated=True, all_sources_preserved=True, equal_priors_after_consolidation=True,
+                near_identical_centers_distinct=True, no_geometric_routing=True,
+                frozen_inventory=4, raw_diagnostics_do_not_veto_map=True, wrong_source_diagnostics_rejected=True)
 
 
 def _historical_recovery(directory):
@@ -470,8 +499,7 @@ def _historical_recovery(directory):
     frame["segment_id"] = ["affected", "affected", "anchor"]
     write_tumor_txt(path, frame, dict(catalog.metadata))
     catalog = load_original_catalog(path)
-    # Explicitly permissive group/contributor screens allow the planted native
-    # G0 estimate; the target reassessment retains its stricter ordinary screen.
+    # Controlled native estimates isolate cap construction and final rescoring.
     config = workflow_config()
     fits, assignments = [], []
 
@@ -495,10 +523,11 @@ def _historical_recovery(directory):
         receipt = run_workflow(path, output, config)
     assert fitting.call_count == 2 and assigning.call_count == 1 and receipt["status"] == "complete"
     result, = assignments
-    one, two = result.assignments
-    assert one["target_reason"] == "stage1_reference_recheck" and two["target_reason"] == "stage2_near_clonal_recheck"
+    one, two, three = result.assignments
+    assert one["target_reason"] == "stage1_reference_recheck" and two["target_reason"] == three["target_reason"] == "stage2_recheck"
     np.testing.assert_array_equal(one["log_scores"], two["log_scores"])
     np.testing.assert_array_equal(one["probabilities"], two["probabilities"])
+    np.testing.assert_array_equal(one["probabilities"], three["probabilities"])
     assert one["final_assignment_label"] == two["final_assignment_label"] == 1
     np.testing.assert_allclose(one["posterior"], .998343610029, rtol=1e-10)
     final = receipt["final_accounting"]
@@ -517,7 +546,7 @@ def _historical_recovery(directory):
                 zero_clonal_occupancy=True, historical_contributor_moves_without_cap_recomputation=True)
 
 
-def _provisional_source_loss(directory):
+def _provisional_source_preservation(directory):
     catalog = write_catalog(directory / "subclonal_source.tsv", [[20], [10]], 100, 1, minor=1)
     config = workflow_config()
     first = _declared_fit(catalog, "stage_one", catalog.mutation_ids, [0, 1], [[.4], [.2]], catalog.default_bounds(), [[1], [1]])
@@ -529,10 +558,14 @@ def _provisional_source_loss(directory):
     second = _declared_fit(catalog, "stage_two", ids, [0], [[.2]], catalog.default_bounds().subset(ids), [[1]])
     reference, targets, unchanged, _ = _build_stage_three_inputs(catalog, first, second, selected,
         classify_groups(catalog, second, config), config)
-    np.testing.assert_array_equal(reference.centers, [[1.], [.2]])
-    assert targets == catalog.mutation_ids[:1] and set(unchanged) == set(ids)
+    np.testing.assert_array_equal(reference.centers, [[1.], [.4], [.2]])
+    assert targets == catalog.mutation_ids and not unchanged
     nearest = float(np.min(np.linalg.norm(reference.centers-[.4], axis=1)))
-    assert nearest == .2
+    assert nearest == 0.
+    np.testing.assert_array_equal(reference.priors, np.full(3, 1/3))
+    request = bundle(catalog, reference, native_centers=[[.4], [.2]])
+    scored = assign_mutations(request)
+    assert [row["map_label"] for row in scored.assignments] == [1, 2]
     with patch("CliPP2.workflow._diagnostics_many", side_effect=ValueError("reporting diagnostic failed")):
         failed = classify_groups(catalog, first, config)
     assert all(group["diagnostic_status"] == "failed" for group in failed)
@@ -545,8 +578,23 @@ def _provisional_source_loss(directory):
     assert select_reference_source(tied)["source_label"] == 0
     tied[1]["minimum_regional_depth"] += 1
     assert select_reference_source(tied)["source_label"] == 1
-    return dict(provisional_subclonal_source=.4, true_distance=.6, useful_reference_lost=True,
+    return dict(provisional_subclonal_source=.4, true_distance=.6, useful_reference_preserved=True,
                 nearest_retained_reference_error=nearest, diagnostic_failure_does_not_veto=True)
+
+
+def _empty_remainder(directory):
+    path = directory / "empty_remainder.tsv"
+    write_catalog(path, [[20], [20]], 100, 1, minor=1)
+    output = directory / "empty_remainder_workflow"
+    receipt = run_workflow(path, output, workflow_config())
+    assert receipt["status"] == "complete" and receipt["counts"]["N2"] == 0
+    request = load_assignment_bundle(output / "assignment_bundle.json")
+    assert request.target_ids == request.catalog.mutation_ids and not request.non_target_ids
+    assert len(request.reference.centers) == 2
+    np.testing.assert_allclose(request.reference.centers, [[1.], [.4]], rtol=0, atol=1e-7)
+    assert receipt["counts"]["targets"] == receipt["counts"]["combined_mutations"] == 2
+    assert receipt["counts"]["non_targets"] == 0
+    return dict(native_fit_completed=True, native_source_preserved=True, every_mutation_reassessed=True)
 
 
 def _historical_native_replay(directory):
@@ -577,7 +625,8 @@ def run_workflow_edge_checks(directory):
     return dict(historical_native_replay=_historical_native_replay(directory),
                 blocked_stage_two=_blocked_count(directory),
                 available_contributors=_available_contributors(directory),
-                provisional_reference_loss=_provisional_source_loss(directory),
+                provisional_reference_preservation=_provisional_source_preservation(directory),
                 capped_target_and_replay=_capped_target_and_replay(directory),
-                geometric_routing=_geometric_routing(directory),
+                reference_preservation=_reference_preservation(directory),
+                empty_remainder=_empty_remainder(directory),
                 historical_recovery=_historical_recovery(directory))
