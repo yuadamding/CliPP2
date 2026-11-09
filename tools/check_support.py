@@ -6,9 +6,9 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 
-from CliPP2 import DescriptiveScreen, FitConfig, WorkflowConfig
+from CliPP2 import FitConfig, WorkflowConfig
 from CliPP2.assignment import AssignmentBundle, AssignmentReference
-from CliPP2.config import AssignmentThresholds, PROTOCOL_VERSION
+from CliPP2.config import PROTOCOL_VERSION
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
 
 
@@ -27,21 +27,13 @@ def write_catalog(path, alt, depth, major, *, minor=0, purity=None, observed=Tru
 
 
 def fixture_reference(labels, region_ids, centers, *args, **kwargs):
-    """Declare external-reference quality explicitly for conditional fixtures."""
-    kwargs.setdefault("regional_quality", np.ones(np.asarray(centers).shape, bool))
-    kwargs.setdefault("regional_quality_reasons", tuple(tuple(() if flag else ("declared_fixture_quality_failure",)
-        for flag in row) for row in kwargs["regional_quality"]))
-    kwargs.setdefault("center_sources", tuple(dict(kind="declared_conditional_fixture") for _ in labels))
+    """Declare controlled coordinates without inventing diagnostic measurements."""
+    kwargs.setdefault("center_sources", tuple(dict(center_source="declared_conditional_fixture") for _ in labels))
     return AssignmentReference(labels, region_ids, centers, *args, **kwargs)
 
 
-def thresholds():
-    return AssignmentThresholds(.9, DescriptiveScreen(10., 5., .05), 1e-10, 1e-10, .95)
-
-
 def workflow_config(**changes):
-    config = WorkflowConfig(thresholds(), .95, 10., DescriptiveScreen(10., 5., .02), 1e-10,
-                            fit=FitConfig(device="cpu", max_clusters=10, cpu_threads=1))
+    config = WorkflowConfig(fit=FitConfig(device="cpu", max_clusters=10, cpu_threads=1))
     return replace(config, **changes)
 
 
@@ -63,7 +55,7 @@ def bundle(catalog, reference, *, target_ids=None, calls=None, native_upper=None
     data = catalog.prediction_data(targets)
     observed = data.count_observed & (data.total_counts > 0)
     baseline = 0 if 0 in reference.labels else reference.labels[0]
-    return AssignmentBundle(catalog, reference, targets, (), thresholds(),
+    return AssignmentBundle(catalog, reference, targets, (),
         np.ones(shape) if native_centers is None else native_centers,
         np.where(observed, 1., np.nan) if calls is None else calls,
         support.lower, support.upper if native_upper is None else native_upper,

@@ -5,7 +5,6 @@ from pathlib import Path
 
 import numpy as np
 
-from CliPP2.assignment import confidence_passes
 from CliPP2.io.data import MultiplicityBounds
 from CliPP2.kernel.backend import NativeBackend
 from CliPP2.kernel.observations import prepare_prediction
@@ -118,11 +117,6 @@ def _diagnostic(catalog, center, call, bounds=None):
         result = backend.component_diagnostics([[center]], [[call]])
     assert result["status"][0, 0] == 0
     return {key: value[0, 0] for key, value in result.items()}
-
-
-def _passes(row, threshold):
-    finite_rival = bool(row["has_second"] and np.isfinite(row["top_two_gap"]))
-    return confidence_passes(row["accepted_log_probability"], threshold, finite_rival)
 
 
 def _cpu_weight_checks():
@@ -296,9 +290,7 @@ def run_native_diagnostic_checks(directory):
         np.testing.assert_allclose(best["map_log_probability"], expected, rtol=2e-14, atol=0)
         assert best["accepted_log_probability"] == best["map_log_probability"]
         assert np.exp(best["map_log_probability"]) == 1. and best["map_multiplicity"] == 2
-        assert np.isfinite(best["top_two_gap"]) and not _passes(best, 1.)
-        assert _passes(best, np.nextafter(1., 0.))
-        assert _passes(best, .95)
+        assert np.isfinite(best["top_two_gap"])
         if depth == 100:
             assert best["map_log_probability"] < 0
         else:
@@ -308,23 +300,23 @@ def run_native_diagnostic_checks(directory):
         other = _diagnostic(catalog, 1., 1.)
         np.testing.assert_allclose(other["accepted_log_probability"],
                                    -depth*np.log(2.)+expected, rtol=2e-14)
-        assert not _passes(other, 1.)
+        assert other["accepted_log_probability"] < 0
 
     catalog = write_catalog(directory / "impossible_alternative.tsv", [[0]], 100, 2)
     sole_finite = _diagnostic(catalog, 1., 1.)
     assert sole_finite["has_second"] and np.isposinf(sole_finite["top_two_gap"])
-    assert sole_finite["map_log_probability"] == 0. and _passes(sole_finite, 1.)
+    assert sole_finite["map_log_probability"] == 0.
     impossible = _diagnostic(catalog, 1., 2.)
-    assert np.isneginf(impossible["accepted_log_probability"]) and not _passes(impossible, 1.)
+    assert np.isneginf(impossible["accepted_log_probability"])
     tied = _diagnostic(catalog, 0., 2.)
     np.testing.assert_allclose(tied["map_log_probability"], -np.log(2.), rtol=1e-15)
-    assert tied["top_two_gap"] == 0 and not _passes(tied, 1.)
+    assert tied["top_two_gap"] == 0
 
     catalog = write_catalog(directory / "singleton.tsv", [[100]], 100, 2)
     bounds = MultiplicityBounds(catalog.mutation_ids, catalog.region_ids, [[2]], [[2]])
     singleton = _diagnostic(catalog, 1., 2., bounds)
     assert not singleton["has_second"] and singleton["map_multiplicity"] == 2
-    assert np.isposinf(singleton["top_two_gap"]) and _passes(singleton, 1.)
+    assert np.isposinf(singleton["top_two_gap"])
     outside = _diagnostic(catalog, 1., 1., bounds)
     assert np.isneginf(outside["accepted_log_probability"])
 
@@ -338,7 +330,7 @@ def run_native_diagnostic_checks(directory):
                 single_state_contract=_single_state_contract_checks(directory),
                 stable_finite_gap_log_probability=True, underflow_cannot_imply_certainty=True,
                 impossible_alternative_and_singleton_certainty=True,
-                tied_and_nonmap_sources_rejected=True, absolute_emission_unchanged=True)
+                tied_and_nonmap_probabilities_retained=True, absolute_emission_unchanged=True)
 
 
 def _cuda_weight_fixtures():

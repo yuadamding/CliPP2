@@ -12,8 +12,6 @@ _EXPORTS = {
     "process_tumor": ".api",
     "load_tumor_txt": ".io.tumor_txt",
     "resolve_fit_config": ".config",
-    "AssignmentThresholds": ".config",
-    "DescriptiveScreen": ".config",
     "WorkflowConfig": ".config",
     "MultiplicityBounds": ".io.data",
     "OriginalCatalog": ".io.data",
