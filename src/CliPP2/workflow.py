@@ -30,7 +30,7 @@ GROUP_COLUMNS = ("source_stage", "source_label", "size", "native_center", "dista
         for field in ("informative_count", "mean_profile_deviance", "maximum_profile_deviance"))
 SEGMENT_POLICY_COLUMNS = ("region_id", "segment_id", "multiplicity_endpoint", "contributor_count",
     "fallback", "fallback_policy", "applies_to", "policy")
-ORIGINAL_COMPARISON_COLUMNS = ("mutation_id", "original_eligible", "original_input_status",
+ORIGINAL_COMPARISON_COLUMNS = ("mutation_id", "original_eligible", "original_input_status", "exclusion_reasons",
     "stage_one_label", "stage_two_label", "baseline_reference_label", "final_assignment_label", "role", "target_reason", "membership_origin",
     "stage_one_native_phi", "stage_one_native_calls", "stage_two_native_phi", "stage_two_native_calls",
     "assignment_status", "evidence_status", "map_cluster_label", "map_label", "map_set", "posterior_defined",
@@ -773,6 +773,14 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
                        error_type=type(error).__name__, error=str(error))
         if receipt[current_stage] not in ("accepted", "scored", "assigned"):
             receipt[current_stage] = "failed"
+        if not (output / "all_original_mutations.tsv").exists():
+            try:
+                rows, accounting = _reconcile_final_memberships(catalog, locals().get("stage_one"),
+                    locals().get("stage_two"), locals().get("source_map", []), {}, locals().get("assignment"))
+                write_supporting_table(output / "all_original_mutations.tsv", rows, columns=ORIGINAL_COMPARISON_COLUMNS)
+                receipt["final_accounting"] = accounting
+            except Exception as publication_error:
+                receipt["failure_accounting_error"] = dict(type=type(publication_error).__name__, message=str(publication_error))
         publish_workflow_receipt(output, receipt)
         raise
 
@@ -801,6 +809,10 @@ def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unch
         row = dict(mutation_id=mutation, original_eligible=bool(catalog.eligible[i].any()),
             original_input_status="filtered" if not catalog.eligible[i].any() else "no_information"
                 if not (catalog.eligible[i] & catalog.count_observed[i] & (catalog.total_counts[i] > 0)).any() else "eligible_informative",
+            exclusion_reasons=tuple(reason for reason, applies in (
+                ("explicit_input_exclusion", catalog.input_excluded[i].any()),
+                ("declared_major_cn_policy", catalog.max_major_cn is not None
+                    and (catalog.major_cn[i] > catalog.max_major_cn).any())) if applies),
             stage_one_label=one, stage_two_label=two, baseline_reference_label=baseline,
             final_assignment_label=unchanged_map.get(mutation), target_reason=reason,
             membership_origin="stage2_unchanged" if non_target else reason,

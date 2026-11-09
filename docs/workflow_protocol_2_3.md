@@ -160,3 +160,16 @@ python tools/qualify_workflow.py --device cpu --replicates 3 --output results/qu
 
 CUDA qualification/native cleanup remain deferred. CPU correctness checks do not
 establish GPU arithmetic, global optimality, calibration or biological superiority.
+
+The bounded comparison harness accepts an explicitly pinned earlier installation
+and source snapshot; it does not discover or modify historical runs:
+
+```sh
+python tools/compare_protocol23.py --outdir /new/comparison \
+  --baseline-python /historical/venv/bin/python --baseline-source /historical/src \
+  --baseline-revision ORIGINAL_COMMIT --current-revision CURRENT_COMMIT
+```
+
+It fixes three low-CN cases, two full-support Stage 2 comparisons and one separate
+high-CN population-expansion case before execution. Reports retain full-precision
+reference inventories, cap endpoints, target populations and membership outcomes.

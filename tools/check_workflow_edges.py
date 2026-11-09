@@ -379,6 +379,11 @@ def _derived_failures(directory, path, config, first, second):
         assert receipt["status"] == "failed" and receipt["stage_one"] == "accepted"
         assert receipt["failed_phase"] == failed
         assert receipt["counts"]["N1"] == len(first.mutation_ids)
+        whole = pd.read_csv(output / "all_original_mutations.tsv", sep="\t")
+        assert len(whole) == len(first.mutation_ids) and not whole.evidence_status.isna().any()
+        if failed != "assignment_publication":
+            assert set(whole.evidence_status) == {"computation_failed"}
+            assert whole.final_assignment_label.isna().all()
         if failed != "stage_one_diagnostics":
             assert receipt["stage_two"] == "accepted" and receipt["counts"]["N2"] == len(second.mutation_ids)
             assert load_accepted_fit(output / "stage_two_accepted.json").state_fingerprint == second.state_fingerprint
