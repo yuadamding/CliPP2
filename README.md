@@ -5,18 +5,18 @@ across tumor regions. It estimates cancer cell fractions (CCFs) and integer
 multiplicities under **one allele-specific tumor copy-number state per
 mutation–region observation**. Mixed tumor copy-number states are unsupported.
 
-Protocol **2.3** selects the Stage 1 group nearest all ones as a provisional
-reference source. Stage 2 fits the remainder with segment caps from the minimum
-available informative MAP multiplicity call. Stage 3 restores original support
-and returns probabilities and deterministic MAP labels against frozen references.
-Confidence, exact ties, coverage and fit discrepancy are diagnostics, not vetoes.
+Protocol **2.3** chooses a provisional Stage 1 source, then fits the remainder
+with caps from the minimum upper endpoint of native multiplicity MAP sets.
+Stage 3 restores original support and reassesses every fitted mutation against
+the canonical all-one hypothesis, the source's native center, and every Stage 2
+center. Exactly identical centers are consolidated before assigning equal priors.
+Confidence, ties, coverage, residuals and distance do not veto defined estimates.
 
-Cluster limits default to **10 for Stage 1 and 20 for Stage 2**. Strict,
-unnormalized L2 distance to all ones **less than 0.05** defines Stage 2 near-clonal
-routing only. Stage 1 source selection has no proximity gate: the selected source
-can be subclonal, and excluding it can remove a useful reference. The broader set
-of cap contributors can lower Stage 2 caps. These consequences are measured by
-evaluation. Package version **2.0.0** and protocol version **2.3** are separate.
+Cluster limits default to **10 for Stage 1 and 20 for Stage 2**. Valid integer CN
+has no automatic eligibility ceiling. Explicit input exclusions, model-domain
+checks and numerical verification remain. Package **2.0.0** and scientific
+protocol **2.3** have separate identities; versioned contracts distinguish the
+current reference-preserving method from earlier routing proposals.
 
 ## Install and run
 
@@ -28,7 +28,7 @@ clipp2 workflow --plan examples/workflow_protocol23.plan.json --output-dir resul
 ```
 
 The example plan declares one workflow configuration without acceptance thresholds.
-Outputs include native Stage 1/2 fits, provisional-source provenance, segment caps,
+Outputs include native Stage 1/2 fits, provisional-source provenance, exact reference consolidation, segment caps,
 reference vectors, complete probability vectors, MAP tie sets and raw diagnostics.
 `all_original_mutations.tsv` retains final membership and unchanged or unassigned
 mutations. Eligible targets without informative reads have a `prior_only` vector
@@ -39,6 +39,7 @@ and no data-supported final label; all-impossible candidates instead yield
 | --- | --- |
 | Three-stage method | `clipp2 workflow --plan PLAN.json --output-dir OUTPUT` |
 | Standalone native fit | `clipp2 fit --input-file INPUT.tsv --output-dir OUTPUT` |
+| Input audit | `clipp2 audit-input --input-file INPUT.tsv --output AUDIT.json` |
 | Frozen-reference reassignment | `clipp2 assign --bundle BUNDLE.json --output-dir OUTPUT` |
 | Biological study | `clipp2-simulate run --cohort-settings SETTINGS.json --outdir OUTPUT` |
 
@@ -75,7 +76,10 @@ zero depth, and input exclusion retain different meanings.
 
 Standalone fitting publishes mutation clusters, cluster centers, and regional
 multiplicity calls. Fitting uses the original CN denominator even when
-multiplicity support is restricted. Stage 3 restores that original support.
+multiplicity support is restricted. Stage 3 restores that original support for every fitted mutation. An explicit
+`--max-major-cn` selects a separately identified restricted population; the
+default retains all valid integer CN. Input audits report missing CN/purity and
+mapping problems without filling absent values.
 
 ## Simulation and checks
 

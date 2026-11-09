@@ -10,7 +10,9 @@ The [plan](workflow_protocol23.plan.json) declares one configuration for the
 [single-state input](workflow_protocol22.tsv). It has no probability or residual
 acceptance thresholds. Stage 1 allows 10 clusters and Stage 2 allows 20; CPU is
 the default backend. Stage 1 chooses a provisional source nearest all ones;
-Stage 3 returns deterministic MAP estimates for informative compatible targets.
+Stage 3 preserves native alternatives and returns deterministic MAP estimates
+for every informative compatible fitted mutation. There is no distance cutoff or
+automatic major-CN ceiling.
 The Protocol 2.2 plan is retained only for use with its historical installation.
 
 Replay its frozen Stage 3 request into a new directory:

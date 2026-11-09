@@ -1,11 +1,15 @@
 {
-  "schema": "clipp2.workflow.plan.v4",
+  "schema": "clipp2.workflow.plan.v5",
   "protocol_version": "2.3",
   "input_path": "workflow_protocol22.tsv",
   "workflow_config": {
-    "fit": {"device": "cpu", "max_clusters": 10, "cpu_threads": 1},
+    "fit": {
+      "device": "cpu",
+      "max_clusters": 10,
+      "cpu_threads": 1,
+      "max_major_cn": null
+    },
     "stage_two_max_clusters": 20,
-    "stage_two_near_clonal_distance_max": 0.05,
     "normal_cn_policy": null
   }
 }
