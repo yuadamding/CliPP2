@@ -23,7 +23,9 @@ def write_catalog(path, alt, depth, major, *, minor=0, purity=None, observed=Tru
         cn_state_fraction=1., allele_a_cn=int(major[i, r]), allele_b_cn=int(minor[i, r]))
         for i in range(alt.shape[0]) for r in range(alt.shape[1])]
     write_tumor_txt(path, pd.DataFrame(rows), metadata)
-    return load_original_catalog(path)
+    # These controlled fixtures declare a numerical observation mask, not the
+    # production default absence assumption. Preserve explicit missing fixtures.
+    return load_original_catalog(path, missing_counts="zero_alt" if observed.all() else "unobserved")
 
 
 def fixture_reference(labels, region_ids, centers, *args, **kwargs):

@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .config import (DEFAULT_AUDIT_SCOPE, DEFAULT_DEVICE, DEFAULT_MAX_CLUSTERS,
-                     DEFAULT_MAX_MAJOR_CN, PROTOCOL_VERSION, FitConfig, resolve_fit_config)
+                     DEFAULT_MAX_MAJOR_CN, DEFAULT_MISSING_COUNTS, PROTOCOL_VERSION, FitConfig, resolve_fit_config)
 from ._version import __version__
 
 
@@ -26,6 +26,8 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--multiplicity-support", help="Complete keyed TSV of multiplicity_lower/multiplicity_upper.")
     fit.add_argument("--normal-cn-policy", choices=["diploid"], default=None,
                      help="Explicitly assume diploid normal CN only where it was not supplied.")
+    fit.add_argument("--missing-counts", choices=("zero_alt", "unobserved"), default=DEFAULT_MISSING_COUNTS,
+                     help="Missing pairs use ALT=0 with supplied or regional median depth; unobserved opts out.")
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
     fit.add_argument(
         "--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN,
@@ -51,13 +53,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Explicitly derive a current-policy result from a frozen historical bundle.")
     assign.add_argument("--output-dir", required=True)
     audit = subparsers.add_parser("audit-input", allow_abbrev=False,
-                                 help="Report missing/invalid biological input without fitting or filling values.")
+                                 help="Report input readiness and read imputation without fitting or changing source files.")
     inputs = audit.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--input-file", dest="input_path")
     inputs.add_argument("--input-dir", dest="input_path")
     audit.add_argument("--output", required=True)
     audit.add_argument("--normal-cn-policy", choices=["diploid"])
     audit.add_argument("--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN)
+    audit.add_argument("--missing-counts", choices=("zero_alt", "unobserved"), default=DEFAULT_MISSING_COUNTS)
     return parser
 
 
@@ -83,7 +86,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "audit-input":
         from .io.tumor_txt import audit_input
         from .io.publication import publish_json
-        result = audit_input(args.input_path, max_major_cn=args.max_major_cn, normal_cn_policy=args.normal_cn_policy)
+        result = audit_input(args.input_path, max_major_cn=args.max_major_cn, normal_cn_policy=args.normal_cn_policy,
+                             missing_counts=args.missing_counts)
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
         publish_json(output, json.dumps(result, indent=2, allow_nan=False) + "\n")
@@ -129,6 +133,7 @@ def main(argv: list[str] | None = None) -> None:
         fit_config=args._fit_config,
         multiplicity_support=args.multiplicity_support,
         normal_cn_policy=args.normal_cn_policy,
+        missing_counts=args.missing_counts,
         run_manifest_id=args.run_manifest_id,
     )
 

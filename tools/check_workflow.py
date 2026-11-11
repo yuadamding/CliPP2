@@ -265,7 +265,7 @@ def check_conditional_information(directory):
     catalog = write_catalog(directory / "observation_flags.tsv", [[0, 0, 0, 0]],
         [[100, 0, 100, 100]], [[3, 3, 3, 11]], minor=1, observed=[[1, 1, 0, 1]])
     # Exercise an explicitly restricted historical population, not the new default.
-    catalog = load_original_catalog(directory / "observation_flags.tsv", max_major_cn=10)
+    catalog = load_original_catalog(directory / "observation_flags.tsv", max_major_cn=10, missing_counts="unobserved")
     reference = fixture_reference((0,), catalog.region_ids, np.ones((1, 4)))
     result = assign_mutations(bundle(catalog, reference), outdir=directory / "observation_flags")
     assert [row["informative"] for row in result.multiplicities] == [True, False, False, False]

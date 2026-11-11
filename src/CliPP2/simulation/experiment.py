@@ -16,7 +16,7 @@ import numpy as np
 
 from CliPP2._version import __version__
 from CliPP2.assignment import AssignmentBundle, assign_mutations
-from CliPP2.config import PROTOCOL_VERSION, WorkflowConfig
+from CliPP2.config import PROTOCOL_VERSION, WorkflowConfig, STAGE_THREE_REFERENCE_POLICY
 from CliPP2.io.assignment import (load_accepted_fit, reserve_output, save_accepted_fit,
                                  save_assignment_bundle, save_original_catalog, publish_assignment,
                                  write_supporting_table)
@@ -41,7 +41,7 @@ def _error(error, stage):
 
 
 def _freeze_arm(catalog, first, selected_group, second, groups, g0, config, arm_name, arm_path, *, run_manifest=None):
-    """Preserve exact native alternatives and reassess the entire fitted population."""
+    """Freeze one clonal reference and Stage 2 alternatives; reassess all members."""
     reference, targets, unchanged, lineage = _build_stage_three_inputs(
         catalog, first, second, selected_group, groups, config)
     g0_set = set(g0)
@@ -55,7 +55,7 @@ def _freeze_arm(catalog, first, selected_group, second, groups, g0, config, arm_
     labels = {m: label_map[fit.source_id, int(fit.labels[i])] for m, (fit, i) in sources.items()}
     if unchanged or set(targets) != set(labels):
         raise AssertionError("Paired Stage 3 requires all fitted mutations and no unchanged subset")
-    consolidated_count = 2 + q2 - len(centers)
+    consolidated_count = 1 + q2 - len(centers)
     native_centers = {m: fit.centers[fit.labels[i]].tolist() for m, (fit, i) in sources.items()}
     selected = [sources[m] for m in targets]
     bundle = AssignmentBundle(catalog, reference, targets, non_targets,
@@ -69,6 +69,7 @@ def _freeze_arm(catalog, first, selected_group, second, groups, g0, config, arm_
         normal_cn_policy=config.normal_cn_policy,
         run_manifest_id=None if run_manifest is None else run_manifest["run_manifest_id"],
         provenance=dict(study_plan_version="1.2", protocol_version=PROTOCOL_VERSION, arm=arm_name,
+                        reference_policy=STAGE_THREE_REFERENCE_POLICY,
                         native_stage_two_centers_preserved=True))
     positions = {m: i for i, m in enumerate(catalog.mutation_ids)}
     indices = [positions[m] for m in targets]
@@ -82,7 +83,8 @@ def _freeze_arm(catalog, first, selected_group, second, groups, g0, config, arm_
         source_members={str(label): [m for m, value in labels.items() if value == label]
                         for label in reference.labels},
         counts=dict(N1=len(first.mutation_ids), N0=len(g0), N2=n2, Q2=q2,
-                    exact_consolidated_centers=consolidated_count, Ncombined=len(labels), combined_mutations=len(labels),
+                    clonal_source_consolidated=1, exact_consolidated_centers=consolidated_count,
+                    Ncombined=len(labels), combined_mutations=len(labels),
                     K=len(centers), T=len(targets), F=len(non_targets),
                     targets=len(targets), non_targets=len(non_targets)))
     # The baseline and exact scoring request exist on disk before any assignment.
@@ -116,6 +118,7 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
     start = perf_counter()
     ledger = dict(fit_count=0, assignment_pass_count=0, reused_fit_count=0, events=[])
     result = dict(schema="clipp2.paired-experiment.v5", study_plan_version="1.2",
+        reference_policy=STAGE_THREE_REFERENCE_POLICY,
         protocol_version=PROTOCOL_VERSION, implementation_version=__version__, status="running",
         config=asdict(config), stage_one=None, stage_one_status="not_started", stage_one_groups=[], g0_label=None,
         g0_ids=[], remainder_ids=[], contributors=[], cap_bounds=None, cap_records=[],
@@ -187,7 +190,7 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
     catalog, first = None, None
     current = "input"
     try:
-        catalog = load_original_catalog(input_path, max_major_cn=config.fit.max_major_cn)
+        catalog = load_original_catalog(input_path, max_major_cn=config.fit.max_major_cn, missing_counts=config.missing_counts)
         validate_workflow_mapping(catalog, normal_cn_policy=config.normal_cn_policy)
         run_manifest = prepare_run_manifest(catalog, run_manifest_id=run_manifest_id)
         resolved_manifest_id = run_manifest["run_manifest_id"]

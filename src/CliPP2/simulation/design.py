@@ -9,7 +9,7 @@ import platform
 
 import numpy as np
 
-from CliPP2.config import PROTOCOL_VERSION, FitConfig, WorkflowConfig
+from CliPP2.config import PROTOCOL_VERSION, STAGE_THREE_REFERENCE_POLICY, FitConfig, WorkflowConfig
 from CliPP2._version import __version__
 from CliPP2.provenance import validate_run_manifest_id
 
@@ -104,6 +104,7 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
             failures="retained in planned-population accounting; no fabricated estimates"),
         base_workflow_config=asdict(workflow_config()),
         evaluation=dict(record_schema="clipp2.simulation.evaluation.v5",
+            reference_policy=STAGE_THREE_REFERENCE_POLICY,
             primary="data-supported MAP sampled-region clonality, detailed membership and CCF error",
             reference_match_atol=reference_match_atol, reference_distance="l2",
             reference_matching="full-vector unnormalized L2 at declared tolerance; maximum valid cardinality then minimum valid distance then lexical tie break",

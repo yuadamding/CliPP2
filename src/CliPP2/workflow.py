@@ -12,7 +12,8 @@ import numpy as np
 
 from .assignment import (AssignmentBundle, AssignmentReference, EVIDENCE_STATUSES,
                          assign_mutations, conditional_multiplicity)
-from .config import PROTOCOL_VERSION, COMPATIBLE_NATIVE_FIT_PROTOCOLS, WorkflowConfig
+from .config import (PROTOCOL_VERSION, COMPATIBLE_NATIVE_FIT_PROTOCOLS, WorkflowConfig,
+                     STAGE_THREE_REFERENCE_POLICY)
 from ._version import __version__
 from .io.data import (ImmutableArrayRecord, MultiplicityBounds, content_hash, freeze_record as _freeze,
                       json_value as _json_value, readonly_array)
@@ -422,7 +423,7 @@ def select_reference_source(groups):
 
 
 def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, group_two, config):
-    """Consolidate exactly equal hypotheses and reassess every fitted mutation."""
+    """Use one fixed clonal hypothesis; retain Stage 1's estimate as provenance."""
     selected = selected_group
     label = selected["source_label"]
     if label not in range(len(stage_one.centers)) or not np.any(stage_one.labels == label):
@@ -434,7 +435,9 @@ def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, gro
         raise ValueError("Stage 2 group diagnostics must cover exactly the accepted native groups")
     r = len(catalog.region_ids)
     centers, source_map = [np.ones(r)], []
-    sources = [[dict(center_source="fixed_all_ones", interpretation="imposed_hypothesis")]]
+    sources = [[dict(center_source="fixed_all_ones", interpretation="imposed_hypothesis",
+        diagnostic_source=dict(source_stage=stage_one.source_id, source_label=label,
+            interpretation="provisional_source_reads_at_fixed_all_ones"))]]
     measurements = [[]]
     inventory = {tuple(centers[0]): 0}
     for fit, groups in ((stage_one, [selected]), (stage_two, sorted(group_two, key=lambda g: g["source_label"]))):
@@ -444,7 +447,10 @@ def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, gro
             if (not np.array_equal(group["native_center"], center)
                     or group.get("source_stage", fit.source_id) != fit.source_id):
                 raise ValueError("Group diagnostics describe a different accepted native source")
-            key = tuple(center)
+            # The selected Stage 1 source and the fixed clonal hypothesis are
+            # one reference, even when the fitted source is not exactly one.
+            # Other native centers are not geometrically merged or altered.
+            key = tuple(centers[0] if fit is stage_one else center)
             if key not in inventory:
                 inventory[key] = len(centers)
                 centers.append(center)
@@ -457,21 +463,23 @@ def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, gro
                 native_center=center.tolist(), distance_to_one=float(np.linalg.norm(center - 1)))
             if fit is stage_one:
                 lineage["selection_rule"] = "nearest_to_one"
+                lineage["reference_center_policy"] = "fixed_all_ones"
+            else:
+                lineage["reference_center_policy"] = "native_stage_two"
             source_map.append(lineage)
             sources[baseline].append(dict(lineage,
-                center_source="accepted_stage_one_native" if fit is stage_one else "accepted_stage_two_native",
+                center_source="accepted_stage_one_clonal_source" if fit is stage_one else "accepted_stage_two_native",
                 accepted_state_hash=fit.state_fingerprint, support_hash=fit.support.content_hash,
                 source_measurements={name: group[name] for name in (
                     "informative_counts", "informative_depths", "native_mean_profile_deviance",
-                    "native_maximum_profile_deviance", "diagnostic_status")},
+                    "native_maximum_profile_deviance", "diagnostic_status") + ((
+                    "all_one_mean_profile_deviance", "all_one_maximum_profile_deviance")
+                    if fit is stage_one else ())},
+                reference_measurement="all_one" if fit is stage_one else "native",
                 diagnostic_error=group.get("diagnostic_error")))
-            measurements[baseline].append((group, "native"))
-    # A fixed all-one hypothesis has no fitted source when no native center is
-    # exactly one. Its discrepancy still describes the provisional source reads.
-    if not measurements[0]:
-        measurements[0] = [(selected, "all_one")]
-        sources[0][0]["diagnostic_source"] = dict(source_stage=stage_one.source_id,
-            source_label=selected["source_label"], interpretation="provisional_source_reads_at_fixed_all_ones")
+            measurements[baseline].append((group, "all_one" if fit is stage_one else "native"))
+    if sum(np.all(center == 1) for center in centers) != 1 or source_map[0]["baseline_reference_label"] != 0:
+        raise AssertionError("Stage 3 requires one all-one reference including the Stage 1 source")
     counts, depths, means, maxima, availability = [], [], [], [], []
     for records in measurements:
         count = np.asarray([g["informative_counts"] for g, _ in records], float)
@@ -497,7 +505,7 @@ def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, gro
         source_informative_count=np.asarray(counts), source_informative_depth=np.asarray(depths),
         source_mean_profile_deviance=np.asarray(means), source_maximum_profile_deviance=np.asarray(maxima),
         diagnostic_availability=availability,
-        center_sources=tuple(dict(center_source="exact_consolidation", sources=entries,
+        center_sources=tuple(dict(center_source="single_clonal_and_exact_native_consolidation", sources=entries,
             diagnostic_aggregation="disjoint_native_source_members_or_declared_fixed_hypothesis_source") for entries in sources))
     g0 = tuple(mutation for mutation, label in zip(stage_one.mutation_ids, stage_one.labels)
                if label == selected["source_label"])
@@ -553,25 +561,28 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
     common_receipt = dict(schema="clipp2.workflow.v5", protocol_version=PROTOCOL_VERSION,
         implementation_version=__version__, config=asdict(config),
         source_policy="nearest_to_one", cap_policy="minimum_native_map_set_upper",
-        reference_policy="exact_unique_all_one_source_and_all_stage_two",
+        reference_policy=STAGE_THREE_REFERENCE_POLICY,
         reassessment_policy="all_combined_fitted_mutations",
         provenance_policy="biological_and_numerical_identity_no_file_checksums")
     try:
-        catalog = load_original_catalog(input_path, max_major_cn=config.fit.max_major_cn)
+        catalog = load_original_catalog(input_path, max_major_cn=config.fit.max_major_cn, missing_counts=config.missing_counts)
     except Exception as error:
         from .io.tumor_txt import audit_input
-        audit = audit_input(input_path, max_major_cn=config.fit.max_major_cn, normal_cn_policy=config.normal_cn_policy)
+        audit = audit_input(input_path, max_major_cn=config.fit.max_major_cn, normal_cn_policy=config.normal_cn_policy,
+                            missing_counts=config.missing_counts)
         publish_workflow_receipt(output, dict(common_receipt, status="failed", failed_stage="input",
             evidence_status=audit["status"] if audit["status"] != "ready" else "computation_failed",
             input_audit=audit, error_type=type(error).__name__, error=str(error)))
         raise
     save_original_catalog(catalog, output / "original_catalog.json")
+    common_receipt["read_counts"] = catalog.read_count_report
     from .io.data import validate_workflow_mapping
     try:
         validate_workflow_mapping(catalog, normal_cn_policy=config.normal_cn_policy)
     except ValueError as error:
         from .io.tumor_txt import audit_input
-        audit = audit_input(input_path, max_major_cn=config.fit.max_major_cn, normal_cn_policy=config.normal_cn_policy)
+        audit = audit_input(input_path, max_major_cn=config.fit.max_major_cn, normal_cn_policy=config.normal_cn_policy,
+                            missing_counts=config.missing_counts)
         publish_workflow_receipt(output, dict(common_receipt, status="failed", failed_stage="input",
             evidence_status=audit["status"] if audit["status"] != "ready" else "input_invalid", input_audit=audit,
             reason="unsupported_biological_mapping", error=str(error),
@@ -713,7 +724,8 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
             raise AssertionError("Protocol 2.3 must reassess the entire combined fitted population")
         combined = set(targets) | set(non_targets)
         q2 = 0 if stage_two is None else len(stage_two.centers)
-        receipt["counts"].update(merged_groups=0, exact_duplicate_centers=2 + q2 - len(centers),
+        receipt["counts"].update(merged_groups=0, clonal_source_consolidated=1,
+            exact_duplicate_centers=1 + q2 - len(centers),
             combined_mutations=len(combined), K=len(centers),
             targets=len(targets), non_targets=len(non_targets), unchanged_non_target=len(non_targets))
         write_supporting_table(output / "source_to_reference.tsv", source_map)
@@ -740,6 +752,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
             normal_cn_policy=config.normal_cn_policy, run_manifest_id=run_manifest_id,
             provenance=dict(stage_two_caps_hash=caps.content_hash,
                  reference_contributors=reference_audit, native_stage_two_centers_preserved=True,
+                 reference_policy=STAGE_THREE_REFERENCE_POLICY,
                  run_manifest_identity=run_manifest["manifest_identity"]))
         positions = {mutation: i for i, mutation in enumerate(catalog.mutation_ids)}
         target_rows = [positions[mutation] for mutation in targets]

@@ -8,15 +8,16 @@ mutation–region observation**. Mixed tumor copy-number states are unsupported.
 Protocol **2.3** chooses a provisional Stage 1 source, then fits the remainder
 with caps from the minimum upper endpoint of native multiplicity MAP sets.
 Stage 3 restores original support and reassesses every fitted mutation against
-the canonical all-one hypothesis, the source's native center, and every Stage 2
-center. Exactly identical centers are consolidated before assigning equal priors.
+one fixed all-one clonal reference and every Stage 2 center. The selected Stage 1
+source maps to that clonal reference; its native estimate remains provenance,
+not a competing cluster. Exact Stage 2 duplicates are consolidated before equal priors.
 Confidence, ties, coverage, residuals and distance do not veto defined estimates.
 
 Cluster limits default to **10 for Stage 1 and 20 for Stage 2**. Valid integer CN
 has no automatic eligibility ceiling. Explicit input exclusions, model-domain
 checks and numerical verification remain. Package **2.0.0** and scientific
 protocol **2.3** have separate identities; versioned contracts distinguish the
-current reference-preserving method from earlier routing proposals.
+current single-clonal-reference policy from earlier reference inventories.
 
 ## Install and run
 
@@ -71,15 +72,24 @@ See the [runnable examples](examples/README.md).
 CN and normal-CN provenance must be explicit. Regional files may supply
 `normal_cn` in their CNA table; an omitted normal CN requires an explicit
 `--normal-cn-policy diploid` for fitting, or `normal_cn_policy` in the workflow
-plan. Non-diploid normal CN remains supported. Missing observations, zero ALT,
-zero depth, and input exclusion retain different meanings.
+plan. Non-diploid normal CN remains supported.
+
+Missing pairs (`count_observed=0`, or an SNV absent from a region's list) default
+to **ALT=0**. REF uses the supplied positive read depth, otherwise that region's
+median positive depth among eligible observed pairs (half-read ties round up).
+Without either depth source, input validation fails. This is an **absence
+assumption**, not measured evidence: raw rows and imputation records are retained
+in workflow catalogs. Explicit exclusions and observed zero-depth pairs stay
+unchanged. To keep missing pairs uninformative, use `--missing-counts unobserved`
+for a fit or `"missing_counts": "unobserved"` in the workflow config.
 
 Standalone fitting publishes mutation clusters, cluster centers, and regional
 multiplicity calls. Fitting uses the original CN denominator even when
 multiplicity support is restricted. Stage 3 restores that original support for every fitted mutation. An explicit
 `--max-major-cn` selects a separately identified restricted population; the
 default retains all valid integer CN. Input audits report missing CN/purity and
-mapping problems without filling absent values.
+mapping problems without filling absent CN/purity, and report read imputations
+without modifying source files.
 
 ## Simulation and checks
 

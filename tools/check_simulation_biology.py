@@ -249,7 +249,8 @@ def run_biology_checks(directory):
             acquisition = acquire(history, 900, .8, 100)
             path = directory / f'{family}_{seed}.tsv'
             write_tumor_txt(path, acquisition, acquisition.attrs['metadata'])
-            catalog = load_original_catalog(path)
+            # Compare raw acquisition masks before any inference-only imputation.
+            catalog = load_original_catalog(path, missing_counts="unobserved")
             binding = validate_history_acquisition_link(history, acquisition.attrs['acquisition'], catalog,
                 history_manifest=dict(history_content_id=history_content_id(history)))
             assert binding['status'] == 'verified_history_binding', binding

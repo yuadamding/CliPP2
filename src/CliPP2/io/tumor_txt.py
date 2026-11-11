@@ -13,7 +13,8 @@ import numpy as np
 import pandas as pd
 
 from .data import CNFilterRecord, CNFilterReport, TumorData, OriginalCatalog, MultiplicityBounds, _indices, PURITY_MEAN_ATOL
-from ..config import DEFAULT_MAX_MAJOR_CN, validate_max_major_cn
+from ..config import DEFAULT_MAX_MAJOR_CN, DEFAULT_MISSING_COUNTS, validate_max_major_cn, validate_missing_counts
+from .read_counts import resolve_read_counts
 
 TUMOR_TXT_SCHEMA = "clipp2.tumor.long.v1"
 CN_FILTER_POLICY_ID = "major_limit_mutation_region_v4"
@@ -436,21 +437,24 @@ def _build_tumor_data(validated, *, report, normal_cn_policy=None):
 
 
 def load_tumor_txt(path: str | Path, *, max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN,
-                   normal_cn_policy=None) -> TumorData:
+                   normal_cn_policy=None, missing_counts=DEFAULT_MISSING_COUNTS) -> TumorData:
     """Load single-state scientific inputs, masking excluded pairs before fitting.
 
     Missing normal CN needs the explicit ``normal_cn_policy='diploid'`` assumption.
     Original raw provenance is retained only by ``load_original_catalog``.
     """
-    return _load_input(path, max_major_cn=max_major_cn, numerical=True, normal_cn_policy=normal_cn_policy)
+    return _load_input(path, max_major_cn=max_major_cn, numerical=True, normal_cn_policy=normal_cn_policy,
+                       missing_counts=missing_counts)
 
 
-def load_original_catalog(path: str | Path, *, max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN) -> OriginalCatalog:
+def load_original_catalog(path: str | Path, *, max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN,
+                          missing_counts=DEFAULT_MISSING_COUNTS) -> OriginalCatalog:
     """Preserve every canonical source key and provenance column before exclusions."""
-    return _load_input(path, max_major_cn=max_major_cn)
+    return _load_input(path, max_major_cn=max_major_cn, missing_counts=missing_counts)
 
 
-def audit_input(path: str | Path, *, max_major_cn=None, normal_cn_policy=None):
+def audit_input(path: str | Path, *, max_major_cn=None, normal_cn_policy=None,
+                missing_counts=DEFAULT_MISSING_COUNTS):
     """Report input readiness and missing-source causes without inventing biology.
 
     An absent profile cannot prove whether the source is unavailable or misnamed;
@@ -460,13 +464,14 @@ def audit_input(path: str | Path, *, max_major_cn=None, normal_cn_policy=None):
     from .data import validate_workflow_mapping
     from .region_files import audit_region_directory, read_region_directory
     cutoff = validate_max_major_cn(max_major_cn)
+    validate_missing_counts(missing_counts)
     if normal_cn_policy not in (None, "diploid"):
         raise ValueError("normal_cn_policy must be None or 'diploid'")
     source = Path(path).resolve()
     result = dict(schema="clipp2.input-audit.v1", source=str(source),
         analysis_scope="complete_requested_input", max_major_cn=cutoff,
         eligibility_policy="unrestricted_valid_cn" if cutoff is None else "major_cn_cutoff",
-        normal_cn_policy=normal_cn_policy, issues=[])
+        normal_cn_policy=normal_cn_policy, missing_counts=missing_counts, issues=[])
     issues = result["issues"]
     if not source.exists():
         issues.append(dict(status="input_missing", code="missing_input_path", source=str(source),
@@ -523,9 +528,10 @@ def audit_input(path: str | Path, *, max_major_cn=None, normal_cn_policy=None):
                         for mutation, region in absent)
                 if not issues:
                     validated = _validate_long_table(metadata, table)
-                    catalog = _catalog_from_validated(metadata, table, validated, max_major_cn=cutoff)
+                    catalog = _catalog_from_validated(metadata, table, validated, max_major_cn=cutoff,
+                                                       missing_counts=missing_counts)
                     validate_workflow_mapping(catalog, normal_cn_policy=normal_cn_policy)
-                    result.update(eligible_pairs=int(catalog.eligible.sum()),
+                    result.update(read_counts=catalog.read_count_report, eligible_pairs=int(catalog.eligible.sum()),
                         informative_pairs=int((catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)).sum()),
                         explicitly_excluded_pairs=int(catalog.input_excluded.sum()),
                         cn_cutoff_excluded_pairs=int((~catalog.cn_population_mask & ~catalog.input_excluded).sum()))
@@ -537,17 +543,21 @@ def audit_input(path: str | Path, *, max_major_cn=None, normal_cn_policy=None):
     return result
 
 
-def _load_input(path, *, max_major_cn, numerical=False, normal_cn_policy=None):
+def _load_input(path, *, max_major_cn, numerical=False, normal_cn_policy=None,
+                 missing_counts=DEFAULT_MISSING_COUNTS):
     from .region_files import read_region_directory
     max_major_cn = validate_max_major_cn(max_major_cn)
+    validate_missing_counts(missing_counts)
     path = Path(path).resolve()
     metadata, table = (read_region_directory(path, preserve_provenance=not numerical) if path.is_dir()
                        else _read_text_table(path, preserve_extra=True))
     validated = _validate_long_table(metadata, table)
     if numerical:
+        rows, _ = resolve_read_counts(validated.rows_by_unit, cutoff=max_major_cn, policy=missing_counts)
+        validated = _ValidatedLongTable(metadata, validated.mutation_ids, validated.sample_ids, rows)
         filtered, report = _filter_snv_cn(validated, max_major_cn=max_major_cn)
         return _build_tumor_data(filtered, report=report, normal_cn_policy=normal_cn_policy)
-    return _catalog_from_validated(metadata, table, validated, max_major_cn=max_major_cn)
+    return _catalog_from_validated(metadata, table, validated, max_major_cn=max_major_cn, missing_counts=missing_counts)
 
 
 def _provenance_flag(row, names, description, *, default=True):
@@ -567,7 +577,7 @@ def _provenance_flag(row, names, description, *, default=True):
     return values[0] if values else default
 
 
-def _catalog_from_validated(metadata, table, validated, *, max_major_cn):
+def _catalog_from_validated(metadata, table, validated, *, max_major_cn, missing_counts=DEFAULT_MISSING_COUNTS):
     """Freeze the pre-filter source already read by either public loader."""
     shape = (len(validated.mutation_ids), len(validated.sample_ids))
     numeric = {name: np.zeros(shape) for name in ("alt_counts", "total_counts", "major_cn", "minor_cn",
@@ -577,6 +587,7 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn):
     flags = {name: np.empty(shape, dtype=bool) for name in
              ("mapping_genuine", "normal_cn_supplied", "input_excluded")}
     original_rows = table.to_dict(orient="records")
+    rows, imputations = resolve_read_counts(validated.rows_by_unit, cutoff=max_major_cn, policy=missing_counts)
     # Match the ordinary loader's full-input, post-CN-filter canonical purity.
     canonical_purity = {}
     for (_, region), row in validated.rows_by_unit.items():
@@ -585,10 +596,9 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn):
             canonical_purity[region] = min(canonical_purity.get(region, value), value)
     for i, mutation in enumerate(validated.mutation_ids):
         for j, region in enumerate(validated.sample_ids):
-            row = validated.rows_by_unit[mutation, region]
+            row = rows[mutation, region]
             observed[i, j] = row["count_observed"]
-            # Preserve provided counts even when count_observed=0; the mask,
-            # rather than destructive normalization, defines numerical use.
+            # Effective counts include declared imputation; source_rows stay raw.
             numeric["alt_counts"][i, j] = row["alt_count"] or 0
             numeric["total_counts"][i, j] = (row["alt_count"] or 0) + (row["ref_count"] or 0)
             numeric["major_cn"][i, j] = row["allele_a_cn"]
@@ -607,7 +617,8 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn):
         count_observed=observed, eligible=eligible,
         segment_ids=segments, **flags,
         source_rows=source_rows, provenance=provenance, metadata=tuple(metadata.items()),
-        max_major_cn=max_major_cn, **numeric)
+        max_major_cn=max_major_cn, missing_counts=missing_counts, read_count_imputations=imputations,
+        _schema_version=6, **numeric)
 
 
 def _catalog_data(catalog, mutation_ids, *, prediction, normal_cn_policy=None):

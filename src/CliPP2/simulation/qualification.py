@@ -46,7 +46,8 @@ def _roundtrip(history, frame, directory):
     """Compare raw catalog values, not the masked numerical placeholders."""
     directory.mkdir(parents=True, exist_ok=True)
     path = write_tumor_txt(directory / "input_catalog.tsv", frame, frame.attrs["metadata"])
-    catalog = load_original_catalog(path)
+    # Acquisition qualification checks measured data, not inference imputation.
+    catalog = load_original_catalog(path, missing_counts="unobserved")
     acquisition = frame.attrs["acquisition"]
     if catalog.mutation_ids != history.mutation_ids or catalog.region_ids != history.region_ids:
         raise AssertionError("Canonical catalog axes do not align with physical truth")
@@ -69,7 +70,8 @@ def _roundtrip(history, frame, directory):
     # rows, and independently exercise the immutable JSON-payload constructor.
     reloaded = OriginalCatalog.from_dict(catalog.to_dict())
     table = pd.DataFrame([dict(row) for row in catalog.source_rows])
-    repeated = load_original_catalog(write_tumor_txt(directory / "roundtrip.tsv", table, dict(catalog.metadata)))
+    repeated = load_original_catalog(write_tumor_txt(directory / "roundtrip.tsv", table, dict(catalog.metadata)),
+                                     missing_counts="unobserved")
     for name in (*fields, "normal_cn_supplied"):
         _assert_equal(getattr(reloaded, name), getattr(catalog, name), "serialized " + name)
         _assert_equal(getattr(repeated, name), getattr(catalog, name), "rewritten " + name)

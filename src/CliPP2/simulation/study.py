@@ -16,7 +16,7 @@ from functools import lru_cache
 import numpy as np
 import pandas as pd
 
-from CliPP2.config import PROTOCOL_VERSION
+from CliPP2.config import PROTOCOL_VERSION, STAGE_THREE_REFERENCE_POLICY
 from CliPP2._version import __version__
 from CliPP2.io.data import content_hash, json_value
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
@@ -170,7 +170,7 @@ def _run_cell(task):
         input_path = attempt / "input_catalog.tsv"
         write_tumor_txt(input_path, frame, metadata)
         save_json(attempt / "acquisition.json", frame.attrs.get("acquisition", {}))
-        catalog = load_original_catalog(input_path, max_major_cn=config.fit.max_major_cn)
+        catalog = load_original_catalog(input_path, max_major_cn=config.fit.max_major_cn, missing_counts=config.missing_counts)
         truth_link = validate_history_acquisition_link(history, frame.attrs["acquisition"], catalog,
                                                        history_manifest=history_manifest)
         if truth_link["status"] != "verified_history_binding":
@@ -214,6 +214,7 @@ def _run_cell(task):
     value["execution_configs"] = task.get("execution_configs")
     value["evaluation_config"] = evaluation_config
     value["evaluation_schema"] = "clipp2.simulation.evaluation.v5"
+    value["reference_policy"] = STAGE_THREE_REFERENCE_POLICY
     value["protocol_version"] = PROTOCOL_VERSION
     value["implementation_version"] = __version__
     value["prior_cost_ledgers"] = ((prior.get("prior_cost_ledgers", [])+prior.get("cost_ledgers", []))
@@ -451,7 +452,8 @@ def _freeze_main_roster(root, contract):
 def _execute(root, contract, *, resume=False, retry_failed=False):
     root = Path(root).resolve()
     if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v7"
-            or contract.get("implementation_version") != __version__):
+            or contract.get("implementation_version") != __version__
+            or contract.get("evaluation", {}).get("reference_policy") != STAGE_THREE_REFERENCE_POLICY):
         raise ValueError(f"Execution requires a Protocol {PROTOCOL_VERSION} simulation contract; earlier studies require their original installed environment")
     if resume:
         frozen = read_json(root / "study_contract.json")
@@ -566,7 +568,8 @@ def run_optional_panels(root, contract, workers, *, retry_failed=False):
             job = completion["job"]
             history = _history(job)
             attempt = root / completion["attempt"]
-            catalog = load_original_catalog(attempt / "input_catalog.tsv", max_major_cn=config.fit.max_major_cn)
+            catalog = load_original_catalog(attempt / "input_catalog.tsv", max_major_cn=config.fit.max_major_cn,
+                                              missing_counts=config.missing_counts)
             paired = _paired_result(attempt) if completion.get("cost_ledgers") else {}
             second_catalog = None
             if options.get("independent_counts"):
@@ -578,7 +581,8 @@ def run_optional_panels(root, contract, workers, *, retry_failed=False):
                 second_path = output / f"{family}_independent_counts.tsv"
                 if not second_path.exists():
                     write_tumor_txt(second_path, second, dict(second.attrs["metadata"], tumor_id=catalog.tumor_id))
-                second_catalog = load_original_catalog(second_path, max_major_cn=config.fit.max_major_cn)
+                second_catalog = load_original_catalog(second_path, max_major_cn=config.fit.max_major_cn,
+                                                         missing_counts=config.missing_counts)
             run_reference_audit(history, catalog, paired, config, directory / "output", second_catalog=second_catalog)
             save_json(directory / "reference_audit.json", dict(source_attempt=source,
                 result=read_json(directory / "output" / "reference_audit.json")))
@@ -595,12 +599,14 @@ def run_optional_panels(root, contract, workers, *, retry_failed=False):
 
 def report(root, *, evaluation_config=None, report_dir=None):
     """Render cached metrics or explicitly reevaluate preserved inference evidence."""
-    from .evaluation import aggregate, normalize_evaluation_config, evaluation_definition, legacy_evaluation_definition
+    from .evaluation import (aggregate, normalize_evaluation_config, evaluation_definition,
+                             legacy_evaluation_definition, HISTORICAL_V5_REFERENCE_POLICY)
     from .figures import make_figures
     from .runtime import recorded_costs, qualification_costs
     from .reporting import planned_roster, reevaluate_cell, placeholder_for_cell, validate_cached_evaluation
     root = Path(root).resolve()
     contract = read_json(root / "study_contract.json")
+    reference_policy = contract.get("evaluation", {}).get("reference_policy", HISTORICAL_V5_REFERENCE_POLICY)
     derive = evaluation_config is not None
     if derive:
         if isinstance(evaluation_config, (str, Path)):
@@ -623,7 +629,7 @@ def report(root, *, evaluation_config=None, report_dir=None):
         if schema.endswith(".v1"):
             evaluation_config["reference_distance"] = "linf"
         evaluation_config = normalize_evaluation_config(evaluation_config)
-    definition = (evaluation_definition(evaluation_config) if schema.endswith(".v5") else
+    definition = (evaluation_definition(evaluation_config, reference_policy=reference_policy) if schema.endswith(".v5") else
                   legacy_evaluation_definition(schema, evaluation_config))
     definition_id = content_hash(definition)
     cells = [value for directory in sorted((root / "cells").glob("*")) if directory.is_dir()
@@ -639,7 +645,8 @@ def report(root, *, evaluation_config=None, report_dir=None):
     evaluations = []
     for cell in main:
         if derive:
-            value = reevaluate_cell(root, cell, evaluation_config, evaluation_schema=schema)
+            value = reevaluate_cell(root, cell, evaluation_config, evaluation_schema=schema,
+                                    reference_policy=reference_policy)
         else:
             try:
                 cached_path = root / cell["evaluations"][0]

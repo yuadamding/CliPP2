@@ -168,7 +168,10 @@ def _protocol23_map_checks():
 def _all_target_checks():
     """Current schema reassigns every fitted member, without historical routing."""
     h, catalog, paired = _routed_map_fixture()
-    paired.update(schema="clipp2.paired-experiment.v5", config=dict(fit=dict(max_major_cn=None)))
+    from CliPP2.config import STAGE_THREE_REFERENCE_POLICY
+    from CliPP2.simulation.evaluation import HISTORICAL_V5_REFERENCE_POLICY
+    paired.update(schema="clipp2.paired-experiment.v5", config=dict(fit=dict(max_major_cn=None)),
+                  reference_policy=STAGE_THREE_REFERENCE_POLICY)
     catalog.max_major_cn = None
     for arm in paired["arms"].values():
         if arm["assignment"]["schema"] == "clipp2.assignment.result.v6":
@@ -190,6 +193,11 @@ def _all_target_checks():
     value = evaluate(h, catalog, paired, truth_qualification="verified_history_binding")
     assert value["schema"] == "clipp2.simulation.evaluation.v5"
     assert value["evaluation_definition"] == evaluation_definition()
+    historical = deepcopy(paired)
+    historical.pop("reference_policy")
+    old_value = evaluate(h, catalog, historical, truth_qualification="verified_history_binding")
+    assert old_value["evaluation_definition"] == evaluation_definition(reference_policy=HISTORICAL_V5_REFERENCE_POLICY)
+    assert old_value["evaluation_definition_id"] != value["evaluation_definition_id"]
     metrics = {(r["name"], r["view"]): r for r in value["metrics"] if r["arm"] == "C3" and r["stratum"] == "all"}
     assert metrics["data_supported_map_coverage", ""]["denominator"] == 14
     assert metrics["data_supported_map_coverage", ""]["value"] == 1
@@ -433,7 +441,9 @@ def _partial_failure_checks():
             for i, mutation in enumerate(h.mutation_ids) for j, region in enumerate(h.region_ids)])
         write_tumor_txt(attempt / 'input_catalog.tsv', frame,
                         dict(tumor_id=job['cell_id'], fixture='declared_memberships_not_native_inference'))
-        catalog = load_original_catalog(attempt / 'input_catalog.tsv')
+        # This fixture's declared memberships/counts assume truly unobserved pairs.
+        catalog = load_original_catalog(attempt / 'input_catalog.tsv', missing_counts='unobserved')
+        paired.setdefault('config', {})['missing_counts'] = 'unobserved'
         order = [h.mutation_ids.index(mutation) for mutation in catalog.mutation_ids]
         truth = SimpleNamespace(**vars(h))
         truth.mutation_ids = catalog.mutation_ids

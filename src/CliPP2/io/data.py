@@ -290,10 +290,11 @@ def _tuples(value):
 
 @dataclass(frozen=True, slots=True)
 class OriginalCatalog(ImmutableArrayRecord):
-    """All original keys and biological values, before numerical placeholders.
+    """All original keys and effective biological values, before numerical placeholders.
 
     ``source_rows`` and ``provenance`` are tuples of key/value tuples, retaining
-    each canonical observation row and its otherwise inert extra columns.
+    each raw canonical observation row and its otherwise inert extra columns.
+    V6 records missing-read imputations separately; subsets reuse frozen depths.
     """
 
     tumor_id: str
@@ -316,6 +317,8 @@ class OriginalCatalog(ImmutableArrayRecord):
     max_major_cn: int | None = None
     input_excluded: np.ndarray | None = None
     _schema_version: int = field(default=5, kw_only=True, repr=False)
+    missing_counts: str = "unobserved"
+    read_count_imputations: tuple = ()
     _content_hash: str = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
@@ -363,9 +366,14 @@ class OriginalCatalog(ImmutableArrayRecord):
         if source_keys != {(mutation, region) for mutation in self.mutation_ids for region in self.region_ids}:
             raise ValueError("Catalog source rows do not cover exactly the original keys")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
-        if (type(self._schema_version) is not int or self._schema_version not in (4, 5)
+        if (type(self._schema_version) is not int or self._schema_version not in (4, 5, 6)
                 or (self._schema_version == 4 and self.max_major_cn is None)):
-            raise ValueError("Catalog v4 requires its original explicit CN cutoff; current catalogs use v5")
+            raise ValueError("Catalog v4 requires its original explicit CN cutoff; current catalogs use v6")
+        object.__setattr__(self, "read_count_imputations", _tuples(self.read_count_imputations))
+        if self._schema_version < 6:
+            if self.read_count_imputations:
+                raise ValueError("Historical catalog schemas cannot encode imputed reads")
+            object.__setattr__(self, "missing_counts", "unobserved")
         if not np.isfinite(self.purity).all() or np.any(self.purity <= 0) or np.any(self.purity > 1):
             raise ValueError("Catalog purity must lie in (0,1]")
         if len(self.mutation_ids) and not np.all(self.purity == self.purity[:1]):
@@ -383,11 +391,15 @@ class OriginalCatalog(ImmutableArrayRecord):
         if not np.array_equal(self.eligible, self.cn_population_mask & ~self.input_excluded):
             raise ValueError("Catalog eligibility disagrees with original CN or explicit exclusion")
         from .tumor_txt import _normalize_row
+        from .read_counts import replay_read_counts
+        raw_rows = [_normalize_row(dict(source), row_number=index + 1) for index, source in enumerate(self.source_rows)]
+        resolved = replay_read_counts({(row["mutation_id"], row["sample_id"]): row for row in raw_rows},
+            self.read_count_imputations, cutoff=self.max_major_cn, policy=self.missing_counts)
         positions = {(mutation, region): (i, j) for i, mutation in enumerate(self.mutation_ids)
                      for j, region in enumerate(self.region_ids)}
         segments, seen = {}, set()
-        for index, source in enumerate(self.source_rows):
-            row = _normalize_row(dict(source), row_number=index + 1)
+        for raw_row in raw_rows:
+            row = resolved[raw_row["mutation_id"], raw_row["sample_id"]]
             unit = row["mutation_id"], row["sample_id"]
             if unit in seen:
                 raise ValueError("Catalog requires one canonical observation per mutation-region pair")
@@ -415,8 +427,10 @@ class OriginalCatalog(ImmutableArrayRecord):
         payload = {"schema": f"clipp2.original-catalog.v{self._schema_version}", "tumor_id": self.tumor_id,
                    "mutation_ids": list(self.mutation_ids), "region_ids": list(self.region_ids),
                    "max_major_cn": self.max_major_cn}
-        if self._schema_version == 5:
+        if self._schema_version >= 5:
             payload["eligibility_policy"] = self.eligibility_policy
+        if self._schema_version >= 6:
+            payload.update(missing_counts=self.missing_counts, read_count_imputations=self.read_count_imputations)
         payload.update((name, getattr(self, name).tolist()) for name in _CATALOG_ARRAYS)
         # Omit the redundant all-false mask from the canonical payload.
         if not self.input_excluded.any():
@@ -427,6 +441,11 @@ class OriginalCatalog(ImmutableArrayRecord):
     @property
     def content_hash(self):
         return self._content_hash
+
+    @property
+    def read_count_report(self):
+        from .read_counts import read_count_report
+        return read_count_report(self.missing_counts, self.read_count_imputations)
 
     @property
     def eligibility_policy(self):
@@ -464,23 +483,25 @@ class OriginalCatalog(ImmutableArrayRecord):
         old_mask = np.ones(self.major_cn.shape, dtype=bool) if cutoff is None else self.major_cn <= cutoff
         if not np.array_equal(self.eligible, old_mask & ~self.input_excluded):
             raise ValueError("Replay CN population differs from the original fitting population")
-        versions = (5,) if cutoff is None else (4, 5)
+        versions = (6,) if self.read_count_imputations else ((5, 6) if cutoff is None else (4, 5, 6))
         return frozenset([content_hash(self.to_dict()), *(
             content_hash(replace(self, max_major_cn=cutoff, _schema_version=version).to_dict())
             for version in versions)])
 
     @classmethod
     def from_dict(cls, payload):
-        schemas = {"clipp2.original-catalog.v4": 4, "clipp2.original-catalog.v5": 5}
+        schemas = {f"clipp2.original-catalog.v{version}": version for version in (4, 5, 6)}
         version = schemas.get(payload.get("schema"))
         if version is None:
-            raise ValueError("Expected single-state original-catalog.v4 or v5; earlier schemas require a versioned historical reader")
+            raise ValueError("Expected single-state original-catalog.v4, v5 or v6; earlier schemas require a versioned historical reader")
+        if version == 6 and not {"missing_counts", "read_count_imputations"} <= payload.keys():
+            raise ValueError("Catalog v6 requires its explicit read-count policy and imputation ledger")
         values = {item.name: payload[item.name] for item in fields(cls)
                   if item.init and item.name in payload and not item.name.startswith("_")}
         if "max_major_cn" not in values:
             raise ValueError("Original catalogs must record their CN population policy explicitly")
         value = cls(**values, _schema_version=version)
-        if version == 5 and payload.get("eligibility_policy") != value.eligibility_policy:
+        if version >= 5 and payload.get("eligibility_policy") != value.eligibility_policy:
             raise ValueError("Original-catalog CN population policy mismatch")
         if payload.get("content_hash") != value.content_hash:
             raise ValueError("Original-catalog content hash mismatch")
@@ -510,7 +531,9 @@ class OriginalCatalog(ImmutableArrayRecord):
         values = {item.name: getattr(self, item.name) for item in fields(self) if item.init}
         values.update((name, getattr(self, name)[ix]) for name in _CATALOG_ARRAYS)
         values.update(mutation_ids=mutations, region_ids=regions,
-                      source_rows=tuple(row for row, _ in selected), provenance=tuple(extra for _, extra in selected))
+                      source_rows=tuple(row for row, _ in selected), provenance=tuple(extra for _, extra in selected),
+                      read_count_imputations=tuple(record for record in self.read_count_imputations
+                          if record[0] in mutation_set and record[1] in region_set))
         return type(self)(**values)
 
     def default_bounds(self):

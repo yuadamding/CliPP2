@@ -17,12 +17,31 @@ purity is an input problem, not a low-confidence estimate. `clipp2 audit-input`
 reports missing profiles, regional/segment mapping problems and invalid values
 without filling them or running inference.
 
+### Missing-read policy
+
+The default `missing_counts="zero_alt"` resolves eligible `count_observed=0`
+pairs (including SNVs absent from a regional list) to ALT=0. Use a positive
+supplied total depth (ALT+REF, or REF when ALT is absent); otherwise use that
+region's median positive depth among eligible, originally observed pairs, with
+half-read medians rounded up. ALT alone cannot supply total depth. If neither
+depth source exists, validation fails. CN-filtered/input-excluded pairs and
+explicitly observed zero-depth pairs are not imputed or used as median donors.
+
+This is an explicit absence assumption, not proof that unreported SNVs were
+measured at zero ALT. Original raw rows and the per-pair depth/source ledger are
+retained in catalog v6; all three stages use the same effective counts. Stage 2
+subsets reuse these frozen depths, never a newly computed subset median. The
+workflow receipt and input audit summarize imputation. Set the workflow config's
+`missing_counts="unobserved"` (or standalone `--missing-counts unobserved`) to
+retain the prior no-evidence interpretation. Frozen v4/v5 catalogs are read
+unchanged, without new imputation.
+
 1. **Stage 1:** fit eligible informative mutations under original support
    `1..original_major_cn`, allowing up to 10 groups by default. Select an occupied
    source by smaller full-vector L2 distance to all ones, then larger minimum
    regional informative depth, then lower public source label. This is a
    **provisional computational source**, not a declaration of biological clonality.
-   Its actual native center remains an explicit reference candidate.
+   Its actual native center remains provenance, not a second clonal candidate.
 2. **Stage 2:** fit the remaining population, allowing up to 20 groups by default.
    At each mapped source observation, calculate component likelihoods under
    original support and the native source CCF. Preserve the full exact maximizing
@@ -30,22 +49,26 @@ without filling them or running inference.
    observed contributor supplies the **largest exact maximizing integer**. A
    region–segment cap is the minimum of these endpoints, with original-support
    fallback when no endpoint is available. The policy is
-   `minimum_native_map_set_upper`. Missing observations do not supply endpoints;
+    `minimum_native_map_set_upper`. Unobserved pairs do not supply endpoints;
    all-impossible component likelihoods are undefined, never uniform. A flat
    likelihood supplies the original upper endpoint and cannot restrict support
    alone. In particular, a zero-CCF/zero-ALT observation has no multiplicity read
    information; its flat set is reported as such, without using its arbitrary
    display point call to restrict support. Original CN denominators never change.
-3. **Frozen references:** take the canonical all-one hypothesis, the provisional
-   Stage 1 source's native center, and every native Stage 2 center. Consolidate
-   only exactly equal coordinate vectors. Preserve every source's lineage,
-   original center, fitted-state identity and diagnostic measurements. Assign
-   equal priors **after** consolidation. Near-identical centers remain distinct.
+3. **Frozen references:** use one canonical all-one clonal hypothesis and every
+   native Stage 2 center. Map the selected Stage 1 source to clonal label 0;
+   do not add its fitted center as a competing reference. Preserve its native
+   center, fitted-state identity and diagnostics as provenance. Consolidate
+   exactly equal Stage 2 vectors, including exact all-one vectors into label 0.
+   Assign equal priors **after** consolidation. Distinct Stage 2 centers remain
+   unchanged; no distance threshold merges genuine nearby subclones.
 4. **Stage 3:** reassess every mutation in the combined fitted population once:
    `T = G0 union Stage2`, `F = empty`. Restore full original multiplicity support
    and use common observation masks. There is no geometric merging or selective
-   reassessment rule. Baseline labels identify each mutation's native source
-   center after exact consolidation, not an assumed all-one membership.
+   reassessment rule. Stage 1 source members have baseline label 0; Stage 2
+   members map to their native center after exact consolidation. Native baseline
+   CCFs and multiplicity calls remain unchanged in provenance. MAP assignment
+   may move source members away from label 0; occupancy is not forced.
 
 Input and CN-population exclusions take precedence over Stage 2 cap-source
 support checks and contributor classification. An excluded pair may have inert
@@ -53,18 +76,21 @@ numerical support `[1,1]` even when its retained catalog bounds are wider; this
 is not a restriction of biological evidence. It remains marked `excluded`, is
 not scored for a cap, and supplies no endpoint. Eligible pairs must still match
 their full original support, including eligible pairs with missing reads.
-Original CN, masks and exclusion provenance remain unchanged.
+Original CN and exclusion provenance remain unchanged. Read masks are resolved
+once by the declared missing-read policy before Stage 1 and remain fixed thereafter.
 
 A nonempty fitting population with an entirely unsupported requested region
 remains explicitly unidentifiable. Removing an acceptance rule does not identify
 an absent coordinate. An empty Stage 2 remainder is valid: reassess the source
-against its preserved native center and the canonical all-one hypothesis.
+against the single all-one hypothesis.
 
 The cap is a discovery heuristic, not a biological upper-bound certificate. One
 uncertain low MAP endpoint can reduce it and exclude another mutation's preferred
 multiplicity. Restoring support in Stage 3 does not refit discovery centers.
-Preserving a source at 0.4 alongside 1 and a Stage 2 center at 0.2 prevents that
-native explanation from disappearing; it does not guarantee correct recovery.
+Replacing a selected source's fitted center with the all-one reference is an
+explicit clonal-source modeling assumption. If that source is genuinely
+subclonal, its native explanation is no longer a Stage 3 candidate; provenance
+retains that fact. The rule does not guarantee biological recovery.
 
 ## Likelihood, estimates and information states
 
@@ -109,9 +135,9 @@ without modifying raw measurements.
 Exact duplicate native centers have disjoint source memberships. Their regional
 counts/depths are summed, means are count-weighted and maxima are retained; all
 individual source diagnostics remain in provenance. A failed informative source
-diagnostic makes that aggregate unavailable, not the estimate. The canonical
-all-one hypothesis without an exactly matching native source reports discrepancy
-against provisional-source reads with that provenance; its center is imposed.
+diagnostic makes that aggregate unavailable, not the estimate. The selected
+Stage 1 source contributes diagnostics evaluated at the fixed all-one vector,
+not at its replaced native center; both measurements remain in provenance.
 
 Whole-original output includes final MAP labels for fitted targets, explicit
 exclusions, and prior-only outcomes for otherwise eligible unobserved mutations.
@@ -122,9 +148,12 @@ mutation later moves away from its native baseline reference.
 ## Contracts and historical replay
 
 The reference-preserving revision uses workflow plan/receipt **v5**, assignment
-bundle/result **v5/v6**, original catalog **v5**, paired experiment **v5**,
+bundle/result **v5/v6**, original catalog **v6**, paired experiment **v5**,
 simulation contract **v7**, and evaluation/definition **v5**. These versions
 separate it from the earlier Protocol 2.3 routing proposal and Protocol 2.2.
+The explicit policy `single_fixed_clonal_stage_one_source_v1` distinguishes the
+single-clonal-reference revision from the preceding source-preserving inventory;
+historical records and fixed-reference replay retain their bound inventories.
 Historical records retain their original interpretations; the protocol string
 alone never selects an evaluation definition.
 
@@ -134,7 +163,8 @@ requires unchanged population, biological observations, masks, supports and
 native fitting settings. Stage 2 also requires unchanged remainder and effective
 caps. A CN-policy label change alone may be compatible only if the complete
 actual eligibility mask and input content are identical. Expanded populations
-require new fits. Historical catalog v4 readers preserve the original payload.
+require new fits. Historical catalog v4/v5 readers preserve the original payload.
+Changing missing-read policy or effective counts also requires new fits.
 
 Historical assignment artifacts are read-only. To score an explicitly identified
 current-policy derivative of a frozen bundle, use `clipp2 assign --derive-current`.

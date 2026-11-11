@@ -14,7 +14,10 @@ import numpy as np
 from scipy.special import logsumexp, xlogy, xlog1py
 from scipy.optimize import linear_sum_assignment
 from copy import deepcopy
+from CliPP2.config import STAGE_THREE_REFERENCE_POLICY
 from CliPP2.io.data import content_hash
+
+HISTORICAL_V5_REFERENCE_POLICY = "exact_unique_canonical_one_source_native_all_stage_two_equal_priors_after_consolidation"
 
 FAMILIES = tuple(f"S{i:02}" for i in range(1, 13))
 TRANSITIONS = ("correct_retained", "error_corrected", "error_persisted", "error_introduced",
@@ -313,8 +316,10 @@ _HISTORICAL_V4 = {'schema': 'clipp2.simulation.evaluation-definition.v4',
  'matching_policy': 'maximum_valid_cardinality_then_minimum_valid_distance_then_lexicographic_truth_reference',
  'matching_ambiguity': 'alternative_equal_cardinality_exact_binary_rational_distance_sum_optima'}
 
-def evaluation_definition(config=None):
+def evaluation_definition(config=None, *, reference_policy=STAGE_THREE_REFERENCE_POLICY):
     config = normalize_evaluation_config(config)
+    if reference_policy not in (STAGE_THREE_REFERENCE_POLICY, HISTORICAL_V5_REFERENCE_POLICY):
+        raise ValueError("Unknown Stage 3 reference policy")
     return dict(schema="clipp2.simulation.evaluation-definition.v5", config=config,
         binary_endpoint="data_supported_MAP_designated_clonality_equals_physical_truth_clonality",
         detailed_endpoint="frozen_source_member_purity_observable_truth_class",
@@ -325,7 +330,7 @@ def evaluation_definition(config=None):
         incompatible="all_candidates_impossible_without_probability_fallback",
         population_denominators="original_evaluable_for_MAP_errors_all_original_members_for_evidence_status",
         reassessment_population="all_combined_fitted_mutations_F_empty",
-        reference_policy="exact_unique_canonical_one_source_native_all_stage_two_equal_priors_after_consolidation",
+        reference_policy=reference_policy,
         cap_policy="minimum_native_map_set_upper", population_policy="unrestricted_valid_cn_unless_explicit_cutoff",
         target_origins=["stage1_reference_recheck", "stage2_recheck"],
         population_scopes={"planned_population": sorted(PLANNED_METRIC_NAMES - {"correct_per_original_evaluable", "binary_correct_per_original_evaluable"}),
@@ -750,7 +755,8 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     map_policy = all_targets or result.get("schema") == "clipp2.paired-experiment.v4" or result.get("protocol_version") == "2.3"
     source_origin = "stage1_reference_recheck" if map_policy else "stage1_clonal_recheck"
     second_origin = "stage2_recheck" if all_targets else "stage2_near_clonal_recheck"
-    definition = (evaluation_definition(evaluation_config) if all_targets else
+    reference_policy = result.get("reference_policy", HISTORICAL_V5_REFERENCE_POLICY)
+    definition = (evaluation_definition(evaluation_config, reference_policy=reference_policy) if all_targets else
                   legacy_evaluation_definition(4 if map_policy else 3, evaluation_config))
     reference_match_atol = evaluation_config["reference_match_atol"]
     reference_distance = evaluation_config["reference_distance"]
@@ -910,7 +916,8 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                 raise ValueError("Current Stage 3 must reassess every combined fitted mutation")
             metric("stage_two_reassessment_coverage", arm, len(set(second_labels) & targets), len(second_labels))
             metric("reference_consolidation_count", arm,
-                   value=2+len(set(second_labels.values()))-len(labels) if available else None)
+                   value=(1 if reference_policy == STAGE_THREE_REFERENCE_POLICY else 2)
+                   + len(set(second_labels.values())) - len(labels) if available else None)
         else:
             newly_merged = targets-g0
             near = {m for m, center in second_centers.items()

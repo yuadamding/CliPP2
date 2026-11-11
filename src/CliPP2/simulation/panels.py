@@ -91,7 +91,7 @@ def contributor_density_diagnostics(history, frame, config, *, densities=(0, 1, 
     with tempfile.TemporaryDirectory() as temporary:
         path = Path(temporary) / 'input.tsv'
         write_tumor_txt(path, frame, frame.attrs['metadata'])
-        catalog = load_original_catalog(path, max_major_cn=config.fit.max_major_cn)
+        catalog = load_original_catalog(path, max_major_cn=config.fit.max_major_cn, missing_counts=config.missing_counts)
     if not pool:
         return dict(status='not_applicable_no_declared_source_pool', target_ids=targets, records=[])
     data = prepare_prediction(catalog, pool, device=config.fit.device, cpu_threads=config.fit.cpu_threads,
@@ -178,7 +178,7 @@ def _scaling_case(path, config_values, mutations, regions, band, seed):
         with tempfile.TemporaryDirectory() as temporary:
             input_path = Path(temporary) / 'scaling.tsv'
             write_tumor_txt(input_path, frame, frame.attrs['metadata'])
-            catalog = load_original_catalog(input_path)
+            catalog = load_original_catalog(input_path, max_major_cn=config.fit.max_major_cn, missing_counts=config.missing_counts)
         centers = {truth_id: history.phi[i] for i, truth_id in enumerate(history.observable_truth_ids)}
         clonal = next(key for key, center in centers.items() if np.all(center == 1))
         order = [clonal, *(key for key in sorted(centers) if key != clonal)]

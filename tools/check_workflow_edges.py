@@ -34,7 +34,7 @@ def _blocked_count(directory):
         "accounting_fixture", 0., 0., 0., 0., {}, biological_identity=catalog.biological_identity,
         tumor_id=catalog.tumor_id)
     with patch("CliPP2.workflow._fit_accepted", return_value=first) as fitter:
-        receipt = run_workflow(path, directory / "blocked", workflow_config())
+        receipt = run_workflow(path, directory / "blocked", workflow_config(missing_counts="unobserved"))
     assert fitter.call_count == 1 and receipt["status"] == "blocked"
     assert receipt["stage_two_candidate_count"] == 1
     assert receipt["counts"]["N1"] == 2 and receipt["counts"]["N0"] == 1
@@ -145,7 +145,7 @@ def _capped_target_and_replay(directory):
             expect_value_error(lambda: run_workflow(other_path, directory / f"wrong_tumor_replay_{index}",
                 config, accepted_stage_one=pair[0], accepted_stage_two=pair[1]))
     return dict(stage_two_targets=int(capped_targets.sum()), native_upper=1, stage_three_upper=4,
-                every_native_center_preserved=True, counts=counts, accepted_copy_immutable=True,
+                every_stage_two_native_center_preserved=True, counts=counts, accepted_copy_immutable=True,
                 repeated_replay_rejects_other_tumor_before_numerics=True,
                 originating_manifest_tampering_rejected=True, accepted_stages_survive_derived_failures=True,
                 current_and_originating_execution_links_separate=True, replay_policy=policy_checks)
@@ -563,14 +563,18 @@ def _provisional_source_preservation(directory):
     second = _declared_fit(catalog, "stage_two", ids, [0], [[.2]], catalog.default_bounds().subset(ids), [[1]])
     reference, targets, unchanged, _ = _build_stage_three_inputs(catalog, first, second, selected,
         classify_groups(catalog, second, config), config)
-    np.testing.assert_array_equal(reference.centers, [[1.], [.4], [.2]])
+    np.testing.assert_array_equal(reference.centers, [[1.], [.2]])
     assert targets == catalog.mutation_ids and not unchanged
     nearest = float(np.min(np.linalg.norm(reference.centers-[.4], axis=1)))
-    assert nearest == 0.
-    np.testing.assert_array_equal(reference.priors, np.full(3, 1/3))
+    assert nearest == .2
+    assert reference.lineage[0]["native_center"] == (.4,)
+    assert reference.lineage[0]["baseline_reference_label"] == 0
+    np.testing.assert_array_equal(reference.source_mean_profile_deviance[0], selected["all_one_mean_profile_deviance"])
+    np.testing.assert_array_equal(reference.priors, np.full(2, .5))
     request = bundle(catalog, reference, native_centers=[[.4], [.2]])
     scored = assign_mutations(request)
-    assert [row["map_label"] for row in scored.assignments] == [1, 2]
+    assert [row["map_label"] for row in scored.assignments] == [1, 1]
+    np.testing.assert_array_equal(request.native_centers, [[.4], [.2]])
     with patch("CliPP2.workflow._diagnostics_many", side_effect=ValueError("reporting diagnostic failed")):
         failed = classify_groups(catalog, first, config)
     assert all(group["diagnostic_status"] == "failed" for group in failed)
@@ -583,7 +587,8 @@ def _provisional_source_preservation(directory):
     assert select_reference_source(tied)["source_label"] == 0
     tied[1]["minimum_regional_depth"] += 1
     assert select_reference_source(tied)["source_label"] == 1
-    return dict(provisional_subclonal_source=.4, true_distance=.6, useful_reference_preserved=True,
+    return dict(provisional_subclonal_source=.4, true_distance=.6, source_estimate_preserved_as_provenance=True,
+                single_fixed_clonal_reference=True, source_not_forced_to_clonal_assignment=True,
                 nearest_retained_reference_error=nearest, diagnostic_failure_does_not_veto=True)
 
 
@@ -595,11 +600,14 @@ def _empty_remainder(directory):
     assert receipt["status"] == "complete" and receipt["counts"]["N2"] == 0
     request = load_assignment_bundle(output / "assignment_bundle.json")
     assert request.target_ids == request.catalog.mutation_ids and not request.non_target_ids
-    assert len(request.reference.centers) == 2
-    np.testing.assert_allclose(request.reference.centers, [[1.], [.4]], rtol=0, atol=1e-7)
+    assert len(request.reference.centers) == 1
+    np.testing.assert_array_equal(request.reference.centers, [[1.]])
+    np.testing.assert_allclose(request.native_centers, [[.4], [.4]], rtol=0, atol=1e-7)
+    assert request.baseline_labels == (0, 0)
     assert receipt["counts"]["targets"] == receipt["counts"]["combined_mutations"] == 2
     assert receipt["counts"]["non_targets"] == 0
-    return dict(native_fit_completed=True, native_source_preserved=True, every_mutation_reassessed=True)
+    return dict(native_fit_completed=True, native_source_provenance_preserved=True,
+                single_clonal_reference=True, every_mutation_reassessed=True)
 
 
 def _historical_native_replay(directory):

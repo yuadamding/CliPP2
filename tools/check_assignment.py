@@ -38,7 +38,8 @@ def _catalog(root, name, alt, depth, major, *, minor=0, observed=True, input_exc
         segment_id="s", cn_state_id="0", cn_state_fraction=1., allele_a_cn=int(major[i, j]),
         allele_b_cn=int(minor[i, j])) for i in range(alt.shape[0]) for j in range(alt.shape[1])]
     path = write_tumor_txt(root / (name + ".tsv"), pd.DataFrame(rows))
-    return load_original_catalog(path)
+    # Explicit numerical-mask fixtures exercise the opt-out, not imputation.
+    return load_original_catalog(path, missing_counts="zero_alt" if observed.all() else "unobserved")
 
 
 def _reference(catalog, centers, *, measurements=None):

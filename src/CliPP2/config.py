@@ -11,13 +11,21 @@ DEFAULT_MAX_CLUSTERS: Final = 20
 DEFAULT_STAGE_ONE_MAX_CLUSTERS: Final = 10
 DEFAULT_DEVICE: Final = "cpu"
 DEFAULT_AUDIT_SCOPE: Final = "selected"
+DEFAULT_MISSING_COUNTS: Final = "zero_alt"
 PROTOCOL_VERSION: Final = "2.3"
+STAGE_THREE_REFERENCE_POLICY: Final = "single_fixed_clonal_stage_one_source_v1"
 COMPATIBLE_NATIVE_FIT_PROTOCOLS: Final = ("2.2", "2.3")
 
 
 def validate_audit_scope(value):
     if value not in ("selected", "all"):
         raise ValueError("audit_scope must be selected or all.")
+    return value
+
+
+def validate_missing_counts(value):
+    if value not in ("zero_alt", "unobserved"):
+        raise ValueError("missing_counts must be zero_alt or unobserved.")
     return value
 
 
@@ -75,8 +83,10 @@ class WorkflowConfig:
         device="cpu", max_clusters=DEFAULT_STAGE_ONE_MAX_CLUSTERS))
     stage_two_max_clusters: int = DEFAULT_MAX_CLUSTERS
     normal_cn_policy: str | None = None
+    missing_counts: str = DEFAULT_MISSING_COUNTS
 
     def __post_init__(self):
+        validate_missing_counts(self.missing_counts)
         if type(self.fit) is not FitConfig:
             raise TypeError("Workflow requires a validated FitConfig")
         if self.normal_cn_policy not in (None, "diploid"):

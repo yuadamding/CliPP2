@@ -53,7 +53,8 @@ def run_checks(directory):
         assert arm["counts"]["Ncombined"] == arm["counts"]["N0"] + arm["counts"]["N2"] == 8
         assert set(arm["targets"]).isdisjoint(arm["non_targets"])
         assert set(arm["targets"] + arm["non_targets"]) == set(arm["combined_labels"])
-        assert arm["counts"]["K"] == 2 + arm["counts"]["Q2"] - arm["counts"]["exact_consolidated_centers"]
+        assert arm["counts"]["clonal_source_consolidated"] == 1
+        assert arm["counts"]["K"] == 1 + arm["counts"]["Q2"] - arm["counts"]["exact_consolidated_centers"]
         assert len(arm["assignment"]["multiplicities"]) == 2*len(arm["targets"])
         assert not arm["non_targets"] and arm["counts"]["F"] == 0
         assert all(row["role"] == "target" for row in arm["original_rows"])
@@ -170,7 +171,11 @@ def _routing_regressions(directory, paired, config):
     assert any(np.array_equal(center, [.98, .98]) for center in bundle.reference.centers)
     assert any(np.array_equal(center, [.4, .3]) for center in bundle.reference.centers)
     for mutation, baseline in zip(bundle.target_ids, bundle.baseline_labels):
-        np.testing.assert_array_equal(bundle.reference.centers[baseline], frozen["native_centers"][mutation])
+        if mutation in paired["g0_ids"]:
+            assert baseline == 0
+            np.testing.assert_array_equal(bundle.reference.centers[baseline], [1., 1.])
+        else:
+            np.testing.assert_array_equal(bundle.reference.centers[baseline], frozen["native_centers"][mutation])
     scored = assign_mutations(bundle, outdir=directory / "routing_assignment")
     assert all(row["target_reason"] == "stage2_recheck" for row in scored.assignments
                if row["mutation_id"] in native.mutation_ids)

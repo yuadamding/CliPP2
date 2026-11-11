@@ -70,11 +70,11 @@ def _read_region(path: Path, *, preserve_provenance=False):
         locus = (chrom, position)
         if locus in observations:
             raise TumorTxtError(f"{path}: duplicate SNV locus {locus!r}.")
-        counts = tuple(
-            _integer(row[name], name=f"{path} {name}") for name in ("alt_count", "ref_count")
-        )
+        observed = _provenance_flag(row, ("count_observed",), "Read observation", default=True)
+        counts = tuple("." if row[name] == "." and not observed else _integer(row[name], name=f"{path} {name}")
+                       for name in ("alt_count", "ref_count"))
         observations[locus] = (*counts, _provenance_flag(row, ("input_excluded",),
-                                                        "Input exclusion", default=False))
+                                                        "Input exclusion", default=False), observed)
         observation_rows[locus] = row
     _, table = _read_text_table(path / "cna.txt", columns=_CNA_COLUMNS,
                                 canonical=False, allow_empty=True)
@@ -128,8 +128,7 @@ def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tupl
                                     f"in sample {sample!r}; run the input audit to inspect profile and segment mapping.")
             else:
                 start, end, major, minor, normal, normal_supplied, genuine = segments[index]
-            observed = (chrom, position) in observations
-            alt, ref, excluded = observations.get((chrom, position), (".", ".", False))
+            alt, ref, excluded, observed = observations.get((chrom, position), (".", ".", False, False))
             row = dict(zip(SCHEMA_COLUMNS, (f"{chrom}:{position}", sample, alt, ref, int(observed), purity,
                          normal, f"{chrom}:{start}-{end}", "0", 1, major, minor)))
             row.update(_mapping_genuine=genuine, _normal_cn_supplied=normal_supplied)
