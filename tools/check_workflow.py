@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic Protocol 2.3 CPU contracts against one imported installation.
+"""Deterministic Protocol 2.4 CPU contracts against one imported installation.
 
 Fixture cutoffs exercise decisions; they are not biological calibration advice.
 All inputs and outputs are temporary. No checkout import path is injected.
@@ -357,7 +357,7 @@ def check_complete_workflow(directory):
     plan_config = asdict(config)
     plan_config["fit"].pop("max_clusters")
     plan_config.pop("stage_two_max_clusters")
-    plan = dict(schema="clipp2.workflow.plan.v5", protocol_version=PROTOCOL_VERSION,
+    plan = dict(schema="clipp2.workflow.plan.v6", protocol_version=PROTOCOL_VERSION,
                 input_path=path.name, workflow_config=plan_config)
     plan_path = directory / "plan.json"
     plan_path.write_text(json.dumps(plan))
@@ -397,6 +397,14 @@ def check_complete_workflow(directory):
     whole = pd.read_csv(output / "all_original_mutations.tsv", sep="\t")
     assert set(whole["reassessment_status"]) <= {"retained", "reassigned"}
     assert (whole["role"] == "target").all() and whole["posterior_defined"].all()
+    profile_output = directory / "workflow_profile"
+    with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("method change refitted frozen fits")):
+        profile_receipt = run_workflow(path, profile_output,
+            replace(config, stage_three_assignment_method="profile"), accepted_stage_one=first, accepted_stage_two=second)
+    assert profile_receipt["status"] == "complete"
+    profile_rows = pd.read_csv(profile_output / "all_original_mutations.tsv", sep="\t")
+    assert profile_rows["final_assignment_label"].notna().all() and not profile_rows["posterior_defined"].any()
+    assert profile_rows["probabilities"].isna().all() and (profile_rows["assignment_method"] == "profile").all()
     catalog = load_original_catalog(path)
     renamed = replace(catalog, tumor_id="another_tumor",
                       metadata=tuple(dict(catalog.metadata, tumor_id="another_tumor").items()))

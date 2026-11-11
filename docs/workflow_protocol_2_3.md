@@ -1,5 +1,8 @@
 # Workflow Protocol 2.3
 
+Historical contract. Use its frozen runtime for the comparison options below;
+the current implementation follows [Protocol 2.4](workflow_protocol_2_4.md).
+
 Protocol 2.3 reports mathematically defined estimates without confidence,
 residual, coverage or distance acceptance thresholds. Numerical verification,
 model-domain validation, explicit input exclusions and biological identity checks
@@ -172,6 +175,55 @@ This preserves its supplied reference inventory and target scope; it is a
 reporting-only comparison, not a reconstruction of the revised workflow.
 Independent publication checks still verify scores, normalization, identities,
 supports, immutable content and final population accounting.
+
+### Optional entropy comparison
+
+`clipp2 assign --bundle BUNDLE.json --assignment-rule minimum_conditional_entropy
+--output-dir NEW_OUTPUT` reuses the fixed references and original support without
+refitting Stage 1/2. The default workflow and assignment rule remain likelihood MAP.
+For each candidate, normalize its binomial masses over multiplicities, then sum
+`-sum(p * log(p))` across informative regions (nats). Choose the smallest entropy
+among candidates with finite joint likelihood. Exact entropy ties use higher
+likelihood, then lower public label; there is no fit-quality threshold. Impossible
+distributions are ineligible, not zero-entropy; missing regions contribute nothing,
+and mutations without informative regions receive no final label. A zero-CCF,
+zero-ALT region has uniform multiplicity probabilities and entropy `log(major_cn)`.
+
+This comparison emits result **v7** from the unchanged v5 bundle; normal MAP results
+remain v6. `map_label`, `best_label`, `posterior`, probability vectors and `entropy`
+retain their **membership-MAP** meanings. The new conditional-multiplicity entropy
+vector, selected entropy/probability/log score and `final_assignment_label` describe
+the alternative decision. Regional `selected_label`, CCF, multiplicity and residuals
+use that selected reference, which need not be the likelihood MAP. Low conditional
+entropy measures certainty about multiplicity **given a reference**, not reference
+correctness: it can favor confident but extremely poor-fitting explanations.
+Independent publication checks verify both the original probabilities and the
+alternative selection; comparison outputs must not overwrite the original workflow.
+
+### Optional profile-likelihood comparison
+
+`clipp2 assign --bundle BUNDLE.json --assignment-rule profile_likelihood
+--output-dir NEW_OUTPUT` instead maximizes the product of regional maximum
+binomial likelihoods. For each informative region and fixed reference, take
+`max(Binomial(ALT; depth, p(m, phi)), m=1..original_major_cn)`, then sum its
+logarithm across regions. This profiles over **all** original multiplicity
+candidates, not only 1 and 2. It does not normalize over multiplicities, average
+their likelihoods, or minimize entropy. No uniform-prior factors enter the
+reported profile score; equal cluster priors would not change its ordering.
+Exact profile-score ties use lower public label. Impossible candidates cannot
+win. Unobserved/excluded pairs contribute nothing; with no informative regions,
+profile scores and the final assignment are missing. No centers are refitted.
+
+The unchanged v5 bundle produces result **v8** with `profile_log_scores`,
+`profile_tied_labels` and `selected_profile_log_score`. Existing `map_label`,
+`best_label`, `posterior` and probability/log-score fields still describe the
+original **marginal** likelihood. `selected_probability` and `selected_log_score`
+give that original marginal evidence for the profile-selected reference;
+profile scores are **not posterior probabilities**. `final_assignment_label`
+and regional `selected_label`, CCFs, multiplicities and residuals use the profile
+winner. Conditional multiplicity distributions remain normalized for reporting.
+Independent publication checks verify both scoring definitions. The default
+workflow, v6 MAP results and v7 entropy comparison remain unchanged.
 
 ## Simulation and attributable comparison
 

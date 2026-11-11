@@ -79,11 +79,66 @@ CLIPP_HD inline CellTerms evaluate_supported(const Observation& o, double phi) {
     return {-ll, gradient, curvature, EmitStatus::Ok};
 }
 
+CLIPP_HD inline CellTerms profile_component_terms(const Observation& o, double phi,
+                                                 std::int64_t multiplicity) {
+    const double slope = o.scaling * static_cast<double>(multiplicity);
+    const double p = component_probability(o, phi, multiplicity);
+    const double ll = component_log_mass(o, p) + ::log(static_cast<double>(o.support));
+    if (ll == -positive_infinity) return {positive_infinity, 0, 1, EmitStatus::ZeroLikelihood};
+    // Explicit zero-count limits, with the existing clipped probability domain.
+    if (slope * phi > 1) return {-ll, 0, curvature_floor, EmitStatus::Ok};
+    const double g = (o.alt == 0 ? 0 : -o.alt / phi)
+                   + (o.ref == 0 ? 0 : o.ref * slope / (1 - p));
+    const double h = (o.alt == 0 ? 0 : o.alt / (phi * phi))
+                   + (o.ref == 0 ? 0 : o.ref * slope * slope / ((1 - p) * (1 - p)));
+    return {-ll, g, h < curvature_floor ? curvature_floor : h,
+            finite_number(ll) && finite_number(g) && finite_number(h)
+                ? EmitStatus::Ok : EmitStatus::NumericalFailure};
+}
+
+CLIPP_HD inline std::int64_t profile_multiplicity(const Observation& o, double phi) {
+    double best = -positive_infinity;
+    std::int64_t selected = o.minimum;
+    for (std::int64_t j = 0; j < o.support; ++j) {
+        const auto m = o.minimum + j;
+        const double mass = component_log_mass(o, component_probability(o, phi, m));
+        if (mass > best) { best = mass; selected = m; }
+    }
+    return selected;  // Exact ties select the lowest integer, not averaged slopes.
+}
+
+struct ProfileSlopes { double right, left; };
+CLIPP_HD inline ProfileSlopes profile_slopes(const Observation& o, double phi) {
+    if (!(o.flags & observed_flag)) return {0, 0};
+    const auto best = profile_multiplicity(o, phi);
+    const double mass = component_log_mass(o, component_probability(o, phi, best));
+    double right = positive_infinity, left = -positive_infinity;
+    for (std::int64_t j = 0; j < o.support; ++j) {
+        const auto m = o.minimum + j;
+        if (component_log_mass(o, component_probability(o, phi, m)) != mass) continue;
+        const auto terms = profile_component_terms(o, phi, m);
+        const double gr = o.ref == 0 && o.scaling * m * phi == 1 ? 0 : terms.gradient;
+        if (gr < right) right = gr;
+        if (terms.gradient > left) left = terms.gradient;
+    }
+    return {right, left};
+}
+
 template<EmitMode Mode>
 CLIPP_HD inline CellTerms evaluate_observation(const Observation& o, double phi) {
     if (!(o.flags & observed_flag)) return {0, 0, 0, EmitStatus::Ok};
     if (!finite_number(phi) || phi < 0 || phi > 1)
         return {positive_infinity, 0, 1, EmitStatus::InvalidInput};
+    if (o.aggregation == LikelihoodAggregation::IntegerProfile) {
+        const auto m = profile_multiplicity(o, phi);
+        if constexpr (Mode == EmitMode::LossOnly) {
+            const double ll = component_log_mass(o, component_probability(o, phi, m))
+                            + ::log(static_cast<double>(o.support));
+            return {-ll, 0, 0, ll == -positive_infinity ? EmitStatus::ZeroLikelihood :
+                    finite_number(ll) ? EmitStatus::Ok : EmitStatus::NumericalFailure};
+        }
+        return profile_component_terms(o, phi, m);
+    }
     switch (o.support) {
     case 1: return evaluate_supported<Mode, 1>(o, phi);
     case 2: return evaluate_supported<Mode, 2>(o, phi);
@@ -93,7 +148,8 @@ CLIPP_HD inline CellTerms evaluate_observation(const Observation& o, double phi)
     }
 }
 
-CLIPP_HD inline double multiplicity_map(const Observation& o, double phi, EmitStatus& status) {
+CLIPP_HD inline double multiplicity_map(Observation o, double phi, EmitStatus& status) {
+    o.aggregation = LikelihoodAggregation::UniformMarginal;
     status = EmitStatus::Ok;
     constexpr double missing = quiet_nan;
     if (!(o.flags & observed_flag)) return missing;
@@ -114,7 +170,8 @@ CLIPP_HD inline double multiplicity_map(const Observation& o, double phi, EmitSt
 }
 
 CLIPP_HD inline ComponentDiagnostics component_diagnostics(
-        const Observation& o, double phi, double accepted_call = quiet_nan) {
+        Observation o, double phi, double accepted_call = quiet_nan) {
+    o.aggregation = LikelihoodAggregation::UniformMarginal;
     ComponentDiagnostics result{quiet_nan, quiet_nan, quiet_nan, quiet_nan,
                                 quiet_nan, quiet_nan, 0, 4};
     if (!(o.flags & observed_flag)) return result;

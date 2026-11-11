@@ -175,7 +175,7 @@ class CandidateBank:
             prior = tuple(None if k in (source, destination) or not parent.coordinate_fits
                           else parent.coordinate_fits[k] for k in order)
             partition = PreparedPartition(parent.model_identity, parent.tree_identity, membership,
-                                          key.labels, tuple(groups[k] for k in order), prior, parent.columns)
+                                          key.labels, tuple(groups[k] for k in order), prior, parent.selection_columns)
             return partition, np.asarray(centers)[list(order)].copy(), None
         finally:
             self.preparation_seconds += perf_counter()-started
@@ -208,12 +208,17 @@ class CandidateBank:
             groups = tuple(prepared)
             coordinate_fits = tuple(reused)
         if fitted is not None and getattr(fitted, "coordinate_fits", None) is not None:
+            if (hasattr(self.model, "method_identity") and
+                    fitted.fit_objective_id != self.model.method_identity["fit_objective_id"]):
+                raise ValueError("Coordinate fits belong to another fitting objective")
             coordinate_fits = tuple(tuple(tuple(value) for value in group)
                                     for group in fitted.coordinate_fits)
+        if columns is not None and getattr(columns, "aggregation", "marginal") != "marginal":
+            raise ValueError("Prepared parents require marginal selection columns")
         return PreparedPartition(getattr(self.model, "identity", ""), self._tree_identity,
                                  Membership(self.tree, cuts) if cuts is not None else Membership(explicit_labels=labels),
                                  labels, groups, coordinate_fits,
-                                 columns if parent is None else parent.columns)
+                                 columns if parent is None else parent.selection_columns)
 
     def consider_cuts(self, cuts, centers, provenance):
         """Trusted canonical cuts: exact cache lookup precedes labels/groups."""
@@ -354,7 +359,10 @@ class CandidateBank:
                 state = FitResult(partition.membership, aligned, weights,
                                   float(fitted.conditional_log_likelihood), float(fitted.mixture_log_likelihood),
                                   float(fitted.complexity_penalty), float(fitted.score), True,
-                                  fitted.reason, fitted.diagnostics, coordinate_fits)
+                                  fitted.reason, fitted.diagnostics, coordinate_fits,
+                                  getattr(fitted, "fitting_log_likelihood", None),
+                                  getattr(fitted, "fit_objective_id", "uniform_multiplicity_marginal_v1"),
+                                  getattr(fitted, "selection_criterion_id", "marginal_mixture_bic_at_fitted_centers_v1"))
             candidate = Candidate(state, [provenance], len(self.candidates))
             self.candidates.append(candidate)
             self._states[state_key] = candidate

@@ -679,6 +679,8 @@ extern "C" int CliPP2GatherJointColumns(void* value,i64 count,const i64* handles
 extern "C" int CliPP2CreateMixtureProblem(void* value,i64 count,const i64* handles,i64* output) {
     return scoring_guarded([&] {
         auto& c=context(value); if(!output) throw std::domain_error("Missing CUDA mixture handle destination");
+        if(c.data.aggregation != LikelihoodAggregation::UniformMarginal)
+            throw std::domain_error("Mixture selection requires marginal columns");
         *output=0;
         auto p=std::make_unique<MixtureProblem>(c,count);
         p->host_charge=add(sizeof(MixtureProblem)+256,multiply(count,64));

@@ -141,6 +141,23 @@ __global__ void refit_grid_kernel(ObservationSoA data, RefitBatch batch,
     if (!threadIdx.x) grid_values[point] = value;
 }
 
+// Match the CPU derivative's logical sum without instantiating the full
+// recursive evaluator inside every CUDA lane. Reuse the objective workspace;
+// both evaluation and reduction are collective and keep their existing order.
+struct DeviceProfileDerivative {
+    ObservationSoA data;
+    const i64* rows;
+    i64 count, region;
+    double probe;
+    double *values, *partials, *total;
+    __device__ double at(double center) const {
+        const ProfileBranchDerivative derivative{data, rows, count, region, probe, center};
+        for (i64 row = threadIdx.x; row < count; row += blockDim.x)
+            values[row] = derivative(row);
+        return ordered_block_sum(values, count, partials, total);
+    }
+};
+
 __global__ void finish_refit_kernel(ObservationSoA data, RefitBatch batch,
         const i64* observed_rows, const i64* observed_counts, double* scratch,
         const double* grid_values, RefitResult* output,i64 row_stride,i64 max_rows,
@@ -165,14 +182,18 @@ __global__ void finish_refit_kernel(ObservationSoA data, RefitBatch batch,
             local.xatol = batch.xatol + task;
             local.incumbent = batch.incumbent ? batch.incumbent + task : nullptr;
             auto* values=scratch+(probability_flags?task*row_stride:begin);
-            const auto result = refit_search_from_grid(local, 0, grid_values + point,
-                RefitObjective{data, observed_rows + begin, observed_counts[task],
+            const auto objective = RefitObjective{data, observed_rows + begin, observed_counts[task],
                     batch.regions[task], values, partials, &total,probability,
                     probability_flags && probability_flags[task]?values+max_rows:nullptr,
                     shape_ids?shape_ids+begin:nullptr,row_shapes?row_shapes+begin:nullptr,
                     shape_counts?shape_counts[task]:0,
                     shape_counts && probability.regions
-                        ?values+max_rows+2*probability.regions[batch.regions[task]].components:nullptr});
+                        ?values+max_rows+2*probability.regions[batch.regions[task]].components:nullptr};
+            const auto result = data.aggregation == LikelihoodAggregation::IntegerProfile
+                ? profile_refit_search(local, 0, objective, DeviceProfileDerivative{
+                    data, observed_rows+begin, observed_counts[task], batch.regions[task], 0,
+                    values, partials, &total})
+                : refit_search_from_grid(local, 0, grid_values + point, objective);
             if (!threadIdx.x) output[task] = result;
         }
         __syncthreads();
@@ -199,7 +220,8 @@ void refit_cuda(Context& c, const RefitBatch& batch, RefitResult* output) {
     const RefitLayout b(tasks, plan.members, plan.points, batch.incumbent != nullptr,probability);
     c.reserve(plan.bytes);
     for (i64 task = 0; task < tasks; ++task) {
-        if (batch.lower[task] == 0 && batch.upper[task] == 1)
+        if (c.data.aggregation == LikelihoodAggregation::UniformMarginal &&
+                batch.lower[task] == 0 && batch.upper[task] == 1)
             cached.tables[task] = cached.get(batch.regions[task]);
         observed_counts.values[task] = !cached.tables[task] ? 0
             : reinterpret_cast<i64>(cached.tables[task]->values);
@@ -228,7 +250,7 @@ void refit_cuda(Context& c, const RefitBatch& batch, RefitResult* output) {
         probability?c.pointer<i64>(b.shape_hash_keys):nullptr,
         probability?c.pointer<i64>(b.shape_hash_values):nullptr);
     c.launched();
-    for (i64 point = 0; point < plan.points;) {
+    for (i64 point = 0; c.data.aggregation == LikelihoodAggregation::UniformMarginal && point < plan.points;) {
         const i64 jobs = std::min(plan.wave, plan.points - point);
         refit_grid_kernel<<<static_cast<unsigned>(jobs), threads, 0, c.stream>>>(c.data, device,
             c.pointer<i64>(b.compacted), c.pointer<i64>(b.counts), c.pointer<RefitResult>(b.results),

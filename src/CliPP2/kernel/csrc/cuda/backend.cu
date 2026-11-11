@@ -3,6 +3,7 @@
 #include "../common/backend.h"
 #include "../common/emission_math.h"
 #include "../common/scalar_search.h"
+#include "../common/profile_refit.h"
 #include "../common/validation.h"
 #include "../common/refit_validation.h"
 #include <cuda_runtime.h>
@@ -225,6 +226,14 @@ template<EmitMode Mode> __global__ void cell_kernel(
         store_terms<Mode>(evaluate_observation<Mode>(observation(data, cells[index]), phi[index]),
                           index, loss, gradient, curvature, status);
 }
+__global__ void profile_slopes_kernel(ObservationSoA data,const double* phi,double* right,double* left) {
+    const auto count=data.mutations*data.regions;
+    for(i64 i=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;i<count;
+            i+=static_cast<i64>(blockDim.x)*gridDim.x) {
+        const auto slopes=profile_slopes(observation(data,i),phi[i]);
+        right[i]=slopes.right; left[i]=slopes.left;
+    }
+}
 __global__ void multiplicity_kernel(ObservationSoA data, i64 first, i64 count, const double* phi,
                                    double* output, std::uint8_t* status) {
     for (i64 index = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -432,7 +441,7 @@ extern "C" int CliPP2BackendCreate(const ObservationSoA* input, int device_index
         auto d = [&](i64 offset) { return reinterpret_cast<double*>(c->prepared + offset); };
         c->data = {input->mutations, input->regions, d(alt), d(ref), d(scaling), d(constant),
                    d(lower), d(upper), reinterpret_cast<i64*>(c->prepared + minimum),
-                   reinterpret_cast<i64*>(c->prepared + support), c->prepared + flags};
+                   reinterpret_cast<i64*>(c->prepared + support), c->prepared + flags, input->aggregation};
         c->upload(d(alt), input->alt, count); c->upload(d(ref), input->ref, count);
         c->upload(d(scaling), input->scaling, count); c->upload(d(constant), input->log_constant, count);
         c->upload(d(lower), input->lower, count); c->upload(d(upper), input->upper, count);
@@ -467,6 +476,20 @@ extern "C" int CliPP2ConfigureCUDAProbabilityReuse(void* value,const Observation
         auto& c=context(value);
         clipp2::validate_observations(*input);
         configure_probability_reuse(c,*input,enabled!=0);
+    });
+}
+extern "C" int CliPP2ProfileSlopes(void* value,const double* phi,double* right,double* left) {
+    return guarded([&] {
+        auto& c=context(value);const auto count=multiply(c.data.mutations,c.data.regions);
+        require(phi && right && left,"Null profile slope argument");
+        for(i64 i=0;i<count;++i)
+            require(finite_number(phi[i]) && phi[i]>=0 && phi[i]<=1,"Invalid profile slope coordinate");
+        Layout layout;const auto x=layout.take<double>(count),r=layout.take<double>(count),l=layout.take<double>(count);
+        c.reserve(layout.bytes);c.upload(c.pointer<double>(x),phi,count);
+        profile_slopes_kernel<<<blocks(count),threads,0,c.stream>>>(c.data,c.pointer<double>(x),
+            c.pointer<double>(r),c.pointer<double>(l));c.launched();
+        c.download(right,c.pointer<double>(r),count);c.download(left,c.pointer<double>(l),count);c.finish();
+        ++c.diagnostics.calls;c.diagnostics.cell_evaluations=add(c.diagnostics.cell_evaluations,count);
     });
 }
 extern "C" int CliPP2CUDAProbabilityDiagnostics(void* value,i64* output) {

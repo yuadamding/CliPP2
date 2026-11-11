@@ -19,6 +19,8 @@ inline std::int64_t checked_product(std::int64_t a, std::int64_t b,
     return count;
 }
 inline std::int64_t validate_observations(const ObservationSoA& input) {
+    require(input.aggregation == LikelihoodAggregation::UniformMarginal ||
+            input.aggregation == LikelihoodAggregation::IntegerProfile, "Unknown likelihood aggregation");
     require(input.mutations > 0 && input.regions > 0, "Model dimensions must be positive");
     const auto cells = checked_product(input.mutations, input.regions);
     require(input.alt && input.ref && input.scaling && input.log_constant &&

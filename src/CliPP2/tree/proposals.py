@@ -144,6 +144,8 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=POLICY.b
                    if prepare is not None and hasattr(model, "joint_column_set") else None)
         prepared = (None if prepare is None else
                     prepare(parent.cuts, labels, fitted=fit, columns=handles))
+        if hasattr(model, "fit_column_set"):
+            handles = model.fit_column_set(fit.centers)
         components = ({cluster: group.members for cluster, group in enumerate(prepared.groups)}
                       if prepared is not None and prepared.groups else
                       {cluster: np.flatnonzero(labels == cluster) for cluster in range(len(fit.centers))})
@@ -363,6 +365,8 @@ def expand_memberships(model, bank, *, work=None):
             handles = model.joint_column_set(centers) if hasattr(model, "joint_column_set") else None
             prepared = (bank.prepare(state.cuts, labels, fitted=state.fit, columns=handles)
                         if hasattr(bank, "prepare") else None)
+            if hasattr(model, "fit_column_set"):
+                handles = model.fit_column_set(centers)
             use_device = (getattr(bank, "device_proposals", False) and handles is not None
                           and getattr(getattr(model, "backend", None), "kind", None) == "cuda")
             positive = handles.positive_transfers(labels) if use_device else None

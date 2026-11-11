@@ -16,7 +16,7 @@ from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 from CliPP2.simulation.evaluation import (aggregate, candidate_correspondence, cap_audit,
     information_diagnostics, mapped_probabilities, partition_scores, probability_scores,
     recovery_reach, reference_center_diagnostics, transition, json_safe, evaluate,
-    evaluation_definition, legacy_evaluation_definition, target_reference_availability, _qualified_matching)
+    legacy_evaluation_definition, target_reference_availability, _qualified_matching)
 from CliPP2.io.data import content_hash
 from CliPP2.simulation.evaluation import log_probability_mass
 
@@ -192,11 +192,11 @@ def _all_target_checks():
                 target_reason=row["target_reason"].replace("stage2_near_clonal_recheck", "stage2_recheck"))
     value = evaluate(h, catalog, paired, truth_qualification="verified_history_binding")
     assert value["schema"] == "clipp2.simulation.evaluation.v5"
-    assert value["evaluation_definition"] == evaluation_definition()
+    assert value["evaluation_definition"] == legacy_evaluation_definition(5, reference_policy=STAGE_THREE_REFERENCE_POLICY)
     historical = deepcopy(paired)
     historical.pop("reference_policy")
     old_value = evaluate(h, catalog, historical, truth_qualification="verified_history_binding")
-    assert old_value["evaluation_definition"] == evaluation_definition(reference_policy=HISTORICAL_V5_REFERENCE_POLICY)
+    assert old_value["evaluation_definition"] == legacy_evaluation_definition(5, reference_policy=HISTORICAL_V5_REFERENCE_POLICY)
     assert old_value["evaluation_definition_id"] != value["evaluation_definition_id"]
     metrics = {(r["name"], r["view"]): r for r in value["metrics"] if r["arm"] == "C3" and r["stratum"] == "all"}
     assert metrics["data_supported_map_coverage", ""]["denominator"] == 14
@@ -215,6 +215,38 @@ def _all_target_checks():
         pass
     else:
         raise AssertionError("Current all-target schema accepted an unchanged population")
+    from CliPP2.assignment import POSTERIOR_FIELDS
+    method_ids = []
+    for method in ("marginal", "profile"):
+        current = deepcopy(paired)
+        current.update(schema="clipp2.paired-experiment.v6", protocol_version="2.4")
+        current["config"]["stage_three_assignment_method"] = method
+        for arm in current["arms"].values():
+            arm["assignment"].update(schema="clipp2.assignment.result.v9", protocol_version="2.4", assignment_method=method)
+            for row in arm["assignment"]["assignments"]:
+                row.update(assignment_method=method, score_defined=True, selection_reason="unique_maximum")
+                if method == "profile":
+                    row.update(dict.fromkeys(POSTERIOR_FIELDS))
+                    row["posterior_defined"] = False
+        assessed = evaluate(h, catalog, current, truth_qualification="verified_history_binding")
+        assert assessed["schema"] == "clipp2.simulation.evaluation.v6"
+        assert assessed["assignment_method"] == method
+        method_ids.append(assessed["evaluation_definition_id"])
+        if method == "profile":
+            assert assessed["calibration"] == []
+            scores = [r for r in assessed["metrics"] if r["name"] in ("binary_brier", "binary_log_loss", "multiclass_log_loss")]
+            assert scores and all(r["value"] is None and r["status"] == "undefined_for_profile" for r in scores)
+            before = {(r["arm"], r["mutation_id"]): r["final_assignment_label"] for r in value["mutations"]}
+            assert all(r["final_assignment_label"] == before[r["arm"], r["mutation_id"]] for r in assessed["mutations"])
+            assert all(r["posterior_defined"] is False for r in assessed["mutations"] if r["role"] == "target")
+            current["arms"]["C"]["assignment"]["assignments"][0]["probabilities"] = [.25]*4
+            try:
+                evaluate(h, catalog, current)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("Profile calibration probabilities were accepted")
+    assert method_ids[0] != method_ids[1] != value["evaluation_definition_id"]
     return dict(status="passed", F_empty=True, every_fitted_member_reassessed=True,
                 unrestricted_catalog_supported=True, explicit_MAP_fields=True)
 

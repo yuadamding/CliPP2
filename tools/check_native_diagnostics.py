@@ -182,6 +182,7 @@ def _resident_lease_checks():
 
     class Owner:
         kind, n = "cuda", 4
+        aggregation = "marginal"
         def __init__(self):
             self.context, self.locked, self.mode, self.calls = object(), False, "success", 0
             self.sizes, self.released = {}, []

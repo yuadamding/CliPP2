@@ -33,6 +33,7 @@ int CliPP2MultiplicityMAP(void*, const double* phi, double* multiplicity, std::u
 // Missing accepted calls use NaN; a supplied call outside support has log P=-inf.
 int CliPP2ComponentDiagnostics(void*, const double* phi, const double* accepted_calls,
                               clipp2::ComponentDiagnostics* output);
+int CliPP2ProfileSlopes(void*, const double* phi, double* right, double* left);
 // Results [grid, row], read emissions only (no assignment bounds).
 int CliPP2EvaluateRegionalGrid(void*, std::int64_t region, std::int64_t row_count,
                               const std::int64_t* rows, std::int64_t grid_count,

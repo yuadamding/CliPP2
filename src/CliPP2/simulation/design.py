@@ -87,7 +87,7 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
         raise ValueError("Declared replicates exceed the supplied study design")
     replicate_roster = dict(unit="variant" if cohort else "family", main=list(range(1, main+1)),
         development=list(range(1, development+1)))
-    return dict(schema="clipp2.simulation-contract.v7", study_version=STUDY_VERSION,
+    return dict(schema="clipp2.simulation-contract.v8", study_version=STUDY_VERSION,
         implementation_version=__version__,
         run_manifest_id=validate_run_manifest_id(run_manifest_id if run_manifest_id is not None
                                                else os.environ.get("CLIPP2_RUN_MANIFEST_ID")),
@@ -103,7 +103,8 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
             population="all declared development histories and acquisitions",
             failures="retained in planned-population accounting; no fabricated estimates"),
         base_workflow_config=asdict(workflow_config()),
-        evaluation=dict(record_schema="clipp2.simulation.evaluation.v5",
+        evaluation=dict(record_schema="clipp2.simulation.evaluation.v6",
+            assignment_method=workflow_config().stage_three_assignment_method,
             reference_policy=STAGE_THREE_REFERENCE_POLICY,
             primary="data-supported MAP sampled-region clonality, detailed membership and CCF error",
             reference_match_atol=reference_match_atol, reference_distance="l2",
@@ -122,8 +123,8 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
 
 def _replicates(contract):
     roster = contract["replicate_roster"]
-    if contract.get("schema") == "clipp2.simulation-contract.v7" and set(roster) != {"unit", "main", "development"}:
-        raise ValueError("Protocol 2.3 requires one main and one development replicate block")
+    if contract.get("schema") in ("clipp2.simulation-contract.v7", "clipp2.simulation-contract.v8") and set(roster) != {"unit", "main", "development"}:
+        raise ValueError("The current protocol requires one main and one development replicate block")
     maximums = (10, 2) if contract.get("cohort") else (50, 10)
     if roster.get("unit") != ("variant" if contract.get("cohort") else "family"):
         raise ValueError("Replicate roster unit differs from the study design")

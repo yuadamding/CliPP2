@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 from scipy.special import logsumexp, xlogy, xlog1py
 
-from .config import PROTOCOL_VERSION
+from .config import PROTOCOL_VERSION, validate_assignment_method
 from ._version import __version__
 from .io.data import (ImmutableArrayRecord, MultiplicityBounds, OriginalCatalog, readonly_array, thaw_record,
                       json_value as _json_value, freeze_record as _freeze, content_hash)
@@ -16,9 +16,15 @@ from .kernel.observations import prepare_prediction
 from .screening import binomial_profile_deviance, summarize_profile_deviance
 
 SUPPORT_POLICY = "original_full_1_to_major_cn"
+ASSIGNMENT_POLICIES = {"marginal": "observed_exact_map_lowest_public_label",
+    "profile": "observed_exact_profile_baseline_then_lowest_public_label"}
+RESULT_SCHEMA = "clipp2.assignment.result.v9"
+POSTERIOR_FIELDS = ("probabilities", "posterior", "best_log_probability",
+    "second_best_probability", "entropy", "log_competitor_ratio")
 EVIDENCE_STATUSES = ("observed", "prior_only", "model_incompatible", "computation_failed", "input_missing", "excluded")
 _HISTORICAL_SCHEMAS = {"clipp2.assignment.bundle.v3": "2.2", "clipp2.assignment.result.v4": "2.2",
-                       "clipp2.assignment.bundle.v4": "2.3", "clipp2.assignment.result.v5": "2.3"}
+    **{f"clipp2.assignment.bundle.v{v}": "2.3" for v in (4, 5)},
+    **{f"clipp2.assignment.result.v{v}": "2.3" for v in (5, 6, 7, 8)}}
 
 
 def _integer_tuple(values, name):
@@ -48,20 +54,29 @@ class HistoricalAssignmentArtifact(ImmutableArrayRecord):
         return content_hash(self.to_dict())
 
 
-def derive_current_bundle(historical):
-    """Explicit fixed-reference derivative; preserve the historical target population.
-
-    This does not rebuild a current workflow's references or its all-target routing.
-    The original artifact remains unchanged and its identity is retained in provenance.
-    """
-    if (type(historical) is not HistoricalAssignmentArtifact
-            or historical.payload["schema"] not in ("clipp2.assignment.bundle.v3", "clipp2.assignment.bundle.v4")):
-        raise TypeError("An intact historical v3/v4 assignment bundle is required")
-    payload = historical.to_dict()
+def derive_assignment_bundle(source, *, assignment_method=None):
+    """Derive a method-bound request without editing observations or frozen references."""
+    if type(source) is AssignmentBundle:
+        source.validated_payload()
+        method = source.assignment_method if assignment_method is None else assignment_method
+        validate_assignment_method(method)
+        if method == source.assignment_method:
+            return source
+        provenance = thaw_record(source.provenance, arrays_as_lists=True)
+        provenance = dict(provenance) if isinstance(provenance, Mapping) else {"original_provenance": provenance}
+        provenance["assignment_derivation"] = dict(source_bundle_hash=source.content_hash,
+            source_assignment_method=source.assignment_method, assignment_method=method)
+        return replace(source, assignment_method=method, provenance=provenance)
+    if (type(source) is not HistoricalAssignmentArtifact
+            or source.payload["schema"] not in tuple(f"clipp2.assignment.bundle.v{v}" for v in (3, 4, 5))):
+        raise TypeError("An intact current or historical v3/v4/v5 assignment bundle is required")
+    method = "marginal" if assignment_method is None else assignment_method
+    validate_assignment_method(method)
+    payload = source.to_dict()
     provenance = payload.get("provenance", {})
     payload["provenance"] = dict(provenance) if isinstance(provenance, Mapping) else {"original_provenance": provenance}
     derivation = dict(schema=payload["schema"], protocol_version=payload["protocol_version"],
-        content_hash=historical.content_hash, scope="fixed_reference_original_targets")
+        content_hash=source.content_hash, scope="fixed_reference_original_targets")
     if payload["schema"] == "clipp2.assignment.bundle.v3":
         reference = payload["reference"]
         derivation["legacy_decision_metadata"] = dict(thresholds=payload.pop("thresholds"),
@@ -71,9 +86,16 @@ def derive_current_bundle(historical):
                      "source_maximum_profile_deviance", "diagnostic_availability"):
             reference[name] = None
     payload["provenance"]["historical_derivation"] = derivation
-    payload["schema"] = "clipp2.assignment.bundle.v5"
-    payload["protocol_version"] = PROTOCOL_VERSION
+    payload["provenance"]["assignment_derivation"] = dict(source_bundle_hash=source.content_hash,
+        source_assignment_method="marginal", assignment_method=method)
+    payload.update(schema="clipp2.assignment.bundle.v6", protocol_version=PROTOCOL_VERSION,
+                   assignment_method=method)
     return AssignmentBundle.from_dict(payload)
+
+
+def derive_current_bundle(historical, *, assignment_method=None):
+    """Explicit historical migration, preserving its target population and source hash."""
+    return derive_assignment_bundle(historical, assignment_method=assignment_method)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +185,7 @@ class AssignmentReference(ImmutableArrayRecord):
         value = dict(value)
         if not {"source_informative_count", "source_informative_depth", "source_mean_profile_deviance",
                 "source_maximum_profile_deviance", "diagnostic_availability", "center_sources"} <= set(value):
-            raise ValueError("Protocol 2.3 references require source measurements and provenance")
+            raise ValueError("Current references require source measurements and provenance")
         priors = np.asarray(value.pop("priors"), float)
         result = cls(**value)
         if not np.array_equal(priors, result.priors):
@@ -189,12 +211,14 @@ class AssignmentBundle(ImmutableArrayRecord):
     normal_cn_policy: str | None = None
     provenance: object = field(default_factory=dict)
     run_manifest_id: str | None = field(default=None, kw_only=True)
+    assignment_method: str = field(default="marginal", kw_only=True)
     bounds: MultiplicityBounds = field(init=False, repr=False)
     _content_hash: str = field(init=False, repr=False)
 
     def __post_init__(self):
         from .provenance import validate_run_manifest_id
         validate_run_manifest_id(self.run_manifest_id)
+        validate_assignment_method(self.assignment_method)
         targets, others = tuple(self.target_ids), tuple(self.non_target_ids)
         if type(self.catalog) is not OriginalCatalog or type(self.reference) is not AssignmentReference:
             raise TypeError("Assignment requires a validated original catalog and frozen reference")
@@ -266,8 +290,8 @@ class AssignmentBundle(ImmutableArrayRecord):
     def to_dict(self):
         values = {name: getattr(self, name) for name in ("target_ids", "non_target_ids", "native_centers",
             "native_calls", "native_lower", "native_upper", "source_stages", "source_labels", "baseline_labels",
-            "device", "cpu_threads", "normal_cn_policy", "provenance", "run_manifest_id")}
-        return _json_value(dict(schema="clipp2.assignment.bundle.v5", protocol_version=PROTOCOL_VERSION,
+            "device", "cpu_threads", "normal_cn_policy", "provenance", "run_manifest_id", "assignment_method")}
+        return _json_value(dict(schema="clipp2.assignment.bundle.v6", protocol_version=PROTOCOL_VERSION,
             support_policy=SUPPORT_POLICY, **values,
             catalog=self.catalog.to_dict(), reference=self.reference.to_dict(),
             bounds=self.bounds.to_dict()))
@@ -291,13 +315,13 @@ class AssignmentBundle(ImmutableArrayRecord):
 
     @classmethod
     def from_dict(cls, value):
-        if value.get("schema") in ("clipp2.assignment.bundle.v3", "clipp2.assignment.bundle.v4"):
+        if value.get("schema") in ("clipp2.assignment.bundle.v3", "clipp2.assignment.bundle.v4", "clipp2.assignment.bundle.v5"):
             return HistoricalAssignmentArtifact(value)
         values = dict(value)
-        if (values.pop("schema", None) != "clipp2.assignment.bundle.v5"
+        if (values.pop("schema", None) != "clipp2.assignment.bundle.v6"
                 or values.pop("protocol_version", None) != PROTOCOL_VERSION
-                or values.pop("support_policy", None) != SUPPORT_POLICY):
-            raise ValueError("Assignment requires a protocol 2.3 bundle with schema v5")
+                or values.pop("support_policy", None) != SUPPORT_POLICY or "assignment_method" not in values):
+            raise ValueError("Assignment requires a protocol 2.4 bundle with schema v6 and an assignment method")
         bounds = MultiplicityBounds.from_dict(values.pop("bounds"))
         values["catalog"] = OriginalCatalog.from_dict(values["catalog"])
         values["reference"] = AssignmentReference.from_dict(values["reference"])
@@ -316,10 +340,12 @@ class AssignmentResult(ImmutableArrayRecord):
     multiplicities: tuple
     summary: object
     run_manifest_id: str | None = field(default=None, kw_only=True)
+    assignment_method: str = field(default="marginal", kw_only=True)
 
     def __post_init__(self):
         from .provenance import validate_run_manifest_id
         validate_run_manifest_id(self.run_manifest_id)
+        validate_assignment_method(self.assignment_method)
         targets = tuple(self.target_ids)
         if type(self.reference) is not AssignmentReference or len(set(targets)) != len(targets):
             raise ValueError("Assignment result needs unique target identities and a validated reference")
@@ -332,32 +358,37 @@ class AssignmentResult(ImmutableArrayRecord):
                 value = row.get(name)
                 if value is not None:
                     _integer_tuple((value,), name)
-            for key in ("probabilities", "log_scores"):
-                values = np.asarray(row[key], dtype=float)
-                if values.shape != (len(self.reference.labels),):
-                    raise ValueError("Assignment probability/score vectors must cover the complete reference")
-                row[key] = readonly_array(values)
+            scores = np.asarray(row["log_scores"], dtype=float)
+            if scores.shape != (len(self.reference.labels),) or np.isnan(scores).any() or np.isposinf(scores).any():
+                raise ValueError("Assignment log scores must cover the reference and be finite or negative infinity")
+            row["log_scores"] = readonly_array(scores)
             if _integer_tuple(row.get("reference_labels", ()), "reference_labels") != self.reference.labels:
-                raise ValueError("Assignment probability labels must preserve exact reference order")
-            probabilities, scores = row["probabilities"], row["log_scores"]
-            if np.isnan(scores).any() or np.isposinf(scores).any():
-                raise ValueError("Assignment log scores must be finite or negative infinity")
-            if np.isfinite(scores).any():
-                if (not np.isfinite(probabilities).all() or np.any(probabilities < 0)
-                        or not np.isclose(probabilities.sum(), 1., rtol=0, atol=1e-12)):
-                    raise ValueError("Defined assignment probabilities must be finite, nonnegative and normalized")
-            elif not np.isnan(probabilities).all():
-                raise ValueError("Uninformative/incompatible assignment probabilities must be missing")
+                raise ValueError("Assignment score labels must preserve exact reference order")
+            if row.get("assignment_method") != self.assignment_method:
+                raise ValueError("Assignment row and result methods differ")
+            expected = assignment_score_summary(scores, self.reference.labels, self.assignment_method, row.get("baseline_label"))
+            if self.assignment_method == "profile":
+                if any(row.get(name) is not None for name in POSTERIOR_FIELDS):
+                    raise ValueError("Profile scores are not cluster posterior probabilities")
+            else:
+                probabilities = np.asarray(row["probabilities"], dtype=float)
+                if probabilities.shape != scores.shape:
+                    raise ValueError("Assignment probability vectors must cover the reference")
+                if np.isfinite(scores).any():
+                    if (not np.isfinite(probabilities).all() or np.any(probabilities < 0)
+                            or not np.isclose(probabilities.sum(), 1., rtol=0, atol=1e-12)):
+                        raise ValueError("Defined probabilities must be finite, nonnegative and normalized")
+                elif not np.isnan(probabilities).all():
+                    raise ValueError("Undefined marginal probabilities must remain missing")
+                row["probabilities"] = readonly_array(probabilities)
             ties = _integer_tuple(row.get("map_tied_labels", ()), "map_tied_labels")
-            expected_ties = (tuple(sorted(label for label, score in zip(self.reference.labels, scores)
-                                          if score == np.max(scores))) if np.isfinite(scores).any() else ())
-            if (ties != expected_ties or _integer_tuple(row.get("map_set", ()), "map_set") != ties
-                    or row.get("map_label") != (ties[0] if ties else None)
-                    or row.get("map_cluster_label") != row.get("map_label")):
-                raise ValueError("Exact maximizing ties and their smallest public representative must agree")
-            if (type(row.get("posterior_defined")) not in (bool, np.bool_)
-                    or row["posterior_defined"] != bool(ties)):
-                raise ValueError("Posterior availability must describe the actual normalized score vector")
+            if (ties != expected["map_tied_labels"] or _integer_tuple(row.get("map_set", ()), "map_set") != ties
+                    or any(row.get(name) != expected[name] for name in
+                           ("best_label", "second_best_label", "map_label", "map_cluster_label", "selection_reason"))):
+                raise ValueError("Exact maximizing set and method-specific representative must agree")
+            for name in ("score_defined", "posterior_defined"):
+                if type(row.get(name)) not in (bool, np.bool_) or row[name] != expected[name]:
+                    raise ValueError("Score/posterior availability differs from the declared method")
             unique = row.get("map_unique")
             if (ties and (not isinstance(unique, (bool, np.bool_)) or unique != (len(ties) == 1))
                     or not ties and unique is not None):
@@ -382,26 +413,32 @@ class AssignmentResult(ImmutableArrayRecord):
     def to_dict(self):
         # Keep numeric NaN/inf in this plain copy payload; JSON publishers apply
         # the shared scientific-value codec at the actual serialization boundary.
-        return thaw_record(dict(schema="clipp2.assignment.result.v6", protocol_version=PROTOCOL_VERSION,
+        return thaw_record(dict(schema=self.schema, protocol_version=PROTOCOL_VERSION,
+            assignment_method=self.assignment_method,
             support_policy=SUPPORT_POLICY,
             bundle_hash=self.bundle_hash, target_ids=self.target_ids, reference=self.reference.to_dict(),
             assignments=self.assignments, multiplicities=self.multiplicities, summary=self.summary,
             run_manifest_id=self.run_manifest_id), arrays_as_lists=True)
 
+    @property
+    def schema(self):
+        return RESULT_SCHEMA
+
     @classmethod
     def from_dict(cls, value):
-        if value.get("schema") in ("clipp2.assignment.result.v4", "clipp2.assignment.result.v5"):
+        if value.get("schema") in tuple(f"clipp2.assignment.result.v{v}" for v in (4, 5, 6, 7, 8)):
             return HistoricalAssignmentArtifact(value)
         values = dict(value)
-        if (values.pop("schema", None) != "clipp2.assignment.result.v6"
+        schema = values.pop("schema", None)
+        if (schema != RESULT_SCHEMA or "assignment_method" not in values
                 or values.pop("protocol_version", None) != PROTOCOL_VERSION
                 or values.pop("support_policy", None) != SUPPORT_POLICY):
-            raise ValueError("Assignment requires a protocol 2.3 result with schema v6")
+            raise ValueError("Assignment requires a protocol 2.4 result with schema v9 and assignment method")
         values["reference"] = AssignmentReference.from_dict(values["reference"])
         return cls(**values)
 
 
-POLICY_FIELDS = ("status", "evidence_status", "best_label", "second_best_label", "posterior",
+POLICY_FIELDS = ("assignment_method", "score_defined", "selection_reason", "status", "evidence_status", "best_label", "second_best_label", "posterior",
     "map_label", "map_set", "posterior_defined",
     "map_cluster_label", "map_tied_labels", "map_unique", "best_log_probability", "second_best_probability",
     "entropy", "log_score_margin", "log_competitor_ratio", "comparison_scope", "has_finite_alternative",
@@ -413,7 +450,7 @@ REGIONAL_BASE_FIELDS = ("mutation_id", "region_id", "alt_count", "ref_count", "t
     "segment_id", "mapping_genuine", "count_observed", "positive_depth", "original_eligible", "original_input_excluded", "excluded",
     "informative", "native_phi", "native_call", "native_lower", "native_upper", "original_lower",
     "original_upper", "source_stage", "source_label")
-REGIONAL_POLICY_FIELDS = ("best_label", "phi", "conditional_map", "conditional_call", "call_probability",
+REGIONAL_POLICY_FIELDS = ("assignment_method", "best_label", "phi", "conditional_map", "conditional_call", "call_probability",
     "call_log_probability", "top_two_gap", "has_second_component", "native_call_log_probability",
     "conditional_distribution_defined", "multiplicity_tie", "map_tied_multiplicities", "map_unique",
     "structural_singleton", "multiplicity_read_informative", "membership_status", "multiplicity_status",
@@ -431,7 +468,7 @@ REASSESSMENT_OUTCOMES = ("retained", "reassigned", "unresolved", "not_applicable
 
 
 def assignment_outcome(source_stage, baseline_label, final_label, clonal_label):
-    """Compare the MAP with the actual source's frozen reference label."""
+    """Compare the selected label with the actual source's frozen reference label."""
     if target_reason(source_stage) == "fixed_reference_recheck":
         status = "not_applicable"
     else:
@@ -533,6 +570,53 @@ def assignment_decision(summary, eligible, informative_regions):
     return "model_incompatible" if summary["best_label"] is None else "observed"
 
 
+def profile_score_summary(scores, labels, baseline_label):
+    """Exact profile maxima; retain baseline only within the exact maximizing set."""
+    scores, labels = np.asarray(scores, float), tuple(labels)
+    if (scores.shape != (len(labels),) or not labels or np.isnan(scores).any() or np.isposinf(scores).any()
+            or len(set(labels)) != len(labels) or any(type(label) is not int or label < 0 for label in labels)):
+        raise ValueError("Profile scores require distinct labels and finite or negative-infinite values")
+    ties = tuple(sorted(label for label, value in zip(labels, scores) if value == np.max(scores))) if np.isfinite(scores).any() else ()
+    label = baseline_label if baseline_label in ties else min(ties) if ties else None
+    best = labels.index(label) if label is not None else None
+    others = sorted((i for i in range(len(labels)) if i != best), key=lambda i: (-scores[i], labels[i]))
+    second = others[0] if best is not None and others else None
+    reason = ("no_finite_candidate" if not ties else "unique_maximum" if len(ties) == 1
+              else "baseline_in_exact_tie" if baseline_label in ties else "lowest_label_in_exact_tie")
+    return dict(best_index=best, second_index=second, best_label=label,
+        second_best_label=labels[second] if second is not None else None, map_label=label,
+        map_cluster_label=label, map_set=ties, map_tied_labels=ties, map_unique=len(ties) == 1 if ties else None,
+        score_defined=bool(ties), posterior_defined=False, **dict.fromkeys(POSTERIOR_FIELDS),
+        log_score_margin=float(scores[best]-scores[second]) if second is not None else np.nan,
+        has_finite_alternative=bool(np.isfinite(np.delete(scores, best)).any()) if best is not None else None,
+        comparison_scope="single_candidate" if len(labels) == 1 else "multiple_candidates", selection_reason=reason)
+
+
+def assignment_score_summary(scores, labels, method, baseline_label):
+    validate_assignment_method(method)
+    if method == "profile":
+        return profile_score_summary(scores, labels, baseline_label)
+    result = score_summary(scores, labels)
+    result.update(score_defined=result["posterior_defined"],
+        selection_reason="no_finite_candidate" if not result["map_set"] else
+            "unique_maximum" if result["map_unique"] else "lowest_label_in_exact_tie")
+    return result
+
+
+def _validated_profile_terms(diagnostics, observed):
+    """Authoritative native maxima: no error-to-zero/impossible/fallback conversion."""
+    observed = np.asarray(observed, bool)
+    status = np.asarray(diagnostics["status"])
+    values = np.asarray(diagnostics["max_component_log_mass"], float)
+    if status.shape != observed.shape or values.shape != observed.shape:
+        raise ArithmeticError("Profile diagnostic arrays do not match the observation mask")
+    if (not np.isin(status, (0, 1, 4)).all() or np.any(observed & (status == 4))
+            or np.any(observed & (status == 0) & ~np.isfinite(values))
+            or np.any(observed & (status == 1) & ~np.isneginf(values))):
+        raise ArithmeticError("Invalid native profile-likelihood status or maximum component mass")
+    return np.where(observed, values, 0.)
+
+
 @dataclass(frozen=True, slots=True)
 class _ReferenceEvaluation:
     records: tuple
@@ -554,13 +638,18 @@ def _score_reference(bundle, progress_callback):
                            dict(status="skipped_empty_targets", device=bundle.device))
     with NativeBackend(observation, cpu_threads=bundle.cpu_threads) as backend:
         for index, center in enumerate(bundle.reference.centers):
-            loss = backend.node_terms(np.broadcast_to(center, (n, r)), derivatives=False)
-            scores[:, index] = np.where(observed, -loss, 0.).sum(axis=1) - np.log(k)
+            centers = np.broadcast_to(center, (n, r))
+            if bundle.assignment_method == "marginal":
+                regional = np.where(observed, -backend.node_terms(centers, derivatives=False), 0.)
+            else:
+                regional = _validated_profile_terms(backend.component_diagnostics(centers), observed)
+            scores[:, index] = regional.sum(axis=1) - np.log(k)
             scores[~observation.eligible.any(axis=1), index] = -np.inf
             if progress_callback:
                 progress_callback(dict(operation="assignment", protocol_version=PROTOCOL_VERSION,
                                        completed_candidates=index + 1, candidate_count=k))
-        summaries = [score_summary(row, bundle.reference.labels) for row in scores]
+        summaries = [assignment_score_summary(row, bundle.reference.labels, bundle.assignment_method, baseline)
+                     for row, baseline in zip(scores, bundle.baseline_labels)]
         best = np.array([row["best_index"] if row["best_index"] is not None else 0 for row in summaries], dtype=int)
         diagnostic_error = None
         try:
@@ -574,8 +663,9 @@ def _score_reference(bundle, progress_callback):
     for i, mutation in enumerate(bundle.target_ids):
         summary = summaries[i]
         status = assignment_decision(summary, bool(observation.eligible[i].any()), int(coverage[i]))
-        final = summary["map_label"] if status == "observed" else None
+        final = bundle.reference.labels[best[i]] if status == "observed" else None
         records.append(dict(mutation_id=mutation, status=status, evidence_status=status,
+            assignment_method=bundle.assignment_method,
             **{key: value for key, value in summary.items() if key not in ("best_index", "second_index")},
             informative_regions=int(coverage[i]), log_scores=scores[i], reference_labels=bundle.reference.labels,
             source_stage=bundle.source_stages[i], source_label=bundle.source_labels[i],
@@ -587,7 +677,7 @@ def _score_reference(bundle, progress_callback):
 
 
 def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifest_id=None):
-    """Return MAP estimates and diagnostic measurements at a frozen reference."""
+    """Execute only the immutable bundle\'s declared assignment method."""
     if type(bundle) is not AssignmentBundle:
         raise TypeError("assign_mutations requires a validated AssignmentBundle")
     bundle.validated_payload()
@@ -611,18 +701,22 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
             if present and diagnostic["status"][i, j] in (2, 3):
                 error = diagnostic["error"] or f"Native component diagnostic status {diagnostic['status'][i, j]}"
             distribution = None
-            if present and error is None:
+            if present and (error is None or bundle.assignment_method == "profile"):
                 try:
                     distribution = conditional_multiplicity(catalog, source, j, phi,
                         int(support.lower[i, j]), int(support.upper[i, j]))
-                    error = distribution["diagnostic_error"]
+                    error = error or distribution["diagnostic_error"]
                 except Exception as failure:
+                    if bundle.assignment_method == "profile":
+                        raise ArithmeticError("Profile winner has no valid maximizing multiplicity") from failure
                     error = f"{type(failure).__name__}: {failure}"
             defined = bool(distribution is not None and distribution["defined"])
+            if present and bundle.assignment_method == "profile" and not defined:
+                raise ArithmeticError("Finite profile winner has undefined conditional multiplicity")
             singleton = bool(support.lower[i, j] == support.upper[i, j])
             call = distribution["map_call"] if defined else np.nan
-            deviance = (distribution["profile_deviance"] if defined else
-                        np.nan if error or not present else np.inf)
+            deviance = (np.nan if error else distribution["profile_deviance"] if defined else
+                        np.nan if not present else np.inf)
             diagnostic_status = "failed" if error else "available" if present else "not_applicable"
             if error:
                 errors.append(f"{region}: {error}")
@@ -663,6 +757,7 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
                 native_lower=int(bundle.native_lower[i, j]), native_upper=int(bundle.native_upper[i, j]),
                 original_lower=int(support.lower[i, j]), original_upper=int(support.upper[i, j]),
                 source_stage=bundle.source_stages[i], source_label=bundle.source_labels[i],
+                assignment_method=bundle.assignment_method,
                 best_label=record["best_label"], phi=phi, conditional_map=call,
                 conditional_call=call if defined and phi > 0 else np.nan,
                 assigned_multiplicity=call if defined and phi > 0 and record["final_assignment_label"] is not None else np.nan,
@@ -688,7 +783,8 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
             maximum_profile_deviance=float(measured["maximum_profile_deviance"]),
             diagnostic_status="failed" if errors else "available" if diagnostic_mask.any() else "not_applicable",
             diagnostic_error="; ".join(errors) if errors else None)
-    summary = dict(schema="clipp2.assignment.result.v6", protocol_version=PROTOCOL_VERSION,
+    summary = dict(schema=RESULT_SCHEMA, protocol_version=PROTOCOL_VERSION,
+        assignment_method=bundle.assignment_method, tie_policy=ASSIGNMENT_POLICIES[bundle.assignment_method],
         implementation_version=__version__, tumor_id=catalog.tumor_id,
         bundle_hash=bundle.content_hash, reference=bundle.reference.to_dict(),
         bounds_hash=support.content_hash, support_policy=SUPPORT_POLICY, normal_cn_policy=bundle.normal_cn_policy,
@@ -703,13 +799,15 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
                              for status in REASSESSMENT_OUTCOMES},
         evaluation_receipt=dict(device=bundle.device, cpu_threads=bundle.cpu_threads,
             run_manifest_id=execution_manifest_id, bundle_run_manifest_id=bundle.run_manifest_id,
-            assignment_policy="observed_exact_map_lowest_public_label", execution=evaluation.execution),
+            assignment_policy=ASSIGNMENT_POLICIES[bundle.assignment_method], execution=evaluation.execution),
         population_scope="targets_only",
         comparison_scope="single_candidate" if len(bundle.reference.labels) == 1 else "multiple_candidates",
-        interpretation="relative_map_at_frozen_reference_not_a_refit")
+        interpretation=("marginal_cluster_MAP" if bundle.assignment_method == "marginal"
+                        else "profile_joint_cluster_multiplicity_MAP_no_cluster_posterior"))
     bundle.validated_payload()
     result = AssignmentResult(bundle.content_hash, bundle.target_ids, bundle.reference,
-                              evaluation.records, tuple(multiplicities), summary, run_manifest_id=execution_manifest_id)
+                              evaluation.records, tuple(multiplicities), summary, run_manifest_id=execution_manifest_id,
+                              assignment_method=bundle.assignment_method)
     if outdir is not None:
         from .io.assignment import publish_assignment
         publish_assignment(bundle, result, outdir)

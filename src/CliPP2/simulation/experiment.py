@@ -1,4 +1,4 @@
-"""Truth-blind paired execution for biological plan 1.2 and Protocol 2.3.
+"""Truth-blind paired execution for biological plan 1.2 and Protocol 2.4.
 
 Only the observed input and an explicit workflow configuration enter inference.
 There is one shared Stage 1, at most two Stage 2 fits, and at most two full-support
@@ -16,7 +16,7 @@ import numpy as np
 
 from CliPP2._version import __version__
 from CliPP2.assignment import AssignmentBundle, assign_mutations
-from CliPP2.config import PROTOCOL_VERSION, WorkflowConfig, STAGE_THREE_REFERENCE_POLICY
+from CliPP2.config import PROTOCOL_VERSION, WorkflowConfig, STAGE_THREE_REFERENCE_POLICY, fitting_identity
 from CliPP2.io.assignment import (load_accepted_fit, reserve_output, save_accepted_fit,
                                  save_assignment_bundle, save_original_catalog, publish_assignment,
                                  write_supporting_table)
@@ -66,6 +66,7 @@ def _freeze_arm(catalog, first, selected_group, second, groups, g0, config, arm_
         tuple(fit.source_id for fit, _ in selected),
         tuple(int(fit.labels[i]) for fit, i in selected), tuple(labels[m] for m in targets),
         device=config.fit.device, cpu_threads=config.fit.cpu_threads,
+        assignment_method=config.stage_three_assignment_method,
         normal_cn_policy=config.normal_cn_policy,
         run_manifest_id=None if run_manifest is None else run_manifest["run_manifest_id"],
         provenance=dict(study_plan_version="1.2", protocol_version=PROTOCOL_VERSION, arm=arm_name,
@@ -117,7 +118,8 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
     arm_root.mkdir()
     start = perf_counter()
     ledger = dict(fit_count=0, assignment_pass_count=0, reused_fit_count=0, events=[])
-    result = dict(schema="clipp2.paired-experiment.v5", study_plan_version="1.2",
+    result = dict(schema="clipp2.paired-experiment.v6", study_plan_version="1.2",
+        fitting_method_identity=fitting_identity(config.fit.fit_multiplicity, config.fit.selection_criterion),
         reference_policy=STAGE_THREE_REFERENCE_POLICY,
         protocol_version=PROTOCOL_VERSION, implementation_version=__version__, status="running",
         config=asdict(config), stage_one=None, stage_one_status="not_started", stage_one_groups=[], g0_label=None,

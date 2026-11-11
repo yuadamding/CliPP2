@@ -1,4 +1,4 @@
-"""Protocol 2.3 orchestration with frozen native fits and biological lineage.
+"""Protocol 2.4 orchestration with frozen native fits and biological lineage.
 
 Biological/numerical identities and native build IDs are retained; file-byte
 and Python-source checksums are intentionally omitted.
@@ -34,7 +34,7 @@ SEGMENT_POLICY_COLUMNS = ("region_id", "segment_id", "multiplicity_endpoint", "c
 ORIGINAL_COMPARISON_COLUMNS = ("mutation_id", "original_eligible", "original_input_status", "exclusion_reasons",
     "stage_one_label", "stage_two_label", "baseline_reference_label", "final_assignment_label", "role", "target_reason", "membership_origin",
     "stage_one_native_phi", "stage_one_native_calls", "stage_two_native_phi", "stage_two_native_calls",
-    "assignment_status", "evidence_status", "map_cluster_label", "map_label", "map_set", "posterior_defined",
+    "assignment_status", "assignment_method", "score_defined", "selection_reason", "evidence_status", "map_cluster_label", "map_label", "map_set", "posterior_defined",
     "reference_labels", "probabilities", "reassessment_status", "baseline_changed",
     "historical_cap_contributor_reassigned")
 
@@ -81,8 +81,26 @@ class AcceptedFit(ImmutableArrayRecord):
     biological_identity: object = None
     protocol_version: str = PROTOCOL_VERSION
     tumor_id: str = field(kw_only=True)
+    fitting_log_likelihood: float | None = field(default=None, kw_only=True)
+    method_identity: object = field(default=None, kw_only=True)
+    record_version: int = field(default=4, kw_only=True)
 
     def __post_init__(self):
+        from .config import fitting_identity
+        if self.record_version not in (3, 4):
+            raise ValueError("Unsupported accepted-fit version")
+        identity = fitting_identity() if self.method_identity is None else dict(self.method_identity)
+        if identity not in (fitting_identity("marginal"), fitting_identity("profile")):
+            raise ValueError("Accepted fit requires a supported complete method identity")
+        if self.record_version == 3 and identity != fitting_identity():
+            raise ValueError("Historical accepted fits describe marginal fitting only")
+        object.__setattr__(self, "method_identity", _freeze(identity))
+        if self.fitting_log_likelihood is None:
+            if identity != fitting_identity():
+                raise ValueError("Profile accepted fits require an explicit fitting likelihood")
+            object.__setattr__(self, "fitting_log_likelihood", self.conditional_log_likelihood)
+        if not np.isfinite(self.fitting_log_likelihood):
+            raise ValueError("Accepted fitting likelihood must be finite")
         from .io.tumor_txt import _safe_tumor_id
         object.__setattr__(self, "tumor_id", _safe_tumor_id(self.tumor_id))
         if self.protocol_version not in COMPATIBLE_NATIVE_FIT_PROTOCOLS:
@@ -125,7 +143,9 @@ class AcceptedFit(ImmutableArrayRecord):
                  "multiplicities", "biological_hash", "model_identity", "score",
                  "conditional_log_likelihood", "mixture_log_likelihood", "complexity_penalty", "normalization",
                  "producer_receipt", "biological_identity", "protocol_version")
-        return content_hash(dict(schema="clipp2.accepted-state.v3", support_hash=self.support.content_hash,
+        if self.record_version == 4:
+            names += ("fitting_log_likelihood", "method_identity")
+        return content_hash(dict(schema=f"clipp2.accepted-state.v{self.record_version}", support_hash=self.support.content_hash,
                                  **{name: getattr(self, name) for name in names}))
 
     def to_dict(self):
@@ -133,16 +153,24 @@ class AcceptedFit(ImmutableArrayRecord):
             "multiplicities", "biological_hash", "model_identity", "score", "conditional_log_likelihood",
             "mixture_log_likelihood", "complexity_penalty", "acceptance_evidence", "normalization",
             "producer_receipt", "compatibility_receipts", "biological_identity", "protocol_version")
-        return _json_value(dict(schema="clipp2.accepted-fit.v3", **{k: getattr(self, k) for k in fields},
+        if self.record_version == 4:
+            fields += ("fitting_log_likelihood", "method_identity")
+        return _json_value(dict(schema=f"clipp2.accepted-fit.v{self.record_version}", **{k: getattr(self, k) for k in fields},
                                support=self.support.to_dict()))
 
     @classmethod
     def from_dict(cls, value):
         values = dict(value)
-        if (values.pop("schema", None) != "clipp2.accepted-fit.v3"
+        schema = values.pop("schema", None)
+        if (schema not in ("clipp2.accepted-fit.v3", "clipp2.accepted-fit.v4")
                 or values.get("protocol_version") not in COMPATIBLE_NATIVE_FIT_PROTOCOLS or not values.get("tumor_id")):
-            raise ValueError("Replay requires accepted-fit.v3 from a compatible native-fit protocol with explicit originating tumor_id; rebuild missing-origin legacy evidence from its original input")
+            raise ValueError("Replay requires accepted-fit.v3/v4 from a compatible native-fit protocol with explicit originating tumor_id; rebuild missing-origin legacy evidence from its original input")
         values["support"] = MultiplicityBounds.from_dict(values["support"])
+        if schema.endswith("v4") and not {"fitting_log_likelihood", "method_identity"} <= values.keys():
+            raise ValueError("Current accepted fit lacks explicit method and fitting likelihood")
+        if schema.endswith("v3") and {"fitting_log_likelihood", "method_identity"} & values.keys():
+            raise ValueError("Historical accepted fit cannot carry new fitting semantics")
+        values["record_version"] = int(schema[-1])
         return cls(**values)
 
     def validate_input_identity(self, catalog, original_config=None):
@@ -161,7 +189,7 @@ class AcceptedFit(ImmutableArrayRecord):
             raise ValueError("Historical denominators, masks, mapping, or observations differ")
 
     def validate(self, catalog, *, expected_ids=None, expected_support=None, device="cpu", cpu_threads=None, run_manifest_id=None):
-        """Return a v2 replay receipt with a separate current compatibility check.
+        """Retain the originating state with a separate current compatibility check.
 
         Original execution evidence is preserved. Older summary/TSV formats are
         not imported, and insufficient evidence never triggers optimization.
@@ -180,7 +208,7 @@ class AcceptedFit(ImmutableArrayRecord):
                 or content_hash(self.biological_identity) != content_hash(catalog.biological_identity)):
             raise ValueError("Historical tumor, regional mapping, mutation convention, or reference build differs")
         producer = self.producer_receipt
-        if (not isinstance(producer, Mapping) or producer.get("schema") != "clipp2.fit-producer.v2"
+        if (not isinstance(producer, Mapping) or producer.get("schema") not in ("clipp2.fit-producer.v2", "clipp2.fit-producer.v3")
                 or producer.get("protocol_version") != self.protocol_version
                 or producer.get("tumor_id") != self.tumor_id
                 or any(not isinstance(producer.get(key), str) or not producer[key]
@@ -200,6 +228,16 @@ class AcceptedFit(ImmutableArrayRecord):
             raise ValueError("Original producer run manifest link differs from its input binding")
         build = producer["run_manifest"].get("build")
         original_config = validate_fit_execution_receipt(producer["fit_config"], producer["execution"], build=build)
+        from .config import fitting_identity
+        identity = fitting_identity(original_config.fit_multiplicity, original_config.selection_criterion)
+        if self.method_identity != identity:
+            raise ValueError("Accepted fitting identity differs from its original configuration")
+        if producer["schema"] == "clipp2.fit-producer.v3":
+            if (self.record_version != 4 or producer.get("method_identity") != identity or
+                    producer.get("fitting_log_likelihood") != self.fitting_log_likelihood):
+                raise ValueError("Producer fitting identity or likelihood differs from accepted state")
+        elif self.record_version != 3 or "fit_multiplicity" in producer["fit_config"]:
+            raise ValueError("Historical producer cannot identify new fitting semantics")
         if "normal_cn_policy" not in producer or producer["normal_cn_policy"] not in (None, "diploid"):
             raise ValueError("Original fit lacks its explicit normal-CN assumption")
         if len(self.centers) > original_config.max_clusters:
@@ -234,19 +272,25 @@ class AcceptedFit(ImmutableArrayRecord):
         if evidence.get("accepted_state_hash") != self.state_fingerprint:
             raise ValueError("Historical acceptance evidence is not bound to this exact fitted state")
         model = RegionalModel(catalog.fit_data(self.mutation_ids, normal_cn_policy=producer["normal_cn_policy"]), device=device,
-                              cpu_threads=cpu_threads, multiplicity_support=self.support)
+                              cpu_threads=cpu_threads, multiplicity_support=self.support,
+                              fit_multiplicity=original_config.fit_multiplicity,
+                              selection_criterion=original_config.selection_criterion)
         try:
-            if (model.mutation_ids != self.mutation_ids or model.identity != self.model_identity
+            identity = model.legacy_marginal_identity if self.record_version == 3 else model.identity
+            if (model.mutation_ids != self.mutation_ids or identity != self.model_identity
                     or model.model_version != producer["model_version"]):
                 raise ValueError("Historical model identity or canonical population order differs")
             fit = FitResult(Membership(explicit_labels=self.labels), self.centers, self.weights,
                 self.conditional_log_likelihood, self.mixture_log_likelihood, self.complexity_penalty,
-                self.score, True)
+                self.score, True, fitting_log_likelihood=self.fitting_log_likelihood,
+                fit_objective_id=self.method_identity["fit_objective_id"],
+                selection_criterion_id=self.method_identity["selection_criterion_id"])
             _verify_fitted_numerics(model, fit)
             calls = model.multiplicity(self.phi)
             if not np.array_equal(calls, self.multiplicities, equal_nan=True):
                 raise ValueError("Historical accepted multiplicities disagree with their native support/CCFs")
-            compatibility = dict(schema="clipp2.fit-compatibility.v2", protocol_version=PROTOCOL_VERSION,
+            compatibility = dict(schema="clipp2.fit-compatibility.v3", protocol_version=PROTOCOL_VERSION,
+                method_identity=dict(self.method_identity),
                 implementation_version=__version__, biological_identity=catalog.biological_identity,
                 tumor_id=self.tumor_id, run_manifest_id=run_manifest_id,
                 originating_run_manifest_id=producer.get("run_manifest_id"),
@@ -256,7 +300,7 @@ class AcceptedFit(ImmutableArrayRecord):
                 checks="biological_inputs_support_native_calls_independent_score",
                 inherited_terminal_audit=True)
         finally:
-            model.backend.close()
+            model.close()
         return replace(self, compatibility_receipts=(*self.compatibility_receipts, compatibility))
 
 
@@ -283,6 +327,7 @@ def _fit_accepted(catalog, ids, bounds, outdir, stage, config, progress_callback
         fit.conditional_log_likelihood, fit.mixture_log_likelihood, fit.complexity_penalty,
         execution.summary["publication"]["verification"],
         producer_receipt=execution.producer_receipt,
+        fitting_log_likelihood=fit.fitting_log_likelihood, method_identity=execution.summary["method_identity"],
         biological_identity=catalog.biological_identity, tumor_id=catalog.tumor_id)
     return replace(accepted, acceptance_evidence=dict(accepted.acceptance_evidence,
                                                      accepted_state_hash=accepted.state_fingerprint))
@@ -558,7 +603,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable")
     config, output = workflow_config, reserve_output(outdir)
-    common_receipt = dict(schema="clipp2.workflow.v5", protocol_version=PROTOCOL_VERSION,
+    common_receipt = dict(schema="clipp2.workflow.v6", protocol_version=PROTOCOL_VERSION,
         implementation_version=__version__, config=asdict(config),
         source_policy="nearest_to_one", cap_policy="minimum_native_map_set_upper",
         reference_policy=STAGE_THREE_REFERENCE_POLICY,
@@ -721,7 +766,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         stage_two_members = set(targets) - reference_members
         non_targets = tuple(unchanged_map)
         if non_targets or set(targets) != set(stage_one.mutation_ids):
-            raise AssertionError("Protocol 2.3 must reassess the entire combined fitted population")
+            raise AssertionError("Protocol 2.4 must reassess the entire combined fitted population")
         combined = set(targets) | set(non_targets)
         q2 = 0 if stage_two is None else len(stage_two.centers)
         receipt["counts"].update(merged_groups=0, clonal_source_consolidated=1,
@@ -749,6 +794,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
             tuple(int(fit.labels[i]) for fit, i in baseline_rows),
             tuple(source_labels[(fit.source_id, int(fit.labels[i]))] for fit, i in baseline_rows),
             device=config.fit.device, cpu_threads=config.fit.cpu_threads,
+            assignment_method=config.stage_three_assignment_method,
             normal_cn_policy=config.normal_cn_policy, run_manifest_id=run_manifest_id,
             provenance=dict(stage_two_caps_hash=caps.content_hash,
                  reference_contributors=reference_audit, native_stage_two_centers_preserved=True,
@@ -834,7 +880,8 @@ def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unch
             membership_origin="stage2_unchanged" if non_target else reason,
             historical_cap_contributor_reassigned=False,
             role="non_target" if non_target else "target" if target else "not_in_combined_baseline",
-            assignment_status=None,
+            assignment_status=None, assignment_method=None if assignment is None else assignment.assignment_method,
+            score_defined=False, selection_reason=None,
             evidence_status="excluded" if not catalog.eligible[i].any() else "computation_failed",
             map_cluster_label=None, map_label=None, map_set=(), posterior_defined=False,
             reference_labels=() if assignment is None else assignment.reference.labels, probabilities=None,
@@ -847,7 +894,9 @@ def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unch
         if record is not None:
             if not target or record["baseline_label"] != baseline or record["target_reason"] != reason:
                 raise ValueError("Target reassessment does not match its native source and baseline")
-            row.update(assignment_status=record["status"], evidence_status=record["evidence_status"], map_cluster_label=record["map_cluster_label"],
+            row.update(assignment_status=record["status"], assignment_method=record["assignment_method"],
+                score_defined=record["score_defined"], selection_reason=record["selection_reason"],
+                evidence_status=record["evidence_status"], map_cluster_label=record["map_cluster_label"],
                 map_label=record["map_label"], map_set=record["map_set"], posterior_defined=record["posterior_defined"],
                 probabilities=record["probabilities"],
                 final_assignment_label=record["final_assignment_label"], reassessment_status=record["reassessment_status"],
@@ -856,7 +905,7 @@ def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unch
                     and record["final_assignment_label"] != baseline))
         elif row["original_input_status"] == "no_information":
             row["evidence_status"] = "prior_only"
-            if assignment is not None:
+            if assignment is not None and assignment.assignment_method == "marginal":
                 row.update(posterior_defined=True, probabilities=assignment.reference.priors,
                     map_label=min(assignment.reference.labels), map_cluster_label=min(assignment.reference.labels),
                     map_set=tuple(sorted(assignment.reference.labels)))

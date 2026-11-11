@@ -1,7 +1,7 @@
 """CliPP2 multi-region vector-jump continuation on one frozen mutation tree.
 
 The positive-curvature, fixed-support majorization uses regional CCF vectors:
-only uncut edges contribute quadratic springs, and the actual marginalized
+only uncut edges contribute quadratic springs, and the configured fitting
 objective accepts steps. Finite-penalty labels come from cuts, never from a
 claim of exact fusion or constrained/global optimality.
 """
@@ -38,6 +38,14 @@ def _spring_gradient(x, edges, penalty):
     np.add.at(result, edges[:, 0], penalty * jumps)
     np.add.at(result, edges[:, 1], -penalty * jumps)
     return result
+
+
+def _stationarity(model, x, total_gradient, spring, lower, upper):
+    if getattr(model, "fit_multiplicity", "marginal") != "profile":
+        return float(np.max(np.abs(x-np.clip(x-total_gradient, lower, upper))))
+    right, left = model.fit_backend.profile_slopes(x)
+    return float(np.max(np.maximum(0, np.maximum(
+        np.minimum(-(spring+right), upper-x), np.minimum(spring+left, x-lower)))))
 
 
 def boxed_forest_quadratic(curvature, rhs, edges, penalty, lower, upper, *, prepared=None):
@@ -272,8 +280,9 @@ def _generate_host_candidates(model, tree, pilot, requested, lower, upper, polic
                 cuts = project_cuts(tree, x, k)
                 forest = tree.edges[~_cut_mask(tree, cuts)]
                 jumps = x[forest[:, 0]] - x[forest[:, 1]]
-                g = gradient + _spring_gradient(x, forest, rho)
-                stationarity = float(np.max(np.abs(x - np.clip(x - g, lower, upper))))
+                spring = _spring_gradient(x, forest, rho)
+                g = gradient + spring
+                stationarity = _stationarity(model, x, g, spring, lower, upper)
                 if stationarity <= policy.stationarity_tolerance:
                     break
                 h = np.maximum(curvature, 1e-8)
@@ -311,8 +320,9 @@ def _generate_host_candidates(model, tree, pilot, requested, lower, upper, polic
                     break
             cuts = project_cuts(tree, x, k)
             forest = tree.edges[~_cut_mask(tree, cuts)]
-            g = gradient + _spring_gradient(x, forest, rho)
-            stationarity = float(np.max(np.abs(x - np.clip(x - g, lower, upper))))
+            spring = _spring_gradient(x, forest, rho)
+            g = gradient + spring
+            stationarity = _stationarity(model, x, g, spring, lower, upper)
             violation = float(np.linalg.norm(x[forest[:, 0]] - x[forest[:, 1]]))
             labels, block_range, longest, mean_h = _component_scale(tree, cuts, x, curvature)
             feasible = max(violation, block_range) <= policy.constraint_tolerance

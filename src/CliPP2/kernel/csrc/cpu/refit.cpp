@@ -2,6 +2,7 @@
 #include "../common/emission_math.h"
 #include "../common/refit_validation.h"
 #include "../common/scalar_search.h"
+#include "../common/profile_refit.h"
 #include "probability_plan.h"
 #include <vector>
 
@@ -69,8 +70,12 @@ void refit_centers(const ObservationSoA& model, const RefitBatch& batch, RefitRe
             output[task] = {nan, nan, nan, nan, 0, static_cast<std::int32_t>(RefitStatus::Unsupported)};
             continue;
         }
-        output[task] = refit_search(batch, task, values.data() + batch.grid_offsets[task],
-            Objective{count, *plans[task], scratch[task]});
+        const Objective objective{count, *plans[task], scratch[task]};
+        output[task] = model.aggregation == LikelihoodAggregation::IntegerProfile
+            ? profile_refit_search(batch, task, objective,
+                ProfileBranchDerivative{model, observed.data() + offsets[task], count,
+                                        batch.regions[task], 0, 0})
+            : refit_search(batch, task, values.data() + batch.grid_offsets[task], objective);
     }
     for (std::int64_t task = 0; task < batch.tasks; ++task)
         if (plans[task]) work.add(plans[task]->components(), plans[task]->shapes(),

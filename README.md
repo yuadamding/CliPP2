@@ -5,7 +5,7 @@ across tumor regions. It estimates cancer cell fractions (CCFs) and integer
 multiplicities under **one allele-specific tumor copy-number state per
 mutation–region observation**. Mixed tumor copy-number states are unsupported.
 
-Protocol **2.3** chooses a provisional Stage 1 source, then fits the remainder
+Protocol **2.4** chooses a provisional Stage 1 source, then fits the remainder
 with caps from the minimum upper endpoint of native multiplicity MAP sets.
 Stage 3 restores original support and reassesses every fitted mutation against
 one fixed all-one clonal reference and every Stage 2 center. The selected Stage 1
@@ -16,7 +16,7 @@ Confidence, ties, coverage, residuals and distance do not veto defined estimates
 Cluster limits default to **10 for Stage 1 and 20 for Stage 2**. Valid integer CN
 has no automatic eligibility ceiling. Explicit input exclusions, model-domain
 checks and numerical verification remain. Package **2.0.0** and scientific
-protocol **2.3** have separate identities; versioned contracts distinguish the
+protocol **2.4** have separate identities; versioned contracts distinguish the
 current single-clonal-reference policy from earlier reference inventories.
 
 ## Install and run
@@ -25,12 +25,13 @@ Fitting requires Python 3.10+ and a C++17 compiler. CPU is the default backend:
 
 ```sh
 python -m pip install .
-clipp2 workflow --plan examples/workflow_protocol23.plan.json --output-dir results/workflow23
+clipp2 workflow --plan examples/workflow_protocol24.plan.json --output-dir results/workflow24
 ```
 
 The example plan declares one workflow configuration without acceptance thresholds.
 Outputs include native Stage 1/2 fits, provisional-source provenance, exact reference consolidation, segment caps,
-reference vectors, complete probability vectors, MAP tie sets and raw diagnostics.
+reference vectors, method-specific scores, MAP tie sets and raw diagnostics.
+Marginal assignment also reports cluster posterior probabilities; profile does not.
 `all_original_mutations.tsv` retains final membership and unchanged or unassigned
 mutations. Eligible targets without informative reads have a `prior_only` vector
 and no data-supported final label; all-impossible candidates instead yield
@@ -44,6 +45,15 @@ and no data-supported final label; all-impossible candidates instead yield
 | Frozen-reference reassignment | `clipp2 assign --bundle BUNDLE.json --output-dir OUTPUT` |
 | Biological study | `clipp2-simulate run --cohort-settings SETTINGS.json --outdir OUTPUT` |
 
+Stage 3 defaults to **marginal** likelihood. Set
+`workflow_config.stage_three_assignment_method` to `"profile"` to maximize each
+region’s binomial likelihood over original multiplicities. For a frozen request,
+use `clipp2 assign --assignment-method profile`; historical requests also require
+`--derive-current`. A method change creates a new request identity and saves the
+executed bundle with its outputs. Profile ties retain the baseline when it is a
+maximizer; otherwise the lowest label wins. Profile scores are not cluster
+posteriors. Entropy comparisons remain only in their frozen research runtime.
+
 CUDA requires an explicit build and device selection:
 
 ```sh
@@ -54,6 +64,12 @@ clipp2 workflow --help
 Set the workflow plan's fit device to `cuda`, or use `clipp2 fit --device cuda`.
 CUDA builds require `nvcc`; execution requires a compatible NVIDIA GPU and driver.
 CPU execution requires neither CUDA nor PyTorch.
+
+Stage 1–2 center fitting defaults to **marginal** likelihood. Opt into
+`--fit-multiplicity profile` (or `workflow_config.fit.fit_multiplicity` in a plan)
+to maximize integer-multiplicity likelihood while retaining marginal-mixture
+BIC selection at the frozen fitted centers. This is independent of Stage 3's
+assignment method. See the [numerical contract and comparisons](docs/profile_fitting_marginal_selection.md).
 
 ## Inputs and outputs
 
@@ -108,7 +124,8 @@ development is descriptive and poor finite performance does not block the main
 study. Numerical verification remains mandatory. The deterministic checks above
 are separate from biological performance assessment and full-cohort execution.
 
-- [Workflow Protocol 2.3](docs/workflow_protocol_2_3.md)
+- [Workflow Protocol 2.4](docs/workflow_protocol_2_4.md)
+- [Historical Protocol 2.3](docs/workflow_protocol_2_3.md)
 - [Historical Protocol 2.2](docs/workflow_protocol_2_2.md)
 - [Simulation design and execution](docs/simulation.md)
 - [Evaluation definitions](docs/simulation_evaluation.md)

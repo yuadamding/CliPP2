@@ -35,11 +35,11 @@ def _ptr(array):
 def _api():
     library, identity = native_library()
     declarations = {
-        'Create': ([ct.c_int]*2 + [ct.c_void_p]*9 + [ct.c_int, ct.c_void_p,
+        'Create': ([ct.c_int]*2 + [ct.c_void_p]*11 + [ct.c_int, ct.c_void_p,
                    ct.POINTER(_ContinuationPolicy), _Norm, _Scores,
                    ct.c_int, ct.c_int, ct.POINTER(ct.c_void_p)], ct.c_int),
         'Poll': ([ct.c_void_p, ct.c_int, ct.c_int, ct.POINTER(_Request)], ct.c_int),
-        'Reply': ([ct.c_void_p, ct.c_int, ct.c_uint64] + [ct.c_void_p]*3, ct.c_int),
+        'Reply': ([ct.c_void_p, ct.c_int, ct.c_uint64] + [ct.c_void_p]*5, ct.c_int),
         'Result': ([ct.c_void_p, ct.c_int] + [ct.c_void_p]*3 +
                    [ct.POINTER(_ContinuationReport)], ct.c_int),
         'Error': ([ct.c_void_p, ct.c_int], ct.c_char_p),
@@ -110,11 +110,13 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
     terms = tuple(_array(value) for value in model.node_terms(initial))
     if len(terms) != 3 or any(value.shape != shape or not np.isfinite(value).all() for value in terms):
         raise ArithmeticError('Initial tree likelihood terms are invalid')
+    profile = getattr(model, "fit_multiplicity", "marginal") == "profile"
+    slopes = model.fit_backend.profile_slopes(initial) if profile else (terms[1], terms[1])
     edges = _array(tree.edges, np.int32)
     canonical = _array(tree.canonical_node_order, np.int32)
     gaps = _array([0.]+[4*np.sin(np.pi/(2*size))**2 for size in range(1, model.n+1)])
     native_policy = _ContinuationPolicy(policy.levels, policy.iterations_per_level,
-        policy.stationarity_tolerance, policy.constraint_tolerance, policy.maximum_penalty)
+        policy.stationarity_tolerance, policy.constraint_tolerance, policy.maximum_penalty, int(profile))
     reduction_errors = []
 
     @_Norm
@@ -154,7 +156,7 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
         results = [None]*len(chosen)
         try:
             check(library.CliPP2ContinuationOwnerCreate(model.n, model.r, _ptr(edges), _ptr(canonical),
-                _ptr(initial), *map(_ptr, terms), _ptr(lower), _ptr(upper), _ptr(gaps), len(chosen),
+                _ptr(initial), *map(_ptr, (*terms, *slopes)), _ptr(lower), _ptr(upper), _ptr(gaps), len(chosen),
                 _ptr(chosen), ct.byref(native_policy), norm, scores,
                 int(keep_raw_phi), int(boundary_requests), ct.byref(owner)))
             while len(completed) < len(chosen):
@@ -182,7 +184,8 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
                         requests.append((task, request.sequence))
                     elif request.kind == 2:
                         stats['native_continuation_boundary_handshakes'] += 1
-                        check(library.CliPP2ContinuationOwnerReply(owner, task, request.sequence, None, None, None))
+                        check(library.CliPP2ContinuationOwnerReply(owner, task, request.sequence,
+                                                                  None, None, None, None, None))
                     elif request.kind == 3:
                         results[task] = _result(library, owner, task, int(chosen[task]), tree, model.r,
                                                 missing, keep_raw_phi, check)
@@ -212,11 +215,13 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
                         replies = list(evaluate_requests(numerical))
                     if len(replies) != len(requests):
                         raise NativeExecutionError('Continuation evaluator returned incomplete ordered replies')
-                    for (task, sequence), reply in zip(requests, replies):
+                    for (task, sequence), reply, (_, x) in zip(requests, replies, numerical):
                         values = tuple(_array(value) for value in reply)
                         if len(values) != 3 or any(value.shape != shape for value in values):
                             raise NativeExecutionError('Continuation evaluator returned invalid term shapes')
-                        check(library.CliPP2ContinuationOwnerReply(owner, task, sequence, *map(_ptr, values)))
+                        directional = model.fit_backend.profile_slopes(x) if profile else (values[1], values[1])
+                        check(library.CliPP2ContinuationOwnerReply(owner, task, sequence,
+                                                                  *map(_ptr, (*values, *directional))))
                 elif not changed:
                     # No full-batch wait: block only until one busy state yields.
                     waiting = next(task for task in range(len(chosen)) if task not in completed)

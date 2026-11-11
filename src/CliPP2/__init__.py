@@ -20,6 +20,7 @@ _EXPORTS = {
     "AssignmentBundle": ".assignment",
     "AssignmentResult": ".assignment",
     "assign_mutations": ".assignment",
+    "derive_assignment_bundle": ".assignment",
     "AcceptedFit": ".workflow",
     "run_workflow": ".workflow",
 }

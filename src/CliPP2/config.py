@@ -12,9 +12,30 @@ DEFAULT_STAGE_ONE_MAX_CLUSTERS: Final = 10
 DEFAULT_DEVICE: Final = "cpu"
 DEFAULT_AUDIT_SCOPE: Final = "selected"
 DEFAULT_MISSING_COUNTS: Final = "zero_alt"
-PROTOCOL_VERSION: Final = "2.3"
+PROTOCOL_VERSION: Final = "2.4"
 STAGE_THREE_REFERENCE_POLICY: Final = "single_fixed_clonal_stage_one_source_v1"
-COMPATIBLE_NATIVE_FIT_PROTOCOLS: Final = ("2.2", "2.3")
+COMPATIBLE_NATIVE_FIT_PROTOCOLS: Final = ("2.2", "2.3", "2.4")
+ASSIGNMENT_METHODS: Final = ("marginal", "profile")
+SELECTION_CRITERION: Final = "marginal_mixture_bic_at_fitted_centers_v1"
+
+
+def fitting_identity(method="marginal", selection=SELECTION_CRITERION):
+    if not isinstance(method, str) or method not in ("marginal", "profile"):
+        raise ValueError("fit_multiplicity must be marginal or profile")
+    if selection != SELECTION_CRITERION:
+        raise ValueError(f"selection_criterion must be {SELECTION_CRITERION}")
+    return {"fit_objective_id": ("integer_multiplicity_profile_v1" if method == "profile"
+                                 else "uniform_multiplicity_marginal_v1"),
+            "selection_criterion_id": selection,
+            "initialization_policy_id": "existing_marginal_pooled_pilot_v1",
+            "scalar_refit_policy_id": ("profile_branch_interval_search_v1" if method == "profile"
+                                       else "marginal_grid_interval_search_v1")}
+
+
+def validate_assignment_method(value):
+    if not isinstance(value, str) or value not in ASSIGNMENT_METHODS:
+        raise ValueError("assignment_method must be marginal or profile")
+    return value
 
 
 def validate_audit_scope(value):
@@ -47,8 +68,11 @@ class FitConfig:
     max_clusters: int = DEFAULT_MAX_CLUSTERS
     cpu_threads: int | None = None
     audit_scope: str = DEFAULT_AUDIT_SCOPE
+    fit_multiplicity: str = "marginal"
+    selection_criterion: str = SELECTION_CRITERION
 
     def __post_init__(self) -> None:
+        fitting_identity(self.fit_multiplicity, self.selection_criterion)
         validate_audit_scope(self.audit_scope)
         if self.device not in ("cpu", "cuda"):
             raise ValueError("device must be cpu or cuda.")
@@ -66,10 +90,13 @@ def resolve_fit_config(
     max_clusters: int = DEFAULT_MAX_CLUSTERS,
     cpu_threads: int | None = None,
     audit_scope: str = DEFAULT_AUDIT_SCOPE,
+    fit_multiplicity: str = "marginal",
+    selection_criterion: str = SELECTION_CRITERION,
 ) -> FitConfig:
     """Construct the only public fit configuration; removed knobs raise TypeError."""
     return FitConfig(device=device, max_major_cn=max_major_cn,
-                     max_clusters=max_clusters, cpu_threads=cpu_threads, audit_scope=audit_scope)
+                     max_clusters=max_clusters, cpu_threads=cpu_threads, audit_scope=audit_scope,
+                     fit_multiplicity=fit_multiplicity, selection_criterion=selection_criterion)
 
 
 __all__ = ["FitConfig", "resolve_fit_config"]
@@ -77,15 +104,17 @@ __all__ = ["FitConfig", "resolve_fit_config"]
 
 @dataclass(frozen=True, slots=True)
 class WorkflowConfig:
-    """Protocol 2.3 estimation policy; numerical verification remains mandatory."""
+    """Protocol 2.4 estimation policy; numerical verification remains mandatory."""
 
     fit: FitConfig = field(default_factory=lambda: FitConfig(
         device="cpu", max_clusters=DEFAULT_STAGE_ONE_MAX_CLUSTERS))
     stage_two_max_clusters: int = DEFAULT_MAX_CLUSTERS
     normal_cn_policy: str | None = None
     missing_counts: str = DEFAULT_MISSING_COUNTS
+    stage_three_assignment_method: str = "marginal"
 
     def __post_init__(self):
+        validate_assignment_method(self.stage_three_assignment_method)
         validate_missing_counts(self.missing_counts)
         if type(self.fit) is not FitConfig:
             raise TypeError("Workflow requires a validated FitConfig")

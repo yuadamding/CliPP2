@@ -1,4 +1,4 @@
-"""Protocol 2.3 workflow boundaries and preserved native-replay evidence."""
+"""Protocol 2.4 workflow boundaries and preserved native-replay evidence."""
 from __future__ import annotations
 
 import copy
@@ -252,7 +252,9 @@ def _execution_tampering(catalog, accepted):
                              ("cuda", "native_owner_cuda_emissions", "native_continuation_build_id")):
         record = dict(execution, device=kind, backend=f"native_{kind}_likelihood_host_forest",
             conditional_refit_backend=f"native_{kind}", weight_execution="cpu" if kind == "cpu" else "cuda_resident",
-            native=dict(execution["native"], kind=kind), continuation={"continuation": route, key: "fixture_native"})
+            native=dict(execution["native"], kind=kind),
+            selection_native=dict(execution["selection_native"], kind=kind),
+            continuation={"continuation": route, key: "fixture_native"})
         validate_fit_execution_receipt(dict(config, device=kind), record)
         validate_fit_execution_receipt(dict(config, device=kind), dict(record, continuation=None))
         bad = copy.deepcopy(record)
@@ -622,13 +624,13 @@ def _historical_native_replay(directory):
     output = directory / "historical22_replayed23"
     with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("compatible old fit optimized")) as optimizer:
         receipt = run_workflow(source, output, workflow_config(), accepted_stage_one=fits[0], accepted_stage_two=fits[1])
-    assert receipt["status"] == "complete" and receipt["protocol_version"] == "2.3" and optimizer.call_count == 0
+    assert receipt["status"] == "complete" and receipt["protocol_version"] == "2.4" and optimizer.call_count == 0
     for before, stage in zip(original, ("one", "two")):
         replay = load_accepted_fit(output / f"stage_{stage}_accepted.json")
         assert replay.protocol_version == "2.2" and replay.to_dict()["producer_receipt"] == before["producer_receipt"]
         assert replay.state_fingerprint == before["acceptance_evidence"]["accepted_state_hash"]
         assert replay.compatibility_receipts[-1]["originating_native_fit_protocol"] == "2.2"
-        assert replay.compatibility_receipts[-1]["current_workflow_protocol"] == "2.3"
+        assert replay.compatibility_receipts[-1]["current_workflow_protocol"] == "2.4"
     return dict(old_native_protocol_and_hash_preserved=True, current_interpretation_appended=True, optimizer_calls=0)
 
 

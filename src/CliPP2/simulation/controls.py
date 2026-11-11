@@ -34,7 +34,9 @@ def _catalog(history, directory, *, seed, depth=1000, mask_last=False):
                     perturbation={"mask_distinguishing_region": mask_last})
     path = directory / "input_catalog.tsv"
     write_tumor_txt(path, frame, metadata=frame.attrs["metadata"])
-    return load_original_catalog(path)
+    # The masked-region diagnostic deliberately removes information; it is not
+    # an absence-imputation experiment and has no observed depth in that region.
+    return load_original_catalog(path, missing_counts="unobserved" if mask_last else "zero_alt")
 
 
 def _controlled_reference(labels, regions, centers, lineage=(), *, clonal_label=0):
@@ -121,6 +123,7 @@ def _snapshot_bundle(history, catalog, reference, targets, config, *, sources=No
     return AssignmentBundle(catalog, reference, targets, tuple(non_targets),
         phi, calls, lower, upper, tuple(stages), tuple(labels), (0,) * len(targets),
         device=config.fit.device, cpu_threads=config.fit.cpu_threads,
+        assignment_method=config.stage_three_assignment_method,
         normal_cn_policy=config.normal_cn_policy,
         run_manifest_id=os.environ.get("CLIPP2_RUN_MANIFEST_ID"),
         provenance=dict(baseline_status="declared_display_snapshot_not_new_accepted_native_fit",
@@ -163,7 +166,10 @@ def _calibration(history, catalog, result, members, *, reference_match_atol=None
         record = dict(mutation_id=mutation, status=row["status"], final_assignment_label=row["final_assignment_label"], evidence_status=row["evidence_status"],
             truth_class=truth[mutation], true_clonal=clonal[mutation],
             absent_true_class=truth[mutation] not in set(mapping.values()),
-            K=len(result.reference.labels), probability_available=bool(np.isfinite(probabilities).all()),
+            assignment_method=result.assignment_method, score_defined=row["score_defined"],
+            K=len(result.reference.labels), probability_available=bool(result.assignment_method == "marginal"
+                and row["posterior_defined"] and probabilities.shape == (len(result.reference.labels),)
+                and np.isfinite(probabilities).all()),
             data_supported=row["evidence_status"] == "observed")
         if record["probability_available"]:
             values = mapped_probabilities(probabilities, result.reference.labels, mapping, classes)
@@ -187,7 +193,10 @@ def _calibration(history, catalog, result, members, *, reference_match_atol=None
                 multiclass_brier=multi["brier"], multiclass_log_loss=multi["log_loss"])
         rows.append(record)
     available = [row for row in rows if row["probability_available"]]
-    summary = dict(target_count=len(rows), probability_count=len(available),
+    summary = dict(assignment_method=result.assignment_method,
+        tie_policy=result.summary["tie_policy"],
+        probability_status="available" if result.assignment_method == "marginal" else "undefined_for_profile",
+        target_count=len(rows), probability_count=len(available),
         data_supported_map_count=sum(row["data_supported"] for row in rows),
         data_supported_map_coverage=sum(row["data_supported"] for row in rows) / len(rows) if rows else None,
         absent_true_class_count=sum(row["absent_true_class"] for row in rows),
@@ -513,11 +522,14 @@ def run_controls(outdir):
                           output / "S04" / name, ledger, "S04_" + name)
         panels["S04_" + name] = _calibration(history, catalog, assigned, source_members)
         if name == "K1":
-            assert all(row["probabilities"] == (1.,) for row in assigned.assignments)
+            assert all(row["probabilities"] == ((1.,) if assigned.assignment_method == "marginal" else None)
+                       for row in assigned.assignments)
             assert any(row["final_assignment_label"] == 0 for row in assigned.assignments)
             record("S04_K1_probability_one_does_not_establish_true_clonality", targets=len(targets))
         else:
-            assert len(reference.labels) > 1 and all(row["probabilities"][0] < 1 for row in assigned.assignments)
+            assert len(reference.labels) > 1 and all(
+                row["probabilities"][0] < 1 if assigned.assignment_method == "marginal" else row["probabilities"] is None
+                for row in assigned.assignments)
             record("S04_complete_reference_preserves_competing_alias", K=len(reference.labels))
 
     history = generate_history("S05", 300, n_mutations=120, n_segments=6, n_regions=4)

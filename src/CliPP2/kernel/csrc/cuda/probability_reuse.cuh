@@ -248,6 +248,8 @@ __device__ CellTerms probability_shape_terms(const Observation& o,double center,
     }
     if(maximum==-positive_infinity) return {positive_infinity,0,1,EmitStatus::ZeroLikelihood};
     if(!finite_number(maximum)) return {positive_infinity,0,1,EmitStatus::NumericalFailure};
+    if(o.aggregation==LikelihoodAggregation::IntegerProfile)
+        return {-(maximum+::log(static_cast<double>(o.support))),0,0,EmitStatus::Ok};
     double total=0;
     for(i64 m=0;m<o.support;++m) total+=::exp(probability_mass(o,p,q,m)-maximum);
     return {-(maximum+::log(total)),0,0,EmitStatus::Ok};

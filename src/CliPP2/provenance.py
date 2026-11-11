@@ -29,9 +29,10 @@ def validate_fit_execution_receipt(config_record, execution, *, build=None):
     Optional external build evidence strengthens these checks; its absence never
     permits missing native execution evidence or defaulted historical settings.
     """
-    from .config import FitConfig
+    from .config import FitConfig, fitting_identity
     required = {"device", "max_major_cn", "max_clusters", "cpu_threads", "audit_scope"}
-    if not isinstance(config_record, Mapping) or set(config_record) != required:
+    if not isinstance(config_record, Mapping) or set(config_record) not in (
+            required, required | {"fit_multiplicity", "selection_criterion"}):
         raise ValueError("Original fit configuration must explicitly contain every FitConfig field")
     try:
         config = FitConfig(**config_record)
@@ -50,6 +51,13 @@ def validate_fit_execution_receipt(config_record, execution, *, build=None):
                   weight_execution="cuda_resident" if kind == "cuda" else "cpu")
     if config.device != kind or any(execution.get(key) != value for key, value in routes.items()):
         raise ValueError("Original execution routes disagree with its configured device")
+    if "fit_multiplicity" in config_record:
+        expected = fitting_identity(config.fit_multiplicity, config.selection_criterion)
+        selection = execution.get("selection_native")
+        if (execution.get("method_identity") != expected or native.get("aggregation") != config.fit_multiplicity
+                or not isinstance(selection, Mapping) or selection.get("aggregation") != "marginal"
+                or any(selection.get(key) != native[key] for key in ("kind", "build_id", "numerical_policy"))):
+            raise ValueError("Original execution fitting/selection identities disagree")
     continuation = execution["continuation"]
     continuation_id = None
     if continuation is not None:
@@ -134,6 +142,9 @@ def validate_replay_policy(accepted, requested_fit_config, *, normal_cn_policy):
         raise ValueError("Replay normal-CN assumption differs from the original fitting policy")
     if original.max_clusters != requested_fit_config.max_clusters:
         raise ValueError("Replay search capacity differs from the original fitting policy")
+    if (original.fit_multiplicity != requested_fit_config.fit_multiplicity or
+            original.selection_criterion != requested_fit_config.selection_criterion):
+        raise ValueError("Replay fitting objective or selection criterion differs from the original policy")
     # A different declared CN cutoff can leave the actual observations unchanged.
     # AcceptedFit.validate must still verify the exact requested population,
     # numerical inputs, masks and effective support before any reuse is allowed.

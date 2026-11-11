@@ -10,17 +10,19 @@ struct ObservationSoA {
     // lower/upper above remain CCF-domain bounds.
     const std::int64_t *minimum, *support;
     const std::uint8_t* flags;
+    LikelihoodAggregation aggregation = LikelihoodAggregation::UniformMarginal;
 };
 
 struct Observation {
     double alt, ref, scaling, log_constant;
     std::int64_t minimum, support;
     std::uint8_t flags;
+    LikelihoodAggregation aggregation = LikelihoodAggregation::UniformMarginal;
 };
 
 CLIPP_HD inline Observation observation(const ObservationSoA& data, std::int64_t cell) {
     return {data.alt[cell], data.ref[cell], data.scaling[cell],
-            data.log_constant[cell], data.minimum[cell], data.support[cell], data.flags[cell]};
+            data.log_constant[cell], data.minimum[cell], data.support[cell], data.flags[cell], data.aggregation};
 }
 
 struct CellTerms {

@@ -62,8 +62,10 @@ def _input_domain(model, centers):
     return observed, allowed
 
 
-def independent_log_columns(model, centers):
+def independent_log_columns(model, centers, *, aggregation="marginal"):
     """Recompute joint reads/validity columns without model caches or kernels."""
+    if aggregation not in ("marginal", "profile"):
+        raise ValueError("Unknown independent emission aggregation")
     centers = np.asarray(centers, dtype=float)
     observed_rows, allowed = _input_domain(model, centers)
     data = model.data
@@ -89,7 +91,9 @@ def independent_log_columns(model, centers):
                        + purity[observed, region]*total[observed, region])
         scale = purity[observed, region] / denominator
         s = support[observed, region]
-        constant = gammaln(n+1)-gammaln(y+1)-gammaln(n-y+1)-np.log(s)
+        constant = gammaln(n+1)-gammaln(y+1)-gammaln(n-y+1)
+        if aggregation == "marginal":
+            constant -= np.log(s)
         original_rows = np.flatnonzero(observed)
         for size in np.unique(s):
             bucket = np.flatnonzero(s == size)
@@ -108,7 +112,8 @@ def independent_log_columns(model, centers):
                         component = (xlogy(y[rows, None], prob)
                                      + xlog1py((n-y)[rows, None], -prob))
                         component += constant[rows, None]
-                        marginal = np.logaddexp(marginal, component)
+                        marginal = (np.logaddexp(marginal, component) if aggregation == "marginal"
+                                    else np.maximum(marginal, component))
                     answer[source, cols] += marginal
     return np.where(allowed, answer, -np.inf)
 
@@ -188,10 +193,17 @@ def _verify_fitted_numerics(model, fit, *, eligible=True, column_cache=None):
     if weight_gap > model.n*(1e-8+roundoff) or active_gap > 1e-8+roundoff:
         raise ValueError('Independent mixture-weight optimality check failed')
     conditional = math.fsum(columns[np.arange(model.n), labels])
+    method = getattr(model, "fit_multiplicity", "marginal")
+    fitting_ll = (conditional if method == "marginal" else math.fsum(
+        independent_log_columns(model, centers, aggregation="profile")[np.arange(model.n), labels]))
+    if (hasattr(model, "method_identity") and (fit.fit_objective_id != model.method_identity["fit_objective_id"]
+            or fit.selection_criterion_id != model.method_identity["selection_criterion_id"])):
+        raise ValueError("Fitted result has a different fitting/selection identity")
     mixture = float(log_mass.sum())
     penalty = (q*model.r+q-1)*math.log(model.n)
     score = -2*mixture+penalty
     for name, actual, expected in (
+        ('fitting likelihood', fitting_ll, fit.fitting_log_likelihood),
         ('conditional likelihood', conditional, fit.conditional_log_likelihood),
         ('joint mixture likelihood', mixture, fit.mixture_log_likelihood),
         ('complexity penalty', penalty, fit.complexity_penalty), ('score', score, fit.score)):
@@ -207,7 +219,8 @@ def _verify_fitted_numerics(model, fit, *, eligible=True, column_cache=None):
             if value is None or not np.isfinite(value) or value < 0 or value > limit:
                 raise ValueError('Ineligible neighbor lacks converged weight diagnostics')
     validity = float(np.log(allowed @ weights).sum())
-    return {'conditional_log_likelihood': conditional,
+    return {'fitting_log_likelihood': fitting_ll, **dict(getattr(model, "method_identity", {})),
+            'conditional_log_likelihood': conditional,
             'hard_partition_log_likelihood': conditional,
             'mixture_log_likelihood': mixture, 'complexity_penalty': penalty, 'score': score,
             'score_definition': SCORE_DEFINITION,

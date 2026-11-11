@@ -1,9 +1,9 @@
 # Exact phylogeny cohort simulation
 
 The `CliPP2.simulation` module implements the supplied Version 1.2 cohort and
-Protocol 2.3 paired experiment. The authoritative biological input still declares
+Protocol 2.4 paired experiment. The authoritative biological input still declares
 Protocol 2.1 and is preserved unchanged. New contracts record
-`source_cohort_protocol_version: "2.1"` and execution `protocol_version: "2.3"`.
+`source_cohort_protocol_version: "2.1"` and execution `protocol_version: "2.4"`.
 The authoritative input is
 `CliPP2_phylogeny_cohort_settings.json.gz` in the repository root. Its 60 variants
 span all 12 families: 600 main histories and 120 development histories, each with
@@ -17,6 +17,9 @@ and semantic seeds depend on parsed settings rather than compression or paths.
 The earlier [Version 1.1 Word study plan](https://github.com/yuadamding/CliPP2/blob/7ce47841fbd5402ed85faeda382371af7a0fe93a/CliPP2_biological_simulation_plan.docx)
 is retained in Git history. Current execution and evaluation are documented here
 and in [simulation evaluation](simulation_evaluation.md).
+The method-bound Stage 3 option defaults to `marginal`; `profile` retains accuracy
+metrics but has no cluster posterior calibration. Methods and tie policies have
+distinct evaluation identities. See [Protocol 2.4](workflow_protocol_2_4.md).
 
 Qualification is separate from a completed native study. A successful replay or
 bounded pilot does not establish that the full cohort has finished. Use the

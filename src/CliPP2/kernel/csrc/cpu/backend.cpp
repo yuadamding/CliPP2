@@ -49,7 +49,8 @@ struct Context {
         minimum.assign(input.minimum, input.minimum + cells);
         support.assign(input.support, input.support + cells); flags.assign(input.flags, input.flags + cells);
         view = {input.mutations, input.regions, alt.data(), ref.data(), scaling.data(),
-                constants.data(), lower.data(), upper.data(), minimum.data(), support.data(), flags.data()};
+                constants.data(), lower.data(), upper.data(), minimum.data(), support.data(), flags.data(),
+                input.aggregation};
         diagnostics.prepared_bytes = cells * 65;
     }
 };
@@ -214,6 +215,19 @@ extern "C" int CliPP2ComponentDiagnostics(void* value, const double* phi,
                 phi[cell], accepted_calls ? accepted_calls[cell] : clipp2::quiet_nan);
         ++ctx.diagnostics.calls;
         record_evaluations(ctx, count);
+    });
+}
+extern "C" int CliPP2ProfileSlopes(void* value, const double* phi, double* right, double* left) {
+    return guarded([&] {
+        auto& ctx = context(value);
+        require(phi && right && left, "Null profile slope argument");
+        const auto count = ctx.view.mutations * ctx.view.regions;
+        for (std::int64_t i=0; i<count; ++i) {
+            require(std::isfinite(phi[i]) && phi[i]>=0 && phi[i]<=1, "Invalid profile slope coordinate");
+            const auto slope = clipp2::profile_slopes(clipp2::observation(ctx.view,i),phi[i]);
+            right[i]=slope.right; left[i]=slope.left;
+        }
+        ++ctx.diagnostics.calls; record_evaluations(ctx,count);
     });
 }
 extern "C" int CliPP2EvaluateRegionalGrid(void* value, std::int64_t region,

@@ -17,7 +17,7 @@ from .execution import resolve_cpu_threads
 _D = ct.POINTER(ct.c_double)
 _I = ct.POINTER(ct.c_int64)
 _B = ct.POINTER(ct.c_uint8)
-BACKEND_ABI = 7
+BACKEND_ABI = 8
 
 
 class NativeExecutionError(RuntimeError):
@@ -77,6 +77,8 @@ class DeviceMixtureProblem:
     """Owned native mixture handle used by the resident CUDA optimizer."""
 
     def __init__(self, backend, columns):
+        if backend.aggregation != "marginal":
+            raise ValueError("Mixture selection requires marginal columns")
         self._owner = weakref.ref(backend)
         self.handle = 0
         handles = backend._column_handles(columns)
@@ -116,7 +118,7 @@ class DeviceMixtureProblem:
 class _Observations(ct.Structure):
     _fields_ = [("n", ct.c_int64), ("r", ct.c_int64)] + [
         (name, _D) for name in ("alt", "ref", "scaling", "constants", "lower", "upper")
-    ] + [("minimum", _I), ("support", _I), ("flags", _B)]
+    ] + [("minimum", _I), ("support", _I), ("flags", _B), ("aggregation", ct.c_int32)]
 
 
 class _ComponentDiagnostics(ct.Structure):
@@ -170,8 +172,11 @@ def _extension_path(directory, stem):
 class NativeBackend:
     """Owns prepared SoA fields; never silently substitutes a CPU backend."""
 
-    def __init__(self, model, *, cpu_threads=None):
+    def __init__(self, model, *, cpu_threads=None, aggregation="marginal"):
         self.context = None
+        if aggregation not in ("marginal", "profile"):
+            raise ValueError("Unknown likelihood aggregation")
+        self._aggregation = aggregation
         self._weight_submission_lock = threading.Lock()
         kind = "cuda" if model.device.startswith("cuda") else "cpu"
         path = _extension_path(Path(__file__).parent, f"_native_{kind}")
@@ -212,6 +217,8 @@ class NativeBackend:
         lib.CliPP2ComponentDiagnostics.argtypes = [
             ct.c_void_p, _D, _D, ct.POINTER(_ComponentDiagnostics)]
         lib.CliPP2ComponentDiagnostics.restype = ct.c_int
+        lib.CliPP2ProfileSlopes.argtypes = [ct.c_void_p, _D, _D, _D]
+        lib.CliPP2ProfileSlopes.restype = ct.c_int
         if kind == "cpu" and hasattr(lib, "CliPP2ProbabilityReuseDiagnostics"):
             lib.CliPP2ProbabilityReuseDiagnostics.argtypes = [ct.c_void_p, _I]
             lib.CliPP2ProbabilityReuseDiagnostics.restype = ct.c_int
@@ -226,7 +233,7 @@ class NativeBackend:
             raise ValueError("Multiplicity minimum and width must be integer N by R arrays")
         fields += [_array(minimum.T, np.int64), _array(support.T, np.int64),
                    _array(model.observed.T, np.uint8)]
-        observations = _Observations(model.n, model.r, *map(_ptr, fields))
+        observations = _Observations(model.n, model.r, *map(_ptr, fields), int(aggregation == "profile"))
         self.context = ct.c_void_p()
         device_index = (int(model.device.split(":", 1)[1]) if ":" in model.device else 0) if kind == "cuda" else -1
         self._check(lib.CliPP2BackendCreate(ct.byref(observations), device_index, ct.byref(self.context)))
@@ -270,6 +277,10 @@ class NativeBackend:
                 function.argtypes, function.restype = args, ct.c_int
             self._check(lib.CliPP2ConfigureCUDAProbabilityReuse(
                 self.context, ct.byref(observations), 1))
+
+    @property
+    def aggregation(self):
+        return self._aggregation
 
     @property
     def native_host_bytes(self):
@@ -348,6 +359,7 @@ class NativeBackend:
         result = _Diagnostics()
         self._check(self.lib.CliPP2BackendGetDiagnostics(self.context, ct.byref(result)))
         diagnostics = {"kind": self.kind, "build_id": self.identity, "numerical_policy": self.policy,
+                       "aggregation": self.aggregation,
                        **{name: getattr(result, name) for name, _ in result._fields_}}
         if self.kind == "cuda":
             diagnostics["scoring"] = self.scoring_diagnostics()
@@ -417,6 +429,17 @@ class NativeBackend:
             dtype = bool if name == "has_second" else np.uint8 if name == "status" else float
             result[name] = np.array(packed[name].reshape(self.r, self.n).T, dtype=dtype, order="C")
         return result
+
+    def profile_slopes(self, x):
+        self._require_open()
+        x = _array(np.asarray(x).T)
+        if x.shape != (self.r, self.n):
+            raise ValueError("Profile slopes require N by R coordinates")
+        right, left = np.empty_like(x), np.empty_like(x)
+        self._check(self.lib.CliPP2ProfileSlopes(self.context, _ptr(x), _ptr(right), _ptr(left)))
+        if not np.isfinite(right).all() or not np.isfinite(left).all():
+            raise NativeExecutionError("Nonfinite profile directional slopes")
+        return np.ascontiguousarray(right.T), np.ascontiguousarray(left.T)
 
     def _evaluate_node_terms(self, x, derivatives, batches):
         """Evaluate already validated region-major states."""
@@ -687,7 +710,7 @@ class NativeBackend:
         return values
 
 
-NATIVE_ABI = 8
+NATIVE_ABI = 9
 
 def native_library():
     root = Path(__file__).resolve().parent.parent
@@ -794,7 +817,8 @@ def forest_quadratic(curvature, rhs, edges, penalty, lower, upper, *, prepared=N
 
 class _ContinuationPolicy(ct.Structure):
     _fields_ = [(name, ct.c_int) for name in ("levels", "iterations")] + [
-        (name, ct.c_double) for name in ("stationarity", "constraint", "maximum_penalty")]
+        (name, ct.c_double) for name in ("stationarity", "constraint", "maximum_penalty")] + [
+        ("aggregation", ct.c_int)]
 
 
 class _ContinuationReport(ct.Structure):
@@ -847,7 +871,8 @@ def continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing, *
     # Scalar evaluation, exactly as in the host controller, not a SIMD sine.
     gaps = np.array([0.] + [4*np.sin(np.pi/(2*size))**2 for size in range(1, model.n+1)])
     native_policy = _ContinuationPolicy(policy.levels, policy.iterations_per_level,
-        policy.stationarity_tolerance, policy.constraint_tolerance, policy.maximum_penalty)
+        policy.stationarity_tolerance, policy.constraint_tolerance, policy.maximum_penalty,
+        int(model.fit_multiplicity == "profile"))
     output = np.empty((len(requested), model.n, model.r)) if keep_raw_phi else None
     labels = np.empty((len(requested), model.n), dtype=np.int32)
     cuts = np.empty((len(requested), model.n-1), dtype=np.uint8)

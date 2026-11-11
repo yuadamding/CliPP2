@@ -372,7 +372,7 @@ def qualify_cohort(settings_path, outdir, *, native_pilot=True, timeout_seconds=
         limitations=["Generator qualification does not establish fitted biological accuracy.",
             "Native pilot timeouts are resource limitations, not scientific abstentions.",
             "The 600 main histories and their 2400 acquisitions have not been fitted by this command.",
-            "The pilot uses one declared Protocol 2.3 workflow; scientific performance is descriptive."])
+            "The pilot uses one declared Protocol 2.4 workflow; scientific performance is descriptive."])
     save_json(root / "qualification_summary.json", summary)
     (root / "qualification.html").write_text(_html(summary), encoding="utf-8")
     if materialize:

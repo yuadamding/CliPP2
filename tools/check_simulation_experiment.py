@@ -43,7 +43,7 @@ def run_checks(directory):
     ledger = paired["cost_ledger"]
     assert (ledger["fit_count"], ledger["assignment_pass_count"]) == (3, 2)
     assert [event["arm"] for event in ledger["events"] if event["operation"] == "fit"] == ["A", "B", "C"]
-    assert paired["protocol_version"] == "2.3"
+    assert paired["protocol_version"] == "2.4"
     assert all(fit["producer_receipt"]["run_manifest"] == paired["run_manifest"] for fit in
                [paired["stage_one"], *(arm["stage_two"] for arm in paired["arms"].values())])
     for arm in paired["arms"].values():
@@ -78,6 +78,25 @@ def run_checks(directory):
     assert (replay["cost_ledger"]["fit_count"], replay["cost_ledger"]["reused_fit_count"],
             replay["cost_ledger"]["assignment_pass_count"]) == (1, 2, 2)
     checks.append("validated_A_B_reuse_without_hidden_refit")
+    profile = run_paired_experiment(directory / "input.tsv", directory / "profile",
+        replace(config, stage_three_assignment_method="profile"), accepted_stage_one=paired["stage_one"],
+        accepted_uncapped_stage_two=paired["arms"]["B"]["stage_two"])
+    assert profile["status"] == "complete", profile.get("error")
+    assert (profile["cost_ledger"]["fit_count"], profile["cost_ledger"]["assignment_pass_count"]) == (1, 2)
+    for arm in profile["arms"].values():
+        assert arm["assignment"]["assignment_method"] == "profile"
+        assert all(r["final_assignment_label"] is not None and r["probabilities"] is None for r in arm["original_rows"])
+    checks.append("profile_method_propagates_with_same_operation_budget")
+    hybrid_config = replace(config, fit=replace(config.fit, fit_multiplicity="profile"))
+    hybrid = run_paired_experiment(directory/"input.tsv", directory/"profile_fitting", hybrid_config)
+    assert hybrid["status"] == "complete", hybrid.get("error")
+    from CliPP2.config import fitting_identity
+    assert hybrid["fitting_method_identity"] == fitting_identity("profile")
+    for native in (hybrid["stage_one"], *(arm["stage_two"] for arm in hybrid["arms"].values())):
+        assert native["method_identity"] == fitting_identity("profile")
+        assert native["schema"] == "clipp2.accepted-fit.v4"
+    assert all(arm["assignment"]["assignment_method"] == "marginal" for arm in hybrid["arms"].values())
+    checks.append("profile_fitting_inherits_across_both_stage_two_arms_without_changing_stage_three")
     for fit in (replay["stage_one"], replay["arms"]["B"]["stage_two"]):
         assert fit["producer_receipt"]["run_manifest_id"] == "simulation_check_origin"
         assert fit["compatibility_receipts"][-1]["run_manifest_id"] == "simulation_check_current_replay"
@@ -225,12 +244,19 @@ def _control_regressions(directory):
     assert np.all(bundle.native_centers == 0) and np.all(bundle.native_calls == 1)
     scored = assign_mutations(bundle, outdir=directory / "independent_assignment")
     assert len(scored.assignments) == 1
-    fake = SimpleNamespace(reference=reference, assignments=[dict(mutation_id=mutation,
+    fake = SimpleNamespace(reference=reference, assignment_method="marginal", summary=scored.summary, assignments=[dict(mutation_id=mutation,
         status="observed", evidence_status="observed", final_assignment_label=1,
+        score_defined=True, posterior_defined=True,
         probabilities=(0., 1., *([0.]*(len(reference.labels)-2))),
         log_scores=(-1000., 0., *([-2000.]*(len(reference.labels)-2))))])
     row = _calibration(history, catalog, fake, members)["mutations"][0]
     assert np.isclose(row["binary_log_loss"], 1000.) and np.isclose(row["multiclass_log_loss"], 1000.)
+    configured = _snapshot_bundle(history, catalog, reference, (mutation,),
+        replace(workflow_config(), stage_three_assignment_method="profile"), sources=sources, independent=True)
+    profiled = assign_mutations(configured, outdir=directory / "profile_control")
+    evaluated = _calibration(history, catalog, profiled, members)
+    assert evaluated["summary"]["assignment_method"] == "profile"
+    assert evaluated["summary"]["probability_count"] == 0 and evaluated["summary"]["binary_brier"] is None
     return ["independent_counts_preserve_valid_first_read_baseline",
             "finite_log_loss_survives_probability_display_underflow"]
 

@@ -29,11 +29,12 @@ double clip(double x, double lo, double hi) { return std::min(std::max(x, lo), h
 double sum(const Vector& x) {
     return clipp2::pairwise_sum([&](std::int64_t i) { return x[i]; }, 0, x.size());
 }
-struct Terms { Vector value, gradient, curvature; };
+struct Terms { Vector value, gradient, curvature, right, left; };
 struct Point { Vector x; Terms terms; };
 void resize(Point& point,std::size_t cells) {
     point.x.resize(cells);point.terms.value.resize(cells);
     point.terms.gradient.resize(cells);point.terms.curvature.resize(cells);
+    point.terms.right.resize(cells);point.terms.left.resize(cells);
 }
 
 // Every capacity reserves its maximum shape before entering continuation.
@@ -75,13 +76,14 @@ struct Engine {
     // Optional reverse-communication hooks. The ordinary CPU path leaves both
     // null and retains its original emitter and execution policy.
     void* request_owner=nullptr;
-    void (*request_terms)(void*,const double*,double*,double*,double*,std::size_t)=nullptr;
+    void (*request_terms)(void*,const double*,double*,double*,double*,double*,double*,std::size_t)=nullptr;
     void (*request_progress)(void*,int,int,std::int64_t)=nullptr;
 
     void evaluate(const Vector& x,Terms& out) const {
         ++evaluations;
         if(request_terms) {
-            request_terms(request_owner,x.data(),out.value.data(),out.gradient.data(),out.curvature.data(),cells);
+            request_terms(request_owner,x.data(),out.value.data(),out.gradient.data(),out.curvature.data(),
+                          out.right.data(),out.left.data(),cells);
             return;
         }
         auto cell_terms=[&](int i) {for(int region=0;region<r;++region) {
@@ -94,6 +96,10 @@ struct Engine {
                 throw std::runtime_error("Native continuation likelihood produced invalid arithmetic");
             out.value[cell]=result.loss; out.gradient[cell]=result.gradient;
             out.curvature[cell]=result.curvature;
+            if(data.aggregation==clipp2::LikelihoodAggregation::IntegerProfile) {
+                const auto slopes=clipp2::profile_slopes(observation,x[cell]);
+                out.right[cell]=slopes.right;out.left[cell]=slopes.left;
+            }
         }};
         if(team)team->run(n,cell_terms);else for(int i=0;i<n;++i)cell_terms(i);
     }
@@ -146,10 +152,17 @@ struct Engine {
         for (std::size_t i=0;i<cells;++i) spring[i]+=point.terms.gradient[i];
         return spring;
     }
-    double stationarity(const Vector& x,const Vector& gradient) const {
+    double stationarity(const Point& point,const Vector& gradient) const {
+        const auto& x=point.x;
         double result=0;
-        for (std::size_t i=0;i<cells;++i)
-            result=std::max(result,std::abs(x[i]-clip(x[i]-gradient[i],lower[i],upper[i])));
+        for (std::size_t i=0;i<cells;++i) {
+            if(data.aggregation==clipp2::LikelihoodAggregation::IntegerProfile) {
+                const double q=gradient[i]-point.terms.gradient[i];
+                result=std::max(result,std::max(0.0,std::max(
+                    std::min(-(q+point.terms.right[i]),upper[i]-x[i]),
+                    std::min(q+point.terms.left[i],x[i]-lower[i]))));
+            } else result=std::max(result,std::abs(x[i]-clip(x[i]-gradient[i],lower[i],upper[i])));
+        }
         return result;
     }
     bool quadratic(const Vector& h,const Vector& rhs,const std::vector<int>& graph,
@@ -301,7 +314,7 @@ struct Engine {
                 const auto& graph=forest(cuts);
                 const auto& delta=jumps(current.x,graph,arena.delta);
                 const auto& gradient=penalized_gradient(current,graph,rho);
-                stationarity_value=stationarity(current.x,gradient);
+                stationarity_value=stationarity(current,gradient);
                 if(stationarity_value<=policy.stationarity) {
                     if(request_progress)request_progress(request_owner,1,level+1,iterations);
                     break;
@@ -345,7 +358,7 @@ struct Engine {
                 if(stalled)break;
             }
             project(current.x,capacity);const auto& graph=forest(cuts);
-            stationarity_value=stationarity(current.x,penalized_gradient(current,graph,rho));
+            stationarity_value=stationarity(current,penalized_gradient(current,graph,rho));
             const auto& delta=jumps(current.x,graph,arena.delta);
             violation=norm(delta.data(),delta.size());
             if(!std::isfinite(violation))throw std::runtime_error("Continuation norm reduction failed");
@@ -399,6 +412,8 @@ extern "C" int CliPP2ContinueCPU(const clipp2::ObservationSoA* data,const int* e
             throw std::invalid_argument("Native continuation dimensions overflow");
         const auto cells=static_cast<std::size_t>(n)*r;
         clipp2::validate_observations(*data);
+        if(policy->aggregation != static_cast<int>(data->aggregation))
+            throw std::invalid_argument("Continuation aggregation differs from its observations");
         if(policy->levels<1 || policy->iterations<1 || !std::isfinite(policy->stationarity)
             || policy->stationarity<=0 || !std::isfinite(policy->constraint) || policy->constraint<=0
             || !std::isfinite(policy->maximum_penalty) || policy->maximum_penalty<=0)
@@ -433,6 +448,11 @@ extern "C" int CliPP2ContinueCPU(const clipp2::ObservationSoA* data,const int* e
             if(result.status==clipp2::EmitStatus::InvalidInput || result.status==clipp2::EmitStatus::NumericalFailure)
                 throw std::runtime_error("Invalid initial continuation likelihood");
             start.terms.value[cell]=result.loss;start.terms.gradient[cell]=result.gradient;start.terms.curvature[cell]=result.curvature;
+            if(data->aggregation==clipp2::LikelihoodAggregation::IntegerProfile) {
+                const auto slopes=clipp2::profile_slopes(
+                    clipp2::observation(*data,static_cast<std::int64_t>(region)*n+i),start.x[cell]);
+                start.terms.right[cell]=slopes.right;start.terms.left[cell]=slopes.left;
+            }
         }});
         if(!std::all_of(start.terms.value.begin(),start.terms.value.end(),[](double x){return std::isfinite(x);}))
             throw std::runtime_error("Initial tree likelihood is nonfinite");
@@ -467,7 +487,8 @@ struct ContinuationState {
     std::mutex mutex;
     std::condition_variable changed;
     std::unique_lock<std::mutex>* cpu_lock=nullptr;
-    double *value_reply=nullptr,*gradient_reply=nullptr,*curvature_reply=nullptr;
+    double *value_reply=nullptr,*gradient_reply=nullptr,*curvature_reply=nullptr,
+           *right_reply=nullptr,*left_reply=nullptr;
     std::string error;
     bool cancelled=false,started=false;
     pthread_t thread{};
@@ -476,7 +497,7 @@ struct ContinuationState {
         owner(group),capacity(k),arena(n,r),output(raw?static_cast<std::size_t>(n)*r:0),
         labels(n),cuts(n-1) {}
     void suspend(int kind,int boundary,int level,std::int64_t iterations,const double* x);
-    static void terms(void*,const double*,double*,double*,double*,std::size_t);
+    static void terms(void*,const double*,double*,double*,double*,double*,double*,std::size_t);
     static void progress(void*,int,int,std::int64_t);
     static void* work(void*);
 };
@@ -497,6 +518,7 @@ struct ContinuationOwner {
 
     ContinuationOwner(int nodes,int regions,const int* graph,const int* order,
         const double* x,const double* values,const double* gradient,const double* curvature,
+        const double* right,const double* left,
         const double* lo,const double* hi,const double* gap,const CliPP2ContinuationPolicy& rules,
         CliPP2Norm reduce_norm,CliPP2CutScores reduce_scores,bool keep_raw,bool boundary_requests):
         n(nodes),r(regions),raw(keep_raw),boundaries(boundary_requests),cells(static_cast<std::size_t>(n)*r),
@@ -507,6 +529,7 @@ struct ContinuationOwner {
         initial.terms.value.assign(values,values+cells);
         initial.terms.gradient.assign(gradient,gradient+cells);
         initial.terms.curvature.assign(curvature,curvature+cells);
+        initial.terms.right.assign(right,right+cells);initial.terms.left.assign(left,left+cells);
     }
     ~ContinuationOwner() {
         for(auto& state:states) {
@@ -533,9 +556,11 @@ void ContinuationState::suspend(int kind,int boundary,int level,std::int64_t ite
     lock.unlock();cpu_lock->lock();
     if(stopped)throw std::runtime_error("Continuation owner cancelled");
 }
-void ContinuationState::terms(void* opaque,const double* x,double* values,double* gradient,double* curvature,std::size_t) {
+void ContinuationState::terms(void* opaque,const double* x,double* values,double* gradient,double* curvature,
+                             double* right,double* left,std::size_t) {
     auto& state=*static_cast<ContinuationState*>(opaque);
     state.value_reply=values;state.gradient_reply=gradient;state.curvature_reply=curvature;
+    state.right_reply=right;state.left_reply=left;
     state.suspend(1,0,0,0,x);
 }
 void ContinuationState::progress(void* opaque,int boundary,int level,std::int64_t iterations) {
@@ -552,7 +577,8 @@ void* ContinuationState::work(void* opaque) {
         clipp2kernel::prepare_forest_workspace(group.n,group.n-1);
         struct Release {~Release(){clipp2kernel::reset_forest_workspace();}} release;
         // Metadata only. The nonnull terms hook prevents any observation access.
-        const clipp2::ObservationSoA metadata{group.n,group.r,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr};
+        const clipp2::ObservationSoA metadata{group.n,group.r,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,
+            static_cast<clipp2::LikelihoodAggregation>(group.policy.aggregation)};
         Engine engine{metadata,group.n,group.r,group.n-1,group.cells,group.edges.data(),
             group.canonical.data(),group.lower.data(),group.upper.data(),group.gaps.data(),group.policy,
             group.norm,group.scores,group.tree,nullptr,state.arena,&state,terms,
@@ -579,12 +605,13 @@ void owner_error(const std::exception& error) {
 
 extern "C" int CliPP2ContinuationOwnerCreate(int n,int r,const int* edges,const int* canonical,
     const double* initial,const double* values,const double* gradient,const double* curvature,
+    const double* right,const double* left,
     const double* lower,const double* upper,const double* gaps,int tasks,const int* capacities,
     const CliPP2ContinuationPolicy* policy,CliPP2Norm norm,CliPP2CutScores scores,
     int output_flags,int boundary_requests,void** owner) {
     error_message[0]='\0';if(owner)*owner=nullptr;
     try {
-        if(!owner||!canonical||!initial||!values||!gradient||!curvature||!lower||!upper||!gaps
+        if(!owner||!canonical||!initial||!values||!gradient||!curvature||!right||!left||!lower||!upper||!gaps
             ||!capacities||!policy||!norm||!scores||n<1||r<1||tasks<1||(n>1&&!edges)
             ||(boundary_requests!=0&&boundary_requests!=1)
             ||(output_flags!=0&&output_flags!=1))
@@ -592,7 +619,8 @@ extern "C" int CliPP2ContinuationOwnerCreate(int n,int r,const int* edges,const 
         const auto cells=static_cast<std::size_t>(clipp2::checked_product(n,r,sizeof(long double)));
         if(policy->levels<1||policy->iterations<1||!std::isfinite(policy->stationarity)||policy->stationarity<=0
             ||!std::isfinite(policy->constraint)||policy->constraint<=0
-            ||!std::isfinite(policy->maximum_penalty)||policy->maximum_penalty<=0)
+            ||!std::isfinite(policy->maximum_penalty)||policy->maximum_penalty<=0
+            ||(policy->aggregation!=0 && policy->aggregation!=1))
             throw std::invalid_argument("Invalid continuation owner policy");
         std::vector<unsigned char> seen(n,0);
         for(int i=0;i<n;++i) {
@@ -610,11 +638,12 @@ extern "C" int CliPP2ContinuationOwnerCreate(int n,int r,const int* edges,const 
         for(std::size_t i=0;i<cells;++i) {
             if(!std::isfinite(initial[i])||!std::isfinite(lower[i])||!std::isfinite(upper[i])
                 ||lower[i]<0||upper[i]>1||lower[i]>upper[i]||initial[i]<lower[i]||initial[i]>upper[i]
-                ||!std::isfinite(values[i])||!std::isfinite(gradient[i])||!std::isfinite(curvature[i]))
+                ||!std::isfinite(values[i])||!std::isfinite(gradient[i])||!std::isfinite(curvature[i])
+                ||!std::isfinite(right[i])||!std::isfinite(left[i]))
                 throw std::invalid_argument("Invalid continuation initial state");
         }
         auto group=std::make_unique<ContinuationOwner>(n,r,edges,canonical,initial,values,gradient,curvature,
-            lower,upper,gaps,*policy,norm,scores,output_flags,boundary_requests);
+            right,left,lower,upper,gaps,*policy,norm,scores,output_flags,boundary_requests);
         group->states.reserve(tasks);
         for(int i=0;i<tasks;++i)
             group->states.emplace_back(std::make_unique<ContinuationState>(*group,n,r,capacities[i],output_flags));
@@ -638,7 +667,7 @@ extern "C" int CliPP2ContinuationOwnerPoll(void* owner,int task,int wait,CliPP2C
     } catch(const std::exception& error) {owner_error(error);return 1;}
 }
 extern "C" int CliPP2ContinuationOwnerReply(void* owner,int task,std::uint64_t sequence,
-    const double* values,const double* gradient,const double* curvature) {
+    const double* values,const double* gradient,const double* curvature,const double* right,const double* left) {
     try {
         if(!owner)throw std::invalid_argument("Missing continuation reply owner");
         auto& group=*static_cast<ContinuationOwner*>(owner);auto& state=group.state(task);
@@ -646,14 +675,17 @@ extern "C" int CliPP2ContinuationOwnerReply(void* owner,int task,std::uint64_t s
         if(state.cancelled||state.request.sequence!=sequence||(state.request.kind!=1&&state.request.kind!=2))
             throw std::invalid_argument("Stale or unexpected continuation reply");
         if(state.request.kind==1) {
-            if(!values||!gradient||!curvature)throw std::invalid_argument("Missing continuation terms reply");
+            if(!values||!gradient||!curvature||!right||!left)throw std::invalid_argument("Missing continuation terms reply");
             for(std::size_t i=0;i<group.cells;++i)
-                if(!std::isfinite(values[i])||!std::isfinite(gradient[i])||!std::isfinite(curvature[i]))
+                if(!std::isfinite(values[i])||!std::isfinite(gradient[i])||!std::isfinite(curvature[i])
+                        ||!std::isfinite(right[i])||!std::isfinite(left[i]))
                     throw std::runtime_error("Nonfinite continuation terms reply");
             std::copy(values,values+group.cells,state.value_reply);
             std::copy(gradient,gradient+group.cells,state.gradient_reply);
             std::copy(curvature,curvature+group.cells,state.curvature_reply);
-        } else if(values||gradient||curvature)throw std::invalid_argument("Unexpected continuation progress payload");
+            std::copy(right,right+group.cells,state.right_reply);
+            std::copy(left,left+group.cells,state.left_reply);
+        } else if(values||gradient||curvature||right||left)throw std::invalid_argument("Unexpected continuation progress payload");
         state.request.kind=0;state.request.coordinates=nullptr;state.changed.notify_all();return 0;
     } catch(const std::exception& error) {owner_error(error);return 1;}
 }

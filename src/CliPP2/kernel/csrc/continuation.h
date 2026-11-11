@@ -5,6 +5,7 @@
 struct CliPP2ContinuationPolicy {
     int levels, iterations;
     double stationarity, constraint, maximum_penalty;
+    int aggregation = 0;
 };
 struct CliPP2ContinuationReport {
     double rho, stationarity, violation, block_range, likelihood, objective;
@@ -38,12 +39,14 @@ int CliPP2ContinueCPU(const clipp2::ObservationSoA*, const int* edges,
     unsigned char* cuts, CliPP2ContinuationReport* reports, int* actual_workers);
 int CliPP2ContinuationOwnerCreate(int n,int regions,const int* edges,const int* canonical,
     const double* initial,const double* values,const double* gradient,const double* curvature,
+    const double* right,const double* left,
     const double* lower,const double* upper,const double* gaps,int tasks,const int* capacities,
     const CliPP2ContinuationPolicy*,CliPP2Norm,CliPP2CutScores,
     int output_flags,int boundary_requests,void** owner);
 int CliPP2ContinuationOwnerPoll(void* owner,int task,int wait,CliPP2ContinuationRequest* request);
 int CliPP2ContinuationOwnerReply(void* owner,int task,std::uint64_t sequence,
-    const double* values,const double* gradient,const double* curvature);
+    const double* values,const double* gradient,const double* curvature,
+    const double* right,const double* left);
 int CliPP2ContinuationOwnerResult(void* owner,int task,double* coordinates,int* labels,
     unsigned char* cuts,CliPP2ContinuationReport* report);
 const char* CliPP2ContinuationOwnerError(void* owner,int task);

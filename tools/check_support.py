@@ -12,14 +12,16 @@ from CliPP2.config import PROTOCOL_VERSION
 from CliPP2.io.tumor_txt import load_original_catalog, write_tumor_txt
 
 
-def write_catalog(path, alt, depth, major, *, minor=0, purity=None, observed=True, metadata=None):
+def write_catalog(path, alt, depth, major, *, minor=0, purity=None, observed=True, metadata=None,
+                  segments="shared_segment"):
     alt, depth, major, minor, observed = np.broadcast_arrays(
         np.atleast_2d(alt), np.atleast_2d(depth), np.atleast_2d(major),
         np.atleast_2d(minor), np.atleast_2d(observed))
     purity = np.ones(alt.shape[1]) if purity is None else np.asarray(purity)
+    segments = np.broadcast_to(segments, alt.shape)
     rows = [dict(mutation_id=f"m{i:03}", sample_id=f"r{r+1}",
         alt_count=int(alt[i, r]), ref_count=int(depth[i, r]-alt[i, r]), count_observed=int(observed[i, r]),
-        purity=float(purity[r]), normal_cn=2, segment_id="shared_segment", cn_state_id="0",
+        purity=float(purity[r]), normal_cn=2, segment_id=str(segments[i, r]), cn_state_id="0",
         cn_state_fraction=1., allele_a_cn=int(major[i, r]), allele_b_cn=int(minor[i, r]))
         for i in range(alt.shape[0]) for r in range(alt.shape[1])]
     write_tumor_txt(path, pd.DataFrame(rows), metadata)

@@ -14,7 +14,8 @@ import numpy as np
 from scipy.special import logsumexp, xlogy, xlog1py
 from scipy.optimize import linear_sum_assignment
 from copy import deepcopy
-from CliPP2.config import STAGE_THREE_REFERENCE_POLICY
+from CliPP2.config import STAGE_THREE_REFERENCE_POLICY, validate_assignment_method
+from CliPP2.assignment import ASSIGNMENT_POLICIES, POSTERIOR_FIELDS
 from CliPP2.io.data import content_hash
 
 HISTORICAL_V5_REFERENCE_POLICY = "exact_unique_canonical_one_source_native_all_stage_two_equal_priors_after_consolidation"
@@ -316,7 +317,7 @@ _HISTORICAL_V4 = {'schema': 'clipp2.simulation.evaluation-definition.v4',
  'matching_policy': 'maximum_valid_cardinality_then_minimum_valid_distance_then_lexicographic_truth_reference',
  'matching_ambiguity': 'alternative_equal_cardinality_exact_binary_rational_distance_sum_optima'}
 
-def evaluation_definition(config=None, *, reference_policy=STAGE_THREE_REFERENCE_POLICY):
+def _evaluation_definition_v5(config=None, *, reference_policy=STAGE_THREE_REFERENCE_POLICY):
     config = normalize_evaluation_config(config)
     if reference_policy not in (STAGE_THREE_REFERENCE_POLICY, HISTORICAL_V5_REFERENCE_POLICY):
         raise ValueError("Unknown Stage 3 reference policy")
@@ -345,9 +346,24 @@ def evaluation_definition(config=None, *, reference_policy=STAGE_THREE_REFERENCE
         matching_ambiguity="alternative_equal_cardinality_exact_binary_rational_distance_sum_optima")
 
 
-def legacy_evaluation_definition(version, config=None):
+def evaluation_definition(config=None, *, reference_policy=STAGE_THREE_REFERENCE_POLICY,
+                          assignment_method="marginal"):
+    method = validate_assignment_method(assignment_method)
+    definition = _evaluation_definition_v5(config, reference_policy=reference_policy)
+    definition.update(schema="clipp2.simulation.evaluation-definition.v6",
+        assignment_method=method, tie_policy=ASSIGNMENT_POLICIES[method],
+        map_policy=ASSIGNMENT_POLICIES[method],
+        posterior_semantics="marginal_cluster_posterior" if method == "marginal" else "undefined_for_profile",
+        missing_information="prior_only_uniform_probabilities_without_data_supported_final_label" if method == "marginal"
+            else "prior_only_equal_scores_without_posterior_or_data_supported_final_label")
+    return definition
+
+
+def legacy_evaluation_definition(version, config=None, *, reference_policy=HISTORICAL_V5_REFERENCE_POLICY):
     """Frozen historical definitions never inherit the current MAP semantics."""
     config = normalize_evaluation_config(config)
+    if version in (5, "v5", "clipp2.simulation.evaluation.v5"):
+        return _evaluation_definition_v5(config, reference_policy=reference_policy)
     if version in (1, "v1", "clipp2.simulation.evaluation.v1"):
         return dict(schema="clipp2.simulation.evaluation-definition.legacy-v1",
             binary_endpoint="accepted_designated_clonal_status_equals_physical_truth_clonality",
@@ -361,7 +377,7 @@ def legacy_evaluation_definition(version, config=None):
     elif version in (4, "v4", "clipp2.simulation.evaluation.v4"):
         definition = deepcopy(_HISTORICAL_V4)
     else:
-        raise ValueError("Only evaluation v1, v2 and v3 are historical definitions")
+        raise ValueError("Only evaluation v1 through v5 are historical definitions")
     definition.update(config=config, reference_distance=config["reference_distance"],
                       reference_match_atol=config["reference_match_atol"])
     return definition
@@ -381,7 +397,7 @@ def record_evaluation_definition(record):
     schema = record.get("schema")
     if schema == "clipp2.simulation.evaluation.v1":
         return legacy_evaluation_definition(1, {"reference_match_atol": record.get("reference_match_atol")})
-    if schema not in ("clipp2.simulation.evaluation.v2", "clipp2.simulation.evaluation.v3", "clipp2.simulation.evaluation.v4", "clipp2.simulation.evaluation.v5"):
+    if schema not in ("clipp2.simulation.evaluation.v2", "clipp2.simulation.evaluation.v3", "clipp2.simulation.evaluation.v4", "clipp2.simulation.evaluation.v5", "clipp2.simulation.evaluation.v6"):
         raise ValueError("Aggregation requires versioned evaluation records")
     definition = record.get("evaluation_definition")
     if not isinstance(definition, dict) or record.get("evaluation_definition_id") != content_hash(definition):
@@ -751,12 +767,15 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
             raise ValueError("Conflicting reference match tolerances")
         config_input["reference_match_atol"] = reference_match_atol
     evaluation_config = normalize_evaluation_config(config_input)
-    all_targets = result.get("schema") == "clipp2.paired-experiment.v5"
+    method_aware = result.get("schema") == "clipp2.paired-experiment.v6"
+    assignment_method = validate_assignment_method(result["config"]["stage_three_assignment_method"]) if method_aware else "marginal"
+    all_targets = result.get("schema") in ("clipp2.paired-experiment.v5", "clipp2.paired-experiment.v6")
     map_policy = all_targets or result.get("schema") == "clipp2.paired-experiment.v4" or result.get("protocol_version") == "2.3"
     source_origin = "stage1_reference_recheck" if map_policy else "stage1_clonal_recheck"
     second_origin = "stage2_recheck" if all_targets else "stage2_near_clonal_recheck"
     reference_policy = result.get("reference_policy", HISTORICAL_V5_REFERENCE_POLICY)
-    definition = (evaluation_definition(evaluation_config, reference_policy=reference_policy) if all_targets else
+    definition = (evaluation_definition(evaluation_config, reference_policy=reference_policy, assignment_method=assignment_method) if method_aware else
+                  legacy_evaluation_definition(5, evaluation_config, reference_policy=reference_policy) if all_targets else
                   legacy_evaluation_definition(4 if map_policy else 3, evaluation_config))
     reference_match_atol = evaluation_config["reference_match_atol"]
     reference_distance = evaluation_config["reference_distance"]
@@ -769,6 +788,22 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                     history_id=metadata.get("history_id", getattr(history, "history_id", "unknown")),
                     acquisition_id=acquisition.get("id", acquisition.get("acquisition_id", "unspecified")),
                     stratum=result.get("stratum", "estimated"))
+    from CliPP2.config import fitting_identity, SELECTION_CRITERION
+    fit_settings = result.get("config", {}).get("fit", {})
+    method_identity = fitting_identity(fit_settings.get("fit_multiplicity", "marginal"),
+                                      fit_settings.get("selection_criterion", SELECTION_CRITERION))
+    if "fitting_method_identity" in result and result["fitting_method_identity"] != method_identity:
+        raise ValueError("Experiment fitting identity differs from its configuration")
+    for accepted in [result.get("stage_one"), *(arm.get("stage_two") for arm in result.get("arms", {}).values())]:
+        if accepted and accepted.get("schema") == "clipp2.accepted-fit.v4" and accepted.get("method_identity") != method_identity:
+            raise ValueError("Evaluated accepted fit uses a different fitting objective")
+    # Historical report identities stay byte-for-byte historical. New producers
+    # bind their fitting method explicitly; absent historical metadata is marginal.
+    if "fitting_method_identity" in result or "fit_multiplicity" in fit_settings:
+        identity["fitting_method_identity"] = method_identity
+    if method_aware:
+        identity.update(assignment_method=assignment_method, tie_policy=ASSIGNMENT_POLICIES[assignment_method],
+                        calibration_status="requires_valid_marginal_posterior" if assignment_method == "marginal" else "undefined_for_profile")
     ids, regions = tuple(history.mutation_ids), tuple(history.region_ids)
     index = {mutation: i for i, mutation in enumerate(ids)}
     truth_ids = dict(zip(ids, history.observable_truth_ids))
@@ -946,6 +981,8 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                sum(baseline_correct.get(m, False) and evaluable[index[m]] for m in ids), original_n,
                reason=None if available else "unavailable_no_correct_decision_credit")
         assignment = payload.get("assignment")
+        if assignment is not None and method_aware and assignment.get("assignment_method") != assignment_method:
+            raise ValueError("Assignment and workflow methods differ")
         records = {row["mutation_id"]: row for row in assignment.get("assignments", ())} if assignment else {}
         stage = arm+"3"
         assignment_available = assignment is not None
@@ -964,11 +1001,19 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         target_evaluable = {m for m in targets if evaluable[index[m]]}
         for mutation in sorted(targets):
             record = records.get(mutation)
+            if record and method_aware:
+                if record.get("assignment_method") != assignment_method:
+                    raise ValueError("Assignment row method differs from workflow")
+                if assignment_method == "profile" and (record.get("posterior_defined") is not False
+                        or any(record.get(field) is not None for field in POSTERIOR_FIELDS)):
+                    raise ValueError("Profile assignment cannot define a cluster posterior")
+                if record.get("evidence_status") == "observed" and record.get("score_defined") is not True:
+                    raise ValueError("Observed assignment requires a defined score")
             accepted = record.get("final_assignment_label" if map_policy else "accepted_label") if record else None
             if map_policy and record:
                 evidence = record.get("evidence_status", record.get("status"))
                 if evidence == "observed" and (accepted is None or accepted != record.get("map_cluster_label")):
-                    raise ValueError("Observed Protocol 2.3 targets require their authoritative MAP final label")
+                    raise ValueError("Observed targets require their authoritative MAP final label")
                 if evidence == "observed" and not observed[index[mutation]].any():
                     raise ValueError("Observed MAP evidence needs informative original reads")
                 if evidence == "prior_only" and observed[index[mutation]].any():
@@ -993,7 +1038,10 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                 unmapped_accepted += accepted is not None and mapping.get(accepted) is None
                 absent_accepted += accepted is not None and truth_ids[mutation] not in set(mapping.values())
             probabilities = np.asarray(record.get("probabilities", []), float) if record else np.array([])
-            probability_defined = probabilities.shape == (len(labels),) and bool(labels) and np.isfinite(probabilities).all()
+            probability_defined = bool(assignment_method == "marginal" and record
+                and record.get("posterior_defined", not method_aware)
+                and probabilities.shape == (len(labels),) and bool(labels) and np.isfinite(probabilities).all()
+                and (not method_aware or (np.all(probabilities >= 0) and np.isclose(probabilities.sum(), 1., rtol=0, atol=1e-12))))
             if is_eval and probability_defined:
                 finite_probability_count += 1
                 mapped = mapped_probabilities(probabilities, labels, mapping, classes)
@@ -1035,6 +1083,10 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                 historical_cap_contributor_reassigned=bool(accepted is not None and accepted != clonal_label
                     and any((mutation, region) in qualified for region in regions)),
                 final_assignment_label=accepted, probability_available=probability_defined))
+            if method_aware:
+                mutation_rows[-1].update(assignment_method=assignment_method,
+                    score_defined=record.get("score_defined") if record else None,
+                    selection_reason=record.get("selection_reason") if record else None)
         for mutation in sorted(non_targets):
             mutation_rows.append(dict(arm=stage, mutation_id=mutation, evaluable=bool(evaluable[index[mutation]]),
                 truth_clonal=clonal[mutation], truth_class=truth_ids[mutation], role="unchanged_non_target",
@@ -1252,7 +1304,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                     and row["true_support_exclusion"] for row in rows)),
                 ("stage3_inherited_support_defect_count", sum(row["inherited_input_exclusion"] is True for row in rows))):
             metric(name, arm, value=count if available else None, reason=None if available else "unavailable_analysis")
-    _probability_metrics(calibration_rows, metric)
+    _probability_metrics(calibration_rows, metric, assignment_method=assignment_method)
     declared_sources = tuple(metadata.get("declared_source_ids", ()))
     structural_catalog = SimpleNamespace(eligible=(np.ones_like(history.major_cn, dtype=bool) if catalog.max_major_cn is None
         else np.asarray(history.major_cn) <= catalog.max_major_cn),
@@ -1336,7 +1388,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
             eligible_mutations=int(catalog.eligible.any(axis=1).sum()), eligible_pairs=int(catalog.eligible.sum()),
             informative_mutations=original_n,
             eligible_pairs_above_legacy_cn_ceiling=int(np.sum(catalog.eligible & (catalog.major_cn > 10))))
-    return json_safe(dict(schema="clipp2.simulation.evaluation.v5" if all_targets else "clipp2.simulation.evaluation.v4" if map_policy else "clipp2.simulation.evaluation.v3", **identity,
+    return json_safe(dict(schema="clipp2.simulation.evaluation.v6" if method_aware else "clipp2.simulation.evaluation.v5" if all_targets else "clipp2.simulation.evaluation.v4" if map_policy else "clipp2.simulation.evaluation.v3", **identity,
         truth_qualification=truth_qualification,
         evaluation_config=evaluation_config, evaluation_definition=definition,
         evaluation_definition_id=content_hash(definition), original_mutation_count=len(ids),
@@ -1535,7 +1587,7 @@ def _cap_metrics(audit, metric):
                stratum=stratum)
 
 
-def _probability_metrics(rows, metric):
+def _probability_metrics(rows, metric, *, assignment_method="marginal"):
     for arm in ("B3", "C3"):
         arm_rows = [row for row in rows if row["arm"] == arm]
         strata = {"all": arm_rows, "K1": [row for row in arm_rows if row["K"] == 1],
@@ -1546,9 +1598,10 @@ def _probability_metrics(rows, metric):
             strata["source:"+source] = [row for row in arm_rows if row["source_stage"] == source]
         for stratum, selected in strata.items():
             for name in ("binary_brier", "binary_log_loss", "multiclass_brier", "multiclass_log_loss", "unmapped_mass"):
-                metric(name, arm, value=float(np.mean([row[name] for row in selected])) if selected else None, stratum=stratum)
+                metric(name, arm, value=float(np.mean([row[name] for row in selected])) if selected else None, stratum=stratum,
+                       reason="undefined_for_profile" if assignment_method == "profile" else None)
             metric("infinite_multiclass_log_loss", arm, sum(np.isposinf(row["multiclass_log_loss"]) for row in selected),
-                   len(selected), stratum=stratum)
+                   len(selected), stratum=stratum, reason="undefined_for_profile" if assignment_method == "profile" else None)
 
 
 def _numeric(value):
@@ -1579,7 +1632,7 @@ def population_accounting(availability):
 
 
 def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expected_definition=None,
-              bootstrap_replicates=1000, seed=20261106, families=FAMILIES):
+              bootstrap_replicates=1000, seed=20261106, families=FAMILIES, expected_fitting_identity=None):
     """Keep frozen planned weights; report conditional available cases separately.
 
     Unknown scientific values are never replaced with zero or dropped from a
@@ -1591,6 +1644,15 @@ def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expect
     if bootstrap_replicates < 0 or len(set(families)) != len(families) or not families:
         raise ValueError("Aggregation requires distinct families and nonnegative bootstrap replicates")
     definitions = {}
+    from CliPP2.config import fitting_identity
+    methods = [record.get("fitting_method_identity", fitting_identity()) for record in evaluations]
+    if expected_fitting_identity is not None:
+        methods.append(expected_fitting_identity)
+    allowed = (fitting_identity(), fitting_identity("profile"))
+    if any(method not in allowed for method in methods):
+        raise ValueError("Unknown fitting/selection identity in evaluation records")
+    if len({content_hash(method) for method in methods}) > 1:
+        raise ValueError("Different fitting objectives require separate aggregates")
     if expected_definition is not None:
         if not isinstance(expected_definition, dict):
             raise ValueError("Expected evaluation definition must be a definition object")

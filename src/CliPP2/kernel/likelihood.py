@@ -7,7 +7,10 @@ from ..io.data import readonly_array
 class RegionalView:
     """One model coordinate and selected mutation rows, always on CCF scale."""
 
-    def __init__(self, model, region_index, mutation_indices):
+    def __init__(self, model, region_index, mutation_indices, *, role="fit"):
+        if role not in ("fit", "selection"):
+            raise ValueError("Regional evaluator role must be fit or selection")
+        self.role = role
         rows = np.asarray(mutation_indices)
         if (not isinstance(region_index, (int, np.integer))
                 or not 0 <= region_index < model.r
@@ -30,7 +33,7 @@ class RegionalView:
         return np.all(self.array("normal") == 2)
 
     def subset(self, indices):
-        return RegionalView(self.model, self.region, self.rows[indices])
+        return RegionalView(self.model, self.region, self.rows[indices], role=self.role)
 
     def bounds(self):
         return self.array("lower"), self.array("upper")
@@ -42,4 +45,5 @@ class RegionalView:
             raise ValueError("Regional proposal grid must be one-dimensional")
         # Preserve the row-major BLAS reduction layout, including recomputed
         # suffixes of partially retained initialization blocks.
-        return np.ascontiguousarray(self.model.backend.regional_grid(self.region, self.rows, grid))
+        backend = self.model.fit_backend if self.role == "fit" else self.model.selection_backend
+        return np.ascontiguousarray(backend.regional_grid(self.region, self.rows, grid))

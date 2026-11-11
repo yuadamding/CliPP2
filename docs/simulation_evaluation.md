@@ -1,19 +1,22 @@
 # Simulation evaluation definitions
 
-Implementation 2.0.0 uses scientific Protocol 2.3 and evaluation/definition v5.
+Implementation 2.0.0 uses scientific Protocol 2.4 and evaluation/definition v6.
 The evaluator consumes retained final labels; it does not fit, reassign, apply
 confidence or residual cutoffs, or select a development threshold. New contracts
 declare `evaluation.record_schema` explicitly. Package version is not a substitute
 for that scientific identity.
 
-## Protocol 2.3 MAP endpoints
+## Method-bound MAP endpoints
 
-An informative target with a defined posterior has
-`final_assignment_label = map_label`. Exact ties retain their complete tie
-set and use the lowest public label as representative. Diagnostics do not veto
-this result. An eligible target with no informative reads is `prior_only`: its
-uniform prior and deterministic MAP representative are available, but its final
-label is missing. `model_incompatible`, `excluded`, and computational failure are
+An informative target with a defined score has
+`final_assignment_label = map_label`. Marginal ties use the lowest public label;
+profile ties retain the baseline if it is a maximizer, otherwise the lowest label.
+Both retain the complete exact maximizing set. Diagnostics do not veto this
+result. Profile scores are not cluster posteriors: probability fields are null,
+`posterior_defined=False`, and posterior Brier/log-loss/calibration are unavailable.
+Conditional multiplicity probabilities remain valid at the selected center.
+An eligible target with no informative reads is `prior_only`: equal scores and a
+deterministic representative are available, but no data-supported final label. `model_incompatible`, `excluded`, and computational failure are
 separate states, with no fabricated final label.
 
 The new metrics have explicit populations:
@@ -44,7 +47,7 @@ correspondence remains `U`, separately reported rather than assumed incorrect.
 center-distance definition without reference-quality predicates. Continuous
 center errors and suitable-reference availability remain separate from routing
 and selected-center correctness. Missing or failed diagnostics never become zero
-residuals or passing flags. Calibration uses observed targets with defined
+residuals or passing flags. Calibration requires marginal assignment, `posterior_defined`, and observed targets with valid
 probabilities; prior-only rows do not become read-supported calibration evidence.
 Raw source coverage/depth/residuals and target mean/maximum residuals remain in
 mutation records. Descriptive strata distinguish zero versus positive source

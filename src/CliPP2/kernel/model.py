@@ -30,6 +30,7 @@ from .observations import observed_mask, prepare_observations
 from .scoring import WeightConvergenceError, completed_weight, fit_mixture_weights
 from .topology import Membership
 from ..io.data import freeze_record, readonly_array
+from ..config import SELECTION_CRITERION, fitting_identity
 
 
 # The retained biological contract has one integer tumor-CN state per pair.
@@ -142,6 +143,7 @@ class JointColumnSet:
     center_keys: tuple
     model_identity: str
     numerical_identity: tuple
+    aggregation: str = "marginal"
 
     def materialize(self):
         if isinstance(self.columns[0], DeviceColumn):
@@ -204,8 +206,13 @@ class FitResult:
     reason: str | None = None
     diagnostics: Mapping = field(default_factory=dict)
     coordinate_fits: np.ndarray | None = None
+    fitting_log_likelihood: float | None = None
+    fit_objective_id: str = "uniform_multiplicity_marginal_v1"
+    selection_criterion_id: str = SELECTION_CRITERION
 
     def __post_init__(self):
+        if self.fitting_log_likelihood is None and self.fit_objective_id == "uniform_multiplicity_marginal_v1":
+            object.__setattr__(self, "fitting_log_likelihood", self.conditional_log_likelihood)
         for name in ("centers", "weights", "coordinate_fits"):
             value = getattr(self, name)
             if value is not None:
@@ -223,7 +230,10 @@ class FitResult:
 class RegionalModel:
     """Immutable, canonically ordered informative mutation vectors."""
 
-    def __init__(self, data, device="cpu", *, cpu_threads=None, multiplicity_support=None):
+    def __init__(self, data, device="cpu", *, cpu_threads=None, multiplicity_support=None,
+                 fit_multiplicity="marginal", selection_criterion=SELECTION_CRITERION):
+        self.method_identity = freeze_record(fitting_identity(fit_multiplicity, selection_criterion))
+        self.fit_multiplicity = fit_multiplicity
         self.data = data
         ids, regions = tuple(data.mutation_ids), tuple(data.region_ids)
         if any(not isinstance(x, str) for x in ids + regions):
@@ -265,11 +275,20 @@ class RegionalModel:
         for values in (self.support, self.lower, self.upper):
             digest.update(values.tobytes())
         digest.update(repr((self.mutation_ids, self.region_ids)).encode())
+        self.legacy_marginal_identity = digest.hexdigest()
+        digest.update(repr(tuple(self.method_identity.items())).encode())
         self.identity = digest.hexdigest()
         self.device = str(device)
         if self.device != "cpu" and not self.device.startswith("cuda"):
             raise ValueError("Regional likelihood device must be cpu or cuda")
-        self.backend = NativeBackend(self, cpu_threads=cpu_threads)
+        self.fit_backend = NativeBackend(self, cpu_threads=cpu_threads, aggregation=fit_multiplicity)
+        try:
+            self.selection_backend = (self.fit_backend if fit_multiplicity == "marginal" else
+                NativeBackend(self, cpu_threads=cpu_threads, aggregation="marginal"))
+        except BaseException:
+            self.fit_backend.close()
+            raise
+        self.backend = self.fit_backend  # Solver compatibility; selection is always explicit.
         self.execution_backend = f"native_{self.backend.kind}_likelihood_host_forest"
         self._refits, self._columns, self._weight_results, self._preparations = (
             _BoundedCache() for _ in range(4))
@@ -290,12 +309,27 @@ class RegionalModel:
     def __len__(self):
         return self.n
 
+    def close(self):
+        try:
+            self.fit_backend.close()
+        finally:
+            if self.selection_backend is not self.fit_backend:
+                self.selection_backend.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
     def execution_diagnostics(self):
         """Execution-only accounting; never included in model or candidate identity."""
         return {"backend": self.execution_backend,
                 "weight_execution": "cuda_resident" if self.backend.kind == "cuda" else "cpu",
                 "conditional_refit_backend": f"native_{self.backend.kind}",
                 "native": self.backend.diagnostics(),
+                "method_identity": dict(self.method_identity),
+                "selection_native": self.selection_backend.diagnostics(),
                 "continuation": getattr(self, "_continuation_execution", None),
                 "host_cache_entries": {"preparation": len(self._preparations),
                                        "refit": len(self._refits), "column": len(self._columns),
@@ -309,11 +343,20 @@ class RegionalModel:
         """Loss, exact gradient, positive complete-data curvature on CCF scale."""
         return self.backend.node_terms(x)
 
+    def fit_node_terms(self, x):
+        return self.fit_backend.node_terms(x)
+
+    def fit_conditional_values(self, tasks, centers):
+        return self.fit_backend.conditional_values(tasks, centers)
+
     def multiplicity(self, x):
         return self.backend.multiplicity(x)
 
     def view(self, region, rows=None):
         return RegionalView(self, region, np.arange(self.n) if rows is None else rows)
+
+    def pilot_view(self, region, rows=None):
+        return RegionalView(self, region, np.arange(self.n) if rows is None else rows, role="selection")
 
     def _regional_likelihood(self, values, rows, region):
         """Grid view of the same emissions used by the joint model."""
@@ -323,7 +366,7 @@ class RegionalModel:
         pilots, diagnostics = np.full((self.n, self.r), np.nan), {}
         for region in range(self.r):
             rows = np.flatnonzero(self.observed[:, region])
-            pilots[rows, region], diag = pooled_ccf_initialization(self.view(region, rows))
+            pilots[rows, region], diag = pooled_ccf_initialization(self.pilot_view(region, rows))
             diagnostics[self.region_ids[region]] = diag
         return pilots, diagnostics
 
@@ -412,6 +455,22 @@ class RegionalModel:
 
     def _coordinate_grid(self, task):
         def prepare_grid():
+            if self.fit_multiplicity == "profile":
+                from .profile import switch_grid
+                switches = []
+                for row in task.rows:
+                    def prepare_switches():
+                        r = task.region
+                        return readonly_array(switch_grid(self.alt[row, r], self.depth[row, r],
+                            self.scaling[row, r], self.multiplicity_min[row, r],
+                            self.multiplicity_max[row, r], 0., 1.))
+                    switches.append(self._prepared(("switches", task.region, int(row)),
+                                                    prepare_switches, "component_mode_cache_hits"))
+                grid = np.unique(np.r_[task.lower, task.upper, np.concatenate(switches)])
+                grid = readonly_array(grid[(grid >= task.lower) & (grid <= task.upper)])
+                self.telemetry["coordinate_grids"] += 1
+                self.telemetry["profile_intervals"] = self.telemetry.get("profile_intervals", 0)+len(grid)-1
+                return grid
             modes = []
             for row in task.rows:
                 def prepare_modes():
@@ -435,6 +494,8 @@ class RegionalModel:
         initial = np.full(len(tasks), np.nan) if incumbents is None else np.asarray(incumbents, dtype=float)
         if initial.shape != (len(tasks),):
             raise ValueError("Refitting needs one incumbent per coordinate task")
+        if self.fit_multiplicity == "profile":
+            initial = np.full(len(tasks), np.nan)  # Completed branch search is start-independent.
         grids = [self._coordinate_grid(task) for task in tasks]
         integers = ([task.region for task in tasks],
                     np.r_[0, np.cumsum([len(task.rows) for task in tasks])],
@@ -466,7 +527,8 @@ class RegionalModel:
             if key in self._refits:
                 self.telemetry["refit_cache_hits"] += 1
                 results[index] = self._refits[key]
-                if np.isfinite(initial[index]) and task.lower <= initial[index] <= task.upper:
+                if (self.fit_multiplicity == "marginal" and np.isfinite(initial[index])
+                        and task.lower <= initial[index] <= task.upper):
                     if initial[index] == results[index][0]:
                         self.telemetry["incumbent_equal_base_reuses"] += 1
                     else:
@@ -489,7 +551,7 @@ class RegionalModel:
             for (_, task), value in zip(missing, fitted):
                 if value.status:
                     raise NativeExecutionError(
-                        f"Marginal-likelihood center refit failed: native status {value.status}; "
+                        f"{self.fit_multiplicity} center refit failed: native status {value.status}; "
                         f"region {self.region_ids[task.region]}, members {len(task.rows)}")
                 if (not np.isfinite([value.base_center, value.base_log_likelihood,
                                      value.center, value.log_likelihood]).all()
@@ -529,9 +591,19 @@ class RegionalModel:
         return centers
 
     def log_likelihood_columns(self, centers):
-        return self.joint_column_set(centers).materialize()
+        """Fitting emissions for legacy proposal callers; scoring uses typed columns."""
+        return self.fit_column_set(centers).materialize()
 
     def joint_column_set(self, centers, *, retained_columns=None):
+        return self.selection_column_set(centers, retained_columns=retained_columns)
+
+    def fit_column_set(self, centers, *, retained_columns=None):
+        return self._column_set(centers, self.fit_backend, retained_columns=retained_columns)
+
+    def selection_column_set(self, centers, *, retained_columns=None):
+        return self._column_set(centers, self.selection_backend, retained_columns=retained_columns)
+
+    def _column_set(self, centers, backend, *, retained_columns=None):
         """Log P(reads, valid assignment | cluster); forbidden pairs are -inf.
 
         No division by admissible prior mass: the fixed-center weight problem
@@ -554,53 +626,54 @@ class RegionalModel:
         # Python retains only call-owned CUDA handles.
         fresh = {}
         evaluated = set()
-        retained = {center.tobytes(): self._columns[self.identity, center.tobytes()]
-                    for center in centers if (self.identity, center.tobytes()) in self._columns}
+        retained = {center.tobytes(): self._columns[self.identity, backend.aggregation, center.tobytes()]
+                    for center in centers if (self.identity, backend.aggregation, center.tobytes()) in self._columns}
         if retained_columns is not None:
             if (retained_columns.model_identity != self.identity
-                    or retained_columns.numerical_identity != (self.backend.policy, self.backend.identity)):
+                    or retained_columns.aggregation != backend.aggregation
+                    or retained_columns.numerical_identity != (backend.policy, backend.identity)):
                 raise ValueError("Retained columns belong to another regional model")
-            if self.backend.kind == "cuda":
-                self.backend._column_handles(retained_columns.columns)
+            if backend.kind == "cuda":
+                backend._column_handles(retained_columns.columns)
             retained.update(zip(retained_columns.center_keys, retained_columns.columns))
         missing = {center.tobytes(): center for center in centers
                    if center.tobytes() not in retained}
         if missing:
             values = np.array(list(missing.values()))
-            if self.backend.kind == "cuda":
-                before = self.backend.scoring_diagnostics()
-                fresh = dict(zip(missing, self.backend.resident_joint_columns(values)))
-                after = self.backend.scoring_diagnostics()
+            if backend.kind == "cuda":
+                before = backend.scoring_diagnostics()
+                fresh = dict(zip(missing, backend.resident_joint_columns(values)))
+                after = backend.scoring_diagnostics()
                 evaluated_count = after["column_evaluations"] - before["column_evaluations"]
                 self.telemetry["column_device_cache_hits"] += after["column_cache_hits"] - before["column_cache_hits"]
             else:
-                matrix = self.backend.joint_columns(values)
+                matrix = backend.joint_columns(values)
                 fresh = dict(zip(missing, matrix.T))
                 evaluated_count = len(missing)
             self.telemetry["likelihood_columns"] += evaluated_count
         columns = []
         for center in centers:
-            key = (self.identity, center.tobytes())
+            key = (self.identity, backend.aggregation, center.tobytes())
             column = self._columns.get(key)
             if column is None:
-                column = retained.get(key[1])
+                column = retained.get(key[2])
             if column is not None:
                 self.telemetry["column_cache_hits"] += 1
-                counter = ("column_batch_reuses" if key[1] in evaluated else
-                           "column_device_retained_hits" if self.backend.kind == "cuda" else
+                counter = ("column_batch_reuses" if key[2] in evaluated else
+                           "column_device_retained_hits" if backend.kind == "cuda" else
                            "column_host_cache_hits")
                 self.telemetry[counter] += 1
             else:
-                column = (fresh[key[1]] if self.backend.kind == "cuda"
-                          else readonly_array(fresh[key[1]]))
-                if key[1] in evaluated:
+                column = (fresh[key[2]] if backend.kind == "cuda"
+                          else readonly_array(fresh[key[2]]))
+                if key[2] in evaluated:
                     self.telemetry["column_batch_reuses"] += 1
-                evaluated.add(key[1])
-                if self.backend.kind == "cpu":
+                evaluated.add(key[2])
+                if backend.kind == "cpu":
                     self._columns[key] = column
             columns.append(column)
         return JointColumnSet(tuple(columns), tuple(center.tobytes() for center in centers), self.identity,
-                              (self.backend.policy, self.backend.identity))
+                              (backend.policy, backend.identity), backend.aggregation)
 
     def _weight_result(self, columns, initial_counts, matrix=None, progress_callback=None):
         """Reuse an exact ordered problem, never a partition or device handle.
@@ -622,9 +695,9 @@ class RegionalModel:
         """Solve after the caller's ordinary cache miss, without a second touch."""
         if self.backend.kind == "cuda":
             from .resident_weights import fit_resident_weights
-            with self.backend.mixture_problem(columns.columns) as problem:
+            with self.selection_backend.mixture_problem(columns.columns) as problem:
                 self.telemetry["weight_solves"] += 1
-                outcome, = fit_resident_weights(self.backend, [problem], [counts], telemetry=self.telemetry)
+                outcome, = fit_resident_weights(self.selection_backend, [problem], [counts], telemetry=self.telemetry)
             completed_weight(progress_callback, len(counts), failed=outcome.operation == "error")
             if outcome.operation == "error":
                 raise outcome.error
@@ -638,8 +711,9 @@ class RegionalModel:
         return self._cache_weight_result(key, result)
 
     def _weight_key(self, columns, counts):
-        if (columns.model_identity != self.identity or columns.numerical_identity !=
-                (self.backend.policy, self.backend.identity)):
+        if (columns.aggregation != "marginal" or columns.model_identity != self.identity
+                or columns.numerical_identity !=
+                (self.selection_backend.policy, self.selection_backend.identity)):
             raise ValueError("Weight columns belong to another regional model or numerical backend")
         # This model-local cache uses one weight solver for its fixed backend.
         return (columns.model_identity, self.backend.kind, columns.numerical_identity,
@@ -662,7 +736,7 @@ class RegionalModel:
         results, first = [], 0
         while first < len(problems):
             last = min(len(problems), first+max_active)
-            outcomes = fit_resident_weights(self.backend, problems[first:last], counts[first:last],
+            outcomes = fit_resident_weights(self.selection_backend, problems[first:last], counts[first:last],
                                             telemetry=telemetry)
             results.extend(outcomes)
             if progress_callback is not None:
@@ -705,7 +779,7 @@ class RegionalModel:
         if partition.model_identity != self.identity:
             raise ValueError("Prepared partition belongs to another regional model")
         return self._refit_groups(partition.labels, partition.groups, initial_centers,
-                                  partition.coordinate_fits, partition.columns, partition.membership,
+                                  partition.coordinate_fits, partition.selection_columns, partition.membership,
                                   progress_callback=progress_callback)
 
     def refit_prepared_batch(self, requests, *, max_active=8,
@@ -776,7 +850,7 @@ class RegionalModel:
                 if len(pending) >= max_active:
                     flush()
                 steps = self._refit_steps(partition.labels, partition.groups, centers,
-                    partition.coordinate_fits, partition.columns, partition.membership,
+                    partition.coordinate_fits, partition.selection_columns, partition.membership,
                     progress_callback=callback, record_weight_time=False)
                 open_steps.append(steps)
                 try:
@@ -798,7 +872,7 @@ class RegionalModel:
                     publish(index, fitted)
                     request = columns = counts = matrix = notify = None
                     continue
-                problem = leases.enter_context(self.backend.mixture_problem(columns.columns))
+                problem = leases.enter_context(self.selection_backend.mixture_problem(columns.columns))
                 self.telemetry["weight_solves"] += 1
                 pending.append({"index": index, "steps": steps, "request": request,
                                 "key": key, "problem": problem})
@@ -876,8 +950,12 @@ class RegionalModel:
         except ScientificCandidateRejection as error:
             return FitResult(membership, centers, np.full(q, np.nan), -np.inf,
                                      -np.inf, penalty, np.inf, False, str(error),
-                                     diagnostics={"rejection_kind": "scientific"})
-        columns = self.joint_column_set(centers, retained_columns=prior_columns)
+                                     diagnostics={"rejection_kind": "scientific"},
+                                     fitting_log_likelihood=-np.inf,
+                                     fit_objective_id=self.method_identity["fit_objective_id"])
+        centers = readonly_array(centers)
+        fitting_ll = math.fsum(value for _, value in fitted)
+        columns = self.selection_column_set(centers, retained_columns=prior_columns)
         matrix = columns.materialize() if self.backend.kind == "cpu" else None
         conditional = math.fsum(matrix[np.arange(self.n), inverse] if matrix is not None
                                 else columns.assigned_values(inverse))
@@ -889,7 +967,9 @@ class RegionalModel:
                 raise
             return FitResult(membership, centers, np.full(q, np.nan), conditional,
                                      -np.inf, penalty, np.inf, False, f"weight_fit:{error}",
-                                     diagnostics={"rejection_kind": "weight_convergence"})
+                                     diagnostics={"rejection_kind": "weight_convergence"},
+                                     fitting_log_likelihood=fitting_ll,
+                                     fit_objective_id=self.method_identity["fit_objective_id"])
         finally:
             if record_weight_time:
                 self.telemetry["weight_seconds"] += time.perf_counter()-start
@@ -901,7 +981,27 @@ class RegionalModel:
                                      "weight_optimality_gap": mixture["weight_optimality_gap"],
                                      "weight_active_score_gap": mixture["weight_active_score_gap"],
                                      "retained_initial_centers": retained_initial,
-                                     "scalar_global_optimality_certified": False,
+                                     "scalar_global_optimality_certified": self.fit_multiplicity == "profile",
+                                     **dict(self.method_identity),
                                      "num_parameters": q*self.r+q-1,
                                      "score_definition": SCORE_DEFINITION},
-                                 coordinate_fits=np.column_stack((fitted, retained_flags)).reshape(q, self.r, 3))
+                                 coordinate_fits=np.column_stack((fitted, retained_flags)).reshape(q, self.r, 3),
+                                 fitting_log_likelihood=fitting_ll,
+                                 fit_objective_id=self.method_identity["fit_objective_id"],
+                                 selection_criterion_id=self.method_identity["selection_criterion_id"])
+
+    def score_frozen_centers(self, centers, labels, selection_columns=None):
+        """Score supplied centers without calling any center optimizer."""
+        centers = readonly_array(self._validate_centers(centers))
+        labels = np.asarray(labels)
+        if (labels.shape != (self.n,) or labels.dtype.kind not in "iu"
+                or not np.array_equal(np.unique(labels), np.arange(len(centers)))):
+            raise ValueError("Frozen-center labels must occupy every supplied center")
+        columns = self.selection_column_set(centers, retained_columns=selection_columns)
+        conditional = math.fsum(columns.assigned_values(labels))
+        mixture = self._weight_result(columns, np.bincount(labels))
+        penalty = float((len(centers)*self.r+len(centers)-1)*math.log(self.n))
+        return {"centers": centers, "conditional_log_likelihood": conditional,
+                "mixture_log_likelihood": mixture["log_likelihood"],
+                "weights": mixture["cluster_weights"], "complexity_penalty": penalty,
+                "score": -2*mixture["log_likelihood"]+penalty}

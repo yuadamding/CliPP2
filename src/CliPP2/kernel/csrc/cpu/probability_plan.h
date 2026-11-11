@@ -136,6 +136,11 @@ public:
             else if (!finite_number(maximum))
                 workspace.terms[index] = {positive_infinity, 0, 1, EmitStatus::NumericalFailure};
             else {
+                if (model_.aggregation == LikelihoodAggregation::IntegerProfile) {
+                    workspace.terms[index] = {-(maximum + ::log(static_cast<double>(o.support))),
+                                               0, 0, EmitStatus::Ok};
+                    continue;
+                }
                 double total = 0;
                 for (std::int64_t m = 0; m < o.support; ++m) total += ::exp(mass(m) - maximum);
                 workspace.terms[index] = {-(maximum + ::log(total)), 0, 0, EmitStatus::Ok};

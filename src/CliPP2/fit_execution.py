@@ -48,7 +48,8 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
         progress.start_phase('input')
     check_destination(outdir, data.tumor_id)
     model = RegionalModel(data, device=config.device, cpu_threads=config.cpu_threads,
-                          multiplicity_support=multiplicity_support)
+                          multiplicity_support=multiplicity_support,
+                          fit_multiplicity=config.fit_multiplicity, selection_criterion=config.selection_criterion)
     input_seconds = perf_counter()-started
     try:
         build = None if run_manifest is None else run_manifest.get('build')
@@ -80,6 +81,8 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
             'num_mutations': model.n, 'num_regions': model.r,
             'num_clusters': len(result.centers), 'region_ids': model.region_ids,
             'fit_config': asdict(config), 'model_identity': model.identity,
+            'method_identity': dict(model.method_identity),
+            'fitting_log_likelihood': result.selected.fit.fitting_log_likelihood,
             'multiplicity_support': None if multiplicity_support is None else {
                 'policy_id': multiplicity_support.policy_id, 'content_hash': multiplicity_support.content_hash},
             'score': result.score, 'score_definition': SCORE_DEFINITION,
@@ -98,10 +101,10 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
             'elapsed_seconds': perf_counter()-started, 'publication': publication,
             'qualification_scope': 'numerical_fit_not_global_optimality_or_biological_accuracy',
         }
-        receipt = dict(schema='clipp2.fit-producer.v2', run_manifest=run_manifest, **{key: summary[key] for key in (
+        receipt = dict(schema='clipp2.fit-producer.v3', run_manifest=run_manifest, **{key: summary[key] for key in (
             'tumor_id', 'protocol_version', 'implementation_version', 'provenance_policy',
             'run_manifest_id', 'normal_cn_policy', 'biological_identity', 'algorithm', 'model_version', 'kernel_version', 'fit_config', 'model_identity',
-            'multiplicity_support', 'execution', 'publication', 'qualification_scope')})
+            'multiplicity_support', 'method_identity', 'fitting_log_likelihood', 'execution', 'publication', 'qualification_scope')})
         fit = result.selected.fit
         order, labels = public_label_order(fit)
         support = MultiplicityBounds(model.mutation_ids, model.region_ids,
@@ -111,4 +114,4 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
             readonly_array(labels), readonly_array(model.multiplicity(fit.centers[fit.labels])),
             support, summary, receipt)
     finally:
-        model.backend.close()
+        model.close()

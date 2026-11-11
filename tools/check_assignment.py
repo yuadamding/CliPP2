@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused Protocol 2.3 assignment contracts against the imported installation."""
+"""Focused Protocol 2.4 assignment contracts against the imported installation."""
 from __future__ import annotations
 
 import copy
@@ -228,6 +228,8 @@ def _fixed_reference_baseline(root):
         assert one["map_label"] == two["map_label"]
     previous23 = request.to_dict()
     previous23["schema"] = "clipp2.assignment.bundle.v4"
+    previous23["protocol_version"] = "2.3"
+    previous23.pop("assignment_method")
     old23 = AssignmentBundle.from_dict(previous23)
     new23 = derive_current_bundle(old23)
     assert old23.to_dict() == previous23 and old23.content_hash != new23.content_hash
@@ -323,7 +325,9 @@ def run_checks(directory):
     from CliPP2.io.data import content_hash
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
-    assert PROTOCOL_VERSION == "2.3"
+    assert PROTOCOL_VERSION == "2.4"
+    from check_assignment_methods import run_checks as check_methods
+    methods = check_methods(root / "methods")
     measurement_roundoff = _reference_measurement_roundoff_checks()
     numerical = _numerical_screen_checks(root)
     loss_only = _loss_only_checks(root)
@@ -517,6 +521,7 @@ def run_checks(directory):
         assert not clone.assignments[0]["probabilities"].flags.writeable
     historical_result = result.to_dict()
     historical_result["schema"] = historical_result["summary"]["schema"] = "clipp2.assignment.result.v5"
+    historical_result["protocol_version"] = "2.3"
     for row in historical_result["assignments"]:
         for field in ("map_label", "map_set", "posterior_defined"):
             row.pop(field)
@@ -543,7 +548,7 @@ def run_checks(directory):
         source_stages=(), source_labels=(), baseline_labels=())
     empty_result = assign_mutations(empty, outdir=root / "empty_targets")
     assert sum(empty_result.summary["assigned_occupancy"].values()) == 0
-    return dict(protocol_version=PROTOCOL_VERSION, fixed_reference_baseline=baseline,
+    return dict(protocol_version=PROTOCOL_VERSION, assignment_methods=methods, fixed_reference_baseline=baseline,
         low_confidence_map=True, exact_and_near_ties=True, finite_competitor_underflow=True,
         diagnostic_measurements_do_not_veto=True, prior_only_distinct_from_incompatible_and_excluded=True,
         conditional_map_without_concentration_gate=True, diagnostic_failure_preserves_scoring=True,

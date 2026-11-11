@@ -162,7 +162,7 @@ class PreparedPartition:
     labels: np.ndarray
     groups: tuple
     coordinate_fits: tuple = ()
-    columns: object = None
+    selection_columns: object = None
 
     def __post_init__(self):
         object.__setattr__(self, "labels", readonly_array(self.labels, dtype=np.int64))

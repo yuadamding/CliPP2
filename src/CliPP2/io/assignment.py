@@ -12,7 +12,8 @@ import pandas as pd
 from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 
 from ..assignment import (AssignmentBundle, AssignmentResult, POLICY_FIELDS,
-                          REGIONAL_BASE_FIELDS, REGIONAL_POLICY_FIELDS, REASSESSMENT_OUTCOMES, EVIDENCE_STATUSES)
+                          REGIONAL_BASE_FIELDS, REGIONAL_POLICY_FIELDS, REASSESSMENT_OUTCOMES, EVIDENCE_STATUSES,
+                          ASSIGNMENT_POLICIES)
 from .data import json_value as _json_value, content_hash
 from .reporting import MANIFEST_SCHEMA
 from .publication import publish_json
@@ -183,8 +184,8 @@ def _conditional_evidence(catalog, source, region, phi, low, high, call, native_
     return candidates, probabilities, log_probability, ties, gap, native_lp, deviance
 
 
-def _independent_scores(catalog, source, reference, informative):
-    """Verify absolute marginal masses and both uniform priors from original CN."""
+def _independent_scores(catalog, source, reference, informative, *, assignment_method="marginal"):
+    """Verify original-CN marginal scores (with priors), or unnormalized profile scores."""
     result = np.full(len(reference.labels), -np.inf)
     if not catalog.eligible[source].any():
         return result
@@ -201,20 +202,21 @@ def _independent_scores(catalog, source, reference, informative):
         alt, depth = catalog.alt_counts[source, region], catalog.total_counts[source, region]
         logs = (gammaln(depth+1)-gammaln(alt+1)-gammaln(depth-alt+1)
                 + xlogy(alt, probabilities) + xlog1py(depth-alt, -probabilities))
-        result += logsumexp(logs, axis=1)-np.log(width)
+        result += np.max(logs, axis=1) if assignment_method == "profile" else logsumexp(logs, axis=1)-np.log(width)
     return result
 
 
 def validate_assignment_result(bundle, result):
-    """Independently verify marginal scores, exact MAP, diagnostics and populations."""
-    from ..assignment import score_summary, assignment_decision, assignment_outcome, target_reason
+    """Independently verify method-bound scores, exact maxima and selected multiplicities."""
+    from ..assignment import assignment_score_summary, assignment_decision, assignment_outcome, target_reason
 
     if type(bundle) is not AssignmentBundle or type(result) is not AssignmentResult:
         raise ValueError("Assignment output requires validated request/result records")
     bundle.validated_payload()
     if (result.bundle_hash != bundle.content_hash or result.target_ids != bundle.target_ids
             or result.reference.to_dict() != bundle.reference.to_dict()
-            or result.summary.get("bundle_hash") != bundle.content_hash):
+            or result.summary.get("bundle_hash") != bundle.content_hash
+            or result.assignment_method != bundle.assignment_method):
         raise ValueError("Assignment output must match its live frozen request")
     catalog, labels = bundle.catalog, bundle.reference.labels
     index = {mutation: i for i, mutation in enumerate(catalog.mutation_ids)}
@@ -228,7 +230,7 @@ def validate_assignment_result(bundle, result):
                 "fit_status", "mean_gate_pass", "outlier_gate_pass", "cluster_tie"}
     for i, (mutation, record) in enumerate(zip(bundle.target_ids, result.assignments)):
         if obsolete & set(record):
-            raise ValueError("Protocol 2.3 assignment records cannot carry statistical acceptance fields")
+            raise ValueError("Protocol 2.4 assignment records cannot carry statistical acceptance fields")
         original = index[mutation]
         informative = catalog.eligible[original] & catalog.count_observed[original] & (catalog.total_counts[original] > 0)
         count = int(informative.sum())
@@ -241,16 +243,18 @@ def validate_assignment_result(bundle, result):
             value = record.get(name)
             if value is not None and (isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))):
                 raise ValueError("Published assignment labels must be integers or missing")
-        _require_fields(record, {"log_scores": _independent_scores(catalog, original, bundle.reference, informative)},
+        _require_fields(record, {"log_scores": _independent_scores(catalog, original, bundle.reference, informative,
+            assignment_method=bundle.assignment_method)},
             "Independent assignment emissions", atol=max(1e-12, 32*np.finfo(float).eps*catalog.total_counts[original, informative].sum()))
-        expected = score_summary(scores, labels)
+        expected = assignment_score_summary(scores, labels, bundle.assignment_method, bundle.baseline_labels[i])
         _require_integer_sequence(record.get("map_set", ()), expected["map_set"], "Authoritative exact MAP set")
         _require_integer_sequence(record.get("map_tied_labels", ()), expected["map_tied_labels"], "Exact MAP tie set")
         _require_fields(record, {key: value for key, value in expected.items()
                                 if key not in ("best_index", "second_index")}, "Assignment probabilities and exact MAP")
         status = assignment_decision(expected, bool(catalog.eligible[original].any()), count)
-        final = expected["map_label"] if status == "observed" else None
-        _require_fields(record, dict(mutation_id=mutation, status=status, evidence_status=status,
+        selected = expected["best_index"]
+        final = labels[selected] if status == "observed" else None
+        _require_fields(record, dict(mutation_id=mutation, assignment_method=bundle.assignment_method, status=status, evidence_status=status,
             informative_regions=count, baseline_label=bundle.baseline_labels[i],
             baseline_reference_label=bundle.baseline_labels[i], final_assignment_label=final,
             source_stage=bundle.source_stages[i], source_label=bundle.source_labels[i],
@@ -258,11 +262,12 @@ def validate_assignment_result(bundle, result):
             **assignment_outcome(bundle.source_stages[i], bundle.baseline_labels[i], final,
                                  bundle.reference.clonal_label)), "Assignment evidence state")
         residuals, errors = [], []
+        selected_joint_score = -np.log(len(labels))
         for j, region in enumerate(bundle.reference.region_ids):
             row = regional[mutation, region]
             low, high = int(bundle.bounds.lower[i, j]), int(bundle.bounds.upper[i, j])
-            present = bool(informative[j] and expected["best_index"] is not None)
-            phi = float(bundle.reference.centers[expected["best_index"], j]) if present else np.nan
+            present = bool(informative[j] and selected is not None)
+            phi = float(bundle.reference.centers[selected, j]) if present else np.nan
             error = row.get("diagnostic_error")
             failed = row.get("diagnostic_status") == "failed"
             if failed:
@@ -271,9 +276,10 @@ def validate_assignment_result(bundle, result):
                 errors.append(f"{region}: {error}")
             elif error is not None:
                 raise ValueError("Available/missing diagnostics cannot carry an unexplained error")
-            pair_defined = present and (not failed or bool(row["conditional_distribution_defined"]))
+            pair_defined = present and (bundle.assignment_method == "profile"
+                                       or not failed or bool(row["conditional_distribution_defined"]))
             singleton = low == high
-            actual = dict(original_lower=low, original_upper=high,
+            actual = dict(assignment_method=bundle.assignment_method, original_lower=low, original_upper=high,
                 original_major_cn=catalog.major_cn[original, j], original_minor_cn=catalog.minor_cn[original, j],
                 original_normal_cn=catalog.normal_cn[original, j],
                 original_total_cn=catalog.major_cn[original, j] + catalog.minor_cn[original, j],
@@ -288,8 +294,8 @@ def validate_assignment_result(bundle, result):
                 native_lower=bundle.native_lower[i, j], native_upper=bundle.native_upper[i, j],
                 source_stage=bundle.source_stages[i], source_label=bundle.source_labels[i],
                 best_label=record["best_label"], membership_status=status, phi=phi,
-                center_source=(bundle.reference.center_sources[expected["best_index"]]
-                               if expected["best_index"] is not None else None),
+                center_source=(bundle.reference.center_sources[selected]
+                               if selected is not None else None),
                 diagnostic_status="failed" if failed else "available" if present else "not_applicable",
                 conditional_distribution_defined=pair_defined, structural_singleton=singleton,
                 multiplicity_read_informative=bool(pair_defined and phi > 0))
@@ -301,6 +307,13 @@ def validate_assignment_result(bundle, result):
             if pair_defined:
                 candidates, conditional, log_probability, ties, gap, native_lp, deviance = _conditional_evidence(
                     catalog, original, j, phi, low, high, row["conditional_map"], bundle.native_calls[i, j])
+                if bundle.assignment_method == "profile":
+                    purity = catalog.purity[original, j]
+                    denominator = ((1-purity)*catalog.normal_cn[original, j]
+                        + purity*(catalog.major_cn[original, j]+catalog.minor_cn[original, j]))
+                    p = min((purity/denominator*row["conditional_map"])*phi, 1.)
+                    a, n = catalog.alt_counts[original, j], catalog.total_counts[original, j]
+                    selected_joint_score += gammaln(n+1)-gammaln(a+1)-gammaln(n-a+1)+xlogy(a,p)+xlog1py(n-a,-p)
                 _require_integer_sequence(row["multiplicity_candidates"], candidates, "Conditional candidates")
                 _require_integer_sequence(row["map_tied_multiplicities"], ties, "Exact multiplicity tie set")
                 _require_fields(row, dict(top_two_gap=gap, native_call_log_probability=native_lp), "Independent conditional evidence",
@@ -329,14 +342,21 @@ def validate_assignment_result(bundle, result):
                     multiplicity_status=expected_status, native_call_log_probability=np.nan,
                     profile_deviance=np.nan if failed or not present else np.inf), "Undefined multiplicity")
             residuals.append(float(row["profile_deviance"]))
-        diagnostic_mask = informative & (expected["best_index"] is not None)
+        if bundle.assignment_method == "profile" and selected is not None:
+            _require_fields({"winning_score": scores[selected]}, {"winning_score": selected_joint_score},
+                "Selected multiplicities must reproduce the winning profile score",
+                atol=max(1e-12, 32*np.finfo(float).eps*catalog.total_counts[original, informative].sum()))
+        diagnostic_mask = informative & (selected is not None)
         measured = (summarize_profile_deviance(residuals, diagnostic_mask, axis=0) if not errors else
                     dict(mean_profile_deviance=np.nan, maximum_profile_deviance=np.nan))
         _require_fields(record, dict(mean_profile_deviance=measured["mean_profile_deviance"],
             maximum_profile_deviance=measured["maximum_profile_deviance"],
             diagnostic_status="failed" if errors else "available" if diagnostic_mask.any() else "not_applicable",
             diagnostic_error="; ".join(errors) if errors else None), "Diagnostic summary", atol=0.)
-    _require_fields(result.summary, dict(schema="clipp2.assignment.result.v6", protocol_version=PROTOCOL_VERSION,
+    _require_fields(result.summary, dict(schema=result.schema, protocol_version=PROTOCOL_VERSION,
+        assignment_method=bundle.assignment_method, tie_policy=ASSIGNMENT_POLICIES[bundle.assignment_method],
+        interpretation=("marginal_cluster_MAP" if bundle.assignment_method == "marginal"
+            else "profile_joint_cluster_multiplicity_MAP_no_cluster_posterior"),
         target_count=len(bundle.target_ids), unchanged_non_target_count=len(bundle.non_target_ids),
         region_count=len(bundle.reference.region_ids), candidate_count=len(labels), support_policy="original_full_1_to_major_cn",
         bounds_hash=bundle.bounds.content_hash, tumor_id=catalog.tumor_id,
@@ -344,7 +364,7 @@ def validate_assignment_result(bundle, result):
         normal_cn_policy=bundle.normal_cn_policy, run_manifest_id=result.run_manifest_id,
         bundle_run_manifest_id=bundle.run_manifest_id, reference=bundle.reference.to_dict()), "Assignment summary")
     _require_fields(result.summary.get("evaluation_receipt", {}), dict(device=bundle.device,
-        cpu_threads=bundle.cpu_threads, assignment_policy="observed_exact_map_lowest_public_label",
+        cpu_threads=bundle.cpu_threads, assignment_policy=ASSIGNMENT_POLICIES[bundle.assignment_method],
         run_manifest_id=result.run_manifest_id, bundle_run_manifest_id=bundle.run_manifest_id), "Evaluation receipt")
     aggregates = dict(assigned_occupancy={str(label): sum(row["final_assignment_label"] == label for row in result.assignments)
                                          for label in labels},
@@ -413,18 +433,20 @@ def publish_assignment(bundle, result, outdir, *, workflow_accounting=None):
     accounting = (None if workflow_accounting is None else
                   _validated_workflow_accounting(bundle, result, workflow_accounting))
     rows = []
+    policy_fields = POLICY_FIELDS
     for i, record in enumerate(result.assignments):
         row = dict(tumor_id=bundle.catalog.tumor_id, mutation_id=bundle.target_ids[i],
             source_stage=bundle.source_stages[i], source_label=bundle.source_labels[i],
             native_phi=json.dumps(_json_value(bundle.native_centers[i])),
             native_calls=json.dumps(_json_value(bundle.native_calls[i])))
-        row.update({key: record[key] for key in POLICY_FIELDS})
+        row.update({key: record[key] for key in policy_fields})
         for j, label in enumerate(bundle.reference.labels):
-            row["probability_" + str(label)] = float(record["probabilities"][j])
+            row["probability_" + str(label)] = (np.nan if record["probabilities"] is None
+                                                else float(record["probabilities"][j]))
             row["log_score_" + str(label)] = float(record["log_scores"][j])
         rows.append(row)
     multiplicities = [dict(tumor_id=bundle.catalog.tumor_id, **row) for row in result.multiplicities]
-    target_columns = ["tumor_id", "mutation_id", "source_stage", "source_label", "native_phi", "native_calls", *POLICY_FIELDS]
+    target_columns = ["tumor_id", "mutation_id", "source_stage", "source_label", "native_phi", "native_calls", *policy_fields]
     for label in bundle.reference.labels:
         target_columns += ["probability_" + str(label), "log_score_" + str(label)]
     regional_columns = ["tumor_id", *REGIONAL_BASE_FIELDS, *REGIONAL_POLICY_FIELDS]
@@ -432,6 +454,8 @@ def publish_assignment(bundle, result, outdir, *, workflow_accounting=None):
     prefix = bundle.catalog.tumor_id + "_"
     paths = [write_supporting_table(output / (prefix + "mutation_assignments.tsv"), rows, columns=target_columns),
              write_supporting_table(output / (prefix + "assignment_multiplicity.tsv"), multiplicities, columns=regional_columns)]
+    if isinstance(bundle.provenance, Mapping) and "assignment_derivation" in bundle.provenance:
+        paths.append(save_assignment_bundle(bundle, output / "assignment_bundle.json"))
     summary = dict(result.summary, manifest_schema=MANIFEST_SCHEMA, files=[path.name for path in paths])
     if accounting is not None:
         summary.update(population_scope="workflow_combined", workflow_accounting=accounting)
