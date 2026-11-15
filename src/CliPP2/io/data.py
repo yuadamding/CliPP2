@@ -316,7 +316,6 @@ class OriginalCatalog(ImmutableArrayRecord):
     metadata: tuple
     max_major_cn: int | None = None
     input_excluded: np.ndarray | None = None
-    _schema_version: int = field(default=5, kw_only=True, repr=False)
     missing_counts: str = "unobserved"
     read_count_imputations: tuple = ()
     _content_hash: str = field(init=False, repr=False, compare=False)
@@ -366,14 +365,7 @@ class OriginalCatalog(ImmutableArrayRecord):
         if source_keys != {(mutation, region) for mutation in self.mutation_ids for region in self.region_ids}:
             raise ValueError("Catalog source rows do not cover exactly the original keys")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
-        if (type(self._schema_version) is not int or self._schema_version not in (4, 5, 6)
-                or (self._schema_version == 4 and self.max_major_cn is None)):
-            raise ValueError("Catalog v4 requires its original explicit CN cutoff; current catalogs use v6")
         object.__setattr__(self, "read_count_imputations", _tuples(self.read_count_imputations))
-        if self._schema_version < 6:
-            if self.read_count_imputations:
-                raise ValueError("Historical catalog schemas cannot encode imputed reads")
-            object.__setattr__(self, "missing_counts", "unobserved")
         if not np.isfinite(self.purity).all() or np.any(self.purity <= 0) or np.any(self.purity > 1):
             raise ValueError("Catalog purity must lie in (0,1]")
         if len(self.mutation_ids) and not np.all(self.purity == self.purity[:1]):
@@ -410,8 +402,9 @@ class OriginalCatalog(ImmutableArrayRecord):
                     raise ValueError(f"Catalog {name} flags disagree with original provenance")
             pair = row["allele_a_cn"], row["allele_b_cn"]
             segment = (j, row["segment_id"])
-            if segments.setdefault(segment, pair) != pair:
-                raise ValueError("Catalog region-segment CN pairs must agree across mutations")
+            specification = pair, row["segment_cn_states"]
+            if segments.setdefault(segment, specification) != specification:
+                raise ValueError("Catalog region-segment CN pairs and state specifications must agree across mutations")
             if (pair != (self.major_cn[i, j], self.minor_cn[i, j])
                     or row["normal_cn"] != self.normal_cn[i, j]
                     or abs(row["purity"] - self.purity[i, j]) > PURITY_SOURCE_CANONICAL_ATOL
@@ -424,13 +417,10 @@ class OriginalCatalog(ImmutableArrayRecord):
             ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).hexdigest())
 
     def _payload(self):
-        payload = {"schema": f"clipp2.original-catalog.v{self._schema_version}", "tumor_id": self.tumor_id,
+        payload = {"schema": "clipp2.original-catalog.v6", "tumor_id": self.tumor_id,
                    "mutation_ids": list(self.mutation_ids), "region_ids": list(self.region_ids),
-                   "max_major_cn": self.max_major_cn}
-        if self._schema_version >= 5:
-            payload["eligibility_policy"] = self.eligibility_policy
-        if self._schema_version >= 6:
-            payload.update(missing_counts=self.missing_counts, read_count_imputations=self.read_count_imputations)
+                   "max_major_cn": self.max_major_cn, "eligibility_policy": self.eligibility_policy,
+                   "missing_counts": self.missing_counts, "read_count_imputations": self.read_count_imputations}
         payload.update((name, getattr(self, name).tolist()) for name in _CATALOG_ARRAYS)
         # Omit the redundant all-false mask from the canonical payload.
         if not self.input_excluded.any():
@@ -473,35 +463,30 @@ class OriginalCatalog(ImmutableArrayRecord):
         return dict(self._payload(), content_hash=self.content_hash)
 
     def compatible_source_identities(self, original_max_major_cn):
-        """Recognize equivalent catalog encodings without expanding a saved fit.
+        """Recognize equivalent CN cutoff policies without expanding a saved fit.
 
         The original cutoff must select exactly the current pair population.
-        Only schema and policy spelling may differ; all source observations,
-        biological arrays, exclusions and provenance remain authoritative.
+        Source observations, biological arrays and provenance must match.
         """
         cutoff = validate_max_major_cn(original_max_major_cn)
         old_mask = np.ones(self.major_cn.shape, dtype=bool) if cutoff is None else self.major_cn <= cutoff
         if not np.array_equal(self.eligible, old_mask & ~self.input_excluded):
             raise ValueError("Replay CN population differs from the original fitting population")
-        versions = (6,) if self.read_count_imputations else ((5, 6) if cutoff is None else (4, 5, 6))
-        return frozenset([content_hash(self.to_dict()), *(
-            content_hash(replace(self, max_major_cn=cutoff, _schema_version=version).to_dict())
-            for version in versions)])
+        return frozenset((content_hash(self.to_dict()),
+                          content_hash(replace(self, max_major_cn=cutoff).to_dict())))
 
     @classmethod
     def from_dict(cls, payload):
-        schemas = {f"clipp2.original-catalog.v{version}": version for version in (4, 5, 6)}
-        version = schemas.get(payload.get("schema"))
-        if version is None:
-            raise ValueError("Expected single-state original-catalog.v4, v5 or v6; earlier schemas require a versioned historical reader")
-        if version == 6 and not {"missing_counts", "read_count_imputations"} <= payload.keys():
+        if payload.get("schema") != "clipp2.original-catalog.v6":
+            raise ValueError("Expected original-catalog.v6")
+        if not {"missing_counts", "read_count_imputations"} <= payload.keys():
             raise ValueError("Catalog v6 requires its explicit read-count policy and imputation ledger")
         values = {item.name: payload[item.name] for item in fields(cls)
                   if item.init and item.name in payload and not item.name.startswith("_")}
         if "max_major_cn" not in values:
             raise ValueError("Original catalogs must record their CN population policy explicitly")
-        value = cls(**values, _schema_version=version)
-        if version >= 5 and payload.get("eligibility_policy") != value.eligibility_policy:
+        value = cls(**values)
+        if payload.get("eligibility_policy") != value.eligibility_policy:
             raise ValueError("Original-catalog CN population policy mismatch")
         if payload.get("content_hash") != value.content_hash:
             raise ValueError("Original-catalog content hash mismatch")

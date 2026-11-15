@@ -10,7 +10,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .evaluation import FAMILIES, TRANSITIONS, DETAILED_STATES, metric_truth_independent
+from .evaluation import FAMILIES, DETAILED_STATES, metric_truth_independent
 
 
 def _unavailable(ax, message="Unavailable for the executed study cells"):
@@ -27,7 +27,7 @@ def _values(evaluations, name, arm, *, view="", stratum="all"):
         if matches and isinstance(matches[0]["value"], (int, float)):
             independent = metric_truth_independent(evaluation, matches[0])
             if matches[0].get("status") == "known_no_decisions" and not independent:
-                continue  # A historical zero tag does not establish endpoint-wide emptiness.
+                continue  # A zero tag alone does not establish endpoint-wide emptiness.
             qualified = (evaluation.get("truth_qualification") == "verified_history_binding"
                          or independent)
             if qualified:
@@ -108,12 +108,9 @@ def _heatmaps(evaluations, output, paths):
 
 
 def _paired(evaluations, aggregate_report, output, paths):
-    correctness = ("binary_map_correct_per_original_evaluable" if
-        aggregate_report.get("evaluation_definition", {}).get("schema", "").endswith((".v4", ".v5", ".v6")) else "correct_per_original_evaluable")
-    all_targets = aggregate_report.get("evaluation_definition", {}).get("schema", "").endswith((".v5", ".v6"))
+    correctness = "binary_map_correct_per_original_evaluable"
     settings = (("ari", "common_native_remainder", "B", "C", "Native partition ARI"),
-                ("reference_consolidation_count" if all_targets else "false_merge_fraction", "", "B", "C",
-                 "Exact duplicate reference consolidation" if all_targets else "False clonal merges"),
+                ("reference_consolidation_count", "", "B", "C", "Exact duplicate reference consolidation"),
                 ("ccf_rmse", "constructed_reference", "B", "C", "Constructed-reference CCF RMSE"),
                 (correctness, "", "B", "B3", "Uncapped reassessment"),
                 (correctness, "", "C", "C3", "Capped reassessment"),
@@ -135,101 +132,18 @@ def _paired(evaluations, aggregate_report, output, paths):
         if summaries and isinstance(summaries[0]["equal_family_mean"], (float, int)):
             row = summaries[0]
             interval = f" [{row['lower_95']:.3g}, {row['upper_95']:.3g}]" if row['lower_95'] is not None else ""
-            ax.text(.02, .02, f"{row.get('population_scope', 'legacy')} Δ {row['equal_family_mean']:.3g}{interval}", transform=ax.transAxes, fontsize=8)
+            ax.text(.02, .02, f"{row['population_scope']} Δ {row['equal_family_mean']:.3g}{interval}", transform=ax.transAxes, fontsize=8)
     figure.suptitle("3 · Paired cells: fitting, merging, and reassessment", y=1.01)
     _save(figure, output, "03_paired_effects", paths)
 
 
-def _decisions(evaluations, aggregate_report, output, paths):
-    if aggregate_report.get("evaluation_definition", {}).get("schema", "").endswith((".v4", ".v5", ".v6")):
-        return _map_decisions(evaluations, output, paths)
-    figure, grid = plt.subplots(2, 3, figsize=(16, 9))
-    axes = grid.ravel()
-    for arm, color in (("B3", "#1565a8"), ("C3", "#ca6b26")):
-        coverage = {(e["family"], e["history_id"], e["acquisition_id"]): value for e, value in _values(evaluations, "acceptance_coverage", arm)}
-        error = {(e["family"], e["history_id"], e["acquisition_id"]): value for e, value in _values(evaluations, "selective_error", arm)}
-        keys = coverage.keys() & error.keys()
-        if keys:
-            axes[0].scatter([coverage[key] for key in keys], [error[key] for key in keys], label=arm, color=color, alpha=.6, s=18)
-        for evaluation in evaluations:
-            curve = [row for row in evaluation.get("error_coverage_curves", ())
-                     if evaluation.get("truth_qualification") == "verified_history_binding" and row["arm"] == arm
-                     and row["acceptance_coverage"] is not None and row["selective_error"] is not None]
-            if curve:
-                axes[0].plot([row["acceptance_coverage"] for row in curve], [row["selective_error"] for row in curve],
-                             color=color, alpha=.2, lw=.8)
-        offset = -.18 if arm == "B3" else .18
-        for index, name in enumerate(TRANSITIONS):
-            values = [value for _, value in _values(evaluations, "transition_fraction", arm, stratum=name)]
-            if values:
-                axes[1].scatter(index+offset+np.linspace(-.08, .08, len(values)), values, color=color, alpha=.4,
-                                s=10, label=arm if index == 0 else None)
-            summaries = [row for row in aggregate_report.get("metrics", ()) if row["name"] == "transition_fraction"
-                         and row["arm"] == arm and row["stratum"] == name]
-            if summaries and isinstance(summaries[0]["equal_family_mean"], (float, int)):
-                axes[1].scatter(index+offset, summaries[0]["equal_family_mean"], color=color, marker="D", s=45)
-    if not axes[0].collections:
-        _unavailable(axes[0])
-    else:
-        axes[0].legend()
-    axes[0].set(xlabel="Accepted / evaluable targets", ylabel="Binary wrong / accepted targets",
-                title="Binary clonality: executed decisions and threshold curves", xlim=(-.02, 1.02), ylim=(-.02, 1.02))
-    axes[1].set(xticks=np.arange(6), xticklabels=[name.replace("_", "\n") for name in TRANSITIONS],
-                ylabel="Fraction of evaluable targets", title="Binary clonality: combined-baseline transitions")
-    if axes[1].collections:
-        axes[1].legend()
-    else:
-        _unavailable(axes[1])
-    definitions = ((axes[2], "", "Detailed membership: targets"),
-                   (axes[3], "unchanged_F", "Detailed membership: unchanged F"))
-    for ax, view, title in definitions:
-        for arm, offset, color in (("B3", -.16, "#1565a8"), ("C3", .16, "#ca6b26")):
-            for position, name in enumerate(("mapped_correct_resolution", "mapped_wrong_resolution", "unmapped_resolution")):
-                values = [value for _, value in _values(evaluations, name, arm, view=view)]
-                if values:
-                    ax.scatter(position+offset+np.linspace(-.06, .06, len(values)), values, color=color,
-                               s=12, alpha=.5, label=arm if position == 0 else None)
-        if ax.collections:
-            ax.legend()
-        else:
-            _unavailable(ax, "Detailed endpoints unavailable in these evaluation records")
-        ax.set(title=title, xticks=[0, 1, 2], xticklabels=["Mc / P", "Mw / P", "U / P"],
-               ylabel="Fraction of evaluable population", ylim=(-.02, 1.02))
-    for arm, color in (("B3", "#1565a8"), ("C3", "#ca6b26")):
-        geom = {(e["history_id"], e["acquisition_id"]): value
-                for e, value in _values(evaluations, "geometric_reference_available", arm)}
-        usable = {(e["history_id"], e["acquisition_id"]): value
-                  for e, value in _values(evaluations, "usable_reference_available", arm)}
-        keys = geom.keys() & usable.keys()
-        if keys:
-            axes[4].scatter([geom[key] for key in keys], [usable[key] for key in keys],
-                            color=color, label=arm, s=15, alpha=.6)
-        values = [value for _, value in _values(evaluations, "geometric_correct_reference_resolution", arm)]
-        if values:
-            position = 0 if arm == "B3" else 1
-            axes[5].scatter(position+np.linspace(-.1, .1, len(values)), values, color=color, s=15, alpha=.6)
-    for ax in axes[4:]:
-        if not ax.collections:
-            _unavailable(ax, "No assessed geometric endpoint; declare a tolerance to evaluate")
-    if axes[4].collections:
-        axes[4].legend()
-    axes[4].set(title="Correct reference availability: targets", xlabel="Geometric availability",
-                ylabel="Usable availability", xlim=(-.02, 1.02), ylim=(-.02, 1.02))
-    axes[5].set(title="Geometric correct-reference acceptance", xticks=[0, 1], xticklabels=["B3", "C3"],
-                ylabel="Correct and usable accepted center / P", ylim=(-.02, 1.02))
-    figure.suptitle("4 · Binary decisions, detailed membership and reference availability", y=1.02)
-    _save(figure, output, "04_decisions_transitions", paths)
-
-
-def _map_decisions(evaluations, output, paths):
+def _decisions(evaluations, output, paths):
     """MAP performance and evidence states, without selective-acceptance curves."""
     figure, axes = plt.subplots(2, 3, figsize=(16, 9))
-    all_targets = any(e.get("schema") in ("clipp2.simulation.evaluation.v5", "clipp2.simulation.evaluation.v6") for e in evaluations)
     panels = (("data_supported_map_coverage", "", "Targets with data-supported MAP / informative targets"),
               ("binary_map_error", "whole_original", "Binary MAP errors / original informative population"),
               ("detailed_map_error", "whole_original", "Wrong mapped subclones / original informative population"),
-              ("map_ccf_rmse", "whole_original" if all_targets else "unchanged_F",
-               "Whole fitted population: MAP CCF RMSE" if all_targets else "Unchanged F: native hard-label CCF RMSE"),
+              ("map_ccf_rmse", "whole_original", "Whole fitted population: MAP CCF RMSE"),
               ("prior_only_fraction", "", "Prior-only / all targets"),
               ("model_incompatible_fraction", "", "Model-incompatible / all targets"))
     for ax, (name, view, title) in zip(axes.flat, panels):
@@ -240,8 +154,7 @@ def _map_decisions(evaluations, output, paths):
         if not ax.collections:
             _unavailable(ax)
         ax.set(title=title, xticks=[0, 1], xticklabels=["B3", "C3"])
-    figure.suptitle("4 · MAP estimates for every fitted mutation and explicit evidence states" if all_targets else
-                   "4 · MAP estimates, unchanged native memberships and explicit evidence states", y=1.02)
+    figure.suptitle("4 · MAP estimates for every fitted mutation and explicit evidence states", y=1.02)
     _save(figure, output, "04_decisions_transitions", paths)
 
 
@@ -316,12 +229,11 @@ def _sensitivity_covariate(evaluation, key):
 
 
 def _sensitivities(evaluations, output, paths):
-    map_policy = any(e.get("schema") in ("clipp2.simulation.evaluation.v4", "clipp2.simulation.evaluation.v5", "clipp2.simulation.evaluation.v6") for e in evaluations)
-    correctness = "binary_map_correct_per_original_evaluable" if map_policy else "correct_per_original_evaluable"
+    correctness = "binary_map_correct_per_original_evaluable"
     figure, axes = plt.subplots(2, 3, figsize=(13, 8))
     definitions = (("mean_depth", "Mean observed depth"), ("region_count", "Requested regions"),
                    ("purity", "Mean supplied purity"), ("major_cn", "Mean original major CN"),
-                   ("contributors", "Available MAP contributors per audited pair" if map_policy else "Qualified contributors per audited pair"),
+                   ("contributors", "Available MAP contributors per audited pair"),
                    ("input_errors", "Input-error panel"))
     for ax, (key, label) in zip(axes.flat, definitions):
         points = []
@@ -339,8 +251,7 @@ def _sensitivities(evaluations, output, paths):
 
 
 def _population_accounting(evaluations, summary, output, paths):
-    map_policy = summary.get("evaluation_definition", {}).get("schema", "").endswith((".v4", ".v5", ".v6"))
-    correctness = "binary_map_correct_per_original_evaluable" if map_policy else "binary_correct_per_original_evaluable"
+    correctness = "binary_map_correct_per_original_evaluable"
     figure, axes = plt.subplots(2, 2, figsize=(14, 10))
     arms = ("B", "C", "B3", "C3")
     ax = axes[0, 0]
@@ -375,9 +286,7 @@ def _population_accounting(evaluations, summary, output, paths):
            ylabel="Retained roster cells", title="Execution, applicability and evaluation states")
     ax.tick_params(axis="x", labelsize=7)
     ax.legend(fontsize=8)
-    source_origin = "stage1_reference_recheck" if map_policy else "stage1_clonal_recheck"
-    second_origin = "stage2_recheck" if summary.get("evaluation_definition", {}).get("schema", "").endswith((".v5", ".v6")) else "stage2_near_clonal_recheck"
-    for ax, origin in zip(axes[1], (source_origin, second_origin)):
+    for ax, origin in zip(axes[1], ("stage1_reference_recheck", "stage2_recheck")):
         matrix = np.zeros((4, 4), int)
         observed = False
         for evaluation in evaluations:
@@ -409,7 +318,7 @@ def make_figures(evaluations, aggregate_report, output_dir, *, histories=()):
     _physical(histories, output, paths)
     _heatmaps(evaluations, output, paths)
     _paired(evaluations, aggregate_report, output, paths)
-    _decisions(evaluations, aggregate_report, output, paths)
+    _decisions(evaluations, output, paths)
     _reliability(evaluations, output, paths)
     _sensitivities(evaluations, output, paths)
     _population_accounting(evaluations, aggregate_report, output, paths)

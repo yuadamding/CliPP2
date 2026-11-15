@@ -7,8 +7,6 @@ from dataclasses import replace
 from decimal import Decimal, localcontext
 import json
 import os
-import io
-import zipfile
 from pathlib import Path
 import pickle
 import tempfile
@@ -19,8 +17,8 @@ import numpy as np
 import pandas as pd
 
 from CliPP2.assignment import (AssignmentBundle, AssignmentReference, AssignmentResult,
-                               HistoricalAssignmentArtifact, EVIDENCE_STATUSES,
-                               assign_mutations, derive_current_bundle, score_summary)
+                               EVIDENCE_STATUSES,
+                               assign_mutations, score_summary)
 from CliPP2.config import PROTOCOL_VERSION
 from CliPP2.io.assignment import (load_assignment_bundle, publish_assignment, save_assignment_bundle,
                                   validate_assignment_result)
@@ -185,59 +183,6 @@ def _scalar_cn_checks(root):
     return dict(whole_catalog_sums=0, assignment_and_independent_publication=True)
 
 
-def _fixed_reference_baseline(root):
-    """Reinterpret a separately identified 2.2 bundle without altering historical files."""
-    from CliPP2.io.data import content_hash
-    with zipfile.ZipFile(Path(__file__).parent / "fixtures/protocol22_baseline.zip") as archive:
-        historical = json.loads(archive.read("assignment_bundle.json"))
-        assert content_hash(historical["payload"]) == historical["content_hash"]
-        payload = copy.deepcopy(historical["payload"])
-        assert payload["protocol_version"] == "2.2"
-        (root / "historical_bundle.json").write_text(json.dumps(historical))
-        assert load_assignment_bundle(root / "historical_bundle.json").to_dict() == payload
-        frozen = AssignmentBundle.from_dict(payload)
-        assert type(frozen) is HistoricalAssignmentArtifact and frozen.to_dict() == payload
-        request = derive_current_bundle(frozen)
-        previous = pd.read_csv(io.BytesIO(archive.read("assignment/workflow_protocol22_mutation_assignments.tsv")),
-                               sep="\t", float_precision="round_trip").set_index("mutation_id")
-        previous_pairs = pd.read_csv(io.BytesIO(archive.read("assignment/workflow_protocol22_assignment_multiplicity.tsv")),
-                                     sep="\t", float_precision="round_trip").set_index(["mutation_id", "region_id"])
-    current = assign_mutations(request, outdir=root / "protocol22_fixed_reference")
-    assert request.content_hash != historical["content_hash"]
-    for row in current.assignments:
-        before = previous.loc[row["mutation_id"]]
-        np.testing.assert_array_equal(row["log_scores"], [before[f"log_score_{label}"] for label in request.reference.labels])
-        np.testing.assert_array_equal(row["probabilities"], [before[f"probability_{label}"] for label in request.reference.labels])
-        np.testing.assert_allclose(row["mean_profile_deviance"], before["mean_profile_deviance"], rtol=1e-12, atol=0.)
-        assert row["final_assignment_label"] == row["map_cluster_label"] and row["evidence_status"] == "observed"
-    for row in current.multiplicities:
-        before = previous_pairs.loc[row["mutation_id"], row["region_id"]]
-        for key in ("conditional_map", "call_probability", "profile_deviance"):
-            np.testing.assert_allclose(row[key], before[key], rtol=1e-12, atol=0.)
-    assert request.provenance["historical_derivation"]["content_hash"] == frozen.content_hash
-    assert frozen.to_dict() == payload
-    _reject(lambda: assign_mutations(frozen), TypeError)
-    altered = copy.deepcopy(payload)
-    altered["thresholds"]["posterior_min"] = 1.
-    altered["reference"]["regional_quality"] = [[False]*len(request.reference.region_ids)]*len(request.reference.labels)
-    altered["reference"]["regional_quality_reasons"] = [[["historical_quality_fixture"]]*len(request.reference.region_ids)]*len(request.reference.labels)
-    alternative = assign_mutations(derive_current_bundle(AssignmentBundle.from_dict(altered)))
-    for one, two in zip(current.assignments, alternative.assignments):
-        np.testing.assert_array_equal(one["log_scores"], two["log_scores"])
-        np.testing.assert_array_equal(one["probabilities"], two["probabilities"])
-        assert one["map_label"] == two["map_label"]
-    previous23 = request.to_dict()
-    previous23["schema"] = "clipp2.assignment.bundle.v4"
-    previous23["protocol_version"] = "2.3"
-    previous23.pop("assignment_method")
-    old23 = AssignmentBundle.from_dict(previous23)
-    new23 = derive_current_bundle(old23)
-    assert old23.to_dict() == previous23 and old23.content_hash != new23.content_hash
-    assert new23.catalog.content_hash == request.catalog.content_hash
-    assert new23.reference.to_dict() == request.reference.to_dict()
-    return dict(targets=len(current.target_ids), scores_exact=True, probabilities_exact=True,
-                diagnostic_measurements_preserved=True, separately_identified_derivative=True,
-                historical_quality_and_thresholds_inert=True, protocol22_and_early23_readers=True)
 
 
 def _accounting_checks(root):
@@ -332,7 +277,6 @@ def run_checks(directory):
     numerical = _numerical_screen_checks(root)
     loss_only = _loss_only_checks(root)
     scalar_cn = _scalar_cn_checks(root)
-    baseline = _fixed_reference_baseline(root)
     accounting = _accounting_checks(root)
     exact = _catalog(root, "exact", 2, 3, 4)
     request = _bundle(exact, _reference(exact, [[1.]]))
@@ -519,21 +463,9 @@ def run_checks(directory):
     for clone in (copy.copy(result), copy.deepcopy(result), pickle.loads(pickle.dumps(result))):
         validate_assignment_result(request, clone)
         assert not clone.assignments[0]["probabilities"].flags.writeable
-    historical_result = result.to_dict()
-    historical_result["schema"] = historical_result["summary"]["schema"] = "clipp2.assignment.result.v5"
-    historical_result["protocol_version"] = "2.3"
-    for row in historical_result["assignments"]:
-        for field in ("map_label", "map_set", "posterior_defined"):
-            row.pop(field)
-        row["target_reason"] = "stage2_near_clonal_recheck"
-        row["reassessment_status"] = "retained_clonal"
-    frozen = AssignmentResult.from_dict(historical_result)
-    assert type(frozen) is HistoricalAssignmentArtifact
-    for clone in (copy.copy(frozen), copy.deepcopy(frozen), pickle.loads(pickle.dumps(frozen))):
-        assert content_hash(clone.to_dict()) == content_hash(historical_result)
-        assert clone.payload["assignments"][0]["target_reason"] == "stage2_near_clonal_recheck"
-        assert clone.payload["assignments"][0]["reassessment_status"] == "retained_clonal"
-        _reject(lambda: validate_assignment_result(request, clone))
+    old_result = result.to_dict()
+    old_result["schema"] = "clipp2.assignment.result.v5"
+    _reject(lambda: AssignmentResult.from_dict(old_result))
     changed = result.to_dict()
     changed["assignments"][0]["posterior_defined"] = False
     _reject(lambda: AssignmentResult.from_dict(changed))
@@ -548,13 +480,13 @@ def run_checks(directory):
         source_stages=(), source_labels=(), baseline_labels=())
     empty_result = assign_mutations(empty, outdir=root / "empty_targets")
     assert sum(empty_result.summary["assigned_occupancy"].values()) == 0
-    return dict(protocol_version=PROTOCOL_VERSION, assignment_methods=methods, fixed_reference_baseline=baseline,
+    return dict(protocol_version=PROTOCOL_VERSION, assignment_methods=methods,
         low_confidence_map=True, exact_and_near_ties=True, finite_competitor_underflow=True,
         diagnostic_measurements_do_not_veto=True, prior_only_distinct_from_incompatible_and_excluded=True,
         conditional_map_without_concentration_gate=True, diagnostic_failure_preserves_scoring=True,
         computational_failure_explicit=True, origin_order_batch_invariance=True,
         immutable_roundtrip_and_tampering=True, byte_identical_replay=True,
-        historical_artifacts_read_only=True, authoritative_map_fields=True,
+        old_artifacts_rejected=True, authoritative_map_fields=True,
         numerical_deviance=numerical, loss_only_scoring=loss_only, scalar_cn=scalar_cn,
         whole_population_accounting=accounting, reference_measurement_roundoff=measurement_roundoff)
 

@@ -77,17 +77,17 @@ def run_truth_link_checks(directory):
         technical = acquire(history, 900, .8, 100, perturbation=perturbation)
         supplied = _catalog(directory, f'perturbed-{index}', technical)
         assert state(a=technical.attrs['acquisition'], c=supplied) == 'verified_history_binding'
-    legacy = dict(acquisition)
-    legacy.pop('history_content_id')
-    legacy_catalog = _catalog(directory, 'legacy', frame, linked=False)
-    assert state(a=legacy, c=legacy_catalog, m={}) == 'legacy_consistent_unbound'
+    unbound = dict(acquisition)
+    unbound.pop('history_content_id')
+    unbound_catalog = _catalog(directory, 'unbound', frame, linked=False)
+    assert state(a=unbound, c=unbound_catalog, m={}) == 'missing_truth_evidence'
     # Same identifiers, seed, dimensions and valid events; different regional CCFs.
     order = [1, 0, 2, 3]
     collision = replace(history, clone_fractions=history.clone_fractions[:, order],
         phi=history.phi[:, order], multiplicity=history.multiplicity[:, order],
         major_cn=history.major_cn[:, order], minor_cn=history.minor_cn[:, order])
     assert np.any(history.phi != collision.phi) and collision.history_id == history.history_id
-    assert state(h=collision, a=legacy, c=legacy_catalog, m={}) == 'conflicting_truth'
+    assert state(h=collision, a=unbound, c=unbound_catalog, m={}) == 'conflicting_truth'
     aliased = generate_history('S04', 300, 120, 6, 4)
     alias = _alias_history(aliased)
     aliased_frame = acquire(aliased, 900, .8, 100)
@@ -95,15 +95,19 @@ def run_truth_link_checks(directory):
     np.testing.assert_allclose(aliased_frame.attrs['acquisition']['true_probability'],
                               alias_frame.attrs['acquisition']['true_probability'], atol=1e-12, rtol=0)
     assert history_content_id(alias) != history_content_id(aliased)
-    alias_legacy = dict(aliased_frame.attrs['acquisition'])
-    alias_legacy.pop('history_content_id')
+    alias_unbound = dict(aliased_frame.attrs['acquisition'])
+    alias_unbound.pop('history_content_id')
     alias_catalog = _catalog(directory, 'alias', aliased_frame, linked=False)
-    assert state(h=alias, a=alias_legacy, c=alias_catalog, m={}) == 'legacy_consistent_unbound'
+    assert state(h=alias, a=alias_unbound, c=alias_catalog, m={}) == 'missing_truth_evidence'
     assert state(h=alias, a=aliased_frame.attrs['acquisition'], c=alias_catalog, m={}) == 'conflicting_truth'
     _offline_truth_checks(directory / 'offline', history, frame, collision)
-    return dict(status='passed', linked_history_verified=True, contradictory_legacy_truth_rejected=True,
+    missing_frame = acquire(history, 900, .8, 100, missing_rate=.1)
+    assert (~missing_frame.attrs['acquisition']['count_observed']).any()
+    _offline_truth_checks(directory / 'offline-missing', history, missing_frame, collision)
+    return dict(status='passed', linked_history_verified=True, contradictory_truth_rejected=True,
         probability_alias_remains_unbound=True, technical_inputs_distinct_from_biological_truth=True,
         malformed_or_missing_truth_rejected=True, offline_has_zero_inference=True,
+        offline_missing_reads_retain_truth_binding=True,
         fit_count=0, assignment_pass_count=0)
 
 
@@ -124,6 +128,9 @@ def _offline_truth_checks(root, history, frame, collision):
     metadata = dict(frame.attrs['metadata'], tumor_id=job['cell_id'])
     write_tumor_txt(attempt / 'input_catalog.tsv', catalog_frame, metadata)
     catalog = load_original_catalog(attempt / 'input_catalog.tsv')
+    missing = ~frame.attrs['acquisition']['count_observed']
+    assert len(catalog.read_count_imputations) == int(missing.sum())
+    assert (catalog.alt_counts[missing] == 0).all() and (catalog.total_counts[missing] > 0).all()
     acquisition = dict(frame.attrs['acquisition'], id='A4')
     from CliPP2.io.data import json_value
     (attempt / 'acquisition.json').write_text(json.dumps(json_value(acquisition)))
@@ -132,10 +139,12 @@ def _offline_truth_checks(root, history, frame, collision):
     manifest = {key: job[key] for key in ('history_id', 'family', 'history_seed', 'dimensions')}
     manifest['history_content_id'] = history_content_id(history)
     (truth_dir / 'history_manifest.json').write_text(json.dumps(manifest))
-    paired = dict(status='complete', original_mutation_ids=history.mutation_ids, region_ids=history.region_ids,
+    paired = dict(schema='clipp2.paired-experiment.v6', protocol_version='2.4', status='complete',
+        original_mutation_ids=history.mutation_ids, region_ids=history.region_ids,
         run_manifest=prepare_run_manifest(catalog), arms={})
     configuration = attempt / 'configuration-1'
     configuration.mkdir()
+    (configuration / 'original_catalog.json').write_text(json.dumps(catalog.to_dict()))
     (configuration / 'paired_result.json').write_text(json.dumps(paired))
     cell = dict(job=job, attempt=str(attempt.relative_to(root)), status='complete')
     config = dict(reference_match_atol=.025, reference_distance='l2')
@@ -149,7 +158,7 @@ def _offline_truth_checks(root, history, frame, collision):
         good = reevaluate_cell(root, cell, config)
         assert good['truth_qualification'] == 'verified_history_binding'
         assert evaluator.call_args.kwargs['truth_qualification'] == 'verified_history_binding'
-        # Legacy input/manifest links are absent; do not retrofit original proof.
+        # Missing input/manifest links cannot establish a truth association.
         manifest.pop('history_content_id')
         (truth_dir / 'history_manifest.json').write_text(json.dumps(manifest))
         acquisition.pop('history_content_id')
@@ -159,10 +168,12 @@ def _offline_truth_checks(root, history, frame, collision):
         catalog = load_original_catalog(attempt / 'input_catalog.tsv')
         paired['run_manifest'] = prepare_run_manifest(catalog)
         assert paired['run_manifest']['input_identity']['original_catalog_identity'] == content_hash(catalog.to_dict())
+        (configuration / 'original_catalog.json').write_text(json.dumps(catalog.to_dict()))
         (configuration / 'paired_result.json').write_text(json.dumps(paired))
-        legacy = reevaluate_cell(root, cell, config)
-        assert legacy['truth_qualification'] == 'legacy_consistent_unbound'
         evaluator.reset_mock()
+        unbound = reevaluate_cell(root, cell, config)
+        assert unbound['truth_qualification'] == 'missing_truth_evidence'
+        evaluator.assert_not_called()
         collision.write_truth(truth_dir)
         conflicting = reevaluate_cell(root, cell, config)
         assert conflicting['truth_qualification'] == 'conflicting_truth'

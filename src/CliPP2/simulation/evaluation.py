@@ -13,25 +13,19 @@ from types import SimpleNamespace
 import numpy as np
 from scipy.special import logsumexp, xlogy, xlog1py
 from scipy.optimize import linear_sum_assignment
-from copy import deepcopy
 from CliPP2.config import STAGE_THREE_REFERENCE_POLICY, validate_assignment_method
 from CliPP2.assignment import ASSIGNMENT_POLICIES, POSTERIOR_FIELDS
 from CliPP2.io.data import content_hash
-
-HISTORICAL_V5_REFERENCE_POLICY = "exact_unique_canonical_one_source_native_all_stage_two_equal_priors_after_consolidation"
 
 FAMILIES = tuple(f"S{i:02}" for i in range(1, 13))
 TRANSITIONS = ("correct_retained", "error_corrected", "error_persisted", "error_introduced",
                "correct_resolution_lost", "error_withheld")
 UNMAPPED = "__unmapped__"
 DETAILED_STATES = ("Mc", "Mw", "U", "unresolved")
-TRUTH_QUALIFICATIONS = frozenset(("verified_history_binding", "legacy_consistent_unbound",
-                                "conflicting_truth", "missing_truth_evidence"))
+TRUTH_QUALIFICATIONS = frozenset(("verified_history_binding", "conflicting_truth", "missing_truth_evidence"))
 TRUTH_INDEPENDENT_METRICS = frozenset(("analysis_available", "analysis_failure", "execution_available",
     "execution_failure", "evaluation_available", "scientifically_applicable"))
-LEGACY_PLANNED_METRIC_NAMES = TRUTH_INDEPENDENT_METRICS | {
-    "correct_per_original_evaluable", "binary_correct_per_original_evaluable"}
-PLANNED_METRIC_NAMES = LEGACY_PLANNED_METRIC_NAMES | {"binary_map_correct_per_original_evaluable"}
+PLANNED_METRIC_NAMES = TRUTH_INDEPENDENT_METRICS | {"binary_map_correct_per_original_evaluable"}
 
 
 def metric_population_scope(name, view=""):
@@ -119,7 +113,6 @@ def metric_truth_independent(record, row):
     if row["name"] in TRUTH_INDEPENDENT_METRICS:
         return True
     denominator = row.get("denominator")
-    no_decision_names = {"correct_per_original_evaluable", "binary_correct_per_original_evaluable", "binary_map_correct_per_original_evaluable"}
     arm_state = next((item for item in record.get("applicability", ()) if item.get("arm") == row.get("arm")), {})
     state = arm_state.get("status", record.get("execution_state", record.get("status")))
     established_failure = state in ("failed", "execution_failed", "blocked", "no_eligible_clonal_reference")
@@ -133,7 +126,7 @@ def metric_truth_independent(record, row):
             "scientific_rejection_before_combined_memberships")
         and (population.get("evidence") != "retained_stage_three_memberships"
              or population.get("unchanged_count") == population.get("accepted_target_count") == 0))
-    return bool(scoped_empty and row["name"] in no_decision_names and row.get("truth_required") is False
+    return bool(scoped_empty and row["name"] == "binary_map_correct_per_original_evaluable" and row.get("truth_required") is False
         and row.get("status") == "known_no_decisions" and row.get("value") == 0 and row.get("numerator") == 0
         and isinstance(denominator, (int, float)) and not isinstance(denominator, bool)
         and np.isfinite(denominator) and denominator > 0 and denominator == record.get("original_evaluable_count")
@@ -227,182 +220,53 @@ def normalize_evaluation_config(config=None):
         tolerance = float(tolerance)
     distance = config.get("reference_distance", "l2")
     if distance not in ("l2", "linf"):
-        raise ValueError("Reference distance must be l2 or explicit legacy linf")
+        raise ValueError("Reference distance must be l2 or linf")
     return dict(schema="clipp2.simulation.evaluation-config.v1", reference_match_atol=tolerance,
                 reference_distance=distance)
 
 
-# Frozen from Protocol 2.2 before changing the current inference definition.
-# Runtime reporting choices replace only config/distance/tolerance below.
-_HISTORICAL_V2 = {'schema': 'clipp2.simulation.evaluation-definition.v2',
- 'config': {'schema': 'clipp2.simulation.evaluation-config.v1',
-            'reference_match_atol': None,
-            'reference_distance': 'l2'},
- 'binary_endpoint': 'accepted_designated_clonal_status_equals_physical_truth_clonality',
- 'binary_objective': 'unchanged_original_population_equal_family_history_acquisition',
- 'detailed_endpoint': 'frozen_source_member_purity_observable_truth_class',
- 'source_member_purity_min': 0.8,
- 'unmapped_acceptance': 'separate_Mc_Mw_U_not_automatic_error',
- 'geometric_endpoint': 'accepted_center_matches_truth_and_quality_passes_informative_regions',
- 'reference_distance': 'l2',
- 'reference_vector': 'full_requested_regions_unnormalized',
- 'reference_match_atol': None,
- 'matching_policy': 'maximum_valid_cardinality_then_minimum_valid_distance_then_lexicographic_truth_reference',
- 'matching_ambiguity': 'alternative_equal_cardinality_exact_binary_rational_distance_sum_optima',
- 'availability_quality_regions': 'original_eligible_observed_positive_depth',
- 'uncertainty_bounds': 'mapping_error_lower_Mw_over_A_upper_Mw_plus_U_over_A_not_confidence_intervals'}
-
-_HISTORICAL_V3 = {'schema': 'clipp2.simulation.evaluation-definition.v3',
- 'config': {'schema': 'clipp2.simulation.evaluation-config.v1',
-            'reference_match_atol': None,
-            'reference_distance': 'l2'},
- 'binary_endpoint': 'accepted_designated_clonal_status_equals_physical_truth_clonality',
- 'binary_objective': 'unchanged_original_population_equal_family_history_acquisition',
- 'population_scopes': {'planned_population': ['analysis_available',
-                                              'analysis_failure',
-                                              'binary_correct_per_original_evaluable',
-                                              'correct_per_original_evaluable',
-                                              'evaluation_available',
-                                              'execution_available',
-                                              'execution_failure',
-                                              'scientifically_applicable'],
-                       'other_metrics': 'conditional_available_cases'},
- 'planned_weights': 'frozen_roster_equal_family_then_equal_history_then_equal_acquisition',
- 'missing_evidence': 'unknown_planned_cell_makes_estimate_null_never_renormalize_survivors',
- 'zero_credit': 'known_no_decisions_with_established_original_evaluable_denominator_only',
- 'truth_qualification_policy': 'verified_history_binding_primary_legacy_consistent_unbound_separate_conditional',
- 'detailed_transition': 'same_Mc_Mw_U_unresolved_state_for_baseline_and_final_by_target_origin',
- 'detailed_endpoint': 'frozen_source_member_purity_observable_truth_class',
- 'source_member_purity_min': 0.8,
- 'unmapped_acceptance': 'separate_Mc_Mw_U_not_automatic_error',
- 'geometric_endpoint': 'accepted_center_matches_truth_and_quality_passes_informative_regions',
- 'reference_distance': 'l2',
- 'reference_vector': 'full_requested_regions_unnormalized',
- 'reference_match_atol': None,
- 'matching_policy': 'maximum_valid_cardinality_then_minimum_valid_distance_then_lexicographic_truth_reference',
- 'matching_ambiguity': 'alternative_equal_cardinality_exact_binary_rational_distance_sum_optima',
- 'availability_quality_regions': 'original_eligible_observed_positive_depth',
- 'uncertainty_bounds': 'mapping_error_lower_Mw_over_A_upper_Mw_plus_U_over_A_not_confidence_intervals'}
-
-_HISTORICAL_V4 = {'schema': 'clipp2.simulation.evaluation-definition.v4',
- 'config': {'schema': 'clipp2.simulation.evaluation-config.v1',
-            'reference_match_atol': None,
-            'reference_distance': 'l2'},
- 'binary_endpoint': 'data_supported_MAP_designated_clonality_equals_physical_truth_clonality',
- 'detailed_endpoint': 'frozen_source_member_purity_observable_truth_class',
- 'source_member_purity_min': 0.8,
- 'unmapped_MAP': 'separate_Mc_Mw_U_not_automatic_error',
- 'geometric_endpoint': 'selected_MAP_center_matches_truth_without_diagnostic_veto',
- 'map_policy': 'authoritative_final_label_observed_only_exact_score_ties_lower_public_label',
- 'missing_information': 'prior_only_uniform_probabilities_without_data_supported_final_label',
- 'incompatible': 'all_candidates_impossible_without_probability_fallback',
- 'population_denominators': 'original_evaluable_for_MAP_errors_all_original_members_for_evidence_status',
- 'unchanged_F': 'native_hard_membership_not_stage_three_posterior',
- 'target_origins': ['stage1_reference_recheck', 'stage2_near_clonal_recheck'],
- 'population_scopes': {'planned_population': ['analysis_available',
-                                              'analysis_failure',
-                                              'binary_map_correct_per_original_evaluable',
-                                              'evaluation_available',
-                                              'execution_available',
-                                              'execution_failure',
-                                              'scientifically_applicable'],
-                       'other_metrics': 'conditional_available_cases'},
- 'planned_weights': 'frozen_roster_equal_family_then_equal_history_then_equal_acquisition',
- 'missing_evidence': 'unknown_planned_cell_makes_estimate_null_never_renormalize_survivors',
- 'zero_credit': 'known_no_decisions_with_established_original_evaluable_denominator_only',
- 'truth_qualification_policy': 'verified_history_binding_primary_legacy_consistent_unbound_separate_conditional',
- 'reference_distance': 'l2',
- 'reference_match_atol': None,
- 'reference_vector': 'full_requested_regions_unnormalized',
- 'matching_policy': 'maximum_valid_cardinality_then_minimum_valid_distance_then_lexicographic_truth_reference',
- 'matching_ambiguity': 'alternative_equal_cardinality_exact_binary_rational_distance_sum_optima'}
-
-def _evaluation_definition_v5(config=None, *, reference_policy=STAGE_THREE_REFERENCE_POLICY):
+def evaluation_definition(config=None, *, reference_policy=STAGE_THREE_REFERENCE_POLICY,
+                          assignment_method="marginal"):
     config = normalize_evaluation_config(config)
-    if reference_policy not in (STAGE_THREE_REFERENCE_POLICY, HISTORICAL_V5_REFERENCE_POLICY):
+    method = validate_assignment_method(assignment_method)
+    if reference_policy != STAGE_THREE_REFERENCE_POLICY:
         raise ValueError("Unknown Stage 3 reference policy")
-    return dict(schema="clipp2.simulation.evaluation-definition.v5", config=config,
+    return dict(schema="clipp2.simulation.evaluation-definition.v6", config=config,
+        assignment_method=method, tie_policy=ASSIGNMENT_POLICIES[method],
+        posterior_semantics="marginal_cluster_posterior" if method == "marginal" else "undefined_for_profile",
         binary_endpoint="data_supported_MAP_designated_clonality_equals_physical_truth_clonality",
         detailed_endpoint="frozen_source_member_purity_observable_truth_class",
         source_member_purity_min=.8, unmapped_MAP="separate_Mc_Mw_U_not_automatic_error",
         geometric_endpoint="selected_MAP_center_matches_truth_without_diagnostic_veto",
-        map_policy="authoritative_final_label_observed_only_exact_score_ties_lower_public_label",
-        missing_information="prior_only_uniform_probabilities_without_data_supported_final_label",
+        map_policy=ASSIGNMENT_POLICIES[method],
+        missing_information="prior_only_uniform_probabilities_without_data_supported_final_label" if method == "marginal"
+            else "prior_only_equal_scores_without_posterior_or_data_supported_final_label",
         incompatible="all_candidates_impossible_without_probability_fallback",
         population_denominators="original_evaluable_for_MAP_errors_all_original_members_for_evidence_status",
         reassessment_population="all_combined_fitted_mutations_F_empty",
         reference_policy=reference_policy,
         cap_policy="minimum_native_map_set_upper", population_policy="unrestricted_valid_cn_unless_explicit_cutoff",
         target_origins=["stage1_reference_recheck", "stage2_recheck"],
-        population_scopes={"planned_population": sorted(PLANNED_METRIC_NAMES - {"correct_per_original_evaluable", "binary_correct_per_original_evaluable"}),
+        population_scopes={"planned_population": sorted(PLANNED_METRIC_NAMES),
                            "other_metrics": "conditional_available_cases"},
         planned_weights="frozen_roster_equal_family_then_equal_history_then_equal_acquisition",
         missing_evidence="unknown_planned_cell_makes_estimate_null_never_renormalize_survivors",
         zero_credit="known_no_decisions_with_established_original_evaluable_denominator_only",
-        truth_qualification_policy="verified_history_binding_primary_legacy_consistent_unbound_separate_conditional",
+        truth_qualification_policy="verified_history_binding_required",
         reference_distance=config["reference_distance"], reference_match_atol=config["reference_match_atol"],
         reference_vector="full_requested_regions_unnormalized",
         matching_policy="maximum_valid_cardinality_then_minimum_valid_distance_then_lexicographic_truth_reference",
         matching_ambiguity="alternative_equal_cardinality_exact_binary_rational_distance_sum_optima")
 
 
-def evaluation_definition(config=None, *, reference_policy=STAGE_THREE_REFERENCE_POLICY,
-                          assignment_method="marginal"):
-    method = validate_assignment_method(assignment_method)
-    definition = _evaluation_definition_v5(config, reference_policy=reference_policy)
-    definition.update(schema="clipp2.simulation.evaluation-definition.v6",
-        assignment_method=method, tie_policy=ASSIGNMENT_POLICIES[method],
-        map_policy=ASSIGNMENT_POLICIES[method],
-        posterior_semantics="marginal_cluster_posterior" if method == "marginal" else "undefined_for_profile",
-        missing_information="prior_only_uniform_probabilities_without_data_supported_final_label" if method == "marginal"
-            else "prior_only_equal_scores_without_posterior_or_data_supported_final_label")
-    return definition
-
-
-def legacy_evaluation_definition(version, config=None, *, reference_policy=HISTORICAL_V5_REFERENCE_POLICY):
-    """Frozen historical definitions never inherit the current MAP semantics."""
-    config = normalize_evaluation_config(config)
-    if version in (5, "v5", "clipp2.simulation.evaluation.v5"):
-        return _evaluation_definition_v5(config, reference_policy=reference_policy)
-    if version in (1, "v1", "clipp2.simulation.evaluation.v1"):
-        return dict(schema="clipp2.simulation.evaluation-definition.legacy-v1",
-            binary_endpoint="accepted_designated_clonal_status_equals_physical_truth_clonality",
-            reference_distance="linf", reference_match_atol=config["reference_match_atol"],
-            matching_policy="legacy_forced_pairs_influence_valid_edge_cost",
-            detailed_endpoint="legacy_multiclass_unmapped_treated_as_incorrect")
-    if version in (2, "v2", "clipp2.simulation.evaluation.v2"):
-        definition = deepcopy(_HISTORICAL_V2)
-    elif version in (3, "v3", "clipp2.simulation.evaluation.v3"):
-        definition = deepcopy(_HISTORICAL_V3)
-    elif version in (4, "v4", "clipp2.simulation.evaluation.v4"):
-        definition = deepcopy(_HISTORICAL_V4)
-    else:
-        raise ValueError("Only evaluation v1 through v5 are historical definitions")
-    definition.update(config=config, reference_distance=config["reference_distance"],
-                      reference_match_atol=config["reference_match_atol"])
-    return definition
-
-
-def _legacy_posterior_passes(log_competitor_ratio, threshold, has_finite_alternative):
-    """Historical display-only threshold curves; never used for Protocol 2.3."""
-    ratio = np.asarray(log_competitor_ratio, float)
-    defined = ~np.isnan(ratio) & ~np.isposinf(ratio)
-    answer = defined & (~np.asarray(has_finite_alternative, bool) if threshold == 1 else
-                        ratio <= np.log1p(-threshold)-np.log(threshold))
-    return bool(answer) if answer.ndim == 0 else answer
-
-
 def record_evaluation_definition(record):
-    """Resolve a retained record's scientific definition without relabeling it."""
-    schema = record.get("schema")
-    if schema == "clipp2.simulation.evaluation.v1":
-        return legacy_evaluation_definition(1, {"reference_match_atol": record.get("reference_match_atol")})
-    if schema not in ("clipp2.simulation.evaluation.v2", "clipp2.simulation.evaluation.v3", "clipp2.simulation.evaluation.v4", "clipp2.simulation.evaluation.v5", "clipp2.simulation.evaluation.v6"):
-        raise ValueError("Aggregation requires versioned evaluation records")
+    """Validate a current evaluation record's scientific definition."""
+    if record.get("schema") != "clipp2.simulation.evaluation.v6":
+        raise ValueError("Aggregation requires evaluation.v6 records")
     definition = record.get("evaluation_definition")
     if not isinstance(definition, dict) or record.get("evaluation_definition_id") != content_hash(definition):
         raise ValueError("Evaluation definition identity is missing or invalid")
-    if definition.get("schema") != "clipp2.simulation.evaluation-definition."+schema.rsplit(".", 1)[1]:
+    if definition.get("schema") != "clipp2.simulation.evaluation-definition.v6":
         raise ValueError("Evaluation schema and definition version differ")
     return definition
 
@@ -483,8 +347,8 @@ def _qualified_matching(distance, valid):
 def reference_center_diagnostics(labels, centers, truth_centers, *, match_atol=None, distance="l2"):
     """Continuous center errors and declared full-vector one-to-one recovery.
 
-    New assessments use unnormalized L2. Explicit ``distance='linf'`` identifies
-    legacy geometry; cached v1 results keep their original matching definition.
+    The default is unnormalized L2; ``distance='linf'`` selects the maximum
+    absolute regional difference.
     """
     config = normalize_evaluation_config(dict(reference_match_atol=match_atol, reference_distance=distance))
     labels, truth_ids = tuple(labels), tuple(sorted(truth_centers, key=str))
@@ -748,8 +612,16 @@ def _truth_clonal(history):
     return np.all(np.isclose(history.phi, 1., rtol=0, atol=1e-12), axis=1)
 
 
-def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol=None, evaluation_config=None,
-             truth_qualification="missing_truth_evidence"):
+def evaluate(
+    history,
+    catalog,
+    result,
+    *,
+    acquisition=None,
+    reference_match_atol=None,
+    evaluation_config=None,
+    truth_qualification="missing_truth_evidence",
+):
     """Evaluate one paired A/B/C/B3/C3 cell; return only JSON-safe data.
 
     ``result`` is the serializable paired payload from ``experiments.run_paired``.
@@ -757,7 +629,9 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     correct-decision credit on the original evaluable population, while scientific
     conditional metrics remain unavailable.
     """
-    if tuple(history.mutation_ids) != tuple(catalog.mutation_ids) or tuple(history.region_ids) != tuple(catalog.region_ids):
+    if tuple(history.mutation_ids) != tuple(catalog.mutation_ids) or tuple(history.region_ids) != tuple(
+        catalog.region_ids
+    ):
         raise ValueError("Evaluation requires the complete aligned original universe")
     if truth_qualification not in TRUTH_QUALIFICATIONS:
         raise ValueError("Unknown truth qualification state")
@@ -767,44 +641,52 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
             raise ValueError("Conflicting reference match tolerances")
         config_input["reference_match_atol"] = reference_match_atol
     evaluation_config = normalize_evaluation_config(config_input)
-    method_aware = result.get("schema") == "clipp2.paired-experiment.v6"
-    assignment_method = validate_assignment_method(result["config"]["stage_three_assignment_method"]) if method_aware else "marginal"
-    all_targets = result.get("schema") in ("clipp2.paired-experiment.v5", "clipp2.paired-experiment.v6")
-    map_policy = all_targets or result.get("schema") == "clipp2.paired-experiment.v4" or result.get("protocol_version") == "2.3"
-    source_origin = "stage1_reference_recheck" if map_policy else "stage1_clonal_recheck"
-    second_origin = "stage2_recheck" if all_targets else "stage2_near_clonal_recheck"
-    reference_policy = result.get("reference_policy", HISTORICAL_V5_REFERENCE_POLICY)
-    definition = (evaluation_definition(evaluation_config, reference_policy=reference_policy, assignment_method=assignment_method) if method_aware else
-                  legacy_evaluation_definition(5, evaluation_config, reference_policy=reference_policy) if all_targets else
-                  legacy_evaluation_definition(4 if map_policy else 3, evaluation_config))
+    if result.get("schema") != "clipp2.paired-experiment.v6" or result.get("protocol_version") != "2.4":
+        raise ValueError("Evaluation requires a current Protocol 2.4 paired experiment")
+    assignment_method = validate_assignment_method(result["config"]["stage_three_assignment_method"])
+    source_origin, second_origin = ("stage1_reference_recheck", "stage2_recheck")
+    reference_policy = result.get("reference_policy", STAGE_THREE_REFERENCE_POLICY)
+    definition = evaluation_definition(
+        evaluation_config, reference_policy=reference_policy, assignment_method=assignment_method
+    )
     reference_match_atol = evaluation_config["reference_match_atol"]
     reference_distance = evaluation_config["reference_distance"]
     acquisition = dict(acquisition or {})
     metadata = dict(history.metadata)
-    identity = dict(family=metadata.get("family", getattr(history, "family", "unknown")),
-                    protocol_version=result.get("protocol_version"),
-                    run_manifest_id=result.get("run_manifest_id"),
-                    source_cohort_protocol_version=result.get("source_cohort_protocol_version"),
-                    history_id=metadata.get("history_id", getattr(history, "history_id", "unknown")),
-                    acquisition_id=acquisition.get("id", acquisition.get("acquisition_id", "unspecified")),
-                    stratum=result.get("stratum", "estimated"))
+    identity = dict(
+        family=metadata.get("family", getattr(history, "family", "unknown")),
+        protocol_version=result.get("protocol_version"),
+        run_manifest_id=result.get("run_manifest_id"),
+        source_cohort_protocol_version=result.get("source_cohort_protocol_version"),
+        history_id=metadata.get("history_id", getattr(history, "history_id", "unknown")),
+        acquisition_id=acquisition.get("id", acquisition.get("acquisition_id", "unspecified")),
+        stratum=result.get("stratum", "estimated"),
+    )
     from CliPP2.config import fitting_identity, SELECTION_CRITERION
+
     fit_settings = result.get("config", {}).get("fit", {})
-    method_identity = fitting_identity(fit_settings.get("fit_multiplicity", "marginal"),
-                                      fit_settings.get("selection_criterion", SELECTION_CRITERION))
+    method_identity = fitting_identity(
+        fit_settings.get("fit_multiplicity", "marginal"), fit_settings.get("selection_criterion", SELECTION_CRITERION)
+    )
     if "fitting_method_identity" in result and result["fitting_method_identity"] != method_identity:
         raise ValueError("Experiment fitting identity differs from its configuration")
     for accepted in [result.get("stage_one"), *(arm.get("stage_two") for arm in result.get("arms", {}).values())]:
-        if accepted and accepted.get("schema") == "clipp2.accepted-fit.v4" and accepted.get("method_identity") != method_identity:
+        if (
+            accepted
+            and accepted.get("schema") == "clipp2.accepted-fit.v4"
+            and (accepted.get("method_identity") != method_identity)
+        ):
             raise ValueError("Evaluated accepted fit uses a different fitting objective")
-    # Historical report identities stay byte-for-byte historical. New producers
-    # bind their fitting method explicitly; absent historical metadata is marginal.
     if "fitting_method_identity" in result or "fit_multiplicity" in fit_settings:
         identity["fitting_method_identity"] = method_identity
-    if method_aware:
-        identity.update(assignment_method=assignment_method, tie_policy=ASSIGNMENT_POLICIES[assignment_method],
-                        calibration_status="requires_valid_marginal_posterior" if assignment_method == "marginal" else "undefined_for_profile")
-    ids, regions = tuple(history.mutation_ids), tuple(history.region_ids)
+    identity.update(
+        assignment_method=assignment_method,
+        tie_policy=ASSIGNMENT_POLICIES[assignment_method],
+        calibration_status="requires_valid_marginal_posterior"
+        if assignment_method == "marginal"
+        else "undefined_for_profile",
+    )
+    ids, regions = (tuple(history.mutation_ids), tuple(history.region_ids))
     index = {mutation: i for i, mutation in enumerate(ids)}
     truth_ids = dict(zip(ids, history.observable_truth_ids))
     classes = tuple(sorted(set(history.observable_truth_ids)))
@@ -817,8 +699,8 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     known = np.isfinite(history.phi).all(axis=1)
     evaluable = known & observed.any(axis=1)
     original_n = int(evaluable.sum())
-    metrics, mutation_rows, correspondence, calibration_rows, containment = [], [], [], [], []
-    reference_geometry, detailed_membership, detailed_transitions = {}, {}, {}
+    metrics, mutation_rows, correspondence, calibration_rows, containment = ([], [], [], [], [])
+    reference_geometry, detailed_membership, detailed_transitions = ({}, {}, {})
     truth_centers = {truth_ids[m]: history.phi[index[m]] for m in ids if evaluable[index[m]]}
 
     def metric(name, arm, numerator=None, denominator=None, *, value=None, view="", stratum="all", reason=None):
@@ -826,10 +708,20 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
             value = None
         elif denominator is not None:
             value = _ratio(numerator, denominator)
-        metrics.append(dict(name=name, arm=arm, view=view, stratum=stratum, value=value,
-            population_scope=metric_population_scope(name, view), truth_required=name not in TRUTH_INDEPENDENT_METRICS,
-            numerator=numerator, denominator=denominator,
-            status=reason or ("available" if value is not None else "not_applicable_zero_denominator")))
+        metrics.append(
+            dict(
+                name=name,
+                arm=arm,
+                view=view,
+                stratum=stratum,
+                value=value,
+                population_scope=metric_population_scope(name, view),
+                truth_required=name not in TRUTH_INDEPENDENT_METRICS,
+                numerator=numerator,
+                denominator=denominator,
+                status=reason or ("available" if value is not None else "not_applicable_zero_denominator"),
+            )
+        )
 
     def partition(arm, labels, selected, view):
         selected = [m for m in selected if m in labels and known[index[m]]]
@@ -840,15 +732,18 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         metric("occupied_groups", arm, value=scores.get("occupied_groups"), view=view)
 
     def ccf(arm, estimates, view, selected=ids):
-        differences = [np.square(np.asarray(estimates[m], float)-history.phi[index[m]])
-                       for m in selected if m in estimates and known[index[m]]]
+        differences = [
+            np.square(np.asarray(estimates[m], float) - history.phi[index[m]])
+            for m in selected
+            if m in estimates and known[index[m]]
+        ]
         values = np.asarray(differences)
         use = np.isfinite(values)
         metric("ccf_rmse", arm, value=float(np.sqrt(values[use].mean())) if use.any() else None, view=view)
-        metric("ccf_estimate_coverage", arm, int(use.sum()), len(selected)*len(regions), view=view)
+        metric("ccf_estimate_coverage", arm, int(use.sum()), len(selected) * len(regions), view=view)
 
     def multiplicity(arm, calls, view, qualified=None):
-        valid, exact, errors, qualified_count, qualified_correct = 0, 0, [], 0, 0
+        valid, exact, errors, qualified_count, qualified_correct = (0, 0, [], 0, 0)
         denominator = 0
         for m in ids:
             i = index[m]
@@ -858,7 +753,7 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
             finite = use & np.isfinite(values)
             valid += int(finite.sum())
             exact += int(np.sum(values[finite] == history.multiplicity[i, finite]))
-            errors.extend(np.abs(values[finite]-history.multiplicity[i, finite]).tolist())
+            errors.extend(np.abs(values[finite] - history.multiplicity[i, finite]).tolist())
             if qualified is not None:
                 q = finite & np.array([(m, r) in qualified for r in regions])
                 qualified_count += int(q.sum())
@@ -873,40 +768,70 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     first_labels, first_centers, first_calls = _fit_view(result.get("stage_one"))
     g0 = set(result.get("g0_ids", ()))
     contributors = result.get("contributors", ())
-    qualified = {(row["mutation_id"], row["region_id"]) for row in contributors if row.get("contributes_to_cap" if map_policy else "usable", False)}
+    qualified = {(row["mutation_id"], row["region_id"]) for row in contributors if row.get("contributes_to_cap", False)}
     metric("original_evaluable", "all", value=original_n)
-    available_clonal = any(clonal[m] and evaluable[index[m]] for m in ids)
+    available_clonal = any((clonal[m] and evaluable[index[m]] for m in ids))
     metric("true_clonal_availability", "A", value=int(available_clonal))
-    metric("available_reference_not_recognized", "A", value=int(available_clonal and not g0)
-           if result.get("stage_one") else None, reason=None if result.get("stage_one") else "unavailable_analysis")
-    metric("appropriate_no_reference", "A", value=int(not available_clonal and not g0)
-           if result.get("stage_one") else None, reason=None if result.get("stage_one") else "unavailable_analysis")
-    metric("selected_reference_purity", "A", sum(clonal[m] for m in g0), len(g0))
-    metric("true_clonal_outside_reference", "A", sum(clonal[m] and m not in g0 for m in ids), sum(clonal.values()))
-    clonal_segments = {(r, str(catalog.segment_ids[index[m], j])) for m in ids if clonal[m] for j, r in enumerate(regions)}
+    metric(
+        "available_reference_not_recognized",
+        "A",
+        value=int(available_clonal and (not g0)) if result.get("stage_one") else None,
+        reason=None if result.get("stage_one") else "unavailable_analysis",
+    )
+    metric(
+        "appropriate_no_reference",
+        "A",
+        value=int(not available_clonal and (not g0)) if result.get("stage_one") else None,
+        reason=None if result.get("stage_one") else "unavailable_analysis",
+    )
+    metric("selected_reference_purity", "A", sum((clonal[m] for m in g0)), len(g0))
+    metric("true_clonal_outside_reference", "A", sum((clonal[m] and m not in g0 for m in ids)), sum(clonal.values()))
+    clonal_segments = {
+        (r, str(catalog.segment_ids[index[m], j])) for m in ids if clonal[m] for j, r in enumerate(regions)
+    }
     selected_segments = {(r, str(catalog.segment_ids[index[m], j])) for m in g0 for j, r in enumerate(regions)}
     metric("reference_segment_coverage", "A", len(clonal_segments & selected_segments), len(clonal_segments))
-    true_classes = {(r, str(catalog.segment_ids[index[m], j]), float(history.multiplicity[index[m], j]))
-                    for m in ids if clonal[m] for j, r in enumerate(regions)}
-    source_classes = {(r, str(catalog.segment_ids[index[m], j]), float(history.multiplicity[index[m], j]))
-                      for m in g0 for j, r in enumerate(regions) if history.phi[index[m], j] > 0}
+    true_classes = {
+        (r, str(catalog.segment_ids[index[m], j]), float(history.multiplicity[index[m], j]))
+        for m in ids
+        if clonal[m]
+        for j, r in enumerate(regions)
+    }
+    source_classes = {
+        (r, str(catalog.segment_ids[index[m], j]), float(history.multiplicity[index[m], j]))
+        for m in g0
+        for j, r in enumerate(regions)
+        if history.phi[index[m], j] > 0
+    }
     metric("reference_segment_multiplicity_coverage", "A", len(true_classes & source_classes), len(true_classes))
     contributor_truth = []
     for row in contributors:
-        i, j = index[row["mutation_id"]], regions.index(row["region_id"])
+        i, j = (index[row["mutation_id"]], regions.index(row["region_id"]))
         if history.phi[i, j] > 0 and np.isfinite(history.multiplicity[i, j]) and observed[i, j]:
-            contributor_truth.append((bool(row.get("contributes_to_cap" if map_policy else "usable", False)),
-                                      float(row.get("cap_source_map_upper" if all_targets else "cap_source_map_call" if map_policy else "native_call", np.nan)) == history.multiplicity[i, j]))
-    metric("contributor_qualification_sensitivity", "A", sum(q and correct for q, correct in contributor_truth),
-           sum(correct for _, correct in contributor_truth))
-    metric("accepted_contributor_accuracy", "A", sum(q and correct for q, correct in contributor_truth),
-           sum(q for q, _ in contributor_truth))
+            contributor_truth.append(
+                (
+                    bool(row.get("contributes_to_cap", False)),
+                    float(row.get("cap_source_map_upper", np.nan)) == history.multiplicity[i, j],
+                )
+            )
+    metric(
+        "contributor_qualification_sensitivity",
+        "A",
+        sum((q and correct for q, correct in contributor_truth)),
+        sum((correct for _, correct in contributor_truth)),
+    )
+    metric(
+        "accepted_contributor_accuracy",
+        "A",
+        sum((q and correct for q, correct in contributor_truth)),
+        sum((q for q, _ in contributor_truth)),
+    )
     partition("A", first_labels, ids, "native")
     ccf("A", first_centers, "native_source")
     multiplicity("A", first_calls, "native_source", qualified)
     retained = {"A": dict(available=bool(result.get("stage_one")) if "stage_one" in result else None)}
     arms = result.get("arms", {})
-    native_views, combined_views, arm_states = {}, {}, {}
+    native_views, combined_views, arm_states = ({}, {}, {})
     for arm in ("B", "C"):
         payload = arms.get(arm, {})
         second_labels, second_centers, second_calls = _fit_view(payload.get("stage_two"))
@@ -916,25 +841,33 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         reference = payload.get("reference") or {}
         labels = tuple(reference.get("labels", ()))
         centers = np.asarray(reference.get("centers", []), float)
-        geometry = reference_center_diagnostics(labels, centers, truth_centers,
-            match_atol=reference_match_atol, distance=reference_distance)
+        geometry = reference_center_diagnostics(
+            labels, centers, truth_centers, match_atol=reference_match_atol, distance=reference_distance
+        )
         if not reference:
             geometry.update(status="unavailable_reference", recovered_count=None, reference_recall=None)
         reference_geometry[arm] = geometry
         for name in ("mean_one_to_one_l2_error", "mean_nearest_l2_error", "reference_recall"):
-            metric(name, arm, value=geometry[name], view="reference_center_geometry",
-                   reason=geometry["status"] if name == "reference_recall" and geometry["status"] != "assessed" else None)
+            metric(
+                name,
+                arm,
+                value=geometry[name],
+                view="reference_center_geometry",
+                reason=geometry["status"] if name == "reference_recall" and geometry["status"] != "assessed" else None,
+            )
         center_lookup = dict(zip(labels, centers))
         clonal_label = reference.get("clonal_label", 0)
-        targets, non_targets = set(payload.get("targets", ())), set(payload.get("non_targets", ()))
+        targets, non_targets = (set(payload.get("targets", ())), set(payload.get("non_targets", ())))
         if combined and (targets & non_targets or targets | non_targets != set(combined)):
             raise ValueError("Targets and unchanged members must partition accepted combined membership")
         status = payload.get("status", "unavailable")
         available = bool(reference) and bool(combined)
-        if status == "complete" and not reference:
+        if status == "complete" and (not reference):
             raise ValueError("Complete arm has no frozen reference")
-        retained[arm] = dict(available=True if available else False if "combined_labels" in payload and not combined else None,
-                            reference_available=bool(reference) if "reference" in payload else None)
+        retained[arm] = dict(
+            available=True if available else False if "combined_labels" in payload and (not combined) else None,
+            reference_available=bool(reference) if "reference" in payload else None,
+        )
         partition(arm, second_labels, result.get("remainder_ids", ()), "native_remainder")
         partition(arm, combined, ids, "combined")
         native_centers = {m: np.asarray(value, float) for m, value in payload.get("native_centers", {}).items()}
@@ -946,45 +879,44 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
         calls = {m: first_calls[m] for m in g0 if m in first_calls}
         calls.update(second_calls)
         multiplicity(arm, calls, "native_source")
-        if all_targets:
-            if non_targets or targets != set(combined):
-                raise ValueError("Current Stage 3 must reassess every combined fitted mutation")
-            metric("stage_two_reassessment_coverage", arm, len(set(second_labels) & targets), len(second_labels))
-            metric("reference_consolidation_count", arm,
-                   value=(1 if reference_policy == STAGE_THREE_REFERENCE_POLICY else 2)
-                   + len(set(second_labels.values())) - len(labels) if available else None)
-        else:
-            newly_merged = targets-g0
-            near = {m for m, center in second_centers.items()
-                    if np.linalg.norm(center - 1) < result["config"]["stage_two_near_clonal_distance_max" if map_policy else "clonal_distance_max"]}
-            metric("geometric_near_clonal_routing_coverage", arm, len(near & targets), len(near))
-            remaining_true_nonclonal = {m for m in second_labels if not clonal[m]}
-            remaining_true_clonal = {m for m in second_labels if clonal[m]}
-            false_merged = {m for m in newly_merged if not clonal[m]}
-            metric("false_merge_fraction", arm, len(false_merged), len(newly_merged))
-            metric("false_merge_nonclonal_rate", arm, len(false_merged), len(remaining_true_nonclonal))
-            metric("unmerged_true_clonal_fraction", arm, len(remaining_true_clonal-newly_merged), len(remaining_true_clonal))
-            groups = payload.get("group_records", ())
-            for classification in ("clonal_merge_eligible", "nonclonal", "unresolved"):
-                metric("group_classification_fraction", arm,
-                       sum(row.get("classification") == classification for row in groups), len(groups), stratum=classification)
+        if non_targets or targets != set(combined):
+            raise ValueError("Current Stage 3 must reassess every combined fitted mutation")
+        metric("stage_two_reassessment_coverage", arm, len(set(second_labels) & targets), len(second_labels))
+        metric(
+            "reference_consolidation_count",
+            arm,
+            value=(1 if reference_policy == STAGE_THREE_REFERENCE_POLICY else 2)
+            + len(set(second_labels.values()))
+            - len(labels)
+            if available
+            else None,
+        )
         sources = {label: [m for m, value in combined.items() if value == label] for label in labels}
         mapping, map_records = candidate_correspondence(labels, clonal_label, sources, truth_ids, clonal_class)
         for row in map_records:
-            field = "reference_source_role" if all_targets else "classification"
-            row["source_roles" if all_targets else "source_classifications"] = sorted({source.get(field, "unavailable")
-                for source in reference.get("lineage", ()) if source.get("baseline_reference_label") == row["candidate_label"]})
-        correspondence.extend(dict(arm=arm, **row) for row in map_records)
+            field = "reference_source_role"
+            row["source_roles"] = sorted(
+                {
+                    source.get(field, "unavailable")
+                    for source in reference.get("lineage", ())
+                    if source.get("baseline_reference_label") == row["candidate_label"]
+                }
+            )
+        correspondence.extend((dict(arm=arm, **row) for row in map_records))
         baseline_correct = {m: (label == clonal_label) == clonal[m] for m, label in combined.items()}
-        baseline_multi = {m: mapping.get(label) == truth_ids[m] for m, label in combined.items()}
-        metric("correct_per_original_evaluable", arm,
-               sum(baseline_correct.get(m, False) and evaluable[index[m]] for m in ids), original_n,
-               reason=None if available else "unavailable_no_correct_decision_credit")
+        metric(
+            "binary_map_correct_per_original_evaluable",
+            arm,
+            sum((baseline_correct.get(m, False) and evaluable[index[m]] for m in ids)),
+            original_n,
+            reason=None if available else "unavailable_no_correct_decision_credit",
+        )
+        metrics[-1]["endpoint"] = "binary_clonality"
         assignment = payload.get("assignment")
-        if assignment is not None and method_aware and assignment.get("assignment_method") != assignment_method:
+        if assignment is not None and assignment.get("assignment_method") != assignment_method:
             raise ValueError("Assignment and workflow methods differ")
         records = {row["mutation_id"]: row for row in assignment.get("assignments", ())} if assignment else {}
-        stage = arm+"3"
+        stage = arm + "3"
         assignment_available = assignment is not None
         if assignment_available and set(records) != targets:
             raise ValueError("Assignment targets differ from the frozen target population")
@@ -994,27 +926,28 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
             if row["mutation_id"] in non_targets and row.get("final_assignment_label") != combined[row["mutation_id"]]:
                 raise ValueError("Reported Stage 3 output changed an unchanged non-target membership")
         final = {m: label for m, label in combined.items() if m in non_targets}
-        accepted_estimates, conditional_calls, assigned_calls = {}, {}, {}
-        finite_probability_count, accepted_count, correct_count, wrong_count = 0, 0, 0, 0
-        mapped_correct, unmapped_accepted, absent_accepted = 0, 0, 0
-        transitions, multi_transitions = Counter(), Counter()
+        accepted_estimates, conditional_calls, assigned_calls = ({}, {}, {})
+        finite_probability_count = 0
+        transitions = Counter()
         target_evaluable = {m for m in targets if evaluable[index[m]]}
         for mutation in sorted(targets):
             record = records.get(mutation)
-            if record and method_aware:
+            if record:
                 if record.get("assignment_method") != assignment_method:
                     raise ValueError("Assignment row method differs from workflow")
-                if assignment_method == "profile" and (record.get("posterior_defined") is not False
-                        or any(record.get(field) is not None for field in POSTERIOR_FIELDS)):
+                if assignment_method == "profile" and (
+                    record.get("posterior_defined") is not False
+                    or any((record.get(field) is not None for field in POSTERIOR_FIELDS))
+                ):
                     raise ValueError("Profile assignment cannot define a cluster posterior")
                 if record.get("evidence_status") == "observed" and record.get("score_defined") is not True:
                     raise ValueError("Observed assignment requires a defined score")
-            accepted = record.get("final_assignment_label" if map_policy else "accepted_label") if record else None
-            if map_policy and record:
+            accepted = record.get("final_assignment_label") if record else None
+            if record:
                 evidence = record.get("evidence_status", record.get("status"))
                 if evidence == "observed" and (accepted is None or accepted != record.get("map_cluster_label")):
                     raise ValueError("Observed targets require their authoritative MAP final label")
-                if evidence == "observed" and not observed[index[mutation]].any():
+                if evidence == "observed" and (not observed[index[mutation]].any()):
                     raise ValueError("Observed MAP evidence needs informative original reads")
                 if evidence == "prior_only" and observed[index[mutation]].any():
                     raise ValueError("Prior-only evidence cannot discard informative original reads")
@@ -1022,26 +955,23 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                     raise ValueError("Non-observed evidence cannot supply a data-supported final label")
             is_eval = mutation in target_evaluable
             correct = (accepted == clonal_label) == clonal[mutation] if accepted is not None else None
-            multi_correct = mapping.get(accepted) == truth_ids[mutation] if accepted is not None else None
             if accepted is not None:
                 if accepted not in center_lookup:
                     raise ValueError("Accepted target label is outside the fixed reference")
                 final[mutation] = accepted
                 accepted_estimates[mutation] = center_lookup[accepted]
             if is_eval and assignment_available:
-                accepted_count += accepted is not None
-                correct_count += correct is True
-                wrong_count += correct is False
                 transitions[transition(baseline_correct[mutation], correct)] += 1
-                multi_transitions[transition(baseline_multi[mutation], multi_correct)] += 1
-                mapped_correct += multi_correct is True
-                unmapped_accepted += accepted is not None and mapping.get(accepted) is None
-                absent_accepted += accepted is not None and truth_ids[mutation] not in set(mapping.values())
             probabilities = np.asarray(record.get("probabilities", []), float) if record else np.array([])
-            probability_defined = bool(assignment_method == "marginal" and record
-                and record.get("posterior_defined", not method_aware)
-                and probabilities.shape == (len(labels),) and bool(labels) and np.isfinite(probabilities).all()
-                and (not method_aware or (np.all(probabilities >= 0) and np.isclose(probabilities.sum(), 1., rtol=0, atol=1e-12))))
+            probability_defined = bool(
+                assignment_method == "marginal"
+                and record
+                and record.get("posterior_defined", False)
+                and (probabilities.shape == (len(labels),))
+                and bool(labels)
+                and np.isfinite(probabilities).all()
+                and (np.all(probabilities >= 0) and np.isclose(probabilities.sum(), 1.0, rtol=0, atol=1e-12))
+            )
             if is_eval and probability_defined:
                 finite_probability_count += 1
                 mapped = mapped_probabilities(probabilities, labels, mapping, classes)
@@ -1049,218 +979,416 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
                 scores = np.asarray(record["log_scores"], float)
                 binary_indices = [i for i, label in enumerate(labels) if (label == clonal_label) == clonal[mutation]]
                 multiclass_indices = [i for i, label in enumerate(labels) if mapping.get(label) == truth_ids[mutation]]
-                binary = probability_scores(q, clonal[mutation], true_log_probability=log_probability_mass(scores, binary_indices))
-                multiclass = probability_scores(mapped, None, truth_class=truth_ids[mutation],
-                                                 true_log_probability=log_probability_mass(scores, multiclass_indices))
-                map_label = record["map_cluster_label"] if map_policy else labels[int(np.argmax(probabilities))]
-                calibration_rows.append(dict(arm=stage, mutation_id=mutation, source_stage=record.get("source_stage"),
-                    K=len(labels), truth_clonal=clonal[mutation], clonal_probability=q,
-                    biological_clonal_mass=mapped.get(clonal_class, 0.) if clonal_class else 0.,
-                    truth_class=truth_ids[mutation], mapped_probabilities=mapped, unmapped_mass=mapped[UNMAPPED],
-                    true_class_present=truth_ids[mutation] in set(mapping.values()),
-                    binary_brier=binary["brier"], binary_log_loss=binary["log_loss"],
-                    multiclass_brier=multiclass["brier"], multiclass_log_loss=multiclass["log_loss"],
-                    confidence=float(np.max(probabilities)), confidence_correct=bool(mapping.get(map_label) == truth_ids[mutation]),
-                    best_log_probability=float(record["best_log_probability"]),
-                    log_competitor_ratio=float(record["log_competitor_ratio"]),
-                    has_finite_alternative=bool(record["has_finite_alternative"]),
-                    best_clonal_correct=bool((map_label == clonal_label) == clonal[mutation]),
-                    nonconfidence_gates_pass=bool(map_policy or (not record.get("cluster_tie", True)
-                        and record.get("reference_quality_pass", False)
-                        and record.get("fit_screen_status") == "pass")),
-                    mean_depth=float(catalog.total_counts[index[mutation]][observed[index[mutation]]].mean()),
-                    major_cn=float(np.max(catalog.major_cn[index[mutation]]))))
-            mutation_rows.append(dict(arm=stage, mutation_id=mutation, evaluable=is_eval, truth_clonal=clonal[mutation],
-                truth_class=truth_ids[mutation], role="target", baseline_reference_label=combined.get(mutation),
-                baseline_correct=baseline_correct.get(mutation), accepted_label=accepted, correct=correct,
-                legacy_multiclass_correct_unmapped_as_error=multi_correct, status=record.get("status") if record else "unavailable_analysis",
-                transition=transition(baseline_correct[mutation], correct) if is_eval and assignment_available else None,
-                source_stage=record.get("source_stage") if record else None,
-                target_reason=record.get("target_reason") if record else
-                    source_origin if mutation in g0 else second_origin,
-                reference_quality_pass=record.get("reference_quality_pass") if record else None,
-                historical_cap_contributor=any((mutation, region) in qualified for region in regions),
-                historical_cap_contributor_reassigned=bool(accepted is not None and accepted != clonal_label
-                    and any((mutation, region) in qualified for region in regions)),
-                final_assignment_label=accepted, probability_available=probability_defined))
-            if method_aware:
-                mutation_rows[-1].update(assignment_method=assignment_method,
-                    score_defined=record.get("score_defined") if record else None,
-                    selection_reason=record.get("selection_reason") if record else None)
+                binary = probability_scores(
+                    q, clonal[mutation], true_log_probability=log_probability_mass(scores, binary_indices)
+                )
+                multiclass = probability_scores(
+                    mapped,
+                    None,
+                    truth_class=truth_ids[mutation],
+                    true_log_probability=log_probability_mass(scores, multiclass_indices),
+                )
+                map_label = record["map_cluster_label"]
+                calibration_rows.append(
+                    dict(
+                        arm=stage,
+                        mutation_id=mutation,
+                        source_stage=record.get("source_stage"),
+                        K=len(labels),
+                        truth_clonal=clonal[mutation],
+                        clonal_probability=q,
+                        biological_clonal_mass=mapped.get(clonal_class, 0.0) if clonal_class else 0.0,
+                        truth_class=truth_ids[mutation],
+                        mapped_probabilities=mapped,
+                        unmapped_mass=mapped[UNMAPPED],
+                        true_class_present=truth_ids[mutation] in set(mapping.values()),
+                        binary_brier=binary["brier"],
+                        binary_log_loss=binary["log_loss"],
+                        multiclass_brier=multiclass["brier"],
+                        multiclass_log_loss=multiclass["log_loss"],
+                        confidence=float(np.max(probabilities)),
+                        confidence_correct=bool(mapping.get(map_label) == truth_ids[mutation]),
+                        best_log_probability=float(record["best_log_probability"]),
+                        log_competitor_ratio=float(record["log_competitor_ratio"]),
+                        has_finite_alternative=bool(record["has_finite_alternative"]),
+                        best_clonal_correct=bool((map_label == clonal_label) == clonal[mutation]),
+                        nonconfidence_gates_pass=bool(True),
+                        mean_depth=float(catalog.total_counts[index[mutation]][observed[index[mutation]]].mean()),
+                        major_cn=float(np.max(catalog.major_cn[index[mutation]])),
+                    )
+                )
+            mutation_rows.append(
+                dict(
+                    arm=stage,
+                    mutation_id=mutation,
+                    evaluable=is_eval,
+                    truth_clonal=clonal[mutation],
+                    truth_class=truth_ids[mutation],
+                    role="target",
+                    baseline_reference_label=combined.get(mutation),
+                    baseline_correct=baseline_correct.get(mutation),
+                    accepted_label=accepted,
+                    correct=correct,
+                    status=record.get("status") if record else "unavailable_analysis",
+                    transition=transition(baseline_correct[mutation], correct)
+                    if is_eval and assignment_available
+                    else None,
+                    source_stage=record.get("source_stage") if record else None,
+                    target_reason=record.get("target_reason")
+                    if record
+                    else source_origin
+                    if mutation in g0
+                    else second_origin,
+                    reference_quality_pass=record.get("reference_quality_pass") if record else None,
+                    historical_cap_contributor=any(((mutation, region) in qualified for region in regions)),
+                    historical_cap_contributor_reassigned=bool(
+                        accepted is not None
+                        and accepted != clonal_label
+                        and any(((mutation, region) in qualified for region in regions))
+                    ),
+                    final_assignment_label=accepted,
+                    probability_available=probability_defined,
+                )
+            )
+            mutation_rows[-1].update(
+                assignment_method=assignment_method,
+                score_defined=record.get("score_defined") if record else None,
+                selection_reason=record.get("selection_reason") if record else None,
+            )
         for mutation in sorted(non_targets):
-            mutation_rows.append(dict(arm=stage, mutation_id=mutation, evaluable=bool(evaluable[index[mutation]]),
-                truth_clonal=clonal[mutation], truth_class=truth_ids[mutation], role="unchanged_non_target",
-                baseline_reference_label=combined[mutation], final_assignment_label=final[mutation],
-                accepted_label=final[mutation], baseline_correct=baseline_correct[mutation],
-                correct=baseline_correct[mutation], legacy_multiclass_correct_unmapped_as_error=baseline_multi[mutation],
-                status="unchanged_non_target", probability_available=False))
-        for mutation in sorted(set(ids)-set(combined)):
-            mutation_rows.append(dict(arm=stage, mutation_id=mutation, evaluable=bool(evaluable[index[mutation]]),
-                truth_clonal=clonal[mutation], truth_class=truth_ids[mutation], role="outside_combined",
-                baseline_reference_label=None, final_assignment_label=None, accepted_label=None, baseline_correct=None, correct=None,
-                status="not_in_accepted_combined_population", probability_available=False))
+            mutation_rows.append(
+                dict(
+                    arm=stage,
+                    mutation_id=mutation,
+                    evaluable=bool(evaluable[index[mutation]]),
+                    truth_clonal=clonal[mutation],
+                    truth_class=truth_ids[mutation],
+                    role="unchanged_non_target",
+                    baseline_reference_label=combined[mutation],
+                    final_assignment_label=final[mutation],
+                    accepted_label=final[mutation],
+                    baseline_correct=baseline_correct[mutation],
+                    correct=baseline_correct[mutation],
+                    status="unchanged_non_target",
+                    probability_available=False,
+                )
+            )
+        for mutation in sorted(set(ids) - set(combined)):
+            mutation_rows.append(
+                dict(
+                    arm=stage,
+                    mutation_id=mutation,
+                    evaluable=bool(evaluable[index[mutation]]),
+                    truth_clonal=clonal[mutation],
+                    truth_class=truth_ids[mutation],
+                    role="outside_combined",
+                    baseline_reference_label=None,
+                    final_assignment_label=None,
+                    accepted_label=None,
+                    baseline_correct=None,
+                    correct=None,
+                    status="not_in_accepted_combined_population",
+                    probability_available=False,
+                )
+            )
         arm_rows = mutation_rows[arm_mutation_start:]
         for row in arm_rows:
             mutation = row["mutation_id"]
             row["binary_clonality_correct"] = row.get("correct")
             row["baseline_detailed_membership_status"] = detailed_membership_status(
-                row["baseline_reference_label"], truth_ids[mutation], mapping)
+                row["baseline_reference_label"], truth_ids[mutation], mapping
+            )
             row["detailed_membership_status"] = detailed_membership_status(
-                row["accepted_label"], truth_ids[mutation], mapping)
+                row["accepted_label"], truth_ids[mutation], mapping
+            )
             row["detailed_membership_transition"] = (
-                row["baseline_detailed_membership_status"]+"->"+row["detailed_membership_status"]
-                if row["role"] != "target" or assignment_available else None)
+                row["baseline_detailed_membership_status"] + "->" + row["detailed_membership_status"]
+                if row["role"] != "target" or assignment_available
+                else None
+            )
             row["detailed_membership_correct"] = {"Mc": True, "Mw": False}.get(row["detailed_membership_status"])
-            row.update(target_reference_availability(history.phi[index[mutation]], observed[index[mutation]],
-                reference, match_atol=reference_match_atol, distance=reference_distance,
-                accepted_label=row["accepted_label"], quality_required=not map_policy))
-            if row["role"] == "target" and not assignment_available:
+            row.update(
+                target_reference_availability(
+                    history.phi[index[mutation]],
+                    observed[index[mutation]],
+                    reference,
+                    match_atol=reference_match_atol,
+                    distance=reference_distance,
+                    accepted_label=row["accepted_label"],
+                    quality_required=False,
+                )
+            )
+            if row["role"] == "target" and (not assignment_available):
                 row["geometric_correct_reference_acceptance"] = None
         populations = {
             "targets": [row for row in arm_rows if row["role"] == "target"],
             "unchanged_F": [row for row in arm_rows if row["role"] == "unchanged_non_target"],
             "whole_original": arm_rows,
-            **{origin: [row for row in arm_rows if row.get("target_reason") == origin]
-               for origin in (source_origin, second_origin)}}
+            **{
+                origin: [row for row in arm_rows if row.get("target_reason") == origin]
+                for origin in (source_origin, second_origin)
+            },
+        }
         detailed_transitions[stage] = {}
         for origin in (source_origin, second_origin):
             selected = [row for row in populations[origin] if row["evaluable"]]
-            counts = Counter(row["detailed_membership_transition"] for row in selected)
-            detailed_transitions[stage][origin] = [dict(baseline_state=before, final_state=after,
-                count=counts[before+"->"+after] if assignment_available else None,
-                denominator=len(selected), fraction=_ratio(counts[before+"->"+after], len(selected)) if assignment_available else None,
-                status="available" if assignment_available else "unavailable_analysis")
-                for before in DETAILED_STATES for after in DETAILED_STATES]
+            counts = Counter((row["detailed_membership_transition"] for row in selected))
+            detailed_transitions[stage][origin] = [
+                dict(
+                    baseline_state=before,
+                    final_state=after,
+                    count=counts[before + "->" + after] if assignment_available else None,
+                    denominator=len(selected),
+                    fraction=_ratio(counts[before + "->" + after], len(selected)) if assignment_available else None,
+                    status="available" if assignment_available else "unavailable_analysis",
+                )
+                for before in DETAILED_STATES
+                for after in DETAILED_STATES
+            ]
             for row in detailed_transitions[stage][origin]:
-                metric("detailed_membership_transition_fraction", stage, value=row["fraction"],
-                    stratum=origin+":"+row["baseline_state"]+"->"+row["final_state"],
-                    reason=None if assignment_available else "unavailable_analysis")
+                metric(
+                    "detailed_membership_transition_fraction",
+                    stage,
+                    value=row["fraction"],
+                    stratum=origin + ":" + row["baseline_state"] + "->" + row["final_state"],
+                    reason=None if assignment_available else "unavailable_analysis",
+                )
         detailed_membership[stage] = {}
         for population_name, rows in populations.items():
             summary = detailed_membership_summary(rows)
-            summary["status"] = ("unavailable_analysis" if population_name != "unchanged_F"
-                and not assignment_available else "available")
+            summary["status"] = (
+                "unavailable_analysis"
+                if population_name != "unchanged_F" and (not assignment_available)
+                else "available"
+            )
             detailed_membership[stage][population_name] = summary
             view = "" if population_name == "targets" else population_name
-            for name in ("mapped_correct_resolution", "mapped_wrong_resolution", "mapped_selective_error",
-                    "unmapped_acceptance_fraction", "unmapped_resolution", "detailed_selective_error_lower_bound",
-                    "detailed_selective_error_upper_bound"):
-                metric(name, stage, value=summary[name], view=view,
-                    reason="unavailable_analysis" if summary["status"] == "unavailable_analysis" else None)
+            for name in (
+                "mapped_correct_resolution",
+                "mapped_wrong_resolution",
+                "mapped_selective_error",
+                "unmapped_acceptance_fraction",
+                "unmapped_resolution",
+                "detailed_selective_error_lower_bound",
+                "detailed_selective_error_upper_bound",
+            ):
+                metric(
+                    name,
+                    stage,
+                    value=summary[name],
+                    view=view,
+                    reason="unavailable_analysis" if summary["status"] == "unavailable_analysis" else None,
+                )
             evaluable_rows = [row for row in rows if row["evaluable"]]
             for kind in ("geometric", "usable"):
-                field = kind+"_reference_available"
+                field = kind + "_reference_available"
                 assessed = [row for row in evaluable_rows if row[field] is not None]
-                unavailable_statuses = sorted({row[kind+"_availability_status"] for row in evaluable_rows})
-                metric(field, stage, sum(row[field] for row in assessed), len(assessed), view=view,
-                    reason=None if assessed else unavailable_statuses[0] if len(unavailable_statuses) == 1
-                    else "not_evaluable_empty_population" if not evaluable_rows else "unavailable_mixed_reasons")
-                metric(kind+"_availability_assessment_coverage", stage, len(assessed), len(evaluable_rows), view=view)
+                unavailable_statuses = sorted({row[kind + "_availability_status"] for row in evaluable_rows})
+                metric(
+                    field,
+                    stage,
+                    sum((row[field] for row in assessed)),
+                    len(assessed),
+                    view=view,
+                    reason=None
+                    if assessed
+                    else unavailable_statuses[0]
+                    if len(unavailable_statuses) == 1
+                    else "not_evaluable_empty_population"
+                    if not evaluable_rows
+                    else "unavailable_mixed_reasons",
+                )
+                metric(kind + "_availability_assessment_coverage", stage, len(assessed), len(evaluable_rows), view=view)
             geometric = [row for row in evaluable_rows if row["geometric_correct_reference_acceptance"] is not None]
-            metric("geometric_correct_reference_resolution", stage,
-                sum(row["geometric_correct_reference_acceptance"] for row in geometric), len(evaluable_rows), view=view,
-                reason=None if len(geometric) == len(evaluable_rows) else "unavailable_geometric_acceptance")
-        # Availability strata use both origins and F, never alter binary recovery reach.
+            metric(
+                "geometric_correct_reference_resolution",
+                stage,
+                sum((row["geometric_correct_reference_acceptance"] for row in geometric)),
+                len(evaluable_rows),
+                view=view,
+                reason=None if len(geometric) == len(evaluable_rows) else "unavailable_geometric_acceptance",
+            )
         for origin in (source_origin, second_origin, "unchanged_F"):
             rows = [row for row in populations[origin] if row["evaluable"]]
             for kind in ("geometric", "usable"):
                 for value in (True, False, None):
-                    selected = [row for row in rows if row[kind+"_reference_available"] is value]
-                    stratum = f"{origin}:{kind}:{'available' if value is True else 'absent' if value is False else 'unassessed'}"
-                    counts = Counter(row["detailed_membership_status"] for row in selected)
-                    for name, count in (("accepted", sum(row["accepted_label"] is not None for row in selected)),
-                            ("binary_correct", sum(row["binary_clonality_correct"] is True for row in selected)),
-                            ("binary_wrong", sum(row["binary_clonality_correct"] is False for row in selected)),
-                            *((key, counts[key]) for key in ("Mc", "Mw", "U", "unresolved"))):
-                        metric("availability_stratified_"+name, stage, count, len(selected),
-                            view="availability", stratum=stratum,
-                            reason="unavailable_analysis" if origin != "unchanged_F" and not assignment_available else None)
+                    selected = [row for row in rows if row[kind + "_reference_available"] is value]
+                    stratum = f"{origin}:{kind}:{('available' if value is True else 'absent' if value is False else 'unassessed')}"
+                    counts = Counter((row["detailed_membership_status"] for row in selected))
+                    for name, count in (
+                        ("accepted", sum((row["accepted_label"] is not None for row in selected))),
+                        ("binary_correct", sum((row["binary_clonality_correct"] is True for row in selected))),
+                        ("binary_wrong", sum((row["binary_clonality_correct"] is False for row in selected))),
+                        *((key, counts[key]) for key in ("Mc", "Mw", "U", "unresolved")),
+                    ):
+                        metric(
+                            "availability_stratified_" + name,
+                            stage,
+                            count,
+                            len(selected),
+                            view="availability",
+                            stratum=stratum,
+                            reason="unavailable_analysis"
+                            if origin != "unchanged_F" and (not assignment_available)
+                            else None,
+                        )
         neval = len(target_evaluable)
         reason = None if assignment_available else "unavailable_analysis"
-        for name, num, den in (("acceptance_coverage", accepted_count, neval), ("correct_resolution", correct_count, neval),
-                ("wrong_per_evaluable", wrong_count, neval), ("selective_error", wrong_count, accepted_count),
-                ("unresolved_fraction", neval-accepted_count, neval), ("probability_availability", finite_probability_count, neval),
-                ("multiclass_correct_resolution", mapped_correct, neval), ("unmapped_accepted_fraction", unmapped_accepted, accepted_count),
-                ("absent_class_false_acceptance", absent_accepted, neval),
-                ("multiclass_accuracy_lower", mapped_correct, accepted_count),
-                ("multiclass_accuracy_upper", mapped_correct+unmapped_accepted, accepted_count)):
-            metric(name, stage, num if assignment_available else None, den if assignment_available else None,
-                   value=None, reason=reason)
+        metric(
+            "probability_availability",
+            stage,
+            finite_probability_count if assignment_available else None,
+            neval if assignment_available else None,
+            reason=reason,
+        )
         for name in TRANSITIONS:
-            metric("transition_fraction", stage, transitions[name] if assignment_available else None,
-                   neval if assignment_available else None, stratum=name, reason=reason)
-            metric("legacy_multiclass_transition_fraction_unmapped_as_error", stage, multi_transitions[name] if assignment_available else None,
-                   neval if assignment_available else None, stratum=name, reason=reason)
-        wrong_baseline = sum(not baseline_correct[m] for m in target_evaluable)
-        correct_baseline = neval-wrong_baseline
+            metric(
+                "transition_fraction",
+                stage,
+                transitions[name] if assignment_available else None,
+                neval if assignment_available else None,
+                stratum=name,
+                reason=reason,
+            )
+        wrong_baseline = sum((not baseline_correct[m] for m in target_evaluable))
+        correct_baseline = neval - wrong_baseline
         metric("baseline_error_recovery", stage, transitions["error_corrected"], wrong_baseline, reason=reason)
-        metric("baseline_correct_introduced_error", stage, transitions["error_introduced"], correct_baseline, reason=reason)
+        metric(
+            "baseline_correct_introduced_error", stage, transitions["error_introduced"], correct_baseline, reason=reason
+        )
         final_correct = {m: (label == clonal_label) == clonal[m] for m, label in final.items()}
-        metric("correct_per_original_evaluable", stage,
-               sum(final_correct.get(m, False) and evaluable[index[m]] for m in ids), original_n,
-               reason=None if assignment_available else "unavailable_targets_no_correct_decision_credit")
-        metric("whole_workflow_wrong_acceptance", stage,
-               sum(final_correct.get(m) is False and evaluable[index[m]] for m in ids), original_n)
-        metric("whole_workflow_unresolved_fraction", stage,
-               sum(m not in final and evaluable[index[m]] for m in ids), original_n)
+        metric(
+            "whole_workflow_wrong_acceptance",
+            stage,
+            sum((final_correct.get(m) is False and evaluable[index[m]] for m in ids)),
+            original_n,
+        )
+        metric(
+            "whole_workflow_unresolved_fraction",
+            stage,
+            sum((m not in final and evaluable[index[m]] for m in ids)),
+            original_n,
+        )
         unchanged_evaluable = {m for m in non_targets if evaluable[index[m]]}
-        metric("unchanged_population_membership_error", stage,
-               sum(final_correct.get(m) is False for m in unchanged_evaluable), len(unchanged_evaluable))
+        metric(
+            "unchanged_population_membership_error",
+            stage,
+            sum((final_correct.get(m) is False for m in unchanged_evaluable)),
+            len(unchanged_evaluable),
+        )
         for role, members in (("target", targets), ("unchanged_non_target", non_targets)):
-            metric("correct_contribution_per_original", stage,
-                   sum(final_correct.get(m, False) and evaluable[index[m]] for m in members), original_n, stratum=role)
+            metric(
+                "correct_contribution_per_original",
+                stage,
+                sum((final_correct.get(m, False) and evaluable[index[m]] for m in members)),
+                original_n,
+                stratum=role,
+            )
         metric("reference_candidates", stage, value=len(labels) if labels else None)
         metric("target_count", stage, value=len(targets))
         metric("unchanged_non_target_count", stage, value=len(non_targets))
-        for origin, population in ((source_origin, target_evaluable & g0),
-                                   (second_origin, target_evaluable - g0)):
-            for status in ("assigned_relative", "unresolved_reference", "unresolved_fit", "low_confidence", "ambiguous_tie"):
-                metric("target_origin_status_fraction", stage,
-                    sum(records.get(m, {}).get("status") == status for m in population), len(population),
-                    stratum=origin+":"+status, reason=reason)
-            for outcome, count in (("correct_accepted", sum(final_correct.get(m) is True for m in population)),
-                                   ("wrong_accepted", sum(final_correct.get(m) is False for m in population)),
-                                   ("unresolved", sum(m not in final for m in population))):
-                metric("target_origin_outcome_fraction", stage, count, len(population),
-                       stratum=origin+":"+outcome, reason=reason)
+        for origin, population in ((source_origin, target_evaluable & g0), (second_origin, target_evaluable - g0)):
+            for status in (
+                "assigned_relative",
+                "unresolved_reference",
+                "unresolved_fit",
+                "low_confidence",
+                "ambiguous_tie",
+            ):
+                metric(
+                    "target_origin_status_fraction",
+                    stage,
+                    sum((records.get(m, {}).get("status") == status for m in population)),
+                    len(population),
+                    stratum=origin + ":" + status,
+                    reason=reason,
+                )
+            for outcome, count in (
+                ("correct_accepted", sum((final_correct.get(m) is True for m in population))),
+                ("wrong_accepted", sum((final_correct.get(m) is False for m in population))),
+                ("unresolved", sum((m not in final for m in population))),
+            ):
+                metric(
+                    "target_origin_outcome_fraction",
+                    stage,
+                    count,
+                    len(population),
+                    stratum=origin + ":" + outcome,
+                    reason=reason,
+                )
         partition(stage, final, ids, "accepted_only")
         ccf(stage, accepted_estimates, "newly_accepted_assignment")
         if assignment:
             for row in assignment.get("multiplicities", ()):
-                i, j = index[row["mutation_id"]], regions.index(row["region_id"])
-                if catalog.eligible[i, j] and (row["original_lower"] != 1 or row["original_upper"] != catalog.major_cn[i, j]):
+                i, j = (index[row["mutation_id"]], regions.index(row["region_id"]))
+                if catalog.eligible[i, j] and (
+                    row["original_lower"] != 1 or row["original_upper"] != catalog.major_cn[i, j]
+                ):
                     raise ValueError("Stage-three original support invariant failed")
                 if row["mutation_id"] not in conditional_calls:
                     conditional_calls[row["mutation_id"]] = np.full(len(regions), np.nan)
                     assigned_calls[row["mutation_id"]] = np.full(len(regions), np.nan)
-                conditional_calls[row["mutation_id"]][j] = float(row["conditional_map"]) if float(row["phi"]) > 0 else np.nan
+                conditional_calls[row["mutation_id"]][j] = (
+                    float(row["conditional_map"]) if float(row["phi"]) > 0 else np.nan
+                )
                 assigned_calls[row["mutation_id"]][j] = float(row["assigned_multiplicity"])
                 native = float(row["native_call"])
-                native_valid = bool(observed[i, j] and catalog.mapping_genuine[i, j] and float(row["native_phi"]) > 0
-                                    and np.isfinite(native) and row["native_lower"] <= native <= row["native_upper"])
-                positive = bool(catalog.eligible[i, j] and history.phi[i, j] > 0 and np.isfinite(history.multiplicity[i, j]))
-                source_violation = bool(not row["original_lower"] <= native <= row["original_upper"]) if native_valid else None
+                native_valid = bool(
+                    observed[i, j]
+                    and catalog.mapping_genuine[i, j]
+                    and (float(row["native_phi"]) > 0)
+                    and np.isfinite(native)
+                    and (row["native_lower"] <= native <= row["native_upper"])
+                )
+                positive = bool(
+                    catalog.eligible[i, j] and history.phi[i, j] > 0 and np.isfinite(history.multiplicity[i, j])
+                )
+                source_violation = (
+                    bool(not row["original_lower"] <= native <= row["original_upper"]) if native_valid else None
+                )
                 if source_violation:
                     raise ValueError("Stage-three valid native source-call containment failed")
-                correct_cn = bool(catalog.major_cn[i, j] == history.major_cn[i, j]
-                                  and catalog.minor_cn[i, j] == history.minor_cn[i, j])
+                correct_cn = bool(
+                    catalog.major_cn[i, j] == history.major_cn[i, j]
+                    and catalog.minor_cn[i, j] == history.minor_cn[i, j]
+                )
                 truth_excluded = bool(history.multiplicity[i, j] > row["original_upper"]) if positive else None
                 if positive and correct_cn and truth_excluded:
                     raise ValueError("Stage-three core true-multiplicity containment failed")
-                containment.append(dict(arm=stage, mutation_id=row["mutation_id"], region_id=row["region_id"],
-                    source_stratum=(("cap_contributor" if (row["mutation_id"], row["region_id"]) in qualified else
-                                     "other_source" if row["mutation_id"] in g0 else "stage_two_native") if all_targets else
-                                    "qualified_G0" if (row["mutation_id"], row["region_id"]) in qualified else
-                                    "other_G0" if row["mutation_id"] in g0 else "newly_merged_stage_two"),
-                    original_eligible=bool(catalog.eligible[i, j]), candidates_checked=len(labels), support_violation=False,
-                    source_call_valid=native_valid, source_call_violation=source_violation,
-                    positive_carrier_truth=positive, true_support_exclusion=truth_excluded, correct_supplied_cn=correct_cn,
-                    inherited_input_exclusion=bool(history.multiplicity[i, j] > catalog.major_cn[i, j]) if positive else None))
+                containment.append(
+                    dict(
+                        arm=stage,
+                        mutation_id=row["mutation_id"],
+                        region_id=row["region_id"],
+                        source_stratum="cap_contributor"
+                        if (row["mutation_id"], row["region_id"]) in qualified
+                        else "other_source"
+                        if row["mutation_id"] in g0
+                        else "stage_two_native",
+                        original_eligible=bool(catalog.eligible[i, j]),
+                        candidates_checked=len(labels),
+                        support_violation=False,
+                        source_call_valid=native_valid,
+                        source_call_violation=source_violation,
+                        positive_carrier_truth=positive,
+                        true_support_exclusion=truth_excluded,
+                        correct_supplied_cn=correct_cn,
+                        inherited_input_exclusion=bool(history.multiplicity[i, j] > catalog.major_cn[i, j])
+                        if positive
+                        else None,
+                    )
+                )
             multiplicity(stage, conditional_calls, "displayed_best_candidate")
             multiplicity(stage, assigned_calls, "assigned_call")
-        arm_states[arm] = dict(baseline=baseline_correct, final=final_correct,
-                              targets=targets, non_targets=non_targets, available=available,
-                              assignment_available=assignment_available, evaluable_target_count=neval)
+        arm_states[arm] = dict(
+            baseline=baseline_correct,
+            final=final_correct,
+            targets=targets,
+            non_targets=non_targets,
+            available=available,
+            assignment_available=assignment_available,
+            evaluable_target_count=neval,
+        )
     common = set(first_labels) & set(native_views.get("B", {})) & set(native_views.get("C", {}))
     for arm, labels in (("A", first_labels), *native_views.items()):
         partition(arm, labels, sorted(common), "common_native_remainder")
@@ -1272,163 +1400,273 @@ def evaluate(history, catalog, result, *, acquisition=None, reference_match_atol
     for arm in ("B", "C"):
         state = arm_states[arm]
         selected = {m for m in common_targets if evaluable[index[m]]}
-        metric("exclusive_target_count", arm+"3", value=len(state["targets"]-common_targets))
-        metric("common_target_correct_resolution", arm+"3",
-               sum(state["final"].get(m) is True for m in selected), len(selected),
-               reason=None if state["assignment_available"] else "unavailable_analysis")
-        metric("common_target_wrong_per_evaluable", arm+"3",
-               sum(state["final"].get(m) is False for m in selected), len(selected),
-               reason=None if state["assignment_available"] else "unavailable_analysis")
-        metric("common_target_acceptance", arm+"3", sum(m in state["final"] for m in selected), len(selected),
-               reason=None if state["assignment_available"] else "unavailable_analysis")
+        metric("exclusive_target_count", arm + "3", value=len(state["targets"] - common_targets))
+        metric(
+            "common_target_correct_resolution",
+            arm + "3",
+            sum((state["final"].get(m) is True for m in selected)),
+            len(selected),
+            reason=None if state["assignment_available"] else "unavailable_analysis",
+        )
+        metric(
+            "common_target_wrong_per_evaluable",
+            arm + "3",
+            sum((state["final"].get(m) is False for m in selected)),
+            len(selected),
+            reason=None if state["assignment_available"] else "unavailable_analysis",
+        )
+        metric(
+            "common_target_acceptance",
+            arm + "3",
+            sum((m in state["final"] for m in selected)),
+            len(selected),
+            reason=None if state["assignment_available"] else "unavailable_analysis",
+        )
     reach = recovery_reach(arm_states, evaluable, index)
     for name, values in reach.items():
         if isinstance(values, dict) and "numerator" in values:
             metric(name, "C3_vs_B", values["numerator"], values["denominator"], view="cap_associated_error")
     bounds = result.get("cap_bounds")
-    audit = cap_audit(history, catalog, result.get("remainder_ids", ()), contributors,
-                      np.asarray(bounds["upper"], float), scope="selected_native_map_set_upper" if all_targets else "selected_available_native_map" if map_policy else "selected_qualified") if bounds else []
+    audit = (
+        cap_audit(
+            history,
+            catalog,
+            result.get("remainder_ids", ()),
+            contributors,
+            np.asarray(bounds["upper"], float),
+            scope="selected_native_map_set_upper",
+        )
+        if bounds
+        else []
+    )
     if bounds:
         remainder_indices = [index[m] for m in result.get("remainder_ids", ())]
         eligible = catalog.eligible[remainder_indices]
         upper = np.asarray(bounds["upper"], float)[remainder_indices]
-        metric("cap_activity_all_eligible", "C", int(np.sum(eligible & (upper < catalog.major_cn[remainder_indices]))),
-               int(eligible.sum()))
+        metric(
+            "cap_activity_all_eligible",
+            "C",
+            int(np.sum(eligible & (upper < catalog.major_cn[remainder_indices]))),
+            int(eligible.sum()),
+        )
     _cap_metrics(audit, metric)
     for arm in ("B3", "C3"):
         rows = [row for row in containment if row["arm"] == arm]
         available = arm_states[arm[0]]["assignment_available"]
-        for name, count in (("stage3_support_violation_count", sum(row["support_violation"] for row in rows)),
-                ("stage3_source_call_violation_count", sum(row["source_call_violation"] is True for row in rows)),
-                ("stage3_core_truth_violation_count", sum(row["positive_carrier_truth"] and row["correct_supplied_cn"]
-                    and row["true_support_exclusion"] for row in rows)),
-                ("stage3_inherited_support_defect_count", sum(row["inherited_input_exclusion"] is True for row in rows))):
+        for name, count in (
+            ("stage3_support_violation_count", sum((row["support_violation"] for row in rows))),
+            ("stage3_source_call_violation_count", sum((row["source_call_violation"] is True for row in rows))),
+            (
+                "stage3_core_truth_violation_count",
+                sum(
+                    (
+                        row["positive_carrier_truth"] and row["correct_supplied_cn"] and row["true_support_exclusion"]
+                        for row in rows
+                    )
+                ),
+            ),
+            ("stage3_inherited_support_defect_count", sum((row["inherited_input_exclusion"] is True for row in rows))),
+        ):
             metric(name, arm, value=count if available else None, reason=None if available else "unavailable_analysis")
     _probability_metrics(calibration_rows, metric, assignment_method=assignment_method)
     declared_sources = tuple(metadata.get("declared_source_ids", ()))
-    structural_catalog = SimpleNamespace(eligible=(np.ones_like(history.major_cn, dtype=bool) if catalog.max_major_cn is None
-        else np.asarray(history.major_cn) <= catalog.max_major_cn),
-        segment_ids=history.segment_ids, major_cn=history.major_cn,
-        count_observed=np.ones_like(observed), total_counts=np.ones_like(catalog.total_counts))
-    declared_contributors = [dict(mutation_id=m, region_id=r, segment_id=str(history.segment_ids[index[m], j]),
-                                  usable=True) for m in declared_sources for j, r in enumerate(regions)]
-    declared = cap_audit(history, structural_catalog, metadata.get("declared_remainder_ids", ()), declared_contributors,
-                         np.asarray(history.major_cn), scope="declared_pre_read_source_truth")
+    structural_catalog = SimpleNamespace(
+        eligible=np.ones_like(history.major_cn, dtype=bool)
+        if catalog.max_major_cn is None
+        else np.asarray(history.major_cn) <= catalog.max_major_cn,
+        segment_ids=history.segment_ids,
+        major_cn=history.major_cn,
+        count_observed=np.ones_like(observed),
+        total_counts=np.ones_like(catalog.total_counts),
+    )
+    declared_contributors = [
+        dict(mutation_id=m, region_id=r, segment_id=str(history.segment_ids[index[m], j]), usable=True)
+        for m in declared_sources
+        for j, r in enumerate(regions)
+    ]
+    declared = cap_audit(
+        history,
+        structural_catalog,
+        metadata.get("declared_remainder_ids", ()),
+        declared_contributors,
+        np.asarray(history.major_cn),
+        scope="declared_pre_read_source_truth",
+    )
     for row in declared:
         row["estimated_upper"] = row["truth_replacement_upper"]
         row["excluded"] = row["truth_replacement_exclusion"]
-        row["cap_active"] = row["truth_replacement_upper"] is not None and row["truth_replacement_upper"] < row["original_upper"]
+        row["cap_active"] = (
+            row["truth_replacement_upper"] is not None and row["truth_replacement_upper"] < row["original_upper"]
+        )
     declared_valid = [row for row in declared if row["truth_replacement_evaluable"]]
-    metric("declared_source_truth_cap_exclusion", "structural", sum(row["excluded"] for row in declared_valid), len(declared_valid))
+    metric(
+        "declared_source_truth_cap_exclusion",
+        "structural",
+        sum((row["excluded"] for row in declared_valid)),
+        len(declared_valid),
+    )
     true_purity = acquisition.get("true_purity", acquisition.get("purity", catalog.purity))
-    true_normal = acquisition.get("normal_cn", np.full_like(history.phi, 2.))
-    information = information_diagnostics(history.phi, history.multiplicity, history.major_cn,
-        history.minor_cn, true_purity, true_normal, catalog.total_counts, observed, history.observable_truth_ids)
+    true_normal = acquisition.get("normal_cn", np.full_like(history.phi, 2.0))
+    information = information_diagnostics(
+        history.phi,
+        history.multiplicity,
+        history.major_cn,
+        history.minor_cn,
+        true_purity,
+        true_normal,
+        catalog.total_counts,
+        observed,
+        history.observable_truth_ids,
+    )
     information = [dict(mutation_id=m, **row) for m, row in zip(ids, information)]
     information_lookup = {row["mutation_id"]: row for row in information}
     for row in mutation_rows:
-        row.update(original_evaluable=bool(evaluable[index[row["mutation_id"]]]),
-                   positive_carrier_truth=bool(np.any(history.phi[index[row["mutation_id"]]] > 0)),
-                   information_stratum=information_lookup[row["mutation_id"]]["information_stratum"],
-                   expected_kl=information_lookup[row["mutation_id"]]["expected_kl"],
-                   target=row["role"] == "target", unchanged_F=row["role"] == "unchanged_non_target",
-                   unavailable=row["status"] == "unavailable_analysis" or not arms.get(row["arm"][0], {}).get("reference"))
+        row.update(
+            original_evaluable=bool(evaluable[index[row["mutation_id"]]]),
+            positive_carrier_truth=bool(np.any(history.phi[index[row["mutation_id"]]] > 0)),
+            information_stratum=information_lookup[row["mutation_id"]]["information_stratum"],
+            expected_kl=information_lookup[row["mutation_id"]]["expected_kl"],
+            target=row["role"] == "target",
+            unchanged_F=row["role"] == "unchanged_non_target",
+            unavailable=row["status"] == "unavailable_analysis" or not arms.get(row["arm"][0], {}).get("reference"),
+        )
     operational = _operational_states(result, retained)
     applicability = [operational[arm] for arm in ("A", "B", "C", "B3", "C3")]
     for item in applicability:
-        for name, value in (("analysis_available", item["available"]), ("analysis_failure", item["execution_failure"]),
-                ("execution_available", item["execution_available"]), ("execution_failure", item["execution_failure"]),
-                ("evaluation_available", True), ("scientifically_applicable", item["scientifically_applicable"])):
+        for name, value in (
+            ("analysis_available", item["available"]),
+            ("analysis_failure", item["execution_failure"]),
+            ("execution_available", item["execution_available"]),
+            ("execution_failure", item["execution_failure"]),
+            ("evaluation_available", True),
+            ("scientifically_applicable", item["scientifically_applicable"]),
+        ):
             if value is None:
                 metric(name, item["arm"], view="all_planned_cells", reason="unknown_execution_evidence")
                 metrics[-1]["denominator"] = 1
             else:
                 metric(name, item["arm"], int(value), 1, view="all_planned_cells")
-    curves = []
-    for arm in ("B3", "C3"):
-        state = arm_states[arm[0]]
-        if not state["assignment_available"]:
-            continue
-        for threshold in (() if map_policy else (.8, .9, .95, .99, 1.)):
-            selected = [row for row in calibration_rows if row["arm"] == arm and row["nonconfidence_gates_pass"]
-                        and _legacy_posterior_passes(row["log_competitor_ratio"], threshold, row["has_finite_alternative"])]
-            wrong = sum(not row["best_clonal_correct"] for row in selected)
-            curves.append(dict(arm=arm, threshold=threshold, evaluable=state["evaluable_target_count"],
-                accepted=len(selected), wrong=wrong, acceptance_coverage=_ratio(len(selected), state["evaluable_target_count"]),
-                selective_error=_ratio(wrong, len(selected)),
-                wrong_per_evaluable=_ratio(wrong, state["evaluable_target_count"])))
-    input_error = ((catalog.major_cn != history.major_cn) | (catalog.minor_cn != history.minor_cn)
-                   | (catalog.purity != np.broadcast_to(true_purity, history.phi.shape))
-                   | (catalog.segment_ids != history.segment_ids) | ~catalog.mapping_genuine)
-    # Original names stay available for frozen selection/report consumers. Explicit
-    # aliases distinguish the unchanged binary endpoint from detailed membership.
-    binary_names = {"correct_resolution", "selective_error", "wrong_per_evaluable", "correct_per_original_evaluable",
-                    "whole_workflow_wrong_acceptance", "baseline_error_recovery", "unchanged_population_membership_error"}
+    input_error = (
+        (catalog.major_cn != history.major_cn)
+        | (catalog.minor_cn != history.minor_cn)
+        | (catalog.purity != np.broadcast_to(true_purity, history.phi.shape))
+        | (catalog.segment_ids != history.segment_ids)
+        | ~catalog.mapping_genuine
+    )
+    binary_names = {
+        "whole_workflow_wrong_acceptance",
+        "baseline_error_recovery",
+        "unchanged_population_membership_error",
+    }
     for row in list(metrics):
         if row["name"] in binary_names:
             row["endpoint"] = "binary_clonality"
-            metrics.append(dict(row, name="binary_"+row["name"]))
-    if map_policy:
-        metrics = _map_metrics(metrics, mutation_rows, arms, history, catalog, index, operational, second_origin=second_origin, all_targets=all_targets)
-        for row in calibration_rows:
-            row.pop("nonconfidence_gates_pass", None)
-        for row in mutation_rows:
-            row["geometric_correct_map"] = row.pop("geometric_correct_reference_acceptance")
-            for key in ("accepted_label", "reference_quality_pass", "usable_reference_available",
-                        "usable_matching_labels", "usable_availability_status", "legacy_multiclass_correct_unmapped_as_error"):
-                row.pop(key, None)
-        for populations in detailed_membership.values():
-            for summary in populations.values():
-                for key in tuple(summary):
-                    if "selective" in key or key == "unmapped_acceptance_fraction":
-                        summary.pop(key)
-    if all_targets:
-        identity["analysis_population"] = dict(max_major_cn=catalog.max_major_cn,
-            eligibility_policy="unrestricted_valid_cn" if catalog.max_major_cn is None else "major_cn_cutoff",
-            eligible_mutations=int(catalog.eligible.any(axis=1).sum()), eligible_pairs=int(catalog.eligible.sum()),
-            informative_mutations=original_n,
-            eligible_pairs_above_legacy_cn_ceiling=int(np.sum(catalog.eligible & (catalog.major_cn > 10))))
-    return json_safe(dict(schema="clipp2.simulation.evaluation.v6" if method_aware else "clipp2.simulation.evaluation.v5" if all_targets else "clipp2.simulation.evaluation.v4" if map_policy else "clipp2.simulation.evaluation.v3", **identity,
-        truth_qualification=truth_qualification,
-        evaluation_config=evaluation_config, evaluation_definition=definition,
-        evaluation_definition_id=content_hash(definition), original_mutation_count=len(ids),
-        original_evaluable_count=original_n, region_count=len(regions), metrics=metrics, mutations=mutation_rows,
-        input_error_fraction=float(input_error.mean()),
-        applicability=applicability, cap_audit=audit, declared_source_audit=declared,
-        candidate_correspondence=correspondence, reference_center_geometry=reference_geometry,
-        reference_match_atol=reference_match_atol, reference_distance=reference_distance,
-        detailed_membership=detailed_membership, detailed_membership_transitions=detailed_transitions,
-        stage_three_containment=containment,
-        calibration=calibration_rows, information=information, recovery_reach=reach,
-        error_coverage_curves=curves,
-        reliability={arm: reliability([row["clonal_probability"] for row in calibration_rows if row["arm"] == arm],
-            [row["truth_clonal"] for row in calibration_rows if row["arm"] == arm]) for arm in ("B3", "C3")},
-        acquisition={key: acquisition[key] for key in ("id", "purity", "mean_depth", "panel") if key in acquisition}))
+            metrics.append(dict(row, name="binary_" + row["name"]))
+    metrics = _map_metrics(
+        metrics, mutation_rows, arms, history, catalog, index, operational, second_origin=second_origin
+    )
+    for row in calibration_rows:
+        row.pop("nonconfidence_gates_pass", None)
+    for row in mutation_rows:
+        row["geometric_correct_map"] = row.pop("geometric_correct_reference_acceptance")
+        for key in (
+            "accepted_label",
+            "reference_quality_pass",
+            "usable_reference_available",
+            "usable_matching_labels",
+            "usable_availability_status",
+        ):
+            row.pop(key, None)
+    for populations in detailed_membership.values():
+        for summary in populations.values():
+            for key in tuple(summary):
+                if "selective" in key or key == "unmapped_acceptance_fraction":
+                    summary.pop(key)
+    identity["analysis_population"] = dict(
+        max_major_cn=catalog.max_major_cn,
+        eligibility_policy="unrestricted_valid_cn" if catalog.max_major_cn is None else "major_cn_cutoff",
+        eligible_mutations=int(catalog.eligible.any(axis=1).sum()),
+        eligible_pairs=int(catalog.eligible.sum()),
+        informative_mutations=original_n,
+        eligible_pairs_above_legacy_cn_ceiling=int(np.sum(catalog.eligible & (catalog.major_cn > 10))),
+    )
+    return json_safe(
+        dict(
+            schema="clipp2.simulation.evaluation.v6",
+            **identity,
+            truth_qualification=truth_qualification,
+            evaluation_config=evaluation_config,
+            evaluation_definition=definition,
+            evaluation_definition_id=content_hash(definition),
+            original_mutation_count=len(ids),
+            original_evaluable_count=original_n,
+            region_count=len(regions),
+            metrics=metrics,
+            mutations=mutation_rows,
+            input_error_fraction=float(input_error.mean()),
+            applicability=applicability,
+            cap_audit=audit,
+            declared_source_audit=declared,
+            candidate_correspondence=correspondence,
+            reference_center_geometry=reference_geometry,
+            reference_match_atol=reference_match_atol,
+            reference_distance=reference_distance,
+            detailed_membership=detailed_membership,
+            detailed_membership_transitions=detailed_transitions,
+            stage_three_containment=containment,
+            calibration=calibration_rows,
+            information=information,
+            recovery_reach=reach,
+            error_coverage_curves=[],
+            reliability={
+                arm: reliability(
+                    [row["clonal_probability"] for row in calibration_rows if row["arm"] == arm],
+                    [row["truth_clonal"] for row in calibration_rows if row["arm"] == arm],
+                )
+                for arm in ("B3", "C3")
+            },
+            acquisition={
+                key: acquisition[key] for key in ("id", "purity", "mean_depth", "panel") if key in acquisition
+            },
+        )
+    )
 
 
-def _map_metrics(metrics, rows, arms, history, catalog, index, operational, *, second_origin="stage2_near_clonal_recheck", all_targets=False):
+def _map_metrics(metrics, rows, arms, history, catalog, index, operational, *, second_origin="stage2_recheck"):
     """Explicit MAP endpoints use population denominators, never accepted-only ones.
 
     Evidence-status fractions include missing/excluded original members. Accuracy
     uses original informative truth; F contributes native hard labels, not posterior
     estimates. Unmapped source correspondence is reported separately from error.
     """
-    removed = {"correct_resolution", "wrong_per_evaluable", "unresolved_fraction", "multiclass_correct_resolution",
-        "multiclass_accuracy_lower", "multiclass_accuracy_upper", "correct_per_original_evaluable",
-        "binary_correct_resolution", "binary_wrong_per_evaluable", "binary_correct_per_original_evaluable",
-        "whole_workflow_unresolved_fraction", "unchanged_population_membership_error",
-        "binary_unchanged_population_membership_error", "group_classification_fraction",
-        "target_origin_status_fraction", "target_origin_outcome_fraction"}
-    baseline_metrics = [dict(row, name="binary_map_correct_per_original_evaluable") for row in metrics
-        if row["name"] == "binary_correct_per_original_evaluable" and row["arm"] in ("B", "C")]
-    contributor_metrics = [dict(row, name="cap_endpoint_accuracy" if all_targets else "cap_contributor_accuracy") for row in metrics
-        if row["name"] == "accepted_contributor_accuracy"]
-    result = [row for row in metrics if row["name"] not in removed
-        and not any(word in row["name"] for word in ("selective", "acceptance", "accepted", "usable_", "legacy_"))
-        and ":usable:" not in row["stratum"]]
+    removed = {
+        "binary_map_correct_per_original_evaluable",
+        "whole_workflow_unresolved_fraction",
+        "unchanged_population_membership_error",
+        "binary_unchanged_population_membership_error",
+        "group_classification_fraction",
+        "target_origin_status_fraction",
+        "target_origin_outcome_fraction",
+    }
+    baseline_metrics = [
+        row for row in metrics
+        if row["name"] == "binary_map_correct_per_original_evaluable" and row["arm"] in ("B", "C")
+    ]
+    contributor_metrics = [
+        dict(row, name="cap_endpoint_accuracy") for row in metrics if row["name"] == "accepted_contributor_accuracy"
+    ]
+    result = [
+        row
+        for row in metrics
+        if row["name"] not in removed
+        and (not any((word in row["name"] for word in ("selective", "acceptance", "accepted", "usable_"))))
+        and (":usable:" not in row["stratum"])
+    ]
     result.extend(baseline_metrics + contributor_metrics)
     for row in result:
-        row["name"] = row["name"].replace("contributor_qualification_sensitivity", "cap_contributor_correct_call_coverage")
+        row["name"] = row["name"].replace(
+            "contributor_qualification_sensitivity", "cap_contributor_correct_call_coverage"
+        )
         row["name"] = row["name"].replace("qualified_call_", "cap_contributor_call_")
         row["name"] = row["name"].replace("geometric_correct_reference_resolution", "geometric_correct_map_resolution")
         if row["view"] == "accepted_only":
@@ -1439,13 +1677,27 @@ def _map_metrics(metrics, rows, arms, history, catalog, index, operational, *, s
     def add(name, arm, numerator=None, denominator=None, *, value=None, view="", unknown=False):
         if denominator is not None:
             value = _ratio(numerator, denominator)
-        result.append(dict(name=name, arm=arm, view=view, stratum="all", numerator=numerator,
-            denominator=denominator, value=None if unknown else value,
-            population_scope=metric_population_scope(name, view), truth_required=True,
-            status="unavailable_analysis" if unknown else "available" if value is not None else "not_applicable_zero_denominator"))
+        result.append(
+            dict(
+                name=name,
+                arm=arm,
+                view=view,
+                stratum="all",
+                numerator=numerator,
+                denominator=denominator,
+                value=None if unknown else value,
+                population_scope=metric_population_scope(name, view),
+                truth_required=True,
+                status="unavailable_analysis"
+                if unknown
+                else "available"
+                if value is not None
+                else "not_applicable_zero_denominator",
+            )
+        )
 
     for arm in ("B", "C"):
-        payload, stage = arms.get(arm, {}), arm+"3"
+        payload, stage = (arms.get(arm, {}), arm + "3")
         records = {row["mutation_id"]: row for row in (payload.get("assignment") or {}).get("assignments", ())}
         arm_rows = [row for row in rows if row["arm"] == stage]
         state = operational[stage]
@@ -1459,75 +1711,159 @@ def _map_metrics(metrics, rows, arms, history, catalog, index, operational, *, s
             i = index[row["mutation_id"]]
             has_eligible = bool(catalog.eligible[i].any())
             has_reads = bool((catalog.eligible[i] & catalog.count_observed[i] & (catalog.total_counts[i] > 0)).any())
-            original_status = "filtered" if not has_eligible else "eligible_informative" if has_reads else "no_information"
+            original_status = (
+                "filtered" if not has_eligible else "eligible_informative" if has_reads else "no_information"
+            )
             evidence = record.get("evidence_status", record.get("status"))
             if row["role"] == "unchanged_non_target":
                 evidence = "stage2_unchanged"
             elif evidence is None:
-                evidence = ("excluded" if not has_eligible else "not_reassessed_no_information"
-                    if row["role"] == "outside_combined" and not has_reads else "computation_failed" if failed else "unavailable")
-            row.update(original_input_status=original_status, evidence_status=evidence, membership_origin="stage2_unchanged" if row["role"] == "unchanged_non_target"
-                       else row.get("target_reason"), map_cluster_label=record.get("map_cluster_label"),
-                       map_unique=record.get("map_unique"), map_tied_labels=record.get("map_tied_labels"),
-                       diagnostic_status=record.get("diagnostic_status"),
-                       mean_profile_deviance=record.get("mean_profile_deviance"),
-                       maximum_profile_deviance=record.get("maximum_profile_deviance"))
-            if all_targets:
-                row.update(map_label=record.get("map_label", record.get("map_cluster_label")),
-                           map_set=record.get("map_set", record.get("map_tied_labels")),
-                           posterior_defined=record.get("posterior_defined"))
-            source_index = labels.index(row["final_assignment_label"]) if row["final_assignment_label"] in labels else None
-            source = {key: reference[key][source_index] if source_index is not None and reference.get(key) is not None else None
-                for key in ("source_informative_count", "source_informative_depth", "source_mean_profile_deviance",
-                            "source_maximum_profile_deviance", "diagnostic_availability")}
+                evidence = (
+                    "excluded"
+                    if not has_eligible
+                    else "not_reassessed_no_information"
+                    if row["role"] == "outside_combined" and (not has_reads)
+                    else "computation_failed"
+                    if failed
+                    else "unavailable"
+                )
+            row.update(
+                original_input_status=original_status,
+                evidence_status=evidence,
+                membership_origin="stage2_unchanged"
+                if row["role"] == "unchanged_non_target"
+                else row.get("target_reason"),
+                map_cluster_label=record.get("map_cluster_label"),
+                map_unique=record.get("map_unique"),
+                map_tied_labels=record.get("map_tied_labels"),
+                diagnostic_status=record.get("diagnostic_status"),
+                mean_profile_deviance=record.get("mean_profile_deviance"),
+                maximum_profile_deviance=record.get("maximum_profile_deviance"),
+            )
+            row.update(
+                map_label=record.get("map_label", record.get("map_cluster_label")),
+                map_set=record.get("map_set", record.get("map_tied_labels")),
+                posterior_defined=record.get("posterior_defined"),
+            )
+            source_index = (
+                labels.index(row["final_assignment_label"]) if row["final_assignment_label"] in labels else None
+            )
+            source = {
+                key: reference[key][source_index]
+                if source_index is not None and reference.get(key) is not None
+                else None
+                for key in (
+                    "source_informative_count",
+                    "source_informative_depth",
+                    "source_mean_profile_deviance",
+                    "source_maximum_profile_deviance",
+                    "diagnostic_availability",
+                )
+            }
             row["reference_source_diagnostics"] = source
             counts = np.asarray(source["source_informative_count"], float)
             observed = catalog.eligible[i] & catalog.count_observed[i] & (catalog.total_counts[i] > 0)
             measured = counts[observed] if counts.shape == observed.shape else np.array([])
-            row["reference_coverage_stratum"] = ("unknown" if not measured.size or not np.isfinite(measured).all()
-                else "zero_in_observed_region" if np.any(measured == 0) else "positive_in_observed_regions")
+            row["reference_coverage_stratum"] = (
+                "unknown"
+                if not measured.size or not np.isfinite(measured).all()
+                else "zero_in_observed_region"
+                if np.any(measured == 0)
+                else "positive_in_observed_regions"
+            )
             residual = record.get("maximum_profile_deviance")
-            row["target_residual_stratum"] = ("unavailable" if residual is None or np.isnan(float(residual))
-                else "infinite" if np.isinf(float(residual)) else "finite")
-        populations = {"": [row for row in arm_rows if row["role"] == "target"],
+            row["target_residual_stratum"] = (
+                "unavailable"
+                if residual is None or np.isnan(float(residual))
+                else "infinite"
+                if np.isinf(float(residual))
+                else "finite"
+            )
+        populations = {
+            "": [row for row in arm_rows if row["role"] == "target"],
             "whole_original": arm_rows,
             "unchanged_F": [row for row in arm_rows if row["role"] == "unchanged_non_target"],
-            **{origin: [row for row in arm_rows if row.get("target_reason") == origin]
-               for origin in ("stage1_reference_recheck", second_origin)}}
+            **{
+                origin: [row for row in arm_rows if row.get("target_reason") == origin]
+                for origin in ("stage1_reference_recheck", second_origin)
+            },
+        }
         for view, population in populations.items():
             informative = [row for row in population if row["evaluable"]]
             n = len(informative)
             labelled = [row for row in informative if row["final_assignment_label"] is not None]
-            unknown = not observed_result and not failed and view != "unchanged_F"
-            for name, count in (("data_supported_map_coverage", len(labelled)),
-                    ("binary_map_error", sum(row["binary_clonality_correct"] is False for row in informative)),
-                    ("binary_map_correct", sum(row["binary_clonality_correct"] is True for row in informative)),
-                    ("detailed_map_error", sum(row["detailed_membership_status"] == "Mw" for row in informative)),
-                    ("detailed_map_correct", sum(row["detailed_membership_status"] == "Mc" for row in informative)),
-                    ("detailed_map_unmapped", sum(row["detailed_membership_status"] == "U" for row in informative))):
+            unknown = not observed_result and (not failed) and (view != "unchanged_F")
+            for name, count in (
+                ("data_supported_map_coverage", len(labelled)),
+                ("binary_map_error", sum((row["binary_clonality_correct"] is False for row in informative))),
+                ("binary_map_correct", sum((row["binary_clonality_correct"] is True for row in informative))),
+                ("detailed_map_error", sum((row["detailed_membership_status"] == "Mw" for row in informative))),
+                ("detailed_map_correct", sum((row["detailed_membership_status"] == "Mc" for row in informative))),
+                ("detailed_map_unmapped", sum((row["detailed_membership_status"] == "U" for row in informative))),
+            ):
                 add(name, stage, count, n, view=view, unknown=unknown)
             for evidence in ("prior_only", "model_incompatible", "excluded"):
-                add(evidence+"_fraction", stage, sum(row["evidence_status"] == evidence for row in population),
-                    len(population), view=view, unknown=unknown)
-            failures = sum(row["evidence_status"] in ("computation_failed", "computation_error", "failed") for row in population)
+                add(
+                    evidence + "_fraction",
+                    stage,
+                    sum((row["evidence_status"] == evidence for row in population)),
+                    len(population),
+                    view=view,
+                    unknown=unknown,
+                )
+            failures = sum(
+                (row["evidence_status"] in ("computation_failed", "computation_error", "failed") for row in population)
+            )
             add("computation_failure_count", stage, value=failures, view=view, unknown=unknown)
-            add("diagnostic_failure_count", stage,
-                value=sum(row.get("diagnostic_status") == "failed" for row in population), view=view, unknown=unknown)
-            errors = [np.square(np.asarray(centers[row["final_assignment_label"]], float)-history.phi[index[row["mutation_id"]]])
-                      for row in labelled]
-            add("map_ccf_rmse", stage, value=float(np.sqrt(np.mean(errors))) if errors else None, view=view, unknown=unknown)
+            add(
+                "diagnostic_failure_count",
+                stage,
+                value=sum((row.get("diagnostic_status") == "failed" for row in population)),
+                view=view,
+                unknown=unknown,
+            )
+            errors = [
+                np.square(
+                    np.asarray(centers[row["final_assignment_label"]], float) - history.phi[index[row["mutation_id"]]]
+                )
+                for row in labelled
+            ]
+            add(
+                "map_ccf_rmse",
+                stage,
+                value=float(np.sqrt(np.mean(errors))) if errors else None,
+                view=view,
+                unknown=unknown,
+            )
             if view == "whole_original":
-                add("binary_map_correct_per_original_evaluable", stage,
-                    sum(row["binary_clonality_correct"] is True for row in informative), n, unknown=unknown)
+                add(
+                    "binary_map_correct_per_original_evaluable",
+                    stage,
+                    sum((row["binary_clonality_correct"] is True for row in informative)),
+                    n,
+                    unknown=unknown,
+                )
         targets = [row for row in populations[""] if row["evaluable"]]
         for field in ("reference_coverage_stratum", "target_residual_stratum"):
             for category in sorted({row[field] for row in targets}):
                 selected = [row for row in targets if row[field] == category]
-                for name, count in (("data_supported_map_coverage", sum(row["final_assignment_label"] is not None for row in selected)),
-                        ("binary_map_error", sum(row["binary_clonality_correct"] is False for row in selected)),
-                        ("detailed_map_error", sum(row["detailed_membership_status"] == "Mw" for row in selected))):
-                    add(name, stage, count, len(selected), view="diagnostic_strata", unknown=not observed_result and not failed)
-                    result[-1]["stratum"] = field+":"+category
+                for name, count in (
+                    (
+                        "data_supported_map_coverage",
+                        sum((row["final_assignment_label"] is not None for row in selected)),
+                    ),
+                    ("binary_map_error", sum((row["binary_clonality_correct"] is False for row in selected))),
+                    ("detailed_map_error", sum((row["detailed_membership_status"] == "Mw" for row in selected))),
+                ):
+                    add(
+                        name,
+                        stage,
+                        count,
+                        len(selected),
+                        view="diagnostic_strata",
+                        unknown=not observed_result and (not failed),
+                    )
+                    result[-1]["stratum"] = field + ":" + category
     return result
 
 
@@ -1711,16 +2047,16 @@ def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expect
                 raise ValueError("Evaluation contains duplicate metric keys")
             groups[key][cell_id] = row
     # Even an entirely missing current cohort has explicit planned endpoints.
-    for name in definition.get("population_scopes", {}).get("planned_population", sorted(LEGACY_PLANNED_METRIC_NAMES)):
+    for name in definition.get("population_scopes", {}).get("planned_population", sorted(PLANNED_METRIC_NAMES)):
         arms = ("A", "B", "C", "B3", "C3") if name in TRUTH_INDEPENDENT_METRICS else ("B", "C", "B3", "C3")
         for arm in arms:
             groups[name, arm, "all_planned_cells" if name in TRUTH_INDEPENDENT_METRICS else "", "all"]
 
-    def value_for(cell_id, row, *, legacy=False):
+    def value_for(cell_id, row):
         if row is None:
             return None, "missing_metric" if cell_id in records else "missing_evaluation_record"
         if "paired_components" in row:
-            parts = [value_for(cell_id, part, legacy=legacy) for part in row["paired_components"]]
+            parts = [value_for(cell_id, part) for part in row["paired_components"]]
             if any(value is None or not np.isfinite(value) for value, _ in parts):
                 return None, "unavailable_paired_components"
             return parts[0][0]-parts[1][0], "available"
@@ -1732,8 +2068,7 @@ def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expect
             return None, "unestablished_empty_decision_population"
         if not independent:
             state = records[cell_id].get("truth_qualification", "missing_truth_evidence")
-            allowed = "legacy_consistent_unbound" if legacy else "verified_history_binding"
-            if state != allowed:
+            if state != "verified_history_binding":
                 return None, state
         return float(value), "available"
 
@@ -1792,10 +2127,6 @@ def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expect
             "incomplete_planned_roster" if not complete_roster else "incomplete_evidence" if unknown else "available")
         if scope != "planned_population":
             planned = None
-        legacy_values = {cell_id: value_for(cell_id, rows.get(cell_id), legacy=True)[0]
-            if records.get(cell_id, {}).get("truth_qualification") == "legacy_consistent_unbound" else None
-            for cell_id in roster}
-        legacy = estimates(legacy_values, fixed=False)[0]
         planned_low, planned_high = interval(planned, planned_histories)
         available_low, available_high = interval(available, available_histories)
         primary = planned if scope == "planned_population" else available
@@ -1806,7 +2137,6 @@ def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expect
         summaries.append(dict(name=key[0], arm=key[1], view=key[2], stratum=key[3], population_scope=scope,
             equal_family_mean=primary, planned_population_estimate=planned, planned_population_status=planned_status,
             available_case_estimate=available, available_case_status="available" if available is not None else "no_qualified_available_cases",
-            legacy_consistent_available_case_estimate=legacy,
             lower_95=primary_low, upper_95=primary_high, planned_lower_95=planned_low, planned_upper_95=planned_high,
             available_case_lower_95=available_low, available_case_upper_95=available_high,
             status=planned_status if scope == "planned_population" else "conditional_available_cases" if available is not None else "unavailable_conditional_cases",

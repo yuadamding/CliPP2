@@ -19,18 +19,7 @@ def observed_mask(data):
     """The shared positive-depth observation mask; population rules stay outside."""
     if not isinstance(data, TumorData):
         raise TypeError("Numerical preparation requires validated TumorData")
-    depth = np.asarray(data.total_counts)
-    shape = len(data.mutation_ids), len(data.region_ids)
-    observed = np.ones(shape, dtype=bool) if data.count_observed is None else np.asarray(data.count_observed, dtype=bool)
-    if depth.shape != shape or observed.shape != shape:
-        raise ValueError("Read counts and masks must align with mutation-region keys")
-    excluded = getattr(data, "input_excluded", None)
-    if excluded is not None:
-        excluded = np.asarray(excluded, dtype=bool)
-        if excluded.shape != shape:
-            raise ValueError("Input exclusions must align with mutation-region keys")
-        observed = observed & ~excluded
-    return observed & np.isfinite(depth) & (depth > 0)
+    return data.count_observed & ~data.input_excluded & (data.total_counts > 0)
 
 
 def prepare_observations(data, multiplicity_support=None, *, rows=None, regions=None):
@@ -47,22 +36,7 @@ def prepare_observations(data, multiplicity_support=None, *, rows=None, regions=
         ("alt", data.alt_counts), ("depth", data.total_counts), ("major", data.major_cn),
         ("normal", data.normal_cn), ("total", data.total_cn), ("purity", data.purity))}
     alt, depth, major, normal, total, purity = (arrays[name] for name in arrays)
-    minor = np.asarray(data.minor_cn, dtype=float)[ix]
-    if any(not np.isfinite(value).all() for value in (major, normal, total, purity)):
-        raise ValueError("CN and purity must be finite in every mutation-region")
-    if np.any(major < 1) or np.any(major != np.rint(major)):
-        raise ValueError("Major CN must be a positive integer")
-    if np.any(normal < 0) or np.any(normal != np.rint(normal)):
-        raise ValueError("Normal CN must be a nonnegative integer")
-    if (not np.isfinite(minor).all() or np.any(minor < 0) or np.any(minor > major)
-            or np.any(minor != np.rint(minor)) or not np.array_equal(total, major + minor)):
-        raise ValueError("Single-state CN needs integer major >= minor >= 0 and total = major + minor")
-    if np.any(purity <= 0) or np.any(purity > 1) or not np.all(purity == purity[:1]):
-        raise ValueError("Purity must be constant within each region and in (0,1]")
-    if (not np.isfinite(alt[observed]).all() or np.any(alt[observed] < 0)
-            or np.any(alt[observed] > depth[observed]) or np.any(alt[observed] != np.rint(alt[observed]))
-            or np.any(depth[observed] != np.rint(depth[observed]))):
-        raise ValueError("Informative read counts must be finite nonnegative integers")
+    # TumorData already validates and freezes counts, CN, purity and masks.
     alt, depth = np.where(observed, alt, 0.), np.where(observed, depth, 0.)
     denominator = (1-purity)*normal + purity*total
     if not np.isfinite(denominator).all() or np.any(denominator <= 0):
@@ -74,9 +48,6 @@ def prepare_observations(data, multiplicity_support=None, *, rows=None, regions=
         if not isinstance(multiplicity_support, MultiplicityBounds):
             raise TypeError("multiplicity_support must be immutable MultiplicityBounds or None")
         minimum, maximum = (values[ix] for values in multiplicity_support.for_data(data))
-    if (np.any(minimum < 1) or np.any(minimum > maximum) or np.any(maximum > default_maximum)
-            or np.any(maximum >= 2**63)):
-        raise ValueError("Multiplicity intervals must satisfy 1 <= lower <= upper <= original support")
     changed = (minimum != 1) | (maximum != default_maximum)
     minimum, maximum = minimum.astype(np.int64), maximum.astype(np.int64)
     support = maximum-minimum+1

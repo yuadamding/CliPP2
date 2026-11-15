@@ -486,8 +486,7 @@ def run_optional_panels(root, contract, workers, *, retry_failed=False):
 
 def report(root, *, evaluation_config=None, report_dir=None):
     """Render cached metrics or explicitly reevaluate preserved inference evidence."""
-    from .evaluation import (aggregate, normalize_evaluation_config, evaluation_definition,
-                             legacy_evaluation_definition, HISTORICAL_V5_REFERENCE_POLICY)
+    from .evaluation import aggregate, normalize_evaluation_config, evaluation_definition
     from .figures import make_figures
     from .runtime import recorded_costs, qualification_costs
     from .reporting import planned_roster, reevaluate_cell, placeholder_for_cell, validate_cached_evaluation
@@ -496,34 +495,21 @@ def report(root, *, evaluation_config=None, report_dir=None):
     fitting = contract.get("base_workflow_config", {}).get("fit", {})
     fitting_method = fitting_identity(fitting.get("fit_multiplicity", "marginal"),
                                       fitting.get("selection_criterion", SELECTION_CRITERION))
-    reference_policy = contract.get("evaluation", {}).get("reference_policy", HISTORICAL_V5_REFERENCE_POLICY)
+    if contract.get("schema") != "clipp2.simulation-contract.v8" or contract.get("protocol_version") != PROTOCOL_VERSION:
+        raise ValueError("Reporting requires the current simulation contract")
+    reference_policy = contract["evaluation"]["reference_policy"]
+    schema = "clipp2.simulation.evaluation.v6"
+    if contract["evaluation"]["record_schema"] != schema:
+        raise ValueError("Study reports require evaluation.v6")
     derive = evaluation_config is not None
-    if derive:
-        if isinstance(evaluation_config, (str, Path)):
-            evaluation_config = read_json(evaluation_config)
-        evaluation_config = normalize_evaluation_config(evaluation_config)
-        schema = ("clipp2.simulation.evaluation.v6" if contract.get("protocol_version") == "2.4" else
-                  "clipp2.simulation.evaluation.v5" if contract.get("schema") == "clipp2.simulation-contract.v7" and contract.get("protocol_version") == "2.3" else
-                  "clipp2.simulation.evaluation.v4" if contract.get("protocol_version") == "2.3" else "clipp2.simulation.evaluation.v3")
-    else:
-        frozen_evaluation = contract.get("evaluation", {})
-        schema = frozen_evaluation.get("record_schema")
-        if schema is None:
-            version = tuple(int(part) for part in contract.get("implementation_version", "0.0.0").split(".")[:3])
-            schema = "clipp2.simulation.evaluation." + (
-                "v3" if version >= (1, 2, 3) else "v2" if version >= (1, 2, 2) else "v1")
-        if schema not in ("clipp2.simulation.evaluation.v1", "clipp2.simulation.evaluation.v2",
-                          "clipp2.simulation.evaluation.v3", "clipp2.simulation.evaluation.v4", "clipp2.simulation.evaluation.v5", "clipp2.simulation.evaluation.v6"):
-            raise ValueError("Frozen study declares an unsupported evaluation record schema")
-        evaluation_config = {key: frozen_evaluation[key]
-            for key in ("reference_match_atol", "reference_distance") if key in frozen_evaluation}
-        if schema.endswith(".v1"):
-            evaluation_config["reference_distance"] = "linf"
-        evaluation_config = normalize_evaluation_config(evaluation_config)
-    definition = (evaluation_definition(evaluation_config, reference_policy=reference_policy,
+    if derive and isinstance(evaluation_config, (str, Path)):
+        evaluation_config = read_json(evaluation_config)
+    if not derive:
+        evaluation_config = {key: contract["evaluation"][key]
+            for key in ("reference_match_atol", "reference_distance") if key in contract["evaluation"]}
+    evaluation_config = normalize_evaluation_config(evaluation_config)
+    definition = evaluation_definition(evaluation_config, reference_policy=reference_policy,
                     assignment_method=contract["base_workflow_config"]["stage_three_assignment_method"])
-                  if schema.endswith(".v6") else
-                  legacy_evaluation_definition(schema, evaluation_config, reference_policy=reference_policy))
     definition_id = content_hash(definition)
     cells = [value for directory in sorted((root / "cells").glob("*")) if directory.is_dir()
              for value in [_latest_completion(directory)] if value is not None]
@@ -545,10 +531,8 @@ def report(root, *, evaluation_config=None, report_dir=None):
                 cached_path = root / cell["evaluations"][0]
                 value = read_json(cached_path)
             except (OSError, ValueError, IndexError, KeyError):
-                value = placeholder_for_cell(root, cell, evaluation_config, evaluation_schema=(
-                    schema if schema.endswith((".v4", ".v5", ".v6")) else "clipp2.simulation.evaluation.v3"))
+                value = placeholder_for_cell(root, cell, evaluation_config, evaluation_schema=schema)
                 # Missing cached records retain the frozen study's definition.
-                # Historical files retain their original inference interpretation.
                 value.update(schema=schema, evaluation_config=evaluation_config,
                     evaluation_definition=definition, evaluation_definition_id=definition_id,
                     reference_match_atol=definition["reference_match_atol"],
@@ -583,13 +567,10 @@ def report(root, *, evaluation_config=None, report_dir=None):
     report_dir.mkdir(parents=True)
     if derive:
         save_json(report_dir / "evaluation_config.json", evaluation_config)
-        selection = root / "threshold_development.json"
         save_json(report_dir / "derivation_manifest.json", dict(schema="clipp2.simulation.report-derivation.v1",
             source_study=str(root), source_contract_schema=contract.get("schema"),
             source_implementation_version=contract.get("implementation_version"),
             source_cohort_content_id=contract.get("cohort", {}).get("content_id") if contract.get("cohort") else None,
-            historical_cohort_identity_backfilled=False,
-            frozen_threshold_development=read_json(selection) if selection.exists() else None,
             development_assessments=[read_json(path) for path in sorted(root.glob("development_assessment*.json"))],
             evaluation_config=evaluation_config, implementation_version=__version__,
             fit_count=0, assignment_pass_count=0, threshold_selection_count=0))
@@ -627,8 +608,6 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
     contract = read_json(root / "study_contract.json")
     allocation = (roster_counts(contract) if "replicate_roster" in contract else
                   read_json(root / "allocation.json") if (root / "allocation.json").exists() else {})
-    development = read_json(root / "threshold_development.json") if (root / "threshold_development.json").exists() else {}
-    selected = development.get("selected")
     assessments = [read_json(path) for path in sorted(root.glob("development_assessment*.json"))]
     if "replicate_roster" in contract:
         allocation_description = "The population was declared by explicit frozen replicate blocks; timing and disk measurements did not select its membership."
@@ -647,16 +626,14 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
         f"<p>Executed scale: {contract['dimensions']['mutations']} mutations, {contract['dimensions']['segments']} segments, {contract['dimensions']['regions']} regions; "
         f"{allocation.get('main_histories_per_family', 0)} independent main histories per family. The proposed full scale is 1,500 mutations, 50 segments, 50 main and 10 development histories per family.</p>",
         f"<p>{allocation_description} Repeated acquisitions share physical histories; uncertainty resamples histories and carries all paired arms together. A reduced cohort does not establish rare-event safety or noninferiority.</p>",
-        "<h2>Frozen population and settings</h2><pre>"+html.escape(json.dumps(dict(replicate_roster=contract.get("replicate_roster"), counts=allocation, historical_selected=selected,
+        "<h2>Frozen population and settings</h2><pre>"+html.escape(json.dumps(dict(replicate_roster=contract.get("replicate_roster"), counts=allocation,
             workflow_config=contract.get("base_workflow_config"), development_assessments=assessments), indent=2))+"</pre>",
         "<h2>Applicability and scientific results</h2><p>Unknown and unavailable estimates remain explicit. Exact aliases and absent candidate explanations cannot be resolved by restoring integer support. Diagnostics are measurements; Protocol 2.4 returns method-specific observed MAP estimates without statistical acceptance screens.</p>"]
     text.append("<h2>Evaluation definition and population</h2><pre>"+html.escape(json.dumps(dict(
         definition=summary.get("evaluation_definition"), report_mode=summary["report_mode"],
         roster_status=summary["roster_status"]), indent=2))+"</pre>")
     text.append(pd.DataFrame(summary["population_counts"]).to_html(index=False, na_rep="NA"))
-    selected_metrics = {"binary_correct_per_original_evaluable", "binary_correct_resolution", "binary_selective_error",
-        "mapped_correct_resolution", "mapped_selective_error", "unmapped_acceptance_fraction",
-        "geometric_correct_reference_resolution", "analysis_available", "analysis_failure", "evaluation_available",
+    selected_metrics = {"analysis_available", "analysis_failure", "evaluation_available",
         "data_supported_map_coverage", "binary_map_error", "detailed_map_error", "map_ccf_rmse",
         "binary_map_correct_per_original_evaluable", "prior_only_fraction", "model_incompatible_fraction", "computation_failure_count"}
     rows = [dict(endpoint=row["name"], arm=row["arm"], view=row["view"], stratum=row["stratum"],
@@ -675,7 +652,7 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
     text.append("<h2>Detailed membership transitions by target origin</h2>"
         "<p>Mc: mapped correct; Mw: mapped wrong; U: selected but unmapped; unresolved: no data-supported final label. "
         "Counts below use verified history bindings only; they do not fill missing planned cells. "
-        "Raw TSV exports retain historical diagnostics with their truth qualification.</p>")
+        "Raw TSV exports retain all diagnostics with their truth qualification.</p>")
     if transitions:
         grouped = pd.DataFrame(transitions).groupby(["arm", "origin", "baseline_state", "final_state"])["count"].sum().reset_index()
         text.append(grouped.to_html(index=False))
@@ -708,6 +685,6 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
                     "their execution is unknown. Configuration flags alone do not establish execution.</p>")
     text.extend(["<h2>Reproducibility and limits</h2>",
         "<p>Per-cell outputs preserve native A/B/C fits, frozen combined references, B3/C3 assignments, exact cap and contributor records, and every original mutation's status. Physical histories and truth are stored separately from inference inputs. Source snapshots and native numerical receipts are retained; file-byte checksums are intentionally absent.</p>",
-        "<p>Core results do not imply a global clustering optimum or patient-population frequencies. Corrected-cap refitting, BAM simulation, and unavailable historical generators were not executed.</p>",
+        "<p>Core results do not imply a global clustering optimum or patient-population frequencies. Corrected-cap refitting and BAM simulation were not executed.</p>",
         "<p>Machine-readable results: <a href='aggregate.json'>aggregate.json</a>; <a href='tumor_metrics.tsv'>tumor metrics</a>; <a href='detailed_transitions.tsv'>detailed transitions</a>; <a href='bound_audit.tsv'>cap audit</a>; <a href='execution_ledger.tsv'>execution ledger</a>.</p>"])
     (directory / "comparison_report.html").write_text("\n".join(text), encoding="utf-8")

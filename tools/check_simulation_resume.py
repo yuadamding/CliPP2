@@ -72,7 +72,7 @@ def _roster_retry(root):
     assert not (root / "threshold_development.json").exists()
     from CliPP2.simulation.runtime import status
     summary = status(root)
-    assert summary["development_assessed"] and not summary["historical_thresholds_frozen"]
+    assert summary["development_assessed"]
     assert summary["planned_main_cells"] == 4 and summary["planned_development_cells"] == 2
     assert summary["conditional_development_extension_cells"] == 0
     return dict(default_keeps_failure=True, explicit_retry_preserves_roster=True,

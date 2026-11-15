@@ -60,7 +60,7 @@ def _available_contributors(directory):
             assert not row["contributes_to_cap"] and caps.upper.item() == 4 and policies[0]["fallback"]
         else:
             assert row["contributes_to_cap"] and caps.upper.item() == row["cap_source_map_upper"]
-            assert caps.policy_id == "minimum_native_map_set_upper"
+            assert caps.policy_id == "read_floor_lower_minimum_native_map_set_upper"
     assert results["weak"]["map_probability"] < .95 and results["weak"]["cap_source_map_call"] == 1
     assert results["residual"]["profile_deviance"] > 10.
     assert not results["tie"]["map_unique"] and results["tie"]["cap_source_map_call"] == 1
@@ -612,33 +612,12 @@ def _empty_remainder(directory):
                 single_clonal_reference=True, every_mutation_reassessed=True)
 
 
-def _historical_native_replay(directory):
-    import zipfile
-    baseline = directory / "historical22"
-    with zipfile.ZipFile(Path(__file__).parent / "fixtures/protocol22_baseline.zip") as archive:
-        archive.extractall(baseline)
-    fits = [load_accepted_fit(baseline / f"stage_{stage}_accepted.json") for stage in ("one", "two")]
-    original = [fit.to_dict() for fit in fits]
-    assert all(fit.protocol_version == "2.2" for fit in fits)
-    source = Path(__file__).resolve().parents[1] / "examples/workflow_protocol22.tsv"
-    output = directory / "historical22_replayed23"
-    with patch("CliPP2.fit_execution.fit_regions", side_effect=AssertionError("compatible old fit optimized")) as optimizer:
-        receipt = run_workflow(source, output, workflow_config(), accepted_stage_one=fits[0], accepted_stage_two=fits[1])
-    assert receipt["status"] == "complete" and receipt["protocol_version"] == "2.4" and optimizer.call_count == 0
-    for before, stage in zip(original, ("one", "two")):
-        replay = load_accepted_fit(output / f"stage_{stage}_accepted.json")
-        assert replay.protocol_version == "2.2" and replay.to_dict()["producer_receipt"] == before["producer_receipt"]
-        assert replay.state_fingerprint == before["acceptance_evidence"]["accepted_state_hash"]
-        assert replay.compatibility_receipts[-1]["originating_native_fit_protocol"] == "2.2"
-        assert replay.compatibility_receipts[-1]["current_workflow_protocol"] == "2.4"
-    return dict(old_native_protocol_and_hash_preserved=True, current_interpretation_appended=True, optimizer_calls=0)
 
 
 def run_workflow_edge_checks(directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    return dict(historical_native_replay=_historical_native_replay(directory),
-                blocked_stage_two=_blocked_count(directory),
+    return dict(blocked_stage_two=_blocked_count(directory),
                 available_contributors=_available_contributors(directory),
                 provisional_reference_preservation=_provisional_source_preservation(directory),
                 capped_target_and_replay=_capped_target_and_replay(directory),

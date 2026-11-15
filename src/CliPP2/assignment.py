@@ -22,9 +22,6 @@ RESULT_SCHEMA = "clipp2.assignment.result.v9"
 POSTERIOR_FIELDS = ("probabilities", "posterior", "best_log_probability",
     "second_best_probability", "entropy", "log_competitor_ratio")
 EVIDENCE_STATUSES = ("observed", "prior_only", "model_incompatible", "computation_failed", "input_missing", "excluded")
-_HISTORICAL_SCHEMAS = {"clipp2.assignment.bundle.v3": "2.2", "clipp2.assignment.result.v4": "2.2",
-    **{f"clipp2.assignment.bundle.v{v}": "2.3" for v in (4, 5)},
-    **{f"clipp2.assignment.result.v{v}": "2.3" for v in (5, 6, 7, 8)}}
 
 
 def _integer_tuple(values, name):
@@ -34,68 +31,20 @@ def _integer_tuple(values, name):
     return values
 
 
-@dataclass(frozen=True, slots=True)
-class HistoricalAssignmentArtifact(ImmutableArrayRecord):
-    """Read-only historical evidence; never an executable current request/result."""
-    payload: object
-
-    def __post_init__(self):
-        if (self.payload.get("schema") not in _HISTORICAL_SCHEMAS
-                or self.payload.get("protocol_version") != _HISTORICAL_SCHEMAS[self.payload["schema"]]
-                or self.payload.get("support_policy") != SUPPORT_POLICY):
-            raise ValueError("Unsupported historical assignment artifact")
-        object.__setattr__(self, "payload", _freeze(self.payload))
-
-    def to_dict(self):
-        return thaw_record(self.payload, arrays_as_lists=True)
-
-    @property
-    def content_hash(self):
-        return content_hash(self.to_dict())
-
-
 def derive_assignment_bundle(source, *, assignment_method=None):
-    """Derive a method-bound request without editing observations or frozen references."""
-    if type(source) is AssignmentBundle:
-        source.validated_payload()
-        method = source.assignment_method if assignment_method is None else assignment_method
-        validate_assignment_method(method)
-        if method == source.assignment_method:
-            return source
-        provenance = thaw_record(source.provenance, arrays_as_lists=True)
-        provenance = dict(provenance) if isinstance(provenance, Mapping) else {"original_provenance": provenance}
-        provenance["assignment_derivation"] = dict(source_bundle_hash=source.content_hash,
-            source_assignment_method=source.assignment_method, assignment_method=method)
-        return replace(source, assignment_method=method, provenance=provenance)
-    if (type(source) is not HistoricalAssignmentArtifact
-            or source.payload["schema"] not in tuple(f"clipp2.assignment.bundle.v{v}" for v in (3, 4, 5))):
-        raise TypeError("An intact current or historical v3/v4/v5 assignment bundle is required")
-    method = "marginal" if assignment_method is None else assignment_method
+    """Change a current request's method while retaining its observations and references."""
+    if type(source) is not AssignmentBundle:
+        raise TypeError("A current AssignmentBundle is required")
+    source.validated_payload()
+    method = source.assignment_method if assignment_method is None else assignment_method
     validate_assignment_method(method)
-    payload = source.to_dict()
-    provenance = payload.get("provenance", {})
-    payload["provenance"] = dict(provenance) if isinstance(provenance, Mapping) else {"original_provenance": provenance}
-    derivation = dict(schema=payload["schema"], protocol_version=payload["protocol_version"],
-        content_hash=source.content_hash, scope="fixed_reference_original_targets")
-    if payload["schema"] == "clipp2.assignment.bundle.v3":
-        reference = payload["reference"]
-        derivation["legacy_decision_metadata"] = dict(thresholds=payload.pop("thresholds"),
-            regional_quality=reference.pop("regional_quality"),
-            regional_quality_reasons=reference.pop("regional_quality_reasons"))
-        for name in ("source_informative_count", "source_informative_depth", "source_mean_profile_deviance",
-                     "source_maximum_profile_deviance", "diagnostic_availability"):
-            reference[name] = None
-    payload["provenance"]["historical_derivation"] = derivation
-    payload["provenance"]["assignment_derivation"] = dict(source_bundle_hash=source.content_hash,
-        source_assignment_method="marginal", assignment_method=method)
-    payload.update(schema="clipp2.assignment.bundle.v6", protocol_version=PROTOCOL_VERSION,
-                   assignment_method=method)
-    return AssignmentBundle.from_dict(payload)
-
-
-def derive_current_bundle(historical, *, assignment_method=None):
-    """Explicit historical migration, preserving its target population and source hash."""
-    return derive_assignment_bundle(historical, assignment_method=assignment_method)
+    if method == source.assignment_method:
+        return source
+    provenance = thaw_record(source.provenance, arrays_as_lists=True)
+    provenance = dict(provenance) if isinstance(provenance, Mapping) else {"original_provenance": provenance}
+    provenance["assignment_derivation"] = dict(source_bundle_hash=source.content_hash,
+        source_assignment_method=source.assignment_method, assignment_method=method)
+    return replace(source, assignment_method=method, provenance=provenance)
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,8 +261,6 @@ class AssignmentBundle(ImmutableArrayRecord):
 
     @classmethod
     def from_dict(cls, value):
-        if value.get("schema") in ("clipp2.assignment.bundle.v3", "clipp2.assignment.bundle.v4", "clipp2.assignment.bundle.v5"):
-            return HistoricalAssignmentArtifact(value)
         values = dict(value)
         if (values.pop("schema", None) != "clipp2.assignment.bundle.v6"
                 or values.pop("protocol_version", None) != PROTOCOL_VERSION
@@ -423,8 +370,6 @@ class AssignmentResult(ImmutableArrayRecord):
 
     @classmethod
     def from_dict(cls, value):
-        if value.get("schema") in tuple(f"clipp2.assignment.result.v{v}" for v in (4, 5, 6, 7, 8)):
-            return HistoricalAssignmentArtifact(value)
         values = dict(value)
         schema = values.pop("schema", None)
         if (schema != RESULT_SCHEMA or "assignment_method" not in values

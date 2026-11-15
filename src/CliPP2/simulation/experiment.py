@@ -21,6 +21,7 @@ from CliPP2.io.assignment import (load_accepted_fit, reserve_output, save_accept
                                  save_assignment_bundle, save_original_catalog, publish_assignment,
                                  write_supporting_table)
 from CliPP2.io.data import json_value, validate_workflow_mapping
+from CliPP2.io.multiplicity import read_floor_bounds
 from CliPP2.io.publication import publish_json
 from CliPP2.io.tumor_txt import audit_input, load_original_catalog
 from CliPP2.provenance import prepare_run_manifest, validate_replay_policy
@@ -203,9 +204,13 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
         save_original_catalog(catalog, output / "original_catalog.json")
         informative = catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)
         population = tuple(m for m, keep in zip(catalog.mutation_ids, informative.any(axis=1)) if keep)
-        full = catalog.default_bounds()
+        fitting_bounds, lower_bound_rows = read_floor_bounds(catalog)
         result.update(original_mutation_ids=catalog.mutation_ids, region_ids=catalog.region_ids,
-                      biological_identity=catalog.biological_identity, stage_one_candidate_count=len(population))
+                      biological_identity=catalog.biological_identity, stage_one_candidate_count=len(population),
+                      read_counts=catalog.read_count_report, lower_bound_policy=fitting_bounds.policy_id,
+                      stage_one_support_hash=fitting_bounds.content_hash,
+                      cap_policy="minimum_native_map_set_upper", cap_conflict_policy="raise_upper_to_read_floor")
+        write_supporting_table(output / "multiplicity_lower_bounds.tsv", lower_bound_rows)
         settings = replace(config.fit, max_clusters=config.stage_two_max_clusters)
         for stage, value, requested in (("stage_one", accepted_stage_one, config.fit),
                                         ("stage_two", accepted_uncapped_stage_two, settings)):
@@ -222,7 +227,7 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
                 else:
                     accepted_uncapped_stage_two = accepted
         current = "stage_one"
-        first = fit_or_reuse(accepted_stage_one, population, full, "A", "stage_one", config.fit)
+        first = fit_or_reuse(accepted_stage_one, population, fitting_bounds, "A", "stage_one", config.fit)
         current = "stage_one_measurement"
         groups = operation("classification", "A", lambda: classify_groups(catalog, first, config))
         result["stage_one_groups"] = groups
@@ -242,8 +247,9 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
         contributors = operation("contributor_collection", "A", lambda:
             collect_cap_contributors(catalog, first, config, mutation_ids=g0))
         result["contributors"] = contributors
-        caps, cap_rows = _stage_two_caps(catalog, contributors)
-        result.update(cap_bounds=caps.to_dict(), cap_records=cap_rows)
+        caps, cap_rows = _stage_two_caps(catalog, contributors, lower_bounds=fitting_bounds)
+        result.update(cap_bounds=caps.to_dict(), cap_records=cap_rows,
+                      stage_two_support_hashes=dict(B=fitting_bounds.content_hash, C=caps.content_hash))
         write_supporting_table(output / "stage2_cap_contributors.tsv", contributors,
                                columns=CONTRIBUTOR_COLUMNS)
         write_supporting_table(output / "stage2_segment_multiplicity_bounds.tsv", cap_rows,
@@ -251,7 +257,7 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
         positions = {m: i for i, m in enumerate(catalog.mutation_ids)}
         unsupported = ([] if not remainder else [region for region, keep in zip(catalog.region_ids,
             informative[[positions[m] for m in remainder]].any(axis=0)) if not keep])
-        for name, bounds, reuse in (("B", full, accepted_uncapped_stage_two), ("C", caps, None)):
+        for name, bounds, reuse in (("B", fitting_bounds, accepted_uncapped_stage_two), ("C", caps, None)):
             arm = result["arms"][name]
             current = "stage_two"
             try:

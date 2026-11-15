@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--normal-cn-policy", choices=["diploid"], default=None,
                      help="Explicitly assume diploid normal CN only where it was not supplied.")
     fit.add_argument("--missing-counts", choices=("zero_alt", "unobserved"), default=DEFAULT_MISSING_COUNTS,
-                     help="Missing pairs use ALT=0 with supplied or regional median depth; unobserved opts out.")
+                     help="Missing pairs use ALT=0 and REF=regional median observed total depth; unobserved opts out.")
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
     fit.add_argument("--fit-multiplicity", choices=("marginal", "profile"), default="marginal",
                      help="Center fitting objective; selection always uses marginal-mixture BIC at frozen centers.")
@@ -53,8 +53,6 @@ def build_parser() -> argparse.ArgumentParser:
     assign.add_argument("--bundle", required=True)
     assign.add_argument("--assignment-method", choices=("marginal", "profile"), default=None,
                         help="Use the frozen method unless explicitly deriving a new request.")
-    assign.add_argument("--derive-current", action="store_true",
-                        help="Explicitly derive a current-policy result from a frozen historical bundle.")
     assign.add_argument("--output-dir", required=True)
     audit = subparsers.add_parser("audit-input", allow_abbrev=False,
                                  help="Report input readiness and read imputation without fitting or changing source files.")
@@ -100,11 +98,9 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(1)
         return
     if args.command == "assign":
-        from .assignment import AssignmentBundle, assign_mutations, derive_assignment_bundle
+        from .assignment import assign_mutations, derive_assignment_bundle
         from .io.assignment import load_assignment_bundle
         request = load_assignment_bundle(args.bundle)
-        if not isinstance(request, AssignmentBundle) and not args.derive_current:
-            raise ValueError("Historical bundles require --derive-current; their original contracts remain frozen")
         request = derive_assignment_bundle(request, assignment_method=args.assignment_method)
         assign_mutations(request, outdir=args.output_dir, run_manifest_id=args.run_manifest_id)
         return
@@ -115,7 +111,7 @@ def main(argv: list[str] | None = None) -> None:
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
         if (plan.get("schema") != "clipp2.workflow.plan.v6"
                 or plan.get("protocol_version") != PROTOCOL_VERSION):
-            raise ValueError("Workflow requires plan.v6 with protocol_version='2.4'; historical plans retain their original contracts")
+            raise ValueError("Workflow requires plan.v6 with protocol_version='2.4'")
         extra = set(plan) - {"schema", "protocol_version", "input_path", "workflow_config", "accepted_stage_one", "accepted_stage_two", "run_build_manifest", "run_manifest_id"}
         if extra:
             raise ValueError(f"Unknown workflow plan fields: {sorted(extra)}")

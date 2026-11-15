@@ -3,7 +3,7 @@
 This opt-in Stage 1–2 estimator fits each candidate partition using
 integer-multiplicity **profile likelihood**, then selects candidates using
 **marginal-mixture BIC at their frozen fitted centers**. Marginal fitting remains
-the compatibility default. Stage 3's independent assignment method is unchanged.
+the default. Stage 3's independent assignment method is unchanged.
 
 ```bash
 clipp2 fit --input-file tumor.tsv --output-dir result --device cpu \
@@ -104,9 +104,8 @@ The four identities are `fit_objective_id`, `selection_criterion_id`,
 `integer_multiplicity_profile_v1`, `marginal_mixture_bic_at_fitted_centers_v1`,
 `existing_marginal_pooled_pilot_v1`, and `profile_branch_interval_search_v1`.
 Accepted-fit/state v4 and producer v3 bind these identities and
-`fitting_log_likelihood`. Historical v3 accepted states remain marginal and retain
-their original serialized identity. Replay never relabels a marginal fit as
-profile-fitted. Standalone public TSV schemas remain unchanged.
+`fitting_log_likelihood`. Reuse never relabels a marginal fit as profile-fitted.
+Standalone public TSV schemas remain unchanged.
 
 Existing `conditional_log_likelihood` means assigned **marginal** likelihood;
 `mixture_log_likelihood`, `complexity_penalty` and `score` also keep their meanings.
@@ -156,5 +155,5 @@ error, ARI and false-merge/split pair counts. Truth is read only after fitting.
 Biological differences are descriptive; numerical and semantic correctness are
 the implementation gates. Comparison artifacts are external research outputs,
 not additional standalone fit TSVs.
-New simulation reports record the fitting identity and refuse to aggregate
-different fitting objectives. Historical report hashes remain unchanged.
+Simulation reports record the fitting identity and refuse to aggregate
+different fitting objectives.

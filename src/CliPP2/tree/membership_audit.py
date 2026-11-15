@@ -120,7 +120,7 @@ def audit_single_moves(model, bank, parent, *, batch_size=1, pass_number=1, audi
                 started=started_pass, complete=complete)
     prepared = None
     if q > 1:
-        columns = model.joint_column_set(centers)
+        columns = model.selection_column_set(centers)
         prepared = bank.prepare(parent.cuts, labels, fitted=parent.fit, columns=columns)
 
     def flush():

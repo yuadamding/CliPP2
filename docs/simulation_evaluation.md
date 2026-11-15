@@ -19,7 +19,7 @@ An eligible target with no informative reads is `prior_only`: equal scores and a
 deterministic representative are available, but no data-supported final label. `model_incompatible`, `excluded`, and computational failure are
 separate states, with no fabricated final label.
 
-The new metrics have explicit populations:
+Metrics have explicit populations:
 
 | Metric | Numerator or measurement | Denominator |
 |---|---|---|
@@ -34,9 +34,7 @@ The new metrics have explicit populations:
 
 Current views include targets (`view=""`), `whole_original`,
 `stage1_reference_recheck` and `stage2_recheck`. Every fitted mutation is a target;
-`unchanged_F` is explicitly empty. Historical routed evaluations retain their
-nonempty F and original `stage2_near_clonal_recheck` origin. Their native hard
-memberships are not retroactively interpreted as Stage 3 posterior estimates.
+`unchanged_F` is explicitly empty.
 Missing labels do not shrink the error denominators. Coverage and evidence-state
 counts expose the absence of an estimate, rather than counting it as correct.
 Binary correctness does not imply the correct subclone: a wrong nonclonal
@@ -52,26 +50,12 @@ probabilities; prior-only rows do not become read-supported calibration evidence
 Raw source coverage/depth/residuals and target mean/maximum residuals remain in
 mutation records. Descriptive strata distinguish zero versus positive source
 coverage and finite/infinite/unavailable target residuals without applying a
-cutoff. No selective-error threshold curves are constructed for Protocol 2.3.
+cutoff. No selective-error threshold curves are constructed.
 
 The provisional Stage 1 source can be subclonal. Evaluation retains its native
 centers, source purity, the learned reference geometry, cap exclusion and
 whole-original performance. Upper endpoints of available native MAP sets can lower the cap;
 truth replacement audits use the exact contributing IDs without requalification.
-
-## Historical Protocol 2.2 endpoints
-
-Historical evaluation v2/v3 definitions and routed Protocol 2.3 evaluation v4
-are frozen independently of current v5. The latter preserves its original
-reference inventory, target scope, metrics and decisions. Current v5 records
-`analysis_population`, including the actual CN policy, eligibility and admitted
-high-CN observations, separately from biological truth. Their
-`correct_resolution` and `selective_error` fields remain binary clonality
-endpoints, with their original `binary_*` aliases and accepted-only selective
-error denominator. Historical quality predicates and threshold curves retain
-their original meaning. They are not applied to new MAP inference. The detailed
-historical conventions described below remain necessary to interpret cached
-records and old-decision offline derivatives.
 
 ## Planned populations and missing evidence
 
@@ -91,36 +75,26 @@ execution failure. An unknown planned cell makes the planned estimate null with
 `incomplete_evidence`; an unestablished roster gives `incomplete_planned_roster`.
 A separate `available_case_estimate` explicitly averages the qualified surviving
 cases. Its interval is never shown as an interval for the planned cohort.
-Conditional endpoints report their available-case population. Historical selective
-error and new MAP error have distinct definitions and are never pooled.
+Conditional endpoints report their available-case population.
 
-Whole-original Stage 3 correctness includes both reassessed targets `T` and
-unchanged members `F`: `(correct_F + correct_accepted_T) / original_evaluable`.
-Failure before target decisions establishes `correct_accepted_T = 0`; it does
-not erase retained F memberships. With valid truth their exact contribution
-remains. With missing truth their correctness is unknown, so the whole-population
-score stays null. Completed B/C combined results remain available independently
-of a later B3/C3 assignment failure.
+Whole-original Stage 3 correctness is the number of correct data-supported
+final memberships divided by the original evaluable population. Every fitted
+mutation is reassessed; the unchanged population is empty. Completed B/C results
+remain available independently of a later B3/C3 assignment failure.
 
-A truth-independent zero now carries explicit `decision_population` evidence:
-whole-original-evaluable scope, complete coverage, the established denominator,
-and zero accepted decisions. Retained Stage 3 evidence separately accounts for
-unchanged and accepted-target memberships. Bare historical `known_no_decisions`
-tags, missing F evidence, and assignment exceptions alone cannot establish this
-claim. Re-evaluation must reconstruct it from retained memberships or an explicit
-failure before any endpoint decisions. Complete all-unresolved target output with
-an explicitly empty F also proves zero; malformed or incomplete returned output
-does not establish completed Stage 3 analysis availability.
+A truth-independent zero requires explicit `decision_population` evidence:
+whole-original-evaluable scope, complete coverage, a positive established
+denominator, and zero final decisions. An assignment exception alone does not
+establish this claim. Complete all-unresolved target output can prove zero;
+malformed or incomplete output cannot establish completed Stage 3 availability.
 
 Records retain missingness by family, history, acquisition and arm, together with
 planned, executed, scientifically applicable, evaluated and unavailable-derived
 counts. Partial arm failures preserve the other arm's results. Entirely unavailable
 current studies still use their frozen current evaluation definition.
 
-Primary truth-dependent estimates require `verified_history_binding`. Reconciled
-but unbound historical truth is `legacy_consistent_unbound`, reported only as
-`legacy_consistent_available_case_estimate`. Conflicting or missing truth remains
-unavailable. Operational execution/evaluation counts do not require biological
+Primary truth-dependent estimates require `verified_history_binding`.
+Conflicting, unbound or missing truth remains unavailable. Operational execution/evaluation counts do not require biological
 truth. An arbitrary `truth_required: false` cannot bypass scientific qualification.
 
 ## Operational accounting
@@ -157,7 +131,7 @@ An upstream exception does not become a downstream execution failure. Its explic
 pre-decision evidence can still establish a whole-original empty decision population
 under the scoped-zero rules above.
 
-## Detailed membership and historical selective endpoints
+## Detailed membership
 
 Frozen source-member purity still maps candidates to observable truth classes
 at the existing `.8` threshold, with the designated clonal reference mapped to
@@ -167,27 +141,17 @@ unmapped or ambiguous `U`; unresolved targets are separate. Evaluation records
 retain these counts for targets, both target origins, unchanged `F`, and the
 whole original population.
 
-Historical v2/v3 records use evaluable population size `P` and accepted count `A`:
-
-- Mapped correct and wrong resolutions are `Mc/P` and `Mw/P`.
-- Mapped selective error is `Mw/(Mc+Mw)`.
-- Unmapped acceptance is `U/A`, also reported as `U/P`.
-- Detailed selective-error bounds are `Mw/A` and `(Mw+U)/A`. They express
-  uncertainty from unresolved candidate mapping, not confidence intervals.
-
 Partition agreement, pair precision/recall, center errors, multiplicity errors,
-and coverage remain available. The unchanged-F view makes errors outside the
-reassessment population visible.
+and coverage remain available.
 
 Baseline and final membership use the same four-state classifier. Per-mutation
 records contain `baseline_detailed_membership_status`,
 `detailed_membership_status`, and `detailed_membership_transition`. A 4×4 cross-tab
 is retained separately for each target origin. `Mw->U` is unmapped acceptance,
 not a persisted mapped error; `U->Mc` is newly mapped-correct without proof that
-the baseline was wrong. Binary transitions are unchanged. The old diagnostic is
-explicitly named `legacy_multiclass_transition_fraction_unmapped_as_error`.
+the baseline was wrong. Binary transitions separately describe clonal/nonclonal changes.
 
-## Geometry and historical quality availability
+## Reference geometry
 
 New declared assessments use full requested-region, unnormalized L2 distance
 `||truth-center - candidate-center||2 <= tolerance`. The current production workflow has no geometric routing cutoff. This optional
@@ -202,105 +166,51 @@ A new evaluation configuration is:
 }
 ```
 
-`reference_match_atol: null` means unassessed. Explicit `reference_distance:
-"linf"` identifies maximum-coordinate geometry when requested; cached evaluation
-v1 records retain their original L∞ and legacy matching definition.
+`reference_match_atol: null` means unassessed. Explicit
+`reference_distance: "linf"` identifies maximum-coordinate geometry when requested.
 
 One-to-one reference matching first maximizes the number of allowed pairs, then
 minimizes distance summed over those pairs. Invalid edges never contribute cost.
 Stored float distances are compared as exact binary rationals, without a tie
 tolerance. Equal-cost optima use a deterministic lexicographic truth/reference order;
 alternative optimal choices are retained as ambiguity evidence. Continuous L2
-and maximum-coordinate errors remain available without a tolerance. The workflow
-qualification tool uses the same declared matcher.
+and maximum-coordinate errors remain available without a tolerance. Controlled reference diagnostics use the same declared matcher.
 
-In historical v2/v3 records, each target and unchanged-F row reports whether any
-geometrically matching reference exists, and whether at least one passes quality in all
-of that mutation's original informative regions. Distance always uses the full
-region vector; only the quality requirement follows the observation mask.
-Quality failure in an unobserved region does not make a candidate unusable.
+No declared tolerance gives null recovery with an unassessed status. Missing
+references, observations or diagnostics retain explicit unavailable states.
+Geometric availability never changes the production reference inventory or
+vetoes a defined assignment.
 
-No declared tolerance gives null availability with an unassessed status. No
-frozen reference gives null with `unavailable_reference`. No informative
-observations gives null usable availability with a not-evaluable status. A valid
-reference without a matching center gives false; matching centers that fail
-required quality give geometric true and usable false. Missing historical quality
-evidence gives null usable availability rather than invented passing flags.
-
-The historical `geometric_correct_reference_resolution` counts accepted matching centers that
-pass required quality over the evaluable population. Outcomes are also stratified
-by availability and target origin. The binary recovery ceiling remains
-`|H intersect T_C|/|H|`; geometric availability never multiplies that binary ceiling.
-
-## Explicit offline reports
+## Offline reports from current artifacts
 
 ```sh
-clipp2-simulate report OLD_STUDY \
+clipp2-simulate report STUDY_DIRECTORY \
   --evaluation-config evaluation.json \
   --report-dir NEW_REPORT_DIRECTORY
 ```
 
-This reads retained truth, input counts, acquisition evidence, selected attempts,
-and paired results, including archived results. Missing or ambiguous evidence is
-reported as unavailable. Truth and counts are not regenerated from a changed
-source path. Frozen development selection and original outputs stay intact.
-Verified single-state `original-catalog.v3` evidence from `f2d1fa1` can be
-reevaluated read-only. The retained catalog payload is checked against its original
-manifest and its original content-hash encoding before conversion. Its current
-working representation must then agree with the preserved input's scientific
-arrays, mutation/region keys, masks, source rows, metadata and provenance.
-Derived records state both `source_catalog_schema` and `working_catalog_schema`;
-neither original catalogs nor manifests are rewritten. Directory and archived
-configuration copies must agree when both remain. Each required filename may
-occur only once within an archive; even identical duplicate members are rejected.
+Offline reporting reads retained truth, input counts, acquisition evidence,
+selected attempts and paired results, including archived results. It performs no
+fitting, reassignment, truth generation or read generation. A report never changes
+saved inference decisions or overwrites the source study.
 
-Present but unsupported formats receive `unsupported_artifact_format` and pinned
-producer guidance, not `conflicting_truth`. This includes older mixed-state
-catalogs, multiple historical CN rows for one observation, and historical
-near-one source fractions that the current exact single-state contract cannot
-represent unchanged. Such evidence is excluded from primary truth-dependent
-estimates. Altered counts, CN, keys, masks, provenance or identity bindings remain
-conflicts. Absent manifest or input-binding keys are missing evidence; present
-malformed bindings remain conflicts. Current-format evidence
-without a redundant catalog copy is usable only if the preserved input exactly
-matches the original manifest identity.
+Only current artifacts are supported: paired experiment v6, original catalog v6,
+assignment bundle v6, assignment result v9 and evaluation/definition v6. Input
+catalogs must agree with their manifests, source observations, masks, CN,
+metadata and imputation ledgers. Missing or conflicting evidence is reported as
+unavailable. Directory and archived copies must agree when both remain, and
+each required filename can occur only once within an archive.
 
-The compact `f2d1fa1_successful_evidence.zip` regression fixture preserves an
-actual 12-mutation, two-region historical run with three native fits and two
-assignment passes. Each arm has seven unchanged members, five accepted targets,
-and nonzero calibration losses. Its archived origin receipt and reproducer record
-the producing revision, environment, configuration and expected results. Cached
-reporting and current reevaluation compare all 853 metrics under the same declared
-evaluation definition, without inference or source changes. The separate failure
-fixture retains coverage of pre-fit failure accounting.
+Without a new evaluation configuration, reports use cached evaluations under
+the study's frozen definition. Every cached record must match that definition
+and its cell identity. Structural or identity errors name the cell and file;
+definition conflicts require explicit reevaluation into a new directory.
+Missing or truncated files remain unavailable evidence.
 
-Without a new evaluation configuration, cached-report behavior is retained.
-Cached reports resolve the complete frozen definition before reading cells.
-Every cached record must match that definition, even when all records are present
-and agree with each other. A conflicting cache requires explicit reevaluation.
-Syntactically valid caches must be objects with the expected cell identity,
-versioned definition, and a list of metric objects. Structural or identity errors
-raise an integrity error naming the cell and file; scientific-definition conflicts
-remain fatal. Missing or truncated files retain explicit unavailable placeholders.
-Missing records remain unknown under that definition, including historical v1
-L∞ geometry, its top-level matching tolerance, and its original matching policy.
-Even an empty report with no recoverable complete roster retains the historical
-definition and unavailable planned estimates. An explicit new evaluation
-configuration derives v3 for retained Protocol 2.2 inference, v4 for routed
-Protocol 2.3 paired-v4 inference, and v5 for reference-preserving paired-v5 inference,
-including when usable records are absent. Changing inference policy requires a
-separate assignment derivative; offline reporting never changes old decisions.
-
-Cached operational values remain historical. To apply corrected stage-specific
-accounting, derive a report into a new directory from retained execution evidence;
-the source evaluations and reports are preserved.
-
-Versioned evaluation, definition and aggregate records contain the endpoint, population
-scope, missing-evidence treatment, truth-qualification policy, metric, tolerance,
-matching policy, and semantic definition identity. Distance configuration remains
-v1; old v1/v2 evaluation files keep their original definitions. Aggregation
-rejects incompatible definitions rather than silently mixing L2, L∞, different
-tolerances, or legacy and revised endpoint interpretations.
+Evaluation, definition and aggregate records bind the endpoint, population,
+missing-evidence treatment, truth qualification, assignment and fitting methods,
+distance metric, tolerance and matching policy. Aggregation rejects incompatible
+definitions, including different methods, distances or tolerances.
 
 ## Consistent operational accounting
 

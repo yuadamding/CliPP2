@@ -1,7 +1,5 @@
 """Method-bound Stage 3 regressions; CPU smoke fixtures, optionally CUDA."""
 from dataclasses import replace
-import copy
-import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -135,14 +133,7 @@ def run_checks(root, *, device="cpu"):
     for version in (4, 5):
         old = marginal.to_dict()
         old.update(schema=f"clipp2.assignment.bundle.v{version}", protocol_version="2.3")
-        old.pop("assignment_method")
-        historical = AssignmentBundle.from_dict(old)
-        before = copy.deepcopy(historical.to_dict())
-        derived = derive_assignment_bundle(historical, assignment_method="profile")
-        assert historical.to_dict() == before and derived.content_hash != historical.content_hash
-        assert derived.catalog.content_hash == marginal.catalog.content_hash
-        assert derived.reference.to_dict() == marginal.reference.to_dict()
-        assert derived.provenance["assignment_derivation"]["source_bundle_hash"] == historical.content_hash
+        _fails(lambda: AssignmentBundle.from_dict(old))
     if device == "cpu":
         from compare_stage3_likelihood import compare
         truth = pd.DataFrame(dict(mutation_id=catalog.mutation_ids, region_id=catalog.region_ids,
@@ -158,11 +149,6 @@ def run_checks(root, *, device="cpu"):
         main(["assign", "--bundle", str(root / "request.json"), "--assignment-method", "profile", "--output-dir", str(root / "cli")])
         executed = load_assignment_bundle(root / "cli" / "assignment_bundle.json")
         assert executed.content_hash == profile.content_hash
-        historical_path = root / "historical.json"
-        historical_path.write_text(json.dumps(dict(payload=historical.to_dict(), content_hash=historical.content_hash)))
-        _fails(lambda: main(["assign", "--bundle", str(historical_path), "--output-dir", str(root / "reject")]))
-        main(["assign", "--bundle", str(historical_path), "--derive-current", "--assignment-method", "profile",
-              "--output-dir", str(root / "derived_cli")])
     return dict(device=device, unique_marginal_profile_reversal=True, exact_tie_baseline_not_first=True,
         original_support_restored=True, mandatory_status_failure=True, optional_failure_preserves_multiplicity=True,
-        profile_has_no_cluster_posterior=True, independent_publication=True, historical_derivation=True)
+        profile_has_no_cluster_posterior=True, independent_publication=True, old_artifacts_rejected=True)

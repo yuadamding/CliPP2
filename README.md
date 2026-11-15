@@ -2,11 +2,16 @@
 
 CliPP2 implements a three-stage research method for joint mutation clustering
 across tumor regions. It estimates cancer cell fractions (CCFs) and integer
-multiplicities under **one allele-specific tumor copy-number state per
-mutation–region observation**. Mixed tumor copy-number states are unsupported.
+multiplicities using **one representative allele-specific tumor copy-number
+state per mutation–region observation** in the likelihood. Supplied CN-state
+fractions additionally determine the read-based multiplicity lower bounds in
+Stages 1 and 2; they do not introduce a mixed-state likelihood.
 
 Protocol **2.4** chooses a provisional Stage 1 source, then fits the remainder
 with caps from the minimum upper endpoint of native multiplicity MAP sets.
+Both fitting stages restrict candidates below by the floor-based estimate
+described below. A conflicting Stage 2 cap is raised to that mutation's lower
+bound, making the lower bound its sole candidate.
 Stage 3 restores original support and reassesses every fitted mutation against
 one fixed all-one clonal reference and every Stage 2 center. The selected Stage 1
 source maps to that clonal reference; its native estimate remains provenance,
@@ -48,11 +53,10 @@ and no data-supported final label; all-impossible candidates instead yield
 Stage 3 defaults to **marginal** likelihood. Set
 `workflow_config.stage_three_assignment_method` to `"profile"` to maximize each
 region’s binomial likelihood over original multiplicities. For a frozen request,
-use `clipp2 assign --assignment-method profile`; historical requests also require
-`--derive-current`. A method change creates a new request identity and saves the
+use `clipp2 assign --assignment-method profile`. A method change creates a new request identity and saves the
 executed bundle with its outputs. Profile ties retain the baseline when it is a
 maximizer; otherwise the lowest label wins. Profile scores are not cluster
-posteriors. Entropy comparisons remain only in their frozen research runtime.
+posteriors.
 
 CUDA requires an explicit build and device selection:
 
@@ -84,6 +88,33 @@ See the [runnable examples](examples/README.md).
 | `purity`, `normal_cn` | Purity in `(0, 1]` and nonnegative integer normal CN |
 | `segment_id`, `cn_state_id`, `cn_state_fraction` | Genuine segment mapping and one state with fraction 1 |
 | `allele_a_cn`, `allele_b_cn` | Integer major/minor CN, with major ≥ minor |
+| `segment_cn_states` (optional) | JSON list preserving all segment CN states and their tumor-cell fractions |
+
+Regional `cna.txt` may give multiple states for an exact chromosome/start/end
+interval by adding `cn_state_id` and `cn_state_fraction`. Fractions describe
+**all tumor cells** and must sum to 1 within the interval. The state with the
+largest `(major_cn, minor_cn)` pair, compared in that order, supplies the
+representative CN for the existing likelihood and the maximum major-CN clamp.
+The full list is retained in the canonical `segment_cn_states` field. Canonical
+TSV inputs preserve their explicit `allele_a_cn`/`allele_b_cn` for the likelihood
+and major-CN clamp, independently of the states in that list. See the
+[regional input example](examples/README.md) for the schema and validation.
+
+For ALT reads `a`, total depth `d`, supplied purity `p`, and original input major
+CN `M`, the Stage 1–2 lower bound is
+
+```text
+Cbar = sum(cn_state_fraction * (major_cn + minor_cn))
+lower = max(1, min(M, floor((a / d) / p * (p * Cbar + 2 * (1 - p)))))
+```
+
+With one supplied state, `Cbar` is its major plus minor CN. The estimator uses
+normal-cell total CN **2**, rounds down, and has no fixed cap of 4. Zero ALT,
+missing reads, and zero depth receive lower bound 1. It does not divide by
+mutation CCF, so it can underestimate multiplicity for subclonal mutations.
+`multiplicity_lower_bounds.tsv` records the inputs and estimates; segment-cap
+audits count cases where the lower bound overrides a cap. Stage 3 restores
+`1..M`, including candidates below the read-based estimate.
 
 CN and normal-CN provenance must be explicit. Regional files may supply
 `normal_cn` in their CNA table; an omitted normal CN requires an explicit
@@ -91,9 +122,12 @@ CN and normal-CN provenance must be explicit. Regional files may supply
 plan. Non-diploid normal CN remains supported.
 
 Missing pairs (`count_observed=0`, or an SNV absent from a region's list) default
-to **ALT=0**. REF uses the supplied positive read depth, otherwise that region's
-median positive depth among eligible observed pairs (half-read ties round up).
-Without either depth source, input validation fails. This is an **absence
+to **ALT=0 and REF=the region's median total read count** among eligible,
+originally observed positive-depth pairs (half-read ties round up). This happens
+automatically in fits and workflows, including when an explicitly missing row
+contains counts. Medians are computed separately for each region, before
+imputation or fitting, and reused by all stages. If a region has no usable
+observed depth, input validation fails. This is an **absence
 assumption**, not measured evidence: raw rows and imputation records are retained
 in workflow catalogs. Explicit exclusions and observed zero-depth pairs stay
 unchanged. To keep missing pairs uninformative, use `--missing-counts unobserved`
@@ -125,8 +159,6 @@ study. Numerical verification remains mandatory. The deterministic checks above
 are separate from biological performance assessment and full-cohort execution.
 
 - [Workflow Protocol 2.4](docs/workflow_protocol_2_4.md)
-- [Historical Protocol 2.3](docs/workflow_protocol_2_3.md)
-- [Historical Protocol 2.2](docs/workflow_protocol_2_2.md)
 - [Simulation design and execution](docs/simulation.md)
 - [Evaluation definitions](docs/simulation_evaluation.md)
 

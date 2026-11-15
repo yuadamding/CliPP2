@@ -140,20 +140,16 @@ def refine_partition(model, tree, candidate, consider, *, max_proposals=POLICY.b
         frontier.remove(parent)
         fit = parent.fit
         labels = fit.labels
-        handles = (model.joint_column_set(fit.centers)
-                   if prepare is not None and hasattr(model, "joint_column_set") else None)
+        handles = model.selection_column_set(fit.centers) if prepare is not None else None
         prepared = (None if prepare is None else
                     prepare(parent.cuts, labels, fitted=fit, columns=handles))
-        if hasattr(model, "fit_column_set"):
-            handles = model.fit_column_set(fit.centers)
+        handles = model.fit_column_set(fit.centers)
         components = ({cluster: group.members for cluster, group in enumerate(prepared.groups)}
                       if prepared is not None and prepared.groups else
                       {cluster: np.flatnonzero(labels == cluster) for cluster in range(len(fit.centers))})
         # The model columns already enforce the complete regional assignment box.
-        gather = (handles.subset_values if device_proposals and handles is not None
-                  and getattr(getattr(model, "backend", None), "kind", None) == "cuda" else None)
-        columns = (None if gather is not None else model.log_likelihood_columns(fit.centers)
-                   if handles is None else handles.materialize())
+        gather = handles.subset_values if device_proposals and model.backend.kind == "cuda" else None
+        columns = None if gather is not None else handles.materialize()
         for edge in parent.cuts:
             if attempted >= max_proposals:
                 return
@@ -362,16 +358,13 @@ def expand_memberships(model, bank, *, work=None):
         for round_index in range(ROUND_LIMIT):
             labels = np.asarray(state.fit.labels, dtype=np.int64)
             centers = np.asarray(state.fit.centers, dtype=float)
-            handles = model.joint_column_set(centers) if hasattr(model, "joint_column_set") else None
+            handles = model.selection_column_set(centers)
             prepared = (bank.prepare(state.cuts, labels, fitted=state.fit, columns=handles)
                         if hasattr(bank, "prepare") else None)
-            if hasattr(model, "fit_column_set"):
-                handles = model.fit_column_set(centers)
-            use_device = (getattr(bank, "device_proposals", False) and handles is not None
-                          and getattr(getattr(model, "backend", None), "kind", None) == "cuda")
+            handles = model.fit_column_set(centers)
+            use_device = getattr(bank, "device_proposals", False) and model.backend.kind == "cuda"
             positive = handles.positive_transfers(labels) if use_device else None
-            columns = (None if use_device else np.asarray(model.log_likelihood_columns(centers), dtype=float)
-                       if handles is None else handles.materialize())
+            columns = None if use_device else handles.materialize()
             if (columns is not None and columns.shape != (model.n, q)) or len(keys) != model.n:
                 raise ValueError("Joint likelihood columns and scientific keys must match N by K")
             evaluations += 1

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -78,7 +79,11 @@ def _read_region(path: Path, *, preserve_provenance=False):
         observation_rows[locus] = row
     _, table = _read_text_table(path / "cna.txt", columns=_CNA_COLUMNS,
                                 canonical=False, allow_empty=True)
-    intervals = {}
+    state_columns = {"cn_state_id", "cn_state_fraction"}
+    if state_columns.intersection(table.columns) and not state_columns.issubset(table.columns):
+        raise TumorTxtError(f"{path}: CNA states require both cn_state_id and cn_state_fraction.")
+    explicit_states = state_columns.issubset(table.columns)
+    interval_groups = {}
     interval_rows = {}
     for row in table.to_dict(orient="records"):
         chrom = _identifier(row["chromosome_index"], name=f"{path} chromosome_index")
@@ -98,8 +103,33 @@ def _read_region(path: Path, *, preserve_provenance=False):
         if normal_supplied and "normal_cn" not in row:
             raise TumorTxtError(f"{path}: normal CN cannot be marked supplied without normal_cn.")
         genuine = _provenance_flag(row, ("mapping_genuine", "_mapping_genuine"), "Genuine-mapping")
-        intervals.setdefault(chrom, []).append((start, end, major, minor, normal, normal_supplied, genuine))
-        interval_rows[chrom, start, end] = row
+        interval_groups.setdefault((chrom, start, end), []).append(
+            (major, minor, normal, normal_supplied, genuine, row))
+    intervals = {}
+    from .cn_states import SegmentCNStates
+    for (chrom, start, end), states in interval_groups.items():
+        segment_id = f"{chrom}:{start}-{end}"
+        if len(states) > 1 and not explicit_states:
+            raise TumorTxtError(f"{path}: duplicate CNA interval {segment_id}; multiple states require "
+                                "cn_state_id and cn_state_fraction.")
+        if any(state[2:5] != states[0][2:5] for state in states[1:]):
+            raise TumorTxtError(f"{path}: normal CN and provenance must agree across states of {segment_id}.")
+        encoded = None
+        if explicit_states:
+            validated = SegmentCNStates(tuple(dict(sample_id=path.name, segment_id=segment_id,
+                cn_state_id=state[5]["cn_state_id"], cn_state_fraction=state[5]["cn_state_fraction"],
+                major_cn=state[0], minor_cn=state[1]) for state in states))
+            encoded = json.dumps([dict(cn_state_id=state[2], cn_state_fraction=state[3],
+                                       major_cn=state[4], minor_cn=state[5])
+                                  for state in validated.records], separators=(",", ":"))
+        # The native likelihood still uses one original integer CN pair. Keep
+        # the state with the greatest (major, minor), preserving max major as
+        # the biological multiplicity ceiling; all states inform the floor.
+        major, minor, normal, normal_supplied, genuine, representative = max(
+            states, key=lambda state: (state[0], state[1], str(state[5].get("cn_state_id", ""))))
+        intervals.setdefault(chrom, []).append((start, end, major, minor, normal,
+                                               normal_supplied, genuine, encoded))
+        interval_rows[chrom, start, end] = representative
     indexed = {}
     for chrom, segments in intervals.items():
         segments.sort()
@@ -127,11 +157,13 @@ def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tupl
                 raise TumorTxtError(f"{path}: input_missing CN segment for mutation {chrom}:{position} "
                                     f"in sample {sample!r}; run the input audit to inspect profile and segment mapping.")
             else:
-                start, end, major, minor, normal, normal_supplied, genuine = segments[index]
+                start, end, major, minor, normal, normal_supplied, genuine, cn_states = segments[index]
             alt, ref, excluded, observed = observations.get((chrom, position), (".", ".", False, False))
             row = dict(zip(SCHEMA_COLUMNS, (f"{chrom}:{position}", sample, alt, ref, int(observed), purity,
                          normal, f"{chrom}:{start}-{end}", "0", 1, major, minor)))
             row.update(_mapping_genuine=genuine, _normal_cn_supplied=normal_supplied)
+            if cn_states is not None:
+                row["segment_cn_states"] = cn_states
             if has_exclusions:
                 row["input_excluded"] = int(excluded)
             if preserve_provenance:
@@ -144,7 +176,8 @@ def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tupl
                                   "mutation_key_convention": "chromosome_index:position"}, path=path)
     table = pd.DataFrame(rows).fillna(".")
     return metadata, table if preserve_provenance else table.loc[:, [*SCHEMA_COLUMNS,
-        "_mapping_genuine", "_normal_cn_supplied", *(["input_excluded"] if has_exclusions else [])]]
+        "_mapping_genuine", "_normal_cn_supplied", *(["input_excluded"] if has_exclusions else []),
+        *(["segment_cn_states"] if "segment_cn_states" in table else [])]]
 
 
 def audit_region_directory(path):

@@ -275,7 +275,6 @@ class RegionalModel:
         for values in (self.support, self.lower, self.upper):
             digest.update(values.tobytes())
         digest.update(repr((self.mutation_ids, self.region_ids)).encode())
-        self.legacy_marginal_identity = digest.hexdigest()
         digest.update(repr(tuple(self.method_identity.items())).encode())
         self.identity = digest.hexdigest()
         self.device = str(device)
@@ -293,7 +292,7 @@ class RegionalModel:
         self._refits, self._columns, self._weight_results, self._preparations = (
             _BoundedCache() for _ in range(4))
         self.telemetry = {"refit_cache_hits": 0, "scalar_refits": 0,
-                          "column_cache_hits": 0, "likelihood_columns": 0,
+                          "likelihood_columns": 0,
                           "likelihood_column_requests": 0,
                           "column_host_cache_hits": 0, "column_batch_reuses": 0,
                           "column_device_cache_hits": 0, "column_device_retained_hits": 0,
@@ -342,12 +341,6 @@ class RegionalModel:
     def node_terms(self, x):
         """Loss, exact gradient, positive complete-data curvature on CCF scale."""
         return self.backend.node_terms(x)
-
-    def fit_node_terms(self, x):
-        return self.fit_backend.node_terms(x)
-
-    def fit_conditional_values(self, tasks, centers):
-        return self.fit_backend.conditional_values(tasks, centers)
 
     def multiplicity(self, x):
         return self.backend.multiplicity(x)
@@ -590,13 +583,6 @@ class RegionalModel:
             raise ValueError("Centers must be finite nonempty q by R CCFs")
         return centers
 
-    def log_likelihood_columns(self, centers):
-        """Fitting emissions for legacy proposal callers; scoring uses typed columns."""
-        return self.fit_column_set(centers).materialize()
-
-    def joint_column_set(self, centers, *, retained_columns=None):
-        return self.selection_column_set(centers, retained_columns=retained_columns)
-
     def fit_column_set(self, centers, *, retained_columns=None):
         return self._column_set(centers, self.fit_backend, retained_columns=retained_columns)
 
@@ -616,8 +602,6 @@ class RegionalModel:
         Host hits reuse pre-call columns, including any
         call-retained copies; batch reuse serves another request from a column
         evaluated in this call.
-        The legacy column_cache_hits also includes hits on newly
-        cached columns, so it overlaps these disjoint counters; do not add it.
         """
         centers = self._validate_centers(centers)
         self.telemetry["joint_matrix_calls"] += 1
@@ -658,7 +642,6 @@ class RegionalModel:
             if column is None:
                 column = retained.get(key[2])
             if column is not None:
-                self.telemetry["column_cache_hits"] += 1
                 counter = ("column_batch_reuses" if key[2] in evaluated else
                            "column_device_retained_hits" if backend.kind == "cuda" else
                            "column_host_cache_hits")

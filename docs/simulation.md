@@ -14,9 +14,8 @@ bytes are unchanged. `load_cohort` accepts both `.json` and `.json.gz`. Study
 directories retain a plain `cohort_settings.json` snapshot, and content identities
 and semantic seeds depend on parsed settings rather than compression or paths.
 
-The earlier [Version 1.1 Word study plan](https://github.com/yuadamding/CliPP2/blob/7ce47841fbd5402ed85faeda382371af7a0fe93a/CliPP2_biological_simulation_plan.docx)
-is retained in Git history. Current execution and evaluation are documented here
-and in [simulation evaluation](simulation_evaluation.md).
+Execution and evaluation are documented here and in
+[simulation evaluation](simulation_evaluation.md).
 The method-bound Stage 3 option defaults to `marginal`; `profile` retains accuracy
 metrics but has no cluster posterior calibration. Methods and tie policies have
 distinct evaluation identities. See [Protocol 2.4](workflow_protocol_2_4.md).
@@ -50,7 +49,7 @@ python -m CliPP2.simulation qualify \
 python -m CliPP2.simulation run \
   --cohort-settings CliPP2_phylogeny_cohort_settings.json.gz \
   --main-replicates 10 --development-replicates 2 \
-  --workers 10 --outdir results/cohort-protocol23
+  --workers 10 --outdir results/cohort-protocol24
 ```
 
 `qualify` replays all 720 histories, checks canonical input roundtrips, and runs
@@ -81,10 +80,10 @@ and optionally `CLIPP2_RUN_BUILD_MANIFEST`; `--source-record` accepts an externa
 prepared report record. Missing external evidence is explicitly unbound.
 
 ```sh
-python -m CliPP2.simulation status results/cohort-full
-python -m CliPP2.simulation run --outdir results/cohort-full --resume
-python -m CliPP2.simulation run --outdir results/cohort-full --resume --retry-failed
-python -m CliPP2.simulation report results/cohort-full
+python -m CliPP2.simulation status results/cohort-protocol24
+python -m CliPP2.simulation run --outdir results/cohort-protocol24 --resume
+python -m CliPP2.simulation run --outdir results/cohort-protocol24 --resume --retry-failed
+python -m CliPP2.simulation report results/cohort-protocol24
 ```
 
 `status` reads progress and in-flight operation journals without changing the
@@ -101,36 +100,28 @@ settings at coordinator execution boundaries before reusing work. Each worker
 then reuses its validated immutable snapshot; a new process loads and verifies
 it again. Semantic random seeds remain unchanged.
 
-Existing v1–v7 study contracts retain their original frozen installations and outputs.
-They are not migrated, and missing historical identity is not retrofitted. A new execution
-under 2.0.0 requires a new directory. Controls run explicitly through
-`qualify` or the research control functions, independently of study execution.
-Historical qualification receipts remain readable for cost reporting but do not
-gate execution or resume. Interrupted costs remain explicitly unknown. Reports
-use new directories.
+Only the current v8 study contract and Protocol 2.4 artifacts are supported.
+Controls run explicitly through `qualify` or the research control functions,
+independently of study execution. Interrupted costs remain explicitly unknown.
+Reports use new directories.
 
 New studies save `main_roster.json` before development. Its
 identity is independent of worker count. The contract also declares the development
 population. `development_assessment.json` binds the fixed workflow configuration,
 study contract, main roster, every planned development cell, its retained evaluation
-paths and execution status. Explicit retries append numbered assessments. No
-`threshold_development.json` or redundant `study_plan.json` is created. Historical
-threshold-selection receipts remain readable without changing old decisions.
-Evaluation v5 uses family/history/acquisition weights. A known
-failure receives zero correct-decision credit only when a positive original
-denominator is established and no data-supported final decisions remain anywhere in that
-endpoint (including native unchanged members only in historical records);
-missing or conflicting evidence produces an unknown score. An incomplete planned
-estimate is null, with available-case summaries labeled separately. Legacy studies
-without an explicit complete frozen roster cannot establish the planned estimate
-from a total cell count alone.
+paths and execution status. Explicit retries append numbered assessments.
+Evaluation v6 uses family/history/acquisition weights. A known failure receives
+zero correct-decision credit only when retained evidence establishes a positive
+original denominator and no data-supported final decisions. Missing or
+conflicting evidence produces an unknown score. An incomplete planned estimate
+is null, with available-case summaries labeled separately. Planned estimates
+require the complete frozen roster.
 
-New history manifests, acquisitions, and input catalogs share an exact semantic
-`history_content_id`. Offline evaluation also reconstructs biological read
+History manifests, acquisitions, and input catalogs share an exact semantic
+`history_content_id`. Offline evaluation reconstructs biological read
 probabilities from true purity, CN, multiplicity, and carrier fraction. Perturbed
-supplied inputs and biased read probabilities remain separate. Consistent legacy
-evidence without an exact retained link is labeled `legacy_consistent_unbound`;
-its conditional diagnostics do not enter the verified primary aggregate.
+supplied inputs and biased read probabilities remain separate. Primary
+truth-dependent aggregates require a verified binding to the retained history.
 
 `--retry-failed` also reaches technical-sensitivity jobs.
 External-reference audits record the selected source attempt, reuse only matching
@@ -156,7 +147,7 @@ configuration and a new report destination:
 ```
 
 ```sh
-clipp2-simulate report results/old-study \
+clipp2-simulate report results/cohort-protocol24 \
   --evaluation-config evaluation.json --report-dir results/new-evaluation-report
 ```
 
@@ -164,8 +155,7 @@ The tolerance above is an example reporting choice. Offline evaluation reads
 preserved truth, input catalogs, acquisition records, selected attempts, and
 paired results, including archives. Missing or conflicting evidence produces an
 unavailable derived record. It performs no fitting, assignment, generation, or
-policy selection; historical development choices and old inference decisions
-remain intact. Without `--evaluation-config`, reports use cached evaluations.
+policy selection; the saved inference decisions remain intact. Without `--evaluation-config`, reports use cached evaluations.
 
 Generate every truth history and prescribed input catalog without fitting:
 
@@ -188,6 +178,9 @@ Numerical arrays use canonical mutation-ID order; metadata retains the original
 prescribed ranks and coordinates. Rank-based S10 masks use those original ranks,
 not canonical array positions. Missing counts, observed zero ALT, zero depth,
 and explicit input exclusion remain distinct; excluded pairs retain raw counts.
+Inference automatically fills missing eligible pairs with ALT=0 and REF equal
+to the corresponding region's median observed positive total depth. The raw
+acquisition mask and the imputation ledger are retained separately.
 
 Valid supplied CCF values retain their exact floating-point values. Five source
 history/class/region endpoints equal `1.0000000000000002`: T/R3 in S07.03 main
@@ -204,53 +197,56 @@ no public random fit seed; source fit-seed templates do not alter its execution.
 
 ## Experiment, development, and accounting
 
-Each core dataset has up to three fits: A fits the full population, B fits the
-remainder with original support, and C fits it with contributor-derived caps.
-B3 and C3 each perform one frozen-reference assignment with fresh full original
-support. The one-configuration core maxima are **7,920 fits and 5,280 assignment
-passes**. Blocked or inapplicable branches may execute fewer operations.
+Each core dataset has up to three fits: A fits the full informative population;
+B fits the remainder with read-derived lower bounds and original major-CN upper
+bounds; C fits the same remainder with those lower bounds and contributor-derived
+upper caps. All three fits use the floor formula in
+[Protocol 2.4](workflow_protocol_2_4.md). If a cap is below the read-derived lower
+bound, the lower bound is the sole candidate. B3 and C3 each perform one
+frozen-reference assignment with full original support `1..major_cn`.
+The one-configuration core maxima are **7,920 fits and 5,280 assignment passes**.
+Blocked or inapplicable branches may execute fewer operations.
 
-Stage 1 chooses the occupied group nearest all ones as a **provisional source**;
-its actual native center remains a reference. Source residuals, coverage and
-distance do not veto continuation. Each defined observed source multiplicity
-likelihood contributes the largest integer in its exact MAP set. Stage 2 caps are
-the minimum of those endpoints, with original-support fallback. A flat likelihood
-supplies the original upper endpoint; undefined all-zero likelihoods supply none.
-Historical native point calls remain separate. The cap is a discovery heuristic,
-not a biological upper-bound certificate.
+Stage 1 chooses the occupied group nearest all ones as a **provisional source**.
+Source residuals, coverage and distance do not veto continuation. Each defined
+observed source multiplicity likelihood contributes the largest integer in its
+exact MAP set over the fitted support. Stage 2 takes the minimum of those
+endpoints as the raw segment cap. Without a contributor, the original upper
+endpoint remains. Native point calls and cap-source MAP sets are retained
+separately. This cap is a discovery heuristic rather than a biological
+upper-bound certificate.
 
-For each arm, Stage 3 consolidates exactly equal vectors from the canonical
-all-one hypothesis, the source native center and every Stage 2 center. All source
-provenance remains. Equal priors are assigned after consolidation; near-identical
-centers remain distinct. Every combined fitted mutation is reassessed under full
-original support: **T is the entire fitted population and F is empty**. Baseline
-labels refer to the actual source center after consolidation. There is no distance
-routing parameter. Cluster defaults remain 10/20, and valid major CN has no default
-upper eligibility ceiling. Deliberate exclusions and numerical verification remain.
+For each arm, Stage 3 uses one fixed all-one clonal hypothesis and every Stage 2
+center, consolidating exact duplicate vectors before assigning equal priors.
+The provisional source maps to the fixed clonal hypothesis; its native center
+remains provenance. Near-identical Stage 2 centers remain distinct. Every fitted
+mutation is reassessed under full original support: **T is the entire fitted
+population and F is empty**. Cluster defaults remain 10/20, and valid major CN
+has no default eligibility ceiling. Explicit exclusions and numerical
+verification remain.
 
 Authoritative outputs contain `map_label`, `map_set`, `posterior_defined`,
-`evidence_status` and `final_assignment_label`. Prior-only, incompatible, excluded
-and failed observations remain distinct. Whole-original tables retain explicit
-outcomes for mutations outside the fitted population. All reference labels remain,
+`evidence_status` and `final_assignment_label`. Prior-only, incompatible,
+excluded and failed observations remain distinct. Whole-original tables retain
+explicit outcomes outside the fitted population. All reference labels remain,
 including zero occupancy. Target origins are `stage1_reference_recheck` and
-`stage2_recheck`; historical cap contributors retain their discovery contribution
-when reassigned. Both arms use production construction/reconciliation helpers.
-Native results remain retained if a later derived phase fails.
+`stage2_recheck`. Source cap contributions remain attached to the discovery fit
+when a mutation is reassigned. Both arms use production construction and
+reconciliation helpers. Native results remain retained if a later derived phase
+fails.
 
-Development has no threshold grid or performance-based stop. Reference-preserving
-outputs use paired v5, assignment bundle/result v5/v6 and evaluation/definition v5.
-Earlier routed Protocol 2.3 records retain v4 semantics; Protocol 2.2 records retain
-their frozen definitions. The numerical protocol string alone does not select the
-evaluation contract. Native/cap comparisons and high-CN population expansion are
-reported separately; the full-support B arm is a prespecified comparator.
+Development has no threshold grid or performance-based stop. Current outputs use
+paired experiment v6, assignment bundle v6, assignment result v9 and
+evaluation/definition v6. The B arm is the prespecified comparison without
+segment caps; it retains the same read-derived lower bounds as A and C.
 
 Reference-center assessment is separate from source-member overlap used for
 calibration labels. Continuous Euclidean and maximum regional errors are retained.
 Binary reference recovery is unassessed by default. The qualification-only
 `qualify --reference-match-atol VALUE` declares an unnormalized full-vector L2
 error bound for new evaluations; recall uses one-to-one matching, so one candidate
-cannot recover several true groups. Cached historical L∞ results keep their
-original definition. See [evaluation definitions](simulation_evaluation.md) for
+cannot recover several true groups. Explicit alternative distance choices remain
+bound to the evaluation definition. See [evaluation definitions](simulation_evaluation.md) for
 detailed membership, target-specific availability, and offline re-evaluation. This reporting tolerance never changes fitting, routing or assignment.
 
 All 12 families remain in the reporting population. Scientific performance is

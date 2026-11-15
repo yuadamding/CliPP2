@@ -1,10 +1,87 @@
 # Workflow Protocol 2.4
 
-Stages 1–2 and reference construction are unchanged from
-[Protocol 2.3](workflow_protocol_2_3.md): one fixed all-one clonal reference,
+Stages 1–2 use read-derived multiplicity lower bounds and the Stage 2 segment
+caps described below. Reference construction uses one fixed all-one clonal reference,
 all distinct Stage 2 centers, and every fitted mutation reassessed under its
 original multiplicity support. Native estimates, caps and producer identities
 remain provenance. No confidence or distance threshold vetoes an estimate.
+
+## Missing regional SNVs
+
+By default, regional `snv.txt` inputs are joined over the union of all detected
+SNVs. For an SNV absent in a region, set ALT to 0 and REF to that region's
+median total depth (ALT+REF) among eligible, originally observed positive-depth
+pairs. Canonical rows marked `count_observed=0` use the same rule, even if they
+contain supplied counts. Half-read median ties round up to preserve integer
+counts. Missing and excluded pairs do not contribute to the median; measured
+zero-ALT and zero-depth pairs retain their original counts. A region without
+any eligible observed positive-depth pair fails validation rather than borrowing
+depth from another region.
+
+This is automatic under the default `missing_counts="zero_alt"`. All stages
+use the same frozen imputed counts; Stage 2 subsets never recalculate a median.
+Raw source rows and the imputation ledger remain in the original catalog, and
+the input audit reports regional medians and imputed-pair counts. Saved catalogs
+retain their validated regional-median ledgers.
+The explicit `missing_counts="unobserved"` option keeps missing pairs uninformative.
+
+## Multiplicity support in Stages 1 and 2
+
+For each mutation's segment in each region, use all supplied CN states to form
+
+$$
+\bar C=\sum_s f_s(A_s+B_s),\qquad \sum_s f_s=1.
+$$
+
+The fractions $f_s$ describe **all tumor cells**, including cells that do not
+carry the mutation. They are supplied input; the workflow does not infer them
+from a clustering fit. For a single state, its fraction is 1. Regional
+`cna.txt` accepts repeated rows for an exact chromosome/start/end interval with
+`cn_state_id` and `cn_state_fraction`; the optional canonical
+`segment_cn_states` JSON list preserves those states on conversion. State IDs
+must be unique, fractions must be finite and nonnegative and sum to 1, and
+normal CN and mapping provenance must agree across the interval's states.
+Distinct intervals must not overlap. See the [input example](../examples/README.md).
+
+Regional CNA conversion uses the largest supplied `(major_cn, minor_cn)` pair,
+compared in that order, as representative input CN for the existing single-state
+likelihood. Canonical TSV inputs retain their explicit `allele_a_cn`/`allele_b_cn`
+pair even when `segment_cn_states` contains larger states. The original input
+major CN $M$ is the multiplicity ceiling. Weighted CN is used only
+for the lower-bound estimate; this extension does not implement a mixed-state
+likelihood or replace the likelihood denominator.
+
+With supplied ALT $a$, total depth $d$, and purity $p$, define
+
+$$
+m_{\mathrm{raw}}=\frac{a/d}{p}\left[p\bar C+2(1-p)\right],\qquad
+L=\max\left(1,\min\left[M,\lfloor m_{\mathrm{raw}}\rfloor\right]\right).
+$$
+
+This estimator assumes normal-cell total CN 2 even when the likelihood uses
+a different supplied normal CN. It rounds down, has no fixed cap of 4, and
+returns $L=1$ for zero ALT, missing observations, or zero depth. It does not
+divide by mutation CCF: under the nominal read model, the raw estimate is
+carrier CCF times carrier-weighted multiplicity. These floors are a discovery
+heuristic and may underestimate subclonal multiplicity.
+
+Stage 1 fits candidates $L,\ldots,M$. At the selected source's native CCF,
+cap contributors use this actual native support and retain the complete exact
+MAP set. The minimum upper endpoint across available contributors remains the
+raw region–segment cap $U$. Stage 2 fits each remainder mutation over
+$L,\ldots,\min(M,\max(L,U))$; without a contributor it uses $L,\ldots,M$.
+If $U<L$, the sole Stage 2 candidate is $L$.
+Thus a segment cap cannot remove every candidate at or above a mutation's
+floor. Original read counts, purities, and likelihood CN denominators remain
+fixed between the stages.
+
+`multiplicity_lower_bounds.tsv` publishes per-pair estimates and source CN.
+`mutation_segments.tsv` retains original endpoints and Stage 1 endpoints.
+`stage2_segment_multiplicity_bounds.tsv` retains raw cap endpoints, lower-bound
+policy, conflict policy, and override counts across eligible mapped pairs.
+Accepted fits bind the actual endpoints; current fits can be reused only
+when their numerical support matches the newly requested support.
+Stage 3 always restores the original interval $1,\ldots,M$.
 
 ## Assignment methods
 
@@ -57,12 +134,9 @@ original support, while recording its source hash and both methods.
 ```sh
 clipp2 workflow --plan examples/workflow_protocol24.plan.json --output-dir results/workflow24
 clipp2 assign --bundle results/workflow24/assignment_bundle.json --assignment-method profile --output-dir results/profile
-# Explicitly migrate a historical request without rewriting it:
-clipp2 assign --bundle historical/assignment_bundle.json --derive-current --assignment-method profile --output-dir results/derived-profile
 ```
 
-Omitting `--assignment-method` uses the frozen method. The CLI offers no entropy
-option; historical entropy experiments retain their frozen runtime and artifacts.
+Omitting `--assignment-method` uses the frozen method.
 Derived requests are published as `assignment_bundle.json` inside the same
 no-clobber output reservation. The summary binds the executed request and tie rule.
 
@@ -84,11 +158,10 @@ label; all-impossible targets have no maximizing set or manufactured winner.
 | Paired experiment / evaluation / evaluation definition | v6 |
 | Simulation study contract | v8 |
 
-Result v7/v8 remain reserved for frozen entropy/profile comparisons. Historical
-payloads retain their bytes, hashes and interpretations. Accepted native fits
-from Protocols 2.2/2.3 remain explicitly reusable; a method change reruns only
-assignment/evaluation when compatible fits are supplied. Resume/aggregation
-must distinguish method and tie-policy identities.
+Only these current contracts are supported. Accepted current native fits can be
+reused when their observations, support, fitting policy and numerical evidence
+match. A Stage 3 method change reruns assignment/evaluation with those compatible
+fits. Resume and aggregation distinguish method and tie-policy identities.
 
 ## Validation and comparison
 

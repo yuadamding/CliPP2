@@ -448,23 +448,6 @@ def check_segment_provenance(directory):
     return measurements
 
 
-def check_qualification_metrics(directory):
-    from qualify_workflow import partition_matching, reference_errors
-    unconstrained = reference_errors([[.2], [.4]], [[.3]])
-    assert unconstrained["reference_recall"] is None and unconstrained["recovered_by_truth"] is None
-    assert unconstrained["recovery_status"] == "unassessed_no_declared_tolerance"
-    assert np.isfinite(unconstrained["nearest_l2"]).all()
-    limited = reference_errors([[.2], [.4]], [[.3]], .11)
-    assert sum(limited["recovered_by_truth"]) == 1 and limited["reference_recall"] == .5
-    _, partition_error = partition_matching([0, 0, 1, 1], [0, 0, 1, 1])
-    distorted = reference_errors([[.2], [.4]], [[.7], [.9]], .05)
-    assert partition_error == 0 and distorted["reference_recall"] == 0
-    absent = reference_errors([[.2], [.4]], [], .05)
-    assert absent["reference_recall"] == 0 and absent["nearest_l2"] == [None, None]
-    return dict(default_binary_recovery_unassessed=True, continuous_error_always_reported=True,
-                one_to_one_recovery=True, perfect_overlap_is_not_center_recovery=True)
-
-
 def run_checks(directory, device="cpu"):
     if device != "cpu":
         raise ValueError("These contract checks qualify CPU only; CUDA needs a separately executed suite")
@@ -474,9 +457,15 @@ def run_checks(directory, device="cpu"):
     from check_native_diagnostics import run_native_diagnostic_checks
     from check_assignment import run_checks as run_assignment_checks
     from check_workflow_edges import run_workflow_edge_checks
-    checks = (run_native_diagnostic_checks, run_assignment_checks, run_input_checks, run_workflow_edge_checks, check_purity_consistency, check_provenance, check_full_support_numerics, check_assignment_decisions,
+    from check_multiplicity_floor import run_multiplicity_floor_checks
+    from check_cn_states import check_cn_states
+    from check_missing_reads import run_missing_read_checks
+    from check_simulation_experiment import run_paired_floor_checks
+    checks = (run_native_diagnostic_checks, run_assignment_checks, run_input_checks, check_cn_states,
+              run_multiplicity_floor_checks, run_missing_read_checks, run_paired_floor_checks,
+              run_workflow_edge_checks, check_purity_consistency, check_provenance, check_full_support_numerics, check_assignment_decisions,
               check_copy_and_publication, check_conditional_information, check_complete_workflow, check_group_outlier_and_fit,
-              check_segment_provenance, check_qualification_metrics)
+              check_segment_provenance)
     records = {}
     for check in checks:
         child = directory / check.__name__

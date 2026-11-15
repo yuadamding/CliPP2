@@ -1,7 +1,7 @@
 {
   "schema": "clipp2.workflow.plan.v6",
   "protocol_version": "2.4",
-  "input_path": "workflow_protocol22.tsv",
+  "input_path": "workflow_protocol24.tsv",
   "workflow_config": {
     "fit": {
       "device": "cpu",

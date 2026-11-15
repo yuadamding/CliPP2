@@ -14,7 +14,6 @@ import zipfile
 import numpy as np
 import pandas as pd
 
-from CliPP2.io.tumor_txt import load_original_catalog
 from CliPP2.simulation.biology import generate_history
 # Import before history-generator mocks: controls binds biology helpers at import time.
 from CliPP2.simulation import controls
@@ -99,9 +98,6 @@ def _design_check(root, settings):
     assert roster_identity(payload) != roster_identity(relocated)
     worker_payload = dict(payload, jobs=list(jobs(other_workers, "main")))
     assert roster_identity(worker_payload) == roster_identity(payload)
-    legacy = {key: payload[key] for key in ("schema", "families", "jobs")}
-    from CliPP2.io.data import content_hash
-    assert roster_identity(legacy) == content_hash(legacy)
     allocation = roster_counts(contract)
     assert allocation["planned_main_datasets"] + allocation["planned_development_datasets"] == 2640
     assert allocation["planned_core_max_fits"] == 7920 and allocation["planned_core_max_assignment_passes"] == 5280
@@ -317,117 +313,6 @@ def _optional_execution_report_check(root):
                 fit_count=0, assignment_pass_count=0)
 
 
-def _record_schema_report_check(root):
-    """Cached and missing records obey the frozen definition; reevaluation is explicit."""
-    from contextlib import ExitStack
-    from CliPP2.io.data import content_hash
-    from CliPP2.simulation.evaluation import legacy_evaluation_definition
-    cases = (("historical_v1_mixed", "1.1.0", "v1", False, 1, True, False),
-             ("historical_v1_all_missing", "1.1.0", "v1", False, 0, True, False),
-             ("historical_v1_no_roster", "1.1.0", "v1", False, 0, False, False),
-             ("historical_v2", "1.2.2", "v2", False, 1, True, False),
-             ("explicit_v3", "1.1.0", "v3", True, 1, True, False),
-             ("explicit_v4", "2.0.0", "v4", True, 1, True, False),
-             ("explicit_reevaluation_empty", "1.1.0", "v1", False, 0, False, True),
-             ("incompatible_v1", "1.1.0", "v1", False, 2, True, False),
-             ("incompatible_v3_tolerance", "1.2.3", "v3", True, 2, True, False),
-             ("incompatible_v3_distance", "1.2.3", "v3", True, 2, True, False),
-             ("incompatible_v3_schema", "1.2.3", "v3", True, 2, True, False))
-    for name, version, suffix, explicit, cached_count, has_roster, derive in cases:
-        directory = root / name
-        contract = make_contract(mutations=12, segments=2, regions=4, workers=1,
-                                 reference_match_atol=.05)
-        contract.pop("replicate_roster")
-        assert contract["evaluation"]["record_schema"] == "clipp2.simulation.evaluation.v6"
-        contract.update(implementation_version=version, protocol_version="2.3" if suffix == "v4" else "2.2",
-                        schema="clipp2.simulation-contract.v6" if suffix == "v4" else "clipp2.simulation-contract.v5", families=["S01"])
-        contract["evaluation"]["record_schema"] = "clipp2.simulation.evaluation." + suffix
-        if not explicit:
-            contract["evaluation"].pop("record_schema")
-        jobs = [dict(cell_id=f"schema-h{i}-A1", history_id=f"schema-h{i}", family="S01",
-                     phase="main", acquisition=dict(id="A1", purity=.8, depth=100)) for i in range(2)]
-        save_json(directory / "study_contract.json", contract)
-        save_json(directory / "allocation.json", dict(planned_main_datasets=2))
-        if has_roster:
-            payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"], jobs=jobs)
-            save_json(directory / "main_roster.json", dict(payload, roster_id=content_hash(payload)))
-        config = dict(reference_match_atol=.025 if derive else .05, reference_distance="l2")
-        definition = legacy_evaluation_definition("v3" if derive else suffix, config)
-        cached_config, cached_suffix = dict(config), suffix
-        if name == "incompatible_v3_tolerance":
-            cached_config["reference_match_atol"] = .06
-        elif name == "incompatible_v3_distance":
-            cached_config["reference_distance"] = "linf"
-        elif name == "incompatible_v3_schema":
-            cached_suffix = "v2"
-        cached_definition = legacy_evaluation_definition(cached_suffix, cached_config)
-        saved = []
-        for index, job in enumerate(jobs if has_roster else []):
-            relative = Path("cells") / job["cell_id"] / "attempt-001/evaluation-1.json"
-            if index < cached_count:
-                success = dict(schema="clipp2.simulation.evaluation."+cached_suffix, **job, acquisition_id="A1",
-                    truth_qualification="verified_history_binding", status="complete", original_evaluable_count=10,
-                    metrics=[dict(name="binary_correct_per_original_evaluable", arm="C3", view="", stratum="all",
-                        value=1., numerator=10, denominator=10, status="available", truth_required=True)])
-                if cached_suffix == "v1":
-                    # Real v1 records kept tolerance at top level, without a definition object.
-                    success["reference_match_atol"] = .06 if index else .05
-                else:
-                    success.update(evaluation_definition=cached_definition,
-                                   evaluation_definition_id=content_hash(cached_definition))
-                save_json(directory / relative, success)
-                saved.append((relative, success))
-            save_json(directory / "cells" / job["cell_id"] / "completion.json", dict(job=job,
-                status="complete", attempt=str(relative.parent), evaluations=[str(relative)], cost_ledgers=[],
-                elapsed_seconds=0., peak_resident_bytes=0, output_bytes=0))
-        captured = []
-        with ExitStack() as stack:
-            for target in ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
-                           "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.study._history",
-                           "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.assess_development",
-                           "CliPP2.simulation.reporting.reevaluate_cell"):
-                stack.enter_context(patch(target, side_effect=AssertionError("Report attempted inference or nonempty reevaluation")))
-            stack.enter_context(patch("CliPP2.simulation.figures.make_figures",
-                side_effect=lambda records, *args: captured.extend(records) or []))
-            if name.startswith("incompatible_"):
-                try:
-                    report(directory)
-                except ValueError as error:
-                    assert "Incompatible evaluation definitions" in str(error)
-                    assert "--evaluation-config" in str(error)
-                else:
-                    raise AssertionError("Cached records overrode the frozen evaluation definition")
-                assert not list((directory / "reports").glob("report-*"))
-                assert all(read_json(directory / relative) == original for relative, original in saved)
-                continue
-            result = report(directory, evaluation_config=config if derive else None)
-        expected_suffix = "v3" if derive else suffix
-        assert len(captured) == (2 if has_roster else 0)
-        assert all(record["schema"] == "clipp2.simulation.evaluation."+expected_suffix for record in captured)
-        for record in captured[cached_count:]:
-            assert record["evaluation_definition"] == definition
-            assert record["evaluation_definition_id"] == content_hash(definition)
-            assert record["reference_match_atol"] == .05
-            assert record["reference_distance"] == record["evaluation_config"]["reference_distance"] == definition["reference_distance"]
-            assert all(row["value"] is None for row in record["metrics"]
-                       if row["name"] == "binary_correct_per_original_evaluable")
-        summary = result["summary"]
-        assert summary["evaluation_definition"] == definition
-        assert summary["evaluation_definition_id"] == content_hash(definition)
-        assert summary["report_mode"] == ("offline_reevaluation" if derive else "cached_metrics")
-        assert summary["roster_complete"] == has_roster
-        assert summary["roster_status"] == ("frozen_roster" if has_roster else "unavailable_complete_frozen_roster")
-        assert all(row["planned_population_estimate"] is None for row in summary["metrics"]
-                   if row["name"] == "binary_correct_per_original_evaluable")
-        assert summary["retained_planned_cells"] == (2 if has_roster else 0)
-        assert summary["planned_main_cells"] == 2
-        assert all(read_json(directory / relative) == original for relative, original in saved)
-        assert Path(result["report"]).is_file()
-    return dict(status="passed", cases=len(cases), frozen_legacy_tolerance_and_geometry_preserved=True,
-        empty_reports_preserve_definition=True, explicit_reevaluation_uses_current_definition=True,
-        incompatible_definitions_rejected=True, fully_cached_definition_conflicts_rejected=True,
-        explicit_schema_independent_of_package_version=True,
-        historical_version_fallback_preserved=True, fit_count=0, assignment_pass_count=0)
 
 
 def _report_integrity_check(root):
@@ -453,7 +338,8 @@ def _report_integrity_check(root):
     def prepare(directory, values):
         save_json(directory / "study_contract.json", contract)
         save_json(directory / "allocation.json", dict(planned_main_datasets=len(values), resource_reduction_applied=False))
-        payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"], jobs=jobs[:len(values)])
+        payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"],
+            identity_policy="semantic_jobs_without_cohort_path", jobs=jobs[:len(values)])
         save_json(directory / "main_roster.json", dict(payload, roster_id=content_hash(payload)))
         paths = []
         for job, value in zip(jobs, values):
@@ -540,7 +426,8 @@ def _partial_evidence_report_checks(root):
         roster = [job(index) for index in range(len(evaluations))]
         save_json(directory / "study_contract.json", contract)
         save_json(directory / "allocation.json", dict(planned_main_datasets=len(roster), main_histories_per_family=len(roster)))
-        payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"], jobs=roster)
+        payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"],
+            identity_policy="semantic_jobs_without_cohort_path", jobs=roster)
         save_json(directory / "main_roster.json", dict(payload, roster_id=content_hash(payload)))
         for record, evaluation in zip(roster, evaluations):
             attempt = Path("cells") / record["cell_id"] / "attempt-001"
@@ -608,14 +495,14 @@ def _partial_evidence_report_checks(root):
         arm.pop("decision_population", None)
     assert figures._values([unsupported], "binary_map_correct_per_original_evaluable", "C3") == []
     result, output, matrices = publish_case(root / "truth_qualified", [successful(0),
-        successful(1, truth="legacy_consistent_unbound", transitions=37)])
+        successful(1, truth="missing_truth_evidence", transitions=37)])
     transitions = pd.read_csv(output / "detailed_transitions.tsv", sep="\t")
     assert transitions.set_index("truth_qualification")["count"].to_dict() == {
-        "verified_history_binding": 3, "legacy_consistent_unbound": 37}
+        "verified_history_binding": 3, "missing_truth_evidence": 37}
     metrics = pd.read_csv(output / "tumor_metrics.tsv", sep="\t")
-    assert set(metrics.truth_qualification) == {"verified_history_binding", "legacy_consistent_unbound"}
+    assert set(metrics.truth_qualification) == {"verified_history_binding", "missing_truth_evidence"}
     assert metrics.groupby("truth_qualification").size().to_dict() == {
-        "verified_history_binding": 7, "legacy_consistent_unbound": 7}
+        "verified_history_binding": 7, "missing_truth_evidence": 7}
     assert len(matrices) == 1 and matrices[0].sum() == matrices[0][0, 1] == 3
     html = (output / "comparison_report.html").read_text()
     section = html.split("<h2>Detailed membership transitions by target origin</h2>")[1].split("<h2>")[0]
@@ -624,7 +511,7 @@ def _partial_evidence_report_checks(root):
     return dict(status="passed", known_zero_preserves_planned_weight=True,
         upstream_failure_preserves_per_arm_execution_counts=True, source_inputs_unchanged=True,
         optional_covariates_do_not_block_publication=True, primary_html_and_heatmap_verified_only=True,
-        raw_exports_preserve_qualified_legacy_rows=True, fit_count=0, assignment_pass_count=0)
+        raw_exports_preserve_truth_qualification=True, fit_count=0, assignment_pass_count=0)
 
 
 def _offline_report_check(root, history, job):
@@ -634,13 +521,8 @@ def _offline_report_check(root, history, job):
     from CliPP2.simulation.study import _latest_completion
     _prepare_fixture(root, history, job)
     save_json(root / "job_manifests/batch-001.json", [job])
-    frozen = dict(selected=dict(contributor=.99, posterior=.90), frozen_before_main_generation=True)
-    save_json(root / "threshold_development.json", frozen)
-    # Remove access to the cohort source without relabeling the retained current
-    # producer as a historical method. Genuine old fixtures are checked separately.
+    # Offline reports use retained evidence without reopening the cohort source.
     contract = read_json(root / "study_contract.json")
-    contract.pop("replicate_roster", None)
-    contract["cohort"].pop("content_id", None)
     contract["cohort"]["path"] = str(root / "not_present_original_cohort.json")
     (root / "study_contract.json").write_text(json.dumps(contract))
     before = {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}
@@ -661,7 +543,8 @@ def _offline_report_check(root, history, job):
     assert derived["evaluation_definition"]["reference_distance"] == "l2"
     assert derived["derivation"]["fit_count"] == derived["derivation"]["assignment_pass_count"] == 0
     manifest = read_json(destination / "derivation_manifest.json")
-    assert manifest["frozen_threshold_development"] == frozen and not manifest["historical_cohort_identity_backfilled"]
+    assert manifest["source_cohort_content_id"] == contract["cohort"]["content_id"]
+    assert manifest["fit_count"] == manifest["assignment_pass_count"] == 0
     assert before == {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}
     cell = _latest_completion(root / "cells" / job["cell_id"])
     fixture = root.parent / "offline_invalid_evidence"
@@ -697,247 +580,8 @@ def _offline_report_check(root, history, job):
     assert invalid["status"] == "unavailable_derived_evidence" and "truth belongs" in invalid["error"]["message"]
 
 
-def _historical_catalog_report_check(root):
-    """Reevaluate real f2d1fa1 artifacts without changing their representation."""
-    from contextlib import ExitStack
-    import csv
-    import warnings
-    from CliPP2.io.data import content_hash
-    from CliPP2.simulation.reporting import (_catalog_evidence, _catalog_payload_hash,
-        UnsupportedArtifactFormat, reevaluate_cell)
-    fixture_dir = Path(__file__).parent / "fixtures"
-    source = root / "source"
-    with zipfile.ZipFile(fixture_dir / "f2d1fa1_single_state_evidence.zip") as archive:
-        archive.extractall(source)
-    origin = read_json(source / "fixture_origin.json")
-    assert origin["producer_revision"] == "f2d1fa1b09dee8b363078f8cc7ab22a6a5263522"
-    assert origin["native_optimizer_calls"] == origin["assignment_passes"] == 0
-    cell = read_json(source / "cells/main-S01-H001-A4/completion.json")
-    config = dict(reference_match_atol=.05, reference_distance="l2")
-    before = {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
-
-    def unpack(name, *, retain_zip=False):
-        directory = root / name
-        shutil.copytree(source, directory)
-        attempt = directory / cell["attempt"]
-        with zipfile.ZipFile(attempt / "configuration-1.zip") as archive:
-            archive.extractall(attempt / "configuration-1")
-        if not retain_zip:
-            (attempt / "configuration-1.zip").unlink()
-        return directory, attempt
-
-    def write(path, value):
-        path.write_text(json.dumps(value, allow_nan=False))
-
-    def rebind(attempt, payload):
-        configuration = attempt / "configuration-1"
-        payload["content_hash"] = _catalog_payload_hash({k: v for k, v in payload.items() if k != "content_hash"})
-        paired = read_json(configuration / "paired_result.json")
-        manifest = paired["run_manifest"]
-        manifest["input_identity"]["original_catalog_identity"] = content_hash(payload)
-        manifest["manifest_identity"] = content_hash({k: manifest[k] for k in ("run_manifest_id", "build", "input_identity")})
-        write(configuration / "original_catalog.json", payload)
-        write(configuration / "paired_result.json", paired)
-        write(configuration / "run_manifest.json", manifest)
-
-    with ExitStack() as stack:
-        for target in ("CliPP2.fit_execution.fit_prepared", "CliPP2.assignment.assign_mutations",
-                       "CliPP2.kernel.model.RegionalModel", "CliPP2.simulation.study._history",
-                       "CliPP2.simulation.study._acquire", "CliPP2.simulation.study.assess_development"):
-            stack.enter_context(patch(target, side_effect=AssertionError("Historical report attempted inference")))
-        stack.enter_context(patch("CliPP2.simulation.figures.make_figures", return_value=[]))
-        cached = report(source, report_dir=root / "cached_report")
-        assert cached["summary"]["report_mode"] == "cached_metrics"
-        assert all(row["truth_qualification"] == "verified_history_binding" for row in cached["summary"]["availability"])
-        output = report(source, evaluation_config=config, report_dir=root / "derived_report")
-        derived = read_json(Path(output["report"]).parent / "evaluations/evaluation-00001.json")
-        assert derived["status"] == "derived_from_preserved_evidence"
-        assert derived["truth_qualification"] == "verified_history_binding"
-        assert derived["catalog_compatibility"]["source_catalog_schema"] == "clipp2.original-catalog.v3"
-        assert derived["catalog_compatibility"]["working_catalog_schema"] == "clipp2.original-catalog.v4"
-        assert derived["derivation"]["fit_count"] == derived["derivation"]["assignment_pass_count"] == 0
-        directory, attempt = unpack("directory")
-        assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "verified_history_binding"
-        directory, attempt = unpack("archive_overlap", retain_zip=True)
-        assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "verified_history_binding"
-        for name in ("original_catalog.json", "paired_result.json", "run_manifest.json"):
-            for conflicting in (False, True):
-                directory, attempt = unpack(f"duplicate_{name}_{conflicting}", retain_zip=True)
-                archive_path = attempt / "configuration-1.zip"
-                with zipfile.ZipFile(archive_path) as archive:
-                    members = [(info.filename, archive.read(info)) for info in archive.infolist()]
-                original = next(data for filename, data in members if filename == name)
-                duplicate = json.loads(original)
-                if conflicting:
-                    duplicate["schema"] = "conflicting_duplicate"
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", UserWarning)
-                    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
-                        archive.writestr(name, json.dumps(duplicate))
-                        for filename, data in members:
-                            archive.writestr(filename, data)
-                prior = {str(p.relative_to(directory)): p.read_bytes() for p in directory.rglob("*") if p.is_file()}
-                rejected = reevaluate_cell(directory, cell, config)
-                assert rejected["truth_qualification"] == "conflicting_truth"
-                assert "Duplicate archived " + name in rejected["error"]["message"]
-                assert prior == {str(p.relative_to(directory)): p.read_bytes() for p in directory.rglob("*") if p.is_file()}
-        for field in ("run_manifest", "input_identity"):
-            for value in ("absent", None, [], "invalid", {}):
-                directory, attempt = unpack(f"binding_{field}_{value!r}")
-                path = attempt / "configuration-1/paired_result.json"
-                paired = read_json(path)
-                owner = paired if field == "run_manifest" else paired["run_manifest"]
-                if value == "absent":
-                    owner.pop(field)
-                else:
-                    owner[field] = value
-                write(path, paired)
-                rejected = reevaluate_cell(directory, cell, config)
-                expected = "missing_truth_evidence" if value == "absent" else "conflicting_truth"
-                assert rejected["truth_qualification"] == expected, rejected
-        directory, attempt = unpack("altered_manifest_identity")
-        path = attempt / "configuration-1/paired_result.json"
-        paired = read_json(path)
-        paired["run_manifest"]["manifest_identity"] = "altered"
-        write(path, paired)
-        assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "conflicting_truth"
-        directory, attempt = unpack("archive_overlap_altered", retain_zip=True)
-        payload_path = attempt / "configuration-1/original_catalog.json"
-        payload = read_json(payload_path)
-        payload["alt_counts"][0][0] += 1
-        write(payload_path, payload)
-        assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "conflicting_truth"
-        for field in ("alt_count", "allele_a_cn", "count_observed", "normal_cn_supplied"):
-            directory, attempt = unpack("input_" + field)
-            path = attempt / "input_catalog.tsv"
-            lines = path.read_text().splitlines()
-            header = next(i for i, line in enumerate(lines) if not line.startswith("#"))
-            rows = list(csv.reader(lines[header:], delimiter="\t"))
-            position = rows[0].index(field)
-            old = float(rows[1][position])
-            rows[1][position] = str(int(not old) if field in ("count_observed", "normal_cn_supplied") else int(old)+1)
-            path.write_text("\n".join(lines[:header] + ["\t".join(row) for row in rows])+"\n")
-            assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "conflicting_truth"
-        directory, attempt = unpack("catalog_tampering")
-        payload_path = attempt / "configuration-1/original_catalog.json"
-        payload = read_json(payload_path)
-        payload["major_cn"][0][0] += 1
-        write(payload_path, payload)
-        assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "conflicting_truth"
-        directory, attempt = unpack("unsupported")
-        payload = read_json(attempt / "configuration-1/original_catalog.json")
-        payload["schema"] = "clipp2.original-catalog.v999"
-        rebind(attempt, payload)
-        unsupported = reevaluate_cell(directory, cell, config)
-        assert unsupported["status"] == "unavailable_derived_evidence"
-        assert unsupported["truth_qualification"] == "unsupported_artifact_format"
-        assert unsupported["error"]["type"] == "UnsupportedArtifactFormat"
-        assert "pinned environment" in unsupported["error"]["message"]
-        assert unsupported["artifact_compatibility"]["required_pinned_revision"]
-        # An exact current identity can be proved even without a redundant catalog copy.
-        directory, attempt = unpack("current_no_catalog")
-        frozen_config = read_json(attempt / "configuration-1/paired_result.json")["config"]
-        current = load_original_catalog(attempt / "input_catalog.tsv", max_major_cn=frozen_config["fit"]["max_major_cn"])
-        rebind(attempt, current.to_dict())
-        (attempt / "configuration-1/original_catalog.json").unlink()
-        assert reevaluate_cell(directory, cell, config)["truth_qualification"] == "verified_history_binding"
-        probes = root / "format_probes"
-        with zipfile.ZipFile(fixture_dir / "f2d1fa1_catalog_format_probes.zip") as archive:
-            archive.extractall(probes)
-        for name in ("unicode", "collapsed_states", "near_one_fraction"):
-            attempt = probes / name
-            paired = read_json(attempt / "configuration-1/paired_result.json")
-            if name == "unicode":
-                _, compatibility = _catalog_evidence(attempt, paired)
-                assert compatibility["conversion"] == "verified_single_state_v3_to_v4"
-            else:
-                try:
-                    _catalog_evidence(attempt, paired)
-                except UnsupportedArtifactFormat as error:
-                    assert error.revision == "f2d1fa1"
-                else:
-                    raise AssertionError("Unsupported historical source representation was reinterpreted")
-    assert before == {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
-    return dict(status="passed", producer_revision=origin["producer_revision"], cached_and_explicit_reports=True,
-        directory_and_archive_supported=True, unicode_identity_preserved=True, altered_input_and_catalog_rejected=True,
-        duplicate_required_members_rejected=True, absent_and_malformed_bindings_distinguished=True,
-        unsupported_formats_distinct_from_truth_conflicts=True, source_files_unchanged=True,
-        fit_count=0, assignment_pass_count=0)
 
 
-def _historical_successful_report_check(root):
-    """A real successful old-native run retains science through both report routes."""
-    from contextlib import ExitStack
-    source = root / "source"
-    with zipfile.ZipFile(Path(__file__).parent / "fixtures/f2d1fa1_successful_evidence.zip") as archive:
-        archive.extractall(source)
-    origin = read_json(source / "fixture_origin.json")
-    assert origin["producer_revision"] == "f2d1fa1b09dee8b363078f8cc7ab22a6a5263522"
-    assert origin["package_source_files_byte_equal_to_revision_archive"] == 84
-    assert (origin["native_fit_count"], origin["assignment_passes"]) == (3, 2)
-    cell = read_json(source / "cells/main-S01-H001-A2/completion.json")
-    cached = read_json(source / cell["evaluations"][0])
-    paired = _paired_result(source / cell["attempt"], 1)
-    assert cell["status"] == paired["status"] == "complete"
-    assert cell["execution_configs"] == [origin["workflow_config"]]
-    assert cached["evaluation_definition"] == origin["expected_evaluation_definition"]
-    for fit in (paired["stage_one"], *(arm["stage_two"] for arm in paired["arms"].values())):
-        assert fit["acceptance_evidence"]["independently_verified"]
-        assert fit["acceptance_evidence"]["membership_audit"]["complete"]
-        assert fit["producer_receipt"]["execution"]["native"]["calls"] > 0
-    for arm in paired["arms"].values():
-        assert {key: arm["counts"][key] for key in origin["expected_population_per_arm"]} == origin["expected_population_per_arm"]
-        assert all(row["reassessment_status"] == "unchanged_non_target"
-                   for row in arm["original_rows"] if row["mutation_id"] in arm["non_targets"])
-        assert all(row["accepted_label"] == 0 and row["status"] == "assigned_relative"
-                   for row in arm["assignment"]["assignments"])
-        assert all(.95 < row["posterior"] < 1. for row in arm["assignment"]["assignments"])
-    before = {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
-    with ExitStack() as stack:
-        for target in ("CliPP2.fit_execution.fit_prepared", "CliPP2.workflow._fit_accepted",
-                       "CliPP2.simulation.experiment._fit_accepted", "CliPP2.assignment.assign_mutations",
-                       "CliPP2.simulation.experiment.assign_mutations", "CliPP2.kernel.model.RegionalModel",
-                       "CliPP2.simulation.study._history", "CliPP2.simulation.study._acquire",
-                       "CliPP2.simulation.study.assess_development", "CliPP2.simulation.cohort.load_cohort"):
-            stack.enter_context(patch(target, side_effect=AssertionError("Historical success report attempted inference")))
-        stack.enter_context(patch("CliPP2.simulation.figures.make_figures", return_value=[]))
-        original_report = report(source, report_dir=root / "cached_report")
-        current_report = report(source, evaluation_config=origin["evaluation_config"], report_dir=root / "derived_report")
-    assert original_report["summary"]["report_mode"] == "cached_metrics"
-    assert current_report["summary"]["report_mode"] == "offline_reevaluation"
-    derived = read_json(root / "derived_report/evaluations/evaluation-00001.json")
-    assert derived["status"] == "derived_from_preserved_evidence"
-    assert derived["truth_qualification"] == cached["truth_qualification"] == "verified_history_binding"
-    assert derived["evaluation_definition"] == cached["evaluation_definition"]
-    assert derived["evaluation_definition_id"] == cached["evaluation_definition_id"]
-    assert derived["catalog_compatibility"]["conversion"] == "verified_single_state_v3_to_v4"
-    assert derived["derivation"]["fit_count"] == derived["derivation"]["assignment_pass_count"] == 0
-    # The definition is identical: all historical metrics and denominators apply.
-    assert len(derived["metrics"]) == len(cached["metrics"]) == 853
-    for expected, actual in zip(cached["metrics"], derived["metrics"]):
-        assert expected.keys() == actual.keys()
-        for key, value in expected.items():
-            if isinstance(value, float):
-                np.testing.assert_allclose(actual[key], value, rtol=1e-12, atol=1e-15)
-            else:
-                assert actual[key] == value
-    for expected in origin["expected_metrics"]:
-        assert expected in cached["metrics"]
-        if expected["name"] in ("binary_brier", "binary_log_loss"):
-            assert expected["value"] > 0
-    assert derived["detailed_membership"] == cached["detailed_membership"]
-    assert derived["detailed_membership_transitions"] == cached["detailed_membership_transitions"]
-    for output in (original_report, current_report):
-        for arm in ("B3", "C3"):
-            metric = next(row for row in output["summary"]["metrics"]
-                if row["name"] == "binary_correct_per_original_evaluable" and row["arm"] == arm)
-            assert metric["planned_population_estimate"] == 1. and metric["available_cells"] == 1
-    assert before == {str(p.relative_to(source)): p.read_bytes() for p in source.rglob("*") if p.is_file()}
-    return dict(status="passed", producer_revision=origin["producer_revision"],
-        producer_native_fits=3, producer_assignment_passes=2, compared_metrics=853,
-        unchanged_members_per_arm=7, accepted_targets_per_arm=5, nonzero_calibration=True,
-        same_declared_definition=True, cached_and_explicit_reports=True, source_files_unchanged=True,
-        fit_count=0, assignment_pass_count=0)
 
 
 def _structured_failure_checks(root):
@@ -1088,9 +732,6 @@ def run_checks(directory, cohort_settings):
     _offline_report_check(root / "native_failure", history, job)
     _planned_report_check(root / "unexecuted_report", contract)
     report_integrity = _report_integrity_check(root / "report_integrity")
-    historical_catalog = _historical_catalog_report_check(root / "historical_catalog")
-    historical_success = _historical_successful_report_check(root / "historical_success")
-    record_schema = _record_schema_report_check(root / "record_schema_reports")
     optional_execution = _optional_execution_report_check(root / "optional_execution_reports")
     partial_reports = _partial_evidence_report_checks(root / "partial_evidence_reports")
     assert controls.generate_history is generate_history, "History mock leaked into real controls"
@@ -1101,21 +742,21 @@ def run_checks(directory, cohort_settings):
         assignment_pass_count=mechanisms["assignment_pass_count"])
     result = dict(status="passed", directory=str(root), native_fit_count=6, assignment_pass_count=4+mechanisms["assignment_pass_count"],
         mechanism_checks=mechanism_checks,
-        lifecycle=lifecycle, resume=resume, partial_evidence_reports=partial_reports, record_schema=record_schema,
-        report_integrity=report_integrity, historical_catalog=historical_catalog, historical_success=historical_success,
+        lifecycle=lifecycle, resume=resume, partial_evidence_reports=partial_reports,
+        report_integrity=report_integrity,
         optional_execution_reports=optional_execution,
         checks=["exact_60_variant_720_history_2640_cell_design", "full_10_20_unrestricted_all_target_contract",
-                "source_protocol21_execution23_and_cross_protocol_resume_rejection",
+                "source_protocol21_execution24_and_cross_protocol_resume_rejection",
                 "authoritative_observed_MAP_ignores_reporting_diagnostics",
                 "poor_finite_development_does_not_block_main", "development_failures_remain_accounted", "post_evaluator_failure_retains_native_costs",
                 "default_resume_terminal_failure_immutable", "changed_execution_config_rejected",
                 "changed_reference_evaluation_tolerance_rejected",
                 "explicit_retry_appends_attempt_and_preserves_prior_costs", "exactly_one_declared_configuration",
                 "successful_retry_archives_complete_numerical_receipts", "archive_roundtrip_preserves_paired_state_and_costs",
-                "full_truth_evaluator_accepts_protocol23_MAP_and_final_membership",
+                "full_truth_evaluator_accepts_protocol24_MAP_and_final_membership",
                 "runtime_counts_archived_failed_and_interrupted_work_once", "runtime_status_does_not_modify_outputs",
                 "frozen_configuration_reaches_real_runner", "unexecuted_main_cells_remain_in_planned_denominator",
-                "offline_archived_legacy_evaluation_preserves_sources_and_frozen_thresholds",
+                "offline_archived_evaluation_preserves_sources_and_contract",
                 "offline_missing_or_ambiguous_evidence_unavailable_without_regeneration"])
     save_json(root / "study_checks.json", result)
     return result

@@ -14,7 +14,6 @@ DEFAULT_AUDIT_SCOPE: Final = "selected"
 DEFAULT_MISSING_COUNTS: Final = "zero_alt"
 PROTOCOL_VERSION: Final = "2.4"
 STAGE_THREE_REFERENCE_POLICY: Final = "single_fixed_clonal_stage_one_source_v1"
-COMPATIBLE_NATIVE_FIT_PROTOCOLS: Final = ("2.2", "2.3", "2.4")
 ASSIGNMENT_METHODS: Final = ("marginal", "profile")
 SELECTION_CRITERION: Final = "marginal_mixture_bic_at_fitted_centers_v1"
 

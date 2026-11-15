@@ -13,7 +13,7 @@ import numpy as np
 from CliPP2.io.assignment import load_accepted_fit, save_accepted_fit
 from CliPP2.io.data import MultiplicityBounds, OriginalCatalog, validate_workflow_mapping
 from CliPP2.io.region_files import read_region_directory
-from CliPP2.io.tumor_txt import SCHEMA_COLUMNS, audit_input, load_original_catalog, load_tumor_txt, write_tumor_txt
+from CliPP2.io.tumor_txt import audit_input, load_original_catalog, load_tumor_txt, write_tumor_txt
 from CliPP2.kernel.backend import NativeBackend
 from CliPP2.kernel.observations import prepare_prediction
 from CliPP2.workflow import _fit_accepted, classify_groups
@@ -214,24 +214,19 @@ def check_unrestricted_cn(directory):
     assert expanded.max_major_cn is None and expanded.to_dict()["eligibility_policy"] == "unrestricted_valid_cn"
     assert load_tumor_txt(path).major_cn[0, 1] == 12
     expect_value_error(lambda: expanded.compatible_source_identities(10))
-    # V4 remains a real identity-preserving reader, never an implicit upgrade.
-    old = replace(restricted, _schema_version=4)
-    payload = old.to_dict()
-    for value in (OriginalCatalog.from_dict(payload), copy.deepcopy(old), pickle.loads(pickle.dumps(old))):
-        assert value.to_dict() == payload and value.content_hash == old.content_hash
+    payload = restricted.to_dict()
+    for value in (OriginalCatalog.from_dict(payload), copy.deepcopy(restricted), pickle.loads(pickle.dumps(restricted))):
+        assert value.to_dict() == payload and value.content_hash == restricted.content_hash
+    for version in (3, 4, 5):
+        expect_value_error(lambda version=version: OriginalCatalog.from_dict(
+            dict(payload, schema=f"clipp2.original-catalog.v{version}")))
     assert content_hash(payload) in restricted.compatible_source_identities(10)
     subset = expanded.subset(expanded.mutation_ids[1:])
-    old_subset = replace(subset, max_major_cn=10, _schema_version=4)
-    assert content_hash(old_subset.to_dict()) in subset.compatible_source_identities(10)
-    tampered = old_subset.to_dict()
+    equivalent = replace(subset, max_major_cn=10)
+    assert content_hash(equivalent.to_dict()) in subset.compatible_source_identities(10)
+    tampered = equivalent.to_dict()
     tampered["total_counts"][0][0] += 1
     expect_value_error(lambda: OriginalCatalog.from_dict(tampered))
-    # Historical source placeholders remain evidence, but new directory joins
-    # cannot invent diploid values even for unobserved mutation-region cells.
-    source_rows = tuple(tuple(dict(row, mapping_genuine="0").items()) for row in old.source_rows)
-    legacy_mapping = replace(old, mapping_genuine=np.zeros(old.major_cn.shape, bool), source_rows=source_rows,
-        provenance=tuple(tuple((k, v) for k, v in row if k not in SCHEMA_COLUMNS) for row in source_rows))
-    assert OriginalCatalog.from_dict(legacy_mapping.to_dict()).to_dict() == legacy_mapping.to_dict()
 
     rows = [dict(mutation_id=f"m{i}", sample_id="r", alt_count=7, ref_count=33,
         count_observed=1, purity=.7, normal_cn=i, segment_id=f"s{i}", cn_state_id="0",
@@ -319,7 +314,7 @@ def check_unrestricted_cn(directory):
     assert audit["status"] == "input_missing" and len(audit["issues"]) == 2
     assert {(row["mutation_id"], row["sample_id"]) for row in audit["issues"]} == {("1:200", "r1"), ("1:100", "r2")}
     expect_value_error(lambda: load_original_catalog(missing_reads))
-    return dict(default_unrestricted=True, explicit_cutoff_preserved=True, historical_catalog_identity_preserved=True,
+    return dict(default_unrestricted=True, explicit_cutoff_preserved=True, current_catalog_identity_preserved=True,
         changed_population_rejected=True, higher_cn_oracles=[11, 64, 257], native_resource_overflow_explicit=True,
         input_audit_missing_profiles_and_mapping=True)
 

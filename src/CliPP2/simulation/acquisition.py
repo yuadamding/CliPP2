@@ -14,9 +14,8 @@ TRUTH_PROBABILITY_ATOL = 1e-12
 def validate_history_acquisition_link(history, acquisition, catalog, *, history_manifest=None):
     """Check biological truth separately from deliberately perturbed fit inputs.
 
-    Legacy probability consistency cannot distinguish multiplicity/CCF aliases.
-    Only retained, matching history links in the acquisition and inference input
-    qualify exact binding; a supplied history manifest must carry that link too.
+    Matching history links are required in the acquisition and inference input;
+    a supplied history manifest must carry that link too.
     """
     identity = history_content_id(history)
     catalog_metadata = dict(catalog.metadata)
@@ -100,10 +99,7 @@ def validate_history_acquisition_link(history, acquisition, catalog, *, history_
         return result('conflicting_truth', str(error))
     if all(value == identity for value in links.values()):
         return result('verified_history_binding', 'Exact retained history links and biological probability agree')
-    if any(value is not None for value in links.values()):
-        return result('missing_truth_evidence', 'History link is present in only part of the retained evidence')
-    return result('legacy_consistent_unbound',
-                  'Biological probability agrees; multiplicity/CCF aliases prevent proof of exact historical association')
+    return result('missing_truth_evidence', 'Every retained source must identify the physical history')
 
 
 def _regional(value, regions, name):

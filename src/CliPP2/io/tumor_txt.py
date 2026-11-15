@@ -31,7 +31,8 @@ def _filter_policy(max_major_cn, records):
 
 
 # The canonical input schema is documented in README.md.
-# Writers emit these first, followed by any inert provenance columns.
+# Writers emit these first, then the optional segment_cn_states estimator input
+# and any inert provenance columns.
 SCHEMA_COLUMNS = (
     "mutation_id",
     "sample_id",
@@ -201,10 +202,13 @@ def _read_text_table(
     missing_columns = sorted(set(columns).difference(header))
     if missing_columns:
         raise TumorTxtError(f"{path} is missing required columns: {missing_columns}.")
-    # Extra columns are accepted as provenance but never enter normalization,
-    # likelihood construction, or the objective identity.
+    # Extra columns retain provenance. The reserved segment_cn_states field is
+    # validated as an estimator input without changing the likelihood CN pair.
     table = pd.DataFrame(rows, columns=header, dtype=object)
-    return metadata, table.loc[:, columns] if canonical and not preserve_extra else table
+    selected = list(columns)
+    if "segment_cn_states" in table.columns and "segment_cn_states" not in selected:
+        selected.append("segment_cn_states")
+    return metadata, table.loc[:, selected] if canonical and not preserve_extra else table
 
 
 def _identifier(value: object, *, name: str) -> str:
@@ -301,6 +305,9 @@ def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, A
     assert allele_a is not None and allele_b is not None
     if allele_a < 1 or allele_a >= 2**63 or allele_a < allele_b:
         raise TumorTxtError(f"{context} requires representable integer 1 <= allele_a_cn < 2**63 and allele_a_cn >= allele_b_cn.")
+    segment_id = _identifier(row["segment_id"], name=f"{context} segment_id")
+    from .cn_states import parse_segment_cn_states
+    states = parse_segment_cn_states(row.get("segment_cn_states"), sample_id=sample_id, segment_id=segment_id)
     return {
         "mutation_id": mutation_id,
         "sample_id": sample_id,
@@ -312,10 +319,8 @@ def _normalize_row(row: Mapping[str, object], *, row_number: int) -> dict[str, A
         "normal_cn_supplied": _provenance_flag(row, ("normal_cn_supplied", "_normal_cn_supplied"), "Normal-CN"),
         "purity": purity,
         "normal_cn": normal_cn,
-        "segment_id": _identifier(
-            row["segment_id"],
-            name=f"{context} segment_id",
-        ),
+        "segment_id": segment_id,
+        "segment_cn_states": None if states is None else states.records,
         "cn_state_id": _identifier(
             row["cn_state_id"],
             name=f"{context} cn_state_id",
@@ -335,9 +340,9 @@ def _validate_long_table(metadata, table):
         if unit in rows:
             raise TumorTxtError(f"One canonical observation is required per mutation/sample pair: {unit!r}.")
         segment = row["sample_id"], row["segment_id"]
-        pair = row["allele_a_cn"], row["allele_b_cn"]
-        if segments.setdefault(segment, pair) != pair:
-            raise TumorTxtError(f"CN pair is inconsistent within region/segment {segment!r}.")
+        specification = row["allele_a_cn"], row["allele_b_cn"], row["segment_cn_states"]
+        if segments.setdefault(segment, specification) != specification:
+            raise TumorTxtError(f"CN pair or state specification is inconsistent within region/segment {segment!r}.")
         purities.setdefault(row["sample_id"], []).append(row["purity"])
         rows[unit] = row
     canonical = {}
@@ -356,101 +361,27 @@ def _validate_long_table(metadata, table):
     return _ValidatedLongTable(dict(metadata), mutations, regions, rows)
 
 
-def _filter_snv_cn(
-    validated: _ValidatedLongTable,
-    *, max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN,
-) -> tuple[_ValidatedLongTable, CNFilterReport]:
-    """Exclude declared pairs or CN above the limit, retaining other regions."""
-    max_major_cn = validate_max_major_cn(max_major_cn)
-    records: list[CNFilterRecord] = []
-    excluded_pairs: set[tuple[str, str]] = set()
-    for (mutation_id, sample_id), row in sorted(validated.rows_by_unit.items()):
-        segment_id = row["segment_id"]
-        max_major = row["allele_a_cn"]
-        if row["input_excluded"] or (max_major_cn is not None and max_major > max_major_cn):
-            excluded_pairs.add((mutation_id, sample_id))
-            records.append(CNFilterRecord(
-                mutation_id, sample_id, segment_id, INPUT_EXCLUDED if row["input_excluded"] else MAJOR_CN_ABOVE_LIMIT,
-                max_major,
-            ))
-    retained_ids = tuple(
-        mutation_id for mutation_id in validated.mutation_ids
-        if any((mutation_id, sample_id) not in excluded_pairs
-               for sample_id in validated.sample_ids)
-    )
-    excluded_ids = set(validated.mutation_ids).difference(retained_ids)
-    report = CNFilterReport(
-        policy_id=_filter_policy(max_major_cn, records),
-        max_major_cn=max_major_cn,
-        input_mutation_count=len(validated.mutation_ids),
-        retained_mutation_count=len(retained_ids),
-        excluded_mutation_ids=tuple(
-            mutation_id for mutation_id in validated.mutation_ids
-            if mutation_id in excluded_ids
-        ),
-        records=tuple(records),
-    )
-    if not retained_ids:
-        raise NoEligibleSNVsError(report, tumor_id=validated.metadata["tumor_id"])
-    retained_rows = {
-        unit: row for unit, row in validated.rows_by_unit.items()
-        if unit[0] not in excluded_ids
-    }
-    retained_purity: dict[str, float] = {}
-    for unit, row in retained_rows.items():
-        if unit in excluded_pairs:
-            continue
-        _, sample_id = unit
-        value = row["_source_purity"]
-        retained_purity[sample_id] = min(retained_purity.get(sample_id, value), value)
-    retained_rows = {
-        unit: dict(row, purity=retained_purity.get(unit[1], row["purity"]))
-        for unit, row in retained_rows.items()
-    }
-    return _ValidatedLongTable(validated.metadata, retained_ids, validated.sample_ids, retained_rows), report
-
-
-def _build_tumor_data(validated, *, report, normal_cn_policy=None):
-    """Compile exclusions to inert numerical placeholders; retain all other biology."""
-    shape = len(validated.mutation_ids), len(validated.sample_ids)
-    arrays = {name: np.zeros(shape) for name in ("alt_counts", "total_counts", "purity")}
-    arrays.update(major_cn=np.ones(shape), minor_cn=np.ones(shape), normal_cn=np.full(shape, 2.))
-    flags = {name: np.zeros(shape, dtype=bool) for name in
-             ("count_observed", "input_excluded", "mapping_genuine", "normal_cn_supplied")}
-    excluded = {(row.mutation_id, row.sample_id) for row in report.records}
-    for i, mutation in enumerate(validated.mutation_ids):
-        for j, region in enumerate(validated.sample_ids):
-            row = validated.rows_by_unit[mutation, region]
-            arrays["purity"][i, j] = row["purity"]
-            for name in flags:
-                flags[name][i, j] = row[name]
-            if (mutation, region) in excluded:
-                flags["count_observed"][i, j] = False
-                continue
-            if row["count_observed"]:
-                arrays["alt_counts"][i, j] = row["alt_count"]
-                arrays["total_counts"][i, j] = row["alt_count"] + row["ref_count"]
-            arrays["major_cn"][i, j], arrays["minor_cn"][i, j] = row["allele_a_cn"], row["allele_b_cn"]
-            arrays["normal_cn"][i, j] = row["normal_cn"]
-    return TumorData(validated.metadata["tumor_id"], validated.mutation_ids, validated.sample_ids,
-                     **arrays, **flags, cn_filter_report=report, normal_cn_policy=normal_cn_policy)
-
-
 def load_tumor_txt(path: str | Path, *, max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN,
                    normal_cn_policy=None, missing_counts=DEFAULT_MISSING_COUNTS) -> TumorData:
     """Load single-state scientific inputs, masking excluded pairs before fitting.
 
     Missing normal CN needs the explicit ``normal_cn_policy='diploid'`` assumption.
-    Original raw provenance is retained only by ``load_original_catalog``.
     """
-    return _load_input(path, max_major_cn=max_major_cn, numerical=True, normal_cn_policy=normal_cn_policy,
-                       missing_counts=missing_counts)
+    return load_original_catalog(path, max_major_cn=max_major_cn, missing_counts=missing_counts).fit_data(
+        normal_cn_policy=normal_cn_policy)
 
 
 def load_original_catalog(path: str | Path, *, max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN,
                           missing_counts=DEFAULT_MISSING_COUNTS) -> OriginalCatalog:
     """Preserve every canonical source key and provenance column before exclusions."""
-    return _load_input(path, max_major_cn=max_major_cn, missing_counts=missing_counts)
+    from .region_files import read_region_directory
+    max_major_cn = validate_max_major_cn(max_major_cn)
+    validate_missing_counts(missing_counts)
+    path = Path(path).resolve()
+    metadata, table = (read_region_directory(path) if path.is_dir()
+                       else _read_text_table(path, preserve_extra=True))
+    validated = _validate_long_table(metadata, table)
+    return _catalog_from_validated(metadata, table, validated, max_major_cn=max_major_cn, missing_counts=missing_counts)
 
 
 def audit_input(path: str | Path, *, max_major_cn=None, normal_cn_policy=None,
@@ -543,23 +474,6 @@ def audit_input(path: str | Path, *, max_major_cn=None, normal_cn_policy=None,
     return result
 
 
-def _load_input(path, *, max_major_cn, numerical=False, normal_cn_policy=None,
-                 missing_counts=DEFAULT_MISSING_COUNTS):
-    from .region_files import read_region_directory
-    max_major_cn = validate_max_major_cn(max_major_cn)
-    validate_missing_counts(missing_counts)
-    path = Path(path).resolve()
-    metadata, table = (read_region_directory(path, preserve_provenance=not numerical) if path.is_dir()
-                       else _read_text_table(path, preserve_extra=True))
-    validated = _validate_long_table(metadata, table)
-    if numerical:
-        rows, _ = resolve_read_counts(validated.rows_by_unit, cutoff=max_major_cn, policy=missing_counts)
-        validated = _ValidatedLongTable(metadata, validated.mutation_ids, validated.sample_ids, rows)
-        filtered, report = _filter_snv_cn(validated, max_major_cn=max_major_cn)
-        return _build_tumor_data(filtered, report=report, normal_cn_policy=normal_cn_policy)
-    return _catalog_from_validated(metadata, table, validated, max_major_cn=max_major_cn, missing_counts=missing_counts)
-
-
 def _provenance_flag(row, names, description, *, default=True):
     values = []
     for name in names:
@@ -618,7 +532,7 @@ def _catalog_from_validated(metadata, table, validated, *, max_major_cn, missing
         segment_ids=segments, **flags,
         source_rows=source_rows, provenance=provenance, metadata=tuple(metadata.items()),
         max_major_cn=max_major_cn, missing_counts=missing_counts, read_count_imputations=imputations,
-        _schema_version=6, **numeric)
+        **numeric)
 
 
 def _catalog_data(catalog, mutation_ids, *, prediction, normal_cn_policy=None):

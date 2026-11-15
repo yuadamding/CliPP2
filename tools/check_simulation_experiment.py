@@ -28,6 +28,68 @@ def _input(path, values, *, tumor="paired_regression"):
     write_tumor_txt(path, frame, metadata=dict(tumor_id=tumor))
 
 
+def run_paired_floor_checks(directory):
+    """Exercise raised floors in shared A and both native Stage 2 arms."""
+    from CliPP2.io.multiplicity import read_floor_bounds
+    from CliPP2.io.tumor_txt import load_original_catalog
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "floors.tsv"
+    # Diploid reads anchor the provisional source near one. Gain-segment source
+    # reads yield cap 1, while the remaining gain reads have read floor 2.
+    values = ([(500, 1, 1, "balanced")]*12 + [(250, 4, 0, "gain")]*2
+              + [(650, 4, 0, "gain")]*12)
+    frame = pd.DataFrame([dict(mutation_id=f"m{i:03}", sample_id="r1", alt_count=alt,
+        ref_count=1000-alt, purity=1, normal_cn=2, segment_id=segment,
+        cn_state_id="0", cn_state_fraction=1, allele_a_cn=major, allele_b_cn=minor,
+        count_observed=1) for i, (alt, major, minor, segment) in enumerate(values)])
+    write_tumor_txt(path, frame)
+    catalog = load_original_catalog(path)
+    expected, _ = read_floor_bounds(catalog)
+    high_ids = {f"m{i:03}" for i in range(14, 26)}
+    records = {}
+    for method in ("marginal", "profile"):
+        base = workflow_config()
+        config = replace(base, fit=replace(base.fit, max_clusters=2, fit_multiplicity=method),
+                         stage_two_max_clusters=2)
+        output = directory / method
+        paired = run_paired_experiment(path, output, config)
+        assert paired["status"] == "complete", paired.get("error")
+        assert paired["cost_ledger"]["fit_count"] == 3
+        assert paired["cost_ledger"]["assignment_pass_count"] == 2
+        assert high_ids.issubset(paired["remainder_ids"])
+        assert paired["lower_bound_policy"] == expected.policy_id
+        assert paired["stage_one_support_hash"] == expected.content_hash
+        np.testing.assert_array_equal(paired["stage_one"]["support"]["lower"], expected.lower)
+        cap = next(row for row in paired["cap_records"] if row["segment_id"] == "gain")
+        assert cap["multiplicity_endpoint"] == 1 and cap["lower_bound_override_count"] == 12
+        assert cap["cap_conflict_policy"] == "raise_upper_to_read_floor"
+        audit = pd.read_csv(output / "multiplicity_lower_bounds.tsv", sep="\t")
+        assert (audit.loc[audit.mutation_id.isin(high_ids), "multiplicity_lower"] == 2).all()
+        for name, arm in paired["arms"].items():
+            native = arm["stage_two"]
+            bounds = expected.subset(native["mutation_ids"])
+            np.testing.assert_array_equal(native["support"]["lower"], bounds.lower)
+            high = np.array([mutation in high_ids for mutation in native["mutation_ids"]])
+            upper = np.asarray(native["support"]["upper"])
+            assert np.all(upper[high] == (4 if name == "B" else 2))
+            assert np.all(np.asarray(native["multiplicities"])[high] >= 2)
+            # Stage 3 restores the original support even for capped singleton
+            # native intervals and the former shared Stage 1 source.
+            assert all(row["original_lower"] == 1 for row in arm["assignment"]["multiplicities"])
+            assert all(row["original_upper"] == 4 for row in arm["assignment"]["multiplicities"]
+                       if row["mutation_id"] in high_ids)
+        replay = run_paired_experiment(path, directory / (method + "_replay"), config,
+            accepted_stage_one=paired["stage_one"], accepted_uncapped_stage_two=paired["arms"]["B"]["stage_two"])
+        assert replay["status"] == "complete", replay.get("error")
+        assert replay["cost_ledger"]["fit_count"] == 1 and replay["cost_ledger"]["reused_fit_count"] == 2
+        records[method] = dict(shared_stage_one_floor=True, both_stage_two_floors=True,
+            cap_below_floor_singleton=True, stage_three_original_support=True,
+            accepted_floor_support_replayed=True)
+    return records
+
+
 def run_checks(directory):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -129,6 +191,7 @@ def run_checks(directory):
         checks.append(name + "_preserves_applicability_and_original_population")
     checks.extend(_control_regressions(directory / "control_regressions"))
     return dict(status="passed", checks=checks, directory=str(directory),
+                multiplicity_floors=run_paired_floor_checks(directory / "multiplicity_floors"),
                 default_max_clusters=[config.fit.max_clusters, config.stage_two_max_clusters])
 
 
