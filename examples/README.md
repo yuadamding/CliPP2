@@ -1,24 +1,34 @@
 # Examples
 
-Run the six-mutation, two-region workflow from the repository root:
+Fit the six-mutation, two-region example from the repository root:
 
 ```sh
-clipp2 workflow --plan examples/workflow_protocol25.plan.json --output-dir results/workflow25
+clipp2 fit --input-dir examples/tumor --max-clusters 3 --output-dir results/example-fit
 ```
 
-The [plan](workflow_protocol25.plan.json) uses Protocol 2.5, CPU execution,
-marginal fitting and assignment, and cluster limits of 10 and 20 for Stages 1
-and 2. Its [input](workflow_protocol25.tsv) supplies normal CN explicitly.
+For the complete three-stage workflow, save this as `plan.json` in the repository
+root. Input paths are relative to the plan file:
+
+```json
+{
+  "schema": "clipp2.workflow.plan.v7",
+  "protocol_version": "2.5",
+  "input_path": "examples/tumor",
+  "workflow_config": {}
+}
+```
+
+Defaults use CPU execution, marginal fitting and assignment, and cluster limits
+of 10 and 20 for Stages 1 and 2. The input supplies normal CN explicitly.
 Set `fit.max_multiplicity_difference` to `null` for independent regional
 multiplicities, or `stage_three_assignment_method` to `"profile"` for profile
 assignment. See the [workflow definition](../docs/workflow_protocol_2_5.md).
 
-Replay the frozen Stage 3 request, or run a standalone fit:
+Run the workflow, then replay its frozen Stage 3 request:
 
 ```sh
+clipp2 workflow --plan plan.json --output-dir results/workflow25
 clipp2 assign --bundle results/workflow25/assignment_bundle.json --output-dir results/replayed-assignment
-clipp2 fit --input-file examples/workflow_protocol25.tsv --max-clusters 3 --output-dir results/example-fit
-clipp2 fit --input-dir examples/tumor --max-clusters 3 --output-dir results/regional-fit
 ```
 
 Each command uses a new output directory. The [`tumor/`](tumor/) fixture has
@@ -44,5 +54,4 @@ likelihood denominator and major-CN ceiling. Canonical TSVs retain these states
 in `segment_cn_states` while preserving their explicit major/minor CN.
 
 The [input contract](../README.md#inputs-and-outputs) defines CN validation,
-read floors and their reconciliation with the joint range rule. The
-[simulation guide](../docs/simulation.md) describes cohort execution.
+read floors and their reconciliation with the joint range rule.

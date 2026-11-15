@@ -247,9 +247,6 @@ class AssignmentBundle(ImmutableArrayRecord):
             raise ValueError("Assignment bundle live content differs from its frozen identity")
         return payload
 
-    def validate_integrity(self):
-        self.validated_payload()
-
     @classmethod
     def from_dict(cls, value):
         values = dict(value)

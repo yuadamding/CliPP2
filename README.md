@@ -8,23 +8,19 @@ fractions additionally determine the read-based multiplicity lower bounds in
 Stages 1 and 2; they do not introduce a mixed-state likelihood.
 
 Protocol **2.5** chooses a provisional Stage 1 source, then fits the remainder
-with caps from the minimum upper endpoint of native multiplicity MAP sets.
-By default, each mutation's multiplicities differ by at most one across its
-informative regions. This joint support is established before pilot CCFs and
-tree construction and is used throughout fitting, model selection and assignment.
-Read floors and Stage 2 caps are reconciled under this rule while preserving
-original major-CN ceilings. Requested and effective bounds are recorded separately.
+using segment caps from that source's multiplicity estimates. By default, each
+mutation's multiplicities differ by at most one across informative regions.
 Stage 3 restores original support and reassesses every fitted mutation against
-one fixed all-one clonal reference and every Stage 2 center. The selected Stage 1
-source maps to that clonal reference; its native estimate remains provenance,
-not a competing cluster. Exact Stage 2 duplicates are consolidated before equal priors.
-Confidence, ties, coverage, residuals and distance do not veto defined estimates.
+one fixed all-one clonal reference and the distinct Stage 2 centers.
 
 Cluster limits default to **10 for Stage 1 and 20 for Stage 2**. Valid integer CN
 has no automatic eligibility ceiling. Explicit input exclusions, model-domain
-checks and numerical verification remain. Package **2.1.0** and scientific
-protocol **2.5** have separate identities; versioned contracts distinguish the
-current single-clonal-reference policy from earlier reference inventories.
+checks and numerical verification remain. Stage 1–2 fitting ends after the
+bounded search and reassignment proposals, followed by BIC selection. It does
+not run exhaustive single-mutation membership audits or certify local optimality.
+Package **2.2.0** implements scientific protocol **2.5**. The
+[protocol specification](docs/workflow_protocol_2_5.md) defines the likelihood,
+BIC, multiplicity constraints, and saved-state contracts.
 
 ## Install and run
 
@@ -32,15 +28,15 @@ Fitting requires Python 3.10+ and a C++17 compiler. CPU is the default backend:
 
 ```sh
 python -m pip install .
-clipp2 workflow --plan examples/workflow_protocol25.plan.json --output-dir results/workflow25
+clipp2 fit --input-dir examples/tumor --max-clusters 3 --output-dir results/example-fit
 ```
 
-The example plan declares one workflow configuration without acceptance thresholds.
-Outputs include native Stage 1/2 fits, provisional-source provenance, exact reference consolidation, segment caps,
+The [examples](examples/README.md) also show the plan for a complete three-stage
+workflow. Its outputs include native Stage 1/2 fits, provisional-source provenance, exact reference consolidation, segment caps,
 reference vectors, method-specific scores, MAP tie sets and raw diagnostics.
 Marginal assignment also reports cluster posterior probabilities; profile does not.
-`all_original_mutations.tsv` retains final membership and unchanged or unassigned
-mutations. Eligible targets without informative reads have a `prior_only` vector
+`all_original_mutations.tsv` retains every mutation and its final assignment or
+unassigned status. Eligible targets without informative reads have a `prior_only` vector
 and no data-supported final label; all-impossible candidates instead yield
 `model_incompatible` with no posterior. Use a new output directory for each run.
 
@@ -50,7 +46,6 @@ and no data-supported final label; all-impossible candidates instead yield
 | Standalone native fit | `clipp2 fit --input-file INPUT.tsv --output-dir OUTPUT` |
 | Input audit | `clipp2 audit-input --input-file INPUT.tsv --output AUDIT.json` |
 | Frozen-reference reassignment | `clipp2 assign --bundle BUNDLE.json --output-dir OUTPUT` |
-| Biological study | `clipp2-simulate run --cohort-settings SETTINGS.json --outdir OUTPUT` |
 
 Stage 3 defaults to **marginal** likelihood. Set
 `workflow_config.stage_three_assignment_method` to `"profile"` to maximize the
@@ -75,8 +70,7 @@ Stage 1–2 center fitting defaults to **marginal** likelihood. Opt into
 `--fit-multiplicity profile` (or `workflow_config.fit.fit_multiplicity` in a plan)
 to maximize integer-multiplicity likelihood while retaining marginal-mixture
 BIC selection at the frozen fitted centers. This is independent of Stage 3's
-assignment method. See the [numerical contract](docs/workflow_protocol_2_5.md#joint-likelihood-and-numerical-implementation)
-and [qualification results](docs/joint_multiplicity_qualification.md).
+assignment method. See the [numerical contract](docs/workflow_protocol_2_5.md#joint-likelihood-and-numerical-implementation).
 
 `FitConfig.max_multiplicity_difference` defaults to `1`; use `None` in Python, `null` in JSON,
 or `--max-multiplicity-difference none` for the independent regional model.
@@ -162,28 +156,6 @@ multiplicity support is restricted. Stage 3 restores that original support for e
 default retains all valid integer CN. Input audits report missing CN/purity and
 mapping problems without filling absent CN/purity, and report read imputations
 without modifying source files.
-
-## Simulation and checks
-
-The exact supplied cohort requires **Python 3.11+ and NumPy 2.3.5**:
-
-```sh
-python -m pip install '.[simulation]'
-clipp2-simulate run --cohort-settings CliPP2_phylogeny_cohort_settings.json.gz --workers 10 --outdir results/cohort
-python tools/check_research.py --groups joint workflow biology evaluation study publication
-```
-
-The full design has 60 cases, 720 physical histories, and 2,640 datasets.
-Development and main replicate counts are declared before execution; worker
-count does not change the experiment. One fixed configuration runs throughout;
-development is descriptive and poor finite performance does not block the main
-study. Numerical verification remains mandatory. The deterministic checks above
-are separate from biological performance assessment and full-cohort execution.
-
-- [Workflow Protocol 2.5](docs/workflow_protocol_2_5.md)
-- [Joint multiplicity qualification](docs/joint_multiplicity_qualification.md)
-- [Simulation design and execution](docs/simulation.md)
-- [Evaluation definitions](docs/simulation_evaluation.md)
 
 ## Contact
 

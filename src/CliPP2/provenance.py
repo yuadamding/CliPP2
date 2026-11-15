@@ -80,53 +80,6 @@ def validate_fit_execution_receipt(config_record, execution, *, build=None):
     return config
 
 
-def validate_inherited_audit(accepted, original_config, *, requested_scope=None):
-    """Check retained per-count certification without reconstructing a search."""
-    from .config import validate_audit_scope
-    from .tree.membership_audit import AUDIT_POLICY
-    from .tree.proposals import SCORE_ATOL, SCORE_RTOL
-
-    scope = original_config.audit_scope if requested_scope is None else validate_audit_scope(requested_scope)
-    evidence = accepted.acceptance_evidence
-    audit = evidence.get("membership_audit") if isinstance(evidence, Mapping) else None
-    if (not isinstance(audit, Mapping) or audit.get("complete") is not True
-            or audit.get("selected_count_certified") is not True
-            or audit.get("scope") != original_config.audit_scope or audit.get("policy") != AUDIT_POLICY
-            or audit.get("score_atol") != SCORE_ATOL or audit.get("score_rtol") != SCORE_RTOL):
-        raise ValueError("Original membership audit policy or certification is incomplete")
-    represented, per_q = audit.get("represented_cluster_counts"), audit.get("per_q")
-    n, selected_q = len(accepted.mutation_ids), len(accepted.centers)
-    if (not isinstance(represented, (tuple, list)) or not represented
-            or any(type(q) is not int or not 1 <= q <= min(n, original_config.max_clusters) for q in represented)
-            or list(represented) != sorted(set(represented)) or selected_q not in represented
-            or not isinstance(per_q, (tuple, list)) or not per_q):
-        raise ValueError("Original membership audit lacks consistent represented counts")
-    counters = ("examined_pairs", "structural_exclusions", "eligible_neighbors", "completed_ineligible_neighbors",
-                "unresolved_evaluations", "improving_eligible_neighbors")
-    certified, states = {}, set()
-    for row in per_q:
-        if (not isinstance(row, Mapping) or type(row.get("occupied_q")) is not int
-                or row["occupied_q"] not in represented or row["occupied_q"] in certified
-                or type(row.get("state_index")) is not int or row["state_index"] < 0 or row["state_index"] in states
-                or any(type(row.get(key)) is not int or row[key] < 0 for key in counters)):
-            raise ValueError("Original membership audit has invalid per-count evidence")
-        q = row["occupied_q"]
-        if (row["examined_pairs"] != n*(q-1) or row["unresolved_evaluations"] != 0
-                or row["improving_eligible_neighbors"] != 0
-                or row["examined_pairs"] != sum(row[key] for key in counters[1:4])):
-            raise ValueError("Original membership audit does not certify a complete terminal neighborhood")
-        certified[q] = row
-        states.add(row["state_index"])
-    selected = certified.get(selected_q)
-    if selected is None or any(audit.get(key) != selected[key] for key in ("occupied_q", "state_index", *counters)):
-        raise ValueError("Selected fitted count disagrees with its retained membership audit")
-    covers_all = set(certified) == set(represented)
-    if audit.get("all_represented_counts_certified") is not covers_all:
-        raise ValueError("Original all-count certification flag disagrees with actual audit coverage")
-    if (original_config.audit_scope == "all" or scope == "all") and not covers_all:
-        raise ValueError("Retained membership audit does not cover every represented count")
-
-
 def validate_replay_policy(accepted, requested_fit_config, *, normal_cn_policy):
     """Require the original scientific search; allow current execution controls."""
     from .config import FitConfig
@@ -150,7 +103,6 @@ def validate_replay_policy(accepted, requested_fit_config, *, normal_cn_policy):
     # numerical inputs, masks and effective support before any reuse is allowed.
     if len(accepted.centers) > original.max_clusters:
         raise ValueError("Accepted occupied count exceeds the original search capacity")
-    validate_inherited_audit(accepted, original, requested_scope=requested_fit_config.audit_scope)
     return original
 
 
@@ -190,7 +142,6 @@ def prepare_run_manifest(catalog, *, supplied=None, run_manifest_id=None):
         artifact = supplied["artifact"]
         if artifact["protocol_version"] != PROTOCOL_VERSION or artifact["implementation_version"] != __version__:
             raise ValueError("External build record describes a different executing protocol or implementation")
-    identifier = validate_run_manifest_id(identifier)
     payload = dict(run_manifest_id=identifier, build=supplied, input_identity=dict(tumor_id=catalog.tumor_id,
         biological_identity=catalog.biological_identity, original_catalog_identity=content_hash(catalog.to_dict())))
     return dict(schema="clipp2.run-manifest.v2", **payload, manifest_identity=content_hash(payload))

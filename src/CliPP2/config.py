@@ -10,7 +10,6 @@ DEFAULT_MAX_MAJOR_CN: Final = None
 DEFAULT_MAX_CLUSTERS: Final = 20
 DEFAULT_STAGE_ONE_MAX_CLUSTERS: Final = 10
 DEFAULT_DEVICE: Final = "cpu"
-DEFAULT_AUDIT_SCOPE: Final = "selected"
 DEFAULT_MISSING_COUNTS: Final = "zero_alt"
 PROTOCOL_VERSION: Final = "2.5"
 STAGE_THREE_REFERENCE_POLICY: Final = "single_fixed_clonal_stage_one_source_v1"
@@ -58,12 +57,6 @@ def validate_assignment_method(value):
     return value
 
 
-def validate_audit_scope(value):
-    if value not in ("selected", "all"):
-        raise ValueError("audit_scope must be selected or all.")
-    return value
-
-
 def validate_missing_counts(value):
     if value not in ("zero_alt", "unobserved"):
         raise ValueError("missing_counts must be zero_alt or unobserved.")
@@ -87,14 +80,12 @@ class FitConfig:
     max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN
     max_clusters: int = DEFAULT_MAX_CLUSTERS
     cpu_threads: int | None = None
-    audit_scope: str = DEFAULT_AUDIT_SCOPE
     fit_multiplicity: str = "marginal"
     selection_criterion: str = SELECTION_CRITERION
     max_multiplicity_difference: int | None = 1
 
     def __post_init__(self) -> None:
         fitting_identity(self.fit_multiplicity, self.selection_criterion, self.max_multiplicity_difference)
-        validate_audit_scope(self.audit_scope)
         if self.device not in ("cpu", "cuda"):
             raise ValueError("device must be cpu or cuda.")
         object.__setattr__(self, "max_major_cn", validate_max_major_cn(self.max_major_cn))
@@ -110,14 +101,13 @@ def resolve_fit_config(
     max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN,
     max_clusters: int = DEFAULT_MAX_CLUSTERS,
     cpu_threads: int | None = None,
-    audit_scope: str = DEFAULT_AUDIT_SCOPE,
     fit_multiplicity: str = "marginal",
     selection_criterion: str = SELECTION_CRITERION,
     max_multiplicity_difference: int | None = 1,
 ) -> FitConfig:
     """Construct the only public fit configuration; removed knobs raise TypeError."""
     return FitConfig(device=device, max_major_cn=max_major_cn,
-                     max_clusters=max_clusters, cpu_threads=cpu_threads, audit_scope=audit_scope,
+                     max_clusters=max_clusters, cpu_threads=cpu_threads,
                      fit_multiplicity=fit_multiplicity, selection_criterion=selection_criterion,
                      max_multiplicity_difference=max_multiplicity_difference)
 

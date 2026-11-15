@@ -164,15 +164,6 @@ class TumorData(ImmutableArrayRecord):
     def total_cn(self):
         return self.major_cn + self.minor_cn
 
-    @property
-    def num_mutations(self):
-        return len(self.mutation_ids)
-
-    @property
-    def num_regions(self):
-        return len(self.region_ids)
-
-
 def _indices(requested, available, name):
     requested = tuple(requested)
     if len(set(requested)) != len(requested):

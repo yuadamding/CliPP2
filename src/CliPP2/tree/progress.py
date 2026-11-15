@@ -2,7 +2,7 @@
 from copy import deepcopy
 from time import perf_counter
 
-PROGRESS_SCHEMA_VERSION = 3
+PROGRESS_SCHEMA_VERSION = 4
 
 
 class ProgressReporter:
@@ -19,7 +19,6 @@ class ProgressReporter:
         self.started = self.last = perf_counter()
         self.phase_clock = self.started
         self.phase = "initialization"
-        self.audit = None
         self.seed_index = self.requested_k = self.occupied_q = None
 
     def completed_candidate(self, bank, provenance):
@@ -28,21 +27,15 @@ class ProgressReporter:
     def start_phase(self, phase, bank=None):
         self.phase = phase
         self.phase_clock = perf_counter()
-        self.audit = None
         self.seed_index = self.requested_k = self.occupied_q = None
         self.emit(bank, started=True)
 
     def completed_operation(self, bank, provenance, operation):
         self.emit(bank, provenance=provenance, operation=operation)
 
-    def membership_audit(self, bank, snapshot, *, started=False, complete=False):
-        self.audit = dict(snapshot, pass_started=started, pass_complete=complete)
-        self.occupied_q = snapshot['occupied_q']
-        self.emit(bank, force=started or complete)
-
-    def emit(self, bank=None, *, provenance=None, operation=None, complete=False, started=False, force=False):
+    def emit(self, bank=None, *, provenance=None, operation=None, complete=False, started=False):
         now = perf_counter()
-        if not (complete or started or force) and now-self.last < 5.0:
+        if not (complete or started) and now-self.last < 5.0:
             return
         self.last = now
         provenance = {} if provenance is None else provenance
@@ -63,7 +56,7 @@ class ProgressReporter:
             "seed_index": provenance.get("seed_index", self.seed_index),
             "requested_k": requested,
             "occupied_q": occupied,
-            "route": provenance.get("route"), "membership_audit": self.audit,
+            "route": provenance.get("route"),
             "telemetry": {} if self.model is None else dict(self.model.telemetry),
         }
         if bank is not None:

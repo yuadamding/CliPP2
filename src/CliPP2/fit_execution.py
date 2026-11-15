@@ -60,13 +60,11 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
         fit_offset = perf_counter()-started
         callback = (None if progress_callback is None else lambda record:
                     progress_callback(dict(record, elapsed_seconds=record['elapsed_seconds']+fit_offset)))
-        result = fit_regions(model, config.max_clusters, progress_callback=callback,
-                             audit_scope=config.audit_scope)
+        result = fit_regions(model, config.max_clusters, progress_callback=callback)
         execution_record = model.execution_diagnostics()
         validate_fit_execution_receipt(asdict(config), execution_record, build=build)
         verification_start = perf_counter()
         publication = publish(model, result, outdir, data.tumor_id, progress=progress)
-        audit = publication['verification']['membership_audit']
         summary = {
             'tumor_id': data.tumor_id, 'algorithm': ALGORITHM, 'model_version': model.model_version,
             'protocol_version': PROTOCOL_VERSION, 'implementation_version': __version__,
@@ -75,7 +73,7 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
             'provenance_policy': 'biological_and_numerical_identity_no_file_checksums',
             'biological_identity': (None if data.original_catalog is None else
                                     data.original_catalog.biological_identity),
-            'output_schema_version': OUTPUT_SCHEMA_VERSION, 'diagnostics_schema_version': 3,
+            'output_schema_version': OUTPUT_SCHEMA_VERSION, 'diagnostics_schema_version': 4,
             'kernel_version': KERNEL_VERSION,
             'num_mutations': model.n, 'num_regions': model.r,
             'num_clusters': len(result.centers), 'region_ids': model.region_ids,
@@ -89,12 +87,10 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
             'exclusions': exclusion_summary(model), 'diagnostics': result.diagnostics,
             'execution': model.execution_diagnostics(),
             'search_status': {'policy': result.diagnostics['search_policy'],
-                'audit_scope': config.audit_scope,
                 'selected_q': len(result.centers), 'selected_state_id': result.selected.state_index,
-                **{key: audit[key] for key in ('selected_count_certified',
-                    'all_represented_counts_certified', 'represented_cluster_counts')},
-                'unresolved_terminal_evaluations': audit['unresolved_evaluations'],
-                'search_work': result.diagnostics['search_work'], 'global_optimality_certified': False},
+                'represented_cluster_counts': sorted({len(candidate.fit.centers) for candidate in result.candidate_bank}),
+                'search_work': result.diagnostics['search_work'],
+                'local_optimality_certified': False, 'global_optimality_certified': False},
             'input_seconds': input_seconds,
             'verification_publication_seconds': perf_counter()-verification_start,
             'elapsed_seconds': perf_counter()-started, 'publication': publication,

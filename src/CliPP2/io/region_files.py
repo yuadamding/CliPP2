@@ -53,7 +53,7 @@ def _integer(value: str, *, name: str, minimum: int = 0) -> int:
     return int(value)
 
 
-def _read_region(path: Path, *, preserve_provenance=False):
+def _read_region(path: Path):
     tokens = (path / "purity.txt").read_text(encoding="utf-8").split()
     if not tokens or tokens == ["."]:
         raise _MissingProfileValue(f"{path}/purity.txt purity may not be missing.")
@@ -136,19 +136,18 @@ def _read_region(path: Path, *, preserve_provenance=False):
         if any(right[0] <= left[1] for left, right in zip(segments, segments[1:])):
             raise TumorTxtError(f"{path}: overlapping CNA intervals on chromosome {chrom!r}.")
         indexed[chrom] = ([segment[0] for segment in segments], segments)
-    result = purity, observations, indexed
-    return (*result, observation_rows, interval_rows) if preserve_provenance else result
+    return purity, observations, indexed, observation_rows, interval_rows
 
 
 def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tuple[dict[str, str], pd.DataFrame]:
     """Join inclusive CN intervals, retaining genuine-mapping evidence by default."""
     path = Path(path).resolve()
-    regions = {region.name: _read_region(region, preserve_provenance=preserve_provenance) for region in _regions(path)}
+    regions = {region.name: _read_region(region) for region in _regions(path)}
     loci = sorted({locus for value in regions.values() for locus in value[1]})
     has_exclusions = any(observation[2] for value in regions.values() for observation in value[1].values())
     rows = []
     for sample, value in regions.items():
-        purity, observations, intervals = value[:3]
+        purity, observations, intervals, observation_rows, interval_rows = value
         for chrom, position in loci:
             starts, segments = intervals.get(chrom, ([], []))
             index = bisect_right(starts, position) - 1
@@ -156,8 +155,7 @@ def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tupl
             if not genuine:
                 raise TumorTxtError(f"{path}: input_missing CN segment for mutation {chrom}:{position} "
                                     f"in sample {sample!r}; run the input audit to inspect profile and segment mapping.")
-            else:
-                start, end, major, minor, normal, normal_supplied, genuine, cn_states = segments[index]
+            start, end, major, minor, normal, normal_supplied, genuine, cn_states = segments[index]
             alt, ref, excluded, observed = observations.get((chrom, position), (".", ".", False, False))
             row = dict(zip(SCHEMA_COLUMNS, (f"{chrom}:{position}", sample, alt, ref, int(observed), purity,
                          normal, f"{chrom}:{start}-{end}", "0", 1, major, minor)))
@@ -169,8 +167,8 @@ def read_region_directory(path: str | Path, *, preserve_provenance=True) -> tupl
             if preserve_provenance:
                 row.update(chromosome_index=chrom, position=position,
                            start_position=start, end_position=end)
-                row.update(("snv_"+key, cell) for key, cell in value[3].get((chrom, position), {}).items())
-                row.update(("cna_"+key, cell) for key, cell in value[4].get((chrom, start, end), {}).items())
+                row.update(("snv_"+key, cell) for key, cell in observation_rows.get((chrom, position), {}).items())
+                row.update(("cna_"+key, cell) for key, cell in interval_rows.get((chrom, start, end), {}).items())
             rows.append(row)
     metadata = _validate_metadata({"tumor_id": _safe_tumor_id(path.name),
                                   "mutation_key_convention": "chromosome_index:position"}, path=path)
@@ -208,7 +206,7 @@ def audit_region_directory(path):
                                code="missing_profile_value" if missing else "invalid_profile", source=str(region),
                                sample_id=region.name, cause="profile_content", message=str(error)))
     loci = sorted({locus for value in parsed.values() for locus in value[1]})
-    for sample, (_, _, intervals) in parsed.items():
+    for sample, (_, _, intervals, _, _) in parsed.items():
         for chrom, position in loci:
             starts, segments = intervals.get(chrom, ([], []))
             index = bisect_right(starts, position) - 1

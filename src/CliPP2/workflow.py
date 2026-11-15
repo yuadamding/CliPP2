@@ -194,10 +194,10 @@ class AcceptedFit(ImmutableArrayRecord):
         Original execution evidence is preserved. Older summary/TSV formats are
         not imported, and insufficient evidence never triggers optimization.
         """
-        from .io.reporting import _verify_fitted_numerics
+        from .io.reporting import VERIFICATION_SCHEMA_VERSION, _verify_fitted_numerics
         from .kernel.model import FitResult, RegionalModel
         from .kernel.topology import Membership
-        from .provenance import resolve_current_run_manifest_id, validate_inherited_audit
+        from .provenance import resolve_current_run_manifest_id
         from .kernel import ALGORITHM, KERNEL_VERSION
         from .kernel.model import MODEL_VERSION, INTERVAL_MODEL_VERSION
         run_manifest_id = resolve_current_run_manifest_id(run_manifest_id)
@@ -233,7 +233,6 @@ class AcceptedFit(ImmutableArrayRecord):
             raise ValueError("Original fit lacks its explicit normal-CN assumption")
         if len(self.centers) > original_config.max_clusters:
             raise ValueError("Accepted occupied count exceeds the original search capacity")
-        validate_inherited_audit(self, original_config)
         if build is not None:
             artifact = build["artifact"]
             if (artifact["protocol_version"] != producer["protocol_version"]
@@ -249,11 +248,12 @@ class AcceptedFit(ImmutableArrayRecord):
             if any(not np.array_equal(actual, expected) for actual, expected in zip(accepted_support, numerical)):
                 raise ValueError("Saved fit has different actual multiplicity support")
         evidence = self.acceptance_evidence
-        audit = evidence.get("membership_audit", {}) if isinstance(evidence, Mapping) else {}
-        if (not isinstance(evidence, Mapping) or not isinstance(audit, Mapping)
-                or evidence.get("independently_verified") is not True
-                or audit.get("selected_count_certified") is not True or audit.get("complete") is not True):
-            raise ValueError("Saved fit lacks accepted independent and terminal-audit evidence")
+        if (not isinstance(evidence, Mapping) or evidence.get("independently_verified") is not True
+                or evidence.get("verification_schema_version") != VERIFICATION_SCHEMA_VERSION
+                or evidence.get("local_optimality_certified") is not False
+                or evidence.get("complete_candidate_bank_reconciled") is not True
+                or evidence.get("selected_fitted_state_retained") is not True):
+            raise ValueError("Saved fit lacks independent numerical and candidate-bank verification")
         publication = producer.get("publication", {})
         original_verification = publication.get("verification") if isinstance(publication, Mapping) else None
         if (not isinstance(original_verification, Mapping) or content_hash(original_verification) !=
@@ -288,8 +288,7 @@ class AcceptedFit(ImmutableArrayRecord):
                 originating_native_fit_protocol=self.protocol_version, current_workflow_protocol=PROTOCOL_VERSION,
                 accepted_state_hash=self.state_fingerprint, model_identity=model.identity,
                 execution=model.execution_diagnostics(), refitted=False,
-                checks="biological_inputs_support_native_calls_independent_score",
-                inherited_terminal_audit=True)
+                checks="biological_inputs_support_native_calls_independent_score")
         finally:
             model.close()
         return replace(self, compatibility_receipts=(*self.compatibility_receipts, compatibility))
@@ -346,11 +345,6 @@ def _diagnostics_many(catalog, ids, coordinates, bounds, config, calls=None):
                 raise ArithmeticError("Group profile diagnostics returned invalid informative measurements")
             diagnostics.append(diagnostic)
     return diagnostics, observation
-
-
-def _diagnostics(catalog, ids, phi, bounds, config, calls=None):
-    diagnostics, observation = _diagnostics_many(catalog, ids, (phi,), bounds, config, calls)
-    return diagnostics[0], observation
 
 
 def collect_cap_contributors(catalog, fit, config, *, mutation_ids=None):
@@ -477,7 +471,7 @@ def select_reference_source(groups):
     return dict(selected, reference_source_role="provisional_reference_source", selection_rule="nearest_to_one")
 
 
-def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, group_two, config):
+def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, group_two):
     """Use one fixed clonal hypothesis; retain Stage 1's estimate as provenance."""
     selected = selected_group
     label = selected["source_label"]
@@ -533,8 +527,6 @@ def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, gro
                 reference_measurement="all_one" if fit is stage_one else "native",
                 diagnostic_error=group.get("diagnostic_error")))
             measurements[baseline].append((group, "all_one" if fit is stage_one else "native"))
-    if sum(np.all(center == 1) for center in centers) != 1 or source_map[0]["baseline_reference_label"] != 0:
-        raise AssertionError("Stage 3 requires one all-one reference including the Stage 1 source")
     counts, depths, means, maxima, availability = [], [], [], [], []
     for records in measurements:
         count = np.asarray([g["informative_counts"] for g, _ in records], float)
@@ -567,7 +559,7 @@ def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, gro
     second_ids = () if stage_two is None else stage_two.mutation_ids
     if not g0 or set(g0) & set(second_ids) or set(g0) | set(second_ids) != set(stage_one.mutation_ids):
         raise ValueError("Accepted Stage 2 and provisional source must partition Stage 1")
-    return reference, tuple(sorted(g0 + second_ids)), {}, source_map
+    return reference, tuple(sorted(g0 + second_ids)), source_map
 
 
 def _stage_two_caps(catalog, audits, *, lower_bounds=None, max_multiplicity_difference=1,
@@ -712,7 +704,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
     current_stage = "stage_one"
     receipt["current_phase"] = "stage_one_fit"
     def unavailable_original(first):
-        rows, accounting = _reconcile_final_memberships(catalog, first, None, [], {}, None)
+        rows, accounting = _reconcile_final_memberships(catalog, first, None, [], None)
         write_supporting_table(output / "all_original_mutations.tsv", rows, columns=ORIGINAL_COMPARISON_COLUMNS)
         receipt["final_accounting"] = accounting
     try:
@@ -754,8 +746,6 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         receipt["counts"]["N0"] = len(g0)
         reference_members = set(g0)
         remainder = tuple(m for m in population if m not in reference_members)
-        if reference_members & set(remainder):
-            raise AssertionError("Reference membership overlaps the stage-two remainder")
         receipt["stage_two_candidate_count"] = len(remainder)
         current_stage = "stage_two"
         receipt["stage_two"] = "preparing"
@@ -802,19 +792,15 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         write_supporting_table(output / "stage_two_groups.tsv", group_two, columns=GROUP_COLUMNS)
         current_stage = "stage_three"
         receipt["current_phase"] = "stage_three_construction"
-        reference, targets, unchanged_map, source_map = _build_stage_three_inputs(
-            catalog, stage_one, stage_two, selected, group_two, config)
+        reference, targets, source_map = _build_stage_three_inputs(
+            catalog, stage_one, stage_two, selected, group_two)
         centers = reference.centers
         stage_two_members = set(targets) - reference_members
-        non_targets = tuple(unchanged_map)
-        if non_targets or set(targets) != set(stage_one.mutation_ids):
-            raise AssertionError("Protocol 2.5 must reassess the entire combined fitted population")
-        combined = set(targets) | set(non_targets)
         q2 = 0 if stage_two is None else len(stage_two.centers)
         receipt["counts"].update(merged_groups=0, clonal_source_consolidated=1,
             exact_duplicate_centers=1 + q2 - len(centers),
-            combined_mutations=len(combined), K=len(centers),
-            targets=len(targets), non_targets=len(non_targets), unchanged_non_target=len(non_targets))
+            combined_mutations=len(targets), K=len(centers),
+            targets=len(targets), non_targets=0, unchanged_non_target=0)
         write_supporting_table(output / "source_to_reference.tsv", source_map)
         write_supporting_table(output / "reference_vectors.tsv", [dict(reference_label=label,
             prior=1 / len(centers), **{"phi_" + region: float(center[j]) for j, region in enumerate(catalog.region_ids)})
@@ -827,7 +813,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
                         baselines[mutation] = (fit, i)
         baseline_rows = [baselines[mutation] for mutation in targets]
         source_labels = {(row["source_stage"], row["source_label"]): row["baseline_reference_label"] for row in source_map}
-        bundle = AssignmentBundle(catalog, reference, targets, non_targets,
+        bundle = AssignmentBundle(catalog, reference, targets, (),
             np.asarray([fit.centers[fit.labels[i]] for fit, i in baseline_rows]),
             np.asarray([fit.multiplicities[i] for fit, i in baseline_rows]),
             np.asarray([fit.support.lower[i] for fit, i in baseline_rows]),
@@ -855,7 +841,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
             raise AssertionError("Stage 3 reassessments do not reconcile the frozen targets")
         receipt["current_phase"] = "final_reconciliation"
         original_rows, final_accounting = _reconcile_final_memberships(
-            catalog, stage_one, stage_two, source_map, unchanged_map, assignment, contributors=reference_audit)
+            catalog, stage_one, stage_two, source_map, assignment, contributors=reference_audit)
         receipt.update(final_accounting=final_accounting, bundle_hash=bundle.content_hash,
                        exact_reference_consolidation_is_refit=False)
         receipt["counts"].update(reassessment)
@@ -875,7 +861,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         if not (output / "all_original_mutations.tsv").exists():
             try:
                 rows, accounting = _reconcile_final_memberships(catalog, locals().get("stage_one"),
-                    locals().get("stage_two"), locals().get("source_map", []), {}, locals().get("assignment"))
+                    locals().get("stage_two"), locals().get("source_map", []), locals().get("assignment"))
                 write_supporting_table(output / "all_original_mutations.tsv", rows, columns=ORIGINAL_COMPARISON_COLUMNS)
                 receipt["final_accounting"] = accounting
             except Exception as publication_error:
@@ -884,11 +870,9 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         raise
 
 
-def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unchanged_map, result,
+def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, result,
                                  *, contributors=()):
     """Construct whole-original final labels and combined accounting exactly once."""
-    if unchanged_map:
-        raise ValueError("The current workflow reassesses every combined fitted mutation")
     first, second, assignment = stage_one, stage_two, result
     mapping = {(row["source_stage"], row["source_label"]): row["baseline_reference_label"] for row in source_map}
     positions = [{} if fit is None else {m: i for i, m in enumerate(fit.mutation_ids)} for fit in (first, second)]

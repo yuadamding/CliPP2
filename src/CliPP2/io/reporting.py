@@ -10,24 +10,18 @@ import numpy as np
 import pandas as pd
 from scipy.special import gammaln, logsumexp, xlogy, xlog1py
 
-from ..config import validate_audit_scope
 from ..kernel import ALGORITHM, SCORE_DEFINITION
-from ..kernel.model import FitResult
-from ..kernel.topology import canonical_partition, partition_from_cuts
-from ..tree.candidates import CandidateBank, RefitAttempt, score_key, validate_candidate_bank
-from ..tree.membership_audit import (AUDIT_POLICY, MembershipAudit, SingleMove,
-                                     fitted_state_fingerprint)
-from ..tree.proposals import SCORE_ATOL, SCORE_RTOL
+from ..kernel.topology import partition_from_cuts
+from ..tree.candidates import validate_candidate_bank
 
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
-OUTPUT_SCHEMA_VERSION = 15
+OUTPUT_SCHEMA_VERSION = 16
 MANIFEST_SCHEMA = 'clipp2.file-list.v1'
-VERIFICATION_SCHEMA_VERSION = 5
+VERIFICATION_SCHEMA_VERSION = 6
 
 _VERIFY_ROWS = 4096
 _VERIFY_CENTERS = 32
-_VERIFY_CACHE_BYTES = 16 * 1024 * 1024
 
 def _input_observed(model):
     """Read observation eligibility from input, never runtime caches."""
@@ -115,7 +109,7 @@ def independent_log_columns(model, centers, *, aggregation="marginal"):
     return np.where(allowed, answer, -np.inf)
 
 
-def _verify_retained_bank(model, result, score):
+def _verify_retained_bank(result, score):
     """Audit the retained states and their compact refit-attempt links."""
     links = result.attempt_links
     if links is None:
@@ -125,29 +119,7 @@ def _verify_retained_bank(model, result, score):
         raise ValueError('Selected fit is not the best complete-bank score')
 
 
-def _independent_columns(model, centers, cache):
-    """Bound verifier-owned columns while retaining the current call's handles."""
-    keys = [np.asarray(center, dtype=float).tobytes() for center in centers]
-    available = {}
-    for key in keys:
-        if key in cache:
-            # Dict insertion order supplies an exact LRU without a new numerical
-            # dependency. Active columns remain alive if later inserts evict them.
-            available[key] = cache.pop(key)
-            cache[key] = available[key]
-    missing = dict((key, center) for key, center in zip(keys, centers) if key not in available)
-    if missing:
-        computed = independent_log_columns(model, np.asarray(list(missing.values())))
-        for index, key in enumerate(missing):
-            available[key] = computed[:, index].copy()
-            cache[key] = available[key]
-    maximum_columns = _VERIFY_CACHE_BYTES // (8*model.n)
-    while len(cache) > maximum_columns:
-        cache.pop(next(iter(cache)))
-    return np.column_stack([available[key] for key in keys])
-
-
-def _verify_fitted_numerics(model, fit, *, eligible=True, column_cache=None):
+def _verify_fitted_numerics(model, fit, *, eligible=True):
     """Independent read/box/weight/score checks for one exact completed state."""
     labels = np.asarray(fit.labels)
     centers, weights = np.asarray(fit.centers), np.asarray(fit.weights)
@@ -170,8 +142,7 @@ def _verify_fitted_numerics(model, fit, *, eligible=True, column_cache=None):
     for k in range(q):
         if not observed[labels == k].any(axis=0).all():
             raise ValueError('Unsupported cluster-region center cannot be published')
-    columns = (independent_log_columns(model, centers) if column_cache is None else
-               _independent_columns(model, centers, column_cache))
+    columns = independent_log_columns(model, centers)
     offset = columns.max(axis=1)
     if not np.isfinite(offset).all():
         raise ValueError('A mutation has zero read likelihood at every admissible center')
@@ -229,154 +200,18 @@ def _verify_fitted_numerics(model, fit, *, eligible=True, column_cache=None):
             'global_optimality_proven': False, 'joint_mixture_center_mle': False}
 
 
-def _neighbor_exclusion(model, labels, observed):
-    """Independent structural check in canonical group/region order."""
-    for group in range(int(labels.max())+1):
-        members = labels == group
-        for region in range(model.r):
-            if not observed[members, region].any():
-                return 'unsupported_cluster_region:'+model.region_ids[region]
-    return None
-
-
-def _verify_membership_audits(model, result, selected_numerics, column_cache):
-    """Verify complete terminal neighborhoods, exact attempt starts and scores."""
-    audits, attempts = result.membership_audits, result.attempt_outcomes
-    if not isinstance(audits, tuple) or not isinstance(attempts, tuple):
-        raise ValueError('Publication requires retained terminal membership audits and outcomes')
-    links = result.attempt_links
-    if links is None or len(attempts) != len(links):
-        raise ValueError('Membership outcomes disagree with retained refit-attempt links')
-    keys = set()
-    for attempt, link in zip(attempts, links):
-        if (not isinstance(attempt, RefitAttempt) or not isinstance(attempt.key, tuple)
-                or len(attempt.key) != 3 or attempt.key in keys
-                or (attempt.key[0], attempt.outcome == 'eligible', attempt.state_index) != link):
-            raise ValueError('Membership outcomes disagree with retained refit-attempt links')
-        keys.add(attempt.key)
-    bank = result.candidate_bank
-    best = {}
-    for candidate in bank:
-        q = len(candidate.fit.centers)
-        if q not in best or score_key(candidate) < score_key(best[q]):
-            best[q] = candidate
-    scope = result.audit_scope
-    validate_audit_scope(scope)
-    if result.diagnostics.get('audit_scope', scope) != scope:
-        raise ValueError('Membership audit scope disagrees with search diagnostics')
-    required = set(best) if scope == 'all' else {len(result.selected.fit.centers)}
-    if len(audits) != len(required):
-        raise ValueError('Terminal membership audits do not cover the requested scope')
-    numerical_policy = CandidateBank.numerical_policy
-    numerical_identity = (model.backend.policy, model.backend.identity)
-    verified = {fitted_state_fingerprint(model, result.tree, result.selected, numerical_policy):
-                selected_numerics}
-    observed = _input_observed(model)
-    seen, counts = set(), []
-    for audit in audits:
-        if (not isinstance(audit, MembershipAudit) or audit.complete is not True
-                or type(audit.occupied_q) is not int or audit.occupied_q not in required
-                or audit.occupied_q in seen or type(audit.mutation_count) is not int
-                or audit.mutation_count != model.n or not isinstance(audit.moves, tuple)):
-            raise ValueError('Invalid or incomplete terminal membership audit')
-        q = audit.occupied_q
-        parent = best[q]
-        fingerprint = fitted_state_fingerprint(model, result.tree, parent, numerical_policy)
-        if (type(audit.state_index) is not int or audit.state_index != parent.state_index
-                or audit.state_fingerprint != fingerprint or audit.model_identity != model.identity
-                or audit.numerical_policy != numerical_policy
-                or audit.numerical_identity != numerical_identity):
-            raise ValueError('Terminal membership audit has stale fitted-state or numerical identity')
-        if fingerprint not in verified:
-            verified[fingerprint] = _verify_fitted_numerics(model, parent.fit, column_cache=column_cache)
-        parent_score = verified[fingerprint]['score']
-        labels, centers = parent.fit.labels, parent.fit.centers
-        sizes = np.bincount(labels, minlength=q)
-        if len(audit.moves) != model.n*(q-1):
-            raise ValueError('Terminal membership audit has incomplete move coverage')
-        row_counts = {'occupied_q': q, 'state_index': parent.state_index,
-                      'examined_pairs': len(audit.moves), 'structural_exclusions': 0,
-                      'eligible_neighbors': 0, 'completed_ineligible_neighbors': 0,
-                      'unresolved_evaluations': 0, 'improving_eligible_neighbors': 0}
-        moves = iter(audit.moves)
-        for row in range(model.n):
-            for destination in range(q):
-                if destination == labels[row]:
-                    continue
-                move = next(moves)
-                if (not isinstance(move, SingleMove) or type(move.row) is not int
-                        or type(move.destination) is not int or (move.row, move.destination) != (row, destination)):
-                    raise ValueError('Terminal membership audit has duplicate or misordered moves')
-                if sizes[labels[row]] == 1:
-                    reason, canonical, initial = 'empty_source_cluster', None, None
-                else:
-                    proposed = labels.copy()
-                    proposed[row] = destination
-                    canonical, initial = canonical_partition(proposed, centers)
-                    reason = _neighbor_exclusion(model, canonical, observed)
-                if reason is not None:
-                    if (move.outcome != 'structural_exclusion' or move.reason != reason
-                            or move.attempt_index is not None):
-                        raise ValueError('Membership audit structural exclusion is not justified by input')
-                    row_counts['structural_exclusions'] += 1
-                    continue
-                if (type(move.attempt_index) is not int
-                        or not 0 <= move.attempt_index < len(attempts)):
-                    raise ValueError('Feasible membership move is missing its exact refit attempt')
-                attempt = attempts[move.attempt_index]
-                expected = (('general', canonical.tobytes()), initial.tobytes(), numerical_policy)
-                if (not isinstance(attempt, RefitAttempt) or attempt.key != expected
-                        or attempt.outcome != move.outcome or attempt.reason != move.reason):
-                    raise ValueError('Membership audit has mismatched refit identity or outcome')
-                if attempt.outcome == 'eligible':
-                    index = attempt.state_index
-                    if (type(index) is not int or not 0 <= index < len(bank)
-                            or attempt.fit is not None or attempt.reason is not None
-                            or bank[index].fit.membership.key != expected[0]):
-                        raise ValueError('Eligible membership neighbor lacks its retained exact state')
-                    neighbor = bank[index]
-                    key = fitted_state_fingerprint(model, result.tree, neighbor, numerical_policy)
-                    if key not in verified:
-                        verified[key] = _verify_fitted_numerics(model, neighbor.fit, column_cache=column_cache)
-                    neighbor_score = verified[key]['score']
-                    tolerance = SCORE_ATOL+SCORE_RTOL*max(abs(parent_score), abs(neighbor_score))
-                    if parent_score-neighbor_score > tolerance:
-                        raise ValueError('Terminal membership audit contains an improving eligible neighbor')
-                    row_counts['eligible_neighbors'] += 1
-                elif attempt.outcome == 'completed_ineligible':
-                    fit = attempt.fit
-                    if (attempt.state_index is not None or attempt.reason != 'zero_mixture_weight'
-                            or not isinstance(fit, FitResult) or fit.membership.key != expected[0]):
-                        raise ValueError('Ineligible neighbor lacks its completed exact refit')
-                    # Multiple ordered moves may share one canonical refit.
-                    key = ('ineligible', move.attempt_index)
-                    if key not in verified:
-                        verified[key] = _verify_fitted_numerics(model, fit, eligible=False, column_cache=column_cache)
-                    row_counts['completed_ineligible_neighbors'] += 1
-                else:
-                    raise ValueError('Feasible membership neighbor has unresolved numerical evaluation')
-        seen.add(q)
-        counts.append(row_counts)
-    counts.sort(key=lambda row: row['occupied_q'])
-    selected = next(row for row in counts if row['state_index'] == result.selected.state_index)
-    return {'complete': True, 'scope': scope, 'policy': AUDIT_POLICY, **selected,
-            'selected_count_certified': True, 'all_represented_counts_certified': seen == set(best),
-            'score_atol': SCORE_ATOL, 'score_rtol': SCORE_RTOL,
-            'represented_cluster_counts': sorted(best), 'per_q': counts}
-
-
 def verify_selected(model, result):
-    """Independently verify bank selection and the requested terminal neighborhoods.
+    """Independently verify the selected fit and candidate-bank selection.
 
     The hard-partition likelihood and assignment-validity diagnostic do not
-    replace the joint mixture score. Local closure is not global optimality.
+    replace the joint mixture score. This does not certify a local or global
+    optimum over memberships.
     """
     selected = result.selected
     fit, labels = selected.fit, selected.fit.labels
     q = len(fit.centers)
-    column_cache = {}
-    verified = _verify_fitted_numerics(model, fit, column_cache=column_cache)
-    _verify_retained_bank(model, result, verified['score'])
+    verified = _verify_fitted_numerics(model, fit)
+    _verify_retained_bank(result, verified['score'])
     cuts = tuple(e for e, (i, j) in enumerate(result.tree.edges) if labels[i] != labels[j])
     kind = selected.membership_kind
     if kind == 'tree':
@@ -386,12 +221,11 @@ def verify_selected(model, result):
             raise ValueError('Selected blocks must be connected in the frozen tree')
     elif kind != 'general' or list(dict.fromkeys(labels.tolist())) != list(range(q)):
         raise ValueError('Selected general membership must use canonical first-occurrence labels')
-    audit = _verify_membership_audits(model, result, verified, column_cache)
     return {'verification_schema_version': VERIFICATION_SCHEMA_VERSION,
             'independently_verified': True, **verified, 'membership_kind': kind,
             'connected_on_proposal_tree': len(cuts)+1 == q,
             'complete_candidate_bank_reconciled': True, 'selected_fitted_state_retained': True,
-            'independent_cached_columns': len(column_cache), 'membership_audit': audit}
+            'local_optimality_certified': False}
 
 
 def public_label_order(fit):

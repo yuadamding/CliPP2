@@ -16,11 +16,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["ruff>=0.12"]
-simulation = ["numpy==2.3.5; python_version >= '3.11'", "matplotlib>=3.7"]
 
 [project.scripts]
 clipp2 = "CliPP2.cli:main"
-clipp2-simulate = "CliPP2.simulation.__main__:main"
 
 [tool.setuptools]
 include-package-data = false

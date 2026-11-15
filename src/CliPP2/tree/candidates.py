@@ -7,14 +7,11 @@ from types import MappingProxyType
 import numpy as np
 
 from ..kernel.model import FitResult
-from ..kernel.topology import (FrozenTree, LabelKey, LabelOrder, Membership, PreparedPartition,
+from ..kernel.topology import (FrozenTree, LabelOrder, Membership, PreparedPartition,
                                canonical_partition, partition_from_cuts)
-from ..kernel.backend import ScientificCandidateRejection
 
 
 def _plain(value):
-    if isinstance(value, LabelKey):
-        return value.labels.tolist()
     if isinstance(value, (dict, MappingProxyType)):
         return {key: _plain(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -74,7 +71,7 @@ def _outcome_kind(fitted):
     if (fitted.reason == "zero_mixture_weight"
             and fitted.diagnostics.get("rejection_kind") != "weight_convergence"):
         return "completed_ineligible"
-    # An unfamiliar rejection cannot certify a required numerical evaluation.
+    # An unfamiliar rejection must not become a structural search exclusion.
     return "unresolved_numerical"
 
 
@@ -105,10 +102,9 @@ class CandidateBank:
     """Retain eligible states before advancement; cache only exact attempts."""
 
     numerical_policy = "regional_conditional_refit_v1"
-    normalize_provenance = staticmethod(_plain)
 
     def __init__(self, model, tree, *, progress=None, request_progress=None,
-                 weight_batch_size=1, device_proposals=False, audit_progress=None):
+                 weight_batch_size=1, device_proposals=False):
         if type(weight_batch_size) is not int or weight_batch_size < 1:
             raise ValueError("weight_batch_size must be a positive integer")
         if type(device_proposals) is not bool:
@@ -116,66 +112,18 @@ class CandidateBank:
         self.model, self.tree = model, tree
         self.progress = progress
         self.request_progress = request_progress
-        self.audit_progress = audit_progress
         self.candidates, self.general_rejections = [], []
         self.by_cuts, self.by_membership, self.ineligible = {}, {}, {}
         self.best_by_q, self.tree_by_q, self.best_overall = {}, {}, None
-        self.membership_attempts = {}
         self._attempts, self._states, self._structural = {}, {}, {}
         self._outcomes, self._outcome_records = {}, []
         self.duplicate_routes = self.refit_calls = 0
         self.attempt_cache_hits = self.structural_cache_hits = 0
         self.refit_seconds = 0.0
-        self.preparation_seconds = self.registration_seconds = 0.0
-        self.prepared_moves = 0
+        self.registration_seconds = 0.0
         self._tree_identity = tree.identity
         self.weight_batch_size = weight_batch_size
         self.device_proposals = device_proposals
-
-    def prepare_single_move(self, parent, row, destination, centers):
-        """Prepare only the changed groups, once, from a frozen eligible parent."""
-        if (parent.model_identity != self.model.identity
-                or parent.tree_identity != self._tree_identity):
-            raise ValueError("Single move parent belongs to another model/tree")
-        started = perf_counter()
-        self.prepared_moves += 1
-        try:
-            labels, groups = parent.labels, list(parent.groups)
-            q = len(centers)
-            if not 0 <= row < self.model.n or not 0 <= destination < q:
-                raise ValueError("Invalid single-mutation move")
-            source = int(labels[row])
-            if source == destination:
-                raise ValueError("A single move must change the assigned group")
-            members = groups[source].members
-            if len(members) == 1:
-                return None, None, "empty_source_cluster"
-            groups[source] = self.model.prepare_group(members[members != row])
-            members = groups[destination].members
-            groups[destination] = self.model.prepare_group(np.insert(members, np.searchsorted(members, row), row))
-            order = tuple(sorted(range(q), key=lambda k: int(groups[k].members[0])))
-            # Other groups were valid in the immutable eligible parent. Keep
-            # canonical group/region rejection order, including missing boxes.
-            for group in order:
-                if group in (source, destination):
-                    for region in range(self.model.r):
-                        try:
-                            self.model._coordinate_task(groups[group], region)
-                        except ScientificCandidateRejection as error:
-                            if not str(error).startswith(("unsupported_cluster_region:", "empty_cluster_region_box:")):
-                                raise
-                            return None, None, str(error)
-            key = LabelKey(labels, int(row), int(destination), order)
-            membership = Membership(label_key=key)
-            prior = tuple(None if k in (source, destination) or not parent.coordinate_fits
-                          else parent.coordinate_fits[k] for k in order)
-            group_prior = tuple(None if k in (source, destination) or not parent.group_fits
-                                else parent.group_fits[k] for k in order)
-            partition = PreparedPartition(parent.model_identity, parent.tree_identity, membership,
-                key.labels, tuple(groups[k] for k in order), prior, parent.selection_columns, group_prior)
-            return partition, np.asarray(centers)[list(order)].copy(), None
-        finally:
-            self.preparation_seconds += perf_counter()-started
 
     def prepare(self, cuts, labels=None, *, parent=None, fitted=None, columns=None):
         """Prepare one active expansion, retaining unchanged group handles.
@@ -260,8 +208,6 @@ class CandidateBank:
         found, candidate = self._cached(("general", labels.tobytes()), centers, provenance)
         if not found:
             candidate = self._consider(self.prepare(None, labels, parent=parent), centers, provenance)
-        key = candidate.fit.membership.key[1] if candidate is not None else Membership(explicit_labels=labels).key[1]
-        self.membership_attempts[(key, None if centers is None else centers.tobytes())] = candidate
         if self.progress is not None:
             self.progress(self, provenance)
         return candidate
@@ -361,11 +307,10 @@ class CandidateBank:
         return candidate
 
     def compact_payloads(self):
-        """After expansion, only indexed winners can become audit parents.
+        """Keep coordinate-reuse payloads only for indexed count winners.
 
         Preserve every state's exact centers, weights, score and membership for
-        independent verification. Release nonwinner coordinate-reuse payloads,
-        never evidence needed to select or certify a state.
+        independent verification while releasing nonwinner reuse payloads.
         """
         keep = {c.state_index for c in self.best_by_q.values()}
         for candidate in self.candidates:
@@ -428,9 +373,6 @@ class CandidateBank:
                 begin(index)
                 partition, centers, provenance, output_index = pending[index]
                 result = self._commit(partition, centers, provenance, fitted)
-                if partition.cuts is None:
-                    self.membership_attempts[(partition.membership.key[1],
-                        None if centers is None else centers.tobytes())] = result
                 results[output_index] = result
                 if self.progress is not None:
                     self.progress(self, provenance)
@@ -479,9 +421,9 @@ def _membership_size(tree, key):
                 or tuple(sorted(set(value))) != value):
             raise ValueError("Candidate bank has invalid tree cuts")
         return len(value)+1
-    if kind != "general" or not isinstance(value, (bytes, LabelKey)) or len(value) != 8*tree.n:
+    if kind != "general" or not isinstance(value, bytes) or len(value) != 8*tree.n:
         raise ValueError("Candidate bank has invalid general membership")
-    labels = value.labels if isinstance(value, LabelKey) else np.frombuffer(value, dtype=np.int64)
+    labels = np.frombuffer(value, dtype=np.int64)
     q = len(np.unique(labels))
     if list(dict.fromkeys(labels.tolist())) != list(range(q)):
         raise ValueError("Candidate bank must retain canonical occupied memberships")

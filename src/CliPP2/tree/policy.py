@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class SearchPolicy:
-    name: str = "bounded_diverse_search_v2"
+    name: str = "bounded_diverse_search_v3"
     tree_width: int = 4
     repair_width: int = 2
     split_slots: int = 32
@@ -41,4 +41,4 @@ class SearchWork:
         return {"policy": POLICY.name, "slots": dict(self.used),
                 "limits": dict(self.limits), "total_slots": sum(self.used.values()),
                 "maximum_slots": sum(self.limits.values()),
-                "excludes": ["continuation", "proposal_ranking", "terminal_audit", "verification"]}
+                "excludes": ["continuation", "proposal_ranking", "verification"]}

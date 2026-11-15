@@ -316,7 +316,7 @@ def _retained_bytes(candidates, bank):
             for candidate in candidates for field in ("labels", "centers", "weights")),
         "membership_attempt_key_bytes": sum(
             len(labels) + (0 if centers is None else len(centers))
-            for labels, centers in bank.membership_attempts),
+            for (kind, labels), centers, _ in bank._attempts if kind == "general"),
         "structural_key_bytes": sum(len(key) for kind, key in bank._structural
                                     if kind == "general"),
         "scope": "logical_array_and_key_payload_not_RSS_or_Python_overhead",

@@ -1,4 +1,4 @@
-"""Bounded tree exploration and exact-state terminal membership certification."""
+"""Bounded tree exploration and joint membership reassignment."""
 
 from dataclasses import dataclass
 from time import perf_counter
@@ -6,7 +6,7 @@ from time import perf_counter
 import numpy as np
 
 from .proposals import refine_partition
-from ..config import DEFAULT_AUDIT_SCOPE, DEFAULT_MAX_CLUSTERS, validate_audit_scope
+from ..config import DEFAULT_MAX_CLUSTERS
 from ..kernel import ALGORITHM
 from .candidates import Candidate as Candidate, CandidateBank as _CandidateBank, score_key as _score_key
 from .policy import POLICY, SearchWork
@@ -22,10 +22,6 @@ class TreeFit:
     diagnostics: dict
     attempt_links: tuple | None = None
     attempt_outcomes: tuple | None = None
-    membership_audits: tuple | None = None
-    # Legacy explicitly constructed evidence covered every q. Public fitting
-    # passes its requested scope explicitly, defaulting to selected.
-    audit_scope: str = "all"
 
     @property
     def labels(self):
@@ -344,18 +340,16 @@ def _tree_frontier(candidates):
     return chosen
 
 
-def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, progress_callback=None,
-                audit_scope=DEFAULT_AUDIT_SCOPE):
-    """Bound tree exploration, then certify the requested exact-state winners.
+def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, progress_callback=None):
+    """Select the best retained state after bounded tree and membership search.
 
     Truth is deliberately absent. Every R>=1 uses this same forest continuation,
-    conditional refitter, candidate registry and complete single-move final audit.
+    conditional refitter, candidate registry and bounded joint reassignment.
     """
     from ..kernel.solver import generate_candidates
     from .progress import ProgressReporter
 
     device_proposals = model.backend.kind == "cuda"
-    validate_audit_scope(audit_scope)
     weight_batch_size = 32 if device_proposals else 1
     continuation_batch_size = 4 if device_proposals else 1
     progress = None if progress_callback is None else ProgressReporter(model, progress_callback)
@@ -404,8 +398,7 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
         "weight_batch_size": weight_batch_size, "device_proposals": device_proposals}
     bank = (_CandidateBank(model, tree, **bank_options) if progress is None else
             _CandidateBank(model, tree, progress=progress.completed_candidate,
-                           request_progress=progress.completed_operation,
-                           audit_progress=progress.membership_audit, **bank_options))
+                           request_progress=progress.completed_operation, **bank_options))
     seeds_diagnostics, requested_seeds = [], set()
     started = perf_counter()
     for index, seed in enumerate(seeds):
@@ -480,14 +473,6 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     times["reassignment_inclusive_seconds"] = reassignment.get("seconds", 0.0)
     if progress is not None:
         progress.emit(bank, complete=True)
-        progress.start_phase("membership_audit", bank)
-    from .membership_audit import refine_memberships
-    started = perf_counter()
-    terminal_audits, audit_passes = refine_memberships(model, bank, batch_size=weight_batch_size,
-                                                      audit_scope=audit_scope)
-    times["membership_audit_inclusive_seconds"] = perf_counter()-started
-    if progress is not None:
-        progress.emit(bank, complete=True)
         progress.start_phase("selection", bank)
     selected = bank.best_overall
     if selected.score > bank.original_selected.score:
@@ -499,7 +484,6 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
         if cuts not in bank.by_cuts or not np.array_equal(partition_from_cuts(tree, cuts), labels):
             unique_partitions += 1
     times["refit_and_score_seconds"] = bank.refit_seconds
-    times["move_preparation_seconds"] = bank.preparation_seconds
     times["bank_registration_seconds"] = bank.registration_seconds
     times["fit_total_seconds"] = perf_counter() - total_started
     for name in ("scalar_refit_seconds", "weight_seconds"):
@@ -508,27 +492,21 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     if progress is not None:
         progress.requested_k, progress.occupied_q = max_clusters, len(selected.fit.centers)
         progress.emit(bank, complete=True)
-    # Count shared parent arrays once, not once per edit; this remains logical
+    # Count each retained label buffer once; this remains logical
     # retained payload, not Python containers, numerical caches, or process RSS.
     label_keys = {id(c.fit.membership.label_key): c.fit.membership.label_key
                   for c in bank.candidates if c.membership_kind == "general"}
-    label_bases = {id(key.base): key.base for key in label_keys.values()}
-    label_bytes = sum(base.nbytes for base in label_bases.values()) + sum(
-        8*len(key.order)+16 for key in label_keys.values() if key.row is not None)
+    label_bytes = sum(map(len, label_keys.values()))
     diagnostics = {
-        "diagnostics_schema_version": 3,
+        "diagnostics_schema_version": 4,
         "pipeline": ALGORITHM,
         "tree_identity": tree.identity, "tree_kind": "mutation_similarity_not_phylogeny",
         "pilots": pilot_diagnostics, "seeds": seeds_diagnostics,
         "capacities": capacities, "search_policy": POLICY.name, "search_work": work.summary(),
         "support_repairs": repairs, "frontier_counts": frontier_counts,
         "frontier_policy": "score_winner_then_uncovered_cuts_then_exact_score_key",
-        "audit_scope": audit_scope,
-        "selected_count_certified": True,
-        "all_represented_counts_certified": len(terminal_audits) == len(bank.best_by_q),
         "supported_proposals": supported_proposals,
         "reassignment": reassignment,
-        "membership_audit_passes": audit_passes,
         "original_tree_candidate_count": original_count,
         "original_tree_selected_score": bank.original_selected.score,
         "selected_membership_kind": selected.membership_kind,
@@ -544,7 +522,6 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
         "duplicate_routes": bank.duplicate_routes, "timings": times,
         "refit_calls": bank.refit_calls, "attempt_cache_hits": bank.attempt_cache_hits,
         "structural_cache_hits": bank.structural_cache_hits,
-        "prepared_single_moves": bank.prepared_moves,
         "candidate_numeric_payload_bytes": label_bytes + sum(candidate.fit.centers.nbytes
             + candidate.fit.weights.nbytes
             + (0 if candidate.fit.coordinate_fits is None else candidate.fit.coordinate_fits.nbytes)
@@ -552,9 +529,10 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
                sum(group.center.nbytes + 32 for group in candidate.fit.group_fits))
             + (8 * len(candidate.cuts) if candidate.membership_kind == "tree" else 0)
             for candidate in bank.candidates),
-        "candidate_membership_storage": "tree_cuts_or_shared_parent_single_edits_or_explicit_labels",
+        "candidate_membership_storage": "tree_cuts_or_explicit_labels",
         "selection": "minimum_over_complete_eligible_scored_bank",
+        "local_optimality_certified": False,
         "global_optimality_certified": False,
     }
     return TreeFit(selected, bank.candidates, tree, np.asarray(pilot), diagnostics,
-                   bank.compact_attempt_links(), tuple(bank._outcome_records), terminal_audits, audit_scope)
+                   bank.compact_attempt_links(), tuple(bank._outcome_records))

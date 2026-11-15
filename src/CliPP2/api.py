@@ -15,7 +15,7 @@ def process_tumor(tumor_file: str | Path, outdir: str | Path,
     """Publish the three fitted tables and return compact operational metadata.
 
     Verification uses retained objects and compact attempt links. Progress
-    callbacks receive schema-3 detached snapshots.
+    callbacks receive schema-4 detached snapshots.
     """
     from .fit_execution import fit_prepared
     from .tree.progress import ProgressReporter

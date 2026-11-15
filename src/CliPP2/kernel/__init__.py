@@ -3,5 +3,5 @@
 from ..config import SELECTION_CRITERION
 
 KERNEL_VERSION = "clipp2_regional_forest_v2"
-ALGORITHM = "regional_bounded_search_single_move_refinement_v6"
+ALGORITHM = "regional_bounded_search_v7"
 SCORE_DEFINITION = SELECTION_CRITERION

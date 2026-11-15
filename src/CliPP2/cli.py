@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .config import (DEFAULT_AUDIT_SCOPE, DEFAULT_DEVICE, DEFAULT_MAX_CLUSTERS,
+from .config import (DEFAULT_DEVICE, DEFAULT_MAX_CLUSTERS,
                      DEFAULT_MAX_MAJOR_CN, DEFAULT_MISSING_COUNTS, PROTOCOL_VERSION, FitConfig, resolve_fit_config)
 from ._version import __version__
 
@@ -39,8 +39,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fit.add_argument("--max-clusters", type=int, default=DEFAULT_MAX_CLUSTERS,
                      help="Largest occupied cluster capacity (positive integer; no fixed upper limit).")
-    fit.add_argument("--audit-scope", choices=("selected", "all"), default=DEFAULT_AUDIT_SCOPE,
-                     help="Certify the selected count, or every represented count, by complete single-mutation passes.")
     fit.add_argument("--cpu-threads", type=int, default=None,
                      help="CPU threads; fallback CLIPP2_CPU_THREADS, OMP_NUM_THREADS, then affinity/quota.")
     fit.add_argument("--run-manifest-id", help="External execution record identifier; no source scan is performed.")
@@ -82,7 +80,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
     return resolve_fit_config(device=args.device,
                               max_major_cn=args.max_major_cn, max_clusters=args.max_clusters,
-                              cpu_threads=args.cpu_threads, audit_scope=args.audit_scope,
+                              cpu_threads=args.cpu_threads,
                               fit_multiplicity=args.fit_multiplicity,
                               max_multiplicity_difference=(None if args.max_multiplicity_difference == "none" else 1))
 
@@ -94,9 +92,7 @@ def main(argv: list[str] | None = None) -> None:
         from .io.publication import publish_json
         result = audit_input(args.input_path, max_major_cn=args.max_major_cn, normal_cn_policy=args.normal_cn_policy,
                              missing_counts=args.missing_counts)
-        output = Path(args.output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        publish_json(output, json.dumps(result, indent=2, allow_nan=False) + "\n")
+        publish_json(args.output, json.dumps(result, indent=2, allow_nan=False) + "\n")
         if result["status"] != "ready":
             raise SystemExit(1)
         return

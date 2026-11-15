@@ -135,6 +135,12 @@ binomial maxima, including binomial coefficients, without prior normalization.
 
 ## Model selection and Stage 3
 
+Stages 1 and 2 select the lowest BIC in the retained candidate bank after bounded
+tree exploration and reassignment proposals. They do not run exhaustive
+single-mutation membership refinement or publish local-optimum certificates.
+Selected-fit numerical verification and candidate-bank reconciliation remain
+mandatory. Stage 3 independently verifies its fixed-reference assignments.
+
 At fitted centers, mixture weights maximize the constrained marginal likelihood:
 
 $$
@@ -166,7 +172,7 @@ residuals have been computed. Regional maxima remain explicitly regional
 diagnostics. Joint selected-component deviances and the nonnegative coupling
 profile loss distinguish the cost of coupling from independent regional fit.
 
-## Publication, replay and qualification
+## Publication and replay
 
 Current identities bind the difference setting, support normalization, pilot
 policy, group-refit policy and both fitting/selection objectives. New receipts
@@ -174,26 +180,12 @@ require the setting explicitly; older receipts cannot inherit the new default.
 
 | Contract | Version |
 | --- | --- |
-| Protocol / package | 2.5 / 2.1.0 |
+| Protocol / package | 2.5 / 2.2.0 |
+| Fit output / numerical verification | v16 / v6 |
 | Workflow plan / receipt | v7 |
 | Accepted fit / state / producer | v5 / v5 / v4 |
 | Assignment bundle / result | v7 / v10 |
-| Paired experiment / evaluation / evaluation definition | v7 |
-| Simulation study contract / aggregate | v9 / v4 |
 
-Independent Python reconstruction checks joint scores, normalization, calls,
-ties, conditional probabilities and BIC. Numerical qualification uses exhaustive
-small-state comparisons, support conflicts, finite-difference and endpoint tests,
-initializer/refit boundary cases and complete workflow replay. CPU and CUDA
-execution are separate qualification results.
-
-```sh
-clipp2 workflow --plan examples/workflow_protocol25.plan.json --output-dir results/workflow25
-python tools/check_research.py --groups joint workflow biology evaluation study publication
-python tools/compare_multiplicity_models.py --help
-```
-
-Scientific comparisons separate fixed centers, fixed partitions and full
-workflows. True regional differences greater than one are deliberate model
-misspecification cases; record their consequences rather than treating the hard
-restriction as a biological guarantee.
+Publication independently reconstructs joint scores, normalization, multiplicity
+calls, ties, conditional probabilities, and BIC. Accepted-fit replay verifies
+the saved inputs, support, configuration, and numerical state without refitting.

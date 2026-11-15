@@ -35,8 +35,7 @@ from ..config import SELECTION_CRITERION, fitting_identity
 MODEL_VERSION = "clipp2_regional_full_support__general_normal_v1__single_state_cn_v1"
 INTERVAL_MODEL_VERSION = MODEL_VERSION + "__multiplicity_intervals_v1"
 
-# Exact caches accelerate repeated work, but exhaustive neighborhoods contain
-# O(N) distinct groups and columns. Their working payload must not grow as N².
+# Bound repeated group and column payloads independently of the search size.
 MODEL_CACHE_BYTES = 16 * 1024 * 1024
 
 
@@ -1094,19 +1093,3 @@ class RegionalModel:
                                  fitting_log_likelihood=fitting_ll,
                                  fit_objective_id=self.method_identity["fit_objective_id"],
                                  selection_criterion_id=self.method_identity["selection_criterion_id"])
-
-    def score_frozen_centers(self, centers, labels, selection_columns=None):
-        """Score supplied centers without calling any center optimizer."""
-        centers = readonly_array(self._validate_centers(centers))
-        labels = np.asarray(labels)
-        if (labels.shape != (self.n,) or labels.dtype.kind not in "iu"
-                or not np.array_equal(np.unique(labels), np.arange(len(centers)))):
-            raise ValueError("Frozen-center labels must occupy every supplied center")
-        columns = self.selection_column_set(centers, retained_columns=selection_columns)
-        conditional = math.fsum(columns.assigned_values(labels))
-        mixture = self._weight_result(columns, np.bincount(labels))
-        penalty = float((len(centers)*self.r+len(centers)-1)*math.log(self.n))
-        return {"centers": centers, "conditional_log_likelihood": conditional,
-                "mixture_log_likelihood": mixture["log_likelihood"],
-                "weights": mixture["cluster_weights"], "complexity_penalty": penalty,
-                "score": -2*mixture["log_likelihood"]+penalty}
