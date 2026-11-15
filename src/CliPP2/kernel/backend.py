@@ -1,4 +1,4 @@
-"""Source-bound emissions/refits and explicitly owned CUDA column/score leases."""
+"""ABI-checked emissions/refits and explicitly owned CUDA column/score leases."""
 import ctypes as ct
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,7 +10,6 @@ from pathlib import Path
 
 import numpy as np
 
-from .build_identity import NATIVE_SOURCES, backend_identity, native_identity as _native_identity
 from .execution import resolve_cpu_threads
 
 
@@ -195,10 +194,10 @@ class NativeBackend:
             function.argtypes, function.restype = args, result
         # Check the observation contract before resolving newly introduced
         # symbols or passing any buffers to a possibly older binary.
+        if lib.CliPP2BackendABI() != BACKEND_ABI:
+            raise NativeExecutionError(f"Incompatible native {kind} ABI; rebuild CliPP2")
         self.identity = lib.CliPP2BackendBuildId().decode()
         self.policy = lib.CliPP2BackendNumericalPolicy().decode()
-        if lib.CliPP2BackendABI() != BACKEND_ABI or self.identity != backend_identity(kind):
-            raise NativeExecutionError(f"Stale or incompatible native {kind} library; rebuild CliPP2")
         for name, args in {
             "Nodes": [ct.c_void_p, ct.c_int64, _D, ct.c_int, _D, _D, _D, _B],
             "Cells": [ct.c_void_p, ct.c_int64, _I, _D, ct.c_int, _D, _D, _D, _B],
@@ -331,11 +330,7 @@ class NativeBackend:
         return self
 
     def __exit__(self, *_):
-        try:
-            if self.context and self.identity != backend_identity(self.kind):
-                raise NativeExecutionError("Native backend source changed during execution")
-        finally:
-            self.close()
+        self.close()
 
     def __del__(self):
         try:
@@ -713,18 +708,15 @@ class NativeBackend:
 NATIVE_ABI = 9
 
 def native_library():
-    root = Path(__file__).resolve().parent.parent
-    path = _extension_path(root / 'kernel', '_native')
+    path = _extension_path(Path(__file__).resolve().parent, '_native')
     if path is None:
         raise NativeExecutionError('Install CliPP2 (pip install .) to build its native kernel')
-    signature = tuple((info.st_mtime_ns, info.st_ctime_ns, info.st_size)
-                      for p in (path, *(root/name for name in NATIVE_SOURCES)) for info in (p.stat(),))
-    return _load_library(root, path, signature)
+    info = path.stat()
+    return _load_library(path, (info.st_mtime_ns, info.st_ctime_ns, info.st_size))
 
 
 @lru_cache(maxsize=4)
-def _load_library(root, path, signature):
-    digest = _native_identity(root)
+def _load_library(path, signature):
     library = ct.CDLL(str(path))
     library.CliPP2KernelABI.argtypes = []
     library.CliPP2KernelABI.restype = ct.c_int
@@ -732,17 +724,16 @@ def _load_library(root, path, signature):
     library.CliPP2KernelBuildId.restype = ct.c_char_p
     library.CliPP2KernelLastError.argtypes = []
     library.CliPP2KernelLastError.restype = ct.c_char_p
-    if library.CliPP2KernelABI() != NATIVE_ABI or library.CliPP2KernelBuildId().decode() != digest:
-        raise NativeExecutionError('CliPP2 kernel binary/source or ABI mismatch; rebuild before fitting')
-    return library, digest
+    if library.CliPP2KernelABI() != NATIVE_ABI:
+        raise NativeExecutionError('Incompatible CliPP2 kernel ABI; rebuild before fitting')
+    return library, library.CliPP2KernelBuildId().decode()
 
 
 class PreparedForest:
-    """Source-bound host-controller buffers, borrowed until the next solve.
+    """ABI-checked host-controller buffers, borrowed until the next solve.
 
     The numerical C entry still admits and releases its native allocations on
     every call. Only the caller-owned output and verified binding are retained.
-    Source identity is rechecked before leaving the continuation batch.
     """
     def __init__(self, n, regions):
         self.shape = n, regions
@@ -760,8 +751,6 @@ class PreparedForest:
             return
         self.closed = True
         self.result = self.diagnostics = None
-        if native_library()[1] != self.identity:
-            raise NativeExecutionError('Native forest source changed during continuation')
 
     def __exit__(self, *_):
         self.close()

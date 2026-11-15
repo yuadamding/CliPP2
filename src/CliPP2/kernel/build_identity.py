@@ -1,4 +1,4 @@
-"""Stdlib-only build identity, shared by packaging and runtime validation."""
+"""Stdlib-only source identities for compilation and explicit qualification."""
 import hashlib
 from pathlib import Path
 

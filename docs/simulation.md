@@ -93,22 +93,23 @@ new command-line settings do not replace them. Completed cells are reused.
 `--retry-failed` reruns execution failures as new attempts, retaining old
 attempts, completion records, and costs. Development retries append revised assessment receipts while preserving earlier
 receipts. There is no scientific-performance selection to reopen. Package
-version 2.0.0 uses simulation contract v7 with explicit replicate blocks. It binds the entire parsed cohort
+version 2.0.0 uses simulation contract v8 with explicit replicate blocks. It binds the entire parsed cohort
 settings to a `cohort_content_id` in contracts, jobs, physical histories,
-acquisitions, and qualification receipts. Formatting and object-key order do not
+and acquisitions. Formatting and object-key order do not
 affect this identity; values and list order do. Resume verifies the frozen
 settings at coordinator execution boundaries before reusing work. Each worker
 then reuses its validated immutable snapshot; a new process loads and verifies
 it again. Semantic random seeds remain unchanged.
 
-Existing v1–v6 study contracts retain their original frozen installations and outputs.
+Existing v1–v7 study contracts retain their original frozen installations and outputs.
 They are not migrated, and missing historical identity is not retrofitted. A new execution
-under 2.0.0 requires a new directory. Qualification has separate numbered
-mechanism/cohort attempts; validated published summaries can complete an
-interrupted wrapper without rerunning controls. Interrupted costs without a
-summary remain explicitly unknown. Reports use new directories.
+under 2.0.0 requires a new directory. Controls run explicitly through
+`qualify` or the research control functions, independently of study execution.
+Historical qualification receipts remain readable for cost reporting but do not
+gate execution or resume. Interrupted costs remain explicitly unknown. Reports
+use new directories.
 
-New studies save `main_roster.json` before qualification and development. Its
+New studies save `main_roster.json` before development. Its
 identity is independent of worker count. The contract also declares the development
 population. `development_assessment.json` binds the fixed workflow configuration,
 study contract, main roster, every planned development cell, its retained evaluation

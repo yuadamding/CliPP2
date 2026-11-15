@@ -177,16 +177,18 @@ class AcceptedFit(ImmutableArrayRecord):
         """Reject changed input content before any new search or numerical reuse."""
         from .provenance import validate_fit_execution_receipt, validate_run_manifest
         producer = self.producer_receipt
-        if original_config is None:
-            original_config = validate_fit_execution_receipt(producer.get("fit_config"), producer.get("execution"))
         if self.tumor_id != catalog.tumor_id or content_hash(self.biological_identity) != content_hash(catalog.biological_identity):
             raise ValueError("Historical fit belongs to different biological input identities")
         manifest = producer.get("run_manifest")
         validate_run_manifest(manifest, tumor_id=catalog.tumor_id, biological_identity=self.biological_identity)
+        if original_config is None:
+            original_config = validate_fit_execution_receipt(producer.get("fit_config"), producer.get("execution"),
+                                                             build=manifest.get("build"))
         if manifest["input_identity"].get("original_catalog_identity") not in catalog.compatible_source_identities(original_config.max_major_cn):
             raise ValueError("Historical run manifest belongs to different original input content")
         if self.biological_hash != _biological_hash(catalog, self.mutation_ids):
             raise ValueError("Historical denominators, masks, mapping, or observations differ")
+        return original_config
 
     def validate(self, catalog, *, expected_ids=None, expected_support=None, device="cpu", cpu_threads=None, run_manifest_id=None):
         """Retain the originating state with a separate current compatibility check.
@@ -197,16 +199,10 @@ class AcceptedFit(ImmutableArrayRecord):
         from .io.reporting import _verify_fitted_numerics
         from .kernel.model import FitResult, RegionalModel
         from .kernel.topology import Membership
-        if self.tumor_id != catalog.tumor_id:
-            raise ValueError("Accepted fit belongs to a different originating tumor")
-        from .provenance import (resolve_current_run_manifest_id, validate_fit_execution_receipt,
-                                 validate_inherited_audit)
+        from .provenance import resolve_current_run_manifest_id, validate_inherited_audit
         from .kernel import ALGORITHM, KERNEL_VERSION
         from .kernel.model import MODEL_VERSION, INTERVAL_MODEL_VERSION
         run_manifest_id = resolve_current_run_manifest_id(run_manifest_id)
-        if (not isinstance(self.biological_identity, Mapping)
-                or content_hash(self.biological_identity) != content_hash(catalog.biological_identity)):
-            raise ValueError("Historical tumor, regional mapping, mutation convention, or reference build differs")
         producer = self.producer_receipt
         if (not isinstance(producer, Mapping) or producer.get("schema") not in ("clipp2.fit-producer.v2", "clipp2.fit-producer.v3")
                 or producer.get("protocol_version") != self.protocol_version
@@ -221,13 +217,10 @@ class AcceptedFit(ImmutableArrayRecord):
                 or not isinstance(producer.get("execution"), Mapping)
                 or producer.get("model_identity") != self.model_identity):
             raise ValueError("Historical fit lacks its original execution/configuration receipt")
-        from .provenance import validate_run_manifest
-        validate_run_manifest(producer.get("run_manifest"), tumor_id=catalog.tumor_id,
-                              biological_identity=self.biological_identity)
+        original_config = self.validate_input_identity(catalog)
         if producer.get("run_manifest_id") != producer["run_manifest"]["run_manifest_id"]:
             raise ValueError("Original producer run manifest link differs from its input binding")
         build = producer["run_manifest"].get("build")
-        original_config = validate_fit_execution_receipt(producer["fit_config"], producer["execution"], build=build)
         from .config import fitting_identity
         identity = fitting_identity(original_config.fit_multiplicity, original_config.selection_criterion)
         if self.method_identity != identity:
@@ -248,7 +241,6 @@ class AcceptedFit(ImmutableArrayRecord):
             if (artifact["protocol_version"] != producer["protocol_version"]
                     or artifact["implementation_version"] != producer["implementation_version"]):
                 raise ValueError("Original run/build manifest disagrees with producer execution identity")
-        self.validate_input_identity(catalog, original_config)
         if tuple(self.region_ids) != tuple(catalog.region_ids):
             raise ValueError("Historical fit has different requested regions")
         if expected_ids is not None and set(self.mutation_ids) != set(expected_ids):

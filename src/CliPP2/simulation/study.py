@@ -344,88 +344,6 @@ def _publish_development_assessment(root, assessment):
     return path
 
 
-def _qualification_summary(output, summary_name):
-    """Validate a passed control summary and its published output inventory."""
-    output = Path(output)
-    summary = read_json(output / summary_name)
-    ledger = summary.get("cost_ledger", {})
-    passes = ledger.get("assignment_pass_count")
-    if (summary.get("status") != "passed" or ledger.get("fit_count") != 0
-            or type(passes) is not int or passes < 0
-            or any(event.get("status") != "complete" for event in ledger.get("events", []))):
-        raise ValueError("Qualification summary is not a completed zero-fit control result")
-    receipts = list(output.rglob("*assignment_summary.json"))
-    if len(receipts) != passes:
-        raise ValueError("Qualification assignment publications do not match its cost summary")
-    for receipt in receipts:
-        record = read_json(receipt)
-        if record.get("manifest_schema") != "clipp2.file-list.v1" or not record.get("files"):
-            raise ValueError("Qualification publication lacks an output inventory")
-        for name in record["files"]:
-            path = (receipt.parent / name).resolve()
-            if not path.is_relative_to(output.resolve()) or not path.is_file():
-                raise ValueError("Qualification publication output is missing or outside its step")
-    for name in summary.get("paths", []):
-        path = (output / name).resolve()
-        if not path.is_relative_to(output.resolve()) or not path.is_file():
-            raise ValueError("Qualification summary output is missing or outside its step")
-    return summary
-
-
-def _qualification_step(root, name, runner, *, summary_name, identity, retry_failed=False):
-    """Retain numbered control attempts and recover published success without rerun."""
-    directory = Path(root) / "qualification_steps" / name
-    directory.mkdir(parents=True, exist_ok=True)
-    binding = dict(step=name, protocol_version=PROTOCOL_VERSION, implementation_version=__version__, **identity)
-    attempts = sorted(directory.glob("attempt-*"))
-
-    def completed(attempt, summary, recovered=False):
-        receipt = dict(schema="clipp2.qualification-step.v1", status="passed", identity=binding,
-            attempt=attempt.name, summary_name=summary_name, summary_content_id=content_hash(summary),
-            recovered_from_summary=recovered, cost_status="known", cost_ledger=summary["cost_ledger"])
-        save_json(attempt / "completion.json", receipt)
-        return receipt
-
-    if attempts and (attempts[-1] / "started.json").exists():
-        prior = attempts[-1]
-        started = read_json(prior / "started.json")
-        if started.get("identity") != binding:
-            raise ValueError("Qualification step identity differs from its original attempt")
-        completion = prior / "completion.json"
-        if completion.exists():
-            receipt = read_json(completion)
-            if receipt.get("identity") != binding:
-                raise ValueError("Qualification completion identity differs")
-            if receipt["status"] == "passed":
-                summary = _qualification_summary(prior / "output", summary_name)
-                if receipt["summary_content_id"] != content_hash(summary):
-                    raise ValueError("Completed qualification summary content changed")
-                return receipt
-            if not retry_failed:
-                raise RuntimeError(f"Qualification step {name} failed; use --retry-failed for a retained new attempt")
-        elif (prior / "output" / summary_name).exists():
-            try:
-                summary = _qualification_summary(prior / "output", summary_name)
-            except (ValueError, OSError):
-                pass  # Incomplete outputs are retained; a new attempt gets a fresh directory.
-            else:
-                return completed(prior, summary, recovered=True)
-        # An incomplete attempt without a cost summary remains unknown-cost evidence.
-    attempt = directory / f"attempt-{len(attempts)+1:03d}"
-    attempt.mkdir()
-    save_json(attempt / "started.json", dict(schema="clipp2.qualification-step.v1", status="started",
-        identity=binding, attempt=attempt.name, summary_name=summary_name, cost_status="unknown"))
-    try:
-        runner(attempt / "output")
-        summary = _qualification_summary(attempt / "output", summary_name)
-        return completed(attempt, summary)
-    except Exception as error:
-        save_json(attempt / "completion.json", dict(schema="clipp2.qualification-step.v1", status="failed",
-            identity=binding, attempt=attempt.name, summary_name=summary_name,
-            error_type=type(error).__name__, error=str(error), cost_status="unknown", cost_ledger=None))
-        raise
-
-
 def execute(root, contract, *, resume=False, retry_failed=False):
     import fcntl
     root = Path(root).resolve()
@@ -481,42 +399,6 @@ def _execute(root, contract, *, resume=False, retry_failed=False):
             _verify_cohort_snapshot(frozen_cohort, contract["cohort"]["content_id"])
         save_json(root / "study_contract.json", contract)
     main_roster = _freeze_main_roster(root, contract)
-    qualification_path = root / "qualification.json"
-    if qualification_path.exists():
-        existing = read_json(qualification_path)
-        cohort_id = contract["cohort"]["content_id"] if contract.get("cohort") else None
-        expected_steps = {"mechanisms", "cohort"} if contract.get("cohort") else {"mechanisms"}
-        if (existing.get("cohort_content_id") != cohort_id
-                or existing.get("protocol_version") != PROTOCOL_VERSION
-                or set(existing.get("controls", {})) != expected_steps):
-            raise ValueError("Qualification aggregate differs from the frozen study identity")
-        for name, receipt in existing["controls"].items():
-            expected = dict(step=name, protocol_version=PROTOCOL_VERSION,
-                            implementation_version=__version__, cohort_content_id=cohort_id)
-            attempt = root / "qualification_steps" / name / receipt["attempt"]
-            if (receipt.get("identity") != expected or receipt.get("status") != "passed"
-                    or read_json(attempt / "completion.json") != receipt
-                    or content_hash(_qualification_summary(attempt / "output", receipt["summary_name"]))
-                    != receipt["summary_content_id"]):
-                raise ValueError("Qualification aggregate is not backed by matching completed steps")
-    if not qualification_path.exists():
-        from .biology import generate_history
-        from .controls import run_controls
-        for family in contract["families"]:
-            for variant in range(3):
-                generate_history(family, variant+100, n_mutations=60, n_segments=6, n_regions=4).validate()
-        binding = dict(cohort_content_id=contract["cohort"]["content_id"] if contract.get("cohort") else None)
-        controls = dict(mechanisms=_qualification_step(root, "mechanisms", run_controls,
-            summary_name="controls_summary.json", identity=binding, retry_failed=retry_failed))
-        if contract.get("cohort"):
-            from .controls import run_cohort_controls
-            controls["cohort"] = _qualification_step(root, "cohort", lambda output: run_cohort_controls(
-                _cohort(contract["cohort"]["path"], contract["cohort"]["content_id"]), output),
-                summary_name="cohort_controls_summary.json", identity=binding, retry_failed=retry_failed)
-        save_json(qualification_path, dict(physical_histories_validated=36, controls=controls,
-            cohort_content_id=binding["cohort_content_id"],
-            protocol_version=PROTOCOL_VERSION, source_cohort_protocol_version=contract.get("source_cohort_protocol_version"),
-            numerical_policy=f"Every native fit and assignment retains the independent Protocol {PROTOCOL_VERSION} verification receipt"))
     workers = contract["resource_limits"]["workers"]
     development_cells = run_jobs(root, jobs(contract, "development"), workers=workers, contract=contract,
                                  retry_failed=retry_failed)

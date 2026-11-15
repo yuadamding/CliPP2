@@ -1,10 +1,9 @@
-"""Source-bound research comparisons of profile fitting / marginal selection.
+"""Research comparisons of profile fitting / marginal selection.
 
 Truth, when supplied, is consumed only after fitting. No method-default change,
 cohort launch, retries, threshold relaxation, or inference truth access occurs.
 """
 from dataclasses import asdict, replace
-import hashlib
 import json
 from pathlib import Path
 import time
@@ -21,14 +20,10 @@ from CliPP2.tree.selection import fit_regions
 
 
 def source_record():
-    from CliPP2.kernel.build_identity import backend_identity, native_identity
     import CliPP2
     root = Path(CliPP2.__file__).resolve().parent
-    files = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
-             for p in sorted(root.rglob("*")) if p.is_file() and p.suffix in (".py", ".cpp", ".h", ".cu", ".cuh")}
-    return dict(package=str(root), inventory=files, interpreter=__import__("sys").executable,
-                native_build_id=native_identity(), cpu_build_id=backend_identity("cpu"),
-                cuda_build_id=backend_identity("cuda"))
+    return dict(package=str(root), implementation_version=CliPP2.__version__,
+                interpreter=__import__("sys").executable)
 
 
 def biological_metrics(model, labels, centers, truth):
@@ -144,8 +139,6 @@ def compare_data(data, output, config, *, scope="search", partitions=None, state
                         else dict(eligible=False, reason=fit.reason))
                 result["comparisons"].append(record)
         result["execution"] = {method: model.execution_diagnostics() for method, model in models.items()}
-    if source_record() != result["source"]:
-        raise RuntimeError("Comparison source changed during execution")
     with (output/"comparison.json").open("x") as stream:
         json.dump(json_value(result), stream, indent=2, allow_nan=False)
         stream.write("\n")
@@ -202,8 +195,6 @@ def compare_workflow(input_path, output, config, *, truth=None):
                     accepted.score, True, fitting_log_likelihood=accepted.fitting_log_likelihood,
                     fit_objective_id=accepted.method_identity["fit_objective_id"])
                 native_results[mode][stage] = describe(model, fit, truth)
-    if source_record() != source_binding:
-        raise RuntimeError("Workflow comparison source changed during execution")
     result = dict(scope="workflow", source=source_binding, fixed_stage_one_fingerprint=frozen.state_fingerprint,
         frozen_stage_two_remainder=remainder, frozen_stage_two_support=bounds.subset(remainder).to_dict() if remainder else None,
         isolated_stage_two=isolated,

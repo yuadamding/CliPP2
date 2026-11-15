@@ -53,8 +53,6 @@ def fit_prepared(data, outdir, config, *, multiplicity_support=None,
     input_seconds = perf_counter()-started
     try:
         build = None if run_manifest is None else run_manifest.get('build')
-        if build is not None and build['artifact'][model.backend.kind + '_build_id'] != model.backend.identity:
-            raise ValueError('External build record differs from the executing native backend')
         if progress is not None:
             progress.model = model
             progress.emit(complete=True)

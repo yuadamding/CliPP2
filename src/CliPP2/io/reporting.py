@@ -29,8 +29,8 @@ _VERIFY_ROWS = 4096
 _VERIFY_CENTERS = 32
 _VERIFY_CACHE_BYTES = 16 * 1024 * 1024
 
-def _input_boxes(model):
-    """Read support and all-member boxes from input, never runtime caches."""
+def _input_observed(model):
+    """Read observation eligibility from input, never runtime caches."""
     data = model.data
     ix = np.ix_(model.active_indices, model.region_indices)
     depth = data.total_counts[ix]
@@ -38,28 +38,17 @@ def _input_boxes(model):
     if data.count_observed is not None:
         observed &= np.asarray(data.count_observed, dtype=bool)[ix]
     observed &= ~data.input_excluded[ix]
-    return observed, np.zeros(observed.shape), np.ones(observed.shape)
+    return observed
 
 
 def _input_domain(model, centers):
-    """Rebuild observations and closed boxes independently of runtime caches."""
+    """Check the common [0,1] domain independently of runtime caches."""
     centers = np.asarray(centers, dtype=float)
     if (centers.ndim != 2 or not len(centers) or centers.shape[1] != model.r
             or not np.isfinite(centers).all()):
         raise ValueError('Centers must be finite nonempty q by R CCFs')
-    observed, lower, upper = _input_boxes(model)
-    allowed = np.ones((model.n, len(centers)), dtype=bool)
-    # Keep validity independent of fitting caches without an N-by-q-by-R
-    # temporary. Missing observations still impose their original bounds.
-    for region in range(model.r):
-        for start in range(0, model.n, _VERIFY_ROWS):
-            rows = slice(start, start+_VERIFY_ROWS)
-            for first in range(0, len(centers), _VERIFY_CENTERS):
-                cols = slice(first, first+_VERIFY_CENTERS)
-                values = centers[cols, region][None, :]
-                allowed[rows, cols] &= ((values >= lower[rows, region, None])
-                                        & (values <= upper[rows, region, None]))
-    return observed, allowed
+    valid = np.all((centers >= 0) & (centers <= 1), axis=1)
+    return _input_observed(model), np.broadcast_to(valid, (model.n, len(centers)))
 
 
 def independent_log_columns(model, centers, *, aggregation="marginal"):
@@ -232,15 +221,13 @@ def _verify_fitted_numerics(model, fit, *, eligible=True, column_cache=None):
             'global_optimality_proven': False, 'joint_mixture_center_mle': False}
 
 
-def _neighbor_exclusion(model, labels, observed, lower, upper):
+def _neighbor_exclusion(model, labels, observed):
     """Independent structural check in canonical group/region order."""
     for group in range(int(labels.max())+1):
         members = labels == group
         for region in range(model.r):
             if not observed[members, region].any():
                 return 'unsupported_cluster_region:'+model.region_ids[region]
-            if lower[members, region].max() > upper[members, region].min():
-                return 'empty_cluster_region_box:'+model.region_ids[region]
     return None
 
 
@@ -277,7 +264,7 @@ def _verify_membership_audits(model, result, selected_numerics, column_cache):
     numerical_identity = (model.backend.policy, model.backend.identity)
     verified = {fitted_state_fingerprint(model, result.tree, result.selected, numerical_policy):
                 selected_numerics}
-    observed, lower, upper = _input_boxes(model)
+    observed = _input_observed(model)
     seen, counts = set(), []
     for audit in audits:
         if (not isinstance(audit, MembershipAudit) or audit.complete is not True
@@ -319,7 +306,7 @@ def _verify_membership_audits(model, result, selected_numerics, column_cache):
                     proposed = labels.copy()
                     proposed[row] = destination
                     canonical, initial = canonical_partition(proposed, centers)
-                    reason = _neighbor_exclusion(model, canonical, observed, lower, upper)
+                    reason = _neighbor_exclusion(model, canonical, observed)
                 if reason is not None:
                     if (move.outcome != 'structural_exclusion' or move.reason != reason
                             or move.attempt_index is not None):
@@ -465,9 +452,6 @@ def publish(model, result, outdir, tumor_id, *, progress=None):
         for suffix, table in tables.items():
             name = tumor_id+'_'+suffix
             table.to_csv(staged/name, sep='\t', index=False, float_format='%.17g', na_rep='NA')
-            parsed = pd.read_csv(staged/name, sep='\t', dtype=str, keep_default_na=False)
-            if list(parsed.columns) != list(table.columns) or len(parsed) != len(table):
-                raise ValueError('Staged TSV did not round-trip its schema and row count')
             files.append(name)
         for name in files:
             os.link(staged/name, outdir/name)

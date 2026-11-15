@@ -82,9 +82,6 @@ def write_supporting_table(path, records, *, columns=None):
     with tempfile.TemporaryDirectory(prefix=".clipp2-table-", dir=path.parent) as temporary:
         staged = Path(temporary) / path.name
         frame.to_csv(staged, sep="\t", index=False, float_format="%.17g", na_rep="NA")
-        parsed = pd.read_csv(staged, sep="\t", dtype=str, keep_default_na=False)
-        if len(parsed) != len(frame) or list(parsed.columns) != list(frame.columns):
-            raise ValueError("Supporting TSV did not round-trip its schema/cardinality")
         os.link(staged, path)
     return path
 

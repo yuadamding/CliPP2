@@ -119,8 +119,10 @@ CPU/CUDA share the branch-search policy. CUDA executes its emissions, objectives
 roots and columns on-device; the existing forest/controller remains on the host.
 Device branch derivatives reuse the ordered block reducer instead of duplicating
 the recursive scalar reduction in every lane.
-Stale/absent native libraries fail explicitly, with no silent objective/device
-fallback. CUDA execution requires its own allocated-device qualification; a CPU
+Absent or ABI-incompatible native libraries fail explicitly, with no silent
+objective/device fallback. Loading records the executing binary's embedded build
+ID; source hashes are computed at compilation, not checked at runtime. Rebuild
+after native source changes. CUDA execution requires its own allocated-device qualification; a CPU
 test or a successful CUDA compilation is not GPU numerical evidence.
 
 ## Qualification and research comparisons

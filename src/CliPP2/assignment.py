@@ -305,9 +305,6 @@ class AssignmentBundle(ImmutableArrayRecord):
         payload = self.to_dict()
         if content_hash(payload) != self._content_hash:
             raise ValueError("Assignment bundle live content differs from its frozen identity")
-        restored = type(self).from_dict(payload)
-        if restored.content_hash != self._content_hash:
-            raise ValueError("Assignment bundle no longer has its canonical validated identity")
         return payload
 
     def validate_integrity(self):

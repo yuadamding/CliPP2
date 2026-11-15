@@ -6,7 +6,6 @@ from copy import deepcopy
 from dataclasses import asdict
 import json
 from pathlib import Path
-from types import SimpleNamespace
 import shutil
 import tempfile
 from unittest.mock import patch
@@ -21,7 +20,7 @@ from CliPP2.simulation.biology import generate_history
 from CliPP2.simulation import controls
 from CliPP2.simulation.design import jobs, roster_counts, make_contract, workflow_config
 from CliPP2.simulation.runtime import qualification_costs, recorded_costs, status
-from CliPP2.simulation.study import (_execute, _paired_result, _prepare_histories, _qualification_step,
+from CliPP2.simulation.study import (_execute, _paired_result, _prepare_histories,
                                     _run_cell, read_json, report, save_json)
 
 
@@ -992,83 +991,37 @@ def _structured_failure_checks(root):
             assert completion.read_bytes() == prior
 
 
-def _qualification_lifecycle_checks(root, contract):
-    def passed(output, summary="controls_summary.json"):
-        save_json(output / "evidence.json", dict(checked=True))
-        save_json(output / summary, dict(status="passed", paths=["evidence.json"],
-            cost_ledger=dict(fit_count=0, assignment_pass_count=0, events=[])))
-    def interrupted(output):
-        save_json(output / "partial.json", dict(started=True))
-        raise KeyboardInterrupt("fixture interruption")
-    for name in ("mechanisms", "cohort"):
-        directory = root / (name + "_interruption")
-        kwargs = dict(summary_name="controls_summary.json", identity=dict(cohort_content_id="fixture"))
-        try:
-            _qualification_step(directory, name, interrupted, **kwargs)
-        except KeyboardInterrupt:
-            pass
-        completed = _qualification_step(directory, name, passed, **kwargs)
-        assert completed["attempt"] == "attempt-002"
-        assert qualification_costs(directory)["unknown_cost_attempts"] == 1
-        recovered_root = root / (name + "_published")
-        def published_then_interrupted(output):
-            passed(output)
-            raise KeyboardInterrupt("summary published")
-        try:
-            _qualification_step(recovered_root, name, published_then_interrupted, **kwargs)
-        except KeyboardInterrupt:
-            pass
-        with patch("builtins.print"):
-            recovered = _qualification_step(recovered_root, name,
-                lambda p: (_ for _ in ()).throw(AssertionError("completed controls reran")), **kwargs)
-        assert recovered["recovered_from_summary"] and recovered["attempt"] == "attempt-001"
-        assert qualification_costs(recovered_root)["unknown_cost_attempts"] == 0
-        (recovered_root / "qualification_steps" / name / "attempt-001" / "output" / "evidence.json").unlink()
-        try:
-            _qualification_step(recovered_root, name, passed, **kwargs)
-        except ValueError:
-            pass
-        else:
-            raise AssertionError("Completed qualification reused missing outputs")
-    failed_root = root / "recorded_failure"
-    kwargs = dict(summary_name="controls_summary.json", identity=dict(cohort_content_id="fixture"))
-    try:
-        _qualification_step(failed_root, "mechanisms", lambda p: (_ for _ in ()).throw(ValueError("failed")), **kwargs)
-    except ValueError:
-        pass
-    try:
-        _qualification_step(failed_root, "mechanisms", passed, **kwargs)
-    except RuntimeError as error:
-        assert "--retry-failed" in str(error)
-    else:
-        raise AssertionError("Recorded qualification failure retried implicitly")
-    assert _qualification_step(failed_root, "mechanisms", passed, retry_failed=True, **kwargs)["attempt"] == "attempt-002"
-    aggregate_root = root / "before_aggregate"
+def _independent_controls_checks(root, contract):
     frozen = deepcopy(contract)
-    original_save = save_json
-    def interrupt_aggregate(path, payload):
-        if Path(path).name == "qualification.json":
-            raise KeyboardInterrupt("before aggregate publication")
-        return original_save(path, payload)
-    with patch("CliPP2.simulation.biology.generate_history", return_value=SimpleNamespace(validate=lambda: None)), \
-            patch.object(controls, "run_controls", side_effect=passed), \
-            patch.object(controls, "run_cohort_controls", side_effect=lambda c, p: passed(p, "cohort_controls_summary.json")), \
-            patch("CliPP2.simulation.study.save_json", side_effect=interrupt_aggregate):
-        try:
-            _execute(aggregate_root, frozen)
-        except KeyboardInterrupt:
-            pass
-    with patch("CliPP2.simulation.biology.generate_history", return_value=SimpleNamespace(validate=lambda: None)), \
-            patch.object(controls, "run_controls", side_effect=AssertionError("mechanisms reran")), \
-            patch.object(controls, "run_cohort_controls", side_effect=AssertionError("cohort reran")), \
-            patch("CliPP2.simulation.study.run_jobs", side_effect=RuntimeError("stop after qualification")):
-        try:
-            _execute(aggregate_root, frozen, resume=True)
-        except RuntimeError as error:
-            assert str(error) == "stop after qualification"
-    receipt = read_json(aggregate_root / "qualification.json")
-    assert receipt["cohort_content_id"] == contract["cohort"]["content_id"]
-    assert all(value["status"] == "passed" for value in receipt["controls"].values())
+    with patch.object(controls, "run_controls", side_effect=AssertionError("automatic controls")), \
+            patch.object(controls, "run_cohort_controls", side_effect=AssertionError("automatic cohort controls")), \
+            patch("CliPP2.simulation.study.run_jobs", return_value=[]) as run, \
+            patch("CliPP2.simulation.study.run_optional_panels"), \
+            patch("CliPP2.simulation.study.report", return_value={"status": "fixture"}) as summarize:
+        assert _execute(root, frozen) == {"status": "fixture"}
+        assert run.call_count == 2 and summarize.call_count == 1
+        assert not (root / "qualification.json").exists()
+        assert not (root / "qualification_steps").exists()
+        roster = (root / "main_roster.json").read_bytes()
+        assessment = (root / "development_assessment.json").read_bytes()
+        # Old failed/interrupted controls are evidence, not a study admission gate.
+        historical = root / "qualification.json"
+        completed = root / "qualification_steps" / "mechanisms" / "attempt-001" / "completion.json"
+        interrupted = root / "qualification_steps" / "cohort" / "attempt-001" / "started.json"
+        save_json(historical, dict(status="failed", historical=True))
+        save_json(completed, dict(status="failed",
+            cost_ledger=dict(fit_count=0, assignment_pass_count=2, events=[])))
+        save_json(interrupted, dict(status="started"))
+        originals = {path: path.read_bytes() for path in (historical, completed, interrupted)}
+        assert _execute(root, frozen, resume=True) == {"status": "fixture"}
+        assert run.call_count == 4 and summarize.call_count == 2
+        assert (root / "main_roster.json").read_bytes() == roster
+        assert (root / "development_assessment.json").read_bytes() == assessment
+        assert all(path.read_bytes() == content for path, content in originals.items())
+    costs = qualification_costs(root)
+    assert costs["known_costs"]["assignment_pass_count"] == 2
+    assert costs["unknown_cost_attempts"] == 1
+    return root
 
 
 def run_lifecycle_checks(root, settings):
@@ -1094,13 +1047,12 @@ def run_lifecycle_checks(root, settings):
     else:
         raise AssertionError("Mismatched historical content identity reused")
     _structured_failure_checks(root / "structured")
-    _qualification_lifecycle_checks(root / "qualification", contract)
-    frozen_root = root / "qualification" / "before_aggregate"
+    frozen_root = _independent_controls_checks(root / "independent_controls", contract)
     frozen = read_json(frozen_root / "study_contract.json")
     content = read_json(frozen_root / "cohort_settings.json")
     content["acquisitions"]["A1"]["mean_depth"] += 1
     (frozen_root / "cohort_settings.json").write_text(json.dumps(content))
-    with patch("CliPP2.simulation.study._qualification_step", side_effect=AssertionError("changed source reached qualification")):
+    with patch("CliPP2.simulation.study.run_jobs", side_effect=AssertionError("changed cohort reached execution")):
         try:
             _execute(frozen_root, frozen, resume=True)
         except ValueError as error:
@@ -1111,8 +1063,8 @@ def run_lifecycle_checks(root, settings):
         checks=["cohort_job_and_history_identity", "matching_history_reuse_and_changed_manifest_rejection",
                 "frozen_content_verified_before_resume_reuse", "caught_stage1_stage2_assignment_failures_retryable",
                 "partial_arm_evaluation_cost_evidence_retained", "scientific_rejections_not_retried",
-                "qualification_interruptions_and_published_summary_recovery", "recorded_qualification_failure_requires_explicit_retry",
-                "before_aggregate_interruption_reuses_both_steps", "interrupted_qualification_cost_unknown"])
+                "study_execution_and_resume_independent_of_controls", "historical_control_receipts_preserved",
+                "historical_control_costs_remain_reported"])
 
 
 def run_checks(directory, cohort_settings):
