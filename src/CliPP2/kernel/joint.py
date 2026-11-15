@@ -43,9 +43,14 @@ def _cavity(prefix, suffix, region, contains_anchor, *, maximum=False):
     return _combine(choices, maximum)
 
 
-def _anchor_map(values, anchor):
+def _anchor_map(values, anchor, fixed=None):
     states = ((0., ()), (-np.inf, ()))
-    for x, y in values:
+    for region, (x, y) in enumerate(values):
+        if fixed is not None and region == fixed[0]:
+            if fixed[1] != anchor:
+                x = -np.inf
+            if fixed[1] != anchor+1:
+                y = -np.inf
         candidates = ([], [])
         for used, (score, word) in enumerate(states):
             if not math.isfinite(score):
@@ -80,6 +85,7 @@ def joint_components(log_masses, minimum, *, observed=None, max_multiplicity_dif
     calls = np.full(len(masses), np.nan)
     cavity = [np.full(len(value), -np.inf) for value in masses]
     conditional = [np.full(len(value), -np.inf) for value in masses]
+    conditional_max = [np.full(len(value), -np.inf) for value in masses]
     probabilities = [np.zeros(len(value)) for value in masses]
     sets = [() for _ in masses]
     log_count = log_mass = profile = 0.
@@ -94,6 +100,8 @@ def joint_components(log_masses, minimum, *, observed=None, max_multiplicity_dif
         for j, r in enumerate(active):
             cavity[r][:] = sum(value for k, value in enumerate(totals) if k != j)
             conditional[r][:] = sum(value for k, value in enumerate(maxima) if k != j)
+            conditional_max[r][:] = [sum(float(value) if k == j else maxima[k]
+                for k in range(len(active))) for value in masses[r]]
     elif len(active):
         largest_lower = int(lower[active].max())
         smallest_upper = min(int(lower[r])+len(masses[r])-1 for r in active)
@@ -126,19 +134,24 @@ def joint_components(log_masses, minimum, *, observed=None, max_multiplicity_dif
                     cavity[r][position] = np.logaddexp(cavity[r][position], value)
                     value = _cavity(max_prefix, max_suffix, j, multiplicity == anchor, maximum=True)
                     conditional[r][position] = max(conditional[r][position], value)
+                    # Exact ties require the same regional addition order as the
+                    # full MAP score. Prefix + suffix regrouping can lose valid
+                    # ties by one ulp, particularly at zero-CCF coordinates.
+                    value = _anchor_map(values, anchor, fixed=(j, multiplicity))[0]
+                    conditional_max[r][position] = max(conditional_max[r][position], value)
     if math.isfinite(log_mass):
         for j, r in enumerate(active):
             probabilities[r] = np.exp(masses[r]+cavity[r]-log_mass)
             calls[r] = selected[j]
             tied = set(int(lower[r])+int(position) for position in
-                       np.flatnonzero(masses[r]+conditional[r] == profile))
+                       np.flatnonzero(conditional_max[r] == profile))
             tied.add(selected[j])
             sets[r] = tuple(sorted(tied))
     return dict(log_marginal=log_mass-log_count, profile=profile,
                 log_normalizer=log_count, log_partition=log_mass, map=calls,
                 map_sets=tuple(sets), probabilities=tuple(probabilities),
                 cavity_log_marginal=tuple(cavity), conditional_offsets=tuple(conditional),
-                conditional_max=tuple(value+mass for value, mass in zip(conditional, masses)),
+                conditional_max=tuple(conditional_max),
                 status="observed" if len(active) and math.isfinite(log_mass) else
                        "zero_likelihood" if len(active) else "unobserved")
 

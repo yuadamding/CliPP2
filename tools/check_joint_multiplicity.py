@@ -78,9 +78,22 @@ def reference_checks():
     absent = joint_row([0, 10], [20, 20], [.25, .25], [1, 1], [4, 4], [True, True], [0, 1])
     assert absent["map"][0] >= 1 and np.ptp(absent["map"]) <= 1
     assert len(absent["probabilities"][0]) == 4
+    # Full-score ties must not depend on regrouped prefix/suffix sums. These
+    # zero-CCF coordinates lost their upper projected tie on Linux float64.
+    for alt, phi, lower, observed, region in (
+        ([0, 61, 47, 42, 95], [0, .5, .5, 1, .2], [2, 1, 4, 3, 3], [True]*5, 0),
+        ([43, 0, 50, 96, 0], [.8, 0, .5, .2, 1], [3, 2, 4, 3, 3], [True]*4+[False], 1),
+    ):
+        tied = joint_row(alt, [100]*5, [.25]*5, lower, [4]*5, observed, phi)
+        assert tied["map_sets"][region] == (3, 4)
+        assert all(tied["conditional_max"][region][m-lower[region]] == tied["profile"] for m in (3, 4))
+    # Do not turn close but unequal scores into ties to repair that bug.
+    near = joint_components([[0., -1e-14], [0.]], [1, 1])
+    assert near["map_sets"] == ((1,), (1,))
     return dict(random_cases=300, settings=[None, 1], maximum_error=max(errors),
                 equal_vectors_counted_once=True, raw_normalization=True,
-                fixed_zero_ccf_scope=True, empty_prediction_product=True)
+                fixed_zero_ccf_scope=True, empty_prediction_product=True,
+                ordered_projected_ties=True, near_ties_remain_distinct=True)
 
 
 def native_checks(directory, device="cpu"):
