@@ -54,16 +54,12 @@ python -m CliPP2.simulation run \
 
 `qualify` replays all 720 histories, checks canonical input roundtrips, and runs
 bounded native pilots. `--skip-native` limits it to the non-fitting checks.
-Separate controlled cohort diagnostics include 11 fixed-reference assignment
-passes; these are not optimizer fits or independent main histories.
 
 The default roster retains the entire supplied cohort and can take many hours
 or days. `--main-replicates` and `--development-replicates` explicitly declare
 replicates per variant, defaulting to 10 and 2. Worker count affects execution,
 not scientific population membership; ten workers use one native CPU thread
-each. Automatic timing/disk allocation and its `--profile`, `--budget-minutes`,
-and `--disk-budget-gib` switches have been removed. Bounded qualification pilots
-remain separate from cohort sizing. Optional panels remain disabled by default.
+each. Optional panels remain disabled by default.
 
 Development uses the same single declared workflow configuration as main execution.
 A reduced declaration runs only its declared replicate block. Poor finite scientific
@@ -102,8 +98,7 @@ it again. Semantic random seeds remain unchanged.
 
 Only the current v9 study contract and Protocol 2.5 artifacts are supported.
 Controls run explicitly through `qualify` or the research control functions,
-independently of study execution. Interrupted costs remain explicitly unknown.
-Reports use new directories.
+independently of study execution. Reports use new directories.
 
 New studies save `main_roster.json` before development. Its
 identity is independent of worker count. The contract also declares the development

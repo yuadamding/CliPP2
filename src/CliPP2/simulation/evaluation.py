@@ -1976,7 +1976,6 @@ def population_accounting(availability):
             if any(value is not None and value not in (0, 1) for value in values):
                 raise ValueError(f"Invalid retained operational indicator {indicator} for {arm}")
             counts.update(zip(names, (sum(value == state for value in values) for state in (1, 0, None))))
-            assert sum(counts[name] for name in names) == len(rows)
         result.append(counts)
     return result
 
@@ -1993,10 +1992,13 @@ def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expect
     evaluations, families = list(evaluations), tuple(families)
     if bootstrap_replicates < 0 or len(set(families)) != len(families) or not families:
         raise ValueError("Aggregation requires distinct families and nonnegative bootstrap replicates")
-    definitions = {}
     from CliPP2.config import fitting_identity
-    methods = [record.get("fitting_method_identity", fitting_identity(max_multiplicity_difference=
-                record_evaluation_definition(record)["max_multiplicity_difference"])) for record in evaluations]
+    definitions, methods = {}, []
+    for record in evaluations:
+        definition = record_evaluation_definition(record)
+        definitions[record["evaluation_definition_id"]] = definition
+        methods.append(record.get("fitting_method_identity", fitting_identity(
+            max_multiplicity_difference=definition["max_multiplicity_difference"])))
     if expected_fitting_identity is not None:
         methods.append(expected_fitting_identity)
     allowed = tuple(fitting_identity(method, max_multiplicity_difference=difference)
@@ -2009,9 +2011,6 @@ def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expect
         if not isinstance(expected_definition, dict):
             raise ValueError("Expected evaluation definition must be a definition object")
         definitions[content_hash(expected_definition)] = expected_definition
-    for record in evaluations:
-        definition = record_evaluation_definition(record)
-        definitions[content_hash(definition)] = definition
     if len(definitions) > 1:
         if expected_definition is not None:
             raise ValueError("Incompatible evaluation definitions conflict with the declared study/report definition; "

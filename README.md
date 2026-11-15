@@ -75,7 +75,8 @@ Stage 1–2 center fitting defaults to **marginal** likelihood. Opt into
 `--fit-multiplicity profile` (or `workflow_config.fit.fit_multiplicity` in a plan)
 to maximize integer-multiplicity likelihood while retaining marginal-mixture
 BIC selection at the frozen fitted centers. This is independent of Stage 3's
-assignment method. See the [numerical contract and comparisons](docs/profile_fitting_marginal_selection.md).
+assignment method. See the [numerical contract](docs/workflow_protocol_2_5.md#joint-likelihood-and-numerical-implementation)
+and [qualification results](docs/joint_multiplicity_qualification.md).
 
 `FitConfig.max_multiplicity_difference` defaults to `1`; use `None` in Python, `null` in JSON,
 or `--max-multiplicity-difference none` for the independent regional model.
@@ -108,7 +109,14 @@ representative CN for the existing likelihood and the maximum major-CN clamp.
 The full list is retained in the canonical `segment_cn_states` field. Canonical
 TSV inputs preserve their explicit `allele_a_cn`/`allele_b_cn` for the likelihood
 and major-CN clamp, independently of the states in that list. See the
-[regional input example](examples/README.md) for the schema and validation.
+[regional input example](examples/README.md) for the schema.
+
+Within each interval, state IDs must be unique, fractions finite and nonnegative,
+and CN integers satisfying `0 <= minor_cn <= major_cn` and
+`total_cn = major_cn + minor_cn`. States must agree on normal CN and provenance
+flags; distinct intervals cannot overlap. A mixed segment may include `(0,0)`,
+but its representative major CN must be at least 1. Single-state CNA tables
+without the two state columns use fraction 1.
 
 For ALT reads `a`, total depth `d`, supplied purity `p`, and original input major
 CN `M`, the requested Stage 1–2 lower bound is

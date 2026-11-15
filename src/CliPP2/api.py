@@ -23,8 +23,6 @@ def process_tumor(tumor_file: str | Path, outdir: str | Path,
     config = resolve_fit_config() if fit_config is None else fit_config
     if type(config) is not FitConfig:
         raise TypeError('fit_config must be a FitConfig')
-    if progress_callback is not None and not callable(progress_callback):
-        raise TypeError('progress_callback must be callable or None')
     started = perf_counter()
     progress = None if progress_callback is None else ProgressReporter(None, progress_callback)
     if progress is not None:

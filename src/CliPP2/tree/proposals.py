@@ -195,14 +195,14 @@ SCORE_RTOL = 1e-10
 
 def _partition_key(candidate):
     """Avoid materializing labels for the original compact tree bank."""
-    if getattr(candidate, "membership_kind", "tree") == "tree":
+    if candidate.membership_kind == "tree":
         return "tree", tuple(candidate.cuts)
     labels = candidate.fit.labels
     groups = {}
     return "general", tuple(groups.setdefault(int(k), len(groups)) for k in labels)
 
 
-def _starting_states(original, winner):
+def _starting_states(original):
     # Freeze the source collection: discoveries cannot enqueue extra starts.
     ordered = sorted(original, key=score_key)
     chosen, seen, counts = [], set(), {}
@@ -302,8 +302,8 @@ def _proposals(labels, centers, columns, observed, keys, *, positive=None):
 
 def _counter_snapshot(model, bank):
     return {
-        "model": dict(getattr(model, "telemetry", {})),
-        "bank": {key: getattr(bank, key, 0) for key in (
+        "model": dict(model.telemetry),
+        "bank": {key: getattr(bank, key) for key in (
             "refit_calls", "attempt_cache_hits", "structural_cache_hits", "refit_seconds")},
     }
 
@@ -316,8 +316,8 @@ def _retained_bytes(candidates, bank):
             for candidate in candidates for field in ("labels", "centers", "weights")),
         "membership_attempt_key_bytes": sum(
             len(labels) + (0 if centers is None else len(centers))
-            for labels, centers in getattr(bank, "membership_attempts", {})),
-        "structural_key_bytes": sum(len(key) for kind, key in getattr(bank, "_structural", {})
+            for labels, centers in bank.membership_attempts),
+        "structural_key_bytes": sum(len(key) for kind, key in bank._structural
                                     if kind == "general"),
         "scope": "logical_array_and_key_payload_not_RSS_or_Python_overhead",
     }
@@ -335,12 +335,8 @@ def expand_memberships(model, bank, *, work=None):
     original = tuple(bank.candidates)
     if not original:
         raise ValueError("Reassignment requires an eligible original candidate bank")
-    winner = getattr(bank, "original_selected", None)
-    if winner is None:
-        winner = min(original, key=score_key)
-    if not any(candidate is winner for candidate in original):
-        raise ValueError("The original winner must belong to the original bank")
-    starts = _starting_states(original, winner)
+    winner = min(original, key=score_key)
+    starts = _starting_states(original)
     keys = tuple(model.observation_keys())
     observed = np.asarray(model.observed, dtype=bool)
     before = _counter_snapshot(model, bank)
@@ -359,10 +355,9 @@ def expand_memberships(model, bank, *, work=None):
             labels = np.asarray(state.fit.labels, dtype=np.int64)
             centers = np.asarray(state.fit.centers, dtype=float)
             handles = model.selection_column_set(centers)
-            prepared = (bank.prepare(state.cuts, labels, fitted=state.fit, columns=handles)
-                        if hasattr(bank, "prepare") else None)
+            prepared = bank.prepare(state.cuts, labels, fitted=state.fit, columns=handles)
             handles = model.fit_column_set(centers)
-            use_device = getattr(bank, "device_proposals", False) and model.backend.kind == "cuda"
+            use_device = bank.device_proposals and model.backend.kind == "cuda"
             positive = handles.positive_transfers(labels) if use_device else None
             columns = None if use_device else handles.materialize()
             if (columns is not None and columns.shape != (model.n, q)) or len(keys) != model.n:
@@ -374,7 +369,7 @@ def expand_memberships(model, bank, *, work=None):
                             **scan, "proposals": [], "advanced": False}
             path["rounds"].append(round_record)
             returned = []
-            independent = [] if getattr(bank, "weight_batch_size", 1) > 1 else None
+            independent = [] if bank.weight_batch_size > 1 else None
 
             def record_result(record, candidate):
                 record["outcome"] = "ineligible" if candidate is None else "eligible"
@@ -394,7 +389,6 @@ def expand_memberships(model, bank, *, work=None):
                     record["outcome"] = "no_legal_positive_gain_transfer"
                     continue
                 callbacks += 1
-                options = {} if prepared is None else {"parent": prepared}
                 provenance = {
                     "route": "fixed_k_joint_reassignment", "proposal_kind": kind,
                     "requested_k": q, "occupied_q": q,
@@ -405,7 +399,7 @@ def expand_memberships(model, bank, *, work=None):
                 if independent is not None:
                     independent.append((record, (None, proposed, centers, provenance, prepared)))
                 else:
-                    record_result(record, bank.consider_membership(proposed, centers, provenance, **options))
+                    record_result(record, bank.consider_membership(proposed, centers, provenance, parent=prepared))
             if independent:
                 fitted = bank.consider_independent([request for _, request in independent])
                 for (record, _), candidate in zip(independent, fitted):

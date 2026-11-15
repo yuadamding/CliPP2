@@ -59,13 +59,13 @@ def fitted_state_fingerprint(model, tree, candidate, numerical_policy):
     fit = candidate.fit
     digest = hashlib.sha256()
     fields = [json.dumps(["clipp2.fitted-state.v2", AUDIT_POLICY, model.identity, tree.identity,
-                          dict(getattr(model, "method_identity", {})),
+                          dict(model.method_identity),
                           model.backend.policy, model.backend.identity, numerical_policy],
                          sort_keys=True, separators=(",", ":")).encode(),
               fit.membership.kind.encode(), np.asarray(fit.labels, dtype=np.int64).tobytes(),
               np.asarray(fit.centers, dtype=float).tobytes(),
               np.asarray(fit.weights, dtype=float).tobytes(),
-              np.asarray([getattr(fit, "fitting_log_likelihood", fit.conditional_log_likelihood),
+              np.asarray([fit.fitting_log_likelihood,
                           fit.conditional_log_likelihood, fit.mixture_log_likelihood,
                           fit.complexity_penalty, fit.score], dtype=float).tobytes()]
     for value in fields:

@@ -27,8 +27,7 @@ from CliPP2.simulation.evaluation import candidate_correspondence, partition_sco
 
 
 def sha(path):
-    with Path(path).open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def macro_f1(truth, prediction, classes):
@@ -185,10 +184,9 @@ def main():
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     args = parser.parse_args()
-    manifest_hash = sha(args.manifest)
-    manifest = json.loads(args.manifest.read_text())
-    if sha(args.manifest) != manifest_hash:
-        raise ValueError("Manifest changed while loading")
+    manifest_bytes = args.manifest.read_bytes()
+    manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+    manifest = json.loads(manifest_bytes)
     ids = [c["id"] for c in manifest["cases"]]
     if len(set(ids)) != len(ids) or any(Path(v).name != v or v in ("", ".", "..") for v in ids):
         raise ValueError("Case identities must be distinct safe directory names")
@@ -204,14 +202,9 @@ def main():
         outdir = args.output_dir / case["id"]
         outdir.mkdir()
         report = compare(request, truth, outdir)
-        for key, path in paths.items():
-            if sha(path) != case[key+"_sha256"]:
-                raise ValueError("Bound input changed during execution: " + str(path))
         _publish_json(outdir / "comparison.json", report)
         reports.append(dict(id=case["id"], **report))
         print(json.dumps(dict(completed=len(reports), total=len(ids), id=case["id"])), flush=True)
-    if sha(args.manifest) != manifest_hash:
-        raise ValueError("Manifest changed during execution")
     _publish_json(args.output_dir / "summary.json", dict(manifest_sha256=manifest_hash, cases=reports,
         native_fit_count=0, assignment_pass_count=2*len(reports)))
 

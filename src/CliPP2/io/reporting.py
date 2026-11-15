@@ -35,8 +35,7 @@ def _input_observed(model):
     ix = np.ix_(model.active_indices, model.region_indices)
     depth = data.total_counts[ix]
     observed = np.isfinite(depth) & (depth > 0)
-    if data.count_observed is not None:
-        observed &= np.asarray(data.count_observed, dtype=bool)[ix]
+    observed &= data.count_observed[ix]
     observed &= ~data.input_excluded[ix]
     return observed
 
@@ -62,7 +61,7 @@ def independent_log_columns(model, centers, *, aggregation="marginal"):
     alt, depth = data.alt_counts[ix], data.total_counts[ix]
     major, total, purity = data.major_cn[ix], data.total_cn[ix], data.purity[ix]
     normal = data.normal_cn[ix]
-    bounds = getattr(model, 'multiplicity_support', None)
+    bounds = model.multiplicity_support
     if bounds is None:
         minimum = np.ones_like(major, dtype=np.int64)
         maximum = major.astype(np.int64)
@@ -118,8 +117,8 @@ def independent_log_columns(model, centers, *, aggregation="marginal"):
 
 def _verify_retained_bank(model, result, score):
     """Audit the retained states and their compact refit-attempt links."""
-    links = getattr(result, 'attempt_links', None)
-    if result.diagnostics.get('diagnostics_schema_version', 0) >= 2 and links is None:
+    links = result.attempt_links
+    if links is None:
         raise ValueError('Candidate bank is missing its compact refit-attempt links')
     retained = validate_candidate_bank(result.tree, result.candidate_bank, result.selected, links)
     if not np.isclose(retained.score, score, atol=1e-7, rtol=1e-10):
@@ -191,11 +190,11 @@ def _verify_fitted_numerics(model, fit, *, eligible=True, column_cache=None):
     if weight_gap > model.n*(1e-8+roundoff) or active_gap > 1e-8+roundoff:
         raise ValueError('Independent mixture-weight optimality check failed')
     conditional = math.fsum(columns[np.arange(model.n), labels])
-    method = getattr(model, "fit_multiplicity", "marginal")
+    method = model.fit_multiplicity
     fitting_ll = (conditional if method == "marginal" else math.fsum(
         independent_log_columns(model, centers, aggregation="profile")[np.arange(model.n), labels]))
-    if (hasattr(model, "method_identity") and (fit.fit_objective_id != model.method_identity["fit_objective_id"]
-            or fit.selection_criterion_id != model.method_identity["selection_criterion_id"])):
+    if (fit.fit_objective_id != model.method_identity["fit_objective_id"]
+            or fit.selection_criterion_id != model.method_identity["selection_criterion_id"]):
         raise ValueError("Fitted result has a different fitting/selection identity")
     mixture = float(log_mass.sum())
     penalty = (q*model.r+q-1)*math.log(model.n)
@@ -217,7 +216,7 @@ def _verify_fitted_numerics(model, fit, *, eligible=True, column_cache=None):
             if value is None or not np.isfinite(value) or value < 0 or value > limit:
                 raise ValueError('Ineligible neighbor lacks converged weight diagnostics')
     validity = float(np.log(allowed @ weights).sum())
-    return {'fitting_log_likelihood': fitting_ll, **dict(getattr(model, "method_identity", {})),
+    return {'fitting_log_likelihood': fitting_ll, **dict(model.method_identity),
             'conditional_log_likelihood': conditional,
             'hard_partition_log_likelihood': conditional,
             'mixture_log_likelihood': mixture, 'complexity_penalty': penalty, 'score': score,
@@ -242,8 +241,7 @@ def _neighbor_exclusion(model, labels, observed):
 
 def _verify_membership_audits(model, result, selected_numerics, column_cache):
     """Verify complete terminal neighborhoods, exact attempt starts and scores."""
-    audits = getattr(result, 'membership_audits', None)
-    attempts = getattr(result, 'attempt_outcomes', None)
+    audits, attempts = result.membership_audits, result.attempt_outcomes
     if not isinstance(audits, tuple) or not isinstance(attempts, tuple):
         raise ValueError('Publication requires retained terminal membership audits and outcomes')
     links = result.attempt_links
@@ -416,7 +414,7 @@ def result_tables(model, result, tumor_id):
     calls = model.multiplicity(phi)
     calls = np.where(~model.observed & (model.support == 1), model.multiplicity_min, calls)
     calls = np.where(phi == 0, np.nan, calls)
-    report = getattr(getattr(model, 'data', None), 'cn_filter_report', None)
+    report = model.data.cn_filter_report
     if report is not None and report.records:
         mutations = {name: i for i, name in enumerate(model.mutation_ids)}
         regions = {name: j for j, name in enumerate(model.region_ids)}

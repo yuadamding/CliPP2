@@ -254,8 +254,7 @@ def validate_assignment_result(bundle, result):
             baseline_reference_label=bundle.baseline_labels[i], final_assignment_label=final,
             source_stage=bundle.source_stages[i], source_label=bundle.source_labels[i],
             target_reason=target_reason(bundle.source_stages[i]),
-            **assignment_outcome(bundle.source_stages[i], bundle.baseline_labels[i], final,
-                                 bundle.reference.clonal_label)), "Assignment evidence state")
+            **assignment_outcome(bundle.source_stages[i], bundle.baseline_labels[i], final)), "Assignment evidence state")
         residuals, errors = [], []
         selected_joint_score = -np.log(len(labels))
         joint = (_joint_evidence(catalog, original, bundle.reference.centers[selected],

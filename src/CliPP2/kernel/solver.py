@@ -41,7 +41,7 @@ def _spring_gradient(x, edges, penalty):
 
 
 def _stationarity(model, x, total_gradient, spring, lower, upper):
-    if getattr(model, "fit_multiplicity", "marginal") != "profile":
+    if model.fit_multiplicity != "profile":
         return float(np.max(np.abs(x-np.clip(x-total_gradient, lower, upper))))
     right, left = model.fit_backend.profile_slopes(x)
     return float(np.max(np.maximum(0, np.maximum(
@@ -183,7 +183,7 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
     pilot = np.asarray(pilot, dtype=float).copy()
     if tree.n != model.n or pilot.shape != (model.n, model.r):
         raise ValueError("Tree, model and pilot dimensions must agree")
-    observed = np.asarray(getattr(model, "observed", np.ones_like(pilot, dtype=bool)), dtype=bool)
+    observed = model.observed
     if observed.shape != pilot.shape or not np.isfinite(pilot[observed]).all():
         raise ValueError("Observed pilot coordinates must be finite")
     missing_initializations = int(np.count_nonzero(~observed))
@@ -206,14 +206,11 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
     upper = np.minimum(np.asarray(model.upper, dtype=float), 1 - 1e-8)
     if lower.shape != pilot.shape or upper.shape != pilot.shape or np.any(lower > upper):
         raise ValueError("No nonempty interior box for raw tree continuation")
-    # Custom scientific/test models retain their own node_terms implementation.
-    # The optional CUDA request owner preserves this same native controller,
-    # with device emissions and original-order publication. Default stays host.
-    from .model import RegionalModel
+    # The CUDA request owner keeps emissions on the device and publishes
+    # results in the original capacity order.
     if native_batch_size > 1:
-        if (not native or type(model) is not RegionalModel or model.backend.kind != "cuda"
-                or "node_terms" in vars(model)):
-            raise ValueError("Native CUDA capacity batching requires the built-in regional model")
+        if not native or model.backend.kind != "cuda":
+            raise ValueError("Native CUDA capacity batching requires a CUDA model")
         from .continuation_requests import continue_requests
         execution = {"continuation": "native_owner_cuda_emissions", "workers": 1,
                      "capacities": len(requested), "cpu_threads": 1,
@@ -225,8 +222,7 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
             telemetry=execution)
         model._continuation_execution = execution
         return candidates
-    if (native and type(model) is RegionalModel and model.backend.kind == "cpu"
-            and "node_terms" not in vars(model)):
+    if native and model.backend.kind == "cpu":
         candidates = continue_cpu(model, tree, pilot, requested, lower, upper, policy, missing_initializations,
                                   keep_raw_phi=keep_raw_phi)
         if progress_callback is not None:
@@ -243,13 +239,10 @@ def generate_candidates(model, tree, pilot, capacities, *, policy=None, native=T
 def _generate_host_candidates(model, tree, pilot, requested, lower, upper, policy,
                               missing_initializations, keep_raw_phi, prepared, progress_callback=None):
     candidates = []
-    # All capacities start at the same clipped pilot. Reuse only the built-in
-    # CUDA model's pure evaluation; scientific/test model overrides retain their
-    # original call sequence. Each capacity owns detached working arrays.
-    from .model import RegionalModel
+    # All capacities start at the same clipped pilot. Reuse the CUDA evaluation;
+    # each capacity still owns detached working arrays.
     initial_state = None
-    if (type(model) is RegionalModel and model.backend.kind == "cuda"
-            and "node_terms" not in vars(model)):
+    if model.backend.kind == "cuda":
         initial = np.clip(pilot, lower, upper)
         initial_state = (initial, *(array.copy() for array in model.node_terms(initial)))
     for capacity_index, k in enumerate(requested):

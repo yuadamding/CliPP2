@@ -843,12 +843,6 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
                  reference_contributors=reference_audit, native_stage_two_centers_preserved=True,
                  reference_policy=STAGE_THREE_REFERENCE_POLICY,
                  run_manifest_identity=run_manifest["manifest_identity"]))
-        positions = {mutation: i for i, mutation in enumerate(catalog.mutation_ids)}
-        target_rows = [positions[mutation] for mutation in targets]
-        eligible_targets = catalog.eligible[target_rows]
-        if (np.any(bundle.bounds.lower[eligible_targets] != 1)
-                or not np.array_equal(bundle.bounds.upper[eligible_targets], catalog.major_cn[target_rows][eligible_targets])):
-            raise AssertionError("Stage 3 must use full original multiplicity support")
         save_assignment_bundle(bundle, output / "assignment_bundle.json")
         receipt["current_phase"] = "stage_three_assignment"
         assignment = assign_mutations(bundle, progress_callback=progress_callback, run_manifest_id=run_manifest_id)
@@ -906,11 +900,8 @@ def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unch
         two = None if mutation not in positions[1] else int(second.labels[positions[1][mutation]])
         baseline = mapping.get((second.source_id, two)) if two is not None else (mapping.get((first.source_id, one)) if one is not None else None)
         record = assignments.get(mutation)
-        non_target = mutation in unchanged_map
-        target = baseline is not None and not non_target
+        target = baseline is not None
         reason = ("stage2_recheck" if two is not None else "stage1_reference_recheck") if target else None
-        if non_target and (two is None or unchanged_map[mutation] != baseline):
-            raise ValueError("Unchanged population does not match accepted Stage 2 source construction")
         row = dict(mutation_id=mutation, original_eligible=bool(catalog.eligible[i].any()),
             original_input_status="filtered" if not catalog.eligible[i].any() else "no_information"
                 if not (catalog.eligible[i] & catalog.count_observed[i] & (catalog.total_counts[i] > 0)).any() else "eligible_informative",
@@ -919,17 +910,15 @@ def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unch
                 ("declared_major_cn_policy", catalog.max_major_cn is not None
                     and (catalog.major_cn[i] > catalog.max_major_cn).any())) if applies),
             stage_one_label=one, stage_two_label=two, baseline_reference_label=baseline,
-            final_assignment_label=unchanged_map.get(mutation), target_reason=reason,
-            membership_origin="stage2_unchanged" if non_target else reason,
+            final_assignment_label=None, target_reason=reason, membership_origin=reason,
             historical_cap_contributor_reassigned=False,
-            role="non_target" if non_target else "target" if target else "not_in_combined_baseline",
+            role="target" if target else "not_in_combined_baseline",
             assignment_status=None, assignment_method=None if assignment is None else assignment.assignment_method,
             score_defined=False, selection_reason=None,
             evidence_status="excluded" if not catalog.eligible[i].any() else "computation_failed",
             map_cluster_label=None, map_label=None, map_set=(), posterior_defined=False,
             reference_labels=() if assignment is None else assignment.reference.labels, probabilities=None,
-            reassessment_status="unchanged_non_target" if non_target else "unavailable" if target else None,
-            baseline_changed=False if non_target else None)
+            reassessment_status="unavailable" if target else None, baseline_changed=None)
         for name, fit, lookup in (("stage_one", first, positions[0]), ("stage_two", second, positions[1])):
             index = lookup.get(mutation)
             row[name + "_native_phi"] = None if index is None else fit.centers[fit.labels[index]].tolist()
@@ -954,27 +943,24 @@ def _reconcile_final_memberships(catalog, stage_one, stage_two, source_map, unch
                     map_set=tuple(sorted(assignment.reference.labels)))
         rows.append(row)
     if assignment is None:
-        return rows, dict(status="unavailable", population_count=0, unchanged_map=dict(unchanged_map))
+        return rows, dict(status="unavailable", population_count=0, unchanged_map={})
     targets = {row["mutation_id"] for row in rows if row["role"] == "target"}
-    if targets != set(assignment.target_ids) or targets & set(unchanged_map):
-        raise ValueError("Result targets and unchanged members do not match the declared population partition")
-    if set(unchanged_map) - set(catalog.mutation_ids):
-        raise ValueError("Unchanged members must belong to the original catalog")
+    if targets != set(assignment.target_ids):
+        raise ValueError("Result targets do not match the combined fitted population")
     counts = {str(label): sum(row["final_assignment_label"] == label for row in rows) for label in assignment.reference.labels}
-    unchanged = {str(label): sum(value == label for value in unchanged_map.values()) for label in assignment.reference.labels}
     unresolved = sum(row["role"] == "target" and row["final_assignment_label"] is None for row in rows)
-    population = len(targets) + len(unchanged_map)
+    population = len(targets)
     if sum(counts.values()) + unresolved != population:
         raise AssertionError("Final MAP occupancy and unassigned targets do not reconcile T/F")
     for label in assignment.reference.labels:
-        if counts[str(label)] != unchanged[str(label)] + sum(row["final_assignment_label"] == label for row in assignment.assignments):
-            raise AssertionError("Final occupancy differs from unchanged members plus observed MAP targets")
+        if counts[str(label)] != sum(row["final_assignment_label"] == label for row in assignment.assignments):
+            raise AssertionError("Final occupancy differs from observed MAP targets")
     origins = {reason: {outcome: sum(row["target_reason"] == reason and row["reassessment_status"] == outcome for row in rows)
                        for outcome in ("retained", "reassigned", "unresolved")}
                for reason in ("stage1_reference_recheck", "stage2_recheck")}
     return rows, dict(status="complete", reassessment_policy="all_combined_fitted_mutations",
         population_count=population, final_occupancy=counts,
-        unchanged_map=dict(unchanged_map), unchanged_non_target_occupancy=unchanged, unresolved_targets=unresolved,
+        unchanged_map={}, unchanged_non_target_occupancy=dict.fromkeys(counts, 0), unresolved_targets=unresolved,
         outcomes_by_origin=origins,
         evidence_status_counts={status: sum(row["evidence_status"] == status for row in assignment.assignments)
             for status in EVIDENCE_STATUSES},

@@ -277,15 +277,15 @@ def run_jobs(root, job_list, *, workers, contract=None, retry_failed=False):
     manifest = manifests / f"batch-{len(list(manifests.glob('batch-*.json')))+1:03d}.json"
     save_json(manifest, job_list)
     _prepare_histories(root, job_list)
-    tasks = []
-    for job in job_list:
-        config = resolve_config(contract) if contract else workflow_config()
-        tasks.append(dict(root=str(root), job=job, execution_configs=[asdict(config)],
-                          retry_failed=retry_failed,
-                          archive_completed=contract["resource_limits"].get("archive_completed_outputs", False) if contract else False,
-                          reference_match_atol=contract.get("evaluation", {}).get("reference_match_atol") if contract else None,
-                          reference_distance=contract.get("evaluation", {}).get("reference_distance", "l2") if contract else "l2",
-                          run_manifest_id=contract.get("run_manifest_id") if contract else None))
+    config = resolve_config(contract) if contract else workflow_config()
+    settings = contract or {}
+    evaluation = settings.get("evaluation", {})
+    shared = dict(root=str(root), execution_configs=[asdict(config)], retry_failed=retry_failed,
+        archive_completed=settings.get("resource_limits", {}).get("archive_completed_outputs", False),
+        reference_match_atol=evaluation.get("reference_match_atol"),
+        reference_distance=evaluation.get("reference_distance", "l2"),
+        run_manifest_id=settings.get("run_manifest_id"))
+    tasks = [dict(job=job, **shared) for job in job_list]
     values = []
     # Prevent BLAS oversubscription; each native fit has an explicit single thread.
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
@@ -491,7 +491,7 @@ def report(root, *, evaluation_config=None, report_dir=None):
     """Render cached metrics or explicitly reevaluate preserved inference evidence."""
     from .evaluation import aggregate, normalize_evaluation_config, evaluation_definition
     from .figures import make_figures
-    from .runtime import recorded_costs, qualification_costs
+    from .runtime import recorded_costs
     from .reporting import planned_roster, reevaluate_cell, placeholder_for_cell, validate_cached_evaluation
     root = Path(root).resolve()
     contract = read_json(root / "study_contract.json")
@@ -520,9 +520,7 @@ def report(root, *, evaluation_config=None, report_dir=None):
     cells = [value for directory in sorted((root / "cells").glob("*")) if directory.is_dir()
              for value in [_latest_completion(directory)] if value is not None]
     main = [cell for cell in cells if cell["job"]["phase"] == "main"]
-    allocation_path = root / "allocation.json"
-    allocation = (roster_counts(contract) if "replicate_roster" in contract else
-                  read_json(allocation_path) if allocation_path.exists() else {})
+    allocation = roster_counts(contract)
     roster = planned_roster(root, contract, allocation, cells)
     completed = {cell["job"]["cell_id"]: cell for cell in main}
     main = [completed.get(job["cell_id"], dict(job=job, status="not_executed", evaluations=[], cost_ledgers=[],
@@ -562,7 +560,7 @@ def report(root, *, evaluation_config=None, report_dir=None):
                    unexecuted_main_cells=max(0, planned-sum(cell["status"] != "not_executed" for cell in main)),
                    all_cell_count=len(cells), peak_resident_bytes=max((c["peak_resident_bytes"] for c in cells), default=0),
                    fit_count=costs.get("fit_attempts", 0), assignment_pass_count=costs.get("assignment_attempts", 0),
-                   operation_costs=costs, qualification_costs=qualification_costs(root),
+                   operation_costs=costs,
                    report_mode="offline_reevaluation" if derive else "cached_metrics",
                    derived_evidence_unavailable=sum(e.get("status") == "unavailable_derived_evidence" for e in evaluations))
     for counts in summary.get("population_counts", []):
@@ -613,17 +611,8 @@ def report(root, *, evaluation_config=None, report_dir=None):
 def _write_report(root, directory, cells, evaluations, summary, figures):
     import html
     contract = read_json(root / "study_contract.json")
-    allocation = (roster_counts(contract) if "replicate_roster" in contract else
-                  read_json(root / "allocation.json") if (root / "allocation.json").exists() else {})
+    allocation = roster_counts(contract)
     assessments = [read_json(path) for path in sorted(root.glob("development_assessment*.json"))]
-    if "replicate_roster" in contract:
-        allocation_description = "The population was declared by explicit frozen replicate blocks; timing and disk measurements did not select its membership."
-    elif allocation.get("resource_reduction_applied") is False or contract.get("profile") == "full":
-        allocation_description = "The explicit full-cohort allocation did not use timing or disk measurements to select its population."
-    elif allocation.get("measured_seconds"):
-        allocation_description = "The balanced allocation was frozen from timing and disk measurements before main generation."
-    else:
-        allocation_description = "The retained evidence does not establish a timing-based allocation procedure."
     text = ["<!doctype html><meta charset='utf-8'><title>CliPP2 biological simulation 1.2</title>",
         "<style>body{font:16px system-ui;max-width:1100px;margin:40px auto;line-height:1.5}img{max-width:100%}pre{white-space:pre-wrap}td,th{padding:6px;border:1px solid #ddd}table{border-collapse:collapse}</style>",
         "<h1>CliPP2 biological simulation 1.2</h1>",
@@ -632,7 +621,7 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
         f"Native fits executed across all phases: {summary['fit_count']}; full-support assignment passes: {summary['assignment_pass_count']}.</p>",
         f"<p>Executed scale: {contract['dimensions']['mutations']} mutations, {contract['dimensions']['segments']} segments, {contract['dimensions']['regions']} regions; "
         f"{allocation.get('main_histories_per_family', 0)} independent main histories per family. The proposed full scale is 1,500 mutations, 50 segments, 50 main and 10 development histories per family.</p>",
-        f"<p>{allocation_description} Repeated acquisitions share physical histories; uncertainty resamples histories and carries all paired arms together. A reduced cohort does not establish rare-event safety or noninferiority.</p>",
+        "<p>The population was declared by explicit frozen replicate blocks; timing and disk measurements did not select its membership. Repeated acquisitions share physical histories; uncertainty resamples histories and carries all paired arms together. A reduced cohort does not establish rare-event safety or noninferiority.</p>",
         "<h2>Frozen population and settings</h2><pre>"+html.escape(json.dumps(dict(replicate_roster=contract.get("replicate_roster"), counts=allocation,
             workflow_config=contract.get("base_workflow_config"), development_assessments=assessments), indent=2))+"</pre>",
         "<h2>Applicability and scientific results</h2><p>Unknown and unavailable estimates remain explicit. Exact aliases and absent candidate explanations cannot be resolved by restoring integer support. Diagnostics are measurements; Protocol 2.5 returns method-specific observed MAP estimates without statistical acceptance screens.</p>"]

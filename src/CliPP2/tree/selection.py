@@ -125,7 +125,7 @@ def _likelihood_ranked_edges(model, tree, edges, cuts=(), *, candidate_centers=(
     parent, parent_edge, component, order, _ = _forest_structure(tree, cuts)
     children = {int(parent_edge[node]): node for node in order if parent[node] != node}
     nodes = np.asarray([children[edge] for edge in edges], dtype=int)
-    joint = getattr(model, "max_multiplicity_difference", None) is not None
+    joint = model.max_multiplicity_difference is not None
     method = "joint_center_vector_gain_v1" if joint else "regional_grid_profile_gain_v1"
     if not len(nodes):
         return [], {"method": method, "ranked_edges": 0}
@@ -201,13 +201,13 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds, work):
         edges, rank_diagnostic = _likelihood_ranked_edges(model, tree, edges, candidate_centers=centers)
     chosen = sorted(edges) if len(edges) <= POLICY.split_slots else edges[:POLICY.split_slots]
     work.spend("split", len(chosen))
-    attempted = set(getattr(bank, "by_cuts", {})) | set(bank.ineligible)
+    attempted = set(bank.by_cuts) | set(bank.ineligible)
 
     def consider(cuts, labels, centers, provenance, *, parent=None):
         attempted.add(tuple(cuts))
         return bank.consider(cuts, labels, centers, provenance, parent=parent)
 
-    if getattr(bank, "weight_batch_size", 1) > 1:
+    if bank.weight_batch_size > 1:
         proposals = (((edge,), partition_from_cuts(tree, (edge,)), None, {
             "route": "supported_one_edge_split", "requested_k": requested,
             "occupied_q": 2, "zero_jumps_allowed": True}, None) for edge in chosen)
@@ -354,14 +354,14 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     from ..kernel.solver import generate_candidates
     from .progress import ProgressReporter
 
-    device_proposals = getattr(getattr(model, "backend", None), "kind", None) == "cuda"
+    device_proposals = model.backend.kind == "cuda"
     validate_audit_scope(audit_scope)
     weight_batch_size = 32 if device_proposals else 1
     continuation_batch_size = 4 if device_proposals else 1
     progress = None if progress_callback is None else ProgressReporter(model, progress_callback)
 
     total_started = perf_counter()
-    telemetry_started = dict(getattr(model, "telemetry", {}))
+    telemetry_started = dict(model.telemetry)
     if isinstance(max_clusters, bool) or not isinstance(max_clusters, (int, np.integer)) or max_clusters < 1:
         raise ValueError("max_clusters must be a positive integer")
     max_clusters = int(max_clusters)
@@ -503,7 +503,7 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     times["bank_registration_seconds"] = bank.registration_seconds
     times["fit_total_seconds"] = perf_counter() - total_started
     for name in ("scalar_refit_seconds", "weight_seconds"):
-        if name in getattr(model, "telemetry", {}):
+        if name in model.telemetry:
             times[name] = model.telemetry[name] - telemetry_started.get(name, 0.0)
     if progress is not None:
         progress.requested_k, progress.occupied_q = max_clusters, len(selected.fit.centers)

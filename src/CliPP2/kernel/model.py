@@ -253,13 +253,9 @@ class RegionalModel:
         self.fit_multiplicity = fit_multiplicity
         self.max_multiplicity_difference = max_multiplicity_difference
         self.data = data
-        ids, regions = tuple(data.mutation_ids), tuple(data.region_ids)
-        if any(not isinstance(x, str) for x in ids + regions):
-            raise ValueError("Mutation and region identities must be strings")
-        if len(set(ids)) != len(ids) or len(set(regions)) != len(regions):
-            raise ValueError("Mutation and region identities must be unique")
-        self.region_indices = readonly_array(sorted(range(len(regions)), key=regions.__getitem__), dtype=int)
         observed = observed_mask(data)
+        ids, regions = data.mutation_ids, data.region_ids
+        self.region_indices = readonly_array(sorted(range(len(regions)), key=regions.__getitem__), dtype=int)
         active = np.flatnonzero(observed.any(axis=1))
         if not len(active):
             raise ValueError("No informative positive-depth mutation remains")

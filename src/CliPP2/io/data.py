@@ -245,11 +245,11 @@ class MultiplicityBounds(ImmutableArrayRecord):
         if not isinstance(data, (TumorData, OriginalCatalog)):
             raise TypeError("Multiplicity bounds require validated TumorData or OriginalCatalog")
         aligned = self.subset(data.mutation_ids, data.region_ids)
-        catalog = data if isinstance(data, OriginalCatalog) else getattr(data, "original_catalog", None)
+        catalog = data if isinstance(data, OriginalCatalog) else data.original_catalog
         if catalog is None:
             major = np.asarray(data.major_cn)
             eligible = ~np.asarray(data.input_excluded, dtype=bool)
-            report = getattr(data, "cn_filter_report", None)
+            report = data.cn_filter_report
             if report is not None and report.records:
                 # Placeholder CN cannot establish original support eligibility.
                 raise ValueError("Bounded excluded inputs require their original catalog")

@@ -61,23 +61,19 @@ def _positive_int(value, name):
 
 def continue_requests(model, tree, initial, capacities, lower, upper, policy, missing=0, *,
                       max_active=8,
-                      keep_raw_phi=True, evaluate_requests=None, progress_callback=None,
+                      keep_raw_phi=True, progress_callback=None,
                       cancelled=None, telemetry=None):
-    """Run the native controller with caller-owned numerical evaluation.
+    """Run the native controller with model-owned numerical evaluation.
 
-    ``evaluate_requests([(capacity_index, owned_coordinates), ...])`` returns
-    ordered ``(values, gradient, curvature)`` triples. Its default calls this
-    model's node_terms sequentially, so a CUDA model still evaluates on CUDA.
-    A future CUDA batch owner may implement the same protocol. No dispatcher
-    selects this experimental path automatically.
+    CUDA models evaluate request batches on the device; CPU models evaluate
+    their node terms sequentially. Replies retain the original request order.
 
     Only one native worker does CPU work at a time; other workers suspend.
     Boundary handshakes are installed only for cancellation; observers receive
     ordered completed-capacity snapshots without an internal event queue.
     numerical requests and their original per-capacity order are unchanged.
     """
-    for value, name in ((evaluate_requests, 'evaluate_requests'),
-                        (progress_callback, 'progress_callback'), (cancelled, 'cancelled')):
+    for value, name in ((progress_callback, 'progress_callback'), (cancelled, 'cancelled')):
         if value is not None and not callable(value):
             raise TypeError(f'{name} must be callable or None')
     if type(keep_raw_phi) is not bool:
@@ -110,7 +106,7 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
     terms = tuple(_array(value) for value in model.node_terms(initial))
     if len(terms) != 3 or any(value.shape != ((model.n,) if index == 0 else shape) or not np.isfinite(value).all() for index, value in enumerate(terms)):
         raise ArithmeticError('Initial tree likelihood terms are invalid')
-    profile = getattr(model, "fit_multiplicity", "marginal") == "profile"
+    profile = model.fit_multiplicity == "profile"
     slopes = model.fit_backend.profile_slopes(initial) if profile else (terms[1], terms[1])
     edges = _array(tree.edges, np.int32)
     canonical = _array(tree.canonical_node_order, np.int32)
@@ -204,15 +200,9 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
                     stats['native_continuation_owner_submissions'] += 1
                     stats['native_continuation_terms_requests'] += len(numerical)
                     stats['native_continuation_batch_max'] = max(stats['native_continuation_batch_max'], len(numerical))
-                    if evaluate_requests is None:
-                        from .model import RegionalModel
-                        if (type(model) is RegionalModel and model.backend.kind == "cuda"
-                                and "node_terms" not in vars(model)):
-                            replies = model.backend.node_terms_batch(np.stack([x for _, x in numerical]))
-                        else:
-                            replies = [model.node_terms(x) for _, x in numerical]
-                    else:
-                        replies = list(evaluate_requests(numerical))
+                    replies = (model.backend.node_terms_batch(np.stack([x for _, x in numerical]))
+                               if model.backend.kind == "cuda" else
+                               [model.node_terms(x) for _, x in numerical])
                     if len(replies) != len(requests):
                         raise NativeExecutionError('Continuation evaluator returned incomplete ordered replies')
                     for (task, sequence), reply, (_, x) in zip(requests, replies, numerical):

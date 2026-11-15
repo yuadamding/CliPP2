@@ -226,14 +226,14 @@ class NativeBackend:
         lib.CliPP2RefitGroupsBatch.argtypes = [ct.c_void_p, ct.c_int64, _I, _I, _D, _D, _D,
             _D, _D, ct.POINTER(ct.c_int32), _I, _D, _B]
         lib.CliPP2RefitGroupsBatch.restype = ct.c_int
-        if kind == "cpu" and hasattr(lib, "CliPP2ProbabilityReuseDiagnostics"):
+        if kind == "cpu":
             lib.CliPP2ProbabilityReuseDiagnostics.argtypes = [ct.c_void_p, _I]
             lib.CliPP2ProbabilityReuseDiagnostics.restype = ct.c_int
         self.kind, self.n, self.r = kind, model.n, model.r
         self.cpu_threads = resolve_cpu_threads(cpu_threads)
         fields = [_array(value.T) for value in (
             model.alt, model.depth-model.alt, model.scaling, model.constants, model.lower, model.upper)]
-        minimum = np.asarray(getattr(model, "multiplicity_min", np.ones_like(model.support, dtype=np.int64)))
+        minimum = np.asarray(model.multiplicity_min)
         support = np.asarray(model.support)
         if (minimum.shape != (model.n, model.r) or support.shape != minimum.shape
                 or minimum.dtype.kind not in "iu" or support.dtype.kind not in "iu"):
@@ -372,8 +372,7 @@ class NativeBackend:
             diagnostics["scoring"] = self.scoring_diagnostics()
             diagnostics["scoring_arena"] = self.scoring_arena_diagnostics()
             diagnostics["scoring_requests"] = self.scoring_request_diagnostics()
-            if hasattr(self.lib, "CliPP2ResidentExecutionDiagnostics"):
-                diagnostics["resident_execution"] = self.resident_execution_diagnostics()
+            diagnostics["resident_execution"] = self.resident_execution_diagnostics()
             diagnostics["probability_reuse"] = self.probability_reuse_diagnostics()
             diagnostics["proposal_scans"] = self._counter_diagnostics("CliPP2CUDAProposalDiagnostics",
                 ("chunks", "positive_pairs", "subset_gathers", "subset_values"))
@@ -382,7 +381,7 @@ class NativeBackend:
                 ("resident_bytes", "resident_peak_bytes", "optional_cache_bytes", "grid_hits", "grid_misses",
                 "grid_reused_cells", "refit_physical_emission_cells", "grid_cache_host_bytes",
                 "scoring_host_bytes"))
-        if self.kind == "cpu" and hasattr(self.lib, "CliPP2ProbabilityReuseDiagnostics"):
+        if self.kind == "cpu":
             diagnostics["probability_reuse"] = self._counter_diagnostics("CliPP2ProbabilityReuseDiagnostics",
                 ("plans", "basis_components", "shape_evaluations",
                  "ordered_row_references", "peak_optional_plan_reservation"))

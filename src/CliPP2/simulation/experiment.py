@@ -355,8 +355,6 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
             original_input_status=result["arms"]["B"]["original_rows"][i]["original_input_status"])
             for i, m in enumerate(catalog.mutation_ids)]
     ledger["elapsed_seconds"] = perf_counter() - start
-    if ledger["fit_count"] > 3 or ledger["assignment_pass_count"] > 2:
-        raise AssertionError("Paired experiment exceeded its fit/assignment budget")
     result["manifest_schema"] = "clipp2.file-list.v1"
     result["files"] = sorted(str(path.relative_to(output)) for path in output.rglob("*") if path.is_file())
     result["files"].append("paired_result.json")

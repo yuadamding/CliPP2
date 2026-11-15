@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from CliPP2.assignment import (AssignmentBundle, AssignmentResult, POSTERIOR_FIELDS,
-    assign_mutations, derive_assignment_bundle, profile_score_summary, _validated_profile_terms)
+    assign_mutations, derive_assignment_bundle, profile_score_summary)
 from CliPP2.io.assignment import (load_assignment_bundle, save_assignment_bundle,
     validate_assignment_result)
 from CliPP2.kernel.backend import NativeBackend
@@ -109,10 +109,6 @@ def run_checks(root, *, device="cpu"):
         if state != "observed":
             assert answer.assignments[0]["final_assignment_label"] is None
 
-    for status, value in ((2, 0.), (3, 0.), (4, 0.), (9, 0.), (0, np.nan), (0, np.inf), (0, -np.inf), (1, 0.)):
-        _fails(lambda: _validated_profile_terms({"status": [[status]], "max_component_log_mass": [[value]]}, [[True]]), ArithmeticError)
-    assert _validated_profile_terms({"status": [[4]], "max_component_log_mass": [[np.nan]]}, [[False]])[0, 0] == 0
-    assert np.isneginf(_validated_profile_terms({"status": [[1]], "max_component_log_mass": [[-np.inf]]}, [[True]])[0, 0])
     with patch.object(NativeBackend, "joint_columns", side_effect=RuntimeError("mandatory scorer failure")):
         _fails(lambda: assign_mutations(profile), RuntimeError)
     with patch.object(NativeBackend, "component_diagnostics", side_effect=RuntimeError("optional regional diagnostic failure")):

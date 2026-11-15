@@ -122,6 +122,17 @@ other regions. Each conditional coordinate search can be global, but the full
 multiregion fit is local. Whole-group caches reuse unchanged memberships and
 full starting vectors; independent scalar caches are used only with `None`.
 
+Set `fit_multiplicity="profile"` in the workflow plan, or pass
+`--fit-multiplicity profile` to `clipp2 fit`, to select profile center fitting.
+Stage 3 retains its separately configured assignment method.
+
+With `max_multiplicity_difference=None`, emissions and pooled pilots factor by
+region, marginal scores subtract each regional interval-width normalizer, and
+center refits are scalar. Independent profile refits search adjacent-branch
+breakpoints and bounded derivative roots to find a scalar global maximum.
+That guarantee does not extend to joint group refits. Profile scores use raw
+binomial maxima, including binomial coefficients, without prior normalization.
+
 ## Model selection and Stage 3
 
 At fitted centers, mixture weights maximize the constrained marginal likelihood:

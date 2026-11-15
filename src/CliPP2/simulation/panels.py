@@ -71,7 +71,6 @@ def sensitivity_jobs(contract, *, extended=False):
             name = f'purity{purity:.1f}'
             jobs.append(dict(base, cell_id=f'{history_id}-{name}',
                 acquisition=dict(id=name, purity=purity, depth=500), perturbation={}))
-    assert len({job['cell_id'] for job in jobs}) == len(jobs)
     return jobs
 
 

@@ -74,7 +74,6 @@ def _roster_retry(root):
     summary = status(root)
     assert summary["development_assessed"]
     assert summary["planned_main_cells"] == 4 and summary["planned_development_cells"] == 2
-    assert summary["conditional_development_extension_cells"] == 0
     return dict(default_keeps_failure=True, explicit_retry_preserves_roster=True,
                 prior_evidence_unchanged=True, revised_assessment_appended=True,
                 main_proceeds_with_recorded_development_failures=True)

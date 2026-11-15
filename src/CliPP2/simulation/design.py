@@ -92,6 +92,7 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
         raise ValueError("Declared replicates exceed the supplied study design")
     replicate_roster = dict(unit="variant" if cohort else "family", main=list(range(1, main+1)),
         development=list(range(1, development+1)))
+    config = workflow_config(max_multiplicity_difference=max_multiplicity_difference)
     return dict(schema="clipp2.simulation-contract.v9", study_version=STUDY_VERSION,
         implementation_version=__version__,
         run_manifest_id=validate_run_manifest_id(run_manifest_id if run_manifest_id is not None
@@ -107,9 +108,9 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
             selection_performed=False, performance_controls_main_execution=False,
             population="all declared development histories and acquisitions",
             failures="retained in planned-population accounting; no fabricated estimates"),
-        base_workflow_config=asdict(workflow_config(max_multiplicity_difference=max_multiplicity_difference)),
+        base_workflow_config=asdict(config),
         evaluation=dict(record_schema="clipp2.simulation.evaluation.v7",
-            assignment_method=workflow_config().stage_three_assignment_method,
+            assignment_method=config.stage_three_assignment_method,
             reference_policy=STAGE_THREE_REFERENCE_POLICY,
             primary="data-supported MAP sampled-region clonality, detailed membership and CCF error",
             reference_match_atol=reference_match_atol, reference_distance="l2",
@@ -128,7 +129,7 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
 
 def _replicates(contract):
     roster = contract["replicate_roster"]
-    if contract.get("schema") == "clipp2.simulation-contract.v9" and set(roster) != {"unit", "main", "development"}:
+    if set(roster) != {"unit", "main", "development"}:
         raise ValueError("The current protocol requires one main and one development replicate block")
     maximums = (10, 2) if contract.get("cohort") else (50, 10)
     if roster.get("unit") != ("variant" if contract.get("cohort") else "family"):
@@ -149,9 +150,7 @@ def roster_counts(contract):
     factor = blocks // len(contract["families"])
     main = blocks*len(roster["main"])*len(contract["acquisitions"])
     development = blocks*len(roster["development"])*len(contract["development_acquisitions"])
-    extension = blocks*len(roster.get("development_extension", ()))*len(contract["development_acquisitions"])
     return dict(planned_main_datasets=main, planned_development_datasets=development,
-        conditional_development_extension_datasets=extension,
         main_histories_per_family=factor*len(roster["main"]),
         development_histories_per_family=factor*len(roster["development"]),
         planned_core_max_fits=3*(main+development), planned_core_max_assignment_passes=2*(main+development))

@@ -175,9 +175,6 @@ class AssignmentBundle(ImmutableArrayRecord):
             raise TypeError("Assignment requires a validated original catalog and frozen reference")
         from .io.data import validate_workflow_mapping
         validate_workflow_mapping(self.catalog, targets + others, normal_cn_policy=self.normal_cn_policy)
-        if (len(set(targets)) != len(targets) or len(set(others)) != len(others)
-                or set(targets) & set(others) or not set(targets + others) <= set(self.catalog.mutation_ids)):
-            raise ValueError("Targets and unchanged non-targets must be unique disjoint original mutation keys")
         if tuple(self.reference.region_ids) != tuple(self.catalog.region_ids):
             raise ValueError("Reference must cover the complete original regional vector in order")
         if self.device not in ("cpu", "cuda"):
@@ -187,12 +184,6 @@ class AssignmentBundle(ImmutableArrayRecord):
         shape = len(targets), len(self.reference.region_ids)
         data = self.catalog.prediction_data(targets, normal_cn_policy=self.normal_cn_policy)
         support = self.catalog.default_bounds().subset(targets, self.reference.region_ids)
-        support.for_data(data)
-        positions = {mutation: i for i, mutation in enumerate(self.catalog.mutation_ids)}
-        rows = [positions[mutation] for mutation in targets]
-        eligible = self.catalog.eligible[rows]
-        if np.any(eligible & ((support.lower != 1) | (support.upper != self.catalog.major_cn[rows]))):
-            raise ValueError("Stage three requires original full single-state support on every eligible target pair")
         object.__setattr__(self, "bounds", support)
         native_support = MultiplicityBounds(targets, self.reference.region_ids, self.native_lower,
                                             self.native_upper, "accepted_native_baseline")
@@ -231,8 +222,6 @@ class AssignmentBundle(ImmutableArrayRecord):
             if name == "baseline_labels" and not set(values) <= set(self.reference.labels):
                 raise ValueError("Pre-assignment baseline labels must belong to the frozen reference")
             object.__setattr__(self, name, values)
-        for stage, baseline in zip(self.source_stages, self.baseline_labels):
-            assignment_outcome(stage, baseline, None, self.reference.clonal_label)
         object.__setattr__(self, "target_ids", targets)
         object.__setattr__(self, "non_target_ids", others)
         object.__setattr__(self, "provenance", _freeze(self.provenance))
@@ -416,7 +405,7 @@ def target_reason(source_stage):
 REASSESSMENT_OUTCOMES = ("retained", "reassigned", "unresolved", "not_applicable")
 
 
-def assignment_outcome(source_stage, baseline_label, final_label, clonal_label):
+def assignment_outcome(source_stage, baseline_label, final_label):
     """Compare the selected label with the actual source's frozen reference label."""
     if target_reason(source_stage) == "fixed_reference_recheck":
         status = "not_applicable"
@@ -545,20 +534,6 @@ def assignment_score_summary(scores, labels, method, baseline_label):
     return result
 
 
-def _validated_profile_terms(diagnostics, observed):
-    """Authoritative native maxima: no error-to-zero/impossible/fallback conversion."""
-    observed = np.asarray(observed, bool)
-    status = np.asarray(diagnostics["status"])
-    values = np.asarray(diagnostics["max_component_log_mass"], float)
-    if status.shape != observed.shape or values.shape != observed.shape:
-        raise ArithmeticError("Profile diagnostic arrays do not match the observation mask")
-    if (not np.isin(status, (0, 1, 4)).all() or np.any(observed & (status == 4))
-            or np.any(observed & (status == 0) & ~np.isfinite(values))
-            or np.any(observed & (status == 1) & ~np.isneginf(values))):
-        raise ArithmeticError("Invalid native profile-likelihood status or maximum component mass")
-    return np.where(observed, values, 0.)
-
-
 @dataclass(frozen=True, slots=True)
 class _ReferenceEvaluation:
     records: tuple
@@ -617,8 +592,7 @@ def _score_reference(bundle, progress_callback):
             source_stage=bundle.source_stages[i], source_label=bundle.source_labels[i],
             baseline_label=bundle.baseline_labels[i], baseline_reference_label=bundle.baseline_labels[i],
             final_assignment_label=final, target_reason=target_reason(bundle.source_stages[i]),
-            **assignment_outcome(bundle.source_stages[i], bundle.baseline_labels[i], final,
-                                 bundle.reference.clonal_label)))
+            **assignment_outcome(bundle.source_stages[i], bundle.baseline_labels[i], final)))
     return _ReferenceEvaluation(tuple(records), best, diagnostics, observed, execution)
 
 

@@ -6,7 +6,7 @@ from types import MappingProxyType
 
 import numpy as np
 
-from ..kernel.model import FitResult, RegionalModel
+from ..kernel.model import FitResult
 from ..kernel.topology import (FrozenTree, LabelKey, LabelOrder, Membership, PreparedPartition,
                                canonical_partition, partition_from_cuts)
 from ..kernel.backend import ScientificCandidateRejection
@@ -134,7 +134,7 @@ class CandidateBank:
 
     def prepare_single_move(self, parent, row, destination, centers):
         """Prepare only the changed groups, once, from a frozen eligible parent."""
-        if (parent.model_identity != getattr(self.model, "identity", "")
+        if (parent.model_identity != self.model.identity
                 or parent.tree_identity != self._tree_identity):
             raise ValueError("Single move parent belongs to another model/tree")
         started = perf_counter()
@@ -147,14 +147,9 @@ class CandidateBank:
             source = int(labels[row])
             if source == destination:
                 raise ValueError("A single move must change the assigned group")
-            members = (groups[source].members if groups else np.flatnonzero(labels == source))
+            members = groups[source].members
             if len(members) == 1:
                 return None, None, "empty_source_cluster"
-            if not groups:
-                proposed = labels.copy()
-                proposed[row] = destination
-                canonical, initial = canonical_partition(proposed, centers)
-                return self.prepare(None, canonical, parent=parent), initial, None
             groups[source] = self.model.prepare_group(members[members != row])
             members = groups[destination].members
             groups[destination] = self.model.prepare_group(np.insert(members, np.searchsorted(members, row), row))
@@ -191,40 +186,33 @@ class CandidateBank:
         """
         if labels is None:
             labels = partition_from_cuts(self.tree, cuts)
-        groups, coordinate_fits, group_fits = (), (), ()
-        if hasattr(self.model, "prepare_group"):
-            counts = np.bincount(labels)
-            reusable = {}
-            if parent is not None:
-                for index, group in enumerate(parent.groups):
-                    target = int(labels[group.members[0]])
-                    if counts[target] == len(group.members) and np.all(labels[group.members] == target):
-                        reusable[target] = (group, parent.coordinate_fits[index]
-                                            if parent.coordinate_fits else None,
-                                            parent.group_fits[index] if parent.group_fits else None)
-            prepared, reused, reused_groups = [], [], []
-            for cluster in range(int(np.max(labels)) + 1):
-                group, previous, previous_group = reusable.get(cluster, (None, None, None))
-                prepared.append(self.model.prepare_group(np.flatnonzero(labels == cluster))
-                                if group is None else group)
-                reused.append(previous)
-                reused_groups.append(previous_group)
-            groups = tuple(prepared)
-            coordinate_fits = tuple(reused)
-            group_fits = tuple(reused_groups)
-        if fitted is not None and getattr(fitted, "coordinate_fits", None) is not None:
-            if (hasattr(self.model, "method_identity") and
-                    fitted.fit_objective_id != self.model.method_identity["fit_objective_id"]):
-                raise ValueError("Coordinate fits belong to another fitting objective")
+        counts = np.bincount(labels)
+        reusable = {}
+        if parent is not None:
+            for index, group in enumerate(parent.groups):
+                target = int(labels[group.members[0]])
+                if counts[target] == len(group.members) and np.all(labels[group.members] == target):
+                    reusable[target] = (group, parent.coordinate_fits[index]
+                                        if parent.coordinate_fits else None,
+                                        parent.group_fits[index] if parent.group_fits else None)
+        prepared, reused, reused_groups = [], [], []
+        for cluster in range(int(np.max(labels)) + 1):
+            group, previous, previous_group = reusable.get(cluster, (None, None, None))
+            prepared.append(self.model.prepare_group(np.flatnonzero(labels == cluster))
+                            if group is None else group)
+            reused.append(previous)
+            reused_groups.append(previous_group)
+        groups, coordinate_fits, group_fits = tuple(prepared), tuple(reused), tuple(reused_groups)
+        if fitted is not None and fitted.fit_objective_id != self.model.method_identity["fit_objective_id"]:
+            raise ValueError("Prepared fits belong to another fitting objective")
+        if fitted is not None and fitted.coordinate_fits is not None:
             coordinate_fits = tuple(tuple(tuple(value) for value in group)
                                     for group in fitted.coordinate_fits)
-        if fitted is not None and getattr(fitted, "group_fits", None) is not None:
-            if fitted.fit_objective_id != self.model.method_identity["fit_objective_id"]:
-                raise ValueError("Group fits belong to another fitting objective")
+        if fitted is not None and fitted.group_fits is not None:
             group_fits = fitted.group_fits
-        if columns is not None and getattr(columns, "aggregation", "marginal") != "marginal":
+        if columns is not None and columns.aggregation != "marginal":
             raise ValueError("Prepared parents require marginal selection columns")
-        return PreparedPartition(getattr(self.model, "identity", ""), self._tree_identity,
+        return PreparedPartition(self.model.identity, self._tree_identity,
                                  Membership(self.tree, cuts) if cuts is not None else Membership(explicit_labels=labels),
                                  labels, groups, coordinate_fits,
                                  columns if parent is None else parent.selection_columns, group_fits)
@@ -241,7 +229,7 @@ class CandidateBank:
 
     def consider_prepared(self, partition, centers, provenance):
         if (partition.tree_identity != self._tree_identity
-                or partition.model_identity != getattr(self.model, "identity", "")):
+                or partition.model_identity != self.model.identity):
             raise ValueError("Prepared partition belongs to another model/tree")
         found, candidate = self._cached(partition.membership.key, centers, provenance)
         if not found:
@@ -295,19 +283,13 @@ class CandidateBank:
         return False, None
 
     def _consider(self, partition, centers, provenance):
-        labels = partition.labels
         provenance = _plain(provenance)
         started = perf_counter()
         self.refit_calls += 1
         try:
-            if self.request_progress is not None and type(self.model) is RegionalModel:
-                fitted = self.model.refit_prepared(
-                    partition, initial_centers=centers,
-                    progress_callback=lambda operation: self.request_progress(self, provenance, operation))
-            else:
-                fitted = (self.model.refit_prepared(partition, initial_centers=centers)
-                          if hasattr(self.model, "refit_prepared")
-                          else self.model.refit(labels, initial_centers=centers))
+            fitted = self.model.refit_prepared(partition, initial_centers=centers,
+                progress_callback=None if self.request_progress is None else
+                lambda operation: self.request_progress(self, provenance, operation))
         finally:
             self.refit_seconds += perf_counter()-started
         return self._commit(partition, centers, provenance, fitted)
@@ -321,7 +303,7 @@ class CandidateBank:
 
     def _commit_result(self, partition, centers, provenance, fitted):
         """Publish exactly one completed fit, always in original request order."""
-        membership, cuts, labels = partition.membership.key, partition.cuts, partition.labels
+        membership, cuts = partition.membership.key, partition.cuts
         provenance = _plain(provenance)
         attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)
         outcome = _outcome_kind(fitted)
@@ -338,45 +320,22 @@ class CandidateBank:
             self._store_outcome(attempt, outcome, fitted.reason, None,
                                 fitted if outcome == "completed_ineligible" else None)
             return None
-        # Prepared results share this exact membership; reuse its active labels
-        # instead of expanding the same retained tree cuts again for validation.
-        fitted_labels = (labels if isinstance(fitted, FitResult)
-                         and fitted.membership is partition.membership else fitted.labels)
-        canonical, aligned = _canonical_inputs(fitted_labels, fitted.centers, self.model.n, self.model.r)
-        if not np.array_equal(canonical, labels):
+        if fitted.membership is not partition.membership:
             raise ValueError("Conditional refit changed the proposed membership")
-        order = list(dict.fromkeys(np.asarray(fitted_labels, dtype=int).tolist()))
-        weights = np.asarray(fitted.weights, dtype=float)
-        if (weights.shape != (len(order),) or not np.isfinite(weights).all()
+        q = len(partition.groups)
+        if fitted.centers.shape != (q, self.model.r) or not np.isfinite(fitted.centers).all():
+            raise ValueError("Eligible fitted centers must be finite occupied q by R rows")
+        weights = fitted.weights
+        if (weights.shape != (q,) or not np.isfinite(weights).all()
                 or np.any(weights <= 0) or not np.isclose(weights.sum(), 1., atol=1e-12, rtol=0)):
             raise ValueError("Eligible fitted weights must be positive normalized occupied rows")
         if not np.isfinite([fitted.conditional_log_likelihood, fitted.mixture_log_likelihood,
                             fitted.complexity_penalty, fitted.score]).all():
             raise ValueError("An eligible candidate has nonfinite likelihood, penalty or score")
-        weights = weights[order]
-        state_key = membership, aligned.tobytes(), weights.tobytes()
+        state_key = membership, fitted.centers.tobytes(), weights.tobytes()
         candidate = self._states.get(state_key)
         if candidate is None:
-            coordinate_fits = getattr(fitted, "coordinate_fits", None)
-            if coordinate_fits is not None:
-                coordinate_fits = np.asarray(coordinate_fits)[order]
-            group_fits = getattr(fitted, "group_fits", None)
-            if group_fits is not None:
-                group_fits = tuple(group_fits[index] for index in order)
-            # Production prepared refits already own the exact compact membership.
-            # Keep validating generic/public refits before aligning their row order.
-            state = fitted
-            if (not isinstance(fitted, FitResult) or fitted.membership is not partition.membership
-                    or order != list(range(len(order)))):
-                state = FitResult(partition.membership, aligned, weights,
-                                  float(fitted.conditional_log_likelihood), float(fitted.mixture_log_likelihood),
-                                  float(fitted.complexity_penalty), float(fitted.score), True,
-                                  fitted.reason, fitted.diagnostics, coordinate_fits,
-                                  getattr(fitted, "fitting_log_likelihood", None),
-                                  getattr(fitted, "fit_objective_id", "uniform_multiplicity_marginal_v1"),
-                                  getattr(fitted, "selection_criterion_id", "marginal_mixture_bic_at_fitted_centers_v1"),
-                                  group_fits)
-            candidate = Candidate(state, [provenance], len(self.candidates))
+            candidate = Candidate(fitted, [provenance], len(self.candidates))
             self.candidates.append(candidate)
             self._states[state_key] = candidate
         else:
@@ -425,7 +384,7 @@ class CandidateBank:
 
         Each request is ``(cuts_or_None, labels, centers, provenance, parent)``.
         Duplicate memberships and existing attempt/structural hits are ordering
-        barriers. Custom models/overrides retain ordinary serial consideration.
+        barriers. CPU requests retain ordinary serial consideration.
         """
         def prepared():
             for cuts, labels, centers, provenance, parent in requests:
@@ -445,9 +404,7 @@ class CandidateBank:
         """One prepared numerical path, with exact-cache logical order barriers."""
 
         model = self.model
-        enabled = (self.weight_batch_size > 1 and type(model) is RegionalModel
-                   and model.backend.kind == "cuda" and not any(name in vars(model) for name in
-                       ("refit", "refit_prepared", "_refit_groups", "_refit_steps", "_weight_result")))
+        enabled = self.weight_batch_size > 1 and model.backend.kind == "cuda"
         if not enabled:
             return [self.consider_prepared(partition, centers, provenance)
                     for partition, centers, provenance in requests]
@@ -492,7 +449,7 @@ class CandidateBank:
             results.append(None)
             partition, centers, provenance = item
             if (partition.tree_identity != self._tree_identity
-                    or partition.model_identity != getattr(model, "identity", "")):
+                    or partition.model_identity != model.identity):
                 raise ValueError("Prepared partition belongs to another model/tree")
             membership = partition.membership.key
             attempt = (membership, None if centers is None else centers.tobytes(), self.numerical_policy)

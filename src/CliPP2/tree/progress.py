@@ -64,7 +64,7 @@ class ProgressReporter:
             "requested_k": requested,
             "occupied_q": occupied,
             "route": provenance.get("route"), "membership_audit": self.audit,
-            "telemetry": dict(getattr(self.model, "telemetry", {})),
+            "telemetry": {} if self.model is None else dict(self.model.telemetry),
         }
         if bank is not None:
             record["candidates"] = {
@@ -75,9 +75,8 @@ class ProgressReporter:
                 "ineligible_tree_partitions": len(bank.ineligible),
                 "general_rejections": len(bank.general_rejections),
             }
-        backend = getattr(self.model, "backend", None)
-        if backend is not None:
+        if self.model is not None:
             # Native diagnostics copy already-maintained host counters; they do
             # not call cudaStreamSynchronize or add work to optimizer iterations.
-            record["native"] = backend.diagnostics()
+            record["native"] = self.model.backend.diagnostics()
         self.callback(deepcopy(record))

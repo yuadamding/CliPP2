@@ -18,7 +18,7 @@ from CliPP2.simulation.biology import generate_history
 # Import before history-generator mocks: controls binds biology helpers at import time.
 from CliPP2.simulation import controls
 from CliPP2.simulation.design import jobs, roster_counts, make_contract, workflow_config
-from CliPP2.simulation.runtime import qualification_costs, recorded_costs, status
+from CliPP2.simulation.runtime import recorded_costs, status
 from CliPP2.simulation.study import (_execute, _paired_result, _prepare_histories,
                                     _run_cell, read_json, report, save_json)
 
@@ -291,7 +291,6 @@ def _optional_execution_report_check(root):
         for name, enabled, cells, expected in cases:
             directory = root / name
             contract = make_contract(mutations=12, segments=2, regions=4, workers=1)
-            contract.pop("replicate_roster")
             contract["optional_panels"].update(technical_sensitivity=enabled, extended_sensitivity=enabled)
             save_json(directory / "study_contract.json", contract)
             summary = dict(fit_count=0, assignment_pass_count=0, report_mode="cached_metrics",
@@ -322,8 +321,7 @@ def _report_integrity_check(root):
     from CliPP2.simulation.evaluation import evaluation_definition
     definition = evaluation_definition()
     contract = make_contract(mutations=12, segments=2, regions=4, workers=1)
-    contract.pop("replicate_roster")
-    contract.update(families=["S01"], profile="full")
+    contract.update(families=["S01"], acquisitions=["A1"])
     jobs = [dict(cell_id=f"integrity-{i}", history_id=f"integrity-h{i}", family="S01",
                  phase="main", acquisition=dict(id="A1", purity=.8, depth=100)) for i in range(4)]
     records = []
@@ -336,8 +334,8 @@ def _report_integrity_check(root):
                 for name, value in zip(("execution_available", "evaluation_available", "scientifically_applicable"), states)]))
 
     def prepare(directory, values):
+        contract["replicate_roster"].update(main=list(range(1, len(values)+1)), development=[1])
         save_json(directory / "study_contract.json", contract)
-        save_json(directory / "allocation.json", dict(planned_main_datasets=len(values), resource_reduction_applied=False))
         payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"],
             identity_policy="semantic_jobs_without_cohort_path", jobs=jobs[:len(values)])
         save_json(directory / "main_roster.json", dict(payload, roster_id=content_hash(payload)))
@@ -367,7 +365,7 @@ def _report_integrity_check(root):
                           and x["name"] == "evaluation_available")
             assert metric["unavailable_derived_cells"] == row["unavailable_derived"]
             assert metric["unknown_evaluation_cells"] == row["evaluation_unknown"]
-        assert "did not use timing or disk measurements" in Path(output["report"]).read_text()
+        assert "timing and disk measurements did not select its membership" in Path(output["report"]).read_text()
         bad = [None, [], dict(records[0], metrics=None), dict(records[0], metrics=[None]),
                dict(records[0], cell_id="other"), dict(records[0], evaluation_definition_id="invalid")]
         for index, value in enumerate(bad):
@@ -421,11 +419,11 @@ def _partial_evidence_report_checks(root):
 
     def publish_case(directory, evaluations):
         contract = make_contract(mutations=12, segments=2, regions=4, workers=1)
-        contract.pop("replicate_roster")
         contract["families"] = ["S01"]
         roster = [job(index) for index in range(len(evaluations))]
+        contract["acquisitions"] = ["A1"]
+        contract["replicate_roster"].update(main=list(range(1, len(roster)+1)), development=[1])
         save_json(directory / "study_contract.json", contract)
-        save_json(directory / "allocation.json", dict(planned_main_datasets=len(roster), main_histories_per_family=len(roster)))
         payload = dict(schema="clipp2.simulation-roster.v1", families=["S01"],
             identity_policy="semantic_jobs_without_cohort_path", jobs=roster)
         save_json(directory / "main_roster.json", dict(payload, roster_id=content_hash(payload)))
@@ -638,7 +636,6 @@ def _structured_failure_checks(root):
 def _independent_controls_checks(root, contract):
     frozen = deepcopy(contract)
     with patch.object(controls, "run_controls", side_effect=AssertionError("automatic controls")), \
-            patch.object(controls, "run_cohort_controls", side_effect=AssertionError("automatic cohort controls")), \
             patch("CliPP2.simulation.study.run_jobs", return_value=[]) as run, \
             patch("CliPP2.simulation.study.run_optional_panels"), \
             patch("CliPP2.simulation.study.report", return_value={"status": "fixture"}) as summarize:
@@ -648,23 +645,10 @@ def _independent_controls_checks(root, contract):
         assert not (root / "qualification_steps").exists()
         roster = (root / "main_roster.json").read_bytes()
         assessment = (root / "development_assessment.json").read_bytes()
-        # Old failed/interrupted controls are evidence, not a study admission gate.
-        historical = root / "qualification.json"
-        completed = root / "qualification_steps" / "mechanisms" / "attempt-001" / "completion.json"
-        interrupted = root / "qualification_steps" / "cohort" / "attempt-001" / "started.json"
-        save_json(historical, dict(status="failed", historical=True))
-        save_json(completed, dict(status="failed",
-            cost_ledger=dict(fit_count=0, assignment_pass_count=2, events=[])))
-        save_json(interrupted, dict(status="started"))
-        originals = {path: path.read_bytes() for path in (historical, completed, interrupted)}
         assert _execute(root, frozen, resume=True) == {"status": "fixture"}
         assert run.call_count == 4 and summarize.call_count == 2
         assert (root / "main_roster.json").read_bytes() == roster
         assert (root / "development_assessment.json").read_bytes() == assessment
-        assert all(path.read_bytes() == content for path, content in originals.items())
-    costs = qualification_costs(root)
-    assert costs["known_costs"]["assignment_pass_count"] == 2
-    assert costs["unknown_cost_attempts"] == 1
     return root
 
 
