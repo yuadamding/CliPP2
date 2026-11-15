@@ -134,7 +134,8 @@ def _run_cell(task):
     if prior is not None:
         value = prior
         if (value.get("protocol_version") != PROTOCOL_VERSION
-                or value.get("implementation_version") != __version__):
+                or value.get("implementation_version") != __version__
+                or "max_multiplicity_difference" not in value):
             raise ValueError("Cell replay requires the current execution protocol and implementation; earlier results remain historical")
         if (value["job"] != job or value.get("execution_configs") != task.get("execution_configs")
                 or value.get("evaluation_config") != evaluation_config):
@@ -154,7 +155,7 @@ def _run_cell(task):
         from CliPP2.config import WorkflowConfig
         configurations = task.get("execution_configs") or [asdict(workflow_config())]
         if len(configurations) != 1:
-            raise ValueError("Protocol 2.4 executes exactly one declared workflow configuration")
+            raise ValueError("Protocol 2.5 executes exactly one declared workflow configuration")
         config = WorkflowConfig.from_dict(configurations[0])
         from .biology import history_content_id
         from .acquisition import validate_history_acquisition_link
@@ -213,11 +214,13 @@ def _run_cell(task):
     value["execution_phase"] = execution_phase
     value["execution_configs"] = task.get("execution_configs")
     value["evaluation_config"] = evaluation_config
-    value["evaluation_schema"] = "clipp2.simulation.evaluation.v6"
+    value["evaluation_schema"] = "clipp2.simulation.evaluation.v7"
     value["assignment_method"] = configurations[0].get("stage_three_assignment_method", "marginal")
     fitting = configurations[0].get("fit", {})
+    value["max_multiplicity_difference"] = fitting["max_multiplicity_difference"]
     value["fitting_method_identity"] = fitting_identity(fitting.get("fit_multiplicity", "marginal"),
-                                                       fitting.get("selection_criterion", SELECTION_CRITERION))
+                                                       fitting.get("selection_criterion", SELECTION_CRITERION),
+                                      fitting["max_multiplicity_difference"])
     value["reference_policy"] = STAGE_THREE_REFERENCE_POLICY
     value["protocol_version"] = PROTOCOL_VERSION
     value["implementation_version"] = __version__
@@ -373,7 +376,7 @@ def _freeze_main_roster(root, contract):
 
 def _execute(root, contract, *, resume=False, retry_failed=False):
     root = Path(root).resolve()
-    if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v8"
+    if (contract.get("protocol_version") != PROTOCOL_VERSION or contract.get("schema") != "clipp2.simulation-contract.v9"
             or contract.get("implementation_version") != __version__
             or contract.get("evaluation", {}).get("reference_policy") != STAGE_THREE_REFERENCE_POLICY
             or contract.get("evaluation", {}).get("assignment_method") != resolve_config(contract).stage_three_assignment_method):
@@ -492,15 +495,17 @@ def report(root, *, evaluation_config=None, report_dir=None):
     from .reporting import planned_roster, reevaluate_cell, placeholder_for_cell, validate_cached_evaluation
     root = Path(root).resolve()
     contract = read_json(root / "study_contract.json")
-    fitting = contract.get("base_workflow_config", {}).get("fit", {})
+    resolve_config(contract)
+    fitting = contract["base_workflow_config"]["fit"]
     fitting_method = fitting_identity(fitting.get("fit_multiplicity", "marginal"),
-                                      fitting.get("selection_criterion", SELECTION_CRITERION))
-    if contract.get("schema") != "clipp2.simulation-contract.v8" or contract.get("protocol_version") != PROTOCOL_VERSION:
+                                      fitting.get("selection_criterion", SELECTION_CRITERION),
+                                      fitting["max_multiplicity_difference"])
+    if contract.get("schema") != "clipp2.simulation-contract.v9" or contract.get("protocol_version") != PROTOCOL_VERSION:
         raise ValueError("Reporting requires the current simulation contract")
     reference_policy = contract["evaluation"]["reference_policy"]
-    schema = "clipp2.simulation.evaluation.v6"
+    schema = "clipp2.simulation.evaluation.v7"
     if contract["evaluation"]["record_schema"] != schema:
-        raise ValueError("Study reports require evaluation.v6")
+        raise ValueError("Study reports require evaluation.v7")
     derive = evaluation_config is not None
     if derive and isinstance(evaluation_config, (str, Path)):
         evaluation_config = read_json(evaluation_config)
@@ -509,7 +514,8 @@ def report(root, *, evaluation_config=None, report_dir=None):
             for key in ("reference_match_atol", "reference_distance") if key in contract["evaluation"]}
     evaluation_config = normalize_evaluation_config(evaluation_config)
     definition = evaluation_definition(evaluation_config, reference_policy=reference_policy,
-                    assignment_method=contract["base_workflow_config"]["stage_three_assignment_method"])
+                    assignment_method=contract["base_workflow_config"]["stage_three_assignment_method"],
+                    max_multiplicity_difference=fitting["max_multiplicity_difference"])
     definition_id = content_hash(definition)
     cells = [value for directory in sorted((root / "cells").glob("*")) if directory.is_dir()
              for value in [_latest_completion(directory)] if value is not None]
@@ -523,6 +529,7 @@ def report(root, *, evaluation_config=None, report_dir=None):
                 elapsed_seconds=0., peak_resident_bytes=0, output_bytes=0)) for job in roster["jobs"]]
     evaluations = []
     for cell in main:
+        cell = dict(cell, max_multiplicity_difference=fitting["max_multiplicity_difference"])
         if derive:
             value = reevaluate_cell(root, cell, evaluation_config, evaluation_schema=schema,
                                     reference_policy=reference_policy)
@@ -628,7 +635,7 @@ def _write_report(root, directory, cells, evaluations, summary, figures):
         f"<p>{allocation_description} Repeated acquisitions share physical histories; uncertainty resamples histories and carries all paired arms together. A reduced cohort does not establish rare-event safety or noninferiority.</p>",
         "<h2>Frozen population and settings</h2><pre>"+html.escape(json.dumps(dict(replicate_roster=contract.get("replicate_roster"), counts=allocation,
             workflow_config=contract.get("base_workflow_config"), development_assessments=assessments), indent=2))+"</pre>",
-        "<h2>Applicability and scientific results</h2><p>Unknown and unavailable estimates remain explicit. Exact aliases and absent candidate explanations cannot be resolved by restoring integer support. Diagnostics are measurements; Protocol 2.4 returns method-specific observed MAP estimates without statistical acceptance screens.</p>"]
+        "<h2>Applicability and scientific results</h2><p>Unknown and unavailable estimates remain explicit. Exact aliases and absent candidate explanations cannot be resolved by restoring integer support. Diagnostics are measurements; Protocol 2.5 returns method-specific observed MAP estimates without statistical acceptance screens.</p>"]
     text.append("<h2>Evaluation definition and population</h2><pre>"+html.escape(json.dumps(dict(
         definition=summary.get("evaluation_definition"), report_mode=summary["report_mode"],
         roster_status=summary["roster_status"]), indent=2))+"</pre>")

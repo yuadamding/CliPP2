@@ -1,4 +1,4 @@
-"""Protocol 2.4 orchestration with frozen native fits and biological lineage.
+"""Protocol 2.5 orchestration with frozen native fits and biological lineage.
 
 Biological/numerical identities and native build IDs are retained; file-byte
 and Python-source checksums are intentionally omitted.
@@ -11,13 +11,13 @@ from collections.abc import Mapping
 import numpy as np
 
 from .assignment import (AssignmentBundle, AssignmentReference, EVIDENCE_STATUSES,
-                         assign_mutations, conditional_multiplicity)
+                         assign_mutations, joint_distribution)
 from .config import (PROTOCOL_VERSION, WorkflowConfig,
                      STAGE_THREE_REFERENCE_POLICY)
 from ._version import __version__
 from .io.data import (ImmutableArrayRecord, MultiplicityBounds, content_hash, freeze_record as _freeze,
                       json_value as _json_value, readonly_array)
-from .io.multiplicity import read_floor_bounds
+from .io.multiplicity import read_floor_bounds, reconcile_workflow_bounds
 from .io.tumor_txt import load_original_catalog
 from .kernel.backend import NativeBackend, NativeExecutionError
 from .kernel.observations import prepare_prediction
@@ -29,10 +29,12 @@ CONTRIBUTOR_COLUMNS = ("mutation_id", "region_id", "segment_id", "source_stage",
 GROUP_COLUMNS = ("source_stage", "source_label", "size", "native_center", "distance_to_one", "informative_counts",
     "informative_depths", "minimum_regional_depth", "diagnostic_status", "diagnostic_error") + tuple(
         prefix + "_" + field for prefix in ("native", "all_one", "original_native", "original_all_one")
-        for field in ("informative_count", "mean_profile_deviance", "maximum_profile_deviance"))
+        for field in ("informative_count", "mean_profile_deviance", "maximum_profile_deviance",
+                      "regional_mean_profile_deviance", "regional_maximum_profile_deviance"))
 SEGMENT_POLICY_COLUMNS = ("region_id", "segment_id", "multiplicity_endpoint", "contributor_count",
     "fallback", "fallback_policy", "applies_to", "policy", "lower_bound_policy",
-    "cap_conflict_policy", "lower_bound_override_count")
+    "cap_conflict_policy", "lower_bound_override_count", "joint_range_cap_override_count",
+    "relaxed_read_floor_count", "max_multiplicity_difference")
 ORIGINAL_COMPARISON_COLUMNS = ("mutation_id", "original_eligible", "original_input_status", "exclusion_reasons",
     "stage_one_label", "stage_two_label", "baseline_reference_label", "final_assignment_label", "role", "target_reason", "membership_origin",
     "stage_one_native_phi", "stage_one_native_calls", "stage_two_native_phi", "stage_two_native_calls",
@@ -77,7 +79,7 @@ class AcceptedFit(ImmutableArrayRecord):
     mixture_log_likelihood: float
     complexity_penalty: float
     acceptance_evidence: object
-    normalization: str = "uniform_interval_width_v1"
+    normalization: str | None = None
     producer_receipt: object = None
     compatibility_receipts: tuple = ()
     biological_identity: object = None
@@ -85,15 +87,18 @@ class AcceptedFit(ImmutableArrayRecord):
     tumor_id: str = field(kw_only=True)
     fitting_log_likelihood: float | None = field(default=None, kw_only=True)
     method_identity: object = field(default=None, kw_only=True)
+    max_multiplicity_difference: int | None = field(default=1, kw_only=True)
 
     def __post_init__(self):
         from .config import fitting_identity
-        identity = fitting_identity() if self.method_identity is None else dict(self.method_identity)
-        if identity not in (fitting_identity("marginal"), fitting_identity("profile")):
+        identity = (fitting_identity(max_multiplicity_difference=self.max_multiplicity_difference)
+                    if self.method_identity is None else dict(self.method_identity))
+        if identity not in tuple(fitting_identity(method, max_multiplicity_difference=self.max_multiplicity_difference)
+                                 for method in ("marginal", "profile")):
             raise ValueError("Accepted fit requires a supported complete method identity")
         object.__setattr__(self, "method_identity", _freeze(identity))
         if self.fitting_log_likelihood is None:
-            if identity != fitting_identity():
+            if identity != fitting_identity(max_multiplicity_difference=self.max_multiplicity_difference):
                 raise ValueError("Profile accepted fits require an explicit fitting likelihood")
             object.__setattr__(self, "fitting_log_likelihood", self.conditional_log_likelihood)
         if not np.isfinite(self.fitting_log_likelihood):
@@ -120,7 +125,10 @@ class AcceptedFit(ImmutableArrayRecord):
             raise ValueError("Accepted fit requires positive normalized occupied-component weights")
         if tuple(self.support.mutation_ids) != self.mutation_ids or tuple(self.support.region_ids) != self.region_ids:
             raise ValueError("Accepted support must be keyed to its exact fitted population")
-        if self.normalization != "uniform_interval_width_v1":
+        normalization = identity["multiplicity_normalization_id"]
+        if self.normalization is None:
+            object.__setattr__(self, "normalization", normalization)
+        elif self.normalization != normalization:
             raise ValueError("Saved fit uses an incompatible support normalization")
         if not np.isfinite([self.score, self.conditional_log_likelihood, self.mixture_log_likelihood, self.complexity_penalty]).all():
             raise ValueError("Accepted numerical evidence must be finite")
@@ -140,8 +148,8 @@ class AcceptedFit(ImmutableArrayRecord):
                  "multiplicities", "biological_hash", "model_identity", "score",
                  "conditional_log_likelihood", "mixture_log_likelihood", "complexity_penalty", "normalization",
                  "producer_receipt", "biological_identity", "protocol_version")
-        names += ("fitting_log_likelihood", "method_identity")
-        return content_hash(dict(schema="clipp2.accepted-state.v4", support_hash=self.support.content_hash,
+        names += ("fitting_log_likelihood", "method_identity", "max_multiplicity_difference")
+        return content_hash(dict(schema="clipp2.accepted-state.v5", support_hash=self.support.content_hash,
                                  **{name: getattr(self, name) for name in names}))
 
     def to_dict(self):
@@ -149,17 +157,17 @@ class AcceptedFit(ImmutableArrayRecord):
             "multiplicities", "biological_hash", "model_identity", "score", "conditional_log_likelihood",
             "mixture_log_likelihood", "complexity_penalty", "acceptance_evidence", "normalization",
             "producer_receipt", "compatibility_receipts", "biological_identity", "protocol_version")
-        fields += ("fitting_log_likelihood", "method_identity")
-        return _json_value(dict(schema="clipp2.accepted-fit.v4", **{k: getattr(self, k) for k in fields},
+        fields += ("fitting_log_likelihood", "method_identity", "max_multiplicity_difference")
+        return _json_value(dict(schema="clipp2.accepted-fit.v5", **{k: getattr(self, k) for k in fields},
                                support=self.support.to_dict()))
 
     @classmethod
     def from_dict(cls, value):
         values = dict(value)
         schema = values.pop("schema", None)
-        if (schema != "clipp2.accepted-fit.v4" or values.get("protocol_version") != PROTOCOL_VERSION
-                or not {"tumor_id", "fitting_log_likelihood", "method_identity"} <= values.keys()):
-            raise ValueError("Replay requires a current accepted-fit.v4 receipt with explicit input and method identity")
+        if (schema != "clipp2.accepted-fit.v5" or values.get("protocol_version") != PROTOCOL_VERSION
+                or not {"tumor_id", "fitting_log_likelihood", "method_identity", "max_multiplicity_difference", "normalization"} <= values.keys()):
+            raise ValueError("Replay requires a current accepted-fit.v5 receipt with explicit input and method identity")
         values["support"] = MultiplicityBounds.from_dict(values["support"])
         return cls(**values)
 
@@ -194,14 +202,16 @@ class AcceptedFit(ImmutableArrayRecord):
         from .kernel.model import MODEL_VERSION, INTERVAL_MODEL_VERSION
         run_manifest_id = resolve_current_run_manifest_id(run_manifest_id)
         producer = self.producer_receipt
-        if (not isinstance(producer, Mapping) or producer.get("schema") != "clipp2.fit-producer.v3"
+        suffix = "__joint_multiplicity_range_one_v1" if self.max_multiplicity_difference == 1 else ""
+        model_versions = tuple(version + suffix for version in (MODEL_VERSION, INTERVAL_MODEL_VERSION))
+        if (not isinstance(producer, Mapping) or producer.get("schema") != "clipp2.fit-producer.v4"
                 or producer.get("protocol_version") != self.protocol_version
                 or producer.get("tumor_id") != self.tumor_id
                 or any(not isinstance(producer.get(key), str) or not producer[key]
                        or producer[key] != producer[key].strip()
                        for key in ("implementation_version", "algorithm", "model_version", "kernel_version", "model_identity"))
                 or producer.get("algorithm") != ALGORITHM or producer.get("kernel_version") != KERNEL_VERSION
-                or producer.get("model_version") not in (MODEL_VERSION, INTERVAL_MODEL_VERSION)
+                or producer.get("model_version") not in model_versions
                 or content_hash(producer.get("biological_identity")) != content_hash(self.biological_identity)
                 or not isinstance(producer.get("fit_config"), Mapping)
                 or not isinstance(producer.get("execution"), Mapping)
@@ -212,7 +222,8 @@ class AcceptedFit(ImmutableArrayRecord):
             raise ValueError("Original producer run manifest link differs from its input binding")
         build = producer["run_manifest"].get("build")
         from .config import fitting_identity
-        identity = fitting_identity(original_config.fit_multiplicity, original_config.selection_criterion)
+        identity = fitting_identity(original_config.fit_multiplicity, original_config.selection_criterion,
+                                    original_config.max_multiplicity_difference)
         if self.method_identity != identity:
             raise ValueError("Accepted fitting identity differs from its original configuration")
         if (producer.get("method_identity") != identity
@@ -253,7 +264,8 @@ class AcceptedFit(ImmutableArrayRecord):
         model = RegionalModel(catalog.fit_data(self.mutation_ids, normal_cn_policy=producer["normal_cn_policy"]), device=device,
                               cpu_threads=cpu_threads, multiplicity_support=self.support,
                               fit_multiplicity=original_config.fit_multiplicity,
-                              selection_criterion=original_config.selection_criterion)
+                              selection_criterion=original_config.selection_criterion,
+                              max_multiplicity_difference=original_config.max_multiplicity_difference)
         try:
             if (model.mutation_ids != self.mutation_ids or model.identity != self.model_identity
                     or model.model_version != producer["model_version"]):
@@ -267,7 +279,8 @@ class AcceptedFit(ImmutableArrayRecord):
             calls = model.multiplicity(self.phi)
             if not np.array_equal(calls, self.multiplicities, equal_nan=True):
                 raise ValueError("Saved accepted multiplicities disagree with their native support/CCFs")
-            compatibility = dict(schema="clipp2.fit-compatibility.v3", protocol_version=PROTOCOL_VERSION,
+            compatibility = dict(schema="clipp2.fit-compatibility.v4", protocol_version=PROTOCOL_VERSION,
+                max_multiplicity_difference=self.max_multiplicity_difference,
                 method_identity=dict(self.method_identity),
                 implementation_version=__version__, biological_identity=catalog.biological_identity,
                 tumor_id=self.tumor_id, run_manifest_id=run_manifest_id,
@@ -306,7 +319,8 @@ def _fit_accepted(catalog, ids, bounds, outdir, stage, config, progress_callback
         execution.summary["publication"]["verification"],
         producer_receipt=execution.producer_receipt,
         fitting_log_likelihood=fit.fitting_log_likelihood, method_identity=execution.summary["method_identity"],
-        biological_identity=catalog.biological_identity, tumor_id=catalog.tumor_id)
+        biological_identity=catalog.biological_identity, tumor_id=catalog.tumor_id,
+        max_multiplicity_difference=config.max_multiplicity_difference)
     return replace(accepted, acceptance_evidence=dict(accepted.acceptance_evidence,
                                                      accepted_state_hash=accepted.state_fingerprint))
 
@@ -314,14 +328,17 @@ def _fit_accepted(catalog, ids, bounds, outdir, stage, config, progress_callback
 def _diagnostics_many(catalog, ids, coordinates, bounds, config, calls=None):
     """Reuse prepared observations and one backend for all coordinate screens."""
     observation = prepare_prediction(catalog, ids, bounds, device=config.fit.device,
-                                     cpu_threads=config.fit.cpu_threads, normal_cn_policy=config.normal_cn_policy)
+                                     cpu_threads=config.fit.cpu_threads, normal_cn_policy=config.normal_cn_policy,
+        max_multiplicity_difference=config.fit.max_multiplicity_difference)
     from .screening import profile_deviance_from_diagnostics
     diagnostics = []
     with NativeBackend(observation, cpu_threads=config.fit.cpu_threads) as backend:
         for phi in coordinates:
-            diagnostic = backend.component_diagnostics(phi, accepted_calls=calls)
+            diagnostic = backend.joint_diagnostics(phi, accepted_calls=calls)
+            regional = backend.component_diagnostics(phi)
+            diagnostic["regional_profile_deviance"] = profile_deviance_from_diagnostics(observation, phi, regional)
             if np.any((diagnostic["status"] == 2) | (diagnostic["status"] == 3)):
-                raise NativeExecutionError("Workflow component diagnostics failed")
+                raise NativeExecutionError("Workflow joint diagnostics failed")
             diagnostic["profile_deviance"] = profile_deviance_from_diagnostics(observation, phi, diagnostic)
             values = np.asarray(diagnostic["profile_deviance"])
             if (values.shape != observation.observed.shape or np.isnan(values[observation.observed]).any()
@@ -355,7 +372,12 @@ def collect_cap_contributors(catalog, fit, config, *, mutation_ids=None):
     if not np.array_equal(support.upper[eligible], original_support.upper[eligible]):
         raise ValueError("Cap source requires original multiplicity upper endpoints")
     observation = prepare_prediction(catalog, ids, support, device=config.fit.device,
-        cpu_threads=config.fit.cpu_threads, normal_cn_policy=config.normal_cn_policy)
+        cpu_threads=config.fit.cpu_threads, normal_cn_policy=config.normal_cn_policy,
+        max_multiplicity_difference=config.fit.max_multiplicity_difference)
+    with NativeBackend(observation, cpu_threads=config.fit.cpu_threads) as backend:
+        diagnostic = backend.joint_diagnostics(fit.phi[selected])
+    if np.any(np.isin(diagnostic["status"], (2, 3))):
+        raise NativeExecutionError("Cap-source joint diagnostics failed")
     records = []
     for i, mutation in enumerate(ids):
         source, original = selected[i], positions[mutation]
@@ -368,15 +390,19 @@ def collect_cap_contributors(catalog, fit, config, *, mutation_ids=None):
                 reason = "nongenuine_mapping"
             elif not observation.observed[i, j]:
                 reason = "missing_observation"
+            elif phi == 0:
+                reason = "zero_ccf"
             else:
-                evidence = conditional_multiplicity(catalog, original, j, phi,
-                    int(support.lower[i, j]), int(support.upper[i, j]))
-                reason = ("flat_native_likelihood" if len(evidence["map_tied_values"]) == len(evidence["candidates"])
+                evidence = joint_distribution(diagnostic, i, j,
+                    int(support.lower[i, j]), int(support.upper[i, j]),
+                    alt=observation.alt[i, j], depth=observation.depth[i, j],
+                    scaling=observation.scaling[i, j], phi=phi)
+                reason = ("flat_joint_map_projection" if len(evidence["map_tied_values"]) == len(evidence["candidates"])
                           else "available") if evidence["defined"] else "model_incompatible"
                 if evidence["defined"] and not (support.lower[i, j] <= evidence["map_call"] <= support.upper[i, j]
                         and evidence["map_call"] == int(evidence["map_call"])):
                     raise ArithmeticError("Conditional MAP call lies outside the native support")
-            available = reason in ("available", "flat_native_likelihood")
+            available = reason in ("available", "flat_joint_map_projection")
             records.append(dict(mutation_id=mutation, region_id=region,
                 segment_id=str(catalog.segment_ids[original, j]), source_stage=fit.source_id,
                 source_label=int(fit.labels[source]), native_phi=phi,
@@ -390,7 +416,7 @@ def collect_cap_contributors(catalog, fit, config, *, mutation_ids=None):
                 map_score_gap=evidence["map_score_gap"] if available else None,
                 profile_deviance=evidence["profile_deviance"] if evidence is not None else None,
                 multiplicity_read_informative=available and phi > 0,
-                contributes_to_cap=available, availability_reason=reason,
+                contributes_to_cap=available and phi > 0, availability_reason=reason,
                 diagnostic_status=evidence["diagnostic_status"] if evidence is not None else "not_applicable",
                 diagnostic_error=evidence["diagnostic_error"] if evidence is not None else None))
     return records
@@ -400,7 +426,8 @@ def classify_groups(catalog, fit, config):
     """Measure native groups without acceptance or geometric routing decisions."""
     from .screening import summarize_profile_deviance
     observation = prepare_prediction(catalog, fit.mutation_ids, fit.support, device=config.fit.device,
-        cpu_threads=config.fit.cpu_threads, normal_cn_policy=config.normal_cn_policy)
+        cpu_threads=config.fit.cpu_threads, normal_cn_policy=config.normal_cn_policy,
+        max_multiplicity_difference=config.fit.max_multiplicity_difference)
     coordinates = (fit.phi, np.ones_like(fit.phi))
     diagnostics, error, same = {}, None, False
     try:
@@ -429,9 +456,14 @@ def classify_groups(catalog, fit, config):
                 if diagnostics else dict(informative_count=coverage,
                     mean_profile_deviance=np.full(len(coverage), np.nan), maximum_profile_deviance=np.full(len(coverage), np.nan)))
             record.update({name + "_" + key: values.tolist() for key, values in summary.items()})
+            regional = (summarize_profile_deviance(diagnostics[name]["regional_profile_deviance"][members], mask, axis=0)
+                        if diagnostics else summary)
+            record.update({name + "_regional_" + key: regional[key].tolist()
+                           for key in ("mean_profile_deviance", "maximum_profile_deviance")})
         if same:
             for name in ("native", "all_one"):
-                for field in ("informative_count", "mean_profile_deviance", "maximum_profile_deviance"):
+                for field in ("informative_count", "mean_profile_deviance", "maximum_profile_deviance",
+                              "regional_mean_profile_deviance", "regional_maximum_profile_deviance"):
                     record["original_"+name+"_"+field] = record[name+"_"+field]
         groups.append(record)
     return groups
@@ -538,20 +570,17 @@ def _build_stage_three_inputs(catalog, stage_one, stage_two, selected_group, gro
     return reference, tuple(sorted(g0 + second_ids)), {}, source_map
 
 
-def _stage_two_caps(catalog, audits, *, lower_bounds=None):
-    """Combine native MAP-set caps with each mutation's read-derived floor."""
-    original = catalog.default_bounds()
+def _stage_two_caps(catalog, audits, *, lower_bounds=None, max_multiplicity_difference=1,
+                    return_adjustments=False):
+    """Retain raw donor caps before resolving floors and the joint range rule."""
     if lower_bounds is None:
         lower_bounds, _ = read_floor_bounds(catalog)
-    lower_bounds = lower_bounds.subset(catalog.mutation_ids, catalog.region_ids)
-    lower = lower_bounds.lower
-    if np.any(lower > original.upper):
-        raise ValueError("Read-derived lower endpoints exceed original major CN")
-    upper = np.array(original.upper)
+    raw = np.array(catalog.major_cn)
     contributors = {}
     for record in audits:
         if record["contributes_to_cap"]:
-            key, call = (record["region_id"], record["segment_id"]), int(record["cap_source_map_upper"])
+            key = record["region_id"], record["segment_id"]
+            call = int(record["cap_source_map_upper"])
             previous, count = contributors.get(key, (call, 0))
             contributors[key] = min(previous, call), count + 1
     policies = {}
@@ -563,19 +592,29 @@ def _stage_two_caps(catalog, audits, *, lower_bounds=None):
                 policies[key] = dict(region_id=region, segment_id=key[1],
                     multiplicity_endpoint=endpoint, contributor_count=count,
                     fallback=count == 0, fallback_policy="original_upper",
-                    applies_to="originally_eligible_genuine_pairs", policy="minimum_native_map_set_upper",
+                    applies_to="originally_eligible_genuine_pairs", policy="minimum_projected_joint_map_set_upper",
                     lower_bound_policy=lower_bounds.policy_id,
-                    cap_conflict_policy="raise_upper_to_read_floor", lower_bound_override_count=0)
+                    cap_conflict_policy=("original_major_then_joint_range_then_floor_then_cap"
+                        if max_multiplicity_difference == 1 else "read_floor_then_cap"),
+                    lower_bound_override_count=0, joint_range_cap_override_count=0,
+                    relaxed_read_floor_count=0, max_multiplicity_difference=max_multiplicity_difference)
             if count and catalog.mapping_genuine[i, j] and catalog.eligible[i, j]:
-                policies[key]["lower_bound_override_count"] += int(endpoint < lower[i, j])
-                upper[i, j] = min(original.upper[i, j], max(lower[i, j], endpoint))
-    return MultiplicityBounds(catalog.mutation_ids, catalog.region_ids,
-        lower, upper, "read_floor_lower_minimum_native_map_set_upper"), list(policies.values())
+                raw[i, j] = min(raw[i, j], endpoint)
+    bounds, adjustments = reconcile_workflow_bounds(catalog, lower_bounds, raw,
+        max_multiplicity_difference=max_multiplicity_difference, stage="stage_two")
+    for row in adjustments:
+        policy = policies[row["region_id"], row["segment_id"]]
+        policy["lower_bound_override_count"] += int(row["raw_upper_cap"] < row["effective_lower"])
+        policy["joint_range_cap_override_count"] += int(row["effective_upper"] >
+                                                        max(row["raw_upper_cap"], row["effective_lower"]))
+        policy["relaxed_read_floor_count"] += int(row["effective_lower"] < row["raw_read_floor"])
+    result = bounds, list(policies.values())
+    return (*result, adjustments) if return_adjustments else result
 
 
 def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
                  accepted_stage_one=None, accepted_stage_two=None, run_build_manifest=None, run_manifest_id=None):
-    """Run applicable stages or replay complete accepted-fit.v4 receipts.
+    """Run applicable stages or replay complete accepted-fit.v5 receipts.
 
     Both native stages support explicit replay. Older API summaries/TSVs lack
     the required producer evidence and are not imported or implicitly refitted.
@@ -588,10 +627,12 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable")
     config, output = workflow_config, reserve_output(outdir)
-    common_receipt = dict(schema="clipp2.workflow.v6", protocol_version=PROTOCOL_VERSION,
+    common_receipt = dict(schema="clipp2.workflow.v7", protocol_version=PROTOCOL_VERSION,
         implementation_version=__version__, config=asdict(config),
-        source_policy="nearest_to_one", cap_policy="minimum_native_map_set_upper",
-        cap_conflict_policy="raise_upper_to_read_floor",
+        source_policy="nearest_to_one", cap_policy="minimum_projected_joint_map_set_upper",
+        cap_conflict_policy=("original_major_then_joint_range_then_floor_then_cap"
+            if config.fit.max_multiplicity_difference == 1 else "read_floor_then_cap"),
+        max_multiplicity_difference=config.fit.max_multiplicity_difference,
         reference_policy=STAGE_THREE_REFERENCE_POLICY,
         reassessment_policy="all_combined_fitted_mutations",
         provenance_policy="biological_and_numerical_identity_no_file_checksums")
@@ -643,8 +684,14 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
     informative = catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)
     population = tuple(m for m, keep in zip(catalog.mutation_ids, informative.any(axis=1)) if keep)
     full = catalog.default_bounds()
-    fitting_bounds, lower_bound_rows = read_floor_bounds(catalog)
-    common_receipt.update(lower_bound_policy=fitting_bounds.policy_id,
+    raw_read_floors, lower_bound_rows = read_floor_bounds(catalog)
+    fitting_bounds, stage_one_adjustments = reconcile_workflow_bounds(catalog, raw_read_floors,
+        max_multiplicity_difference=config.fit.max_multiplicity_difference, stage="stage_one")
+    for row, adjustment in zip(lower_bound_rows, stage_one_adjustments):
+        row.update(adjustment)
+    common_receipt.update(lower_bound_policy=raw_read_floors.policy_id,
+                          max_multiplicity_difference=config.fit.max_multiplicity_difference,
+                          support_reconciliation_policy=fitting_bounds.policy_id,
                           stage_one_support_hash=fitting_bounds.content_hash)
     write_supporting_table(output / "multiplicity_lower_bounds.tsv", lower_bound_rows)
     write_supporting_table(output / "mutation_segments.tsv", [dict(mutation_id=mutation,
@@ -715,7 +762,10 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         receipt["current_phase"] = "stage_two_cap_construction"
         reference_audit = collect_cap_contributors(catalog, stage_one, config, mutation_ids=g0)
         write_supporting_table(output / "stage2_cap_contributors.tsv", reference_audit, columns=CONTRIBUTOR_COLUMNS)
-        caps, cap_rows = _stage_two_caps(catalog, reference_audit, lower_bounds=fitting_bounds)
+        caps, cap_rows, stage_two_adjustments = _stage_two_caps(catalog, reference_audit,
+            lower_bounds=raw_read_floors, max_multiplicity_difference=config.fit.max_multiplicity_difference,
+            return_adjustments=True)
+        write_supporting_table(output / "stage2_effective_multiplicity_bounds.tsv", stage_two_adjustments)
         receipt["stage_two_support_hash"] = caps.content_hash
         write_supporting_table(output / "stage2_segment_multiplicity_bounds.tsv", cap_rows, columns=SEGMENT_POLICY_COLUMNS)
         receipt["current_phase"] = "stage_two_feasibility"
@@ -758,7 +808,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         stage_two_members = set(targets) - reference_members
         non_targets = tuple(unchanged_map)
         if non_targets or set(targets) != set(stage_one.mutation_ids):
-            raise AssertionError("Protocol 2.4 must reassess the entire combined fitted population")
+            raise AssertionError("Protocol 2.5 must reassess the entire combined fitted population")
         combined = set(targets) | set(non_targets)
         q2 = 0 if stage_two is None else len(stage_two.centers)
         receipt["counts"].update(merged_groups=0, clonal_source_consolidated=1,
@@ -787,6 +837,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
             tuple(source_labels[(fit.source_id, int(fit.labels[i]))] for fit, i in baseline_rows),
             device=config.fit.device, cpu_threads=config.fit.cpu_threads,
             assignment_method=config.stage_three_assignment_method,
+            max_multiplicity_difference=config.fit.max_multiplicity_difference,
             normal_cn_policy=config.normal_cn_policy, run_manifest_id=run_manifest_id,
             provenance=dict(stage_two_caps_hash=caps.content_hash,
                  reference_contributors=reference_audit, native_stage_two_centers_preserved=True,

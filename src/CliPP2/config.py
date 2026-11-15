@@ -12,23 +12,44 @@ DEFAULT_STAGE_ONE_MAX_CLUSTERS: Final = 10
 DEFAULT_DEVICE: Final = "cpu"
 DEFAULT_AUDIT_SCOPE: Final = "selected"
 DEFAULT_MISSING_COUNTS: Final = "zero_alt"
-PROTOCOL_VERSION: Final = "2.4"
+PROTOCOL_VERSION: Final = "2.5"
 STAGE_THREE_REFERENCE_POLICY: Final = "single_fixed_clonal_stage_one_source_v1"
 ASSIGNMENT_METHODS: Final = ("marginal", "profile")
 SELECTION_CRITERION: Final = "marginal_mixture_bic_at_fitted_centers_v1"
 
 
-def fitting_identity(method="marginal", selection=SELECTION_CRITERION):
+def validate_max_multiplicity_difference(value):
+    if value is not None and (type(value) is not int or value != 1):
+        raise ValueError("max_multiplicity_difference must be 1 or None (independent)")
+    return value
+
+
+def fitting_identity(method="marginal", selection=SELECTION_CRITERION,
+                     max_multiplicity_difference=1):
     if not isinstance(method, str) or method not in ("marginal", "profile"):
         raise ValueError("fit_multiplicity must be marginal or profile")
     if selection != SELECTION_CRITERION:
         raise ValueError(f"selection_criterion must be {SELECTION_CRITERION}")
+    validate_max_multiplicity_difference(max_multiplicity_difference)
+    if max_multiplicity_difference == 1:
+        return {"fit_objective_id": ("joint_range_one_profile_v1" if method == "profile"
+                                     else "joint_range_one_marginal_v1"),
+                "selection_criterion_id": selection,
+                "initialization_policy_id": "joint_pooled_posterior_pilot_v1",
+                "scalar_refit_policy_id": ("joint_profile_coordinate_envelope_v1" if method == "profile"
+                                           else "joint_marginal_em_stationary_v1"),
+                "max_multiplicity_difference": 1,
+                "multiplicity_policy_id": "joint_range_one_v1",
+                "multiplicity_normalization_id": "uniform_joint_vectors_v1"}
     return {"fit_objective_id": ("integer_multiplicity_profile_v1" if method == "profile"
                                  else "uniform_multiplicity_marginal_v1"),
             "selection_criterion_id": selection,
             "initialization_policy_id": "existing_marginal_pooled_pilot_v1",
             "scalar_refit_policy_id": ("profile_branch_interval_search_v1" if method == "profile"
-                                       else "marginal_grid_interval_search_v1")}
+                                       else "marginal_grid_interval_search_v1"),
+            "max_multiplicity_difference": None,
+            "multiplicity_policy_id": "independent_regions_v1",
+            "multiplicity_normalization_id": "uniform_interval_width_v1"}
 
 
 def validate_assignment_method(value):
@@ -69,9 +90,10 @@ class FitConfig:
     audit_scope: str = DEFAULT_AUDIT_SCOPE
     fit_multiplicity: str = "marginal"
     selection_criterion: str = SELECTION_CRITERION
+    max_multiplicity_difference: int | None = 1
 
     def __post_init__(self) -> None:
-        fitting_identity(self.fit_multiplicity, self.selection_criterion)
+        fitting_identity(self.fit_multiplicity, self.selection_criterion, self.max_multiplicity_difference)
         validate_audit_scope(self.audit_scope)
         if self.device not in ("cpu", "cuda"):
             raise ValueError("device must be cpu or cuda.")
@@ -91,11 +113,13 @@ def resolve_fit_config(
     audit_scope: str = DEFAULT_AUDIT_SCOPE,
     fit_multiplicity: str = "marginal",
     selection_criterion: str = SELECTION_CRITERION,
+    max_multiplicity_difference: int | None = 1,
 ) -> FitConfig:
     """Construct the only public fit configuration; removed knobs raise TypeError."""
     return FitConfig(device=device, max_major_cn=max_major_cn,
                      max_clusters=max_clusters, cpu_threads=cpu_threads, audit_scope=audit_scope,
-                     fit_multiplicity=fit_multiplicity, selection_criterion=selection_criterion)
+                     fit_multiplicity=fit_multiplicity, selection_criterion=selection_criterion,
+                     max_multiplicity_difference=max_multiplicity_difference)
 
 
 __all__ = ["FitConfig", "resolve_fit_config"]
@@ -103,7 +127,7 @@ __all__ = ["FitConfig", "resolve_fit_config"]
 
 @dataclass(frozen=True, slots=True)
 class WorkflowConfig:
-    """Protocol 2.4 estimation policy; numerical verification remains mandatory."""
+    """Current estimation policy; numerical verification remains mandatory."""
 
     fit: FitConfig = field(default_factory=lambda: FitConfig(
         device="cpu", max_clusters=DEFAULT_STAGE_ONE_MAX_CLUSTERS))

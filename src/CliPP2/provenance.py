@@ -49,10 +49,12 @@ def validate_fit_execution_receipt(config_record, execution, *, build=None):
                   weight_execution="cuda_resident" if kind == "cuda" else "cpu")
     if config.device != kind or any(execution.get(key) != value for key, value in routes.items()):
         raise ValueError("Original execution routes disagree with its configured device")
-    expected = fitting_identity(config.fit_multiplicity, config.selection_criterion)
+    expected = fitting_identity(config.fit_multiplicity, config.selection_criterion, config.max_multiplicity_difference)
     selection = execution.get("selection_native")
     if (execution.get("method_identity") != expected or native.get("aggregation") != config.fit_multiplicity
+            or native.get("max_multiplicity_difference", "missing") != config.max_multiplicity_difference
             or not isinstance(selection, Mapping) or selection.get("aggregation") != "marginal"
+            or selection.get("max_multiplicity_difference", "missing") != config.max_multiplicity_difference
             or any(selection.get(key) != native[key] for key in ("kind", "build_id", "numerical_policy"))):
         raise ValueError("Original execution fitting/selection identities disagree")
     continuation = execution["continuation"]
@@ -140,8 +142,9 @@ def validate_replay_policy(accepted, requested_fit_config, *, normal_cn_policy):
     if original.max_clusters != requested_fit_config.max_clusters:
         raise ValueError("Replay search capacity differs from the original fitting policy")
     if (original.fit_multiplicity != requested_fit_config.fit_multiplicity or
-            original.selection_criterion != requested_fit_config.selection_criterion):
-        raise ValueError("Replay fitting objective or selection criterion differs from the original policy")
+            original.selection_criterion != requested_fit_config.selection_criterion or
+            original.max_multiplicity_difference != requested_fit_config.max_multiplicity_difference):
+        raise ValueError("Replay fitting objective, selection criterion or multiplicity-difference policy differs from the original policy")
     # A different declared CN cutoff can leave the actual observations unchanged.
     # AcceptedFit.validate must still verify the exact requested population,
     # numerical inputs, masks and effective support before any reuse is allowed.

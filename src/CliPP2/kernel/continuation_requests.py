@@ -108,7 +108,7 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
     if cancelled is not None and cancelled():
         raise ContinuationCancelled('Continuation cancelled before numerical evaluation')
     terms = tuple(_array(value) for value in model.node_terms(initial))
-    if len(terms) != 3 or any(value.shape != shape or not np.isfinite(value).all() for value in terms):
+    if len(terms) != 3 or any(value.shape != ((model.n,) if index == 0 else shape) or not np.isfinite(value).all() for index, value in enumerate(terms)):
         raise ArithmeticError('Initial tree likelihood terms are invalid')
     profile = getattr(model, "fit_multiplicity", "marginal") == "profile"
     slopes = model.fit_backend.profile_slopes(initial) if profile else (terms[1], terms[1])
@@ -217,7 +217,7 @@ def continue_requests(model, tree, initial, capacities, lower, upper, policy, mi
                         raise NativeExecutionError('Continuation evaluator returned incomplete ordered replies')
                     for (task, sequence), reply, (_, x) in zip(requests, replies, numerical):
                         values = tuple(_array(value) for value in reply)
-                        if len(values) != 3 or any(value.shape != shape for value in values):
+                        if len(values) != 3 or any(value.shape != ((model.n,) if index == 0 else shape) for index, value in enumerate(values)):
                             raise NativeExecutionError('Continuation evaluator returned invalid term shapes')
                         directional = model.fit_backend.profile_slopes(x) if profile else (values[1], values[1])
                         check(library.CliPP2ContinuationOwnerReply(owner, task, sequence,

@@ -21,6 +21,7 @@ inline std::int64_t checked_product(std::int64_t a, std::int64_t b,
 inline std::int64_t validate_observations(const ObservationSoA& input) {
     require(input.aggregation == LikelihoodAggregation::UniformMarginal ||
             input.aggregation == LikelihoodAggregation::IntegerProfile, "Unknown likelihood aggregation");
+    require(input.max_multiplicity_difference == -1 || input.max_multiplicity_difference == 1, "Unknown regional multiplicity constraint");
     require(input.mutations > 0 && input.regions > 0, "Model dimensions must be positive");
     const auto cells = checked_product(input.mutations, input.regions);
     require(input.alt && input.ref && input.scaling && input.log_constant &&
@@ -42,6 +43,15 @@ inline std::int64_t validate_observations(const ObservationSoA& input) {
                     std::isfinite(input.ref[cell]) && input.ref[cell] >= 0 &&
                     input.ref[cell] == std::floor(input.ref[cell]) &&
                     std::isfinite(input.log_constant[cell]), "Invalid observed counts or constant");
+    }
+    if(input.max_multiplicity_difference==1)for(std::int64_t i=0;i<input.mutations;++i) {
+        std::int64_t lower=1,upper=std::numeric_limits<std::int64_t>::max();
+        for(std::int64_t r=0;r<input.regions;++r) {
+            const auto c=r*input.mutations+i;if(!(input.flags[c]&observed_flag))continue;
+            if(input.minimum[c]>lower)lower=input.minimum[c];
+            const auto hi=input.minimum[c]+input.support[c]-1;if(hi<upper)upper=hi;
+        }
+        require(lower<=upper||lower-upper<=1,"Empty joint multiplicity support");
     }
     return cells;
 }

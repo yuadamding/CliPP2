@@ -62,6 +62,7 @@ def binomial_profile_deviance(alt, depth, probability, informative=None):
 def profile_deviance_from_diagnostics(observation, centers, diagnostic):
     """Reconstruct the conditional MAP probability in native multiplication order."""
     probability = np.minimum((observation.scaling * diagnostic["map_multiplicity"]) * centers, 1.)
+    probability = np.where(observation.observed & (np.asarray(centers) == 0), 0., probability)
     return binomial_profile_deviance(observation.alt, observation.depth, probability, observation.observed)
 
 

@@ -119,11 +119,12 @@ def _snapshot_bundle(history, catalog, reference, targets, config, *, sources=No
         for i, stage in enumerate(stages):
             if "snapshot_not_native_fit" in stage:
                 calls[i] = evaluated[i]
-    calls[~observed] = np.nan
+    calls[~observed | (phi == 0)] = np.nan
     return AssignmentBundle(catalog, reference, targets, tuple(non_targets),
         phi, calls, lower, upper, tuple(stages), tuple(labels), (0,) * len(targets),
         device=config.fit.device, cpu_threads=config.fit.cpu_threads,
         assignment_method=config.stage_three_assignment_method,
+        max_multiplicity_difference=config.fit.max_multiplicity_difference,
         normal_cn_policy=config.normal_cn_policy,
         run_manifest_id=os.environ.get("CLIPP2_RUN_MANIFEST_ID"),
         provenance=dict(baseline_status="declared_display_snapshot_not_new_accepted_native_fit",
@@ -234,7 +235,8 @@ def run_reference_audit(history, catalog, paired_result, config, outdir, second_
     informative = catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)
     common = tuple(m for m, keep in zip(catalog.mutation_ids, informative.any(axis=1)) if keep)
     ledger = dict(fit_count=0, assignment_pass_count=0, events=[])
-    result = dict(schema="clipp2.fixed-reference-audit.v4", protocol_version=PROTOCOL_VERSION,
+    result = dict(schema="clipp2.fixed-reference-audit.v5", protocol_version=PROTOCOL_VERSION,
+                  max_multiplicity_difference=config.fit.max_multiplicity_difference,
                   source_cohort_protocol_version=paired_result.get("source_cohort_protocol_version"),
                   status="complete", common_target_ids=common,
                   cost_ledger=ledger, panels={}, truth_access="evaluation_side_declared_reference_intervention")
@@ -463,7 +465,8 @@ def run_cohort_controls(cohort, outdir):
         assigned = _score(_snapshot_bundle(history, catalog, reference, history.mutation_ids, config),
             output / "S11.03" / mode, ledger, "S11_" + mode)
         panels["S11_" + mode] = dict(status="complete", **_calibration(history, catalog, assigned, source_members))
-    result = dict(schema="clipp2.cohort-controls.v4", simulation_plan_version="1.2", status="passed",
+    result = dict(schema="clipp2.cohort-controls.v5", simulation_plan_version="1.2", status="passed",
+        max_multiplicity_difference=config.fit.max_multiplicity_difference,
         protocol_version=PROTOCOL_VERSION, source_cohort_protocol_version=cohort.settings["workflow_protocol"],
         structural_variant_count=len(records), structural_records=records, panels=panels,
         cost_ledger=ledger, assignment_pass_count=ledger["assignment_pass_count"],
@@ -591,7 +594,8 @@ def run_controls(outdir):
     assert any(not np.array_equal(a["log_scores"], b["log_scores"])
                for a, b in zip(changed.assignments, unperturbed.assignments))
     record("reference_centroid_perturbation_changes_fixed_target_scores")
-    result = dict(schema="clipp2.simulation-controls.v4", protocol_version=PROTOCOL_VERSION, status="passed", checks=checks,
+    result = dict(schema="clipp2.simulation-controls.v5", protocol_version=PROTOCOL_VERSION, status="passed", checks=checks,
+        max_multiplicity_difference=config.fit.max_multiplicity_difference,
         panels=panels, cost_ledger=ledger, assignment_pass_count=ledger["assignment_pass_count"],
         paths=sorted(str(p.relative_to(output)) for p in output.rglob("*") if p.is_file()),
         interpretation="declared physical/source/reference interventions; no native clustering frequency claim")

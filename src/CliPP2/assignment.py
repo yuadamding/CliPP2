@@ -5,9 +5,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 
 import numpy as np
-from scipy.special import logsumexp, xlogy, xlog1py
+from scipy.special import logsumexp, xlogy
 
-from .config import PROTOCOL_VERSION, validate_assignment_method
+from .config import PROTOCOL_VERSION, validate_assignment_method, validate_max_multiplicity_difference
 from ._version import __version__
 from .io.data import (ImmutableArrayRecord, MultiplicityBounds, OriginalCatalog, readonly_array, thaw_record,
                       json_value as _json_value, freeze_record as _freeze, content_hash)
@@ -18,7 +18,7 @@ from .screening import binomial_profile_deviance, summarize_profile_deviance
 SUPPORT_POLICY = "original_full_1_to_major_cn"
 ASSIGNMENT_POLICIES = {"marginal": "observed_exact_map_lowest_public_label",
     "profile": "observed_exact_profile_baseline_then_lowest_public_label"}
-RESULT_SCHEMA = "clipp2.assignment.result.v9"
+RESULT_SCHEMA = "clipp2.assignment.result.v10"
 POSTERIOR_FIELDS = ("probabilities", "posterior", "best_log_probability",
     "second_best_probability", "entropy", "log_competitor_ratio")
 EVIDENCE_STATUSES = ("observed", "prior_only", "model_incompatible", "computation_failed", "input_missing", "excluded")
@@ -161,6 +161,7 @@ class AssignmentBundle(ImmutableArrayRecord):
     provenance: object = field(default_factory=dict)
     run_manifest_id: str | None = field(default=None, kw_only=True)
     assignment_method: str = field(default="marginal", kw_only=True)
+    max_multiplicity_difference: int | None = field(default=1, kw_only=True)
     bounds: MultiplicityBounds = field(init=False, repr=False)
     _content_hash: str = field(init=False, repr=False)
 
@@ -168,6 +169,7 @@ class AssignmentBundle(ImmutableArrayRecord):
         from .provenance import validate_run_manifest_id
         validate_run_manifest_id(self.run_manifest_id)
         validate_assignment_method(self.assignment_method)
+        validate_max_multiplicity_difference(self.max_multiplicity_difference)
         targets, others = tuple(self.target_ids), tuple(self.non_target_ids)
         if type(self.catalog) is not OriginalCatalog or type(self.reference) is not AssignmentReference:
             raise TypeError("Assignment requires a validated original catalog and frozen reference")
@@ -213,10 +215,10 @@ class AssignmentBundle(ImmutableArrayRecord):
                 or np.any(self.native_calls[finite] > self.native_upper[finite])):
             raise ValueError("Native baseline calls must lie in their accepted support")
         informative = np.asarray(data.count_observed, bool) & (data.total_counts > 0)
-        if np.any(informative & (~np.isfinite(self.native_centers) | ~finite)):
-            raise ValueError("Every informative target needs a finite accepted native baseline CCF and call")
-        if np.any(finite & ~informative):
-            raise ValueError("Missing/excluded native baseline multiplicities must remain missing")
+        if np.any(informative & (~np.isfinite(self.native_centers) | ((self.native_centers > 0) & ~finite))):
+            raise ValueError("Every informative target needs a native CCF; positive CCFs also need native calls")
+        if np.any(finite & (~informative | (self.native_centers == 0))):
+            raise ValueError("Missing, excluded and zero-CCF native multiplicities must remain missing")
         for name in ("source_stages", "source_labels", "baseline_labels"):
             values = tuple(getattr(self, name))
             if len(values) != len(targets):
@@ -239,8 +241,8 @@ class AssignmentBundle(ImmutableArrayRecord):
     def to_dict(self):
         values = {name: getattr(self, name) for name in ("target_ids", "non_target_ids", "native_centers",
             "native_calls", "native_lower", "native_upper", "source_stages", "source_labels", "baseline_labels",
-            "device", "cpu_threads", "normal_cn_policy", "provenance", "run_manifest_id", "assignment_method")}
-        return _json_value(dict(schema="clipp2.assignment.bundle.v6", protocol_version=PROTOCOL_VERSION,
+            "device", "cpu_threads", "normal_cn_policy", "provenance", "run_manifest_id", "assignment_method", "max_multiplicity_difference")}
+        return _json_value(dict(schema="clipp2.assignment.bundle.v7", protocol_version=PROTOCOL_VERSION,
             support_policy=SUPPORT_POLICY, **values,
             catalog=self.catalog.to_dict(), reference=self.reference.to_dict(),
             bounds=self.bounds.to_dict()))
@@ -262,10 +264,10 @@ class AssignmentBundle(ImmutableArrayRecord):
     @classmethod
     def from_dict(cls, value):
         values = dict(value)
-        if (values.pop("schema", None) != "clipp2.assignment.bundle.v6"
+        if (values.pop("schema", None) != "clipp2.assignment.bundle.v7"
                 or values.pop("protocol_version", None) != PROTOCOL_VERSION
-                or values.pop("support_policy", None) != SUPPORT_POLICY or "assignment_method" not in values):
-            raise ValueError("Assignment requires a protocol 2.4 bundle with schema v6 and an assignment method")
+                or values.pop("support_policy", None) != SUPPORT_POLICY or not {"assignment_method", "max_multiplicity_difference"} <= values.keys()):
+            raise ValueError("Assignment requires a protocol 2.5 bundle with schema v7 and an assignment method")
         bounds = MultiplicityBounds.from_dict(values.pop("bounds"))
         values["catalog"] = OriginalCatalog.from_dict(values["catalog"])
         values["reference"] = AssignmentReference.from_dict(values["reference"])
@@ -285,11 +287,13 @@ class AssignmentResult(ImmutableArrayRecord):
     summary: object
     run_manifest_id: str | None = field(default=None, kw_only=True)
     assignment_method: str = field(default="marginal", kw_only=True)
+    max_multiplicity_difference: int | None = field(default=1, kw_only=True)
 
     def __post_init__(self):
         from .provenance import validate_run_manifest_id
         validate_run_manifest_id(self.run_manifest_id)
         validate_assignment_method(self.assignment_method)
+        validate_max_multiplicity_difference(self.max_multiplicity_difference)
         targets = tuple(self.target_ids)
         if type(self.reference) is not AssignmentReference or len(set(targets)) != len(targets):
             raise ValueError("Assignment result needs unique target identities and a validated reference")
@@ -358,7 +362,7 @@ class AssignmentResult(ImmutableArrayRecord):
         # Keep numeric NaN/inf in this plain copy payload; JSON publishers apply
         # the shared scientific-value codec at the actual serialization boundary.
         return thaw_record(dict(schema=self.schema, protocol_version=PROTOCOL_VERSION,
-            assignment_method=self.assignment_method,
+            assignment_method=self.assignment_method, max_multiplicity_difference=self.max_multiplicity_difference,
             support_policy=SUPPORT_POLICY,
             bundle_hash=self.bundle_hash, target_ids=self.target_ids, reference=self.reference.to_dict(),
             assignments=self.assignments, multiplicities=self.multiplicities, summary=self.summary,
@@ -372,10 +376,10 @@ class AssignmentResult(ImmutableArrayRecord):
     def from_dict(cls, value):
         values = dict(value)
         schema = values.pop("schema", None)
-        if (schema != RESULT_SCHEMA or "assignment_method" not in values
+        if (schema != RESULT_SCHEMA or not {"assignment_method", "max_multiplicity_difference"} <= values.keys()
                 or values.pop("protocol_version", None) != PROTOCOL_VERSION
                 or values.pop("support_policy", None) != SUPPORT_POLICY):
-            raise ValueError("Assignment requires a protocol 2.4 result with schema v9 and assignment method")
+            raise ValueError("Assignment requires a protocol 2.5 result with schema v10 and assignment method")
         values["reference"] = AssignmentReference.from_dict(values["reference"])
         return cls(**values)
 
@@ -386,7 +390,8 @@ POLICY_FIELDS = ("assignment_method", "score_defined", "selection_reason", "stat
     "entropy", "log_score_margin", "log_competitor_ratio", "comparison_scope", "has_finite_alternative",
     "mean_profile_deviance", "maximum_profile_deviance", "diagnostic_status", "diagnostic_error",
     "informative_regions", "baseline_label", "reassessment_status", "baseline_changed", "reference_labels",
-    "baseline_reference_label", "final_assignment_label", "target_reason")
+    "baseline_reference_label", "final_assignment_label", "target_reason",
+    "joint_marginal_log_likelihood", "joint_profile_log_likelihood", "joint_log_normalizer", "coupling_profile_loss")
 REGIONAL_BASE_FIELDS = ("mutation_id", "region_id", "alt_count", "ref_count", "total_depth", "purity",
     "original_major_cn", "original_minor_cn", "original_normal_cn", "original_total_cn", "normal_cn_supplied",
     "segment_id", "mapping_genuine", "count_observed", "positive_depth", "original_eligible", "original_input_excluded", "excluded",
@@ -397,7 +402,9 @@ REGIONAL_POLICY_FIELDS = ("assignment_method", "best_label", "phi", "conditional
     "conditional_distribution_defined", "multiplicity_tie", "map_tied_multiplicities", "map_unique",
     "structural_singleton", "multiplicity_read_informative", "membership_status", "multiplicity_status",
     "multiplicity_candidates", "conditional_probabilities", "profile_deviance", "assigned_multiplicity",
-    "diagnostic_status", "diagnostic_error", "center_source")
+    "diagnostic_status", "diagnostic_error", "center_source", "max_multiplicity_difference",
+    "joint_profile_deviance", "regional_profile_deviance", "latent_joint_map",
+    "regional_diagnostic_status", "regional_diagnostic_error")
 
 
 def target_reason(source_stage):
@@ -420,48 +427,41 @@ def assignment_outcome(source_stage, baseline_label, final_label, clonal_label):
                 baseline_changed=None if final_label is None else final_label != baseline_label)
 
 
-def conditional_multiplicity(catalog, source, region, phi, lower, upper):
-    """Exact MAP of computed conditional log masses, ties resolved by integer order.
+def joint_distribution(diagnostic, row, region, lower, upper, *, alt, depth, scaling, phi):
+    """One regional projection of the authoritative joint native diagnostic.
 
-    The binomial coefficient and uniform multiplicity prior cancel in this
-    conditional distribution. Retained native calls are separate provenance.
+    The selected coordinate belongs to a complete joint MAP vector. It need
+    not maximize either the regional likelihood or its posterior marginal.
+    Posterior probabilities condition on every informative region; raw
+    component maxima remain separate regional diagnostics.
     """
-    if (not np.isfinite(phi) or not 0 <= phi <= 1 or lower != int(lower) or upper != int(upper)
-            or not 1 <= lower <= upper <= catalog.major_cn[source, region]):
-        raise ValueError("Conditional multiplicity needs a valid CCF and original-support interval")
     candidates = np.arange(lower, upper + 1, dtype=np.int64)
-    purity = catalog.purity[source, region]
-    total_cn = catalog.major_cn[source, region] + catalog.minor_cn[source, region]
-    denominator = (1-purity)*catalog.normal_cn[source, region] + purity*total_cn
-    p = np.minimum((purity/denominator*candidates)*phi, 1.)
-    alt, depth = catalog.alt_counts[source, region], catalog.total_counts[source, region]
-    logs = xlogy(alt, p) + xlog1py(depth-alt, -p)
-    if np.isnan(logs).any() or np.isposinf(logs).any():
-        raise ArithmeticError("Conditional multiplicity log masses are invalid")
-    if not np.isfinite(logs).any():
-        return dict(defined=False, candidates=candidates, log_masses=logs,
-                    probabilities=np.full(logs.shape, np.nan), map_call=np.nan,
-                    map_tied_values=(), map_unique=None, map_probability=np.nan,
-                    map_log_probability=np.nan, map_score_gap=np.nan, profile_deviance=np.inf,
-                    diagnostic_status="available", diagnostic_error=None)
-    best = int(np.argmax(logs))
-    others = np.delete(logs, best)
-    total = np.exp(others-logs[best]).sum()
-    log_probability = float(-np.log1p(total))
-    probabilities = np.exp(logs-logs[best])/(1.+total)
-    ties = tuple(int(value) for value in candidates[logs == logs[best]])
+    call = float(diagnostic["map_multiplicity"][row, region])
+    status = int(diagnostic["status"][row])
+    probabilities = np.asarray(diagnostic["probabilities"][row][region], float)
+    defined = status == 0 and np.isfinite(call) and len(probabilities) == len(candidates)
+    if not defined:
+        return dict(defined=False, candidates=candidates,
+            probabilities=np.full(len(candidates), np.nan), map_call=np.nan, map_tied_values=(),
+            map_unique=None, map_probability=np.nan, map_log_probability=np.nan, map_score_gap=np.nan,
+            profile_deviance=np.inf, diagnostic_status="available", diagnostic_error=None)
+    selected = int(call) - lower
+    maxima = np.asarray(diagnostic["conditional_max"][row][region], float)
+    alternatives = np.delete(maxima, selected)
+    ties = tuple(int(value) for value in diagnostic["map_sets"][row][region])
     deviance, error = np.nan, None
     try:
-        deviance = float(binomial_profile_deviance(alt, depth, p[best]))
+        deviance = float(binomial_profile_deviance(alt, depth, min(1., scaling*call*phi)))
         if np.isnan(deviance) or deviance < 0:
-            raise ArithmeticError("Profile deviance must be nonnegative and nonmissing")
+            raise ArithmeticError("Joint MAP deviance must be nonnegative and nonmissing")
     except Exception as failure:
         deviance = np.nan
         error = f"{type(failure).__name__}: {failure}"
-    return dict(defined=True, candidates=candidates, log_masses=logs, probabilities=probabilities,
-        map_call=int(candidates[best]), map_tied_values=ties, map_unique=len(ties) == 1,
-        map_probability=float(np.exp(log_probability)), map_log_probability=log_probability,
-        map_score_gap=float(logs[best]-np.max(others)) if len(others) else np.nan,
+    return dict(defined=True, candidates=candidates, probabilities=probabilities,
+        map_call=int(call), map_tied_values=ties, map_unique=len(ties) == 1,
+        map_probability=float(probabilities[selected]),
+        map_log_probability=float(diagnostic["map_log_probability"][row, region]),
+        map_score_gap=float(maxima[selected]-np.max(alternatives)) if len(alternatives) else np.nan,
         profile_deviance=deviance, diagnostic_status="failed" if error else "available", diagnostic_error=error)
 
 
@@ -570,37 +570,41 @@ class _ReferenceEvaluation:
 
 def _score_reference(bundle, progress_callback):
     observation = prepare_prediction(bundle.catalog, bundle.target_ids, bundle.bounds,
-                                     device=bundle.device, cpu_threads=bundle.cpu_threads, normal_cn_policy=bundle.normal_cn_policy)
-    n, r, k = observation.n, observation.r, len(bundle.reference.labels)
+                                     device=bundle.device, cpu_threads=bundle.cpu_threads, normal_cn_policy=bundle.normal_cn_policy,
+                                     max_multiplicity_difference=bundle.max_multiplicity_difference)
+    n, k = observation.n, len(bundle.reference.labels)
     observed = np.asarray(observation.observed, bool)
     coverage = observed.sum(axis=1)
     scores = np.full((n, k), -np.inf)
     if not n:
         return _ReferenceEvaluation((), np.empty(0, dtype=int), {}, observed,
                            dict(status="skipped_empty_targets", device=bundle.device))
-    with NativeBackend(observation, cpu_threads=bundle.cpu_threads) as backend:
-        for index, center in enumerate(bundle.reference.centers):
-            centers = np.broadcast_to(center, (n, r))
-            if bundle.assignment_method == "marginal":
-                regional = np.where(observed, -backend.node_terms(centers, derivatives=False), 0.)
-            else:
-                regional = _validated_profile_terms(backend.component_diagnostics(centers), observed)
-            scores[:, index] = regional.sum(axis=1) - np.log(k)
-            scores[~observation.eligible.any(axis=1), index] = -np.inf
-            if progress_callback:
-                progress_callback(dict(operation="assignment", protocol_version=PROTOCOL_VERSION,
-                                       completed_candidates=index + 1, candidate_count=k))
+    with NativeBackend(observation, cpu_threads=bundle.cpu_threads,
+                       aggregation=bundle.assignment_method) as backend:
+        scores[:] = backend.joint_columns(bundle.reference.centers) - np.log(k)
+        scores[~observation.eligible.any(axis=1)] = -np.inf
+        if progress_callback:
+            progress_callback(dict(operation="assignment", protocol_version=PROTOCOL_VERSION,
+                                   completed_candidates=k, candidate_count=k))
         summaries = [assignment_score_summary(row, bundle.reference.labels, bundle.assignment_method, baseline)
                      for row, baseline in zip(scores, bundle.baseline_labels)]
         best = np.array([row["best_index"] if row["best_index"] is not None else 0 for row in summaries], dtype=int)
-        diagnostic_error = None
+        winner = bundle.reference.centers[best]
+        diagnostics = backend.joint_diagnostics(winner, bundle.native_calls)
+        if np.isin(diagnostics["status"], (2, 3)).any():
+            raise ArithmeticError("Authoritative joint assignment diagnostics failed")
+        diagnostics["error"] = None
+        diagnostics["regional_error"] = None
         try:
-            diagnostics = backend.component_diagnostics(bundle.reference.centers[best], bundle.native_calls)
+            from .screening import profile_deviance_from_diagnostics
+            regional = backend.component_diagnostics(winner)
+            if np.isin(regional["status"], (2, 3)).any():
+                raise ArithmeticError("Regional component diagnostics failed")
+            diagnostics["regional_profile_deviance"] = profile_deviance_from_diagnostics(observation, winner, regional)
         except Exception as error:
-            diagnostics = {"status": np.where(observed, 3, 4)}
-            diagnostic_error = f"{type(error).__name__}: {error}"
+            diagnostics["regional_profile_deviance"] = np.full(observed.shape, np.nan)
+            diagnostics["regional_error"] = f"{type(error).__name__}: {error}"
         execution = dict(status="evaluated", **backend.diagnostics())
-    diagnostics["error"] = diagnostic_error
     records = []
     for i, mutation in enumerate(bundle.target_ids):
         summary = summaries[i]
@@ -635,18 +639,28 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
         source = original_rows[mutation]
         record, diagnostic = evaluation.records[i], evaluation.best_diagnostics
         residuals, errors = [], []
+        if diagnostic.get("error") is None:
+            record.update(joint_marginal_log_likelihood=float(diagnostic["log_marginal"][i]),
+                joint_profile_log_likelihood=float(diagnostic["profile"][i]),
+                joint_log_normalizer=float(diagnostic["log_normalizer"][i]),
+                coupling_profile_loss=float(diagnostic["coupling_profile_loss"][i]))
         for j, region in enumerate(bundle.reference.region_ids):
             informative = bool(evaluation.observed[i, j])
             present = informative and record["best_label"] is not None
             phi = float(bundle.reference.centers[evaluation.best_indices[i], j]) if present else float("nan")
             error = None
-            if present and diagnostic["status"][i, j] in (2, 3):
-                error = diagnostic["error"] or f"Native component diagnostic status {diagnostic['status'][i, j]}"
+            if present and diagnostic["status"][i] in (2, 3):
+                error = diagnostic["error"] or f"Native joint diagnostic status {diagnostic['status'][i]}"
             distribution = None
             if present and (error is None or bundle.assignment_method == "profile"):
                 try:
-                    distribution = conditional_multiplicity(catalog, source, j, phi,
-                        int(support.lower[i, j]), int(support.upper[i, j]))
+                    purity = catalog.purity[source, j]
+                    scaling = purity / ((1-purity)*catalog.normal_cn[source, j]
+                        + purity*(catalog.major_cn[source, j]+catalog.minor_cn[source, j]))
+                    distribution = joint_distribution(diagnostic, i, j,
+                        int(support.lower[i, j]), int(support.upper[i, j]),
+                        alt=catalog.alt_counts[source, j], depth=catalog.total_counts[source, j],
+                        scaling=scaling, phi=phi)
                     error = error or distribution["diagnostic_error"]
                 except Exception as failure:
                     if bundle.assignment_method == "profile":
@@ -678,11 +692,8 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
             else:
                 multiplicity_status = "conditional"
             native_lp = np.nan
-            if defined:
-                index = int(bundle.native_calls[i, j])-int(support.lower[i, j])
-                logs = distribution["log_masses"]
-                native_lp = (float(logs[index]-np.max(logs)+distribution["map_log_probability"])
-                             if 0 <= index < len(logs) else -np.inf)
+            if defined and np.isfinite(bundle.native_calls[i, j]):
+                native_lp = float(diagnostic["accepted_log_probability"][i, j])
             multiplicities.append(dict(mutation_id=mutation, region_id=region,
                 alt_count=float(catalog.alt_counts[source, j]),
                 ref_count=float(catalog.total_counts[source, j] - catalog.alt_counts[source, j]),
@@ -700,6 +711,7 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
                 original_lower=int(support.lower[i, j]), original_upper=int(support.upper[i, j]),
                 source_stage=bundle.source_stages[i], source_label=bundle.source_labels[i],
                 assignment_method=bundle.assignment_method,
+                max_multiplicity_difference=bundle.max_multiplicity_difference,
                 best_label=record["best_label"], phi=phi, conditional_map=call,
                 conditional_call=call if defined and phi > 0 else np.nan,
                 assigned_multiplicity=call if defined and phi > 0 and record["final_assignment_label"] is not None else np.nan,
@@ -717,7 +729,13 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
                 membership_status=record["status"], multiplicity_status=multiplicity_status,
                 multiplicity_candidates=distribution["candidates"] if defined else (),
                 conditional_probabilities=distribution["probabilities"] if defined else (),
-                profile_deviance=deviance, diagnostic_status=diagnostic_status, diagnostic_error=error))
+                profile_deviance=deviance, joint_profile_deviance=deviance,
+                regional_profile_deviance=(float(diagnostic["regional_profile_deviance"][i, j])
+                    if present else np.nan),
+                regional_diagnostic_status=("failed" if diagnostic.get("regional_error") else "available")
+                    if present else "not_applicable",
+                regional_diagnostic_error=diagnostic.get("regional_error") if present else None,
+                latent_joint_map=call, diagnostic_status=diagnostic_status, diagnostic_error=error))
         diagnostic_mask = evaluation.observed[i] & (record["best_label"] is not None)
         measured = (summarize_profile_deviance(residuals, diagnostic_mask, axis=0) if not errors else
                     dict(mean_profile_deviance=np.nan, maximum_profile_deviance=np.nan))
@@ -726,6 +744,7 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
             diagnostic_status="failed" if errors else "available" if diagnostic_mask.any() else "not_applicable",
             diagnostic_error="; ".join(errors) if errors else None)
     summary = dict(schema=RESULT_SCHEMA, protocol_version=PROTOCOL_VERSION,
+        max_multiplicity_difference=bundle.max_multiplicity_difference,
         assignment_method=bundle.assignment_method, tie_policy=ASSIGNMENT_POLICIES[bundle.assignment_method],
         implementation_version=__version__, tumor_id=catalog.tumor_id,
         bundle_hash=bundle.content_hash, reference=bundle.reference.to_dict(),
@@ -740,6 +759,7 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
         reassessment_counts={status: sum(row["reassessment_status"] == status for row in evaluation.records)
                              for status in REASSESSMENT_OUTCOMES},
         evaluation_receipt=dict(device=bundle.device, cpu_threads=bundle.cpu_threads,
+            max_multiplicity_difference=bundle.max_multiplicity_difference,
             run_manifest_id=execution_manifest_id, bundle_run_manifest_id=bundle.run_manifest_id,
             assignment_policy=ASSIGNMENT_POLICIES[bundle.assignment_method], execution=evaluation.execution),
         population_scope="targets_only",
@@ -749,7 +769,8 @@ def assign_mutations(bundle, *, outdir=None, progress_callback=None, run_manifes
     bundle.validated_payload()
     result = AssignmentResult(bundle.content_hash, bundle.target_ids, bundle.reference,
                               evaluation.records, tuple(multiplicities), summary, run_manifest_id=execution_manifest_id,
-                              assignment_method=bundle.assignment_method)
+                              assignment_method=bundle.assignment_method,
+                              max_multiplicity_difference=bundle.max_multiplicity_difference)
     if outdir is not None:
         from .io.assignment import publish_assignment
         publish_assignment(bundle, result, outdir)

@@ -350,8 +350,9 @@ def qualify_cohort(settings_path, outdir, *, native_pilot=True, timeout_seconds=
                 if row["variant_id"] == variant and (materialize or row["split"] == "development" and row["replicate"] == 1)),
             roundtrips_passed=sum(row["status"] == "passed" for row in a),
             native_pilot_status=p["status"] if p else "not_run"))
-    summary = dict(schema="clipp2.cohort-qualification.v4", study_version="1.2", protocol_version=PROTOCOL_VERSION,
+    summary = dict(schema="clipp2.cohort-qualification.v5", study_version="1.2", protocol_version=PROTOCOL_VERSION,
         cohort_content_id=cohort.content_id,
+        max_multiplicity_difference=contract["base_workflow_config"]["fit"]["max_multiplicity_difference"],
         source_cohort_protocol_version=cohort.settings["workflow_protocol"],
         status="validation_passed" if valid else "validation_failed", settings_path=cohort.path,
         numpy_version=np.__version__, required_numpy_version=cohort.settings["numpy_version"],
@@ -372,7 +373,7 @@ def qualify_cohort(settings_path, outdir, *, native_pilot=True, timeout_seconds=
         limitations=["Generator qualification does not establish fitted biological accuracy.",
             "Native pilot timeouts are resource limitations, not scientific abstentions.",
             "The 600 main histories and their 2400 acquisitions have not been fitted by this command.",
-            "The pilot uses one declared Protocol 2.4 workflow; scientific performance is descriptive."])
+            "The pilot uses one declared Protocol 2.5 workflow; scientific performance is descriptive."])
     save_json(root / "qualification_summary.json", summary)
     (root / "qualification.html").write_text(_html(summary), encoding="utf-8")
     if materialize:

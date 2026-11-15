@@ -1,4 +1,4 @@
-"""Truth-blind paired execution for biological plan 1.2 and Protocol 2.4.
+"""Truth-blind paired execution for biological plan 1.2 and Protocol 2.5.
 
 Only the observed input and an explicit workflow configuration enter inference.
 There is one shared Stage 1, at most two Stage 2 fits, and at most two full-support
@@ -21,7 +21,7 @@ from CliPP2.io.assignment import (load_accepted_fit, reserve_output, save_accept
                                  save_assignment_bundle, save_original_catalog, publish_assignment,
                                  write_supporting_table)
 from CliPP2.io.data import json_value, validate_workflow_mapping
-from CliPP2.io.multiplicity import read_floor_bounds
+from CliPP2.io.multiplicity import read_floor_bounds, reconcile_workflow_bounds
 from CliPP2.io.publication import publish_json
 from CliPP2.io.tumor_txt import audit_input, load_original_catalog
 from CliPP2.provenance import prepare_run_manifest, validate_replay_policy
@@ -68,6 +68,7 @@ def _freeze_arm(catalog, first, selected_group, second, groups, g0, config, arm_
         tuple(int(fit.labels[i]) for fit, i in selected), tuple(labels[m] for m in targets),
         device=config.fit.device, cpu_threads=config.fit.cpu_threads,
         assignment_method=config.stage_three_assignment_method,
+        max_multiplicity_difference=config.fit.max_multiplicity_difference,
         normal_cn_policy=config.normal_cn_policy,
         run_manifest_id=None if run_manifest is None else run_manifest["run_manifest_id"],
         provenance=dict(study_plan_version="1.2", protocol_version=PROTOCOL_VERSION, arm=arm_name,
@@ -119,8 +120,10 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
     arm_root.mkdir()
     start = perf_counter()
     ledger = dict(fit_count=0, assignment_pass_count=0, reused_fit_count=0, events=[])
-    result = dict(schema="clipp2.paired-experiment.v6", study_plan_version="1.2",
-        fitting_method_identity=fitting_identity(config.fit.fit_multiplicity, config.fit.selection_criterion),
+    result = dict(schema="clipp2.paired-experiment.v7", study_plan_version="1.2",
+        max_multiplicity_difference=config.fit.max_multiplicity_difference,
+        fitting_method_identity=fitting_identity(config.fit.fit_multiplicity, config.fit.selection_criterion,
+                                                 config.fit.max_multiplicity_difference),
         reference_policy=STAGE_THREE_REFERENCE_POLICY,
         protocol_version=PROTOCOL_VERSION, implementation_version=__version__, status="running",
         config=asdict(config), stage_one=None, stage_one_status="not_started", stage_one_groups=[], g0_label=None,
@@ -204,12 +207,19 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
         save_original_catalog(catalog, output / "original_catalog.json")
         informative = catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)
         population = tuple(m for m, keep in zip(catalog.mutation_ids, informative.any(axis=1)) if keep)
-        fitting_bounds, lower_bound_rows = read_floor_bounds(catalog)
+        raw_read_floors, lower_bound_rows = read_floor_bounds(catalog)
+        fitting_bounds, stage_one_adjustments = reconcile_workflow_bounds(catalog, raw_read_floors,
+            max_multiplicity_difference=config.fit.max_multiplicity_difference, stage="stage_one")
+        for row, adjustment in zip(lower_bound_rows, stage_one_adjustments):
+            row.update(adjustment)
         result.update(original_mutation_ids=catalog.mutation_ids, region_ids=catalog.region_ids,
                       biological_identity=catalog.biological_identity, stage_one_candidate_count=len(population),
-                      read_counts=catalog.read_count_report, lower_bound_policy=fitting_bounds.policy_id,
+                      read_counts=catalog.read_count_report, lower_bound_policy=raw_read_floors.policy_id,
+                      support_reconciliation_policy=fitting_bounds.policy_id,
                       stage_one_support_hash=fitting_bounds.content_hash,
-                      cap_policy="minimum_native_map_set_upper", cap_conflict_policy="raise_upper_to_read_floor")
+                      cap_policy="minimum_projected_joint_map_set_upper",
+                      cap_conflict_policy=("original_major_then_joint_range_then_floor_then_cap"
+                          if config.fit.max_multiplicity_difference == 1 else "read_floor_then_cap"))
         write_supporting_table(output / "multiplicity_lower_bounds.tsv", lower_bound_rows)
         settings = replace(config.fit, max_clusters=config.stage_two_max_clusters)
         for stage, value, requested in (("stage_one", accepted_stage_one, config.fit),
@@ -247,7 +257,9 @@ def run_paired_experiment(input_path, output_dir, config, *, progress_callback=N
         contributors = operation("contributor_collection", "A", lambda:
             collect_cap_contributors(catalog, first, config, mutation_ids=g0))
         result["contributors"] = contributors
-        caps, cap_rows = _stage_two_caps(catalog, contributors, lower_bounds=fitting_bounds)
+        caps, cap_rows, adjustments = _stage_two_caps(catalog, contributors, lower_bounds=raw_read_floors,
+            max_multiplicity_difference=config.fit.max_multiplicity_difference, return_adjustments=True)
+        write_supporting_table(output / "stage2_effective_multiplicity_bounds.tsv", adjustments)
         result.update(cap_bounds=caps.to_dict(), cap_records=cap_rows,
                       stage_two_support_hashes=dict(B=fitting_bounds.content_hash, C=caps.content_hash))
         write_supporting_table(output / "stage2_cap_contributors.tsv", contributors,

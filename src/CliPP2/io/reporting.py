@@ -21,9 +21,9 @@ from ..tree.proposals import SCORE_ATOL, SCORE_RTOL
 
 OUTPUT_SUFFIXES = ('mutation_clusters.tsv', 'cluster_centers.tsv',
                    'mutation_region_multiplicity.tsv')
-OUTPUT_SCHEMA_VERSION = 14
+OUTPUT_SCHEMA_VERSION = 15
 MANIFEST_SCHEMA = 'clipp2.file-list.v1'
-VERIFICATION_SCHEMA_VERSION = 4
+VERIFICATION_SCHEMA_VERSION = 5
 
 _VERIFY_ROWS = 4096
 _VERIFY_CENTERS = 32
@@ -69,6 +69,15 @@ def independent_log_columns(model, centers, *, aggregation="marginal"):
     else:
         minimum, maximum = bounds.for_data(data)
         minimum, maximum = np.asarray(minimum)[ix], np.asarray(maximum)[ix]
+    if model.max_multiplicity_difference == 1:
+        from ..kernel.joint import joint_log_columns
+        scale = purity / ((1-purity)*normal+purity*total)
+        valid = np.all((centers >= 0) & (centers <= 1), axis=1)
+        answer = np.full((model.n, len(centers)), -np.inf)
+        if valid.any():
+            answer[:, valid] = joint_log_columns(alt, depth, scale, minimum, maximum,
+                observed_rows, centers[valid], max_multiplicity_difference=1, aggregation=aggregation)
+        return answer
     support = maximum-minimum+1
     answer = np.zeros((model.n, len(centers)))
     for region in range(model.r):
@@ -406,6 +415,7 @@ def result_tables(model, result, tumor_id):
                                 cluster_size=np.bincount(public)))
     calls = model.multiplicity(phi)
     calls = np.where(~model.observed & (model.support == 1), model.multiplicity_min, calls)
+    calls = np.where(phi == 0, np.nan, calls)
     report = getattr(getattr(model, 'data', None), 'cn_filter_report', None)
     if report is not None and report.records:
         mutations = {name: i for i, name in enumerate(model.mutation_ids)}

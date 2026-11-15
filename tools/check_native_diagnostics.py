@@ -34,7 +34,8 @@ def _single_state_contract_checks(directory):
     np.testing.assert_array_equal(limited["scaling"], full["scaling"])
     np.testing.assert_array_equal(limited["total"], full["total"])
     for support in (None, bounds):
-        model = RegionalModel(data, device="cpu", cpu_threads=1, multiplicity_support=support)
+        model = RegionalModel(data, device="cpu", cpu_threads=1, multiplicity_support=support,
+                              max_multiplicity_difference=None)
         try:
             assert not model.view(0).standard and not model.view(1).standard and model.view(2).standard
             if support is None:
@@ -44,7 +45,7 @@ def _single_state_contract_checks(directory):
                                             (0., np.nextafter(1., 0.), 1)):
                     buffers = [_array([value]) for value in (0., 20., 1/6, -np.log(6.), lower, upper)]
                     buffers += [_array([1], np.int64), _array([6], np.int64), _array([flags], np.uint8)]
-                    native = _Observations(1, 1, *map(_ptr, buffers))
+                    native = _Observations(1, 1, *map(_ptr, buffers), 0, -1)
                     context = ct.c_void_p()
                     status = model.backend.lib.CliPP2BackendCreate(ct.byref(native), -1, ct.byref(context))
                     if context.value:
@@ -54,19 +55,22 @@ def _single_state_contract_checks(directory):
                 phi = np.full((model.n, model.r), center)
                 loss = model.backend.node_terms(phi, derivatives=False)
                 diagnostic = model.backend.component_diagnostics(phi)
-                for i, r in np.ndindex(loss.shape):
+                expected_rows = np.zeros(model.n)
+                assert loss.shape == (model.n,)
+                for i, r in np.ndindex(model.observed.shape):
                     if not model.observed[i, r]:
-                        assert loss[i, r] == 0 and diagnostic["status"][i, r] == 4
+                        assert diagnostic["status"][i, r] == 4
                         assert np.isnan(diagnostic["log_emission"][i, r])
                         continue
                     multiplicities = np.arange(model.multiplicity_min[i, r], model.multiplicity_max[i, r]+1)
                     probability = np.minimum(1., (model.scaling[i, r]*multiplicities)*center)
                     masses = binom.logpmf(model.alt[i, r], model.depth[i, r], probability)
                     expected = logsumexp(masses)-np.log(len(multiplicities))
-                    np.testing.assert_allclose(-loss[i, r], expected, atol=2e-11, rtol=2e-13)
+                    expected_rows[i] += expected
                     np.testing.assert_allclose(diagnostic["log_emission"][i, r], expected, atol=2e-11, rtol=2e-13)
                     if np.isfinite(expected):
                         assert diagnostic["map_multiplicity"][i, r] == multiplicities[np.argmax(masses)]
+                np.testing.assert_allclose(-loss, expected_rows, atol=2e-11, rtol=2e-13)
             # Match the established single-state tie encoding, including its
             # historical constant mixed flag, without retaining that field.
             import hashlib

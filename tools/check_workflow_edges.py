@@ -1,4 +1,4 @@
-"""Protocol 2.4 workflow boundaries and preserved native-replay evidence."""
+"""Protocol 2.5 workflow boundaries and preserved native-replay evidence."""
 from __future__ import annotations
 
 import copy
@@ -56,21 +56,21 @@ def _available_contributors(directory):
         caps, policies = _stage_two_caps(catalog, [row])
         results[name] = row
         assert row["native_source_call"] == 2.
-        if name in ("missing", "incompatible"):
+        if name in ("missing", "incompatible", "zero"):
             assert not row["contributes_to_cap"] and caps.upper.item() == 4 and policies[0]["fallback"]
         else:
             assert row["contributes_to_cap"] and caps.upper.item() == row["cap_source_map_upper"]
-            assert caps.policy_id == "read_floor_lower_minimum_native_map_set_upper"
+            assert caps.policy_id == "joint_range_one_original_major_then_floor_then_cap_v1"
     assert results["weak"]["map_probability"] < .95 and results["weak"]["cap_source_map_call"] == 1
     assert results["residual"]["profile_deviance"] > 10.
     assert not results["tie"]["map_unique"] and results["tie"]["cap_source_map_call"] == 1
     assert tuple(results["tie"]["map_tied_values"]) == (1, 2)
     assert results["tie"]["cap_source_map_upper"] == 2
-    assert results["zero"]["cap_source_map_upper"] == 4 and not results["zero"]["multiplicity_read_informative"]
-    assert results["zero"]["availability_reason"] == "flat_native_likelihood"
-    assert results["incompatible"]["availability_reason"] == "model_incompatible"
+    assert results["zero"]["cap_source_map_upper"] is None and not results["zero"]["multiplicity_read_informative"]
+    assert results["zero"]["availability_reason"] == "zero_ccf"
+    assert results["incompatible"]["availability_reason"] == "zero_ccf"
     return dict(weak_call_lowers_cap=True, large_residual_contributes=True, exact_tie_upper_endpoint=True,
-                zero_ccf_flat_distribution_unrestrictive=True, undefined_distribution_not_uniform=True,
+                zero_ccf_excluded_from_donors=True, undefined_distribution_not_uniform=True,
                 missing_fallback=True, historical_call_preserved=True)
 
 
@@ -80,7 +80,10 @@ def _capped_target_and_replay(directory):
     metadata = dict(tumor_id="tumor_A", genome_build="fixture_build",
                     mutation_key_convention="opaque_fixture")
     catalog = write_catalog(path, alt, 100, 4, metadata=metadata)
-    config = workflow_config(fit=FitConfig(device="cpu", max_clusters=3, cpu_threads=1),
+    # Preserve this independent-model cap/replay regression: its discordant
+    # clonal donors deliberately require regional multiplicities (4,1)/(1,4).
+    config = workflow_config(fit=FitConfig(device="cpu", max_clusters=3, cpu_threads=1,
+                                         max_multiplicity_difference=None),
                              stage_two_max_clusters=3)
     output = directory / "capped_workflow"
     with patch("CliPP2.workflow.collect_cap_contributors", wraps=collect_cap_contributors) as qualify:
@@ -267,10 +270,18 @@ def _execution_tampering(catalog, accepted):
         changed = copy.deepcopy(original)
         changed["fit_config"].pop(key)
         variants.append(changed)
-        if key not in ("cpu_threads", "max_major_cn"):
+        if key not in ("cpu_threads", "max_major_cn", "max_multiplicity_difference"):
             changed = copy.deepcopy(original)
             changed["fit_config"][key] = None
             variants.append(changed)
+    for value in (2, 1 if config["max_multiplicity_difference"] is None else None):
+        changed = copy.deepcopy(original)
+        changed["fit_config"]["max_multiplicity_difference"] = value
+        variants.append(changed)
+    for backend in ("native", "selection_native"):
+        changed = copy.deepcopy(original)
+        changed["execution"][backend].pop("max_multiplicity_difference")
+        variants.append(changed)
     changed = copy.deepcopy(original)
     changed["fit_config"]["max_major_cn"] = 0
     variants.append(changed)
@@ -457,11 +468,11 @@ def _reference_preservation(directory):
         np.where(catalog.count_observed[1:], 1., np.nan))
     with patch("CliPP2.screening.summarize_profile_deviance", wraps=summarize_profile_deviance) as summarize:
         first_groups = classify_groups(catalog, first, config)
-        assert summarize.call_count == 2 * len(first_groups)
+        assert summarize.call_count == 4 * len(first_groups)  # Joint and regional residuals.
     selected = first_groups[0]
     with patch("CliPP2.screening.summarize_profile_deviance", wraps=summarize_profile_deviance) as summarize:
         groups = classify_groups(catalog, second, config)
-        assert summarize.call_count == 4 * len(groups)
+        assert summarize.call_count == 8 * len(groups)
     assert selected["distance_to_one"] == 0.
     assert all("near_clonal" not in group for group in groups)
     assert max(groups[0]["native_mean_profile_deviance"]) > 10.

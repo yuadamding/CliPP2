@@ -242,17 +242,8 @@ __global__ void resident_joint_kernel(ObservationSoA data,i64 count,const double
     for(i64 index=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;index<count;
         index+=static_cast<i64>(gridDim.x)*blockDim.x) {
         const i64 cluster=index/data.mutations,row=index%data.mutations;
-        double total=0.; EmitStatus state=EmitStatus::Ok;
-        for(i64 region=0;region<data.regions;++region) {
-            const i64 cell=region*data.mutations+row;
-            const double phi=centers[cluster*data.regions+region];
-            if(phi<data.lower[cell]||phi>data.upper[cell]) {
-                total=-positive_infinity; state=EmitStatus::ZeroLikelihood; break;
-            }
-            const auto terms=evaluate_observation<EmitMode::LossOnly>(observation(data,cell),phi);
-            if(static_cast<int>(terms.status)>static_cast<int>(state)) state=terms.status;
-            total-=terms.loss;
-        }
+        double total=0.;JointMass mass{data,row,centers+cluster*data.regions,1};
+        const auto state=joint_column_score(mass,total);
         columns[cluster][row]=total;
         if(state>EmitStatus::ZeroLikelihood) atomicMax(maximum,static_cast<int>(state));
     }

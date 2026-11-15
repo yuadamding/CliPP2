@@ -60,7 +60,7 @@ def biological_metrics(model, labels, centers, truth):
                 continue
             errors.append(abs(float(centers[labels[i], r])-float(row.true_ccf)))
     return dict(center_error=float(np.mean(errors)) if errors else None,
-                center_error_pairs=len(errors), membership_accuracy=partition_scores(true, pred)["ARI"] if rows else None,
+                center_error_pairs=len(errors), membership_accuracy=partition_scores(true, pred)["ari"] if rows else None,
                 membership_accuracy_definition="ARI", false_merges=pairs(counts.sum(axis=0))-tp,
                 false_splits=pairs(counts.sum(axis=1))-tp, evaluated_mutations=len(rows))
 
@@ -87,9 +87,10 @@ def compare_data(data, output, config, *, scope="search", partitions=None, state
     output.mkdir(parents=True, exist_ok=False)
     result = dict(scope=scope, config=asdict(config), source=source_record(),
                   source_selection=None, cap_changes=None, searches={}, comparisons=[])
-    with RegionalModel(data, config.device, cpu_threads=config.cpu_threads, multiplicity_support=support) as marginal, \
+    with RegionalModel(data, config.device, cpu_threads=config.cpu_threads, multiplicity_support=support,
+            max_multiplicity_difference=config.max_multiplicity_difference) as marginal, \
             RegionalModel(data, config.device, cpu_threads=config.cpu_threads, multiplicity_support=support,
-                          fit_multiplicity="profile") as profile:
+                          fit_multiplicity="profile", max_multiplicity_difference=config.max_multiplicity_difference) as profile:
         models = dict(marginal=marginal, profile=profile)
         result.update(mutation_ids=marginal.mutation_ids, region_ids=marginal.region_ids,
                       actual_lower=marginal.multiplicity_min, actual_upper=marginal.multiplicity_max,
@@ -163,7 +164,8 @@ def compare_workflow(input_path, output, config, *, truth=None):
     source = select_reference_source(classify_groups(catalog, frozen, config))
     g0 = tuple(m for m, k in zip(frozen.mutation_ids, frozen.labels) if k == source["source_label"])
     remainder = tuple(m for m in frozen.mutation_ids if m not in set(g0))
-    bounds, _ = _stage_two_caps(catalog, collect_cap_contributors(catalog, frozen, config, mutation_ids=g0))
+    bounds, _ = _stage_two_caps(catalog, collect_cap_contributors(catalog, frozen, config, mutation_ids=g0),
+                               max_multiplicity_difference=config.fit.max_multiplicity_difference)
     isolated = None
     if remainder:
         isolated = compare_data(catalog.fit_data(remainder, normal_cn_policy=config.normal_cn_policy),
@@ -176,7 +178,8 @@ def compare_workflow(input_path, output, config, *, truth=None):
     revised = load_accepted_fit(output/"profile/stage_one_accepted.json")
     selected = select_reference_source(classify_groups(catalog, revised, config))
     members = tuple(m for m, k in zip(revised.mutation_ids, revised.labels) if k == selected["source_label"])
-    revised_bounds, _ = _stage_two_caps(catalog, collect_cap_contributors(catalog, revised, config, mutation_ids=members))
+    revised_bounds, _ = _stage_two_caps(catalog, collect_cap_contributors(catalog, revised, config, mutation_ids=members),
+                                       max_multiplicity_difference=config.fit.max_multiplicity_difference)
     native_results = {}
     from CliPP2.kernel.model import FitResult
     from CliPP2.kernel.topology import Membership
@@ -189,7 +192,7 @@ def compare_workflow(input_path, output, config, *, truth=None):
             accepted = load_accepted_fit(path)
             with RegionalModel(catalog.fit_data(accepted.mutation_ids, normal_cn_policy=config.normal_cn_policy), config.fit.device,
                     cpu_threads=config.fit.cpu_threads, multiplicity_support=accepted.support,
-                    fit_multiplicity=mode) as model:
+                    fit_multiplicity=mode, max_multiplicity_difference=config.fit.max_multiplicity_difference) as model:
                 fit = FitResult(Membership(explicit_labels=accepted.labels), accepted.centers, accepted.weights,
                     accepted.conditional_log_likelihood, accepted.mixture_log_likelihood, accepted.complexity_penalty,
                     accepted.score, True, fitting_log_likelihood=accepted.fitting_log_likelihood,
@@ -220,8 +223,11 @@ if __name__ == "__main__":
     parser.add_argument("--stage-two-max-clusters", type=int, default=20)
     parser.add_argument("--max-major-cn", type=int)
     parser.add_argument("--missing-counts", choices=("zero_alt", "unobserved"), default="zero_alt")
+    parser.add_argument("--independent-multiplicities", action="store_true",
+                        help="Disable the default regional multiplicity range restriction.")
     args = parser.parse_args()
-    config = FitConfig(device=args.device, max_clusters=args.max_clusters, max_major_cn=args.max_major_cn, cpu_threads=1)
+    config = FitConfig(device=args.device, max_clusters=args.max_clusters, max_major_cn=args.max_major_cn, cpu_threads=1,
+                      max_multiplicity_difference=None if args.independent_multiplicities else 1)
     if args.scope == "workflow":
         compare_workflow(args.input, args.output_dir, WorkflowConfig(fit=config,
             stage_two_max_clusters=args.stage_two_max_clusters, missing_counts=args.missing_counts), truth=args.truth)

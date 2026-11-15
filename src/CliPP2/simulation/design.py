@@ -29,14 +29,18 @@ def seed_for(master, phase, family, history, acquisition=0):
                                       int(history), int(acquisition)]).generate_state(1)[0])
 
 
-def workflow_config(*, device="cpu", threads=1):
+def workflow_config(*, device="cpu", threads=1, max_multiplicity_difference=1):
     """One declared workflow; scientific performance does not select settings."""
-    return WorkflowConfig(fit=FitConfig(device=device, cpu_threads=threads, max_clusters=10),
+    return WorkflowConfig(fit=FitConfig(device=device, cpu_threads=threads, max_clusters=10,
+        max_multiplicity_difference=max_multiplicity_difference),
         stage_two_max_clusters=20)
 
 
 def resolve_config(contract):
-    return WorkflowConfig.from_dict(contract["base_workflow_config"])
+    settings = contract["base_workflow_config"]
+    if "max_multiplicity_difference" not in settings.get("fit", {}):
+        raise ValueError("Simulation contracts must explicitly declare max_multiplicity_difference")
+    return WorkflowConfig.from_dict(settings)
 
 
 def source_identity():
@@ -50,7 +54,8 @@ def source_identity():
 
 def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, regions=4,
                   main_replicates=None, development_replicates=None,
-                  cohort_settings=None, reference_match_atol=None, run_manifest_id=None):
+                  cohort_settings=None, reference_match_atol=None, run_manifest_id=None,
+                  max_multiplicity_difference=1):
     if (type(workers) is not int or workers < 1
             or any(type(value) is not int or value < lower for value, lower in
                    ((mutations, 12), (segments, 1), (regions, 1)))):
@@ -87,7 +92,7 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
         raise ValueError("Declared replicates exceed the supplied study design")
     replicate_roster = dict(unit="variant" if cohort else "family", main=list(range(1, main+1)),
         development=list(range(1, development+1)))
-    return dict(schema="clipp2.simulation-contract.v8", study_version=STUDY_VERSION,
+    return dict(schema="clipp2.simulation-contract.v9", study_version=STUDY_VERSION,
         implementation_version=__version__,
         run_manifest_id=validate_run_manifest_id(run_manifest_id if run_manifest_id is not None
                                                else os.environ.get("CLIPP2_RUN_MANIFEST_ID")),
@@ -102,8 +107,8 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
             selection_performed=False, performance_controls_main_execution=False,
             population="all declared development histories and acquisitions",
             failures="retained in planned-population accounting; no fabricated estimates"),
-        base_workflow_config=asdict(workflow_config()),
-        evaluation=dict(record_schema="clipp2.simulation.evaluation.v6",
+        base_workflow_config=asdict(workflow_config(max_multiplicity_difference=max_multiplicity_difference)),
+        evaluation=dict(record_schema="clipp2.simulation.evaluation.v7",
             assignment_method=workflow_config().stage_three_assignment_method,
             reference_policy=STAGE_THREE_REFERENCE_POLICY,
             primary="data-supported MAP sampled-region clonality, detailed membership and CCF error",
@@ -123,7 +128,7 @@ def make_contract(*, master_seed=None, workers=10, mutations=1500, segments=50, 
 
 def _replicates(contract):
     roster = contract["replicate_roster"]
-    if contract.get("schema") in ("clipp2.simulation-contract.v7", "clipp2.simulation-contract.v8") and set(roster) != {"unit", "main", "development"}:
+    if contract.get("schema") == "clipp2.simulation-contract.v9" and set(roster) != {"unit", "main", "development"}:
         raise ValueError("The current protocol requires one main and one development replicate block")
     maximums = (10, 2) if contract.get("cohort") else (50, 10)
     if roster.get("unit") != ("variant" if contract.get("cohort") else "family"):

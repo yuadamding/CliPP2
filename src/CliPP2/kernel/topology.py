@@ -163,6 +163,7 @@ class PreparedPartition:
     groups: tuple
     coordinate_fits: tuple = ()
     selection_columns: object = None
+    group_fits: tuple = ()
 
     def __post_init__(self):
         object.__setattr__(self, "labels", readonly_array(self.labels, dtype=np.int64))

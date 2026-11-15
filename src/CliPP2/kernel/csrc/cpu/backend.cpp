@@ -1,5 +1,8 @@
 #include "../common/backend.h"
 #include "../common/emission_math.h"
+#include "../common/joint_multiplicity.h"
+#include "../common/joint_refit.h"
+#include "../common/joint_workspace.h"
 #include "../common/validation.h"
 #include "../common/refit_validation.h"
 #include "probability_plan.h"
@@ -35,6 +38,7 @@ struct Context {
     std::vector<std::int64_t> minimum, support;
     std::vector<std::uint8_t> flags;
     clipp2::ObservationSoA view{};
+    clipp2::JointWorkspace joint_workspace;
     CliPP2BackendDiagnostics diagnostics{};
     clipp2::ProbabilityWork probability_work{};
     clipp2::ProbabilityCache probability_cache;
@@ -50,8 +54,10 @@ struct Context {
         support.assign(input.support, input.support + cells); flags.assign(input.flags, input.flags + cells);
         view = {input.mutations, input.regions, alt.data(), ref.data(), scaling.data(),
                 constants.data(), lower.data(), upper.data(), minimum.data(), support.data(), flags.data(),
-                input.aggregation};
-        diagnostics.prepared_bytes = cells * 65;
+                input.aggregation, input.max_multiplicity_difference};
+        joint_workspace.prepare(view);
+        diagnostics.prepared_bytes = cells * 65 + 8*(joint_workspace.offsets.size()+joint_workspace.rows.size());
+        diagnostics.workspace_bytes = 8*joint_workspace.values.capacity();
     }
 };
 Context& context(void* value) {
@@ -92,11 +98,19 @@ void store(const clipp2::Observation& observation, double phi, std::int64_t inde
 template<EmitMode Mode>
 void nodes(Context& ctx, std::int64_t count, const double* phi, double* loss,
            double* gradient, double* curvature, std::uint8_t* status) {
-    const auto cells = ctx.view.mutations * ctx.view.regions;
+    const auto n=ctx.view.mutations,cells=n*ctx.view.regions;
+    if(Mode!=EmitMode::LossOnly)ctx.joint_workspace.prepare(ctx.view,count/cells);
     CLIPP_PARALLEL_FOR
-    for (std::int64_t index = 0; index < count; ++index)
-        store<Mode>(clipp2::observation(ctx.view, index % cells), phi[index], index,
-                    loss, gradient, curvature, status);
+    for(std::int64_t index=0;index<count/ctx.view.regions;++index) {
+        const auto row=index%n,batch=index/n;
+        clipp2::JointMass mass{ctx.view,row,phi+batch*cells+row,n};
+        status[index]=static_cast<std::uint8_t>(clipp2::joint_terms(mass,loss[index],
+            Mode==EmitMode::LossOnly?nullptr:gradient+batch*cells+row,
+            Mode==EmitMode::LossOnly?nullptr:curvature+batch*cells+row,n,nullptr,nullptr,
+            Mode==EmitMode::LossOnly?nullptr:ctx.joint_workspace.component_offsets(row),
+            Mode==EmitMode::LossOnly?nullptr:ctx.joint_workspace.cavity(row,batch),
+            Mode==EmitMode::LossOnly?nullptr:ctx.joint_workspace.messages(row,batch)));
+    }
 }
 }
 
@@ -117,7 +131,9 @@ extern "C" void CliPP2BackendDestroy(void* ctx) { delete static_cast<Context*>(c
 extern "C" int CliPP2BackendGetDiagnostics(void* value, CliPP2BackendDiagnostics* output) {
     return guarded([&] {
         require(output, "Null diagnostics output"); auto& ctx = context(value);
-        ctx.diagnostics.cache_bytes = ctx.probability_cache.bytes(); *output = ctx.diagnostics;
+        ctx.diagnostics.cache_bytes = ctx.probability_cache.bytes();
+        ctx.diagnostics.workspace_bytes=std::max<std::int64_t>(ctx.diagnostics.workspace_bytes,8*ctx.joint_workspace.values.capacity());
+        *output = ctx.diagnostics;
     });
 }
 extern "C" int CliPP2ConfigureCPUExecution(void* value, int threads) {
@@ -193,12 +209,16 @@ extern "C" int CliPP2MultiplicityMAP(void* value, const double* phi, double* out
     return guarded([&] {
         auto& ctx = context(value);
         require(phi && output && status, "Null multiplicity argument");
-        const auto count = ctx.view.mutations * ctx.view.regions;
+        const auto count=ctx.view.mutations*ctx.view.regions,n=ctx.view.mutations;
         CLIPP_PARALLEL_FOR
-        for (std::int64_t cell = 0; cell < count; ++cell) {
-            auto state = clipp2::EmitStatus::Ok;
-            output[cell] = clipp2::multiplicity_map(clipp2::observation(ctx.view, cell), phi[cell], state);
-            status[cell] = static_cast<std::uint8_t>(state);
+        for(std::int64_t row=0;row<n;++row) {
+            clipp2::JointMass mass{ctx.view,row,phi+row,n};
+            clipp2::joint_map(mass,output+row,n);
+            const auto state=clipp2::finite_number(clipp2::joint_reduce(mass))?0:1;
+            for(std::int64_t r=0;r<ctx.view.regions;++r) {
+                const auto c=r*n+row;status[c]=state;
+                if(phi[c]==0)output[c]=clipp2::quiet_nan;
+            }
         }
         ++ctx.diagnostics.calls; ctx.diagnostics.cell_evaluations += count;
     });
@@ -221,11 +241,12 @@ extern "C" int CliPP2ProfileSlopes(void* value, const double* phi, double* right
     return guarded([&] {
         auto& ctx = context(value);
         require(phi && right && left, "Null profile slope argument");
-        const auto count = ctx.view.mutations * ctx.view.regions;
-        for (std::int64_t i=0; i<count; ++i) {
-            require(std::isfinite(phi[i]) && phi[i]>=0 && phi[i]<=1, "Invalid profile slope coordinate");
-            const auto slope = clipp2::profile_slopes(clipp2::observation(ctx.view,i),phi[i]);
-            right[i]=slope.right; left[i]=slope.left;
+        const auto count=ctx.view.mutations*ctx.view.regions,n=ctx.view.mutations;
+        std::vector<double> gradient(count),curvature(count);
+        for(std::int64_t row=0;row<n;++row) {
+            clipp2::JointMass mass{ctx.view,row,phi+row,n};double loss;
+            const auto state=clipp2::joint_terms(mass,loss,gradient.data()+row,curvature.data()+row,n,right+row,left+row);
+            require(state==clipp2::EmitStatus::Ok,"Invalid joint profile slope state");
         }
         ++ctx.diagnostics.calls; record_evaluations(ctx,count);
     });
@@ -269,6 +290,16 @@ extern "C" int CliPP2EvaluateJointColumns(void* value, std::int64_t count,
         auto& ctx = context(value);
         const auto cells = product(count, ctx.view.mutations); product(count, ctx.view.regions);
         require(!cells || (centers && output && status), "Null joint column argument");
+        if(ctx.view.max_multiplicity_difference==1) {
+            CLIPP_PARALLEL_FOR
+            for(std::int64_t index=0;index<cells;++index) {
+                const auto row=index%ctx.view.mutations,cluster=index/ctx.view.mutations;
+                clipp2::JointMass mass{ctx.view,row,centers+cluster*ctx.view.regions,1};
+                status[index]=static_cast<std::uint8_t>(clipp2::joint_column_score(mass,output[index]));
+            }
+            ++ctx.diagnostics.calls;ctx.diagnostics.cell_evaluations+=cells*ctx.view.regions;return;
+        }
+
         clipp2::ProbabilityTasks plans(ctx.view, 0, ctx.view.regions, nullptr, ctx.view.mutations,
                                       count, ctx.probability_cache);
         const auto workers = plans.workers;
@@ -361,6 +392,75 @@ extern "C" int CliPP2EvaluateConditionalValues(void* value, const clipp2::Condit
         }
         ctx.diagnostics.workspace_bytes = std::max(ctx.diagnostics.workspace_bytes,
                                                    static_cast<std::int64_t>(scratch) + probability_work.reserved);
+        ++ctx.diagnostics.calls;
+    });
+}
+
+extern "C" int CliPP2JointDiagnostics(void* value,const double* phi,const double* accepted,
+        const std::int64_t* offsets,double* row_values,double* maps,double* component_at_map,
+        double* accepted_logp,double* map_logp,double* conditional,double* probabilities,std::uint8_t* status) {
+    return guarded([&] {
+        auto& ctx=context(value);const auto n=ctx.view.mutations,cells=n*ctx.view.regions;
+        require(phi&&offsets&&row_values&&maps&&component_at_map&&accepted_logp&&map_logp&&conditional&&probabilities&&status,"Missing joint diagnostics buffers");
+        require(offsets[0]==0,"Invalid ragged joint diagnostic offsets");
+        for(std::int64_t c=0;c<cells;++c)require(offsets[c+1]-offsets[c]==ctx.view.support[c],"Joint diagnostic support mismatch");
+        CLIPP_PARALLEL_FOR
+        for(std::int64_t row=0;row<n;++row) {
+            clipp2::JointMass mass{ctx.view,row,phi+row,n};
+            status[row]=static_cast<std::uint8_t>(clipp2::joint_diagnostics_row(mass,offsets,row_values+4*row,maps,component_at_map,
+                accepted_logp,map_logp,conditional,probabilities,ctx.joint_workspace.messages(row),accepted));
+        }
+        ++ctx.diagnostics.calls;
+    });
+}
+extern "C" int CliPP2PooledJointPilots(void* value,const std::int64_t* grid_offsets,const double* grids,
+        const double* weights,double* pilots,std::uint8_t* status) {
+    return guarded([&] {
+        auto& ctx=context(value);const auto n=ctx.view.mutations,rn=ctx.view.regions,cells=n*rn;
+        require(grid_offsets&&grids&&weights&&pilots&&status,"Missing pooled component buffers");
+        std::vector<std::int64_t> offsets(cells+1,0);
+        for(std::int64_t c=0;c<cells;++c)offsets[c+1]=offsets[c]+ctx.view.support[c];
+        std::vector<double> masses(offsets.back()),moments(offsets.back()),cavities(offsets.back());
+        for(std::int64_t r=0;r<rn;++r)require(grid_offsets[r+1]>grid_offsets[r],"Empty regional pool");
+        CLIPP_PARALLEL_FOR
+        for(std::int64_t c=0;c<cells;++c) {
+            const auto r=c/n;const auto o=clipp2::observation(ctx.view,c);
+            for(std::int64_t j=0;j<o.support;++j)clipp2::pooled_component(o,o.minimum+j,grids+grid_offsets[r],
+                weights+grid_offsets[r],grid_offsets[r+1]-grid_offsets[r],masses[offsets[c]+j],moments[offsets[c]+j]);
+        }
+        CLIPP_PARALLEL_FOR
+        for(std::int64_t row=0;row<n;++row) {
+            clipp2::JointMass mass{ctx.view,row,nullptr,1,offsets.data(),masses.data()};
+            status[row]=static_cast<std::uint8_t>(clipp2::pooled_pilot_row(mass,moments.data(),pilots,cavities.data(),ctx.joint_workspace.messages(row)));
+        }
+        ++ctx.diagnostics.calls;
+    });
+}
+extern "C" int CliPP2RefitGroupsBatch(void* value,std::int64_t groups,const std::int64_t* offsets,
+        const std::int64_t* members,const double* initial,const double* lower,const double* upper,
+        double* centers,double* likelihood,std::int32_t* status,std::int64_t* iterations,
+        double* projected,std::uint8_t* retained) {
+    return guarded([&] {
+        auto& ctx=context(value);const auto R=ctx.view.regions;
+        require(groups>=0&&offsets&&members&&initial&&lower&&upper&&centers&&likelihood&&status&&iterations&&projected&&retained,"Missing joint group buffers");
+        require(offsets[0]==0,"Invalid joint group offsets");
+        for(std::int64_t g=0;g<groups;++g)require(offsets[g+1]>offsets[g],"Empty joint fitting group");
+        for(std::int64_t j=0;j<offsets[groups];++j)require(members[j]>=0&&members[j]<ctx.view.mutations,"Invalid joint group member");
+        CLIPP_PARALLEL_FOR
+        for(std::int64_t g=0;g<groups;++g) {
+            const auto count=offsets[g+1]-offsets[g];const auto rows=members+offsets[g];
+            std::vector<std::int64_t> component_offsets(count*R+1,0);std::int64_t maximum=1;
+            for(std::int64_t i=0;i<count;++i)for(std::int64_t r=0;r<R;++r) {
+                const auto width=ctx.view.support[r*ctx.view.mutations+rows[i]],c=i*R+r;
+                component_offsets[c+1]=component_offsets[c]+width;if(width>maximum)maximum=width;
+            }
+            const auto components=component_offsets.back();
+            std::vector<double> scratch(2*components+maximum+12*R+6);
+            std::vector<std::int64_t> branches(maximum);
+            clipp2::JointGroup group{ctx.view,rows,count,lower+g*R,upper+g*R,component_offsets.data()};
+            clipp2::refit_joint_group(group,initial+g*R,centers+g*R,likelihood[g],status[g],iterations[g],projected[g],retained[g],
+                scratch.data(),branches.data(),components,maximum);
+        }
         ++ctx.diagnostics.calls;
     });
 }

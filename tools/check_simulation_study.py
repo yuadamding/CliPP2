@@ -58,8 +58,8 @@ def _design_check(root, settings):
     snapshot = root / "cohort_settings.json"
     save_json(snapshot, load_cohort(settings).settings)
     contract = make_contract(cohort_settings=snapshot)
-    assert contract["protocol_version"] == "2.4" and contract["source_cohort_protocol_version"] == "2.1"
-    assert contract["schema"] == "clipp2.simulation-contract.v8"
+    assert contract["protocol_version"] == "2.5" and contract["source_cohort_protocol_version"] == "2.1"
+    assert contract["schema"] == "clipp2.simulation-contract.v9"
     assert contract["evaluation"]["reference_match_atol"] is None
     assert json.loads(snapshot.read_text())["workflow_protocol"] == "2.1"
     main, development = list(jobs(contract, "main")), list(jobs(contract, "development"))
@@ -161,7 +161,7 @@ def _native_failure_check(root, history, frame, job, contract):
     def evaluator(_history, _catalog, experiment, **kwargs):
         captured.append(deepcopy(experiment))
         evaluated = real_evaluator(_history, _catalog, experiment, **kwargs)
-        assert evaluated["protocol_version"] == "2.4" and evaluated["metrics"]
+        assert evaluated["protocol_version"] == "2.5" and evaluated["metrics"]
         return evaluated
 
     with patch("CliPP2.simulation.study._history", return_value=history), \
@@ -257,7 +257,7 @@ def _planned_report_check(root, contract):
     assert len({".".join(row["history_id"].split(".")[1:3]) for row in captured}) == 60
     assert all(all(not state["available"] and state["status"] == "not_executed"
                    for state in row["applicability"]) for row in captured)
-    assert all(row["schema"] == "clipp2.simulation.evaluation.v6" for row in captured)
+    assert all(row["schema"] == "clipp2.simulation.evaluation.v7" for row in captured)
     assert all(metric["value"] is None for row in captured for metric in row["metrics"]
                if metric["name"] == "binary_correct_per_original_evaluable")
 
@@ -328,7 +328,7 @@ def _report_integrity_check(root):
                  phase="main", acquisition=dict(id="A1", purity=.8, depth=100)) for i in range(4)]
     records = []
     for job, states in zip(jobs, ((0, 0, None), (0, None, None), (None, None, None), (1, 1, 1))):
-        records.append(dict(schema="clipp2.simulation.evaluation.v6", **job, acquisition_id="A1",
+        records.append(dict(schema="clipp2.simulation.evaluation.v7", max_multiplicity_difference=1, **job, acquisition_id="A1",
             status="execution_failed" if states == (0, 0, None) else "complete",
             evaluation_definition=definition, evaluation_definition_id=content_hash(definition),
             metrics=[dict(name=name, arm=arm, view="all_planned_cells", stratum="all", value=value,
@@ -412,7 +412,7 @@ def _partial_evidence_report_checks(root):
             for name, value in (("analysis_available", 1), ("analysis_failure", 0),
                                ("execution_available", 1), ("execution_failure", 0),
                                ("evaluation_available", 1), ("scientifically_applicable", 1))]
-        return dict(schema="clipp2.simulation.evaluation.v6", evaluation_definition=definition,
+        return dict(schema="clipp2.simulation.evaluation.v7", max_multiplicity_difference=1, evaluation_definition=definition,
             evaluation_definition_id=content_hash(definition), truth_qualification=truth,
             **record, acquisition_id="A1", original_evaluable_count=10, region_count=4,
             status="complete", metrics=metrics, calibration=[], cap_audit=[],
@@ -753,7 +753,7 @@ def run_checks(directory, cohort_settings):
                 "changed_reference_evaluation_tolerance_rejected",
                 "explicit_retry_appends_attempt_and_preserves_prior_costs", "exactly_one_declared_configuration",
                 "successful_retry_archives_complete_numerical_receipts", "archive_roundtrip_preserves_paired_state_and_costs",
-                "full_truth_evaluator_accepts_protocol24_MAP_and_final_membership",
+                "full_truth_evaluator_accepts_protocol25_MAP_and_final_membership",
                 "runtime_counts_archived_failed_and_interrupted_work_once", "runtime_status_does_not_modify_outputs",
                 "frozen_configuration_reaches_real_runner", "unexecuted_main_cells_remain_in_planned_denominator",
                 "offline_archived_evaluation_preserves_sources_and_contract",

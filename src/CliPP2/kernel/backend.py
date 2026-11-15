@@ -16,7 +16,7 @@ from .execution import resolve_cpu_threads
 _D = ct.POINTER(ct.c_double)
 _I = ct.POINTER(ct.c_int64)
 _B = ct.POINTER(ct.c_uint8)
-BACKEND_ABI = 8
+BACKEND_ABI = 9
 
 
 class NativeExecutionError(RuntimeError):
@@ -117,7 +117,7 @@ class DeviceMixtureProblem:
 class _Observations(ct.Structure):
     _fields_ = [("n", ct.c_int64), ("r", ct.c_int64)] + [
         (name, _D) for name in ("alt", "ref", "scaling", "constants", "lower", "upper")
-    ] + [("minimum", _I), ("support", _I), ("flags", _B), ("aggregation", ct.c_int32)]
+    ] + [("minimum", _I), ("support", _I), ("flags", _B), ("aggregation", ct.c_int32), ("max_multiplicity_difference", ct.c_int32)]
 
 
 class _ComponentDiagnostics(ct.Structure):
@@ -176,6 +176,7 @@ class NativeBackend:
         if aggregation not in ("marginal", "profile"):
             raise ValueError("Unknown likelihood aggregation")
         self._aggregation = aggregation
+        self.max_multiplicity_difference = getattr(model, "max_multiplicity_difference", None)
         self._weight_submission_lock = threading.Lock()
         kind = "cuda" if model.device.startswith("cuda") else "cpu"
         path = _extension_path(Path(__file__).parent, f"_native_{kind}")
@@ -218,6 +219,13 @@ class NativeBackend:
         lib.CliPP2ComponentDiagnostics.restype = ct.c_int
         lib.CliPP2ProfileSlopes.argtypes = [ct.c_void_p, _D, _D, _D]
         lib.CliPP2ProfileSlopes.restype = ct.c_int
+        lib.CliPP2JointDiagnostics.argtypes = [ct.c_void_p, _D, _D, _I, _D, _D, _D, _D, _D, _D, _D, _B]
+        lib.CliPP2JointDiagnostics.restype = ct.c_int
+        lib.CliPP2PooledJointPilots.argtypes = [ct.c_void_p, _I, _D, _D, _D, _B]
+        lib.CliPP2PooledJointPilots.restype = ct.c_int
+        lib.CliPP2RefitGroupsBatch.argtypes = [ct.c_void_p, ct.c_int64, _I, _I, _D, _D, _D,
+            _D, _D, ct.POINTER(ct.c_int32), _I, _D, _B]
+        lib.CliPP2RefitGroupsBatch.restype = ct.c_int
         if kind == "cpu" and hasattr(lib, "CliPP2ProbabilityReuseDiagnostics"):
             lib.CliPP2ProbabilityReuseDiagnostics.argtypes = [ct.c_void_p, _I]
             lib.CliPP2ProbabilityReuseDiagnostics.restype = ct.c_int
@@ -232,7 +240,10 @@ class NativeBackend:
             raise ValueError("Multiplicity minimum and width must be integer N by R arrays")
         fields += [_array(minimum.T, np.int64), _array(support.T, np.int64),
                    _array(model.observed.T, np.uint8)]
-        observations = _Observations(model.n, model.r, *map(_ptr, fields), int(aggregation == "profile"))
+        self._support = np.array(support, dtype=np.int64, copy=True)
+        self._minimum = np.array(minimum, dtype=np.int64, copy=True)
+        observations = _Observations(model.n, model.r, *map(_ptr, fields), int(aggregation == "profile"),
+                                    -1 if self.max_multiplicity_difference is None else self.max_multiplicity_difference)
         self.context = ct.c_void_p()
         device_index = (int(model.device.split(":", 1)[1]) if ":" in model.device else 0) if kind == "cuda" else -1
         self._check(lib.CliPP2BackendCreate(ct.byref(observations), device_index, ct.byref(self.context)))
@@ -288,7 +299,7 @@ class NativeBackend:
         if self.kind == "cuda":
             reuse = np.empty(9, dtype=np.int64)
             self._check(self.lib.CliPP2CUDAReuseDiagnostics(self.context, _ptr(reuse)))
-            return int(reuse[7]) + int(reuse[8]) + self.probability_reuse_diagnostics()["host_bytes"]
+            return int(reuse[7]) + int(reuse[8]) + self.probability_reuse_diagnostics()["host_bytes"] + 8*self.n*self.r
         result = _Diagnostics()
         self._check(self.lib.CliPP2BackendGetDiagnostics(self.context, ct.byref(result)))
         return result.prepared_bytes + result.cache_bytes
@@ -355,6 +366,7 @@ class NativeBackend:
         self._check(self.lib.CliPP2BackendGetDiagnostics(self.context, ct.byref(result)))
         diagnostics = {"kind": self.kind, "build_id": self.identity, "numerical_policy": self.policy,
                        "aggregation": self.aggregation,
+                       "max_multiplicity_difference": self.max_multiplicity_difference,
                        **{name: getattr(result, name) for name, _ in result._fields_}}
         if self.kind == "cuda":
             diagnostics["scoring"] = self.scoring_diagnostics()
@@ -395,7 +407,7 @@ class NativeBackend:
         result = self._evaluate_node_terms(x, derivatives, 1)
         # Host continuation reduces these N-by-R arrays in the established
         # row-major order. A transposed view would silently change that order.
-        return tuple(np.ascontiguousarray(value.T) for value in result) if derivatives else np.ascontiguousarray(result[0].T)
+        return (result[0].reshape(self.n), *(np.ascontiguousarray(value.T) for value in result[1:])) if derivatives else result[0].reshape(self.n)
 
     def component_diagnostics(self, x, accepted_calls=None):
         """Compact fixed-CCF diagnostics, retaining explicit missing/error status.
@@ -428,8 +440,8 @@ class NativeBackend:
     def profile_slopes(self, x):
         self._require_open()
         x = _array(np.asarray(x).T)
-        if x.shape != (self.r, self.n):
-            raise ValueError("Profile slopes require N by R coordinates")
+        if x.shape != (self.r, self.n) or not np.isfinite(x).all() or np.any((x < 0) | (x > 1)):
+            raise ValueError("Profile slopes require finite N by R CCFs in [0, 1]")
         right, left = np.empty_like(x), np.empty_like(x)
         self._check(self.lib.CliPP2ProfileSlopes(self.context, _ptr(x), _ptr(right), _ptr(left)))
         if not np.isfinite(right).all() or not np.isfinite(left).all():
@@ -438,8 +450,8 @@ class NativeBackend:
 
     def _evaluate_node_terms(self, x, derivatives, batches):
         """Evaluate already validated region-major states."""
-        result = [np.empty_like(x) for _ in range(3 if derivatives else 1)]
-        status = np.empty(x.shape, dtype=np.uint8)
+        result = [np.empty((batches, self.n))] + ([np.empty_like(x), np.empty_like(x)] if derivatives else [])
+        status = np.empty((batches, self.n), dtype=np.uint8)
         pointers = [_ptr(value) for value in result] + [None] * (3-len(result))
         self._check(self.lib.CliPP2EvaluateNodes(self.context, batches, _ptr(x), int(derivatives),
                                                 *pointers, _ptr(status)), status)
@@ -460,7 +472,7 @@ class NativeBackend:
             return []
         x = _array(coordinates.transpose(0, 2, 1))
         result = self._evaluate_node_terms(x, derivatives, batches)
-        ordered = [np.ascontiguousarray(value.transpose(0, 2, 1)) for value in result]
+        ordered = [result[0]] + [np.ascontiguousarray(value.transpose(0, 2, 1)) for value in result[1:]]
         return ([tuple(value[index] for value in ordered) for index in range(batches)]
                 if derivatives else list(ordered[0]))
 
@@ -658,6 +670,77 @@ class NativeBackend:
             raise ValueError("Multiplicity posterior is undefined at zero likelihood")
         return np.ascontiguousarray(result.T)
 
+    def joint_diagnostics(self, x, accepted_calls=None):
+        """Native joint MAP, projected ties and posterior marginals on fixed support."""
+        self._require_open()
+        states = _array(np.asarray(x).T)
+        if states.shape != (self.r, self.n) or not np.isfinite(states).all() or np.any((states < 0) | (states > 1)):
+            raise ValueError("Joint diagnostic CCFs must be finite N by R in [0, 1]")
+        calls = None if accepted_calls is None else _array(np.asarray(accepted_calls).T)
+        if calls is not None and calls.shape != states.shape:
+            raise ValueError("Accepted calls must match N by R")
+        widths = self._support.T.ravel()
+        offsets = _array(np.r_[0, np.cumsum(widths)], np.int64)
+        rows = np.empty((self.n, 4))
+        fields = [np.empty_like(states) for _ in range(4)]
+        conditional, probabilities = np.empty(offsets[-1]), np.empty(offsets[-1])
+        status = np.empty(self.n, np.uint8)
+        self._check(self.lib.CliPP2JointDiagnostics(self.context, _ptr(states),
+            None if calls is None else _ptr(calls), _ptr(offsets), _ptr(rows),
+            *map(_ptr, fields), _ptr(conditional), _ptr(probabilities), _ptr(status)), status)
+        result = dict(zip(("log_marginal", "profile", "log_normalizer", "coupling_profile_loss"), rows.T))
+        result.update(zip(("map_multiplicity", "component_log_mass_at_map", "accepted_log_probability", "map_log_probability"),
+                          (np.ascontiguousarray(a.T) for a in fields)))
+        result["status"] = status
+        def ragged(values):
+            return tuple(tuple(values[offsets[r*self.n+i]:offsets[r*self.n+i+1]].copy()
+                         for r in range(self.r)) for i in range(self.n))
+        result["conditional_max"], result["probabilities"] = ragged(conditional), ragged(probabilities)
+        result["map_sets"] = tuple(tuple(tuple(int(self._minimum[i, r]+j) for j in
+            np.flatnonzero(np.isfinite(result["profile"][i]) &
+                           (result["conditional_max"][i][r] == result["profile"][i])))
+            for r in range(self.r)) for i in range(self.n))
+        return result
+
+    def pooled_joint_pilots(self, grids, weights):
+        """Integrate sparse regional CCF pools and condition on joint multiplicities."""
+        if len(grids) != self.r or len(weights) != self.r:
+            raise ValueError("One pooled CCF distribution is required per region")
+        grids, weights = tuple(map(_array, grids)), tuple(map(_array, weights))
+        if any(g.ndim != 1 or w.shape != g.shape or not len(g) or not np.isfinite(g).all()
+               or np.any((g < 0) | (g > 1)) or not np.isfinite(w).all() or np.any(w < 0)
+               or not np.isclose(w.sum(), 1.) for g, w in zip(grids, weights)):
+            raise ValueError("Regional pools require finite normalized weights and CCF grids")
+        offsets = _array(np.r_[0, np.cumsum([len(g) for g in grids])], np.int64)
+        grids, weights = _array(np.concatenate(grids)), _array(np.concatenate(weights))
+        output, status = np.empty((self.r, self.n)), np.empty(self.n, np.uint8)
+        self._check(self.lib.CliPP2PooledJointPilots(self.context, _ptr(offsets), _ptr(grids),
+            _ptr(weights), _ptr(output), _ptr(status)), status)
+        return np.ascontiguousarray(output.T), status
+
+    def refit_groups(self, groups, initial_centers, lower=None, upper=None):
+        """Native vector refits with whole-group dependence and stationarity checks."""
+        self._require_open()
+        groups = tuple(self._rows(0, members) for members in groups)
+        count = len(groups)
+        initial = _array(initial_centers)
+        lower = _array(np.zeros_like(initial) if lower is None else lower)
+        upper = _array(np.ones_like(initial) if upper is None else upper)
+        if initial.shape != (count, self.r) or lower.shape != initial.shape or upper.shape != initial.shape:
+            raise ValueError("Group starts and bounds must match groups by regions")
+        if np.any(lower > upper) or np.any(lower < 0) or np.any(upper > 1):
+            raise ValueError("Invalid group CCF bounds")
+        offsets = _array(np.r_[0, np.cumsum([len(g) for g in groups])], np.int64)
+        members = _array(np.concatenate(groups), np.int64)
+        centers, likelihood = np.empty_like(initial), np.empty(count)
+        status, iterations = np.empty(count, np.int32), np.empty(count, np.int64)
+        projected, retained = np.empty(count), np.empty(count, np.uint8)
+        self._check(self.lib.CliPP2RefitGroupsBatch(self.context, count, _ptr(offsets), _ptr(members),
+            _ptr(initial), _ptr(lower), _ptr(upper), _ptr(centers), _ptr(likelihood),
+            status.ctypes.data_as(ct.POINTER(ct.c_int32)), _ptr(iterations), _ptr(projected), _ptr(retained)))
+        return dict(centers=centers, log_likelihood=likelihood, status=status, iterations=iterations,
+                    projected_gradient=projected, retained_initial=retained.astype(bool))
+
     def refit(self, prepared):
         """Execute model-prepared scientific inputs, preserving their exact order."""
         self._require_open()
@@ -705,7 +788,7 @@ class NativeBackend:
         return values
 
 
-NATIVE_ABI = 9
+NATIVE_ABI = 10
 
 def native_library():
     path = _extension_path(Path(__file__).resolve().parent, '_native')

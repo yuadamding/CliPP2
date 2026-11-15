@@ -36,8 +36,8 @@ def run_checks(root, *, device="cpu"):
     data = catalog.fit_data()
     labels = np.zeros(2, dtype=int)
     report = {}
-    with RegionalModel(data, device, cpu_threads=1, fit_multiplicity="profile") as model, \
-            RegionalModel(data, device, cpu_threads=1) as marginal:
+    with RegionalModel(data, device, cpu_threads=1, fit_multiplicity="profile", max_multiplicity_difference=None) as model, \
+            RegionalModel(data, device, cpu_threads=1, max_multiplicity_difference=None) as marginal:
         assert model.identity != marginal.identity
         assert model.fit_backend is not model.selection_backend
         assert marginal.fit_backend is marginal.selection_backend
@@ -90,9 +90,9 @@ def run_checks(root, *, device="cpu"):
         loss, gradient, curvature = model.node_terms(x)
         h = 1e-5
         finite_difference = (model.loss(x+h)-model.loss(x-h))/(2*h)
-        np.testing.assert_allclose(gradient, finite_difference, atol=5e-8, rtol=1e-7)
+        np.testing.assert_allclose(gradient, finite_difference[:, None], atol=5e-8, rtol=1e-7)
         second_difference = (model.loss(x+h)-2*loss+model.loss(x-h))/(h*h)
-        np.testing.assert_allclose(curvature, second_difference, atol=1e-4, rtol=1e-5)
+        np.testing.assert_allclose(curvature, second_difference[:, None], atol=1e-4, rtol=1e-5)
         pilots, _ = model.pilots()
         np.testing.assert_array_equal(pilots, marginal.pilots()[0])
         tree = build_tree(pilots, model.observed, model.mutation_ids)
@@ -119,8 +119,8 @@ def run_checks(root, *, device="cpu"):
         report["native"] = model.execution_diagnostics()
 
     support = MultiplicityBounds(catalog.mutation_ids, catalog.region_ids, [[1], [1]], [[1], [1]], "singleton_test")
-    with RegionalModel(data, device, cpu_threads=1, multiplicity_support=support) as a, \
-            RegionalModel(data, device, cpu_threads=1, multiplicity_support=support, fit_multiplicity="profile") as b:
+    with RegionalModel(data, device, cpu_threads=1, multiplicity_support=support, max_multiplicity_difference=None) as a, \
+            RegionalModel(data, device, cpu_threads=1, multiplicity_support=support, fit_multiplicity="profile", max_multiplicity_difference=None) as b:
         np.testing.assert_allclose(a.refit(labels).centers, [[.6]], atol=1e-8)
         np.testing.assert_allclose(b.refit(labels).centers, [[.6]], atol=2e-12)
         np.testing.assert_array_equal(a.loss([[.6], [.6]]), b.loss([[.6], [.6]]))
@@ -134,7 +134,7 @@ def run_checks(root, *, device="cpu"):
         major = rng.integers(1, 4, size=(n, 1))
         cat = write_catalog(root/f"random{index}.tsv", y, 20, major, minor=0, purity=[.7],
                             segments=np.arange(n)[:, None].astype(str))
-        with RegionalModel(cat.fit_data(), device, cpu_threads=1, fit_multiplicity="profile") as model:
+        with RegionalModel(cat.fit_data(), device, cpu_threads=1, fit_multiplicity="profile", max_multiplicity_difference=None) as model:
             fit = model.refit(np.zeros(n, dtype=int))
             oracle = -np.inf
             for ms in itertools.product(*(range(1, int(m)+1) for m in major[:, 0])):
@@ -149,19 +149,20 @@ def run_checks(root, *, device="cpu"):
 
     for name, y, phi in (("zero", 0, 0.), ("all", 20, 1.), ("impossible", 1, 0.)):
         cat = write_catalog(root/f"{name}.tsv", [[y], [2]], 20, 2, minor=0, purity=[1.])
-        with RegionalModel(cat.fit_data(), device, cpu_threads=1, fit_multiplicity="profile") as model:
+        with RegionalModel(cat.fit_data(), device, cpu_threads=1, fit_multiplicity="profile", max_multiplicity_difference=None) as model:
             loss = model.loss([[phi], [.4]])
-            assert np.isposinf(loss[0, 0]) if name == "impossible" else np.isfinite(loss[0, 0])
+            assert np.isposinf(loss[0]) if name == "impossible" else np.isfinite(loss[0])
             if name != "impossible":
-                np.testing.assert_allclose(loss[0, 0], -binom.logpmf(y, 20, phi), atol=1e-12)
+                np.testing.assert_allclose(loss[0], -binom.logpmf(y, 20, phi), atol=1e-12)
     cat = write_catalog(root/"mask.tsv", [[4, 0], [2, 1]], 20, 2, minor=0,
                         observed=[[True, False], [True, True]], purity=[.5, .7])
-    with RegionalModel(cat.fit_data(), device, cpu_threads=1, fit_multiplicity="profile") as model:
-        assert model.loss(np.ones((2, 2))*.4)[0, 1] == 0
+    with RegionalModel(cat.fit_data(), device, cpu_threads=1, fit_multiplicity="profile", max_multiplicity_difference=None) as model:
+        np.testing.assert_allclose(model.loss(np.ones((2, 2))*.4)[0],
+            -model.fit_backend.regional_grid(0, np.array([0]), [.4])[0, 0])
     # Retained single-move paths keep marginal selection columns and reuse only
     # unchanged profile coordinates, even after fitting columns interleave.
     cat = write_catalog(root/"parent.tsv", [[3], [5], [7], [9], [11], [13]], 40, 3)
-    with RegionalModel(cat.fit_data(), device, cpu_threads=1, fit_multiplicity="profile") as model:
+    with RegionalModel(cat.fit_data(), device, cpu_threads=1, fit_multiplicity="profile", max_multiplicity_difference=None) as model:
         pilots, _ = model.pilots()
         tree = build_tree(pilots, model.observed, model.mutation_ids)
         bank = CandidateBank(model, tree)
@@ -182,7 +183,7 @@ def run_checks(root, *, device="cpu"):
     # derivative that could hide descent. Flat maxima choose the smallest CCF.
     from CliPP2.kernel.solver import _stationarity
     cat = write_catalog(root/"ties.tsv", [[0], [20]], 20, 2, minor=0)
-    with RegionalModel(cat.fit_data(), device, cpu_threads=1, fit_multiplicity="profile") as model:
+    with RegionalModel(cat.fit_data(), device, cpu_threads=1, fit_multiplicity="profile", max_multiplicity_difference=None) as model:
         x = np.array([[0.], [1.]])
         right, left = model.fit_backend.profile_slopes(x)
         np.testing.assert_array_equal(right, [[10.], [0.]])
@@ -190,15 +191,15 @@ def run_checks(root, *, device="cpu"):
         _, gradient, _ = model.node_terms(x)
         assert _stationarity(model, x, gradient, np.zeros_like(x), model.lower, model.upper) == 0
         np.testing.assert_array_equal(model.refit(np.array([0, 1])).centers, x)
-    assert WorkflowConfig(fit=FitConfig(fit_multiplicity="profile")).fit.fit_multiplicity == "profile"
-    rejects(lambda: FitConfig(fit_multiplicity="invalid"))
-    rejects(lambda: FitConfig(selection_criterion="profile_bic"))
+    assert WorkflowConfig(fit=FitConfig(fit_multiplicity="profile", max_multiplicity_difference=None)).fit.fit_multiplicity == "profile"
+    rejects(lambda: FitConfig(fit_multiplicity="invalid", max_multiplicity_difference=None))
+    rejects(lambda: FitConfig(selection_criterion="profile_bic", max_multiplicity_difference=None))
     assert fitting_identity("profile") != fitting_identity("marginal")
     from CliPP2.simulation.evaluation import aggregate
     rejects(lambda: aggregate([{"fitting_method_identity": fitting_identity("profile")},
                                 {"fitting_method_identity": fitting_identity("marginal")}]))
     from compare_profile_fitting import compare_data, compare_workflow
-    comparison_config = FitConfig(device=device, max_clusters=2, cpu_threads=1)
+    comparison_config = FitConfig(device=device, max_clusters=2, cpu_threads=1, max_multiplicity_difference=None)
     fixed = compare_data(data, root/"fixed_centers", comparison_config, scope="fixed-centers",
                          states=[dict(labels=[0, 0], centers=[[.4]]), dict(labels=[0, 0], centers=[[.45]])])
     assert len(fixed["comparisons"]) == 2
@@ -211,7 +212,7 @@ def run_checks(root, *, device="cpu"):
     # Stage 2 first, then end-to-end (Stage 1 may change the caps).
     workflow_input = root/"workflow.tsv"
     write_catalog(workflow_input, [[50, 50]]*3+[[20, 15]]*3, 100, 1, minor=1)
-    workflow_config = WorkflowConfig(fit=FitConfig(device=device, max_clusters=2, cpu_threads=1),
+    workflow_config = WorkflowConfig(fit=FitConfig(device=device, max_clusters=2, cpu_threads=1, max_multiplicity_difference=None),
                                      stage_two_max_clusters=2)
     workflows = compare_workflow(workflow_input, root/"workflows", workflow_config)
     assert all(w["status"] == "complete" for w in workflows["workflows"].values())

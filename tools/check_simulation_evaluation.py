@@ -73,19 +73,21 @@ def _current_fixture():
             source_informative_count=[[0, 1]]*4, source_informative_depth=[[0, 100]]*4,
             source_mean_profile_deviance=[[None, np.inf]]*4, source_maximum_profile_deviance=[[None, np.inf]]*4,
             diagnostic_availability=[['not_applicable', 'available']]*4),
-        targets=ids, non_targets=(), assignment=dict(schema='clipp2.assignment.result.v9', protocol_version='2.4',
-            assignment_method='marginal', assignments=records, multiplicities=[]))
+        targets=ids, non_targets=(), assignment=dict(schema='clipp2.assignment.result.v10', protocol_version='2.5',
+            assignment_method='marginal', max_multiplicity_difference=1, assignments=records, multiplicities=[]))
     from CliPP2.config import STAGE_THREE_REFERENCE_POLICY
-    result = dict(schema='clipp2.paired-experiment.v6', protocol_version='2.4', run_manifest_id='evaluation-fixture',
+    result = dict(schema='clipp2.paired-experiment.v7', protocol_version='2.5', run_manifest_id='evaluation-fixture',
         reference_policy=STAGE_THREE_REFERENCE_POLICY, stage_one=first, g0_ids=ids[:5], remainder_ids=ids[5:-1],
-        arms={'B': deepcopy(arm), 'C': arm}, config=dict(fit=dict(max_major_cn=None), stage_three_assignment_method='marginal'))
+        max_multiplicity_difference=1,
+        arms={'B': deepcopy(arm), 'C': arm}, config=dict(fit=dict(max_major_cn=None,
+            max_multiplicity_difference=1), stage_three_assignment_method='marginal'))
     return history, catalog, result
 
 
 def _all_target_checks():
     h, catalog, paired = _current_fixture()
     value = evaluate(h, catalog, paired, truth_qualification='verified_history_binding')
-    assert value['schema'] == 'clipp2.simulation.evaluation.v6'
+    assert value['schema'] == 'clipp2.simulation.evaluation.v7'
     assert value['evaluation_definition'] == evaluation_definition()
     metrics = {(r['name'], r['view']): r for r in value['metrics'] if r['arm'] == 'C3' and r['stratum'] == 'all'}
     assert metrics['data_supported_map_coverage', '']['denominator'] == 14
@@ -143,7 +145,7 @@ def _planned_population_checks():
                     ('evaluation_available', int(evaluated)), ('scientifically_applicable', int(not failure))):
                 metrics.append(dict(name=name, arm=arm, view='all_planned_cells', stratum='all', value=value,
                                     numerator=value, denominator=1, truth_required=False))
-        return dict(schema='clipp2.simulation.evaluation.v6', evaluation_definition=definition,
+        return dict(schema='clipp2.simulation.evaluation.v7', max_multiplicity_difference=1, evaluation_definition=definition,
             evaluation_definition_id=content_hash(definition), truth_qualification=truth,
             cell_id=job['cell_id'], family=job['family'], history_id=job['history_id'], acquisition_id=job['acquisition']['id'],
             original_evaluable_count=denominator, status='execution_failed' if failure else 'complete', metrics=metrics,
@@ -198,7 +200,7 @@ def _planned_population_checks():
     assert endpoint(partial_summary, arm='B3')['planned_population_estimate'] == 1
     assert endpoint(partial_summary, arm='C3')['planned_population_estimate'] == .5
     unavailable = summary([cell(job, None, evaluated=False, truth='missing_truth_evidence') for job in roster])
-    assert unavailable['schema'] == 'clipp2.simulation.aggregate.v3'
+    assert unavailable['schema'] == 'clipp2.simulation.aggregate.v4'
     assert endpoint(unavailable)['planned_population_estimate'] is None
     assert endpoint(unavailable, 'evaluation_available')['planned_population_estimate'] == 0
     incomplete = summary([success, failed], complete=False)
@@ -350,7 +352,8 @@ def run_checks():
     for family, histories in (('S01', [(0, [0., 0.]), (1, [1.])]), ('S02', [(0, [1.]), (1, [1.])])):
         for history, values in histories:
             for acquisition, value in enumerate(values):
-                cells.append(dict(schema='clipp2.simulation.evaluation.v6', truth_qualification='verified_history_binding',
+                cells.append(dict(schema='clipp2.simulation.evaluation.v7', max_multiplicity_difference=1,
+                    truth_qualification='verified_history_binding',
                     evaluation_definition=evaluation_definition(), evaluation_definition_id=content_hash(evaluation_definition()),
                     family=family, history_id=str(history), acquisition_id=str(acquisition),
                     metrics=[dict(name='score', arm='B', value=value), dict(name='score', arm='C', value=value+.1)]))
@@ -362,7 +365,7 @@ def run_checks():
     incomplete = aggregate(cells, bootstrap_replicates=0)
     assert all(row['planned_population_estimate'] is None for row in incomplete['metrics'])
     assert incomplete['roster_complete'] is False
-    assert summary['schema'] == 'clipp2.simulation.aggregate.v3'
+    assert summary['schema'] == 'clipp2.simulation.aggregate.v4'
     altered = deepcopy(cells[0])
     altered['evaluation_definition'] = evaluation_definition(dict(reference_match_atol=.1))
     altered['evaluation_definition_id'] = content_hash(altered['evaluation_definition'])

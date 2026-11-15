@@ -100,27 +100,45 @@ def _supported_split_edges(model, tree, cuts=()):
     return [edge for _, _, edge in sorted(ranked)]
 
 
-def _likelihood_ranked_edges(model, tree, edges, cuts=()):
-    """Coarse regional profile gains, with ID-free content ties, not final scores.
+def _joint_proposal_centers(model, existing=()):
+    """Bounded full-vector starts from fitted centers and joint pilot summaries."""
+    pilot, _ = model.pilots()
+    filled = np.where(np.isfinite(pilot), pilot, np.nanmedian(pilot, axis=0))
+    unique = np.unique(filled, axis=0)
+    selected = unique[np.linspace(0, len(unique)-1, min(24, len(unique)), dtype=int)]
+    summaries = np.quantile(filled, np.linspace(0., 1., 7), axis=0)
+    if len(existing):
+        existing = np.unique(np.asarray(existing, dtype=float), axis=0)
+        existing = existing[np.linspace(0, len(existing)-1, min(32, len(existing)), dtype=int)]
+        selected = np.vstack((selected, existing))
+    return np.unique(np.clip(np.vstack((selected, summaries)), 0., 1.), axis=0)
+
+
+def _likelihood_ranked_edges(model, tree, edges, cuts=(), *, candidate_centers=()):
+    """Coarse likelihood gains, with ID-free content ties, not final scores.
 
     Stream fixed-grid columns through postorder sums and impossible counts:
     O(N R G) work and O(N) storage for fixed G, without per-edge member gathers.
-    The historical near-zero grid point is retained for stable proposal ties.
-    Resolution can still miss modes; no likelihood bound is claimed.
+    Joint mode scores bounded full center vectors. Independent mode retains its
+    regional grids exactly. Resolution can miss modes; no bound is claimed.
     """
     parent, parent_edge, component, order, _ = _forest_structure(tree, cuts)
     children = {int(parent_edge[node]): node for node in order if parent[node] != node}
     nodes = np.asarray([children[edge] for edge in edges], dtype=int)
+    joint = getattr(model, "max_multiplicity_difference", None) is not None
+    method = "joint_center_vector_gain_v1" if joint else "regional_grid_profile_gain_v1"
     if not len(nodes):
-        return [], {"method": "regional_grid_profile_gain_v1", "ranked_edges": 0}
-    grid = np.unique(np.r_[np.linspace(0., 1., 33), 1e-6])
+        return [], {"method": method, "ranked_edges": 0}
+    grid = (_joint_proposal_centers(model, candidate_centers) if joint else
+            np.unique(np.r_[np.linspace(0., 1., 33), 1e-6]))
     width = 8
     gains = np.zeros(len(nodes))
     roots = component[nodes]
-    for region in range(model.r):
+    for region in ((None,) if joint else range(model.r)):
         left, right, whole = [np.full(len(nodes), -np.inf) for _ in range(3)]
         for first in range(0, len(grid), width):
-            values = model.regional_profile_columns(region, grid[first:first+width])
+            values = (model.fit_column_set(grid[first:first+width]).materialize() if joint else
+                      model.regional_profile_columns(region, grid[first:first+width]))
             if np.isnan(values).any() or np.isposinf(values).any():
                 raise ValueError("Proposal profiles must be finite or negative infinity")
             invalid = np.isneginf(values).astype(np.int64)
@@ -156,7 +174,7 @@ def _likelihood_ranked_edges(model, tree, edges, cuts=()):
         return (rank is not None, 0 if rank is None else -rank, content, edges[index])
     ordered = sorted(range(len(edges)), key=key)
     return [edges[i] for i in ordered], {
-        "method": "regional_grid_profile_gain_v1", "ranked_edges": len(edges),
+        "method": method, "ranked_edges": len(edges),
         "grid_points": len(grid), "grid_column_block": width,
         "proxy_rank_quantum": quantum, "proxy_tied_edges": len(ranks)-len(set(ranks)),
         "unresolved_profiles": sum(rank is None for rank in ranks),
@@ -179,7 +197,8 @@ def _add_supported_proposals(model, tree, bank, capacities, seeds, work):
     edges = _supported_split_edges(model, tree) if requested is not None else []
     rank_diagnostic = {"method": "all_supported_splits_within_budget"}
     if len(edges) > POLICY.split_slots:
-        edges, rank_diagnostic = _likelihood_ranked_edges(model, tree, edges)
+        centers = [center for candidate in bank.candidates for center in candidate.fit.centers]
+        edges, rank_diagnostic = _likelihood_ranked_edges(model, tree, edges, candidate_centers=centers)
     chosen = sorted(edges) if len(edges) <= POLICY.split_slots else edges[:POLICY.split_slots]
     work.spend("split", len(chosen))
     attempted = set(getattr(bank, "by_cuts", {})) | set(bank.ineligible)
@@ -529,6 +548,8 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
         "candidate_numeric_payload_bytes": label_bytes + sum(candidate.fit.centers.nbytes
             + candidate.fit.weights.nbytes
             + (0 if candidate.fit.coordinate_fits is None else candidate.fit.coordinate_fits.nbytes)
+            + (0 if candidate.fit.group_fits is None else
+               sum(group.center.nbytes + 32 for group in candidate.fit.group_fits))
             + (8 * len(candidate.cuts) if candidate.membership_kind == "tree" else 0)
             for candidate in bank.candidates),
         "candidate_membership_storage": "tree_cuts_or_shared_parent_single_edits_or_explicit_labels",

@@ -226,12 +226,17 @@ def normalize_evaluation_config(config=None):
 
 
 def evaluation_definition(config=None, *, reference_policy=STAGE_THREE_REFERENCE_POLICY,
-                          assignment_method="marginal"):
+                          assignment_method="marginal", max_multiplicity_difference=1):
+    from CliPP2.config import validate_max_multiplicity_difference
+    validate_max_multiplicity_difference(max_multiplicity_difference)
     config = normalize_evaluation_config(config)
     method = validate_assignment_method(assignment_method)
     if reference_policy != STAGE_THREE_REFERENCE_POLICY:
         raise ValueError("Unknown Stage 3 reference policy")
-    return dict(schema="clipp2.simulation.evaluation-definition.v6", config=config,
+    return dict(schema="clipp2.simulation.evaluation-definition.v7", config=config,
+        max_multiplicity_difference=max_multiplicity_difference,
+        multiplicity_call_semantics="joint_MAP_vector_with_zero_CCF_public_calls_missing",
+        residual_semantics="joint_MAP_coordinate_with_regional_profile_reported_separately",
         assignment_method=method, tie_policy=ASSIGNMENT_POLICIES[method],
         posterior_semantics="marginal_cluster_posterior" if method == "marginal" else "undefined_for_profile",
         binary_endpoint="data_supported_MAP_designated_clonality_equals_physical_truth_clonality",
@@ -245,7 +250,7 @@ def evaluation_definition(config=None, *, reference_policy=STAGE_THREE_REFERENCE
         population_denominators="original_evaluable_for_MAP_errors_all_original_members_for_evidence_status",
         reassessment_population="all_combined_fitted_mutations_F_empty",
         reference_policy=reference_policy,
-        cap_policy="minimum_native_map_set_upper", population_policy="unrestricted_valid_cn_unless_explicit_cutoff",
+        cap_policy="minimum_projected_joint_map_set_upper", population_policy="unrestricted_valid_cn_unless_explicit_cutoff",
         target_origins=["stage1_reference_recheck", "stage2_recheck"],
         population_scopes={"planned_population": sorted(PLANNED_METRIC_NAMES),
                            "other_metrics": "conditional_available_cases"},
@@ -261,13 +266,18 @@ def evaluation_definition(config=None, *, reference_policy=STAGE_THREE_REFERENCE
 
 def record_evaluation_definition(record):
     """Validate a current evaluation record's scientific definition."""
-    if record.get("schema") != "clipp2.simulation.evaluation.v6":
-        raise ValueError("Aggregation requires evaluation.v6 records")
+    if record.get("schema") != "clipp2.simulation.evaluation.v7":
+        raise ValueError("Aggregation requires evaluation.v7 records")
     definition = record.get("evaluation_definition")
     if not isinstance(definition, dict) or record.get("evaluation_definition_id") != content_hash(definition):
         raise ValueError("Evaluation definition identity is missing or invalid")
-    if definition.get("schema") != "clipp2.simulation.evaluation-definition.v6":
+    if (definition.get("schema") != "clipp2.simulation.evaluation-definition.v7"
+            or "max_multiplicity_difference" not in definition):
         raise ValueError("Evaluation schema and definition version differ")
+    from CliPP2.config import validate_max_multiplicity_difference
+    validate_max_multiplicity_difference(definition["max_multiplicity_difference"])
+    if record.get("max_multiplicity_difference", "missing") != definition["max_multiplicity_difference"]:
+        raise ValueError("Evaluation must explicitly bind its multiplicity-difference policy")
     return definition
 
 
@@ -641,13 +651,14 @@ def evaluate(
             raise ValueError("Conflicting reference match tolerances")
         config_input["reference_match_atol"] = reference_match_atol
     evaluation_config = normalize_evaluation_config(config_input)
-    if result.get("schema") != "clipp2.paired-experiment.v6" or result.get("protocol_version") != "2.4":
-        raise ValueError("Evaluation requires a current Protocol 2.4 paired experiment")
+    if result.get("schema") != "clipp2.paired-experiment.v7" or result.get("protocol_version") != "2.5":
+        raise ValueError("Evaluation requires a current Protocol 2.5 paired experiment")
     assignment_method = validate_assignment_method(result["config"]["stage_three_assignment_method"])
     source_origin, second_origin = ("stage1_reference_recheck", "stage2_recheck")
     reference_policy = result.get("reference_policy", STAGE_THREE_REFERENCE_POLICY)
     definition = evaluation_definition(
-        evaluation_config, reference_policy=reference_policy, assignment_method=assignment_method
+        evaluation_config, reference_policy=reference_policy, assignment_method=assignment_method,
+        max_multiplicity_difference=result["config"]["fit"]["max_multiplicity_difference"]
     )
     reference_match_atol = evaluation_config["reference_match_atol"]
     reference_distance = evaluation_config["reference_distance"]
@@ -666,19 +677,22 @@ def evaluate(
 
     fit_settings = result.get("config", {}).get("fit", {})
     method_identity = fitting_identity(
-        fit_settings.get("fit_multiplicity", "marginal"), fit_settings.get("selection_criterion", SELECTION_CRITERION)
+        fit_settings.get("fit_multiplicity", "marginal"), fit_settings.get("selection_criterion", SELECTION_CRITERION),
+        fit_settings["max_multiplicity_difference"]
     )
     if "fitting_method_identity" in result and result["fitting_method_identity"] != method_identity:
         raise ValueError("Experiment fitting identity differs from its configuration")
     for accepted in [result.get("stage_one"), *(arm.get("stage_two") for arm in result.get("arms", {}).values())]:
         if (
             accepted
-            and accepted.get("schema") == "clipp2.accepted-fit.v4"
+            and accepted.get("schema") == "clipp2.accepted-fit.v5"
             and (accepted.get("method_identity") != method_identity)
         ):
             raise ValueError("Evaluated accepted fit uses a different fitting objective")
-    if "fitting_method_identity" in result or "fit_multiplicity" in fit_settings:
-        identity["fitting_method_identity"] = method_identity
+    identity["fitting_method_identity"] = method_identity
+    identity["max_multiplicity_difference"] = fit_settings["max_multiplicity_difference"]
+    if result.get("max_multiplicity_difference", "missing") != fit_settings["max_multiplicity_difference"]:
+        raise ValueError("Experiment must explicitly bind its multiplicity-difference policy")
     identity.update(
         assignment_method=assignment_method,
         tie_policy=ASSIGNMENT_POLICIES[assignment_method],
@@ -1592,7 +1606,7 @@ def evaluate(
     )
     return json_safe(
         dict(
-            schema="clipp2.simulation.evaluation.v6",
+            schema="clipp2.simulation.evaluation.v7",
             **identity,
             truth_qualification=truth_qualification,
             evaluation_config=evaluation_config,
@@ -1981,10 +1995,12 @@ def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expect
         raise ValueError("Aggregation requires distinct families and nonnegative bootstrap replicates")
     definitions = {}
     from CliPP2.config import fitting_identity
-    methods = [record.get("fitting_method_identity", fitting_identity()) for record in evaluations]
+    methods = [record.get("fitting_method_identity", fitting_identity(max_multiplicity_difference=
+                record_evaluation_definition(record)["max_multiplicity_difference"])) for record in evaluations]
     if expected_fitting_identity is not None:
         methods.append(expected_fitting_identity)
-    allowed = (fitting_identity(), fitting_identity("profile"))
+    allowed = tuple(fitting_identity(method, max_multiplicity_difference=difference)
+                    for method in ("marginal", "profile") for difference in (None, 1))
     if any(method not in allowed for method in methods):
         raise ValueError("Unknown fitting/selection identity in evaluation records")
     if len({content_hash(method) for method in methods}) > 1:
@@ -2161,7 +2177,7 @@ def aggregate(evaluations, *, planned_roster=None, roster_complete=False, expect
             availability.append(dict(coordinate, arm=arm, **statuses,
                 truth_qualification=record.get("truth_qualification", "missing_truth_evidence"),
                 record_status=record.get("status", "missing_evaluation_record"), planned_weight=weights[cell_id]))
-    return json_safe(dict(schema="clipp2.simulation.aggregate.v3", evaluation_definition=definition,
+    return json_safe(dict(schema="clipp2.simulation.aggregate.v4", evaluation_definition=definition,
         evaluation_definition_id=definition_id, weighting="frozen_roster_equal_family_then_equal_history_then_equal_acquisition",
         available_case_weighting="available_families_then_available_histories_then_available_acquisitions",
         uncertainty="paired_history_bootstrap_all_acquisitions_together_separate_planned_and_available_case",

@@ -118,7 +118,7 @@ def _initialization_grid(view):
     }
 
 
-def pooled_ccf_initialization(view):
+def pooled_ccf_initialization(view, *, return_pool=False):
     """Use the source-scoped grid/convergence policy on shared CCF emissions.
 
     Standard single-state normal-CN-two observations retain the bounded narrow-
@@ -128,10 +128,11 @@ def pooled_ccf_initialization(view):
     """
     if not view.array("observed").all():
         raise ValueError("Pilot views must contain informative observations only")
-    return _pooled_standard(view) if view.standard else _pooled_adapter(view)
+    return (_pooled_standard(view, return_pool=return_pool) if view.standard
+            else _pooled_adapter(view, return_pool=return_pool))
 
 
-def _pooled_standard(view):
+def _pooled_standard(view, *, return_pool=False):
     """Return posterior-mean CCFs and finite-grid optimization diagnostics.
 
     The base grid, resolution rule and optimization budget are data-independent.
@@ -356,7 +357,7 @@ def _pooled_standard(view):
                        "grid_cell_evaluations": grid_cell_evaluations,
                        **execution.diagnostics()},
     }
-    return pilot, diagnostics
+    return (pilot, diagnostics, grid.copy(), weights.copy()) if return_pool else (pilot, diagnostics)
 
 
 class _GridOracle:
@@ -429,7 +430,7 @@ class _GridOracle:
             values[first:stop] = block
         return values
 
-def _pooled_adapter(view):
+def _pooled_adapter(view, *, return_pool=False):
     """Stream the explicit general-normal grid; exact concave weight gap.
 
     Safeguarded SQUAREM and exact grow/shrink exchange mirror the inherited
@@ -546,7 +547,7 @@ def _pooled_adapter(view):
     gap = max(0., float(score.max()-1))
     if gap > ADAPTER_GRID_TOLERANCE:
         raise RuntimeError("Streamed pooled-grid final duality gap changed")
-    return pilot, {
+    diagnostics = {
         "method": "general_normal_v1_streamed_pooled_ccf_grid_v2",
         "inherited_single_state_initialization": False,
         "grid_size": len(grid), "iterations": iteration,
@@ -565,3 +566,4 @@ def _pooled_adapter(view):
                        "grid_cell_evaluations": oracle.grid_cell_evaluations,
                        **oracle.execution.diagnostics()},
     }
+    return (pilot, diagnostics, grid.copy(), weights.copy()) if return_pool else (pilot, diagnostics)

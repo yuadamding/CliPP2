@@ -20,8 +20,8 @@ namespace clipp2 {
 constexpr double maximum_finite = std::numeric_limits<double>::max();
 constexpr double positive_infinity = std::numeric_limits<double>::infinity();
 constexpr double quiet_nan = std::numeric_limits<double>::quiet_NaN();
-constexpr int backend_abi = 8;
-constexpr const char* numerical_policy = "compact_fp64_marginal_profile_emission_v4";
+constexpr int backend_abi = 9;
+constexpr const char* numerical_policy = "compact_fp64_joint_range_one_v1";
 constexpr double curvature_floor = 1e-8;
 constexpr std::uint8_t observed_flag = 1;
 // Retained solely by the deferred CUDA cache layout. Input validation rejects

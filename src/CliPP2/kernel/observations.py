@@ -11,6 +11,7 @@ import hashlib
 import numpy as np
 from scipy.special import gammaln
 
+from ..config import validate_max_multiplicity_difference
 from ..io.data import (ImmutableArrayRecord, OriginalCatalog, MultiplicityBounds, TumorData,
                        freeze_record, readonly_array)
 
@@ -22,12 +23,14 @@ def observed_mask(data):
     return data.count_observed & ~data.input_excluded & (data.total_counts > 0)
 
 
-def prepare_observations(data, multiplicity_support=None, *, rows=None, regions=None):
+def prepare_observations(data, multiplicity_support=None, *, rows=None, regions=None,
+                         max_multiplicity_difference=1):
     """One production preparation of biological arrays, domains and emissions.
 
     Callers choose the population: fitting excludes uninformative rows and requires
     regional coverage; prediction preserves requested rows, including empty inputs.
     """
+    validate_max_multiplicity_difference(max_multiplicity_difference)
     rows = np.arange(len(data.mutation_ids)) if rows is None else rows
     regions = np.arange(len(data.region_ids)) if regions is None else regions
     ix = np.ix_(rows, regions)
@@ -50,6 +53,10 @@ def prepare_observations(data, multiplicity_support=None, *, rows=None, regions=
         minimum, maximum = (values[ix] for values in multiplicity_support.for_data(data))
     changed = (minimum != 1) | (maximum != default_maximum)
     minimum, maximum = minimum.astype(np.int64), maximum.astype(np.int64)
+    if max_multiplicity_difference == 1:
+        for i, mask in enumerate(observed):
+            if mask.any() and int(minimum[i, mask].max()) > int(maximum[i, mask].min()) + 1:
+                raise ValueError(f"Empty joint multiplicity support for mutation {data.mutation_ids[rows[i]]!r}")
     support = maximum-minimum+1
     lower, upper = np.zeros_like(major), np.ones_like(major)
     arrays.update(alt=alt, depth=depth, observed=observed, multiplicity_min=minimum,
@@ -81,6 +88,7 @@ class PreparedObservations(ImmutableArrayRecord):
     support: np.ndarray
     identity: str
     bounds: MultiplicityBounds
+    max_multiplicity_difference: int | None = 1
 
     def __post_init__(self):
         for item in fields(self):
@@ -102,7 +110,8 @@ class PreparedObservations(ImmutableArrayRecord):
 
 
 def prepare_prediction(catalog: OriginalCatalog, targets, bounds: MultiplicityBounds | None = None,
-                       *, device="cpu", cpu_threads=None, normal_cn_policy=None) -> PreparedObservations:
+                       *, device="cpu", cpu_threads=None, normal_cn_policy=None,
+                       max_multiplicity_difference=1) -> PreparedObservations:
     """Prepare every target in requested order, including excluded/missing rows.
 
     ``cpu_threads`` is accepted for a uniform caller interface; execution owners
@@ -119,15 +128,18 @@ def prepare_prediction(catalog: OriginalCatalog, targets, bounds: MultiplicityBo
     if not isinstance(bounds, MultiplicityBounds):
         raise TypeError("Prediction bounds must be MultiplicityBounds")
     selected_bounds = bounds.subset(data.mutation_ids, data.region_ids)
-    numerical = prepare_observations(data, selected_bounds)
+    numerical = prepare_observations(data, selected_bounds,
+                                     max_multiplicity_difference=max_multiplicity_difference)
     row_lookup = {value: index for index, value in enumerate(catalog.mutation_ids)}
     rows = np.asarray([row_lookup[value] for value in data.mutation_ids], dtype=int)
     eligible = catalog.eligible[rows]
-    digest = hashlib.sha256(b"clipp2.prediction-observations.v1\0")
+    digest = hashlib.sha256(b"clipp2.prediction-observations.v2\0")
+    digest.update(repr(max_multiplicity_difference).encode())
     digest.update(catalog.content_hash.encode())
     digest.update(selected_bounds.content_hash.encode())
     return PreparedObservations(data, data.mutation_ids, data.region_ids, device,
         eligible=eligible, identity=digest.hexdigest(), bounds=selected_bounds,
+        max_multiplicity_difference=max_multiplicity_difference,
         **{name: value for name, value in numerical.items()
            if name not in ("multiplicity_max", "multiplicity_restricted")})
 

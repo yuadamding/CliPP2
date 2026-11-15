@@ -1,10 +1,17 @@
 # Simulation evaluation definitions
 
-Implementation 2.0.0 uses scientific Protocol 2.4 and evaluation/definition v6.
+Implementation 2.1.0 uses scientific Protocol 2.5 and evaluation/definition v7.
 The evaluator consumes retained final labels; it does not fit, reassign, apply
 confidence or residual cutoffs, or select a development threshold. New contracts
 declare `evaluation.record_schema` explicitly. Package version is not a substitute
 for that scientific identity.
+
+Every new paired result and evaluation explicitly records
+`max_multiplicity_difference`: `1` for the joint range constraint or `null` for
+independent regional support. The evaluation definition binds the same setting;
+aggregation rejects missing, inconsistent or mixed policies. The default joint
+model uses posterior CCF pilots before tree construction and joint emissions in
+both native stages and Stage 3. See [Protocol 2.5](workflow_protocol_2_5.md).
 
 ## Method-bound MAP endpoints
 
@@ -14,7 +21,11 @@ profile ties retain the baseline if it is a maximizer, otherwise the lowest labe
 Both retain the complete exact maximizing set. Diagnostics do not veto this
 result. Profile scores are not cluster posteriors: probability fields are null,
 `posterior_defined=False`, and posterior Brier/log-loss/calibration are unavailable.
-Conditional multiplicity probabilities remain valid at the selected center.
+Conditional multiplicity probabilities remain valid at the selected center and
+condition on all informative regions. Zero-CCF public calls are NA while their
+latent multiplicities remain in the fixed joint support. Regional profile
+deviance, joint selected-call deviance and coupling profile loss have distinct
+meanings and are retained separately.
 An eligible target with no informative reads is `prior_only`: equal scores and a
 deterministic representative are available, but no data-supported final label. `model_incompatible`, `excluded`, and computational failure are
 separate states, with no fabricated final label.
@@ -54,7 +65,8 @@ cutoff. No selective-error threshold curves are constructed.
 
 The provisional Stage 1 source can be subclonal. Evaluation retains its native
 centers, source purity, the learned reference geometry, cap exclusion and
-whole-original performance. Upper endpoints of available native MAP sets can lower the cap;
+whole-original performance. Upper endpoints of projected joint MAP sets at
+positive CCF can lower the cap;
 truth replacement audits use the exact contributing IDs without requalification.
 
 ## Planned populations and missing evidence
@@ -194,8 +206,8 @@ selected attempts and paired results, including archived results. It performs no
 fitting, reassignment, truth generation or read generation. A report never changes
 saved inference decisions or overwrites the source study.
 
-Only current artifacts are supported: paired experiment v6, original catalog v6,
-assignment bundle v6, assignment result v9 and evaluation/definition v6. Input
+Only current artifacts are supported: paired experiment v7, original catalog v6,
+assignment bundle v7, assignment result v10 and evaluation/definition v7. Input
 catalogs must agree with their manifests, source observations, masks, CN,
 metadata and imputation ledgers. Missing or conflicting evidence is reported as
 unavailable. Directory and archived copies must agree when both remain, and

@@ -7,11 +7,13 @@ state per mutation–region observation** in the likelihood. Supplied CN-state
 fractions additionally determine the read-based multiplicity lower bounds in
 Stages 1 and 2; they do not introduce a mixed-state likelihood.
 
-Protocol **2.4** chooses a provisional Stage 1 source, then fits the remainder
+Protocol **2.5** chooses a provisional Stage 1 source, then fits the remainder
 with caps from the minimum upper endpoint of native multiplicity MAP sets.
-Both fitting stages restrict candidates below by the floor-based estimate
-described below. A conflicting Stage 2 cap is raised to that mutation's lower
-bound, making the lower bound its sole candidate.
+By default, each mutation's multiplicities differ by at most one across its
+informative regions. This joint support is established before pilot CCFs and
+tree construction and is used throughout fitting, model selection and assignment.
+Read floors and Stage 2 caps are reconciled under this rule while preserving
+original major-CN ceilings. Requested and effective bounds are recorded separately.
 Stage 3 restores original support and reassesses every fitted mutation against
 one fixed all-one clonal reference and every Stage 2 center. The selected Stage 1
 source maps to that clonal reference; its native estimate remains provenance,
@@ -20,8 +22,8 @@ Confidence, ties, coverage, residuals and distance do not veto defined estimates
 
 Cluster limits default to **10 for Stage 1 and 20 for Stage 2**. Valid integer CN
 has no automatic eligibility ceiling. Explicit input exclusions, model-domain
-checks and numerical verification remain. Package **2.0.0** and scientific
-protocol **2.4** have separate identities; versioned contracts distinguish the
+checks and numerical verification remain. Package **2.1.0** and scientific
+protocol **2.5** have separate identities; versioned contracts distinguish the
 current single-clonal-reference policy from earlier reference inventories.
 
 ## Install and run
@@ -30,7 +32,7 @@ Fitting requires Python 3.10+ and a C++17 compiler. CPU is the default backend:
 
 ```sh
 python -m pip install .
-clipp2 workflow --plan examples/workflow_protocol24.plan.json --output-dir results/workflow24
+clipp2 workflow --plan examples/workflow_protocol25.plan.json --output-dir results/workflow25
 ```
 
 The example plan declares one workflow configuration without acceptance thresholds.
@@ -51,8 +53,8 @@ and no data-supported final label; all-impossible candidates instead yield
 | Biological study | `clipp2-simulate run --cohort-settings SETTINGS.json --outdir OUTPUT` |
 
 Stage 3 defaults to **marginal** likelihood. Set
-`workflow_config.stage_three_assignment_method` to `"profile"` to maximize each
-region’s binomial likelihood over original multiplicities. For a frozen request,
+`workflow_config.stage_three_assignment_method` to `"profile"` to maximize the
+joint binomial likelihood over admissible multiplicity vectors. For a frozen request,
 use `clipp2 assign --assignment-method profile`. A method change creates a new request identity and saves the
 executed bundle with its outputs. Profile ties retain the baseline when it is a
 maximizer; otherwise the lowest label wins. Profile scores are not cluster
@@ -74,6 +76,14 @@ Stage 1–2 center fitting defaults to **marginal** likelihood. Opt into
 to maximize integer-multiplicity likelihood while retaining marginal-mixture
 BIC selection at the frozen fitted centers. This is independent of Stage 3's
 assignment method. See the [numerical contract and comparisons](docs/profile_fitting_marginal_selection.md).
+
+`FitConfig.max_multiplicity_difference` defaults to `1`; use `None` in Python, `null` in JSON,
+or `--max-multiplicity-difference none` for the independent regional model.
+Only `1` and `None` are implemented. A region participates according to its
+resolved positive-depth observation mask, including imputed observations, even
+when its fitted CCF is zero. The corresponding public multiplicity is then NA
+and it cannot donate a Stage 2 cap. This fixed latent support is stronger than
+a restriction limited to mutation-bearing regions.
 
 ## Inputs and outputs
 
@@ -101,7 +111,7 @@ and major-CN clamp, independently of the states in that list. See the
 [regional input example](examples/README.md) for the schema and validation.
 
 For ALT reads `a`, total depth `d`, supplied purity `p`, and original input major
-CN `M`, the Stage 1–2 lower bound is
+CN `M`, the requested Stage 1–2 lower bound is
 
 ```text
 Cbar = sum(cn_state_fraction * (major_cn + minor_cn))
@@ -112,9 +122,13 @@ With one supplied state, `Cbar` is its major plus minor CN. The estimator uses
 normal-cell total CN **2**, rounds down, and has no fixed cap of 4. Zero ALT,
 missing reads, and zero depth receive lower bound 1. It does not divide by
 mutation CCF, so it can underestimate multiplicity for subclonal mutations.
-`multiplicity_lower_bounds.tsv` records the inputs and estimates; segment-cap
-audits count cases where the lower bound overrides a cap. Stage 3 restores
-`1..M`, including candidates below the read-based estimate.
+`multiplicity_lower_bounds.tsv` records these raw estimates. Over each mutation's
+informative regions, let `B=min(M)`. Joint mode retains `L*=min(lower,B+1)`,
+sets `q=max(1,max(L*)-1)`, and uses `U*=max(raw_cap,L*,q)`; Stage 1's raw cap is
+`M`. This prioritizes original CN ceilings, the joint range rule, read floors,
+then donor caps. Independent mode retains the original floor/cap rule.
+Explicit support TSVs are hard constraints and incompatible joint supports fail
+validation. Stage 3 restores `1..M` together with the same joint range rule.
 
 CN and normal-CN provenance must be explicit. Regional files may supply
 `normal_cn` in their CNA table; an omitted normal CN requires an explicit
@@ -148,7 +162,7 @@ The exact supplied cohort requires **Python 3.11+ and NumPy 2.3.5**:
 ```sh
 python -m pip install '.[simulation]'
 clipp2-simulate run --cohort-settings CliPP2_phylogeny_cohort_settings.json.gz --workers 10 --outdir results/cohort
-python tools/check_research.py --groups workflow biology evaluation study publication
+python tools/check_research.py --groups joint workflow biology evaluation study publication
 ```
 
 The full design has 60 cases, 720 physical histories, and 2,640 datasets.
@@ -158,7 +172,8 @@ development is descriptive and poor finite performance does not block the main
 study. Numerical verification remains mandatory. The deterministic checks above
 are separate from biological performance assessment and full-cohort execution.
 
-- [Workflow Protocol 2.4](docs/workflow_protocol_2_4.md)
+- [Workflow Protocol 2.5](docs/workflow_protocol_2_5.md)
+- [Joint multiplicity qualification](docs/joint_multiplicity_qualification.md)
 - [Simulation design and execution](docs/simulation.md)
 - [Evaluation definitions](docs/simulation_evaluation.md)
 

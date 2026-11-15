@@ -19,7 +19,7 @@ const char* CliPP2BackendLastError();
 int CliPP2BackendCreate(const clipp2::ObservationSoA*, int device_index, void** context);
 void CliPP2BackendDestroy(void* context);
 int CliPP2BackendGetDiagnostics(void* context, CliPP2BackendDiagnostics* output);
-// phi and node results: [batch, region, mutation]. Status is one byte per cell.
+// phi/derivatives: [batch, region, mutation]; loss/status: [batch, mutation].
 int CliPP2EvaluateNodes(void*, std::int64_t batches, const double* phi, int mode,
                        double* loss, double* gradient, double* curvature,
                        std::uint8_t* status);
@@ -34,6 +34,17 @@ int CliPP2MultiplicityMAP(void*, const double* phi, double* multiplicity, std::u
 int CliPP2ComponentDiagnostics(void*, const double* phi, const double* accepted_calls,
                               clipp2::ComponentDiagnostics* output);
 int CliPP2ProfileSlopes(void*, const double* phi, double* right, double* left);
+int CliPP2JointDiagnostics(void*, const double* phi, const double* accepted,
+    const std::int64_t* offsets, double* row_values, double* maps, double* component_at_map,
+    double* accepted_logp, double* map_logp, double* conditional_max, double* probabilities,
+    std::uint8_t* status);
+int CliPP2PooledJointPilots(void*, const std::int64_t* grid_offsets, const double* grids,
+    const double* weights, double* pilots, std::uint8_t* status);
+int CliPP2RefitGroupsBatch(void*, std::int64_t groups, const std::int64_t* offsets,
+    const std::int64_t* members, const double* initial, const double* lower, const double* upper,
+    double* centers, double* log_likelihood, std::int32_t* status, std::int64_t* iterations,
+    double* projected_gradient, std::uint8_t* retained_initial);
+
 // Results [grid, row], read emissions only (no assignment bounds).
 int CliPP2EvaluateRegionalGrid(void*, std::int64_t region, std::int64_t row_count,
                               const std::int64_t* rows, std::int64_t grid_count,

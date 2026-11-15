@@ -2,6 +2,8 @@
 // stay resident; the C ABI makes the requested host-result boundary explicit.
 #include "../common/backend.h"
 #include "../common/emission_math.h"
+#include "../common/joint_multiplicity.h"
+#include "../common/joint_refit.h"
 #include "../common/scalar_search.h"
 #include "../common/profile_refit.h"
 #include "../common/validation.h"
@@ -75,6 +77,9 @@ void destroy_probability_cache(Context&) noexcept;
 
 struct Context {
     ObservationSoA data{};
+    std::vector<i64> host_support;
+    const i64 *joint_offsets=nullptr,*joint_rows=nullptr;
+    i64 joint_scratch_count=0;
     int device = 0;
     cudaStream_t stream = nullptr;
     unsigned char *prepared = nullptr, *workspace = nullptr;
@@ -211,12 +216,20 @@ template<EmitMode Mode> __device__ void store_terms(
 }
 template<EmitMode Mode> __global__ void node_kernel(
         ObservationSoA data, i64 count, const double* phi, double* loss,
-        double* gradient, double* curvature, std::uint8_t* status) {
-    const i64 cells = data.mutations * data.regions;
-    for (i64 index = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
-         index < count; index += static_cast<i64>(blockDim.x) * gridDim.x)
-        store_terms<Mode>(evaluate_observation<Mode>(observation(data, index % cells), phi[index]),
-                          index, loss, gradient, curvature, status);
+        double* gradient, double* curvature, std::uint8_t* status,const i64* offsets,const i64* work_rows,
+        double* scratch) {
+    const i64 n=data.mutations,cells=n*data.regions,rows=count/data.regions;
+    for(i64 index=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;index<rows;
+        index+=static_cast<i64>(blockDim.x)*gridDim.x) {
+        const i64 row=index%n,batch=index/n;
+        JointMass mass{data,row,phi+batch*cells+row,n};
+        const auto local_offsets=offsets+row*(data.regions+1);
+        double* cavity=Mode==EmitMode::LossOnly?nullptr:scratch+batch*work_rows[n]+work_rows[row];
+        status[index]=static_cast<std::uint8_t>(joint_terms(mass,loss[index],
+            Mode==EmitMode::LossOnly?nullptr:gradient+batch*cells+row,
+            Mode==EmitMode::LossOnly?nullptr:curvature+batch*cells+row,n,nullptr,nullptr,
+            local_offsets,cavity,Mode==EmitMode::LossOnly?nullptr:cavity+local_offsets[data.regions]));
+    }
 }
 template<EmitMode Mode> __global__ void cell_kernel(
         ObservationSoA data, i64 count, const i64* cells, const double* phi,
@@ -227,20 +240,21 @@ template<EmitMode Mode> __global__ void cell_kernel(
                           index, loss, gradient, curvature, status);
 }
 __global__ void profile_slopes_kernel(ObservationSoA data,const double* phi,double* right,double* left) {
-    const auto count=data.mutations*data.regions;
-    for(i64 i=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;i<count;
-            i+=static_cast<i64>(blockDim.x)*gridDim.x) {
-        const auto slopes=profile_slopes(observation(data,i),phi[i]);
-        right[i]=slopes.right; left[i]=slopes.left;
+    const auto n=data.mutations;
+    for(i64 row=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;row<n;
+        row+=static_cast<i64>(blockDim.x)*gridDim.x) {
+        JointMass mass{data,row,phi+row,n};double loss;
+        joint_terms(mass,loss,right+row,left+row,n,right+row,left+row);
     }
 }
-__global__ void multiplicity_kernel(ObservationSoA data, i64 first, i64 count, const double* phi,
-                                   double* output, std::uint8_t* status) {
-    for (i64 index = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
-         index < count; index += static_cast<i64>(blockDim.x) * gridDim.x) {
-        EmitStatus state;
-        output[index] = multiplicity_map(observation(data, first + index), phi[index], state);
-        status[index] = static_cast<std::uint8_t>(state);
+__global__ void multiplicity_kernel(ObservationSoA data,i64 first,i64 count,const double* phi,
+        double* output,std::uint8_t* status) {
+    const auto n=data.mutations;
+    for(i64 row=static_cast<i64>(blockIdx.x)*blockDim.x+threadIdx.x;row<n;
+        row+=static_cast<i64>(blockDim.x)*gridDim.x) {
+        JointMass mass{data,row,phi+row,n};joint_map(mass,output+row,n);
+        const auto state=finite_number(joint_reduce(mass))?0:1;
+        for(i64 r=0;r<data.regions;++r){const auto c=r*n+row;status[c]=state;if(phi[c]==0)output[c]=quiet_nan;}
     }
 }
 __global__ void component_diagnostics_kernel(ObservationSoA data, i64 count,
@@ -267,25 +281,15 @@ __global__ void joint_kernel(ObservationSoA data, i64 first_row, i64 rows, i64 c
     for (i64 index = static_cast<i64>(blockIdx.x) * blockDim.x + threadIdx.x;
          index < count; index += static_cast<i64>(blockDim.x) * gridDim.x) {
         const i64 cluster = index / rows, row = first_row + index % rows;
-        double total = 0;
-        EmitStatus state = EmitStatus::Ok;
-        for (i64 region = 0; region < data.regions; ++region) {
-            const i64 cell = region * data.mutations + row;
-            const double phi = centers[cluster * data.regions + region];
-            // Assignment boxes apply even when this observation is missing.
-            if (phi < data.lower[cell] || phi > data.upper[cell]) {
-                total = -positive_infinity;
-                state = EmitStatus::ZeroLikelihood;
-                break;
-            }
-            const auto terms = evaluate_observation<EmitMode::LossOnly>(observation(data, cell), phi);
-            if (static_cast<int>(terms.status) > static_cast<int>(state)) state = terms.status;
-            total -= terms.loss;
-        }
+        double total=0.;EmitStatus state;
+        JointMass mass{data,row,centers+cluster*data.regions,1};
+        state=joint_column_score(mass,total);
         ll[index] = total;
         status[index] = static_cast<std::uint8_t>(state);
     }
 }
+
+#include "joint_operations.cuh"
 
 #include "probability_reuse.cuh"
 #include "ordered_reduce.cuh"
@@ -388,15 +392,16 @@ __global__ void conditional_kernel(ObservationSoA data, ConditionalBatch batch,
 // A full phase owns one workspace. Slot offsets are planned before allocation,
 // including all argument, result, and reduction buffers (no hidden N*R*M array).
 struct EmissionBuffers {
-    i64 phi, loss, gradient, curvature, status, cells, bytes;
-    EmissionBuffers(i64 count, int mode, bool indexed) {
+    i64 phi, loss, gradient, curvature, status, cells, scratch, bytes;
+    EmissionBuffers(i64 count, int mode, bool indexed, i64 joint_scratch=0, i64 row_count=-1) {
         Layout layout;
         phi = layout.take<double>(count);
-        loss = layout.take<double>(count);
+        loss = layout.take<double>(row_count<0?count:row_count);
         gradient = layout.take<double>(mode ? count : 0);
         curvature = layout.take<double>(mode ? count : 0);
-        status = layout.take<std::uint8_t>(count);
+        status = layout.take<std::uint8_t>(row_count<0?count:row_count);
         cells = layout.take<i64>(indexed ? count : 0);
+        scratch = layout.take<double>(joint_scratch);
         bytes = layout.bytes;
     }
 };
@@ -437,11 +442,23 @@ extern "C" int CliPP2BackendCreate(const ObservationSoA* input, int device_index
                   lower = layout.take<double>(count), upper = layout.take<double>(count),
                   minimum = layout.take<i64>(count), support = layout.take<i64>(count),
                   flags = layout.take<std::uint8_t>(count);
+        std::vector<i64> joint_offsets(input->mutations*(input->regions+1)),joint_rows(input->mutations+1,0);
+        for(i64 i=0;i<input->mutations;++i) {
+            auto out=joint_offsets.data()+i*(input->regions+1);out[0]=0;
+            for(i64 r=0;r<input->regions;++r)out[r+1]=add(out[r],input->support[r*input->mutations+i]);
+            joint_rows[i+1]=add(joint_rows[i],out[input->regions]+4*(input->regions+1));
+        }
+        const auto jo=layout.take<i64>(joint_offsets.size()),jr=layout.take<i64>(joint_rows.size());
         cuda_check(cudaMalloc(reinterpret_cast<void**>(&c->prepared), layout.bytes), "allocate prepared CUDA data");
         auto d = [&](i64 offset) { return reinterpret_cast<double*>(c->prepared + offset); };
         c->data = {input->mutations, input->regions, d(alt), d(ref), d(scaling), d(constant),
                    d(lower), d(upper), reinterpret_cast<i64*>(c->prepared + minimum),
-                   reinterpret_cast<i64*>(c->prepared + support), c->prepared + flags, input->aggregation};
+                   reinterpret_cast<i64*>(c->prepared + support), c->prepared + flags, input->aggregation, input->max_multiplicity_difference};
+        c->host_support.assign(input->support,input->support+count);
+        c->joint_offsets=reinterpret_cast<i64*>(c->prepared+jo);c->joint_rows=reinterpret_cast<i64*>(c->prepared+jr);
+        c->joint_scratch_count=joint_rows.back();
+        c->upload(const_cast<i64*>(c->joint_offsets),joint_offsets.data(),joint_offsets.size());
+        c->upload(const_cast<i64*>(c->joint_rows),joint_rows.data(),joint_rows.size());
         c->upload(d(alt), input->alt, count); c->upload(d(ref), input->ref, count);
         c->upload(d(scaling), input->scaling, count); c->upload(d(constant), input->log_constant, count);
         c->upload(d(lower), input->lower, count); c->upload(d(upper), input->upper, count);
@@ -543,15 +560,20 @@ extern "C" int CliPP2EvaluateNodes(void* value, i64 batches, const double* phi, 
         output_check(count, mode, loss, gradient, curvature, status);
         require(!count || phi, "Missing CUDA node states");
         if (!count) return;
-        const EmissionBuffers b(count, mode, false); c.reserve(b.bytes);
+        const EmissionBuffers b(count, mode, false, mode?multiply(batches,c.joint_scratch_count):0,batches*c.data.mutations); c.reserve(b.bytes);
         c.upload(c.pointer<double>(b.phi), phi, count);
         if (mode) node_kernel<EmitMode::LossGradientCurvature><<<blocks(count), threads, 0, c.stream>>>(
             c.data, count, c.pointer<double>(b.phi), c.pointer<double>(b.loss),
-            c.pointer<double>(b.gradient), c.pointer<double>(b.curvature), c.pointer<std::uint8_t>(b.status));
+            c.pointer<double>(b.gradient), c.pointer<double>(b.curvature), c.pointer<std::uint8_t>(b.status),
+            c.joint_offsets,c.joint_rows,c.pointer<double>(b.scratch));
         else node_kernel<EmitMode::LossOnly><<<blocks(count), threads, 0, c.stream>>>(
             c.data, count, c.pointer<double>(b.phi), c.pointer<double>(b.loss), nullptr, nullptr,
-            c.pointer<std::uint8_t>(b.status));
-        c.launched(); emission_results(c, b, count, mode, loss, gradient, curvature, status);
+            c.pointer<std::uint8_t>(b.status),c.joint_offsets,c.joint_rows,nullptr);
+        c.launched();
+        c.download(loss,c.pointer<double>(b.loss),batches*c.data.mutations);
+        c.download(status,c.pointer<std::uint8_t>(b.status),batches*c.data.mutations);
+        if(mode){c.download(gradient,c.pointer<double>(b.gradient),count);c.download(curvature,c.pointer<double>(b.curvature),count);}
+        c.diagnostics.cell_evaluations=add(c.diagnostics.cell_evaluations,count);c.finish();
     });
 }
 extern "C" int CliPP2EvaluateCells(void* value, i64 count, const i64* cells, const double* phi,
@@ -711,3 +733,86 @@ extern "C" int CliPP2EvaluateConditionalValues(void* value, const ConditionalBat
 }
 #include "scoring.cuh"
 #include "resident_api.cuh"
+
+extern "C" int CliPP2JointDiagnostics(void* value,const double* phi,const double* accepted,
+        const i64* offsets,double* rows,double* maps,double* component,double* accepted_p,
+        double* map_p,double* conditional,double* probability,std::uint8_t* status) {
+    return guarded([&] {
+        auto& c=context(value);const auto n=c.data.mutations,cells=n*c.data.regions;
+        require(phi&&offsets&&rows&&maps&&component&&accepted_p&&map_p&&conditional&&probability&&status,"Missing CUDA joint diagnostic buffer");
+        require(offsets[0]==0,"Invalid joint component offsets");
+        for(i64 j=0;j<cells;++j)require(offsets[j+1]-offsets[j]==c.host_support[j],"Joint component support mismatch");
+        const auto components=offsets[cells];Layout layout;
+        const auto dp=layout.take<double>(cells),da=layout.take<double>(accepted?cells:0),dof=layout.take<i64>(cells+1),
+            dr=layout.take<double>(4*n),dm=layout.take<double>(cells),dc=layout.take<double>(cells),
+            dap=layout.take<double>(cells),dmp=layout.take<double>(cells),dcm=layout.take<double>(components),
+            dpr=layout.take<double>(components),ds=layout.take<std::uint8_t>(n),dmsg=layout.take<double>(n*4*(c.data.regions+1));
+        c.reserve(layout.bytes);c.upload(c.pointer<double>(dp),phi,cells);c.upload(c.pointer<i64>(dof),offsets,cells+1);
+        if(accepted)c.upload(c.pointer<double>(da),accepted,cells);
+        joint_diagnostics_kernel<<<blocks(n),threads,0,c.stream>>>(c.data,c.pointer<double>(dp),accepted?c.pointer<double>(da):nullptr,
+            c.pointer<i64>(dof),c.pointer<double>(dr),c.pointer<double>(dm),c.pointer<double>(dc),c.pointer<double>(dap),
+            c.pointer<double>(dmp),c.pointer<double>(dcm),c.pointer<double>(dpr),c.pointer<std::uint8_t>(ds),c.pointer<double>(dmsg));
+        c.launched();c.download(rows,c.pointer<double>(dr),4*n);c.download(maps,c.pointer<double>(dm),cells);
+        c.download(component,c.pointer<double>(dc),cells);c.download(accepted_p,c.pointer<double>(dap),cells);
+        c.download(map_p,c.pointer<double>(dmp),cells);c.download(conditional,c.pointer<double>(dcm),components);
+        c.download(probability,c.pointer<double>(dpr),components);c.download(status,c.pointer<std::uint8_t>(ds),n);c.finish();
+    });
+}
+extern "C" int CliPP2PooledJointPilots(void* value,const i64* grid_offsets,const double* grids,
+        const double* weights,double* pilots,std::uint8_t* status) {
+    return guarded([&] {
+        auto& c=context(value);const auto n=c.data.mutations,R=c.data.regions,cells=n*R;
+        require(grid_offsets&&grids&&weights&&pilots&&status,"Missing CUDA pooled component buffer");
+        std::vector<i64> offsets(cells+1,0);for(i64 j=0;j<cells;++j)offsets[j+1]=add(offsets[j],c.host_support[j]);
+        for(i64 r=0;r<R;++r)require(grid_offsets[r+1]>grid_offsets[r],"Empty regional CCF pool");
+        const auto components=offsets.back(),points=grid_offsets[R];Layout layout;
+        const auto dof=layout.take<i64>(cells+1),dgo=layout.take<i64>(R+1),dg=layout.take<double>(points),
+            dw=layout.take<double>(points),dm=layout.take<double>(components),dv=layout.take<double>(components),
+            dp=layout.take<double>(cells),ds=layout.take<std::uint8_t>(n),dcav=layout.take<double>(components),dmsg=layout.take<double>(n*4*(R+1));
+        c.reserve(layout.bytes);c.upload(c.pointer<i64>(dof),offsets.data(),cells+1);c.upload(c.pointer<i64>(dgo),grid_offsets,R+1);
+        c.upload(c.pointer<double>(dg),grids,points);c.upload(c.pointer<double>(dw),weights,points);
+        pooled_components_kernel<<<blocks(cells),threads,0,c.stream>>>(c.data,c.pointer<i64>(dof),c.pointer<i64>(dgo),
+            c.pointer<double>(dg),c.pointer<double>(dw),c.pointer<double>(dm),c.pointer<double>(dv));c.launched();
+        pooled_joint_kernel<<<blocks(n),threads,0,c.stream>>>(c.data,c.pointer<i64>(dof),c.pointer<double>(dm),
+            c.pointer<double>(dv),c.pointer<double>(dp),c.pointer<std::uint8_t>(ds),c.pointer<double>(dcav),c.pointer<double>(dmsg));c.launched();
+        c.download(pilots,c.pointer<double>(dp),cells);c.download(status,c.pointer<std::uint8_t>(ds),n);c.finish();
+    });
+}
+extern "C" int CliPP2RefitGroupsBatch(void* value,i64 groups,const i64* offsets,const i64* members,
+        const double* initial,const double* lower,const double* upper,double* centers,double* likelihood,
+        std::int32_t* status,i64* iterations,double* projected,std::uint8_t* retained) {
+    return guarded([&] {
+        auto& c=context(value);const auto R=c.data.regions;
+        require(groups>=0&&offsets&&members&&initial&&lower&&upper&&centers&&likelihood&&status&&iterations&&projected&&retained,"Missing CUDA joint group buffer");
+        require(offsets[0]==0,"Invalid group offsets");
+        std::vector<i64> components,bases(groups+1,0),scratch_offsets(groups+1,0),branch_offsets(groups+1,0);
+        for(i64 g=0;g<groups;++g) {
+            require(offsets[g+1]>offsets[g],"Empty joint group");i64 total=0,maximum=1;components.push_back(0);
+            for(i64 j=offsets[g];j<offsets[g+1];++j) {
+                require(members[j]>=0&&members[j]<c.data.mutations,"Invalid joint group member");
+                for(i64 r=0;r<R;++r){const auto width=c.host_support[r*c.data.mutations+members[j]];
+                    total=add(total,width);components.push_back(total);maximum=std::max(maximum,width);}
+            }
+            bases[g+1]=components.size();scratch_offsets[g+1]=add(scratch_offsets[g],add(2*total+maximum,12*R+6));
+            branch_offsets[g+1]=add(branch_offsets[g],maximum);
+        }
+        const auto member_count=offsets[groups],coordinates=multiply(groups,R);Layout layout;
+        const auto dof=layout.take<i64>(groups+1),dmem=layout.take<i64>(member_count),di=layout.take<double>(coordinates),
+            dl=layout.take<double>(coordinates),du=layout.take<double>(coordinates),dc=layout.take<double>(coordinates),
+            dll=layout.take<double>(groups),dst=layout.take<std::int32_t>(groups),dit=layout.take<i64>(groups),
+            dpg=layout.take<double>(groups),dret=layout.take<std::uint8_t>(groups),dbase=layout.take<i64>(groups+1),
+            dco=layout.take<i64>(components.size()),dso=layout.take<i64>(groups+1),dbo=layout.take<i64>(groups+1),
+            dscratch=layout.take<double>(scratch_offsets.back()),dbranches=layout.take<i64>(branch_offsets.back());
+        c.reserve(layout.bytes);c.upload(c.pointer<i64>(dof),offsets,groups+1);c.upload(c.pointer<i64>(dmem),members,member_count);
+        c.upload(c.pointer<double>(di),initial,coordinates);c.upload(c.pointer<double>(dl),lower,coordinates);c.upload(c.pointer<double>(du),upper,coordinates);
+        c.upload(c.pointer<i64>(dbase),bases.data(),groups+1);c.upload(c.pointer<i64>(dco),components.data(),components.size());
+        c.upload(c.pointer<i64>(dso),scratch_offsets.data(),groups+1);c.upload(c.pointer<i64>(dbo),branch_offsets.data(),groups+1);
+        joint_refit_kernel<<<blocks(groups),threads,0,c.stream>>>(c.data,groups,c.pointer<i64>(dof),c.pointer<i64>(dmem),
+            c.pointer<double>(di),c.pointer<double>(dl),c.pointer<double>(du),c.pointer<double>(dc),c.pointer<double>(dll),
+            c.pointer<std::int32_t>(dst),c.pointer<i64>(dit),c.pointer<double>(dpg),c.pointer<std::uint8_t>(dret),
+            c.pointer<i64>(dbase),c.pointer<i64>(dco),c.pointer<i64>(dso),c.pointer<i64>(dbo),c.pointer<double>(dscratch),c.pointer<i64>(dbranches));
+        c.launched();c.download(centers,c.pointer<double>(dc),coordinates);c.download(likelihood,c.pointer<double>(dll),groups);
+        c.download(status,c.pointer<std::int32_t>(dst),groups);c.download(iterations,c.pointer<i64>(dit),groups);
+        c.download(projected,c.pointer<double>(dpg),groups);c.download(retained,c.pointer<std::uint8_t>(dret),groups);c.finish();
+    });
+}

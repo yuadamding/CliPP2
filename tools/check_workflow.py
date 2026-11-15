@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic Protocol 2.4 CPU contracts against one imported installation.
+"""Deterministic Protocol 2.5 CPU contracts against one imported installation.
 
 Fixture cutoffs exercise decisions; they are not biological calibration advice.
 All inputs and outputs are temporary. No checkout import path is injected.
@@ -357,7 +357,7 @@ def check_complete_workflow(directory):
     plan_config = asdict(config)
     plan_config["fit"].pop("max_clusters")
     plan_config.pop("stage_two_max_clusters")
-    plan = dict(schema="clipp2.workflow.plan.v6", protocol_version=PROTOCOL_VERSION,
+    plan = dict(schema="clipp2.workflow.plan.v7", protocol_version=PROTOCOL_VERSION,
                 input_path=path.name, workflow_config=plan_config)
     plan_path = directory / "plan.json"
     plan_path.write_text(json.dumps(plan))

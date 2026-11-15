@@ -18,10 +18,10 @@ import time
 
 import numpy as np
 import pandas as pd
-from scipy.special import logsumexp, xlogy, xlog1py
 
-from CliPP2.assignment import (assign_mutations, conditional_multiplicity,
+from CliPP2.assignment import (assign_mutations,
     derive_assignment_bundle, profile_score_summary)
+from CliPP2.kernel.joint import joint_row
 from CliPP2.io.assignment import load_assignment_bundle, _publish_json, write_supporting_table
 from CliPP2.simulation.evaluation import candidate_correspondence, partition_scores
 
@@ -38,29 +38,31 @@ def macro_f1(truth, prediction, classes):
 
 
 def _attribute(request, marginal, profile):
-    """Independent finite-component identity; impossible candidates remain -inf."""
+    """Independent joint-volume identity; impossible candidates remain -inf."""
     lookup = {m: i for i, m in enumerate(request.catalog.mutation_ids)}
-    c = request.catalog
     volume = np.zeros((len(request.target_ids), len(request.reference.labels)))
     for i, mutation in enumerate(request.target_ids):
         source = lookup[mutation]
-        for r in np.flatnonzero(c.eligible[source] & c.count_observed[source] & (c.total_counts[source] > 0)):
-            width = int(c.major_cn[source, r])
-            a = c.purity[source, r] / ((1-c.purity[source, r])*c.normal_cn[source, r]
-                + c.purity[source, r]*(c.major_cn[source, r]+c.minor_cn[source, r]))
-            p = np.minimum(a*np.arange(1, width+1)[None, :]*request.reference.centers[:, r, None], 1.)
-            y, n = c.alt_counts[source, r], c.total_counts[source, r]
-            logs = xlogy(y, p)+xlog1py(n-y, -p)
-            maximum = np.max(logs, axis=1)
-            finite = np.isfinite(maximum)
-            volume[i, finite] += logsumexp(logs[finite]-maximum[finite, None], axis=1)-np.log(width)
-            volume[i, ~finite] = np.nan
+        for k, center in enumerate(request.reference.centers):
+            result = _joint_at(request, source, center)
+            volume[i, k] = (result["log_marginal"]-result["profile"]
+                            if np.isfinite(result["profile"]) else np.nan)
     actual = np.array([r["log_scores"] for r in marginal.assignments])
     profiled = np.array([r["log_scores"] for r in profile.assignments])
     np.testing.assert_array_equal(np.isfinite(actual), np.isfinite(profiled))
     finite = np.isfinite(actual)
     np.testing.assert_allclose(actual[finite], (profiled+volume)[finite], rtol=1e-10, atol=1e-10)
     return volume, float(np.max(abs(actual[finite]-(profiled+volume)[finite]), initial=0.))
+
+
+def _joint_at(request, source, center):
+    catalog = request.catalog
+    purity = catalog.purity[source]
+    scaling = purity / ((1-purity)*catalog.normal_cn[source]+purity*catalog.total_cn[source])
+    observed = catalog.eligible[source] & catalog.count_observed[source] & (catalog.total_counts[source] > 0)
+    return joint_row(catalog.alt_counts[source], catalog.total_counts[source], scaling,
+        np.ones(len(center), dtype=int), catalog.major_cn[source], observed, center,
+        max_multiplicity_difference=request.max_multiplicity_difference)
 
 
 def compare(request, truth, outdir):
@@ -115,10 +117,10 @@ def compare(request, truth, outdir):
         if choice == row["final_assignment_label"]:
             continue
         center = request.reference.centers[request.reference.labels.index(choice)]
+        joint = _joint_at(request, indices[i], center)
         for r in np.flatnonzero(observed[i]):
-            d = conditional_multiplicity(catalog, indices[i], r, center[r], 1, int(catalog.major_cn[indices[i], r]))
             phis["profile_lowest"][i, r] = center[r]
-            calls["profile_lowest"][i, r] = d["map_call"] if center[r] > 0 else np.nan
+            calls["profile_lowest"][i, r] = joint["map"][r] if center[r] > 0 else np.nan
     biological = observed & truth.observed.to_numpy(bool).reshape(shape)
     tm = truth.true_multiplicity.to_numpy(float).reshape(shape)
     cna = biological & truth.cna.to_numpy(bool).reshape(shape) & np.isfinite(tm) & (tm >= 1) & (tm == np.rint(tm))

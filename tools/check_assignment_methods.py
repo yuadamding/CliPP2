@@ -113,19 +113,15 @@ def run_checks(root, *, device="cpu"):
         _fails(lambda: _validated_profile_terms({"status": [[status]], "max_component_log_mass": [[value]]}, [[True]]), ArithmeticError)
     assert _validated_profile_terms({"status": [[4]], "max_component_log_mass": [[np.nan]]}, [[False]])[0, 0] == 0
     assert np.isneginf(_validated_profile_terms({"status": [[1]], "max_component_log_mass": [[-np.inf]]}, [[True]])[0, 0])
-    with patch.object(NativeBackend, "component_diagnostics", side_effect=RuntimeError("mandatory scorer failure")):
+    with patch.object(NativeBackend, "joint_columns", side_effect=RuntimeError("mandatory scorer failure")):
         _fails(lambda: assign_mutations(profile), RuntimeError)
-    original = NativeBackend.component_diagnostics
-    def diagnostics(self, centers, native_calls=None):
-        if native_calls is not None:
-            raise RuntimeError("optional selected diagnostic failure")
-        return original(self, centers)
-    with patch.object(NativeBackend, "component_diagnostics", diagnostics):
+    with patch.object(NativeBackend, "component_diagnostics", side_effect=RuntimeError("optional regional diagnostic failure")):
         optional = assign_mutations(profile, outdir=root / "optional_failure")
-    assert optional.assignments[0]["diagnostic_status"] == "failed"
+    assert optional.assignments[0]["diagnostic_status"] == "available"
+    assert optional.multiplicities[0]["regional_diagnostic_status"] == "failed"
     assert optional.multiplicities[0]["assigned_multiplicity"] == second.multiplicities[0]["assigned_multiplicity"]
-    with patch("CliPP2.assignment.conditional_multiplicity", side_effect=RuntimeError("essential enumeration failure")):
-        _fails(lambda: assign_mutations(profile), ArithmeticError)
+    with patch.object(NativeBackend, "joint_diagnostics", side_effect=RuntimeError("essential joint enumeration failure")):
+        _fails(lambda: assign_mutations(profile), (ArithmeticError, RuntimeError))
     with patch("CliPP2.assignment.binomial_profile_deviance", side_effect=RuntimeError("optional deviance failure")):
         optional = assign_mutations(profile, outdir=root / "deviance_failure")
     assert optional.multiplicities[0]["conditional_distribution_defined"]

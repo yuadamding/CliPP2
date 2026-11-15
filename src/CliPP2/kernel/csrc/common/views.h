@@ -11,6 +11,7 @@ struct ObservationSoA {
     const std::int64_t *minimum, *support;
     const std::uint8_t* flags;
     LikelihoodAggregation aggregation = LikelihoodAggregation::UniformMarginal;
+    std::int32_t max_multiplicity_difference = -1;
 };
 
 struct Observation {

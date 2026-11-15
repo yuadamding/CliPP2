@@ -5,6 +5,8 @@
 #include "prepared_tree.h"
 #include "executor.h"
 #include "common/emission_math.h"
+#include "common/joint_multiplicity.h"
+#include "common/joint_workspace.h"
 #include "common/scalar_search.h"
 #include "common/validation.h"
 #include <algorithm>
@@ -31,8 +33,8 @@ double sum(const Vector& x) {
 }
 struct Terms { Vector value, gradient, curvature, right, left; };
 struct Point { Vector x; Terms terms; };
-void resize(Point& point,std::size_t cells) {
-    point.x.resize(cells);point.terms.value.resize(cells);
+void resize(Point& point,std::size_t cells,std::size_t nodes) {
+    point.x.resize(cells);point.terms.value.resize(nodes);
     point.terms.gradient.resize(cells);point.terms.curvature.resize(cells);
     point.terms.right.resize(cells);point.terms.left.resize(cells);
 }
@@ -42,18 +44,20 @@ void resize(Point& point,std::size_t cells) {
 struct Arena {
     unsigned long coordinate_epoch=0,projection_epoch=~0UL;
     Point current,trial,warm;
+    clipp2::JointWorkspace joint_workspace;
     Vector gradient,delta,spring_delta,trial_delta,h,rhs,qp,diagonal,direction,products;
     Vector minima,maxima,means,lo,hi,center,next,group_gradient,group_h,group_direction,group_products;
     std::vector<long double> scores,cut_delta,audit_gradient,audit_scale,audit_delta;
     std::vector<int> selected,graph,parent,labels,mapping,sizes,degree,warm_labels,qp_diagnostics;
     std::vector<unsigned char> cuts;
-    explicit Arena(int n,int r):
+    explicit Arena(int n,int r,const clipp2::ObservationSoA* data=nullptr):
         scores(n-1),cut_delta(static_cast<std::size_t>(n-1)*r),
         audit_gradient(static_cast<std::size_t>(n)*r),audit_scale(audit_gradient.size()),
         audit_delta(cut_delta.size()),parent(n),labels(n),mapping(n),sizes(n),degree(n),
         qp_diagnostics(2*r),cuts(n-1) {
         const auto cells=static_cast<std::size_t>(n)*r;
-        resize(current,cells);resize(trial,cells);resize(warm,cells);
+        if(data)joint_workspace.prepare(*data);
+        resize(current,cells,n);resize(trial,cells,n);resize(warm,cells,n);
         for(auto* value:{&gradient,&delta,&spring_delta,&trial_delta,&h,&rhs,&qp,&diagonal,&direction,&products,
                         &minima,&maxima,&means,&lo,&hi,&center,&next,&group_gradient,&group_h,&group_direction,&group_products})
             value->resize(cells);
@@ -86,21 +90,15 @@ struct Engine {
                           out.right.data(),out.left.data(),cells);
             return;
         }
-        auto cell_terms=[&](int i) {for(int region=0;region<r;++region) {
-            const auto cell=static_cast<std::size_t>(i)*r+region;
-            const auto observation=clipp2::observation(data, static_cast<std::int64_t>(region)*n+i);
-            const auto result=clipp2::evaluate_observation<clipp2::EmitMode::LossGradientCurvature>(observation,x[cell]);
-            if (result.status==clipp2::EmitStatus::InvalidInput)
-                throw std::invalid_argument("Native continuation received invalid CCFs");
-            if (result.status==clipp2::EmitStatus::NumericalFailure)
-                throw std::runtime_error("Native continuation likelihood produced invalid arithmetic");
-            out.value[cell]=result.loss; out.gradient[cell]=result.gradient;
-            out.curvature[cell]=result.curvature;
-            if(data.aggregation==clipp2::LikelihoodAggregation::IntegerProfile) {
-                const auto slopes=clipp2::profile_slopes(observation,x[cell]);
-                out.right[cell]=slopes.right;out.left[cell]=slopes.left;
-            }
-        }};
+        auto cell_terms=[&](int i) {
+            const auto cell=static_cast<std::size_t>(i)*r;
+            clipp2::JointMass mass{data,i,x.data()+cell,1};
+            const auto state=clipp2::joint_terms(mass,out.value[i],out.gradient.data()+cell,
+                out.curvature.data()+cell,1,out.right.data()+cell,out.left.data()+cell,
+                arena.joint_workspace.component_offsets(i),arena.joint_workspace.cavity(i),arena.joint_workspace.messages(i));
+            if(state==clipp2::EmitStatus::InvalidInput)throw std::invalid_argument("Native continuation received invalid CCFs");
+            if(state==clipp2::EmitStatus::NumericalFailure)throw std::runtime_error("Native joint continuation likelihood produced invalid arithmetic");
+        };
         if(team)team->run(n,cell_terms);else for(int i=0;i<n;++i)cell_terms(i);
     }
     const std::vector<unsigned char>& project(const Vector& x, int k) const {
@@ -439,25 +437,22 @@ extern "C" int CliPP2ContinueCPU(const clipp2::ObservationSoA* data,const int* e
         clipp2kernel::Executor pool(workers);
         pool.each([&](int){clipp2kernel::reset_forest_workspace();clipp2kernel::prepare_forest_workspace(n,e);});
         const bool capacity_parallel=tasks>=workers;
-        Point start;resize(start,cells);start.x.assign(initial,initial+cells);
+        clipp2::JointWorkspace initial_workspace;initial_workspace.prepare(*data);
+        Point start;resize(start,cells,n);start.x.assign(initial,initial+cells);
         // Initial emissions reuse the same pool but need no capacity arena.
-        pool.run(n,[&](int i){for(int region=0;region<r;++region) {
-            const auto cell=static_cast<std::size_t>(i)*r+region;
-            const auto result=clipp2::evaluate_observation<clipp2::EmitMode::LossGradientCurvature>(
-                clipp2::observation(*data,static_cast<std::int64_t>(region)*n+i),start.x[cell]);
-            if(result.status==clipp2::EmitStatus::InvalidInput || result.status==clipp2::EmitStatus::NumericalFailure)
-                throw std::runtime_error("Invalid initial continuation likelihood");
-            start.terms.value[cell]=result.loss;start.terms.gradient[cell]=result.gradient;start.terms.curvature[cell]=result.curvature;
-            if(data->aggregation==clipp2::LikelihoodAggregation::IntegerProfile) {
-                const auto slopes=clipp2::profile_slopes(
-                    clipp2::observation(*data,static_cast<std::int64_t>(region)*n+i),start.x[cell]);
-                start.terms.right[cell]=slopes.right;start.terms.left[cell]=slopes.left;
-            }
-        }});
+        pool.run(n,[&](int i) {
+            const auto cell=static_cast<std::size_t>(i)*r;
+            clipp2::JointMass mass{*data,i,start.x.data()+cell,1};
+            const auto state=clipp2::joint_terms(mass,start.terms.value[i],start.terms.gradient.data()+cell,
+                start.terms.curvature.data()+cell,1,start.terms.right.data()+cell,start.terms.left.data()+cell,
+                initial_workspace.component_offsets(i),initial_workspace.cavity(i),initial_workspace.messages(i));
+            if(state==clipp2::EmitStatus::InvalidInput||state==clipp2::EmitStatus::NumericalFailure)
+                throw std::runtime_error("Invalid initial joint continuation likelihood");
+        });
         if(!std::all_of(start.terms.value.begin(),start.terms.value.end(),[](double x){return std::isfinite(x);}))
             throw std::runtime_error("Initial tree likelihood is nonfinite");
         auto work=[&](int task){
-            Arena arena(n,r);
+            Arena arena(n,r,data);
             Engine engine{*data,n,r,e,cells,edges,canonical,lower,upper,gaps,*policy,norm,cut_scores,
                           tree,capacity_parallel?nullptr:&pool,arena};
             engine.run(start,capacities[task],output_flags?output+static_cast<std::size_t>(task)*cells:nullptr,
@@ -526,7 +521,7 @@ struct ContinuationOwner {
         policy(rules),norm(reduce_norm),scores(reduce_scores),tree(n,n-1,graph) {
         if(n>1)edges.assign(graph,graph+2*static_cast<std::size_t>(n-1));
         initial.x.assign(x,x+cells);
-        initial.terms.value.assign(values,values+cells);
+        initial.terms.value.assign(values,values+n);
         initial.terms.gradient.assign(gradient,gradient+cells);
         initial.terms.curvature.assign(curvature,curvature+cells);
         initial.terms.right.assign(right,right+cells);initial.terms.left.assign(left,left+cells);
@@ -638,10 +633,11 @@ extern "C" int CliPP2ContinuationOwnerCreate(int n,int r,const int* edges,const 
         for(std::size_t i=0;i<cells;++i) {
             if(!std::isfinite(initial[i])||!std::isfinite(lower[i])||!std::isfinite(upper[i])
                 ||lower[i]<0||upper[i]>1||lower[i]>upper[i]||initial[i]<lower[i]||initial[i]>upper[i]
-                ||!std::isfinite(values[i])||!std::isfinite(gradient[i])||!std::isfinite(curvature[i])
+                ||!std::isfinite(gradient[i])||!std::isfinite(curvature[i])
                 ||!std::isfinite(right[i])||!std::isfinite(left[i]))
                 throw std::invalid_argument("Invalid continuation initial state");
         }
+        for(int i=0;i<n;++i)if(!std::isfinite(values[i]))throw std::invalid_argument("Invalid row-level continuation loss");
         auto group=std::make_unique<ContinuationOwner>(n,r,edges,canonical,initial,values,gradient,curvature,
             right,left,lower,upper,gaps,*policy,norm,scores,output_flags,boundary_requests);
         group->states.reserve(tasks);
@@ -677,10 +673,11 @@ extern "C" int CliPP2ContinuationOwnerReply(void* owner,int task,std::uint64_t s
         if(state.request.kind==1) {
             if(!values||!gradient||!curvature||!right||!left)throw std::invalid_argument("Missing continuation terms reply");
             for(std::size_t i=0;i<group.cells;++i)
-                if(!std::isfinite(values[i])||!std::isfinite(gradient[i])||!std::isfinite(curvature[i])
+                if(!std::isfinite(gradient[i])||!std::isfinite(curvature[i])
                         ||!std::isfinite(right[i])||!std::isfinite(left[i]))
                     throw std::runtime_error("Nonfinite continuation terms reply");
-            std::copy(values,values+group.cells,state.value_reply);
+            for(int i=0;i<group.n;++i)if(!std::isfinite(values[i]))throw std::runtime_error("Nonfinite row-level continuation loss");
+            std::copy(values,values+group.n,state.value_reply);
             std::copy(gradient,gradient+group.cells,state.gradient_reply);
             std::copy(curvature,curvature+group.cells,state.curvature_reply);
             std::copy(right,right+group.cells,state.right_reply);

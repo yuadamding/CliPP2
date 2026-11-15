@@ -194,8 +194,8 @@ def _load_evidence(root, cell):
     paired = _configuration(attempt)
     if not isinstance(paired, Mapping):
         raise TypeError("Preserved paired inference must be a JSON object")
-    if paired.get("schema") != "clipp2.paired-experiment.v6" or paired.get("protocol_version") != "2.4":
-        raise ValueError("Preserved paired inference requires the current Protocol 2.4 format")
+    if paired.get("schema") != "clipp2.paired-experiment.v7" or paired.get("protocol_version") != "2.5":
+        raise ValueError("Preserved paired inference requires the current Protocol 2.5 format")
     catalog, raw_catalog, compatibility = _catalog_evidence(attempt, paired)
     if job.get("cohort_content_id") is not None and dict(catalog.metadata).get("cohort_content_id") != job["cohort_content_id"]:
         raise ValueError("Preserved input catalog belongs to a different cohort content")
@@ -230,14 +230,14 @@ def _load_evidence(root, cell):
 def unavailable_evaluation(job, status, *, evaluation_config, error=None,
                            execution_state=None, evidence_state="missing_truth_evidence",
                            arm_applicability=None, original_evaluable_count=None,
-                           evaluation_schema="clipp2.simulation.evaluation.v6", assignment_method="marginal",
-                           reference_policy=STAGE_THREE_REFERENCE_POLICY):
+                           evaluation_schema="clipp2.simulation.evaluation.v7", assignment_method="marginal",
+                           reference_policy=STAGE_THREE_REFERENCE_POLICY, max_multiplicity_difference=1):
     """Unavailable derived evidence receives no invented scientific decisions."""
     from .evaluation import evaluation_definition, normalize_evaluation_config, metric_truth_independent
-    if evaluation_schema != "clipp2.simulation.evaluation.v6":
-        raise ValueError("Unavailable evidence requires evaluation.v6")
+    if evaluation_schema != "clipp2.simulation.evaluation.v7":
+        raise ValueError("Unavailable evidence requires evaluation.v7")
     definition = evaluation_definition(evaluation_config, reference_policy=reference_policy,
-                                       assignment_method=assignment_method)
+                                       assignment_method=assignment_method, max_multiplicity_difference=max_multiplicity_difference)
     arms = ({row["arm"]: row for row in arm_applicability} if isinstance(arm_applicability, (list, tuple))
             else dict(arm_applicability or {}))
     if original_evaluable_count is not None and (type(original_evaluable_count) is not int or original_evaluable_count < 0):
@@ -275,6 +275,7 @@ def unavailable_evaluation(job, status, *, evaluation_config, error=None,
                                   upstream_failure=bool(state.get("upstream_failure")),
                                   decision_population=state.get("decision_population")))
     return dict(schema=evaluation_schema, evaluation_definition=definition,
+        max_multiplicity_difference=max_multiplicity_difference,
         evaluation_config=normalize_evaluation_config(evaluation_config), truth_qualification=evidence_state,
         evaluation_definition_id=content_hash(definition), cell_id=job["cell_id"], history_id=job["history_id"],
         family=job["family"], acquisition_id=job["acquisition"]["id"], acquisition=job["acquisition"],
@@ -446,9 +447,10 @@ def placeholder_for_cell(root, cell, evaluation_config, *, evidence_state="missi
     value = unavailable_evaluation(job, "unavailable_derived_evidence", evaluation_config=evaluation_config,
         reference_policy=reference_policy,
         assignment_method=cell.get("assignment_method", "marginal"),
+        max_multiplicity_difference=cell.get("max_multiplicity_difference", 1),
         execution_state=cell.get("status"), evidence_state=evidence_state, arm_applicability=arms,
         original_evaluable_count=count, error=error, evaluation_schema=evaluation_schema or cell.get("evaluation_schema") or
-        "clipp2.simulation.evaluation.v6")
+        "clipp2.simulation.evaluation.v7")
     if region_count is not None:
         value["region_count"] = region_count
     return value

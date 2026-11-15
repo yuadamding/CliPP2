@@ -255,13 +255,13 @@ def check_unrestricted_cn(directory):
     huge_catalog = load_original_catalog(huge_path)
     prepared = prepare_prediction(huge_catalog, huge_catalog.mutation_ids)
     assert prepared.support[0, 0] == 2**60
-    with NativeBackend(prepared, cpu_threads=1) as backend:
-        try:
+    try:
+        with NativeBackend(prepared, cpu_threads=1) as backend:
             backend.regional_grid(0, np.array([0]), [.5])
-        except NativeExecutionError as error:
-            assert "overflow" in str(error).lower()
-        else:
-            raise AssertionError("Unrepresentable scratch storage was silently accepted")
+    except NativeExecutionError as error:
+        assert "overflow" in str(error).lower()
+    else:
+        raise AssertionError("Unrepresentable scratch storage was silently accepted")
 
     ready = audit_input(high_path)
     assert ready["status"] == "ready" and ready["eligible_pairs"] == 3

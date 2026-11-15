@@ -30,7 +30,7 @@ def _input(path, values, *, tumor="paired_regression"):
 
 def run_paired_floor_checks(directory):
     """Exercise raised floors in shared A and both native Stage 2 arms."""
-    from CliPP2.io.multiplicity import read_floor_bounds
+    from CliPP2.io.multiplicity import read_floor_bounds, reconcile_workflow_bounds
     from CliPP2.io.tumor_txt import load_original_catalog
 
     directory = Path(directory)
@@ -47,6 +47,7 @@ def run_paired_floor_checks(directory):
     write_tumor_txt(path, frame)
     catalog = load_original_catalog(path)
     expected, _ = read_floor_bounds(catalog)
+    effective, _ = reconcile_workflow_bounds(catalog, expected)
     high_ids = {f"m{i:03}" for i in range(14, 26)}
     records = {}
     for method in ("marginal", "profile"):
@@ -60,11 +61,12 @@ def run_paired_floor_checks(directory):
         assert paired["cost_ledger"]["assignment_pass_count"] == 2
         assert high_ids.issubset(paired["remainder_ids"])
         assert paired["lower_bound_policy"] == expected.policy_id
-        assert paired["stage_one_support_hash"] == expected.content_hash
+        assert paired["stage_one_support_hash"] == effective.content_hash
+        assert paired["support_reconciliation_policy"] == effective.policy_id
         np.testing.assert_array_equal(paired["stage_one"]["support"]["lower"], expected.lower)
         cap = next(row for row in paired["cap_records"] if row["segment_id"] == "gain")
         assert cap["multiplicity_endpoint"] == 1 and cap["lower_bound_override_count"] == 12
-        assert cap["cap_conflict_policy"] == "raise_upper_to_read_floor"
+        assert cap["cap_conflict_policy"] == "original_major_then_joint_range_then_floor_then_cap"
         audit = pd.read_csv(output / "multiplicity_lower_bounds.tsv", sep="\t")
         assert (audit.loc[audit.mutation_id.isin(high_ids), "multiplicity_lower"] == 2).all()
         for name, arm in paired["arms"].items():
@@ -105,7 +107,7 @@ def run_checks(directory):
     ledger = paired["cost_ledger"]
     assert (ledger["fit_count"], ledger["assignment_pass_count"]) == (3, 2)
     assert [event["arm"] for event in ledger["events"] if event["operation"] == "fit"] == ["A", "B", "C"]
-    assert paired["protocol_version"] == "2.4"
+    assert paired["protocol_version"] == "2.5"
     assert all(fit["producer_receipt"]["run_manifest"] == paired["run_manifest"] for fit in
                [paired["stage_one"], *(arm["stage_two"] for arm in paired["arms"].values())])
     for arm in paired["arms"].values():
@@ -156,7 +158,7 @@ def run_checks(directory):
     assert hybrid["fitting_method_identity"] == fitting_identity("profile")
     for native in (hybrid["stage_one"], *(arm["stage_two"] for arm in hybrid["arms"].values())):
         assert native["method_identity"] == fitting_identity("profile")
-        assert native["schema"] == "clipp2.accepted-fit.v4"
+        assert native["schema"] == "clipp2.accepted-fit.v5"
     assert all(arm["assignment"]["assignment_method"] == "marginal" for arm in hybrid["arms"].values())
     checks.append("profile_fitting_inherits_across_both_stage_two_arms_without_changing_stage_three")
     for fit in (replay["stage_one"], replay["arms"]["B"]["stage_two"]):
@@ -298,13 +300,13 @@ def _control_regressions(directory):
     reference, members = _truth_reference(history)
     mutation = history.metadata["mutation_classes"]["E"][0]
     sources = _source_arrays(history)
-    # A first-read zero-CCF/singleton call stays a valid display baseline even
+    # A first-read zero-CCF baseline retains NA multiplicity even
     # when independent reads have ALT>0. It need not fit the second read sample.
     sources[mutation] = dict(center=[0., 0.], call=[1., 1.], lower=[1, 1], upper=[1, 1],
                              stage="test_first_read_zero_ccf_snapshot", label=0)
     bundle = _snapshot_bundle(history, catalog, reference, (mutation,), workflow_config(),
                               sources=sources, independent=True)
-    assert np.all(bundle.native_centers == 0) and np.all(bundle.native_calls == 1)
+    assert np.all(bundle.native_centers == 0) and np.isnan(bundle.native_calls).all()
     scored = assign_mutations(bundle, outdir=directory / "independent_assignment")
     assert len(scored.assignments) == 1
     fake = SimpleNamespace(reference=reference, assignment_method="marginal", summary=scored.summary, assignments=[dict(mutation_id=mutation,

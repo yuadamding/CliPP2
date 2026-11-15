@@ -1,31 +1,34 @@
 # Examples
 
-Run the six-mutation, two-region Protocol 2.4 workflow from the repository root:
+Run the six-mutation, two-region Protocol 2.5 workflow from the repository root:
 
 ```sh
-clipp2 workflow --plan examples/workflow_protocol24.plan.json --output-dir results/workflow24
+clipp2 workflow --plan examples/workflow_protocol25.plan.json --output-dir results/workflow25
 ```
 
-The [plan](workflow_protocol24.plan.json) declares one configuration for the
-[single-state input](workflow_protocol24.tsv). It has no probability or residual
+The [plan](workflow_protocol25.plan.json) declares one configuration for the
+[single-state input](workflow_protocol25.tsv). It has no probability or residual
 acceptance thresholds. Stage 1 allows 10 clusters and Stage 2 allows 20; CPU is
 the default backend. Stage 1 chooses a provisional source nearest all ones;
 Stage 3 uses the fixed all-one reference and distinct Stage 2 centers, returning MAP estimates
 for every informative compatible fitted mutation. There is no distance cutoff or
 automatic major-CN ceiling.
-Set `stage_three_assignment_method` to `"profile"` for regional maximum-likelihood
+Set `stage_three_assignment_method` to `"profile"` for joint maximum-likelihood
 assignment without cluster posterior probabilities; `"marginal"` remains the default.
+The default `max_multiplicity_difference: 1` restricts each mutation's multiplicity
+range across informative regions. Set this fit field to `null` for the independent
+comparison; the CLI equivalent is `--max-multiplicity-difference none`.
 
 Replay its frozen Stage 3 request into a new directory:
 
 ```sh
-clipp2 assign --bundle results/workflow24/assignment_bundle.json --output-dir results/replayed-assignment
+clipp2 assign --bundle results/workflow25/assignment_bundle.json --output-dir results/replayed-assignment
 ```
 
 For a standalone fit, use the same TSV or the regional directory fixture:
 
 ```sh
-clipp2 fit --input-file examples/workflow_protocol24.tsv --max-clusters 3 --output-dir results/example-fit
+clipp2 fit --input-file examples/workflow_protocol25.tsv --max-clusters 3 --output-dir results/example-fit
 clipp2 fit --input-dir examples/tumor --max-clusters 3 --output-dir results/regional-fit
 ```
 
@@ -81,6 +84,6 @@ Stage 3 restores candidates `1..M`. These bounds do not divide by mutation
 CCF, so subclonal multiplicity can be underestimated. Per-pair estimates are
 published in `multiplicity_lower_bounds.tsv`.
 
-See the [workflow definition](../docs/workflow_protocol_2_4.md) and
+See the [workflow definition](../docs/workflow_protocol_2_5.md) and
 [simulation guide](../docs/simulation.md). Each command requires a new output
 directory; CUDA use requires an explicit CUDA build and device setting.

@@ -1,9 +1,9 @@
 # Exact phylogeny cohort simulation
 
 The `CliPP2.simulation` module implements the supplied Version 1.2 cohort and
-Protocol 2.4 paired experiment. The authoritative biological input still declares
+Protocol 2.5 paired experiment. The authoritative biological input still declares
 Protocol 2.1 and is preserved unchanged. New contracts record
-`source_cohort_protocol_version: "2.1"` and execution `protocol_version: "2.4"`.
+`source_cohort_protocol_version: "2.1"` and execution `protocol_version: "2.5"`.
 The authoritative input is
 `CliPP2_phylogeny_cohort_settings.json.gz` in the repository root. Its 60 variants
 span all 12 families: 600 main histories and 120 development histories, each with
@@ -18,7 +18,7 @@ Execution and evaluation are documented here and in
 [simulation evaluation](simulation_evaluation.md).
 The method-bound Stage 3 option defaults to `marginal`; `profile` retains accuracy
 metrics but has no cluster posterior calibration. Methods and tie policies have
-distinct evaluation identities. See [Protocol 2.4](workflow_protocol_2_4.md).
+distinct evaluation identities. See [Protocol 2.5](workflow_protocol_2_5.md).
 
 Qualification is separate from a completed native study. A successful replay or
 bounded pilot does not establish that the full cohort has finished. Use the
@@ -49,7 +49,7 @@ python -m CliPP2.simulation qualify \
 python -m CliPP2.simulation run \
   --cohort-settings CliPP2_phylogeny_cohort_settings.json.gz \
   --main-replicates 10 --development-replicates 2 \
-  --workers 10 --outdir results/cohort-protocol24
+  --workers 10 --outdir results/cohort-protocol25
 ```
 
 `qualify` replays all 720 histories, checks canonical input roundtrips, and runs
@@ -80,10 +80,10 @@ and optionally `CLIPP2_RUN_BUILD_MANIFEST`; `--source-record` accepts an externa
 prepared report record. Missing external evidence is explicitly unbound.
 
 ```sh
-python -m CliPP2.simulation status results/cohort-protocol24
-python -m CliPP2.simulation run --outdir results/cohort-protocol24 --resume
-python -m CliPP2.simulation run --outdir results/cohort-protocol24 --resume --retry-failed
-python -m CliPP2.simulation report results/cohort-protocol24
+python -m CliPP2.simulation status results/cohort-protocol25
+python -m CliPP2.simulation run --outdir results/cohort-protocol25 --resume
+python -m CliPP2.simulation run --outdir results/cohort-protocol25 --resume --retry-failed
+python -m CliPP2.simulation report results/cohort-protocol25
 ```
 
 `status` reads progress and in-flight operation journals without changing the
@@ -92,7 +92,7 @@ new command-line settings do not replace them. Completed cells are reused.
 `--retry-failed` reruns execution failures as new attempts, retaining old
 attempts, completion records, and costs. Development retries append revised assessment receipts while preserving earlier
 receipts. There is no scientific-performance selection to reopen. Package
-version 2.0.0 uses simulation contract v8 with explicit replicate blocks. It binds the entire parsed cohort
+version 2.1.0 uses simulation contract v9 with explicit replicate blocks. It binds the entire parsed cohort
 settings to a `cohort_content_id` in contracts, jobs, physical histories,
 and acquisitions. Formatting and object-key order do not
 affect this identity; values and list order do. Resume verifies the frozen
@@ -100,7 +100,7 @@ settings at coordinator execution boundaries before reusing work. Each worker
 then reuses its validated immutable snapshot; a new process loads and verifies
 it again. Semantic random seeds remain unchanged.
 
-Only the current v8 study contract and Protocol 2.4 artifacts are supported.
+Only the current v9 study contract and Protocol 2.5 artifacts are supported.
 Controls run explicitly through `qualify` or the research control functions,
 independently of study execution. Interrupted costs remain explicitly unknown.
 Reports use new directories.
@@ -110,7 +110,7 @@ identity is independent of worker count. The contract also declares the developm
 population. `development_assessment.json` binds the fixed workflow configuration,
 study contract, main roster, every planned development cell, its retained evaluation
 paths and execution status. Explicit retries append numbered assessments.
-Evaluation v6 uses family/history/acquisition weights. A known failure receives
+Evaluation v7 uses family/history/acquisition weights. A known failure receives
 zero correct-decision credit only when retained evidence establishes a positive
 original denominator and no data-supported final decisions. Missing or
 conflicting evidence produces an unknown score. An incomplete planned estimate
@@ -147,7 +147,7 @@ configuration and a new report destination:
 ```
 
 ```sh
-clipp2-simulate report results/cohort-protocol24 \
+clipp2-simulate report results/cohort-protocol25 \
   --evaluation-config evaluation.json --report-dir results/new-evaluation-report
 ```
 
@@ -201,16 +201,19 @@ Each core dataset has up to three fits: A fits the full informative population;
 B fits the remainder with read-derived lower bounds and original major-CN upper
 bounds; C fits the same remainder with those lower bounds and contributor-derived
 upper caps. All three fits use the floor formula in
-[Protocol 2.4](workflow_protocol_2_4.md). If a cap is below the read-derived lower
-bound, the lower bound is the sole candidate. B3 and C3 each perform one
-frozen-reference assignment with full original support `1..major_cn`.
+[Protocol 2.5](workflow_protocol_2_5.md). Each stage reconciles its raw floors
+and caps under the joint range-one rule before calculating pilots. Original
+major CN has priority, then joint feasibility, read floors, and donor caps.
+B3 and C3 each perform one frozen-reference assignment with original intervals
+`1..major_cn` and the same joint constraint. `max_multiplicity_difference=null`
+records the independent comparison as a distinct scientific identity.
 The one-configuration core maxima are **7,920 fits and 5,280 assignment passes**.
 Blocked or inapplicable branches may execute fewer operations.
 
 Stage 1 chooses the occupied group nearest all ones as a **provisional source**.
 Source residuals, coverage and distance do not veto continuation. Each defined
-observed source multiplicity likelihood contributes the largest integer in its
-exact MAP set over the fitted support. Stage 2 takes the minimum of those
+observed positive-CCF source contributes the largest integer in its regional
+projection of the joint MAP set over fitted support. Stage 2 takes the minimum of those
 endpoints as the raw segment cap. Without a contributor, the original upper
 endpoint remains. Native point calls and cap-source MAP sets are retained
 separately. This cap is a discovery heuristic rather than a biological
@@ -236,9 +239,16 @@ reconciliation helpers. Native results remain retained if a later derived phase
 fails.
 
 Development has no threshold grid or performance-based stop. Current outputs use
-paired experiment v6, assignment bundle v6, assignment result v9 and
-evaluation/definition v6. The B arm is the prespecified comparison without
-segment caps; it retains the same read-derived lower bounds as A and C.
+paired experiment v7, assignment bundle v7, assignment result v10 and
+evaluation/definition v7. The B arm is the prespecified comparison without
+segment caps; it retains the same raw read-floor requests as A and C.
+
+The focused `tools/compare_multiplicity_models.py` comparison separates fixed
+centers, fixed partitions and full discovery workflows. It includes true
+multiplicity differences of zero, one and greater than one, zero-CCF regions,
+conflicting floors/caps and supports where all vectors already obey the rule.
+Differences greater than one deliberately violate the model; numerical correctness
+does not establish biological accuracy in those cases.
 
 Reference-center assessment is separate from source-member overlap used for
 calibration labels. Continuous Euclidean and maximum regional errors are retained.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused Protocol 2.4 assignment contracts against the imported installation."""
+"""Focused Protocol 2.5 assignment contracts against the imported installation."""
 from __future__ import annotations
 
 import copy
@@ -126,10 +126,12 @@ def _numerical_screen_checks(root):
 
 
 def _loss_only_checks(root):
-    """Compare native loss-only candidate scores against the former diagnostic path."""
+    """Compare native joint columns against independent Python reconstruction."""
     from CliPP2.kernel.backend import NativeBackend
     from CliPP2.io.data import content_hash
-    node_terms, diagnostics = NativeBackend.node_terms, NativeBackend.component_diagnostics
+    from CliPP2.kernel.joint import joint_log_columns
+    from CliPP2.kernel.observations import prepare_prediction
+    columns, diagnostics = NativeBackend.joint_columns, NativeBackend.component_diagnostics
     cases = (("tie", [[1, 1]], 3, 2, True, [[.6, .6], [.6, .6]]),
              ("missing", [[1, 0]], 3, 2, [[True, False]], [[1., 0.], [.6, 1.]]),
              ("impossible", [[1]], 2, 1, True, [[0.], [1.]]),
@@ -140,29 +142,33 @@ def _loss_only_checks(root):
         bundle = _bundle(catalog, _reference(catalog, centers))
         calls = dict(loss=0, diagnostics=0)
 
-        def loss_only(self, coordinates, derivatives=True):
-            assert derivatives is False
+        def loss_only(self, coordinates):
             calls["loss"] += 1
-            return node_terms(self, coordinates, derivatives=False)
+            return columns(self, coordinates)
 
         def selected(self, *args, **kwargs):
             calls["diagnostics"] += 1
             return diagnostics(self, *args, **kwargs)
 
-        with patch.object(NativeBackend, "node_terms", loss_only), patch.object(NativeBackend, "component_diagnostics", selected):
+        with patch.object(NativeBackend, "joint_columns", loss_only), patch.object(NativeBackend, "component_diagnostics", selected):
             current = assign_mutations(bundle)
-        assert calls == dict(loss=len(centers), diagnostics=1)
+        assert calls == dict(loss=1, diagnostics=1)
 
-        def old_candidate(self, coordinates, derivatives=False):
-            assert derivatives is False
-            result = diagnostics(self, coordinates)
-            return np.where(result["status"] == 4, 0., -result["log_emission"])
+        observation = prepare_prediction(bundle.catalog, bundle.target_ids, bundle.bounds,
+            max_multiplicity_difference=bundle.max_multiplicity_difference)
+        def reconstructed(self, coordinates):
+            return joint_log_columns(observation.alt, observation.depth, observation.scaling,
+                observation.multiplicity_min, observation.multiplicity_max, observation.observed,
+                coordinates, max_multiplicity_difference=bundle.max_multiplicity_difference)
 
-        with patch.object(NativeBackend, "node_terms", old_candidate):
+        with patch.object(NativeBackend, "joint_columns", reconstructed):
             previous = assign_mutations(bundle)
         for before, after in zip(previous.assignments, current.assignments):
-            np.testing.assert_array_equal(before["log_scores"], after["log_scores"])
-            np.testing.assert_array_equal(before["probabilities"], after["probabilities"])
+            np.testing.assert_allclose(before["log_scores"], after["log_scores"], atol=2e-12, rtol=2e-12)
+            if before["probabilities"] is None:
+                assert after["probabilities"] is None
+            else:
+                np.testing.assert_allclose(before["probabilities"], after["probabilities"], atol=2e-12, rtol=2e-12)
             for field in ("status", "final_assignment_label", "best_label", "map_unique"):
                 assert before[field] == after[field]
         assert content_hash(previous.to_dict()["multiplicities"]) == content_hash(current.to_dict()["multiplicities"])
@@ -270,7 +276,7 @@ def run_checks(directory):
     from CliPP2.io.data import content_hash
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
-    assert PROTOCOL_VERSION == "2.4"
+    assert PROTOCOL_VERSION == "2.5"
     from check_assignment_methods import run_checks as check_methods
     methods = check_methods(root / "methods")
     measurement_roundoff = _reference_measurement_roundoff_checks()
@@ -368,7 +374,7 @@ def run_checks(directory):
         pair = zero_result.multiplicities[0]
         assert pair["multiplicity_status"] == "uninformative_zero_ccf"
         assert np.isnan(pair["conditional_call"]) and not pair["multiplicity_read_informative"]
-        np.testing.assert_array_equal(pair["conditional_probabilities"], np.full(width, 1/width))
+        np.testing.assert_allclose(pair["conditional_probabilities"], np.full(width, 1/width), atol=1e-15, rtol=1e-15)
     singleton = _catalog(root, "singleton", 50, 100, 1, minor=1)
     pair = assign_mutations(_bundle(singleton, _reference(singleton, [[1.]]))).multiplicities[0]
     assert pair["multiplicity_status"] == "structural_singleton" and pair["assigned_multiplicity"] == 1
@@ -388,9 +394,11 @@ def run_checks(directory):
         np.testing.assert_array_equal(one["log_scores"], two["log_scores"])
         np.testing.assert_array_equal(one["probabilities"], two["probabilities"])
         assert one["final_assignment_label"] == two["final_assignment_label"]
-        assert two["diagnostic_status"] == "failed" and two["diagnostic_error"]
-        assert np.isnan(two["mean_profile_deviance"])
-    with patch.object(NativeBackend, "node_terms", side_effect=RuntimeError("score fixture failure")):
+        assert two["diagnostic_status"] == "available"
+        assert two["mean_profile_deviance"] == one["mean_profile_deviance"]
+    assert all(row["regional_diagnostic_status"] == "failed" and row["regional_diagnostic_error"]
+               for row in failed.multiplicities if row["phi"] is not None and np.isfinite(row["phi"]))
+    with patch.object(NativeBackend, "joint_columns", side_effect=RuntimeError("score fixture failure")):
         _reject(lambda: assign_mutations(request), RuntimeError)
     with patch("CliPP2.assignment.binomial_profile_deviance", side_effect=RuntimeError("residual fixture failure")):
         residual_failed = assign_mutations(request, outdir=root / "residual_failure")

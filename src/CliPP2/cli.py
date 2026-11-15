@@ -31,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--device", choices=["cpu", "cuda"], default=DEFAULT_DEVICE)
     fit.add_argument("--fit-multiplicity", choices=("marginal", "profile"), default="marginal",
                      help="Center fitting objective; selection always uses marginal-mixture BIC at frozen centers.")
+    fit.add_argument("--max-multiplicity-difference", choices=("1", "none"), default="1",
+                     help="Maximum regional multiplicity difference; none uses independent regional supports.")
     fit.add_argument(
         "--max-major-cn", type=int, default=DEFAULT_MAX_MAJOR_CN,
         help="Explicit restricted-population CN ceiling; default retains all valid integer CN.",
@@ -44,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--run-manifest-id", help="External execution record identifier; no source scan is performed.")
     fit.add_argument("--version", action="version", version=__version__)
     workflow = subparsers.add_parser("workflow", allow_abbrev=False,
-                                    help="Run reference-preserving Protocol 2.4 from an explicit v6 JSON plan.")
+                                    help="Run Protocol 2.5 from an explicit v7 JSON plan.")
     workflow.add_argument("--plan", required=True)
     workflow.add_argument("--output-dir", required=True)
     assign = subparsers.add_parser("assign", allow_abbrev=False,
@@ -81,7 +83,8 @@ def _fit_config_from_args(args: argparse.Namespace) -> FitConfig:
     return resolve_fit_config(device=args.device,
                               max_major_cn=args.max_major_cn, max_clusters=args.max_clusters,
                               cpu_threads=args.cpu_threads, audit_scope=args.audit_scope,
-                              fit_multiplicity=args.fit_multiplicity)
+                              fit_multiplicity=args.fit_multiplicity,
+                              max_multiplicity_difference=(None if args.max_multiplicity_difference == "none" else 1))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -109,9 +112,9 @@ def main(argv: list[str] | None = None) -> None:
         from .workflow import run_workflow
         plan_path = Path(args.plan).resolve()
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
-        if (plan.get("schema") != "clipp2.workflow.plan.v6"
+        if (plan.get("schema") != "clipp2.workflow.plan.v7"
                 or plan.get("protocol_version") != PROTOCOL_VERSION):
-            raise ValueError("Workflow requires plan.v6 with protocol_version='2.4'")
+            raise ValueError("Workflow requires plan.v7 with protocol_version='2.5'")
         extra = set(plan) - {"schema", "protocol_version", "input_path", "workflow_config", "accepted_stage_one", "accepted_stage_two", "run_build_manifest", "run_manifest_id"}
         if extra:
             raise ValueError(f"Unknown workflow plan fields: {sorted(extra)}")

@@ -139,7 +139,8 @@ def _offline_truth_checks(root, history, frame, collision):
     manifest = {key: job[key] for key in ('history_id', 'family', 'history_seed', 'dimensions')}
     manifest['history_content_id'] = history_content_id(history)
     (truth_dir / 'history_manifest.json').write_text(json.dumps(manifest))
-    paired = dict(schema='clipp2.paired-experiment.v6', protocol_version='2.4', status='complete',
+    paired = dict(schema='clipp2.paired-experiment.v7', protocol_version='2.5', status='complete',
+        max_multiplicity_difference=1, config=dict(fit=dict(max_multiplicity_difference=1)),
         original_mutation_ids=history.mutation_ids, region_ids=history.region_ids,
         run_manifest=prepare_run_manifest(catalog), arms={})
     configuration = attempt / 'configuration-1'

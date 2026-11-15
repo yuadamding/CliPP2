@@ -1,10 +1,8 @@
-"""CliPP2 emissions, conditional centers and joint reads/validity mixture score.
+"""CCF inference with latent, optionally coupled regional multiplicities.
 
-CCF, not cellular prevalence, is the fitting/geometry scale for every region.
-One shared emission primitive serves arrays, pilot grids and coordinate views.
-Mixed CN explicitly retains CliPP2's capped support, weighted denominator,
-clipped likelihood and original interior box. Assignment validity is observed
-jointly with reads; it is not conditioned away by renormalizing mixture weights.
+The joint model restricts each mutation's informative-region multiplicity range
+before initialization. Regional pooling supplies joint posterior pilots; group
+center refits, proposal columns and selection use the same fixed support.
 CUDA is an explicit float64 likelihood/host-forest path, never a CPU fallback;
 emissions and conditional centers share a native float64 numerical policy.
 Forest continuation and candidate selection remain on the host. CUDA weight
@@ -131,6 +129,20 @@ class PreparedGroup:
     tasks: tuple
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class GroupFit:
+    """A complete stationary group-vector fit, never a reusable coordinate."""
+
+    center: np.ndarray
+    log_likelihood: float
+    retained_initial: bool = False
+    iterations: int = 0
+    projected_gradient: float = 0.
+
+    def __post_init__(self):
+        object.__setattr__(self, "center", readonly_array(self.center))
+
+
 @dataclass(frozen=True)
 class JointColumnSet:
     """Call-owned immutable column handles; cache clearing cannot invalidate them.
@@ -209,6 +221,7 @@ class FitResult:
     fitting_log_likelihood: float | None = None
     fit_objective_id: str = "uniform_multiplicity_marginal_v1"
     selection_criterion_id: str = SELECTION_CRITERION
+    group_fits: tuple | None = None
 
     def __post_init__(self):
         if self.fitting_log_likelihood is None and self.fit_objective_id == "uniform_multiplicity_marginal_v1":
@@ -218,6 +231,8 @@ class FitResult:
             if value is not None:
                 object.__setattr__(self, name, readonly_array(value))
         object.__setattr__(self, "diagnostics", freeze_record(self.diagnostics))
+        if self.group_fits is not None:
+            object.__setattr__(self, "group_fits", tuple(self.group_fits))
 
     @property
     def labels(self):
@@ -231,9 +246,12 @@ class RegionalModel:
     """Immutable, canonically ordered informative mutation vectors."""
 
     def __init__(self, data, device="cpu", *, cpu_threads=None, multiplicity_support=None,
-                 fit_multiplicity="marginal", selection_criterion=SELECTION_CRITERION):
-        self.method_identity = freeze_record(fitting_identity(fit_multiplicity, selection_criterion))
+                 fit_multiplicity="marginal", selection_criterion=SELECTION_CRITERION,
+                 max_multiplicity_difference=1):
+        self.method_identity = freeze_record(fitting_identity(
+            fit_multiplicity, selection_criterion, max_multiplicity_difference))
         self.fit_multiplicity = fit_multiplicity
+        self.max_multiplicity_difference = max_multiplicity_difference
         self.data = data
         ids, regions = tuple(data.mutation_ids), tuple(data.region_ids)
         if any(not isinstance(x, str) for x in ids + regions):
@@ -251,7 +269,8 @@ class RegionalModel:
         self.exclusions = tuple({"mutation_id": ids[i], "reason": "no_informative_observations"}
                                 for i in np.flatnonzero(~observed.any(axis=1)))
         for name, value in prepare_observations(data, multiplicity_support,
-                rows=self.active_indices, regions=self.region_indices).items():
+                rows=self.active_indices, regions=self.region_indices,
+                max_multiplicity_difference=max_multiplicity_difference).items():
             setattr(self, name, value)
         self.n, self.r = self.observed.shape
         if not self.observed.any(axis=0).all():
@@ -260,6 +279,8 @@ class RegionalModel:
         self.region_purities = readonly_array(self.purity[0])
         self.multiplicity_support = multiplicity_support
         self.model_version = INTERVAL_MODEL_VERSION if self.multiplicity_restricted else MODEL_VERSION
+        if max_multiplicity_difference is not None:
+            self.model_version += "__joint_multiplicity_range_one_v1"
         digest = hashlib.sha256(self.model_version.encode())
         for values in (self.alt, self.depth, self.observed):
             digest.update(values.tobytes())
@@ -291,6 +312,7 @@ class RegionalModel:
         self.execution_backend = f"native_{self.backend.kind}_likelihood_host_forest"
         self._refits, self._columns, self._weight_results, self._preparations = (
             _BoundedCache() for _ in range(4))
+        self._pilot_cache = None
         self.telemetry = {"refit_cache_hits": 0, "scalar_refits": 0,
                           "likelihood_columns": 0,
                           "likelihood_column_requests": 0,
@@ -302,6 +324,8 @@ class RegionalModel:
                           "incumbent_equal_base_reuses": 0, "fused_incumbents": 0,
                           "unchanged_coordinate_reuses": 0,
                           "scalar_refit_seconds": 0.0, "weight_seconds": 0.0,
+                          "group_refits": 0, "group_refit_seconds": 0.,
+                          "unchanged_group_reuses": 0,
                           "weight_cache_hits": 0, "weight_cache_misses": 0,
                           "weight_solves": 0}
 
@@ -356,12 +380,41 @@ class RegionalModel:
         return self.view(region, rows).log_likelihood_columns(np.atleast_1d(values)).T
 
     def pilots(self):
+        if self._pilot_cache is not None:
+            return self._pilot_cache
         pilots, diagnostics = np.full((self.n, self.r), np.nan), {}
+        grids, weights = [], []
         for region in range(self.r):
             rows = np.flatnonzero(self.observed[:, region])
-            pilots[rows, region], diag = pooled_ccf_initialization(self.pilot_view(region, rows))
+            result = pooled_ccf_initialization(self.pilot_view(region, rows),
+                return_pool=self.max_multiplicity_difference is not None)
+            pilots[rows, region], diag = result[:2]
+            if self.max_multiplicity_difference is not None:
+                grid, weight = result[2:]
+                active = weight > 0
+                grids.append(grid[active])
+                weights.append(weight[active])
             diagnostics[self.region_ids[region]] = diag
-        return pilots, diagnostics
+        if self.max_multiplicity_difference is not None:
+            pooled = pilots.copy()
+            pilots, status = self.selection_backend.pooled_joint_pilots(grids, weights)
+            if np.any(~np.isin(status, (0, 1))):
+                raise NativeExecutionError("Joint posterior pilot integration failed")
+            fallback = status == 1
+            pilots[fallback] = (pooled[fallback] + .5) / 2
+            pilots[~self.observed] = np.nan
+            if not np.isfinite(pilots[self.observed]).all():
+                raise NativeExecutionError("Joint posterior pilots are nonfinite")
+            diagnostics["joint"] = dict(
+                method="joint_pooled_posterior_pilot_v1",
+                role="initialization_only_frozen_before_tree",
+                posterior_rows=int(np.count_nonzero(~fallback)),
+                interior_fallback_rows=int(np.count_nonzero(fallback)),
+                interior_fallback_mutation_ids=[self.mutation_ids[i] for i in np.flatnonzero(fallback)],
+                fallback_policy="half_pooled_plus_half_midpoint_v1",
+                max_multiplicity_difference=1)
+        self._pilot_cache = readonly_array(pilots), diagnostics
+        return self._pilot_cache
 
     def observation_keys(self):
         """ID-free scientific row signatures for deterministic proposal ties."""
@@ -575,6 +628,66 @@ class RegionalModel:
     def _cache_refit(self, key, fitted):
         self._refits[key] = fitted
 
+    def _fit_group_vectors(self, groups, incumbents=None, prepared_results=()):
+        """Fit complete regional vectors; cache membership and complete starts."""
+        groups = tuple(group if isinstance(group, PreparedGroup) else self.prepare_group(group)
+                       for group in groups)
+        lower, upper = np.empty((len(groups), self.r)), np.empty((len(groups), self.r))
+        for index, group in enumerate(groups):
+            for region in range(self.r):
+                task = self._coordinate_task(group, region)
+                lower[index, region], upper[index, region] = task.lower, task.upper
+        if incumbents is None:
+            initial = (lower + upper) / 2
+            if self._pilot_cache is not None:
+                pilot = self._pilot_cache[0]
+                for index, group in enumerate(groups):
+                    initial[index] = np.nanmean(pilot[group.members], axis=0)
+                initial = np.clip(initial, lower, upper)
+        else:
+            initial = np.asarray(incumbents, dtype=float)
+        if (initial.shape != lower.shape or not np.isfinite(initial).all()
+                or np.any(initial < lower) or np.any(initial > upper)):
+            raise ValueError("Joint group refits require finite centers within the group boxes")
+        results, pending, keys = [None] * len(groups), [], []
+        for index, group in enumerate(groups):
+            previous = None if not prepared_results else prepared_results[index]
+            if previous is not None and np.array_equal(initial[index], previous.center):
+                results[index] = previous
+                self.telemetry["unchanged_group_reuses"] += 1
+                continue
+            key = ("joint_group", self.identity, self.backend.policy, self.backend.identity,
+                   group.members.tobytes(), initial[index].tobytes())
+            cached = self._refits.get(key)
+            if cached is not None:
+                results[index] = cached
+                self.telemetry["refit_cache_hits"] += 1
+            else:
+                pending.append(index)
+                keys.append(key)
+        if pending:
+            started = time.perf_counter()
+            fitted = self.backend.refit_groups([groups[index].members for index in pending],
+                initial[pending], lower=lower[pending], upper=upper[pending])
+            self.telemetry["group_refit_seconds"] += time.perf_counter() - started
+            fitted_centers = np.asarray(fitted["centers"])
+            scores = np.asarray(fitted["log_likelihood"])
+            status = np.asarray(fitted["status"])
+            if fitted_centers.shape != (len(pending), self.r) or scores.shape != (len(pending),):
+                raise NativeExecutionError("Native group refit returned incomplete results")
+            if (np.any(status) or not np.isfinite(fitted_centers).all()
+                    or not np.isfinite(scores).all()
+                    or np.any(fitted_centers < lower[pending]) or np.any(fitted_centers > upper[pending])):
+                raise NativeExecutionError(f"Joint {self.fit_multiplicity} group refit failed: {status.tolist()}")
+            for local, (index, key) in enumerate(zip(pending, keys)):
+                value = GroupFit(fitted_centers[local], float(scores[local]),
+                    bool(fitted["retained_initial"][local]), int(fitted["iterations"][local]),
+                    float(fitted["projected_gradient"][local]))
+                results[index] = value
+                self._refits[key] = value
+                self.telemetry["group_refits"] += 1
+        return tuple(results)
+
     def _validate_centers(self, centers):
         """Validate only q-by-R metadata; do not construct an N-by-q mask."""
         centers = np.asarray(centers, dtype=float)
@@ -762,7 +875,8 @@ class RegionalModel:
         if partition.model_identity != self.identity:
             raise ValueError("Prepared partition belongs to another regional model")
         return self._refit_groups(partition.labels, partition.groups, initial_centers,
-                                  partition.coordinate_fits, partition.selection_columns, partition.membership,
+                                  (partition.group_fits if self.max_multiplicity_difference is not None
+                                   else partition.coordinate_fits), partition.selection_columns, partition.membership,
                                   progress_callback=progress_callback)
 
     def refit_prepared_batch(self, requests, *, max_active=8,
@@ -833,7 +947,8 @@ class RegionalModel:
                 if len(pending) >= max_active:
                     flush()
                 steps = self._refit_steps(partition.labels, partition.groups, centers,
-                    partition.coordinate_fits, partition.selection_columns, partition.membership,
+                    (partition.group_fits if self.max_multiplicity_difference is not None
+                     else partition.coordinate_fits), partition.selection_columns, partition.membership,
                     progress_callback=callback, record_weight_time=False)
                 open_steps.append(steps)
                 try:
@@ -922,14 +1037,23 @@ class RegionalModel:
             if initial_centers.shape != centers.shape:
                 raise ValueError("Initial centers must follow sorted occupied label order")
         penalty = float((q*self.r+q-1)*math.log(self.n))
+        coordinate_fits, group_fits = None, None
         try:
-            tasks = [(group, region) for group in groups for region in range(self.r)]
-            fitted, retained_initial, retained_flags = self._fit_coordinates(
-                tasks, None if initial_centers is None else initial_centers.ravel(),
-                None if not prior else [value for group in prior for value in
-                                        ([None] * self.r if group is None else group)],
-                return_details=True)
-            centers[:] = np.array([center for center, _ in fitted]).reshape(q, self.r)
+            if self.max_multiplicity_difference is not None:
+                group_fits = self._fit_group_vectors(groups, initial_centers, prior)
+                centers[:] = np.asarray([value.center for value in group_fits])
+                fitting_ll = math.fsum(value.log_likelihood for value in group_fits)
+                retained_initial = sum(value.retained_initial for value in group_fits)
+            else:
+                tasks = [(group, region) for group in groups for region in range(self.r)]
+                fitted, retained_initial, retained_flags = self._fit_coordinates(
+                    tasks, None if initial_centers is None else initial_centers.ravel(),
+                    None if not prior else [value for group in prior for value in
+                                            ([None] * self.r if group is None else group)],
+                    return_details=True)
+                centers[:] = np.array([center for center, _ in fitted]).reshape(q, self.r)
+                fitting_ll = math.fsum(value for _, value in fitted)
+                coordinate_fits = np.column_stack((fitted, retained_flags)).reshape(q, self.r, 3)
         except ScientificCandidateRejection as error:
             return FitResult(membership, centers, np.full(q, np.nan), -np.inf,
                                      -np.inf, penalty, np.inf, False, str(error),
@@ -937,7 +1061,6 @@ class RegionalModel:
                                      fitting_log_likelihood=-np.inf,
                                      fit_objective_id=self.method_identity["fit_objective_id"])
         centers = readonly_array(centers)
-        fitting_ll = math.fsum(value for _, value in fitted)
         columns = self.selection_column_set(centers, retained_columns=prior_columns)
         matrix = columns.materialize() if self.backend.kind == "cpu" else None
         conditional = math.fsum(matrix[np.arange(self.n), inverse] if matrix is not None
@@ -964,11 +1087,14 @@ class RegionalModel:
                                      "weight_optimality_gap": mixture["weight_optimality_gap"],
                                      "weight_active_score_gap": mixture["weight_active_score_gap"],
                                      "retained_initial_centers": retained_initial,
-                                     "scalar_global_optimality_certified": self.fit_multiplicity == "profile",
+                                     "scalar_global_optimality_certified": (self.fit_multiplicity == "profile"
+                                         and self.max_multiplicity_difference is None),
+                                     "group_vector_stationarity_checked": self.max_multiplicity_difference is not None,
+                                     "group_vector_global_optimality_certified": False,
                                      **dict(self.method_identity),
                                      "num_parameters": q*self.r+q-1,
                                      "score_definition": SCORE_DEFINITION},
-                                 coordinate_fits=np.column_stack((fitted, retained_flags)).reshape(q, self.r, 3),
+                                 coordinate_fits=coordinate_fits, group_fits=group_fits,
                                  fitting_log_likelihood=fitting_ll,
                                  fit_objective_id=self.method_identity["fit_objective_id"],
                                  selection_criterion_id=self.method_identity["selection_criterion_id"])

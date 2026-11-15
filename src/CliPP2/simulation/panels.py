@@ -93,20 +93,29 @@ def contributor_density_diagnostics(history, frame, config, *, densities=(0, 1, 
         write_tumor_txt(path, frame, frame.attrs['metadata'])
         catalog = load_original_catalog(path, max_major_cn=config.fit.max_major_cn, missing_counts=config.missing_counts)
     if not pool:
-        return dict(status='not_applicable_no_declared_source_pool', target_ids=targets, records=[])
+        return dict(status='not_applicable_no_declared_source_pool', target_ids=targets, records=[],
+                    max_multiplicity_difference=config.fit.max_multiplicity_difference)
     data = prepare_prediction(catalog, pool, device=config.fit.device, cpu_threads=config.fit.cpu_threads,
-                              normal_cn_policy=config.normal_cn_policy)
+                              normal_cn_policy=config.normal_cn_policy,
+                              max_multiplicity_difference=config.fit.max_multiplicity_difference)
     phi = history.phi[positions]
     with NativeBackend(data, cpu_threads=config.fit.cpu_threads) as backend:
-        diagnostic = backend.component_diagnostics(phi)
+        diagnostic = backend.joint_diagnostics(phi)
     if np.isin(diagnostic['status'], (2, 3)).any():
         raise ArithmeticError('Native source diagnostics failed')
     residual = profile_deviance_from_diagnostics(data, phi, diagnostic)
     calls = diagnostic['map_multiplicity']
     contributes = (data.observed & catalog.mapping_genuine[positions] & catalog.eligible[positions]
-                   & (phi > 0) & (diagnostic['status'] == 0) & np.isfinite(calls)
+                   & (phi > 0) & (diagnostic['status'][:, None] == 0) & np.isfinite(calls)
                    & (calls == np.floor(calls)) & (calls >= data.multiplicity_min)
                    & (calls < data.multiplicity_min + data.support))
+    gaps = np.full(phi.shape, np.nan)
+    for i, r in zip(*np.where(data.observed & np.isfinite(calls))):
+        selected = int(calls[i, r]-data.multiplicity_min[i, r])
+        maxima = diagnostic["conditional_max"][i][r]
+        alternatives = np.delete(maxima, selected)
+        if len(alternatives):
+            gaps[i, r] = maxima[selected]-np.max(alternatives)
     source_lookup = {mutation: i for i, mutation in enumerate(pool)}
     source_sets = {segment: tuple(m for m in pool if history.segment_ids[index[m], 0] == segment)
                    for segment in history.segment_keys}
@@ -123,7 +132,7 @@ def contributor_density_diagnostics(history, frame, config, *, densities=(0, 1, 
             local_targets = [index[m] for m in targets if history.segment_ids[index[m], 0] == segment]
             for r, region in enumerate(history.region_ids):
                 ids = [m for m in selected_ids if contributes[source_lookup[m], r]]
-                calls = [diagnostic['map_multiplicity'][source_lookup[m], r] for m in ids]
+                calls = [max(diagnostic['map_sets'][source_lookup[m]][r]) for m in ids]
                 truth = [history.multiplicity[index[m], r] for m in ids]
                 selected_truth = [history.multiplicity[index[m], r] for m in selected_ids]
                 truth_known = all(np.isfinite(value) for value in truth)
@@ -158,10 +167,11 @@ def contributor_density_diagnostics(history, frame, config, *, densities=(0, 1, 
             availability='limited_by_source_availability' if any(len(ids) < density for ids in source_sets.values()) else 'complete',
             selected_source_ids=[m for ids in selected.values() for m in ids], **totals, segment_audit=audits))
     return _plain(dict(status='complete', scope='controlled_true_center_available_calls_not_a_native_fit',
+        max_multiplicity_difference=config.fit.max_multiplicity_difference,
         target_ids=targets, source_pool_ids=pool, records=records,
         contributor_diagnostics=[dict(mutation_id=m, region_id=region,
             contributes_to_cap=bool(contributes[i, r]), map_probability=float(np.exp(diagnostic["map_log_probability"][i, r])),
-            map_score_gap=float(diagnostic["top_two_gap"][i, r]), profile_deviance=float(residual[i, r]))
+            map_score_gap=float(gaps[i, r]), profile_deviance=float(residual[i, r]))
             for i, m in enumerate(pool) for r, region in enumerate(history.region_ids)],
         notes='The target population is fixed across all densities; missing positive-carrier truth is not substituted.'))
 
@@ -188,9 +198,10 @@ def _scaling_case(path, config_values, mutations, regions, band, seed):
         support = catalog.default_bounds()
         observed = catalog.count_observed & (catalog.total_counts > 0) & catalog.eligible
         bundle = AssignmentBundle(catalog, reference, history.mutation_ids, (),
-            history.phi, np.where(observed, history.multiplicity, np.nan), support.lower, support.upper,
+            history.phi, np.where(observed & (history.phi > 0), history.multiplicity, np.nan), support.lower, support.upper,
             ('controlled_truth_reference',)*mutations, labels, labels, config.fit.device, config.fit.cpu_threads,
             run_manifest_id=os.environ.get("CLIPP2_RUN_MANIFEST_ID"),
+            max_multiplicity_difference=config.fit.max_multiplicity_difference,
             provenance=dict(scope='fixed_reference_assignment_scaling_no_fit'))
         prepared = perf_counter()
         result = assign_mutations(bundle)
@@ -234,7 +245,8 @@ def run_scaling(outdir, config, *, sizes=(1000, 5000, 20000), region_counts=(2, 
                     path.write_text(json.dumps(dict(status='failed', mutations=mutations, regions=regions,
                         cn_band=band, error_type='WorkerFailure', error='timeout or process exit', exitcode=process.exitcode))+'\n')
                 records.append(json.loads(path.read_text()))
-    report = dict(schema='clipp2.simulation-scaling.v2', status='complete' if all(row['status'] == 'complete' for row in records) else 'partial_failure',
+    report = dict(schema='clipp2.simulation-scaling.v3', status='complete' if all(row['status'] == 'complete' for row in records) else 'partial_failure',
+        max_multiplicity_difference=config.fit.max_multiplicity_difference,
         records=records, fits=0, assignment_passes=sum(row['status'] == 'complete' for row in records),
         memory_measurement='fresh-worker process peak RSS; includes preparation, Python results and native allocations')
     (outdir / 'scaling_summary.json').write_text(json.dumps(report, allow_nan=False)+'\n')
