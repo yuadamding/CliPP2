@@ -1,13 +1,7 @@
 # Examples
 
-Fit the six-mutation, two-region example from the repository root:
-
-```sh
-clipp2 fit --input-dir examples/tumor --max-clusters 3 --output-dir results/example-fit
-```
-
-For the complete three-stage workflow, save this as `plan.json` in the repository
-root. Input paths are relative to the plan file:
+Run the six-mutation, two-region example from the repository root. Save this as
+`plan.json`; input paths are relative to the plan file:
 
 ```json
 {
@@ -24,16 +18,20 @@ Set `fit.max_multiplicity_difference` to `null` for independent regional
 multiplicities, or `stage_three_assignment_method` to `"profile"` for profile
 assignment. See the [workflow definition](../docs/workflow_protocol_2_5.md).
 
-Run the workflow, then replay its frozen Stage 3 request:
+Run all three stages in a new output directory:
 
 ```sh
 clipp2 workflow --plan plan.json --output-dir results/workflow25
-clipp2 assign --bundle results/workflow25/assignment_bundle.json --output-dir results/replayed-assignment
 ```
 
-Each command uses a new output directory. The [`tumor/`](tumor/) fixture has
+Both fitting stages use a fresh A initializer followed by B mixture fitting;
+Stage 2 uses caps recomputed from Stage 1's B result. Saved fits cannot be replayed.
+The [`tumor/`](tumor/) fixture has
 `snv.txt`, `cna.txt`, and `purity.txt` in each region, with explicit normal CN.
-Pass `examples/tumor/region1` for a single-region fit.
+Set `input_path` to `examples/tumor/region1` for a single-region workflow, or to
+a canonical TSV for the other supported input format. The only optional
+top-level plan field is `run_manifest_id`; saved-fit and build-manifest fields
+are rejected.
 
 Missing regional SNVs are filled automatically with ALT=0 and REF equal to the
 region's median observed positive depth. Raw observations remain in the input

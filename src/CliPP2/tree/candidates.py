@@ -7,7 +7,7 @@ from types import MappingProxyType
 import numpy as np
 
 from ..kernel.model import FitResult
-from ..kernel.topology import (FrozenTree, LabelOrder, Membership, PreparedPartition,
+from ..kernel.topology import (LabelOrder, Membership, PreparedPartition,
                                canonical_partition, partition_from_cuts)
 
 
@@ -405,85 +405,3 @@ class CandidateBank:
             memberships.add(membership)
         flush()
         return results
-
-    def compact_attempt_links(self):
-        """Bind every refit attempt to its retained state using immutable keys."""
-        return tuple((key[0], candidate is not None,
-                      None if candidate is None else candidate.state_index)
-                     for key, candidate in self._attempts.items())
-
-
-def _membership_size(tree, key):
-    kind, value = key
-    if kind == "tree":
-        if (not isinstance(value, tuple) or any(type(edge) is not int or
-                not 0 <= edge < len(tree.edges) for edge in value)
-                or tuple(sorted(set(value))) != value):
-            raise ValueError("Candidate bank has invalid tree cuts")
-        return len(value)+1
-    if kind != "general" or not isinstance(value, bytes) or len(value) != 8*tree.n:
-        raise ValueError("Candidate bank has invalid general membership")
-    labels = np.frombuffer(value, dtype=np.int64)
-    q = len(np.unique(labels))
-    if list(dict.fromkeys(labels.tolist())) != list(range(q)):
-        raise ValueError("Candidate bank must retain canonical occupied memberships")
-    return q
-
-
-def validate_candidate_bank(tree, candidates, selected, attempt_links=None):
-    """Audit retained objects directly; no export, decoding or refit execution."""
-    if not isinstance(tree, FrozenTree):
-        raise ValueError("Candidate bank requires a validated immutable FrozenTree")
-    if not candidates or not any(candidate is selected for candidate in candidates):
-        raise ValueError("Selected fitted state is absent from the complete candidate bank")
-    memberships, region_count = [], None
-    for index, candidate in enumerate(candidates):
-        fit, membership = candidate.fit, candidate.fit.membership
-        if (not isinstance(membership, Membership) or
-                (membership.tree is not None and membership.tree is not tree
-                 and membership.tree.identity != tree.identity)):
-            raise ValueError("Candidate belongs to a different frozen tree")
-        key = membership.key
-        q = _membership_size(tree, key)
-        centers, weights = np.asarray(fit.centers), np.asarray(fit.weights)
-        if (centers.ndim != 2 or centers.shape[0] != q or not centers.shape[1]
-                or not np.isfinite(centers).all() or np.any(centers < 0) or np.any(centers > 1)):
-            raise ValueError("Candidate bank needs finite q-by-R CCF centers in [0,1]")
-        if region_count is None:
-            region_count = centers.shape[1]
-        elif centers.shape[1] != region_count:
-            raise ValueError("Candidate bank mixes different region counts")
-        if (weights.shape != (q,) or not np.isfinite(weights).all() or np.any(weights <= 0)
-                or not np.isclose(weights.sum(), 1., rtol=0., atol=1e-12)):
-            raise ValueError("Candidate bank has invalid occupied weights")
-        penalty = float((q*region_count+q-1)*np.log(tree.n))
-        score = -2*float(fit.mixture_log_likelihood)+penalty
-        if (fit.eligible is not True or not np.isfinite(score)
-                or not np.isfinite(fit.conditional_log_likelihood)
-                or not np.isclose(penalty, fit.complexity_penalty, atol=1e-7, rtol=1e-10)
-                or not np.isclose(score, fit.score, atol=1e-7, rtol=1e-10)):
-            raise ValueError("Candidate bank score arithmetic is inconsistent")
-        if candidate.state_index is not None and (type(candidate.state_index) is not int
-                                                  or candidate.state_index != index):
-            raise ValueError("Retained fitted-state index disagrees with candidate order")
-        memberships.append(key)
-    if attempt_links is not None:
-        retained = set()
-        for key, eligible, index in attempt_links:
-            _membership_size(tree, key)
-            if type(eligible) is not bool:
-                raise ValueError("Refit attempt eligibility must be explicit")
-            if not eligible:
-                if index is not None:
-                    raise ValueError("A rejected refit attempt cannot reference an eligible state")
-                continue
-            if type(index) is not int or not 0 <= index < len(candidates):
-                raise ValueError("An eligible refit attempt is missing its retained fitted state")
-            if key != memberships[index]:
-                raise ValueError("Refit attempt and retained fitted-state memberships disagree")
-            retained.add(index)
-        if retained != set(range(len(candidates))):
-            raise ValueError("Candidate bank contains fitted states without an eligible refit attempt")
-    if selected is not min(candidates, key=score_key):
-        raise ValueError("Selected fit is not the best complete-bank score and tie-break")
-    return selected

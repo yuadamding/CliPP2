@@ -17,87 +17,72 @@ this consolidated reference set. Native fit records remain unchanged as provenan
 
 Cluster limits default to **10 for Stage 1 and 20 for Stage 2**. Valid integer CN
 has no automatic eligibility ceiling. Explicit input exclusions, model-domain
-checks and numerical verification remain. New Stage 1–2 fits start directly
-from observation-derived seeds and jointly optimize marginal-mixture centers
-and weights, without tree search or an accepted-fit initializer. Every distinct
-converged start enters the BIC comparison. Exactly identical centers are
-consolidated; distinct positive-weight components remain even when no mutation
-has that component as its MAP label. Labels do not trigger a hard center refit.
+checks, optimizer convergence and candidate-bank checks remain. Each fitting
+stage first runs **A**, the recurring conditional tree/general-partition search,
+on that stage's observations and support, then uses its fitted state to initialize
+**B**, joint marginal-mixture optimization of centers and weights. Stage 1's B
+result determines the provisional source and caps; Stage 2 runs a fresh A→B fit
+on the recomputed population and support. Every distinct converged B start enters
+the BIC comparison. Exactly identical centers are consolidated; distinct
+positive-weight components remain even when no mutation has that component as
+its MAP label. Labels do not trigger a hard center refit.
 The bounded birth/transfer/merge/split–merge search is not a local- or
 global-optimality certificate.
 Package **2.2.0** implements scientific protocol **2.5**. The
 [protocol specification](docs/workflow_protocol_2_5.md) defines the likelihood,
-BIC, multiplicity constraints, and saved-state contracts.
+BIC, multiplicity constraints, and output contracts.
 
 ## Install and run
 
-Fitting requires Python 3.10+ and a C++17 compiler. CPU is the default backend:
+Requires Python 3.10+ and a C++17 compiler. Run the complete workflow from a JSON
+plan; see the [runnable example](examples/README.md):
 
 ```sh
 python -m pip install .
-clipp2 fit --input-dir examples/tumor --max-clusters 3 --output-dir results/example-fit
+clipp2 workflow --plan PLAN.json --output-dir OUTPUT
 ```
 
-The [examples](examples/README.md) also show the plan for a complete three-stage
-workflow. Its outputs include native Stage 1/2 fits, provisional-source provenance, clonal-reference merging, segment caps,
-reference vectors, method-specific scores, MAP tie sets and raw diagnostics.
+This is the only command. Each run starts Stage 1 and Stage 2 afresh; saved fits
+cannot be supplied for replay. The plan uses schema `clipp2.workflow.plan.v7`,
+protocol `2.5`, `input_path`, `workflow_config`, and optional `run_manifest_id`.
+Input paths are relative to the plan. Saved-fit and build-manifest fields are
+rejected. Use a new output directory for each run.
+
+Outputs include native Stage 1/2 provenance records, clonal-reference merging,
+segment caps, reference vectors, method-specific scores, MAP tie sets and raw diagnostics.
 Marginal assignment also reports cluster posterior probabilities; profile does not.
 `all_original_mutations.tsv` retains every mutation and its final assignment or
 unassigned status. Eligible targets without informative reads have a `prior_only` vector
 and no data-supported final label; all-impossible candidates instead yield
-`model_incompatible` with no posterior. Use a new output directory for each run.
-
-| Operation | Command |
-| --- | --- |
-| Three-stage method | `clipp2 workflow --plan PLAN.json --output-dir OUTPUT` |
-| Standalone native fit | `clipp2 fit --input-file INPUT.tsv --output-dir OUTPUT` |
-| Input audit | `clipp2 audit-input --input-file INPUT.tsv --output AUDIT.json` |
-| Frozen-reference reassignment | `clipp2 assign --bundle BUNDLE.json --output-dir OUTPUT` |
-
-The **CPU-only saved-population comparison** command uses the same soft-mixture
-optimizer with independently validated saved marginal centers as its initializer:
-
-```sh
-clipp2 experiment-mixture --catalog RUN/original_catalog.json \
-  --accepted-fit RUN/stage_two_accepted.json --output experiment.json
-```
-
-It preserves the saved population and support and independently verifies its
-selected mixture before publication. Its experimental JSON is not an accepted
-production fit and cannot replace a workflow `AcceptedFit`. Ordinary `fit` and
-`workflow` do not require this command or a saved fit. Better likelihood or BIC
-does not establish better biological accuracy or CUDA qualification.
+`model_incompatible` with no posterior.
 
 Stage 3 defaults to **marginal** likelihood. Set
 `workflow_config.stage_three_assignment_method` to `"profile"` to maximize the
-joint binomial likelihood over admissible multiplicity vectors. For a frozen request,
-use `clipp2 assign --assignment-method profile`. A method change creates a new request identity and saves the
-executed bundle with its outputs. Profile ties retain the baseline when it is a
+joint binomial likelihood over admissible multiplicity vectors. The method is
+bound in the saved Stage 3 bundle. Profile ties retain the baseline when it is a
 maximizer; otherwise the lowest label wins. Profile scores are not cluster
 posteriors.
 
-New standalone and Stage 1–2 fits currently require **CPU** and
-**`fit_multiplicity="marginal"`**. Requests for CUDA or profile fitting fail
-explicitly; there is no silent CPU fallback or substitution of the legacy
-tree-based estimator. CPU execution requires neither CUDA nor PyTorch.
-Complete historical accepted fits retain their original algorithm, fitting
-objective and execution provenance during numerical replay; this does not
-authorize a new CUDA/profile fit. Stage 3's separate **profile assignment**
-remains supported. See the
+Stage 1–2 fits require **CPU** and **`fit_multiplicity="marginal"`**.
+Requests for CUDA or profile fitting fail
+explicitly; there is no silent CPU fallback or A-only substitution. CPU execution
+requires neither CUDA nor PyTorch. Stage 3's separate **profile assignment**
+remains supported. Better likelihood or BIC does not establish better biological
+accuracy or CUDA qualification. See the
 [numerical contract](docs/workflow_protocol_2_5.md#joint-likelihood-and-numerical-implementation).
 
-`FitConfig.max_multiplicity_difference` defaults to `1`; use `None` in Python, `null` in JSON,
-or `--max-multiplicity-difference none` for the independent regional model.
-Only `1` and `None` are implemented. A region participates according to its
-resolved positive-depth observation mask, including imputed observations, even
+`workflow_config.fit.max_multiplicity_difference` defaults to `1`; set it to
+`null` for the independent regional model. Only these settings are implemented.
+A region participates according to its resolved positive-depth observation
+mask, including imputed observations, even
 when its fitted CCF is zero. The corresponding public multiplicity is then NA
 and it cannot donate a Stage 2 cap. This fixed latent support is stronger than
 a restriction limited to mutation-bearing regions.
 
 ## Inputs and outputs
 
-Use a canonical TSV (`--input-file`, gzip supported) or a tumor directory
-(`--input-dir`) with `snv.txt`, `cna.txt`, and `purity.txt` in each region folder.
+Set the plan's `input_path` to a canonical TSV (gzip supported) or a tumor
+directory with `snv.txt`, `cna.txt`, and `purity.txt` in each region folder.
 See the [runnable examples](examples/README.md).
 
 | Canonical TSV fields | Meaning |
@@ -143,37 +128,36 @@ informative regions, let `B=min(M)`. Joint mode retains `L*=min(lower,B+1)`,
 sets `q=max(1,max(L*)-1)`, and uses `U*=max(raw_cap,L*,q)`; Stage 1's raw cap is
 `M`. This prioritizes original CN ceilings, the joint range rule, read floors,
 then donor caps. Independent mode retains the original floor/cap rule.
-Explicit support TSVs are hard constraints and incompatible joint supports fail
-validation. Stage 3 restores `1..M` together with the same joint range rule.
+Stage 3 restores `1..M` together with the same joint range rule.
 
 CN and normal-CN provenance must be explicit. Regional files may supply
 `normal_cn` in their CNA table; an omitted normal CN requires an explicit
-`--normal-cn-policy diploid` for fitting, or `normal_cn_policy` in the workflow
-plan. Non-diploid normal CN remains supported.
+`"normal_cn_policy": "diploid"` in `workflow_config`. Non-diploid normal CN
+remains supported.
 
 Missing pairs (`count_observed=0`, or an SNV absent from a region's list) default
 to **ALT=0 and REF=the region's median total read count** among eligible,
 originally observed positive-depth pairs (half-read ties round up). This happens
-automatically in fits and workflows, including when an explicitly missing row
+automatically in the workflow, including when an explicitly missing row
 contains counts. Medians are computed separately for each region, before
 imputation or fitting, and reused by all stages. If a region has no usable
 observed depth, input validation fails. This is an **absence
 assumption**, not measured evidence: raw rows and imputation records are retained
 in workflow catalogs. Explicit exclusions and observed zero-depth pairs stay
-unchanged. To keep missing pairs uninformative, use `--missing-counts unobserved`
-for a fit or `"missing_counts": "unobserved"` in the workflow config.
+unchanged. To keep missing pairs uninformative, set
+`"missing_counts": "unobserved"` in `workflow_config`.
 
-Standalone fitting publishes the same three tables: mutation clusters, cluster
-centers, and regional multiplicity calls. Output schema **17** retains every
+Each native fitting stage publishes mutation clusters, cluster centers, and
+regional multiplicity calls. Output schema **17** retains every
 positive mixture component in the centers table, including `cluster_size=0`
 for components without MAP members. Component count and occupied MAP-group
 count are distinct; BIC uses the former. Fitting uses the original CN denominator
 even when multiplicity support is restricted. Stage 3 restores that original
 support for every fitted mutation. An explicit
-`--max-major-cn` selects a separately identified restricted population; the
-default retains all valid integer CN. Input audits report missing CN/purity and
-mapping problems without filling absent CN/purity, and report read imputations
-without modifying source files.
+`workflow_config.fit.max_major_cn` selects a separately identified restricted
+population; the default retains all valid integer CN. Input validation rejects
+missing CN/purity and mapping problems without filling absent CN/purity or
+modifying source files. Stage 1/2 records are provenance, not replay inputs.
 
 ## Contact
 

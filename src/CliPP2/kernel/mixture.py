@@ -600,24 +600,10 @@ def _mixture_proposals(model, parent, pilot, max_clusters):
         yield from (proposal for proposal in group if proposal is not None)
 
 
-def _observation_seeds(model, max_clusters, pilot):
-    """Deterministic observed-data starts; no tree, partition or accepted fit."""
-    observed = np.isfinite(pilot)
-    means = np.divide(np.where(observed, pilot, 0.).sum(axis=0), observed.sum(axis=0),
-                      out=np.full(model.r, .5), where=observed.any(axis=0))
-    points = np.where(observed, pilot, means)
-    yield means[None, :]
-    if max_clusters >= 2 and len(points) >= 2:
-        first = int(np.argmax(np.sum((points-means)**2, axis=1)))
-        second = int(np.argmax(np.sum((points-points[first])**2, axis=1)))
-        if not np.array_equal(points[first], points[second]):
-            yield points[[first, second]]
-
-
-def search_marginal_mixture(model, initial_fits=None, *, max_clusters, proposal_budget=32,
+def search_marginal_mixture(model, initial_fits, *, max_clusters, proposal_budget=32,
                             max_iterations=2000, gradient_tolerance=1e-5,
                             progress_callback=None):
-    """Bounded experimental birth/merge/split-merge search over mixture fits.
+    """Bounded birth/merge/split-merge search from explicit A-fitted seeds.
 
     Seeds may be center arrays or objects with ``centers`` and ``weights``.
     Proposal centers are pilot means, never conditional hard-partition refits.
@@ -629,16 +615,17 @@ def search_marginal_mixture(model, initial_fits=None, *, max_clusters, proposal_
     if (isinstance(max_clusters, bool) or int(max_clusters) != max_clusters or max_clusters < 1
             or isinstance(proposal_budget, bool) or int(proposal_budget) != proposal_budget
             or proposal_budget < 0):
-        raise ValueError("Experimental mixture search requires positive K and nonnegative proposal budget")
+        raise ValueError("Mixture search requires positive K and nonnegative proposal budget")
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable or None")
+    if initial_fits is None:
+        raise ValueError("Mixture search requires explicit initial fits")
+    seeds = tuple(initial_fits)
+    if not seeds:
+        raise ValueError("Mixture search requires at least one center seed")
     started = perf_counter()
     pilot, _ = model.pilots()
     _record(model, "pilot_seconds", perf_counter()-started)
-    direct = initial_fits is None
-    seeds = tuple(_observation_seeds(model, max_clusters, pilot) if direct else initial_fits)
-    if not seeds:
-        raise ValueError("Experimental mixture search requires at least one center seed")
     bank, failures, seen = [], [], set()
     frontier, scheduled = deque(), set()
     attempted, expanded = 0, 0
@@ -680,7 +667,7 @@ def search_marginal_mixture(model, initial_fits=None, *, max_clusters, proposal_
             raise ValueError("Initial mixture seed exceeds max_clusters")
         admit(centers, getattr(seed, "weights", None), "seed")
     if not bank:
-        raise MixtureConvergenceError(f"All experimental mixture seeds failed: {failures}")
+        raise MixtureConvergenceError(f"All mixture seeds failed: {failures}")
     while frontier and attempted < proposal_budget:
         parent, proposals = frontier.popleft()
         if proposals is None:
@@ -704,7 +691,7 @@ def search_marginal_mixture(model, initial_fits=None, *, max_clusters, proposal_
                          proposal_quantum=1, expanded_states=expanded,
                          remaining_frontier_states=len(frontier),
                          candidate_count=len(bank), estimator="joint_marginal_mixture",
-                         initialization="prepared_observations_no_tree" if direct else "explicit_saved_initializers",
+                         initialization="explicit_initializers",
                          all_converged_starts_retained=True,
                          work={name:value for name,value in model.telemetry.items()
                                if name.startswith("mixture_") or name.startswith("weight_")},

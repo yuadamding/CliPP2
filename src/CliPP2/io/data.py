@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, field, fields
 import hashlib
 import json
 from types import MappingProxyType
@@ -452,19 +452,6 @@ class OriginalCatalog(ImmutableArrayRecord):
 
     def to_dict(self):
         return dict(self._payload(), content_hash=self.content_hash)
-
-    def compatible_source_identities(self, original_max_major_cn):
-        """Recognize equivalent CN cutoff policies without expanding a saved fit.
-
-        The original cutoff must select exactly the current pair population.
-        Source observations, biological arrays and provenance must match.
-        """
-        cutoff = validate_max_major_cn(original_max_major_cn)
-        old_mask = np.ones(self.major_cn.shape, dtype=bool) if cutoff is None else self.major_cn <= cutoff
-        if not np.array_equal(self.eligible, old_mask & ~self.input_excluded):
-            raise ValueError("Replay CN population differs from the original fitting population")
-        return frozenset((content_hash(self.to_dict()),
-                          content_hash(replace(self, max_major_cn=cutoff).to_dict())))
 
     @classmethod
     def from_dict(cls, payload):

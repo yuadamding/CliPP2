@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.special import logsumexp, xlogy
@@ -29,22 +29,6 @@ def _integer_tuple(values, name):
     if any(isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) for value in values):
         raise ValueError(f"{name} requires exact integers")
     return values
-
-
-def derive_assignment_bundle(source, *, assignment_method=None):
-    """Change a current request's method while retaining its observations and references."""
-    if type(source) is not AssignmentBundle:
-        raise TypeError("A current AssignmentBundle is required")
-    source.validated_payload()
-    method = source.assignment_method if assignment_method is None else assignment_method
-    validate_assignment_method(method)
-    if method == source.assignment_method:
-        return source
-    provenance = thaw_record(source.provenance, arrays_as_lists=True)
-    provenance = dict(provenance) if isinstance(provenance, Mapping) else {"original_provenance": provenance}
-    provenance["assignment_derivation"] = dict(source_bundle_hash=source.content_hash,
-        source_assignment_method=source.assignment_method, assignment_method=method)
-    return replace(source, assignment_method=method, provenance=provenance)
 
 
 @dataclass(frozen=True, slots=True)

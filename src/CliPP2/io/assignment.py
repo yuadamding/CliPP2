@@ -1,4 +1,4 @@
-"""Versioned frozen requests, accepted-fit receipts, and no-clobber outputs."""
+"""Versioned Stage 3 requests and no-clobber workflow outputs."""
 from __future__ import annotations
 
 import json
@@ -14,7 +14,7 @@ from scipy.special import gammaln, xlogy, xlog1py
 from ..assignment import (AssignmentBundle, AssignmentResult, POLICY_FIELDS,
                           REGIONAL_BASE_FIELDS, REGIONAL_POLICY_FIELDS, REASSESSMENT_OUTCOMES, EVIDENCE_STATUSES,
                           ASSIGNMENT_POLICIES)
-from .data import json_value as _json_value, content_hash
+from .data import json_value as _json_value
 from .reporting import MANIFEST_SCHEMA
 from .publication import publish_json
 from ..config import PROTOCOL_VERSION
@@ -40,34 +40,8 @@ def save_assignment_bundle(bundle, path):
     return _publish_json(path, dict(payload=payload, content_hash=bundle.content_hash))
 
 
-def load_assignment_bundle(path):
-    value = json.loads(Path(path).read_text(encoding="utf-8"))
-    if set(value) != {"payload", "content_hash"} or content_hash(value["payload"]) != value["content_hash"]:
-        raise ValueError("Frozen assignment bundle hash mismatch")
-    bundle = AssignmentBundle.from_dict(value["payload"])
-    if bundle.content_hash != value["content_hash"]:
-        raise ValueError("Frozen assignment bundle did not round-trip its content")
-    return bundle
-
-
 def save_original_catalog(catalog, path):
     return _publish_json(path, catalog.to_dict())
-
-
-def save_accepted_fit(fit, path):
-    from ..workflow import AcceptedFit
-    if type(fit) is not AcceptedFit:
-        raise TypeError("An AcceptedFit is required")
-    payload = fit.to_dict()
-    return _publish_json(path, dict(payload=payload, content_hash=content_hash(payload)))
-
-
-def load_accepted_fit(path):
-    from ..workflow import AcceptedFit
-    value = json.loads(Path(path).read_text(encoding="utf-8"))
-    if set(value) != {"payload", "content_hash"} or content_hash(value["payload"]) != value["content_hash"]:
-        raise ValueError("An intact full accepted-fit receipt is required; native TSVs alone are insufficient")
-    return AcceptedFit.from_dict(value["payload"])
 
 
 def write_supporting_table(path, records, *, columns=None):

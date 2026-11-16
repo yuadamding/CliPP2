@@ -1,45 +1,19 @@
 """Tree initialization and recurring general-partition exploration."""
 
 from dataclasses import dataclass
-from time import perf_counter
 
 import numpy as np
 
 from .proposals import refine_partition
 from ..config import DEFAULT_MAX_CLUSTERS
-from ..kernel import LEGACY_SEARCH_ALGORITHMS
 from .candidates import Candidate as Candidate, CandidateBank as _CandidateBank, score_key as _score_key
 from .policy import POLICY, SearchWork
 from ..kernel.topology import build_tree, canonical_partition, partition_from_cuts
-
-ALGORITHM = LEGACY_SEARCH_ALGORITHMS[0]
 
 
 @dataclass(eq=False)
 class TreeFit:
     selected: Candidate
-    candidate_bank: list
-    tree: object
-    pilot: np.ndarray
-    diagnostics: dict
-    attempt_links: tuple | None = None
-    attempt_outcomes: tuple | None = None
-
-    @property
-    def labels(self):
-        return self.selected.fit.labels
-
-    @property
-    def centers(self):
-        return self.selected.fit.centers
-
-    @property
-    def weights(self):
-        return self.selected.fit.weights
-
-    @property
-    def score(self):
-        return self.selected.score
 
 
 def _forest_structure(tree, cuts):
@@ -356,8 +330,6 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     continuation_batch_size = 4 if device_proposals else 1
     progress = None if progress_callback is None else ProgressReporter(model, progress_callback)
 
-    total_started = perf_counter()
-    telemetry_started = dict(model.telemetry)
     if isinstance(max_clusters, bool) or not isinstance(max_clusters, (int, np.integer)) or max_clusters < 1:
         raise ValueError("max_clusters must be a positive integer")
     max_clusters = int(max_clusters)
@@ -370,29 +342,22 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
                                  not 1 <= k <= min(max_clusters, model.n) for k in capacities):
             raise ValueError("capacities must contain valid requested cluster counts")
         capacities = tuple(sorted(set(map(int, capacities))))
-    times = {}
     if progress is not None:
         progress.start_phase("initialization")
-    started = perf_counter()
-    pilot, pilot_diagnostics = model.pilots()
-    times["initialization_seconds"] = perf_counter() - started
+    pilot, _ = model.pilots()
     if progress is not None:
         progress.emit(complete=True)
         progress.start_phase("tree")
-    started = perf_counter()
     tree = build_tree(pilot, model.observed, model.mutation_ids)
-    times["tree_seconds"] = perf_counter() - started
     if progress is not None:
         progress.emit(complete=True)
         progress.start_phase("continuation")
-    started = perf_counter()
     continuation = {} if continuation_batch_size == 1 else {"native_batch_size": continuation_batch_size}
     seeds = (generate_candidates(model, tree, pilot, capacities, keep_raw_phi=False, **continuation)
              if progress is None else generate_candidates(
                  model, tree, pilot, capacities, keep_raw_phi=False,
                  progress_callback=lambda operation: progress.completed_operation(None, None, operation),
                  **continuation))
-    times["continuation_seconds"] = perf_counter() - started
     if progress is not None:
         progress.emit(complete=True)
         progress.start_phase("candidate_search")
@@ -401,8 +366,7 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     bank = (_CandidateBank(model, tree, **bank_options) if progress is None else
             _CandidateBank(model, tree, progress=progress.completed_candidate,
                            request_progress=progress.completed_operation, **bank_options))
-    seeds_diagnostics, requested_seeds = [], set()
-    started = perf_counter()
+    requested_seeds = set()
     for index, seed in enumerate(seeds):
         cuts = tuple(sorted(map(int, seed["cuts"])))
         requested = int(seed["requested_k"])
@@ -418,38 +382,28 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
             "route": "native", "seed_index": index, "requested_k": requested,
             "occupied_q": len(cuts) + 1, "native_collapsed": len(cuts) + 1 < requested,
         }
-        seeds_diagnostics.append({**native, "cuts": cuts, "solver": seed["diagnostics"]})
         work.spend("native")
         bank.consider(cuts, labels, None, native)
     if requested_seeds != set(capacities):
         raise ValueError("Continuation did not return every requested capacity")
-    times["native_refits_seconds"] = perf_counter()-started
-    started = perf_counter()
-    repairs = [_repair_seed(model, tree, bank, seed, pilot, work) for seed in seeds]
-    times["support_repair_seconds"] = perf_counter()-started
-    started = perf_counter()
+    for seed in seeds:
+        _repair_seed(model, tree, bank, seed, pilot, work)
     if progress is not None:
         progress.emit(bank, complete=True)
         progress.start_phase("supplemental_search", bank)
-    supported_proposals = _add_supported_proposals(model, tree, bank, capacities, seeds, work)
-    times["supplemental_search_inclusive_seconds"] = perf_counter()-started
+    _add_supported_proposals(model, tree, bank, capacities, seeds, work)
     if progress is not None:
         progress.emit(bank, complete=True)
         progress.start_phase("coarsening", bank)
-    started = perf_counter()
-    frontier_counts, boundary_seconds = {}, 0.
     for q in range(min(max_clusters, model.n), 1, -1):
         # Freeze once at this q. General memberships never enter the tree beam.
         frontier = _tree_frontier(bank.tree_by_q.get(q, {}).values())
-        frontier_counts[q] = len(frontier)
         for parent in frontier:
-            boundary_started = perf_counter()
             advanced = refine_partition(model, tree, parent, bank.consider, prepare=bank.prepare,
                 max_proposals=POLICY.boundary_slots, device_proposals=device_proposals,
                 consume_slot=lambda: work.spend("boundary"))
             for candidate in advanced:
                 parent = candidate
-            boundary_seconds += perf_counter()-boundary_started
             children = []
             for removed in parent.cuts:
                 work.spend("coarsening")
@@ -458,8 +412,6 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
                     {"route": "bounded_coarsening", "parent_state_index": parent.state_index,
                      "parent_cuts": parent.cuts, "occupied_q": q-1, "removed_edge": removed}, None))
             bank.consider_independent(children)
-    times["coarsening_inclusive_seconds"] = perf_counter()-started
-    times["boundary_inclusive_seconds"] = boundary_seconds
     if progress is not None:
         progress.emit(bank, complete=True)
         progress.start_phase("reassignment", bank)
@@ -469,73 +421,16 @@ def fit_regions(model, max_clusters=DEFAULT_MAX_CLUSTERS, capacities=None, *, pr
     # Keep the tree baseline distinct from the complete legacy polish winner,
     # which expand_memberships preserves before recurring general exploration.
     bank.original_selected = bank.best_overall
-    original_count = len(bank.candidates)
     from .proposals import expand_memberships
-    reassignment = expand_memberships(model, bank, work=work)
+    expand_memberships(model, bank, work=work)
     bank.compact_payloads()
-    times["reassignment_inclusive_seconds"] = reassignment.get("seconds", 0.0)
     if progress is not None:
         progress.emit(bank, complete=True)
         progress.start_phase("selection", bank)
     selected = bank.best_overall
     if selected.score > bank.original_selected.score:
         raise AssertionError("Reassignment lost the original selected score")
-    unique_partitions = len(bank.by_cuts)
-    for candidate in bank.by_membership.values():
-        labels = candidate.fit.labels
-        cuts = tuple(np.flatnonzero(labels[tree.edges[:, 0]] != labels[tree.edges[:, 1]]))
-        if cuts not in bank.by_cuts or not np.array_equal(partition_from_cuts(tree, cuts), labels):
-            unique_partitions += 1
-    times["refit_and_score_seconds"] = bank.refit_seconds
-    times["bank_registration_seconds"] = bank.registration_seconds
-    times["fit_total_seconds"] = perf_counter() - total_started
-    for name in ("scalar_refit_seconds", "weight_seconds"):
-        if name in model.telemetry:
-            times[name] = model.telemetry[name] - telemetry_started.get(name, 0.0)
     if progress is not None:
         progress.requested_k, progress.occupied_q = max_clusters, len(selected.fit.centers)
         progress.emit(bank, complete=True)
-    # Count each retained label buffer once; this remains logical
-    # retained payload, not Python containers, numerical caches, or process RSS.
-    label_keys = {id(c.fit.membership.label_key): c.fit.membership.label_key
-                  for c in bank.candidates if c.membership_kind == "general"}
-    label_bytes = sum(map(len, label_keys.values()))
-    diagnostics = {
-        "diagnostics_schema_version": 5,
-        "pipeline": ALGORITHM,
-        "tree_identity": tree.identity, "tree_kind": "mutation_similarity_not_phylogeny",
-        "pilots": pilot_diagnostics, "seeds": seeds_diagnostics,
-        "capacities": capacities, "search_policy": POLICY.name, "search_work": work.summary(),
-        "support_repairs": repairs, "frontier_counts": frontier_counts,
-        "frontier_policy": "score_winner_then_uncovered_cuts_then_exact_score_key",
-        "supported_proposals": supported_proposals,
-        "reassignment": reassignment,
-        "original_tree_candidate_count": original_count,
-        "original_tree_selected_score": bank.original_selected.score,
-        "selected_membership_kind": selected.membership_kind,
-        "eligible_scored_candidates": len(bank.candidates),
-        "unique_eligible_partitions": unique_partitions,
-        "ineligible_candidate_count": len(bank.ineligible),
-        "ineligible_candidates": list(bank.ineligible.values()),
-        "general_ineligible_candidate_count": len(bank.general_rejections),
-        "unsupported_candidate_count": sum(str(entry["reason"]).startswith(
-            "unsupported_cluster_region") for entry in bank.ineligible.values()),
-        "unsupported_candidates": [entry for entry in bank.ineligible.values()
-                                   if str(entry["reason"]).startswith("unsupported_cluster_region")],
-        "duplicate_routes": bank.duplicate_routes, "timings": times,
-        "refit_calls": bank.refit_calls, "attempt_cache_hits": bank.attempt_cache_hits,
-        "structural_cache_hits": bank.structural_cache_hits,
-        "candidate_numeric_payload_bytes": label_bytes + sum(candidate.fit.centers.nbytes
-            + candidate.fit.weights.nbytes
-            + (0 if candidate.fit.coordinate_fits is None else candidate.fit.coordinate_fits.nbytes)
-            + (0 if candidate.fit.group_fits is None else
-               sum(group.center.nbytes + 32 for group in candidate.fit.group_fits))
-            + (8 * len(candidate.cuts) if candidate.membership_kind == "tree" else 0)
-            for candidate in bank.candidates),
-        "candidate_membership_storage": "tree_cuts_or_explicit_labels",
-        "selection": "minimum_over_complete_eligible_scored_bank",
-        "local_optimality_certified": False,
-        "global_optimality_certified": False,
-    }
-    return TreeFit(selected, bank.candidates, tree, np.asarray(pilot), diagnostics,
-                   bank.compact_attempt_links(), tuple(bank._outcome_records))
+    return TreeFit(selected)

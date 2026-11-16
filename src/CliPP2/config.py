@@ -59,10 +59,10 @@ def validate_assignment_method(value):
 
 
 def mixture_fitting_identity(selection=SELECTION_CRITERION, max_multiplicity_difference=1):
-    """Tree-free observed-mixture objective, distinct from legacy group refits."""
+    """Joint-mixture objective with fresh A initialization."""
     identity = fitting_identity("marginal", selection, max_multiplicity_difference)
     identity.update(fit_objective_id="observed_joint_marginal_mixture_v1",
-                    initialization_policy_id="observed_data_mixture_seeds_v1",
+                    initialization_policy_id="fresh_A_conditional_tree_search_v1",
                     scalar_refit_policy_id="soft_joint_em_stationary_v1")
     return identity
 
@@ -106,28 +106,9 @@ class FitConfig:
             raise ValueError("cpu_threads must be a positive int32 or None (auto).")
 
 
-def resolve_fit_config(
-    *, device: str = DEFAULT_DEVICE,
-    max_major_cn: int | None = DEFAULT_MAX_MAJOR_CN,
-    max_clusters: int = DEFAULT_MAX_CLUSTERS,
-    cpu_threads: int | None = None,
-    fit_multiplicity: str = "marginal",
-    selection_criterion: str = SELECTION_CRITERION,
-    max_multiplicity_difference: int | None = 1,
-) -> FitConfig:
-    """Construct the only public fit configuration; removed knobs raise TypeError."""
-    return FitConfig(device=device, max_major_cn=max_major_cn,
-                     max_clusters=max_clusters, cpu_threads=cpu_threads,
-                     fit_multiplicity=fit_multiplicity, selection_criterion=selection_criterion,
-                     max_multiplicity_difference=max_multiplicity_difference)
-
-
-__all__ = ["FitConfig", "resolve_fit_config"]
-
-
 @dataclass(frozen=True, slots=True)
 class WorkflowConfig:
-    """Current estimation policy; numerical verification remains mandatory."""
+    """Stage-specific search limits and the unchanged assignment policy."""
 
     fit: FitConfig = field(default_factory=lambda: FitConfig(
         device="cpu", max_clusters=DEFAULT_STAGE_ONE_MAX_CLUSTERS))
@@ -155,4 +136,4 @@ class WorkflowConfig:
         return cls(**values)
 
 
-__all__ += ["WorkflowConfig"]
+__all__ = ["FitConfig", "WorkflowConfig"]

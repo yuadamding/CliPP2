@@ -1,25 +1,21 @@
-"""Protocol 2.5 orchestration with frozen native fits and biological lineage.
-
-Biological/numerical identities and native build IDs are retained; file-byte
-and Python-source checksums are intentionally omitted.
-"""
+"""Protocol 2.5: fresh A-initialized B stages, cap reconstruction and reassignment."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
-from collections.abc import Mapping
+from dataclasses import asdict, dataclass, replace
 
 import numpy as np
 
 from .assignment import (AssignmentBundle, AssignmentReference, EVIDENCE_STATUSES,
                          assign_mutations, joint_distribution)
-from .config import (PROTOCOL_VERSION, WorkflowConfig,
+from .config import (PROTOCOL_VERSION, WorkflowConfig, mixture_fitting_identity,
                      STAGE_THREE_REFERENCE_POLICY, STAGE_TWO_CLONAL_MERGE_DISTANCE)
 from ._version import __version__
-from .io.data import (ImmutableArrayRecord, MultiplicityBounds, content_hash, freeze_record as _freeze,
+from .io.data import (ImmutableArrayRecord, MultiplicityBounds, content_hash,
                       json_value as _json_value, readonly_array)
 from .io.multiplicity import read_floor_bounds, reconcile_workflow_bounds
 from .io.tumor_txt import load_original_catalog
 from .kernel.backend import NativeBackend, NativeExecutionError
+from .kernel import ALGORITHM
 from .kernel.observations import prepare_prediction
 
 CONTRIBUTOR_COLUMNS = ("mutation_id", "region_id", "segment_id", "source_stage", "source_label",
@@ -43,28 +39,12 @@ ORIGINAL_COMPARISON_COLUMNS = ("mutation_id", "original_eligible", "original_inp
     "historical_cap_contributor_reassigned")
 
 
-def _biological_hash(catalog, mutation_ids):
-    positions = {mutation: i for i, mutation in enumerate(catalog.mutation_ids)}
-    rows = [positions[mutation] for mutation in mutation_ids]
-    payload = dict(schema="clipp2.accepted-biological-input.v3", tumor_id=catalog.tumor_id, biological_identity=catalog.biological_identity,
-        mutation_ids=mutation_ids, region_ids=catalog.region_ids,
-        **{key: getattr(catalog, key)[rows] for key in ("alt_counts", "total_counts", "count_observed",
-           "eligible", "major_cn", "minor_cn", "normal_cn", "total_cn", "purity",
-           "segment_ids", "mapping_genuine", "normal_cn_supplied")})
-    if catalog.input_excluded[rows].any():
-        payload["input_excluded"] = catalog.input_excluded[rows]
-    return content_hash(payload)
-
-
 @dataclass(frozen=True, slots=True)
-class AcceptedFit(ImmutableArrayRecord):
-    """Full-precision native estimates, actual support, and acceptance receipt.
-
-    Labels are public source labels. Merging never changes this record.
-    Import validation evaluates the existing estimates and never refits them.
-    """
+class StageFit(ImmutableArrayRecord):
+    """Immutable native stage estimates; not an import or replay contract."""
 
     source_id: str
+    tumor_id: str
     mutation_ids: tuple[str, ...]
     region_ids: tuple[str, ...]
     labels: np.ndarray
@@ -72,45 +52,13 @@ class AcceptedFit(ImmutableArrayRecord):
     weights: np.ndarray
     multiplicities: np.ndarray
     support: MultiplicityBounds
-    biological_hash: str
-    model_identity: str
     score: float
     conditional_log_likelihood: float
     mixture_log_likelihood: float
     complexity_penalty: float
-    acceptance_evidence: object
-    normalization: str | None = None
-    producer_receipt: object = None
-    compatibility_receipts: tuple = ()
-    biological_identity: object = None
-    protocol_version: str = PROTOCOL_VERSION
-    tumor_id: str = field(kw_only=True)
-    fitting_log_likelihood: float | None = field(default=None, kw_only=True)
-    method_identity: object = field(default=None, kw_only=True)
-    max_multiplicity_difference: int | None = field(default=1, kw_only=True)
+    max_multiplicity_difference: int | None = 1
 
     def __post_init__(self):
-        from .config import fitting_identity, mixture_fitting_identity
-        from .kernel import ALGORITHM
-        soft = isinstance(self.producer_receipt, Mapping) and self.producer_receipt.get("algorithm") == ALGORITHM
-        identity = (fitting_identity(max_multiplicity_difference=self.max_multiplicity_difference)
-                    if self.method_identity is None else dict(self.method_identity))
-        allowed = ((mixture_fitting_identity(max_multiplicity_difference=self.max_multiplicity_difference),) if soft else
-                   tuple(fitting_identity(method, max_multiplicity_difference=self.max_multiplicity_difference)
-                         for method in ("marginal", "profile")))
-        if identity not in allowed:
-            raise ValueError("Accepted fit requires a supported complete method identity")
-        object.__setattr__(self, "method_identity", _freeze(identity))
-        if self.fitting_log_likelihood is None:
-            if identity != fitting_identity(max_multiplicity_difference=self.max_multiplicity_difference):
-                raise ValueError("Profile accepted fits require an explicit fitting likelihood")
-            object.__setattr__(self, "fitting_log_likelihood", self.conditional_log_likelihood)
-        if not np.isfinite(self.fitting_log_likelihood):
-            raise ValueError("Accepted fitting likelihood must be finite")
-        from .io.tumor_txt import _safe_tumor_id
-        object.__setattr__(self, "tumor_id", _safe_tumor_id(self.tumor_id))
-        if self.protocol_version != PROTOCOL_VERSION:
-            raise ValueError("Accepted fit requires explicitly supported native-fit protocol evidence")
         object.__setattr__(self, "mutation_ids", tuple(self.mutation_ids))
         object.__setattr__(self, "region_ids", tuple(self.region_ids))
         n, r = len(self.mutation_ids), len(self.region_ids)
@@ -119,28 +67,20 @@ class AcceptedFit(ImmutableArrayRecord):
                 or labels.shape != (n,) or labels.dtype.kind not in "iu"
                 or centers.ndim != 2 or centers.shape[1] != r or not len(centers)
                 or np.any(labels < 0) or np.any(labels >= len(centers))
-                or (not soft and not np.array_equal(np.unique(labels), np.arange(len(centers))))
                 or not np.isfinite(centers).all() or np.any(centers < 0) or np.any(centers > 1)):
-            raise ValueError("Accepted fit requires valid source labels and finite native centers; legacy fits require occupied labels")
+            raise ValueError("Stage fit requires valid labels and finite native CCF centers")
         for name in ("labels", "centers", "weights", "multiplicities"):
-            object.__setattr__(self, name, readonly_array(getattr(self, name), dtype=np.int64 if name == "labels" else float))
-        if self.multiplicities.shape != (n, r) or self.weights.shape != (len(centers),):
-            raise ValueError("Accepted native parameters do not align with populations")
-        if not np.isfinite(self.weights).all() or np.any(self.weights <= 0) or not np.isclose(self.weights.sum(), 1, atol=1e-12, rtol=0):
-            raise ValueError("Accepted fit requires positive normalized component weights")
+            object.__setattr__(self, name, readonly_array(getattr(self, name),
+                dtype=np.int64 if name == "labels" else float))
+        if (self.multiplicities.shape != (n, r) or self.weights.shape != (len(centers),)
+                or not np.isfinite(self.weights).all() or np.any(self.weights <= 0)
+                or not np.isclose(self.weights.sum(), 1, atol=1e-12, rtol=0)):
+            raise ValueError("Stage fit requires aligned native calls and positive normalized weights")
         if tuple(self.support.mutation_ids) != self.mutation_ids or tuple(self.support.region_ids) != self.region_ids:
-            raise ValueError("Accepted support must be keyed to its exact fitted population")
-        normalization = identity["multiplicity_normalization_id"]
-        if self.normalization is None:
-            object.__setattr__(self, "normalization", normalization)
-        elif self.normalization != normalization:
-            raise ValueError("Saved fit uses an incompatible support normalization")
-        if not np.isfinite([self.score, self.conditional_log_likelihood, self.mixture_log_likelihood, self.complexity_penalty]).all():
-            raise ValueError("Accepted numerical evidence must be finite")
-        object.__setattr__(self, "acceptance_evidence", _freeze(self.acceptance_evidence))
-        object.__setattr__(self, "producer_receipt", _freeze(self.producer_receipt))
-        object.__setattr__(self, "compatibility_receipts", _freeze(self.compatibility_receipts))
-        object.__setattr__(self, "biological_identity", _freeze(self.biological_identity))
+            raise ValueError("Stage support must be keyed to its exact fitted population")
+        if not np.isfinite([self.score, self.conditional_log_likelihood,
+                            self.mixture_log_likelihood, self.complexity_penalty]).all():
+            raise ValueError("Stage fit numerical summaries must be finite")
 
     @property
     def phi(self):
@@ -148,208 +88,29 @@ class AcceptedFit(ImmutableArrayRecord):
 
     @property
     def state_fingerprint(self):
-        """Bind acceptance evidence to these exact public-ordered native values."""
-        names = ("tumor_id", "source_id", "mutation_ids", "region_ids", "labels", "centers", "weights",
-                 "multiplicities", "biological_hash", "model_identity", "score",
-                 "conditional_log_likelihood", "mixture_log_likelihood", "complexity_penalty", "normalization",
-                 "producer_receipt", "biological_identity", "protocol_version")
-        names += ("fitting_log_likelihood", "method_identity", "max_multiplicity_difference")
-        return content_hash(dict(schema="clipp2.accepted-state.v5", support_hash=self.support.content_hash,
-                                 **{name: getattr(self, name) for name in names}))
+        return content_hash(self.to_dict())
 
     def to_dict(self):
-        fields = ("tumor_id", "source_id", "mutation_ids", "region_ids", "labels", "centers", "weights",
-            "multiplicities", "biological_hash", "model_identity", "score", "conditional_log_likelihood",
-            "mixture_log_likelihood", "complexity_penalty", "acceptance_evidence", "normalization",
-            "producer_receipt", "compatibility_receipts", "biological_identity", "protocol_version")
-        fields += ("fitting_log_likelihood", "method_identity", "max_multiplicity_difference")
-        return _json_value(dict(schema="clipp2.accepted-fit.v5", **{k: getattr(self, k) for k in fields},
-                               support=self.support.to_dict()))
-
-    @classmethod
-    def from_dict(cls, value):
-        values = dict(value)
-        schema = values.pop("schema", None)
-        if (schema != "clipp2.accepted-fit.v5" or values.get("protocol_version") != PROTOCOL_VERSION
-                or not {"tumor_id", "fitting_log_likelihood", "method_identity", "max_multiplicity_difference", "normalization"} <= values.keys()):
-            raise ValueError("Replay requires a current accepted-fit.v5 receipt with explicit input and method identity")
-        values["support"] = MultiplicityBounds.from_dict(values["support"])
-        return cls(**values)
-
-    def validate_input_identity(self, catalog, original_config=None):
-        """Reject changed input content before any new search or numerical reuse."""
-        from .provenance import validate_fit_execution_receipt, validate_run_manifest
-        producer = self.producer_receipt
-        if self.tumor_id != catalog.tumor_id or content_hash(self.biological_identity) != content_hash(catalog.biological_identity):
-            raise ValueError("Saved fit belongs to different biological input identities")
-        manifest = producer.get("run_manifest")
-        validate_run_manifest(manifest, tumor_id=catalog.tumor_id, biological_identity=self.biological_identity)
-        if original_config is None:
-            original_config = validate_fit_execution_receipt(producer.get("fit_config"), producer.get("execution"),
-                                                             build=manifest.get("build"))
-        if manifest["input_identity"].get("original_catalog_identity") not in catalog.compatible_source_identities(original_config.max_major_cn):
-            raise ValueError("Saved run manifest belongs to different original input content")
-        if self.biological_hash != _biological_hash(catalog, self.mutation_ids):
-            raise ValueError("Saved denominators, masks, mapping, or observations differ")
-        return original_config
-
-    def validate(self, catalog, *, expected_ids=None, expected_support=None, device="cpu", cpu_threads=None, run_manifest_id=None):
-        """Retain the originating state with a separate current compatibility check.
-
-        Original execution evidence is preserved. Older summary/TSV formats are
-        not imported, and insufficient evidence never triggers optimization.
-        """
-        from .io.reporting import VERIFICATION_SCHEMA_VERSION, _verify_fitted_numerics
-        from .kernel.model import FitResult, RegionalModel
-        from .kernel.topology import Membership
-        from .provenance import resolve_current_run_manifest_id
-        from .kernel import ALGORITHM, COMPATIBLE_SEARCH_ALGORITHMS, KERNEL_VERSION
-        from .kernel.model import MODEL_VERSION, INTERVAL_MODEL_VERSION
-        run_manifest_id = resolve_current_run_manifest_id(run_manifest_id)
-        producer = self.producer_receipt
-        suffix = "__joint_multiplicity_range_one_v1" if self.max_multiplicity_difference == 1 else ""
-        model_versions = tuple(version + suffix for version in (MODEL_VERSION, INTERVAL_MODEL_VERSION))
-        if (not isinstance(producer, Mapping) or producer.get("schema") != "clipp2.fit-producer.v4"
-                or producer.get("protocol_version") != self.protocol_version
-                or producer.get("tumor_id") != self.tumor_id
-                or any(not isinstance(producer.get(key), str) or not producer[key]
-                       or producer[key] != producer[key].strip()
-                       for key in ("implementation_version", "algorithm", "model_version", "kernel_version", "model_identity"))
-                or producer.get("algorithm") not in COMPATIBLE_SEARCH_ALGORITHMS
-                or producer.get("kernel_version") != KERNEL_VERSION
-                or producer.get("model_version") not in model_versions
-                or content_hash(producer.get("biological_identity")) != content_hash(self.biological_identity)
-                or not isinstance(producer.get("fit_config"), Mapping)
-                or not isinstance(producer.get("execution"), Mapping)
-                or producer.get("model_identity") != self.model_identity):
-            raise ValueError("Saved fit lacks its original execution/configuration receipt")
-        original_config = self.validate_input_identity(catalog)
-        if producer.get("run_manifest_id") != producer["run_manifest"]["run_manifest_id"]:
-            raise ValueError("Original producer run manifest link differs from its input binding")
-        build = producer["run_manifest"].get("build")
-        from .config import fitting_identity, mixture_fitting_identity
-        soft = producer["algorithm"] == ALGORITHM
-        if soft != (producer["execution"].get("algorithm") == ALGORITHM):
-            raise ValueError("Producer algorithm and original optimizer execution differ")
-        identity = (mixture_fitting_identity(original_config.selection_criterion,
-                    original_config.max_multiplicity_difference) if soft else
-                    fitting_identity(original_config.fit_multiplicity, original_config.selection_criterion,
-                                     original_config.max_multiplicity_difference))
-        if self.method_identity != identity:
-            raise ValueError("Accepted fitting identity differs from its original configuration")
-        if (producer.get("method_identity") != identity
-                or producer.get("fitting_log_likelihood") != self.fitting_log_likelihood):
-            raise ValueError("Producer fitting identity or likelihood differs from accepted state")
-        if "normal_cn_policy" not in producer or producer["normal_cn_policy"] not in (None, "diploid"):
-            raise ValueError("Original fit lacks its explicit normal-CN assumption")
-        if len(self.centers) > original_config.max_clusters:
-            raise ValueError("Accepted component count exceeds the original search capacity")
-        if build is not None:
-            artifact = build["artifact"]
-            if (artifact["protocol_version"] != producer["protocol_version"]
-                    or artifact["implementation_version"] != producer["implementation_version"]):
-                raise ValueError("Original run/build manifest disagrees with producer execution identity")
-        if tuple(self.region_ids) != tuple(catalog.region_ids):
-            raise ValueError("Saved fit has different requested regions")
-        if expected_ids is not None and set(self.mutation_ids) != set(expected_ids):
-            raise ValueError("Saved fit population differs from the requested stage")
-        if expected_support is not None:
-            data = catalog.fit_data(self.mutation_ids, normal_cn_policy=producer["normal_cn_policy"])
-            numerical, accepted_support = expected_support.for_data(data), self.support.for_data(data)
-            if any(not np.array_equal(actual, expected) for actual, expected in zip(accepted_support, numerical)):
-                raise ValueError("Saved fit has different actual multiplicity support")
-        evidence = self.acceptance_evidence
-        if (not isinstance(evidence, Mapping) or evidence.get("independently_verified") is not True
-                or evidence.get("verification_schema_version") != VERIFICATION_SCHEMA_VERSION
-                or evidence.get("local_optimality_certified") is not False
-                or evidence.get("complete_candidate_bank_reconciled") is not True
-                or evidence.get("selected_fitted_state_retained") is not True):
-            raise ValueError("Saved fit lacks independent numerical and candidate-bank verification")
-        publication = producer.get("publication", {})
-        original_verification = publication.get("verification") if isinstance(publication, Mapping) else None
-        if (not isinstance(original_verification, Mapping) or content_hash(original_verification) !=
-                content_hash({key: value for key, value in evidence.items() if key != "accepted_state_hash"})):
-            raise ValueError("Saved acceptance evidence disagrees with its original producer receipt")
-        if evidence.get("accepted_state_hash") != self.state_fingerprint:
-            raise ValueError("Saved acceptance evidence is not bound to this exact fitted state")
-        model = RegionalModel(catalog.fit_data(self.mutation_ids, normal_cn_policy=producer["normal_cn_policy"]), device=device,
-                              cpu_threads=cpu_threads, multiplicity_support=self.support,
-                              fit_multiplicity=original_config.fit_multiplicity,
-                              selection_criterion=original_config.selection_criterion,
-                              max_multiplicity_difference=original_config.max_multiplicity_difference)
-        try:
-            if (model.mutation_ids != self.mutation_ids or model.identity != self.model_identity
-                    or model.model_version != producer["model_version"]):
-                raise ValueError("Saved model identity or canonical population order differs")
-            if soft:
-                from .kernel.mixture import MixtureFit
-                from .kernel.mixture_verification import verify_marginal_mixture
-                from .io.reporting import independent_log_columns
-                from scipy.special import logsumexp
-                columns = independent_log_columns(model, self.centers)
-                mass = columns + np.log(self.weights)
-                posterior = np.exp(mass - logsumexp(mass, axis=1)[:, None])
-                fit = MixtureFit(self.centers, self.weights, posterior, self.labels,
-                    self.mixture_log_likelihood, self.score, len(self.centers),
-                    len(np.unique(self.labels)), True, 0, {})
-                verified = verify_marginal_mixture(model, fit)
-                for key in ("fitting_log_likelihood", "conditional_log_likelihood", "complexity_penalty"):
-                    if not np.isclose(verified[key], getattr(self, key), atol=1e-7, rtol=1e-10):
-                        raise ValueError(f"Saved soft-mixture {key} differs from independent replay")
-            else:
-                fit = FitResult(Membership(explicit_labels=self.labels), self.centers, self.weights,
-                    self.conditional_log_likelihood, self.mixture_log_likelihood, self.complexity_penalty,
-                    self.score, True, fitting_log_likelihood=self.fitting_log_likelihood,
-                    fit_objective_id=self.method_identity["fit_objective_id"],
-                    selection_criterion_id=self.method_identity["selection_criterion_id"])
-                _verify_fitted_numerics(model, fit)
-            calls = model.multiplicity(self.phi)
-            if not np.array_equal(calls, self.multiplicities, equal_nan=True):
-                raise ValueError("Saved accepted multiplicities disagree with their native support/CCFs")
-            compatibility = dict(schema="clipp2.fit-compatibility.v4", protocol_version=PROTOCOL_VERSION,
-                max_multiplicity_difference=self.max_multiplicity_difference,
-                method_identity=dict(self.method_identity),
-                implementation_version=__version__, biological_identity=catalog.biological_identity,
-                tumor_id=self.tumor_id, run_manifest_id=run_manifest_id,
-                originating_run_manifest_id=producer.get("run_manifest_id"),
-                originating_native_fit_protocol=self.protocol_version, current_workflow_protocol=PROTOCOL_VERSION,
-                originating_search_algorithm=producer["algorithm"], current_search_algorithm=ALGORITHM,
-                accepted_state_hash=self.state_fingerprint, model_identity=model.identity,
-                execution=model.execution_diagnostics(), refitted=False,
-                checks="biological_inputs_support_native_calls_independent_score")
-        finally:
-            model.close()
-        return replace(self, compatibility_receipts=(*self.compatibility_receipts, compatibility))
+        names = ("source_id", "tumor_id", "mutation_ids", "region_ids", "labels", "centers",
+                 "weights", "multiplicities", "score", "conditional_log_likelihood",
+                 "mixture_log_likelihood", "complexity_penalty")
+        return _json_value(dict(schema="clipp2.stage-fit.v1", protocol_version=PROTOCOL_VERSION,
+            algorithm=ALGORITHM, method_identity=mixture_fitting_identity(
+                max_multiplicity_difference=self.max_multiplicity_difference),
+            replay_supported=False, **{name: getattr(self, name) for name in names},
+            fitting_log_likelihood=self.mixture_log_likelihood, support=self.support.to_dict()))
 
 
-def _fit_accepted(catalog, ids, bounds, outdir, stage, config, progress_callback, *, normal_cn_policy=None,
-                  run_manifest=None, run_manifest_id=None):
+def _fit_stage(catalog, ids, bounds, outdir, stage, config, progress_callback, *, normal_cn_policy=None):
     from .fit_execution import fit_prepared
-    if run_manifest is None:
-        from .provenance import prepare_run_manifest
-        run_manifest = prepare_run_manifest(catalog, run_manifest_id=run_manifest_id)
-    from .provenance import validate_run_manifest
-    if run_manifest_id is not None and run_manifest_id != run_manifest["run_manifest_id"]:
-        raise ValueError("Fit execution run manifest links disagree")
-    run_manifest_id = run_manifest["run_manifest_id"]
-    validate_run_manifest(run_manifest, tumor_id=catalog.tumor_id, biological_identity=catalog.biological_identity)
-    if run_manifest["input_identity"].get("original_catalog_identity") != content_hash(catalog.to_dict()):
-        raise ValueError("Run manifest does not identify this original input")
     callback = None if progress_callback is None else lambda record: progress_callback(dict(record, stage=stage))
-    execution = fit_prepared(catalog.fit_data(ids, normal_cn_policy=normal_cn_policy), outdir, config, multiplicity_support=bounds,
-        progress_callback=callback, run_manifest=run_manifest, run_manifest_id=run_manifest_id)
+    execution = fit_prepared(catalog.fit_data(ids, normal_cn_policy=normal_cn_policy), outdir, config,
+        multiplicity_support=bounds, progress_callback=callback)
     fit, order = execution.fit, execution.public_order
-    accepted = AcceptedFit(stage, execution.mutation_ids, execution.region_ids, execution.public_labels,
-        fit.centers[order], fit.weights[order], execution.multiplicities, execution.support,
-        _biological_hash(catalog, execution.mutation_ids), execution.summary["model_identity"], fit.score,
-        fit.conditional_log_likelihood, fit.mixture_log_likelihood, fit.complexity_penalty,
-        execution.summary["publication"]["verification"],
-        producer_receipt=execution.producer_receipt,
-        fitting_log_likelihood=fit.fitting_log_likelihood, method_identity=execution.summary["method_identity"],
-        biological_identity=catalog.biological_identity, tumor_id=catalog.tumor_id,
-        max_multiplicity_difference=config.max_multiplicity_difference)
-    return replace(accepted, acceptance_evidence=dict(accepted.acceptance_evidence,
-                                                     accepted_state_hash=accepted.state_fingerprint))
+    return StageFit(stage, catalog.tumor_id, execution.mutation_ids, execution.region_ids,
+        execution.public_labels, fit.centers[order], fit.weights[order], execution.multiplicities,
+        execution.support, fit.score, fit.conditional_log_likelihood,
+        fit.mixture_log_likelihood, fit.complexity_penalty, config.max_multiplicity_difference)
 
 
 def _diagnostics_many(catalog, ids, coordinates, bounds, config, calls=None):
@@ -641,23 +402,17 @@ def _stage_two_caps(catalog, audits, *, lower_bounds=None, max_multiplicity_diff
     return (*result, adjustments) if return_adjustments else result
 
 
-def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
-                 accepted_stage_one=None, accepted_stage_two=None, run_build_manifest=None, run_manifest_id=None):
-    """Run applicable stages or replay complete accepted-fit.v5 receipts.
-
-    Both native stages support explicit replay. Older API summaries/TSVs lack
-    the required producer evidence and are not imported or implicitly refitted.
-    """
-    from .io.assignment import (load_accepted_fit, publish_workflow_receipt, reserve_output,
-                                save_accepted_fit, save_assignment_bundle, save_original_catalog,
-                                write_supporting_table, _publish_json, publish_assignment)
+def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None, run_manifest_id=None):
+    """Fit both stages afresh, reconstruct reference caps and perform Stage 3."""
+    from .io.assignment import (publish_workflow_receipt, reserve_output, save_assignment_bundle,
+                                save_original_catalog, write_supporting_table, _publish_json,
+                                publish_assignment)
     if type(workflow_config) is not WorkflowConfig:
         raise TypeError("workflow_config must be a WorkflowConfig")
     if progress_callback is not None and not callable(progress_callback):
         raise TypeError("progress_callback must be callable")
-    if accepted_stage_one is None:
-        from .production import require_supported_production
-        require_supported_production(workflow_config.fit)
+    from .production import require_supported_production
+    require_supported_production(workflow_config.fit)
     config, output = workflow_config, reserve_output(outdir)
     common_receipt = dict(schema="clipp2.workflow.v7", protocol_version=PROTOCOL_VERSION,
         implementation_version=__version__, config=asdict(config),
@@ -695,7 +450,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         raise
     from .provenance import prepare_run_manifest
     try:
-        run_manifest = prepare_run_manifest(catalog, supplied=run_build_manifest, run_manifest_id=run_manifest_id)
+        run_manifest = prepare_run_manifest(catalog, run_manifest_id=run_manifest_id)
     except (TypeError, ValueError, OSError) as error:
         publish_workflow_receipt(output, dict(common_receipt, status="failed", failed_stage="provenance",
             error_type=type(error).__name__, error=str(error)))
@@ -703,17 +458,6 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
     _publish_json(output / "run_manifest.json", run_manifest)
     run_manifest_id = run_manifest["run_manifest_id"]
     common_receipt.update(run_manifest=run_manifest, run_manifest_id=run_manifest_id)
-    def replay_policy(value, stage, settings):
-        from .provenance import validate_replay_policy
-        accepted = value if isinstance(value, AcceptedFit) else load_accepted_fit(value)
-        if accepted.source_id != stage:
-            raise ValueError("Accepted receipt source stage does not match requested replay stage")
-        original = validate_replay_policy(accepted, settings, normal_cn_policy=config.normal_cn_policy)
-        accepted.validate_input_identity(catalog, original)
-        return accepted
-    def replay(accepted, ids, bounds, settings):
-        return accepted.validate(catalog, expected_ids=ids, expected_support=bounds,
-                                 device=settings.device, cpu_threads=settings.cpu_threads, run_manifest_id=run_manifest_id)
     informative = catalog.eligible & catalog.count_observed & (catalog.total_counts > 0)
     population = tuple(m for m, keep in zip(catalog.mutation_ids, informative.any(axis=1)) if keep)
     full = catalog.default_bounds()
@@ -752,25 +496,8 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         receipt["final_accounting"] = accounting
     try:
         stage_two_config = replace(config.fit, max_clusters=config.stage_two_max_clusters)
-        # A supplied replay must not silently start a different search in either
-        # stage before its saved scientific policy has been checked.
-        for stage, value, settings in (("stage_one", accepted_stage_one, config.fit),
-                                        ("stage_two", accepted_stage_two, stage_two_config)):
-            if value is not None:
-                current_stage = stage
-                receipt["current_phase"] = stage + "_replay_policy"
-                accepted = replay_policy(value, stage, settings)
-                if stage == "stage_one":
-                    accepted_stage_one = accepted
-                else:
-                    accepted_stage_two = accepted
-        current_stage = "stage_one"
-        receipt["current_phase"] = "stage_one_fit"
-        if accepted_stage_one is None:
-            stage_one = _fit_accepted(catalog, population, fitting_bounds, output / "stage_one", "stage_one", config.fit, progress_callback,
-                                      normal_cn_policy=config.normal_cn_policy, run_manifest=run_manifest, run_manifest_id=run_manifest_id)
-        else:
-            stage_one = replay(accepted_stage_one, population, fitting_bounds, config.fit)
+        stage_one = _fit_stage(catalog, population, fitting_bounds, output / "stage_one", "stage_one",
+            config.fit, progress_callback, normal_cn_policy=config.normal_cn_policy)
         if set(stage_one.mutation_ids) != set(population):
             raise AssertionError("Accepted Stage 1 population differs from the numerical candidate population")
         receipt["counts"]["N1"] = len(stage_one.mutation_ids)
@@ -778,7 +505,7 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
             stage_one_occupied_map_groups=len(np.unique(stage_one.labels)))
         receipt["stage_one"] = "accepted"
         receipt["current_phase"] = "stage_one_record_publication"
-        save_accepted_fit(stage_one, output / "stage_one_accepted.json")
+        _publish_json(output / "stage_one_accepted.json", stage_one.to_dict())
         receipt["current_phase"] = "stage_one_diagnostics"
         group_one = classify_groups(catalog, stage_one, config)
         receipt["current_phase"] = "stage_one_group_publication"
@@ -806,8 +533,6 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
         receipt["current_phase"] = "stage_two_feasibility"
         stage_two, group_two = None, []
         if not remainder:
-            if accepted_stage_two is not None:
-                raise ValueError("Stage-two replay is inapplicable to an empty remainder")
             receipt["stage_two"] = "skipped_no_eligible_informative_remainder"
         else:
             positions = {mutation: i for i, mutation in enumerate(catalog.mutation_ids)}
@@ -819,19 +544,15 @@ def run_workflow(input_path, outdir, workflow_config, *, progress_callback=None,
                 publish_workflow_receipt(output, receipt)
                 return receipt
             receipt["current_phase"] = "stage_two_fit"
-            if accepted_stage_two is None:
-                stage_two = _fit_accepted(catalog, remainder, caps.subset(remainder), output / "stage_two",
-                    "stage_two", stage_two_config, progress_callback, normal_cn_policy=config.normal_cn_policy,
-                    run_manifest=run_manifest, run_manifest_id=run_manifest_id)
-            else:
-                stage_two = replay(accepted_stage_two, remainder, caps.subset(remainder), stage_two_config)
+            stage_two = _fit_stage(catalog, remainder, caps.subset(remainder), output / "stage_two",
+                "stage_two", stage_two_config, progress_callback, normal_cn_policy=config.normal_cn_policy)
             if set(stage_two.mutation_ids) != set(remainder):
                 raise AssertionError("Accepted Stage 2 population differs from its numerical candidate population")
             receipt["counts"].update(N2=len(stage_two.mutation_ids), Q2=len(stage_two.centers),
                 stage_two_occupied_map_groups=len(np.unique(stage_two.labels)))
             receipt["stage_two"] = "accepted"
             receipt["current_phase"] = "stage_two_record_publication"
-            save_accepted_fit(stage_two, output / "stage_two_accepted.json")
+            _publish_json(output / "stage_two_accepted.json", stage_two.to_dict())
             receipt["current_phase"] = "stage_two_diagnostics"
             group_two = classify_groups(catalog, stage_two, config)
         receipt["current_phase"] = "stage_two_group_publication"

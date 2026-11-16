@@ -1,4 +1,4 @@
-"""CliPP2: free-center joint regional clustering with recurring partition search."""
+"""CliPP2: A-initialized joint-mixture workflow with fixed-reference Stage 3."""
 
 from __future__ import annotations
 
@@ -9,21 +9,12 @@ from ._version import __version__
 _EXPORTS = {
     "FitConfig": ".config",
     "TumorData": ".io.data",
-    "process_tumor": ".api",
     "load_tumor_txt": ".io.tumor_txt",
-    "resolve_fit_config": ".config",
     "WorkflowConfig": ".config",
     "MultiplicityBounds": ".io.data",
     "OriginalCatalog": ".io.data",
     "load_original_catalog": ".io.tumor_txt",
-    "AssignmentReference": ".assignment",
-    "AssignmentBundle": ".assignment",
-    "AssignmentResult": ".assignment",
-    "assign_mutations": ".assignment",
-    "derive_assignment_bundle": ".assignment",
-    "AcceptedFit": ".workflow",
     "run_workflow": ".workflow",
-    "run_mixture_experiment": ".experimental",
 }
 
 __all__ = [*_EXPORTS, "__version__"]
